@@ -123,8 +123,11 @@ def upsert_build_config(
     compile_commands_path: str,
 ) -> None:
     conn.execute(
-        """INSERT OR IGNORE INTO build_configs(config_hash, project_id, compile_commands_path)
-           VALUES (?,?,?)""",
+        """INSERT INTO build_configs(config_hash, project_id, compile_commands_path)
+           VALUES (?,?,?)
+           ON CONFLICT(config_hash) DO UPDATE SET
+               created_at = datetime('now'),
+               compile_commands_path = excluded.compile_commands_path""",
         (config_hash, project_id, compile_commands_path),
     )
 
