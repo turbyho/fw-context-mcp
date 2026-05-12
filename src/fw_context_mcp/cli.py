@@ -225,6 +225,7 @@ def cmd_init(args: argparse.Namespace) -> int:
 
 def _update_marked_section(path: Path, content: str, marker: str) -> None:
     """Insert or replace a <!-- marker --> ... <!-- /marker --> block in a markdown file."""
+    import re
     start_tag = f"<!-- {marker} -->"
     end_tag = f"<!-- /{marker} -->"
 
@@ -232,12 +233,19 @@ def _update_marked_section(path: Path, content: str, marker: str) -> None:
     existing = path.read_text(encoding="utf-8") if path.exists() else ""
 
     if start_tag in existing and end_tag in existing:
-        # Replace the existing block
+        # Replace the existing marked block
         before = existing[:existing.index(start_tag)]
         after = existing[existing.index(end_tag) + len(end_tag):]
         updated = before.rstrip("\n") + "\n\n" + content + "\n" + after.lstrip("\n")
     else:
-        # Append
+        # Remove any unmarked section with the same heading (idempotency for manual installs)
+        heading = re.search(r'^## .+', content, re.MULTILINE)
+        if heading:
+            pattern = re.compile(
+                r'\n*' + re.escape(heading.group()) + r'.*?(?=\n## |\Z)',
+                re.DOTALL,
+            )
+            existing = pattern.sub("", existing)
         updated = existing.rstrip("\n") + ("\n\n" if existing.strip() else "") + content + "\n"
 
     path.write_text(updated, encoding="utf-8")
