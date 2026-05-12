@@ -379,19 +379,29 @@ def smart_search(
     ollama_warning: dict | None = None
 
     prompt = (
-        "You are a C/C++ code search assistant.\n"
-        "Generate 2-4 FTS5 search keyword queries for the following natural-language "
-        "description. Output one query per line, no explanations, no numbering.\n"
-        "Use short identifiers, C/C++ naming conventions, and prefix wildcards when useful.\n\n"
+        "You are a C/C++ code search assistant for an embedded firmware project.\n"
+        "Generate 2-4 FTS5 keyword search terms for the symbol index based on the description below.\n"
+        "Rules:\n"
+        "- Output ONLY the search terms, one per line, no numbering, no markdown, no punctuation\n"
+        "- Use snake_case identifiers (e.g. modem_init, conn_open)\n"
+        "- You may use a trailing wildcard suffix: modem* matches modem_init, modem_connect, etc.\n"
+        "- No asterisks anywhere else — FTS5 only supports trailing wildcards\n"
+        "- Prefer short stems over full function names\n\n"
         f"Description: {query}\n"
     )
     try:
         raw = call_ollama(prompt, cfg.llm)
-        keyword_queries = [
-            line.strip().strip('"').strip("'")
-            for line in raw.splitlines()
-            if line.strip() and not line.strip().startswith("#")
-        ][:4]
+        import re as _re
+        keyword_queries = []
+        for line in raw.splitlines():
+            # strip markdown: leading numbers/bullets, asterisks, backticks, quotes
+            cleaned = _re.sub(r'^[\s\d\.\-\*]+', '', line).strip().strip('`\'"*')
+            if cleaned and not cleaned.startswith("#"):
+                # FTS5 query parser doesn't split on '_'; replace with space so
+                # 'modem_init' becomes AND('modem','init') rather than a missing token
+                cleaned = cleaned.replace("_", " ")
+                keyword_queries.append(cleaned)
+        keyword_queries = keyword_queries[:4]
     except OllamaModelNotFoundError as e:
         ollama_warning = {"warning": str(e), "hint": "Run: check_ollama()"}
         keyword_queries = [query]
@@ -425,6 +435,7 @@ def smart_search(
     elif _is_stale(cfg_data, cfg_data["compile_commands_path"]):
         results.append({"warning": "Index may be stale — run 'fw-context index'."})
 
+    results.append({"_generated_queries": keyword_queries})
     results += list(seen.values())[:limit]
     return results
 
