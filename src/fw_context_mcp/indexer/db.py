@@ -137,15 +137,16 @@ def upsert_file(
 def insert_symbols_batch(
     conn: sqlite3.Connection,
     rows: list[tuple],
-) -> None:
-    """Insert symbol rows; skip on USR conflict (already indexed)."""
-    conn.executemany(
+) -> int:
+    """Insert symbol rows; skip on USR conflict. Returns count of newly inserted rows."""
+    cur = conn.executemany(
         """INSERT OR IGNORE INTO symbols
            (config_hash, file_id, usr, name, qualified_name, kind,
             line, col, is_definition, signature, docstring)
            VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
         rows,
     )
+    return cur.rowcount
 
 
 def get_active_config(conn: sqlite3.Connection, project_id: str) -> sqlite3.Row | None:

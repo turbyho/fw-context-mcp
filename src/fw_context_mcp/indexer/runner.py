@@ -106,8 +106,8 @@ def run(
                 )
                 for s in syms
             ]
-            insert_symbols_batch(conn, rows)
-            total_syms += len(rows)
+            inserted = insert_symbols_batch(conn, rows)
+            total_syms += inserted
 
         if (i + 1) % 50 == 0:
             elapsed = time.monotonic() - t0
