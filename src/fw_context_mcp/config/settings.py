@@ -27,7 +27,8 @@ db_dir = "~/.fw-context/index"
 
 [llm]
 ollama_url = "http://localhost:11434"
-model = "qwen2.5-coder:14b-q4_K_M"
+model = "codestral:latest"
+num_ctx = 8192
 cloud_model = "devstral-small-2:cloud"
 """
 
@@ -47,8 +48,9 @@ source_roots = ["src", "lib"]
 @dataclass
 class LLMConfig:
     ollama_url: str = "http://localhost:11434"
-    model: str = "qwen2.5-coder:14b-q4_K_M"
+    model: str = "codestral:latest"
     cloud_model: str = "devstral-small-2:cloud"
+    num_ctx: int = 8192
 
 
 @dataclass
@@ -115,6 +117,8 @@ def _from_dict(data: dict) -> Config:
             cfg.llm.model = model
         if cloud := llm.get("cloud_model"):
             cfg.llm.cloud_model = cloud
+        if num_ctx := llm.get("num_ctx"):
+            cfg.llm.num_ctx = int(num_ctx)
 
     return cfg
 
