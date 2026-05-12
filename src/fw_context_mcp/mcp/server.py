@@ -66,6 +66,8 @@ def _detect_build_system(root: Path) -> str:
         return "mbed-os"
     if (root / "west.yml").exists() or (root / "prj.conf").exists():
         return "zephyr"
+    if (root / "platformio.ini").exists():
+        return "platformio"
     return "unknown"
 
 
