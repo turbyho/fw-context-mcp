@@ -40,6 +40,17 @@ _DROP_WITH_ARG = frozenset({
 
 _SOURCE_EXTS = frozenset({".c", ".cpp", ".cc", ".cxx", ".c++"})
 
+# Map from -mcpu= prefix to clang --target triple
+_ARM_CORTEX_TARGET = "--target=arm-none-eabi"
+
+
+def _infer_target(args: list[str]) -> str | None:
+    """Return a clang --target triple inferred from -mcpu= flags, or None."""
+    for arg in args:
+        if arg.startswith("-mcpu=cortex-m"):
+            return _ARM_CORTEX_TARGET
+    return None
+
 
 @dataclass
 class CompilationUnit:
@@ -107,6 +118,44 @@ def normalize_args(raw_args: list[str], cwd: Path) -> list[str]:
 
         result.append(token)
 
+    # Inject --target triple so clang understands -mcpu=/-mfpu=/-mfloat-abi= on the host
+    target = _infer_target(result)
+    if target:
+        result = [target] + result
+
+    return result
+
+
+def _gcc_system_includes(compiler: Path) -> list[str]:
+    """Return -isystem flags for a GCC ARM cross-compiler's built-in headers."""
+    # compiler: .../gcc-arm-none-eabi-X/bin/arm-none-eabi-g++
+    # lib dir:  .../gcc-arm-none-eabi-X/lib/gcc/arm-none-eabi/<ver>/include
+    toolchain_root = compiler.parent.parent
+    lib_gcc = toolchain_root / "lib" / "gcc"
+    result: list[str] = []
+    if lib_gcc.is_dir():
+        for triple_dir in lib_gcc.iterdir():
+            for ver_dir in triple_dir.iterdir():
+                inc = ver_dir / "include"
+                if inc.is_dir():
+                    result += ["-isystem", str(inc)]
+                inc_fixed = ver_dir / "include-fixed"
+                if inc_fixed.is_dir():
+                    result += ["-isystem", str(inc_fixed)]
+    triple = triple_dir.name  # e.g. arm-none-eabi
+    libc_inc = toolchain_root / triple / "include"
+    if libc_inc.is_dir():
+        result += ["-isystem", str(libc_inc)]
+    # C++ standard library headers (arm-none-eabi/include/c++/<ver>)
+    cxx_inc_base = toolchain_root / triple / "include" / "c++"
+    if cxx_inc_base.is_dir():
+        for ver_dir in cxx_inc_base.iterdir():
+            if ver_dir.is_dir():
+                result += ["-isystem", str(ver_dir)]
+                # Per-target subdir (e.g. arm-none-eabi, thumb, ...)
+                for sub in ver_dir.iterdir():
+                    if sub.is_dir():
+                        result += ["-isystem", str(sub)]
     return result
 
 
@@ -123,11 +172,20 @@ def parse(path: Path) -> Iterator[CompilationUnit]:
         raw_args: list[str] = entry.get("arguments") or shlex.split(
             entry.get("command", "")
         )
-        # First token is the compiler binary — libclang doesn't need it
+
+        # Extract compiler binary before stripping it
+        compiler: Path | None = None
         if raw_args and not raw_args[0].startswith("-"):
+            compiler = Path(raw_args[0])
             raw_args = raw_args[1:]
 
         clang_args = normalize_args(raw_args, cwd)
+
+        # For ARM GCC cross-compilers inject system include paths so libclang
+        # finds stdint.h and friends when --target=arm-none-eabi is active
+        if compiler and "arm-none-eabi" in compiler.name:
+            clang_args = clang_args + _gcc_system_includes(compiler)
+
         lang = _detect_language(file, clang_args)
 
         yield CompilationUnit(
