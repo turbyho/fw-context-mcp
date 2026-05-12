@@ -25,6 +25,7 @@ db_dir = "~/.fw-context/index"
 ollama_url = "http://localhost:11434"
 model = "codestral:latest"
 num_ctx = 8192
+# debug_log = "~/.fw-context/llm-debug.jsonl"   # write LLM prompts/responses to JSONL
 """
 
 _PROJECT_DEFAULTS_TEMPLATE = """\
@@ -42,7 +43,10 @@ exclude_paths = ["build", "BUILD"]
 
 # [llm]
 # enabled = false   # disable Ollama, return raw prompts for the agent to answer
+# ollama_url = "http://localhost:11434"
 # model = "qwen2.5-coder:7b-q4_K_M"   # override global model for this project
+# num_ctx = 8192
+# debug_log = "~/.fw-context/llm-debug.jsonl"   # write LLM prompts/responses to JSONL
 """
 
 
@@ -147,15 +151,28 @@ def _ensure_project_config(project_root: Path) -> Path:
 def load(project_root: Path | None = None) -> Config:
     """Load merged config for the given project root.
 
-    Creates default config files on first use.
+    Creates default config files on first use.  TOML parse errors in user
+    configs are logged and the built-in defaults are used instead — a broken
+    config file must not prevent the MCP tools from loading.
     """
+    import logging
+
+    log = logging.getLogger(__name__)
+    data: dict = {}
+
     global_path = _ensure_global_config()
-    data = tomllib.loads(global_path.read_text())
+    try:
+        data = tomllib.loads(global_path.read_text())
+    except Exception:
+        log.exception("Failed to parse %s — using defaults", global_path)
 
     if project_root is not None:
         proj_path = _ensure_project_config(project_root)
-        proj_data = tomllib.loads(proj_path.read_text())
-        data = _deep_merge(data, proj_data)
+        try:
+            proj_data = tomllib.loads(proj_path.read_text())
+            data = _deep_merge(data, proj_data)
+        except Exception:
+            log.exception("Failed to parse %s — ignoring project config", proj_path)
 
     cfg = _from_dict(data)
     cfg.index.db_dir = cfg.index.db_dir.expanduser().resolve()
