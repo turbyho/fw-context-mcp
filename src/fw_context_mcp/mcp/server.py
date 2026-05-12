@@ -9,6 +9,7 @@ from pathlib import Path
 
 from mcp.server.fastmcp import FastMCP
 
+from ..config import load as load_config
 from ..indexer.db import get_active_config, open_db, search_symbols
 
 log = logging.getLogger(__name__)
@@ -18,12 +19,10 @@ mcp = FastMCP(
     instructions="Build-aware code intelligence index for embedded firmware (Mbed OS, Zephyr).",
 )
 
-_DEFAULT_DB_DIR = Path.home() / ".fw-context" / "index"
-
-
 def _db_path(project_root: Path) -> Path:
+    cfg = load_config(project_root=project_root)
     project_id = _derive_project_id(project_root)
-    return _DEFAULT_DB_DIR / project_id / "index.db"
+    return cfg.index.db_dir / project_id / "index.db"
 
 
 def _derive_project_id(root: Path) -> str:
