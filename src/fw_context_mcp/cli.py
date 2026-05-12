@@ -9,6 +9,7 @@ from pathlib import Path
 
 
 def cmd_index(args: argparse.Namespace) -> int:
+    from .config import load as load_config
     from .indexer.runner import run
 
     logging.basicConfig(
@@ -17,16 +18,17 @@ def cmd_index(args: argparse.Namespace) -> int:
         datefmt="%H:%M:%S",
     )
 
-    compile_commands = Path(args.compile_commands)
+    project_root = Path(args.project or ".").resolve()
+    cfg = load_config(project_root=project_root)
+
+    compile_commands = Path(args.compile_commands) if args.compile_commands else cfg.index.compile_commands
+    if not compile_commands.is_absolute():
+        compile_commands = (project_root / compile_commands).resolve()
     if not compile_commands.exists():
         print(f"error: {compile_commands} not found", file=sys.stderr)
         return 1
 
-    db_dir = Path(args.db_dir) if args.db_dir else Path.home() / ".fw-context" / "index"
-    import hashlib
-    import subprocess
-
-    project_root = compile_commands.parent.resolve()
+    import hashlib, subprocess
     try:
         url = subprocess.check_output(
             ["git", "remote", "get-url", "origin"],
@@ -36,17 +38,15 @@ def cmd_index(args: argparse.Namespace) -> int:
     except Exception:
         project_id = hashlib.sha256(str(project_root).encode()).hexdigest()[:16]
 
-    db_path = db_dir / project_id / "index.db"
+    db_path = cfg.index.db_dir / project_id / "index.db"
 
-    source_roots = None
-    if args.source_roots:
-        source_roots = [Path(r) for r in args.source_roots]
+    source_roots = [Path(r) for r in args.source_roots] if args.source_roots else cfg.source_root_paths(project_root)
 
     config_hash = run(
         compile_commands=compile_commands,
         db_path=db_path,
         source_roots=source_roots,
-        project_name=args.name,
+        project_name=args.name or cfg.project.name,
     )
     print(f"Indexed. config_hash={config_hash[:16]}…  db={db_path}")
     return 0
@@ -94,10 +94,10 @@ def main() -> None:
     sub = parser.add_subparsers(dest="cmd")
 
     p_index = sub.add_parser("index", help="Build the symbol index from compile_commands.json")
-    p_index.add_argument("compile_commands", nargs="?", default="compile_commands.json")
+    p_index.add_argument("compile_commands", nargs="?", default=None, metavar="compile_commands.json")
+    p_index.add_argument("--project", metavar="DIR", help="Project root (default: cwd)")
     p_index.add_argument("--source-roots", nargs="+", metavar="DIR")
-    p_index.add_argument("--db-dir", metavar="DIR")
-    p_index.add_argument("--name", metavar="NAME", help="Project name")
+    p_index.add_argument("--name", metavar="NAME", help="Project name override")
     p_index.set_defaults(func=cmd_index)
 
     p_search = sub.add_parser("search", help="Search indexed symbols")
