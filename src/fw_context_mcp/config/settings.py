@@ -51,6 +51,7 @@ class LLMConfig:
     model: str = "codestral:latest"
     cloud_model: str = "devstral-small-2:cloud"
     num_ctx: int = 8192
+    debug_log: Path | None = None
 
 
 @dataclass
@@ -119,6 +120,8 @@ def _from_dict(data: dict) -> Config:
             cfg.llm.cloud_model = cloud
         if num_ctx := llm.get("num_ctx"):
             cfg.llm.num_ctx = int(num_ctx)
+        if debug_log := llm.get("debug_log"):
+            cfg.llm.debug_log = Path(debug_log).expanduser()
 
     return cfg
 

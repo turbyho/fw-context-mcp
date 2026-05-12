@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
+import json
 import logging
+import time
+from datetime import datetime, timezone
+from pathlib import Path
 
 import httpx
 
@@ -11,6 +15,15 @@ from ..config.settings import LLMConfig
 log = logging.getLogger(__name__)
 
 _TIMEOUT = 60.0
+
+
+def _write_debug_log(path: Path, entry: dict) -> None:
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    except Exception as e:
+        log.warning("LLM debug log write failed: %s", e)
 
 
 def call_ollama(prompt: str, cfg: LLMConfig) -> str:
@@ -25,10 +38,21 @@ def call_ollama(prompt: str, cfg: LLMConfig) -> str:
         "stream": False,
         "options": {"num_ctx": cfg.num_ctx},
     }
+    t0 = time.monotonic()
     try:
         resp = httpx.post(url, json=payload, timeout=_TIMEOUT)
         resp.raise_for_status()
-        return resp.json()["response"]
+        response_text = resp.json()["response"]
+        if cfg.debug_log:
+            _write_debug_log(cfg.debug_log, {
+                "ts": datetime.now(timezone.utc).isoformat(),
+                "model": cfg.model,
+                "num_ctx": cfg.num_ctx,
+                "latency_s": round(time.monotonic() - t0, 2),
+                "prompt": prompt,
+                "response": response_text,
+            })
+        return response_text
     except httpx.ConnectError as e:
         raise OllamaError(
             f"Cannot connect to Ollama at {cfg.ollama_url}. "
@@ -38,11 +62,10 @@ def call_ollama(prompt: str, cfg: LLMConfig) -> str:
         raise OllamaError(f"Ollama request timed out after {_TIMEOUT}s")
     except httpx.HTTPStatusError as e:
         if e.response.status_code == 404:
-            raise OllamaModelNotFoundError(
-                cfg.model,
-                cfg.ollama_url,
-            ) from e
+            raise OllamaModelNotFoundError(cfg.model, cfg.ollama_url) from e
         raise OllamaError(f"Ollama HTTP {e.response.status_code}: {e.response.text[:200]}") from e
+    except OllamaError:
+        raise
     except Exception as e:
         raise OllamaError(str(e)) from e
 
@@ -84,6 +107,9 @@ def check_setup(cfg: LLMConfig) -> dict:
         "num_ctx": cfg.num_ctx,
         "installed_models": installed,
     }
+
+    if cfg.debug_log:
+        result["debug_log"] = str(cfg.debug_log)
 
     if not model_found:
         result["message"] = (
