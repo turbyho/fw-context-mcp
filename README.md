@@ -1,18 +1,87 @@
 # fw-context
 
-Build-aware code intelligence for embedded firmware. Lets your AI assistant
-(Claude Code, OpenCode) understand C/C++ codebases built with **Mbed OS**,
-**Zephyr**, or **PlatformIO** — without grep, without reading entire files,
-without hallucinating symbols that don't exist.
+Build-aware code intelligence for embedded firmware — a symbolic index of your
+entire C/C++ codebase that AI assistants (Claude Code, OpenCode) can query
+directly, with zero hallucination.
 
-It works in two parts:
+## What problem it solves
 
-1. **Indexer** — parses your `compile_commands.json` via libclang, extracts every
-   function, class, method, enum, and typedef, stores them in a local SQLite
-   database with full-text search.
-2. **MCP server** — exposes the index as tools that AI assistants call to
-   look up definitions, search for symbols, and even ask a local LLM to explain
-   what a function does.
+AI coding assistants are great at Python, JavaScript, and Go — languages with
+mature LSP servers, static analysis, and training data. Embedded firmware is
+different:
+
+- **Proprietary codebases** the model has never seen — no training data.
+- **Massive dependency trees** (Mbed OS alone is ~8000 C++ files) — too large
+  to read into context.
+- **Build-time macros and `#ifdef`s** that change which code is actually compiled.
+- **Custom build systems** (`mbed compile`, `west build`, `pio run`) whose
+  include paths, defines, and compiler flags are opaque until you run them.
+
+Without an index, the assistant resorts to grep — slow, imprecise, and blind to
+which translation units are actually part of the build. It hallucinates function
+names, misses overloads, and can't tell a definition from a declaration.
+
+**fw-context solves this by parsing your actual build.** It reads
+`compile_commands.json` (the exact same compilation database your build system
+produces), parses every translation unit with **libclang** (the same parser as
+your IDE), and stores the extracted symbols in a **SQLite + FTS5** database on
+disk. Your AI assistant then queries this database through an **MCP server** —
+sub-millisecond lookups, zero hallucination, real C/C++ understanding.
+
+## How it works, at a glance
+
+```
+  1. Your build system         2. fw-context index            3. AI assistant
+  ┌──────────────────┐        ┌─────────────────────┐        ┌──────────────────┐
+  │ bear / west / pio │  ──→  │ libclang parses      │  ──→  │ lookup_symbol(…) │
+  │ compile_commands  │        │ every .c/.cpp in TU │        │ search_code(…)   │
+  │ .json             │        │ SQLite + FTS5 db    │        │ explain_symbol(…)│
+  └──────────────────┘        └─────────────────────┘        └──────────────────┘
+```
+
+### Architecture (3 components)
+
+| Component | Runs as | Built with | Purpose |
+|-----------|---------|------------|---------|
+| **CLI** (`fw-context`) | User command | Python + Click-like argparse | Index build, status checks, project management |
+| **Indexer** | Called by CLI | **libclang** (C API via `libclang` Python bindings), SQLite FTS5 | Parses C/C++; extracts functions, classes, methods, enums, typedefs, variables; stores in full-text-searchable database |
+| **MCP server** (`fw-context-mcp`) | Subprocess started by AI assistant | **MCP SDK** (stdlib JSON-RPC 2.0), SQLite, **httpx** (Ollama HTTP) | Exposes 9 tools over stdin/stdout; optionally calls **Ollama** for natural-language search and symbol explanation |
+
+### Key technologies
+
+| Tool | Role |
+|------|------|
+| **[libclang](https://clang.llvm.org/doxygen/group__CINDEX.html)** | C/C++ parser — traverses AST for each translation unit, extracts symbols with their qualified names, signatures, docstrings, and location. Uses the *exact* compiler flags from `compile_commands.json` (include paths, defines, standards) so it sees what the compiler sees. |
+| **[SQLite](https://sqlite.org) + [FTS5](https://sqlite.org/fts5.html)** | Storage and full-text search. The `symbols` table stores name, kind, signature, file/line, docstring, and definition-vs-declaration flag. FTS5 enables fast prefix/phrase/keyword queries without loading entire files. |
+| **[MCP SDK](https://github.com/modelcontextprotocol/python-sdk)** | JSON-RPC 2.0 server framework. Handles protocol initialization, message framing, and tool registration. The server is stateless between calls — each tool invocation opens the DB, runs the query, and closes. |
+| **[httpx](https://www.python-httpx.org/)** | Async HTTP client for calling Ollama's REST API (`/api/chat`, `/api/tags`). Used by `smart_search` and `explain_symbol`. |
+| **[Ollama](https://ollama.com)** *(optional)* | Local or cloud LLM. Powers natural-language search (translates "how does the modem connect?" → FTS5 keywords `modem connect`, `modem attach`) and generates plain-English explanations of C/C++ functions. When disabled, the AI assistant processes results with its own LLM — no Ollama required. |
+| **[`bear`](https://github.com/rizsotto/Bear)** | LD_PRELOAD-based build interception. Wraps your build command (`bear -- python3 build_app.py`) to produce `compile_commands.json`. Required once per build config change. |
+
+### What gets indexed
+
+The indexer extracts every **definition and declaration** from the translation
+units in `compile_commands.json`:
+
+| Symbol kind | Example |
+|-------------|---------|
+| Function | `void uart_init(int baudrate)` |
+| Method | `bool Modem::connect(const char *apn)` |
+| Constructor / Destructor | `BleManager::BleManager()` |
+| Class / Struct | `class BoxManager { … }` |
+| Enum | `enum class State { IDLE, ACTIVE }` |
+| Enum constant | `State::IDLE` |
+| Typedef / Using | `using Callback = void(*)(int)`; `typedef uint32_t tick_t` |
+| Variable / Field | `int _counter`; `static constexpr size_t BUFFER_SIZE` |
+| Namespace | `namespace zbox { … }` |
+
+All have **qualified names** (e.g. `zbox::BleManager::start_advertising`),
+**signatures**, and **file + line** locations.
+
+Source roots are auto-detected from your project structure (`src`, `lib`, `app`,
+`include`, `modules`, `zephyr`, `mbed-os`) and `compile_commands.json` entries —
+OS and framework symbols your project actually `#include`s are indexed
+automatically. No manual configuration needed.
 
 ## Quick start
 
@@ -484,38 +553,6 @@ Delete the old index and rebuild:
 ```bash
 fw-context reset -y
 fw-context index
-```
-
-## How it works
-
-```
-compile_commands.json
-        │
-        ▼
-  ┌─────────────┐     ┌──────────────┐
-  │ config_hash  │     │ libclang     │
-  │ (detects     │     │ per-TU parse │
-  │  changes)    │     └──────┬───────┘
-  └─────────────┘            │
-        │              Symbol records
-        ▼                    │
-  ┌──────────────────────────▼─────┐
-  │         SQLite + FTS5          │
-  │  ~/.fw-context/index/<id>/     │
-  │        index.db                │
-  └────────────┬───────────────────┘
-               │
-     ┌─────────▼──────────┐
-     │   MCP server (stdio)│
-     │   search_code       │
-     │   lookup_symbol     │
-     │   ...               │
-     └─────────┬───────────┘
-               │
-     ┌─────────▼──────────┐
-     │   AI assistant      │
-     │   (Claude / OpenCode)│
-     └────────────────────┘
 ```
 
 ## Directory layout
