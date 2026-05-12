@@ -12,7 +12,7 @@ from mcp.server.fastmcp import FastMCP
 
 from ..config import load as load_config
 from ..indexer.db import get_active_config, open_db, search_symbols
-from ..llm.ollama import OllamaError, call_ollama
+from ..llm.ollama import OllamaError, OllamaModelNotFoundError, call_ollama, check_setup
 
 log = logging.getLogger(__name__)
 
@@ -237,6 +237,24 @@ def lookup_symbol(
 
 
 @mcp.tool()
+def check_ollama(project_root: str | None = None) -> dict:
+    """Check whether Ollama is running and the configured model is installed.
+
+    Args:
+        project_root: Absolute path to the project. Defaults to nearest git root.
+
+    Returns a status dict:
+      - status: "ok" | "model_missing" | "error"
+      - ollama_running: bool
+      - configured_model, num_ctx, installed_models
+      - message + available_code_models when status != "ok"
+    """
+    root = _resolve_project_root(project_root)
+    cfg = load_config(project_root=root)
+    return check_setup(cfg.llm)
+
+
+@mcp.tool()
 def explain_symbol(
     name: str,
     project_root: str | None = None,
@@ -319,6 +337,8 @@ def explain_symbol(
     }
     try:
         result["explanation"] = call_ollama(prompt, cfg.llm)
+    except OllamaModelNotFoundError as e:
+        result["warning"] = str(e)
     except OllamaError as e:
         result["warning"] = f"Ollama unavailable: {e}"
 
@@ -372,6 +392,9 @@ def smart_search(
             for line in raw.splitlines()
             if line.strip() and not line.strip().startswith("#")
         ][:4]
+    except OllamaModelNotFoundError as e:
+        ollama_warning = {"warning": str(e), "hint": "Run: check_ollama()"}
+        keyword_queries = [query]
     except OllamaError as e:
         ollama_warning = {"warning": f"Ollama unavailable, using direct search: {e}"}
         keyword_queries = [query]
