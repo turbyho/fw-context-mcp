@@ -56,6 +56,7 @@ class IndexConfig:
     db_dir: Path = field(default_factory=lambda: Path.home() / ".fw-context" / "index")
     compile_commands: Path = field(default_factory=lambda: Path("compile_commands.json"))
     source_roots: list[str] = field(default_factory=lambda: ["src", "lib"])
+    exclude_paths: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -75,6 +76,9 @@ class Config:
             for r in self.index.source_roots
             if (project_root / r).exists()
         ]
+
+    def exclude_root_paths(self, project_root: Path) -> list[Path]:
+        return [(project_root / p).resolve() for p in self.index.exclude_paths]
 
 
 def _deep_merge(base: dict, override: dict) -> dict:
@@ -101,6 +105,8 @@ def _from_dict(data: dict) -> Config:
             cfg.index.compile_commands = Path(cc)
         if roots := idx.get("source_roots"):
             cfg.index.source_roots = roots
+        if excludes := idx.get("exclude_paths"):
+            cfg.index.exclude_paths = excludes
 
     if llm := data.get("llm", {}):
         if url := llm.get("ollama_url"):

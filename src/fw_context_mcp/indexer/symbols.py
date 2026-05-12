@@ -121,14 +121,21 @@ def _docstring(cursor: cx.Cursor) -> str:
     return " ".join(cleaned)
 
 
-def extract(unit: CompilationUnit, source_roots: list[Path] | None = None) -> Iterator[Symbol]:
+def extract(
+    unit: CompilationUnit,
+    source_roots: list[Path] | None = None,
+    exclude_paths: list[Path] | None = None,
+) -> Iterator[Symbol]:
     """Parse unit and yield Symbol records for definitions in source_roots.
 
     source_roots: only emit symbols whose file is under one of these paths.
-    If None, emit symbols from the unit's own file only.
+    exclude_paths: skip symbols whose file is under any of these paths (applied after source_roots).
+    If source_roots is None, emit symbols from the unit's own file only.
     """
     if source_roots is None:
         source_roots = [unit.file.parent]
+    if exclude_paths is None:
+        exclude_paths = []
 
     tu = _INDEX.parse(
         str(unit.file),
@@ -149,6 +156,10 @@ def extract(unit: CompilationUnit, source_roots: list[Path] | None = None) -> It
         p = _resolve(path)
         return any(p == r or p.is_relative_to(r) for r in source_roots)
 
+    def _not_excluded(path: str) -> bool:
+        p = _resolve(path)
+        return not any(p == e or p.is_relative_to(e) for e in exclude_paths)
+
     # Maps USR → is_definition; allows promotion from declaration to definition
     seen_usrs: dict[str, bool] = {}
 
@@ -160,6 +171,8 @@ def extract(unit: CompilationUnit, source_roots: list[Path] | None = None) -> It
         if not loc.file:
             continue
         if not _in_roots(loc.file.name):
+            continue
+        if not _not_excluded(loc.file.name):
             continue
 
         # For most kinds require definition; for declarations of callables allow decl too

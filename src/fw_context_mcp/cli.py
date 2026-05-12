@@ -41,11 +41,13 @@ def cmd_index(args: argparse.Namespace) -> int:
     db_path = cfg.index.db_dir / project_id / "index.db"
 
     source_roots = [Path(r) for r in args.source_roots] if args.source_roots else cfg.source_root_paths(project_root)
+    exclude_paths = cfg.exclude_root_paths(project_root)
 
     config_hash = run(
         compile_commands=compile_commands,
         db_path=db_path,
         source_roots=source_roots,
+        exclude_paths=exclude_paths,
         project_name=args.name or cfg.project.name,
     )
     print(f"Indexed. config_hash={config_hash[:16]}…  db={db_path}")
