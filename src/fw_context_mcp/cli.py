@@ -33,7 +33,8 @@ When working on the `fw-context-mcp` source code itself
 **Code search:**
 - Looking up a symbol definition or declaration → `lookup_symbol(name)`
 - Searching for functions/classes by topic → `search_code(query)` or `smart_search(query)`
-- Understanding what a function does → `explain_symbol(name)` (calls local Ollama)
+- Understanding what a function does → `explain_symbol(name)` (uses local Ollama
+   when available; falls back to returning source + prompt for you to explain)
 - Checking build metadata or index freshness → `get_active_build()`
 
 **Index administration:**
@@ -52,6 +53,8 @@ When working on the `fw-context-mcp` source code itself
    a session to verify the local model is available.
 4. `explain_symbol` reads source context and calls the local Ollama model — it may
    take 10–30 s. Do not call it in a loop over many symbols.
+5. When `explain_symbol` returns a `warning` with `source` and `explain_prompt`
+   instead of `explanation`, Ollama is unavailable — answer the prompt yourself.
 
 ### Index setup (first use in a project)
 
@@ -93,7 +96,8 @@ When working on the `fw-context-mcp` source code itself
 **Code search:**
 - Looking up a symbol definition or declaration → `lookup_symbol(name)`
 - Searching for functions/classes by topic → `search_code(query)` or `smart_search(query)`
-- Understanding what a function does → `explain_symbol(name)` (calls local Ollama)
+- Understanding what a function does → `explain_symbol(name)` (uses local Ollama
+   when available; falls back to returning source + prompt for you to explain)
 - Checking build metadata or index freshness → `get_active_build()`
 
 **Index administration:**
@@ -112,6 +116,8 @@ When working on the `fw-context-mcp` source code itself
    a session to verify the local model is available.
 4. `explain_symbol` reads source context and calls the local Ollama model — it may
    take 10–30 s. Do not call it in a loop over many symbols.
+5. When `explain_symbol` returns a `warning` with `source` and `explain_prompt`
+   instead of `explanation`, Ollama is unavailable — answer the prompt yourself.
 
 ## Index setup (first use in a project)
 

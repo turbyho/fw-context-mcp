@@ -10,7 +10,7 @@ that provides 9 tools for navigating embedded firmware codebases:
 
 - **Look up** any C/C++ symbol definition with file + line + signature
 - **Search** symbols by keyword or natural language
-- **Explain** what a function does (local Ollama LLM)
+- **Explain** what a function does (local Ollama LLM, or falls back to returning code + prompt for the AI assistant)
 - **Manage** the symbol index (check staleness, re-index files, reset)
 
 ## Protocol
@@ -106,14 +106,16 @@ is always `_generated_queries`.
 
 ### `explain_symbol`
 
-Look up a symbol and ask Ollama to explain it. **Takes 10–30 seconds.**
+Look up a symbol and explain what it does. **Takes 10–30 seconds with Ollama.**
 
 ```
 Input:  {"name": "modem_parser_oob_init", "context_lines?": 40}
 Output: {"name": "…", "signature": "…", "explanation": "This function initializes…"}
 ```
 
-Returns `warning` instead of `explanation` when Ollama is unavailable.
+When Ollama is unavailable or disabled (`enabled = false`), returns `source`
+(source code snippet) and `explain_prompt` (the LLM prompt) instead of
+`explanation`. The AI assistant should use its own LLM to answer the prompt.
 Call `check_ollama` first.
 
 ### `check_ollama`
@@ -122,8 +124,11 @@ Verify Ollama connectivity before using `explain_symbol` or `smart_search`.
 
 ```
 Input:  {}
-Output: {"status": "ok", "ollama_running": true, "configured_model": "codestral:latest", …}
+Output: {"status": "ok", "ollama_running": true, "ollama_enabled": true, "configured_model": "codestral:latest", …}
 ```
+
+Returns `status: "disabled"` when `enabled = false` in config —
+no Ollama needed, the AI assistant handles the results.
 
 ### `list_projects`
 
@@ -237,8 +242,10 @@ instructions on how to update:
 - **CWD:** The server resolves project root from the current working directory
   when `project_root` is not provided. Set the assistant to launch the server
   from the firmware project root.
-- **No network required** for core tools (search, lookup, list). Only
-  `explain_symbol` and `smart_search` need a local Ollama instance.
+- **No network required** for core tools (search, lookup, list).
+  `explain_symbol` and `smart_search` support both local Ollama and a fallback
+  mode where the AI assistant processes results itself — no LLM required on
+  the server side.
 - **Stateless** between calls — each tool call opens the database, runs the
   query, and closes. No persistent connections.
 

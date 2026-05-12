@@ -66,6 +66,15 @@ class TestFromDict:
         assert cfg.llm.model == "deepseek-coder"
         assert cfg.llm.num_ctx == 4096
 
+    def test_llm_enabled_default(self):
+        """enabled defaults to True."""
+        cfg = _from_dict({})
+        assert cfg.llm.enabled is True
+
+    def test_llm_enabled_false(self):
+        cfg = _from_dict({"llm": {"enabled": False}})
+        assert cfg.llm.enabled is False
+
 
 class TestDeriveProjectId:
     def test_git_repo_produces_stable_id(self):
@@ -106,6 +115,7 @@ class TestSourceRootPaths:
         cfg = Config()
         cfg.index.exclude_paths = ["build", "BUILD"]
         (tmpdir / "build").mkdir()
+        (tmpdir / "BUILD").mkdir()
         paths = cfg.exclude_root_paths(tmpdir)
-        assert len(paths) == 1
+        assert len(paths) == 2
         assert paths[0] == (tmpdir / "build").resolve()

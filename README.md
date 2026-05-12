@@ -43,7 +43,7 @@ fw-context index
 | SSH key for `git.montyho.com` | To clone the repository |
 | Compiler toolchain (ARM GCC / Zephyr SDK / PlatformIO) | libclang needs system headers to parse cross-compiled code |
 | [`bear`](https://github.com/rizsotto/Bear) | Intercepts build commands to produce `compile_commands.json` |
-| [Ollama](https://ollama.com) *(optional)* | Powers `explain_symbol` and `smart_search` |
+| [Ollama](https://ollama.com) *(optional)* | Powers `explain_symbol` and `smart_search`. Not required —                  when disabled, the AI assistant processes the results itself. |
 
 ## Installation
 
@@ -282,10 +282,15 @@ Auto-created on first run:
 db_dir = "~/.fw-context/index"
 
 [llm]
+# enabled = true   # set to false to disable Ollama, return raw prompts to AI assistant
 ollama_url = "http://localhost:11434"
 model = "codestral:latest"
 num_ctx = 8192
 ```
+
+Set `enabled = false` if you don't have Ollama (no GPU, no cloud account).
+The AI assistant will process the returned source code and prompt itself —
+no local LLM required.
 
 Change `ollama_url` if Ollama runs on a different machine:
 
@@ -313,6 +318,7 @@ compile_commands = "compile_commands.json"
 exclude_paths = ["build", "generated"]
 
 [llm]
+# enabled = false   # disable Ollama, return raw prompts for the AI assistant
 model = "deepseek-coder:6.7b"   # use a different model for this project
 ```
 
@@ -325,10 +331,13 @@ you fine-tune when needed.
 
 ## Choosing an Ollama model
 
-`explain_symbol` and `smart_search` use a local Ollama model. The tasks are
-lightweight — generating FTS5 search terms and writing 2–4 sentence symbol
-explanations. An 8B code-optimized model is plenty; you don't need a 24B+ model
-for this.
+`explain_symbol` and `smart_search` use a local Ollama model by default.
+**Ollama is optional** — if you don't have it, set `enabled = false` in config
+and the AI assistant will process the results with its own LLM.
+
+The tasks are lightweight — generating FTS5 search terms and writing 2–4
+sentence symbol explanations. An 8B code-optimized model is plenty; you don't
+need a 24B+ model for this.
 
 All models are accessed through the same Ollama API — the config only changes
 the model name. Cloud models require `ollama signin` first.
@@ -424,9 +433,21 @@ By default source roots are auto-detected from your project structure and
 
 ### "Cannot connect to Ollama"
 
-Ollama is optional. Tools that need it (`explain_symbol`, `smart_search`) will
-return a warning and fall back to direct search. Install from
-[ollama.com](https://ollama.com) and pull a model:
+Ollama is optional. If you don't have it (no GPU, no cloud account), disable
+it in config:
+
+```toml
+# ~/.fw-context/config.toml
+[llm]
+enabled = false
+```
+
+Then `explain_symbol` returns the source code and prompt for the AI assistant
+to answer itself, and `smart_search` falls back to direct keyword search —
+no Ollama connection needed.
+
+To use Ollama instead, install it from [ollama.com](https://ollama.com) and
+pull a model:
 
 ```bash
 ollama pull codestral:latest

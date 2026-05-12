@@ -21,10 +21,10 @@ _GLOBAL_DEFAULTS = """\
 db_dir = "~/.fw-context/index"
 
 [llm]
+# enabled = true   # set to false to disable Ollama and return raw prompts for the agent
 ollama_url = "http://localhost:11434"
 model = "codestral:latest"
 num_ctx = 8192
-cloud_model = "devstral-small-2:cloud"
 """
 
 _PROJECT_DEFAULTS_TEMPLATE = """\
@@ -41,15 +41,16 @@ source_roots = []
 exclude_paths = ["build", "BUILD"]
 
 # [llm]
+# enabled = false   # disable Ollama, return raw prompts for the agent to answer
 # model = "qwen2.5-coder:7b-q4_K_M"   # override global model for this project
 """
 
 
 @dataclass
 class LLMConfig:
+    enabled: bool = True
     ollama_url: str = "http://localhost:11434"
     model: str = "codestral:latest"
-    cloud_model: str = "devstral-small-2:cloud"
     num_ctx: int = 8192
     debug_log: Path | None = None
 
@@ -112,12 +113,12 @@ def _from_dict(data: dict) -> Config:
             cfg.index.exclude_paths = excludes
 
     if llm := data.get("llm", {}):
+        if "enabled" in llm:
+            cfg.llm.enabled = bool(llm["enabled"])
         if url := llm.get("ollama_url"):
             cfg.llm.ollama_url = url
         if model := llm.get("model"):
             cfg.llm.model = model
-        if cloud := llm.get("cloud_model"):
-            cfg.llm.cloud_model = cloud
         if num_ctx := llm.get("num_ctx"):
             cfg.llm.num_ctx = int(num_ctx)
         if debug_log := llm.get("debug_log"):

@@ -562,8 +562,9 @@ def check_ollama(project_root: str | None = None) -> dict:
 
     Returns:
         dict with:
-        - status: "ok" | "model_missing" | "error"
+        - status: "ok" | "model_missing" | "error" | "disabled"
         - ollama_running (bool)
+        - ollama_enabled (bool)
         - configured_model (str): the model name from config
         - num_ctx (int): context size setting
         - installed_models (list[str]): all models available in Ollama
@@ -572,7 +573,22 @@ def check_ollama(project_root: str | None = None) -> dict:
           models that are already installed and could be used instead
     """
     _, cfg, _, _ = _resolve_context(project_root)
-    return check_setup(cfg.llm)
+    if not cfg.llm.enabled:
+        return {
+            "status": "disabled",
+            "ollama_enabled": False,
+            "ollama_running": False,
+            "configured_model": cfg.llm.model,
+            "num_ctx": cfg.llm.num_ctx,
+            "message": (
+                "Ollama is disabled in config ([llm] enabled = false). "
+                "explain_symbol will return source + explain_prompt for the agent to answer. "
+                "smart_search will use raw text queries."
+            ),
+        }
+    result = check_setup(cfg.llm)
+    result["ollama_enabled"] = True
+    return result
 
 
 @mcp.tool()
@@ -581,15 +597,19 @@ async def explain_symbol(
     project_root: str | None = None,
     context_lines: int = 40,
 ) -> dict:
-    """Look up a symbol and ask Ollama to explain what it does.
+    """Look up a symbol and explain what it does.
 
-    Sends the symbol's source code context (surrounding lines) to a local
-    Ollama model for a plain-English explanation. The explanation is 2–4
-    sentences, focused on purpose and behaviour.
+    When a local Ollama model is available, sends the symbol's source code
+    context for a plain-English explanation (2–4 sentences).
 
-    **Performance:** Each call takes 10–30 seconds. Do NOT call in a loop
-    over many symbols. Call ``check_ollama()`` first to verify the model is
-    available. Falls back with a warning when Ollama is unavailable.
+    When Ollama is *not* available (no GPU, no cloud account), the result
+    includes ``source`` (the source code snippet) and ``explain_prompt`` (the
+    LLM prompt that would have been sent). The calling agent should use its
+    own LLM to answer the prompt.
+
+    **Performance:** With Ollama each call takes 10–30 seconds. Do NOT call
+    in a loop over many symbols. Call ``check_ollama()`` first to verify the
+    model is available.
 
     Args:
         name: Symbol name (exact match). If multiple symbols share the name,
@@ -599,8 +619,9 @@ async def explain_symbol(
                        definition for context (default 40).
 
     Returns:
-        dict with: name, kind, file, line, signature, and either explanation
-        (str) or warning (str) when Ollama is unavailable.
+        dict with: name, kind, file, line, signature.
+        With Ollama: + explanation (str).
+        Without Ollama: + warning (str), source (str), explain_prompt (str).
     """
     db_path, cfg, project_id, root = _resolve_context(project_root)
     if not db_path.exists():
@@ -666,12 +687,24 @@ async def explain_symbol(
         "line": line_no,
         "signature": signature,
     }
-    try:
-        result["explanation"] = await call_ollama_async(prompt, cfg.llm)
-    except OllamaModelNotFoundError as e:
-        result["warning"] = str(e)
-    except OllamaError as e:
-        result["warning"] = f"Ollama unavailable: {e}"
+    if cfg.llm.enabled:
+        try:
+            result["explanation"] = await call_ollama_async(prompt, cfg.llm)
+        except OllamaModelNotFoundError as e:
+            result["warning"] = (
+                f"{e}. No Ollama model available — interpret the 'source' and "
+                f"'explain_prompt' fields below with your own LLM to provide the explanation."
+            )
+        except OllamaError as e:
+            result["warning"] = (
+                f"Ollama unavailable: {e}. No local LLM — interpret the 'source' and "
+                f"'explain_prompt' fields below with your own LLM to provide the explanation."
+            )
+        else:
+            return result
+
+    result["source"] = source_snippet[:4000] if len(source_snippet) > 4000 else source_snippet
+    result["explain_prompt"] = prompt
 
     return result
 
@@ -737,23 +770,23 @@ async def smart_search(
             "- Prefer short stems over full function names\n\n"
             f"Description: {query}\n"
         )
-        try:
-            raw = await call_ollama_async(prompt, cfg.llm)
-            keyword_queries = []
-            for line in raw.splitlines():
-                # strip markdown: leading numbers/bullets, asterisks, backticks, quotes
-                cleaned = re.sub(r'^[\s\d\.\-\*]+', '', line).strip().strip('`\'"*')
-                if cleaned and not cleaned.startswith("#"):
-                    # FTS5 query parser doesn't split on '_'; replace with space so
-                    # 'modem_init' becomes AND('modem','init') rather than a missing token
-                    cleaned = cleaned.replace("_", " ")
-                    keyword_queries.append(cleaned)
-            keyword_queries = keyword_queries[:4]
-        except OllamaModelNotFoundError as e:
-            ollama_warning = {"warning": str(e), "hint": "Run: check_ollama()"}
-            keyword_queries = [query]
-        except OllamaError as e:
-            ollama_warning = {"warning": f"Ollama unavailable, using direct search: {e}"}
+        if cfg.llm.enabled:
+            try:
+                raw = await call_ollama_async(prompt, cfg.llm)
+                keyword_queries = []
+                for line in raw.splitlines():
+                    cleaned = re.sub(r'^[\s\d\.\-\*]+', '', line).strip().strip('`\'"*')
+                    if cleaned and not cleaned.startswith("#"):
+                        cleaned = cleaned.replace("_", " ")
+                        keyword_queries.append(cleaned)
+                keyword_queries = keyword_queries[:4]
+            except OllamaModelNotFoundError as e:
+                ollama_warning = {"warning": str(e), "hint": "Run: check_ollama()"}
+                keyword_queries = [query]
+            except OllamaError as e:
+                ollama_warning = {"warning": f"Ollama unavailable, using direct search: {e}"}
+                keyword_queries = [query]
+        else:
             keyword_queries = [query]
 
         for kq in keyword_queries:
