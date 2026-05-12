@@ -82,6 +82,13 @@ def run(
 
     for i, unit in enumerate(units):
         file_path = str(unit.file)
+
+        # Skip TUs that live under an excluded path entirely
+        resolved_tu = unit.file.resolve()
+        if any(resolved_tu == ep or resolved_tu.is_relative_to(ep) for ep in exclude_paths):
+            unchanged += 1
+            continue
+
         try:
             current_mtime = unit.file.stat().st_mtime if unit.file.exists() else 0.0
         except OSError:
@@ -105,12 +112,22 @@ def run(
             if file_path in existing_files:
                 file_id, _ = existing_files[file_path]
                 delete_symbols_for_file(conn, file_id)
-            file_id = upsert_file(conn, config_hash, file_path, unit.language, mtime=current_mtime)
+            # Register the TU file (for mtime tracking)
+            upsert_file(conn, config_hash, file_path, unit.language, mtime=current_mtime)
+
             if syms:
-                rows = [
-                    (
+                # Each symbol may come from a different file (e.g. included header).
+                # Build a per-file cache so file_id reflects the symbol's actual location.
+                file_id_cache: dict[str, int] = {}
+                rows = []
+                for s in syms:
+                    sym_file = s.file
+                    if sym_file not in file_id_cache:
+                        lang = "cpp" if Path(sym_file).suffix.lower() in {".cpp", ".cc", ".cxx", ".c++"} else "c"
+                        file_id_cache[sym_file] = upsert_file(conn, config_hash, sym_file, lang)
+                    rows.append((
                         config_hash,
-                        file_id,
+                        file_id_cache[sym_file],
                         s.usr,
                         s.name,
                         s.qualified_name,
@@ -120,9 +137,7 @@ def run(
                         int(s.is_definition),
                         s.signature,
                         s.docstring,
-                    )
-                    for s in syms
-                ]
+                    ))
                 total_syms += insert_symbols_batch(conn, rows)
 
         updated += 1
