@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import argparse
 import logging
+import re
 import sys
+from datetime import UTC
 from pathlib import Path
 
 _CLAUDE_MD_INSTRUCTIONS = """\
@@ -110,7 +112,8 @@ fw-context index
 
 
 def cmd_index(args: argparse.Namespace) -> int:
-    from .config import derive_project_id, load as load_config
+    from .config import derive_project_id
+    from .config import load as load_config
     from .indexer.runner import run
 
     logging.basicConfig(
@@ -149,26 +152,27 @@ def cmd_index(args: argparse.Namespace) -> int:
 
 def cmd_search(args: argparse.Namespace) -> int:
     from .config import derive_project_id
+    from .config import load as load_config
     from .indexer.db import get_active_config, open_db, search_symbols
 
     project_root = Path(args.project or ".").resolve()
+    cfg = load_config(project_root=project_root)
     project_id = derive_project_id(project_root)
 
-    db_path = Path.home() / ".fw-context" / "index" / project_id / "index.db"
+    db_path = cfg.index.db_dir / project_id / "index.db"
     if not db_path.exists():
         print(f"No index found at {db_path}. Run 'fw-context index' first.")
         return 1
 
     conn = open_db(db_path)
-    cfg = get_active_config(conn, project_id)
-    if not cfg:
+    build_cfg = get_active_config(conn, project_id)
+    if not build_cfg:
         print("No build config indexed.")
         return 1
 
-    results = search_symbols(conn, args.query, cfg["config_hash"], limit=args.limit)
-    from pathlib import Path as P
+    results = search_symbols(conn, args.query, build_cfg["config_hash"], limit=args.limit)
     for r in results:
-        print(f"[{r['kind']:15}] {r['qualified_name']}  @ {P(r['file_path']).name}:{r['line']}")
+        print(f"[{r['kind']:15}] {r['qualified_name']}  @ {Path(r['file_path']).name}:{r['line']}")
         if args.verbose and r["signature"]:
             print(f"               {r['signature']}")
     print(f"\n{len(results)} result(s) for '{args.query}'")
@@ -204,7 +208,8 @@ def cmd_list(args: argparse.Namespace) -> int:
 
 
 def cmd_reset(args: argparse.Namespace) -> int:
-    from .config import derive_project_id, load as load_config
+    from .config import derive_project_id
+    from .config import load as load_config
     from .indexer.db import get_active_config, open_db
 
     project_root = Path(args.project or ".").resolve()
@@ -241,14 +246,16 @@ def cmd_reset(args: argparse.Namespace) -> int:
             return 0
 
     db_path.unlink()
-    print(f"Index deleted. Run 'fw-context index' to rebuild.")
+    print("Index deleted. Run 'fw-context index' to rebuild.")
     return 0
 
 
 def cmd_status(args: argparse.Namespace) -> int:
     import os
-    from datetime import datetime, timezone
-    from .config import derive_project_id, load as load_config
+    from datetime import datetime
+
+    from .config import derive_project_id
+    from .config import load as load_config
     from .indexer.db import get_active_config, open_db
 
     project_root = Path(args.project or ".").resolve()
@@ -258,7 +265,7 @@ def cmd_status(args: argparse.Namespace) -> int:
 
     db_path = cfg.index.db_dir / project_id / "index.db"
     if not db_path.exists():
-        print(f"No index found. Run 'fw-context index' first.")
+        print("No index found. Run 'fw-context index' first.")
         return 1
 
     conn = open_db(db_path)
@@ -278,7 +285,7 @@ def cmd_status(args: argparse.Namespace) -> int:
     cc = active["compile_commands_path"]
     if cc and Path(cc).exists():
         cc_mtime = os.path.getmtime(cc)
-        indexed_at = datetime.fromisoformat(active["created_at"]).replace(tzinfo=timezone.utc)
+        indexed_at = datetime.fromisoformat(active["created_at"]).replace(tzinfo=UTC)
         stale = cc_mtime > indexed_at.timestamp() + 1
 
     print(f"Project : {project_root}")
@@ -286,19 +293,19 @@ def cmd_status(args: argparse.Namespace) -> int:
     print(f"Indexed : {active['created_at']}{'  [STALE]' if stale else ''}")
     print(f"DB      : {db_path}")
     if stale:
-        print(f"  compile_commands.json changed — run 'fw-context index' to update")
+        print("  compile_commands.json changed — run 'fw-context index' to update")
     return 0
 
 
 def _cli_is_stale(row) -> bool:
     import os
-    from datetime import datetime, timezone
+    from datetime import datetime
     try:
         cc = row["compile_commands_path"]
         if not cc or not Path(cc).exists():
             return False
         cc_mtime = os.path.getmtime(cc)
-        indexed_at = datetime.fromisoformat(row["created_at"]).replace(tzinfo=timezone.utc)
+        indexed_at = datetime.fromisoformat(row["created_at"]).replace(tzinfo=UTC)
         return cc_mtime > indexed_at.timestamp() + 1
     except Exception:
         return False
@@ -308,8 +315,22 @@ def cmd_init(args: argparse.Namespace) -> int:
     import shutil
     import subprocess
 
-    mcp_bin = shutil.which("fw-context-mcp") or str(Path(sys.executable).parent / "fw-context-mcp")
-    ok = True
+    from .config.settings import _ensure_project_config
+
+    mcp_bin = shutil.which("fw-context-mcp")
+    if not mcp_bin:
+        for candidate in [
+            Path(sys.executable).parent / "fw-context-mcp",
+            Path.home() / ".fw-context" / ".venv" / "bin" / "fw-context-mcp",
+        ]:
+            if candidate.exists():
+                mcp_bin = str(candidate)
+                break
+    if not mcp_bin:
+        print("[error] fw-context-mcp not found in PATH. "
+              "Run: uv pip install ~/.fw-context/src/", file=sys.stderr)
+        return 1
+    ok = False
 
     # 1. Claude Code — global MCP registration
     claude_bin = shutil.which("claude")
@@ -320,11 +341,13 @@ def cmd_init(args: argparse.Namespace) -> int:
         )
         if result.returncode == 0:
             print(f"[ok] Claude Code: fw-context registered ({mcp_bin})")
+            ok = True
         else:
             # already registered is not a fatal error
             msg = (result.stderr or result.stdout).strip()
             if "already" in msg.lower() or "exists" in msg.lower():
-                print(f"[ok] Claude Code: fw-context already registered")
+                print("[ok] Claude Code: fw-context already registered")
+                ok = True
             else:
                 print(f"[warn] Claude Code: {msg}", file=sys.stderr)
     else:
@@ -335,6 +358,7 @@ def cmd_init(args: argparse.Namespace) -> int:
     claude_md = Path.home() / ".claude" / "CLAUDE.md"
     _update_marked_section(claude_md, _CLAUDE_MD_INSTRUCTIONS, "fw-context")
     print(f"[ok] {claude_md}: fw-context section updated")
+    ok = True
 
     # 3. OpenCode rules
     opencode_rules = Path.home() / ".config" / "opencode" / "rules"
@@ -342,17 +366,24 @@ def cmd_init(args: argparse.Namespace) -> int:
         rule_file = opencode_rules / "fw-context.md"
         rule_file.write_text(_OPENCODE_RULES_INSTRUCTIONS, encoding="utf-8")
         print(f"[ok] {rule_file}: written")
+        ok = True
     else:
         print("[skip] OpenCode rules dir not found — skipping OpenCode setup")
 
+    # 4. Project-level config — create .fw-context/config.toml in cwd
+    cwd = Path.cwd()
+    proj_config = _ensure_project_config(cwd)
+    print(f"[ok] {proj_config}: project config ready — edit source_roots, excludes, etc.")
+
     if ok:
         print("\nSetup complete. Restart your AI assistant to pick up the new MCP server.")
+    else:
+        print("\nNo AI assistants were configured. Try manual setup — see README-MCP.md#integration.", file=sys.stderr)
     return 0 if ok else 1
 
 
 def _update_marked_section(path: Path, content: str, marker: str) -> None:
     """Insert or replace a <!-- marker --> ... <!-- /marker --> block in a markdown file."""
-    import re
     start_tag = f"<!-- {marker} -->"
     end_tag = f"<!-- /{marker} -->"
 
@@ -366,13 +397,23 @@ def _update_marked_section(path: Path, content: str, marker: str) -> None:
         updated = before.rstrip("\n") + "\n\n" + content + "\n" + after.lstrip("\n")
     else:
         # Remove any unmarked section with the same heading (idempotency for manual installs)
-        heading = re.search(r'^## .+', content, re.MULTILINE)
-        if heading:
-            pattern = re.compile(
-                r'\n*' + re.escape(heading.group()) + r'.*?(?=\n## |\Z)',
-                re.DOTALL,
-            )
-            existing = pattern.sub("", existing)
+        heading_match = re.search(r'^## .+', content, re.MULTILINE)
+        if heading_match:
+            heading = heading_match.group()
+            lines = existing.splitlines()
+            result_lines: list[str] = []
+            skip_until_next_h2 = False
+            for line in lines:
+                if not skip_until_next_h2:
+                    if line.strip() == heading:
+                        skip_until_next_h2 = True
+                        continue
+                    result_lines.append(line)
+                else:
+                    if line.startswith("## "):
+                        skip_until_next_h2 = False
+                        result_lines.append(line)
+            existing = "\n".join(result_lines)
         updated = existing.rstrip("\n") + ("\n\n" if existing.strip() else "") + content + "\n"
 
     path.write_text(updated, encoding="utf-8")

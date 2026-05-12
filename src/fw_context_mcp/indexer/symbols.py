@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass, field
+from collections.abc import Iterator
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterator
 
 import clang.cindex as cx
 
@@ -132,7 +132,7 @@ def extract(
     exclude_paths: skip symbols whose file is under any of these paths (applied after source_roots).
     If source_roots is None, emit symbols from the unit's own file only.
     """
-    if source_roots is None:
+    if not source_roots:
         source_roots = [unit.file.parent]
     if exclude_paths is None:
         exclude_paths = []

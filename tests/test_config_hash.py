@@ -1,9 +1,8 @@
 """Tests for fw_context_mcp.indexer.config_hash."""
 
 import json
-from pathlib import Path
 
-from fw_context_mcp.indexer.config_hash import compute, _normalize_entry
+from fw_context_mcp.indexer.config_hash import _normalize_entry, compute
 
 
 class TestNormalizeEntry:

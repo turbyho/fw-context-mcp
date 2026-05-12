@@ -21,6 +21,9 @@ def _normalize_entry(entry: dict) -> dict:
         entry.get("command", "")
     )
 
+    entry_file = entry.get("file", "")
+    source_basename = Path(entry_file).name
+
     # Drop compiler binary (first non-flag token)
     if raw_args and not raw_args[0].startswith("-"):
         raw_args = raw_args[1:]
@@ -47,11 +50,13 @@ def _normalize_entry(entry: dict) -> dict:
             continue
         if token in _TRANSIENT_DROP:
             continue
-        # Drop source file itself (last arg) — keyed by "file" field already
+        # Drop source file argument — keyed by "file" field already
+        if source_basename and Path(token).name == source_basename:
+            continue
         result.append(token)
 
     # Normalize file path: strip leading ./
-    file = entry.get("file", "").lstrip("./")
+    file = entry_file.lstrip("./")
 
     return {"file": file, "args": sorted(result)}
 

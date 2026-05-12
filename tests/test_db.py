@@ -1,7 +1,6 @@
 """Tests for fw_context_mcp.indexer.db."""
 
 import sqlite3
-from pathlib import Path
 
 import pytest
 
@@ -9,8 +8,8 @@ from fw_context_mcp.indexer.db import (
     delete_symbols_for_file,
     get_active_config,
     get_all_projects,
-    get_file_mtimes,
     get_file_mtime_indexed,
+    get_file_mtimes,
     insert_symbols_batch,
     open_db,
     search_symbols,

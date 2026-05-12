@@ -1,6 +1,5 @@
 """Shared fixtures for fw-context-mcp tests."""
 
-import os
 import tempfile
 from pathlib import Path
 
@@ -93,7 +92,7 @@ def temp_db(tmpdir):
 @pytest.fixture
 def populated_db(temp_db):
     """Database with a project and build config pre-inserted."""
-    from fw_context_mcp.indexer.db import transaction, upsert_project, upsert_build_config
+    from fw_context_mcp.indexer.db import transaction, upsert_build_config, upsert_project
 
     with transaction(temp_db):
         upsert_project(temp_db, "proj-001", "test-project", "/tmp/test-project")

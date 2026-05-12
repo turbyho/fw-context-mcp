@@ -3,11 +3,10 @@
 from __future__ import annotations
 
 import json
-import re
 import shlex
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Iterator
 
 # Flags libclang does not support — drop silently
 _DROP_FLAGS = frozenset({
@@ -82,8 +81,12 @@ def _detect_language(file: Path, clang_args: list[str]) -> str:
     return "c"
 
 
-def normalize_args(raw_args: list[str], cwd: Path) -> list[str]:
-    """Expand response files and strip GCC-specific flags incompatible with libclang."""
+def normalize_args(raw_args: list[str], cwd: Path, source_file: str | None = None) -> list[str]:
+    """Expand response files and strip GCC-specific flags incompatible with libclang.
+
+    If source_file is given, any token matching that filename (by basename)
+    is dropped — handles build systems where the source file is not the last arg.
+    """
     # Expand @response_files first
     expanded: list[str] = []
     for token in raw_args:
@@ -91,6 +94,8 @@ def normalize_args(raw_args: list[str], cwd: Path) -> list[str]:
             expanded.extend(_expand_response_file(token, cwd))
         else:
             expanded.append(token)
+
+    source_basename = Path(source_file).name if source_file else None
 
     result: list[str] = []
     skip_next = False
@@ -112,9 +117,12 @@ def normalize_args(raw_args: list[str], cwd: Path) -> list[str]:
                 skip_next = True
             continue
 
-        # Source file as last argument — libclang receives file path separately
-        if i == len(expanded) - 1 and _is_source_file(token):
-            continue
+        # Source file — libclang receives file path separately
+        if _is_source_file(token):
+            if source_basename and Path(token).name == source_basename:
+                continue
+            if source_basename is None and i == len(expanded) - 1:
+                continue
 
         result.append(token)
 
@@ -126,6 +134,13 @@ def normalize_args(raw_args: list[str], cwd: Path) -> list[str]:
     return result
 
 
+def _safe_iterdir(path: Path) -> list[Path]:
+    try:
+        return sorted(path.iterdir()) if path.is_dir() else []
+    except OSError:
+        return []
+
+
 def _gcc_system_includes(compiler: Path) -> list[str]:
     """Return -isystem flags for a GCC ARM cross-compiler's built-in headers."""
     # compiler: .../gcc-arm-none-eabi-X/bin/arm-none-eabi-g++
@@ -133,9 +148,9 @@ def _gcc_system_includes(compiler: Path) -> list[str]:
     toolchain_root = compiler.parent.parent
     lib_gcc = toolchain_root / "lib" / "gcc"
     result: list[str] = []
-    triple_dirs = sorted(lib_gcc.iterdir()) if lib_gcc.is_dir() else []
+    triple_dirs = _safe_iterdir(lib_gcc)
     for triple_dir in triple_dirs:
-        for ver_dir in sorted(triple_dir.iterdir()):
+        for ver_dir in _safe_iterdir(triple_dir):
             inc = ver_dir / "include"
             if inc.is_dir():
                 result += ["-isystem", str(inc)]
@@ -149,14 +164,13 @@ def _gcc_system_includes(compiler: Path) -> list[str]:
             result += ["-isystem", str(libc_inc)]
         # C++ standard library headers (arm-none-eabi/include/c++/<ver>)
         cxx_inc_base = toolchain_root / triple / "include" / "c++"
-        if cxx_inc_base.is_dir():
-            for ver_dir in sorted(cxx_inc_base.iterdir()):
-                if ver_dir.is_dir():
-                    result += ["-isystem", str(ver_dir)]
-                    # Per-target subdir (e.g. arm-none-eabi, thumb, ...)
-                    for sub in sorted(ver_dir.iterdir()):
-                        if sub.is_dir():
-                            result += ["-isystem", str(sub)]
+        for ver_dir in _safe_iterdir(cxx_inc_base):
+            if ver_dir.is_dir():
+                result += ["-isystem", str(ver_dir)]
+                # Per-target subdir (e.g. arm-none-eabi, thumb, ...)
+                for sub in _safe_iterdir(ver_dir):
+                    if sub.is_dir():
+                        result += ["-isystem", str(sub)]
     return result
 
 
@@ -180,7 +194,7 @@ def parse(path: Path) -> Iterator[CompilationUnit]:
             compiler = Path(raw_args[0])
             raw_args = raw_args[1:]
 
-        clang_args = normalize_args(raw_args, cwd)
+        clang_args = normalize_args(raw_args, cwd, str(file))
 
         # For ARM GCC cross-compilers inject system include paths so libclang
         # finds stdint.h and friends when --target=arm-none-eabi is active
