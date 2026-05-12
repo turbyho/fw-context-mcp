@@ -162,7 +162,11 @@ def run(
                     sym_file = s.file
                     if sym_file not in file_id_cache:
                         lang = "cpp" if Path(sym_file).suffix.lower() in {".cpp", ".cc", ".cxx", ".c++"} else "c"
-                        file_id_cache[sym_file] = upsert_file(conn, config_hash, sym_file, lang)
+                        try:
+                            sym_mtime = Path(sym_file).stat().st_mtime
+                        except OSError:
+                            sym_mtime = 0.0
+                        file_id_cache[sym_file] = upsert_file(conn, config_hash, sym_file, lang, mtime=sym_mtime)
                     rows.append((
                         config_hash,
                         file_id_cache[sym_file],
