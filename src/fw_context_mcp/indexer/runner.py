@@ -10,6 +10,8 @@ from pathlib import Path
 from .compile_commands import parse as parse_compile_commands
 from .config_hash import compute as compute_config_hash
 from .db import (
+    delete_symbols_for_file,
+    get_file_mtimes,
     insert_symbols_batch,
     open_db,
     transaction,
@@ -59,66 +61,77 @@ def run(
         upsert_project(conn, project_id, name, str(project_root))
         upsert_build_config(conn, config_hash, project_id, str(compile_commands))
 
-    # Check if this config was already fully indexed
-    existing = conn.execute(
-        "SELECT COUNT(*) FROM symbols WHERE config_hash=?", (config_hash,)
-    ).fetchone()[0]
-    if existing:
-        log.info("config_hash %s already indexed (%d symbols), skipping", config_hash[:12], existing)
-        return config_hash
-
     from .compile_commands import _SOURCE_EXTS  # reuse C/C++ extension set
 
     units = list(parse_compile_commands(compile_commands))
-    # Drop assembler and other non-C/C++ TUs libclang cannot parse
     units = [u for u in units if u.file.suffix.lower() in _SOURCE_EXTS]
     log.info("TUs to index: %d", len(units))
 
+    # Load existing file records for incremental update
+    existing_files = get_file_mtimes(conn, config_hash)
+
     total_syms = 0
     skipped = 0
+    unchanged = 0
+    updated = 0
     t0 = time.monotonic()
 
     for i, unit in enumerate(units):
         file_path = str(unit.file)
+        try:
+            current_mtime = unit.file.stat().st_mtime if unit.file.exists() else 0.0
+        except OSError:
+            current_mtime = 0.0
+
+        # Skip if file hasn't changed since last index
+        if file_path in existing_files:
+            _, stored_mtime = existing_files[file_path]
+            if abs(current_mtime - stored_mtime) < 0.001:
+                unchanged += 1
+                continue
+
         try:
             syms = list(extract_symbols(unit, source_roots=source_roots))
         except Exception as exc:
             log.warning("skip TU %s: %s", unit.file.name, exc)
             skipped += 1
             continue
-        with transaction(conn):
-            file_id = upsert_file(conn, config_hash, file_path, unit.language)
-            if not syms:
-                continue
-            rows = [
-                (
-                    config_hash,
-                    file_id,
-                    s.usr,
-                    s.name,
-                    s.qualified_name,
-                    s.kind,
-                    s.line,
-                    s.column,
-                    int(s.is_definition),
-                    s.signature,
-                    s.docstring,
-                )
-                for s in syms
-            ]
-            inserted = insert_symbols_batch(conn, rows)
-            total_syms += inserted
 
-        if (i + 1) % 50 == 0:
+        with transaction(conn):
+            if file_path in existing_files:
+                file_id, _ = existing_files[file_path]
+                delete_symbols_for_file(conn, file_id)
+            file_id = upsert_file(conn, config_hash, file_path, unit.language, mtime=current_mtime)
+            if syms:
+                rows = [
+                    (
+                        config_hash,
+                        file_id,
+                        s.usr,
+                        s.name,
+                        s.qualified_name,
+                        s.kind,
+                        s.line,
+                        s.column,
+                        int(s.is_definition),
+                        s.signature,
+                        s.docstring,
+                    )
+                    for s in syms
+                ]
+                total_syms += insert_symbols_batch(conn, rows)
+
+        updated += 1
+        if updated % 50 == 0:
             elapsed = time.monotonic() - t0
             log.info(
-                "  %d/%d TUs, %d symbols, %.1fs elapsed",
+                "  %d/%d TUs processed, %d symbols, %.1fs elapsed",
                 i + 1, len(units), total_syms, elapsed,
             )
 
     elapsed = time.monotonic() - t0
     log.info(
-        "Done: %d TUs (%d skipped), %d symbols in %.1fs (config_hash=%s)",
-        len(units), skipped, total_syms, elapsed, config_hash[:12],
+        "Done: %d updated, %d unchanged, %d skipped — %d symbols in %.1fs (config_hash=%s)",
+        updated, unchanged, skipped, total_syms, elapsed, config_hash[:12],
     )
     return config_hash

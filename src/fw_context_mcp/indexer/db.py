@@ -31,6 +31,7 @@ CREATE TABLE IF NOT EXISTS files (
     path         TEXT NOT NULL,
     language     TEXT NOT NULL,     -- 'c' | 'cpp'
     generated    INTEGER NOT NULL DEFAULT 0,
+    mtime        REAL    NOT NULL DEFAULT 0,
     UNIQUE(config_hash, path)
 );
 
@@ -89,7 +90,12 @@ def open_db(path: Path) -> sqlite3.Connection:
     conn = sqlite3.connect(str(path))
     conn.row_factory = sqlite3.Row
     conn.executescript(_SCHEMA)
-    conn.commit()
+    # Schema migration: add mtime column to files if missing
+    try:
+        conn.execute("ALTER TABLE files ADD COLUMN mtime REAL NOT NULL DEFAULT 0")
+        conn.commit()
+    except sqlite3.OperationalError:
+        pass
     return conn
 
 
@@ -129,16 +135,32 @@ def upsert_file(
     path: str,
     language: str,
     generated: bool = False,
+    mtime: float = 0.0,
 ) -> int:
     cur = conn.execute(
-        """INSERT INTO files(config_hash, path, language, generated)
-           VALUES (?,?,?,?)
-           ON CONFLICT(config_hash, path) DO UPDATE SET language=excluded.language
+        """INSERT INTO files(config_hash, path, language, generated, mtime)
+           VALUES (?,?,?,?,?)
+           ON CONFLICT(config_hash, path) DO UPDATE SET
+               language=excluded.language,
+               mtime=excluded.mtime
            RETURNING id""",
-        (config_hash, path, language, int(generated)),
+        (config_hash, path, language, int(generated), mtime),
     )
     row = cur.fetchone()
     return row[0]
+
+
+def get_file_mtimes(conn: sqlite3.Connection, config_hash: str) -> dict[str, tuple[int, float]]:
+    """Return {path: (file_id, mtime)} for all files under config_hash."""
+    rows = conn.execute(
+        "SELECT id, path, mtime FROM files WHERE config_hash=?", (config_hash,)
+    ).fetchall()
+    return {r["path"]: (r["id"], r["mtime"]) for r in rows}
+
+
+def delete_symbols_for_file(conn: sqlite3.Connection, file_id: int) -> None:
+    """Delete all symbols for a file (FTS ad trigger cleans up FTS index)."""
+    conn.execute("DELETE FROM symbols WHERE file_id=?", (file_id,))
 
 
 def insert_symbols_batch(
