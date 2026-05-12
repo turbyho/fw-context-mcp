@@ -752,17 +752,20 @@ async def smart_search(
 ) -> list[dict]:
     """Natural-language search: Ollama generates FTS5 keywords, then searches the index.
 
-    Translates a natural-language description into 2–4 FTS5 search terms by
-    asking a local Ollama model, then runs ``search_code`` for each generated
-    term and merges unique results.
+    Two-phase approach:
+    1) Rough word-split search to gather real symbol names from the index.
+    2) Ollama sees those symbols + the original query and generates 2-4 refined
+       FTS5 terms that match the project's naming conventions.
+    3) Final search with refined terms, merged and deduplicated.
 
     **When to prefer over search_code:** When you don't know the exact keywords
     and want to describe what you're looking for ("how does the modem connect?",
     "handle BLE pairing failure").
 
     **Fallback:** When Ollama is unavailable or the model is not installed,
-    falls back to direct FTS5 search with the original query text. Results
-    include ``_generated_queries`` so you can see which terms were used.
+    falls back to direct FTS5 search with word-split terms from the query.
+    Results include ``_generated_queries`` and ``_rough_queries`` so you can
+    see which terms were used in each phase.
 
     Args:
         query: Natural language description of what you're looking for.
@@ -771,8 +774,8 @@ async def smart_search(
         limit: Maximum number of results (default 20, max 100).
 
     Returns:
-        list of dicts. The first entry is ``_generated_queries`` with the list
-        of search terms used. Subsequent entries are symbol results in the same
+        list of dicts. The first entries are ``_generated_queries`` and
+        ``_rough_queries``. Subsequent entries are symbol results in the same
         format as ``search_code``. May include a warning when Ollama is
         unavailable or the index is stale.
     """
@@ -791,35 +794,133 @@ async def smart_search(
         config_hash = cfg_data["config_hash"]
         limit = min(limit, 100)
 
+        def _fmt(r):
+            return {
+                "name": r["name"],
+                "qualified_name": r["qualified_name"],
+                "kind": r["kind"],
+                "file": r["file_path"],
+                "line": r["line"],
+                "is_definition": bool(r["is_definition"]),
+                "signature": r["signature"],
+                "docstring": r["docstring"],
+            }
+
+        # --- Phase 1: rough search to gather real symbol names for Ollama ---
+        STOP_WORDS = frozenset({
+            "a", "an", "the", "is", "are", "was", "were", "be", "been", "being",
+            "have", "has", "had", "do", "does", "did", "will", "would", "could",
+            "should", "may", "might", "shall", "can", "to", "of", "in", "for",
+            "on", "with", "at", "by", "from", "and", "or", "not", "but", "if",
+            "then", "else", "when", "up", "down", "out", "off", "over", "under",
+            "again", "how", "what", "where", "which", "who", "whom", "why",
+            "handle", "handler", "using", "that", "this", "it", "its",
+        })
+        raw_words = re.findall(r"[a-zA-Z0-9_]+", query.lower())
+        content_words = [w for w in raw_words if w not in STOP_WORDS and len(w) > 1]
+
+        rough_terms = content_words if content_words else [query]
+        rough_samples: list[dict] = []
+        rough_seen_names: set[str] = set()
+
+        def _is_noise(name: str) -> bool:
+            """Filter out names with special chars that carry no naming convention signal."""
+            if set(name) & {"(", ")", "~", "=", "<", ">", "[", "]"}:
+                return True
+            return False
+
+        # Phase 1a: phrase searches — combine first word with each other
+        # word to find symbols matching multiple query terms (more relevant).
+        if len(content_words) >= 2:
+            for w in content_words[1:]:
+                phrase = f'"{content_words[0]} {w}"'
+                try:
+                    rows = search_symbols(conn, phrase, config_hash, limit=5)
+                except Exception:
+                    continue
+                for r in rows:
+                    name = r["name"]
+                    if _is_noise(name) or name in rough_seen_names:
+                        continue
+                    rough_seen_names.add(name)
+                    rough_samples.append(r)
+                if len(rough_samples) >= 20:
+                    break
+
+        # Phase 1b: individual word searches to fill remaining slots.
+        if len(rough_samples) < 20:
+            for word in rough_terms:
+                try:
+                    rows = search_symbols(conn, word, config_hash, limit=8)
+                except Exception:
+                    continue
+                for r in rows:
+                    name = r["name"]
+                    if _is_noise(name) or name in rough_seen_names:
+                        continue
+                    rough_seen_names.add(name)
+                    rough_samples.append(r)
+                if len(rough_samples) >= 20:
+                    break
+
+        # --- Phase 2: Ollama generates refined terms using real symbol names ---
         keyword_queries: list[str] = []
         ollama_warning: dict | None = None
 
-        prompt = (
-            "You are a C/C++ code search assistant for an embedded firmware project.\n"
-            "Generate 2-4 FTS5 keyword search terms based on the description below.\n"
-            "Return a JSON array of snake_case strings, e.g.: [\"modem_init\", \"conn_open\"]\n"
-            "Rules:\n"
-            "- Output MUST be a valid JSON array and nothing else\n"
-            "- Use snake_case identifiers (e.g. modem_init, conn_open)\n"
-            "- You may use a trailing wildcard suffix: \"modem*\" matches modem_init, modem_connect, etc.\n"
-            "- No asterisks anywhere else — FTS5 only supports trailing wildcards\n"
-            "- Prefer short stems over full function names\n\n"
-            f"Description: {query}\n"
-        )
+        if rough_samples:
+            context_lines = [
+                f"  {r['name']} ({r['kind']})" for r in rough_samples[:15]
+            ]
+            context_str = "\n".join(context_lines)
+
+            prompt = (
+                "You are a C/C++ code search assistant for an embedded firmware project.\n"
+                "Generate 3-5 FTS5 keyword search terms based on the description below.\n"
+                "Study the real symbol names to learn the project's naming conventions\n"
+                "(prefixes, word order, abbreviations). Match them.\n\n"
+                f"Real symbols from this project:\n{context_str}\n\n"
+                "Return a JSON array of snake_case strings, e.g.: [\"modem_init\", \"conn_open\"]\n"
+                "Rules:\n"
+                "- Output MUST be a valid JSON array and nothing else\n"
+                "- Use snake_case identifiers matching the project's naming patterns\n"
+                "- STRONGLY prefer short stems with a trailing wildcard over exact\n"
+                "  full names — stems find more symbols (\"ble_conn*\" > \"ble_connection_handler\")\n"
+                "- You may use a trailing wildcard: \"ble_gap*\" matches ble_gap_init, etc.\n"
+                "- No asterisks anywhere else — FTS5 only supports trailing wildcards\n"
+                "- Cover different naming patterns found in the context — e.g. if\n"
+                "  the project has \"ble_*\", \"on_*\", and \"connection_*\" prefixes,\n"
+                "  generate one stem per pattern\n\n"
+                f"Description: {query}\n"
+            )
+        else:
+            prompt = (
+                "You are a C/C++ code search assistant for an embedded firmware project.\n"
+                "Generate 3-5 FTS5 keyword search terms based on the description below.\n"
+                "Return a JSON array of snake_case strings, e.g.: [\"modem_init\", \"conn_open\"]\n"
+                "Rules:\n"
+                "- Output MUST be a valid JSON array and nothing else\n"
+                "- Use snake_case identifiers (e.g. modem_init, conn_open)\n"
+                "- STRONGLY prefer short stems with a trailing wildcard\n"
+                "- You may use a trailing wildcard suffix: \"modem*\" matches modem_init, modem_connect, etc.\n"
+                "- No asterisks anywhere else — FTS5 only supports trailing wildcards\n\n"
+                f"Description: {query}\n"
+            )
+
         if cfg.llm.enabled:
             try:
                 raw = await call_ollama_async(prompt, cfg.llm)
                 keyword_queries = _parse_search_terms(raw)
-                keyword_queries = keyword_queries[:4]
+                keyword_queries = keyword_queries[:5]
             except OllamaModelNotFoundError as e:
                 ollama_warning = {"warning": str(e), "hint": "Run: check_ollama()"}
-                keyword_queries = [query]
+                keyword_queries = rough_terms
             except OllamaError as e:
-                ollama_warning = {"warning": f"Ollama unavailable, using direct search: {e}"}
-                keyword_queries = [query]
+                ollama_warning = {"warning": f"Ollama unavailable: {e}"}
+                keyword_queries = rough_terms
         else:
-            keyword_queries = [query]
+            keyword_queries = rough_terms
 
+        # --- Phase 3: final search with refined (or fallback) terms ---
         for kq in keyword_queries:
             try:
                 rows = search_symbols(conn, kq, config_hash, limit=limit)
@@ -828,20 +929,13 @@ async def smart_search(
             for r in rows:
                 key = (r["name"], r["file_path"], r["line"])
                 if key not in seen:
-                    seen[key] = {
-                        "name": r["name"],
-                        "qualified_name": r["qualified_name"],
-                        "kind": r["kind"],
-                        "file": r["file_path"],
-                        "line": r["line"],
-                        "is_definition": bool(r["is_definition"]),
-                        "signature": r["signature"],
-                        "docstring": r["docstring"],
-                    }
+                    seen[key] = _fmt(r)
 
     results: list[dict] = []
 
     results.append({"_generated_queries": keyword_queries})
+    if rough_terms:
+        results.append({"_rough_queries": rough_terms})
     if ollama_warning:
         results.append(ollama_warning)
     if not ollama_warning and cfg_data and _is_stale(cfg_data, cfg_data["compile_commands_path"]):
