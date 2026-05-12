@@ -23,7 +23,7 @@ db_dir = "~/.fw-context/index"
 [llm]
 # enabled = true   # set to false to disable Ollama and return raw prompts for the agent
 ollama_url = "http://localhost:11434"
-model = "codestral:latest"
+model = "qwen2.5-coder:14b"
 num_ctx = 8192
 # debug_log = "~/.fw-context/llm-debug.jsonl"   # write LLM prompts/responses to JSONL
 """
@@ -54,7 +54,7 @@ exclude_paths = ["build", "BUILD"]
 class LLMConfig:
     enabled: bool = True
     ollama_url: str = "http://localhost:11434"
-    model: str = "codestral:latest"
+    model: str = "qwen2.5-coder:14b"
     num_ctx: int = 8192
     debug_log: Path | None = None
 
