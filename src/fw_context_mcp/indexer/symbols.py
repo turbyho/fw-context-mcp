@@ -149,7 +149,8 @@ def extract(unit: CompilationUnit, source_roots: list[Path] | None = None) -> It
         p = _resolve(path)
         return any(p == r or p.is_relative_to(r) for r in source_roots)
 
-    seen_usrs: set[str] = set()
+    # Maps USR → is_definition; allows promotion from declaration to definition
+    seen_usrs: dict[str, bool] = {}
 
     for cursor in tu.cursor.walk_preorder():
         if cursor.kind not in _SYMBOL_KINDS:
@@ -167,9 +168,18 @@ def extract(unit: CompilationUnit, source_roots: list[Path] | None = None) -> It
             continue
 
         usr = cursor.get_usr()
-        if not usr or usr in seen_usrs:
+        if not usr:
             continue
-        seen_usrs.add(usr)
+
+        prev = seen_usrs.get(usr)
+        if prev is not None:
+            if is_def and not prev:
+                # Promote: declaration seen before, now we have the definition
+                seen_usrs[usr] = True
+            else:
+                continue
+        else:
+            seen_usrs[usr] = is_def
 
         yield Symbol(
             name=cursor.spelling,

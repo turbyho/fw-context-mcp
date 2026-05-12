@@ -74,6 +74,13 @@ CREATE TRIGGER IF NOT EXISTS symbols_ad AFTER DELETE ON symbols BEGIN
     INSERT INTO symbols_fts(symbols_fts, rowid, name, qualified_name, signature, docstring)
     VALUES ('delete', old.id, old.name, old.qualified_name, old.signature, old.docstring);
 END;
+
+CREATE TRIGGER IF NOT EXISTS symbols_au AFTER UPDATE ON symbols BEGIN
+    INSERT INTO symbols_fts(symbols_fts, rowid, name, qualified_name, signature, docstring)
+    VALUES ('delete', old.id, old.name, old.qualified_name, old.signature, old.docstring);
+    INSERT INTO symbols_fts(rowid, name, qualified_name, signature, docstring)
+    VALUES (new.id, new.name, new.qualified_name, new.signature, new.docstring);
+END;
 """
 
 
@@ -138,12 +145,23 @@ def insert_symbols_batch(
     conn: sqlite3.Connection,
     rows: list[tuple],
 ) -> int:
-    """Insert symbol rows; skip on USR conflict. Returns count of newly inserted rows."""
+    """Insert symbol rows, promoting declaration→definition on USR conflict.
+
+    Returns count of rows inserted or upgraded to definition.
+    """
     cur = conn.executemany(
-        """INSERT OR IGNORE INTO symbols
+        """INSERT INTO symbols
            (config_hash, file_id, usr, name, qualified_name, kind,
             line, col, is_definition, signature, docstring)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+           VALUES (?,?,?,?,?,?,?,?,?,?,?)
+           ON CONFLICT(config_hash, usr) DO UPDATE SET
+               file_id       = excluded.file_id,
+               line          = excluded.line,
+               col           = excluded.col,
+               is_definition = 1,
+               signature     = excluded.signature,
+               docstring     = excluded.docstring
+           WHERE excluded.is_definition = 1 AND symbols.is_definition = 0""",
         rows,
     )
     return cur.rowcount
