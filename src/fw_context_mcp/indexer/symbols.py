@@ -140,10 +140,7 @@ def extract(
     tu = _INDEX.parse(
         str(unit.file),
         args=unit.clang_args,
-        options=(
-            cx.TranslationUnit.PARSE_SKIP_FUNCTION_BODIES
-            | cx.TranslationUnit.PARSE_DETAILED_PROCESSING_RECORD
-        ),
+        options=cx.TranslationUnit.PARSE_DETAILED_PROCESSING_RECORD,
     )
 
     cwd = unit.directory
