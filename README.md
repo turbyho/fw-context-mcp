@@ -278,6 +278,13 @@ model = "codestral:latest"
 num_ctx = 8192
 ```
 
+Change `ollama_url` if Ollama runs on a different machine:
+
+```toml
+[llm]
+ollama_url = "http://192.168.1.50:11434"   # remote Ollama instance
+```
+
 ### Per-project config (`.fw-context/config.toml`)
 
 Place in your project root to override defaults:
@@ -353,6 +360,7 @@ for source code context — keep 8192 or higher in your config:
 
 ```toml
 [llm]
+ollama_url = "http://localhost:11434"      # default, change for remote Ollama
 model = "nemotron-3-nano:cloud"
 num_ctx = 8192
 ```
