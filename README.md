@@ -301,13 +301,18 @@ generated code, third-party sources, etc.
 
 ## Choosing an Ollama model
 
-`explain_symbol` and `smart_search` use a local Ollama model. The default is
-`codestral:latest`, but you can pick a model that fits your hardware.
+`explain_symbol` and `smart_search` use a local Ollama model. The tasks are
+lightweight — generating FTS5 search terms and writing 2–4 sentence symbol
+explanations. An 8B code-optimized model is plenty; you don't need a 24B+ model
+for this.
 
 All models are accessed through the same Ollama API — the config only changes
 the model name. Cloud models require `ollama signin` first.
 
 ### Local models (with GPU)
+
+For subagent tasks the priority is low latency, not maximum quality. Start with
+the smallest model that fits your VRAM and upgrade only if the results are poor.
 
 | VRAM | Model | Ollama tag | Notes |
 |------|-------|-----------|-------|
@@ -321,13 +326,25 @@ the model name. Cloud models require `ollama signin` first.
 
 Ollama v0.12+ supports cloud-hosted models. They run on ollama.com
 infrastructure but are accessed through your local Ollama daemon.
+
+Browse the full catalog at [ollama.com/search?c=cloud](https://ollama.com/search?c=cloud).
 Requires: `ollama signin`.
+
+For fw-context, start with the smallest model — generating search terms and
+short explanations needs little reasoning depth. Sorted smallest → largest:
 
 | Model | Ollama tag | Size | Notes |
 |-------|-----------|------|-------|
-| **Devstral Small 2** | `devstral-small-2:cloud` | 24B | **Recommended** — code exploration and tool use |
-| DeepSeek V4 Flash | `deepseek-v4-flash:cloud` | MoE (fast) | Good price/performance |
-| RnJ-1 | `rnj-1:cloud` | 8B | Smallest, code/STEM optimized |
+| **Nemotron-3 Nano** | `nemotron-3-nano:cloud` | 4B | **Recommended smallest** — agentic, tools-enabled, efficient |
+| **RnJ-1** | `rnj-1:cloud` | 8B | Code/STEM optimized, great for search + explanations |
+| Qwen3-Coder-Next | `qwen3-coder-next:cloud` | — | Coding-focused, agentic workflows |
+| DeepSeek V4 Flash | `deepseek-v4-flash:cloud` | MoE (13B active) | Fast, good price/performance |
+| Qwen3.5 | `qwen3.5:cloud` | 9B tag available | General-purpose, strong tool use |
+| Devstral Small 2 | `devstral-small-2:cloud` | 24B | Code exploration and multi-file editing |
+
+> **Tip:** Use `ollama pull <tag>` to download, then test with
+> `ollama run <tag> "explain: void uart_init(int baudrate)"` to gauge
+> latency and quality before switching.
 
 ### Context window
 
@@ -336,13 +353,18 @@ for source code context — keep 8192 or higher in your config:
 
 ```toml
 [llm]
-model = "qwen2.5-coder:14b-q4_K_M"
+model = "nemotron-3-nano:cloud"
 num_ctx = 8192
 ```
 
-For subagent tasks (search, rerank, compress), the model doesn't need to be
-the largest — low-latency tool loop is the priority. **With GPU, use
-`qwen2.5-coder:14b-q4_K_M`. Without GPU, use `devstral-small-2:cloud`.**
+### Recommendation
+
+| Setup | Model | Why |
+|-------|-------|-----|
+| GPU, 8–12 GB VRAM | `qwen2.5-coder:14b-q4_K_M` | Best quality for local subagent tasks |
+| No GPU — smallest | `nemotron-3-nano:cloud` | 4B, agentic, fast — plenty for search terms + short explanations |
+| No GPU — code focused | `rnj-1:cloud` | 8B, code/STEM optimized |
+| Need deeper code analysis | `devstral-small-2:cloud` | 24B, better for complex reasoning about code |
 
 ## AI assistant setup
 
