@@ -4,13 +4,28 @@ from __future__ import annotations
 
 import logging
 import os
-from datetime import datetime, timezone
+import re
+import time
+from datetime import UTC, datetime
 from pathlib import Path
 
 from mcp.server.fastmcp import FastMCP
 
-from ..config import derive_project_id, load as load_config
-from ..indexer.db import get_active_config, get_all_projects, get_file_mtime_indexed, open_db, search_symbols
+from ..config import Config, derive_project_id
+from ..config import load as load_config
+from ..indexer.compile_commands import parse as parse_cc
+from ..indexer.db import (
+    delete_symbols_for_file,
+    get_active_config,
+    get_all_projects,
+    get_file_mtime_indexed,
+    get_file_mtimes,
+    insert_symbols_batch,
+    open_db,
+    search_symbols,
+    transaction,
+    upsert_file,
+)
 from ..llm.ollama import OllamaError, OllamaModelNotFoundError, call_ollama, check_setup
 
 log = logging.getLogger(__name__)
@@ -24,6 +39,18 @@ def _db_path(project_root: Path) -> Path:
     cfg = load_config(project_root=project_root)
     project_id = derive_project_id(project_root)
     return cfg.index.db_dir / project_id / "index.db"
+
+
+def _resolve_context(project_root: str | None) -> tuple[Path, Config, str, Path]:
+    """Return (db_path, config, project_id, root) in one config load.
+
+    Use when a tool needs both the config (LLM settings, source roots) and
+    the DB path — avoids loading config twice.
+    """
+    root = _resolve_project_root(project_root)
+    cfg = load_config(project_root=root)
+    project_id = derive_project_id(root)
+    return cfg.index.db_dir / project_id / "index.db", cfg, project_id, root
 
 
 def _resolve_project_root(project_root: str | None) -> Path:
@@ -43,7 +70,7 @@ def _is_stale(cfg, compile_commands_path: str) -> bool:
     """Return True if compile_commands.json is newer than the indexed timestamp."""
     try:
         cc_mtime = os.path.getmtime(compile_commands_path)
-        indexed_at = datetime.fromisoformat(cfg["created_at"]).replace(tzinfo=timezone.utc)
+        indexed_at = datetime.fromisoformat(cfg["created_at"]).replace(tzinfo=UTC)
         return cc_mtime > indexed_at.timestamp() + 1
     except Exception:
         return False
@@ -106,31 +133,31 @@ def get_active_build(project_root: str | None = None) -> dict:
     if not db_path.exists():
         return {"error": f"No index found for {root}. Run 'fw-context index' first."}
 
-    conn = open_db(db_path)
-    project_id = derive_project_id(root)
-    cfg = get_active_config(conn, project_id)
-    if not cfg:
-        return {"error": f"No build config indexed for project at {root}."}
+    with open_db(db_path) as conn:
+        project_id = derive_project_id(root)
+        cfg = get_active_config(conn, project_id)
+        if not cfg:
+            return {"error": f"No build config indexed for project at {root}."}
 
-    config_hash = cfg["config_hash"]
-    sym_count = conn.execute(
-        "SELECT COUNT(*) FROM symbols WHERE config_hash=?", (config_hash,)
-    ).fetchone()[0]
-    file_count = conn.execute(
-        "SELECT COUNT(*) FROM files WHERE config_hash=?", (config_hash,)
-    ).fetchone()[0]
+        config_hash = cfg["config_hash"]
+        sym_count = conn.execute(
+            "SELECT COUNT(*) FROM symbols WHERE config_hash=?", (config_hash,)
+        ).fetchone()[0]
+        file_count = conn.execute(
+            "SELECT COUNT(*) FROM files WHERE config_hash=?", (config_hash,)
+        ).fetchone()[0]
 
-    return {
-        "config_hash": config_hash,
-        "project_id": project_id,
-        "project_root": str(root),
-        "build_system": _detect_build_system(root),
-        "compile_commands": cfg["compile_commands_path"],
-        "indexed_at": cfg["created_at"],
-        "symbol_count": sym_count,
-        "file_count": file_count,
-        "stale": _is_stale(cfg, cfg["compile_commands_path"]),
-    }
+        return {
+            "config_hash": config_hash,
+            "project_id": project_id,
+            "project_root": str(root),
+            "build_system": _detect_build_system(root),
+            "compile_commands": cfg["compile_commands_path"],
+            "indexed_at": cfg["created_at"],
+            "symbol_count": sym_count,
+            "file_count": file_count,
+            "stale": _is_stale(cfg, cfg["compile_commands_path"]),
+        }
 
 
 @mcp.tool()
@@ -174,40 +201,40 @@ def search_code(
     if not db_path.exists():
         return [{"error": f"No index found for {root}. Run 'fw-context index' first."}]
 
-    conn = open_db(db_path)
-    project_id = derive_project_id(root)
-    cfg = get_active_config(conn, project_id)
-    if not cfg:
-        return [{"error": "No build config indexed."}]
+    with open_db(db_path) as conn:
+        project_id = derive_project_id(root)
+        cfg = get_active_config(conn, project_id)
+        if not cfg:
+            return [{"error": "No build config indexed."}]
 
-    limit = min(limit, 100)
-    rows = search_symbols(conn, query, cfg["config_hash"], limit=limit)
+        limit = min(limit, 100)
+        rows = search_symbols(conn, query, cfg["config_hash"], limit=limit)
 
-    if kind:
-        rows = [r for r in rows if r["kind"] == kind]
+        if kind:
+            rows = [r for r in rows if r["kind"] == kind]
 
-    results: list[dict] = []
-    if _is_stale(cfg, cfg["compile_commands_path"]):
-        results.append({"warning": "Index may be stale — compile_commands.json changed since last index. Run 'fw-context index' to update."})
+        results: list[dict] = []
+        if _is_stale(cfg, cfg["compile_commands_path"]):
+            results.append({"warning": "Index may be stale — compile_commands.json changed since last index. Run 'fw-context index' to update."})
 
-    result_rows = [
-        {
-            "name": r["name"],
-            "qualified_name": r["qualified_name"],
-            "kind": r["kind"],
-            "file": r["file_path"],
-            "line": r["line"],
-            "is_definition": bool(r["is_definition"]),
-            "signature": r["signature"],
-            "docstring": r["docstring"],
-        }
-        for r in rows
-    ]
-    stale_f = _stale_files(conn, cfg["config_hash"], [r["file_path"] for r in rows])
-    if stale_f:
-        results.append({"warning": f"File(s) modified since last index — results may be outdated. Run 'fw-context index' or reindex_file(): {stale_f}"})
-    results += result_rows
-    return results
+        result_rows = [
+            {
+                "name": r["name"],
+                "qualified_name": r["qualified_name"],
+                "kind": r["kind"],
+                "file": r["file_path"],
+                "line": r["line"],
+                "is_definition": bool(r["is_definition"]),
+                "signature": r["signature"],
+                "docstring": r["docstring"],
+            }
+            for r in rows
+        ]
+        stale_f = _stale_files(conn, cfg["config_hash"], [r["file_path"] for r in rows])
+        if stale_f:
+            results.append({"warning": f"File(s) modified since last index — results may be outdated. Run 'fw-context index' or reindex_file(): {stale_f}"})
+        results += result_rows
+        return results
 
 
 @mcp.tool()
@@ -244,53 +271,53 @@ def lookup_symbol(
     if not db_path.exists():
         return [{"error": f"No index found for {root}."}]
 
-    conn = open_db(db_path)
-    project_id = derive_project_id(root)
-    cfg = get_active_config(conn, project_id)
-    if not cfg:
-        return [{"error": "No build config indexed."}]
+    with open_db(db_path) as conn:
+        project_id = derive_project_id(root)
+        cfg = get_active_config(conn, project_id)
+        if not cfg:
+            return [{"error": "No build config indexed."}]
 
-    config_hash = cfg["config_hash"]
-    if exact:
-        rows = conn.execute(
-            """SELECT s.*, f.path as file_path FROM symbols s
-               JOIN files f ON f.id = s.file_id
-               WHERE s.config_hash=? AND s.name=?
-               ORDER BY s.is_definition DESC, s.line""",
-            (config_hash, name),
-        ).fetchall()
-    else:
-        rows = conn.execute(
-            """SELECT s.*, f.path as file_path FROM symbols s
-               JOIN files f ON f.id = s.file_id
-               WHERE s.config_hash=? AND s.name LIKE ?
-               ORDER BY s.is_definition DESC, s.line
-               LIMIT 50""",
-            (config_hash, f"{name}%"),
-        ).fetchall()
+        config_hash = cfg["config_hash"]
+        if exact:
+            rows = conn.execute(
+                """SELECT s.*, f.path as file_path FROM symbols s
+                   JOIN files f ON f.id = s.file_id
+                   WHERE s.config_hash=? AND s.name=?
+                   ORDER BY s.is_definition DESC, s.line""",
+                (config_hash, name),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                """SELECT s.*, f.path as file_path FROM symbols s
+                   JOIN files f ON f.id = s.file_id
+                   WHERE s.config_hash=? AND s.name LIKE ?
+                   ORDER BY s.is_definition DESC, s.line
+                   LIMIT 50""",
+                (config_hash, f"{name}%"),
+            ).fetchall()
 
-    results: list[dict] = []
-    if _is_stale(cfg, cfg["compile_commands_path"]):
-        results.append({"warning": "Index may be stale — compile_commands.json changed since last index. Run 'fw-context index' to update."})
+        results: list[dict] = []
+        if _is_stale(cfg, cfg["compile_commands_path"]):
+            results.append({"warning": "Index may be stale — compile_commands.json changed since last index. Run 'fw-context index' to update."})
 
-    result_rows = [
-        {
-            "name": r["name"],
-            "qualified_name": r["qualified_name"],
-            "kind": r["kind"],
-            "file": r["file_path"],
-            "line": r["line"],
-            "is_definition": bool(r["is_definition"]),
-            "signature": r["signature"],
-            "docstring": r["docstring"],
-        }
-        for r in rows
-    ]
-    stale_f = _stale_files(conn, cfg["config_hash"], [r["file_path"] for r in rows])
-    if stale_f:
-        results.append({"warning": f"File(s) modified since last index — results may be outdated. Run 'fw-context index' or reindex_file(): {stale_f}"})
-    results += result_rows
-    return results
+        result_rows = [
+            {
+                "name": r["name"],
+                "qualified_name": r["qualified_name"],
+                "kind": r["kind"],
+                "file": r["file_path"],
+                "line": r["line"],
+                "is_definition": bool(r["is_definition"]),
+                "signature": r["signature"],
+                "docstring": r["docstring"],
+            }
+            for r in rows
+        ]
+        stale_f = _stale_files(conn, cfg["config_hash"], [r["file_path"] for r in rows])
+        if stale_f:
+            results.append({"warning": f"File(s) modified since last index — results may be outdated. Run 'fw-context index' or reindex_file(): {stale_f}"})
+        results += result_rows
+        return results
 
 
 @mcp.tool()
@@ -318,8 +345,8 @@ def list_projects(project_root: str | None = None) -> list[dict]:
     results: list[dict] = []
     for db_path in sorted(db_files):
         try:
-            conn = open_db(db_path)
-            rows = get_all_projects(conn)
+            with open_db(db_path) as conn:
+                rows = get_all_projects(conn)
             for r in rows:
                 stale = _is_stale(
                     {"created_at": r["created_at"]},
@@ -367,21 +394,23 @@ def reset_index(project_root: str | None = None, confirm: bool = False) -> dict:
     if not db_path.exists():
         return {"error": f"No index found for {root}. Nothing to reset."}
 
-    conn = open_db(db_path)
     project_id = derive_project_id(root)
-    cfg_data = get_active_config(conn, project_id)
-    conn.close()
+    cfg_data = None
+    sym_count = 0
+    with open_db(db_path) as conn:
+        cfg_data = get_active_config(conn, project_id)
+        if cfg_data:
+            sym_count = conn.execute(
+                "SELECT COUNT(*) FROM symbols WHERE config_hash=?",
+                (cfg_data["config_hash"],),
+            ).fetchone()[0]
 
-    info = {
+    info: dict[str, object] = {
         "project_root": str(root),
         "db": str(db_path),
         "project_id": project_id,
     }
     if cfg_data:
-        sym_count = open_db(db_path).execute(
-            "SELECT COUNT(*) FROM symbols WHERE config_hash=?",
-            (cfg_data["config_hash"],),
-        ).fetchone()[0]
         info["symbol_count"] = sym_count
         info["indexed_at"] = cfg_data["created_at"]
 
@@ -430,79 +459,70 @@ def reindex_file(
         When re-indexing a header via a single TU, includes a warning that other
         TUs may be stale.
     """
-    import time
+    from ..indexer.symbols import extract  # lazy: requires libclang
 
-    from ..indexer.compile_commands import parse as parse_cc
-    from ..indexer.db import delete_symbols_for_file, get_file_mtimes, insert_symbols_batch, transaction, upsert_file
-    from ..indexer.symbols import extract
-
-    root = _resolve_project_root(project_root)
-    db_path = _db_path(root)
+    db_path, cfg, project_id, root = _resolve_context(project_root)
     if not db_path.exists():
         return {"error": f"No index found for {root}. Run 'fw-context index' first."}
 
-    conn = open_db(db_path)
-    project_id = derive_project_id(root)
-    cfg_data = get_active_config(conn, project_id)
-    if not cfg_data:
-        return {"error": "No build config indexed."}
+    with open_db(db_path) as conn:
+        cfg_data = get_active_config(conn, project_id)
+        if not cfg_data:
+            return {"error": "No build config indexed."}
 
-    target = Path(file_path).resolve()
-    if not target.exists():
-        return {"error": f"File not found: {target}"}
+        target = Path(file_path).resolve()
+        if not target.exists():
+            return {"error": f"File not found: {target}"}
+        cc_path = Path(cfg_data["compile_commands_path"])
+        if not cc_path.exists():
+            return {"error": f"compile_commands.json not found: {cc_path}"}
 
-    cfg = load_config(project_root=root)
-    cc_path = Path(cfg_data["compile_commands_path"])
-    if not cc_path.exists():
-        return {"error": f"compile_commands.json not found: {cc_path}"}
+        units = parse_cc(cc_path)
+        matching = [u for u in units if Path(u.file).resolve() == target]
+        if not matching:
+            return {"error": f"{target.name} not found in compile_commands.json — it may be a header-only file."}
 
-    units = parse_cc(cc_path)
-    matching = [u for u in units if Path(u.file).resolve() == target]
-    if not matching:
-        return {"error": f"{target.name} not found in compile_commands.json — it may be a header-only file."}
+        config_hash = cfg_data["config_hash"]
+        source_roots = cfg.source_root_paths(root)
+        exclude_paths = cfg.exclude_root_paths(root)
 
-    config_hash = cfg_data["config_hash"]
-    source_roots = cfg.source_root_paths(root)
-    exclude_paths = cfg.exclude_root_paths(root)
+        t0 = time.monotonic()
+        total_symbols = 0
 
-    t0 = time.monotonic()
-    total_symbols = 0
+        for unit in matching:
+            file_path_str = str(unit.file.resolve())
+            current_mtime = unit.file.stat().st_mtime if unit.file.exists() else 0.0
 
-    for unit in matching:
-        file_path_str = str(unit.file.resolve())
-        current_mtime = unit.file.stat().st_mtime if unit.file.exists() else 0.0
+            # Extract first — if this fails, skip TU without touching DB
+            try:
+                syms = list(extract(unit, source_roots=source_roots, exclude_paths=exclude_paths))
+            except Exception as exc:
+                log.warning("skip reindex TU %s: %s", unit.file.name, exc)
+                continue
 
-        # Extract first — if this fails, skip TU without touching DB
-        try:
-            syms = list(extract(unit, source_roots=source_roots, exclude_paths=exclude_paths))
-        except Exception as exc:
-            log.warning("skip reindex TU %s: %s", unit.file.name, exc)
-            continue
+            with transaction(conn):
+                existing = get_file_mtimes(conn, config_hash)
+                if file_path_str in existing:
+                    file_id_old, _ = existing[file_path_str]
+                    delete_symbols_for_file(conn, file_id_old)
 
-        with transaction(conn):
-            existing = get_file_mtimes(conn, config_hash)
-            if file_path_str in existing:
-                file_id_old, _ = existing[file_path_str]
-                delete_symbols_for_file(conn, file_id_old)
+                file_id_cache: dict[str, int] = {}
+                rows = []
+                for s in syms:
+                    sym_file = s.file
+                    if sym_file not in file_id_cache:
+                        lang = "cpp" if Path(sym_file).suffix.lower() in {".cpp", ".cc", ".cxx", ".c++"} else "c"
+                        file_id_cache[sym_file] = upsert_file(conn, config_hash, sym_file, lang, mtime=current_mtime if sym_file == file_path_str else 0.0)
+                    rows.append((
+                        config_hash, file_id_cache[sym_file], s.usr, s.name,
+                        s.qualified_name, s.kind, s.line, s.column,
+                        int(s.is_definition), s.signature, s.docstring,
+                    ))
 
-            file_id_cache: dict[str, int] = {}
-            rows = []
-            for s in syms:
-                sym_file = s.file
-                if sym_file not in file_id_cache:
-                    from pathlib import Path as P
-                    lang = "cpp" if P(sym_file).suffix.lower() in {".cpp", ".cc", ".cxx", ".c++"} else "c"
-                    file_id_cache[sym_file] = upsert_file(conn, config_hash, sym_file, lang, mtime=current_mtime if sym_file == file_path_str else 0.0)
-                rows.append((
-                    config_hash, file_id_cache[sym_file], s.usr, s.name,
-                    s.qualified_name, s.kind, s.line, s.column,
-                    int(s.is_definition), s.signature, s.docstring,
-                ))
+                if rows:
+                    total_symbols += insert_symbols_batch(conn, rows)
 
-            if rows:
-                total_symbols += insert_symbols_batch(conn, rows)
-
-            upsert_file(conn, config_hash, file_path_str, unit.language, mtime=current_mtime)
+                upsert_file(conn, config_hash, file_path_str, unit.language, mtime=current_mtime)
 
     elapsed = round(time.monotonic() - t0, 2)
 
@@ -539,8 +559,7 @@ def check_ollama(project_root: str | None = None) -> dict:
         - available_code_models (list[str], when model missing): code-related
           models that are already installed and could be used instead
     """
-    root = _resolve_project_root(project_root)
-    cfg = load_config(project_root=root)
+    _, cfg, _, _ = _resolve_context(project_root)
     return check_setup(cfg.llm)
 
 
@@ -571,41 +590,40 @@ def explain_symbol(
         dict with: name, kind, file, line, signature, and either explanation
         (str) or warning (str) when Ollama is unavailable.
     """
-    root = _resolve_project_root(project_root)
-    db_path = _db_path(root)
+    db_path, cfg, project_id, root = _resolve_context(project_root)
     if not db_path.exists():
         return {"error": f"No index found for {root}. Run 'fw-context index' first."}
 
-    conn = open_db(db_path)
-    project_id = derive_project_id(root)
-    cfg_data = get_active_config(conn, project_id)
-    if not cfg_data:
-        return {"error": "No build config indexed."}
+    with open_db(db_path) as conn:
+        cfg_data = get_active_config(conn, project_id)
+        if not cfg_data:
+            return {"error": "No build config indexed."}
 
-    config_hash = cfg_data["config_hash"]
-    row = conn.execute(
-        """SELECT s.*, f.path as file_path FROM symbols s
-           JOIN files f ON f.id = s.file_id
-           WHERE s.config_hash=? AND s.name=? AND s.is_definition=1
-           ORDER BY s.line LIMIT 1""",
-        (config_hash, name),
-    ).fetchone()
-    if not row:
+        config_hash = cfg_data["config_hash"]
         row = conn.execute(
             """SELECT s.*, f.path as file_path FROM symbols s
                JOIN files f ON f.id = s.file_id
-               WHERE s.config_hash=? AND s.name=?
-               ORDER BY s.is_definition DESC, s.line LIMIT 1""",
+               WHERE s.config_hash=? AND s.name=? AND s.is_definition=1
+               ORDER BY s.line LIMIT 1""",
             (config_hash, name),
         ).fetchone()
-    if not row:
-        return {"error": f"Symbol not found: {name}"}
+        if not row:
+            row = conn.execute(
+                """SELECT s.*, f.path as file_path FROM symbols s
+                   JOIN files f ON f.id = s.file_id
+                   WHERE s.config_hash=? AND s.name=?
+                   ORDER BY s.is_definition DESC, s.line LIMIT 1""",
+                (config_hash, name),
+            ).fetchone()
+        if not row:
+            return {"error": f"Symbol not found: {name}"}
 
-    file_path = row["file_path"]
-    line_no = row["line"]
-    signature = row["signature"] or ""
-    kind = row["kind"]
+        file_path = row["file_path"]
+        line_no = row["line"]
+        signature = row["signature"] or ""
+        kind = row["kind"]
 
+    context_lines = min(context_lines, 200)
     source_snippet = ""
     try:
         lines = Path(file_path).read_text(errors="replace").splitlines()
@@ -618,7 +636,6 @@ def explain_symbol(
     except Exception:
         pass
 
-    cfg = load_config(project_root=root)
     prompt = (
         f"You are a C/C++ embedded firmware expert.\n"
         f"Explain what the following {kind} does in 2-4 sentences. "
@@ -679,82 +696,81 @@ def smart_search(
         format as ``search_code``. May include a warning when Ollama is
         unavailable or the index is stale.
     """
-    root = _resolve_project_root(project_root)
-    db_path = _db_path(root)
+    db_path, cfg, project_id, root = _resolve_context(project_root)
     if not db_path.exists():
         return [{"error": f"No index found for {root}. Run 'fw-context index' first."}]
 
-    conn = open_db(db_path)
-    project_id = derive_project_id(root)
-    cfg_data = get_active_config(conn, project_id)
-    if not cfg_data:
-        return [{"error": "No build config indexed."}]
-
-    cfg = load_config(project_root=root)
-    config_hash = cfg_data["config_hash"]
-    limit = min(limit, 100)
-
-    keyword_queries: list[str] = []
-    ollama_warning: dict | None = None
-
-    prompt = (
-        "You are a C/C++ code search assistant for an embedded firmware project.\n"
-        "Generate 2-4 FTS5 keyword search terms for the symbol index based on the description below.\n"
-        "Rules:\n"
-        "- Output ONLY the search terms, one per line, no numbering, no markdown, no punctuation\n"
-        "- Use snake_case identifiers (e.g. modem_init, conn_open)\n"
-        "- You may use a trailing wildcard suffix: modem* matches modem_init, modem_connect, etc.\n"
-        "- No asterisks anywhere else — FTS5 only supports trailing wildcards\n"
-        "- Prefer short stems over full function names\n\n"
-        f"Description: {query}\n"
-    )
-    try:
-        raw = call_ollama(prompt, cfg.llm)
-        import re as _re
-        keyword_queries = []
-        for line in raw.splitlines():
-            # strip markdown: leading numbers/bullets, asterisks, backticks, quotes
-            cleaned = _re.sub(r'^[\s\d\.\-\*]+', '', line).strip().strip('`\'"*')
-            if cleaned and not cleaned.startswith("#"):
-                # FTS5 query parser doesn't split on '_'; replace with space so
-                # 'modem_init' becomes AND('modem','init') rather than a missing token
-                cleaned = cleaned.replace("_", " ")
-                keyword_queries.append(cleaned)
-        keyword_queries = keyword_queries[:4]
-    except OllamaModelNotFoundError as e:
-        ollama_warning = {"warning": str(e), "hint": "Run: check_ollama()"}
-        keyword_queries = [query]
-    except OllamaError as e:
-        ollama_warning = {"warning": f"Ollama unavailable, using direct search: {e}"}
-        keyword_queries = [query]
-
+    cfg_data = None
+    config_hash = ""
     seen: dict[tuple, dict] = {}
-    for kq in keyword_queries:
+
+    with open_db(db_path) as conn:
+        cfg_data = get_active_config(conn, project_id)
+        if not cfg_data:
+            return [{"error": "No build config indexed."}]
+        config_hash = cfg_data["config_hash"]
+        limit = min(limit, 100)
+
+        keyword_queries: list[str] = []
+        ollama_warning: dict | None = None
+
+        prompt = (
+            "You are a C/C++ code search assistant for an embedded firmware project.\n"
+            "Generate 2-4 FTS5 keyword search terms for the symbol index based on the description below.\n"
+            "Rules:\n"
+            "- Output ONLY the search terms, one per line, no numbering, no markdown, no punctuation\n"
+            "- Use snake_case identifiers (e.g. modem_init, conn_open)\n"
+            "- You may use a trailing wildcard suffix: modem* matches modem_init, modem_connect, etc.\n"
+            "- No asterisks anywhere else — FTS5 only supports trailing wildcards\n"
+            "- Prefer short stems over full function names\n\n"
+            f"Description: {query}\n"
+        )
         try:
-            rows = search_symbols(conn, kq, config_hash, limit=limit)
-        except Exception:
-            continue
-        for r in rows:
-            key = (r["name"], r["file_path"], r["line"])
-            if key not in seen:
-                seen[key] = {
-                    "name": r["name"],
-                    "qualified_name": r["qualified_name"],
-                    "kind": r["kind"],
-                    "file": r["file_path"],
-                    "line": r["line"],
-                    "is_definition": bool(r["is_definition"]),
-                    "signature": r["signature"],
-                    "docstring": r["docstring"],
-                }
+            raw = call_ollama(prompt, cfg.llm)
+            keyword_queries = []
+            for line in raw.splitlines():
+                # strip markdown: leading numbers/bullets, asterisks, backticks, quotes
+                cleaned = re.sub(r'^[\s\d\.\-\*]+', '', line).strip().strip('`\'"*')
+                if cleaned and not cleaned.startswith("#"):
+                    # FTS5 query parser doesn't split on '_'; replace with space so
+                    # 'modem_init' becomes AND('modem','init') rather than a missing token
+                    cleaned = cleaned.replace("_", " ")
+                    keyword_queries.append(cleaned)
+            keyword_queries = keyword_queries[:4]
+        except OllamaModelNotFoundError as e:
+            ollama_warning = {"warning": str(e), "hint": "Run: check_ollama()"}
+            keyword_queries = [query]
+        except OllamaError as e:
+            ollama_warning = {"warning": f"Ollama unavailable, using direct search: {e}"}
+            keyword_queries = [query]
+
+        for kq in keyword_queries:
+            try:
+                rows = search_symbols(conn, kq, config_hash, limit=limit)
+            except Exception:
+                continue
+            for r in rows:
+                key = (r["name"], r["file_path"], r["line"])
+                if key not in seen:
+                    seen[key] = {
+                        "name": r["name"],
+                        "qualified_name": r["qualified_name"],
+                        "kind": r["kind"],
+                        "file": r["file_path"],
+                        "line": r["line"],
+                        "is_definition": bool(r["is_definition"]),
+                        "signature": r["signature"],
+                        "docstring": r["docstring"],
+                    }
 
     results: list[dict] = []
-    if ollama_warning:
-        results.append(ollama_warning)
-    if not ollama_warning and _is_stale(cfg_data, cfg_data["compile_commands_path"]):
-        results.append({"warning": "Index may be stale — run 'fw-context index'."})
 
     results.append({"_generated_queries": keyword_queries})
+    if ollama_warning:
+        results.append(ollama_warning)
+    if not ollama_warning and cfg_data and _is_stale(cfg_data, cfg_data["compile_commands_path"]):
+        results.append({"warning": "Index may be stale — run 'fw-context index'."})
+
     results += list(seen.values())[:limit]
     if not seen:
         results.append({"info": "No results found for the generated queries."})

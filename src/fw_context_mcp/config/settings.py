@@ -8,14 +8,9 @@ Hierarchy (later overrides earlier):
 
 from __future__ import annotations
 
-import sys
+import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
-
-if sys.version_info >= (3, 11):
-    import tomllib
-else:
-    import tomli as tomllib  # type: ignore[no-redef]
 
 _GLOBAL_CONFIG_PATH = Path.home() / ".fw-context" / "config.toml"
 _PROJECT_CONFIG_DIR = ".fw-context"
@@ -38,7 +33,12 @@ _PROJECT_DEFAULTS_TEMPLATE = """\
 
 [index]
 compile_commands = "compile_commands.json"
-source_roots = ["src", "lib"]
+# source_roots: directories to index symbols from.
+#   Empty list = auto-detect (scans for src, lib, app, include, zephyr, mbed-os,
+#   modules + top-level directories from compile_commands.json).
+#   Set explicitly to narrow indexing to specific directories.
+source_roots = []
+exclude_paths = ["build"]
 
 # [llm]
 # model = "qwen2.5-coder:7b-q4_K_M"   # override global model for this project
@@ -58,8 +58,8 @@ class LLMConfig:
 class IndexConfig:
     db_dir: Path = field(default_factory=lambda: Path.home() / ".fw-context" / "index")
     compile_commands: Path = field(default_factory=lambda: Path("compile_commands.json"))
-    source_roots: list[str] = field(default_factory=lambda: ["src", "lib"])
-    exclude_paths: list[str] = field(default_factory=list)
+    source_roots: list[str] = field(default_factory=list)
+    exclude_paths: list[str] = field(default_factory=lambda: ["build"])
 
 
 @dataclass
@@ -165,7 +165,10 @@ def load(project_root: Path | None = None) -> Config:
 def derive_project_id(root: Path) -> str:
     """Derive a stable project_id from git remote URL or directory path."""
     import hashlib
+    import logging
     import subprocess
+
+    log = logging.getLogger(__name__)
 
     try:
         url = subprocess.check_output(
@@ -174,4 +177,5 @@ def derive_project_id(root: Path) -> str:
         ).decode().strip()
         return hashlib.sha256(url.encode()).hexdigest()[:16]
     except Exception:
+        log.debug("git remote origin not found for %s, using path hash", root)
         return hashlib.sha256(str(root.resolve()).encode()).hexdigest()[:16]

@@ -136,8 +136,14 @@ First run takes a few seconds to minutes depending on project size (8&hairsp;500
 symbols across 950 files takes ~15&hairsp;s). Subsequent runs are
 **incremental** — only files with changed modification time are re-parsed.
 
+**Source roots are auto-detected** by default. The indexer scans your project
+for common source directories (`src`, `lib`, `app`, `include`, `modules`) and
+OS/framework directories (`zephyr`, `mbed-os`), then supplements with
+directories discovered from `compile_commands.json`. This means OS symbols
+your project actually uses are indexed automatically — no manual config needed.
+
 ```bash
-# Custom source roots (override .fw-context/config.toml)
+# Custom source roots (override auto-detection)
 fw-context index --source-roots src lib vendor
 
 # Index a different project
@@ -191,7 +197,7 @@ fw-context index [compile_commands.json] [--project DIR] [--source-roots DIR ...
 |--------|---------|-------------|
 | `compile_commands.json` | from config | Path to the compilation database |
 | `--project DIR` | `.` | Project root directory |
-| `--source-roots DIR...` | `src lib` | Directories to index symbols from |
+| `--source-roots DIR...` | auto-detected | Directories to index symbols from |
 | `--name NAME` | directory name | Project name override |
 | `-v` | off | Verbose progress output |
 
@@ -243,6 +249,9 @@ fw-context reset --project /path  # specific project
 ### `fw-context init`
 
 Register fw-context with Claude Code and OpenCode (see [Setup](#setting-up-ai-assistant-integration)).
+Also creates `.fw-context/config.toml` in the current directory, so you can
+customize `source_roots`, `exclude_paths`, and LLM settings per-project before
+the first `fw-context index`.
 
 ## MCP tools
 
@@ -295,16 +304,24 @@ name = "my-firmware"
 
 [index]
 compile_commands = "compile_commands.json"
-source_roots = ["src", "lib"]
-exclude_paths = ["lib/zcbor/generation", "build"]
+# source_roots: which directories to index symbols from.
+#   Empty = auto-detect (default). Scans for common source dirs
+#   (src, lib, app, include, modules) + OS/framework dirs
+#   (zephyr, mbed-os) + top-level dirs from compile_commands.json.
+#   Set explicitly to narrow indexing:
+# source_roots = ["src", "lib"]
+exclude_paths = ["build", "generated"]
 
 [llm]
 model = "deepseek-coder:6.7b"   # use a different model for this project
 ```
 
-`source_roots` controls which files' symbols get indexed — only symbols whose
-defining file lives under one of these directories. `exclude_paths` filters out
-generated code, third-party sources, etc.
+Auto-detection ensures that OS/framework symbols your project actually uses
+(via `#include`) are indexed, without having to manually list every directory.
+The `compile_commands.json` determines *which* translation units are parsed;
+the `#include` chain determines *which* OS headers are traversed — providing
+natural, build-accurate filtering. `source_roots` and `exclude_paths` let
+you fine-tune when needed.
 
 ## Choosing an Ollama model
 
@@ -392,9 +409,18 @@ Run `fw-context index` — it's incremental and picks up only changed files.
 
 ### Symbols missing or incomplete
 
-Check your `.fw-context/config.toml` — `source_roots` must include the
-directory where the symbol's file lives. Also make sure the file is listed in
-`compile_commands.json`.
+By default source roots are auto-detected from your project structure and
+`compile_commands.json`. If symbols from certain directories are missing:
+
+1. Check `.fw-context/config.toml` — explicit `source_roots` overrides
+   auto-detection. Remove it to restore auto-detection, or add the missing
+   directories.
+2. Make sure the file is listed in `compile_commands.json`.
+3. For PlatformIO frameworks (Arduino, ESP-IDF) whose sources live outside
+   the project root (e.g. `~/.platformio/packages/`), add them explicitly:
+   ```toml
+   source_roots = ["src", "lib", "/home/user/.platformio/packages/framework-arduinoespressif32"]
+   ```
 
 ### "Cannot connect to Ollama"
 

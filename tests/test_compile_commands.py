@@ -1,10 +1,7 @@
 """Tests for fw_context_mcp.indexer.compile_commands."""
 
 import json
-import tempfile
 from pathlib import Path
-
-import pytest
 
 from fw_context_mcp.indexer.compile_commands import (
     _SOURCE_EXTS,
@@ -15,7 +12,6 @@ from fw_context_mcp.indexer.compile_commands import (
     _is_source_file,
     normalize_args,
     parse,
-    CompilationUnit,
 )
 
 

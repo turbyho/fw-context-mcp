@@ -7,6 +7,7 @@ import time
 from pathlib import Path
 
 from ..config.settings import derive_project_id
+from .compile_commands import _SOURCE_EXTS
 from .compile_commands import parse as parse_compile_commands
 from .config_hash import compute as compute_config_hash
 from .db import (
@@ -23,6 +24,58 @@ from .symbols import extract as extract_symbols
 
 log = logging.getLogger(__name__)
 
+# Directories to look for when auto-detecting source roots
+_COMMON_SOURCE_DIRS = ["src", "lib", "app", "include", "drivers", "modules"]
+_COMMON_OS_DIRS = ["zephyr", "mbed-os"]
+
+
+def _detect_source_roots(project_root: Path, compile_commands: Path) -> list[Path]:
+    """Auto-detect source directories from project structure and compile_commands.json.
+
+    Scans project root for common source/OS directories, then supplements with
+    top-level directories discovered from compile_commands.json entries.
+    Falls back to the project root itself if nothing is found.
+    """
+    roots: list[Path] = []
+    seen: set[Path] = set()
+
+    # 1. Scan for common source directories
+    for name in _COMMON_SOURCE_DIRS:
+        p = project_root / name
+        if p.is_dir() and p not in seen:
+            roots.append(p)
+            seen.add(p)
+
+    # 2. Scan for common OS/framework directories
+    for name in _COMMON_OS_DIRS:
+        p = project_root / name
+        if p.is_dir() and p not in seen:
+            roots.append(p)
+            seen.add(p)
+
+    # 3. Discover additional top-level dirs from compile_commands.json
+    try:
+        units = list(parse_compile_commands(compile_commands))
+        for unit in units:
+            try:
+                rel = unit.file.resolve().relative_to(project_root)
+                top = project_root / rel.parts[0]
+                if top.is_dir() and top not in seen:
+                    roots.append(top)
+                    seen.add(top)
+            except ValueError:
+                pass  # outside project root, skip
+    except Exception:
+        pass
+
+    # 4. Fallback: index everything under project root
+    if not roots:
+        roots = [project_root]
+        log.info("No source directories detected, falling back to project root")
+
+    log.info("Auto-detected source roots: %s", [str(r) for r in roots])
+    return roots
+
 
 def run(
     compile_commands: Path,
@@ -33,8 +86,8 @@ def run(
 ) -> str:
     """Index a project. Returns config_hash of the indexed build."""
     project_root = compile_commands.parent.resolve()
-    if source_roots is None:
-        source_roots = [project_root / "src", project_root / "lib"]
+    if not source_roots:
+        source_roots = _detect_source_roots(project_root, compile_commands)
     # Only keep roots that actually exist
     source_roots = [r.resolve() for r in source_roots if r.exists()]
     if exclude_paths is None:
@@ -51,8 +104,6 @@ def run(
     with transaction(conn):
         upsert_project(conn, project_id, name, str(project_root))
         upsert_build_config(conn, config_hash, project_id, str(compile_commands))
-
-    from .compile_commands import _SOURCE_EXTS  # reuse C/C++ extension set
 
     units = list(parse_compile_commands(compile_commands))
     units = [u for u in units if u.file.suffix.lower() in _SOURCE_EXTS]

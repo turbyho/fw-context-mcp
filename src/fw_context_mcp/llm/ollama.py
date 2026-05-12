@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import time
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 import httpx
@@ -45,7 +45,7 @@ def call_ollama(prompt: str, cfg: LLMConfig) -> str:
         response_text = resp.json()["response"]
         if cfg.debug_log:
             _write_debug_log(cfg.debug_log, {
-                "ts": datetime.now(timezone.utc).isoformat(),
+                "ts": datetime.now(UTC).isoformat(),
                 "model": cfg.model,
                 "num_ctx": cfg.num_ctx,
                 "latency_s": round(time.monotonic() - t0, 2),
@@ -59,7 +59,7 @@ def call_ollama(prompt: str, cfg: LLMConfig) -> str:
             "Make sure Ollama is running: https://ollama.com"
         ) from e
     except httpx.TimeoutException:
-        raise OllamaError(f"Ollama request timed out after {_TIMEOUT}s")
+        raise OllamaError(f"Ollama request timed out after {_TIMEOUT}s") from None
     except httpx.HTTPStatusError as e:
         if e.response.status_code == 404:
             raise OllamaModelNotFoundError(cfg.model, cfg.ollama_url) from e

@@ -3,10 +3,9 @@
 from __future__ import annotations
 
 import sqlite3
+from collections.abc import Generator
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Generator
-
 
 _SCHEMA = """
 PRAGMA journal_mode = WAL;
