@@ -17,10 +17,11 @@ It works in two parts:
 ## Quick start
 
 ```bash
-# 1. Install
+# 1. Clone and install
+git clone git@git.montyho.com:turbyho/fw-context-mcp.git ~/.fw-context/src
 uv venv ~/.fw-context/.venv --python 3.12
-uv pip install --python ~/.fw-context/.venv/bin/python /path/to/fw-context-mcp/
-export PATH="$HOME/.fw-context/.venv/bin:$PATH"   # add to .bashrc / .zshrc
+uv pip install --python ~/.fw-context/.venv/bin/python ~/.fw-context/src/
+echo 'export PATH="$HOME/.fw-context/.venv/bin:$PATH"' >> ~/.bashrc
 
 # 2. Register with your AI assistant
 fw-context init
@@ -39,24 +40,47 @@ fw-context index
 |------|-----|
 | Python 3.11+ | Runtime |
 | [`uv`](https://docs.astral.sh/uv/) | Fast package installer |
+| SSH key for `git.montyho.com` | To clone the repository |
 | Compiler toolchain (ARM GCC / Zephyr SDK / PlatformIO) | libclang needs system headers to parse cross-compiled code |
 | [`bear`](https://github.com/rizsotto/Bear) | Intercepts build commands to produce `compile_commands.json` |
 | [Ollama](https://ollama.com) *(optional)* | Powers `explain_symbol` and `smart_search` |
 
 ## Installation
 
+### Clone from repository
+
 ```bash
+# Clone to ~/.fw-context/src (or any location you prefer)
+git clone git@git.montyho.com:turbyho/fw-context-mcp.git ~/.fw-context/src
+
 # Create a dedicated virtual environment
 uv venv ~/.fw-context/.venv --python 3.12
 
-# Install the tool
-uv pip install --python ~/.fw-context/.venv/bin/python /path/to/fw-context-mcp/
+# Install from the cloned source
+uv pip install --python ~/.fw-context/.venv/bin/python ~/.fw-context/src/
 
 # Make fw-context available in your shell
 export PATH="$HOME/.fw-context/.venv/bin:$PATH"
+# Add to ~/.bashrc or ~/.zshrc for persistence
 ```
 
-To upgrade later, just run the `uv pip install` line again.
+### Upgrade
+
+Pull the latest source and re-install:
+
+```bash
+cd ~/.fw-context/src
+git pull
+uv pip install --python ~/.fw-context/.venv/bin/python ~/.fw-context/src/
+```
+
+### Install from local path
+
+If you already have the source elsewhere:
+
+```bash
+uv pip install --python ~/.fw-context/.venv/bin/python /path/to/fw-context-mcp/
+```
 
 ## Setting up AI assistant integration
 
