@@ -30,6 +30,22 @@ After a source update:
 uv pip install --python ~/.fw-context/.venv/bin/python /path/to/fw-context-mcp/
 ```
 
+## Setup — AI assistant integration
+
+Run once after installation to register the MCP server and install usage instructions
+into Claude Code and OpenCode:
+
+```bash
+fw-context init
+```
+
+This command:
+- Registers `fw-context-mcp` in Claude Code (`claude mcp add --scope user`)
+- Inserts a usage instructions block into `~/.claude/CLAUDE.md`
+- Writes `~/.config/opencode/rules/fw-context.md`
+
+The command is idempotent — safe to re-run after updates.
+
 ## Generating compile_commands.json
 
 For **Mbed OS** projects:
