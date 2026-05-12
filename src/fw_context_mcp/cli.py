@@ -18,6 +18,20 @@ projects built with Mbed OS, Zephyr, or PlatformIO.** Do not use in Python, JS,
 Go, or other projects — the index is built from `compile_commands.json` and only
 covers C/C++ translation units.
 
+### lean-ctx compatibility
+
+lean-ctx compression is useful for documentation, config files, and non-code
+content — keep using it there.
+
+Do NOT use lean-ctx tools (`ctx_read`, `ctx_shell`, `ctx_search`, `ctx_tree`,
+`ctx_edit`, `ctx_multi_read`) to process or display results from fw-context code
+queries (`search_code`, `lookup_symbol`, `explain_symbol`, `smart_search`,
+`reindex_file`). C/C++ code results must stay uncompressed — use native tools.
+
+When working on the `fw-context-mcp` source code itself
+(`~/dev/sw/work/tools/fw-context-mcp/`), do NOT use lean-ctx at all. Python
+source, git diffs, and test output must be uncompressed.
+
 ### When to use
 
 **Code search:**
@@ -67,6 +81,20 @@ _OPENCODE_RULES_INSTRUCTIONS = """\
 projects built with Mbed OS, Zephyr, or PlatformIO.** Do not use in Python, JS,
 Go, or other projects — the index is built from `compile_commands.json` and only
 covers C/C++ translation units.
+
+## lean-ctx compatibility
+
+lean-ctx compression is useful for documentation, config files, and non-code
+content — keep using it there.
+
+Do NOT use lean-ctx tools (`ctx_read`, `ctx_shell`, `ctx_search`, `ctx_tree`,
+`ctx_edit`, `ctx_multi_read`) to process or display results from fw-context code
+queries (`search_code`, `lookup_symbol`, `explain_symbol`, `smart_search`,
+`reindex_file`). C/C++ code results must stay uncompressed — use native tools.
+
+When working on the `fw-context-mcp` source code itself
+(`~/dev/sw/work/tools/fw-context-mcp/`), do NOT use lean-ctx at all. Python
+source, git diffs, and test output must be uncompressed.
 
 ## When to use
 
