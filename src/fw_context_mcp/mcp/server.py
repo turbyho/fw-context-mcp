@@ -671,8 +671,8 @@ async def explain_symbol(
 
     prompt = (
         f"You are a C/C++ embedded firmware expert.\n"
-        f"Explain what the following {kind} does in 2-4 sentences. "
-        f"Be concise and focus on purpose and behaviour.\n\n"
+        f"Explain what the following {kind} does. "
+        f"Cover: (1) what it does and why, (2) key mechanism or logic, (3) when/how it fits in the system.\n\n"
         f"Symbol: {name}\n"
         f"File: {file_path}:{line_no}\n"
         f"Signature: {signature}\n"
@@ -707,6 +707,41 @@ async def explain_symbol(
     result["explain_prompt"] = prompt
 
     return result
+
+
+def _parse_search_terms(raw: str) -> list[str]:
+    """Parse LLM response into FTS5 keyword search terms.
+
+    Tries JSON array first, falls back to line-by-line regex.
+    """
+    import json
+
+    terms: list[str] = []
+
+    # Try JSON array: just look for the first '['...']' block in case model
+    # wraps it in markdown or adds extra text.
+    try:
+        start = raw.index("[")
+        end = raw.rindex("]") + 1
+        parsed = json.loads(raw[start:end])
+        if isinstance(parsed, list):
+            for item in parsed:
+                if isinstance(item, str) and item.strip():
+                    terms.append(item.strip())
+    except (ValueError, json.JSONDecodeError):
+        pass
+
+    # Fallback: line-by-line regex cleanup
+    if not terms:
+        for line in raw.splitlines():
+            # Strip parenthetical comments
+            line = re.sub(r"\s*\(.*\)\s*$", "", line)
+            cleaned = re.sub(r"^[\s\d\.\-\*]+", "", line).strip().strip("`'\"*")
+            if cleaned and not cleaned.startswith("#"):
+                terms.append(cleaned)
+
+    # Replace underscores with spaces for FTS5 tokenizer
+    return [t.replace("_", " ") for t in terms]
 
 
 @mcp.tool()
@@ -761,11 +796,12 @@ async def smart_search(
 
         prompt = (
             "You are a C/C++ code search assistant for an embedded firmware project.\n"
-            "Generate 2-4 FTS5 keyword search terms for the symbol index based on the description below.\n"
+            "Generate 2-4 FTS5 keyword search terms based on the description below.\n"
+            "Return a JSON array of snake_case strings, e.g.: [\"modem_init\", \"conn_open\"]\n"
             "Rules:\n"
-            "- Output ONLY the search terms, one per line, no numbering, no markdown, no punctuation\n"
+            "- Output MUST be a valid JSON array and nothing else\n"
             "- Use snake_case identifiers (e.g. modem_init, conn_open)\n"
-            "- You may use a trailing wildcard suffix: modem* matches modem_init, modem_connect, etc.\n"
+            "- You may use a trailing wildcard suffix: \"modem*\" matches modem_init, modem_connect, etc.\n"
             "- No asterisks anywhere else — FTS5 only supports trailing wildcards\n"
             "- Prefer short stems over full function names\n\n"
             f"Description: {query}\n"
@@ -773,12 +809,7 @@ async def smart_search(
         if cfg.llm.enabled:
             try:
                 raw = await call_ollama_async(prompt, cfg.llm)
-                keyword_queries = []
-                for line in raw.splitlines():
-                    cleaned = re.sub(r'^[\s\d\.\-\*]+', '', line).strip().strip('`\'"*')
-                    if cleaned and not cleaned.startswith("#"):
-                        cleaned = cleaned.replace("_", " ")
-                        keyword_queries.append(cleaned)
+                keyword_queries = _parse_search_terms(raw)
                 keyword_queries = keyword_queries[:4]
             except OllamaModelNotFoundError as e:
                 ollama_warning = {"warning": str(e), "hint": "Run: check_ollama()"}
