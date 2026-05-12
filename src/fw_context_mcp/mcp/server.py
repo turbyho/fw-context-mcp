@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import os
+from datetime import datetime, timezone
 from pathlib import Path
 
 from mcp.server.fastmcp import FastMCP
@@ -50,6 +51,16 @@ def _resolve_project_root(project_root: str | None) -> Path:
     return cwd
 
 
+def _is_stale(cfg: object, compile_commands_path: str) -> bool:
+    """Return True if compile_commands.json is newer than the indexed timestamp."""
+    try:
+        cc_mtime = os.path.getmtime(compile_commands_path)
+        indexed_at = datetime.fromisoformat(cfg["created_at"]).replace(tzinfo=timezone.utc)
+        return cc_mtime > indexed_at.timestamp() + 1
+    except Exception:
+        return False
+
+
 # ---------------------------------------------------------------------------
 # Tools
 # ---------------------------------------------------------------------------
@@ -91,6 +102,7 @@ def get_active_build(project_root: str | None = None) -> dict:
         "indexed_at": cfg["created_at"],
         "symbol_count": sym_count,
         "file_count": file_count,
+        "stale": _is_stale(cfg, cfg["compile_commands_path"]),
     }
 
 
@@ -129,7 +141,11 @@ def search_code(
     if kind:
         rows = [r for r in rows if r["kind"] == kind]
 
-    return [
+    results: list[dict] = []
+    if _is_stale(cfg, cfg["compile_commands_path"]):
+        results.append({"warning": "Index may be stale — compile_commands.json changed since last index. Run 'fw-context index' to update."})
+
+    results += [
         {
             "name": r["name"],
             "qualified_name": r["qualified_name"],
@@ -142,6 +158,7 @@ def search_code(
         }
         for r in rows
     ]
+    return results
 
 
 @mcp.tool()
@@ -187,7 +204,11 @@ def lookup_symbol(
             (config_hash, f"{name}%"),
         ).fetchall()
 
-    return [
+    results: list[dict] = []
+    if _is_stale(cfg, cfg["compile_commands_path"]):
+        results.append({"warning": "Index may be stale — compile_commands.json changed since last index. Run 'fw-context index' to update."})
+
+    results += [
         {
             "name": r["name"],
             "qualified_name": r["qualified_name"],
@@ -200,6 +221,7 @@ def lookup_symbol(
         }
         for r in rows
     ]
+    return results
 
 
 def main() -> None:
