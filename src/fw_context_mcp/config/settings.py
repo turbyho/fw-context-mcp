@@ -38,7 +38,7 @@ compile_commands = "compile_commands.json"
 #   modules + top-level directories from compile_commands.json).
 #   Set explicitly to narrow indexing to specific directories.
 source_roots = []
-exclude_paths = ["build"]
+exclude_paths = ["build", "BUILD"]
 
 # [llm]
 # model = "qwen2.5-coder:7b-q4_K_M"   # override global model for this project
@@ -59,7 +59,7 @@ class IndexConfig:
     db_dir: Path = field(default_factory=lambda: Path.home() / ".fw-context" / "index")
     compile_commands: Path = field(default_factory=lambda: Path("compile_commands.json"))
     source_roots: list[str] = field(default_factory=list)
-    exclude_paths: list[str] = field(default_factory=lambda: ["build"])
+    exclude_paths: list[str] = field(default_factory=lambda: ["build", "BUILD"])
 
 
 @dataclass

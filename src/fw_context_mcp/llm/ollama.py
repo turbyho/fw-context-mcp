@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import time
@@ -68,6 +69,15 @@ def call_ollama(prompt: str, cfg: LLMConfig) -> str:
         raise
     except Exception as e:
         raise OllamaError(str(e)) from e
+
+
+async def call_ollama_async(prompt: str, cfg: LLMConfig) -> str:
+    """Async wrapper for call_ollama — offloads blocking httpx to a thread.
+
+    Use from async MCP tool handlers to avoid blocking the event loop during
+    long-running Ollama requests (10-60 s).
+    """
+    return await asyncio.to_thread(call_ollama, prompt, cfg)
 
 
 def check_setup(cfg: LLMConfig) -> dict:

@@ -46,13 +46,13 @@ class TestFromDict:
                 "db_dir": "/tmp/db",
                 "compile_commands": "build/cc.json",
                 "source_roots": ["src", "lib"],
-                "exclude_paths": ["build"],
+                "exclude_paths": ["build", "BUILD"],
             }
         })
         assert cfg.index.db_dir == Path("/tmp/db")
         assert cfg.index.compile_commands == Path("build/cc.json")
         assert cfg.index.source_roots == ["src", "lib"]
-        assert cfg.index.exclude_paths == ["build"]
+        assert cfg.index.exclude_paths == ["build", "BUILD"]
 
     def test_llm_settings(self):
         cfg = _from_dict({
@@ -104,7 +104,7 @@ class TestSourceRootPaths:
 
     def test_exclude_root_paths(self, tmpdir):
         cfg = Config()
-        cfg.index.exclude_paths = ["build"]
+        cfg.index.exclude_paths = ["build", "BUILD"]
         (tmpdir / "build").mkdir()
         paths = cfg.exclude_root_paths(tmpdir)
         assert len(paths) == 1

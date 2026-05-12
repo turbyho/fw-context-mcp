@@ -26,7 +26,7 @@ from ..indexer.db import (
     transaction,
     upsert_file,
 )
-from ..llm.ollama import OllamaError, OllamaModelNotFoundError, call_ollama, check_setup
+from ..llm.ollama import OllamaError, OllamaModelNotFoundError, call_ollama_async, check_setup
 
 log = logging.getLogger(__name__)
 
@@ -242,6 +242,7 @@ def lookup_symbol(
     name: str,
     project_root: str | None = None,
     exact: bool = False,
+    limit: int = 50,
 ) -> list[dict]:
     """Look up a symbol by name. Returns all matches — declarations and definitions.
 
@@ -257,6 +258,7 @@ def lookup_symbol(
         name: Symbol name (case-sensitive). Use prefix match by default.
         project_root: Absolute path to the project. Defaults to nearest git root.
         exact: If True, match exact name only. If False, also match as prefix.
+        limit: Maximum number of results (default 50, max 100).
 
     Returns:
         list of dicts with: name, qualified_name, kind, file, line,
@@ -266,58 +268,64 @@ def lookup_symbol(
     Example:
         ``lookup_symbol("BoxManager", exact=True)`` → constructor + class
     """
-    root = _resolve_project_root(project_root)
-    db_path = _db_path(root)
-    if not db_path.exists():
-        return [{"error": f"No index found for {root}."}]
+    try:
+        root = _resolve_project_root(project_root)
+        db_path = _db_path(root)
+        if not db_path.exists():
+            return [{"error": f"No index found for {root}."}]
 
-    with open_db(db_path) as conn:
-        project_id = derive_project_id(root)
-        cfg = get_active_config(conn, project_id)
-        if not cfg:
-            return [{"error": "No build config indexed."}]
+        with open_db(db_path) as conn:
+            project_id = derive_project_id(root)
+            cfg = get_active_config(conn, project_id)
+            if not cfg:
+                return [{"error": "No build config indexed."}]
 
-        config_hash = cfg["config_hash"]
-        if exact:
-            rows = conn.execute(
-                """SELECT s.*, f.path as file_path FROM symbols s
-                   JOIN files f ON f.id = s.file_id
-                   WHERE s.config_hash=? AND s.name=?
-                   ORDER BY s.is_definition DESC, s.line""",
-                (config_hash, name),
-            ).fetchall()
-        else:
-            rows = conn.execute(
-                """SELECT s.*, f.path as file_path FROM symbols s
-                   JOIN files f ON f.id = s.file_id
-                   WHERE s.config_hash=? AND s.name LIKE ?
-                   ORDER BY s.is_definition DESC, s.line
-                   LIMIT 50""",
-                (config_hash, f"{name}%"),
-            ).fetchall()
+            config_hash = cfg["config_hash"]
+            limit = min(limit, 100)
+            if exact:
+                rows = conn.execute(
+                    """SELECT s.*, f.path as file_path FROM symbols s
+                       JOIN files f ON f.id = s.file_id
+                       WHERE s.config_hash=? AND s.name=?
+                       ORDER BY s.is_definition DESC, s.line
+                       LIMIT ?""",
+                    (config_hash, name, limit),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    """SELECT s.*, f.path as file_path FROM symbols s
+                       JOIN files f ON f.id = s.file_id
+                       WHERE s.config_hash=? AND s.name LIKE ?
+                       ORDER BY s.is_definition DESC, s.line
+                       LIMIT ?""",
+                    (config_hash, f"{name}%", limit),
+                ).fetchall()
 
-        results: list[dict] = []
-        if _is_stale(cfg, cfg["compile_commands_path"]):
-            results.append({"warning": "Index may be stale — compile_commands.json changed since last index. Run 'fw-context index' to update."})
+            results: list[dict] = []
+            if _is_stale(cfg, cfg["compile_commands_path"]):
+                results.append({"warning": "Index may be stale — compile_commands.json changed since last index. Run 'fw-context index' to update."})
 
-        result_rows = [
-            {
-                "name": r["name"],
-                "qualified_name": r["qualified_name"],
-                "kind": r["kind"],
-                "file": r["file_path"],
-                "line": r["line"],
-                "is_definition": bool(r["is_definition"]),
-                "signature": r["signature"],
-                "docstring": r["docstring"],
-            }
-            for r in rows
-        ]
-        stale_f = _stale_files(conn, cfg["config_hash"], [r["file_path"] for r in rows])
-        if stale_f:
-            results.append({"warning": f"File(s) modified since last index — results may be outdated. Run 'fw-context index' or reindex_file(): {stale_f}"})
-        results += result_rows
-        return results
+            result_rows = [
+                {
+                    "name": r["name"],
+                    "qualified_name": r["qualified_name"],
+                    "kind": r["kind"],
+                    "file": r["file_path"],
+                    "line": r["line"],
+                    "is_definition": bool(r["is_definition"]),
+                    "signature": r["signature"],
+                    "docstring": r["docstring"],
+                }
+                for r in rows
+            ]
+            stale_f = _stale_files(conn, cfg["config_hash"], [r["file_path"] for r in rows])
+            if stale_f:
+                results.append({"warning": f"File(s) modified since last index — results may be outdated. Run 'fw-context index' or reindex_file(): {stale_f}"})
+            results += result_rows
+            return results
+    except Exception as e:
+        log.exception("lookup_symbol failed: %s", e)
+        return [{"error": f"lookup_symbol failed: {e}"}]
 
 
 @mcp.tool()
@@ -564,7 +572,7 @@ def check_ollama(project_root: str | None = None) -> dict:
 
 
 @mcp.tool()
-def explain_symbol(
+async def explain_symbol(
     name: str,
     project_root: str | None = None,
     context_lines: int = 40,
@@ -655,7 +663,7 @@ def explain_symbol(
         "signature": signature,
     }
     try:
-        result["explanation"] = call_ollama(prompt, cfg.llm)
+        result["explanation"] = await call_ollama_async(prompt, cfg.llm)
     except OllamaModelNotFoundError as e:
         result["warning"] = str(e)
     except OllamaError as e:
@@ -665,7 +673,7 @@ def explain_symbol(
 
 
 @mcp.tool()
-def smart_search(
+async def smart_search(
     query: str,
     project_root: str | None = None,
     limit: int = 20,
@@ -726,7 +734,7 @@ def smart_search(
             f"Description: {query}\n"
         )
         try:
-            raw = call_ollama(prompt, cfg.llm)
+            raw = await call_ollama_async(prompt, cfg.llm)
             keyword_queries = []
             for line in raw.splitlines():
                 # strip markdown: leading numbers/bullets, asterisks, backticks, quotes
