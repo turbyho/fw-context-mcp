@@ -67,17 +67,27 @@ def run(
         log.info("config_hash %s already indexed (%d symbols), skipping", config_hash[:12], existing)
         return config_hash
 
+    from .compile_commands import _SOURCE_EXTS  # reuse C/C++ extension set
+
     units = list(parse_compile_commands(compile_commands))
+    # Drop assembler and other non-C/C++ TUs libclang cannot parse
+    units = [u for u in units if u.file.suffix.lower() in _SOURCE_EXTS]
     log.info("TUs to index: %d", len(units))
 
     total_syms = 0
+    skipped = 0
     t0 = time.monotonic()
 
     for i, unit in enumerate(units):
         file_path = str(unit.file)
+        try:
+            syms = list(extract_symbols(unit, source_roots=source_roots))
+        except Exception as exc:
+            log.warning("skip TU %s: %s", unit.file.name, exc)
+            skipped += 1
+            continue
         with transaction(conn):
             file_id = upsert_file(conn, config_hash, file_path, unit.language)
-            syms = list(extract_symbols(unit, source_roots=source_roots))
             if not syms:
                 continue
             rows = [
@@ -108,7 +118,7 @@ def run(
 
     elapsed = time.monotonic() - t0
     log.info(
-        "Done: %d TUs, %d symbols in %.1fs (config_hash=%s)",
-        len(units), total_syms, elapsed, config_hash[:12],
+        "Done: %d TUs (%d skipped), %d symbols in %.1fs (config_hash=%s)",
+        len(units), skipped, total_syms, elapsed, config_hash[:12],
     )
     return config_hash
