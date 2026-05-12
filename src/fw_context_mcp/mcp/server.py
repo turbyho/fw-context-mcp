@@ -431,6 +431,10 @@ def reset_index(project_root: str | None = None, confirm: bool = False) -> dict:
         return info
 
     db_path.unlink()
+    for suffix in ("-wal", "-shm"):
+        p = db_path.with_name(db_path.name + suffix)
+        if p.exists():
+            p.unlink()
     info["action"] = "deleted"
     info["message"] = (
         f"Index deleted. Run 'fw-context index' in {root} to rebuild."
