@@ -215,3 +215,21 @@ def search_symbols(
            LIMIT ?""",
         (query, config_hash, limit),
     ).fetchall()
+
+
+def get_all_projects(conn: sqlite3.Connection) -> list[sqlite3.Row]:
+    """Return all projects with their latest build_config stats."""
+    return conn.execute(
+        """SELECT p.project_id, p.name, p.root_path,
+                  b.config_hash, b.created_at, b.compile_commands_path,
+                  COUNT(DISTINCT s.id) AS symbol_count,
+                  COUNT(DISTINCT f.id) AS file_count
+           FROM projects p
+           LEFT JOIN build_configs b ON b.project_id = p.project_id
+               AND b.created_at = (
+                   SELECT MAX(created_at) FROM build_configs WHERE project_id = p.project_id
+               )
+           LEFT JOIN symbols s ON s.config_hash = b.config_hash
+           LEFT JOIN files f ON f.config_hash = b.config_hash
+           GROUP BY p.project_id""",
+    ).fetchall()

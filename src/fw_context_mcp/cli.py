@@ -18,10 +18,17 @@ covers C/C++ translation units.
 
 ### When to use
 
+**Code search:**
 - Looking up a symbol definition or declaration → `lookup_symbol(name)`
 - Searching for functions/classes by topic → `search_code(query)` or `smart_search(query)`
 - Understanding what a function does → `explain_symbol(name)` (calls local Ollama)
 - Checking build metadata or index freshness → `get_active_build()`
+
+**Index administration:**
+- List all indexed projects → `list_projects()`
+- Delete index for a project (e.g. after toolchain change) → `reset_index(project_root?)`;
+  always call without `confirm` first (dry-run), then with `confirm=True` to proceed
+- Check Ollama model availability → `check_ollama()`
 
 ### Workflow
 
@@ -61,10 +68,17 @@ covers C/C++ translation units.
 
 ## When to use
 
+**Code search:**
 - Looking up a symbol definition or declaration → `lookup_symbol(name)`
 - Searching for functions/classes by topic → `search_code(query)` or `smart_search(query)`
 - Understanding what a function does → `explain_symbol(name)` (calls local Ollama)
 - Checking build metadata or index freshness → `get_active_build()`
+
+**Index administration:**
+- List all indexed projects → `list_projects()`
+- Delete index for a project (e.g. after toolchain change) → `reset_index(project_root?)`;
+  always call without `confirm` first (dry-run), then with `confirm=True` to proceed
+- Check Ollama model availability → `check_ollama()`
 
 ## Workflow
 
@@ -177,6 +191,150 @@ def cmd_search(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_list(args: argparse.Namespace) -> int:
+    from .config import load as load_config
+    from .indexer.db import get_all_projects, open_db
+
+    cfg = load_config()
+    index_dir = cfg.index.db_dir
+    db_files = sorted(index_dir.glob("*/index.db")) if index_dir.exists() else []
+
+    if not db_files:
+        print(f"No indexed projects under {index_dir}.")
+        return 0
+
+    for db_path in db_files:
+        try:
+            conn = open_db(db_path)
+            rows = get_all_projects(conn)
+            for r in rows:
+                stale_marker = " [STALE]" if _cli_is_stale(r) else ""
+                print(f"{r['name'] or r['project_id']}  {r['root_path']}{stale_marker}")
+                print(f"  symbols={r['symbol_count']}  files={r['file_count']}  indexed={r['created_at']}")
+                if args.verbose:
+                    print(f"  db={db_path}")
+                    print(f"  compile_commands={r['compile_commands_path']}")
+        except Exception as e:
+            print(f"[error] {db_path}: {e}", file=sys.stderr)
+    return 0
+
+
+def cmd_reset(args: argparse.Namespace) -> int:
+    import hashlib, subprocess
+    from .config import load as load_config
+    from .indexer.db import get_active_config, open_db
+
+    project_root = Path(args.project or ".").resolve()
+    cfg = load_config(project_root=project_root)
+
+    try:
+        url = subprocess.check_output(
+            ["git", "remote", "get-url", "origin"],
+            cwd=project_root, stderr=subprocess.DEVNULL,
+        ).decode().strip()
+        project_id = hashlib.sha256(url.encode()).hexdigest()[:16]
+    except Exception:
+        project_id = hashlib.sha256(str(project_root).encode()).hexdigest()[:16]
+
+    db_path = cfg.index.db_dir / project_id / "index.db"
+    if not db_path.exists():
+        print(f"No index found for {project_root}.")
+        return 1
+
+    conn = open_db(db_path)
+    active = get_active_config(conn, project_id)
+    conn.close()
+
+    sym_count = 0
+    if active:
+        from .indexer.db import open_db as _open
+        sym_count = _open(db_path).execute(
+            "SELECT COUNT(*) FROM symbols WHERE config_hash=?",
+            (active["config_hash"],),
+        ).fetchone()[0]
+
+    print(f"Project : {project_root}")
+    print(f"DB      : {db_path}")
+    if active:
+        print(f"Symbols : {sym_count}  indexed={active['created_at']}")
+
+    if not args.yes:
+        answer = input("Delete index? [y/N] ").strip().lower()
+        if answer != "y":
+            print("Aborted.")
+            return 0
+
+    db_path.unlink()
+    print(f"Index deleted. Run 'fw-context index' to rebuild.")
+    return 0
+
+
+def cmd_status(args: argparse.Namespace) -> int:
+    import hashlib, os, subprocess
+    from datetime import datetime, timezone
+    from .config import load as load_config
+    from .indexer.db import get_active_config, open_db
+
+    project_root = Path(args.project or ".").resolve()
+    cfg = load_config(project_root=project_root)
+
+    try:
+        url = subprocess.check_output(
+            ["git", "remote", "get-url", "origin"],
+            cwd=project_root, stderr=subprocess.DEVNULL,
+        ).decode().strip()
+        project_id = hashlib.sha256(url.encode()).hexdigest()[:16]
+    except Exception:
+        project_id = hashlib.sha256(str(project_root).encode()).hexdigest()[:16]
+
+    db_path = cfg.index.db_dir / project_id / "index.db"
+    if not db_path.exists():
+        print(f"No index found. Run 'fw-context index' first.")
+        return 1
+
+    conn = open_db(db_path)
+    active = get_active_config(conn, project_id)
+    if not active:
+        print("No build config indexed.")
+        return 1
+
+    sym_count = conn.execute(
+        "SELECT COUNT(*) FROM symbols WHERE config_hash=?", (active["config_hash"],)
+    ).fetchone()[0]
+    file_count = conn.execute(
+        "SELECT COUNT(*) FROM files WHERE config_hash=?", (active["config_hash"],)
+    ).fetchone()[0]
+
+    stale = False
+    cc = active["compile_commands_path"]
+    if cc and Path(cc).exists():
+        cc_mtime = os.path.getmtime(cc)
+        indexed_at = datetime.fromisoformat(active["created_at"]).replace(tzinfo=timezone.utc)
+        stale = cc_mtime > indexed_at.timestamp() + 1
+
+    print(f"Project : {project_root}")
+    print(f"Symbols : {sym_count}  files={file_count}")
+    print(f"Indexed : {active['created_at']}{'  [STALE]' if stale else ''}")
+    print(f"DB      : {db_path}")
+    if stale:
+        print(f"  compile_commands.json changed — run 'fw-context index' to update")
+    return 0
+
+
+def _cli_is_stale(row) -> bool:
+    import os
+    from datetime import datetime, timezone
+    try:
+        cc = row["compile_commands_path"]
+        if not cc or not Path(cc).exists():
+            return False
+        cc_mtime = os.path.getmtime(cc)
+        indexed_at = datetime.fromisoformat(row["created_at"]).replace(tzinfo=timezone.utc)
+        return cc_mtime > indexed_at.timestamp() + 1
+    except Exception:
+        return False
+
+
 def cmd_init(args: argparse.Namespace) -> int:
     import shutil
     import subprocess
@@ -271,6 +429,18 @@ def main() -> None:
 
     p_init = sub.add_parser("init", help="Register fw-context in Claude Code and OpenCode globally")
     p_init.set_defaults(func=cmd_init)
+
+    p_list = sub.add_parser("list", help="List all indexed projects")
+    p_list.set_defaults(func=cmd_list)
+
+    p_reset = sub.add_parser("reset", help="Delete the index for a project")
+    p_reset.add_argument("--project", metavar="DIR", help="Project root (default: cwd)")
+    p_reset.add_argument("-y", "--yes", action="store_true", help="Skip confirmation prompt")
+    p_reset.set_defaults(func=cmd_reset)
+
+    p_status = sub.add_parser("status", help="Show index status for the current project")
+    p_status.add_argument("--project", metavar="DIR")
+    p_status.set_defaults(func=cmd_status)
 
     args = parser.parse_args()
     if not hasattr(args, "func"):

@@ -11,7 +11,7 @@ from pathlib import Path
 from mcp.server.fastmcp import FastMCP
 
 from ..config import load as load_config
-from ..indexer.db import get_active_config, open_db, search_symbols
+from ..indexer.db import get_active_config, get_all_projects, open_db, search_symbols
 from ..llm.ollama import OllamaError, OllamaModelNotFoundError, call_ollama, check_setup
 
 log = logging.getLogger(__name__)
@@ -234,6 +234,105 @@ def lookup_symbol(
         for r in rows
     ]
     return results
+
+
+@mcp.tool()
+def list_projects(project_root: str | None = None) -> list[dict]:
+    """List all indexed firmware projects with their status.
+
+    Args:
+        project_root: If given, uses that project's db. Otherwise scans all
+                      known db files under ~/.fw-context/index/.
+
+    Returns a list of dicts with project_id, name, root_path, symbol_count,
+    file_count, indexed_at, stale, build_system.
+    """
+    cfg = load_config(project_root=Path(project_root).resolve() if project_root else None)
+    index_dir = cfg.index.db_dir
+
+    db_files = list(index_dir.glob("*/index.db")) if index_dir.exists() else []
+    if not db_files:
+        return [{"info": f"No indexed projects found under {index_dir}."}]
+
+    results: list[dict] = []
+    for db_path in sorted(db_files):
+        try:
+            conn = open_db(db_path)
+            rows = get_all_projects(conn)
+            for r in rows:
+                stale = _is_stale(
+                    {"created_at": r["created_at"]},
+                    r["compile_commands_path"],
+                ) if r["compile_commands_path"] else False
+                root = Path(r["root_path"]) if r["root_path"] else None
+                results.append({
+                    "project_id": r["project_id"],
+                    "name": r["name"],
+                    "root_path": r["root_path"],
+                    "build_system": _detect_build_system(root) if root else "unknown",
+                    "symbol_count": r["symbol_count"],
+                    "file_count": r["file_count"],
+                    "indexed_at": r["created_at"],
+                    "stale": stale,
+                    "db": str(db_path),
+                })
+        except Exception as e:
+            results.append({"db": str(db_path), "error": str(e)})
+
+    return results
+
+
+@mcp.tool()
+def reset_index(project_root: str | None = None, confirm: bool = False) -> dict:
+    """Delete the symbol index for a project so it can be re-indexed from scratch.
+
+    Args:
+        project_root: Absolute path to the project. Defaults to nearest git root.
+        confirm: Must be True to actually delete. When False, returns what would
+                 be deleted without taking any action (dry-run).
+
+    Use this when the index is corrupt, after a toolchain change, or when
+    compile_commands.json has changed significantly. After reset, run
+    'fw-context index' to rebuild.
+    """
+    root = _resolve_project_root(project_root)
+    db_path = _db_path(root)
+
+    if not db_path.exists():
+        return {"error": f"No index found for {root}. Nothing to reset."}
+
+    conn = open_db(db_path)
+    project_id = _derive_project_id(root)
+    cfg_data = get_active_config(conn, project_id)
+    conn.close()
+
+    info = {
+        "project_root": str(root),
+        "db": str(db_path),
+        "project_id": project_id,
+    }
+    if cfg_data:
+        sym_count = open_db(db_path).execute(
+            "SELECT COUNT(*) FROM symbols WHERE config_hash=?",
+            (cfg_data["config_hash"],),
+        ).fetchone()[0]
+        info["symbol_count"] = sym_count
+        info["indexed_at"] = cfg_data["created_at"]
+
+    if not confirm:
+        info["action"] = "dry_run"
+        info["message"] = (
+            f"Would delete {db_path}. "
+            "Call reset_index(confirm=True) to proceed."
+        )
+        return info
+
+    db_path.unlink()
+    info["action"] = "deleted"
+    info["message"] = (
+        f"Index deleted. Run 'fw-context index' in {root} to rebuild."
+    )
+    return info
 
 
 @mcp.tool()
