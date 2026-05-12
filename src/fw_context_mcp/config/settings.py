@@ -160,3 +160,18 @@ def load(project_root: Path | None = None) -> Config:
     cfg.index.db_dir = cfg.index.db_dir.expanduser().resolve()
 
     return cfg
+
+
+def derive_project_id(root: Path) -> str:
+    """Derive a stable project_id from git remote URL or directory path."""
+    import hashlib
+    import subprocess
+
+    try:
+        url = subprocess.check_output(
+            ["git", "remote", "get-url", "origin"],
+            cwd=root, stderr=subprocess.DEVNULL,
+        ).decode().strip()
+        return hashlib.sha256(url.encode()).hexdigest()[:16]
+    except Exception:
+        return hashlib.sha256(str(root.resolve()).encode()).hexdigest()[:16]

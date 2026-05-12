@@ -104,6 +104,7 @@ def transaction(conn: sqlite3.Connection) -> Generator[sqlite3.Connection, None,
     try:
         yield conn
         conn.commit()
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
     except Exception:
         conn.rollback()
         raise
@@ -215,6 +216,15 @@ def search_symbols(
            LIMIT ?""",
         (query, config_hash, limit),
     ).fetchall()
+
+
+def get_file_mtime_indexed(conn: sqlite3.Connection, config_hash: str, path: str) -> float | None:
+    """Return the stored mtime for a file, or None if not in the index."""
+    row = conn.execute(
+        "SELECT mtime FROM files WHERE config_hash=? AND path=?",
+        (config_hash, path),
+    ).fetchone()
+    return row["mtime"] if row else None
 
 
 def get_all_projects(conn: sqlite3.Connection) -> list[sqlite3.Row]:

@@ -110,7 +110,7 @@ fw-context index
 
 
 def cmd_index(args: argparse.Namespace) -> int:
-    from .config import load as load_config
+    from .config import derive_project_id, load as load_config
     from .indexer.runner import run
 
     logging.basicConfig(
@@ -129,15 +129,7 @@ def cmd_index(args: argparse.Namespace) -> int:
         print(f"error: {compile_commands} not found", file=sys.stderr)
         return 1
 
-    import hashlib, subprocess
-    try:
-        url = subprocess.check_output(
-            ["git", "remote", "get-url", "origin"],
-            cwd=project_root, stderr=subprocess.DEVNULL,
-        ).decode().strip()
-        project_id = hashlib.sha256(url.encode()).hexdigest()[:16]
-    except Exception:
-        project_id = hashlib.sha256(str(project_root).encode()).hexdigest()[:16]
+    project_id = derive_project_id(project_root)
 
     db_path = cfg.index.db_dir / project_id / "index.db"
 
@@ -156,19 +148,11 @@ def cmd_index(args: argparse.Namespace) -> int:
 
 
 def cmd_search(args: argparse.Namespace) -> int:
-    import hashlib
-    import subprocess
+    from .config import derive_project_id
     from .indexer.db import get_active_config, open_db, search_symbols
 
     project_root = Path(args.project or ".").resolve()
-    try:
-        url = subprocess.check_output(
-            ["git", "remote", "get-url", "origin"],
-            cwd=project_root, stderr=subprocess.DEVNULL,
-        ).decode().strip()
-        project_id = hashlib.sha256(url.encode()).hexdigest()[:16]
-    except Exception:
-        project_id = hashlib.sha256(str(project_root).encode()).hexdigest()[:16]
+    project_id = derive_project_id(project_root)
 
     db_path = Path.home() / ".fw-context" / "index" / project_id / "index.db"
     if not db_path.exists():
@@ -220,21 +204,13 @@ def cmd_list(args: argparse.Namespace) -> int:
 
 
 def cmd_reset(args: argparse.Namespace) -> int:
-    import hashlib, subprocess
-    from .config import load as load_config
+    from .config import derive_project_id, load as load_config
     from .indexer.db import get_active_config, open_db
 
     project_root = Path(args.project or ".").resolve()
     cfg = load_config(project_root=project_root)
 
-    try:
-        url = subprocess.check_output(
-            ["git", "remote", "get-url", "origin"],
-            cwd=project_root, stderr=subprocess.DEVNULL,
-        ).decode().strip()
-        project_id = hashlib.sha256(url.encode()).hexdigest()[:16]
-    except Exception:
-        project_id = hashlib.sha256(str(project_root).encode()).hexdigest()[:16]
+    project_id = derive_project_id(project_root)
 
     db_path = cfg.index.db_dir / project_id / "index.db"
     if not db_path.exists():
@@ -270,22 +246,15 @@ def cmd_reset(args: argparse.Namespace) -> int:
 
 
 def cmd_status(args: argparse.Namespace) -> int:
-    import hashlib, os, subprocess
+    import os
     from datetime import datetime, timezone
-    from .config import load as load_config
+    from .config import derive_project_id, load as load_config
     from .indexer.db import get_active_config, open_db
 
     project_root = Path(args.project or ".").resolve()
     cfg = load_config(project_root=project_root)
 
-    try:
-        url = subprocess.check_output(
-            ["git", "remote", "get-url", "origin"],
-            cwd=project_root, stderr=subprocess.DEVNULL,
-        ).decode().strip()
-        project_id = hashlib.sha256(url.encode()).hexdigest()[:16]
-    except Exception:
-        project_id = hashlib.sha256(str(project_root).encode()).hexdigest()[:16]
+    project_id = derive_project_id(project_root)
 
     db_path = cfg.index.db_dir / project_id / "index.db"
     if not db_path.exists():

@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
-import hashlib
 import logging
 import time
 from pathlib import Path
 
+from ..config.settings import derive_project_id
 from .compile_commands import parse as parse_compile_commands
 from .config_hash import compute as compute_config_hash
 from .db import (
@@ -22,19 +22,6 @@ from .db import (
 from .symbols import extract as extract_symbols
 
 log = logging.getLogger(__name__)
-
-
-def _project_id(root: Path) -> str:
-    """Derive a stable project_id from git remote URL or directory path."""
-    try:
-        import subprocess
-        out = subprocess.check_output(
-            ["git", "remote", "get-url", "origin"],
-            cwd=root, stderr=subprocess.DEVNULL,
-        ).decode().strip()
-        return hashlib.sha256(out.encode()).hexdigest()[:16]
-    except Exception:
-        return hashlib.sha256(str(root.resolve()).encode()).hexdigest()[:16]
 
 
 def run(
@@ -54,7 +41,7 @@ def run(
         exclude_paths = []
     exclude_paths = [p.resolve() for p in exclude_paths]
 
-    project_id = _project_id(project_root)
+    project_id = derive_project_id(project_root)
     name = project_name or project_root.name
     config_hash = compute_config_hash(compile_commands)
 

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import logging
 import os
 from datetime import datetime, timezone
@@ -10,8 +9,8 @@ from pathlib import Path
 
 from mcp.server.fastmcp import FastMCP
 
-from ..config import load as load_config
-from ..indexer.db import get_active_config, get_all_projects, open_db, search_symbols
+from ..config import derive_project_id, load as load_config
+from ..indexer.db import get_active_config, get_all_projects, get_file_mtime_indexed, open_db, search_symbols
 from ..llm.ollama import OllamaError, OllamaModelNotFoundError, call_ollama, check_setup
 
 log = logging.getLogger(__name__)
@@ -23,20 +22,8 @@ mcp = FastMCP(
 
 def _db_path(project_root: Path) -> Path:
     cfg = load_config(project_root=project_root)
-    project_id = _derive_project_id(project_root)
+    project_id = derive_project_id(project_root)
     return cfg.index.db_dir / project_id / "index.db"
-
-
-def _derive_project_id(root: Path) -> str:
-    try:
-        import subprocess
-        url = subprocess.check_output(
-            ["git", "remote", "get-url", "origin"],
-            cwd=root, stderr=subprocess.DEVNULL,
-        ).decode().strip()
-        return hashlib.sha256(url.encode()).hexdigest()[:16]
-    except Exception:
-        return hashlib.sha256(str(root.resolve()).encode()).hexdigest()[:16]
 
 
 def _resolve_project_root(project_root: str | None) -> Path:
@@ -52,7 +39,7 @@ def _resolve_project_root(project_root: str | None) -> Path:
     return cwd
 
 
-def _is_stale(cfg: object, compile_commands_path: str) -> bool:
+def _is_stale(cfg, compile_commands_path: str) -> bool:
     """Return True if compile_commands.json is newer than the indexed timestamp."""
     try:
         cc_mtime = os.path.getmtime(compile_commands_path)
@@ -60,6 +47,21 @@ def _is_stale(cfg: object, compile_commands_path: str) -> bool:
         return cc_mtime > indexed_at.timestamp() + 1
     except Exception:
         return False
+
+
+def _stale_files(conn, config_hash: str, file_paths: list[str]) -> list[str]:
+    """Return subset of file_paths whose on-disk mtime is newer than stored mtime."""
+    stale = []
+    for path in dict.fromkeys(file_paths):  # deduplicate, preserve order
+        try:
+            stored = get_file_mtime_indexed(conn, config_hash, path)
+            if stored is None:
+                continue
+            if os.path.getmtime(path) > stored + 1:
+                stale.append(path)
+        except OSError:
+            pass
+    return stale
 
 
 def _detect_build_system(root: Path) -> str:
@@ -80,11 +82,24 @@ def _detect_build_system(root: Path) -> str:
 def get_active_build(project_root: str | None = None) -> dict:
     """Return metadata about the most recently indexed build configuration.
 
+    Call this at the start of every session to confirm the index exists and is
+    not stale. If ``stale`` is true, remind the user to run ``fw-context index``
+    before relying on search results.
+
     Args:
         project_root: Absolute path to the project. Defaults to nearest git root.
 
-    Returns a dict with config_hash, project name, compile_commands path, and
-    symbol/file counts.
+    Returns:
+        dict with keys:
+        - config_hash (str): identity of the indexed build config
+        - project_id (str): stable hex id derived from git remote URL
+        - project_root (str): absolute path to the project
+        - build_system (str): one of "mbed-os", "zephyr", "platformio", "unknown"
+        - compile_commands (str): path to the compile_commands.json used
+        - indexed_at (str): ISO-8601 timestamp of when the index was built
+        - symbol_count (int): total symbols in the index
+        - file_count (int): total files indexed
+        - stale (bool): True when compile_commands.json is newer than the index
     """
     root = _resolve_project_root(project_root)
     db_path = _db_path(root)
@@ -92,7 +107,7 @@ def get_active_build(project_root: str | None = None) -> dict:
         return {"error": f"No index found for {root}. Run 'fw-context index' first."}
 
     conn = open_db(db_path)
-    project_id = _derive_project_id(root)
+    project_id = derive_project_id(root)
     cfg = get_active_config(conn, project_id)
     if not cfg:
         return {"error": f"No build config indexed for project at {root}."}
@@ -127,14 +142,32 @@ def search_code(
 ) -> list[dict]:
     """Full-text search over indexed symbols (functions, classes, methods, enums, etc.).
 
+    Use when looking for symbols by topic or keyword rather than exact name.
+    Prefer ``lookup_symbol`` when you already know the symbol name.
+
+    **FTS5 syntax:**
+    - ``init*`` matches init, init_uart, initialize (trailing wildcard)
+    - ``"spi init"`` matches the exact phrase "spi init"
+    - Do NOT use underscore in queries — ``modem_init`` is split into
+      ``modem AND init``. Use ``modem init`` instead.
+
+    **Kind filter values:** ``function``, ``method``, ``constructor``,
+    ``destructor``, ``class``, ``struct``, ``enum``, ``enum_constant``,
+    ``typedef``, ``variable``, ``field``, ``namespace``.
+
     Args:
-        query: Search term(s). Supports FTS5 syntax (prefix: "init*", phrase: '"spi init"').
+        query: Search term(s) with FTS5 syntax. Keep queries short — 1–3 words.
         project_root: Absolute path to the project. Defaults to nearest git root.
-        kind: Optional filter by symbol kind: function, method, class, struct, enum,
-              typedef, variable, field, enum_constant, namespace.
+        kind: Optional filter to return only symbols of this kind.
         limit: Maximum number of results (default 20, max 100).
 
-    Returns list of dicts with name, qualified_name, kind, file, line, signature, docstring.
+    Returns:
+        list of dicts, each with: name, qualified_name, kind, file, line,
+        is_definition, signature, docstring. May include a ``warning`` entry
+        when the index is stale or individual files were modified.
+
+    Example:
+        ``search_code("modem init", kind="method", limit=5)``
     """
     root = _resolve_project_root(project_root)
     db_path = _db_path(root)
@@ -142,7 +175,7 @@ def search_code(
         return [{"error": f"No index found for {root}. Run 'fw-context index' first."}]
 
     conn = open_db(db_path)
-    project_id = _derive_project_id(root)
+    project_id = derive_project_id(root)
     cfg = get_active_config(conn, project_id)
     if not cfg:
         return [{"error": "No build config indexed."}]
@@ -157,7 +190,7 @@ def search_code(
     if _is_stale(cfg, cfg["compile_commands_path"]):
         results.append({"warning": "Index may be stale — compile_commands.json changed since last index. Run 'fw-context index' to update."})
 
-    results += [
+    result_rows = [
         {
             "name": r["name"],
             "qualified_name": r["qualified_name"],
@@ -170,6 +203,10 @@ def search_code(
         }
         for r in rows
     ]
+    stale_f = _stale_files(conn, cfg["config_hash"], [r["file_path"] for r in rows])
+    if stale_f:
+        results.append({"warning": f"File(s) modified since last index — results may be outdated. Run 'fw-context index' or reindex_file(): {stale_f}"})
+    results += result_rows
     return results
 
 
@@ -179,12 +216,28 @@ def lookup_symbol(
     project_root: str | None = None,
     exact: bool = False,
 ) -> list[dict]:
-    """Look up a symbol by name. Returns all matches (declarations + definitions).
+    """Look up a symbol by name. Returns all matches — declarations and definitions.
+
+    Use when you know the exact or partial name of a symbol and want its
+    location, signature, and whether it's a definition or just a declaration.
+    For keyword-based search, use ``search_code`` instead.
+
+    When ``exact=False`` (the default), the lookup uses prefix matching —
+    ``lookup_symbol("Box")`` returns ``BoxManager``, ``BoxManager::init``, etc.
+    When ``exact=True``, only symbols whose name is exactly ``name`` are returned.
 
     Args:
-        name: Symbol name to look up (case-sensitive).
-        project_root: Absolute path to the project.
+        name: Symbol name (case-sensitive). Use prefix match by default.
+        project_root: Absolute path to the project. Defaults to nearest git root.
         exact: If True, match exact name only. If False, also match as prefix.
+
+    Returns:
+        list of dicts with: name, qualified_name, kind, file, line,
+        is_definition, signature, docstring. Definitions are sorted first.
+        May include a ``warning`` when the index is stale.
+
+    Example:
+        ``lookup_symbol("BoxManager", exact=True)`` → constructor + class
     """
     root = _resolve_project_root(project_root)
     db_path = _db_path(root)
@@ -192,7 +245,7 @@ def lookup_symbol(
         return [{"error": f"No index found for {root}."}]
 
     conn = open_db(db_path)
-    project_id = _derive_project_id(root)
+    project_id = derive_project_id(root)
     cfg = get_active_config(conn, project_id)
     if not cfg:
         return [{"error": "No build config indexed."}]
@@ -220,7 +273,7 @@ def lookup_symbol(
     if _is_stale(cfg, cfg["compile_commands_path"]):
         results.append({"warning": "Index may be stale — compile_commands.json changed since last index. Run 'fw-context index' to update."})
 
-    results += [
+    result_rows = [
         {
             "name": r["name"],
             "qualified_name": r["qualified_name"],
@@ -233,6 +286,10 @@ def lookup_symbol(
         }
         for r in rows
     ]
+    stale_f = _stale_files(conn, cfg["config_hash"], [r["file_path"] for r in rows])
+    if stale_f:
+        results.append({"warning": f"File(s) modified since last index — results may be outdated. Run 'fw-context index' or reindex_file(): {stale_f}"})
+    results += result_rows
     return results
 
 
@@ -240,12 +297,16 @@ def lookup_symbol(
 def list_projects(project_root: str | None = None) -> list[dict]:
     """List all indexed firmware projects with their status.
 
-    Args:
-        project_root: If given, uses that project's db. Otherwise scans all
-                      known db files under ~/.fw-context/index/.
+    Use to discover which projects are available, check their index health
+    (symbol count, staleness), and find the project_id for operations.
 
-    Returns a list of dicts with project_id, name, root_path, symbol_count,
-    file_count, indexed_at, stale, build_system.
+    Args:
+        project_root: If given, returns only the project matching this path.
+                      Otherwise scans all db files under ``~/.fw-context/index/``.
+
+    Returns:
+        list of dicts, each with: project_id, name, root_path, build_system,
+        symbol_count, file_count, indexed_at, stale, db (path to index file).
     """
     cfg = load_config(project_root=Path(project_root).resolve() if project_root else None)
     index_dir = cfg.index.db_dir
@@ -286,14 +347,19 @@ def list_projects(project_root: str | None = None) -> list[dict]:
 def reset_index(project_root: str | None = None, confirm: bool = False) -> dict:
     """Delete the symbol index for a project so it can be re-indexed from scratch.
 
+    Use after a toolchain change, compiler upgrade, or when the index is corrupt.
+    **Always call without confirm first** (dry-run) to see what would be deleted,
+    then call with ``confirm=True`` to proceed. After reset, remind the user to
+    run ``fw-context index`` to rebuild.
+
     Args:
         project_root: Absolute path to the project. Defaults to nearest git root.
-        confirm: Must be True to actually delete. When False, returns what would
-                 be deleted without taking any action (dry-run).
+        confirm: Must be True to actually delete. When False (default), returns
+                 what would be deleted without taking any action (dry-run).
 
-    Use this when the index is corrupt, after a toolchain change, or when
-    compile_commands.json has changed significantly. After reset, run
-    'fw-context index' to rebuild.
+    Returns:
+        dict with: project_root, db (path), project_id, symbol_count,
+        indexed_at, action ("dry_run" or "deleted"), message.
     """
     root = _resolve_project_root(project_root)
     db_path = _db_path(root)
@@ -302,7 +368,7 @@ def reset_index(project_root: str | None = None, confirm: bool = False) -> dict:
         return {"error": f"No index found for {root}. Nothing to reset."}
 
     conn = open_db(db_path)
-    project_id = _derive_project_id(root)
+    project_id = derive_project_id(root)
     cfg_data = get_active_config(conn, project_id)
     conn.close()
 
@@ -336,17 +402,142 @@ def reset_index(project_root: str | None = None, confirm: bool = False) -> dict:
 
 
 @mcp.tool()
+def reindex_file(
+    file_path: str,
+    project_root: str | None = None,
+) -> dict:
+    """Re-parse a single source file and update its symbols in the index.
+
+    Use after editing a .c/.cpp file to keep the index current without running
+    a full ``fw-context index``. The tool finds the translation unit in
+    compile_commands.json that corresponds to the given file, re-parses it with
+    libclang, and replaces the old symbols atomically.
+
+    **Limitations:**
+    - Only processes one translation unit per matching entry. If a header appears
+      in multiple TUs, only the first matching TU is used — other TUs including
+      that header may still have stale symbols. Run ``fw-context index`` for full
+      accuracy.
+    - The file must appear in compile_commands.json. Header-only files without
+      a corresponding .c/.cpp entry cannot be re-indexed this way.
+
+    Args:
+        file_path: Absolute path to the source file to re-index (.c/.cpp only).
+        project_root: Absolute path to the project. Defaults to nearest git root.
+
+    Returns:
+        dict with: file, translation_units (count), symbols_updated, elapsed_s.
+        When re-indexing a header via a single TU, includes a warning that other
+        TUs may be stale.
+    """
+    import time
+
+    from ..indexer.compile_commands import parse as parse_cc
+    from ..indexer.db import delete_symbols_for_file, get_file_mtimes, insert_symbols_batch, transaction, upsert_file
+    from ..indexer.symbols import extract
+
+    root = _resolve_project_root(project_root)
+    db_path = _db_path(root)
+    if not db_path.exists():
+        return {"error": f"No index found for {root}. Run 'fw-context index' first."}
+
+    conn = open_db(db_path)
+    project_id = derive_project_id(root)
+    cfg_data = get_active_config(conn, project_id)
+    if not cfg_data:
+        return {"error": "No build config indexed."}
+
+    target = Path(file_path).resolve()
+    if not target.exists():
+        return {"error": f"File not found: {target}"}
+
+    cfg = load_config(project_root=root)
+    cc_path = Path(cfg_data["compile_commands_path"])
+    if not cc_path.exists():
+        return {"error": f"compile_commands.json not found: {cc_path}"}
+
+    units = parse_cc(cc_path)
+    matching = [u for u in units if Path(u.file).resolve() == target]
+    if not matching:
+        return {"error": f"{target.name} not found in compile_commands.json — it may be a header-only file."}
+
+    config_hash = cfg_data["config_hash"]
+    source_roots = cfg.source_root_paths(root)
+    exclude_paths = cfg.exclude_root_paths(root)
+
+    t0 = time.monotonic()
+    total_symbols = 0
+
+    for unit in matching:
+        file_path_str = str(unit.file.resolve())
+        current_mtime = unit.file.stat().st_mtime if unit.file.exists() else 0.0
+
+        # Extract first — if this fails, skip TU without touching DB
+        try:
+            syms = list(extract(unit, source_roots=source_roots, exclude_paths=exclude_paths))
+        except Exception as exc:
+            log.warning("skip reindex TU %s: %s", unit.file.name, exc)
+            continue
+
+        with transaction(conn):
+            existing = get_file_mtimes(conn, config_hash)
+            if file_path_str in existing:
+                file_id_old, _ = existing[file_path_str]
+                delete_symbols_for_file(conn, file_id_old)
+
+            file_id_cache: dict[str, int] = {}
+            rows = []
+            for s in syms:
+                sym_file = s.file
+                if sym_file not in file_id_cache:
+                    from pathlib import Path as P
+                    lang = "cpp" if P(sym_file).suffix.lower() in {".cpp", ".cc", ".cxx", ".c++"} else "c"
+                    file_id_cache[sym_file] = upsert_file(conn, config_hash, sym_file, lang, mtime=current_mtime if sym_file == file_path_str else 0.0)
+                rows.append((
+                    config_hash, file_id_cache[sym_file], s.usr, s.name,
+                    s.qualified_name, s.kind, s.line, s.column,
+                    int(s.is_definition), s.signature, s.docstring,
+                ))
+
+            if rows:
+                total_symbols += insert_symbols_batch(conn, rows)
+
+            upsert_file(conn, config_hash, file_path_str, unit.language, mtime=current_mtime)
+
+    elapsed = round(time.monotonic() - t0, 2)
+
+    result = {
+        "file": str(target),
+        "translation_units": len(matching),
+        "symbols_updated": total_symbols,
+        "elapsed_s": elapsed,
+    }
+    if len(matching) == 1 and target.suffix.lower() in {".h", ".hpp"}:
+        result["warning"] = "Header re-indexed via one TU. Other TUs including this header may still have stale symbols — run 'fw-context index' for full accuracy."
+    return result
+
+
+@mcp.tool()
 def check_ollama(project_root: str | None = None) -> dict:
     """Check whether Ollama is running and the configured model is installed.
+
+    Call before the first ``explain_symbol`` or ``smart_search`` call in a session
+    to verify the local LLM is available. These tools fall back to direct search
+    when Ollama is unavailable, but checking first avoids confusing warnings.
 
     Args:
         project_root: Absolute path to the project. Defaults to nearest git root.
 
-    Returns a status dict:
-      - status: "ok" | "model_missing" | "error"
-      - ollama_running: bool
-      - configured_model, num_ctx, installed_models
-      - message + available_code_models when status != "ok"
+    Returns:
+        dict with:
+        - status: "ok" | "model_missing" | "error"
+        - ollama_running (bool)
+        - configured_model (str): the model name from config
+        - num_ctx (int): context size setting
+        - installed_models (list[str]): all models available in Ollama
+        - message (str, when status != "ok"): human-readable description
+        - available_code_models (list[str], when model missing): code-related
+          models that are already installed and could be used instead
     """
     root = _resolve_project_root(project_root)
     cfg = load_config(project_root=root)
@@ -361,12 +552,24 @@ def explain_symbol(
 ) -> dict:
     """Look up a symbol and ask Ollama to explain what it does.
 
-    Args:
-        name: Symbol name (exact match).
-        project_root: Absolute path to the project. Defaults to nearest git root.
-        context_lines: Lines of source code to include above and below the definition.
+    Sends the symbol's source code context (surrounding lines) to a local
+    Ollama model for a plain-English explanation. The explanation is 2–4
+    sentences, focused on purpose and behaviour.
 
-    Returns dict with name, file, line, signature, and explanation (or error).
+    **Performance:** Each call takes 10–30 seconds. Do NOT call in a loop
+    over many symbols. Call ``check_ollama()`` first to verify the model is
+    available. Falls back with a warning when Ollama is unavailable.
+
+    Args:
+        name: Symbol name (exact match). If multiple symbols share the name,
+              the definition is preferred over declarations.
+        project_root: Absolute path to the project. Defaults to nearest git root.
+        context_lines: Lines of source code to include above and below the
+                       definition for context (default 40).
+
+    Returns:
+        dict with: name, kind, file, line, signature, and either explanation
+        (str) or warning (str) when Ollama is unavailable.
     """
     root = _resolve_project_root(project_root)
     db_path = _db_path(root)
@@ -374,7 +577,7 @@ def explain_symbol(
         return {"error": f"No index found for {root}. Run 'fw-context index' first."}
 
     conn = open_db(db_path)
-    project_id = _derive_project_id(root)
+    project_id = derive_project_id(root)
     cfg_data = get_active_config(conn, project_id)
     if not cfg_data:
         return {"error": "No build config indexed."}
@@ -452,12 +655,29 @@ def smart_search(
 ) -> list[dict]:
     """Natural-language search: Ollama generates FTS5 keywords, then searches the index.
 
+    Translates a natural-language description into 2–4 FTS5 search terms by
+    asking a local Ollama model, then runs ``search_code`` for each generated
+    term and merges unique results.
+
+    **When to prefer over search_code:** When you don't know the exact keywords
+    and want to describe what you're looking for ("how does the modem connect?",
+    "handle BLE pairing failure").
+
+    **Fallback:** When Ollama is unavailable or the model is not installed,
+    falls back to direct FTS5 search with the original query text. Results
+    include ``_generated_queries`` so you can see which terms were used.
+
     Args:
         query: Natural language description of what you're looking for.
+               Be specific — 5–15 words works best.
         project_root: Absolute path to the project. Defaults to nearest git root.
-        limit: Maximum number of results (default 20).
+        limit: Maximum number of results (default 20, max 100).
 
-    Falls back to direct FTS5 search when Ollama is unavailable.
+    Returns:
+        list of dicts. The first entry is ``_generated_queries`` with the list
+        of search terms used. Subsequent entries are symbol results in the same
+        format as ``search_code``. May include a warning when Ollama is
+        unavailable or the index is stale.
     """
     root = _resolve_project_root(project_root)
     db_path = _db_path(root)
@@ -465,7 +685,7 @@ def smart_search(
         return [{"error": f"No index found for {root}. Run 'fw-context index' first."}]
 
     conn = open_db(db_path)
-    project_id = _derive_project_id(root)
+    project_id = derive_project_id(root)
     cfg_data = get_active_config(conn, project_id)
     if not cfg_data:
         return [{"error": "No build config indexed."}]
@@ -531,11 +751,13 @@ def smart_search(
     results: list[dict] = []
     if ollama_warning:
         results.append(ollama_warning)
-    elif _is_stale(cfg_data, cfg_data["compile_commands_path"]):
+    if not ollama_warning and _is_stale(cfg_data, cfg_data["compile_commands_path"]):
         results.append({"warning": "Index may be stale — run 'fw-context index'."})
 
     results.append({"_generated_queries": keyword_queries})
     results += list(seen.values())[:limit]
+    if not seen:
+        results.append({"info": "No results found for the generated queries."})
     return results
 
 
