@@ -61,6 +61,14 @@ def _is_stale(cfg: object, compile_commands_path: str) -> bool:
         return False
 
 
+def _detect_build_system(root: Path) -> str:
+    if (root / "mbed-os").is_dir() or (root / "mbed_app.json").exists():
+        return "mbed-os"
+    if (root / "west.yml").exists() or (root / "prj.conf").exists():
+        return "zephyr"
+    return "unknown"
+
+
 # ---------------------------------------------------------------------------
 # Tools
 # ---------------------------------------------------------------------------
@@ -98,6 +106,7 @@ def get_active_build(project_root: str | None = None) -> dict:
         "config_hash": config_hash,
         "project_id": project_id,
         "project_root": str(root),
+        "build_system": _detect_build_system(root),
         "compile_commands": cfg["compile_commands_path"],
         "indexed_at": cfg["created_at"],
         "symbol_count": sym_count,
