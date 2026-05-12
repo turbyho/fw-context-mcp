@@ -133,29 +133,30 @@ def _gcc_system_includes(compiler: Path) -> list[str]:
     toolchain_root = compiler.parent.parent
     lib_gcc = toolchain_root / "lib" / "gcc"
     result: list[str] = []
-    if lib_gcc.is_dir():
-        for triple_dir in lib_gcc.iterdir():
-            for ver_dir in triple_dir.iterdir():
-                inc = ver_dir / "include"
-                if inc.is_dir():
-                    result += ["-isystem", str(inc)]
-                inc_fixed = ver_dir / "include-fixed"
-                if inc_fixed.is_dir():
-                    result += ["-isystem", str(inc_fixed)]
-    triple = triple_dir.name  # e.g. arm-none-eabi
-    libc_inc = toolchain_root / triple / "include"
-    if libc_inc.is_dir():
-        result += ["-isystem", str(libc_inc)]
-    # C++ standard library headers (arm-none-eabi/include/c++/<ver>)
-    cxx_inc_base = toolchain_root / triple / "include" / "c++"
-    if cxx_inc_base.is_dir():
-        for ver_dir in cxx_inc_base.iterdir():
-            if ver_dir.is_dir():
-                result += ["-isystem", str(ver_dir)]
-                # Per-target subdir (e.g. arm-none-eabi, thumb, ...)
-                for sub in ver_dir.iterdir():
-                    if sub.is_dir():
-                        result += ["-isystem", str(sub)]
+    triple_dirs = sorted(lib_gcc.iterdir()) if lib_gcc.is_dir() else []
+    for triple_dir in triple_dirs:
+        for ver_dir in sorted(triple_dir.iterdir()):
+            inc = ver_dir / "include"
+            if inc.is_dir():
+                result += ["-isystem", str(inc)]
+            inc_fixed = ver_dir / "include-fixed"
+            if inc_fixed.is_dir():
+                result += ["-isystem", str(inc_fixed)]
+    for triple_dir in triple_dirs:
+        triple = triple_dir.name
+        libc_inc = toolchain_root / triple / "include"
+        if libc_inc.is_dir():
+            result += ["-isystem", str(libc_inc)]
+        # C++ standard library headers (arm-none-eabi/include/c++/<ver>)
+        cxx_inc_base = toolchain_root / triple / "include" / "c++"
+        if cxx_inc_base.is_dir():
+            for ver_dir in sorted(cxx_inc_base.iterdir()):
+                if ver_dir.is_dir():
+                    result += ["-isystem", str(ver_dir)]
+                    # Per-target subdir (e.g. arm-none-eabi, thumb, ...)
+                    for sub in sorted(ver_dir.iterdir()):
+                        if sub.is_dir():
+                            result += ["-isystem", str(sub)]
     return result
 
 
