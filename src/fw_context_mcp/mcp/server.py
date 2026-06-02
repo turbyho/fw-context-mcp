@@ -878,31 +878,41 @@ async def smart_search(
                 "Generate 3-5 FTS5 keyword search terms based on the description below.\n"
                 "Study the real symbol names to learn the project's naming conventions\n"
                 "(prefixes, word order, abbreviations). Match them.\n\n"
+                "CRITICAL: Embedded code uses camelCase AND snake_case. The FTS5 tokenizer\n"
+                "treats each camelCase word as ONE token — e.g. \"onConnectionComplete\" is\n"
+                "a single token, NOT split into \"on\", \"Connection\", \"Complete\".\n"
+                "Therefore your queries MUST match token BEGINNINGS (prefixes):\n"
+                "- For \"connect\" → generate \"connection*\" (prefix of \"ConnectionComplete\")\n"
+                "- For \"init\" → generate \"init*\" (prefix of \"Init\", \"Initialize\")\n"
+                "- Generate BOTH snake_case AND camelCase prefix variants\n\n"
                 f"Real symbols from this project:\n{context_str}\n\n"
-                "Return a JSON array of snake_case strings, e.g.: [\"modem_init\", \"conn_open\"]\n"
+                "Return a JSON array of strings, e.g.: [\"ble_conn*\", \"connection*\", \"on_connect*\"]\n"
                 "Rules:\n"
                 "- Output MUST be a valid JSON array and nothing else\n"
-                "- Use snake_case identifiers matching the project's naming patterns\n"
-                "- STRONGLY prefer short stems with a trailing wildcard over exact\n"
-                "  full names — stems find more symbols (\"ble_conn*\" > \"ble_connection_handler\")\n"
+                "- Mix snake_case and camelCase prefixes: \"modem_init*\", \"Connection*\", \"on_conn*\"\n"
+                "- STRONGLY prefer short stems with a trailing wildcard over exact full names\n"
                 "- You may use a trailing wildcard: \"ble_gap*\" matches ble_gap_init, etc.\n"
                 "- No asterisks anywhere else — FTS5 only supports trailing wildcards\n"
                 "- Cover different naming patterns found in the context — e.g. if\n"
                 "  the project has \"ble_*\", \"on_*\", and \"connection_*\" prefixes,\n"
-                "  generate one stem per pattern\n\n"
+                "  generate one stem per pattern\n"
+                "- For each concept in the description, generate the MOST LIKELY prefix\n"
+                "  that matches real symbol beginnings (not substrings!)\n\n"
                 f"Description: {query}\n"
             )
         else:
             prompt = (
                 "You are a C/C++ code search assistant for an embedded firmware project.\n"
                 "Generate 3-5 FTS5 keyword search terms based on the description below.\n"
-                "Return a JSON array of snake_case strings, e.g.: [\"modem_init\", \"conn_open\"]\n"
+                "Return a JSON array of strings, e.g.: [\"modem_init*\", \"connection*\", \"on_connect*\"]\n"
                 "Rules:\n"
                 "- Output MUST be a valid JSON array and nothing else\n"
-                "- Use snake_case identifiers (e.g. modem_init, conn_open)\n"
+                "- Mix snake_case and camelCase prefixes matching C/C++ naming\n"
                 "- STRONGLY prefer short stems with a trailing wildcard\n"
-                "- You may use a trailing wildcard suffix: \"modem*\" matches modem_init, modem_connect, etc.\n"
-                "- No asterisks anywhere else — FTS5 only supports trailing wildcards\n\n"
+                "- You may use a trailing wildcard: \"modem*\" matches modem_init, modem_connect\n"
+                "- No asterisks anywhere else — FTS5 only supports trailing wildcards\n"
+                "- CRITICAL: camelCase tokens are ONE token — match their BEGINNINGS\n"
+                "  e.g. for \"connect\" generate \"connection*\" not \"onConnection*\"\n\n"
                 f"Description: {query}\n"
             )
 
@@ -920,16 +930,49 @@ async def smart_search(
         else:
             keyword_queries = rough_terms
 
-        # --- Phase 3: final search with refined (or fallback) terms ---
-        for kq in keyword_queries:
+        # --- Phase 3: OR search with client-side term-match scoring ---
+        # Using OR instead of AND because Ollama generates diverse terms
+        # covering different naming patterns — no single symbol matches all.
+        if keyword_queries:
+            or_query = " OR ".join(keyword_queries)
+            # Fetch a wider pool so scoring has enough candidates
+            fetch_limit = max(limit * 3, 40)
             try:
-                rows = search_symbols(conn, kq, config_hash, limit=limit)
+                rows = search_symbols(conn, or_query, config_hash, limit=fetch_limit)
             except Exception:
-                continue
-            for r in rows:
-                key = (r["name"], r["file_path"], r["line"])
-                if key not in seen:
-                    seen[key] = _fmt(r)
+                rows = []
+
+            if rows:
+                # Score each result by how many keyword terms match the symbol name.
+                # Strip trailing wildcards to get the stem for substring matching.
+                stems = [kq.rstrip("*") for kq in keyword_queries]
+
+                def _match_count(name: str) -> int:
+                    if not name:
+                        return 0
+                    nl = name.lower()
+                    return sum(1 for s in stems if s.lower() in nl)
+
+                # rank is a hidden FTS5 column not exposed via JOIN — use row position as fallback
+                scored = [(_match_count(r["name"]), i, r) for i, r in enumerate(rows)]
+                # Sort: higher match count first, then by original FTS5 position
+                scored.sort(key=lambda x: (-x[0], x[1]))
+
+                for _, _, r in scored:
+                    key = (r["name"], r["file_path"], r["line"])
+                    if key not in seen:
+                        seen[key] = _fmt(r)
+            elif not seen:
+                # Fallback: try individual queries if OR found nothing
+                for kq in keyword_queries:
+                    try:
+                        rows = search_symbols(conn, kq, config_hash, limit=limit)
+                    except Exception:
+                        continue
+                    for r in rows:
+                        key = (r["name"], r["file_path"], r["line"])
+                        if key not in seen:
+                            seen[key] = _fmt(r)
 
     results: list[dict] = []
 
