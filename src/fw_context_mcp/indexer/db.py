@@ -201,13 +201,39 @@ def get_active_config(conn: sqlite3.Connection, project_id: str) -> sqlite3.Row 
     ).fetchone()
 
 
+def _expand_query(query: str) -> str:
+    """Add trailing wildcard to each bare word for broader prefix matching.
+
+    Leaves existing wildcards (*) and FTS5 syntax (NEAR, ", parentheses) intact.
+    """
+    import re
+
+    # Tokens that already are FTS5 syntax — don't touch them
+    if any(c in query for c in ('"', 'NEAR', 'AND', 'OR', '(', ')')):
+        return query
+
+    parts = query.split()
+    expanded = []
+    for p in parts:
+        if p.endswith('*'):
+            expanded.append(p)
+        else:
+            expanded.append(f'{p}*')
+    return ' '.join(expanded)
+
+
 def search_symbols(
     conn: sqlite3.Connection,
     query: str,
     config_hash: str,
     limit: int = 20,
 ) -> list[sqlite3.Row]:
-    """FTS5 search over symbols for a given build config."""
+    """FTS5 search over symbols for a given build config.
+
+    Bare words are expanded to trailing-wildcard prefix queries so that
+    ``modem init`` matches ``modem_parser_oob_init``.
+    """
+    expanded = _expand_query(query)
     return conn.execute(
         """SELECT s.*, f.path as file_path
            FROM symbols_fts
@@ -216,7 +242,7 @@ def search_symbols(
            WHERE symbols_fts MATCH ? AND s.config_hash = ?
            ORDER BY rank
            LIMIT ?""",
-        (query, config_hash, limit),
+        (expanded, config_hash, limit),
     ).fetchall()
 
 
