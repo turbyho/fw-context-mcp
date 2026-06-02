@@ -966,13 +966,28 @@ async def smart_search(
         # Using OR instead of AND because Ollama generates diverse terms
         # covering different naming patterns — no single symbol matches all.
         if keyword_queries:
+            # Build two OR queries:
+            # 1. Standard query across all columns (strong FTS5 ranking for exact matches)
+            # 2. name_tokens-only query to specifically surface camelCase symbols whose
+            #    components match query terms — e.g. "connection*" finds onConnectionComplete
+            #    via name_tokens="on connection complete" even when the name token itself
+            #    starts with "on" and ranks low in the full-column search.
             or_query = " OR ".join(keyword_queries)
-            # Fetch a wider pool so scoring has enough candidates
-            fetch_limit = max(limit * 3, 40)
-            try:
-                rows = search_symbols(conn, or_query, config_hash, limit=fetch_limit)
-            except Exception:
-                rows = []
+            nt_terms = [f"name_tokens : {kq}" for kq in keyword_queries]
+            nt_query = " OR ".join(nt_terms)
+            # Fetch a larger pool so camelCase symbols buried in FTS5 ranking get included.
+            fetch_limit = max(limit * 6, 120)
+            rows = []
+            seen_keys: set[tuple] = set()
+            for q in (or_query, nt_query):
+                try:
+                    for r in search_symbols(conn, q, config_hash, limit=fetch_limit):
+                        k = (r["name"], r["file_path"], r["line"])
+                        if k not in seen_keys:
+                            seen_keys.add(k)
+                            rows.append(r)
+                except Exception:
+                    pass
 
             if rows:
                 stems = [kq.rstrip("*").lower() for kq in keyword_queries]
