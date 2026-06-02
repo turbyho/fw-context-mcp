@@ -57,6 +57,16 @@ class TestOpenDb:
         assert "mtime" in cols
         conn.close()
 
+    def test_file_path_column_migration(self, tmpdir):
+        """Schema migration: file_path column and FTS5 are upgraded."""
+        db_path = tmpdir / "test.db"
+        conn = open_db(db_path)
+        sym_cols = [r[1] for r in conn.execute("PRAGMA table_info(symbols)").fetchall()]
+        assert "file_path" in sym_cols
+        fts_cols = [r[1] for r in conn.execute("PRAGMA table_info(symbols_fts)").fetchall()]
+        assert "file_path" in fts_cols
+        conn.close()
+
 
 class TestTransaction:
     def test_commit(self, temp_db):
@@ -167,9 +177,9 @@ class TestInsertSymbolsBatch:
     def test_insert(self, populated_db):
         file_id = upsert_file(populated_db, "hash-deadbeef", "/tmp/test.cpp", "cpp")
         rows = [
-            ("hash-deadbeef", file_id, "usr-1", "foo", "ns::foo", "function",
+            ("hash-deadbeef", file_id, "src/test.cpp", "usr-1", "foo", "ns::foo", "function",
              10, 1, 0, "void foo()", ""),
-            ("hash-deadbeef", file_id, "usr-2", "bar", "ns::bar", "function",
+            ("hash-deadbeef", file_id, "src/test.cpp", "usr-2", "bar", "ns::bar", "function",
              20, 1, 0, "int bar(int)", "Returns bar"),
         ]
         count = insert_symbols_batch(populated_db, rows)
@@ -179,12 +189,12 @@ class TestInsertSymbolsBatch:
         file_id = upsert_file(populated_db, "hash-deadbeef", "/tmp/test.cpp", "cpp")
         # Insert as declaration
         insert_symbols_batch(populated_db, [
-            ("hash-deadbeef", file_id, "usr-1", "foo", "ns::foo", "function",
+            ("hash-deadbeef", file_id, "src/test.cpp", "usr-1", "foo", "ns::foo", "function",
              5, 1, 0, "void foo()", ""),
         ])
         # Insert as definition (same USR) — should promote
         insert_symbols_batch(populated_db, [
-            ("hash-deadbeef", file_id, "usr-1", "foo", "ns::foo", "function",
+            ("hash-deadbeef", file_id, "src/test.cpp", "usr-1", "foo", "ns::foo", "function",
              10, 1, 1, "void foo(int x)", "Does foo"),
         ])
         row = populated_db.execute(
@@ -198,12 +208,12 @@ class TestInsertSymbolsBatch:
         file_id = upsert_file(populated_db, "hash-deadbeef", "/tmp/test.cpp", "cpp")
         # Insert as definition first
         insert_symbols_batch(populated_db, [
-            ("hash-deadbeef", file_id, "usr-1", "foo", "ns::foo", "function",
+            ("hash-deadbeef", file_id, "src/test.cpp", "usr-1", "foo", "ns::foo", "function",
              10, 1, 1, "void foo()", ""),
         ])
         # Then try to insert as declaration — WHERE clause prevents demotion
         insert_symbols_batch(populated_db, [
-            ("hash-deadbeef", file_id, "usr-1", "foo", "ns::foo", "function",
+            ("hash-deadbeef", file_id, "src/test.cpp", "usr-1", "foo", "ns::foo", "function",
              5, 1, 0, "void foo();", ""),
         ])
         row = populated_db.execute(
@@ -216,8 +226,8 @@ class TestDeleteSymbolsForFile:
     def test_delete(self, populated_db):
         file_id = upsert_file(populated_db, "hash-deadbeef", "/tmp/del.cpp", "cpp")
         insert_symbols_batch(populated_db, [
-            ("hash-deadbeef", file_id, "usr-1", "f1", "ns::f1", "function", 1, 1, 1, "void f1()", ""),
-            ("hash-deadbeef", file_id, "usr-2", "f2", "ns::f2", "function", 2, 1, 1, "void f2()", ""),
+            ("hash-deadbeef", file_id, "src/del.cpp", "usr-1", "f1", "ns::f1", "function", 1, 1, 1, "void f1()", ""),
+            ("hash-deadbeef", file_id, "src/del.cpp", "usr-2", "f2", "ns::f2", "function", 2, 1, 1, "void f2()", ""),
         ])
         count_before = populated_db.execute(
             "SELECT COUNT(*) FROM symbols WHERE file_id=?", (file_id,)
@@ -258,11 +268,11 @@ class TestSearchSymbols:
     def test_fts5_search(self, populated_db):
         file_id = upsert_file(populated_db, "hash-deadbeef", "/tmp/search.cpp", "cpp")
         insert_symbols_batch(populated_db, [
-            ("hash-deadbeef", file_id, "u1", "modem_init", "ns::modem_init",
+            ("hash-deadbeef", file_id, "src/modem/modem_driver.cpp", "u1", "modem_init", "ns::modem_init",
              "function", 1, 1, 1, "void modem_init()", ""),
-            ("hash-deadbeef", file_id, "u2", "uart_send", "ns::uart_send",
+            ("hash-deadbeef", file_id, "src/uart/uart_driver.cpp", "u2", "uart_send", "ns::uart_send",
              "function", 5, 1, 1, "void uart_send(char c)", ""),
-            ("hash-deadbeef", file_id, "u3", "modem_connect", "ns::modem_connect",
+            ("hash-deadbeef", file_id, "src/modem/modem_driver.cpp", "u3", "modem_connect", "ns::modem_connect",
              "function", 10, 1, 1, "int modem_connect(const char* host)", ""),
         ])
 
@@ -271,6 +281,22 @@ class TestSearchSymbols:
         names = {r["name"] for r in results}
         assert names == {"modem_init", "modem_connect"}
 
+    def test_fts5_search_by_path(self, populated_db):
+        """Symbols can be found via file path tokens in FTS5."""
+        file_id = upsert_file(populated_db, "hash-deadbeef", "/tmp/spi_driver.cpp", "cpp")
+        insert_symbols_batch(populated_db, [
+            ("hash-deadbeef", file_id, "src/spi/spi_driver.cpp", "u10", "write", "SPI::write",
+             "method", 1, 1, 1, "void write(const uint8_t* buf, int len)", ""),
+            ("hash-deadbeef", file_id, "src/uart/uart_driver.cpp", "u11", "write", "UART::write",
+             "method", 1, 1, 1, "void write(char c)", ""),
+        ])
+        # "spi* write*" should find SPI::write because file_path "src/spi/spi_driver.cpp"
+        # contains "spi" as an FTS5 token
+        results = search_symbols(populated_db, "spi* write*", "hash-deadbeef")
+        assert len(results) == 1
+        assert results[0]["name"] == "write"
+        assert "spi" in results[0]["file_path"].lower()
+
     def test_search_no_results(self, populated_db):
         results = search_symbols(populated_db, "nonexistent_symbol_xyz", "hash-deadbeef")
         assert results == []
@@ -278,7 +304,7 @@ class TestSearchSymbols:
     def test_search_limit(self, populated_db):
         file_id = upsert_file(populated_db, "hash-deadbeef", "/tmp/limit.cpp", "cpp")
         rows_data = [
-            ("hash-deadbeef", file_id, f"u{i}", f"func{i}", f"ns::func{i}",
+            ("hash-deadbeef", file_id, "src/limit.cpp", f"u{i}", f"func{i}", f"ns::func{i}",
              "function", i, 1, 1, f"void func{i}()", "")
             for i in range(10)
         ]
