@@ -167,9 +167,16 @@ def run(
                         except OSError:
                             sym_mtime = 0.0
                         file_id_cache[sym_file] = upsert_file(conn, config_hash, sym_file, lang, mtime=sym_mtime)
+                    # Relative path for FTS5: strip project root so path tokens
+                    # reflect module structure (e.g. "src/zble" not "/home/...src/zble")
+                    try:
+                        rel_path = str(Path(sym_file).resolve().relative_to(project_root))
+                    except ValueError:
+                        rel_path = sym_file
                     rows.append((
                         config_hash,
                         file_id_cache[sym_file],
+                        rel_path,
                         s.usr,
                         s.name,
                         s.qualified_name,

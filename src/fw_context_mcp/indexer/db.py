@@ -38,6 +38,7 @@ CREATE TABLE IF NOT EXISTS symbols (
     id             INTEGER PRIMARY KEY,
     config_hash    TEXT    NOT NULL REFERENCES build_configs(config_hash),
     file_id        INTEGER NOT NULL REFERENCES files(id),
+    file_path      TEXT    NOT NULL DEFAULT '',
     usr            TEXT    NOT NULL,
     name           TEXT    NOT NULL,
     qualified_name TEXT    NOT NULL,
@@ -61,25 +62,26 @@ CREATE VIRTUAL TABLE IF NOT EXISTS symbols_fts USING fts5(
     qualified_name,
     signature,
     docstring,
+    file_path,
     content='symbols',
     content_rowid='id'
 );
 
 CREATE TRIGGER IF NOT EXISTS symbols_ai AFTER INSERT ON symbols BEGIN
-    INSERT INTO symbols_fts(rowid, name, qualified_name, signature, docstring)
-    VALUES (new.id, new.name, new.qualified_name, new.signature, new.docstring);
+    INSERT INTO symbols_fts(rowid, name, qualified_name, signature, docstring, file_path)
+    VALUES (new.id, new.name, new.qualified_name, new.signature, new.docstring, new.file_path);
 END;
 
 CREATE TRIGGER IF NOT EXISTS symbols_ad AFTER DELETE ON symbols BEGIN
-    INSERT INTO symbols_fts(symbols_fts, rowid, name, qualified_name, signature, docstring)
-    VALUES ('delete', old.id, old.name, old.qualified_name, old.signature, old.docstring);
+    INSERT INTO symbols_fts(symbols_fts, rowid, name, qualified_name, signature, docstring, file_path)
+    VALUES ('delete', old.id, old.name, old.qualified_name, old.signature, old.docstring, old.file_path);
 END;
 
 CREATE TRIGGER IF NOT EXISTS symbols_au AFTER UPDATE ON symbols BEGIN
-    INSERT INTO symbols_fts(symbols_fts, rowid, name, qualified_name, signature, docstring)
-    VALUES ('delete', old.id, old.name, old.qualified_name, old.signature, old.docstring);
-    INSERT INTO symbols_fts(rowid, name, qualified_name, signature, docstring)
-    VALUES (new.id, new.name, new.qualified_name, new.signature, new.docstring);
+    INSERT INTO symbols_fts(symbols_fts, rowid, name, qualified_name, signature, docstring, file_path)
+    VALUES ('delete', old.id, old.name, old.qualified_name, old.signature, old.docstring, old.file_path);
+    INSERT INTO symbols_fts(rowid, name, qualified_name, signature, docstring, file_path)
+    VALUES (new.id, new.name, new.qualified_name, new.signature, new.docstring, new.file_path);
 END;
 """
 
@@ -89,12 +91,61 @@ def open_db(path: Path) -> sqlite3.Connection:
     conn = sqlite3.connect(str(path))
     conn.row_factory = sqlite3.Row
     conn.executescript(_SCHEMA)
-    # Schema migration: add mtime column to files if missing
+
+    # Migration: mtime column in files
     try:
         conn.execute("ALTER TABLE files ADD COLUMN mtime REAL NOT NULL DEFAULT 0")
         conn.commit()
     except sqlite3.OperationalError:
         pass
+
+    # Migration: file_path column in symbols (denormalized for FTS5)
+    sym_cols = [r[1] for r in conn.execute("PRAGMA table_info(symbols)").fetchall()]
+    if "file_path" not in sym_cols:
+        conn.execute("ALTER TABLE symbols ADD COLUMN file_path TEXT NOT NULL DEFAULT ''")
+        conn.execute("""
+            UPDATE symbols SET file_path = COALESCE(
+                (SELECT f.path FROM files f WHERE f.id = symbols.file_id), ''
+            ) WHERE file_path = ''
+        """)
+        conn.commit()
+
+    # Migration: rebuild FTS5 + triggers if file_path column is missing
+    fts_cols = [r[1] for r in conn.execute("PRAGMA table_info(symbols_fts)").fetchall()]
+    if "file_path" not in fts_cols:
+        conn.executescript("""
+            DROP TRIGGER IF EXISTS symbols_ai;
+            DROP TRIGGER IF EXISTS symbols_ad;
+            DROP TRIGGER IF EXISTS symbols_au;
+            DROP TABLE IF EXISTS symbols_fts;
+        """)
+        conn.executescript("""
+            CREATE VIRTUAL TABLE symbols_fts USING fts5(
+                name, qualified_name, signature, docstring, file_path,
+                content='symbols', content_rowid='id'
+            );
+            CREATE TRIGGER symbols_ai AFTER INSERT ON symbols BEGIN
+                INSERT INTO symbols_fts(rowid, name, qualified_name, signature, docstring, file_path)
+                VALUES (new.id, new.name, new.qualified_name, new.signature, new.docstring, new.file_path);
+            END;
+            CREATE TRIGGER symbols_ad AFTER DELETE ON symbols BEGIN
+                INSERT INTO symbols_fts(symbols_fts, rowid, name, qualified_name, signature, docstring, file_path)
+                VALUES ('delete', old.id, old.name, old.qualified_name, old.signature, old.docstring, old.file_path);
+            END;
+            CREATE TRIGGER symbols_au AFTER UPDATE ON symbols BEGIN
+                INSERT INTO symbols_fts(symbols_fts, rowid, name, qualified_name, signature, docstring, file_path)
+                VALUES ('delete', old.id, old.name, old.qualified_name, old.signature, old.docstring, old.file_path);
+                INSERT INTO symbols_fts(rowid, name, qualified_name, signature, docstring, file_path)
+                VALUES (new.id, new.name, new.qualified_name, new.signature, new.docstring, new.file_path);
+            END;
+        """)
+        conn.execute("""
+            INSERT INTO symbols_fts(rowid, name, qualified_name, signature, docstring, file_path)
+            SELECT id, name, qualified_name, COALESCE(signature,''), COALESCE(docstring,''), COALESCE(file_path,'')
+            FROM symbols
+        """)
+        conn.commit()
+
     return conn
 
 
@@ -172,15 +223,19 @@ def insert_symbols_batch(
 ) -> int:
     """Insert symbol rows, promoting declaration→definition on USR conflict.
 
+    Each row: (config_hash, file_id, file_path, usr, name, qualified_name,
+               kind, line, col, is_definition, signature, docstring)
+
     Returns count of rows inserted or upgraded to definition.
     """
     cur = conn.executemany(
         """INSERT INTO symbols
-           (config_hash, file_id, usr, name, qualified_name, kind,
+           (config_hash, file_id, file_path, usr, name, qualified_name, kind,
             line, col, is_definition, signature, docstring)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
            ON CONFLICT(config_hash, usr) DO UPDATE SET
                file_id       = excluded.file_id,
+               file_path     = excluded.file_path,
                line          = excluded.line,
                col           = excluded.col,
                is_definition = 1,

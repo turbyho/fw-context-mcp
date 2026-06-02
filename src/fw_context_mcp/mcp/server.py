@@ -525,8 +525,12 @@ def reindex_file(
                     if sym_file not in file_id_cache:
                         lang = "cpp" if Path(sym_file).suffix.lower() in {".cpp", ".cc", ".cxx", ".c++"} else "c"
                         file_id_cache[sym_file] = upsert_file(conn, config_hash, sym_file, lang, mtime=current_mtime if sym_file == file_path_str else 0.0)
+                    try:
+                        rel_path = str(Path(sym_file).resolve().relative_to(root))
+                    except ValueError:
+                        rel_path = sym_file
                     rows.append((
-                        config_hash, file_id_cache[sym_file], s.usr, s.name,
+                        config_hash, file_id_cache[sym_file], rel_path, s.usr, s.name,
                         s.qualified_name, s.kind, s.line, s.column,
                         int(s.is_definition), s.signature, s.docstring,
                     ))
@@ -967,18 +971,21 @@ async def smart_search(
                 rows = []
 
             if rows:
-                # Score each result by how many keyword terms match the symbol name.
-                # Strip trailing wildcards to get the stem for substring matching.
-                stems = [kq.rstrip("*") for kq in keyword_queries]
+                # Score each result by how many keyword stems appear in the
+                # symbol name, qualified name, or file path — all three carry
+                # meaningful context for embedded code.
+                stems = [kq.rstrip("*").lower() for kq in keyword_queries]
 
-                def _match_count(name: str) -> int:
-                    if not name:
-                        return 0
-                    nl = name.lower()
-                    return sum(1 for s in stems if s.lower() in nl)
+                def _match_count(r) -> int:
+                    text = " ".join(filter(None, [
+                        (r["name"] or "").lower(),
+                        (r["qualified_name"] or "").lower(),
+                        (r["file_path"] or "").lower(),
+                    ]))
+                    return sum(1 for s in stems if s in text)
 
                 # rank is a hidden FTS5 column not exposed via JOIN — use row position as fallback
-                scored = [(_match_count(r["name"]), i, r) for i, r in enumerate(rows)]
+                scored = [(_match_count(r), i, r) for i, r in enumerate(rows)]
                 # Sort: higher match count first, then by original FTS5 position
                 scored.sort(key=lambda x: (-x[0], x[1]))
 
