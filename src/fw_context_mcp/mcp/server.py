@@ -23,6 +23,7 @@ from ..indexer.db import (
     insert_symbols_batch,
     open_db,
     search_symbols,
+    split_tokens,
     transaction,
     upsert_file,
 )
@@ -530,8 +531,9 @@ def reindex_file(
                     except ValueError:
                         rel_path = sym_file
                     rows.append((
-                        config_hash, file_id_cache[sym_file], rel_path, s.usr, s.name,
-                        s.qualified_name, s.kind, s.line, s.column,
+                        config_hash, file_id_cache[sym_file], rel_path,
+                        split_tokens(s.name, s.qualified_name),
+                        s.usr, s.name, s.qualified_name, s.kind, s.line, s.column,
                         int(s.is_definition), s.signature, s.docstring,
                     ))
 
@@ -986,15 +988,18 @@ async def smart_search(
                 }
 
                 def _score(r) -> int:
-                    name  = (r["name"]          or "").lower()
-                    qname = (r["qualified_name"] or "").lower()
-                    fpath = (r["file_path"]      or "").lower()
+                    name   = (r["name"]          or "").lower()
+                    ntoks  = (r["name_tokens"]    or "").lower()
+                    qname  = (r["qualified_name"] or "").lower()
+                    fpath  = (r["file_path"]      or "").lower()
 
-                    # Weighted field matching: name (3) > qname (2) > file_path (1).
-                    # Each stem counted only at the highest level where it matches.
+                    # Weighted field matching — each stem counted at highest level only:
+                    #   name / name_tokens = 3  (it IS the symbol name, just differently tokenized)
+                    #   qualified_name     = 2  (class/namespace context)
+                    #   file_path          = 1  (module-level context, weakest)
                     s = 0
                     for stem in stems:
-                        if stem in name:
+                        if stem in name or stem in ntoks:
                             s += 3
                         elif stem in qname:
                             s += 2
