@@ -740,8 +740,15 @@ def _parse_search_terms(raw: str) -> list[str]:
             if cleaned and not cleaned.startswith("#"):
                 terms.append(cleaned)
 
-    # Replace underscores with spaces for FTS5 tokenizer
-    return [t.replace("_", " ") for t in terms]
+    # Replace underscores with spaces for FTS5 tokenizer.
+    # Also strip leading/trailing whitespace from each term — LLM sometimes
+    # emits [" key*", " storage*"] with a leading space which breaks FTS5.
+    result = []
+    for t in terms:
+        cleaned = t.replace("_", " ").strip()
+        if cleaned:
+            result.append(cleaned)
+    return result
 
 
 @mcp.tool()
@@ -782,6 +789,23 @@ async def smart_search(
     db_path, cfg, project_id, root = _resolve_context(project_root)
     if not db_path.exists():
         return [{"error": f"No index found for {root}. Run 'fw-context index' first."}]
+
+    # --- Phase 0: translate non-ASCII (e.g. Czech) query to English ---
+    translated_from: str | None = None
+    if cfg.llm.enabled and not query.isascii():
+        translate_prompt = (
+            "Translate the following text to English. "
+            "Output only the translated text, nothing else.\n\n"
+            f"{query}"
+        )
+        try:
+            translated = await call_ollama_async(translate_prompt, cfg.llm)
+            translated = translated.strip()
+            if translated and translated.isascii():
+                translated_from = query
+                query = translated
+        except Exception:
+            pass  # keep original query on failure
 
     cfg_data = None
     config_hash = ""
@@ -979,6 +1003,8 @@ async def smart_search(
     results.append({"_generated_queries": keyword_queries})
     if rough_terms:
         results.append({"_rough_queries": rough_terms})
+    if translated_from:
+        results.append({"_translated_from": translated_from, "_translated_to": query})
     if ollama_warning:
         results.append(ollama_warning)
     if not ollama_warning and cfg_data and _is_stale(cfg_data, cfg_data["compile_commands_path"]):
