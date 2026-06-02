@@ -855,6 +855,8 @@ async def smart_search(
             """Filter out names with special chars that carry no naming convention signal."""
             if set(name) & {"(", ")", "~", "=", "<", ">", "[", "]"}:
                 return True
+            if len(name) <= 2:
+                return True
             return False
 
         # Phase 1a: phrase searches — combine first word with each other
@@ -1014,7 +1016,14 @@ async def smart_search(
                 scored.sort(key=lambda x: (-x[0], x[1]))
 
                 for _, _, r in scored:
-                    key = (r["name"], r["file_path"], r["line"])
+                    name = r["name"] or ""
+                    # Skip noise: unnamed symbols, single/two-char local variable names,
+                    # and C-style loop/temp variables that leak through file_path matching.
+                    if name.startswith("("):
+                        continue
+                    if len(name) <= 2 and r["kind"] in ("variable", "field"):
+                        continue
+                    key = (name, r["file_path"], r["line"])
                     if key not in seen:
                         seen[key] = _fmt(r)
             elif not seen:
