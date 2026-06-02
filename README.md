@@ -52,7 +52,7 @@ sub-millisecond lookups, zero hallucination, real C/C++ understanding.
 | Tool | Role |
 |------|------|
 | **[libclang](https://clang.llvm.org/doxygen/group__CINDEX.html)** | C/C++ parser — traverses AST for each translation unit, extracts symbols with their qualified names, signatures, docstrings, and location. Uses the *exact* compiler flags from `compile_commands.json` (include paths, defines, standards) so it sees what the compiler sees. |
-| **[SQLite](https://sqlite.org) + [FTS5](https://sqlite.org/fts5.html)** | Storage and full-text search. The `symbols` table stores name, kind, signature, file/line, docstring, and definition-vs-declaration flag. FTS5 enables fast prefix/phrase/keyword queries without loading entire files. |
+| **[SQLite](https://sqlite.org) + [FTS5](https://sqlite.org/fts5.html)** | Storage and full-text search. The `symbols` table stores name, kind, signature, file/line, docstring, and definition-vs-declaration flag. The FTS5 index covers 6 columns: `name` (original C++ name), `qualified_name` (full `namespace::class::method`), `signature` (parameter types), `docstring` (documentation comments), `file_path` (relative path from project root, for module context), and `name_tokens` (camelCase/snake_case split for sub-token search — e.g. `onConnectionComplete` → `on connection complete`). FTS5 enables fast prefix/phrase/keyword queries without loading entire files. |
 | **[MCP SDK](https://github.com/modelcontextprotocol/python-sdk)** | JSON-RPC 2.0 server framework. Handles protocol initialization, message framing, and tool registration. The server is stateless between calls — each tool invocation opens the DB, runs the query, and closes. |
 | **[httpx](https://www.python-httpx.org/)** | Async HTTP client for calling Ollama's REST API (`/api/chat`, `/api/tags`). Used by `smart_search` and `explain_symbol`. |
 | **[Ollama](https://ollama.com)** *(optional)* | Local or cloud LLM. Powers natural-language search (translates "how does the modem connect?" → FTS5 keywords `modem connect`, `modem attach`) and generates plain-English explanations of C/C++ functions. When disabled, the AI assistant processes results with its own LLM — no Ollama required. |
@@ -77,6 +77,17 @@ units in `compile_commands.json`:
 
 All have **qualified names** (e.g. `zbox::BleManager::start_advertising`),
 **signatures**, and **file + line** locations.
+
+Each symbol is stored in the FTS5 index with 6 searchable columns:
+
+| FTS5 column | Content |
+|-------------|---------|
+| `name` | Original C++ name |
+| `qualified_name` | Full `namespace::class::method` |
+| `signature` | Parameter types |
+| `docstring` | Documentation comments |
+| `file_path` | Relative path from project root (module context) |
+| `name_tokens` | camelCase/snake_case split — `onConnectionComplete` → `on connection complete` |
 
 Source roots are auto-detected from your project structure (`src`, `lib`, `app`,
 `include`, `modules`, `zephyr`, `mbed-os`) and `compile_commands.json` entries —
@@ -339,6 +350,35 @@ and integration details.
 | Maintenance | `reset_index` | Delete and rebuild index |
 | Maintenance | `list_projects` | List all indexed projects |
 | Maintenance | `check_ollama` | Verify Ollama availability |
+
+### Search behaviour
+
+**Auto-prefix expansion:** bare words passed to `search_code` and `smart_search`
+are automatically expanded to prefix queries, so `modem init` becomes
+`modem* init*`. This means a query for `uart` also matches `uart_init`,
+`uart_write`, etc. Use quoted phrases (`"spi init"`) to suppress expansion and
+match the exact token sequence.
+
+**Non-ASCII queries:** if the query contains non-ASCII characters (e.g. Czech),
+`smart_search` passes it through Ollama for translation to English before
+generating FTS5 terms — no manual transliteration needed.
+
+### Search quality
+
+`smart_search` ranks results by a weighted score across FTS5 columns:
+
+| Match | Points |
+|-------|--------|
+| `name` / `name_tokens` (camelCase split) | 3 |
+| `qualified_name` | 2 |
+| `file_path` (module context, e.g. `spi* write*` hits `write` in `spi_driver.cpp`) | 1 |
+| Project-local symbol (`src/`, `lib/`, not `mbed-os/`) | +1 bonus |
+| Kind: function / method / class | +2 bonus |
+| Kind: enum constant | +1 bonus |
+| Kind: variable / field | 0 bonus |
+
+Results are sorted by score descending. When Ollama is disabled, `smart_search`
+falls back to `search_code` with a plain keyword split — scoring still applies.
 
 ## Configuration
 
