@@ -2,10 +2,43 @@
 
 from __future__ import annotations
 
+import re
 import sqlite3
 from collections.abc import Generator
 from contextlib import contextmanager
 from pathlib import Path
+
+
+def split_tokens(name: str, qualified_name: str = "") -> str:
+    """Normalize camelCase/snake_case names to space-separated lowercase tokens.
+
+    Builds a searchable token graph in FTS5 where each camelCase component
+    becomes an independent node, so ``connect*`` finds ``onConnectionComplete``,
+    ``modem*`` finds ``ModemMsgManager``, etc.
+
+    Examples:
+        onConnectionComplete       → "on connection complete"
+        modem_parser_oob_init      → "modem parser oob init"
+        ZCfgDataManager            → "cfg data manager"
+        HTTPResponse               → "http response"
+        ZBLE::onConnectionComplete → "zble on connection complete"
+        _last_ble_connected        → "last ble connected"
+    """
+    def _tokenize(s: str) -> list[str]:
+        s = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", s)      # camelCase split
+        s = re.sub(r"([A-Z]+)([A-Z][a-z])", r"\1 \2", s)   # HTTPResponse → HTTP Response
+        parts = re.split(r"[^a-zA-Z0-9]+", s)               # split on non-alnum
+        return [p.lower() for p in parts if len(p) > 1]
+
+    tokens: list[str] = []
+    seen: set[str] = set()
+    for src in (name, qualified_name):
+        if src:
+            for tok in _tokenize(src):
+                if tok not in seen:
+                    seen.add(tok)
+                    tokens.append(tok)
+    return " ".join(tokens)
 
 _SCHEMA = """
 PRAGMA journal_mode = WAL;
@@ -39,6 +72,7 @@ CREATE TABLE IF NOT EXISTS symbols (
     config_hash    TEXT    NOT NULL REFERENCES build_configs(config_hash),
     file_id        INTEGER NOT NULL REFERENCES files(id),
     file_path      TEXT    NOT NULL DEFAULT '',
+    name_tokens    TEXT    NOT NULL DEFAULT '',
     usr            TEXT    NOT NULL,
     name           TEXT    NOT NULL,
     qualified_name TEXT    NOT NULL,
@@ -63,25 +97,26 @@ CREATE VIRTUAL TABLE IF NOT EXISTS symbols_fts USING fts5(
     signature,
     docstring,
     file_path,
+    name_tokens,
     content='symbols',
     content_rowid='id'
 );
 
 CREATE TRIGGER IF NOT EXISTS symbols_ai AFTER INSERT ON symbols BEGIN
-    INSERT INTO symbols_fts(rowid, name, qualified_name, signature, docstring, file_path)
-    VALUES (new.id, new.name, new.qualified_name, new.signature, new.docstring, new.file_path);
+    INSERT INTO symbols_fts(rowid, name, qualified_name, signature, docstring, file_path, name_tokens)
+    VALUES (new.id, new.name, new.qualified_name, new.signature, new.docstring, new.file_path, new.name_tokens);
 END;
 
 CREATE TRIGGER IF NOT EXISTS symbols_ad AFTER DELETE ON symbols BEGIN
-    INSERT INTO symbols_fts(symbols_fts, rowid, name, qualified_name, signature, docstring, file_path)
-    VALUES ('delete', old.id, old.name, old.qualified_name, old.signature, old.docstring, old.file_path);
+    INSERT INTO symbols_fts(symbols_fts, rowid, name, qualified_name, signature, docstring, file_path, name_tokens)
+    VALUES ('delete', old.id, old.name, old.qualified_name, old.signature, old.docstring, old.file_path, old.name_tokens);
 END;
 
 CREATE TRIGGER IF NOT EXISTS symbols_au AFTER UPDATE ON symbols BEGIN
-    INSERT INTO symbols_fts(symbols_fts, rowid, name, qualified_name, signature, docstring, file_path)
-    VALUES ('delete', old.id, old.name, old.qualified_name, old.signature, old.docstring, old.file_path);
-    INSERT INTO symbols_fts(rowid, name, qualified_name, signature, docstring, file_path)
-    VALUES (new.id, new.name, new.qualified_name, new.signature, new.docstring, new.file_path);
+    INSERT INTO symbols_fts(symbols_fts, rowid, name, qualified_name, signature, docstring, file_path, name_tokens)
+    VALUES ('delete', old.id, old.name, old.qualified_name, old.signature, old.docstring, old.file_path, old.name_tokens);
+    INSERT INTO symbols_fts(rowid, name, qualified_name, signature, docstring, file_path, name_tokens)
+    VALUES (new.id, new.name, new.qualified_name, new.signature, new.docstring, new.file_path, new.name_tokens);
 END;
 """
 
@@ -110,9 +145,22 @@ def open_db(path: Path) -> sqlite3.Connection:
         """)
         conn.commit()
 
-    # Migration: rebuild FTS5 + triggers if file_path column is missing
+    # Migration: name_tokens column — camelCase/snake_case split for FTS5 token graph
+    sym_cols = [r[1] for r in conn.execute("PRAGMA table_info(symbols)").fetchall()]
+    if "name_tokens" not in sym_cols:
+        conn.execute("ALTER TABLE symbols ADD COLUMN name_tokens TEXT NOT NULL DEFAULT ''")
+        conn.commit()
+        # Backfill using Python split_tokens (SQLite can't call Python functions)
+        rows = conn.execute("SELECT id, name, qualified_name FROM symbols WHERE name_tokens = ''").fetchall()
+        conn.executemany(
+            "UPDATE symbols SET name_tokens = ? WHERE id = ?",
+            [(split_tokens(r["name"], r["qualified_name"]), r["id"]) for r in rows],
+        )
+        conn.commit()
+
+    # Migration: rebuild FTS5 + triggers if name_tokens column is missing
     fts_cols = [r[1] for r in conn.execute("PRAGMA table_info(symbols_fts)").fetchall()]
-    if "file_path" not in fts_cols:
+    if "name_tokens" not in fts_cols:
         conn.executescript("""
             DROP TRIGGER IF EXISTS symbols_ai;
             DROP TRIGGER IF EXISTS symbols_ad;
@@ -121,27 +169,28 @@ def open_db(path: Path) -> sqlite3.Connection:
         """)
         conn.executescript("""
             CREATE VIRTUAL TABLE symbols_fts USING fts5(
-                name, qualified_name, signature, docstring, file_path,
+                name, qualified_name, signature, docstring, file_path, name_tokens,
                 content='symbols', content_rowid='id'
             );
             CREATE TRIGGER symbols_ai AFTER INSERT ON symbols BEGIN
-                INSERT INTO symbols_fts(rowid, name, qualified_name, signature, docstring, file_path)
-                VALUES (new.id, new.name, new.qualified_name, new.signature, new.docstring, new.file_path);
+                INSERT INTO symbols_fts(rowid, name, qualified_name, signature, docstring, file_path, name_tokens)
+                VALUES (new.id, new.name, new.qualified_name, new.signature, new.docstring, new.file_path, new.name_tokens);
             END;
             CREATE TRIGGER symbols_ad AFTER DELETE ON symbols BEGIN
-                INSERT INTO symbols_fts(symbols_fts, rowid, name, qualified_name, signature, docstring, file_path)
-                VALUES ('delete', old.id, old.name, old.qualified_name, old.signature, old.docstring, old.file_path);
+                INSERT INTO symbols_fts(symbols_fts, rowid, name, qualified_name, signature, docstring, file_path, name_tokens)
+                VALUES ('delete', old.id, old.name, old.qualified_name, old.signature, old.docstring, old.file_path, old.name_tokens);
             END;
             CREATE TRIGGER symbols_au AFTER UPDATE ON symbols BEGIN
-                INSERT INTO symbols_fts(symbols_fts, rowid, name, qualified_name, signature, docstring, file_path)
-                VALUES ('delete', old.id, old.name, old.qualified_name, old.signature, old.docstring, old.file_path);
-                INSERT INTO symbols_fts(rowid, name, qualified_name, signature, docstring, file_path)
-                VALUES (new.id, new.name, new.qualified_name, new.signature, new.docstring, new.file_path);
+                INSERT INTO symbols_fts(symbols_fts, rowid, name, qualified_name, signature, docstring, file_path, name_tokens)
+                VALUES ('delete', old.id, old.name, old.qualified_name, old.signature, old.docstring, old.file_path, old.name_tokens);
+                INSERT INTO symbols_fts(rowid, name, qualified_name, signature, docstring, file_path, name_tokens)
+                VALUES (new.id, new.name, new.qualified_name, new.signature, new.docstring, new.file_path, new.name_tokens);
             END;
         """)
         conn.execute("""
-            INSERT INTO symbols_fts(rowid, name, qualified_name, signature, docstring, file_path)
-            SELECT id, name, qualified_name, COALESCE(signature,''), COALESCE(docstring,''), COALESCE(file_path,'')
+            INSERT INTO symbols_fts(rowid, name, qualified_name, signature, docstring, file_path, name_tokens)
+            SELECT id, name, qualified_name, COALESCE(signature,''), COALESCE(docstring,''),
+                   COALESCE(file_path,''), COALESCE(name_tokens,'')
             FROM symbols
         """)
         conn.commit()
@@ -223,19 +272,20 @@ def insert_symbols_batch(
 ) -> int:
     """Insert symbol rows, promoting declaration→definition on USR conflict.
 
-    Each row: (config_hash, file_id, file_path, usr, name, qualified_name,
-               kind, line, col, is_definition, signature, docstring)
+    Each row: (config_hash, file_id, file_path, name_tokens, usr, name,
+               qualified_name, kind, line, col, is_definition, signature, docstring)
 
     Returns count of rows inserted or upgraded to definition.
     """
     cur = conn.executemany(
         """INSERT INTO symbols
-           (config_hash, file_id, file_path, usr, name, qualified_name, kind,
+           (config_hash, file_id, file_path, name_tokens, usr, name, qualified_name, kind,
             line, col, is_definition, signature, docstring)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
            ON CONFLICT(config_hash, usr) DO UPDATE SET
                file_id       = excluded.file_id,
                file_path     = excluded.file_path,
+               name_tokens   = excluded.name_tokens,
                line          = excluded.line,
                col           = excluded.col,
                is_definition = 1,
