@@ -971,22 +971,46 @@ async def smart_search(
                 rows = []
 
             if rows:
-                # Score each result by how many keyword stems appear in the
-                # symbol name, qualified name, or file path — all three carry
-                # meaningful context for embedded code.
                 stems = [kq.rstrip("*").lower() for kq in keyword_queries]
 
-                def _match_count(r) -> int:
-                    text = " ".join(filter(None, [
-                        (r["name"] or "").lower(),
-                        (r["qualified_name"] or "").lower(),
-                        (r["file_path"] or "").lower(),
-                    ]))
-                    return sum(1 for s in stems if s in text)
+                # Kind weights: prefer callable/declarative over data/locals.
+                # Variables and fields found only via file_path are usually
+                # local variables — not what a developer is looking for.
+                _KIND_WEIGHT = {
+                    "function": 2, "method": 2, "constructor": 2, "destructor": 2,
+                    "class": 2, "struct": 2, "enum": 2, "typedef": 2,
+                    "enum_constant": 1, "namespace": 1,
+                    "variable": 0, "field": 0,
+                }
+
+                def _score(r) -> int:
+                    name  = (r["name"]          or "").lower()
+                    qname = (r["qualified_name"] or "").lower()
+                    fpath = (r["file_path"]      or "").lower()
+
+                    # Weighted field matching: name (3) > qname (2) > file_path (1).
+                    # Each stem counted only at the highest level where it matches.
+                    s = 0
+                    for stem in stems:
+                        if stem in name:
+                            s += 3
+                        elif stem in qname:
+                            s += 2
+                        elif stem in fpath:
+                            s += 1
+
+                    # Bonus for project-local code (src/, lib/ not under mbed-os).
+                    if fpath and ("src/" in fpath or "lib/" in fpath) and "mbed-os" not in fpath:
+                        s += 1
+
+                    # Kind bonus: push functions/classes above variables/locals.
+                    s += _KIND_WEIGHT.get(r["kind"] or "", 0)
+
+                    return s
 
                 # rank is a hidden FTS5 column not exposed via JOIN — use row position as fallback
-                scored = [(_match_count(r), i, r) for i, r in enumerate(rows)]
-                # Sort: higher match count first, then by original FTS5 position
+                scored = [(_score(r), i, r) for i, r in enumerate(rows)]
+                # Sort: higher score first, then by original FTS5 position
                 scored.sort(key=lambda x: (-x[0], x[1]))
 
                 for _, _, r in scored:
