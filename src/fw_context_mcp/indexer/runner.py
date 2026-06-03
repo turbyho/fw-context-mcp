@@ -130,9 +130,13 @@ def _build_embeddings(conn, config_hash: str, llm_config) -> None:
         name = r["name"] or ""
         class_ = "::".join(qname.split("::")[:-1]) if "::" in qname else ""
         sig = r["signature"] or ""
-        doc = (r["docstring"] or "").strip()
-        if doc and len(doc) > 20:
-            doc = doc[:150]
+        # Skip mbed-os docstrings — massive and add keyword noise
+        is_os = "mbed-os" in fp.lower()
+        doc = ""
+        if not is_os:
+            doc = (r["docstring"] or "").strip()
+            if doc and len(doc) > 20:
+                doc = doc[:150]
         parts = [path, file_, class_, name, sig]
         if doc:
             parts.append(doc)
