@@ -29,6 +29,7 @@ Both files are auto-created with sensible defaults on first use.
 | `source_roots` | `[]` *(auto-detect)* | project | Directories to scan for symbols. **Empty list = auto-detect** (scans `src`, `lib`, `app`, `include`, `modules` + framework dirs `zephyr`/`mbed-os` + top-level dirs from `compile_commands.json`). Set explicitly to narrow indexing: `["src", "lib"]`. Directories that don't exist are silently skipped. |
 | `exclude_paths` | `["build", "BUILD"]` | project | Directories to skip during indexing. Useful for generated code, test fixtures, or third-party vendored code. Paths are relative to project root. |
 | `index_refs` | `false` | project | Build the cross-reference / call graph (`find_callers`, `find_references`). Off by default — reference extraction adds indexing time and DB size. Set `true` (or pass `--refs`) and re-index to enable. |
+| `index_embeddings` | `true` | project | Generate symbol embeddings for semantic search during indexing. Requires a running Ollama instance. Adds ~1–2 minutes to indexing time (batch embedding calls). Disable with `false` or `--no-embeddings` if Ollama is not available — embeddings will be generated lazily on first `smart_search` call instead. |
 
 #### `[llm]` — LLM / Ollama settings
 
@@ -37,6 +38,7 @@ Both files are auto-created with sensible defaults on first use.
 | `enabled` | `true` | both | Enable or disable Ollama integration. When `false`, `explain_symbol` returns the source code + prompt for the AI assistant to answer itself, and `smart_search` falls back to direct keyword search. No Ollama connection needed. |
 | `ollama_url` | `"http://localhost:11434"` | global | Ollama API base URL. Change if Ollama runs on a different machine (e.g. `"http://192.168.1.50:11434"`). |
 | `model` | `"qwen2.5-coder:14b"` | both | Ollama model tag. Override per-project to use a different model for different codebases. See [Choosing an Ollama model](installation.md#choosing-an-ollama-model) for recommendations. |
+| `embed_model` | `"mxbai-embed-large:latest"` | both | Ollama embedding model used for semantic search. Automatically pulled on first use via `ollama pull` if not installed. Embeddings are stored in the index DB as 1024-dimensional float vectors. |
 | `num_ctx` | `8192` | global | Context window size in tokens passed to Ollama. The factory default (2048) is too small for source code — keep at least 8192. |
 | `debug_log` | *(none)* | both | Path to a JSONL debug log file. When set, all Ollama prompts and responses are logged for debugging. Example: `"~/.fw-context/llm-debug.jsonl"`. |
 
