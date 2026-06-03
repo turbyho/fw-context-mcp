@@ -443,6 +443,28 @@ definition under your source roots), which keeps the graph bounded — reference
 into system/framework headers are dropped. `find_callers` returns each call site
 with its file:line and the enclosing caller's qualified name.
 
+### Source reading (`get_source`)
+
+`get_source` returns a symbol's full definition body straight from disk — no
+LLM, no waiting. It reads the **exact line range** stored during indexing
+(`line .. end_line` from libclang's AST extent), so the body is always
+correctly bounded even for multi-line signatures, templates, and braces inside
+strings or comments. For indexes built without `end_line` (before the column
+was added), it falls back to brace-matching.
+
+### Index health (`get_active_build`)
+
+`get_active_build` now reports two additional fields beyond symbol/file counts:
+
+- `reference_count` — number of indexed cross-references (0 when `index_refs`
+  was not enabled). Only populated after indexing with `--refs`.
+- `modified_files_count` — indexed source files whose on-disk modification time
+  is newer than the stored one. A non-zero count means source files have been
+  edited since the last index and a reindex would pick up the changes.
+
+The top-level `stale` flag is now `True` when either `compile_commands.json` or
+**any individual source file** has changed since the last index.
+
 ### Search behaviour
 
 **Auto-prefix expansion:** bare words passed to `search_code` and `smart_search`
