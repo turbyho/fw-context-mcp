@@ -153,7 +153,7 @@ sub-millisecond lookups, zero hallucination, real C/C++ understanding.
 | **[SQLite](https://sqlite.org) + [FTS5](https://sqlite.org/fts5.html)** | Storage and full-text search. The `symbols` table stores name, kind, signature, file/line, docstring, and definition-vs-declaration flag. The FTS5 index covers 6 columns: `name` (original C++ name), `qualified_name` (full `namespace::class::method`), `signature` (parameter types), `docstring` (documentation comments), `file_path` (relative path from project root, for module context), and `name_tokens` (camelCase/snake_case split for sub-token search — e.g. `onConnectionComplete` → `on connection complete`). FTS5 enables fast prefix/phrase/keyword queries without loading entire files. |
 | **[MCP SDK](https://github.com/modelcontextprotocol/python-sdk)** | JSON-RPC 2.0 server framework. Handles protocol initialization, message framing, and tool registration. The server is stateless between calls — each tool invocation opens the DB, runs the query, and closes. |
 | **[httpx](https://www.python-httpx.org/)** | Async HTTP client for calling Ollama's REST API (`/api/chat`, `/api/tags`). Used by `smart_search` and `explain_symbol`. |
-| **[Ollama](https://ollama.com)** *(optional)* | Local or cloud LLM. Powers natural-language search (translates "how does the modem connect?" → FTS5 keywords `modem connect`, `modem attach`) and generates plain-English explanations of C/C++ functions. When disabled, the AI assistant processes results with its own LLM — no Ollama required. |
+| **[Ollama](https://ollama.com)** *(optional)* | Local LLM runtime. Two models are used: `qwen2.5-coder:14b` for natural-language-to-FTS5 translation, query understanding, and symbol explanation; `mxbai-embed-large:latest` for semantic embedding search (Phase 4 — cosine similarity between query and 15K+ symbol descriptions). Both models auto-pull on first use. When disabled, the AI assistant processes results with its own LLM — no Ollama required. |
 | **[`bear`](https://github.com/rizsotto/Bear)** | LD_PRELOAD-based build interception. Wraps your build command (`bear -- python3 build_app.py`) to produce `compile_commands.json`. Required once per build config change. |
 
 ### What gets indexed
@@ -381,11 +381,18 @@ to answer itself, and `smart_search` falls back to direct keyword search —
 no Ollama connection needed.
 
 To use Ollama instead, install it from [ollama.com](https://ollama.com) and
-pull a model:
+pull the models:
 
 ```bash
+# LLM model — required for smart_search and explain_symbol
 ollama pull qwen2.5-coder:14b
+
+# Embedding model — required for semantic search (Phase 4)
+ollama pull mxbai-embed-large:latest
 ```
+
+Both models are auto-pulled on first use if not installed — but pre-pulling
+avoids a long delay during the first `smart_search` call.
 
 Then verify:
 ```bash
