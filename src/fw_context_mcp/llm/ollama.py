@@ -18,6 +18,26 @@ log = logging.getLogger(__name__)
 _TIMEOUT = 60.0
 
 
+def _pull_model(model: str, base_url: str) -> None:
+    """Pull a model via Ollama /api/pull (blocking, streaming).
+
+    Downloads the model if not already installed.  The streaming response
+    is consumed to avoid leaving a dangling connection.
+    """
+    url = base_url.rstrip("/") + "/api/pull"
+    try:
+        with httpx.stream("POST", url, json={"name": model}, timeout=600.0) as resp:
+            resp.raise_for_status()
+            for _ in resp.iter_lines():
+                pass  # consume stream
+    except httpx.HTTPStatusError as e:
+        raise OllamaError(
+            f"Failed to pull model '{model}': HTTP {e.response.status_code}"
+        ) from e
+    except Exception as e:
+        raise OllamaError(f"Failed to pull model '{model}': {e}") from e
+
+
 def _write_debug_log(path: Path, entry: dict) -> None:
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -42,6 +62,10 @@ def call_ollama(prompt: str, cfg: LLMConfig) -> str:
     t0 = time.monotonic()
     try:
         resp = httpx.post(url, json=payload, timeout=_TIMEOUT)
+        if resp.status_code == 404:
+            log.info("LLM model '%s' not found, pulling...", cfg.model)
+            _pull_model(cfg.model, cfg.ollama_url)
+            resp = httpx.post(url, json=payload, timeout=_TIMEOUT)
         resp.raise_for_status()
         response_text = resp.json()["response"]
         if cfg.debug_log:
@@ -88,6 +112,15 @@ def call_ollama_embed(inputs: list[str], cfg: LLMConfig) -> list[list[float]]:
         resp = httpx.post(url, json=payload, timeout=_TIMEOUT * 2)
         resp.raise_for_status()
         return resp.json()["embeddings"]
+    except httpx.HTTPStatusError as e:
+        if e.response.status_code == 404:
+            # Model not installed — pull it, then retry
+            log.info("Embedding model '%s' not found, pulling...", cfg.embed_model)
+            _pull_model(cfg.embed_model, cfg.ollama_url)
+            resp = httpx.post(url, json=payload, timeout=_TIMEOUT * 2)
+            resp.raise_for_status()
+            return resp.json()["embeddings"]
+        raise OllamaError(f"Ollama HTTP {e.response.status_code}: {e.response.text[:200]}") from e
     except httpx.ConnectError as e:
         raise OllamaError(
             f"Cannot connect to Ollama at {cfg.ollama_url}. "
@@ -95,10 +128,6 @@ def call_ollama_embed(inputs: list[str], cfg: LLMConfig) -> list[list[float]]:
         ) from e
     except httpx.TimeoutException:
         raise OllamaError(f"Ollama embed request timed out") from None
-    except httpx.HTTPStatusError as e:
-        if e.response.status_code == 404:
-            raise OllamaModelNotFoundError(cfg.embed_model, cfg.ollama_url) from e
-        raise OllamaError(f"Ollama HTTP {e.response.status_code}: {e.response.text[:200]}") from e
     except OllamaError:
         raise
     except Exception as e:
