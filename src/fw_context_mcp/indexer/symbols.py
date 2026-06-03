@@ -38,6 +38,31 @@ _DECL_KINDS = frozenset({
     cx.CursorKind.CXX_METHOD,
 })
 
+# Callable definitions that establish an "enclosing function" for references
+_CALLABLE_KINDS = frozenset({
+    cx.CursorKind.FUNCTION_DECL,
+    cx.CursorKind.FUNCTION_TEMPLATE,
+    cx.CursorKind.CXX_METHOD,
+    cx.CursorKind.CONSTRUCTOR,
+    cx.CursorKind.DESTRUCTOR,
+})
+
+# Reference expression kinds → ref_kind label
+_REF_KINDS = {
+    cx.CursorKind.CALL_EXPR: "call",
+    cx.CursorKind.DECL_REF_EXPR: "ref",
+    cx.CursorKind.MEMBER_REF_EXPR: "member",
+}
+
+
+@dataclass
+class Reference:
+    to_usr: str        # USR of the referenced definition (links to Symbol.usr)
+    from_file: str     # file containing the reference (absolute, as clang reports)
+    from_line: int
+    from_usr: str | None   # USR of the enclosing function/method (caller), or None
+    ref_kind: str      # "call" | "ref" | "member"
+
 
 @dataclass
 class Symbol:
@@ -128,9 +153,27 @@ def extract(
 ) -> Iterator[Symbol]:
     """Parse unit and yield Symbol records for definitions in source_roots.
 
-    source_roots: only emit symbols whose file is under one of these paths.
-    exclude_paths: skip symbols whose file is under any of these paths (applied after source_roots).
-    If source_roots is None, emit symbols from the unit's own file only.
+    Thin backward-compatible wrapper over ``extract_all`` (symbols only).
+    """
+    symbols, _ = extract_all(unit, source_roots, exclude_paths, with_refs=False)
+    return iter(symbols)
+
+
+def extract_all(
+    unit: CompilationUnit,
+    source_roots: list[Path] | None = None,
+    exclude_paths: list[Path] | None = None,
+    with_refs: bool = False,
+) -> tuple[list[Symbol], list[Reference]]:
+    """Parse unit once and return (symbols, references).
+
+    symbols: definitions/declarations whose file is under source_roots.
+    references: when with_refs is True, call/ref/member expressions whose BOTH
+                ends (referencing site and referenced definition) are under
+                source_roots — i.e. project-internal references, bounded in size.
+    source_roots: only emit symbols/refs whose file is under one of these paths.
+    exclude_paths: skip files under any of these paths (applied after source_roots).
+    If source_roots is None, restrict to the unit's own file only.
     """
     if not source_roots:
         source_roots = [unit.file.parent]
@@ -157,13 +200,13 @@ def extract(
         p = _resolve(path)
         return not any(p == e or p.is_relative_to(e) for e in exclude_paths)
 
-    # Maps USR → is_definition; allows promotion from declaration to definition
-    seen_usrs: dict[str, bool] = {}
+    # --- Symbols ---
+    symbols: list[Symbol] = []
+    seen_usrs: dict[str, bool] = {}  # USR → is_definition (allows decl→def promotion)
 
     for cursor in tu.cursor.walk_preorder():
         if cursor.kind not in _SYMBOL_KINDS:
             continue
-
         loc = cursor.location
         if not loc.file:
             continue
@@ -172,7 +215,6 @@ def extract(
         if not _not_excluded(loc.file.name):
             continue
 
-        # For most kinds require definition; for declarations of callables allow decl too
         is_def = cursor.is_definition()
         if not is_def and cursor.kind not in _DECL_KINDS:
             continue
@@ -184,14 +226,13 @@ def extract(
         prev = seen_usrs.get(usr)
         if prev is not None:
             if is_def and not prev:
-                # Promote: declaration seen before, now we have the definition
                 seen_usrs[usr] = True
             else:
                 continue
         else:
             seen_usrs[usr] = is_def
 
-        yield Symbol(
+        symbols.append(Symbol(
             name=cursor.spelling,
             qualified_name=_qualified_name(cursor),
             kind=_cursor_kind_label(cursor.kind),
@@ -202,4 +243,45 @@ def extract(
             signature=_signature(cursor),
             docstring=_docstring(cursor),
             usr=usr,
-        )
+        ))
+
+    if not with_refs:
+        return symbols, []
+
+    # --- References (explicit stack DFS to track the enclosing function) ---
+    refs: list[Reference] = []
+    seen_ref: set[tuple] = set()
+    # stack of (cursor, enclosing_function_usr)
+    stack: list[tuple] = [(tu.cursor, None)]
+    while stack:
+        cursor, fn_usr = stack.pop()
+        cur_fn = fn_usr
+        if cursor.kind in _CALLABLE_KINDS and cursor.is_definition():
+            cur_fn = cursor.get_usr() or fn_usr
+
+        ref_kind = _REF_KINDS.get(cursor.kind)
+        if ref_kind is not None:
+            referenced = cursor.referenced
+            loc = cursor.location
+            if referenced is not None and loc.file and _in_roots(loc.file.name) and _not_excluded(loc.file.name):
+                to_usr = referenced.get_usr()
+                # Only keep references whose target is itself project-indexable
+                # (its declaration lives under source_roots) — bounds index size
+                # by dropping refs into system/framework headers.
+                ref_loc = referenced.location
+                if to_usr and ref_loc.file and _in_roots(ref_loc.file.name) and _not_excluded(ref_loc.file.name):
+                    key = (to_usr, loc.file.name, loc.line, cur_fn, ref_kind)
+                    if key not in seen_ref:
+                        seen_ref.add(key)
+                        refs.append(Reference(
+                            to_usr=to_usr,
+                            from_file=loc.file.name,
+                            from_line=loc.line,
+                            from_usr=cur_fn,
+                            ref_kind=ref_kind,
+                        ))
+
+        for child in cursor.get_children():
+            stack.append((child, cur_fn))
+
+    return symbols, refs

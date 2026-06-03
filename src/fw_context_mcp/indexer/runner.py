@@ -11,8 +11,10 @@ from .compile_commands import _SOURCE_EXTS
 from .compile_commands import parse as parse_compile_commands
 from .config_hash import compute as compute_config_hash
 from .db import (
+    delete_refs_for_file,
     delete_symbols_for_file,
     get_file_mtimes,
+    insert_refs_batch,
     insert_symbols_batch,
     open_db,
     split_tokens,
@@ -21,7 +23,7 @@ from .db import (
     upsert_file,
     upsert_project,
 )
-from .symbols import extract as extract_symbols
+from .symbols import extract_all
 
 log = logging.getLogger(__name__)
 
@@ -84,6 +86,7 @@ def run(
     source_roots: list[Path] | None = None,
     exclude_paths: list[Path] | None = None,
     project_name: str | None = None,
+    index_refs: bool = False,
 ) -> str:
     """Index a project. Returns config_hash of the indexed build."""
     project_root = compile_commands.parent.resolve()
@@ -114,6 +117,7 @@ def run(
     existing_files = get_file_mtimes(conn, config_hash)
 
     total_syms = 0
+    total_refs = 0
     skipped = 0
     unchanged = 0
     updated = 0
@@ -141,7 +145,10 @@ def run(
                 continue
 
         try:
-            syms = list(extract_symbols(unit, source_roots=source_roots, exclude_paths=exclude_paths))
+            syms, refs = extract_all(
+                unit, source_roots=source_roots, exclude_paths=exclude_paths,
+                with_refs=index_refs,
+            )
         except Exception as exc:
             log.warning("skip TU %s: %s", unit.file.name, exc)
             skipped += 1
@@ -189,17 +196,36 @@ def run(
                     ))
                 total_syms += insert_symbols_batch(conn, rows)
 
+            if index_refs and refs:
+                # Store from_file relative to project root (consistent with
+                # symbols.file_path). On incremental reindex, clear this TU's
+                # old refs first (keyed by the TU's relative path).
+                def _rel(p: str) -> str:
+                    try:
+                        return str(Path(p).resolve().relative_to(project_root))
+                    except ValueError:
+                        return p
+
+                tu_rel = _rel(file_path)
+                if file_path in existing_files:
+                    delete_refs_for_file(conn, config_hash, tu_rel)
+                ref_rows = [
+                    (config_hash, r.to_usr, _rel(r.from_file), r.from_line, r.from_usr, r.ref_kind)
+                    for r in refs
+                ]
+                total_refs += insert_refs_batch(conn, ref_rows)
+
         updated += 1
         if updated % 50 == 0:
             elapsed = time.monotonic() - t0
             log.info(
-                "  %d/%d TUs processed, %d symbols, %.1fs elapsed",
-                i + 1, len(units), total_syms, elapsed,
+                "  %d/%d TUs processed, %d symbols, %d refs, %.1fs elapsed",
+                i + 1, len(units), total_syms, total_refs, elapsed,
             )
 
     elapsed = time.monotonic() - t0
     log.info(
-        "Done: %d updated, %d unchanged, %d skipped — %d symbols in %.1fs (config_hash=%s)",
-        updated, unchanged, skipped, total_syms, elapsed, config_hash[:12],
+        "Done: %d updated, %d unchanged, %d skipped — %d symbols, %d refs in %.1fs (config_hash=%s)",
+        updated, unchanged, skipped, total_syms, total_refs, elapsed, config_hash[:12],
     )
     return config_hash

@@ -5,11 +5,15 @@ import sqlite3
 import pytest
 
 from fw_context_mcp.indexer.db import (
+    count_refs,
+    delete_refs_for_file,
     delete_symbols_for_file,
+    find_refs,
     get_active_config,
     get_all_projects,
     get_file_mtime_indexed,
     get_file_mtimes,
+    insert_refs_batch,
     insert_symbols_batch,
     open_db,
     search_symbols,
@@ -347,3 +351,74 @@ class TestForeignKeyConstraint:
     def test_valid_fk_passes(self, populated_db):
         file_id = upsert_file(populated_db, "hash-deadbeef", "/tmp/valid.cpp", "cpp")
         assert file_id > 0
+
+
+class TestRefs:
+    def _setup_symbols(self, db):
+        """Two symbols: callee modem_init (usr=U_callee), caller app_run (usr=U_caller)."""
+        fid = upsert_file(db, "hash-deadbeef", "/tmp/app.cpp", "cpp")
+        insert_symbols_batch(db, [
+            ("hash-deadbeef", fid, "src/modem.cpp", split_tokens("modem_init", "modem_init"),
+             "U_callee", "modem_init", "modem_init", "function", 10, 1, 1, "void modem_init()", ""),
+            ("hash-deadbeef", fid, "src/app.cpp", split_tokens("app_run", "App::app_run"),
+             "U_caller", "app_run", "App::app_run", "method", 50, 1, 1, "void app_run()", ""),
+        ])
+
+    def test_count_refs_empty(self, populated_db):
+        assert count_refs(populated_db, "hash-deadbeef") == 0
+
+    def test_insert_and_find_call(self, populated_db):
+        self._setup_symbols(populated_db)
+        # app_run (U_caller) calls modem_init (U_callee) at app.cpp:55
+        insert_refs_batch(populated_db, [
+            ("hash-deadbeef", "U_callee", "src/app.cpp", 55, "U_caller", "call"),
+        ])
+        assert count_refs(populated_db, "hash-deadbeef") == 1
+
+        rows = find_refs(populated_db, "hash-deadbeef", "modem_init", ref_kind="call")
+        assert len(rows) == 1
+        r = rows[0]
+        assert r["from_file"] == "src/app.cpp"
+        assert r["from_line"] == 55
+        assert r["ref_kind"] == "call"
+        # caller resolved via from_usr → symbols.usr
+        assert r["caller_name"] == "app_run"
+        assert r["caller_qname"] == "App::app_run"
+
+    def test_find_refs_kind_filter(self, populated_db):
+        self._setup_symbols(populated_db)
+        insert_refs_batch(populated_db, [
+            ("hash-deadbeef", "U_callee", "src/app.cpp", 55, "U_caller", "call"),
+            ("hash-deadbeef", "U_callee", "src/app.cpp", 60, "U_caller", "ref"),
+        ])
+        calls = find_refs(populated_db, "hash-deadbeef", "modem_init", ref_kind="call")
+        assert len(calls) == 1
+        all_refs = find_refs(populated_db, "hash-deadbeef", "modem_init", ref_kind=None)
+        assert len(all_refs) == 2
+
+    def test_find_refs_unknown_caller_null_from_usr(self, populated_db):
+        self._setup_symbols(populated_db)
+        # reference from file scope (from_usr NULL) — LEFT JOIN keeps it
+        insert_refs_batch(populated_db, [
+            ("hash-deadbeef", "U_callee", "src/app.cpp", 5, None, "call"),
+        ])
+        rows = find_refs(populated_db, "hash-deadbeef", "modem_init")
+        assert len(rows) == 1
+        assert rows[0]["caller_name"] is None
+
+    def test_delete_refs_for_file(self, populated_db):
+        self._setup_symbols(populated_db)
+        insert_refs_batch(populated_db, [
+            ("hash-deadbeef", "U_callee", "src/app.cpp", 55, "U_caller", "call"),
+            ("hash-deadbeef", "U_callee", "src/other.cpp", 5, None, "call"),
+        ])
+        assert count_refs(populated_db, "hash-deadbeef") == 2
+        delete_refs_for_file(populated_db, "hash-deadbeef", "src/app.cpp")
+        assert count_refs(populated_db, "hash-deadbeef") == 1
+        remaining = find_refs(populated_db, "hash-deadbeef", "modem_init")
+        assert remaining[0]["from_file"] == "src/other.cpp"
+
+    def test_find_refs_no_match(self, populated_db):
+        self._setup_symbols(populated_db)
+        rows = find_refs(populated_db, "hash-deadbeef", "nonexistent")
+        assert rows == []

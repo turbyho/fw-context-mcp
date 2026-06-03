@@ -171,6 +171,7 @@ def cmd_index(args: argparse.Namespace) -> int:
         source_roots=source_roots,
         exclude_paths=exclude_paths,
         project_name=args.name or cfg.project.name,
+        index_refs=args.refs or cfg.index.index_refs,
     )
     print(f"Indexed. config_hash={config_hash[:16]}…  db={db_path}")
     return 0
@@ -455,6 +456,7 @@ def main() -> None:
     p_index.add_argument("--project", metavar="DIR", help="Project root (default: cwd)")
     p_index.add_argument("--source-roots", nargs="+", metavar="DIR")
     p_index.add_argument("--name", metavar="NAME", help="Project name override")
+    p_index.add_argument("--refs", action="store_true", help="Build cross-reference / call graph (find_callers, find_references)")
     p_index.set_defaults(func=cmd_index)
 
     p_search = sub.add_parser("search", help="Search indexed symbols")
