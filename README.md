@@ -1,24 +1,94 @@
 # fw-context
 
-Build-aware code intelligence for embedded firmware. **fw-context** parses your
-actual build (`compile_commands.json`) with [libclang](https://clang.llvm.org/)
-and stores every C/C++ symbol — functions, classes, methods, enums, typedefs,
-variables — in a full-text-searchable **SQLite + FTS5** database. AI assistants
-(Claude Code, OpenCode) query it through an **MCP server** with sub-millisecond
-latency and zero hallucination.
+Build-aware code intelligence for embedded firmware — a tool that lets AI
+assistants **understand your C/C++ codebase** without hallucinating function
+names, missing overloads, or guessing which `#ifdef` branch is active.
+
+## What it does
+
+**fw-context** parses your actual build (`compile_commands.json`) with
+[libclang](https://clang.llvm.org/) — the same parser your IDE uses — and
+stores every C/C++ symbol in a full-text-searchable **SQLite + FTS5** database
+on disk. An **MCP server** then exposes this index as tools that AI assistants
+(Claude Code, OpenCode) can call directly: sub-millisecond lookups, zero
+hallucination, real C/C++ understanding.
+
+Once indexed, your AI assistant can answer questions like:
+
+> *"What does `modem_parser_oob_init` do and who calls it?"*
+>
+> *"Find all functions related to BLE pairing failure handling."*
+>
+> *"Show me the definition of `ZCfgDataManager` — not the declaration, the actual implementation."*
+>
+> *"Is the index up to date, or did I forget to re-index after my last edit?"*
+>
+> *"Where is `reset_slot_error_lock` used across the entire project?"*
+
+The assistant resolves these by querying the index — no grepping through files,
+no guessing from training data, no reading 8000 Mbed OS headers into context.
+
+### Why not just use LSP?
+
+LSP servers (clangd, ccls) are designed for interactive editing — go-to-definition,
+autocomplete, hover info. They're excellent at that. But they have limitations
+for AI-assisted code exploration:
+
+- **No full-text search across the codebase.** LSP can find a symbol by name,
+  but not "all functions related to modem initialization."
+- **No persistent index.** The LSP index lives in memory; restart the server
+  and it rebuilds from scratch. fw-context's index is a SQLite file — it
+  survives reboots, and your AI assistant reads it in milliseconds.
+- **No AI-oriented interface.** LSP speaks a protocol designed for editors,
+  not for AI agents. fw-context's MCP tools are purpose-built for the
+  assistant's workflow: lookup, search, explain, re-index.
+- **Grep is blind to build context.** `grep -r` doesn't know which translation
+  units are actually compiled, which `#ifdef` branch is active, or whether a
+  match is a definition or just a forward declaration. fw-context knows all
+  three.
+
+fw-context doesn't replace LSP — it complements it. Use clangd for editing,
+fw-context for AI-assisted exploration.
+
+### Three components
+
+| Component | Runs as | Purpose |
+|-----------|---------|---------|
+| **CLI** (`fw-context`) | User command | Index build, status checks, project management |
+| **Indexer** | Called by CLI | libclang parses every translation unit from `compile_commands.json`, extracts symbols with qualified names, signatures, and locations, stores them in SQLite + FTS5 |
+| **MCP server** (`fw-context-mcp`) | Subprocess started by AI assistant | Exposes 12 tools over JSON-RPC 2.0 (stdin/stdout); optionally calls a local **Ollama** model for natural-language search and symbol explanation |
+
+### Key characteristics
+
+- **Zero daemon.** No background process — the index is a file on disk that
+  the MCP server reads on-demand. Each tool call opens the DB, runs a query,
+  and closes.
+- **Ollama is optional.** `explain_symbol` and `smart_search` can use a local
+  LLM for natural-language queries, but when Ollama is disabled, the AI
+  assistant processes results with its own model. Everything else works
+  without any LLM at all.
+- **Incremental by default.** After the first index, only files with changed
+  modification time are re-parsed. Editing one file and running `fw-context index`
+  takes under a second.
+- **Auto-reindex on query.** `search_code` and `lookup_symbol` detect stale
+  files in their results and re-index them on the fly — so the typical
+  edit→search workflow requires no manual steps.
+- **Offline-first.** The index lives at `~/.fw-context/index/`. No cloud
+  account needed. Ollama runs locally if you choose to use it.
+
+### Supported ecosystems
 
 Works with **any embedded build system** that produces `compile_commands.json`:
 **Mbed OS**, **Zephyr RTOS**, **PlatformIO** (Arduino, ESP-IDF, STM32Cube),
 **FreeRTOS**, **bare-metal ARM**, and anything else compiled with GCC or Clang.
-No LSP server required — it uses the real compiler flags, so it sees what your
-compiler sees, `#ifdef`s and all.
+No LSP server, no `c_cpp_properties.json`, no manual configuration — it uses
+the real compiler flags, so it sees what your compiler sees, `#ifdef`s and all.
 
 First indexing depends on project size — from **seconds** for small bare-metal
 projects (50–200 files) to **15–20 minutes** for large Mbed OS codebases with
 thousands of framework headers pulled in through `#include`. Subsequent runs
 are **incremental** — only changed files are re-parsed, so they finish in
-seconds. The index lives on disk; your AI assistant reads it directly, no
-daemon, no background process.
+seconds.
 
 ## Supported ecosystems
 
@@ -74,14 +144,6 @@ sub-millisecond lookups, zero hallucination, real C/C++ understanding.
   │ .json             │        │ SQLite + FTS5 db    │        │ explain_symbol(…)│
   └──────────────────┘        └─────────────────────┘        └──────────────────┘
 ```
-
-### Architecture (3 components)
-
-| Component | Runs as | Built with | Purpose |
-|-----------|---------|------------|---------|
-| **CLI** (`fw-context`) | User command | Python + Click-like argparse | Index build, status checks, project management |
-| **Indexer** | Called by CLI | **libclang** (C API via `libclang` Python bindings), SQLite FTS5 | Parses C/C++; extracts functions, classes, methods, enums, typedefs, variables; stores in full-text-searchable database |
-| **MCP server** (`fw-context-mcp`) | Subprocess started by AI assistant | **MCP SDK** (stdlib JSON-RPC 2.0), SQLite, **httpx** (Ollama HTTP) | Exposes 12 tools over stdin/stdout; optionally calls **Ollama** for natural-language search and symbol explanation |
 
 ### Key technologies
 
