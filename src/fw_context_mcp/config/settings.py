@@ -73,7 +73,7 @@ class IndexConfig:
     source_roots: list[str] = field(default_factory=list)
     exclude_paths: list[str] = field(default_factory=lambda: ["build", "BUILD"])
     index_refs: bool = False
-    index_embeddings: bool = False
+    index_embeddings: bool = True
 
 
 @dataclass
