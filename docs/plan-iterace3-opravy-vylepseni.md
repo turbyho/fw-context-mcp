@@ -248,3 +248,34 @@ s opt-in flagem.
   refs.
 - **Dokumentace**: aktualizovat README (nové nástroje, schéma) a tento plán
   doplnit o výsledky po implementaci.
+
+---
+
+## Výsledky implementace (2026-06-03)
+
+Status: **Implementováno** — všechny 4 fáze hotové, 111 testů prochází, ruff čistý.
+
+| Fáze | Commit | Stav |
+|------|--------|------|
+| 1 — path regrese | `51c7bcc` | ✅ + odhalena a opravena druhá tichá regrese (`_stale_files` dostával relativní cesty → per-file staleness nefungoval) |
+| 3 — get_source + 4a | `430a337` | ✅ brace-matching tělo, `_lookup_definition` preferuje projekt před mbed-os |
+| 2 — call graph | `22d1cab` | ✅ `refs` tabulka, `extract_all`, `find_callers`/`find_references`, opt-in `index_refs` |
+| 4b/4c — cache + staleness | `621778a` | ✅ Ollama keyword cache, `modified_files_count`/`reference_count` v get_active_build |
+| README | `d077ccb` | ✅ |
+
+### Klíčová zjištění
+
+- **Druhá regrese z `3d686cc`:** `_stale_files` query `files.path` (absolutní),
+  ale od odstranění JOINu dostával relativní `symbols.file_path` → lookup vždy
+  None → per-file staleness varování tiše přestalo fungovat. Opraveno `_abs_path`.
+- **Reference objem:** jeden TU (`wdt.cpp`) = 515 projekt-interních referencí
+  (99 call). Filtr „oba konce v source_roots" drží index ohraničený.
+- **Aktivace call grafu vyžaduje full reindex:** inkrementální indexace přeskočí
+  nezměněné TU *před* extrakcí referencí, takže `index --refs` na aktuálním
+  indexu nic nepřidá. Nutný `reset` + `index --refs`.
+
+### Odložené (nízká priorita, neimplementováno)
+
+- 5a `_signature` const/template kvalifikátory
+- 5b lazy `.fw-context/config.toml` creation
+- 5c batch Phase 1 rough search dotazů
