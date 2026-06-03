@@ -208,11 +208,11 @@ fw-context init
 
 # 3. Generate compile_commands.json, then index
 cd your-firmware-project
-bear --output .fw-context/compile_commands.json -- python3 build_app.py --profile release     # Mbed OS
-fw-context index .fw-context/compile_commands.json
+bear --output compile_commands.json -- python3 build_app.py --profile release     # Mbed OS
+fw-context index compile_commands.json
 
 # Set as default for the project:
-echo 'compile_commands = ".fw-context/compile_commands.json"' >> .fw-context/config.toml
+echo 'compile_commands = "compile_commands.json"' >> .fw-context/config.toml
 
 # Done. Restart your AI assistant and start asking it about your code.
 ```

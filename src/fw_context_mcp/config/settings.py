@@ -33,8 +33,8 @@ _PROJECT_DEFAULTS_TEMPLATE = """\
 # name = "my-project"   # defaults to directory name
 
 [index]
-compile_commands = ".fw-context/compile_commands.json"
-# Generate it with:  bear --output .fw-context/compile_commands.json -- <build-cmd>
+compile_commands = "compile_commands.json"
+# Generate it with:  bear --output compile_commands.json -- <build-cmd>
 # source_roots: directories to index symbols from.
 #   Empty list = auto-detect (scans for src, lib, app, include, zephyr, mbed-os,
 #   modules + top-level directories from compile_commands.json).

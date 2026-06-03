@@ -25,7 +25,7 @@ Both files are auto-created with sensible defaults on first use.
 | Key | Default | Scope | Description |
 |-----|---------|-------|-------------|
 | `db_dir` | `"~/.fw-context/index"` | global | Directory where SQLite index databases are stored. One subdirectory per project (keyed by project ID). |
-| `compile_commands` | `"compile_commands.json"` | project | Path to the compilation database. Relative paths are resolved from the project root. Recommended: `.fw-context/compile_commands.json` to keep the project root clean. Use `bear --output .fw-context/compile_commands.json -- ...` to generate it there. |
+| `compile_commands` | `"compile_commands.json"` | project | Path to the compilation database. Relative paths are resolved from the project root. Use `bear --output compile_commands.json -- ...` to generate it. |
 | `source_roots` | `[]` *(auto-detect)* | project | Directories to scan for symbols. **Empty list = auto-detect** (scans `src`, `lib`, `app`, `include`, `modules` + framework dirs `zephyr`/`mbed-os` + top-level dirs from `compile_commands.json`). Set explicitly to narrow indexing: `["src", "lib"]`. Directories that don't exist are silently skipped. |
 | `exclude_paths` | `["build", "BUILD"]` | project | Directories to skip during indexing. Useful for generated code, test fixtures, or third-party vendored code. Paths are relative to project root. |
 | `index_refs` | `false` | project | Build the cross-reference / call graph (`find_callers`, `find_references`). Off by default — reference extraction adds indexing time and DB size. Set `true` (or pass `--refs`) and re-index to enable. |
