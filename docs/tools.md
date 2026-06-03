@@ -20,6 +20,8 @@ fw-context index [compile_commands.json] [--project DIR] [--source-roots DIR ...
 | `--source-roots DIR...` | auto-detected | Directories to index symbols from |
 | `--name NAME` | directory name | Project name override |
 | `--refs` | off | Build cross-reference / call graph (`find_callers`, `find_references`) |
+| `--embeddings` | on | Generate symbol embeddings for semantic search (default) |
+| `--no-embeddings` | off | Skip embedding generation |
 | `-v` | off | Verbose progress output |
 
 ### `fw-context search`
@@ -127,57 +129,87 @@ the AI assistant to process with its own LLM.
 
 #### `smart_search` — natural language → FTS5 keywords (2–10 s)
 
-A two-phase search that translates human language into precise FTS5 queries:
+A multi-phase search combining FTS5 keyword search, LLM query refinement,
+and semantic embedding search:
 
 ```
-                         Phase 1: Rough search
-┌──────────────┐    ┌─────────────────────────────┐
-│ User query:  │    │ 1. Split into words         │
-│ "uart serial │───▶│ 2. FTS5 search with stems   │───▶ rough results
-│  port read   │    │    (uart* serial* port*…)    │    (~20–50 symbols)
-│  and write   │    └─────────────────────────────┘
-│  data"       │
-└──────────────┘
-                         Phase 2: Ollama refinement
-┌─────────────────────────────────────────────────┐
-│ 3. Take rough result symbol names               │
-│    → PalUartReadData, uarte_irq_handler,        │
-│      nordic_nrf5_uart0_handler, SerialBase …    │
-│                                                  │
-│ 4. Send to Ollama with prompt:                  │
-│    "Study these real symbols from the project.   │
-│     Learn the naming conventions. Generate       │
-│     3–5 FTS5 keyword search terms matching       │
-│     these patterns."                             │
-│                                                  │
-│ 5. Ollama returns JSON:                         │
-│    ["uart*", "Uart*", "serial*", "Serial*",     │
-│     "read_data*", "ReadData*", "write_data*"]    │
-└─────────────────────────────────────────────────┘
-                         ▼
-┌─────────────────────────────────────────────────┐
-│ 6. Run FTS5 with refined terms                  │
-│ 7. Merge & deduplicate with rough results        │
-│ 8. Rank by weighted score                       │
-│ 9. Return final results (max 100)               │
-└─────────────────────────────────────────────────┘
+Phase 0: Translation (LLM)
+┌────────────────────────────────────────────────────┐
+│ Always sent to Ollama for language detection.      │
+│ English → returned unchanged.                      │
+│ Czech/Slovak/etc. → translated to English.         │
+│ Works even without diacritics ("komunikace").      │
+└────────────────────────────────────────────────────┘
+                         Phase 1: Rough search (balanced sampling)
+┌──────────────┐    ┌─────────────────────────────────────┐
+│ User query:  │    │ 1a. Phrase FTS5 search (word pairs) │
+│ "modem       │───▶│ 1b. Single-word FTS5 search          │───▶ rough samples
+│  registers   │    │ Slots allocated proportionally       │    (~12–20 symbols)
+│  to network" │    │ across all content words             │    with file paths
+└──────────────┘    └─────────────────────────────────────┘
+                         Phase 2a: LLM understanding + first queries
+┌────────────────────────────────────────────────────┐
+│ Ollama receives:                                   │
+│  - Full translated query (sentence context)        │
+│  - Rough samples with file paths                   │
+│  - Hierarchical format: path : file : class : name │
+│                                                    │
+│ Responds with:                                     │
+│  UNDERSTANDING: <subsystem, what they want>        │
+│  QUERIES: ["network_reg*", "modem_init*", ...]     │
+└────────────────────────────────────────────────────┘
+                         Phase 2b: LLM refinement (feedback loop)
+┌────────────────────────────────────────────────────┐
+│ First-round queries are executed.                  │
+│ LLM sees TOP RESULTS and evaluates:                │
+│  "Are these from the right subsystem?"             │
+│  If NO → generates BETTER queries                  │
+│  If YES → returns [] (no refinement needed)        │
+└────────────────────────────────────────────────────┘
+                         Phase 3: FTS5 search + scoring
+┌────────────────────────────────────────────────────┐
+│ Run all queries (Phase 2a + 2b) via OR, merge.    │
+│ Score by weighted field matching:                  │
+│  name/name_tokens = 3, qualified_name = 2,         │
+│  file_path = 1, project-local code = +1 bonus.     │
+│ Deduplicate by (name, file_path), prefer defs.     │
+│ Sort by score only (no FTS5 rank tiebreaker).      │
+└────────────────────────────────────────────────────┘
+                         Phase 4: Embedding search (semantic)
+┌────────────────────────────────────────────────────┐
+│ Query embedded via mxbai-embed-large:latest.       │
+│ Cosine similarity against 15K symbol embeddings    │
+│ in the index DB.                                   │
+│ Top matches (>0.5 similarity) merged into results. │
+│ Embeddings generated during fw-context index.      │
+└────────────────────────────────────────────────────┘
 ```
 
-**Why two phases?** The rough search gathers real symbol names from the
-project so Ollama can learn the naming conventions. If you just sent the
-query "uart serial port read and write data" to FTS5 directly, you'd miss
-camelCase symbols like `PalUartReadData` (single token in FTS5 — prefix
-`Uart*` won't match `uart*`). Ollama sees both patterns and generates
-matching prefixes for each.
+**Phase 1 — Balanced sampling:** Slots in the rough sample set are
+allocated proportionally across content words, preventing high-frequency
+words (e.g. "connection" matching 100s of BLE symbols) from crowding out
+less frequent but equally relevant terms ("network", "modem").
 
-**Non-ASCII (Czech) queries** get an extra pre-processing step: the query
-is sent to Ollama for translation to English before entering Phase 1. This
-means `"jak se modem připojuje"` becomes `"how does the modem connect"`
-first, then proceeds through the two-phase search.
+**Phase 2a — Sentence context:** Instead of isolated keywords, the LLM
+sees the full translated sentence. This disambiguates words: "registers
+to the network" → network registration, not hardware register.
 
-**When Ollama is disabled:** `smart_search` falls back to Phase 1 only —
-word-split + FTS5 with stems. Results are still scored and ranked, just
-without the naming-convention refinement.
+**Phase 2b — Feedback loop:** The LLM sees actual search results and can
+course-correct. If BLE connection symbols appear for a modem query, it
+generates refined queries targeting the correct subsystem. Even runs when
+zero results are found (indicates clearly wrong queries).
+
+**Phase 4 — Semantic search:** Symbol embeddings (hierarchical format:
+`path : file : class : name : signature`) stored in the index DB. Generated
+with `mxbai-embed-large` during `fw-context index`. Cosine similarity >0.5
+adds symbol to results even when FTS5 would miss it.
+
+**Non-ASCII (Czech) queries** are always detected by the LLM in Phase 0 —
+no `isascii()` check needed. Czech without diacritics ("SPI komunikace s
+displayem") is correctly translated.
+
+**When Ollama is disabled:** Falls back to Phase 1 rough terms only —
+word-split + FTS5 with stems. Embedding search is also skipped.
 
 #### `explain_symbol` — plain-English function explanation (10–40 s)
 
@@ -420,12 +452,17 @@ generating FTS5 terms — no manual transliteration needed.
 |-------|--------|
 | `name` / `name_tokens` (camelCase split) | 3 |
 | `qualified_name` | 2 |
-| `file_path` (module context, e.g. `spi* write*` hits `write` in `spi_driver.cpp`) | 1 |
+| `file_path` (module context) | 1 |
 | Project-local symbol (`src/`, `lib/`, not `mbed-os/`) | +1 bonus |
-| Kind: function / method / class | +2 bonus |
+| Kind: function / method / constructor / class | +2 bonus |
 | Kind: enum constant | +1 bonus |
 | Kind: variable / field | 0 bonus |
 
-Results are sorted by score descending. When Ollama is disabled, `smart_search`
-falls back to `search_code` with a plain keyword split — scoring still applies.
+Results are sorted by **score only** (no FTS5 rank tiebreaker — prevents
+massive docstring matches from dominating). Symbols are deduplicated by
+`(name, file_path)` with definitions preferred over declarations.
+Embedding results (Phase 4) are merged in with the same scoring weight.
+
+When Ollama is disabled, `smart_search` falls back to `search_code` with
+a plain keyword split — scoring still applies.
 
