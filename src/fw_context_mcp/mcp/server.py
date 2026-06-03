@@ -1713,15 +1713,15 @@ async def smart_search(
                 if fpath and ("src/" in fpath or "lib/" in fpath) and "mbed-os" not in fpath:
                     s += 1
                 elif fpath and "mbed-os" in fpath:
-                    s -= 3  # framework code is less relevant than project code
+                    s -= 5  # framework code is less relevant than project code
 
                 s += _KIND_WEIGHT.get(r["kind"] or "", 0)
                 return s
 
-            scored = [(_score(r), i, r) for i, r in enumerate(all_rows)]
-            scored.sort(key=lambda x: (-x[0], x[1]))
+            scored = [(_score(r), r) for r in all_rows]
+            scored.sort(key=lambda x: -x[0])
 
-            for _, _, r in scored:
+            for _, r in scored:
                 name = r["name"] or ""
                 if name.startswith("("):
                     continue
