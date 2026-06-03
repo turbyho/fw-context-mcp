@@ -21,6 +21,7 @@ from ..indexer.db import (
     find_refs,
     get_active_config,
     get_all_projects,
+    DatabaseCorruptionError,
     get_file_mtime_indexed,
     get_file_mtimes,
     insert_refs_batch,
@@ -71,6 +72,23 @@ def _resolve_context(project_root: str | None) -> tuple[Path, Config, str, Path]
     cfg = load_config(project_root=root)
     project_id = derive_project_id(root)
     return cfg.index.db_dir / project_id / "index.db", cfg, project_id, root
+
+
+def _open_db_safe(db_path: Path) -> tuple[sqlite3.Connection | None, dict | None]:
+    """Open DB with corruption check.
+
+    Returns ``(conn, None)`` on success — the caller should continue with
+    ``with conn:``.  Returns ``(None, error_dict)`` when the database is
+    corrupt, so the tool can short-circuit and return the error directly.
+    """
+    try:
+        return open_db(db_path), None
+    except DatabaseCorruptionError as e:
+        return None, {
+            "error": f"Database corruption detected: {e.details}",
+            "action": "reset_index",
+            "hint": "Run reset_index() then fw-context index to rebuild.",
+        }
 
 
 def _resolve_project_root(project_root: str | None) -> Path:
@@ -242,6 +260,35 @@ def _detect_build_system(root: Path) -> str:
     return "unknown"
 
 
+def _auto_reindex_stale(
+    stale_files: list[str],
+    project_root: Path,
+    max_files: int = 5,
+    timeout_s: float = 30.0,
+) -> tuple[list[str], list[str]]:
+    """Reindex stale files in-place. Returns (succeeded, failed).
+
+    Bounded by *max_files* and *timeout_s* to prevent unbounded latency
+    when many files are stale (e.g. after a toolchain update touches every
+    object file).
+    """
+    succeeded: list[str] = []
+    failed: list[str] = []
+    t0 = time.monotonic()
+    for fp in stale_files[:max_files]:
+        if time.monotonic() - t0 > timeout_s:
+            break
+        try:
+            result = reindex_file(fp, str(project_root))
+            if "error" in result:
+                failed.append(fp)
+            else:
+                succeeded.append(fp)
+        except Exception:
+            failed.append(fp)
+    return succeeded, failed
+
+
 # ---------------------------------------------------------------------------
 # Tools
 # ---------------------------------------------------------------------------
@@ -274,7 +321,10 @@ def get_active_build(project_root: str | None = None) -> dict:
     if not db_path.exists():
         return {"error": f"No index found for {root}. Run 'fw-context index' first."}
 
-    with open_db(db_path) as conn:
+    conn, err = _open_db_safe(db_path)
+    if err:
+        return err
+    with conn:
         project_id = derive_project_id(root)
         cfg = get_active_config(conn, project_id)
         if not cfg:
@@ -346,23 +396,16 @@ def search_code(
     if not db_path.exists():
         return [{"error": f"No index found for {root}. Run 'fw-context index' first."}]
 
-    with open_db(db_path) as conn:
-        project_id = derive_project_id(root)
-        cfg = get_active_config(conn, project_id)
-        if not cfg:
-            return [{"error": "No build config indexed."}]
+    conn, err = _open_db_safe(db_path)
+    if err:
+        return [err]
 
-        limit = min(limit, 100)
-        rows = search_symbols(conn, query, cfg["config_hash"], limit=limit)
-
+    # --- inner: run FTS5 search + format results ---
+    def _do_search(c: sqlite3.Connection, config_hash: str) -> list[dict]:
+        rows = search_symbols(c, query, config_hash, limit=limit)
         if kind:
             rows = [r for r in rows if r["kind"] == kind]
-
-        results: list[dict] = []
-        if _is_stale(cfg, cfg["compile_commands_path"]):
-            results.append({"warning": "Index may be stale — compile_commands.json changed since last index. Run 'fw-context index' to update."})
-
-        result_rows = [
+        return [
             {
                 "name": r["name"],
                 "qualified_name": r["qualified_name"],
@@ -375,13 +418,39 @@ def search_code(
             }
             for r in rows
         ]
-        # _stale_files queries files.path (absolute) — pass absolute paths so the
-        # mtime lookup matches (relative file_path would silently never match).
-        stale_f = _stale_files(conn, cfg["config_hash"], [_abs_path(root, r["file_path"]) for r in rows])
-        if stale_f:
-            results.append({"warning": f"File(s) modified since last index — results may be outdated. Run 'fw-context index' or reindex_file(): {stale_f}"})
-        results += result_rows
-        return results
+
+    with conn:
+        project_id = derive_project_id(root)
+        cfg = get_active_config(conn, project_id)
+        if not cfg:
+            return [{"error": "No build config indexed."}]
+
+        config_hash = cfg["config_hash"]
+        limit = min(limit, 100)
+
+        result_rows = _do_search(conn, config_hash)
+        stale_f = _stale_files(conn, config_hash, [_abs_path(root, r["file"]) for r in result_rows])
+
+    # --- auto-reindex stale files, then re-run search ---
+    results: list[dict] = []
+    if _is_stale(cfg, cfg["compile_commands_path"]):
+        results.append({"warning": "Index may be stale — compile_commands.json changed since last index. Run 'fw-context index' to update."})
+
+    if stale_f:
+        succeeded, failed = _auto_reindex_stale(stale_f, root)
+        if succeeded:
+            conn2, err2 = _open_db_safe(db_path)
+            if err2:
+                results.append({"warning": f"Auto-reindex partially succeeded ({len(succeeded)} files), but DB is now corrupt. Run reset_index() + 'fw-context index'."})
+                results += result_rows
+                return results
+            with conn2:
+                result_rows = _do_search(conn2, config_hash)
+        if failed:
+            results.append({"warning": f"Auto-reindex failed for {len(failed)} file(s): {', '.join(failed[:3])}. Run 'fw-context index' manually."})
+
+    results += result_rows
+    return results
 
 
 @mcp.tool()
@@ -421,16 +490,14 @@ def lookup_symbol(
         if not db_path.exists():
             return [{"error": f"No index found for {root}."}]
 
-        with open_db(db_path) as conn:
-            project_id = derive_project_id(root)
-            cfg = get_active_config(conn, project_id)
-            if not cfg:
-                return [{"error": "No build config indexed."}]
+        conn, err = _open_db_safe(db_path)
+        if err:
+            return [err]
 
-            config_hash = cfg["config_hash"]
-            limit = min(limit, 100)
+        # --- inner: run SQL lookup + format results ---
+        def _do_lookup(c: sqlite3.Connection, config_hash: str) -> list[dict]:
             if exact:
-                rows = conn.execute(
+                rows = c.execute(
                     """SELECT s.* FROM symbols s
                        WHERE s.config_hash=? AND s.name=?
                        ORDER BY s.is_definition DESC, s.line
@@ -438,19 +505,14 @@ def lookup_symbol(
                     (config_hash, name, limit),
                 ).fetchall()
             else:
-                rows = conn.execute(
+                rows = c.execute(
                     """SELECT s.* FROM symbols s
                        WHERE s.config_hash=? AND s.name LIKE ?
                        ORDER BY s.is_definition DESC, s.line
                        LIMIT ?""",
                     (config_hash, f"{name}%", limit),
                 ).fetchall()
-
-            results: list[dict] = []
-            if _is_stale(cfg, cfg["compile_commands_path"]):
-                results.append({"warning": "Index may be stale — compile_commands.json changed since last index. Run 'fw-context index' to update."})
-
-            result_rows = [
+            return [
                 {
                     "name": r["name"],
                     "qualified_name": r["qualified_name"],
@@ -463,11 +525,39 @@ def lookup_symbol(
                 }
                 for r in rows
             ]
-            stale_f = _stale_files(conn, cfg["config_hash"], [_abs_path(root, r["file_path"]) for r in rows])
-            if stale_f:
-                results.append({"warning": f"File(s) modified since last index — results may be outdated. Run 'fw-context index' or reindex_file(): {stale_f}"})
-            results += result_rows
-            return results
+
+        with conn:
+            project_id = derive_project_id(root)
+            cfg = get_active_config(conn, project_id)
+            if not cfg:
+                return [{"error": "No build config indexed."}]
+
+            config_hash = cfg["config_hash"]
+            limit = min(limit, 100)
+
+            result_rows = _do_lookup(conn, config_hash)
+            stale_f = _stale_files(conn, config_hash, [_abs_path(root, r["file"]) for r in result_rows])
+
+        # --- auto-reindex stale files, then re-run lookup ---
+        results: list[dict] = []
+        if _is_stale(cfg, cfg["compile_commands_path"]):
+            results.append({"warning": "Index may be stale — compile_commands.json changed since last index. Run 'fw-context index' to update."})
+
+        if stale_f:
+            succeeded, failed = _auto_reindex_stale(stale_f, root)
+            if succeeded:
+                conn2, err2 = _open_db_safe(db_path)
+                if err2:
+                    results.append({"warning": f"Auto-reindex partially succeeded ({len(succeeded)} files), but DB is now corrupt."})
+                    results += result_rows
+                    return results
+                with conn2:
+                    result_rows = _do_lookup(conn2, config_hash)
+            if failed:
+                results.append({"warning": f"Auto-reindex failed for {len(failed)} file(s): {', '.join(failed[:3])}. Run 'fw-context index' manually."})
+
+        results += result_rows
+        return results
     except Exception as e:
         log.exception("lookup_symbol failed: %s", e)
         return [{"error": f"lookup_symbol failed: {e}"}]
@@ -498,7 +588,11 @@ def list_projects(project_root: str | None = None) -> list[dict]:
     results: list[dict] = []
     for db_path in sorted(db_files):
         try:
-            with open_db(db_path) as conn:
+            conn, err = _open_db_safe(db_path)
+            if err:
+                results.append(err)
+                continue
+            with conn:
                 rows = get_all_projects(conn)
             for r in rows:
                 stale = _is_stale(
@@ -550,13 +644,19 @@ def reset_index(project_root: str | None = None, confirm: bool = False) -> dict:
     project_id = derive_project_id(root)
     cfg_data = None
     sym_count = 0
-    with open_db(db_path) as conn:
-        cfg_data = get_active_config(conn, project_id)
-        if cfg_data:
-            sym_count = conn.execute(
-                "SELECT COUNT(*) FROM symbols WHERE config_hash=?",
-                (cfg_data["config_hash"],),
-            ).fetchone()[0]
+    corrupt = False
+    try:
+        conn = open_db(db_path)
+    except DatabaseCorruptionError as e:
+        corrupt = True
+    else:
+        with conn:
+            cfg_data = get_active_config(conn, project_id)
+            if cfg_data:
+                sym_count = conn.execute(
+                    "SELECT COUNT(*) FROM symbols WHERE config_hash=?",
+                    (cfg_data["config_hash"],),
+                ).fetchone()[0]
 
     info: dict[str, object] = {
         "project_root": str(root),
@@ -566,13 +666,22 @@ def reset_index(project_root: str | None = None, confirm: bool = False) -> dict:
     if cfg_data:
         info["symbol_count"] = sym_count
         info["indexed_at"] = cfg_data["created_at"]
+    elif corrupt:
+        info["warning"] = "Database is corrupt — integrity check failed."
 
     if not confirm:
         info["action"] = "dry_run"
-        info["message"] = (
-            f"Would delete {db_path}. "
-            "Call reset_index(confirm=True) to proceed."
-        )
+        if corrupt:
+            info["message"] = (
+                f"Database at {db_path} is corrupt. "
+                "Call reset_index(confirm=True) to delete it anyway, "
+                "then run 'fw-context index' to rebuild."
+            )
+        else:
+            info["message"] = (
+                f"Would delete {db_path}. "
+                "Call reset_index(confirm=True) to proceed."
+            )
         return info
 
     db_path.unlink()
@@ -622,7 +731,10 @@ def reindex_file(
     if not db_path.exists():
         return {"error": f"No index found for {root}. Run 'fw-context index' first."}
 
-    with open_db(db_path) as conn:
+    conn, err = _open_db_safe(db_path)
+    if err:
+        return err
+    with conn:
         cfg_data = get_active_config(conn, project_id)
         if not cfg_data:
             return {"error": "No build config indexed."}
@@ -799,7 +911,10 @@ async def explain_symbol(
     if not db_path.exists():
         return {"error": f"No index found for {root}. Run 'fw-context index' first."}
 
-    with open_db(db_path) as conn:
+    conn, err = _open_db_safe(db_path)
+    if err:
+        return err
+    with conn:
         cfg_data = get_active_config(conn, project_id)
         if not cfg_data:
             return {"error": "No build config indexed."}
@@ -894,7 +1009,10 @@ def get_source(name: str, project_root: str | None = None) -> dict:
     if not db_path.exists():
         return {"error": f"No index found for {root}. Run 'fw-context index' first."}
 
-    with open_db(db_path) as conn:
+    conn, err = _open_db_safe(db_path)
+    if err:
+        return err
+    with conn:
         cfg_data = get_active_config(conn, project_id)
         if not cfg_data:
             return {"error": "No build config indexed."}
@@ -928,7 +1046,10 @@ def _references_result(name: str, project_root: str | None, ref_kind: str | None
     if not db_path.exists():
         return [{"error": f"No index found for {root}. Run 'fw-context index' first."}]
 
-    with open_db(db_path) as conn:
+    conn, err = _open_db_safe(db_path)
+    if err:
+        return [err]
+    with conn:
         cfg_data = get_active_config(conn, project_id)
         if not cfg_data:
             return [{"error": "No build config indexed."}]
@@ -1105,7 +1226,10 @@ async def smart_search(
     config_hash = ""
     seen: dict[tuple, dict] = {}
 
-    with open_db(db_path) as conn:
+    conn, err = _open_db_safe(db_path)
+    if err:
+        return [err]
+    with conn:
         cfg_data = get_active_config(conn, project_id)
         if not cfg_data:
             return [{"error": "No build config indexed."}]
@@ -1357,7 +1481,10 @@ async def smart_search(
     if ollama_warning:
         results.append(ollama_warning)
     if not ollama_warning and cfg_data and _is_stale(cfg_data, cfg_data["compile_commands_path"]):
-        results.append({"warning": "Index may be stale — run 'fw-context index'."})
+        results.append({
+            "warning": "Index may be stale — compile_commands.json changed since last index.",
+            "hint": "Call reindex_file() on modified files or run 'fw-context index' to update.",
+        })
 
     results += list(seen.values())[:limit]
     if not seen:

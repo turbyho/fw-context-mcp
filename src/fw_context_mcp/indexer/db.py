@@ -9,6 +9,21 @@ from contextlib import contextmanager
 from pathlib import Path
 
 
+class DatabaseCorruptionError(sqlite3.DatabaseError):
+    """Raised when the SQLite database fails integrity check.
+
+    The caller should present the error to the user with a clear action:
+    run ``reset_index()`` then ``fw-context index`` to rebuild.
+    """
+
+    def __init__(self, db_path: str, details: str = ""):
+        self.db_path = db_path
+        self.details = details
+        super().__init__(
+            f"Database corruption detected at {db_path}: {details}"
+        )
+
+
 def split_tokens(name: str, qualified_name: str = "") -> str:
     """Normalize camelCase/snake_case names to space-separated lowercase tokens.
 
@@ -142,87 +157,104 @@ def open_db(path: Path) -> sqlite3.Connection:
     path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(path))
     conn.row_factory = sqlite3.Row
-    conn.executescript(_SCHEMA)
 
-    # Migration: mtime column in files
     try:
-        conn.execute("ALTER TABLE files ADD COLUMN mtime REAL NOT NULL DEFAULT 0")
-        conn.commit()
-    except sqlite3.OperationalError:
-        pass
+        conn.executescript(_SCHEMA)
 
-    # Migration: end_line column in symbols (full definition extent for get_source)
+        # Migration: mtime column in files
+        try:
+            conn.execute("ALTER TABLE files ADD COLUMN mtime REAL NOT NULL DEFAULT 0")
+            conn.commit()
+        except sqlite3.OperationalError:
+            pass
+
+        # Migration: end_line column in symbols (full definition extent for get_source)
+        try:
+            conn.execute("ALTER TABLE symbols ADD COLUMN end_line INTEGER NOT NULL DEFAULT 0")
+            conn.commit()
+        except sqlite3.OperationalError:
+            pass
+
+        # Migration: file_path column in symbols (denormalized for FTS5)
+        sym_cols = [r[1] for r in conn.execute("PRAGMA table_info(symbols)").fetchall()]
+        if "file_path" not in sym_cols:
+            conn.execute("ALTER TABLE symbols ADD COLUMN file_path TEXT NOT NULL DEFAULT ''")
+            conn.execute("""
+                UPDATE symbols SET file_path = COALESCE(
+                    (SELECT f.path FROM files f WHERE f.id = symbols.file_id), ''
+                ) WHERE file_path = ''
+            """)
+            conn.commit()
+
+        # Migration: name_tokens column — camelCase/snake_case split for FTS5 token graph
+        sym_cols = [r[1] for r in conn.execute("PRAGMA table_info(symbols)").fetchall()]
+        if "name_tokens" not in sym_cols:
+            conn.execute("ALTER TABLE symbols ADD COLUMN name_tokens TEXT NOT NULL DEFAULT ''")
+            conn.commit()
+            # Backfill using Python split_tokens (SQLite can't call Python functions).
+            # Use a generator to avoid materialising all rows in memory at once.
+            conn.executemany(
+                "UPDATE symbols SET name_tokens = ? WHERE id = ?",
+                (
+                    (split_tokens(r["name"], r["qualified_name"]), r["id"])
+                    for r in conn.execute(
+                        "SELECT id, name, qualified_name FROM symbols WHERE name_tokens = ''"
+                    )
+                ),
+            )
+            conn.commit()
+
+        # Migration: rebuild FTS5 + triggers if name_tokens column is missing
+        fts_cols = [r[1] for r in conn.execute("PRAGMA table_info(symbols_fts)").fetchall()]
+        if "name_tokens" not in fts_cols:
+            conn.executescript("""
+                DROP TRIGGER IF EXISTS symbols_ai;
+                DROP TRIGGER IF EXISTS symbols_ad;
+                DROP TRIGGER IF EXISTS symbols_au;
+                DROP TABLE IF EXISTS symbols_fts;
+            """)
+            conn.executescript("""
+                CREATE VIRTUAL TABLE symbols_fts USING fts5(
+                    name, qualified_name, signature, docstring, file_path, name_tokens,
+                    content='symbols', content_rowid='id'
+                );
+                CREATE TRIGGER symbols_ai AFTER INSERT ON symbols BEGIN
+                    INSERT INTO symbols_fts(rowid, name, qualified_name, signature, docstring, file_path, name_tokens)
+                    VALUES (new.id, new.name, new.qualified_name, new.signature, new.docstring, new.file_path, new.name_tokens);
+                END;
+                CREATE TRIGGER symbols_ad AFTER DELETE ON symbols BEGIN
+                    INSERT INTO symbols_fts(symbols_fts, rowid, name, qualified_name, signature, docstring, file_path, name_tokens)
+                    VALUES ('delete', old.id, old.name, old.qualified_name, old.signature, old.docstring, old.file_path, old.name_tokens);
+                END;
+                CREATE TRIGGER symbols_au AFTER UPDATE ON symbols BEGIN
+                    INSERT INTO symbols_fts(symbols_fts, rowid, name, qualified_name, signature, docstring, file_path, name_tokens)
+                    VALUES ('delete', old.id, old.name, old.qualified_name, old.signature, old.docstring, old.file_path, old.name_tokens);
+                    INSERT INTO symbols_fts(rowid, name, qualified_name, signature, docstring, file_path, name_tokens)
+                    VALUES (new.id, new.name, new.qualified_name, new.signature, new.docstring, new.file_path, new.name_tokens);
+                END;
+            """)
+            conn.execute("""
+                INSERT INTO symbols_fts(rowid, name, qualified_name, signature, docstring, file_path, name_tokens)
+                SELECT id, name, qualified_name, COALESCE(signature,''), COALESCE(docstring,''),
+                       COALESCE(file_path,''), COALESCE(name_tokens,'')
+                FROM symbols
+            """)
+            conn.commit()
+
+    except sqlite3.DatabaseError as e:
+        conn.close()
+        raise DatabaseCorruptionError(str(path), str(e)) from e
+
+    # Integrity check — detect corruption early, before any tool uses the DB
     try:
-        conn.execute("ALTER TABLE symbols ADD COLUMN end_line INTEGER NOT NULL DEFAULT 0")
-        conn.commit()
-    except sqlite3.OperationalError:
-        pass
-
-    # Migration: file_path column in symbols (denormalized for FTS5)
-    sym_cols = [r[1] for r in conn.execute("PRAGMA table_info(symbols)").fetchall()]
-    if "file_path" not in sym_cols:
-        conn.execute("ALTER TABLE symbols ADD COLUMN file_path TEXT NOT NULL DEFAULT ''")
-        conn.execute("""
-            UPDATE symbols SET file_path = COALESCE(
-                (SELECT f.path FROM files f WHERE f.id = symbols.file_id), ''
-            ) WHERE file_path = ''
-        """)
-        conn.commit()
-
-    # Migration: name_tokens column — camelCase/snake_case split for FTS5 token graph
-    sym_cols = [r[1] for r in conn.execute("PRAGMA table_info(symbols)").fetchall()]
-    if "name_tokens" not in sym_cols:
-        conn.execute("ALTER TABLE symbols ADD COLUMN name_tokens TEXT NOT NULL DEFAULT ''")
-        conn.commit()
-        # Backfill using Python split_tokens (SQLite can't call Python functions).
-        # Use a generator to avoid materialising all rows in memory at once.
-        conn.executemany(
-            "UPDATE symbols SET name_tokens = ? WHERE id = ?",
-            (
-                (split_tokens(r["name"], r["qualified_name"]), r["id"])
-                for r in conn.execute(
-                    "SELECT id, name, qualified_name FROM symbols WHERE name_tokens = ''"
-                )
-            ),
-        )
-        conn.commit()
-
-    # Migration: rebuild FTS5 + triggers if name_tokens column is missing
-    fts_cols = [r[1] for r in conn.execute("PRAGMA table_info(symbols_fts)").fetchall()]
-    if "name_tokens" not in fts_cols:
-        conn.executescript("""
-            DROP TRIGGER IF EXISTS symbols_ai;
-            DROP TRIGGER IF EXISTS symbols_ad;
-            DROP TRIGGER IF EXISTS symbols_au;
-            DROP TABLE IF EXISTS symbols_fts;
-        """)
-        conn.executescript("""
-            CREATE VIRTUAL TABLE symbols_fts USING fts5(
-                name, qualified_name, signature, docstring, file_path, name_tokens,
-                content='symbols', content_rowid='id'
-            );
-            CREATE TRIGGER symbols_ai AFTER INSERT ON symbols BEGIN
-                INSERT INTO symbols_fts(rowid, name, qualified_name, signature, docstring, file_path, name_tokens)
-                VALUES (new.id, new.name, new.qualified_name, new.signature, new.docstring, new.file_path, new.name_tokens);
-            END;
-            CREATE TRIGGER symbols_ad AFTER DELETE ON symbols BEGIN
-                INSERT INTO symbols_fts(symbols_fts, rowid, name, qualified_name, signature, docstring, file_path, name_tokens)
-                VALUES ('delete', old.id, old.name, old.qualified_name, old.signature, old.docstring, old.file_path, old.name_tokens);
-            END;
-            CREATE TRIGGER symbols_au AFTER UPDATE ON symbols BEGIN
-                INSERT INTO symbols_fts(symbols_fts, rowid, name, qualified_name, signature, docstring, file_path, name_tokens)
-                VALUES ('delete', old.id, old.name, old.qualified_name, old.signature, old.docstring, old.file_path, old.name_tokens);
-                INSERT INTO symbols_fts(rowid, name, qualified_name, signature, docstring, file_path, name_tokens)
-                VALUES (new.id, new.name, new.qualified_name, new.signature, new.docstring, new.file_path, new.name_tokens);
-            END;
-        """)
-        conn.execute("""
-            INSERT INTO symbols_fts(rowid, name, qualified_name, signature, docstring, file_path, name_tokens)
-            SELECT id, name, qualified_name, COALESCE(signature,''), COALESCE(docstring,''),
-                   COALESCE(file_path,''), COALESCE(name_tokens,'')
-            FROM symbols
-        """)
-        conn.commit()
+        result = conn.execute("PRAGMA integrity_check").fetchone()
+        if result and result[0] != "ok":
+            details = result[0]
+            conn.close()
+            raise DatabaseCorruptionError(str(path), details)
+    except sqlite3.DatabaseError as e:
+        conn.close()
+        raise DatabaseCorruptionError(str(path), str(e)) from e
 
     return conn
 
