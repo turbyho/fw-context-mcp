@@ -6,6 +6,7 @@ import pytest
 
 from fw_context_mcp.indexer.db import (
     DatabaseCorruptionError,
+    _expand_query,
     count_refs,
     delete_refs_for_file,
     delete_symbols_for_file,
@@ -341,6 +342,43 @@ class TestSearchSymbols:
 
         results = search_symbols(populated_db, "func*", "hash-deadbeef", limit=3)
         assert len(results) == 3
+
+
+class TestExpandQuery:
+    """Tests for _expand_query — wildcard expansion with FTS5 syntax awareness."""
+
+    def test_bare_word_gets_wildcard(self):
+        assert _expand_query("connect") == "connect*"
+
+    def test_multiple_words_all_get_wildcards(self):
+        assert _expand_query("modem init") == "modem* init*"
+
+    def test_existing_wildcard_preserved(self):
+        assert _expand_query("connect*") == "connect*"
+
+    def test_cpp_scope_gets_expansion(self):
+        """C++ :: should not block wildcard expansion."""
+        assert _expand_query("std::vector") == "std* vector*"
+
+    def test_cpp_scope_with_multiple_tokens(self):
+        """C++ :: in a multi-word query should expand all tokens."""
+        assert _expand_query("mbed::DigitalOut write") == "mbed* DigitalOut* write*"
+
+    def test_column_filter_bypassed(self):
+        """Column-filter syntax with single colon must not get expanded."""
+        assert _expand_query("name_tokens : connect") == "name_tokens : connect"
+
+    def test_quoted_string_bypassed(self):
+        assert _expand_query('"hello world"') == '"hello world"'
+
+    def test_fts5_operators_bypassed(self):
+        assert _expand_query("NEAR(a, b)") == "NEAR(a, b)"
+
+    def test_or_operator_bypassed(self):
+        assert _expand_query("connect OR write") == "connect OR write"
+
+    def test_parentheses_bypassed(self):
+        assert _expand_query("(connect write)") == "(connect write)"
 
 
 class TestForeignKeyConstraint:
