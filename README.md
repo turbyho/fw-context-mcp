@@ -45,7 +45,7 @@ sub-millisecond lookups, zero hallucination, real C/C++ understanding.
 |-----------|---------|------------|---------|
 | **CLI** (`fw-context`) | User command | Python + Click-like argparse | Index build, status checks, project management |
 | **Indexer** | Called by CLI | **libclang** (C API via `libclang` Python bindings), SQLite FTS5 | Parses C/C++; extracts functions, classes, methods, enums, typedefs, variables; stores in full-text-searchable database |
-| **MCP server** (`fw-context-mcp`) | Subprocess started by AI assistant | **MCP SDK** (stdlib JSON-RPC 2.0), SQLite, **httpx** (Ollama HTTP) | Exposes 9 tools over stdin/stdout; optionally calls **Ollama** for natural-language search and symbol explanation |
+| **MCP server** (`fw-context-mcp`) | Subprocess started by AI assistant | **MCP SDK** (stdlib JSON-RPC 2.0), SQLite, **httpx** (Ollama HTTP) | Exposes 12 tools over stdin/stdout; optionally calls **Ollama** for natural-language search and symbol explanation |
 
 ### Key technologies
 
@@ -130,7 +130,7 @@ fw-context index
 
 ```bash
 # Clone to ~/.fw-context/src (or any location you prefer)
-git clone git@git.montyho.com:turbyho/fw-context-mcp.git ~/.fw-context/src
+git clone https://git.montyho.com/turbyho/fw-context-mcp.git ~/.fw-context/src
 
 # Create a dedicated virtual environment
 uv venv ~/.fw-context/.venv --python 3.12
@@ -417,12 +417,31 @@ and integration details.
 | Search | `search_code` | Keyword search (FTS5) |
 | Search | `lookup_symbol` | Find symbol by name |
 | Search | `smart_search` | Natural language → search (Ollama) |
+| Understanding | `get_source` | Read a symbol's full definition body (no LLM, fast) |
 | Understanding | `explain_symbol` | LLM explanation of a symbol (10–30 s) |
 | Understanding | `get_active_build` | Check index freshness |
+| Call graph | `find_callers` | Who calls a function (needs `index_refs`) |
+| Call graph | `find_references` | All uses of a symbol — calls/reads/member access (needs `index_refs`) |
 | Maintenance | `reindex_file` | Re-index one file |
 | Maintenance | `reset_index` | Delete and rebuild index |
 | Maintenance | `list_projects` | List all indexed projects |
 | Maintenance | `check_ollama` | Verify Ollama availability |
+
+### Call graph (cross-references)
+
+`find_callers` and `find_references` answer "who calls `modem_init`?" and "where
+is `ZCfgDataManager` used?". The reference graph is **opt-in** — it adds indexing
+time and database size, so it is off by default. Enable it and re-index:
+
+```bash
+fw-context index --refs
+# or set in .fw-context/config.toml:  [index] index_refs = true
+```
+
+Only project-internal references are stored (both the call site and the target
+definition under your source roots), which keeps the graph bounded — references
+into system/framework headers are dropped. `find_callers` returns each call site
+with its file:line and the enclosing caller's qualified name.
 
 ### Search behaviour
 
@@ -478,6 +497,7 @@ Both files are auto-created with sensible defaults on first use.
 | `compile_commands` | `"compile_commands.json"` | project | Path to the compilation database. Relative paths are resolved from the project root. Use for non-standard locations (e.g. `build/compile_commands.json` for Zephyr). |
 | `source_roots` | `[]` *(auto-detect)* | project | Directories to scan for symbols. **Empty list = auto-detect** (scans `src`, `lib`, `app`, `include`, `modules` + framework dirs `zephyr`/`mbed-os` + top-level dirs from `compile_commands.json`). Set explicitly to narrow indexing: `["src", "lib"]`. Directories that don't exist are silently skipped. |
 | `exclude_paths` | `["build", "BUILD"]` | project | Directories to skip during indexing. Useful for generated code, test fixtures, or third-party vendored code. Paths are relative to project root. |
+| `index_refs` | `false` | project | Build the cross-reference / call graph (`find_callers`, `find_references`). Off by default — reference extraction adds indexing time and DB size. Set `true` (or pass `--refs`) and re-index to enable. |
 
 #### `[llm]` — LLM / Ollama settings
 
