@@ -443,14 +443,19 @@ def _expand_query(query: str) -> str:
     """Add trailing wildcard to each bare word for broader prefix matching.
 
     Leaves existing wildcards (*) and FTS5 syntax (NEAR, ", parentheses,
-    column filters with :) intact.
+    column filters with ``name_tokens : term*``) intact.  Single colons in
+    column-filter syntax are detected via regex; C++ ``::`` passes through
+    so its tokens get wildcard expansion.
     """
     # Tokens that already are FTS5 syntax — don't touch them.
-    # ':' covers column-filter expressions like "name_tokens : term*".
-    if any(c in query for c in ('"', 'NEAR', 'AND', 'OR', '(', ')', ':')):
+    # Single colon (not part of ::) covers column-filter expressions like
+    # "name_tokens : term*" which would be corrupted by wildcard appending.
+    _bare_syntax = ('"', 'NEAR', 'AND', 'OR', '(', ')')
+    _has_col_filter = re.search(r'(?<!:):(?!:)', query)
+    if any(c in query for c in _bare_syntax) or _has_col_filter:
         return query
 
-    parts = query.split()
+    parts = query.replace("::", " ").split()
     expanded = []
     for p in parts:
         if p.endswith('*'):

@@ -508,18 +508,18 @@ def lookup_symbol(
             if exact:
                 rows = c.execute(
                     """SELECT s.* FROM symbols s
-                       WHERE s.config_hash=? AND s.name=?
+                       WHERE s.config_hash=? AND (s.name=? OR s.qualified_name=?)
                        ORDER BY s.is_definition DESC, s.line
                        LIMIT ?""",
-                    (config_hash, name, limit),
+                    (config_hash, name, name, limit),
                 ).fetchall()
             else:
                 rows = c.execute(
                     """SELECT s.* FROM symbols s
-                       WHERE s.config_hash=? AND s.name LIKE ?
+                       WHERE s.config_hash=? AND (s.name LIKE ? OR s.qualified_name LIKE ?)
                        ORDER BY s.is_definition DESC, s.line
                        LIMIT ?""",
-                    (config_hash, f"{name}%", limit),
+                    (config_hash, f"{name}%", f"{name}%", limit),
                 ).fetchall()
             return [
                 {
