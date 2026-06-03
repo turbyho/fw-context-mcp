@@ -104,8 +104,7 @@ def _build_embeddings(conn, config_hash: str, llm_config) -> None:
              AND s.kind IN ('function', 'method', 'constructor', 'destructor',
                             'class', 'struct')
            ORDER BY CASE WHEN s.docstring IS NOT NULL AND LENGTH(s.docstring) > 30
-                      THEN 0 ELSE 1 END
-           LIMIT 5000""",
+                      THEN 0 ELSE 1 END""",
         (config_hash,),
     ).fetchall()
 
