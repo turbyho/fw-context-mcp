@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import re
@@ -1149,6 +1150,40 @@ def find_references(name: str, project_root: str | None = None, limit: int = 50)
     return _references_result(name, project_root, ref_kind=None, limit=limit)
 
 
+def _parse_understanding_response(raw: str) -> tuple[str, list[str]]:
+    """Parse Phase 2a LLM response into (understanding, queries).
+
+    Expected format:
+        UNDERSTANDING: <one sentence>
+        QUERIES: ["term1*", "term2*", ...]
+
+    Falls back to treating the whole response as a JSON array if the
+    structured format is not found.
+    """
+    understanding = ""
+    queries: list[str] = []
+
+    # Try structured format first
+    und_match = re.search(r"UNDERSTANDING:\s*(.+?)(?:\n|$)", raw, re.IGNORECASE)
+    if und_match:
+        understanding = und_match.group(1).strip()
+
+    # Extract JSON array — look for the first [...] block (handles markdown
+    # wrapping, stray text, etc.)
+    try:
+        start = raw.index("[")
+        end = raw.rindex("]") + 1
+        parsed = json.loads(raw[start:end])
+        if isinstance(parsed, list):
+            for item in parsed:
+                if isinstance(item, str) and item.strip():
+                    queries.append(item.strip())
+    except (ValueError, json.JSONDecodeError):
+        pass
+
+    return understanding, queries
+
+
 def _parse_search_terms(raw: str) -> list[str]:
     """Parse LLM response into FTS5 keyword search terms.
 
@@ -1183,10 +1218,11 @@ def _parse_search_terms(raw: str) -> list[str]:
     # Replace underscores with spaces for FTS5 tokenizer.
     # Also strip leading/trailing whitespace from each term — LLM sometimes
     # emits [" key*", " storage*"] with a leading space which breaks FTS5.
+    _BOGUS_TERMS = frozenset({"json", "[]"})
     result = []
     for t in terms:
         cleaned = t.replace("_", " ").strip()
-        if cleaned:
+        if cleaned and cleaned.lower() not in _BOGUS_TERMS:
             result.append(cleaned)
     return result
 
@@ -1366,7 +1402,7 @@ async def smart_search(
                 if len(rough_samples) >= 20:
                     break
 
-        # --- Phase 2: Ollama generates refined terms using real symbol names ---
+        # --- Phase 2a: first LLM call — understand query + generate queries ---
         keyword_queries: list[str] = []
         ollama_warning: dict | None = None
 
@@ -1378,191 +1414,196 @@ async def smart_search(
             context_str = "\n".join(context_lines)
 
             prompt = (
-                "You are a C/C++ code search assistant for an embedded firmware project.\n"
-                "Generate 3-5 FTS5 keyword search terms based on the description below.\n"
-                "Study the real symbol names to learn the project's naming conventions\n"
-                "(prefixes, word order, abbreviations). Match them.\n\n"
-                "CRITICAL: Embedded code uses camelCase AND snake_case. The FTS5 tokenizer\n"
-                "treats each camelCase word as ONE token — e.g. \"onConnectionComplete\" is\n"
-                "a single token, NOT split into \"on\", \"Connection\", \"Complete\".\n"
-                "Therefore your queries MUST match token BEGINNINGS (prefixes):\n"
-                "- For \"connect\" → generate \"connection*\" (prefix of \"ConnectionComplete\")\n"
-                "- For \"init\" → generate \"init*\" (prefix of \"Init\", \"Initialize\")\n"
-                "- Generate BOTH snake_case AND camelCase prefix variants\n\n"
-                "FIRST: Identify which subsystem/domain the description is about\n"
-                "(modem, BLE, storage, sensors, WiFi, display, keyboard, general, etc.).\n"
-                "The rough samples below include file paths. Use them to distinguish\n"
-                "between symbols from different subsystems:\n"
-                "- Symbols under src/ or lib/modem/ are modem firmware code\n"
-                "- Symbols under mbed-os/connectivity/FEATURE_BLE/ are BLE stack code\n"
-                "- Symbols under lib/ble/ are project-specific BLE code\n"
-                "- Symbols under mbed-os/connectivity/cellular/ are cellular/modem driver code\n"
-                "- Symbols under src/ble_*.cpp or src/zble*.cpp are project BLE code\n"
-                "- Symbols under src/zmodem*.cpp or src/modem_*.cpp are project modem code\n"
-                "Focus your generated queries on the subsystem that matches the\n"
-                "description. Ignore rough samples from unrelated subsystems —\n"
-                "they share keywords but belong to different domains.\n\n"
-                "DISAMBIGUATION — some English words map to different concepts in C/C++:\n"
-                "- 'register' in modem/networking queries → 'network registration',\n"
-                "  'data registration', NOT hardware register (read_register, etc.)\n"
-                "- 'connect' in modem queries → 'network attach', 'registration',\n"
-                "  'network init', NOT 'onConnection' or 'connection parameters'\n"
-                "- 'connect' in BLE queries → 'connection', 'onConnection', 'gap connect'\n"
-                "Use the file paths in rough samples to pick the correct meaning.\n\n"
-                f"KEY CONCEPTS from description: {', '.join(content_words)}\n"
-                "For EACH concept above, make sure at least one generated query\n"
-                "covers it. Do NOT drop concepts — if the description mentions\n"
-                "'watchdog', one query MUST contain 'watchdog'.\n\n"
-                f"Real symbols from this project:\n{context_str}\n\n"
-                "Return a JSON array of strings, e.g.: [\"ble_conn*\", \"connection*\", \"on_connect*\"]\n"
-                "Rules:\n"
-                "- Output MUST be a valid JSON array and nothing else\n"
-                "- Mix snake_case and camelCase prefixes: \"modem_init*\", \"Connection*\", \"on_conn*\"\n"
-                "- STRONGLY prefer short stems with a trailing wildcard over exact full names\n"
-                "- You may use a trailing wildcard: \"ble_gap*\" matches ble_gap_init, etc.\n"
-                "- No asterisks anywhere else — FTS5 only supports trailing wildcards\n"
-                "- Cover different naming patterns found in the target subsystem\n"
-                "- For each concept in the description, generate the MOST LIKELY prefix\n"
-                "  that matches real symbol beginnings (not substrings!)\n\n"
-                f"Description: {query}\n"
+                "You are a C/C++ code search assistant for an embedded firmware project.\n\n"
+                "A developer asked:\n"
+                f"  «{query}»\n\n"
+                "Step 1 — Understand the question. Read the full sentence:\n"
+                "- What subsystem/domain? (modem, BLE, storage, sensors, etc.)\n"
+                "- Disambiguate words from context: e.g. \"registers to the network\"\n"
+                "  → network registration (modem), NOT hardware register.\n"
+                "  \"modem connects\" → network attach/init, NOT BLE onConnection.\n\n"
+                "Step 2 — Generate 3-5 FTS5 prefix search terms.\n"
+                "CRITICAL: Look at the actual symbol names in the samples.\n"
+                "Use THEIR naming style — snake_case for snake_case code,\n"
+                "camelCase for camelCase code. Copy real prefixes, don't\n"
+                "invent names. If samples show 'network_registration', use\n"
+                "'network_reg*', not 'NetworkRegistration*'.\n"
+                "Rules: camelCase = ONE token (match BEGINNINGS), prefer short\n"
+                "stems with *, both snake_case AND camelCase, no * except trailing.\n\n"
+                "Samples (use file paths to identify the right subsystem; samples\n"
+                "from unrelated subsystems are noise):\n"
+                f"{context_str}\n\n"
+                "Output format:\n"
+                "UNDERSTANDING: <one sentence — what subsystem, what they really want>\n"
+                "QUERIES: [\"term1*\", \"term2*\", ...]\n"
             )
         else:
             prompt = (
-                "You are a C/C++ code search assistant for an embedded firmware project.\n"
-                "Generate 3-5 FTS5 keyword search terms based on the description below.\n"
-                "Return a JSON array of strings, e.g.: [\"modem_init*\", \"connection*\", \"on_connect*\"]\n"
-                "Rules:\n"
-                "- Output MUST be a valid JSON array and nothing else\n"
-                "- Mix snake_case and camelCase prefixes matching C/C++ naming\n"
-                "- STRONGLY prefer short stems with a trailing wildcard\n"
-                "- You may use a trailing wildcard: \"modem*\" matches modem_init, modem_connect\n"
-                "- No asterisks anywhere else — FTS5 only supports trailing wildcards\n"
-                "- CRITICAL: camelCase tokens are ONE token — match their BEGINNINGS\n"
-                "  e.g. for \"connect\" generate \"connection*\" not \"onConnection*\"\n\n"
-                f"Description: {query}\n"
+                "You are a C/C++ code search assistant for an embedded firmware project.\n\n"
+                "A developer asked:\n"
+                f"  «{query}»\n\n"
+                "Step 1 — Understand: what subsystem/domain? Disambiguate words.\n"
+                "Step 2 — Generate 3-5 FTS5 prefix queries. Rules: camelCase = one\n"
+                "token, match beginnings, short stems with *, both snake_case and\n"
+                "camelCase, no * except trailing.\n\n"
+                "Output format:\n"
+                "UNDERSTANDING: <one sentence>\n"
+                "QUERIES: [\"term1*\", \"term2*\", ...]\n"
             )
 
-        if cfg.llm.enabled:
-            cache_key = (query, config_hash)
-            cached = _KEYWORD_CACHE.get(cache_key)
-            if cached is not None:
-                keyword_queries = cached
-            else:
-                try:
-                    raw = await call_ollama_async(prompt, cfg.llm)
-                    keyword_queries = _parse_search_terms(raw)[:5]
-                    if len(_KEYWORD_CACHE) >= _KEYWORD_CACHE_MAX:
-                        _KEYWORD_CACHE.clear()
-                    _KEYWORD_CACHE[cache_key] = keyword_queries
-                except OllamaModelNotFoundError as e:
-                    ollama_warning = {"warning": str(e), "hint": "Run: check_ollama()"}
-                    keyword_queries = rough_terms
-                except OllamaError as e:
-                    ollama_warning = {"warning": f"Ollama unavailable: {e}"}
-                    keyword_queries = rough_terms
-        else:
-            keyword_queries = rough_terms
-
-        # --- Phase 3: OR search with client-side term-match scoring ---
-        # Using OR instead of AND because Ollama generates diverse terms
-        # covering different naming patterns — no single symbol matches all.
-        if keyword_queries:
-            # Build two OR queries:
-            # 1. Standard query across all columns (strong FTS5 ranking for exact matches)
-            # 2. name_tokens column-filter query to specifically surface camelCase symbols
-            #    whose components match query terms — e.g. "connection*" finds
-            #    onConnectionComplete via name_tokens="on connection complete" even when
-            #    the name token itself starts with "on" and ranks low in the full search.
-            or_query = " OR ".join(keyword_queries)
-            # Column-filter expressions "name_tokens : term*" must NOT pass through
-            # _expand_query (which would corrupt the ": " as a bare token). They are
-            # already valid FTS5 syntax — search_symbols handles them correctly via
-            # the ':' guard in _expand_query's bypass check.
-            nt_terms = [f"name_tokens : {kq}" for kq in keyword_queries]
+        # --- Helper: run a set of queries and return scored, deduped rows ---
+        def _search_queries(queries: list[str], fetch_limit: int) -> list[dict]:
+            if not queries:
+                return []
+            or_query = " OR ".join(queries)
+            nt_terms = [f"name_tokens : {kq}" for kq in queries]
             nt_query = " OR ".join(nt_terms)
-            # Fetch a larger pool so camelCase symbols buried in FTS5 ranking get included.
-            fetch_limit = max(limit * 6, 120)
-            rows = []
-            seen_keys: dict[tuple, int] = {}  # (name, file_path) -> index in rows
+            rows: list[dict] = []
+            seen: dict[tuple, int] = {}
             for q in (or_query, nt_query):
                 try:
                     for r in search_symbols(conn, q, config_hash, limit=fetch_limit):
                         k = (r["name"], r["file_path"])
-                        prev_idx = seen_keys.get(k)
+                        prev_idx = seen.get(k)
                         if prev_idx is None:
-                            seen_keys[k] = len(rows)
+                            seen[k] = len(rows)
                             rows.append(r)
                         elif r["is_definition"] and not rows[prev_idx]["is_definition"]:
-                            # Replace declaration with definition
                             rows[prev_idx] = r
                 except Exception as e:
-                    log.debug("smart_search FTS5 query failed (q=%r): %s", q[:60], e)
+                    log.debug("smart_search query failed (q=%r): %s", q[:60], e)
+            return rows
 
-            if rows:
-                stems = [kq.rstrip("*").lower() for kq in keyword_queries]
+        # --- Phase 2a: first LLM call ---
+        all_queries: list[str] = []
+        if cfg.llm.enabled:
+            cache_key = (query, config_hash)
+            cached = _KEYWORD_CACHE.get(cache_key)
+            if cached is not None:
+                all_queries = cached
+            else:
+                try:
+                    raw = await call_ollama_async(prompt, cfg.llm)
+                    understanding, first_queries = _parse_understanding_response(raw)
+                    keyword_queries = first_queries[:5]
+                    all_queries = list(keyword_queries)
+                except (OllamaModelNotFoundError, OllamaError) as e:
+                    ollama_warning = {"warning": str(e)}
+                    keyword_queries = rough_terms
+                    all_queries = list(rough_terms)
+        else:
+            keyword_queries = rough_terms
+            all_queries = list(rough_terms)
 
-                def _score(r) -> int:
-                    name   = (r["name"]          or "").lower()
-                    ntoks  = (r["name_tokens"]    or "").lower()
-                    qname  = (r["qualified_name"] or "").lower()
-                    fpath  = (r["file_path"]      or "").lower()
+        # --- Phase 3a: run first-round queries ---
+        fetch_limit = max(limit * 6, 120)
+        all_rows = _search_queries(all_queries, fetch_limit)
 
-                    # Weighted field matching — each stem counted at highest level only:
-                    #   name / name_tokens = 3  (it IS the symbol name, just differently tokenized)
-                    #   qualified_name     = 2  (class/namespace context)
-                    #   file_path          = 1  (module-level context, weakest)
-                    s = 0
-                    for stem in stems:
-                        if stem in name or stem in ntoks:
-                            s += 3
-                        elif stem in qname:
-                            s += 2
-                        elif stem in fpath:
-                            s += 1
+        # --- Phase 2b: second LLM call — refine based on actual results ---
+        # Run even when all_rows is empty — zero results means the queries
+        # were likely wrong (e.g. invented CamelCase names that don't match
+        # the project's snake_case convention).
+        if cfg.llm.enabled and not ollama_warning:
+            # Format top results for LLM feedback
+            top_lines = []
+            for r in (all_rows or [])[:10]:
+                name = r["name"] or "?"
+                kind = r["kind"] or "?"
+                path = r["file_path"] or "?"
+                top_lines.append(f"  {name} ({kind}) — {path}")
+            if all_rows:
+                top_str = "\n".join(top_lines)
+                result_note = f"Top results from those queries:\n{top_str}\n\n"
+            else:
+                result_note = "Those queries returned ZERO results — they are likely wrong.\n\n"
 
-                    # Bonus for project-local code (src/, lib/ not under mbed-os).
-                    if fpath and ("src/" in fpath or "lib/" in fpath) and "mbed-os" not in fpath:
+            refine_prompt = (
+                "A developer searched for:\n"
+                f"  «{query}»\n\n"
+                f"First-round FTS5 queries: {json.dumps(all_queries)}\n\n"
+                f"{result_note}"
+                "Are these results from the RIGHT subsystem? If the results look\n"
+                "misaligned (e.g. BLE connection code for a modem query, hardware\n"
+                "register code for a network registration query), generate 3-5\n"
+                "BETTER FTS5 prefix queries that target the CORRECT subsystem.\n\n"
+                "If the results already look correct, return an empty array: []\n\n"
+                "CRITICAL: Use naming patterns from the original samples. If the\n"
+                "project uses snake_case (modem_init, network_registration), your\n"
+                "queries MUST be snake_case (modem_init*, network_reg*).\n\n"
+                "Return ONLY a JSON array: [\"better1*\", \"better2*\"] or []\n"
+            )
+            try:
+                raw2 = await call_ollama_async(refine_prompt, cfg.llm)
+                refined = _parse_search_terms(raw2)[:5]
+                if refined:
+                    keyword_queries = keyword_queries + refined
+                    all_queries = all_queries + refined
+                    # Run second-round queries and merge
+                    round2_rows = _search_queries(refined, fetch_limit)
+                    all_rows.extend(round2_rows)
+            except Exception:
+                pass  # refinement is optional; keep first-round results
+
+            # Update cache with combined queries
+            if len(_KEYWORD_CACHE) >= _KEYWORD_CACHE_MAX:
+                _KEYWORD_CACHE.clear()
+            _KEYWORD_CACHE[(query, config_hash)] = all_queries
+
+        # --- Phase 3: score, sort, dedup, format final results ---
+        seen: dict[tuple, dict] = {}
+        if all_rows:
+            stems = [kq.rstrip("*").lower() for kq in all_queries]
+
+            def _score(r) -> int:
+                name   = (r["name"]          or "").lower()
+                ntoks  = (r["name_tokens"]    or "").lower()
+                qname  = (r["qualified_name"] or "").lower()
+                fpath  = (r["file_path"]      or "").lower()
+
+                s = 0
+                for stem in stems:
+                    if stem in name or stem in ntoks:
+                        s += 3
+                    elif stem in qname:
+                        s += 2
+                    elif stem in fpath:
                         s += 1
 
-                    # Kind bonus: push functions/classes above variables/locals.
-                    s += _KIND_WEIGHT.get(r["kind"] or "", 0)
+                if fpath and ("src/" in fpath or "lib/" in fpath) and "mbed-os" not in fpath:
+                    s += 1
 
-                    return s
+                s += _KIND_WEIGHT.get(r["kind"] or "", 0)
+                return s
 
-                # rank is a hidden FTS5 column not exposed via JOIN — use row position as fallback
-                scored = [(_score(r), i, r) for i, r in enumerate(rows)]
-                # Sort: higher score first, then by original FTS5 position
-                scored.sort(key=lambda x: (-x[0], x[1]))
+            scored = [(_score(r), i, r) for i, r in enumerate(all_rows)]
+            scored.sort(key=lambda x: (-x[0], x[1]))
 
-                for _, _, r in scored:
-                    name = r["name"] or ""
-                    # Skip noise: unnamed symbols, single/two-char local variable names,
-                    # and C-style loop/temp variables that leak through file_path matching.
-                    if name.startswith("("):
-                        continue
-                    if len(name) <= 2 and r["kind"] in ("variable", "field"):
-                        continue
-                    key = (name, r["file_path"])
+            for _, _, r in scored:
+                name = r["name"] or ""
+                if name.startswith("("):
+                    continue
+                if len(name) <= 2 and r["kind"] in ("variable", "field"):
+                    continue
+                key = (name, r["file_path"])
+                prev = seen.get(key)
+                if prev is None:
+                    seen[key] = _fmt(r)
+                elif r["is_definition"] and not prev["is_definition"]:
+                    seen[key] = _fmt(r)
+        elif not seen:
+            # Fallback: individual queries if OR found nothing
+            for kq in all_queries:
+                try:
+                    rows = search_symbols(conn, kq, config_hash, limit=limit)
+                except Exception:
+                    continue
+                for r in rows:
+                    key = (r["name"], r["file_path"])
                     prev = seen.get(key)
                     if prev is None:
                         seen[key] = _fmt(r)
                     elif r["is_definition"] and not prev["is_definition"]:
-                        # Replace declaration with definition
                         seen[key] = _fmt(r)
-            elif not seen:
-                # Fallback: try individual queries if OR found nothing
-                for kq in keyword_queries:
-                    try:
-                        rows = search_symbols(conn, kq, config_hash, limit=limit)
-                    except Exception:
-                        continue
-                    for r in rows:
-                        key = (r["name"], r["file_path"])
-                        prev = seen.get(key)
-                        if prev is None:
-                            seen[key] = _fmt(r)
-                        elif r["is_definition"] and not prev["is_definition"]:
-                            seen[key] = _fmt(r)
 
     results: list[dict] = []
 
