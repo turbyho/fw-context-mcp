@@ -1592,14 +1592,15 @@ async def smart_search(
                 "QUERIES: [\"term1*\", \"term2*\", ...]\n"
             )
 
+        # Exclude docstring from FTS5 search — massive mbed-os docstrings
+        # (ble::Gap has 5000+ chars) cause false positives for unrelated
+        # queries by matching generic keywords like "update", "management".
+        _FTS_COLS = "{name qualified_name signature file_path name_tokens}"
+
         # --- Helper: run a set of queries and return scored, deduped rows ---
         def _search_queries(queries: list[str], fetch_limit: int) -> list[dict]:
             if not queries:
                 return []
-            # Exclude docstring from FTS5 search — massive mbed-os docstrings
-            # (ble::Gap has 5000+ chars) cause false positives for unrelated
-            # queries by matching generic keywords like "update", "management".
-            _FTS_COLS = "{name qualified_name signature file_path name_tokens}"
             or_query = _FTS_COLS + " : (" + " OR ".join(queries) + ")"
             nt_terms = [f"name_tokens : {kq}" for kq in queries]
             nt_query = " OR ".join(nt_terms)
@@ -1736,10 +1737,13 @@ async def smart_search(
                 elif r["is_definition"] and not prev["is_definition"]:
                     seen[key] = _fmt(r)
         elif not seen:
-            # Fallback: individual queries if OR found nothing
+            # Fallback: individual queries if OR found nothing.
+            # Use the same column filter as _search_queries to avoid
+            # docstring false positives.
             for kq in all_queries:
                 try:
-                    rows = search_symbols(conn, kq, config_hash, limit=limit)
+                    rows = search_symbols(conn,
+                        _FTS_COLS + " : " + kq, config_hash, limit=limit)
                 except Exception:
                     continue
                 for r in rows:
