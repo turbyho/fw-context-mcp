@@ -101,6 +101,69 @@ def _is_stale(cfg, compile_commands_path: str) -> bool:
         return False
 
 
+def _lookup_definition(conn, config_hash: str, name: str):
+    """Return the best symbol row for a name: definition preferred, project code
+    (src/, lib/ outside mbed-os) preferred over framework code. Returns None if
+    the name is not indexed.
+    """
+    # Prefer a definition; tie-break toward project-local files over mbed-os.
+    row = conn.execute(
+        """SELECT s.* FROM symbols s
+           WHERE s.config_hash=? AND s.name=? AND s.is_definition=1
+           ORDER BY (CASE WHEN s.file_path LIKE '%mbed-os%' THEN 1 ELSE 0 END), s.line
+           LIMIT 1""",
+        (config_hash, name),
+    ).fetchone()
+    if not row:
+        row = conn.execute(
+            """SELECT s.* FROM symbols s
+               WHERE s.config_hash=? AND s.name=?
+               ORDER BY s.is_definition DESC,
+                        (CASE WHEN s.file_path LIKE '%mbed-os%' THEN 1 ELSE 0 END), s.line
+               LIMIT 1""",
+            (config_hash, name),
+        ).fetchone()
+    return row
+
+
+def _read_symbol_body(file_path: str, line_no: int, max_lines: int = 400) -> str:
+    """Read a symbol's source from its definition line, balancing braces.
+
+    Scans forward from the definition line counting { and } until the body is
+    balanced, returning numbered source lines for the full definition. Falls
+    back to a small window when there is no brace body (declaration, field,
+    enum constant). Brace counting is best-effort — braces inside string/char
+    literals or comments may skew the end on pathological inputs.
+    """
+    try:
+        lines = Path(file_path).read_text(errors="replace").splitlines()
+    except Exception:
+        return ""
+    start = line_no - 1  # 0-indexed
+    if start < 0 or start >= len(lines):
+        return ""
+
+    depth = 0
+    seen_open = False
+    end = start
+    for i in range(start, min(len(lines), start + max_lines)):
+        for ch in lines[i]:
+            if ch == "{":
+                depth += 1
+                seen_open = True
+            elif ch == "}":
+                depth -= 1
+        end = i
+        if seen_open and depth <= 0:
+            break
+
+    if not seen_open:
+        # No body braces — declaration/field/enum constant: return a small window.
+        end = min(len(lines) - 1, start + 2)
+
+    return "\n".join(f"{i + 1:4d}  {lines[i]}" for i in range(start, end + 1))
+
+
 def _stale_files(conn, config_hash: str, file_paths: list[str]) -> list[str]:
     """Return subset of file_paths whose on-disk mtime is newer than stored mtime."""
     stale = []
@@ -663,19 +726,7 @@ async def explain_symbol(
             return {"error": "No build config indexed."}
 
         config_hash = cfg_data["config_hash"]
-        row = conn.execute(
-            """SELECT s.* FROM symbols s
-               WHERE s.config_hash=? AND s.name=? AND s.is_definition=1
-               ORDER BY s.line LIMIT 1""",
-            (config_hash, name),
-        ).fetchone()
-        if not row:
-            row = conn.execute(
-                """SELECT s.* FROM symbols s
-                   WHERE s.config_hash=? AND s.name=?
-                   ORDER BY s.is_definition DESC, s.line LIMIT 1""",
-                (config_hash, name),
-            ).fetchone()
+        row = _lookup_definition(conn, config_hash, name)
         if not row:
             return {"error": f"Symbol not found: {name}"}
 
@@ -734,6 +785,61 @@ async def explain_symbol(
     result["source"] = source_snippet[:4000] if len(source_snippet) > 4000 else source_snippet
     result["explain_prompt"] = prompt
 
+    return result
+
+
+@mcp.tool()
+def get_source(name: str, project_root: str | None = None) -> dict:
+    """Return the source code of a symbol's definition — no LLM, fast.
+
+    Unlike ``explain_symbol`` (which calls Ollama and takes 10–30 s), this reads
+    the definition's full body straight from disk by brace-matching from the
+    definition line. Use it to read an implementation when you want the actual
+    code, not a prose summary.
+
+    The definition is preferred over declarations, and project-local code
+    (``src/``, ``lib/``) is preferred over framework code (mbed-os) when a name
+    exists in both (e.g. a Gap event-handler override in ``src/`` vs the mbed-os
+    base class).
+
+    Args:
+        name: Symbol name (exact match).
+        project_root: Absolute path to the project. Defaults to nearest git root.
+
+    Returns:
+        dict with: name, qualified_name, kind, file (absolute), line, signature,
+        source (numbered lines of the full definition body). Error dict if the
+        symbol is not indexed.
+    """
+    db_path, cfg, project_id, root = _resolve_context(project_root)
+    if not db_path.exists():
+        return {"error": f"No index found for {root}. Run 'fw-context index' first."}
+
+    with open_db(db_path) as conn:
+        cfg_data = get_active_config(conn, project_id)
+        if not cfg_data:
+            return {"error": "No build config indexed."}
+
+        row = _lookup_definition(conn, cfg_data["config_hash"], name)
+        if not row:
+            return {"error": f"Symbol not found: {name}"}
+
+        file_path = _abs_path(root, row["file_path"])
+        result = {
+            "name": row["name"],
+            "qualified_name": row["qualified_name"],
+            "kind": row["kind"],
+            "file": file_path,
+            "line": row["line"],
+            "signature": row["signature"] or "",
+            "is_definition": bool(row["is_definition"]),
+        }
+
+    source = _read_symbol_body(file_path, row["line"])
+    if not source:
+        result["warning"] = f"Could not read source from {file_path}"
+    else:
+        result["source"] = source[:8000] if len(source) > 8000 else source
     return result
 
 
