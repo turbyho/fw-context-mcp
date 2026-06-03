@@ -11,6 +11,8 @@ venv/
 # fw-context runtime data
 .fw-context/
 
+.lean-ctx
+
 # IDE
 .vscode/
 .idea/
@@ -19,3 +21,4 @@ venv/
 .pytest_cache/
 .coverage
 htmlcov/
+.lean-ctx/
