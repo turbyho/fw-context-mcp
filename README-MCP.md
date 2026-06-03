@@ -108,6 +108,10 @@ is always `_generated_queries`.
 
 Look up a symbol and explain what it does. **Takes 10–30 seconds with Ollama.**
 
+**Name matching:** Uses exact match on the **short name** (e.g. `ModemMsgManager`).
+Qualified names like `zbox::ModemMsgManager` will NOT be found — use
+`lookup_symbol` first if you only have a partial or qualified name.
+
 ```
 Input:  {"name": "modem_parser_oob_init", "context_lines?": 40}
 Output: {"name": "…", "signature": "…", "explanation": "This function initializes…"}
@@ -124,7 +128,7 @@ Verify Ollama connectivity before using `explain_symbol` or `smart_search`.
 
 ```
 Input:  {}
-Output: {"status": "ok", "ollama_running": true, "ollama_enabled": true, "configured_model": "codestral:latest", …}
+Output: {"status": "ok", "ollama_running": true, "ollama_enabled": true, "configured_model": "qwen2.5-coder:14b", …}
 ```
 
 Returns `status: "disabled"` when `enabled = false` in config —
