@@ -527,7 +527,7 @@ Both files are auto-created with sensible defaults on first use.
 |-----|---------|-------|-------------|
 | `enabled` | `true` | both | Enable or disable Ollama integration. When `false`, `explain_symbol` returns the source code + prompt for the AI assistant to answer itself, and `smart_search` falls back to direct keyword search. No Ollama connection needed. |
 | `ollama_url` | `"http://localhost:11434"` | global | Ollama API base URL. Change if Ollama runs on a different machine (e.g. `"http://192.168.1.50:11434"`). |
-| `model` | `"codestral:latest"` | both | Ollama model tag. Override per-project to use a different model for different codebases. See [Choosing an Ollama model](#choosing-an-ollama-model) for recommendations. |
+| `model` | `"qwen2.5-coder:14b"` | both | Ollama model tag. Override per-project to use a different model for different codebases. See [Choosing an Ollama model](#choosing-an-ollama-model) for recommendations. |
 | `num_ctx` | `8192` | global | Context window size in tokens passed to Ollama. The factory default (2048) is too small for source code — keep at least 8192. |
 | `debug_log` | *(none)* | both | Path to a JSONL debug log file. When set, all Ollama prompts and responses are logged for debugging. Example: `"~/.fw-context/llm-debug.jsonl"`. |
 
@@ -546,7 +546,7 @@ db_dir = "~/.fw-context/index"
 [llm]
 enabled = true
 ollama_url = "http://localhost:11434"
-model = "codestral:latest"
+model = "qwen2.5-coder:14b"
 num_ctx = 8192
 # debug_log = "~/.fw-context/llm-debug.jsonl"   # uncomment to log all LLM calls
 ```
@@ -705,7 +705,7 @@ To use Ollama instead, install it from [ollama.com](https://ollama.com) and
 pull a model:
 
 ```bash
-ollama pull codestral:latest
+ollama pull qwen2.5-coder:14b
 ```
 
 Then verify:

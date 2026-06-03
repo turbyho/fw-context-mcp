@@ -115,25 +115,33 @@ def _lookup_definition(conn, config_hash: str, name: str):
     """Return the best symbol row for a name: definition preferred, project code
     (src/, lib/ outside mbed-os) preferred over framework code. Returns None if
     the name is not indexed.
+
+    Tries exact match on short name first (``ModemMsgManager``), then falls back
+    to exact match on qualified name (``zbox::ModemMsgManager``).
     """
-    # Prefer a definition; tie-break toward project-local files over mbed-os.
-    row = conn.execute(
-        """SELECT s.* FROM symbols s
-           WHERE s.config_hash=? AND s.name=? AND s.is_definition=1
-           ORDER BY (CASE WHEN s.file_path LIKE '%mbed-os%' THEN 1 ELSE 0 END), s.line
-           LIMIT 1""",
-        (config_hash, name),
-    ).fetchone()
-    if not row:
+    BASE_QUERY = """SELECT s.* FROM symbols s
+       WHERE s.config_hash=? AND %s
+       ORDER BY %s (CASE WHEN s.file_path LIKE '%%mbed-os%%' THEN 1 ELSE 0 END), s.line
+       LIMIT 1"""
+
+    for column in ("s.name", "s.qualified_name"):
+        # 1) definition preferred
         row = conn.execute(
-            """SELECT s.* FROM symbols s
-               WHERE s.config_hash=? AND s.name=?
-               ORDER BY s.is_definition DESC,
-                        (CASE WHEN s.file_path LIKE '%mbed-os%' THEN 1 ELSE 0 END), s.line
-               LIMIT 1""",
+            BASE_QUERY % (f"{column}=? AND s.is_definition=1", ""),
             (config_hash, name),
         ).fetchone()
-    return row
+        if row:
+            return row
+
+        # 2) any symbol, definitions sorted first
+        row = conn.execute(
+            BASE_QUERY % (f"{column}=?", "s.is_definition DESC,"),
+            (config_hash, name),
+        ).fetchone()
+        if row:
+            return row
+
+    return None
 
 
 def _read_symbol_body(file_path: str, line_no: int, end_line: int = 0, max_lines: int = 400) -> str:
@@ -772,8 +780,12 @@ async def explain_symbol(
     model is available.
 
     Args:
-        name: Symbol name (exact match). If multiple symbols share the name,
-              the definition is preferred over declarations.
+        name: Symbol name (exact match on short name, e.g. ``ModemMsgManager``).
+              Qualified names (``ns::Foo``) are NOT supported — use the
+              unqualified short name as it appears in the index.
+              If multiple symbols share the name, the definition is preferred
+              over declarations. Use ``lookup_symbol(name)`` first if unsure
+              about the exact short name.
         project_root: Absolute path to the project. Defaults to nearest git root.
         context_lines: Lines of source code to include above and below the
                        definition for context (default 40).
