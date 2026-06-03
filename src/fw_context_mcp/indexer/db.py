@@ -362,9 +362,12 @@ def find_refs(
     Resolves the target name → its USR(s) via symbols, then joins refs.to_usr.
     Each result carries the referencing location and, when known, the enclosing
     caller symbol (joined from refs.from_usr → symbols.usr).
+
+    Tries exact match on short name first (``ModemMsgManager``), then falls back
+    to exact match on qualified name (``zbox::ModemMsgManager``).
     """
     kind_filter = "AND r.ref_kind = ?" if ref_kind else ""
-    params: list = [config_hash, config_hash, name]
+    params: list = [config_hash, config_hash, name, name]
     if ref_kind:
         params.append(ref_kind)
     params.append(limit)
@@ -380,7 +383,8 @@ def find_refs(
               ON tgt.config_hash = r.config_hash AND tgt.usr = r.to_usr
             LEFT JOIN symbols caller
               ON caller.config_hash = r.config_hash AND caller.usr = r.from_usr
-            WHERE r.config_hash = ? AND tgt.config_hash = ? AND tgt.name = ? {kind_filter}
+            WHERE r.config_hash = ? AND tgt.config_hash = ?
+              AND (tgt.name = ? OR tgt.qualified_name = ?) {kind_filter}
             ORDER BY r.from_file, r.from_line
             LIMIT ?""",
         params,

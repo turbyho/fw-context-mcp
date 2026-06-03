@@ -968,7 +968,8 @@ def find_callers(name: str, project_root: str | None = None, limit: int = 50) ->
     ``fw-context index --refs``). Without it, returns an info message.
 
     Args:
-        name: Function/method name (exact match).
+        name: Function/method name (exact match on short name, e.g. ``reset_slot_error_lock``,
+              or qualified name, e.g. ``zbox::ZRTDATA::reset_slot_error_lock``).
         project_root: Absolute path to the project. Defaults to nearest git root.
         limit: Maximum number of call sites (default 50, max 200).
 
@@ -989,7 +990,8 @@ def find_references(name: str, project_root: str | None = None, limit: int = 50)
     true`` then re-index, or ``fw-context index --refs``).
 
     Args:
-        name: Symbol name (exact match).
+        name: Symbol name (exact match on short name, e.g. ``reset_slot_error_lock``,
+              or qualified name, e.g. ``zbox::ZRTDATA::reset_slot_error_lock``).
         project_root: Absolute path to the project. Defaults to nearest git root.
         limit: Maximum number of references (default 50, max 200).
 
