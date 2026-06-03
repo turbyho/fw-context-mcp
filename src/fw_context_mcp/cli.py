@@ -172,8 +172,13 @@ def cmd_index(args: argparse.Namespace) -> int:
         exclude_paths=exclude_paths,
         project_name=args.name or cfg.project.name,
         index_refs=args.refs or cfg.index.index_refs,
+        index_embeddings=(
+            False if getattr(args, 'no_embeddings', False)
+            else getattr(args, 'embeddings', None) or cfg.index.index_embeddings
+        ),
         project_root=project_root,
         project_id=project_id,
+        llm_config=cfg.llm,
     )
     print(f"Indexed. config_hash={config_hash[:16]}…  db={db_path}")
     return 0
@@ -459,6 +464,8 @@ def main() -> None:
     p_index.add_argument("--source-roots", nargs="+", metavar="DIR")
     p_index.add_argument("--name", metavar="NAME", help="Project name override")
     p_index.add_argument("--refs", action="store_true", help="Build cross-reference / call graph (find_callers, find_references)")
+    p_index.add_argument("--no-embeddings", action="store_true", dest="no_embeddings", help="Skip embedding generation")
+    p_index.add_argument("--embeddings", action="store_true", dest="embeddings", default=None, help="Generate symbol embeddings (default)")
     p_index.set_defaults(func=cmd_index)
 
     p_search = sub.add_parser("search", help="Search indexed symbols")
