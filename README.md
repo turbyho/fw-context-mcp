@@ -317,10 +317,13 @@ Once indexed, your assistant can:
 
 ### 4. Keep the index current
 
-After editing source files, the index stays accurate in two ways:
+After editing source files, the index stays accurate in three ways:
 
-- **Automatic staleness detection** — if `compile_commands.json` or individual
-  source files have changed since the last index, tools return a warning.
+- **Automatic re-index** — `search_code` and `lookup_symbol` detect stale files
+  in their results and re-index them on the fly (up to 5 files, 30 s timeout),
+  then re-run the query. No manual steps needed for typical edit→search workflows.
+- **Automatic staleness detection** — if `compile_commands.json` itself changed,
+  or auto-reindex failed, tools return a clear warning with next steps.
 - **On-demand re-index** — run `fw-context index` (incremental, fast) or use
   `reindex_file("src/main.cpp")` via the MCP tool.
 
@@ -352,6 +355,7 @@ fw-context index [compile_commands.json] [--project DIR] [--source-roots DIR ...
 | `--project DIR` | `.` | Project root directory |
 | `--source-roots DIR...` | auto-detected | Directories to index symbols from |
 | `--name NAME` | directory name | Project name override |
+| `--refs` | off | Build cross-reference / call graph (`find_callers`, `find_references`) |
 | `-v` | off | Verbose progress output |
 
 ### `fw-context search`
@@ -430,7 +434,9 @@ and integration details.
 ### Call graph (cross-references)
 
 `find_callers` and `find_references` answer "who calls `modem_init`?" and "where
-is `ZCfgDataManager` used?". The reference graph is **opt-in** — it adds indexing
+is `ZCfgDataManager` used?". Both accept short names (`reset_slot_error_lock`)
+or qualified names (`zbox::ZRTDATA::reset_slot_error_lock`). The reference
+graph is **opt-in** — it adds indexing
 time and database size, so it is off by default. Enable it and re-index:
 
 ```bash
@@ -544,7 +550,7 @@ Both files are auto-created with sensible defaults on first use.
 db_dir = "~/.fw-context/index"
 
 [llm]
-enabled = true
+# enabled = true   # set to false to disable Ollama — tools return raw prompts
 ollama_url = "http://localhost:11434"
 model = "qwen2.5-coder:14b"
 num_ctx = 8192

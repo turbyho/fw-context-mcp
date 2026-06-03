@@ -94,23 +94,26 @@ Output: [{"name": "BoxManager", "kind": "class", "file": "…", "line": 21}, …
 
 ### `smart_search`
 
-Natural language → FTS5 keywords → search. Calls Ollama to generate keywords.
+Natural language → FTS5 keywords → search. Three-phase process:
+(1) rough word-split search to gather real symbol names, (2) Ollama generates
+refined FTS5 terms from those names, (3) OR search with client-side scoring.
+Non-ASCII queries are auto-translated to English before the rough search phase.
 
 ```
 Input:  {"query": "how does the modem connect?", "limit?": 20}
-Output: [{"_generated_queries": ["modem connect", "modem attach", …]}, …symbols…]
+Output: [{"_generated_queries": ["modem connect*", …]}, {"_rough_queries": ["modem", "connect"]}, …symbols…]
 ```
 
-Falls back to direct search when Ollama is unavailable. The first result entry
-is always `_generated_queries`.
+Falls back to direct FTS5 word-split search when Ollama is unavailable. The
+first entries are always `_generated_queries` and `_rough_queries`. When the
+query was translated, `_translated_from` and `_translated_to` are also included.
 
 ### `explain_symbol`
 
 Look up a symbol and explain what it does. **Takes 10–30 seconds with Ollama.**
 
-**Name matching:** Uses exact match on the **short name** (e.g. `ModemMsgManager`).
-Qualified names like `zbox::ModemMsgManager` will NOT be found — use
-`lookup_symbol` first if you only have a partial or qualified name.
+**Name matching:** Exact match on short name (e.g. `ModemMsgManager`) or
+qualified name (e.g. `zbox::ModemMsgManager`). Both are supported.
 
 ```
 Input:  {"name": "modem_parser_oob_init", "context_lines?": 40}
@@ -128,7 +131,7 @@ Verify Ollama connectivity before using `explain_symbol` or `smart_search`.
 
 ```
 Input:  {}
-Output: {"status": "ok", "ollama_running": true, "ollama_enabled": true, "configured_model": "qwen2.5-coder:14b", …}
+Output: {"status": "ok", "ollama_running": true, "ollama_enabled": true, "configured_model": "qwen2.5-coder:14b", "num_ctx": 8192, "installed_models": […], …}
 ```
 
 Returns `status: "disabled"` when `enabled = false` in config —
@@ -161,7 +164,7 @@ Re-index a single file after editing it.
 
 ```
 Input:  {"file_path": "/abs/path/to/main.cpp"}
-Output: {"file": "…", "symbols_updated": 28, "elapsed_s": 2.5}
+Output: {"file": "…", "translation_units": 1, "symbols_updated": 28, "elapsed_s": 2.5}
 ```
 
 **Limitations:**
@@ -229,17 +232,38 @@ Note: tool-level errors use `isError: false` (they are successful tool
 invocations with an error field in the return value). Only JSON-RPC protocol
 errors use the `error` key at the top level.
 
-### Staleness warnings
+### Staleness warnings and auto-reindex
 
-When the index is outdated, tools include a `warning` entry in the results with
-instructions on how to update:
+When the index is outdated, `search_code` and `lookup_symbol` **automatically
+re-index** stale files found in the results (up to 5 files, 30 s timeout), then
+re-run the query with fresh data. The caller gets clean results without stale
+markers — no manual intervention needed.
+
+When auto-reindex fails (e.g. for header-only files) or compile_commands.json
+itself is stale, a `warning` entry is included:
 
 ```json
 [
-  {"warning": "File(s) modified since last index …"},
+  {"warning": "Auto-reindex failed for 1 file(s): …"},
   {"name": "BoxManager", …}
 ]
 ```
+
+### Database corruption
+
+The server runs `PRAGMA integrity_check` on every database open. If corruption
+is detected, tools return a structured error with a clear action hint:
+
+```json
+{
+  "error": "Database corruption detected: …",
+  "action": "reset_index",
+  "hint": "Run reset_index() then fw-context index to rebuild."
+}
+```
+
+Call `reset_index(confirm=True)` to delete the corrupt database, then run
+`fw-context index` in the project root to rebuild from scratch.
 
 ## Environment
 
