@@ -41,6 +41,11 @@ compile_commands = "compile_commands.json"
 source_roots = []
 exclude_paths = ["build", "BUILD"]
 
+# index_refs: build a cross-reference / call graph (find_callers, find_references).
+#   Off by default — reference extraction adds indexing time and DB size.
+#   Set true to enable, then re-run 'fw-context index'.
+# index_refs = false
+
 # [llm]
 # enabled = false   # disable Ollama, return raw prompts for the agent to answer
 # ollama_url = "http://localhost:11434"
@@ -65,6 +70,7 @@ class IndexConfig:
     compile_commands: Path = field(default_factory=lambda: Path("compile_commands.json"))
     source_roots: list[str] = field(default_factory=list)
     exclude_paths: list[str] = field(default_factory=lambda: ["build", "BUILD"])
+    index_refs: bool = False
 
 
 @dataclass
@@ -115,6 +121,8 @@ def _from_dict(data: dict) -> Config:
             cfg.index.source_roots = roots
         if excludes := idx.get("exclude_paths"):
             cfg.index.exclude_paths = excludes
+        if "index_refs" in idx:
+            cfg.index.index_refs = bool(idx["index_refs"])
 
     if llm := data.get("llm", {}):
         if "enabled" in llm:

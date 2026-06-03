@@ -118,6 +118,22 @@ CREATE TRIGGER IF NOT EXISTS symbols_au AFTER UPDATE ON symbols BEGIN
     INSERT INTO symbols_fts(rowid, name, qualified_name, signature, docstring, file_path, name_tokens)
     VALUES (new.id, new.name, new.qualified_name, new.signature, new.docstring, new.file_path, new.name_tokens);
 END;
+
+-- Cross-reference / call graph (opt-in via [index] index_refs = true).
+-- to_usr links to symbols.usr (the referenced definition); from_usr is the
+-- enclosing function/method that contains the reference (may be NULL).
+CREATE TABLE IF NOT EXISTS refs (
+    id           INTEGER PRIMARY KEY,
+    config_hash  TEXT    NOT NULL,
+    to_usr       TEXT    NOT NULL,
+    from_file    TEXT    NOT NULL,
+    from_line    INTEGER NOT NULL,
+    from_usr     TEXT,
+    ref_kind     TEXT    NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_refs_to_usr   ON refs(config_hash, to_usr);
+CREATE INDEX IF NOT EXISTS idx_refs_from_usr ON refs(config_hash, from_usr);
+CREATE INDEX IF NOT EXISTS idx_refs_fromfile ON refs(config_hash, from_file);
 """
 
 
@@ -302,6 +318,72 @@ def insert_symbols_batch(
     return cur.rowcount
 
 
+def insert_refs_batch(conn: sqlite3.Connection, rows: list[tuple]) -> int:
+    """Insert reference rows for the cross-reference / call graph.
+
+    Each row: (config_hash, to_usr, from_file, from_line, from_usr, ref_kind)
+    Returns number of rows inserted.
+    """
+    cur = conn.executemany(
+        """INSERT INTO refs (config_hash, to_usr, from_file, from_line, from_usr, ref_kind)
+           VALUES (?,?,?,?,?,?)""",
+        rows,
+    )
+    return cur.rowcount
+
+
+def delete_refs_for_file(conn: sqlite3.Connection, config_hash: str, from_file: str) -> None:
+    """Delete all references originating in a given file (for incremental reindex)."""
+    conn.execute(
+        "DELETE FROM refs WHERE config_hash=? AND from_file=?",
+        (config_hash, from_file),
+    )
+
+
+def find_refs(
+    conn: sqlite3.Connection,
+    config_hash: str,
+    name: str,
+    ref_kind: str | None = None,
+    limit: int = 50,
+) -> list[sqlite3.Row]:
+    """Find references to a symbol by name.
+
+    Resolves the target name → its USR(s) via symbols, then joins refs.to_usr.
+    Each result carries the referencing location and, when known, the enclosing
+    caller symbol (joined from refs.from_usr → symbols.usr).
+    """
+    kind_filter = "AND r.ref_kind = ?" if ref_kind else ""
+    params: list = [config_hash, config_hash, name]
+    if ref_kind:
+        params.append(ref_kind)
+    params.append(limit)
+    return conn.execute(
+        f"""SELECT r.from_file, r.from_line, r.ref_kind,
+                   r.from_usr,
+                   caller.name           AS caller_name,
+                   caller.qualified_name AS caller_qname,
+                   caller.kind           AS caller_kind,
+                   caller.file_path      AS caller_file
+            FROM refs r
+            JOIN symbols tgt
+              ON tgt.config_hash = r.config_hash AND tgt.usr = r.to_usr
+            LEFT JOIN symbols caller
+              ON caller.config_hash = r.config_hash AND caller.usr = r.from_usr
+            WHERE r.config_hash = ? AND tgt.config_hash = ? AND tgt.name = ? {kind_filter}
+            ORDER BY r.from_file, r.from_line
+            LIMIT ?""",
+        params,
+    ).fetchall()
+
+
+def count_refs(conn: sqlite3.Connection, config_hash: str) -> int:
+    """Return total reference count for a build config (0 when refs not indexed)."""
+    return conn.execute(
+        "SELECT COUNT(*) FROM refs WHERE config_hash=?", (config_hash,)
+    ).fetchone()[0]
+
+
 def get_active_config(conn: sqlite3.Connection, project_id: str) -> sqlite3.Row | None:
     """Return the most recently indexed build_config for a project."""
     return conn.execute(
@@ -317,8 +399,6 @@ def _expand_query(query: str) -> str:
     Leaves existing wildcards (*) and FTS5 syntax (NEAR, ", parentheses,
     column filters with :) intact.
     """
-    import re
-
     # Tokens that already are FTS5 syntax — don't touch them.
     # ':' covers column-filter expressions like "name_tokens : term*".
     if any(c in query for c in ('"', 'NEAR', 'AND', 'OR', '(', ')', ':')):

@@ -15,11 +15,15 @@ from ..config import Config, derive_project_id
 from ..config import load as load_config
 from ..indexer.compile_commands import parse as parse_cc
 from ..indexer.db import (
+    count_refs,
+    delete_refs_for_file,
     delete_symbols_for_file,
+    find_refs,
     get_active_config,
     get_all_projects,
     get_file_mtime_indexed,
     get_file_mtimes,
+    insert_refs_batch,
     insert_symbols_batch,
     open_db,
     search_symbols,
@@ -559,7 +563,7 @@ def reindex_file(
         When re-indexing a header via a single TU, includes a warning that other
         TUs may be stale.
     """
-    from ..indexer.symbols import extract  # lazy: requires libclang
+    from ..indexer.symbols import extract_all  # lazy: requires libclang
 
     db_path, cfg, project_id, root = _resolve_context(project_root)
     if not db_path.exists():
@@ -595,7 +599,10 @@ def reindex_file(
 
             # Extract first — if this fails, skip TU without touching DB
             try:
-                syms = list(extract(unit, source_roots=source_roots, exclude_paths=exclude_paths))
+                syms, refs = extract_all(
+                    unit, source_roots=source_roots, exclude_paths=exclude_paths,
+                    with_refs=cfg.index.index_refs,
+                )
             except Exception as exc:
                 log.warning("skip reindex TU %s: %s", unit.file.name, exc)
                 continue
@@ -626,6 +633,21 @@ def reindex_file(
 
                 if rows:
                     total_symbols += insert_symbols_batch(conn, rows)
+
+                if cfg.index.index_refs:
+                    def _rel(p: str) -> str:
+                        try:
+                            return str(Path(p).resolve().relative_to(root))
+                        except ValueError:
+                            return p
+                    tu_rel = _rel(file_path_str)
+                    delete_refs_for_file(conn, config_hash, tu_rel)
+                    if refs:
+                        ref_rows = [
+                            (config_hash, r.to_usr, _rel(r.from_file), r.from_line, r.from_usr, r.ref_kind)
+                            for r in refs
+                        ]
+                        insert_refs_batch(conn, ref_rows)
 
                 upsert_file(conn, config_hash, file_path_str, unit.language, mtime=current_mtime)
 
@@ -841,6 +863,85 @@ def get_source(name: str, project_root: str | None = None) -> dict:
     else:
         result["source"] = source[:8000] if len(source) > 8000 else source
     return result
+
+
+def _references_result(name: str, project_root: str | None, ref_kind: str | None, limit: int) -> list[dict]:
+    """Shared logic for find_callers / find_references."""
+    db_path, cfg, project_id, root = _resolve_context(project_root)
+    if not db_path.exists():
+        return [{"error": f"No index found for {root}. Run 'fw-context index' first."}]
+
+    with open_db(db_path) as conn:
+        cfg_data = get_active_config(conn, project_id)
+        if not cfg_data:
+            return [{"error": "No build config indexed."}]
+        config_hash = cfg_data["config_hash"]
+
+        if count_refs(conn, config_hash) == 0:
+            return [{"info": (
+                "No references indexed. The cross-reference graph is opt-in — "
+                "enable it with [index] index_refs = true (or run "
+                "'fw-context index --refs') and re-index the project."
+            )}]
+
+        limit = min(limit, 200)
+        rows = find_refs(conn, config_hash, name, ref_kind=ref_kind, limit=limit)
+        if not rows:
+            label = "callers" if ref_kind == "call" else "references"
+            return [{"info": f"No {label} found for '{name}'. Check the name (exact match) and that the index is current."}]
+
+        return [
+            {
+                "file": _abs_path(root, r["from_file"]),
+                "line": r["from_line"],
+                "ref_kind": r["ref_kind"],
+                "caller": r["caller_qname"] or r["caller_name"] or "<file scope>",
+                "caller_kind": r["caller_kind"],
+            }
+            for r in rows
+        ]
+
+
+@mcp.tool()
+def find_callers(name: str, project_root: str | None = None, limit: int = 50) -> list[dict]:
+    """Find call sites of a function/method — who calls ``name``.
+
+    Returns only direct calls (ref_kind='call'). Requires the cross-reference
+    graph to be built (``[index] index_refs = true`` then re-index, or
+    ``fw-context index --refs``). Without it, returns an info message.
+
+    Args:
+        name: Function/method name (exact match).
+        project_root: Absolute path to the project. Defaults to nearest git root.
+        limit: Maximum number of call sites (default 50, max 200).
+
+    Returns:
+        list of dicts with: file (absolute), line, ref_kind, caller
+        (qualified name of the enclosing function, or "<file scope>"),
+        caller_kind. Or a single info/error dict.
+    """
+    return _references_result(name, project_root, ref_kind="call", limit=limit)
+
+
+@mcp.tool()
+def find_references(name: str, project_root: str | None = None, limit: int = 50) -> list[dict]:
+    """Find all references to a symbol — calls, reads, and member accesses.
+
+    Broader than ``find_callers``: includes every use (calls, value references,
+    member access). Requires the cross-reference graph (``[index] index_refs =
+    true`` then re-index, or ``fw-context index --refs``).
+
+    Args:
+        name: Symbol name (exact match).
+        project_root: Absolute path to the project. Defaults to nearest git root.
+        limit: Maximum number of references (default 50, max 200).
+
+    Returns:
+        list of dicts with: file (absolute), line, ref_kind ('call'|'ref'|
+        'member'), caller (enclosing function qualified name), caller_kind.
+        Or a single info/error dict.
+    """
+    return _references_result(name, project_root, ref_kind=None, limit=limit)
 
 
 def _parse_search_terms(raw: str) -> list[str]:

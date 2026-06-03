@@ -120,7 +120,6 @@ fw-context index
 |------|-----|
 | Python 3.11+ | Runtime |
 | [`uv`](https://docs.astral.sh/uv/) | Fast package installer |
-| SSH key for `git.montyho.com` | To clone the repository |
 | Compiler toolchain (ARM GCC / Zephyr SDK / PlatformIO) | libclang needs system headers to parse cross-compiled code |
 | [`bear`](https://github.com/rizsotto/Bear) | Intercepts build commands to produce `compile_commands.json` |
 | [Ollama](https://ollama.com) *(optional)* | Powers `explain_symbol` and `smart_search`. Not required —                  when disabled, the AI assistant processes the results itself. |
