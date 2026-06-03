@@ -76,6 +76,7 @@ class Symbol:
     signature: str           # return type + params for callables
     docstring: str           # raw comment above the symbol
     usr: str                 # libclang Unified Symbol Resolution
+    end_line: int = 0        # last line of the definition extent (0 if unknown)
 
 
 def _cursor_kind_label(kind: cx.CursorKind) -> str:
@@ -129,6 +130,24 @@ def _signature(cursor: cx.Cursor) -> str:
         return f"{result_type} {cursor.spelling}({params})"
     except Exception:
         return cursor.displayname
+
+
+def _end_line(cursor: cx.Cursor, loc) -> int:
+    """Last source line of the cursor's extent (full body for definitions).
+
+    Uses libclang's exact AST extent — handles multi-line signatures, braces in
+    strings/comments, macros, and templates correctly. Guards against the extent
+    ending in a different file (can happen with macro expansions): returns 0 so
+    callers fall back to a heuristic.
+    """
+    try:
+        ext = cursor.extent
+        end = ext.end
+        if end.file and loc.file and end.file.name == loc.file.name and end.line >= loc.line:
+            return end.line
+    except Exception:
+        pass
+    return 0
 
 
 def _docstring(cursor: cx.Cursor) -> str:
@@ -243,6 +262,7 @@ def extract_all(
             signature=_signature(cursor),
             docstring=_docstring(cursor),
             usr=usr,
+            end_line=_end_line(cursor, loc),
         ))
 
     if not with_refs:

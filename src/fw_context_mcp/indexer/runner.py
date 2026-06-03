@@ -190,6 +190,7 @@ def run(
                         s.kind,
                         s.line,
                         s.column,
+                        s.end_line,
                         int(s.is_definition),
                         s.signature,
                         s.docstring,

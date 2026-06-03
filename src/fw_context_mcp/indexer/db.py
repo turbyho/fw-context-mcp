@@ -79,6 +79,7 @@ CREATE TABLE IF NOT EXISTS symbols (
     kind           TEXT    NOT NULL,
     line           INTEGER NOT NULL,
     col            INTEGER NOT NULL,
+    end_line       INTEGER NOT NULL DEFAULT 0,
     is_definition  INTEGER NOT NULL DEFAULT 0,
     signature      TEXT    NOT NULL DEFAULT '',
     docstring      TEXT    NOT NULL DEFAULT '',
@@ -146,6 +147,13 @@ def open_db(path: Path) -> sqlite3.Connection:
     # Migration: mtime column in files
     try:
         conn.execute("ALTER TABLE files ADD COLUMN mtime REAL NOT NULL DEFAULT 0")
+        conn.commit()
+    except sqlite3.OperationalError:
+        pass
+
+    # Migration: end_line column in symbols (full definition extent for get_source)
+    try:
+        conn.execute("ALTER TABLE symbols ADD COLUMN end_line INTEGER NOT NULL DEFAULT 0")
         conn.commit()
     except sqlite3.OperationalError:
         pass
@@ -294,21 +302,23 @@ def insert_symbols_batch(
     """Insert symbol rows, promoting declaration→definition on USR conflict.
 
     Each row: (config_hash, file_id, file_path, name_tokens, usr, name,
-               qualified_name, kind, line, col, is_definition, signature, docstring)
+               qualified_name, kind, line, col, end_line, is_definition,
+               signature, docstring)
 
     Returns count of rows inserted or upgraded to definition.
     """
     cur = conn.executemany(
         """INSERT INTO symbols
            (config_hash, file_id, file_path, name_tokens, usr, name, qualified_name, kind,
-            line, col, is_definition, signature, docstring)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+            line, col, end_line, is_definition, signature, docstring)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
            ON CONFLICT(config_hash, usr) DO UPDATE SET
                file_id       = excluded.file_id,
                file_path     = excluded.file_path,
                name_tokens   = excluded.name_tokens,
                line          = excluded.line,
                col           = excluded.col,
+               end_line      = excluded.end_line,
                is_definition = 1,
                signature     = excluded.signature,
                docstring     = excluded.docstring
