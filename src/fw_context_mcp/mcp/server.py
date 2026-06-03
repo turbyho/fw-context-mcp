@@ -1592,16 +1592,11 @@ async def smart_search(
                 "QUERIES: [\"term1*\", \"term2*\", ...]\n"
             )
 
-        # Exclude docstring from FTS5 search — massive mbed-os docstrings
-        # (ble::Gap has 5000+ chars) cause false positives for unrelated
-        # queries by matching generic keywords like "update", "management".
-        _FTS_COLS = "{name qualified_name signature file_path name_tokens}"
-
         # --- Helper: run a set of queries and return scored, deduped rows ---
         def _search_queries(queries: list[str], fetch_limit: int) -> list[dict]:
             if not queries:
                 return []
-            or_query = _FTS_COLS + " : (" + " OR ".join(queries) + ")"
+            or_query = " OR ".join(queries)
             nt_terms = [f"name_tokens : {kq}" for kq in queries]
             nt_query = " OR ".join(nt_terms)
             rows: list[dict] = []
@@ -1717,6 +1712,8 @@ async def smart_search(
 
                 if fpath and ("src/" in fpath or "lib/" in fpath) and "mbed-os" not in fpath:
                     s += 1
+                elif fpath and "mbed-os" in fpath:
+                    s -= 5
 
                 s += _KIND_WEIGHT.get(r["kind"] or "", 0)
                 return s
@@ -1737,13 +1734,10 @@ async def smart_search(
                 elif r["is_definition"] and not prev["is_definition"]:
                     seen[key] = _fmt(r)
         elif not seen:
-            # Fallback: individual queries if OR found nothing.
-            # Use the same column filter as _search_queries to avoid
-            # docstring false positives.
+            # Fallback: individual queries if OR found nothing
             for kq in all_queries:
                 try:
-                    rows = search_symbols(conn,
-                        _FTS_COLS + " : " + kq, config_hash, limit=limit)
+                    rows = search_symbols(conn, kq, config_hash, limit=limit)
                 except Exception:
                     continue
                 for r in rows:
@@ -1778,7 +1772,7 @@ async def smart_search(
                     scored.sort(key=lambda x: -x[0])
                     # Take top 30, fetch symbol rows
                     top_sims = scored[:30]
-                    top_ids = [s[1] for s in top_sims if s[0] > 0.55]
+                    top_ids = [s[1] for s in top_sims if s[0] > 0.5]
                     if top_ids:
                         placeholders = ",".join("?" * len(top_ids))
                         emb_rows = conn.execute(
