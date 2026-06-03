@@ -76,6 +76,21 @@ def _resolve_project_root(project_root: str | None) -> Path:
     return cwd
 
 
+def _abs_path(root: Path, path: str) -> str:
+    """Resolve a stored file_path to an absolute path for tool output.
+
+    symbols.file_path is stored relative to the project root (for FTS5 module
+    tokenisation). Tool consumers need absolute paths to open / click them, so
+    we join with root here. Already-absolute paths are returned unchanged.
+    """
+    if not path:
+        return path
+    p = Path(path)
+    if p.is_absolute():
+        return str(p)
+    return str(root / p)
+
+
 def _is_stale(cfg, compile_commands_path: str) -> bool:
     """Return True if compile_commands.json is newer than the indexed timestamp."""
     try:
@@ -232,7 +247,7 @@ def search_code(
                 "name": r["name"],
                 "qualified_name": r["qualified_name"],
                 "kind": r["kind"],
-                "file": r["file_path"],
+                "file": _abs_path(root, r["file_path"]),
                 "line": r["line"],
                 "is_definition": bool(r["is_definition"]),
                 "signature": r["signature"],
@@ -240,7 +255,9 @@ def search_code(
             }
             for r in rows
         ]
-        stale_f = _stale_files(conn, cfg["config_hash"], [r["file_path"] for r in rows])
+        # _stale_files queries files.path (absolute) — pass absolute paths so the
+        # mtime lookup matches (relative file_path would silently never match).
+        stale_f = _stale_files(conn, cfg["config_hash"], [_abs_path(root, r["file_path"]) for r in rows])
         if stale_f:
             results.append({"warning": f"File(s) modified since last index — results may be outdated. Run 'fw-context index' or reindex_file(): {stale_f}"})
         results += result_rows
@@ -294,8 +311,7 @@ def lookup_symbol(
             limit = min(limit, 100)
             if exact:
                 rows = conn.execute(
-                    """SELECT s.*, f.path as file_path FROM symbols s
-                       JOIN files f ON f.id = s.file_id
+                    """SELECT s.* FROM symbols s
                        WHERE s.config_hash=? AND s.name=?
                        ORDER BY s.is_definition DESC, s.line
                        LIMIT ?""",
@@ -303,8 +319,7 @@ def lookup_symbol(
                 ).fetchall()
             else:
                 rows = conn.execute(
-                    """SELECT s.*, f.path as file_path FROM symbols s
-                       JOIN files f ON f.id = s.file_id
+                    """SELECT s.* FROM symbols s
                        WHERE s.config_hash=? AND s.name LIKE ?
                        ORDER BY s.is_definition DESC, s.line
                        LIMIT ?""",
@@ -320,7 +335,7 @@ def lookup_symbol(
                     "name": r["name"],
                     "qualified_name": r["qualified_name"],
                     "kind": r["kind"],
-                    "file": r["file_path"],
+                    "file": _abs_path(root, r["file_path"]),
                     "line": r["line"],
                     "is_definition": bool(r["is_definition"]),
                     "signature": r["signature"],
@@ -328,7 +343,7 @@ def lookup_symbol(
                 }
                 for r in rows
             ]
-            stale_f = _stale_files(conn, cfg["config_hash"], [r["file_path"] for r in rows])
+            stale_f = _stale_files(conn, cfg["config_hash"], [_abs_path(root, r["file_path"]) for r in rows])
             if stale_f:
                 results.append({"warning": f"File(s) modified since last index — results may be outdated. Run 'fw-context index' or reindex_file(): {stale_f}"})
             results += result_rows
@@ -649,16 +664,14 @@ async def explain_symbol(
 
         config_hash = cfg_data["config_hash"]
         row = conn.execute(
-            """SELECT s.*, f.path as file_path FROM symbols s
-               JOIN files f ON f.id = s.file_id
+            """SELECT s.* FROM symbols s
                WHERE s.config_hash=? AND s.name=? AND s.is_definition=1
                ORDER BY s.line LIMIT 1""",
             (config_hash, name),
         ).fetchone()
         if not row:
             row = conn.execute(
-                """SELECT s.*, f.path as file_path FROM symbols s
-                   JOIN files f ON f.id = s.file_id
+                """SELECT s.* FROM symbols s
                    WHERE s.config_hash=? AND s.name=?
                    ORDER BY s.is_definition DESC, s.line LIMIT 1""",
                 (config_hash, name),
@@ -666,7 +679,7 @@ async def explain_symbol(
         if not row:
             return {"error": f"Symbol not found: {name}"}
 
-        file_path = row["file_path"]
+        file_path = _abs_path(root, row["file_path"])
         line_no = row["line"]
         signature = row["signature"] or ""
         kind = row["kind"]
@@ -838,7 +851,7 @@ async def smart_search(
                 "name": r["name"],
                 "qualified_name": r["qualified_name"],
                 "kind": r["kind"],
-                "file": r["file_path"],
+                "file": _abs_path(root, r["file_path"]),
                 "line": r["line"],
                 "is_definition": bool(r["is_definition"]),
                 "signature": r["signature"],
