@@ -1,8 +1,41 @@
 # fw-context
 
-Build-aware code intelligence for embedded firmware — a symbolic index of your
-entire C/C++ codebase that AI assistants (Claude Code, OpenCode) can query
-directly, with zero hallucination.
+Build-aware code intelligence for embedded firmware. **fw-context** parses your
+actual build (`compile_commands.json`) with [libclang](https://clang.llvm.org/)
+and stores every C/C++ symbol — functions, classes, methods, enums, typedefs,
+variables — in a full-text-searchable **SQLite + FTS5** database. AI assistants
+(Claude Code, OpenCode) query it through an **MCP server** with sub-millisecond
+latency and zero hallucination.
+
+Works with **any embedded build system** that produces `compile_commands.json`:
+**Mbed OS**, **Zephyr RTOS**, **PlatformIO** (Arduino, ESP-IDF, STM32Cube),
+**FreeRTOS**, **bare-metal ARM**, and anything else compiled with GCC or Clang.
+No LSP server required — it uses the real compiler flags, so it sees what your
+compiler sees, `#ifdef`s and all.
+
+First indexing of a typical project (500–1 000 files, 5 000–10 000 symbols)
+takes **10–30 seconds**. Subsequent runs are incremental — only changed files
+are re-parsed. The index lives on disk; your AI assistant reads it directly,
+no daemon, no background process.
+
+## Supported ecosystems
+
+fw-context auto-detects your build system and source roots from the project
+structure. The only hard requirement is `compile_commands.json` — if your
+toolchain can produce one, fw-context can index it.
+
+| Ecosystem | Auto-detection | Project scope | Framework scope | Notes |
+|-----------|---------------|---------------|-----------------|-------|
+| **Mbed OS** | `mbed-os/` directory, `mbed_app.json` | 50–500 files<br>500–5 000 project symbols | ~8 000 C++ files<br>~50 000+ symbols | ARM Mbed OS 5/6; `bear -- python3 build_app.py` |
+| **Zephyr RTOS** | `west.yml`, `prj.conf` | 30–300 files<br>300–3 000 project symbols | ~15 000 files<br>~100 000+ symbols | Zephyr 3.x; `west build -- -DCMAKE_EXPORT_COMPILE_COMMANDS=ON` |
+| **PlatformIO** | `platformio.ini` | 20–500 files<br>200–5 000 project symbols | Arduino ~500 files<br>ESP-IDF ~10 000 files | Arduino, ESP-IDF, STM32Cube, Teensy…; `pio run --target compiledb` |
+| **FreeRTOS / Azure RTOS / ChibiOS / bare-metal** | Any build with `bear` | 10–500 files<br>100–5 000 symbols | Depends on RTOS | Any GCC/Clang-based toolchain; `bear -- make` / `bear -- cmake --build .` |
+| **Custom / in-house RTOS** | Any build with `bear` | Scales to 2 000+ files<br>20 000+ symbols | Included in build | Proprietary toolchains that emit compile_commands.json work too |
+
+The indexer auto-detects source directories (`src`, `lib`, `app`, `include`,
+`drivers`, `modules`, `zephyr`, `mbed-os`) from your project structure and
+`compile_commands.json` entries. Framework symbols your code actually
+`#include`s are indexed automatically — no manual configuration needed.
 
 ## What problem it solves
 
@@ -11,8 +44,9 @@ mature LSP servers, static analysis, and training data. Embedded firmware is
 different:
 
 - **Proprietary codebases** the model has never seen — no training data.
-- **Massive dependency trees** (Mbed OS alone is ~8000 C++ files) — too large
-  to read into context.
+- **Massive dependency trees** — Mbed OS ships ~8 000 C++ files, Zephyr workspace
+  contains 15 000+ source files across subsystems and drivers, and ESP-IDF
+  adds ~10 000 more. Too large to read into context.
 - **Build-time macros and `#ifdef`s** that change which code is actually compiled.
 - **Custom build systems** (`mbed compile`, `west build`, `pio run`) whose
   include paths, defines, and compiler flags are opaque until you run them.
@@ -98,7 +132,9 @@ automatically. No manual configuration needed.
 
 ```bash
 # 1. Clone and install
-git clone git@git.montyho.com:turbyho/fw-context-mcp.git ~/.fw-context/src
+git clone git@github.com:turbyho/fw-context-mcp.git ~/.fw-context/src
+# or from the primary server:
+# git clone git@git.montyho.com:turbyho/fw-context-mcp.git ~/.fw-context/src
 uv venv ~/.fw-context/.venv --python 3.12
 uv pip install --python ~/.fw-context/.venv/bin/python ~/.fw-context/src/
 echo 'export PATH="$HOME/.fw-context/.venv/bin:$PATH"' >> ~/.bashrc
@@ -133,7 +169,9 @@ echo 'compile_commands = ".fw-context/compile_commands.json"' >> .fw-context/con
 
 ```bash
 # Clone to ~/.fw-context/src (or any location you prefer)
-git clone https://git.montyho.com/turbyho/fw-context-mcp.git ~/.fw-context/src
+git clone git@github.com:turbyho/fw-context-mcp.git ~/.fw-context/src
+# or from the primary server:
+# git clone https://git.montyho.com/turbyho/fw-context-mcp.git ~/.fw-context/src
 
 # Create a dedicated virtual environment
 uv venv ~/.fw-context/.venv --python 3.12
