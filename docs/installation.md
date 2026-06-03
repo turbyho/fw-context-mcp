@@ -95,6 +95,9 @@ ollama pull qwen2.5-coder:14b
 # Smaller option (~4 GB VRAM)
 ollama pull qwen2.5-coder:7b
 
+# Semantic embedding model (~500 MB) — used for similarity search
+ollama pull mxbai-embed-large:latest
+
 # If you have no local GPU — use a cloud model (requires ollama signin)
 ollama signin
 ollama pull nemotron-3-nano:cloud   # free tier, 4B
@@ -116,10 +119,11 @@ Edit `~/.fw-context/config.toml` (global) or `.fw-context/config.toml` (project)
 
 ```toml
 [llm]
-enabled   = true
-model     = "qwen2.5-coder:14b"   # must match the pulled tag exactly
-ollama_url = "http://localhost:11434"
-num_ctx   = 8192                   # keep ≥ 8192 — factory default (2048) is too small
+enabled      = true
+model        = "qwen2.5-coder:14b"          # LLM for translation/search/explain
+embed_model  = "mxbai-embed-large:latest"   # embedding model for semantic search
+ollama_url   = "http://localhost:11434"
+num_ctx      = 8192   # keep ≥ 8192 — factory default (2048) is too small
 ```
 
 > **Remote Ollama:** If Ollama runs on another machine (e.g. a GPU server),
