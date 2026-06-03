@@ -31,6 +31,15 @@ from ..llm.ollama import OllamaError, OllamaModelNotFoundError, call_ollama_asyn
 
 log = logging.getLogger(__name__)
 
+# Kind weights for search scoring — module-level constant, not per-call allocation.
+# Prefer callable/declarative symbols over data storage (variables/fields).
+_KIND_WEIGHT: dict[str, int] = {
+    "function": 2, "method": 2, "constructor": 2, "destructor": 2,
+    "class": 2, "struct": 2, "enum": 2, "typedef": 2,
+    "enum_constant": 1, "namespace": 1,
+    "variable": 0, "field": 0,
+}
+
 mcp = FastMCP(
     "fw-context",
     instructions="Build-aware code intelligence index for embedded firmware (Mbed OS, Zephyr).",
@@ -968,11 +977,15 @@ async def smart_search(
         if keyword_queries:
             # Build two OR queries:
             # 1. Standard query across all columns (strong FTS5 ranking for exact matches)
-            # 2. name_tokens-only query to specifically surface camelCase symbols whose
-            #    components match query terms — e.g. "connection*" finds onConnectionComplete
-            #    via name_tokens="on connection complete" even when the name token itself
-            #    starts with "on" and ranks low in the full-column search.
+            # 2. name_tokens column-filter query to specifically surface camelCase symbols
+            #    whose components match query terms — e.g. "connection*" finds
+            #    onConnectionComplete via name_tokens="on connection complete" even when
+            #    the name token itself starts with "on" and ranks low in the full search.
             or_query = " OR ".join(keyword_queries)
+            # Column-filter expressions "name_tokens : term*" must NOT pass through
+            # _expand_query (which would corrupt the ": " as a bare token). They are
+            # already valid FTS5 syntax — search_symbols handles them correctly via
+            # the ':' guard in _expand_query's bypass check.
             nt_terms = [f"name_tokens : {kq}" for kq in keyword_queries]
             nt_query = " OR ".join(nt_terms)
             # Fetch a larger pool so camelCase symbols buried in FTS5 ranking get included.
@@ -986,21 +999,11 @@ async def smart_search(
                         if k not in seen_keys:
                             seen_keys.add(k)
                             rows.append(r)
-                except Exception:
-                    pass
+                except Exception as e:
+                    log.debug("smart_search FTS5 query failed (q=%r): %s", q[:60], e)
 
             if rows:
                 stems = [kq.rstrip("*").lower() for kq in keyword_queries]
-
-                # Kind weights: prefer callable/declarative over data/locals.
-                # Variables and fields found only via file_path are usually
-                # local variables — not what a developer is looking for.
-                _KIND_WEIGHT = {
-                    "function": 2, "method": 2, "constructor": 2, "destructor": 2,
-                    "class": 2, "struct": 2, "enum": 2, "typedef": 2,
-                    "enum_constant": 1, "namespace": 1,
-                    "variable": 0, "field": 0,
-                }
 
                 def _score(r) -> int:
                     name   = (r["name"]          or "").lower()

@@ -150,11 +150,16 @@ def open_db(path: Path) -> sqlite3.Connection:
     if "name_tokens" not in sym_cols:
         conn.execute("ALTER TABLE symbols ADD COLUMN name_tokens TEXT NOT NULL DEFAULT ''")
         conn.commit()
-        # Backfill using Python split_tokens (SQLite can't call Python functions)
-        rows = conn.execute("SELECT id, name, qualified_name FROM symbols WHERE name_tokens = ''").fetchall()
+        # Backfill using Python split_tokens (SQLite can't call Python functions).
+        # Use a generator to avoid materialising all rows in memory at once.
         conn.executemany(
             "UPDATE symbols SET name_tokens = ? WHERE id = ?",
-            [(split_tokens(r["name"], r["qualified_name"]), r["id"]) for r in rows],
+            (
+                (split_tokens(r["name"], r["qualified_name"]), r["id"])
+                for r in conn.execute(
+                    "SELECT id, name, qualified_name FROM symbols WHERE name_tokens = ''"
+                )
+            ),
         )
         conn.commit()
 
@@ -309,12 +314,14 @@ def get_active_config(conn: sqlite3.Connection, project_id: str) -> sqlite3.Row 
 def _expand_query(query: str) -> str:
     """Add trailing wildcard to each bare word for broader prefix matching.
 
-    Leaves existing wildcards (*) and FTS5 syntax (NEAR, ", parentheses) intact.
+    Leaves existing wildcards (*) and FTS5 syntax (NEAR, ", parentheses,
+    column filters with :) intact.
     """
     import re
 
-    # Tokens that already are FTS5 syntax — don't touch them
-    if any(c in query for c in ('"', 'NEAR', 'AND', 'OR', '(', ')')):
+    # Tokens that already are FTS5 syntax — don't touch them.
+    # ':' covers column-filter expressions like "name_tokens : term*".
+    if any(c in query for c in ('"', 'NEAR', 'AND', 'OR', '(', ')', ':')):
         return query
 
     parts = query.split()
@@ -337,13 +344,15 @@ def search_symbols(
 
     Bare words are expanded to trailing-wildcard prefix queries so that
     ``modem init`` matches ``modem_parser_oob_init``.
+    Note: file_path is read from the denormalized symbols.file_path column,
+    not re-joined from files — the JOIN was removed to avoid the redundant
+    round-trip and the shadowing hazard.
     """
     expanded = _expand_query(query)
     return conn.execute(
-        """SELECT s.*, f.path as file_path
+        """SELECT s.*
            FROM symbols_fts
            JOIN symbols s ON s.id = symbols_fts.rowid
-           JOIN files f ON f.id = s.file_id
            WHERE symbols_fts MATCH ? AND s.config_hash = ?
            ORDER BY rank
            LIMIT ?""",
