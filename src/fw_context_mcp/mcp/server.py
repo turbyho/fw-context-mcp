@@ -58,7 +58,6 @@ _KEYWORD_CACHE_MAX = 256
 # Keyed by config_hash — each build has its own symbol set.
 # Values: (descriptions: list[str], embeddings: list[list[float]], symbol_ids: list[int])
 _EMBEDDING_CACHE: dict[str, tuple[list[str], list[list[float]], list[int]]] = {}
-_EMBEDDING_CACHE_MAX_SYMBOLS = 5000
 
 
 def _build_symbol_description(r: dict) -> str:
@@ -147,9 +146,8 @@ def _ensure_embeddings(conn, config_hash: str, cfg_llm) -> tuple[list[str], list
                       THEN 0 ELSE 1 END,
                     CASE WHEN (s.file_path LIKE 'src/%' OR s.file_path LIKE 'lib/%')
                          AND s.file_path NOT LIKE '%mbed-os%'
-                      THEN 0 ELSE 1 END
-           LIMIT ?""",
-        (config_hash, _EMBEDDING_CACHE_MAX_SYMBOLS),
+                      THEN 0 ELSE 1 END""",
+        (config_hash,),
     ).fetchall()
 
     if not rows:
