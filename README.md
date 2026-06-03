@@ -162,6 +162,80 @@ If you already have the source elsewhere:
 uv pip install --python ~/.fw-context/.venv/bin/python /path/to/fw-context-mcp/
 ```
 
+## Installing Ollama (optional)
+
+Ollama powers `smart_search` (natural-language → FTS5 keywords, Czech/non-ASCII
+query translation) and `explain_symbol` (plain-English function explanations).
+It is **optional** — set `enabled = false` in `[llm]` config and the AI
+assistant processes results with its own LLM instead.
+
+### Install Ollama
+
+```bash
+# Linux / macOS
+curl -fsSL https://ollama.com/install.sh | sh
+
+# Or via package manager on Arch/Manjaro:
+# yay -S ollama
+# pacman -S ollama
+
+# Verify it runs
+ollama --version
+```
+
+Ollama starts a local daemon on `http://localhost:11434`. The daemon must be
+running whenever fw-context calls `smart_search` or `explain_symbol`.
+
+```bash
+# Start the daemon (if not started automatically as a service)
+ollama serve &
+```
+
+### Pull a model
+
+Pick one model based on available VRAM. The default config expects
+`qwen2.5-coder:14b` (proven in testing), but any code-oriented model works.
+
+```bash
+# Recommended: good balance of quality and speed (~9 GB VRAM)
+ollama pull qwen2.5-coder:14b
+
+# Smaller option (~4 GB VRAM)
+ollama pull qwen2.5-coder:7b
+
+# If you have no local GPU — use a cloud model (requires ollama signin)
+ollama signin
+ollama pull nemotron-3-nano:cloud   # free tier, 4B
+```
+
+### Verify the model works
+
+```bash
+# Quick smoke test — should return a short explanation
+ollama run qwen2.5-coder:14b "In one sentence: what does void uart_init(int baud) do?"
+
+# Or use fw-context's built-in check:
+fw-context status         # shows Ollama availability and configured model
+```
+
+### Configure fw-context to use the model
+
+Edit `~/.fw-context/config.toml` (global) or `.fw-context/config.toml` (project):
+
+```toml
+[llm]
+enabled   = true
+model     = "qwen2.5-coder:14b"   # must match the pulled tag exactly
+ollama_url = "http://localhost:11434"
+num_ctx   = 8192                   # keep ≥ 8192 — factory default (2048) is too small
+```
+
+> **Remote Ollama:** If Ollama runs on another machine (e.g. a GPU server),
+> set `ollama_url = "http://192.168.1.50:11434"`. Everything else stays the same.
+
+See [Choosing an Ollama model](#choosing-an-ollama-model) for a full comparison
+of local and cloud model options.
+
 ## Setting up AI assistant integration
 
 Run this once:
