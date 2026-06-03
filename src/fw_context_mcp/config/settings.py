@@ -73,6 +73,7 @@ class IndexConfig:
     source_roots: list[str] = field(default_factory=list)
     exclude_paths: list[str] = field(default_factory=lambda: ["build", "BUILD"])
     index_refs: bool = False
+    index_embeddings: bool = False
 
 
 @dataclass
@@ -125,6 +126,8 @@ def _from_dict(data: dict) -> Config:
             cfg.index.exclude_paths = excludes
         if "index_refs" in idx:
             cfg.index.index_refs = bool(idx["index_refs"])
+        if "index_embeddings" in idx:
+            cfg.index.index_embeddings = bool(idx["index_embeddings"])
 
     if llm := data.get("llm", {}):
         if "enabled" in llm:
