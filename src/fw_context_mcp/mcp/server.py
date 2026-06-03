@@ -1232,18 +1232,40 @@ async def smart_search(
     if not db_path.exists():
         return [{"error": f"No index found for {root}. Run 'fw-context index' first."}]
 
-    # --- Phase 0: translate non-ASCII (e.g. Czech) query to English ---
+    # --- Phase 0: detect and translate non-English query to English ---
+    # Always use the LLM — Czech without diacritics (e.g. "jak se
+    # inicializuje watchdog") passes isascii() but is not English.
+    # Simple "translate" prompt: English input passes through naturally,
+    # non-English gets translated.  We compare output to input to decide
+    # whether a translation actually happened.
     translated_from: str | None = None
-    if cfg.llm.enabled and not query.isascii():
+    if cfg.llm.enabled:
         translate_prompt = (
             "Translate the following text to English. "
-            "Output only the translated text, nothing else.\n\n"
+            "If the text is already in English, return it unchanged. "
+            "IMPORTANT: Your entire response must be ONLY the final "
+            "English text — no introductory words, no explanations, "
+            "no \"YES\", no \"The text is already\", nothing else.\n\n"
             f"{query}"
         )
         try:
             translated = await call_ollama_async(translate_prompt, cfg.llm)
+            # Strip common LLM conversational prefixes that leak through
+            # despite instructions (smaller models often do this).
+            for prefix in (
+                "YES\n\n", "YES\n", "YES. ", "YES ",
+                "The text is already in English.\n\n",
+                "The text is already in English.\n",
+                "The text is in English.\n\n",
+                "The text is in English.\n",
+                "Already in English.\n\n",
+                "Already in English.\n",
+            ):
+                if translated.startswith(prefix):
+                    translated = translated[len(prefix):]
+                    break
             translated = translated.strip()
-            if translated and translated.isascii():
+            if translated and translated != query:
                 translated_from = query
                 query = translated
         except Exception:
@@ -1302,11 +1324,16 @@ async def smart_search(
 
         # Phase 1a: phrase searches — combine first word with each other
         # word to find symbols matching multiple query terms (more relevant).
+        # Balanced: allocate slots proportionally across word pairs so a
+        # high-frequency word like "connection" doesn't crowd out equally
+        # relevant but less frequent terms from the same query.
         if len(content_words) >= 2:
-            for w in content_words[1:]:
+            pairs = content_words[1:]  # one pair per remaining word
+            per_pair_budget = max(3, min(5, 20 // len(pairs)))
+            for w in pairs:
                 phrase = f'"{content_words[0]} {w}"'
                 try:
-                    rows = search_symbols(conn, phrase, config_hash, limit=5)
+                    rows = search_symbols(conn, phrase, config_hash, limit=per_pair_budget)
                 except Exception:
                     continue
                 for r in rows:
@@ -1319,10 +1346,15 @@ async def smart_search(
                     break
 
         # Phase 1b: individual word searches to fill remaining slots.
-        if len(rough_samples) < 20:
+        # Balanced: each word gets an equal share of remaining slots,
+        # preventing a single high-frequency word (e.g. "connection")
+        # from dominating the rough sample set.
+        remaining = 20 - len(rough_samples)
+        if remaining > 0 and rough_terms:
+            per_word_budget = max(2, min(8, remaining // len(rough_terms)))
             for word in rough_terms:
                 try:
-                    rows = search_symbols(conn, word, config_hash, limit=8)
+                    rows = search_symbols(conn, word, config_hash, limit=per_word_budget)
                 except Exception:
                     continue
                 for r in rows:
@@ -1340,7 +1372,8 @@ async def smart_search(
 
         if rough_samples:
             context_lines = [
-                f"  {r['name']} ({r['kind']})" for r in rough_samples[:15]
+                f"  {r['name']} ({r['kind']}) — {r['file_path']}"
+                for r in rough_samples[:15]
             ]
             context_str = "\n".join(context_lines)
 
@@ -1356,6 +1389,30 @@ async def smart_search(
                 "- For \"connect\" → generate \"connection*\" (prefix of \"ConnectionComplete\")\n"
                 "- For \"init\" → generate \"init*\" (prefix of \"Init\", \"Initialize\")\n"
                 "- Generate BOTH snake_case AND camelCase prefix variants\n\n"
+                "FIRST: Identify which subsystem/domain the description is about\n"
+                "(modem, BLE, storage, sensors, WiFi, display, keyboard, general, etc.).\n"
+                "The rough samples below include file paths. Use them to distinguish\n"
+                "between symbols from different subsystems:\n"
+                "- Symbols under src/ or lib/modem/ are modem firmware code\n"
+                "- Symbols under mbed-os/connectivity/FEATURE_BLE/ are BLE stack code\n"
+                "- Symbols under lib/ble/ are project-specific BLE code\n"
+                "- Symbols under mbed-os/connectivity/cellular/ are cellular/modem driver code\n"
+                "- Symbols under src/ble_*.cpp or src/zble*.cpp are project BLE code\n"
+                "- Symbols under src/zmodem*.cpp or src/modem_*.cpp are project modem code\n"
+                "Focus your generated queries on the subsystem that matches the\n"
+                "description. Ignore rough samples from unrelated subsystems —\n"
+                "they share keywords but belong to different domains.\n\n"
+                "DISAMBIGUATION — some English words map to different concepts in C/C++:\n"
+                "- 'register' in modem/networking queries → 'network registration',\n"
+                "  'data registration', NOT hardware register (read_register, etc.)\n"
+                "- 'connect' in modem queries → 'network attach', 'registration',\n"
+                "  'network init', NOT 'onConnection' or 'connection parameters'\n"
+                "- 'connect' in BLE queries → 'connection', 'onConnection', 'gap connect'\n"
+                "Use the file paths in rough samples to pick the correct meaning.\n\n"
+                f"KEY CONCEPTS from description: {', '.join(content_words)}\n"
+                "For EACH concept above, make sure at least one generated query\n"
+                "covers it. Do NOT drop concepts — if the description mentions\n"
+                "'watchdog', one query MUST contain 'watchdog'.\n\n"
                 f"Real symbols from this project:\n{context_str}\n\n"
                 "Return a JSON array of strings, e.g.: [\"ble_conn*\", \"connection*\", \"on_connect*\"]\n"
                 "Rules:\n"
@@ -1364,9 +1421,7 @@ async def smart_search(
                 "- STRONGLY prefer short stems with a trailing wildcard over exact full names\n"
                 "- You may use a trailing wildcard: \"ble_gap*\" matches ble_gap_init, etc.\n"
                 "- No asterisks anywhere else — FTS5 only supports trailing wildcards\n"
-                "- Cover different naming patterns found in the context — e.g. if\n"
-                "  the project has \"ble_*\", \"on_*\", and \"connection_*\" prefixes,\n"
-                "  generate one stem per pattern\n"
+                "- Cover different naming patterns found in the target subsystem\n"
                 "- For each concept in the description, generate the MOST LIKELY prefix\n"
                 "  that matches real symbol beginnings (not substrings!)\n\n"
                 f"Description: {query}\n"
@@ -1428,14 +1483,18 @@ async def smart_search(
             # Fetch a larger pool so camelCase symbols buried in FTS5 ranking get included.
             fetch_limit = max(limit * 6, 120)
             rows = []
-            seen_keys: set[tuple] = set()
+            seen_keys: dict[tuple, int] = {}  # (name, file_path) -> index in rows
             for q in (or_query, nt_query):
                 try:
                     for r in search_symbols(conn, q, config_hash, limit=fetch_limit):
-                        k = (r["name"], r["file_path"], r["line"])
-                        if k not in seen_keys:
-                            seen_keys.add(k)
+                        k = (r["name"], r["file_path"])
+                        prev_idx = seen_keys.get(k)
+                        if prev_idx is None:
+                            seen_keys[k] = len(rows)
                             rows.append(r)
+                        elif r["is_definition"] and not rows[prev_idx]["is_definition"]:
+                            # Replace declaration with definition
+                            rows[prev_idx] = r
                 except Exception as e:
                     log.debug("smart_search FTS5 query failed (q=%r): %s", q[:60], e)
 
@@ -1483,8 +1542,12 @@ async def smart_search(
                         continue
                     if len(name) <= 2 and r["kind"] in ("variable", "field"):
                         continue
-                    key = (name, r["file_path"], r["line"])
-                    if key not in seen:
+                    key = (name, r["file_path"])
+                    prev = seen.get(key)
+                    if prev is None:
+                        seen[key] = _fmt(r)
+                    elif r["is_definition"] and not prev["is_definition"]:
+                        # Replace declaration with definition
                         seen[key] = _fmt(r)
             elif not seen:
                 # Fallback: try individual queries if OR found nothing
@@ -1494,8 +1557,11 @@ async def smart_search(
                     except Exception:
                         continue
                     for r in rows:
-                        key = (r["name"], r["file_path"], r["line"])
-                        if key not in seen:
+                        key = (r["name"], r["file_path"])
+                        prev = seen.get(key)
+                        if prev is None:
+                            seen[key] = _fmt(r)
+                        elif r["is_definition"] and not prev["is_definition"]:
                             seen[key] = _fmt(r)
 
     results: list[dict] = []
