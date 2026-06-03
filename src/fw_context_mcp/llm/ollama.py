@@ -71,6 +71,40 @@ def call_ollama(prompt: str, cfg: LLMConfig) -> str:
         raise OllamaError(str(e)) from e
 
 
+def call_ollama_embed(inputs: list[str], cfg: LLMConfig) -> list[list[float]]:
+    """Generate embeddings for a batch of texts via Ollama.
+
+    Uses the configured embedding model (e.g. mxbai-embed-large).  Batching
+    is handled by Ollama — send all texts in one request.
+
+    Raises OllamaError on network or API failure.
+    """
+    url = cfg.ollama_url.rstrip("/") + "/api/embed"
+    payload = {
+        "model": cfg.embed_model,
+        "input": inputs,
+    }
+    try:
+        resp = httpx.post(url, json=payload, timeout=_TIMEOUT * 2)
+        resp.raise_for_status()
+        return resp.json()["embeddings"]
+    except httpx.ConnectError as e:
+        raise OllamaError(
+            f"Cannot connect to Ollama at {cfg.ollama_url}. "
+            "Make sure Ollama is running: https://ollama.com"
+        ) from e
+    except httpx.TimeoutException:
+        raise OllamaError(f"Ollama embed request timed out") from None
+    except httpx.HTTPStatusError as e:
+        if e.response.status_code == 404:
+            raise OllamaModelNotFoundError(cfg.embed_model, cfg.ollama_url) from e
+        raise OllamaError(f"Ollama HTTP {e.response.status_code}: {e.response.text[:200]}") from e
+    except OllamaError:
+        raise
+    except Exception as e:
+        raise OllamaError(str(e)) from e
+
+
 async def call_ollama_async(prompt: str, cfg: LLMConfig) -> str:
     """Async wrapper for call_ollama — offloads blocking httpx to a thread.
 
