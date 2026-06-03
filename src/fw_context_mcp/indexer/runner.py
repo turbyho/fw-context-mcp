@@ -80,6 +80,88 @@ def _detect_source_roots(project_root: Path, compile_commands: Path) -> list[Pat
     return roots
 
 
+def _build_embeddings(conn, config_hash: str, llm_config) -> None:
+    """Generate and store embeddings for all definition symbols in a build."""
+    import httpx
+
+    from ..llm.ollama import call_ollama_embed, OllamaError
+    from .db import _vec_to_blob, upsert_embeddings
+
+    # Quick check — skip entire phase if Ollama is unreachable.
+    try:
+        resp = httpx.get(llm_config.ollama_url.rstrip("/") + "/api/tags", timeout=5.0)
+        resp.raise_for_status()
+    except Exception:
+        log.warning("Ollama not reachable — skipping embedding generation")
+        return
+
+    rows = conn.execute(
+        """SELECT s.id, s.name, s.qualified_name, s.kind, s.file_path,
+                  s.signature, s.is_definition, s.docstring
+           FROM symbols s
+           WHERE s.config_hash = ?
+             AND s.is_definition = 1
+             AND s.kind IN ('function', 'method', 'constructor', 'destructor',
+                            'class', 'struct')
+           ORDER BY CASE WHEN s.docstring IS NOT NULL AND LENGTH(s.docstring) > 30
+                      THEN 0 ELSE 1 END
+           LIMIT 5000""",
+        (config_hash,),
+    ).fetchall()
+
+    if not rows:
+        return
+
+    # Release the read lock before the (potentially slow) Ollama calls.
+    conn.commit()
+
+    # Build descriptions using the same format as _build_symbol_description
+    # in server.py — keep them in sync.
+    descriptions = []
+    for r in rows:
+        fp = (r["file_path"] or "").replace("\\", "/")
+        path = ""
+        file_ = ""
+        if "/" in fp:
+            *dirs, file_ = fp.split("/")
+            path = "/".join(dirs[-2:])
+        elif fp:
+            file_ = fp
+        qname = r["qualified_name"] or ""
+        name = r["name"] or ""
+        class_ = "::".join(qname.split("::")[:-1]) if "::" in qname else ""
+        sig = r["signature"] or ""
+        doc = (r["docstring"] or "").strip()
+        if doc and len(doc) > 20:
+            doc = doc[:150]
+        parts = [path, file_, class_, name, sig]
+        if doc:
+            parts.append(doc)
+        descriptions.append(" : ".join(p for p in parts if p))
+
+    model = llm_config.embed_model
+    total = 0
+    chunk_size = 100
+
+    for i in range(0, len(rows), chunk_size):
+        chunk_rows = rows[i:i + chunk_size]
+        chunk_descs = descriptions[i:i + chunk_size]
+        try:
+            embs = call_ollama_embed(chunk_descs, llm_config)
+        except Exception as e:
+            log.warning("Embedding batch %d failed: %s", i // chunk_size, e)
+            continue
+
+        batch = []
+        for r, emb in zip(chunk_rows, embs):
+            blob = _vec_to_blob(emb)
+            batch.append((r["id"], blob, model))
+        upsert_embeddings(conn, batch)
+        total += len(batch)
+
+    log.info("Embeddings stored: %d symbols (model=%s)", total, model)
+
+
 def run(
     compile_commands: Path,
     db_path: Path,
@@ -87,8 +169,10 @@ def run(
     exclude_paths: list[Path] | None = None,
     project_name: str | None = None,
     index_refs: bool = False,
+    index_embeddings: bool = False,
     project_root: Path | None = None,
     project_id: str | None = None,
+    llm_config = None,
 ) -> str:
     """Index a project. Returns config_hash of the indexed build.
 
@@ -238,9 +322,20 @@ def run(
                 i + 1, len(units), total_syms, total_refs, elapsed,
             )
 
+    # --- Embedding generation (opt-in) ---
+    if index_embeddings and llm_config is not None and llm_config.enabled:
+        log.info("Generating embeddings for %d symbols...", total_syms)
+        _build_embeddings(conn, config_hash, llm_config)
+        conn.commit()
+
     elapsed = time.monotonic() - t0
-    # Single WAL truncate after all per-TU commits (each used checkpoint=False).
-    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    # Single WAL checkpoint after all per-TU commits.
+    # Use PASSIVE — TRUNCATE requires an exclusive lock which may conflict
+    # with embedding writes that just completed.
+    try:
+        conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
+    except Exception:
+        pass
     log.info(
         "Done: %d updated, %d unchanged, %d skipped — %d symbols, %d refs in %.1fs (config_hash=%s)",
         updated, unchanged, skipped, total_syms, total_refs, elapsed, config_hash[:12],

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 import sqlite3
+import struct
 from collections.abc import Generator
 from contextlib import contextmanager
 from pathlib import Path
@@ -150,6 +151,17 @@ CREATE TABLE IF NOT EXISTS refs (
 CREATE INDEX IF NOT EXISTS idx_refs_to_usr   ON refs(config_hash, to_usr);
 CREATE INDEX IF NOT EXISTS idx_refs_from_usr ON refs(config_hash, from_usr);
 CREATE INDEX IF NOT EXISTS idx_refs_fromfile ON refs(config_hash, from_file);
+
+-- Symbol embeddings for semantic search (opt-in via [index] index_embeddings = true).
+-- Stored as BLOB: 1024 float32 values packed with struct.pack('f', ...).
+-- ON DELETE CASCADE: when a symbol row is deleted, its embedding is removed.
+CREATE TABLE IF NOT EXISTS embeddings (
+    symbol_id    INTEGER PRIMARY KEY REFERENCES symbols(id) ON DELETE CASCADE,
+    embedding    BLOB   NOT NULL,
+    model        TEXT   NOT NULL,
+    updated_at   TEXT   NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_embeddings_symbol ON embeddings(symbol_id);
 """
 
 
@@ -391,6 +403,57 @@ def delete_refs_for_file(conn: sqlite3.Connection, config_hash: str, from_file: 
         "DELETE FROM refs WHERE config_hash=? AND from_file=?",
         (config_hash, from_file),
     )
+
+
+# ---------------------------------------------------------------------------
+# Embedding helpers — pack/unpack float vectors as BLOBs for the embeddings
+# table.  1024 float32 values = 4096 bytes per embedding with mxbai-embed-large.
+# ---------------------------------------------------------------------------
+
+_EMBEDDING_DIM = 1024
+
+
+def _vec_to_blob(vec: list[float]) -> bytes:
+    """Pack a float vector into a BLOB for storage."""
+    return struct.pack(f"f" * len(vec), *vec)
+
+
+def _blob_to_vec(blob: bytes) -> list[float]:
+    """Unpack a BLOB back into a float vector."""
+    return list(struct.unpack(f"f" * (len(blob) // 4), blob))
+
+
+def upsert_embeddings(
+    conn: sqlite3.Connection,
+    rows: list[tuple[int, bytes, str]],
+) -> int:
+    """Insert or replace embedding rows.
+
+    Each row is (symbol_id, embedding_blob, model).
+    Returns number of rows inserted.
+    """
+    cur = conn.executemany(
+        """INSERT OR REPLACE INTO embeddings(symbol_id, embedding, model, updated_at)
+           VALUES (?, ?, ?, datetime('now'))""",
+        rows,
+    )
+    return cur.rowcount
+
+
+def get_embeddings(
+    conn: sqlite3.Connection,
+    config_hash: str,
+    model: str,
+) -> dict[int, list[float]]:
+    """Return {symbol_id: embedding_vector} for a build config and model."""
+    rows = conn.execute(
+        """SELECT e.symbol_id, e.embedding
+           FROM embeddings e
+           JOIN symbols s ON s.id = e.symbol_id
+           WHERE s.config_hash = ? AND e.model = ?""",
+        (config_hash, model),
+    ).fetchall()
+    return {r["symbol_id"]: _blob_to_vec(r["embedding"]) for r in rows}
 
 
 def find_refs(

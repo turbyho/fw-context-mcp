@@ -89,36 +89,52 @@ def _build_symbol_description(r: dict) -> str:
 
     sig = (r.get("signature") or "")
 
-    # Append docstring if available (truncated)
+    # Append docstring if available (short — hierarchy matters more)
     doc = (r.get("docstring") or "").strip()
     if doc and len(doc) > 20:
-        doc = doc[:300]
+        doc = doc[:150]
 
     parts = [path, file_, class_, name, sig]
     if doc:
         parts.append(doc)
-    return " ".join(p for p in parts if p)
+    return " : ".join(p for p in parts if p)
 
 
 def _ensure_embeddings(conn, config_hash: str, cfg_llm) -> tuple[list[str], list[list[float]], list[int]]:
-    """Load and embed top symbols from the DB, caching in memory.
+    """Load embeddings from DB (fast), or generate + store if not indexed.
 
-    Only project-local functions/methods (src/, lib/ outside mbed-os) are
-    embedded — they carry the most domain signal.  Framework symbols are
-    too generic to help with disambiguation.
+    After ``fw-context index --index-embeddings``, embeddings are stored
+    in the ``embeddings`` table and loaded directly — no Ollama call needed.
     """
     global _EMBEDDING_CACHE
     if config_hash in _EMBEDDING_CACHE:
         return _EMBEDDING_CACHE[config_hash]
 
+    from ..indexer.db import get_embeddings, _vec_to_blob, upsert_embeddings
     from ..llm.ollama import call_ollama_embed
 
-    log.info("Building embedding index for config %s...", config_hash[:12])
+    # 1. Try loading pre-computed embeddings from DB
+    stored = get_embeddings(conn, config_hash, cfg_llm.embed_model)
+    if stored:
+        # Fetch symbol metadata for the cached rows
+        placeholders = ",".join("?" * len(stored))
+        rows = conn.execute(
+            f"""SELECT id, name, qualified_name, kind, file_path,
+                       signature, is_definition, docstring
+                FROM symbols
+                WHERE id IN ({placeholders})
+                ORDER BY id""",
+            list(stored.keys()),
+        ).fetchall()
+        descriptions = [_build_symbol_description(r) for r in rows]
+        symbol_ids = [r["id"] for r in rows]
+        embeddings = [stored[sid] for sid in symbol_ids]
+        _EMBEDDING_CACHE[config_hash] = (descriptions, embeddings, symbol_ids)
+        log.info("Loaded %d embeddings from DB", len(embeddings))
+        return _EMBEDDING_CACHE[config_hash]
 
-    # Fetch symbols for embedding: docstring-rich symbols first (best
-    # semantic signal), then project-local definitions as fallback.
-    # Include mbed-os symbols — they have the most comprehensive docstrings
-    # and help with generic queries like "permanent memory" → FlashIAPBlockDevice.
+    # 2. Fallback: generate embeddings on the fly and store for next time
+    log.info("Building embedding index for config %s...", config_hash[:12])
     rows = conn.execute(
         """SELECT s.id, s.name, s.qualified_name, s.kind, s.file_path,
                   s.signature, s.is_definition, s.docstring
@@ -143,17 +159,20 @@ def _ensure_embeddings(conn, config_hash: str, cfg_llm) -> tuple[list[str], list
     descriptions = [_build_symbol_description(r) for r in rows]
     symbol_ids = [r["id"] for r in rows]
 
-    # Batch-embed in chunks of 100 (Ollama embed API limit)
     all_embeddings: list[list[float]] = []
     chunk_size = 100
     for i in range(0, len(descriptions), chunk_size):
         chunk = descriptions[i:i + chunk_size]
+        chunk_rows = rows[i:i + chunk_size]
         try:
             embeddings = call_ollama_embed(chunk, cfg_llm)
             all_embeddings.extend(embeddings)
+            # Store to DB for next time
+            batch = [(r["id"], _vec_to_blob(emb), cfg_llm.embed_model)
+                     for r, emb in zip(chunk_rows, embeddings)]
+            upsert_embeddings(conn, batch)
         except Exception as e:
             log.warning("Embedding batch %d failed: %s", i // chunk_size, e)
-            # Pad with zero vectors for failed chunks
             all_embeddings.extend([[0.0] * 1024] * len(chunk))
 
     _EMBEDDING_CACHE[config_hash] = (descriptions, all_embeddings, symbol_ids)
