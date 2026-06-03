@@ -1596,7 +1596,11 @@ async def smart_search(
         def _search_queries(queries: list[str], fetch_limit: int) -> list[dict]:
             if not queries:
                 return []
-            or_query = " OR ".join(queries)
+            # Exclude docstring from FTS5 search — massive mbed-os docstrings
+            # (ble::Gap has 5000+ chars) cause false positives for unrelated
+            # queries by matching generic keywords like "update", "management".
+            _FTS_COLS = "{name qualified_name signature file_path name_tokens}"
+            or_query = _FTS_COLS + " : (" + " OR ".join(queries) + ")"
             nt_terms = [f"name_tokens : {kq}" for kq in queries]
             nt_query = " OR ".join(nt_terms)
             rows: list[dict] = []
@@ -1712,8 +1716,6 @@ async def smart_search(
 
                 if fpath and ("src/" in fpath or "lib/" in fpath) and "mbed-os" not in fpath:
                     s += 1
-                elif fpath and "mbed-os" in fpath:
-                    s -= 5  # framework code is less relevant than project code
 
                 s += _KIND_WEIGHT.get(r["kind"] or "", 0)
                 return s
