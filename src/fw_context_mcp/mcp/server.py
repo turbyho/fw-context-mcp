@@ -44,6 +44,12 @@ _KIND_WEIGHT: dict[str, int] = {
     "variable": 0, "field": 0,
 }
 
+# In-memory cache of Ollama-generated keyword terms, keyed by (query, config_hash).
+# The MCP server is long-lived, so this avoids re-calling Ollama (10-30 s) for
+# repeated/similar queries within a session. Bounded; cleared wholesale when full.
+_KEYWORD_CACHE: dict[tuple, list[str]] = {}
+_KEYWORD_CACHE_MAX = 256
+
 mcp = FastMCP(
     "fw-context",
     instructions="Build-aware code intelligence index for embedded firmware (Mbed OS, Zephyr).",
@@ -183,6 +189,33 @@ def _stale_files(conn, config_hash: str, file_paths: list[str]) -> list[str]:
     return stale
 
 
+def _count_modified_files(conn, config_hash: str, root: Path) -> int:
+    """Count indexed files whose on-disk mtime is newer than the stored mtime.
+
+    More representative of "should I reindex?" than the compile_commands.json
+    timestamp alone — source files change far more often. Relative file paths
+    are resolved against the project root before stat.
+    """
+    modified = 0
+    rows = conn.execute(
+        "SELECT path, mtime FROM files WHERE config_hash=?", (config_hash,)
+    ).fetchall()
+    for r in rows:
+        path = r["path"]
+        stored = r["mtime"]
+        if not stored:
+            continue
+        p = Path(path)
+        if not p.is_absolute():
+            p = (root / path).resolve()
+        try:
+            if p.stat().st_mtime > stored + 1:
+                modified += 1
+        except OSError:
+            pass
+    return modified
+
+
 def _detect_build_system(root: Path) -> str:
     if (root / "mbed-os").is_dir() or (root / "mbed_app.json").exists():
         return "mbed-os"
@@ -238,6 +271,8 @@ def get_active_build(project_root: str | None = None) -> dict:
         file_count = conn.execute(
             "SELECT COUNT(*) FROM files WHERE config_hash=?", (config_hash,)
         ).fetchone()[0]
+        ref_count = count_refs(conn, config_hash)
+        modified_count = _count_modified_files(conn, config_hash, root)
 
         return {
             "config_hash": config_hash,
@@ -248,7 +283,9 @@ def get_active_build(project_root: str | None = None) -> dict:
             "indexed_at": cfg["created_at"],
             "symbol_count": sym_count,
             "file_count": file_count,
-            "stale": _is_stale(cfg, cfg["compile_commands_path"]),
+            "reference_count": ref_count,
+            "modified_files_count": modified_count,
+            "stale": _is_stale(cfg, cfg["compile_commands_path"]) or modified_count > 0,
         }
 
 
@@ -1178,16 +1215,23 @@ async def smart_search(
             )
 
         if cfg.llm.enabled:
-            try:
-                raw = await call_ollama_async(prompt, cfg.llm)
-                keyword_queries = _parse_search_terms(raw)
-                keyword_queries = keyword_queries[:5]
-            except OllamaModelNotFoundError as e:
-                ollama_warning = {"warning": str(e), "hint": "Run: check_ollama()"}
-                keyword_queries = rough_terms
-            except OllamaError as e:
-                ollama_warning = {"warning": f"Ollama unavailable: {e}"}
-                keyword_queries = rough_terms
+            cache_key = (query, config_hash)
+            cached = _KEYWORD_CACHE.get(cache_key)
+            if cached is not None:
+                keyword_queries = cached
+            else:
+                try:
+                    raw = await call_ollama_async(prompt, cfg.llm)
+                    keyword_queries = _parse_search_terms(raw)[:5]
+                    if len(_KEYWORD_CACHE) >= _KEYWORD_CACHE_MAX:
+                        _KEYWORD_CACHE.clear()
+                    _KEYWORD_CACHE[cache_key] = keyword_queries
+                except OllamaModelNotFoundError as e:
+                    ollama_warning = {"warning": str(e), "hint": "Run: check_ollama()"}
+                    keyword_queries = rough_terms
+                except OllamaError as e:
+                    ollama_warning = {"warning": f"Ollama unavailable: {e}"}
+                    keyword_queries = rough_terms
         else:
             keyword_queries = rough_terms
 
