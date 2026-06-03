@@ -88,10 +88,16 @@ def _build_symbol_description(r: dict) -> str:
 
     sig = (r.get("signature") or "")
 
-    # Append docstring if available (short — hierarchy matters more)
-    doc = (r.get("docstring") or "").strip()
-    if doc and len(doc) > 20:
-        doc = doc[:150]
+    # Append docstring if available — but skip mbed-os docstrings entirely.
+    # They are massive (ble::Gap has 5000+ chars) and add keyword noise
+    # that drowns out the hierarchical signal for unrelated queries.
+    fp_lower = fp.lower()
+    is_os = "mbed-os" in fp_lower
+    doc = ""
+    if not is_os:
+        doc = (r.get("docstring") or "").strip()
+        if doc and len(doc) > 20:
+            doc = doc[:150]
 
     parts = [path, file_, class_, name, sig]
     if doc:
