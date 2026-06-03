@@ -70,3 +70,24 @@ class TestReadSymbolBody:
         path = self._write(tmp_path, "int x;\n")
         assert _read_symbol_body(path, 999) == ""
 
+    def test_end_line_exact_range_preferred(self, tmp_path):
+        # end_line from libclang extent → exact range, ignores brace heuristic
+        src = "a\nb\nc\nd\ne\nf\n"
+        path = self._write(tmp_path, src)
+        body = _read_symbol_body(path, 2, end_line=4)
+        # lines 2..4 = b, c, d
+        assert "b" in body and "c" in body and "d" in body
+        assert "a" not in body and "e" not in body
+
+    def test_end_line_clamped_to_file(self, tmp_path):
+        path = self._write(tmp_path, "x\ny\n")
+        body = _read_symbol_body(path, 1, end_line=999)
+        assert "x" in body and "y" in body
+
+    def test_end_line_zero_falls_back_to_braces(self, tmp_path):
+        src = "void f()\n{\n  g();\n}\nint after;\n"
+        path = self._write(tmp_path, src)
+        body = _read_symbol_body(path, 1, end_line=0)
+        assert "void f()" in body and "g();" in body
+        assert "int after" not in body
+

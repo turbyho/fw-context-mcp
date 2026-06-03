@@ -136,14 +136,16 @@ def _lookup_definition(conn, config_hash: str, name: str):
     return row
 
 
-def _read_symbol_body(file_path: str, line_no: int, max_lines: int = 400) -> str:
-    """Read a symbol's source from its definition line, balancing braces.
+def _read_symbol_body(file_path: str, line_no: int, end_line: int = 0, max_lines: int = 400) -> str:
+    """Read a symbol's source as numbered lines.
 
-    Scans forward from the definition line counting { and } until the body is
-    balanced, returning numbered source lines for the full definition. Falls
-    back to a small window when there is no brace body (declaration, field,
-    enum constant). Brace counting is best-effort — braces inside string/char
-    literals or comments may skew the end on pathological inputs.
+    Preferred path: when ``end_line`` is known (libclang AST extent stored at
+    index time), read the exact ``line_no..end_line`` range — correct for
+    multi-line signatures, braces in strings/comments, macros and templates.
+
+    Fallback (end_line == 0, e.g. an index built before the column existed):
+    brace-balance forward from the definition line, or a small window when the
+    symbol has no brace body. Brace counting is best-effort.
     """
     try:
         lines = Path(file_path).read_text(errors="replace").splitlines()
@@ -153,6 +155,12 @@ def _read_symbol_body(file_path: str, line_no: int, max_lines: int = 400) -> str
     if start < 0 or start >= len(lines):
         return ""
 
+    # Preferred: exact extent from libclang.
+    if end_line and end_line >= line_no:
+        end = min(len(lines) - 1, end_line - 1)
+        return "\n".join(f"{i + 1:4d}  {lines[i]}" for i in range(start, end + 1))
+
+    # Fallback: brace matching.
     depth = 0
     seen_open = False
     end = start
@@ -665,7 +673,7 @@ def reindex_file(
                         config_hash, file_id_cache[sym_file], rel_path,
                         split_tokens(s.name, s.qualified_name),
                         s.usr, s.name, s.qualified_name, s.kind, s.line, s.column,
-                        int(s.is_definition), s.signature, s.docstring,
+                        s.end_line, int(s.is_definition), s.signature, s.docstring,
                     ))
 
                 if rows:
@@ -894,7 +902,7 @@ def get_source(name: str, project_root: str | None = None) -> dict:
             "is_definition": bool(row["is_definition"]),
         }
 
-    source = _read_symbol_body(file_path, row["line"])
+    source = _read_symbol_body(file_path, row["line"], end_line=row["end_line"] or 0)
     if not source:
         result["warning"] = f"Could not read source from {file_path}"
     else:
