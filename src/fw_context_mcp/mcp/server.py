@@ -1772,7 +1772,7 @@ async def smart_search(
                     scored.sort(key=lambda x: -x[0])
                     # Take top 30, fetch symbol rows
                     top_sims = scored[:30]
-                    top_ids = [s[1] for s in top_sims if s[0] > 0.5]
+                    top_ids = [s[1] for s in top_sims if s[0] > 0.55]
                     if top_ids:
                         placeholders = ",".join("?" * len(top_ids))
                         emb_rows = conn.execute(
