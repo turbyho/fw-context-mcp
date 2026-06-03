@@ -1712,8 +1712,6 @@ async def smart_search(
 
                 if fpath and ("src/" in fpath or "lib/" in fpath) and "mbed-os" not in fpath:
                     s += 1
-                elif fpath and "mbed-os" in fpath:
-                    s -= 5
 
                 s += _KIND_WEIGHT.get(r["kind"] or "", 0)
                 return s
