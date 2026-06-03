@@ -5,6 +5,7 @@ import sqlite3
 import pytest
 
 from fw_context_mcp.indexer.db import (
+    DatabaseCorruptionError,
     count_refs,
     delete_refs_for_file,
     delete_symbols_for_file,
@@ -422,3 +423,40 @@ class TestRefs:
         self._setup_symbols(populated_db)
         rows = find_refs(populated_db, "hash-deadbeef", "nonexistent")
         assert rows == []
+
+
+class TestIntegrityCheck:
+    """Verify that open_db() detects database corruption."""
+
+    def test_integrity_ok(self, tmpdir):
+        """A freshly created database passes integrity check."""
+        db_path = tmpdir / "ok.db"
+        conn = open_db(db_path)
+        conn.close()
+        # Re-opening should still pass
+        conn2 = open_db(db_path)
+        conn2.close()
+
+    def test_corrupt_db_raises_database_corruption_error(self, tmpdir):
+        """A file that is not a valid SQLite database raises DatabaseCorruptionError."""
+        db_path = tmpdir / "not_a_db.db"
+        db_path.write_text("this is not a sqlite database", encoding="utf-8")
+        with pytest.raises(DatabaseCorruptionError):
+            open_db(db_path)
+
+    def test_corrupt_db_includes_path_in_message(self, tmpdir):
+        """The exception message includes the database path."""
+        db_path = tmpdir / "garbage.db"
+        db_path.write_text("garbage", encoding="utf-8")
+        with pytest.raises(DatabaseCorruptionError) as exc_info:
+            open_db(db_path)
+        assert str(db_path) in str(exc_info.value)
+
+    def test_corrupt_db_has_action_hint(self, tmpdir):
+        """The exception carries db_path and details attributes."""
+        db_path = tmpdir / "broken.db"
+        db_path.write_text("broken", encoding="utf-8")
+        with pytest.raises(DatabaseCorruptionError) as exc_info:
+            open_db(db_path)
+        assert exc_info.value.db_path == str(db_path)
+        assert exc_info.value.details  # non-empty
