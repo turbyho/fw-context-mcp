@@ -314,7 +314,12 @@ def get_active_build(project_root: str | None = None) -> dict:
         - indexed_at (str): ISO-8601 timestamp of when the index was built
         - symbol_count (int): total symbols in the index
         - file_count (int): total files indexed
-        - stale (bool): True when compile_commands.json is newer than the index
+        - reference_count (int, optional): total cross-references indexed (only
+          present when refs are indexed)
+        - modified_files_count (int): number of indexed files whose on-disk
+          content has changed since the last index
+        - stale (bool): True when compile_commands.json or any indexed source
+          file has changed since the last index
     """
     root = _resolve_project_root(project_root)
     db_path = _db_path(root)
@@ -385,8 +390,10 @@ def search_code(
 
     Returns:
         list of dicts, each with: name, qualified_name, kind, file, line,
-        is_definition, signature, docstring. May include a ``warning`` entry
-        when the index is stale or individual files were modified.
+        is_definition, signature, docstring. Stale files found in results
+        are auto-reindexed (up to 5 files, 30 s timeout) and the query is
+        re-run. May include a ``warning`` entry when auto-reindex fails or
+        the compile_commands.json itself is stale.
 
     Example:
         ``search_code("modem init", kind="method", limit=5)``
@@ -479,7 +486,9 @@ def lookup_symbol(
     Returns:
         list of dicts with: name, qualified_name, kind, file, line,
         is_definition, signature, docstring. Definitions are sorted first.
-        May include a ``warning`` when the index is stale.
+        Stale files are auto-reindexed (up to 5 files, 30 s timeout) and
+        the lookup is re-run. May include a ``warning`` when auto-reindex
+        fails or the compile_commands.json itself is stale.
 
     Example:
         ``lookup_symbol("BoxManager", exact=True)`` → constructor + class
@@ -634,6 +643,7 @@ def reset_index(project_root: str | None = None, confirm: bool = False) -> dict:
     Returns:
         dict with: project_root, db (path), project_id, symbol_count,
         indexed_at, action ("dry_run" or "deleted"), message.
+        May include ``warning`` (str) when the database is corrupt.
     """
     root = _resolve_project_root(project_root)
     db_path = _db_path(root)
@@ -892,12 +902,11 @@ async def explain_symbol(
     model is available.
 
     Args:
-        name: Symbol name (exact match on short name, e.g. ``ModemMsgManager``).
-              Qualified names (``ns::Foo``) are NOT supported — use the
-              unqualified short name as it appears in the index.
+        name: Symbol name (exact match on short name, e.g. ``ModemMsgManager``,
+              or qualified name, e.g. ``zbox::ModemMsgManager``).
               If multiple symbols share the name, the definition is preferred
               over declarations. Use ``lookup_symbol(name)`` first if unsure
-              about the exact short name.
+              about the exact name.
         project_root: Absolute path to the project. Defaults to nearest git root.
         context_lines: Lines of source code to include above and below the
                        definition for context (default 40).
@@ -997,7 +1006,7 @@ def get_source(name: str, project_root: str | None = None) -> dict:
     base class).
 
     Args:
-        name: Symbol name (exact match).
+        name: Symbol name (exact match on short name or qualified name).
         project_root: Absolute path to the project. Defaults to nearest git root.
 
     Returns:
@@ -1197,9 +1206,11 @@ async def smart_search(
 
     Returns:
         list of dicts. The first entries are ``_generated_queries`` and
-        ``_rough_queries``. Subsequent entries are symbol results in the same
-        format as ``search_code``. May include a warning when Ollama is
-        unavailable or the index is stale.
+        ``_rough_queries``. When the query was translated from a non-ASCII
+        language, ``_translated_from`` and ``_translated_to`` are included.
+        Subsequent entries are symbol results in the same format as
+        ``search_code``. May include a warning when Ollama is unavailable
+        or the index is stale.
     """
     db_path, cfg, project_id, root = _resolve_context(project_root)
     if not db_path.exists():
