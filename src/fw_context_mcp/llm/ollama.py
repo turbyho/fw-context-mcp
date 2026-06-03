@@ -37,7 +37,7 @@ def call_ollama(prompt: str, cfg: LLMConfig) -> str:
         "model": cfg.model,
         "prompt": prompt,
         "stream": False,
-        "options": {"num_ctx": cfg.num_ctx},
+        "options": {"num_ctx": cfg.num_ctx, "temperature": 0},
     }
     t0 = time.monotonic()
     try:
