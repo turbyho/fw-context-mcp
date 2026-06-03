@@ -87,9 +87,22 @@ def run(
     exclude_paths: list[Path] | None = None,
     project_name: str | None = None,
     index_refs: bool = False,
+    project_root: Path | None = None,
+    project_id: str | None = None,
 ) -> str:
-    """Index a project. Returns config_hash of the indexed build."""
-    project_root = compile_commands.parent.resolve()
+    """Index a project. Returns config_hash of the indexed build.
+
+    *project_root* and *project_id* should be passed by the caller (the CLI) so
+    they match the identity used to compute ``db_path``. When omitted they are
+    derived from ``compile_commands.parent`` — which is only correct when the
+    file lives at the project root and the repo has a git remote. Passing them
+    explicitly avoids a project_id mismatch for out-of-tree builds (e.g. Zephyr
+    ``build/compile_commands.json``) in repos without a remote.
+    """
+    if project_root is None:
+        project_root = compile_commands.parent.resolve()
+    else:
+        project_root = project_root.resolve()
     if not source_roots:
         source_roots = _detect_source_roots(project_root, compile_commands)
     # Only keep roots that actually exist
@@ -98,7 +111,8 @@ def run(
         exclude_paths = []
     exclude_paths = [p.resolve() for p in exclude_paths]
 
-    project_id = derive_project_id(project_root)
+    if project_id is None:
+        project_id = derive_project_id(project_root)
     name = project_name or project_root.name
     config_hash = compute_config_hash(compile_commands)
 
@@ -154,7 +168,7 @@ def run(
             skipped += 1
             continue
 
-        with transaction(conn):
+        with transaction(conn, checkpoint=False):
             if file_path in existing_files:
                 file_id, _ = existing_files[file_path]
                 delete_symbols_for_file(conn, file_id)
@@ -225,6 +239,8 @@ def run(
             )
 
     elapsed = time.monotonic() - t0
+    # Single WAL truncate after all per-TU commits (each used checkpoint=False).
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
     log.info(
         "Done: %d updated, %d unchanged, %d skipped — %d symbols, %d refs in %.1fs (config_hash=%s)",
         updated, unchanged, skipped, total_syms, total_refs, elapsed, config_hash[:12],

@@ -260,11 +260,22 @@ def open_db(path: Path) -> sqlite3.Connection:
 
 
 @contextmanager
-def transaction(conn: sqlite3.Connection) -> Generator[sqlite3.Connection, None, None]:
+def transaction(
+    conn: sqlite3.Connection, checkpoint: bool = True
+) -> Generator[sqlite3.Connection, None, None]:
+    """Commit-or-rollback context manager.
+
+    By default a WAL truncate-checkpoint runs after each successful commit to
+    keep the -wal file small. Pass ``checkpoint=False`` inside tight per-item
+    loops (e.g. the indexer's per-TU commits) and run a single checkpoint once
+    the loop finishes — per-commit checkpoints there are O(n) and dominate
+    indexing time.
+    """
     try:
         yield conn
         conn.commit()
-        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        if checkpoint:
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
     except Exception:
         conn.rollback()
         raise
@@ -470,24 +481,33 @@ def search_symbols(
     query: str,
     config_hash: str,
     limit: int = 20,
+    kind: str | None = None,
 ) -> list[sqlite3.Row]:
     """FTS5 search over symbols for a given build config.
 
     Bare words are expanded to trailing-wildcard prefix queries so that
     ``modem init`` matches ``modem_parser_oob_init``.
+    When *kind* is given, the filter is applied in SQL (before LIMIT) so the
+    caller reliably gets up to *limit* matching rows — filtering after the fact
+    in Python would silently under-return.
     Note: file_path is read from the denormalized symbols.file_path column,
     not re-joined from files — the JOIN was removed to avoid the redundant
     round-trip and the shadowing hazard.
     """
     expanded = _expand_query(query)
+    kind_filter = "AND s.kind = ?" if kind else ""
+    params: list = [expanded, config_hash]
+    if kind:
+        params.append(kind)
+    params.append(limit)
     return conn.execute(
-        """SELECT s.*
+        f"""SELECT s.*
            FROM symbols_fts
            JOIN symbols s ON s.id = symbols_fts.rowid
-           WHERE symbols_fts MATCH ? AND s.config_hash = ?
+           WHERE symbols_fts MATCH ? AND s.config_hash = ? {kind_filter}
            ORDER BY rank
            LIMIT ?""",
-        (expanded, config_hash, limit),
+        params,
     ).fetchall()
 
 
