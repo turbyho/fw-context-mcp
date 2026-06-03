@@ -61,6 +61,7 @@ class LLMConfig:
     enabled: bool = True
     ollama_url: str = "http://localhost:11434"
     model: str = "qwen2.5-coder:14b"
+    embed_model: str = "mxbai-embed-large:latest"
     num_ctx: int = 8192
     debug_log: Path | None = None
 
@@ -132,6 +133,8 @@ def _from_dict(data: dict) -> Config:
             cfg.llm.ollama_url = url
         if model := llm.get("model"):
             cfg.llm.model = model
+        if embed_model := llm.get("embed_model"):
+            cfg.llm.embed_model = embed_model
         if num_ctx := llm.get("num_ctx"):
             cfg.llm.num_ctx = int(num_ctx)
         if debug_log := llm.get("debug_log"):

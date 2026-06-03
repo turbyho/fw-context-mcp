@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import re
 import sqlite3
@@ -52,6 +53,123 @@ _KIND_WEIGHT: dict[str, int] = {
 # repeated/similar queries within a session. Bounded; cleared wholesale when full.
 _KEYWORD_CACHE: dict[tuple, list[str]] = {}
 _KEYWORD_CACHE_MAX = 256
+
+# Lazy-loaded embedding index for semantic search.
+# Keyed by config_hash — each build has its own symbol set.
+# Values: (descriptions: list[str], embeddings: list[list[float]], symbol_ids: list[int])
+_EMBEDDING_CACHE: dict[str, tuple[list[str], list[list[float]], list[int]]] = {}
+_EMBEDDING_CACHE_MAX_SYMBOLS = 5000
+
+
+def _build_symbol_description(r: dict) -> str:
+    """Build a hierarchical description string for embedding.
+
+    Format: <path> <file> <class> <name> <signature> [docstring]
+
+    The directory path and class name give the embedding model domain
+    context — e.g. 'lib/modem zmodem_driver ZMODEM_DRIVER network_registration'
+    clearly belongs to the modem subsystem.
+    """
+    fp = (r.get("file_path") or "").replace("\\", "/")
+    path = ""
+    file_ = ""
+    if "/" in fp:
+        *dirs, file_ = fp.split("/")
+        path = "/".join(dirs[-2:])  # last 2 dirs
+    elif fp:
+        file_ = fp
+
+    # Extract class/namespace from qualified_name
+    qname = (r.get("qualified_name") or "")
+    name = r.get("name") or ""
+    class_ = ""
+    if "::" in qname:
+        # Everything before the last :: is the class/namespace
+        class_ = "::".join(qname.split("::")[:-1])
+
+    sig = (r.get("signature") or "")
+
+    # Append docstring if available (truncated)
+    doc = (r.get("docstring") or "").strip()
+    if doc and len(doc) > 20:
+        doc = doc[:300]
+
+    parts = [path, file_, class_, name, sig]
+    if doc:
+        parts.append(doc)
+    return " ".join(p for p in parts if p)
+
+
+def _ensure_embeddings(conn, config_hash: str, cfg_llm) -> tuple[list[str], list[list[float]], list[int]]:
+    """Load and embed top symbols from the DB, caching in memory.
+
+    Only project-local functions/methods (src/, lib/ outside mbed-os) are
+    embedded — they carry the most domain signal.  Framework symbols are
+    too generic to help with disambiguation.
+    """
+    global _EMBEDDING_CACHE
+    if config_hash in _EMBEDDING_CACHE:
+        return _EMBEDDING_CACHE[config_hash]
+
+    from ..llm.ollama import call_ollama_embed
+
+    log.info("Building embedding index for config %s...", config_hash[:12])
+
+    # Fetch symbols for embedding: docstring-rich symbols first (best
+    # semantic signal), then project-local definitions as fallback.
+    # Include mbed-os symbols — they have the most comprehensive docstrings
+    # and help with generic queries like "permanent memory" → FlashIAPBlockDevice.
+    rows = conn.execute(
+        """SELECT s.id, s.name, s.qualified_name, s.kind, s.file_path,
+                  s.signature, s.is_definition, s.docstring
+           FROM symbols s
+           WHERE s.config_hash = ?
+             AND s.is_definition = 1
+             AND s.kind IN ('function', 'method', 'constructor', 'destructor',
+                            'class', 'struct')
+           ORDER BY CASE WHEN s.docstring IS NOT NULL AND LENGTH(s.docstring) > 30
+                      THEN 0 ELSE 1 END,
+                    CASE WHEN (s.file_path LIKE 'src/%' OR s.file_path LIKE 'lib/%')
+                         AND s.file_path NOT LIKE '%mbed-os%'
+                      THEN 0 ELSE 1 END
+           LIMIT ?""",
+        (config_hash, _EMBEDDING_CACHE_MAX_SYMBOLS),
+    ).fetchall()
+
+    if not rows:
+        _EMBEDDING_CACHE[config_hash] = ([], [], [])
+        return _EMBEDDING_CACHE[config_hash]
+
+    descriptions = [_build_symbol_description(r) for r in rows]
+    symbol_ids = [r["id"] for r in rows]
+
+    # Batch-embed in chunks of 100 (Ollama embed API limit)
+    all_embeddings: list[list[float]] = []
+    chunk_size = 100
+    for i in range(0, len(descriptions), chunk_size):
+        chunk = descriptions[i:i + chunk_size]
+        try:
+            embeddings = call_ollama_embed(chunk, cfg_llm)
+            all_embeddings.extend(embeddings)
+        except Exception as e:
+            log.warning("Embedding batch %d failed: %s", i // chunk_size, e)
+            # Pad with zero vectors for failed chunks
+            all_embeddings.extend([[0.0] * 1024] * len(chunk))
+
+    _EMBEDDING_CACHE[config_hash] = (descriptions, all_embeddings, symbol_ids)
+    log.info("Embedding index ready: %d symbols", len(descriptions))
+    return _EMBEDDING_CACHE[config_hash]
+
+
+def _cosine_similarity(a: list[float], b: list[float]) -> float:
+    """Cosine similarity between two vectors."""
+    dot = sum(x * y for x, y in zip(a, b))
+    norm_a = math.sqrt(sum(x * x for x in a))
+    norm_b = math.sqrt(sum(x * x for x in b))
+    if norm_a == 0 or norm_b == 0:
+        return 0.0
+    return dot / (norm_a * norm_b)
+
 
 mcp = FastMCP(
     "fw-context",
@@ -1605,9 +1723,54 @@ async def smart_search(
                     elif r["is_definition"] and not prev["is_definition"]:
                         seen[key] = _fmt(r)
 
+    # --- Phase 4: embedding-based semantic search ---
+    # Complements FTS5 keyword search.  Embeddings understand that
+    # "registers to the network" ≈ network_registration even though
+    # the tokens don't overlap.  The hierarchical symbol descriptions
+    # (dir + class + name + signature) give domain context.
+    embedding_used = False
+    if cfg.llm.enabled and not ollama_warning:
+        try:
+            from ..llm.ollama import call_ollama_embed
+
+            descs, embs, sym_ids = _ensure_embeddings(conn, config_hash, cfg.llm)
+            if embs:
+                # Embed the query
+                query_emb = call_ollama_embed([query], cfg.llm)
+                if query_emb:
+                    query_vec = query_emb[0]
+                    # Compute similarities
+                    scored = [
+                        (_cosine_similarity(query_vec, ev), sym_ids[i])
+                        for i, ev in enumerate(embs)
+                    ]
+                    scored.sort(key=lambda x: -x[0])
+                    # Take top 30, fetch symbol rows
+                    top_sims = scored[:30]
+                    top_ids = [s[1] for s in top_sims if s[0] > 0.4]
+                    if top_ids:
+                        placeholders = ",".join("?" * len(top_ids))
+                        emb_rows = conn.execute(
+                            f"""SELECT * FROM symbols
+                                WHERE config_hash = ? AND id IN ({placeholders})
+                                AND is_definition = 1""",
+                            (config_hash, *top_ids),
+                        ).fetchall()
+                        # Add to seen with embedding score boost marker
+                        for r in emb_rows:
+                            key = (r["name"], r["file_path"])
+                            if key not in seen:
+                                seen[key] = _fmt(r)
+                        if emb_rows:
+                            embedding_used = True
+        except Exception:
+            pass  # embedding is optional; FTS5 results still work
+
     results: list[dict] = []
 
     results.append({"_generated_queries": keyword_queries})
+    if embedding_used:
+        results.append({"_embedding_used": True})
     if rough_terms:
         results.append({"_rough_queries": rough_terms})
     if translated_from:
