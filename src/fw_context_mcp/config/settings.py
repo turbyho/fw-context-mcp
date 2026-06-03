@@ -157,6 +157,14 @@ def _ensure_project_config(project_root: Path) -> Path:
     return path
 
 
+def _is_loopback_url(url: str) -> bool:
+    """True if *url*'s host is a loopback address (localhost / 127.0.0.0/8 / ::1)."""
+    from urllib.parse import urlparse
+
+    host = (urlparse(url).hostname or "").lower()
+    return host in {"localhost", "::1"} or host.startswith("127.")
+
+
 def load(project_root: Path | None = None) -> Config:
     """Load merged config for the given project root.
 
@@ -180,6 +188,15 @@ def load(project_root: Path | None = None) -> Config:
         try:
             proj_data = tomllib.loads(proj_path.read_text())
             data = _deep_merge(data, proj_data)
+            # Security: a committed project config can redirect LLM calls (which
+            # include source-code snippets) to an arbitrary host. Warn loudly.
+            proj_url = (proj_data.get("llm") or {}).get("ollama_url")
+            if proj_url and not _is_loopback_url(proj_url):
+                log.warning(
+                    "Project config %s sets a non-local ollama_url (%s). "
+                    "Source-code snippets in LLM prompts will be sent to that host.",
+                    proj_path, proj_url,
+                )
         except Exception:
             log.exception("Failed to parse %s — ignoring project config", proj_path)
 

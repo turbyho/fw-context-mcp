@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import os
 import re
+import sqlite3
 import time
 from datetime import UTC, datetime
 from pathlib import Path
@@ -15,13 +16,13 @@ from ..config import Config, derive_project_id
 from ..config import load as load_config
 from ..indexer.compile_commands import parse as parse_cc
 from ..indexer.db import (
+    DatabaseCorruptionError,
     count_refs,
     delete_refs_for_file,
     delete_symbols_for_file,
     find_refs,
     get_active_config,
     get_all_projects,
-    DatabaseCorruptionError,
     get_file_mtime_indexed,
     get_file_mtimes,
     insert_refs_batch,
@@ -398,66 +399,68 @@ def search_code(
     Example:
         ``search_code("modem init", kind="method", limit=5)``
     """
-    root = _resolve_project_root(project_root)
-    db_path = _db_path(root)
-    if not db_path.exists():
-        return [{"error": f"No index found for {root}. Run 'fw-context index' first."}]
+    try:
+        root = _resolve_project_root(project_root)
+        db_path = _db_path(root)
+        if not db_path.exists():
+            return [{"error": f"No index found for {root}. Run 'fw-context index' first."}]
 
-    conn, err = _open_db_safe(db_path)
-    if err:
-        return [err]
+        conn, err = _open_db_safe(db_path)
+        if err:
+            return [err]
 
-    # --- inner: run FTS5 search + format results ---
-    def _do_search(c: sqlite3.Connection, config_hash: str) -> list[dict]:
-        rows = search_symbols(c, query, config_hash, limit=limit)
-        if kind:
-            rows = [r for r in rows if r["kind"] == kind]
-        return [
-            {
-                "name": r["name"],
-                "qualified_name": r["qualified_name"],
-                "kind": r["kind"],
-                "file": _abs_path(root, r["file_path"]),
-                "line": r["line"],
-                "is_definition": bool(r["is_definition"]),
-                "signature": r["signature"],
-                "docstring": r["docstring"],
-            }
-            for r in rows
-        ]
+        # --- inner: run FTS5 search + format results ---
+        def _do_search(c: sqlite3.Connection, config_hash: str) -> list[dict]:
+            rows = search_symbols(c, query, config_hash, limit=limit, kind=kind)
+            return [
+                {
+                    "name": r["name"],
+                    "qualified_name": r["qualified_name"],
+                    "kind": r["kind"],
+                    "file": _abs_path(root, r["file_path"]),
+                    "line": r["line"],
+                    "is_definition": bool(r["is_definition"]),
+                    "signature": r["signature"],
+                    "docstring": r["docstring"],
+                }
+                for r in rows
+            ]
 
-    with conn:
-        project_id = derive_project_id(root)
-        cfg = get_active_config(conn, project_id)
-        if not cfg:
-            return [{"error": "No build config indexed."}]
+        with conn:
+            project_id = derive_project_id(root)
+            cfg = get_active_config(conn, project_id)
+            if not cfg:
+                return [{"error": "No build config indexed."}]
 
-        config_hash = cfg["config_hash"]
-        limit = min(limit, 100)
+            config_hash = cfg["config_hash"]
+            limit = min(limit, 100)
 
-        result_rows = _do_search(conn, config_hash)
-        stale_f = _stale_files(conn, config_hash, [_abs_path(root, r["file"]) for r in result_rows])
+            result_rows = _do_search(conn, config_hash)
+            stale_f = _stale_files(conn, config_hash, [_abs_path(root, r["file"]) for r in result_rows])
 
-    # --- auto-reindex stale files, then re-run search ---
-    results: list[dict] = []
-    if _is_stale(cfg, cfg["compile_commands_path"]):
-        results.append({"warning": "Index may be stale — compile_commands.json changed since last index. Run 'fw-context index' to update."})
+        # --- auto-reindex stale files, then re-run search ---
+        results: list[dict] = []
+        if _is_stale(cfg, cfg["compile_commands_path"]):
+            results.append({"warning": "Index may be stale — compile_commands.json changed since last index. Run 'fw-context index' to update."})
 
-    if stale_f:
-        succeeded, failed = _auto_reindex_stale(stale_f, root)
-        if succeeded:
-            conn2, err2 = _open_db_safe(db_path)
-            if err2:
-                results.append({"warning": f"Auto-reindex partially succeeded ({len(succeeded)} files), but DB is now corrupt. Run reset_index() + 'fw-context index'."})
-                results += result_rows
-                return results
-            with conn2:
-                result_rows = _do_search(conn2, config_hash)
-        if failed:
-            results.append({"warning": f"Auto-reindex failed for {len(failed)} file(s): {', '.join(failed[:3])}. Run 'fw-context index' manually."})
+        if stale_f:
+            succeeded, failed = _auto_reindex_stale(stale_f, root)
+            if succeeded:
+                conn2, err2 = _open_db_safe(db_path)
+                if err2:
+                    results.append({"warning": f"Auto-reindex partially succeeded ({len(succeeded)} files), but DB is now corrupt. Run reset_index() + 'fw-context index'."})
+                    results += result_rows
+                    return results
+                with conn2:
+                    result_rows = _do_search(conn2, config_hash)
+            if failed:
+                results.append({"warning": f"Auto-reindex failed for {len(failed)} file(s): {', '.join(failed[:3])}. Run 'fw-context index' manually."})
 
-    results += result_rows
-    return results
+        results += result_rows
+        return results
+    except Exception as e:
+        log.exception("search_code failed: %s", e)
+        return [{"error": f"search_code failed: {e}"}]
 
 
 @mcp.tool()
@@ -514,12 +517,15 @@ def lookup_symbol(
                     (config_hash, name, name, limit),
                 ).fetchall()
             else:
+                # Escape LIKE metacharacters so underscores (ubiquitous in C
+                # identifiers) match literally instead of as single-char wildcards.
+                esc = name.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
                 rows = c.execute(
-                    """SELECT s.* FROM symbols s
-                       WHERE s.config_hash=? AND (s.name LIKE ? OR s.qualified_name LIKE ?)
+                    r"""SELECT s.* FROM symbols s
+                       WHERE s.config_hash=? AND (s.name LIKE ? ESCAPE '\' OR s.qualified_name LIKE ? ESCAPE '\')
                        ORDER BY s.is_definition DESC, s.line
                        LIMIT ?""",
-                    (config_hash, f"{name}%", f"{name}%", limit),
+                    (config_hash, f"{esc}%", f"{esc}%", limit),
                 ).fetchall()
             return [
                 {
@@ -657,7 +663,7 @@ def reset_index(project_root: str | None = None, confirm: bool = False) -> dict:
     corrupt = False
     try:
         conn = open_db(db_path)
-    except DatabaseCorruptionError as e:
+    except DatabaseCorruptionError:
         corrupt = True
     else:
         with conn:
@@ -794,7 +800,17 @@ def reindex_file(
                     sym_file = s.file
                     if sym_file not in file_id_cache:
                         lang = "cpp" if Path(sym_file).suffix.lower() in {".cpp", ".cc", ".cxx", ".c++"} else "c"
-                        file_id_cache[sym_file] = upsert_file(conn, config_hash, sym_file, lang, mtime=current_mtime if sym_file == file_path_str else 0.0)
+                        # Store each file's real mtime — including headers pulled in
+                        # via this TU. Writing 0.0 for headers would make them look
+                        # perpetually stale and trigger spurious auto-reindex attempts.
+                        if sym_file == file_path_str:
+                            sym_mtime = current_mtime
+                        else:
+                            try:
+                                sym_mtime = Path(sym_file).stat().st_mtime
+                            except OSError:
+                                sym_mtime = 0.0
+                        file_id_cache[sym_file] = upsert_file(conn, config_hash, sym_file, lang, mtime=sym_mtime)
                     try:
                         rel_path = str(Path(sym_file).resolve().relative_to(root))
                     except ValueError:

@@ -257,7 +257,7 @@ def extract_all(
             kind=_cursor_kind_label(cursor.kind),
             file=loc.file.name,
             line=loc.line,
-            column=loc.offset,
+            column=loc.column,
             is_definition=is_def,
             signature=_signature(cursor),
             docstring=_docstring(cursor),

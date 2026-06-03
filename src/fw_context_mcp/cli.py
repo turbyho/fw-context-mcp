@@ -172,6 +172,8 @@ def cmd_index(args: argparse.Namespace) -> int:
         exclude_paths=exclude_paths,
         project_name=args.name or cfg.project.name,
         index_refs=args.refs or cfg.index.index_refs,
+        project_root=project_root,
+        project_id=project_id,
     )
     print(f"Indexed. config_hash={config_hash[:16]}…  db={db_path}")
     return 0
