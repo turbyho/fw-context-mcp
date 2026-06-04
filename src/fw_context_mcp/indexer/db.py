@@ -170,6 +170,15 @@ def open_db(path: Path) -> sqlite3.Connection:
     conn = sqlite3.connect(str(path))
     conn.row_factory = sqlite3.Row
 
+    # Load sqlite-vec extension for vector search (graceful when missing)
+    try:
+        conn.enable_load_extension(True)
+        import sqlite_vec
+
+        sqlite_vec.load(conn)
+    except (ImportError, Exception):
+        pass
+
     try:
         conn.executescript(_SCHEMA)
 
@@ -256,6 +265,12 @@ def open_db(path: Path) -> sqlite3.Connection:
     except sqlite3.DatabaseError as e:
         conn.close()
         raise DatabaseCorruptionError(str(path), str(e)) from e
+
+    # Migrate vec0 table when sqlite-vec is available (idempotent CREATE IF NOT EXISTS)
+    try:
+        init_vec_table(conn)
+    except Exception:
+        pass
 
     # Integrity check — detect corruption early, before any tool uses the DB
     try:
@@ -454,6 +469,347 @@ def get_embeddings(
         (config_hash, model),
     ).fetchall()
     return {r["symbol_id"]: _blob_to_vec(r["embedding"]) for r in rows}
+
+
+# ---------------------------------------------------------------------------
+# Vector search via sqlite-vec (vec0 virtual table)
+# ---------------------------------------------------------------------------
+
+_VEC_SCHEMA = """
+CREATE VIRTUAL TABLE IF NOT EXISTS vec_symbols USING vec0(
+    embedding float[{dim}] distance_metric=cosine,
+    config_hash TEXT,
+    symbol_id INTEGER
+);
+"""
+
+
+def init_vec_table(conn: sqlite3.Connection) -> None:
+    """Create the vec0 virtual table if it does not exist.
+
+    Must be called after ``sqlite_vec.load(conn)``.
+    The table stores embeddings keyed by ``symbol_id`` with a per-build
+    ``config_hash`` metadata column for filtered KNN queries.
+    """
+    conn.execute(_VEC_SCHEMA.format(dim=_EMBEDDING_DIM))
+    conn.commit()
+
+
+def upsert_embeddings_vec(
+    conn: sqlite3.Connection,
+    rows: list[tuple[int, str, list[float]]],
+) -> int:
+    """Insert or replace embeddings into the vec0 vector table.
+
+    Each row is ``(symbol_id, config_hash, embedding_vector)``.
+    Uses INSERT OR REPLACE so re-indexing the same build is idempotent.
+    Returns number of rows inserted.
+    """
+    import json
+
+    # vec0 requires INSERT per-row (no batch executemany via virtual table).
+    # We build a single transaction around the whole batch.
+    count = 0
+    for symbol_id, config_hash, vec in rows:
+        conn.execute(
+            "INSERT OR REPLACE INTO vec_symbols(rowid, embedding, config_hash, symbol_id) "
+            "VALUES (?, ?, ?, ?)",
+            (symbol_id, json.dumps(vec), config_hash, symbol_id),
+        )
+        count += 1
+    return count
+
+
+def search_similar_vec(
+    conn: sqlite3.Connection,
+    query_vec: list[float],
+    config_hash: str,
+    threshold: float = 0.6,
+    limit: int = 30,
+) -> list[sqlite3.Row]:
+    """KNN search over the vec0 table filtered by *config_hash*.
+
+    Returns rows with ``symbol_id`` and ``distance`` (cosine distance,
+    range [0, 2], where 0 = identical).  Results are post-filtered by
+    *threshold* so only sufficiently similar vectors are returned.
+    """
+    import json
+
+    query_json = json.dumps(query_vec)
+    rows = conn.execute(
+        """SELECT symbol_id, distance
+           FROM vec_symbols
+           WHERE embedding MATCH ?
+             AND config_hash = ?
+             AND k = ?
+           ORDER BY distance""",
+        (query_json, config_hash, limit),
+    ).fetchall()
+
+    # Post-filter by threshold (vec0 does not natively support distance < N
+    # in the WHERE clause — distance is available only after MATCH)
+    return [r for r in rows if r["distance"] <= (1.0 - threshold)]
+
+
+def search_similar_hybrid(
+    conn: sqlite3.Connection,
+    query_vec: list[float],
+    config_hash: str,
+    fts5_query: str,
+    threshold: float = 0.6,
+    limit: int = 20,
+) -> list[sqlite3.Row]:
+    """Hybrid search: combine FTS5 text relevance with vector similarity.
+
+    1. Fetch candidate symbols via FTS5 (broad recall – up to 200 candidates).
+    2. Re-rank candidates by cosine distance against *query_vec*.
+    3. Return top *limit* results sorted by distance.
+
+    This avoids a full-scan of vec_symbols while still leveraging semantic
+    similarity for ranking.
+    """
+    import json
+
+    from fw_context_mcp.indexer.db import search_symbols
+
+    # Phase 1 — text recall
+    text_candidates = search_symbols(conn, fts5_query, config_hash, limit=200)
+    if not text_candidates:
+        return []
+
+    candidate_ids = [r["id"] for r in text_candidates]
+    placeholders = ",".join("?" * len(candidate_ids))
+
+    # Phase 2 — vector re-rank
+    query_json = json.dumps(query_vec)
+    rows = conn.execute(
+        f"""SELECT vs.symbol_id, distance
+            FROM vec_symbols vs
+            WHERE vs.symbol_id IN ({placeholders})
+              AND vs.config_hash = ?""",
+        (*candidate_ids, config_hash),
+    ).fetchall()
+
+    # Build distance map, filter by threshold
+    dist_map: dict[int, float] = {}
+    for r in rows:
+        d = r["distance"]
+        if d <= (1.0 - threshold):
+            dist_map[r["symbol_id"]] = d
+
+    # Re-rank candidates by vector distance
+    scored = [
+        (dist_map[r["id"]], r)
+        for r in text_candidates
+        if r["id"] in dist_map
+    ]
+    scored.sort(key=lambda x: x[0])
+
+    top = scored[:limit]
+    # Embed distance into result dict
+    return [
+        dict(r, _vector_distance=d)
+        for d, r in top
+    ]
+
+
+# ---------------------------------------------------------------------------
+# Graph analytics — call-graph traversal via recursive CTE
+# ---------------------------------------------------------------------------
+
+
+def _resolve_target_usr(
+    conn: sqlite3.Connection, config_hash: str, name: str
+) -> str | None:
+    """Look up the USR of a symbol by name (prefer definition)."""
+    row = conn.execute(
+        """SELECT usr FROM symbols
+           WHERE config_hash = ?
+             AND (name = ? OR qualified_name = ?)
+           ORDER BY is_definition DESC
+           LIMIT 1""",
+        (config_hash, name, name),
+    ).fetchone()
+    return row["usr"] if row else None
+
+
+def find_call_path(
+    conn: sqlite3.Connection,
+    config_hash: str,
+    from_name: str,
+    to_name: str,
+    max_depth: int = 10,
+) -> list[dict]:
+    """Find call paths from *from_name* to *to_name* via BFS in the refs table.
+
+    Uses a recursive CTE to walk edges from caller to callee.  Returns up to
+    5 shortest paths, each with ``depth`` (number of edges) and ``chain``
+    (human-readable ``A → B → C`` string).
+    """
+    from_usr = _resolve_target_usr(conn, config_hash, from_name)
+    to_usr = _resolve_target_usr(conn, config_hash, to_name)
+    if not from_usr or not to_usr:
+        return []
+
+    rows = conn.execute(
+        """WITH RECURSIVE paths(from_usr, to_usr, depth, chain) AS (
+            SELECT r.from_usr, r.to_usr, 1,
+                   caller.name || ' → ' || callee.name
+            FROM refs r
+            JOIN symbols caller ON caller.usr = r.from_usr AND caller.config_hash = r.config_hash
+            JOIN symbols callee ON callee.usr = r.to_usr   AND callee.config_hash = r.config_hash
+            WHERE r.from_usr = ? AND r.config_hash = ?
+              AND caller.is_definition = 1
+            UNION ALL
+            SELECT r.from_usr, r.to_usr, p.depth + 1,
+                   p.chain || ' → ' || callee.name
+            FROM refs r
+            JOIN paths p ON p.to_usr = r.from_usr
+            JOIN symbols callee ON callee.usr = r.to_usr AND callee.config_hash = r.config_hash
+            WHERE p.depth < ? AND r.config_hash = ?
+        )
+        SELECT depth, chain, to_usr
+        FROM paths
+        WHERE to_usr = ?
+        ORDER BY depth
+        LIMIT 5""",
+        (from_usr, config_hash, max_depth, config_hash, to_usr),
+    ).fetchall()
+
+    return [
+        {"depth": r["depth"], "chain": r["chain"], "target_usr": r["to_usr"]}
+        for r in rows
+    ]
+
+
+def find_all_callers_recursive(
+    conn: sqlite3.Connection,
+    config_hash: str,
+    name: str,
+    max_depth: int = 5,
+    limit: int = 50,
+) -> list[dict]:
+    """Find all transitive callers of *name* (who calls it, directly or indirectly).
+
+    Returns deduplicated results with ``depth`` (shortest distance to target)
+    and the callee's ``name``, ``qualified_name``, ``kind``, ``file_path``.
+    """
+    target_usr = _resolve_target_usr(conn, config_hash, name)
+    if not target_usr:
+        return []
+
+    rows = conn.execute(
+        """WITH RECURSIVE callers(usr, depth) AS (
+            SELECT from_usr, 1
+            FROM refs
+            WHERE to_usr = ? AND config_hash = ?
+            UNION
+            SELECT r.from_usr, c.depth + 1
+            FROM refs r
+            JOIN callers c ON r.to_usr = c.usr
+            WHERE c.depth < ? AND r.config_hash = ?
+        )
+        SELECT s.name, s.qualified_name, s.kind, s.file_path, s.signature,
+               MIN(c.depth) AS depth
+        FROM callers c
+        JOIN symbols s ON s.usr = c.usr AND s.config_hash = ?
+        WHERE s.is_definition = 1
+        GROUP BY s.usr
+        ORDER BY depth, s.name
+        LIMIT ?""",
+        (target_usr, config_hash, max_depth, config_hash, config_hash, limit),
+    ).fetchall()
+
+    return [dict(r) for r in rows]
+
+
+def find_callees_recursive(
+    conn: sqlite3.Connection,
+    config_hash: str,
+    name: str,
+    max_depth: int = 5,
+    limit: int = 50,
+) -> list[dict]:
+    """Find all transitive callees of *name* (what it calls, directly or indirectly).
+
+    Inverse of ``find_all_callers_recursive`` — walks edges from caller to callee.
+    """
+    source_usr = _resolve_target_usr(conn, config_hash, name)
+    if not source_usr:
+        return []
+
+    rows = conn.execute(
+        """WITH RECURSIVE callees(usr, depth) AS (
+            SELECT to_usr, 1
+            FROM refs
+            WHERE from_usr = ? AND config_hash = ?
+            UNION
+            SELECT r.to_usr, c.depth + 1
+            FROM refs r
+            JOIN callees c ON r.from_usr = c.usr
+            WHERE c.depth < ? AND r.config_hash = ?
+        )
+        SELECT s.name, s.qualified_name, s.kind, s.file_path, s.signature,
+               MIN(c.depth) AS depth
+        FROM callees c
+        JOIN symbols s ON s.usr = c.usr AND s.config_hash = ?
+        WHERE s.is_definition = 1
+        GROUP BY s.usr
+        ORDER BY depth, s.name
+        LIMIT ?""",
+        (source_usr, config_hash, max_depth, config_hash, config_hash, limit),
+    ).fetchall()
+
+    return [dict(r) for r in rows]
+
+
+def find_dead_code(
+    conn: sqlite3.Connection,
+    config_hash: str,
+    limit: int = 100,
+) -> list[dict]:
+    """Find functions/methods that are defined but never called.
+
+    A "dead" symbol is one whose USR never appears in ``refs.to_usr``.
+    """
+    rows = conn.execute(
+        """SELECT s.name, s.qualified_name, s.kind, s.file_path,
+                  s.signature, s.line
+           FROM symbols s
+           WHERE s.config_hash = ?
+             AND s.is_definition = 1
+             AND s.kind IN ('function', 'method', 'constructor', 'destructor')
+             AND s.usr NOT IN (
+                 SELECT DISTINCT to_usr FROM refs WHERE config_hash = ?
+             )
+           ORDER BY s.kind, s.name
+           LIMIT ?""",
+        (config_hash, config_hash, limit),
+    ).fetchall()
+
+    return [dict(r) for r in rows]
+
+
+def find_hotspots(
+    conn: sqlite3.Connection,
+    config_hash: str,
+    limit: int = 20,
+) -> list[dict]:
+    """Find the most-called functions (hotspots) ranked by caller count."""
+    rows = conn.execute(
+        """SELECT s.name, s.qualified_name, s.kind, s.file_path,
+                  s.signature, s.line,
+                  COUNT(r.rowid) AS caller_count
+           FROM refs r
+           JOIN symbols s ON s.usr = r.to_usr AND s.config_hash = r.config_hash
+           WHERE r.config_hash = ? AND s.is_definition = 1
+           GROUP BY s.usr
+           ORDER BY caller_count DESC
+           LIMIT ?""",
+        (config_hash, limit),
+    ).fetchall()
+
+    return [dict(r) for r in rows]
 
 
 def find_refs(

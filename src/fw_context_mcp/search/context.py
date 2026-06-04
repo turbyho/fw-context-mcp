@@ -7,12 +7,12 @@ accidentally mutate state they don't own.
 
 from __future__ import annotations
 
-import os
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 from fw_context_mcp.config import Config, derive_project_id
 from fw_context_mcp.config import load as load_config
+from fw_context_mcp.utils import resolve_project_root
 
 
 @dataclass(frozen=True)
@@ -79,7 +79,7 @@ class PipelineContext:
         """
         from fw_context_mcp.indexer.db import get_active_config, open_db
 
-        root = _resolve_project_root(project_root)
+        root = resolve_project_root(project_root)
         cfg = load_config(project_root=root)
         project_id = derive_project_id(root)
         db_path = cfg.index.db_dir / project_id / "index.db"
@@ -88,11 +88,14 @@ class PipelineContext:
             raise ValueError(f"No index found for {root}. Run 'fw-context index' first.")
 
         conn = open_db(db_path)
-        with conn:
-            build_cfg = get_active_config(conn, project_id)
-            if not build_cfg:
-                raise ValueError(f"No build config indexed for {root}.")
-            config_hash = build_cfg["config_hash"]
+        try:
+            with conn:
+                build_cfg = get_active_config(conn, project_id)
+                if not build_cfg:
+                    raise ValueError(f"No build config indexed for {root}.")
+                config_hash = build_cfg["config_hash"]
+        finally:
+            conn.close()
 
         return cls(
             config_hash=config_hash,
@@ -103,16 +106,3 @@ class PipelineContext:
             config=cfg,
             limit=min(limit, 100),
         )
-
-
-def _resolve_project_root(project_root: str | None) -> Path:
-    """Find project root: explicit path → git root → cwd."""
-    if project_root:
-        return Path(project_root).resolve()
-    cwd = Path(os.getcwd())
-    p = cwd
-    while p != p.parent:
-        if (p / ".git").exists():
-            return p
-        p = p.parent
-    return cwd

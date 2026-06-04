@@ -22,6 +22,11 @@ from ..indexer.compile_commands import parse as parse_cc
 from ..indexer.db import (
     DatabaseCorruptionError,
     count_refs,
+    find_all_callers_recursive,
+    find_callees_recursive,
+    find_call_path,
+    find_dead_code,
+    find_hotspots,
     find_refs,
     get_active_config,
     get_all_projects,
@@ -31,6 +36,7 @@ from ..indexer.db import (
     transaction,
 )
 from ..llm.ollama import OllamaError, OllamaModelNotFoundError, call_ollama_async, check_setup
+from ..utils import MTIME_TOLERANCE_S, abs_path, resolve_project_root
 
 log = logging.getLogger(__name__)
 
@@ -51,7 +57,7 @@ def _db_path(project_root: Path) -> Path:
 
 
 def _resolve_context(project_root: str | None) -> tuple[Path, Config, str, Path]:
-    root = _resolve_project_root(project_root)
+    root = resolve_project_root(project_root)
     cfg = load_config(project_root=root)
     project_id = derive_project_id(root)
     return cfg.index.db_dir / project_id / "index.db", cfg, project_id, root
@@ -68,32 +74,11 @@ def _open_db_safe(db_path: Path) -> tuple[sqlite3.Connection | None, dict | None
         }
 
 
-def _resolve_project_root(project_root: str | None) -> Path:
-    if project_root:
-        return Path(project_root).resolve()
-    cwd = Path(os.getcwd())
-    p = cwd
-    while p != p.parent:
-        if (p / ".git").exists():
-            return p
-        p = p.parent
-    return cwd
-
-
-def _abs_path(root: Path, path: str) -> str:
-    if not path:
-        return path
-    p = Path(path)
-    if p.is_absolute():
-        return str(p)
-    return str(root / p)
-
-
 def _is_stale(cfg, compile_commands_path: str) -> bool:
     try:
         cc_mtime = os.path.getmtime(compile_commands_path)
         indexed_at = datetime.fromisoformat(cfg["created_at"]).replace(tzinfo=UTC)
-        return cc_mtime > indexed_at.timestamp() + 1
+        return cc_mtime > indexed_at.timestamp() + MTIME_TOLERANCE_S
     except Exception:
         return False
 
@@ -120,32 +105,57 @@ def _lookup_definition(conn, config_hash: str, name: str):
 
 
 def _read_symbol_body(file_path: str, line_no: int, end_line: int = 0, max_lines: int = 400) -> str:
+    """Read up to *max_lines* lines around *line_no* without loading the entire file.
+
+    When *end_line* is provided (from libclang) it is used as the exact body
+    boundary.  Otherwise brace-matching finds the closing ``}``.
+    """
     try:
-        lines = Path(file_path).read_text(errors="replace").splitlines()
+        p = Path(file_path)
+        if not p.exists():
+            return ""
+        # Read only the needed window — avoid loading huge generated files
+        start_idx = max(0, line_no - 1)
+        read_start = max(0, start_idx - 5)  # small margin for brace matching
+        read_end = end_line + 5 if end_line else start_idx + max_lines + 5
+        window: list[str] = []
+        with p.open(errors="replace") as fh:
+            for i, line in enumerate(fh):
+                if i < read_start:
+                    continue
+                if i >= read_end:
+                    break
+                window.append(line.rstrip("\n\r"))
     except Exception:
         return ""
-    start = line_no - 1
-    if start < 0 or start >= len(lines):
+
+    if start_idx < read_start or not window:
         return ""
+    local_start = start_idx - read_start
+    if local_start < 0 or local_start >= len(window):
+        return ""
+
     if end_line and end_line >= line_no:
-        end = min(len(lines) - 1, end_line - 1)
-        return "\n".join(f"{i + 1:4d}  {lines[i]}" for i in range(start, end + 1))
+        local_end = min(len(window) - 1, end_line - 1 - read_start)
+        return "\n".join(f"{read_start + i + 1:4d}  {window[i]}" for i in range(local_start, local_end + 1))
+
+    # Brace matching
     depth = 0
     seen_open = False
-    end = start
-    for i in range(start, min(len(lines), start + max_lines)):
-        for ch in lines[i]:
+    local_end = local_start
+    for i in range(local_start, len(window)):
+        for ch in window[i]:
             if ch == "{":
                 depth += 1
                 seen_open = True
             elif ch == "}":
                 depth -= 1
-        end = i
+        local_end = i
         if seen_open and depth <= 0:
             break
     if not seen_open:
-        end = min(len(lines) - 1, start + 2)
-    return "\n".join(f"{i + 1:4d}  {lines[i]}" for i in range(start, end + 1))
+        local_end = min(len(window) - 1, local_start + 2)
+    return "\n".join(f"{read_start + i + 1:4d}  {window[i]}" for i in range(local_start, local_end + 1))
 
 
 def _stale_files(conn, config_hash: str, file_paths: list[str]) -> list[str]:
@@ -155,7 +165,7 @@ def _stale_files(conn, config_hash: str, file_paths: list[str]) -> list[str]:
             stored = get_file_mtime_indexed(conn, config_hash, path)
             if stored is None:
                 continue
-            if os.path.getmtime(path) > stored + 1:
+            if os.path.getmtime(path) > stored + MTIME_TOLERANCE_S:
                 stale.append(path)
         except OSError:
             pass
@@ -176,7 +186,7 @@ def _count_modified_files(conn, config_hash: str, root: Path) -> int:
         if not p.is_absolute():
             p = (root / path).resolve()
         try:
-            if p.stat().st_mtime > stored + 1:
+            if p.stat().st_mtime > stored + MTIME_TOLERANCE_S:
                 modified += 1
         except OSError:
             pass
@@ -222,40 +232,100 @@ def _auto_reindex_stale(
 @mcp.tool()
 def get_active_build(project_root: str | None = None) -> dict:
     """Return metadata about the most recently indexed build configuration."""
-    root = _resolve_project_root(project_root)
+    root = resolve_project_root(project_root)
     db_path = _db_path(root)
     if not db_path.exists():
         return {"error": f"No index found for {root}. Run 'fw-context index' first."}
     conn, err = _open_db_safe(db_path)
     if err:
         return err
-    with conn:
-        project_id = derive_project_id(root)
-        cfg = get_active_config(conn, project_id)
-        if not cfg:
-            return {"error": f"No build config indexed for project at {root}."}
-        config_hash = cfg["config_hash"]
-        sym_count = conn.execute(
-            "SELECT COUNT(*) FROM symbols WHERE config_hash=?", (config_hash,)
-        ).fetchone()[0]
-        file_count = conn.execute(
-            "SELECT COUNT(*) FROM files WHERE config_hash=?", (config_hash,)
-        ).fetchone()[0]
-        ref_count = count_refs(conn, config_hash)
-        modified_count = _count_modified_files(conn, config_hash, root)
-        return {
-            "config_hash": config_hash,
-            "project_id": project_id,
-            "project_root": str(root),
-            "build_system": _detect_build_system(root),
-            "compile_commands": cfg["compile_commands_path"],
-            "indexed_at": cfg["created_at"],
-            "symbol_count": sym_count,
-            "file_count": file_count,
-            "reference_count": ref_count,
-            "modified_files_count": modified_count,
-            "stale": _is_stale(cfg, cfg["compile_commands_path"]) or modified_count > 0,
-        }
+    try:
+        with conn:
+            project_id = derive_project_id(root)
+            cfg = get_active_config(conn, project_id)
+            if not cfg:
+                return {"error": f"No build config indexed for project at {root}."}
+            config_hash = cfg["config_hash"]
+            sym_count = conn.execute(
+                "SELECT COUNT(*) FROM symbols WHERE config_hash=?", (config_hash,)
+            ).fetchone()[0]
+            file_count = conn.execute(
+                "SELECT COUNT(*) FROM files WHERE config_hash=?", (config_hash,)
+            ).fetchone()[0]
+            ref_count = count_refs(conn, config_hash)
+            modified_count = _count_modified_files(conn, config_hash, root)
+            result: dict = {
+                "config_hash": config_hash,
+                "project_id": project_id,
+                "project_root": str(root),
+                "build_system": _detect_build_system(root),
+                "compile_commands": cfg["compile_commands_path"],
+                "indexed_at": cfg["created_at"],
+                "symbol_count": sym_count,
+                "file_count": file_count,
+                "reference_count": ref_count,
+                "modified_files_count": modified_count,
+                "stale": _is_stale(cfg, cfg["compile_commands_path"]) or modified_count > 0,
+            }
+        return result
+    finally:
+        conn.close()
+
+
+def _with_stale_recovery(
+    root: Path,
+    db_path: Path,
+    query_fn,
+    *,
+    stale_msg: str = "",
+) -> list[dict]:
+    """Execute *query_fn(conn, config_hash)* with automatic stale-recovery.
+
+    When the index or result files are stale:
+    1. Auto-reindex up to 5 stale files (30 s timeout).
+    2. Re-run *query_fn* against a fresh connection.
+    3. Aggregate warnings.
+
+    Connections are always closed before returning.
+    """
+    conn, err = _open_db_safe(db_path)
+    if err:
+        return [err]
+    try:
+        with conn:
+            project_id = derive_project_id(root)
+            cfg = get_active_config(conn, project_id)
+            if not cfg:
+                return [{"error": "No build config indexed."}]
+            config_hash = cfg["config_hash"]
+            result_rows = query_fn(conn, config_hash)
+            stale_f = _stale_files(
+                conn, config_hash,
+                [abs_path(root, r["file"]) for r in result_rows],
+            )
+    finally:
+        conn.close()
+
+    results: list[dict] = []
+    if _is_stale(cfg, cfg["compile_commands_path"]):
+        results.append({"warning": stale_msg or "Index may be stale — compile_commands.json changed since last index. Run 'fw-context index' to update."})
+    if stale_f:
+        succeeded, failed = _auto_reindex_stale(stale_f, root)
+        if succeeded:
+            conn2, err2 = _open_db_safe(db_path)
+            if err2:
+                results.append({"warning": f"Auto-reindex partially succeeded ({len(succeeded)} files), but DB is now corrupt."})
+                results += result_rows
+                return results
+            try:
+                with conn2:
+                    result_rows = query_fn(conn2, config_hash)
+            finally:
+                conn2.close()
+        if failed:
+            results.append({"warning": f"Auto-reindex failed for {len(failed)} file(s): {', '.join(failed[:3])}. Run 'fw-context index' manually."})
+    results += result_rows
+    return results
 
 
 @mcp.tool()
@@ -267,13 +337,12 @@ def lookup_symbol(
 ) -> list[dict]:
     """Look up a symbol by name. Returns all matches — declarations and definitions."""
     try:
-        root = _resolve_project_root(project_root)
+        root = resolve_project_root(project_root)
         db_path = _db_path(root)
         if not db_path.exists():
             return [{"error": f"No index found for {root}."}]
-        conn, err = _open_db_safe(db_path)
-        if err:
-            return [err]
+
+        limit = min(limit, 100)
 
         def _do_lookup(c: sqlite3.Connection, config_hash: str) -> list[dict]:
             if exact:
@@ -298,7 +367,7 @@ def lookup_symbol(
                     "name": r["name"],
                     "qualified_name": r["qualified_name"],
                     "kind": r["kind"],
-                    "file": _abs_path(root, r["file_path"]),
+                    "file": abs_path(root, r["file_path"]),
                     "line": r["line"],
                     "is_definition": bool(r["is_definition"]),
                     "signature": r["signature"],
@@ -307,33 +376,7 @@ def lookup_symbol(
                 for r in rows
             ]
 
-        with conn:
-            project_id = derive_project_id(root)
-            cfg = get_active_config(conn, project_id)
-            if not cfg:
-                return [{"error": "No build config indexed."}]
-            config_hash = cfg["config_hash"]
-            limit = min(limit, 100)
-            result_rows = _do_lookup(conn, config_hash)
-            stale_f = _stale_files(conn, config_hash, [_abs_path(root, r["file"]) for r in result_rows])
-
-        results: list[dict] = []
-        if _is_stale(cfg, cfg["compile_commands_path"]):
-            results.append({"warning": "Index may be stale — compile_commands.json changed since last index. Run 'fw-context index' to update."})
-        if stale_f:
-            succeeded, failed = _auto_reindex_stale(stale_f, root)
-            if succeeded:
-                conn2, err2 = _open_db_safe(db_path)
-                if err2:
-                    results.append({"warning": f"Auto-reindex partially succeeded ({len(succeeded)} files), but DB is now corrupt."})
-                    results += result_rows
-                    return results
-                with conn2:
-                    result_rows = _do_lookup(conn2, config_hash)
-            if failed:
-                results.append({"warning": f"Auto-reindex failed for {len(failed)} file(s): {', '.join(failed[:3])}. Run 'fw-context index' manually."})
-        results += result_rows
-        return results
+        return _with_stale_recovery(root, db_path, _do_lookup)
     except Exception as e:
         log.exception("lookup_symbol failed: %s", e)
         return [{"error": f"lookup_symbol failed: {e}"}]
@@ -354,8 +397,11 @@ def list_projects(project_root: str | None = None) -> list[dict]:
             if err:
                 results.append(err)
                 continue
-            with conn:
-                rows = get_all_projects(conn)
+            try:
+                with conn:
+                    rows = get_all_projects(conn)
+            finally:
+                conn.close()
             for r in rows:
                 stale = _is_stale(
                     {"created_at": r["created_at"]},
@@ -381,7 +427,7 @@ def list_projects(project_root: str | None = None) -> list[dict]:
 @mcp.tool()
 def reset_index(project_root: str | None = None, confirm: bool = False) -> dict:
     """Delete the symbol index for a project so it can be re-indexed from scratch."""
-    root = _resolve_project_root(project_root)
+    root = resolve_project_root(project_root)
     db_path = _db_path(root)
     if not db_path.exists():
         return {"error": f"No index found for {root}. Nothing to reset."}
@@ -394,13 +440,16 @@ def reset_index(project_root: str | None = None, confirm: bool = False) -> dict:
     except DatabaseCorruptionError:
         corrupt = True
     else:
-        with conn:
-            cfg_data = get_active_config(conn, project_id)
-            if cfg_data:
-                sym_count = conn.execute(
-                    "SELECT COUNT(*) FROM symbols WHERE config_hash=?",
-                    (cfg_data["config_hash"],),
-                ).fetchone()[0]
+        try:
+            with conn:
+                cfg_data = get_active_config(conn, project_id)
+                if cfg_data:
+                    sym_count = conn.execute(
+                        "SELECT COUNT(*) FROM symbols WHERE config_hash=?",
+                        (cfg_data["config_hash"],),
+                    ).fetchone()[0]
+        finally:
+            conn.close()
     info: dict[str, object] = {
         "project_root": str(root),
         "db": str(db_path),
@@ -447,42 +496,45 @@ def reindex_file(
     conn, err = _open_db_safe(db_path)
     if err:
         return err
-    with conn:
-        cfg_data = get_active_config(conn, project_id)
-        if not cfg_data:
-            return {"error": "No build config indexed."}
-        target = Path(file_path).resolve()
-        if not target.exists():
-            return {"error": f"File not found: {target}"}
-        cc_path = Path(cfg_data["compile_commands_path"])
-        if not cc_path.exists():
-            return {"error": f"compile_commands.json not found: {cc_path}"}
-        units = parse_cc(cc_path)
-        matching = [u for u in units if Path(u.file).resolve() == target]
-        if not matching:
-            return {"error": f"{target.name} not found in compile_commands.json — it may be a header-only file."}
-        config_hash = cfg_data["config_hash"]
-        source_roots = cfg.source_root_paths(root)
-        exclude_paths = cfg.exclude_root_paths(root)
-        t0 = time.monotonic()
-        total_symbols = 0
-        from ..indexer.ops import store_symbols_for_unit
-        for unit in matching:
-            with transaction(conn):
-                syms_added, _ = store_symbols_for_unit(
-                    conn, unit, config_hash, root,
-                    source_roots=source_roots,
-                    exclude_paths=exclude_paths,
-                    index_refs=cfg.index.index_refs,
-                )
-                total_symbols += syms_added
-    elapsed = round(time.monotonic() - t0, 2)
-    result = {
-        "file": str(target),
-        "translation_units": len(matching),
-        "symbols_updated": total_symbols,
-        "elapsed_s": elapsed,
-    }
+    try:
+        with conn:
+            cfg_data = get_active_config(conn, project_id)
+            if not cfg_data:
+                return {"error": "No build config indexed."}
+            target = Path(file_path).resolve()
+            if not target.exists():
+                return {"error": f"File not found: {target}"}
+            cc_path = Path(cfg_data["compile_commands_path"])
+            if not cc_path.exists():
+                return {"error": f"compile_commands.json not found: {cc_path}"}
+            units = parse_cc(cc_path)
+            matching = [u for u in units if Path(u.file).resolve() == target]
+            if not matching:
+                return {"error": f"{target.name} not found in compile_commands.json — it may be a header-only file."}
+            config_hash = cfg_data["config_hash"]
+            source_roots = cfg.source_root_paths(root)
+            exclude_paths = cfg.exclude_root_paths(root)
+            t0 = time.monotonic()
+            total_symbols = 0
+            from ..indexer.ops import store_symbols_for_unit
+            for unit in matching:
+                with transaction(conn):
+                    syms_added, _ = store_symbols_for_unit(
+                        conn, unit, config_hash, root,
+                        source_roots=source_roots,
+                        exclude_paths=exclude_paths,
+                        index_refs=cfg.index.index_refs,
+                    )
+                    total_symbols += syms_added
+        elapsed = round(time.monotonic() - t0, 2)
+        result: dict = {
+            "file": str(target),
+            "translation_units": len(matching),
+            "symbols_updated": total_symbols,
+            "elapsed_s": elapsed,
+        }
+    finally:
+        conn.close()
     if len(matching) == 1 and target.suffix.lower() in {".h", ".hpp"}:
         result["warning"] = "Header re-indexed via one TU. Other TUs including this header may still have stale symbols — run 'fw-context index' for full accuracy."
     return result
@@ -523,18 +575,21 @@ async def explain_symbol(
     conn, err = _open_db_safe(db_path)
     if err:
         return err
-    with conn:
-        cfg_data = get_active_config(conn, project_id)
-        if not cfg_data:
-            return {"error": "No build config indexed."}
-        config_hash = cfg_data["config_hash"]
-        row = _lookup_definition(conn, config_hash, name)
-        if not row:
-            return {"error": f"Symbol not found: {name}"}
-        file_path = _abs_path(root, row["file_path"])
-        line_no = row["line"]
-        signature = row["signature"] or ""
-        kind = row["kind"]
+    try:
+        with conn:
+            cfg_data = get_active_config(conn, project_id)
+            if not cfg_data:
+                return {"error": "No build config indexed."}
+            config_hash = cfg_data["config_hash"]
+            row = _lookup_definition(conn, config_hash, name)
+            if not row:
+                return {"error": f"Symbol not found: {name}"}
+            file_path = abs_path(root, row["file_path"])
+            line_no = row["line"]
+            signature = row["signature"] or ""
+            kind = row["kind"]
+    finally:
+        conn.close()
     context_lines = min(context_lines, 200)
     source_snippet = ""
     try:
@@ -593,24 +648,29 @@ def get_source(name: str, project_root: str | None = None) -> dict:
     conn, err = _open_db_safe(db_path)
     if err:
         return err
-    with conn:
-        cfg_data = get_active_config(conn, project_id)
-        if not cfg_data:
-            return {"error": "No build config indexed."}
-        row = _lookup_definition(conn, cfg_data["config_hash"], name)
-        if not row:
-            return {"error": f"Symbol not found: {name}"}
-        file_path = _abs_path(root, row["file_path"])
-        result = {
-            "name": row["name"],
-            "qualified_name": row["qualified_name"],
-            "kind": row["kind"],
-            "file": file_path,
-            "line": row["line"],
-            "signature": row["signature"] or "",
-            "is_definition": bool(row["is_definition"]),
-        }
-    source = _read_symbol_body(file_path, row["line"], end_line=row["end_line"] or 0)
+    try:
+        with conn:
+            cfg_data = get_active_config(conn, project_id)
+            if not cfg_data:
+                return {"error": "No build config indexed."}
+            row = _lookup_definition(conn, cfg_data["config_hash"], name)
+            if not row:
+                return {"error": f"Symbol not found: {name}"}
+            file_path = abs_path(root, row["file_path"])
+            result: dict = {
+                "name": row["name"],
+                "qualified_name": row["qualified_name"],
+                "kind": row["kind"],
+                "file": file_path,
+                "line": row["line"],
+                "signature": row["signature"] or "",
+                "is_definition": bool(row["is_definition"]),
+            }
+            end_line = row["end_line"] or 0
+            line_no = row["line"]
+    finally:
+        conn.close()
+    source = _read_symbol_body(file_path, line_no, end_line=end_line)
     if not source:
         result["warning"] = f"Could not read source from {file_path}"
     else:
@@ -626,32 +686,36 @@ def _references_result(name: str, project_root: str | None, ref_kind: str | None
     conn, err = _open_db_safe(db_path)
     if err:
         return [err]
-    with conn:
-        cfg_data = get_active_config(conn, project_id)
-        if not cfg_data:
-            return [{"error": "No build config indexed."}]
-        config_hash = cfg_data["config_hash"]
-        if count_refs(conn, config_hash) == 0:
-            return [{"info": (
-                "No references indexed. The cross-reference graph is opt-in — "
-                "enable it with [index] index_refs = true (or run "
-                "'fw-context index --refs') and re-index the project."
-            )}]
-        limit = min(limit, 200)
-        rows = find_refs(conn, config_hash, name, ref_kind=ref_kind, limit=limit)
-        if not rows:
-            label = "callers" if ref_kind == "call" else "references"
-            return [{"info": f"No {label} found for '{name}'. Check the name (exact match) and that the index is current."}]
-        return [
-            {
-                "file": _abs_path(root, r["from_file"]),
-                "line": r["from_line"],
-                "ref_kind": r["ref_kind"],
-                "caller": r["caller_qname"] or r["caller_name"] or "<file scope>",
-                "caller_kind": r["caller_kind"],
-            }
-            for r in rows
-        ]
+    try:
+        with conn:
+            cfg_data = get_active_config(conn, project_id)
+            if not cfg_data:
+                return [{"error": "No build config indexed."}]
+            config_hash = cfg_data["config_hash"]
+            if count_refs(conn, config_hash) == 0:
+                return [{"info": (
+                    "No references indexed. The cross-reference graph is opt-in — "
+                    "enable it with [index] index_refs = true (or run "
+                    "'fw-context index --refs') and re-index the project."
+                )}]
+            limit = min(limit, 200)
+            rows = find_refs(conn, config_hash, name, ref_kind=ref_kind, limit=limit)
+            if not rows:
+                label = "callers" if ref_kind == "call" else "references"
+                return [{"info": f"No {label} found for '{name}'. Check the name (exact match) and that the index is current."}]
+            result: list[dict] = [
+                {
+                    "file": abs_path(root, r["from_file"]),
+                    "line": r["from_line"],
+                    "ref_kind": r["ref_kind"],
+                    "caller": r["caller_qname"] or r["caller_name"] or "<file scope>",
+                    "caller_kind": r["caller_kind"],
+                }
+                for r in rows
+            ]
+        return result
+    finally:
+        conn.close()
 
 
 @mcp.tool()
@@ -664,6 +728,167 @@ def find_callers(name: str, project_root: str | None = None, limit: int = 50) ->
 def find_references(name: str, project_root: str | None = None, limit: int = 50) -> list[dict]:
     """Find all references to a symbol — calls, reads, and member accesses."""
     return _references_result(name, project_root, ref_kind=None, limit=limit)
+
+
+# ── Graph analytics tools ─────────────────────────────────────────────────────
+
+
+def _refs_guard(project_root: str | None) -> tuple[Path, str, str] | tuple[None, None, list[dict]]:
+    """Shared guard for graph tools: resolve project, open DB, check refs exist.
+
+    Returns ``(root, config_hash, None)`` on success or ``(None, None, error_list)``
+    on failure (caller propagates the error list directly).
+    """
+    root = resolve_project_root(project_root)
+    db_path = _db_path(root)
+    if not db_path.exists():
+        return None, None, [{"error": f"No index found for {root}. Run 'fw-context index' first."}]
+    conn, err = _open_db_safe(db_path)
+    if err:
+        return None, None, [err]
+    try:
+        project_id = derive_project_id(root)
+        with conn:
+            cfg_data = get_active_config(conn, project_id)
+            if not cfg_data:
+                return None, None, [{"error": "No build config indexed."}]
+            config_hash = cfg_data["config_hash"]
+            if count_refs(conn, config_hash) == 0:
+                return None, None, [{"info": (
+                    "No references indexed. Enable [index] index_refs = true "
+                    "and re-index the project."
+                )}]
+            # Connection stays open — caller must close it
+            return root, config_hash, None
+    except Exception:
+        conn.close()
+        raise
+    # conn intentionally NOT closed here — caller will use it
+
+
+@mcp.tool()
+def find_call_path(
+    from_name: str,
+    to_name: str,
+    project_root: str | None = None,
+    max_depth: int = 10,
+) -> list[dict]:
+    """Find call paths between two functions via BFS in the call graph.
+
+    Returns up to 5 shortest paths, each with ``depth`` (edge count) and
+    ``chain`` (e.g. ``"main → app_run → modem_init"``).
+
+    Requires refs indexed (``fw-context index --refs``).
+    """
+    root, config_hash, err = _refs_guard(project_root)
+    if err:
+        return err
+    db_path = _db_path(root)
+    conn, open_err = _open_db_safe(db_path)
+    if open_err:
+        return [open_err]
+    try:
+        rows = find_call_path(conn, config_hash, from_name, to_name, max_depth=max_depth)
+        if not rows:
+            return [{"info": f"No path found from '{from_name}' to '{to_name}' within depth {max_depth}."}]
+        return rows
+    finally:
+        conn.close()
+
+
+@mcp.tool()
+def find_all_callers_recursive(
+    name: str,
+    project_root: str | None = None,
+    max_depth: int = 5,
+    limit: int = 50,
+) -> list[dict]:
+    """Find all transitive callers — who calls *name*, directly or indirectly.
+
+    Returns deduplicated results with ``depth`` (shortest path length to target).
+    """
+    root, config_hash, err = _refs_guard(project_root)
+    if err:
+        return err
+    db_path = _db_path(root)
+    conn, open_err = _open_db_safe(db_path)
+    if open_err:
+        return [open_err]
+    try:
+        rows = find_all_callers_recursive(conn, config_hash, name, max_depth=max_depth, limit=limit)
+        if not rows:
+            return [{"info": f"No callers found for '{name}'."}]
+        return rows
+    finally:
+        conn.close()
+
+
+@mcp.tool()
+def find_callees_recursive(
+    name: str,
+    project_root: str | None = None,
+    max_depth: int = 5,
+    limit: int = 50,
+) -> list[dict]:
+    """Find all transitive callees — what *name* calls, directly or indirectly."""
+    root, config_hash, err = _refs_guard(project_root)
+    if err:
+        return err
+    db_path = _db_path(root)
+    conn, open_err = _open_db_safe(db_path)
+    if open_err:
+        return [open_err]
+    try:
+        rows = find_callees_recursive(conn, config_hash, name, max_depth=max_depth, limit=limit)
+        if not rows:
+            return [{"info": f"No callees found for '{name}'."}]
+        return rows
+    finally:
+        conn.close()
+
+
+@mcp.tool()
+def find_dead_code(
+    project_root: str | None = None,
+    limit: int = 100,
+) -> list[dict]:
+    """Find functions/methods that are defined but never called."""
+    root, config_hash, err = _refs_guard(project_root)
+    if err:
+        return err
+    db_path = _db_path(root)
+    conn, open_err = _open_db_safe(db_path)
+    if open_err:
+        return [open_err]
+    try:
+        rows = find_dead_code(conn, config_hash, limit=limit)
+        if not rows:
+            return [{"info": "No dead code found — every defined function has at least one caller."}]
+        return rows
+    finally:
+        conn.close()
+
+
+@mcp.tool()
+def find_hotspots(
+    project_root: str | None = None,
+    limit: int = 20,
+) -> list[dict]:
+    """Find the most-called functions ranked by caller count."""
+    root, config_hash, err = _refs_guard(project_root)
+    if err:
+        return err
+    db_path = _db_path(root)
+    conn, open_err = _open_db_safe(db_path)
+    if open_err:
+        return [open_err]
+    try:
+        rows = find_hotspots(conn, config_hash, limit=limit)
+        if not rows:
+            return [{"info": "No references indexed — enable index_refs and re-index."}]
+        return rows
+    finally:
+        conn.close()
 
 
 # ── Pipeline-based search tools ─────────────────────────────────────────────
@@ -702,14 +927,12 @@ def search_code(
         is_definition, signature, docstring.
     """
     try:
-        root = _resolve_project_root(project_root)
+        root = resolve_project_root(project_root)
         db_path = _db_path(root)
         if not db_path.exists():
             return [{"error": f"No index found for {root}. Run 'fw-context index' first."}]
 
-        conn, err = _open_db_safe(db_path)
-        if err:
-            return [err]
+        limit = min(limit, 100)
 
         def _do_search(c: sqlite3.Connection, config_hash: str) -> list[dict]:
             rows = search_symbols(c, query, config_hash, limit=limit, kind=kind)
@@ -718,7 +941,7 @@ def search_code(
                     "name": r["name"],
                     "qualified_name": r["qualified_name"],
                     "kind": r["kind"],
-                    "file": _abs_path(root, r["file_path"]),
+                    "file": abs_path(root, r["file_path"]),
                     "line": r["line"],
                     "is_definition": bool(r["is_definition"]),
                     "signature": r["signature"],
@@ -727,33 +950,7 @@ def search_code(
                 for r in rows
             ]
 
-        with conn:
-            project_id = derive_project_id(root)
-            cfg = get_active_config(conn, project_id)
-            if not cfg:
-                return [{"error": "No build config indexed."}]
-            config_hash = cfg["config_hash"]
-            limit = min(limit, 100)
-            result_rows = _do_search(conn, config_hash)
-            stale_f = _stale_files(conn, config_hash, [_abs_path(root, r["file"]) for r in result_rows])
-
-        results: list[dict] = []
-        if _is_stale(cfg, cfg["compile_commands_path"]):
-            results.append({"warning": "Index may be stale — compile_commands.json changed since last index. Run 'fw-context index' to update."})
-        if stale_f:
-            succeeded, failed = _auto_reindex_stale(stale_f, root)
-            if succeeded:
-                conn2, err2 = _open_db_safe(db_path)
-                if err2:
-                    results.append({"warning": f"Auto-reindex partially succeeded ({len(succeeded)} files), but DB is now corrupt. Run reset_index() + 'fw-context index'."})
-                    results += result_rows
-                    return results
-                with conn2:
-                    result_rows = _do_search(conn2, config_hash)
-            if failed:
-                results.append({"warning": f"Auto-reindex failed for {len(failed)} file(s): {', '.join(failed[:3])}. Run 'fw-context index' manually."})
-        results += result_rows
-        return results
+        return _with_stale_recovery(root, db_path, _do_search)
     except Exception as e:
         log.exception("search_code failed: %s", e)
         return [{"error": f"search_code failed: {e}"}]
@@ -811,13 +1008,16 @@ async def smart_search(
         conn, err = _open_db_safe(ctx.db_path)
         if err:
             return [err]
-        with conn:
-            cfg_data = get_active_config(conn, derive_project_id(ctx.project_root))
-            if cfg_data and _is_stale(cfg_data, cfg_data["compile_commands_path"]):
-                results.append({
-                    "warning": "Index may be stale — compile_commands.json changed since last index.",
-                    "hint": "Call reindex_file() on modified files or run 'fw-context index' to update.",
-                })
+        try:
+            with conn:
+                cfg_data = get_active_config(conn, derive_project_id(ctx.project_root))
+                if cfg_data and _is_stale(cfg_data, cfg_data["compile_commands_path"]):
+                    results.append({
+                        "warning": "Index may be stale — compile_commands.json changed since last index.",
+                        "hint": "Call reindex_file() on modified files or run 'fw-context index' to update.",
+                    })
+        finally:
+            conn.close()
     return results
 
 

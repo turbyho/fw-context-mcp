@@ -13,6 +13,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 from ..config.settings import derive_project_id
+from ..utils import MTIME_TOLERANCE_S
 from .compile_commands import _SOURCE_EXTS
 from .compile_commands import parse as parse_compile_commands
 from .config_hash import compute as compute_config_hash
@@ -71,7 +72,7 @@ def _build_embeddings(conn, config_hash: str, llm_config) -> None:
     import httpx
 
     from ..llm.ollama import call_ollama_embed
-    from .db import _vec_to_blob, upsert_embeddings
+    from .db import _vec_to_blob, upsert_embeddings, upsert_embeddings_vec
 
     try:
         resp = httpx.get(llm_config.ollama_url.rstrip("/") + "/api/tags", timeout=5.0)
@@ -80,21 +81,21 @@ def _build_embeddings(conn, config_hash: str, llm_config) -> None:
         log.warning("Ollama not reachable — skipping embedding generation")
         return
 
-    rows = conn.execute(
-        """SELECT s.id, s.name, s.qualified_name, s.kind, s.file_path,
-                  s.signature, s.is_definition, s.docstring
-           FROM symbols s
-           WHERE s.config_hash = ?
-             AND s.is_definition = 1
-             AND s.kind IN ('function', 'method', 'constructor', 'destructor',
-                            'class', 'struct')
-           ORDER BY CASE WHEN s.docstring IS NOT NULL AND LENGTH(s.docstring) > 30
-                      THEN 0 ELSE 1 END""",
-        (config_hash,),
-    ).fetchall()
-    if not rows:
-        return
-    conn.commit()
+    with transaction(conn):
+        rows = conn.execute(
+            """SELECT s.id, s.name, s.qualified_name, s.kind, s.file_path,
+                      s.signature, s.is_definition, s.docstring
+               FROM symbols s
+               WHERE s.config_hash = ?
+                 AND s.is_definition = 1
+                 AND s.kind IN ('function', 'method', 'constructor', 'destructor',
+                                'class', 'struct')
+               ORDER BY CASE WHEN s.docstring IS NOT NULL AND LENGTH(s.docstring) > 30
+                          THEN 0 ELSE 1 END""",
+            (config_hash,),
+        ).fetchall()
+        if not rows:
+            return
 
     # Build descriptions using the same format as embed phase
     descriptions = []
@@ -133,9 +134,19 @@ def _build_embeddings(conn, config_hash: str, llm_config) -> None:
         except Exception as e:
             log.warning("Embedding batch %d failed: %s", i // chunk_size, e)
             continue
-        batch = [(r["id"], _vec_to_blob(emb), model) for r, emb in zip(chunk_rows, embs)]
-        upsert_embeddings(conn, batch)
-        total += len(batch)
+
+        # Store in legacy BLOB table (backward compatibility)
+        blob_batch = [(r["id"], _vec_to_blob(emb), model) for r, emb in zip(chunk_rows, embs)]
+        upsert_embeddings(conn, blob_batch)
+
+        # Store in vec0 table (sqlite-vec KNN search)
+        try:
+            vec_batch = [(r["id"], config_hash, emb) for r, emb in zip(chunk_rows, embs)]
+            upsert_embeddings_vec(conn, vec_batch)
+        except Exception as e:
+            log.debug("vec0 batch insert failed (sqlite-vec may not be loaded): %s", e)
+
+        total += len(blob_batch)
     log.info("Embeddings stored: %d symbols (model=%s)", total, model)
 
 
