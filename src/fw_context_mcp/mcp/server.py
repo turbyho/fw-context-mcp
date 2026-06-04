@@ -678,6 +678,75 @@ def get_source(name: str, project_root: str | None = None) -> dict:
     return result
 
 
+@mcp.tool()
+def get_symbol_context(name: str, project_root: str | None = None) -> dict:
+    """Return the body, signature, callers, and callees of a symbol.
+
+    Designed as rich LLM context — answers "what does this do and how does
+    it fit in the system?" in a single response.  Callers and callees are
+    limited to 5 each so the result fits in a compact context window.
+    """
+    db_path, cfg, project_id, root = _resolve_context(project_root)
+    if not db_path.exists():
+        return {"error": f"No index found for {root}. Run 'fw-context index' first."}
+    conn, err = _open_db_safe(db_path)
+    if err:
+        return err
+    try:
+        with conn:
+            cfg_data = get_active_config(conn, project_id)
+            if not cfg_data:
+                return {"error": "No build config indexed."}
+            config_hash = cfg_data["config_hash"]
+            row = _lookup_definition(conn, config_hash, name)
+            if not row:
+                return {"error": f"Symbol not found: {name}"}
+            file_path = abs_path(root, row["file_path"])
+            symbol_usr = row["usr"]
+
+            # Immediate callers (who calls this symbol)
+            callers = find_refs(conn, config_hash, name, ref_kind="call", limit=5)
+            callers_list = [
+                {"name": c["caller_name"] or "?", "qualified_name": c["caller_qname"] or "",
+                 "file": abs_path(root, c["caller_file"] or c["from_file"]),
+                 "line": c["from_line"], "kind": c["caller_kind"] or ""}
+                for c in callers if c["ref_kind"] == "call"
+            ][:5]
+
+            # Immediate callees (what this symbol calls)
+            callees_rows = conn.execute(
+                """SELECT s.name, s.qualified_name, s.kind, s.file_path
+                   FROM refs r
+                   JOIN symbols s ON s.usr = r.to_usr AND s.config_hash = r.config_hash
+                   WHERE r.from_usr = ? AND r.config_hash = ? AND r.ref_kind = 'call'
+                   LIMIT 5""",
+                (symbol_usr, config_hash),
+            ).fetchall()
+            callees_list = [
+                {"name": c["name"], "qualified_name": c["qualified_name"] or "",
+                 "kind": c["kind"], "file": abs_path(root, c["file_path"])}
+                for c in callees_rows
+            ]
+    finally:
+        conn.close()
+
+    source = _read_symbol_body(file_path, row["line"], end_line=row["end_line"] or 0)
+    result: dict = {
+        "name": row["name"],
+        "qualified_name": row["qualified_name"],
+        "kind": row["kind"],
+        "file": file_path,
+        "line": row["line"],
+        "signature": row["signature"] or "",
+        "is_definition": bool(row["is_definition"]),
+        "callers": callers_list,
+        "callees": callees_list,
+    }
+    if source:
+        result["source"] = source[:6000] if len(source) > 6000 else source
+    return result
+
+
 def _references_result(name: str, project_root: str | None, ref_kind: str | None, limit: int) -> list[dict]:
     """Shared logic for find_callers / find_references."""
     db_path, cfg, project_id, root = _resolve_context(project_root)
@@ -1019,6 +1088,66 @@ async def smart_search(
         finally:
             conn.close()
     return results
+
+
+# ── MCP Resources ──────────────────────────────────────────────────────────
+
+
+@mcp.resource("fw-context://stats")
+def resource_stats() -> str:
+    """Return a human-readable summary of all indexed projects."""
+    import json
+
+    projects = list_projects()
+    if not projects:
+        return "No indexed projects found."
+    lines = [f"# fw-context — {len(projects)} project(s)", ""]
+    for p in projects:
+        if "error" in p:
+            lines.append(f"- **{p.get('db', '?')}**: ERROR — {p['error']}")
+            continue
+        stale = "⚠ stale" if p.get("stale") else "✓ fresh"
+        lines.append(
+            f"- **{p['name']}** ({p['project_id']}) — "
+            f"{p['symbol_count']} symbols, {p['file_count']} files, "
+            f"indexed {p['indexed_at']}, {stale}"
+        )
+    return "\n".join(lines)
+
+
+@mcp.resource("fw-context://projects")
+def resource_projects() -> str:
+    """Return project list as JSON."""
+    import json
+    return json.dumps(list_projects(), indent=2, ensure_ascii=False, default=str)
+
+
+@mcp.resource("fw-context://symbols/{name}")
+def resource_symbol(name: str) -> str:
+    """Return the definition source of a symbol as a resource."""
+    import json
+
+    result = get_source(name)
+    if "error" in result:
+        return json.dumps(result)
+    source = result.pop("source", "")
+    # Render as a small markdown document
+    lines = [
+        f"# {result['name']}",
+        "",
+        f"- **qualified:** `{result['qualified_name']}`",
+        f"- **kind:** {result['kind']}",
+        f"- **file:** `{result['file']}:{result['line']}`",
+        f"- **signature:** `{result.get('signature', '')}`",
+        "",
+        "```cpp",
+        source,
+        "```",
+    ]
+    return "\n".join(lines)
+
+
+# ── main ────────────────────────────────────────────────────────────────────
 
 
 def main() -> None:

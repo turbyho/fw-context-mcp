@@ -391,12 +391,12 @@ Resources umožňují "watch" pattern — klient subscribne a server notifikuje 
 - [x] R2f: `find_hotspots` — funkce s nejvíce callery
 
 ### Fáze 4 — SCIP + LLM chunking (2-3 dny)
-- [ ] R3: SCIP export
-- [ ] R4: `get_symbol_context` tool
+- [x] R3: JSON export (`fw-context export --format json`, bez protobuf — praktičtější pro embedded)
+- [x] R4: `get_symbol_context` tool — tělo funkce + callers + callees pro LLM kontext
 
 ### Fáze 5 — Watch + Resources (budoucnost)
-- [ ] R5: `fw-context watch`
-- [ ] R7: MCP Resources
+- [x] R5: `fw-context watch` — auto-reindex při změně .c/.cpp/.h/.hpp (watchfiles + debounce)
+- [x] R7: MCP Resources — `fw-context://stats`, `fw-context://projects`, `fw-context://symbols/{{name}}`
 
 ---
 

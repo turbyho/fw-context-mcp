@@ -431,6 +431,196 @@ def _update_marked_section(path: Path, content: str, marker: str) -> None:
     path.write_text(updated, encoding="utf-8")
 
 
+def cmd_export(args: argparse.Namespace) -> int:
+    """Export the symbol index as portable JSON."""
+    import json
+
+    from .config import derive_project_id
+    from .config import load as load_config
+    from .indexer.db import count_refs, get_active_config, open_db
+
+    project_root = Path(args.project or ".").resolve()
+    cfg = load_config(project_root=project_root)
+    project_id = derive_project_id(project_root)
+    db_path = cfg.index.db_dir / project_id / "index.db"
+
+    if not db_path.exists():
+        print(f"No index found for {project_root}. Run 'fw-context index' first.", file=sys.stderr)
+        return 1
+
+    conn = open_db(db_path)
+    try:
+        build_cfg = get_active_config(conn, project_id)
+        if not build_cfg:
+            print(f"No build config indexed for {project_root}.", file=sys.stderr)
+            return 1
+        config_hash = build_cfg["config_hash"]
+
+        output: dict = {
+            "_format": "fw-context-export/1",
+            "project": {
+                "id": project_id,
+                "root": str(project_root),
+                "build_system": _detect_build_system(project_root),
+                "compile_commands": build_cfg["compile_commands_path"],
+                "indexed_at": build_cfg["created_at"],
+            },
+            "config_hash": config_hash,
+        }
+
+        # Symbols
+        symbols = conn.execute(
+            """SELECT name, qualified_name, kind, file_path, line, col, end_line,
+                      is_definition, signature, docstring
+               FROM symbols WHERE config_hash=? ORDER BY kind, name""",
+            (config_hash,),
+        ).fetchall()
+        output["symbols"] = [dict(r) for r in symbols]
+        output["symbol_count"] = len(symbols)
+
+        # References (optional)
+        if not args.no_refs:
+            ref_count = count_refs(conn, config_hash)
+            if ref_count > 0:
+                refs = conn.execute(
+                    """SELECT r.to_usr, r.from_file, r.from_line, r.ref_kind,
+                              caller.name AS caller_name,
+                              callee.name AS callee_name
+                       FROM refs r
+                       LEFT JOIN symbols caller ON caller.usr = r.from_usr AND caller.config_hash = r.config_hash
+                       LEFT JOIN symbols callee ON callee.usr = r.to_usr AND callee.config_hash = r.config_hash
+                       WHERE r.config_hash = ?
+                       ORDER BY r.from_file, r.from_line""",
+                    (config_hash,),
+                ).fetchall()
+                output["references"] = [dict(r) for r in refs]
+                output["reference_count"] = ref_count
+            else:
+                output["reference_count"] = 0
+    finally:
+        conn.close()
+
+    json_text = json.dumps(output, indent=2, ensure_ascii=False, default=str)
+
+    if args.output:
+        Path(args.output).write_text(json_text, encoding="utf-8")
+        print(f"Exported {output['symbol_count']} symbols"
+              f"{' + ' + str(output.get('reference_count', 0)) + ' references' if 'reference_count' in output else ''}"
+              f" → {args.output}")
+    else:
+        print(json_text)
+
+    return 0
+
+
+def cmd_watch(args: argparse.Namespace) -> int:
+    """Watch project source files and auto-reindex on changes.
+
+    Monitors the project directory for changes to ``.c``, ``.cpp``, ``.h``,
+    and ``.hpp`` files and runs ``reindex_file`` on each modified file.
+    Changes are debounced so rapid saves (e.g. from an IDE) trigger at most
+    one re-index per *debounce_ms* interval per file.
+    """
+    import time
+    from collections import defaultdict
+
+    from watchfiles import watch
+
+    from .config import derive_project_id, load as load_config
+    from .indexer.compile_commands import parse as parse_cc
+    from .indexer.db import get_active_config, open_db
+    from .indexer.ops import store_symbols_for_unit
+
+    root = Path(args.project or ".").resolve()
+    cfg = load_config(project_root=root)
+    project_id = derive_project_id(root)
+    db_path = cfg.index.db_dir / project_id / "index.db"
+
+    if not db_path.exists():
+        print(f"No index found for {root}. Run 'fw-context index' first.", file=sys.stderr)
+        return 1
+
+    print(f"👀 Watching {root} for changes (debounce={args.debounce}ms)...")
+    print("   Press Ctrl+C to stop.")
+
+    debounce_s = args.debounce / 1000.0
+    pending: dict[str, float] = defaultdict(float)
+
+    try:
+        for changes in watch(root, debounce=debounce_s, recursive=True):
+            source_exts = {".c", ".cpp", ".h", ".hpp"}
+            changed_files = {
+                (Path(root), change)
+                for change, root in changes
+                if Path(root).suffix.lower() in source_exts
+                and "__pycache__" not in root
+                and ".git/" not in root
+            }
+
+            if not changed_files:
+                continue
+
+            now = time.monotonic()
+            for path, _ in changed_files:
+                pending[str(path)] = now
+
+            # Process files whose debounce window has elapsed
+            ready = [p for p, t in pending.items() if now - t >= debounce_s]
+            if not ready:
+                continue
+
+            # Reload compile_commands to pick up any new TUs
+            try:
+                conn = open_db(db_path)
+                build_cfg = get_active_config(conn, project_id)
+                if not build_cfg:
+                    conn.close()
+                    continue
+                cc_path = Path(build_cfg["compile_commands_path"])
+                units = list(parse_cc(cc_path))
+                config_hash = build_cfg["config_hash"]
+                source_roots = cfg.source_root_paths(root)
+                exclude_paths = cfg.exclude_root_paths(root)
+            except Exception as e:
+                print(f"  ⚠ Failed to reload build config: {e}")
+                conn.close()
+                continue
+
+            for fp in ready:
+                del pending[fp]
+                try:
+                    target = Path(fp).resolve()
+                    matching = [u for u in units if Path(u.file).resolve() == target]
+                    if not matching:
+                        continue
+                    total = 0
+                    for unit in matching:
+                        syms_added, _ = store_symbols_for_unit(
+                            conn, unit, config_hash, root,
+                            source_roots=source_roots,
+                            exclude_paths=exclude_paths,
+                            index_refs=cfg.index.index_refs,
+                        )
+                        total += syms_added
+                    conn.commit()
+                    try:
+                        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                    except Exception:
+                        pass
+                    if total > 0:
+                        rel = target.relative_to(root)
+                        print(f"  ✓ reindexed {rel} ({total} symbols)")
+                except Exception as e:
+                    print(f"  ✗ {fp}: {e}")
+
+            conn.close()
+
+    except KeyboardInterrupt:
+        print("\nStopped.")
+
+    return 0
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(prog="fw-context", description="Firmware code intelligence")
     parser.add_argument("-v", "--verbose", action="store_true")
@@ -473,6 +663,18 @@ def main() -> None:
     p_status = sub.add_parser("status", help="Show index status for the current project")
     p_status.add_argument("--project", metavar="DIR")
     p_status.set_defaults(func=cmd_status)
+
+    p_export = sub.add_parser("export", help="Export the symbol index as JSON")
+    p_export.add_argument("--project", metavar="DIR")
+    p_export.add_argument("-o", "--output", metavar="PATH", help="Output file (default: stdout)")
+    p_export.add_argument("--no-refs", action="store_true", help="Omit cross-references")
+    p_export.set_defaults(func=cmd_export)
+
+    p_watch = sub.add_parser("watch", help="Watch project files and auto-reindex on changes")
+    p_watch.add_argument("--project", metavar="DIR", help="Project root (default: cwd)")
+    p_watch.add_argument("--debounce", type=int, default=2000, metavar="MS",
+                         help="Debounce delay in ms (default: 2000)")
+    p_watch.set_defaults(func=cmd_watch)
 
     args = parser.parse_args()
     if not hasattr(args, "func"):
