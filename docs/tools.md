@@ -71,10 +71,54 @@ fw-context reset --project /path  # specific project
 
 ### `fw-context init`
 
-Register fw-context with Claude Code and OpenCode (see [Setup](installation.md#setting-up-ai-assistant-integration)).
-Also creates `.fw-context/config.toml` in the current directory, so you can
-customize `source_roots`, `exclude_paths`, and LLM settings per-project before
-the first `fw-context index`.
+### `fw-context init`
+
+Register fw-context with AI assistants and inject usage instructions.
+
+Per-tool injection with inheritance awareness and collision detection.
+When run without arguments, sets up all detected tools.
+
+```bash
+fw-context init                         # set up all detected AI assistants
+fw-context init --tool claude-code      # set up a specific tool
+fw-context init --list-tools            # show supported tools and detection status
+fw-context init --dry-run               # preview changes without writing
+fw-context init --force                 # overwrite even when collisions detected
+fw-context init --instructions-only     # only inject instructions, skip MCP registration
+fw-context init --scope project         # inject into project-level config files
+```
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--tool ID` | all detected | Set up a specific tool (`claude-code`, `opencode`, `kilocode`, `codex`, `cursor`) |
+| `--dry-run` | off | Show what would be done without making changes |
+| `--force` | off | Overwrite even when collisions are detected |
+| `--instructions-only` | off | Only inject instruction files, skip MCP server registration |
+| `--scope global\|project` | `global` | Inject into global (`~/`) or project (`.cursor/`, `CLAUDE.md`) config |
+| `--project DIR` | `.` | Project root for project-scoped targets |
+| `--list-tools` | — | List supported AI assistants and their detection status |
+
+**Supported tools:**
+
+| Tool | ID | Detection | Inheritance |
+|------|----|-----------|-------------|
+| Claude Code | `claude-code` | `claude` binary, `~/.claude/` | — |
+| OpenCode | `opencode` | `~/.config/opencode/` | — |
+| Kilo Code | `kilocode` | `~/.kilocode/` | inherits from Claude Code |
+| Codex | `codex` | `~/.codex/` | — |
+| Cursor | `cursor` | `~/.cursor/` | — |
+
+**Inheritance:** Kilo Code shares Claude Code's configuration — when
+Claude Code has fw-context instructions, Kilo Code reads them automatically.
+Running `fw-context init --tool kilocode` prints "inherits from Claude Code —
+nothing to do" unless `--force` is used.
+
+**Collision detection:** Before writing, the tool checks for:
+- Existing `<!-- fw-context -->` marked sections (safe to update)
+- Unmarked fw-context content (potential duplicate — skipped unless `--force`)
+- skillshare-managed directories (injection may be overwritten — skipped unless `--force`)
+
+Also creates `.fw-context/config.toml` in the current directory.
 
 ## MCP tools
 
