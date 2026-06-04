@@ -763,9 +763,9 @@ def _references_result(name: str, project_root: str | None, ref_kind: str | None
             config_hash = cfg_data["config_hash"]
             if count_refs(conn, config_hash) == 0:
                 return [{"info": (
-                    "No references indexed. The cross-reference graph is opt-in — "
-                    "enable it with [index] index_refs = true (or run "
-                    "'fw-context index --refs') and re-index the project."
+                    "No references indexed. Refs are on by default — "
+                    "they may have been disabled with [index] index_refs = false. "
+                    "Re-run 'fw-context index' to rebuild with refs enabled."
                 )}]
             limit = min(limit, 200)
             rows = find_refs(conn, config_hash, name, ref_kind=ref_kind, limit=limit)
@@ -824,8 +824,9 @@ def _refs_guard(project_root: str | None) -> tuple[Path, str, str] | tuple[None,
             config_hash = cfg_data["config_hash"]
             if count_refs(conn, config_hash) == 0:
                 return None, None, [{"info": (
-                    "No references indexed. Enable [index] index_refs = true "
-                    "and re-index the project."
+                    "No references indexed. Refs are on by default — "
+                    "they may have been disabled with [index] index_refs = false. "
+                    "Re-run 'fw-context index' to rebuild."
                 )}]
             # Connection stays open — caller must close it
             return root, config_hash, None

@@ -44,7 +44,7 @@ def cmd_index(args: argparse.Namespace) -> int:
         source_roots=source_roots,
         exclude_paths=exclude_paths,
         project_name=args.name or cfg.project.name,
-        index_refs=args.refs or cfg.index.index_refs,
+        index_refs=False if args.no_refs else cfg.index.index_refs,
         index_embeddings=(
             False if getattr(args, 'no_embeddings', False)
             else getattr(args, 'embeddings', None) or cfg.index.index_embeddings
@@ -631,7 +631,7 @@ def main() -> None:
     p_index.add_argument("--project", metavar="DIR", help="Project root (default: cwd)")
     p_index.add_argument("--source-roots", nargs="+", metavar="DIR")
     p_index.add_argument("--name", metavar="NAME", help="Project name override")
-    p_index.add_argument("--refs", action="store_true", help="Build cross-reference / call graph (find_callers, find_references)")
+    p_index.add_argument("--no-refs", action="store_true", help="Skip cross-reference indexing (on by default)")
     p_index.add_argument("--no-embeddings", action="store_true", dest="no_embeddings", help="Skip embedding generation")
     p_index.add_argument("--embeddings", action="store_true", dest="embeddings", default=None, help="Generate symbol embeddings (default)")
     p_index.set_defaults(func=cmd_index)

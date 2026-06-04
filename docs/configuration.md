@@ -28,7 +28,7 @@ Both files are auto-created with sensible defaults on first use.
 | `compile_commands` | `"compile_commands.json"` | project | Path to compilation database. Relative paths resolved from project root. |
 | `source_roots` | `[]` *(auto-detect)* | project | Directories to scan for symbols. **Empty = auto-detect** — scans `src`, `lib`, `app`, `include`, `modules`, `drivers` + framework dirs (`zephyr/`, `mbed-os/`) + top-level dirs from `compile_commands.json`. Set explicitly to narrow or extend: `["src", "lib", "/path/to/framework"]`. |
 | `exclude_paths` | `["build", "BUILD"]` | project | Directories to skip. Useful for generated code, test fixtures, vendored code. |
-| `index_refs` | `false` | project | Build cross-reference / call graph. Off by default — adds indexing time and DB size. Set `true` (or pass `--refs`) to enable `find_callers`, `find_call_path`, `find_dead_code`, etc. |
+| `index_refs` | `true` | project | Build cross-reference / call graph. On by default — enables `find_callers`, `find_call_path`, `find_dead_code`, etc. Set `false` or pass `--no-refs` for faster indexing on very large projects. |
 | `index_embeddings` | `true` | project | Generate vector embeddings during indexing. Requires Ollama. Adds ~1–2 minutes. Disable with `false` or `--no-embeddings`. Embeddings power semantic search and hybrid FTS5+vector re-ranking. |
 
 ### `[llm]` — Ollama
@@ -74,7 +74,7 @@ name = "my-firmware"
 compile_commands = "build/compile_commands.json"   # Zephyr: in build/
 source_roots = []                                   # auto-detect
 exclude_paths = ["build", "BUILD", "generated", "third_party"]
-index_refs = true                                    # enable call graph
+# index_refs = false                                 # disable for faster indexing
 # index_embeddings = false                           # skip if no Ollama
 
 [llm]
