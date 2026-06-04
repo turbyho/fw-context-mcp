@@ -469,28 +469,64 @@ def find_refs(
     Each result carries the referencing location and, when known, the enclosing
     caller symbol (joined from refs.from_usr → symbols.usr).
 
-    Tries exact match on short name first (``ModemMsgManager``), then falls back
-    to exact match on qualified name (``zbox::ModemMsgManager``).
+    For classes, structs, and enums the index stores references at member-level
+    granularity (e.g. ``ZUART::get``, not ``ZUART`` itself).  When the resolved
+    symbol is an aggregate type, the query uses USR prefix matching
+    (``to_usr LIKE usr || '@%'``) so all member references are included.
     """
+    # ── Resolve name → USR and kind ──────────────────────────────────────
+    symbol = conn.execute(
+        """SELECT usr, kind FROM symbols
+           WHERE config_hash = ?
+             AND (name = ? OR qualified_name = ?)
+           ORDER BY is_definition DESC, qualified_name = ? DESC
+           LIMIT 1""",
+        (config_hash, name, name, name),
+    ).fetchone()
+
+    if not symbol:
+        return []
+
+    is_aggregate = symbol["kind"] in ("class", "struct", "enum")
     kind_filter = "AND r.ref_kind = ?" if ref_kind else ""
-    params: list = [config_hash, config_hash, name, name]
+
+    _SELECT = """SELECT r.from_file, r.from_line, r.ref_kind,
+                        r.from_usr,
+                        caller.name           AS caller_name,
+                        caller.qualified_name AS caller_qname,
+                        caller.kind           AS caller_kind,
+                        caller.file_path      AS caller_file
+                 FROM refs r
+                 LEFT JOIN symbols caller
+                   ON caller.config_hash = r.config_hash AND caller.usr = r.from_usr
+                 WHERE r.config_hash = ?"""
+
+    if is_aggregate:
+        usr_prefix = symbol["usr"] + "@%"
+        params: list = [config_hash, usr_prefix]
+        if ref_kind:
+            params.append(ref_kind)
+        params.append(limit)
+        return conn.execute(
+            f"""{_SELECT}
+                  AND r.to_usr LIKE ? {kind_filter}
+                ORDER BY r.from_file, r.from_line
+                LIMIT ?""",
+            params,
+        ).fetchall()
+
+    # ── Exact USR match for functions, methods, variables, etc. ──────────
+    params = [config_hash, config_hash, name, name]
     if ref_kind:
         params.append(ref_kind)
     params.append(limit)
     return conn.execute(
-        f"""SELECT r.from_file, r.from_line, r.ref_kind,
-                   r.from_usr,
-                   caller.name           AS caller_name,
-                   caller.qualified_name AS caller_qname,
-                   caller.kind           AS caller_kind,
-                   caller.file_path      AS caller_file
-            FROM refs r
-            JOIN symbols tgt
-              ON tgt.config_hash = r.config_hash AND tgt.usr = r.to_usr
-            LEFT JOIN symbols caller
-              ON caller.config_hash = r.config_hash AND caller.usr = r.from_usr
-            WHERE r.config_hash = ? AND tgt.config_hash = ?
-              AND (tgt.name = ? OR tgt.qualified_name = ?) {kind_filter}
+        f"""{_SELECT}
+              AND r.to_usr IN (
+                  SELECT usr FROM symbols
+                  WHERE config_hash = ?
+                    AND (name = ? OR qualified_name = ?)
+              ) {kind_filter}
             ORDER BY r.from_file, r.from_line
             LIMIT ?""",
         params,
