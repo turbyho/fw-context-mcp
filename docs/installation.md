@@ -206,21 +206,37 @@ num_ctx = 8192
 
 ## AI assistant setup
 
-Run `fw-context init` for automatic registration (Claude Code + OpenCode).
+Run `fw-context init` for automatic registration with all detected AI assistants.
 For manual setup or other assistants, see **[README-MCP.md](../README-MCP.md#integration)**.
 
-
-## Setting up AI assistant integration
-
-Run this once:
-
 ```bash
-fw-context init
+fw-context init                    # set up all detected AI assistants
+fw-context init --list-tools       # show which tools are supported and detected
+fw-context init --dry-run          # preview changes without writing
+fw-context init --tool codex       # set up a specific tool only
 ```
 
-It registers the MCP server globally in Claude Code, inserts usage instructions
-into `~/.claude/CLAUDE.md`, and writes rules for OpenCode. The command is
-idempotent — safe to re-run after updates.
+The command is idempotent — safe to re-run after updates. It registers the
+MCP server (Claude Code), injects usage instructions into tool-specific config
+files, and creates `.fw-context/config.toml` in the current directory.
 
-For manual setup or other assistants, see [AI assistant setup](#ai-assistant-setup).
+**Supported tools:**
+
+| Tool | What `init` does |
+|------|-----------------|
+| **Claude Code** | Registers MCP server via `claude mcp add`, injects `<!-- fw-context -->` section into `~/.claude/CLAUDE.md` |
+| **OpenCode** | Writes `~/.config/opencode/rules/fw-context.md` |
+| **Kilo Code** | Nothing — inherits from Claude Code automatically |
+| **Codex** | Writes `~/.codex/rules/fw-context.md` |
+| **Cursor** | Writes `.cursor/rules/fw-context.mdc` (project-scoped) |
+
+**Inheritance:** Kilo Code shares Claude Code's configuration files, so
+fw-context instructions in `~/.claude/CLAUDE.md` apply to both. Running
+`fw-context init --tool kilocode` confirms inheritance and skips.
+
+**Collision detection:** Before writing, `init` checks for existing
+fw-context content (marked sections, unmarked duplicates, skillshare-managed
+directories) and warns instead of overwriting. Use `--force` to override.
+
+For manual setup or other assistants, see **[README-MCP.md](../README-MCP.md#integration)**.
 
