@@ -9,133 +9,6 @@ import sys
 from datetime import UTC
 from pathlib import Path
 
-_CLAUDE_MD_INSTRUCTIONS = """\
-<!-- fw-context -->
-## fw-context — Build-aware code intelligence
-
-`fw-context` MCP tools are available globally. **Use them only in embedded firmware
-projects built with Mbed OS, Zephyr, or PlatformIO.** Do not use in Python, JS,
-Go, or other projects — the index is built from `compile_commands.json` and only
-covers C/C++ translation units.
-
-### lean-ctx compatibility
-
-Do NOT use lean-ctx tools (`ctx_read`, `ctx_shell`, `ctx_search`, `ctx_tree`,
-`ctx_edit`, `ctx_multi_read`) to process or display results from fw-context code
-queries (`search_code`, `lookup_symbol`, `explain_symbol`, `smart_search`,
-`reindex_file`). C/C++ code results must stay uncompressed — use native tools.
-
-When working on the `fw-context-mcp` source code itself
-(`~/dev/sw/work/tools/fw-context-mcp/`), do NOT use lean-ctx for C/C++ code.
-
-### When to use
-
-**Code search:**
-- Looking up a symbol definition or declaration → `lookup_symbol(name)`
-- Searching for functions/classes by topic → `search_code(query)` or `smart_search(query)`
-- Understanding what a function does → `explain_symbol(name)` (uses local Ollama
-   when available; falls back to returning source + prompt for you to explain)
-- Checking build metadata or index freshness → `get_active_build()`
-
-**Index administration:**
-- List all indexed projects → `list_projects()`
-- Delete index for a project (e.g. after toolchain change) → `reset_index(project_root?)`;
-  always call without `confirm` first (dry-run), then with `confirm=True` to proceed
-- Check Ollama model availability → `check_ollama()`
-
-### Workflow
-
-1. Call `get_active_build()` first to confirm the index exists and is not stale.
-   If `stale: true`, remind the user to run `fw-context index` in the project root.
-2. Prefer `lookup_symbol` for exact names, `search_code` for keyword search,
-   `smart_search` for natural-language queries.
-3. Use `check_ollama()` before the first `explain_symbol` or `smart_search` call in
-   a session to verify the local model is available.
-4. `explain_symbol` reads source context and calls the local Ollama model — it may
-   take 10–30 s. Do not call it in a loop over many symbols.
-5. When `explain_symbol` returns a `warning` with `source` and `explain_prompt`
-   instead of `explanation`, Ollama is unavailable — answer the prompt yourself.
-
-### Index setup (first use in a project)
-
-```bash
-# Mbed OS
-bear -- python3 build_app.py --profile release --type DEV
-fw-context index
-
-# Zephyr
-west build -b <board> -- -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
-fw-context index build/compile_commands.json
-
-# PlatformIO
-pio run --target compiledb
-fw-context index
-```
-<!-- /fw-context -->"""
-
-_OPENCODE_RULES_INSTRUCTIONS = """\
-# fw-context — Build-aware code intelligence
-
-`fw-context` MCP tools are available globally. **Use them only in embedded firmware
-projects built with Mbed OS, Zephyr, or PlatformIO.** Do not use in Python, JS,
-Go, or other projects — the index is built from `compile_commands.json` and only
-covers C/C++ translation units.
-
-## lean-ctx compatibility
-
-Do NOT use lean-ctx tools (`ctx_read`, `ctx_shell`, `ctx_search`, `ctx_tree`,
-`ctx_edit`, `ctx_multi_read`) to process or display results from fw-context code
-queries (`search_code`, `lookup_symbol`, `explain_symbol`, `smart_search`,
-`reindex_file`). C/C++ code results must stay uncompressed — use native tools.
-
-When working on the `fw-context-mcp` source code itself
-(`~/dev/sw/work/tools/fw-context-mcp/`), do NOT use lean-ctx at C/C++ code.
-
-## When to use
-
-**Code search:**
-- Looking up a symbol definition or declaration → `lookup_symbol(name)`
-- Searching for functions/classes by topic → `search_code(query)` or `smart_search(query)`
-- Understanding what a function does → `explain_symbol(name)` (uses local Ollama
-   when available; falls back to returning source + prompt for you to explain)
-- Checking build metadata or index freshness → `get_active_build()`
-
-**Index administration:**
-- List all indexed projects → `list_projects()`
-- Delete index for a project (e.g. after toolchain change) → `reset_index(project_root?)`;
-  always call without `confirm` first (dry-run), then with `confirm=True` to proceed
-- Check Ollama model availability → `check_ollama()`
-
-## Workflow
-
-1. Call `get_active_build()` first to confirm the index exists and is not stale.
-   If `stale: true`, remind the user to run `fw-context index` in the project root.
-2. Prefer `lookup_symbol` for exact names, `search_code` for keyword search,
-   `smart_search` for natural-language queries.
-3. Use `check_ollama()` before the first `explain_symbol` or `smart_search` call in
-   a session to verify the local model is available.
-4. `explain_symbol` reads source context and calls the local Ollama model — it may
-   take 10–30 s. Do not call it in a loop over many symbols.
-5. When `explain_symbol` returns a `warning` with `source` and `explain_prompt`
-   instead of `explanation`, Ollama is unavailable — answer the prompt yourself.
-
-## Index setup (first use in a project)
-
-```bash
-# Mbed OS
-bear -- python3 build_app.py --profile release --type DEV
-fw-context index
-
-# Zephyr
-west build -b <board> -- -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
-fw-context index build/compile_commands.json
-
-# PlatformIO
-pio run --target compiledb
-fw-context index
-```
-"""
-
 
 def cmd_index(args: argparse.Namespace) -> int:
     from .config import derive_project_id
@@ -346,11 +219,25 @@ def _cli_is_stale(row) -> bool:
 
 
 def cmd_init(args: argparse.Namespace) -> int:
-    import shutil
-    import subprocess
+    """Register fw-context with AI assistants and inject usage instructions.
 
+    Per-tool injection with inheritance awareness, collision detection,
+    dry-run preview, and --list-tools discovery.
+    """
+    import shutil
+
+    from .config.tools import TOOLS, check_target
     from .config.settings import _ensure_project_config
 
+    # --list-tools: show supported tools and detection status
+    if args.list_tools:
+        print("Supported AI assistants:\n")
+        for tool in TOOLS.values():
+            print(f"  {tool.status()}")
+        print("\nRun 'fw-context init --tool <id>' to set up a specific tool.")
+        return 0
+
+    # Resolve fw-context-mcp binary
     mcp_bin = shutil.which("fw-context-mcp")
     if not mcp_bin:
         for candidate in [
@@ -360,60 +247,151 @@ def cmd_init(args: argparse.Namespace) -> int:
             if candidate.exists():
                 mcp_bin = str(candidate)
                 break
-    if not mcp_bin:
-        print("[error] fw-context-mcp not found in PATH. "
-              "Run: uv pip install ~/.fw-context/src/", file=sys.stderr)
+
+    # Select tools to act on
+    selected: list[str] = []
+    if args.tool:
+        selected = [t.strip() for t in args.tool.split(",")]
+        for tid in selected:
+            if tid not in TOOLS:
+                print(f"[error] Unknown tool: {tid}", file=sys.stderr)
+                print(f"        Supported: {', '.join(TOOLS.keys())}", file=sys.stderr)
+                return 1
+    else:
+        # Default: all detected tools
+        selected = [tid for tid, t in TOOLS.items() if t.is_detected()]
+
+    if not selected:
+        print("No AI assistants detected. Use --list-tools to see supported tools.")
         return 1
+
+    project_root = Path.cwd() if not args.project else Path(args.project).resolve()
     ok = False
+    warnings: list[str] = []
 
-    # 1. Claude Code — global MCP registration
-    claude_bin = shutil.which("claude")
-    if claude_bin:
-        result = subprocess.run(
-            [claude_bin, "mcp", "add", "--scope", "user", "fw-context", mcp_bin],
-            capture_output=True, text=True,
-        )
-        if result.returncode == 0:
-            print(f"[ok] Claude Code: fw-context registered ({mcp_bin})")
-            ok = True
-        else:
-            # already registered is not a fatal error
-            msg = (result.stderr or result.stdout).strip()
-            if "already" in msg.lower() or "exists" in msg.lower():
-                print("[ok] Claude Code: fw-context already registered")
-                ok = True
+    for tool_id in selected:
+        tool = TOOLS[tool_id]
+        print(f"\n── {tool.name} ({tool_id}) ──")
+
+        # Inheritance check
+        if tool.inherits_from:
+            parent = TOOLS.get(tool.inherits_from)
+            parent_name = parent.name if parent else tool.inherits_from
+            parent_ok = parent and parent.is_detected()
+            if parent_ok and tool_id in selected and tool.inherits_from in selected:
+                print(f"  [info] Inherits from {parent_name} — already handled above, skipping")
+                continue
+            elif parent_ok:
+                print(f"  [info] Inherits from {parent_name} which has fw-context instructions")
+                ok = True  # Inheritance is a valid configuration — not an error
+                if not args.force:
+                    print(f"  [skip] Nothing to do. Use --force to inject anyway.")
+                    continue
+                print(f"  [force] Injecting despite inheritance...")
             else:
-                print(f"[warn] Claude Code: {msg}", file=sys.stderr)
-    else:
-        print("[skip] Claude Code: 'claude' not found in PATH — register manually:")
-        print(f"       claude mcp add --scope user fw-context {mcp_bin}")
+                print(f"  [warn] Inherits from {parent_name} but parent NOT DETECTED")
+                print(f"  [info] Injecting instructions anyway...")
 
-    # 2. ~/.claude/CLAUDE.md — insert/replace fw-context section
-    claude_md = Path.home() / ".claude" / "CLAUDE.md"
-    _update_marked_section(claude_md, _CLAUDE_MD_INSTRUCTIONS, "fw-context")
-    print(f"[ok] {claude_md}: fw-context section updated")
-    ok = True
+        # MCP registration (only if not --instructions-only)
+        if not args.instructions_only and tool.mcp_registration and mcp_bin:
+            _register_mcp(tool, mcp_bin)
 
-    # 3. OpenCode rules
-    opencode_rules = Path.home() / ".config" / "opencode" / "rules"
-    if opencode_rules.is_dir():
-        rule_file = opencode_rules / "fw-context.md"
-        rule_file.write_text(_OPENCODE_RULES_INSTRUCTIONS, encoding="utf-8")
-        print(f"[ok] {rule_file}: written")
-        ok = True
-    else:
-        print("[skip] OpenCode rules dir not found — skipping OpenCode setup")
+        # Instruction injection
+        if not tool.targets:
+            if not tool.mcp_registration:
+                print(f"  [skip] No instruction targets defined")
+            continue
 
-    # 4. Project-level config — create .fw-context/config.toml in cwd
-    cwd = Path.cwd()
-    proj_config = _ensure_project_config(cwd)
-    print(f"[ok] {proj_config}: project config ready — edit source_roots, excludes, etc.")
+        for target in tool.targets:
+            if target.scope == "project" and args.scope == "global":
+                continue
+            if target.scope == "global" and args.scope == "project":
+                continue
 
+            collision = check_target(target, project_root if target.scope == "project" else None)
+            resolved = collision.path
+            instructions = target.render_instructions()
+
+            # Collision handling
+            if collision.is_skillshare_managed and not args.force:
+                print(f"  [warn] {resolved}: directory managed by skillshare — skipping")
+                warnings.append(f"{tool.name}: {resolved} is skillshare-managed, use --force to overwrite")
+                continue
+
+            if collision.has_unmarked_content and not args.force:
+                print(f"  [warn] {resolved}: found unmarked fw-context content — skipping")
+                print(f"         Use --force to overwrite, or remove the existing section manually")
+                warnings.append(f"{tool.name}: {resolved} has unmarked fw-context content")
+                continue
+
+            # Dry-run
+            if args.dry_run:
+                if collision.has_marked_section:
+                    print(f"  [dry-run] {resolved}: would UPDATE marked section")
+                else:
+                    print(f"  [dry-run] {resolved}: would CREATE ({target.method})")
+                ok = True
+                continue
+
+            # Write
+            if target.method == "marked_section":
+                _update_marked_section(resolved, instructions, marker="fw-context")
+                if collision.has_marked_section:
+                    print(f"  [ok] {resolved}: updated fw-context section")
+                else:
+                    print(f"  [ok] {resolved}: added fw-context section")
+            elif target.method == "separate_file":
+                resolved.parent.mkdir(parents=True, exist_ok=True)
+                resolved.write_text(instructions, encoding="utf-8")
+                print(f"  [ok] {resolved}: written")
+            ok = True
+
+    # Project-level config (only when something was actually done)
+    if ok and not args.instructions_only and not args.dry_run:
+        proj_config = _ensure_project_config(project_root)
+        print(f"\n[ok] {proj_config}: project config ready — edit source_roots, excludes, etc.")
+
+    if warnings:
+        print(f"\nWarnings:")
+        for w in warnings:
+            print(f"  ⚠ {w}")
     if ok:
-        print("\nSetup complete. Restart your AI assistant to pick up the new MCP server.")
+        if args.dry_run:
+            print("\nDry-run complete. Run without --dry-run to apply changes.")
+        else:
+            print("\nSetup complete. Restart your AI assistant to pick up changes.")
     else:
-        print("\nNo AI assistants were configured. Try manual setup — see README-MCP.md#integration.", file=sys.stderr)
+        print("\nNo changes made.", file=sys.stderr)
     return 0 if ok else 1
+
+
+def _register_mcp(tool, mcp_bin: str) -> None:
+    """Register fw-context as an MCP server with a tool's CLI."""
+    import subprocess
+    import shutil
+    from .config.tools import AiTool
+
+    if not tool.mcp_registration:
+        return
+
+    cmd_str = tool.mcp_registration.replace("{bin}", mcp_bin)
+    parts = cmd_str.split()
+    binary = parts[0]
+
+    if not shutil.which(binary):
+        print(f"  [skip] '{binary}' not found in PATH — register manually:")
+        print(f"         {cmd_str}")
+        return
+
+    result = subprocess.run(parts, capture_output=True, text=True)
+    if result.returncode == 0:
+        print(f"  [ok] {tool.name}: fw-context registered ({mcp_bin})")
+    else:
+        msg = (result.stderr or result.stdout).strip()
+        if "already" in msg.lower() or "exists" in msg.lower():
+            print(f"  [ok] {tool.name}: fw-context already registered")
+        else:
+            print(f"  [warn] {tool.name}: {msg}", file=sys.stderr)
 
 
 def _update_marked_section(path: Path, content: str, marker: str) -> None:
@@ -474,8 +452,15 @@ def main() -> None:
     p_search.add_argument("--limit", type=int, default=20)
     p_search.set_defaults(func=cmd_search)
 
-    p_init = sub.add_parser("init", help="Register fw-context in Claude Code and OpenCode globally")
-    p_init.set_defaults(func=cmd_init)
+    p_init = sub.add_parser("init", help="Register fw-context with AI assistants and inject instructions")
+    p_init.add_argument("--tool", metavar="ID", help="Set up a specific tool (claude-code, opencode, kilocode, codex, cursor)")
+    p_init.add_argument("--dry-run", action="store_true", help="Show what would be done without making changes")
+    p_init.add_argument("--force", action="store_true", help="Overwrite even when collisions are detected")
+    p_init.add_argument("--instructions-only", action="store_true", help="Only inject instructions, skip MCP registration")
+    p_init.add_argument("--scope", choices=["global", "project"], default="global", help="Which scope to inject (default: global)")
+    p_init.add_argument("--project", metavar="DIR", help="Project root (for project-scoped targets)")
+    p_init.add_argument("--list-tools", action="store_true", help="List supported AI assistants and their detection status")
+    p_init.set_defaults(func=cmd_init, tool=None, dry_run=False, force=False, instructions_only=False, list_tools=False)
 
     p_list = sub.add_parser("list", help="List all indexed projects")
     p_list.set_defaults(func=cmd_list)
