@@ -9,17 +9,20 @@ Complete reference for all fw-context CLI commands and MCP server tools.
 Build or update the symbol index from `compile_commands.json`.
 
 ```bash
-# Auto-detect compile_commands.json from config
+# Default: everything on (refs + embeddings)
 fw-context index
 
-# Explicit path
-fw-context index compile_commands.json
+# Explicit path, verbose
+fw-context index compile_commands.json -v
 
-# With cross-references (call graph)
-fw-context index --refs
+# Skip cross-references for faster indexing on large projects
+fw-context index --no-refs
 
-# Custom source roots, verbose
-fw-context index --source-roots src lib drivers -v
+# Skip embeddings (no Ollama available)
+fw-context index --no-embeddings
+
+# Custom source roots
+fw-context index --source-roots src lib drivers
 ```
 
 | Option | Default | Description |
@@ -28,8 +31,7 @@ fw-context index --source-roots src lib drivers -v
 | `--project DIR` | `.` | Project root directory |
 | `--source-roots DIR…` | auto-detected | Directories to index symbols from |
 | `--name NAME` | directory name | Project name override |
-| `--refs` | off | Build cross-reference / call graph |
-| `--embeddings` | on | Generate symbol embeddings for vector search |
+| `--no-refs` | off | Skip cross-reference / call graph indexing |
 | `--no-embeddings` | off | Skip embedding generation |
 | `-v` | off | Verbose progress output |
 
@@ -251,10 +253,11 @@ Output: {"name": "modem_connect", "kind": "function",
 Designed as one-shot LLM context — answers "what does this do and how does it fit?"
 in a single call. Limited to 5 callers and 5 callees.
 
-### Call graph (requires `--refs` index)
+### Call graph
 
-All graph tools require the cross-reference index. Enable with
-`fw-context index --refs` or `[index] index_refs = true` in config.
+All graph tools use the cross-reference index. Enabled by default —
+disable with `fw-context index --no-refs` or `[index] index_refs = false`
+if you don't need them.
 
 #### `find_callers`
 

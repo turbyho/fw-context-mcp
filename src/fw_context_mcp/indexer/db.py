@@ -136,7 +136,7 @@ CREATE TRIGGER IF NOT EXISTS symbols_au AFTER UPDATE ON symbols BEGIN
     VALUES (new.id, new.name, new.qualified_name, new.signature, new.docstring, new.file_path, new.name_tokens);
 END;
 
--- Cross-reference / call graph (opt-in via [index] index_refs = true).
+-- Cross-reference / call graph (on by default; disable with [index] index_refs = false).
 -- to_usr links to symbols.usr (the referenced definition); from_usr is the
 -- enclosing function/method that contains the reference (may be NULL).
 CREATE TABLE IF NOT EXISTS refs (

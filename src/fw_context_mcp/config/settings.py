@@ -42,9 +42,9 @@ compile_commands = "compile_commands.json"
 source_roots = []
 exclude_paths = ["build", "BUILD"]
 
-# index_refs: build a cross-reference / call graph (find_callers, find_references).
-#   Off by default — reference extraction adds indexing time and DB size.
-#   Set true to enable, then re-run 'fw-context index'.
+# index_refs: build a cross-reference / call graph.
+#   On by default — enables find_callers, find_call_path, find_dead_code, etc.
+#   Set false to disable for faster indexing on very large projects.
 # index_refs = false
 
 # [llm]
@@ -72,7 +72,7 @@ class IndexConfig:
     compile_commands: Path = field(default_factory=lambda: Path("compile_commands.json"))
     source_roots: list[str] = field(default_factory=list)
     exclude_paths: list[str] = field(default_factory=lambda: ["build", "BUILD"])
-    index_refs: bool = False
+    index_refs: bool = True
     index_embeddings: bool = True
 
 
