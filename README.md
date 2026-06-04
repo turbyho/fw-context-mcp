@@ -80,19 +80,60 @@ Use **clangd for editing**, **fw-context for AI-assisted exploration**.
 
 ## Architecture
 
+### Data flow
+
 ```
-  Your build system          fw-context index              AI assistant
-  =================          ================              ==============
-  bear / west / pio    -->   libclang parses         -->   lookup_symbol(…)
-  compile_commands            every .c/.cpp in TU          search_code(…)
-  .json                       SQLite + FTS5 db             explain_symbol(…)
+   BUILD                          INDEX                          QUERY
+   =====                          =====                          =====
+   bear / west / pio    libclang parses each TU          AI assistant calls
+   cmake / make         extracts symbols + refs          MCP tools over
+        │               generates embeddings            JSON-RPC (stdio)
+        ▼                       │                              │
+   compile_commands      SQLite db on disk               lookup_symbol(…)
+   .json                 ~/.fw-context/index/            search_code(…)
+                         │            │                  find_callers(…)
+                         ▼            ▼                  explain_symbol(…)
+                    symbols + refs   vec0                 get_symbol_context(…)
+                    (FTS5 index)   (vector KNN)                 │
+                                                          ▼
+                                                    AI assistant answers
+                                                    your question about
+                                                    the code
+```
+
+### Components
+
+```
+   CLI (fw-context)            MCP server (fw-context-mcp)          Ollama (optional)
+   ================            ===========================          ==================
+   fw-context index            exposes 17 tools over               local LLM runtime
+   fw-context export           JSON-RPC (stdio)                    HTTP :11434
+   fw-context watch                  │                                  │
+   fw-context status           search_code ───────────── lookup   smart_search ──▶ translates NL → FTS5 terms
+   fw-context reset            lookup_symbol ─────────── prefix   explain_symbol ─▶ explains function
+   fw-context init             smart_search ──────────── NL       embeddings ────▶ mxbai-embed-large
+   fw-context search           get_source ────────────── body
+                               get_symbol_context ────── body+callers+callees
+                               find_callers ──────────── direct callers
+                               find_references ───────── all uses
+                               find_call_path ────────── BFS in call graph
+                               find_all_callers_recursive  transitive callers
+                               find_callees_recursive ── transitive callees
+                               find_dead_code ────────── never called
+                               find_hotspots ─────────── most-called
+                               get_active_build ──────── index health
+                               reindex_file ──────────── re-parse one file
+                               reset_index ───────────── delete + rebuild
+                               list_projects ─────────── all indexed projects
+                               check_ollama ──────────── verify LLM
 ```
 
 | Component | Runs as | Purpose |
 |-----------|---------|---------|
-| **CLI** (`fw-context`) | User command | Index, export, watch, status, project management |
-| **Indexer** | Called by CLI | libclang parses every translation unit, extracts symbols + references |
-| **MCP server** (`fw-context-mcp`) | Subprocess started by AI assistant | 17 tools over JSON-RPC; optional Ollama for NL search + explanations |
+| **CLI** (`fw-context`) | User command | Index, export, watch, status, reset, init, search |
+| **Indexer** | Called by CLI | libclang parses every TU, stores in SQLite + FTS5 + vec0 |
+| **MCP server** (`fw-context-mcp`) | Subprocess (AI assistant) | 17 tools over JSON-RPC — search, graph, source, maintenance |
+| **Ollama** *(optional)* | Local daemon | NL search, symbol explanation, embedding generation |
 
 ## Key capabilities
 
