@@ -17,6 +17,9 @@ dev = [
     "ruff>=0.4",
     "mypy>=1.10",
 ]
+watch = [
+    "watchfiles>=0.21",
+]
 
 [project.scripts]
 fw-context = "fw_context_mcp.cli:main"
