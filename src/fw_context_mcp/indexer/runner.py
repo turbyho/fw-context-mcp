@@ -139,9 +139,10 @@ def _build_embeddings(conn, config_hash: str, llm_config) -> None:
     log.info("Embeddings stored: %d symbols (model=%s)", total, model)
 
 
-def _process_unit(unit, config_hash, project_root, source_roots, exclude_paths, index_refs, conn, existing_files):
+def _process_unit(unit, config_hash, project_root, source_roots, exclude_paths, index_refs, db_path, existing_files):
     """Process one translation unit: check staleness, parse, store.
 
+    Opens its own DB connection so it is safe to call from worker threads.
     Returns (status, symbols_added, refs_added) where status is
     'updated', 'unchanged', or 'skipped'.
     """
@@ -159,17 +160,21 @@ def _process_unit(unit, config_hash, project_root, source_roots, exclude_paths, 
         if abs(current_mtime - stored_mtime) < 0.001:
             return ("unchanged", 0, 0)
 
+    conn = open_db(db_path)
     try:
-        syms_added, refs_added = store_symbols_for_unit(
-            conn, unit, config_hash, project_root,
-            source_roots=source_roots,
-            exclude_paths=exclude_paths,
-            index_refs=index_refs,
-        )
+        with transaction(conn):
+            syms_added, refs_added = store_symbols_for_unit(
+                conn, unit, config_hash, project_root,
+                source_roots=source_roots,
+                exclude_paths=exclude_paths,
+                index_refs=index_refs,
+            )
         return ("updated", syms_added, refs_added)
     except Exception as exc:
         log.warning("skip TU %s: %s", unit.file.name, exc)
         return ("skipped", 0, 0)
+    finally:
+        conn.close()
 
 
 def run(
@@ -234,7 +239,7 @@ def run(
             futures = {
                 executor.submit(
                     _process_unit, u, config_hash, project_root,
-                    source_roots, exclude_paths, index_refs, conn, existing_files,
+                    source_roots, exclude_paths, index_refs, db_path, existing_files,
                 ): i
                 for i, u in enumerate(units)
             }
@@ -261,13 +266,12 @@ def run(
                         total_syms, total_refs, elapsed,
                     )
     else:
-        # Sequential path — uses per-TU transactions (checkpoint=False)
+        # Sequential path — uses per-TU transactions
         for i, unit in enumerate(units):
-            with transaction(conn, checkpoint=False):
-                status, syms, refs = _process_unit(
-                    unit, config_hash, project_root,
-                    source_roots, exclude_paths, index_refs, conn, existing_files,
-                )
+            status, syms, refs = _process_unit(
+                unit, config_hash, project_root,
+                source_roots, exclude_paths, index_refs, db_path, existing_files,
+            )
             if status == "updated":
                 updated += 1
                 total_syms += syms
