@@ -2,9 +2,8 @@
 
 from __future__ import annotations
 
-from pathlib import Path
-
 from fw_context_mcp.search.phases.base import Phase
+from fw_context_mcp.utils import abs_path
 
 
 class FormatPhase(Phase):
@@ -24,7 +23,7 @@ class FormatPhase(Phase):
                 "name": r.get("name", ""),
                 "qualified_name": r.get("qualified_name", ""),
                 "kind": r.get("kind", ""),
-                "file": _abs_path(project_root, r.get("file_path", "")),
+                "file": abs_path(project_root, r.get("file_path", "")),
                 "line": r.get("line", 0),
                 "is_definition": bool(r.get("is_definition", False)),
                 "signature": r.get("signature", ""),
@@ -55,13 +54,3 @@ class FormatPhase(Phase):
             results.append({"info": "No results found for the generated queries."})
 
         return ctx.evolve(formatted_results=results)
-
-
-def _abs_path(root: Path, path: str) -> str:
-    """Resolve a stored relative file_path to an absolute path."""
-    if not path:
-        return path
-    p = Path(path)
-    if p.is_absolute():
-        return str(p)
-    return str(root / p)

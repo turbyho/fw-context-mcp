@@ -5,7 +5,8 @@ from pathlib import Path
 
 import pytest
 
-from fw_context_mcp.mcp.server import _abs_path, _read_symbol_body
+from fw_context_mcp.mcp.server import _read_symbol_body
+from fw_context_mcp.utils import abs_path as _abs_path
 
 
 class TestAbsPath:
