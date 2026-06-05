@@ -106,7 +106,7 @@ Use **clangd for editing**, **fw-context for AI-assisted exploration**.
 ```
    CLI (fw-context)            MCP server (fw-context-mcp)          Ollama (optional)
    ================            ===========================          ==================
-   fw-context index            exposes 17 tools over               local LLM runtime
+   fw-context index            exposes 18 tools over               local LLM runtime
    fw-context export           JSON-RPC (stdio)                    HTTP :11434
    fw-context watch                  │                                  │
    fw-context status           search_code ───────────── lookup   smart_search ──▶ translates NL → FTS5 terms
@@ -132,7 +132,7 @@ Use **clangd for editing**, **fw-context for AI-assisted exploration**.
 |-----------|---------|---------|
 | **CLI** (`fw-context`) | User command | Index, export, watch, status, reset, init, search |
 | **Indexer** | Called by CLI | libclang parses every TU, stores in SQLite + FTS5 + vec0 |
-| **MCP server** (`fw-context-mcp`) | Subprocess (AI assistant) | 17 tools over JSON-RPC — search, graph, source, maintenance |
+| **MCP server** (`fw-context-mcp`) | Subprocess (AI assistant) | 18 tools over JSON-RPC — search, graph, source, maintenance |
 | **Ollama** *(optional)* | Local daemon | NL search, symbol explanation, embedding generation |
 
 ## Key capabilities
@@ -164,7 +164,7 @@ Subsequent runs are **incremental** — seconds for a few changed files.
 | Document | Covers |
 |----------|--------|
 | **[Installation](docs/installation.md)** | Prerequisites, install, upgrade, Ollama setup, AI assistant integration |
-| **[Tools Reference](docs/tools.md)** | All 17 MCP tools, 8 CLI commands, internal workings, search pipeline |
+| **[Tools Reference](docs/tools.md)** | All 18 MCP tools, 8 CLI commands, internal workings, search pipeline |
 | **[Configuration](docs/configuration.md)** | `.fw-context/config.toml` — global defaults, per-project overrides, every setting |
 | **[MCP Server](README-MCP.md)** | JSON-RPC protocol, tool schemas, error handling, debugging |
 

@@ -64,10 +64,9 @@ Show index freshness and statistics.
 ```bash
 $ fw-context status
 Project : /home/user/firmware
-Symbols : 8586  files=952  refs=12430
+Symbols : 8586  files=952
 Indexed : 2026-06-05 09:35:18
 DB      : ~/.fw-context/index/a1b2c3d4/index.db
-Status  : fresh
 ```
 
 ### `fw-context list`
@@ -76,8 +75,8 @@ List all indexed projects.
 
 ```bash
 $ fw-context list
-my-zephyr-app   /home/user/zephyr-app     symbols=12430  files=1502  indexed=2026-06-05
-my-mbed-app     /home/user/mbed-app       symbols=8586   files=952   indexed=2026-06-04
+my-zephyr-app   /home/user/zephyr-app     symbols=12430  files=1502  indexed=2026-06-05 09:35:18
+my-mbed-app     /home/user/mbed-app       symbols=8586   files=952   indexed=2026-06-04 16:20:45
 ```
 
 ### `fw-context reset`
@@ -497,13 +496,13 @@ workflow requires no manual steps.
    Parse with libclang using exact compiler flags (-I, -D, -std, --target)
    Traverse AST → extract symbols within source_roots
    Category: function, method, class, enum, typedef, variable, field, …
-   If --refs: extract cross-references within source_roots
+   Extract cross-references within source_roots (on by default; skip with --no-refs)
 
 4. Write to SQLite (atomic per-TU transaction):
    Delete old symbols for this TU
    Insert new symbols + FTS5 triggers
-   If --refs: insert references
-   If --embeddings: generate + store vector embeddings
+   Insert references (on by default; skip with --no-refs)
+   Generate + store vector embeddings (on by default; skip with --no-embeddings)
 
 5. Write build metadata:
    compile_commands.json hash, file mtimes, symbol/file/ref counts
