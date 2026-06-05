@@ -28,33 +28,81 @@ covers C/C++ translation units.
 
 {lean_ctx_carveout}
 
-### When to use
+### Session start
 
-**Code search:**
-- Looking up a symbol definition or declaration → `lookup_symbol(name)`
-- Searching for functions/classes by topic → `search_code(query)` or `smart_search(query)`
-- Understanding what a function does → `explain_symbol(name)` (uses local Ollama
-   when available; falls back to returning source + prompt for you to explain)
-- Checking build metadata or index freshness → `get_active_build()`
+Call `get_active_build()` first. If `stale: true`, remind the user to run
+`fw-context index`.  If the index is missing, show the setup commands below.
 
-**Index administration:**
-- List all indexed projects → `list_projects()`
-- Delete index for a project (e.g. after toolchain change) → `reset_index(project_root?)`;
-  always call without `confirm` first (dry-run), then with `confirm=True` to proceed
-- Check Ollama model availability → `check_ollama()`
+### Source code — read function bodies and file structure directly
 
-### Workflow
+**Do NOT use Read/grep on source files for symbols that are in the index.**
+Instead use:
 
-1. Call `get_active_build()` first to confirm the index exists and is not stale.
-   If `stale: true`, remind the user to run `fw-context index` in the project root.
-2. Prefer `lookup_symbol` for exact names, `search_code` for keyword search,
-   `smart_search` for natural-language queries.
-3. Use `check_ollama()` before the first `explain_symbol` or `smart_search` call in
-   a session to verify the local model is available.
-4. `explain_symbol` reads source context and calls the local Ollama model — it may
-   take 10–30 s. Do not call it in a loop over many symbols.
-5. When `explain_symbol` returns a `warning` with `source` and `explain_prompt`
-   instead of `explanation`, Ollama is unavailable — answer the prompt yourself.
+- `get_source(name)` — full body of a function/method with line numbers.
+  Uses libclang's exact extent; faster and more precise than grep+Read.
+- `get_file_map(path)` — all symbols in a file grouped by kind (methods,
+  variables, classes, …).  Like a table of contents — use BEFORE reading
+  a large file to understand its structure.
+- `get_symbol_context(name)` — body, signature, and up to 5 direct callers
+  + 5 direct callees.  One-shot context for "what does X do and how does
+  it fit?"
+
+### Symbol search
+
+- `lookup_symbol(name, exact?)` — find by exact or prefix name.  Prefer
+  when you know the identifier.
+- `search_code(query, kind?)` — FTS5 full-text search.  Use 1–3 words,
+  omit underscores (`modem init`, not `modem_init`).  Filter by kind
+  (`function`, `method`, `class`, `struct`, `enum`, …) for precision.
+- `smart_search(query)` — natural-language → FTS5 + vector re-rank.
+  Use when you don't know the right keywords (\"how does the modem connect?\").
+  Slow — 10–30 s with Ollama; call `check_ollama()` first.
+
+### Call graph
+
+All graph tools require `index_refs: true` (the default).  If `find_callers`
+returns \"No references indexed\", remind the user to re-index without `--no-refs`.
+
+- `find_callers(name)` — who calls this?  Direct call sites only.
+- `find_references(name)` — all uses: calls, reads, member access.
+- `find_call_path(from, to, max_depth?)` — shortest paths between two
+  functions via BFS.  Returns up to 5 paths with depth and chain.
+- `find_all_callers_recursive(name, max_depth?)` — transitive callers,
+  deduplicated by shortest distance.
+- `find_callees_recursive(name, max_depth?)` — transitive callees.
+- `find_hotspots(limit?)` — most-called functions ranked by caller count.
+  Useful for impact analysis: changing a hotspot affects many callers.
+- `find_dead_code(limit?)` — functions/methods defined but never called.
+  Expect false positives (constructors called via factory, interrupt
+  handlers, virtual methods).
+
+### Code understanding (Ollama)
+
+- `explain_symbol(name)` — plain-English explanation via local Ollama.
+  10–30 s per call.  Falls back to source + prompt when Ollama is off.
+- `check_ollama()` — verify Ollama is running and the configured model
+  is available.  Call before the first `explain_symbol` or `smart_search`.
+
+### Index maintenance
+
+- `get_active_build()` — index freshness, symbol/file/ref counts, staleness.
+- `reindex_file(path)` — re-parse one file after editing.  File must be in
+  `compile_commands.json`.  For broader changes, remind the user to run
+  `fw-context index`.
+- `reset_index(confirm?)` — delete the index.  Always call without `confirm`
+  first (dry-run), then with `confirm=True` to actually delete.
+- `list_projects()` — show all indexed firmware projects.
+
+### Workflow patterns
+
+1. **Explore a file:** `get_file_map("src/modem.cpp")` → see what's inside
+   → `get_source("ModemMsg::send")` to read specific functions.
+2. **Trace impact:** `find_all_callers_recursive("uart_write")` → see the
+   call chain → `get_source` on the callers that matter.
+3. **Understand a function:** `get_symbol_context("modem_connect")` →
+   body + direct callers + callees in a single call.
+4. **Find by topic:** `search_code("ble advertising", kind="function")`
+   → `get_source` on the matches → `find_callers` to see usage.
 
 ### Index setup (first use in a project)
 
