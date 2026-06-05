@@ -1014,6 +1014,58 @@ def get_file_mtime_indexed(conn: sqlite3.Connection, config_hash: str, path: str
     return row["mtime"] if row else None
 
 
+def get_file_map(
+    conn: sqlite3.Connection,
+    config_hash: str,
+    file_path: str,
+) -> dict:
+    """Return all symbols in a file grouped by kind — fast structural overview.
+
+    *file_path* is relative to the project root (e.g. ``src/modem_msg.cpp``),
+    matching the ``symbols.file_path`` column.  Exact match first, then suffix
+    match so both ``src/main.cpp`` and ``main.cpp`` work.
+    """
+    rows = conn.execute(
+        """SELECT name, qualified_name, kind, line, col, end_line,
+                  is_definition, signature
+           FROM symbols
+           WHERE config_hash = ? AND file_path = ?
+           ORDER BY kind, line""",
+        (config_hash, file_path),
+    ).fetchall()
+
+    if not rows:
+        rows = conn.execute(
+            """SELECT name, qualified_name, kind, line, col, end_line,
+                      is_definition, signature
+               FROM symbols
+               WHERE config_hash = ? AND file_path LIKE ?
+               ORDER BY kind, line""",
+            (config_hash, f"%{file_path}"),
+        ).fetchall()
+
+    groups: dict[str, list[dict]] = {}
+    for r in rows:
+        kind = r["kind"]
+        entry: dict = {
+            "name": r["name"],
+            "qualified_name": r["qualified_name"],
+            "line": r["line"],
+            "is_definition": bool(r["is_definition"]),
+        }
+        if r["signature"]:
+            entry["signature"] = r["signature"]
+        if r["end_line"] and r["end_line"] > r["line"]:
+            entry["end_line"] = r["end_line"]
+        groups.setdefault(kind, []).append(entry)
+
+    return {
+        "file": file_path,
+        "total_symbols": len(rows),
+        "symbols": groups,
+    }
+
+
 def get_all_projects(conn: sqlite3.Connection) -> list[sqlite3.Row]:
     """Return all projects with their latest build_config stats."""
     return conn.execute(

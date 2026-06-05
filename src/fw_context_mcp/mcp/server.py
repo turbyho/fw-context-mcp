@@ -675,6 +675,55 @@ def get_source(name: str, project_root: str | None = None) -> dict:
 
 
 @mcp.tool()
+def get_file_map(
+    file_path: str,
+    project_root: str | None = None,
+) -> dict:
+    """Return all symbols in a file grouped by kind — fast structural overview.
+
+    Like a table of contents before reading a chapter.  Pass a path relative
+    to the project root (``src/main.cpp``) or just the filename (``main.cpp``).
+
+    Returns a dict with ``file``, ``total_symbols``, and ``symbols`` keyed by
+    kind (``function``, ``method``, ``class``, ``struct``, ``enum``, …).
+    Each symbol has ``name``, ``line``, and optionally ``signature``.
+    """
+    db_path, cfg, project_id, root = _resolve_context(project_root)
+    if not db_path.exists():
+        return {"error": f"No index found for {root}. Run 'fw-context index' first."}
+    conn, err = _open_db_safe(db_path)
+    if err:
+        return err
+    try:
+        with conn:
+            cfg_data = get_active_config(conn, project_id)
+            if not cfg_data:
+                return {"error": "No build config indexed."}
+            config_hash = cfg_data["config_hash"]
+            # Resolve file_path: try exact match first, then suffix
+            exact = conn.execute(
+                "SELECT COUNT(*) FROM symbols WHERE config_hash=? AND file_path=?",
+                (config_hash, file_path),
+            ).fetchone()[0]
+            if not exact:
+                # Try to find the canonical path from the files table
+                candidates = conn.execute(
+                    "SELECT path FROM files WHERE config_hash=? AND path LIKE ? LIMIT 3",
+                    (config_hash, f"%{file_path}"),
+                ).fetchall()
+                if not candidates:
+                    return {"error": f"File not found in index: {file_path}. Check the path — use relative paths like 'src/main.cpp'."}
+                # Pick the best match (shortest path that ends with file_path)
+                resolved = min((c["path"] for c in candidates), key=len)
+            else:
+                resolved = file_path
+            result = index_db.get_file_map(conn, config_hash, resolved)
+    finally:
+        conn.close()
+    return result
+
+
+@mcp.tool()
 def get_symbol_context(name: str, project_root: str | None = None) -> dict:
     """Return the body, signature, callers, and callees of a symbol.
 
