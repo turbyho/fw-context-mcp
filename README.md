@@ -1,4 +1,5 @@
 # fw-context
+<!-- mcp-name: io.github.turbyho/fw-context-mcp -->
 
 **MCP server for embedded C/C++ firmware** — gives AI assistants (Claude Code,
 Cursor, OpenCode, etc.) real understanding of your codebase. Parses your actual build
