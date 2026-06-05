@@ -1018,12 +1018,18 @@ def get_file_map(
     conn: sqlite3.Connection,
     config_hash: str,
     file_path: str,
+    signatures: bool = False,
+    max_per_kind: int = 30,
 ) -> dict:
     """Return all symbols in a file grouped by kind — fast structural overview.
 
     *file_path* is relative to the project root (e.g. ``src/modem_msg.cpp``),
     matching the ``symbols.file_path`` column.  Exact match first, then suffix
     match so both ``src/main.cpp`` and ``main.cpp`` work.
+
+    *signatures* adds full signatures (off by default to keep output compact).
+    *max_per_kind* limits items per kind; the ``count`` field always shows the
+    real total.  Set to 0 for no limit.
     """
     rows = conn.execute(
         """SELECT name, qualified_name, kind, line, col, end_line,
@@ -1044,20 +1050,21 @@ def get_file_map(
             (config_hash, f"%{file_path}"),
         ).fetchall()
 
-    groups: dict[str, list[dict]] = {}
+    groups: dict[str, dict] = {}
     for r in rows:
         kind = r["kind"]
-        entry: dict = {
-            "name": r["name"],
-            "qualified_name": r["qualified_name"],
-            "line": r["line"],
-            "is_definition": bool(r["is_definition"]),
-        }
-        if r["signature"]:
-            entry["signature"] = r["signature"]
-        if r["end_line"] and r["end_line"] > r["line"]:
-            entry["end_line"] = r["end_line"]
-        groups.setdefault(kind, []).append(entry)
+        if kind not in groups:
+            groups[kind] = {"count": 0, "items": []}
+        groups[kind]["count"] += 1
+        if max_per_kind == 0 or len(groups[kind]["items"]) < max_per_kind:
+            entry: dict = {
+                "name": r["name"],
+                "qualified_name": r["qualified_name"],
+                "line": r["line"],
+            }
+            if signatures and r["signature"]:
+                entry["signature"] = r["signature"]
+            groups[kind]["items"].append(entry)
 
     return {
         "file": file_path,

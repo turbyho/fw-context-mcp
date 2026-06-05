@@ -678,6 +678,8 @@ def get_source(name: str, project_root: str | None = None) -> dict:
 def get_file_map(
     file_path: str,
     project_root: str | None = None,
+    signatures: bool = False,
+    max_per_kind: int = 30,
 ) -> dict:
     """Return all symbols in a file grouped by kind — fast structural overview.
 
@@ -686,7 +688,8 @@ def get_file_map(
 
     Returns a dict with ``file``, ``total_symbols``, and ``symbols`` keyed by
     kind (``function``, ``method``, ``class``, ``struct``, ``enum``, …).
-    Each symbol has ``name``, ``line``, and optionally ``signature``.
+    Each kind has ``count`` (total) and ``items`` (first N, default 30).
+    Set ``max_per_kind=0`` for unlimited, ``signatures=true`` for full sigs.
     """
     db_path, cfg, project_id, root = _resolve_context(project_root)
     if not db_path.exists():
@@ -717,7 +720,10 @@ def get_file_map(
                 resolved = min((c["path"] for c in candidates), key=len)
             else:
                 resolved = file_path
-            result = index_db.get_file_map(conn, config_hash, resolved)
+            result = index_db.get_file_map(
+                conn, config_hash, resolved,
+                signatures=signatures, max_per_kind=max_per_kind,
+            )
     finally:
         conn.close()
     return result
