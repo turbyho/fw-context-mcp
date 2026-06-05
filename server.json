@@ -1,0 +1,25 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.turbyho/fw-context-mcp",
+  "description": "Build-aware code intelligence for embedded C/C++ firmware. Parses compile_commands.json with libclang, extracts every symbol into a persistent SQLite+FTS5 index, and exposes 19 MCP tools: symbol search, source reading, call-graph traversal, hotspot analysis, dead code detection, and vector search. Supports Mbed OS, Zephyr, PlatformIO, and any build system that produces compile_commands.json.",
+  "version": "0.1.0",
+  "repository": {
+    "url": "https://github.com/turbyho/fw-context-mcp",
+    "source": "github"
+  },
+  "packages": [
+    {
+      "registryType": "pypi",
+      "identifier": "fw-context-mcp",
+      "version": "0.1.0",
+      "transport": {
+        "type": "stdio"
+      }
+    }
+  ],
+  "remotes": [],
+  "categories": ["code-analysis", "developer-tools", "embedded-systems"],
+  "license": "MIT",
+  "homepage": "https://github.com/turbyho/fw-context-mcp",
+  "tags": ["c++", "c", "embedded", "firmware", "libclang", "call-graph", "code-intelligence", "mbed-os", "zephyr", "platformio"]
+}
