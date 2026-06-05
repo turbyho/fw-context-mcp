@@ -155,13 +155,13 @@ Use **clangd for editing**, **fw-context for AI-assisted exploration**.
 
 Works with **any build system** that produces `compile_commands.json`:
 
-| Ecosystem | Auto-detection | Typical scope | First index |
-|-----------|---------------|---------------|-------------|
-| **Mbed OS** | `mbed-os/`, `mbed_app.json` | 2 000–9 000 files, 20 000–80 000 symbols | 5–20 min |
-| **Zephyr RTOS** | `west.yml`, `prj.conf` | 1 000–15 000 files, 10 000–100 000+ symbols | 3–20 min |
-| **PlatformIO** | `platformio.ini` | 500–10 000 files, 5 000–80 000 symbols | 1–15 min |
-| **Bare-metal / FreeRTOS** | Any build with `bear` | 50–2 000 files, 500–20 000 symbols | 5 s–3 min |
-| **Custom toolchain** | Any build with `bear` | Scales to 100 000+ symbols | 10–30 min |
+| Ecosystem | Auto-detection |
+|-----------|---------------|
+| **Mbed OS** | `mbed-os/` directory or `mbed_app.json` |
+| **Zephyr RTOS** | `west.yml` or `prj.conf` |
+| **PlatformIO** | `platformio.ini` |
+| **Bare-metal / FreeRTOS** | Any build with `bear` |
+| **Custom toolchain** | Any build with `bear` |
 
 Subsequent runs are **incremental** — seconds for a few changed files.
 
