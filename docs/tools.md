@@ -200,6 +200,27 @@ FTS5 search. Non-English queries are auto-translated in Phase 0.
 
 ### Understanding
 
+#### `get_file_map`
+
+Structural overview of a file — all symbols grouped by kind. Fast table of
+contents before reading a chapter.
+
+```
+Input:  {"file_path": "src/modem_msg.cpp"}
+Output: {"file": "src/modem_msg.cpp", "total_symbols": 426,
+         "symbols": {
+           "method":    [{"name": "_is_socket_ok", "line": 140, "signature": "bool _is_socket_ok()"}, …],
+           "variable":  [{"name": "_buffer_msg", "line": 105}, …],
+           "constructor": [{"name": "ModemMsg", "line": 130, "signature": "void ModemMsg(…)"}, …],
+           "function":  [{"name": "memset", "line": 94}, …],
+           "struct":    [{"name": "buffer", "line": 3561}, …]
+         }}
+```
+
+Pass a relative path (`src/main.cpp`) or just the filename (`main.cpp` — suffix
+match). Use this instead of `Read` on large files — a 4300-line file returns
+~400 symbols organized by kind in a single response.
+
 #### `get_source`
 
 Read a symbol's definition body — no LLM, fast.

@@ -106,13 +106,14 @@ Use **clangd for editing**, **fw-context for AI-assisted exploration**.
 ```
    CLI (fw-context)            MCP server (fw-context-mcp)          Ollama (optional)
    ================            ===========================          ==================
-   fw-context index            exposes 18 tools over               local LLM runtime
+   fw-context index            exposes 19 tools over               local LLM runtime
    fw-context export           JSON-RPC (stdio)                    HTTP :11434
    fw-context watch                  │                                  │
    fw-context status           search_code ───────────── lookup   smart_search ──▶ translates NL → FTS5 terms
    fw-context reset            lookup_symbol ─────────── prefix   explain_symbol ─▶ explains function
    fw-context init             smart_search ──────────── NL       embeddings ────▶ mxbai-embed-large
-   fw-context search           get_source ────────────── body
+   fw-context search           get_file_map ──────────── file structure by kind
+                               get_source ────────────── body
                                get_symbol_context ────── body+callers+callees
                                find_callers ──────────── direct callers
                                find_references ───────── all uses
@@ -132,7 +133,7 @@ Use **clangd for editing**, **fw-context for AI-assisted exploration**.
 |-----------|---------|---------|
 | **CLI** (`fw-context`) | User command | Index, export, watch, status, reset, init, search |
 | **Indexer** | Called by CLI | libclang parses every TU, stores in SQLite + FTS5 + vec0 |
-| **MCP server** (`fw-context-mcp`) | Subprocess (AI assistant) | 18 tools over JSON-RPC — search, graph, source, maintenance |
+| **MCP server** (`fw-context-mcp`) | Subprocess (AI assistant) | 19 tools over JSON-RPC — search, graph, source, maintenance |
 | **Ollama** *(optional)* | Local daemon | NL search, symbol explanation, embedding generation |
 
 ## Key capabilities
