@@ -173,7 +173,7 @@ def _process_unit(unit, config_hash, project_root, source_roots, exclude_paths, 
 
     conn = open_db(db_path)
     try:
-        with transaction(conn):
+        with transaction(conn, checkpoint=False):
             syms_added, refs_added = store_symbols_for_unit(
                 conn, unit, config_hash, project_root,
                 source_roots=source_roots,
@@ -244,7 +244,7 @@ def run(
     t0 = time.monotonic()
 
     if parallel and len(units) > 1:
-        max_workers = min(os.cpu_count() or 4, 16)
+        max_workers = min(os.cpu_count() or 2, 2)  # libclang contention kills scaling above 2
         log.info("Parallel indexing with %d workers", max_workers)
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             futures = {

@@ -19,14 +19,10 @@ from mcp.server.fastmcp import FastMCP
 from ..config import Config, derive_project_id
 from ..config import load as load_config
 from ..indexer.compile_commands import parse as parse_cc
+from ..indexer import db as index_db
 from ..indexer.db import (
     DatabaseCorruptionError,
     count_refs,
-    find_all_callers_recursive,
-    find_callees_recursive,
-    find_call_path,
-    find_dead_code,
-    find_hotspots,
     find_refs,
     get_active_config,
     get_all_projects,
@@ -828,12 +824,12 @@ def _refs_guard(project_root: str | None) -> tuple[Path, str, str] | tuple[None,
                     "they may have been disabled with [index] index_refs = false. "
                     "Re-run 'fw-context index' to rebuild."
                 )}]
-            # Connection stays open — caller must close it
             return root, config_hash, None
     except Exception:
         conn.close()
         raise
-    # conn intentionally NOT closed here — caller will use it
+    finally:
+        conn.close()
 
 
 @mcp.tool()
@@ -858,7 +854,7 @@ def find_call_path(
     if open_err:
         return [open_err]
     try:
-        rows = find_call_path(conn, config_hash, from_name, to_name, max_depth=max_depth)
+        rows = index_db.find_call_path(conn, config_hash, from_name, to_name, max_depth=max_depth)
         if not rows:
             return [{"info": f"No path found from '{from_name}' to '{to_name}' within depth {max_depth}."}]
         return rows
@@ -885,7 +881,7 @@ def find_all_callers_recursive(
     if open_err:
         return [open_err]
     try:
-        rows = find_all_callers_recursive(conn, config_hash, name, max_depth=max_depth, limit=limit)
+        rows = index_db.find_all_callers_recursive(conn, config_hash, name, max_depth=max_depth, limit=limit)
         if not rows:
             return [{"info": f"No callers found for '{name}'."}]
         return rows
@@ -909,7 +905,7 @@ def find_callees_recursive(
     if open_err:
         return [open_err]
     try:
-        rows = find_callees_recursive(conn, config_hash, name, max_depth=max_depth, limit=limit)
+        rows = index_db.find_callees_recursive(conn, config_hash, name, max_depth=max_depth, limit=limit)
         if not rows:
             return [{"info": f"No callees found for '{name}'."}]
         return rows
@@ -931,7 +927,7 @@ def find_dead_code(
     if open_err:
         return [open_err]
     try:
-        rows = find_dead_code(conn, config_hash, limit=limit)
+        rows = index_db.find_dead_code(conn, config_hash, limit=limit)
         if not rows:
             return [{"info": "No dead code found — every defined function has at least one caller."}]
         return rows
@@ -953,7 +949,7 @@ def find_hotspots(
     if open_err:
         return [open_err]
     try:
-        rows = find_hotspots(conn, config_hash, limit=limit)
+        rows = index_db.find_hotspots(conn, config_hash, limit=limit)
         if not rows:
             return [{"info": "No references indexed — enable index_refs and re-index."}]
         return rows
