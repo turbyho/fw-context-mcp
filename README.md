@@ -1,30 +1,34 @@
 # fw-context
 
-Build-aware code intelligence for embedded firmware — gives AI assistants
-**real C/C++ understanding** of your codebase without hallucination.
+**MCP server for embedded C/C++ firmware** — gives AI assistants (Claude Code,
+Cursor, OpenCode) real understanding of your codebase. Parses your actual build
+with [libclang](https://clang.llvm.org/), extracts every symbol, and builds a
+persistent index with full-text search, call graph, and vector embeddings.
+
+No hallucination. No grepping. No reading 8000 Mbed OS headers into context.
 
 ## What it does
 
-fw-context parses your **actual build** (`compile_commands.json`) with
-[libclang](https://clang.llvm.org/), extracts every C/C++ symbol with its
-qualified name, signature, and location, and stores them in a persistent
-**SQLite + FTS5** database. An **MCP server** exposes this index as tools
-that AI assistants call directly — fast lookups, zero hallucination,
-real `#ifdef`-aware understanding.
-
-Once indexed, your assistant can answer:
+Your AI assistant goes from guessing to knowing:
 
 > *"What does `uart_init` do and who calls it?"*
+> → `get_symbol_context("uart_init")` — body, callers, callees in one call.
 >
 > *"Find all BLE advertising functions and how they're connected."*
+> → `search_code("ble advertising", kind="function")` → `find_call_path("gap_init", "start_advertising")`
 >
 > *"Show me the implementation of `adc_read` — not the declaration."*
+> → `get_source("adc_read")` — exact body via libclang, no file reading.
 >
 > *"What would break if I change `spi_transfer`?"*
+> → `find_all_callers_recursive("spi_transfer")` — every caller, direct and indirect.
 >
-> *"Is the index up to date after my last edit?"*
+> *"Give me a map of `modem_msg.cpp` before I read it."*
+> → `get_file_map("src/modem_msg.cpp")` — 426 symbols grouped by kind.
 
-**No grepping. No hallucination. No reading 8000 Mbed OS headers into context.**
+**19 MCP tools** — symbol search, source reading, call-graph traversal, hotspot
+analysis, dead code detection, vector search. All backed by real compiler flags
+from `compile_commands.json` — `#ifdef`-aware, not grep.
 
 ## Quick start
 
