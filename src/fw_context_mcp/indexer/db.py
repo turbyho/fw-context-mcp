@@ -169,6 +169,7 @@ def open_db(path: Path) -> sqlite3.Connection:
     path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(path))
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA busy_timeout = 30000")  # 30s — wait on lock, don't fail
 
     # Load sqlite-vec extension for vector search (graceful when missing)
     try:
@@ -621,16 +622,24 @@ def search_similar_hybrid(
 def _resolve_target_usr(
     conn: sqlite3.Connection, config_hash: str, name: str
 ) -> str | None:
-    """Look up the USR of a symbol by name (prefer definition)."""
-    row = conn.execute(
-        """SELECT usr FROM symbols
-           WHERE config_hash = ?
-             AND (name = ? OR qualified_name = ?)
-           ORDER BY is_definition DESC
+    """Look up the USR of a symbol by name.
+
+    When multiple USRs exist for the same name (e.g. C++ inline functions
+    with ``#*1C.#`` ABI tags), pick the one with the most incoming
+    references — that is the variant actually called throughout the codebase.
+    """
+    rows = conn.execute(
+        """SELECT s.usr, COUNT(r.rowid) AS ref_count
+           FROM symbols s
+           LEFT JOIN refs r ON r.to_usr = s.usr AND r.config_hash = s.config_hash
+           WHERE s.config_hash = ?
+             AND (s.name = ? OR s.qualified_name = ?)
+           GROUP BY s.usr
+           ORDER BY s.is_definition DESC, ref_count DESC
            LIMIT 1""",
         (config_hash, name, name),
     ).fetchone()
-    return row["usr"] if row else None
+    return rows["usr"] if rows else None
 
 
 def find_call_path(
@@ -642,8 +651,9 @@ def find_call_path(
 ) -> list[dict]:
     """Find call paths from *from_name* to *to_name* via BFS in the refs table.
 
-    Uses a recursive CTE to walk edges from caller to callee.  Returns up to
-    5 shortest paths, each with ``depth`` (number of edges) and ``chain``
+    Uses Python BFS with cycle detection — avoids the exponential explosion
+    of a recursive CTE over 1M+ reference edges.  Returns up to 5 shortest
+    paths, each with ``depth`` (number of edges) and ``chain``
     (human-readable ``A → B → C`` string).
     """
     from_usr = _resolve_target_usr(conn, config_hash, from_name)
@@ -651,35 +661,64 @@ def find_call_path(
     if not from_usr or not to_usr:
         return []
 
-    rows = conn.execute(
-        """WITH RECURSIVE paths(from_usr, to_usr, depth, chain) AS (
-            SELECT r.from_usr, r.to_usr, 1,
-                   caller.name || ' → ' || callee.name
-            FROM refs r
-            JOIN symbols caller ON caller.usr = r.from_usr AND caller.config_hash = r.config_hash
-            JOIN symbols callee ON callee.usr = r.to_usr   AND callee.config_hash = r.config_hash
-            WHERE r.from_usr = ? AND r.config_hash = ?
-              AND caller.is_definition = 1
-            UNION ALL
-            SELECT r.from_usr, r.to_usr, p.depth + 1,
-                   p.chain || ' → ' || callee.name
-            FROM refs r
-            JOIN paths p ON p.to_usr = r.from_usr
-            JOIN symbols callee ON callee.usr = r.to_usr AND callee.config_hash = r.config_hash
-            WHERE p.depth < ? AND r.config_hash = ?
+    # Pre-load adjacency: for each USR, its outgoing edges → [(to_usr, callee_name)]
+    # We fetch edges in bulk, indexed by from_usr, so BFS only does dict lookups.
+    all_edges: dict[str, list[tuple[str, str]]] = {}
+    for row in conn.execute(
+        """SELECT r.from_usr, r.to_usr, s.name AS callee_name
+           FROM refs r
+           JOIN symbols s ON s.usr = r.to_usr AND s.config_hash = r.config_hash
+           WHERE r.config_hash = ? AND s.is_definition = 1""",
+        (config_hash,),
+    ):
+        all_edges.setdefault(row["from_usr"], []).append(
+            (row["to_usr"], row["callee_name"])
         )
-        SELECT depth, chain, to_usr
-        FROM paths
-        WHERE to_usr = ?
-        ORDER BY depth
-        LIMIT 5""",
-        (from_usr, config_hash, max_depth, config_hash, to_usr),
-    ).fetchall()
 
-    return [
-        {"depth": r["depth"], "chain": r["chain"], "target_usr": r["to_usr"]}
-        for r in rows
-    ]
+    # Also load symbol names for USRs (needed for caller names in base step)
+    usr_names: dict[str, str] = {}
+    for row in conn.execute(
+        "SELECT usr, name FROM symbols WHERE config_hash=? AND is_definition=1",
+        (config_hash,),
+    ):
+        usr_names[row["usr"]] = row["name"]
+
+    from_name_resolved = usr_names.get(from_usr, from_name)
+
+    # BFS queue: (current_usr, depth, chain)
+    from collections import deque
+    queue: deque = deque()
+    visited: set[str] = {from_usr}  # cycle prevention — never revisit a USR
+
+    for to_usr_edge, callee_name in all_edges.get(from_usr, []):
+        if to_usr_edge not in visited:
+            chain = f"{from_name_resolved} → {callee_name}"
+            if to_usr_edge == to_usr:
+                return [{"depth": 1, "chain": chain, "target_usr": to_usr}]
+            queue.append((to_usr_edge, 1, chain))
+            visited.add(to_usr_edge)
+
+    # BFS main loop
+    found: list[dict] = []
+    while queue and len(found) < 5:
+        current, depth, chain = queue.popleft()
+        if current == to_usr:
+            found.append({"depth": depth, "chain": chain, "target_usr": current})
+            continue
+        if depth >= max_depth:
+            continue
+        for next_usr, next_name in all_edges.get(current, []):
+            if next_usr not in visited:
+                visited.add(next_usr)
+                new_chain = f"{chain} → {next_name}"
+                if next_usr == to_usr:
+                    found.append({"depth": depth + 1, "chain": new_chain, "target_usr": next_usr})
+                    if len(found) >= 5:
+                        break
+                else:
+                    queue.append((next_usr, depth + 1, new_chain))
+
+    return found
 
 
 def find_all_callers_recursive(
