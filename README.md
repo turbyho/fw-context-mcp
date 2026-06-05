@@ -9,7 +9,7 @@ fw-context parses your **actual build** (`compile_commands.json`) with
 [libclang](https://clang.llvm.org/), extracts every C/C++ symbol with its
 qualified name, signature, and location, and stores them in a persistent
 **SQLite + FTS5** database. An **MCP server** exposes this index as tools
-that AI assistants call directly — sub-millisecond lookups, zero hallucination,
+that AI assistants call directly — fast lookups, zero hallucination,
 real `#ifdef`-aware understanding.
 
 Once indexed, your assistant can answer:
@@ -137,7 +137,7 @@ Use **clangd for editing**, **fw-context for AI-assisted exploration**.
 
 ## Key capabilities
 
-- **Sub-millisecond lookups** — FTS5 full-text search, prefix/exact symbol lookup, call-graph traversal
+- **Fast lookups** — FTS5 full-text search, prefix/exact symbol lookup, call-graph traversal
 - **Natural-language search** — *"how does the modem connect?"* → finds `network_registration`, `modem_attach`, … (Ollama, optional)
 - **Vector search** — semantic similarity via `sqlite-vec` + Ollama embeddings, hybrid FTS5+vector re-ranking
 - **Graph analytics** — call paths, transitive callers/callees, dead code detection, hotspot analysis

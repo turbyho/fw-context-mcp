@@ -143,7 +143,7 @@ pip install "fw-context-mcp[watch]"   # install watch dependency
 
 ## MCP tools
 
-These 17 tools are called by your AI assistant over JSON-RPC. Each tool
+These tools are called by your AI assistant over JSON-RPC. Each tool
 opens the database, runs its query, and closes — no persistent connections.
 
 ### Search & lookup
@@ -203,7 +203,7 @@ FTS5 search. Non-English queries are auto-translated in Phase 0.
 
 #### `get_source`
 
-Read a symbol's definition body — no LLM, sub-millisecond.
+Read a symbol's definition body — no LLM, fast.
 
 ```
 Input:  {"name": "adc_read"}
