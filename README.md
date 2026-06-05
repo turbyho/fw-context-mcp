@@ -5,7 +5,7 @@ Cursor, OpenCode) real understanding of your codebase. Parses your actual build
 with [libclang](https://clang.llvm.org/), extracts every symbol, and builds a
 persistent index with full-text search, call graph, and vector embeddings.
 
-No hallucination. No grepping. No reading 8000 Mbed OS headers into context.
+No hallucination. No grepping. No reading thousands of framework headers into context.
 
 ## What it does
 
