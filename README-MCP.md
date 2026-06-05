@@ -6,7 +6,7 @@ as tools for AI assistants. Communicates over **JSON-RPC 2.0 via stdio**.
 ## What it is
 
 A persistent subprocess started by your AI assistant (Claude Code, OpenCode, …)
-that provides **17 tools** for navigating embedded firmware codebases:
+that provides **18 tools** for navigating embedded firmware codebases:
 
 | Category | Tools |
 |----------|-------|
