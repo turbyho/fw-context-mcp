@@ -40,9 +40,10 @@ Instead use:
 
 - `get_source(name)` — full body of a function/method with line numbers.
   Uses libclang's exact extent; faster and more precise than grep+Read.
-- `get_file_map(path)` — all symbols in a file grouped by kind (methods,
-  variables, classes, …).  Like a table of contents — use BEFORE reading
-  a large file to understand its structure.
+- `get_file_map(path, signatures?, max_per_kind?)` — all symbols in a file
+  grouped by kind with counts.  Compact by default (first 30 per kind, no
+  signatures).  Use for quick orientation.  Pass ``max_per_kind=0`` for the
+  full list, ``signatures=true`` for parameter details.
 - `get_symbol_context(name)` — body, signature, and up to 5 direct callers
   + 5 direct callees.  One-shot context for "what does X do and how does
   it fit?"
