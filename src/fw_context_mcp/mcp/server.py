@@ -97,6 +97,28 @@ def _lookup_definition(conn, config_hash: str, name: str):
         ).fetchone()
         if row:
             return row
+
+    # Fallback: "Foo::bar" without namespace — extract short name, suffix-filter
+    if "::" in name:
+        short_name = name.rsplit("::", 1)[-1]
+        FALLBACK_QUERY = """SELECT s.* FROM symbols s
+           WHERE s.config_hash=? AND %s
+           ORDER BY %s (CASE WHEN s.file_path LIKE '%%mbed-os%%' THEN 1 ELSE 0 END), s.line"""
+        for column in ("s.name", "s.qualified_name"):
+            rows = conn.execute(
+                FALLBACK_QUERY % (f"{column}=? AND s.is_definition=1", ""),
+                (config_hash, short_name),
+            ).fetchall()
+            for row in rows:
+                if row["qualified_name"].endswith(name):
+                    return row
+            rows = conn.execute(
+                FALLBACK_QUERY % (f"{column}=?", "s.is_definition DESC,"),
+                (config_hash, short_name),
+            ).fetchall()
+            for row in rows:
+                if row["qualified_name"].endswith(name):
+                    return row
     return None
 
 
@@ -358,6 +380,29 @@ def lookup_symbol(
                        LIMIT ?""",
                     (config_hash, f"{esc}%", f"{esc}%", limit),
                 ).fetchall()
+
+            # Fallback: "Foo::bar" without namespace — extract short name, suffix-filter
+            if not rows and "::" in name:
+                short_name = name.rsplit("::", 1)[-1]
+                if exact:
+                    rows = c.execute(
+                        """SELECT s.* FROM symbols s
+                           WHERE s.config_hash=? AND (s.name=? OR s.qualified_name=?)
+                           ORDER BY s.is_definition DESC, s.line
+                           LIMIT ?""",
+                        (config_hash, short_name, short_name, limit * 2),
+                    ).fetchall()
+                else:
+                    esc2 = short_name.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+                    rows = c.execute(
+                        r"""SELECT s.* FROM symbols s
+                           WHERE s.config_hash=? AND (s.name LIKE ? ESCAPE '\' OR s.qualified_name LIKE ? ESCAPE '\')
+                           ORDER BY s.is_definition DESC, s.line
+                           LIMIT ?""",
+                        (config_hash, f"{esc2}%", f"{esc2}%", limit * 2),
+                    ).fetchall()
+                rows = [r for r in rows if r["qualified_name"].endswith(name)][:limit]
+
             return [
                 {
                     "name": r["name"],
