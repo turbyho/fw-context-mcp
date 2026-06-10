@@ -2,6 +2,12 @@
 <!-- mcp-name: io.github.turbyho/fw-context-mcp -->
 mcp-name: io.github.turbyho/fw-context-mcp
 
+[![Python](https://img.shields.io/badge/python-3.11+-blue.svg)](https://python.org)
+[![MCP](https://img.shields.io/badge/MCP-2024--11--05-green.svg)](https://modelcontextprotocol.io)
+[![License](https://img.shields.io/badge/license-MIT-yellow.svg)](LICENSE)
+[![Tests](https://img.shields.io/badge/tests-135%20passed-brightgreen.svg)](tests/)
+[![Glama](https://glama.ai/mcp/servers/turbyho/fw-context-mcp/badges/score.svg)](https://glama.ai/mcp/servers/turbyho/fw-context-mcp)
+
 **MCP server for embedded C/C++ firmware** — gives AI assistants (Claude Code,
 Cursor, OpenCode, etc.) real understanding of your codebase. Parses your actual build
 with [libclang](https://clang.llvm.org/), extracts every symbol, and builds a
