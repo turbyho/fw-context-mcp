@@ -458,7 +458,7 @@ def lookup_symbol(
 def list_projects(
     project_root: Annotated[str | None, Field(description="Project root. Auto-detected if omitted. Pass to distinguish multiple indexed projects.")] = None,
 ) -> list[dict]:
-    """List all indexed firmware projects with their status."""
+    """Read-only. No side effects. Lists all firmware projects that have been indexed with fw-context, showing each project's database path, symbol count, and last re-index time. Use at session start to discover available projects; use get_active_build for details on the current project."""
     cfg = load_config(project_root=Path(project_root).resolve() if project_root else None)
     index_dir = cfg.index.db_dir
     db_files = list(index_dir.glob("*/index.db")) if index_dir.exists() else []
@@ -566,7 +566,7 @@ def reindex_file(
     file_path: Annotated[str, Field(description="Path to source file to re-parse. Must be in compile_commands.json.")],
     project_root: Annotated[str | None, Field(description="Project root. Auto-detected if omitted.")] = None,
 ) -> dict:
-    """Re-parse a single source file and update its symbols in the index."""
+    """Not read-only — mutates the index. Re-parses a single source file with libclang using the exact compiler flags from compile_commands.json and updates its symbols in the SQLite+FTS5 index. The file must be in compile_commands.json. Use after editing a file to keep the index current without rebuilding; use reset_index to rebuild from scratch."""
     db_path, cfg, project_id, root = _resolve_context(project_root)
     if not db_path.exists():
         return {"error": f"No index found for {root}. Run 'fw-context index' first."}
@@ -655,7 +655,7 @@ async def explain_symbol(
     project_root: Annotated[str | None, Field(description="Project root. Auto-detected if omitted.")] = None,
     context_lines: Annotated[int, Field(description="Lines of source context around the symbol definition.")] = 40,
 ) -> dict:
-    """Look up a symbol and explain what it does."""
+    """Read-only. No side effects — may call Ollama (optional external LLM) if configured. Returns a plain-English explanation of what a C/C++ symbol does, based on its name, signature, docstring, and call context. Requires Ollama to be running. For raw source code use get_source; for symbol metadata without explanation use lookup_symbol; for body+callers+callees use get_symbol_context."""
     db_path, cfg, project_id, root = _resolve_context(project_root)
     if not db_path.exists():
         return {"error": f"No index found for {root}. Run 'fw-context index' first."}
@@ -961,7 +961,7 @@ def find_references(
     project_root: Annotated[str | None, Field(description="Project root. Auto-detected if omitted.")] = None,
     limit: Annotated[int, Field(description="Maximum results.")] = 50,
 ) -> list[dict]:
-    """Find all references to a symbol — calls, reads, and member accesses."""
+    """Read-only. No side effects. Returns all references to a symbol (call sites, reads, member accesses) across the indexed codebase. Requires refs to be indexed (fw-context index --refs). For direct callers only use find_callers; for transitive callers use find_all_callers_recursive; for call paths between two symbols use find_call_path."""
     return _references_result(name, project_root, ref_kind=None, limit=limit)
 
 
