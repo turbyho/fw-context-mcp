@@ -1,0 +1,14 @@
+{
+  "$schema": "https://glama.ai/schemas/server-metadata.json",
+  "name": "fw-context-mcp",
+  "maintenance": {
+    "is_actively_maintained": true,
+    "has_documentation": true,
+    "has_tests": true,
+    "has_ci": false
+  },
+  "community": {
+    "discord_url": null,
+    "issue_tracker": "https://github.com/turbyho/fw-context-mcp/issues"
+  }
+}

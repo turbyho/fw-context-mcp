@@ -249,7 +249,16 @@ def _auto_reindex_stale(
 
 @mcp.tool()
 def get_active_build(project_root: str | None = None) -> dict:
-    """Return metadata about the most recently indexed build configuration."""
+    """Return metadata about the most recently indexed build configuration.
+
+    Read-only: yes. Call at session start to check if the index exists,
+    how many symbols it contains, and whether it is stale (needs re-index).
+
+    Returns:
+        dict: {index_exists, project_id, total_symbols, total_files,
+        total_refs, config_hash, last_indexed (ISO timestamp),
+        stale (bool — True if compile_commands.json is newer than index)}
+    """
     root = resolve_project_root(project_root)
     db_path = _db_path(root)
     if not db_path.exists():
@@ -353,7 +362,26 @@ def lookup_symbol(
     exact: bool = False,
     limit: int = 50,
 ) -> list[dict]:
-    """Look up a symbol by name. Returns all matches — declarations and definitions."""
+    """Look up a symbol by name — exact or prefix matching.
+
+    Returns all declarations and definitions matching the name across the
+    entire indexed codebase. Prefer this over search_code when you know the
+    exact symbol name. Use search_code for keyword/concept search.
+
+    Read-only: yes. May auto-reindex stale files (non-blocking).
+
+    Args:
+        name: Symbol name (exact match) or prefix (set exact=False).
+            E.g. 'uart_init' finds the exact function; 'uart_' finds
+            all symbols starting with 'uart_'.
+        project_root: Project directory. Auto-detected if omitted.
+        exact: True = exact name match, False = prefix LIKE match (default).
+        limit: Maximum results (default 50).
+
+    Returns:
+        list[dict]: Symbols with name, qualified_name, kind, file, line,
+        signature, docstring, is_definition fields. Empty if not found.
+    """
     try:
         root = resolve_project_root(project_root)
         db_path = _db_path(root)
@@ -583,7 +611,15 @@ def reindex_file(
 
 @mcp.tool()
 def check_ollama(project_root: str | None = None) -> dict:
-    """Check whether Ollama is running and the configured model is installed."""
+    """Check whether Ollama is running and the configured embedding/chat model is installed.
+
+    Read-only: yes. No side effects. Call before smart_search or
+    explain_symbol if unsure about Ollama availability.
+
+    Returns:
+        dict: {ollama_running: bool, model_installed: bool, model: str,
+        error: str or None}
+    """
     _, cfg, _, _ = _resolve_context(project_root)
     if not cfg.llm.enabled:
         return {
@@ -728,13 +764,23 @@ def get_file_map(
 ) -> dict:
     """Return all symbols in a file grouped by kind — fast structural overview.
 
-    Like a table of contents before reading a chapter.  Pass a path relative
+    Like a table of contents before reading a chapter. Pass a path relative
     to the project root (``src/main.cpp``) or just the filename (``main.cpp``).
+    Returns symbols keyed by kind (function, method, class, struct, enum, ...).
+    Each kind has count (total) and items (first N, default 30).
+    Set max_per_kind=0 for unlimited, signatures=true for full sigs.
 
-    Returns a dict with ``file``, ``total_symbols``, and ``symbols`` keyed by
-    kind (``function``, ``method``, ``class``, ``struct``, ``enum``, …).
-    Each kind has ``count`` (total) and ``items`` (first N, default 30).
-    Set ``max_per_kind=0`` for unlimited, ``signatures=true`` for full sigs.
+    Read-only: yes. No side effects. Use before reading a large file to
+    orient yourself — see what functions, classes, and enums it defines.
+
+    Args:
+        file_path: Path relative to project root, or just the filename.
+        project_root: Project directory. Auto-detected if omitted.
+        signatures: Include full function signatures. Default: False.
+        max_per_kind: Max items per kind group (default 30, 0 = unlimited).
+
+    Returns:
+        dict: {file, total_symbols, symbols: {kind: {count, items[]}}}
     """
     db_path, cfg, project_id, root = _resolve_context(project_root)
     if not db_path.exists():
