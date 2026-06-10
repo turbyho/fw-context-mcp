@@ -360,10 +360,10 @@ def _with_stale_recovery(
 
 @mcp.tool()
 def lookup_symbol(
-    name: str,
-    project_root: str | None = None,
-    exact: bool = False,
-    limit: int = 50,
+    name: Annotated[str, Field(description="Symbol name. Exact match if exact=True, prefix LIKE match otherwise. E.g. 'uart_init' or 'uart_'.")],
+    project_root: Annotated[str | None, Field(description="Project root directory. Auto-detected from CWD if omitted.")] = None,
+    exact: Annotated[bool, Field(description="True = exact name match, False = prefix LIKE match (default).")] = False,
+    limit: Annotated[int, Field(description="Maximum results returned (default 50).")] = 50,
 ) -> list[dict]:
     """Look up a symbol by name — exact or prefix matching.
 
@@ -455,7 +455,9 @@ def lookup_symbol(
 
 
 @mcp.tool()
-def list_projects(project_root: str | None = None) -> list[dict]:
+def list_projects(
+    project_root: Annotated[str | None, Field(description="Project root. Auto-detected if omitted. Pass to distinguish multiple indexed projects.")] = None,
+) -> list[dict]:
     """List all indexed firmware projects with their status."""
     cfg = load_config(project_root=Path(project_root).resolve() if project_root else None)
     index_dir = cfg.index.db_dir
@@ -497,7 +499,10 @@ def list_projects(project_root: str | None = None) -> list[dict]:
 
 
 @mcp.tool()
-def reset_index(project_root: str | None = None, confirm: bool = False) -> dict:
+def reset_index(
+    project_root: Annotated[str | None, Field(description="Project root. Auto-detected if omitted.")] = None,
+    confirm: Annotated[bool, Field(description="Must be True to execute. Call without confirm first as dry-run.")] = False,
+) -> dict:
     """Delete the symbol index for a project so it can be re-indexed from scratch."""
     root = resolve_project_root(project_root)
     db_path = _db_path(root)
@@ -558,8 +563,8 @@ def reset_index(project_root: str | None = None, confirm: bool = False) -> dict:
 
 @mcp.tool()
 def reindex_file(
-    file_path: str,
-    project_root: str | None = None,
+    file_path: Annotated[str, Field(description="Path to source file to re-parse. Must be in compile_commands.json.")],
+    project_root: Annotated[str | None, Field(description="Project root. Auto-detected if omitted.")] = None,
 ) -> dict:
     """Re-parse a single source file and update its symbols in the index."""
     db_path, cfg, project_id, root = _resolve_context(project_root)
@@ -613,7 +618,9 @@ def reindex_file(
 
 
 @mcp.tool()
-def check_ollama(project_root: str | None = None) -> dict:
+def check_ollama(
+    project_root: Annotated[str | None, Field(description="Project root. Auto-detected if omitted. Ignored by this tool.")] = None,
+) -> dict:
     """Check whether Ollama is running and the configured embedding/chat model is installed.
 
     Read-only: yes. No side effects. Call before smart_search or
@@ -644,9 +651,9 @@ def check_ollama(project_root: str | None = None) -> dict:
 
 @mcp.tool()
 async def explain_symbol(
-    name: str,
-    project_root: str | None = None,
-    context_lines: int = 40,
+    name: Annotated[str, Field(description="Symbol name to explain. E.g. 'uart_init', 'ModemMsg::send'.")],
+    project_root: Annotated[str | None, Field(description="Project root. Auto-detected if omitted.")] = None,
+    context_lines: Annotated[int, Field(description="Lines of source context around the symbol definition.")] = 40,
 ) -> dict:
     """Look up a symbol and explain what it does."""
     db_path, cfg, project_id, root = _resolve_context(project_root)
@@ -720,7 +727,10 @@ async def explain_symbol(
 
 
 @mcp.tool()
-def get_source(name: str, project_root: str | None = None) -> dict:
+def get_source(
+    name: Annotated[str, Field(description="Fully qualified symbol name. Returns exact function body via libclang extent.")],
+    project_root: Annotated[str | None, Field(description="Project root. Auto-detected if omitted.")] = None,
+) -> dict:
     """Return the source code of a symbol's definition — no LLM, fast."""
     db_path, cfg, project_id, root = _resolve_context(project_root)
     if not db_path.exists():
@@ -760,10 +770,10 @@ def get_source(name: str, project_root: str | None = None) -> dict:
 
 @mcp.tool()
 def get_file_map(
-    file_path: str,
-    project_root: str | None = None,
-    signatures: bool = False,
-    max_per_kind: int = 30,
+    file_path: Annotated[str, Field(description="Path to source file — relative to project root or just filename.")],
+    project_root: Annotated[str | None, Field(description="Project root. Auto-detected if omitted.")] = None,
+    signatures: Annotated[bool, Field(description="Include full function signatures in output.")] = False,
+    max_per_kind: Annotated[int, Field(description="Max items per symbol kind group (default 30, 0 = unlimited).")] = 30,
 ) -> dict:
     """Return all symbols in a file grouped by kind — fast structural overview.
 
@@ -824,7 +834,10 @@ def get_file_map(
 
 
 @mcp.tool()
-def get_symbol_context(name: str, project_root: str | None = None) -> dict:
+def get_symbol_context(
+    name: Annotated[str, Field(description="Symbol name. Returns body, signature, up to 5 callers and 5 callees in one call.")],
+    project_root: Annotated[str | None, Field(description="Project root. Auto-detected if omitted.")] = None,
+) -> dict:
     """Return the body, signature, callers, and callees of a symbol.
 
     Designed as rich LLM context — answers "what does this do and how does
@@ -933,13 +946,21 @@ def _references_result(name: str, project_root: str | None, ref_kind: str | None
 
 
 @mcp.tool()
-def find_callers(name: str, project_root: str | None = None, limit: int = 50) -> list[dict]:
+def find_callers(
+    name: Annotated[str, Field(description="Symbol name to find callers of. Returns direct call sites.")],
+    project_root: Annotated[str | None, Field(description="Project root. Auto-detected if omitted.")] = None,
+    limit: Annotated[int, Field(description="Maximum results.")] = 50,
+) -> list[dict]:
     """Find call sites of a function/method — who calls ``name``."""
     return _references_result(name, project_root, ref_kind="call", limit=limit)
 
 
 @mcp.tool()
-def find_references(name: str, project_root: str | None = None, limit: int = 50) -> list[dict]:
+def find_references(
+    name: Annotated[str, Field(description="Symbol name to find all references of — calls, reads, member accesses.")],
+    project_root: Annotated[str | None, Field(description="Project root. Auto-detected if omitted.")] = None,
+    limit: Annotated[int, Field(description="Maximum results.")] = 50,
+) -> list[dict]:
     """Find all references to a symbol — calls, reads, and member accesses."""
     return _references_result(name, project_root, ref_kind=None, limit=limit)
 
@@ -983,10 +1004,10 @@ def _refs_guard(project_root: str | None) -> tuple[Path, str, str] | tuple[None,
 
 @mcp.tool()
 def find_call_path(
-    from_name: str,
-    to_name: str,
-    project_root: str | None = None,
-    max_depth: int = 10,
+    from_name: Annotated[str, Field(description="Starting symbol for path search.")],
+    to_name: Annotated[str, Field(description="Target symbol to find path to.")],
+    project_root: Annotated[str | None, Field(description="Project root. Auto-detected if omitted.")] = None,
+    max_depth: Annotated[int, Field(description="Maximum BFS depth for path search (default 10).")] = 10,
 ) -> list[dict]:
     """Find call paths between two functions via BFS in the call graph.
 
@@ -1013,10 +1034,10 @@ def find_call_path(
 
 @mcp.tool()
 def find_all_callers_recursive(
-    name: str,
-    project_root: str | None = None,
-    max_depth: int = 5,
-    limit: int = 50,
+    name: Annotated[str, Field(description="Symbol name to find transitive callers of.")],
+    project_root: Annotated[str | None, Field(description="Project root. Auto-detected if omitted.")] = None,
+    max_depth: Annotated[int, Field(description="Maximum BFS depth for transitive search (default 5).")] = 5,
+    limit: Annotated[int, Field(description="Maximum results (default 50).")] = 50,
 ) -> list[dict]:
     """Find all transitive callers — who calls *name*, directly or indirectly.
 
@@ -1040,10 +1061,10 @@ def find_all_callers_recursive(
 
 @mcp.tool()
 def find_callees_recursive(
-    name: str,
-    project_root: str | None = None,
-    max_depth: int = 5,
-    limit: int = 50,
+    name: Annotated[str, Field(description="Symbol name to find transitive callees of.")],
+    project_root: Annotated[str | None, Field(description="Project root. Auto-detected if omitted.")] = None,
+    max_depth: Annotated[int, Field(description="Maximum BFS depth for transitive search (default 5).")] = 5,
+    limit: Annotated[int, Field(description="Maximum results (default 50).")] = 50,
 ) -> list[dict]:
     """Find all transitive callees — what *name* calls, directly or indirectly."""
     root, config_hash, err = _refs_guard(project_root)
@@ -1064,8 +1085,8 @@ def find_callees_recursive(
 
 @mcp.tool()
 def find_dead_code(
-    project_root: str | None = None,
-    limit: int = 100,
+    project_root: Annotated[str | None, Field(description="Project root. Auto-detected if omitted.")] = None,
+    limit: Annotated[int, Field(description="Maximum results (default 100).")] = 100,
 ) -> list[dict]:
     """Find functions/methods that are defined but never called."""
     root, config_hash, err = _refs_guard(project_root)
@@ -1086,8 +1107,8 @@ def find_dead_code(
 
 @mcp.tool()
 def find_hotspots(
-    project_root: str | None = None,
-    limit: int = 20,
+    project_root: Annotated[str | None, Field(description="Project root. Auto-detected if omitted.")] = None,
+    limit: Annotated[int, Field(description="Number of top-called functions to return (default 20).")] = 20,
 ) -> list[dict]:
     """Find the most-called functions ranked by caller count."""
     root, config_hash, err = _refs_guard(project_root)
@@ -1111,10 +1132,10 @@ def find_hotspots(
 
 @mcp.tool()
 def search_code(
-    query: str,
-    project_root: str | None = None,
-    kind: str | None = None,
-    limit: int = 20,
+    query: Annotated[str, Field(description="FTS5 search terms. 1-3 words, omit underscores. E.g. 'modem init' not 'modem_init'. Supports trailing wildcard 'modem*'.")],
+    project_root: Annotated[str | None, Field(description="Project root. Auto-detected if omitted.")] = None,
+    kind: Annotated[str | None, Field(description="Optional kind filter: function, method, class, struct, enum, typedef, variable, field, namespace.")] = None,
+    limit: Annotated[int, Field(description="Maximum results (default 20, max 100).")] = 20,
 ) -> list[dict]:
     """Full-text search over indexed symbols (functions, classes, methods, enums, etc.).
 
@@ -1173,9 +1194,9 @@ def search_code(
 
 @mcp.tool()
 async def smart_search(
-    query: str,
-    project_root: str | None = None,
-    limit: int = 20,
+    query: Annotated[str, Field(description="Natural language description, 5-15 words. E.g. 'how does the modem connect?' or 'handle BLE pairing failure'.")],
+    project_root: Annotated[str | None, Field(description="Project root. Auto-detected if omitted.")] = None,
+    limit: Annotated[int, Field(description="Maximum results (default 20, max 100).")] = 20,
 ) -> list[dict]:
     """Natural-language search: Ollama generates FTS5 keywords, then searches the index.
 
