@@ -1,5 +1,4 @@
 {
-  "$schema": "https://glama.ai/schemas/server-metadata.json",
   "name": "fw-context-mcp",
   "maintenance": {
     "is_actively_maintained": true,
