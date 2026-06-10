@@ -5,14 +5,15 @@ Search tools (search_code, smart_search) delegate to the search pipeline
 handlers with shared helpers for DB access, staleness detection, etc.
 """
 
-from __future__ import annotations
-
 import logging
 import os
 import sqlite3
 import time
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Annotated
+
+from pydantic import Field
 
 from mcp.server.fastmcp import FastMCP
 
@@ -248,7 +249,9 @@ def _auto_reindex_stale(
 
 
 @mcp.tool()
-def get_active_build(project_root: str | None = None) -> dict:
+def get_active_build(
+    project_root: Annotated[str | None, Field(description="Project root directory. Auto-detected from CWD if omitted.")] = None,
+) -> dict:
     """Return metadata about the most recently indexed build configuration.
 
     Read-only: yes. Call at session start to check if the index exists,
