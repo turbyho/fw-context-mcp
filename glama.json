@@ -1,13 +1,12 @@
 {
-  "name": "fw-context-mcp",
-  "maintenance": {
-    "is_actively_maintained": true,
-    "has_documentation": true,
-    "has_tests": true,
-    "has_ci": false
-  },
-  "community": {
-    "discord_url": null,
-    "issue_tracker": "https://github.com/turbyho/fw-context-mcp/issues"
-  }
+  "$schema": "https://glama.ai/schemas/glama.json",
+  "maintainers": ["turbyho"],
+  "title": "fw-context-mcp",
+  "description": "Build-aware code intelligence for embedded C/C++ firmware. libclang + SQLite+FTS5, 19 MCP tools for symbol search, call graphs, hotspot analysis, and dead code detection.",
+  "tags": ["c++", "c", "embedded", "firmware", "libclang", "call-graph", "code-intelligence", "mbed-os", "zephyr", "platformio"],
+  "repository": "https://github.com/turbyho/fw-context-mcp",
+  "license": "MIT",
+  "categories": ["developer-tools", "code-analysis", "embedded-systems"],
+  "language": "Python",
+  "runtime": "python"
 }
