@@ -50,14 +50,18 @@ def _detect_source_roots(project_root: Path, compile_commands: Path) -> list[Pat
     try:
         units = list(parse_compile_commands(compile_commands))
         for unit in units:
+            resolved = unit.file.resolve()
             try:
-                rel = unit.file.resolve().relative_to(project_root)
+                rel = resolved.relative_to(project_root)
                 top = project_root / rel.parts[0]
                 if top.is_dir() and top not in seen:
                     roots.append(top)
                     seen.add(top)
             except ValueError:
-                pass
+                # TU is outside the project root (e.g. PlatformIO packages,
+                # ESP-IDF framework, Zephyr modules). Walk up to find a
+                # sensible framework root directory.
+                _add_external_root(resolved, roots, seen)
     except Exception:
         pass
     if not roots:
@@ -65,6 +69,63 @@ def _detect_source_roots(project_root: Path, compile_commands: Path) -> list[Pat
         log.info("No source directories detected, falling back to project root")
     log.info("Auto-detected source roots: %s", [str(r) for r in roots])
     return roots
+
+
+def _add_external_root(tu_path: Path, roots: list[Path], seen: set[Path]) -> None:
+    """Add a framework root directory for a TU outside the project root.
+
+    Walks up looking for known markers (library.json, library.properties,
+    CMakeLists.txt with project()/idf_build, Kconfig), then falls back to
+    the grandparent or great-great-grandparent directory — whichever is the
+    smallest directory that still groups multiple TUs.
+    """
+    # Walk up looking for known framework/library markers
+    for ancestor in tu_path.parents:
+        if ancestor in seen:
+            return
+        # PlatformIO library markers
+        if (ancestor / "library.json").exists() or (ancestor / "library.properties").exists():
+            if ancestor not in seen:
+                roots.append(ancestor)
+                seen.add(ancestor)
+            return
+        # ESP-IDF component / Zephyr module marker
+        cmake = ancestor / "CMakeLists.txt"
+        if cmake.exists():
+            try:
+                text = cmake.read_text()
+                if "idf_build" in text or "idf_component" in text:
+                    # This is an ESP-IDF component dir — go one level up for
+                    # the IDF root (e.g. ~/esp/esp-idf/components/foo → ~/esp/esp-idf)
+                    parent = ancestor.parent
+                    if parent not in seen:
+                        roots.append(parent)
+                        seen.add(parent)
+                    return
+                if "zephyr_library" in text or "zephyr_module" in text:
+                    parent = ancestor.parent
+                    if parent not in seen:
+                        roots.append(parent)
+                        seen.add(parent)
+                    return
+            except (OSError, UnicodeDecodeError):
+                pass
+
+    # Fallback: walk up 2–4 levels and add the first directory not yet covered.
+    # For PlatformIO: ~/.platformio/packages/framework-arduinoespressif32/cores/esp32/foo.c
+    #   up 2 → framework-arduinoespressif32/cores/ (too deep)
+    #   up 3 → framework-arduinoespressif32/ (correct)
+    # For ESP-IDF:  ~/esp/esp-idf/components/esp_system/esp_err.c
+    #   up 2 → esp-idf/components/ (too deep)
+    #   up 3 → esp-idf/ (correct)
+    parents = list(tu_path.parents)
+    for level in (3, 2, 4):  # try level 3 first (best heuristic), then 2, then 4
+        if level < len(parents):
+            candidate = parents[level]
+            if candidate not in seen and not str(candidate).startswith("/usr"):
+                roots.append(candidate)
+                seen.add(candidate)
+                return
 
 
 def _build_embeddings(conn, config_hash: str, llm_config) -> None:
