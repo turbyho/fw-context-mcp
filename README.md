@@ -56,18 +56,14 @@ from `compile_commands.json` — `#ifdef`-aware, not grep.
 
 ```bash
 git clone git@github.com:turbyho/fw-context-mcp.git ~/.fw-context/src
-uv venv ~/.fw-context/.venv --python 3.12
-uv pip install --python ~/.fw-context/.venv/bin/python ~/.fw-context/src/
-echo 'export PATH="$HOME/.fw-context/.venv/bin:$PATH"' >> ~/.zshrc
+cd ~/.fw-context/src && make install
 ```
 
 #### macOS
 
 ```bash
 git clone git@github.com:turbyho/fw-context-mcp.git ~/.fw-context/src
-uv venv ~/.fw-context/.venv --python 3.12
-uv pip install --python ~/.fw-context/.venv/bin/python ~/.fw-context/src/
-echo 'export PATH="$HOME/.fw-context/.venv/bin:$PATH"' >> ~/.zshrc
+cd ~/.fw-context/src && make install
 ```
 
 ### 2. Ollama (optional)
@@ -97,9 +93,7 @@ fw-context init
 ### 4. Update
 
 ```bash
-cd ~/.fw-context/src
-git pull
-uv pip install --reinstall --python ~/.fw-context/.venv/bin/python ~/.fw-context/src/
+cd ~/.fw-context/src && make update
 ```
 
 ### 5. Index your firmware project
