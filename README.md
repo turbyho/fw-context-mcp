@@ -50,6 +50,7 @@ from `compile_commands.json` — `#ifdef`-aware, not grep.
 | uv | `curl -LsSf https://astral.sh/uv/install.sh \| sh` | `brew install uv` |
 | bear | `sudo apt install bear` | `brew install bear` |
 | libclang | `sudo apt install libclang-dev` | `brew install llvm` |
+| Ollama *(volitelné)* | `curl -fsSL https://ollama.com/install.sh \| sh` | `brew install ollama` |
 
 #### Linux
 
@@ -69,13 +70,31 @@ uv pip install --python ~/.fw-context/.venv/bin/python ~/.fw-context/src/
 echo 'export PATH="$HOME/.fw-context/.venv/bin:$PATH"' >> ~/.zshrc
 ```
 
-### 2. Register with your AI assistant
+### 2. Ollama (volitelné)
+
+Powers `smart_search` (natural-language search) and `explain_symbol`.
+Funguje i bez Ollama — AI asistent zpracuje výsledky sám.
+
+```bash
+# Install
+curl -fsSL https://ollama.com/install.sh | sh   # Linux
+brew install ollama                               # macOS
+
+# Pull models
+ollama pull qwen2.5-coder:14b          # LLM (~9 GB VRAM, nebo menší :7b)
+ollama pull mxbai-embed-large:latest   # embedding model pro vector search
+
+# Start daemon
+ollama serve &
+```
+
+### 3. Register with your AI assistant
 
 ```bash
 fw-context init
 ```
 
-### 3. Update
+### 4. Update
 
 ```bash
 cd ~/.fw-context/src
@@ -83,7 +102,7 @@ git pull
 uv pip install --reinstall --python ~/.fw-context/.venv/bin/python ~/.fw-context/src/
 ```
 
-### 4. Index your firmware project
+### 5. Index your firmware project
 
 ```bash
 cd your-firmware-project
@@ -106,7 +125,7 @@ bear -- make
 fw-context index
 ```
 
-### 5. Restart your assistant and start asking about your code
+### 6. Restart your assistant and start asking about your code
 
 For detailed prerequisites, Ollama setup, and AI assistant integration:
 **[Installation guide →](docs/installation.md)**
