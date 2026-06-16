@@ -40,17 +40,52 @@ from `compile_commands.json` — `#ifdef`-aware, not grep.
 
 ## Quick start
 
+### 1. Install
+
+#### Prerequisites
+
+| | Linux (apt) | macOS (brew) |
+|---|---|---|
+| Python 3.11+ | `sudo apt install python3` | `brew install python@3.12` |
+| uv | `curl -LsSf https://astral.sh/uv/install.sh \| sh` | `brew install uv` |
+| bear | `sudo apt install bear` | `brew install bear` |
+| libclang | `sudo apt install libclang-dev` | `brew install llvm` |
+
+#### Linux
+
 ```bash
-# 1. Install
 git clone git@github.com:turbyho/fw-context-mcp.git ~/.fw-context/src
 uv venv ~/.fw-context/.venv --python 3.12
 uv pip install --python ~/.fw-context/.venv/bin/python ~/.fw-context/src/
 echo 'export PATH="$HOME/.fw-context/.venv/bin:$PATH"' >> ~/.zshrc
+```
 
-# 2. Register with your AI assistant
+#### macOS
+
+```bash
+git clone git@github.com:turbyho/fw-context-mcp.git ~/.fw-context/src
+uv venv ~/.fw-context/.venv --python 3.12
+uv pip install --python ~/.fw-context/.venv/bin/python ~/.fw-context/src/
+echo 'export PATH="$HOME/.fw-context/.venv/bin:$PATH"' >> ~/.zshrc
+```
+
+### 2. Register with your AI assistant
+
+```bash
 fw-context init
+```
 
-# 3. Generate compile_commands.json and index
+### 3. Update
+
+```bash
+cd ~/.fw-context/src
+git pull
+uv pip install --reinstall --python ~/.fw-context/.venv/bin/python ~/.fw-context/src/
+```
+
+### 4. Index your firmware project
+
+```bash
 cd your-firmware-project
 
 # Mbed OS:
@@ -69,9 +104,9 @@ bear -- make
 # or: bear -- cmake --build build
 
 fw-context index
-
-# 4. Restart your assistant and start asking about your code
 ```
+
+### 5. Restart your assistant and start asking about your code
 
 For detailed prerequisites, Ollama setup, and AI assistant integration:
 **[Installation guide →](docs/installation.md)**

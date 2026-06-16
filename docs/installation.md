@@ -4,6 +4,29 @@ Complete installation guide — prerequisites, setup, Ollama, AI assistant integ
 
 ## Prerequisites
 
+### Linux
+
+```bash
+# Ubuntu / Debian
+sudo apt install python3 bear libclang-dev
+
+# Arch / Manjaro
+sudo pacman -S python bear libclang
+
+# uv
+curl -LsSf https://astral.sh/uv/install.sh | sh
+```
+
+### macOS
+
+```bash
+# Homebrew (install from https://brew.sh if not present)
+brew install python@3.12 uv bear llvm
+
+# Add Homebrew Python to PATH
+echo 'export PATH="/opt/homebrew/opt/python@3.12/libexec/bin:$PATH"' >> ~/.zshrc
+```
+
 | What | Why |
 |------|-----|
 | Python 3.11+ | Runtime |
@@ -13,6 +36,23 @@ Complete installation guide — prerequisites, setup, Ollama, AI assistant integ
 | [Ollama](https://ollama.com) *(optional)* | Powers `smart_search` and `explain_symbol`. Disable with `[llm] enabled = false` to let the AI assistant handle results. |
 
 ## Install
+
+### Linux 🐧
+
+```bash
+# Clone
+git clone git@github.com:turbyho/fw-context-mcp.git ~/.fw-context/src
+# or: git clone git@git.montyho.com:turbyho/fw-context-mcp.git ~/.fw-context/src
+
+# Create venv + install
+uv venv ~/.fw-context/.venv --python 3.12
+uv pip install --python ~/.fw-context/.venv/bin/python ~/.fw-context/src/
+
+# Add to PATH
+echo 'export PATH="$HOME/.fw-context/.venv/bin:$PATH"' >> ~/.zshrc
+```
+
+### macOS 🍎
 
 ```bash
 # Clone
@@ -30,19 +70,26 @@ echo 'export PATH="$HOME/.fw-context/.venv/bin:$PATH"' >> ~/.zshrc
 **Optional dependencies:**
 
 ```bash
-# Vector search engine (auto-installed as core dependency)
-pip install sqlite-vec
-
 # File watcher for fw-context watch
 uv pip install --python ~/.fw-context/.venv/bin/python "fw-context-mcp[watch]"
 ```
 
-## Upgrade
+## Update
+
+### Linux 🐧
 
 ```bash
 cd ~/.fw-context/src
 git pull
-uv pip install --python ~/.fw-context/.venv/bin/python ~/.fw-context/src/
+uv pip install --reinstall --python ~/.fw-context/.venv/bin/python ~/.fw-context/src/
+```
+
+### macOS 🍎
+
+```bash
+cd ~/.fw-context/src
+git pull
+uv pip install --reinstall --python ~/.fw-context/.venv/bin/python ~/.fw-context/src/
 ```
 
 ## Verify
