@@ -649,6 +649,66 @@ def _resolve_target_usr(
     return rows["usr"] if rows else None
 
 
+def _bridge_weak_aliases(
+    conn: sqlite3.Connection,
+    config_hash: str,
+    all_edges: dict[str, list[tuple[str, str]]],
+) -> None:
+    """Add synthetic edges from weak-alias declarations to their definitions.
+
+    Embedded firmware uses ``__attribute__((weak, alias(\"__func\")))`` for
+    user-overridable hooks (e.g. ``digitalWrite`` → ``__digitalWrite``).
+    Libclang sees these as two different USRs with no connection.  We detect
+    them by looking for declaration-only callees that have a ``__``-prefixed
+    sibling definition with the same parameter signature — and inject a
+    synthetic edge so the BFS can traverse past the declaration.
+    """
+    # Collect declaration-only callee USRs that have no outgoing edges
+    decl_usrs: set[str] = set()
+    for edge_list in all_edges.values():
+        for to_usr_edge, _ in edge_list:
+            if to_usr_edge not in all_edges:  # has no outgoing edges
+                decl_usrs.add(to_usr_edge)
+    if not decl_usrs:
+        return
+
+    # Fetch (usr, name, param_count) for declarations + potential __-definitions
+    placeholders = ",".join("?" * len(decl_usrs))
+    rows = conn.execute(
+        f"""SELECT s.usr, s.name, s.signature, s.is_definition
+            FROM symbols s
+            WHERE s.config_hash = ?
+              AND (s.usr IN ({placeholders})
+                   OR (s.is_definition = 1 AND s.name LIKE '__%'))""",
+        (config_hash, *decl_usrs),
+    ).fetchall()
+
+    # Index: (name, param_count) → definition USR
+    import re
+    def_name_index: dict[tuple[str, int], str] = {}
+    decl_info: dict[str, tuple[str, int]] = {}  # usr → (name, param_count)
+    for row in rows:
+        usr, name, sig, is_def = row["usr"], row["name"], row["signature"] or "", row["is_definition"]
+        param_count = sig.count(",") + 1 if sig else 0
+        if is_def and name.startswith("__"):
+            def_name_index[(name, param_count)] = usr
+        elif usr in decl_usrs:
+            decl_info[usr] = (name, param_count)
+
+    # Match declarations to __-prefixed definitions by signature
+    bridged = 0
+    for usr, (name, pc) in decl_info.items():
+        # Try __<name> first, then other common patterns
+        for candidate in (f"__{name}", f"_{name}"):
+            def_usr = def_name_index.get((candidate, pc))
+            if def_usr:
+                all_edges.setdefault(usr, []).append(
+                    (def_usr, candidate)
+                )
+                bridged += 1
+                break
+
+
 def find_call_path(
     conn: sqlite3.Connection,
     config_hash: str,
@@ -706,6 +766,14 @@ def find_call_path(
             usr_names[row["usr"]] = row["name"]
 
     from_name_resolved = usr_names.get(from_usr, from_name)
+
+    # --- Weak-alias bridging ---
+    # Declaration symbols with no outgoing edges (e.g. digitalWrite in .h)
+    # never lead anywhere.  Detect the ``__attribute__((alias("__name")))``
+    # pattern by looking for a definition whose name is ``__<declname>`` with
+    # the same parameter signature.  Add a synthetic edge so the BFS can
+    # continue from the declaration into the framework internals.
+    _bridge_weak_aliases(conn, config_hash, all_edges)
 
     # BFS queue: (current_usr, depth, chain)
     from collections import deque
