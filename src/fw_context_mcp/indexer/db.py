@@ -627,15 +627,22 @@ def _resolve_target_usr(
     When multiple USRs exist for the same name (e.g. C++ inline functions
     with ``#*1C.#`` ABI tags), pick the one with the most incoming
     references — that is the variant actually called throughout the codebase.
+
+    Tiebreaker: prefer symbols that have outgoing refs (they call other
+    functions — i.e. they have a body) over symbols with no outgoing refs
+    (framework struct fields, declaration-only symbols, etc.).
     """
     rows = conn.execute(
-        """SELECT s.usr, COUNT(r.rowid) AS ref_count
+        """SELECT s.usr,
+                  COUNT(r_in.rowid) AS ref_count,
+                  COUNT(r_out.rowid) AS out_count
            FROM symbols s
-           LEFT JOIN refs r ON r.to_usr = s.usr AND r.config_hash = s.config_hash
+           LEFT JOIN refs r_in ON r_in.to_usr = s.usr AND r_in.config_hash = s.config_hash
+           LEFT JOIN refs r_out ON r_out.from_usr = s.usr AND r_out.config_hash = s.config_hash
            WHERE s.config_hash = ?
              AND (s.name = ? OR s.qualified_name = ?)
            GROUP BY s.usr
-           ORDER BY s.is_definition DESC, ref_count DESC
+           ORDER BY s.is_definition DESC, ref_count DESC, out_count DESC
            LIMIT 1""",
         (config_hash, name, name),
     ).fetchone()
