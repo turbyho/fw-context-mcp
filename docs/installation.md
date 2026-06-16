@@ -44,12 +44,8 @@ echo 'export PATH="/opt/homebrew/opt/python@3.12/libexec/bin:$PATH"' >> ~/.zshrc
 git clone git@github.com:turbyho/fw-context-mcp.git ~/.fw-context/src
 # or: git clone git@git.montyho.com:turbyho/fw-context-mcp.git ~/.fw-context/src
 
-# Create venv + install
-uv venv ~/.fw-context/.venv --python 3.12
-uv pip install --python ~/.fw-context/.venv/bin/python ~/.fw-context/src/
-
-# Add to PATH
-echo 'export PATH="$HOME/.fw-context/.venv/bin:$PATH"' >> ~/.zshrc
+# Install (creates venv, installs package, adds to PATH)
+cd ~/.fw-context/src && make install
 ```
 
 ### macOS 🍎
@@ -59,19 +55,14 @@ echo 'export PATH="$HOME/.fw-context/.venv/bin:$PATH"' >> ~/.zshrc
 git clone git@github.com:turbyho/fw-context-mcp.git ~/.fw-context/src
 # or: git clone git@git.montyho.com:turbyho/fw-context-mcp.git ~/.fw-context/src
 
-# Create venv + install
-uv venv ~/.fw-context/.venv --python 3.12
-uv pip install --python ~/.fw-context/.venv/bin/python ~/.fw-context/src/
-
-# Add to PATH
-echo 'export PATH="$HOME/.fw-context/.venv/bin:$PATH"' >> ~/.zshrc
+# Install (creates venv, installs package, adds to PATH)
+cd ~/.fw-context/src && make install
 ```
 
-**Optional dependencies:**
+**Optional: file watcher for `fw-context watch`:**
 
 ```bash
-# File watcher for fw-context watch
-uv pip install --python ~/.fw-context/.venv/bin/python "fw-context-mcp[watch]"
+cd ~/.fw-context/src && make install-watch
 ```
 
 ## Update
@@ -79,17 +70,13 @@ uv pip install --python ~/.fw-context/.venv/bin/python "fw-context-mcp[watch]"
 ### Linux 🐧
 
 ```bash
-cd ~/.fw-context/src
-git pull
-uv pip install --reinstall --python ~/.fw-context/.venv/bin/python ~/.fw-context/src/
+cd ~/.fw-context/src && make update
 ```
 
 ### macOS 🍎
 
 ```bash
-cd ~/.fw-context/src
-git pull
-uv pip install --reinstall --python ~/.fw-context/.venv/bin/python ~/.fw-context/src/
+cd ~/.fw-context/src && make update
 ```
 
 ## Verify
