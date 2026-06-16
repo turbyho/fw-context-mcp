@@ -50,7 +50,7 @@ from `compile_commands.json` — `#ifdef`-aware, not grep.
 | uv | `curl -LsSf https://astral.sh/uv/install.sh \| sh` | `brew install uv` |
 | bear | `sudo apt install bear` | `brew install bear` |
 | libclang | `sudo apt install libclang-dev` | `brew install llvm` |
-| Ollama *(volitelné)* | `curl -fsSL https://ollama.com/install.sh \| sh` | `brew install ollama` |
+| Ollama *(optional)* | `curl -fsSL https://ollama.com/install.sh \| sh` | `brew install ollama` |
 
 #### Linux
 
