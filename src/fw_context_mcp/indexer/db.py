@@ -662,26 +662,41 @@ def find_call_path(
         return []
 
     # Pre-load adjacency: for each USR, its outgoing edges → [(to_usr, callee_name)]
-    # We fetch edges in bulk, indexed by from_usr, so BFS only does dict lookups.
+    # Use LEFT JOIN — edges whose target is a declaration-only symbol
+    # (is_definition=0, common for weak aliases like digitalWrite) are included.
+    # COALESCE prefers the definition name, falls back to any name.
     all_edges: dict[str, list[tuple[str, str]]] = {}
     for row in conn.execute(
-        """SELECT r.from_usr, r.to_usr, s.name AS callee_name
+        """SELECT r.from_usr, r.to_usr,
+                  COALESCE(
+                      (SELECT name FROM symbols s
+                       WHERE s.usr = r.to_usr AND s.config_hash = r.config_hash
+                         AND s.is_definition = 1 LIMIT 1),
+                      (SELECT name FROM symbols s
+                       WHERE s.usr = r.to_usr AND s.config_hash = r.config_hash LIMIT 1),
+                      '?'
+                  ) AS callee_name
            FROM refs r
-           JOIN symbols s ON s.usr = r.to_usr AND s.config_hash = r.config_hash
-           WHERE r.config_hash = ? AND s.is_definition = 1""",
+           WHERE r.config_hash = ?
+           GROUP BY r.from_usr, r.to_usr""",
         (config_hash,),
     ):
         all_edges.setdefault(row["from_usr"], []).append(
             (row["to_usr"], row["callee_name"])
         )
 
-    # Also load symbol names for USRs (needed for caller names in base step)
+    # Also load symbol names for USRs (needed for caller names in base step).
+    # Prefer definition names, fall back to declaration names.
     usr_names: dict[str, str] = {}
     for row in conn.execute(
-        "SELECT usr, name FROM symbols WHERE config_hash=? AND is_definition=1",
+        """SELECT usr, name, is_definition
+           FROM symbols
+           WHERE config_hash = ?
+           ORDER BY is_definition DESC""",
         (config_hash,),
     ):
-        usr_names[row["usr"]] = row["name"]
+        if row["usr"] not in usr_names:
+            usr_names[row["usr"]] = row["name"]
 
     from_name_resolved = usr_names.get(from_usr, from_name)
 
