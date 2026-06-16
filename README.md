@@ -70,10 +70,10 @@ uv pip install --python ~/.fw-context/.venv/bin/python ~/.fw-context/src/
 echo 'export PATH="$HOME/.fw-context/.venv/bin:$PATH"' >> ~/.zshrc
 ```
 
-### 2. Ollama (volitelné)
+### 2. Ollama (optional)
 
 Powers `smart_search` (natural-language search) and `explain_symbol`.
-Funguje i bez Ollama — AI asistent zpracuje výsledky sám.
+Works without Ollama too — the AI assistant processes results on its own.
 
 ```bash
 # Install
@@ -81,8 +81,8 @@ curl -fsSL https://ollama.com/install.sh | sh   # Linux
 brew install ollama                               # macOS
 
 # Pull models
-ollama pull qwen2.5-coder:14b          # LLM (~9 GB VRAM, nebo menší :7b)
-ollama pull mxbai-embed-large:latest   # embedding model pro vector search
+ollama pull qwen2.5-coder:14b          # LLM (~9 GB VRAM, or :7b for 4 GB)
+ollama pull mxbai-embed-large:latest   # embedding model for vector search
 
 # Start daemon
 ollama serve &
