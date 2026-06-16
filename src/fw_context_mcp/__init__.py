@@ -1,3 +1,8 @@
 """fw-context-mcp — build-aware code intelligence for embedded projects."""
 
-__version__ = "0.1.0"
+import importlib.metadata
+
+try:
+    __version__ = importlib.metadata.version("fw-context-mcp")
+except importlib.metadata.PackageNotFoundError:
+    __version__ = "0.0.0-dev"

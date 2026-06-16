@@ -9,6 +9,8 @@ import sys
 from datetime import UTC
 from pathlib import Path
 
+from . import __version__
+
 
 def cmd_index(args: argparse.Namespace) -> int:
     from .config import derive_project_id
@@ -621,9 +623,22 @@ def cmd_watch(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_version(args: argparse.Namespace) -> int:
+    """Print version and exit."""
+    from . import __version__
+    print(f"fw-context-mcp {__version__}")
+    return 0
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(prog="fw-context", description="Firmware code intelligence")
     parser.add_argument("-v", "--verbose", action="store_true")
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"fw-context-mcp {__version__}",
+        help="Show version and exit",
+    )
     sub = parser.add_subparsers(dest="cmd")
 
     p_index = sub.add_parser("index", help="Build the symbol index from compile_commands.json")
@@ -675,6 +690,9 @@ def main() -> None:
     p_watch.add_argument("--debounce", type=int, default=2000, metavar="MS",
                          help="Debounce delay in ms (default: 2000)")
     p_watch.set_defaults(func=cmd_watch)
+
+    p_version = sub.add_parser("version", help="Show version information")
+    p_version.set_defaults(func=cmd_version)
 
     args = parser.parse_args()
     if not hasattr(args, "func"):
