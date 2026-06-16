@@ -10,8 +10,9 @@
 # Remove:
 #   cd ~/.fw-context/src && make uninstall
 
+# Auto-detect source directory (the directory containing this Makefile)
+SRC       := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))
 VENV      ?= $(HOME)/.fw-context/.venv
-SRC       ?= $(HOME)/.fw-context/src
 PYTHON    ?= python3.12
 UV        := $(shell command -v uv 2>/dev/null)
 
