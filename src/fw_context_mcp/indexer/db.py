@@ -649,6 +649,58 @@ def _resolve_target_usr(
     return rows["usr"] if rows else None
 
 
+def _get_alias_pairs(
+    conn: sqlite3.Connection, config_hash: str
+) -> list[tuple[str, str]]:
+    """Return [(decl_usr, def_usr)] for weak-alias declarations → definitions.
+
+    Detects the ``__attribute__((weak, alias(\"__func\")))`` pattern by finding
+    declaration-only symbols that have a ``__``-prefixed sibling definition
+    with the same parameter signature.
+    """
+    # Declarations that appear as callees but have no outgoing refs themselves.
+    # Use NOT EXISTS instead of NOT IN — the refs table has NULL from_usr
+    # (2760 file-scope references with no enclosing function), and NOT IN
+    # returns NULL (falsy) when the subquery contains NULLs.
+    rows = conn.execute(
+        """SELECT s.usr, s.name, s.signature
+           FROM symbols s
+           WHERE s.config_hash = ?
+             AND s.is_definition = 0
+             AND s.kind IN ('function', 'method', 'constructor', 'destructor')
+             AND EXISTS (SELECT 1 FROM refs r WHERE r.to_usr = s.usr AND r.config_hash = ?)
+             AND NOT EXISTS (SELECT 1 FROM refs r WHERE r.from_usr = s.usr AND r.config_hash = ?)
+        """,
+        (config_hash, config_hash, config_hash),
+    ).fetchall()
+
+    if not rows:
+        return []
+
+    # Build index of __-prefixed definitions by (name, param_count)
+    def_rows = conn.execute(
+        """SELECT usr, name, signature FROM symbols
+           WHERE config_hash = ? AND is_definition = 1 AND name LIKE '__%'
+        """,
+        (config_hash,),
+    ).fetchall()
+
+    def_index: dict[tuple[str, int], str] = {}
+    for r in def_rows:
+        pc = (r["signature"] or "").count(",") + 1 if r["signature"] else 0
+        def_index[(r["name"], pc)] = r["usr"]
+
+    pairs: list[tuple[str, str]] = []
+    for r in rows:
+        pc = (r["signature"] or "").count(",") + 1 if r["signature"] else 0
+        for candidate in (f"__{r['name']}", f"_{r['name']}"):
+            def_usr = def_index.get((candidate, pc))
+            if def_usr:
+                pairs.append((r["usr"], def_usr))
+                break
+    return pairs
+
+
 def _bridge_weak_aliases(
     conn: sqlite3.Connection,
     config_hash: str,
@@ -658,55 +710,18 @@ def _bridge_weak_aliases(
 
     Embedded firmware uses ``__attribute__((weak, alias(\"__func\")))`` for
     user-overridable hooks (e.g. ``digitalWrite`` → ``__digitalWrite``).
-    Libclang sees these as two different USRs with no connection.  We detect
-    them by looking for declaration-only callees that have a ``__``-prefixed
-    sibling definition with the same parameter signature — and inject a
-    synthetic edge so the BFS can traverse past the declaration.
+    Libclang sees these as two different USRs with no connection.  We inject
+    synthetic edges so the BFS can traverse past the declaration.
     """
-    # Collect declaration-only callee USRs that have no outgoing edges
-    decl_usrs: set[str] = set()
-    for edge_list in all_edges.values():
-        for to_usr_edge, _ in edge_list:
-            if to_usr_edge not in all_edges:  # has no outgoing edges
-                decl_usrs.add(to_usr_edge)
-    if not decl_usrs:
-        return
-
-    # Fetch (usr, name, param_count) for declarations + potential __-definitions
-    placeholders = ",".join("?" * len(decl_usrs))
-    rows = conn.execute(
-        f"""SELECT s.usr, s.name, s.signature, s.is_definition
-            FROM symbols s
-            WHERE s.config_hash = ?
-              AND (s.usr IN ({placeholders})
-                   OR (s.is_definition = 1 AND s.name LIKE '__%'))""",
-        (config_hash, *decl_usrs),
-    ).fetchall()
-
-    # Index: (name, param_count) → definition USR
-    import re
-    def_name_index: dict[tuple[str, int], str] = {}
-    decl_info: dict[str, tuple[str, int]] = {}  # usr → (name, param_count)
-    for row in rows:
-        usr, name, sig, is_def = row["usr"], row["name"], row["signature"] or "", row["is_definition"]
-        param_count = sig.count(",") + 1 if sig else 0
-        if is_def and name.startswith("__"):
-            def_name_index[(name, param_count)] = usr
-        elif usr in decl_usrs:
-            decl_info[usr] = (name, param_count)
-
-    # Match declarations to __-prefixed definitions by signature
-    bridged = 0
-    for usr, (name, pc) in decl_info.items():
-        # Try __<name> first, then other common patterns
-        for candidate in (f"__{name}", f"_{name}"):
-            def_usr = def_name_index.get((candidate, pc))
-            if def_usr:
-                all_edges.setdefault(usr, []).append(
-                    (def_usr, candidate)
-                )
-                bridged += 1
-                break
+    pairs = _get_alias_pairs(conn, config_hash)
+    for decl_usr, def_usr in pairs:
+        # Get the definition name for display in chains
+        def_name = conn.execute(
+            "SELECT name FROM symbols WHERE config_hash=? AND usr=? LIMIT 1",
+            (config_hash, def_usr),
+        ).fetchone()
+        label = def_name["name"] if def_name else "?"
+        all_edges.setdefault(decl_usr, []).append((def_usr, label))
 
 
 def find_call_path(
@@ -827,27 +842,60 @@ def find_all_callers_recursive(
     if not target_usr:
         return []
 
-    rows = conn.execute(
-        """WITH RECURSIVE callers(usr, depth) AS (
+    # Build extended refs: real refs + synthetic weak-alias edges.
+    # When someone calls decl_usr (alias), they also effectively call def_usr.
+    alias_pairs = _get_alias_pairs(conn, config_hash)
+    alias_values = ", ".join(
+        f"('{d}', '{f}')" for d, f in alias_pairs
+    )
+    alias_cte = (
+        f"""alias_pairs(decl_usr, def_usr) AS (VALUES {alias_values}),"""
+        if alias_values else ""
+    )
+    alias_join = (
+        """UNION ALL
+        SELECT r.from_usr, ap.def_usr
+        FROM refs r
+        JOIN alias_pairs ap ON r.to_usr = ap.decl_usr
+        WHERE r.config_hash = ?"""
+        if alias_values else ""
+    )
+
+    query = f"""WITH {alias_cte}
+        extended_refs(from_usr, to_usr) AS (
+            SELECT from_usr, to_usr FROM refs WHERE config_hash = ?
+            {alias_join}
+        ),
+        callers(usr, depth) AS (
             SELECT from_usr, 1
-            FROM refs
-            WHERE to_usr = ? AND config_hash = ?
+            FROM extended_refs
+            WHERE to_usr = ?
             UNION
-            SELECT r.from_usr, c.depth + 1
-            FROM refs r
-            JOIN callers c ON r.to_usr = c.usr
-            WHERE c.depth < ? AND r.config_hash = ?
+            SELECT er.from_usr, c.depth + 1
+            FROM extended_refs er
+            JOIN callers c ON er.to_usr = c.usr
+            WHERE c.depth < ?
         )
-        SELECT s.name, s.qualified_name, s.kind, s.file_path, s.signature,
+        SELECT COALESCE(s_def.name, s_any.name, '?') AS name,
+               COALESCE(s_def.qualified_name, s_any.qualified_name) AS qualified_name,
+               COALESCE(s_def.kind, s_any.kind) AS kind,
+               COALESCE(s_def.file_path, s_any.file_path) AS file_path,
+               COALESCE(s_def.signature, s_any.signature) AS signature,
                MIN(c.depth) AS depth
         FROM callers c
-        JOIN symbols s ON s.usr = c.usr AND s.config_hash = ?
-        WHERE s.is_definition = 1
-        GROUP BY s.usr
-        ORDER BY depth, s.name
-        LIMIT ?""",
-        (target_usr, config_hash, max_depth, config_hash, config_hash, limit),
-    ).fetchall()
+        LEFT JOIN symbols s_def ON s_def.usr = c.usr AND s_def.config_hash = ?
+                                   AND s_def.is_definition = 1
+        LEFT JOIN symbols s_any ON s_any.usr = c.usr AND s_any.config_hash = ?
+        HAVING COALESCE(s_def.name, s_any.name) IS NOT NULL
+        ORDER BY depth, COALESCE(s_def.name, s_any.name)
+        LIMIT ?"""
+
+    params = [config_hash]
+    if alias_values:
+        params.append(config_hash)
+    params.extend([target_usr, max_depth, config_hash, config_hash, limit])
+
+    rows = conn.execute(query, params).fetchall()
 
     return [dict(r) for r in rows]
 
@@ -867,27 +915,61 @@ def find_callees_recursive(
     if not source_usr:
         return []
 
-    rows = conn.execute(
-        """WITH RECURSIVE callees(usr, depth) AS (
+    # Build extended refs: real refs + synthetic weak-alias edges.
+    # When decl_usr is an alias for def_usr, anything def_usr calls should
+    # also be reachable from decl_usr.
+    alias_pairs = _get_alias_pairs(conn, config_hash)
+    alias_values = ", ".join(
+        f"('{d}', '{f}')" for d, f in alias_pairs
+    )
+    alias_cte = (
+        f"""alias_pairs(decl_usr, def_usr) AS (VALUES {alias_values}),"""
+        if alias_values else ""
+    )
+    alias_join = (
+        """UNION ALL
+        SELECT ap.decl_usr, r.to_usr
+        FROM refs r
+        JOIN alias_pairs ap ON r.from_usr = ap.def_usr
+        WHERE r.config_hash = ?"""
+        if alias_values else ""
+    )
+
+    query = f"""WITH {alias_cte}
+        extended_refs(from_usr, to_usr) AS (
+            SELECT from_usr, to_usr FROM refs WHERE config_hash = ?
+            {alias_join}
+        ),
+        callees(usr, depth) AS (
             SELECT to_usr, 1
-            FROM refs
-            WHERE from_usr = ? AND config_hash = ?
+            FROM extended_refs
+            WHERE from_usr = ?
             UNION
-            SELECT r.to_usr, c.depth + 1
-            FROM refs r
-            JOIN callees c ON r.from_usr = c.usr
-            WHERE c.depth < ? AND r.config_hash = ?
+            SELECT er.to_usr, c.depth + 1
+            FROM extended_refs er
+            JOIN callees c ON er.from_usr = c.usr
+            WHERE c.depth < ?
         )
-        SELECT s.name, s.qualified_name, s.kind, s.file_path, s.signature,
+        SELECT COALESCE(s_def.name, s_any.name, '?') AS name,
+               COALESCE(s_def.qualified_name, s_any.qualified_name) AS qualified_name,
+               COALESCE(s_def.kind, s_any.kind) AS kind,
+               COALESCE(s_def.file_path, s_any.file_path) AS file_path,
+               COALESCE(s_def.signature, s_any.signature) AS signature,
                MIN(c.depth) AS depth
         FROM callees c
-        JOIN symbols s ON s.usr = c.usr AND s.config_hash = ?
-        WHERE s.is_definition = 1
-        GROUP BY s.usr
-        ORDER BY depth, s.name
-        LIMIT ?""",
-        (source_usr, config_hash, max_depth, config_hash, config_hash, limit),
-    ).fetchall()
+        LEFT JOIN symbols s_def ON s_def.usr = c.usr AND s_def.config_hash = ?
+                                   AND s_def.is_definition = 1
+        LEFT JOIN symbols s_any ON s_any.usr = c.usr AND s_any.config_hash = ?
+        HAVING COALESCE(s_def.name, s_any.name) IS NOT NULL
+        ORDER BY depth, COALESCE(s_def.name, s_any.name)
+        LIMIT ?"""
+
+    params = [config_hash]
+    if alias_values:
+        params.append(config_hash)
+    params.extend([source_usr, max_depth, config_hash, config_hash, limit])
+
+    rows = conn.execute(query, params).fetchall()
 
     return [dict(r) for r in rows]
 
