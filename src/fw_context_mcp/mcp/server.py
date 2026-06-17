@@ -862,21 +862,23 @@ def get_symbol_context(
             file_path = abs_path(root, row["file_path"])
             symbol_usr = row["usr"]
 
-            # Immediate callers (who calls this symbol)
-            callers = find_refs(conn, config_hash, name, ref_kind="call", limit=5)
+            # Immediate callers (who calls this symbol, direct + indirect)
+            callers = find_refs(conn, config_hash, name, ref_kind=None, limit=10)
             callers_list = [
                 {"name": c["caller_name"] or "?", "qualified_name": c["caller_qname"] or "",
                  "file": abs_path(root, c["caller_file"] or c["from_file"]),
-                 "line": c["from_line"], "kind": c["caller_kind"] or ""}
-                for c in callers if c["ref_kind"] == "call"
+                 "line": c["from_line"], "kind": c["caller_kind"] or "",
+                 "ref_kind": c["ref_kind"]}
+                for c in callers if c["ref_kind"] in ("call", "indirect")
             ][:5]
 
-            # Immediate callees (what this symbol calls)
+            # Immediate callees (what this symbol calls, direct + indirect)
             callees_rows = conn.execute(
-                """SELECT s.name, s.qualified_name, s.kind, s.file_path
+                """SELECT s.name, s.qualified_name, s.kind, s.file_path, r.ref_kind
                    FROM refs r
                    JOIN symbols s ON s.usr = r.to_usr AND s.config_hash = r.config_hash
-                   WHERE r.from_usr = ? AND r.config_hash = ? AND r.ref_kind = 'call'
+                   WHERE r.from_usr = ? AND r.config_hash = ?
+                     AND r.ref_kind IN ('call', 'indirect')
                    LIMIT 5""",
                 (symbol_usr, config_hash),
             ).fetchall()
@@ -928,7 +930,7 @@ def _references_result(name: str, project_root: str | None, ref_kind: str | None
             limit = min(limit, 200)
             rows = find_refs(conn, config_hash, name, ref_kind=ref_kind, limit=limit)
             if not rows:
-                label = "callers" if ref_kind == "call" else "references"
+                label = "callers" if ref_kind is None or ref_kind == "call" else "references"
                 return [{"info": f"No {label} found for '{name}'. Check the name (exact match) and that the index is current."}]
             result: list[dict] = [
                 {
@@ -947,12 +949,12 @@ def _references_result(name: str, project_root: str | None, ref_kind: str | None
 
 @mcp.tool()
 def find_callers(
-    name: Annotated[str, Field(description="Symbol name to find callers of. Returns direct call sites.")],
+    name: Annotated[str, Field(description="Symbol name to find callers of. Returns direct call sites and indirect calls via function pointers.")],
     project_root: Annotated[str | None, Field(description="Project root. Auto-detected if omitted.")] = None,
     limit: Annotated[int, Field(description="Maximum results.")] = 50,
 ) -> list[dict]:
-    """Find call sites of a function/method — who calls ``name``."""
-    return _references_result(name, project_root, ref_kind="call", limit=limit)
+    """Find call sites of a function/method — who calls ``name`` (direct + indirect via function pointers)."""
+    return _references_result(name, project_root, ref_kind=None, limit=limit)
 
 
 @mcp.tool()

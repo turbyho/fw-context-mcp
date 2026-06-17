@@ -54,6 +54,13 @@ _REF_KINDS = {
     cx.CursorKind.MEMBER_REF_EXPR: "member",
 }
 
+# Cursor kinds that are valid targets for an indirect call (function pointers)
+_INDIRECT_TARGET_KINDS = frozenset({
+    cx.CursorKind.FUNCTION_DECL,
+    cx.CursorKind.FUNCTION_TEMPLATE,
+    cx.CursorKind.CXX_METHOD,
+})
+
 
 @dataclass
 class Reference:
@@ -61,7 +68,7 @@ class Reference:
     from_file: str     # file containing the reference (absolute, as clang reports)
     from_line: int
     from_usr: str | None   # USR of the enclosing function/method (caller), or None
-    ref_kind: str      # "call" | "ref" | "member"
+    ref_kind: str      # "call" | "ref" | "member" | "indirect"
 
 
 @dataclass
@@ -163,6 +170,70 @@ def _docstring(cursor: cx.Cursor) -> str:
         if line:
             cleaned.append(line)
     return " ".join(cleaned)
+
+
+def _find_fn_refs_in_expr(
+    cursor: cx.Cursor,
+    in_roots_fn,
+    not_excluded_fn,
+    _skip_usr: str | None = None,
+) -> list[cx.Cursor]:
+    """Recursively extract function/method declarations referenced inside an expression.
+
+    Walks into UNARY_OPERATOR (address-of ``&``), nested CALL_EXPR (callback
+    wrappers like ``mbed::callback(...)``), and other intermediate nodes to find
+    function pointer targets that libclang can resolve.
+
+    ``_skip_usr`` is the callee USR of the nearest enclosing CALL_EXPR whose
+    callee is a project function; its children (the callee's own DECL_REF_EXPR
+    wrappers) are skipped to avoid re-emitting direct calls as indirect edges.
+
+    Returns a list of resolved ``FUNCTION_DECL`` / ``CXX_METHOD`` cursors whose
+    definition location passes ``in_roots_fn`` and ``not_excluded_fn``.
+    """
+    results: list[cx.Cursor] = []
+
+    # Direct reference to a callable (bare function name, method ref, etc.)
+    if cursor.kind in (cx.CursorKind.DECL_REF_EXPR, cx.CursorKind.MEMBER_REF_EXPR):
+        ref = cursor.referenced
+        if ref is not None and ref.kind in _INDIRECT_TARGET_KINDS:
+            # Skip if this is the callee of the enclosing project-function call
+            if _skip_usr and ref.get_usr() == _skip_usr:
+                return results
+            loc = ref.location
+            if loc.file and in_roots_fn(loc.file.name) and not_excluded_fn(loc.file.name):
+                results.append(ref)
+        return results
+
+    # Address-of operator (&) — peel and recurse into the operand
+    if cursor.kind == cx.CursorKind.UNARY_OPERATOR:
+        for child in cursor.get_children():
+            results.extend(_find_fn_refs_in_expr(child, in_roots_fn, not_excluded_fn, _skip_usr))
+        return results
+
+    # Nested call expression — e.g. callback(&Class::method, this).
+    # Always recurse into arguments to find function pointer targets.
+    # When the nested callee is itself a project function (not a callback
+    # wrapper like mbed::callback), propagate its USR as _skip_usr so its
+    # own callee-reference children are not emitted as indirect edges.
+    if cursor.kind == cx.CursorKind.CALL_EXPR:
+        nested_callee = cursor.referenced
+        nested_skip = _skip_usr
+        if nested_callee is not None:
+            nested_callee_usr = nested_callee.get_usr()
+            if nested_callee_usr:
+                loc = nested_callee.location
+                if loc.file and in_roots_fn(loc.file.name) and not_excluded_fn(loc.file.name):
+                    nested_skip = nested_callee_usr
+        for child in cursor.get_children():
+            results.extend(_find_fn_refs_in_expr(child, in_roots_fn, not_excluded_fn, nested_skip))
+        return results
+
+    # Default: recurse into all children (handles implicit casts, parentheses, etc.)
+    for child in cursor.get_children():
+        results.extend(_find_fn_refs_in_expr(child, in_roots_fn, not_excluded_fn, _skip_usr))
+
+    return results
 
 
 def extract(
@@ -268,6 +339,14 @@ def extract_all(
     if not with_refs:
         return symbols, []
 
+    # Build qualified-name → USR lookup for token-based fallback
+    # (UNEXPOSED_EXPR nodes hide template expansions like mbed::callback(...)
+    #  so we fall back to scanning raw tokens for &Class::method patterns)
+    _qn_to_usr: dict[str, str] = {}
+    for s in symbols:
+        if s.qualified_name:
+            _qn_to_usr[s.qualified_name] = s.usr
+
     # --- References (explicit stack DFS to track the enclosing function) ---
     refs: list[Reference] = []
     seen_ref: set[tuple] = set()
@@ -300,6 +379,85 @@ def extract_all(
                             from_usr=cur_fn,
                             ref_kind=ref_kind,
                         ))
+
+        # --- Indirect calls: detect function pointers passed as arguments ---
+        # When a CALL_EXPR passes a function/method pointer as an argument
+        # (e.g. callback(&Class::method, this), Thread::start(callback(...)),
+        #  EventQueue::call_every(ms, obj, &Class::handler)),
+        # extract the target and emit an "indirect" reference edge.
+        # This is platform-agnostic: works for Mbed OS, Zephyr, FreeRTOS, POSIX,
+        # and any other framework that accepts function pointers as arguments.
+        if cursor.kind == cx.CursorKind.CALL_EXPR:
+            loc = cursor.location
+            direct_callee = cursor.referenced
+            direct_callee_usr = direct_callee.get_usr() if direct_callee else None
+            if loc.file and _in_roots(loc.file.name) and _not_excluded(loc.file.name):
+                for arg in cursor.get_children():
+                    targets = _find_fn_refs_in_expr(arg, _in_roots, _not_excluded, direct_callee_usr)
+                    for target in targets:
+                        target_usr = target.get_usr()
+                        if not target_usr:
+                            continue
+                        # Don't emit indirect if it's the same as the direct callee
+                        if target_usr == direct_callee_usr:
+                            continue
+                        target_loc = target.location
+                        if target_loc.file and _in_roots(target_loc.file.name) and _not_excluded(target_loc.file.name):
+                            key = (target_usr, loc.file.name, loc.line, cur_fn, "indirect")
+                            if key not in seen_ref:
+                                seen_ref.add(key)
+                                refs.append(Reference(
+                                    to_usr=target_usr,
+                                    from_file=loc.file.name,
+                                    from_line=loc.line,
+                                    from_usr=cur_fn,
+                                    ref_kind="indirect",
+                                ))
+
+        # --- Token fallback for UNEXPOSED_EXPR ---
+        # When libclang cannot decompose a template expression (e.g. Mbed OS
+        # callback(&Class::method, this)), the entire expression becomes an
+        # opaque UNEXPOSED_EXPR with no children.  We scan the raw tokens for
+        # &ClassName::methodName patterns and resolve them against the symbols
+        # already extracted from this translation unit.
+        #
+        # The token sequence "& ClassName :: methodName" yields a partial
+        # qualified name (e.g. "ZMODEM::thread_app" without the namespace
+        # prefix).  We match by suffix against the full qualified-name map.
+        if cursor.kind == cx.CursorKind.UNEXPOSED_EXPR:
+            loc = cursor.location
+            if loc.file and _in_roots(loc.file.name) and _not_excluded(loc.file.name):
+                tokens = list(cursor.get_tokens())
+                for i, tok in enumerate(tokens):
+                    if tok.spelling == "&" and i + 3 < len(tokens):
+                        t1 = tokens[i + 1]
+                        t2 = tokens[i + 2]
+                        t3 = tokens[i + 3]
+                        if (t1.kind.name == "IDENTIFIER"
+                                and t2.spelling == "::"
+                                and t3.kind.name == "IDENTIFIER"):
+                            partial = f"{t1.spelling}::{t3.spelling}"
+                            # Try exact match first, then suffix match for
+                            # namespace-qualified symbols (e.g. token
+                            # "ZMODEM::thread_app" → "zbox::ZMODEM::thread_app")
+                            target_usr = _qn_to_usr.get(partial)
+                            if not target_usr:
+                                suffix = f"::{partial}"
+                                for qn, usr in _qn_to_usr.items():
+                                    if qn.endswith(suffix):
+                                        target_usr = usr
+                                        break
+                            if target_usr:
+                                key = (target_usr, loc.file.name, loc.line, cur_fn, "indirect")
+                                if key not in seen_ref:
+                                    seen_ref.add(key)
+                                    refs.append(Reference(
+                                        to_usr=target_usr,
+                                        from_file=loc.file.name,
+                                        from_line=loc.line,
+                                        from_usr=cur_fn,
+                                        ref_kind="indirect",
+                                    ))
 
         for child in cursor.get_children():
             stack.append((child, cur_fn))
