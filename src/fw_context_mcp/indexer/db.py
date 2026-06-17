@@ -1023,11 +1023,26 @@ def find_hotspots(
     return [dict(r) for r in rows]
 
 
+def _build_kind_filter(ref_kind: str | list[str] | None) -> tuple[str, list[str]]:
+    """Build a SQL kind-filter clause and parameter list for ref_kind.
+
+    Returns ``(sql_fragment, params)`` — the fragment is empty when
+    *ref_kind* is None, a single ``= ?`` for a string, or an ``IN (...)``
+    clause for a list.
+    """
+    if ref_kind is None:
+        return "", []
+    if isinstance(ref_kind, list):
+        placeholders = ", ".join("?" * len(ref_kind))
+        return f"AND r.ref_kind IN ({placeholders})", list(ref_kind)
+    return "AND r.ref_kind = ?", [ref_kind]
+
+
 def find_refs(
     conn: sqlite3.Connection,
     config_hash: str,
     name: str,
-    ref_kind: str | None = None,
+    ref_kind: str | list[str] | None = None,
     limit: int = 50,
 ) -> list[sqlite3.Row]:
     """Find references to a symbol by name.
@@ -1040,6 +1055,9 @@ def find_refs(
     granularity (e.g. ``ZUART::get``, not ``ZUART`` itself).  When the resolved
     symbol is an aggregate type, the query uses USR prefix matching
     (``to_usr LIKE usr || '@%'``) so all member references are included.
+
+    *ref_kind* can be a single value, a list (→ ``IN`` clause), or None
+    (no filter).
     """
     # ── Resolve name → USR and kind ──────────────────────────────────────
     symbol = conn.execute(
@@ -1055,7 +1073,7 @@ def find_refs(
         return []
 
     is_aggregate = symbol["kind"] in ("class", "struct", "enum")
-    kind_filter = "AND r.ref_kind = ?" if ref_kind else ""
+    kind_filter, kind_params = _build_kind_filter(ref_kind)
 
     _SELECT = """SELECT r.from_file, r.from_line, r.ref_kind,
                         r.from_usr,
@@ -1070,10 +1088,7 @@ def find_refs(
 
     if is_aggregate:
         usr_prefix = symbol["usr"] + "@%"
-        params: list = [config_hash, usr_prefix]
-        if ref_kind:
-            params.append(ref_kind)
-        params.append(limit)
+        params: list = [config_hash, usr_prefix] + kind_params + [limit]
         return conn.execute(
             f"""{_SELECT}
                   AND r.to_usr LIKE ? {kind_filter}
@@ -1083,10 +1098,7 @@ def find_refs(
         ).fetchall()
 
     # ── Exact USR match for functions, methods, variables, etc. ──────────
-    params = [config_hash, config_hash, name, name]
-    if ref_kind:
-        params.append(ref_kind)
-    params.append(limit)
+    params = [config_hash, config_hash, name, name] + kind_params + [limit]
     return conn.execute(
         f"""{_SELECT}
               AND r.to_usr IN (
