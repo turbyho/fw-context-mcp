@@ -16,12 +16,38 @@ python3 bump.py <nova-verze>
 
 Updatuje `pyproject.toml` a `server.json`.
 
-## Commit a push na oba servery
+## Vytvořit tag
 
 ```bash
+git tag -a v<verze> <commit> -m "v<verze>: <strucny popis>"
+git push origin v<verze> && git push github v<verze>
+```
+
+## Vytvořit GitHub Release
+
+```bash
+gh release create v<verze> --title "v<verze> — <titulek>" --notes "<markdown popis>"
+```
+
+## Kompletní postup
+
+```bash
+# 1. bump verze
+python3 bump.py <nova-verze>
+
+# 2. commit
 git add -A
-git commit -m "fix: ..."
+git commit -m "<typ>: <popis>"
+
+# 3. tag
+git tag -a v<verze> -m "v<verze>: <strucny popis>"
+
+# 4. push commity a tagy na oba servery
 git push origin main && git push github main
+git push origin v<verze> && git push github v<verze>
+
+# 5. GitHub Release
+gh release create v<verze> --title "v<verze> — <titulek>" --notes "<markdown>"
 ```
 
 **Remoty:**
