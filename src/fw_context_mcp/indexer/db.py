@@ -760,6 +760,7 @@ def find_call_path(
                   ) AS callee_name
            FROM refs r
            WHERE r.config_hash = ?
+             AND r.ref_kind IN ('call', 'indirect')
            GROUP BY r.from_usr, r.to_usr""",
         (config_hash,),
     ):
@@ -863,7 +864,8 @@ def find_all_callers_recursive(
 
     query = f"""WITH {alias_cte}
         extended_refs(from_usr, to_usr) AS (
-            SELECT from_usr, to_usr FROM refs WHERE config_hash = ?
+            SELECT from_usr, to_usr FROM refs
+            WHERE config_hash = ? AND ref_kind IN ('call', 'indirect')
             {alias_join}
         ),
         callers(usr, depth) AS (
@@ -875,19 +877,24 @@ def find_all_callers_recursive(
             FROM extended_refs er
             JOIN callers c ON er.to_usr = c.usr
             WHERE c.depth < ?
+        ),
+        dedup AS (
+            SELECT usr, MIN(depth) AS depth
+            FROM callers
+            GROUP BY usr
         )
         SELECT COALESCE(s_def.name, s_any.name, '?') AS name,
                COALESCE(s_def.qualified_name, s_any.qualified_name) AS qualified_name,
                COALESCE(s_def.kind, s_any.kind) AS kind,
                COALESCE(s_def.file_path, s_any.file_path) AS file_path,
                COALESCE(s_def.signature, s_any.signature) AS signature,
-               MIN(c.depth) AS depth
-        FROM callers c
-        LEFT JOIN symbols s_def ON s_def.usr = c.usr AND s_def.config_hash = ?
+               d.depth
+        FROM dedup d
+        LEFT JOIN symbols s_def ON s_def.usr = d.usr AND s_def.config_hash = ?
                                    AND s_def.is_definition = 1
-        LEFT JOIN symbols s_any ON s_any.usr = c.usr AND s_any.config_hash = ?
-        HAVING COALESCE(s_def.name, s_any.name) IS NOT NULL
-        ORDER BY depth, COALESCE(s_def.name, s_any.name)
+        LEFT JOIN symbols s_any ON s_any.usr = d.usr AND s_any.config_hash = ?
+        WHERE COALESCE(s_def.name, s_any.name) IS NOT NULL
+        ORDER BY d.depth, COALESCE(s_def.name, s_any.name)
         LIMIT ?"""
 
     params = [config_hash]
@@ -937,7 +944,8 @@ def find_callees_recursive(
 
     query = f"""WITH {alias_cte}
         extended_refs(from_usr, to_usr) AS (
-            SELECT from_usr, to_usr FROM refs WHERE config_hash = ?
+            SELECT from_usr, to_usr FROM refs
+            WHERE config_hash = ? AND ref_kind IN ('call', 'indirect')
             {alias_join}
         ),
         callees(usr, depth) AS (
@@ -949,19 +957,24 @@ def find_callees_recursive(
             FROM extended_refs er
             JOIN callees c ON er.from_usr = c.usr
             WHERE c.depth < ?
+        ),
+        dedup AS (
+            SELECT usr, MIN(depth) AS depth
+            FROM callees
+            GROUP BY usr
         )
         SELECT COALESCE(s_def.name, s_any.name, '?') AS name,
                COALESCE(s_def.qualified_name, s_any.qualified_name) AS qualified_name,
                COALESCE(s_def.kind, s_any.kind) AS kind,
                COALESCE(s_def.file_path, s_any.file_path) AS file_path,
                COALESCE(s_def.signature, s_any.signature) AS signature,
-               MIN(c.depth) AS depth
-        FROM callees c
-        LEFT JOIN symbols s_def ON s_def.usr = c.usr AND s_def.config_hash = ?
+               d.depth
+        FROM dedup d
+        LEFT JOIN symbols s_def ON s_def.usr = d.usr AND s_def.config_hash = ?
                                    AND s_def.is_definition = 1
-        LEFT JOIN symbols s_any ON s_any.usr = c.usr AND s_any.config_hash = ?
-        HAVING COALESCE(s_def.name, s_any.name) IS NOT NULL
-        ORDER BY depth, COALESCE(s_def.name, s_any.name)
+        LEFT JOIN symbols s_any ON s_any.usr = d.usr AND s_any.config_hash = ?
+        WHERE COALESCE(s_def.name, s_any.name) IS NOT NULL
+        ORDER BY d.depth, COALESCE(s_def.name, s_any.name)
         LIMIT ?"""
 
     params = [config_hash]
@@ -1006,14 +1019,21 @@ def find_hotspots(
     config_hash: str,
     limit: int = 20,
 ) -> list[dict]:
-    """Find the most-called functions (hotspots) ranked by caller count."""
+    """Find the most-called functions (hotspots) ranked by caller count.
+
+    Only counts actual call edges (``ref_kind IN ('call', 'indirect')``) —
+    plain references and member-access expressions are excluded so enum
+    constants and fields don't appear as "hot" call targets.
+    """
     rows = conn.execute(
         """SELECT s.name, s.qualified_name, s.kind, s.file_path,
                   s.signature, s.line,
                   COUNT(r.rowid) AS caller_count
            FROM refs r
            JOIN symbols s ON s.usr = r.to_usr AND s.config_hash = r.config_hash
-           WHERE r.config_hash = ? AND s.is_definition = 1
+           WHERE r.config_hash = ?
+             AND s.is_definition = 1
+             AND r.ref_kind IN ('call', 'indirect')
            GROUP BY s.usr
            ORDER BY caller_count DESC
            LIMIT ?""",
@@ -1160,6 +1180,7 @@ def search_symbols(
     config_hash: str,
     limit: int = 20,
     kind: str | None = None,
+    exclude_variables: bool = False,
 ) -> list[sqlite3.Row]:
     """FTS5 search over symbols for a given build config.
 
@@ -1168,12 +1189,21 @@ def search_symbols(
     When *kind* is given, the filter is applied in SQL (before LIMIT) so the
     caller reliably gets up to *limit* matching rows — filtering after the fact
     in Python would silently under-return.
+    When *exclude_variables* is True, local/file-scope variables are excluded
+    from results.  Set True in topic-search tools (``search_code``) to prevent
+    low-signal entries from cluttering the top results; leave False in recall
+    phases (hybrid / embedding search) where vector re-ranking handles relevance.
     Note: file_path is read from the denormalized symbols.file_path column,
     not re-joined from files — the JOIN was removed to avoid the redundant
     round-trip and the shadowing hazard.
     """
     expanded = _expand_query(query)
-    kind_filter = "AND s.kind = ?" if kind else ""
+    if kind:
+        kind_filter = "AND s.kind = ?"
+    elif exclude_variables:
+        kind_filter = "AND s.kind != 'variable'"
+    else:
+        kind_filter = ""
     params: list = [expanded, config_hash]
     if kind:
         params.append(kind)
