@@ -835,14 +835,15 @@ def get_file_map(
 
 @mcp.tool()
 def get_symbol_context(
-    name: Annotated[str, Field(description="Symbol name. Returns body, signature, up to 5 callers and 5 callees in one call.")],
+    name: Annotated[str, Field(description="Symbol name. Returns body, signature, all direct callers and callees.")],
     project_root: Annotated[str | None, Field(description="Project root. Auto-detected if omitted.")] = None,
 ) -> dict:
     """Return the body, signature, callers, and callees of a symbol.
 
     Designed as rich LLM context — answers "what does this do and how does
-    it fit in the system?" in a single response.  Callers and callees are
-    limited to 5 each so the result fits in a compact context window.
+    it fit in the system?" in a single response.  Returns all direct callers
+    and callees (no artificial limit).  For transitive exploration use
+    ``find_all_callers_recursive`` / ``find_callees_recursive``.
     """
     db_path, cfg, project_id, root = _resolve_context(project_root)
     if not db_path.exists():
@@ -863,7 +864,7 @@ def get_symbol_context(
             symbol_usr = row["usr"]
 
             # Immediate callers (who calls this symbol, direct + indirect)
-            callers = find_refs(conn, config_hash, name, ref_kind=["call", "indirect"], limit=5)
+            callers = find_refs(conn, config_hash, name, ref_kind=["call", "indirect"])
             callers_list = [
                 {"name": c["caller_name"] or "?", "qualified_name": c["caller_qname"] or "",
                  "file": abs_path(root, c["caller_file"] or c["from_file"]),
@@ -878,8 +879,7 @@ def get_symbol_context(
                    FROM refs r
                    JOIN symbols s ON s.usr = r.to_usr AND s.config_hash = r.config_hash
                    WHERE r.from_usr = ? AND r.config_hash = ?
-                     AND r.ref_kind IN ('call', 'indirect')
-                   LIMIT 5""",
+                     AND r.ref_kind IN ('call', 'indirect')""",
                 (symbol_usr, config_hash),
             ).fetchall()
             callees_list = [
@@ -1091,7 +1091,12 @@ def find_dead_code(
     project_root: Annotated[str | None, Field(description="Project root. Auto-detected if omitted.")] = None,
     limit: Annotated[int, Field(description="Maximum results (default 100).")] = 100,
 ) -> list[dict]:
-    """Find functions/methods that are defined but never called."""
+    """Find functions/methods that are defined but never called.
+
+    Expect false positives: constructors called via factories or template
+    instantiation, interrupt handlers (ISRs), virtual method overrides, and
+    weak-aliased symbols often have no direct calls in the reference index.
+    """
     root, config_hash, err = _refs_guard(project_root)
     if err:
         return err
@@ -1174,7 +1179,10 @@ def search_code(
         limit = min(limit, 100)
 
         def _do_search(c: sqlite3.Connection, config_hash: str) -> list[dict]:
-            rows = search_symbols(c, query, config_hash, limit=limit, kind=kind)
+            rows = search_symbols(
+                c, query, config_hash, limit=limit, kind=kind,
+                exclude_variables=(kind is None),
+            )
             return [
                 {
                     "name": r["name"],
