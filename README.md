@@ -202,6 +202,7 @@ Use **clangd for editing**, **fw-context for AI-assisted exploration**.
 - **Natural-language search** — *"how does the modem connect?"* → finds `network_registration`, `modem_attach`, … (Ollama, optional)
 - **Vector search** — semantic similarity via `sqlite-vec` + Ollama embeddings, hybrid FTS5+vector re-ranking
 - **Graph analytics** — call paths, transitive callers/callees, dead code detection, hotspot analysis
+- **Indirect call detection** — resolves function-pointer arguments at direct call sites, uncovering call-graph edges that grep/cscope miss
 - **Incremental indexing** — only changed files re-parsed; auto-reindex on query detects and fixes staleness
 - **Offline-first** — index is a file on disk at `~/.fw-context/index/`. No daemon, no cloud, no network.
 - **`#ifdef`-aware** — uses real compiler flags; sees exactly what your compiler sees
@@ -225,7 +226,7 @@ Subsequent runs are **incremental** — seconds for a few changed files.
 | Document | Covers |
 |----------|--------|
 | **[Installation](docs/installation.md)** | Prerequisites, install, upgrade, Ollama setup, AI assistant integration |
-| **[Tools Reference](docs/tools.md)** | All 18 MCP tools, 8 CLI commands, internal workings, search pipeline |
+| **[Tools Reference](docs/tools.md)** | All 19 MCP tools, 8 CLI commands, internal workings, search pipeline |
 | **[Configuration](docs/configuration.md)** | `.fw-context/config.toml` — global defaults, per-project overrides, every setting |
 | **[MCP Server](README-MCP.md)** | JSON-RPC protocol, tool schemas, error handling, debugging |
 
