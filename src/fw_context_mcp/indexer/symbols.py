@@ -350,6 +350,36 @@ def extract_all(
     # --- References (explicit stack DFS to track the enclosing function) ---
     refs: list[Reference] = []
     seen_ref: set[tuple] = set()
+    # Track function spans: [(usr, start_line, end_line)] for source-line fallback
+    _fn_spans: list[tuple[str, int, int]] = []
+
+    def _resolve_method_usr(
+        method_name: str, field_name: str = ""
+    ) -> str | None:
+        """Find USR for *method_name*, preferring classes matching *field_name*."""
+        usr = _qn_to_usr.get(method_name)
+        if usr:
+            return usr
+        suffix = f"::{method_name}"
+        candidates: list[tuple[str, str]] = [
+            (qn, u) for qn, u in _qn_to_usr.items() if qn.endswith(suffix)
+        ]
+        if not candidates:
+            return None
+        if len(candidates) == 1:
+            return candidates[0][1]
+        if field_name:
+            _hint = field_name.lstrip("_").lower()
+            _scored = []
+            for qn, u in candidates:
+                _class_part = qn.rsplit("::", 2)[-2] if "::" in qn else ""
+                _score = 1 if _hint in _class_part.lower() else 0
+                _scored.append((_score, qn, u))
+            _scored.sort(key=lambda x: -x[0])
+            if _scored[0][0] > 0:
+                return _scored[0][2]
+        return candidates[0][1]
+
     # stack of (cursor, enclosing_function_usr)
     stack: list[tuple] = [(tu.cursor, None)]
     while stack:
@@ -357,6 +387,17 @@ def extract_all(
         cur_fn = fn_usr
         if cursor.kind in _CALLABLE_KINDS and cursor.is_definition():
             cur_fn = cursor.get_usr() or fn_usr
+            # Track function span for source-line fallback
+            try:
+                _ext = cursor.extent
+                if _ext.start.file:
+                    _ext_file = _ext.start.file.name
+                    _resolved_ext = Path(_ext_file).resolve()
+                    _resolved_tu = Path(tu.spelling).resolve()
+                    if str(_resolved_ext) == str(_resolved_tu):
+                        _fn_spans.append((cur_fn, _ext.start.line, _ext.end.line))
+            except Exception:
+                pass
 
         ref_kind = _REF_KINDS.get(cursor.kind)
         if ref_kind is not None:
@@ -379,6 +420,43 @@ def extract_all(
                             from_usr=cur_fn,
                             ref_kind=ref_kind,
                         ))
+
+            # --- Field-access call fallback ---
+            # When a CALL_EXPR's direct referenced cursor is None or its
+            # definition location is unresolvable (common for method calls on
+            # member variables like ``_zmodem_driver.send()`` where libclang
+            # cannot resolve the callee through the field type), walk the
+            # CALL_EXPR's children looking for a MEMBER_REF_EXPR whose
+            # referenced cursor points to a valid definition under source_roots.
+            if cursor.kind == cx.CursorKind.CALL_EXPR:
+                _callee_resolved = referenced is not None
+                _callee_in_roots = False
+                if _callee_resolved:
+                    try:
+                        _crl = referenced.location
+                        if _crl.file and _in_roots(_crl.file.name) and _not_excluded(_crl.file.name):
+                            _callee_in_roots = True
+                    except Exception:
+                        pass
+                if not _callee_in_roots:
+                    for child in cursor.get_children():
+                        if child.kind == cx.CursorKind.MEMBER_REF_EXPR:
+                            child_ref = child.referenced
+                            if child_ref is not None:
+                                child_usr = child_ref.get_usr()
+                                child_loc = child_ref.location
+                                if child_usr and child_loc.file and _in_roots(child_loc.file.name) and _not_excluded(child_loc.file.name):
+                                    key = (child_usr, loc.file.name, loc.line, cur_fn, "call")
+                                    if key not in seen_ref:
+                                        seen_ref.add(key)
+                                        refs.append(Reference(
+                                            to_usr=child_usr,
+                                            from_file=loc.file.name,
+                                            from_line=loc.line,
+                                            from_usr=cur_fn,
+                                            ref_kind="call",
+                                        ))
+                                    break  # one resolved callee per CALL_EXPR
 
         # --- Indirect calls: detect function pointers passed as arguments ---
         # When a CALL_EXPR passes a function/method pointer as an argument
@@ -459,7 +537,110 @@ def extract_all(
                                         ref_kind="indirect",
                                     ))
 
+        # --- Token fallback for template-obscured CALL_EXPR ---
+        # When a CALL_EXPR is obscured by C++ standard library template
+        # expansions (e.g. ``_zmodem_driver.network_init() != MODEM_RET_SUCCESS``
+        # where the ``operator!=`` template dominates the AST), libclang
+        # cannot resolve the callee through cursor.referenced or children.
+        #
+        # We scan the raw tokens of the CALL_EXPR for method-call patterns
+        # (``field.method(`` or bare ``method(``) and resolve the callee
+        # name against the symbol table built from this translation unit.
+        if cursor.kind == cx.CursorKind.CALL_EXPR:
+            loc = cursor.location
+            if loc.file and _in_roots(loc.file.name) and _not_excluded(loc.file.name):
+                tokens = list(cursor.get_tokens())
+                # Pattern 1: obj.method( → IDENTIFIER DOT IDENTIFIER LPAREN
+                for i, tok in enumerate(tokens):
+                    if (tok.kind.name == "IDENTIFIER"
+                            and i + 3 < len(tokens)
+                            and tokens[i + 1].spelling == "."
+                            and tokens[i + 2].kind.name == "IDENTIFIER"
+                            and tokens[i + 3].spelling == "("):
+                        field_name = tok.spelling
+                        method_name = tokens[i + 2].spelling
+                        target_usr = _resolve_method_usr(method_name, field_name)
+                        if target_usr:
+                            key = (target_usr, loc.file.name, loc.line, cur_fn, "call")
+                            if key not in seen_ref:
+                                seen_ref.add(key)
+                                refs.append(Reference(
+                                    to_usr=target_usr,
+                                    from_file=loc.file.name,
+                                    from_line=loc.line,
+                                    from_usr=cur_fn,
+                                    ref_kind="call",
+                                ))
+                    # Pattern 2: bare method( → IDENTIFIER LPAREN
+                    if (tok.kind.name == "IDENTIFIER"
+                            and i + 1 < len(tokens)
+                            and tokens[i + 1].spelling == "("
+                            and (i == 0 or tokens[i - 1].spelling != ".")):
+                        method_name = tok.spelling
+                        target_usr = _resolve_method_usr(method_name)
+                        if target_usr:
+                            key = (target_usr, loc.file.name, loc.line, cur_fn, "call")
+                            if key not in seen_ref:
+                                seen_ref.add(key)
+                                refs.append(Reference(
+                                    to_usr=target_usr,
+                                    from_file=loc.file.name,
+                                    from_line=loc.line,
+                                    from_usr=cur_fn,
+                                    ref_kind="call",
+                                ))
+
         for child in cursor.get_children():
             stack.append((child, cur_fn))
+
+    # --- Source-line fallback for template-obscured method calls ---
+    # When C++ standard library template expansions dominate the AST
+    # (e.g. ``_zmodem_driver.network_init() != MODEM_RET_SUCCESS`` where
+    # ``operator!=`` templates consume all CALL_EXPR nodes at the same source
+    # line), libclang cannot resolve the project-level callee.
+    #
+    # Post-processing pass: scan the original source file for lines that are
+    # inside a known function body but have no ``call`` / ``indirect``
+    # reference, and emit references for ``obj.method(`` patterns found there.
+    #
+    if with_refs:
+        _tu_file = tu.spelling  # absolute path to the source file
+        _lines_with_calls: set[int] = {
+            r.from_line for r in refs if r.ref_kind in ("call", "indirect")
+            and r.from_file == _tu_file
+        }
+        try:
+            _source_text = Path(_tu_file).read_text(encoding="utf-8", errors="replace")
+            _source_lines = _source_text.splitlines()
+        except Exception:
+            _source_lines = []
+        for _lineno_0, _line in enumerate(_source_lines):
+            _lineno = _lineno_0 + 1  # 1-based
+            if _lineno in _lines_with_calls:
+                continue
+            # Find enclosing function for this line
+            _line_fn = None
+            for _fn_usr, _fn_start, _fn_end in _fn_spans:
+                if _fn_start <= _lineno <= _fn_end:
+                    _line_fn = _fn_usr
+                    break
+            if _line_fn is None:
+                continue
+            # Scan for obj.method( patterns
+            for _m in re.finditer(r'(\w+)\.(\w+)\s*\(', _line):
+                _field_name = _m.group(1)
+                _method_name = _m.group(2)
+                _target_usr = _resolve_method_usr(_method_name, _field_name)
+                if _target_usr:
+                    _key = (_target_usr, _tu_file, _lineno, _line_fn, "call")
+                    if _key not in seen_ref:
+                        seen_ref.add(_key)
+                        refs.append(Reference(
+                            to_usr=_target_usr,
+                            from_file=_tu_file,
+                            from_line=_lineno,
+                            from_usr=_line_fn,
+                            ref_kind="call",
+                        ))
 
     return symbols, refs
