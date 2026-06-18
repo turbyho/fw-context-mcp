@@ -24,18 +24,34 @@ KIND_WEIGHT: dict[str, int] = {
 }
 
 
-def score_result(row: dict, query_stems: list[str]) -> int:
+def _is_project_local(fpath: str, source_roots: list[str] | None) -> bool:
+    """Check whether *fpath* is under one of the project source roots."""
+    if not source_roots or not fpath:
+        return False
+    fpath_lower = fpath.lower()
+    for root in source_roots:
+        root_lower = root.lower().rstrip("/")
+        if fpath_lower.startswith(root_lower + "/") or fpath_lower == root_lower:
+            return True
+    return False
+
+
+def score_result(
+    row: dict,
+    query_stems: list[str],
+    source_roots: list[str] | None = None,
+) -> int:
     """Score a single result row by how well it matches the query stems.
 
     Points:
         name / name_tokens match  → +3
         qualified_name match      → +2
         file_path match           → +1
-        project-local code        → +1 (src/ or lib/, not mbed-os)
+        project-local code        → +1 (under any source_root)
         kind weight               → KIND_WEIGHT bonus
 
     ``query_stems`` are lowercased query terms with trailing ``*`` stripped
-    so "modem_init*" becomes "modem_init".
+    so ``modem_init*`` becomes ``modem_init``.
     """
     name = (row.get("name") or "").lower()
     ntoks = (row.get("name_tokens") or "").lower()
@@ -52,8 +68,8 @@ def score_result(row: dict, query_stems: list[str]) -> int:
         elif stem in fpath:
             s += 1
 
-    # Bonus for project-local symbols
-    if fpath and ("src/" in fpath or "lib/" in fpath) and "mbed-os" not in fpath:
+    # Bonus for symbols under project source roots
+    if source_roots and _is_project_local(fpath, source_roots):
         s += 1
 
     s += KIND_WEIGHT.get(kind, 0)

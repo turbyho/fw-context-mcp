@@ -83,7 +83,7 @@ def _is_stale(cfg, compile_commands_path: str) -> bool:
 def _lookup_definition(conn, config_hash: str, name: str):
     BASE_QUERY = """SELECT s.* FROM symbols s
        WHERE s.config_hash=? AND %s
-       ORDER BY %s (CASE WHEN s.file_path LIKE '%%mbed-os%%' THEN 1 ELSE 0 END), s.line
+       ORDER BY %s s.line
        LIMIT 1"""
     for column in ("s.name", "s.qualified_name"):
         row = conn.execute(
@@ -104,7 +104,7 @@ def _lookup_definition(conn, config_hash: str, name: str):
         short_name = name.rsplit("::", 1)[-1]
         FALLBACK_QUERY = """SELECT s.* FROM symbols s
            WHERE s.config_hash=? AND %s
-           ORDER BY %s (CASE WHEN s.file_path LIKE '%%mbed-os%%' THEN 1 ELSE 0 END), s.line"""
+           ORDER BY %s s.line"""
         for column in ("s.name", "s.qualified_name"):
             rows = conn.execute(
                 FALLBACK_QUERY % (f"{column}=? AND s.is_definition=1", ""),

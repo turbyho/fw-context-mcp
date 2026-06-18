@@ -8,7 +8,7 @@ from fw_context_mcp.indexer.compile_commands import (
     _detect_language,
     _expand_response_file,
     _gcc_system_includes,
-    _infer_target,
+    _detect_target_triple,
     _is_source_file,
     normalize_args,
     parse,
@@ -48,16 +48,22 @@ class TestDetectLanguage:
 
 class TestInferTarget:
     def test_cortex_m4(self):
-        assert _infer_target(["-mcpu=cortex-m4", "-std=c++14"]) == "--target=arm-none-eabi"
+        assert _detect_target_triple(None, ["-mcpu=cortex-m4", "-std=c++14"]) == "arm-none-eabi"
 
     def test_cortex_m33(self):
-        assert _infer_target(["-mcpu=cortex-m33"]) == "--target=arm-none-eabi"
+        assert _detect_target_triple(None, ["-mcpu=cortex-m33"]) == "arm-none-eabi"
 
     def test_no_mcpu(self):
-        assert _infer_target(["-std=c99"]) is None
+        assert _detect_target_triple(None, ["-std=c99"]) is None
 
     def test_empty_args(self):
-        assert _infer_target([]) is None
+        assert _detect_target_triple(None, []) is None
+
+    def test_arm_compiler_name(self):
+        assert _detect_target_triple(Path("arm-none-eabi-g++"), []) == "arm-none-eabi"
+
+    def test_riscv_compiler_name(self):
+        assert _detect_target_triple(Path("riscv32-unknown-elf-gcc"), []) == "riscv32-unknown-elf"
 
 
 class TestExpandResponseFile:

@@ -33,16 +33,18 @@ class DeduplicatePhase(Phase):
             key = (name, r.get("file_path"))
             prev = seen.get(key)
             if prev is None:
-                s = score_result(r, stems)
+                source_roots = ctx.config.index.source_roots if ctx.config else None
+                s = score_result(r, stems, source_roots=source_roots)
                 seen[key] = r
                 scored.append((s, r))
             elif r.get("is_definition") and not prev.get("is_definition"):
                 # Replace declaration with definition
                 seen[key] = r
                 # Rescore
+                source_roots = ctx.config.index.source_roots if ctx.config else None
                 for i, (_, existing) in enumerate(scored):
                     if existing.get("name") == name and existing.get("file_path") == r.get("file_path"):
-                        scored[i] = (score_result(r, stems), r)
+                        scored[i] = (score_result(r, stems, source_roots=source_roots), r)
                         break
 
         scored.sort(key=lambda x: -x[0])
