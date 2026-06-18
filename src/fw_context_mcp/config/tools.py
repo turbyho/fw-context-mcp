@@ -22,7 +22,7 @@ BASE_INSTRUCTIONS = """\
 ## fw-context — Build-aware code intelligence
 
 `fw-context` MCP tools are available globally. **Use them only in embedded firmware
-projects built with Mbed OS, Zephyr, or PlatformIO.** Do not use in Python, JS,
+projects built with Zephyr, PlatformIO, or Mbed OS.** Do not use in Python, JS,
 Go, or other projects — the index is built from `compile_commands.json` and only
 covers C/C++ translation units.
 
@@ -44,9 +44,9 @@ Instead use:
   grouped by kind with counts.  Compact by default (first 30 per kind, no
   signatures).  Use for quick orientation.  Pass ``max_per_kind=0`` for the
   full list, ``signatures=true`` for parameter details.
-- `get_symbol_context(name)` — body, signature, and up to 5 direct callers
-  + 5 direct callees.  One-shot context for "what does X do and how does
-  it fit?"
+- `get_symbol_context(name)` — body, signature, and all direct callers
+  + callees (no artificial limit).  One-shot context for "what does X do
+  and how does it fit?"
 
 ### Symbol search
 
@@ -73,9 +73,17 @@ returns \"No references indexed\", remind the user to re-index without `--no-ref
 - `find_callees_recursive(name, max_depth?)` — transitive callees.
 - `find_hotspots(limit?)` — most-called functions ranked by caller count.
   Useful for impact analysis: changing a hotspot affects many callers.
-- `find_dead_code(limit?)` — functions/methods defined but never called.
-  Expect false positives (constructors called via factory, interrupt
-  handlers, virtual methods).
+- `find_dead_code(limit?, exclude_paths?)` — functions/methods defined but
+  never called.  Expect false positives (constructors called via factory,
+  interrupt handlers, virtual methods).  Pass ``exclude_paths`` (LIKE
+  patterns, e.g. ``["zephyr/%"]``) to filter vendor SDK noise.
+- `find_wrapper_callers(class_name)` — find wrapper classes that call
+  methods of a driver class.  Useful for understanding adapter/wrapper
+  architecture (e.g. ``UART`` wrapping ``UART_DRIVER``).
+- `trace_data_flow(type_name, to_symbol)` — trace how data of a given type
+  flows to a target function.  Experimental — finds functions whose
+  signature mentions *type_name*, then looks for call paths to *to_symbol*.
+  Best used together with ``find_call_path`` to verify specific paths.
 
 ### Code understanding (Ollama)
 
@@ -108,16 +116,16 @@ returns \"No references indexed\", remind the user to re-index without `--no-ref
 ### Index setup (first use in a project)
 
 ```bash
-# Mbed OS
-bear -- python3 build_app.py --profile release --type DEV
-fw-context index
-
 # Zephyr
 west build -b <board> -- -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
 fw-context index build/compile_commands.json
 
 # PlatformIO
 pio run --target compiledb
+fw-context index
+
+# Mbed OS
+bear -- python3 build_app.py --profile release --type DEV
 fw-context index
 ```
 """

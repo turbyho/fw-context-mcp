@@ -1128,7 +1128,7 @@ def find_dead_code(
 
 @mcp.tool()
 def find_wrapper_callers(
-    class_name: Annotated[str, Field(description="Driver class name to find wrappers for. E.g. 'ZMODEM_DRIVER' or 'zbox::ZMODEM_DRIVER'.")],
+    class_name: Annotated[str, Field(description="Driver class name to find wrappers for. E.g. 'UART_DRIVER' or 'hal::UART_DRIVER'.")],
     project_root: Annotated[str | None, Field(description="Project root. Auto-detected if omitted.")] = None,
     limit: Annotated[int, Field(description="Maximum wrapper method results (default 50).")] = 50,
 ) -> list[dict]:
@@ -1136,7 +1136,7 @@ def find_wrapper_callers(
 
     Returns wrapper methods grouped by wrapper class, showing which driver
     methods each wrapper calls.  Useful for understanding the adapter/wrapper
-    architecture (e.g. ``ZMODEM`` wraps ``ZMODEM_DRIVER``).
+    architecture (e.g. ``UART`` wraps ``UART_DRIVER``).
     """
     root, config_hash, err = _refs_guard(project_root)
     if err:
@@ -1225,8 +1225,8 @@ def find_wrapper_callers(
 
 @mcp.tool()
 def trace_data_flow(
-    type_name: Annotated[str, Field(description="Type name to trace. E.g. 'InventorySlot' or 'ZCfgDataManager::InventorySlot'.")],
-    to_symbol: Annotated[str, Field(description="Target symbol name. E.g. 'zbox::ZMODEM_DRIVER::send'.")],
+    type_name: Annotated[str, Field(description="Type name to trace. E.g. 'SensorData' or 'Config::SensorData'.")],
+    to_symbol: Annotated[str, Field(description="Target symbol name. E.g. 'uart_send' or 'UART_DRIVER::send'.")],
     project_root: Annotated[str | None, Field(description="Project root. Auto-detected if omitted.")] = None,
     max_depth: Annotated[int, Field(description="Maximum call path depth (default 8).")] = 8,
     limit: Annotated[int, Field(description="Maximum source functions to trace (default 15).")] = 15,

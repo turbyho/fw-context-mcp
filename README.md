@@ -101,15 +101,16 @@ cd ~/.fw-context/src && make update
 ```bash
 cd your-firmware-project
 
-# Mbed OS:
-bear -- mbed compile --profile release
-
 # Zephyr:
 west build -b <board> -- -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
 fw-context index build/compile_commands.json
 
 # PlatformIO:
 pio run --target compiledb
+fw-context index
+
+# Mbed OS:
+bear -- mbed compile --profile release
 fw-context index
 
 # CMake / Make:
@@ -166,7 +167,7 @@ Use **clangd for editing**, **fw-context for AI-assisted exploration**.
 ```
    CLI (fw-context)            MCP server (fw-context-mcp)          Ollama (optional)
    ================            ===========================          ==================
-   fw-context index            exposes 19 tools over               local LLM runtime
+   fw-context index            exposes 21 tools over               local LLM runtime
    fw-context export           JSON-RPC (stdio)                    HTTP :11434
    fw-context watch                  │                                  │
    fw-context status           search_code ───────────── lookup   smart_search ──▶ translates NL → FTS5 terms
@@ -193,7 +194,7 @@ Use **clangd for editing**, **fw-context for AI-assisted exploration**.
 |-----------|---------|---------|
 | **CLI** (`fw-context`) | User command | Index, export, watch, status, reset, init, search |
 | **Indexer** | Called by CLI | libclang parses every TU, stores in SQLite + FTS5 + vec0 |
-| **MCP server** (`fw-context-mcp`) | Subprocess (AI assistant) | 19 tools over JSON-RPC — search, graph, source, maintenance |
+| **MCP server** (`fw-context-mcp`) | Subprocess (AI assistant) | 21 tools over JSON-RPC — search, graph, source, maintenance |
 | **Ollama** *(optional)* | Local daemon | NL search, symbol explanation, embedding generation |
 
 ## Key capabilities
@@ -213,9 +214,9 @@ Works with **any build system** that produces `compile_commands.json`:
 
 | Ecosystem | Auto-detection |
 |-----------|---------------|
-| **Mbed OS** | `mbed-os/` directory or `mbed_app.json` |
 | **Zephyr RTOS** | `west.yml` or `prj.conf` |
 | **PlatformIO** | `platformio.ini` |
+| **Mbed OS** | `mbed-os/` directory or `mbed_app.json` |
 | **Bare-metal / FreeRTOS** | Any build with `bear` |
 | **Custom toolchain** | Any build with `bear` |
 

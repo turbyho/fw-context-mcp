@@ -6,13 +6,13 @@ as tools for AI assistants. Communicates over **JSON-RPC 2.0 via stdio**.
 ## What it is
 
 A persistent subprocess started by your AI assistant (Claude Code, OpenCode, …)
-that provides **19 tools** for navigating embedded firmware codebases:
+that provides **21 tools** for navigating embedded firmware codebases:
 
 | Category | Tools |
 |----------|-------|
 | **Search & lookup** | `search_code`, `lookup_symbol`, `smart_search` |
 | **Understanding** | `get_file_map`, `get_source`, `explain_symbol`, `get_symbol_context` |
-| **Call graph** | `find_callers`, `find_references`, `find_call_path`, `find_all_callers_recursive`, `find_callees_recursive`, `find_dead_code`, `find_hotspots` |
+| **Call graph** | `find_callers`, `find_references`, `find_call_path`, `find_all_callers_recursive`, `find_callees_recursive`, `find_dead_code`, `find_hotspots`, `find_wrapper_callers`, `trace_data_flow` |
 | **Maintenance** | `get_active_build`, `reindex_file`, `reset_index`, `list_projects` |
 | **Setup** | `check_ollama` |
 
