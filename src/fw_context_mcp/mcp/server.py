@@ -331,7 +331,7 @@ def _with_stale_recovery(
             result_rows = query_fn(conn, config_hash)
             stale_f = _stale_files(
                 conn, config_hash,
-                [abs_path(root, r["file"]) for r in result_rows],
+                [abs_path(root, r["file"]) for r in result_rows if "file" in r],
             )
     finally:
         conn.close()
@@ -434,7 +434,16 @@ def lookup_symbol(
                     ).fetchall()
                 rows = [r for r in rows if r["qualified_name"].endswith(name)][:limit]
 
-            return [
+            # Did-you-mean? suggestions when nothing matched
+            _suggestions: list[str] = []
+            if not rows:
+                try:
+                    from ..search.did_you_mean import suggest as suggest_names
+                    _suggestions = suggest_names(c, config_hash, name, limit=5)
+                except Exception:
+                    pass  # suggestions are best-effort
+
+            result = [
                 {
                     "name": r["name"],
                     "qualified_name": r["qualified_name"],
@@ -447,6 +456,9 @@ def lookup_symbol(
                 }
                 for r in rows
             ]
+            if _suggestions:
+                result.append({"_did_you_mean": _suggestions})
+            return result
 
         return _with_stale_recovery(root, db_path, _do_lookup)
     except Exception as e:
@@ -1090,12 +1102,46 @@ def find_callees_recursive(
 def find_dead_code(
     project_root: Annotated[str | None, Field(description="Project root. Auto-detected if omitted.")] = None,
     limit: Annotated[int, Field(description="Maximum results (default 100).")] = 100,
+    exclude_paths: Annotated[list[str] | None, Field(description="File path LIKE patterns to exclude. Default: mbed-os, cmsis, connectivity, targets, libraries in mbed-os tree.")] = None,
 ) -> list[dict]:
     """Find functions/methods that are defined but never called.
 
     Expect false positives: constructors called via factories or template
     instantiation, interrupt handlers (ISRs), virtual method overrides, and
     weak-aliased symbols often have no direct calls in the reference index.
+    """
+    if exclude_paths is None:
+        exclude_paths = [
+            "mbed-os/%", "cmsis/%", "connectivity/%",
+            "targets/%", "libraries/%",
+        ]
+    root, config_hash, err = _refs_guard(project_root)
+    if err:
+        return err
+    db_path = _db_path(root)
+    conn, open_err = _open_db_safe(db_path)
+    if open_err:
+        return [open_err]
+    try:
+        rows = index_db.find_dead_code(conn, config_hash, limit=limit, exclude_paths=exclude_paths)
+        if not rows:
+            return [{"info": "No dead code found — every defined function has at least one caller."}]
+        return rows
+    finally:
+        conn.close()
+
+
+@mcp.tool()
+def find_wrapper_callers(
+    class_name: Annotated[str, Field(description="Driver class name to find wrappers for. E.g. 'ZMODEM_DRIVER' or 'zbox::ZMODEM_DRIVER'.")],
+    project_root: Annotated[str | None, Field(description="Project root. Auto-detected if omitted.")] = None,
+    limit: Annotated[int, Field(description="Maximum wrapper method results (default 50).")] = 50,
+) -> list[dict]:
+    """Find wrapper classes that call methods of a driver class.
+
+    Returns wrapper methods grouped by wrapper class, showing which driver
+    methods each wrapper calls.  Useful for understanding the adapter/wrapper
+    architecture (e.g. ``ZMODEM`` wraps ``ZMODEM_DRIVER``).
     """
     root, config_hash, err = _refs_guard(project_root)
     if err:
@@ -1105,10 +1151,171 @@ def find_dead_code(
     if open_err:
         return [open_err]
     try:
-        rows = index_db.find_dead_code(conn, config_hash, limit=limit)
+        # Resolve driver class USR — find all methods of the class
+        driver_methods = conn.execute(
+            """SELECT s.usr, s.name, s.qualified_name
+               FROM symbols s
+               WHERE s.config_hash = ?
+                 AND s.kind = 'method'
+                 AND (s.qualified_name LIKE ? OR s.qualified_name LIKE ?)
+               ORDER BY s.name""",
+            (config_hash, f"{class_name}::%", f"%{class_name}::%"),
+        ).fetchall()
+
+        if not driver_methods:
+            return [{"info": f"No methods found for class '{class_name}'."}]
+
+        driver_usr_map = {r["usr"]: r for r in driver_methods}
+
+        # Find all callers of those methods
+        placeholders = ",".join("?" * len(driver_usr_map))
+        rows = conn.execute(
+            f"""SELECT r.from_usr, r.to_usr, r.from_file, r.from_line, r.ref_kind,
+                       caller.name AS caller_name,
+                       caller.qualified_name AS caller_qname,
+                       caller.kind AS caller_kind
+                FROM refs r
+                LEFT JOIN symbols caller
+                  ON caller.config_hash = r.config_hash AND caller.usr = r.from_usr
+                WHERE r.config_hash = ?
+                  AND r.to_usr IN ({placeholders})
+                  AND r.ref_kind IN ('call', 'indirect')
+                ORDER BY caller.qualified_name, r.from_line
+                LIMIT ?""",
+            (config_hash, *driver_usr_map.keys(), limit),
+        ).fetchall()
+
         if not rows:
-            return [{"info": "No dead code found — every defined function has at least one caller."}]
-        return rows
+            return [{"info": f"No callers found for methods of '{class_name}'."}]
+
+        # Group by wrapper class
+        wrapped: dict[str, dict] = {}
+        for r in rows:
+            caller_qn = r["caller_qname"] or r["caller_name"] or "?"
+            # Extract class from qualified name: "zbox::ZMODEM::start" → "zbox::ZMODEM"
+            if "::" in caller_qn:
+                wrapper_class = caller_qn.rsplit("::", 1)[0]
+            else:
+                wrapper_class = "(global)"
+            if wrapper_class not in wrapped:
+                wrapped[wrapper_class] = {"class": wrapper_class, "methods": {}, "_file": r["from_file"]}
+            cm = wrapped[wrapper_class]["methods"]
+            if caller_qn not in cm:
+                cm[caller_qn] = {
+                    "method": r["caller_name"],
+                    "qualified_name": caller_qn,
+                    "kind": r["caller_kind"],
+                    "calls": [],
+                }
+            target = driver_usr_map.get(r["to_usr"])
+            if target:
+                cm[caller_qn]["calls"].append({
+                    "driver_method": target["name"],
+                    "line": r["from_line"],
+                })
+
+        # Flatten for output
+        result = []
+        for wc in sorted(wrapped.keys()):
+            entry = wrapped[wc]
+            result.append({
+                "wrapper_class": wc,
+                "method_count": len(entry["methods"]),
+                "methods": sorted(entry["methods"].values(), key=lambda m: m["qualified_name"]),
+            })
+        return result
+    finally:
+        conn.close()
+
+
+@mcp.tool()
+def trace_data_flow(
+    type_name: Annotated[str, Field(description="Type name to trace. E.g. 'InventorySlot' or 'ZCfgDataManager::InventorySlot'.")],
+    to_symbol: Annotated[str, Field(description="Target symbol name. E.g. 'zbox::ZMODEM_DRIVER::send'.")],
+    project_root: Annotated[str | None, Field(description="Project root. Auto-detected if omitted.")] = None,
+    max_depth: Annotated[int, Field(description="Maximum call path depth (default 8).")] = 8,
+    limit: Annotated[int, Field(description="Maximum source functions to trace (default 15).")] = 15,
+) -> list[dict]:
+    """Trace how data of a given type flows to a target function.
+
+    Finds functions whose signature mentions *type_name*, then looks for call
+    paths from those functions to *to_symbol*.  Returns an approximate data
+    flow map — useful for understanding how a data structure travels through
+    the system before reaching its destination.
+
+    **Experimental.**  Does not resolve type transformations (e.g. CBOR
+    encoding).  Best used together with ``find_call_path`` to verify specific
+    paths.
+    """
+    root, config_hash, err = _refs_guard(project_root)
+    if err:
+        return err
+    db_path = _db_path(root)
+    conn, open_err = _open_db_safe(db_path)
+    if open_err:
+        return [open_err]
+    try:
+        # Resolve target USR
+        target = conn.execute(
+            """SELECT usr, name FROM symbols
+               WHERE config_hash = ? AND (name = ? OR qualified_name = ?)
+               ORDER BY is_definition DESC LIMIT 1""",
+            (config_hash, to_symbol, to_symbol),
+        ).fetchone()
+        if not target:
+            return [{"info": f"Target symbol '{to_symbol}' not found."}]
+
+        # Find functions mentioning type_name in their signature (ranked by
+        # caller count so the most "active" data handlers are shown first)
+        sources = conn.execute(
+            """SELECT s.name, s.qualified_name, s.kind, s.file_path, s.line,
+                      s.signature, s.usr,
+                      (SELECT COUNT(*) FROM refs r
+                       WHERE r.to_usr = s.usr AND r.config_hash = s.config_hash
+                         AND r.ref_kind IN ('call', 'indirect')) AS caller_count
+               FROM symbols s
+               WHERE s.config_hash = ?
+                 AND s.is_definition = 1
+                 AND s.signature LIKE ?
+               ORDER BY caller_count DESC
+               LIMIT ?""",
+            (config_hash, f"%{type_name}%", limit),
+        ).fetchall()
+
+        if not sources:
+            return [{"info": f"No functions found with '{type_name}' in their signature."}]
+
+        # Try call paths from each source to target
+        results = []
+        for src in sources:
+            paths = index_db.find_call_path(
+                conn, config_hash, src["qualified_name"], to_symbol, max_depth=max_depth,
+            )
+            entry = {
+                "source_name": src["name"],
+                "source_qualified_name": src["qualified_name"],
+                "source_kind": src["kind"],
+                "source_file": abs_path(root, src["file_path"]),
+                "source_line": src["line"],
+                "caller_count": src["caller_count"],
+            }
+            if paths:
+                entry["reachable"] = True
+                entry["paths"] = paths[:3]
+            else:
+                entry["reachable"] = False
+            results.append(entry)
+
+        num_reachable = sum(1 for r in results if r["reachable"])
+        return [
+            {
+                "_summary": f"{num_reachable}/{len(results)} source functions reach '{to_symbol}' within depth {max_depth}",
+                "_type": type_name,
+                "_target": to_symbol,
+                "_experimental": True,
+            },
+            *results,
+        ]
     finally:
         conn.close()
 
@@ -1183,8 +1390,39 @@ def search_code(
                 c, query, config_hash, limit=limit, kind=kind,
                 exclude_variables=(kind is None),
             )
-            return [
-                {
+            # Fallback: when FTS5 returns nothing, try prefix lookup on each
+            # query term.  Handles cases like ``"socket state"`` where FTS5
+            # tokenisation misses ``socket_state_t``.
+            fallback_used = False
+            if not rows:
+                fallback_used = True
+                terms = [t for t in query.split() if len(t) > 1]
+                seen_usr: set[str] = set()
+                fallback_rows: list = []
+                for term in terms:
+                    esc = term.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+                    kind_filter = "AND s.kind = ?" if kind else ""
+                    params = [config_hash, f"{esc}%", f"{esc}%"]
+                    if kind:
+                        params.append(kind)
+                    params.append(limit * 2)
+                    term_rows = c.execute(
+                        rf"""SELECT s.* FROM symbols s
+                           WHERE s.config_hash=?
+                             AND (s.name LIKE ? ESCAPE '\' OR s.qualified_name LIKE ? ESCAPE '\')
+                             {kind_filter}
+                           ORDER BY s.is_definition DESC, s.line
+                           LIMIT ?""",
+                        params,
+                    ).fetchall()
+                    for r in term_rows:
+                        if r["usr"] not in seen_usr:
+                            seen_usr.add(r["usr"])
+                            fallback_rows.append(r)
+                rows = fallback_rows[:limit]
+
+            def _fmt(r) -> dict:
+                d = {
                     "name": r["name"],
                     "qualified_name": r["qualified_name"],
                     "kind": r["kind"],
@@ -1194,8 +1432,11 @@ def search_code(
                     "signature": r["signature"],
                     "docstring": r["docstring"],
                 }
-                for r in rows
-            ]
+                if fallback_used:
+                    d["_fallback"] = "lookup_symbol"
+                return d
+
+            return [_fmt(r) for r in rows]
 
         return _with_stale_recovery(root, db_path, _do_search)
     except Exception as e:

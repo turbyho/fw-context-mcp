@@ -448,6 +448,13 @@ def upsert_embeddings(
     Each row is (symbol_id, embedding_blob, model).
     Returns number of rows inserted.
     """
+    # Clean orphaned embeddings whose symbol no longer exists (can happen
+    # after partial reindex / reset that didn't cascade properly).
+    conn.execute(
+        """DELETE FROM embeddings WHERE symbol_id NOT IN (
+            SELECT id FROM symbols
+        )"""
+    )
     cur = conn.executemany(
         """INSERT OR REPLACE INTO embeddings(symbol_id, embedding, model, updated_at)
            VALUES (?, ?, ?, datetime('now'))""",
@@ -991,13 +998,26 @@ def find_dead_code(
     conn: sqlite3.Connection,
     config_hash: str,
     limit: int = 100,
+    exclude_paths: list[str] | None = None,
 ) -> list[dict]:
     """Find functions/methods that are defined but never called.
 
     A "dead" symbol is one whose USR never appears in ``refs.to_usr``.
+
+    *exclude_paths* is a list of LIKE patterns for file paths to exclude
+    (e.g. ``["mbed-os/%", "cmsis/%"]``).  When omitted, no paths are excluded.
     """
+    if exclude_paths:
+        path_clauses = " AND ".join(
+            "s.file_path NOT LIKE ?" for _ in exclude_paths
+        )
+        params = [config_hash, config_hash] + list(exclude_paths) + [limit]
+    else:
+        path_clauses = ""
+        params = [config_hash, config_hash, limit]
+
     rows = conn.execute(
-        """SELECT s.name, s.qualified_name, s.kind, s.file_path,
+        f"""SELECT s.name, s.qualified_name, s.kind, s.file_path,
                   s.signature, s.line
            FROM symbols s
            WHERE s.config_hash = ?
@@ -1006,9 +1026,10 @@ def find_dead_code(
              AND s.usr NOT IN (
                  SELECT DISTINCT to_usr FROM refs WHERE config_hash = ?
              )
+             {('AND ' + path_clauses) if path_clauses else ''}
            ORDER BY s.kind, s.name
            LIMIT ?""",
-        (config_hash, config_hash, limit),
+        params,
     ).fetchall()
 
     return [dict(r) for r in rows]
