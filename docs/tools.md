@@ -39,9 +39,9 @@ fw-context index --source-roots src lib drivers
 
 | Build system | Command |
 |-------------|---------|
-| **Mbed OS** | `bear -- mbed compile --profile release` |
 | **Zephyr** | `west build -b <board> -- -DCMAKE_EXPORT_COMPILE_COMMANDS=ON` |
 | **PlatformIO** | `pio run --target compiledb` |
+| **Mbed OS** | `bear -- mbed compile --profile release` |
 | **CMake** | `bear -- cmake --build build` or `cmake -DCMAKE_EXPORT_COMPILE_COMMANDS=ON` |
 | **Make** | `bear -- make` |
 | **Custom** | `bear -- <your-build-command>` |
@@ -76,7 +76,7 @@ List all indexed projects.
 ```bash
 $ fw-context list
 my-zephyr-app   /home/user/zephyr-app     symbols=12430  files=1502  indexed=2026-06-05 09:35:18
-my-mbed-app     /home/user/mbed-app       symbols=8586   files=952   indexed=2026-06-04 16:20:45
+my-platformio-app /home/user/pio-app      symbols=8586   files=952   indexed=2026-06-04 16:20:45
 ```
 
 ### `fw-context reset`
@@ -136,6 +136,15 @@ filesystem events. Press `Ctrl+C` to stop.
 
 ```bash
 pip install "fw-context-mcp[watch]"   # install watch dependency
+```
+
+### `fw-context version`
+
+Show version information.
+
+```bash
+$ fw-context version
+fw-context-mcp 0.2.3
 ```
 
 ---
@@ -271,7 +280,7 @@ Output: {"name": "modem_connect", "kind": "function",
 ```
 
 Designed as one-shot LLM context — answers "what does this do and how does it fit?"
-in a single call. Limited to 5 callers and 5 callees.
+in a single call. Returns all direct callers and callees (no artificial limit).
 
 ### Call graph
 
@@ -337,13 +346,14 @@ Output: [{"name": "spi_init", "kind": "function", "file": "/path/src/spi.c", "de
 Functions defined but never called.
 
 ```
-Input:  {"limit?": 100}
+Input:  {"limit?": 100, "exclude_paths?": ["zephyr/%", "mbed-os/%"]}
 Output: [{"name": "unused_helper", "kind": "function", "file": "/path/src/utils.c",
           "signature": "void unused_helper(int x)", "line": 200}, …]
 ```
 
 Entry points (`main`, interrupt handlers) will appear here — filter them out
 manually. Only definitions with `kind IN ('function', 'method', 'constructor', 'destructor')` are checked.
+Use `exclude_paths` to skip vendor SDK code (LIKE patterns — `%` matches any suffix).
 
 #### `find_hotspots`
 
@@ -354,6 +364,37 @@ Input:  {"limit?": 20}
 Output: [{"name": "log_debug", "kind": "function", "caller_count": 147, …},
          {"name": "millis", "kind": "function", "caller_count": 89, …}, …]
 ```
+
+#### `find_wrapper_callers`
+
+Find wrapper classes that call methods of a driver class. Useful for
+understanding adapter/wrapper architecture.
+
+```
+Input:  {"class_name": "UART_DRIVER"}
+Output: [{"wrapper_class": "UART", "wrapper_method": "send",
+          "driver_method": "UART_DRIVER::send", "file": "/path/src/uart.cpp",
+          "line": 45, "ref_kind": "call"}, …]
+```
+
+Pass a fully-qualified class name (`hal::UART_DRIVER`) or just the bare name
+(`UART_DRIVER`). Results are grouped by wrapper class.
+
+#### `trace_data_flow`
+
+Trace how data of a given type flows to a target function. **Experimental.**
+
+```
+Input:  {"type_name": "SensorData", "to_symbol": "uart_send"}
+Output: [{"source_function": "sensor_read", "source_type": "SensorData",
+          "file": "/path/src/sensor.cpp", "line": 120,
+          "call_path": "sensor_read → pack_payload → uart_send"}, …]
+```
+
+Finds functions whose signature mentions `type_name`, then looks for call paths
+from those functions to `to_symbol`. Does NOT resolve type transformations
+(e.g. CBOR encoding). Best used together with `find_call_path` to verify
+specific paths.
 
 ### Index maintenance
 
@@ -510,7 +551,7 @@ workflow requires no manual steps.
 
 2. Auto-detect source_roots:
    Scan for src/, lib/, app/, include/, modules/
-   Add framework dirs (mbed-os/, zephyr/)
+   Add framework dirs (zephyr/, mbed-os/)
    Add top-level dirs from compile_commands.json entries
 
 3. For each translation unit (parallel, ThreadPoolExecutor):
@@ -550,9 +591,9 @@ searches and expensive merging.
 
 | Ecosystem | Detected by | compile_commands.json location |
 |-----------|------------|-------------------------------|
-| **Mbed OS** | `mbed-os/` directory or `mbed_app.json` | Project root |
 | **Zephyr** | `west.yml` or `prj.conf` | `build/compile_commands.json` |
 | **PlatformIO** | `platformio.ini` | Project root |
+| **Mbed OS** | `mbed-os/` directory or `mbed_app.json` | Project root |
 | **CMake** | `CMakeLists.txt` + `compile_commands.json` | `build/` |
 | **Bare-metal** | Any build with `bear` | Project root |
 
