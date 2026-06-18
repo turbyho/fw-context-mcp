@@ -39,15 +39,66 @@ _DROP_WITH_ARG = frozenset({
 
 _SOURCE_EXTS = frozenset({".c", ".cpp", ".cc", ".cxx", ".c++"})
 
-# Map from -mcpu= prefix to clang --target triple
-_ARM_CORTEX_TARGET = "--target=arm-none-eabi"
+# Known -mcpu prefix → GNU target triple mapping for architectures where
+# the flag alone is sufficient to identify the target.
+_MCPU_TO_TRIPLE: dict[str, str] = {
+    "cortex-m": "arm-none-eabi",
+    "cortex-a": "aarch64-none-elf",
+    "cortex-r": "arm-none-eabi",
+}
 
 
-def _infer_target(args: list[str]) -> str | None:
-    """Return a clang --target triple inferred from -mcpu= flags, or None."""
+def _detect_target_triple(
+    compiler: Path | None, args: list[str]
+) -> str | None:
+    """Detect the GNU target triple for the cross-compiler.
+
+    1. Extract from compiler name: ``<triple>-gcc`` → ``<triple>``
+       (e.g. ``arm-none-eabi-g++`` → ``arm-none-eabi``,
+             ``riscv32-unknown-elf-gcc`` → ``riscv32-unknown-elf``,
+             ``xtensa-esp32-elf-g++`` → ``xtensa-esp32-elf``)
+    2. Fallback: infer from ``-mcpu=`` flags (Cortex-M → arm-none-eabi).
+    3. Fallback: infer from ``-march=`` flags (``-march=rv32*`` → riscv,
+       ``-march=armv*-m*`` → arm-none-eabi).
+    Returns None when the target cannot be determined.
+    """
+    # 1 — Compiler name: strip trailing -gcc/-g++/-clang suffix
+    if compiler is not None:
+        name = compiler.name
+        for suffix in ("-g++", "-gcc", "-clang", "-clang++"):
+            if name.endswith(suffix):
+                return name[: -len(suffix)]
+        # Bare name without suffix (e.g. just "gcc" for host)
+        if "-" in name:
+            # Heuristic: any compiler with a hyphen likely has a target prefix
+            # like "arm-none-eabi-g++". Try stripping the last two components.
+            parts = name.rsplit("-", 2)
+            if len(parts) == 3 and parts[-1] in ("gcc", "g++", "clang", "clang++"):
+                return parts[0] + "-" + parts[1]
+            # Single-hyphen: e.g. "riscv64-gcc" → "riscv64"
+            parts2 = name.rsplit("-", 1)
+            if len(parts2) == 2 and parts2[-1] in ("gcc", "g++", "clang", "clang++"):
+                return parts2[0]
+
+    # 2 — -mcpu= flags
     for arg in args:
-        if arg.startswith("-mcpu=cortex-m"):
-            return _ARM_CORTEX_TARGET
+        if arg.startswith("-mcpu="):
+            cpu = arg[6:].split("+")[0].lower()  # strip +extensions
+            for prefix, triple in _MCPU_TO_TRIPLE.items():
+                if cpu.startswith(prefix):
+                    return triple
+            # Unknown -mcpu — can't infer triple
+            return None
+
+    # 3 — -march= flags
+    for arg in args:
+        if arg.startswith("-march="):
+            arch = arg[7:].lower()
+            if arch.startswith("rv"):
+                return "riscv32-unknown-elf"
+            if "armv" in arch and "-m" in arch:
+                return "arm-none-eabi"
+
     return None
 
 
@@ -81,7 +132,12 @@ def _detect_language(file: Path, clang_args: list[str]) -> str:
     return "c"
 
 
-def normalize_args(raw_args: list[str], cwd: Path, source_file: str | None = None) -> list[str]:
+def normalize_args(
+    raw_args: list[str],
+    cwd: Path,
+    source_file: str | None = None,
+    compiler: Path | None = None,
+) -> list[str]:
     """Expand response files and strip GCC-specific flags incompatible with libclang.
 
     If source_file is given, any token matching that filename (by basename)
@@ -127,9 +183,9 @@ def normalize_args(raw_args: list[str], cwd: Path, source_file: str | None = Non
         result.append(token)
 
     # Inject --target triple so clang understands -mcpu=/-mfpu=/-mfloat-abi= on the host
-    target = _infer_target(result)
+    target = _detect_target_triple(compiler, result)
     if target:
-        result = [target] + result
+        result = [f"--target={target}"] + result
 
     return result
 
@@ -194,12 +250,14 @@ def parse(path: Path) -> Iterator[CompilationUnit]:
             compiler = Path(raw_args[0])
             raw_args = raw_args[1:]
 
-        clang_args = normalize_args(raw_args, cwd, str(file))
+        clang_args = normalize_args(raw_args, cwd, str(file), compiler)
 
-        # For ARM GCC cross-compilers inject system include paths so libclang
-        # finds stdint.h and friends when --target=arm-none-eabi is active
-        if compiler and "arm-none-eabi" in compiler.name:
-            clang_args = clang_args + _gcc_system_includes(compiler)
+        # For GCC cross-compilers inject system include paths so libclang
+        # finds stdint.h and friends when --target is active.
+        if compiler is not None:
+            triple = _detect_target_triple(compiler, [])
+            if triple is not None:
+                clang_args = clang_args + _gcc_system_includes(compiler)
 
         lang = _detect_language(file, clang_args)
 
