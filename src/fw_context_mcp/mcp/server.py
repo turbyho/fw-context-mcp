@@ -1102,7 +1102,7 @@ def find_callees_recursive(
 def find_dead_code(
     project_root: Annotated[str | None, Field(description="Project root. Auto-detected if omitted.")] = None,
     limit: Annotated[int, Field(description="Maximum results (default 100).")] = 100,
-    exclude_paths: Annotated[list[str] | None, Field(description="File path LIKE patterns to exclude. Default: mbed-os, cmsis, connectivity, targets, libraries in mbed-os tree.")] = None,
+    exclude_paths: Annotated[list[str] | None, Field(description="File path LIKE patterns to exclude. E.g. ['mbed-os/%', 'zephyr/%'] for SDK paths. No default — pass explicitly to filter vendor noise.")] = None,
 ) -> list[dict]:
     """Find functions/methods that are defined but never called.
 
@@ -1110,11 +1110,6 @@ def find_dead_code(
     instantiation, interrupt handlers (ISRs), virtual method overrides, and
     weak-aliased symbols often have no direct calls in the reference index.
     """
-    if exclude_paths is None:
-        exclude_paths = [
-            "mbed-os/%", "cmsis/%", "connectivity/%",
-            "targets/%", "libraries/%",
-        ]
     root, config_hash, err = _refs_guard(project_root)
     if err:
         return err
