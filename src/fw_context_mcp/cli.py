@@ -26,12 +26,37 @@ def cmd_index(args: argparse.Namespace) -> int:
     project_root = Path(args.project or ".").resolve()
     cfg = load_config(project_root=project_root)
 
-    compile_commands = Path(args.compile_commands) if args.compile_commands else cfg.index.compile_commands
-    if not compile_commands.is_absolute():
-        compile_commands = (project_root / compile_commands).resolve()
-    if not compile_commands.exists():
-        print(f"error: {compile_commands} not found", file=sys.stderr)
-        return 1
+    # Resolve compile_commands.json path
+    # Explicit path in positional arg implies --no-build
+    explicit_cc = bool(args.compile_commands)
+
+    if args.no_build or explicit_cc:
+        # Use existing compile_commands.json
+        compile_commands = Path(args.compile_commands) if explicit_cc else cfg.index.compile_commands
+        if not compile_commands.is_absolute():
+            compile_commands = (project_root / compile_commands).resolve()
+        if not compile_commands.exists():
+            print(f"error: {compile_commands} not found", file=sys.stderr)
+            print("  Run 'fw-context index' without arguments to build and index automatically.", file=sys.stderr)
+            return 1
+
+        # Warn if compile_commands.json looks incomplete
+        from .indexer.build import check_completeness
+        for warning in check_completeness(compile_commands, project_root):
+            print(f"warning: {warning}", file=sys.stderr)
+    else:
+        # Default: generate compile_commands.json from a freshly built build
+        from .indexer.build import generate_compile_commands
+
+        build_cfg = cfg.build
+        if args.no_clean:
+            build_cfg.clean = False
+        try:
+            compile_commands = generate_compile_commands(project_root, build_cfg)
+            print(f"Generated: {compile_commands}")
+        except RuntimeError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 1
 
     project_id = derive_project_id(project_root)
 
@@ -439,6 +464,7 @@ def cmd_export(args: argparse.Namespace) -> int:
 
     from .config import derive_project_id
     from .config import load as load_config
+    from .indexer.build import detect_build_system
     from .indexer.db import count_refs, get_active_config, open_db
 
     project_root = Path(args.project or ".").resolve()
@@ -463,7 +489,7 @@ def cmd_export(args: argparse.Namespace) -> int:
             "project": {
                 "id": project_id,
                 "root": str(project_root),
-                "build_system": _detect_build_system(project_root),
+                "build_system": detect_build_system(project_root),
                 "compile_commands": build_cfg["compile_commands_path"],
                 "indexed_at": build_cfg["created_at"],
             },
@@ -641,9 +667,12 @@ def main() -> None:
     )
     sub = parser.add_subparsers(dest="cmd")
 
-    p_index = sub.add_parser("index", help="Build the symbol index from compile_commands.json")
-    p_index.add_argument("compile_commands", nargs="?", default=None, metavar="compile_commands.json")
+    p_index = sub.add_parser("index", help="Build the symbol index from compile_commands.json (generates it from a clean build by default)")
+    p_index.add_argument("compile_commands", nargs="?", default=None, metavar="compile_commands.json",
+                         help="Use an existing compile_commands.json (skips build)")
     p_index.add_argument("--project", metavar="DIR", help="Project root (default: cwd)")
+    p_index.add_argument("--no-build", action="store_true", help="Skip build — use existing compile_commands.json")
+    p_index.add_argument("--no-clean", action="store_true", help="Skip clean build (incremental — may produce incomplete index)")
     p_index.add_argument("--source-roots", nargs="+", metavar="DIR")
     p_index.add_argument("--name", metavar="NAME", help="Project name override")
     p_index.add_argument("--no-refs", action="store_true", help="Skip cross-reference indexing (on by default)")

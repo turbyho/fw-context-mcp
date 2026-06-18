@@ -12,6 +12,8 @@ import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from ..indexer.build import BuildConfig
+
 _GLOBAL_CONFIG_PATH = Path.home() / ".fw-context" / "config.toml"
 _PROJECT_CONFIG_DIR = ".fw-context"
 _PROJECT_CONFIG_NAME = "config.toml"
@@ -32,9 +34,24 @@ _PROJECT_DEFAULTS_TEMPLATE = """\
 [project]
 # name = "my-project"   # defaults to directory name
 
+[build]
+# system = "mbed-os"        # auto-detected: mbed-os, zephyr, platformio
+# clean = true              # always clean build before indexing (recommended)
+# command = "bear -- make"  # full override — bypasses all detection
+#
+# Mbed OS overrides (auto-detected from .mbed):
+# target = "P_ECB_BOARD"
+# toolchain = "GCC_ARM"
+# profile = "Develop"
+# app_config = "mbed_app.json"
+# extra_profiles = ["lto.json"]
+#
+# Zephyr override:
+# board = "nrf52840dk_nrf52840"
+
 [index]
 compile_commands = "compile_commands.json"
-# Generate it with:  bear --output compile_commands.json -- <build-cmd>
+# Generate it with:  fw-context index --build  (auto-detects build system)
 # source_roots: directories to index symbols from.
 #   Empty list = auto-detect (scans for src, lib, app, include, zephyr, mbed-os,
 #   modules + top-level directories from compile_commands.json).
@@ -84,6 +101,7 @@ class ProjectMeta:
 @dataclass
 class Config:
     project: ProjectMeta = field(default_factory=ProjectMeta)
+    build: BuildConfig = field(default_factory=BuildConfig)
     index: IndexConfig = field(default_factory=IndexConfig)
     llm: LLMConfig = field(default_factory=LLMConfig)
 
@@ -114,6 +132,26 @@ def _from_dict(data: dict) -> Config:
     if proj := data.get("project", {}):
         if name := proj.get("name"):
             cfg.project.name = name
+
+    if build := data.get("build", {}):
+        if system := build.get("system"):
+            cfg.build.system = system
+        if "clean" in build:
+            cfg.build.clean = bool(build["clean"])
+        if command := build.get("command"):
+            cfg.build.command = command
+        if target := build.get("target"):
+            cfg.build.target = target
+        if toolchain := build.get("toolchain"):
+            cfg.build.toolchain = toolchain
+        if profile := build.get("profile"):
+            cfg.build.profile = profile
+        if app_config := build.get("app_config"):
+            cfg.build.app_config = app_config
+        if extra := build.get("extra_profiles"):
+            cfg.build.extra_profiles = list(extra)
+        if board := build.get("board"):
+            cfg.build.board = board
 
     if idx := data.get("index", {}):
         if db_dir := idx.get("db_dir"):
