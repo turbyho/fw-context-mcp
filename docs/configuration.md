@@ -20,6 +20,23 @@ Both files are auto-created with sensible defaults on first use.
 
 ## Settings reference
 
+### `[build]` — Build system
+
+Controls how `fw-context index` generates `compile_commands.json`.
+Used only when running without `--no-build`.
+
+| Key | Default | Scope | Description |
+|-----|---------|-------|-------------|
+| `system` | *(auto-detect)* | project | Build system: `"mbed-os"`, `"zephyr"`, `"platformio"`. Auto-detected from project markers (`west.yml`, `.mbed`, `platformio.ini`, etc.) |
+| `clean` | `true` | project | Always do a clean build before generating. **Recommended** — ensures complete `compile_commands.json`. Set `false` or use `--no-clean` for incremental builds. |
+| `command` | *(none)* | project | Full build command override. Bypasses all auto-detection. Example: `"bear -- make -j4"`. |
+| `target` | *(auto-detect)* | project | Mbed OS target board. Auto-detected from `.mbed` or `custom_targets.json`. |
+| `toolchain` | *(auto-detect)* | project | Mbed OS toolchain. Auto-detected from `.mbed`. |
+| `profile` | `"Develop"` | project | Mbed OS build profile. `Develop` is best for indexing (includes `-g` debug symbols). |
+| `app_config` | `"mbed_app.json"` | project | Mbed OS app configuration file. |
+| `extra_profiles` | `["lto.json"]` | project | Additional Mbed OS profiles (resolved relative to `mbed-os/tools/profiles/extensions/`). |
+| `board` | *(required)* | project | Zephyr board name. Must be set explicitly for Zephyr projects. |
+
 ### `[index]` — Indexer
 
 | Key | Default | Scope | Description |
@@ -69,6 +86,15 @@ num_ctx = 8192
 ```toml
 [project]
 name = "my-firmware"
+
+[build]
+# system = "mbed-os"                  # auto-detected
+# clean = true                        # always clean build (recommended)
+# target = "P_ECB_BOARD"             # override .mbed
+# profile = "Develop"                 # best for indexing
+# app_config = "mbed_app.json"
+# extra_profiles = ["lto.json"]
+# board = "nrf52840dk_nrf52840"      # required for Zephyr
 
 [index]
 compile_commands = "build/compile_commands.json"   # Zephyr: in build/

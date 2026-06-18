@@ -101,24 +101,25 @@ cd ~/.fw-context/src && make update
 ```bash
 cd your-firmware-project
 
-# Zephyr:
-west build -b <board> -- -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
-fw-context index build/compile_commands.json
-
-# PlatformIO:
-pio run --target compiledb
+# One command — auto-detects build system, runs clean build, indexes:
 fw-context index
 
-# Mbed OS:
-bear -- mbed compile --profile release
-fw-context index
-
-# CMake / Make:
-bear -- make
-# or: bear -- cmake --build build
-
-fw-context index
+# Skip the build step (use existing compile_commands.json):
+fw-context index --no-build
 ```
+
+**Auto-detection:** mbed-os (`.mbed`, `mbed-os/`), Zephyr (`west.yml`),
+PlatformIO (`platformio.ini`), or any build with `bear`.
+
+**What happens:** On `fw-context index` without arguments, the tool:
+1. Detects your build system
+2. Runs a clean build via `bear` / `west` / `pio` to produce a complete
+   `compile_commands.json`
+3. Parses every translation unit with libclang
+4. Builds the SQLite index with symbols, references, and embeddings
+
+**Subsequent runs** are incremental — seconds for a few changed files.
+Use `--no-build` if you already have an up-to-date `compile_commands.json`.
 
 ### 6. Restart your assistant and start asking about your code
 
@@ -214,13 +215,15 @@ Use **clangd for editing**, **fw-context for AI-assisted exploration**.
 
 Works with **any build system** that produces `compile_commands.json`:
 
-| Ecosystem | Auto-detection |
-|-----------|---------------|
-| **Zephyr RTOS** | `west.yml` or `prj.conf` |
-| **PlatformIO** | `platformio.ini` |
-| **Mbed OS** | `mbed-os/` directory or `mbed_app.json` |
-| **Bare-metal / FreeRTOS** | Any build with `bear` |
-| **Custom toolchain** | Any build with `bear` |
+| Ecosystem | Auto-detection | Build command |
+|-----------|---------------|---------------|
+| **Mbed OS** | `.mbed`, `mbed-os/`, `mbed_app.json` | `bear -- mbed compile --clean` |
+| **Zephyr RTOS** | `west.yml` or `zephyr/` | `west build -b <board> --pristine` |
+| **PlatformIO** | `platformio.ini` | `pio run --target compiledb` |
+| **Custom** | Any `[build] command` override | User-specified |
+
+`fw-context index` handles the build automatically. Use `--no-build` to
+skip and use an existing `compile_commands.json`.
 
 Subsequent runs are **incremental** — seconds for a few changed files.
 
