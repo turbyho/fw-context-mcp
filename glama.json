@@ -2,7 +2,7 @@
   "$schema": "https://glama.ai/schemas/glama.json",
   "maintainers": ["turbyho"],
   "title": "fw-context-mcp",
-  "description": "Build-aware code intelligence for embedded C/C++ firmware. libclang + SQLite+FTS5, 19 MCP tools for symbol search, call graphs, hotspot analysis, and dead code detection.",
+  "description": "Build-aware code intelligence for embedded C/C++ firmware. libclang + SQLite+FTS5, 21 MCP tools for symbol search, call graphs, hotspot analysis, and dead code detection.",
   "tags": ["c++", "c", "embedded", "firmware", "libclang", "call-graph", "code-intelligence", "mbed-os", "zephyr", "platformio"],
   "repository": "https://github.com/turbyho/fw-context-mcp",
   "license": "MIT",

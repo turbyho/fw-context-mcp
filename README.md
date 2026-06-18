@@ -34,7 +34,7 @@ Your AI assistant goes from guessing to knowing:
 > *"Give me a map of `modem_msg.cpp` before I read it."*
 > → `get_file_map("src/modem_msg.cpp")` — 426 symbols grouped by kind.
 
-**19 MCP tools** — symbol search, source reading, call-graph traversal, hotspot
+**21 MCP tools** — symbol search, source reading, call-graph traversal, hotspot
 analysis, dead code detection, vector search. All backed by real compiler flags
 from `compile_commands.json` — `#ifdef`-aware, not grep.
 
@@ -183,6 +183,8 @@ Use **clangd for editing**, **fw-context for AI-assisted exploration**.
                                find_callees_recursive ── transitive callees
                                find_dead_code ────────── never called
                                find_hotspots ─────────── most-called
+                               find_wrapper_callers ──── wrapper→driver
+                               trace_data_flow ───────── data flow paths
                                get_active_build ──────── index health
                                reindex_file ──────────── re-parse one file
                                reset_index ───────────── delete + rebuild
@@ -227,7 +229,7 @@ Subsequent runs are **incremental** — seconds for a few changed files.
 | Document | Covers |
 |----------|--------|
 | **[Installation](docs/installation.md)** | Prerequisites, install, upgrade, Ollama setup, AI assistant integration |
-| **[Tools Reference](docs/tools.md)** | All 19 MCP tools, 8 CLI commands, internal workings, search pipeline |
+| **[Tools Reference](docs/tools.md)** | All 21 MCP tools, 9 CLI commands, internal workings, search pipeline |
 | **[Configuration](docs/configuration.md)** | `.fw-context/config.toml` — global defaults, per-project overrides, every setting |
 | **[MCP Server](README-MCP.md)** | JSON-RPC protocol, tool schemas, error handling, debugging |
 
