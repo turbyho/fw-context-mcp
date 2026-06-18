@@ -39,6 +39,50 @@ _DROP_WITH_ARG = frozenset({
 
 _SOURCE_EXTS = frozenset({".c", ".cpp", ".cc", ".cxx", ".c++"})
 
+# Target triple prefixes known to be supported by the bundled libclang.
+# Only inject --target for these; unsupported triples (xtensa, etc.) cause
+# TranslationUnitLoadError when libclang lacks that backend.
+# Covers all LLVM backends that have corresponding GCC cross-compiler triples.
+_SUPPORTED_TARGET_PREFIXES = frozenset({
+    # ARM family
+    "arm-",
+    "armv6-", "armv7-", "armv8-",
+    "thumb-",
+    "aarch64-",
+    # RISC-V
+    "riscv32-", "riscv64-",
+    # x86
+    "i386-", "i486-", "i586-", "i686-", "i786-",
+    "x86_64-",
+    # MIPS
+    "mips-", "mipsel-", "mips64-", "mips64el-",
+    "mipsisa32r6-", "mipsisa64r6-",
+    # PowerPC
+    "powerpc-", "powerpc64-", "powerpc64le-", "powerpcle-",
+    # Sparc
+    "sparc-", "sparc64-",
+    # SystemZ (s390x)
+    "s390-", "s390x-",
+    # LoongArch
+    "loongarch32-", "loongarch64-",
+    # WebAssembly
+    "wasm32-", "wasm64-",
+    # AVR
+    "avr-",
+    # MSP430
+    "msp430-",
+    # XCore
+    "xcore-",
+    # BPF
+    "bpf-",
+    # Hexagon
+    "hexagon-",
+    # Lanai
+    "lanai-",
+    # VE
+    "ve-",
+})
+
 # Known -mcpu prefix → GNU target triple mapping for architectures where
 # the flag alone is sufficient to identify the target.
 _MCPU_TO_TRIPLE: dict[str, str] = {
@@ -60,45 +104,62 @@ def _detect_target_triple(
     2. Fallback: infer from ``-mcpu=`` flags (Cortex-M → arm-none-eabi).
     3. Fallback: infer from ``-march=`` flags (``-march=rv32*`` → riscv,
        ``-march=armv*-m*`` → arm-none-eabi).
-    Returns None when the target cannot be determined.
+
+    Returns None when the target cannot be determined or is not supported
+    by the installed libclang (e.g. xtensa, msp430, avr).
     """
+    triple: str | None = None
+
     # 1 — Compiler name: strip trailing -gcc/-g++/-clang suffix
     if compiler is not None:
         name = compiler.name
         for suffix in ("-g++", "-gcc", "-clang", "-clang++"):
             if name.endswith(suffix):
-                return name[: -len(suffix)]
-        # Bare name without suffix (e.g. just "gcc" for host)
-        if "-" in name:
+                triple = name[: -len(suffix)]
+                break
+        if triple is None and "-" in name:
             # Heuristic: any compiler with a hyphen likely has a target prefix
             # like "arm-none-eabi-g++". Try stripping the last two components.
             parts = name.rsplit("-", 2)
             if len(parts) == 3 and parts[-1] in ("gcc", "g++", "clang", "clang++"):
-                return parts[0] + "-" + parts[1]
-            # Single-hyphen: e.g. "riscv64-gcc" → "riscv64"
-            parts2 = name.rsplit("-", 1)
-            if len(parts2) == 2 and parts2[-1] in ("gcc", "g++", "clang", "clang++"):
-                return parts2[0]
+                triple = parts[0] + "-" + parts[1]
+            else:
+                # Single-hyphen: e.g. "riscv64-gcc" → "riscv64"
+                parts2 = name.rsplit("-", 1)
+                if len(parts2) == 2 and parts2[-1] in ("gcc", "g++", "clang", "clang++"):
+                    triple = parts2[0]
 
     # 2 — -mcpu= flags
-    for arg in args:
-        if arg.startswith("-mcpu="):
-            cpu = arg[6:].split("+")[0].lower()  # strip +extensions
-            for prefix, triple in _MCPU_TO_TRIPLE.items():
-                if cpu.startswith(prefix):
-                    return triple
-            # Unknown -mcpu — can't infer triple
-            return None
+    if triple is None:
+        for arg in args:
+            if arg.startswith("-mcpu="):
+                cpu = arg[6:].split("+")[0].lower()  # strip +extensions
+                for prefix, t in _MCPU_TO_TRIPLE.items():
+                    if cpu.startswith(prefix):
+                        triple = t
+                        break
+                break  # -mcpu without mapping → unknown, don't fall through
 
     # 3 — -march= flags
-    for arg in args:
-        if arg.startswith("-march="):
-            arch = arg[7:].lower()
-            if arch.startswith("rv"):
-                return "riscv32-unknown-elf"
-            if "armv" in arch and "-m" in arch:
-                return "arm-none-eabi"
+    if triple is None:
+        for arg in args:
+            if arg.startswith("-march="):
+                arch = arg[7:].lower()
+                if arch.startswith("rv"):
+                    triple = "riscv32-unknown-elf"
+                elif "armv" in arch and "-m" in arch:
+                    triple = "arm-none-eabi"
+                break
 
+    if triple is None:
+        return None
+
+    # Only inject --target for triples the installed libclang actually supports.
+    # Unspported targets (xtensa, msp430, avr, etc.) cause
+    # TranslationUnitLoadError — libclang parses them fine as host target.
+    for prefix in _SUPPORTED_TARGET_PREFIXES:
+        if triple.startswith(prefix):
+            return triple
     return None
 
 
