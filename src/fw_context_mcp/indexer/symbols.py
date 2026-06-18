@@ -342,9 +342,14 @@ def extract_all(
     # Build qualified-name → USR lookup for token-based fallback
     # (UNEXPOSED_EXPR nodes hide template expansions like mbed::callback(...)
     #  so we fall back to scanning raw tokens for &Class::method patterns)
+    # Only include callable symbols — token-based fallbacks resolve
+    # method/function names, so including fields/variables/enum_constants
+    # would create spurious "call"/"indirect" references to non-callable
+    # targets, polluting call-graph queries like find_hotspots.
+    _callable_kind_strs = frozenset({"function", "method", "constructor", "destructor"})
     _qn_to_usr: dict[str, str] = {}
     for s in symbols:
-        if s.qualified_name:
+        if s.qualified_name and s.kind in _callable_kind_strs:
             _qn_to_usr[s.qualified_name] = s.usr
 
     # --- References (explicit stack DFS to track the enclosing function) ---
@@ -442,7 +447,7 @@ def extract_all(
                     for child in cursor.get_children():
                         if child.kind == cx.CursorKind.MEMBER_REF_EXPR:
                             child_ref = child.referenced
-                            if child_ref is not None:
+                            if child_ref is not None and child_ref.kind in _CALLABLE_KINDS:
                                 child_usr = child_ref.get_usr()
                                 child_loc = child_ref.location
                                 if child_usr and child_loc.file and _in_roots(child_loc.file.name) and _not_excluded(child_loc.file.name):
