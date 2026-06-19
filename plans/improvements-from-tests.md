@@ -2,7 +2,39 @@
 
 **Projekt:** fw-context-mcp (`~/dev/sw/work/tools/fw-context-mcp`)
 **Větev:** `main`
-**Status:** Návrh — čeká na schválení
+**Status:** P0.1 hotovo (cd79a56), P0.2 neaplikovatelné, P1–P3 hotovo dříve
+
+## Výsledek implementace (2026-06-19)
+
+### P0.1 — Root cause a oprava
+
+Diagnostika na reálných projektech (zbox-ecb-fw, HA_Boiler) odhalila:
+
+1. **Reference v indexu JSOU** — `find_callees_recursive("ZMODEM::thread_app")` vrací
+   `ZMODEM_DRIVER::send`, takže indexer ukládá field-access volání správně.
+
+2. **Problém byl v `find_refs` name resolution** — dotaz `name = ? OR qualified_name = ?`
+   nerozpoznal částečně kvalifikovaná jména jako `ZMODEM_DRIVER::send`:
+   - `name` sloupec obsahuje jen `send`
+   - `qualified_name` obsahuje `zbox::ZMODEM_DRIVER::send`
+   - `ZMODEM_DRIVER::send` neodpovídá ani jednomu
+
+3. **Oprava:** Přidán suffix LIKE fallback (`qualified_name LIKE '%::<name>'`)
+   do `find_refs` (obě větve) a `_resolve_target_usr`. Tím se pokryjí všechna
+   částečně kvalifikovaná jména napříč všemi call-graph tooly.
+
+### P0.2 — Field-access calls
+
+Není potřeba opravovat indexer — reference se ukládají správně. Problém byl
+čistě v query vrstvě (P0.1).
+
+### Co se implementovalo jinak než plán navrhoval
+
+- Místo debug logování a lepších error messages (plán P0.1) jsme provedli
+  přímou diagnostiku SQL dotazy na reálných indexech
+- Místo `find_refs` restrukturalizace (plán navrhoval změnu na `to_usr IN`)
+  jsme přidali suffix LIKE — minimální změna se stejnou funkčností
+- `_did_you_mean` (P1.4) už byl hotový dříve, stejně jako ostatní P1–P3 featury
 
 ## Cíl
 
