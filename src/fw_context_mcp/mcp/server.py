@@ -478,6 +478,21 @@ def lookup_symbol(
                 except Exception:
                     pass  # suggestions are best-effort
 
+            # Auto-fallback: when exact/prefix lookup found nothing but we have
+            # did-you-mean suggestions, try the top match so the user doesn't
+            # get an empty result — e.g. "uart_init" → nrfx_uarte_init
+            if not rows and _suggestions:
+                for suggestion in _suggestions[:3]:
+                    rows = c.execute(
+                        """SELECT s.* FROM symbols s
+                           WHERE s.config_hash=? AND (s.name=? OR s.qualified_name=?)
+                           ORDER BY s.is_definition DESC, s.line
+                           LIMIT ?""",
+                        (config_hash, suggestion, suggestion, limit),
+                    ).fetchall()
+                    if rows:
+                        break
+
             result = [
                 {
                     "name": r["name"],

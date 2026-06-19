@@ -1,21 +1,154 @@
 """Did-you-mean? suggestions for lookup_symbol when no exact match is found.
 
-Uses difflib for fast approximate matching against the indexed symbol names.
+Uses token-based matching (snake_case + camelCase split) instead of difflib
+sequence matching.  Token matching prefers candidates that share multiple
+tokens with the query, with exact-token and prefix-token weights.
+
 Results are cached per-query for the lifetime of the process.
 """
 
 from __future__ import annotations
 
-import difflib
+import re
 import sqlite3
-from typing import TYPE_CHECKING
-
-if TYPE_CHECKING:
-    pass
+from collections import defaultdict
 
 # Simple cache: {query: [suggestions]}
 _cache: dict[str, list[str]] = {}
 _MAX_CACHE = 128
+
+# Characters that delimit tokens in symbol names
+_TOKEN_SPLIT = re.compile(r"[_]+")
+
+
+def _tokenize(name: str) -> list[str]:
+    """Split a symbol name into lowercase tokens.
+
+    Splits on ``_`` first, then splits each part on camelCase boundaries.
+    Returns deduplicated, lowercased tokens.
+    """
+    tokens: list[str] = []
+    for part in _TOKEN_SPLIT.split(name):
+        if not part:
+            continue
+        # Split camelCase: "nrfxUarteInit" → ["nrfx", "Uarte", "Init"]
+        subtokens = re.findall(r"[A-Z]?[a-z0-9]+|[A-Z0-9]+(?=[A-Z]|$)", part)
+        for t in subtokens:
+            t = t.lower()
+            if t and t not in tokens:
+                tokens.append(t)
+    return tokens
+
+
+def suggest(
+    conn: sqlite3.Connection,
+    config_hash: str,
+    name: str,
+    limit: int = 5,
+    cutoff: float = 0.5,
+) -> list[str]:
+    """Return symbol names similar to *name*, or empty list.
+
+    Uses token-based matching: splits both query and candidates into tokens
+    (on ``_`` and camelCase boundaries), then scores candidates by how many
+    query tokens they share.  Exact token matches score higher than prefix
+    matches.  At least one token must match exactly or by prefix.
+
+    Args:
+        conn: Open SQLite connection.
+        config_hash: Build config hash.
+        name: The user-provided name that didn't match.
+        limit: Maximum suggestions to return.
+        cutoff: Ignored (kept for API compatibility).
+
+    Returns:
+        List of similar symbol names, best match first.
+    """
+    cache_key = f"{config_hash}:{name}"
+    if cache_key in _cache:
+        return _cache[cache_key][:limit]
+
+    candidates = _load_names(conn, config_hash)
+    if not candidates:
+        return []
+
+    query_tokens = _tokenize(name)
+    if not query_tokens:
+        return []
+
+    # Build token → candidate index for efficient filtering
+    token_index: dict[str, list[str]] = defaultdict(list)
+    for c in candidates:
+        for t in _tokenize(c):
+            token_index[t].append(c)
+
+    # Score candidates that share at least one token with the query
+    scored: dict[str, float] = {}
+    for qt in query_tokens:
+        # Exact matches
+        for c in token_index.get(qt, []):
+            if c not in scored:
+                scored[c] = 0.0
+        # Prefix matches (e.g. query "uart" matches candidate token "uarte")
+        for token, cands in token_index.items():
+            if token.startswith(qt) and token != qt:
+                for c in cands:
+                    if c not in scored:
+                        scored[c] = 0.0
+
+    # Score each shortlisted candidate
+    results: list[tuple[str, float]] = []
+    for c, _ in scored.items():
+        c_tokens = _tokenize(c)
+        score = _token_score(query_tokens, c_tokens)
+        if score > 0:
+            results.append((c, score))
+
+    # Sort by score descending, then by name length (shorter = less noise)
+    results.sort(key=lambda x: (-x[1], len(x[0])))
+
+    matches = [r[0] for r in results[:limit]]
+
+    # Maintain cache size
+    if len(_cache) >= _MAX_CACHE:
+        _cache.pop(next(iter(_cache)))
+    _cache[cache_key] = matches
+
+    return matches
+
+
+def _token_score(query_tokens: list[str], candidate_tokens: list[str]) -> float:
+    """Score a candidate against query tokens.
+
+    Exact token match: +2.0
+    Prefix token match: +1.0
+    Same-position match: +0.5 bonus
+
+    Score is normalized against query token count so a candidate matching
+    all tokens scores >= 2.0 regardless of query length.
+    """
+    if not query_tokens:
+        return 0.0
+
+    score = 0.0
+    matched_any = False
+
+    for qi, qt in enumerate(query_tokens):
+        for ci, ct in enumerate(candidate_tokens):
+            if ct == qt:
+                score += 2.0
+                if qi == ci:
+                    score += 0.5  # same position bonus
+                matched_any = True
+                break
+            elif ct.startswith(qt) and len(qt) >= 3:
+                score += 1.0
+                if qi == ci:
+                    score += 0.5
+                matched_any = True
+                break
+
+    return score if matched_any else 0.0
 
 
 def _load_names(conn: sqlite3.Connection, config_hash: str) -> list[str]:
@@ -33,40 +166,3 @@ def _load_names(conn: sqlite3.Connection, config_hash: str) -> list[str]:
         (config_hash,),
     ).fetchall()
     return [r["name"] for r in rows]
-
-
-def suggest(
-    conn: sqlite3.Connection,
-    config_hash: str,
-    name: str,
-    limit: int = 5,
-    cutoff: float = 0.5,
-) -> list[str]:
-    """Return symbol names similar to *name*, or empty list.
-
-    Args:
-        conn: Open SQLite connection.
-        config_hash: Build config hash.
-        name: The user-provided name that didn't match.
-        limit: Maximum suggestions to return.
-        cutoff: Minimum similarity ratio (0.0–1.0).  Default 0.5.
-
-    Returns:
-        List of similar symbol names, best match first.
-    """
-    cache_key = f"{config_hash}:{name}"
-    if cache_key in _cache:
-        return _cache[cache_key][:limit]
-
-    candidates = _load_names(conn, config_hash)
-    if not candidates:
-        return []
-
-    matches = difflib.get_close_matches(name, candidates, n=limit, cutoff=cutoff)
-
-    # Maintain cache size
-    if len(_cache) >= _MAX_CACHE:
-        _cache.pop(next(iter(_cache)))
-    _cache[cache_key] = matches
-
-    return matches
