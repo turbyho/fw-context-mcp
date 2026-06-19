@@ -32,9 +32,10 @@ Used only when running without `--no-build`.
 | `command` | *(none)* | project | Full build command override. Bypasses all auto-detection. Example: `"bear -- make -j4"`. |
 | `target` | *(auto-detect)* | project | Mbed OS target board. Auto-detected from `.mbed` or `custom_targets.json`. |
 | `toolchain` | *(auto-detect)* | project | Mbed OS toolchain. Auto-detected from `.mbed`. |
-| `profile` | `"Develop"` | project | Mbed OS build profile. `Develop` is best for indexing (includes `-g` debug symbols). |
+| `profile` | `"develop"` | project | Mbed OS build profile. `develop` is best for indexing (includes `-g` debug symbols). |
 | `app_config` | `"mbed_app.json"` | project | Mbed OS app configuration file. |
 | `extra_profiles` | `["lto.json"]` | project | Additional Mbed OS profiles (resolved relative to `mbed-os/tools/profiles/extensions/`). |
+| `defines` | `[]` | project | Extra preprocessor macros passed to the compiler (`-D` flags). Example: `["VERSION_FW_MAJOR=4", "DEV"]`. Useful for conditional code paths — ensures `#ifdef DEV` branches are indexed. |
 | `board` | *(required)* | project | Zephyr board name. Must be set explicitly for Zephyr projects. |
 
 ### `[index]` — Indexer
@@ -91,9 +92,10 @@ name = "my-firmware"
 # system = "mbed-os"                  # auto-detected
 # clean = true                        # always clean build (recommended)
 # target = "P_ECB_BOARD"             # override .mbed
-# profile = "Develop"                 # best for indexing
+# profile = "develop"                 # best for indexing
 # app_config = "mbed_app.json"
 # extra_profiles = ["lto.json"]
+# defines = ["VERSION_FW_MAJOR=4", "DEV"]  # extra -D macros
 # board = "nrf52840dk_nrf52840"      # required for Zephyr
 
 [index]
