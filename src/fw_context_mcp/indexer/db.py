@@ -56,6 +56,9 @@ def split_tokens(name: str, qualified_name: str = "") -> str:
                     tokens.append(tok)
     return " ".join(tokens)
 
+CURRENT_SCHEMA_VERSION = 1  # bump when the schema changes — triggers re-index hint in get_active_build()
+
+
 _SCHEMA = """
 PRAGMA journal_mode = WAL;
 PRAGMA foreign_keys = ON;
@@ -290,7 +293,19 @@ def open_db(path: Path) -> sqlite3.Connection:
         conn.close()
         raise DatabaseCorruptionError(str(path), str(e)) from e
 
+    # Stamp schema version after all migrations succeeded
+    conn.execute(f"PRAGMA user_version = {CURRENT_SCHEMA_VERSION}")
+
     return conn
+
+
+def get_db_schema_version(conn: sqlite3.Connection) -> int:
+    """Return the schema version stored in the database (``PRAGMA user_version``).
+
+    Compare with ``CURRENT_SCHEMA_VERSION`` — if lower, the index was built
+    with an older schema and may miss data populated by newer migrations.
+    """
+    return conn.execute("PRAGMA user_version").fetchone()[0]
 
 
 @contextmanager

@@ -22,11 +22,13 @@ from ..config import load as load_config
 from ..indexer.compile_commands import parse as parse_cc
 from ..indexer import db as index_db
 from ..indexer.db import (
+    CURRENT_SCHEMA_VERSION,
     DatabaseCorruptionError,
     count_refs,
     find_refs,
     get_active_config,
     get_all_projects,
+    get_db_schema_version,
     get_file_mtime_indexed,
     open_db,
     search_symbols,
@@ -260,7 +262,8 @@ def get_active_build(
     Returns:
         dict: {index_exists, project_id, total_symbols, total_files,
         total_refs, config_hash, last_indexed (ISO timestamp),
-        stale (bool — True if compile_commands.json is newer than index)}
+        stale (bool — True if compile_commands.json is newer than index),
+        schema_version (int — DB schema version), current_schema (int — code expects)}
     """
     root = resolve_project_root(project_root)
     db_path = _db_path(root)
@@ -284,6 +287,7 @@ def get_active_build(
             ).fetchone()[0]
             ref_count = count_refs(conn, config_hash)
             modified_count = _count_modified_files(conn, config_hash, root)
+            db_schema_ver = get_db_schema_version(conn)
             result: dict = {
                 "config_hash": config_hash,
                 "project_id": project_id,
@@ -295,7 +299,10 @@ def get_active_build(
                 "file_count": file_count,
                 "reference_count": ref_count,
                 "modified_files_count": modified_count,
-                "stale": _is_stale(cfg, cfg["compile_commands_path"]) or modified_count > 0,
+                "schema_version": db_schema_ver,
+                "current_schema": CURRENT_SCHEMA_VERSION,
+                "stale": _is_stale(cfg, cfg["compile_commands_path"]) or modified_count > 0
+                or db_schema_ver < CURRENT_SCHEMA_VERSION,
             }
         return result
     finally:
