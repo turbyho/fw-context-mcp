@@ -139,7 +139,7 @@ class TestBuildConfig:
         assert cfg.clean is True
         assert cfg.system is None
         assert cfg.command is None
-        assert cfg.profile == "Develop"
+        assert cfg.profile == "develop"
         assert cfg.app_config == "mbed_app.json"
         assert cfg.extra_profiles == ["lto.json"]
 

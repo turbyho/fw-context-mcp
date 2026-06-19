@@ -42,9 +42,10 @@ _PROJECT_DEFAULTS_TEMPLATE = """\
 # Mbed OS overrides (auto-detected from .mbed):
 # target = "P_ECB_BOARD"
 # toolchain = "GCC_ARM"
-# profile = "Develop"
+# profile = "develop"
 # app_config = "mbed_app.json"
 # extra_profiles = ["lto.json"]
+# defines = ["VERSION_FW_MAJOR=4", "DEV"]  # extra -D macros passed to compiler
 #
 # Zephyr override:
 # board = "nrf52840dk_nrf52840"
@@ -150,6 +151,8 @@ def _from_dict(data: dict) -> Config:
             cfg.build.app_config = app_config
         if extra := build.get("extra_profiles"):
             cfg.build.extra_profiles = list(extra)
+        if defines := build.get("defines"):
+            cfg.build.defines = list(defines)
         if board := build.get("board"):
             cfg.build.board = board
 

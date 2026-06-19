@@ -185,9 +185,9 @@ class TestInsertSymbolsBatch:
         file_id = upsert_file(populated_db, "hash-deadbeef", "/tmp/test.cpp", "cpp")
         rows = [
             ("hash-deadbeef", file_id, "src/test.cpp", "foo", "usr-1", "foo", "ns::foo", "function",
-             10, 1, 0, 0, "void foo()", ""),
+             10, 1, 0, 0, "void foo()", "", None),
             ("hash-deadbeef", file_id, "src/test.cpp", "bar", "usr-2", "bar", "ns::bar", "function",
-             20, 1, 0, 0, "int bar(int)", "Returns bar"),
+             20, 1, 0, 0, "int bar(int)", "Returns bar", None),
         ]
         count = insert_symbols_batch(populated_db, rows)
         assert count == 2
@@ -197,12 +197,12 @@ class TestInsertSymbolsBatch:
         # Insert as declaration
         insert_symbols_batch(populated_db, [
             ("hash-deadbeef", file_id, "src/test.cpp", "foo", "usr-1", "foo", "ns::foo", "function",
-             5, 1, 0, 0, "void foo()", ""),
+             5, 1, 0, 0, "void foo()", "", None),
         ])
         # Insert as definition (same USR) — should promote
         insert_symbols_batch(populated_db, [
             ("hash-deadbeef", file_id, "src/test.cpp", "foo", "usr-1", "foo", "ns::foo", "function",
-             10, 1, 0, 1, "void foo(int x)", "Does foo"),
+             10, 1, 0, 1, "void foo(int x)", "Does foo", None),
         ])
         row = populated_db.execute(
             "SELECT is_definition, signature, line FROM symbols WHERE usr=?", ("usr-1",)
@@ -216,12 +216,12 @@ class TestInsertSymbolsBatch:
         # Insert as definition first
         insert_symbols_batch(populated_db, [
             ("hash-deadbeef", file_id, "src/test.cpp", "foo", "usr-1", "foo", "ns::foo", "function",
-             10, 1, 0, 1, "void foo()", ""),
+             10, 1, 0, 1, "void foo()", "", None),
         ])
         # Then try to insert as declaration — WHERE clause prevents demotion
         insert_symbols_batch(populated_db, [
             ("hash-deadbeef", file_id, "src/test.cpp", "foo", "usr-1", "foo", "ns::foo", "function",
-             5, 1, 0, 0, "void foo();", ""),
+             5, 1, 0, 0, "void foo();", "", None),
         ])
         row = populated_db.execute(
             "SELECT is_definition FROM symbols WHERE usr=?", ("usr-1",)
@@ -233,8 +233,8 @@ class TestDeleteSymbolsForFile:
     def test_delete(self, populated_db):
         file_id = upsert_file(populated_db, "hash-deadbeef", "/tmp/del.cpp", "cpp")
         insert_symbols_batch(populated_db, [
-            ("hash-deadbeef", file_id, "src/del.cpp", "f1", "usr-1", "f1", "ns::f1", "function", 1, 1, 0, 1, "void f1()", ""),
-            ("hash-deadbeef", file_id, "src/del.cpp", "f2", "usr-2", "f2", "ns::f2", "function", 2, 1, 0, 1, "void f2()", ""),
+            ("hash-deadbeef", file_id, "src/del.cpp", "f1", "usr-1", "f1", "ns::f1", "function", 1, 1, 0, 1, "void f1()", "", None),
+            ("hash-deadbeef", file_id, "src/del.cpp", "f2", "usr-2", "f2", "ns::f2", "function", 2, 1, 0, 1, "void f2()", "", None),
         ])
         count_before = populated_db.execute(
             "SELECT COUNT(*) FROM symbols WHERE file_id=?", (file_id,)
@@ -277,13 +277,13 @@ class TestSearchSymbols:
         insert_symbols_batch(populated_db, [
             ("hash-deadbeef", file_id, "src/modem/modem_driver.cpp",
              split_tokens("modem_init", "ns::modem_init"),
-             "u1", "modem_init", "ns::modem_init", "function", 1, 1, 0, 1, "void modem_init()", ""),
+             "u1", "modem_init", "ns::modem_init", "function", 1, 1, 0, 1, "void modem_init()", "", None),
             ("hash-deadbeef", file_id, "src/uart/uart_driver.cpp",
              split_tokens("uart_send", "ns::uart_send"),
-             "u2", "uart_send", "ns::uart_send", "function", 5, 1, 0, 1, "void uart_send(char c)", ""),
+             "u2", "uart_send", "ns::uart_send", "function", 5, 1, 0, 1, "void uart_send(char c)", "", None),
             ("hash-deadbeef", file_id, "src/modem/modem_driver.cpp",
              split_tokens("modem_connect", "ns::modem_connect"),
-             "u3", "modem_connect", "ns::modem_connect", "function", 10, 1, 0, 1, "int modem_connect(const char* host)", ""),
+             "u3", "modem_connect", "ns::modem_connect", "function", 10, 1, 0, 1, "int modem_connect(const char* host)", "", None),
         ])
 
         results = search_symbols(populated_db, "modem", "hash-deadbeef")
@@ -297,10 +297,10 @@ class TestSearchSymbols:
         insert_symbols_batch(populated_db, [
             ("hash-deadbeef", file_id, "src/spi/spi_driver.cpp",
              split_tokens("write", "SPI::write"),
-             "u10", "write", "SPI::write", "method", 1, 1, 0, 1, "void write(const uint8_t* buf, int len)", ""),
+             "u10", "write", "SPI::write", "method", 1, 1, 0, 1, "void write(const uint8_t* buf, int len)", "", None),
             ("hash-deadbeef", file_id, "src/uart/uart_driver.cpp",
              split_tokens("write", "UART::write"),
-             "u11", "write", "UART::write", "method", 1, 1, 0, 1, "void write(char c)", ""),
+             "u11", "write", "UART::write", "method", 1, 1, 0, 1, "void write(char c)", "", None),
         ])
         results = search_symbols(populated_db, "spi* write*", "hash-deadbeef")
         assert len(results) == 1
@@ -314,11 +314,11 @@ class TestSearchSymbols:
             ("hash-deadbeef", file_id, "lib/ble/ble.cpp",
              split_tokens("onConnectionComplete", "ZBLE::onConnectionComplete"),
              "u20", "onConnectionComplete", "ZBLE::onConnectionComplete",
-             "method", 1, 1, 0, 1, "void onConnectionComplete()", ""),
+             "method", 1, 1, 0, 1, "void onConnectionComplete()", "", None),
             ("hash-deadbeef", file_id, "lib/ble/ble.cpp",
              split_tokens("startAdvertising", "ZBLE::startAdvertising"),
              "u21", "startAdvertising", "ZBLE::startAdvertising",
-             "method", 2, 1, 0, 1, "void startAdvertising()", ""),
+             "method", 2, 1, 0, 1, "void startAdvertising()", "", None),
         ])
         # connect* must find onConnectionComplete via name_tokens = "on connection complete"
         results = search_symbols(populated_db, "connect*", "hash-deadbeef")
@@ -335,7 +335,7 @@ class TestSearchSymbols:
         rows_data = [
             ("hash-deadbeef", file_id, "src/limit.cpp",
              split_tokens(f"func{i}", f"ns::func{i}"),
-             f"u{i}", f"func{i}", f"ns::func{i}", "function", i, 1, 0, 1, f"void func{i}()", "")
+             f"u{i}", f"func{i}", f"ns::func{i}", "function", i, 1, 0, 1, f"void func{i}()", "", None)
             for i in range(10)
         ]
         insert_symbols_batch(populated_db, rows_data)
@@ -398,9 +398,9 @@ class TestRefs:
         fid = upsert_file(db, "hash-deadbeef", "/tmp/app.cpp", "cpp")
         insert_symbols_batch(db, [
             ("hash-deadbeef", fid, "src/modem.cpp", split_tokens("modem_init", "modem_init"),
-             "U_callee", "modem_init", "modem_init", "function", 10, 1, 0, 1, "void modem_init()", ""),
+             "U_callee", "modem_init", "modem_init", "function", 10, 1, 0, 1, "void modem_init()", "", None),
             ("hash-deadbeef", fid, "src/app.cpp", split_tokens("app_run", "App::app_run"),
-             "U_caller", "app_run", "App::app_run", "method", 50, 1, 0, 1, "void app_run()", ""),
+             "U_caller", "app_run", "App::app_run", "method", 50, 1, 0, 1, "void app_run()", "", None),
         ])
 
     def test_count_refs_empty(self, populated_db):
@@ -461,6 +461,119 @@ class TestRefs:
         self._setup_symbols(populated_db)
         rows = find_refs(populated_db, "hash-deadbeef", "nonexistent")
         assert rows == []
+
+
+class TestEnumValue:
+    """Enum constant values are stored and returned."""
+
+    def test_enum_constant_with_value(self, populated_db):
+        file_id = upsert_file(populated_db, "hash-deadbeef", "/tmp/cmd.h", "cpp")
+        insert_symbols_batch(populated_db, [
+            ("hash-deadbeef", file_id, "src/ble_cmd.h",
+             split_tokens("StatusCode", "zbox::BleCmd::StatusCode"),
+             "U_enum", "StatusCode", "zbox::BleCmd::StatusCode", "enum",
+             19, 1, 36, 1, "", "", None),
+            ("hash-deadbeef", file_id, "src/ble_cmd.h",
+             split_tokens("TOKEN_INVALID", "zbox::BleCmd::StatusCode::TOKEN_INVALID"),
+             "U_tok_inv", "TOKEN_INVALID", "zbox::BleCmd::StatusCode::TOKEN_INVALID",
+             "enum_constant", 23, 1, 0, 1, "", "", -2),
+            ("hash-deadbeef", file_id, "src/ble_cmd.h",
+             split_tokens("OPERATION_SUCCESSFUL", "zbox::BleCmd::StatusCode::OPERATION_SUCCESSFUL"),
+             "U_ok", "OPERATION_SUCCESSFUL", "zbox::BleCmd::StatusCode::OPERATION_SUCCESSFUL",
+             "enum_constant", 21, 1, 0, 1, "", "", 1),
+            ("hash-deadbeef", file_id, "src/ble_cmd.h",
+             split_tokens("DEVICE_ERROR", "zbox::BleCmd::StatusCode::DEVICE_ERROR"),
+             "U_dev_err", "DEVICE_ERROR", "zbox::BleCmd::StatusCode::DEVICE_ERROR",
+             "enum_constant", 28, 1, 0, 1, "", "", -7),
+        ])
+
+        # Verify enum_value is stored and retrievable
+        row = populated_db.execute(
+            "SELECT name, enum_value FROM symbols WHERE usr=?", ("U_tok_inv",)
+        ).fetchone()
+        assert row["name"] == "TOKEN_INVALID"
+        assert row["enum_value"] == -2
+
+        # Verify NULL for non-enum_constant (enum itself)
+        row_enum = populated_db.execute(
+            "SELECT enum_value FROM symbols WHERE usr=?", ("U_enum",)
+        ).fetchone()
+        assert row_enum["enum_value"] is None
+
+    def test_get_file_map_groups_by_parent_enum(self, populated_db):
+        file_id = upsert_file(populated_db, "hash-deadbeef", "/tmp/cmd.h", "cpp")
+        insert_symbols_batch(populated_db, [
+            ("hash-deadbeef", file_id, "src/ble_cmd.h",
+             split_tokens("StatusCode", "zbox::BleCmd::StatusCode"),
+             "U_enum", "StatusCode", "zbox::BleCmd::StatusCode", "enum",
+             19, 1, 0, 1, "", "", None),
+            ("hash-deadbeef", file_id, "src/ble_cmd.h",
+             split_tokens("TOKEN_INVALID", "zbox::BleCmd::StatusCode::TOKEN_INVALID"),
+             "U_tok_inv", "TOKEN_INVALID", "zbox::BleCmd::StatusCode::TOKEN_INVALID",
+             "enum_constant", 23, 1, 0, 1, "", "", -2),
+            ("hash-deadbeef", file_id, "src/ble_cmd.h",
+             split_tokens("OPERATION_SUCCESSFUL", "zbox::BleCmd::StatusCode::OPERATION_SUCCESSFUL"),
+             "U_ok", "OPERATION_SUCCESSFUL", "zbox::BleCmd::StatusCode::OPERATION_SUCCESSFUL",
+             "enum_constant", 21, 1, 0, 1, "", "", 1),
+            ("hash-deadbeef", file_id, "src/ble_cmd.h",
+             split_tokens("State", "zbox::BleCmd::State"),
+             "U_state", "State", "zbox::BleCmd::State", "enum",
+             90, 1, 0, 1, "", "", None),
+            ("hash-deadbeef", file_id, "src/ble_cmd.h",
+             split_tokens("Idle", "zbox::BleCmd::State::Idle"),
+             "U_idle", "Idle", "zbox::BleCmd::State::Idle",
+             "enum_constant", 92, 1, 0, 1, "", "", 0),
+        ])
+
+        from fw_context_mcp.indexer.db import get_file_map
+        result = get_file_map(populated_db, "hash-deadbeef", "src/ble_cmd.h", max_per_kind=0)
+
+        enum_const = result["symbols"]["enum_constant"]
+        assert enum_const["count"] == 3
+        assert "subgroups" in enum_const
+        assert len(enum_const["subgroups"]) == 2
+
+        # Find StatusCode subgroup
+        subgroups_by_name = {s["name"]: s for s in enum_const["subgroups"]}
+        assert "zbox::BleCmd::StatusCode" in subgroups_by_name
+        sc = subgroups_by_name["zbox::BleCmd::StatusCode"]
+        assert sc["count"] == 2
+        assert len(sc["constants"]) == 2
+        # Verify constants include name, qualified_name, line, and enum_value
+        sc_names = {c["name"] for c in sc["constants"]}
+        assert sc_names == {"OPERATION_SUCCESSFUL", "TOKEN_INVALID"}
+        for c in sc["constants"]:
+            assert "enum_value" in c
+            assert "qualified_name" in c
+            assert "line" in c
+        tok_const = next(c for c in sc["constants"] if c["name"] == "TOKEN_INVALID")
+        assert tok_const["enum_value"] == -2
+
+        # State subgroup
+        st = subgroups_by_name["zbox::BleCmd::State"]
+        assert st["count"] == 1
+        idle = st["constants"][0]
+        assert idle["name"] == "Idle"
+        assert idle["enum_value"] == 0
+
+    def test_enum_constant_searchable_by_name(self, populated_db):
+        """Enum constants remain searchable by name via FTS5."""
+        file_id = upsert_file(populated_db, "hash-deadbeef", "/tmp/cmd.h", "cpp")
+        insert_symbols_batch(populated_db, [
+            ("hash-deadbeef", file_id, "src/ble_cmd.h",
+             split_tokens("TOKEN_INVALID", "zbox::BleCmd::StatusCode::TOKEN_INVALID"),
+             "U_tok_inv", "TOKEN_INVALID", "zbox::BleCmd::StatusCode::TOKEN_INVALID",
+             "enum_constant", 23, 1, 0, 1, "", "", -2),
+            ("hash-deadbeef", file_id, "src/ble_cmd.h",
+             split_tokens("OPERATION_SUCCESSFUL", "zbox::BleCmd::StatusCode::OPERATION_SUCCESSFUL"),
+             "U_ok", "OPERATION_SUCCESSFUL", "zbox::BleCmd::StatusCode::OPERATION_SUCCESSFUL",
+             "enum_constant", 21, 1, 0, 1, "", "", 1),
+        ])
+
+        results = search_symbols(populated_db, "TOKEN", "hash-deadbeef")
+        assert len(results) == 1
+        assert results[0]["name"] == "TOKEN_INVALID"
+        assert results[0]["enum_value"] == -2
 
 
 class TestIntegrityCheck:

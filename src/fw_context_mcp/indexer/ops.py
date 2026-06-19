@@ -116,6 +116,7 @@ def store_symbols_for_unit(
                 int(s.is_definition),
                 s.signature,
                 s.docstring,
+                s.enum_value,
             ))
         total_syms = insert_symbols_batch(conn, rows)
 
