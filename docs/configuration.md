@@ -82,7 +82,9 @@ num_ctx = 8192
 # debug_log = "~/.fw-context/llm-debug.jsonl"
 ```
 
-### Zephyr
+### Per-project config (`<project>/.fw-context/config.toml`)
+
+#### Zephyr
 
 ```toml
 [project]
@@ -102,7 +104,7 @@ exclude_paths = ["build", "BUILD"]
 # enabled = false                        # set false if you don't use Ollama
 ```
 
-### PlatformIO / Arduino
+#### PlatformIO / Arduino
 
 ```toml
 [project]
@@ -121,7 +123,7 @@ source_roots = [
 exclude_paths = [".pio", "build", "BUILD"]
 ```
 
-### Mbed OS
+#### Mbed OS
 
 ```toml
 [project]
