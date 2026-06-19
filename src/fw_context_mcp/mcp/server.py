@@ -939,6 +939,7 @@ def get_file_map(
 def get_symbol_context(
     name: Annotated[str, Field(description="Symbol name. Returns body, signature, all direct callers and callees.")],
     project_root: Annotated[str | None, Field(description="Project root. Auto-detected if omitted.")] = None,
+    project_only: Annotated[bool, Field(description="When True (default), filters callers and callees to project paths (excludes SDK/vendor).")] = True,
 ) -> dict:
     """Read-only. Rich one-shot context for a symbol: body, signature, all direct
     callers and callees. Answers "what does this do and how does it fit in the
@@ -946,6 +947,9 @@ def get_symbol_context(
 
     For body-only use get_source (faster). For transitive call-graph exploration
     use find_all_callers_recursive or find_callees_recursive.
+
+    By default, SDK/vendor callers and callees are filtered out for clarity.
+    Use ``project_only=False`` to see all callers/callees.
 
     Returns dict with: name, qualified_name, kind, file, line, signature,
     is_definition, callers (list), callees (list), source (body text).
@@ -969,6 +973,9 @@ def get_symbol_context(
             file_path = abs_path(root, row["file_path"])
             symbol_usr = row["usr"]
 
+            # Build SDK exclude patterns for project filtering
+            sdk_excludes = _build_sdk_excludes(root) if project_only else []
+
             # Immediate callers (who calls this symbol, direct + indirect)
             callers = find_refs(conn, config_hash, name, ref_kind=["call", "indirect"])
             callers_list = [
@@ -977,6 +984,9 @@ def get_symbol_context(
                  "line": c["from_line"], "kind": c["caller_kind"] or "",
                  "ref_kind": c["ref_kind"]}
                 for c in callers
+                if not sdk_excludes or not any(
+                    _path_matches(c["caller_file"] or c["from_file"], p) for p in sdk_excludes
+                )
             ]
 
             # Immediate callees (what this symbol calls, direct + indirect)
@@ -993,7 +1003,26 @@ def get_symbol_context(
                  "kind": c["kind"], "file": abs_path(root, c["file_path"]),
                  "ref_kind": c["ref_kind"]}
                 for c in callees_rows
+                if not sdk_excludes or not any(
+                    _path_matches(c["file_path"], p) for p in sdk_excludes
+                )
             ]
+
+            # Fallback: if project filtering removed everything, show all
+            if project_only and not callers_list and not callees_list:
+                callers_list = [
+                    {"name": c["caller_name"] or "?", "qualified_name": c["caller_qname"] or "",
+                     "file": abs_path(root, c["caller_file"] or c["from_file"]),
+                     "line": c["from_line"], "kind": c["caller_kind"] or "",
+                     "ref_kind": c["ref_kind"]}
+                    for c in callers
+                ]
+                callees_list = [
+                    {"name": c["name"], "qualified_name": c["qualified_name"] or "",
+                     "kind": c["kind"], "file": abs_path(root, c["file_path"]),
+                     "ref_kind": c["ref_kind"]}
+                    for c in callees_rows
+                ]
 
             # For enums, collect all constants with their values
             enum_constants: list[dict] = []
@@ -1260,6 +1289,57 @@ def find_callees_recursive(
         conn.close()
 
 
+# ── Shared helpers for SDK path filtering ──────────────────────────────────
+
+
+def _path_matches(file_path: str, pattern: str) -> bool:
+    """Check if *file_path* matches a SQL LIKE pattern (supports % wildcard)."""
+    import fnmatch
+    # Convert SQL LIKE pattern to fnmatch pattern: % → *
+    fn_pattern = pattern.replace("%", "*")
+    # Match against the path itself, and also against any containing directory
+    return fnmatch.fnmatch(file_path, fn_pattern) or fnmatch.fnmatch(
+        "/" + file_path, "*/" + fn_pattern
+    )
+
+
+def _build_sdk_excludes(root: Path) -> list[str]:
+    """Build default SDK exclude patterns from build system type."""
+    build_system = _detect_build_system(root)
+    excludes: list[str] = []
+    if build_system == "mbed-os":
+        excludes.append("mbed-os/%")
+    elif build_system == "platformio":
+        excludes.extend([".pio/%", "%.platformio/%"])
+    elif build_system == "zephyr":
+        excludes.extend(["zephyr/%", "build/%", "modules/%"])
+    return excludes
+
+
+def _merge_excludes(exclude_paths: list[str] | None, project_only: bool, root: Path) -> list[str] | None:
+    """Merge auto-SDK + config + user exclude patterns. Returns None if empty."""
+    if not project_only:
+        return exclude_paths  # pass through as-is
+
+    effective: list[str] = list(_build_sdk_excludes(root))
+    try:
+        cfg = load_config(project_root=root)
+        effective.extend(cfg.index.exclude_paths)
+    except Exception:
+        pass
+    if exclude_paths:
+        effective.extend(exclude_paths)
+
+    # Deduplicate while preserving order
+    seen: set[str] = set()
+    final: list[str] = []
+    for p in effective:
+        if p not in seen:
+            seen.add(p)
+            final.append(p)
+    return final if final else None
+
+
 @mcp.tool()
 def find_dead_code(
     project_root: Annotated[str | None, Field(description="Project root. Auto-detected if omitted.")] = None,
@@ -1285,37 +1365,7 @@ def find_dead_code(
     if err:
         return err
 
-    # Build effective exclude list: config defaults + auto-SDK + user-supplied
-    effective_excludes: list[str] = []
-
-    if project_only:
-        # Auto-detect SDK paths from build system
-        build_system = _detect_build_system(root)
-        if build_system == "mbed-os":
-            effective_excludes.append("mbed-os/%")
-        elif build_system == "platformio":
-            effective_excludes.extend([".pio/%", "%.platformio/%"])
-        elif build_system == "zephyr":
-            effective_excludes.extend(["zephyr/%", "build/%", "modules/%"])
-
-        # Apply project config exclude_paths
-        try:
-            cfg = load_config(project_root=root)
-            effective_excludes.extend(cfg.index.exclude_paths)
-        except Exception:
-            pass
-
-    # Merge user-supplied excludes (append, don't replace)
-    if exclude_paths:
-        effective_excludes.extend(exclude_paths)
-
-    # Deduplicate while preserving order
-    seen: set[str] = set()
-    final_excludes = []
-    for p in effective_excludes:
-        if p not in seen:
-            seen.add(p)
-            final_excludes.append(p)
+    final_excludes = _merge_excludes(exclude_paths, project_only, root)
 
     db_path = _db_path(root)
     conn, open_err = _open_db_safe(db_path)
@@ -1324,7 +1374,7 @@ def find_dead_code(
     try:
         rows = index_db.find_dead_code(
             conn, config_hash, limit=limit,
-            exclude_paths=final_excludes if final_excludes else None,
+            exclude_paths=final_excludes,
         )
         if not rows:
             return [{"info": "No dead code found — every defined function has at least one caller."}]
@@ -1531,6 +1581,8 @@ def trace_data_flow(
 def find_hotspots(
     project_root: Annotated[str | None, Field(description="Project root. Auto-detected if omitted.")] = None,
     limit: Annotated[int, Field(description="Number of top-called functions to return (default 20).")] = 20,
+    project_only: Annotated[bool, Field(description="When True (default), auto-excludes SDK/vendor paths so hotspots reflect project code.")] = True,
+    exclude_paths: Annotated[list[str] | None, Field(description="Additional LIKE patterns to exclude. Merged with defaults. E.g. ['lib/%'].")] = None,
 ) -> list[dict]:
     """Read-only. Find the most-called functions ranked by caller count.
 
@@ -1539,6 +1591,9 @@ def find_hotspots(
     "architectural weight" — good targets for refactoring, optimization,
     or extra testing.
 
+    By default, SDK/vendor paths are auto-excluded. Use ``project_only=False``
+    to see all results including vendor code.
+
     Requires the reference index (``fw-context index`` — refs on by default).
     For the callers of a specific hotspot, follow up with ``find_callers``
     or ``find_all_callers_recursive``.
@@ -1546,12 +1601,18 @@ def find_hotspots(
     root, config_hash, err = _refs_guard(project_root)
     if err:
         return err
+
+    final_excludes = _merge_excludes(exclude_paths, project_only, root)
+
     db_path = _db_path(root)
     conn, open_err = _open_db_safe(db_path)
     if open_err:
         return [open_err]
     try:
-        rows = index_db.find_hotspots(conn, config_hash, limit=limit)
+        rows = index_db.find_hotspots(conn, config_hash, limit=limit, exclude_paths=final_excludes)
+        if not rows and final_excludes:
+            # Nothing found with project filter — try without
+            rows = index_db.find_hotspots(conn, config_hash, limit=limit, exclude_paths=None)
         if not rows:
             return [{"info": "No references indexed — enable index_refs and re-index."}]
         return rows
