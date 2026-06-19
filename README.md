@@ -1,11 +1,9 @@
 # fw-context
-<!-- mcp-name: io.github.turbyho/fw-context-mcp -->
 mcp-name: io.github.turbyho/fw-context-mcp
 
 [![Python](https://img.shields.io/badge/python-3.11+-blue.svg)](https://python.org)
 [![MCP](https://img.shields.io/badge/MCP-2024--11--05-green.svg)](https://modelcontextprotocol.io)
 [![License](https://img.shields.io/badge/license-MIT-yellow.svg)](LICENSE)
-[![Tests](https://img.shields.io/badge/tests-135%20passed-brightgreen.svg)](tests/)
 [![Glama](https://glama.ai/mcp/servers/turbyho/fw-context-mcp/badges/score.svg)](https://glama.ai/mcp/servers/turbyho/fw-context-mcp)
 
 **MCP server for embedded C/C++ firmware** — gives AI assistants (Claude Code,
@@ -44,22 +42,28 @@ from `compile_commands.json` — `#ifdef`-aware, not grep.
 
 #### Prerequisites
 
-| | Linux (apt) | macOS (brew) |
-|---|---|---|
-| Python 3.11+ | `sudo apt install python3` | `brew install python@3.12` |
-| uv | `curl -LsSf https://astral.sh/uv/install.sh \| sh` | `brew install uv` |
-| bear | `sudo apt install bear` | `brew install bear` |
-| libclang | `sudo apt install libclang-dev` | `brew install llvm` |
-| Ollama *(optional)* | `curl -fsSL https://ollama.com/install.sh \| sh` | `brew install ollama` |
-
-#### Linux
+| Component | Linux (apt) | macOS (brew) |
+|-----------|-------------|--------------|
+| Python 3.11+ | `python3` | `python` |
+| uv | `uv` | `uv` |
+| bear | `bear` | `bear` |
+| libclang | `libclang-dev` | `llvm` |
+| Ollama *(optional)* | `ollama` | `ollama` |
 
 ```bash
-git clone git@github.com:turbyho/fw-context-mcp.git ~/.fw-context/src
-cd ~/.fw-context/src && make install
-```
+# Linux
+sudo apt install python3 bear libclang-dev
 
-#### macOS
+# macOS
+brew install python bear llvm
+
+# Both — uv
+curl -LsSf https://astral.sh/uv/install.sh | sh
+
+# Both — Ollama (optional)
+curl -fsSL https://ollama.com/install.sh | sh   # Linux
+brew install ollama                               # macOS
+```
 
 ```bash
 git clone git@github.com:turbyho/fw-context-mcp.git ~/.fw-context/src
@@ -69,20 +73,8 @@ cd ~/.fw-context/src && make install
 ### 2. Ollama (optional)
 
 Powers `smart_search` (natural-language search) and `explain_symbol`.
-Works without Ollama too — the AI assistant processes results on its own.
-
-```bash
-# Install
-curl -fsSL https://ollama.com/install.sh | sh   # Linux
-brew install ollama                               # macOS
-
-# Pull models
-ollama pull qwen2.5-coder:14b          # LLM (~9 GB VRAM, or :7b for 4 GB)
-ollama pull mxbai-embed-large:latest   # embedding model for vector search
-
-# Start daemon
-ollama serve &
-```
+Works without it — the AI assistant processes results on its own.
+See the [installation guide](docs/installation.md) for detailed setup.
 
 ### 3. Register with your AI assistant
 
@@ -144,53 +136,39 @@ Use **clangd for editing**, **fw-context for AI-assisted exploration**.
 
 ### Data flow
 
-```
-   BUILD                          INDEX                          QUERY
-   =====                          =====                          =====
-   bear / west / pio    libclang parses each TU          AI assistant calls
-   cmake / make         extracts symbols + refs          MCP tools over
-        │               generates embeddings            JSON-RPC (stdio)
-        ▼                       │                              │
-   compile_commands      SQLite db on disk               lookup_symbol(…)
-   .json                 ~/.fw-context/index/            search_code(…)
-                         │            │                  find_callers(…)
-                         ▼            ▼                  explain_symbol(…)
-                    symbols + refs   vec0                 get_symbol_context(…)
-                    (FTS5 index)   (vector KNN)                 │
-                                                          ▼
-                                                    AI assistant answers
-                                                    your question about
-                                                    the code
+```mermaid
+graph TB
+    subgraph BUILD["Build"]
+        build[Bear / West / PIO<br/>cmake / make]
+        cc[(compile_commands.json)]
+        build --> cc
+    end
+    subgraph INDEX["Index"]
+        libclang[libclang parses each TU<br/>extracts symbols + refs<br/>generates embeddings]
+        db[(SQLite on disk<br/>~/.fw-context/index/)]
+        cc --> libclang
+        libclang --> db
+    end
+    subgraph QUERY["Query"]
+        mcp[MCP tools<br/>JSON-RPC stdio]
+        ai[AI assistant answers<br/>your question about the code]
+        mcp --> ai
+    end
+    db --> mcp
 ```
 
 ### Components
 
-```
-   CLI (fw-context)            MCP server (fw-context-mcp)          Ollama (optional)
-   ================            ===========================          ==================
-   fw-context index            exposes 21 tools over               local LLM runtime
-   fw-context export           JSON-RPC (stdio)                    HTTP :11434
-   fw-context watch                  │                                  │
-   fw-context status           search_code ───────────── lookup   smart_search ──▶ translates NL → FTS5 terms
-   fw-context reset            lookup_symbol ─────────── prefix   explain_symbol ─▶ explains function
-   fw-context init             smart_search ──────────── NL       embeddings ────▶ mxbai-embed-large
-   fw-context search           get_file_map ──────────── file structure by kind
-                               get_source ────────────── body
-                               get_symbol_context ────── body+callers+callees
-                               find_callers ──────────── direct callers
-                               find_references ───────── all uses
-                               find_call_path ────────── BFS in call graph
-                               find_all_callers_recursive  transitive callers
-                               find_callees_recursive ── transitive callees
-                               find_dead_code ────────── never called
-                               find_hotspots ─────────── most-called
-                               find_wrapper_callers ──── wrapper→driver
-                               trace_data_flow ───────── data flow paths
-                               get_active_build ──────── index health
-                               reindex_file ──────────── re-parse one file
-                               reset_index ───────────── delete + rebuild
-                               list_projects ─────────── all indexed projects
-                               check_ollama ──────────── verify LLM
+```mermaid
+graph LR
+    cli[CLI: fw-context<br/>index, export, watch, status]
+    server[MCP Server: fw-context-mcp<br/>21 tools across search, source,<br/>graph, and maintenance categories]
+    ollama[Ollama<br/>optional]
+    db[(SQLite + FTS5<br/>+ vec0 + refs)]
+
+    cli -->|writes| db
+    server -->|reads| db
+    ollama -->|HTTP| server
 ```
 
 | Component | Runs as | Purpose |
@@ -200,7 +178,7 @@ Use **clangd for editing**, **fw-context for AI-assisted exploration**.
 | **MCP server** (`fw-context-mcp`) | Subprocess (AI assistant) | 21 tools over JSON-RPC — search, graph, source, maintenance |
 | **Ollama** *(optional)* | Local daemon | NL search, symbol explanation, embedding generation |
 
-## Key capabilities
+## Features
 
 - **Fast lookups** — FTS5 full-text search, prefix/exact symbol lookup, call-graph traversal
 - **Natural-language search** — *"how does the modem connect?"* → finds `network_registration`, `modem_attach`, … (Ollama, optional)
