@@ -445,11 +445,15 @@ Input:  {"project_root?": "/path/to/project"}
 Output: {"config_hash": "a1b2…", "project_id": "c3d4…", "project_root": "/path/to/project",
          "build_system": "zephyr", "compile_commands": "/path/build/compile_commands.json",
          "indexed_at": "2026-06-05T09:35:18", "symbol_count": 12430, "file_count": 1502,
-         "reference_count": 8900, "modified_files_count": 3, "stale": true}
+         "reference_count": 8900, "modified_files_count": 3,
+         "schema_version": 84935291, "current_schema": 84935291, "stale": false}
 ```
 
-`stale: true` when `compile_commands.json` changed or any indexed source file
-has a newer on-disk mtime.
+`stale: true` when:
+- `compile_commands.json` changed since the index was built, or
+- any indexed source file has a newer on-disk mtime, or
+- `schema_version < current_schema` — the index was built with an older
+  DB schema; re-index to populate columns added by migrations.
 
 #### `reindex_file`
 

@@ -202,6 +202,8 @@ def _count_modified_files(conn, config_hash: str, root: Path) -> int:
         path = r["path"]
         stored = r["mtime"]
         if not stored:
+            # mtime=0 from a pre-migration database — unknown, treat as stale
+            modified += 1
             continue
         p = Path(path)
         if not p.is_absolute():
@@ -496,10 +498,11 @@ def list_projects(
             try:
                 with conn:
                     rows = get_all_projects(conn)
+                    db_schema_ver = get_db_schema_version(conn)
             finally:
                 conn.close()
             for r in rows:
-                stale = _is_stale(
+                cc_stale = _is_stale(
                     {"created_at": r["created_at"]},
                     r["compile_commands_path"],
                 ) if r["compile_commands_path"] else False
@@ -512,7 +515,9 @@ def list_projects(
                     "symbol_count": r["symbol_count"],
                     "file_count": r["file_count"],
                     "indexed_at": r["created_at"],
-                    "stale": stale,
+                    "schema_version": db_schema_ver,
+                    "current_schema": CURRENT_SCHEMA_VERSION,
+                    "stale": cc_stale or db_schema_ver < CURRENT_SCHEMA_VERSION,
                     "db": str(db_path),
                 })
         except Exception as e:
