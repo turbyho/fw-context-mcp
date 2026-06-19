@@ -43,7 +43,23 @@ log = logging.getLogger(__name__)
 
 mcp = FastMCP(
     "fw-context",
-    instructions="Build-aware code intelligence index for embedded firmware (Mbed OS, Zephyr).",
+    instructions=(
+        "Primary interface for reading and navigating indexed C/C++ embedded code. "
+        "Prefer get_source, get_file_map, and get_symbol_context for reading symbols "
+        "and functions — they use libclang extents and understand build flags. Use "
+        "normal file reads for broader file context outside indexed symbols.\n\n"
+        "Start every session with get_active_build() to check index health.\n\n"
+        "Code reading: get_file_map (symbol table of contents) → get_source (function "
+        "body, fast) or get_symbol_context (body + callers + callees in one call).\n\n"
+        "Search: lookup_symbol (by exact/prefix name), search_code (by FTS5 keywords), "
+        "smart_search (natural language via Ollama, slow).\n\n"
+        "Call graph (refs must be indexed): find_callers, find_call_path, "
+        "find_all_callers_recursive, find_callees_recursive, find_hotspots, "
+        "find_dead_code, find_wrapper_callers, trace_data_flow.\n\n"
+        "Maintenance: reindex_file (after editing a file), reset_index (destructive! "
+        "re-index from scratch), check_ollama (before smart_search/explain_symbol), "
+        "list_projects (discover indexed projects)."
+    ),
 )
 
 # ── Shared helpers ──────────────────────────────────────────────────────────
@@ -530,7 +546,7 @@ def reset_index(
     project_root: Annotated[str | None, Field(description="Project root. Auto-detected if omitted.")] = None,
     confirm: Annotated[bool, Field(description="Must be True to execute. Call without confirm first as dry-run.")] = False,
 ) -> dict:
-    """Delete the symbol index for a project so it can be re-indexed from scratch."""
+    """Not read-only — deletes the entire symbol index. Call without confirm=True first as dry-run. Re-index with 'fw-context index' afterwards."""
     root = resolve_project_root(project_root)
     db_path = _db_path(root)
     if not db_path.exists():
@@ -593,7 +609,7 @@ def reindex_file(
     file_path: Annotated[str, Field(description="Path to source file to re-parse. Must be in compile_commands.json.")],
     project_root: Annotated[str | None, Field(description="Project root. Auto-detected if omitted.")] = None,
 ) -> dict:
-    """Not read-only — mutates the index. Re-parses a single source file with libclang using the exact compiler flags from compile_commands.json and updates its symbols in the SQLite+FTS5 index. The file must be in compile_commands.json. Use after editing a file to keep the index current without rebuilding; use reset_index to rebuild from scratch."""
+    """Not read-only — re-parses a single source file with libclang using the exact compiler flags from compile_commands.json and updates its symbols in the SQLite+FTS5 index. The file must be in compile_commands.json. Use after editing a file to keep the index current without rebuilding; use reset_index to rebuild from scratch."""
     db_path, cfg, project_id, root = _resolve_context(project_root)
     if not db_path.exists():
         return {"error": f"No index found for {root}. Run 'fw-context index' first."}
@@ -758,11 +774,14 @@ def get_source(
     name: Annotated[str, Field(description="Fully qualified symbol name. Returns exact function body via libclang extent.")],
     project_root: Annotated[str | None, Field(description="Project root. Auto-detected if omitted.")] = None,
 ) -> dict:
-    """Return the source code of a symbol's definition — no LLM, fast.
+    """Read-only. Preferred way to read a function/method/enum body — uses libclang
+    for exact extents instead of guessing from line numbers. No LLM, fast.
 
     For enums, includes a ``constants`` array listing all member constants
-    with their names and integer values. Enum constants include their
-    ``enum_value`` field.
+    with their names and integer values.
+
+    For rich context (who calls this, what does it call) use
+    get_symbol_context instead. For the full file, use a normal file read.
     """
     db_path, cfg, project_id, root = _resolve_context(project_root)
     if not db_path.exists():
@@ -898,16 +917,16 @@ def get_symbol_context(
     name: Annotated[str, Field(description="Symbol name. Returns body, signature, all direct callers and callees.")],
     project_root: Annotated[str | None, Field(description="Project root. Auto-detected if omitted.")] = None,
 ) -> dict:
-    """Return the body, signature, callers, and callees of a symbol.
+    """Read-only. Rich one-shot context for a symbol: body, signature, all direct
+    callers and callees. Answers "what does this do and how does it fit in the
+    system?" in a single response.
 
-    Designed as rich LLM context — answers "what does this do and how does
-    it fit in the system?" in a single response.  Returns all direct callers
-    and callees (no artificial limit).  For transitive exploration use
-    ``find_all_callers_recursive`` / ``find_callees_recursive``.
+    For body-only use get_source (faster). For transitive call-graph exploration
+    use find_all_callers_recursive or find_callees_recursive.
 
-    For enums, includes a ``constants`` array listing all member constants
-    with their names and integer values. Enum constants include their
-    ``enum_value`` field.
+    Returns dict with: name, qualified_name, kind, file, line, signature,
+    is_definition, callers (list), callees (list), source (body text).
+    For enums also returns constants and enum_value.
     """
     db_path, cfg, project_id, root = _resolve_context(project_root)
     if not db_path.exists():
@@ -1042,7 +1061,7 @@ def find_callers(
     project_root: Annotated[str | None, Field(description="Project root. Auto-detected if omitted.")] = None,
     limit: Annotated[int, Field(description="Maximum results.")] = 50,
 ) -> list[dict]:
-    """Find call sites of a function/method — who calls ``name`` (direct + indirect via function pointers).
+    """Read-only. Find call sites of a function/method — who calls ``name`` (direct + indirect via function pointers).
 
     Use when you need a quick, flat list of immediate callers. For the full
     transitive call tree (who calls this indirectly through other functions),
@@ -1111,7 +1130,7 @@ def find_call_path(
     project_root: Annotated[str | None, Field(description="Project root. Auto-detected if omitted.")] = None,
     max_depth: Annotated[int, Field(description="Maximum BFS depth for path search (default 10).")] = 10,
 ) -> list[dict]:
-    """Find call paths between two functions via BFS in the call graph.
+    """Read-only. Find call paths between two functions via BFS in the call graph.
 
     Use to answer "how does A reach B?" — e.g. tracing how a high-level
     event handler eventually calls a low-level driver.  Returns up to 5
@@ -1146,7 +1165,7 @@ def find_all_callers_recursive(
     max_depth: Annotated[int, Field(description="Maximum BFS depth for transitive search (default 5).")] = 5,
     limit: Annotated[int, Field(description="Maximum results (default 50).")] = 50,
 ) -> list[dict]:
-    """Find all transitive callers — who calls *name*, directly or indirectly.
+    """Read-only. Find all transitive callers — who calls *name*, directly or indirectly.
 
     Use for impact analysis: "if I change this function, how far does the
     ripple go?"  Returns callers at depth 1 (direct), depth 2 (callers of
@@ -1180,7 +1199,7 @@ def find_callees_recursive(
     max_depth: Annotated[int, Field(description="Maximum BFS depth for transitive search (default 5).")] = 5,
     limit: Annotated[int, Field(description="Maximum results (default 50).")] = 50,
 ) -> list[dict]:
-    """Find all transitive callees — what *name* calls, directly or indirectly.
+    """Read-only. Find all transitive callees — what *name* calls, directly or indirectly.
 
     Use for dependency analysis: "what does this function depend on to do
     its job?"  Returns callees at depth 1 (direct), depth 2 (callees of
@@ -1213,7 +1232,7 @@ def find_dead_code(
     limit: Annotated[int, Field(description="Maximum results (default 100).")] = 100,
     exclude_paths: Annotated[list[str] | None, Field(description="File path LIKE patterns to exclude. E.g. ['mbed-os/%', 'zephyr/%'] for SDK paths. No default — pass explicitly to filter vendor noise.")] = None,
 ) -> list[dict]:
-    """Find functions/methods that are defined but never called.
+    """Read-only. Find functions/methods that are defined but never called.
 
     Use to spot unused code candidates.  Expect false positives:
     constructors called via factories or template instantiation, interrupt
@@ -1246,7 +1265,7 @@ def find_wrapper_callers(
     project_root: Annotated[str | None, Field(description="Project root. Auto-detected if omitted.")] = None,
     limit: Annotated[int, Field(description="Maximum wrapper method results (default 50).")] = 50,
 ) -> list[dict]:
-    """Find wrapper classes that call methods of a driver class.
+    """Read-only. Find wrapper classes that call methods of a driver class.
 
     Returns wrapper methods grouped by wrapper class, showing which driver
     methods each wrapper calls.  Useful for understanding the adapter/wrapper
@@ -1345,7 +1364,7 @@ def trace_data_flow(
     max_depth: Annotated[int, Field(description="Maximum call path depth (default 8).")] = 8,
     limit: Annotated[int, Field(description="Maximum source functions to trace (default 15).")] = 15,
 ) -> list[dict]:
-    """Trace how data of a given type flows to a target function.
+    """Read-only. Experimental. Trace how data of a given type flows to a target function.
 
     Finds functions whose signature mentions *type_name*, then looks for call
     paths from those functions to *to_symbol*.  Returns an approximate data
@@ -1435,7 +1454,7 @@ def find_hotspots(
     project_root: Annotated[str | None, Field(description="Project root. Auto-detected if omitted.")] = None,
     limit: Annotated[int, Field(description="Number of top-called functions to return (default 20).")] = 20,
 ) -> list[dict]:
-    """Find the most-called functions ranked by caller count.
+    """Read-only. Find the most-called functions ranked by caller count.
 
     Use for high-level impact assessment: changing a hotspot affects many
     call sites.  The result tells you which functions carry the most
@@ -1472,7 +1491,7 @@ def search_code(
     kind: Annotated[str | None, Field(description="Optional kind filter: function, method, class, struct, enum, typedef, variable, field, namespace.")] = None,
     limit: Annotated[int, Field(description="Maximum results (default 20, max 100).")] = 20,
 ) -> list[dict]:
-    """Full-text search over indexed symbols (functions, classes, methods, enums, etc.).
+    """Read-only. Full-text search over indexed symbols (functions, classes, methods, enums, etc.).
 
     Use when looking for symbols by topic or keyword rather than exact name.
     Prefer ``lookup_symbol`` when you already know the symbol name.
@@ -1573,7 +1592,7 @@ async def smart_search(
     project_root: Annotated[str | None, Field(description="Project root. Auto-detected if omitted.")] = None,
     limit: Annotated[int, Field(description="Maximum results (default 20, max 100).")] = 20,
 ) -> list[dict]:
-    """Natural-language search: Ollama generates FTS5 keywords, then searches the index.
+    """Read-only. Natural-language search: Ollama generates FTS5 keywords, then searches the index. Slow (10-30 s).
 
     Multi-phase approach:
     1) Translate non-English queries
