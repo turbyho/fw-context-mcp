@@ -20,6 +20,7 @@ from fw_context_mcp.indexer.db import (
     find_all_callers_recursive, find_callees_recursive,
     find_call_path, find_hotspots, find_dead_code,
     search_symbols, find_refs, get_file_map,
+    open_db,
 )
 
 _INDEX_ROOT = Path.home() / ".fw-context" / "index"
@@ -66,7 +67,7 @@ def run_tests(name, db_path):
     print(f"  {name}")
     print(f"{'='*60}")
 
-    conn = sqlite3.connect(str(db_path))
+    conn = open_db(db_path)
     conn.row_factory = sqlite3.Row
     ch = conn.execute(
         "SELECT config_hash FROM build_configs ORDER BY created_at DESC LIMIT 1"
