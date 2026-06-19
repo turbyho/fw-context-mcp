@@ -1134,15 +1134,28 @@ def find_hotspots(
     conn: sqlite3.Connection,
     config_hash: str,
     limit: int = 20,
+    exclude_paths: list[str] | None = None,
 ) -> list[dict]:
     """Find the most-called functions (hotspots) ranked by caller count.
 
     Only counts actual call edges (``ref_kind IN ('call', 'indirect')``) —
     plain references and member-access expressions are excluded so enum
     constants and fields don't appear as "hot" call targets.
+
+    When *exclude_paths* is given, symbols whose ``file_path`` matches any
+    of the LIKE patterns are excluded.
     """
+    path_clauses = ""
+    params: list = [config_hash]
+    if exclude_paths:
+        path_clauses = "AND " + " AND ".join(
+            "s.file_path NOT LIKE ?" for _ in exclude_paths
+        )
+        params.extend(exclude_paths)
+    params.append(limit)
+
     rows = conn.execute(
-        """SELECT s.name, s.qualified_name, s.kind, s.file_path,
+        f"""SELECT s.name, s.qualified_name, s.kind, s.file_path,
                   s.signature, s.line,
                   COUNT(r.rowid) AS caller_count
            FROM refs r
@@ -1150,10 +1163,11 @@ def find_hotspots(
            WHERE r.config_hash = ?
              AND s.is_definition = 1
              AND r.ref_kind IN ('call', 'indirect')
+             {path_clauses}
            GROUP BY s.usr
            ORDER BY caller_count DESC
            LIMIT ?""",
-        (config_hash, limit),
+        params,
     ).fetchall()
 
     return [dict(r) for r in rows]
