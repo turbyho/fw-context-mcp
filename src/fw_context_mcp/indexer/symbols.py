@@ -84,6 +84,7 @@ class Symbol:
     docstring: str           # raw comment above the symbol
     usr: str                 # libclang Unified Symbol Resolution
     end_line: int = 0        # last line of the definition extent (0 if unknown)
+    enum_value: int | None = None  # value of enum constant (ENUM_CONSTANT_DECL only)
 
 
 def _cursor_kind_label(kind: cx.CursorKind) -> str:
@@ -313,6 +314,14 @@ def extract_all(
         if not usr:
             continue
 
+        # Extract enum constant value (signed int, works for negative values too)
+        enum_val: int | None = None
+        if cursor.kind == cx.CursorKind.ENUM_CONSTANT_DECL:
+            try:
+                enum_val = cursor.enum_value
+            except Exception:
+                enum_val = None
+
         prev = seen_usrs.get(usr)
         if prev is not None:
             if is_def and not prev:
@@ -334,6 +343,7 @@ def extract_all(
             docstring=_docstring(cursor),
             usr=usr,
             end_line=_end_line(cursor, loc),
+            enum_value=enum_val,
         ))
 
     if not with_refs:

@@ -226,6 +226,12 @@ def open_db(path: Path) -> sqlite3.Connection:
             )
             conn.commit()
 
+        # Migration: enum_value column in symbols (enum constant values)
+        sym_cols = [r[1] for r in conn.execute("PRAGMA table_info(symbols)").fetchall()]
+        if "enum_value" not in sym_cols:
+            conn.execute("ALTER TABLE symbols ADD COLUMN enum_value INTEGER")
+            conn.commit()
+
         # Migration: rebuild FTS5 + triggers if name_tokens column is missing
         fts_cols = [r[1] for r in conn.execute("PRAGMA table_info(symbols_fts)").fetchall()]
         if "name_tokens" not in fts_cols:
@@ -374,15 +380,15 @@ def insert_symbols_batch(
 
     Each row: (config_hash, file_id, file_path, name_tokens, usr, name,
                qualified_name, kind, line, col, end_line, is_definition,
-               signature, docstring)
+               signature, docstring, enum_value)
 
     Returns count of rows inserted or upgraded to definition.
     """
     cur = conn.executemany(
         """INSERT INTO symbols
            (config_hash, file_id, file_path, name_tokens, usr, name, qualified_name, kind,
-            line, col, end_line, is_definition, signature, docstring)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            line, col, end_line, is_definition, signature, docstring, enum_value)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
            ON CONFLICT(config_hash, usr) DO UPDATE SET
                file_id       = excluded.file_id,
                file_path     = excluded.file_path,
@@ -392,7 +398,8 @@ def insert_symbols_batch(
                end_line      = excluded.end_line,
                is_definition = 1,
                signature     = excluded.signature,
-               docstring     = excluded.docstring
+               docstring     = excluded.docstring,
+               enum_value    = excluded.enum_value
            WHERE excluded.is_definition = 1 AND symbols.is_definition = 0""",
         rows,
     )
@@ -1268,7 +1275,7 @@ def get_file_map(
     """
     rows = conn.execute(
         """SELECT name, qualified_name, kind, line, col, end_line,
-                  is_definition, signature
+                  is_definition, signature, enum_value
            FROM symbols
            WHERE config_hash = ? AND file_path = ?
            ORDER BY kind, line""",
@@ -1278,7 +1285,7 @@ def get_file_map(
     if not rows:
         rows = conn.execute(
             """SELECT name, qualified_name, kind, line, col, end_line,
-                      is_definition, signature
+                      is_definition, signature, enum_value
                FROM symbols
                WHERE config_hash = ? AND file_path LIKE ?
                ORDER BY kind, line""",
@@ -1291,15 +1298,45 @@ def get_file_map(
         if kind not in groups:
             groups[kind] = {"count": 0, "items": []}
         groups[kind]["count"] += 1
-        if max_per_kind == 0 or len(groups[kind]["items"]) < max_per_kind:
-            entry: dict = {
-                "name": r["name"],
-                "qualified_name": r["qualified_name"],
-                "line": r["line"],
-            }
-            if signatures and r["signature"]:
-                entry["signature"] = r["signature"]
-            groups[kind]["items"].append(entry)
+
+        if kind == "enum_constant":
+            # Group by parent enum: extract everything before last "::"
+            qn = r["qualified_name"] or ""
+            if "::" in qn:
+                parent_enum = qn.rsplit("::", 1)[0]
+            else:
+                parent_enum = "(anonymous)"
+            # Initialize subgroup dict — stored in a special key on the kind group
+            subgroups = groups[kind].setdefault("_subgroups", {})
+            if parent_enum not in subgroups:
+                subgroups[parent_enum] = {"name": parent_enum, "count": 0, "constants": []}
+            subgroups[parent_enum]["count"] += 1
+            if max_per_kind == 0 or subgroups[parent_enum]["count"] <= max_per_kind:
+                entry: dict = {
+                    "name": r["name"],
+                    "qualified_name": r["qualified_name"],
+                    "line": r["line"],
+                }
+                if r["enum_value"] is not None:
+                    entry["enum_value"] = r["enum_value"]
+                subgroups[parent_enum]["constants"].append(entry)
+        else:
+            if max_per_kind == 0 or len(groups[kind]["items"]) < max_per_kind:
+                entry: dict = {
+                    "name": r["name"],
+                    "qualified_name": r["qualified_name"],
+                    "line": r["line"],
+                }
+                if signatures and r["signature"]:
+                    entry["signature"] = r["signature"]
+                groups[kind]["items"].append(entry)
+
+    # Convert enum_constant subgroups from dict to sorted list
+    for group in groups.values():
+        if "_subgroups" in group:
+            group["subgroups"] = sorted(
+                group.pop("_subgroups").values(), key=lambda g: g["name"]
+            )
 
     return {
         "file": file_path,

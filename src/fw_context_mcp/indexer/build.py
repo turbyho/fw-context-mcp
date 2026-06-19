@@ -31,9 +31,10 @@ class BuildConfig:
     # Mbed OS overrides (auto-detected from .mbed / custom_targets.json)
     target: str | None = None
     toolchain: str | None = None
-    profile: str = "Develop"
+    profile: str = "develop"
     app_config: str = "mbed_app.json"
     extra_profiles: list[str] = field(default_factory=lambda: ["lto.json"])
+    defines: list[str] = field(default_factory=list)  # extra -D flags for the compiler
 
     # Zephyr override (required, no safe auto-detection)
     board: str | None = None
@@ -159,6 +160,9 @@ def _build_mbed_os(project_root: Path, cfg: BuildConfig) -> Path:
 
     for ep in _resolve_mbed_extra_profiles(project_root, cfg.extra_profiles):
         cmd += ["--profile", ep]
+
+    for d in cfg.defines:
+        cmd += ["-D", d]
 
     if cfg.clean:
         cmd.append("--clean")
