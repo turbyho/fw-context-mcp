@@ -56,8 +56,89 @@ def split_tokens(name: str, qualified_name: str = "") -> str:
                     tokens.append(tok)
     return " ".join(tokens)
 
-CURRENT_SCHEMA_VERSION = 1  # bump when the schema changes — triggers re-index hint in get_active_build()
+def _parse_expected_columns(schema_sql: str, migration_statements: list[str]) -> dict[str, set[str]]:
+    """Extract expected table→columns from CREATE TABLE and ALTER TABLE statements.
 
+    Parses the ``_SCHEMA`` SQL for ``CREATE TABLE ... (col1, col2, ...)``
+    and the migration list for ``ALTER TABLE t ADD COLUMN c``.  Returns a
+    dict of ``{table_name: {column_name, ...}}``.
+
+    Adding a migration automatically updates the schema fingerprint —
+    no manual constant to bump.
+    """
+    tables: dict[str, set[str]] = {}
+
+    # Parse CREATE TABLE statements from _SCHEMA
+    for match in re.finditer(
+        r"CREATE TABLE.*?(\w+)\s*\((.*?)\);",
+        schema_sql, re.DOTALL | re.IGNORECASE,
+    ):
+        table = match.group(1)
+        if table.startswith("idx_"):
+            continue
+        body = match.group(2)
+        cols: set[str] = set()
+        for line in body.splitlines():
+            line = line.strip()
+            if not line or line.startswith("--"):
+                continue
+            col_name = line.split()[0].strip()
+            if not col_name:
+                continue
+            if col_name.upper() in (
+                "PRIMARY", "UNIQUE", "FOREIGN", "CHECK", "CONSTRAINT",
+            ):
+                continue
+            if col_name.upper().startswith("UNIQUE"):
+                continue  # UNIQUE(col, ...) constraint, not a column
+            cols.add(col_name)
+        tables[table] = cols
+
+    # Parse ALTER TABLE ADD COLUMN from migration statements
+    for stmt in migration_statements:
+        match = re.match(
+            r"ALTER TABLE (\w+) ADD COLUMN (\w+)",
+            stmt.strip(), re.IGNORECASE,
+        )
+        if match:
+            table, col = match.group(1), match.group(2)
+            tables.setdefault(table, set()).add(col)
+
+    return tables
+
+
+def _derive_schema_version(
+    schema_sql: str,
+    migration_statements: list[str],
+) -> int:
+    """Return a stable fingerprint of the full DB schema.
+
+    Derived from the actual ``_SCHEMA`` and ``ALTER TABLE`` migrations
+    in ``open_db()`` — zero-maintenance: adding a migration automatically
+    changes the fingerprint.
+    """
+    import hashlib
+
+    tables = _parse_expected_columns(schema_sql, migration_statements)
+    canonical = "".join(
+        f"{table}:{','.join(sorted(cols))};"
+        for table, cols in sorted(tables.items())
+    )
+    return int.from_bytes(hashlib.sha256(canonical.encode()).digest()[:4], "big")
+
+
+# Simple add-column migrations — run idempotently and feed into the schema
+# fingerprint.  Add new ALTER TABLE statements here and CURRENT_SCHEMA_VERSION
+# changes automatically.  (Complex migrations with backfill logic live inline in
+# open_db() — their ALTER TABLE must also be listed here so the fingerprint
+# stays accurate.)
+_MIGRATION_ADD_COLUMNS = [
+    "ALTER TABLE files ADD COLUMN mtime REAL NOT NULL DEFAULT 0",
+    "ALTER TABLE symbols ADD COLUMN end_line INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE symbols ADD COLUMN file_path TEXT NOT NULL DEFAULT ''",
+    "ALTER TABLE symbols ADD COLUMN name_tokens TEXT NOT NULL DEFAULT ''",
+    "ALTER TABLE symbols ADD COLUMN enum_value INTEGER",
+]
 
 _SCHEMA = """
 PRAGMA journal_mode = WAL;
@@ -167,6 +248,8 @@ CREATE TABLE IF NOT EXISTS embeddings (
 CREATE INDEX IF NOT EXISTS idx_embeddings_symbol ON embeddings(symbol_id);
 """
 
+CURRENT_SCHEMA_VERSION = _derive_schema_version(_SCHEMA, _MIGRATION_ADD_COLUMNS)
+
 
 def open_db(path: Path) -> sqlite3.Connection:
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -186,24 +269,20 @@ def open_db(path: Path) -> sqlite3.Connection:
     try:
         conn.executescript(_SCHEMA)
 
-        # Migration: mtime column in files
-        try:
-            conn.execute("ALTER TABLE files ADD COLUMN mtime REAL NOT NULL DEFAULT 0")
-            conn.commit()
-        except sqlite3.OperationalError:
-            pass
+        # Simple add-column migrations — idempotent, run from _MIGRATION_ADD_COLUMNS
+        # so the schema fingerprint (CURRENT_SCHEMA_VERSION) stays in sync automatically.
+        for stmt in _MIGRATION_ADD_COLUMNS:
+            try:
+                conn.execute(stmt)
+                conn.commit()
+            except sqlite3.OperationalError:
+                pass
 
-        # Migration: end_line column in symbols (full definition extent for get_source)
-        try:
-            conn.execute("ALTER TABLE symbols ADD COLUMN end_line INTEGER NOT NULL DEFAULT 0")
-            conn.commit()
-        except sqlite3.OperationalError:
-            pass
-
-        # Migration: file_path column in symbols (denormalized for FTS5)
-        sym_cols = [r[1] for r in conn.execute("PRAGMA table_info(symbols)").fetchall()]
-        if "file_path" not in sym_cols:
-            conn.execute("ALTER TABLE symbols ADD COLUMN file_path TEXT NOT NULL DEFAULT ''")
+        # Migration: file_path backfill — column added by _MIGRATION_ADD_COLUMNS loop.
+        # Backfill empties left over from old indexes or the DEFAULT ''.
+        if conn.execute(
+            "SELECT COUNT(*) FROM symbols WHERE file_path = ''"
+        ).fetchone()[0] > 0:
             conn.execute("""
                 UPDATE symbols SET file_path = COALESCE(
                     (SELECT f.path FROM files f WHERE f.id = symbols.file_id), ''
@@ -211,13 +290,12 @@ def open_db(path: Path) -> sqlite3.Connection:
             """)
             conn.commit()
 
-        # Migration: name_tokens column — camelCase/snake_case split for FTS5 token graph
-        sym_cols = [r[1] for r in conn.execute("PRAGMA table_info(symbols)").fetchall()]
-        if "name_tokens" not in sym_cols:
-            conn.execute("ALTER TABLE symbols ADD COLUMN name_tokens TEXT NOT NULL DEFAULT ''")
-            conn.commit()
-            # Backfill using Python split_tokens (SQLite can't call Python functions).
-            # Use a generator to avoid materialising all rows in memory at once.
+        # Migration: name_tokens backfill — column added by _MIGRATION_ADD_COLUMNS loop.
+        # Backfill using Python split_tokens (SQLite can't call Python functions).
+        # Use a generator to avoid materialising all rows in memory at once.
+        if conn.execute(
+            "SELECT COUNT(*) FROM symbols WHERE name_tokens = ''"
+        ).fetchone()[0] > 0:
             conn.executemany(
                 "UPDATE symbols SET name_tokens = ? WHERE id = ?",
                 (
@@ -229,13 +307,7 @@ def open_db(path: Path) -> sqlite3.Connection:
             )
             conn.commit()
 
-        # Migration: enum_value column in symbols (enum constant values)
-        sym_cols = [r[1] for r in conn.execute("PRAGMA table_info(symbols)").fetchall()]
-        if "enum_value" not in sym_cols:
-            conn.execute("ALTER TABLE symbols ADD COLUMN enum_value INTEGER")
-            conn.commit()
-
-        # Migration: rebuild FTS5 + triggers if name_tokens column is missing
+        # Migration: FTS5 rebuild —
         fts_cols = [r[1] for r in conn.execute("PRAGMA table_info(symbols_fts)").fetchall()]
         if "name_tokens" not in fts_cols:
             conn.executescript("""
