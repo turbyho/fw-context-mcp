@@ -34,7 +34,7 @@ from ..indexer.db import (
     search_symbols,
     transaction,
 )
-from ..llm.ollama import OllamaError, OllamaModelNotFoundError, call_ollama_async, check_setup
+from ..llm.ollama import OllamaError, OllamaModelNotFoundError, call_ollama_async, call_ollama_embed, check_setup
 from ..utils import MTIME_TOLERANCE_S, abs_path, resolve_project_root
 
 log = logging.getLogger(__name__)
@@ -1502,6 +1502,24 @@ def search_code(
     - Do NOT use underscore in queries — ``modem_init`` is split into
       ``modem AND init``. Use ``modem init`` instead.
 
+    **Progressive relaxation:** when the initial FTS5 search returns nothing,
+    the tool automatically broadens the search in three steps:
+
+    1. *FTS5 without kind filter* — drops the ``kind`` constraint (users often
+       guess the wrong kind for a symbol).
+    2. *name_tokens substring match* — searches the pre-computed CamelCase/
+       snake_case token column (e.g. ``BuildType`` is indexed as
+       ``"build type"``).  Requires at least N‑1 of N query terms to match.
+    3. *Single-term docstring LIKE* — when only one query term was given and
+       the token-based steps found nothing, does a raw LIKE over the docstring
+       column to catch terms the FTS5 tokeniser may have missed.
+    4. *Individual term FTS5* — searches each query word separately and merges
+       the results.
+
+    Results from steps 2–5 carry ``_fallback`` indicating which step succeeded
+    (``"fts5"``, ``"name_tokens_like"``, ``"docstring_like"``,
+    ``"individual_terms"``).
+
     **Kind filter values:** ``function``, ``method``, ``constructor``,
     ``destructor``, ``class``, ``struct``, ``enum``, ``enum_constant``,
     ``typedef``, ``variable``, ``field``, ``namespace``.
@@ -1530,36 +1548,80 @@ def search_code(
                 c, query, config_hash, limit=limit, kind=kind,
                 exclude_variables=(kind is None),
             )
-            # Fallback: when FTS5 returns nothing, try prefix lookup on each
-            # query term.  Handles cases like ``"socket state"`` where FTS5
-            # tokenisation misses ``socket_state_t``.
-            fallback_used = False
+            # Progressive fallback cascade when FTS5 returns nothing.
+            # Each step broadens the search until we find results or exhaust options.
+            method = "fts5+kind"  # track which step succeeded for _fallback marker
+            if not rows and kind:
+                # Step 2: drop kind filter — users often guess the wrong kind
+                rows = search_symbols(
+                    c, query, config_hash, limit=limit, kind=None,
+                    exclude_variables=True,
+                )
+                if rows:
+                    method = "fts5"
+
             if not rows:
-                fallback_used = True
-                terms = [t for t in query.split() if len(t) > 1]
-                seen_usr: set[str] = set()
-                fallback_rows: list = []
-                for term in terms:
-                    esc = term.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
-                    kind_filter = "AND s.kind = ?" if kind else ""
-                    params = [config_hash, f"{esc}%", f"{esc}%"]
-                    if kind:
-                        params.append(kind)
-                    params.append(limit * 2)
-                    term_rows = c.execute(
-                        rf"""SELECT s.* FROM symbols s
-                           WHERE s.config_hash=?
-                             AND (s.name LIKE ? ESCAPE '\' OR s.qualified_name LIKE ? ESCAPE '\')
-                             {kind_filter}
-                           ORDER BY s.is_definition DESC, s.line
+                # Step 3: name_tokens substring matching.
+                # name_tokens is a pre-computed column with CamelCase/snake_case
+                # tokens already split to lowercase space-separated words
+                # (e.g. ``BuildType`` → ``"build type"``,
+                #  ``socket_state_t`` → ``"socket state"``).
+                # We require at least N-1 of N query terms to match so that a
+                # single unrelated term doesn't kill the result set.
+                terms = [t.lower() for t in query.split() if len(t) > 1]
+                if terms:
+                    min_matches = max(1, len(terms) - 1)
+                    like_cases = []
+                    for term in terms:
+                        esc = term.replace("'", "''")
+                        like_cases.append(
+                            f"CASE WHEN s.name_tokens LIKE '%{esc}%' THEN 1 ELSE 0 END"
+                        )
+                    match_sum = " + ".join(like_cases)
+                    rows = c.execute(
+                        f"""SELECT s.*, ({match_sum}) AS _match_cnt FROM symbols s
+                           WHERE s.config_hash = ? AND ({match_sum}) >= ?
+                           ORDER BY s.is_definition DESC, _match_cnt DESC, s.line
                            LIMIT ?""",
-                        params,
+                        (config_hash, min_matches, limit),
                     ).fetchall()
-                    for r in term_rows:
+                    if rows:
+                        method = "name_tokens_like"
+
+            if not rows and len(terms) == 1:
+                # Step 4: single-term last resort — LIKE on docstring (in
+                # case FTS5 tokenizer missed something the raw text contains).
+                esc = terms[0].replace("'", "''")
+                rows = c.execute(
+                    f"""SELECT s.* FROM symbols s
+                       WHERE s.config_hash = ? AND s.docstring LIKE '%{esc}%'
+                       ORDER BY s.is_definition DESC, s.line
+                       LIMIT ?""",
+                    (config_hash, limit),
+                ).fetchall()
+                if rows:
+                    method = "docstring_like"
+
+            if not rows and len(terms) > 1:
+                # Step 5: fall back to individual FTS5 searches for each term,
+                # then merge and deduplicate.
+                seen_usr: set[str] = set()
+                ind_rows: list = []
+                for term in terms:
+                    term_results = search_symbols(
+                        c, term, config_hash,
+                        limit=max(3, limit // len(terms)),
+                        kind=None, exclude_variables=True,
+                    )
+                    for r in term_results:
                         if r["usr"] not in seen_usr:
                             seen_usr.add(r["usr"])
-                            fallback_rows.append(r)
-                rows = fallback_rows[:limit]
+                            ind_rows.append(r)
+                rows = ind_rows[:limit]
+                if rows:
+                    method = "individual_terms"
+
+            fallback_used = (method != "fts5+kind")
 
             def _fmt(r) -> dict:
                 d = {
@@ -1575,7 +1637,7 @@ def search_code(
                 if r["enum_value"] is not None:
                     d["enum_value"] = r["enum_value"]
                 if fallback_used:
-                    d["_fallback"] = "lookup_symbol"
+                    d["_fallback"] = method
                 return d
 
             return [_fmt(r) for r in rows]
@@ -1649,6 +1711,264 @@ async def smart_search(
         finally:
             conn.close()
     return results
+
+
+@mcp.tool()
+async def semantic_search(
+    query: Annotated[str, Field(description="Natural language description, 5-15 words. E.g. 'parcel locker state machine' or 'how does the modem connect?'.")],
+    project_root: Annotated[str | None, Field(description="Project root. Auto-detected if omitted.")] = None,
+    threshold: Annotated[float, Field(description="Minimum cosine similarity (0.0-1.0). Default 0.55 is calibrated for mxbai-embed-large. Use 0.50 for exploratory, 0.60 for high-precision.")] = 0.55,
+    limit: Annotated[int, Field(description="Maximum results (default 20, max 100).")] = 20,
+) -> list[dict]:
+    """Read-only. Semantic search using pre-computed symbol embeddings.
+
+    Finds symbols conceptually related to a natural-language query, even when
+    the query words don't appear literally in the code.  Uses cosine similarity
+    over 1024-dimensional embeddings generated during ``fw-context index``.
+
+    **When to prefer over search_code:** When you're describing a *concept*
+    rather than searching for a known keyword.  Examples:
+    - ``"parcel locker state"`` finds door-state and shipment methods even
+      though "parcel" and "locker" don't appear in their names.
+    - ``"cell modem"`` finds ``_socket_t`` and ``ModemMsg*`` classes.
+    - ``"delivery box"`` finds ``set_shipment`` and ``get_zrtdata``.
+    - ``"power consumption"`` finds ``get_load_power`` and INA260 class.
+
+    **When to prefer search_code instead:** When you know the exact keyword
+    or symbol name (``"fram_write"``, ``"cbor encode"``).  FTS5 is faster
+    and more precise for lexical matches.
+
+    **Threshold guidance (mxbai-embed-large model):**
+    - ``0.50`` — exploratory: more results, lower precision
+    - ``0.55`` — balanced (default, ~1000 results)
+    - ``0.60`` — precise: ~175 avg, high precision
+    - ``0.65`` — strict: few results, may miss relevant symbols
+
+    **Source-aware ranking:** Project code (``src/``) boosted 1.2×,
+    library code (``lib/``) 1.1×, vendored SDK (``mbed-os/``) 0.85×.
+
+    **Requires Ollama** with an embedding model (``mxbai-embed-large``).
+    Falls back to ``search_code`` with a warning if Ollama is unavailable.
+
+    Args:
+        query: Natural language description of what you're looking for.
+               Be specific — 5–15 words works best.
+        project_root: Project root. Auto-detected if omitted.
+        threshold: Minimum cosine similarity (0.0-1.0). Default 0.55.
+        limit: Maximum number of results (default 20, max 100).
+
+    Returns:
+        list of dicts, each with: name, qualified_name, kind, file, line,
+        is_definition, signature, docstring, plus ``_similarity`` (cosine
+        similarity score) and ``_method`` (``"embedding"`` or
+        ``"search_code_fallback"``).
+    """
+    import asyncio
+    import math
+    import struct
+
+    try:
+        root = resolve_project_root(project_root)
+        db_path = _db_path(root)
+        if not db_path.exists():
+            return [{"error": f"No index found for {root}. Run 'fw-context index' first."}]
+
+        limit = min(limit, 100)
+        threshold = max(0.0, min(1.0, threshold))
+
+        # Check Ollama availability
+        cfg = load_config(project_root=root)
+        if not cfg.llm.enabled:
+            return _fallback_to_search_code(
+                root, db_path, query, limit,
+                warning="Ollama is disabled in config. "
+                        "Enable it with `[llm] enabled = true` to use semantic search.",
+            )
+
+        try:
+            setup = check_setup(cfg.llm)
+        except Exception:
+            setup = {"ollama_running": False}
+
+        if not setup.get("ollama_running"):
+            return _fallback_to_search_code(
+                root, db_path, query, limit,
+                warning="Ollama is not running. Start it to use semantic search.",
+            )
+
+        # Generate query embedding
+        try:
+            query_embs = await asyncio.to_thread(
+                call_ollama_embed, [query], cfg.llm
+            )
+            query_vec = query_embs[0]
+        except Exception as e:
+            log.warning("semantic_search: Ollama embed failed: %s", e)
+            return _fallback_to_search_code(
+                root, db_path, query, limit,
+                warning=f"Ollama embedding failed: {e}. "
+                        "Showing lexical search results instead.",
+            )
+
+        # Load embeddings and run cosine search
+        def _do_semantic(c: sqlite3.Connection, config_hash: str) -> list[dict]:
+            # Load all embeddings with file_path for source-aware boosting
+            rows = c.execute(
+                """SELECT e.symbol_id, e.embedding, s.file_path
+                   FROM embeddings e
+                   JOIN symbols s ON s.id = e.symbol_id
+                   WHERE s.config_hash = ? AND s.is_definition = 1""",
+                (config_hash,),
+            ).fetchall()
+
+            if not rows:
+                return _fallback_to_search_code_inner(
+                    c, root, query, config_hash, limit,
+                    warning="No embeddings found in the index. "
+                            "Run `fw-context index --embeddings` to generate them.",
+                )
+
+            # Source-aware boost: project code > libraries > vendored SDK
+            def _source_boost(file_path: str) -> float:
+                if file_path.startswith("src/"):
+                    return 1.2
+                elif file_path.startswith("lib/"):
+                    return 1.1
+                else:
+                    return 0.85
+
+            # Compute cosine similarity + source boost for each embedding
+            scored: list[tuple[float, float, sqlite3.Row]] = []
+            for r in rows:
+                try:
+                    vec = struct.unpack(f'{len(query_vec)}f', r["embedding"])
+                except Exception:
+                    continue
+                dot = sum(x * y for x, y in zip(query_vec, vec))
+                norm_a = math.sqrt(sum(x * x for x in query_vec))
+                norm_b = math.sqrt(sum(x * x for x in vec))
+                raw_sim = dot / (norm_a * norm_b) if norm_a and norm_b else 0.0
+                if raw_sim > threshold:
+                    boost = _source_boost(r["file_path"] or "")
+                    scored.append((raw_sim * boost, raw_sim, r))
+
+            scored.sort(key=lambda x: -x[0])
+            top = scored[:limit]
+
+            if not top:
+                return [{
+                    "warning": f"No symbols matched with similarity > {threshold}. "
+                               "Try lowering the threshold or rephrasing the query.",
+                    "hint": "Use search_code for lexical/keyword search.",
+                }]
+
+            # Resolve symbol details
+            sym_ids = [r[2]["symbol_id"] for r in top]  # r[2] is the Row
+            placeholders = ",".join("?" * len(sym_ids))
+            sym_rows = c.execute(
+                f"""SELECT * FROM symbols
+                    WHERE config_hash = ? AND id IN ({placeholders})
+                    ORDER BY CASE id {' '.join(f'WHEN {i} THEN {j}' for j, i in enumerate(sym_ids))} END""",
+                (config_hash, *sym_ids),
+            ).fetchall()
+
+            sym_map = {r["id"]: r for r in sym_rows}
+            # Map symbol_id → raw similarity (r[1] from scored tuple)
+            sim_map = {r[2]["symbol_id"]: r[1] for r in top}
+
+            results: list[dict] = []
+            for sid in sym_ids:
+                sr = sym_map.get(sid)
+                if sr is None:
+                    continue
+                d = {
+                    "name": sr["name"],
+                    "qualified_name": sr["qualified_name"],
+                    "kind": sr["kind"],
+                    "file": abs_path(root, sr["file_path"]),
+                    "line": sr["line"],
+                    "is_definition": bool(sr["is_definition"]),
+                    "signature": sr["signature"],
+                    "docstring": sr["docstring"],
+                    "_similarity": round(sim_map[sid], 4),
+                    "_method": "embedding",
+                }
+                if sr["enum_value"] is not None:
+                    d["enum_value"] = sr["enum_value"]
+                results.append(d)
+
+            return results
+
+        return _with_stale_recovery(root, db_path, _do_semantic)
+
+    except Exception as e:
+        log.exception("semantic_search failed: %s", e)
+        return [{"error": f"semantic_search failed: {e}"}]
+
+
+def _fallback_to_search_code(
+    root: Path,
+    db_path: Path,
+    query: str,
+    limit: int,
+    warning: str,
+) -> list[dict]:
+    """Fall back to lexical search when Ollama/embeddings are unavailable."""
+    import sqlite3
+
+    try:
+        conn = sqlite3.connect(str(db_path))
+        conn.row_factory = sqlite3.Row
+        with conn:
+            config_hash = conn.execute(
+                "SELECT config_hash FROM build_configs ORDER BY created_at DESC LIMIT 1"
+            ).fetchone()["config_hash"]
+            return _fallback_to_search_code_inner(
+                conn, root, query, config_hash, limit, warning
+            )
+    except Exception as e:
+        return [{"error": f"semantic_search failed and fallback error: {e}"}]
+
+
+def _fallback_to_search_code_inner(
+    conn: sqlite3.Connection,
+    root: Path,
+    query: str,
+    config_hash: str,
+    limit: int,
+    warning: str,
+) -> list[dict]:
+    """Inner fallback with an open connection."""
+    from fw_context_mcp.indexer.db import search_symbols
+
+    rows = search_symbols(
+        conn, query, config_hash, limit=limit, kind=None,
+        exclude_variables=True,
+    )
+    results: list[dict] = []
+    for r in rows:
+        d = {
+            "name": r["name"],
+            "qualified_name": r["qualified_name"],
+            "kind": r["kind"],
+            "file": abs_path(root, r["file_path"]),
+            "line": r["line"],
+            "is_definition": bool(r["is_definition"]),
+            "signature": r["signature"],
+            "docstring": r["docstring"],
+            "_method": "search_code_fallback",
+        }
+        if r["enum_value"] is not None:
+            d["enum_value"] = r["enum_value"]
+        results.append(d)
+
+    if not results:
+        return [{"warning": f"{warning} (no lexical results either)."}]
+
+    return [
+        {"warning": warning, "_method": "search_code_fallback"},
+        *results,
+    ]
 
 
 # ── MCP Resources ──────────────────────────────────────────────────────────
