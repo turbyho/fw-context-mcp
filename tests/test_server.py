@@ -252,3 +252,234 @@ class TestLookupSymbolSQL:
         assert rows[0]["is_definition"] == 1
         assert rows[1]["is_definition"] == 0
 
+
+
+class TestLikeEscaping:
+    """Verify LIKE wildcard escaping in search_code progressive relaxation.
+
+    The escape order: backslash first, then %, then _, then '.
+    The LIKE clause must use ESCAPE '\\' so \\_ is literal underscore,
+    \\% is literal percent, and \\\\ is literal backslash.
+    """
+
+    @pytest.fixture
+    def db(self):
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        conn.executescript(SYMBOLS_SCHEMA)
+        return conn
+
+    @staticmethod
+    def _escape_like(term: str) -> str:
+        """The escaping used in search_code LIKE fallback (post-fix)."""
+        return term.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_").replace("'", "''")
+
+    # ── Underscore ─────────────────────────────────────────────────────────
+
+    def test_underscore_not_wildcard_in_name_tokens(self, db):
+        """Literal _ in query term must not match space in name_tokens."""
+        _insert_symbol(db, usr="u_1", name="test_func",
+                       qualified_name="mcu::test_func",
+                       name_tokens="test func")
+        esc = self._escape_like("test_func")
+        row = db.execute(
+            f"SELECT * FROM symbols WHERE name_tokens LIKE '%{esc}%' ESCAPE '\\' "
+            "AND config_hash=? LIMIT 1",
+            ("hash-aaa",),
+        ).fetchone()
+        assert row is None, (
+            f"Escaped LIKE '%{esc}%' matched 'test func' — "
+            f"underscore is being treated as a wildcard"
+        )
+
+    def test_underscore_matches_literal_underscore(self, db):
+        """Escaped _ in query term matches literal _ in name_tokens."""
+        _insert_symbol(db, usr="u_1", name="test_func",
+                       qualified_name="mcu::test_func",
+                       name_tokens="test func")
+        _insert_symbol(db, usr="u_2", name="test_func",
+                       qualified_name="mcu::test_func",
+                       name_tokens="test_func")
+        esc = self._escape_like("test_func")
+        rows = db.execute(
+            f"SELECT * FROM symbols WHERE name_tokens LIKE '%{esc}%' ESCAPE '\\' "
+            "AND config_hash=? ORDER BY line",
+            ("hash-aaa",),
+        ).fetchall()
+        assert len(rows) == 1, f"Expected 1 match (literal underscore), got {len(rows)}"
+        assert rows[0]["name_tokens"] == "test_func"
+
+    # ── Percent ────────────────────────────────────────────────────────────
+
+    def test_percent_not_wildcard_in_name_tokens(self, db):
+        """Literal % in query term must not match arbitrary text."""
+        _insert_symbol(db, usr="u_pct", name="pct",
+                       qualified_name="mcu::pct",
+                       name_tokens="100 percent")
+        esc = self._escape_like("100%")
+        row = db.execute(
+            f"SELECT * FROM symbols WHERE name_tokens LIKE '%{esc}%' ESCAPE '\\' "
+            "AND config_hash=? LIMIT 1",
+            ("hash-aaa",),
+        ).fetchone()
+        assert row is None, (
+            f"Escaped LIKE '%{esc}%' matched '100 percent' — "
+            f"percent is being treated as a wildcard"
+        )
+
+    def test_percent_matches_literal_percent(self, db):
+        """Escaped % in query term matches literal % in name_tokens."""
+        _insert_symbol(db, usr="u_pct", name="pct",
+                       qualified_name="mcu::pct",
+                       name_tokens="100% full")
+        esc = self._escape_like("100%")
+        rows = db.execute(
+            f"SELECT * FROM symbols WHERE name_tokens LIKE '%{esc}%' ESCAPE '\\' "
+            "AND config_hash=? ORDER BY line",
+            ("hash-aaa",),
+        ).fetchall()
+        assert len(rows) == 1, f"Expected 1 match (literal %), got {len(rows)}"
+        assert rows[0]["name_tokens"] == "100% full"
+
+    # ── Backslash ──────────────────────────────────────────────────────────
+
+    def test_backslash_escaped_in_like(self, db):
+        """Literal backslash in query term is correctly double-escaped."""
+        _insert_symbol(db, usr="u_bs", name="path_join",
+                       qualified_name="util::path_join",
+                       name_tokens="path join")
+        esc = self._escape_like("path\\join")
+        row = db.execute(
+            f"SELECT * FROM symbols WHERE name_tokens LIKE '%{esc}%' ESCAPE '\\' "
+            "AND config_hash=? LIMIT 1",
+            ("hash-aaa",),
+        ).fetchone()
+        assert row is None, (
+            f"Escaped backslash LIKE '%{esc}%' unexpectedly matched"
+        )
+
+    # ── Docstring LIKE (same escaping, different column) ───────────────────
+
+    def test_docstring_like_escapes_underscore(self, db):
+        """Same escaping used in docstring LIKE fallback."""
+        _insert_symbol(db, usr="u_ds1", name="fn", qualified_name="mcu::fn",
+                       docstring="Initialize the UART peripheral with baud rate.")
+        _insert_symbol(db, usr="u_ds2", name="fn2", qualified_name="mcu::fn2",
+                       docstring="Configure test_function callback.")
+        esc = self._escape_like("test_func")
+        rows = db.execute(
+            f"SELECT * FROM symbols WHERE docstring LIKE '%{esc}%' ESCAPE '\\' "
+            "AND config_hash=? ORDER BY line",
+            ("hash-aaa",),
+        ).fetchall()
+        assert len(rows) == 1
+        assert rows[0]["name"] == "fn2"
+
+    # ── Single quote (SQL injection prevention) ────────────────────────────
+
+    def test_single_quote_escaped_in_like(self, db):
+        """Single quotes in search terms are escaped to SQL ''."""
+        _insert_symbol(db, usr="u_sq", name="it_s",
+                       qualified_name="mcu::it_s",
+                       name_tokens="it s")
+        esc = self._escape_like("it's")
+        row = db.execute(
+            f"SELECT * FROM symbols WHERE name_tokens LIKE '%{esc}%' ESCAPE '\\' "
+            "AND config_hash=? LIMIT 1",
+            ("hash-aaa",),
+        ).fetchone()
+        assert row is None  # "it's" doesn't match "it s"
+
+    # ── Empty term ─────────────────────────────────────────────────────────
+
+    def test_empty_term_escaped_safely(self, db):
+        """Empty string after escaping is safe for LIKE."""
+        esc = self._escape_like("")
+        assert esc == ""
+        # Empty LIKE pattern matches everything — but this is a corner case
+        # that should be caught by the caller (terms are filtered by len>1)
+        rows = db.execute(
+            f"SELECT * FROM symbols WHERE name_tokens LIKE '%{esc}%' ESCAPE '\\' "
+            "AND config_hash=?",
+            ("hash-aaa",),
+        ).fetchall()
+        # With empty pattern, matches everything — caller must guard against this
+        assert len(rows) == 0  # no symbols inserted
+
+    # ── Combined special chars ─────────────────────────────────────────────
+
+    def test_combined_special_chars(self, db):
+        """Term with _, %, \\ and ' all together is correctly escaped."""
+        _insert_symbol(db, usr="u_co", name="weird",
+                       qualified_name="mcu::weird",
+                       name_tokens="100% test_func path\\join it s")
+        esc = self._escape_like("100%_test\\func'path")
+        # After escaping: 100\%\_test\\func''path
+        # LIKE should NOT match the space-separated tokens because
+        # the escaped special chars don't match the spaces
+        row = db.execute(
+            f"SELECT * FROM symbols WHERE name_tokens LIKE '%{esc}%' ESCAPE '\\' "
+            "AND config_hash=? LIMIT 1",
+            ("hash-aaa",),
+        ).fetchone()
+        assert row is None, (
+            f"Escaped combined special chars unexpectedly matched"
+        )
+
+
+class TestFallbackToSearchCode:
+    """Test _fallback_to_search_code error handling and stale detection."""
+
+    def test_missing_db_returns_graceful_error(self):
+        """When no index exists, fallback returns structured error."""
+        from fw_context_mcp.mcp.server import _fallback_to_search_code
+
+        nonexistent = Path("/tmp/nonexistent_fwctx_test.db")
+        result = _fallback_to_search_code(
+            root=Path("/tmp"),
+            db_path=nonexistent,
+            query="uart_init",
+            limit=10,
+            warning="Test warning",
+        )
+        assert isinstance(result, list)
+        assert len(result) == 1
+        assert "error" in result[0], f"Expected error dict, got {result[0]}"
+        # Error must mention the DB path so the user/LLM knows what's wrong
+        err_msg = str(result[0].get("error", ""))
+        assert "nonexistent" in err_msg.lower() or "index" in err_msg.lower(), (
+            f"Error message should be descriptive, got: {err_msg}"
+        )
+
+    def test_empty_query_fallback(self):
+        """Empty query doesn't crash the fallback."""
+        from fw_context_mcp.mcp.server import _fallback_to_search_code
+
+        result = _fallback_to_search_code(
+            root=Path("/tmp"),
+            db_path=Path("/tmp/nonexistent_fwctx_test_2.db"),
+            query="",
+            limit=10,
+            warning="Empty query",
+        )
+        # Must return a list (error or warning), not crash
+        assert isinstance(result, list)
+
+    def test_get_active_build_docstring_covers_schema_staleness(self):
+        """get_active_build docstring explains all three stale conditions."""
+        from fw_context_mcp.mcp.server import get_active_build
+
+        doc = get_active_build.__doc__ or ""
+        assert "schema_version" in doc, "docstring must mention schema_version"
+        assert "current_schema" in doc, "docstring must mention current_schema"
+        assert "full" in doc.lower(), (
+            "Docstring should mention that schema staleness needs a full re-index"
+        )
+
+    def test_get_active_build_docstring_stale_field(self):
+        """get_active_build docstring mentions stale is a bool union."""
+        from fw_context_mcp.mcp.server import get_active_build
+
+        doc = get_active_build.__doc__ or ""
+        assert "stale" in doc, "docstring must mention stale field"
+        assert "modified_files_count" in doc, "docstring must mention modified_files_count"
