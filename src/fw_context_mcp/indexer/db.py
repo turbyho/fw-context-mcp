@@ -1238,6 +1238,7 @@ def find_refs(
         return conn.execute(
             f"""{_SELECT}
                   AND r.to_usr LIKE ? {kind_filter}
+                GROUP BY caller.qualified_name, r.from_file, r.from_line
                 ORDER BY r.from_file, r.from_line
                 LIMIT ?""",
             params,
