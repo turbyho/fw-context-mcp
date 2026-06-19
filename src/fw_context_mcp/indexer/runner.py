@@ -18,6 +18,7 @@ from .compile_commands import _SOURCE_EXTS
 from .compile_commands import parse as parse_compile_commands
 from .config_hash import compute as compute_config_hash
 from .db import (
+    CURRENT_SCHEMA_VERSION,
     get_file_mtimes,
     open_db,
     transaction,
@@ -370,6 +371,9 @@ def run(
         conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
     except Exception:
         pass
+    # Stamp schema version — marks the index as current (get_active_build
+    # compares PRAGMA user_version against CURRENT_SCHEMA_VERSION).
+    conn.execute(f"PRAGMA user_version = {CURRENT_SCHEMA_VERSION}")
     log.info(
         "Done: %d updated, %d unchanged, %d skipped — %d symbols, %d refs in %.1fs (config_hash=%s)",
         updated, unchanged, skipped, total_syms, total_refs, elapsed, config_hash[:12],

@@ -275,8 +275,10 @@ def open_db(path: Path) -> sqlite3.Connection:
             try:
                 conn.execute(stmt)
                 conn.commit()
-            except sqlite3.OperationalError:
-                pass
+            except sqlite3.OperationalError as e:
+                # Only skip "duplicate column" — re-raise disk-full etc.
+                if "duplicate column" not in str(e):
+                    raise
 
         # Migration: file_path backfill — column added by _MIGRATION_ADD_COLUMNS loop.
         # Backfill empties left over from old indexes or the DEFAULT ''.
@@ -364,9 +366,6 @@ def open_db(path: Path) -> sqlite3.Connection:
     except sqlite3.DatabaseError as e:
         conn.close()
         raise DatabaseCorruptionError(str(path), str(e)) from e
-
-    # Stamp schema version after all migrations succeeded
-    conn.execute(f"PRAGMA user_version = {CURRENT_SCHEMA_VERSION}")
 
     return conn
 
