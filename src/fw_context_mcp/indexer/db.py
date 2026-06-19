@@ -1298,7 +1298,7 @@ def _expand_query(query: str) -> str:
             expanded.append(p)
         else:
             expanded.append(f'{p}*')
-    return ' '.join(expanded)
+    return ' OR '.join(expanded)
 
 
 def search_symbols(

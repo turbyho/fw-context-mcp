@@ -302,7 +302,7 @@ class TestSearchSymbols:
              split_tokens("write", "UART::write"),
              "u11", "write", "UART::write", "method", 1, 1, 0, 1, "void write(char c)", "", None),
         ])
-        results = search_symbols(populated_db, "spi* write*", "hash-deadbeef")
+        results = search_symbols(populated_db, "spi* AND write*", "hash-deadbeef")
         assert len(results) == 1
         assert results[0]["name"] == "write"
         assert "spi" in results[0]["file_path"].lower()
@@ -351,18 +351,18 @@ class TestExpandQuery:
         assert _expand_query("connect") == "connect*"
 
     def test_multiple_words_all_get_wildcards(self):
-        assert _expand_query("modem init") == "modem* init*"
+        assert _expand_query("modem init") == "modem* OR init*"
 
     def test_existing_wildcard_preserved(self):
         assert _expand_query("connect*") == "connect*"
 
     def test_cpp_scope_gets_expansion(self):
         """C++ :: should not block wildcard expansion."""
-        assert _expand_query("std::vector") == "std* vector*"
+        assert _expand_query("std::vector") == "std* OR vector*"
 
     def test_cpp_scope_with_multiple_tokens(self):
         """C++ :: in a multi-word query should expand all tokens."""
-        assert _expand_query("mbed::DigitalOut write") == "mbed* DigitalOut* write*"
+        assert _expand_query("mbed::DigitalOut write") == "mbed* OR DigitalOut* OR write*"
 
     def test_column_filter_bypassed(self):
         """Column-filter syntax with single colon must not get expanded."""
