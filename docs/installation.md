@@ -37,19 +37,6 @@ echo 'export PATH="/opt/homebrew/opt/python@3.12/libexec/bin:$PATH"' >> ~/.zshrc
 
 ## Install
 
-### Linux 🐧
-
-```bash
-# Clone
-git clone git@github.com:turbyho/fw-context-mcp.git ~/.fw-context/src
-# or: git clone git@git.montyho.com:turbyho/fw-context-mcp.git ~/.fw-context/src
-
-# Install (creates venv, installs package, adds to PATH)
-cd ~/.fw-context/src && make install
-```
-
-### macOS 🍎
-
 ```bash
 # Clone
 git clone git@github.com:turbyho/fw-context-mcp.git ~/.fw-context/src
@@ -65,15 +52,69 @@ cd ~/.fw-context/src && make install
 cd ~/.fw-context/src && make install-watch
 ```
 
-## Update
+## Configure your project
 
-### Linux 🐧
+After install, create `<project>/.fw-context/config.toml` in your firmware
+project — or let `fw-context index` auto-create it with defaults.
+Full reference: **[Configuration →](configuration.md)**.
 
-```bash
-cd ~/.fw-context/src && make update
+### Zephyr
+
+```toml
+[build]
+board = "nrf52840dk_nrf52840"    # required
+# clean = true                   # pristine build (recommended)
 ```
 
-### macOS 🍎
+### PlatformIO / Arduino
+
+```toml
+[build]
+# nothing required — auto-detected from platformio.ini
+# clean = true
+
+[index]
+# PlatformIO frameworks live outside the project root:
+source_roots = [
+    "src",
+    "lib",
+    "/home/user/.platformio/packages/framework-arduinoespressif32",
+]
+exclude_paths = [".pio", "build", "BUILD"]
+```
+
+### Mbed OS
+
+```toml
+[project]
+name = "my-mbed-app"
+
+[build]
+system = "mbed-os"               # auto-detected from .mbed
+target = "P_ECB_BOARD"           # auto-detected from .mbed / custom_targets.json
+toolchain = "GCC_ARM"            # auto-detected from .mbed
+profile = "develop"              # best for indexing (includes -g debug symbols)
+app_config = "mbed_app.json"
+extra_profiles = ["lto.json"]
+defines = [
+    "VERSION_FW_MAJOR=4",
+    "VERSION_FW_MINOR=15",
+    "VERSION_FW_PATCH=0",
+    "VERSION_FW_BUILD=0",
+    "DEV",
+    "xCUSTOM_NDEBUG",
+]
+
+[index]
+source_roots = []
+exclude_paths = ["build", "BUILD"]
+```
+
+> **`defines`** are passed as `-D` flags to the compiler. Use them for version
+> numbers and feature toggles — ensures `#ifdef DEV` / `#if VERSION_FW_MAJOR`
+> branches are indexed correctly.
+
+## Update
 
 ```bash
 cd ~/.fw-context/src && make update
