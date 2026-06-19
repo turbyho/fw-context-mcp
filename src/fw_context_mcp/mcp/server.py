@@ -1492,17 +1492,17 @@ def trace_data_flow(
     max_depth: Annotated[int, Field(description="Maximum call path depth (default 8).")] = 8,
     limit: Annotated[int, Field(description="Maximum source functions to trace (default 15).")] = 15,
 ) -> list[dict]:
-    """Read-only. Experimental. Trace how data of a given type flows to a target function.
+    """Read-only. Trace how data of a given type flows to a target function.
 
     Finds functions whose signature mentions *type_name*, then looks for call
-    paths from those functions to *to_symbol*.  Returns an approximate data
-    flow map — useful for understanding how a data structure travels through
-    the system before reaching its destination.
+    paths from those functions to *to_symbol*.  Returns a data flow map —
+    useful for understanding how a data structure travels through the system
+    to its destination.
 
-    **Experimental.**  Does not resolve type transformations (e.g. CBOR
-    encoding, serialization, void-pointer casts).  Best used as a starting
-    point, then verify specific paths with ``find_call_path``.  For exact
-    call-graph queries without type tracking, use the ``find_*`` family.
+    Works best for synchronous driver stacks (e.g. sensor read → I2C write).
+    Cannot follow async flows (message queues, interrupts, RS485 callbacks).
+    For exact call-graph queries use the ``find_*`` family;
+    verify specific paths with ``find_call_path``.
     """
     root, config_hash, err = _refs_guard(project_root)
     if err:
@@ -1569,7 +1569,6 @@ def trace_data_flow(
                 "_summary": f"{num_reachable}/{len(results)} source functions reach '{to_symbol}' within depth {max_depth}",
                 "_type": type_name,
                 "_target": to_symbol,
-                "_experimental": True,
             },
             *results,
         ]
