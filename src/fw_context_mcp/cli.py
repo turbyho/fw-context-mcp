@@ -430,10 +430,14 @@ def _update_marked_section(path: Path, content: str, marker: str) -> None:
     existing = path.read_text(encoding="utf-8") if path.exists() else ""
 
     if start_tag in existing and end_tag in existing:
-        # Replace the existing marked block
+        # Replace the existing marked block (keep markers for idempotency)
         before = existing[:existing.index(start_tag)]
         after = existing[existing.index(end_tag) + len(end_tag):]
-        updated = before.rstrip("\n") + "\n\n" + content + "\n" + after.lstrip("\n")
+        updated = (
+            before.rstrip("\n") + "\n\n"
+            + start_tag + "\n" + content + "\n" + end_tag + "\n"
+            + after.lstrip("\n")
+        )
     else:
         # Remove any unmarked section with the same heading (idempotency for manual installs)
         heading_match = re.search(r'^## .+', content, re.MULTILINE)
@@ -453,7 +457,10 @@ def _update_marked_section(path: Path, content: str, marker: str) -> None:
                         skip_until_next_h2 = False
                         result_lines.append(line)
             existing = "\n".join(result_lines)
-        updated = existing.rstrip("\n") + ("\n\n" if existing.strip() else "") + content + "\n"
+        updated = (
+            existing.rstrip("\n") + ("\n\n" if existing.strip() else "")
+            + start_tag + "\n" + content + "\n" + end_tag + "\n"
+        )
 
     path.write_text(updated, encoding="utf-8")
 
