@@ -27,128 +27,18 @@ Go, or other projects — the index is built from `compile_commands.json` and on
 covers C/C++ translation units.
 
 {lean_ctx_carveout}
-
 ### Session start
 
 Call `get_active_build()` first. If `stale: true`, remind the user to run
 `fw-context index`.  If the index is missing, show the setup commands below.
 
-### Source code — read function bodies and file structure directly
+### Code reading
 
-**Do NOT use Read/grep on source files for symbols that are in the index.**
-Instead use:
-
-- `get_source(name)` — full body of a function/method with line numbers.
-  Uses libclang's exact extent; faster and more precise than grep+Read.
-  For enums, includes a ``constants`` array with all member names and their
-  integer values.  Enum constants include their ``enum_value``.
-- `get_file_map(path, signatures?, max_per_kind?)` — all symbols in a file
-  grouped by kind with counts.  Compact by default (first 30 per kind, no
-  signatures).  Use for quick orientation.  Pass ``max_per_kind=0`` for the
-  full list, ``signatures=true`` for parameter details.
-  Enum constants are nested into ``subgroups`` by parent enum — each subgroup
-  has ``name``, ``count``, and ``constants[]`` with ``enum_value``.
-- `get_symbol_context(name)` — body, signature, and all direct callers
-  + callees (no artificial limit).  One-shot context for "what does X do
-  and how does it fit?"  For enums, includes ``constants`` array with
-  all member values.
-
-### Symbol search
-
-- `lookup_symbol(name, exact?)` — find by exact or prefix name.  Prefer
-  when you know the identifier or a prefix (``uart_`` finds all UART symbols).
-  Use ``exact=true`` for precise match.
-- `search_code(query, kind?)` — FTS5 full-text search by topic/keyword.
-  Use when you don't know the symbol name — search by what it does.
-  1–3 words, omit underscores (`modem init`, not `modem_init`).
-  Filter by kind (`function`, `method`, `class`, `struct`, `enum`, …).
-- `smart_search(query)` — natural-language → FTS5 + vector re-rank.
-  Use when you don't know the right keywords ("how does the modem connect?").
-  Slow — 10–30 s with Ollama; call `check_ollama()` first.
-
-### Call graph
-
-All graph tools require the reference index (``fw-context index`` — refs
-are on by default).  If any returns "No references indexed", remind the
-user to re-index without ``--no-refs``.
-
-**Direct callers:**
-- `find_callers(name)` — flat list of immediate call sites (direct +
-  indirect via function pointers).  Fast — use for quick "who calls this?"
-  For the full transitive tree use ``find_all_callers_recursive``.
-- `find_references(name)` — all uses of a symbol: calls, reads, member
-  access.  Use when you need to find every place the symbol appears,
-  not just call sites.
-
-**Transitive / path traversal:**
-- `find_all_callers_recursive(name, max_depth?)` — all transitive callers
-  (who reaches this, directly or indirectly).  Use for impact analysis:
-  "if I change this, what's the blast radius?"  Deduplicated by shortest
-  distance.  For a flat direct-only list use ``find_callers`` (faster).
-- `find_callees_recursive(name, max_depth?)` — all transitive callees
-  (what does this reach?).  Use for dependency analysis: "what does this
-  function depend on to do its job?"  For direct callees only,
-  ``get_symbol_context`` gives a faster flat list.
-- `find_call_path(from, to, max_depth?)` — shortest paths between two
-  symbols via BFS.  Use to answer "how does A reach B?" — tracing how
-  a high-level handler eventually calls a low-level driver.  Returns
-  up to 5 paths with ``depth`` and ``chain``.
-
-**Architecture analysis:**
-- `find_hotspots(limit?)` — most-called functions ranked by caller count.
-  Use for high-level impact assessment: changing a hotspot affects many
-  call sites.  Follow up with ``find_callers`` on the top results.
-- `find_dead_code(limit?, exclude_paths?)` — functions/methods defined but
-  never called.  Use to spot unused code candidates; verify each hit with
-  ``find_callers`` before deleting.  Expect false positives (constructors
-  called via factory, ISRs, virtual method overrides).  Pass
-  ``exclude_paths`` (LIKE patterns, e.g. ``["mbed-os/%", "zephyr/%"]``)
-  to filter vendor SDK noise.
-- `find_wrapper_callers(class_name)` — find wrapper classes that call
-  methods of a driver class.  Use to understand adapter/wrapper
-  architecture (e.g. ``UART`` wraps ``UART_DRIVER``).
-
-**Experimental:**
-- `trace_data_flow(type_name, to_symbol)` — approximate data flow: finds
-  functions whose signature mentions *type_name*, then looks for call paths
-  to *to_symbol*.  Does NOT resolve type transformations (serialization,
-  void-pointer casts).  Best used as a starting point, then verify with
-  ``find_call_path``.  For exact call-graph queries without type tracking,
-  use the ``find_*`` family.
-
-### Code understanding (Ollama)
-
-- `explain_symbol(name)` — plain-English explanation via local Ollama.
-  10–30 s per call.  Falls back to source + prompt when Ollama is off.
-- `check_ollama()` — verify Ollama is running and the configured model
-  is available.  Call before the first `explain_symbol` or `smart_search`.
-
-### Index maintenance
-
-- `get_active_build()` — index freshness, symbol/file/ref counts, staleness.
-- `reindex_file(path)` — re-parse one file after editing.  File must be in
-  `compile_commands.json`.  For broader changes, remind the user to run
-  `fw-context index`.
-- `reset_index(confirm?)` — delete the index.  Always call without `confirm`
-  first (dry-run), then with `confirm=True` to actually delete.
-- `list_projects()` — show all indexed firmware projects.
-
-### Workflow patterns
-
-1. **Explore a file:** `get_file_map("src/modem.cpp")` → see what's inside
-   → `get_source("ModemMsg::send")` to read specific functions.
-2. **Understand a function:** `get_symbol_context("modem_connect")` →
-   body + direct callers + callees in a single call.
-3. **Trace impact:** `find_all_callers_recursive("uart_write")` → see the
-   full call tree → `get_source` on the callers that matter.
-4. **Find by topic:** `search_code("ble advertising", kind="function")`
-   → `get_source` on the matches → `find_callers` to see usage.
-5. **Inspect an enum:** `get_source("StatusCode")` → see all constants
-   with their integer values in the ``constants`` array.
-6. **Find dead code:** `find_dead_code(exclude_paths=["zephyr/%", "mbed-os/%"])`
-   → verify interesting hits with `find_callers` before concluding.
-7. **Understand a wrapper:** `find_wrapper_callers("UART_DRIVER")` → see
-   which classes adapt the driver and which methods they call.
+Prefer `get_source`, `get_file_map`, and `get_symbol_context` for reading
+symbols and functions — they use libclang extents and understand build flags.
+Use normal file reads for broader file context outside indexed symbols.
+Individual tool descriptions and the full call-graph/search workflow are
+described in the MCP tool listings.
 
 ### Index setup (first use in a project)
 
