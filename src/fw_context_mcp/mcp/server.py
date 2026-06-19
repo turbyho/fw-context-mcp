@@ -1609,7 +1609,7 @@ def search_code(
         def _do_search(c: sqlite3.Connection, config_hash: str) -> list[dict]:
             rows = search_symbols(
                 c, query, config_hash, limit=limit, kind=kind,
-                exclude_variables=(kind is None),
+                exclude_variables=False,
             )
             # Progressive fallback cascade when FTS5 returns nothing.
             # Each step broadens the search until we find results or exhaust options.
@@ -1618,7 +1618,7 @@ def search_code(
                 # Step 2: drop kind filter — users often guess the wrong kind
                 rows = search_symbols(
                     c, query, config_hash, limit=limit, kind=None,
-                    exclude_variables=True,
+                    exclude_variables=False,
                 )
                 if rows:
                     method = "fts5"
