@@ -82,37 +82,35 @@ num_ctx = 8192
 # debug_log = "~/.fw-context/llm-debug.jsonl"
 ```
 
-### Per-project config (`<project>/.fw-context/config.toml`)
+### Zephyr
 
 ```toml
 [project]
-name = "my-firmware"
+name = "my-zephyr-app"
 
 [build]
-# system = "mbed-os"                  # auto-detected
-# clean = true                        # always clean build (recommended)
-# target = "P_ECB_BOARD"             # override .mbed
-# profile = "develop"                 # best for indexing
-# app_config = "mbed_app.json"
-# extra_profiles = ["lto.json"]
-# defines = ["VERSION_FW_MAJOR=4", "DEV"]  # extra -D macros
-# board = "nrf52840dk_nrf52840"      # required for Zephyr
+# system = "zephyr"                      # auto-detected from west.yml
+board = "nrf52840dk_nrf52840"            # required — your board name
+# clean = true                           # pristine build (recommended)
 
 [index]
-compile_commands = "build/compile_commands.json"   # Zephyr: in build/
-source_roots = []                                   # auto-detect
-exclude_paths = ["build", "BUILD", "generated", "third_party"]
-# index_refs = false                                 # disable for faster indexing
-# index_embeddings = false                           # skip if no Ollama
+compile_commands = "build/compile_commands.json"
+source_roots = []
+exclude_paths = ["build", "BUILD"]
 
 [llm]
-enabled = false                                      # AI assistant handles results
-# model = "deepseek-coder-v2:16b"                    # different model just for this project
+# enabled = false                        # set false if you don't use Ollama
 ```
 
-### PlatformIO with external framework
+### PlatformIO / Arduino
 
 ```toml
+[project]
+name = "my-pio-project"
+
+[build]
+# system = "platformio"                  # auto-detected from platformio.ini
+
 [index]
 compile_commands = "compile_commands.json"
 source_roots = [
@@ -120,6 +118,25 @@ source_roots = [
     "lib",
     "/home/user/.platformio/packages/framework-arduinoespressif32",
 ]
+exclude_paths = [".pio", "build", "BUILD"]
+```
+
+### Mbed OS
+
+```toml
+[project]
+name = "my-mbed-app"
+
+[build]
+# system = "mbed-os"                     # auto-detected from .mbed
+# target = "P_ECB_BOARD"                # override auto-detected target
+# profile = "develop"                    # best for indexing
+# defines = ["VERSION_FW_MAJOR=4", "DEV"]  # extra -D macros
+
+[index]
+compile_commands = "compile_commands.json"
+source_roots = []
+exclude_paths = ["build", "BUILD"]
 ```
 
 ## Source root auto-detection
