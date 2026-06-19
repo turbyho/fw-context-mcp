@@ -462,6 +462,60 @@ class TestRefs:
         rows = find_refs(populated_db, "hash-deadbeef", "nonexistent")
         assert rows == []
 
+    def test_find_refs_with_partial_namespace(self, populated_db):
+        """Partially-qualified names (Class::method) resolve via suffix LIKE."""
+        fid = upsert_file(populated_db, "hash-deadbeef", "/tmp/wrapper.cpp", "cpp")
+        insert_symbols_batch(populated_db, [
+            ("hash-deadbeef", fid, "src/modem.cpp",
+             split_tokens("send", "ns::DRIVER::send"),
+             "U_drv_send", "send", "ns::DRIVER::send", "method",
+             100, 1, 0, 1, "void send(char* data)", "", None),
+            ("hash-deadbeef", fid, "src/wrapper.cpp",
+             split_tokens("transmit", "ns::WRAPPER::transmit"),
+             "U_wrp_xmit", "transmit", "ns::WRAPPER::transmit", "method",
+             50, 1, 0, 1, "void transmit()", "", None),
+        ])
+        # Reference: WRAPPER::transmit calls DRIVER::send
+        insert_refs_batch(populated_db, [
+            ("hash-deadbeef", "U_drv_send", "src/wrapper.cpp", 55, "U_wrp_xmit", "call"),
+        ])
+
+        # Partially-qualified name should resolve via suffix LIKE
+        rows = find_refs(populated_db, "hash-deadbeef", "DRIVER::send", ref_kind="call")
+        assert len(rows) == 1
+        assert rows[0]["caller_qname"] == "ns::WRAPPER::transmit"
+
+        # Fully-qualified still works
+        rows = find_refs(populated_db, "hash-deadbeef", "ns::DRIVER::send", ref_kind="call")
+        assert len(rows) == 1
+
+    def test_find_refs_partial_namespace_aggregate(self, populated_db):
+        """Partially-qualified class name resolves for aggregate prefix matching."""
+        fid = upsert_file(populated_db, "hash-deadbeef", "/tmp/drv.cpp", "cpp")
+        # Use USRs where method USR shares class USR prefix (matching libclang convention)
+        insert_symbols_batch(populated_db, [
+            ("hash-deadbeef", fid, "src/drv.cpp",
+             split_tokens("DRIVER", "ns::DRIVER"),
+             "c:@N@ns@S@DRIVER", "DRIVER", "ns::DRIVER", "class",
+             1, 1, 0, 1, "", "", None),
+            ("hash-deadbeef", fid, "src/drv.cpp",
+             split_tokens("send", "ns::DRIVER::send"),
+             "c:@N@ns@S@DRIVER@F@send#1", "send", "ns::DRIVER::send", "method",
+             10, 1, 0, 1, "void send()", "", None),
+            ("hash-deadbeef", fid, "src/main.cpp",
+             split_tokens("main", "main"),
+             "U_main", "main", "main", "function",
+             1, 1, 0, 1, "int main()", "", None),
+        ])
+        insert_refs_batch(populated_db, [
+            ("hash-deadbeef", "c:@N@ns@S@DRIVER@F@send#1", "src/main.cpp", 5, "U_main", "call"),
+        ])
+
+        # Partially-qualified class name → aggregate prefix match
+        rows = find_refs(populated_db, "hash-deadbeef", "DRIVER")
+        assert len(rows) == 1
+        assert rows[0]["caller_name"] == "main"
+
 
 class TestEnumValue:
     """Enum constant values are stored and returned."""
