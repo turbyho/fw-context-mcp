@@ -130,7 +130,10 @@ name = "my-mbed-app"
 [build]
 # system = "mbed-os"                     # auto-detected from .mbed
 # target = "P_ECB_BOARD"                # override auto-detected target
+# toolchain = "GCC_ARM"                  # auto-detected from .mbed
 # profile = "develop"                    # best for indexing
+# app_config = "mbed_app.json"
+# extra_profiles = ["lto.json"]
 # defines = ["VERSION_FW_MAJOR=4", "DEV"]  # extra -D macros
 
 [index]
