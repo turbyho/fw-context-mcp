@@ -1856,7 +1856,7 @@ async def smart_search(
 async def semantic_search(
     query: Annotated[str, Field(description="Natural language description, 5-15 words. E.g. 'parcel locker state machine' or 'how does the modem connect?'.")],
     project_root: Annotated[str | None, Field(description="Project root. Auto-detected if omitted.")] = None,
-    threshold: Annotated[float, Field(description="Minimum cosine similarity (0.0-1.0). Default 0.55 is calibrated for mxbai-embed-large. Use 0.50 for exploratory, 0.60 for high-precision.")] = 0.55,
+    threshold: Annotated[float, Field(description="Minimum cosine similarity (0.0-1.0). Default 0.60. Use 0.55 for exploratory, 0.50 for broad search.")] = 0.60,
     limit: Annotated[int, Field(description="Maximum results (default 20, max 100).")] = 20,
 ) -> list[dict]:
     """Read-only. Semantic search using pre-computed symbol embeddings.
@@ -1893,7 +1893,7 @@ async def semantic_search(
         query: Natural language description of what you're looking for.
                Be specific — 5–15 words works best.
         project_root: Project root. Auto-detected if omitted.
-        threshold: Minimum cosine similarity (0.0-1.0). Default 0.55.
+        threshold: Minimum cosine similarity (0.0-1.0). Default 0.60.
         limit: Maximum number of results (default 20, max 100).
 
     Returns:
