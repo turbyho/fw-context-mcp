@@ -6,16 +6,21 @@ mcp-name: io.github.turbyho/fw-context-mcp
 [![License](https://img.shields.io/badge/license-MIT-yellow.svg)](LICENSE)
 [![Glama](https://glama.ai/mcp/servers/turbyho/fw-context-mcp/badges/score.svg)](https://glama.ai/mcp/servers/turbyho/fw-context-mcp)
 
-**Your AI agent's C/C++ codebase co-pilot** — think of it as a build-aware search
-engine that sits between your AI assistant and your code. It parses the exact
-compiler flags from `compile_commands.json` with [libclang](https://clang.llvm.org/),
-extracts every function, class, method, and enum into a persistent SQLite index, then
-gives your AI agent 22 tools to search, navigate, and analyze the codebase — from
-full-text symbol search and call-graph traversal to semantic embedding search and
-dead code detection.
+**Working on an embedded C/C++ project — Zephyr, PlatformIO, Mbed OS, Arduino, FreeRTOS, and beyond — and want more from your AI assistant than just reading files?**
 
-No grepping through header files. No guessing which `#ifdef` branch is active. No
-hallucinated function names. Your AI agent sees what the compiler sees.
+Your AI agent can open `main.cpp`, but it doesn't know who calls `uart_init`, which
+functions are dead, or how data flows from a sensor to the modem. Every question
+burns tokens repeatedly re-reading headers and source, and you still end up in the
+wrong `#ifdef` branch.
+
+fw-context gives your AI agent a compiler-accurate map of your codebase. It parses
+your actual build flags from `compile_commands.json` with libclang and builds a
+persistent index that sees active `#ifdef` branches exactly like your compiler does.
+22 tools for symbol lookup, call-graph traversal, full-text and semantic search,
+dead code detection, and hotspot analysis. Ask in natural language, get precise
+answers. No grepping. No hallucination.
+
+If your AI agent works with embedded C/C++, you want this.
 
 ## What it does
 
