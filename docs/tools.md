@@ -167,6 +167,8 @@ Output: [{"name": "uart_init", "qualified_name": "drv::uart_init", "kind": "func
           "signature": "void uart_init(int baudrate)", "docstring": "Initialize UART"}, …]
 ```
 
+Enum constants include `enum_value` (the integer value) when non-None.
+
 **FTS5 syntax:**
 - `uart*` — prefix wildcard
 - `"spi transfer"` — exact phrase match
@@ -187,6 +189,8 @@ Output: [{"name": "uart_init", "qualified_name": "drv::uart_init", "kind": "func
 
 Definitions are sorted before declarations. Use `exact: true` for exact name
 match; the default is prefix match (`uart` → `uart_init`, `uart_write`, …).
+
+Enum constants include `enum_value` when non-None.
 
 #### `smart_search`
 
@@ -222,9 +226,25 @@ Output: {"file": "src/modem_msg.cpp", "total_symbols": 426,
            "variable":  [{"name": "_buffer_msg", "line": 105}, …],
            "constructor": [{"name": "ModemMsg", "line": 130, "signature": "void ModemMsg(…)"}, …],
            "function":  [{"name": "memset", "line": 94}, …],
-           "struct":    [{"name": "buffer", "line": 3561}, …]
+           "struct":    [{"name": "buffer", "line": 3561}, …],
+           "enum_constant": {
+             "count": 8,
+             "subgroups": [
+               {"name": "StatusCode", "count": 5,
+                "constants": [
+                  {"name": "OPERATION_SUCCESSFUL", "enum_value": 1, "line": 21},
+                  {"name": "TOKEN_INVALID", "enum_value": -2, "line": 23}, …]},
+               {"name": "State", "count": 3,
+                "constants": [{"name": "Idle", "enum_value": 0, "line": 10}, …]}
+             ]
+           }
          }}
 ```
+
+Enum constants are grouped into `subgroups` by parent enum. Each subgroup has
+`name` (parent enum), `count` (real total, even when `max_per_kind` limits
+`constants`), and a `constants` list with `name`, `qualified_name`, `line`,
+and `enum_value` (integer value, when available).
 
 Pass a relative path (`src/main.cpp`) or just the filename (`main.cpp` — suffix
 match). Use this instead of `Read` on large files — a 4300-line file returns
@@ -243,6 +263,21 @@ Output: {"name": "adc_read", "kind": "function", "file": "/path/src/adc.c",
 
 Uses libclang's `end_line` for exact body boundaries. Falls back to
 brace-matching for older indexes.
+
+For enum constants, the result includes `enum_value` (the integer value).
+For enums, the result includes a `constants` array listing all member
+constants with their names and values:
+
+```
+Input:  {"name": "BleCmd::StatusCode"}
+Output: {"name": "StatusCode", "kind": "enum", "file": "/path/src/ble_cmd.h",
+         "line": 20, "signature": "",
+         "constants": [
+           {"name": "OPERATION_SUCCESSFUL", "enum_value": 1},
+           {"name": "TOKEN_INVALID", "enum_value": -2}
+         ],
+         "source": "  20  enum StatusCode {\n  …\n  24  }"}
+```
 
 #### `explain_symbol`
 
@@ -281,6 +316,9 @@ Output: {"name": "modem_connect", "kind": "function",
 
 Designed as one-shot LLM context — answers "what does this do and how does it fit?"
 in a single call. Returns all direct callers and callees (no artificial limit).
+
+For enum constants, includes `enum_value`. For enums, includes a `constants`
+array with all member constants and their values (same shape as `get_source`).
 
 ### Call graph
 

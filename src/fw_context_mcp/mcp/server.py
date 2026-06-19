@@ -369,7 +369,8 @@ def lookup_symbol(
 
     Returns all declarations and definitions matching the name across the
     entire indexed codebase. Prefer this over search_code when you know the
-    exact symbol name. Use search_code for keyword/concept search.
+    exact symbol name or a prefix of it (``uart_`` finds all UART symbols).
+    Use search_code for keyword/concept search when you don't know the name.
 
     Read-only: yes. May auto-reindex stale files (non-blocking).
 
@@ -383,7 +384,8 @@ def lookup_symbol(
 
     Returns:
         list[dict]: Symbols with name, qualified_name, kind, file, line,
-        signature, docstring, is_definition fields. Empty if not found.
+        signature, docstring, is_definition fields. Enum constants include
+        ``enum_value`` with the integer value. Empty if not found.
     """
     try:
         root = resolve_project_root(project_root)
@@ -453,6 +455,7 @@ def lookup_symbol(
                     "is_definition": bool(r["is_definition"]),
                     "signature": r["signature"],
                     "docstring": r["docstring"],
+                    **({"enum_value": r["enum_value"]} if r["enum_value"] is not None else {}),
                 }
                 for r in rows
             ]
@@ -743,7 +746,12 @@ def get_source(
     name: Annotated[str, Field(description="Fully qualified symbol name. Returns exact function body via libclang extent.")],
     project_root: Annotated[str | None, Field(description="Project root. Auto-detected if omitted.")] = None,
 ) -> dict:
-    """Return the source code of a symbol's definition — no LLM, fast."""
+    """Return the source code of a symbol's definition — no LLM, fast.
+
+    For enums, includes a ``constants`` array listing all member constants
+    with their names and integer values. Enum constants include their
+    ``enum_value`` field.
+    """
     db_path, cfg, project_id, root = _resolve_context(project_root)
     if not db_path.exists():
         return {"error": f"No index found for {root}. Run 'fw-context index' first."}
@@ -768,6 +776,27 @@ def get_source(
                 "signature": row["signature"] or "",
                 "is_definition": bool(row["is_definition"]),
             }
+            if row["enum_value"] is not None:
+                result["enum_value"] = row["enum_value"]
+            # For enums, collect all constants with their values
+            if row["kind"] == "enum":
+                qn = row["qualified_name"]
+                const_rows = conn.execute(
+                    """SELECT name, qualified_name, line, enum_value
+                       FROM symbols
+                       WHERE config_hash = ? AND kind = 'enum_constant'
+                         AND (qualified_name LIKE ? OR qualified_name LIKE ?)
+                       ORDER BY line""",
+                    (cfg_data["config_hash"], f"{qn}::%", f"%{qn}::%"),
+                ).fetchall()
+                if const_rows:
+                    result["constants"] = [
+                        {
+                            "name": c["name"],
+                            **({"enum_value": c["enum_value"]} if c["enum_value"] is not None else {}),
+                        }
+                        for c in const_rows
+                    ]
             end_line = row["end_line"] or 0
             line_no = row["line"]
     finally:
@@ -795,6 +824,12 @@ def get_file_map(
     Each kind has count (total) and items (first N, default 30).
     Set max_per_kind=0 for unlimited, signatures=true for full sigs.
 
+    Enum constants (``enum_constant``) are grouped into ``subgroups`` by
+    parent enum. Each subgroup has ``name``, ``count``, and ``constants``
+    (list of ``{name, qualified_name, line, enum_value}``). The subgroup
+    count reflects the real total even when ``max_per_kind`` limits the
+    constants list.
+
     Read-only: yes. No side effects. Use before reading a large file to
     orient yourself — see what functions, classes, and enums it defines.
 
@@ -805,7 +840,8 @@ def get_file_map(
         max_per_kind: Max items per kind group (default 30, 0 = unlimited).
 
     Returns:
-        dict: {file, total_symbols, symbols: {kind: {count, items[]}}}
+        dict: {file, total_symbols, symbols: {kind: {count, items[],
+        subgroups?[]}}}
     """
     db_path, cfg, project_id, root = _resolve_context(project_root)
     if not db_path.exists():
@@ -856,6 +892,10 @@ def get_symbol_context(
     it fit in the system?" in a single response.  Returns all direct callers
     and callees (no artificial limit).  For transitive exploration use
     ``find_all_callers_recursive`` / ``find_callees_recursive``.
+
+    For enums, includes a ``constants`` array listing all member constants
+    with their names and integer values. Enum constants include their
+    ``enum_value`` field.
     """
     db_path, cfg, project_id, root = _resolve_context(project_root)
     if not db_path.exists():
@@ -900,6 +940,26 @@ def get_symbol_context(
                  "ref_kind": c["ref_kind"]}
                 for c in callees_rows
             ]
+
+            # For enums, collect all constants with their values
+            enum_constants: list[dict] = []
+            if row["kind"] == "enum":
+                qn = row["qualified_name"]
+                const_rows = conn.execute(
+                    """SELECT name, qualified_name, line, enum_value
+                       FROM symbols
+                       WHERE config_hash = ? AND kind = 'enum_constant'
+                         AND (qualified_name LIKE ? OR qualified_name LIKE ?)
+                       ORDER BY line""",
+                    (config_hash, f"{qn}::%", f"%{qn}::%"),
+                ).fetchall()
+                enum_constants = [
+                    {
+                        "name": c["name"],
+                        **({"enum_value": c["enum_value"]} if c["enum_value"] is not None else {}),
+                    }
+                    for c in const_rows
+                ]
     finally:
         conn.close()
 
@@ -915,6 +975,10 @@ def get_symbol_context(
         "callers": callers_list,
         "callees": callees_list,
     }
+    if row["enum_value"] is not None:
+        result["enum_value"] = row["enum_value"]
+    if enum_constants:
+        result["constants"] = enum_constants
     if source:
         result["source"] = source[:6000] if len(source) > 6000 else source
     return result
@@ -966,7 +1030,18 @@ def find_callers(
     project_root: Annotated[str | None, Field(description="Project root. Auto-detected if omitted.")] = None,
     limit: Annotated[int, Field(description="Maximum results.")] = 50,
 ) -> list[dict]:
-    """Find call sites of a function/method — who calls ``name`` (direct + indirect via function pointers)."""
+    """Find call sites of a function/method — who calls ``name`` (direct + indirect via function pointers).
+
+    Use when you need a quick, flat list of immediate callers. For the full
+    transitive call tree (who calls this indirectly through other functions),
+    use ``find_all_callers_recursive``.  For all references including reads
+    and member accesses, use ``find_references``.  For a path between two
+    specific symbols, use ``find_call_path``.
+
+    Requires the reference index (``fw-context index`` — refs are on by
+    default).  Only direct call sites are returned; callers more than one
+    hop away are not included.
+    """
     return _references_result(name, project_root, ref_kind=["call", "indirect"], limit=limit, caller_mode=True)
 
 
@@ -1026,10 +1101,15 @@ def find_call_path(
 ) -> list[dict]:
     """Find call paths between two functions via BFS in the call graph.
 
-    Returns up to 5 shortest paths, each with ``depth`` (edge count) and
-    ``chain`` (e.g. ``"main → app_run → modem_init"``).
+    Use to answer "how does A reach B?" — e.g. tracing how a high-level
+    event handler eventually calls a low-level driver.  Returns up to 5
+    shortest paths, each with ``depth`` (edge count) and ``chain``
+    (e.g. ``"main → app_run → modem_init"``).
 
-    Requires refs indexed (``fw-context index --refs``).
+    For one-sided exploration use ``find_all_callers_recursive`` (who reaches
+    this?) or ``find_callees_recursive`` (what does this reach?).
+    Requires both symbols to be in the index and refs enabled
+    (``fw-context index`` — refs on by default).
     """
     root, config_hash, err = _refs_guard(project_root)
     if err:
@@ -1056,7 +1136,14 @@ def find_all_callers_recursive(
 ) -> list[dict]:
     """Find all transitive callers — who calls *name*, directly or indirectly.
 
-    Returns deduplicated results with ``depth`` (shortest path length to target).
+    Use for impact analysis: "if I change this function, how far does the
+    ripple go?"  Returns callers at depth 1 (direct), depth 2 (callers of
+    callers), up to ``max_depth`` (default 5).  Results are deduplicated —
+    each caller appears once at its shortest distance to the target.
+
+    For a flat, single-level caller list use ``find_callers`` (faster).
+    Requires the reference index (``fw-context index`` — refs on by default).
+    BFS from the target outward; performance scales with call-graph fan-out.
     """
     root, config_hash, err = _refs_guard(project_root)
     if err:
@@ -1081,7 +1168,17 @@ def find_callees_recursive(
     max_depth: Annotated[int, Field(description="Maximum BFS depth for transitive search (default 5).")] = 5,
     limit: Annotated[int, Field(description="Maximum results (default 50).")] = 50,
 ) -> list[dict]:
-    """Find all transitive callees — what *name* calls, directly or indirectly."""
+    """Find all transitive callees — what *name* calls, directly or indirectly.
+
+    Use for dependency analysis: "what does this function depend on to do
+    its job?"  Returns callees at depth 1 (direct), depth 2 (callees of
+    callees), up to ``max_depth`` (default 5).  Results are deduplicated
+    by shortest distance.
+
+    For direct callees only, ``get_symbol_context`` gives a faster flat
+    list along with the function body and callers.
+    Requires the reference index (``fw-context index`` — refs on by default).
+    """
     root, config_hash, err = _refs_guard(project_root)
     if err:
         return err
@@ -1106,9 +1203,14 @@ def find_dead_code(
 ) -> list[dict]:
     """Find functions/methods that are defined but never called.
 
-    Expect false positives: constructors called via factories or template
-    instantiation, interrupt handlers (ISRs), virtual method overrides, and
-    weak-aliased symbols often have no direct calls in the reference index.
+    Use to spot unused code candidates.  Expect false positives:
+    constructors called via factories or template instantiation, interrupt
+    handlers (ISRs), virtual method overrides, and weak-aliased symbols
+    often have no direct calls in the reference index.  Verify each hit
+    with ``find_callers`` before deleting.
+
+    Use ``exclude_paths`` to filter vendor SDK noise (e.g.
+    ``['mbed-os/%', 'zephyr/%']``). Requires the reference index.
     """
     root, config_hash, err = _refs_guard(project_root)
     if err:
@@ -1239,8 +1341,9 @@ def trace_data_flow(
     the system before reaching its destination.
 
     **Experimental.**  Does not resolve type transformations (e.g. CBOR
-    encoding).  Best used together with ``find_call_path`` to verify specific
-    paths.
+    encoding, serialization, void-pointer casts).  Best used as a starting
+    point, then verify specific paths with ``find_call_path``.  For exact
+    call-graph queries without type tracking, use the ``find_*`` family.
     """
     root, config_hash, err = _refs_guard(project_root)
     if err:
@@ -1320,7 +1423,17 @@ def find_hotspots(
     project_root: Annotated[str | None, Field(description="Project root. Auto-detected if omitted.")] = None,
     limit: Annotated[int, Field(description="Number of top-called functions to return (default 20).")] = 20,
 ) -> list[dict]:
-    """Find the most-called functions ranked by caller count."""
+    """Find the most-called functions ranked by caller count.
+
+    Use for high-level impact assessment: changing a hotspot affects many
+    call sites.  The result tells you which functions carry the most
+    "architectural weight" — good targets for refactoring, optimization,
+    or extra testing.
+
+    Requires the reference index (``fw-context index`` — refs on by default).
+    For the callers of a specific hotspot, follow up with ``find_callers``
+    or ``find_all_callers_recursive``.
+    """
     root, config_hash, err = _refs_guard(project_root)
     if err:
         return err
@@ -1370,7 +1483,8 @@ def search_code(
 
     Returns:
         list of dicts, each with: name, qualified_name, kind, file, line,
-        is_definition, signature, docstring.
+        is_definition, signature, docstring. Enum constants include
+        ``enum_value`` with the integer value.
     """
     try:
         root = resolve_project_root(project_root)
@@ -1427,6 +1541,8 @@ def search_code(
                     "signature": r["signature"],
                     "docstring": r["docstring"],
                 }
+                if r["enum_value"] is not None:
+                    d["enum_value"] = r["enum_value"]
                 if fallback_used:
                     d["_fallback"] = "lookup_symbol"
                 return d
