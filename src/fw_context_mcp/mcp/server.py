@@ -13,14 +13,13 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Annotated
 
-from pydantic import Field
-
 from mcp.server.fastmcp import FastMCP
+from pydantic import Field
 
 from ..config import Config, derive_project_id
 from ..config import load as load_config
-from ..indexer.compile_commands import parse as parse_cc
 from ..indexer import db as index_db
+from ..indexer.compile_commands import parse as parse_cc
 from ..indexer.db import (
     CURRENT_SCHEMA_VERSION,
     DatabaseCorruptionError,
@@ -52,13 +51,15 @@ mcp = FastMCP(
         "Code reading: get_file_map (symbol table of contents) → get_source (function "
         "body, fast) or get_symbol_context (body + callers + callees in one call).\n\n"
         "Search: lookup_symbol (by exact/prefix name), search_code (by FTS5 keywords), "
-        "smart_search (natural language via Ollama, slow).\n\n"
-        "Call graph (refs must be indexed): find_callers, find_call_path, "
-        "find_all_callers_recursive, find_callees_recursive, find_hotspots, "
-        "find_dead_code, find_wrapper_callers, trace_data_flow.\n\n"
+        "smart_search (natural language via Ollama, slow), semantic_search (by "
+        "concept/embedding, cosine similarity), explain_symbol (plain-English "
+        "symbol explanation via Ollama).\n\n"
+        "Call graph (refs must be indexed): find_callers, find_references, "
+        "find_call_path, find_all_callers_recursive, find_callees_recursive, "
+        "find_hotspots, find_dead_code, find_wrapper_callers, trace_data_flow.\n\n"
         "Maintenance: reindex_file (after editing a file), reset_index (destructive! "
-        "re-index from scratch), check_ollama (before smart_search/explain_symbol), "
-        "list_projects (discover indexed projects)."
+        "re-index from scratch), check_ollama (before smart_search/explain_symbol/"
+        "semantic_search), list_projects (discover indexed projects)."
     ),
 )
 
@@ -277,10 +278,17 @@ def get_active_build(
     Read-only: yes. Call at session start to check if the index exists,
     how many symbols it contains, and whether it is stale (needs re-index).
 
+    ``stale`` is True when any of: (1) ``compile_commands.json`` changed
+    since the last index, (2) source files were modified after indexing,
+    or (3) the index schema is older than the current code expects
+    (``schema_version < current_schema``).  Cases (1) and (2) are handled
+    transparently by auto-reindex on query; case (3) requires a full
+    ``fw-context index`` — remind the user.
+
     Returns:
         dict: {index_exists, project_id, total_symbols, total_files,
         total_refs, config_hash, last_indexed (ISO timestamp),
-        stale (bool — True if compile_commands.json is newer than index),
+        stale (bool — any staleness condition), modified_files_count (int),
         schema_version (int — DB schema version), current_schema (int — code expects)}
     """
     root = resolve_project_root(project_root)
@@ -1029,6 +1037,9 @@ def _references_result(name: str, project_root: str | None, ref_kind: str | list
             if not cfg_data:
                 return [{"error": "No build config indexed."}]
             config_hash = cfg_data["config_hash"]
+            symbol = _lookup_definition(conn, config_hash, name)
+            if symbol is None:
+                return [{"error": f"Symbol not found: {name}"}]
             if count_refs(conn, config_hash) == 0:
                 return [{"info": (
                     "No references indexed. Refs are on by default — "
@@ -1039,7 +1050,7 @@ def _references_result(name: str, project_root: str | None, ref_kind: str | list
             rows = find_refs(conn, config_hash, name, ref_kind=ref_kind, limit=limit)
             if not rows:
                 label = "callers" if caller_mode else "references"
-                return [{"info": f"No {label} found for '{name}'. Check the name (exact match) and that the index is current."}]
+                return [{"info": f"No {label} found for '{name}'."}]
             result: list[dict] = [
                 {
                     "file": abs_path(root, r["from_file"]),
@@ -1150,6 +1161,10 @@ def find_call_path(
     if open_err:
         return [open_err]
     try:
+        if _lookup_definition(conn, config_hash, from_name) is None:
+            return [{"error": f"Symbol not found: {from_name}"}]
+        if _lookup_definition(conn, config_hash, to_name) is None:
+            return [{"error": f"Symbol not found: {to_name}"}]
         rows = index_db.find_call_path(conn, config_hash, from_name, to_name, max_depth=max_depth)
         if not rows:
             return [{"info": f"No path found from '{from_name}' to '{to_name}' within depth {max_depth}."}]
@@ -1184,6 +1199,8 @@ def find_all_callers_recursive(
     if open_err:
         return [open_err]
     try:
+        if _lookup_definition(conn, config_hash, name) is None:
+            return [{"error": f"Symbol not found: {name}"}]
         rows = index_db.find_all_callers_recursive(conn, config_hash, name, max_depth=max_depth, limit=limit)
         if not rows:
             return [{"info": f"No callers found for '{name}'."}]
@@ -1218,6 +1235,8 @@ def find_callees_recursive(
     if open_err:
         return [open_err]
     try:
+        if _lookup_definition(conn, config_hash, name) is None:
+            return [{"error": f"Symbol not found: {name}"}]
         rows = index_db.find_callees_recursive(conn, config_hash, name, max_depth=max_depth, limit=limit)
         if not rows:
             return [{"info": f"No callees found for '{name}'."}]
@@ -1230,7 +1249,8 @@ def find_callees_recursive(
 def find_dead_code(
     project_root: Annotated[str | None, Field(description="Project root. Auto-detected if omitted.")] = None,
     limit: Annotated[int, Field(description="Maximum results (default 100).")] = 100,
-    exclude_paths: Annotated[list[str] | None, Field(description="File path LIKE patterns to exclude. E.g. ['mbed-os/%', 'zephyr/%'] for SDK paths. No default — pass explicitly to filter vendor noise.")] = None,
+    exclude_paths: Annotated[list[str] | None, Field(description="Additional LIKE patterns to exclude. Merged with defaults from config. E.g. ['lib/%'].")] = None,
+    project_only: Annotated[bool, Field(description="When True (default), auto-excludes SDK/vendor paths (mbed-os/%, .pio/%, zephyr/%, build/%) and applies project config exclude_paths. Set False to see all results.")] = True,
 ) -> list[dict]:
     """Read-only. Find functions/methods that are defined but never called.
 
@@ -1240,18 +1260,57 @@ def find_dead_code(
     often have no direct calls in the reference index.  Verify each hit
     with ``find_callers`` before deleting.
 
-    Use ``exclude_paths`` to filter vendor SDK noise (e.g.
-    ``['mbed-os/%', 'zephyr/%']``). Requires the reference index.
+    By default, SDK/vendor paths are auto-excluded based on the build
+    system (mbed-os/ for Mbed OS, .pio/ for PlatformIO, zephyr/ + build/
+    + modules/ for Zephyr), and project config exclude_paths are applied.
+    Use ``project_only=False`` to see all results including vendor code.
+    Requires the reference index.
     """
     root, config_hash, err = _refs_guard(project_root)
     if err:
         return err
+
+    # Build effective exclude list: config defaults + auto-SDK + user-supplied
+    effective_excludes: list[str] = []
+
+    if project_only:
+        # Auto-detect SDK paths from build system
+        build_system = _detect_build_system(root)
+        if build_system == "mbed-os":
+            effective_excludes.append("mbed-os/%")
+        elif build_system == "platformio":
+            effective_excludes.extend([".pio/%", "%.platformio/%"])
+        elif build_system == "zephyr":
+            effective_excludes.extend(["zephyr/%", "build/%", "modules/%"])
+
+        # Apply project config exclude_paths
+        try:
+            cfg = load_config(project_root=root)
+            effective_excludes.extend(cfg.index.exclude_paths)
+        except Exception:
+            pass
+
+    # Merge user-supplied excludes (append, don't replace)
+    if exclude_paths:
+        effective_excludes.extend(exclude_paths)
+
+    # Deduplicate while preserving order
+    seen: set[str] = set()
+    final_excludes = []
+    for p in effective_excludes:
+        if p not in seen:
+            seen.add(p)
+            final_excludes.append(p)
+
     db_path = _db_path(root)
     conn, open_err = _open_db_safe(db_path)
     if open_err:
         return [open_err]
     try:
-        rows = index_db.find_dead_code(conn, config_hash, limit=limit, exclude_paths=exclude_paths)
+        rows = index_db.find_dead_code(
+            conn, config_hash, limit=limit,
+            exclude_paths=final_excludes if final_excludes else None,
+        )
         if not rows:
             return [{"info": "No dead code found — every defined function has at least one caller."}]
         return rows
@@ -1279,7 +1338,11 @@ def find_wrapper_callers(
     if open_err:
         return [open_err]
     try:
-        # Resolve driver class USR — find all methods of the class
+        # Resolve driver class — check it exists in the index
+        if _lookup_definition(conn, config_hash, class_name) is None:
+            return [{"error": f"Symbol not found: {class_name}"}]
+
+        # Find all methods of the class
         driver_methods = conn.execute(
             """SELECT s.usr, s.name, s.qualified_name
                FROM symbols s
@@ -1573,9 +1636,9 @@ def search_code(
                     min_matches = max(1, len(terms) - 1)
                     like_cases = []
                     for term in terms:
-                        esc = term.replace("'", "''")
+                        esc = term.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_").replace("'", "''")
                         like_cases.append(
-                            f"CASE WHEN s.name_tokens LIKE '%{esc}%' THEN 1 ELSE 0 END"
+                            f"CASE WHEN s.name_tokens LIKE '%{esc}%' ESCAPE '\\' THEN 1 ELSE 0 END"
                         )
                     match_sum = " + ".join(like_cases)
                     rows = c.execute(
@@ -1591,10 +1654,10 @@ def search_code(
             if not rows and len(terms) == 1:
                 # Step 4: single-term last resort — LIKE on docstring (in
                 # case FTS5 tokenizer missed something the raw text contains).
-                esc = terms[0].replace("'", "''")
+                esc = terms[0].replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_").replace("'", "''")
                 rows = c.execute(
                     f"""SELECT s.* FROM symbols s
-                       WHERE s.config_hash = ? AND s.docstring LIKE '%{esc}%'
+                       WHERE s.config_hash = ? AND s.docstring LIKE '%{esc}%' ESCAPE '\\'
                        ORDER BY s.is_definition DESC, s.line
                        LIMIT ?""",
                     (config_hash, limit),
@@ -1913,21 +1976,42 @@ def _fallback_to_search_code(
     limit: int,
     warning: str,
 ) -> list[dict]:
-    """Fall back to lexical search when Ollama/embeddings are unavailable."""
-    import sqlite3
+    """Fall back to lexical search when Ollama/embeddings are unavailable.
 
+    Uses the same DB-safe open path as regular tools so migrations and
+    integrity checks run.  Adds a stale warning when the index is out of date.
+    """
+    conn, err = _open_db_safe(db_path)
+    if err:
+        return [err]
     try:
-        conn = sqlite3.connect(str(db_path))
-        conn.row_factory = sqlite3.Row
         with conn:
-            config_hash = conn.execute(
-                "SELECT config_hash FROM build_configs ORDER BY created_at DESC LIMIT 1"
-            ).fetchone()["config_hash"]
-            return _fallback_to_search_code_inner(
+            project_id = derive_project_id(root)
+            cfg = get_active_config(conn, project_id)
+            if not cfg:
+                return [{"error": "No build config indexed."}]
+            config_hash = cfg["config_hash"]
+            results = _fallback_to_search_code_inner(
                 conn, root, query, config_hash, limit, warning
             )
-    except Exception as e:
-        return [{"error": f"semantic_search failed and fallback error: {e}"}]
+            # Collect file paths for staleness check before closing
+            result_files = [abs_path(root, r["file"]) for r in results if "file" in r]
+            stale_f = _stale_files(conn, config_hash, result_files)
+            is_stale = _is_stale(cfg, cfg["compile_commands_path"])
+    finally:
+        conn.close()
+
+    if is_stale:
+        results.insert(0, {
+            "warning": "Index may be stale — compile_commands.json changed. Run 'fw-context index' to update.",
+            "_method": "search_code_fallback",
+        })
+    if stale_f:
+        results.insert(0, {
+            "warning": f"Results may be stale — {len(stale_f)} file(s) changed. Run 'fw-context index' to update.",
+            "_method": "search_code_fallback",
+        })
+    return results
 
 
 def _fallback_to_search_code_inner(
@@ -1977,7 +2061,6 @@ def _fallback_to_search_code_inner(
 @mcp.resource("fw-context://stats")
 def resource_stats() -> str:
     """Return a human-readable summary of all indexed projects."""
-    import json
 
     projects = list_projects()
     if not projects:
