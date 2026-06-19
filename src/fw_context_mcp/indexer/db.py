@@ -646,6 +646,8 @@ def _resolve_target_usr(
     functions — i.e. they have a body) over symbols with no outgoing refs
     (framework struct fields, declaration-only symbols, etc.).
     """
+    esc_name = name.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    suffix_pattern = f"%::{esc_name}"
     rows = conn.execute(
         """SELECT s.usr,
                   COUNT(r_in.rowid) AS ref_count,
@@ -654,11 +656,11 @@ def _resolve_target_usr(
            LEFT JOIN refs r_in ON r_in.to_usr = s.usr AND r_in.config_hash = s.config_hash
            LEFT JOIN refs r_out ON r_out.from_usr = s.usr AND r_out.config_hash = s.config_hash
            WHERE s.config_hash = ?
-             AND (s.name = ? OR s.qualified_name = ?)
+             AND (s.name = ? OR s.qualified_name = ? OR s.qualified_name LIKE ? ESCAPE '\\')
            GROUP BY s.usr
            ORDER BY s.is_definition DESC, ref_count DESC, out_count DESC
            LIMIT 1""",
-        (config_hash, name, name),
+        (config_hash, name, name, suffix_pattern),
     ).fetchone()
     return rows["usr"] if rows else None
 
@@ -1099,6 +1101,12 @@ def find_refs(
     Each result carries the referencing location and, when known, the enclosing
     caller symbol (joined from refs.from_usr → symbols.usr).
 
+    Name resolution uses a three-tier match so partially-qualified names work:
+    1. Exact ``name`` match (e.g. ``send`` matches bare name ``send``)
+    2. Exact ``qualified_name`` match (``zbox::ZMODEM_DRIVER::send``)
+    3. Suffix LIKE on ``qualified_name`` (``ZMODEM_DRIVER::send``
+       matches ``zbox::ZMODEM_DRIVER::send``)
+
     For classes, structs, and enums the index stores references at member-level
     granularity (e.g. ``ZUART::get``, not ``ZUART`` itself).  When the resolved
     symbol is an aggregate type, the query uses USR prefix matching
@@ -1108,13 +1116,17 @@ def find_refs(
     (no filter).
     """
     # ── Resolve name → USR and kind ──────────────────────────────────────
+    # Three-tier match: exact name, exact qualified_name, suffix LIKE
+    # Escape % and _ for the LIKE pattern
+    esc_name = name.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    suffix_pattern = f"%::{esc_name}"
     symbol = conn.execute(
         """SELECT usr, kind FROM symbols
            WHERE config_hash = ?
-             AND (name = ? OR qualified_name = ?)
+             AND (name = ? OR qualified_name = ? OR qualified_name LIKE ? ESCAPE '\\')
            ORDER BY is_definition DESC, qualified_name = ? DESC
            LIMIT 1""",
-        (config_hash, name, name, name),
+        (config_hash, name, name, suffix_pattern, name),
     ).fetchone()
 
     if not symbol:
@@ -1146,13 +1158,14 @@ def find_refs(
         ).fetchall()
 
     # ── Exact USR match for functions, methods, variables, etc. ──────────
-    params = [config_hash, config_hash, name, name] + kind_params + [limit]
+    # Same three-tier name resolution: exact name, exact qualified_name, suffix LIKE
+    params = [config_hash, config_hash, name, name, suffix_pattern] + kind_params + [limit]
     return conn.execute(
         f"""{_SELECT}
               AND r.to_usr IN (
                   SELECT usr FROM symbols
                   WHERE config_hash = ?
-                    AND (name = ? OR qualified_name = ?)
+                    AND (name = ? OR qualified_name = ? OR qualified_name LIKE ? ESCAPE '\\')
               ) {kind_filter}
             ORDER BY r.from_file, r.from_line
             LIMIT ?""",
