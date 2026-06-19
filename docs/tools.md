@@ -211,6 +211,37 @@ Multi-phase pipeline: translate → rough search → LLM query generation
 When Ollama is disabled (`[llm] enabled = false`), falls back to word-split
 FTS5 search. Non-English queries are auto-translated in Phase 0.
 
+#### `semantic_search`
+
+Concept search using pre-computed symbol embeddings. Finds symbols conceptually
+related to a natural-language query, even when the query words don't appear
+literally in the code.
+
+```
+Input:  {"query": "parcel locker state machine", "threshold?": 0.55, "limit?": 20}
+Output: [{"name": "set_shipment", "qualified_name": "Locker::set_shipment",
+          "_similarity": 0.72, "_method": "embedding", …}, …]
+```
+
+Uses cosine similarity over 1024-dimensional embeddings (generated during
+`fw-context index --embeddings`). **When to prefer over `search_code`:**
+conceptual queries ("power consumption" → `get_load_power`) where keywords
+don't match. **When to prefer `search_code`:** known keywords or symbol names
+(`"fram_write"`, `"cbor encode"`).
+
+Results include `_similarity` (cosine similarity score, 0–1) and `_method`
+(`"embedding"` or `"search_code_fallback"`). Source-aware ranking boosts
+project code (1.2×) over vendored SDK paths (0.85×).
+
+**Threshold guidance** (mxbai-embed-large):
+- `0.50` — exploratory, more results
+- `0.55` — balanced (default)
+- `0.60` — high precision
+- `0.65` — strict, may miss relevant symbols
+
+Requires Ollama with an embedding model. Falls back to `search_code` if
+Ollama is unavailable or disabled.
+
 ### Understanding
 
 #### `get_file_map`

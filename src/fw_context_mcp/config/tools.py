@@ -10,11 +10,9 @@ Each supported AI assistant is registered with:
 from __future__ import annotations
 
 import os
-import re
 import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
-
 
 # ── Instruction templates ───────────────────────────────────────────────────
 
@@ -37,8 +35,21 @@ Call `get_active_build()` first. If `stale: true`, remind the user to run
 Prefer `get_source`, `get_file_map`, and `get_symbol_context` for reading
 symbols and functions — they use libclang extents and understand build flags.
 Use normal file reads for broader file context outside indexed symbols.
-Individual tool descriptions and the full call-graph/search workflow are
-described in the MCP tool listings.
+
+### Tool categories
+
+- **Search:** `lookup_symbol` (exact/prefix name), `search_code` (FTS5 keywords),
+  `smart_search` (natural language via Ollama, slow), `semantic_search` (concept
+  embedding, cosine similarity), `explain_symbol` (plain-English via Ollama)
+- **Call graph** (refs must be indexed): `find_callers`, `find_references`,
+  `find_call_path`, `find_all_callers_recursive`, `find_callees_recursive`,
+  `find_hotspots`, `find_dead_code`, `find_wrapper_callers`, `trace_data_flow`
+- **Maintenance:** `reindex_file` (after editing a file), `reset_index`
+  (destructive! re-index from scratch), `check_ollama` (before smart_search/
+  explain_symbol/semantic_search), `list_projects` (discover indexed projects)
+
+Individual tool descriptions and parameters are in the MCP tool listings —
+use the MCP protocol to discover them at runtime.
 
 ### Index setup (first use in a project)
 
@@ -61,9 +72,9 @@ LEAN_CTX_CARVEOUT = """\
 ### lean-ctx compatibility
 
 fw-context query results (`search_code`, `lookup_symbol`, `explain_symbol`,
-`smart_search`, `reindex_file`) return structured C/C++ symbol data. Do NOT
-pipe this structured output through lean-ctx compression — display it with
-native tools. C/C++ code results must stay uncompressed.
+`smart_search`, `semantic_search`, `reindex_file`) return structured C/C++
+symbol data. Do NOT pipe this structured output through lean-ctx compression
+— display it with native tools. C/C++ code results must stay uncompressed.
 
 Reading source files referenced by fw-context results IS fine with `ctx_read`
 — those are regular files on disk, not query output.
