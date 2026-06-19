@@ -6,12 +6,16 @@ mcp-name: io.github.turbyho/fw-context-mcp
 [![License](https://img.shields.io/badge/license-MIT-yellow.svg)](LICENSE)
 [![Glama](https://glama.ai/mcp/servers/turbyho/fw-context-mcp/badges/score.svg)](https://glama.ai/mcp/servers/turbyho/fw-context-mcp)
 
-**MCP server for embedded C/C++ firmware** — gives AI assistants (Claude Code,
-Cursor, OpenCode, etc.) real understanding of your codebase. Parses your actual build
-with [libclang](https://clang.llvm.org/), extracts every symbol, and builds a
-persistent index with full-text search, call graph, and vector embeddings.
+**Your AI agent's C/C++ codebase co-pilot** — think of it as a build-aware search
+engine that sits between your AI assistant and your code. It parses the exact
+compiler flags from `compile_commands.json` with [libclang](https://clang.llvm.org/),
+extracts every function, class, method, and enum into a persistent SQLite index, then
+gives your AI agent 22 tools to search, navigate, and analyze the codebase — from
+full-text symbol search and call-graph traversal to semantic embedding search and
+dead code detection.
 
-No hallucination. No grepping. No reading thousands of framework headers into context.
+No grepping through header files. No guessing which `#ifdef` branch is active. No
+hallucinated function names. Your AI agent sees what the compiler sees.
 
 ## What it does
 
