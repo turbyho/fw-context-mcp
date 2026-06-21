@@ -97,6 +97,8 @@ class Symbol:
     is_virtual: bool = False          # True for virtual CXX_METHOD
     is_pure_virtual: bool = False     # True for pure virtual (= 0) CXX_METHOD
     parent_usr: str = ""    # USR of enclosing class/struct (empty for free functions)
+    is_template: bool = False  # True for CLASS_TEMPLATE, FUNCTION_TEMPLATE declarations
+    template_usr: str = ""   # USR of the primary template (non-empty = this is an instantiation)
 
 
 def _cursor_kind_label(kind: cx.CursorKind) -> str:
@@ -351,6 +353,21 @@ def extract_all(
         ):
             parent_usr = sem_parent.get_usr() or ""
 
+        # Template tracking: detect template declarations and instantiations
+        is_template = cursor.kind in (
+            cx.CursorKind.CLASS_TEMPLATE,
+            cx.CursorKind.FUNCTION_TEMPLATE,
+        )
+        template_usr = ""
+        if not is_template:
+            # Check if this is an instantiation of a template
+            try:
+                specialized = cursor.specialized_template
+                if specialized is not None:
+                    template_usr = specialized.get_usr() or ""
+            except Exception:
+                pass  # specialized_template may fail for some cursor kinds
+
         prev = seen_usrs.get(usr)
         if prev is not None:
             if is_def and not prev:
@@ -376,6 +393,8 @@ def extract_all(
             is_virtual=is_virtual,
             is_pure_virtual=is_pure,
             parent_usr=parent_usr,
+            is_template=is_template,
+            template_usr=template_usr,
         ))
 
         # Collect class/struct definition cursors for inheritance extraction

@@ -123,6 +123,8 @@ def store_symbols_for_unit(
                 int(s.is_virtual),
                 int(s.is_pure_virtual),
                 s.parent_usr,
+                int(s.is_template),
+                s.template_usr,
             ))
         total_syms = insert_symbols_batch(conn, rows)
 

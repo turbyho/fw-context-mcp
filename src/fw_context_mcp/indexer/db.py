@@ -144,6 +144,8 @@ _MIGRATION_ADD_COLUMNS = [
     "ALTER TABLE symbols ADD COLUMN is_virtual INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE symbols ADD COLUMN is_pure_virtual INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE symbols ADD COLUMN parent_usr TEXT NOT NULL DEFAULT ''",
+    "ALTER TABLE symbols ADD COLUMN is_template INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE symbols ADD COLUMN template_usr TEXT NOT NULL DEFAULT ''",
 ]
 
 _SCHEMA = """
@@ -192,6 +194,8 @@ CREATE TABLE IF NOT EXISTS symbols (
     is_virtual     INTEGER NOT NULL DEFAULT 0,
     is_pure_virtual INTEGER NOT NULL DEFAULT 0,
     parent_usr     TEXT    NOT NULL DEFAULT '',
+    is_template    INTEGER NOT NULL DEFAULT 0,
+    template_usr   TEXT    NOT NULL DEFAULT '',
     UNIQUE(config_hash, usr)
 );
 
@@ -200,6 +204,7 @@ CREATE INDEX IF NOT EXISTS idx_symbols_qname       ON symbols(qualified_name);
 CREATE INDEX IF NOT EXISTS idx_symbols_kind        ON symbols(kind);
 CREATE INDEX IF NOT EXISTS idx_symbols_file        ON symbols(file_id);
 CREATE INDEX IF NOT EXISTS idx_symbols_parent     ON symbols(config_hash, parent_usr);
+CREATE INDEX IF NOT EXISTS idx_symbols_template  ON symbols(config_hash, template_usr);
 CREATE INDEX IF NOT EXISTS idx_files_config        ON files(config_hash);
 
 CREATE VIRTUAL TABLE IF NOT EXISTS symbols_fts USING fts5(
@@ -575,7 +580,7 @@ def insert_symbols_batch(
     Each row: (config_hash, file_id, file_path, name_tokens, usr, name,
                qualified_name, kind, line, col, end_line, is_definition,
                signature, docstring, enum_value, is_virtual, is_pure_virtual,
-               parent_usr)
+               parent_usr, is_template, template_usr)
 
     Returns count of rows inserted or upgraded to definition.
     """
@@ -583,8 +588,8 @@ def insert_symbols_batch(
         """INSERT INTO symbols
            (config_hash, file_id, file_path, name_tokens, usr, name, qualified_name, kind,
             line, col, end_line, is_definition, signature, docstring, enum_value,
-            is_virtual, is_pure_virtual, parent_usr)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            is_virtual, is_pure_virtual, parent_usr, is_template, template_usr)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
            ON CONFLICT(config_hash, usr) DO UPDATE SET
                file_id       = excluded.file_id,
                file_path     = excluded.file_path,
@@ -598,7 +603,9 @@ def insert_symbols_batch(
                enum_value    = excluded.enum_value,
                is_virtual    = excluded.is_virtual,
                is_pure_virtual = excluded.is_pure_virtual,
-               parent_usr    = excluded.parent_usr
+               parent_usr    = excluded.parent_usr,
+               is_template   = excluded.is_template,
+               template_usr  = excluded.template_usr
            WHERE excluded.is_definition = 1 AND symbols.is_definition = 0""",
         rows,
     )
@@ -727,6 +734,28 @@ def get_class_members(
            WHERE config_hash = ? AND parent_usr = ?
            ORDER BY kind, name""",
         (config_hash, parent_usr),
+    ).fetchall()
+
+
+def get_template_instances(
+    conn: sqlite3.Connection,
+    config_hash: str,
+    template_usr: str,
+    limit: int = 50,
+) -> list[sqlite3.Row]:
+    """Return all instantiated symbols for a given template USR.
+
+    Each row is a full symbol row for an instantiation whose ``template_usr``
+    matches the given template.
+    """
+    return conn.execute(
+        """SELECT name, qualified_name, kind, file_path, line, col AS column,
+                  signature, is_definition, parent_usr
+           FROM symbols
+           WHERE config_hash = ? AND template_usr = ?
+           ORDER BY file_path, line
+           LIMIT ?""",
+        (config_hash, template_usr, limit),
     ).fetchall()
 
 

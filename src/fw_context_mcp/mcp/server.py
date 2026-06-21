@@ -39,6 +39,7 @@ from ..indexer.db import (
 )
 from ..indexer.db import (
     get_class_members as query_class_members,
+    get_template_instances as query_template_instances,
 )
 from ..llm.ollama import OllamaError, OllamaModelNotFoundError, call_ollama_async, call_ollama_embed, check_setup
 from ..utils import MTIME_TOLERANCE_S, abs_path, resolve_project_root
@@ -66,7 +67,8 @@ mcp = FastMCP(
         "find_hotspots, find_dead_code, find_wrapper_callers, trace_data_flow.\n\n"
         "Inheritance: get_inheritance_chain (C++ class hierarchy — bases and "
         "derived classes), get_class_members (list all methods and fields of a "
-        "class/struct).\n\n"
+        "class/struct), get_template_instances (find concrete instantiations "
+        "of a class or function template).\n\n"
         "Maintenance: reindex_file (after editing a file), reset_index (destructive! "
         "re-index from scratch), check_ollama (before smart_search/explain_symbol/"
         "semantic_search), list_projects (discover indexed projects)."
@@ -530,6 +532,8 @@ def lookup_symbol(
                     "is_definition": bool(r["is_definition"]),
                     "signature": r["signature"],
                     "docstring": r["docstring"],
+                    "is_template": bool(r["is_template"]),
+                    **({"template_usr": r["template_usr"]} if r["template_usr"] else {}),
                     **({"enum_value": r["enum_value"]} if r["enum_value"] is not None else {}),
                     **({"summary": r["summary"]} if r["summary"] else {}),
                     **({"inputs": r["inputs"]} if r["inputs"] else {}),
@@ -1903,6 +1907,75 @@ def get_class_members(
             result["members"] = grouped
             result["member_count"] = len(members)
 
+            return result
+    finally:
+        conn.close()
+
+
+@mcp.tool()
+def get_template_instances(
+    template_name: Annotated[str, Field(description="Template name to find instantiations for. E.g. 'Callback' or 'mbed::Callback'.")],
+    project_root: Annotated[str | None, Field(description="Project root. Auto-detected if omitted.")] = None,
+    limit: Annotated[int, Field(description="Maximum results (default 50).")] = 50,
+) -> list[dict]:
+    """Read-only. Find all template instantiations for a given class or function template.
+
+    Returns concrete instantiations of the template — each with its full type
+    signature (e.g. ``Callback<void(int)>``).  The template declaration itself
+    is also returned as the first result when found.
+
+    Uses the ``template_usr`` column populated during indexing via libclang's
+    ``cursor.specialized_template``.
+
+    Returns:
+        list[dict]: {name, qualified_name, kind, file, line, signature,
+                     is_definition, template_usr}
+    """
+    db_path, cfg, project_id, root = _resolve_context(project_root)
+    if not db_path.exists():
+        return [{"error": f"No index found for {root}. Run 'fw-context index' first."}]
+    conn, err = _open_db_safe(db_path)
+    if err:
+        return [err]
+    try:
+        with conn:
+            cfg_data = get_active_config(conn, project_id)
+            if not cfg_data:
+                return [{"error": "No build config indexed."}]
+            config_hash = cfg_data["config_hash"]
+            row = _lookup_definition(conn, config_hash, template_name)
+            if not row:
+                return [{"error": f"Symbol not found: {template_name}"}]
+            if not row["is_template"]:
+                return [{"error": f"'{template_name}' is not a template (kind: {row['kind']}, is_template: false)."}]
+
+            template_usr = row["usr"]
+            instances = query_template_instances(conn, config_hash, template_usr, limit=limit)
+
+            result: list[dict] = [
+                {
+                    "name": row["name"],
+                    "qualified_name": row["qualified_name"],
+                    "kind": row["kind"],
+                    "file": abs_path(root, row["file_path"]),
+                    "line": row["line"],
+                    "is_definition": bool(row["is_definition"]),
+                    "signature": row["signature"],
+                    "instances": [
+                        {
+                            "name": i["name"],
+                            "qualified_name": i["qualified_name"],
+                            "kind": i["kind"],
+                            "file": abs_path(root, i["file_path"]),
+                            "line": i["line"],
+                            "signature": i["signature"],
+                            "is_definition": bool(i["is_definition"]),
+                        }
+                        for i in instances
+                    ],
+                    "instance_count": len(instances),
+                }
+            ]
             return result
     finally:
         conn.close()
