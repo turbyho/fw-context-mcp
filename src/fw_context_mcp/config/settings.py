@@ -2,8 +2,9 @@
 
 Hierarchy (later overrides earlier):
   1. built-in defaults
-  2. ~/.fw-context/config.toml      (global, per-user)
-  3. <project>/.fw-context/config.toml  (project, committable)
+  2. ~/.fw-context/config.toml           (global, per-user)
+  3. <project>/.fw-context/config.toml   (project, shared — commit to git)
+  4. <project>/.fw-context/local.toml    (project, local — gitignore)
 """
 
 from __future__ import annotations
@@ -19,6 +20,7 @@ __all__ = ["Config", "LLMConfig", "IndexConfig", "ProjectMeta", "load", "derive_
 _GLOBAL_CONFIG_PATH = Path.home() / ".fw-context" / "config.toml"
 _PROJECT_CONFIG_DIR = ".fw-context"
 _PROJECT_CONFIG_NAME = "config.toml"
+_PROJECT_LOCAL_CONFIG_NAME = "local.toml"
 
 _GLOBAL_DEFAULTS = """\
 [index]
@@ -84,7 +86,19 @@ exclude_paths = ["build", "BUILD"]
 #   Set false to disable for faster indexing on very large projects.
 # index_refs = false
 
-# [llm]
+# index_embeddings: generate vector embeddings for semantic search.
+#   On by default. Set false to disable for faster indexing.
+# index_embeddings = false
+
+# LLM and local-path settings belong in local.toml (gitignored).
+# See local.toml for ollama_url, model, db_dir, etc.
+"""
+
+_PROJECT_LOCAL_DEFAULTS_TEMPLATE = """\
+# Local developer settings — NOT committed to git.
+# Overrides values from config.toml where both define the same key.
+
+[llm]
 # enabled = false   # disable Ollama, return raw prompts for the agent to answer
 # ollama_url = "http://localhost:11434"
 # model = "qwen2.5-coder:14b"   # minimum 14B recommended — see global config for options
@@ -92,6 +106,9 @@ exclude_paths = ["build", "BUILD"]
 # debug_log = "~/.fw-context/llm-debug.jsonl"   # write LLM prompts/responses to JSONL
 # analyze_symbols = true    # generate structured symbol descriptions (summary, inputs, outputs) — enabled by default
 # analyze_files = true      # generate per-file summaries (2-3 sentences) — enabled by default
+
+[index]
+# db_dir = "~/.fw-context/index"   # where to store the SQLite index database
 """
 
 
@@ -160,7 +177,8 @@ class Config:
     """Top-level configuration container aggregating all sub-configs.
 
     Loaded from TOML files with hierarchy: built-in defaults → global
-    (``~/.fw-context/config.toml``) → project (``.fw-context/config.toml``).
+    (``~/.fw-context/config.toml``) → shared project (``.fw-context/config.toml``)
+    → local project (``.fw-context/local.toml``).
     Later levels override earlier ones via deep merge.
 
     Attributes:
@@ -291,6 +309,15 @@ def _ensure_project_config(project_root: Path) -> Path:
     return path
 
 
+def _ensure_project_local_config(project_root: Path) -> Path:
+    config_dir = project_root / _PROJECT_CONFIG_DIR
+    path = config_dir / _PROJECT_LOCAL_CONFIG_NAME
+    if not path.exists():
+        config_dir.mkdir(parents=True, exist_ok=True)
+        path.write_text(_PROJECT_LOCAL_DEFAULTS_TEMPLATE)
+    return path
+
+
 def _is_loopback_url(url: str) -> bool:
     """True if *url*'s host is a loopback address.
 
@@ -326,17 +353,25 @@ def load(project_root: Path | None = None) -> Config:
         try:
             proj_data = tomllib.loads(proj_path.read_text())
             data = _deep_merge(data, proj_data)
-            # Security: a committed project config can redirect LLM calls (which
-            # include source-code snippets) to an arbitrary host. Warn loudly.
-            proj_url = (proj_data.get("llm") or {}).get("ollama_url")
-            if proj_url and not _is_loopback_url(proj_url):
-                log.warning(
-                    "Project config %s sets a non-local ollama_url (%s). "
-                    "Source-code snippets in LLM prompts will be sent to that host.",
-                    proj_path, proj_url,
-                )
         except Exception:
             log.exception("Failed to parse %s — ignoring project config", proj_path)
+
+        local_path = _ensure_project_local_config(project_root)
+        try:
+            local_data = tomllib.loads(local_path.read_text())
+            data = _deep_merge(data, local_data)
+        except Exception:
+            log.exception("Failed to parse %s — ignoring local config", local_path)
+
+        # Security: a committed or local config can redirect LLM calls (which
+        # include source-code snippets) to an arbitrary host. Warn loudly.
+        final_url = (data.get("llm") or {}).get("ollama_url")
+        if final_url and not _is_loopback_url(final_url):
+            log.warning(
+                "Config sets a non-local ollama_url (%s). "
+                "Source-code snippets in LLM prompts will be sent to that host.",
+                final_url,
+            )
 
     cfg = _from_dict(data)
     cfg.index.db_dir = cfg.index.db_dir.expanduser().resolve()

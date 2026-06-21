@@ -2,7 +2,14 @@
 
 from pathlib import Path
 
-from fw_context_mcp.config.settings import Config, _deep_merge, _from_dict, derive_project_id
+from fw_context_mcp.config.settings import (
+    Config,
+    _deep_merge,
+    _ensure_project_local_config,
+    _from_dict,
+    derive_project_id,
+    load,
+)
 
 
 class TestDeepMerge:
@@ -94,6 +101,96 @@ class TestDeriveProjectId:
         a.mkdir()
         b.mkdir()
         assert derive_project_id(a) != derive_project_id(b)
+
+
+class TestLocalConfig:
+    """Tests for local.toml — the 4th layer of config hierarchy."""
+
+    def test_local_overrides_shared(self):
+        """local.toml values should override config.toml values."""
+        global_data = {"llm": {"model": "global-model", "ollama_url": "http://localhost:11434"}}
+        shared = {"build": {"board": "nrf52840"}}
+        local = {"llm": {"model": "local-model"}}
+        merged = _deep_merge(global_data, shared)
+        merged = _deep_merge(merged, local)
+        assert merged["build"]["board"] == "nrf52840"  # preserved from shared
+        assert merged["llm"]["model"] == "local-model"  # overridden by local
+        assert merged["llm"]["ollama_url"] == "http://localhost:11434"  # preserved from global
+
+    def test_local_missing_is_ok(self):
+        """Empty local config should not break anything."""
+        global_data = {"llm": {"model": "global-model"}}
+        shared = {"build": {"board": "nrf52840"}}
+        local: dict = {}
+        merged = _deep_merge(global_data, shared)
+        merged = _deep_merge(merged, local)
+        assert merged["llm"]["model"] == "global-model"
+        assert merged["build"]["board"] == "nrf52840"
+
+    def test_local_can_add_new_sections(self):
+        """local.toml can add settings not present in shared config.toml."""
+        shared: dict = {"build": {"board": "nrf52840"}}
+        local = {"llm": {"model": "my-local-model"}}
+        merged = _deep_merge(shared, local)
+        assert merged["build"]["board"] == "nrf52840"
+        assert merged["llm"]["model"] == "my-local-model"
+
+    def test_local_index_db_dir_override(self):
+        """local.toml can override db_dir regardless of config.toml."""
+        shared = {"index": {"source_roots": ["src"], "exclude_paths": ["build"]}}
+        local = {"index": {"db_dir": "/custom/db/path"}}
+        merged = _deep_merge(shared, local)
+        assert merged["index"]["source_roots"] == ["src"]  # preserved
+        assert merged["index"]["exclude_paths"] == ["build"]  # preserved
+        assert merged["index"]["db_dir"] == "/custom/db/path"  # from local
+
+    def test_ensure_project_local_config_creates_file(self, tmpdir):
+        """_ensure_project_local_config creates local.toml with template."""
+        path = _ensure_project_local_config(tmpdir)
+        assert path.exists()
+        assert path.name == "local.toml"
+        content = path.read_text()
+        assert "[llm]" in content
+        assert "db_dir" in content
+
+    def test_ensure_project_local_config_idempotent(self, tmpdir):
+        """Calling _ensure_project_local_config twice doesn't overwrite user edits."""
+        path = _ensure_project_local_config(tmpdir)
+        path.write_text("# my custom config\n[llm]\nmodel = \"my-model\"\n")
+        path2 = _ensure_project_local_config(tmpdir)
+        assert path == path2
+        assert path.read_text() == "# my custom config\n[llm]\nmodel = \"my-model\"\n"
+
+    def test_load_with_local_toml(self, tmpdir, monkeypatch):
+        """load() reads local.toml as the 4th layer."""
+        # Point global config to a temp file that doesn't exist yet
+        fake_home = tmpdir / "fake-home"
+        fake_home.mkdir()
+        monkeypatch.setattr(Path, "home", lambda: fake_home)
+
+        # Create project config (shared)
+        proj_dir = tmpdir / "project"
+        proj_dir.mkdir()
+        fw_dir = proj_dir / ".fw-context"
+        fw_dir.mkdir(parents=True)
+        (fw_dir / "config.toml").write_text("""\
+[build]
+board = "nrf52840"
+
+[index]
+source_roots = ["src"]
+""")
+
+        # Create local config
+        (fw_dir / "local.toml").write_text("""\
+[llm]
+model = "my-local-model"
+""")
+
+        cfg = load(proj_dir)
+        assert cfg.build.board == "nrf52840"
+        assert cfg.index.source_roots == ["src"]
+        assert cfg.llm.model == "my-local-model"
 
 
 class TestSourceRootPaths:

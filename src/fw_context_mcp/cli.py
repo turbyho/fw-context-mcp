@@ -296,12 +296,12 @@ def cmd_init(args: argparse.Namespace) -> int:
     (CLAUDE.md, AGENTS.md, etc.). Respects tool inheritance — e.g. tools based
     on Claude Code read the parent's instructions automatically.
 
-    Writes ``.fw-context/config.toml`` in the project root when using
-    project-scoped injection.
+    Writes ``.fw-context/config.toml`` and ``.fw-context/local.toml`` in the
+    project root when using project-scoped injection.
     """
     import shutil
 
-    from .config.settings import _ensure_project_config
+    from .config.settings import _ensure_project_config, _ensure_project_local_config
     from .config.tools import TOOLS, check_target
 
     # --list-tools: show supported tools and detection status
@@ -424,7 +424,9 @@ def cmd_init(args: argparse.Namespace) -> int:
     # Project-level config (only when something was actually done)
     if ok and not args.instructions_only and not args.dry_run:
         proj_config = _ensure_project_config(project_root)
-        print(f"\n[ok] {proj_config}: project config ready — edit source_roots, excludes, etc.")
+        local_config = _ensure_project_local_config(project_root)
+        print(f"\n[ok] {proj_config}: shared project config ready — edit source_roots, excludes, etc. (commit to git)")
+        print(f"[ok] {local_config}: local developer config ready — edit ollama_url, model, etc. (gitignore)")
 
     if warnings:
         print("\nWarnings:")

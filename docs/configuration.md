@@ -1,22 +1,31 @@
 # Configuration
 
-Complete reference for `.fw-context/config.toml` — global defaults,
-per-project overrides, and every available setting.
+Complete reference for `.fw-context/config.toml` and `.fw-context/local.toml` —
+global defaults, shared project settings, local developer overrides, and every
+available setting.
 
 ## How config works
 
-Two TOML files, merged with **project overrides global**:
+Three levels of TOML files, merged in order (later overrides earlier):
 
 ```
-~/.fw-context/config.toml          global defaults (apply to all projects)
+~/.fw-context/config.toml                global defaults (apply to all projects)
         │
-        ├── merged with ──→  <project>/.fw-context/config.toml   project overrides
+        ├── merged with ──→  <project>/.fw-context/config.toml   shared project config (commit to git)
+        │
+        ├── merged with ──→  <project>/.fw-context/local.toml    local developer overrides (gitignored)
         │
         ▼
     final Config used by fw-context
 ```
 
-Both files are auto-created with sensible defaults on first use.
+**Why two project files?** `config.toml` holds settings that are the same for
+everyone on the project — build parameters, source roots, excludes. Commit it
+to git. `local.toml` holds developer-specific settings — which Ollama model you
+have installed, where your index database lives, whether you want LLM analysis
+enabled. Keep it out of git (add to `.gitignore`).
+
+All files are auto-created with commented-out defaults on first use.
 
 ## Settings reference
 
@@ -42,7 +51,7 @@ Used only when running without `--no-build`.
 
 | Key | Default | Scope | Description |
 |-----|---------|-------|-------------|
-| `db_dir` | `"~/.fw-context/index"` | global | Directory for SQLite index databases. One subdirectory per project. |
+| `db_dir` | `"~/.fw-context/index"` | global, local | Directory for SQLite index databases. One subdirectory per project. |
 | `compile_commands` | `"compile_commands.json"` | project | Path to compilation database. Relative paths resolved from project root. |
 | `source_roots` | `[]` *(auto-detect)* | project | Directories to scan for symbols. **Empty = auto-detect** — scans `src`, `lib`, `app`, `include`, `modules`, `drivers` + framework dirs (`zephyr/`, `mbed-os/`) + top-level dirs from `compile_commands.json`. Set explicitly to narrow or extend: `["src", "lib", "/path/to/framework"]`. |
 | `exclude_paths` | `["build", "BUILD"]` | project | Directories to skip. Useful for generated code, test fixtures, vendored code. |
@@ -51,16 +60,20 @@ Used only when running without `--no-build`.
 
 ### `[llm]` — Ollama
 
+These settings belong in `~/.fw-context/config.toml` (global defaults) or
+`<project>/.fw-context/local.toml` (per-project overrides). They should NOT
+go in the shared `config.toml` — LLM configuration is developer-specific.
+
 | Key | Default | Scope | Description |
 |-----|---------|-------|-------------|
-| `enabled` | `true` | both | Enable Ollama. When `false`, `smart_search` falls back to word-split FTS5, `explain_symbol` returns source + prompt for the AI assistant. |
-| `ollama_url` | `"http://localhost:11434"` | global | Ollama API base URL. Change for remote GPU servers. |
-| `model` | `"qwen2.5-coder:14b"` | both | LLM model tag. Override per-project for different codebases. |
-| `embed_model` | `"mxbai-embed-large:latest"` | both | Embedding model for vector search. Auto-pulled on first use. |
-| `num_ctx` | `16384` | global | Context window in tokens. Accommodates full function bodies during analysis generation. |
-| `analyze_symbols` | `true` | both | Generate per-symbol LLM analysis (summary, inputs, outputs) during indexing. Stored in `llm_analysis` table — symbols become searchable by purpose. |
-| `analyze_files` | `true` | both | Generate per-file LLM summaries (2–3 sentences) during indexing. Returned by `get_file_analysis` and as `file_summary` in `get_file_map`. |
-| `debug_log` | *(none)* | both | Path to JSONL debug log for Ollama prompts + responses. Example: `"~/.fw-context/llm-debug.jsonl"`. |
+| `enabled` | `true` | global, local | Enable Ollama. When `false`, `smart_search` falls back to word-split FTS5, `explain_symbol` returns source + prompt for the AI assistant. |
+| `ollama_url` | `"http://localhost:11434"` | global, local | Ollama API base URL. Change for remote GPU servers. |
+| `model` | `"qwen2.5-coder:14b"` | global, local | LLM model tag. Override per-project for different codebases. |
+| `embed_model` | `"mxbai-embed-large:latest"` | global, local | Embedding model for vector search. Auto-pulled on first use. |
+| `num_ctx` | `16384` | global, local | Context window in tokens. Accommodates full function bodies during analysis generation. |
+| `analyze_symbols` | `true` | global, local | Generate per-symbol LLM analysis (summary, inputs, outputs) during indexing. Stored in `llm_analysis` table — symbols become searchable by purpose. |
+| `analyze_files` | `true` | global, local | Generate per-file LLM summaries (2–3 sentences) during indexing. Returned by `get_file_analysis` and as `file_summary` in `get_file_map`. |
+| `debug_log` | *(none)* | global, local | Path to JSONL debug log for Ollama prompts + responses. Example: `"~/.fw-context/llm-debug.jsonl"`. |
 
 ### `[project]` — Metadata
 
@@ -84,7 +97,9 @@ num_ctx = 16384
 # debug_log = "~/.fw-context/llm-debug.jsonl"
 ```
 
-### Per-project config (`<project>/.fw-context/config.toml`)
+### Shared project config (`<project>/.fw-context/config.toml`)
+
+Commit this file to git. It contains settings that are the same for all developers.
 
 #### Zephyr
 
@@ -101,9 +116,6 @@ board = "nrf52840dk_nrf52840"            # required — your board name
 compile_commands = "build/compile_commands.json"
 source_roots = []
 exclude_paths = ["build", "BUILD"]
-
-[llm]
-# enabled = false                        # set false if you don't use Ollama
 ```
 
 #### PlatformIO / Arduino
@@ -144,6 +156,23 @@ name = "my-mbed-app"
 compile_commands = "compile_commands.json"
 source_roots = []
 exclude_paths = ["build", "BUILD"]
+```
+
+### Local developer config (`<project>/.fw-context/local.toml`)
+
+Keep this file out of git (add to `.gitignore`). It overrides settings from
+`config.toml` and the global config — use it for developer-specific preferences.
+
+```toml
+[llm]
+# enabled = false                        # set false if you don't use Ollama
+# ollama_url = "http://localhost:11434"
+# model = "qwen2.5-coder:14b"           # override if you have a different model
+# analyze_symbols = true
+# analyze_files = true
+
+[index]
+# db_dir = "~/.fw-context/index"        # override if you store indexes elsewhere
 ```
 
 ## Source root auto-detection

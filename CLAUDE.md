@@ -207,7 +207,8 @@ For simple `search_code` (no Ollama), only `fts5_search.py` runs.
 Hierarchy (later overrides earlier):
 1. Built-in defaults
 2. `~/.fw-context/config.toml` (global, per-user)
-3. `<project>/.fw-context/config.toml` (project, committable)
+3. `<project>/.fw-context/config.toml` (project, shared — commit to git)
+4. `<project>/.fw-context/local.toml` (project, local — gitignore)
 
 Loaded by `config/settings.py` into a `Config` dataclass.
 
