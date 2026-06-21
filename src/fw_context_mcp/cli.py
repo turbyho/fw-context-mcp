@@ -80,6 +80,11 @@ def cmd_index(args: argparse.Namespace) -> int:
             False if getattr(args, 'no_analyze', False)
             else getattr(args, 'analyze', False) or cfg.llm.analyze_symbols
         ),
+        analyze_files=(
+            False if getattr(args, 'no_analyze', False)
+            else cfg.llm.analyze_files
+        ),
+        analyze_overrides=True,
         project_root=project_root,
         project_id=project_id,
         llm_config=cfg.llm,
@@ -665,7 +670,7 @@ def cmd_analyze(args: argparse.Namespace) -> int:
     from .config import derive_project_id
     from .config import load as load_config
     from .indexer.db import get_active_config, open_db
-    from .indexer.runner import _build_llm_analysis
+    from .indexer.runner import _build_file_analysis, _build_llm_analysis, _build_overrides
 
     logging.basicConfig(
         level=logging.DEBUG if args.verbose else logging.INFO,
@@ -701,6 +706,9 @@ def cmd_analyze(args: argparse.Namespace) -> int:
     conn = open_db(db_path)
     try:
         _build_llm_analysis(conn, config_hash, cfg.llm)
+        if cfg.llm.analyze_files:
+            _build_file_analysis(conn, config_hash, cfg.llm)
+        _build_overrides(conn, config_hash)
         conn.commit()
     finally:
         conn.close()

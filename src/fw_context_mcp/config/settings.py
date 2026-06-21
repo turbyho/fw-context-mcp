@@ -43,6 +43,8 @@ ollama_url = "http://localhost:11434"
 model = "qwen2.5-coder:14b"
 num_ctx = 16384
 # debug_log = "~/.fw-context/llm-debug.jsonl"   # write LLM prompts/responses to JSONL
+analyze_symbols = true
+analyze_files = true    # generate per-file summaries (2-3 sentences)
 """
 
 _PROJECT_DEFAULTS_TEMPLATE = """\
@@ -87,6 +89,7 @@ exclude_paths = ["build", "BUILD"]
 # num_ctx = 16384
 # debug_log = "~/.fw-context/llm-debug.jsonl"   # write LLM prompts/responses to JSONL
 # analyze_symbols = true    # generate structured symbol descriptions (summary, inputs, outputs) — enabled by default
+# analyze_files = true      # generate per-file summaries (2-3 sentences) — enabled by default
 """
 
 
@@ -99,6 +102,7 @@ class LLMConfig:
     num_ctx: int = 16384
     debug_log: Path | None = None
     analyze_symbols: bool = True
+    analyze_files: bool = True
 
 
 @dataclass
@@ -202,6 +206,8 @@ def _from_dict(data: dict) -> Config:
             cfg.llm.debug_log = Path(debug_log).expanduser()
         if "analyze_symbols" in llm:
             cfg.llm.analyze_symbols = bool(llm["analyze_symbols"])
+        if "analyze_files" in llm:
+            cfg.llm.analyze_files = bool(llm["analyze_files"])
 
     return cfg
 

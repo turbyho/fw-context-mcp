@@ -31,8 +31,10 @@ from ..indexer.db import (
     get_db_schema_version,
     get_direct_bases,
     get_direct_derived,
+    get_file_analysis_for_file,
     get_file_mtime_indexed,
     get_llm_analysis_for_symbol,
+    get_overrides_for_method,
     open_db,
     search_symbols,
     transaction,
@@ -717,10 +719,13 @@ def reindex_file(
     # (old rows deleted via ON DELETE CASCADE, new symbols inserted with new IDs).
     if cfg.llm.enabled and cfg.llm.analyze_symbols and total_symbols > 0:
         try:
-            from ..indexer.runner import _build_llm_analysis
+            from ..indexer.runner import _build_file_analysis, _build_llm_analysis, _build_overrides
             conn2 = open_db(db_path)
             try:
                 _build_llm_analysis(conn2, config_hash, cfg.llm)
+                if cfg.llm.analyze_files:
+                    _build_file_analysis(conn2, config_hash, cfg.llm)
+                _build_overrides(conn2, config_hash)
                 conn2.commit()
                 analyzed_count = conn2.execute(
                     "SELECT COUNT(*) FROM llm_analysis a JOIN symbols s ON s.id = a.symbol_id WHERE s.config_hash = ?",
@@ -1003,9 +1008,68 @@ def get_file_map(
                 conn, config_hash, resolved,
                 signatures=signatures, max_per_kind=max_per_kind,
             )
+            # Look up file-level analysis summary
+            file_id = conn.execute(
+                "SELECT id FROM files WHERE config_hash=? AND path=?",
+                (config_hash, resolved),
+            ).fetchone()
+            if file_id:
+                fa = get_file_analysis_for_file(conn, file_id[0])
+                if fa:
+                    result["file_summary"] = fa["summary"]
     finally:
         conn.close()
     return result
+
+
+@mcp.tool()
+def get_file_analysis(
+    file_path: Annotated[str, Field(description="Path to source file — relative to project root.")],
+    project_root: Annotated[str | None, Field(description="Project root. Auto-detected if omitted.")] = None,
+) -> dict:
+    """Return the file-level LLM analysis summary for a source file.
+
+    Read-only: yes. No side effects. Returns the pre-computed 2-3 sentence
+    summary describing what the file is responsible for.  Generated during
+    ``fw-context index`` when ``[llm] analyze_symbols`` is enabled.
+
+    Returns ``file``, ``summary``, ``model``, ``analyzed_at`` on success,
+    or an error message if no analysis exists yet.
+    """
+    db_path, cfg, project_id, root = _resolve_context(project_root)
+    if not db_path.exists():
+        return {"error": f"No index found for {root}. Run 'fw-context index' first."}
+    conn, err = _open_db_safe(db_path)
+    if err:
+        return err
+    try:
+        with conn:
+            cfg_data = get_active_config(conn, project_id)
+            if not cfg_data:
+                return {"error": "No build config indexed."}
+            config_hash = cfg_data["config_hash"]
+            # Resolve file path
+            file_row = conn.execute(
+                "SELECT id, path FROM files WHERE config_hash=? AND (path=? OR path LIKE ?) LIMIT 1",
+                (config_hash, file_path, f"%{file_path}"),
+            ).fetchone()
+            if not file_row:
+                return {"error": f"File not found in index: {file_path}"}
+            fa = get_file_analysis_for_file(conn, file_row["id"])
+            if not fa:
+                return {
+                    "file": file_row["path"],
+                    "summary": None,
+                    "message": "No file-level analysis yet. Run 'fw-context index' with [llm] analyze_symbols = true.",
+                }
+            return {
+                "file": file_row["path"],
+                "summary": fa["summary"],
+                "model": fa["model"],
+                "analyzed_at": fa["analyzed_at"],
+            }
+    finally:
+        conn.close()
 
 
 @mcp.tool()
@@ -1122,6 +1186,10 @@ def get_symbol_context(
                 ]
             # Pre-computed LLM analysis (if available)
             llm_analysis = get_llm_analysis_for_symbol(conn, row["id"])
+            # Override info for virtual methods
+            overrides_info = None
+            if row["kind"] in ("method", "destructor") and (row["is_virtual"] or row["is_pure_virtual"]):
+                overrides_info = get_overrides_for_method(conn, config_hash, symbol_usr)
     finally:
         conn.close()
 
@@ -1143,6 +1211,9 @@ def get_symbol_context(
         result["constants"] = enum_constants
     if llm_analysis:
         result["llm_analysis"] = llm_analysis
+    if overrides_info:
+        result["overrides"] = overrides_info["overrides"]
+        result["overridden_by"] = overrides_info["overridden_by"]
     if source:
         result["source"] = source[:6000] if len(source) > 6000 else source
     return result
@@ -1979,6 +2050,83 @@ def get_template_instances(
             return result
     finally:
         conn.close()
+
+
+@mcp.tool()
+async def get_method_overrides(
+    method_name: Annotated[str, Field(description="Method name to get override information for. Use qualified name for disambiguation, e.g. 'UART_DRIVER::write'.")],
+    project_root: Annotated[str | None, Field(description="Project root. Auto-detected if omitted.")] = None,
+) -> dict:
+    """Read-only. Return virtual method override information.
+
+    Shows what base-class method this method overrides, and what derived-class
+    methods override this one.  Built from the ``overrides`` table which is
+    populated during ``fw-context index`` via post-processing of the inheritance
+    graph and virtual method signatures.
+
+    For class-level inheritance, use ``get_inheritance_chain``.  For symbol
+    details, use ``get_symbol_context``.
+
+    Returns:
+        dict: {
+            name, qualified_name, kind, file, line, signature,
+            overrides: [{usr, name, qualified_name, kind, file, line}],
+            overridden_by: [{usr, name, qualified_name, kind, file, line}]
+        }
+    """
+    db_path, cfg, project_id, root = _resolve_context(project_root)
+    if not db_path.exists():
+        return {"error": f"No index found for {root}. Run 'fw-context index' first."}
+    conn, err = _open_db_safe(db_path)
+    if err:
+        return err
+    try:
+        with conn:
+            cfg_data = get_active_config(conn, project_id)
+            if not cfg_data:
+                return {"error": "No build config indexed."}
+            config_hash = cfg_data["config_hash"]
+            row = _lookup_definition(conn, config_hash, method_name)
+            if not row:
+                return {"error": f"Symbol not found: {method_name}"}
+            if row["kind"] not in ("method", "destructor"):
+                return {"error": f"'{method_name}' is a {row['kind']}, not a method."}
+
+            result: dict = {
+                "name": row["name"],
+                "qualified_name": row["qualified_name"],
+                "kind": row["kind"],
+                "file": abs_path(root, row["file_path"]),
+                "line": row["line"],
+                "signature": row["signature"],
+            }
+
+            ov = get_overrides_for_method(conn, config_hash, row["usr"])
+            result["overrides"] = [
+                {
+                    "usr": o["base_usr"],
+                    "name": o["name"],
+                    "qualified_name": o["qualified_name"],
+                    "kind": o["kind"],
+                    "file": abs_path(root, o["file_path"]) if o.get("file_path") else None,
+                    "line": o["line"],
+                }
+                for o in ov["overrides"]
+            ]
+            result["overridden_by"] = [
+                {
+                    "usr": o["derived_usr"],
+                    "name": o["name"],
+                    "qualified_name": o["qualified_name"],
+                    "kind": o["kind"],
+                    "file": abs_path(root, o["file_path"]) if o.get("file_path") else None,
+                    "line": o["line"],
+                }
+                for o in ov["overridden_by"]
+            ]
+    finally:
+        conn.close()
+    return result
 
 
 # ── Pipeline-based search tools ─────────────────────────────────────────────

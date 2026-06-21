@@ -412,6 +412,290 @@ def _build_llm_analysis(conn, config_hash: str, llm_config) -> None:
     log.info("LLM analysis stored: %d symbols (model=%s)", total, model)
 
 
+def _build_file_analysis(conn, config_hash: str, llm_config) -> None:
+    """Generate file-level LLM analysis (2-3 sentence summaries) for project
+    source files using Ollama in batches of 5.
+
+    Uses the already-indexed symbols table to describe what each file is
+    responsible for.  Only project files are analyzed (non-SDK).
+    """
+    import httpx
+
+    from ..indexer.prompts import build_file_analysis_prompt, parse_file_analysis_response
+    from .db import upsert_file_analysis_batch
+
+    try:
+        resp = httpx.get(llm_config.ollama_url.rstrip("/") + "/api/tags", timeout=5.0)
+        resp.raise_for_status()
+    except Exception:
+        log.warning("Ollama not reachable — skipping file analysis generation")
+        return
+
+    # Gather files with their representative symbols (up to 30 per file)
+    with transaction(conn):
+        file_rows = conn.execute(
+            """SELECT f.id AS file_id, f.path,
+                       COUNT(s.id) AS sym_count
+                FROM files f
+                JOIN symbols s ON s.file_id = f.id AND s.config_hash = ?
+                WHERE f.config_hash = ?
+                  AND f.path NOT LIKE 'mbed-os/%'
+                  AND f.path NOT LIKE '.pio/%'
+                  AND f.path NOT LIKE 'zephyr/%'
+                  AND f.path NOT LIKE 'build/%'
+                  AND f.path NOT LIKE 'modules/%'
+                  AND f.id NOT IN (SELECT file_id FROM file_analysis)
+                GROUP BY f.id
+                ORDER BY sym_count DESC""",
+            (config_hash, config_hash),
+        ).fetchall()
+        if not file_rows:
+            log.info("All project files already analyzed — nothing to do")
+            return
+
+    # Fetch representative symbols for each file
+    files_with_syms: list[dict] = []
+    for fr in file_rows:
+        syms = conn.execute(
+            """SELECT name, qualified_name, kind, signature
+               FROM symbols
+               WHERE file_id = ? AND config_hash = ?
+               ORDER BY is_definition DESC, kind, line
+               LIMIT 30""",
+            (fr["file_id"], config_hash),
+        ).fetchall()
+        files_with_syms.append({
+            "file_id": fr["file_id"],
+            "path": fr["path"],
+            "symbols": [dict(s) for s in syms],
+        })
+
+    model = llm_config.model
+    total = 0
+    batch_size = 5
+    batches = (len(files_with_syms) + batch_size - 1) // batch_size
+    log.info("File analysis: %d files in %d batches (model=%s)", len(files_with_syms), batches, model)
+
+    for batch_num in range(0, len(files_with_syms), batch_size):
+        batch = files_with_syms[batch_num:batch_num + batch_size]
+        prompt = build_file_analysis_prompt(batch)
+        try:
+            response = call_ollama(prompt, llm_config, temperature=0.1, num_predict=2000)
+        except Exception as e:
+            log.warning("File analysis batch %d failed: %s", batch_num // batch_size, e)
+            continue
+
+        parsed = parse_file_analysis_response(response, batch)
+        if not parsed:
+            log.warning(
+                "File analysis batch %d: no valid entries parsed from response",
+                batch_num // batch_size,
+            )
+            continue
+
+        with transaction(conn):
+            db_rows = [(r["file_id"], r["summary"], model) for r in parsed]
+            inserted = upsert_file_analysis_batch(conn, db_rows)
+            total += inserted
+
+        if (batch_num // batch_size) % 4 == 0:
+            log.info("  file batch %d/%d: %d stored", batch_num // batch_size + 1, batches, total)
+
+    log.info("File analysis stored: %d files (model=%s)", total, model)
+
+
+def _extract_param_types(signature: str) -> str:
+    """Extract the parameter type list from a C/C++ function signature.
+
+    Strips parameter names, default values, and whitespace to produce a
+    normalized string suitable for override comparison.
+
+    Examples:
+        "int read(char *buf, size_t len)" → "char *,size_t"
+        "void write(const uint8_t *data, size_t len)" → "const uint8_t *,size_t"
+        "void reset()" → ""
+        "void set(int)" → "int"
+    """
+    # Find the outermost parentheses
+    paren_start = signature.find("(")
+    if paren_start == -1:
+        return ""
+    paren_depth = 0
+    paren_end = paren_start
+    for i in range(paren_start, len(signature)):
+        if signature[i] == "(":
+            paren_depth += 1
+        elif signature[i] == ")":
+            paren_depth -= 1
+            if paren_depth == 0:
+                paren_end = i
+                break
+    params_str = signature[paren_start + 1:paren_end].strip()
+    if not params_str:
+        return ""
+
+    # Split by top-level commas, strip parameter names (keep only types)
+    parts: list[str] = []
+    depth = 0
+    current: list[str] = []
+    for ch in params_str:
+        if ch == "," and depth == 0:
+            parts.append("".join(current).strip())
+            current = []
+        else:
+            if ch in "<({[":
+                depth += 1
+            elif ch in ">)}]":
+                depth -= 1
+            current.append(ch)
+    if current:
+        parts.append("".join(current).strip())
+
+    # For each parameter, extract the type by removing the parameter name
+    # and any trailing default value
+    normalized: list[str] = []
+    for param in parts:
+        param = param.strip()
+        if not param:
+            continue
+        # Remove default value (everything after '=')
+        eq_idx = param.find("=")
+        if eq_idx != -1:
+            param = param[:eq_idx].strip()
+        # Remove parameter name from the end.
+        # The parameter name is the last identifier — it may be preceded by
+        # pointer/reference markers (*, &, &&) that belong to the type.
+        tokens = param.split()
+        if len(tokens) >= 2:
+            last = tokens[-1]
+            # Strip leading pointer/reference markers from the last token
+            stripped = last.lstrip("*&")
+            # If what remains is a pure identifier (alphanumeric + underscores),
+            # it's the parameter name — remove it, keeping any pointer/ref prefix
+            # on the type
+            if stripped and stripped.replace("_", "").isalnum():
+                ptr_prefix = last[:len(last) - len(stripped)]
+                if ptr_prefix:
+                    # Pointer/ref on the name token (e.g. "*buf") — move markers
+                    # to the type by keeping them as a separate token
+                    tokens[-1] = ptr_prefix
+                else:
+                    # Pure name — drop the last token
+                    tokens = tokens[:-1]
+        param = " ".join(tokens).strip()
+        normalized.append(param)
+
+    return ",".join(normalized)
+
+
+def _build_overrides(conn, config_hash: str) -> None:
+    """Build the method override graph by matching virtual methods to their
+    base-class counterparts through the inheritance chain.
+
+    Pure post-processing — walks the inheritance graph already stored in
+    the ``inheritance`` table and matches methods by name.  Parameter-type
+    comparison provides a basic guard against accidental name collisions
+    (overloads, not overrides).
+    """
+    from .db import insert_overrides_batch
+
+    total = 0
+
+    # Phase 1: collect all virtual/pure-virtual project methods with parent class info
+    with transaction(conn):
+        virtual_rows = conn.execute(
+            """SELECT s.usr, s.name, s.qualified_name, s.signature,
+                      s.parent_usr, s.kind
+               FROM symbols s
+               WHERE s.config_hash = ?
+                 AND s.is_definition = 1
+                 AND (s.is_virtual = 1 OR s.is_pure_virtual = 1)
+                 AND s.kind IN ('method', 'destructor')
+                 AND s.parent_usr != ''
+               ORDER BY s.parent_usr, s.name""",
+            (config_hash,),
+        ).fetchall()
+
+    if not virtual_rows:
+        log.info("No virtual methods found — skipping override analysis")
+        return
+
+    # Phase 2: for each virtual method, walk the inheritance chain up and
+    # find base-class methods with the same name.
+    # Build parent→bases lookup cache for efficiency.
+    parent_to_bases: dict[str, list[str]] = {}
+
+    def _get_bases_recursive(parent_usr: str, visited: set | None = None) -> list[str]:
+        """BFS up the inheritance chain — return all ancestor USRs."""
+        if visited is None:
+            visited = set()
+        if parent_usr in parent_to_bases:
+            return parent_to_bases[parent_usr]
+        bases: list[str] = []
+        queue = [parent_usr]
+        while queue:
+            cur = queue.pop(0)
+            if cur in visited:
+                continue
+            visited.add(cur)
+            rows = conn.execute(
+                """SELECT base_usr FROM inheritance
+                   WHERE config_hash = ? AND derived_usr = ?""",
+                (config_hash, cur),
+            ).fetchall()
+            for r in rows:
+                if r["base_usr"] not in visited:
+                    bases.append(r["base_usr"])
+                    queue.append(r["base_usr"])
+        parent_to_bases[parent_usr] = bases
+        return bases
+
+    # Phase 3: resolve overrides
+    override_rows: list[tuple[str, str, str]] = []
+    skipped_no_base = 0
+    skipped_no_match = 0
+
+    for vrow in virtual_rows:
+        base_usrs = _get_bases_recursive(vrow["parent_usr"])
+        if not base_usrs:
+            skipped_no_base += 1
+            continue
+
+        # Find methods with the same name in any base class
+        placeholders = ",".join("?" * len(base_usrs))
+        base_methods = conn.execute(
+            f"""SELECT usr, signature, parent_usr, qualified_name
+                FROM symbols
+                WHERE config_hash = ?
+                  AND name = ?
+                  AND kind IN ('method', 'destructor')
+                  AND parent_usr IN ({placeholders})
+                ORDER BY qualified_name""",
+            (config_hash, vrow["name"], *base_usrs),
+        ).fetchall()
+
+        if not base_methods:
+            skipped_no_match += 1
+            continue
+
+        # Compare parameter types to filter out accidental name collisions
+        derived_params = _extract_param_types(vrow["signature"] or "")
+        for bm in base_methods:
+            base_params = _extract_param_types(bm["signature"] or "")
+            if derived_params == base_params:
+                override_rows.append((config_hash, vrow["usr"], bm["usr"]))
+
+    if override_rows:
+        with transaction(conn):
+            inserted = insert_overrides_batch(conn, override_rows)
+            total += inserted
+
+    log.info(
+        "Overrides stored: %d relationships (%d virtual, %d no-base, %d no-match)",
+        total, len(virtual_rows), skipped_no_base, skipped_no_match,
+    )
+
+
 def _process_unit(unit, config_hash, project_root, source_roots, exclude_paths, index_refs, db_path, existing_files):
     """Process one translation unit: check staleness, parse, store.
 
@@ -459,6 +743,8 @@ def run(
     index_refs: bool = False,
     index_embeddings: bool = False,
     analyze_symbols: bool = False,
+    analyze_files: bool = False,
+    analyze_overrides: bool = True,
     project_root: Path | None = None,
     project_id: str | None = None,
     llm_config=None,
@@ -571,6 +857,18 @@ def run(
     if analyze_symbols and llm_config is not None and llm_config.enabled:
         log.info("Generating LLM analysis for project symbols...")
         _build_llm_analysis(conn, config_hash, llm_config)
+        conn.commit()
+
+    # File-level LLM analysis (opt-in, runs after symbol analysis)
+    if analyze_files and llm_config is not None and llm_config.enabled:
+        log.info("Generating file-level LLM analysis...")
+        _build_file_analysis(conn, config_hash, llm_config)
+        conn.commit()
+
+    # Method override tracking (post-processing, no LLM needed)
+    if analyze_overrides:
+        log.info("Building method override graph...")
+        _build_overrides(conn, config_hash)
         conn.commit()
 
     elapsed = time.monotonic() - t0
