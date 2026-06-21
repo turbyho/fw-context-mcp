@@ -789,7 +789,11 @@ def reindex_file(
             cfg_data = get_active_config(conn, project_id)
             if not cfg_data:
                 return {"error": "No build config indexed."}
-            target = Path(file_path).resolve()
+            target = Path(file_path)
+            if not target.is_absolute():
+                target = (root / target).resolve()
+            else:
+                target = target.resolve()
             if not target.exists():
                 return {"error": f"File not found: {target}"}
             cc_path = Path(cfg_data["compile_commands_path"])
