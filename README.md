@@ -220,7 +220,7 @@ Subsequent runs are **incremental** — seconds for a few changed files.
 |----------|--------|
 | **[Installation](docs/installation.md)** | Prerequisites, install, upgrade, Ollama setup, AI assistant integration |
 | **[Tools Reference](docs/tools.md)** | All 27 MCP tools, 10 CLI commands, internal workings, search pipeline |
-| **[Configuration](docs/configuration.md)** | `.fw-context/config.toml` — global defaults, per-project overrides, every setting |
+| **[Configuration](docs/configuration.md)** | `.fw-context/config.toml` + `local.toml` — shared project config and local developer overrides |
 | **[MCP Server](README-MCP.md)** | JSON-RPC protocol, tool schemas, error handling, debugging |
 
 ## Directory layout
@@ -238,6 +238,7 @@ Subsequent runs are **incremental** — seconds for a few changed files.
 
 your-firmware/
 ├── .fw-context/
-│   └── config.toml          # per-project overrides
+│   ├── config.toml          # shared project config (commit to git)
+│   └── local.toml           # local developer overrides (gitignored)
 └── compile_commands.json
 ```
