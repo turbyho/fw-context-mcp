@@ -550,6 +550,61 @@ Members are ordered by kind then name. Shows the full API surface without
 opening the header file. Works for C structs too — they just won't have
 methods. Returns `member_count: 0` for indexes predating this feature.
 
+#### `get_template_instances`
+
+Find concrete instantiations of a class or function template.
+
+```
+Input:  {"template_name": "std::vector"}
+Output: {"template_name": "std::vector", "template_usr": "c:@...",
+         "instance_count": 3,
+         "instances": [{"name": "vector", "qualified_name": "std::vector<int>",
+                         "kind": "class", "file": "/path/src/main.cpp", "line": 42,
+                         "signature": "class vector<int>", "is_definition": true}, …]}
+```
+
+Returns empty `instances` when the template is declared but never instanciated
+in project code.  Works for both class templates (`CXCursor_CLASS_TEMPLATE`)
+and function templates (`CXCursor_FUNCTION_TEMPLATE`).  The template is
+resolved by name (exact or qualified) just like `lookup_symbol`.
+
+#### `get_method_overrides`
+
+Show which virtual methods override which base-class methods, and which
+derived-class methods override this one.
+
+```
+Input:  {"class_name::method_name": "UART_DRIVER::send"}
+Output: {"method": "send", "qualified_name": "hal::UART_DRIVER::send",
+         "kind": "method", "file": "/path/src/UART_DRIVER.cpp", "line": 88,
+         "is_virtual": true, "is_pure_virtual": false,
+         "overrides": [{"name": "send", "qualified_name": "SerialBase::send",
+                         "usr": "c:@...", "file": "/path/src/SerialBase.h"}],
+         "overridden_by": []}
+```
+
+Uses the `overrides` table built during indexing.  Parameter-type comparison
+filters out accidental name collisions (overloads, not overrides).  For a
+non-virtual method or a method whose class has no ancestors, both
+`overrides` and `overridden_by` are empty lists.
+
+#### `get_file_analysis`
+
+Return the LLM-generated summary for a source file.
+
+```
+Input:  {"file_path": "src/main.cpp"}
+Output: {"file": "/abs/path/src/main.cpp", "file_path": "src/main.cpp",
+         "summary": "Main entry point — initializes the modem, sets up the
+         sensor polling loop, and dispatches events to the UI task.",
+         "model": "qwen2.5-coder:14b",
+         "analyzed_at": "2026-06-21T10:30:00"}
+```
+
+Also included as `file_summary` in `get_file_map` output.  Requires
+`[llm] analyze_files = true` during indexing (default).  Returns
+`{"error": "No analysis available…"}` when the file hasn't been analyzed.
+
 ### Index maintenance
 
 #### `get_active_build`
