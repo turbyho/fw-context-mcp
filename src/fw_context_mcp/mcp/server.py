@@ -730,8 +730,9 @@ def check_ollama(
 ) -> dict:
     """Check whether Ollama is running and the configured embedding/chat model is installed.
 
-    Read-only: yes. No side effects. Call before smart_search or
-    explain_symbol if unsure about Ollama availability.
+    Read-only: yes. No side effects. Call before smart_search,
+    semantic_search, or explain_symbol (when on-demand fallback is
+    expected — pre-computed analysis returns instantly without Ollama).
 
     Returns:
         dict: {ollama_running: bool, model_installed: bool, model: str,
@@ -747,7 +748,8 @@ def check_ollama(
             "num_ctx": cfg.llm.num_ctx,
             "message": (
                 "Ollama is disabled in config ([llm] enabled = false). "
-                "explain_symbol will return source + explain_prompt for the agent to answer. "
+                "explain_symbol with pre-computed analysis (default) returns instantly. "
+                "Without analysis, it returns source + explain_prompt for the agent to answer. "
                 "smart_search will use raw text queries."
             ),
         }
