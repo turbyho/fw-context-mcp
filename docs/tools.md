@@ -9,7 +9,7 @@ Complete reference for all fw-context CLI commands and MCP server tools.
 Build or update the symbol index from `compile_commands.json`.
 
 ```bash
-# Default: everything on (refs + embeddings)
+# Default: everything on (refs + embeddings + LLM analysis)
 fw-context index
 
 # Explicit path, verbose
@@ -20,6 +20,9 @@ fw-context index --no-refs
 
 # Skip embeddings (no Ollama available)
 fw-context index --no-embeddings
+
+# Skip LLM symbol analysis
+fw-context index --no-analyze
 
 # Custom source roots
 fw-context index --source-roots src lib drivers
@@ -33,6 +36,8 @@ fw-context index --source-roots src lib drivers
 | `--name NAME` | directory name | Project name override |
 | `--no-refs` | off | Skip cross-reference / call graph indexing |
 | `--no-embeddings` | off | Skip embedding generation |
+| `--no-analyze` | off | Skip LLM symbol analysis |
+| `--analyze` | on | Force LLM symbol analysis (negates --no-analyze) |
 | `-v` | off | Verbose progress output |
 
 **Generating `compile_commands.json`:**
@@ -138,6 +143,26 @@ filesystem events. Press `Ctrl+C` to stop.
 pip install "fw-context-mcp[watch]"   # install watch dependency
 ```
 
+### `fw-context analyze`
+
+Run LLM symbol analysis on an already-indexed project. Useful when the
+index was built with `--no-analyze` and you want to add analysis later,
+or when you want to re-generate analysis for all symbols.
+
+```bash
+fw-context analyze                        # analyze current project
+fw-context analyze --project /path        # specific project
+fw-context analyze --retry-failed         # retry only symbols where analysis failed
+```
+
+Analysis is generated per function/method using the full function body
+(via libclang extent) and callee names as supplementary context. Results
+are stored in the `llm_analysis` table and denormalized into the FTS5
+index — symbols become searchable by their purpose, not just their name.
+
+Configure with `[llm] analyze_symbols`, `[llm] analysis_model`, and
+`[llm] num_ctx` in `~/.fw-context/config.toml`.
+
 ### `fw-context version`
 
 Show version information.
@@ -235,8 +260,8 @@ project code (1.2×) over vendored SDK paths (0.85×).
 
 **Threshold guidance** (mxbai-embed-large):
 - `0.50` — exploratory, more results
-- `0.55` — balanced (default)
-- `0.60` — high precision
+- `0.55` — balanced, ~1 000 results
+- `0.60` — high precision (default)
 - `0.65` — strict, may miss relevant symbols
 
 Requires Ollama with an embedding model. Falls back to `search_code` if
@@ -312,17 +337,30 @@ Output: {"name": "StatusCode", "kind": "enum", "file": "/path/src/ble_cmd.h",
 
 #### `explain_symbol`
 
-Look up a symbol and get a plain-English explanation via Ollama.
+Look up a symbol and get a plain-English explanation of its purpose, inputs,
+outputs, and side effects.
 
 ```
 Input:  {"name": "spi_transfer", "context_lines?": 40}
 Output: {"name": "spi_transfer", "kind": "function", "file": "/path/src/spi.c",
          "line": 120, "signature": "int spi_transfer(const uint8_t* tx, uint8_t* rx, size_t n)",
-         "explanation": "This function performs a full-duplex SPI transfer…"}
+         "explanation": "This function performs a full-duplex SPI transfer…\n\nInputs: …\nOutputs: …",
+         "llm_analysis": {"summary": "…", "inputs": "…", "outputs": "…",
+                          "model": "qwen2.5-coder:14b", "analyzed_at": "2026-06-21T17:51:14"}}
 ```
 
-Takes 10–30 seconds with Ollama. When disabled, returns `source` + `explain_prompt`
-for the AI assistant to process with its own model.
+**Pre-computed (instant):** When the index was built with `--analyze` (default),
+symbols have pre-generated descriptions stored in the `llm_analysis` table.
+`explain_symbol` returns these instantly — no Ollama call, no waiting.
+
+**On-demand fallback (10–30 s):** When no pre-computed analysis exists (index
+built with `--no-analyze`, or symbol re-indexed without re-analysis), falls
+back to calling Ollama directly. When Ollama is disabled, returns `source` +
+`explain_prompt` for the AI assistant to answer with its own model.
+
+The analysis is generated during indexing using the full function body (via
+libclang extent) and callee names from the reference index as context.
+Re-indexing a file (`reindex_file`) auto-regenerates its analysis.
 
 #### `get_symbol_context`
 
@@ -477,8 +515,13 @@ Output: {"config_hash": "a1b2…", "project_id": "c3d4…", "project_root": "/pa
          "build_system": "zephyr", "compile_commands": "/path/build/compile_commands.json",
          "indexed_at": "2026-06-05T09:35:18", "symbol_count": 12430, "file_count": 1502,
          "reference_count": 8900, "modified_files_count": 3,
+         "analyzed_symbols": 8450, "analysis_model": "qwen2.5-coder:14b",
          "schema_version": 84935291, "current_schema": 84935291, "stale": false}
 ```
+
+`analyzed_symbols` is the count of symbols with pre-computed LLM analysis
+(0 when index was built with `--no-analyze` or `[llm] analyze_symbols = false`).
+`analysis_model` is the Ollama model used to generate the analysis.
 
 `stale: true` when:
 - `compile_commands.json` changed since the index was built, or
@@ -522,16 +565,22 @@ Output: [{"project_id": "a1b2…", "name": "my-zephyr-app", "root_path": "/path"
 
 #### `check_ollama`
 
-Verify Ollama availability before using `smart_search` or `explain_symbol`.
+Verify Ollama availability. Call before `smart_search`, `semantic_search`,
+or when `explain_symbol` needs on-demand analysis (no pre-computed analysis
+available).
 
 ```
 Input:  {}
 Output: {"status": "ok", "ollama_running": true, "ollama_enabled": true,
-         "configured_model": "qwen2.5-coder:14b", "num_ctx": 8192,
+         "configured_model": "qwen2.5-coder:14b", "num_ctx": 16384,
          "installed_models": ["qwen2.5-coder:14b", "mxbai-embed-large:latest"], …}
 ```
 
 Returns `status: "disabled"` when `[llm] enabled = false` — no Ollama needed.
+
+Note: `explain_symbol` with pre-computed analysis (default) returns instantly
+and does not require Ollama at query time. `num_ctx` is 16384 by default to
+accommodate full function bodies during analysis generation.
 
 ---
 
