@@ -195,7 +195,7 @@ enabled      = true
 model        = "qwen2.5-coder:14b"
 embed_model  = "mxbai-embed-large:latest"
 ollama_url   = "http://localhost:11434"
-num_ctx      = 8192
+num_ctx      = 16384
 ```
 
 > **Remote Ollama:** Set `ollama_url = "http://192.168.1.50:11434"` if

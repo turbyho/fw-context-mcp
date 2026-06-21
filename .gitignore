@@ -8,6 +8,11 @@ build/
 venv/
 .env
 
+# Project memory and plans (local only)
+MEMORY.md
+memory/
+plans/
+
 # fw-context runtime data
 .fw-context/
 
