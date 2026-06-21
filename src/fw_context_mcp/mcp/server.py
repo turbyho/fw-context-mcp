@@ -29,6 +29,7 @@ from ..indexer.db import (
     get_all_projects,
     get_db_schema_version,
     get_file_mtime_indexed,
+    get_llm_analysis_for_symbol,
     open_db,
     search_symbols,
     transaction,
@@ -314,6 +315,21 @@ def get_active_build(
             ref_count = count_refs(conn, config_hash)
             modified_count = _count_modified_files(conn, config_hash, root)
             db_schema_ver = get_db_schema_version(conn)
+
+            # LLM analysis statistics
+            analyzed_count = conn.execute(
+                """SELECT COUNT(*) FROM llm_analysis a
+                   JOIN symbols s ON s.id = a.symbol_id
+                   WHERE s.config_hash = ?""",
+                (config_hash,),
+            ).fetchone()[0]
+            analysis_model_row = conn.execute(
+                """SELECT a.model FROM llm_analysis a
+                   JOIN symbols s ON s.id = a.symbol_id
+                   WHERE s.config_hash = ? LIMIT 1""",
+                (config_hash,),
+            ).fetchone()
+
             result: dict = {
                 "config_hash": config_hash,
                 "project_id": project_id,
@@ -327,6 +343,8 @@ def get_active_build(
                 "modified_files_count": modified_count,
                 "schema_version": db_schema_ver,
                 "current_schema": CURRENT_SCHEMA_VERSION,
+                "analyzed_symbols": analyzed_count,
+                "analysis_model": analysis_model_row["model"] if analysis_model_row else None,
                 "stale": _is_stale(cfg, cfg["compile_commands_path"]) or modified_count > 0
                 or db_schema_ver < CURRENT_SCHEMA_VERSION,
             }
@@ -504,6 +522,9 @@ def lookup_symbol(
                     "signature": r["signature"],
                     "docstring": r["docstring"],
                     **({"enum_value": r["enum_value"]} if r["enum_value"] is not None else {}),
+                    **({"summary": r["summary"]} if r["summary"] else {}),
+                    **({"inputs": r["inputs"]} if r["inputs"] else {}),
+                    **({"outputs": r["outputs"]} if r["outputs"] else {}),
                 }
                 for r in rows
             ]
@@ -678,6 +699,26 @@ def reindex_file(
         }
     finally:
         conn.close()
+
+    # Regenerate LLM analysis for any symbols that lost their analysis
+    # (old rows deleted via ON DELETE CASCADE, new symbols inserted with new IDs).
+    if cfg.llm.enabled and cfg.llm.analyze_symbols and total_symbols > 0:
+        try:
+            from ..indexer.runner import _build_llm_analysis
+            conn2 = open_db(db_path)
+            try:
+                _build_llm_analysis(conn2, config_hash, cfg.llm)
+                conn2.commit()
+                analyzed_count = conn2.execute(
+                    "SELECT COUNT(*) FROM llm_analysis a JOIN symbols s ON s.id = a.symbol_id WHERE s.config_hash = ?",
+                    (config_hash,),
+                ).fetchone()[0]
+                result["analysis_updated"] = analyzed_count
+            finally:
+                conn2.close()
+        except Exception as exc:
+            result["analysis_warning"] = f"LLM analysis skipped: {exc}"
+
     if len(matching) == 1 and target.suffix.lower() in {".h", ".hpp"}:
         result["warning"] = "Header re-indexed via one TU. Other TUs including this header may still have stale symbols — run 'fw-context index' for full accuracy."
     return result
@@ -721,7 +762,7 @@ async def explain_symbol(
     project_root: Annotated[str | None, Field(description="Project root. Auto-detected if omitted.")] = None,
     context_lines: Annotated[int, Field(description="Lines of source context around the symbol definition.")] = 40,
 ) -> dict:
-    """Read-only. No side effects — may call Ollama (optional external LLM) if configured. Returns a plain-English explanation of what a C/C++ symbol does, based on its name, signature, docstring, and call context. Requires Ollama to be running. For raw source code use get_source; for symbol metadata without explanation use lookup_symbol; for body+callers+callees use get_symbol_context."""
+    """Read-only. No side effects — uses pre-computed LLM analysis when available (instant), falls back to calling Ollama on-demand. Returns a plain-English explanation of what a C/C++ symbol does, including its purpose, inputs, outputs, and side effects. For raw source code use get_source; for symbol metadata without explanation use lookup_symbol; for body+callers+callees use get_symbol_context."""
     db_path, cfg, project_id, root = _resolve_context(project_root)
     if not db_path.exists():
         return {"error": f"No index found for {root}. Run 'fw-context index' first."}
@@ -741,8 +782,32 @@ async def explain_symbol(
             line_no = row["line"]
             signature = row["signature"] or ""
             kind = row["kind"]
+            symbol_id = row["id"]
+
+            # Check for pre-computed LLM analysis (instant, no Ollama call)
+            llm_analysis = get_llm_analysis_for_symbol(conn, symbol_id)
     finally:
         conn.close()
+
+    result: dict = {
+        "name": name,
+        "kind": kind,
+        "file": file_path,
+        "line": line_no,
+        "signature": signature,
+    }
+
+    # Use pre-computed analysis if available (instant response)
+    if llm_analysis:
+        explanation = llm_analysis["summary"]
+        if llm_analysis["inputs"]:
+            explanation += f"\n\nInputs: {llm_analysis['inputs']}"
+        if llm_analysis["outputs"]:
+            explanation += f"\nOutputs: {llm_analysis['outputs']}"
+        result["explanation"] = explanation
+        result["llm_analysis"] = llm_analysis
+        return result
+
     context_lines = min(context_lines, 200)
     source_snippet = ""
     try:
@@ -765,13 +830,6 @@ async def explain_symbol(
     )
     if source_snippet:
         prompt += f"\nSource context:\n```cpp\n{source_snippet}\n```\n"
-    result: dict = {
-        "name": name,
-        "kind": kind,
-        "file": file_path,
-        "line": line_no,
-        "signature": signature,
-    }
     if cfg.llm.enabled:
         try:
             result["explanation"] = await call_ollama_async(prompt, cfg.llm)
@@ -954,6 +1012,10 @@ def get_symbol_context(
     Returns dict with: name, qualified_name, kind, file, line, signature,
     is_definition, callers (list), callees (list), source (body text).
     For enums also returns constants and enum_value.
+    When LLM analysis has been generated (``fw-context index --analyze``),
+    includes ``llm_analysis``: {summary, inputs, outputs, model, analyzed_at}
+    with a structured description of the symbol's purpose, parameters, and
+    return values/side effects.
     """
     db_path, cfg, project_id, root = _resolve_context(project_root)
     if not db_path.exists():
@@ -1043,6 +1105,8 @@ def get_symbol_context(
                     }
                     for c in const_rows
                 ]
+            # Pre-computed LLM analysis (if available)
+            llm_analysis = get_llm_analysis_for_symbol(conn, row["id"])
     finally:
         conn.close()
 
@@ -1062,6 +1126,8 @@ def get_symbol_context(
         result["enum_value"] = row["enum_value"]
     if enum_constants:
         result["constants"] = enum_constants
+    if llm_analysis:
+        result["llm_analysis"] = llm_analysis
     if source:
         result["source"] = source[:6000] if len(source) > 6000 else source
     return result
@@ -1662,6 +1728,11 @@ def search_code(
     ``destructor``, ``class``, ``struct``, ``enum``, ``enum_constant``,
     ``typedef``, ``variable``, ``field``, ``namespace``.
 
+    Each result may include ``summary``, ``inputs``, ``outputs``
+    when LLM analysis has been generated (``fw-context index --analyze``).
+    These provide structured descriptions: what the symbol does, what
+    parameters/data it receives, and what it returns/produces.
+
     Args:
         query: Search term(s) with FTS5 syntax. Keep queries short — 1–3 words.
         project_root: Absolute path to the project. Defaults to nearest git root.
@@ -1774,6 +1845,15 @@ def search_code(
                 }
                 if r["enum_value"] is not None:
                     d["enum_value"] = r["enum_value"]
+                llm = (r["summary"] if "summary" in r.keys() else "") or ""
+                if llm:
+                    d["summary"] = llm
+                llm_in = (r["inputs"] if "inputs" in r.keys() else "") or ""
+                if llm_in:
+                    d["inputs"] = llm_in
+                llm_out = (r["outputs"] if "outputs" in r.keys() else "") or ""
+                if llm_out:
+                    d["outputs"] = llm_out
                 if fallback_used:
                     d["_fallback"] = method
                 return d
@@ -2033,6 +2113,12 @@ async def semantic_search(
                 }
                 if sr["enum_value"] is not None:
                     d["enum_value"] = sr["enum_value"]
+                if sr["summary"]:
+                    d["summary"] = sr["summary"]
+                if sr["inputs"]:
+                    d["inputs"] = sr["inputs"]
+                if sr["outputs"]:
+                    d["outputs"] = sr["outputs"]
                 results.append(d)
 
             return results

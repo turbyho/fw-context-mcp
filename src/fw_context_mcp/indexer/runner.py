@@ -13,6 +13,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 from ..config.settings import derive_project_id
+from ..llm.ollama import call_ollama
 from ..utils import MTIME_TOLERANCE_S
 from .compile_commands import _SOURCE_EXTS
 from .compile_commands import parse as parse_compile_commands
@@ -146,7 +147,7 @@ def _build_embeddings(conn, config_hash: str, llm_config) -> None:
     with transaction(conn):
         rows = conn.execute(
             """SELECT s.id, s.name, s.qualified_name, s.kind, s.file_path,
-                      s.signature, s.is_definition, s.docstring
+                      s.signature, s.is_definition, s.docstring, s.summary
                FROM symbols s
                WHERE s.config_hash = ?
                  AND s.is_definition = 1
@@ -180,9 +181,14 @@ def _build_embeddings(conn, config_hash: str, llm_config) -> None:
             doc = (r["docstring"] or "").strip()
             if doc and len(doc) > 20:
                 doc = doc[:150]
+        llm = (r["summary"] or "").strip()
+        if llm:
+            llm = llm[:200]
         parts = [path, file_, class_, name, sig]
         if doc:
             parts.append(doc)
+        if llm:
+            parts.append(llm)
         descriptions.append(" : ".join(p for p in parts if p))
 
     model = llm_config.embed_model
@@ -210,6 +216,200 @@ def _build_embeddings(conn, config_hash: str, llm_config) -> None:
 
         total += len(blob_batch)
     log.info("Embeddings stored: %d symbols (model=%s)", total, model)
+
+# SDK path patterns for filtering (mbed-os, Zephyr, PlatformIO, build dirs)
+_SDK_PATH_PATTERNS = ("mbed-os/", ".pio/", "zephyr/", "build/", "modules/")
+
+
+def _read_body(abs_path: str, start_line: int, end_line: int) -> str:
+    """Read a function body from a source file using line numbers.
+
+    Returns the body text or an empty string on any error (missing file, bad range).
+    """
+    try:
+        with open(abs_path) as f:
+            lines = f.readlines()
+    except (FileNotFoundError, OSError):
+        return ""
+    if end_line > start_line and end_line <= len(lines):
+        return "".join(lines[start_line - 1 : end_line])
+    return ""
+
+
+def _fetch_callees(conn, symbol_usr: str, config_hash: str) -> list[str]:
+    """Return the qualified names of functions called by *symbol_usr*."""
+    rows = conn.execute(
+        """SELECT DISTINCT s.qualified_name
+           FROM refs r
+           JOIN symbols s ON s.usr = r.to_usr AND s.config_hash = ?
+           WHERE r.from_usr = ?
+             AND r.ref_kind = 'call'
+             AND r.config_hash = ?
+             AND s.qualified_name != ''
+           ORDER BY s.qualified_name
+           LIMIT 35""",
+        (config_hash, symbol_usr, config_hash),
+    ).fetchall()
+    return [r[0] for r in rows]
+
+
+def _enrich_batch(conn, batch_rows, config_hash: str) -> list[dict]:
+    """Augment symbol rows with ``body`` and ``callees`` keys.
+
+    Reads function/method bodies from disk and fetches callee names
+    from the reference index.  Failures are non-fatal — missing body
+    or callees are left as empty strings/lists.
+    """
+    enriched: list[dict] = []
+    for r in batch_rows:
+        d = dict(r)
+        body = ""
+        callees: list[str] = []
+
+        kind = d.get("kind", "")
+        abs_path = d.get("abs_path", "")
+        start_line = d.get("line", 0)
+        end_line = d.get("end_line", 0)
+        usr = d.get("usr", "")
+
+        # Only read body for functions/methods with valid extents
+        if kind in ("function", "method", "constructor", "destructor") and abs_path and end_line > start_line:
+            body = _read_body(abs_path, start_line, end_line)
+
+        # Fetch callees from the reference index
+        if usr:
+            callees = _fetch_callees(conn, usr, config_hash)
+
+        d["body"] = body
+        d["callees"] = callees
+        enriched.append(d)
+    return enriched
+
+
+def _build_llm_analysis(conn, config_hash: str, llm_config) -> None:
+    """Generate structured LLM analysis (summary, inputs, outputs) for all
+    project-definition symbols using Ollama in batches.
+
+    Follows the same pattern as _build_embeddings() but uses the chat endpoint
+    instead of the embed endpoint, and stores structured text rather than vectors.
+    Only project symbols (non-SDK) are analyzed.
+
+    Since 2026-06 the prompt includes the full function body (read from disk via
+    exact libclang extents) and callee names (from the reference index), which
+    dramatically improves description quality — especially for large functions
+    without docstrings.
+    """
+    import httpx
+
+    from ..indexer.prompts import build_analysis_prompt, parse_analysis_response
+    from .db import upsert_llm_analysis_batch
+
+    # Check Ollama reachability
+    try:
+        resp = httpx.get(llm_config.ollama_url.rstrip("/") + "/api/tags", timeout=5.0)
+        resp.raise_for_status()
+    except Exception:
+        log.warning("Ollama not reachable — skipping LLM analysis generation")
+        return
+
+    with transaction(conn):
+        rows = conn.execute(
+            """SELECT s.id, s.name, s.qualified_name, s.kind, s.file_path,
+                      s.signature, s.is_definition, s.docstring,
+                      s.end_line, s.line, s.usr,
+                      f.path as abs_path
+               FROM symbols s
+               JOIN files f ON s.file_id = f.id
+               WHERE s.config_hash = ?
+                 AND s.is_definition = 1
+                 AND s.kind IN ('function', 'method', 'constructor', 'destructor',
+                                'class', 'struct')
+                 AND s.file_path NOT LIKE 'mbed-os/%'
+                 AND s.file_path NOT LIKE '.pio/%'
+                 AND s.file_path NOT LIKE 'zephyr/%'
+                 AND s.file_path NOT LIKE 'build/%'
+                 AND s.file_path NOT LIKE 'modules/%'
+                 AND s.id NOT IN (SELECT symbol_id FROM llm_analysis)
+               ORDER BY s.kind, s.file_path, s.line""",
+            (config_hash,),
+        ).fetchall()
+        if not rows:
+            log.info("All project symbols already analyzed — nothing to do")
+            return
+
+    model = llm_config.model
+    total = 0
+    failed_ids: list[int] = []
+
+    # ── Phase 1: batch analysis ──────────────────────────────────────────
+    batch_size = 10
+    batches = (len(rows) + batch_size - 1) // batch_size
+    log.info("LLM analysis: %d symbols in %d batches (model=%s)", len(rows), batches, model)
+
+    for batch_num in range(0, len(rows), batch_size):
+        batch = rows[batch_num:batch_num + batch_size]
+        batch_dicts = _enrich_batch(conn, batch, config_hash)
+        prompt = build_analysis_prompt(batch_dicts)
+        try:
+            response = call_ollama(prompt, llm_config, temperature=0.1, num_predict=3000)
+        except Exception as e:
+            log.warning("LLM analysis batch %d failed: %s", batch_num // batch_size, e)
+            failed_ids.extend(r["id"] for r in batch)
+            continue
+
+        parsed = parse_analysis_response(response, batch_dicts)
+        if not parsed:
+            log.warning(
+                "LLM analysis batch %d: no valid entries parsed from response",
+                batch_num // batch_size,
+            )
+            failed_ids.extend(r["id"] for r in batch)
+            continue
+
+        with transaction(conn):
+            db_rows = [
+                (r["symbol_id"], r["summary"], r["inputs"], r["outputs"], model)
+                for r in parsed
+            ]
+            inserted = upsert_llm_analysis_batch(conn, db_rows)
+            total += inserted
+
+        if (batch_num // batch_size) % 5 == 0:
+            log.info("  batch %d/%d: %d stored", batch_num // batch_size + 1, batches, total)
+
+    # ── Phase 2: retry failed symbols individually ───────────────────────
+    if failed_ids:
+        log.info("Retrying %d failed symbols individually...", len(failed_ids))
+        # Re-fetch only the failed symbols (they may have been modified)
+        failed_rows = conn.execute(
+            """SELECT s.id, s.name, s.qualified_name, s.kind, s.file_path,
+                      s.signature, s.docstring, s.end_line, s.line, s.usr,
+                      f.path as abs_path
+               FROM symbols s
+               JOIN files f ON s.file_id = f.id
+               WHERE s.id IN ({})""".format(",".join("?" * len(failed_ids))),
+            failed_ids,
+        ).fetchall()
+        for row in failed_rows:
+            batch_dicts = _enrich_batch(conn, [row], config_hash)
+            prompt = build_analysis_prompt(batch_dicts)
+            try:
+                response = call_ollama(prompt, llm_config, temperature=0.1, num_predict=4000)
+                parsed = parse_analysis_response(response, batch_dicts)
+                if parsed:
+                    with transaction(conn):
+                        inserted = upsert_llm_analysis_batch(
+                            conn,
+                            [(parsed[0]["symbol_id"], parsed[0]["summary"],
+                              parsed[0]["inputs"], parsed[0]["outputs"], model)],
+                        )
+                        total += inserted
+                else:
+                    log.warning("Individual retry failed for %s", row["qualified_name"])
+            except Exception as e:
+                log.warning("Individual retry failed for %s: %s", row["qualified_name"], e)
+
+    log.info("LLM analysis stored: %d symbols (model=%s)", total, model)
 
 
 def _process_unit(unit, config_hash, project_root, source_roots, exclude_paths, index_refs, db_path, existing_files):
@@ -258,6 +458,7 @@ def run(
     project_name: str | None = None,
     index_refs: bool = False,
     index_embeddings: bool = False,
+    analyze_symbols: bool = False,
     project_root: Path | None = None,
     project_id: str | None = None,
     llm_config=None,
@@ -364,6 +565,12 @@ def run(
     if index_embeddings and llm_config is not None and llm_config.enabled:
         log.info("Generating embeddings for %d symbols...", total_syms)
         _build_embeddings(conn, config_hash, llm_config)
+        conn.commit()
+
+    # LLM analysis generation (opt-in)
+    if analyze_symbols and llm_config is not None and llm_config.enabled:
+        log.info("Generating LLM analysis for project symbols...")
+        _build_llm_analysis(conn, config_hash, llm_config)
         conn.commit()
 
     elapsed = time.monotonic() - t0

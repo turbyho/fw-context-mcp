@@ -25,8 +25,23 @@ db_dir = "~/.fw-context/index"
 [llm]
 # enabled = true   # set to false to disable Ollama and return raw prompts for the agent
 ollama_url = "http://localhost:11434"
+
+# Chat model for symbolic analysis and search query generation.
+# Minimum recommended: 14B parameters — smaller models produce inconsistent JSON
+# and poor-quality descriptions for C++ embedded code.
+#
+# Recommended models (min. 14B parameters):
+#   Local:
+#     qwen2.5-coder:14b        (4.8 GB VRAM, balanced speed/quality)
+#     deepseek-coder-v2:16b    (10 GB VRAM, strong code comprehension)
+#     qwen2.5-coder:32b        (19 GB VRAM, best local quality)
+#   Cloud (Ollama proxies to cloud APIs — "ollama pull <model>"):
+#     qwen3-coder:480b-cloud         (coding-focused, best quality)
+#     deepseek-v4-flash:cloud        (284B MoE, 13B active — great value)
+#     gemini-3-flash-preview:latest-cloud   (fast, affordable)
+#   See: https://ollama.com/search?c=cloud
 model = "qwen2.5-coder:14b"
-num_ctx = 8192
+num_ctx = 16384
 # debug_log = "~/.fw-context/llm-debug.jsonl"   # write LLM prompts/responses to JSONL
 """
 
@@ -68,9 +83,10 @@ exclude_paths = ["build", "BUILD"]
 # [llm]
 # enabled = false   # disable Ollama, return raw prompts for the agent to answer
 # ollama_url = "http://localhost:11434"
-# model = "qwen2.5-coder:7b-q4_K_M"   # override global model for this project
-# num_ctx = 8192
+# model = "qwen2.5-coder:14b"   # minimum 14B recommended — see global config for options
+# num_ctx = 16384
 # debug_log = "~/.fw-context/llm-debug.jsonl"   # write LLM prompts/responses to JSONL
+# analyze_symbols = true    # generate structured symbol descriptions (summary, inputs, outputs) — enabled by default
 """
 
 
@@ -80,8 +96,9 @@ class LLMConfig:
     ollama_url: str = "http://localhost:11434"
     model: str = "qwen2.5-coder:14b"
     embed_model: str = "mxbai-embed-large:latest"
-    num_ctx: int = 8192
+    num_ctx: int = 16384
     debug_log: Path | None = None
+    analyze_symbols: bool = True
 
 
 @dataclass
@@ -183,6 +200,8 @@ def _from_dict(data: dict) -> Config:
             cfg.llm.num_ctx = int(num_ctx)
         if debug_log := llm.get("debug_log"):
             cfg.llm.debug_log = Path(debug_log).expanduser()
+        if "analyze_symbols" in llm:
+            cfg.llm.analyze_symbols = bool(llm["analyze_symbols"])
 
     return cfg
 

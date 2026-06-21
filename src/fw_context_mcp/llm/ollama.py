@@ -15,7 +15,7 @@ from ..config.settings import LLMConfig
 
 log = logging.getLogger(__name__)
 
-_TIMEOUT = 60.0
+_TIMEOUT = 120.0
 
 
 def _pull_model(model: str, base_url: str) -> None:
@@ -47,17 +47,32 @@ def _write_debug_log(path: Path, entry: dict) -> None:
         log.warning("LLM debug log write failed: %s", e)
 
 
-def call_ollama(prompt: str, cfg: LLMConfig) -> str:
+def call_ollama(
+    prompt: str,
+    cfg: LLMConfig,
+    *,
+    temperature: float = 0.0,
+    num_predict: int | None = None,
+) -> str:
     """Send a prompt to Ollama and return the response text.
+
+    Args:
+        prompt: The full prompt text to send.
+        cfg: LLM configuration.
+        temperature: Sampling temperature (0.0 = deterministic, default).
+        num_predict: Maximum tokens to generate (None = model default).
 
     Raises OllamaError on network or API failure.
     """
     url = cfg.ollama_url.rstrip("/") + "/api/generate"
-    payload = {
+    options: dict = {"num_ctx": cfg.num_ctx, "temperature": temperature}
+    if num_predict is not None:
+        options["num_predict"] = num_predict
+    payload: dict = {
         "model": cfg.model,
         "prompt": prompt,
         "stream": False,
-        "options": {"num_ctx": cfg.num_ctx, "temperature": 0},
+        "options": options,
     }
     t0 = time.monotonic()
     try:
