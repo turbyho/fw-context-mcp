@@ -2,7 +2,12 @@
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 from fw_context_mcp.search.phases.base import Phase
+
+if TYPE_CHECKING:
+    from fw_context_mcp.search.context import PipelineContext
 from fw_context_mcp.utils import abs_path
 
 
@@ -15,7 +20,7 @@ class FormatPhase(Phase):
 
     name = "format"
 
-    async def run(self, ctx):
+    async def run(self, ctx: PipelineContext) -> PipelineContext:
         project_root = ctx.project_root
 
         def _fmt(r: dict) -> dict:

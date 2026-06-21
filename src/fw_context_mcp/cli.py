@@ -6,7 +6,7 @@ import argparse
 import logging
 import re
 import sys
-from datetime import UTC
+from datetime import UTC, datetime
 from pathlib import Path
 
 from . import __version__
@@ -194,9 +194,6 @@ def cmd_reset(args: argparse.Namespace) -> int:
 
 
 def cmd_status(args: argparse.Namespace) -> int:
-    import os
-    from datetime import datetime
-
     from .config import derive_project_id
     from .config import load as load_config
     from .indexer.db import get_active_config, open_db
@@ -225,11 +222,7 @@ def cmd_status(args: argparse.Namespace) -> int:
     ).fetchone()[0]
 
     stale = False
-    cc = active["compile_commands_path"]
-    if cc and Path(cc).exists():
-        cc_mtime = os.path.getmtime(cc)
-        indexed_at = datetime.fromisoformat(active["created_at"]).replace(tzinfo=UTC)
-        stale = cc_mtime > indexed_at.timestamp() + 1
+    stale = _cli_is_stale(active)
 
     print(f"Project : {project_root}")
     print(f"Symbols : {sym_count}  files={file_count}")
@@ -242,14 +235,15 @@ def cmd_status(args: argparse.Namespace) -> int:
 
 def _cli_is_stale(row) -> bool:
     import os
-    from datetime import datetime
+
+    from .utils import MTIME_TOLERANCE_S as _MTS
     try:
         cc = row["compile_commands_path"]
         if not cc or not Path(cc).exists():
             return False
         cc_mtime = os.path.getmtime(cc)
         indexed_at = datetime.fromisoformat(row["created_at"]).replace(tzinfo=UTC)
-        return cc_mtime > indexed_at.timestamp() + 1
+        return cc_mtime > indexed_at.timestamp() + _MTS
     except Exception:
         return False
 
@@ -262,8 +256,8 @@ def cmd_init(args: argparse.Namespace) -> int:
     """
     import shutil
 
-    from .config.tools import TOOLS, check_target
     from .config.settings import _ensure_project_config
+    from .config.tools import TOOLS, check_target
 
     # --list-tools: show supported tools and detection status
     if args.list_tools:
@@ -321,12 +315,12 @@ def cmd_init(args: argparse.Namespace) -> int:
                 print(f"  [info] Inherits from {parent_name} which has fw-context instructions")
                 ok = True  # Inheritance is a valid configuration — not an error
                 if not args.force:
-                    print(f"  [skip] Nothing to do. Use --force to inject anyway.")
+                    print("  [skip] Nothing to do. Use --force to inject anyway.")
                     continue
-                print(f"  [force] Injecting despite inheritance...")
+                print("  [force] Injecting despite inheritance...")
             else:
                 print(f"  [warn] Inherits from {parent_name} but parent NOT DETECTED")
-                print(f"  [info] Injecting instructions anyway...")
+                print("  [info] Injecting instructions anyway...")
 
         # MCP registration (only if not --instructions-only)
         if not args.instructions_only and tool.mcp_registration and mcp_bin:
@@ -335,7 +329,7 @@ def cmd_init(args: argparse.Namespace) -> int:
         # Instruction injection
         if not tool.targets:
             if not tool.mcp_registration:
-                print(f"  [skip] No instruction targets defined")
+                print("  [skip] No instruction targets defined")
             continue
 
         for target in tool.targets:
@@ -356,7 +350,7 @@ def cmd_init(args: argparse.Namespace) -> int:
 
             if collision.has_unmarked_content and not args.force:
                 print(f"  [warn] {resolved}: found unmarked fw-context content — skipping")
-                print(f"         Use --force to overwrite, or remove the existing section manually")
+                print("         Use --force to overwrite, or remove the existing section manually")
                 warnings.append(f"{tool.name}: {resolved} has unmarked fw-context content")
                 continue
 
@@ -388,7 +382,7 @@ def cmd_init(args: argparse.Namespace) -> int:
         print(f"\n[ok] {proj_config}: project config ready — edit source_roots, excludes, etc.")
 
     if warnings:
-        print(f"\nWarnings:")
+        print("\nWarnings:")
         for w in warnings:
             print(f"  ⚠ {w}")
     if ok:
@@ -403,9 +397,9 @@ def cmd_init(args: argparse.Namespace) -> int:
 
 def _register_mcp(tool, mcp_bin: str) -> None:
     """Register fw-context as an MCP server with a tool's CLI."""
-    import subprocess
     import shutil
-    from .config.tools import AiTool
+    import subprocess
+
 
     if not tool.mcp_registration:
         return
@@ -424,7 +418,8 @@ def _register_mcp(tool, mcp_bin: str) -> None:
         print(f"  [ok] {tool.name}: fw-context registered ({mcp_bin})")
     else:
         msg = (result.stderr or result.stdout).strip()
-        if "already" in msg.lower() or "exists" in msg.lower():
+        msg_lower = msg.lower()
+        if "already registered" in msg_lower or "already exists" in msg_lower:
             print(f"  [ok] {tool.name}: fw-context already registered")
         else:
             print(f"  [warn] {tool.name}: {msg}", file=sys.stderr)
@@ -570,7 +565,8 @@ def cmd_watch(args: argparse.Namespace) -> int:
 
     from watchfiles import watch
 
-    from .config import derive_project_id, load as load_config
+    from .config import derive_project_id
+    from .config import load as load_config
     from .indexer.compile_commands import parse as parse_cc
     from .indexer.db import get_active_config, open_db
     from .indexer.ops import store_symbols_for_unit

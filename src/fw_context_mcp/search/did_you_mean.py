@@ -9,9 +9,13 @@ Results are cached per-query for the lifetime of the process.
 
 from __future__ import annotations
 
+import logging
 import re
 import sqlite3
+import time
 from collections import defaultdict
+
+log = logging.getLogger(__name__)
 
 # Simple cache: {query: [suggestions]}
 _cache: dict[str, list[str]] = {}
@@ -32,7 +36,9 @@ def _tokenize(name: str) -> list[str]:
         if not part:
             continue
         # Split camelCase: "nrfxUarteInit" → ["nrfx", "Uarte", "Init"]
-        subtokens = re.findall(r"[A-Z]?[a-z0-9]+|[A-Z0-9]+(?=[A-Z]|$)", part)
+        # Second alternative uses [A-Z]+ (not [A-Z0-9]+) so digits after an
+        # acronym become their own token: "TIM16Config" → ["TIM", "16", "Config"].
+        subtokens = re.findall(r"[A-Z]?[a-z0-9]+|[A-Z]+(?=[A-Z][a-z]|$|\d)", part)
         for t in subtokens:
             t = t.lower()
             if t and t not in tokens:
@@ -68,11 +74,14 @@ def suggest(
     if cache_key in _cache:
         return _cache[cache_key][:limit]
 
+    t0 = time.monotonic()
     candidates = _load_names(conn, config_hash)
     if not candidates:
         return []
 
     query_tokens = _tokenize(name)
+    log.debug("did-you-mean: loaded %d candidates in %.2fs for '%s'",
+              len(candidates), time.monotonic() - t0, name)
     if not query_tokens:
         return []
 

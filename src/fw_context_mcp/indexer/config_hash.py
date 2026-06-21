@@ -34,7 +34,10 @@ def _normalize_entry(entry: dict) -> dict:
         if token.startswith("@"):
             rsp = Path(token[1:])
             if rsp.exists():
-                expanded.extend(shlex.split(rsp.read_text()))
+                try:
+                    expanded.extend(shlex.split(rsp.read_text()))
+                except (OSError, ValueError):
+                    pass  # unreadable: skip; hash will differ — intentional
             # If missing: skip; hash will differ — intentional (build dir gone)
         else:
             expanded.append(token)

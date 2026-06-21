@@ -41,12 +41,24 @@ from ..indexer.db import (
 )
 from ..indexer.db import (
     get_class_members as query_class_members,
+)
+from ..indexer.db import (
     get_template_instances as query_template_instances,
 )
 from ..llm.ollama import OllamaError, OllamaModelNotFoundError, call_ollama_async, call_ollama_embed, check_setup
 from ..utils import MTIME_TOLERANCE_S, abs_path, resolve_project_root
 
 log = logging.getLogger(__name__)
+
+LOOKUP_EXACT_SQL = """SELECT s.* FROM symbols s
+   WHERE s.config_hash=? AND (s.name=? OR s.qualified_name=?)
+   ORDER BY s.is_definition DESC, s.line
+   LIMIT ?"""
+
+LOOKUP_PREFIX_SQL = r"""SELECT s.* FROM symbols s
+   WHERE s.config_hash=? AND (s.name LIKE ? ESCAPE '\' OR s.qualified_name LIKE ? ESCAPE '\')
+   ORDER BY s.is_definition DESC, s.line
+   LIMIT ?"""
 
 # ── MCP server instance ─────────────────────────────────────────────────────
 
@@ -111,7 +123,8 @@ def _is_stale(cfg, compile_commands_path: str) -> bool:
         cc_mtime = os.path.getmtime(compile_commands_path)
         indexed_at = datetime.fromisoformat(cfg["created_at"]).replace(tzinfo=UTC)
         return cc_mtime > indexed_at.timestamp() + MTIME_TOLERANCE_S
-    except Exception:
+    except (FileNotFoundError, KeyError, ValueError, OSError) as e:
+        log.warning("Staleness check failed: %s", e)
         return False
 
 
@@ -314,6 +327,7 @@ def get_active_build(
     conn, err = _open_db_safe(db_path)
     if err:
         return err
+    assert conn is not None
     try:
         with conn:
             project_id = derive_project_id(root)
@@ -387,6 +401,7 @@ def _with_stale_recovery(
     conn, err = _open_db_safe(db_path)
     if err:
         return [err]
+    assert conn is not None
     try:
         with conn:
             project_id = derive_project_id(root)
@@ -403,7 +418,8 @@ def _with_stale_recovery(
         conn.close()
 
     results: list[dict] = []
-    if _is_stale(cfg, cfg["compile_commands_path"]):
+    cc_path = cfg["compile_commands_path"] if "compile_commands_path" in cfg else ""
+    if cc_path and _is_stale(cfg, cc_path):
         results.append({"warning": stale_msg or "Index may be stale — compile_commands.json changed since last index. Run 'fw-context index' to update."})
     if stale_f:
         succeeded, failed = _auto_reindex_stale(stale_f, root)
@@ -413,6 +429,7 @@ def _with_stale_recovery(
                 results.append({"warning": f"Auto-reindex partially succeeded ({len(succeeded)} files), but DB is now corrupt."})
                 results += result_rows
                 return results
+            assert conn2 is not None
             try:
                 with conn2:
                     result_rows = query_fn(conn2, config_hash)
@@ -429,7 +446,7 @@ def lookup_symbol(
     name: Annotated[str, Field(description="Symbol name. Exact match if exact=True, prefix LIKE match otherwise. E.g. 'uart_init' or 'uart_'.")],
     project_root: Annotated[str | None, Field(description="Project root directory. Auto-detected from CWD if omitted.")] = None,
     exact: Annotated[bool, Field(description="True = exact name match, False = prefix LIKE match (default).")] = False,
-    limit: Annotated[int, Field(description="Maximum results returned (default 50).")] = 50,
+    limit: Annotated[int, Field(description="Maximum results returned (capped at 100, default 50).")] = 50,
 ) -> list[dict]:
     """Look up a symbol by name — exact or prefix matching.
 
@@ -464,19 +481,13 @@ def lookup_symbol(
         def _do_lookup(c: sqlite3.Connection, config_hash: str) -> list[dict]:
             if exact:
                 rows = c.execute(
-                    """SELECT s.* FROM symbols s
-                       WHERE s.config_hash=? AND (s.name=? OR s.qualified_name=?)
-                       ORDER BY s.is_definition DESC, s.line
-                       LIMIT ?""",
+LOOKUP_EXACT_SQL,
                     (config_hash, name, name, limit),
                 ).fetchall()
             else:
                 esc = name.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
                 rows = c.execute(
-                    r"""SELECT s.* FROM symbols s
-                       WHERE s.config_hash=? AND (s.name LIKE ? ESCAPE '\' OR s.qualified_name LIKE ? ESCAPE '\')
-                       ORDER BY s.is_definition DESC, s.line
-                       LIMIT ?""",
+LOOKUP_PREFIX_SQL,
                     (config_hash, f"{esc}%", f"{esc}%", limit),
                 ).fetchall()
 
@@ -575,6 +586,7 @@ def list_projects(
             if err:
                 results.append(err)
                 continue
+            assert conn is not None
             try:
                 with conn:
                     rows = get_all_projects(conn)
@@ -680,6 +692,7 @@ def reindex_file(
     conn, err = _open_db_safe(db_path)
     if err:
         return err
+    assert conn is not None
     try:
         with conn:
             cfg_data = get_active_config(conn, project_id)
@@ -806,6 +819,7 @@ async def explain_symbol(
     conn, err = _open_db_safe(db_path)
     if err:
         return err
+    assert conn is not None
     try:
         with conn:
             cfg_data = get_active_config(conn, project_id)
@@ -907,6 +921,7 @@ def get_source(
     conn, err = _open_db_safe(db_path)
     if err:
         return err
+    assert conn is not None
     try:
         with conn:
             cfg_data = get_active_config(conn, project_id)
@@ -1005,6 +1020,7 @@ def get_file_map(
     conn, err = _open_db_safe(db_path)
     if err:
         return err
+    assert conn is not None
     try:
         with conn:
             cfg_data = get_active_config(conn, project_id)
@@ -1066,6 +1082,7 @@ def get_file_analysis(
     conn, err = _open_db_safe(db_path)
     if err:
         return err
+    assert conn is not None
     try:
         with conn:
             cfg_data = get_active_config(conn, project_id)
@@ -1126,6 +1143,7 @@ def get_symbol_context(
     conn, err = _open_db_safe(db_path)
     if err:
         return err
+    assert conn is not None
     try:
         with conn:
             cfg_data = get_active_config(conn, project_id)
@@ -1258,6 +1276,7 @@ def _references_result(name: str, project_root: str | None, ref_kind: str | list
     conn, err = _open_db_safe(db_path)
     if err:
         return [err]
+    assert conn is not None
     try:
         with conn:
             cfg_data = get_active_config(conn, project_id)
@@ -1327,7 +1346,7 @@ def find_references(
 # ── Graph analytics tools ─────────────────────────────────────────────────────
 
 
-def _refs_guard(project_root: str | None) -> tuple[Path, str, str] | tuple[None, None, list[dict]]:
+def _refs_guard(project_root: str | None) -> tuple[Path, str, None] | tuple[None, None, list[dict]]:
     """Shared guard for graph tools: resolve project, open DB, check refs exist.
 
     Returns ``(root, config_hash, None)`` on success or ``(None, None, error_list)``
@@ -1340,6 +1359,7 @@ def _refs_guard(project_root: str | None) -> tuple[Path, str, str] | tuple[None,
     conn, err = _open_db_safe(db_path)
     if err:
         return None, None, [err]
+    assert conn is not None
     try:
         project_id = derive_project_id(root)
         with conn:
@@ -1354,9 +1374,6 @@ def _refs_guard(project_root: str | None) -> tuple[Path, str, str] | tuple[None,
                     "Re-run 'fw-context index' to rebuild."
                 )}]
             return root, config_hash, None
-    except Exception:
-        conn.close()
-        raise
     finally:
         conn.close()
 
@@ -1383,10 +1400,13 @@ def find_call_path(
     root, config_hash, err = _refs_guard(project_root)
     if err:
         return err
+    assert root is not None
+    assert config_hash is not None
     db_path = _db_path(root)
     conn, open_err = _open_db_safe(db_path)
     if open_err:
         return [open_err]
+    assert conn is not None
     try:
         if _lookup_definition(conn, config_hash, from_name) is None:
             return [{"error": f"Symbol not found: {from_name}"}]
@@ -1421,10 +1441,13 @@ def find_all_callers_recursive(
     root, config_hash, err = _refs_guard(project_root)
     if err:
         return err
+    assert root is not None
+    assert config_hash is not None
     db_path = _db_path(root)
     conn, open_err = _open_db_safe(db_path)
     if open_err:
         return [open_err]
+    assert conn is not None
     try:
         if _lookup_definition(conn, config_hash, name) is None:
             return [{"error": f"Symbol not found: {name}"}]
@@ -1457,10 +1480,13 @@ def find_callees_recursive(
     root, config_hash, err = _refs_guard(project_root)
     if err:
         return err
+    assert root is not None
+    assert config_hash is not None
     db_path = _db_path(root)
     conn, open_err = _open_db_safe(db_path)
     if open_err:
         return [open_err]
+    assert conn is not None
     try:
         if _lookup_definition(conn, config_hash, name) is None:
             return [{"error": f"Symbol not found: {name}"}]
@@ -1547,6 +1573,8 @@ def find_dead_code(
     root, config_hash, err = _refs_guard(project_root)
     if err:
         return err
+    assert root is not None
+    assert config_hash is not None
 
     final_excludes = _merge_excludes(exclude_paths, project_only, root)
 
@@ -1554,6 +1582,7 @@ def find_dead_code(
     conn, open_err = _open_db_safe(db_path)
     if open_err:
         return [open_err]
+    assert conn is not None
     try:
         rows = index_db.find_dead_code(
             conn, config_hash, limit=limit,
@@ -1581,10 +1610,13 @@ def find_wrapper_callers(
     root, config_hash, err = _refs_guard(project_root)
     if err:
         return err
+    assert root is not None
+    assert config_hash is not None
     db_path = _db_path(root)
     conn, open_err = _open_db_safe(db_path)
     if open_err:
         return [open_err]
+    assert conn is not None
     try:
         # Resolve driver class — check it exists in the index
         if _lookup_definition(conn, config_hash, class_name) is None:
@@ -1690,10 +1722,13 @@ def trace_data_flow(
     root, config_hash, err = _refs_guard(project_root)
     if err:
         return err
+    assert root is not None
+    assert config_hash is not None
     db_path = _db_path(root)
     conn, open_err = _open_db_safe(db_path)
     if open_err:
         return [open_err]
+    assert conn is not None
     try:
         # Resolve target USR
         target = conn.execute(
@@ -1783,6 +1818,8 @@ def find_hotspots(
     root, config_hash, err = _refs_guard(project_root)
     if err:
         return err
+    assert root is not None
+    assert config_hash is not None
 
     final_excludes = _merge_excludes(exclude_paths, project_only, root)
 
@@ -1790,6 +1827,7 @@ def find_hotspots(
     conn, open_err = _open_db_safe(db_path)
     if open_err:
         return [open_err]
+    assert conn is not None
     try:
         rows = index_db.find_hotspots(conn, config_hash, limit=limit, exclude_paths=final_excludes)
         if not rows and final_excludes:
@@ -1837,6 +1875,7 @@ def get_inheritance_chain(
     conn, err = _open_db_safe(db_path)
     if err:
         return err
+    assert conn is not None
     try:
         with conn:
             cfg_data = get_active_config(conn, project_id)
@@ -1971,6 +2010,7 @@ def get_class_members(
     conn, err = _open_db_safe(db_path)
     if err:
         return err
+    assert conn is not None
     try:
         with conn:
             cfg_data = get_active_config(conn, project_id)
@@ -2040,6 +2080,7 @@ def get_template_instances(
     conn, err = _open_db_safe(db_path)
     if err:
         return [err]
+    assert conn is not None
     try:
         with conn:
             cfg_data = get_active_config(conn, project_id)
@@ -2112,6 +2153,7 @@ async def get_method_overrides(
     conn, err = _open_db_safe(db_path)
     if err:
         return err
+    assert conn is not None
     try:
         with conn:
             cfg_data = get_active_config(conn, project_id)
@@ -2328,15 +2370,12 @@ def search_code(
                     d["parent_usr"] = r["parent_usr"]
                 if r["enum_value"] is not None:
                     d["enum_value"] = r["enum_value"]
-                llm = (r["summary"] if "summary" in r.keys() else "") or ""
-                if llm:
-                    d["summary"] = llm
-                llm_in = (r["inputs"] if "inputs" in r.keys() else "") or ""
-                if llm_in:
-                    d["inputs"] = llm_in
-                llm_out = (r["outputs"] if "outputs" in r.keys() else "") or ""
-                if llm_out:
-                    d["outputs"] = llm_out
+                if "summary" in r.keys() and r["summary"]:
+                    d["summary"] = r["summary"]
+                if "inputs" in r.keys() and r["inputs"]:
+                    d["inputs"] = r["inputs"]
+                if "outputs" in r.keys() and r["outputs"]:
+                    d["outputs"] = r["outputs"]
                 if fallback_used:
                     d["_fallback"] = method
                 return d
@@ -2401,6 +2440,7 @@ async def smart_search(
         conn, err = _open_db_safe(ctx.db_path)
         if err:
             return [err]
+        assert conn is not None
         try:
             with conn:
                 cfg_data = get_active_config(conn, derive_project_id(ctx.project_root))
@@ -2513,16 +2553,16 @@ async def semantic_search(
 
         # Load embeddings and run cosine search
         def _do_semantic(c: sqlite3.Connection, config_hash: str) -> list[dict]:
-            # Load all embeddings with file_path for source-aware boosting
-            rows = c.execute(
-                """SELECT e.symbol_id, e.embedding, s.file_path
+            # Count embeddings first so we can paginate
+            total = c.execute(
+                """SELECT COUNT(*)
                    FROM embeddings e
                    JOIN symbols s ON s.id = e.symbol_id
                    WHERE s.config_hash = ? AND s.is_definition = 1""",
                 (config_hash,),
-            ).fetchall()
+            ).fetchone()[0]
 
-            if not rows:
+            if total == 0:
                 return _fallback_to_search_code_inner(
                     c, root, query, config_hash, limit,
                     warning="No embeddings found in the index. "
@@ -2539,22 +2579,47 @@ async def semantic_search(
                     return 0.85
 
             # Compute cosine similarity + source boost for each embedding
-            scored: list[tuple[float, float, sqlite3.Row]] = []
-            for r in rows:
-                try:
-                    vec = struct.unpack(f'{len(query_vec)}f', r["embedding"])
-                except Exception:
-                    continue
-                dot = sum(x * y for x, y in zip(query_vec, vec))
-                norm_a = math.sqrt(sum(x * x for x in query_vec))
-                norm_b = math.sqrt(sum(x * x for x in vec))
-                raw_sim = dot / (norm_a * norm_b) if norm_a and norm_b else 0.0
-                if raw_sim > threshold:
-                    boost = _source_boost(r["file_path"] or "")
-                    scored.append((raw_sim * boost, raw_sim, r))
+            BATCH = 1000
+            norm_a = math.sqrt(sum(x * x for x in query_vec))
+            keep = limit * 10
+            top_candidates: list[tuple[float, float, int]] = []
 
-            scored.sort(key=lambda x: -x[0])
-            top = scored[:limit]
+            for offset in range(0, total, BATCH):
+                rows = c.execute(
+                    """SELECT e.symbol_id, e.embedding, s.file_path
+                       FROM embeddings e
+                       JOIN symbols s ON s.id = e.symbol_id
+                       WHERE s.config_hash = ? AND s.is_definition = 1
+                       ORDER BY e.symbol_id
+                       LIMIT ? OFFSET ?""",
+                    (config_hash, BATCH, offset),
+                ).fetchall()
+
+                for r in rows:
+                    try:
+                        vec = struct.unpack(f'{len(query_vec)}f', r["embedding"])
+                    except Exception:
+                        continue
+                    dot = sum(x * y for x, y in zip(query_vec, vec, strict=True))
+                    norm_b = math.sqrt(sum(x * x for x in vec))
+                    raw_sim = dot / (norm_a * norm_b) if norm_a and norm_b else 0.0
+                    if raw_sim > threshold:
+                        boost = _source_boost(r["file_path"] or "")
+                        top_candidates.append((raw_sim * boost, raw_sim, r["symbol_id"]))
+
+                if len(top_candidates) > keep:
+                    top_candidates.sort(key=lambda x: -x[0])
+                    top_candidates = top_candidates[:keep]
+
+            if not top_candidates:
+                return [{
+                    "warning": f"No symbols matched with similarity > {threshold}. "
+                               "Try lowering the threshold or rephrasing the query.",
+                    "hint": "Use search_code for lexical/keyword search.",
+                }]
+
+            top_candidates.sort(key=lambda x: -x[0])
+            top = top_candidates[:limit]
 
             if not top:
                 return [{
@@ -2564,7 +2629,7 @@ async def semantic_search(
                 }]
 
             # Resolve symbol details
-            sym_ids = [r[2]["symbol_id"] for r in top]  # r[2] is the Row
+            sym_ids = [r[2] for r in top]  # r[2] is symbol_id
             placeholders = ",".join("?" * len(sym_ids))
             sym_rows = c.execute(
                 f"""SELECT * FROM symbols
@@ -2575,7 +2640,7 @@ async def semantic_search(
 
             sym_map = {r["id"]: r for r in sym_rows}
             # Map symbol_id → raw similarity (r[1] from scored tuple)
-            sim_map = {r[2]["symbol_id"]: r[1] for r in top}
+            sim_map = {r[2]: r[1] for r in top}  # symbol_id → raw_sim
 
             results: list[dict] = []
             for sid in sym_ids:
@@ -2628,6 +2693,7 @@ def _fallback_to_search_code(
     conn, err = _open_db_safe(db_path)
     if err:
         return [err]
+    assert conn is not None
     try:
         with conn:
             project_id = derive_project_id(root)

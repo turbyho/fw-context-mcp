@@ -2,7 +2,12 @@
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 from fw_context_mcp.search.phases.base import Phase
+
+if TYPE_CHECKING:
+    from fw_context_mcp.search.context import PipelineContext
 
 
 class TranslatePhase(Phase):
@@ -17,7 +22,7 @@ class TranslatePhase(Phase):
     def should_run(self, ctx) -> bool:
         return ctx.config.llm.enabled
 
-    async def run(self, ctx):
+    async def run(self, ctx: PipelineContext) -> PipelineContext:
         from fw_context_mcp.llm.ollama import OllamaError, call_ollama_async
 
         query = ctx.query

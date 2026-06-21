@@ -315,8 +315,9 @@ def parse(path: Path) -> Iterator[CompilationUnit]:
 
         # For GCC cross-compilers inject system include paths so libclang
         # finds stdint.h and friends when --target is active.
+        # Pass raw_args so -mcpu=/-march= heuristics can augment compiler-name detection.
         if compiler is not None:
-            triple = _detect_target_triple(compiler, [])
+            triple = _detect_target_triple(compiler, raw_args)
             if triple is not None:
                 clang_args = clang_args + _gcc_system_includes(compiler)
 

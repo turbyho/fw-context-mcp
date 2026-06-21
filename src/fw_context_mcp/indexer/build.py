@@ -208,12 +208,7 @@ def _build_zephyr(project_root: Path, cfg: BuildConfig) -> Path:
 
     if cfg.clean:
         cmd.append("--pristine")
-    else:
-        cmd.append("--")
-
-    if not cfg.clean:
-        cmd.append("--")
-
+    cmd.append("--")
     cmd.append("-DCMAKE_EXPORT_COMPILE_COMMANDS=ON")
 
     log.info("zephyr build: %s", " ".join(cmd))
@@ -337,7 +332,8 @@ def generate_compile_commands(
     # Full command override
     if cfg.command:
         log.info("Running custom build command: %s", cfg.command)
-        result = subprocess.run(cfg.command, shell=True, cwd=root)
+        import shlex
+        result = subprocess.run(shlex.split(cfg.command), shell=False, cwd=root)
         if result.returncode != 0:
             raise RuntimeError(f"Build command failed with exit code {result.returncode}")
         cc_path = root / "compile_commands.json"

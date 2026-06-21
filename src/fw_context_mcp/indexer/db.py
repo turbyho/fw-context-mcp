@@ -96,12 +96,12 @@ def _parse_expected_columns(schema_sql: str, migration_statements: list[str]) ->
 
     # Parse ALTER TABLE ADD COLUMN from migration statements
     for stmt in migration_statements:
-        match = re.match(
+        alt_match = re.match(
             r"ALTER TABLE (\w+) ADD COLUMN (\w+)",
             stmt.strip(), re.IGNORECASE,
         )
-        if match:
-            table, col = match.group(1), match.group(2)
+        if alt_match:
+            table, col = alt_match.group(1), alt_match.group(2)
             tables.setdefault(table, set()).add(col)
 
     return tables
@@ -479,9 +479,12 @@ def open_db(path: Path) -> sqlite3.Connection:
             conn.execute("PRAGMA busy_timeout = 30000")
             conn.executescript(_SCHEMA)
             for stmt in _MIGRATION_ADD_COLUMNS:
-                try: conn.execute(stmt); conn.commit()
+                try:
+                    conn.execute(stmt)
+                    conn.commit()
                 except sqlite3.OperationalError as e2:
-                    if "duplicate column" not in str(e2): raise
+                    if "duplicate column" not in str(e2):
+                        raise
         else:
             conn.close()
             raise DatabaseCorruptionError(str(path), str(e)) from e
@@ -529,15 +532,21 @@ def transaction(
     loops (e.g. the indexer's per-TU commits) and run a single checkpoint once
     the loop finishes — per-commit checkpoints there are O(n) and dominate
     indexing time.
+
+    The checkpoint is best-effort: if it fails (e.g. another connection holds
+    a read transaction), the commit is NOT rolled back — data is already safe.
     """
     try:
         yield conn
         conn.commit()
-        if checkpoint:
-            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
     except Exception:
         conn.rollback()
         raise
+    if checkpoint:
+        try:
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        except Exception:
+            pass  # best-effort — data was already committed
 
 
 def upsert_project(conn: sqlite3.Connection, project_id: str, name: str, root_path: str) -> None:
@@ -852,12 +861,12 @@ _EMBEDDING_DIM = 1024
 
 def _vec_to_blob(vec: list[float]) -> bytes:
     """Pack a float vector into a BLOB for storage."""
-    return struct.pack(f"f" * len(vec), *vec)
+    return struct.pack("f" * len(vec), *vec)
 
 
 def _blob_to_vec(blob: bytes) -> list[float]:
     """Unpack a BLOB back into a float vector."""
-    return list(struct.unpack(f"f" * (len(blob) // 4), blob))
+    return list(struct.unpack("f" * (len(blob) // 4), blob))
 
 
 def upsert_embeddings(
@@ -987,7 +996,7 @@ def search_similar_hybrid(
     fts5_query: str,
     threshold: float = 0.6,
     limit: int = 20,
-) -> list[sqlite3.Row]:
+) -> list[dict]:
     """Hybrid search: combine FTS5 text relevance with vector similarity.
 
     1. Fetch candidate symbols via FTS5 (broad recall – up to 200 candidates).
@@ -997,7 +1006,6 @@ def search_similar_hybrid(
     This avoids a full-scan of vec_symbols while still leveraging semantic
     similarity for ranking.
     """
-    import json
 
     from fw_context_mcp.indexer.db import search_symbols
 
@@ -1010,7 +1018,6 @@ def search_similar_hybrid(
     placeholders = ",".join("?" * len(candidate_ids))
 
     # Phase 2 — vector re-rank
-    query_json = json.dumps(query_vec)
     rows = conn.execute(
         f"""SELECT vs.symbol_id, distance
             FROM vec_symbols vs
@@ -1129,6 +1136,18 @@ def _get_alias_pairs(
                 pairs.append((r["usr"], def_usr))
                 break
     return pairs
+
+
+def _escape_usr_values(alias_pairs: list[tuple[str, str]]) -> str:
+    """Return SQL VALUES string with single-quote-escaped USRs.
+
+    USRs from libclang (e.g. ``c:@F@main#I#``) do not contain single quotes,
+    but we escape defensively to prevent SQL syntax errors or injection.
+    """
+    return ", ".join(
+        f"('{d.replace(chr(39), chr(39) * 2)}', '{f.replace(chr(39), chr(39) * 2)}')"
+        for d, f in alias_pairs
+    )
 
 
 def _bridge_weak_aliases(
@@ -1276,9 +1295,7 @@ def find_all_callers_recursive(
     # Build extended refs: real refs + synthetic weak-alias edges.
     # When someone calls decl_usr (alias), they also effectively call def_usr.
     alias_pairs = _get_alias_pairs(conn, config_hash)
-    alias_values = ", ".join(
-        f"('{d}', '{f}')" for d, f in alias_pairs
-    )
+    alias_values = _escape_usr_values(alias_pairs)
     alias_cte = (
         f"""alias_pairs(decl_usr, def_usr) AS (VALUES {alias_values}),"""
         if alias_values else ""
@@ -1327,7 +1344,7 @@ def find_all_callers_recursive(
         ORDER BY d.depth, COALESCE(s_def.name, s_any.name)
         LIMIT ?"""
 
-    params = [config_hash]
+    params: list[object] = [config_hash]
     if alias_values:
         params.append(config_hash)
     params.extend([target_usr, max_depth, config_hash, config_hash, limit])
@@ -1356,9 +1373,7 @@ def find_callees_recursive(
     # When decl_usr is an alias for def_usr, anything def_usr calls should
     # also be reachable from decl_usr.
     alias_pairs = _get_alias_pairs(conn, config_hash)
-    alias_values = ", ".join(
-        f"('{d}', '{f}')" for d, f in alias_pairs
-    )
+    alias_values = _escape_usr_values(alias_pairs)
     alias_cte = (
         f"""alias_pairs(decl_usr, def_usr) AS (VALUES {alias_values}),"""
         if alias_values else ""
@@ -1407,7 +1422,7 @@ def find_callees_recursive(
         ORDER BY d.depth, COALESCE(s_def.name, s_any.name)
         LIMIT ?"""
 
-    params = [config_hash]
+    params: list[object] = [config_hash]
     if alias_values:
         params.append(config_hash)
     params.extend([source_usr, max_depth, config_hash, config_hash, limit])
@@ -1764,7 +1779,7 @@ def get_file_map(
                 subgroups[parent_enum]["constants"].append(entry)
         else:
             if max_per_kind == 0 or len(groups[kind]["items"]) < max_per_kind:
-                entry: dict = {
+                entry = {
                     "name": r["name"],
                     "qualified_name": r["qualified_name"],
                     "line": r["line"],

@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from fw_context_mcp.mcp.server import _read_symbol_body
+from fw_context_mcp.mcp.server import LOOKUP_EXACT_SQL, LOOKUP_PREFIX_SQL, _read_symbol_body
 from fw_context_mcp.utils import abs_path as _abs_path
 
 
@@ -124,15 +124,8 @@ CREATE INDEX IF NOT EXISTS idx_symbols_name  ON symbols(name);
 CREATE INDEX IF NOT EXISTS idx_symbols_qname ON symbols(qualified_name);
 """
 
-EXACT_SQL = """SELECT s.* FROM symbols s
-   WHERE s.config_hash=? AND (s.name=? OR s.qualified_name=?)
-   ORDER BY s.is_definition DESC, s.line
-   LIMIT ?"""
-
-PREFIX_SQL = """SELECT s.* FROM symbols s
-   WHERE s.config_hash=? AND (s.name LIKE ? OR s.qualified_name LIKE ?)
-   ORDER BY s.is_definition DESC, s.line
-   LIMIT ?"""
+# LOOKUP_EXACT_SQL and LOOKUP_PREFIX_SQL are imported from fw_context_mcp.mcp.server
+# — no local duplicates that could drift out of sync.
 
 
 def _insert_symbol(c, **kw):
@@ -182,7 +175,7 @@ class TestLookupSymbolSQL:
         """lookup_symbol("mbed::DigitalOut::write", exact=True) finds the symbol."""
         _insert_symbol(db, usr="u1", name="write",
                        qualified_name="mbed::DigitalOut::write")
-        rows = db.execute(EXACT_SQL,
+        rows = db.execute(LOOKUP_EXACT_SQL,
                           ("hash-aaa", "mbed::DigitalOut::write",
                            "mbed::DigitalOut::write", 50)).fetchall()
         assert len(rows) == 1
@@ -193,14 +186,14 @@ class TestLookupSymbolSQL:
         """Exact match by short name still works (backward compatibility)."""
         _insert_symbol(db, usr="u1", name="write",
                        qualified_name="mbed::DigitalOut::write")
-        rows = db.execute(EXACT_SQL, ("hash-aaa", "write", "write", 50)).fetchall()
+        rows = db.execute(LOOKUP_EXACT_SQL, ("hash-aaa", "write", "write", 50)).fetchall()
         assert len(rows) == 1
 
     def test_exact_no_match_on_wrong_qualified_name(self, db):
         """No false positives — wrong qualified name must not match."""
         _insert_symbol(db, usr="u1", name="write",
                        qualified_name="mbed::DigitalOut::write")
-        rows = db.execute(EXACT_SQL,
+        rows = db.execute(LOOKUP_EXACT_SQL,
                           ("hash-aaa", "mbed::GPIO::write",
                            "mbed::GPIO::write", 50)).fetchall()
         assert rows == []
@@ -213,7 +206,7 @@ class TestLookupSymbolSQL:
                        qualified_name="mbed::DigitalOut::read")
         _insert_symbol(db, usr="u2", name="read_voltage",
                        qualified_name="mbed::AnalogIn::read_voltage")
-        rows = db.execute(PREFIX_SQL,
+        rows = db.execute(LOOKUP_PREFIX_SQL,
                           ("hash-aaa", "mbed::DigitalOut%",
                            "mbed::DigitalOut%", 50)).fetchall()
         assert len(rows) == 1
@@ -223,7 +216,7 @@ class TestLookupSymbolSQL:
         """Prefix match by short name still works (backward compatibility)."""
         _insert_symbol(db, usr="u1", name="read_voltage",
                        qualified_name="mbed::AnalogIn::read_voltage")
-        rows = db.execute(PREFIX_SQL,
+        rows = db.execute(LOOKUP_PREFIX_SQL,
                           ("hash-aaa", "read%", "read%", 50)).fetchall()
         assert len(rows) >= 1
         assert any(r["name"] == "read_voltage" for r in rows)
@@ -234,7 +227,7 @@ class TestLookupSymbolSQL:
                        qualified_name="mbed::DigitalOut::write")
         _insert_symbol(db, usr="u2", name="write",
                        qualified_name="mbed::SPI::write")
-        rows = db.execute(PREFIX_SQL,
+        rows = db.execute(LOOKUP_PREFIX_SQL,
                           ("hash-aaa", "mbed::%", "mbed::%", 50)).fetchall()
         assert len(rows) >= 2
 
@@ -248,7 +241,7 @@ class TestLookupSymbolSQL:
         _insert_symbol(db, usr="u2", name="write",
                        qualified_name="mbed::DigitalOut::write",
                        is_definition=1, signature="void write(int)")
-        rows = db.execute(PREFIX_SQL,
+        rows = db.execute(LOOKUP_PREFIX_SQL,
                           ("hash-aaa", "mbed::DigitalOut::write%",
                            "mbed::DigitalOut::write%", 50)).fetchall()
         assert len(rows) == 2
@@ -426,7 +419,7 @@ class TestLikeEscaping:
             ("hash-aaa",),
         ).fetchone()
         assert row is None, (
-            f"Escaped combined special chars unexpectedly matched"
+            "Escaped combined special chars unexpectedly matched"
         )
 
 

@@ -9,6 +9,8 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
+__all__ = ["MTIME_TOLERANCE_S", "abs_path", "resolve_project_root"]
+
 # Seconds of tolerance when comparing file mtimes to account for
 # clock skew between the indexer and the filesystem.
 MTIME_TOLERANCE_S: float = 1.0
@@ -37,7 +39,8 @@ def abs_path(root: Path, path: str) -> str:
     """Resolve a stored (potentially relative) file path to an absolute path.
 
     Absolute paths are returned unchanged; relative paths are joined with
-    *root*.
+    *root*.  An empty string is returned as-is (callers should guard
+    against empty paths before calling).
     """
     if not path:
         return path

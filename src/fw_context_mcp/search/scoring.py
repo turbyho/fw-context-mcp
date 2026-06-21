@@ -61,6 +61,8 @@ def score_result(
 
     s = 0
     for stem in query_stems:
+        if len(stem) < 2:  # skip single-char stems — too noisy
+            continue
         if stem in name or stem in ntoks:
             s += 3
         elif stem in qname:

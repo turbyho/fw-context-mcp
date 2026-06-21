@@ -7,6 +7,6 @@ Provides:
 - Predefined pipelines: SEARCH_CODE, SMART_SEARCH
 """
 
-from fw_context_mcp.search.pipeline import PipelineRunner, PipelineConfig, SEARCH_CODE, SMART_SEARCH
+from fw_context_mcp.search.pipeline import SEARCH_CODE, SMART_SEARCH, PipelineConfig, PipelineRunner
 
 __all__ = ["PipelineRunner", "PipelineConfig", "SEARCH_CODE", "SMART_SEARCH"]

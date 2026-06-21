@@ -1,14 +1,11 @@
 """Tests for fw_context_mcp.indexer.build."""
 
 import json
-from pathlib import Path
-
-import pytest
 
 from fw_context_mcp.indexer.build import (
     BuildConfig,
-    _parse_mbed_dotfile,
     _mbed_target_from_custom_targets,
+    _parse_mbed_dotfile,
     check_completeness,
     detect_build_system,
 )
