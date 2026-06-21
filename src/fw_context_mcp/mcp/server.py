@@ -5,6 +5,7 @@ Search tools (search_code, smart_search) delegate to the search pipeline
 handlers with shared helpers for DB access, staleness detection, etc.
 """
 
+import collections
 import logging
 import os
 import sqlite3
@@ -28,6 +29,8 @@ from ..indexer.db import (
     get_active_config,
     get_all_projects,
     get_db_schema_version,
+    get_direct_bases,
+    get_direct_derived,
     get_file_mtime_indexed,
     get_llm_analysis_for_symbol,
     open_db,
@@ -58,6 +61,7 @@ mcp = FastMCP(
         "Call graph (refs must be indexed): find_callers, find_references, "
         "find_call_path, find_all_callers_recursive, find_callees_recursive, "
         "find_hotspots, find_dead_code, find_wrapper_callers, trace_data_flow.\n\n"
+        "Inheritance: get_inheritance_chain (C++ class hierarchy — bases and derived classes).\n\n"
         "Maintenance: reindex_file (after editing a file), reset_index (destructive! "
         "re-index from scratch), check_ollama (before smart_search/explain_symbol/"
         "semantic_search), list_projects (discover indexed projects)."
@@ -1683,6 +1687,154 @@ def find_hotspots(
         if not rows:
             return [{"info": "No references indexed — enable index_refs and re-index."}]
         return rows
+    finally:
+        conn.close()
+
+
+# ── Inheritance tool ──────────────────────────────────────────────────────
+
+
+@mcp.tool()
+def get_inheritance_chain(
+    class_name: Annotated[str, Field(description="Class or struct name to get inheritance information for. E.g. 'UART_DRIVER' or 'zbox::ZMODEM'.")],
+    project_root: Annotated[str | None, Field(description="Project root. Auto-detected if omitted.")] = None,
+    transitive: Annotated[bool, Field(description="When True, walk the full inheritance tree both up (ancestors) and down (descendants). Default: False (direct bases and derived only).")] = False,
+) -> dict:
+    """Read-only. Return the C++ inheritance chain for a class or struct.
+
+    Shows direct base classes (what this inherits from) and direct derived
+    classes (what inherits from this), along with access level and virtual
+    flag for each edge.
+
+    When ``transitive=True``, walks the full hierarchy up to all ancestors
+    and down to all descendants. Uses BFS with cycle detection to handle
+    diamond inheritance.
+
+    Returns:
+        dict: {
+            name, qualified_name, kind, file, line,
+            bases: [{name, usr, access, is_virtual, file}],
+            derived: [{name, usr, access, is_virtual, file}],
+            all_bases: [...] (when transitive=True, ancestors sorted by depth),
+            all_derived: [...] (when transitive=True, descendants sorted by depth)
+        }
+    """
+    db_path, cfg, project_id, root = _resolve_context(project_root)
+    if not db_path.exists():
+        return {"error": f"No index found for {root}. Run 'fw-context index' first."}
+    conn, err = _open_db_safe(db_path)
+    if err:
+        return err
+    try:
+        with conn:
+            cfg_data = get_active_config(conn, project_id)
+            if not cfg_data:
+                return {"error": "No build config indexed."}
+            config_hash = cfg_data["config_hash"]
+            row = _lookup_definition(conn, config_hash, class_name)
+            if not row:
+                return {"error": f"Symbol not found: {class_name}"}
+            if row["kind"] not in ("class", "struct"):
+                return {"error": f"'{class_name}' is a {row['kind']}, not a class or struct."}
+
+            usr = row["usr"]
+            result: dict = {
+                "name": row["name"],
+                "qualified_name": row["qualified_name"],
+                "kind": row["kind"],
+                "file": abs_path(root, row["file_path"]),
+                "line": row["line"],
+            }
+
+            # ── Direct base classes (parents) ──
+            bases = get_direct_bases(conn, config_hash, usr)
+            result["bases"] = [
+                {
+                    "name": b.get("base_name") or "<unknown>",
+                    "usr": b["base_usr"],
+                    "access": b["access"],
+                    "is_virtual": bool(b["is_virtual"]),
+                    "file": abs_path(root, b["base_file"]) if b.get("base_file") else None,
+                }
+                for b in bases
+            ]
+
+            # ── Direct derived classes (children) ──
+            derived = get_direct_derived(conn, config_hash, usr)
+            result["derived"] = [
+                {
+                    "name": d.get("derived_name") or "<unknown>",
+                    "usr": d["derived_usr"],
+                    "access": d["access"],
+                    "is_virtual": bool(d["is_virtual"]),
+                    "file": abs_path(root, d["derived_file"]) if d.get("derived_file") else None,
+                }
+                for d in derived
+            ]
+
+            # ── Transitive walk (BFS with cycle detection) ──
+            if transitive:
+                # Walk up — ancestors
+                all_bases: list[dict] = []
+                visited_up: set[str] = {usr}
+                queue_up = collections.deque(
+                    (b["base_usr"], b["access"], b["is_virtual"], 1) for b in bases if b["base_usr"] not in visited_up
+                )
+                while queue_up:
+                    cur_usr, cur_access, cur_is_virtual, depth = queue_up.popleft()
+                    if cur_usr in visited_up:
+                        continue
+                    visited_up.add(cur_usr)
+                    cur_row = conn.execute(
+                        "SELECT name, kind, file_path FROM symbols WHERE config_hash=? AND usr=? LIMIT 1",
+                        (config_hash, cur_usr),
+                    ).fetchone()
+                    all_bases.append({
+                        "name": cur_row["name"] if cur_row else "<unknown>",
+                        "usr": cur_usr,
+                        "access": cur_access,
+                        "is_virtual": bool(cur_is_virtual),
+                        "depth": depth,
+                        "file": abs_path(root, cur_row["file_path"]) if cur_row and cur_row["file_path"] else None,
+                        "kind": cur_row["kind"] if cur_row else None,
+                    })
+                    grand_bases = get_direct_bases(conn, config_hash, cur_usr)
+                    for gb in grand_bases:
+                        if gb["base_usr"] not in visited_up:
+                            queue_up.append((gb["base_usr"], gb["access"], gb["is_virtual"], depth + 1))
+                result["all_bases"] = all_bases
+
+                # Walk down — descendants
+                all_derived: list[dict] = []
+                visited_down: set[str] = {usr}
+                queue_down = collections.deque(
+                    (d["derived_usr"], d["access"], d["is_virtual"], 1) for d in derived if d["derived_usr"] not in visited_down
+                )
+                while queue_down:
+                    cur_usr, cur_access, cur_is_virtual, depth = queue_down.popleft()
+                    if cur_usr in visited_down:
+                        continue
+                    visited_down.add(cur_usr)
+                    cur_row = conn.execute(
+                        "SELECT name, kind, file_path FROM symbols WHERE config_hash=? AND usr=? LIMIT 1",
+                        (config_hash, cur_usr),
+                    ).fetchone()
+                    all_derived.append({
+                        "name": cur_row["name"] if cur_row else "<unknown>",
+                        "usr": cur_usr,
+                        "access": cur_access,
+                        "is_virtual": bool(cur_is_virtual),
+                        "depth": depth,
+                        "file": abs_path(root, cur_row["file_path"]) if cur_row and cur_row["file_path"] else None,
+                        "kind": cur_row["kind"] if cur_row else None,
+                    })
+                    grand_derived = get_direct_derived(conn, config_hash, cur_usr)
+                    for gd in grand_derived:
+                        if gd["derived_usr"] not in visited_down:
+                            queue_down.append((gd["derived_usr"], gd["access"], gd["is_virtual"], depth + 1))
+                result["all_derived"] = all_derived
+
+        return result
     finally:
         conn.close()
 

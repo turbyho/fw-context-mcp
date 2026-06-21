@@ -11,9 +11,11 @@ import logging
 from pathlib import Path
 
 from fw_context_mcp.indexer.db import (
+    delete_inheritance_for_file,
     delete_refs_for_file,
     delete_symbols_for_file,
     get_file_mtimes,
+    insert_inheritance_batch,
     insert_refs_batch,
     insert_symbols_batch,
     split_tokens,
@@ -58,7 +60,7 @@ def store_symbols_for_unit(
 
     # Parse
     try:
-        syms, refs = extract_all(
+        syms, refs, inheritance = extract_all(
             unit,
             source_roots=source_roots,
             exclude_paths=exclude_paths,
@@ -72,6 +74,7 @@ def store_symbols_for_unit(
     existing = get_file_mtimes(conn, config_hash)
     if file_path in existing:
         file_id_old, _ = existing[file_path]
+        delete_inheritance_for_file(conn, config_hash, file_id_old)
         delete_symbols_for_file(conn, file_id_old)
 
     # Upsert the TU file record
@@ -117,6 +120,8 @@ def store_symbols_for_unit(
                 s.signature,
                 s.docstring,
                 s.enum_value,
+                int(s.is_virtual),
+                int(s.is_pure_virtual),
             ))
         total_syms = insert_symbols_batch(conn, rows)
 
@@ -135,7 +140,13 @@ def store_symbols_for_unit(
         ]
         total_refs = insert_refs_batch(conn, ref_rows)
 
-    return total_syms, total_refs
+    # Inheritance
+    if inheritance:
+        inheritance_rows = [
+            (config_hash, i.derived_usr, i.base_usr, i.access, int(i.is_virtual))
+            for i in inheritance
+        ]
+        insert_inheritance_batch(conn, inheritance_rows)
 
 
 def unit_is_unchanged(

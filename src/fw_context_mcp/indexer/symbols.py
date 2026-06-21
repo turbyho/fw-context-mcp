@@ -72,6 +72,15 @@ class Reference:
 
 
 @dataclass
+class InheritanceRecord:
+    """A C++ inheritance edge: ``class Derived : public Base { ... }``."""
+    derived_usr: str   # USR of the derived class (child)
+    base_usr: str      # USR of the base class (parent)
+    access: str        # "public", "protected", or "private"
+    is_virtual: bool   # True for virtual inheritance
+
+
+@dataclass
 class Symbol:
     name: str
     qualified_name: str      # namespace::Class::method
@@ -85,6 +94,8 @@ class Symbol:
     usr: str                 # libclang Unified Symbol Resolution
     end_line: int = 0        # last line of the definition extent (0 if unknown)
     enum_value: int | None = None  # value of enum constant (ENUM_CONSTANT_DECL only)
+    is_virtual: bool = False          # True for virtual CXX_METHOD
+    is_pure_virtual: bool = False     # True for pure virtual (= 0) CXX_METHOD
 
 
 def _cursor_kind_label(kind: cx.CursorKind) -> str:
@@ -246,7 +257,7 @@ def extract(
 
     Thin backward-compatible wrapper over ``extract_all`` (symbols only).
     """
-    symbols, _ = extract_all(unit, source_roots, exclude_paths, with_refs=False)
+    symbols, _, _ = extract_all(unit, source_roots, exclude_paths, with_refs=False)
     return iter(symbols)
 
 
@@ -255,13 +266,15 @@ def extract_all(
     source_roots: list[Path] | None = None,
     exclude_paths: list[Path] | None = None,
     with_refs: bool = False,
-) -> tuple[list[Symbol], list[Reference]]:
-    """Parse unit once and return (symbols, references).
+) -> tuple[list[Symbol], list[Reference], list[InheritanceRecord]]:
+    """Parse unit once and return (symbols, references, inheritance).
 
     symbols: definitions/declarations whose file is under source_roots.
     references: when with_refs is True, call/ref/member expressions whose BOTH
                 ends (referencing site and referenced definition) are under
                 source_roots — i.e. project-internal references, bounded in size.
+    inheritance: C++ base class edges for class/struct definitions under
+                 source_roots (always extracted, regardless of with_refs).
     source_roots: only emit symbols/refs whose file is under one of these paths.
     exclude_paths: skip files under any of these paths (applied after source_roots).
     If source_roots is None, restrict to the unit's own file only.
@@ -294,6 +307,7 @@ def extract_all(
     # --- Symbols ---
     symbols: list[Symbol] = []
     seen_usrs: dict[str, bool] = {}  # USR → is_definition (allows decl→def promotion)
+    class_cursors: list[cx.Cursor] = []  # class/struct def cursors for inheritance extraction
 
     for cursor in tu.cursor.walk_preorder():
         if cursor.kind not in _SYMBOL_KINDS:
@@ -322,6 +336,10 @@ def extract_all(
             except Exception:
                 enum_val = None
 
+        # Virtual method flags (CXX_METHOD only; False for all other kinds)
+        is_virtual = bool(cursor.is_virtual_method()) if cursor.kind == cx.CursorKind.CXX_METHOD else False
+        is_pure = bool(cursor.is_pure_virtual_method()) if cursor.kind == cx.CursorKind.CXX_METHOD else False
+
         prev = seen_usrs.get(usr)
         if prev is not None:
             if is_def and not prev:
@@ -344,10 +362,57 @@ def extract_all(
             usr=usr,
             end_line=_end_line(cursor, loc),
             enum_value=enum_val,
+            is_virtual=is_virtual,
+            is_pure_virtual=is_pure,
         ))
 
+        # Collect class/struct definition cursors for inheritance extraction
+        if cursor.kind in (cx.CursorKind.CLASS_DECL, cx.CursorKind.STRUCT_DECL) and is_def:
+            class_cursors.append(cursor)
+
+    # --- Inheritance: examine base specifiers of collected class cursors ---
+    inheritance: list[InheritanceRecord] = []
+    _access_map = {
+        cx.AccessSpecifier.PUBLIC: "public",
+        cx.AccessSpecifier.PROTECTED: "protected",
+        cx.AccessSpecifier.PRIVATE: "private",
+    }
+    for cls_cursor in class_cursors:
+        cls_usr = cls_cursor.get_usr()
+        if not cls_usr:
+            continue
+        try:
+            for child in cls_cursor.get_children():
+                if child.kind == cx.CursorKind.CXX_BASE_SPECIFIER:
+                    base_ref = child.referenced
+                    if base_ref is None:
+                        continue
+                    base_usr = base_ref.get_usr()
+                    if not base_usr:
+                        continue
+                    # Only record edges where the base class is in project sources
+                    base_loc = base_ref.location
+                    if base_loc.file and (not _in_roots(base_loc.file.name) or not _not_excluded(base_loc.file.name)):
+                        continue
+                    # Access specifier
+                    access = _access_map.get(child.access_specifier, "public")
+                    # Virtual inheritance (uses C API via ctypes — not exposed in Python bindings)
+                    try:
+                        from clang.cindex import conf
+                        is_virt = bool(conf.lib.clang_isVirtualBase(child))
+                    except Exception:
+                        is_virt = False
+                    inheritance.append(InheritanceRecord(
+                        derived_usr=cls_usr,
+                        base_usr=base_usr,
+                        access=access,
+                        is_virtual=is_virt,
+                    ))
+        except Exception:
+            continue  # skip malformed cursors
+
     if not with_refs:
-        return symbols, []
+        return symbols, [], inheritance
 
     # Build qualified-name → USR lookup for token-based fallback
     # (UNEXPOSED_EXPR nodes hide template expansions like mbed::callback(...)
@@ -658,4 +723,4 @@ def extract_all(
                             ref_kind="call",
                         ))
 
-    return symbols, refs
+    return symbols, refs, inheritance
