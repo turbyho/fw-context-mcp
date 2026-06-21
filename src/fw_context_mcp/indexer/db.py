@@ -141,6 +141,8 @@ _MIGRATION_ADD_COLUMNS = [
     "ALTER TABLE symbols ADD COLUMN summary TEXT NOT NULL DEFAULT ''",
     "ALTER TABLE symbols ADD COLUMN inputs TEXT NOT NULL DEFAULT ''",
     "ALTER TABLE symbols ADD COLUMN outputs TEXT NOT NULL DEFAULT ''",
+    "ALTER TABLE symbols ADD COLUMN is_virtual INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE symbols ADD COLUMN is_pure_virtual INTEGER NOT NULL DEFAULT 0",
 ]
 
 _SCHEMA = """
@@ -186,6 +188,8 @@ CREATE TABLE IF NOT EXISTS symbols (
     is_definition  INTEGER NOT NULL DEFAULT 0,
     signature      TEXT    NOT NULL DEFAULT '',
     docstring      TEXT    NOT NULL DEFAULT '',
+    is_virtual     INTEGER NOT NULL DEFAULT 0,
+    is_pure_virtual INTEGER NOT NULL DEFAULT 0,
     UNIQUE(config_hash, usr)
 );
 
@@ -264,6 +268,21 @@ CREATE TABLE IF NOT EXISTS llm_analysis (
     model        TEXT    NOT NULL,
     analyzed_at  TEXT    NOT NULL DEFAULT (datetime('now'))
 );
+
+-- C++ inheritance hierarchy edges.
+-- derived_usr → base_usr: class Derived : public Base { ... }
+-- access: "public", "protected", "private"
+CREATE TABLE IF NOT EXISTS inheritance (
+    id           INTEGER PRIMARY KEY,
+    config_hash  TEXT    NOT NULL REFERENCES build_configs(config_hash),
+    derived_usr  TEXT    NOT NULL,
+    base_usr     TEXT    NOT NULL,
+    access       TEXT    NOT NULL DEFAULT 'public',
+    is_virtual   INTEGER NOT NULL DEFAULT 0,
+    UNIQUE(config_hash, derived_usr, base_usr)
+);
+CREATE INDEX IF NOT EXISTS idx_inheritance_derived ON inheritance(config_hash, derived_usr);
+CREATE INDEX IF NOT EXISTS idx_inheritance_base    ON inheritance(config_hash, base_usr);
 """
 
 CURRENT_SCHEMA_VERSION = _derive_schema_version(_SCHEMA, _MIGRATION_ADD_COLUMNS)
@@ -552,15 +571,16 @@ def insert_symbols_batch(
 
     Each row: (config_hash, file_id, file_path, name_tokens, usr, name,
                qualified_name, kind, line, col, end_line, is_definition,
-               signature, docstring, enum_value)
+               signature, docstring, enum_value, is_virtual, is_pure_virtual)
 
     Returns count of rows inserted or upgraded to definition.
     """
     cur = conn.executemany(
         """INSERT INTO symbols
            (config_hash, file_id, file_path, name_tokens, usr, name, qualified_name, kind,
-            line, col, end_line, is_definition, signature, docstring, enum_value)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            line, col, end_line, is_definition, signature, docstring, enum_value,
+            is_virtual, is_pure_virtual)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
            ON CONFLICT(config_hash, usr) DO UPDATE SET
                file_id       = excluded.file_id,
                file_path     = excluded.file_path,
@@ -571,7 +591,9 @@ def insert_symbols_batch(
                is_definition = 1,
                signature     = excluded.signature,
                docstring     = excluded.docstring,
-               enum_value    = excluded.enum_value
+               enum_value    = excluded.enum_value,
+               is_virtual    = excluded.is_virtual,
+               is_pure_virtual = excluded.is_pure_virtual
            WHERE excluded.is_definition = 1 AND symbols.is_definition = 0""",
         rows,
     )
@@ -598,6 +620,83 @@ def delete_refs_for_file(conn: sqlite3.Connection, config_hash: str, from_file: 
         "DELETE FROM refs WHERE config_hash=? AND from_file=?",
         (config_hash, from_file),
     )
+
+
+# ---------------------------------------------------------------------------
+# Inheritance helpers — C++ class hierarchy tracking
+# ---------------------------------------------------------------------------
+
+
+def insert_inheritance_batch(conn: sqlite3.Connection, rows: list[tuple]) -> int:
+    """Insert inheritance edges.
+
+    Each row: (config_hash, derived_usr, base_usr, access, is_virtual).
+    Uses ON CONFLICT DO UPDATE so re-indexing the same derived class
+    updates the access/virtual flags without duplication.
+
+    Returns number of rows inserted or updated.
+    """
+    cur = conn.executemany(
+        """INSERT INTO inheritance (config_hash, derived_usr, base_usr, access, is_virtual)
+           VALUES (?,?,?,?,?)
+           ON CONFLICT(config_hash, derived_usr, base_usr) DO UPDATE SET
+               access = excluded.access,
+               is_virtual = excluded.is_virtual""",
+        rows,
+    )
+    return cur.rowcount
+
+
+def delete_inheritance_for_file(conn: sqlite3.Connection, config_hash: str, file_id: int) -> None:
+    """Delete inheritance records for classes defined in the given file.
+
+    Called before re-indexing a TU to remove stale edges for classes
+    whose definitions are in the file being re-parsed.
+    """
+    conn.execute(
+        """DELETE FROM inheritance WHERE config_hash = ? AND derived_usr IN (
+            SELECT usr FROM symbols WHERE config_hash = ? AND file_id = ?
+        )""",
+        (config_hash, config_hash, file_id),
+    )
+
+
+def get_direct_bases(conn: sqlite3.Connection, config_hash: str, usr: str) -> list[dict]:
+    """Return direct base classes of *usr* (the class this one inherits from).
+
+    Each result: {base_usr, derived_usr, access, is_virtual,
+                   base_name, base_kind, base_file}
+    """
+    rows = conn.execute(
+        """SELECT i.derived_usr, i.base_usr, i.access, i.is_virtual,
+                  s.name AS base_name, s.kind AS base_kind,
+                  s.file_path AS base_file
+           FROM inheritance i
+           LEFT JOIN symbols s ON s.usr = i.base_usr AND s.config_hash = i.config_hash
+           WHERE i.config_hash = ? AND i.derived_usr = ?
+           ORDER BY s.name""",
+        (config_hash, usr),
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_direct_derived(conn: sqlite3.Connection, config_hash: str, usr: str) -> list[dict]:
+    """Return direct derived classes of *usr* (classes that inherit from this one).
+
+    Each result: {base_usr, derived_usr, access, is_virtual,
+                   derived_name, derived_kind, derived_file}
+    """
+    rows = conn.execute(
+        """SELECT i.derived_usr, i.base_usr, i.access, i.is_virtual,
+                  s.name AS derived_name, s.kind AS derived_kind,
+                  s.file_path AS derived_file
+           FROM inheritance i
+           LEFT JOIN symbols s ON s.usr = i.derived_usr AND s.config_hash = i.config_hash
+           WHERE i.config_hash = ? AND i.base_usr = ?
+           ORDER BY s.name""",
+        (config_hash, usr),
+    ).fetchall()
+    return [dict(r) for r in rows]
 
 
 # ---------------------------------------------------------------------------
