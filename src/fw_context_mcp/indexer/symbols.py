@@ -1,4 +1,4 @@
-"""Extract symbol records from a CompilationUnit using libclang."""
+"""Extract symbols, references, and inheritance edges from a CompilationUnit using libclang."""
 
 from __future__ import annotations
 
@@ -66,6 +66,19 @@ _INDIRECT_TARGET_KINDS = frozenset({
 
 @dataclass
 class Reference:
+    """An edge from a call or reference site to the symbol it refers to.
+
+    Attributes:
+        to_usr: USR of the referenced definition (links to ``Symbol.usr``).
+        from_file: Absolute path of the file containing the reference.
+        from_line: Source line of the reference expression.
+        from_usr: USR of the enclosing function or method (the caller), or
+            None when the reference appears at file scope.
+        ref_kind: Classification of the reference — ``"call"`` for direct
+            function calls, ``"ref"`` for variable/enum reads, ``"member"``
+            for member accesses, ``"indirect"`` for function-pointer or
+            callback arguments.
+    """
     to_usr: str        # USR of the referenced definition (links to Symbol.usr)
     from_file: str     # file containing the reference (absolute, as clang reports)
     from_line: int
@@ -84,6 +97,55 @@ class InheritanceRecord:
 
 @dataclass
 class Symbol:
+    """A parsed C/C++ symbol extracted from a translation unit.
+
+    Represents a single declaration or definition encountered during
+    libclang AST traversal.  Every symbol carries a ``usr`` that uniquely
+    identifies it across translation units, a ``qualified_name`` built
+    from semantic parent traversal, and metadata specific to its kind
+    (signature for callables, enum values for constants, virtual flags
+    for methods, and template relationships for specializations).
+
+    Attributes:
+        name: Unqualified symbol name (e.g. ``uart_init``).
+        qualified_name: Fully qualified name with ``::`` separators,
+            built by traversing semantic parents
+            (e.g. ``namespace::Class::method``).
+        kind: Symbol kind string — one of ``"function"``, ``"method"``,
+            ``"constructor"``, ``"destructor"``, ``"class"``, ``"struct"``,
+            ``"enum"``, ``"enum_constant"``, ``"typedef"``, ``"variable"``,
+            ``"field"``, or ``"namespace"``.
+        file: Absolute path to the source file containing this symbol.
+        line: Start line of the declaration or definition (1-based).
+        column: Start column of the declaration or definition (0-based).
+        is_definition: True when the cursor is a definition; for
+            ``_DECL_KINDS`` (function, function template, method) the
+            declaration is indexed even without a definition.
+        signature: Human-readable signature for callables — combines
+            return type, name, and parameter list.  Empty string for
+            non-callable symbols.
+        docstring: Raw comment text from above the symbol, with comment
+            markers (``/**``, ``//``, ``*``) stripped and collapsed into
+            a single line.
+        usr: libclang Unified Symbol Resolution — a cross-translation-unit
+            identifier that links declarations and definitions of the
+            same symbol.
+        end_line: Last source line of the definition extent, or 0 when
+            the extent is unavailable (e.g. the end lies in a different
+            file due to macro expansion).
+        enum_value: Integer value for ``enum_constant`` symbols.
+            ``None`` for all other symbol kinds.
+        is_virtual: True for virtual ``CXX_METHOD`` and destructor
+            declarations.
+        is_pure_virtual: True for pure virtual methods (marked ``= 0``).
+        parent_usr: USR of the enclosing class, struct, or template.
+            Empty string for free functions and file-scope symbols.
+        is_template: True when this is a ``CLASS_TEMPLATE``,
+            ``FUNCTION_TEMPLATE``, or partial specialization declaration.
+        template_usr: USR of the primary template.  Non-empty only when
+            this symbol is an instantiation of a template (e.g. a
+            ``CLASS_DECL`` that was generated from a ``CLASS_TEMPLATE``).
+    """
     name: str
     qualified_name: str      # namespace::Class::method
     kind: str                # "function", "class", "struct", "enum", etc.
@@ -104,6 +166,12 @@ class Symbol:
 
 
 def _cursor_kind_label(kind: cx.CursorKind) -> str:
+    """Map a libclang ``CursorKind`` to a short string label.
+
+    Returns the user-facing kind string (e.g. ``"function"``, ``"class"``,
+    ``"method"``) used to populate ``Symbol.kind``.  Falls back to the
+    lowercase cursor kind name for unrecognised kinds.
+    """
     mapping = {
         cx.CursorKind.FUNCTION_DECL: "function",
         cx.CursorKind.FUNCTION_TEMPLATE: "function",
@@ -126,6 +194,16 @@ def _cursor_kind_label(kind: cx.CursorKind) -> str:
 
 
 def _qualified_name(cursor: cx.Cursor) -> str:
+    """Build the fully qualified name of a cursor via semantic parent traversal.
+
+    Walks up the semantic parent chain (skipping the translation unit root)
+    and joins each ancestor's spelling with ``::``.  Anonymous namespaces
+    and unnamed entities produce empty segments which are collapsed by
+    the join.
+
+    Returns a string like ``"namespace::Class::method"``, or an empty
+    string for the translation unit root.
+    """
     parts: list[str] = []
     c = cursor
     while c and c.kind != cx.CursorKind.TRANSLATION_UNIT:
@@ -137,7 +215,12 @@ def _qualified_name(cursor: cx.Cursor) -> str:
 
 
 def _signature(cursor: cx.Cursor) -> str:
-    """Build a human-readable signature for callables."""
+    """Build a human-readable signature for callables.
+
+    Returns an empty string for non-callable cursors (classes, enums,
+    variables, etc.) so callers can unconditionally assign it to
+    ``Symbol.signature``.
+    """
     if cursor.kind not in (
         cx.CursorKind.FUNCTION_DECL,
         cx.CursorKind.FUNCTION_TEMPLATE,
@@ -273,17 +356,31 @@ def extract_all(
     exclude_paths: list[Path] | None = None,
     with_refs: bool = False,
 ) -> tuple[list[Symbol], list[Reference], list[InheritanceRecord]]:
-    """Parse unit once and return (symbols, references, inheritance).
+    """Parse one translation unit and return extracted symbols, references, and inheritance.
 
-    symbols: definitions/declarations whose file is under source_roots.
-    references: when with_refs is True, call/ref/member expressions whose BOTH
-                ends (referencing site and referenced definition) are under
-                source_roots — i.e. project-internal references, bounded in size.
-    inheritance: C++ base class edges for class/struct definitions under
-                 source_roots (always extracted, regardless of with_refs).
-    source_roots: only emit symbols/refs whose file is under one of these paths.
-    exclude_paths: skip files under any of these paths (applied after source_roots).
-    If source_roots is None, restrict to the unit's own file only.
+    This is the single-pass entry point for all data extraction from a
+    ``CompilationUnit``.  It parses the file with libclang, walks the AST
+    once, and produces three outputs simultaneously.
+
+    Args:
+        unit: The translation unit to parse (file path + compiler flags).
+        source_roots: Only emit symbols and references whose file is under
+            one of these directories.  Defaults to ``[unit.file.parent]``.
+        exclude_paths: Skip any file that falls under one of these paths
+            (applied after ``source_roots`` filtering).
+        with_refs: When True, also extract call, reference, and member-access
+            edges and embed a source-line token fallback pass for
+            template-obscured expressions.  Inheritance is always extracted
+            regardless of this flag.
+
+    Returns:
+        A tuple ``(symbols, references, inheritance)``:
+            symbols — all matching declarations and definitions.
+            references — when ``with_refs`` is True, project-internal
+                call/ref/member/indirect edges whose both ends are under
+                ``source_roots``; empty list otherwise.
+            inheritance — C++ base class edges for class/struct
+                definitions under ``source_roots``, always extracted.
     """
     if not source_roots:
         source_roots = [unit.file.parent]

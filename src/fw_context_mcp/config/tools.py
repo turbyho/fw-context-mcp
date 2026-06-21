@@ -277,6 +277,7 @@ class Collision:
 
     @property
     def is_clean(self) -> bool:
+        """True when the file has no fw-context content at all — safe for fresh injection."""
         return not self.has_marked_section and not self.has_unmarked_content
 
     @property

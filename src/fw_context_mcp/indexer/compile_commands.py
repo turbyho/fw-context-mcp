@@ -165,6 +165,14 @@ def _detect_target_triple(
 
 @dataclass
 class CompilationUnit:
+    """One compilation unit from compile_commands.json.
+
+    Attributes:
+        file: Absolute or relative path to the source file being compiled.
+        directory: Working directory for the compilation command.
+        language: Source language — ``"c"`` or ``"cpp"``.
+        clang_args: Full compiler argument list (resolved and normalized for libclang).
+    """
     file: Path
     directory: Path
     language: str        # "c" or "cpp"

@@ -20,9 +20,14 @@ class FTS5SearchPhase(Phase):
     same symbol appears in both.
     """
 
-    name = "fts5_search"
+    name = "fts5_search"  #: Phase identifier used in pipeline configuration.
 
     async def run(self, ctx: PipelineContext) -> PipelineContext:
+        """Execute all generated (or rough) queries via FTS5 and merge results.
+
+        Opens a fresh DB connection, runs both OR queries and name_tokens
+        queries, and merges with deduplication preferring definitions.
+        """
         from fw_context_mcp.indexer.db import open_db
 
         queries = ctx.generated_queries if ctx.generated_queries else ctx.rough_queries

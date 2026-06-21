@@ -17,6 +17,15 @@ _TRANSIENT_DROP_WITH_ARG = frozenset({"-o", "-MF", "-MT", "-MQ"})
 
 
 def _normalize_entry(entry: dict) -> dict:
+    """Normalize a single compile_commands.json entry for stable hashing.
+
+    Strips the compiler binary, expands response files (@rsp), removes
+    transient flags (-MD, -o, -MF, -MT, -MQ and their arguments), drops
+    the source file argument (keyed by the "file" field already), and
+    sorts remaining arguments.  The result is a deterministic
+    ``{file, args}`` dict that produces the same hash for the same
+    build configuration regardless of timestamps or output paths.
+    """
     raw_args: list[str] = entry.get("arguments") or shlex.split(
         entry.get("command", "")
     )

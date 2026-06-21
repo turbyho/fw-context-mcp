@@ -14,6 +14,8 @@ from pathlib import Path
 
 from ..indexer.build import BuildConfig
 
+__all__ = ["Config", "LLMConfig", "IndexConfig", "ProjectMeta", "load", "derive_project_id"]
+
 _GLOBAL_CONFIG_PATH = Path.home() / ".fw-context" / "config.toml"
 _PROJECT_CONFIG_DIR = ".fw-context"
 _PROJECT_CONFIG_NAME = "config.toml"
@@ -95,6 +97,21 @@ exclude_paths = ["build", "BUILD"]
 
 @dataclass
 class LLMConfig:
+    """LLM (Ollama) configuration for symbol analysis, search query generation, and embeddings.
+
+    Attributes:
+        enabled: Set False to disable all Ollama calls — tools return raw prompts
+            for the agent to answer instead.
+        ollama_url: Ollama API endpoint (must be a loopback address unless you
+            accept that source-code snippets will be sent externally).
+        model: Chat model for analysis and search query generation.
+            Minimum 14B parameters recommended for C++ embedded code.
+        embed_model: Embedding model for semantic search (mxbai-embed-large).
+        num_ctx: Context window size in tokens.
+        debug_log: Optional path to a JSONL file for debugging LLM prompts/responses.
+        analyze_symbols: Generate per-symbol summaries, inputs, and outputs during indexing.
+        analyze_files: Generate per-file summaries (2-3 sentences) during indexing.
+    """
     enabled: bool = True
     ollama_url: str = "http://localhost:11434"
     model: str = "qwen2.5-coder:14b"
@@ -107,6 +124,18 @@ class LLMConfig:
 
 @dataclass
 class IndexConfig:
+    """Index storage and scoping configuration.
+
+    Attributes:
+        db_dir: Directory where per-project SQLite databases are stored.
+        compile_commands: Path to compile_commands.json (relative to project root).
+        source_roots: Directories to index symbols from. Empty = auto-detect.
+        exclude_paths: Directories to exclude from indexing (LIKE patterns).
+        index_refs: Build cross-reference index for call-graph tools
+            (find_callers, find_call_path, etc.). Enabled by default.
+        index_embeddings: Generate vector embeddings during indexing for
+            semantic search. Enabled by default.
+    """
     db_dir: Path = field(default_factory=lambda: Path.home() / ".fw-context" / "index")
     compile_commands: Path = field(default_factory=lambda: Path("compile_commands.json"))
     source_roots: list[str] = field(default_factory=list)
@@ -117,17 +146,40 @@ class IndexConfig:
 
 @dataclass
 class ProjectMeta:
+    """Optional project-level metadata.
+
+    Attributes:
+        name: Human-readable name for the project. Defaults to the directory
+            name when not set.
+    """
     name: str | None = None
 
 
 @dataclass
 class Config:
+    """Top-level configuration container aggregating all sub-configs.
+
+    Loaded from TOML files with hierarchy: built-in defaults → global
+    (``~/.fw-context/config.toml``) → project (``.fw-context/config.toml``).
+    Later levels override earlier ones via deep merge.
+
+    Attributes:
+        project: Optional project metadata (name override).
+        build: Build system settings for compile_commands.json generation.
+        index: Index storage, scoping, and feature flags.
+        llm: Ollama configuration for analysis and search.
+    """
     project: ProjectMeta = field(default_factory=ProjectMeta)
     build: BuildConfig = field(default_factory=BuildConfig)
     index: IndexConfig = field(default_factory=IndexConfig)
     llm: LLMConfig = field(default_factory=LLMConfig)
 
     def source_root_paths(self, project_root: Path) -> list[Path]:
+        """Resolve and validate source root directories against *project_root*.
+
+        Only directories that actually exist on disk are returned —
+        configured paths that don't exist are logged as warnings and skipped.
+        """
         import logging
         log = logging.getLogger(__name__)
         result: list[Path] = []
@@ -140,6 +192,11 @@ class Config:
         return result
 
     def exclude_root_paths(self, project_root: Path) -> list[Path]:
+        """Resolve exclude paths against *project_root*.
+
+        Note: This does NOT resolve glob patterns or validate existence —
+        the paths are used as SQL LIKE patterns downstream.
+        """
         return [(project_root / p).resolve() for p in self.index.exclude_paths]
 
 
@@ -235,7 +292,11 @@ def _ensure_project_config(project_root: Path) -> Path:
 
 
 def _is_loopback_url(url: str) -> bool:
-    """True if *url*'s host is a loopback address (localhost / 127.0.0.0/8 / ::1)."""
+    """True if *url*'s host is a loopback address.
+
+    Matches localhost, 127.0.0.0/8 (including ``127.x.x.x``), ``::1``,
+    and IPv4-mapped IPv6 (``::ffff:127.x``).
+    """
     from urllib.parse import urlparse
 
     host = (urlparse(url).hostname or "").lower()

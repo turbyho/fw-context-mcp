@@ -17,12 +17,19 @@ class TranslatePhase(Phase):
     are returned unchanged.  Skipped when ``llm.enabled`` is False.
     """
 
-    name = "translate"
+    name = "translate"  #: Phase identifier used in pipeline configuration.
 
     def should_run(self, ctx) -> bool:
+        """Only run when Ollama is enabled in config."""
         return ctx.config.llm.enabled
 
     async def run(self, ctx: PipelineContext) -> PipelineContext:
+        """Send the query to Ollama for language detection and translation.
+
+        English queries are returned unchanged.  Strips common "already
+        English" prefixes from the response.  On Ollama errors the original
+        query is kept.
+        """
         from fw_context_mcp.llm.ollama import OllamaError, call_ollama_async
 
         query = ctx.query

@@ -23,9 +23,10 @@ class RefinePhase(Phase):
     or when an Ollama error occurred in Phase 2a.
     """
 
-    name = "refine"
+    name = "refine"  #: Phase identifier used in pipeline configuration.
 
     def should_run(self, ctx) -> bool:
+        """Only run when LLM is enabled, we have generated queries, and no Ollama warning."""
         return (
             ctx.config.llm.enabled
             and bool(ctx.generated_queries)
@@ -33,6 +34,13 @@ class RefinePhase(Phase):
         )
 
     async def run(self, ctx: PipelineContext) -> PipelineContext:
+        """Show FTS5 results to the LLM and let it course-correct query terms.
+
+        Builds a prompt with the top 10 FTS5 results and asks the LLM
+        whether they match the original intent.  Returns refined query
+        terms when results are misaligned, or an empty list when correct.
+        Updates the keyword cache on success.
+        """
         from fw_context_mcp.llm.ollama import OllamaError, call_ollama_async
         from fw_context_mcp.search.cache import keyword_cache
 

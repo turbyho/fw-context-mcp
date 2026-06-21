@@ -13,6 +13,16 @@ from . import __version__
 
 
 def cmd_index(args: argparse.Namespace) -> int:
+    """Build or rebuild the symbol index from compile_commands.json.
+
+    By default, generates ``compile_commands.json`` from a clean build
+    (auto-detecting Mbed OS / Zephyr / PlatformIO), then parses every
+    translation unit with libclang and stores symbols, references,
+    and optionally embeddings + LLM analysis in SQLite.
+
+    Pass an explicit ``compile_commands.json`` path or ``--no-build`` to
+    skip the build step and use an existing compilation database.
+    """
     from .config import derive_project_id
     from .config import load as load_config
     from .indexer.runner import run
@@ -94,6 +104,11 @@ def cmd_index(args: argparse.Namespace) -> int:
 
 
 def cmd_search(args: argparse.Namespace) -> int:
+    """Full-text search over indexed symbols and print results to stdout.
+
+    Queries the FTS5 index for symbols matching the given keywords
+    and prints each hit with its kind, qualified name, file, and line.
+    """
     from .config import derive_project_id
     from .config import load as load_config
     from .indexer.db import get_active_config, open_db, search_symbols
@@ -123,6 +138,12 @@ def cmd_search(args: argparse.Namespace) -> int:
 
 
 def cmd_list(args: argparse.Namespace) -> int:
+    """List all indexed firmware projects found under the configured index directory.
+
+    Prints each project's name, root path, symbol count, file count,
+    and index timestamp. Marks stale projects (compile_commands.json
+    changed since last index).
+    """
     from .config import load as load_config
     from .indexer.db import get_all_projects, open_db
 
@@ -151,6 +172,12 @@ def cmd_list(args: argparse.Namespace) -> int:
 
 
 def cmd_reset(args: argparse.Namespace) -> int:
+    """Delete the symbol index for a project after confirmation.
+
+    Shows project info (root, DB path, symbol count, index date) and
+    prompts for confirmation before deleting the SQLite database file.
+    Use ``-y``/``--yes`` to skip the prompt.
+    """
     from .config import derive_project_id
     from .config import load as load_config
     from .indexer.db import get_active_config, open_db
@@ -194,6 +221,12 @@ def cmd_reset(args: argparse.Namespace) -> int:
 
 
 def cmd_status(args: argparse.Namespace) -> int:
+    """Show index status for the current project.
+
+    Prints project root, symbol count, file count, index timestamp,
+    and whether the index is stale (compile_commands.json changed
+    since last index).
+    """
     from .config import derive_project_id
     from .config import load as load_config
     from .indexer.db import get_active_config, open_db
@@ -234,6 +267,10 @@ def cmd_status(args: argparse.Namespace) -> int:
 
 
 def _cli_is_stale(row) -> bool:
+    """Check if a project's compile_commands.json is newer than its index timestamp.
+
+    Returns False on any error so staleness checks don't block CLI output.
+    """
     import os
 
     from .utils import MTIME_TOLERANCE_S as _MTS
@@ -252,7 +289,15 @@ def cmd_init(args: argparse.Namespace) -> int:
     """Register fw-context with AI assistants and inject usage instructions.
 
     Per-tool injection with inheritance awareness, collision detection,
-    dry-run preview, and --list-tools discovery.
+    dry-run preview, and ``--list-tools`` discovery.
+
+    Registers the ``fw-context-mcp`` MCP server with each detected tool's CLI
+    and writes fw-context usage instructions into the tool's configuration files
+    (CLAUDE.md, AGENTS.md, etc.). Respects tool inheritance — e.g. tools based
+    on Claude Code read the parent's instructions automatically.
+
+    Writes ``.fw-context/config.toml`` in the project root when using
+    project-scoped injection.
     """
     import shutil
 
@@ -396,6 +441,11 @@ def cmd_init(args: argparse.Namespace) -> int:
 
 
 def _register_mcp(tool, mcp_bin: str) -> None:
+    """Register fw-context as an MCP server in *tool*'s CLI configuration.
+
+    *tool* is an ``AiTool`` instance; *mcp_bin* is the path or name of the
+    ``fw-context-mcp`` executable. No-op when *tool* has no ``mcp_registration``.
+    """
     """Register fw-context as an MCP server with a tool's CLI."""
     import shutil
     import subprocess
@@ -470,7 +520,12 @@ def _update_marked_section(path: Path, content: str, marker: str) -> None:
 
 
 def cmd_export(args: argparse.Namespace) -> int:
-    """Export the symbol index as portable JSON."""
+    """Export the symbol index as portable JSON (``_format: "fw-context-export/1"``).
+
+    Writes all symbols and optionally cross-references to a JSON file
+    or stdout. The format includes project metadata, all symbol records,
+    and reference counts.
+    """
     import json
 
     from .config import derive_project_id
@@ -662,7 +717,14 @@ def cmd_watch(args: argparse.Namespace) -> int:
 
 
 def cmd_analyze(args: argparse.Namespace) -> int:
-    """Re-run LLM symbol analysis on existing index (idempotent)."""
+    """Re-run LLM symbol analysis on an existing index (idempotent).
+
+    Requires Ollama (or LM Studio) running and ``[llm] enabled = true``
+    in config. Re-generates per-symbol summaries, inputs/outputs analysis,
+    file-level summaries (if ``[llm] analyze_files`` is enabled), and
+    method override relationships. Existing analysis rows are skipped
+    (idempotent) — only unanalyzed symbols are processed.
+    """
     from .config import derive_project_id
     from .config import load as load_config
     from .indexer.db import get_active_config, open_db
@@ -721,6 +783,12 @@ def cmd_version(args: argparse.Namespace) -> int:
 
 
 def main() -> None:
+    """Entry point for the ``fw-context`` CLI — dispatches subcommands.
+
+    Subcommands: index, search, list, reset, status, init, export, watch,
+    analyze, version. Parses arguments via argparse and calls the
+    corresponding ``cmd_*`` handler.
+    """
     parser = argparse.ArgumentParser(prog="fw-context", description="Firmware code intelligence")
     parser.add_argument("-v", "--verbose", action="store_true")
     parser.add_argument(

@@ -22,7 +22,21 @@ log = logging.getLogger(__name__)
 
 @dataclass
 class BuildConfig:
-    """Build system configuration for compile_commands.json generation."""
+    """Build system configuration for compile_commands.json generation.
+
+    Attributes:
+        system: Build system name — ``"mbed-os"``, ``"zephyr"``, ``"platformio"``,
+            or None (auto-detect from project markers).
+        clean: Always clean-build before generating compile_commands.json.
+        command: Full shell command override — bypasses all detection when set.
+        target: Mbed OS target board name (e.g. ``"P_ECB_BOARD"``).
+        toolchain: Mbed OS toolchain (e.g. ``"GCC_ARM"``).
+        profile: Mbed OS build profile (default ``"develop"``).
+        app_config: Path to Mbed OS app config JSON (default ``"mbed_app.json"``).
+        extra_profiles: Additional Mbed OS profiles merged on top (default ``["lto.json"]``).
+        defines: Extra ``-D`` preprocessor macros passed to the compiler.
+        board: Zephyr board name (e.g. ``"nrf52840dk_nrf52840"``). Required for Zephyr.
+    """
 
     system: str | None = None  # "mbed-os", "zephyr", "platformio", or None (auto-detect)
     clean: bool = True  # always clean build before generating

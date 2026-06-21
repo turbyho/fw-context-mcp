@@ -39,6 +39,7 @@ def _pull_model(model: str, base_url: str) -> None:
 
 
 def _write_debug_log(path: Path, entry: dict) -> None:
+    """Append a JSON line to the LLM debug log file."""
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         with path.open("a", encoding="utf-8") as f:
@@ -113,10 +114,19 @@ def call_ollama(
 def call_ollama_embed(inputs: list[str], cfg: LLMConfig) -> list[list[float]]:
     """Generate embeddings for a batch of texts via Ollama.
 
-    Uses the configured embedding model (e.g. mxbai-embed-large).  Batching
-    is handled by Ollama — send all texts in one request.
+    Uses the configured embedding model (e.g. ``mxbai-embed-large``).
+    Batching is handled by Ollama — send all texts in one request.
 
-    Raises OllamaError on network or API failure.
+    Args:
+        inputs: List of text strings to embed.
+        cfg: LLM configuration (ollama_url, embed_model, debug_log).
+
+    Returns:
+        List of embedding vectors, each a list of floats (typically 1024-dim).
+
+    Raises:
+        OllamaError: On network failure. Auto-pulls the model on HTTP 404,
+            then retries once.
     """
     url = cfg.ollama_url.rstrip("/") + "/api/embed"
     payload = {
@@ -170,10 +180,17 @@ def call_ollama_embed(inputs: list[str], cfg: LLMConfig) -> list[list[float]]:
 
 
 async def call_ollama_async(prompt: str, cfg: LLMConfig) -> str:
-    """Async wrapper for call_ollama — offloads blocking httpx to a thread.
+    """Async wrapper for ``call_ollama`` — offloads blocking httpx to a thread.
 
     Use from async MCP tool handlers to avoid blocking the event loop during
     long-running Ollama requests (10-60 s).
+
+    Args:
+        prompt: The full prompt string to send to the chat model.
+        cfg: LLM configuration (ollama_url, model, num_ctx, debug_log).
+
+    Returns:
+        The model's text response.
     """
     return await asyncio.to_thread(call_ollama, prompt, cfg)
 
@@ -181,7 +198,13 @@ async def call_ollama_async(prompt: str, cfg: LLMConfig) -> str:
 def check_setup(cfg: LLMConfig) -> dict:
     """Check Ollama connectivity and model availability.
 
-    Returns a status dict suitable for returning directly as an MCP tool result.
+    Args:
+        cfg: LLM configuration.
+
+    Returns:
+        dict: {ollama_running (bool), model_installed (bool), model (str),
+        message (str, on error), latency_s, embedding_model,
+        embedding_installed}.
     """
     base_url = cfg.ollama_url.rstrip("/")
     try:
@@ -233,10 +256,15 @@ def check_setup(cfg: LLMConfig) -> dict:
 
 
 class OllamaError(RuntimeError):
-    pass
+    """Base exception for Ollama API and network failures."""
 
 
 class OllamaModelNotFoundError(OllamaError):
+    """Raised when the requested model is not installed in Ollama.
+
+    The error message includes the exact ``ollama pull`` command to run.
+    """
+
     def __init__(self, model: str, url: str) -> None:
         self.model = model
         super().__init__(

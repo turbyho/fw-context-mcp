@@ -2,6 +2,55 @@
 
 from __future__ import annotations
 
+__all__ = [
+    "CURRENT_SCHEMA_VERSION",
+    "DatabaseCorruptionError",
+    "count_file_analysis",
+    "count_llm_analysis",
+    "count_refs",
+    "delete_inheritance_for_file",
+    "delete_refs_for_file",
+    "delete_symbols_for_file",
+    "find_all_callers_recursive",
+    "find_callees_recursive",
+    "find_call_path",
+    "find_dead_code",
+    "find_hotspots",
+    "find_refs",
+    "get_active_config",
+    "get_all_projects",
+    "get_class_members",
+    "get_db_schema_version",
+    "get_direct_bases",
+    "get_direct_derived",
+    "get_embeddings",
+    "get_file_analysis_for_file",
+    "get_file_map",
+    "get_file_mtime_indexed",
+    "get_file_mtimes",
+    "get_llm_analysis_for_symbol",
+    "get_overrides_for_method",
+    "get_template_instances",
+    "init_vec_table",
+    "insert_inheritance_batch",
+    "insert_overrides_batch",
+    "insert_refs_batch",
+    "insert_symbols_batch",
+    "open_db",
+    "search_similar_hybrid",
+    "search_similar_vec",
+    "search_symbols",
+    "split_tokens",
+    "transaction",
+    "upsert_build_config",
+    "upsert_embeddings",
+    "upsert_embeddings_vec",
+    "upsert_file",
+    "upsert_file_analysis_batch",
+    "upsert_llm_analysis_batch",
+    "upsert_project",
+]
+
 import re
 import sqlite3
 import struct
@@ -114,8 +163,14 @@ def _derive_schema_version(
     """Return a stable fingerprint of the full DB schema.
 
     Derived from the actual ``_SCHEMA`` and ``ALTER TABLE`` migrations
-    in ``open_db()`` — zero-maintenance: adding a migration automatically
-    changes the fingerprint.
+    in ``open_db()``.  Adding an ALTER TABLE to ``_MIGRATION_ADD_COLUMNS``
+    automatically changes the fingerprint — no manual constant to bump.
+
+    However, complex inline migrations in ``open_db()`` (backfill FTS5
+    columns, name_tokens backfill, summary/inputs/outputs backfill) also
+    have their ALTER TABLE statements listed in ``_MIGRATION_ADD_COLUMNS``
+    to keep the fingerprint accurate.  Adding or removing such a migration
+    requires manually updating ``_MIGRATION_ADD_COLUMNS``.
     """
     import hashlib
 
@@ -323,6 +378,43 @@ CURRENT_SCHEMA_VERSION = _derive_schema_version(_SCHEMA, _MIGRATION_ADD_COLUMNS)
 
 
 def open_db(path: Path) -> sqlite3.Connection:
+    """Open SQLite database at *path*, enabling WAL mode and loading extensions.
+
+    Creates the parent directory if missing.  Configures WAL journal mode,
+    foreign keys, and a 30 s busy timeout.  Loads the ``sqlite-vec`` extension
+    (best-effort — silently skipped when unavailable).
+
+    Runs the full schema and migrations in sequence:
+
+    1. Executes ``_SCHEMA`` (CREATE TABLE IF NOT EXISTS, indexes, triggers).
+    2. Applies add-column migrations from ``_MIGRATION_ADD_COLUMNS``
+       (idempotent — skips duplicate column errors).
+    3. Backfills ``symbols.file_path`` from ``files.path`` for rows with
+       empty ``file_path`` (migration for old indexes).
+    4. Backfills ``symbols.name_tokens`` via Python ``split_tokens()``
+       (SQLite cannot call Python functions).
+    5. Rebuilds ``symbols_fts`` FTS5 virtual table when it lacks the
+       ``name_tokens`` column (older schema).
+    6. Backfills ``symbols.summary/inputs/outputs`` from ``llm_analysis``
+       table, then rebuilds FTS5 again when it lacks those columns.
+    7. Initialises the ``vec_symbols`` vec0 table (best-effort).
+    8. Runs ``PRAGMA integrity_check`` — raises ``DatabaseCorruptionError``
+       on failure (detected before any tool reads the data).
+
+    On ``OperationalError('locked')`` the connection is retried once after a
+    short sleep.  Other ``OperationalError`` and ``DatabaseError`` are
+    converted to ``DatabaseCorruptionError``.
+
+    Args:
+        path: Filesystem path to the SQLite database file.
+
+    Returns:
+        Open ``sqlite3.Connection`` with ``row_factory = sqlite3.Row``.
+
+    Raises:
+        DatabaseCorruptionError: When ``PRAGMA integrity_check`` fails or the
+            database is otherwise unreadable.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(path))
     conn.row_factory = sqlite3.Row
@@ -550,6 +642,17 @@ def transaction(
 
 
 def upsert_project(conn: sqlite3.Connection, project_id: str, name: str, root_path: str) -> None:
+    """Insert or replace a project record.
+
+    Args:
+        conn: Open database connection.
+        project_id: Unique project identifier (derived from project root path).
+        name: Human-readable project name.
+        root_path: Absolute filesystem path to the project root.
+
+    Returns:
+        None.
+    """
     conn.execute(
         "INSERT OR REPLACE INTO projects(project_id, name, root_path) VALUES (?,?,?)",
         (project_id, name, root_path),
@@ -562,6 +665,20 @@ def upsert_build_config(
     project_id: str,
     compile_commands_path: str,
 ) -> None:
+    """Insert or update a build configuration record.
+
+    Uses ``ON CONFLICT`` so re-indexing the same config refreshes
+    ``created_at`` and ``compile_commands_path``.
+
+    Args:
+        conn: Open database connection.
+        config_hash: Content-addressable hash of the compile_commands.json.
+        project_id: Foreign key to ``projects``.
+        compile_commands_path: Absolute path to ``compile_commands.json``.
+
+    Returns:
+        None.
+    """
     conn.execute(
         """INSERT INTO build_configs(config_hash, project_id, compile_commands_path)
            VALUES (?,?,?)
@@ -580,6 +697,25 @@ def upsert_file(
     generated: bool = False,
     mtime: float = 0.0,
 ) -> int:
+    """Insert or update a file record, returning its row id.
+
+    ``generated`` is converted from ``bool`` to ``int`` (0/1) for storage.
+    ``language`` must be ``"c"`` or ``"cpp"``.
+
+    Uses ``ON CONFLICT`` so re-indexing the same ``(config_hash, path)``
+    updates language and mtime without duplication.
+
+    Args:
+        conn: Open database connection.
+        config_hash: Build config hash the file belongs to.
+        path: Relative or absolute file path.
+        language: ``"c"`` or ``"cpp"`` — set during compilation database parsing.
+        generated: Whether the file is auto-generated (default False).
+        mtime: Last-modified timestamp (float, seconds since epoch).
+
+    Returns:
+        int: The ``files.id`` of the inserted or updated row.
+    """
     cur = conn.execute(
         """INSERT INTO files(config_hash, path, language, generated, mtime)
            VALUES (?,?,?,?,?)
@@ -860,12 +996,32 @@ _EMBEDDING_DIM = 1024
 
 
 def _vec_to_blob(vec: list[float]) -> bytes:
-    """Pack a float vector into a BLOB for storage."""
+    """Pack a float vector into a BLOB for storage.
+
+    Uses ``struct.pack("f" * N, *vec)`` where each float32 is 4 bytes.
+    The embedding dimension is ``_EMBEDDING_DIM`` (1024 for mxbai-embed-large).
+
+    Args:
+        vec: Float vector (list of float32 values).
+
+    Returns:
+        bytes: BLOB of packed float32 values.
+    """
     return struct.pack("f" * len(vec), *vec)
 
 
 def _blob_to_vec(blob: bytes) -> list[float]:
-    """Unpack a BLOB back into a float vector."""
+    """Unpack a BLOB back into a float vector.
+
+    Inverse of ``_vec_to_blob``.  Each 4-byte chunk is unpacked as a
+    float32 via ``struct.unpack("f" * (len(blob) // 4), blob)``.
+
+    Args:
+        blob: BLOB of packed float32 values (must be a multiple of 4 bytes).
+
+    Returns:
+        list[float]: The reconstructed float vector.
+    """
     return list(struct.unpack("f" * (len(blob) // 4), blob))
 
 
@@ -1723,8 +1879,8 @@ def get_file_map(
     """Return all symbols in a file grouped by kind — fast structural overview.
 
     *file_path* is relative to the project root (e.g. ``src/modem_msg.cpp``),
-    matching the ``symbols.file_path`` column.  Exact match first, then suffix
-    match so both ``src/main.cpp`` and ``main.cpp`` work.
+    matching the ``symbols.file_path`` column.  Exact match first, then
+    LIKE-based path match so both ``src/main.cpp`` and ``main.cpp`` work.
 
     *signatures* adds full signatures (off by default to keep output compact).
     *max_per_kind* limits items per kind; the ``count`` field always shows the

@@ -16,9 +16,16 @@ class DeduplicatePhase(Phase):
     prefer definitions, and sort by score.
     """
 
-    name = "deduplicate"
+    name = "deduplicate"  #: Phase identifier used in pipeline configuration.
 
     async def run(self, ctx: PipelineContext) -> PipelineContext:
+        """Merge FTS5 and embedding results, deduplicate, score, and sort.
+
+        Merges both result sets, filters noise (very short variable/field
+        names, names starting with ``(``), deduplicates by ``(name,
+        file_path)`` preferring definitions, scores each result, and sorts
+        by score descending.  Limits to ``ctx.limit`` results.
+        """
         queries = ctx.generated_queries if ctx.generated_queries else ctx.rough_queries
         stems = stems_from_queries(queries)
 
