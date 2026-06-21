@@ -1,8 +1,27 @@
-"""fw-context MCP server — build-aware code intelligence for embedded projects.
+"""fw-context MCP server — build-aware code intelligence for embedded C/C++ projects.
 
-Search tools (search_code, smart_search) delegate to the search pipeline
-(fw_context_mcp.search).  Everything else stays in this file as thin
-handlers with shared helpers for DB access, staleness detection, etc.
+Serves 20 MCP tools and 3 MCP resources via FastMCP (stdio transport).
+
+**Search tools** (delegate to ``fw_context_mcp.search`` pipeline):
+``search_code`` (FTS5), ``smart_search`` (Ollama-driven), ``semantic_search``
+(embeddings + cosine similarity).
+
+**Symbol reading tools:** ``lookup_symbol``, ``get_source``, ``get_file_map``,
+``get_symbol_context``, ``explain_symbol``, ``get_file_analysis``.
+
+**Call graph tools** (require ``--refs`` index): ``find_callers``,
+``find_references``, ``find_call_path``, ``find_all_callers_recursive``,
+``find_callees_recursive``, ``find_hotspots``, ``find_dead_code``,
+``find_wrapper_callers``, ``trace_data_flow``.
+
+**Inheritance tools:** ``get_inheritance_chain``, ``get_class_members``,
+``get_template_instances``, ``get_method_overrides``.
+
+**Maintenance tools:** ``get_active_build``, ``list_projects``, ``check_ollama``,
+``reindex_file``, ``reset_index``.
+
+**MCP Resources:** ``fw-context://stats``, ``fw-context://projects``,
+``fw-context://symbols/{name}``.
 """
 
 import collections
@@ -95,12 +114,14 @@ mcp = FastMCP(
 
 
 def _db_path(project_root: Path) -> Path:
+    """Resolve the SQLite database path for a project root."""
     cfg = load_config(project_root=project_root)
     project_id = derive_project_id(project_root)
     return cfg.index.db_dir / project_id / "index.db"
 
 
 def _resolve_context(project_root: str | None) -> tuple[Path, Config, str, Path]:
+    """Resolve all context needed by most tools: db_path, config, project_id, root."""
     root = resolve_project_root(project_root)
     cfg = load_config(project_root=root)
     project_id = derive_project_id(root)
@@ -108,6 +129,7 @@ def _resolve_context(project_root: str | None) -> tuple[Path, Config, str, Path]
 
 
 def _open_db_safe(db_path: Path) -> tuple[sqlite3.Connection | None, dict | None]:
+    """Open the database, returning (conn, None) or (None, error_dict) on corruption."""
     try:
         return open_db(db_path), None
     except DatabaseCorruptionError as e:
@@ -119,6 +141,11 @@ def _open_db_safe(db_path: Path) -> tuple[sqlite3.Connection | None, dict | None
 
 
 def _is_stale(cfg, compile_commands_path: str) -> bool:
+    """Check if compile_commands.json is newer than the index timestamp.
+
+    Returns False on any error (missing file, bad timestamp) to avoid
+    blocking queries when the staleness check itself fails.
+    """
     try:
         cc_mtime = os.path.getmtime(compile_commands_path)
         indexed_at = datetime.fromisoformat(cfg["created_at"]).replace(tzinfo=UTC)
@@ -129,6 +156,13 @@ def _is_stale(cfg, compile_commands_path: str) -> bool:
 
 
 def _lookup_definition(conn, config_hash: str, name: str):
+    """Find the best-matching symbol definition, trying exact then suffix match.
+
+    Tries exact name match (preferring definitions), then qualified name match.
+    Falls back to suffix-filtering by short name when ``::`` is present and
+    the full name didn't match (e.g. ``Foo::bar`` → match ``bar``, then
+    filter by ``qualified_name`` ending with ``Foo::bar``).
+    """
     BASE_QUERY = """SELECT s.* FROM symbols s
        WHERE s.config_hash=? AND %s
        ORDER BY %s s.line
@@ -226,6 +260,7 @@ def _read_symbol_body(file_path: str, line_no: int, end_line: int = 0, max_lines
 
 
 def _stale_files(conn, config_hash: str, file_paths: list[str]) -> list[str]:
+    """Return the subset of *file_paths* whose on-disk mtime is newer than the index."""
     stale = []
     for path in dict.fromkeys(file_paths):
         try:
@@ -240,6 +275,10 @@ def _stale_files(conn, config_hash: str, file_paths: list[str]) -> list[str]:
 
 
 def _count_modified_files(conn, config_hash: str, root: Path) -> int:
+    """Count files whose on-disk mtime is newer than the stored mtime.
+
+    Files with mtime=0 (pre-migration databases) are always counted as modified.
+    """
     modified = 0
     rows = conn.execute(
         "SELECT path, mtime FROM files WHERE config_hash=?", (config_hash,)
@@ -263,6 +302,10 @@ def _count_modified_files(conn, config_hash: str, root: Path) -> int:
 
 
 def _detect_build_system(root: Path) -> str:
+    """Detect the build system in use from well-known project files.
+
+    Returns one of ``"mbed-os"``, ``"zephyr"``, ``"platformio"``, or ``"unknown"``.
+    """
     if (root / "mbed-os").is_dir() or (root / "mbed_app.json").exists():
         return "mbed-os"
     if (root / "west.yml").exists() or (root / "prj.conf").exists():
@@ -278,6 +321,12 @@ def _auto_reindex_stale(
     max_files: int = 5,
     timeout_s: float = 30.0,
 ) -> tuple[list[str], list[str]]:
+    """Re-index up to *max_files* stale files, bounded by *timeout_s*.
+
+    Returns (succeeded_files, failed_files). Each file is reindexed via
+    ``reindex_file``; errors are caught per-file so one failure doesn't
+    block the rest.
+    """
     succeeded: list[str] = []
     failed: list[str] = []
     t0 = time.monotonic()
@@ -573,7 +622,16 @@ LOOKUP_PREFIX_SQL,
 def list_projects(
     project_root: Annotated[str | None, Field(description="Project root. Auto-detected if omitted. Pass to distinguish multiple indexed projects.")] = None,
 ) -> list[dict]:
-    """Read-only. No side effects. Lists all firmware projects that have been indexed with fw-context, showing each project's database path, symbol count, and last re-index time. Use at session start to discover available projects; use get_active_build for details on the current project."""
+    """List all indexed firmware projects with their statistics.
+
+    Read-only. No side effects. Use at session start to discover available
+    projects; use ``get_active_build`` for details on the currently active project.
+
+    Returns:
+        list of dicts, each with: project_id, name, root_path, build_system,
+        symbol_count, file_count, indexed_at, schema_version, current_schema,
+        stale (bool), db (path to SQLite database file).
+    """
     cfg = load_config(project_root=Path(project_root).resolve() if project_root else None)
     index_dir = cfg.index.db_dir
     db_files = list(index_dir.glob("*/index.db")) if index_dir.exists() else []
@@ -622,7 +680,23 @@ def reset_index(
     project_root: Annotated[str | None, Field(description="Project root. Auto-detected if omitted.")] = None,
     confirm: Annotated[bool, Field(description="Must be True to execute. Call without confirm first as dry-run.")] = False,
 ) -> dict:
-    """Not read-only — deletes the entire symbol index. Call without confirm=True first as dry-run. Re-index with 'fw-context index' afterwards."""
+    """Delete the entire symbol index for a project.
+
+    Not read-only — permanently deletes the SQLite database and WAL files.
+    Call with ``confirm=False`` first (dry-run) to see what would be deleted.
+    Re-index with ``fw-context index`` afterwards.
+
+    Handles corrupt databases gracefully — you can delete a corrupt index
+    without needing to open it first.
+
+    Args:
+        project_root: Project root directory. Auto-detected if omitted.
+        confirm: Must be True to execute. Call without first as dry-run.
+
+    Returns:
+        dict: {project_root, db, project_id, action: "dry_run"|"deleted",
+        message, symbol_count, indexed_at (dry-run)}.
+    """
     root = resolve_project_root(project_root)
     db_path = _db_path(root)
     if not db_path.exists():
@@ -685,7 +759,24 @@ def reindex_file(
     file_path: Annotated[str, Field(description="Path to source file to re-parse. Must be in compile_commands.json.")],
     project_root: Annotated[str | None, Field(description="Project root. Auto-detected if omitted.")] = None,
 ) -> dict:
-    """Not read-only — re-parses a single source file with libclang using the exact compiler flags from compile_commands.json and updates its symbols in the SQLite+FTS5 index. The file must be in compile_commands.json. Use after editing a file to keep the index current without rebuilding; use reset_index to rebuild from scratch."""
+    """Re-parse a single source file with libclang and update its symbols in the index.
+
+    Not read-only — uses the exact compiler flags from ``compile_commands.json``.
+    The file must be listed in ``compile_commands.json`` (headers are re-indexed
+    via the translation unit that includes them). Use after editing a file to
+    keep the index current without a full rebuild.
+
+    Also regenerates LLM analysis and method override relationships for
+    affected symbols when those features are enabled in config.
+
+    Args:
+        file_path: Path to source file to re-parse. Must be in compile_commands.json.
+        project_root: Project root directory. Auto-detected if omitted.
+
+    Returns:
+        dict: {file, translation_units, symbols_updated, elapsed_s,
+        analysis_updated (if LLM enabled), or error}.
+    """
     db_path, cfg, project_id, root = _resolve_context(project_root)
     if not db_path.exists():
         return {"error": f"No index found for {root}. Run 'fw-context index' first."}
@@ -812,7 +903,27 @@ async def explain_symbol(
     project_root: Annotated[str | None, Field(description="Project root. Auto-detected if omitted.")] = None,
     context_lines: Annotated[int, Field(description="Lines of source context around the symbol definition.")] = 40,
 ) -> dict:
-    """Read-only. No side effects — uses pre-computed LLM analysis when available (instant), falls back to calling Ollama on-demand. Returns a plain-English explanation of what a C/C++ symbol does, including its purpose, inputs, outputs, and side effects. For raw source code use get_source; for symbol metadata without explanation use lookup_symbol; for body+callers+callees use get_symbol_context."""
+    """Explain what a C/C++ symbol does in plain English.
+
+    Read-only. No side effects — uses pre-computed LLM analysis when available
+    (instant, generated during ``fw-context index --analyze``), falls back to
+    calling Ollama on-demand. Returns the symbol's purpose, inputs, outputs,
+    and side effects.
+
+    For raw source code use ``get_source``. For symbol metadata without
+    explanation use ``lookup_symbol``. For body + callers + callees use
+    ``get_symbol_context``.
+
+    Args:
+        name: Symbol name to explain. E.g. ``uart_init``, ``ModemMsg::send``.
+        project_root: Project root directory. Auto-detected if omitted.
+        context_lines: Lines of source context around the symbol definition
+            (default 40, max 200). Only used when no pre-computed analysis exists.
+
+    Returns:
+        dict: {name, kind, file, line, signature, explanation, llm_analysis
+        (if pre-computed)}, plus source/explain_prompt on fallback.
+    """
     db_path, cfg, project_id, root = _resolve_context(project_root)
     if not db_path.exists():
         return {"error": f"No index found for {root}. Run 'fw-context index' first."}
@@ -1269,7 +1380,22 @@ def get_symbol_context(
 
 
 def _references_result(name: str, project_root: str | None, ref_kind: str | list[str] | None, limit: int, *, caller_mode: bool = False) -> list[dict]:
-    """Shared logic for find_callers / find_references."""
+    """Shared logic for ``find_callers`` and ``find_references``.
+
+    Resolves the project, opens the DB, looks up the symbol, checks that refs
+    are indexed, and returns formatted reference results.
+
+    Args:
+        name: Symbol name to find references for.
+        project_root: Project root directory.
+        ref_kind: Reference kind filter (``["call", "indirect"]`` for callers,
+            ``None`` for all kinds).
+        limit: Maximum results.
+        caller_mode: If True, use "callers" in info messages instead of "references".
+
+    Returns:
+        list of dicts, each with: file, line, ref_kind, caller, caller_kind.
+    """
     db_path, cfg, project_id, root = _resolve_context(project_root)
     if not db_path.exists():
         return [{"error": f"No index found for {root}. Run 'fw-context index' first."}]
@@ -1339,7 +1465,24 @@ def find_references(
     project_root: Annotated[str | None, Field(description="Project root. Auto-detected if omitted.")] = None,
     limit: Annotated[int, Field(description="Maximum results.")] = 50,
 ) -> list[dict]:
-    """Read-only. No side effects. Returns all references to a symbol (call sites, reads, member accesses) across the indexed codebase. Requires refs to be indexed (fw-context index --refs). For direct callers only use find_callers; for transitive callers use find_all_callers_recursive; for call paths between two symbols use find_call_path."""
+    """Find all references to a symbol — calls, reads, and member accesses.
+
+    Read-only. No side effects. Returns every reference in the indexed codebase,
+    including call sites, variable reads, and struct member accesses. Requires
+    the reference index (``fw-context index`` — refs on by default).
+
+    For direct callers only use ``find_callers``. For transitive callers use
+    ``find_all_callers_recursive``. For call paths between two symbols use
+    ``find_call_path``.
+
+    Args:
+        name: Symbol name to find all references of.
+        project_root: Project root directory. Auto-detected if omitted.
+        limit: Maximum results (default 50, max 200).
+
+    Returns:
+        list of dicts, each with: file, line, ref_kind, caller, caller_kind.
+    """
     return _references_result(name, project_root, ref_kind=None, limit=limit)
 
 
@@ -1349,8 +1492,13 @@ def find_references(
 def _refs_guard(project_root: str | None) -> tuple[Path, str, None] | tuple[None, None, list[dict]]:
     """Shared guard for graph tools: resolve project, open DB, check refs exist.
 
-    Returns ``(root, config_hash, None)`` on success or ``(None, None, error_list)``
-    on failure (caller propagates the error list directly).
+    Opens and closes the DB connection — callers must open a fresh connection
+    after this guard succeeds.
+
+    Returns:
+        ``(root, config_hash, None)`` on success — caller opens its own connection.
+        ``(None, None, error_list)`` on failure — caller propagates the error
+        list directly to the tool result.
     """
     root = resolve_project_root(project_root)
     db_path = _db_path(root)
@@ -2213,10 +2361,11 @@ def search_code(
     kind: Annotated[str | None, Field(description="Optional kind filter: function, method, class, struct, enum, typedef, variable, field, namespace.")] = None,
     limit: Annotated[int, Field(description="Maximum results (default 20, max 100).")] = 20,
 ) -> list[dict]:
-    """Read-only. Full-text search over indexed symbols (functions, classes, methods, enums, etc.).
+    """Full-text search over indexed C/C++ symbols (functions, classes, methods, enums, etc.).
 
-    Use when looking for symbols by topic or keyword rather than exact name.
-    Prefer ``lookup_symbol`` when you already know the symbol name.
+    Read-only. No side effects. Use when looking for symbols by topic or keyword
+    rather than exact name. Prefer ``lookup_symbol`` when you already know the
+    symbol name.
 
     **FTS5 syntax:**
     - ``init*`` matches init, init_uart, initialize (trailing wildcard)
@@ -2225,7 +2374,7 @@ def search_code(
       ``modem AND init``. Use ``modem init`` instead.
 
     **Progressive relaxation:** when the initial FTS5 search returns nothing,
-    the tool automatically broadens the search in three steps:
+    the tool automatically broadens the search in four steps:
 
     1. *FTS5 without kind filter* — drops the ``kind`` constraint (users often
        guess the wrong kind for a symbol).
@@ -2238,8 +2387,8 @@ def search_code(
     4. *Individual term FTS5* — searches each query word separately and merges
        the results.
 
-    Results from steps 2–5 carry ``_fallback`` indicating which step succeeded
-    (``"fts5"``, ``"name_tokens_like"``, ``"docstring_like"``,
+    Results from fallback steps carry ``_fallback`` indicating which method
+    succeeded (``"fts5"``, ``"name_tokens_like"``, ``"docstring_like"``,
     ``"individual_terms"``).
 
     **Kind filter values:** ``function``, ``method``, ``constructor``,
@@ -2253,14 +2402,15 @@ def search_code(
 
     Args:
         query: Search term(s) with FTS5 syntax. Keep queries short — 1–3 words.
-        project_root: Absolute path to the project. Defaults to nearest git root.
+        project_root: Project root directory. Auto-detected from CWD if omitted.
         kind: Optional filter to return only symbols of this kind.
         limit: Maximum number of results (default 20, max 100).
 
     Returns:
         list of dicts, each with: name, qualified_name, kind, file, line,
         is_definition, signature, docstring. Enum constants include
-        ``enum_value`` with the integer value.
+        ``enum_value`` with the integer value. Fallback results include
+        ``_fallback`` with the method name.
     """
     try:
         root = resolve_project_root(project_root)
@@ -2394,16 +2544,20 @@ async def smart_search(
     project_root: Annotated[str | None, Field(description="Project root. Auto-detected if omitted.")] = None,
     limit: Annotated[int, Field(description="Maximum results (default 20, max 100).")] = 20,
 ) -> list[dict]:
-    """Read-only. Natural-language search: Ollama generates FTS5 keywords, then searches the index. Slow (10-30 s).
+    """Natural-language search: Ollama generates FTS5 keywords, then searches the index.
+
+    Read-only. No side effects. Slow (10-30 s) — delegates to the full
+    ``SMART_SEARCH`` pipeline (8 phases: translate → rough_search → llm_query →
+    fts5_search → refine → embedding → deduplicate → format).
 
     Multi-phase approach:
     1) Translate non-English queries
-    2) Rough FTS5 search to gather sample symbols
+    2) Rough search to gather sample symbols for naming conventions
     3) Ollama sees those samples + query and generates FTS5 terms
-    4) Refine: Ollama checks results and course-corrects
-    5) FTS5 search with generated terms
-    6) Semantic embedding search (cosine similarity)
-    7) Score, deduplicate, format
+    4) FTS5 search with generated terms
+    5) Refine: Ollama checks results and course-corrects query terms
+    6) Semantic embedding search (cosine similarity re-rank)
+    7) Deduplicate, score, and format results
 
     **When to prefer over search_code:** When you don't know the exact keywords
     and want to describe what you're looking for ("how does the modem connect?",
@@ -2415,12 +2569,13 @@ async def smart_search(
     Args:
         query: Natural language description of what you're looking for.
                Be specific — 5–15 words works best.
-        project_root: Absolute path to the project. Defaults to nearest git root.
+        project_root: Project root directory. Auto-detected from CWD if omitted.
         limit: Maximum number of results (default 20, max 100).
 
     Returns:
         list of dicts with metadata entries (_generated_queries, _rough_queries,
-        _translated_from) followed by symbol results.
+        _translated_from) followed by symbol results with name, qualified_name,
+        kind, file, line, is_definition, signature, docstring.
     """
     from fw_context_mcp.search import SMART_SEARCH
     from fw_context_mcp.search.context import PipelineContext
@@ -2770,7 +2925,11 @@ def _fallback_to_search_code_inner(
 
 @mcp.resource("fw-context://stats")
 def resource_stats() -> str:
-    """Return a human-readable summary of all indexed projects."""
+    """Return a human-readable markdown summary of all indexed projects.
+
+    Read-only. Aggregates stats from every project database found under the
+    configured index directory.
+    """
 
     projects = list_projects()
     if not projects:
@@ -2791,14 +2950,22 @@ def resource_stats() -> str:
 
 @mcp.resource("fw-context://projects")
 def resource_projects() -> str:
-    """Return project list as JSON."""
+    """Return project list as a JSON string.
+
+    Read-only. Uses the same data as ``list_projects``, serialized as
+    indented JSON.
+    """
     import json
     return json.dumps(list_projects(), indent=2, ensure_ascii=False, default=str)
 
 
 @mcp.resource("fw-context://symbols/{name}")
 def resource_symbol(name: str) -> str:
-    """Return the definition source of a symbol as a resource."""
+    """Return the definition source of a symbol as a markdown document.
+
+    Read-only. Renders symbol metadata (name, kind, file, signature) and
+    source code as a formatted markdown resource.
+    """
     import json
 
     result = get_source(name)
@@ -2825,4 +2992,5 @@ def resource_symbol(name: str) -> str:
 
 
 def main() -> None:
+    """Start the FastMCP stdio server — entry point for the ``fw-context-mcp`` command."""
     mcp.run()

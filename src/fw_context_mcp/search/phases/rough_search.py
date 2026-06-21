@@ -46,9 +46,15 @@ class RoughSearchPhase(Phase):
     the project's naming conventions before generating search terms.
     """
 
-    name = "rough_search"
+    name = "rough_search"  #: Phase identifier used in pipeline configuration.
 
     async def run(self, ctx: PipelineContext) -> PipelineContext:
+        """Gather 12-20 sample symbols via embedding or FTS5 search.
+
+        Tries embedding-based sampling first (semantic similarity). Falls
+        back to FTS5 word-pair + single-word search. Extracts keyword
+        terms from sample names for downstream FTS5 fallback use.
+        """
         from fw_context_mcp.indexer.db import open_db as _open_db
 
         query = ctx.query
@@ -281,6 +287,7 @@ def _fts5_rough_samples(conn, query: str, content_words: list[str], config_hash:
 
 
 def _table_exists(conn, name: str) -> bool:
+    """Check whether a table or virtual table exists."""
     row = conn.execute(
         "SELECT 1 FROM sqlite_master WHERE name=? LIMIT 1", (name,)
     ).fetchone()
@@ -288,6 +295,7 @@ def _table_exists(conn, name: str) -> bool:
 
 
 def _table_has_rows(conn, name: str) -> bool:
+    """Check whether a table exists and contains at least one row."""
     if not _table_exists(conn, name):
         return False
     row = conn.execute(f"SELECT 1 FROM {name} LIMIT 1").fetchone()

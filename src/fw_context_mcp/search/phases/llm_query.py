@@ -27,12 +27,20 @@ class LLMQueryPhase(Phase):
     Falls back to rough terms when Ollama is unavailable.
     """
 
-    name = "llm_query"
+    name = "llm_query"  #: Phase identifier used in pipeline configuration.
 
     def should_run(self, ctx) -> bool:
+        """Only run when Ollama is enabled in config."""
         return ctx.config.llm.enabled
 
     async def run(self, ctx: PipelineContext) -> PipelineContext:
+        """Build an LLM prompt from query + sample symbols, call Ollama, parse FTS5 terms.
+
+        Checks the keyword cache first.  Shows the LLM sample symbols so
+        it learns naming conventions before generating search terms.
+        Parses the ``UNDERSTANDING: ... QUERIES: [...]`` output format.
+        Falls back to rough terms on Ollama errors.
+        """
         from fw_context_mcp.llm.ollama import OllamaError, OllamaModelNotFoundError, call_ollama_async
 
         cache_key = (ctx.query, ctx.config_hash)

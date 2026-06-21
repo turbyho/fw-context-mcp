@@ -18,9 +18,15 @@ class FormatPhase(Phase):
     ``_translated_from`` / ``_translated_to``, warnings, etc.
     """
 
-    name = "format"
+    name = "format"  #: Phase identifier used in pipeline configuration.
 
     async def run(self, ctx: PipelineContext) -> PipelineContext:
+        """Convert final scored results to MCP tool output dicts.
+
+        Prepends metadata entries (``_generated_queries``, ``_rough_queries``,
+        ``_translated_from``, warnings), converts relative paths to absolute,
+        and includes optional fields (``summary``, ``inputs``, ``outputs``).
+        """
         project_root = ctx.project_root
 
         def _fmt(r: dict) -> dict:

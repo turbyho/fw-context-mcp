@@ -31,12 +31,20 @@ class EmbeddingPhase(Phase):
     vec0 virtual table (sqlite-vec, for KNN queries).
     """
 
-    name = "embedding"
+    name = "embedding"  #: Phase identifier used in pipeline configuration.
 
     def should_run(self, ctx) -> bool:
+        """Only run when LLM is enabled and no Ollama warning occurred earlier."""
         return ctx.config.llm.enabled and ctx.ollama_warning is None
 
     async def run(self, ctx: PipelineContext) -> PipelineContext:
+        """Run semantic search via cosine similarity as a re-rank or standalone KNN.
+
+        When FTS5 results exist, operates as a re-rank (scoring FTS5
+        candidates by vector distance).  Otherwise runs a standalone KNN
+        query via sqlite-vec ``vec0`` virtual table, falling back to
+        brute-force BLOB search for legacy indexes.
+        """
 
         from fw_context_mcp.indexer.db import (
             get_embeddings,
