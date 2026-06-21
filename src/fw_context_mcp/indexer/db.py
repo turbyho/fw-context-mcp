@@ -179,7 +179,7 @@ def _derive_schema_version(
         f"{table}:{','.join(sorted(cols))};"
         for table, cols in sorted(tables.items())
     )
-    return int.from_bytes(hashlib.sha256(canonical.encode()).digest()[:4], "big")
+    return int.from_bytes(hashlib.sha256(canonical.encode()).digest()[:4], "big") & 0x7FFFFFFF
 
 
 # Simple add-column migrations — run idempotently and feed into the schema
@@ -589,6 +589,10 @@ def open_db(path: Path) -> sqlite3.Connection:
         init_vec_table(conn)
     except Exception:
         pass
+
+    # Stamp the database with the current schema version so we can detect
+    # stale indexes — PRAGMA user_version is the standard SQLite mechanism.
+    conn.execute(f"PRAGMA user_version = {CURRENT_SCHEMA_VERSION}")
 
     # Integrity check — detect corruption early, before any tool uses the DB
     try:
