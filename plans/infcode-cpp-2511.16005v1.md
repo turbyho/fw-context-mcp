@@ -216,8 +216,8 @@ agentní architekturu.
 | 1 | **Inheritance chain** | 🔴 Vysoký | Střední (~330 ř.) | **P0** ✅ hotovo (f779b25) |
 | 2 | **Class member grouping** | 🟡 Střední | Nízká (~150 ř.) | **P1** ✅ hotovo (ac339e7) |
 | 3 | **Template tracking** | 🟡 Střední | Střední (~100 ř.) | **P2** ✅ hotovo (2026-06-21) |
-| 4 | **File-level intent** | 🟢 Nízký-Střední | Nízká (~100 ř.) | **P3** |
-| 5 | **Method override** | 🟡 Střední | Vyšší (~200 ř.) | **P3** — závisí na #1 |
+| 4 | **File-level intent** | 🟢 Nízký-Střední | Nízká (~100 ř.) | **P3** ✅ hotovo (2026-06-21) |
+| 5 | **Method override** | 🟡 Střední | Vyšší (~200 ř.) | **P3** ✅ hotovo (2026-06-21) |
 
 ### 🔬 Paperem potvrzené směry které už máme
 
@@ -247,10 +247,8 @@ Paper validuje naši současnou strategii:
 1. ✅ ~~**Teď:** Implementovat inheritance chain (#1)~~ — hotovo (f779b25)
 2. ✅ ~~**Brzy:** Class member grouping (#2)~~ — hotovo (ac339e7)
 3. ✅ ~~**Později:** Template tracking (#3)~~ — hotovo (2026-06-21)
-4. **Možná:** File-level intent (#4) — spíše "nice to have", současné
-   per-symbol popisy + `get_file_map` pokrývají většinu use-cases.
-5. **Později:** Method override tracking (#5) — závisí na #1 (inheritance už je),
-   potřebuje signature-matching napříč hierarchií.
+4. ✅ ~~**Možná:** File-level intent (#4)~~ — hotovo (2026-06-21)
+5. ✅ ~~**Později:** Method override tracking (#5)~~ — hotovo (2026-06-21)
 
 ### ⚠️ Co z paperu nedává smysl přebírat
 

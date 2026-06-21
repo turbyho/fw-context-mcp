@@ -174,3 +174,120 @@ def parse_analysis_response(
         })
 
     return result if result else None
+
+
+# ---------------------------------------------------------------------------
+# File-level analysis prompt — generates a short summary per file based on
+# the symbols it contains.  Batched (5 files at a time) for efficiency.
+# ---------------------------------------------------------------------------
+
+_FILE_ANALYSIS_SYSTEM = """You are a senior C/C++ embedded engineer writing codebase documentation.
+
+For each file below, write a 2-3 sentence summary of what the file is responsible for.
+Base your summary on the symbols it contains — their names, kinds, and what they collectively accomplish.
+
+Output a JSON array with one object per file:
+  "file": the file path as given
+  "summary": 2-3 sentences describing the file's purpose and responsibilities
+
+EXAMPLE:
+[
+  {
+    "file": "src/uart.cpp",
+    "summary": "Implements the UART hardware abstraction layer. Provides uart_init() for pin/baud configuration and uart_write()/uart_read() for blocking data transfer. Manages TX/RX buffer state and interrupt handling for the USART peripheral."
+  }
+]
+
+Output ONLY the JSON array. No markdown fences, no commentary.
+"""
+
+
+def build_file_analysis_prompt(batch: list[dict]) -> str:
+    """Build the file-level analysis prompt for a batch of files.
+
+    *batch* is a list of dicts with keys: ``file_id``, ``path``,
+    ``symbols`` (list of {name, kind, qualified_name, signature} for
+    up to 30 representative symbols in the file).
+    """
+    parts: list[str] = []
+    for i, entry in enumerate(batch, 1):
+        path = entry["path"]
+        syms = entry.get("symbols", [])
+        lines = [f"{i}. {path}"]
+        for s in syms[:30]:
+            qn = s.get("qualified_name") or s["name"]
+            sig = s.get("signature", "")
+            if sig:
+                lines.append(f"   [{s['kind']}] {qn} — {sig}")
+            else:
+                lines.append(f"   [{s['kind']}] {qn}")
+        parts.append("\n".join(lines))
+
+    return _FILE_ANALYSIS_SYSTEM + "\nFiles:\n\n" + "\n\n".join(parts) + "\n\nJSON:"
+
+
+def parse_file_analysis_response(
+    response: str,
+    batch: list[dict],
+) -> list[dict] | None:
+    """Parse the Ollama JSON response for file-level analysis.
+
+    Returns a list of {file_id, summary} or None on total parse failure.
+    Accepts partial results — the returned list may be shorter than the batch.
+    """
+    text = response.strip()
+
+    # Strip markdown fences
+    if text.startswith("```"):
+        for fence_marker in ("```json", "```", "``"):
+            if text.startswith(fence_marker):
+                text = text[len(fence_marker):].strip()
+                break
+    if text.endswith("```"):
+        text = text[:-3].strip()
+
+    parsed: list[dict] = []
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError:
+        match = re.search(r"\[.*\]", text, re.DOTALL)
+        if not match:
+            log.warning("Cannot parse file analysis LLM response: %.200s", response)
+            return None
+        try:
+            parsed = json.loads(match.group())
+        except json.JSONDecodeError:
+            log.warning("Cannot parse file analysis LLM response (fallback): %.200s", response)
+            return None
+
+    if not isinstance(parsed, list):
+        log.warning("File analysis LLM response is not a JSON array: %.200s", response)
+        return None
+
+    # Build a lookup by file path for matching
+    path_to_id: dict[str, int] = {}
+    for entry in batch:
+        path_to_id[entry["path"]] = entry["file_id"]
+
+    result: list[dict] = []
+    for entry in parsed:
+        if not isinstance(entry, dict):
+            continue
+        file_path = entry.get("file", "")
+        summary = (entry.get("summary", "") or "").strip()
+        if not summary:
+            continue
+        # Match by path (exact or suffix)
+        file_id = path_to_id.get(file_path)
+        if file_id is None:
+            # Try suffix match
+            for path, fid in path_to_id.items():
+                if path.endswith(file_path) or file_path.endswith(path):
+                    file_id = fid
+                    break
+        if file_id is None:
+            log.warning("File analysis: cannot match path '%s' to batch", file_path)
+            continue
+        result.append({"file_id": file_id, "summary": summary})
+
+    return result if result else None

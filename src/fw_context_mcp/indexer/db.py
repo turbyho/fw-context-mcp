@@ -277,6 +277,17 @@ CREATE TABLE IF NOT EXISTS llm_analysis (
     analyzed_at  TEXT    NOT NULL DEFAULT (datetime('now'))
 );
 
+-- Per-file LLM analysis (opt-in via [llm] analyze_files = true).
+-- Pre-computed by Ollama during indexing: a 2-3 sentence summary of what
+-- the file is responsible for, based on the symbols it contains.
+-- ON DELETE CASCADE: when a file row is deleted, its analysis is removed.
+CREATE TABLE IF NOT EXISTS file_analysis (
+    file_id      INTEGER PRIMARY KEY REFERENCES files(id) ON DELETE CASCADE,
+    summary      TEXT    NOT NULL DEFAULT '',
+    model        TEXT    NOT NULL,
+    analyzed_at  TEXT    NOT NULL DEFAULT (datetime('now'))
+);
+
 -- C++ inheritance hierarchy edges.
 -- derived_usr → base_usr: class Derived : public Base { ... }
 -- access: "public", "protected", "private"
@@ -291,6 +302,19 @@ CREATE TABLE IF NOT EXISTS inheritance (
 );
 CREATE INDEX IF NOT EXISTS idx_inheritance_derived ON inheritance(config_hash, derived_usr);
 CREATE INDEX IF NOT EXISTS idx_inheritance_base    ON inheritance(config_hash, base_usr);
+
+-- Virtual method override tracking.
+-- derived_usr → base_usr: DerivedClass::method overrides BaseClass::method.
+-- Built as a post-processing step after inheritance chains are indexed.
+CREATE TABLE IF NOT EXISTS overrides (
+    id           INTEGER PRIMARY KEY,
+    config_hash  TEXT    NOT NULL REFERENCES build_configs(config_hash),
+    derived_usr  TEXT    NOT NULL,
+    base_usr     TEXT    NOT NULL,
+    UNIQUE(config_hash, derived_usr, base_usr)
+);
+CREATE INDEX IF NOT EXISTS idx_overrides_derived ON overrides(config_hash, derived_usr);
+CREATE INDEX IF NOT EXISTS idx_overrides_base    ON overrides(config_hash, base_usr);
 """
 
 CURRENT_SCHEMA_VERSION = _derive_schema_version(_SCHEMA, _MIGRATION_ADD_COLUMNS)
@@ -709,6 +733,63 @@ def get_direct_derived(conn: sqlite3.Connection, config_hash: str, usr: str) -> 
         (config_hash, usr),
     ).fetchall()
     return [dict(r) for r in rows]
+
+
+def insert_overrides_batch(
+    conn: sqlite3.Connection,
+    rows: list[tuple[str, str, str]],
+) -> int:
+    """Insert or replace override relationships.
+
+    Each row: (config_hash, derived_usr, base_usr).
+    Deletes existing overrides for the same derived_usr before inserting,
+    so re-analysis is idempotent. Returns number of rows inserted.
+    """
+    conn.executemany(
+        """DELETE FROM overrides WHERE config_hash = ? AND derived_usr = ?""",
+        [(r[0], r[1]) for r in rows],
+    )
+    cur = conn.executemany(
+        """INSERT INTO overrides (config_hash, derived_usr, base_usr)
+           VALUES (?, ?, ?)""",
+        rows,
+    )
+    return cur.rowcount
+
+
+def get_overrides_for_method(
+    conn: sqlite3.Connection,
+    config_hash: str,
+    usr: str,
+) -> dict[str, list[dict]]:
+    """Return what *usr* overrides and what overrides *usr*.
+
+    Returns:
+        dict with ``overrides`` (base methods this method overrides) and
+        ``overridden_by`` (derived methods that override this one).
+    """
+    overrides_rows = conn.execute(
+        """SELECT o.base_usr, s.name, s.qualified_name, s.kind, s.file_path, s.line
+           FROM overrides o
+           JOIN symbols s ON s.usr = o.base_usr AND s.config_hash = ?
+           WHERE o.config_hash = ? AND o.derived_usr = ?
+           ORDER BY s.qualified_name""",
+        (config_hash, config_hash, usr),
+    ).fetchall()
+
+    overridden_by_rows = conn.execute(
+        """SELECT o.derived_usr, s.name, s.qualified_name, s.kind, s.file_path, s.line
+           FROM overrides o
+           JOIN symbols s ON s.usr = o.derived_usr AND s.config_hash = ?
+           WHERE o.config_hash = ? AND o.base_usr = ?
+           ORDER BY s.qualified_name""",
+        (config_hash, config_hash, usr),
+    ).fetchall()
+
+    return {
+        "overrides": [dict(r) for r in overrides_rows],
+        "overridden_by": [dict(r) for r in overridden_by_rows],
+    }
 
 
 def get_class_members(
@@ -1768,6 +1849,62 @@ def count_llm_analysis(
         """SELECT COUNT(*) FROM llm_analysis a
            JOIN symbols s ON s.id = a.symbol_id
            WHERE s.config_hash = ?""",
+        (config_hash,),
+    ).fetchone()[0]
+
+
+def upsert_file_analysis_batch(
+    conn: sqlite3.Connection,
+    rows: list[tuple[int, str, str]],
+) -> int:
+    """Insert or replace file-level LLM analysis rows.
+
+    Each row: (file_id, summary, model).
+    Uses INSERT OR REPLACE so re-analysis is idempotent.
+    Cleans orphaned rows. Returns number of rows inserted.
+    """
+    conn.execute(
+        """DELETE FROM file_analysis WHERE file_id NOT IN (
+            SELECT id FROM files
+        )"""
+    )
+    cur = conn.executemany(
+        """INSERT OR REPLACE INTO file_analysis(file_id, summary, model, analyzed_at)
+           VALUES (?, ?, ?, datetime('now'))""",
+        rows,
+    )
+    return cur.rowcount
+
+
+def get_file_analysis_for_file(
+    conn: sqlite3.Connection,
+    file_id: int,
+) -> dict | None:
+    """Return the file-level LLM analysis for a single file, or None."""
+    row = conn.execute(
+        """SELECT summary, model, analyzed_at
+           FROM file_analysis
+           WHERE file_id = ?""",
+        (file_id,),
+    ).fetchone()
+    if not row:
+        return None
+    return {
+        "summary": row["summary"],
+        "model": row["model"],
+        "analyzed_at": row["analyzed_at"],
+    }
+
+
+def count_file_analysis(
+    conn: sqlite3.Connection,
+    config_hash: str,
+) -> int:
+    """Return how many files in a config have pre-computed LLM analysis."""
+    return conn.execute(
+        """SELECT COUNT(*) FROM file_analysis a
+           JOIN files f ON f.id = a.file_id
+           WHERE f.config_hash = ?""",
         (config_hash,),
     ).fetchone()[0]
 
