@@ -37,6 +37,9 @@ from ..indexer.db import (
     search_symbols,
     transaction,
 )
+from ..indexer.db import (
+    get_class_members as query_class_members,
+)
 from ..llm.ollama import OllamaError, OllamaModelNotFoundError, call_ollama_async, call_ollama_embed, check_setup
 from ..utils import MTIME_TOLERANCE_S, abs_path, resolve_project_root
 
@@ -61,7 +64,9 @@ mcp = FastMCP(
         "Call graph (refs must be indexed): find_callers, find_references, "
         "find_call_path, find_all_callers_recursive, find_callees_recursive, "
         "find_hotspots, find_dead_code, find_wrapper_callers, trace_data_flow.\n\n"
-        "Inheritance: get_inheritance_chain (C++ class hierarchy — bases and derived classes).\n\n"
+        "Inheritance: get_inheritance_chain (C++ class hierarchy — bases and "
+        "derived classes), get_class_members (list all methods and fields of a "
+        "class/struct).\n\n"
         "Maintenance: reindex_file (after editing a file), reset_index (destructive! "
         "re-index from scratch), check_ollama (before smart_search/explain_symbol/"
         "semantic_search), list_projects (discover indexed projects)."
@@ -1835,6 +1840,70 @@ def get_inheritance_chain(
                 result["all_derived"] = all_derived
 
         return result
+    finally:
+        conn.close()
+
+
+@mcp.tool()
+def get_class_members(
+    class_name: Annotated[str, Field(description="Class or struct name. E.g. 'ModemManager' or 'zbox::ZMODEM'.")],
+    project_root: Annotated[str | None, Field(description="Project root. Auto-detected if omitted.")] = None,
+) -> dict:
+    """Read-only. Return all methods, fields, and nested types of a class/struct.
+
+    Members are grouped by kind (method, constructor, destructor, field, enum,
+    typedef, class, struct). Each member includes its signature, virtual flags,
+    and source line. Works for C structs too — they just won't have methods.
+
+    Returns:
+        dict: {name, qualified_name, kind, file, line, members: {kind: [...]}, member_count}
+    """
+    db_path, cfg, project_id, root = _resolve_context(project_root)
+    if not db_path.exists():
+        return {"error": f"No index found for {root}. Run 'fw-context index' first."}
+    conn, err = _open_db_safe(db_path)
+    if err:
+        return err
+    try:
+        with conn:
+            cfg_data = get_active_config(conn, project_id)
+            if not cfg_data:
+                return {"error": "No build config indexed."}
+            config_hash = cfg_data["config_hash"]
+            row = _lookup_definition(conn, config_hash, class_name)
+            if not row:
+                return {"error": f"Symbol not found: {class_name}"}
+            if row["kind"] not in ("class", "struct"):
+                return {"error": f"'{class_name}' is a {row['kind']}, not a class or struct."}
+
+            usr = row["usr"]
+            result: dict = {
+                "name": row["name"],
+                "qualified_name": row["qualified_name"],
+                "kind": row["kind"],
+                "file": abs_path(root, row["file_path"]),
+                "line": row["line"],
+            }
+
+            # ── Members grouped by kind ──
+            members = query_class_members(conn, config_hash, usr)
+            grouped: dict[str, list[dict]] = {}
+            for m in members:
+                k = m["kind"]
+                if k not in grouped:
+                    grouped[k] = []
+                grouped[k].append({
+                    "name": m["name"],
+                    "qualified_name": m["qualified_name"],
+                    "signature": m["signature"] or "",
+                    "is_virtual": bool(m["is_virtual"]),
+                    "is_pure_virtual": bool(m["is_pure_virtual"]),
+                    "line": m["line"],
+                })
+            result["members"] = grouped
+            result["member_count"] = len(members)
+
+            return result
     finally:
         conn.close()
 

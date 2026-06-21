@@ -122,6 +122,7 @@ def store_symbols_for_unit(
                 s.enum_value,
                 int(s.is_virtual),
                 int(s.is_pure_virtual),
+                s.parent_usr,
             ))
         total_syms = insert_symbols_batch(conn, rows)
 

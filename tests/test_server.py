@@ -117,6 +117,7 @@ CREATE TABLE IF NOT EXISTS symbols (
     is_definition  INTEGER NOT NULL DEFAULT 0,
     signature      TEXT    NOT NULL DEFAULT '',
     docstring      TEXT    NOT NULL DEFAULT '',
+    parent_usr     TEXT    NOT NULL DEFAULT '',
     UNIQUE(config_hash, usr)
 );
 CREATE INDEX IF NOT EXISTS idx_symbols_name  ON symbols(name);
@@ -148,17 +149,19 @@ def _insert_symbol(c, **kw):
         "is_definition": 1,
         "signature": "void f()",
         "docstring": "",
+        "parent_usr": "",
     }
     defaults.update(kw)
     c.execute(
         """INSERT INTO symbols (config_hash, file_id, file_path, name_tokens,
            usr, name, qualified_name, kind, line, col, end_line, is_definition,
-           signature, docstring)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+           signature, docstring, parent_usr)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         tuple(defaults[f] for f in [
             "config_hash", "file_id", "file_path", "name_tokens",
             "usr", "name", "qualified_name", "kind", "line", "col",
             "end_line", "is_definition", "signature", "docstring",
+            "parent_usr",
         ]),
     )
 
