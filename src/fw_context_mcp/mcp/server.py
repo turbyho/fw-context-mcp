@@ -1038,7 +1038,7 @@ def get_file_map(
                 (config_hash, resolved),
             ).fetchone()
             if file_id:
-                fa = get_file_analysis_for_file(conn, file_id[0])
+                fa = get_file_analysis_for_file(conn, config_hash, file_id[0])
                 if fa:
                     result["file_summary"] = fa["summary"]
     finally:
@@ -1079,7 +1079,7 @@ def get_file_analysis(
             ).fetchone()
             if not file_row:
                 return {"error": f"File not found in index: {file_path}"}
-            fa = get_file_analysis_for_file(conn, file_row["id"])
+            fa = get_file_analysis_for_file(conn, config_hash, file_row["id"])
             if not fa:
                 return {
                     "file": file_row["path"],

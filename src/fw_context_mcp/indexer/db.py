@@ -146,6 +146,7 @@ _MIGRATION_ADD_COLUMNS = [
     "ALTER TABLE symbols ADD COLUMN parent_usr TEXT NOT NULL DEFAULT ''",
     "ALTER TABLE symbols ADD COLUMN is_template INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE symbols ADD COLUMN template_usr TEXT NOT NULL DEFAULT ''",
+    "ALTER TABLE file_analysis ADD COLUMN config_hash TEXT NOT NULL DEFAULT ''",
 ]
 
 _SCHEMA = """
@@ -283,6 +284,7 @@ CREATE TABLE IF NOT EXISTS llm_analysis (
 -- ON DELETE CASCADE: when a file row is deleted, its analysis is removed.
 CREATE TABLE IF NOT EXISTS file_analysis (
     file_id      INTEGER PRIMARY KEY REFERENCES files(id) ON DELETE CASCADE,
+    config_hash  TEXT    NOT NULL DEFAULT '',
     summary      TEXT    NOT NULL DEFAULT '',
     model        TEXT    NOT NULL,
     analyzed_at  TEXT    NOT NULL DEFAULT (datetime('now'))
@@ -1855,11 +1857,11 @@ def count_llm_analysis(
 
 def upsert_file_analysis_batch(
     conn: sqlite3.Connection,
-    rows: list[tuple[int, str, str]],
+    rows: list[tuple[int, str, str, str]],
 ) -> int:
     """Insert or replace file-level LLM analysis rows.
 
-    Each row: (file_id, summary, model).
+    Each row: (file_id, config_hash, summary, model).
     Uses INSERT OR REPLACE so re-analysis is idempotent.
     Cleans orphaned rows. Returns number of rows inserted.
     """
@@ -1869,8 +1871,8 @@ def upsert_file_analysis_batch(
         )"""
     )
     cur = conn.executemany(
-        """INSERT OR REPLACE INTO file_analysis(file_id, summary, model, analyzed_at)
-           VALUES (?, ?, ?, datetime('now'))""",
+        """INSERT OR REPLACE INTO file_analysis(file_id, config_hash, summary, model, analyzed_at)
+           VALUES (?, ?, ?, ?, datetime('now'))""",
         rows,
     )
     return cur.rowcount
@@ -1878,14 +1880,15 @@ def upsert_file_analysis_batch(
 
 def get_file_analysis_for_file(
     conn: sqlite3.Connection,
+    config_hash: str,
     file_id: int,
 ) -> dict | None:
     """Return the file-level LLM analysis for a single file, or None."""
     row = conn.execute(
         """SELECT summary, model, analyzed_at
            FROM file_analysis
-           WHERE file_id = ?""",
-        (file_id,),
+           WHERE config_hash = ? AND file_id = ?""",
+        (config_hash, file_id),
     ).fetchone()
     if not row:
         return None
@@ -1903,8 +1906,8 @@ def count_file_analysis(
     """Return how many files in a config have pre-computed LLM analysis."""
     return conn.execute(
         """SELECT COUNT(*) FROM file_analysis a
-           JOIN files f ON f.id = a.file_id
-           WHERE f.config_hash = ?""",
+           WHERE a.config_hash = ? OR a.config_hash = ''
+           """,
         (config_hash,),
     ).fetchone()[0]
 
