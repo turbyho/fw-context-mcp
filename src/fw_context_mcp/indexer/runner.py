@@ -500,7 +500,7 @@ def _build_file_analysis(conn, config_hash: str, llm_config, extra_exclude_like:
             continue
 
         with transaction(conn):
-            db_rows = [(r["file_id"], r["summary"], model) for r in parsed]
+            db_rows = [(r["file_id"], config_hash, r["summary"], model) for r in parsed]
             inserted = upsert_file_analysis_batch(conn, db_rows)
             total += inserted
 

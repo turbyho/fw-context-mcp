@@ -924,9 +924,9 @@ class TestFileAnalysis:
         """upsert_file_analysis_batch stores analysis; get_file_analysis_for_file retrieves it."""
         file_id = upsert_file(populated_db, "hash-deadbeef", "/tmp/main.cpp", "cpp")
         upsert_file_analysis_batch(populated_db, [
-            (file_id, "Main entry point for the application.", "test-model"),
+            (file_id, "hash-deadbeef", "Main entry point for the application.", "test-model"),
         ])
-        result = get_file_analysis_for_file(populated_db, file_id)
+        result = get_file_analysis_for_file(populated_db, "hash-deadbeef", file_id)
         assert result is not None
         assert result["summary"] == "Main entry point for the application."
         assert result["model"] == "test-model"
@@ -934,19 +934,19 @@ class TestFileAnalysis:
 
     def test_no_analysis_for_unknown_file(self, populated_db):
         """get_file_analysis_for_file returns None for files without analysis."""
-        result = get_file_analysis_for_file(populated_db, 99999)
+        result = get_file_analysis_for_file(populated_db, "hash-deadbeef", 99999)
         assert result is None
 
     def test_upsert_replaces_existing(self, populated_db):
         """Re-upserting the same file_id replaces the old analysis."""
         file_id = upsert_file(populated_db, "hash-deadbeef", "/tmp/foo.cpp", "cpp")
         upsert_file_analysis_batch(populated_db, [
-            (file_id, "First summary.", "model-a"),
+            (file_id, "hash-deadbeef", "First summary.", "model-a"),
         ])
         upsert_file_analysis_batch(populated_db, [
-            (file_id, "Updated summary.", "model-b"),
+            (file_id, "hash-deadbeef", "Updated summary.", "model-b"),
         ])
-        result = get_file_analysis_for_file(populated_db, file_id)
+        result = get_file_analysis_for_file(populated_db, "hash-deadbeef", file_id)
         assert result is not None
         assert result["summary"] == "Updated summary."
         assert result["model"] == "model-b"
