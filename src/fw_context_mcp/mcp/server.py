@@ -364,10 +364,11 @@ def get_active_build(
     ``fw-context index`` — remind the user.
 
     Returns:
-        dict: {index_exists, project_id, total_symbols, total_files,
-        total_refs, config_hash, last_indexed (ISO timestamp),
-        stale (bool — any staleness condition), modified_files_count (int),
-        schema_version (int — DB schema version), current_schema (int — code expects)}
+        dict: {config_hash, project_id, project_root, build_system,
+        compile_commands, indexed_at (ISO timestamp), symbol_count, file_count,
+        reference_count, modified_files_count (int), analyzed_symbols,
+        analysis_model (str or None), schema_version (int — DB schema version),
+        current_schema (int — code expects), stale (bool — any staleness condition)}
     """
     root = resolve_project_root(project_root)
     db_path = _db_path(root)
@@ -878,8 +879,10 @@ def check_ollama(
     expected — pre-computed analysis returns instantly without Ollama).
 
     Returns:
-        dict: {ollama_running: bool, model_installed: bool, model: str,
-        error: str or None}
+        dict: {ollama_enabled (bool), status (str — "ok"|"disabled"|"error"|"model_missing"),
+        ollama_running (bool), ollama_url (str), configured_model (str),
+        num_ctx (int), installed_models (list[str]),
+        message (str, on error/disabled), available_code_models (list[str], when model missing)}
     """
     _, cfg, _, _ = _resolve_context(project_root)
     if not cfg.llm.enabled:

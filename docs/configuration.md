@@ -57,7 +57,9 @@ Used only when running without `--no-build`.
 | `ollama_url` | `"http://localhost:11434"` | global | Ollama API base URL. Change for remote GPU servers. |
 | `model` | `"qwen2.5-coder:14b"` | both | LLM model tag. Override per-project for different codebases. |
 | `embed_model` | `"mxbai-embed-large:latest"` | both | Embedding model for vector search. Auto-pulled on first use. |
-| `num_ctx` | `8192` | global | Context window in tokens. Keep ≥8192 — factory default (2048) is too small for source code. |
+| `num_ctx` | `16384` | global | Context window in tokens. Accommodates full function bodies during analysis generation. |
+| `analyze_symbols` | `true` | both | Generate per-symbol LLM analysis (summary, inputs, outputs) during indexing. Stored in `llm_analysis` table — symbols become searchable by purpose. |
+| `analyze_files` | `true` | both | Generate per-file LLM summaries (2–3 sentences) during indexing. Returned by `get_file_analysis` and as `file_summary` in `get_file_map`. |
 | `debug_log` | *(none)* | both | Path to JSONL debug log for Ollama prompts + responses. Example: `"~/.fw-context/llm-debug.jsonl"`. |
 
 ### `[project]` — Metadata
@@ -78,7 +80,7 @@ db_dir = "~/.fw-context/index"
 # enabled = true   # set false to disable Ollama entirely
 ollama_url = "http://localhost:11434"
 model = "qwen2.5-coder:14b"
-num_ctx = 8192
+num_ctx = 16384
 # debug_log = "~/.fw-context/llm-debug.jsonl"
 ```
 

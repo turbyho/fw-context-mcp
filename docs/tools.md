@@ -179,6 +179,10 @@ fw-context-mcp 0.2.3
 These tools are called by your AI assistant over JSON-RPC. Each tool
 opens the database, runs its query, and closes — no persistent connections.
 
+All tools accept an optional `project_root` parameter (default: auto-detected
+from the current working directory). It is shown in every input block below
+but typically omitted — the auto-detection handles the common case.
+
 ### Search & lookup
 
 #### `search_code`
@@ -186,13 +190,42 @@ opens the database, runs its query, and closes — no persistent connections.
 Full-text search with FTS5 syntax.
 
 ```
-Input:  {"query": "uart init", "kind?": "function", "limit?": 20}
+Input:  {"query": "uart init", "project_root?": "/path/to/project", "kind?": "function", "limit?": 20}
 Output: [{"name": "uart_init", "qualified_name": "drv::uart_init", "kind": "function",
           "file": "/path/src/uart.c", "line": 42, "is_definition": true,
-          "signature": "void uart_init(int baudrate)", "docstring": "Initialize UART"}, …]
+          "signature": "void uart_init(int baudrate)", "docstring": "Initialize UART",
+          "is_template": false, "is_virtual": false, "is_pure_virtual": false,
+          "summary": "Initialize the UART peripheral…", "inputs": "baudrate…",
+          "outputs": "…", "enum_value": null, "_fallback": "fts5+kind"}, …]
 ```
 
 Enum constants include `enum_value` (the integer value) when non-None.
+Results include `is_template`, `is_virtual`, `is_pure_virtual` flags
+(boolean, always present). When the symbol is a template instantiation,
+`template_usr` references the template definition. When the symbol is
+a member (method/field/nested type), `parent_usr` references the parent class.
+When LLM analysis has been generated (`fw-context index --analyze`), results
+include `summary`, `inputs`, and `outputs` fields with plain-English
+descriptions.
+
+**Progressive relaxation:** when the initial FTS5 search returns nothing, the
+tool automatically broadens the search in four fallback steps:
+
+1. *FTS5 without kind filter* — drops the `kind` constraint (users often guess
+   the wrong kind for a symbol).
+2. *`name_tokens` substring match* — searches the pre-computed CamelCase/
+   snake_case token column (e.g. `BuildType` is indexed as `"build type"`).
+   Requires at least N‑1 of N query terms to match.
+3. *Single-term docstring LIKE* — when only one query term was given and the
+   token-based steps found nothing, does a raw LIKE over the docstring column
+   to catch terms the FTS5 tokeniser may have missed.
+4. *Individual term FTS5* — searches each query word separately and merges
+   the results.
+
+Results from fallback steps carry `_fallback` indicating which method
+succeeded: `"fts5"`, `"name_tokens_like"`, `"docstring_like"`, or
+`"individual_terms"`. Results from the primary FTS5 path have
+`"_fallback": "fts5+kind"` or omit the field.
 
 **FTS5 syntax:**
 - `uart*` — prefix wildcard
@@ -206,7 +239,7 @@ Enum constants include `enum_value` (the integer value) when non-None.
 Find a symbol by name (exact or prefix match).
 
 ```
-Input:  {"name": "uart_init", "exact?": true}
+Input:  {"name": "uart_init", "project_root?": "/path/to/project", "exact?": true, "limit?": 50}
 Output: [{"name": "uart_init", "qualified_name": "drv::uart_init", "kind": "function",
           "file": "/path/src/uart.c", "line": 42, "is_definition": true,
           "signature": "void uart_init(int baudrate)", "docstring": "Initialize UART"}]
@@ -222,7 +255,7 @@ Enum constants include `enum_value` when non-None.
 Natural language → FTS5 keywords via Ollama (optional).
 
 ```
-Input:  {"query": "how does the modem connect to the network?", "limit?": 20}
+Input:  {"query": "how does the modem connect to the network?", "project_root?": "/path/to/project", "limit?": 20}
 Output: [
   {"_generated_queries": ["network_reg*", "modem_attach*", "pdp_context*"]},
   {"_rough_queries": ["modem", "connect", "network"]},
@@ -243,7 +276,7 @@ related to a natural-language query, even when the query words don't appear
 literally in the code.
 
 ```
-Input:  {"query": "parcel locker state machine", "threshold?": 0.55, "limit?": 20}
+Input:  {"query": "parcel locker state machine", "project_root?": "/path/to/project", "threshold?": 0.55, "limit?": 20}
 Output: [{"name": "set_shipment", "qualified_name": "Locker::set_shipment",
           "_similarity": 0.72, "_method": "embedding", …}, …]
 ```
@@ -275,8 +308,9 @@ Structural overview of a file — all symbols grouped by kind. Fast table of
 contents before reading a chapter.
 
 ```
-Input:  {"file_path": "src/modem_msg.cpp"}
+Input:  {"file_path": "src/modem_msg.cpp", "project_root?": "/path/to/project", "signatures?": false, "max_per_kind?": 30}
 Output: {"file": "src/modem_msg.cpp", "total_symbols": 426,
+         "file_summary": "Modem message handling — encodes/decodes protocol buffers…",
          "symbols": {
            "method":    [{"name": "_is_socket_ok", "line": 140, "signature": "bool _is_socket_ok()"}, …],
            "variable":  [{"name": "_buffer_msg", "line": 105}, …],
@@ -311,7 +345,7 @@ match). Use this instead of `Read` on large files — a 4300-line file returns
 Read a symbol's definition body — no LLM, fast.
 
 ```
-Input:  {"name": "adc_read"}
+Input:  {"name": "adc_read", "project_root?": "/path/to/project"}
 Output: {"name": "adc_read", "kind": "function", "file": "/path/src/adc.c",
          "line": 55, "signature": "uint16_t adc_read(uint8_t channel)",
          "source": "  55  uint16_t adc_read(uint8_t channel) {\n  …\n  70  }"}
@@ -325,7 +359,7 @@ For enums, the result includes a `constants` array listing all member
 constants with their names and values:
 
 ```
-Input:  {"name": "BleCmd::StatusCode"}
+Input:  {"name": "BleCmd::StatusCode", "project_root?": "/path/to/project"}
 Output: {"name": "StatusCode", "kind": "enum", "file": "/path/src/ble_cmd.h",
          "line": 20, "signature": "",
          "constants": [
@@ -341,7 +375,7 @@ Look up a symbol and get a plain-English explanation of its purpose, inputs,
 outputs, and side effects.
 
 ```
-Input:  {"name": "spi_transfer", "context_lines?": 40}
+Input:  {"name": "spi_transfer", "project_root?": "/path/to/project", "context_lines?": 40}
 Output: {"name": "spi_transfer", "kind": "function", "file": "/path/src/spi.c",
          "line": 120, "signature": "int spi_transfer(const uint8_t* tx, uint8_t* rx, size_t n)",
          "explanation": "This function performs a full-duplex SPI transfer…\n\nInputs: …\nOutputs: …",
@@ -367,7 +401,7 @@ Re-indexing a file (`reindex_file`) auto-regenerates its analysis.
 Rich LLM context — body, callers, and callees in one response.
 
 ```
-Input:  {"name": "modem_connect"}
+Input:  {"name": "modem_connect", "project_root?": "/path/to/project", "project_only?": true}
 Output: {"name": "modem_connect", "kind": "function",
          "file": "/path/src/modem.c", "line": 210,
          "signature": "int modem_connect(const char* apn)",
@@ -400,7 +434,7 @@ if you don't need them.
 Who calls this function? (direct callers only)
 
 ```
-Input:  {"name": "uart_write", "limit?": 50}
+Input:  {"name": "uart_write", "project_root?": "/path/to/project", "limit?": 50}
 Output: [{"file": "/path/src/main.c", "line": 35, "ref_kind": "call",
           "caller": "main", "caller_kind": "function"}, …]
 ```
@@ -410,7 +444,7 @@ Output: [{"file": "/path/src/main.c", "line": 35, "ref_kind": "call",
 All uses of a symbol — calls, reads, member access.
 
 ```
-Input:  {"name": "g_sensor_data", "limit?": 50}
+Input:  {"name": "g_sensor_data", "project_root?": "/path/to/project", "limit?": 50}
 Output: [{"file": "/path/src/sensor.c", "line": 12, "ref_kind": "ref",
           "caller": "sensor_task", "caller_kind": "function"}, …]
 ```
@@ -420,7 +454,7 @@ Output: [{"file": "/path/src/sensor.c", "line": 12, "ref_kind": "ref",
 Find paths between two functions via BFS in the call graph.
 
 ```
-Input:  {"from_name": "main", "to_name": "uart_send_byte", "max_depth?": 10}
+Input:  {"from_name": "main", "to_name": "uart_send_byte", "project_root?": "/path/to/project", "max_depth?": 10}
 Output: [{"depth": 3, "chain": "main → app_init → uart_write → uart_send_byte"}]
 ```
 
@@ -431,7 +465,7 @@ Returns up to 5 shortest paths. Requires both symbols to be in the index.
 All transitive callers — who calls this, directly or indirectly?
 
 ```
-Input:  {"name": "gpio_set", "max_depth?": 5}
+Input:  {"name": "gpio_set", "project_root?": "/path/to/project", "max_depth?": 5, "limit?": 50}
 Output: [{"name": "led_toggle", "qualified_name": "led_toggle", "kind": "function",
           "file": "/path/src/led.c", "depth": 1}, … (2 steps away), … (3 steps away)]
 ```
@@ -443,7 +477,7 @@ Deduplicated — each caller appears once at its shortest distance.
 What does this call, directly or indirectly?
 
 ```
-Input:  {"name": "main", "max_depth?": 5}
+Input:  {"name": "main", "project_root?": "/path/to/project", "max_depth?": 5, "limit?": 50}
 Output: [{"name": "spi_init", "kind": "function", "file": "/path/src/spi.c", "depth": 1},
          {"name": "spi_transfer", "kind": "function", "file": "/path/src/spi.c", "depth": 2}, …]
 ```
@@ -453,7 +487,7 @@ Output: [{"name": "spi_init", "kind": "function", "file": "/path/src/spi.c", "de
 Functions defined but never called.
 
 ```
-Input:  {"limit?": 100, "exclude_paths?": ["zephyr/%", "mbed-os/%"]}
+Input:  {"project_root?": "/path/to/project", "limit?": 100, "exclude_paths?": ["zephyr/%", "mbed-os/%"], "project_only?": true}
 Output: [{"name": "unused_helper", "kind": "function", "file": "/path/src/utils.c",
           "signature": "void unused_helper(int x)", "line": 200}, …]
 ```
@@ -467,7 +501,7 @@ Use `exclude_paths` to skip vendor SDK code (LIKE patterns — `%` matches any s
 Most-called functions ranked by caller count.
 
 ```
-Input:  {"limit?": 20}
+Input:  {"project_root?": "/path/to/project", "limit?": 20, "project_only?": true, "exclude_paths?": ["lib/%"]}
 Output: [{"name": "log_debug", "kind": "function", "caller_count": 147, …},
          {"name": "millis", "kind": "function", "caller_count": 89, …}, …]
 ```
@@ -478,7 +512,7 @@ Find wrapper classes that call methods of a driver class. Useful for
 understanding adapter/wrapper architecture.
 
 ```
-Input:  {"class_name": "UART_DRIVER"}
+Input:  {"class_name": "UART_DRIVER", "project_root?": "/path/to/project", "limit?": 50}
 Output: [{"wrapper_class": "UART", "wrapper_method": "send",
           "driver_method": "UART_DRIVER::send", "file": "/path/src/uart.cpp",
           "line": 45, "ref_kind": "call"}, …]
@@ -492,7 +526,7 @@ Pass a fully-qualified class name (`hal::UART_DRIVER`) or just the bare name
 Trace how data of a given type flows to a target function. **Experimental.**
 
 ```
-Input:  {"type_name": "SensorData", "to_symbol": "uart_send"}
+Input:  {"type_name": "SensorData", "to_symbol": "uart_send", "project_root?": "/path/to/project", "max_depth?": 8, "limit?": 15}
 Output: [{"source_function": "sensor_read", "source_type": "SensorData",
           "file": "/path/src/sensor.cpp", "line": 120,
           "call_path": "sensor_read → pack_payload → uart_send"}, …]
@@ -512,7 +546,7 @@ Return the C++ inheritance hierarchy for a class or struct — direct bases
 this), with access level and virtual flag.
 
 ```
-Input:  {"class_name": "UART_DRIVER", "transitive?": false}
+Input:  {"class_name": "UART_DRIVER", "project_root?": "/path/to/project", "transitive?": false, "max_depth?": 10}
 Output: {"name": "UART_DRIVER", "qualified_name": "hal::UART_DRIVER",
          "kind": "class", "file": "/path/src/UART_DRIVER.h", "line": 45,
          "bases": [{"name": "SerialBase", "usr": "c:@...", "access": "public",
@@ -532,7 +566,7 @@ The `class_name` can be a bare name (`UART_DRIVER`) or qualified
 Return all methods, fields, and nested types of a class/struct grouped by kind.
 
 ```
-Input:  {"class_name": "ModemManager"}
+Input:  {"class_name": "ModemManager", "project_root?": "/path/to/project"}
 Output: {"name": "ModemManager", "qualified_name": "ns::ModemManager",
          "kind": "class", "file": "/path/src/modem.h", "line": 120,
          "members": {
@@ -555,7 +589,7 @@ methods. Returns `member_count: 0` for indexes predating this feature.
 Find concrete instantiations of a class or function template.
 
 ```
-Input:  {"template_name": "std::vector"}
+Input:  {"template_name": "std::vector", "project_root?": "/path/to/project", "limit?": 50}
 Output: {"template_name": "std::vector", "template_usr": "c:@...",
          "instance_count": 3,
          "instances": [{"name": "vector", "qualified_name": "std::vector<int>",
@@ -574,7 +608,7 @@ Show which virtual methods override which base-class methods, and which
 derived-class methods override this one.
 
 ```
-Input:  {"class_name::method_name": "UART_DRIVER::send"}
+Input:  {"method_name": "UART_DRIVER::send", "project_root?": "/path/to/project"}
 Output: {"method": "send", "qualified_name": "hal::UART_DRIVER::send",
          "kind": "method", "file": "/path/src/UART_DRIVER.cpp", "line": 88,
          "is_virtual": true, "is_pure_virtual": false,
@@ -593,7 +627,7 @@ non-virtual method or a method whose class has no ancestors, both
 Return the LLM-generated summary for a source file.
 
 ```
-Input:  {"file_path": "src/main.cpp"}
+Input:  {"file_path": "src/main.cpp", "project_root?": "/path/to/project"}
 Output: {"file": "/abs/path/src/main.cpp", "file_path": "src/main.cpp",
          "summary": "Main entry point — initializes the modem, sets up the
          sensor polling loop, and dispatches events to the UI task.",
@@ -636,7 +670,7 @@ Output: {"config_hash": "a1b2…", "project_id": "c3d4…", "project_root": "/pa
 Re-index a single file after editing.
 
 ```
-Input:  {"file_path": "/abs/path/to/src/main.c"}
+Input:  {"file_path": "/abs/path/to/src/main.c", "project_root?": "/path/to/project"}
 Output: {"file": "/abs/path/to/src/main.c", "translation_units": 1,
          "symbols_updated": 28, "elapsed_s": 2.5}
 ```
@@ -650,8 +684,8 @@ run `fw-context index` instead.
 Delete the index. Always dry-run first, then `confirm: true`.
 
 ```
-Input:  {"confirm": false}     → {"action": "dry_run", "symbol_count": 8586, …}
-Input:  {"confirm": true}      → {"action": "deleted", "message": "…"}
+Input:  {"project_root?": "/path/to/project", "confirm": false}     → {"action": "dry_run", "symbol_count": 8586, …}
+Input:  {"project_root?": "/path/to/project", "confirm": true}      → {"action": "deleted", "message": "…"}
 ```
 
 #### `list_projects`
@@ -659,7 +693,7 @@ Input:  {"confirm": true}      → {"action": "deleted", "message": "…"}
 List all indexed firmware projects.
 
 ```
-Input:  {}
+Input:  {"project_root?": "/path/to/project"}
 Output: [{"project_id": "a1b2…", "name": "my-zephyr-app", "root_path": "/path",
           "build_system": "zephyr", "symbol_count": 12430, "file_count": 1502,
           "indexed_at": "2026-06-05T09:35:18", "stale": false, "db": "…"}, …]
@@ -672,7 +706,7 @@ or when `explain_symbol` needs on-demand analysis (no pre-computed analysis
 available).
 
 ```
-Input:  {}
+Input:  {"project_root?": "/path/to/project"}
 Output: {"status": "ok", "ollama_running": true, "ollama_enabled": true,
          "configured_model": "qwen2.5-coder:14b", "num_ctx": 16384,
          "installed_models": ["qwen2.5-coder:14b", "mxbai-embed-large:latest"], …}
@@ -683,6 +717,60 @@ Returns `status: "disabled"` when `[llm] enabled = false` — no Ollama needed.
 Note: `explain_symbol` with pre-computed analysis (default) returns instantly
 and does not require Ollama at query time. `num_ctx` is 16384 by default to
 accommodate full function bodies during analysis generation.
+
+### MCP Resources
+
+Resources are read-only URI-addressable endpoints that return structured
+content (Markdown or JSON). Unlike tools, they take no JSON-RPC parameters
+(except `symbols/{name}` which takes a name path segment).
+
+#### `fw-context://stats`
+
+Markdown summary of all indexed projects — symbol counts, file counts,
+freshness, and index timestamps.
+
+```
+URI:    fw-context://stats
+Output: # fw-context — 3 project(s)
+
+        - **my-zephyr-app** (a1b2…) — 12430 symbols, 1502 files, indexed 2026-06-05T09:35:18, ✓ fresh
+        - **my-pio-app** (c3d4…) — 8586 symbols, 952 files, indexed 2026-06-04T16:20:45, ⚠ stale
+```
+
+Aggregates across all project databases under `~/.fw-context/index/`.
+Projects with errors are shown with an ERROR marker.
+
+#### `fw-context://projects`
+
+Same data as [`list_projects`](#list_projects), serialized as indented JSON.
+
+```
+URI:    fw-context://projects
+Output: [{"project_id": "a1b2…", "name": "my-zephyr-app", "symbol_count": 12430, …}, …]
+```
+
+#### `fw-context://symbols/{name}`
+
+Definition source of a symbol rendered as a Markdown document. Uses the same
+lookup as [`get_source`](#get_source).
+
+```
+URI:    fw-context://symbols/uart_init
+Output: # uart_init
+
+        - **qualified:** `drv::uart_init`
+        - **kind:** function
+        - **file:** `/path/src/uart.c:42`
+        - **signature:** `void uart_init(int baudrate)`
+
+        ```cpp
+        void uart_init(int baudrate) {
+          …
+        }
+        ```
+```
+
+When the symbol is not found, returns a JSON error object.
 
 ---
 
