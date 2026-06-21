@@ -76,6 +76,10 @@ def cmd_index(args: argparse.Namespace) -> int:
             False if getattr(args, 'no_embeddings', False)
             else getattr(args, 'embeddings', None) or cfg.index.index_embeddings
         ),
+        analyze_symbols=(
+            False if getattr(args, 'no_analyze', False)
+            else getattr(args, 'analyze', False) or cfg.llm.analyze_symbols
+        ),
         project_root=project_root,
         project_id=project_id,
         llm_config=cfg.llm,
@@ -656,6 +660,55 @@ def cmd_watch(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_analyze(args: argparse.Namespace) -> int:
+    """Re-run LLM symbol analysis on existing index (idempotent)."""
+    from .config import derive_project_id
+    from .config import load as load_config
+    from .indexer.db import get_active_config, open_db
+    from .indexer.runner import _build_llm_analysis
+
+    logging.basicConfig(
+        level=logging.DEBUG if args.verbose else logging.INFO,
+        format="%(asctime)s %(levelname)s %(message)s",
+        datefmt="%H:%M:%S",
+    )
+
+    project_root = Path(args.project or ".").resolve()
+    cfg = load_config(project_root=project_root)
+
+    if not cfg.llm.enabled:
+        print("error: [llm] enabled = false in config. Enable Ollama first.", file=sys.stderr)
+        return 1
+
+    project_id = derive_project_id(project_root)
+    db_path = cfg.index.db_dir / project_id / "index.db"
+
+    if not db_path.exists():
+        print(f"No index found for {project_root}. Run 'fw-context index' first.", file=sys.stderr)
+        return 1
+
+    conn = open_db(db_path)
+    try:
+        build_cfg = get_active_config(conn, project_id)
+        if not build_cfg:
+            print("No build config indexed.", file=sys.stderr)
+            return 1
+        config_hash = build_cfg["config_hash"]
+    finally:
+        conn.close()
+
+    # Re-open connection for the analysis (uses its own transactions)
+    conn = open_db(db_path)
+    try:
+        _build_llm_analysis(conn, config_hash, cfg.llm)
+        conn.commit()
+    finally:
+        conn.close()
+
+    print(f"LLM analysis complete for {project_root}")
+    return 0
+
+
 def cmd_version(args: argparse.Namespace) -> int:
     """Print version and exit."""
     from . import __version__
@@ -685,6 +738,9 @@ def main() -> None:
     p_index.add_argument("--no-refs", action="store_true", help="Skip cross-reference indexing (on by default)")
     p_index.add_argument("--no-embeddings", action="store_true", dest="no_embeddings", help="Skip embedding generation")
     p_index.add_argument("--embeddings", action="store_true", dest="embeddings", default=None, help="Generate symbol embeddings (default)")
+    p_index.add_argument("--analyze", action="store_true", dest="analyze", default=False,
+                         help="Generate LLM-based symbol analysis (summary, inputs, outputs)")
+    p_index.add_argument("--no-analyze", action="store_true", dest="no_analyze", help="Skip LLM analysis generation")
     p_index.set_defaults(func=cmd_index)
 
     p_search = sub.add_parser("search", help="Search indexed symbols")
@@ -726,6 +782,10 @@ def main() -> None:
     p_watch.add_argument("--debounce", type=int, default=2000, metavar="MS",
                          help="Debounce delay in ms (default: 2000)")
     p_watch.set_defaults(func=cmd_watch)
+
+    p_analyze = sub.add_parser("analyze", help="Re-run LLM symbol analysis on existing index (idempotent)")
+    p_analyze.add_argument("--project", metavar="DIR", help="Project root (default: cwd)")
+    p_analyze.set_defaults(func=cmd_analyze)
 
     p_version = sub.add_parser("version", help="Show version information")
     p_version.set_defaults(func=cmd_version)

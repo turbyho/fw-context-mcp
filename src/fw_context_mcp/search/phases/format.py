@@ -19,7 +19,7 @@ class FormatPhase(Phase):
         project_root = ctx.project_root
 
         def _fmt(r: dict) -> dict:
-            return {
+            item: dict = {
                 "name": r.get("name", ""),
                 "qualified_name": r.get("qualified_name", ""),
                 "kind": r.get("kind", ""),
@@ -29,6 +29,11 @@ class FormatPhase(Phase):
                 "signature": r.get("signature", ""),
                 "docstring": r.get("docstring", ""),
             }
+            for field in ("summary", "inputs", "outputs"):
+                val = r.get(field, "") or ""
+                if val:
+                    item[field] = val
+            return item
 
         results: list[dict] = []
 

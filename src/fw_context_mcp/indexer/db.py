@@ -138,6 +138,9 @@ _MIGRATION_ADD_COLUMNS = [
     "ALTER TABLE symbols ADD COLUMN file_path TEXT NOT NULL DEFAULT ''",
     "ALTER TABLE symbols ADD COLUMN name_tokens TEXT NOT NULL DEFAULT ''",
     "ALTER TABLE symbols ADD COLUMN enum_value INTEGER",
+    "ALTER TABLE symbols ADD COLUMN summary TEXT NOT NULL DEFAULT ''",
+    "ALTER TABLE symbols ADD COLUMN inputs TEXT NOT NULL DEFAULT ''",
+    "ALTER TABLE symbols ADD COLUMN outputs TEXT NOT NULL DEFAULT ''",
 ]
 
 _SCHEMA = """
@@ -199,25 +202,28 @@ CREATE VIRTUAL TABLE IF NOT EXISTS symbols_fts USING fts5(
     docstring,
     file_path,
     name_tokens,
+    summary,
+    inputs,
+    outputs,
     content='symbols',
     content_rowid='id'
 );
 
 CREATE TRIGGER IF NOT EXISTS symbols_ai AFTER INSERT ON symbols BEGIN
-    INSERT INTO symbols_fts(rowid, name, qualified_name, signature, docstring, file_path, name_tokens)
-    VALUES (new.id, new.name, new.qualified_name, new.signature, new.docstring, new.file_path, new.name_tokens);
+    INSERT INTO symbols_fts(rowid, name, qualified_name, signature, docstring, file_path, name_tokens, summary, inputs, outputs)
+    VALUES (new.id, new.name, new.qualified_name, new.signature, new.docstring, new.file_path, new.name_tokens, new.summary, new.inputs, new.outputs);
 END;
 
 CREATE TRIGGER IF NOT EXISTS symbols_ad AFTER DELETE ON symbols BEGIN
-    INSERT INTO symbols_fts(symbols_fts, rowid, name, qualified_name, signature, docstring, file_path, name_tokens)
-    VALUES ('delete', old.id, old.name, old.qualified_name, old.signature, old.docstring, old.file_path, old.name_tokens);
+    INSERT INTO symbols_fts(symbols_fts, rowid, name, qualified_name, signature, docstring, file_path, name_tokens, summary, inputs, outputs)
+    VALUES ('delete', old.id, old.name, old.qualified_name, old.signature, old.docstring, old.file_path, old.name_tokens, old.summary, old.inputs, old.outputs);
 END;
 
 CREATE TRIGGER IF NOT EXISTS symbols_au AFTER UPDATE ON symbols BEGIN
-    INSERT INTO symbols_fts(symbols_fts, rowid, name, qualified_name, signature, docstring, file_path, name_tokens)
-    VALUES ('delete', old.id, old.name, old.qualified_name, old.signature, old.docstring, old.file_path, old.name_tokens);
-    INSERT INTO symbols_fts(rowid, name, qualified_name, signature, docstring, file_path, name_tokens)
-    VALUES (new.id, new.name, new.qualified_name, new.signature, new.docstring, new.file_path, new.name_tokens);
+    INSERT INTO symbols_fts(symbols_fts, rowid, name, qualified_name, signature, docstring, file_path, name_tokens, summary, inputs, outputs)
+    VALUES ('delete', old.id, old.name, old.qualified_name, old.signature, old.docstring, old.file_path, old.name_tokens, old.summary, old.inputs, old.outputs);
+    INSERT INTO symbols_fts(rowid, name, qualified_name, signature, docstring, file_path, name_tokens, summary, inputs, outputs)
+    VALUES (new.id, new.name, new.qualified_name, new.signature, new.docstring, new.file_path, new.name_tokens, new.summary, new.inputs, new.outputs);
 END;
 
 -- Cross-reference / call graph (on by default; disable with [index] index_refs = false).
@@ -246,6 +252,18 @@ CREATE TABLE IF NOT EXISTS embeddings (
     updated_at   TEXT   NOT NULL DEFAULT (datetime('now'))
 );
 CREATE INDEX IF NOT EXISTS idx_embeddings_symbol ON embeddings(symbol_id);
+
+-- LLM analysis for structured symbol descriptions (opt-in via [llm] analyze_symbols = true).
+-- Pre-computed by Ollama during indexing: summary, inputs, outputs for each symbol.
+-- ON DELETE CASCADE: when a symbol row is deleted, its analysis is automatically removed.
+CREATE TABLE IF NOT EXISTS llm_analysis (
+    symbol_id    INTEGER PRIMARY KEY REFERENCES symbols(id) ON DELETE CASCADE,
+    summary      TEXT    NOT NULL DEFAULT '',
+    inputs       TEXT    NOT NULL DEFAULT '',
+    outputs      TEXT    NOT NULL DEFAULT '',
+    model        TEXT    NOT NULL,
+    analyzed_at  TEXT    NOT NULL DEFAULT (datetime('now'))
+);
 """
 
 CURRENT_SCHEMA_VERSION = _derive_schema_version(_SCHEMA, _MIGRATION_ADD_COLUMNS)
@@ -346,6 +364,74 @@ def open_db(path: Path) -> sqlite3.Connection:
             """)
             conn.commit()
 
+        # Migration: summary/inputs/outputs — backfill from llm_analysis table.
+        if conn.execute(
+            "SELECT COUNT(*) FROM symbols WHERE summary = ''"
+        ).fetchone()[0] > 0:
+            conn.execute(
+                """UPDATE symbols SET
+                       summary = COALESCE((SELECT a.summary FROM llm_analysis a WHERE a.symbol_id = symbols.id), ''),
+                       inputs = COALESCE((SELECT a.inputs FROM llm_analysis a WHERE a.symbol_id = symbols.id), ''),
+                       outputs = COALESCE((SELECT a.outputs FROM llm_analysis a WHERE a.symbol_id = symbols.id), '')
+                   WHERE id IN (SELECT symbol_id FROM llm_analysis)"""
+            )
+            conn.commit()
+
+        # Migration: FTS5 rebuild — add summary/inputs/outputs columns.
+        fts_cols2 = [r[1] for r in conn.execute("PRAGMA table_info(symbols_fts)").fetchall()]
+        if "summary" not in fts_cols2:
+            conn.executescript("""
+                DROP TRIGGER IF EXISTS symbols_ai;
+                DROP TRIGGER IF EXISTS symbols_ad;
+                DROP TRIGGER IF EXISTS symbols_au;
+                DROP TABLE IF EXISTS symbols_fts;
+            """)
+            conn.executescript("""
+                CREATE VIRTUAL TABLE symbols_fts USING fts5(
+                    name, qualified_name, signature, docstring, file_path, name_tokens,
+                    summary, inputs, outputs,
+                    content='symbols', content_rowid='id'
+                );
+                CREATE TRIGGER symbols_ai AFTER INSERT ON symbols BEGIN
+                    INSERT INTO symbols_fts(rowid, name, qualified_name, signature, docstring, file_path, name_tokens, summary, inputs, outputs)
+                    VALUES (new.id, new.name, new.qualified_name, new.signature, new.docstring, new.file_path, new.name_tokens, new.summary, new.inputs, new.outputs);
+                END;
+                CREATE TRIGGER symbols_ad AFTER DELETE ON symbols BEGIN
+                    INSERT INTO symbols_fts(symbols_fts, rowid, name, qualified_name, signature, docstring, file_path, name_tokens, summary, inputs, outputs)
+                    VALUES ('delete', old.id, old.name, old.qualified_name, old.signature, old.docstring, old.file_path, old.name_tokens, old.summary, old.inputs, old.outputs);
+                END;
+                CREATE TRIGGER symbols_au AFTER UPDATE ON symbols BEGIN
+                    INSERT INTO symbols_fts(symbols_fts, rowid, name, qualified_name, signature, docstring, file_path, name_tokens, summary, inputs, outputs)
+                    VALUES ('delete', old.id, old.name, old.qualified_name, old.signature, old.docstring, old.file_path, old.name_tokens, old.summary, old.inputs, old.outputs);
+                    INSERT INTO symbols_fts(rowid, name, qualified_name, signature, docstring, file_path, name_tokens, summary, inputs, outputs)
+                    VALUES (new.id, new.name, new.qualified_name, new.signature, new.docstring, new.file_path, new.name_tokens, new.summary, new.inputs, new.outputs);
+                END;
+            """)
+            conn.execute("""
+                INSERT INTO symbols_fts(rowid, name, qualified_name, signature, docstring, file_path, name_tokens, summary, inputs, outputs)
+                SELECT id, name, qualified_name, COALESCE(signature,''), COALESCE(docstring,''),
+                       COALESCE(file_path,''), COALESCE(name_tokens,''),
+                       COALESCE(summary,''), COALESCE(inputs,''), COALESCE(outputs,'')
+                FROM symbols
+            """)
+            conn.commit()
+
+    except sqlite3.OperationalError as e:
+        if "locked" in str(e).lower():
+            conn.close()
+            import time as _time
+            _time.sleep(2)
+            conn = sqlite3.connect(str(path))
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA busy_timeout = 30000")
+            conn.executescript(_SCHEMA)
+            for stmt in _MIGRATION_ADD_COLUMNS:
+                try: conn.execute(stmt); conn.commit()
+                except sqlite3.OperationalError as e2:
+                    if "duplicate column" not in str(e2): raise
+        else:
+            conn.close()
+            raise DatabaseCorruptionError(str(path), str(e)) from e
     except sqlite3.DatabaseError as e:
         conn.close()
         raise DatabaseCorruptionError(str(path), str(e)) from e
@@ -1457,6 +1543,74 @@ def get_file_map(
         "total_symbols": len(rows),
         "symbols": groups,
     }
+
+
+# ---------------------------------------------------------------------------
+# LLM analysis helpers — structured symbol descriptions from Ollama
+# ---------------------------------------------------------------------------
+
+def upsert_llm_analysis_batch(
+    conn: sqlite3.Connection,
+    rows: list[tuple[int, str, str, str, str]],
+) -> int:
+    """Insert or replace LLM analysis rows.
+
+    Each row: (symbol_id, summary, inputs, outputs, model).
+    Uses INSERT OR REPLACE so re-analysis is idempotent.
+    Cleans orphaned rows and syncs denormalized columns to symbols.
+    Returns number of rows inserted.
+    """
+    conn.execute(
+        """DELETE FROM llm_analysis WHERE symbol_id NOT IN (
+            SELECT id FROM symbols
+        )"""
+    )
+    cur = conn.executemany(
+        """INSERT OR REPLACE INTO llm_analysis(symbol_id, summary, inputs, outputs, model, analyzed_at)
+           VALUES (?, ?, ?, ?, ?, datetime('now'))""",
+        rows,
+    )
+    # Sync denormalized columns on symbols table for FTS5 indexing
+    conn.executemany(
+        """UPDATE symbols SET summary = ?, inputs = ?, outputs = ? WHERE id = ?""",
+        [(r[1], r[2], r[3], r[0]) for r in rows],
+    )
+    return cur.rowcount
+
+
+def get_llm_analysis_for_symbol(
+    conn: sqlite3.Connection,
+    symbol_id: int,
+) -> dict | None:
+    """Return the LLM analysis row for a single symbol, or None."""
+    row = conn.execute(
+        """SELECT summary, inputs, outputs, model, analyzed_at
+           FROM llm_analysis
+           WHERE symbol_id = ?""",
+        (symbol_id,),
+    ).fetchone()
+    if not row:
+        return None
+    return {
+        "summary": row["summary"],
+        "inputs": row["inputs"],
+        "outputs": row["outputs"],
+        "model": row["model"],
+        "analyzed_at": row["analyzed_at"],
+    }
+
+
+def count_llm_analysis(
+    conn: sqlite3.Connection,
+    config_hash: str,
+) -> int:
+    """Return how many symbols in a config have pre-computed LLM analysis."""
+    return conn.execute(
+        """SELECT COUNT(*) FROM llm_analysis a
+           JOIN symbols s ON s.id = a.symbol_id
+           WHERE s.config_hash = ?""",
+        (config_hash,),
+    ).fetchone()[0]
 
 
 def get_all_projects(conn: sqlite3.Connection) -> list[sqlite3.Row]:
