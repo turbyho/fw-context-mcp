@@ -580,13 +580,18 @@ def open_db(path: Path) -> sqlite3.Connection:
         elif "no such column" in str(e):
             # Old database — _SCHEMA contains CREATE INDEX statements that
             # reference columns (e.g. parent_usr) which don't exist yet.
-            # Run add-column migrations first, then retry _SCHEMA.
+            # Also possible: the DB predates newer tables entirely
+            # (file_analysis, inheritance, overrides) — executescript may
+            # have stopped before creating them.
+            # Strategy: apply add-column migrations (skip tables that don't
+            # exist yet), then retry _SCHEMA to create remaining tables
+            # and indexes.
             for stmt in _MIGRATION_ADD_COLUMNS:
                 try:
                     conn.execute(stmt)
                     conn.commit()
                 except sqlite3.OperationalError as e2:
-                    if "duplicate column" not in str(e2):
+                    if "duplicate column" not in str(e2) and "no such table" not in str(e2):
                         raise
             conn.executescript(_SCHEMA)
         else:
