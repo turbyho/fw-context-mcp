@@ -96,6 +96,7 @@ class Symbol:
     enum_value: int | None = None  # value of enum constant (ENUM_CONSTANT_DECL only)
     is_virtual: bool = False          # True for virtual CXX_METHOD
     is_pure_virtual: bool = False     # True for pure virtual (= 0) CXX_METHOD
+    parent_usr: str = ""    # USR of enclosing class/struct (empty for free functions)
 
 
 def _cursor_kind_label(kind: cx.CursorKind) -> str:
@@ -340,6 +341,16 @@ def extract_all(
         is_virtual = bool(cursor.is_virtual_method()) if cursor.kind == cx.CursorKind.CXX_METHOD else False
         is_pure = bool(cursor.is_pure_virtual_method()) if cursor.kind == cx.CursorKind.CXX_METHOD else False
 
+        # Parent class/struct USR — set for methods, fields, and nested types
+        parent_usr = ""
+        sem_parent = cursor.semantic_parent
+        if sem_parent and sem_parent.kind in (
+            cx.CursorKind.CLASS_DECL,
+            cx.CursorKind.STRUCT_DECL,
+            cx.CursorKind.CLASS_TEMPLATE,
+        ):
+            parent_usr = sem_parent.get_usr() or ""
+
         prev = seen_usrs.get(usr)
         if prev is not None:
             if is_def and not prev:
@@ -364,6 +375,7 @@ def extract_all(
             enum_value=enum_val,
             is_virtual=is_virtual,
             is_pure_virtual=is_pure,
+            parent_usr=parent_usr,
         ))
 
         # Collect class/struct definition cursors for inheritance extraction

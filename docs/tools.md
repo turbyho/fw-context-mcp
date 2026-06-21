@@ -503,6 +503,53 @@ from those functions to `to_symbol`. Does NOT resolve type transformations
 (e.g. CBOR encoding). Best used together with `find_call_path` to verify
 specific paths.
 
+### Class analysis
+
+#### `get_inheritance_chain`
+
+Return the C++ inheritance hierarchy for a class or struct — direct bases
+(what this inherits from) and direct derived classes (what inherits from
+this), with access level and virtual flag.
+
+```
+Input:  {"class_name": "UART_DRIVER", "transitive?": false}
+Output: {"name": "UART_DRIVER", "qualified_name": "hal::UART_DRIVER",
+         "kind": "class", "file": "/path/src/UART_DRIVER.h", "line": 45,
+         "bases": [{"name": "SerialBase", "usr": "c:@...", "access": "public",
+                     "is_virtual": false, "file": "/path/src/SerialBase.h"}],
+         "derived": [{"name": "UART", "usr": "c:@...", "access": "public",
+                       "is_virtual": false, "file": "/path/src/UART.h"}]}
+```
+
+When `transitive: true`, adds `all_bases` (ancestors BFS) and `all_derived`
+(descendants BFS) with `depth` and cycle detection for diamond inheritance.
+
+The `class_name` can be a bare name (`UART_DRIVER`) or qualified
+(`hal::UART_DRIVER`). Only classes and structs are valid targets.
+
+#### `get_class_members`
+
+Return all methods, fields, and nested types of a class/struct grouped by kind.
+
+```
+Input:  {"class_name": "ModemManager"}
+Output: {"name": "ModemManager", "qualified_name": "ns::ModemManager",
+         "kind": "class", "file": "/path/src/modem.h", "line": 120,
+         "members": {
+             "method": [{"name": "send", "qualified_name": "ns::ModemManager::send",
+                          "signature": "int send(const uint8_t*,size_t)",
+                          "is_virtual": false, "is_pure_virtual": false, "line": 150}, …],
+             "field": [{"name": "_baudrate", …}, …],
+             "constructor": [{"name": "ModemManager", …}],
+             "enum": [{"name": "State", …}]
+         },
+         "member_count": 12}
+```
+
+Members are ordered by kind then name. Shows the full API surface without
+opening the header file. Works for C structs too — they just won't have
+methods. Returns `member_count: 0` for indexes predating this feature.
+
 ### Index maintenance
 
 #### `get_active_build`
