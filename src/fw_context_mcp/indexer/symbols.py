@@ -21,6 +21,7 @@ _SYMBOL_KINDS = frozenset({
     cx.CursorKind.DESTRUCTOR,
     cx.CursorKind.CLASS_DECL,
     cx.CursorKind.CLASS_TEMPLATE,
+    cx.CursorKind.CLASS_TEMPLATE_PARTIAL_SPECIALIZATION,
     cx.CursorKind.STRUCT_DECL,
     cx.CursorKind.ENUM_DECL,
     cx.CursorKind.ENUM_CONSTANT_DECL,
@@ -110,6 +111,7 @@ def _cursor_kind_label(kind: cx.CursorKind) -> str:
         cx.CursorKind.DESTRUCTOR: "destructor",
         cx.CursorKind.CLASS_DECL: "class",
         cx.CursorKind.CLASS_TEMPLATE: "class",
+        cx.CursorKind.CLASS_TEMPLATE_PARTIAL_SPECIALIZATION: "class",
         cx.CursorKind.STRUCT_DECL: "struct",
         cx.CursorKind.ENUM_DECL: "enum",
         cx.CursorKind.ENUM_CONSTANT_DECL: "enum_constant",
@@ -339,9 +341,9 @@ def extract_all(
             except Exception:
                 enum_val = None
 
-        # Virtual method flags (CXX_METHOD only; False for all other kinds)
-        is_virtual = bool(cursor.is_virtual_method()) if cursor.kind == cx.CursorKind.CXX_METHOD else False
-        is_pure = bool(cursor.is_pure_virtual_method()) if cursor.kind == cx.CursorKind.CXX_METHOD else False
+        # Virtual method flags (CXX_METHOD and DESTRUCTOR; destructors can be virtual too)
+        is_virtual = bool(cursor.is_virtual_method()) if cursor.kind in (cx.CursorKind.CXX_METHOD, cx.CursorKind.DESTRUCTOR) else False
+        is_pure = bool(cursor.is_pure_virtual_method()) if cursor.kind in (cx.CursorKind.CXX_METHOD, cx.CursorKind.DESTRUCTOR) else False
 
         # Parent class/struct USR — set for methods, fields, and nested types
         parent_usr = ""
@@ -350,6 +352,7 @@ def extract_all(
             cx.CursorKind.CLASS_DECL,
             cx.CursorKind.STRUCT_DECL,
             cx.CursorKind.CLASS_TEMPLATE,
+            cx.CursorKind.CLASS_TEMPLATE_PARTIAL_SPECIALIZATION,
         ):
             parent_usr = sem_parent.get_usr() or ""
 
@@ -357,16 +360,26 @@ def extract_all(
         is_template = cursor.kind in (
             cx.CursorKind.CLASS_TEMPLATE,
             cx.CursorKind.FUNCTION_TEMPLATE,
+            cx.CursorKind.CLASS_TEMPLATE_PARTIAL_SPECIALIZATION,
         )
         template_usr = ""
         if not is_template:
-            # Check if this is an instantiation of a template
-            try:
-                specialized = cursor.specialized_template
-                if specialized is not None:
-                    template_usr = specialized.get_usr() or ""
-            except Exception:
-                pass  # specialized_template may fail for some cursor kinds
+            # Check if this is an instantiation of a template.  Only resolve
+            # for class/struct/function-level symbols — methods of template
+            # classes are excluded (the template_usr would point to the
+            # template method, not the template class, which is misleading).
+            _TEMPLATE_INSTANCE_KINDS = frozenset({
+                cx.CursorKind.CLASS_DECL,
+                cx.CursorKind.STRUCT_DECL,
+                cx.CursorKind.FUNCTION_DECL,
+            })
+            if cursor.kind in _TEMPLATE_INSTANCE_KINDS:
+                try:
+                    specialized = cursor.specialized_template
+                    if specialized is not None:
+                        template_usr = specialized.get_usr() or ""
+                except Exception:
+                    pass  # specialized_template may fail for some cursor kinds
 
         prev = seen_usrs.get(usr)
         if prev is not None:

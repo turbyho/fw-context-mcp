@@ -17,9 +17,13 @@ from fw_context_mcp.indexer.db import (
     get_class_members,
     get_direct_bases,
     get_direct_derived,
+    get_file_analysis_for_file,
     get_file_mtime_indexed,
     get_file_mtimes,
+    get_overrides_for_method,
+    get_template_instances,
     insert_inheritance_batch,
+    insert_overrides_batch,
     insert_refs_batch,
     insert_symbols_batch,
     open_db,
@@ -28,6 +32,7 @@ from fw_context_mcp.indexer.db import (
     transaction,
     upsert_build_config,
     upsert_file,
+    upsert_file_analysis_batch,
     upsert_project,
 )
 
@@ -841,3 +846,203 @@ class TestParentUsr:
         cols = [r[1] for r in conn.execute("PRAGMA table_info(symbols)").fetchall()]
         assert "parent_usr" in cols
         conn.close()
+
+
+class TestTemplateTracking:
+    """P2: template instantiation tracking — is_template flag, template_usr column."""
+
+    def test_is_template_flag_stored(self, populated_db):
+        """is_template is stored and retrievable."""
+        file_id = upsert_file(populated_db, "hash-deadbeef", "/tmp/vector.h", "cpp")
+        insert_symbols_batch(populated_db, [
+            ("hash-deadbeef", file_id, "src/vector.h",
+             split_tokens("vector", "std::vector"),
+             "U_tpl", "vector", "std::vector", "class",
+             10, 1, 50, 1, "", "", None, 0, 0, "", 1, ""),
+            ("hash-deadbeef", file_id, "src/main.cpp",
+             split_tokens("vector", "std::vector<int>"),
+             "U_inst", "vector", "std::vector<int>", "class",
+             42, 1, 0, 1, "", "", None, 0, 0, "", 0, "U_tpl"),
+        ])
+        row = populated_db.execute(
+            "SELECT is_template, template_usr FROM symbols WHERE usr=?",
+            ("U_tpl",),
+        ).fetchone()
+        assert row["is_template"] == 1
+        assert row["template_usr"] == ""
+
+        row2 = populated_db.execute(
+            "SELECT is_template, template_usr FROM symbols WHERE usr=?",
+            ("U_inst",),
+        ).fetchone()
+        assert row2["is_template"] == 0
+        assert row2["template_usr"] == "U_tpl"
+
+    def test_get_template_instances(self, populated_db):
+        """get_template_instances returns all instantiations of a template."""
+        file_id = upsert_file(populated_db, "hash-deadbeef", "/tmp/list.h", "cpp")
+        insert_symbols_batch(populated_db, [
+            # Template declaration
+            ("hash-deadbeef", file_id, "src/list.h",
+             split_tokens("list", "ns::list"),
+             "U_list_tpl", "list", "ns::list", "class",
+             5, 1, 100, 1, "", "", None, 0, 0, "", 1, ""),
+            # Two instantiations
+            ("hash-deadbeef", file_id, "src/list.h",
+             split_tokens("list", "ns::list<int>"),
+             "U_list_int", "list", "ns::list<int>", "class",
+             200, 1, 0, 1, "", "", None, 0, 0, "", 0, "U_list_tpl"),
+            ("hash-deadbeef", file_id, "src/widget.cpp",
+             split_tokens("list", "ns::list<Widget>"),
+             "U_list_widget", "list", "ns::list<Widget>", "class",
+             10, 5, 0, 1, "", "", None, 0, 0, "", 0, "U_list_tpl"),
+        ])
+        instances = get_template_instances(populated_db, "hash-deadbeef", "U_list_tpl")
+        assert len(instances) == 2
+        names = {r["qualified_name"] for r in instances}
+        assert names == {"ns::list<int>", "ns::list<Widget>"}
+
+    def test_get_template_instances_empty(self, populated_db):
+        """get_template_instances returns empty list for template with no instances."""
+        instances = get_template_instances(populated_db, "hash-deadbeef", "non_existent_usr")
+        assert instances == []
+
+    def test_template_usr_column_migration(self, tmpdir):
+        """template_usr column is added by migration on old databases."""
+        db_path = tmpdir / "test_migrate_tpl.db"
+        conn = open_db(db_path)
+        cols = [r[1] for r in conn.execute("PRAGMA table_info(symbols)").fetchall()]
+        assert "is_template" in cols
+        assert "template_usr" in cols
+        conn.close()
+
+
+class TestFileAnalysis:
+    """P3: file-level LLM analysis — upsert, query, and empty-result handling."""
+
+    def test_upsert_and_query(self, populated_db):
+        """upsert_file_analysis_batch stores analysis; get_file_analysis_for_file retrieves it."""
+        file_id = upsert_file(populated_db, "hash-deadbeef", "/tmp/main.cpp", "cpp")
+        upsert_file_analysis_batch(populated_db, [
+            (file_id, "Main entry point for the application.", "test-model"),
+        ])
+        result = get_file_analysis_for_file(populated_db, file_id)
+        assert result is not None
+        assert result["summary"] == "Main entry point for the application."
+        assert result["model"] == "test-model"
+        assert result["analyzed_at"] is not None
+
+    def test_no_analysis_for_unknown_file(self, populated_db):
+        """get_file_analysis_for_file returns None for files without analysis."""
+        result = get_file_analysis_for_file(populated_db, 99999)
+        assert result is None
+
+    def test_upsert_replaces_existing(self, populated_db):
+        """Re-upserting the same file_id replaces the old analysis."""
+        file_id = upsert_file(populated_db, "hash-deadbeef", "/tmp/foo.cpp", "cpp")
+        upsert_file_analysis_batch(populated_db, [
+            (file_id, "First summary.", "model-a"),
+        ])
+        upsert_file_analysis_batch(populated_db, [
+            (file_id, "Updated summary.", "model-b"),
+        ])
+        result = get_file_analysis_for_file(populated_db, file_id)
+        assert result is not None
+        assert result["summary"] == "Updated summary."
+        assert result["model"] == "model-b"
+
+    def test_file_analysis_table_exists(self, populated_db):
+        """file_analysis table exists in the database."""
+        tables = [
+            r[0] for r in populated_db.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()
+        ]
+        assert "file_analysis" in tables
+
+
+class TestOverrides:
+    """P3: method override tracking — insert, query, and unique constraint."""
+
+    def _insert_method(self, conn, file_id, name, qname, usr, parent_usr,
+                       is_virtual=1, is_pure=0, signature="void f()"):
+        """Helper to insert a single virtual method symbol."""
+        insert_symbols_batch(conn, [
+            ("hash-deadbeef", file_id, "src/test.cpp",
+             split_tokens(name, qname),
+             usr, name, qname, "method",
+             10, 1, 20, 1, signature, "", None,
+             is_virtual, is_pure, parent_usr, 0, ""),
+        ])
+
+    def _insert_class(self, conn, file_id, name, qname, usr):
+        """Helper to insert a class symbol."""
+        insert_symbols_batch(conn, [
+            ("hash-deadbeef", file_id, "src/test.cpp",
+             split_tokens(name, qname),
+             usr, name, qname, "class",
+             1, 1, 100, 1, "", "", None, 0, 0, "", 0, ""),
+        ])
+
+    def test_insert_and_query_overrides(self, populated_db):
+        """insert_overrides_batch stores; get_overrides_for_method retrieves."""
+        file_id = upsert_file(populated_db, "hash-deadbeef", "/tmp/test.cpp", "cpp")
+
+        # Class hierarchy: Derived → Base
+        self._insert_class(populated_db, file_id, "Base", "Base", "U_base")
+        self._insert_class(populated_db, file_id, "Derived", "Derived", "U_derived")
+        self._insert_method(populated_db, file_id, "foo", "Base::foo", "U_base_foo", "U_base")
+        self._insert_method(populated_db, file_id, "foo", "Derived::foo", "U_derived_foo", "U_derived")
+
+        insert_overrides_batch(populated_db, [
+            ("hash-deadbeef", "U_derived_foo", "U_base_foo"),
+        ])
+
+        # Query from derived perspective
+        info = get_overrides_for_method(populated_db, "hash-deadbeef", "U_derived_foo")
+        assert len(info["overrides"]) == 1
+        assert info["overrides"][0]["base_usr"] == "U_base_foo"
+        assert info["overrides"][0]["name"] == "foo"
+
+        # Query from base perspective
+        info2 = get_overrides_for_method(populated_db, "hash-deadbeef", "U_base_foo")
+        assert len(info2["overridden_by"]) == 1
+        assert info2["overridden_by"][0]["derived_usr"] == "U_derived_foo"
+
+    def test_no_overrides_for_non_virtual(self, populated_db):
+        """Method without overrides returns empty lists."""
+        file_id = upsert_file(populated_db, "hash-deadbeef", "/tmp/test.cpp", "cpp")
+        self._insert_class(populated_db, file_id, "Base", "Base", "U_base")
+        self._insert_method(populated_db, file_id, "bar", "Base::bar", "U_base_bar", "U_base")
+
+        info = get_overrides_for_method(populated_db, "hash-deadbeef", "U_base_bar")
+        assert info["overrides"] == []
+        assert info["overridden_by"] == []
+
+    def test_overrides_unique_constraint(self, populated_db):
+        """Inserting the same edge twice does not create duplicates."""
+        file_id = upsert_file(populated_db, "hash-deadbeef", "/tmp/test.cpp", "cpp")
+        self._insert_class(populated_db, file_id, "Base", "Base", "U_base")
+        self._insert_class(populated_db, file_id, "Derived", "Derived", "U_derived")
+        self._insert_method(populated_db, file_id, "foo", "Base::foo", "U_base_foo", "U_base")
+        self._insert_method(populated_db, file_id, "foo", "Derived::foo", "U_derived_foo", "U_derived")
+
+        # Insert same edge twice
+        insert_overrides_batch(populated_db, [
+            ("hash-deadbeef", "U_derived_foo", "U_base_foo"),
+        ])
+        insert_overrides_batch(populated_db, [
+            ("hash-deadbeef", "U_derived_foo", "U_base_foo"),
+        ])
+
+        info = get_overrides_for_method(populated_db, "hash-deadbeef", "U_derived_foo")
+        assert len(info["overrides"]) == 1  # not duplicated
+
+    def test_overrides_table_exists(self, populated_db):
+        """overrides table exists in the database."""
+        tables = [
+            r[0] for r in populated_db.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()
+        ]
+        assert "overrides" in tables

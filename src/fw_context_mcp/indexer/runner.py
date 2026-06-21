@@ -412,12 +412,15 @@ def _build_llm_analysis(conn, config_hash: str, llm_config) -> None:
     log.info("LLM analysis stored: %d symbols (model=%s)", total, model)
 
 
-def _build_file_analysis(conn, config_hash: str, llm_config) -> None:
+def _build_file_analysis(conn, config_hash: str, llm_config, extra_exclude_like: list[str] | None = None) -> None:
     """Generate file-level LLM analysis (2-3 sentence summaries) for project
     source files using Ollama in batches of 5.
 
     Uses the already-indexed symbols table to describe what each file is
     responsible for.  Only project files are analyzed (non-SDK).
+
+    *extra_exclude_like* are additional LIKE patterns (relative to project
+    root) to exclude, merged with the built-in SDK patterns.
     """
     import httpx
 
@@ -431,23 +434,26 @@ def _build_file_analysis(conn, config_hash: str, llm_config) -> None:
         log.warning("Ollama not reachable — skipping file analysis generation")
         return
 
-    # Gather files with their representative symbols (up to 30 per file)
-    with transaction(conn):
-        file_rows = conn.execute(
-            """SELECT f.id AS file_id, f.path,
+    # Gather files with their representative symbols (up to 30 per file).
+    # Built-in SDK exclusions cover common embedded ecosystems; project-specific
+    # exclude_paths (from .fw-context/config.toml) are appended.
+    _SDK_EXCLUDES = ["mbed-os/%", ".pio/%", "zephyr/%", "build/%", "modules/%"]
+    exclude_patterns = list(_SDK_EXCLUDES)
+    if extra_exclude_like:
+        exclude_patterns.extend(extra_exclude_like)
+    where_clauses = " AND ".join(["f.path NOT LIKE ?"] * len(exclude_patterns))
+    query = f"""SELECT f.id AS file_id, f.path,
                        COUNT(s.id) AS sym_count
                 FROM files f
                 JOIN symbols s ON s.file_id = f.id AND s.config_hash = ?
                 WHERE f.config_hash = ?
-                  AND f.path NOT LIKE 'mbed-os/%'
-                  AND f.path NOT LIKE '.pio/%'
-                  AND f.path NOT LIKE 'zephyr/%'
-                  AND f.path NOT LIKE 'build/%'
-                  AND f.path NOT LIKE 'modules/%'
+                  AND {where_clauses}
                   AND f.id NOT IN (SELECT file_id FROM file_analysis)
                 GROUP BY f.id
-                ORDER BY sym_count DESC""",
-            (config_hash, config_hash),
+                ORDER BY sym_count DESC"""
+    with transaction(conn):
+        file_rows = conn.execute(
+            query, (config_hash, config_hash, *exclude_patterns),
         ).fetchall()
         if not file_rows:
             log.info("All project files already analyzed — nothing to do")
@@ -533,6 +539,9 @@ def _extract_param_types(signature: str) -> str:
     params_str = signature[paren_start + 1:paren_end].strip()
     if not params_str:
         return ""
+    # In C++, foo(void) and foo() are semantically identical — normalize both to empty
+    if params_str == "void":
+        return ""
 
     # Split by top-level commas, strip parameter names (keep only types)
     parts: list[str] = []
@@ -572,8 +581,10 @@ def _extract_param_types(signature: str) -> str:
             stripped = last.lstrip("*&")
             # If what remains is a pure identifier (alphanumeric + underscores),
             # it's the parameter name — remove it, keeping any pointer/ref prefix
-            # on the type
-            if stripped and stripped.replace("_", "").isalnum():
+            # on the type.  But C++ type qualifiers (const, volatile, etc.) are
+            # NOT parameter names — keep them.
+            _CPP_TYPE_QUALIFIERS = frozenset({"const", "volatile", "constexpr", "noexcept"})
+            if stripped and stripped.replace("_", "").isalnum() and stripped not in _CPP_TYPE_QUALIFIERS:
                 ptr_prefix = last[:len(last) - len(stripped)]
                 if ptr_prefix:
                     # Pointer/ref on the name token (e.g. "*buf") — move markers
@@ -661,7 +672,9 @@ def _build_overrides(conn, config_hash: str) -> None:
             skipped_no_base += 1
             continue
 
-        # Find methods with the same name in any base class
+        # Find virtual methods with the same name in any base class.
+        # Only virtual/pure-virtual base methods can be overridden — non-virtual
+        # methods with the same signature are *hidden*, not overridden.
         placeholders = ",".join("?" * len(base_usrs))
         base_methods = conn.execute(
             f"""SELECT usr, signature, parent_usr, qualified_name
@@ -669,6 +682,7 @@ def _build_overrides(conn, config_hash: str) -> None:
                 WHERE config_hash = ?
                   AND name = ?
                   AND kind IN ('method', 'destructor')
+                  AND (is_virtual OR is_pure_virtual)
                   AND parent_usr IN ({placeholders})
                 ORDER BY qualified_name""",
             (config_hash, vrow["name"], *base_usrs),
@@ -687,8 +701,8 @@ def _build_overrides(conn, config_hash: str) -> None:
 
     if override_rows:
         with transaction(conn):
-            inserted = insert_overrides_batch(conn, override_rows)
-            total += inserted
+            insert_overrides_batch(conn, override_rows)
+            total += len(override_rows)
 
     log.info(
         "Overrides stored: %d relationships (%d virtual, %d no-base, %d no-match)",
@@ -862,7 +876,16 @@ def run(
     # File-level LLM analysis (opt-in, runs after symbol analysis)
     if analyze_files and llm_config is not None and llm_config.enabled:
         log.info("Generating file-level LLM analysis...")
-        _build_file_analysis(conn, config_hash, llm_config)
+        # Convert absolute exclude paths to LIKE patterns relative to project root
+        extra_like: list[str] = []
+        if exclude_paths:
+            for ep in exclude_paths:
+                try:
+                    rel = ep.resolve().relative_to(project_root)
+                    extra_like.append(str(rel) + "/%")
+                except ValueError:
+                    pass  # path not under project_root — skip
+        _build_file_analysis(conn, config_hash, llm_config, extra_exclude_like=extra_like)
         conn.commit()
 
     # Method override tracking (post-processing, no LLM needed)

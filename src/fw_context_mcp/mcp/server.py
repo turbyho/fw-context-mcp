@@ -70,7 +70,9 @@ mcp = FastMCP(
         "Inheritance: get_inheritance_chain (C++ class hierarchy — bases and "
         "derived classes), get_class_members (list all methods and fields of a "
         "class/struct), get_template_instances (find concrete instantiations "
-        "of a class or function template).\n\n"
+        "of a class or function template), get_method_overrides (show which "
+        "virtual methods override which base methods), get_file_analysis "
+        "(LLM-generated per-file summary).\n\n"
         "Maintenance: reindex_file (after editing a file), reset_index (destructive! "
         "re-index from scratch), check_ollama (before smart_search/explain_symbol/"
         "semantic_search), list_projects (discover indexed projects)."
@@ -535,7 +537,10 @@ def lookup_symbol(
                     "signature": r["signature"],
                     "docstring": r["docstring"],
                     "is_template": bool(r["is_template"]),
+                    "is_virtual": bool(r["is_virtual"]),
+                    "is_pure_virtual": bool(r["is_pure_virtual"]),
                     **({"template_usr": r["template_usr"]} if r["template_usr"] else {}),
+                    **({"parent_usr": r["parent_usr"]} if r["parent_usr"] else {}),
                     **({"enum_value": r["enum_value"]} if r["enum_value"] is not None else {}),
                     **({"summary": r["summary"]} if r["summary"] else {}),
                     **({"inputs": r["inputs"]} if r["inputs"] else {}),
@@ -719,13 +724,12 @@ def reindex_file(
     # (old rows deleted via ON DELETE CASCADE, new symbols inserted with new IDs).
     if cfg.llm.enabled and cfg.llm.analyze_symbols and total_symbols > 0:
         try:
-            from ..indexer.runner import _build_file_analysis, _build_llm_analysis, _build_overrides
+            from ..indexer.runner import _build_file_analysis, _build_llm_analysis
             conn2 = open_db(db_path)
             try:
                 _build_llm_analysis(conn2, config_hash, cfg.llm)
                 if cfg.llm.analyze_files:
                     _build_file_analysis(conn2, config_hash, cfg.llm)
-                _build_overrides(conn2, config_hash)
                 conn2.commit()
                 analyzed_count = conn2.execute(
                     "SELECT COUNT(*) FROM llm_analysis a JOIN symbols s ON s.id = a.symbol_id WHERE s.config_hash = ?",
@@ -736,6 +740,19 @@ def reindex_file(
                 conn2.close()
         except Exception as exc:
             result["analysis_warning"] = f"LLM analysis skipped: {exc}"
+
+    # Regenerate method override relationships (pure DB computation, no LLM).
+    if total_symbols > 0:
+        try:
+            from ..indexer.runner import _build_overrides
+            conn3 = open_db(db_path)
+            try:
+                _build_overrides(conn3, config_hash)
+                conn3.commit()
+            finally:
+                conn3.close()
+        except Exception as exc:
+            result["overrides_warning"] = f"Override analysis skipped: {exc}"
 
     if len(matching) == 1 and target.suffix.lower() in {".h", ".hpp"}:
         result["warning"] = "Header re-indexed via one TU. Other TUs including this header may still have stale symbols — run 'fw-context index' for full accuracy."
@@ -907,7 +924,14 @@ def get_source(
                 "line": row["line"],
                 "signature": row["signature"] or "",
                 "is_definition": bool(row["is_definition"]),
+                "is_template": bool(row["is_template"]),
+                "is_virtual": bool(row["is_virtual"]),
+                "is_pure_virtual": bool(row["is_pure_virtual"]),
             }
+            if row["template_usr"]:
+                result["template_usr"] = row["template_usr"]
+            if row["parent_usr"]:
+                result["parent_usr"] = row["parent_usr"]
             if row["enum_value"] is not None:
                 result["enum_value"] = row["enum_value"]
             # For enums, collect all constants with their values
@@ -1202,9 +1226,16 @@ def get_symbol_context(
         "line": row["line"],
         "signature": row["signature"] or "",
         "is_definition": bool(row["is_definition"]),
+        "is_template": bool(row["is_template"]),
+        "is_virtual": bool(row["is_virtual"]),
+        "is_pure_virtual": bool(row["is_pure_virtual"]),
         "callers": callers_list,
         "callees": callees_list,
     }
+    if row["template_usr"]:
+        result["template_usr"] = row["template_usr"]
+    if row["parent_usr"]:
+        result["parent_usr"] = row["parent_usr"]
     if row["enum_value"] is not None:
         result["enum_value"] = row["enum_value"]
     if enum_constants:
@@ -1779,6 +1810,7 @@ def get_inheritance_chain(
     class_name: Annotated[str, Field(description="Class or struct name to get inheritance information for. E.g. 'UART_DRIVER' or 'zbox::ZMODEM'.")],
     project_root: Annotated[str | None, Field(description="Project root. Auto-detected if omitted.")] = None,
     transitive: Annotated[bool, Field(description="When True, walk the full inheritance tree both up (ancestors) and down (descendants). Default: False (direct bases and derived only).")] = False,
+    max_depth: Annotated[int, Field(description="Maximum BFS depth for transitive walk (default 10).", ge=1, le=50)] = 10,
 ) -> dict:
     """Read-only. Return the C++ inheritance chain for a class or struct.
 
@@ -1787,8 +1819,8 @@ def get_inheritance_chain(
     flag for each edge.
 
     When ``transitive=True``, walks the full hierarchy up to all ancestors
-    and down to all descendants. Uses BFS with cycle detection to handle
-    diamond inheritance.
+    and down to all descendants (bounded by ``max_depth``). Uses BFS with
+    cycle detection to handle diamond inheritance.
 
     Returns:
         dict: {
@@ -1880,7 +1912,7 @@ def get_inheritance_chain(
                     })
                     grand_bases = get_direct_bases(conn, config_hash, cur_usr)
                     for gb in grand_bases:
-                        if gb["base_usr"] not in visited_up:
+                        if gb["base_usr"] not in visited_up and depth < max_depth:
                             queue_up.append((gb["base_usr"], gb["access"], gb["is_virtual"], depth + 1))
                 result["all_bases"] = all_bases
 
@@ -1910,7 +1942,7 @@ def get_inheritance_chain(
                     })
                     grand_derived = get_direct_derived(conn, config_hash, cur_usr)
                     for gd in grand_derived:
-                        if gd["derived_usr"] not in visited_down:
+                        if gd["derived_usr"] not in visited_down and depth < max_depth:
                             queue_down.append((gd["derived_usr"], gd["access"], gd["is_virtual"], depth + 1))
                 result["all_derived"] = all_derived
 
@@ -2286,7 +2318,14 @@ def search_code(
                     "is_definition": bool(r["is_definition"]),
                     "signature": r["signature"],
                     "docstring": r["docstring"],
+                    "is_template": bool(r["is_template"]),
+                    "is_virtual": bool(r["is_virtual"]),
+                    "is_pure_virtual": bool(r["is_pure_virtual"]),
                 }
+                if r["template_usr"]:
+                    d["template_usr"] = r["template_usr"]
+                if r["parent_usr"]:
+                    d["parent_usr"] = r["parent_usr"]
                 if r["enum_value"] is not None:
                     d["enum_value"] = r["enum_value"]
                 llm = (r["summary"] if "summary" in r.keys() else "") or ""
