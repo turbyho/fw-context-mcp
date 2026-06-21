@@ -80,8 +80,8 @@ def store_symbols_for_unit(
     # Upsert the TU file record
     upsert_file(conn, config_hash, file_path, unit.language, mtime=current_mtime)
 
-    total_syms = 0
-    total_refs = 0
+    syms_added = 0
+    refs_added = 0
 
     if syms:
         file_id_cache: dict[str, int] = {}
@@ -126,7 +126,8 @@ def store_symbols_for_unit(
                 int(s.is_template),
                 s.template_usr,
             ))
-        total_syms = insert_symbols_batch(conn, rows)
+        insert_symbols_batch(conn, rows)
+        syms_added = len(rows)
 
     # References
     if index_refs and refs:
@@ -141,7 +142,8 @@ def store_symbols_for_unit(
             (config_hash, r.to_usr, _rel(r.from_file), r.from_line, r.from_usr, r.ref_kind)
             for r in refs
         ]
-        total_refs = insert_refs_batch(conn, ref_rows)
+        insert_refs_batch(conn, ref_rows)
+        refs_added = len(ref_rows)
 
     # Inheritance
     if inheritance:
@@ -151,29 +153,4 @@ def store_symbols_for_unit(
         ]
         insert_inheritance_batch(conn, inheritance_rows)
 
-
-def unit_is_unchanged(
-    unit,
-    config_hash: str,
-    existing_files: dict[str, tuple[int, float]],
-    exclude_paths: list[Path],
-) -> bool:
-    """Return True if the TU's file hasn't changed since last index.
-
-    Checks: not excluded, exists, mtime hasn't changed.
-    """
-    resolved_tu = unit.file.resolve()
-    if any(resolved_tu == ep or resolved_tu.is_relative_to(ep) for ep in exclude_paths):
-        return True
-
-    file_path = str(unit.file)
-    if file_path not in existing_files:
-        return False
-
-    try:
-        current_mtime = unit.file.stat().st_mtime if unit.file.exists() else 0.0
-    except OSError:
-        current_mtime = 0.0
-
-    _, stored_mtime = existing_files[file_path]
-    return abs(current_mtime - stored_mtime) < 0.001
+    return syms_added, refs_added

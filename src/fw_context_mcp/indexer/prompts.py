@@ -18,6 +18,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+from pathlib import Path
 from typing import Any
 
 log = logging.getLogger(__name__)
@@ -277,10 +278,18 @@ def parse_file_analysis_response(
         summary = (entry.get("summary", "") or "").strip()
         if not summary:
             continue
-        # Match by path (exact or suffix)
+        # Match by path — exact first, then by unique basename, then suffix
         file_id = path_to_id.get(file_path)
         if file_id is None:
-            # Try suffix match
+            # Try basename match (only if unique in this batch)
+            basename_matches = [
+                (p, fid) for p, fid in path_to_id.items()
+                if Path(p).name == Path(file_path).name
+            ]
+            if len(basename_matches) == 1:
+                file_id = basename_matches[0][1]
+        if file_id is None:
+            # Last resort: suffix match (loose — may collide in large batches)
             for path, fid in path_to_id.items():
                 if path.endswith(file_path) or file_path.endswith(path):
                     file_id = fid

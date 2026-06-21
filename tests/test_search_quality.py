@@ -9,11 +9,36 @@ Kvalita se hodnotí podle:
 
 from __future__ import annotations
 
-import json
 import re
 import sqlite3
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
+
+_INDEX_ROOT = Path.home() / ".fw-context" / "index"
+
+
+def _discover_projects() -> dict[str, Path]:
+    """Return {label: db_path} for all indexed projects."""
+    projects: dict[str, Path] = {}
+    if not _INDEX_ROOT.exists():
+        return projects
+    for p in sorted(_INDEX_ROOT.iterdir()):
+        if not p.is_dir():
+            continue
+        db = p / "index.db"
+        if not db.exists():
+            continue
+        try:
+            conn = sqlite3.connect(str(db))
+            conn.row_factory = sqlite3.Row
+            name = conn.execute("SELECT name FROM projects LIMIT 1").fetchone()
+            conn.close()
+            label = f"{name['name']} ({p.name})" if name else p.name
+        except Exception:
+            label = p.name
+        projects[label] = db
+    return projects
 
 
 # ─── camelCase splitting ────────────────────────────────────────────
@@ -294,7 +319,6 @@ def evaluate(
     mbedos = sum(1 for p in paths if is_mbedos(p))
     other = len(rows) - zbox - mbedos
 
-    expected_lower = {e.lower() for e in expected}
     found_expected = []
     missed_expected = []
     for e in expected:
@@ -329,20 +353,24 @@ def evaluate(
 
 # ─── main ─────────────────────────────────────────────────────────────
 
-def main():
-    db_path = Path.home() / ".fw-context/index/452361ffbf84f774/index.db"
-    if not db_path.exists():
-        print(f"DB not found: {db_path}")
-        return
-
+def _evaluate_project(label: str, db_path: Path) -> None:
+    """Run query strategy evaluation on a single project."""
     conn = sqlite3.connect(str(db_path))
     conn.row_factory = sqlite3.Row
 
     cfg = conn.execute(
         "SELECT config_hash FROM build_configs ORDER BY created_at DESC LIMIT 1"
     ).fetchone()
+    if cfg is None:
+        print("  No build config found — skipping")
+        conn.close()
+        return
     config_hash = cfg["config_hash"]
-    print(f"config_hash: {config_hash}")
+
+    print(f"\n{'=' * 80}")
+    print(f"  Project: {label}")
+    print(f"  config_hash: {config_hash}")
+    print(f"{'=' * 80}")
 
     strategies = {
         "A-naive": lambda q: q,
@@ -351,15 +379,12 @@ def main():
         "D-hybrid": lambda q: expand_query_hybrid(q),
     }
 
-    print("\n" + "=" * 80)
-    print("QUERY STRATEGY EVALUATION")
-    print("=" * 80)
+    print("\n── QUERY STRATEGY EVALUATION ──")
 
     for tc in TEST_CASES:
         print(f"\n── Query: '{tc.query}' — {tc.description} ──")
         print(f"   Očekávané symboly: {tc.expected_names}")
 
-        best = None
         all_results = []
         for sname, sfn in strategies.items():
             expanded = sfn(tc.query)
@@ -368,10 +393,6 @@ def main():
                 conn, config_hash, expanded, tc.expected_names,
             )
             all_results.append(r)
-            z_ratio = r.zbox_count / max(r.total_results, 1)
-            score = len(r.expected_found) * 2 + r.zbox_count
-            if best is None or score > best[0]:
-                best = (score, r.name)
 
         for r in sorted(all_results, key=lambda x: len(x.expected_found) * 2 + x.zbox_count, reverse=True):
             z_ratio = r.zbox_count / max(r.total_results, 1)
@@ -416,12 +437,9 @@ def main():
     print("=" * 80)
     for tc in TEST_CASES:
         print(f"\n── Query: '{tc.query}' — {tc.description} ──")
-        # Simulace: query slova expandujeme na camelCase-split varianty
-        # a hledáme v existujícím indexu, zda by split varianta něco našla
         query_tokens = tc.query.lower().split()
         found_names = set()
         for qt in query_tokens:
-            # Hledáme FTS5 MATCH na qt* — co najde?
             try:
                 rows = conn.execute(
                     """SELECT s.name FROM symbols_fts
@@ -436,7 +454,6 @@ def main():
             except Exception:
                 pass
 
-        # Najdi symboly, které MATCHUJÍ splitnutý dotaz
         found_via_split = {}
         for qt in query_tokens:
             split_vars = tokenize_camel(qt)
@@ -453,7 +470,6 @@ def main():
                         (f"{sv}*", config_hash),
                     ).fetchall()
                     for r in rows:
-                        # Ověř, že by to split index skutečně trefil
                         name_tokens = tokenize_camel(r["name"])
                         if sv in name_tokens:
                             key = (r["name"], r["path"])
@@ -464,12 +480,27 @@ def main():
 
         print(f"   Nalezeno přes přímé tokeny:    {sorted(found_names)[:8]}")
         if found_via_split:
-            print(f"   NAVÍC přes camelCase split:    ")
+            print("   NAVÍC přes camelCase split:    ")
             for (name, path), token in sorted(found_via_split.items(), key=lambda x: x[0][0])[:8]:
                 src = "zbox" if is_zbox(path) else "mbed-os" if is_mbedos(path) else "other"
                 print(f"      {name:45s} [{src}] via '{token}*'")
 
     conn.close()
+
+
+def main():
+    projects = _discover_projects()
+
+    if not projects:
+        print("No indexed projects found in ~/.fw-context/index/")
+        print("Run 'fw-context index' in a firmware project first.")
+        sys.exit(0)
+
+    print(f"Found {len(projects)} project(s) in ~/.fw-context/index/")
+
+    for label, db_path in projects.items():
+        _evaluate_project(label, db_path)
+
     print("\nDone.")
 
 

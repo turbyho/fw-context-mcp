@@ -128,11 +128,16 @@ class Config:
     llm: LLMConfig = field(default_factory=LLMConfig)
 
     def source_root_paths(self, project_root: Path) -> list[Path]:
-        return [
-            (project_root / r).resolve()
-            for r in self.index.source_roots
-            if (project_root / r).exists()
-        ]
+        import logging
+        log = logging.getLogger(__name__)
+        result: list[Path] = []
+        for r in self.index.source_roots:
+            p = (project_root / r).resolve()
+            if p.exists():
+                result.append(p)
+            else:
+                log.warning("source_root %r does not exist — skipping", r)
+        return result
 
     def exclude_root_paths(self, project_root: Path) -> list[Path]:
         return [(project_root / p).resolve() for p in self.index.exclude_paths]
@@ -234,7 +239,7 @@ def _is_loopback_url(url: str) -> bool:
     from urllib.parse import urlparse
 
     host = (urlparse(url).hostname or "").lower()
-    return host in {"localhost", "::1"} or host.startswith("127.")
+    return host in {"localhost", "::1"} or host.startswith("127.") or host.startswith("::ffff:127.")
 
 
 def load(project_root: Path | None = None) -> Config:

@@ -9,6 +9,7 @@ Each supported AI assistant is registered with:
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
 from dataclasses import dataclass, field
@@ -79,8 +80,8 @@ symbol data. Do NOT pipe this structured output through lean-ctx compression
 Reading source files referenced by fw-context results IS fine with `ctx_read`
 — those are regular files on disk, not query output.
 
-When working on the `fw-context-mcp` source code itself
-(`~/dev/sw/work/tools/fw-context-mcp/`), do NOT use lean-ctx for C/C++ code.
+When working on the `fw-context-mcp` source code itself, do NOT use
+lean-ctx for C/C++ code.
 """
 
 NO_LEAN_CTX_CARVEOUT = """\
@@ -301,7 +302,6 @@ def check_target(target: InstructionTarget, project_root: Path | None = None) ->
         manifest = parent / ".skillshare-manifest.json"
         if manifest.exists():
             try:
-                import json
                 data = json.loads(manifest.read_text())
                 managed = data.get("managed", {})
                 if managed:  # Non-empty managed dict = skillshare active here
@@ -314,7 +314,10 @@ def check_target(target: InstructionTarget, project_root: Path | None = None) ->
     if not resolved.exists():
         return collision
 
-    content = resolved.read_text(encoding="utf-8")
+    try:
+        content = resolved.read_text(encoding="utf-8")
+    except (UnicodeDecodeError, OSError):
+        return collision
 
     # Check for marked section
     if MARKER_START in content and MARKER_END in content:

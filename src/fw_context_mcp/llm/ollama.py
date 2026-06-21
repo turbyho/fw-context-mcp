@@ -123,10 +123,20 @@ def call_ollama_embed(inputs: list[str], cfg: LLMConfig) -> list[list[float]]:
         "model": cfg.embed_model,
         "input": inputs,
     }
+    t0 = time.monotonic()
     try:
         resp = httpx.post(url, json=payload, timeout=_TIMEOUT * 2)
         resp.raise_for_status()
-        return resp.json()["embeddings"]
+        embeddings = resp.json()["embeddings"]
+        if cfg.debug_log:
+            _write_debug_log(cfg.debug_log, {
+                "ts": datetime.now(UTC).isoformat(),
+                "model": cfg.embed_model,
+                "latency_s": round(time.monotonic() - t0, 2),
+                "num_inputs": len(inputs),
+                "embedding_dims": [len(e) for e in embeddings],
+            })
+        return embeddings
     except httpx.HTTPStatusError as e:
         if e.response.status_code == 404:
             # Model not installed — pull it, then retry
@@ -134,7 +144,17 @@ def call_ollama_embed(inputs: list[str], cfg: LLMConfig) -> list[list[float]]:
             _pull_model(cfg.embed_model, cfg.ollama_url)
             resp = httpx.post(url, json=payload, timeout=_TIMEOUT * 2)
             resp.raise_for_status()
-            return resp.json()["embeddings"]
+            embeddings = resp.json()["embeddings"]
+            if cfg.debug_log:
+                _write_debug_log(cfg.debug_log, {
+                    "ts": datetime.now(UTC).isoformat(),
+                    "model": cfg.embed_model,
+                    "latency_s": round(time.monotonic() - t0, 2),
+                    "num_inputs": len(inputs),
+                    "embedding_dims": [len(e) for e in embeddings],
+                    "note": "pulled model first",
+                })
+            return embeddings
         raise OllamaError(f"Ollama HTTP {e.response.status_code}: {e.response.text[:200]}") from e
     except httpx.ConnectError as e:
         raise OllamaError(
@@ -142,7 +162,7 @@ def call_ollama_embed(inputs: list[str], cfg: LLMConfig) -> list[list[float]]:
             "Make sure Ollama is running: https://ollama.com"
         ) from e
     except httpx.TimeoutException:
-        raise OllamaError(f"Ollama embed request timed out") from None
+        raise OllamaError("Ollama embed request timed out") from None
     except OllamaError:
         raise
     except Exception as e:

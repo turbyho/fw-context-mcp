@@ -13,8 +13,12 @@ expensive merging in the subsequent deduplication phase.
 from __future__ import annotations
 
 import logging
+from typing import TYPE_CHECKING
 
 from fw_context_mcp.search.phases.base import Phase
+
+if TYPE_CHECKING:
+    from fw_context_mcp.search.context import PipelineContext
 
 log = logging.getLogger(__name__)
 
@@ -32,8 +36,7 @@ class EmbeddingPhase(Phase):
     def should_run(self, ctx) -> bool:
         return ctx.config.llm.enabled and ctx.ollama_warning is None
 
-    async def run(self, ctx):
-        import json
+    async def run(self, ctx: PipelineContext) -> PipelineContext:
 
         from fw_context_mcp.indexer.db import (
             get_embeddings,
@@ -79,15 +82,15 @@ class EmbeddingPhase(Phase):
 
                 # ---- Direct KNN path ----
                 if has_vec0:
-                    rows = search_similar_vec(
+                    vec_rows = search_similar_vec(
                         conn,
                         query_vec,
                         ctx.config_hash,
                         threshold=0.5,
                         limit=30,
                     )
-                    if rows:
-                        sym_ids = [r["symbol_id"] for r in rows]
+                    if vec_rows:
+                        sym_ids = [r["symbol_id"] for r in vec_rows]
                         placeholders = ",".join("?" * len(sym_ids))
                         emb_rows = conn.execute(
                             f"""SELECT * FROM symbols
@@ -117,6 +120,8 @@ class EmbeddingPhase(Phase):
                     return ctx.evolve(embedding_results=[dict(r) for r in emb_rows])
         finally:
             conn.close()
+
+        return ctx
 
 
 # ---------------------------------------------------------------------------
@@ -153,7 +158,7 @@ def _brute_force_search(
 
     scored: list[tuple[int, float]] = []
     for sym_id, emb_vec in stored.items():
-        dot = sum(x * y for x, y in zip(query_vec, emb_vec))
+        dot = sum(x * y for x, y in zip(query_vec, emb_vec, strict=True))
         norm_a = math.sqrt(sum(x * x for x in query_vec))
         norm_b = math.sqrt(sum(x * x for x in emb_vec))
         if norm_a == 0 or norm_b == 0:

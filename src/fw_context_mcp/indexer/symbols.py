@@ -467,6 +467,10 @@ def extract_all(
     # would create spurious "call"/"indirect" references to non-callable
     # targets, polluting call-graph queries like find_hotspots.
     _callable_kind_strs = frozenset({"function", "method", "constructor", "destructor"})
+    # Build qualified-name → USR map for template-obscured call resolution.
+    # Limitation: overloaded functions share the same qualified_name (e.g. two
+    # void send(int) / void send(char) specializations); the last one wins.
+    # In practice, overloaded function templates are rare in embedded C/C++.
     _qn_to_usr: dict[str, str] = {}
     for s in symbols:
         if s.qualified_name and s.kind in _callable_kind_strs:

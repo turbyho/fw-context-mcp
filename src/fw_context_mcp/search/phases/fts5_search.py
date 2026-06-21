@@ -3,8 +3,12 @@
 from __future__ import annotations
 
 import logging
+from typing import TYPE_CHECKING
 
 from fw_context_mcp.search.phases.base import Phase
+
+if TYPE_CHECKING:
+    from fw_context_mcp.search.context import PipelineContext
 
 log = logging.getLogger(__name__)
 
@@ -18,8 +22,8 @@ class FTS5SearchPhase(Phase):
 
     name = "fts5_search"
 
-    async def run(self, ctx):
-        from fw_context_mcp.indexer.db import open_db, search_symbols
+    async def run(self, ctx: PipelineContext) -> PipelineContext:
+        from fw_context_mcp.indexer.db import open_db
 
         queries = ctx.generated_queries if ctx.generated_queries else ctx.rough_queries
         fetch_limit = max(ctx.limit * 6, 120)
@@ -32,13 +36,28 @@ class FTS5SearchPhase(Phase):
 
 
 def _search_queries(conn, queries: list[str], config_hash: str, fetch_limit: int) -> list[dict]:
-    """Execute both OR query and name_tokens query, merge with dedup."""
+    """Execute both OR query and name_tokens query, merge with dedup.
+
+    The name_tokens column filter is applied to each space-separated token
+    individually — in FTS5, ``name_tokens : a b*`` would otherwise apply the
+    column filter only to ``a``, leaving ``b*`` unconstrained.
+    """
     if not queries:
         return []
 
     or_query = " OR ".join(queries)
-    nt_terms = [f"name_tokens : {kq}" for kq in queries]
-    nt_query = " OR ".join(nt_terms)
+
+    # FTS5 column-filter syntax applies only to the immediately following
+    # token.  Split multi-word queries so each token gets its own filter:
+    #   "modem init*" → "name_tokens : modem AND name_tokens : init*"
+    _nt_parts: list[str] = []
+    for kq in queries:
+        tokens = kq.split()
+        if len(tokens) >= 2:
+            _nt_parts.append(" AND ".join(f"name_tokens : {t}" for t in tokens))
+        else:
+            _nt_parts.append(f"name_tokens : {kq}")
+    nt_query = " OR ".join(f"({p})" if " AND " in p else p for p in _nt_parts)
 
     from fw_context_mcp.indexer.db import search_symbols
 
@@ -56,6 +75,6 @@ def _search_queries(conn, queries: list[str], config_hash: str, fetch_limit: int
                 elif r["is_definition"] and not rows[prev_idx].get("is_definition"):
                     rows[prev_idx] = dict(r)
         except Exception as e:
-            log.debug("FTS5 query failed (q=%r): %s", q[:60], e)
+            log.warning("FTS5 query failed (q=%r): %s", q[:60], e)
 
     return rows

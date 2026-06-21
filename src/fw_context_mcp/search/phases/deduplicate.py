@@ -2,8 +2,13 @@
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 from fw_context_mcp.search.phases.base import Phase
 from fw_context_mcp.search.scoring import score_result, stems_from_queries
+
+if TYPE_CHECKING:
+    from fw_context_mcp.search.context import PipelineContext
 
 
 class DeduplicatePhase(Phase):
@@ -13,7 +18,7 @@ class DeduplicatePhase(Phase):
 
     name = "deduplicate"
 
-    async def run(self, ctx):
+    async def run(self, ctx: PipelineContext) -> PipelineContext:
         queries = ctx.generated_queries if ctx.generated_queries else ctx.rough_queries
         stems = stems_from_queries(queries)
 
@@ -43,7 +48,8 @@ class DeduplicatePhase(Phase):
                 # Rescore
                 source_roots = ctx.config.index.source_roots if ctx.config else None
                 for i, (_, existing) in enumerate(scored):
-                    if existing.get("name") == name and existing.get("file_path") == r.get("file_path"):
+                    if (existing.get("name") == name
+                            and (existing.get("file_path") or "") == (r.get("file_path") or "")):
                         scored[i] = (score_result(r, stems, source_roots=source_roots), r)
                         break
 

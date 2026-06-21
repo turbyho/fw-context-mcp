@@ -14,7 +14,6 @@ from pathlib import Path
 
 from ..config.settings import derive_project_id
 from ..llm.ollama import call_ollama
-from ..utils import MTIME_TOLERANCE_S
 from .compile_commands import _SOURCE_EXTS
 from .compile_commands import parse as parse_compile_commands
 from .config_hash import compute as compute_config_hash
@@ -204,12 +203,12 @@ def _build_embeddings(conn, config_hash: str, llm_config) -> None:
             continue
 
         # Store in legacy BLOB table (backward compatibility)
-        blob_batch = [(r["id"], _vec_to_blob(emb), model) for r, emb in zip(chunk_rows, embs)]
+        blob_batch = [(r["id"], _vec_to_blob(emb), model) for r, emb in zip(chunk_rows, embs, strict=True)]
         upsert_embeddings(conn, blob_batch)
 
         # Store in vec0 table (sqlite-vec KNN search)
         try:
-            vec_batch = [(r["id"], config_hash, emb) for r, emb in zip(chunk_rows, embs)]
+            vec_batch = [(r["id"], config_hash, emb) for r, emb in zip(chunk_rows, embs, strict=True)]
             upsert_embeddings_vec(conn, vec_batch)
         except Exception as e:
             log.debug("vec0 batch insert failed (sqlite-vec may not be loaded): %s", e)

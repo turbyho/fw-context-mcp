@@ -22,14 +22,14 @@ def _build_registry() -> dict[str, Phase]:
     if _REGISTRY:
         return _REGISTRY
 
-    from fw_context_mcp.search.phases.translate import TranslatePhase
-    from fw_context_mcp.search.phases.rough_search import RoughSearchPhase
+    from fw_context_mcp.search.phases.deduplicate import DeduplicatePhase
+    from fw_context_mcp.search.phases.embedding import EmbeddingPhase
+    from fw_context_mcp.search.phases.format import FormatPhase
+    from fw_context_mcp.search.phases.fts5_search import FTS5SearchPhase
     from fw_context_mcp.search.phases.llm_query import LLMQueryPhase
     from fw_context_mcp.search.phases.refine import RefinePhase
-    from fw_context_mcp.search.phases.fts5_search import FTS5SearchPhase
-    from fw_context_mcp.search.phases.embedding import EmbeddingPhase
-    from fw_context_mcp.search.phases.deduplicate import DeduplicatePhase
-    from fw_context_mcp.search.phases.format import FormatPhase
+    from fw_context_mcp.search.phases.rough_search import RoughSearchPhase
+    from fw_context_mcp.search.phases.translate import TranslatePhase
 
     for cls in [
         TranslatePhase,
@@ -41,7 +41,7 @@ def _build_registry() -> dict[str, Phase]:
         DeduplicatePhase,
         FormatPhase,
     ]:
-        instance = cls()
+        instance = cls()  # type: ignore[abstract]
         _REGISTRY[instance.name] = instance
 
     return _REGISTRY
@@ -52,17 +52,13 @@ def _build_registry() -> dict[str, Phase]:
 
 @dataclass
 class PipelineConfig:
-    """Which phases to run, in what order, with what parameters.
+    """Which phases to run, in what order.
 
     Use the predefined constants ``SEARCH_CODE`` and ``SMART_SEARCH`` for
     standard configurations, or build a custom one.
     """
 
     phases: list[str] = field(default_factory=list)
-    fts5_limit: int = 20
-    embedding_threshold: float = 0.5
-    max_rough_samples: int = 20
-    cache_ttl: int = 300
 
 
 # Predefined pipelines

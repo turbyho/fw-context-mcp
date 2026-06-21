@@ -6,9 +6,9 @@ from pathlib import Path
 from fw_context_mcp.indexer.compile_commands import (
     _SOURCE_EXTS,
     _detect_language,
+    _detect_target_triple,
     _expand_response_file,
     _gcc_system_includes,
-    _detect_target_triple,
     _is_source_file,
     normalize_args,
     parse,

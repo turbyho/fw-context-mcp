@@ -4,9 +4,13 @@ from __future__ import annotations
 
 import json
 import re
+from typing import TYPE_CHECKING
 
 from fw_context_mcp.search.cache import keyword_cache
 from fw_context_mcp.search.phases.base import Phase
+
+if TYPE_CHECKING:
+    from fw_context_mcp.search.context import PipelineContext
 
 
 class LLMQueryPhase(Phase):
@@ -28,7 +32,7 @@ class LLMQueryPhase(Phase):
     def should_run(self, ctx) -> bool:
         return ctx.config.llm.enabled
 
-    async def run(self, ctx):
+    async def run(self, ctx: PipelineContext) -> PipelineContext:
         from fw_context_mcp.llm.ollama import OllamaError, OllamaModelNotFoundError, call_ollama_async
 
         cache_key = (ctx.query, ctx.config_hash)

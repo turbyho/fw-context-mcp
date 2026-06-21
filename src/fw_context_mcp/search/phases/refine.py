@@ -4,8 +4,12 @@ from __future__ import annotations
 
 import json
 import re
+from typing import TYPE_CHECKING
 
 from fw_context_mcp.search.phases.base import Phase
+
+if TYPE_CHECKING:
+    from fw_context_mcp.search.context import PipelineContext
 
 
 class RefinePhase(Phase):
@@ -28,7 +32,7 @@ class RefinePhase(Phase):
             and ctx.ollama_warning is None
         )
 
-    async def run(self, ctx):
+    async def run(self, ctx: PipelineContext) -> PipelineContext:
         from fw_context_mcp.llm.ollama import OllamaError, call_ollama_async
         from fw_context_mcp.search.cache import keyword_cache
 

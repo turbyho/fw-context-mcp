@@ -9,9 +9,16 @@ Falls back to FTS5 phrase/word search when embeddings or Ollama are unavailable.
 
 from __future__ import annotations
 
+import logging
 import re
+from typing import TYPE_CHECKING
 
 from fw_context_mcp.search.phases.base import Phase
+
+if TYPE_CHECKING:
+    from fw_context_mcp.search.context import PipelineContext
+
+log = logging.getLogger(__name__)
 
 # Words that add no search signal
 _STOP_WORDS = frozenset({
@@ -41,7 +48,7 @@ class RoughSearchPhase(Phase):
 
     name = "rough_search"
 
-    async def run(self, ctx):
+    async def run(self, ctx: PipelineContext) -> PipelineContext:
         from fw_context_mcp.indexer.db import open_db as _open_db
 
         query = ctx.query
@@ -49,7 +56,7 @@ class RoughSearchPhase(Phase):
 
         # Extract content words for FTS5 fallback — from both translated
         # and original query so local-language code names also match
-        raw_words = re.findall(r"\w+", query.lower(), re.UNICODE)
+        raw_words = re.findall(r"\w+", query.lower())
         content_words = [w for w in raw_words if w not in _STOP_WORDS and len(w) > 1]
         rough_terms: list[str] = content_words if content_words else [query]
 
@@ -100,6 +107,7 @@ async def _try_embedding_samples(ctx) -> list[dict] | None:
         )
         from fw_context_mcp.llm.ollama import OllamaError, call_ollama_embed
     except Exception:
+        log.warning("Embedding rough search unavailable — import failed", exc_info=True)
         return None
 
     conn = _open_db(ctx.db_path)
@@ -175,6 +183,7 @@ async def _try_embedding_samples(ctx) -> list[dict] | None:
 
             return None
     except Exception:
+        log.warning("Embedding rough search failed", exc_info=True)
         return None
     finally:
         conn.close()
