@@ -208,14 +208,14 @@ Description: {description}"""
 # ─── testovací sada ───────────────────────────────────────────────────
 
 @dataclass
-class TestCase:
+class QueryTestCase:
     query: str
     description: str
     expected_names: list[str] = field(default_factory=list)  # symboly, které by měly být nalezeny
 
 
 TEST_CASES = [
-    TestCase(
+    QueryTestCase(
         query="ble connect",
         description="BLE connection establishment and handling",
         expected_names=[
@@ -225,7 +225,7 @@ TEST_CASES = [
             "connectionHandle",
         ],
     ),
-    TestCase(
+    QueryTestCase(
         query="modem init",
         description="inicializace a nastavení modemu",
         expected_names=[
@@ -235,7 +235,7 @@ TEST_CASES = [
             "power_on",
         ],
     ),
-    TestCase(
+    QueryTestCase(
         query="key encrypt decrypt",
         description="key storage encryption decryption",
         expected_names=[
@@ -245,7 +245,7 @@ TEST_CASES = [
             "_encrypt_key",
         ],
     ),
-    TestCase(
+    QueryTestCase(
         query="watchdog refresh",
         description="watchdog timer refresh and management",
         expected_names=[
@@ -254,7 +254,7 @@ TEST_CASES = [
             "wdt_kick",
         ],
     ),
-    TestCase(
+    QueryTestCase(
         query="flash write read",
         description="flash memory write and read operations",
         expected_names=[
