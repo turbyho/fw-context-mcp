@@ -45,7 +45,7 @@ except ImportError:
 _INDEX_ROOT = Path.home() / ".fw-context" / "index"
 
 
-class TestResults:
+class CheckResults:
     """Per-run test statistics (avoids global mutable state)."""
 
     def __init__(self) -> None:
@@ -68,7 +68,7 @@ class TestResults:
             print(f"\n── {title}")
 
 
-_res = TestResults()
+_res = CheckResults()
 
 def _discover_projects():
     projects = {}
