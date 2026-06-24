@@ -28,6 +28,8 @@ import collections
 import logging
 import os
 import sqlite3
+import subprocess
+import threading
 import time
 from datetime import UTC, datetime
 from pathlib import Path
@@ -319,13 +321,14 @@ def _auto_reindex_stale(
     stale_files: list[str],
     project_root: Path,
     max_files: int = 5,
-    timeout_s: float = 30.0,
+    timeout_s: float = 120.0,
 ) -> tuple[list[str], list[str]]:
     """Re-index up to *max_files* stale files, bounded by *timeout_s*.
 
-    Returns (succeeded_files, failed_files). Each file is reindexed via
-    ``reindex_file``; errors are caught per-file so one failure doesn't
-    block the rest.
+    Calls ``_reindex_file_impl`` **without** LLM analysis or override
+    regeneration — those are left for the background ``fw-context index``
+    subprocess.  This keeps query-time recovery fast while the full
+    reindex (including LLM analysis) catches up in the background.
     """
     succeeded: list[str] = []
     failed: list[str] = []
@@ -334,14 +337,188 @@ def _auto_reindex_stale(
         if time.monotonic() - t0 > timeout_s:
             break
         try:
-            result = reindex_file(fp, str(project_root))
-            if "error" in result:
+            result = _reindex_file_impl(fp, project_root, with_analysis=False)
+            if result.get("error"):
                 failed.append(fp)
             else:
                 succeeded.append(fp)
         except Exception:
             failed.append(fp)
     return succeeded, failed
+
+
+# ── Background reindex ──────────────────────────────────────────────────────
+
+_bg_reindex_lock = threading.Lock()
+_bg_reindex_running: set[str] = set()  # project_ids with an active background reindex
+
+# ── File-watch daemon ───────────────────────────────────────────────────────
+
+_SOURCE_EXTS_WATCH = {".c", ".cpp", ".h", ".hpp"}
+
+
+def _start_bg_watcher(root: Path) -> None:
+    """Spawn a daemon thread that watches project sources and reindexes on change.
+
+    Two-phase approach:
+    1. **Immediate** — reindex changed files (symbols + refs, no LLM), debounced
+       at 500 ms so rapid IDE saves trigger at most one reindex per file.
+    2. **Quiet-period LLM** — after 60 s without changes, regenerate LLM symbol
+       analysis and file summaries for all symbols that lost their analysis
+       (idempotent — only unanalyzed symbols are processed).
+
+    Uses a pidfile (``<db_dir>/<project_id>/watcher.lock``) so only one
+    watcher runs per project, even across multiple MCP server instances.
+    """
+    db_path = _db_path(root)
+    if not db_path.exists():
+        return
+    lock_file = db_path.parent / "watcher.lock"
+
+    # Check for an existing live watcher
+    if lock_file.exists():
+        try:
+            stale_pid = int(lock_file.read_text().strip())
+            os.kill(stale_pid, 0)
+            log.debug("Watcher already running (pid %d), skipping.", stale_pid)
+            return
+        except (ProcessLookupError, ValueError, OSError):
+            pass  # Stale lock — take over
+
+    lock_file.write_text(str(os.getpid()))
+
+    def _watch_loop() -> None:
+        import re
+
+        from watchfiles import watch
+
+        from ..indexer.runner import _build_file_analysis, _build_llm_analysis
+
+        exclude_rx = re.compile(r"(/\.git/|/\.pio/|/build/|/__pycache__/|/node_modules/)")
+        debounce_s = 0.5
+        llm_quiet_s = 60.0  # Trigger LLM analysis after 60 s without changes
+        pending: dict[str, float] = {}
+        last_change: float = 0.0
+        any_changed = False
+
+        log.info("Background watcher started for %s", root)
+        try:
+            for changes in watch(
+                root, debounce=500, recursive=True,
+                rust_timeout=5000, yield_on_timeout=True,
+            ):
+                now = time.monotonic()
+                had_changes = False
+                for _, changed_path_str in changes:
+                    p = Path(changed_path_str)
+                    if p.suffix.lower() not in _SOURCE_EXTS_WATCH:
+                        continue
+                    if exclude_rx.search(changed_path_str):
+                        continue
+                    pending[changed_path_str] = now
+                    had_changes = True
+
+                # Phase 1 — immediate symbol reindex (debounced)
+                ready = [fp for fp, t in pending.items() if now - t >= debounce_s]
+                for fp in ready:
+                    del pending[fp]
+                    try:
+                        result = _reindex_file_impl(fp, str(root), with_analysis=False)
+                        if result.get("error"):
+                            log.debug("Watcher reindex skipped %s: %s", Path(fp).name, result["error"])
+                        else:
+                            log.debug("Watcher reindexed %s (%d symbols)", Path(fp).name, result.get("symbols_updated", 0))
+                    except Exception:
+                        log.debug("Watcher reindex failed for %s", Path(fp).name, exc_info=True)
+
+                if had_changes:
+                    last_change = now
+                    any_changed = True
+
+                # Phase 2 — LLM analysis after quiet period
+                if any_changed and pending == {} and now - last_change >= llm_quiet_s:
+                    any_changed = False
+                    try:
+                        conn = open_db(db_path)
+                        try:
+                            project_id = derive_project_id(root)
+                            cfg_data = get_active_config(conn, project_id)
+                            if cfg_data:
+                                cfg = load_config(project_root=root)
+                                if cfg.llm.enabled and cfg.llm.analyze_symbols:
+                                    _build_llm_analysis(conn, cfg_data["config_hash"], cfg.llm)
+                                    if cfg.llm.analyze_files:
+                                        _build_file_analysis(conn, cfg_data["config_hash"], cfg.llm)
+                                    conn.commit()
+                                    log.debug("Watcher LLM analysis completed for %s", root)
+                        finally:
+                            conn.close()
+                    except Exception:
+                        log.debug("Watcher LLM analysis failed", exc_info=True)
+
+        except Exception:
+            log.warning("Background watcher stopped unexpectedly", exc_info=True)
+        finally:
+            try:
+                lock_file.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+    t = threading.Thread(target=_watch_loop, daemon=True, name="fw-context-watcher")
+    t.start()
+    log.info("Background watcher thread started for %s (pid %d)", root, os.getpid())
+
+
+def _start_bg_reindex_if_stale(root: Path) -> None:
+    """Kick off a background ``fw-context index`` if files are stale.
+
+    No-op when no index exists, no stale files are present, or a background
+    reindex is already running for this project.  A daemon thread waits for
+    the subprocess and removes the project from ``_bg_reindex_running`` so
+    ``get_active_build`` can report accurately.
+    Queries continue to be served from the existing index while the new one
+    is being built.
+    """
+    global _bg_reindex_running
+    with _bg_reindex_lock:
+        db_path = _db_path(root)
+        if not db_path.exists():
+            return
+        conn, err = _open_db_safe(db_path)
+        if err:
+            return
+        assert conn is not None
+        try:
+            project_id = derive_project_id(root)
+            if project_id in _bg_reindex_running:
+                return
+            cfg = get_active_config(conn, project_id)
+            if not cfg:
+                return
+            modified = _count_modified_files(conn, cfg["config_hash"], root)
+            if modified == 0:
+                return
+            _bg_reindex_running.add(project_id)
+        finally:
+            conn.close()
+
+    log.info("Starting background reindex for %s (%d stale files)", root, modified)
+    proc = subprocess.Popen(
+        ["fw-context", "index"],
+        cwd=str(root),
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+    def _waiter() -> None:
+        proc.wait()
+        with _bg_reindex_lock:
+            global _bg_reindex_running
+            _bg_reindex_running.discard(project_id)
+        log.info("Background reindex finished for %s (exit %d)", root, proc.returncode)
+
+    t = threading.Thread(target=_waiter, daemon=True)
+    t.start()
 
 
 # ── Tools (non-search) ──────────────────────────────────────────────────────
@@ -362,6 +539,11 @@ def get_active_build(
     (``schema_version < current_schema``).  Cases (1) and (2) are handled
     transparently by auto-reindex on query; case (3) requires a full
     ``fw-context index`` — remind the user.
+
+    When ``modified_files_count > 0``, a background ``fw-context index``
+    subprocess is spawned automatically (non-blocking, at most one at a time).
+    Queries continue to be served from the existing index while the new one
+    is being built.
 
     Returns:
         dict: {config_hash, project_id, project_root, build_system,
@@ -420,6 +602,7 @@ def get_active_build(
                 "file_count": file_count,
                 "reference_count": ref_count,
                 "modified_files_count": modified_count,
+                "bg_reindex_running": project_id in _bg_reindex_running,
                 "schema_version": db_schema_ver,
                 "current_schema": CURRENT_SCHEMA_VERSION,
                 "analyzed_symbols": analyzed_count,
@@ -427,6 +610,8 @@ def get_active_build(
                 "stale": _is_stale(cfg, cfg["compile_commands_path"]) or modified_count > 0
                 or db_schema_ver < CURRENT_SCHEMA_VERSION,
             }
+        if modified_count > 0:
+            _start_bg_reindex_if_stale(root)
         return result
     finally:
         conn.close()
@@ -756,27 +941,17 @@ def reset_index(
 
 
 @mcp.tool()
-def reindex_file(
-    file_path: Annotated[str, Field(description="Path to source file to re-parse. Must be in compile_commands.json.")],
-    project_root: Annotated[str | None, Field(description="Project root. Auto-detected if omitted.")] = None,
+def _reindex_file_impl(
+    file_path: str,
+    project_root: str | None = None,
+    *,
+    with_analysis: bool = True,
 ) -> dict:
-    """Re-parse a single source file with libclang and update its symbols in the index.
+    """Core reindex logic shared by ``reindex_file`` and ``_auto_reindex_stale``.
 
-    Not read-only — uses the exact compiler flags from ``compile_commands.json``.
-    The file must be listed in ``compile_commands.json`` (headers are re-indexed
-    via the translation unit that includes them). Use after editing a file to
-    keep the index current without a full rebuild.
-
-    Also regenerates LLM analysis and method override relationships for
-    affected symbols when those features are enabled in config.
-
-    Args:
-        file_path: Path to source file to re-parse. Must be in compile_commands.json.
-        project_root: Project root directory. Auto-detected if omitted.
-
-    Returns:
-        dict: {file, translation_units, symbols_updated, elapsed_s,
-        analysis_updated (if LLM enabled), or error}.
+    Always re-parses the file with libclang and stores updated symbols/refs.
+    When *with_analysis* is True, also regenerates LLM symbol analysis,
+    file-level summaries, and method override relationships.
     """
     db_path, cfg, project_id, root = _resolve_context(project_root)
     if not db_path.exists():
@@ -829,8 +1004,11 @@ def reindex_file(
     finally:
         conn.close()
 
-    # Regenerate LLM analysis for any symbols that lost their analysis
-    # (old rows deleted via ON DELETE CASCADE, new symbols inserted with new IDs).
+    if not with_analysis:
+        return result
+
+    # ── LLM analysis (slow — skipped when with_analysis=False) ────────────
+
     if cfg.llm.enabled and cfg.llm.analyze_symbols and total_symbols > 0:
         try:
             from ..indexer.runner import _build_file_analysis, _build_llm_analysis
@@ -850,7 +1028,8 @@ def reindex_file(
         except Exception as exc:
             result["analysis_warning"] = f"LLM analysis skipped: {exc}"
 
-    # Regenerate method override relationships (pure DB computation, no LLM).
+    # ── Method override graph ─────────────────────────────────────────────
+
     if total_symbols > 0:
         try:
             from ..indexer.runner import _build_overrides
@@ -866,6 +1045,32 @@ def reindex_file(
     if len(matching) == 1 and target.suffix.lower() in {".h", ".hpp"}:
         result["warning"] = "Header re-indexed via one TU. Other TUs including this header may still have stale symbols — run 'fw-context index' for full accuracy."
     return result
+
+
+@mcp.tool()
+def reindex_file(
+    file_path: Annotated[str, Field(description="Path to source file to re-parse. Must be in compile_commands.json.")],
+    project_root: Annotated[str | None, Field(description="Project root. Auto-detected if omitted.")] = None,
+) -> dict:
+    """Re-parse a single source file with libclang and update its symbols in the index.
+
+    Not read-only — uses the exact compiler flags from ``compile_commands.json``.
+    The file must be listed in ``compile_commands.json`` (headers are re-indexed
+    via the translation unit that includes them). Use after editing a file to
+    keep the index current without a full rebuild.
+
+    Also regenerates LLM analysis and method override relationships for
+    affected symbols when those features are enabled in config.
+
+    Args:
+        file_path: Path to source file to re-parse. Must be in compile_commands.json.
+        project_root: Project root directory. Auto-detected if omitted.
+
+    Returns:
+        dict: {file, translation_units, symbols_updated, elapsed_s,
+        analysis_updated (if LLM enabled), or error}.
+    """
+    return _reindex_file_impl(file_path, project_root, with_analysis=True)
 
 
 @mcp.tool()
@@ -2999,5 +3204,18 @@ def resource_symbol(name: str) -> str:
 
 
 def main() -> None:
-    """Start the FastMCP stdio server — entry point for the ``fw-context-mcp`` command."""
+    """Start the FastMCP stdio server — entry point for the ``fw-context-mcp`` command.
+
+    On startup:
+    1. Spawns a file-watch daemon that reindexes changed source files on the fly.
+    2. If the CWD project index is stale, kicks off a background
+       ``fw-context index`` (including LLM analysis) so the index is fresh
+       by the time the AI agent makes its first query.
+    """
+    try:
+        root = resolve_project_root(None)
+        _start_bg_watcher(root)
+        _start_bg_reindex_if_stale(root)
+    except Exception:
+        pass  # Never block server startup
     mcp.run()
