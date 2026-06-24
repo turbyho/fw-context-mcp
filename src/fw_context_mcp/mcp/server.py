@@ -29,6 +29,7 @@ import logging
 import os
 import sqlite3
 import subprocess
+import sys
 import threading
 import time
 from datetime import UTC, datetime
@@ -504,7 +505,7 @@ def _start_bg_reindex_if_stale(root: Path) -> None:
 
     log.info("Starting background reindex for %s (%d stale files)", root, modified)
     proc = subprocess.Popen(
-        ["fw-context", "index"],
+        [sys.executable, "-m", "fw_context_mcp.cli", "index"],
         cwd=str(root),
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
@@ -602,7 +603,6 @@ def get_active_build(
                 "file_count": file_count,
                 "reference_count": ref_count,
                 "modified_files_count": modified_count,
-                "bg_reindex_running": project_id in _bg_reindex_running,
                 "schema_version": db_schema_ver,
                 "current_schema": CURRENT_SCHEMA_VERSION,
                 "analyzed_symbols": analyzed_count,
@@ -612,6 +612,9 @@ def get_active_build(
             }
         if modified_count > 0:
             _start_bg_reindex_if_stale(root)
+            result["bg_reindex_running"] = project_id in _bg_reindex_running
+        else:
+            result["bg_reindex_running"] = False
         return result
     finally:
         conn.close()
