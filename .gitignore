@@ -28,3 +28,6 @@ plans/
 htmlcov/
 .lean-ctx/
 work/
+
+# Manual test harness (not for git)
+test_tools/
