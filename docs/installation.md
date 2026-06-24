@@ -42,7 +42,7 @@ echo 'export PATH="/opt/homebrew/opt/python@3.12/libexec/bin:$PATH"' >> ~/.zshrc
 git clone git@github.com:turbyho/fw-context-mcp.git ~/.fw-context/src
 # or: git clone git@git.montyho.com:turbyho/fw-context-mcp.git ~/.fw-context/src
 
-# Install (creates venv, installs package, adds to PATH)
+# Install (creates venv, installs package, symlinks binaries into ~/.local/bin)
 cd ~/.fw-context/src && make install
 ```
 
