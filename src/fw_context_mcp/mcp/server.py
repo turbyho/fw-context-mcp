@@ -548,8 +548,8 @@ def _start_bg_reindex_if_stale(root: Path) -> None:
         proc = subprocess.Popen(
             [sys.executable, "-u", "-m", "fw_context_mcp.cli", "index"],
             cwd=str(root),
-            stdout=subprocess.DEVNULL,
-            stderr=open(log_file, "a"),
+            stdout=open(log_file, "a"),
+            stderr=subprocess.STDOUT,
             env={**os.environ, "PYTHONUNBUFFERED": "1"},
         )
     except Exception as exc:
