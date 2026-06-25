@@ -530,11 +530,12 @@ def _start_bg_reindex_if_stale(root: Path) -> None:
         return  # Another reindex started between _is_bg_reindex_running and now
 
     log.info("Starting background reindex for %s (%d stale files)", root, modified)
+    log_file = db_path.parent / "reindex.log"
     proc = subprocess.Popen(
         [sys.executable, "-m", "fw_context_mcp.cli", "index"],
         cwd=str(root),
         stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
+        stderr=open(log_file, "w"),
     )
 
     def _waiter() -> None:
@@ -577,13 +578,16 @@ def get_active_build(
     When ``modified_files_count > 0``, a background ``fw-context index``
     subprocess is spawned automatically (non-blocking, at most one at a time).
     Queries continue to be served from the existing index while the new one
-    is being built.
+    is being built.  ``reindex_progress`` contains the last log line from
+    the reindex subprocess when ``bg_reindex_running`` is True.
 
     Returns:
         dict: {config_hash, project_id, project_root, build_system,
         compile_commands, indexed_at (ISO timestamp), symbol_count, file_count,
         reference_count, modified_files_count (int), analyzed_symbols,
-        analysis_model (str or None), schema_version (int — DB schema version),
+        analysis_model (str or None), bg_reindex_running (bool),
+        reindex_progress (str or None — last log line when reindex is running),
+        schema_version (int — DB schema version),
         current_schema (int — code expects), stale (bool — any staleness condition)}
     """
     root = resolve_project_root(project_root)
@@ -645,7 +649,16 @@ def get_active_build(
             }
         if modified_count > 0:
             _start_bg_reindex_if_stale(root)
-        result["bg_reindex_running"] = _is_bg_reindex_running(root)
+        bg_running = _is_bg_reindex_running(root)
+        result["bg_reindex_running"] = bg_running
+        if bg_running:
+            log_file = db_path.parent / "reindex.log"
+            try:
+                with open(log_file) as fh:
+                    lines = fh.readlines()
+                    result["reindex_progress"] = lines[-1].strip() if lines else None
+            except (OSError, IndexError):
+                result["reindex_progress"] = None
         return result
     finally:
         conn.close()
