@@ -500,12 +500,18 @@ def _is_bg_reindex_running(root: Path) -> bool:
 
 
 def _start_bg_reindex_if_stale(root: Path) -> None:
-    """Kick off a background ``fw-context index`` if files are stale.
+    """Kick off a background ``fw-context index`` if files are stale or
+    symbols lack LLM analysis.
 
-    No-op when no index exists, no stale files are present, or a background
+    No-op when no index exists, no work is needed, or a background
     reindex is already running.  Uses ``fcntl.flock`` for concurrency control
     — the kernel releases the lock when the MCP server exits, so a crashed
     subprocess never leaves a stale lock.
+
+    The subprocess first reindexes changed files (fast for unchanged files
+    thanks to mtime comparison), then runs LLM symbol analysis for any
+    symbols that still need it.  If the process crashes during LLM analysis,
+    the next call detects the unanalyzed symbols and restarts.
     """
     if _is_bg_reindex_running(root):
         return
@@ -523,10 +529,37 @@ def _start_bg_reindex_if_stale(root: Path) -> None:
             if not cfg:
                 return
             modified = _count_modified_files(conn, cfg["config_hash"], root)
+            unanalyzed = 0
             if modified == 0:
-                return
+                # Check for definition symbols that still need LLM analysis —
+                # the background reindex may have crashed during _build_llm_analysis
+                # after the main indexing had already updated all file mtimes.
+                unanalyzed = conn.execute(
+                    """SELECT COUNT(*)
+                       FROM symbols s
+                       WHERE s.config_hash = ?
+                         AND s.is_definition = 1
+                         AND s.kind IN ('function', 'method', 'constructor',
+                                        'destructor', 'class', 'struct')
+                         AND s.file_path NOT LIKE 'mbed-os/%'
+                         AND s.file_path NOT LIKE '.pio/%'
+                         AND s.file_path NOT LIKE 'zephyr/%'
+                         AND s.file_path NOT LIKE 'build/%'
+                         AND s.file_path NOT LIKE 'modules/%'
+                         AND s.id NOT IN (SELECT symbol_id FROM llm_analysis)""",
+                    (cfg["config_hash"],),
+                ).fetchone()[0]
+                if unanalyzed == 0:
+                    return
     finally:
         conn.close()
+
+    reason_parts: list[str] = []
+    if modified > 0:
+        reason_parts.append(f"{modified} stale files")
+    if unanalyzed > 0:
+        reason_parts.append(f"{unanalyzed} unanalyzed symbols")
+    reason = ", ".join(reason_parts)
 
     lock_file = db_path.parent / "reindex.lock"
     log_file = db_path.parent / "reindex.log"
@@ -539,11 +572,11 @@ def _start_bg_reindex_if_stale(root: Path) -> None:
     # Write the first line so get_active_build() always has something to show
     try:
         with open(log_file, "w") as fh:
-            fh.write(f"Starting reindex of {modified} stale files...\n")
+            fh.write(f"Starting reindex ({reason})...\n")
     except OSError:
         pass
 
-    log.info("Starting background reindex for %s (%d stale files)", root, modified)
+    log.info("Starting background reindex for %s (%s)", root, reason)
     try:
         stdout_fh = open(log_file, "a")
         proc = subprocess.Popen(
@@ -656,6 +689,23 @@ def get_active_build(
                 (config_hash,),
             ).fetchone()
 
+            # Count definition symbols that still need LLM analysis
+            unanalyzed_count = conn.execute(
+                """SELECT COUNT(*)
+                   FROM symbols s
+                   WHERE s.config_hash = ?
+                     AND s.is_definition = 1
+                     AND s.kind IN ('function', 'method', 'constructor',
+                                    'destructor', 'class', 'struct')
+                     AND s.file_path NOT LIKE 'mbed-os/%'
+                     AND s.file_path NOT LIKE '.pio/%'
+                     AND s.file_path NOT LIKE 'zephyr/%'
+                     AND s.file_path NOT LIKE 'build/%'
+                     AND s.file_path NOT LIKE 'modules/%'
+                     AND s.id NOT IN (SELECT symbol_id FROM llm_analysis)""",
+                (config_hash,),
+            ).fetchone()[0]
+
             result: dict = {
                 "config_hash": config_hash,
                 "project_id": project_id,
@@ -670,11 +720,12 @@ def get_active_build(
                 "schema_version": db_schema_ver,
                 "current_schema": CURRENT_SCHEMA_VERSION,
                 "analyzed_symbols": analyzed_count,
+                "unanalyzed_symbols": unanalyzed_count,
                 "analysis_model": analysis_model_row["model"] if analysis_model_row else None,
                 "stale": _is_stale(cfg, cfg["compile_commands_path"]) or modified_count > 0
                 or db_schema_ver < CURRENT_SCHEMA_VERSION,
             }
-        if modified_count > 0:
+        if modified_count > 0 or unanalyzed_count > 0:
             _start_bg_reindex_if_stale(root)
         bg_running = _is_bg_reindex_running(root)
         result["bg_reindex_running"] = bg_running
