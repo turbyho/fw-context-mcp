@@ -363,34 +363,40 @@ def _build_llm_analysis(conn, config_hash: str, llm_config) -> None:
 
     for batch_num in range(0, len(rows), batch_size):
         batch = rows[batch_num:batch_num + batch_size]
-        batch_dicts = _enrich_batch(conn, batch, config_hash)
-        prompt = build_analysis_prompt(batch_dicts)
+        batch_idx = batch_num // batch_size
         try:
-            response = call_ollama(prompt, llm_config, temperature=0.1, num_predict=3000)
+            batch_dicts = _enrich_batch(conn, batch, config_hash)
+            prompt = build_analysis_prompt(batch_dicts)
+            try:
+                response = call_ollama(prompt, llm_config, temperature=0.1, num_predict=3000)
+            except Exception as e:
+                log.warning("LLM analysis batch %d failed: %s", batch_idx, e)
+                failed_ids.extend(r["id"] for r in batch)
+                continue
+
+            parsed = parse_analysis_response(response, batch_dicts)
+            if not parsed:
+                log.warning(
+                    "LLM analysis batch %d: no valid entries parsed from response",
+                    batch_idx,
+                )
+                failed_ids.extend(r["id"] for r in batch)
+                continue
+
+            with transaction(conn):
+                db_rows = [
+                    (r["symbol_id"], r["summary"], r["inputs"], r["outputs"], model)
+                    for r in parsed
+                ]
+                inserted = upsert_llm_analysis_batch(conn, db_rows)
+                total += inserted
+
+            if batch_idx % 5 == 0:
+                log.info("  batch %d/%d: %d stored", batch_idx + 1, batches, total)
         except Exception as e:
-            log.warning("LLM analysis batch %d failed: %s", batch_num // batch_size, e)
+            log.warning("LLM analysis batch %d crashed: %s", batch_idx, e)
             failed_ids.extend(r["id"] for r in batch)
             continue
-
-        parsed = parse_analysis_response(response, batch_dicts)
-        if not parsed:
-            log.warning(
-                "LLM analysis batch %d: no valid entries parsed from response",
-                batch_num // batch_size,
-            )
-            failed_ids.extend(r["id"] for r in batch)
-            continue
-
-        with transaction(conn):
-            db_rows = [
-                (r["symbol_id"], r["summary"], r["inputs"], r["outputs"], model)
-                for r in parsed
-            ]
-            inserted = upsert_llm_analysis_batch(conn, db_rows)
-            total += inserted
-
-        if (batch_num // batch_size) % 5 == 0:
-            log.info("  batch %d/%d: %d stored", batch_num // batch_size + 1, batches, total)
 
     # ── Phase 2: retry failed symbols individually ───────────────────────
     if failed_ids:
