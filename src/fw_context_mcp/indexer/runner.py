@@ -14,6 +14,7 @@ from pathlib import Path
 
 from ..config.settings import derive_project_id
 from ..llm.ollama import call_ollama
+from ..utils import MTIME_TOLERANCE_S
 from .compile_commands import _SOURCE_EXTS
 from .compile_commands import parse as parse_compile_commands
 from .config_hash import compute as compute_config_hash
@@ -761,7 +762,7 @@ def _process_unit(unit, config_hash, project_root, source_roots, exclude_paths, 
             current_mtime = unit.file.stat().st_mtime if unit.file.exists() else 0.0
         except OSError:
             current_mtime = 0.0
-        if abs(current_mtime - stored_mtime) < 0.001:
+        if current_mtime <= stored_mtime + MTIME_TOLERANCE_S:
             return ("unchanged", 0, 0)
 
     conn = open_db(db_path)

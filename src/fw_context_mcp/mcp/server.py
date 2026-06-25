@@ -545,13 +545,15 @@ def _start_bg_reindex_if_stale(root: Path) -> None:
 
     log.info("Starting background reindex for %s (%d stale files)", root, modified)
     try:
+        stdout_fh = open(log_file, "a")
         proc = subprocess.Popen(
-            [sys.executable, "-u", "-m", "fw_context_mcp.cli", "index"],
+            [sys.executable, "-u", "-m", "fw_context_mcp.cli", "index", "--no-build"],
             cwd=str(root),
-            stdout=open(log_file, "a"),
+            stdout=stdout_fh,
             stderr=subprocess.STDOUT,
             env={**os.environ, "PYTHONUNBUFFERED": "1"},
         )
+        stdout_fh.close()  # Close parent copy — child has its own fd
     except Exception as exc:
         log.exception("Failed to spawn background reindex subprocess")
         try:
