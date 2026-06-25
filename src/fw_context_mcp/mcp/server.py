@@ -350,9 +350,6 @@ def _auto_reindex_stale(
 
 # ── Background reindex ──────────────────────────────────────────────────────
 
-_bg_reindex_lock = threading.Lock()
-_bg_reindex_running: set[str] = set()  # project_ids with an active background reindex
-
 # ── File-watch daemon ───────────────────────────────────────────────────────
 
 _SOURCE_EXTS_WATCH = {".c", ".cpp", ".h", ".hpp"}
@@ -470,39 +467,60 @@ def _start_bg_watcher(root: Path) -> None:
     log.info("Background watcher thread started for %s (pid %d)", root, os.getpid())
 
 
+def _is_bg_reindex_running(root: Path) -> bool:
+    """Check whether a background ``fw-context index`` is running for *root*.
+
+    Uses a pidfile (``<db_dir>/<project_id>/reindex.lock``) — same pattern
+    as the watcher.  Stale locks are cleaned up automatically.
+    """
+    db_path = _db_path(root)
+    if not db_path.exists():
+        return False
+    lock_file = db_path.parent / "reindex.lock"
+    if not lock_file.exists():
+        return False
+    try:
+        pid = int(lock_file.read_text().strip())
+        os.kill(pid, 0)
+        return True
+    except (ProcessLookupError, ValueError, OSError):
+        try:
+            lock_file.unlink(missing_ok=True)
+        except OSError:
+            pass
+        return False
+
+
 def _start_bg_reindex_if_stale(root: Path) -> None:
     """Kick off a background ``fw-context index`` if files are stale.
 
     No-op when no index exists, no stale files are present, or a background
-    reindex is already running for this project.  A daemon thread waits for
-    the subprocess and removes the project from ``_bg_reindex_running`` so
-    ``get_active_build`` can report accurately.
-    Queries continue to be served from the existing index while the new one
-    is being built.
+    reindex is already running.  The subprocess is fire-and-forget — a
+    pidfile (``reindex.lock``) prevents concurrent runs per project.
+    Stale locks are detected by ``os.kill(pid, 0)`` liveness check.
     """
-    global _bg_reindex_running
-    with _bg_reindex_lock:
-        db_path = _db_path(root)
-        if not db_path.exists():
-            return
-        conn, err = _open_db_safe(db_path)
-        if err:
-            return
-        assert conn is not None
-        try:
+    if _is_bg_reindex_running(root):
+        return
+    db_path = _db_path(root)
+    if not db_path.exists():
+        return
+    conn, err = _open_db_safe(db_path)
+    if err:
+        return
+    assert conn is not None
+    try:
+        with conn:
             project_id = derive_project_id(root)
-            if project_id in _bg_reindex_running:
-                return
             cfg = get_active_config(conn, project_id)
             if not cfg:
                 return
             modified = _count_modified_files(conn, cfg["config_hash"], root)
             if modified == 0:
                 return
-            _bg_reindex_running.add(project_id)
-        finally:
-            conn.close()
+    finally:
+        conn.close()
 
+    lock_file = db_path.parent / "reindex.lock"
     log.info("Starting background reindex for %s (%d stale files)", root, modified)
     proc = subprocess.Popen(
         [sys.executable, "-m", "fw_context_mcp.cli", "index"],
@@ -510,16 +528,7 @@ def _start_bg_reindex_if_stale(root: Path) -> None:
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
-
-    def _waiter() -> None:
-        proc.wait()
-        with _bg_reindex_lock:
-            global _bg_reindex_running
-            _bg_reindex_running.discard(project_id)
-        log.info("Background reindex finished for %s (exit %d)", root, proc.returncode)
-
-    t = threading.Thread(target=_waiter, daemon=True)
-    t.start()
+    lock_file.write_text(str(proc.pid))
 
 
 # ── Tools (non-search) ──────────────────────────────────────────────────────
@@ -612,9 +621,7 @@ def get_active_build(
             }
         if modified_count > 0:
             _start_bg_reindex_if_stale(root)
-            result["bg_reindex_running"] = project_id in _bg_reindex_running
-        else:
-            result["bg_reindex_running"] = False
+        result["bg_reindex_running"] = _is_bg_reindex_running(root)
         return result
     finally:
         conn.close()
