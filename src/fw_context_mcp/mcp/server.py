@@ -523,6 +523,7 @@ def _start_bg_reindex_if_stale(root: Path) -> None:
         conn.close()
 
     lock_file = db_path.parent / "reindex.lock"
+    log_file = db_path.parent / "reindex.log"
     try:
         lock_fd = os.open(lock_file, os.O_CREAT | os.O_RDWR)
         fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -530,13 +531,24 @@ def _start_bg_reindex_if_stale(root: Path) -> None:
         return  # Another reindex started between _is_bg_reindex_running and now
 
     log.info("Starting background reindex for %s (%d stale files)", root, modified)
-    log_file = db_path.parent / "reindex.log"
-    proc = subprocess.Popen(
-        [sys.executable, "-m", "fw_context_mcp.cli", "index"],
-        cwd=str(root),
-        stdout=subprocess.DEVNULL,
-        stderr=open(log_file, "w"),
-    )
+    try:
+        proc = subprocess.Popen(
+            [sys.executable, "-u", "-m", "fw_context_mcp.cli", "index"],
+            cwd=str(root),
+            stdout=subprocess.DEVNULL,
+            stderr=open(log_file, "w"),
+            env={**os.environ, "PYTHONUNBUFFERED": "1"},
+        )
+    except Exception as exc:
+        log.exception("Failed to spawn background reindex subprocess")
+        try:
+            with open(log_file, "a") as fh:
+                fh.write(f"Failed to spawn: {exc}\n")
+        except OSError:
+            pass
+        fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        os.close(lock_fd)
+        return
 
     def _waiter() -> None:
         try:
