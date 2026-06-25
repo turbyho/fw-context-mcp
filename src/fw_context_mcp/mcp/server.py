@@ -1072,11 +1072,43 @@ def _reindex_file_impl(
     *,
     with_analysis: bool = True,
 ) -> dict:
-    """Core reindex logic shared by ``reindex_file`` and ``_auto_reindex_stale``.
+    """Re-parse a single source file with libclang and update its symbols in the index.
 
-    Always re-parses the file with libclang and stores updated symbols/refs.
-    When *with_analysis* is True, also regenerates LLM symbol analysis,
-    file-level summaries, and method override relationships.
+    Shared implementation used by ``reindex_file`` (public tool, full analysis) and
+    ``_auto_reindex_stale`` (background fast path, no LLM). Prefer ``reindex_file``
+    for interactive use; call this directly only when you need to control
+    *with_analysis* explicitly.
+
+    Requires an existing index (``fw-context index`` must have been run first).
+    The file must appear in ``compile_commands.json`` — header-only files are
+    re-indexed via the ``.cpp`` translation unit that includes them.
+
+    Args:
+        file_path: Absolute or project-relative path to the source file to
+            re-parse. Must have a matching entry in compile_commands.json.
+        project_root: Project root directory. Auto-detected from cwd if omitted.
+        with_analysis: When True (default), also regenerates LLM symbol analysis,
+            file-level summaries, and method override relationships — slower but
+            produces a fully up-to-date index. Set to False for a fast
+            symbol-only update (used by background auto-reindex).
+
+    Returns:
+        On success — dict with keys:
+            file (str): Resolved absolute path to the re-indexed file.
+            translation_units (int): Number of TUs that include this file.
+            symbols_updated (int): Number of symbols written/updated.
+            elapsed_s (float): Parse + store time in seconds.
+            analysis_updated (int, optional): Symbol count with fresh LLM
+                analysis (only present when LLM analysis is enabled and
+                with_analysis=True).
+            analysis_warning (str, optional): Reason LLM analysis was skipped.
+            overrides_warning (str, optional): Reason override analysis was skipped.
+            warning (str, optional): Header re-indexed via a single TU — other
+                TUs including this header may still have stale symbols; run
+                ``fw-context index`` for full accuracy.
+        On error — dict with key:
+            error (str): Human-readable reason (no index found, file not found,
+                file not in compile_commands.json, no build config indexed).
     """
     db_path, cfg, project_id, root = _resolve_context(project_root)
     if not db_path.exists():
