@@ -379,8 +379,14 @@ def _start_bg_watcher(root: Path) -> None:
         try:
             stale_pid = int(lock_file.read_text().strip())
             os.kill(stale_pid, 0)
-            log.debug("Watcher already running (pid %d), skipping.", stale_pid)
-            return
+            # PID exists — but if the lock file is older than 24 h,
+            # the watcher is stale regardless (e.g. old MCP server
+            # left running across sessions).
+            lock_age_s = time.time() - lock_file.stat().st_mtime
+            if lock_age_s < 86400:
+                log.debug("Watcher already running (pid %d), skipping.", stale_pid)
+                return
+            log.info("Stale watcher pid %d (lock age %d h), taking over.", stale_pid, int(lock_age_s / 3600))
         except (ProcessLookupError, ValueError, OSError):
             pass  # Stale lock — take over
 
@@ -530,13 +536,20 @@ def _start_bg_reindex_if_stale(root: Path) -> None:
     except (OSError, BlockingIOError):
         return  # Another reindex started between _is_bg_reindex_running and now
 
+    # Write the first line so get_active_build() always has something to show
+    try:
+        with open(log_file, "w") as fh:
+            fh.write(f"Starting reindex of {modified} stale files...\n")
+    except OSError:
+        pass
+
     log.info("Starting background reindex for %s (%d stale files)", root, modified)
     try:
         proc = subprocess.Popen(
             [sys.executable, "-u", "-m", "fw_context_mcp.cli", "index"],
             cwd=str(root),
             stdout=subprocess.DEVNULL,
-            stderr=open(log_file, "w"),
+            stderr=open(log_file, "a"),
             env={**os.environ, "PYTHONUNBUFFERED": "1"},
         )
     except Exception as exc:
