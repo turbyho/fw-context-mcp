@@ -25,6 +25,7 @@ Serves 20 MCP tools and 3 MCP resources via FastMCP (stdio transport).
 """
 
 import collections
+import fcntl
 import logging
 import os
 import sqlite3
@@ -470,34 +471,35 @@ def _start_bg_watcher(root: Path) -> None:
 def _is_bg_reindex_running(root: Path) -> bool:
     """Check whether a background ``fw-context index`` is running for *root*.
 
-    Uses a pidfile (``<db_dir>/<project_id>/reindex.lock``) — same pattern
-    as the watcher.  Stale locks are cleaned up automatically.
+    Uses ``fcntl.flock`` on ``<db_dir>/<project_id>/reindex.lock`` — the
+    kernel tracks the lock, auto-releases on process exit.  No PID tracking,
+    no race conditions, no stale lock cleanup.
     """
     db_path = _db_path(root)
     if not db_path.exists():
         return False
     lock_file = db_path.parent / "reindex.lock"
-    if not lock_file.exists():
+    try:
+        lock_fd = os.open(lock_file, os.O_CREAT | os.O_RDWR)
+    except OSError:
         return False
     try:
-        pid = int(lock_file.read_text().strip())
-        os.kill(pid, 0)
-        return True
-    except (ProcessLookupError, ValueError, OSError):
-        try:
-            lock_file.unlink(missing_ok=True)
-        except OSError:
-            pass
-        return False
+        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        os.close(lock_fd)
+        return True  # Lock held by another process
+    fcntl.flock(lock_fd, fcntl.LOCK_UN)
+    os.close(lock_fd)
+    return False
 
 
 def _start_bg_reindex_if_stale(root: Path) -> None:
     """Kick off a background ``fw-context index`` if files are stale.
 
     No-op when no index exists, no stale files are present, or a background
-    reindex is already running.  The subprocess is fire-and-forget — a
-    pidfile (``reindex.lock``) prevents concurrent runs per project.
-    Stale locks are detected by ``os.kill(pid, 0)`` liveness check.
+    reindex is already running.  Uses ``fcntl.flock`` for concurrency control
+    — the kernel releases the lock when the MCP server exits, so a crashed
+    subprocess never leaves a stale lock.
     """
     if _is_bg_reindex_running(root):
         return
@@ -521,6 +523,12 @@ def _start_bg_reindex_if_stale(root: Path) -> None:
         conn.close()
 
     lock_file = db_path.parent / "reindex.lock"
+    try:
+        lock_fd = os.open(lock_file, os.O_CREAT | os.O_RDWR)
+        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except (OSError, BlockingIOError):
+        return  # Another reindex started between _is_bg_reindex_running and now
+
     log.info("Starting background reindex for %s (%d stale files)", root, modified)
     proc = subprocess.Popen(
         [sys.executable, "-m", "fw_context_mcp.cli", "index"],
@@ -528,7 +536,23 @@ def _start_bg_reindex_if_stale(root: Path) -> None:
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
-    lock_file.write_text(str(proc.pid))
+
+    def _waiter() -> None:
+        try:
+            proc.wait(timeout=14400)  # 4 h — generous, catches hung subprocess
+        except subprocess.TimeoutExpired:
+            log.warning("Background reindex for %s timed out — killing", root)
+            try:
+                proc.kill()
+                proc.wait(timeout=10)
+            except Exception:
+                pass
+        finally:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            os.close(lock_fd)
+        log.info("Background reindex finished for %s (exit %d)", root, proc.returncode)
+
+    threading.Thread(target=_waiter, daemon=True).start()
 
 
 # ── Tools (non-search) ──────────────────────────────────────────────────────
