@@ -869,3 +869,7 @@ def main() -> None:
         parser.print_help()
         sys.exit(0)
     sys.exit(args.func(args))
+
+
+if __name__ == "__main__":
+    main()
