@@ -620,7 +620,7 @@ def _start_bg_reindex_if_stale(root: Path) -> None:
         inactivity_timeout = 600  # 10 min
         try:
             while proc.poll() is None:
-                proc.wait(timeout=30)  # check every 30 s
+                time.sleep(30)  # check every 30 s
                 now = time.monotonic()
                 # Check total timeout
                 if now > total_deadline:
@@ -642,9 +642,8 @@ def _start_bg_reindex_if_stale(root: Path) -> None:
                     )
                     _kill_and_log(proc, f"inactive for {int(now - last_progress)}s")
                     return
-        except subprocess.TimeoutExpired:
-            log.warning("Background reindex for %s timed out — killing", root)
-            _kill_and_log(proc, "timed out")
+        except Exception:
+            log.exception("Background reindex watcher for %s crashed", root)
         finally:
             fcntl.flock(lock_fd, fcntl.LOCK_UN)
             os.close(lock_fd)
