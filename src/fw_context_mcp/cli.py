@@ -765,10 +765,10 @@ def cmd_analyze(args: argparse.Namespace) -> int:
     # Re-open connection for the analysis (uses its own transactions)
     conn = open_db(db_path)
     try:
-        _build_llm_analysis(conn, config_hash, cfg.llm)
+        _build_llm_analysis(conn, config_hash, cfg.llm, db_path.parent)
         if cfg.llm.analyze_files:
-            _build_file_analysis(conn, config_hash, cfg.llm)
-        _build_overrides(conn, config_hash)
+            _build_file_analysis(conn, config_hash, cfg.llm, db_path.parent)
+        _build_overrides(conn, config_hash, db_path.parent)
         conn.commit()
     finally:
         conn.close()

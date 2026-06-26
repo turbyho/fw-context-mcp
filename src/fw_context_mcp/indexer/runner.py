@@ -20,11 +20,13 @@ from .compile_commands import parse as parse_compile_commands
 from .config_hash import compute as compute_config_hash
 from .db import (
     CURRENT_SCHEMA_VERSION,
+    WriteLockTimeout,
     get_file_mtimes,
     open_db,
     transaction,
     upsert_build_config,
     upsert_project,
+    write_lock,
 )
 from .ops import store_symbols_for_unit
 
@@ -130,7 +132,7 @@ def _add_external_root(tu_path: Path, roots: list[Path], seen: set[Path]) -> Non
                 return
 
 
-def _build_embeddings(conn, config_hash: str, llm_config) -> None:
+def _build_embeddings(conn, config_hash: str, llm_config, db_dir: Path) -> None:
     """Generate and store vector embeddings for all definition symbols.
 
     Selects all function, method, constructor, destructor, class, and struct
@@ -219,15 +221,16 @@ def _build_embeddings(conn, config_hash: str, llm_config) -> None:
             continue
 
         # Store in legacy BLOB table (backward compatibility)
-        blob_batch = [(r["id"], _vec_to_blob(emb), model) for r, emb in zip(chunk_rows, embs, strict=True)]
-        upsert_embeddings(conn, blob_batch)
+        with write_lock(db_dir, timeout=5.0):
+            blob_batch = [(r["id"], _vec_to_blob(emb), model) for r, emb in zip(chunk_rows, embs, strict=True)]
+            upsert_embeddings(conn, blob_batch)
 
-        # Store in vec0 table (sqlite-vec KNN search)
-        try:
-            vec_batch = [(r["id"], config_hash, emb) for r, emb in zip(chunk_rows, embs, strict=True)]
-            upsert_embeddings_vec(conn, vec_batch)
-        except Exception as e:
-            log.debug("vec0 batch insert failed (sqlite-vec may not be loaded): %s", e)
+            # Store in vec0 table (sqlite-vec KNN search)
+            try:
+                vec_batch = [(r["id"], config_hash, emb) for r, emb in zip(chunk_rows, embs, strict=True)]
+                upsert_embeddings_vec(conn, vec_batch)
+            except Exception as e:
+                log.debug("vec0 batch insert failed (sqlite-vec may not be loaded): %s", e)
 
         total += len(blob_batch)
     log.info("Embeddings stored: %d symbols (model=%s)", total, model)
@@ -301,7 +304,7 @@ def _enrich_batch(conn, batch_rows, config_hash: str) -> list[dict]:
     return enriched
 
 
-def _build_llm_analysis(conn, config_hash: str, llm_config) -> None:
+def _build_llm_analysis(conn, config_hash: str, llm_config, db_dir: Path) -> None:
     """Generate structured LLM analysis (summary, inputs, outputs) for all
     project-definition symbols using Ollama in batches.
 
@@ -313,6 +316,9 @@ def _build_llm_analysis(conn, config_hash: str, llm_config) -> None:
     exact libclang extents) and callee names (from the reference index), which
     dramatically improves description quality — especially for large functions
     without docstrings.
+
+    *db_dir* is the directory containing the index database — used for the
+    write lock that serializes DB access across processes.
     """
     import httpx
 
@@ -383,13 +389,14 @@ def _build_llm_analysis(conn, config_hash: str, llm_config) -> None:
                 failed_ids.extend(r["id"] for r in batch)
                 continue
 
-            with transaction(conn):
-                db_rows = [
-                    (r["symbol_id"], r["summary"], r["inputs"], r["outputs"], model)
-                    for r in parsed
-                ]
-                inserted = upsert_llm_analysis_batch(conn, db_rows)
-                total += inserted
+            with write_lock(db_dir, timeout=5.0):
+                with transaction(conn):
+                    db_rows = [
+                        (r["symbol_id"], r["summary"], r["inputs"], r["outputs"], model)
+                        for r in parsed
+                    ]
+                    inserted = upsert_llm_analysis_batch(conn, db_rows)
+                    total += inserted
 
             if batch_idx % 5 == 0:
                 log.info("  batch %d/%d: %d stored", batch_idx + 1, batches, total)
@@ -418,13 +425,14 @@ def _build_llm_analysis(conn, config_hash: str, llm_config) -> None:
                 response = call_ollama(prompt, llm_config, temperature=0.1, num_predict=4000)
                 parsed = parse_analysis_response(response, batch_dicts)
                 if parsed:
-                    with transaction(conn):
-                        inserted = upsert_llm_analysis_batch(
-                            conn,
-                            [(parsed[0]["symbol_id"], parsed[0]["summary"],
-                              parsed[0]["inputs"], parsed[0]["outputs"], model)],
-                        )
-                        total += inserted
+                    with write_lock(db_dir, timeout=5.0):
+                        with transaction(conn):
+                            inserted = upsert_llm_analysis_batch(
+                                conn,
+                                [(parsed[0]["symbol_id"], parsed[0]["summary"],
+                                  parsed[0]["inputs"], parsed[0]["outputs"], model)],
+                            )
+                            total += inserted
                 else:
                     log.warning("Individual retry failed for %s", row["qualified_name"])
             except Exception as e:
@@ -433,7 +441,7 @@ def _build_llm_analysis(conn, config_hash: str, llm_config) -> None:
     log.info("LLM analysis stored: %d symbols (model=%s)", total, model)
 
 
-def _build_file_analysis(conn, config_hash: str, llm_config, extra_exclude_like: list[str] | None = None) -> None:
+def _build_file_analysis(conn, config_hash: str, llm_config, db_dir: Path, extra_exclude_like: list[str] | None = None) -> None:
     """Generate file-level LLM analysis (2-3 sentence summaries) for project
     source files using Ollama in batches of 5.
 
@@ -520,10 +528,11 @@ def _build_file_analysis(conn, config_hash: str, llm_config, extra_exclude_like:
             )
             continue
 
-        with transaction(conn):
-            db_rows = [(r["file_id"], config_hash, r["summary"], model) for r in parsed]
-            inserted = upsert_file_analysis_batch(conn, db_rows)
-            total += inserted
+        with write_lock(db_dir, timeout=5.0):
+            with transaction(conn):
+                db_rows = [(r["file_id"], config_hash, r["summary"], model) for r in parsed]
+                inserted = upsert_file_analysis_batch(conn, db_rows)
+                total += inserted
 
         if (batch_num // batch_size) % 4 == 0:
             log.info("  file batch %d/%d: %d stored", batch_num // batch_size + 1, batches, total)
@@ -620,7 +629,7 @@ def _extract_param_types(signature: str) -> str:
     return ",".join(normalized)
 
 
-def _build_overrides(conn, config_hash: str) -> None:
+def _build_overrides(conn, config_hash: str, db_dir: Path) -> None:
     """Build the method override graph by matching virtual methods to their
     base-class counterparts through the inheritance chain.
 
@@ -721,9 +730,10 @@ def _build_overrides(conn, config_hash: str) -> None:
                 override_rows.append((config_hash, vrow["usr"], bm["usr"]))
 
     if override_rows:
-        with transaction(conn):
-            insert_overrides_batch(conn, override_rows)
-            total += len(override_rows)
+        with write_lock(db_dir, timeout=5.0):
+            with transaction(conn):
+                insert_overrides_batch(conn, override_rows)
+                total += len(override_rows)
 
     log.info(
         "Overrides stored: %d relationships (%d virtual, %d no-base, %d no-match)",
@@ -773,14 +783,18 @@ def _process_unit(unit, config_hash, project_root, source_roots, exclude_paths, 
 
     conn = open_db(db_path)
     try:
-        with transaction(conn, checkpoint=False):
-            syms_added, refs_added = store_symbols_for_unit(
-                conn, unit, config_hash, project_root,
-                source_roots=source_roots,
-                exclude_paths=exclude_paths,
-                index_refs=index_refs,
-            )
+        with write_lock(db_path.parent, timeout=10.0):
+            with transaction(conn, checkpoint=False):
+                syms_added, refs_added = store_symbols_for_unit(
+                    conn, unit, config_hash, project_root,
+                    source_roots=source_roots,
+                    exclude_paths=exclude_paths,
+                    index_refs=index_refs,
+                )
         return ("updated", syms_added, refs_added)
+    except WriteLockTimeout:
+        log.warning("Could not acquire write lock for %s — skipping TU %s", db_path.parent, unit.file.name)
+        return ("skipped", 0, 0)
     except Exception as exc:
         log.warning("skip TU %s: %s", unit.file.name, exc)
         return ("skipped", 0, 0)
@@ -947,13 +961,13 @@ def run(
     # Embedding generation (opt-in)
     if index_embeddings and llm_config is not None and llm_config.enabled:
         log.info("Generating embeddings for %d symbols...", total_syms)
-        _build_embeddings(conn, config_hash, llm_config)
+        _build_embeddings(conn, config_hash, llm_config, db_path.parent)
         conn.commit()
 
     # LLM analysis generation (opt-in)
     if analyze_symbols and llm_config is not None and llm_config.enabled:
         log.info("Generating LLM analysis for project symbols...")
-        _build_llm_analysis(conn, config_hash, llm_config)
+        _build_llm_analysis(conn, config_hash, llm_config, db_path.parent)
         conn.commit()
 
     # File-level LLM analysis (opt-in, runs after symbol analysis)
@@ -968,13 +982,13 @@ def run(
                     extra_like.append(str(rel) + "/%")
                 except ValueError:
                     pass  # path not under project_root — skip
-        _build_file_analysis(conn, config_hash, llm_config, extra_exclude_like=extra_like)
+        _build_file_analysis(conn, config_hash, llm_config, db_path.parent, extra_exclude_like=extra_like)
         conn.commit()
 
     # Method override tracking (post-processing, no LLM needed)
     if analyze_overrides:
         log.info("Building method override graph...")
-        _build_overrides(conn, config_hash)
+        _build_overrides(conn, config_hash, db_path.parent)
         conn.commit()
 
     elapsed = time.monotonic() - t0
