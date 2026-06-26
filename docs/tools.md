@@ -293,7 +293,7 @@ project code (1.2×) over vendored SDK paths (0.85×).
 
 **Threshold guidance** (mxbai-embed-large):
 - `0.50` — exploratory, more results
-- `0.55` — balanced, ~1 000 results
+- `0.55` — balanced
 - `0.60` — high precision (default)
 - `0.65` — strict, may miss relevant symbols
 
@@ -337,8 +337,8 @@ Enum constants are grouped into `subgroups` by parent enum. Each subgroup has
 and `enum_value` (integer value, when available).
 
 Pass a relative path (`src/main.cpp`) or just the filename (`main.cpp` — suffix
-match). Use this instead of `Read` on large files — a 4300-line file returns
-~400 symbols organized by kind in a single response.
+match). Use this instead of `Read` on large files — symbols are organized by
+kind in a single response.
 
 #### `get_source`
 

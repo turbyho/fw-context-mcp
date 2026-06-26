@@ -119,7 +119,7 @@ PlatformIO (`platformio.ini`), or any build with `bear`.
 3. Parses every translation unit with libclang
 4. Builds the SQLite index with symbols, references, and embeddings
 
-**Subsequent runs** are incremental — seconds for a few changed files.
+**Subsequent runs** are incremental — only changed files are re-parsed.
 Use `--no-build` if you already have an up-to-date `compile_commands.json`.
 
 ### 6. Restart your assistant and start asking about your code
@@ -135,7 +135,7 @@ But they have limitations for AI-assisted exploration:
 | Limitation | fw-context solution |
 |-----------|---------------------|
 | No full-text search across the codebase | FTS5 over 6 columns — find "all functions related to modem init" |
-| Index dies with the server — rebuild from scratch | Persistent SQLite file — survives reboots, reads in milliseconds |
+| Index dies with the server — rebuild from scratch | Persistent SQLite file — survives reboots, near-instant reads |
 | Editor protocol, not AI protocol | MCP tools purpose-built for AI assistant workflow |
 | Blind to which `#ifdef` branch is active | Uses real compiler flags from `compile_commands.json` |
 
