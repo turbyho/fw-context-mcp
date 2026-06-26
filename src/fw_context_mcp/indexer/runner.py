@@ -11,6 +11,7 @@ import os
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import nullcontext
 from pathlib import Path
 
 from ..config.settings import derive_project_id
@@ -305,7 +306,7 @@ def _enrich_batch(conn, batch_rows, config_hash: str) -> list[dict]:
     return enriched
 
 
-def _build_llm_analysis(conn, config_hash: str, llm_config, db_dir: Path) -> None:
+def _build_llm_analysis(conn, config_hash: str, llm_config, db_dir: Path, *, write_lock_held: bool = False) -> None:
     """Generate structured LLM analysis (summary, inputs, outputs) for all
     project-definition symbols using Ollama in batches.
 
@@ -390,7 +391,7 @@ def _build_llm_analysis(conn, config_hash: str, llm_config, db_dir: Path) -> Non
                 failed_ids.extend(r["id"] for r in batch)
                 continue
 
-            with write_lock(db_dir, timeout=5.0):
+            with (write_lock(db_dir, timeout=5.0) if not write_lock_held else nullcontext()):
                 with transaction(conn):
                     db_rows = [
                         (r["symbol_id"], r["summary"], r["inputs"], r["outputs"], model)
@@ -426,7 +427,7 @@ def _build_llm_analysis(conn, config_hash: str, llm_config, db_dir: Path) -> Non
                 response = call_ollama(prompt, llm_config, temperature=0.1, num_predict=4000)
                 parsed = parse_analysis_response(response, batch_dicts)
                 if parsed:
-                    with write_lock(db_dir, timeout=5.0):
+                    with (write_lock(db_dir, timeout=5.0) if not write_lock_held else nullcontext()):
                         with transaction(conn):
                             inserted = upsert_llm_analysis_batch(
                                 conn,
@@ -442,7 +443,7 @@ def _build_llm_analysis(conn, config_hash: str, llm_config, db_dir: Path) -> Non
     log.info("LLM analysis stored: %d symbols (model=%s)", total, model)
 
 
-def _build_file_analysis(conn, config_hash: str, llm_config, db_dir: Path, extra_exclude_like: list[str] | None = None) -> None:
+def _build_file_analysis(conn, config_hash: str, llm_config, db_dir: Path, extra_exclude_like: list[str] | None = None, *, write_lock_held: bool = False) -> None:
     """Generate file-level LLM analysis (2-3 sentence summaries) for project
     source files using Ollama in batches of 5.
 
@@ -529,7 +530,7 @@ def _build_file_analysis(conn, config_hash: str, llm_config, db_dir: Path, extra
             )
             continue
 
-        with write_lock(db_dir, timeout=5.0):
+        with (write_lock(db_dir, timeout=5.0) if not write_lock_held else nullcontext()):
             with transaction(conn):
                 db_rows = [(r["file_id"], config_hash, r["summary"], model) for r in parsed]
                 inserted = upsert_file_analysis_batch(conn, db_rows)
@@ -630,7 +631,7 @@ def _extract_param_types(signature: str) -> str:
     return ",".join(normalized)
 
 
-def _build_overrides(conn, config_hash: str, db_dir: Path) -> None:
+def _build_overrides(conn, config_hash: str, db_dir: Path, *, write_lock_held: bool = False) -> None:
     """Build the method override graph by matching virtual methods to their
     base-class counterparts through the inheritance chain.
 
@@ -731,7 +732,7 @@ def _build_overrides(conn, config_hash: str, db_dir: Path) -> None:
                 override_rows.append((config_hash, vrow["usr"], bm["usr"]))
 
     if override_rows:
-        with write_lock(db_dir, timeout=5.0):
+        with (write_lock(db_dir, timeout=5.0) if not write_lock_held else nullcontext()):
             with transaction(conn):
                 insert_overrides_batch(conn, override_rows)
                 total += len(override_rows)

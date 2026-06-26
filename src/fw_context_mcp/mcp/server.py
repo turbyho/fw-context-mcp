@@ -790,10 +790,10 @@ def _with_stale_recovery(
 ) -> list[dict]:
     """Execute *query_fn(conn, config_hash)* with automatic stale-recovery.
 
-    When the index or result files are stale:
-    1. Auto-reindex up to 5 stale files (30 s timeout).
-    2. Re-run *query_fn* against a fresh connection.
-    3. Aggregate warnings.
+    When the index or result files are stale, kicks off a background
+    ``fw-context index`` and returns a warning.  The original (possibly
+    stale) results are always returned — the background reindex handles
+    the actual fix asynchronously.
 
     Connections are always closed before returning.
     """
@@ -817,25 +817,9 @@ def _with_stale_recovery(
         conn.close()
 
     results: list[dict] = []
-    cc_path = cfg["compile_commands_path"] if "compile_commands_path" in cfg else ""
-    if cc_path and _is_stale(cfg, cc_path):
-        results.append({"warning": stale_msg or "Index may be stale — compile_commands.json changed since last index. Run 'fw-context index' to update."})
     if stale_f:
-        succeeded, failed = _auto_reindex_stale(stale_f, root)
-        if succeeded:
-            conn2, err2 = _open_db_safe(db_path)
-            if err2:
-                results.append({"warning": f"Auto-reindex partially succeeded ({len(succeeded)} files), but DB is now corrupt."})
-                results += result_rows
-                return results
-            assert conn2 is not None
-            try:
-                with conn2:
-                    result_rows = query_fn(conn2, config_hash)
-            finally:
-                conn2.close()
-        if failed:
-            results.append({"warning": f"Auto-reindex failed for {len(failed)} file(s): {', '.join(failed[:3])}. Run 'fw-context index' manually."})
+        _start_bg_reindex_if_stale(root)
+        results.append({"warning": f"Results may be stale — {len(stale_f)} file(s) changed. Background reindex in progress. Run 'fw-context index' to force full update."})
     results += result_rows
     return results
 
@@ -1157,92 +1141,87 @@ def _reindex_file_impl(
         return err
     assert conn is not None
     try:
-        with conn:
-            cfg_data = get_active_config(conn, project_id)
-            if not cfg_data:
-                return {"error": "No build config indexed."}
-            target = Path(file_path)
-            if not target.is_absolute():
-                target = (root / target).resolve()
-            else:
-                target = target.resolve()
-            if not target.exists():
-                return {"error": f"File not found: {target}"}
-            cc_path = Path(cfg_data["compile_commands_path"])
-            if not cc_path.exists():
-                return {"error": f"compile_commands.json not found: {cc_path}"}
-            units = parse_cc(cc_path)
-            matching = [u for u in units if Path(u.file).resolve() == target]
-            if not matching:
-                return {"error": f"{target.name} not found in compile_commands.json — it may be a header-only file."}
-            config_hash = cfg_data["config_hash"]
-            source_roots = cfg.source_root_paths(root)
-            exclude_paths = cfg.exclude_root_paths(root)
-            t0 = time.monotonic()
-            total_symbols = 0
-            from ..indexer.db import write_lock as db_write_lock
-            from ..indexer.ops import store_symbols_for_unit
+        cfg_data = get_active_config(conn, project_id)
+        if not cfg_data:
+            return {"error": "No build config indexed."}
+        target = Path(file_path)
+        if not target.is_absolute():
+            target = (root / target).resolve()
+        else:
+            target = target.resolve()
+        if not target.exists():
+            return {"error": f"File not found: {target}"}
+        cc_path = Path(cfg_data["compile_commands_path"])
+        if not cc_path.exists():
+            return {"error": f"compile_commands.json not found: {cc_path}"}
+        units = parse_cc(cc_path)
+        matching = [u for u in units if Path(u.file).resolve() == target]
+        if not matching:
+            return {"error": f"{target.name} not found in compile_commands.json — it may be a header-only file."}
+        config_hash = cfg_data["config_hash"]
+        source_roots = cfg.source_root_paths(root)
+        exclude_paths = cfg.exclude_root_paths(root)
+
+        from ..indexer.db import write_lock as db_write_lock
+        from ..indexer.ops import store_symbols_for_unit
+
+        t0 = time.monotonic()
+        total_symbols = 0
+
+        with db_write_lock(db_path.parent, timeout=20.0):
+            # ── Phase 1: main symbol write ──
             for unit in matching:
-                with db_write_lock(db_path.parent, timeout=10.0):
-                    with transaction(conn):
-                        syms_added, _ = store_symbols_for_unit(
-                            conn, unit, config_hash, root,
-                            source_roots=source_roots,
-                            exclude_paths=exclude_paths,
-                            index_refs=cfg.index.index_refs,
-                        )
-                        total_symbols += syms_added
-        elapsed = round(time.monotonic() - t0, 2)
-        result: dict = {
-            "file": str(target),
-            "translation_units": len(matching),
-            "symbols_updated": total_symbols,
-            "elapsed_s": elapsed,
-        }
+                with transaction(conn):
+                    syms_added, _ = store_symbols_for_unit(
+                        conn, unit, config_hash, root,
+                        source_roots=source_roots,
+                        exclude_paths=exclude_paths,
+                        index_refs=cfg.index.index_refs,
+                    )
+                    total_symbols += syms_added
+
+            elapsed = round(time.monotonic() - t0, 2)
+            result: dict = {
+                "file": str(target),
+                "translation_units": len(matching),
+                "symbols_updated": total_symbols,
+                "elapsed_s": elapsed,
+            }
+
+            if not with_analysis:
+                return result
+
+            # ── Phase 2: LLM analysis ──
+            if cfg.llm.enabled and cfg.llm.analyze_symbols and total_symbols > 0:
+                try:
+                    from ..indexer.runner import _build_file_analysis, _build_llm_analysis
+                    _build_llm_analysis(conn, config_hash, cfg.llm, db_path.parent, write_lock_held=True)
+                    if cfg.llm.analyze_files:
+                        _build_file_analysis(conn, config_hash, cfg.llm, db_path.parent, write_lock_held=True)
+                    conn.commit()
+                    analyzed_count = conn.execute(
+                        "SELECT COUNT(*) FROM llm_analysis a JOIN symbols s ON s.id = a.symbol_id WHERE s.config_hash = ?",
+                        (config_hash,),
+                    ).fetchone()[0]
+                    result["analysis_updated"] = analyzed_count
+                except Exception as exc:
+                    result["analysis_warning"] = f"LLM analysis skipped: {exc}"
+
+            # ── Phase 3: method override graph ──
+            if total_symbols > 0:
+                try:
+                    from ..indexer.runner import _build_overrides
+                    _build_overrides(conn, config_hash, db_path.parent, write_lock_held=True)
+                    conn.commit()
+                except Exception as exc:
+                    result["overrides_warning"] = f"Override analysis skipped: {exc}"
+
+            if len(matching) == 1 and target.suffix.lower() in {".h", ".hpp"}:
+                result["warning"] = "Header re-indexed via one TU. Other TUs including this header may still have stale symbols — run 'fw-context index' for full accuracy."
+
+            return result
     finally:
         conn.close()
-
-    if not with_analysis:
-        return result
-
-    # ── LLM analysis (slow — skipped when with_analysis=False) ────────────
-
-    if cfg.llm.enabled and cfg.llm.analyze_symbols and total_symbols > 0:
-        try:
-            from ..indexer.runner import _build_file_analysis, _build_llm_analysis
-            conn2 = open_db(db_path)
-            try:
-                _build_llm_analysis(conn2, config_hash, cfg.llm, db_path.parent)
-                if cfg.llm.analyze_files:
-                    _build_file_analysis(conn2, config_hash, cfg.llm, db_path.parent)
-                conn2.commit()
-                analyzed_count = conn2.execute(
-                    "SELECT COUNT(*) FROM llm_analysis a JOIN symbols s ON s.id = a.symbol_id WHERE s.config_hash = ?",
-                    (config_hash,),
-                ).fetchone()[0]
-                result["analysis_updated"] = analyzed_count
-            finally:
-                conn2.close()
-        except Exception as exc:
-            result["analysis_warning"] = f"LLM analysis skipped: {exc}"
-
-    # ── Method override graph ─────────────────────────────────────────────
-
-    if total_symbols > 0:
-        try:
-            from ..indexer.runner import _build_overrides
-            conn3 = open_db(db_path)
-            try:
-                _build_overrides(conn3, config_hash, db_path.parent)
-                conn3.commit()
-            finally:
-                conn3.close()
-        except Exception as exc:
-            result["overrides_warning"] = f"Override analysis skipped: {exc}"
-
-    if len(matching) == 1 and target.suffix.lower() in {".h", ".hpp"}:
-        result["warning"] = "Header re-indexed via one TU. Other TUs including this header may still have stale symbols — run 'fw-context index' for full accuracy."
-    return result
 
 
 @mcp.tool()
