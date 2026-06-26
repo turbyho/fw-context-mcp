@@ -76,8 +76,9 @@ class Reference:
             None when the reference appears at file scope.
         ref_kind: Classification of the reference — ``"call"`` for direct
             function calls, ``"ref"`` for variable/enum reads, ``"member"``
-            for member accesses, ``"indirect"`` for function-pointer or
-            callback arguments.
+            for member accesses, ``"indirect"`` for function pointers found
+            in call arguments, assignments, variable initializers, or
+            struct/array init lists.
     """
     to_usr: str        # USR of the referenced definition (links to Symbol.usr)
     from_file: str     # file containing the reference (absolute, as clang reports)
@@ -284,6 +285,12 @@ def _find_fn_refs_in_expr(
     Walks into UNARY_OPERATOR (address-of ``&``), nested CALL_EXPR (callback
     wrappers like ``mbed::callback(...)``), and other intermediate nodes to find
     function pointer targets that libclang can resolve.
+
+    Used both for function pointers passed as call arguments (via
+    ``_emit_fn_ptr_targets`` on CALL_EXPR) and for function pointers in
+    assignments, variable initializers, and struct/array init lists
+    (via ``_emit_fn_ptr_targets`` on BINARY_OPERATOR, VAR_DECL, and
+    INIT_LIST_EXPR).
 
     ``_skip_usr`` is the callee USR of the nearest enclosing CALL_EXPR whose
     callee is a project function; its children (the callee's own DECL_REF_EXPR
@@ -684,39 +691,65 @@ def extract_all(
                                         ))
                                     break  # one resolved callee per CALL_EXPR
 
-        # --- Indirect calls: detect function pointers passed as arguments ---
-        # When a CALL_EXPR passes a function/method pointer as an argument
-        # (e.g. callback(&Class::method, this), Thread::start(callback(...)),
-        #  EventQueue::call_every(ms, obj, &Class::handler)),
-        # extract the target and emit an "indirect" reference edge.
-        # This is platform-agnostic: works for Mbed OS, Zephyr, FreeRTOS, POSIX,
-        # and any other framework that accepts function pointers as arguments.
+        # --- Helper: emit "indirect" refs for function pointers in expression children ---
+        # Shared by CALL_EXPR (callback arguments), BINARY_OPERATOR
+        # (assignments), VAR_DECL (initializers), and INIT_LIST_EXPR
+        # (struct/array init).  The recursive walk is handled by
+        # _find_fn_refs_in_expr; this helper only iterates the top-level
+        # children of *expr_cursor* and emits References.
+        def _emit_fn_ptr_targets(
+            expr_cursor: cx.Cursor,
+            caller_usr: str | None,
+            skip_usr: str | None = None,
+        ) -> None:
+            loc = expr_cursor.location
+            if not loc.file or not _in_roots(loc.file.name) or not _not_excluded(loc.file.name):
+                return
+            for child in expr_cursor.get_children():
+                targets = _find_fn_refs_in_expr(child, _in_roots, _not_excluded, skip_usr)
+                for target in targets:
+                    target_usr = target.get_usr()
+                    if not target_usr:
+                        continue
+                    if target_usr == skip_usr:
+                        continue
+                    target_loc = target.location
+                    if target_loc.file and _in_roots(target_loc.file.name) and _not_excluded(target_loc.file.name):
+                        key = (target_usr, loc.file.name, loc.line, caller_usr, "indirect")
+                        if key not in seen_ref:
+                            seen_ref.add(key)
+                            refs.append(Reference(
+                                to_usr=target_usr,
+                                from_file=loc.file.name,
+                                from_line=loc.line,
+                                from_usr=caller_usr,
+                                ref_kind="indirect",
+                            ))
+
+        # --- Indirect calls: function pointers passed as arguments ---
+        # e.g. callback(&Class::method, this), Thread::start(callback(...)),
+        # EventQueue::call_every(ms, obj, &Class::handler).
         if cursor.kind == cx.CursorKind.CALL_EXPR:
-            loc = cursor.location
             direct_callee = cursor.referenced
             direct_callee_usr = direct_callee.get_usr() if direct_callee else None
-            if loc.file and _in_roots(loc.file.name) and _not_excluded(loc.file.name):
-                for arg in cursor.get_children():
-                    targets = _find_fn_refs_in_expr(arg, _in_roots, _not_excluded, direct_callee_usr)
-                    for target in targets:
-                        target_usr = target.get_usr()
-                        if not target_usr:
-                            continue
-                        # Don't emit indirect if it's the same as the direct callee
-                        if target_usr == direct_callee_usr:
-                            continue
-                        target_loc = target.location
-                        if target_loc.file and _in_roots(target_loc.file.name) and _not_excluded(target_loc.file.name):
-                            key = (target_usr, loc.file.name, loc.line, cur_fn, "indirect")
-                            if key not in seen_ref:
-                                seen_ref.add(key)
-                                refs.append(Reference(
-                                    to_usr=target_usr,
-                                    from_file=loc.file.name,
-                                    from_line=loc.line,
-                                    from_usr=cur_fn,
-                                    ref_kind="indirect",
-                                ))
+            _emit_fn_ptr_targets(cursor, cur_fn, direct_callee_usr)
+
+        # --- Indirect calls: function pointers in assignments ---
+        # field = &function, global = &function, *ptr = &function.
+        # BINARY_OPERATOR covers =, +=, -= etc.; _find_fn_refs_in_expr only
+        # returns function declarations so comparisons (==, !=) are harmless.
+        if cursor.kind == cx.CursorKind.BINARY_OPERATOR:
+            _emit_fn_ptr_targets(cursor, cur_fn)
+
+        # --- Indirect calls: function pointers in variable initializers ---
+        # static void (*cb)(int) = &handler;  or local fn-ptr init.
+        if cursor.kind == cx.CursorKind.VAR_DECL:
+            _emit_fn_ptr_targets(cursor, cur_fn)
+
+        # --- Indirect calls: function pointers in struct/array init lists ---
+        # .on_data = &handler, {EV_DATA, &handler}, {&fn_a, &fn_b}.
+        if cursor.kind == cx.CursorKind.INIT_LIST_EXPR:
+            _emit_fn_ptr_targets(cursor, cur_fn)
 
         # --- Token fallback for UNEXPOSED_EXPR ---
         # When libclang cannot decompose a template expression (e.g. Mbed OS
