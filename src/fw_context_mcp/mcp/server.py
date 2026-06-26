@@ -1824,6 +1824,29 @@ def find_callers(
     Requires the reference index (``fw-context index`` — refs are on by
     default).  Only direct call sites are returned; callers more than one
     hop away are not included.
+
+    Indirect edges (``ref_kind: "indirect"``) are detected when a function
+    pointer references a function through:
+
+    - **Call arguments**: ``callback(&Class::method, this)``,
+      ``EventQueue::call_every(ms, obj, &handler)``
+    - **Assignments**: ``driver.onData = &handleData``,
+      ``global_cb = &handler``
+    - **Variable initializers**: ``static void (*fp)(int) = &handler``
+    - **Struct/array init lists**: ``{.on_data = &handler}``,
+      ``{&fn_a, &fn_b}``
+
+    Args:
+        name: Symbol name to find callers of. Uses the same three-tier
+            resolution as ``find_references`` (exact name, exact qualified,
+            suffix LIKE).
+        project_root: Project root directory. Auto-detected if omitted.
+        limit: Maximum results (default 50).
+
+    Returns:
+        list of dicts, each with: file, line, ref_kind (``"call"`` or
+        ``"indirect"``), caller (enclosing function name), caller_kind
+        (``"function"``, ``"method"``, …), caller_file.
     """
     return _references_result(name, project_root, ref_kind=["call", "indirect"], limit=limit, caller_mode=True)
 
@@ -1837,8 +1860,9 @@ def find_references(
     """Find all references to a symbol — calls, reads, and member accesses.
 
     Read-only. No side effects. Returns every reference in the indexed codebase,
-    including call sites, variable reads, and struct member accesses. Requires
-    the reference index (``fw-context index`` — refs on by default).
+    including call sites, variable reads, struct member accesses, and indirect
+    function-pointer references.  Requires the reference index
+    (``fw-context index`` — refs on by default).
 
     For direct callers only use ``find_callers``. For transitive callers use
     ``find_all_callers_recursive``. For call paths between two symbols use
@@ -1851,6 +1875,9 @@ def find_references(
 
     Returns:
         list of dicts, each with: file, line, ref_kind, caller, caller_kind.
+        ``ref_kind`` is one of: ``"call"``, ``"ref"``, ``"member"``,
+        ``"indirect"`` (function-pointer reference in arguments, assignments,
+        initializers, or init lists), ``"template_ref"``.
     """
     return _references_result(name, project_root, ref_kind=None, limit=limit)
 

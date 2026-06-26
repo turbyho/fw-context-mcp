@@ -431,7 +431,8 @@ if you don't need them.
 
 #### `find_callers`
 
-Who calls this function? (direct callers only)
+Who calls this function? Direct callers and indirect calls via function pointers
+detected in call arguments, assignments, and initializers.
 
 ```
 Input:  {"name": "uart_write", "project_root?": "/path/to/project", "limit?": 50}

@@ -576,14 +576,13 @@ Every tool has boundaries. Here are fw-context's — clearly stated.
 
 ### Callbacks and function pointers
 
-`find_callers("handleData")` returns empty because `handleData` is registered
-as a callback via `MB.onDataHandler(&handleData)`. The actual caller is inside
-the eModbus library, through a stored function pointer. This edge is invisible
-to the static call graph.
+`find_callers` detects function pointers registered through framework APIs like
+`Thread::start(callback(&Class::method, this))` and through direct assignments
+like `driver.onData = &handleData`. These appear as `"indirect"` call edges.
 
-**What you can do:** `find_references("handleData")` WILL find the registration
-site. The empty `find_callers` result is itself information — it tells you
-"this is callback-driven, not directly called."
+Registration through stored pointers in libraries (e.g. inside eModbus) where
+the actual call site is in precompiled code still has no call-graph edge
+because the invocation side is not indexed.
 
 ### ISRs, RTOS primitives, message queues
 
@@ -608,12 +607,13 @@ If macros generate function names via token pasting (X-Macros), the generated
 symbols are indexed, but the connection to the macro that produced them is
 lost. The expanded form is there; the meta-programming is not.
 
-### These are being worked on
+### Indirect call sites
 
-Function pointer resolution at call sites is the most-requested feature and is
-actively being explored. libclang tracks the target of `&handleData` — the
-challenge is following the data flow through the callback storage and
-invocation.
+When a function pointer is called directly (e.g. ``stored_callback(args)`` or
+``obj->onData(buf, len)``), libclang sees the field or variable but not the
+target function. Detecting these call sites and linking them to their
+assignments (type-based data-flow) is the next step — see
+[[plans/fn-pointer-assignment-detection.md#fáze-2-detekce-indirect-call-sites]].
 
 ---
 
