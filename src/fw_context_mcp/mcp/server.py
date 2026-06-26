@@ -585,6 +585,7 @@ def _start_bg_reindex_if_stale(root: Path) -> None:
         pass
 
     log.info("Starting background reindex for %s (%s)", root, reason)
+    heartbeat_file = db_path.parent / "heartbeat"
     try:
         stdout_fh = open(log_file, "a")
         proc = subprocess.Popen(
@@ -592,7 +593,11 @@ def _start_bg_reindex_if_stale(root: Path) -> None:
             cwd=str(root),
             stdout=stdout_fh,
             stderr=subprocess.STDOUT,
-            env={**os.environ, "PYTHONUNBUFFERED": "1"},
+            env={
+                **os.environ,
+                "PYTHONUNBUFFERED": "1",
+                "FW_CONTEXT_HEARTBEAT": str(heartbeat_file),
+            },
         )
         stdout_fh.close()  # Close parent copy — child has its own fd
     except Exception as exc:
@@ -607,40 +612,39 @@ def _start_bg_reindex_if_stale(root: Path) -> None:
         return
 
     def _waiter() -> None:
-        """Monitor the subprocess — kill only if it hangs (no log output).
+        """Watchdog — kill the subprocess if it stops kicking the heartbeat.
 
-        Uses log file size to detect progress.  When the subprocess stops
-        writing to the log for 10 minutes, it is considered hung and gets
-        killed.  There is NO total time limit — a legitimate reindex of
-        many files can take hours.
+        A healthy subprocess writes the current time to the heartbeat file
+        every 30 seconds from a daemon thread.  If 90 seconds pass without
+        a heartbeat, the process is considered deadlocked and gets killed.
+
+        No total time limit — a legitimate reindex can run for hours.
         """
-        last_size = 0
-        last_progress = time.monotonic()
-        inactivity_timeout = 600  # 10 min
+        kick_timeout = 90  # seconds without heartbeat → deadlocked
         try:
             while proc.poll() is None:
-                time.sleep(30)  # check every 30 s
-                now = time.monotonic()
-                # Check inactivity via log file size
+                time.sleep(30)
                 try:
-                    curr_size = log_file.stat().st_size
+                    mtime = heartbeat_file.stat().st_mtime
                 except OSError:
-                    curr_size = last_size
-                if curr_size > last_size:
-                    last_size = curr_size
-                    last_progress = now
-                elif now - last_progress > inactivity_timeout:
+                    mtime = 0
+                if time.time() - mtime > kick_timeout:
                     log.warning(
-                        "Background reindex for %s inactive for %ds — killing",
-                        root, int(now - last_progress),
+                        "Background reindex for %s deadlocked — no heartbeat for %ds",
+                        root, int(time.time() - mtime),
                     )
-                    _kill_and_log(proc, f"inactive for {int(now - last_progress)}s")
+                    _kill_and_log(proc, f"no heartbeat for {int(time.time() - mtime)}s")
                     return
         except Exception:
             log.exception("Background reindex watcher for %s crashed", root)
         finally:
             fcntl.flock(lock_fd, fcntl.LOCK_UN)
             os.close(lock_fd)
+            # Clean up heartbeat file
+            try:
+                heartbeat_file.unlink()
+            except OSError:
+                pass
         log.info("Background reindex finished for %s (exit %d)", root, proc.returncode)
 
     def _kill_and_log(p: subprocess.Popen, reason: str) -> None:
