@@ -585,7 +585,6 @@ def _start_bg_reindex_if_stale(root: Path) -> None:
         pass
 
     log.info("Starting background reindex for %s (%s)", root, reason)
-    heartbeat_file = db_path.parent / "heartbeat"
     try:
         stdout_fh = open(log_file, "a")
         proc = subprocess.Popen(
@@ -596,7 +595,7 @@ def _start_bg_reindex_if_stale(root: Path) -> None:
             env={
                 **os.environ,
                 "PYTHONUNBUFFERED": "1",
-                "FW_CONTEXT_HEARTBEAT": str(heartbeat_file),
+                "FW_CONTEXT_HEARTBEAT_LOG": str(log_file),
             },
         )
         stdout_fh.close()  # Close parent copy — child has its own fd
@@ -612,25 +611,24 @@ def _start_bg_reindex_if_stale(root: Path) -> None:
         return
 
     def _waiter() -> None:
-        """Watchdog — kill the subprocess if it stops kicking the heartbeat.
+        """Watchdog — kill the subprocess if heartbeat lines stop appearing.
 
-        A healthy subprocess writes the current time to the heartbeat file
-        every 30 seconds from a daemon thread.  If 90 seconds pass without
-        a heartbeat, the process is considered deadlocked and gets killed.
-
-        No total time limit — a legitimate reindex can run for hours.
+        A healthy subprocess writes a heartbeat line to the log file every
+        30 seconds from a daemon thread.  If 90 seconds pass without the log
+        file being modified, the process is considered deadlocked and gets
+        killed.  No total time limit — a legitimate reindex can run for hours.
         """
-        kick_timeout = 90  # seconds without heartbeat → deadlocked
+        kick_timeout = 90  # seconds without log modification → deadlocked
         try:
             while proc.poll() is None:
                 time.sleep(30)
                 try:
-                    mtime = heartbeat_file.stat().st_mtime
+                    mtime = log_file.stat().st_mtime
                 except OSError:
-                    mtime = 0
+                    continue  # file not created yet — process is still starting
                 if time.time() - mtime > kick_timeout:
                     log.warning(
-                        "Background reindex for %s deadlocked — no heartbeat for %ds",
+                        "Background reindex for %s deadlocked — log not modified for %ds",
                         root, int(time.time() - mtime),
                     )
                     _kill_and_log(proc, f"no heartbeat for {int(time.time() - mtime)}s")
@@ -640,11 +638,6 @@ def _start_bg_reindex_if_stale(root: Path) -> None:
         finally:
             fcntl.flock(lock_fd, fcntl.LOCK_UN)
             os.close(lock_fd)
-            # Clean up heartbeat file
-            try:
-                heartbeat_file.unlink()
-            except OSError:
-                pass
         log.info("Background reindex finished for %s (exit %d)", root, proc.returncode)
 
     def _kill_and_log(p: subprocess.Popen, reason: str) -> None:

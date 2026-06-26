@@ -884,17 +884,19 @@ def run(
     name = project_name or project_root.name
     config_hash = compute_config_hash(compile_commands)
 
-    # Heartbeat for background reindex watchdog.  The watchdog kills the
-    # process if this heartbeat stops (deadlock / hung syscall).  Only
-    # active when FW_CONTEXT_HEARTBEAT env var is set (background reindex).
-    _heartbeat_path = os.environ.get("FW_CONTEXT_HEARTBEAT")
-    if _heartbeat_path:
+    # Heartbeat for background reindex watchdog.  When the subprocess is
+    # stuck (deadlock / hung syscall), this daemon thread stops writing
+    # and the watchdog kills the process.  Only active when the heartbeat
+    # log path is passed via env var (background reindex).
+    _hb_log = os.environ.get("FW_CONTEXT_HEARTBEAT_LOG")
+    if _hb_log:
         _hb_stop = threading.Event()
 
         def _heartbeat() -> None:
             while not _hb_stop.wait(30.0):
                 try:
-                    Path(_heartbeat_path).write_text(str(time.time()))
+                    with open(_hb_log, "a") as f:
+                        f.write(f"{time.strftime('%H:%M:%S')} heartbeat\n")
                 except Exception:
                     pass
 
