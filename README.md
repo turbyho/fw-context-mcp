@@ -607,13 +607,14 @@ If macros generate function names via token pasting (X-Macros), the generated
 symbols are indexed, but the connection to the macro that produced them is
 lost. The expanded form is there; the meta-programming is not.
 
-### Indirect call sites
+### Indirect call sites (invocation side)
 
-When a function pointer is called directly (e.g. ``stored_callback(args)`` or
-``obj->onData(buf, len)``), libclang sees the field or variable but not the
-target function. Detecting these call sites and linking them to their
-assignments (type-based data-flow) is the next step — see
-[[plans/fn-pointer-assignment-detection.md#fáze-2-detekce-indirect-call-sites]].
+While the registration side is covered (see **Callbacks and function pointers**
+above), the invocation side is not: when a stored function pointer is called
+directly (``stored_callback(args)`` or ``obj->onData(buf, len)``), libclang
+sees the field or variable but not the target function.  Detecting these call
+sites and linking them to their assignments via type-based data-flow is the
+next step.
 
 ---
 
