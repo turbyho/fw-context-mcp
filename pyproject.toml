@@ -1,7 +1,7 @@
 [project]
 name = "fw-context-mcp"
 version = "0.8.3"
-description = "Build-aware code intelligence MCP server for embedded C/C++ firmware (Mbed OS, Zephyr, PlatformIO)"
+description = "Build-aware code intelligence MCP server for embedded C/C++ firmware"
 requires-python = ">=3.11"
 license = {text = "MIT"}
 repository = "https://github.com/turbyho/fw-context-mcp"
