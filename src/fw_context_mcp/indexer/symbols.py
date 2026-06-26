@@ -97,6 +97,35 @@ class InheritanceRecord:
 
 
 @dataclass
+class IndirectCallSite:
+    """A call site where a function pointer is invoked through a field or variable.
+
+    Unlike ``Reference`` (which points to a resolved FUNCTION_DECL), this
+    records the FIELD_DECL or VAR_DECL that holds the function pointer —
+    the actual function called depends on runtime state.
+
+    Attributes:
+        from_file: Absolute path of the file containing the call.
+        from_line: Source line of the call expression.
+        from_usr: USR of the enclosing function or method, or None.
+        expr_text: Callee expression text, e.g. ``"driver.onData"`` or
+            ``"stored_callback"``.
+        target_usr: USR of the function pointer field or variable being
+            called (the FIELD_DECL / VAR_DECL, not the target function).
+        target_name: Display name of the field or variable, e.g. ``"onData"``.
+        fn_ptr_type: Function pointer type signature string,
+            e.g. ``"void (*)(uint8_t *, size_t)"``.
+    """
+    from_file: str
+    from_line: int
+    from_usr: str | None
+    expr_text: str
+    target_usr: str
+    target_name: str
+    fn_ptr_type: str
+
+
+@dataclass
 class Symbol:
     """A parsed C/C++ symbol extracted from a translation unit.
 
@@ -353,7 +382,7 @@ def extract(
 
     Thin backward-compatible wrapper over ``extract_all`` (symbols only).
     """
-    symbols, _, _ = extract_all(unit, source_roots, exclude_paths, with_refs=False)
+    symbols, _, _, _ = extract_all(unit, source_roots, exclude_paths, with_refs=False)
     return iter(symbols)
 
 
@@ -362,12 +391,12 @@ def extract_all(
     source_roots: list[Path] | None = None,
     exclude_paths: list[Path] | None = None,
     with_refs: bool = False,
-) -> tuple[list[Symbol], list[Reference], list[InheritanceRecord]]:
+) -> tuple[list[Symbol], list[Reference], list[InheritanceRecord], list[IndirectCallSite]]:
     """Parse one translation unit and return extracted symbols, references, and inheritance.
 
     This is the single-pass entry point for all data extraction from a
     ``CompilationUnit``.  It parses the file with libclang, walks the AST
-    once, and produces three outputs simultaneously.
+    once, and produces four outputs simultaneously.
 
     Args:
         unit: The translation unit to parse (file path + compiler flags).
@@ -381,13 +410,17 @@ def extract_all(
             regardless of this flag.
 
     Returns:
-        A tuple ``(symbols, references, inheritance)``:
+        A tuple ``(symbols, references, inheritance, indirect_call_sites)``:
             symbols — all matching declarations and definitions.
             references — when ``with_refs`` is True, project-internal
                 call/ref/member/indirect edges whose both ends are under
                 ``source_roots``; empty list otherwise.
             inheritance — C++ base class edges for class/struct
                 definitions under ``source_roots``, always extracted.
+            indirect_call_sites — when ``with_refs`` is True, call sites
+                where a function pointer field or variable is invoked
+                (``obj->onData(args)``, ``stored_callback(args)``);
+                empty list otherwise.
     """
     if not source_roots:
         source_roots = [unit.file.parent]
@@ -561,7 +594,7 @@ def extract_all(
             continue  # skip malformed cursors
 
     if not with_refs:
-        return symbols, [], inheritance
+        return symbols, [], inheritance, []
 
     # Build qualified-name → USR lookup for token-based fallback
     # (UNEXPOSED_EXPR nodes hide template expansions like mbed::callback(...)
@@ -582,6 +615,7 @@ def extract_all(
 
     # --- References (explicit stack DFS to track the enclosing function) ---
     refs: list[Reference] = []
+    indirect_call_sites: list[IndirectCallSite] = []
     seen_ref: set[tuple] = set()
     # Track function spans: [(usr, start_line, end_line)] for source-line fallback
     _fn_spans: list[tuple[str, int, int]] = []
@@ -690,6 +724,59 @@ def extract_all(
                                             ref_kind="call",
                                         ))
                                     break  # one resolved callee per CALL_EXPR
+
+        # --- Helper: function pointer type check ---
+        def _is_fn_ptr_type(t: cx.Type) -> bool:
+            """True when *t* is (or resolves via typedef to) a function pointer."""
+            try:
+                canon = t.get_canonical()
+                if canon.kind == cx.TypeKind.POINTER:
+                    pointee = canon.get_pointee()
+                    return pointee.kind in (cx.TypeKind.FUNCTIONPROTO, cx.TypeKind.FUNCTIONNOPROTO)
+            except Exception:
+                pass
+            return False
+
+        def _call_expr_text(cursor: cx.Cursor) -> str:
+            """Extract callee expression text from a CALL_EXPR's token stream.
+
+            Returns everything before the opening ``(``, space-joined.
+            ``driver->onData(buf, len)`` → ``"driver->onData"``
+            ``stored_callback(42)``      → ``"stored_callback"``
+            """
+            parts: list[str] = []
+            try:
+                for tok in cursor.get_tokens():
+                    if tok.spelling == "(":
+                        break
+                    parts.append(tok.spelling)
+            except Exception:
+                return ""
+            return " ".join(parts)
+
+        # --- Indirect function pointer invocation detection ---
+        # Detect CALL_EXPR where the callee is a function pointer field,
+        # variable, or parameter.  libclang resolves cursor.referenced to the
+        # FIELD_DECL / VAR_DECL / PARM_DECL (not a FUNCTION_DECL), so we
+        # check the type directly on the callee cursor.
+        if cursor.kind == cx.CursorKind.CALL_EXPR:
+            loc = cursor.location
+            if loc.file and _in_roots(loc.file.name) and _not_excluded(loc.file.name):
+                callee = cursor.referenced
+                if (callee is not None
+                        and callee.kind in (cx.CursorKind.FIELD_DECL, cx.CursorKind.VAR_DECL, cx.CursorKind.PARM_DECL)
+                        and _is_fn_ptr_type(callee.type)):
+                    target_usr = callee.get_usr()
+                    if target_usr:
+                        indirect_call_sites.append(IndirectCallSite(
+                            from_file=loc.file.name,
+                            from_line=loc.line,
+                            from_usr=cur_fn,
+                            expr_text=_call_expr_text(cursor),
+                            target_usr=target_usr,
+                            target_name=callee.spelling,
+                            fn_ptr_type=callee.type.spelling,
+                        ))
 
         # --- Helper: emit "indirect" refs for function pointers in expression children ---
         # Shared by CALL_EXPR (callback arguments), BINARY_OPERATOR
@@ -902,4 +989,4 @@ def extract_all(
                             ref_kind="call",
                         ))
 
-    return symbols, refs, inheritance
+    return symbols, refs, inheritance, indirect_call_sites

@@ -6,9 +6,11 @@ __all__ = [
     "CURRENT_SCHEMA_VERSION",
     "DatabaseCorruptionError",
     "count_file_analysis",
+    "count_indirect_call_sites",
     "count_llm_analysis",
     "count_refs",
     "delete_inheritance_for_file",
+    "delete_indirect_call_sites_for_file",
     "delete_refs_for_file",
     "delete_symbols_for_file",
     "find_all_callers_recursive",
@@ -16,6 +18,7 @@ __all__ = [
     "find_call_path",
     "find_dead_code",
     "find_hotspots",
+    "find_indirect_call_sites",
     "find_refs",
     "get_active_config",
     "get_all_projects",
@@ -32,6 +35,7 @@ __all__ = [
     "get_overrides_for_method",
     "get_template_instances",
     "init_vec_table",
+    "insert_indirect_call_sites_batch",
     "insert_inheritance_batch",
     "insert_overrides_batch",
     "insert_refs_batch",
@@ -309,6 +313,25 @@ CREATE TABLE IF NOT EXISTS refs (
 CREATE INDEX IF NOT EXISTS idx_refs_to_usr   ON refs(config_hash, to_usr);
 CREATE INDEX IF NOT EXISTS idx_refs_from_usr ON refs(config_hash, from_usr);
 CREATE INDEX IF NOT EXISTS idx_refs_fromfile ON refs(config_hash, from_file);
+
+-- Indirect function-pointer call sites (Phase 2).
+-- Records locations where a function pointer field or variable is invoked --
+-- unlike refs, there is no resolved target function (the callee is a
+-- FIELD_DECL or VAR_DECL, not a FUNCTION_DECL).
+CREATE TABLE IF NOT EXISTS indirect_call_sites (
+    id           INTEGER PRIMARY KEY,
+    config_hash  TEXT    NOT NULL,
+    from_file    TEXT    NOT NULL,
+    from_line    INTEGER NOT NULL,
+    from_usr     TEXT,
+    expr_text    TEXT    NOT NULL DEFAULT '',
+    target_usr   TEXT    NOT NULL,
+    target_name  TEXT    NOT NULL DEFAULT '',
+    fn_ptr_type  TEXT    NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_ics_config_target ON indirect_call_sites(config_hash, target_usr);
+CREATE INDEX IF NOT EXISTS idx_ics_config_file   ON indirect_call_sites(config_hash, from_file);
+CREATE INDEX IF NOT EXISTS idx_ics_config_usr    ON indirect_call_sites(config_hash, from_usr);
 
 -- Symbol embeddings for semantic search (opt-in via [index] index_embeddings = true).
 -- Stored as BLOB: 1024 float32 values packed with struct.pack('f', ...).
@@ -824,6 +847,76 @@ def delete_refs_for_file(conn: sqlite3.Connection, config_hash: str, from_file: 
         "DELETE FROM refs WHERE config_hash=? AND from_file=?",
         (config_hash, from_file),
     )
+
+
+# ---------------------------------------------------------------------------
+# Indirect call sites (Phase 2) — function pointer invocation tracking
+# ---------------------------------------------------------------------------
+
+
+def insert_indirect_call_sites_batch(conn: sqlite3.Connection, rows: list[tuple]) -> int:
+    """Insert indirect call site rows.
+
+    Each row: (config_hash, from_file, from_line, from_usr, expr_text,
+    target_usr, target_name, fn_ptr_type).
+    Returns number of rows inserted.
+    """
+    cur = conn.executemany(
+        """INSERT INTO indirect_call_sites
+           (config_hash, from_file, from_line, from_usr, expr_text, target_usr, target_name, fn_ptr_type)
+           VALUES (?,?,?,?,?,?,?,?)""",
+        rows,
+    )
+    return cur.rowcount
+
+
+def delete_indirect_call_sites_for_file(conn: sqlite3.Connection, config_hash: str, from_file: str) -> None:
+    """Delete all indirect call sites originating in a given file (for incremental reindex)."""
+    conn.execute(
+        "DELETE FROM indirect_call_sites WHERE config_hash=? AND from_file=?",
+        (config_hash, from_file),
+    )
+
+
+def find_indirect_call_sites(
+    conn: sqlite3.Connection,
+    config_hash: str,
+    name: str,
+    limit: int = 50,
+) -> list[sqlite3.Row]:
+    """Find indirect call sites for a function pointer field or variable by name.
+
+    Three-tier name resolution (same pattern as ``find_refs``): exact name,
+    exact qualified_name, suffix LIKE.
+    """
+    esc_name = name.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    suffix_pattern = f"%::{esc_name}"
+    return conn.execute(
+        """SELECT ics.*,
+                  caller.name            AS caller_name,
+                  caller.qualified_name  AS caller_qname,
+                  caller.kind            AS caller_kind
+           FROM indirect_call_sites ics
+           LEFT JOIN symbols caller
+             ON caller.config_hash = ics.config_hash AND caller.usr = ics.from_usr
+           WHERE ics.config_hash = ?
+             AND ics.target_usr IN (
+                 SELECT usr FROM symbols
+                 WHERE config_hash = ?
+                   AND (name = ? OR qualified_name = ? OR qualified_name LIKE ? ESCAPE '\\')
+             )
+           ORDER BY ics.from_file, ics.from_line
+           LIMIT ?""",
+        (config_hash, config_hash, name, name, suffix_pattern, limit),
+    ).fetchall()
+
+
+def count_indirect_call_sites(conn: sqlite3.Connection, config_hash: str) -> int:
+    """Return total indirect call site count (0 when not indexed)."""
+    return conn.execute(
+        "SELECT COUNT(*) FROM indirect_call_sites WHERE config_hash=?",
+        (config_hash,),
+    ).fetchone()[0]
 
 
 # ---------------------------------------------------------------------------
