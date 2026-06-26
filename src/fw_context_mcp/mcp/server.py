@@ -607,14 +607,13 @@ def _start_bg_reindex_if_stale(root: Path) -> None:
         return
 
     def _waiter() -> None:
-        """Monitor the subprocess — kill if it hangs or times out.
+        """Monitor the subprocess — kill only if it hangs (no log output).
 
-        Total timeout: 30 minutes.  Inactivity timeout: 10 minutes (no new
-        log output).  Both are generous enough for LLM analysis on large
-        projects but prevent indefinite hangs from deadlocks or stuck HTTP
-        calls.
+        Uses log file size to detect progress.  When the subprocess stops
+        writing to the log for 10 minutes, it is considered hung and gets
+        killed.  There is NO total time limit — a legitimate reindex of
+        many files can take hours.
         """
-        total_deadline = time.monotonic() + 1800  # 30 min
         last_size = 0
         last_progress = time.monotonic()
         inactivity_timeout = 600  # 10 min
@@ -622,11 +621,6 @@ def _start_bg_reindex_if_stale(root: Path) -> None:
             while proc.poll() is None:
                 time.sleep(30)  # check every 30 s
                 now = time.monotonic()
-                # Check total timeout
-                if now > total_deadline:
-                    log.warning("Background reindex for %s timed out (30 min) — killing", root)
-                    _kill_and_log(proc, "timed out after 30 minutes")
-                    return
                 # Check inactivity via log file size
                 try:
                     curr_size = log_file.stat().st_size
