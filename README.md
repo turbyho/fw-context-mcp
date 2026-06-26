@@ -192,7 +192,7 @@ libclang parses every file     ← same -I, -D, --target as your compiler
 SQLite index on disk           ← symbols + call graph + FTS5 + embeddings
     │                              + pre-computed LLM analysis
     ▼
-27 MCP tools                   ← your AI queries the index, not files
+29 MCP tools                   ← your AI queries the index, not files
     │
     ▼
 Your AI assistant              ← Claude, OpenCode, Cursor, Codex, Kilo Code
@@ -244,6 +244,8 @@ querying the index:
 - `find_dead_code` — defined but never called (with project/vendor filtering)
 - `find_hotspots` — most-called functions ranked by caller count
 - `find_wrapper_callers` — which wrapper classes call which driver methods?
+- `find_indirect_call_sites` — where is a function pointer field/variable actually invoked?
+- `find_indirect_targets` — which functions are assigned to a callback field/param?
 - `trace_data_flow` — follow a type through function signatures to a target
 
 **🏗️ C++ Analysis** — Navigate classes and templates
@@ -576,9 +578,21 @@ Every tool has boundaries. Here are fw-context's — clearly stated.
 
 ### Callbacks and function pointers
 
-`find_callers` detects function pointers registered through framework APIs like
-`Thread::start(callback(&Class::method, this))` and through direct assignments
-like `driver.onData = &handleData`. These appear as `"indirect"` call edges.
+fw-context tracks function pointers end-to-end across three phases:
+
+1. **Registration** — `find_callers` and `find_references` detect function
+   pointers in assignments (`driver.onData = &handler`), call arguments
+   (`register_cb(&handler)`), variable initializers (`void (*fp)(int) = &handler`),
+   and designated struct initializers (`.onReady = &handler`). These appear as
+   `"indirect"` call edges.
+
+2. **Invocation** — `find_indirect_call_sites` finds where function pointers are
+   actually called, whether through fields (`driver.onData(buf, len)`),
+   variables (`stored_callback(42)`), or parameters (`cb(args)`).
+
+3. **Linking** — `find_indirect_targets` connects assignments to call sites
+   via the field's USR, answering "which functions can be called through
+   `onData`?" with precise, compiler-verified results.
 
 Registration through stored pointers in libraries (e.g. inside eModbus) where
 the actual call site is in precompiled code still has no call-graph edge
@@ -609,12 +623,11 @@ lost. The expanded form is there; the meta-programming is not.
 
 ### Indirect call sites (invocation side)
 
-While the registration side is covered (see **Callbacks and function pointers**
-above), the invocation side is not: when a stored function pointer is called
-directly (``stored_callback(args)`` or ``obj->onData(buf, len)``), libclang
-sees the field or variable but not the target function.  Detecting these call
-sites and linking them to their assignments via type-based data-flow is the
-next step.
+The invocation side is now covered — `find_indirect_call_sites` detects when
+function pointers are called through fields, variables, or parameters, and
+`find_indirect_targets` links them to their assignments. Dynamically-indexed
+arrays (`handlers[i](args)`), `void*`-erased callbacks, and multi-hop pointer
+chains through intermediate variables remain outside the reach of static analysis.
 
 ---
 
@@ -707,7 +720,7 @@ window become practical.
 |----------|--------|
 | **[Technical Overview](docs/README.md)** | Architecture diagrams, directory layout, features, supported ecosystems — the original README |
 | **[Installation Guide](docs/installation.md)** | Prerequisites, install, upgrade, Ollama setup, AI assistant integration |
-| **[Tools Reference](docs/tools.md)** | All 27 MCP tools, 10 CLI commands, search pipeline internals |
+| **[Tools Reference](docs/tools.md)** | All 29 MCP tools, 10 CLI commands, search pipeline internals |
 | **[Configuration](docs/configuration.md)** | `.fw-context/config.toml` + `local.toml` — shared project config and local developer overrides |
 | **[MCP Server](README-MCP.md)** | JSON-RPC protocol, tool schemas, error handling, debugging |
 
