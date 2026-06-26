@@ -522,7 +522,11 @@ def open_db(path: Path) -> sqlite3.Connection:
     # WAL mode — persistent on the DB file once set, but needs to be applied
     # on first-open.  Run outside executescript() to avoid an unnecessary
     # write transaction when the DB is already in WAL mode.
-    conn.execute("PRAGMA journal_mode = WAL")
+    try:
+        conn.execute("PRAGMA journal_mode = WAL")
+    except sqlite3.DatabaseError as e:
+        conn.close()
+        raise DatabaseCorruptionError(str(path), str(e)) from e
 
     # Load sqlite-vec extension for vector search (graceful when missing)
     try:
@@ -537,7 +541,11 @@ def open_db(path: Path) -> sqlite3.Connection:
     # is outdated.  executescript() implies a write transaction — skipping it
     # when the schema is current means read-only queries never acquire a
     # write lock, even while a background reindex is writing.
-    current_schema_ver = conn.execute("PRAGMA user_version").fetchone()[0]
+    try:
+        current_schema_ver = conn.execute("PRAGMA user_version").fetchone()[0]
+    except sqlite3.DatabaseError as e:
+        conn.close()
+        raise DatabaseCorruptionError(str(path), str(e)) from e
 
     if current_schema_ver < CURRENT_SCHEMA_VERSION:
         try:

@@ -559,6 +559,46 @@ def _start_bg_reindex_if_stale(root: Path) -> None:
                 ).fetchone()[0]
                 if unanalyzed == 0:
                     return
+
+            # Sync stored mtimes for stale files that are NOT in
+            # compile_commands.json.  These files (typically header-only
+            # includes) are never processed by the background reindex
+            # subprocess, so their stored mtimes stay stale forever unless
+            # we update them here.  Without this, _count_modified_files
+            # keeps returning > 0 after every reindex finishes → infinite
+            # reindex-respawn loop.
+            if modified > 0:
+                cc_path = Path(cfg["compile_commands_path"])
+                if cc_path.exists():
+                    cc_files = {str(Path(u.file).resolve()) for u in parse_cc(cc_path)}
+                    stale_rows = conn.execute(
+                        "SELECT id, path, mtime FROM files WHERE config_hash = ?",
+                        (cfg["config_hash"],),
+                    ).fetchall()
+                    synced = 0
+                    for r in stale_rows:
+                        stored = r["mtime"]
+                        p = Path(r["path"])
+                        if not p.is_absolute():
+                            p = (root / r["path"]).resolve()
+                        try:
+                            disk_mtime = p.stat().st_mtime
+                        except OSError:
+                            continue
+                        if stored == 0 or disk_mtime > stored + MTIME_TOLERANCE_S:
+                            if str(p.resolve()) not in cc_files:
+                                conn.execute(
+                                    "UPDATE files SET mtime = ? WHERE id = ?",
+                                    (disk_mtime, r["id"]),
+                                )
+                                synced += 1
+                    if synced > 0:
+                        conn.commit()
+                        log.info(
+                            "Synced %d stale file mtimes not in compile_commands.json",
+                            synced,
+                        )
+                        modified = _count_modified_files(conn, cfg["config_hash"], root)
     finally:
         conn.close()
 
