@@ -459,9 +459,9 @@ def _start_bg_watcher(root: Path) -> None:
                             if cfg_data:
                                 cfg = load_config(project_root=root)
                                 if cfg.llm.enabled and cfg.llm.analyze_symbols:
-                                    _build_llm_analysis(conn, cfg_data["config_hash"], cfg.llm)
+                                    _build_llm_analysis(conn, cfg_data["config_hash"], cfg.llm, db_path.parent)
                                     if cfg.llm.analyze_files:
-                                        _build_file_analysis(conn, cfg_data["config_hash"], cfg.llm)
+                                        _build_file_analysis(conn, cfg_data["config_hash"], cfg.llm, db_path.parent)
                                     conn.commit()
                                     log.debug("Watcher LLM analysis completed for %s", root)
                         finally:
@@ -607,19 +607,60 @@ def _start_bg_reindex_if_stale(root: Path) -> None:
         return
 
     def _waiter() -> None:
+        """Monitor the subprocess — kill if it hangs or times out.
+
+        Total timeout: 30 minutes.  Inactivity timeout: 10 minutes (no new
+        log output).  Both are generous enough for LLM analysis on large
+        projects but prevent indefinite hangs from deadlocks or stuck HTTP
+        calls.
+        """
+        total_deadline = time.monotonic() + 1800  # 30 min
+        last_size = 0
+        last_progress = time.monotonic()
+        inactivity_timeout = 600  # 10 min
         try:
-            proc.wait(timeout=14400)  # 4 h — generous, catches hung subprocess
+            while proc.poll() is None:
+                proc.wait(timeout=30)  # check every 30 s
+                now = time.monotonic()
+                # Check total timeout
+                if now > total_deadline:
+                    log.warning("Background reindex for %s timed out (30 min) — killing", root)
+                    _kill_and_log(proc, "timed out after 30 minutes")
+                    return
+                # Check inactivity via log file size
+                try:
+                    curr_size = log_file.stat().st_size
+                except OSError:
+                    curr_size = last_size
+                if curr_size > last_size:
+                    last_size = curr_size
+                    last_progress = now
+                elif now - last_progress > inactivity_timeout:
+                    log.warning(
+                        "Background reindex for %s inactive for %ds — killing",
+                        root, int(now - last_progress),
+                    )
+                    _kill_and_log(proc, f"inactive for {int(now - last_progress)}s")
+                    return
         except subprocess.TimeoutExpired:
             log.warning("Background reindex for %s timed out — killing", root)
-            try:
-                proc.kill()
-                proc.wait(timeout=10)
-            except Exception:
-                pass
+            _kill_and_log(proc, "timed out")
         finally:
             fcntl.flock(lock_fd, fcntl.LOCK_UN)
             os.close(lock_fd)
         log.info("Background reindex finished for %s (exit %d)", root, proc.returncode)
+
+    def _kill_and_log(p: subprocess.Popen, reason: str) -> None:
+        try:
+            p.kill()
+            p.wait(timeout=10)
+        except Exception:
+            pass
+        try:
+            with open(log_file, "a") as fh:
+                fh.write(f"Killed: {reason}\n")
+        except OSError:
+            pass
 
     threading.Thread(target=_waiter, daemon=True).start()
 
@@ -1149,16 +1190,18 @@ def _reindex_file_impl(
             exclude_paths = cfg.exclude_root_paths(root)
             t0 = time.monotonic()
             total_symbols = 0
+            from ..indexer.db import write_lock as db_write_lock
             from ..indexer.ops import store_symbols_for_unit
             for unit in matching:
-                with transaction(conn):
-                    syms_added, _ = store_symbols_for_unit(
-                        conn, unit, config_hash, root,
-                        source_roots=source_roots,
-                        exclude_paths=exclude_paths,
-                        index_refs=cfg.index.index_refs,
-                    )
-                    total_symbols += syms_added
+                with db_write_lock(db_path.parent, timeout=10.0):
+                    with transaction(conn):
+                        syms_added, _ = store_symbols_for_unit(
+                            conn, unit, config_hash, root,
+                            source_roots=source_roots,
+                            exclude_paths=exclude_paths,
+                            index_refs=cfg.index.index_refs,
+                        )
+                        total_symbols += syms_added
         elapsed = round(time.monotonic() - t0, 2)
         result: dict = {
             "file": str(target),
@@ -1179,9 +1222,9 @@ def _reindex_file_impl(
             from ..indexer.runner import _build_file_analysis, _build_llm_analysis
             conn2 = open_db(db_path)
             try:
-                _build_llm_analysis(conn2, config_hash, cfg.llm)
+                _build_llm_analysis(conn2, config_hash, cfg.llm, db_path.parent)
                 if cfg.llm.analyze_files:
-                    _build_file_analysis(conn2, config_hash, cfg.llm)
+                    _build_file_analysis(conn2, config_hash, cfg.llm, db_path.parent)
                 conn2.commit()
                 analyzed_count = conn2.execute(
                     "SELECT COUNT(*) FROM llm_analysis a JOIN symbols s ON s.id = a.symbol_id WHERE s.config_hash = ?",
@@ -1200,7 +1243,7 @@ def _reindex_file_impl(
             from ..indexer.runner import _build_overrides
             conn3 = open_db(db_path)
             try:
-                _build_overrides(conn3, config_hash)
+                _build_overrides(conn3, config_hash, db_path.parent)
                 conn3.commit()
             finally:
                 conn3.close()
