@@ -22,9 +22,10 @@ from .compile_commands import parse as parse_compile_commands
 from .config_hash import compute as compute_config_hash
 from .db import (
     CURRENT_SCHEMA_VERSION,
-    WriteLockTimeout,
+    drop_fts_triggers,
     get_file_mtimes,
     open_db,
+    rebuild_fts,
     transaction,
     upsert_build_config,
     upsert_project,
@@ -743,12 +744,15 @@ def _build_overrides(conn, config_hash: str, db_dir: Path, *, write_lock_held: b
     )
 
 
-def _process_unit(unit, config_hash, project_root, source_roots, exclude_paths, index_refs, db_path, existing_files):
+def _process_unit(unit, config_hash, project_root, source_roots, exclude_paths, index_refs, db_path, existing_files, lock=None, conn=None):
     """Process one translation unit: check staleness, parse, store.
 
-    Opens its own DB connection so it is safe to call from worker threads.
-    Skips the TU if it is excluded by ``exclude_paths`` or if its mtime
-    matches the stored value (no changes since last index).
+    Opens its own DB connection when *conn* is ``None``, otherwise reuses
+    the caller-supplied connection (persistent per-worker connection).
+
+    Serializes DB writes via *lock* when supplied (``threading.Lock`` for
+    intra-process synchronization).  When *lock* is ``None``, the caller
+    is responsible for serialisation (sequential path with fcntl wrap).
 
     Args:
         unit: The ``CompilationUnit`` to parse (file path + clang flags).
@@ -758,10 +762,16 @@ def _process_unit(unit, config_hash, project_root, source_roots, exclude_paths, 
         source_roots: Directories whose symbols are considered project code.
         exclude_paths: Directories to skip during extraction.
         index_refs: When True, extract call-graph references.
-        db_path: Path to the SQLite database — each worker opens its own
-            connection to this file so concurrent access is safe.
+        db_path: Path to the SQLite database — used to open a connection
+            when *conn* is ``None``.
         existing_files: Dictionary mapping file paths to ``(file_id, mtime)``
             tuples, used to skip unchanged translation units.
+        lock: Optional ``threading.Lock`` used as a context manager to
+            serialise DB writes between workers (intra-process).
+        conn: Optional persistent SQLite connection — when provided, the
+            caller manages its lifecycle (open once per worker thread,
+            close after all TUs).  When ``None``, a connection is opened
+            and closed for this call.
 
     Returns:
         A tuple ``(status, symbols_added, refs_added)`` where ``status`` is
@@ -771,7 +781,7 @@ def _process_unit(unit, config_hash, project_root, source_roots, exclude_paths, 
     """
     resolved_tu = unit.file.resolve()
     if any(resolved_tu == ep or resolved_tu.is_relative_to(ep) for ep in exclude_paths):
-        return ("unchanged", 0, 0)
+        return ("unchanged", 0, 0, (0.0, 0.0, 0.0))
 
     file_path = str(unit.file)
     if file_path in existing_files:
@@ -781,27 +791,68 @@ def _process_unit(unit, config_hash, project_root, source_roots, exclude_paths, 
         except OSError:
             current_mtime = 0.0
         if current_mtime <= stored_mtime + MTIME_TOLERANCE_S:
-            return ("unchanged", 0, 0)
+            return ("unchanged", 0, 0, (0.0, 0.0, 0.0))
 
-    conn = open_db(db_path)
+    # Parse with libclang outside any lock — this is the expensive
+    # CPU-bound step.  Only serialise DB writes, not parsing.
+    from .symbols import extract_all
+
+    t_parse_start = time.monotonic()
     try:
-        with write_lock(db_path.parent, timeout=10.0):
+        parsed = extract_all(
+            unit,
+            source_roots=source_roots,
+            exclude_paths=exclude_paths,
+            with_refs=index_refs,
+        )
+    except Exception as exc:
+        log.warning("skip TU %s: %s", unit.file.name, exc)
+        return ("skipped", 0, 0, (0.0, 0.0, 0.0))
+    t_parse_end = time.monotonic()
+
+    # Resolve connection: persistent (callable → lazy open, don't close),
+    # explicit, or own (open now, close after).
+    if callable(conn):
+        conn = conn()          # lazy thread-local — caller manages lifecycle
+        own_conn = False
+    elif conn is None:
+        conn = open_db(db_path)
+        own_conn = True
+    else:
+        own_conn = False       # caller-supplied, don't close
+
+    t_lock_start = time.monotonic()
+    try:
+        # threading.Lock (intra-process) or nullcontext (sequential path
+        # where the caller holds fcntl write_lock across all TUs)
+        lock_ctx: object = lock if lock is not None else nullcontext()
+        with lock_ctx:
+            t_write_start = time.monotonic()
             with transaction(conn, checkpoint=False):
                 syms_added, refs_added = store_symbols_for_unit(
                     conn, unit, config_hash, project_root,
                     source_roots=source_roots,
                     exclude_paths=exclude_paths,
                     index_refs=index_refs,
+                    pre_parsed=parsed,
+                    existing_files=existing_files,
                 )
-        return ("updated", syms_added, refs_added)
-    except WriteLockTimeout:
-        log.warning("Could not acquire write lock for %s — skipping TU %s", db_path.parent, unit.file.name)
-        return ("skipped", 0, 0)
+            t_write_end = time.monotonic()
+            t_parse = t_parse_end - t_parse_start
+            t_lock = t_write_start - t_lock_start
+            t_write = t_write_end - t_write_start
+            log.debug(
+                "  TU %s: parse=%.1fs lock_wait=%.2fs write=%.1fs syms=%d refs=%d",
+                unit.file.name, t_parse, t_lock, t_write, syms_added, refs_added,
+            )
+        timing = (t_parse, t_lock, t_write)
+        return ("updated", syms_added, refs_added, timing)
     except Exception as exc:
         log.warning("skip TU %s: %s", unit.file.name, exc)
-        return ("skipped", 0, 0)
+        return ("skipped", 0, 0, (0.0, 0.0, 0.0))
     finally:
-        conn.close()
+        if own_conn:
+            conn.close()
 
 
 def run(
@@ -917,35 +968,102 @@ def run(
 
     existing_files = get_file_mtimes(conn, config_hash)
 
+    # Drop FTS5 content-sync triggers before bulk indexing — each symbol
+    # INSERT/DELETE/UPDATE would otherwise pay per-row FTS index overhead
+    # (~2× write I/O).  The FTS table is rebuilt from scratch in one pass
+    # after all TUs are stored.
+    drop_fts_triggers(conn)
+
     total_syms = 0
     total_refs = 0
     skipped = 0
     unchanged = 0
     updated = 0
+    acc_parse = 0.0
+    acc_lock = 0.0
+    acc_write = 0.0
     t0 = time.monotonic()
 
     if parallel and len(units) > 1:
-        max_workers = min(os.cpu_count() or 2, 2)  # libclang contention kills scaling above 2
+        # Parsing + AST traversal is GIL-bound Python; more threads
+        # don't help.  Single worker, sequential path for simplicity.
+        max_workers = 1
         log.info("Parallel indexing with %d workers", max_workers)
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            futures = {
-                executor.submit(
-                    _process_unit, u, config_hash, project_root,
+
+        # ── Intra-process lock ──
+        # threading.Lock is user-space (no syscall per poll iteration).
+        # fcntl write_lock is acquired ONCE around the entire parallel
+        # block for cross-process protection (background reindex).
+        db_lock = threading.Lock()
+
+        # ── Per-thread persistent connections ──
+        # Each worker thread opens one SQLite connection lazily (on first
+        # use) and reuses it across TUs.  Without this, open_db() runs
+        # PRAGMA integrity_check on the entire 6+ GB DB for every TU.
+        _tlocal = threading.local()
+
+        def _worker_conn_factory():
+            """Lazy thread-local connection — called inside _process_unit."""
+            if not hasattr(_tlocal, "conn"):
+                # integrity_check already ran on the main connection;
+                # skip it for workers — scanning 6+ GB per worker
+                # saturates disk I/O and delays writes by minutes.
+                _tlocal.conn = open_db(db_path, skip_integrity_check=True)
+            return _tlocal.conn
+
+        with write_lock(db_path.parent, timeout=60.0):
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                futures = {
+                    executor.submit(
+                        _process_unit, u, config_hash, project_root,
+                        source_roots, exclude_paths, index_refs, db_path, existing_files,
+                        lock=db_lock, conn=_worker_conn_factory,
+                    ): i
+                    for i, u in enumerate(units)
+                }
+                for future in as_completed(futures):
+                    try:
+                        status, syms, refs, timing = future.result()
+                    except Exception as exc:
+                        log.warning("Worker failed: %s", exc)
+                        skipped += 1
+                        continue
+                    if status == "updated":
+                        updated += 1
+                        total_syms += syms
+                        total_refs += refs
+                        acc_parse += timing[0]
+                        acc_lock += timing[1]
+                        acc_write += timing[2]
+                    elif status == "unchanged":
+                        unchanged += 1
+                    elif status == "skipped":
+                        skipped += 1
+                    if updated % 50 == 0 and updated > 0:
+                        elapsed = time.monotonic() - t0
+                        log.info(
+                            "  %d/%d TUs, %d syms, %d refs, %.1fs | "
+                            "parse=%.1fs lock=%.1fs write=%.1fs",
+                            updated + unchanged + skipped, len(units),
+                            total_syms, total_refs, elapsed,
+                            acc_parse, acc_lock, acc_write,
+                        )
+    else:
+        # Sequential path — uses per-TU transactions; wrap in fcntl lock
+        # once so a background reindex cannot interleave writes.
+        with write_lock(db_path.parent, timeout=60.0):
+            for i, unit in enumerate(units):
+                status, syms, refs, timing = _process_unit(
+                    unit, config_hash, project_root,
                     source_roots, exclude_paths, index_refs, db_path, existing_files,
-                ): i
-                for i, u in enumerate(units)
-            }
-            for future in as_completed(futures):
-                try:
-                    status, syms, refs = future.result()
-                except Exception as exc:
-                    log.warning("Worker failed: %s", exc)
-                    skipped += 1
-                    continue
+                )
                 if status == "updated":
                     updated += 1
                     total_syms += syms
                     total_refs += refs
+                    acc_parse += timing[0]
+                    acc_lock += timing[1]
+                    acc_write += timing[2]
                 elif status == "unchanged":
                     unchanged += 1
                 elif status == "skipped":
@@ -953,31 +1071,28 @@ def run(
                 if updated % 50 == 0 and updated > 0:
                     elapsed = time.monotonic() - t0
                     log.info(
-                        "  %d/%d TUs processed, %d symbols, %d refs, %.1fs elapsed",
-                        updated + unchanged + skipped, len(units),
-                        total_syms, total_refs, elapsed,
+                        "  %d/%d TUs, %d syms, %d refs, %.1fs | "
+                        "parse=%.1fs lock=%.1fs write=%.1fs",
+                        i + 1, len(units), total_syms, total_refs, elapsed,
+                        acc_parse, acc_lock, acc_write,
                     )
-    else:
-        # Sequential path — uses per-TU transactions
-        for i, unit in enumerate(units):
-            status, syms, refs = _process_unit(
-                unit, config_hash, project_root,
-                source_roots, exclude_paths, index_refs, db_path, existing_files,
-            )
-            if status == "updated":
-                updated += 1
-                total_syms += syms
-                total_refs += refs
-            elif status == "unchanged":
-                unchanged += 1
-            elif status == "skipped":
-                skipped += 1
-            if updated % 50 == 0 and updated > 0:
-                elapsed = time.monotonic() - t0
-                log.info(
-                    "  %d/%d TUs processed, %d symbols, %d refs, %.1fs elapsed",
-                    i + 1, len(units), total_syms, total_refs, elapsed,
-                )
+
+    # Rebuild FTS5 table from the now-complete symbols table — restores
+    # full-text search after the triggers were dropped before indexing.
+    log.info("Rebuilding FTS5 index...")
+    t_fts_start = time.monotonic()
+    rebuild_fts(conn)
+    t_fts = time.monotonic() - t_fts_start
+
+    elapsed = time.monotonic() - t0
+    log.info(
+        "Index summary: %d updated, %d unchanged, %d skipped, "
+        "%d syms, %d refs, %.1fs total | "
+        "parse=%.1fs lock_wait=%.1fs write=%.1fs fts_rebuild=%.1fs",
+        updated, unchanged, skipped,
+        total_syms, total_refs, elapsed,
+        acc_parse, acc_lock, acc_write, t_fts,
+    )
 
     # Embedding generation (opt-in)
     if index_embeddings and llm_config is not None and llm_config.enabled:

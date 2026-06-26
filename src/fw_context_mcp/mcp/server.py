@@ -140,10 +140,25 @@ def _resolve_context(project_root: str | None) -> tuple[Path, Config, str, Path]
     return cfg.index.db_dir / project_id / "index.db", cfg, project_id, root
 
 
+# Per-process integrity-check cache: PRAGMA integrity_check scans the entire
+# DB (15–30 s on 6+ GB).  We run it once per database path and skip it on
+# subsequent opens — corruption is rare and read queries cannot cause it.
+_integrity_checked: set[str] = set()
+
+
 def _open_db_safe(db_path: Path) -> tuple[sqlite3.Connection | None, dict | None]:
-    """Open the database, returning (conn, None) or (None, error_dict) on corruption."""
+    """Open the database, returning (conn, None) or (None, error_dict) on corruption.
+
+    Runs ``PRAGMA integrity_check`` only once per database path (per process
+    lifetime).  Subsequent opens skip the check — on 5+ GB databases a full
+    scan takes 15–30 s and turns every MCP query into a disk-bound operation.
+    """
+    db_key = str(db_path.resolve())
+    skip = db_key in _integrity_checked
     try:
-        return open_db(db_path), None
+        conn = open_db(db_path, skip_integrity_check=skip)
+        _integrity_checked.add(db_key)
+        return conn, None
     except DatabaseCorruptionError as e:
         return None, {
             "error": f"Database corruption detected: {e.details}",
@@ -1238,19 +1253,38 @@ def _reindex_file_impl(
 
         from ..indexer.db import write_lock as db_write_lock
         from ..indexer.ops import store_symbols_for_unit
+        from ..indexer.symbols import extract_all
+
+        # ── Parse outside the write lock ──
+        # libclang is CPU-bound; running it inside the lock serialises
+        # parsing when multiple TUs match (e.g. reindexing a header
+        # included by several .cpp files).
+        parsed_units: list[tuple[object, object]] = []
+        for unit in matching:
+            try:
+                parsed = extract_all(
+                    unit,
+                    source_roots=source_roots,
+                    exclude_paths=exclude_paths,
+                    with_refs=cfg.index.index_refs,
+                )
+                parsed_units.append((unit, parsed))
+            except Exception as exc:
+                log.warning("skip TU %s during reindex: %s", unit.file.name, exc)
 
         t0 = time.monotonic()
         total_symbols = 0
 
         with db_write_lock(db_path.parent, timeout=20.0):
             # ── Phase 1: main symbol write ──
-            for unit in matching:
+            for unit, parsed in parsed_units:
                 with transaction(conn):
                     syms_added, _ = store_symbols_for_unit(
                         conn, unit, config_hash, root,
                         source_roots=source_roots,
                         exclude_paths=exclude_paths,
                         index_refs=cfg.index.index_refs,
+                        pre_parsed=parsed,
                     )
                     total_symbols += syms_added
 
