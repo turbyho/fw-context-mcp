@@ -47,6 +47,7 @@ from ..indexer.compile_commands import parse as parse_cc
 from ..indexer.db import (
     CURRENT_SCHEMA_VERSION,
     DatabaseCorruptionError,
+    count_indirect_call_sites,
     count_refs,
     find_refs,
     get_active_config,
@@ -61,6 +62,9 @@ from ..indexer.db import (
     open_db,
     search_symbols,
     transaction,
+)
+from ..indexer.db import (
+    find_indirect_call_sites as query_indirect_call_sites,
 )
 from ..indexer.db import (
     get_class_members as query_class_members,
@@ -1610,7 +1614,9 @@ def get_symbol_context(
     Use ``project_only=False`` to see all callers/callees.
 
     Returns dict with: name, qualified_name, kind, file, line, signature,
-    is_definition, callers (list), callees (list), source (body text).
+    is_definition, callers (list), callees (list), source (body text),
+    indirect_call_sites (list, for field/variable symbols — where the
+    function pointer is actually invoked).
     For enums also returns constants and enum_value.
     When LLM analysis has been generated (``fw-context index --analyze``),
     includes ``llm_analysis``: {summary, inputs, outputs, model, analyzed_at}
@@ -1687,6 +1693,23 @@ def get_symbol_context(
                     for c in callees_rows
                 ]
 
+            # Indirect call sites — for function pointer fields and variables
+            indirect_calls_list: list[dict] = []
+            if row["kind"] in ("field", "variable"):
+                ics_rows = query_indirect_call_sites(
+                    conn, config_hash, row["qualified_name"] or row["name"], limit=200
+                )
+                indirect_calls_list = [
+                    {
+                        "file": abs_path(root, r["from_file"]),
+                        "line": r["from_line"],
+                        "expr_text": r["expr_text"],
+                        "fn_ptr_type": r["fn_ptr_type"],
+                        "caller": r["caller_qname"] or r["caller_name"] or "<file scope>",
+                    }
+                    for r in ics_rows
+                ]
+
             # For enums, collect all constants with their values
             enum_constants: list[dict] = []
             if row["kind"] == "enum":
@@ -1729,6 +1752,7 @@ def get_symbol_context(
         "is_pure_virtual": bool(row["is_pure_virtual"]),
         "callers": callers_list,
         "callees": callees_list,
+        "indirect_call_sites": indirect_calls_list,
     }
     if row["template_usr"]:
         result["template_usr"] = row["template_usr"]
@@ -1880,6 +1904,81 @@ def find_references(
         initializers, or init lists), ``"template_ref"``.
     """
     return _references_result(name, project_root, ref_kind=None, limit=limit)
+
+
+@mcp.tool()
+def find_indirect_call_sites(
+    name: Annotated[str, Field(description="Name of the function pointer field or variable to find call sites of. E.g. 'onData' finds all calls through Driver::onData.")],
+    project_root: Annotated[str | None, Field(description="Project root directory. Auto-detected if omitted.")] = None,
+    limit: Annotated[int, Field(description="Maximum results (default 50).")] = 50,
+) -> list[dict]:
+    """Find indirect call sites where a function pointer field or variable is invoked.
+
+    Returns locations where a function pointer is called through a field
+    access (``driver.onData(buf, len)``) or variable dereference
+    (``stored_callback(42)``).
+
+    Read-only. No side effects. Use this to answer "where is this function
+    pointer invoked?" as opposed to ``find_callers`` which answers "who
+    calls this function?" and ``find_references`` which answers "where is
+    this symbol read or assigned?"
+
+    Requires the reference index (``fw-context index`` — refs on by default).
+
+    Args:
+        name: Name of the function pointer field or variable.
+            E.g. ``"onData"`` finds every call through a field named
+            ``onData``.  Uses three-tier resolution: exact name, exact
+            qualified, suffix LIKE.
+        project_root: Project root directory. Auto-detected if omitted.
+        limit: Maximum results (default 50, max 200).
+
+    Returns:
+        list of dicts, each with: file, line, expr_text (the callee
+        expression, e.g. ``"driver.onData"``), target_usr, target_name,
+        fn_ptr_type (the function pointer type signature), caller
+        (enclosing function name), caller_kind.
+    """
+    db_path, cfg, project_id, root = _resolve_context(project_root)
+    if not db_path.exists():
+        return [{"error": f"No index found for {root}. Run 'fw-context index' first."}]
+    conn, err = _open_db_safe(db_path)
+    if err:
+        return [err]
+    assert conn is not None
+    try:
+        with conn:
+            cfg_data = get_active_config(conn, project_id)
+            if not cfg_data:
+                return [{"error": "No build config indexed."}]
+            config_hash = cfg_data["config_hash"]
+
+            if count_indirect_call_sites(conn, config_hash) == 0:
+                return [{"info": (
+                    "No indirect call sites indexed. Re-run 'fw-context index' "
+                    "to populate the table (added in Phase 2)."
+                )}]
+
+            limit = min(limit, 200)
+            rows = find_indirect_call_sites(conn, config_hash, name, limit=limit)
+            if not rows:
+                return [{"info": f"No indirect call sites found for '{name}'."}]
+
+            return [
+                {
+                    "file": abs_path(root, r["from_file"]),
+                    "line": r["from_line"],
+                    "expr_text": r["expr_text"],
+                    "target_usr": r["target_usr"],
+                    "target_name": r["target_name"],
+                    "fn_ptr_type": r["fn_ptr_type"],
+                    "caller": r["caller_qname"] or r["caller_name"] or "<file scope>",
+                    "caller_kind": r["caller_kind"],
+                }
+                for r in rows
+            ]
+    finally:
+        conn.close()
 
 
 # ── Graph analytics tools ─────────────────────────────────────────────────────

@@ -11,10 +11,12 @@ import logging
 from pathlib import Path
 
 from fw_context_mcp.indexer.db import (
+    delete_indirect_call_sites_for_file,
     delete_inheritance_for_file,
     delete_refs_for_file,
     delete_symbols_for_file,
     get_file_mtimes,
+    insert_indirect_call_sites_batch,
     insert_inheritance_batch,
     insert_refs_batch,
     insert_symbols_batch,
@@ -60,7 +62,7 @@ def store_symbols_for_unit(
 
     # Parse
     try:
-        syms, refs, inheritance = extract_all(
+        syms, refs, inheritance, indirect_call_sites = extract_all(
             unit,
             source_roots=source_roots,
             exclude_paths=exclude_paths,
@@ -129,13 +131,15 @@ def store_symbols_for_unit(
         insert_symbols_batch(conn, rows)
         syms_added = len(rows)
 
+    # Path-relative helper used by refs and indirect_call_sites blocks
+    def _rel(p: str) -> str:
+        try:
+            return str(Path(p).resolve().relative_to(project_root))
+        except ValueError:
+            return p
+
     # References
     if index_refs and refs:
-        def _rel(p: str) -> str:
-            try:
-                return str(Path(p).resolve().relative_to(project_root))
-            except ValueError:
-                return p
         tu_rel = _rel(file_path)
         delete_refs_for_file(conn, config_hash, tu_rel)
         ref_rows = [
@@ -144,6 +148,17 @@ def store_symbols_for_unit(
         ]
         insert_refs_batch(conn, ref_rows)
         refs_added = len(ref_rows)
+
+    # Indirect call sites (function pointer invocations)
+    if index_refs and indirect_call_sites:
+        tu_rel = _rel(file_path)
+        delete_indirect_call_sites_for_file(conn, config_hash, tu_rel)
+        ics_rows = [
+            (config_hash, _rel(ics.from_file), ics.from_line, ics.from_usr,
+             ics.expr_text, ics.target_usr, ics.target_name, ics.fn_ptr_type)
+            for ics in indirect_call_sites
+        ]
+        insert_indirect_call_sites_batch(conn, ics_rows)
 
     # Inheritance
     if inheritance:
