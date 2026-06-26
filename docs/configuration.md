@@ -56,7 +56,7 @@ Used only when running without `--no-build`.
 | `source_roots` | `[]` *(auto-detect)* | project | Directories to scan for symbols. **Empty = auto-detect** — scans `src`, `lib`, `app`, `include`, `modules`, `drivers` + framework dirs (`zephyr/`, `mbed-os/`) + top-level dirs from `compile_commands.json`. Set explicitly to narrow or extend: `["src", "lib", "/path/to/framework"]`. |
 | `exclude_paths` | `["build", "BUILD"]` | project | Directories to skip. Useful for generated code, test fixtures, vendored code. |
 | `index_refs` | `true` | project | Build cross-reference / call graph. On by default — enables `find_callers`, `find_call_path`, `find_dead_code`, etc. Set `false` or pass `--no-refs` for faster indexing on very large projects. |
-| `index_embeddings` | `true` | project | Generate vector embeddings during indexing. Requires Ollama. Adds ~1–2 minutes. Disable with `false` or `--no-embeddings`. Embeddings power semantic search and hybrid FTS5+vector re-ranking. |
+| `index_embeddings` | `true` | project | Generate vector embeddings during indexing. Requires Ollama. Embeddings power semantic search and hybrid FTS5+vector re-ranking. Disable with `false` or `--no-embeddings`. |
 
 ### `[llm]` — Ollama
 

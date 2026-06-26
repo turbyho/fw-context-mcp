@@ -48,14 +48,14 @@ fw-context.
 
 | Question | LLM Alone | LLM + fw-context |
 |----------|-----------|-----------------|
-| *"Who calls `spi_transfer`?"* | Grep for `spi_transfer` → 47 matches in vendor HAL, declarations, and comments → manually filter → ~10 min, still uncertain about callbacks | `find_callers("spi_transfer")` → 4 direct callers at exact file:line → 2 seconds, verified against compiled AST |
-| *"What would break if I change this signature?"* | Read every caller manually → grep for function name in each file → hope you didn't miss the callback registration → ~30 min, low confidence | `find_all_callers_recursive("spi_transfer", max_depth=5)` → transitive tree of 12 callers across 8 files → 3 seconds, exhaustive |
-| *"What does this function do?"* | Read the file → trace includes to understand types → look up macros → read callees manually → ~15 min | `get_symbol_context("boiler_control")` → body + callers + callees + pre-computed plain-English analysis → 1 call, instant |
-| *"Is there dead code?"* | Generate function list → grep for each → filter entry points/ISRs/constructors → verify candidates → **days** for a 10k-function codebase | `find_dead_code(project_only=true)` → 3 candidates at exact file:line → 5 seconds, then verify manually |
-| *"How does battery data reach the heating logic?"* | Read modbus_poll → read handleData → search for batt_soc references → trace through boiler_control → piece together mentally → ~40 min | `find_references("rt_data")` → 25 references in 5 functions across 4 files → complete data flow map → 2 seconds |
-| *"Find all code related to power management"* | Grep `power`, `sleep`, `low_power`, `pm_`, `suspend`, `resume` → 300+ hits, 90% in vendor headers → overload | `semantic_search("power management low power sleep modes")` → top 10 conceptually related symbols ranked by similarity → 1 second |
-| *"Give me an overview of this 4 300-line file"* | `Read file` → 4 300 lines → ~12 000 tokens burned on one file → still don't know the structure | `get_file_map("modem_msg.cpp")` → 426 symbols grouped by kind (methods, fields, enums, nested types) → ~800 tokens |
-| *"What's the full dependency tree of main()?"* | Read main → find each called function → read each of those → find their callees → exponential explosion of reading → **hours** | `find_callees_recursive("loop", max_depth=3)` → 30 callees at depths 1-3, project + framework → 5 seconds |
+| *"Who calls `spi_transfer`?"* | Grep for `spi_transfer` → 47 matches in vendor HAL, declarations, and comments → manually filter → still uncertain about callbacks | `find_callers("spi_transfer")` → 4 direct callers at exact file:line, verified against compiled AST |
+| *"What would break if I change this signature?"* | Read every caller manually → grep for function name in each file → hope you didn't miss the callback registration → low confidence | `find_all_callers_recursive("spi_transfer", max_depth=5)` → transitive tree of 12 callers across 8 files, exhaustive |
+| *"What does this function do?"* | Read the file → trace includes to understand types → look up macros → read callees manually | `get_symbol_context("boiler_control")` → body + callers + callees + pre-computed plain-English analysis → one call |
+| *"Is there dead code?"* | Generate function list → grep for each → filter entry points/ISRs/constructors → verify candidates → impractical for large codebases | `find_dead_code(project_only=true)` → candidates at exact file:line with `dead`/`possibly_dead` classification |
+| *"How does battery data reach the heating logic?"* | Read modbus_poll → read handleData → search for batt_soc references → trace through boiler_control → piece together mentally | `find_references("rt_data")` → 25 references in 5 functions across 4 files → complete data flow map |
+| *"Find all code related to power management"* | Grep `power`, `sleep`, `low_power`, `pm_`, `suspend`, `resume` → 300+ hits, 90% in vendor headers → overload | `semantic_search("power management low power sleep modes")` → top 10 conceptually related symbols ranked by similarity |
+| *"Give me an overview of this 4 300-line file"* | `Read file` → 4 300 lines → thousands of tokens on one file → still don't know the structure | `get_file_map("modem_msg.cpp")` → 426 symbols grouped by kind (methods, fields, enums, nested types) |
+| *"What's the full dependency tree of main()?"* | Read main → find each called function → read each of those → find their callees → exponential explosion of reading | `find_callees_recursive("loop", max_depth=3)` → 30 callees at depths 1-3, project + framework |
 
 ### The Token Economics
 
@@ -68,7 +68,6 @@ ask**.
 | Tokens to trace callers (3 levels) | 15 000–40 000 (exponential file reading) | 300–800 (one `find_all_callers_recursive` call) |
 | Tokens to find all references to a variable | 5 000–15 000 (grep + read each file) | 200–400 (one `find_references` call) |
 | Questions per conversation before context fills up | 3–5 | 15–25 |
-| **Cost per deep investigation** | **$0.50–$2.00** (burning context on file reads) | **$0.05–$0.20** (structured queries, minimal reads) |
 
 The AI with fw-context doesn't just answer faster — it can answer questions
 you'd never ask without it, because the token cost of asking would exhaust your
@@ -256,7 +255,7 @@ querying the index:
 
 **🔧 Maintenance** — Keep the index healthy
 - `get_active_build` — health check: is the index stale?
-- `reindex_file` — update one file (2 seconds after editing)
+- `reindex_file` — update one file after editing
 - `reset_index` — delete and rebuild
 - `list_projects` — what's indexed on this machine?
 - `check_ollama` — is Ollama available for smart_search?
@@ -350,7 +349,6 @@ project, you'd get a list of candidates to investigate.
 **LLM alone:** Reads `modbus.cpp` → reads `control.cpp` → pieces together the
 flow manually. Might miss the stale detection (`modbus_is_stale`) because it's
 a separate function. Might miss the hysteresis constants in `config.h`.
-Answer after ~20 minutes and 15 000 tokens.
 
 **LLM + fw-context:**
 ```
@@ -392,28 +390,23 @@ two ways.
 ### Without fw-context: The Manual Detective
 
 ```
-08:00  Open main.cpp. Find loop(). See ha_update() called every 5 seconds.
-       → Read file: 163 lines, ~800 tokens
-08:05  Search for ha_update. Open ha_mqtt.cpp. See it calls boiler_control().
-       → Read file: 113 lines, ~600 tokens
-08:10  Open control.cpp. Read boiler_control() — 42 lines, 5 conditions.
-       → Read file: 63 lines, ~400 tokens
-08:15  Search for BATT_VOLTAGE_THRESHOLD — config.h — 5380 = 53.80V.
-       → Another file read
-08:20  Search for TEMP_SENTINEL — also config.h — 125.0 = disconnected sensor.
-08:25  Search for modbus_is_stale — modbus.cpp — returns true after 5 min.
-08:30  Read modbus_poll() — sends SOC and voltage requests every 2 seconds.
-08:35  Read handleData() — validates and stores Modbus responses.
-08:40  Read getTemp() — DS18B20 with RunningMedian filter.
-08:50  Try to piece together: sensor → rt_data → boiler_control → relay.
-       But who calls handleData? Grep finds nothing. Must be a callback.
-       Search for onDataHandler — found in modbus_setup(). The callback
-       is registered there. The actual caller is inside eModbus library.
-09:10  Finally have a mental model of the data flow.
+Open main.cpp → find loop() → see ha_update() called.
+Search for ha_update → open ha_mqtt.cpp → see it calls boiler_control().
+Open control.cpp → read boiler_control() — 42 lines, 5 conditions.
+Search for BATT_VOLTAGE_THRESHOLD → config.h.
+Search for TEMP_SENTINEL → config.h.
+Search for modbus_is_stale → modbus.cpp.
+Read modbus_poll() — sends SOC and voltage requests.
+Read handleData() — validates and stores Modbus responses.
+Read getTemp() — DS18B20 with RunningMedian filter.
+Try to piece together: sensor → rt_data → boiler_control → relay.
+But who calls handleData? Grep finds nothing. Must be a callback.
+Search for onDataHandler → found in modbus_setup(). The callback
+is registered there. The actual caller is inside eModbus library.
+→ Finally have a mental model of the data flow.
 
-Total tokens burned: ~15 000 (reading 8 files, multiple searches)
+Total: 8 files read, multiple searches across codebase
 Questions answered: "What does boiler_control do and how does the data flow?"
-Time: ~70 minutes (if you're thorough)
 Confidence: Moderate — might have missed a reference or a macro
 ```
 
@@ -421,32 +414,31 @@ Confidence: Moderate — might have missed a reference or a macro
 
 ```
 get_symbol_context("boiler_control")
-→ Body + callers + callees + LLM analysis. One call. 500 tokens.
+→ Body + callers + callees + LLM analysis. One call.
 → Answers "what does this do and where does it fit?"
 
 find_references("rt_data")
-→ 25 references across 5 functions in 4 files. 300 tokens.
+→ 25 references across 5 functions in 4 files.
 → Complete data flow map.
 
 explain_symbol("modbus_poll")
-→ Pre-computed plain-English. 200 tokens.
+→ Pre-computed plain-English.
 → "Polls the Modbus server for battery SOC and voltage..."
 
 find_callers("handleData")
-→ Empty — it's a callback. 150 tokens.
+→ Empty — it's a callback.
 → This IS the answer: callback-based, invoked by Modbus library.
 
 find_call_path("loop", "handleData")
-→ No path found. 150 tokens.
+→ No path found.
 → Confirms the callback boundary.
 
 get_file_analysis("src/control.cpp")
-→ "Implements control logic for the boiler system..." 100 tokens.
+→ "Implements control logic for the boiler system..."
 → Context for the whole module.
 
-Total tokens burned: ~1 400 (6 tool calls, zero file reads)
+Total: 6 tool calls, zero file reads
 Questions answered: Full data flow, architecture, timing, edge cases
-Time: ~5 minutes
 Confidence: High — every reference is compiler-verified, every edge is from the AST
 ```
 
@@ -455,12 +447,10 @@ Confidence: High — every reference is compiler-verified, every edge is from th
 | | LLM Alone | LLM + fw-context |
 |---|---|---|
 | Files read | 8 (entire files) | 0 (index queries only) |
-| Token cost | ~15 000 | ~1 400 |
-| Time invested | ~70 minutes | ~5 minutes |
 | Callback discovery | Manual grep + luck | `find_callers` returning empty — explicit signal |
 | Macro resolution | Manual config.h reading | libclang already resolved them |
 | Data flow confidence | Mental model, could miss references | 25 references enumerated, every one accounted for |
-| **Questions you can ask** | Limited by token budget | Limited by tool coverage (27 tools, wide) |
+| **Questions you can ask** | Limited by token budget | Limited by tool coverage (29 tools, wide) |
 
 ---
 
@@ -519,8 +509,8 @@ fw-context index
 ```
 
 Auto-detects Zephyr, PlatformIO, Mbed OS, or wraps any build with `bear`.
-First indexing: ~90 seconds for 15 000 symbols. Subsequent: incremental,
-seconds.
+First indexing builds the full database. Subsequent runs are incremental —
+only changed files are re-parsed.
 
 ### 3. Start Asking Real Questions
 
@@ -543,7 +533,7 @@ Your AI now queries the index instead of grepping files.
 ### 4. Stay Fresh
 
 ```bash
-fw-context reindex src/control.cpp    # after editing — 2 seconds
+fw-context reindex src/control.cpp    # after editing — incremental, fast
 fw-context index                       # after a big merge
 # Or just work — auto-reindex detects stale files on query
 ```
@@ -677,7 +667,7 @@ fully functional without any LLM dependency.
 
 ```bash
 fw-context reset   # delete
-fw-context index   # rebuild — ~90 seconds for 15 000 symbols
+fw-context index   # rebuild
 ```
 
 The index is just a SQLite file. No permanent state.
