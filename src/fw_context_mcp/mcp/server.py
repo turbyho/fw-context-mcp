@@ -47,6 +47,7 @@ from ..indexer.compile_commands import parse as parse_cc
 from ..indexer.db import (
     CURRENT_SCHEMA_VERSION,
     DatabaseCorruptionError,
+    count_fp_assignments,
     count_indirect_call_sites,
     count_refs,
     find_refs,
@@ -65,6 +66,9 @@ from ..indexer.db import (
 )
 from ..indexer.db import (
     find_indirect_call_sites as query_indirect_call_sites,
+)
+from ..indexer.db import (
+    find_indirect_targets as query_indirect_targets,
 )
 from ..indexer.db import (
     get_class_members as query_class_members,
@@ -1617,6 +1621,11 @@ def get_symbol_context(
     is_definition, callers (list), callees (list), source (body text),
     indirect_call_sites (list, for field/variable symbols — where the
     function pointer is actually invoked).
+    For field and variable symbols that have function pointer type,
+    also includes ``resolution``: {assignments_found, call_sites_found,
+    resolved, note} indicating whether assignments and call sites are
+    linked (Phase 3).  ``resolved=False`` with a note when parts are
+    missing — LLM can detect uncertainty.
     For enums also returns constants and enum_value.
     When LLM analysis has been generated (``fw-context index --analyze``),
     includes ``llm_analysis``: {summary, inputs, outputs, model, analyzed_at}
@@ -1710,6 +1719,42 @@ def get_symbol_context(
                     for r in ics_rows
                 ]
 
+            # Resolution info — for function pointer fields/variables
+            resolution: dict | None = None
+            if row["kind"] in ("field", "variable"):
+                # Count assignments to this field
+                assign_count = conn.execute(
+                    "SELECT COUNT(*) FROM fp_assignments WHERE config_hash = ? AND lhs_usr = ?",
+                    (config_hash, symbol_usr),
+                ).fetchone()[0]
+                ics_count = len(indirect_calls_list)
+                resolved = assign_count > 0 and ics_count > 0
+                if assign_count > 0 or ics_count > 0:
+                    note_parts: list[str] = []
+                    if assign_count > 0:
+                        note_parts.append(f"{assign_count} function(s) assigned")
+                    else:
+                        note_parts.append("no assignments found")
+                    if ics_count > 0:
+                        note_parts.append(f"{ics_count} call site(s)")
+                    else:
+                        note_parts.append("no call sites found")
+                    if resolved:
+                        note_parts.append("fully resolved")
+                    else:
+                        note_parts.append(
+                            "not fully resolved — "
+                            "assignment may be in unindexed code or through type-erased API"
+                            if assign_count == 0
+                            else "call sites may be in unindexed code"
+                        )
+                    resolution = {
+                        "assignments_found": assign_count,
+                        "call_sites_found": ics_count,
+                        "resolved": resolved,
+                        "note": "; ".join(note_parts),
+                    }
+
             # For enums, collect all constants with their values
             enum_constants: list[dict] = []
             if row["kind"] == "enum":
@@ -1754,6 +1799,8 @@ def get_symbol_context(
         "callees": callees_list,
         "indirect_call_sites": indirect_calls_list,
     }
+    if resolution:
+        result["resolution"] = resolution
     if row["template_usr"]:
         result["template_usr"] = row["template_usr"]
     if row["parent_usr"]:
@@ -1923,6 +1970,9 @@ def find_indirect_call_sites(
     calls this function?" and ``find_references`` which answers "where is
     this symbol read or assigned?"
 
+    For the reverse query — which functions are assigned to a given field
+    or parameter — use ``find_indirect_targets``.
+
     Requires the reference index (``fw-context index`` — refs on by default).
 
     Args:
@@ -1974,6 +2024,87 @@ def find_indirect_call_sites(
                     "fn_ptr_type": r["fn_ptr_type"],
                     "caller": r["caller_qname"] or r["caller_name"] or "<file scope>",
                     "caller_kind": r["caller_kind"],
+                }
+                for r in rows
+            ]
+    finally:
+        conn.close()
+
+
+@mcp.tool()
+def find_indirect_targets(
+    name: Annotated[str, Field(description="Name of the function pointer field, variable, or parameter. "
+        "E.g. 'onData' — returns functions assigned to Driver::onData.")],
+    project_root: Annotated[str | None, Field(description="Project root. Auto-detected if omitted.")] = None,
+    limit: Annotated[int, Field(description="Maximum results (default 50, max 200).")] = 50,
+) -> list[dict]:
+    """Read-only. Find functions assigned to a function pointer field or variable.
+
+    Links assignment sites (``driver.onData = &handler``) to call
+    sites (``driver.onData(buf, len)``) via the field's USR.
+
+    Returns each function that could be invoked through the named function
+    pointer, showing both the assignment location and the call site(s).
+    When a function is assigned but no call site is found, ``call_file``
+    and ``call_line`` are ``null`` — the assignment exists but the
+    invocation may be in unindexed code.
+
+    For the reverse query — where is this field or parameter called — use
+    ``find_indirect_call_sites``.
+
+    Read-only. No side effects. Requires the reference index
+    (``fw-context index`` — refs on by default).
+
+    Args:
+        name: Name of the function pointer field, variable, or parameter.
+            E.g. ``"onData"`` finds every function assigned to a field
+            named ``onData``.  Uses three-tier resolution.
+        project_root: Project root directory. Auto-detected if omitted.
+        limit: Maximum results (default 50, max 200).
+
+    Returns:
+        list of dicts, each with: rhs_name (assigned function),
+        rhs_qname, fn_ptr_type, method (assignment/call_arg/var_init/
+        init_list), assign_file, assign_line, assign_caller,
+        call_file, call_line, call_expr_text.
+    """
+    db_path, cfg, project_id, root = _resolve_context(project_root)
+    if not db_path.exists():
+        return [{"error": f"No index found for {root}. Run 'fw-context index' first."}]
+    conn, err = _open_db_safe(db_path)
+    if err:
+        return [err]
+    assert conn is not None
+    try:
+        with conn:
+            cfg_data = get_active_config(conn, project_id)
+            if not cfg_data:
+                return [{"error": "No build config indexed."}]
+            config_hash = cfg_data["config_hash"]
+
+            if count_fp_assignments(conn, config_hash) == 0:
+                return [{"info": (
+                    "No function pointer assignments indexed. Re-run "
+                    "'fw-context index' to populate the table (added in Phase 3)."
+                )}]
+
+            limit = min(limit, 200)
+            rows = query_indirect_targets(conn, config_hash, name, limit=limit)
+            if not rows:
+                return [{"info": f"No functions assigned to '{name}'."}]
+
+            return [
+                {
+                    "rhs_name": r["rhs_name"],
+                    "rhs_qname": r["rhs_qname"] or r["rhs_name"],
+                    "fn_ptr_type": r["fn_ptr_type"],
+                    "method": r["method"],
+                    "assign_file": abs_path(root, r["assign_file"]),
+                    "assign_line": r["assign_line"],
+                    "assign_caller": r["assign_caller"] or "<file scope>",
+                    "call_file": abs_path(root, r["call_file"]) if r["call_file"] else None,
+                    "call_line": r["call_line"],
+                    "call_expr_text": r["call_expr_text"],
                 }
                 for r in rows
             ]
@@ -2201,11 +2332,21 @@ def find_dead_code(
 ) -> list[dict]:
     """Read-only. Find functions/methods that are defined but never called.
 
-    Use to spot unused code candidates.  Expect false positives:
-    constructors called via factories or template instantiation, interrupt
-    handlers (ISRs), virtual method overrides, and weak-aliased symbols
-    often have no direct calls in the reference index.  Verify each hit
-    with ``find_callers`` before deleting.
+    Returns two categories of results, each with a ``status`` field:
+
+    * ``"dead"`` — no references at all (neither calls nor function
+      pointer assignments).  Likely unused.
+    * ``"possibly_dead"`` — the function is assigned to a function
+      pointer (Phase 1 ``ref_kind="indirect"``) but no call site
+      through that pointer was resolved (Phase 3).  This means the
+      function MIGHT be called through unindexed code or a type-erased
+      API.  LLM should treat this as uncertain, not as confirmed dead
+      code.  Verify each hit with ``find_indirect_targets`` before
+      deleting.
+
+    Expect additional false positives from constructors called via
+    factories, ISRs, virtual method overrides, and weak-aliased symbols.
+    Always verify before deleting.
 
     By default, SDK/vendor paths are auto-excluded based on the build
     system (mbed-os/ for Mbed OS, .pio/ for PlatformIO, zephyr/ + build/
@@ -2232,7 +2373,7 @@ def find_dead_code(
             exclude_paths=final_excludes,
         )
         if not rows:
-            return [{"info": "No dead code found — every defined function has at least one caller."}]
+            return [{"info": "No dead or possibly-dead functions found — every defined function has at least one caller."}]
         return rows
     finally:
         conn.close()

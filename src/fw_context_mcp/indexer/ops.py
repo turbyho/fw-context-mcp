@@ -11,11 +11,13 @@ import logging
 from pathlib import Path
 
 from fw_context_mcp.indexer.db import (
+    delete_fp_assignments_for_file,
     delete_indirect_call_sites_for_file,
     delete_inheritance_for_file,
     delete_refs_for_file,
     delete_symbols_for_file,
     get_file_mtimes,
+    insert_fp_assignments_batch,
     insert_indirect_call_sites_batch,
     insert_inheritance_batch,
     insert_refs_batch,
@@ -62,7 +64,7 @@ def store_symbols_for_unit(
 
     # Parse
     try:
-        syms, refs, inheritance, indirect_call_sites = extract_all(
+        syms, refs, inheritance, indirect_call_sites, fp_assignments = extract_all(
             unit,
             source_roots=source_roots,
             exclude_paths=exclude_paths,
@@ -159,6 +161,17 @@ def store_symbols_for_unit(
             for ics in indirect_call_sites
         ]
         insert_indirect_call_sites_batch(conn, ics_rows)
+
+    # Function pointer assignments (Phase 3 — links assignments to call sites)
+    if index_refs and fp_assignments:
+        delete_fp_assignments_for_file(conn, config_hash, tu_rel)
+        fpa_rows = [
+            (config_hash, _rel(fpa.from_file), fpa.from_line,
+             fpa.lhs_usr, fpa.lhs_name, fpa.rhs_usr, fpa.rhs_name,
+             fpa.fn_ptr_type, fpa.method, fpa.from_usr)
+            for fpa in fp_assignments
+        ]
+        insert_fp_assignments_batch(conn, fpa_rows)
 
     # Inheritance
     if inheritance:
