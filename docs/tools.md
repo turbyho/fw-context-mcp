@@ -414,14 +414,41 @@ Output: {"name": "modem_connect", "kind": "function",
            {"name": "send_at_command", "kind": "function", "file": "/path/src/modem.c"},
            {"name": "wait_for_urc", "kind": "function", "file": "/path/src/modem.c"},
            {"name": "pdp_activate", "kind": "function", "file": "/path/src/net.c"}
-         ]}
+         ],
+         "indirect_call_sites": [],
+         "resolution": null}
+```
+
+For function pointer fields the output includes call sites and resolution:
+
+```
+Input:  {"name": "onData", "project_root?": "/path/to/project"}
+Output: {"name": "onData", "kind": "field",
+         "indirect_call_sites": [
+           {"file": "/path/src/main.c", "line": 16,
+            "expr_text": "drv . onData",
+            "fn_ptr_type": "void (*)(unsigned char *, int)",
+            "caller": "test_assign"}
+         ],
+         "resolution": {
+           "assignments_found": 1,
+           "call_sites_found": 1,
+           "resolved": true,
+           "note": "1 function(s) assigned; 1 call site(s); fully resolved"
+         }}
 ```
 
 Designed as one-shot LLM context — answers "what does this do and how does it fit?"
 in a single call. Returns all direct callers and callees (no artificial limit).
 
-For enum constants, includes `enum_value`. For enums, includes a `constants`
-array with all member constants and their values (same shape as `get_source`).
+For field and variable symbols that have function pointer type, also includes
+a ``resolution`` block: ``{assignments_found, call_sites_found, resolved, note}``
+indicating whether assignments and call sites are linked (Phase 3).
+``resolved: false`` with an explanatory note when data is incomplete — LLM
+can detect uncertainty from this signal.
+
+For enums, includes a ``constants`` array with all member constants and their
+values (same shape as `get_source`). Enum constants include `enum_value`.
 
 ### Call graph
 
@@ -432,23 +459,40 @@ if you don't need them.
 #### `find_callers`
 
 Who calls this function? Direct callers and indirect calls via function pointers
-detected in call arguments, assignments, and initializers.
+detected in call arguments, assignments, variable initializers, and struct/array
+init lists.
 
 ```
 Input:  {"name": "uart_write", "project_root?": "/path/to/project", "limit?": 50}
 Output: [{"file": "/path/src/main.c", "line": 35, "ref_kind": "call",
-          "caller": "main", "caller_kind": "function"}, …]
+          "caller": "main", "caller_kind": "function"},
+         {"file": "/path/src/setup.c", "line": 12, "ref_kind": "indirect",
+          "caller": "setup", "caller_kind": "function"}]
 ```
+
+Indirect edges (``ref_kind: "indirect"``) appear when a function pointer
+references a function through any of these patterns:
+``callback(&Class::method, this)``, ``driver.onData = &handleData``,
+``void (*fp)(int) = &handler``, or ``{.on_data = &handler}``.
+
+For the invocation side — where the stored pointer is actually called — use
+``find_indirect_call_sites``. For linking assignments to call sites — which
+specific functions can run at a given call site — use
+``find_indirect_targets``.
 
 #### `find_references`
 
-All uses of a symbol — calls, reads, member access.
+All uses of a symbol — calls, reads, member access, indirect references.
 
 ```
 Input:  {"name": "g_sensor_data", "project_root?": "/path/to/project", "limit?": 50}
 Output: [{"file": "/path/src/sensor.c", "line": 12, "ref_kind": "ref",
           "caller": "sensor_task", "caller_kind": "function"}, …]
 ```
+
+``ref_kind`` values: ``"call"`` (direct call), ``"ref"`` (variable read/write),
+``"member"`` (member access), ``"indirect"`` (function pointer reference in
+arguments, assignments, initializers, or init lists), ``"template_ref"``.
 
 #### `find_call_path`
 
@@ -485,17 +529,38 @@ Output: [{"name": "spi_init", "kind": "function", "file": "/path/src/spi.c", "de
 
 #### `find_dead_code`
 
-Functions defined but never called.
+Functions defined but never called. Returns two categories:
 
 ```
 Input:  {"project_root?": "/path/to/project", "limit?": 100, "exclude_paths?": ["zephyr/%", "mbed-os/%"], "project_only?": true}
-Output: [{"name": "unused_helper", "kind": "function", "file": "/path/src/utils.c",
-          "signature": "void unused_helper(int x)", "line": 200}, …]
+Output: [
+  {"name": "orphan_fn", "kind": "function", "file": "/path/src/utils.c",
+   "signature": "void orphan_fn()", "line": 200,
+   "status": "dead", "reason": "no references found — likely unused"},
+  {"name": "handler_timeout", "kind": "function", "file": "/path/src/main.c",
+   "signature": "void handler_timeout()", "line": 25,
+   "status": "possibly_dead",
+   "reason": "assigned as function pointer but call sites unresolved",
+   "indirect_refs": "src/main.c:60"},
+  …
+]
 ```
 
-Entry points (`main`, interrupt handlers) will appear here — filter them out
-manually. Only definitions with `kind IN ('function', 'method', 'constructor', 'destructor')` are checked.
-Use `exclude_paths` to skip vendor SDK code (LIKE patterns — `%` matches any suffix).
+**`"dead"`** — no references at all (neither calls nor function pointer
+assignments). Likely unused.
+
+**`"possibly_dead"`** — the function is assigned to a function pointer
+(``ref_kind="indirect"``) but no call site through that pointer was resolved.
+This means the function MIGHT be called through unindexed code or a
+type-erased API. Treat this as uncertain, not as confirmed dead code.
+Verify each hit with ``find_indirect_targets`` before deleting.
+
+Expect additional false positives from entry points (`main`), ISRs,
+virtual method overrides, constructors called via factories, and
+weak-aliased symbols. Only definitions with
+`kind IN ('function', 'method', 'constructor', 'destructor')` are checked.
+Use `exclude_paths` to skip vendor SDK code (LIKE patterns — `%` matches
+any suffix).
 
 #### `find_hotspots`
 
@@ -521,6 +586,55 @@ Output: [{"wrapper_class": "UART", "wrapper_method": "send",
 
 Pass a fully-qualified class name (`hal::UART_DRIVER`) or just the bare name
 (`UART_DRIVER`). Results are grouped by wrapper class.
+
+#### `find_indirect_call_sites`
+
+Find indirect call sites where a function pointer field or variable is invoked.
+
+```
+Input:  {"name": "onData", "project_root?": "/path/to/project", "limit?": 50}
+Output: [{"file": "/path/src/main.c", "line": 36, "expr_text": "drv . onData",
+          "target_usr": "c:@S@Driver@FI@onData", "target_name": "onData",
+          "fn_ptr_type": "void (*)(unsigned char *, int)",
+          "caller": "test_assign", "caller_kind": "function"}]
+```
+
+Returns locations where a function pointer is called through a field access
+(``driver.onData(buf, len)``) or variable (``stored_callback(42)``). Use
+this to answer *"where is this function pointer invoked?"* — complement with
+``find_indirect_targets`` for *"which functions are assigned to this field?"*
+
+Uses three-tier name resolution: exact name, exact qualified, suffix LIKE.
+
+#### `find_indirect_targets`
+
+Find functions assigned to a function pointer field, variable, or parameter.
+
+```
+Input:  {"name": "onData", "project_root?": "/path/to/project", "limit?": 50}
+Output: [{"rhs_name": "handler_data", "rhs_qname": "handler_data",
+          "fn_ptr_type": "void (*)(unsigned char *, int)",
+          "method": "assignment",
+          "assign_file": "/path/src/main.c", "assign_line": 14,
+          "assign_caller": "test_assign",
+          "call_file": "/path/src/main.c", "call_line": 16,
+          "call_expr_text": "drv . onData"}]
+```
+
+Links assignment sites (``driver.onData = &handler``) to call sites
+(``driver.onData(buf, len)``) via the field's USR. Shows the execution
+flow: *handler is assigned to onData at line 14, and onData is called at
+line 16 → handler may run at that call site.*
+
+When a function is assigned but no call site is found, ``call_file`` and
+``call_line`` are ``null`` — the assignment exists but the invocation may be
+in unindexed code. The ``method`` field indicates how the assignment was
+detected: ``"assignment"`` (direct field assignment), ``"call_arg"``
+(passed as callback argument), ``"var_init"`` (variable initializer), or
+``"init_list"`` (struct/array designated initializer).
+
+For the reverse query — where is this field called — use
+``find_indirect_call_sites``.
 
 #### `trace_data_flow`
 
