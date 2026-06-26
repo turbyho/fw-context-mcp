@@ -599,6 +599,40 @@ def _start_bg_reindex_if_stale(root: Path) -> None:
                             synced,
                         )
                         modified = _count_modified_files(conn, cfg["config_hash"], root)
+
+            # Detect completely missing refs, indirect call sites, or
+            # function-pointer assignments (e.g. initial index ran without
+            # --refs).  Reset stored mtimes for compile_commands.json files
+            # so the bg reindex force-processes them and fills in the
+            # missing data.  This is a one-time cost — after the reindex
+            # the data is present and incremental updates keep it current.
+            proj_cfg = load_config(root)
+            if proj_cfg.index.index_refs:
+                missing_refs = conn.execute(
+                    "SELECT COUNT(*) FROM refs WHERE config_hash = ?",
+                    (cfg["config_hash"],),
+                ).fetchone()[0] == 0
+                missing_indirect = conn.execute(
+                    "SELECT COUNT(*) FROM indirect_call_sites WHERE config_hash = ?",
+                    (cfg["config_hash"],),
+                ).fetchone()[0] == 0
+                if missing_refs or missing_indirect:
+                    cc_path = Path(cfg["compile_commands_path"])
+                    if cc_path.exists():
+                        cc_units = list(parse_cc(cc_path))
+                        cc_files_list = [str(Path(u.file).resolve()) for u in cc_units]
+                        if cc_files_list:
+                            placeholders = ",".join("?" * len(cc_files_list))
+                            conn.execute(
+                                f"UPDATE files SET mtime = 0 WHERE config_hash = ? AND path IN ({placeholders})",
+                                (cfg["config_hash"], *cc_files_list),
+                            )
+                            conn.commit()
+                            modified = _count_modified_files(conn, cfg["config_hash"], root)
+                            log.info(
+                                "Reset mtimes for %d cc files to fill missing refs/indirect data",
+                                len(cc_files_list),
+                            )
     finally:
         conn.close()
 
