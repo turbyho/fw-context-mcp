@@ -1960,7 +1960,7 @@ def find_indirect_call_sites(
                 )}]
 
             limit = min(limit, 200)
-            rows = find_indirect_call_sites(conn, config_hash, name, limit=limit)
+            rows = query_indirect_call_sites(conn, config_hash, name, limit=limit)
             if not rows:
                 return [{"info": f"No indirect call sites found for '{name}'."}]
 
