@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import logging
 import os
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -882,6 +883,23 @@ def run(
         project_id = derive_project_id(project_root)
     name = project_name or project_root.name
     config_hash = compute_config_hash(compile_commands)
+
+    # Heartbeat for background reindex watchdog.  The watchdog kills the
+    # process if this heartbeat stops (deadlock / hung syscall).  Only
+    # active when FW_CONTEXT_HEARTBEAT env var is set (background reindex).
+    _heartbeat_path = os.environ.get("FW_CONTEXT_HEARTBEAT")
+    if _heartbeat_path:
+        _hb_stop = threading.Event()
+
+        def _heartbeat() -> None:
+            while not _hb_stop.wait(30.0):
+                try:
+                    Path(_heartbeat_path).write_text(str(time.time()))
+                except Exception:
+                    pass
+
+        _hb_thread = threading.Thread(target=_heartbeat, daemon=True)
+        _hb_thread.start()
 
     log.info("project=%s config_hash=%s", name, config_hash[:12])
 
