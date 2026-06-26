@@ -5,6 +5,8 @@ from __future__ import annotations
 __all__ = [
     "CURRENT_SCHEMA_VERSION",
     "DatabaseCorruptionError",
+    "drop_fts_triggers",
+    "rebuild_fts",
     "count_file_analysis",
     "count_fp_assignments",
     "count_indirect_call_sites",
@@ -475,7 +477,7 @@ def write_lock(db_dir: Path, timeout: float = 60.0) -> Generator[None, None, Non
         os.close(fd)
 
 
-def open_db(path: Path) -> sqlite3.Connection:
+def open_db(path: Path, *, skip_integrity_check: bool = False) -> sqlite3.Connection:
     """Open SQLite database at *path*, enabling WAL mode and loading extensions.
 
     Creates the parent directory if missing.  Configures WAL journal mode,
@@ -496,8 +498,9 @@ def open_db(path: Path) -> sqlite3.Connection:
     6. Backfills ``symbols.summary/inputs/outputs`` from ``llm_analysis``
        table, then rebuilds FTS5 again when it lacks those columns.
     7. Initialises the ``vec_symbols`` vec0 table (best-effort).
-    8. Runs ``PRAGMA integrity_check`` — raises ``DatabaseCorruptionError``
-       on failure (detected before any tool reads the data).
+    8. Runs ``PRAGMA integrity_check`` (unless *skip_integrity_check*
+       is ``True``) — raises ``DatabaseCorruptionError`` on failure
+       (detected before any tool reads the data).
 
     On ``OperationalError('locked')`` the connection is retried once after a
     short sleep.  Other ``OperationalError`` and ``DatabaseError`` are
@@ -505,6 +508,11 @@ def open_db(path: Path) -> sqlite3.Connection:
 
     Args:
         path: Filesystem path to the SQLite database file.
+        skip_integrity_check: When ``True``, skip the ``PRAGMA integrity_check``
+            scan.  Use for auxiliary connections (worker threads, pooled
+            connections) where the check was already performed on the primary
+            connection.  On large databases (5+ GB) the scan takes 15–30 s
+            and saturates disk I/O.
 
     Returns:
         Open ``sqlite3.Connection`` with ``row_factory = sqlite3.Row``.
@@ -735,16 +743,20 @@ def open_db(path: Path) -> sqlite3.Connection:
     except Exception:
         pass
 
-    # Integrity check — detect corruption early, before any tool uses the DB
-    try:
-        result = conn.execute("PRAGMA integrity_check").fetchone()
-        if result and result[0] != "ok":
-            details = result[0]
+    # Integrity check — detect corruption early, before any tool uses the DB.
+    # Skip for auxiliary connections (worker threads, pooled connections)
+    # where the check already ran on the primary connection.  On 5+ GB
+    # databases a full scan takes 15–30 s and saturates disk I/O.
+    if not skip_integrity_check:
+        try:
+            result = conn.execute("PRAGMA integrity_check").fetchone()
+            if result and result[0] != "ok":
+                details = result[0]
+                conn.close()
+                raise DatabaseCorruptionError(str(path), details)
+        except sqlite3.DatabaseError as e:
             conn.close()
-            raise DatabaseCorruptionError(str(path), details)
-    except sqlite3.DatabaseError as e:
-        conn.close()
-        raise DatabaseCorruptionError(str(path), str(e)) from e
+            raise DatabaseCorruptionError(str(path), str(e)) from e
 
     return conn
 
@@ -756,6 +768,75 @@ def get_db_schema_version(conn: sqlite3.Connection) -> int:
     with an older schema and may miss data populated by newer migrations.
     """
     return conn.execute("PRAGMA user_version").fetchone()[0]
+
+
+def drop_fts_triggers(conn: sqlite3.Connection) -> None:
+    """Drop the three FTS5 content-sync triggers (ai, ad, au).
+
+    Call before bulk indexing to eliminate the per-row FTS index overhead.
+    After all TUs are processed, call ``rebuild_fts()`` to recreate the FTS
+    table and triggers in one pass.
+    """
+    conn.execute("DROP TRIGGER IF EXISTS symbols_ai")
+    conn.execute("DROP TRIGGER IF EXISTS symbols_ad")
+    conn.execute("DROP TRIGGER IF EXISTS symbols_au")
+
+
+def rebuild_fts(conn: sqlite3.Connection) -> None:
+    """Rebuild the FTS5 virtual table from the current ``symbols`` content.
+
+    Drops and recreates ``symbols_fts``, populates it with a single
+    ``INSERT ... SELECT`` from ``symbols``, then reinstates the three
+    content-sync triggers (ai, ad, au).  Call after bulk indexing to
+    restore FTS5 search capability in one pass instead of paying per-row
+    trigger overhead for every symbol INSERT/DELETE/UPDATE.
+
+    Idempotent — safe to call on an already-healthy FTS table.
+    """
+    conn.executescript("""
+        DROP TRIGGER IF EXISTS symbols_ai;
+        DROP TRIGGER IF EXISTS symbols_ad;
+        DROP TRIGGER IF EXISTS symbols_au;
+        DROP TABLE IF EXISTS symbols_fts;
+
+        CREATE VIRTUAL TABLE symbols_fts USING fts5(
+            name, qualified_name, signature, docstring, file_path, name_tokens,
+            summary, inputs, outputs,
+            content='symbols', content_rowid='id'
+        );
+
+        INSERT INTO symbols_fts(rowid, name, qualified_name, signature, docstring,
+                                file_path, name_tokens, summary, inputs, outputs)
+        SELECT id, name, qualified_name, COALESCE(signature,''), COALESCE(docstring,''),
+               COALESCE(file_path,''), COALESCE(name_tokens,''),
+               COALESCE(summary,''), COALESCE(inputs,''), COALESCE(outputs,'')
+        FROM symbols;
+
+        CREATE TRIGGER symbols_ai AFTER INSERT ON symbols BEGIN
+            INSERT INTO symbols_fts(rowid, name, qualified_name, signature, docstring,
+                                    file_path, name_tokens, summary, inputs, outputs)
+            VALUES (new.id, new.name, new.qualified_name, new.signature, new.docstring,
+                    new.file_path, new.name_tokens, new.summary, new.inputs, new.outputs);
+        END;
+
+        CREATE TRIGGER symbols_ad AFTER DELETE ON symbols BEGIN
+            INSERT INTO symbols_fts(symbols_fts, rowid, name, qualified_name, signature,
+                                    docstring, file_path, name_tokens, summary, inputs, outputs)
+            VALUES ('delete', old.id, old.name, old.qualified_name, old.signature,
+                    old.docstring, old.file_path, old.name_tokens, old.summary, old.inputs, old.outputs);
+        END;
+
+        CREATE TRIGGER symbols_au AFTER UPDATE ON symbols BEGIN
+            INSERT INTO symbols_fts(symbols_fts, rowid, name, qualified_name, signature,
+                                    docstring, file_path, name_tokens, summary, inputs, outputs)
+            VALUES ('delete', old.id, old.name, old.qualified_name, old.signature,
+                    old.docstring, old.file_path, old.name_tokens, old.summary, old.inputs, old.outputs);
+            INSERT INTO symbols_fts(rowid, name, qualified_name, signature, docstring,
+                                    file_path, name_tokens, summary, inputs, outputs)
+            VALUES (new.id, new.name, new.qualified_name, new.signature, new.docstring,
+                    new.file_path, new.name_tokens, new.summary, new.inputs, new.outputs);
+        END;
+    """)
 
 
 @contextmanager

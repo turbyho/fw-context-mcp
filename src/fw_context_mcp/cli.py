@@ -625,7 +625,7 @@ def cmd_watch(args: argparse.Namespace) -> int:
     from .config import derive_project_id
     from .config import load as load_config
     from .indexer.compile_commands import parse as parse_cc
-    from .indexer.db import get_active_config, open_db
+    from .indexer.db import get_active_config, open_db, write_lock
     from .indexer.ops import store_symbols_for_unit
 
     root = Path(args.project or ".").resolve()
@@ -691,15 +691,16 @@ def cmd_watch(args: argparse.Namespace) -> int:
                     if not matching:
                         continue
                     total = 0
-                    for unit in matching:
-                        syms_added, _ = store_symbols_for_unit(
-                            conn, unit, config_hash, root,
-                            source_roots=source_roots,
-                            exclude_paths=exclude_paths,
-                            index_refs=cfg.index.index_refs,
-                        )
-                        total += syms_added
-                    conn.commit()
+                    with write_lock(db_path.parent, timeout=10.0):
+                        for unit in matching:
+                            syms_added, _ = store_symbols_for_unit(
+                                conn, unit, config_hash, root,
+                                source_roots=source_roots,
+                                exclude_paths=exclude_paths,
+                                index_refs=cfg.index.index_refs,
+                            )
+                            total += syms_added
+                        conn.commit()
                     try:
                         conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
                     except Exception:

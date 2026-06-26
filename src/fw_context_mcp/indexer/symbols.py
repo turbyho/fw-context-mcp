@@ -11,7 +11,32 @@ import clang.cindex as cx
 
 from .compile_commands import CompilationUnit
 
-_INDEX = cx.Index.create()
+_INDEX: cx.Index | None = None
+_index_lock = None
+
+
+def _get_index() -> cx.Index:
+    """Return a thread-local libclang Index.
+
+    libclang's Index objects are not thread-safe — concurrent calls to
+    ``parse()`` on the same Index object serialize internally.  We keep
+    one Index per thread so worker threads parse translation units in
+    true parallel, one Index each.
+    """
+    global _INDEX, _index_lock
+    import threading
+    if _index_lock is None:
+        _index_lock = threading.Lock()
+    if _INDEX is None:
+        with _index_lock:
+            if _INDEX is None:
+                _INDEX = cx.Index.create()
+    ident = threading.current_thread().ident
+    if not hasattr(_get_index, "_per_thread"):
+        _get_index._per_thread: dict[int, cx.Index] = {}
+    if ident not in _get_index._per_thread:
+        _get_index._per_thread[ident] = cx.Index.create()
+    return _get_index._per_thread[ident]
 
 _SYMBOL_KINDS = frozenset({
     cx.CursorKind.FUNCTION_DECL,
@@ -473,11 +498,16 @@ def extract_all(
     if exclude_paths is None:
         exclude_paths = []
 
-    tu = _INDEX.parse(
+    import logging
+    import time as _time
+    _log = logging.getLogger(__name__)
+    _t_start = _time.monotonic()
+    tu = _get_index().parse(
         str(unit.file),
         args=unit.clang_args,
         options=cx.TranslationUnit.PARSE_DETAILED_PROCESSING_RECORD,
     )
+    _t_parse = _time.monotonic() - _t_start
 
     cwd = unit.directory
 
@@ -598,6 +628,8 @@ def extract_all(
         if cursor.kind in (cx.CursorKind.CLASS_DECL, cx.CursorKind.STRUCT_DECL) and is_def:
             class_cursors.append(cursor)
 
+    _t_symwalk = _time.monotonic() - _t_start - _t_parse  # subtract parse time
+
     # --- Inheritance: examine base specifiers of collected class cursors ---
     inheritance: list[InheritanceRecord] = []
     _access_map = {
@@ -640,6 +672,7 @@ def extract_all(
             continue  # skip malformed cursors
 
     if not with_refs:
+        _log.debug("  parse=%.1fs symwalk=%.1fs syms=%d", _t_parse, _t_symwalk, len(symbols))
         return symbols, [], inheritance, [], []
 
     # Build qualified-name → USR lookup for token-based fallback
@@ -694,24 +727,40 @@ def extract_all(
                 return _scored[0][2]
         return candidates[0][1]
 
-    # stack of (cursor, enclosing_function_usr)
-    stack: list[tuple] = [(tu.cursor, None)]
-    while stack:
-        cursor, fn_usr = stack.pop()
-        cur_fn = fn_usr
+    # Track enclosing function via walk_preorder() — the C implementation
+    # is orders of magnitude faster than the equivalent manual stack DFS.
+    # Each Python-level cursor.get_children() call crosses ctypes; the C
+    # generator pays that cost once per cursor internally and just yields.
+    fn_stack: list[tuple[str, int]] = []  # [(usr, end_line)]
+
+    for cursor in tu.cursor.walk_preorder():
+        # Pop enclosing functions whose body extent we've left.
+        # walk_preorder() visits all descendants before any sibling, so
+        # comparing line > end_line reliably detects scope exit.
+        _cl = cursor.location
+        while fn_stack and fn_stack[-1][1] > 0 and _cl is not None and _cl.line > fn_stack[-1][1]:
+            fn_stack.pop()
+        cur_fn = fn_stack[-1][0] if fn_stack else None
+
+        # If this is a callable definition, it becomes the new enclosing
+        # function for its children (which walk_preorder visits next).
         if cursor.kind in _CALLABLE_KINDS and cursor.is_definition():
-            cur_fn = cursor.get_usr() or fn_usr
-            # Track function span for source-line fallback
+            own_usr = cursor.get_usr()
+            if own_usr:
+                cur_fn = own_usr
             try:
                 _ext = cursor.extent
                 if _ext.start.file:
                     _ext_file = _ext.start.file.name
-                    _resolved_ext = Path(_ext_file).resolve()
-                    _resolved_tu = Path(tu.spelling).resolve()
-                    if str(_resolved_ext) == str(_resolved_tu):
+                    if str(Path(_ext_file).resolve()) == str(Path(tu.spelling).resolve()):
                         _fn_spans.append((cur_fn, _ext.start.line, _ext.end.line))
+                        fn_stack.append((cur_fn, _ext.end.line))
+                    else:
+                        fn_stack.append((cur_fn, 0))
+                else:
+                    fn_stack.append((cur_fn, 0))
             except Exception:
-                pass
+                fn_stack.append((cur_fn, 0))
 
         ref_kind = _REF_KINDS.get(cursor.kind)
         if ref_kind is not None:
@@ -1088,9 +1137,6 @@ def extract_all(
                                     ref_kind="call",
                                 ))
 
-        for child in cursor.get_children():
-            stack.append((child, cur_fn))
-
     # --- Source-line fallback for template-obscured method calls ---
     # When C++ standard library template expansions dominate the AST
     # (e.g. ``_zmodem_driver.network_init() != MODEM_RET_SUCCESS`` where
@@ -1141,4 +1187,10 @@ def extract_all(
                             ref_kind="call",
                         ))
 
+    _t_total = _time.monotonic() - _t_start
+    _t_refwalk = _t_total - _t_parse - _t_symwalk
+    _log.debug(
+        "  parse=%.1fs symwalk=%.1fs refwalk=%.1fs syms=%d refs=%d",
+        _t_parse, _t_symwalk, _t_refwalk, len(symbols), len(refs),
+    )
     return symbols, refs, inheritance, indirect_call_sites, fp_assignments
