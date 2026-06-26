@@ -217,9 +217,6 @@ _MIGRATION_ADD_COLUMNS = [
 ]
 
 _SCHEMA = """
-PRAGMA journal_mode = WAL;
-PRAGMA foreign_keys = ON;
-
 CREATE TABLE IF NOT EXISTS projects (
     project_id   TEXT PRIMARY KEY,
     name         TEXT NOT NULL,
@@ -519,7 +516,13 @@ def open_db(path: Path) -> sqlite3.Connection:
     path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(path))
     conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA busy_timeout = 30000")  # 30s — wait on lock, don't fail
+    conn.execute("PRAGMA busy_timeout = 10000")  # 10s — wait on lock, don't fail
+    conn.execute("PRAGMA foreign_keys = ON")
+
+    # WAL mode — persistent on the DB file once set, but needs to be applied
+    # on first-open.  Run outside executescript() to avoid an unnecessary
+    # write transaction when the DB is already in WAL mode.
+    conn.execute("PRAGMA journal_mode = WAL")
 
     # Load sqlite-vec extension for vector search (graceful when missing)
     try:
@@ -530,187 +533,199 @@ def open_db(path: Path) -> sqlite3.Connection:
     except (ImportError, Exception):
         pass
 
-    try:
-        conn.executescript(_SCHEMA)
+    # Only run the (expensive) schema/migration block when the on-disk schema
+    # is outdated.  executescript() implies a write transaction — skipping it
+    # when the schema is current means read-only queries never acquire a
+    # write lock, even while a background reindex is writing.
+    current_schema_ver = conn.execute("PRAGMA user_version").fetchone()[0]
 
-        # Simple add-column migrations — idempotent, run from _MIGRATION_ADD_COLUMNS
-        # so the schema fingerprint (CURRENT_SCHEMA_VERSION) stays in sync automatically.
-        for stmt in _MIGRATION_ADD_COLUMNS:
-            try:
-                conn.execute(stmt)
+    if current_schema_ver < CURRENT_SCHEMA_VERSION:
+        try:
+            conn.executescript(_SCHEMA)
+
+            # Simple add-column migrations — idempotent, run from
+            # _MIGRATION_ADD_COLUMNS so the schema fingerprint
+            # (CURRENT_SCHEMA_VERSION) stays in sync automatically.
+            for stmt in _MIGRATION_ADD_COLUMNS:
+                try:
+                    conn.execute(stmt)
+                    conn.commit()
+                except sqlite3.OperationalError as e:
+                    # Only skip "duplicate column" — re-raise disk-full etc.
+                    if "duplicate column" not in str(e):
+                        raise
+
+            # Migration: file_path backfill — column added by
+            # _MIGRATION_ADD_COLUMNS loop.  Backfill empties left over from
+            # old indexes or the DEFAULT ''.
+            if conn.execute(
+                "SELECT COUNT(*) FROM symbols WHERE file_path = ''"
+            ).fetchone()[0] > 0:
+                conn.execute("""
+                    UPDATE symbols SET file_path = COALESCE(
+                        (SELECT f.path FROM files f WHERE f.id = symbols.file_id), ''
+                    ) WHERE file_path = ''
+                """)
                 conn.commit()
-            except sqlite3.OperationalError as e:
-                # Only skip "duplicate column" — re-raise disk-full etc.
-                if "duplicate column" not in str(e):
-                    raise
 
-        # Migration: file_path backfill — column added by _MIGRATION_ADD_COLUMNS loop.
-        # Backfill empties left over from old indexes or the DEFAULT ''.
-        if conn.execute(
-            "SELECT COUNT(*) FROM symbols WHERE file_path = ''"
-        ).fetchone()[0] > 0:
-            conn.execute("""
-                UPDATE symbols SET file_path = COALESCE(
-                    (SELECT f.path FROM files f WHERE f.id = symbols.file_id), ''
-                ) WHERE file_path = ''
-            """)
-            conn.commit()
+            # Migration: name_tokens backfill — column added by
+            # _MIGRATION_ADD_COLUMNS loop.  Backfill using Python split_tokens
+            # (SQLite can't call Python functions).  Use a generator to avoid
+            # materialising all rows in memory at once.
+            if conn.execute(
+                "SELECT COUNT(*) FROM symbols WHERE name_tokens = ''"
+            ).fetchone()[0] > 0:
+                conn.executemany(
+                    "UPDATE symbols SET name_tokens = ? WHERE id = ?",
+                    (
+                        (split_tokens(r["name"], r["qualified_name"]), r["id"])
+                        for r in conn.execute(
+                            "SELECT id, name, qualified_name FROM symbols WHERE name_tokens = ''"
+                        )
+                    ),
+                )
+                conn.commit()
 
-        # Migration: name_tokens backfill — column added by _MIGRATION_ADD_COLUMNS loop.
-        # Backfill using Python split_tokens (SQLite can't call Python functions).
-        # Use a generator to avoid materialising all rows in memory at once.
-        if conn.execute(
-            "SELECT COUNT(*) FROM symbols WHERE name_tokens = ''"
-        ).fetchone()[0] > 0:
-            conn.executemany(
-                "UPDATE symbols SET name_tokens = ? WHERE id = ?",
-                (
-                    (split_tokens(r["name"], r["qualified_name"]), r["id"])
-                    for r in conn.execute(
-                        "SELECT id, name, qualified_name FROM symbols WHERE name_tokens = ''"
-                    )
-                ),
-            )
-            conn.commit()
-
-        # Migration: FTS5 rebuild —
-        fts_cols = [r[1] for r in conn.execute("PRAGMA table_info(symbols_fts)").fetchall()]
-        if "name_tokens" not in fts_cols:
-            conn.executescript("""
-                DROP TRIGGER IF EXISTS symbols_ai;
-                DROP TRIGGER IF EXISTS symbols_ad;
-                DROP TRIGGER IF EXISTS symbols_au;
-                DROP TABLE IF EXISTS symbols_fts;
-            """)
-            conn.executescript("""
-                CREATE VIRTUAL TABLE symbols_fts USING fts5(
-                    name, qualified_name, signature, docstring, file_path, name_tokens,
-                    content='symbols', content_rowid='id'
-                );
-                CREATE TRIGGER symbols_ai AFTER INSERT ON symbols BEGIN
+            # Migration: FTS5 rebuild —
+            fts_cols = [r[1] for r in conn.execute("PRAGMA table_info(symbols_fts)").fetchall()]
+            if "name_tokens" not in fts_cols:
+                conn.executescript("""
+                    DROP TRIGGER IF EXISTS symbols_ai;
+                    DROP TRIGGER IF EXISTS symbols_ad;
+                    DROP TRIGGER IF EXISTS symbols_au;
+                    DROP TABLE IF EXISTS symbols_fts;
+                """)
+                conn.executescript("""
+                    CREATE VIRTUAL TABLE symbols_fts USING fts5(
+                        name, qualified_name, signature, docstring, file_path, name_tokens,
+                        content='symbols', content_rowid='id'
+                    );
+                    CREATE TRIGGER symbols_ai AFTER INSERT ON symbols BEGIN
+                        INSERT INTO symbols_fts(rowid, name, qualified_name, signature, docstring, file_path, name_tokens)
+                        VALUES (new.id, new.name, new.qualified_name, new.signature, new.docstring, new.file_path, new.name_tokens);
+                    END;
+                    CREATE TRIGGER symbols_ad AFTER DELETE ON symbols BEGIN
+                        INSERT INTO symbols_fts(symbols_fts, rowid, name, qualified_name, signature, docstring, file_path, name_tokens)
+                        VALUES ('delete', old.id, old.name, old.qualified_name, old.signature, old.docstring, old.file_path, old.name_tokens);
+                    END;
+                    CREATE TRIGGER symbols_au AFTER UPDATE ON symbols BEGIN
+                        INSERT INTO symbols_fts(symbols_fts, rowid, name, qualified_name, signature, docstring, file_path, name_tokens)
+                        VALUES ('delete', old.id, old.name, old.qualified_name, old.signature, old.docstring, old.file_path, old.name_tokens);
+                        INSERT INTO symbols_fts(rowid, name, qualified_name, signature, docstring, file_path, name_tokens)
+                        VALUES (new.id, new.name, new.qualified_name, new.signature, new.docstring, new.file_path, new.name_tokens);
+                    END;
+                """)
+                conn.execute("""
                     INSERT INTO symbols_fts(rowid, name, qualified_name, signature, docstring, file_path, name_tokens)
-                    VALUES (new.id, new.name, new.qualified_name, new.signature, new.docstring, new.file_path, new.name_tokens);
-                END;
-                CREATE TRIGGER symbols_ad AFTER DELETE ON symbols BEGIN
-                    INSERT INTO symbols_fts(symbols_fts, rowid, name, qualified_name, signature, docstring, file_path, name_tokens)
-                    VALUES ('delete', old.id, old.name, old.qualified_name, old.signature, old.docstring, old.file_path, old.name_tokens);
-                END;
-                CREATE TRIGGER symbols_au AFTER UPDATE ON symbols BEGIN
-                    INSERT INTO symbols_fts(symbols_fts, rowid, name, qualified_name, signature, docstring, file_path, name_tokens)
-                    VALUES ('delete', old.id, old.name, old.qualified_name, old.signature, old.docstring, old.file_path, old.name_tokens);
-                    INSERT INTO symbols_fts(rowid, name, qualified_name, signature, docstring, file_path, name_tokens)
-                    VALUES (new.id, new.name, new.qualified_name, new.signature, new.docstring, new.file_path, new.name_tokens);
-                END;
-            """)
-            conn.execute("""
-                INSERT INTO symbols_fts(rowid, name, qualified_name, signature, docstring, file_path, name_tokens)
-                SELECT id, name, qualified_name, COALESCE(signature,''), COALESCE(docstring,''),
-                       COALESCE(file_path,''), COALESCE(name_tokens,'')
-                FROM symbols
-            """)
-            conn.commit()
+                    SELECT id, name, qualified_name, COALESCE(signature,''), COALESCE(docstring,''),
+                           COALESCE(file_path,''), COALESCE(name_tokens,'')
+                    FROM symbols
+                """)
+                conn.commit()
 
-        # Migration: summary/inputs/outputs — backfill from llm_analysis table.
-        if conn.execute(
-            "SELECT COUNT(*) FROM symbols WHERE summary = ''"
-        ).fetchone()[0] > 0:
-            conn.execute(
-                """UPDATE symbols SET
-                       summary = COALESCE((SELECT a.summary FROM llm_analysis a WHERE a.symbol_id = symbols.id), ''),
-                       inputs = COALESCE((SELECT a.inputs FROM llm_analysis a WHERE a.symbol_id = symbols.id), ''),
-                       outputs = COALESCE((SELECT a.outputs FROM llm_analysis a WHERE a.symbol_id = symbols.id), '')
-                   WHERE id IN (SELECT symbol_id FROM llm_analysis)"""
-            )
-            conn.commit()
+            # Migration: summary/inputs/outputs — backfill from llm_analysis table.
+            if conn.execute(
+                "SELECT COUNT(*) FROM symbols WHERE summary = ''"
+            ).fetchone()[0] > 0:
+                conn.execute(
+                    """UPDATE symbols SET
+                           summary = COALESCE((SELECT a.summary FROM llm_analysis a WHERE a.symbol_id = symbols.id), ''),
+                           inputs = COALESCE((SELECT a.inputs FROM llm_analysis a WHERE a.symbol_id = symbols.id), ''),
+                           outputs = COALESCE((SELECT a.outputs FROM llm_analysis a WHERE a.symbol_id = symbols.id), '')
+                       WHERE id IN (SELECT symbol_id FROM llm_analysis)"""
+                )
+                conn.commit()
 
-        # Migration: FTS5 rebuild — add summary/inputs/outputs columns.
-        fts_cols2 = [r[1] for r in conn.execute("PRAGMA table_info(symbols_fts)").fetchall()]
-        if "summary" not in fts_cols2:
-            conn.executescript("""
-                DROP TRIGGER IF EXISTS symbols_ai;
-                DROP TRIGGER IF EXISTS symbols_ad;
-                DROP TRIGGER IF EXISTS symbols_au;
-                DROP TABLE IF EXISTS symbols_fts;
-            """)
-            conn.executescript("""
-                CREATE VIRTUAL TABLE symbols_fts USING fts5(
-                    name, qualified_name, signature, docstring, file_path, name_tokens,
-                    summary, inputs, outputs,
-                    content='symbols', content_rowid='id'
-                );
-                CREATE TRIGGER symbols_ai AFTER INSERT ON symbols BEGIN
+            # Migration: FTS5 rebuild — add summary/inputs/outputs columns.
+            fts_cols2 = [r[1] for r in conn.execute("PRAGMA table_info(symbols_fts)").fetchall()]
+            if "summary" not in fts_cols2:
+                conn.executescript("""
+                    DROP TRIGGER IF EXISTS symbols_ai;
+                    DROP TRIGGER IF EXISTS symbols_ad;
+                    DROP TRIGGER IF EXISTS symbols_au;
+                    DROP TABLE IF EXISTS symbols_fts;
+                """)
+                conn.executescript("""
+                    CREATE VIRTUAL TABLE symbols_fts USING fts5(
+                        name, qualified_name, signature, docstring, file_path, name_tokens,
+                        summary, inputs, outputs,
+                        content='symbols', content_rowid='id'
+                    );
+                    CREATE TRIGGER symbols_ai AFTER INSERT ON symbols BEGIN
+                        INSERT INTO symbols_fts(rowid, name, qualified_name, signature, docstring, file_path, name_tokens, summary, inputs, outputs)
+                        VALUES (new.id, new.name, new.qualified_name, new.signature, new.docstring, new.file_path, new.name_tokens, new.summary, new.inputs, new.outputs);
+                    END;
+                    CREATE TRIGGER symbols_ad AFTER DELETE ON symbols BEGIN
+                        INSERT INTO symbols_fts(symbols_fts, rowid, name, qualified_name, signature, docstring, file_path, name_tokens, summary, inputs, outputs)
+                        VALUES ('delete', old.id, old.name, old.qualified_name, old.signature, old.docstring, old.file_path, old.name_tokens, old.summary, old.inputs, old.outputs);
+                    END;
+                    CREATE TRIGGER symbols_au AFTER UPDATE ON symbols BEGIN
+                        INSERT INTO symbols_fts(symbols_fts, rowid, name, qualified_name, signature, docstring, file_path, name_tokens, summary, inputs, outputs)
+                        VALUES ('delete', old.id, old.name, old.qualified_name, old.signature, old.docstring, old.file_path, old.name_tokens, old.summary, old.inputs, old.outputs);
+                        INSERT INTO symbols_fts(rowid, name, qualified_name, signature, docstring, file_path, name_tokens, summary, inputs, outputs)
+                        VALUES (new.id, new.name, new.qualified_name, new.signature, new.docstring, new.file_path, new.name_tokens, new.summary, new.inputs, new.outputs);
+                    END;
+                """)
+                conn.execute("""
                     INSERT INTO symbols_fts(rowid, name, qualified_name, signature, docstring, file_path, name_tokens, summary, inputs, outputs)
-                    VALUES (new.id, new.name, new.qualified_name, new.signature, new.docstring, new.file_path, new.name_tokens, new.summary, new.inputs, new.outputs);
-                END;
-                CREATE TRIGGER symbols_ad AFTER DELETE ON symbols BEGIN
-                    INSERT INTO symbols_fts(symbols_fts, rowid, name, qualified_name, signature, docstring, file_path, name_tokens, summary, inputs, outputs)
-                    VALUES ('delete', old.id, old.name, old.qualified_name, old.signature, old.docstring, old.file_path, old.name_tokens, old.summary, old.inputs, old.outputs);
-                END;
-                CREATE TRIGGER symbols_au AFTER UPDATE ON symbols BEGIN
-                    INSERT INTO symbols_fts(symbols_fts, rowid, name, qualified_name, signature, docstring, file_path, name_tokens, summary, inputs, outputs)
-                    VALUES ('delete', old.id, old.name, old.qualified_name, old.signature, old.docstring, old.file_path, old.name_tokens, old.summary, old.inputs, old.outputs);
-                    INSERT INTO symbols_fts(rowid, name, qualified_name, signature, docstring, file_path, name_tokens, summary, inputs, outputs)
-                    VALUES (new.id, new.name, new.qualified_name, new.signature, new.docstring, new.file_path, new.name_tokens, new.summary, new.inputs, new.outputs);
-                END;
-            """)
-            conn.execute("""
-                INSERT INTO symbols_fts(rowid, name, qualified_name, signature, docstring, file_path, name_tokens, summary, inputs, outputs)
-                SELECT id, name, qualified_name, COALESCE(signature,''), COALESCE(docstring,''),
-                       COALESCE(file_path,''), COALESCE(name_tokens,''),
-                       COALESCE(summary,''), COALESCE(inputs,''), COALESCE(outputs,'')
-                FROM symbols
-            """)
-            conn.commit()
+                    SELECT id, name, qualified_name, COALESCE(signature,''), COALESCE(docstring,''),
+                           COALESCE(file_path,''), COALESCE(name_tokens,''),
+                           COALESCE(summary,''), COALESCE(inputs,''), COALESCE(outputs,'')
+                    FROM symbols
+                """)
+                conn.commit()
 
-    except sqlite3.OperationalError as e:
-        if "locked" in str(e).lower():
-            conn.close()
-            import time as _time
-            _time.sleep(2)
-            conn = sqlite3.connect(str(path))
-            conn.row_factory = sqlite3.Row
-            conn.execute("PRAGMA busy_timeout = 30000")
-            conn.executescript(_SCHEMA)
-            for stmt in _MIGRATION_ADD_COLUMNS:
-                try:
-                    conn.execute(stmt)
-                    conn.commit()
-                except sqlite3.OperationalError as e2:
-                    if "duplicate column" not in str(e2):
-                        raise
-        elif "no such column" in str(e):
-            # Old database — _SCHEMA contains CREATE INDEX statements that
-            # reference columns (e.g. parent_usr) which don't exist yet.
-            # Also possible: the DB predates newer tables entirely
-            # (file_analysis, inheritance, overrides) — executescript may
-            # have stopped before creating them.
-            # Strategy: apply add-column migrations (skip tables that don't
-            # exist yet), then retry _SCHEMA to create remaining tables
-            # and indexes.
-            for stmt in _MIGRATION_ADD_COLUMNS:
-                try:
-                    conn.execute(stmt)
-                    conn.commit()
-                except sqlite3.OperationalError as e2:
-                    if "duplicate column" not in str(e2) and "no such table" not in str(e2):
-                        raise
-            conn.executescript(_SCHEMA)
-        else:
+        except sqlite3.OperationalError as e:
+            if "locked" in str(e).lower():
+                conn.close()
+                import time as _time
+                _time.sleep(1)
+                conn = sqlite3.connect(str(path))
+                conn.row_factory = sqlite3.Row
+                conn.execute("PRAGMA busy_timeout = 10000")
+                conn.execute("PRAGMA foreign_keys = ON")
+                conn.execute("PRAGMA journal_mode = WAL")
+                conn.executescript(_SCHEMA)
+                for stmt in _MIGRATION_ADD_COLUMNS:
+                    try:
+                        conn.execute(stmt)
+                        conn.commit()
+                    except sqlite3.OperationalError as e2:
+                        if "duplicate column" not in str(e2):
+                            raise
+            elif "no such column" in str(e):
+                # Old database — _SCHEMA contains CREATE INDEX statements
+                # that reference columns (e.g. parent_usr) which don't exist
+                # yet.  Also possible: the DB predates newer tables entirely
+                # (file_analysis, inheritance, overrides) — executescript
+                # may have stopped before creating them.
+                # Strategy: apply add-column migrations (skip tables that
+                # don't exist yet), then retry _SCHEMA to create remaining
+                # tables and indexes.
+                for stmt in _MIGRATION_ADD_COLUMNS:
+                    try:
+                        conn.execute(stmt)
+                        conn.commit()
+                    except sqlite3.OperationalError as e2:
+                        if "duplicate column" not in str(e2) and "no such table" not in str(e2):
+                            raise
+                conn.executescript(_SCHEMA)
+            else:
+                conn.close()
+                raise DatabaseCorruptionError(str(path), str(e)) from e
+        except sqlite3.DatabaseError as e:
             conn.close()
             raise DatabaseCorruptionError(str(path), str(e)) from e
-    except sqlite3.DatabaseError as e:
-        conn.close()
-        raise DatabaseCorruptionError(str(path), str(e)) from e
+
+        # Stamp the database with the current schema version so we can detect
+        # stale indexes — PRAGMA user_version is the standard SQLite mechanism.
+        conn.execute(f"PRAGMA user_version = {CURRENT_SCHEMA_VERSION}")
 
     # Migrate vec0 table when sqlite-vec is available (idempotent CREATE IF NOT EXISTS)
     try:
         init_vec_table(conn)
     except Exception:
         pass
-
-    # Stamp the database with the current schema version so we can detect
-    # stale indexes — PRAGMA user_version is the standard SQLite mechanism.
-    conn.execute(f"PRAGMA user_version = {CURRENT_SCHEMA_VERSION}")
 
     # Integrity check — detect corruption early, before any tool uses the DB
     try:
