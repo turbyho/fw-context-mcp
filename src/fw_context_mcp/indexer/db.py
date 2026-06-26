@@ -6,9 +6,11 @@ __all__ = [
     "CURRENT_SCHEMA_VERSION",
     "DatabaseCorruptionError",
     "count_file_analysis",
+    "count_fp_assignments",
     "count_indirect_call_sites",
     "count_llm_analysis",
     "count_refs",
+    "delete_fp_assignments_for_file",
     "delete_inheritance_for_file",
     "delete_indirect_call_sites_for_file",
     "delete_refs_for_file",
@@ -19,6 +21,7 @@ __all__ = [
     "find_dead_code",
     "find_hotspots",
     "find_indirect_call_sites",
+    "find_indirect_targets",
     "find_refs",
     "get_active_config",
     "get_all_projects",
@@ -35,6 +38,7 @@ __all__ = [
     "get_overrides_for_method",
     "get_template_instances",
     "init_vec_table",
+    "insert_fp_assignments_batch",
     "insert_indirect_call_sites_batch",
     "insert_inheritance_batch",
     "insert_overrides_batch",
@@ -332,6 +336,27 @@ CREATE TABLE IF NOT EXISTS indirect_call_sites (
 CREATE INDEX IF NOT EXISTS idx_ics_config_target ON indirect_call_sites(config_hash, target_usr);
 CREATE INDEX IF NOT EXISTS idx_ics_config_file   ON indirect_call_sites(config_hash, from_file);
 CREATE INDEX IF NOT EXISTS idx_ics_config_usr    ON indirect_call_sites(config_hash, from_usr);
+
+-- Function pointer assignments (Phase 3).
+-- Records both sides of "field = &function" so Phase 3 can link
+-- fp_assignments.lhs_usr = indirect_call_sites.target_usr to answer
+-- "which functions can be called through this field?"
+CREATE TABLE IF NOT EXISTS fp_assignments (
+    id           INTEGER PRIMARY KEY,
+    config_hash  TEXT    NOT NULL,
+    from_file    TEXT    NOT NULL,
+    from_line    INTEGER NOT NULL,
+    lhs_usr      TEXT    NOT NULL,
+    lhs_name     TEXT    NOT NULL DEFAULT '',
+    rhs_usr      TEXT    NOT NULL,
+    rhs_name     TEXT    NOT NULL DEFAULT '',
+    fn_ptr_type  TEXT    NOT NULL DEFAULT '',
+    method       TEXT    NOT NULL,
+    from_usr     TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_fpa_config_lhs ON fp_assignments(config_hash, lhs_usr);
+CREATE INDEX IF NOT EXISTS idx_fpa_config_rhs ON fp_assignments(config_hash, rhs_usr);
+CREATE INDEX IF NOT EXISTS idx_fpa_config_file ON fp_assignments(config_hash, from_file);
 
 -- Symbol embeddings for semantic search (opt-in via [index] index_embeddings = true).
 -- Stored as BLOB: 1024 float32 values packed with struct.pack('f', ...).
@@ -900,14 +925,21 @@ def find_indirect_call_sites(
            LEFT JOIN symbols caller
              ON caller.config_hash = ics.config_hash AND caller.usr = ics.from_usr
            WHERE ics.config_hash = ?
-             AND ics.target_usr IN (
-                 SELECT usr FROM symbols
-                 WHERE config_hash = ?
-                   AND (name = ? OR qualified_name = ? OR qualified_name LIKE ? ESCAPE '\\')
+             AND (
+                 -- Match via indexed symbols (covers FIELD_DECL, VAR_DECL)
+                 ics.target_usr IN (
+                     SELECT usr FROM symbols
+                     WHERE config_hash = ?
+                       AND (name = ? OR qualified_name = ? OR qualified_name LIKE ? ESCAPE '\\')
+                 )
+                 OR
+                 -- Fallback: direct name match (covers PARM_DECL which are
+                 -- not in the symbols table)
+                 ics.target_name = ?
              )
            ORDER BY ics.from_file, ics.from_line
            LIMIT ?""",
-        (config_hash, config_hash, name, name, suffix_pattern, limit),
+        (config_hash, config_hash, name, name, suffix_pattern, name, limit),
     ).fetchall()
 
 
@@ -915,6 +947,99 @@ def count_indirect_call_sites(conn: sqlite3.Connection, config_hash: str) -> int
     """Return total indirect call site count (0 when not indexed)."""
     return conn.execute(
         "SELECT COUNT(*) FROM indirect_call_sites WHERE config_hash=?",
+        (config_hash,),
+    ).fetchone()[0]
+
+
+# ---------------------------------------------------------------------------
+# Function pointer assignment helpers — Phase 3 linking
+# ---------------------------------------------------------------------------
+
+
+def insert_fp_assignments_batch(conn: sqlite3.Connection, rows: list[tuple]) -> int:
+    """Insert function pointer assignment records.
+
+    Each row: (config_hash, from_file, from_line, lhs_usr, lhs_name,
+    rhs_usr, rhs_name, fn_ptr_type, method, from_usr).
+    Uses OR IGNORE to handle re-indexing of the same file.
+    """
+    cur = conn.executemany(
+        """INSERT OR IGNORE INTO fp_assignments
+           (config_hash, from_file, from_line, lhs_usr, lhs_name,
+            rhs_usr, rhs_name, fn_ptr_type, method, from_usr)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        rows,
+    )
+    return cur.rowcount
+
+
+def delete_fp_assignments_for_file(
+    conn: sqlite3.Connection, config_hash: str, from_file: str,
+) -> None:
+    """Delete fp_assignments rows for *from_file* under *config_hash*.
+
+    Called before re-indexing a TU to remove stale entries."""
+    conn.execute(
+        "DELETE FROM fp_assignments WHERE config_hash = ? AND from_file = ?",
+        (config_hash, from_file),
+    )
+
+
+def find_indirect_targets(
+    conn: sqlite3.Connection,
+    config_hash: str,
+    name: str,
+    limit: int = 50,
+) -> list[sqlite3.Row]:
+    """Find functions assigned to a function pointer field/variable/parameter.
+
+    Joins ``fp_assignments`` with ``indirect_call_sites`` on
+    ``lhs_usr = target_usr`` to link assignment sites to call sites.
+    Three-tier name resolution: exact name, exact qualified, suffix LIKE.
+    """
+    esc_name = name.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    suffix_pattern = f"%::{esc_name}"
+    return conn.execute(
+        """SELECT fpa.rhs_usr, fpa.rhs_name, fpa.fn_ptr_type, fpa.method,
+                  fpa.from_file AS assign_file, fpa.from_line AS assign_line,
+                  fpa.from_usr AS assign_from_usr,
+                  ics.from_file AS call_file, ics.from_line AS call_line,
+                  ics.expr_text AS call_expr_text,
+                  rhs_sym.qualified_name AS rhs_qname,
+                  caller_sym.name AS assign_caller
+           FROM fp_assignments fpa
+           LEFT JOIN indirect_call_sites ics
+             ON ics.target_usr = fpa.lhs_usr
+            AND ics.config_hash = fpa.config_hash
+           LEFT JOIN symbols rhs_sym
+             ON rhs_sym.usr = fpa.rhs_usr
+            AND rhs_sym.config_hash = fpa.config_hash
+           LEFT JOIN symbols caller_sym
+             ON caller_sym.usr = fpa.from_usr
+            AND caller_sym.config_hash = fpa.config_hash
+           WHERE fpa.config_hash = ?
+             AND (
+                 -- Match via indexed symbols (covers FIELD_DECL, VAR_DECL)
+                 fpa.lhs_usr IN (
+                     SELECT usr FROM symbols
+                     WHERE config_hash = ?
+                       AND (name = ? OR qualified_name = ? OR qualified_name LIKE ? ESCAPE ?)
+                 )
+                 OR
+                 -- Fallback: direct name match (covers PARM_DECL which are
+                 -- not in the symbols table)
+                 fpa.lhs_name = ?
+             )
+           ORDER BY fpa.from_file, fpa.from_line
+           LIMIT ?""",
+        (config_hash, config_hash, name, name, suffix_pattern, "\\", name, limit),
+    ).fetchall()
+
+
+def count_fp_assignments(conn: sqlite3.Connection, config_hash: str) -> int:
+    """Return total fp_assignment count (0 when not indexed)."""
+    return conn.execute(
+        "SELECT COUNT(*) FROM fp_assignments WHERE config_hash=?",
         (config_hash,),
     ).fetchone()[0]
 
@@ -1710,23 +1835,38 @@ def find_dead_code(
 ) -> list[dict]:
     """Find functions/methods that are defined but never called.
 
-    A "dead" symbol is one whose USR never appears in ``refs.to_usr``.
+    Returns two categories of results, each with a ``status`` field:
+
+    * ``"dead"`` — the symbol's USR has no entry at all in ``refs.to_usr``
+      (neither direct calls nor indirect function pointer assignments).
+    * ``"possibly_dead"`` — the symbol has at least one indirect reference
+      (``ref_kind = 'indirect'``, a function pointer assignment) but the
+      assignment is not linked to any call site via ``fp_assignments``.
+      This means the function IS assigned to a function pointer somewhere,
+      but the invocation site is unknown — it may be called through
+      unindexed code or a type-erased API.  LLM should treat this as
+      uncertain, not as confirmed dead code.
+
+    Each result dict includes: name, qualified_name, kind, file_path,
+    signature, line, status, reason.
 
     *exclude_paths* is a list of LIKE patterns for file paths to exclude
     (e.g. ``["mbed-os/%", "cmsis/%"]``).  When omitted, no paths are excluded.
     """
     if exclude_paths:
-        path_clauses = " AND ".join(
+        path_clause = "AND " + " AND ".join(
             "s.file_path NOT LIKE ?" for _ in exclude_paths
         )
-        params = [config_hash, config_hash] + list(exclude_paths) + [limit]
+        exclude_params = list(exclude_paths)
     else:
-        path_clauses = ""
-        params = [config_hash, config_hash, limit]
+        path_clause = ""
+        exclude_params = []
 
-    rows = conn.execute(
+    # Category 1: truly dead — no refs at all
+    dead_params: list[object] = [config_hash, config_hash] + exclude_params + [limit]
+    dead_rows = conn.execute(
         f"""SELECT s.name, s.qualified_name, s.kind, s.file_path,
-                  s.signature, s.line
+                  s.signature, s.line, s.usr
            FROM symbols s
            WHERE s.config_hash = ?
              AND s.is_definition = 1
@@ -1734,13 +1874,87 @@ def find_dead_code(
              AND s.usr NOT IN (
                  SELECT DISTINCT to_usr FROM refs WHERE config_hash = ?
              )
-             {('AND ' + path_clauses) if path_clauses else ''}
+             {path_clause}
            ORDER BY s.kind, s.name
            LIMIT ?""",
-        params,
+        dead_params,
     ).fetchall()
 
-    return [dict(r) for r in rows]
+    results: list[dict] = []
+    dead_usr_set: set[str] = set()
+    for r in dead_rows:
+        dead_usr_set.add(r["usr"])
+        results.append({
+            "name": r["name"],
+            "qualified_name": r["qualified_name"],
+            "kind": r["kind"],
+            "file_path": r["file_path"],
+            "signature": r["signature"],
+            "line": r["line"],
+            "status": "dead",
+            "reason": "no references found — likely unused",
+        })
+
+    # Category 2: possibly dead — indirect refs exist but no resolved call site.
+    # A symbol is possibly dead when it has ref_kind='indirect' entries
+    # (function pointer assignments) but is NOT found as a resolved target
+    # via fp_assignments → indirect_call_sites linking.
+    remaining_slots = limit - len(results)
+    if remaining_slots > 0:
+        possibly_params: list[object] = [
+            config_hash, config_hash, config_hash, config_hash,
+        ] + exclude_params + [remaining_slots]
+        possibly_rows = conn.execute(
+            f"""SELECT s.name, s.qualified_name, s.kind, s.file_path,
+                      s.signature, s.line, s.usr,
+                      (SELECT GROUP_CONCAT(site, ', ')
+                       FROM (SELECT DISTINCT r2.from_file || ':' || r2.from_line AS site
+                             FROM refs r2
+                             WHERE r2.to_usr = s.usr AND r2.config_hash = s.config_hash
+                               AND r2.ref_kind = 'indirect'
+                             LIMIT 3)) AS indirect_sites
+               FROM symbols s
+               WHERE s.config_hash = ?
+                 AND s.is_definition = 1
+                 AND s.kind IN ('function', 'method', 'constructor', 'destructor')
+                 -- has indirect refs
+                 AND s.usr IN (
+                     SELECT DISTINCT to_usr FROM refs
+                     WHERE config_hash = ? AND ref_kind = 'indirect'
+                 )
+                 -- but NOT in fp_assignments that link to a call site
+                 AND s.usr NOT IN (
+                     SELECT fpa.rhs_usr FROM fp_assignments fpa
+                     JOIN indirect_call_sites ics
+                       ON ics.target_usr = fpa.lhs_usr
+                      AND ics.config_hash = fpa.config_hash
+                     WHERE fpa.config_hash = ?
+                 )
+                 -- exclude truly dead (already covered)
+                 AND s.usr NOT IN (
+                     SELECT to_usr FROM refs WHERE config_hash = ? AND ref_kind = 'call'
+                 )
+                 {path_clause}
+               ORDER BY s.kind, s.name
+               LIMIT ?""",
+            possibly_params,
+        ).fetchall()
+        for r in possibly_rows:
+            if r["usr"] in dead_usr_set:
+                continue
+            results.append({
+                "name": r["name"],
+                "qualified_name": r["qualified_name"],
+                "kind": r["kind"],
+                "file_path": r["file_path"],
+                "signature": r["signature"],
+                "line": r["line"],
+                "status": "possibly_dead",
+                "reason": "assigned as function pointer but call sites unresolved",
+                "indirect_refs": r["indirect_sites"] or "",
+            })
+
+    return results
 
 
 def find_hotspots(
