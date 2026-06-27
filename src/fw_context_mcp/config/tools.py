@@ -149,8 +149,14 @@ class AiTool:
         inherits_from: ID of another tool whose instruction files this tool
                        reads.  When set, no separate injection is needed —
                        the parent tool's instructions cover this one.
-        mcp_registration: Command to register fw-context as an MCP server.
-                          ``{bin}`` is replaced with the fw-context-mcp binary path.
+        mcp_registration: CLI command for MCP registration (e.g. ``claude mcp add``).
+                         ``{bin}`` is replaced with the fw-context-mcp binary path.
+                         Mutually exclusive with ``mcp_config_file``.
+        mcp_config_file: Path to an MCP client config file for file-based
+                         registration (e.g. ``~/.config/opencode/opencode.json``).
+                         Mutually exclusive with ``mcp_registration``.
+        mcp_config_key: JSON key in the ``mcp`` servers map for file-based
+                        registration (e.g. ``"fw-context"``).
         targets: Where to inject fw-context instructions.
     """
     id: str
@@ -159,6 +165,8 @@ class AiTool:
     detection_dirs: list[str] = field(default_factory=list)
     inherits_from: str | None = None
     mcp_registration: str | None = None
+    mcp_config_file: str | None = None
+    mcp_config_key: str | None = None
     targets: list[InstructionTarget] = field(default_factory=list)
 
     def is_detected(self) -> bool:
@@ -215,7 +223,8 @@ TOOLS: dict[str, AiTool] = {
         id="opencode",
         name="OpenCode",
         detection_dirs=["~/.config/opencode"],
-        mcp_registration=None,  # manual: edit opencode.json
+        mcp_config_file="~/.config/opencode/opencode.json",
+        mcp_config_key="fw-context",
         targets=[
             InstructionTarget(
                 path="~/.config/opencode/rules/fw-context.md",
