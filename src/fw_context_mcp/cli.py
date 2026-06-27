@@ -312,16 +312,21 @@ def cmd_init(args: argparse.Namespace) -> int:
         print("\nRun 'fw-context init --tool <id>' to set up a specific tool.")
         return 0
 
-    # Resolve fw-context-mcp binary
-    mcp_bin = shutil.which("fw-context-mcp")
+    # Resolve fw-context-mcp binary — prefer canonical install over dev venv
+    mcp_bin = None
+    for candidate in [
+        Path.home() / ".local" / "bin" / "fw-context-mcp",
+        Path.home() / ".fw-context" / ".venv" / "bin" / "fw-context-mcp",
+    ]:
+        if candidate.exists():
+            mcp_bin = str(candidate)
+            break
     if not mcp_bin:
-        for candidate in [
-            Path(sys.executable).parent / "fw-context-mcp",
-            Path.home() / ".fw-context" / ".venv" / "bin" / "fw-context-mcp",
-        ]:
-            if candidate.exists():
-                mcp_bin = str(candidate)
-                break
+        mcp_bin = shutil.which("fw-context-mcp")
+    if not mcp_bin:
+        dev_candidate = Path(sys.executable).parent / "fw-context-mcp"
+        if dev_candidate.exists():
+            mcp_bin = str(dev_candidate)
 
     # Select tools to act on
     selected: list[str] = []
@@ -368,12 +373,15 @@ def cmd_init(args: argparse.Namespace) -> int:
                 print("  [info] Injecting instructions anyway...")
 
         # MCP registration (only if not --instructions-only)
-        if not args.instructions_only and tool.mcp_registration and mcp_bin:
-            _register_mcp(tool, mcp_bin)
+        if not args.instructions_only and mcp_bin and (tool.mcp_registration or tool.mcp_config_file):
+            if args.dry_run:
+                _register_mcp(tool, mcp_bin, dry_run=True)
+            else:
+                _register_mcp(tool, mcp_bin)
 
         # Instruction injection
         if not tool.targets:
-            if not tool.mcp_registration:
+            if not tool.mcp_registration and not tool.mcp_config_file:
                 print("  [skip] No instruction targets defined")
             continue
 
@@ -442,16 +450,26 @@ def cmd_init(args: argparse.Namespace) -> int:
     return 0 if ok else 1
 
 
-def _register_mcp(tool, mcp_bin: str) -> None:
-    """Register fw-context as an MCP server in *tool*'s CLI configuration.
+def _register_mcp(tool, mcp_bin: str, dry_run: bool = False) -> None:
+    """Register fw-context as an MCP server with *tool*'s configuration.
 
     *tool* is an ``AiTool`` instance; *mcp_bin* is the path or name of the
-    ``fw-context-mcp`` executable. No-op when *tool* has no ``mcp_registration``.
+    ``fw-context-mcp`` executable. Dispatches to CLI-based or file-based
+    registration depending on which fields are set on *tool*.
     """
-    """Register fw-context as an MCP server with a tool's CLI."""
+    if tool.mcp_config_file:
+        _register_mcp_file(tool, mcp_bin, dry_run=dry_run)
+    elif tool.mcp_registration:
+        if dry_run:
+            print(f"  [dry-run] {tool.name}: would register {mcp_bin}")
+        else:
+            _register_mcp_cli(tool, mcp_bin)
+
+
+def _register_mcp_cli(tool, mcp_bin: str) -> None:
+    """Register fw-context as an MCP server via a CLI command."""
     import shutil
     import subprocess
-
 
     if not tool.mcp_registration:
         return
@@ -475,6 +493,57 @@ def _register_mcp(tool, mcp_bin: str) -> None:
             print(f"  [ok] {tool.name}: fw-context already registered")
         else:
             print(f"  [warn] {tool.name}: {msg}", file=sys.stderr)
+
+
+def _register_mcp_file(tool, mcp_bin: str, dry_run: bool = False) -> None:
+    """Register fw-context as an MCP server by editing a JSON config file.
+
+    Used for tools that store MCP server configuration in a JSON file
+    rather than exposing a CLI command (e.g. OpenCode's ``opencode.json``).
+    Preserves existing file structure (schema, other MCP servers, etc.)
+    and marks fw-context as ``enabled: true`` with ``type: local``.
+    """
+    import json
+    import os
+
+    if not tool.mcp_config_file:
+        return
+
+    config_path = Path(os.path.expanduser(tool.mcp_config_file))
+
+    try:
+        if config_path.exists():
+            data = json.loads(config_path.read_text(encoding="utf-8"))
+        else:
+            data = {}
+    except (json.JSONDecodeError, OSError) as e:
+        print(f"  [warn] {tool.name}: could not read {config_path}: {e}", file=sys.stderr)
+        return
+
+    mcp_servers = data.setdefault("mcp", {})
+    key = tool.mcp_config_key or "fw-context"
+
+    existing = mcp_servers.get(key)
+    if isinstance(existing, dict) and existing.get("command") == [mcp_bin]:
+        print(f"  [ok] {tool.name}: fw-context already registered")
+        return
+
+    if dry_run:
+        if isinstance(existing, dict):
+            print(f"  [dry-run] {tool.name}: {config_path}: would UPDATE fw-context → {mcp_bin}")
+        else:
+            print(f"  [dry-run] {tool.name}: {config_path}: would ADD fw-context → {mcp_bin}")
+        return
+
+    mcp_servers[key] = {
+        "command": [mcp_bin],
+        "enabled": True,
+        "type": "local",
+    }
+
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    config_path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+    print(f"  [ok] {tool.name}: fw-context registered ({mcp_bin})")
 
 
 def _update_marked_section(path: Path, content: str, marker: str) -> None:
