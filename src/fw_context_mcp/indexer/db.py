@@ -741,7 +741,15 @@ def open_db(path: Path, *, skip_integrity_check: bool = False) -> sqlite3.Connec
                     except sqlite3.OperationalError as e2:
                         if "duplicate column" not in str(e2) and "no such table" not in str(e2):
                             raise
-                conn.executescript(_SCHEMA)
+                try:
+                    conn.executescript(_SCHEMA)
+                except sqlite3.OperationalError as e3:
+                    conn.close()
+                    raise DatabaseCorruptionError(
+                        str(path),
+                        f"Schema migration failed after column recovery — "
+                        f"the database may be in an inconsistent state: {e3}",
+                    ) from e3
             else:
                 conn.close()
                 raise DatabaseCorruptionError(str(path), str(e)) from e
@@ -752,6 +760,69 @@ def open_db(path: Path, *, skip_integrity_check: bool = False) -> sqlite3.Connec
         # Stamp the database with the current schema version so we can detect
         # stale indexes — PRAGMA user_version is the standard SQLite mechanism.
         conn.execute(f"PRAGMA user_version = {CURRENT_SCHEMA_VERSION}")
+
+    # ── Defensive table creation ──────────────────────────────────────────
+    # Critical tables that were added after the initial _SCHEMA definition.
+    # These run unconditionally (outside the version gate) so that a database
+    # whose migration was interrupted — leaving user_version stamped but
+    # tables missing — self-heals automatically.  CREATE TABLE IF NOT EXISTS
+    # is idempotent and takes microseconds when the table already exists.
+    _CRITICAL_TABLES = """
+    CREATE TABLE IF NOT EXISTS indirect_call_sites (
+        id           INTEGER PRIMARY KEY,
+        config_hash  TEXT    NOT NULL,
+        from_file    TEXT    NOT NULL,
+        from_line    INTEGER NOT NULL,
+        from_usr     TEXT,
+        expr_text    TEXT    NOT NULL DEFAULT '',
+        target_usr   TEXT    NOT NULL,
+        target_name  TEXT    NOT NULL DEFAULT '',
+        fn_ptr_type  TEXT    NOT NULL DEFAULT ''
+    );
+    CREATE INDEX IF NOT EXISTS idx_ics_config_target ON indirect_call_sites(config_hash, target_usr);
+    CREATE INDEX IF NOT EXISTS idx_ics_config_file   ON indirect_call_sites(config_hash, from_file);
+    CREATE INDEX IF NOT EXISTS idx_ics_config_usr    ON indirect_call_sites(config_hash, from_usr);
+
+    CREATE TABLE IF NOT EXISTS fp_assignments (
+        id           INTEGER PRIMARY KEY,
+        config_hash  TEXT    NOT NULL,
+        from_file    TEXT    NOT NULL,
+        from_line    INTEGER NOT NULL,
+        lhs_usr      TEXT    NOT NULL,
+        lhs_name     TEXT    NOT NULL DEFAULT '',
+        rhs_usr      TEXT    NOT NULL,
+        rhs_name     TEXT    NOT NULL DEFAULT '',
+        fn_ptr_type  TEXT    NOT NULL DEFAULT '',
+        method       TEXT    NOT NULL,
+        from_usr     TEXT
+    );
+    CREATE INDEX IF NOT EXISTS idx_fpa_config_lhs ON fp_assignments(config_hash, lhs_usr);
+    CREATE INDEX IF NOT EXISTS idx_fpa_config_rhs ON fp_assignments(config_hash, rhs_usr);
+    CREATE INDEX IF NOT EXISTS idx_fpa_config_file ON fp_assignments(config_hash, from_file);
+
+    CREATE TABLE IF NOT EXISTS inheritance (
+        id           INTEGER PRIMARY KEY,
+        config_hash  TEXT    NOT NULL REFERENCES build_configs(config_hash),
+        derived_usr  TEXT    NOT NULL,
+        base_usr     TEXT    NOT NULL,
+        access       TEXT    NOT NULL DEFAULT 'public',
+        is_virtual   INTEGER NOT NULL DEFAULT 0,
+        UNIQUE(config_hash, derived_usr, base_usr)
+    );
+    CREATE INDEX IF NOT EXISTS idx_inheritance_derived ON inheritance(config_hash, derived_usr);
+    CREATE INDEX IF NOT EXISTS idx_inheritance_base    ON inheritance(config_hash, base_usr);
+
+    CREATE TABLE IF NOT EXISTS overrides (
+        id           INTEGER PRIMARY KEY,
+        config_hash  TEXT    NOT NULL REFERENCES build_configs(config_hash),
+        derived_usr  TEXT    NOT NULL,
+        base_usr     TEXT    NOT NULL,
+        UNIQUE(config_hash, derived_usr, base_usr)
+    );
+    CREATE INDEX IF NOT EXISTS idx_overrides_derived ON overrides(config_hash, derived_usr);
+    CREATE INDEX IF NOT EXISTS idx_overrides_base    ON overrides(config_hash, base_usr);
+    """
+    conn.executescript(_CRITICAL_TABLES)
 
     # Migrate vec0 table when sqlite-vec is available (idempotent CREATE IF NOT EXISTS)
     try:
