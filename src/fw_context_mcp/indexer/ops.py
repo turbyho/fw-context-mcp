@@ -307,6 +307,8 @@ def store_symbols_for_unit(
             ).fetchone()
             if old_row is None:
                 continue  # genuine new symbol
+            if old_row["summary"] is None:
+                continue  # no analysis to preserve — nothing to move
             if old_row["file_id"] == file_id_cache[s.file]:
                 continue  # same file, wasn't in saved_analyses → new symbol
 
