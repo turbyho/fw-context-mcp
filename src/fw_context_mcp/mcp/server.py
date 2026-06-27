@@ -498,28 +498,110 @@ def _start_bg_watcher(root: Path) -> None:
 
 
 def _is_bg_reindex_running(root: Path) -> bool:
-    """Check whether a background ``fw-context index`` is running for *root*.
+    """Check whether any index process is running for *root*.
 
-    Uses ``fcntl.flock`` on ``<db_dir>/<project_id>/reindex.lock`` — the
-    kernel tracks the lock, auto-releases on process exit.  No PID tracking,
-    no race conditions, no stale lock cleanup.
+    Checks two lock files:
+
+    1. ``<db_dir>/<project_id>/reindex.lock`` — held by the background
+       auto-reindex subprocess spawned by ``_start_bg_reindex_if_stale``.
+    2. ``<db_dir>/write.lock`` — held by ANY index process
+       (``fw-context index``, ``reindex_file``, auto-reindex).
+
+    If either lock is held, another index process is active — skip
+    launching a duplicate background reindex.
+
+    Uses ``fcntl.flock`` on each lock file — the kernel tracks the lock,
+    auto-releases on process exit.  No PID tracking, no race conditions,
+    no stale lock cleanup.
     """
     db_path = _db_path(root)
     if not db_path.exists():
         return False
-    lock_file = db_path.parent / "reindex.lock"
+
+    # ── Lock-check helper ──
+    def _lock_held(lock_file: Path) -> bool:
+        try:
+            lock_fd = os.open(lock_file, os.O_CREAT | os.O_RDWR)
+        except OSError:
+            return False
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            os.close(lock_fd)
+            return True  # Lock held by another process
+        fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        os.close(lock_fd)
+        return False
+
+    # 1. Auto-reindex lock (db_dir/project_id/reindex.lock)
+    if _lock_held(db_path.parent / "reindex.lock"):
+        return True
+
+    # 2. General write lock (db_dir/write.lock)
+    if _lock_held(db_path.parent / "write.lock"):
+        return True
+
+    return False
+
+
+def _request_bg_reindex_pause(root: Path) -> None:
+    """Signal the background reindex to release the write lock.
+
+    Writes ``<pid>`` to ``<db_dir>/<project_id>/reindex.pause`` so the
+    bg reindex can check whether the requesting process is still alive.
+    The bg process checks this marker between translation units — if the
+    requesting PID is dead, it ignores the stale marker and continues.
+    """
+    db_path = _db_path(root)
+    pause_file = db_path.parent / "reindex.pause"
     try:
-        lock_fd = os.open(lock_file, os.O_CREAT | os.O_RDWR)
+        pause_file.write_text(str(os.getpid()), encoding="utf-8")
     except OSError:
+        pass
+
+
+def _resume_bg_reindex(root: Path) -> None:
+    """Remove the pause marker — the bg reindex may now resume."""
+    db_path = _db_path(root)
+    pause_file = db_path.parent / "reindex.pause"
+    try:
+        pause_file.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def _check_bg_pause(root: Path) -> bool:
+    """Check whether a pause was requested and the requester is still alive.
+
+    Returns True if the bg reindex should pause (pause marker exists AND
+    the requesting PID is still running).  Returns False if there is no
+    pause marker or the requesting process has died (stale marker —
+    cleaned up automatically).
+    """
+    db_path = _db_path(root)
+    pause_file = db_path.parent / "reindex.pause"
+    if not pause_file.exists():
         return False
     try:
-        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except BlockingIOError:
-        os.close(lock_fd)
-        return True  # Lock held by another process
-    fcntl.flock(lock_fd, fcntl.LOCK_UN)
-    os.close(lock_fd)
-    return False
+        content = pause_file.read_text(encoding="utf-8").strip()
+        requester_pid = int(content)
+    except (OSError, ValueError):
+        try:
+            pause_file.unlink(missing_ok=True)
+        except OSError:
+            pass
+        return False
+    # Check if the requesting process is still alive
+    try:
+        os.kill(requester_pid, 0)
+    except OSError:
+        # Process dead — clean up stale marker
+        try:
+            pause_file.unlink(missing_ok=True)
+        except OSError:
+            pass
+        return False
+    return True
 
 
 def _start_bg_reindex_if_stale(root: Path) -> None:
@@ -674,6 +756,7 @@ def _start_bg_reindex_if_stale(root: Path) -> None:
         pass
 
     log.info("Starting background reindex for %s (%s)", root, reason)
+    pid_file = db_path.parent / "reindex.pid"
     try:
         stdout_fh = open(log_file, "a")
         proc = subprocess.Popen(
@@ -688,6 +771,8 @@ def _start_bg_reindex_if_stale(root: Path) -> None:
             },
         )
         stdout_fh.close()  # Close parent copy — child has its own fd
+        # Store PID so manual operations can kill the bg process
+        pid_file.write_text(str(proc.pid), encoding="utf-8")
     except Exception as exc:
         log.exception("Failed to spawn background reindex subprocess")
         try:
@@ -697,6 +782,10 @@ def _start_bg_reindex_if_stale(root: Path) -> None:
             pass
         fcntl.flock(lock_fd, fcntl.LOCK_UN)
         os.close(lock_fd)
+        try:
+            pid_file.unlink(missing_ok=True)
+        except OSError:
+            pass
         return
 
     def _waiter() -> None:
@@ -727,6 +816,10 @@ def _start_bg_reindex_if_stale(root: Path) -> None:
         finally:
             fcntl.flock(lock_fd, fcntl.LOCK_UN)
             os.close(lock_fd)
+            try:
+                pid_file.unlink(missing_ok=True)
+            except OSError:
+                pass
         log.info("Background reindex finished for %s (exit %d)", root, proc.returncode)
 
     def _kill_and_log(p: subprocess.Popen, reason: str) -> None:
@@ -1280,62 +1373,71 @@ def _reindex_file_impl(
             except Exception as exc:
                 log.warning("skip TU %s during reindex: %s", unit.file.name, exc)
 
+        # Request bg reindex to pause — manual operations take priority.
+        # The bg process checks for the pause marker between TUs and
+        # releases the write lock, allowing this operation to proceed
+        # without erroring or killing anything.
+        _request_bg_reindex_pause(root)
+
         t0 = time.monotonic()
         total_symbols = 0
 
-        with db_write_lock(db_path.parent, timeout=20.0):
-            # ── Phase 1: main symbol write ──
-            for unit, parsed in parsed_units:
-                with transaction(conn):
-                    syms_added, _ = store_symbols_for_unit(
-                        conn, unit, config_hash, root,
-                        source_roots=source_roots,
-                        exclude_paths=exclude_paths,
-                        index_refs=cfg.index.index_refs,
-                        pre_parsed=parsed,
-                    )
-                    total_symbols += syms_added
+        try:
+            with db_write_lock(db_path.parent, timeout=60.0):
+                # ── Phase 1: main symbol write ──
+                for unit, parsed in parsed_units:
+                    with transaction(conn):
+                        syms_added, _ = store_symbols_for_unit(
+                            conn, unit, config_hash, root,
+                            source_roots=source_roots,
+                            exclude_paths=exclude_paths,
+                            index_refs=cfg.index.index_refs,
+                            pre_parsed=parsed,
+                        )
+                        total_symbols += syms_added
 
-            elapsed = round(time.monotonic() - t0, 2)
-            result: dict = {
-                "file": str(target),
-                "translation_units": len(matching),
-                "symbols_updated": total_symbols,
-                "elapsed_s": elapsed,
-            }
+                elapsed = round(time.monotonic() - t0, 2)
+                result: dict = {
+                    "file": str(target),
+                    "translation_units": len(matching),
+                    "symbols_updated": total_symbols,
+                    "elapsed_s": elapsed,
+                }
 
-            if not with_analysis:
+                if not with_analysis:
+                    return result
+
+                # ── Phase 2: LLM analysis ──
+                if cfg.llm.enabled and cfg.llm.analyze_symbols and total_symbols > 0:
+                    try:
+                        from ..indexer.runner import _build_file_analysis, _build_llm_analysis
+                        _build_llm_analysis(conn, config_hash, cfg.llm, db_path.parent, write_lock_held=True)
+                        if cfg.llm.analyze_files:
+                            _build_file_analysis(conn, config_hash, cfg.llm, db_path.parent, write_lock_held=True)
+                        conn.commit()
+                        analyzed_count = conn.execute(
+                            "SELECT COUNT(*) FROM llm_analysis a JOIN symbols s ON s.id = a.symbol_id WHERE s.config_hash = ?",
+                            (config_hash,),
+                        ).fetchone()[0]
+                        result["analysis_updated"] = analyzed_count
+                    except Exception as exc:
+                        result["analysis_warning"] = f"LLM analysis skipped: {exc}"
+
+                # ── Phase 3: method override graph ──
+                if total_symbols > 0:
+                    try:
+                        from ..indexer.runner import _build_overrides
+                        _build_overrides(conn, config_hash, db_path.parent, write_lock_held=True)
+                        conn.commit()
+                    except Exception as exc:
+                        result["overrides_warning"] = f"Override analysis skipped: {exc}"
+
+                if len(matching) == 1 and target.suffix.lower() in {".h", ".hpp"}:
+                    result["warning"] = "Header re-indexed via one TU. Other TUs including this header may still have stale symbols — run 'fw-context index' for full accuracy."
+
                 return result
-
-            # ── Phase 2: LLM analysis ──
-            if cfg.llm.enabled and cfg.llm.analyze_symbols and total_symbols > 0:
-                try:
-                    from ..indexer.runner import _build_file_analysis, _build_llm_analysis
-                    _build_llm_analysis(conn, config_hash, cfg.llm, db_path.parent, write_lock_held=True)
-                    if cfg.llm.analyze_files:
-                        _build_file_analysis(conn, config_hash, cfg.llm, db_path.parent, write_lock_held=True)
-                    conn.commit()
-                    analyzed_count = conn.execute(
-                        "SELECT COUNT(*) FROM llm_analysis a JOIN symbols s ON s.id = a.symbol_id WHERE s.config_hash = ?",
-                        (config_hash,),
-                    ).fetchone()[0]
-                    result["analysis_updated"] = analyzed_count
-                except Exception as exc:
-                    result["analysis_warning"] = f"LLM analysis skipped: {exc}"
-
-            # ── Phase 3: method override graph ──
-            if total_symbols > 0:
-                try:
-                    from ..indexer.runner import _build_overrides
-                    _build_overrides(conn, config_hash, db_path.parent, write_lock_held=True)
-                    conn.commit()
-                except Exception as exc:
-                    result["overrides_warning"] = f"Override analysis skipped: {exc}"
-
-            if len(matching) == 1 and target.suffix.lower() in {".h", ".hpp"}:
-                result["warning"] = "Header re-indexed via one TU. Other TUs including this header may still have stale symbols — run 'fw-context index' for full accuracy."
-
-            return result
+        finally:
+            _resume_bg_reindex(root)
     finally:
         conn.close()
 

@@ -984,6 +984,39 @@ def run(
     acc_write = 0.0
     t0 = time.monotonic()
 
+    def _wait_if_paused() -> None:
+        """If a manual operation requested pause, wait until it finishes.
+
+        The MCP server writes ``<pid>`` to ``reindex.pause`` before a manual
+        ``reindex_file`` or ``reset_index``.  This function blocks until the
+        pause is lifted or the requesting process dies (stale marker cleanup).
+        """
+        pause_file = db_path.parent / "reindex.pause"
+        while True:
+            if not pause_file.exists():
+                return
+            try:
+                content = pause_file.read_text(encoding="utf-8").strip()
+                requester_pid = int(content)
+            except (OSError, ValueError):
+                try:
+                    pause_file.unlink(missing_ok=True)
+                except OSError:
+                    pass
+                return
+            try:
+                os.kill(requester_pid, 0)
+            except OSError:
+                # Process dead — clean up stale marker
+                try:
+                    pause_file.unlink(missing_ok=True)
+                except OSError:
+                    pass
+                return
+            time.sleep(1.0)  # Wait, then check again
+
+    _wait_if_paused()
+
     if parallel and len(units) > 1:
         # Parsing + AST traversal is GIL-bound Python; more threads
         # don't help.  Single worker, sequential path for simplicity.
