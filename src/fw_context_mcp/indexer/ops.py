@@ -7,6 +7,7 @@ same code path.
 
 from __future__ import annotations
 
+import hashlib
 import logging
 from pathlib import Path
 
@@ -27,6 +28,48 @@ from fw_context_mcp.indexer.db import (
 )
 
 log = logging.getLogger(__name__)
+
+
+def _read_file_lines(abs_path: str) -> list[str] | None:
+    """Read all lines from a source file, or ``None`` on failure.
+
+    Used by ``_compute_content_hash`` to read symbol bodies for
+    change detection during incremental reindex.
+    """
+    try:
+        with open(abs_path) as f:
+            return f.readlines()
+    except (FileNotFoundError, OSError):
+        return None
+
+
+def _read_body(lines: list[str], start_line: int, end_line: int) -> str:
+    """Extract symbol body from pre-read file lines using libclang extents.
+
+    *start_line* and *end_line* are 1-based.
+    Returns the joined body text or an empty string when the range is invalid.
+    """
+    if end_line > start_line and end_line <= len(lines):
+        return "".join(lines[start_line - 1 : end_line])
+    return ""
+
+
+def _compute_content_hash(
+    lines: list[str],
+    start_line: int,
+    end_line: int,
+    signature: str,
+    docstring: str,
+) -> str:
+    """Stable hash of a symbol's body + signature for change detection.
+
+    Uses the actual body text (read from disk via libclang extents) so that
+    even a refactor preserving line count is detected.  Whitespace is stripped
+    so formatting-only changes are ignored.
+    """
+    body = _read_body(lines, start_line, end_line)
+    raw = f"{signature or ''}|{body.strip()}|{docstring or ''}"
+    return hashlib.sha256(raw.encode()).hexdigest()[:16]
 
 
 def store_symbols_for_unit(
@@ -90,7 +133,7 @@ def store_symbols_for_unit(
             log.warning("skip TU %s: %s", unit.file.name, exc)
             return 0, 0
 
-    # Delete old symbols for this TU.
+    # ── Resolve known files for this TU ──
     # When the caller provides *existing_files* (bulk indexing path), use it
     # directly — avoids a redundant full-scan of the files table inside the
     # write lock (O(N) per TU → O(N²) total).  Falls back to get_file_mtimes()
@@ -99,10 +142,55 @@ def store_symbols_for_unit(
         known = existing_files
     else:
         known = get_file_mtimes(conn, config_hash)
+
+    # ── File-content cache for body hashing ──
+    # Each source file is read at most once per TU; all symbols from
+    # the same file share the cached lines.
+    _body_cache: dict[str, list[str] | None] = {}
+
+    def _cached_lines(abs_path: str) -> list[str] | None:
+        if abs_path not in _body_cache:
+            _body_cache[abs_path] = _read_file_lines(abs_path)
+        return _body_cache[abs_path]
+
+    # ── Phase 1: Save existing LLM analysis before delete ──
+    # Keyed by USR so unchanged symbols can be restored with their
+    # original analysis after the DELETE+INSERT cycle.
+    saved_analyses: dict[str, dict] = {}
+    if file_path in known:
+        file_id_old, _ = known[file_path]
+        rows = conn.execute(
+            """SELECT s.usr, s.signature, s.end_line, s.line, s.docstring,
+                      s.file_id, f.path as abs_path,
+                      a.summary, a.inputs, a.outputs, a.model, a.analyzed_at
+               FROM symbols s
+               JOIN llm_analysis a ON a.symbol_id = s.id
+               JOIN files f ON f.id = s.file_id
+               WHERE s.file_id = ?""",
+            (file_id_old,),
+        ).fetchall()
+        for r in rows:
+            lines = _cached_lines(r["abs_path"])
+            if lines is None:
+                continue  # source file gone — cannot verify, skip restore
+            ch = _compute_content_hash(
+                lines, r["line"], r["end_line"], r["signature"], r["docstring"],
+            )
+            saved_analyses[r["usr"]] = {
+                "summary": r["summary"],
+                "inputs": r["inputs"],
+                "outputs": r["outputs"],
+                "model": r["model"],
+                "analyzed_at": r["analyzed_at"],
+                "content_hash": ch,
+            }
+
+    # ── Phase 2: Delete old symbols (existing logic) ──
     if file_path in known:
         file_id_old, _ = known[file_path]
         delete_inheritance_for_file(conn, config_hash, file_id_old)
         delete_symbols_for_file(conn, file_id_old)
+        # ON DELETE CASCADE → llm_analysis, embeddings removed
 
     # Upsert the TU file record
     upsert_file(conn, config_hash, file_path, unit.language, mtime=current_mtime)
@@ -155,6 +243,114 @@ def store_symbols_for_unit(
             ))
         insert_symbols_batch(conn, rows)
         syms_added = len(rows)
+
+        # ── Phase 3: Restore LLM analysis for unchanged symbols ──
+        restored = 0
+        if saved_analyses:
+            for s in syms:
+                if s.usr not in saved_analyses:
+                    continue
+                old = saved_analyses[s.usr]
+                lines = _cached_lines(s.file)
+                if lines is None:
+                    continue
+                new_ch = _compute_content_hash(
+                    lines, s.line, s.end_line, s.signature, s.docstring,
+                )
+                if old["content_hash"] != new_ch:
+                    continue  # symbol changed — _build_llm_analysis will re-analyze
+
+                # Symbol unchanged — restore analysis with original timestamp
+                new_id = conn.execute(
+                    "SELECT id FROM symbols WHERE config_hash = ? AND usr = ?",
+                    (config_hash, s.usr),
+                ).fetchone()
+                if not new_id:
+                    continue
+                conn.execute(
+                    """INSERT OR REPLACE INTO llm_analysis
+                       (symbol_id, summary, inputs, outputs, model, analyzed_at)
+                       VALUES (?, ?, ?, ?, ?, ?)""",
+                    (new_id[0], old["summary"], old["inputs"],
+                     old["outputs"], old["model"], old["analyzed_at"]),
+                )
+                # Sync denormalized columns on symbols (FTS5 needs these)
+                conn.execute(
+                    """UPDATE symbols SET summary = ?, inputs = ?, outputs = ?
+                       WHERE id = ?""",
+                    (old["summary"], old["inputs"], old["outputs"], new_id[0]),
+                )
+                restored += 1
+        if restored:
+            log.debug(
+                "Restored LLM analysis for %d unchanged symbols in %s",
+                restored, Path(file_path).name,
+            )
+
+        # ── Phase 4: Detect and fix moved symbols ──
+        # Symbols not in saved_analyses may have moved from another file.
+        # Find existing row with same USR, same content_hash, but different
+        # file_id → update file_id, keep analysis, delete duplicate.
+        moved = 0
+        for s in syms:
+            if s.usr in saved_analyses:
+                continue  # already handled in Phase 3
+            old_row = conn.execute(
+                """SELECT s.id, s.file_id, s.signature, s.line, s.end_line,
+                          s.docstring, f.path as abs_path,
+                          a.summary, a.inputs, a.outputs, a.model, a.analyzed_at
+                   FROM symbols s
+                   LEFT JOIN llm_analysis a ON a.symbol_id = s.id
+                   JOIN files f ON f.id = s.file_id
+                   WHERE s.usr = ? AND s.config_hash = ?""",
+                (s.usr, config_hash),
+            ).fetchone()
+            if old_row is None:
+                continue  # genuine new symbol
+            if old_row["file_id"] == file_id_cache[s.file]:
+                continue  # same file, wasn't in saved_analyses → new symbol
+
+            # Same USR, different file — check if content matches
+            lines = _cached_lines(s.file)
+            if lines is None:
+                continue
+            old_lines = _cached_lines(old_row["abs_path"])
+            if old_lines is None:
+                continue
+            old_ch = _compute_content_hash(
+                old_lines, old_row["line"], old_row["end_line"],
+                old_row["signature"], old_row["docstring"],
+            )
+            new_ch = _compute_content_hash(
+                lines, s.line, s.end_line, s.signature, s.docstring,
+            )
+            if old_ch != new_ch:
+                continue  # content changed — treat as new symbol
+
+            # Same content, different file — moved
+            try:
+                new_rel = str(Path(s.file).resolve().relative_to(project_root))
+            except ValueError:
+                new_rel = s.file
+            conn.execute(
+                """UPDATE symbols SET file_id = ?, file_path = ?,
+                   line = ?, col = ?, end_line = ?
+                   WHERE id = ?""",
+                (file_id_cache[s.file], new_rel, s.line, s.column,
+                 s.end_line, old_row["id"]),
+            )
+            # Delete the duplicate row just inserted by insert_symbols_batch
+            dup_id = conn.execute(
+                "SELECT id FROM symbols WHERE config_hash = ? AND usr = ? AND id != ?",
+                (config_hash, s.usr, old_row["id"]),
+            ).fetchone()
+            if dup_id:
+                conn.execute("DELETE FROM symbols WHERE id = ?", (dup_id[0],))
+            moved += 1
+        if moved:
+            log.debug(
+                "Detected %d moved symbols in %s", moved, Path(file_path).name,
+            )
 
     # Path-relative helper used by refs and indirect_call_sites blocks
     def _rel(p: str) -> str:
