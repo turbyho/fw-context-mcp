@@ -1512,17 +1512,17 @@ def upsert_embeddings_vec(
     """Insert or replace embeddings into the vec0 vector table.
 
     Each row is ``(symbol_id, config_hash, embedding_vector)``.
-    Uses INSERT OR REPLACE so re-indexing the same build is idempotent.
+    Uses DELETE + INSERT because ``vec0`` virtual tables do not reliably
+    support ``INSERT OR REPLACE`` conflict resolution.
     Returns number of rows inserted.
     """
     import json
 
-    # vec0 requires INSERT per-row (no batch executemany via virtual table).
-    # We build a single transaction around the whole batch.
     count = 0
     for symbol_id, config_hash, vec in rows:
+        conn.execute("DELETE FROM vec_symbols WHERE rowid = ?", (symbol_id,))
         conn.execute(
-            "INSERT OR REPLACE INTO vec_symbols(rowid, embedding, config_hash, symbol_id) "
+            "INSERT INTO vec_symbols(rowid, embedding, config_hash, symbol_id) "
             "VALUES (?, ?, ?, ?)",
             (symbol_id, json.dumps(vec), config_hash, symbol_id),
         )
