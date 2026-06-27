@@ -46,6 +46,7 @@ ollama_url = "http://localhost:11434"
 #   See: https://ollama.com/search?c=cloud
 model = "qwen2.5-coder:14b"
 num_ctx = 16384
+# timeout = 600.0   # HTTP timeout for Ollama requests in seconds (default 600)
 # debug_log = "~/.fw-context/llm-debug.jsonl"   # write LLM prompts/responses to JSONL
 analyze_symbols = true
 analyze_files = true    # generate per-file summaries (2-3 sentences)
@@ -103,6 +104,7 @@ _PROJECT_LOCAL_DEFAULTS_TEMPLATE = """\
 # ollama_url = "http://localhost:11434"
 # model = "qwen2.5-coder:14b"   # minimum 14B recommended — see global config for options
 # num_ctx = 16384
+# timeout = 600.0   # HTTP timeout for Ollama requests in seconds (default 600)
 # debug_log = "~/.fw-context/llm-debug.jsonl"   # write LLM prompts/responses to JSONL
 # analyze_symbols = true    # generate structured symbol descriptions (summary, inputs, outputs) — enabled by default
 # analyze_files = true      # generate per-file summaries (2-3 sentences) — enabled by default
@@ -125,6 +127,10 @@ class LLMConfig:
             Minimum 14B parameters recommended for C++ embedded code.
         embed_model: Embedding model for semantic search (mxbai-embed-large).
         num_ctx: Context window size in tokens.
+        timeout: HTTP request timeout in seconds for Ollama API calls.
+            Default 600 s (10 min) — analysis batches with large prompts and
+            ``num_predict=3000`` can take several minutes, especially when
+            the model runs on CPU. Embed requests use ``timeout * 2``.
         debug_log: Optional path to a JSONL file for debugging LLM prompts/responses.
         analyze_symbols: Generate per-symbol summaries, inputs, and outputs during indexing.
         analyze_files: Generate per-file summaries (2-3 sentences) during indexing.
@@ -134,6 +140,7 @@ class LLMConfig:
     model: str = "qwen2.5-coder:14b"
     embed_model: str = "mxbai-embed-large:latest"
     num_ctx: int = 16384
+    timeout: float = 600.0
     debug_log: Path | None = None
     analyze_symbols: bool = True
     analyze_files: bool = True
@@ -282,6 +289,8 @@ def _from_dict(data: dict) -> Config:
             cfg.llm.embed_model = embed_model
         if num_ctx := llm.get("num_ctx"):
             cfg.llm.num_ctx = int(num_ctx)
+        if timeout := llm.get("timeout"):
+            cfg.llm.timeout = float(timeout)
         if debug_log := llm.get("debug_log"):
             cfg.llm.debug_log = Path(debug_log).expanduser()
         if "analyze_symbols" in llm:
