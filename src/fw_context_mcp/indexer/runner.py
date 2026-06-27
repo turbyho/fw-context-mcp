@@ -233,7 +233,7 @@ def _build_embeddings(conn, config_hash: str, llm_config, db_dir: Path) -> None:
                 vec_batch = [(r["id"], config_hash, emb) for r, emb in zip(chunk_rows, embs, strict=True)]
                 upsert_embeddings_vec(conn, vec_batch)
             except Exception as e:
-                log.debug("vec0 batch insert failed (sqlite-vec may not be loaded): %s", e)
+                log.warning("vec0 batch insert failed (sqlite-vec may not be loaded): %s", e)
 
         total += len(blob_batch)
     log.info("Embeddings stored: %d symbols (model=%s)", total, model)
