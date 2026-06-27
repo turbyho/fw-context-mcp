@@ -64,13 +64,29 @@ __all__ = [
 ]
 
 import fcntl
+import logging
 import os
 import re
-import sqlite3
 import struct
+import sys
+
+# Replace stdlib sqlite3 with pysqlite3 when available.
+# The stdlib sqlite3 on macOS (pyenv without --enable-loadable-sqlite-extensions)
+# lacks enable_load_extension(), which is required by sqlite-vec.
+# pysqlite3 provides a build of SQLite with extension support and pre-built
+# wheels for macOS, Linux, and Windows.
+try:
+    import pysqlite3
+
+    sys.modules["sqlite3"] = pysqlite3
+except ImportError:
+    pass
+import sqlite3
 from collections.abc import Generator
 from contextlib import contextmanager
 from pathlib import Path
+
+log = logging.getLogger(__name__)
 
 
 class DatabaseCorruptionError(sqlite3.DatabaseError):
@@ -740,8 +756,12 @@ def open_db(path: Path, *, skip_integrity_check: bool = False) -> sqlite3.Connec
     # Migrate vec0 table when sqlite-vec is available (idempotent CREATE IF NOT EXISTS)
     try:
         init_vec_table(conn)
-    except Exception:
-        pass
+    except Exception as e:
+        log.warning(
+            "sqlite-vec vector table initialization failed — "
+            "semantic search will use legacy BLOB fallback: %s",
+            e,
+        )
 
     # Integrity check — detect corruption early, before any tool uses the DB.
     # Skip for auxiliary connections (worker threads, pooled connections)
