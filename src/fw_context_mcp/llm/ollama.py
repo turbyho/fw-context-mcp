@@ -18,8 +18,6 @@ from ..config.settings import LLMConfig
 
 log = logging.getLogger(__name__)
 
-_TIMEOUT = 120.0
-
 # Per-process lock serializing Ollama HTTP calls.  Multiple concurrent
 # requests to a single Ollama instance can cause timeouts, OOM, or hangs
 # when the GPU is saturated.  This lock ensures at most one in-flight
@@ -101,12 +99,12 @@ def call_ollama(
     t0 = time.monotonic()
     try:
         with ollama_guard():
-            resp = httpx.post(url, json=payload, timeout=_TIMEOUT)
+            resp = httpx.post(url, json=payload, timeout=cfg.timeout)
         if resp.status_code == 404:
             log.info("LLM model '%s' not found, pulling...", cfg.model)
             _pull_model(cfg.model, cfg.ollama_url)
             with ollama_guard():
-                resp = httpx.post(url, json=payload, timeout=_TIMEOUT)
+                resp = httpx.post(url, json=payload, timeout=cfg.timeout)
         resp.raise_for_status()
         response_text = resp.json()["response"]
         if cfg.debug_log:
@@ -125,7 +123,7 @@ def call_ollama(
             "Make sure Ollama is running: https://ollama.com"
         ) from e
     except httpx.TimeoutException:
-        raise OllamaError(f"Ollama request timed out after {_TIMEOUT}s") from None
+        raise OllamaError(f"Ollama request timed out after {cfg.timeout:.0f}s") from None
     except httpx.HTTPStatusError as e:
         if e.response.status_code == 404:
             raise OllamaModelNotFoundError(cfg.model, cfg.ollama_url) from e
@@ -161,7 +159,7 @@ def call_ollama_embed(inputs: list[str], cfg: LLMConfig) -> list[list[float]]:
     t0 = time.monotonic()
     try:
         with ollama_guard():
-            resp = httpx.post(url, json=payload, timeout=_TIMEOUT * 2)
+            resp = httpx.post(url, json=payload, timeout=cfg.timeout * 2)
         resp.raise_for_status()
         embeddings = resp.json()["embeddings"]
         if cfg.debug_log:
@@ -179,7 +177,7 @@ def call_ollama_embed(inputs: list[str], cfg: LLMConfig) -> list[list[float]]:
             log.info("Embedding model '%s' not found, pulling...", cfg.embed_model)
             _pull_model(cfg.embed_model, cfg.ollama_url)
             with ollama_guard():
-                resp = httpx.post(url, json=payload, timeout=_TIMEOUT * 2)
+                resp = httpx.post(url, json=payload, timeout=cfg.timeout * 2)
             resp.raise_for_status()
             embeddings = resp.json()["embeddings"]
             if cfg.debug_log:
