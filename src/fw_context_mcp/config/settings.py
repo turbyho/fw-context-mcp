@@ -48,6 +48,10 @@ model = "qwen2.5-coder:14b"
 num_ctx = 16384
 # timeout = 600.0   # HTTP timeout for Ollama requests in seconds (default 600)
 # debug_log = "~/.fw-context/llm-debug.jsonl"   # write LLM prompts/responses to JSONL
+
+# Embedding model for semantic_search.  Must be pulled first:  ollama pull mxbai-embed-large
+# embed_model = "mxbai-embed-large:latest"
+
 analyze_symbols = true
 analyze_files = true    # generate per-file summaries (2-3 sentences)
 """
@@ -57,20 +61,33 @@ _PROJECT_DEFAULTS_TEMPLATE = """\
 # name = "my-project"   # defaults to directory name
 
 [build]
-# system = "mbed-os"        # auto-detected: mbed-os, zephyr, platformio
+# Build system auto-detection: scans for .mbed, west.yml, or platformio.ini.
+# Set system explicitly when auto-detection fails or you need to force a specific one.
+# system = "mbed-os"        # choices: mbed-os, zephyr, platformio
 # clean = true              # always clean build before indexing (recommended)
 # command = "bear -- make"  # full override — bypasses all detection
+
+# ── Mbed OS ──────────────────────────────────────────────────────────────
+# Most values are auto-detected from .mbed and custom_targets.json.
+# Override them here when auto-detection is wrong or incomplete.
 #
-# Mbed OS overrides (auto-detected from .mbed):
 # target = "P_ECB_BOARD"
 # toolchain = "GCC_ARM"
 # profile = "develop"
 # app_config = "mbed_app.json"
 # extra_profiles = ["lto.json"]
 # defines = ["VERSION_FW_MAJOR=4", "DEV"]  # extra -D macros passed to compiler
+
+# ── Zephyr ───────────────────────────────────────────────────────────────
+# board is REQUIRED — there is no safe auto-detection for Zephyr boards.
+# Set system = "zephyr" if west.yml coexists with another build system marker.
 #
-# Zephyr override:
+# system = "zephyr"
 # board = "nrf52840dk_nrf52840"
+
+# ── PlatformIO ───────────────────────────────────────────────────────────
+# Usually needs no extra config — pio run --target compiledb is enough.
+# system = "platformio"
 
 [index]
 compile_commands = "compile_commands.json"
@@ -106,6 +123,7 @@ _PROJECT_LOCAL_DEFAULTS_TEMPLATE = """\
 # num_ctx = 16384
 # timeout = 600.0   # HTTP timeout for Ollama requests in seconds (default 600)
 # debug_log = "~/.fw-context/llm-debug.jsonl"   # write LLM prompts/responses to JSONL
+# embed_model = "mxbai-embed-large:latest"   # embedding model for semantic search
 # analyze_symbols = true    # generate structured symbol descriptions (summary, inputs, outputs) — enabled by default
 # analyze_files = true      # generate per-file summaries (2-3 sentences) — enabled by default
 
