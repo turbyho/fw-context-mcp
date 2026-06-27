@@ -1252,14 +1252,22 @@ def _reindex_file_impl(
         exclude_paths = cfg.exclude_root_paths(root)
 
         from ..indexer.db import write_lock as db_write_lock
+        from ..indexer.compile_commands import CompilationUnit as TU
         from ..indexer.ops import store_symbols_for_unit
-        from ..indexer.symbols import extract_all
+        from ..indexer.symbols import (
+            FnPointerAssignment,
+            IndirectCallSite,
+            InheritanceRecord,
+            Reference,
+            Symbol,
+            extract_all,
+        )
 
         # ── Parse outside the write lock ──
         # libclang is CPU-bound; running it inside the lock serialises
         # parsing when multiple TUs match (e.g. reindexing a header
         # included by several .cpp files).
-        parsed_units: list[tuple[object, object]] = []
+        parsed_units: list[tuple[TU, tuple[list[Symbol], list[Reference], list[InheritanceRecord], list[IndirectCallSite], list[FnPointerAssignment]]]] = []
         for unit in matching:
             try:
                 parsed = extract_all(

@@ -13,6 +13,7 @@ from .compile_commands import CompilationUnit
 
 _INDEX: cx.Index | None = None
 _index_lock = None
+_per_thread_index: dict[int, cx.Index] | None = None
 
 
 def _get_index() -> cx.Index:
@@ -23,7 +24,7 @@ def _get_index() -> cx.Index:
     one Index per thread so worker threads parse translation units in
     true parallel, one Index each.
     """
-    global _INDEX, _index_lock
+    global _INDEX, _index_lock, _per_thread_index
     import threading
     if _index_lock is None:
         _index_lock = threading.Lock()
@@ -32,11 +33,14 @@ def _get_index() -> cx.Index:
             if _INDEX is None:
                 _INDEX = cx.Index.create()
     ident = threading.current_thread().ident
-    if not hasattr(_get_index, "_per_thread"):
-        _get_index._per_thread: dict[int, cx.Index] = {}
-    if ident not in _get_index._per_thread:
-        _get_index._per_thread[ident] = cx.Index.create()
-    return _get_index._per_thread[ident]
+    if ident is None:
+        # Thread is not alive — fall back to shared index
+        return _INDEX
+    if _per_thread_index is None:
+        _per_thread_index = {}
+    if ident not in _per_thread_index:
+        _per_thread_index[ident] = cx.Index.create()
+    return _per_thread_index[ident]
 
 _SYMBOL_KINDS = frozenset({
     cx.CursorKind.FUNCTION_DECL,
@@ -753,14 +757,14 @@ def extract_all(
                 if _ext.start.file:
                     _ext_file = _ext.start.file.name
                     if str(Path(_ext_file).resolve()) == str(Path(tu.spelling).resolve()):
-                        _fn_spans.append((cur_fn, _ext.start.line, _ext.end.line))
-                        fn_stack.append((cur_fn, _ext.end.line))
+                        _fn_spans.append((cur_fn or '', _ext.start.line, _ext.end.line))
+                        fn_stack.append((cur_fn or '', _ext.end.line))
                     else:
-                        fn_stack.append((cur_fn, 0))
+                        fn_stack.append((cur_fn or '', 0))
                 else:
-                    fn_stack.append((cur_fn, 0))
+                    fn_stack.append((cur_fn or '', 0))
             except Exception:
-                fn_stack.append((cur_fn, 0))
+                fn_stack.append((cur_fn or '', 0))
 
         ref_kind = _REF_KINDS.get(cursor.kind)
         if ref_kind is not None:
