@@ -11,6 +11,7 @@ Run::
 
 from __future__ import annotations
 
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -213,7 +214,10 @@ void log_message(const char* msg) {
 
 @pytest.fixture
 def indexed_project(c_project: Path):
-    """Index the C project and return the project root."""
+    """Index the C project and return the project root.
+
+    Cleans up the index database directory after the test finishes.
+    """
     cc_json = c_project / "compile_commands.json"
     result = _cli(["index", "--no-refs", "--no-analyze", "--no-embeddings", str(cc_json)], cwd=c_project)
     if result.returncode != 0:
@@ -222,7 +226,9 @@ def indexed_project(c_project: Path):
     db_path = _db_path_for_project(c_project)
     assert db_path.exists(), f"DB not created at {db_path}"
 
-    return c_project
+    yield c_project
+
+    shutil.rmtree(db_path.parent, ignore_errors=True)
 
 
 # ── unit tests: content hash helpers ──────────────────────────────────
@@ -1428,7 +1434,10 @@ void log_message(const char* msg) {
 
     db_path = _db_path_for_project(proj)
     assert db_path.exists(), f"DB not created at {db_path}"
-    return proj
+
+    yield proj
+
+    shutil.rmtree(db_path.parent, ignore_errors=True)
 
 
 def _config_hash(conn):
