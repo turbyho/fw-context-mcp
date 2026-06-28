@@ -150,6 +150,10 @@ def parse_analysis_response(
             log.warning("Cannot parse LLM response as JSON (fallback failed): %.200s", response)
             return None
 
+    # Single object → wrap in list (common with one symbol per request)
+    if isinstance(parsed, dict):
+        parsed = [parsed]
+
     if not isinstance(parsed, list):
         log.warning("LLM response is not a JSON array: %.200s", response)
         return None
@@ -260,6 +264,10 @@ def parse_file_analysis_response(
         except json.JSONDecodeError:
             log.warning("Cannot parse file analysis LLM response (fallback): %.200s", response)
             return None
+
+    # Single object → wrap in list
+    if isinstance(parsed, dict):
+        parsed = [parsed]
 
     if not isinstance(parsed, list):
         log.warning("File analysis LLM response is not a JSON array: %.200s", response)

@@ -308,17 +308,15 @@ def _enrich_batch(conn, batch_rows, config_hash: str) -> list[dict]:
 
 
 def _build_llm_analysis(conn, config_hash: str, llm_config, db_dir: Path, *, write_lock_held: bool = False) -> None:
-    """Generate structured LLM analysis (summary, inputs, outputs) for all
-    project-definition symbols using Ollama in batches.
+    """Generate structured LLM analysis (summary, inputs, outputs) for each
+    project-definition symbol using Ollama, one symbol per request.
 
-    Follows the same pattern as _build_embeddings() but uses the chat endpoint
-    instead of the embed endpoint, and stores structured text rather than vectors.
-    Only project symbols (non-SDK) are analyzed.
+    Processes symbols individually — one Ollama request per symbol — for
+    reliable format adherence. Only project symbols (non-SDK) are analyzed.
 
-    Since 2026-06 the prompt includes the full function body (read from disk via
-    exact libclang extents) and callee names (from the reference index), which
-    dramatically improves description quality — especially for large functions
-    without docstrings.
+    The prompt includes the full function body (read from disk via exact
+    libclang extents) and callee names (from the reference index), which
+    dramatically improves description quality.
 
     *db_dir* is the directory containing the index database — used for the
     write lock that serializes DB access across processes.
@@ -362,34 +360,25 @@ def _build_llm_analysis(conn, config_hash: str, llm_config, db_dir: Path, *, wri
             return
 
     model = llm_config.model
+    total_symbols = len(rows)
     total = 0
-    failed_ids: list[int] = []
 
-    # ── Phase 1: batch analysis ──────────────────────────────────────────
-    batch_size = 10
-    batches = (len(rows) + batch_size - 1) // batch_size
-    log.info("LLM analysis: %d symbols in %d batches (model=%s)", len(rows), batches, model)
+    log.info("LLM analysis: %d symbols (model=%s)", total_symbols, model)
 
-    for batch_num in range(0, len(rows), batch_size):
-        batch = rows[batch_num:batch_num + batch_size]
-        batch_idx = batch_num // batch_size
+    for idx, row in enumerate(rows):
+        qname = row["qualified_name"] or row["name"]
         try:
-            batch_dicts = _enrich_batch(conn, batch, config_hash)
+            batch_dicts = _enrich_batch(conn, [row], config_hash)
             prompt = build_analysis_prompt(batch_dicts)
             try:
                 response = call_ollama(prompt, llm_config, temperature=0.1, num_predict=3000)
             except Exception as e:
-                log.warning("LLM analysis batch %d failed: %s", batch_idx, e)
-                failed_ids.extend(r["id"] for r in batch)
+                log.warning("[%d/%d] %s: Ollama call failed: %s", idx + 1, total_symbols, qname, e)
                 continue
 
             parsed = parse_analysis_response(response, batch_dicts)
             if not parsed:
-                log.warning(
-                    "LLM analysis batch %d: no valid entries parsed from response",
-                    batch_idx,
-                )
-                failed_ids.extend(r["id"] for r in batch)
+                log.warning("[%d/%d] %s: no valid entries parsed from response", idx + 1, total_symbols, qname)
                 continue
 
             with (write_lock(db_dir, timeout=5.0) if not write_lock_held else nullcontext()):
@@ -401,47 +390,12 @@ def _build_llm_analysis(conn, config_hash: str, llm_config, db_dir: Path, *, wri
                     inserted = upsert_llm_analysis_batch(conn, db_rows)
                     total += inserted
 
-            if batch_idx % 5 == 0:
-                log.info("  batch %d/%d: %d stored", batch_idx + 1, batches, total)
+            log.info("[%d/%d] %s: stored", idx + 1, total_symbols, qname)
         except Exception as e:
-            log.warning("LLM analysis batch %d crashed: %s", batch_idx, e)
-            failed_ids.extend(r["id"] for r in batch)
+            log.warning("[%d/%d] %s: crashed: %s", idx + 1, total_symbols, qname, e)
             continue
 
-    # ── Phase 2: retry failed symbols individually ───────────────────────
-    if failed_ids:
-        log.info("Retrying %d failed symbols individually...", len(failed_ids))
-        # Re-fetch only the failed symbols (they may have been modified)
-        failed_rows = conn.execute(
-            """SELECT s.id, s.name, s.qualified_name, s.kind, s.file_path,
-                      s.signature, s.docstring, s.end_line, s.line, s.usr,
-                      f.path as abs_path
-               FROM symbols s
-               JOIN files f ON s.file_id = f.id
-               WHERE s.id IN ({})""".format(",".join("?" * len(failed_ids))),
-            failed_ids,
-        ).fetchall()
-        for row in failed_rows:
-            batch_dicts = _enrich_batch(conn, [row], config_hash)
-            prompt = build_analysis_prompt(batch_dicts)
-            try:
-                response = call_ollama(prompt, llm_config, temperature=0.1, num_predict=4000)
-                parsed = parse_analysis_response(response, batch_dicts)
-                if parsed:
-                    with (write_lock(db_dir, timeout=5.0) if not write_lock_held else nullcontext()):
-                        with transaction(conn):
-                            inserted = upsert_llm_analysis_batch(
-                                conn,
-                                [(parsed[0]["symbol_id"], parsed[0]["summary"],
-                                  parsed[0]["inputs"], parsed[0]["outputs"], model)],
-                            )
-                            total += inserted
-                else:
-                    log.warning("Individual retry failed for %s", row["qualified_name"])
-            except Exception as e:
-                log.warning("Individual retry failed for %s: %s", row["qualified_name"], e)
-
-    log.info("LLM analysis stored: %d symbols (model=%s)", total, model)
+    log.info("LLM analysis stored: %d/%d symbols (model=%s)", total, total_symbols, model)
 
 
 def _build_file_analysis(conn, config_hash: str, llm_config, db_dir: Path, extra_exclude_like: list[str] | None = None, *, write_lock_held: bool = False) -> None:
