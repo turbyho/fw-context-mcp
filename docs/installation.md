@@ -91,18 +91,14 @@ name = "my-mbed-app"
 
 [build]
 system = "mbed-os"               # auto-detected from .mbed
-target = "P_ECB_BOARD"           # auto-detected from .mbed / custom_targets.json
+target = "NUCLEO_F429ZI"         # auto-detected from .mbed / custom_targets.json
 toolchain = "GCC_ARM"            # auto-detected from .mbed
 profile = "develop"              # best for indexing (includes -g debug symbols)
 app_config = "mbed_app.json"
-extra_profiles = ["lto.json"]
+# extra_profiles = ["lto.json"]   # uncomment if you use LTO
 defines = [
-    "VERSION_FW_MAJOR=4",
-    "VERSION_FW_MINOR=15",
-    "VERSION_FW_PATCH=0",
-    "VERSION_FW_BUILD=0",
-    "DEV",
-    "xCUSTOM_NDEBUG",
+    "DEBUG",
+    "ENABLE_LOGGING",
 ]
 
 [index]
