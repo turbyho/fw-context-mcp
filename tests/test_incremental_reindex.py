@@ -11,19 +11,15 @@ Run::
 
 from __future__ import annotations
 
-import sqlite3
 import subprocess
 import sys
-import tempfile
 from pathlib import Path
 
 import pytest
 
 from fw_context_mcp.indexer.db import (
-    get_file_mtimes,
     insert_symbols_batch,
     open_db,
-    search_symbols,
     split_tokens,
     transaction,
     upsert_build_config,
@@ -38,6 +34,8 @@ def _db_path_for_project(project_root: Path) -> Path:
     """Resolve the index DB path for a project root."""
     from fw_context_mcp.config import (
         derive_project_id,
+    )
+    from fw_context_mcp.config import (
         load as load_config,
     )
 
@@ -341,9 +339,9 @@ class TestIncrementalReindex:
 
     def _test_reindex_via_api(self, project_root: Path, rel_path: str) -> None:
         """Call reindex_file_impl directly and verify results."""
-        from fw_context_mcp.mcp.server import _reindex_file_impl
+        from fw_context_mcp.mcp.handlers.maintenance import reindex_file_impl
 
-        result = _reindex_file_impl(rel_path, str(project_root), with_analysis=False)
+        result = reindex_file_impl(rel_path, str(project_root), with_analysis=False)
         if "error" in result:
             pytest.fail(f"Reindex failed: {result['error']}")
         assert result["symbols_updated"] > 0
@@ -433,9 +431,9 @@ class TestIncrementalReindex:
         modem_c.write_text(modified, encoding="utf-8")
 
         # ── Reindex ──
-        from fw_context_mcp.mcp.server import _reindex_file_impl
+        from fw_context_mcp.mcp.handlers.maintenance import reindex_file_impl
 
-        result = _reindex_file_impl("src/modem.c", str(indexed_project), with_analysis=False)
+        result = reindex_file_impl("src/modem.c", str(indexed_project), with_analysis=False)
         assert "error" not in result, f"Reindex failed: {result.get('error')}"
         print(f"  Reindex result: {json.dumps(result)}")
 
@@ -524,9 +522,9 @@ class TestIncrementalReindex:
         utils_c.write_text(modified, encoding="utf-8")
 
         # ── Reindex ──
-        from fw_context_mcp.mcp.server import _reindex_file_impl
+        from fw_context_mcp.mcp.handlers.maintenance import reindex_file_impl
 
-        result = _reindex_file_impl("src/utils.c", str(indexed_project), with_analysis=False)
+        result = reindex_file_impl("src/utils.c", str(indexed_project), with_analysis=False)
         assert "error" not in result, f"Reindex failed: {result.get('error')}"
         print(f"  Reindex result: {json.dumps(result)}")
 
@@ -578,9 +576,9 @@ int modem_flush(void) {
         modem_c.write_text(original + new_func, encoding="utf-8")
 
         # Reindex
-        from fw_context_mcp.mcp.server import _reindex_file_impl
+        from fw_context_mcp.mcp.handlers.maintenance import reindex_file_impl
 
-        result = _reindex_file_impl("src/modem.c", str(indexed_project), with_analysis=False)
+        result = reindex_file_impl("src/modem.c", str(indexed_project), with_analysis=False)
         assert "error" not in result, f"Reindex failed: {result.get('error')}"
 
         # Verify new symbol exists
@@ -639,9 +637,9 @@ int modem_flush(void) {
         assert "modem_recv" not in modem_c.read_text(encoding="utf-8"), "modem_recv still in file"
 
         # Reindex
-        from fw_context_mcp.mcp.server import _reindex_file_impl
+        from fw_context_mcp.mcp.handlers.maintenance import reindex_file_impl
 
-        result = _reindex_file_impl("src/modem.c", str(indexed_project), with_analysis=False)
+        result = reindex_file_impl("src/modem.c", str(indexed_project), with_analysis=False)
         assert "error" not in result, f"Reindex failed: {result.get('error')}"
 
         # Verify modem_recv is gone from index
@@ -666,9 +664,9 @@ int modem_flush(void) {
 
     def test_reindex_header_only_file(self, indexed_project: Path):
         """Reindexing a header file that's not in compile_commands.json returns error."""
-        from fw_context_mcp.mcp.server import _reindex_file_impl
+        from fw_context_mcp.mcp.handlers.maintenance import reindex_file_impl
 
-        result = _reindex_file_impl("src/modem.h", str(indexed_project), with_analysis=False)
+        result = reindex_file_impl("src/modem.h", str(indexed_project), with_analysis=False)
         # Header-only files not in compile_commands.json should return error
         if "error" in result:
             assert "header" in result["error"].lower() or "not found" in result["error"].lower()
@@ -744,12 +742,12 @@ class TestMoveDetection:
         modem_c.write_text(modem_modified, encoding="utf-8")
 
         # ── Reindex BOTH files ──
-        from fw_context_mcp.mcp.server import _reindex_file_impl
+        from fw_context_mcp.mcp.handlers.maintenance import reindex_file_impl
 
-        r1 = _reindex_file_impl("src/utils.c", str(indexed_project), with_analysis=False)
+        r1 = reindex_file_impl("src/utils.c", str(indexed_project), with_analysis=False)
         print(f"  Reindex utils.c: {json.dumps(r1)}")
 
-        r2 = _reindex_file_impl("src/modem.c", str(indexed_project), with_analysis=False)
+        r2 = reindex_file_impl("src/modem.c", str(indexed_project), with_analysis=False)
         print(f"  Reindex modem.c: {json.dumps(r2)}")
 
         # ── Verify log_message is in modem.c ──
@@ -811,10 +809,10 @@ class TestMoveDetection:
         utils_c.write_text(utils_modified, encoding="utf-8")
         modem_c.write_text(modem_original.rstrip() + "\n\n" + checksum_func + "\n", encoding="utf-8")
 
-        from fw_context_mcp.mcp.server import _reindex_file_impl
+        from fw_context_mcp.mcp.handlers.maintenance import reindex_file_impl
 
-        r1 = _reindex_file_impl("src/utils.c", str(indexed_project), with_analysis=False)
-        r2 = _reindex_file_impl("src/modem.c", str(indexed_project), with_analysis=False)
+        r1 = reindex_file_impl("src/utils.c", str(indexed_project), with_analysis=False)
+        r2 = reindex_file_impl("src/modem.c", str(indexed_project), with_analysis=False)
         assert "error" not in r1, f"utils.c reindex failed: {r1.get('error')}"
         assert "error" not in r2, f"modem.c reindex failed: {r2.get('error')}"
 
@@ -858,7 +856,7 @@ class TestAutoReindexStale:
                 ).fetchone()["config_hash"]
             )
 
-            from fw_context_mcp.mcp.server import _count_modified_files
+            from fw_context_mcp.mcp.shared.stale import _count_modified_files
 
             # Nothing should be modified initially
             mod_before = _count_modified_files(conn, ch, indexed_project)
@@ -878,10 +876,9 @@ class TestAutoReindexStale:
 
     def test_auto_reindex_stale_integration(self, indexed_project: Path):
         """_auto_reindex_stale reindexes changed files successfully."""
-        import json
         import time
 
-        from fw_context_mcp.mcp.server import _auto_reindex_stale
+        from fw_context_mcp.mcp.shared.stale import _auto_reindex_stale
 
         # Sleep past MTIME_TOLERANCE_S, then touch utils.c
         time.sleep(1.2)
@@ -898,7 +895,7 @@ class TestAutoReindexStale:
 
     def test_auto_reindex_empty_list(self, indexed_project: Path):
         """Empty stale list returns empty results."""
-        from fw_context_mcp.mcp.server import _auto_reindex_stale
+        from fw_context_mcp.mcp.shared.stale import _auto_reindex_stale
 
         ok, failed = _auto_reindex_stale([], str(indexed_project))
         assert ok == []
@@ -906,12 +903,12 @@ class TestAutoReindexStale:
 
 
 class TestReindexFileImplEdgeCases:
-    """Edge cases for _reindex_file_impl."""
+    """Edge cases for reindex_file_impl."""
 
     def test_nonexistent_file(self, indexed_project: Path):
-        from fw_context_mcp.mcp.server import _reindex_file_impl
+        from fw_context_mcp.mcp.handlers.maintenance import reindex_file_impl
 
-        result = _reindex_file_impl("src/nonexistent.c", str(indexed_project), with_analysis=False)
+        result = reindex_file_impl("src/nonexistent.c", str(indexed_project), with_analysis=False)
         assert "error" in result
 
     def test_file_not_in_compile_commands(self, indexed_project: Path):
@@ -920,26 +917,26 @@ class TestReindexFileImplEdgeCases:
         orphan = indexed_project / "src" / "orphan.h"
         orphan.write_text("int orphan_func(void);\n", encoding="utf-8")
 
-        from fw_context_mcp.mcp.server import _reindex_file_impl
+        from fw_context_mcp.mcp.handlers.maintenance import reindex_file_impl
 
-        result = _reindex_file_impl("src/orphan.h", str(indexed_project), with_analysis=False)
+        result = reindex_file_impl("src/orphan.h", str(indexed_project), with_analysis=False)
         # Should return error — not in compile_commands.json
         assert "error" in result, f"Expected error for header not in CC, got: {result}"
 
     def test_with_analysis_flag_false_skips_llm(self, indexed_project: Path):
         """with_analysis=False should skip LLM analysis but still update symbols."""
-        from fw_context_mcp.mcp.server import _reindex_file_impl
+        from fw_context_mcp.mcp.handlers.maintenance import reindex_file_impl
 
-        result = _reindex_file_impl("src/modem.c", str(indexed_project), with_analysis=False)
+        result = reindex_file_impl("src/modem.c", str(indexed_project), with_analysis=False)
         assert "error" not in result, f"Reindex failed: {result.get('error')}"
         assert "analysis_updated" not in result, "with_analysis=False should skip analysis"
         assert result["symbols_updated"] > 0
 
     def test_no_index_exists(self, tmp_path: Path):
         """Calling reindex on a project without index returns error."""
-        from fw_context_mcp.mcp.server import _reindex_file_impl
+        from fw_context_mcp.mcp.handlers.maintenance import reindex_file_impl
 
-        result = _reindex_file_impl("src/main.c", str(tmp_path), with_analysis=False)
+        result = reindex_file_impl("src/main.c", str(tmp_path), with_analysis=False)
         assert "error" in result
         assert "no index" in result["error"].lower() or "run" in result["error"].lower()
 
@@ -953,7 +950,7 @@ class TestStoreSymbolsForUnitAnalysisRestore:
     @pytest.fixture
     def store_db(self, tmp_path: Path):
         """Create a DB with project + build config, return (conn, config_hash, project_root)."""
-        from fw_context_mcp.indexer.db import open_db as _open_db, upsert_build_config, upsert_project
+        from fw_context_mcp.indexer.db import open_db as _open_db
 
         db_path = tmp_path / "test.db"
         conn = _open_db(db_path)
@@ -1245,6 +1242,16 @@ class TestStoreSymbolsForUnitAnalysisRestore:
 # ── fixtures for LLM analysis tests ──────────────────────────────────
 
 
+def _ollama_available() -> bool:
+    """Check if Ollama is running — skip LLM tests if not."""
+    try:
+        import httpx
+        resp = httpx.get("http://localhost:11434/api/tags", timeout=2.0)
+        return resp.status_code == 200
+    except Exception:
+        return False
+
+
 @pytest.fixture(scope="class")
 def indexed_project_with_analysis(tmp_path_factory):
     """Index the C project with LLM analysis enabled (requires Ollama).
@@ -1253,7 +1260,6 @@ def indexed_project_with_analysis(tmp_path_factory):
     Creates its own temp C project so it doesn't depend on function-scoped fixtures.
     """
     import json
-    import shutil
 
     proj = tmp_path_factory.mktemp("demo_analysis")
 
@@ -1373,6 +1379,7 @@ def _config_hash(conn):
 # ── LLM analysis consistency tests (requires Ollama) ──────────────────
 
 
+@pytest.mark.skipif(not _ollama_available(), reason="Ollama not running")
 class TestLlvmAnalysisConsistency:
     """End-to-end tests with real LLM analysis: index → modify → reindex → verify consistency."""
 
@@ -1497,9 +1504,9 @@ class TestLlvmAnalysisConsistency:
         modem_c.write_text(modified, encoding="utf-8")
 
         time.sleep(1.2)
-        from fw_context_mcp.mcp.server import _reindex_file_impl
+        from fw_context_mcp.mcp.handlers.maintenance import reindex_file_impl
 
-        result = _reindex_file_impl("src/modem.c", str(indexed_project_with_analysis), with_analysis=True)
+        result = reindex_file_impl("src/modem.c", str(indexed_project_with_analysis), with_analysis=True)
         print(f"  Reindex result: {result}")
         if "analysis_warning" in result:
             print(f"  Analysis warning: {result['analysis_warning']}")
@@ -1525,7 +1532,7 @@ class TestLlvmAnalysisConsistency:
             conn.close()
 
         modem_c.write_text(original, encoding="utf-8")
-        _reindex_file_impl("src/modem.c", str(indexed_project_with_analysis), with_analysis=False)
+        reindex_file_impl("src/modem.c", str(indexed_project_with_analysis), with_analysis=False)
 
     def test_unchanged_symbol_keeps_analysis_after_reindex(self, indexed_project_with_analysis: Path):
         """Phase 3: unchanged symbol preserves original LLM analysis timestamp."""
@@ -1559,9 +1566,9 @@ class TestLlvmAnalysisConsistency:
         utils_c.write_text(modified, encoding="utf-8")
 
         time.sleep(1.2)
-        from fw_context_mcp.mcp.server import _reindex_file_impl
+        from fw_context_mcp.mcp.handlers.maintenance import reindex_file_impl
 
-        result = _reindex_file_impl("src/utils.c", str(indexed_project_with_analysis), with_analysis=True)
+        result = reindex_file_impl("src/utils.c", str(indexed_project_with_analysis), with_analysis=True)
         print(f"  Reindex result: {result}")
         if "analysis_warning" in result:
             print(f"  Analysis warning: {result['analysis_warning']}")
@@ -1578,9 +1585,9 @@ class TestLlvmAnalysisConsistency:
             ).fetchone()
             assert new is not None, "compute_checksum analysis disappeared"
             if new["summary"] == old_summary:
-                print(f"  ✓ Analysis PRESERVED (Phase 3 restore)")
+                print("  ✓ Analysis PRESERVED (Phase 3 restore)")
             else:
-                print(f"  Analysis regenerated (summary changed)")
+                print("  Analysis regenerated (summary changed)")
             print(f"  New summary: {new['summary'][:100]}...")
 
         finally:
@@ -1610,9 +1617,9 @@ int compute_average(const int* values, int count) {
         utils_c.write_text(original.rstrip() + new_func + "\n", encoding="utf-8")
 
         time.sleep(1.2)
-        from fw_context_mcp.mcp.server import _reindex_file_impl
+        from fw_context_mcp.mcp.handlers.maintenance import reindex_file_impl
 
-        result = _reindex_file_impl("src/utils.c", str(indexed_project_with_analysis), with_analysis=True)
+        result = reindex_file_impl("src/utils.c", str(indexed_project_with_analysis), with_analysis=True)
         print(f"  Reindex result: {result}")
         if "analysis_warning" in result:
             print(f"  Analysis warning: {result['analysis_warning']}")
@@ -1646,7 +1653,7 @@ int compute_average(const int* values, int count) {
             conn.close()
 
         utils_c.write_text(original, encoding="utf-8")
-        _reindex_file_impl("src/utils.c", str(indexed_project_with_analysis), with_analysis=False)
+        reindex_file_impl("src/utils.c", str(indexed_project_with_analysis), with_analysis=False)
 
     def test_line_numbers_updated_after_inserting_code(self, indexed_project_with_analysis: Path):
         """When code is inserted before a function, its line number shifts correctly."""
@@ -1655,9 +1662,9 @@ int compute_average(const int* values, int count) {
 
         # First reindex the original file to get a clean baseline
         # (previous tests may have modified and reindexed this file)
-        from fw_context_mcp.mcp.server import _reindex_file_impl
+        from fw_context_mcp.mcp.handlers.maintenance import reindex_file_impl
 
-        _reindex_file_impl("src/modem.c", str(indexed_project_with_analysis), with_analysis=False)
+        reindex_file_impl("src/modem.c", str(indexed_project_with_analysis), with_analysis=False)
 
         db_path = _db_path_for_project(indexed_project_with_analysis)
         conn = open_db(db_path)
@@ -1682,7 +1689,7 @@ int compute_average(const int* values, int count) {
         )
         modem_c.write_text(modified, encoding="utf-8")
 
-        _reindex_file_impl("src/modem.c", str(indexed_project_with_analysis), with_analysis=False)
+        reindex_file_impl("src/modem.c", str(indexed_project_with_analysis), with_analysis=False)
 
         conn = open_db(db_path)
         try:
@@ -1710,7 +1717,7 @@ int compute_average(const int* values, int count) {
 
         # Reindex the restored original to leave clean state for next tests
         modem_c.write_text(original, encoding="utf-8")
-        _reindex_file_impl("src/modem.c", str(indexed_project_with_analysis), with_analysis=False)
+        reindex_file_impl("src/modem.c", str(indexed_project_with_analysis), with_analysis=False)
 
     def test_analysis_consistency_after_multiple_reindexes(self, indexed_project_with_analysis: Path):
         """Multiple reindexes of the same file don't corrupt or duplicate analysis."""
@@ -1728,11 +1735,11 @@ int compute_average(const int* values, int count) {
         finally:
             conn.close()
 
-        from fw_context_mcp.mcp.server import _reindex_file_impl
+        from fw_context_mcp.mcp.handlers.maintenance import reindex_file_impl
 
         for i in range(3):
             time.sleep(1.2)
-            result = _reindex_file_impl(
+            result = reindex_file_impl(
                 "src/modem.c", str(indexed_project_with_analysis), with_analysis=True,
             )
             assert "error" not in result, f"Reindex {i+1} failed: {result.get('error')}"

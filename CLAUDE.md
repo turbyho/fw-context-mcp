@@ -265,7 +265,7 @@ Loaded by `config/settings.py` into a `Config` dataclass.
 
 - pytest with fixtures in `tests/conftest.py`
 - Test database: use `:memory:` SQLite or temporary directories
-- Test comprehensiveness: `test_comprehensive_quality.py` runs against real
+- Test comprehensiveness: `comprehensive_quality_check.py` runs against real
   indexed projects
 
 ## Safe and dangerous actions

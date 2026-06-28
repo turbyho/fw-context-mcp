@@ -13,18 +13,16 @@ from .compile_commands import CompilationUnit
 
 _INDEX: cx.Index | None = None
 _index_lock = None
-_per_thread_index: dict[int, cx.Index] | None = None
 
 
 def _get_index() -> cx.Index:
-    """Return a thread-local libclang Index.
+    """Return the libclang Index singleton.
 
-    libclang's Index objects are not thread-safe — concurrent calls to
-    ``parse()`` on the same Index object serialize internally.  We keep
-    one Index per thread so worker threads parse translation units in
-    true parallel, one Index each.
+    ``cx.Index.create()`` is lightweight and Index objects internally
+    serialize concurrent ``parse()`` calls, so a single shared instance
+    is sufficient.
     """
-    global _INDEX, _index_lock, _per_thread_index
+    global _INDEX, _index_lock
     import threading
     if _index_lock is None:
         _index_lock = threading.Lock()
@@ -32,15 +30,7 @@ def _get_index() -> cx.Index:
         with _index_lock:
             if _INDEX is None:
                 _INDEX = cx.Index.create()
-    ident = threading.current_thread().ident
-    if ident is None:
-        # Thread is not alive — fall back to shared index
-        return _INDEX
-    if _per_thread_index is None:
-        _per_thread_index = {}
-    if ident not in _per_thread_index:
-        _per_thread_index[ident] = cx.Index.create()
-    return _per_thread_index[ident]
+    return _INDEX
 
 _SYMBOL_KINDS = frozenset({
     cx.CursorKind.FUNCTION_DECL,

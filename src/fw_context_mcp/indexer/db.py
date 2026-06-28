@@ -339,6 +339,7 @@ CREATE INDEX IF NOT EXISTS idx_refs_fromfile ON refs(config_hash, from_file);
 
 -- Indirect function-pointer call sites (Phase 2).
 -- Records locations where a function pointer field or variable is invoked --
+-- NOTE: keep in sync with _CRITICAL_TABLES below (defensive re-creation block). --
 -- unlike refs, there is no resolved target function (the callee is a
 -- FIELD_DECL or VAR_DECL, not a FUNCTION_DECL).
 CREATE TABLE IF NOT EXISTS indirect_call_sites (
@@ -359,6 +360,7 @@ CREATE INDEX IF NOT EXISTS idx_ics_config_usr    ON indirect_call_sites(config_h
 -- Function pointer assignments (Phase 3).
 -- Records both sides of "field = &function" so Phase 3 can link
 -- fp_assignments.lhs_usr = indirect_call_sites.target_usr to answer
+-- NOTE: keep in sync with _CRITICAL_TABLES below.
 -- "which functions can be called through this field?"
 CREATE TABLE IF NOT EXISTS fp_assignments (
     id           INTEGER PRIMARY KEY,
@@ -415,6 +417,7 @@ CREATE TABLE IF NOT EXISTS file_analysis (
 -- C++ inheritance hierarchy edges.
 -- derived_usr → base_usr: class Derived : public Base { ... }
 -- access: "public", "protected", "private"
+-- NOTE: keep in sync with _CRITICAL_TABLES below.
 CREATE TABLE IF NOT EXISTS inheritance (
     id           INTEGER PRIMARY KEY,
     config_hash  TEXT    NOT NULL REFERENCES build_configs(config_hash),
@@ -430,6 +433,7 @@ CREATE INDEX IF NOT EXISTS idx_inheritance_base    ON inheritance(config_hash, b
 -- Virtual method override tracking.
 -- derived_usr → base_usr: DerivedClass::method overrides BaseClass::method.
 -- Built as a post-processing step after inheritance chains are indexed.
+-- NOTE: keep in sync with _CRITICAL_TABLES below.
 CREATE TABLE IF NOT EXISTS overrides (
     id           INTEGER PRIMARY KEY,
     config_hash  TEXT    NOT NULL REFERENCES build_configs(config_hash),
@@ -627,33 +631,39 @@ def open_db(path: Path, *, skip_integrity_check: bool = False) -> sqlite3.Connec
                     DROP TRIGGER IF EXISTS symbols_au;
                     DROP TABLE IF EXISTS symbols_fts;
                 """)
+                # Use IF NOT EXISTS for race-free idempotency —
+                # another process may have created the table between our
+                # DROP above and the CREATE below.
                 conn.executescript("""
-                    CREATE VIRTUAL TABLE symbols_fts USING fts5(
+                    CREATE VIRTUAL TABLE IF NOT EXISTS symbols_fts USING fts5(
                         name, qualified_name, signature, docstring, file_path, name_tokens,
                         content='symbols', content_rowid='id'
                     );
-                    CREATE TRIGGER symbols_ai AFTER INSERT ON symbols BEGIN
+                    CREATE TRIGGER IF NOT EXISTS symbols_ai AFTER INSERT ON symbols BEGIN
                         INSERT INTO symbols_fts(rowid, name, qualified_name, signature, docstring, file_path, name_tokens)
                         VALUES (new.id, new.name, new.qualified_name, new.signature, new.docstring, new.file_path, new.name_tokens);
                     END;
-                    CREATE TRIGGER symbols_ad AFTER DELETE ON symbols BEGIN
+                    CREATE TRIGGER IF NOT EXISTS symbols_ad AFTER DELETE ON symbols BEGIN
                         INSERT INTO symbols_fts(symbols_fts, rowid, name, qualified_name, signature, docstring, file_path, name_tokens)
                         VALUES ('delete', old.id, old.name, old.qualified_name, old.signature, old.docstring, old.file_path, old.name_tokens);
                     END;
-                    CREATE TRIGGER symbols_au AFTER UPDATE ON symbols BEGIN
+                    CREATE TRIGGER IF NOT EXISTS symbols_au AFTER UPDATE ON symbols BEGIN
                         INSERT INTO symbols_fts(symbols_fts, rowid, name, qualified_name, signature, docstring, file_path, name_tokens)
                         VALUES ('delete', old.id, old.name, old.qualified_name, old.signature, old.docstring, old.file_path, old.name_tokens);
                         INSERT INTO symbols_fts(rowid, name, qualified_name, signature, docstring, file_path, name_tokens)
                         VALUES (new.id, new.name, new.qualified_name, new.signature, new.docstring, new.file_path, new.name_tokens);
                     END;
                 """)
-                conn.execute("""
-                    INSERT INTO symbols_fts(rowid, name, qualified_name, signature, docstring, file_path, name_tokens)
-                    SELECT id, name, qualified_name, COALESCE(signature,''), COALESCE(docstring,''),
-                           COALESCE(file_path,''), COALESCE(name_tokens,'')
-                    FROM symbols
-                """)
-                conn.commit()
+                try:
+                    conn.execute("""
+                        INSERT INTO symbols_fts(rowid, name, qualified_name, signature, docstring, file_path, name_tokens)
+                        SELECT id, name, qualified_name, COALESCE(signature,''), COALESCE(docstring,''),
+                               COALESCE(file_path,''), COALESCE(name_tokens,'')
+                        FROM symbols
+                    """)
+                    conn.commit()
+                except sqlite3.OperationalError:
+                    pass  # another process already backfilled
 
             # Migration: summary/inputs/outputs — backfill from llm_analysis table.
             if conn.execute(
@@ -759,6 +769,8 @@ def open_db(path: Path, *, skip_integrity_check: bool = False) -> sqlite3.Connec
 
         # Stamp the database with the current schema version so we can detect
         # stale indexes — PRAGMA user_version is the standard SQLite mechanism.
+        # PRAGMA does not support bound parameters, so we use an f-string.
+        # CURRENT_SCHEMA_VERSION is an integer constant — no injection risk.
         conn.execute(f"PRAGMA user_version = {CURRENT_SCHEMA_VERSION}")
 
     # ── Defensive table creation ──────────────────────────────────────────
@@ -767,6 +779,12 @@ def open_db(path: Path, *, skip_integrity_check: bool = False) -> sqlite3.Connec
     # whose migration was interrupted — leaving user_version stamped but
     # tables missing — self-heals automatically.  CREATE TABLE IF NOT EXISTS
     # is idempotent and takes microseconds when the table already exists.
+    #
+    # IMPORTANT: every table definition below MUST be kept in sync with the
+    # corresponding CREATE TABLE statement in _SCHEMA above.  When you change
+    # one, change the other.  The two copies exist because _CRITICAL_TABLES
+    # runs unconditionally (self-healing) while _SCHEMA runs only on fresh
+    # databases and schema-version migrations.
     _CRITICAL_TABLES = """
     CREATE TABLE IF NOT EXISTS indirect_call_sites (
         id           INTEGER PRIMARY KEY,
@@ -1787,8 +1805,9 @@ def _escape_usr_values(alias_pairs: list[tuple[str, str]]) -> str:
     USRs from libclang (e.g. ``c:@F@main#I#``) do not contain single quotes,
     but we escape defensively to prevent SQL syntax errors or injection.
     """
+    _q = "'"  # single quote
     return ", ".join(
-        f"('{d.replace(chr(39), chr(39) * 2)}', '{f.replace(chr(39), chr(39) * 2)}')"
+        f"({_q}{d.replace(_q, _q * 2)}{_q}, {_q}{f.replace(_q, _q * 2)}{_q})"
         for d, f in alias_pairs
     )
 

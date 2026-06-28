@@ -254,7 +254,6 @@ def cmd_status(args: argparse.Namespace) -> int:
         "SELECT COUNT(*) FROM files WHERE config_hash=?", (active["config_hash"],)
     ).fetchone()[0]
 
-    stale = False
     stale = _cli_is_stale(active)
 
     print(f"Project : {project_root}")
@@ -360,6 +359,7 @@ def cmd_init(args: argparse.Namespace) -> int:
             parent_ok = parent and parent.is_detected()
             if parent_ok and tool_id in selected and tool.inherits_from in selected:
                 print(f"  [info] Inherits from {parent_name} — already handled above, skipping")
+                ok = True  # Inheritance is a valid configuration
                 continue
             elif parent_ok:
                 print(f"  [info] Inherits from {parent_name} which has fw-context instructions")
@@ -706,7 +706,7 @@ def cmd_watch(args: argparse.Namespace) -> int:
         print(f"No index found for {root}. Run 'fw-context index' first.", file=sys.stderr)
         return 1
 
-    print(f"👀 Watching {root} for changes (debounce={args.debounce}ms)...")
+    print(f"Watching {root} for changes (debounce={args.debounce}ms)...")
     print("   Press Ctrl+C to stop.")
 
     debounce_s = args.debounce / 1000.0
@@ -716,11 +716,11 @@ def cmd_watch(args: argparse.Namespace) -> int:
         for changes in watch(root, debounce=debounce_s, recursive=True):
             source_exts = {".c", ".cpp", ".h", ".hpp"}
             changed_files = {
-                (Path(root), change)
-                for change, root in changes
-                if Path(root).suffix.lower() in source_exts
-                and "__pycache__" not in root
-                and ".git/" not in root
+                (Path(changed_path), change)
+                for change, changed_path in changes
+                if Path(changed_path).suffix.lower() in source_exts
+                and "__pycache__" not in changed_path
+                and ".git/" not in changed_path
             }
 
             if not changed_files:
@@ -749,38 +749,44 @@ def cmd_watch(args: argparse.Namespace) -> int:
                 exclude_paths = cfg.exclude_root_paths(root)
             except Exception as e:
                 print(f"  ⚠ Failed to reload build config: {e}")
-                conn.close()
+                if 'conn' in locals():
+                    conn.close()
                 continue
 
-            for fp in ready:
-                del pending[fp]
-                try:
-                    target = Path(fp).resolve()
-                    matching = [u for u in units if Path(u.file).resolve() == target]
-                    if not matching:
-                        continue
-                    total = 0
-                    with write_lock(db_path.parent, timeout=10.0):
-                        for unit in matching:
-                            syms_added, _ = store_symbols_for_unit(
-                                conn, unit, config_hash, root,
-                                source_roots=source_roots,
-                                exclude_paths=exclude_paths,
-                                index_refs=cfg.index.index_refs,
-                            )
-                            total += syms_added
-                        conn.commit()
+            try:
+                for fp in ready:
+                    del pending[fp]
                     try:
-                        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-                    except Exception:
-                        pass
-                    if total > 0:
-                        rel = target.relative_to(root)
-                        print(f"  ✓ reindexed {rel} ({total} symbols)")
-                except Exception as e:
-                    print(f"  ✗ {fp}: {e}")
-
-            conn.close()
+                        target = Path(fp).resolve()
+                        matching = [u for u in units if Path(u.file).resolve() == target]
+                        if not matching:
+                            continue
+                        total = 0
+                        with write_lock(db_path.parent, timeout=10.0):
+                            for unit in matching:
+                                syms_added, _ = store_symbols_for_unit(
+                                    conn, unit, config_hash, root,
+                                    source_roots=source_roots,
+                                    exclude_paths=exclude_paths,
+                                    index_refs=cfg.index.index_refs,
+                                )
+                                total += syms_added
+                            conn.commit()
+                        try:
+                            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                        except Exception:
+                            pass
+                        if total > 0:
+                            rel = target.relative_to(root)
+                            print(f"  ✓ reindexed {rel} ({total} symbols)")
+                    except Exception as e:
+                        print(f"  ✗ {fp}: {e}")
+                        try:
+                            conn.rollback()
+                        except Exception:
+                            pass
+            finally:
+                conn.close()
 
     except KeyboardInterrupt:
         print("\nStopped.")

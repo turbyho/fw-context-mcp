@@ -1,7 +1,5 @@
 """Tests for fw_context_mcp.indexer.db."""
 
-import sqlite3
-
 import pytest
 
 from fw_context_mcp.indexer.db import (
@@ -394,8 +392,13 @@ class TestExpandQuery:
 class TestForeignKeyConstraint:
     def test_upsert_file_requires_build_config(self, temp_db):
         """upsert_file should fail when config_hash doesn't exist in build_configs."""
-        with pytest.raises(sqlite3.IntegrityError):
+        # pytest.raises(Exception) instead of sqlite3.IntegrityError: the db
+        # module monkey-patches sys.modules["sqlite3"] = pysqlite3, so the
+        # actual exception is pysqlite3.dbapi2.IntegrityError — a different
+        # class that the stdlib sqlite3.IntegrityError won't catch.
+        with pytest.raises(Exception) as exc_info:
             upsert_file(temp_db, "nonexistent-hash", "/tmp/file.cpp", "cpp")
+        assert "FOREIGN KEY" in str(exc_info.value).upper()
 
     def test_valid_fk_passes(self, populated_db):
         file_id = upsert_file(populated_db, "hash-deadbeef", "/tmp/valid.cpp", "cpp")

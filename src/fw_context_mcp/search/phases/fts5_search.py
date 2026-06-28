@@ -1,4 +1,4 @@
-"""Phase 3: Execute FTS5 queries and merge results."""
+"""Phase 4: Execute FTS5 queries and merge results."""
 
 from __future__ import annotations
 
@@ -50,18 +50,27 @@ def _search_queries(conn, queries: list[str], config_hash: str, fetch_limit: int
     if not queries:
         return []
 
+    import re
+
     or_query = " OR ".join(queries)
 
     # FTS5 column-filter syntax applies only to the immediately following
     # token.  Split multi-word queries so each token gets its own filter:
     #   "modem init*" → "name_tokens : modem AND name_tokens : init*"
+    #
+    # Sanitize tokens: only allow alphanumeric, underscore, and wildcard.
+    # LLM-generated terms may contain FTS5 syntax that would change query
+    # semantics if interpolated directly into the column filter.
+    _SAFE_TOKEN = re.compile(r"^[\w*]+$")
     _nt_parts: list[str] = []
     for kq in queries:
-        tokens = kq.split()
+        tokens = [t for t in kq.split() if _SAFE_TOKEN.match(t)]
+        if not tokens:
+            continue
         if len(tokens) >= 2:
             _nt_parts.append(" AND ".join(f"name_tokens : {t}" for t in tokens))
         else:
-            _nt_parts.append(f"name_tokens : {kq}")
+            _nt_parts.append(f"name_tokens : {tokens[0]}")
     nt_query = " OR ".join(f"({p})" if " AND " in p else p for p in _nt_parts)
 
     from fw_context_mcp.indexer.db import search_symbols

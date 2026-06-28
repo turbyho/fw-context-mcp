@@ -5,7 +5,8 @@ from pathlib import Path
 
 import pytest
 
-from fw_context_mcp.mcp.server import LOOKUP_EXACT_SQL, LOOKUP_PREFIX_SQL, _read_symbol_body
+from fw_context_mcp.mcp.handlers.search import LOOKUP_EXACT_SQL, LOOKUP_PREFIX_SQL
+from fw_context_mcp.mcp.handlers.source import _read_symbol_body
 from fw_context_mcp.utils import abs_path as _abs_path
 
 
@@ -428,7 +429,7 @@ class TestFallbackToSearchCode:
 
     def test_missing_db_returns_graceful_error(self):
         """When no index exists, fallback returns structured error."""
-        from fw_context_mcp.mcp.server import _fallback_to_search_code
+        from fw_context_mcp.mcp.shared.fallback import _fallback_to_search_code
 
         nonexistent = Path("/tmp/nonexistent_fwctx_test.db")
         result = _fallback_to_search_code(
@@ -438,18 +439,17 @@ class TestFallbackToSearchCode:
             limit=10,
             warning="Test warning",
         )
-        assert isinstance(result, list)
-        assert len(result) == 1
-        assert "error" in result[0], f"Expected error dict, got {result[0]}"
+        assert isinstance(result, dict)
+        assert "error" in result, f"Expected error dict, got {result}"
         # Error must mention the DB path so the user/LLM knows what's wrong
-        err_msg = str(result[0].get("error", ""))
+        err_msg = str(result.get("error", ""))
         assert "nonexistent" in err_msg.lower() or "index" in err_msg.lower(), (
             f"Error message should be descriptive, got: {err_msg}"
         )
 
     def test_empty_query_fallback(self):
         """Empty query doesn't crash the fallback."""
-        from fw_context_mcp.mcp.server import _fallback_to_search_code
+        from fw_context_mcp.mcp.shared.fallback import _fallback_to_search_code
 
         result = _fallback_to_search_code(
             root=Path("/tmp"),
@@ -458,12 +458,12 @@ class TestFallbackToSearchCode:
             limit=10,
             warning="Empty query",
         )
-        # Must return a list (error or warning), not crash
-        assert isinstance(result, list)
+        # Must return a dict (error) or list (results), not crash
+        assert isinstance(result, (list, dict))
 
     def test_get_active_build_docstring_covers_schema_staleness(self):
         """get_active_build docstring explains all three stale conditions."""
-        from fw_context_mcp.mcp.server import get_active_build
+        from fw_context_mcp.mcp.handlers.maintenance import get_active_build
 
         doc = get_active_build.__doc__ or ""
         assert "schema_version" in doc, "docstring must mention schema_version"
@@ -474,7 +474,7 @@ class TestFallbackToSearchCode:
 
     def test_get_active_build_docstring_stale_field(self):
         """get_active_build docstring mentions stale is a bool union."""
-        from fw_context_mcp.mcp.server import get_active_build
+        from fw_context_mcp.mcp.handlers.maintenance import get_active_build
 
         doc = get_active_build.__doc__ or ""
         assert "stale" in doc, "docstring must mention stale field"

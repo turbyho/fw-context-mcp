@@ -17,9 +17,10 @@ from collections import defaultdict
 
 log = logging.getLogger(__name__)
 
-# Simple cache: {query: [suggestions]}
-_cache: dict[str, list[str]] = {}
+# Simple cache with TTL: {query: (timestamp, [suggestions])}
+_cache: dict[str, tuple[float, list[str]]] = {}
 _MAX_CACHE = 128
+_CACHE_TTL_S = 300  # Invalidate after 5 minutes (matches keyword_cache)
 
 # Characters that delimit tokens in symbol names
 _TOKEN_SPLIT = re.compile(r"[_]+")
@@ -51,7 +52,6 @@ def suggest(
     config_hash: str,
     name: str,
     limit: int = 5,
-    cutoff: float = 0.5,
 ) -> list[str]:
     """Return symbol names similar to *name*, or empty list.
 
@@ -65,14 +65,17 @@ def suggest(
         config_hash: Build config hash.
         name: The user-provided name that didn't match.
         limit: Maximum suggestions to return.
-        cutoff: Ignored (kept for API compatibility).
 
     Returns:
         List of similar symbol names, best match first.
     """
     cache_key = f"{config_hash}:{name}"
     if cache_key in _cache:
-        return _cache[cache_key][:limit]
+        ts, cached = _cache[cache_key]
+        if time.monotonic() - ts < _CACHE_TTL_S:
+            return cached[:limit]
+        # TTL expired — remove stale entry
+        del _cache[cache_key]
 
     t0 = time.monotonic()
     candidates = _load_names(conn, config_hash)
@@ -121,7 +124,7 @@ def suggest(
     # Maintain cache size
     if len(_cache) >= _MAX_CACHE:
         _cache.pop(next(iter(_cache)))
-    _cache[cache_key] = matches
+    _cache[cache_key] = (time.monotonic(), matches)
 
     return matches
 

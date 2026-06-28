@@ -22,6 +22,13 @@ log = logging.getLogger(__name__)
 # requests to a single Ollama instance can cause timeouts, OOM, or hangs
 # when the GPU is saturated.  This lock ensures at most one in-flight
 # Ollama request per process.
+#
+# NOTE: this is NOT about httpx thread-safety (httpx.Client is thread-safe).
+# It prevents saturating the Ollama server, which typically runs with one
+# GPU and limited VRAM.  In the MCP stdio transport (one request at a time),
+# this lock has no throughput impact.  If you switch to a multi-client
+# transport (SSE/streamable), consider replacing with a semaphore to allow
+# limited concurrency for embedding requests (small model, fast).
 _ollama_lock = threading.Lock()
 
 
@@ -129,7 +136,7 @@ def call_ollama(
             raise OllamaModelNotFoundError(cfg.model, cfg.ollama_url) from e
         raise OllamaError(f"Ollama HTTP {e.response.status_code}: {e.response.text[:200]}") from e
     except OllamaError:
-        raise
+        raise  # Pass through — prevents wrapping by the broad except Exception below
     except Exception as e:
         raise OllamaError(str(e)) from e
 
@@ -199,12 +206,18 @@ def call_ollama_embed(inputs: list[str], cfg: LLMConfig) -> list[list[float]]:
     except httpx.TimeoutException:
         raise OllamaError("Ollama embed request timed out") from None
     except OllamaError:
-        raise
+        raise  # Pass through — prevents wrapping by the broad except Exception below
     except Exception as e:
         raise OllamaError(str(e)) from e
 
 
-async def call_ollama_async(prompt: str, cfg: LLMConfig) -> str:
+async def call_ollama_async(
+    prompt: str,
+    cfg: LLMConfig,
+    *,
+    temperature: float = 0.0,
+    num_predict: int | None = None,
+) -> str:
     """Async wrapper for ``call_ollama`` — offloads blocking httpx to a thread.
 
     Use from async MCP tool handlers to avoid blocking the event loop during
@@ -213,11 +226,15 @@ async def call_ollama_async(prompt: str, cfg: LLMConfig) -> str:
     Args:
         prompt: The full prompt string to send to the chat model.
         cfg: LLM configuration (ollama_url, model, num_ctx, debug_log).
+        temperature: Sampling temperature (0.0 = deterministic, default).
+        num_predict: Maximum tokens to generate (None = model default).
 
     Returns:
         The model's text response.
     """
-    return await asyncio.to_thread(call_ollama, prompt, cfg)
+    return await asyncio.to_thread(
+        call_ollama, prompt, cfg, temperature=temperature, num_predict=num_predict
+    )
 
 
 def check_setup(cfg: LLMConfig) -> dict:
@@ -255,6 +272,11 @@ def check_setup(cfg: LLMConfig) -> dict:
         # Try prefix match (e.g. "codestral" matches "codestral:latest")
         model_found = any(m.startswith(cfg.model.split(":")[0]) for m in installed)
 
+    # Check embedding model too — semantic_search will fail at query time if it's missing
+    embed_found = cfg.embed_model in installed
+    if not embed_found:
+        embed_found = any(m.startswith(cfg.embed_model.split(":")[0]) for m in installed)
+
     result: dict = {
         "status": "ok" if model_found else "model_missing",
         "ollama_running": True,
@@ -262,6 +284,8 @@ def check_setup(cfg: LLMConfig) -> dict:
         "configured_model": cfg.model,
         "num_ctx": cfg.num_ctx,
         "installed_models": installed,
+        "configured_embed_model": cfg.embed_model,
+        "embedding_installed": embed_found,
     }
 
     if cfg.debug_log:
@@ -276,6 +300,16 @@ def check_setup(cfg: LLMConfig) -> dict:
             m for m in installed
             if any(kw in m for kw in ("coder", "codestral", "code", "deepseek", "starcoder"))
         ]
+
+    if not embed_found:
+        embed_msg = (
+            f"Embedding model '{cfg.embed_model}' is not installed. "
+            f"Run: ollama pull {cfg.embed_model}"
+        )
+        if "message" in result:
+            result["message"] += " " + embed_msg
+        else:
+            result["message"] = embed_msg
 
     return result
 

@@ -1,4 +1,4 @@
-"""Phase 5: Merge FTS5 + embedding results, score, deduplicate."""
+"""Phase 6: Merge FTS5 + embedding results, score, deduplicate."""
 
 from __future__ import annotations
 

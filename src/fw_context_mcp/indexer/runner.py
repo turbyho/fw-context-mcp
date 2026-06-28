@@ -1018,10 +1018,11 @@ def run(
     _wait_if_paused()
 
     if parallel and len(units) > 1:
-        # Parsing + AST traversal is GIL-bound Python; more threads
-        # don't help.  Single worker, sequential path for simplicity.
+        # Single worker — libclang parsing through ctypes does not
+        # meaningfully release the GIL in practice (tested).  Multiple
+        # workers only increase memory pressure (multiple ASTs in RAM)
+        # without measurable speedup.
         max_workers = 1
-        log.info("Parallel indexing with %d workers", max_workers)
 
         # ── Intra-process lock ──
         # threading.Lock is user-space (no syscall per poll iteration).
@@ -1167,6 +1168,8 @@ def run(
         pass
     # Stamp schema version — marks the index as current (get_active_build
     # compares PRAGMA user_version against CURRENT_SCHEMA_VERSION).
+    # PRAGMA does not support bound parameters; CURRENT_SCHEMA_VERSION is
+    # an integer constant — no injection risk.
     conn.execute(f"PRAGMA user_version = {CURRENT_SCHEMA_VERSION}")
     log.info(
         "Done: %d updated, %d unchanged, %d skipped — %d symbols, %d refs in %.1fs (config_hash=%s)",

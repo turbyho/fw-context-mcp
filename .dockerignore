@@ -1,5 +1,7 @@
 .venv
 .git
+.gitignore
+.gitattributes
 __pycache__
 *.pyc
 .eggs
@@ -13,9 +15,15 @@ htmlcov
 .mypy_cache
 .ruff_cache
 tests
+plans
+.claude
 node_modules
 .env
 *.tar.gz
 *.whl
+uv.lock
+server.json
+glama.json
+docs
 Dockerfile
 .dockerignore
