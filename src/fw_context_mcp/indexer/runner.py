@@ -1006,16 +1006,20 @@ def run(
                         _process_unit, u, config_hash, project_root,
                         source_roots, exclude_paths, index_refs, db_path, existing_files,
                         lock=db_lock, conn=_worker_conn_factory,
-                    ): i
+                    ): (i, u.file.name)
                     for i, u in enumerate(units)
                 }
+                processed = 0
                 for future in as_completed(futures):
+                    idx, fname = futures[future]
                     try:
                         status, syms, refs, timing = future.result()
                     except Exception as exc:
-                        log.warning("Worker failed: %s", exc)
+                        processed += 1
                         skipped += 1
+                        log.warning("[%d/%d] %s: FAILED — %s", processed, len(units), fname, exc)
                         continue
+                    processed += 1
                     if status == "updated":
                         updated += 1
                         total_syms += syms
@@ -1023,28 +1027,27 @@ def run(
                         acc_parse += timing[0]
                         acc_lock += timing[1]
                         acc_write += timing[2]
+                        log.info(
+                            "[%d/%d] %s: %d syms, %d refs, %.1fs",
+                            processed, len(units), fname, syms, refs, sum(timing),
+                        )
                     elif status == "unchanged":
                         unchanged += 1
+                        log.info("[%d/%d] %s: unchanged", processed, len(units), fname)
                     elif status == "skipped":
                         skipped += 1
-                    if updated % 50 == 0 and updated > 0:
-                        elapsed = time.monotonic() - t0
-                        log.info(
-                            "  %d/%d TUs, %d syms, %d refs, %.1fs | "
-                            "parse=%.1fs lock=%.1fs write=%.1fs",
-                            updated + unchanged + skipped, len(units),
-                            total_syms, total_refs, elapsed,
-                            acc_parse, acc_lock, acc_write,
-                        )
+                        log.info("[%d/%d] %s: skipped", processed, len(units), fname)
     else:
         # Sequential path — uses per-TU transactions; wrap in fcntl lock
         # once so a background reindex cannot interleave writes.
         with write_lock(db_path.parent, timeout=60.0):
             for i, unit in enumerate(units):
+                fname = unit.file.name
                 status, syms, refs, timing = _process_unit(
                     unit, config_hash, project_root,
                     source_roots, exclude_paths, index_refs, db_path, existing_files,
                 )
+                processed = i + 1
                 if status == "updated":
                     updated += 1
                     total_syms += syms
@@ -1052,18 +1055,16 @@ def run(
                     acc_parse += timing[0]
                     acc_lock += timing[1]
                     acc_write += timing[2]
+                    log.info(
+                        "[%d/%d] %s: %d syms, %d refs, %.1fs",
+                        processed, len(units), fname, syms, refs, sum(timing),
+                    )
                 elif status == "unchanged":
                     unchanged += 1
+                    log.info("[%d/%d] %s: unchanged", processed, len(units), fname)
                 elif status == "skipped":
                     skipped += 1
-                if updated % 50 == 0 and updated > 0:
-                    elapsed = time.monotonic() - t0
-                    log.info(
-                        "  %d/%d TUs, %d syms, %d refs, %.1fs | "
-                        "parse=%.1fs lock=%.1fs write=%.1fs",
-                        i + 1, len(units), total_syms, total_refs, elapsed,
-                        acc_parse, acc_lock, acc_write,
-                    )
+                    log.info("[%d/%d] %s: skipped", processed, len(units), fname)
 
     # Rebuild FTS5 table from the now-complete symbols table — restores
     # full-text search after the triggers were dropped before indexing.
