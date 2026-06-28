@@ -355,7 +355,65 @@ def reindex_file_impl(
         else:
             target = target.resolve()
         if not target.exists():
-            return {"error": f"File not found: {target}"}
+            # File deleted from disk — clean up its records from the index.
+            config_hash = cfg_data["config_hash"]
+            from ...indexer.db import (
+                delete_fp_assignments_for_file as _del_fpa,
+            )
+            from ...indexer.db import (
+                delete_indirect_call_sites_for_file as _del_ics,
+            )
+            from ...indexer.db import (
+                delete_inheritance_for_file as _del_inh,
+            )
+            from ...indexer.db import (
+                delete_refs_for_file as _del_refs,
+            )
+            from ...indexer.db import (
+                delete_symbols_for_file as _del_syms,
+            )
+            from ...indexer.db import (
+                get_file_mtimes,
+            )
+            from ...indexer.db import (
+                write_lock as _db_write_lock,
+            )
+            from ..background import _request_bg_reindex_pause, _resume_bg_reindex
+
+            known = get_file_mtimes(conn, config_hash)
+            file_path_str = str(target)
+            if file_path_str not in known:
+                return {"error": f"File not found on disk or in index: {target}"}
+
+            file_id_old, _ = known[file_path_str]
+            symbol_count = conn.execute(
+                "SELECT COUNT(*) FROM symbols WHERE file_id = ?", (file_id_old,)
+            ).fetchone()[0]
+
+            try:
+                tu_rel = str(target.relative_to(root))
+            except ValueError:
+                tu_rel = file_path_str
+
+            _request_bg_reindex_pause(root)
+            try:
+                with _db_write_lock(db_path.parent, timeout=60.0):
+                    with transaction(conn):
+                        _del_inh(conn, config_hash, file_id_old)
+                        _del_syms(conn, file_id_old)
+                        # ON DELETE CASCADE → llm_analysis, embeddings removed
+                        _del_refs(conn, config_hash, tu_rel)
+                        _del_ics(conn, config_hash, tu_rel)
+                        _del_fpa(conn, config_hash, tu_rel)
+                        conn.execute("DELETE FROM files WHERE id = ?", (file_id_old,))
+                return {
+                    "file": str(target),
+                    "symbols_removed": symbol_count,
+                    "action": "deleted",
+                }
+            finally:
+                _resume_bg_reindex(root)
+
         cc_path = Path(cfg_data["compile_commands_path"])
         if not cc_path.exists():
             return {"error": f"compile_commands.json not found: {cc_path}"}
