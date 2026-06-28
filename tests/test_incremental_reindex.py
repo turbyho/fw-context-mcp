@@ -317,6 +317,7 @@ class TestContentHashHelpers:
 # ── functional tests: full indexing + reindex flow ────────────────────
 
 
+@pytest.mark.libclang
 class TestIncrementalReindex:
     """End-to-end tests: index → modify → reindex → verify."""
 
@@ -675,6 +676,7 @@ int modem_flush(void) {
             print(f"  Header reindexed (via include): {result}")
 
 
+@pytest.mark.libclang
 class TestMoveDetection:
     """Phase 4: detect and fix symbols moved between files."""
 
@@ -840,6 +842,7 @@ class TestMoveDetection:
         modem_c.write_text(modem_original, encoding="utf-8")
 
 
+@pytest.mark.libclang
 class TestAutoReindexStale:
     """Tests for _auto_reindex_stale — background reindex of modified files."""
 
@@ -902,6 +905,7 @@ class TestAutoReindexStale:
         assert failed == []
 
 
+@pytest.mark.libclang
 class TestReindexFileImplEdgeCases:
     """Edge cases for reindex_file_impl."""
 
@@ -1242,16 +1246,6 @@ class TestStoreSymbolsForUnitAnalysisRestore:
 # ── fixtures for LLM analysis tests ──────────────────────────────────
 
 
-def _ollama_available() -> bool:
-    """Check if Ollama is running — skip LLM tests if not."""
-    try:
-        import httpx
-        resp = httpx.get("http://localhost:11434/api/tags", timeout=2.0)
-        return resp.status_code == 200
-    except Exception:
-        return False
-
-
 @pytest.fixture(scope="class")
 def indexed_project_with_analysis(tmp_path_factory):
     """Index the C project with LLM analysis enabled (requires Ollama).
@@ -1379,7 +1373,8 @@ def _config_hash(conn):
 # ── LLM analysis consistency tests (requires Ollama) ──────────────────
 
 
-@pytest.mark.skipif(not _ollama_available(), reason="Ollama not running")
+@pytest.mark.ollama
+@pytest.mark.libclang
 class TestLlvmAnalysisConsistency:
     """End-to-end tests with real LLM analysis: index → modify → reindex → verify consistency."""
 

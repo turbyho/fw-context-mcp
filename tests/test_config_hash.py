@@ -2,6 +2,8 @@
 
 import json
 
+import pytest
+
 from fw_context_mcp.indexer.config_hash import _normalize_entry, compute
 
 
@@ -120,3 +122,53 @@ class TestCompute:
         result = compute(p)
         assert len(result) == 64
         assert all(c in "0123456789abcdef" for c in result)
+
+    def test_empty_compile_commands(self, tmpdir):
+        """Empty compile_commands.json should produce a hash."""
+        p = tmpdir / "cc.json"
+        p.write_text("[]")
+        result = compute(p)
+        assert len(result) == 64
+
+    def test_single_entry_minimal(self, tmpdir):
+        """Single entry with minimal fields should produce a hash."""
+        data = [{"directory": str(tmpdir), "file": "a.c", "command": "gcc -c a.c"}]
+        p = tmpdir / "cc.json"
+        p.write_text(json.dumps(data))
+        result = compute(p)
+        assert len(result) == 64
+
+    def test_compile_commands_with_null_fields(self, tmpdir):
+        """Entries with null fields should not crash."""
+        data = [
+            {
+                "directory": str(tmpdir),
+                "file": "a.c",
+                "arguments": ["gcc", "-c", "a.c"],
+            },
+            {
+                "directory": None,
+                "file": "b.c",
+                "arguments": ["gcc", "-c", "b.c"],
+            },
+        ]
+        p = tmpdir / "cc.json"
+        p.write_text(json.dumps(data))
+        result = compute(p)
+        assert len(result) == 64
+
+    def test_file_with_only_whitespace(self, tmpdir):
+        """Whitespace-only compile_commands.json should fail gracefully."""
+        p = tmpdir / "cc.json"
+        p.write_text("   \n  \n  ")
+        try:
+            compute(p)
+        except (json.JSONDecodeError, ValueError):
+            pass  # Expected — invalid JSON or empty parse
+
+    def test_malformed_json(self, tmpdir):
+        """Malformed JSON should raise an error."""
+        p = tmpdir / "cc.json"
+        p.write_text("{this is not json}")
+        with pytest.raises((json.JSONDecodeError, ValueError)):
+            compute(p)

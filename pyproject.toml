@@ -68,3 +68,8 @@ warn_redundant_casts = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = [
+    "slow: tests that take longer than 2 seconds (full index/reindex via libclang)",
+    "ollama: tests that require a running Ollama instance",
+    "libclang: tests that require libclang and a C compiler (gcc/clang)",
+]
