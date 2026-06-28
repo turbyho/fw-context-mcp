@@ -56,10 +56,6 @@ period of inactivity. Install the watcher dependency to enable it:
 cd ~/.fw-context/src && make install-watch
 ```
 
-Without `watchfiles`, the MCP server works normally but skips background
-watching. The standalone `fw-context watch` command is also available for
-use outside the MCP server.
-
 ## Configure your project
 
 After install, create `<project>/.fw-context/config.toml` in your firmware
