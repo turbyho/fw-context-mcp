@@ -26,14 +26,14 @@ def _fallback_to_search_code(
     """
     conn, err = _open_db_safe(db_path)
     if err:
-        return err
+        return [err]
     assert conn is not None
     try:
         with conn:
             project_id = derive_project_id(root)
             cfg = get_active_config(conn, project_id)
             if not cfg:
-                return {"error": "No build config indexed."}
+                return [{"error": "No build config indexed."}]
             config_hash = cfg["config_hash"]
             results = _fallback_to_search_code_inner(
                 conn, root, query, config_hash, limit, warning

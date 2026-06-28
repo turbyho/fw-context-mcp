@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import math
-
 import pytest
 
 from fw_context_mcp.search.phases.embedding_helpers import (

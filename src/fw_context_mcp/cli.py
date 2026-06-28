@@ -678,122 +678,6 @@ def cmd_export(args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_watch(args: argparse.Namespace) -> int:
-    """Watch project source files and auto-reindex on changes.
-
-    Monitors the project directory for changes to ``.c``, ``.cpp``, ``.h``,
-    and ``.hpp`` files and runs ``reindex_file`` on each modified file.
-    Changes are debounced so rapid saves (e.g. from an IDE) trigger at most
-    one re-index per *debounce_ms* interval per file.
-    """
-    import time
-    from collections import defaultdict
-
-    from watchfiles import watch
-
-    from .config import derive_project_id
-    from .config import load as load_config
-    from .indexer.compile_commands import parse as parse_cc
-    from .indexer.db import get_active_config, open_db, write_lock
-    from .indexer.ops import store_symbols_for_unit
-
-    root = Path(args.project or ".").resolve()
-    cfg = load_config(project_root=root)
-    project_id = derive_project_id(root)
-    db_path = cfg.index.db_dir / project_id / "index.db"
-
-    if not db_path.exists():
-        print(f"No index found for {root}. Run 'fw-context index' first.", file=sys.stderr)
-        return 1
-
-    print(f"Watching {root} for changes (debounce={args.debounce}ms)...")
-    print("   Press Ctrl+C to stop.")
-
-    debounce_s = args.debounce / 1000.0
-    pending: dict[str, float] = defaultdict(float)
-
-    try:
-        for changes in watch(root, debounce=debounce_s, recursive=True):
-            source_exts = {".c", ".cpp", ".h", ".hpp"}
-            changed_files = {
-                (Path(changed_path), change)
-                for change, changed_path in changes
-                if Path(changed_path).suffix.lower() in source_exts
-                and "__pycache__" not in changed_path
-                and ".git/" not in changed_path
-            }
-
-            if not changed_files:
-                continue
-
-            now = time.monotonic()
-            for path, _ in changed_files:
-                pending[str(path)] = now
-
-            # Process files whose debounce window has elapsed
-            ready = [p for p, t in pending.items() if now - t >= debounce_s]
-            if not ready:
-                continue
-
-            # Reload compile_commands to pick up any new TUs
-            try:
-                conn = open_db(db_path)
-                build_cfg = get_active_config(conn, project_id)
-                if not build_cfg:
-                    conn.close()
-                    continue
-                cc_path = Path(build_cfg["compile_commands_path"])
-                units = list(parse_cc(cc_path))
-                config_hash = build_cfg["config_hash"]
-                source_roots = cfg.source_root_paths(root)
-                exclude_paths = cfg.exclude_root_paths(root)
-            except Exception as e:
-                print(f"  ⚠ Failed to reload build config: {e}")
-                if 'conn' in locals():
-                    conn.close()
-                continue
-
-            try:
-                for fp in ready:
-                    del pending[fp]
-                    try:
-                        target = Path(fp).resolve()
-                        matching = [u for u in units if Path(u.file).resolve() == target]
-                        if not matching:
-                            continue
-                        total = 0
-                        with write_lock(db_path.parent, timeout=10.0):
-                            for unit in matching:
-                                syms_added, _ = store_symbols_for_unit(
-                                    conn, unit, config_hash, root,
-                                    source_roots=source_roots,
-                                    exclude_paths=exclude_paths,
-                                    index_refs=cfg.index.index_refs,
-                                )
-                                total += syms_added
-                            conn.commit()
-                        try:
-                            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-                        except Exception:
-                            pass
-                        if total > 0:
-                            rel = target.relative_to(root)
-                            print(f"  ✓ reindexed {rel} ({total} symbols)")
-                    except Exception as e:
-                        print(f"  ✗ {fp}: {e}")
-                        try:
-                            conn.rollback()
-                        except Exception:
-                            pass
-            finally:
-                conn.close()
-
-    except KeyboardInterrupt:
-        print("\nStopped.")
-
-    return 0
-
-
 def cmd_analyze(args: argparse.Namespace) -> int:
     """Re-run LLM symbol analysis on an existing index (idempotent).
 
@@ -926,12 +810,6 @@ def main() -> None:
     p_export.add_argument("-o", "--output", metavar="PATH", help="Output file (default: stdout)")
     p_export.add_argument("--no-refs", action="store_true", help="Omit cross-references")
     p_export.set_defaults(func=cmd_export)
-
-    p_watch = sub.add_parser("watch", help="Watch project files and auto-reindex on changes")
-    p_watch.add_argument("--project", metavar="DIR", help="Project root (default: cwd)")
-    p_watch.add_argument("--debounce", type=int, default=2000, metavar="MS",
-                         help="Debounce delay in ms (default: 2000)")
-    p_watch.set_defaults(func=cmd_watch)
 
     p_analyze = sub.add_parser("analyze", help="Re-run LLM symbol analysis on existing index (idempotent)")
     p_analyze.add_argument("--project", metavar="DIR", help="Project root (default: cwd)")

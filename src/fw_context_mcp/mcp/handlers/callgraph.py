@@ -51,20 +51,20 @@ def _references_result(name: str, project_root: str | None, ref_kind: str | list
     """
     db_path, cfg, project_id, root = _resolve_context(project_root)
     if not db_path.exists():
-        return {"error": f"No index found for {root}. Run 'fw-context index' first."}
+        return [{"error": f"No index found for {root}. Run 'fw-context index' first."}]
     conn, err = _open_db_safe(db_path)
     if err:
-        return err
+        return [err]
     assert conn is not None
     try:
         with conn:
             cfg_data = get_active_config(conn, project_id)
             if not cfg_data:
-                return {"error": "No build config indexed."}
+                return [{"error": "No build config indexed."}]
             config_hash = cfg_data["config_hash"]
             symbol = _lookup_definition(conn, config_hash, name)
             if symbol is None:
-                return {"error": f"Symbol not found: {name}"}
+                return [{"error": f"Symbol not found: {name}"}]
             if count_refs(conn, config_hash) == 0:
                 return [{"info": (
                     "No references indexed. Refs are on by default — "
@@ -201,16 +201,16 @@ def find_indirect_call_sites(
     """
     db_path, cfg, project_id, root = _resolve_context(project_root)
     if not db_path.exists():
-        return {"error": f"No index found for {root}. Run 'fw-context index' first."}
+        return [{"error": f"No index found for {root}. Run 'fw-context index' first."}]
     conn, err = _open_db_safe(db_path)
     if err:
-        return err
+        return [err]
     assert conn is not None
     try:
         with conn:
             cfg_data = get_active_config(conn, project_id)
             if not cfg_data:
-                return {"error": "No build config indexed."}
+                return [{"error": "No build config indexed."}]
             config_hash = cfg_data["config_hash"]
 
             if count_indirect_call_sites(conn, config_hash) == 0:
@@ -279,16 +279,16 @@ def find_indirect_targets(
     """
     db_path, cfg, project_id, root = _resolve_context(project_root)
     if not db_path.exists():
-        return {"error": f"No index found for {root}. Run 'fw-context index' first."}
+        return [{"error": f"No index found for {root}. Run 'fw-context index' first."}]
     conn, err = _open_db_safe(db_path)
     if err:
-        return err
+        return [err]
     assert conn is not None
     try:
         with conn:
             cfg_data = get_active_config(conn, project_id)
             if not cfg_data:
-                return {"error": "No build config indexed."}
+                return [{"error": "No build config indexed."}]
             config_hash = cfg_data["config_hash"]
 
             if count_fp_assignments(conn, config_hash) == 0:
@@ -334,17 +334,17 @@ def _refs_guard(project_root: str | None) -> tuple[sqlite3.Connection, Path, str
     root = resolve_project_root(project_root)
     db_path = _db_path(root)
     if not db_path.exists():
-        return None, None, None, {"error": f"No index found for {root}. Run 'fw-context index' first."}
+        return None, None, None, [{"error": f"No index found for {root}. Run 'fw-context index' first."}]
     conn, err = _open_db_safe(db_path)
     if err:
-        return None, None, None, err
+        return None, None, None, [err]
     assert conn is not None
     project_id = derive_project_id(root)
     with conn:
         cfg_data = get_active_config(conn, project_id)
         if not cfg_data:
             conn.close()
-            return None, None, None, {"error": "No build config indexed."}
+            return None, None, None, [{"error": "No build config indexed."}]
         config_hash = cfg_data["config_hash"]
         if count_refs(conn, config_hash) == 0:
             conn.close()
@@ -382,9 +382,9 @@ def find_call_path(
     assert config_hash is not None
     try:
         if _lookup_definition(conn, config_hash, from_name) is None:
-            return {"error": f"Symbol not found: {from_name}"}
+            return [{"error": f"Symbol not found: {from_name}"}]
         if _lookup_definition(conn, config_hash, to_name) is None:
-            return {"error": f"Symbol not found: {to_name}"}
+            return [{"error": f"Symbol not found: {to_name}"}]
         rows = index_db.find_call_path(conn, config_hash, from_name, to_name, max_depth=max_depth)
         if not rows:
             return [{"info": f"No path found from '{from_name}' to '{to_name}' within depth {max_depth}."}]
@@ -418,7 +418,7 @@ def find_all_callers_recursive(
     assert config_hash is not None
     try:
         if _lookup_definition(conn, config_hash, name) is None:
-            return {"error": f"Symbol not found: {name}"}
+            return [{"error": f"Symbol not found: {name}"}]
         rows = index_db.find_all_callers_recursive(conn, config_hash, name, max_depth=max_depth, limit=limit)
         if not rows:
             return [{"info": f"No callers found for '{name}'."}]
@@ -452,7 +452,7 @@ def find_callees_recursive(
     assert config_hash is not None
     try:
         if _lookup_definition(conn, config_hash, name) is None:
-            return {"error": f"Symbol not found: {name}"}
+            return [{"error": f"Symbol not found: {name}"}]
         rows = index_db.find_callees_recursive(conn, config_hash, name, max_depth=max_depth, limit=limit)
         if not rows:
             return [{"info": f"No callees found for '{name}'."}]
@@ -491,7 +491,7 @@ def find_dead_code(
     Use ``project_only=False`` to see all results including vendor code.
     Requires the reference index.
     """
-    root, config_hash, err = _refs_guard(project_root)
+    _conn, root, config_hash, err = _refs_guard(project_root)
     if err:
         return err
     assert root is not None
@@ -536,7 +536,7 @@ def find_wrapper_callers(
     try:
         # Resolve driver class — check it exists in the index
         if _lookup_definition(conn, config_hash, class_name) is None:
-            return {"error": f"Symbol not found: {class_name}"}
+            return [{"error": f"Symbol not found: {class_name}"}]
 
         # Find all methods of the class
         driver_methods = conn.execute(
@@ -725,7 +725,7 @@ def find_hotspots(
     For the callers of a specific hotspot, follow up with ``find_callers``
     or ``find_all_callers_recursive``.
     """
-    root, config_hash, err = _refs_guard(project_root)
+    _conn, root, config_hash, err = _refs_guard(project_root)
     if err:
         return err
     assert root is not None

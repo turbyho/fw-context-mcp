@@ -55,10 +55,6 @@ endif
 pip-install: venv
 	$(UV) pip install --python $(VENV)/bin/python $(SRC)
 
-# ---- install with watch extra ----
-install-watch: install
-	$(UV) pip install --python $(VENV)/bin/python "$(SRC)[watch]"
-
 # ---- symlink binaries into ~/.local/bin ----
 link-add:
 	@mkdir -p $(HOME)/.local/bin
@@ -81,4 +77,4 @@ clean-path:
 		fi; \
 	done
 
-.PHONY: install update uninstall venv pip-install link-add clean-path install-watch
+.PHONY: install update uninstall venv pip-install link-add clean-path

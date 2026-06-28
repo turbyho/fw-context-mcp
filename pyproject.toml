@@ -1,6 +1,6 @@
 [project]
 name = "fw-context-mcp"
-version = "0.9.3"
+version = "0.10.0"
 description = "Build-aware code intelligence MCP server for embedded C/C++ firmware"
 requires-python = ">=3.11"
 license = {text = "MIT"}
@@ -16,6 +16,7 @@ dependencies = [
     "mcp[cli]>=1.0.0",
     "pysqlite3>=0.5.0",
     "sqlite-vec>=0.1.0",
+    "watchfiles>=0.21",
 ]
 
 [project.optional-dependencies]
@@ -23,9 +24,6 @@ dev = [
     "pytest>=8",
     "ruff>=0.4",
     "mypy>=1.10",
-]
-watch = [
-    "watchfiles>=0.21",
 ]
 
 [project.scripts]

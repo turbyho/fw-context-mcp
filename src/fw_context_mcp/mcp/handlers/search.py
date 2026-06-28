@@ -66,7 +66,7 @@ def lookup_symbol(
         root = resolve_project_root(project_root)
         db_path = _db_path(root)
         if not db_path.exists():
-            return {"error": f"No index found for {root}."}
+            return [{"error": f"No index found for {root}."}]
 
         limit = min(limit, 100)
 
@@ -158,7 +158,7 @@ LOOKUP_PREFIX_SQL,
         return _with_stale_recovery(root, db_path, _do_lookup)
     except Exception as e:
         log.exception("lookup_symbol failed: %s", e)
-        return {"error": f"lookup_symbol failed: {e}"}
+        return [{"error": f"lookup_symbol failed: {e}"}]
 
 # ── moved from server.py ──
 def search_code(
@@ -226,7 +226,7 @@ def search_code(
         root = resolve_project_root(project_root)
         db_path = _db_path(root)
         if not db_path.exists():
-            return {"error": f"No index found for {root}. Run 'fw-context index' first."}
+            return [{"error": f"No index found for {root}. Run 'fw-context index' first."}]
 
         limit = min(limit, 100)
 
@@ -345,7 +345,7 @@ def search_code(
         return _with_stale_recovery(root, db_path, _do_search)
     except Exception as e:
         log.exception("search_code failed: %s", e)
-        return {"error": f"search_code failed: {e}"}
+        return [{"error": f"search_code failed: {e}"}]
 
 # ── moved from server.py ──
 async def smart_search(
@@ -393,7 +393,7 @@ async def smart_search(
     try:
         ctx = PipelineContext.create(query=query, project_root=project_root, limit=limit)
     except ValueError as e:
-        return {"error": str(e)}
+        return [{"error": str(e)}]
 
     runner = PipelineRunner(SMART_SEARCH)
     ctx = await runner.run(ctx)
@@ -403,7 +403,7 @@ async def smart_search(
     if ctx.ollama_warning is None:
         conn, err = _open_db_safe(ctx.db_path)
         if err:
-            return err
+            return [err]
         assert conn is not None
         try:
             with conn:
@@ -475,7 +475,7 @@ async def semantic_search(
         root = resolve_project_root(project_root)
         db_path = _db_path(root)
         if not db_path.exists():
-            return {"error": f"No index found for {root}. Run 'fw-context index' first."}
+            return [{"error": f"No index found for {root}. Run 'fw-context index' first."}]
 
         limit = min(limit, 100)
         threshold = max(0.0, min(1.0, threshold))
@@ -638,4 +638,4 @@ async def semantic_search(
 
     except Exception as e:
         log.exception("semantic_search failed: %s", e)
-        return {"error": f"semantic_search failed: {e}"}
+        return [{"error": f"semantic_search failed: {e}"}]

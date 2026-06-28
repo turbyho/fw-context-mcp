@@ -638,7 +638,7 @@ class TestReindexIntegrity:
                    WHERE config_hash=? AND name='driver_get_status' AND is_definition=1""",
                 (ch,),
             ).fetchone()[0]
-            assert after == 0, f"Function definition still in index after removal"
+            assert after == 0, "Function definition still in index after removal"
         finally:
             conn.close()
 
