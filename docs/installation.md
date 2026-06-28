@@ -156,9 +156,12 @@ ollama serve &   # start daemon if not running as a service
 ### Pull models
 
 ```bash
-# LLM — required for smart_search + explain_symbol
-ollama pull qwen2.5-coder:14b        # recommended (~9 GB VRAM)
-ollama pull qwen2.5-coder:7b         # smaller (~4 GB VRAM)
+# LLM — required for smart_search + explain_symbol (min. 14B parameters)
+ollama pull qwen2.5-coder:14b        # recommended (~12 GB VRAM)
+
+# Cloud alternative — no GPU needed (requires ollama signin)
+ollama pull deepseek-v4-flash:cloud  # 284B MoE, 13B active, great value
+ollama pull qwen3-coder:480b-cloud   # coding-focused, top quality
 
 # Embedding model — required for vector search
 ollama pull mxbai-embed-large:latest
@@ -171,19 +174,22 @@ ollama run qwen2.5-coder:14b "Explain: void uart_init(int baudrate)"
 
 **With GPU:**
 
-| VRAM | Model | Tag |
-|------|-------|-----|
-| 8 GB | Qwen2.5-Coder 7B | `qwen2.5-coder:7b` |
-| 12 GB | **Qwen2.5-Coder 14B** | `qwen2.5-coder:14b` |
-| 16 GB | Qwen2.5-Coder 14B Q8 | `qwen2.5-coder:14b-q8_0` |
-| 24 GB+ | Qwen2.5-Coder 32B | `qwen2.5-coder:32b` |
+| VRAM | Model | Tag | Notes |
+|------|-------|-----|-------|
+| 12 GB | **Qwen2.5-Coder 14B** | `qwen2.5-coder:14b` | Minimum recommended — robust JSON, good code comprehension |
+| 16 GB | Qwen2.5-Coder 14B Q8 | `qwen2.5-coder:14b-q8_0` | Higher precision, slightly better quality |
+| 24 GB+ | Qwen2.5-Coder 32B | `qwen2.5-coder:32b` | Best local quality for embedded C++ |
+
+> **Less than 12 GB VRAM?** Use cloud models (below) — smaller local models
+> produce inconsistent JSON and poor-quality descriptions for C++ embedded code.
 
 **Without GPU (cloud models, requires `ollama signin`):**
 
 | Model | Tag | Notes |
 |-------|-----|-------|
-| **Nemotron-3 Nano** | `nemotron-3-nano:cloud` | 4B, fast, free tier |
-| RnJ-1 | `rnj-1:cloud` | 8B, code/STEM optimized |
+| **DeepSeek V4 Flash** | `deepseek-v4-flash:cloud` | 284B MoE (13B active), great value |
+| **Qwen3-Coder 480B** | `qwen3-coder:480b-cloud` | Coding-focused, best analysis quality |
+| Gemini 3 Flash | `gemini-3-flash-preview:cloud` | Fast, affordable |
 
 ### Configure
 
