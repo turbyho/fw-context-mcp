@@ -119,8 +119,20 @@ PlatformIO (`platformio.ini`), or any build with `bear`.
 3. Parses every translation unit with libclang
 4. Builds the SQLite index with symbols, references, and embeddings
 
-**Subsequent runs** are incremental — only changed files are re-parsed.
-Use `--no-build` if you already have an up-to-date `compile_commands.json`.
+> **⚠️ Every `fw-context index` (without `--no-build`) does a full re-index.**
+> The clean build regenerates `compile_commands.json`, which produces a new
+> config hash — so every translation unit is re-parsed from scratch, even if
+> no source file changed.
+>
+> **For incremental indexing** (only changed files re-parsed, seconds instead
+> of minutes), use `--no-build`:
+>
+>     fw-context index --no-build
+>
+> This reuses the existing `compile_commands.json`. When the config hash
+> matches, only files with newer mtimes are re-parsed; the rest are skipped.
+> The MCP server's file watcher auto-reindexes edited files on save, so a
+> full `fw-context index` is rarely needed after the initial one.
 
 ### 6. Restart your assistant and start asking about your code
 
@@ -194,7 +206,7 @@ graph LR
 - **Vector search** — semantic similarity via `sqlite-vec` + Ollama embeddings, hybrid FTS5+vector re-ranking
 - **Graph analytics** — call paths, transitive callers/callees, dead code detection, hotspot analysis
 - **Indirect call detection** — resolves function-pointer arguments at direct call sites, uncovering call-graph edges that grep/cscope miss
-- **Incremental indexing** — only changed files re-parsed; auto-reindex on query detects and fixes staleness
+- **Incremental indexing** — with `--no-build`, only changed files are re-parsed (seconds, not minutes). The file watcher auto-reindexes on save — a full `fw-context index` rebuild is rarely needed after the first run
 - **Offline-first** — index is a file on disk at `~/.fw-context/index/`. No daemon, no cloud, no network.
 - **`#ifdef`-aware** — uses real compiler flags; sees exactly what your compiler sees
 
@@ -212,7 +224,9 @@ Works with **any build system** that produces `compile_commands.json`:
 `fw-context index` handles the build automatically. Use `--no-build` to
 skip and use an existing `compile_commands.json`.
 
-Subsequent runs are **incremental** — seconds for a few changed files.
+Without `--no-build`, every run does a full re-index — the clean build
+produces a new config hash.  With `--no-build`, subsequent runs are
+**incremental** — seconds for a few changed files.
 
 ## Documentation
 
