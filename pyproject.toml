@@ -6,8 +6,15 @@ requires-python = ">=3.11"
 license = {text = "MIT"}
 repository = "https://github.com/turbyho/fw-context-mcp"
 homepage = "https://github.com/turbyho/fw-context-mcp"
-keywords = ["mcp", "c++", "embedded", "firmware", "libclang", "call-graph", "code-intelligence"]
+keywords = ["mcp", "mcp-server", "c++", "clang", "embedded", "firmware", "libclang", "sqlite", "fts5", "call-graph", "code-intelligence", "static-analysis", "claude", "llm"]
 readme = "README.md"
+
+[project.urls]
+Homepage = "https://github.com/turbyho/fw-context-mcp"
+Documentation = "https://github.com/turbyho/fw-context-mcp#readme"
+Source = "https://github.com/turbyho/fw-context-mcp"
+"Issue Tracker" = "https://github.com/turbyho/fw-context-mcp/issues"
+
 dependencies = [
     "httpx>=0.27.0",
     "libclang>=18.1.1",
