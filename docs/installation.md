@@ -48,13 +48,9 @@ cd ~/.fw-context/src && make install
 
 **File watcher (auto-reindex on save):**
 
-The MCP server starts a background watcher daemon automatically — edited
+The MCP server starts a background watcher daemon automatically. Edited
 source files are reindexed on save, and LLM analysis regenerates after a
-period of inactivity. Install the watcher dependency to enable it:
-
-```bash
-cd ~/.fw-context/src && make install-watch
-```
+period of inactivity.
 
 ## Configure your project
 
