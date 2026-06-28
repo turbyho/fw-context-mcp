@@ -944,6 +944,74 @@ class TestReindexFileImplEdgeCases:
         assert "error" in result
         assert "no index" in result["error"].lower() or "run" in result["error"].lower()
 
+    def test_deleted_file_cleans_up_db_records(self, indexed_project: Path):
+        """When a previously-indexed file is deleted from disk, reindex_file
+        cleans up its symbols and the files table entry."""
+        import shutil
+
+        from fw_context_mcp.indexer.db import open_db as _open_db
+        from fw_context_mcp.indexer.ops import get_file_mtimes
+        from fw_context_mcp.mcp.handlers.maintenance import reindex_file_impl
+
+        db_path = _db_path_for_project(indexed_project)
+        target = (indexed_project / "src" / "utils.c").resolve()
+        target_str = str(target)
+
+        # ── Precondition: file exists in index ──
+        conn = _open_db(db_path)
+        try:
+            config_hash = conn.execute(
+                "SELECT config_hash FROM build_configs LIMIT 1"
+            ).fetchone()["config_hash"]
+
+            known = get_file_mtimes(conn, config_hash)
+            assert target_str in known, f"{target_str} not in files table before test"
+            old_file_id = known[target_str][0]
+            sym_count_before = conn.execute(
+                "SELECT COUNT(*) FROM symbols WHERE file_id=?", (old_file_id,)
+            ).fetchone()[0]
+            assert sym_count_before > 0, "Expected symbols for utils.c before deletion"
+        finally:
+            conn.close()
+
+        # ── Delete the file from disk ──
+        shutil.move(target, target.with_suffix(".c.bak"))
+
+        try:
+            # ── Reindex the (now deleted) file ──
+            result = reindex_file_impl("src/utils.c", str(indexed_project), with_analysis=False)
+            assert "error" not in result, f"Unexpected error: {result.get('error')}"
+            assert result.get("action") == "deleted", f"Expected action='deleted', got: {result}"
+            assert result.get("symbols_removed") == sym_count_before, (
+                f"Expected {sym_count_before} symbols removed, got {result.get('symbols_removed')}"
+            )
+
+            # ── Verify DB is clean ──
+            conn = _open_db(db_path)
+            try:
+                known_after = get_file_mtimes(conn, config_hash)
+                assert target_str not in known_after, "File record should be removed from files table"
+
+                sym_count_after = conn.execute(
+                    "SELECT COUNT(*) FROM symbols WHERE file_id=?", (old_file_id,)
+                ).fetchone()[0]
+                assert sym_count_after == 0, f"Expected 0 symbols, found {sym_count_after}"
+            finally:
+                conn.close()
+        finally:
+            # Restore the file so the fixture stays clean for other tests
+            shutil.move(target.with_suffix(".c.bak"), target)
+            # Reindex to restore the index state
+            reindex_file_impl("src/utils.c", str(indexed_project), with_analysis=False)
+
+    def test_deleted_file_not_in_index_returns_error(self, indexed_project: Path):
+        """File that exists neither on disk nor in the index returns an error."""
+        from fw_context_mcp.mcp.handlers.maintenance import reindex_file_impl
+
+        result = reindex_file_impl("src/never_existed.c", str(indexed_project), with_analysis=False)
+        assert "error" in result
+        assert "not found" in result["error"].lower()
+
 
 # ── direct store_symbols_for_unit tests ────────────────────────────────
 
