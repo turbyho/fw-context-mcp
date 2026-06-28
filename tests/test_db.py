@@ -1049,3 +1049,87 @@ class TestOverrides:
             ).fetchall()
         ]
         assert "overrides" in tables
+
+
+class TestSearchEdgeCases:
+    """Edge case tests for search and symbol insertion."""
+
+    def test_search_empty_query(self, populated_db):
+        """Empty query should not crash."""
+        results = search_symbols(populated_db, "", "hash-deadbeef", limit=5)
+        assert isinstance(results, list)
+
+    def test_search_whitespace_only_query(self, populated_db):
+        """Whitespace-only query should not crash."""
+        results = search_symbols(populated_db, "   ", "hash-deadbeef", limit=5)
+        assert isinstance(results, list)
+
+    def test_search_special_chars(self, populated_db):
+        """Special FTS5 characters should be handled safely."""
+        results = search_symbols(populated_db, "test*", "hash-deadbeef", limit=5)
+        assert isinstance(results, list)
+
+    def test_search_quote_handling(self, populated_db):
+        """Quotes in query should not crash."""
+        results = search_symbols(populated_db, '"test"', "hash-deadbeef", limit=5)
+        assert isinstance(results, list)
+
+    def test_insert_symbol_empty_parent_usr(self, populated_db):
+        """Symbol with empty parent_usr should be stored correctly."""
+        fid = upsert_file(populated_db, "hash-deadbeef", "/tmp/empty_parent.c", "c")
+        rows = [(
+            "hash-deadbeef", fid, "src/empty_parent.c",
+            split_tokens("top_level_fn", "top_level_fn"),
+            "usr-empty-parent", "top_level_fn", "top_level_fn", "function",
+            1, 0, 1, 1, "void top_level_fn()", "", None, 0, 0, "", 0, "",
+        )]
+        insert_symbols_batch(populated_db, rows)
+        row = populated_db.execute(
+            "SELECT parent_usr FROM symbols WHERE usr='usr-empty-parent'"
+        ).fetchone()
+        assert row is not None
+        assert row["parent_usr"] == ""
+
+    def test_insert_symbol_empty_signature(self, populated_db):
+        """Symbol with empty signature should not crash."""
+        fid = upsert_file(populated_db, "hash-deadbeef", "/tmp/empty_sig.c", "c")
+        rows = [(
+            "hash-deadbeef", fid, "src/empty_sig.c",
+            split_tokens("fn", "fn"),
+            "usr-empty-sig", "fn", "fn", "function",
+            1, 0, 1, 1, "", "", None, 0, 0, "", 0, "",
+        )]
+        insert_symbols_batch(populated_db, rows)
+        row = populated_db.execute(
+            "SELECT signature FROM symbols WHERE usr='usr-empty-sig'"
+        ).fetchone()
+        assert row is not None
+        assert row["signature"] == ""
+
+    def test_insert_symbol_zero_line(self, populated_db):
+        """Symbol with line=0 is stored (though unusual)."""
+        fid = upsert_file(populated_db, "hash-deadbeef", "/tmp/line_zero.c", "c")
+        rows = [(
+            "hash-deadbeef", fid, "src/line_zero.c",
+            split_tokens("fn", "fn"),
+            "usr-zero-line", "fn", "fn", "function",
+            0, 0, 0, 1, "void fn()", "", None, 0, 0, "", 0, "",
+        )]
+        insert_symbols_batch(populated_db, rows)
+        row = populated_db.execute(
+            "SELECT line FROM symbols WHERE usr='usr-zero-line'"
+        ).fetchone()
+        assert row is not None
+        assert row["line"] == 0
+
+    def test_upsert_file_empty_path(self, populated_db):
+        """Upserting a file with an empty path should work but may produce warnings."""
+        # File paths are stored as-is; empty path is an edge case
+        fid = upsert_file(populated_db, "hash-deadbeef", "", "c")
+        assert fid > 0
+
+    def test_search_very_long_query(self, populated_db):
+        """Very long query should not crash."""
+        long_query = "a" * 1000
+        results = search_symbols(populated_db, long_query, "hash-deadbeef", limit=5)
+        assert isinstance(results, list)
