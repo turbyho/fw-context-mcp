@@ -56,6 +56,14 @@ regenerates after 60 s of inactivity. No separate configuration needed.
 
 After install, create `<project>/.fw-context/config.toml` in your firmware
 project — or let `fw-context index` auto-create it with defaults.
+
+Two project-level files exist:
+
+| File | Purpose | Git |
+|------|---------|-----|
+| `.fw-context/config.toml` | Shared settings (build, index, project name) | Commit |
+| `.fw-context/local.toml` | Private overrides (LLM model, db path, analysis toggles) | Gitignore |
+
 Full reference: **[Configuration →](configuration.md)**.
 
 ### Zephyr
@@ -189,7 +197,8 @@ ollama run qwen2.5-coder:14b "Explain: void uart_init(int baudrate)"
 
 ### Configure
 
-Edit `~/.fw-context/config.toml`:
+Edit `~/.fw-context/config.toml` (global) or
+`<project>/.fw-context/local.toml` (per-project override):
 
 ```toml
 [llm]
@@ -202,6 +211,8 @@ num_ctx      = 16384
 
 > **Remote Ollama:** Set `ollama_url = "http://192.168.1.50:11434"` if
 > Ollama runs on another machine.
+> **Per-project model:** Use `<project>/.fw-context/local.toml` to override
+> the model for a specific project (e.g. a 32B model for a large codebase).
 
 ## AI assistant setup
 
