@@ -46,11 +46,20 @@ git clone git@github.com:turbyho/fw-context-mcp.git ~/.fw-context/src
 cd ~/.fw-context/src && make install
 ```
 
-**Optional: file watcher for `fw-context watch`:**
+**File watcher (auto-reindex on save):**
+
+The MCP server starts a background watcher daemon automatically — edited
+source files are reindexed within 500 ms of saving, and LLM analysis
+regenerates after 60 s of inactivity. Install the watcher dependency to
+enable it:
 
 ```bash
 cd ~/.fw-context/src && make install-watch
 ```
+
+Without `watchfiles`, the MCP server works normally but skips background
+watching. The standalone `fw-context watch` command is also available for
+use outside the MCP server.
 
 ## Configure your project
 
