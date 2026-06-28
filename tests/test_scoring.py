@@ -2,9 +2,7 @@
 
 from __future__ import annotations
 
-import pytest
-
-from fw_context_mcp.search.scoring import _is_project_local, score_result, stems_from_queries, KIND_WEIGHT
+from fw_context_mcp.search.scoring import _is_project_local, score_result, stems_from_queries
 
 
 class TestIsProjectLocal:

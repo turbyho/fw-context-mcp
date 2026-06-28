@@ -1830,3 +1830,237 @@ int compute_average(const int* values, int count) {
 
         finally:
             conn.close()
+
+
+# ── functional tests: background reindex (new/changed/deleted files) ──
+
+
+def _symbol_names(conn, config_hash: str) -> set[str]:
+    """Return the set of symbol names for a given config_hash."""
+    return {
+        r["name"]
+        for r in conn.execute(
+            "SELECT name FROM symbols WHERE config_hash = ?", (config_hash,)
+        ).fetchall()
+    }
+
+
+@pytest.mark.libclang
+class TestBackgroundReindex:
+    """End-to-end tests: index → change files → reindex via ``fw-context index --no-build``.
+
+    These verify the behaviour the background reindex subprocess relies on:
+    same compile_commands.json, stale source files → re-run indexer → verify.
+    """
+
+    def test_reindex_after_modifying_file(self, indexed_project: Path):
+        """Modify a function body → reindex via reindex_file_impl → symbols updated.
+
+        Uses ``reindex_file_impl`` (same code path as the background file watcher)
+        to avoid the mtime-tolerance race inherent in the full-indexer path.
+        """
+        from fw_context_mcp.mcp.handlers.maintenance import reindex_file_impl
+
+        db_path = _db_path_for_project(indexed_project)
+
+        # ── Verify initial state ──
+        conn = open_db(db_path)
+        try:
+            ch_before = _config_hash(conn)
+            row = conn.execute(
+                "SELECT line, end_line FROM symbols WHERE config_hash=? AND name='modem_send'",
+                (ch_before,),
+            ).fetchone()
+            assert row is not None, "modem_send not found in index"
+            old_end_line = row["end_line"]
+            print(f"  modem_send before: line={row['line']}, end_line={old_end_line}")
+        finally:
+            conn.close()
+
+        # ── Modify modem.c — replace modem_send body with more lines ──
+        modem_c = indexed_project / "src" / "modem.c"
+        original = modem_c.read_text(encoding="utf-8")
+        modified = original.replace(
+            "int modem_send(const char* data, int len) {\n    if (!data || len <= 0) return -1;\n    return len;\n}",
+            "int modem_send(const char* data, int len) {\n    if (!data || len <= 0) return -1;\n    /* send data over UART */\n    for (int i = 0; i < len; i++) {\n        uart_putc(data[i]);\n    }\n    return len;\n}",
+        )
+        assert modified != original, "Modification didn't change the file"
+        modem_c.write_text(modified, encoding="utf-8")
+
+        try:
+            # ── Reindex the single file (same path the bg watcher uses) ──
+            result = reindex_file_impl("src/modem.c", str(indexed_project), with_analysis=False)
+            assert "error" not in result, f"Reindex failed: {result.get('error')}"
+            assert result["symbols_updated"] > 0, f"No symbols updated: {result}"
+            print(f"  Reindex result: symbols_updated={result['symbols_updated']}")
+
+            # ── Verify: modem_send end_line increased (body is longer) ──
+            conn = open_db(db_path)
+            try:
+                ch_after = _config_hash(conn)
+                assert ch_after == ch_before, (
+                    f"config_hash changed unexpectedly: {ch_before[:12]} → {ch_after[:12]}"
+                )
+                row = conn.execute(
+                    "SELECT line, end_line FROM symbols WHERE config_hash=? AND name='modem_send'",
+                    (ch_after,),
+                ).fetchone()
+                assert row is not None, "modem_send disappeared after reindex"
+                assert row["end_line"] > old_end_line, (
+                    f"modem_send end_line didn't grow: {row['end_line']} (was {old_end_line})"
+                )
+                print(f"  modem_send after: line={row['line']}, end_line={row['end_line']}")
+            finally:
+                conn.close()
+        finally:
+            modem_c.write_text(original, encoding="utf-8")
+
+    def test_reindex_picks_up_new_file(self, indexed_project: Path):
+        """Add a new .c file + update cc.json → reindex → new symbols appear."""
+        import json
+
+        db_path = _db_path_for_project(indexed_project)
+
+        # ── Verify initial state — no "sensor" symbols ──
+        conn = open_db(db_path)
+        try:
+            ch_before = _config_hash(conn)
+            names_before = _symbol_names(conn, ch_before)
+            assert "sensor_read" not in names_before, "sensor_read already exists"
+            assert "sensor_init" not in names_before
+        finally:
+            conn.close()
+
+        # ── Create new source file ──
+        sensor_c = indexed_project / "src" / "sensor.c"
+        _write_file(
+            sensor_c,
+            """\
+#include "modem.h"
+
+static int g_sensor_value = 0;
+
+void sensor_init(int threshold) {
+    g_sensor_value = threshold;
+}
+
+int sensor_read(void) {
+    return g_sensor_value;
+}
+""",
+        )
+
+        # ── Add to compile_commands.json ──
+        cc_json = indexed_project / "compile_commands.json"
+        cc = json.loads(cc_json.read_text(encoding="utf-8"))
+        cc.append({
+            "directory": str(indexed_project / "src"),
+            "file": "sensor.c",
+            "arguments": [
+                "gcc", "-std=c11", "-O2", "-Isrc", "-c", "sensor.c", "-o", "build/sensor.o",
+            ],
+        })
+        cc_json.write_text(json.dumps(cc, indent=2), encoding="utf-8")
+
+        try:
+            # ── Reindex via direct API (avoids subprocess config complications) ──
+            from fw_context_mcp.indexer.runner import run
+
+            db_path_resolved = _db_path_for_project(indexed_project)
+            config_hash_new = run(
+                compile_commands=cc_json,
+                db_path=db_path_resolved,
+                source_roots=[],
+                exclude_paths=[],
+                project_root=indexed_project,
+                index_refs=False,
+                index_embeddings=False,
+                analyze_symbols=False,
+                analyze_files=False,
+                analyze_overrides=False,
+            )
+            print(f"  New config_hash: {config_hash_new[:16]}…")
+
+            # ── Verify: new symbols in index ──
+            conn = open_db(db_path)
+            try:
+                names_after = _symbol_names(conn, config_hash_new)
+                assert "sensor_init" in names_after, f"sensor_init not found. Names: {sorted(names_after)}"
+                assert "sensor_read" in names_after, "sensor_read not found"
+                # Old symbols still present under new config_hash
+                for name in ["modem_init", "modem_send", "compute_checksum", "main"]:
+                    assert name in names_after, f"{name} lost after reindex"
+            finally:
+                conn.close()
+        finally:
+            # Restore original cc.json
+            cc = cc[:-1]
+            cc_json.write_text(json.dumps(cc, indent=2), encoding="utf-8")
+
+    def test_reindex_removes_deleted_file_symbols(self, indexed_project: Path):
+        """Remove a .c file from cc.json → reindex → symbols from that file gone from new config."""
+        import json
+
+        from fw_context_mcp.indexer.runner import run
+
+        db_path = _db_path_for_project(indexed_project)
+
+        # ── Verify initial state — utils.c symbols exist ──
+        conn = open_db(db_path)
+        try:
+            ch_before = _config_hash(conn)
+            names_before = _symbol_names(conn, ch_before)
+            assert "compute_checksum" in names_before
+            assert "log_message" in names_before
+            print(f"  config_hash before: {ch_before[:16]}…")
+        finally:
+            conn.close()
+
+        # ── Remove utils.c from compile_commands.json ──
+        cc_json = indexed_project / "compile_commands.json"
+        cc = json.loads(cc_json.read_text(encoding="utf-8"))
+        cc_original = list(cc)
+        cc = [entry for entry in cc if entry["file"] != "utils.c"]
+        assert len(cc) == len(cc_original) - 1, "utils.c not removed from cc"
+        cc_json.write_text(json.dumps(cc, indent=2), encoding="utf-8")
+
+        try:
+            # ── Reindex via direct API ──
+            config_hash_new = run(
+                compile_commands=cc_json,
+                db_path=db_path,
+                source_roots=[],
+                exclude_paths=[],
+                project_root=indexed_project,
+                index_refs=False,
+                index_embeddings=False,
+                analyze_symbols=False,
+                analyze_files=False,
+                analyze_overrides=False,
+            )
+            print(f"  New config_hash: {config_hash_new[:16]}…")
+
+            # ── Verify: utils.c definitions gone from the NEW build config ──
+            # Note: declarations from utils.h (included by main.c) may still
+            # appear under the new config_hash — only definitions should be gone.
+            assert config_hash_new != ch_before, "config_hash should change when cc.json changes"
+            conn = open_db(db_path)
+            try:
+                def_names = {
+                    r["name"]
+                    for r in conn.execute(
+                        "SELECT name FROM symbols WHERE config_hash=? AND is_definition=1",
+                        (config_hash_new,),
+                    ).fetchall()
+                }
+                assert "compute_checksum" not in def_names, (
+                    f"compute_checksum definition should be gone. Defs: {sorted(def_names)}"
+                )
+                assert "log_message" not in def_names, "log_message definition should be gone"
+                # Other files' definitions still present
+                for name in ["modem_init", "modem_send", "main"]:
+                    assert name in def_names, f"{name} definition lost after reindex"
+            finally:
+                conn.close()
+        finally:
+            cc_json.write_text(json.dumps(cc_original, indent=2), encoding="utf-8")

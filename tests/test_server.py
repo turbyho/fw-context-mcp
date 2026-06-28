@@ -428,7 +428,7 @@ class TestFallbackToSearchCode:
     """Test _fallback_to_search_code error handling and stale detection."""
 
     def test_missing_db_returns_graceful_error(self):
-        """When no index exists, fallback returns structured error."""
+        """When no index exists, fallback returns structured error as list[dict]."""
         from fw_context_mcp.mcp.shared.fallback import _fallback_to_search_code
 
         nonexistent = Path("/tmp/nonexistent_fwctx_test.db")
@@ -439,10 +439,12 @@ class TestFallbackToSearchCode:
             limit=10,
             warning="Test warning",
         )
-        assert isinstance(result, dict)
-        assert "error" in result, f"Expected error dict, got {result}"
+        assert isinstance(result, list), f"Expected list, got {type(result)}"
+        assert len(result) == 1, f"Expected 1-item list, got {len(result)}"
+        assert isinstance(result[0], dict)
+        assert "error" in result[0], f"Expected error dict, got {result[0]}"
         # Error must mention the DB path so the user/LLM knows what's wrong
-        err_msg = str(result.get("error", ""))
+        err_msg = str(result[0].get("error", ""))
         assert "nonexistent" in err_msg.lower() or "index" in err_msg.lower(), (
             f"Error message should be descriptive, got: {err_msg}"
         )

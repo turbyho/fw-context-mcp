@@ -6,8 +6,6 @@ import os
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-import pytest
-
 from fw_context_mcp.mcp.shared.context import _detect_build_system, _is_stale
 
 
@@ -16,7 +14,7 @@ class TestIsStale:
         cc = tmp_path / "compile_commands.json"
         cc.write_text("[]")
         # Touch the file to set a mtime
-        cc_mtime = cc.stat().st_mtime
+        _ = cc.stat().st_mtime
 
         cfg = {
             "created_at": (datetime.now(UTC) - timedelta(hours=1)).isoformat(),

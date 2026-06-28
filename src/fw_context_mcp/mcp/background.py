@@ -12,6 +12,8 @@ import threading
 import time
 from pathlib import Path
 
+from watchfiles import watch
+
 from ..config import derive_project_id
 from ..config import load as load_config
 from ..indexer.compile_commands import parse as parse_cc
@@ -67,8 +69,6 @@ def _start_bg_watcher(root: Path) -> None:
     lock_file.write_text(str(os.getpid()))
 
     def _watch_loop() -> None:
-
-        from watchfiles import watch
 
         from ..handlers.maintenance import reindex_file_impl
         from ..indexer.runner import _build_file_analysis, _build_llm_analysis

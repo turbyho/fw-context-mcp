@@ -4,8 +4,6 @@ from __future__ import annotations
 
 from pathlib import Path
 
-import pytest
-
 from fw_context_mcp.indexer.ops import _compute_content_hash, _read_body, _read_file_lines
 
 

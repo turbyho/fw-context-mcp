@@ -127,22 +127,6 @@ fw-context export --no-refs           # symbols only
 The format is `fw-context-export/1` — suitable for sharing between machines,
 debugging, or as input to other tools.
 
-### `fw-context watch`
-
-Watch project files and auto-reindex on changes.
-
-```bash
-fw-context watch                      # watch current project
-fw-context watch --debounce 3000      # 3-second debounce (default: 2000 ms)
-```
-
-Monitors `.c`, `.cpp`, `.h`, `.hpp` files. Uses `watchfiles` for efficient
-filesystem events. Press `Ctrl+C` to stop.
-
-```bash
-pip install "fw-context-mcp[watch]"   # install watch dependency
-```
-
 ### `fw-context analyze`
 
 Run LLM symbol analysis on an already-indexed project. Useful when the

@@ -2,9 +2,7 @@
 
 from __future__ import annotations
 
-import pytest
-
-from fw_context_mcp.search.did_you_mean import _tokenize, _token_score, suggest
+from fw_context_mcp.search.did_you_mean import _token_score, _tokenize, suggest
 
 
 class TestTokenize:
@@ -137,7 +135,6 @@ class TestSuggest:
 
     def test_cache_hit_same_config_hash(self, populated_db, monkeypatch):
         """Verify _cache is used — second call with same query is instant."""
-        import time
         from fw_context_mcp.search import did_you_mean
 
         # Clear cache first

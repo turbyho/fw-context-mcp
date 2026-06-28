@@ -4,8 +4,6 @@ from __future__ import annotations
 
 from pathlib import Path
 
-import pytest
-
 from fw_context_mcp.mcp.shared.filtering import (
     _build_sdk_excludes,
     _merge_excludes,

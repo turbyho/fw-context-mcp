@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import pytest
-
 from fw_context_mcp.search.phases.refine import _parse_search_terms
 
 

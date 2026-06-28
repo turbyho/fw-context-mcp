@@ -260,22 +260,22 @@ def get_template_instances(
     """
     db_path, cfg, project_id, root = _resolve_context(project_root)
     if not db_path.exists():
-        return {"error": f"No index found for {root}. Run 'fw-context index' first."}
+        return [{"error": f"No index found for {root}. Run 'fw-context index' first."}]
     conn, err = _open_db_safe(db_path)
     if err:
-        return err
+        return [err]
     assert conn is not None
     try:
         with conn:
             cfg_data = get_active_config(conn, project_id)
             if not cfg_data:
-                return {"error": "No build config indexed."}
+                return [{"error": "No build config indexed."}]
             config_hash = cfg_data["config_hash"]
             row = _lookup_definition(conn, config_hash, template_name)
             if not row:
-                return {"error": f"Symbol not found: {template_name}"}
+                return [{"error": f"Symbol not found: {template_name}"}]
             if not row["is_template"]:
-                return {"error": f"'{template_name}' is not a template (kind: {row['kind']}, is_template: false)."}
+                return [{"error": f"'{template_name}' is not a template (kind: {row['kind']}, is_template: false)."}]
 
             template_usr = row["usr"]
             instances = query_template_instances(conn, config_hash, template_usr, limit=limit)

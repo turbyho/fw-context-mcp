@@ -81,7 +81,7 @@ def _auto_reindex_stale(
         if time.monotonic() - t0 > timeout_s:
             break
         try:
-            result = reindex_file_impl(fp, project_root, with_analysis=False)
+            result = reindex_file_impl(fp, str(project_root), with_analysis=False)
             if result.get("error"):
                 failed.append(fp)
             else:
@@ -111,14 +111,14 @@ def _with_stale_recovery(
 
     conn, err = _open_db_safe(db_path)
     if err:
-        return err
+        return [err]
     assert conn is not None
     try:
         with conn:
             project_id = derive_project_id(root)
             cfg = get_active_config(conn, project_id)
             if not cfg:
-                return {"error": "No build config indexed."}
+                return [{"error": "No build config indexed."}]
             config_hash = cfg["config_hash"]
             result_rows = query_fn(conn, config_hash)
             # Ensure plain dicts — sqlite3.Row objects become invalid after conn.close()
