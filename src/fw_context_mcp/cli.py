@@ -763,10 +763,10 @@ def main() -> None:
 
     p_index = sub.add_parser("index", help="Build the symbol index from compile_commands.json (generates it from a clean build by default)")
     p_index.add_argument("compile_commands", nargs="?", default=None, metavar="compile_commands.json",
-                         help="Use an existing compile_commands.json (skips build)")
+                         help="Use an existing compile_commands.json (skips build, enables incremental re-index)")
     p_index.add_argument("--project", metavar="DIR", help="Project root (default: cwd)")
-    p_index.add_argument("--no-build", action="store_true", help="Skip build — use existing compile_commands.json")
-    p_index.add_argument("--no-clean", action="store_true", help="Skip clean build (incremental — may produce incomplete index)")
+    p_index.add_argument("--no-build", action="store_true", help="Skip build — reuse existing compile_commands.json for incremental re-index")
+    p_index.add_argument("--no-clean", action="store_true", help="Skip clean build (incremental build — may produce incomplete compile_commands.json)")
     p_index.add_argument("--source-roots", nargs="+", metavar="DIR")
     p_index.add_argument("--name", metavar="NAME", help="Project name override")
     p_index.add_argument("--no-refs", action="store_true", help="Skip cross-reference indexing (on by default)")

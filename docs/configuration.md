@@ -34,10 +34,16 @@ All files are auto-created with commented-out defaults on first use.
 Controls how `fw-context index` generates `compile_commands.json`.
 Used only when running without `--no-build`.
 
+> **⚠️ Every `fw-context index` without `--no-build` triggers a full
+> re-index** — the build step regenerates ``compile_commands.json``,
+> which produces a new config hash, so every translation unit is
+> re-parsed from scratch.  For fast incremental indexing (seconds),
+> use ``fw-context index --no-build`` after the initial run.
+
 | Key | Default | Scope | Description |
 |-----|---------|-------|-------------|
 | `system` | *(auto-detect)* | project | Build system: `"mbed-os"`, `"zephyr"`, `"platformio"`. Auto-detected from project markers (`west.yml`, `.mbed`, `platformio.ini`, etc.) |
-| `clean` | `true` | project | Always do a clean build before generating. **Recommended** — ensures complete `compile_commands.json`. Set `false` or use `--no-clean` for incremental builds. |
+| `clean` | `true` | project | Always do a clean build before generating. **Recommended** — ensures complete `compile_commands.json`. Set `false` or use `--no-clean` for incremental builds. Note: a clean build forces a full re-index. |
 | `command` | *(none)* | project | Full build command override. Bypasses all auto-detection. Example: `"bear -- make -j4"`. |
 | `target` | *(auto-detect)* | project | Mbed OS target board. Auto-detected from `.mbed` or `custom_targets.json`. |
 | `toolchain` | *(auto-detect)* | project | Mbed OS toolchain. Auto-detected from `.mbed`. |

@@ -8,9 +8,17 @@ Complete reference for all fw-context CLI commands and MCP server tools.
 
 Build or update the symbol index from `compile_commands.json`.
 
+> **⚠️ Without `--no-build`, every run does a full re-index.** The clean build
+> regenerates `compile_commands.json` → new config hash → every translation
+> unit re-parsed from scratch.  For fast incremental indexing (only changed
+> files, seconds), always use `--no-build` after the initial run.
+
 ```bash
-# Default: everything on (refs + embeddings + LLM analysis)
+# First run — auto-detects build system, clean build, full index:
 fw-context index
+
+# Subsequent runs — skip build, incremental (only changed files):
+fw-context index --no-build
 
 # Explicit path, verbose
 fw-context index compile_commands.json -v
@@ -30,8 +38,10 @@ fw-context index --source-roots src lib drivers
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `compile_commands.json` | from config | Path to the compilation database |
+| `compile_commands.json` | from config | Path to the compilation database (skips build — incremental) |
 | `--project DIR` | `.` | Project root directory |
+| `--no-build` | off | Skip build — reuse existing `compile_commands.json` for incremental re-index |
+| `--no-clean` | off | Skip clean build (incremental build — may produce incomplete index) |
 | `--source-roots DIR…` | auto-detected | Directories to index symbols from |
 | `--name NAME` | directory name | Project name override |
 | `--no-refs` | off | Skip cross-reference / call graph indexing |
