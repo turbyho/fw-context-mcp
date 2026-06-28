@@ -1,4 +1,4 @@
-"""Phase 2a: LLM generates FTS5 search terms from query + sample symbols."""
+"""Phase 2: LLM generates FTS5 search terms from query + sample symbols."""
 
 from __future__ import annotations
 
@@ -114,7 +114,7 @@ class LLMQueryPhase(Phase):
 
 
 def _parse_understanding_response(raw: str) -> tuple[str, list[str]]:
-    """Parse Phase 2a LLM response into (understanding, queries)."""
+    """Parse Phase 2 LLM response into (understanding, queries)."""
     understanding = ""
     queries: list[str] = []
     und_match = re.search(r"UNDERSTANDING:\s*(.+?)(?:\n|$)", raw, re.IGNORECASE)

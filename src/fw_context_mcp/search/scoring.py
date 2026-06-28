@@ -25,13 +25,18 @@ KIND_WEIGHT: dict[str, int] = {
 
 
 def _is_project_local(fpath: str, source_roots: list[str] | None) -> bool:
-    """Check whether *fpath* is under one of the project source roots."""
+    """Check whether *fpath* is under one of the project source roots.
+
+    Uses case-sensitive comparison on Linux (correct for the filesystem);
+    on case-insensitive filesystems the paths will already match in the
+    correct case from ``compile_commands.json``.
+    """
     if not source_roots or not fpath:
         return False
-    fpath_lower = fpath.lower()
+    fpath_normalized = fpath.rstrip("/")
     for root in source_roots:
-        root_lower = root.lower().rstrip("/")
-        if fpath_lower.startswith(root_lower + "/") or fpath_lower == root_lower:
+        root_normalized = root.rstrip("/")
+        if fpath_normalized.startswith(root_normalized + "/") or fpath_normalized == root_normalized:
             return True
     return False
 

@@ -1,4 +1,4 @@
-"""Phase 2b: LLM checks first-round results and refines queries if needed."""
+"""Phase 3: LLM checks first-round results and refines queries if needed."""
 
 from __future__ import annotations
 
@@ -75,6 +75,9 @@ class RefinePhase(Phase):
         try:
             raw = await call_ollama_async(refine_prompt, ctx.config.llm)
             refined = _parse_search_terms(raw)[:5]
+            # Sanitize LLM-generated tokens — same pattern as H9 in fts5_search.py
+            _SAFE_TOKEN = re.compile(r"^[\w*]+$")
+            refined = [t for t in refined if _SAFE_TOKEN.match(t)]
             if refined:
                 all_queries = ctx.generated_queries + refined
                 cache_key = (ctx.query, ctx.config_hash)

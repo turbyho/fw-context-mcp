@@ -84,8 +84,7 @@ When working on the `fw-context-mcp` source code itself, do NOT use
 lean-ctx for C/C++ code.
 """
 
-NO_LEAN_CTX_CARVEOUT = """\
-"""
+NO_LEAN_CTX_CARVEOUT = ""
 
 # Marker tags for marked-section injection
 MARKER_START = "<!-- fw-context -->"
@@ -282,7 +281,6 @@ class Collision:
         self.has_marked_section = False
         self.has_unmarked_content = False
         self.is_skillshare_managed = False
-        self.existing_marker_content: str | None = None
 
     @property
     def is_clean(self) -> bool:
@@ -332,13 +330,6 @@ def check_target(target: InstructionTarget, project_root: Path | None = None) ->
     # Check for marked section
     if MARKER_START in content and MARKER_END in content:
         collision.has_marked_section = True
-        # Extract existing content between markers for diff display
-        try:
-            start = content.index(MARKER_START) + len(MARKER_START)
-            end = content.index(MARKER_END)
-            collision.existing_marker_content = content[start:end].strip()
-        except ValueError:
-            pass
         return collision
 
     # Check for unmarked fw-context content (keyword density)

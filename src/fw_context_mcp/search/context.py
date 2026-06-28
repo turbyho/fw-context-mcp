@@ -38,26 +38,25 @@ class PipelineContext:
     rough_queries: list[str] = field(default_factory=list)
     rough_samples: list[dict] = field(default_factory=list)
 
-    # ── Phase 2a output ───────────────────────────────────────────────────
+    # ── Phase 2 output ────────────────────────────────────────────────────
     llm_understanding: str = ""
     generated_queries: list[str] = field(default_factory=list)
 
-    # ── Phase 3 output ────────────────────────────────────────────────────
+    # ── Phase 4 output ────────────────────────────────────────────────────
     fts5_results: list[dict] = field(default_factory=list)
 
-    # ── Phase 4 output ────────────────────────────────────────────────────
+    # ── Phase 5 output ────────────────────────────────────────────────────
     embedding_results: list[dict] = field(default_factory=list)
 
-    # ── Phase 5 output ────────────────────────────────────────────────────
+    # ── Phase 6 output ────────────────────────────────────────────────────
     final_results: list[dict] = field(default_factory=list)
 
-    # ── Phase 6 output ────────────────────────────────────────────────────
+    # ── Phase 7 output ────────────────────────────────────────────────────
     formatted_results: list[dict] = field(default_factory=list)
 
     # ── metadata / warnings ───────────────────────────────────────────────
     ollama_warning: dict | None = None
     warnings: list[str] = field(default_factory=list)
-    metadata: dict = field(default_factory=dict)
 
     # ── helpers ───────────────────────────────────────────────────────────
 

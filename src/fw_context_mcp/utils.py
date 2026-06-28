@@ -43,7 +43,7 @@ def abs_path(root: Path, path: str) -> str:
     against empty paths before calling).
     """
     if not path:
-        return path
+        return ""  # Empty path — caller should guard before calling
     p = Path(path)
     if p.is_absolute():
         return str(p)

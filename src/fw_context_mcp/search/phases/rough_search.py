@@ -18,7 +18,15 @@ from fw_context_mcp.search.phases.base import Phase
 if TYPE_CHECKING:
     from fw_context_mcp.search.context import PipelineContext
 
+from fw_context_mcp.search.phases.embedding_helpers import (
+    brute_force_search,
+    table_exists,
+    table_has_rows,
+)
+
 log = logging.getLogger(__name__)
+
+_table_exists = table_exists  # backward-compat alias
 
 # Words that add no search signal
 _STOP_WORDS = frozenset({
@@ -162,16 +170,7 @@ async def _try_embedding_samples(ctx) -> list[dict] | None:
                 stored = get_embeddings(conn, ctx.config_hash, ctx.config.llm.embed_model)
                 if not stored:
                     return None
-                import math
-                scored: list[tuple[int, float]] = []
-                for sym_id, emb_vec in stored.items():
-                    dot = sum(x * y for x, y in zip(query_vec, emb_vec, strict=True))
-                    norm_a = math.sqrt(sum(x * x for x in query_vec))
-                    norm_b = math.sqrt(sum(x * x for x in emb_vec))
-                    sim = (dot / (norm_a * norm_b)) if norm_a and norm_b else 0.0
-                    if sim > threshold:
-                        scored.append((sym_id, sim))
-                scored.sort(key=lambda x: -x[1])
+                scored = brute_force_search(query_vec, stored, threshold=threshold)
                 top_ids = [s[0] for s in scored[:20]]
                 if not top_ids:
                     return None
@@ -237,6 +236,8 @@ def _fts5_rough_samples(conn, query: str, content_words: list[str], config_hash:
     rough_seen_names: set[str] = set()
 
     def _is_noise(name: str) -> bool:
+        if name.startswith("operator"):
+            return False  # valid C++ operator overloads
         if set(name) & {"(", ")", "~", "=", "<", ">", "[", "]"}:
             return True
         return len(name) <= 2
@@ -282,21 +283,4 @@ def _fts5_rough_samples(conn, query: str, content_words: list[str], config_hash:
 
 
 # ---------------------------------------------------------------------------
-# Helpers (inlined from embedding.py to avoid circular imports)
-# ---------------------------------------------------------------------------
-
-
-def _table_exists(conn, name: str) -> bool:
-    """Check whether a table or virtual table exists."""
-    row = conn.execute(
-        "SELECT 1 FROM sqlite_master WHERE name=? LIMIT 1", (name,)
-    ).fetchone()
-    return row is not None
-
-
-def _table_has_rows(conn, name: str) -> bool:
-    """Check whether a table exists and contains at least one row."""
-    if not _table_exists(conn, name):
-        return False
-    row = conn.execute(f"SELECT 1 FROM {name} LIMIT 1").fetchone()
-    return row is not None
+_table_has_rows = table_has_rows

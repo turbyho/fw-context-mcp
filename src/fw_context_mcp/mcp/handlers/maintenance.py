@@ -1,0 +1,524 @@
+"""Maintenance MCP tools — see mcp/server.py for registration."""
+
+from __future__ import annotations
+
+import logging
+import time
+from pathlib import Path
+from typing import Annotated
+
+from pydantic import Field
+
+from ...config import derive_project_id
+from ...config import load as load_config
+from ...indexer.compile_commands import parse as parse_cc
+from ...indexer.db import (
+    CURRENT_SCHEMA_VERSION,
+    DatabaseCorruptionError,
+    count_refs,
+    get_active_config,
+    get_all_projects,
+    get_db_schema_version,
+    open_db,
+    transaction,
+)
+from ...indexer.symbols import (
+    FnPointerAssignment,
+    IndirectCallSite,
+    InheritanceRecord,
+    Symbol,
+)
+from ...llm.ollama import check_setup
+from ...utils import resolve_project_root
+from ..background import _is_bg_reindex_running, _start_bg_reindex_if_stale
+from ..shared.context import _db_path, _detect_build_system, _is_stale, _open_db_safe, _resolve_context
+from ..shared.stale import _count_modified_files
+
+log = logging.getLogger(__name__)
+
+# ── moved from server.py ──
+def get_active_build(
+    project_root: Annotated[str | None, Field(description="Project root directory. Auto-detected from CWD if omitted.")] = None,
+) -> dict:
+    """Return metadata about the most recently indexed build configuration.
+
+    Read-only: yes. Call at session start to check if the index exists,
+    how many symbols it contains, and whether it is stale (needs re-index).
+
+    ``stale`` is True when any of: (1) ``compile_commands.json`` changed
+    since the last index, (2) source files were modified after indexing,
+    or (3) the index schema is older than the current code expects
+    (``schema_version < current_schema``).  Cases (1) and (2) are handled
+    transparently by auto-reindex on query; case (3) requires a full
+    ``fw-context index`` — remind the user.
+
+    When ``modified_files_count > 0``, a background ``fw-context index``
+    subprocess is spawned automatically (non-blocking, at most one at a time).
+    Queries continue to be served from the existing index while the new one
+    is being built.  ``reindex_progress`` contains the last log line from
+    the reindex subprocess when ``bg_reindex_running`` is True.
+
+    Returns:
+        dict: {config_hash, project_id, project_root, build_system,
+        compile_commands, indexed_at (ISO timestamp), symbol_count, file_count,
+        reference_count, modified_files_count (int), analyzed_symbols (int),
+        unanalyzed_symbols (int — definition symbols still needing LLM analysis),
+        analysis_model (str or None), bg_reindex_running (bool),
+        reindex_progress (str or None — last log line when reindex is running),
+        schema_version (int — DB schema version),
+        current_schema (int — code expects), stale (bool — any staleness condition)}
+    """
+    root = resolve_project_root(project_root)
+    db_path = _db_path(root)
+    if not db_path.exists():
+        return {"error": f"No index found for {root}. Run 'fw-context index' first."}
+    conn, err = _open_db_safe(db_path)
+    if err:
+        return err
+    assert conn is not None
+    try:
+        with conn:
+            project_id = derive_project_id(root)
+            cfg = get_active_config(conn, project_id)
+            if not cfg:
+                return {"error": f"No build config indexed for project at {root}."}
+            config_hash = cfg["config_hash"]
+            sym_count = conn.execute(
+                "SELECT COUNT(*) FROM symbols WHERE config_hash=?", (config_hash,)
+            ).fetchone()[0]
+            file_count = conn.execute(
+                "SELECT COUNT(*) FROM files WHERE config_hash=?", (config_hash,)
+            ).fetchone()[0]
+            ref_count = count_refs(conn, config_hash)
+            modified_count = _count_modified_files(conn, config_hash, root)
+            db_schema_ver = get_db_schema_version(conn)
+
+            # LLM analysis statistics
+            analyzed_count = conn.execute(
+                """SELECT COUNT(*) FROM llm_analysis a
+                   JOIN symbols s ON s.id = a.symbol_id
+                   WHERE s.config_hash = ?""",
+                (config_hash,),
+            ).fetchone()[0]
+            analysis_model_row = conn.execute(
+                """SELECT a.model FROM llm_analysis a
+                   JOIN symbols s ON s.id = a.symbol_id
+                   WHERE s.config_hash = ? LIMIT 1""",
+                (config_hash,),
+            ).fetchone()
+
+            # Count definition symbols that still need LLM analysis
+            unanalyzed_count = conn.execute(
+                """SELECT COUNT(*)
+                   FROM symbols s
+                   WHERE s.config_hash = ?
+                     AND s.is_definition = 1
+                     AND s.kind IN ('function', 'method', 'constructor',
+                                    'destructor', 'class', 'struct')
+                     AND s.file_path NOT LIKE 'mbed-os/%'
+                     AND s.file_path NOT LIKE '.pio/%'
+                     AND s.file_path NOT LIKE 'zephyr/%'
+                     AND s.file_path NOT LIKE 'build/%'
+                     AND s.file_path NOT LIKE 'modules/%'
+                     AND s.id NOT IN (SELECT symbol_id FROM llm_analysis)""",
+                (config_hash,),
+            ).fetchone()[0]
+
+            result: dict = {
+                "config_hash": config_hash,
+                "project_id": project_id,
+                "project_root": str(root),
+                "build_system": _detect_build_system(root),
+                "compile_commands": cfg["compile_commands_path"],
+                "indexed_at": cfg["created_at"],
+                "symbol_count": sym_count,
+                "file_count": file_count,
+                "reference_count": ref_count,
+                "modified_files_count": modified_count,
+                "schema_version": db_schema_ver,
+                "current_schema": CURRENT_SCHEMA_VERSION,
+                "analyzed_symbols": analyzed_count,
+                "unanalyzed_symbols": unanalyzed_count,
+                "analysis_model": analysis_model_row["model"] if analysis_model_row else None,
+                "stale": _is_stale(cfg, cfg["compile_commands_path"]) or modified_count > 0
+                or db_schema_ver < CURRENT_SCHEMA_VERSION,
+            }
+        if modified_count > 0 or unanalyzed_count > 0:
+            _start_bg_reindex_if_stale(root)
+        bg_running = _is_bg_reindex_running(root)
+        result["bg_reindex_running"] = bg_running
+        if bg_running:
+            log_file = db_path.parent / "reindex.log"
+            try:
+                with open(log_file) as fh:
+                    lines = fh.readlines()
+                    result["reindex_progress"] = lines[-1].strip() if lines else None
+            except (OSError, IndexError):
+                result["reindex_progress"] = None
+        return result
+    finally:
+        conn.close()
+
+# ── moved from server.py ──
+def list_projects(
+    project_root: Annotated[str | None, Field(description="Project root. Auto-detected if omitted. Pass to distinguish multiple indexed projects.")] = None,
+) -> list[dict]:
+    """List all indexed firmware projects with their statistics.
+
+    Read-only. No side effects. Use at session start to discover available
+    projects; use ``get_active_build`` for details on the currently active project.
+
+    Returns:
+        list of dicts, each with: project_id, name, root_path, build_system,
+        symbol_count, file_count, indexed_at, schema_version, current_schema,
+        stale (bool), db (path to SQLite database file).
+    """
+    cfg = load_config(project_root=Path(project_root).resolve() if project_root else None)
+    index_dir = cfg.index.db_dir
+    db_files = list(index_dir.glob("*/index.db")) if index_dir.exists() else []
+    if not db_files:
+        return [{"info": f"No indexed projects found under {index_dir}."}]
+    results: list[dict] = []
+    for db_path in sorted(db_files):
+        try:
+            conn, err = _open_db_safe(db_path)
+            if err:
+                results.append(err)
+                continue
+            assert conn is not None
+            try:
+                with conn:
+                    rows = get_all_projects(conn)
+                    db_schema_ver = get_db_schema_version(conn)
+            finally:
+                conn.close()
+            for r in rows:
+                cc_stale = _is_stale(
+                    {"created_at": r["created_at"]},
+                    r["compile_commands_path"],
+                ) if r["compile_commands_path"] else False
+                root = Path(r["root_path"]) if r["root_path"] else None
+                results.append({
+                    "project_id": r["project_id"],
+                    "name": r["name"],
+                    "root_path": r["root_path"],
+                    "build_system": _detect_build_system(root) if root else "unknown",
+                    "symbol_count": r["symbol_count"],
+                    "file_count": r["file_count"],
+                    "indexed_at": r["created_at"],
+                    "schema_version": db_schema_ver,
+                    "current_schema": CURRENT_SCHEMA_VERSION,
+                    "stale": cc_stale or db_schema_ver < CURRENT_SCHEMA_VERSION,
+                    "db": str(db_path),
+                })
+        except Exception as e:
+            results.append({"db": str(db_path), "error": str(e)})
+    return results
+
+# ── moved from server.py ──
+def reset_index(
+    project_root: Annotated[str | None, Field(description="Project root. Auto-detected if omitted.")] = None,
+    confirm: Annotated[bool, Field(description="Must be True to execute. Call without confirm first as dry-run.")] = False,
+) -> dict:
+    """Delete the entire symbol index for a project.
+
+    Not read-only — permanently deletes the SQLite database and WAL files.
+    Call with ``confirm=False`` first (dry-run) to see what would be deleted.
+    Re-index with ``fw-context index`` afterwards.
+
+    Handles corrupt databases gracefully — you can delete a corrupt index
+    without needing to open it first.
+
+    Args:
+        project_root: Project root directory. Auto-detected if omitted.
+        confirm: Must be True to execute. Call without first as dry-run.
+
+    Returns:
+        dict: {project_root, db, project_id, action: "dry_run"|"deleted",
+        message, symbol_count, indexed_at (dry-run)}.
+    """
+    root = resolve_project_root(project_root)
+    db_path = _db_path(root)
+    if not db_path.exists():
+        return {"error": f"No index found for {root}. Nothing to reset."}
+    project_id = derive_project_id(root)
+    cfg_data = None
+    sym_count = 0
+    corrupt = False
+    try:
+        conn = open_db(db_path)
+    except DatabaseCorruptionError:
+        corrupt = True
+    else:
+        try:
+            with conn:
+                cfg_data = get_active_config(conn, project_id)
+                if cfg_data:
+                    sym_count = conn.execute(
+                        "SELECT COUNT(*) FROM symbols WHERE config_hash=?",
+                        (cfg_data["config_hash"],),
+                    ).fetchone()[0]
+        finally:
+            conn.close()
+    info: dict[str, object] = {
+        "project_root": str(root),
+        "db": str(db_path),
+        "project_id": project_id,
+    }
+    if cfg_data:
+        info["symbol_count"] = sym_count
+        info["indexed_at"] = cfg_data["created_at"]
+    elif corrupt:
+        info["warning"] = "Database is corrupt — integrity check failed."
+    if not confirm:
+        info["action"] = "dry_run"
+        if corrupt:
+            info["message"] = (
+                f"Database at {db_path} is corrupt. "
+                "Call reset_index(confirm=True) to delete it anyway, "
+                "then run 'fw-context index' to rebuild."
+            )
+        else:
+            info["message"] = (
+                f"Would delete {db_path}. "
+                "Call reset_index(confirm=True) to proceed."
+            )
+        return info
+    db_path.unlink()
+    for suffix in ("-wal", "-shm"):
+        p = db_path.with_name(db_path.name + suffix)
+        if p.exists():
+            p.unlink()
+    info["action"] = "deleted"
+    info["message"] = f"Index deleted. Run 'fw-context index' in {root} to rebuild."
+    return info
+
+# ── moved from server.py ──
+def reindex_file_impl(
+    file_path: str,
+    project_root: str | None = None,
+    *,
+    with_analysis: bool = True,
+) -> dict:
+    """Re-parse a single source file with libclang and update its symbols in the index.
+
+    Shared implementation used by ``reindex_file`` (public tool, full analysis) and
+    ``_auto_reindex_stale`` (background fast path, no LLM). Prefer ``reindex_file``
+    for interactive use; call this directly only when you need to control
+    *with_analysis* explicitly.
+
+    Requires an existing index (``fw-context index`` must have been run first).
+    The file must appear in ``compile_commands.json`` — header-only files are
+    re-indexed via the ``.cpp`` translation unit that includes them.
+
+    Args:
+        file_path: Absolute or project-relative path to the source file to
+            re-parse. Must have a matching entry in compile_commands.json.
+        project_root: Project root directory. Auto-detected from cwd if omitted.
+        with_analysis: When True (default), also regenerates LLM symbol analysis,
+            file-level summaries, and method override relationships — slower but
+            produces a fully up-to-date index. Set to False for a fast
+            symbol-only update (used by background auto-reindex).
+
+    Returns:
+        On success — dict with keys:
+            file (str): Resolved absolute path to the re-indexed file.
+            translation_units (int): Number of TUs that include this file.
+            symbols_updated (int): Number of symbols written/updated.
+            elapsed_s (float): Parse + store time in seconds.
+            analysis_updated (int, optional): Symbol count with fresh LLM
+                analysis (only present when LLM analysis is enabled and
+                with_analysis=True).
+            analysis_warning (str, optional): Reason LLM analysis was skipped.
+            overrides_warning (str, optional): Reason override analysis was skipped.
+            warning (str, optional): Header re-indexed via a single TU — other
+                TUs including this header may still have stale symbols; run
+                ``fw-context index`` for full accuracy.
+        On error — dict with key:
+            error (str): Human-readable reason (no index found, file not found,
+                file not in compile_commands.json, no build config indexed).
+    """
+    db_path, cfg, project_id, root = _resolve_context(project_root)
+    if not db_path.exists():
+        return {"error": f"No index found for {root}. Run 'fw-context index' first."}
+    conn, err = _open_db_safe(db_path)
+    if err:
+        return err
+    assert conn is not None
+    try:
+        cfg_data = get_active_config(conn, project_id)
+        if not cfg_data:
+            return {"error": "No build config indexed."}
+        target = Path(file_path)
+        if not target.is_absolute():
+            target = (root / target).resolve()
+        else:
+            target = target.resolve()
+        if not target.exists():
+            return {"error": f"File not found: {target}"}
+        cc_path = Path(cfg_data["compile_commands_path"])
+        if not cc_path.exists():
+            return {"error": f"compile_commands.json not found: {cc_path}"}
+        units = parse_cc(cc_path)
+        matching = [u for u in units if Path(u.file).resolve() == target]
+        if not matching:
+            return {"error": f"{target.name} not found in compile_commands.json — it may be a header-only file."}
+        config_hash = cfg_data["config_hash"]
+        source_roots = cfg.source_root_paths(root)
+        exclude_paths = cfg.exclude_root_paths(root)
+
+        from ...indexer.compile_commands import CompilationUnit as TU
+        from ...indexer.db import write_lock as db_write_lock
+        from ...indexer.ops import store_symbols_for_unit
+        from ...indexer.symbols import (
+            Reference,
+            extract_all,
+        )
+        from ..background import _request_bg_reindex_pause, _resume_bg_reindex
+
+        # ── Parse outside the write lock ──
+        # libclang is CPU-bound; running it inside the lock serialises
+        # parsing when multiple TUs match (e.g. reindexing a header
+        # included by several .cpp files).
+        parsed_units: list[tuple[TU, tuple[list[Symbol], list[Reference], list[InheritanceRecord], list[IndirectCallSite], list[FnPointerAssignment]]]] = []
+        for unit in matching:
+            try:
+                parsed = extract_all(
+                    unit,
+                    source_roots=source_roots,
+                    exclude_paths=exclude_paths,
+                    with_refs=cfg.index.index_refs,
+                )
+                parsed_units.append((unit, parsed))
+            except Exception as exc:
+                log.warning("skip TU %s during reindex: %s", unit.file.name, exc)
+
+        # Request bg reindex to pause — manual operations take priority.
+        # The bg process checks for the pause marker between TUs and
+        # releases the write lock, allowing this operation to proceed
+        # without erroring or killing anything.
+        _request_bg_reindex_pause(root)
+
+        t0 = time.monotonic()
+        total_symbols = 0
+
+        try:
+            with db_write_lock(db_path.parent, timeout=60.0):
+                # ── Phase 1: main symbol write ──
+                for unit, parsed in parsed_units:
+                    with transaction(conn):
+                        syms_added, _ = store_symbols_for_unit(
+                            conn, unit, config_hash, root,
+                            source_roots=source_roots,
+                            exclude_paths=exclude_paths,
+                            index_refs=cfg.index.index_refs,
+                            pre_parsed=parsed,
+                        )
+                        total_symbols += syms_added
+
+                elapsed = round(time.monotonic() - t0, 2)
+                result: dict = {
+                    "file": str(target),
+                    "translation_units": len(matching),
+                    "symbols_updated": total_symbols,
+                    "elapsed_s": elapsed,
+                }
+
+                if not with_analysis:
+                    return result
+
+                # ── Phase 2: LLM analysis ──
+                if cfg.llm.enabled and cfg.llm.analyze_symbols and total_symbols > 0:
+                    try:
+                        from ...indexer.runner import _build_file_analysis, _build_llm_analysis
+                        _build_llm_analysis(conn, config_hash, cfg.llm, db_path.parent, write_lock_held=True)
+                        if cfg.llm.analyze_files:
+                            _build_file_analysis(conn, config_hash, cfg.llm, db_path.parent, write_lock_held=True)
+                        conn.commit()
+                        analyzed_count = conn.execute(
+                            "SELECT COUNT(*) FROM llm_analysis a JOIN symbols s ON s.id = a.symbol_id WHERE s.config_hash = ?",
+                            (config_hash,),
+                        ).fetchone()[0]
+                        result["analysis_updated"] = analyzed_count
+                    except Exception as exc:
+                        result["analysis_warning"] = f"LLM analysis skipped: {exc}"
+
+                # ── Phase 3: method override graph ──
+                if total_symbols > 0:
+                    try:
+                        from ...indexer.runner import _build_overrides
+                        _build_overrides(conn, config_hash, db_path.parent, write_lock_held=True)
+                        conn.commit()
+                    except Exception as exc:
+                        result["overrides_warning"] = f"Override analysis skipped: {exc}"
+
+                if len(matching) == 1 and target.suffix.lower() in {".h", ".hpp"}:
+                    result["warning"] = "Header re-indexed via one TU. Other TUs including this header may still have stale symbols — run 'fw-context index' for full accuracy."
+
+                return result
+        finally:
+            _resume_bg_reindex(root)
+    finally:
+        conn.close()
+
+# ── moved from server.py ──
+def reindex_file(
+    file_path: Annotated[str, Field(description="Path to source file to re-parse. Must be in compile_commands.json.")],
+    project_root: Annotated[str | None, Field(description="Project root. Auto-detected if omitted.")] = None,
+) -> dict:
+    """Re-parse a single source file with libclang and update its symbols in the index.
+
+    Not read-only — uses the exact compiler flags from ``compile_commands.json``.
+    The file must be listed in ``compile_commands.json`` (headers are re-indexed
+    via the translation unit that includes them). Use after editing a file to
+    keep the index current without a full rebuild.
+
+    Also regenerates LLM analysis and method override relationships for
+    affected symbols when those features are enabled in config.
+
+    Args:
+        file_path: Path to source file to re-parse. Must be in compile_commands.json.
+        project_root: Project root directory. Auto-detected if omitted.
+
+    Returns:
+        dict: {file, translation_units, symbols_updated, elapsed_s,
+        analysis_updated (if LLM enabled), or error}.
+    """
+    return reindex_file_impl(file_path, project_root, with_analysis=True)
+
+# ── moved from server.py ──
+def check_ollama(
+    project_root: Annotated[str | None, Field(description="Project root. Auto-detected if omitted. Ignored by this tool.")] = None,
+) -> dict:
+    """Check whether Ollama is running and the configured embedding/chat model is installed.
+
+    Read-only: yes. No side effects. Call before smart_search,
+    semantic_search, or explain_symbol (when on-demand fallback is
+    expected — pre-computed analysis returns instantly without Ollama).
+
+    Returns:
+        dict: {ollama_enabled (bool), status (str — "ok"|"disabled"|"error"|"model_missing"),
+        ollama_running (bool), ollama_url (str), configured_model (str),
+        num_ctx (int), installed_models (list[str]),
+        configured_embed_model (str), embedding_installed (bool),
+        message (str, on error/disabled), available_code_models (list[str], when model missing),
+        debug_log (str, optional — only when debug logging is enabled)}
+    """
+    _, cfg, _, _ = _resolve_context(project_root)
+    if not cfg.llm.enabled:
+        return {
+            "status": "disabled",
+            "ollama_enabled": False,
+            "ollama_running": False,
+            "configured_model": cfg.llm.model,
+            "num_ctx": cfg.llm.num_ctx,
+            "message": (
+                "Ollama is disabled in config ([llm] enabled = false). "
+                "explain_symbol with pre-computed analysis (default) returns instantly. "
+                "Without analysis, it returns source + explain_prompt for the agent to answer. "
+                "smart_search will use raw text queries."
+            ),
+        }
+    result = check_setup(cfg.llm)
+    result["ollama_enabled"] = True
+    return result

@@ -1,4 +1,4 @@
-"""Phase 6: Format results for MCP tool output."""
+"""Phase 7: Format results for MCP tool output."""
 
 from __future__ import annotations
 

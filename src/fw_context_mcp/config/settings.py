@@ -9,6 +9,7 @@ Hierarchy (later overrides earlier):
 
 from __future__ import annotations
 
+import sys
 import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -322,8 +323,12 @@ def _from_dict(data: dict) -> Config:
 def _ensure_global_config() -> Path:
     path = _GLOBAL_CONFIG_PATH
     if not path.exists():
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(_GLOBAL_DEFAULTS)
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(_GLOBAL_DEFAULTS)
+        except (OSError, PermissionError) as e:
+            import logging
+            logging.getLogger(__name__).warning("Could not create global config %s: %s", path, e)
     return path
 
 
@@ -331,8 +336,12 @@ def _ensure_project_config(project_root: Path) -> Path:
     config_dir = project_root / _PROJECT_CONFIG_DIR
     path = config_dir / _PROJECT_CONFIG_NAME
     if not path.exists():
-        config_dir.mkdir(parents=True, exist_ok=True)
-        path.write_text(_PROJECT_DEFAULTS_TEMPLATE)
+        try:
+            config_dir.mkdir(parents=True, exist_ok=True)
+            path.write_text(_PROJECT_DEFAULTS_TEMPLATE)
+        except (OSError, PermissionError) as e:
+            import logging
+            logging.getLogger(__name__).warning("Could not create project config %s: %s", path, e)
     return path
 
 
@@ -340,21 +349,38 @@ def _ensure_project_local_config(project_root: Path) -> Path:
     config_dir = project_root / _PROJECT_CONFIG_DIR
     path = config_dir / _PROJECT_LOCAL_CONFIG_NAME
     if not path.exists():
-        config_dir.mkdir(parents=True, exist_ok=True)
-        path.write_text(_PROJECT_LOCAL_DEFAULTS_TEMPLATE)
+        try:
+            config_dir.mkdir(parents=True, exist_ok=True)
+            path.write_text(_PROJECT_LOCAL_DEFAULTS_TEMPLATE)
+        except (OSError, PermissionError) as e:
+            import logging
+            logging.getLogger(__name__).warning("Could not create local config %s: %s", path, e)
     return path
 
 
 def _is_loopback_url(url: str) -> bool:
     """True if *url*'s host is a loopback address.
 
-    Matches localhost, 127.0.0.0/8 (including ``127.x.x.x``), ``::1``,
-    and IPv4-mapped IPv6 (``::ffff:127.x``).
+    Uses ``ipaddress`` for robust IPv4/IPv6 detection, including shortened
+    IPv6 formats (``0:0:0:0:0:0:0:1``, ``::1``) and IPv4-mapped IPv6.
     """
+    import ipaddress
     from urllib.parse import urlparse
 
     host = (urlparse(url).hostname or "").lower()
-    return host in {"localhost", "::1"} or host.startswith("127.") or host.startswith("::ffff:127.")
+    if host == "localhost":
+        return True
+    try:
+        addr = ipaddress.ip_address(host)
+        return addr.is_loopback
+    except ValueError:
+        return False
+
+
+# Module-level config cache with mtime-based invalidation.
+# load_config() is called 20+ times per MCP session; caching avoids redundant
+# TOML parsing when config files haven't changed.
+_config_cache: dict[tuple, tuple[float, Config]] = {}
 
 
 def load(project_root: Path | None = None) -> Config:
@@ -363,6 +389,9 @@ def load(project_root: Path | None = None) -> Config:
     Creates default config files on first use.  TOML parse errors in user
     configs are logged and the built-in defaults are used instead — a broken
     config file must not prevent the MCP tools from loading.
+
+    Results are cached per (global_path, proj_path, local_path) tuple and
+    invalidated when any source file's mtime changes.
     """
     import logging
 
@@ -370,20 +399,37 @@ def load(project_root: Path | None = None) -> Config:
     data: dict = {}
 
     global_path = _ensure_global_config()
+    proj_path = _ensure_project_config(project_root) if project_root is not None else None
+    local_path = _ensure_project_local_config(project_root) if project_root is not None else None
+
+    # Check mtime-based cache
+    cache_key = (global_path, proj_path, local_path)
+    if cache_key in _config_cache:
+        cached_ts, cached_cfg = _config_cache[cache_key]
+        # Check if any source file changed
+        try:
+            newest = max(
+                p.stat().st_mtime for p in cache_key if p is not None
+            )
+            if newest <= cached_ts:
+                return cached_cfg
+        except OSError:
+            pass  # File missing → reload
+
     try:
         data = tomllib.loads(global_path.read_text())
     except Exception:
         log.exception("Failed to parse %s — using defaults", global_path)
 
     if project_root is not None:
-        proj_path = _ensure_project_config(project_root)
+        assert proj_path is not None
         try:
             proj_data = tomllib.loads(proj_path.read_text())
             data = _deep_merge(data, proj_data)
         except Exception:
             log.exception("Failed to parse %s — ignoring project config", proj_path)
 
-        local_path = _ensure_project_local_config(project_root)
+        assert local_path is not None
         try:
             local_data = tomllib.loads(local_path.read_text())
             data = _deep_merge(data, local_data)
@@ -399,9 +445,23 @@ def load(project_root: Path | None = None) -> Config:
                 "Source-code snippets in LLM prompts will be sent to that host.",
                 final_url,
             )
+            print(
+                f"⚠ WARNING: non-local ollama_url ({final_url}) — "
+                "source code will be sent to an external host.",
+                file=sys.stderr,
+            )
 
     cfg = _from_dict(data)
     cfg.index.db_dir = cfg.index.db_dir.expanduser().resolve()
+
+    # Cache with current mtime
+    try:
+        newest_mtime = max(
+            p.stat().st_mtime for p in cache_key if p is not None
+        )
+        _config_cache[cache_key] = (newest_mtime, cfg)
+    except OSError:
+        pass  # Can't cache if we can't stat files
 
     return cfg
 

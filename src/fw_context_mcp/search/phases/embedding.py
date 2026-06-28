@@ -1,10 +1,10 @@
-"""Phase 4: Semantic search via cosine similarity using sqlite-vec.
+"""Phase 5: Semantic search via cosine similarity using sqlite-vec.
 
 Uses the ``vec0`` virtual table for KNN search when available (index created
 with ``fw-context index --embeddings``).  Falls back to brute-force BLOB
 search for backward compatibility with older indexes.
 
-When Phase 3 (FTS5) has already produced results, the phase operates as a
+When Phase 4 (FTS5) has already produced results, the phase operates as a
 **re-rank**: FTS5 candidates are scored by vector distance instead of running
 an independent KNN query.  This avoids duplicate results and the need for
 expensive merging in the subsequent deduplication phase.
@@ -20,7 +20,15 @@ from fw_context_mcp.search.phases.base import Phase
 if TYPE_CHECKING:
     from fw_context_mcp.search.context import PipelineContext
 
+from fw_context_mcp.search.phases.embedding_helpers import (
+    brute_force_search,
+    table_exists,
+    table_has_rows,
+)
+
 log = logging.getLogger(__name__)
+
+_table_exists = table_exists  # backward-compat alias
 
 
 class EmbeddingPhase(Phase):
@@ -77,7 +85,11 @@ class EmbeddingPhase(Phase):
                 # merged results than running an independent KNN query.
                 if ctx.fts5_results and has_vec0:
                     queries = ctx.generated_queries if ctx.generated_queries else ctx.rough_queries
-                    fts5_query = " OR ".join(queries) if queries else ctx.query
+                    # Expand to prefix match — _expand_query skips wildcards when
+                    # the query already contains OR, so we add * per-term here.
+                    fts5_query = " OR ".join(
+                        (q if q.endswith("*") else f"{q}*") for q in queries
+                    ) if queries else ctx.query
                     rows = search_similar_hybrid(
                         conn,
                         query_vec,
@@ -132,48 +144,5 @@ class EmbeddingPhase(Phase):
         return ctx
 
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-
-def _table_exists(conn, name: str) -> bool:
-    """Check whether a table or virtual table exists."""
-    row = conn.execute(
-        "SELECT 1 FROM sqlite_master WHERE name=? LIMIT 1", (name,)
-    ).fetchone()
-    return row is not None
-
-
-def _table_has_rows(conn, name: str) -> bool:
-    """Check whether a table exists and contains at least one row."""
-    if not _table_exists(conn, name):
-        return False
-    row = conn.execute(f"SELECT 1 FROM {name} LIMIT 1").fetchone()
-    return row is not None
-
-
-def _brute_force_search(
-    query_vec: list[float],
-    stored: dict[int, list[float]],
-    threshold: float = 0.5,
-) -> list[tuple[int, float]]:
-    """Legacy brute-force cosine similarity (fallback for old BLOB indexes).
-
-    Returns list of ``(symbol_id, similarity)`` sorted by similarity descending.
-    """
-    import math
-
-    scored: list[tuple[int, float]] = []
-    for sym_id, emb_vec in stored.items():
-        dot = sum(x * y for x, y in zip(query_vec, emb_vec, strict=True))
-        norm_a = math.sqrt(sum(x * x for x in query_vec))
-        norm_b = math.sqrt(sum(x * x for x in emb_vec))
-        if norm_a == 0 or norm_b == 0:
-            sim = 0.0
-        else:
-            sim = dot / (norm_a * norm_b)
-        if sim > threshold:
-            scored.append((sym_id, sim))
-    scored.sort(key=lambda x: -x[1])
-    return scored
+_table_has_rows = table_has_rows
+_brute_force_search = brute_force_search
