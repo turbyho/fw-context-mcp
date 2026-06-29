@@ -46,6 +46,7 @@ __all__ = [
     "insert_overrides_batch",
     "insert_refs_batch",
     "insert_symbols_batch",
+    "lookup_llm_analysis_cache",
     "open_db",
     "search_similar_hybrid",
     "search_similar_vec",
@@ -60,6 +61,7 @@ __all__ = [
     "upsert_file",
     "upsert_file_analysis_batch",
     "upsert_llm_analysis_batch",
+    "upsert_llm_analysis_cache",
     "upsert_project",
 ]
 
@@ -400,6 +402,19 @@ CREATE TABLE IF NOT EXISTS llm_analysis (
     outputs      TEXT    NOT NULL DEFAULT '',
     model        TEXT    NOT NULL,
     analyzed_at  TEXT    NOT NULL DEFAULT (datetime('now'))
+);
+
+-- Content-addressable cache for LLM analysis — survives re-indexes,
+-- config changes, and branch switches.  Keyed by content_hash so
+-- identical functions return their cached analysis instantly without
+-- another Ollama call.
+CREATE TABLE IF NOT EXISTS llm_analysis_cache (
+    content_hash TEXT PRIMARY KEY,
+    summary      TEXT NOT NULL DEFAULT '',
+    inputs       TEXT NOT NULL DEFAULT '',
+    outputs      TEXT NOT NULL DEFAULT '',
+    model        TEXT NOT NULL,
+    analyzed_at  TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
 -- Per-file LLM analysis (opt-in via [llm] analyze_files = true).
@@ -2601,6 +2616,48 @@ def get_llm_analysis_for_symbol(
            FROM llm_analysis
            WHERE symbol_id = ?""",
         (symbol_id,),
+    ).fetchone()
+    if not row:
+        return None
+    return {
+        "summary": row["summary"],
+        "inputs": row["inputs"],
+        "outputs": row["outputs"],
+        "model": row["model"],
+        "analyzed_at": row["analyzed_at"],
+    }
+
+
+def upsert_llm_analysis_cache(
+    conn: sqlite3.Connection,
+    entries: list[tuple[str, str, str, str, str]],
+) -> int:
+    """Insert or replace cache entries keyed by content hash.
+
+    *entries*: ``(content_hash, summary, inputs, outputs, model)``.
+    Uses ``INSERT OR REPLACE`` — when the same function is re-analyzed
+    with a different model, the cache entry is overwritten.
+    Returns number of rows inserted.
+    """
+    cur = conn.executemany(
+        """INSERT OR REPLACE INTO llm_analysis_cache
+           (content_hash, summary, inputs, outputs, model, analyzed_at)
+           VALUES (?, ?, ?, ?, ?, datetime('now'))""",
+        entries,
+    )
+    return cur.rowcount
+
+
+def lookup_llm_analysis_cache(
+    conn: sqlite3.Connection,
+    content_hash: str,
+) -> dict | None:
+    """Return cached LLM analysis for *content_hash*, or None."""
+    row = conn.execute(
+        """SELECT summary, inputs, outputs, model, analyzed_at
+           FROM llm_analysis_cache
+           WHERE content_hash = ?""",
+        (content_hash,),
     ).fetchone()
     if not row:
         return None
