@@ -34,7 +34,6 @@ from fw_context_mcp.mcp.server import (
     find_wrapper_callers,
     get_active_build,
     get_class_members,
-    get_file_analysis,
     get_file_map,
     get_inheritance_chain,
     get_method_overrides,
@@ -551,19 +550,6 @@ def run_tests_for_project(proj: dict, results: CheckResults) -> None:
     fm_err = get_file_map("___nonexistent_file_xyz__.cpp", project_root=root)
     results.check("file_map nonexistent → error or 0 symbols",
                   "error" in fm_err or fm_err.get("total_symbols", -1) == 0)
-
-    # ═══ 5. FILE ANALYSIS ═══════════════════════════════════════════════════════
-    results.section("5. File Analysis")
-
-    if sym.get("analyzed_file"):
-        fa = _call(results, "get_file_analysis analyzed", get_file_analysis,
-                   sym["analyzed_file"], project_root=root)
-        if fa:
-            has_summary = fa.get("summary") is not None
-            results.check(f"file_analysis → returns dict (summary={'present' if has_summary else 'none'})", True)
-
-    fa_err = get_file_analysis("___nonexistent_file__.cpp", project_root=root)
-    results.check("file_analysis nonexistent → error", "error" in fa_err)
 
     # ═══ 6. SYMBOL CONTEXT ══════════════════════════════════════════════════════
     results.section("6. Symbol Context")

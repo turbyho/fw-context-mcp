@@ -79,7 +79,6 @@ go in the shared `config.toml` — LLM configuration is developer-specific.
 | `embed_model` | `"mxbai-embed-large:latest"` | global, local | Embedding model for vector search. Auto-pulled on first use. |
 | `num_ctx` | `16384` | global, local | Context window in tokens. Accommodates full function bodies during analysis generation. |
 | `analyze_symbols` | `true` | global, local | Generate per-symbol LLM analysis (summary, inputs, outputs) during indexing. Stored in `llm_analysis` table — symbols become searchable by purpose. |
-| `analyze_files` | `true` | global, local | Generate per-file LLM summaries (2–3 sentences) during indexing. Returned by `get_file_analysis` and as `file_summary` in `get_file_map`. |
 | `debug_log` | *(none)* | global, local | Path to JSONL debug log for Ollama prompts + responses. Example: `"~/.fw-context/llm-debug.jsonl"`. |
 
 ### `[project]` — Metadata
