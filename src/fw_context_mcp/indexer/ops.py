@@ -22,9 +22,12 @@ from fw_context_mcp.indexer.db import (
     insert_inheritance_batch,
     insert_refs_batch,
     insert_symbols_batch,
+    lookup_llm_analysis_cache,
     split_tokens,
     upsert_file,
+    upsert_llm_analysis_batch,
 )
+from fw_context_mcp.utils import compute_content_hash
 
 log = logging.getLogger(__name__)
 
@@ -154,37 +157,15 @@ def store_symbols_for_unit(
             _body_cache[abs_path] = _read_file_lines(abs_path)
         return _body_cache[abs_path]
 
-    # ── Phase 1: Save existing LLM analysis before delete ──
-    # Keyed by USR so unchanged symbols can be restored with their
-    # original analysis after the DELETE+INSERT cycle.
-    saved_analyses: dict[str, dict] = {}
+
+    # ── Phase 1: Save USRs of old symbols (Phase 4 needs this for move detection) ──
+    old_usrs: set[str] = set()
     if file_path in known:
         file_id_old, _ = known[file_path]
         rows = conn.execute(
-            """SELECT s.usr, s.qualified_name, s.signature, s.end_line, s.line, s.docstring,
-                      s.file_id, f.path as abs_path,
-                      a.summary, a.inputs, a.outputs, a.model, a.analyzed_at
-               FROM symbols s
-               JOIN llm_analysis a ON a.symbol_id = s.id
-               JOIN files f ON f.id = s.file_id
-               WHERE s.file_id = ?""",
-            (file_id_old,),
+            "SELECT usr FROM symbols WHERE file_id = ?", (file_id_old,),
         ).fetchall()
-        for r in rows:
-            lines = _cached_lines(r["abs_path"])
-            if lines is None:
-                continue  # source file gone — cannot verify, skip restore
-            ch = _compute_content_hash(
-                lines, r["line"], r["end_line"], r["signature"], r["qualified_name"], r["docstring"],
-            )
-            saved_analyses[r["usr"]] = {
-                "summary": r["summary"],
-                "inputs": r["inputs"],
-                "outputs": r["outputs"],
-                "model": r["model"],
-                "analyzed_at": r["analyzed_at"],
-                "content_hash": ch,
-            }
+        old_usrs = {r["usr"] for r in rows}
 
     # ── Phase 2: Delete old symbols (existing logic) ──
     if file_path in known:
@@ -245,56 +226,42 @@ def store_symbols_for_unit(
         insert_symbols_batch(conn, rows)
         syms_added = len(rows)
 
-        # ── Phase 3: Restore LLM analysis for unchanged symbols ──
+        # ── Phase 3: Restore LLM analysis from content-addressable cache ──
         restored = 0
-        if saved_analyses:
+        if syms:
             for s in syms:
-                if s.usr not in saved_analyses:
-                    continue
-                old = saved_analyses[s.usr]
                 lines = _cached_lines(s.file)
                 if lines is None:
                     continue
-                new_ch = _compute_content_hash(
-                    lines, s.line, s.end_line, s.signature, s.qualified_name, s.docstring,
-                )
-                if old["content_hash"] != new_ch:
-                    continue  # symbol changed — _build_llm_analysis will re-analyze
-
-                # Symbol unchanged — restore analysis with original timestamp
+                body = _read_body(lines, s.line, s.end_line)
+                ch = compute_content_hash(body, s.qualified_name, s.signature, s.docstring)
+                cached = lookup_llm_analysis_cache(conn, ch)
+                if not cached:
+                    continue  # not in cache — _build_llm_analysis will handle it
                 new_id = conn.execute(
                     "SELECT id FROM symbols WHERE config_hash = ? AND usr = ?",
                     (config_hash, s.usr),
                 ).fetchone()
                 if not new_id:
                     continue
-                conn.execute(
-                    """INSERT OR REPLACE INTO llm_analysis
-                       (symbol_id, summary, inputs, outputs, model, analyzed_at)
-                       VALUES (?, ?, ?, ?, ?, ?)""",
-                    (new_id[0], old["summary"], old["inputs"],
-                     old["outputs"], old["model"], old["analyzed_at"]),
-                )
-                # Sync denormalized columns on symbols (FTS5 needs these)
-                conn.execute(
-                    """UPDATE symbols SET summary = ?, inputs = ?, outputs = ?
-                       WHERE id = ?""",
-                    (old["summary"], old["inputs"], old["outputs"], new_id[0]),
-                )
+                upsert_llm_analysis_batch(conn, [(
+                    new_id[0], cached["summary"], cached["inputs"],
+                    cached["outputs"], cached["model"],
+                )])
                 restored += 1
         if restored:
             log.debug(
-                "Restored LLM analysis for %d unchanged symbols in %s",
+                "Restored LLM analysis for %d symbols from cache in %s",
                 restored, Path(file_path).name,
             )
 
         # ── Phase 4: Detect and fix moved symbols ──
-        # Symbols not in saved_analyses may have moved from another file.
+        # Symbols not in old_usrs may have moved from another file.
         # Find existing row with same USR, same content_hash, but different
         # file_id → update file_id, keep analysis, delete duplicate.
         moved = 0
         for s in syms:
-            if s.usr in saved_analyses:
+            if s.usr in old_usrs:
                 continue  # already handled in Phase 3
             old_row = conn.execute(
                 """SELECT s.id, s.file_id, s.qualified_name, s.signature, s.line, s.end_line,
