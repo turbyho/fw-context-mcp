@@ -331,7 +331,7 @@ def _enrich_batch(conn, batch_rows, config_hash: str) -> list[dict]:
         usr = d.get("usr", "")
 
         # Only read body for functions/methods with valid extents
-        if kind in ("function", "method", "constructor", "destructor") and abs_path and end_line > start_line:
+        if kind in ("function", "method", "constructor", "destructor", "class", "struct") and abs_path and end_line > start_line:
             body = _read_body(abs_path, start_line, end_line)
 
         # Fetch callees from the reference index
@@ -363,7 +363,8 @@ def _build_llm_analysis(conn, config_hash: str, llm_config, db_dir: Path, *, exc
     import httpx
 
     from ..indexer.prompts import build_analysis_prompt, parse_analysis_response
-    from .db import upsert_llm_analysis_batch
+    from ..utils import compute_content_hash
+    from .db import lookup_llm_analysis_cache, upsert_llm_analysis_batch, upsert_llm_analysis_cache
 
     # Check Ollama reachability
     try:
@@ -410,6 +411,25 @@ def _build_llm_analysis(conn, config_hash: str, llm_config, db_dir: Path, *, exc
         qname = row["qualified_name"] or row["name"]
         try:
             batch_dicts = _enrich_batch(conn, [row], config_hash)
+            d = batch_dicts[0]
+
+            # ── Cache check ──
+            h = compute_content_hash(d["body"], d["qualified_name"], d["signature"], d["docstring"])
+            cached = lookup_llm_analysis_cache(conn, h)
+
+            if cached:
+                # Cache hit — re-use existing analysis
+                with (write_lock(db_dir, timeout=5.0) if not write_lock_held else nullcontext()):
+                    with transaction(conn):
+                        upsert_llm_analysis_batch(conn, [(
+                            d["id"], cached["summary"], cached["inputs"],
+                            cached["outputs"], cached["model"],
+                        )])
+                total += 1
+                log.debug("[%d/%d] %s: cache hit", idx + 1, total_symbols, qname)
+                continue
+
+            # Cache miss — Ollama
             prompt = build_analysis_prompt(batch_dicts)
             try:
                 response = call_ollama(prompt, llm_config, temperature=0.1, num_predict=3000)
@@ -422,13 +442,15 @@ def _build_llm_analysis(conn, config_hash: str, llm_config, db_dir: Path, *, exc
                 log.warning("[%d/%d] %s: no valid entries parsed from response", idx + 1, total_symbols, qname)
                 continue
 
+            r = parsed[0]
             with (write_lock(db_dir, timeout=5.0) if not write_lock_held else nullcontext()):
                 with transaction(conn):
-                    db_rows = [
-                        (r["symbol_id"], r["summary"], r["inputs"], r["outputs"], model)
-                        for r in parsed
-                    ]
+                    db_rows = [(r["symbol_id"], r["summary"], r["inputs"], r["outputs"], model)]
                     inserted = upsert_llm_analysis_batch(conn, db_rows)
+                    # Store in cache for next time
+                    upsert_llm_analysis_cache(conn, [(
+                        h, r["summary"], r["inputs"], r["outputs"], model,
+                    )])
                     total += inserted
 
             log.info("[%d/%d] %s: stored", idx + 1, total_symbols, qname)

@@ -6,10 +6,11 @@ other small helpers that were copied into multiple modules.
 
 from __future__ import annotations
 
+import hashlib
 import os
 from pathlib import Path
 
-__all__ = ["MTIME_TOLERANCE_S", "abs_path", "resolve_project_root"]
+__all__ = ["MTIME_TOLERANCE_S", "abs_path", "compute_content_hash", "resolve_project_root"]
 
 # Seconds of tolerance when comparing file mtimes to account for
 # clock skew between the indexer and the filesystem.
@@ -48,3 +49,13 @@ def abs_path(root: Path, path: str) -> str:
     if p.is_absolute():
         return str(p)
     return str(root / p)
+
+
+def compute_content_hash(body: str, qualified_name: str, signature: str, docstring: str) -> str:
+    """Stable SHA256 hex fingerprint of a symbol's content.
+
+    Used for content-addressable LLM analysis caching — survives
+    re-indexes, config changes, and branch switches.
+    """
+    raw = f"{body.strip()}|{qualified_name}|{signature or ''}|{(docstring or '').strip()}"
+    return hashlib.sha256(raw.encode()).hexdigest()

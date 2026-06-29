@@ -7,7 +7,6 @@ same code path.
 
 from __future__ import annotations
 
-import hashlib
 import logging
 from pathlib import Path
 
@@ -59,17 +58,19 @@ def _compute_content_hash(
     start_line: int,
     end_line: int,
     signature: str,
+    qualified_name: str,
     docstring: str,
 ) -> str:
-    """Stable hash of a symbol's body + signature for change detection.
+    """Stable hash of a symbol's body + identity for change detection.
 
     Uses the actual body text (read from disk via libclang extents) so that
     even a refactor preserving line count is detected.  Whitespace is stripped
     so formatting-only changes are ignored.
     """
+    from fw_context_mcp.utils import compute_content_hash
+
     body = _read_body(lines, start_line, end_line)
-    raw = f"{signature or ''}|{body.strip()}|{docstring or ''}"
-    return hashlib.sha256(raw.encode()).hexdigest()[:16]
+    return compute_content_hash(body, qualified_name, signature, docstring)
 
 
 def store_symbols_for_unit(
@@ -160,7 +161,7 @@ def store_symbols_for_unit(
     if file_path in known:
         file_id_old, _ = known[file_path]
         rows = conn.execute(
-            """SELECT s.usr, s.signature, s.end_line, s.line, s.docstring,
+            """SELECT s.usr, s.qualified_name, s.signature, s.end_line, s.line, s.docstring,
                       s.file_id, f.path as abs_path,
                       a.summary, a.inputs, a.outputs, a.model, a.analyzed_at
                FROM symbols s
@@ -174,7 +175,7 @@ def store_symbols_for_unit(
             if lines is None:
                 continue  # source file gone — cannot verify, skip restore
             ch = _compute_content_hash(
-                lines, r["line"], r["end_line"], r["signature"], r["docstring"],
+                lines, r["line"], r["end_line"], r["signature"], r["qualified_name"], r["docstring"],
             )
             saved_analyses[r["usr"]] = {
                 "summary": r["summary"],
@@ -255,7 +256,7 @@ def store_symbols_for_unit(
                 if lines is None:
                     continue
                 new_ch = _compute_content_hash(
-                    lines, s.line, s.end_line, s.signature, s.docstring,
+                    lines, s.line, s.end_line, s.signature, s.qualified_name, s.docstring,
                 )
                 if old["content_hash"] != new_ch:
                     continue  # symbol changed — _build_llm_analysis will re-analyze
@@ -296,7 +297,7 @@ def store_symbols_for_unit(
             if s.usr in saved_analyses:
                 continue  # already handled in Phase 3
             old_row = conn.execute(
-                """SELECT s.id, s.file_id, s.signature, s.line, s.end_line,
+                """SELECT s.id, s.file_id, s.qualified_name, s.signature, s.line, s.end_line,
                           s.docstring, f.path as abs_path,
                           a.summary, a.inputs, a.outputs, a.model, a.analyzed_at
                    FROM symbols s
@@ -321,10 +322,10 @@ def store_symbols_for_unit(
                 continue
             old_ch = _compute_content_hash(
                 old_lines, old_row["line"], old_row["end_line"],
-                old_row["signature"], old_row["docstring"],
+                old_row["signature"], old_row["qualified_name"], old_row["docstring"],
             )
             new_ch = _compute_content_hash(
-                lines, s.line, s.end_line, s.signature, s.docstring,
+                lines, s.line, s.end_line, s.signature, s.qualified_name, s.docstring,
             )
             if old_ch != new_ch:
                 continue  # content changed — treat as new symbol
