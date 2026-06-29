@@ -320,7 +320,6 @@ contents before reading a chapter.
 ```
 Input:  {"file_path": "src/modem_msg.cpp", "project_root?": "/path/to/project", "signatures?": false, "max_per_kind?": 30}
 Output: {"file": "src/modem_msg.cpp", "total_symbols": 426,
-         "file_summary": "Modem message handling — encodes/decodes protocol buffers…",
          "symbols": {
            "method":    [{"name": "_is_socket_ok", "line": 140, "signature": "bool _is_socket_ok()"}, …],
            "variable":  [{"name": "_buffer_msg", "line": 105}, …],

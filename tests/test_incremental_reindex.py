@@ -1985,8 +1985,7 @@ int sensor_read(void) {
                 index_refs=False,
                 index_embeddings=False,
                 analyze_symbols=False,
-                analyze_files=False,
-                analyze_overrides=False,
+                               analyze_overrides=False,
             )
             print(f"  New config_hash: {config_hash_new[:16]}…")
 
@@ -2044,8 +2043,7 @@ int sensor_read(void) {
                 index_refs=False,
                 index_embeddings=False,
                 analyze_symbols=False,
-                analyze_files=False,
-                analyze_overrides=False,
+                               analyze_overrides=False,
             )
             print(f"  New config_hash: {config_hash_new[:16]}…")
 
@@ -2118,8 +2116,7 @@ class TestFastStalenessCheck:
                 index_refs=True,
                 index_embeddings=False,
                 analyze_symbols=False,
-                analyze_files=False,
-                analyze_overrides=False,
+                               analyze_overrides=False,
             )
         finally:
             _os.environ.pop("FW_CONTEXT_FORCE_REFINDEX", None)
@@ -2160,7 +2157,7 @@ class TestFastStalenessCheck:
                 source_roots=[], exclude_paths=[],
                 project_root=indexed_project,
                 index_refs=True, index_embeddings=False,
-                analyze_symbols=False, analyze_files=False, analyze_overrides=False,
+                analyze_symbols=False, analyze_overrides=False,
             )
         finally:
             _os.environ.pop("FW_CONTEXT_FORCE_REFINDEX", None)
@@ -2418,7 +2415,7 @@ class TestBgReindexEndToEnd:
             source_roots=[], exclude_paths=[],
             project_root=indexed_project,
             index_refs=True, index_embeddings=False,
-            analyze_symbols=False, analyze_files=False, analyze_overrides=False,
+            analyze_symbols=False, analyze_overrides=False,
         )
 
         # ── Step 1: Delete refs (simulate db corruption or pre-refs index) ──

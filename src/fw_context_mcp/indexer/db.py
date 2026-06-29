@@ -7,7 +7,6 @@ __all__ = [
     "DatabaseCorruptionError",
     "drop_fts_triggers",
     "rebuild_fts",
-    "count_file_analysis",
     "count_fp_assignments",
     "count_indirect_call_sites",
     "count_llm_analysis",
@@ -32,7 +31,6 @@ __all__ = [
     "get_direct_bases",
     "get_direct_derived",
     "get_embeddings",
-    "get_file_analysis_for_file",
     "get_file_map",
     "get_file_mtime_indexed",
     "get_file_mtimes",
@@ -59,7 +57,6 @@ __all__ = [
     "upsert_embeddings",
     "upsert_embeddings_vec",
     "upsert_file",
-    "upsert_file_analysis_batch",
     "upsert_llm_analysis_batch",
     "upsert_llm_analysis_cache",
     "upsert_project",
@@ -233,7 +230,6 @@ _MIGRATION_ADD_COLUMNS = [
     "ALTER TABLE symbols ADD COLUMN parent_usr TEXT NOT NULL DEFAULT ''",
     "ALTER TABLE symbols ADD COLUMN is_template INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE symbols ADD COLUMN template_usr TEXT NOT NULL DEFAULT ''",
-    "ALTER TABLE file_analysis ADD COLUMN config_hash TEXT NOT NULL DEFAULT ''",
 ]
 
 _SCHEMA = """
@@ -754,7 +750,7 @@ def open_db(path: Path, *, skip_integrity_check: bool = False) -> sqlite3.Connec
                 # Old database — _SCHEMA contains CREATE INDEX statements
                 # that reference columns (e.g. parent_usr) which don't exist
                 # yet.  Also possible: the DB predates newer tables entirely
-                # (file_analysis, inheritance, overrides) — executescript
+                # (inheritance, overrides) — executescript
                 # may have stopped before creating them.
                 # Strategy: apply add-column migrations (skip tables that
                 # don't exist yet), then retry _SCHEMA to create remaining
@@ -2679,63 +2675,6 @@ def count_llm_analysis(
         """SELECT COUNT(*) FROM llm_analysis a
            JOIN symbols s ON s.id = a.symbol_id
            WHERE s.config_hash = ?""",
-        (config_hash,),
-    ).fetchone()[0]
-
-
-def upsert_file_analysis_batch(
-    conn: sqlite3.Connection,
-    rows: list[tuple[int, str, str, str]],
-) -> int:
-    """Insert or replace file-level LLM analysis rows.
-
-    Each row: (file_id, config_hash, summary, model).
-    Uses INSERT OR REPLACE so re-analysis is idempotent.
-    Cleans orphaned rows. Returns number of rows inserted.
-    """
-    conn.execute(
-        """DELETE FROM file_analysis WHERE file_id NOT IN (
-            SELECT id FROM files
-        )"""
-    )
-    cur = conn.executemany(
-        """INSERT OR REPLACE INTO file_analysis(file_id, config_hash, summary, model, analyzed_at)
-           VALUES (?, ?, ?, ?, datetime('now'))""",
-        rows,
-    )
-    return cur.rowcount
-
-
-def get_file_analysis_for_file(
-    conn: sqlite3.Connection,
-    config_hash: str,
-    file_id: int,
-) -> dict | None:
-    """Return the file-level LLM analysis for a single file, or None."""
-    row = conn.execute(
-        """SELECT summary, model, analyzed_at
-           FROM file_analysis
-           WHERE config_hash = ? AND file_id = ?""",
-        (config_hash, file_id),
-    ).fetchone()
-    if not row:
-        return None
-    return {
-        "summary": row["summary"],
-        "model": row["model"],
-        "analyzed_at": row["analyzed_at"],
-    }
-
-
-def count_file_analysis(
-    conn: sqlite3.Connection,
-    config_hash: str,
-) -> int:
-    """Return how many files in a config have pre-computed LLM analysis."""
-    return conn.execute(
-        """SELECT COUNT(*) FROM file_analysis a
-           WHERE a.config_hash = ? OR a.config_hash = ''
-           """,
         (config_hash,),
     ).fetchone()[0]
 

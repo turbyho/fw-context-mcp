@@ -106,10 +106,6 @@ def cmd_index(args: argparse.Namespace) -> int:
             False if getattr(args, 'no_analyze', False)
             else getattr(args, 'analyze', False) or cfg.llm.analyze_symbols
         ),
-        analyze_files=(
-            False if getattr(args, 'no_analyze', False)
-            else cfg.llm.analyze_files
-        ),
         analyze_overrides=True,
         project_root=project_root,
         project_id=project_id,
@@ -898,15 +894,14 @@ def cmd_analyze(args: argparse.Namespace) -> int:
     """Re-run LLM symbol analysis on an existing index (idempotent).
 
     Requires Ollama (or LM Studio) running and ``[llm] enabled = true``
-    in config. Re-generates per-symbol summaries, inputs/outputs analysis,
-    file-level summaries (if ``[llm] analyze_files`` is enabled), and
-    method override relationships. Existing analysis rows are skipped
+    in config. Re-generates per-symbol summaries, inputs/outputs analysis
+    and method override relationships. Existing analysis rows are skipped
     (idempotent) — only unanalyzed symbols are processed.
     """
     from .config import derive_project_id
     from .config import load as load_config
     from .indexer.db import get_active_config, open_db
-    from .indexer.runner import _build_file_analysis, _build_llm_analysis, _build_overrides
+    from .indexer.runner import _build_llm_analysis, _build_overrides
 
     logging.basicConfig(
         level=logging.DEBUG if args.verbose else logging.INFO,
@@ -953,8 +948,6 @@ def cmd_analyze(args: argparse.Namespace) -> int:
     conn = open_db(db_path)
     try:
         _build_llm_analysis(conn, config_hash, cfg.llm, db_path.parent, exclude_like=exclude_like)
-        if cfg.llm.analyze_files:
-            _build_file_analysis(conn, config_hash, cfg.llm, db_path.parent, exclude_like=exclude_like)
         _build_overrides(conn, config_hash, db_path.parent)
         conn.commit()
     finally:

@@ -316,8 +316,8 @@ def reindex_file_impl(
         file_path: Absolute or project-relative path to the source file to
             re-parse. Must have a matching entry in compile_commands.json.
         project_root: Project root directory. Auto-detected from cwd if omitted.
-        with_analysis: When True (default), also regenerates LLM symbol analysis,
-            file-level summaries, and method override relationships — slower but
+        with_analysis: When True (default), also regenerates LLM symbol analysis
+            and method override relationships — slower but
             produces a fully up-to-date index. Set to False for a fast
             symbol-only update (used by background auto-reindex).
 
@@ -491,10 +491,8 @@ def reindex_file_impl(
                 # ── Phase 2: LLM analysis ──
                 if cfg.llm.enabled and cfg.llm.analyze_symbols and total_symbols > 0:
                     try:
-                        from ...indexer.runner import _build_file_analysis, _build_llm_analysis
+                        from ...indexer.runner import _build_llm_analysis
                         _build_llm_analysis(conn, config_hash, cfg.llm, db_path.parent, write_lock_held=True)
-                        if cfg.llm.analyze_files:
-                            _build_file_analysis(conn, config_hash, cfg.llm, db_path.parent, write_lock_held=True)
                         conn.commit()
                         analyzed_count = conn.execute(
                             "SELECT COUNT(*) FROM llm_analysis a JOIN symbols s ON s.id = a.symbol_id WHERE s.config_hash = ?",
