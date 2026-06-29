@@ -386,7 +386,9 @@ def _build_llm_analysis(conn, config_hash: str, llm_config, db_dir: Path, *, exc
                WHERE s.config_hash = ?
                  AND s.is_definition = 1
                  AND s.kind IN ('function', 'method', 'constructor', 'destructor',
-                                'class', 'struct')"""
+                                'class', 'struct')
+                 AND s.name NOT LIKE '%(anonymous%'
+                 AND s.name NOT LIKE '%(unnamed%'"""
     if exclude_clauses:
         query += f" AND {exclude_clauses}"
     query += """ AND s.id NOT IN (SELECT symbol_id FROM llm_analysis)
