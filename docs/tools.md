@@ -8,17 +8,16 @@ Complete reference for all fw-context CLI commands and MCP server tools.
 
 Build or update the symbol index from `compile_commands.json`.
 
-> **⚠️ Without `--no-build`, every run does a full re-index.** The clean build
-> regenerates `compile_commands.json` → new config hash → every translation
-> unit re-parsed from scratch.  For fast incremental indexing (only changed
-> files, seconds), always use `--no-build` after the initial run.
+> **Incremental by default.**  An existing `compile_commands.json` is reused
+> — only changed files are re-parsed.  Use `--build` to force a clean build
+> and full re-index when needed (e.g. after SDK update or build system changes).
 
 ```bash
-# First run — auto-detects build system, clean build, full index:
+# Incremental (default) — reuse existing compile_commands.json, fast:
 fw-context index
 
-# Subsequent runs — skip build, incremental (only changed files):
-fw-context index --no-build
+# Force clean build + full re-index:
+fw-context index --build
 
 # Explicit path, verbose
 fw-context index compile_commands.json -v
@@ -38,10 +37,10 @@ fw-context index --source-roots src lib drivers
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `compile_commands.json` | from config | Path to the compilation database (skips build — incremental) |
+| `compile_commands.json` | from config | Path to the compilation database (skips build) |
 | `--project DIR` | `.` | Project root directory |
-| `--no-build` | off | Skip build — reuse existing `compile_commands.json` for incremental re-index |
-| `--no-clean` | off | Skip clean build (incremental build — may produce incomplete index) |
+| `--build` | off | Force a clean build and regenerate `compile_commands.json` |
+| `--no-clean` | off | With `--build`: skip clean, do incremental build |
 | `--source-roots DIR…` | auto-detected | Directories to index symbols from |
 | `--name NAME` | directory name | Project name override |
 | `--no-refs` | off | Skip cross-reference / call graph indexing |
@@ -60,6 +59,23 @@ fw-context index --source-roots src lib drivers
 | **CMake** | `bear -- cmake --build build` or `cmake -DCMAKE_EXPORT_COMPILE_COMMANDS=ON` |
 | **Make** | `bear -- make` |
 | **Custom** | `bear -- <your-build-command>` |
+
+### `fw-context project-init`
+
+Initialize or verify project-level configuration.
+
+```bash
+fw-context project-init                     # create configs, update .gitignore
+fw-context project-init --project /path     # specific project
+```
+
+What it does:
+1. Creates `.fw-context/config.toml` and `.fw-context/local.toml` with defaults (idempotent)
+2. Adds `compile_commands.json` and `.fw-context/local.toml` to `.gitignore`
+3. Auto-detects the build system
+4. Checks `compile_commands.json` for completeness
+
+Run after `fw-context init` or when setting up a new clone.
 
 ### `fw-context search`
 
@@ -760,19 +776,30 @@ Output: {"config_hash": "a1b2…", "project_id": "c3d4…", "project_root": "/pa
          "build_system": "zephyr", "compile_commands": "/path/build/compile_commands.json",
          "indexed_at": "2026-06-05T09:35:18", "symbol_count": 12430, "file_count": 1502,
          "reference_count": 8900, "modified_files_count": 3,
-         "analyzed_symbols": 8450, "analysis_model": "qwen2.5-coder:14b",
-         "schema_version": 84935291, "current_schema": 84935291, "stale": false}
+         "schema_version": 84935291, "current_schema": 84935291,
+         "analyzed_symbols": 8450, "unanalyzed_symbols": 120,
+         "analysis_model": "qwen2.5-coder:14b",
+         "bg_reindex_running": false, "reindex_progress": null, "stale": false}
 ```
 
-`analyzed_symbols` is the count of symbols with pre-computed LLM analysis
-(0 when index was built with `--no-analyze` or `[llm] analyze_symbols = false`).
-`analysis_model` is the Ollama model used to generate the analysis.
+**Read-only.** No side effects — does not spawn background tasks.
+Background reindex is managed by the server startup thread and the file
+watcher.  ``bg_reindex_running`` and ``reindex_progress`` report whether
+a background reindex is active and its last log line.
+
+``modified_files_count`` is cached for 30 seconds (calls within that window
+return the same value).  The ``stale`` field is True when at least one
+detection condition is met (see below).  ``unanalyzed_symbols`` counts
+definition symbols that still need LLM analysis (zero when analysis is
+disabled, empty when all symbols are analyzed).
 
 `stale: true` when:
 - `compile_commands.json` changed since the index was built, or
-- any indexed source file has a newer on-disk mtime, or
+- any indexed source file has a newer on-disk mtime (`modified_files_count > 0`), or
 - `schema_version < current_schema` — the index was built with an older
-  DB schema; re-index to populate columns added by migrations.
+  DB schema, or
+- `unanalyzed_symbols > 0` — some symbols lack LLM analysis (index built
+  with `--no-analyze`).
 
 #### `reindex_file`
 
@@ -958,12 +985,16 @@ Phase 5: Deduplicate + format
 | Kind: enum constant / namespace | +1 |
 | Kind: variable / field | 0 |
 
-### Auto-reindex on query
+### Staleness recovery on query
 
-`search_code` and `lookup_symbol` detect stale files in their results
-(on-disk mtime > stored mtime) and re-index them automatically (up to 5
-files, 30 s timeout), then re-run the query. The typical edit→search
-workflow requires no manual steps.
+`search_code`, `lookup_symbol`, and `semantic_search` detect stale files in
+their results (on-disk mtime > stored mtime).  When stale files are found,
+the tools append a warning to the response and the server's background
+reindex subprocess picks up the work — no query blocks waiting for
+reindex.  The file watcher independently handles recently edited files
+within 500 ms of save, so stale results in practice are rare.
+
+For manual recovery, use `reindex_file` or `fw-context index`.
 
 ### Index building (detailed)
 
@@ -975,11 +1006,13 @@ workflow requires no manual steps.
    Add framework dirs (zephyr/, mbed-os/)
    Add top-level dirs from compile_commands.json entries
 
-3. For each translation unit (parallel, ThreadPoolExecutor):
+3. For each translation unit (sequential, per-TU write lock):
    Parse with libclang using exact compiler flags (-I, -D, -std, --target)
    Traverse AST → extract symbols within source_roots
    Category: function, method, class, enum, typedef, variable, field, …
    Extract cross-references within source_roots (on by default; skip with --no-refs)
+   Release write lock between TUs — manual operations (``reindex_file``)
+   can interleave via the pause marker mechanism without blocking.
 
 4. Write to SQLite (atomic per-TU transaction):
    Delete old symbols for this TU

@@ -1856,7 +1856,7 @@ def _symbol_names(conn, config_hash: str) -> set[str]:
 
 @pytest.mark.libclang
 class TestBackgroundReindex:
-    """End-to-end tests: index → change files → reindex via ``fw-context index --no-build``.
+    """End-to-end tests: index → change files → reindex via ``fw-context index``.
 
     These verify the behaviour the background reindex subprocess relies on:
     same compile_commands.json, stale source files → re-run indexer → verify.
@@ -2073,3 +2073,421 @@ int sensor_read(void) {
                 conn.close()
         finally:
             cc_json.write_text(json.dumps(cc_original, indent=2), encoding="utf-8")
+
+
+class TestFastStalenessCheck:
+    """Verify ``_fast_staleness_check`` and related fixes for the bg reindex timeout loop.
+
+    The ``indexed_project`` fixture uses ``--no-refs --no-analyze``, so a fresh
+    index has empty ``refs``, ``indirect_call_sites``, and ``llm_analysis`` tables.
+    These are legitimate detections — the tests verify the check is correct and
+    that after filling the data, no false positives remain.
+    """
+
+    def test_detects_missing_refs_and_unanalyzed(self, indexed_project: Path):
+        """Index built with --no-refs --no-analyze: fast check reports both."""
+        from fw_context_mcp.mcp.background import _fast_staleness_check
+
+        needs, reasons = _fast_staleness_check(indexed_project)
+        assert needs, "Should detect work needed (missing refs + unanalyzed)"
+        assert "refs missing" in reasons, f"Expected 'refs missing', got: {reasons}"
+        assert "indirect call sites missing" in reasons, f"Expected 'indirect call sites missing', got: {reasons}"
+        assert any("unanalyzed" in r for r in reasons), f"Expected unanalyzed, got: {reasons}"
+
+    def test_no_false_positive_after_full_reindex(self, indexed_project: Path):
+        """After filling refs, indirect sites, and analysis: check is clean."""
+        import os as _os
+
+        from fw_context_mcp.indexer.runner import run
+        from fw_context_mcp.mcp.background import _fast_staleness_check
+        from fw_context_mcp.mcp.shared.stale import _count_modified_files
+
+        db_path = _db_path_for_project(indexed_project)
+        cc_json = indexed_project / "compile_commands.json"
+
+        # Reindex with refs — set FORCE_REFINDEX so unchanged files are
+        # still re-parsed to populate the refs/indirect tables.
+        _os.environ["FW_CONTEXT_FORCE_REFINDEX"] = "1"
+        try:
+            run(
+                compile_commands=cc_json,
+                db_path=db_path,
+                source_roots=[],
+                exclude_paths=[],
+                project_root=indexed_project,
+                index_refs=True,
+                index_embeddings=False,
+                analyze_symbols=False,
+                analyze_files=False,
+                analyze_overrides=False,
+            )
+        finally:
+            _os.environ.pop("FW_CONTEXT_FORCE_REFINDEX", None)
+
+        # Now check — refs should be present
+        needs, reasons = _fast_staleness_check(indexed_project)
+        assert "refs missing" not in reasons, (
+            f"Refs should be populated after reindex with --refs, got: {reasons}"
+        )
+        # Note: "indirect call sites missing" may be legitimate — the test
+        # project has no function pointer calls, so the table is empty.
+        # mtimes must not be false-positive detected as changed
+        conn = open_db(db_path)
+        try:
+            ch = _config_hash(conn)
+            mod_count = _count_modified_files(conn, ch, indexed_project)
+            assert mod_count == 0, (
+                f"After reindex, 0 files should be detected as modified, got {mod_count}"
+            )
+        finally:
+            conn.close()
+
+    def test_detects_missing_refs_after_delete(self, indexed_project: Path):
+        """After filling refs then deleting them, fast check reports 'refs missing'."""
+        import os as _os
+
+        from fw_context_mcp.indexer.runner import run
+        from fw_context_mcp.mcp.background import _fast_staleness_check
+
+        db_path = _db_path_for_project(indexed_project)
+        cc_json = indexed_project / "compile_commands.json"
+
+        # First, fill refs by reindexing with --refs
+        _os.environ["FW_CONTEXT_FORCE_REFINDEX"] = "1"
+        try:
+            run(
+                compile_commands=cc_json, db_path=db_path,
+                source_roots=[], exclude_paths=[],
+                project_root=indexed_project,
+                index_refs=True, index_embeddings=False,
+                analyze_symbols=False, analyze_files=False, analyze_overrides=False,
+            )
+        finally:
+            _os.environ.pop("FW_CONTEXT_FORCE_REFINDEX", None)
+
+        # Now delete refs
+        conn = open_db(db_path)
+        try:
+            ch = _config_hash(conn)
+            conn.execute("DELETE FROM refs WHERE config_hash=?", (ch,))
+            conn.commit()
+        finally:
+            conn.close()
+
+        needs, reasons = _fast_staleness_check(indexed_project)
+        assert needs, "Should detect refs missing after DELETE"
+        assert "refs missing" in reasons, f"Expected 'refs missing', got: {reasons}"
+
+    def test_detects_schema_mismatch(self, indexed_project: Path, monkeypatch):
+        """When schema version is behind, _fast_staleness_check reports it.
+
+        ``open_db()`` auto-migrates, so we monkeypatch ``get_db_schema_version``
+        to return a version lower than ``CURRENT_SCHEMA_VERSION``.
+        """
+        import fw_context_mcp.indexer.db as db_mod
+        from fw_context_mcp.mcp.background import _fast_staleness_check
+
+        monkeypatch.setattr(db_mod, "get_db_schema_version", lambda conn: 0)
+
+        needs, reasons = _fast_staleness_check(indexed_project)
+        assert needs, "Should detect schema mismatch"
+        assert any("schema" in r for r in reasons), (
+            f"Expected schema-related reason, got: {reasons}"
+        )
+
+    def test_compile_commands_changed_detection(self, indexed_project: Path):
+        """When compile_commands.json mtime is newer than index, it's detected."""
+        import time
+
+        from fw_context_mcp.mcp.background import _fast_staleness_check
+
+        time.sleep(1.1)
+        cc_json = indexed_project / "compile_commands.json"
+        cc_json.touch()
+
+        needs, reasons = _fast_staleness_check(indexed_project)
+        assert needs, "Should detect compile_commands.json changed"
+        assert "compile_commands.json changed" in reasons, (
+            f"Expected 'compile_commands.json changed' in reasons, got: {reasons}"
+        )
+
+
+class TestModifiedFilesCache:
+    """Verify ``_count_modified_files`` caching and invalidation."""
+
+    def test_cache_returns_cached_value(self, indexed_project: Path):
+        """Second call with use_cache=True returns cached value within TTL."""
+
+        from fw_context_mcp.mcp.shared.stale import (
+            _count_modified_files,
+            _invalidate_modified_cache,
+        )
+
+        db_path = _db_path_for_project(indexed_project)
+        conn = open_db(db_path)
+        try:
+            ch = _config_hash(conn)
+
+            # First call — uncached
+            count1 = _count_modified_files(conn, ch, indexed_project, use_cache=True)
+
+            # Artificially bump all stored mtimes far into the future so
+            # that a fresh stat would return 0 modified files.  The cache
+            # should still return the OLD value (count1) until TTL expires.
+            conn.execute("UPDATE files SET mtime = mtime + 100000 WHERE config_hash=?", (ch,))
+            conn.commit()
+
+            # Second call — must hit cache
+            count2 = _count_modified_files(conn, ch, indexed_project, use_cache=True)
+            assert count2 == count1, (
+                f"Cache should return {count1}, got {count2} "
+                "(stored mtimes were bumped, so fresh count would be 0)"
+            )
+        finally:
+            conn.close()
+            _invalidate_modified_cache(ch)
+
+    def test_invalidate_clears_cache(self, indexed_project: Path):
+        """After _invalidate_modified_cache, next call re-counts from disk."""
+        from fw_context_mcp.mcp.shared.stale import (
+            _count_modified_files,
+            _invalidate_modified_cache,
+        )
+
+        db_path = _db_path_for_project(indexed_project)
+        conn = open_db(db_path)
+        try:
+            ch = _config_hash(conn)
+
+            count1 = _count_modified_files(conn, ch, indexed_project, use_cache=True)
+            _invalidate_modified_cache(ch)
+
+            # After invalidation, the cached value is gone
+            count2 = _count_modified_files(conn, ch, indexed_project, use_cache=True)
+            # count2 should still match count1 since nothing changed on disk
+            assert count2 == count1, f"After invalidation, count should be {count1}, got {count2}"
+        finally:
+            conn.close()
+            _invalidate_modified_cache(ch)
+
+    def test_cache_without_use_cache_skips_cache(self, indexed_project: Path):
+        """Without use_cache=True, each call does a fresh count."""
+        from fw_context_mcp.mcp.shared.stale import (
+            _count_modified_files,
+            _invalidate_modified_cache,
+        )
+
+        db_path = _db_path_for_project(indexed_project)
+        conn = open_db(db_path)
+        try:
+            ch = _config_hash(conn)
+
+            count1 = _count_modified_files(conn, ch, indexed_project, use_cache=False)
+
+            # Bump mtimes — should be reflected immediately without cache
+            conn.execute("UPDATE files SET mtime = mtime + 100000 WHERE config_hash=?", (ch,))
+            conn.commit()
+            count2 = _count_modified_files(conn, ch, indexed_project, use_cache=False)
+            assert count2 == 0, (
+                f"Without cache, bumped mtimes should give 0 modified, got {count2}"
+            )
+            _ = count1  # used only for reference
+        finally:
+            conn.close()
+            _invalidate_modified_cache(ch)
+
+
+class TestForceRefindex:
+    """Verify ``FW_CONTEXT_FORCE_REFINDEX`` makes ``_process_unit`` skip mtime check."""
+
+    def test_force_refindex_skips_mtime_check(self, indexed_project: Path):
+        """With FW_CONTEXT_FORCE_REFINDEX=1, unchanged files are still processed."""
+        import os as _os
+
+        from fw_context_mcp.indexer.compile_commands import parse as parse_cc
+        from fw_context_mcp.indexer.db import get_file_mtimes
+        from fw_context_mcp.indexer.runner import _process_unit
+
+        db_path = _db_path_for_project(indexed_project)
+        cc_json = indexed_project / "compile_commands.json"
+
+        conn = open_db(db_path)
+        try:
+            ch = _config_hash(conn)
+            existing = get_file_mtimes(conn, ch)
+        finally:
+            conn.close()
+
+        # Use the real compilation unit from compile_commands.json
+        units = list(parse_cc(cc_json))
+        modem_unit = [u for u in units if u.file.name == "modem.c"]
+        assert modem_unit, "modem.c must be in compile_commands.json"
+
+        # ── Without env var: should return "unchanged" ──
+        _os.environ.pop("FW_CONTEXT_FORCE_REFINDEX", None)
+        status, _, _, _ = _process_unit(
+            modem_unit[0], ch, indexed_project, [indexed_project], [], False,
+            db_path, existing_files=existing,
+        )
+        assert status == "unchanged", (
+            f"Without FORCE_REFINDEX, unchanged file should return 'unchanged', got '{status}'"
+        )
+
+        # ── With env var: should NOT return "unchanged" ──
+        _os.environ["FW_CONTEXT_FORCE_REFINDEX"] = "1"
+        try:
+            status_forced, syms, _, _ = _process_unit(
+                modem_unit[0], ch, indexed_project, [indexed_project], [], False,
+                db_path, existing_files=existing,
+            )
+            assert status_forced == "updated", (
+                f"With FORCE_REFINDEX, unchanged file should return 'updated', got '{status_forced}'"
+            )
+            assert syms > 0, "FORCE_REFINDEX should extract symbols from the file"
+        finally:
+            _os.environ.pop("FW_CONTEXT_FORCE_REFINDEX", None)
+
+    def test_force_refindex_0_does_not_skip(self, indexed_project: Path):
+        """FW_CONTEXT_FORCE_REFINDEX=0 behaves same as unset (normal mtime check)."""
+        import os as _os
+
+        from fw_context_mcp.indexer.compile_commands import parse as parse_cc
+        from fw_context_mcp.indexer.db import get_file_mtimes
+        from fw_context_mcp.indexer.runner import _process_unit
+
+        db_path = _db_path_for_project(indexed_project)
+        cc_json = indexed_project / "compile_commands.json"
+
+        conn = open_db(db_path)
+        try:
+            ch = _config_hash(conn)
+            existing = get_file_mtimes(conn, ch)
+        finally:
+            conn.close()
+
+        units = list(parse_cc(cc_json))
+        modem_unit = [u for u in units if u.file.name == "modem.c"]
+        assert modem_unit, "modem.c must be in compile_commands.json"
+
+        _os.environ["FW_CONTEXT_FORCE_REFINDEX"] = "0"
+        try:
+            status, _, _, _ = _process_unit(
+                modem_unit[0], ch, indexed_project, [indexed_project], [], False,
+                db_path, existing_files=existing,
+            )
+            assert status == "unchanged", (
+                f"FORCE_REFINDEX=0 should still do mtime check, got '{status}'"
+            )
+        finally:
+            _os.environ.pop("FW_CONTEXT_FORCE_REFINDEX", None)
+
+
+class TestBgReindexEndToEnd:
+    """End-to-end: simulate the missing-refs → reindex → no-false-positive cycle."""
+
+    def test_missing_refs_reindex_no_false_positive_cycle(
+        self, indexed_project: Path,
+    ):
+        """The full cycle that used to loop forever now completes cleanly.
+
+        1. Fill refs via run() API, then delete them to simulate the problem
+        2. _fast_staleness_check detects "refs missing"
+        3. _start_bg_reindex_if_stale spawns subprocess with FW_CONTEXT_FORCE_REFINDEX
+        4. After the subprocess completes, _fast_staleness_check returns clean for refs
+        5. _count_modified_files returns 0 (no false positive mtime detection)
+        """
+        import os as _os
+        import time
+
+        from fw_context_mcp.indexer.runner import run
+        from fw_context_mcp.mcp.background import (
+            _fast_staleness_check,
+            _start_bg_reindex_if_stale,
+        )
+        from fw_context_mcp.mcp.shared.stale import (
+            _count_modified_files,
+            _invalidate_modified_cache,
+        )
+
+        db_path = _db_path_for_project(indexed_project)
+        cc_json = indexed_project / "compile_commands.json"
+
+        # ── First, establish a baseline with refs filled ──
+        run(
+            compile_commands=cc_json, db_path=db_path,
+            source_roots=[], exclude_paths=[],
+            project_root=indexed_project,
+            index_refs=True, index_embeddings=False,
+            analyze_symbols=False, analyze_files=False, analyze_overrides=False,
+        )
+
+        # ── Step 1: Delete refs (simulate db corruption or pre-refs index) ──
+        conn = open_db(db_path)
+        try:
+            ch = _config_hash(conn)
+            conn.execute("DELETE FROM refs WHERE config_hash=?", (ch,))
+            conn.execute("DELETE FROM indirect_call_sites WHERE config_hash=?", (ch,))
+            conn.commit()
+            ref_count = conn.execute(
+                "SELECT COUNT(*) FROM refs WHERE config_hash=?", (ch,)
+            ).fetchone()[0]
+            assert ref_count == 0
+        finally:
+            conn.close()
+            _invalidate_modified_cache(ch)
+
+        # ── Step 2: Verify fast check detects the problem ──
+        needs_before, reasons = _fast_staleness_check(indexed_project)
+        assert needs_before, f"Should detect work needed, got reasons: {reasons}"
+        assert "refs missing" in reasons, f"Should detect refs missing, got: {reasons}"
+        print(f"  Detected before reindex: {reasons}")
+
+        # ── Step 3: Trigger bg reindex (spawns subprocess with FORCE_REFINDEX) ──
+        _start_bg_reindex_if_stale(indexed_project)
+
+        # Wait for subprocess to complete (on this small test project,
+        # the reindex finishes in seconds; waiter checks every 30s)
+        deadline = time.monotonic() + 120.0
+        while time.monotonic() < deadline:
+            reindex_lock = db_path.parent / "reindex.lock"
+            try:
+                lock_fd = _os.open(reindex_lock, _os.O_CREAT | _os.O_RDWR)
+                import fcntl
+                fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                fcntl.flock(lock_fd, fcntl.LOCK_UN)
+                _os.close(lock_fd)
+                break  # Lock free → subprocess done
+            except BlockingIOError:
+                _os.close(lock_fd)
+                time.sleep(0.5)
+
+        # ── Step 4: Verify refs were refilled ──
+        needs_after, reasons_after = _fast_staleness_check(indexed_project)
+        assert "refs missing" not in reasons_after, (
+            f"Refs should be populated after bg reindex, got: {reasons_after}"
+        )
+        assert "indirect call sites missing" not in reasons_after, (
+            f"Indirect call sites should be populated, got: {reasons_after}"
+        )
+
+        # ── Step 5: Verify no false positive mtime detection ──
+        # The key fix: mtimes must NOT be reset to 0. After reindex,
+        # _count_modified_files must report 0 for unchanged files.
+        conn = open_db(db_path)
+        try:
+            ch = _config_hash(conn)
+            mod_count = _count_modified_files(conn, ch, indexed_project)
+            assert mod_count == 0, (
+                f"CRITICAL: {mod_count} files falsely detected as modified after reindex. "
+                "The mtime-reset bug would cause infinite reindex-respawn loop."
+            )
+
+            # Also verify refs are actually populated
+            ref_count_after = conn.execute(
+                "SELECT COUNT(*) FROM refs WHERE config_hash=?", (ch,)
+            ).fetchone()[0]
+            assert ref_count_after > 0, "Refs table should be populated after reindex"
+            print(f"  After reindex: reasons={reasons_after}, modified={mod_count}, refs={ref_count_after}")
+        finally:
+            conn.close()
+            _invalidate_modified_cache(ch)

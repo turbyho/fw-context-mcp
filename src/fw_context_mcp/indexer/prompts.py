@@ -26,6 +26,21 @@ log = logging.getLogger(__name__)
 # Maximum docstring length to include in the prompt (keeps token usage bounded)
 _MAX_DOCSTRING_CHARS = 400
 
+# Characters that would break JSON when reproduced by the model inside string
+# values.  Replaced with text descriptions before the prompt is built so the
+# model never sees them and cannot reproduce them literally.
+_JSON_UNSAFE_REPLACEMENTS = {
+    "\\": "[backslash]",
+    "\"": "[double-quote]",
+}
+
+
+def _sanitize_prompt_text(text: str) -> str:
+    """Replace characters that are unsafe to reproduce in JSON output."""
+    for char, replacement in _JSON_UNSAFE_REPLACEMENTS.items():
+        text = text.replace(char, replacement)
+    return text
+
 # System prompt for structured symbol analysis — example-driven to keep
 # inputs/outputs as flat strings (not nested objects).
 _ANALYSIS_SYSTEM = """You are a senior C/C++ embedded engineer writing comprehensive documentation.
@@ -36,6 +51,7 @@ For each symbol, output a JSON object with EXACTLY these three string fields:
   "outputs": a single string describing all outputs and side effects. For functions: return value, error codes, and all side effects. For classes: what the class provides and manages. Format as ONE STRING, not a JSON object.
 
 CRITICAL: "inputs" and "outputs" MUST be plain text strings. DO NOT use nested JSON objects like {"param": "desc"}. Write everything as a single string separated by semicolons or newlines.
+CRITICAL: NEVER output literal backslash or double-quote characters inside JSON string values. These break JSON syntax. Describe them by name instead: write "backslash" not backslash, write "double-quote" not double-quote.
 
 The symbol description always includes a ``body`` (the full function source — this is the PRIMARY source of information) and may include ``called functions`` (supplementary context only — to help you understand dependencies and the surrounding system).
 
@@ -69,6 +85,10 @@ def build_analysis_prompt(batch: list[dict[str, Any]]) -> str:
         body = (sym.get("body") or "").strip()
         callees: list[str] = sym.get("callees") or []
 
+        # Sanitize: replace characters that would break JSON when reproduced
+        doc = _sanitize_prompt_text(doc)
+        body = _sanitize_prompt_text(body)
+
         doc_display = doc[:_MAX_DOCSTRING_CHARS] if doc else "(NO DOCSTRING — infer from name, signature, file path, body, and callees)"
 
         entry = (
@@ -87,7 +107,10 @@ def build_analysis_prompt(batch: list[dict[str, Any]]) -> str:
 
         parts.append(entry)
 
-    return _ANALYSIS_SYSTEM + "\nSymbols:\n\n" + "\n\n".join(parts) + "\n\nJSON:"
+    prompt = _ANALYSIS_SYSTEM + "\nSymbols:\n\n" + "\n\n".join(parts) + "\n\nJSON:"
+    log.debug("LLM analysis prompt (%d symbols, %d chars):\n—— prompt ——\n%s\n—— end prompt ——",
+              len(batch), len(prompt), prompt)
+    return prompt
 
 
 def _flatten_value(value: Any) -> str:
@@ -108,6 +131,24 @@ def _flatten_value(value: Any) -> str:
     if isinstance(value, list):
         return "; ".join(_flatten_value(v) for v in value if v)
     return str(value).strip() if value else ""
+
+
+# Valid JSON escape sequences.  Anything else (e.g. ``\'``, ``\x``) is a
+# model error — the backslash is stripped so the character passes through
+# literally.
+_INVALID_JSON_ESCAPE = re.compile(r"\\(?![\"\\/bfnrt]|u[0-9a-fA-F]{4})")
+
+
+def _sanitize_json_escapes(text: str) -> str:
+    """Fix invalid JSON escape sequences produced by LLM output.
+
+    Models occasionally emit escapes like ``\\'`` (single quote) or ``\\x``
+    inside JSON strings.  These are not valid JSON and cause ``json.loads``
+    to raise ``JSONDecodeError``.  We strip the errant backslash, which is
+    the conservative fix — it preserves the intended character rather than
+    dropping the entire response.
+    """
+    return _INVALID_JSON_ESCAPE.sub("", text)
 
 
 def parse_analysis_response(
@@ -134,31 +175,48 @@ def parse_analysis_response(
     if text.endswith("```"):
         text = text[:-3].strip()
 
+    # Fix common LLM JSON mistakes before parsing
+    text = _sanitize_json_escapes(text)
+
     # Parse JSON
     parsed: list[dict[str, Any]] = []
     try:
         parsed = json.loads(text)
-    except json.JSONDecodeError:
+    except json.JSONDecodeError as e:
         # Fallback: find a JSON array anywhere in the text
         match = re.search(r"\[.*\]", text, re.DOTALL)
         if not match:
-            log.warning("Cannot parse LLM response as JSON: %.200s", response)
+            log.warning(
+                "Cannot parse LLM response as JSON: %s (line %d col %d)\n"
+                "—— response ——\n%s\n—— end response ——",
+                e.msg, e.lineno, e.colno, response,
+            )
             return None
         try:
             parsed = json.loads(match.group())
-        except json.JSONDecodeError:
-            log.warning("Cannot parse LLM response as JSON (fallback failed): %.200s", response)
+        except json.JSONDecodeError as e2:
+            log.warning(
+                "Cannot parse LLM response as JSON (fallback failed): %s (line %d col %d)\n"
+                "—— response ——\n%s\n—— end response ——",
+                e2.msg, e2.lineno, e2.colno, response,
+            )
             return None
+
+    log.debug(
+        "LLM analysis response parsed (%d entries):\n—— response ——\n%s\n—— end response ——",
+        len(parsed) if isinstance(parsed, list) else 1, response,
+    )
 
     # Single object → wrap in list (common with one symbol per request)
     if isinstance(parsed, dict):
         parsed = [parsed]
 
     if not isinstance(parsed, list):
-        log.warning("LLM response is not a JSON array: %.200s", response)
+        log.warning(
+            "LLM response is not a JSON array:\n—— response ——\n%s\n—— end response ——",
+            response,
+        )
         return None
-
-    # Map parsed entries to batch symbols by position
     result: list[dict[str, Any]] = []
     for i, entry in enumerate(parsed):
         if i >= len(batch):
@@ -228,7 +286,10 @@ def build_file_analysis_prompt(batch: list[dict]) -> str:
                 lines.append(f"   [{s['kind']}] {qn}")
         parts.append("\n".join(lines))
 
-    return _FILE_ANALYSIS_SYSTEM + "\nFiles:\n\n" + "\n\n".join(parts) + "\n\nJSON:"
+    prompt = _FILE_ANALYSIS_SYSTEM + "\nFiles:\n\n" + "\n\n".join(parts) + "\n\nJSON:"
+    log.debug("File analysis prompt (%d files, %d chars):\n—— prompt ——\n%s\n—— end prompt ——",
+              len(batch), len(prompt), prompt)
+    return prompt
 
 
 def parse_file_analysis_response(
@@ -251,43 +312,75 @@ def parse_file_analysis_response(
     if text.endswith("```"):
         text = text[:-3].strip()
 
+    # Fix common LLM JSON mistakes before parsing
+    text = _sanitize_json_escapes(text)
+
     parsed: list[dict] = []
     try:
         parsed = json.loads(text)
-    except json.JSONDecodeError:
+    except json.JSONDecodeError as e:
         match = re.search(r"\[.*\]", text, re.DOTALL)
         if not match:
-            log.warning("Cannot parse file analysis LLM response: %.200s", response)
+            log.warning(
+                "Cannot parse file analysis LLM response: %s (line %d col %d)\n"
+                "—— response ——\n%s\n—— end response ——",
+                e.msg, e.lineno, e.colno, response,
+            )
             return None
         try:
             parsed = json.loads(match.group())
-        except json.JSONDecodeError:
-            log.warning("Cannot parse file analysis LLM response (fallback): %.200s", response)
+        except json.JSONDecodeError as e2:
+            log.warning(
+                "Cannot parse file analysis LLM response (fallback): %s (line %d col %d)\n"
+                "—— response ——\n%s\n—— end response ——",
+                e2.msg, e2.lineno, e2.colno, response,
+            )
             return None
+
+    log.debug(
+        "File analysis response parsed (%d entries):\n—— response ——\n%s\n—— end response ——",
+        len(parsed) if isinstance(parsed, list) else 1, response,
+    )
 
     # Single object → wrap in list
     if isinstance(parsed, dict):
         parsed = [parsed]
 
     if not isinstance(parsed, list):
-        log.warning("File analysis LLM response is not a JSON array: %.200s", response)
+        log.warning(
+            "File analysis LLM response is not a JSON array:\n—— response ——\n%s\n—— end response ——",
+            response,
+        )
         return None
 
-    # Build a lookup by file path for matching
+    # Build a lookup by file path for matching.  Normalize paths:
+    # strip leading "./" and trailing slashes so suffix matching works
+    # regardless of how the path was stored in the DB.
     path_to_id: dict[str, int] = {}
     for entry in batch:
-        path_to_id[entry["path"]] = entry["file_id"]
+        norm = entry["path"].removeprefix("./").rstrip("/")
+        path_to_id[norm] = entry["file_id"]
+
+    log.debug("File analysis batch paths: %s", sorted(path_to_id.keys()))
 
     result: list[dict] = []
     for entry in parsed:
         if not isinstance(entry, dict):
             continue
-        file_path = entry.get("file", "")
+        file_path = entry.get("file", "").removeprefix("./").rstrip("/")
         summary = (entry.get("summary", "") or "").strip()
         if not summary:
             continue
-        # Match by path — exact first, then by unique basename, then suffix
+        # Match by path — exact first, then suffix (model may return absolute
+        # path while batch has relative), then unique basename
         file_id = path_to_id.get(file_path)
+        if file_id is None:
+            # Try suffix match: model returns absolute path like
+            # /home/.../mbed-os/foo/bar.c, batch has mbed-os/foo/bar.c
+            for path, fid in path_to_id.items():
+                if file_path.endswith(path) or path.endswith(file_path):
+                    file_id = fid
+                    break
         if file_id is None:
             # Try basename match (only if unique in this batch)
             basename_matches = [
@@ -297,13 +390,10 @@ def parse_file_analysis_response(
             if len(basename_matches) == 1:
                 file_id = basename_matches[0][1]
         if file_id is None:
-            # Last resort: suffix match (loose — may collide in large batches)
-            for path, fid in path_to_id.items():
-                if path.endswith(file_path) or file_path.endswith(path):
-                    file_id = fid
-                    break
-        if file_id is None:
-            log.warning("File analysis: cannot match path '%s' to batch", file_path)
+            log.warning(
+                "File analysis: cannot match path '%s' to batch %s",
+                file_path, sorted(path_to_id.keys()),
+            )
             continue
         result.append({"file_id": file_id, "summary": summary})
 

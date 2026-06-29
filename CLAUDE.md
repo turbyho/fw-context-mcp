@@ -115,6 +115,9 @@ Release workflow is documented in `.claude/skills/release.md`. Key rules:
 ### Install (development)
 
 ```bash
+# Create venv with pip (needed by IDE tooling):
+uv venv --seed
+# Install project in editable mode:
 uv pip install -e ".[dev]"
 ```
 

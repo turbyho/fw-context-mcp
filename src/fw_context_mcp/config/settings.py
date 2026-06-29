@@ -127,6 +127,7 @@ _PROJECT_LOCAL_DEFAULTS_TEMPLATE = """\
 # embed_model = "mxbai-embed-large:latest"   # embedding model for semantic search
 # analyze_symbols = true    # generate structured symbol descriptions (summary, inputs, outputs) — enabled by default
 # analyze_files = true      # generate per-file summaries (2-3 sentences) — enabled by default
+# analyze_vendor = false    # when true, also analyze vendor/SDK code (mbed-os, Zephyr, etc.) — can add hours
 
 [index]
 # db_dir = "~/.fw-context/index"   # where to store the SQLite index database
@@ -153,6 +154,9 @@ class LLMConfig:
         debug_log: Optional path to a JSONL file for debugging LLM prompts/responses.
         analyze_symbols: Generate per-symbol summaries, inputs, and outputs during indexing.
         analyze_files: Generate per-file summaries (2-3 sentences) during indexing.
+        analyze_vendor: When False (default), skip LLM analysis for vendor/SDK code
+            (mbed-os, Zephyr, PlatformIO, etc.) — only project code is analyzed.
+            Set True to analyze every indexed symbol regardless of origin.
     """
     enabled: bool = True
     ollama_url: str = "http://localhost:11434"
@@ -163,6 +167,7 @@ class LLMConfig:
     debug_log: Path | None = None
     analyze_symbols: bool = True
     analyze_files: bool = True
+    analyze_vendor: bool = False
 
 
 @dataclass
@@ -316,6 +321,8 @@ def _from_dict(data: dict) -> Config:
             cfg.llm.analyze_symbols = bool(llm["analyze_symbols"])
         if "analyze_files" in llm:
             cfg.llm.analyze_files = bool(llm["analyze_files"])
+        if "analyze_vendor" in llm:
+            cfg.llm.analyze_vendor = bool(llm["analyze_vendor"])
 
     return cfg
 

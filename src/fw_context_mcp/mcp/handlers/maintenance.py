@@ -30,7 +30,7 @@ from ...indexer.symbols import (
 )
 from ...llm.ollama import check_setup
 from ...utils import resolve_project_root
-from ..background import _is_bg_reindex_running, _start_bg_reindex_if_stale
+from ..background import _is_bg_reindex_running
 from ..shared.context import _db_path, _detect_build_system, _is_stale, _open_db_safe, _resolve_context
 from ..shared.stale import _count_modified_files
 
@@ -90,7 +90,7 @@ def get_active_build(
                 "SELECT COUNT(*) FROM files WHERE config_hash=?", (config_hash,)
             ).fetchone()[0]
             ref_count = count_refs(conn, config_hash)
-            modified_count = _count_modified_files(conn, config_hash, root)
+            modified_count = _count_modified_files(conn, config_hash, root, use_cache=True)
             db_schema_ver = get_db_schema_version(conn)
 
             # LLM analysis statistics
@@ -143,8 +143,9 @@ def get_active_build(
                 "stale": _is_stale(cfg, cfg["compile_commands_path"]) or modified_count > 0
                 or db_schema_ver < CURRENT_SCHEMA_VERSION,
             }
-        if modified_count > 0 or unanalyzed_count > 0:
-            _start_bg_reindex_if_stale(root)
+        # Background reindex is managed by the startup daemon thread and the
+        # file watcher — get_active_build() is a read-only tool and should
+        # not spawn subprocesses.
         bg_running = _is_bg_reindex_running(root)
         result["bg_reindex_running"] = bg_running
         if bg_running:
@@ -413,6 +414,8 @@ def reindex_file_impl(
                 }
             finally:
                 _resume_bg_reindex(root)
+                from ...mcp.shared.stale import _invalidate_modified_cache
+                _invalidate_modified_cache(config_hash)
 
         cc_path = Path(cfg_data["compile_commands_path"])
         if not cc_path.exists():
@@ -516,6 +519,8 @@ def reindex_file_impl(
                 return result
         finally:
             _resume_bg_reindex(root)
+            from ...mcp.shared.stale import _invalidate_modified_cache
+            _invalidate_modified_cache(config_hash)
     finally:
         conn.close()
 
