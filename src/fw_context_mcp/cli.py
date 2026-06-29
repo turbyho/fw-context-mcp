@@ -1,5 +1,7 @@
 """fw-context CLI — index and query firmware code intelligence."""
 
+# ruff: noqa: I001 — lazy imports in functions must stay near use sites
+
 from __future__ import annotations
 
 import argparse
@@ -473,14 +475,10 @@ def cmd_project_init(args: argparse.Namespace) -> int:
     ``.gitignore`` entries, and appends missing config options to
     existing files.
     """
-    import re
-
     from .config import load as load_config
     from .config.settings import (
         _PROJECT_DEFAULTS_TEMPLATE,
         _PROJECT_LOCAL_DEFAULTS_TEMPLATE,
-        _ensure_project_config,
-        _ensure_project_local_config,
     )
 
     project_root = Path(args.project or ".").resolve()
@@ -488,7 +486,7 @@ def cmd_project_init(args: argparse.Namespace) -> int:
     fix = args.fix
 
     label = "[fix]" if fix else "[info]"
-    print(f"Project: {project_root}")
+    print(f"{label} Project: {project_root}")
     if fix:
         print("Mode: fix — applying corrections\n")
     else:
@@ -560,7 +558,7 @@ def cmd_project_init(args: argparse.Namespace) -> int:
         except Exception as e:
             print(f"  [warn] cannot read index: {e}")
     else:
-        print(f"  [info] no index yet — run 'fw-context index' to build")
+        print("  [info] no index yet — run 'fw-context index' to build")
 
     if fix:
         print("\nProject fixed. Run 'fw-context index' to (re)build the index.")

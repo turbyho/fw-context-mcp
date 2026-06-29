@@ -21,7 +21,7 @@ _src = _repo_root / "src"
 if str(_src) not in sys.path:
     sys.path.insert(0, str(_src))
 
-from fw_context_mcp.mcp.server import (
+from fw_context_mcp.mcp.server import (  # noqa: E402 — sys.path setup must precede
     check_ollama,
     explain_symbol,
     find_all_callers_recursive,
@@ -416,7 +416,6 @@ def run_tests_for_project(proj: dict, results: CheckResults) -> None:
     sym = proj["test_symbols"]
     has_refs = proj["has_refs"]
     has_cls = proj["has_classes"]
-    has_inh = proj["has_inheritance"]
     has_tpl = proj["has_templates"]
     has_virt = proj["has_virtual"]
     has_drv = proj["has_driver"]
@@ -460,7 +459,6 @@ def run_tests_for_project(proj: dict, results: CheckResults) -> None:
         results.check("check_ollama → returns dict", isinstance(ollama, dict))
         results.check("check_ollama → has status", "status" in ollama)
         results.check("check_ollama → has ollama_running", "ollama_running" in ollama)
-    ollama_available = ollama and ollama.get("ollama_running", False)
 
     # ═══ 2. SYMBOL LOOKUP ═══════════════════════════════════════════════════════
     results.section("2. Symbol Lookup")
