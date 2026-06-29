@@ -1074,6 +1074,18 @@ class TestStoreSymbolsForUnitAnalysisRestore:
             "UPDATE symbols SET summary='Test function.', inputs='none', outputs='void' WHERE id=?",
             (sym_id,),
         )
+
+        # Populate content-addressable cache — Phase 3 now reads from cache
+        from fw_context_mcp.utils import compute_content_hash
+        content_hash = compute_content_hash(
+            "void foo(void) {\n    return;\n}\n", "foo", "void foo(void)", "",
+        )
+        conn.execute(
+            """INSERT OR REPLACE INTO llm_analysis_cache
+               (content_hash, summary, inputs, outputs, model, analyzed_at)
+               VALUES (?, ?, ?, ?, ?, datetime('now'))""",
+            (content_hash, "Test function.", "none", "void", "test"),
+        )
         conn.commit()
 
         # Verify analysis exists before
@@ -1279,6 +1291,17 @@ class TestStoreSymbolsForUnitAnalysisRestore:
         conn.execute(
             "UPDATE symbols SET summary='Returns magic number.', inputs='none', outputs='42' WHERE id=?",
             (sym_id,),
+        )
+
+        from fw_context_mcp.utils import compute_content_hash
+        content_hash = compute_content_hash(
+            "int calc(void) {\n    return 42;\n}\n", "calc", "int calc(void)", "",
+        )
+        conn.execute(
+            """INSERT OR REPLACE INTO llm_analysis_cache
+               (content_hash, summary, inputs, outputs, model, analyzed_at)
+               VALUES (?, 'Returns magic number.', 'none', '42', 'test', datetime('now'))""",
+            (content_hash,),
         )
         conn.commit()
 
