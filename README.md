@@ -596,8 +596,18 @@ message queue has no static call path.
 
 ### Precompiled libraries
 
-Nordic SoftDevice, TI BLE stack, precompiled WiFi blobs — no source to index.
-Calls into them will have missing callee edges.
+Nordic SoftDevice, TI BLE stack, precompiled WiFi blobs — the implementation
+is a binary `.a`/`.o` with no source to index.  **Headers are still indexed**
+as long as they live under a project source root (`lib/`, `include/`, etc.),
+so the API surface (function declarations, type definitions, enums) is fully
+searchable.  What's missing:
+
+- **Function bodies** — `get_source("sd_ble_stack_init")` returns empty.
+- **Internal call-graph edges** — calls made *inside* the precompiled library
+  are invisible.
+- **Callee edges from project code** — when your code calls into the library,
+  the call site is recorded, but `get_symbol_context` for the calling function
+  won't list the library function as a callee (the definition side is missing).
 
 ### Proprietary IDEs without compile_commands.json
 
