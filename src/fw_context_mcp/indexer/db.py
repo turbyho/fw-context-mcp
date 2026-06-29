@@ -854,8 +854,13 @@ def open_db(path: Path, *, skip_integrity_check: bool = False) -> sqlite3.Connec
 
     # Integrity check — detect corruption early, before any tool uses the DB.
     # Skip for auxiliary connections (worker threads, pooled connections)
-    # where the check already ran on the primary connection.  On 5+ GB
-    # databases a full scan takes 15–30 s and saturates disk I/O.
+    # where the check already ran on the primary connection.
+    #
+    # GOTCHA — on 5+ GB databases a full scan takes 15–30 s and saturates
+    # disk I/O.  Never call this during MCP server startup (even in a
+    # background thread — the I/O contention delays first queries).
+    # server.py pre-marks _integrity_checked to skip it; the DB was already
+    # verified during ``fw-context index``.  See server.py:324-328.
     if not skip_integrity_check:
         try:
             result = conn.execute("PRAGMA integrity_check").fetchone()

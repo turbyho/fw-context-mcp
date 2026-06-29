@@ -36,6 +36,7 @@ from .background import (
 from .handlers import callgraph, inheritance, maintenance, search, source
 from .handlers.maintenance import get_active_build, list_projects, reindex_file_impl  # noqa: F401 — backward compat
 from .handlers.source import _read_symbol_body, get_source  # noqa: F401 — backward compat
+from .shared.context import _db_path, _integrity_checked
 
 log = logging.getLogger(__name__)
 
@@ -304,15 +305,50 @@ def main() -> None:
     """Start the FastMCP stdio server — entry point for the ``fw-context-mcp`` command.
 
     On startup:
-    1. Spawns a file-watch daemon that reindexes changed source files on the fly.
-    2. If the CWD project index is stale, kicks off a background
-       ``fw-context index`` (including LLM analysis) so the index is fresh
-       by the time the AI agent makes its first query.
+    1. Pre-marks the database as integrity-checked so ``_open_db_safe`` never
+       blocks on ``PRAGMA integrity_check`` (10-30 s on large DBs).  The check
+       already ran during ``fw-context index``; re-running it at every server
+       start would saturate disk I/O and delay the first MCP query.
+    2. Spawns a file-watch daemon that reindexes changed source files on the fly.
+    3. If the CWD project index needs work, kicks off a background
+       ``fw-context index`` in a daemon thread — ``mcp.run()`` starts
+       immediately regardless of index size.  The staleness check uses
+       only lightweight COUNT queries and at most one ``stat()`` call.
     """
     try:
         root = resolve_project_root(None)
-        _start_bg_watcher(root)
-        _start_bg_reindex_if_stale(root)
     except Exception:
-        log.exception("Background service startup failed — auto-reindex and file watching unavailable")
+        log.exception("Failed to resolve project root, server starting without DB")
+        mcp.run()
+        return
+
+    # GOTCHA — integrity_check on large DBs is I/O-bound (10-30 s for
+    # 3+ GB).  If it runs here via _open_db_safe during MCP server startup,
+    # the MCP client times out during tool discovery and fw-context tools
+    # never appear.  The check already ran during ``fw-context index``, so
+    # we skip it by pre-marking the DB — a corrupt DB will be caught by
+    # individual queries via _open_db_safe.
+    db_path = _db_path(root)
+    if db_path.exists():
+        _integrity_checked.add(str(db_path.resolve()))
+
+    try:
+        _start_bg_watcher(root)
+        # Defer staleness check to a daemon thread so mcp.run() starts
+        # immediately.  _start_bg_reindex_if_stale opens the database
+        # and stats files — on large projects (3+ GB, 100k+ files)
+        # this takes 5-30 s and would cause MCP tool-discovery timeouts.
+        import threading
+        threading.Thread(
+            target=_start_bg_reindex_if_stale,
+            args=(root,),
+            daemon=True,
+            name="fw-context-startup",
+        ).start()
+    except Exception:
+        log.exception(
+            "Background service startup failed — "
+            "auto-reindex and file watching unavailable"
+        )
+
     mcp.run()

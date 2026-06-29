@@ -23,22 +23,23 @@ Three levels of TOML files, merged in order (later overrides earlier):
 everyone on the project — build parameters, source roots, excludes. Commit it
 to git. `local.toml` holds developer-specific settings — which Ollama model you
 have installed, where your index database lives, whether you want LLM analysis
-enabled. Keep it out of git (add to `.gitignore`).
+enabled. Keep it out of git.
 
-All files are auto-created with commented-out defaults on first use.
+Run ``fw-context project-init`` to auto-create the config files and add the
+necessary entries to ``.gitignore``. All files are created with commented-out
+defaults on first use.
 
 ## Settings reference
 
 ### `[build]` — Build system
 
 Controls how `fw-context index` generates `compile_commands.json`.
-Used only when running without `--no-build`.
+Used only when running with ``--build`` or when ``compile_commands.json``
+doesn't exist yet.
 
-> **⚠️ Every `fw-context index` without `--no-build` triggers a full
-> re-index** — the build step regenerates ``compile_commands.json``,
-> which produces a new config hash, so every translation unit is
-> re-parsed from scratch.  For fast incremental indexing (seconds),
-> use ``fw-context index --no-build`` after the initial run.
+> **Incremental is the default.**  ``fw-context index`` reuses an existing
+> ``compile_commands.json`` whenever possible.  Use ``fw-context index --build``
+> to force a clean build and full re-index when needed.
 
 | Key | Default | Scope | Description |
 |-----|---------|-------|-------------|

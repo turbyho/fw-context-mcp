@@ -10,7 +10,6 @@ import logging
 import os
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import nullcontext
 from pathlib import Path
 
@@ -135,6 +134,42 @@ def _add_external_root(tu_path: Path, roots: list[Path], seen: set[Path]) -> Non
                 return
 
 
+def _detect_sdk_exclude_like(project_root: Path, extra_exclude: list[str] | None = None) -> list[str]:
+    """Return LIKE patterns for SDK/vendor directories present in *project_root*.
+
+    Auto-detects known ecosystem markers and returns patterns with a ``%``
+    prefix so they match both relative (``mbed-os/...``) and absolute
+    (``/home/.../mbed-os/...``) paths in the files table.
+
+    Merges with *extra_exclude* from the project config (``exclude_paths``).
+    """
+    patterns: list[str] = []
+
+    _MARKERS: dict[str, str] = {
+        "mbed-os": "mbed-os",
+        "zephyr": "zephyr",
+        ".pio": ".pio",
+        "modules": "modules",
+    }
+
+    for marker_dir, pattern_base in _MARKERS.items():
+        if (project_root / marker_dir).is_dir():
+            patterns.append(f"%{pattern_base}/%")
+
+    # Build output directories (build/BUILD) — always added as they are
+    # common across all ecosystems and the config default includes them.
+    for build_dir in ("build", "BUILD"):
+        patterns.append(f"%{build_dir}/%")
+
+    if extra_exclude:
+        for p in extra_exclude:
+            p = p.strip("/")
+            if p and f"%{p}/%" not in patterns:
+                patterns.append(f"%{p}/%")
+
+    return patterns
+
+
 def _build_embeddings(conn, config_hash: str, llm_config, db_dir: Path) -> None:
     """Generate and store vector embeddings for all definition symbols.
 
@@ -164,6 +199,7 @@ def _build_embeddings(conn, config_hash: str, llm_config, db_dir: Path) -> None:
         log.warning("Ollama not reachable — skipping embedding generation")
         return
 
+    model = llm_config.embed_model
     with transaction(conn):
         rows = conn.execute(
             """SELECT s.id, s.name, s.qualified_name, s.kind, s.file_path,
@@ -173,11 +209,13 @@ def _build_embeddings(conn, config_hash: str, llm_config, db_dir: Path) -> None:
                  AND s.is_definition = 1
                  AND s.kind IN ('function', 'method', 'constructor', 'destructor',
                                 'class', 'struct')
+                 AND s.id NOT IN (SELECT symbol_id FROM embeddings WHERE model = ?)
                ORDER BY CASE WHEN s.docstring IS NOT NULL AND LENGTH(s.docstring) > 30
                           THEN 0 ELSE 1 END""",
-            (config_hash,),
+            (config_hash, model),
         ).fetchall()
         if not rows:
+            log.info("All definition symbols already embedded (model=%s) — nothing to do", model)
             return
 
     # Build descriptions using the same format as embed phase
@@ -211,7 +249,6 @@ def _build_embeddings(conn, config_hash: str, llm_config, db_dir: Path) -> None:
             parts.append(llm)
         descriptions.append(" : ".join(p for p in parts if p))
 
-    model = llm_config.embed_model
     total = 0
     chunk_size = 100
     for i in range(0, len(rows), chunk_size):
@@ -307,7 +344,7 @@ def _enrich_batch(conn, batch_rows, config_hash: str) -> list[dict]:
     return enriched
 
 
-def _build_llm_analysis(conn, config_hash: str, llm_config, db_dir: Path, *, write_lock_held: bool = False) -> None:
+def _build_llm_analysis(conn, config_hash: str, llm_config, db_dir: Path, *, exclude_like: list[str] | None = None, write_lock_held: bool = False) -> None:
     """Generate structured LLM analysis (summary, inputs, outputs) for each
     project-definition symbol using Ollama, one symbol per request.
 
@@ -320,6 +357,8 @@ def _build_llm_analysis(conn, config_hash: str, llm_config, db_dir: Path, *, wri
 
     *db_dir* is the directory containing the index database — used for the
     write lock that serializes DB access across processes.
+    *exclude_like* are LIKE patterns for SDK/vendor paths to skip
+    (auto-detected from project structure when omitted).
     """
     import httpx
 
@@ -334,9 +373,11 @@ def _build_llm_analysis(conn, config_hash: str, llm_config, db_dir: Path, *, wri
         log.warning("Ollama not reachable — skipping LLM analysis generation")
         return
 
-    with transaction(conn):
-        rows = conn.execute(
-            """SELECT s.id, s.name, s.qualified_name, s.kind, s.file_path,
+    if exclude_like is None:
+        exclude_like = []
+
+    exclude_clauses = " AND ".join(["s.file_path NOT LIKE ?"] * len(exclude_like))
+    query = """SELECT s.id, s.name, s.qualified_name, s.kind, s.file_path,
                       s.signature, s.is_definition, s.docstring,
                       s.end_line, s.line, s.usr,
                       f.path as abs_path
@@ -345,16 +386,14 @@ def _build_llm_analysis(conn, config_hash: str, llm_config, db_dir: Path, *, wri
                WHERE s.config_hash = ?
                  AND s.is_definition = 1
                  AND s.kind IN ('function', 'method', 'constructor', 'destructor',
-                                'class', 'struct')
-                 AND s.file_path NOT LIKE 'mbed-os/%'
-                 AND s.file_path NOT LIKE '.pio/%'
-                 AND s.file_path NOT LIKE 'zephyr/%'
-                 AND s.file_path NOT LIKE 'build/%'
-                 AND s.file_path NOT LIKE 'modules/%'
-                 AND s.id NOT IN (SELECT symbol_id FROM llm_analysis)
-               ORDER BY s.kind, s.file_path, s.line""",
-            (config_hash,),
-        ).fetchall()
+                                'class', 'struct')"""
+    if exclude_clauses:
+        query += f" AND {exclude_clauses}"
+    query += """ AND s.id NOT IN (SELECT symbol_id FROM llm_analysis)
+               ORDER BY s.kind, s.file_path, s.line"""
+
+    with transaction(conn):
+        rows = conn.execute(query, (config_hash, *exclude_like)).fetchall()
         if not rows:
             log.info("All project symbols already analyzed — nothing to do")
             return
@@ -398,15 +437,16 @@ def _build_llm_analysis(conn, config_hash: str, llm_config, db_dir: Path, *, wri
     log.info("LLM analysis stored: %d/%d symbols (model=%s)", total, total_symbols, model)
 
 
-def _build_file_analysis(conn, config_hash: str, llm_config, db_dir: Path, extra_exclude_like: list[str] | None = None, *, write_lock_held: bool = False) -> None:
+def _build_file_analysis(conn, config_hash: str, llm_config, db_dir: Path, exclude_like: list[str] | None = None, *, write_lock_held: bool = False) -> None:
     """Generate file-level LLM analysis (2-3 sentence summaries) for project
     source files using Ollama in batches of 5.
 
     Uses the already-indexed symbols table to describe what each file is
     responsible for.  Only project files are analyzed (non-SDK).
 
-    *extra_exclude_like* are additional LIKE patterns (relative to project
-    root) to exclude, merged with the built-in SDK patterns.
+    *exclude_like* are LIKE patterns for paths to exclude (auto-detected
+    SDK roots + project config ``exclude_paths``).  When empty/None, all
+    files are candidates.
     """
     import httpx
 
@@ -420,26 +460,23 @@ def _build_file_analysis(conn, config_hash: str, llm_config, db_dir: Path, extra
         log.warning("Ollama not reachable — skipping file analysis generation")
         return
 
-    # Gather files with their representative symbols (up to 30 per file).
-    # Built-in SDK exclusions cover common embedded ecosystems; project-specific
-    # exclude_paths (from .fw-context/config.toml) are appended.
-    _SDK_EXCLUDES = ["mbed-os/%", ".pio/%", "zephyr/%", "build/%", "modules/%"]
-    exclude_patterns = list(_SDK_EXCLUDES)
-    if extra_exclude_like:
-        exclude_patterns.extend(extra_exclude_like)
-    where_clauses = " AND ".join(["f.path NOT LIKE ?"] * len(exclude_patterns))
-    query = f"""SELECT f.id AS file_id, f.path,
+    if exclude_like is None:
+        exclude_like = []
+
+    where_clauses = " AND ".join(["f.path NOT LIKE ?"] * len(exclude_like))
+    query = """SELECT f.id AS file_id, f.path,
                        COUNT(s.id) AS sym_count
                 FROM files f
                 JOIN symbols s ON s.file_id = f.id AND s.config_hash = ?
-                WHERE f.config_hash = ?
-                  AND {where_clauses}
-                  AND f.id NOT IN (SELECT file_id FROM file_analysis)
+                WHERE f.config_hash = ?"""
+    if where_clauses:
+        query += f" AND {where_clauses}"
+    query += """ AND f.id NOT IN (SELECT file_id FROM file_analysis)
                 GROUP BY f.id
                 ORDER BY sym_count DESC"""
     with transaction(conn):
         file_rows = conn.execute(
-            query, (config_hash, config_hash, *exclude_patterns),
+            query, (config_hash, config_hash, *exclude_like),
         ).fetchall()
         if not file_rows:
             log.info("All project files already analyzed — nothing to do")
@@ -597,6 +634,14 @@ def _build_overrides(conn, config_hash: str, db_dir: Path, *, write_lock_held: b
     """
     from .db import insert_overrides_batch
 
+    # Idempotency: if overrides were already built for this config, skip
+    row = conn.execute(
+        "SELECT COUNT(*) FROM overrides WHERE config_hash = ?", (config_hash,)
+    ).fetchone()
+    if row and row[0] > 0:
+        log.info("Override graph already built (%d relationships) — nothing to do", row[0])
+        return
+
     total = 0
 
     # Phase 1: collect all virtual/pure-virtual project methods with parent class info
@@ -738,7 +783,8 @@ def _process_unit(unit, config_hash, project_root, source_roots, exclude_paths, 
         return ("unchanged", 0, 0, (0.0, 0.0, 0.0))
 
     file_path = str(unit.file)
-    if file_path in existing_files:
+    force_refs = os.environ.get("FW_CONTEXT_FORCE_REFINDEX") == "1"
+    if not force_refs and file_path in existing_files:
         _, stored_mtime = existing_files[file_path]
         try:
             current_mtime = unit.file.stat().st_mtime if unit.file.exists() else 0.0
@@ -865,10 +911,9 @@ def run(
         llm_config: Configuration dataclass for Ollama connection (URL,
             model names, enabled flag).  Required when any ``index_*`` or
             ``analyze_*`` option is enabled.
-        parallel: When True (default), use a ``ThreadPoolExecutor`` with
-            up to 2 workers to parse multiple translation units concurrently.
-            libclang releases the GIL during parsing, so threads provide real
-            parallelism.  Set to False for debugging or single-core systems.
+        parallel: Deprecated — kept for backward compatibility.  All
+            indexing is now sequential with per-TU write locks so manual
+            operations (reindex_file) can interleave via the pause marker.
 
     Returns:
         The ``config_hash`` string — a content-addressable fingerprint of the
@@ -969,102 +1014,36 @@ def run(
                 return
             time.sleep(1.0)  # Wait, then check again
 
-    _wait_if_paused()
-
-    if parallel and len(units) > 1:
-        # Single worker — libclang parsing through ctypes does not
-        # meaningfully release the GIL in practice (tested).  Multiple
-        # workers only increase memory pressure (multiple ASTs in RAM)
-        # without measurable speedup.
-        max_workers = 1
-
-        # ── Intra-process lock ──
-        # threading.Lock is user-space (no syscall per poll iteration).
-        # fcntl write_lock is acquired ONCE around the entire parallel
-        # block for cross-process protection (background reindex).
-        db_lock = threading.Lock()
-
-        # ── Per-thread persistent connections ──
-        # Each worker thread opens one SQLite connection lazily (on first
-        # use) and reuses it across TUs.  Without this, open_db() runs
-        # PRAGMA integrity_check on the entire 6+ GB DB for every TU.
-        _tlocal = threading.local()
-
-        def _worker_conn_factory():
-            """Lazy thread-local connection — called inside _process_unit."""
-            if not hasattr(_tlocal, "conn"):
-                # integrity_check already ran on the main connection;
-                # skip it for workers — scanning 6+ GB per worker
-                # saturates disk I/O and delays writes by minutes.
-                _tlocal.conn = open_db(db_path, skip_integrity_check=True)
-            return _tlocal.conn
-
-        with write_lock(db_path.parent, timeout=60.0):
-            with ThreadPoolExecutor(max_workers=max_workers) as executor:
-                futures = {
-                    executor.submit(
-                        _process_unit, u, config_hash, project_root,
-                        source_roots, exclude_paths, index_refs, db_path, existing_files,
-                        lock=db_lock, conn=_worker_conn_factory,
-                    ): (i, u.file.name)
-                    for i, u in enumerate(units)
-                }
-                processed = 0
-                for future in as_completed(futures):
-                    idx, fname = futures[future]
-                    try:
-                        status, syms, refs, timing = future.result()
-                    except Exception as exc:
-                        processed += 1
-                        skipped += 1
-                        log.warning("[%d/%d] %s: FAILED — %s", processed, len(units), fname, exc)
-                        continue
-                    processed += 1
-                    if status == "updated":
-                        updated += 1
-                        total_syms += syms
-                        total_refs += refs
-                        acc_parse += timing[0]
-                        acc_lock += timing[1]
-                        acc_write += timing[2]
-                        log.info(
-                            "[%d/%d] %s: %d syms, %d refs, %.1fs",
-                            processed, len(units), fname, syms, refs, sum(timing),
-                        )
-                    elif status == "unchanged":
-                        unchanged += 1
-                        log.info("[%d/%d] %s: unchanged", processed, len(units), fname)
-                    elif status == "skipped":
-                        skipped += 1
-                        log.info("[%d/%d] %s: skipped", processed, len(units), fname)
-    else:
-        # Sequential path — uses per-TU transactions; wrap in fcntl lock
-        # once so a background reindex cannot interleave writes.
-        with write_lock(db_path.parent, timeout=60.0):
-            for i, unit in enumerate(units):
-                fname = unit.file.name
-                status, syms, refs, timing = _process_unit(
-                    unit, config_hash, project_root,
-                    source_roots, exclude_paths, index_refs, db_path, existing_files,
+    # Single sequential loop with per-TU write lock for responsiveness.
+    # The lock is acquired and released for each translation unit so that
+    # manual operations (reindex_file, reset_index) can interleave via
+    # the pause marker mechanism instead of blocking for 60+ seconds.
+    for i, unit in enumerate(units):
+        _wait_if_paused()  # Check pause marker before each TU
+        with write_lock(db_path.parent, timeout=120.0):
+            fname = unit.file.name
+            status, syms, refs, timing = _process_unit(
+                unit, config_hash, project_root,
+                source_roots, exclude_paths, index_refs, db_path, existing_files,
+            )
+            processed = i + 1
+            if status == "updated":
+                updated += 1
+                total_syms += syms
+                total_refs += refs
+                acc_parse += timing[0]
+                acc_lock += timing[1]
+                acc_write += timing[2]
+                log.info(
+                    "[%d/%d] %s: %d syms, %d refs, %.1fs",
+                    processed, len(units), fname, syms, refs, sum(timing),
                 )
-                processed = i + 1
-                if status == "updated":
-                    updated += 1
-                    total_syms += syms
-                    total_refs += refs
-                    acc_parse += timing[0]
-                    acc_lock += timing[1]
-                    acc_write += timing[2]
-                    log.info(
-                        "[%d/%d] %s: %d syms, %d refs, %.1fs",
-                        processed, len(units), fname, syms, refs, sum(timing),
-                    )
-                elif status == "unchanged":
-                    unchanged += 1
-                    log.info("[%d/%d] %s: unchanged", processed, len(units), fname)
-                elif status == "skipped":
-                    skipped += 1
-                    log.info("[%d/%d] %s: skipped", processed, len(units), fname)
+            elif status == "unchanged":
+                unchanged += 1
+                log.info("[%d/%d] %s: unchanged", processed, len(units), fname)
+            elif status == "skipped":
+                skipped += 1
+                log.info("[%d/%d] %s: skipped", processed, len(units), fname)
 
     # Rebuild FTS5 table from the now-complete symbols table — restores
     # full-text search after the triggers were dropped before indexing.
@@ -1083,31 +1062,37 @@ def run(
         acc_parse, acc_lock, acc_write, t_fts,
     )
 
+    # Post-processing — each function handles its own idempotency
+    # (returns immediately when data already exists).
+
+    # Compute SDK exclude patterns once (auto-detected from project structure
+    # + config exclude_paths).  When analyze_vendor is True, skip exclusion
+    # so vendor/SDK code is also analyzed.
+    if llm_config is not None and llm_config.analyze_vendor:
+        exclude_like: list[str] = []
+    else:
+        config_exclude_strs = [str(p.relative_to(project_root)) for p in exclude_paths
+                               if p.is_relative_to(project_root)]
+        exclude_like = _detect_sdk_exclude_like(project_root, config_exclude_strs)
+
     # Embedding generation (opt-in)
     if index_embeddings and llm_config is not None and llm_config.enabled:
-        log.info("Generating embeddings for %d symbols...", total_syms)
+        log.info("Generating embeddings...")
         _build_embeddings(conn, config_hash, llm_config, db_path.parent)
         conn.commit()
 
     # LLM analysis generation (opt-in)
     if analyze_symbols and llm_config is not None and llm_config.enabled:
         log.info("Generating LLM analysis for project symbols...")
-        _build_llm_analysis(conn, config_hash, llm_config, db_path.parent)
+        _build_llm_analysis(conn, config_hash, llm_config, db_path.parent,
+                           exclude_like=exclude_like)
         conn.commit()
 
     # File-level LLM analysis (opt-in, runs after symbol analysis)
     if analyze_files and llm_config is not None and llm_config.enabled:
         log.info("Generating file-level LLM analysis...")
-        # Convert absolute exclude paths to LIKE patterns relative to project root
-        extra_like: list[str] = []
-        if exclude_paths:
-            for ep in exclude_paths:
-                try:
-                    rel = ep.resolve().relative_to(project_root)
-                    extra_like.append(str(rel) + "/%")
-                except ValueError:
-                    pass  # path not under project_root — skip
-        _build_file_analysis(conn, config_hash, llm_config, db_path.parent, extra_exclude_like=extra_like)
+        _build_file_analysis(conn, config_hash, llm_config, db_path.parent,
+                            exclude_like=exclude_like)
         conn.commit()
 
     # Method override tracking (post-processing, no LLM needed)

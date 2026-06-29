@@ -14,6 +14,23 @@ from .context import _open_db_safe
 
 log = logging.getLogger(__name__)
 
+# ── Mtime cache ──
+# Cache for _count_modified_files results with a 30-second TTL.
+# Invalidation is done explicitly by _invalidate_modified_cache after
+# write operations (reindex_file_impl, file watcher).  The background
+# reindex is a separate OS process and cannot invalidate this cache;
+# the TTL ensures staleness is bounded to at most 30 seconds.
+_modified_cache: dict[str, tuple[float, int]] = {}
+_MTIME_CACHE_TTL: float = 30.0
+
+
+def _invalidate_modified_cache(config_hash: str | None = None) -> None:
+    """Invalidate the mtime cache.  If *config_hash* is None, clear all entries."""
+    if config_hash:
+        _modified_cache.pop(config_hash, None)
+    else:
+        _modified_cache.clear()
+
 
 def _stale_files(conn, config_hash: str, file_paths: list[str]) -> list[str]:
     """Return the subset of *file_paths* whose on-disk mtime is newer than the index."""
@@ -32,11 +49,29 @@ def _stale_files(conn, config_hash: str, file_paths: list[str]) -> list[str]:
     return stale
 
 
-def _count_modified_files(conn, config_hash: str, root: Path) -> int:
+def _count_modified_files(
+    conn,
+    config_hash: str,
+    root: Path,
+    *,
+    use_cache: bool = False,
+) -> int:
     """Count files whose on-disk mtime is newer than the stored mtime.
 
     Files with mtime=0 (pre-migration databases) are always counted as modified.
+
+    When *use_cache* is True and a cached value is less than
+    ``_MTIME_CACHE_TTL`` seconds old, the cached value is returned.
+    Call ``_invalidate_modified_cache(config_hash)`` after any write
+    operation that changes file mtimes.
     """
+    if use_cache:
+        cached = _modified_cache.get(config_hash)
+        if cached is not None:
+            ts, count = cached
+            if time.monotonic() - ts < _MTIME_CACHE_TTL:
+                return count
+
     modified = 0
     rows = conn.execute(
         "SELECT path, mtime FROM files WHERE config_hash=?", (config_hash,)
@@ -56,6 +91,9 @@ def _count_modified_files(conn, config_hash: str, root: Path) -> int:
                 modified += 1
         except OSError:
             pass
+
+    if use_cache:
+        _modified_cache[config_hash] = (time.monotonic(), modified)
     return modified
 
 

@@ -15,13 +15,11 @@ from . import __version__
 def cmd_index(args: argparse.Namespace) -> int:
     """Build or rebuild the symbol index from compile_commands.json.
 
-    By default, generates ``compile_commands.json`` from a clean build
-    (auto-detecting Mbed OS / Zephyr / PlatformIO), then parses every
-    translation unit with libclang and stores symbols, references,
-    and optionally embeddings + LLM analysis in SQLite.
+    By default, reuses an existing ``compile_commands.json`` for fast
+    incremental indexing.  When the file is missing, a clean build is
+    triggered automatically (auto-detecting Mbed OS / Zephyr / PlatformIO).
 
-    Pass an explicit ``compile_commands.json`` path or ``--no-build`` to
-    skip the build step and use an existing compilation database.
+    Pass ``--build`` to force a fresh build and full re-index.
     """
     from .config import derive_project_id
     from .config import load as load_config
@@ -37,25 +35,10 @@ def cmd_index(args: argparse.Namespace) -> int:
     cfg = load_config(project_root=project_root)
 
     # Resolve compile_commands.json path
-    # Explicit path in positional arg implies --no-build
     explicit_cc = bool(args.compile_commands)
 
-    if args.no_build or explicit_cc:
-        # Use existing compile_commands.json
-        compile_commands = Path(args.compile_commands) if explicit_cc else cfg.index.compile_commands
-        if not compile_commands.is_absolute():
-            compile_commands = (project_root / compile_commands).resolve()
-        if not compile_commands.exists():
-            print(f"error: {compile_commands} not found", file=sys.stderr)
-            print("  Run 'fw-context index' without arguments to build and index automatically.", file=sys.stderr)
-            return 1
-
-        # Warn if compile_commands.json looks incomplete
-        from .indexer.build import check_completeness
-        for warning in check_completeness(compile_commands, project_root):
-            print(f"warning: {warning}", file=sys.stderr)
-    else:
-        # Default: generate compile_commands.json from a freshly built build
+    if args.build:
+        # Explicit build requested — always run build
         from .indexer.build import generate_compile_commands
 
         build_cfg = cfg.build
@@ -67,6 +50,39 @@ def cmd_index(args: argparse.Namespace) -> int:
         except RuntimeError as exc:
             print(f"error: {exc}", file=sys.stderr)
             return 1
+    elif explicit_cc:
+        # Explicit compile_commands.json path given — use as-is
+        compile_commands = Path(args.compile_commands)
+        if not compile_commands.is_absolute():
+            compile_commands = (project_root / compile_commands).resolve()
+        if not compile_commands.exists():
+            print(f"error: {compile_commands} not found", file=sys.stderr)
+            print("  Run 'fw-context index --build' to build and index automatically.", file=sys.stderr)
+            return 1
+
+        # Warn if compile_commands.json looks incomplete
+        from .indexer.build import check_completeness
+        for warning in check_completeness(compile_commands, project_root):
+            print(f"warning: {warning}", file=sys.stderr)
+    else:
+        # Default: reuse existing compile_commands.json, build only if missing
+        from .indexer.build import check_completeness, generate_compile_commands
+
+        compile_commands = cfg.index.compile_commands
+        if not compile_commands.is_absolute():
+            compile_commands = (project_root / compile_commands).resolve()
+        if not compile_commands.exists():
+            print("compile_commands.json not found, running build...", file=sys.stderr)
+            try:
+                compile_commands = generate_compile_commands(project_root, cfg.build)
+                print(f"Generated: {compile_commands}")
+            except RuntimeError as exc:
+                print(f"error: {exc}", file=sys.stderr)
+                return 1
+        else:
+            # Warn if compile_commands.json looks incomplete
+            for warning in check_completeness(compile_commands, project_root):
+                print(f"warning: {warning}", file=sys.stderr)
 
     project_id = derive_project_id(project_root)
 
@@ -435,6 +451,7 @@ def cmd_init(args: argparse.Namespace) -> int:
         local_config = _ensure_project_local_config(project_root)
         print(f"\n[ok] {proj_config}: shared project config ready — edit source_roots, excludes, etc. (commit to git)")
         print(f"[ok] {local_config}: local developer config ready — edit ollama_url, model, etc. (gitignore)")
+        print("  Run 'fw-context project-init' to set up .gitignore and verify project configuration.")
 
     if warnings:
         print("\nWarnings:")
@@ -448,6 +465,205 @@ def cmd_init(args: argparse.Namespace) -> int:
     else:
         print("\nNo changes made.", file=sys.stderr)
     return 0 if ok else 1
+
+
+def cmd_project_init(args: argparse.Namespace) -> int:
+    """Verify or fix project-level fw-context configuration.
+
+    Without ``--fix``: reports the current state of config files,
+    ``.gitignore`` entries, build system detection, and index freshness.
+
+    With ``--fix``: creates missing config files, adds missing
+    ``.gitignore`` entries, and appends missing config options to
+    existing files.
+    """
+    import re
+
+    from .config import load as load_config
+    from .config.settings import (
+        _PROJECT_DEFAULTS_TEMPLATE,
+        _PROJECT_LOCAL_DEFAULTS_TEMPLATE,
+        _ensure_project_config,
+        _ensure_project_local_config,
+    )
+
+    project_root = Path(args.project or ".").resolve()
+    cfg = load_config(project_root=project_root)
+    fix = args.fix
+
+    label = "[fix]" if fix else "[info]"
+    print(f"Project: {project_root}")
+    if fix:
+        print("Mode: fix — applying corrections\n")
+    else:
+        print("Mode: verify — use --fix to apply corrections\n")
+
+    # ── 1. Config files ──
+    _check_config_file(
+        project_root, ".fw-context/config.toml",
+        _PROJECT_DEFAULTS_TEMPLATE, fix,
+    )
+    _check_config_file(
+        project_root, ".fw-context/local.toml",
+        _PROJECT_LOCAL_DEFAULTS_TEMPLATE, fix,
+    )
+
+    # ── 2. .gitignore entries ──
+    _ensure_gitignore(project_root, fix=fix)
+
+    # ── 3. Build system ──
+    from .indexer.build import detect_build_system
+    build_system = detect_build_system(project_root)
+    if build_system:
+        print(f"  [ok] build system: {build_system}")
+    elif fix:
+        print("  [warn] no build system detected — set [build] system in config.toml")
+    else:
+        print("  [warn] no build system detected — set [build] system in config.toml")
+
+    # ── 4. compile_commands.json ──
+    cc = cfg.index.compile_commands
+    if not cc.is_absolute():
+        cc = (project_root / cc).resolve()
+    if cc.exists():
+        from .indexer.build import check_completeness
+        issues = list(check_completeness(cc, project_root))
+        if issues:
+            print(f"  [warn] {cc}:")
+            for w in issues:
+                print(f"         {w}")
+        else:
+            print(f"  [ok] {cc}")
+    else:
+        print(f"  [info] {cc} not found — run 'fw-context index --build' to build and index")
+
+    # ── 5. Index health ──
+    from .config import derive_project_id
+    from .indexer.db import get_active_config, open_db as db_open
+    project_id = derive_project_id(project_root)
+    db_path = cfg.index.db_dir / project_id / "index.db"
+    if db_path.exists():
+        try:
+            conn = db_open(db_path)
+            active = get_active_config(conn, project_id)
+            if active:
+                sym_count = conn.execute(
+                    "SELECT COUNT(*) FROM symbols WHERE config_hash=?",
+                    (active["config_hash"],),
+                ).fetchone()[0]
+                print(f"  [ok] index: {sym_count} symbols")
+                # Check embeddings
+                emb_count = conn.execute("SELECT COUNT(*) FROM embeddings").fetchone()[0]
+                if emb_count == 0:
+                    print("  [info] no embeddings yet — run 'fw-context index' to generate")
+                # Check LLM analysis
+                ana_count = conn.execute("SELECT COUNT(*) FROM llm_analysis").fetchone()[0]
+                if ana_count == 0:
+                    print("  [info] no LLM symbol analysis yet — run 'fw-context index' to generate")
+            conn.close()
+        except Exception as e:
+            print(f"  [warn] cannot read index: {e}")
+    else:
+        print(f"  [info] no index yet — run 'fw-context index' to build")
+
+    if fix:
+        print("\nProject fixed. Run 'fw-context index' to (re)build the index.")
+    else:
+        print("\nProject verified. Run 'fw-context project-init --fix' to apply corrections.")
+    return 0
+
+
+def _check_config_file(project_root: Path, rel_path: str, template: str, fix: bool) -> None:
+    """Check a single config file — report missing keys, optionally fix."""
+    path = project_root / rel_path
+    if not path.exists():
+        if fix:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(template)
+            print(f"  [fix] created {path}")
+        else:
+            print(f"  [warn] {path} missing — run with --fix to create")
+        return
+
+    # Parse template for option keys (lines like "# key = value" or "key = value")
+    import re
+    template_keys: set[str] = set()
+    for line in template.splitlines():
+        # Match both "# key = ..." and "key = ..." lines
+        m = re.match(r'^#?\s*(\w+)\s*=', line)
+        if m:
+            template_keys.add(m.group(1))
+
+    existing_text = path.read_text(encoding="utf-8")
+    missing: list[str] = []
+    for key in sorted(template_keys):
+        if not re.search(rf'^\s*#?\s*{key}\s*=', existing_text, re.MULTILINE):
+            # Also check if key appears under a [section] (TOML scoped)
+            if not re.search(rf'^\s*{key}\s*=', existing_text, re.MULTILINE):
+                missing.append(key)
+
+    if missing:
+        if fix:
+            with path.open("a", encoding="utf-8") as f:
+                f.write("\n")
+                for line in template.splitlines():
+                    m = re.match(r'^#?\s*(\w+)\s*=', line)
+                    if m and m.group(1) in missing:
+                        f.write(line + "\n")
+            print(f"  [fix] {path}: added {', '.join(missing)}")
+        else:
+            print(f"  [info] {path}: missing options: {', '.join(missing)}")
+    else:
+        print(f"  [ok] {path}")
+
+
+def _ensure_gitignore(project_root: Path, *, fix: bool = False) -> None:
+    """Add ``compile_commands.json`` and ``.fw-context/local.toml`` to the
+    project's ``.gitignore`` if they aren't already listed.
+
+    Reads the existing file (when present), checks each entry as a literal
+    line, and appends missing entries.  Idempotent — running multiple times
+    adds no duplicates.
+
+    In fix mode (*fix=True*), actually writes the file.  Otherwise only
+    reports what would be added.
+    """
+    entries = [
+        "compile_commands.json",
+        ".fw-context/local.toml",
+    ]
+
+    gitignore = project_root / ".gitignore"
+    try:
+        existing_lines: set[str] = set()
+        if gitignore.exists():
+            existing_lines = {
+                line.strip()
+                for line in gitignore.read_text(encoding="utf-8").splitlines()
+                if line.strip() and not line.strip().startswith("#")
+            }
+    except (OSError, PermissionError):
+        return
+
+    missing = [e for e in entries if e not in existing_lines]
+    if not missing:
+        print(f"  [ok] {gitignore}")
+        return
+
+    if fix:
+        try:
+            with gitignore.open("a", encoding="utf-8") as f:
+                if gitignore.stat().st_size > 0:
+                    f.seek(0, 2)
+                f.write("\n# fw-context\n")
+                for e in missing:
+                    f.write(f"{e}\n")
+            print(f"  [fix] {gitignore}: added {', '.join(missing)}")
+        except (OSError, PermissionError) as e:
+            import logging
+            logging.getLogger(__name__).warning("Could not update %s: %s", gitignore, e)
+    else:
+        print(f"  [info] {gitignore}: missing entries: {', '.join(missing)}")
 
 
 def _register_mcp(tool, mcp_bin: str, dry_run: bool = False) -> None:
@@ -722,12 +938,23 @@ def cmd_analyze(args: argparse.Namespace) -> int:
     finally:
         conn.close()
 
+    # Compute SDK exclude patterns for this project.
+    # When analyze_vendor is True, analyze everything.
+    from .indexer.runner import _detect_sdk_exclude_like
+    if cfg.llm.analyze_vendor:
+        exclude_like: list[str] = []
+    else:
+        exclude_paths = cfg.exclude_root_paths(project_root)
+        config_exclude_strs = [str(p.relative_to(project_root)) for p in exclude_paths
+                               if p.is_relative_to(project_root)]
+        exclude_like = _detect_sdk_exclude_like(project_root, config_exclude_strs)
+
     # Re-open connection for the analysis (uses its own transactions)
     conn = open_db(db_path)
     try:
-        _build_llm_analysis(conn, config_hash, cfg.llm, db_path.parent)
+        _build_llm_analysis(conn, config_hash, cfg.llm, db_path.parent, exclude_like=exclude_like)
         if cfg.llm.analyze_files:
-            _build_file_analysis(conn, config_hash, cfg.llm, db_path.parent)
+            _build_file_analysis(conn, config_hash, cfg.llm, db_path.parent, exclude_like=exclude_like)
         _build_overrides(conn, config_hash, db_path.parent)
         conn.commit()
     finally:
@@ -761,12 +988,12 @@ def main() -> None:
     )
     sub = parser.add_subparsers(dest="cmd")
 
-    p_index = sub.add_parser("index", help="Build the symbol index from compile_commands.json (generates it from a clean build by default)")
+    p_index = sub.add_parser("index", help="Build the symbol index from compile_commands.json (reuses existing compile_commands.json, builds only if missing)")
     p_index.add_argument("compile_commands", nargs="?", default=None, metavar="compile_commands.json",
-                         help="Use an existing compile_commands.json (skips build, enables incremental re-index)")
+                         help="Use an explicit compile_commands.json (skips build)")
     p_index.add_argument("--project", metavar="DIR", help="Project root (default: cwd)")
-    p_index.add_argument("--no-build", action="store_true", help="Skip build — reuse existing compile_commands.json for incremental re-index")
-    p_index.add_argument("--no-clean", action="store_true", help="Skip clean build (incremental build — may produce incomplete compile_commands.json)")
+    p_index.add_argument("--build", action="store_true", help="Force a clean build and regenerate compile_commands.json")
+    p_index.add_argument("--no-clean", action="store_true", help="With --build: skip clean, do incremental build (may produce incomplete compile_commands.json)")
     p_index.add_argument("--source-roots", nargs="+", metavar="DIR")
     p_index.add_argument("--name", metavar="NAME", help="Project name override")
     p_index.add_argument("--no-refs", action="store_true", help="Skip cross-reference indexing (on by default)")
@@ -810,6 +1037,11 @@ def main() -> None:
     p_export.add_argument("-o", "--output", metavar="PATH", help="Output file (default: stdout)")
     p_export.add_argument("--no-refs", action="store_true", help="Omit cross-references")
     p_export.set_defaults(func=cmd_export)
+
+    p_project_init = sub.add_parser("project-init", help="Verify or fix project setup (config, .gitignore, build system)")
+    p_project_init.add_argument("--project", metavar="DIR", help="Project root (default: cwd)")
+    p_project_init.add_argument("--fix", action="store_true", help="Apply fixes for detected issues")
+    p_project_init.set_defaults(func=cmd_project_init)
 
     p_analyze = sub.add_parser("analyze", help="Re-run LLM symbol analysis on existing index (idempotent)")
     p_analyze.add_argument("--project", metavar="DIR", help="Project root (default: cwd)")

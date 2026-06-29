@@ -14,14 +14,11 @@ from pathlib import Path
 
 from ..config import derive_project_id
 from ..config import load as load_config
-from ..indexer.compile_commands import parse as parse_cc
 from ..indexer.db import (
     get_active_config,
     open_db,
 )
-from ..utils import MTIME_TOLERANCE_S
-from .shared.context import _db_path, _open_db_safe
-from .shared.stale import _count_modified_files
+from .shared.context import _db_path
 
 log = logging.getLogger(__name__)
 
@@ -254,142 +251,127 @@ def _check_bg_pause(root: Path) -> bool:
         return False
     return True
 
-# ── _start_bg_reindex_if_stale (was at server.py:474) ──
-def _start_bg_reindex_if_stale(root: Path) -> None:
-    """Kick off a background ``fw-context index`` if files are stale or
-    symbols lack LLM analysis.
+# ── _fast_staleness_check (before _start_bg_reindex_if_stale) ──
+def _fast_staleness_check(root: Path) -> tuple[bool, list[str]]:
+    """Lightweight staleness check — COUNT queries and at most one ``stat()``.
 
-    No-op when no index exists, no work is needed, or a background
-    reindex is already running.  Uses ``fcntl.flock`` for concurrency control
-    — the kernel releases the lock when the MCP server exits, so a crashed
-    subprocess never leaves a stale lock.
+    Returns ``(needs_reindex, reasons)`` where *reasons* is a list of
+    human-readable strings explaining why a reindex is needed.
 
-    The subprocess first reindexes changed files (fast for unchanged files
-    thanks to mtime comparison), then runs LLM symbol analysis for any
-    symbols that still need it.  If the process crashes during LLM analysis,
-    the next call detects the unanalyzed symbols and restarts.
+    Does **not** call ``_count_modified_files`` — the background subprocess
+    does its own per-file mtime comparison during ``run()``.  This function
+    only detects structural issues (missing data, schema changes,
+    compile_commands.json modification).
     """
-    if _is_bg_reindex_running(root):
-        return
+    from ..config import derive_project_id
+    from ..config import load as load_config
+    from ..indexer.db import (
+        CURRENT_SCHEMA_VERSION,
+        get_active_config,
+        get_db_schema_version,
+    )
+    from .shared.context import _db_path, _is_stale, _open_db_safe
+
     db_path = _db_path(root)
     if not db_path.exists():
-        return
+        return False, []
+
     conn, err = _open_db_safe(db_path)
     if err:
-        return
+        return False, []
     assert conn is not None
+    reasons: list[str] = []
     try:
         with conn:
             project_id = derive_project_id(root)
             cfg = get_active_config(conn, project_id)
             if not cfg:
-                return
-            modified = _count_modified_files(conn, cfg["config_hash"], root)
-            unanalyzed = 0
-            if modified == 0:
-                # Check for definition symbols that still need LLM analysis —
-                # the background reindex may have crashed during _build_llm_analysis
-                # after the main indexing had already updated all file mtimes.
+                return False, []
+            config_hash = cfg["config_hash"]
+
+            # 1. compile_commands.json changed? (one stat call)
+            cc_path = cfg["compile_commands_path"]
+            if _is_stale(cfg, cc_path):
+                reasons.append("compile_commands.json changed")
+
+            # 2. Schema version mismatch?
+            schema_ver = get_db_schema_version(conn)
+            if schema_ver < CURRENT_SCHEMA_VERSION:
+                reasons.append(f"schema {schema_ver} < {CURRENT_SCHEMA_VERSION}")
+
+            # 3. Missing refs or indirect call sites?
+            proj_cfg = load_config(root)
+            if proj_cfg.index.index_refs:
+                ref_count = conn.execute(
+                    "SELECT COUNT(*) FROM refs WHERE config_hash=?",
+                    (config_hash,),
+                ).fetchone()[0]
+                if ref_count == 0:
+                    reasons.append("refs missing")
+                    # Also check indirect call sites — but only flag them
+                    # when refs are missing (if refs were populated, the
+                    # indirect extraction ran too; empty table is legitimate).
+                    ics_count = conn.execute(
+                        "SELECT COUNT(*) FROM indirect_call_sites WHERE config_hash=?",
+                        (config_hash,),
+                    ).fetchone()[0]
+                    if ics_count == 0:
+                        reasons.append("indirect call sites missing")
+
+            # 4. Unanalyzed symbols?
+            if proj_cfg.llm.enabled and proj_cfg.llm.analyze_symbols:
                 unanalyzed = conn.execute(
                     """SELECT COUNT(*)
                        FROM symbols s
                        WHERE s.config_hash = ?
                          AND s.is_definition = 1
-                         AND s.kind IN ('function', 'method', 'constructor',
-                                        'destructor', 'class', 'struct')
+                         AND s.kind IN ('function', 'method',
+                                        'constructor', 'destructor',
+                                        'class', 'struct')
                          AND s.file_path NOT LIKE 'mbed-os/%'
                          AND s.file_path NOT LIKE '.pio/%'
                          AND s.file_path NOT LIKE 'zephyr/%'
                          AND s.file_path NOT LIKE 'build/%'
                          AND s.file_path NOT LIKE 'modules/%'
                          AND s.id NOT IN (SELECT symbol_id FROM llm_analysis)""",
-                    (cfg["config_hash"],),
+                    (config_hash,),
                 ).fetchone()[0]
-                if unanalyzed == 0:
-                    return
-
-            # Sync stored mtimes for stale files that are NOT in
-            # compile_commands.json.  These files (typically header-only
-            # includes) are never processed by the background reindex
-            # subprocess, so their stored mtimes stay stale forever unless
-            # we update them here.  Without this, _count_modified_files
-            # keeps returning > 0 after every reindex finishes → infinite
-            # reindex-respawn loop.
-            if modified > 0:
-                cc_path = Path(cfg["compile_commands_path"])
-                if cc_path.exists():
-                    cc_files = {str(Path(u.file).resolve()) for u in parse_cc(cc_path)}
-                    stale_rows = conn.execute(
-                        "SELECT id, path, mtime FROM files WHERE config_hash = ?",
-                        (cfg["config_hash"],),
-                    ).fetchall()
-                    synced = 0
-                    for r in stale_rows:
-                        stored = r["mtime"]
-                        p = Path(r["path"])
-                        if not p.is_absolute():
-                            p = (root / r["path"]).resolve()
-                        try:
-                            disk_mtime = p.stat().st_mtime
-                        except OSError:
-                            continue
-                        if stored == 0 or disk_mtime > stored + MTIME_TOLERANCE_S:
-                            if str(p.resolve()) not in cc_files:
-                                conn.execute(
-                                    "UPDATE files SET mtime = ? WHERE id = ?",
-                                    (disk_mtime, r["id"]),
-                                )
-                                synced += 1
-                    if synced > 0:
-                        conn.commit()
-                        log.info(
-                            "Synced %d stale file mtimes not in compile_commands.json",
-                            synced,
-                        )
-                        modified = _count_modified_files(conn, cfg["config_hash"], root)
-
-            # Detect completely missing refs, indirect call sites, or
-            # function-pointer assignments (e.g. initial index ran without
-            # --refs).  Reset stored mtimes for compile_commands.json files
-            # so the bg reindex force-processes them and fills in the
-            # missing data.  This is a one-time cost — after the reindex
-            # the data is present and incremental updates keep it current.
-            proj_cfg = load_config(root)
-            if proj_cfg.index.index_refs:
-                missing_refs = conn.execute(
-                    "SELECT COUNT(*) FROM refs WHERE config_hash = ?",
-                    (cfg["config_hash"],),
-                ).fetchone()[0] == 0
-                missing_indirect = conn.execute(
-                    "SELECT COUNT(*) FROM indirect_call_sites WHERE config_hash = ?",
-                    (cfg["config_hash"],),
-                ).fetchone()[0] == 0
-                if missing_refs or missing_indirect:
-                    cc_path = Path(cfg["compile_commands_path"])
-                    if cc_path.exists():
-                        cc_units = list(parse_cc(cc_path))
-                        cc_files_list = [str(Path(u.file).resolve()) for u in cc_units]
-                        if cc_files_list:
-                            placeholders = ",".join("?" * len(cc_files_list))
-                            conn.execute(
-                                f"UPDATE files SET mtime = 0 WHERE config_hash = ? AND path IN ({placeholders})",
-                                (cfg["config_hash"], *cc_files_list),
-                            )
-                            conn.commit()
-                            modified = _count_modified_files(conn, cfg["config_hash"], root)
-                            log.info(
-                                "Reset mtimes for %d cc files to fill missing refs/indirect data",
-                                len(cc_files_list),
-                            )
+                if unanalyzed > 0:
+                    reasons.append(f"{unanalyzed} unanalyzed symbols")
     finally:
         conn.close()
 
-    reason_parts: list[str] = []
-    if modified > 0:
-        reason_parts.append(f"{modified} stale files")
-    if unanalyzed > 0:
-        reason_parts.append(f"{unanalyzed} unanalyzed symbols")
-    reason = ", ".join(reason_parts)
+    return len(reasons) > 0, reasons
+
+
+# ── _start_bg_reindex_if_stale (rewritten with _fast_staleness_check) ──
+def _start_bg_reindex_if_stale(root: Path) -> None:
+    """Kick off a background ``fw-context index`` if the index needs work.
+
+    Uses ``_fast_staleness_check`` (COUNT queries + one stat) — no O(n)
+    mtime scan.  The subprocess does its own per-file mtime comparison
+    during ``run()``.
+
+    When refs or indirect call sites are completely missing, the subprocess
+    is launched with ``FW_CONTEXT_FORCE_REFINDEX=1`` so it skips mtime
+    checks and re-parses every file (one-time cost to backfill the data).
+    Mtimes are **not** reset — the next run is fully incremental.
+
+    No-op when no index exists, no work is needed, or a background reindex
+    is already running.
+    """
+    if _is_bg_reindex_running(root):
+        return
+    db_path = _db_path(root)
+    if not db_path.exists():
+        return
+
+    needs_reindex, reasons = _fast_staleness_check(root)
+    if not needs_reindex:
+        return
+
+    reason = ", ".join(reasons)
+    log.info("Starting background reindex for %s (%s)", root, reason)
 
     lock_file = db_path.parent / "reindex.lock"
     log_file = db_path.parent / "reindex.log"
@@ -406,20 +388,23 @@ def _start_bg_reindex_if_stale(root: Path) -> None:
     except OSError:
         pass
 
-    log.info("Starting background reindex for %s (%s)", root, reason)
     pid_file = db_path.parent / "reindex.pid"
+    force_refs = "refs missing" in reason or "indirect call sites missing" in reason
     try:
         stdout_fh = open(log_file, "a")
+        env: dict[str, str] = {
+            **os.environ,
+            "PYTHONUNBUFFERED": "1",
+            "FW_CONTEXT_HEARTBEAT_LOG": str(log_file),
+        }
+        if force_refs:
+            env["FW_CONTEXT_FORCE_REFINDEX"] = "1"
         proc = subprocess.Popen(
-            [sys.executable, "-u", "-m", "fw_context_mcp.cli", "index", "--no-build"],
+            [sys.executable, "-u", "-m", "fw_context_mcp.cli", "index"],
             cwd=str(root),
             stdout=stdout_fh,
             stderr=subprocess.STDOUT,
-            env={
-                **os.environ,
-                "PYTHONUNBUFFERED": "1",
-                "FW_CONTEXT_HEARTBEAT_LOG": str(log_file),
-            },
+            env=env,
         )
         stdout_fh.close()  # Close parent copy — child has its own fd
         # Store PID so manual operations can kill the bg process

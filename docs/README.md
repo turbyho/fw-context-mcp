@@ -103,35 +103,30 @@ cd ~/.fw-context/src && make update
 cd your-firmware-project
 
 # One command — auto-detects build system, runs clean build, indexes:
-fw-context index
+fw-context index --build
 
-# Skip the build step (use existing compile_commands.json):
-fw-context index --no-build
+# Or reuse existing compile_commands.json (incremental, default):
+fw-context index
 ```
 
 **Auto-detection:** mbed-os (`.mbed`, `mbed-os/`), Zephyr (`west.yml`),
 PlatformIO (`platformio.ini`), or any build with `bear`.
 
-**What happens:** On `fw-context index` without arguments, the tool:
+**What happens:** On `fw-context index --build`, the tool:
 1. Detects your build system
 2. Runs a clean build via `bear` / `west` / `pio` to produce a complete
    `compile_commands.json`
 3. Parses every translation unit with libclang
 4. Builds the SQLite index with symbols, references, and embeddings
 
-> **⚠️ Every `fw-context index` (without `--no-build`) does a full re-index.**
-> The clean build regenerates `compile_commands.json`, which produces a new
-> config hash — so every translation unit is re-parsed from scratch, even if
-> no source file changed.
+> **Incremental by default.**  `fw-context index` reuses an existing
+> `compile_commands.json` — only changed files are re-parsed (seconds, not
+> minutes).  The MCP server's file watcher auto-reindexes edited files on
+> save, so a full re-index is rarely needed after the first run.
 >
-> **For incremental indexing** (only changed files re-parsed, seconds instead
-> of minutes), use `--no-build`:
+> Use `--build` when you need a fresh start:
 >
->     fw-context index --no-build
->
-> This reuses the existing `compile_commands.json`. When the config hash
-> matches, only files with newer mtimes are re-parsed; the rest are skipped.
-> The MCP server's file watcher auto-reindexes edited files on save, so a
+>     fw-context index --build
 > full `fw-context index` is rarely needed after the initial one.
 
 ### 6. Restart your assistant and start asking about your code
@@ -206,7 +201,7 @@ graph LR
 - **Vector search** — semantic similarity via `sqlite-vec` + Ollama embeddings, hybrid FTS5+vector re-ranking
 - **Graph analytics** — call paths, transitive callers/callees, dead code detection, hotspot analysis
 - **Indirect call detection** — resolves function-pointer arguments at direct call sites, uncovering call-graph edges that grep/cscope miss
-- **Incremental indexing** — with `--no-build`, only changed files are re-parsed (seconds, not minutes). The file watcher auto-reindexes on save — a full `fw-context index` rebuild is rarely needed after the first run
+- **Incremental indexing** — by default, only changed files are re-parsed (seconds, not minutes). The file watcher auto-reindexes on save — use `--build` for a full re-index when needed
 - **Offline-first** — index is a file on disk at `~/.fw-context/index/`. No daemon, no cloud, no network.
 - **`#ifdef`-aware** — uses real compiler flags; sees exactly what your compiler sees
 
@@ -221,12 +216,11 @@ Works with **any build system** that produces `compile_commands.json`:
 | **PlatformIO** | `platformio.ini` | `pio run --target compiledb` |
 | **Custom** | Any `[build] command` override | User-specified |
 
-`fw-context index` handles the build automatically. Use `--no-build` to
-skip and use an existing `compile_commands.json`.
+`fw-context index` handles the build automatically. Use `--build` to
+force a clean build and full re-index.
 
-Without `--no-build`, every run does a full re-index — the clean build
-produces a new config hash.  With `--no-build`, subsequent runs are
-**incremental** — seconds for a few changed files.
+By default, `fw-context index` reuses an existing `compile_commands.json`,
+making subsequent runs **incremental** — seconds for a few changed files.
 
 ## Documentation
 

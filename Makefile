@@ -49,7 +49,7 @@ ifeq ($(UV),)
 	@echo "  curl -LsSf https://astral.sh/uv/install.sh | sh"
 	@exit 1
 endif
-	@test -d $(VENV) || $(UV) venv $(VENV) --python $(PYTHON)
+	@test -d $(VENV) || $(UV) venv $(VENV) --python $(PYTHON) --seed
 
 # ---- pip install into venv ----
 pip-install: venv
