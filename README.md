@@ -216,7 +216,7 @@ Not the text on disk.
 | **Vectors** | sqlite-vec | 1024-dimensional embeddings for semantic/concept search |
 | **Analysis** | llm_analysis table | pre-computed plain-English explanations of every function |
 
-### The 27 Tools
+### The 29 Tools
 
 Your AI assistant gets these capabilities — not by reading files, but by
 querying the index:
@@ -584,9 +584,9 @@ fw-context tracks function pointers end-to-end across three phases:
    via the field's USR, answering "which functions can be called through
    `onData`?" with precise, compiler-verified results.
 
-Registration through stored pointers in libraries (e.g. inside eModbus) where
-the actual call site is in precompiled code still has no call-graph edge
-because the invocation side is not indexed.
+Registration through pointers stored inside libraries (e.g. eModbus) — where
+the actual call site lives in precompiled code — still produces no call-graph
+edge, because the invocation side is not indexed.
 
 ### ISRs, RTOS primitives, message queues
 
@@ -597,10 +597,10 @@ message queue has no static call path.
 ### Precompiled libraries
 
 Nordic SoftDevice, TI BLE stack, precompiled WiFi blobs — the implementation
-is a binary `.a`/`.o` with no source to index.  **Headers are still indexed**
+is a binary `.a`/`.o` with no source to index. **Headers are still indexed**
 as long as they live under a project source root (`lib/`, `include/`, etc.),
 so the API surface (function declarations, type definitions, enums) is fully
-searchable.  What's missing:
+searchable. What's missing:
 
 - **Function bodies** — `get_source("sd_ble_stack_init")` returns empty.
 - **Internal call-graph edges** — calls made *inside* the precompiled library
@@ -625,7 +625,7 @@ lost. The expanded form is there; the meta-programming is not.
 
 The invocation side is now covered — `find_indirect_call_sites` detects when
 function pointers are called through fields, variables, or parameters, and
-`find_indirect_targets` links them to their assignments. Dynamically-indexed
+`find_indirect_targets` links them to their assignments. Dynamically indexed
 arrays (`handlers[i](args)`), `void*`-erased callbacks, and multi-hop pointer
 chains through intermediate variables remain outside the reach of static analysis.
 
@@ -668,7 +668,7 @@ occasional smart_search queries.
 
 ### Can I use it without Ollama at all?
 
-Yes. All 27 tools work without Ollama. `smart_search` falls back to word-split
+Yes. All 29 tools work without Ollama. `smart_search` falls back to word-split
 FTS5. `semantic_search` falls back to `search_code`. `explain_symbol` returns
 source + prompt for your AI to process itself. The index and call graph are
 fully functional without any LLM dependency.

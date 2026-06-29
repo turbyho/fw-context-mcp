@@ -16,7 +16,7 @@ wrong `#ifdef` branch.
 fw-context gives your AI agent a compiler-accurate map of your codebase. It parses
 your actual build flags from `compile_commands.json` with libclang and builds a
 persistent index that sees active `#ifdef` branches exactly like your compiler does.
-27 tools for symbol lookup, call-graph traversal, full-text and semantic search,
+29 tools for symbol lookup, call-graph traversal, full-text and semantic search,
 dead code detection, and hotspot analysis. Ask in natural language, get precise
 answers. No grepping. No hallucination.
 
@@ -41,7 +41,7 @@ Your AI assistant goes from guessing to knowing:
 > *"Give me a map of `modem_msg.cpp` before I read it."*
 > → `get_file_map("src/modem_msg.cpp")` — 426 symbols grouped by kind.
 
-**27 MCP tools** — symbol search, source reading, call-graph traversal, hotspot
+**29 MCP tools** — symbol search, source reading, call-graph traversal, hotspot
 analysis, dead code detection, vector search. All backed by real compiler flags
 from `compile_commands.json` — `#ifdef`-aware, not grep.
 
@@ -178,7 +178,7 @@ graph TB
 ```mermaid
 graph LR
     cli[CLI: fw-context<br/>index, export, watch, status]
-    server[MCP Server: fw-context-mcp<br/>27 tools across search, source,<br/>graph, and maintenance categories]
+    server[MCP Server: fw-context-mcp<br/>29 tools across search, source,<br/>graph, and maintenance categories]
     ollama[Ollama<br/>optional]
     db[(SQLite + FTS5<br/>+ vec0 + refs)]
 
@@ -191,7 +191,7 @@ graph LR
 |-----------|---------|---------|
 | **CLI** (`fw-context`) | User command | Index, export, watch, status, reset, init, search |
 | **Indexer** | Called by CLI | libclang parses every TU, stores in SQLite + FTS5 + vec0 |
-| **MCP server** (`fw-context-mcp`) | Subprocess (AI assistant) | 27 tools over JSON-RPC — search, graph, source, maintenance |
+| **MCP server** (`fw-context-mcp`) | Subprocess (AI assistant) | 29 tools over JSON-RPC — search, graph, source, maintenance |
 | **Ollama** *(optional)* | Local daemon | NL search, symbol explanation, embedding generation |
 
 ## Features
@@ -227,7 +227,7 @@ making subsequent runs **incremental** — seconds for a few changed files.
 | Document | Covers |
 |----------|--------|
 | **[Installation](docs/installation.md)** | Prerequisites, install, upgrade, Ollama setup, AI assistant integration |
-| **[Tools Reference](docs/tools.md)** | All 27 MCP tools, 10 CLI commands, internal workings, search pipeline |
+| **[Tools Reference](docs/tools.md)** | All 29 MCP tools, 10 CLI commands, internal workings, search pipeline |
 | **[Configuration](docs/configuration.md)** | `.fw-context/config.toml` + `local.toml` — shared project config and local developer overrides |
 | **[MCP Server](README-MCP.md)** | JSON-RPC protocol, tool schemas, error handling, debugging |
 
