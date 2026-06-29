@@ -18,7 +18,7 @@ Project instructions for all AI tooling. Dynamic project memory belongs in
   firmware
 - Targets Mbed OS, Zephyr, and PlatformIO projects via
   `compile_commands.json` + libclang
-- 22 MCP tools: symbol lookup, full-text search, call-graph traversal, vector
+- 29 MCP tools: symbol lookup, full-text search, call-graph traversal, vector
   search, source code retrieval
 - Serves AI assistants (Claude Code, Cursor, OpenCode) as an MCP server
 - Python 3.11+, distributed as a PyPI package + GitHub release
@@ -171,7 +171,7 @@ fw-context index --refs   # index with call-graph references
   `init`). `cmd_index()` orchestrates build detection → compile_commands →
   libclang parse → SQLite write.
 - `src/fw_context_mcp/mcp/server.py` — `main()` starts the FastMCP stdio
-  server. All 22 tools are registered as decorated async functions.
+  server. All 29 tools are registered as decorated async functions.
 
 ### Index pipeline
 
