@@ -746,23 +746,6 @@ filters out accidental name collisions (overloads, not overrides).  For a
 non-virtual method or a method whose class has no ancestors, both
 `overrides` and `overridden_by` are empty lists.
 
-#### `get_file_analysis`
-
-Return the LLM-generated summary for a source file.
-
-```
-Input:  {"file_path": "src/main.cpp", "project_root?": "/path/to/project"}
-Output: {"file": "/abs/path/src/main.cpp", "file_path": "src/main.cpp",
-         "summary": "Main entry point — initializes the modem, sets up the
-         sensor polling loop, and dispatches events to the UI task.",
-         "model": "qwen2.5-coder:14b",
-         "analyzed_at": "2026-06-21T10:30:00"}
-```
-
-Also included as `file_summary` in `get_file_map` output.  Requires
-`[llm] analyze_files = true` during indexing (default).  Returns
-`{"error": "No analysis available…"}` when the file hasn't been analyzed.
-
 ### Index maintenance
 
 #### `get_active_build`

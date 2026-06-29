@@ -11,7 +11,7 @@ that provides **29 tools** for navigating embedded firmware codebases:
 | Category | Tools |
 |----------|-------|
 | **Search & lookup** | `search_code`, `lookup_symbol`, `smart_search`, `semantic_search` |
-| **Understanding** | `get_file_map`, `get_source`, `explain_symbol`, `get_symbol_context`, `get_file_analysis` |
+| **Understanding** | `get_file_map`, `get_source`, `explain_symbol`, `get_symbol_context` |
 | **Call graph** | `find_callers`, `find_references`, `find_call_path`, `find_all_callers_recursive`, `find_callees_recursive`, `find_dead_code`, `find_hotspots`, `find_wrapper_callers`, `find_indirect_call_sites`, `find_indirect_targets`, `trace_data_flow` |
 | **Class analysis** | `get_inheritance_chain`, `get_class_members`, `get_template_instances`, `get_method_overrides` |
 | **Index maintenance** | `get_active_build`, `reindex_file`, `reset_index`, `list_projects`, `check_ollama` |

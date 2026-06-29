@@ -232,7 +232,6 @@ querying the index:
 - `get_symbol_context` — body + callers + callees + LLM analysis in ONE call
 - `get_file_map` — symbol table of contents (4 300-line file → 426 symbols grouped by kind)
 - `explain_symbol` — plain-English description, pre-computed during indexing
-- `get_file_analysis` — per-file summary (*"Implements control logic for the boiler system..."*)
 
 **🕸️ Call Graph & Dependencies** — Understand what depends on what
 - `find_callers` — direct callers with exact file:line
@@ -433,11 +432,7 @@ find_call_path("loop", "handleData")
 → No path found.
 → Confirms the callback boundary.
 
-get_file_analysis("src/control.cpp")
-→ "Implements control logic for the boiler system..."
-→ Context for the whole module.
-
-Total: 6 tool calls, zero file reads
+Total: 5 tool calls, zero file reads
 Questions answered: Full data flow, architecture, timing, edge cases
 Confidence: High — every reference is compiler-verified, every edge is from the AST
 ```
