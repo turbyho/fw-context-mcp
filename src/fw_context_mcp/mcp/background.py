@@ -68,7 +68,7 @@ def _start_bg_watcher(root: Path) -> None:
         from watchfiles import watch
 
         from ..handlers.maintenance import reindex_file_impl
-        from ..indexer.runner import _build_file_analysis, _build_llm_analysis
+        from ..indexer.runner import _build_llm_analysis
 
         exclude_rx = re.compile(r"(/\.git/|/\.pio/|/build/|/__pycache__/|/node_modules/)")
         debounce_s = 0.5
@@ -123,8 +123,6 @@ def _start_bg_watcher(root: Path) -> None:
                                 cfg = load_config(project_root=root)
                                 if cfg.llm.enabled and cfg.llm.analyze_symbols:
                                     _build_llm_analysis(conn, cfg_data["config_hash"], cfg.llm, db_path.parent)
-                                    if cfg.llm.analyze_files:
-                                        _build_file_analysis(conn, cfg_data["config_hash"], cfg.llm, db_path.parent)
                                     conn.commit()
                                     log.info("Watcher LLM analysis completed for %s", root)
                         finally:

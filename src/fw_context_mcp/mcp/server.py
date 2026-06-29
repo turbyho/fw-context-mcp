@@ -1,13 +1,13 @@
 """fw-context MCP server — build-aware code intelligence for embedded C/C++ projects.
 
-Serves 30 MCP tools and 3 MCP resources via FastMCP (stdio transport).
+Serves 29 MCP tools and 3 MCP resources via FastMCP (stdio transport).
 
 **Search tools** (delegate to ``fw_context_mcp.search`` pipeline):
 ``search_code`` (FTS5), ``smart_search`` (Ollama-driven), ``semantic_search``
 (embeddings + cosine similarity).
 
 **Symbol reading tools:** ``lookup_symbol``, ``get_source``, ``get_file_map``,
-``get_symbol_context``, ``explain_symbol``, ``get_file_analysis``.
+``get_symbol_context``, ``explain_symbol``.
 
 **Call graph tools** (require ``--refs`` index): ``find_callers``,
 ``find_references``, ``find_call_path``, ``find_all_callers_recursive``,
@@ -53,8 +53,7 @@ mcp = FastMCP(
         "• get_source(name) — exact function/method body via libclang\n"
         "• get_symbol_context(name) — body + callers + callees in one call\n"
         "• get_file_map(path) — symbol table of contents for a file\n"
-        "• explain_symbol(name) — plain-English description of what a symbol does\n"
-        "• get_file_analysis(path) — per-file LLM summary\n\n"
+        "• explain_symbol(name) — plain-English description of what a symbol does\n\n"
         "Search:\n"
         "• lookup_symbol(name) — by exact or prefix name\n"
         "• search_code(query) — FTS5 keyword search (fast)\n"
@@ -219,7 +218,6 @@ mcp.tool()(callgraph.trace_data_flow)
 
 # source.py
 mcp.tool()(source.explain_symbol)
-mcp.tool()(source.get_file_analysis)
 mcp.tool()(source.get_file_map)
 mcp.tool()(source.get_source)
 mcp.tool()(source.get_symbol_context)

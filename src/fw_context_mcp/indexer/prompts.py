@@ -18,7 +18,6 @@ from __future__ import annotations
 import json
 import logging
 import re
-from pathlib import Path
 from typing import Any
 
 log = logging.getLogger(__name__)
@@ -139,6 +138,43 @@ def _flatten_value(value: Any) -> str:
 _INVALID_JSON_ESCAPE = re.compile(r"\\(?![\"\\/bfnrt]|u[0-9a-fA-F]{4})")
 
 
+def _extract_first_json_array(text: str) -> str | None:
+    """Extract the first complete JSON array from *text* using bracket counting.
+
+    Returns the array substring (from ``[`` to matching ``]``) or None.
+    Handles nested arrays/objects and strings correctly — unlike the
+    greedy ``re.search(r\"\\[.*\\]\", text, re.DOTALL)`` which matches
+    from the first ``[`` to the last ``]`` across multiple arrays.
+    """
+    start = text.find("[")
+    if start == -1:
+        return None
+
+    depth = 0
+    in_string = False
+    escape = False
+    for i in range(start, len(text)):
+        ch = text[i]
+        if escape:
+            escape = False
+            continue
+        if ch == "\\" and in_string:
+            escape = True
+            continue
+        if ch == '"':
+            in_string = not in_string
+            continue
+        if in_string:
+            continue
+        if ch == "[":
+            depth += 1
+        elif ch == "]":
+            depth -= 1
+            if depth == 0:
+                return text[start:i + 1]
+    return None
+
+
 def _sanitize_json_escapes(text: str) -> str:
     """Fix invalid JSON escape sequences produced by LLM output.
 
@@ -184,8 +220,8 @@ def parse_analysis_response(
         parsed = json.loads(text)
     except json.JSONDecodeError as e:
         # Fallback: find a JSON array anywhere in the text
-        match = re.search(r"\[.*\]", text, re.DOTALL)
-        if not match:
+        arr_text = _extract_first_json_array(text)
+        if not arr_text:
             log.warning(
                 "Cannot parse LLM response as JSON: %s (line %d col %d)\n"
                 "—— response ——\n%s\n—— end response ——",
@@ -193,7 +229,7 @@ def parse_analysis_response(
             )
             return None
         try:
-            parsed = json.loads(match.group())
+            parsed = json.loads(arr_text)
         except json.JSONDecodeError as e2:
             log.warning(
                 "Cannot parse LLM response as JSON (fallback failed): %s (line %d col %d)\n"
@@ -235,166 +271,5 @@ def parse_analysis_response(
             "inputs": inputs,
             "outputs": outputs,
         })
-
-    return result if result else None
-
-
-# ---------------------------------------------------------------------------
-# File-level analysis prompt — generates a short summary per file based on
-# the symbols it contains.  Batched (5 files at a time) for efficiency.
-# ---------------------------------------------------------------------------
-
-_FILE_ANALYSIS_SYSTEM = """You are a senior C/C++ embedded engineer writing codebase documentation.
-
-For each file below, write a 2-3 sentence summary of what the file is responsible for.
-Base your summary on the symbols it contains — their names, kinds, and what they collectively accomplish.
-
-Output a JSON array with one object per file:
-  "file": the file path as given
-  "summary": 2-3 sentences describing the file's purpose and responsibilities
-
-EXAMPLE:
-[
-  {
-    "file": "src/uart.cpp",
-    "summary": "Implements the UART hardware abstraction layer. Provides uart_init() for pin/baud configuration and uart_write()/uart_read() for blocking data transfer. Manages TX/RX buffer state and interrupt handling for the USART peripheral."
-  }
-]
-
-Output ONLY the JSON array. No markdown fences, no commentary.
-"""
-
-
-def build_file_analysis_prompt(batch: list[dict]) -> str:
-    """Build the file-level analysis prompt for a batch of files.
-
-    *batch* is a list of dicts with keys: ``file_id``, ``path``,
-    ``symbols`` (list of {name, kind, qualified_name, signature} for
-    up to 30 representative symbols in the file).
-    """
-    parts: list[str] = []
-    for i, entry in enumerate(batch, 1):
-        path = entry["path"]
-        syms = entry.get("symbols", [])
-        lines = [f"{i}. {path}"]
-        for s in syms[:30]:
-            qn = s.get("qualified_name") or s["name"]
-            sig = s.get("signature", "")
-            if sig:
-                lines.append(f"   [{s['kind']}] {qn} — {sig}")
-            else:
-                lines.append(f"   [{s['kind']}] {qn}")
-        parts.append("\n".join(lines))
-
-    prompt = _FILE_ANALYSIS_SYSTEM + "\nFiles:\n\n" + "\n\n".join(parts) + "\n\nJSON:"
-    log.debug("File analysis prompt (%d files, %d chars):\n—— prompt ——\n%s\n—— end prompt ——",
-              len(batch), len(prompt), prompt)
-    return prompt
-
-
-def parse_file_analysis_response(
-    response: str,
-    batch: list[dict],
-) -> list[dict] | None:
-    """Parse the Ollama JSON response for file-level analysis.
-
-    Returns a list of {file_id, summary} or None on total parse failure.
-    Accepts partial results — the returned list may be shorter than the batch.
-    """
-    text = response.strip()
-
-    # Strip markdown fences
-    if text.startswith("```"):
-        for fence_marker in ("```json", "```", "``"):
-            if text.startswith(fence_marker):
-                text = text[len(fence_marker):].strip()
-                break
-    if text.endswith("```"):
-        text = text[:-3].strip()
-
-    # Fix common LLM JSON mistakes before parsing
-    text = _sanitize_json_escapes(text)
-
-    parsed: list[dict] = []
-    try:
-        parsed = json.loads(text)
-    except json.JSONDecodeError as e:
-        match = re.search(r"\[.*\]", text, re.DOTALL)
-        if not match:
-            log.warning(
-                "Cannot parse file analysis LLM response: %s (line %d col %d)\n"
-                "—— response ——\n%s\n—— end response ——",
-                e.msg, e.lineno, e.colno, response,
-            )
-            return None
-        try:
-            parsed = json.loads(match.group())
-        except json.JSONDecodeError as e2:
-            log.warning(
-                "Cannot parse file analysis LLM response (fallback): %s (line %d col %d)\n"
-                "—— response ——\n%s\n—— end response ——",
-                e2.msg, e2.lineno, e2.colno, response,
-            )
-            return None
-
-    log.debug(
-        "File analysis response parsed (%d entries):\n—— response ——\n%s\n—— end response ——",
-        len(parsed) if isinstance(parsed, list) else 1, response,
-    )
-
-    # Single object → wrap in list
-    if isinstance(parsed, dict):
-        parsed = [parsed]
-
-    if not isinstance(parsed, list):
-        log.warning(
-            "File analysis LLM response is not a JSON array:\n—— response ——\n%s\n—— end response ——",
-            response,
-        )
-        return None
-
-    # Build a lookup by file path for matching.  Normalize paths:
-    # strip leading "./" and trailing slashes so suffix matching works
-    # regardless of how the path was stored in the DB.
-    path_to_id: dict[str, int] = {}
-    for entry in batch:
-        norm = entry["path"].removeprefix("./").rstrip("/")
-        path_to_id[norm] = entry["file_id"]
-
-    log.debug("File analysis batch paths: %s", sorted(path_to_id.keys()))
-
-    result: list[dict] = []
-    for entry in parsed:
-        if not isinstance(entry, dict):
-            continue
-        file_path = entry.get("file", "").removeprefix("./").rstrip("/")
-        summary = (entry.get("summary", "") or "").strip()
-        if not summary:
-            continue
-        # Match by path — exact first, then suffix (model may return absolute
-        # path while batch has relative), then unique basename
-        file_id = path_to_id.get(file_path)
-        if file_id is None:
-            # Try suffix match: model returns absolute path like
-            # /home/.../mbed-os/foo/bar.c, batch has mbed-os/foo/bar.c
-            for path, fid in path_to_id.items():
-                if file_path.endswith(path) or path.endswith(file_path):
-                    file_id = fid
-                    break
-        if file_id is None:
-            # Try basename match (only if unique in this batch)
-            basename_matches = [
-                (p, fid) for p, fid in path_to_id.items()
-                if Path(p).name == Path(file_path).name
-            ]
-            if len(basename_matches) == 1:
-                file_id = basename_matches[0][1]
-        if file_id is None:
-            log.warning(
-                "File analysis: cannot match path '%s' to batch %s",
-                file_path, sorted(path_to_id.keys()),
-            )
-            continue
-        result.append({"file_id": file_id, "summary": summary})
 
     return result if result else None

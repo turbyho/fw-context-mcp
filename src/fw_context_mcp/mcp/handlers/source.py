@@ -13,7 +13,6 @@ from ...indexer.db import (
     find_indirect_call_sites,
     find_refs,
     get_active_config,
-    get_file_analysis_for_file,
     get_llm_analysis_for_symbol,
     get_overrides_for_method,
 )
@@ -399,8 +398,7 @@ def get_file_map(
 
     Returns:
         dict: {file, total_symbols, symbols: {kind: {count, items[],
-        subgroups?[]}}, file_summary (str, optional — file-level LLM
-        analysis summary when available)}
+        subgroups?[]}}}
     """
     db_path, cfg, project_id, root = _resolve_context(project_root)
     if not db_path.exists():
@@ -436,68 +434,9 @@ def get_file_map(
                 conn, config_hash, resolved,
                 signatures=signatures, max_per_kind=max_per_kind,
             )
-            # Look up file-level analysis summary
-            file_id = conn.execute(
-                "SELECT id FROM files WHERE config_hash=? AND path=?",
-                (config_hash, resolved),
-            ).fetchone()
-            if file_id:
-                fa = get_file_analysis_for_file(conn, config_hash, file_id[0])
-                if fa:
-                    result["file_summary"] = fa["summary"]
     finally:
         conn.close()
     return result
-
-# ── moved from server.py ──
-def get_file_analysis(
-    file_path: Annotated[str, Field(description="Path to source file — relative to project root.")],
-    project_root: Annotated[str | None, Field(description="Project root. Auto-detected if omitted.")] = None,
-) -> dict:
-    """Return the file-level LLM analysis summary for a source file.
-
-    Read-only: yes. No side effects. Returns the pre-computed 2-3 sentence
-    summary describing what the file is responsible for.  Generated during
-    ``fw-context index`` when ``[llm] analyze_symbols`` is enabled.
-
-    Returns ``file``, ``summary``, ``model``, ``analyzed_at`` on success,
-    or an error message if no analysis exists yet.
-    """
-    db_path, cfg, project_id, root = _resolve_context(project_root)
-    if not db_path.exists():
-        return {"error": f"No index found for {root}. Run 'fw-context index' first."}
-    conn, err = _open_db_safe(db_path)
-    if err:
-        return err
-    assert conn is not None
-    try:
-        with conn:
-            cfg_data = get_active_config(conn, project_id)
-            if not cfg_data:
-                return {"error": "No build config indexed."}
-            config_hash = cfg_data["config_hash"]
-            # Resolve file path
-            file_row = conn.execute(
-                "SELECT id, path FROM files WHERE config_hash=? AND (path=? OR path LIKE ?) LIMIT 1",
-                (config_hash, file_path, f"%{file_path}"),
-            ).fetchone()
-            if not file_row:
-                return {"error": f"File not found in index: {file_path}"}
-            fa = get_file_analysis_for_file(conn, config_hash, file_row["id"])
-            if not fa:
-                return {
-                    "file": file_row["path"],
-                    "summary": None,
-                    "message": "No file-level analysis yet. Run 'fw-context index' with [llm] analyze_symbols = true.",
-                }
-            return {
-                "file": file_row["path"],
-                "summary": fa["summary"],
-                "model": fa["model"],
-                "analyzed_at": fa["analyzed_at"],
-            }
-    finally:
-        conn.close()
 
 # ── moved from server.py ──
 def get_symbol_context(

@@ -461,103 +461,6 @@ def _build_llm_analysis(conn, config_hash: str, llm_config, db_dir: Path, *, exc
     log.info("LLM analysis stored: %d/%d symbols (model=%s)", total, total_symbols, model)
 
 
-def _build_file_analysis(conn, config_hash: str, llm_config, db_dir: Path, exclude_like: list[str] | None = None, *, write_lock_held: bool = False) -> None:
-    """Generate file-level LLM analysis (2-3 sentence summaries) for project
-    source files using Ollama in batches of 5.
-
-    Uses the already-indexed symbols table to describe what each file is
-    responsible for.  Only project files are analyzed (non-SDK).
-
-    *exclude_like* are LIKE patterns for paths to exclude (auto-detected
-    SDK roots + project config ``exclude_paths``).  When empty/None, all
-    files are candidates.
-    """
-    import httpx
-
-    from ..indexer.prompts import build_file_analysis_prompt, parse_file_analysis_response
-    from .db import upsert_file_analysis_batch
-
-    try:
-        resp = httpx.get(llm_config.ollama_url.rstrip("/") + "/api/tags", timeout=5.0)
-        resp.raise_for_status()
-    except Exception:
-        log.warning("Ollama not reachable — skipping file analysis generation")
-        return
-
-    if exclude_like is None:
-        exclude_like = []
-
-    where_clauses = " AND ".join(["f.path NOT LIKE ?"] * len(exclude_like))
-    query = """SELECT f.id AS file_id, f.path,
-                       COUNT(s.id) AS sym_count
-                FROM files f
-                JOIN symbols s ON s.file_id = f.id AND s.config_hash = ?
-                WHERE f.config_hash = ?"""
-    if where_clauses:
-        query += f" AND {where_clauses}"
-    query += """ AND f.id NOT IN (SELECT file_id FROM file_analysis)
-                GROUP BY f.id
-                ORDER BY sym_count DESC"""
-    with transaction(conn):
-        file_rows = conn.execute(
-            query, (config_hash, config_hash, *exclude_like),
-        ).fetchall()
-        if not file_rows:
-            log.info("All project files already analyzed — nothing to do")
-            return
-
-    # Fetch representative symbols for each file
-    files_with_syms: list[dict] = []
-    for fr in file_rows:
-        syms = conn.execute(
-            """SELECT name, qualified_name, kind, signature
-               FROM symbols
-               WHERE file_id = ? AND config_hash = ?
-               ORDER BY is_definition DESC, kind, line
-               LIMIT 30""",
-            (fr["file_id"], config_hash),
-        ).fetchall()
-        files_with_syms.append({
-            "file_id": fr["file_id"],
-            "path": fr["path"],
-            "symbols": [dict(s) for s in syms],
-        })
-
-    model = llm_config.model
-    total = 0
-    batch_size = 5
-    batches = (len(files_with_syms) + batch_size - 1) // batch_size
-    log.info("File analysis: %d files in %d batches (model=%s)", len(files_with_syms), batches, model)
-
-    for batch_num in range(0, len(files_with_syms), batch_size):
-        batch = files_with_syms[batch_num:batch_num + batch_size]
-        prompt = build_file_analysis_prompt(batch)
-        try:
-            response = call_ollama(prompt, llm_config, temperature=0.1, num_predict=2000)
-        except Exception as e:
-            log.warning("File analysis batch %d failed: %s", batch_num // batch_size, e)
-            continue
-
-        parsed = parse_file_analysis_response(response, batch)
-        if not parsed:
-            log.warning(
-                "File analysis batch %d: no valid entries parsed from response",
-                batch_num // batch_size,
-            )
-            continue
-
-        with (write_lock(db_dir, timeout=5.0) if not write_lock_held else nullcontext()):
-            with transaction(conn):
-                db_rows = [(r["file_id"], config_hash, r["summary"], model) for r in parsed]
-                inserted = upsert_file_analysis_batch(conn, db_rows)
-                total += inserted
-
-        if (batch_num // batch_size) % 4 == 0:
-            log.info("  file batch %d/%d: %d stored", batch_num // batch_size + 1, batches, total)
-
-    log.info("File analysis stored: %d files (model=%s)", total, model)
-
-
 def _extract_param_types(signature: str) -> str:
     """Extract the parameter type list from a C/C++ function signature.
 
@@ -888,7 +791,6 @@ def run(
     index_refs: bool = False,
     index_embeddings: bool = False,
     analyze_symbols: bool = False,
-    analyze_files: bool = False,
     analyze_overrides: bool = True,
     project_root: Path | None = None,
     project_id: str | None = None,
@@ -922,8 +824,6 @@ def run(
             definition symbols using Ollama after indexing.
         analyze_symbols: When True, generate structured LLM analysis
             (summary, inputs, outputs) for project symbols via Ollama.
-        analyze_files: When True, generate file-level summaries via Ollama
-            (requires ``analyze_symbols`` to have run first for best quality).
         analyze_overrides: When True (default), build the method override
             graph by matching virtual methods across the inheritance chain.
             Runs entirely on the local index — no LLM needed.
@@ -1110,13 +1010,6 @@ def run(
         log.info("Generating LLM analysis for project symbols...")
         _build_llm_analysis(conn, config_hash, llm_config, db_path.parent,
                            exclude_like=exclude_like)
-        conn.commit()
-
-    # File-level LLM analysis (opt-in, runs after symbol analysis)
-    if analyze_files and llm_config is not None and llm_config.enabled:
-        log.info("Generating file-level LLM analysis...")
-        _build_file_analysis(conn, config_hash, llm_config, db_path.parent,
-                            exclude_like=exclude_like)
         conn.commit()
 
     # Method override tracking (post-processing, no LLM needed)
