@@ -248,7 +248,7 @@ wheels = [
 
 [[package]]
 name = "fw-context-mcp"
-version = "0.8.6"
+version = "0.10.1"
 source = { editable = "." }
 dependencies = [
     { name = "httpx" },
@@ -256,6 +256,7 @@ dependencies = [
     { name = "mcp", extra = ["cli"] },
     { name = "pysqlite3" },
     { name = "sqlite-vec" },
+    { name = "watchfiles" },
 ]
 
 [package.optional-dependencies]
@@ -263,9 +264,6 @@ dev = [
     { name = "mypy" },
     { name = "pytest" },
     { name = "ruff" },
-]
-watch = [
-    { name = "watchfiles" },
 ]
 
 [package.metadata]
@@ -278,9 +276,9 @@ requires-dist = [
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8" },
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.4" },
     { name = "sqlite-vec", specifier = ">=0.1.0" },
-    { name = "watchfiles", marker = "extra == 'watch'", specifier = ">=0.21" },
+    { name = "watchfiles", specifier = ">=0.21" },
 ]
-provides-extras = ["dev", "watch"]
+provides-extras = ["dev"]
 
 [[package]]
 name = "h11"
