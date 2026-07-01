@@ -1,4 +1,4 @@
-# Shared Index — Centrální PostgreSQL backend
+# Shared LLM Analysis Cache — Centrální cache pro analýzu symbolů
 
 **Stav:** Návrh — čeká na mentální review
 
@@ -11,348 +11,221 @@ modelu. LLM vrací `unparseable response`, ale protože se neuloží žádný
 záznam do `llm_analysis`, symbol se při každém `fw-context index --analyze`
 znovu a znovu posílá do Ollama → nekonečná smyčka.
 
-**Vyřešeno v `runner.py` (`_build_llm_analysis`):**
-- Před Ollama callem se odhadnou tokeny promptu a porovnají s velikostí
-  kontextu modelu (získanou z Ollama `/api/tags` → `details.context_length`,
-  fallback na `num_ctx` z configu)
-- Pokud prompt + odpověď překročí kontext → uloží se sentinel row
-  `model="skip:toolarge:{ctx_size}"` a symbol se přeskočí
-- Při přechodu na model s větším kontextem se staré sentinely automaticky
-  smažou → symbol se znovu pokusí analyzovat
+**Vyřešeno v `runner.py` (`_build_llm_analysis`):** prompt-fit check +
+sentinel row `model="skip:toolarge:{ctx_size}"`.
 
 ### Sekundární — sdílení LLM analýzy mezi vývojáři (TENTO PLÁN)
 
 **Situace:**
-- Projekt zbox: `fw-context index --analyze` trvá 8–12 h (jen CPU)
-- Někteří devové nemají GPU → analýzu nespouští vůbec, nebo jim trvá desítky hodin
-- Pracovní stanice (včetně GPU stroje) se vypínají — index nemůže běžet lokálně 24/7
-- Server běží 24/7, už na něm běží nginx s HTTPS
-- Mezi devy není VPN → NFS nepřipadá v úvahu
-- Potřebujeme síťové rozhraní přístupné přes internet
+- Projekt zbox: `fw-context index --analyze` trvá 8–12 h na CPU (jen LLM
+  analýza symbolů — samotné parsování a indexování je rychlé, minuty)
+- Někteří devové nemají GPU → analýzu nespouští, nebo trvá desítky hodin
+- GPU stanice se vypíná, server běží 24/7
 
-## Zvažované alternativy
+**Klíčový vhled:** Jediné co je pomalé a potřebuje sdílení je **LLM analýza
+symbolů**. Parsování, indexování, reference, embeddingy — to všechno jsou
+minuty. Jen Ollama volání (tisíce symbolů, každý 10-30s) trvá hodiny.
 
-### 1. NFS / sdílený disk (ZAMÍTNUTO)
-- Nejsme na stejné síti, nemáme VPN
-- SQLite WAL přes NFS není doporučený pro zápis
+`llm_analysis_cache` už existuje — je to content-addressable cache kde
+klíčem je hash těla + jména + signatury + docstringu. Identický symbol
+v různých projektech nebo po re-indexu dostane stejný hash → cache hit.
 
-### 2. MCP server proxy (ZAMÍTNUTO)
-- GPU stanice se vypíná — nemůže hostit MCP server 24/7
-- I kdyby běžela, jeden MCP server obsluhující všechny devy by byl bottleneck
+## Řešení
 
-### 3. rqlite (ZAMÍTNUTO)
-- SQLite-kompatibilní s HTTP API, Raft konsensus
-- **Problém:** žádná správa uživatelů na úrovni databáze
-- Nelze říct "dev A vidí jen projekt X, dev B jen projekt Y"
-- Auth musí řešit nginx → manuální správa uživatelů v htpasswd, žádné per-project
-  oprávnění
-- Pro více projektů a více vývojářů s různými právy nedostačující
-
-### 4. PostgreSQL (VYBRÁNO)
-- Síťový přístup odkudkoliv (TCP)
-- Plná správa uživatelů a oprávnění (role, GRANT, row-level security)
-- Per-project izolace přes schema nebo row-level security
-- Paralelní zápisy (více lidí může indexovat současně — MVCC)
-- Connection pooling (pgBouncer)
-- Streamovací replikace, point-in-time recovery
-- `pgvector` místo `sqlite-vec`, `tsvector` místo FTS5
-- Audit log (`pgaudit`), monitoring (`pg_stat_statements`)
-
-## Co získáme
-
-| Vlastnost | Předtím (SQLite) | Potom (PostgreSQL) |
-|-----------|-----------------|-------------------|
-| Přístup | Lokální soubor | Síťový (TCP, kdekoliv) |
-| Uživatelé | Žádní | Role, GRANT, row-level security |
-| Projekty | Jeden na DB | Více schemat / RLS per-project |
-| Souběžný zápis | `write_lock` (fcntl) | MVCC — kdokoliv může indexovat |
-| Full-text | FTS5 (`modem*`) | tsvector (`modem:*`) |
-| Vektory | sqlite-vec | pgvector |
-| Replikace | manuální rsync | Streaming replication |
-| Monitoring | Žádný | pg_stat_statements, pgaudit |
-| Cache persistence | `llm_analysis_cache` (SQLite) | Stejná tabulka v PostgreSQL |
-| Závislosti | Žádné (SQLite embedded) | PostgreSQL server, psycopg3/asyncpg |
-
-## Co ztratíme
-
-- **Jednoduchost jednoho souboru** — `index.db` je jeden file, PostgreSQL je
-  běžící služba s konfigurací, autentizací, connection poolem
-- **Zero-dependency deployment** — předtím stačilo `pip install fw-context-mcp`
-  a `fw-context index`, teď potřebuješ PostgreSQL server někde na síti
-- **Rychlost lokálních dotazů** — i "lokální" dotazy jdou přes TCP (ale na
-  LAN <1ms, na WAN <10-50ms — pro MCP tools akceptovatelné)
-- **FTS5 prefix syntax** — `modem*` se mění na `modem:*` (tsquery), drobná
-  změna v parseru query
-- **Content-sync triggery** — FTS5 se aktualizuje automaticky při INSERT/DELETE
-  přes triggery. tsvector vyžaduje explicitní `REFRESH` nebo generovaný sloupec
-- **write_lock / fcntl.flock** — celý locking mechanizmus padá, nahradí se
-  transakční izolací (MVCC)
-- **BLOB embedding formát** — `sqlite-vec` ukládá vektory jako BLOB s custom
-  binárním formátem, `pgvector` používá `vector(1024)` typ — nutná konverze
-  při migraci existujících indexů
-
-## Rozsah změn
-
-### Nutné přepsání
-
-| Soubor | Rozsah | Popis |
-|--------|--------|-------|
-| `indexer/db.py` | ~2700 ř. → celé přepsání | Schéma, indexy, triggery, migrace, všechny query funkce |
-| `indexer/ops.py` | ~200 ř. | INSERT/UPDATE logika — `INSERT ... ON CONFLICT` → `INSERT ... ON CONFLICT` (PG to má taky, jen jiná syntax) |
-| `config/settings.py` | ~30 ř. | Nový `[database]` section: `url`, `pool_size`, read-only flag |
-| `llm/ollama.py` | ~5 ř. | Beze změny (jen Ollama klient) |
-| `indexer/runner.py` | ~30 ř. | `write_lock` → transakce, connection management |
-
-### Beze změny
-
-| Soubor | Důvod |
-|--------|-------|
-| `indexer/symbols.py` | Libclang parsování — nezávislé na storage |
-| `indexer/prompts.py` | LLM prompty a response parsing — beze změny |
-| `mcp/handlers/source.py` | MCP handlery — pokud zůstane stejné DB API |
-| `mcp/handlers/callgraph.py` | dtto |
-| `mcp/handlers/maintenance.py` | dtto (kromě `reset_index` — to se změní na `TRUNCATE`) |
-| `search/pipeline.py` | Search pipeline — beze změny |
-| `search/phases/*.py` | Search fáze — beze změny |
-
-### Nové soubory
-
-| Soubor | Popis |
-|--------|-------|
-| `indexer/db_pg.py` | PostgreSQL implementace storage vrstvy |
-| `migrations/` | Alembic migrace (náhrada za `_MIGRATION_ADD_COLUMNS`) |
-| `config/pgconfig.py` | PostgreSQL connection config, pool management |
-
-## Architektura po migraci
+**Centralizovat jen `llm_analysis_cache`, zbytek zůstává lokální SQLite.**
 
 ```
-┌─────────────────────────────────────────────────────────┐
-│ Server (24/7)                                           │
-│                                                         │
-│ PostgreSQL 16+                                          │
-│   ├─ pgvector extension                                │
-│   ├─ pg_trgm / tsvector (full-text)                    │
-│   ├─ pgaudit (audit log)                               │
-│   ├─ role-based auth:                                   │
-│   │   gpu_writer — SELECT, INSERT, UPDATE, DELETE      │
-│   │   dev_reader — SELECT only                         │
-│   └─ pgBouncer (connection pooling)                    │
-│                                                         │
-│ nginx:443 → pgBouncer:6432 (už existuje)               │
-└─────────────────────────────────────────────────────────┘
-        ▲                             ▲
-        │ TCP (LAN/internet)          │ TCP
-   ┌────┴──────────┐            ┌────┴──────────┐
-   │ Dev A (GPU)   │            │ Dev B (CPU)    │
-   │               │            │               │
-   │ fw-context    │            │ fw-context     │
-   │ index         │            │ (read-only)    │
-   │ --analyze     │            │               │
-   │               │            │ jen query      │
-   │ zapisuje přes │            │ čte přes       │
-   │ PG connection │            │ PG connection  │
-   └───────────────┘            └───────────────┘
+┌─────────────────────────────────────────────┐
+│ Server (24/7)                               │
+│                                             │
+│ fw-context-cache-server                     │
+│   ├─ HTTP API (fastapi/starlette)           │
+│   ├─ SQLite (jen llm_analysis_cache)        │
+│   ├─ nginx HTTPS + auth (už existuje)       │
+│   └─ GET  /cache/{content_hash}            │
+│       PUT  /cache/{content_hash}            │
+└─────────────────────────────────────────────┘
+        ▲                        ▲
+        │ HTTPS                  │ HTTPS
+   ┌────┴──────────┐       ┌────┴──────────┐
+   │ Dev A (GPU)   │       │ Dev B (CPU)    │
+   │               │       │               │
+   │ Lokální       │       │ Lokální        │
+   │ index.db      │       │ index.db       │
+   │               │       │               │
+   │ fw-context    │       │ fw-context     │
+   │ index         │       │ index          │
+   │ --analyze     │       │ --analyze      │
+   │               │       │               │
+   │ Cache miss →  │       │ Cache miss →   │
+   │ Ollama (GPU)  │       │ GET /cache/    │
+   │ → PUT /cache  │       │   → hit!       │
+   │               │       │   (uloží se    │
+   │               │       │    lokálně)    │
+   └───────────────┘       └───────────────┘
 ```
 
-## Schéma databáze (návrh)
+**Flow:**
 
-PostgreSQL schéma kopíruje SQLite schéma s minimálními změnami:
+1. GPU dev spustí `fw-context index --analyze`
+   - Pro každý symbol: `compute_content_hash()` → dotaz na cache server
+   - Cache hit → okamžitě uloženo do lokální `llm_analysis` (bez Ollama)
+   - Cache miss → Ollama (GPU) → výsledek se uloží lokálně **a zároveň
+     PUT na cache server**
+2. CPU dev spustí `fw-context index --analyze`
+   - Pro každý symbol: `compute_content_hash()` → dotaz na cache server
+   - Cache hit → okamžitě uloženo lokálně (naprostá většina — GPU dev už
+     analýzu vygeneroval)
+   - Cache miss → Ollama (CPU) — ale jen pro nové/změněné symboly
 
-```sql
--- Projekty (stejné)
-CREATE TABLE projects (
-    project_id   TEXT PRIMARY KEY,
-    name         TEXT NOT NULL,
-    root_path    TEXT NOT NULL
-);
+**Efekt:**
+- CPU dev analyzuje jen symboly které ještě nikdo neanalyzoval
+- Jakmile GPU dev jednou projet celý projekt, všichni ostatní mají cache hit
+  pro všechny nezměněné symboly → `fw-context index --analyze` trvá minuty
+  místo hodin
+- Cache je content-addressable → přežije re-index, změnu configu, přechod
+  na jiný projekt se stejným SDK kódem
 
--- Build konfigurace (stejné)
-CREATE TABLE build_configs (
-    config_hash TEXT PRIMARY KEY,
-    project_id  TEXT NOT NULL REFERENCES projects(project_id),
-    created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
-    compile_commands_path TEXT NOT NULL
-);
+## Co se musí změnit
 
--- Soubory (stejné)
-CREATE TABLE files (
-    id          BIGSERIAL PRIMARY KEY,
-    config_hash TEXT NOT NULL REFERENCES build_configs(config_hash),
-    path        TEXT NOT NULL,
-    language    TEXT NOT NULL,
-    generated   BOOLEAN NOT NULL DEFAULT false,
-    mtime       DOUBLE PRECISION NOT NULL DEFAULT 0,
-    UNIQUE(config_hash, path)
-);
+### 1. Cache server (`fw-context-cache-server`)
 
--- Symboly (téměř stejné, přidán tsvector)
-CREATE TABLE symbols (
-    id              BIGSERIAL PRIMARY KEY,
-    config_hash     TEXT NOT NULL,
-    file_id         BIGINT NOT NULL REFERENCES files(id),
-    file_path       TEXT NOT NULL DEFAULT '',
-    name_tokens     TEXT NOT NULL DEFAULT '',
-    usr             TEXT NOT NULL,
-    name            TEXT NOT NULL,
-    qualified_name  TEXT NOT NULL,
-    kind            TEXT NOT NULL,
-    line            INTEGER NOT NULL,
-    col             INTEGER NOT NULL,
-    end_line        INTEGER NOT NULL DEFAULT 0,
-    is_definition   BOOLEAN NOT NULL DEFAULT false,
-    is_virtual      BOOLEAN NOT NULL DEFAULT false,
-    is_pure_virtual BOOLEAN NOT NULL DEFAULT false,
-    is_template     BOOLEAN NOT NULL DEFAULT false,
-    is_project      BOOLEAN NOT NULL DEFAULT false,
-    signature       TEXT NOT NULL DEFAULT '',
-    docstring       TEXT NOT NULL DEFAULT '',
-    summary         TEXT NOT NULL DEFAULT '',
-    inputs          TEXT NOT NULL DEFAULT '',
-    outputs         TEXT NOT NULL DEFAULT '',
-    parent_usr      TEXT NOT NULL DEFAULT '',
-    template_usr    TEXT NOT NULL DEFAULT '',
-    pagerank        REAL NOT NULL DEFAULT 0.0,
-    enum_value      INTEGER,
-    -- Full-text search (náhrada FTS5)
-    fts_vector      TSVECTOR GENERATED ALWAYS AS (
-        to_tsvector('english', coalesce(name, '') || ' ' ||
-                    coalesce(qualified_name, '') || ' ' ||
-                    coalesce(signature, '') || ' ' ||
-                    coalesce(docstring, '') || ' ' ||
-                    coalesce(file_path, '') || ' ' ||
-                    coalesce(name_tokens, '') || ' ' ||
-                    coalesce(summary, '') || ' ' ||
-                    coalesce(inputs, '') || ' ' ||
-                    coalesce(outputs, ''))
-    ) STORED,
-    UNIQUE(config_hash, usr)
-);
-CREATE INDEX idx_symbols_fts ON symbols USING GIN(fts_vector);
+Nový subcommand, samostatný proces na serveru:
 
--- Reference / call graph (stejné)
-CREATE TABLE refs (
-    id          BIGSERIAL PRIMARY KEY,
-    config_hash TEXT NOT NULL,
-    to_usr      TEXT NOT NULL,
-    from_file   TEXT NOT NULL,
-    from_line   INTEGER NOT NULL,
-    from_usr    TEXT,
-    ref_kind    TEXT NOT NULL
-);
+```python
+# Nový soubor: src/fw_context_mcp/cache_server.py
+# Spouští se jako: fw-context-cache-server --port 8080
 
--- Embeddings (pgvector místo BLOB)
-CREATE EXTENSION IF NOT EXISTS vector;
-CREATE TABLE embeddings (
-    symbol_id   BIGINT PRIMARY KEY REFERENCES symbols(id) ON DELETE CASCADE,
-    embedding   vector(1024) NOT NULL,
-    model       TEXT NOT NULL,
-    updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
-);
+from fastapi import FastAPI, HTTPException
+app = FastAPI()
 
--- LLM analýza (stejné, akorát TIMESTAMP → TIMESTAMPTZ)
-CREATE TABLE llm_analysis (
-    symbol_id   BIGINT PRIMARY KEY REFERENCES symbols(id) ON DELETE CASCADE,
-    summary     TEXT NOT NULL DEFAULT '',
-    inputs      TEXT NOT NULL DEFAULT '',
-    outputs     TEXT NOT NULL DEFAULT '',
-    model       TEXT NOT NULL,
-    analyzed_at TIMESTAMPTZ NOT NULL DEFAULT now()
-);
+@app.get("/cache/{content_hash}")
+def get_cache(content_hash: str):
+    row = db.execute("SELECT * FROM llm_analysis_cache WHERE content_hash = ?",
+                     (content_hash,)).fetchone()
+    if not row:
+        raise HTTPException(404)
+    return dict(row)
 
--- Content-addressable cache (stejné)
-CREATE TABLE llm_analysis_cache (
-    content_hash TEXT PRIMARY KEY,
-    summary      TEXT NOT NULL DEFAULT '',
-    inputs       TEXT NOT NULL DEFAULT '',
-    outputs      TEXT NOT NULL DEFAULT '',
-    model        TEXT NOT NULL,
-    analyzed_at  TIMESTAMPTZ NOT NULL DEFAULT now()
-);
-
--- Ostatní tabulky (inheritance, overrides, hotspot_cache, indirect_call_sites,
--- fp_assignments) — identické schéma, jen SERIAL → BIGSERIAL, BOOLEAN
+@app.put("/cache/{content_hash}")
+def put_cache(content_hash: str, entry: CacheEntry):
+    db.execute("INSERT OR REPLACE INTO llm_analysis_cache VALUES (?,?,?,?,?,?)",
+               (content_hash, entry.summary, entry.inputs,
+                entry.outputs, entry.model, datetime.now()))
+    return {"status": "ok"}
 ```
 
-## Návrh oprávnění
+**Auth:** API key v headeru, ověřený nginx (`auth_request`).
 
-```sql
--- Writer role (GPU dev, CI)
-CREATE ROLE gpu_writer WITH LOGIN PASSWORD '...';
-GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO gpu_writer;
-GRANT USAGE ON ALL SEQUENCES IN SCHEMA public TO gpu_writer;
+**Storage:** Jeden SQLite soubor (max pár MB — jen hashe a texty).
 
--- Reader role (všichni devové)
-CREATE ROLE dev_reader WITH LOGIN PASSWORD '...';
-GRANT SELECT ON ALL TABLES IN SCHEMA public TO dev_reader;
+### 2. `llm_analysis_cache` klient
 
--- Row-level security pro multi-tenant (volitelné)
-ALTER TABLE symbols ENABLE ROW LEVEL SECURITY;
-CREATE POLICY project_isolation ON symbols
-    USING (config_hash IN (
-        SELECT config_hash FROM build_configs
-        WHERE project_id = current_setting('app.project_id', true)
-    ));
+V `runner.py:_build_llm_analysis` přidat remote cache lookup:
+
+```python
+# Místo:
+cached = lookup_llm_analysis_cache(conn, h)
+
+# Nově:
+cached = lookup_llm_analysis_cache(conn, h)
+if not cached and cache_client:
+    cached = cache_client.get(h)
+    if cached:
+        # Uložit lokálně pro příští použití
+        upsert_llm_analysis_cache(conn, [(h, cached["summary"],
+            cached["inputs"], cached["outputs"], cached["model"])])
 ```
 
-## Relativní cesty — nutná podmínka pro sdílenou DB
+A po úspěšné Ollama analýze navíc PUT na cache server:
 
-Aby index fungoval napříč různými stroji, musí se vyřešit cesty k souborům.
-Problém: `compile_commands.json` obsahuje absolutní cesty a ne všechny
-soubory jsou uvnitř project root (SDK: `mbed-os/`, `.pio/`, `zephyr/`,
-ESP-IDF, systémové headery).
+```python
+# Po upsert_llm_analysis_cache lokálně:
+if cache_client:
+    cache_client.put(h, r["summary"], r["inputs"], r["outputs"], model)
+```
 
-**Které nástroje potřebují přístup k souborům:**
+### 3. Konfigurace
 
-| Nástroj | Potřebuje soubory? | Funguje bez nich? |
-|---------|-------------------|-------------------|
-| `lookup_symbol` | Ne (jen metadata) | Ano |
-| `search_code` | Ne (jen FTS5/tsvector) | Ano |
-| `find_callers`, `find_all_callers_recursive` | Ne (jen refs) | Ano |
-| `semantic_search` | Ne (jen embeddings) | Ano |
-| `explain_symbol` (cached) | Ne (pre-computed LLM) | Ano |
-| `get_file_map` | Ne (jen metadata) | Ano |
-| `get_source` | **Ano** | Ne — vrátí warning |
-| `explain_symbol` (on-demand) | **Ano** | Ne — vrátí warning |
+```toml
+# .fw-context/local.toml
+[llm]
+enabled = true
+model = "qwen2.5-coder:14b"
+ollama_url = "http://localhost:11434"
 
-**Závěr:** 95 % nástrojů funguje jen s DB metadaty. Pro sdílenou DB je
-hlavní hodnota v **pre-computed LLM analýze** (`summary`, `inputs`, `outputs`),
-která je uložená přímo v DB. `get_source()` a on-demand analýza můžou selhat
-s `"source file not found"` — to je akceptovatelné.
+[cache_server]
+url = "https://fw-cache.example.com"
+api_key = "${FW_CACHE_API_KEY}"
+# write = true   # GPU dev — zapisuje do cache
+# write = false  # CPU dev — jen čte
+```
 
-**Řešení pro cesty:**
-1. Projektové soubory (uvnitř `source_roots`) ukládat relativně k `project_root`
-2. SDK/vendor soubory (mimo `source_roots`) ukládat jako absolutní — při
-   `get_source()` zkusit přečíst, pokud neexistuje, vrátit warning
-3. `project_root` se předává jako parametr při startu MCP serveru — každý
-   dev si nastaví svou cestu
+### 4. CLI
+
+```bash
+# Spuštění cache serveru (na serveru 24/7)
+fw-context-cache-server --db /srv/fw-context/cache.db --port 8080
+
+# Dev s GPU (zapisuje do cache)
+fw-context index --analyze  # použije [cache_server] url z configu
+
+# Dev bez GPU (čte z cache)
+fw-context index --analyze  # cache hity pokryjí 95% symbolů
+```
+
+## Co se nemění
+
+- **SQLite zůstává** — každý dev má svůj lokální `index.db`
+- **Parsování, reference, embeddingy** — vše lokální, rychlé (minuty)
+- **FTS5, vec0** — lokální, žádná změna
+- **MCP server** — lokální, stdio, žádná změna
+- **Celá architektura** — jen se přidá optional cache vrstva
+- **Offline režim** — bez cache serveru to funguje jako dřív (pomalejší, ale funkční)
+
+## Výhody oproti PostgreSQL
+
+| Vlastnost | PostgreSQL backend | Cache server |
+|-----------|-------------------|--------------|
+| Změna kódu | ~2700 ř. (celý `db.py`) | ~100 ř. (cache lookup/put) |
+| Deployment | PostgreSQL server + migrace | Jeden Python proces + SQLite |
+| Fallback | Žádný (requires PG) | Offline režim bez cache |
+| Lokální výkon | Síťový round-trip na vše | Lokální SQLite |
+| Složitost | Vysoká | Nízká |
+| Riziko | Breaking change | Zero-risk (optional) |
+
+## Nevýhody
+
+- Nový běžící proces na serveru (ale triviální — FastAPI + SQLite)
+- Cache server je single point of failure pro nové analýzy (ale ne pro
+  existující — ty jsou uložené lokálně)
+- Nutná správa API klíčů (ale to řeší nginx)
+
+## Plán implementace (odhad: 2 dny)
+
+1. **Cache server** (`cache_server.py`) — FastAPI, 2 endpointy, SQLite
+2. **Klient** v `runner.py` — `CacheClient` třída s `get()` a `put()`
+3. **Konfigurace** — `[cache_server]` section v `Config`
+4. **Systemd unit** — `fw-context-cache-server.service`
+5. **Testy** — unit testy na cache client, integrační test na server
 
 ## Otevřené otázky pro zítřejší review
 
-1. **Je PostgreSQL správná volba?** Získáme hodně, ale ztrácíme tu "one file"
-   jednoduchost — stačí `pip install` a jedeš. S PostgreSQL je deployment
-   složitější (musí běžet server, musí být dostupný po síti).
+1. **Je to dostatečné?** Cache server řeší jen LLM analýzu — ne sdílení
+   embeddingů nebo referencí. Embeddingy se počítají rychle (batch po 100,
+   jeden Ollama call). Reference se počítají lokálně při indexování.
 
-2. **Nestačilo by lokální SQLite + `llm_analysis_cache` sdílená přes síť?**
-   Cache je content-addressable — kdyby se sdílela (např. jako samostatný
-   rqlite/shared SQLite), devové bez GPU by měli instantní analýzy pro
-   nezměněné symboly. Nové/změněné by stále museli analyzovat (nebo počkat
-   až to udělá GPU dev).
+2. **Cache eviction?** `llm_analysis_cache` roste s každým unikátním
+   symbolem. Po roce to může být pár set MB. Limitovat LRU? Nebo neřešit
+   (disk je levný)?
 
-3. **Co `compile_commands.json` cesty?** PostgreSQL je síťový, ale zdrojáky
-   zůstávají lokální. Symboly v DB obsahují `file_path` — čtení body
-   (`get_source`) vyžaduje aby cesty seděly. Řešení: relativní cesty vůči
-   project root, nebo Docker s fixními mount pointy (`/workspace`).
+3. **Cache warming?** GPU dev by měl po každé změně kódu spustit
+   `fw-context index --analyze` aby naplnil cache pro ostatní. Automatizovat
+   přes CI?
 
-4. **Connection pooling** — psycopg3 s connection poolem, nebo pgBouncer?
-   Pro MCP server (jeden klient, stdio) stačí jedno connection. Pro paralelní
-   indexování je potřeba pool.
-
-5. **Fázování migrace** — udělat PostgreSQL jako optional backend (vedle
-   SQLite), nebo rovnou migrovat a SQLite zahodit? Druhá varianta je
-   jednodušší na kód (jeden storage backend), ale znamená breaking change.
-
-6. **Odhad práce** — ~2 týdny na storage vrstvu, ~1 týden testování, ~1 týden
-   deployment/docs. Celkem ~měsíc.
+4. **Race condition?** Dva GPU devové zapíšou stejný hash současně.
+   `INSERT OR REPLACE` v SQLite je atomický (stejný hash = stejná data,
+   content-addressable) — v pohodě.
 
 ---
 
