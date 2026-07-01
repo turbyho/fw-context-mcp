@@ -294,6 +294,36 @@ CREATE POLICY project_isolation ON symbols
     ));
 ```
 
+## Relativní cesty — nutná podmínka pro sdílenou DB
+
+Aby index fungoval napříč různými stroji, **všechny cesty k souborům v DB
+musí být relativní vůči project root**. Dnes tomu tak není —
+`compile_commands.json` obsahuje absolutní cesty a ty se ukládají 1:1 do
+`files.path` i `symbols.file_path`.
+
+**Co se musí změnit:**
+
+| Místo | Současný stav | Cílový stav |
+|-------|--------------|-------------|
+| `compile_commands.py:parse()` | Absolutní cesta z JSON | `os.path.relpath(abs_path, project_root)` |
+| `compile_commands.py:CompilationUnit.file` | `Path(abs_path)` | `project_root / Path(rel_path)` — rekonstrukce pro čtení |
+| `files.path` v DB | Absolutní | Relativní k `project_root` |
+| `symbols.file_path` v DB | Absolutní | Relativní k `project_root` |
+| `refs.from_file` v DB | Absolutní | Relativní k `project_root` |
+| `get_source()` / `_read_body()` | Čte `abs_path` přímo | `project_root / db_path` |
+
+**Výhoda:** Každý dev může mít projekt v jiném adresáři (`~/work/zbox` vs
+`/home/petr/projects/zbox`). DB je přenositelná.
+
+**Riziko:** `project_root` se musí předávat všude, kde se pracuje s cestami
+z DB. Už teď se předává ve většině funkcí — `get_active_build` vrací
+`project_root` — ale je potřeba audit všech míst, kde se `file_path` čte
+napřímo bez připojení rootu.
+
+**Backward compat:** Tohle je breaking change i pro lokální SQLite —
+existující indexy s absolutními cestami by přestaly fungovat. Nutný
+`reset_index` + re-index po nasazení.
+
 ## Otevřené otázky pro zítřejší review
 
 1. **Je PostgreSQL správná volba?** Získáme hodně, ale ztrácíme tu "one file"
