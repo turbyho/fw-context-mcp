@@ -47,6 +47,7 @@ ollama_url = "http://localhost:11434"
 #   See: https://ollama.com/search?c=cloud
 model = "qwen2.5-coder:14b"
 num_ctx = 16384
+# keep_alive = "10m"   # how long to keep model loaded in VRAM after each request
 # timeout = 600.0   # HTTP timeout for Ollama requests in seconds (default 600)
 # debug_log = "~/.fw-context/llm-debug.jsonl"   # write LLM prompts/responses to JSONL
 
@@ -121,6 +122,7 @@ _PROJECT_LOCAL_DEFAULTS_TEMPLATE = """\
 # ollama_url = "http://localhost:11434"
 # model = "qwen2.5-coder:14b"   # minimum 14B recommended — see global config for options
 # num_ctx = 16384
+# keep_alive = "10m"   # how long to keep model loaded in VRAM after each request
 # timeout = 600.0   # HTTP timeout for Ollama requests in seconds (default 600)
 # debug_log = "~/.fw-context/llm-debug.jsonl"   # write LLM prompts/responses to JSONL
 # embed_model = "mxbai-embed-large:latest"   # embedding model for semantic search
@@ -150,6 +152,12 @@ class LLMConfig:
             ``num_predict=3000`` can take several minutes, especially when
             the model runs on CPU. Embed requests use ``timeout * 2``.
         debug_log: Optional path to a JSONL file for debugging LLM prompts/responses.
+        keep_alive: How long Ollama keeps the model loaded in VRAM after a request.
+            ``"10m"`` (default) means the model stays loaded for 10 minutes of
+            inactivity before unloading.  During indexing (~40 back-to-back
+            requests), this prevents per-request model loading (~2-5 s each).
+            Set ``"0"`` to unload immediately (saves VRAM, adds latency).
+            Set ``"-1"`` to keep loaded indefinitely.
         analyze_symbols: Generate per-symbol summaries, inputs, and outputs during indexing.
         analyze_vendor: When False (default), skip LLM analysis for vendor/SDK code
             (mbed-os, Zephyr, PlatformIO, etc.) — only project code is analyzed.
@@ -161,6 +169,7 @@ class LLMConfig:
     embed_model: str = "mxbai-embed-large:latest"
     num_ctx: int = 16384
     timeout: float = 600.0
+    keep_alive: str = "10m"
     debug_log: Path | None = None
     analyze_symbols: bool = True
     analyze_vendor: bool = False
@@ -311,6 +320,8 @@ def _from_dict(data: dict) -> Config:
             cfg.llm.num_ctx = int(num_ctx)
         if timeout := llm.get("timeout"):
             cfg.llm.timeout = float(timeout)
+        if keep_alive := llm.get("keep_alive"):
+            cfg.llm.keep_alive = keep_alive
         if debug_log := llm.get("debug_log"):
             cfg.llm.debug_log = Path(debug_log).expanduser()
         if "analyze_symbols" in llm:

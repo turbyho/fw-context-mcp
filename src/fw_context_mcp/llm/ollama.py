@@ -101,6 +101,7 @@ def call_ollama(
         "model": cfg.model,
         "prompt": prompt,
         "stream": False,
+        "keep_alive": cfg.keep_alive,
         "options": options,
     }
     t0 = time.monotonic()
@@ -162,6 +163,7 @@ def call_ollama_embed(inputs: list[str], cfg: LLMConfig) -> list[list[float]]:
     payload = {
         "model": cfg.embed_model,
         "input": inputs,
+        "keep_alive": cfg.keep_alive,
     }
     t0 = time.monotonic()
     try:
