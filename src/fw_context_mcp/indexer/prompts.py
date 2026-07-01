@@ -23,7 +23,7 @@ from typing import Any
 log = logging.getLogger(__name__)
 
 # Maximum docstring length to include in the prompt (keeps token usage bounded)
-_MAX_DOCSTRING_CHARS = 400
+_MAX_DOCSTRING_CHARS = 800
 
 # Characters that would break JSON when reproduced by the model inside string
 # values.  Replaced with text descriptions before the prompt is built so the
@@ -46,19 +46,45 @@ _ANALYSIS_SYSTEM = """You are a senior C/C++ embedded engineer writing comprehen
 
 For each symbol, output a JSON object with EXACTLY these three string fields:
   "summary": a detailed description (3-6 sentences). Explain the purpose, behavior, key design patterns, and embedded-system context.
-  "inputs": a single string describing all inputs. For functions: list each parameter with type and role. For classes: describe dependencies and configuration. Format as "param1 (type): role; param2 (type): role". Write everything inline as ONE STRING, not a JSON object.
-  "outputs": a single string describing all outputs and side effects. For functions: return value, error codes, and all side effects. For classes: what the class provides and manages. Format as ONE STRING, not a JSON object.
+  "inputs": a single string describing all inputs. For functions: list each parameter with type and role. For classes: describe dependencies and configuration. For typedefs: the underlying type. For enums: not applicable, use "-". Format as "param1 (type): role; param2 (type): role". Write everything inline as ONE STRING, not a JSON object.
+  "outputs": a single string describing all outputs and side effects. For functions: return value, error codes, and all side effects. For classes: what the class provides and manages. For typedefs: what the type alias represents. For enums: what each constant means and how it's used. Format as ONE STRING, not a JSON object.
 
 CRITICAL: "inputs" and "outputs" MUST be plain text strings. DO NOT use nested JSON objects like {"param": "desc"}. Write everything as a single string separated by semicolons or newlines.
 CRITICAL: NEVER output literal backslash or double-quote characters inside JSON string values. These break JSON syntax. Describe them by name instead: write "backslash" not backslash, write "double-quote" not double-quote.
+CRITICAL: DO NOT enumerate individual fields, members, or constants. Describe the symbol's PURPOSE and ROLE — what problem it solves, what subsystem it belongs to, how it's used. For large structs with many fields, summarize the CATEGORIES of data it holds (e.g. "system config, comm settings, sensor thresholds") rather than listing every field.
 
-The symbol description always includes a ``body`` (the full function source — this is the PRIMARY source of information) and may include ``called functions`` (supplementary context only — to help you understand dependencies and the surrounding system).
+The symbol description always includes a ``doc`` field (documentation comment — when present this is the AUTHORITATIVE source written by the developer), a ``body`` (the full source or declaration — use this to verify/expand on the documentation), and may include ``called functions`` (supplementary context only — to help you understand dependencies and the surrounding system).
 
-EXAMPLE of correct format:
+**Documentation (doc:):** When present, prioritize the developer's own description. ``@brief`` describes the purpose, ``@param`` describes each parameter, ``@return`` describes the return value. Use this as the primary source — it reflects the developer's intent. If the doc field shows "(NO DOCSTRING — ...)", fall back to inferring from body, signature, file_path, and callee names.
+
+EXAMPLES:
+
+Function:
 {
   "summary": "Initializes the UART peripheral with the specified pins and baud rate. Configures the hardware registers for the given TX/RX pins. Sets up the baud rate generator based on the system clock. This function must be called before any UART read/write operations. The peripheral remains disabled until uart_enable() is called.",
   "inputs": "tx (PinName): UART transmit pin; rx (PinName): UART receive pin; baud (int): communication speed in bits per second",
   "outputs": "Returns 0 on success, -1 if pins are invalid. Side effects: configures GPIO alternate functions for TX/RX pins, enables UART clock, writes to USART_BRR and USART_CR1 registers"
+}
+
+Class/Struct:
+{
+  "summary": "Holds all run-time configuration for the device, loaded from flash and validated at boot. Groups settings by subsystem: system identity (device ID, axes orientation), cellular communication (APN, data server), USSD codes, battery monitoring thresholds, and POI detection parameters. Each field is a key in a key-value config store accessed via anitra::IConfig interface.",
+  "inputs": "Loaded from flash at boot; defaults to zero/false when flash is blank or corrupted. Validated by ConfigManager against schema version.",
+  "outputs": "Provides read/write access to all device configuration. Changes take effect immediately for most fields; communication-related fields require a modem restart."
+}
+
+Typedef:
+{
+  "summary": "Type alias for a fixed-width 32-bit unsigned integer. Used throughout the firmware for portability — guarantees the size regardless of the compiler or target platform. Preferred over raw 'unsigned int' to ensure consistent register-width calculations on 32-bit ARM Cortex-M targets.",
+  "inputs": "Underlying type: unsigned int (at least 32 bits on the target platform)",
+  "outputs": "Provides a portable uint32_t type name used for register values, bitfields, and protocol data structures"
+}
+
+Enum:
+{
+  "summary": "Defines the possible states of the modem state machine. Each constant represents a distinct operational phase. The state machine transitions linearly through the states during connection establishment, with IDLE and ERROR as the terminal entry/exit points. Designed so that ISRs and the main loop can check state via a single variable rather than multiple flags.",
+  "inputs": "-",
+  "outputs": "IDLE: modem powered off or not yet initialized; RESETTING: modem is being reset; WAIT_URC_AT_READY: waiting for AT ready unsolicited response; WAIT_CFUN: waiting for full functionality confirmation; WAIT_NETWORK: waiting for network registration; CONNECTED: fully operational, ready for data; ERROR: unrecoverable fault, requires power cycle"
 }
 
 Output ONLY the JSON array. No markdown fences, no commentary.

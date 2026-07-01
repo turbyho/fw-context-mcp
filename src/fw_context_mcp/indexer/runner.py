@@ -15,7 +15,7 @@ from pathlib import Path
 
 from ..config.settings import derive_project_id
 from ..llm.ollama import call_ollama
-from ..utils import MTIME_TOLERANCE_S
+from ..utils import MTIME_TOLERANCE_S, read_file_lines
 from .compile_commands import _SOURCE_EXTS
 from .compile_commands import parse as parse_compile_commands
 from .config_hash import compute as compute_config_hash
@@ -33,6 +33,16 @@ from .db import (
 from .ops import store_symbols_for_unit
 
 log = logging.getLogger(__name__)
+
+
+def _fmt_dur(seconds: float) -> str:
+    """Human-readable duration: ``87ms``, ``1.2s``, ``12s``."""
+    if seconds < 0.1:
+        return f"{seconds * 1000:.0f}ms"
+    if seconds < 10:
+        return f"{seconds:.1f}s"
+    return f"{seconds:.0f}s"
+
 
 _COMMON_SOURCE_DIRS = ["src", "lib", "app", "include", "drivers", "modules"]
 _COMMON_OS_DIRS = ["zephyr", "mbed-os"]
@@ -207,9 +217,9 @@ def _build_embeddings(conn, config_hash: str, llm_config, db_dir: Path) -> None:
                FROM symbols s
                WHERE s.config_hash = ?
                  AND s.is_definition = 1
-                 AND s.kind IN ('function', 'method', 'constructor', 'destructor',
-                                'class', 'struct')
-                 AND s.id NOT IN (SELECT symbol_id FROM embeddings WHERE model = ?)
+                  AND s.kind IN ('function', 'method', 'constructor', 'destructor',
+                                'class', 'struct', 'typedef', 'enum')
+                  AND s.id NOT IN (SELECT symbol_id FROM embeddings WHERE model = ?)
                ORDER BY CASE WHEN s.docstring IS NOT NULL AND LENGTH(s.docstring) > 30
                           THEN 0 ELSE 1 END""",
             (config_hash, model),
@@ -223,14 +233,12 @@ def _build_embeddings(conn, config_hash: str, llm_config, db_dir: Path) -> None:
     for r in rows:
         fp = (r["file_path"] or "").replace("\\", "/")
         path = ""
-        file_ = ""
         if "/" in fp:
-            *dirs, file_ = fp.split("/")
+            *dirs, _ = fp.split("/")
             path = "/".join(dirs[-2:])
-        elif fp:
-            file_ = fp
         qname = r["qualified_name"] or ""
         name = r["name"] or ""
+        kind = r["kind"] or ""
         class_ = "::".join(qname.split("::")[:-1]) if "::" in qname else ""
         sig = r["signature"] or ""
         is_os = "mbed-os" in fp.lower()
@@ -242,12 +250,21 @@ def _build_embeddings(conn, config_hash: str, llm_config, db_dir: Path) -> None:
         llm = (r["summary"] or "").strip()
         if llm:
             llm = llm[:200]
-        parts = [path, file_, class_, name, sig]
+
+        # Structured description: kind prefix helps embeddings distinguish
+        # e.g. "function", "class", "typedef" from each other
+        parts = [f"{kind} {name}"]
+        if class_:
+            parts.append(f"in {class_}")
+        if path:
+            parts.append(f"in {path}")
+        if sig:
+            parts.append(sig)
         if doc:
             parts.append(doc)
         if llm:
             parts.append(llm)
-        descriptions.append(" : ".join(p for p in parts if p))
+        descriptions.append(" : ".join(parts))
 
     total = 0
     chunk_size = 100
@@ -284,12 +301,10 @@ def _read_body(abs_path: str, start_line: int, end_line: int) -> str:
 
     Returns the body text or an empty string on any error (missing file, bad range).
     """
-    try:
-        with open(abs_path) as f:
-            lines = f.readlines()
-    except (FileNotFoundError, OSError):
+    lines = read_file_lines(abs_path)
+    if lines is None:
         return ""
-    if end_line > start_line and end_line <= len(lines):
+    if 0 < start_line <= end_line <= len(lines):
         return "".join(lines[start_line - 1 : end_line])
     return ""
 
@@ -330,8 +345,9 @@ def _enrich_batch(conn, batch_rows, config_hash: str) -> list[dict]:
         end_line = d.get("end_line", 0)
         usr = d.get("usr", "")
 
-        # Only read body for functions/methods with valid extents
-        if kind in ("function", "method", "constructor", "destructor", "class", "struct") and abs_path and end_line > start_line:
+        # Read body for symbols with meaningful extents.  Enums and typedefs
+        # benefit from body text during LLM analysis (enum constants, type alias).
+        if kind in ("function", "method", "constructor", "destructor", "class", "struct", "enum", "typedef") and abs_path and end_line > start_line:
             body = _read_body(abs_path, start_line, end_line)
 
         # Fetch callees from the reference index
@@ -366,13 +382,48 @@ def _build_llm_analysis(conn, config_hash: str, llm_config, db_dir: Path, *, exc
     from ..utils import compute_content_hash
     from .db import lookup_llm_analysis_cache, upsert_llm_analysis_batch, upsert_llm_analysis_cache
 
-    # Check Ollama reachability
+    # Suppress httpx INFO logs (one per symbol — noisy during analysis)
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+
+    # Check Ollama reachability and resolve model context size.
+    # /api/tags response includes details.context_length per model —
+    # authoritative for both local and cloud-proxied models.
+    _model_ctx_size = llm_config.num_ctx
     try:
         resp = httpx.get(llm_config.ollama_url.rstrip("/") + "/api/tags", timeout=5.0)
         resp.raise_for_status()
+        for m in resp.json().get("models", []):
+            if m.get("name") == llm_config.model:
+                ctx = m.get("details", {}).get("context_length", 0)
+                if ctx > 0:
+                    _model_ctx_size = ctx
+                    log.debug("Resolved model context from Ollama: %d tokens", ctx)
+                break
     except Exception:
         log.warning("Ollama not reachable — skipping LLM analysis generation")
         return
+
+    model = llm_config.model
+
+    # Un-skip symbols that were previously skipped because of a smaller
+    # context window.  When the user switches to a model with a larger
+    # context, those symbols may now fit and should be re-attempted.
+    conn.execute(
+        """DELETE FROM llm_analysis
+           WHERE model LIKE 'skip:toolarge:%'
+             AND CAST(SUBSTR(model, 15) AS INTEGER) < ?""",
+        (_model_ctx_size,),
+    )
+
+    # Un-skip symbols that were skipped due to unparseable output.
+    # The sentinel is "skip:unparseable:<model>" — clear when the
+    # current model differs so a different model can retry.
+    conn.execute(
+        """DELETE FROM llm_analysis
+           WHERE model LIKE 'skip:unparseable:%'
+             AND SUBSTR(model, 18) != ?""",
+        (model,),
+    )
 
     if exclude_like is None:
         exclude_like = []
@@ -387,7 +438,7 @@ def _build_llm_analysis(conn, config_hash: str, llm_config, db_dir: Path, *, exc
                WHERE s.config_hash = ?
                  AND s.is_definition = 1
                  AND s.kind IN ('function', 'method', 'constructor', 'destructor',
-                                'class', 'struct')
+                                'class', 'struct', 'typedef', 'enum')
                  AND s.name NOT LIKE '%(anonymous%'
                  AND s.name NOT LIKE '%(unnamed%'"""
     if exclude_clauses:
@@ -408,6 +459,7 @@ def _build_llm_analysis(conn, config_hash: str, llm_config, db_dir: Path, *, exc
     log.info("LLM analysis: %d symbols (model=%s)", total_symbols, model)
 
     for idx, row in enumerate(rows):
+        t0 = time.monotonic()
         qname = row["qualified_name"] or row["name"]
         try:
             batch_dicts = _enrich_batch(conn, [row], config_hash)
@@ -426,20 +478,75 @@ def _build_llm_analysis(conn, config_hash: str, llm_config, db_dir: Path, *, exc
                             cached["outputs"], cached["model"],
                         )])
                 total += 1
-                log.debug("[%d/%d] %s: cache hit", idx + 1, total_symbols, qname)
+                elapsed = time.monotonic() - t0
+                log.info("[%d/%d] %s: ok %s", idx + 1, total_symbols, qname, _fmt_dur(elapsed))
                 continue
 
-            # Cache miss — Ollama
+            # Cache miss — build prompt, check context fit, then call Ollama
             prompt = build_analysis_prompt(batch_dicts)
+
+            # If the symbol body is very large (>5000 chars), truncate it
+            # regardless of context budget.  Models struggle to produce
+            # structured JSON when the prompt contains hundreds of lines
+            # of C++ declarations — they default to reproducing field lists
+            # instead of summarising.  Keeping ~60 lines gives enough
+            # structure for a useful analysis without overwhelming the model.
+            body = d.get("body", "")
+            if body and len(body) > 5000:
+                body_lines = body.split("\n")
+                truncated = "\n".join(body_lines[:60])
+                if len(truncated) > 9000:  # safety: raw cutoff if 60 lines is still huge
+                    truncated = body[:9000]
+                truncated += f"\n// ... ({len(body)} total chars, {len(body_lines)} lines — truncated for analysis)\n"
+                d["body"] = truncated
+                prompt = build_analysis_prompt(batch_dicts)
+                _est_prompt_tokens = len(prompt) / 3.5
+                log.debug("[%d/%d] %s: body truncated %d → %d chars, prompt %d chars",
+                         idx + 1, total_symbols, qname, len(body), len(truncated), len(prompt))
+
+            # Compute response budget — how many tokens remain after the prompt
+            # inside the model context window.
+            _est_prompt_tokens = len(prompt) / 3.5
+            _safety_margin = 300
+            _ctx_size = _model_ctx_size
+            num_predict = max(500, int(_ctx_size - _est_prompt_tokens - _safety_margin))
+
+            # If the prompt STILL doesn't fit after truncation, skip.
+            # The model needs at least 300 tokens of response space.
+            if _est_prompt_tokens + 300 + _safety_margin > _ctx_size:
+                with (write_lock(db_dir, timeout=5.0) if not write_lock_held else nullcontext()):
+                    with transaction(conn):
+                        upsert_llm_analysis_batch(conn, [(d["id"], "", "", "", f"skip:toolarge:{_model_ctx_size}")])
+                total += 1
+                elapsed = time.monotonic() - t0
+                log.warning("[%d/%d] %s: skip %s (body too large even after trunc, prompt=%d chars, ctx=%d tokens)",
+                          idx + 1, total_symbols, qname, _fmt_dur(elapsed), len(prompt), _ctx_size)
+                continue
+
             try:
-                response = call_ollama(prompt, llm_config, temperature=0.1, num_predict=3000)
+                response = call_ollama(prompt, llm_config, temperature=0.1, num_predict=num_predict)
             except Exception as e:
-                log.warning("[%d/%d] %s: Ollama call failed: %s", idx + 1, total_symbols, qname, e)
+                elapsed = time.monotonic() - t0
+                log.warning("[%d/%d] %s: err %s: %s", idx + 1, total_symbols, qname, _fmt_dur(elapsed), e)
                 continue
 
             parsed = parse_analysis_response(response, batch_dicts)
             if not parsed:
-                log.warning("[%d/%d] %s: no valid entries parsed from response", idx + 1, total_symbols, qname)
+                # Store sentinel in the per-build analysis table only —
+                # NOT in the content-addressable cache.  If we store it in
+                # the cache, the next run with a DIFFERENT prompt (e.g.
+                # after an Ollama model upgrade or prompt fix) will hit
+                # the cache and silently reuse the sentinel, skipping the
+                # re-analysis.  The sentinel protects the CURRENT build
+                # from infinite retries; the cache protects across builds
+                # and should only hold successful analyses.
+                total += 1
+                with (write_lock(db_dir, timeout=5.0) if not write_lock_held else nullcontext()):
+                    with transaction(conn):
+                        sentinel = f"skip:unparseable:{model}"
+                        upsert_llm_analysis_batch(conn, [(d["id"], "", "", "", sentinel)])
+                elapsed = time.monotonic() - t0
+                log.warning("[%d/%d] %s: err %s: unparseable response", idx + 1, total_symbols, qname, _fmt_dur(elapsed))
                 continue
 
             r = parsed[0]
@@ -453,9 +560,14 @@ def _build_llm_analysis(conn, config_hash: str, llm_config, db_dir: Path, *, exc
                     )])
                     total += inserted
 
-            log.info("[%d/%d] %s: stored", idx + 1, total_symbols, qname)
+            elapsed = time.monotonic() - t0
+            log.info("[%d/%d] %s: ok %s", idx + 1, total_symbols, qname, _fmt_dur(elapsed))
+            log.debug("  summary: %s", r["summary"])
+            log.debug("  inputs : %s", r["inputs"])
+            log.debug("  outputs: %s", r["outputs"])
         except Exception as e:
-            log.warning("[%d/%d] %s: crashed: %s", idx + 1, total_symbols, qname, e)
+            elapsed = time.monotonic() - t0
+            log.warning("[%d/%d] %s: err %s: %s", idx + 1, total_symbols, qname, _fmt_dur(elapsed), e)
             continue
 
     log.info("LLM analysis stored: %d/%d symbols (model=%s)", total, total_symbols, model)
@@ -668,6 +780,120 @@ def _build_overrides(conn, config_hash: str, db_dir: Path, *, write_lock_held: b
         "Overrides stored: %d relationships (%d virtual, %d no-base, %d no-match)",
         total, len(virtual_rows), skipped_no_base, skipped_no_match,
     )
+
+
+def _build_pagerank(conn, config_hash: str, *, write_lock_held: bool = False) -> None:
+    """Compute PageRank scores for function/method symbols from the call graph.
+
+    Iterates until convergence (max 50 iterations, damping factor 0.85).
+    Scores are normalized to 0.0–1.0 and stored in ``symbols.pagerank``.
+
+    Idempotent — skips when pagerank already exists for this config.
+    Requires the reference index (``fw-context index`` — refs on by default).
+    """
+    # Check already computed
+    row = conn.execute(
+        "SELECT COUNT(*) FROM symbols WHERE config_hash = ? AND pagerank > 0",
+        (config_hash,),
+    ).fetchone()
+    if row and row[0] > 0:
+        log.info("PageRank already computed — nothing to do")
+        return
+
+    edges = conn.execute(
+        """SELECT DISTINCT r.from_usr, r.to_usr
+           FROM refs r
+           JOIN symbols fs ON fs.usr = r.from_usr AND fs.config_hash = r.config_hash
+           JOIN symbols ts ON ts.usr = r.to_usr AND ts.config_hash = r.config_hash
+           WHERE r.config_hash = ?
+             AND r.ref_kind = 'call'
+             AND fs.kind IN ('function', 'method', 'constructor', 'destructor')
+             AND ts.kind IN ('function', 'method', 'constructor', 'destructor')
+             AND r.from_usr != ''
+             AND r.to_usr != ''
+        """,
+        (config_hash,),
+    ).fetchall()
+
+    outgoing: dict[str, list[str]] = {}
+    incoming: dict[str, list[str]] = {}
+    all_nodes: set[str] = set()
+
+    for e in edges:
+        frm, to = e["from_usr"], e["to_usr"]
+        outgoing.setdefault(frm, []).append(to)
+        incoming.setdefault(to, []).append(frm)
+        all_nodes.add(frm)
+        all_nodes.add(to)
+
+    n = len(all_nodes)
+    if n == 0:
+        log.info("No call graph edges — skipping PageRank")
+        return
+
+    damping = 0.85
+    scores: dict[str, float] = {node: 1.0 / n for node in all_nodes}
+
+    for iteration in range(50):
+        new_scores: dict[str, float] = {}
+        for node in all_nodes:
+            rank = (1 - damping) / n
+            for caller in incoming.get(node, []):
+                out_count = len(outgoing.get(caller, [1]))
+                rank += damping * scores[caller] / out_count
+            new_scores[node] = rank
+        diff = sum(abs(new_scores[node] - scores[node]) for node in all_nodes)
+        scores = new_scores
+        if diff < 1e-6:
+            log.info("PageRank converged after %d iterations", iteration + 1)
+            break
+
+    # Normalize to 0.0–1.0
+    max_score = max(scores.values()) if scores else 1.0
+    if max_score > 0:
+        for node in scores:
+            scores[node] /= max_score
+
+    with transaction(conn):
+        conn.executemany(
+            "UPDATE symbols SET pagerank = ? WHERE config_hash = ? AND usr = ?",
+            [(scores[usr], config_hash, usr) for usr in scores],
+        )
+
+    log.info("PageRank stored: %d nodes", n)
+
+
+def _build_hotspot_cache(conn, config_hash: str) -> None:
+    """Pre-compute hotspot caller counts for instant ``find_hotspots`` queries.
+
+    Idempotent — skips when cache already exists for this config.
+    Requires the reference index.
+    """
+    row = conn.execute(
+        "SELECT COUNT(*) FROM hotspot_cache WHERE config_hash = ?", (config_hash,)
+    ).fetchone()
+    if row and row[0] > 0:
+        log.info("Hotspot cache already built — nothing to do")
+        return
+
+    with transaction(conn):
+        conn.execute(
+            """INSERT INTO hotspot_cache (config_hash, symbol_id, caller_count)
+               SELECT r.config_hash, s.id, COUNT(r.rowid)
+               FROM refs r
+               JOIN symbols s ON s.usr = r.to_usr AND s.config_hash = r.config_hash
+               WHERE r.config_hash = ?
+                 AND s.is_definition = 1
+                 AND r.ref_kind IN ('call', 'indirect')
+               GROUP BY s.usr
+            """,
+            (config_hash,),
+        )
+
+    cnt = conn.execute(
+        "SELECT COUNT(*) FROM hotspot_cache WHERE config_hash = ?", (config_hash,)
+    ).fetchone()[0]
+    log.info("Hotspot cache stored: %d entries", cnt)
 
 
 def _process_unit(unit, config_hash, project_root, source_roots, exclude_paths, index_refs, db_path, existing_files, lock=None, conn=None):
@@ -1016,6 +1242,16 @@ def run(
     if analyze_overrides:
         log.info("Building method override graph...")
         _build_overrides(conn, config_hash, db_path.parent)
+        conn.commit()
+
+    # PageRank computation (post-processing, requires reference index)
+    if index_refs:
+        log.info("Computing PageRank on call graph...")
+        _build_pagerank(conn, config_hash)
+        conn.commit()
+
+        log.info("Building hotspot cache...")
+        _build_hotspot_cache(conn, config_hash)
         conn.commit()
 
     elapsed = time.monotonic() - t0
