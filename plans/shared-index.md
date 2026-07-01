@@ -38,6 +38,14 @@ v různých projektech nebo po re-indexu dostane stejný hash → cache hit.
 
 **Centralizovat jen `llm_analysis_cache`, zbytek zůstává lokální SQLite.**
 
+Jedna centrální cache pro **všechny projekty**. Dnes je cache per-projekt
+(v lokálním SQLite) — každý projekt analyzuje Zephyr/Mbed symboly znovu.
+S centrálním serverem první projekt naplní cache a všechny ostatní ji čtou:
+
+- Projekt A (zbox, Zephyr) → 5000 symbolů, 8h na GPU → zaplní cache
+- Projekt B (birdie, Zephyr) → 80 % symbolů cache hit → jen ~1000 Ollama volání
+- Projekt C (další Zephyr) → 85 % cache hit → jen ~750 volání
+
 ```
 ┌─────────────────────────────────────────────┐
 │ Server (24/7)                               │
