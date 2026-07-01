@@ -27,7 +27,11 @@ symbolů**. Parsování, indexování, reference, embeddingy — to všechno jso
 minuty. Jen Ollama volání (tisíce symbolů, každý 10-30s) trvá hodiny.
 
 `llm_analysis_cache` už existuje — je to content-addressable cache kde
-klíčem je hash těla + jména + signatury + docstringu. Identický symbol
+klíčem je `SHA256(f"{body}|{qualified_name}|{signature}|{docstring}")`.
+SHA256 je kryptografický hash — pravděpodobnost kolize je zanedbatelná
+(2⁻²⁵⁶).  Zahrnutí `qualified_name` je záměrné: i identické tělo funkce
+v různých namespacech dostane jiný hash, což je správné chování
+(analýza pro `mbed::sleep` ≠ `zephyr::sleep`).  Identický symbol
 v různých projektech nebo po re-indexu dostane stejný hash → cache hit.
 
 ## Řešení
