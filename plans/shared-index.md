@@ -117,7 +117,35 @@ def put_cache(content_hash: str, entry: CacheEntry):
 
 **Auth:** API key v headeru, ověřený nginx (`auth_request`).
 
-**Storage:** Jeden SQLite soubor (max pár MB — jen hashe a texty).
+**Storage backend:** Pluggable — rozhraní `CacheStorageBackend` se dvěma
+metodami (`get_hash`, `put_hash`). Při startu se vybere podle configu:
+
+```toml
+[cache_server]
+backend = "sqlite"           # nebo "postgresql"
+# SQLite varianta (výchozí):
+db_path = "/srv/fw-context/cache.db"
+# PostgreSQL varianta:
+# db_url = "postgresql://fw-cache:pass@localhost:5432/cache"
+```
+
+SQLite je výchozí — jeden soubor, žádná závislost navíc. PostgreSQL je
+alternativa — pokud už na serveru běží, nebo chcete mít cache persistentní
+napříč restarty se sdíleným connection poolem. Oba implementují stejné
+rozhraní:
+
+```python
+class CacheStorageBackend(ABC):
+    @abstractmethod
+    def get(self, content_hash: str) -> dict | None: ...
+    @abstractmethod
+    def put(self, content_hash: str, summary: str, inputs: str,
+            outputs: str, model: str) -> None: ...
+```
+
+Implementace jsou triviální (jeden SELECT/INSERT), rozdíl je jen v
+connection managementu. Pro SQLite: `sqlite3.connect()`. Pro PostgreSQL:
+`asyncpg` nebo `psycopg3` s connection poolem.
 
 ### 2. `llm_analysis_cache` klient
 
