@@ -296,33 +296,35 @@ CREATE POLICY project_isolation ON symbols
 
 ## Relativní cesty — nutná podmínka pro sdílenou DB
 
-Aby index fungoval napříč různými stroji, **všechny cesty k souborům v DB
-musí být relativní vůči project root**. Dnes tomu tak není —
-`compile_commands.json` obsahuje absolutní cesty a ty se ukládají 1:1 do
-`files.path` i `symbols.file_path`.
+Aby index fungoval napříč různými stroji, musí se vyřešit cesty k souborům.
+Problém: `compile_commands.json` obsahuje absolutní cesty a ne všechny
+soubory jsou uvnitř project root (SDK: `mbed-os/`, `.pio/`, `zephyr/`,
+ESP-IDF, systémové headery).
 
-**Co se musí změnit:**
+**Které nástroje potřebují přístup k souborům:**
 
-| Místo | Současný stav | Cílový stav |
-|-------|--------------|-------------|
-| `compile_commands.py:parse()` | Absolutní cesta z JSON | `os.path.relpath(abs_path, project_root)` |
-| `compile_commands.py:CompilationUnit.file` | `Path(abs_path)` | `project_root / Path(rel_path)` — rekonstrukce pro čtení |
-| `files.path` v DB | Absolutní | Relativní k `project_root` |
-| `symbols.file_path` v DB | Absolutní | Relativní k `project_root` |
-| `refs.from_file` v DB | Absolutní | Relativní k `project_root` |
-| `get_source()` / `_read_body()` | Čte `abs_path` přímo | `project_root / db_path` |
+| Nástroj | Potřebuje soubory? | Funguje bez nich? |
+|---------|-------------------|-------------------|
+| `lookup_symbol` | Ne (jen metadata) | Ano |
+| `search_code` | Ne (jen FTS5/tsvector) | Ano |
+| `find_callers`, `find_all_callers_recursive` | Ne (jen refs) | Ano |
+| `semantic_search` | Ne (jen embeddings) | Ano |
+| `explain_symbol` (cached) | Ne (pre-computed LLM) | Ano |
+| `get_file_map` | Ne (jen metadata) | Ano |
+| `get_source` | **Ano** | Ne — vrátí warning |
+| `explain_symbol` (on-demand) | **Ano** | Ne — vrátí warning |
 
-**Výhoda:** Každý dev může mít projekt v jiném adresáři (`~/work/zbox` vs
-`/home/petr/projects/zbox`). DB je přenositelná.
+**Závěr:** 95 % nástrojů funguje jen s DB metadaty. Pro sdílenou DB je
+hlavní hodnota v **pre-computed LLM analýze** (`summary`, `inputs`, `outputs`),
+která je uložená přímo v DB. `get_source()` a on-demand analýza můžou selhat
+s `"source file not found"` — to je akceptovatelné.
 
-**Riziko:** `project_root` se musí předávat všude, kde se pracuje s cestami
-z DB. Už teď se předává ve většině funkcí — `get_active_build` vrací
-`project_root` — ale je potřeba audit všech míst, kde se `file_path` čte
-napřímo bez připojení rootu.
-
-**Backward compat:** Tohle je breaking change i pro lokální SQLite —
-existující indexy s absolutními cestami by přestaly fungovat. Nutný
-`reset_index` + re-index po nasazení.
+**Řešení pro cesty:**
+1. Projektové soubory (uvnitř `source_roots`) ukládat relativně k `project_root`
+2. SDK/vendor soubory (mimo `source_roots`) ukládat jako absolutní — při
+   `get_source()` zkusit přečíst, pokud neexistuje, vrátit warning
+3. `project_root` se předává jako parametr při startu MCP serveru — každý
+   dev si nastaví svou cestu
 
 ## Otevřené otázky pro zítřejší review
 
