@@ -197,10 +197,15 @@ def _build_embeddings(conn, config_hash: str, llm_config, db_dir: Path) -> None:
     When Ollama is unreachable or returns an error for a batch, a warning is
     logged and the batch is skipped (non-fatal — remaining batches continue).
     """
+    import time
+
     import httpx
 
     from ..llm.ollama import call_ollama_embed
     from .db import _vec_to_blob, upsert_embeddings, upsert_embeddings_vec
+
+    # Suppress httpx INFO logs (one per batch — noisy during embedding)
+    logging.getLogger("httpx").setLevel(logging.WARNING)
 
     try:
         resp = httpx.get(llm_config.ollama_url.rstrip("/") + "/api/tags", timeout=5.0)
@@ -268,13 +273,17 @@ def _build_embeddings(conn, config_hash: str, llm_config, db_dir: Path) -> None:
 
     total = 0
     chunk_size = 100
+    total_batches = (len(rows) + chunk_size - 1) // chunk_size
     for i in range(0, len(rows), chunk_size):
+        batch_num = i // chunk_size
         chunk_rows = rows[i:i + chunk_size]
         chunk_descs = descriptions[i:i + chunk_size]
+        t0 = time.monotonic()
         try:
             embs = call_ollama_embed(chunk_descs, llm_config)
         except Exception as e:
-            log.warning("Embedding batch %d failed: %s", i // chunk_size, e)
+            elapsed = time.monotonic() - t0
+            log.warning("[%d/%d] embedding batch failed %s: %s", batch_num + 1, total_batches, _fmt_dur(elapsed), e)
             continue
 
         # Store in legacy BLOB table (backward compatibility)
@@ -290,6 +299,8 @@ def _build_embeddings(conn, config_hash: str, llm_config, db_dir: Path) -> None:
                 log.warning("vec0 batch insert failed (sqlite-vec may not be loaded): %s", e)
 
         total += len(blob_batch)
+        elapsed = time.monotonic() - t0
+        log.info("[%d/%d] %d symbols embedded %s", batch_num + 1, total_batches, len(chunk_rows), _fmt_dur(elapsed))
     log.info("Embeddings stored: %d symbols (model=%s)", total, model)
 
 # SDK path patterns for filtering (mbed-os, Zephyr, PlatformIO, build dirs)
