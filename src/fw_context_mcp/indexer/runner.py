@@ -511,7 +511,7 @@ def _build_llm_analysis(
                     with transaction(conn):
                         upsert_llm_analysis_batch(conn, [(
                             d["id"], cached["summary"], cached["inputs"],
-                            cached["outputs"], cached["model"],
+                            cached["outputs"], cached["model"], h,
                         )])
                 total += 1
                 elapsed = time.monotonic() - t0
@@ -552,7 +552,7 @@ def _build_llm_analysis(
             if _est_prompt_tokens + 300 + _safety_margin > _ctx_size:
                 with (write_lock(db_dir, timeout=5.0) if not write_lock_held else nullcontext()):
                     with transaction(conn):
-                        upsert_llm_analysis_batch(conn, [(d["id"], "", "", "", f"skip:toolarge:{_model_ctx_size}")])
+                        upsert_llm_analysis_batch(conn, [(d["id"], "", "", "", f"skip:toolarge:{_model_ctx_size}", h)])
                 total += 1
                 elapsed = time.monotonic() - t0
                 log.warning("[%d/%d] %s: skip %s (body too large even after trunc, prompt=%d chars, ctx=%d tokens)",
@@ -580,7 +580,7 @@ def _build_llm_analysis(
                 with (write_lock(db_dir, timeout=5.0) if not write_lock_held else nullcontext()):
                     with transaction(conn):
                         sentinel = f"skip:unparseable:{model}"
-                        upsert_llm_analysis_batch(conn, [(d["id"], "", "", "", sentinel)])
+                        upsert_llm_analysis_batch(conn, [(d["id"], "", "", "", sentinel, h)])
                 elapsed = time.monotonic() - t0
                 log.warning("[%d/%d] %s: err %s: unparseable response", idx + 1, total_symbols, qname, _fmt_dur(elapsed))
                 continue
@@ -588,7 +588,7 @@ def _build_llm_analysis(
             r = parsed[0]
             with (write_lock(db_dir, timeout=5.0) if not write_lock_held else nullcontext()):
                 with transaction(conn):
-                    db_rows = [(r["symbol_id"], r["summary"], r["inputs"], r["outputs"], model)]
+                    db_rows = [(r["symbol_id"], r["summary"], r["inputs"], r["outputs"], model, h)]
                     inserted = upsert_llm_analysis_batch(conn, db_rows)
                     # Store in local global cache
                     try:
