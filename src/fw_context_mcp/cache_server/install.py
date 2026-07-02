@@ -13,7 +13,15 @@ from pathlib import Path
 
 def _server_executable() -> str:
     """Return the path to the fw-cache-server executable."""
-    return shutil.which("fw-cache-server") or sys.executable
+    # Check /opt (production install) first, then PATH, then current venv
+    for candidate in (
+        "/opt/fw-cache-server/venv/bin/fw-cache-server",
+        shutil.which("fw-cache-server"),
+        Path(sys.executable).parent / "fw-cache-server",
+    ):
+        if candidate and Path(str(candidate)).exists():
+            return str(candidate)
+    return f"{sys.executable} -m fw_context_mcp.cache_server.cli"
 
 
 SYSTEMD_UNIT_TEMPLATE = """[Unit]
@@ -52,19 +60,27 @@ def generate_systemd_unit(
 
 
 def install_systemd_unit(unit_text: str) -> None:
-    """Write the unit file to /etc/systemd/system/fw-cache-server.service."""
-    unit_path = Path("/etc/systemd/system/fw-cache-server.service")
-    if unit_path.parent.exists():
-        unit_path.write_text(unit_text)
-        print(f"Unit written to {unit_path}")
-        print("To enable and start:")
-        print("  sudo systemctl daemon-reload")
-        print("  sudo systemctl enable --now fw-cache-server")
-    else:
-        print(unit_text)
-        print(f"\nSave the above to {unit_path}, then run:")
-        print("  sudo systemctl daemon-reload")
-        print("  sudo systemctl enable --now fw-cache-server")
+    """Write the unit file to /etc/systemd/system/fw-cache-server.service (via sudo)."""
+    import subprocess
+    unit_path = "/etc/systemd/system/fw-cache-server.service"
+    try:
+        result = subprocess.run(
+            ["sudo", "tee", unit_path],
+            input=unit_text, text=True, capture_output=True, timeout=10,
+        )
+        if result.returncode == 0:
+            print(f"Unit written to {unit_path}")
+            print("To enable and start:")
+            print("  sudo systemctl daemon-reload")
+            print("  sudo systemctl enable --now fw-cache-server")
+            return
+    except Exception:
+        pass
+    # Fallback: print for manual install
+    print(unit_text)
+    print(f"\nSave the above to {unit_path}, then run:")
+    print("  sudo systemctl daemon-reload")
+    print("  sudo systemctl enable --now fw-cache-server")
 
 
 LAUNCHD_PLIST_TEMPLATE = """<?xml version="1.0" encoding="UTF-8"?>

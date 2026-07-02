@@ -23,6 +23,10 @@ def setup_wizard() -> int:
     print("\n  fw-context Cache Server Setup")
     print("  " + "─" * 36 + "\n")
 
+    # 0. Ensure dedicated venv in /opt (accessible by fw-cache user)
+    if not _ensure_server_venv():
+        return 1
+
     # 1. Detect OS
     system = platform.system()
     print(f"  [✓] OS — {system} ({platform.release()})")
@@ -111,8 +115,10 @@ def _ask(msg: str, default: str = "y") -> bool:
 
 def _run(cmd: list[str], **kwargs: object) -> bool:
     """Run a shell command.  Returns True on success."""
+    # Suppress "could not change directory" noise from sudo commands
+    scwd = kwargs.pop("cwd", "/tmp") if cmd[0] == "sudo" and "cwd" not in kwargs else kwargs.pop("cwd", None)
     try:
-        subprocess.run(cmd, check=True, **kwargs)  # type: ignore[arg-type]
+        subprocess.run(cmd, check=True, cwd=scwd, **kwargs)  # type: ignore[arg-type]
         return True
     except subprocess.CalledProcessError as e:
         print(f"    Error: {e}", file=sys.stderr)
@@ -120,6 +126,64 @@ def _run(cmd: list[str], **kwargs: object) -> bool:
     except FileNotFoundError:
         print(f"    Error: command not found — {' '.join(cmd)}", file=sys.stderr)
         return False
+
+
+def _ensure_server_venv() -> bool:
+    """Ensure a dedicated venv exists (default /opt/fw-cache-server/venv)."""
+    _DEFAULT = "/opt/fw-cache-server"
+
+    # Check for existing installation
+    for candidate in ("/opt/fw-cache-server/venv/bin/fw-cache-server", "/var/lib/fw-cache-server/venv/bin/fw-cache-server"):
+        if Path(candidate).exists():
+            venv_dir = Path(candidate).parent.parent
+            print(f"  [✓] Server venv — {venv_dir}")
+            os.environ["FW_CACHE_VENV"] = str(venv_dir)
+            return True
+
+    print("  [!] Server venv — not found")
+    try:
+        path = input(f"  Install path (default {_DEFAULT}): ").strip()
+    except (EOFError, KeyboardInterrupt):
+        return False
+    if not path:
+        path = _DEFAULT
+
+    venv_dir = Path(path) / "venv"
+
+    # Create dir via sudo
+    _run(["sudo", "mkdir", "-p", str(venv_dir.parent)], timeout=10)
+    _run(["sudo", "chown", f"{os.getuid()}:{os.getgid()}", str(venv_dir.parent)], timeout=10)
+
+    import subprocess
+    # Create venv
+    subprocess.run([sys.executable, "-m", "venv", str(venv_dir)], check=True, timeout=60)
+
+    pip = str(venv_dir / "bin" / "pip")
+
+    # Install fw-context-mcp from local wheel (same version as running)
+    wheel_candidates = [
+        Path.home() / "fw_context_mcp-0.11.1-py3-none-any.whl",
+        Path("/tmp/fw_context_mcp-0.11.1-py3-none-any.whl"),
+    ]
+    wheel_path = None
+    for w in wheel_candidates:
+        if w.exists():
+            wheel_path = str(w)
+            break
+
+    if wheel_path:
+        subprocess.run([pip, "install", wheel_path], check=True, timeout=120)
+    else:
+        print("    No wheel found — install manually: pip install fw-context-mcp", file=sys.stderr)
+        return False
+    subprocess.run([pip, "install", "fastapi", "uvicorn[standard]", "asyncpg"], check=True, timeout=120)
+
+    # Ensure fw-cache user can read the venv
+    _run(["sudo", "chown", "-R", "fw-cache:fw-cache", str(venv_dir)], timeout=10)
+
+    os.environ["FW_CACHE_VENV"] = str(venv_dir)
+    print(f"  [✓] Server venv — {venv_dir}")
+    return True
 
 
 # -- PostgreSQL --
@@ -170,7 +234,8 @@ def _ensure_postgresql() -> bool:
 # -- Database user --
 
 def _ensure_db_user() -> bool:
-    """Ensure the ``fw_cache`` PostgreSQL user exists."""
+    """Ensure the ``fw_cache`` PostgreSQL user exists and credentials are saved."""
+    user_exists = False
     try:
         result = subprocess.run(
             ["sudo", "-u", "postgres", "psql", "-tAc",
@@ -178,49 +243,99 @@ def _ensure_db_user() -> bool:
             capture_output=True, text=True, timeout=10,
         )
         if result.stdout.strip() == "1":
-            print("  [✓] Database user 'fw_cache' — exists")
-            return True
+            user_exists = True
     except Exception:
         pass
 
-    print("  [!] Database user 'fw_cache' — does not exist")
+    if not user_exists:
+        print("  [!] Database user 'fw_cache' — does not exist")
+        if not _ask("Create user 'fw_cache'?"):
+            return False
+        password = secrets.token_urlsafe(24)
+        if not _run(
+            ["sudo", "-u", "postgres", "psql", "-c",
+             f"CREATE USER fw_cache WITH PASSWORD '{password}' CREATEDB"],
+            timeout=10,
+        ):
+            return False
+        _save_credentials(password)
+        return True
 
-    if not _ask("Create user 'fw_cache'?"):
-        return False
+    # User exists — check if we have saved credentials
+    if _find_db_url():
+        print("  [✓] Database user 'fw_cache' — exists")
+        return True
 
-    password = secrets.token_urlsafe(24)
-    if not _run(
-        ["sudo", "-u", "postgres", "psql", "-c",
-         f"CREATE USER fw_cache WITH PASSWORD '{password}' CREATEDB"],
-        timeout=10,
-    ):
-        return False
+    # User exists but no saved password — regenerate
+    print("  [!] Database user 'fw_cache' exists but no saved credentials")
+    if _ask("Reset password and save credentials?"):
+        password = secrets.token_urlsafe(24)
+        _run(
+            ["sudo", "-u", "postgres", "psql", "-c",
+             f"ALTER USER fw_cache WITH PASSWORD '{password}'"],
+            timeout=10,
+        )
+        _save_credentials(password)
+        return True
 
-    # Store credentials
-    env_path = Path("/etc/fw-cache-server/db.env")
-    env_path.parent.mkdir(parents=True, exist_ok=True)
-    env_path.write_text(f'FW_CACHE_DB_URL="postgresql://fw_cache:{password}@localhost:5432"\n')
+    print("    Set FW_CACHE_DB_URL manually to continue")
+    return False
 
-    os.environ["FW_CACHE_DB_URL"] = f"postgresql://fw_cache:{password}@localhost:5432"
 
-    print("  [✓] User created — credentials saved to /etc/fw-cache-server/db.env")
-    return True
+def _save_credentials(password: str) -> None:
+    """Save the database URL to a credentials file."""
+    db_url = f"postgresql://fw_cache:{password}@localhost:5432"
+    db_url_line = f'FW_CACHE_DB_URL="{db_url}"\n'
+
+    # Production primary: /var/lib/fw-cache-server/ — app data, readable by fw-cache group
+    lib_path = Path("/var/lib/fw-cache-server")
+    try:
+        _run(["sudo", "mkdir", "-p", str(lib_path)], timeout=10)
+        lib_path.chmod(0o750)
+        import subprocess
+        subprocess.run(
+            ["sudo", "tee", str(lib_path / "db.env")],
+            input=db_url_line, text=True, capture_output=True, timeout=10, check=True,
+        )
+        _run(["sudo", "chown", "root:fw-cache", str(lib_path / "db.env")], timeout=10)
+        _run(["sudo", "chmod", "644", str(lib_path / "db.env")], timeout=10)
+        print(f"  [✓] Credentials saved to {lib_path / 'db.env'}")
+        os.environ["FW_CACHE_DB_URL"] = db_url
+        return
+    except Exception:
+        pass
+
+    # Fallback: user home directory (single-user non-sudo setups)
+    home_parent = Path.home() / ".fw-context"
+    home_parent.mkdir(parents=True, exist_ok=True)
+    home_path = home_parent / "db.env"
+    home_path.write_text(db_url_line)
+    home_path.chmod(0o600)
+    print(f"  [✓] Credentials saved to {home_path}")
+    os.environ["FW_CACHE_DB_URL"] = db_url
+
+
+def _find_db_url() -> str:
+    """Find the PostgreSQL connection URL from env or credentials files."""
+    db_url = os.environ.get("FW_CACHE_DB_URL", "")
+    if db_url:
+        return db_url
+    for env_path in (Path("/var/lib/fw-cache-server/db.env"), Path.home() / ".fw-context" / "db.env"):
+        if env_path.exists():
+            import re
+            content = env_path.read_text()
+            m = re.search(r'FW_CACHE_DB_URL="([^"]+)"', content)
+            if m:
+                os.environ["FW_CACHE_DB_URL"] = m.group(1)
+                return m.group(1)
+    return ""
 
 
 # -- Databases --
 
 def _ensure_databases() -> bool:
     """Ensure the meta and cache databases exist."""
-    db_url = os.environ.get("FW_CACHE_DB_URL", "")
-    if not db_url:
-        env_file = Path("/etc/fw-cache-server/db.env")
-        if env_file.exists():
-            import re
-            content = env_file.read_text()
-            m = re.search(r'FW_CACHE_DB_URL="([^"]+)"', content)
-            if m:
-                os.environ["FW_CACHE_DB_URL"] = m.group(1)
-                db_url = m.group(1)
+    db_url = _find_db_url()
 
     if not db_url:
         print("  [!] No FW_CACHE_DB_URL set — cannot verify databases")
@@ -262,16 +377,7 @@ def _ensure_databases() -> bool:
 
 def _ensure_cache_server_init() -> str | None:
     """Initialize the cache server schema and return the admin token, or None on failure."""
-    db_url = os.environ.get("FW_CACHE_DB_URL", "")
-    if not db_url:
-        env_file = Path("/etc/fw-cache-server/db.env")
-        if env_file.exists():
-            import re
-            content = env_file.read_text()
-            m = re.search(r'FW_CACHE_DB_URL="([^"]+)"', content)
-            if m:
-                db_url = m.group(1)
-                os.environ["FW_CACHE_DB_URL"] = db_url
+    db_url = _find_db_url()
 
     print("  [ ] Cache server — checking...")
 
@@ -323,12 +429,30 @@ def _ensure_cache_server_init() -> str | None:
 
 def _setup_project_and_tokens(admin_token: str) -> tuple[str, str, str] | None:
     """Interactively create a project and its read/write tokens."""
-    print()
-    if not _ask("Create a project and tokens for devs now?"):
-        return None
+    import asyncio
 
+    db_url = _find_db_url()
+
+    async def _list_existing() -> list[dict]:
+        from .backend import CacheBackend
+        backend = CacheBackend(db_url)
+        try:
+            await backend.connect()
+            return await backend.list_projects()
+        finally:
+            await backend.close()
+
+    existing = asyncio.run(_list_existing())
+    if existing:
+        print()
+        existing_ids = ", ".join(p["id"] for p in existing)
+        print(f"  Projects: {existing_ids}")
+        if not _ask("Create another project?"):
+            return None
+
+    print()
     try:
-        project_id = input("  Project ID (e.g. firma/zbox): ").strip()
+        project_id = input("  Project ID (e.g. my-firmware): ").strip()
     except (EOFError, KeyboardInterrupt):
         return None
 
@@ -336,18 +460,14 @@ def _setup_project_and_tokens(admin_token: str) -> tuple[str, str, str] | None:
         print("    Empty project ID — skipping")
         return None
 
-    db_url = os.environ.get("FW_CACHE_DB_URL", "")
-
-    import asyncio
-
     async def _create() -> tuple[str, str, str] | None:
         from .backend import CacheBackend
-
         backend = CacheBackend(db_url)
         try:
             await backend.connect()
-            # Create project (or reuse existing)
-            await backend.create_project(project_id)
+            result = await backend.create_project(project_id)
+            if result is None:
+                print(f"    Project '{project_id}' already exists — creating additional tokens")
 
             write_token = await backend.create_token(
                 project_id, can_read=True, can_write=True, can_overwrite=True, description="admin"
@@ -383,6 +503,13 @@ def _ensure_systemd_service() -> None:
     print("  [ ] systemd service — not installed")
     if not _ask("Install systemd service?"):
         return
+
+    # Ensure fw-cache system user exists
+    import pwd
+    try:
+        pwd.getpwnam("fw-cache")
+    except KeyError:
+        _run(["sudo", "useradd", "-r", "-s", "/usr/sbin/nologin", "-d", "/nonexistent", "fw-cache"], timeout=10)
 
     from .install import generate_systemd_unit, install_systemd_unit
 
@@ -485,24 +612,45 @@ def _ensure_nginx() -> None:
         print("  [!] certbot — not installed")
         if _ask("Install certbot?"):
             _run(["sudo", "apt", "install", "-y", "certbot", "python3-certbot-nginx"], timeout=120)
+        else:
+            print("    Skipping HTTPS — certbot required for Let's Encrypt")
+            return
     else:
         print("  [✓] certbot — installed")
 
-    # Obtain certificate
-    if not certbot_state["has_certificates"]:
-        print("  [!] No Let's Encrypt certificates found")
-        if _ask("Obtain certificate via Let's Encrypt?"):
-            if obtain_certificate(domain):
-                print(f"  [✓] Certificate obtained for {domain}")
-            else:
-                print("  [!] Certificate failed — you can run certbot manually later")
-    else:
-        print("  [✓] Let's Encrypt certificates — found")
-        if _ask("Expand existing certificate with this domain?"):
-            if obtain_certificate(domain, expand=True):
-                print(f"  [✓] Certificate expanded with {domain}")
-            else:
-                print("  [!] Expand failed — you can run certbot --expand manually later")
+    # Obtain certificate if needed
+    from .nginx_config import cert_exists
+    if not cert_exists(domain):
+        print(f"  [!] No certificate for {domain} — obtaining via certbot...")
+        # First, create temporary HTTP-only config so certbot can verify
+        http_config = f"""server {{
+    listen 80;
+    server_name {domain};
+    root /var/www/html;
+}}
+"""
+        import subprocess
+
+        from .nginx_config import NGINX_CONFIG_NAME, NGINX_SITES_AVAILABLE
+        tmp_path = str(NGINX_SITES_AVAILABLE / NGINX_CONFIG_NAME)
+        subprocess.run(["sudo", "tee", tmp_path], input=http_config, text=True,
+                       capture_output=True, timeout=10)
+        enable_nginx_site()
+        subprocess.run(["sudo", "nginx", "-s", "reload"], capture_output=True, timeout=10)
+
+        # Run certbot (tries standalone first, then nginx)
+        cert_ok = obtain_certificate(domain)
+        if not cert_ok:
+            print(f"  [!] Certificate failed — you can run: sudo certbot --nginx -d {domain}")
+            print("      Continuing with HTTP-only config")
+            return
+
+        print(f"  [✓] Certificate obtained for {domain}")
+
+    # Write full HTTPS nginx config (cert now exists)
+    config_path = write_nginx_config(domain)
+    enable_nginx_site()
+    print(f"  [✓] nginx config — {config_path}")
 
     # Test and reload nginx
     if test_nginx_config():
