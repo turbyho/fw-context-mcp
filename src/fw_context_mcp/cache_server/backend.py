@@ -372,3 +372,23 @@ class CacheBackend:
             )
             tag = result.split()
             return int(tag[2]) if len(tag) >= 3 else 0
+
+    async def create_admin_token(self) -> str:
+        """Create an admin token not scoped to any project (``project_id IS NULL``).
+
+        Used once during ``fw-cache-server init`` to bootstrap the first
+        admin token.  Returns the plain-text token.
+        """
+        import hashlib
+        import secrets
+
+        token = secrets.token_hex(32)
+        token_hash = hashlib.sha256(token.encode()).digest()
+
+        async with self._meta_pool.acquire() as conn:  # type: ignore[union-attr]
+            await conn.execute(
+                "INSERT INTO tokens (token_hash, project_id, can_read, can_write, can_overwrite, description) "
+                "VALUES ($1, NULL, true, true, true, 'admin (setup)')",
+                token_hash,
+            )
+        return token

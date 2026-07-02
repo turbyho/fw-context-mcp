@@ -320,10 +320,10 @@ def _from_dict(data: dict) -> Config:
             cfg.index.db_dir = Path(db_dir).expanduser()
         if cc := idx.get("compile_commands"):
             cfg.index.compile_commands = Path(cc)
-        if roots := idx.get("source_roots"):
-            cfg.index.source_roots = roots
-        if excludes := idx.get("exclude_paths"):
-            cfg.index.exclude_paths = excludes
+        if "source_roots" in idx:
+            cfg.index.source_roots = idx["source_roots"]
+        if "exclude_paths" in idx:
+            cfg.index.exclude_paths = idx["exclude_paths"]
         if "index_refs" in idx:
             cfg.index.index_refs = bool(idx["index_refs"])
         if "index_embeddings" in idx:

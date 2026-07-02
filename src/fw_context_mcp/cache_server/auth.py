@@ -53,7 +53,8 @@ class CacheAuthMiddleware(BaseHTTPMiddleware):
 
 def require_can_read(request: Request) -> JSONResponse | None:
     """Check that the authenticated token has ``can_read``."""
-    if not request.state.permissions.get("can_read", False):
+    perms = getattr(request.state, "permissions", {})
+    if not perms.get("can_read", False):
         return JSONResponse({"detail": "Token does not have read permission"}, status_code=403)
     return None
 
@@ -61,14 +62,15 @@ def require_can_read(request: Request) -> JSONResponse | None:
 def require_can_write(request: Request) -> JSONResponse | None:
     """Check that the authenticated token has ``can_write``.
 
-    If the ``X-Cache-Overwrite`` header is present, also checks
-    ``can_overwrite``.
+    Also parses ``X-Cache-Overwrite`` once and stores the result in
+    ``request.state.can_overwrite`` so route handlers don't re-parse it.
     """
-    perms = request.state.permissions
+    perms = getattr(request.state, "permissions", {})
     if not perms.get("can_write", False):
         return JSONResponse({"detail": "Token does not have write permission"}, status_code=403)
 
     overwrite = request.headers.get("X-Cache-Overwrite", "").lower() in ("true", "1", "yes")
+    request.state.can_overwrite = overwrite
     if overwrite and not perms.get("can_overwrite", False):
         return JSONResponse({"detail": "Token does not have overwrite permission"}, status_code=403)
 

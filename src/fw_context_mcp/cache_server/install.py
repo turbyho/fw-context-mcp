@@ -12,8 +12,12 @@ from pathlib import Path
 
 
 def _server_executable() -> str:
-    """Return the path to the fw-cache-server executable."""
-    # Check /opt (production install) first, then PATH, then current venv
+    """Return the path to the fw-cache-server executable.
+
+    Checks /opt (production), PATH, and current venv.  Falls back to
+    ``python -m fw_context_mcp.cache_server.cli`` — requires the
+    ``[cache-server]`` extras to be installed in the current environment.
+    """
     for candidate in (
         "/opt/fw-cache-server/venv/bin/fw-cache-server",
         shutil.which("fw-cache-server"),
@@ -51,10 +55,14 @@ def generate_systemd_unit(
     port: int = 8000,
 ) -> str:
     """Generate a systemd unit file content."""
+    env_port = int(os.environ.get("FW_CACHE_PORT", str(port)))
+    env_db = db_url or os.environ.get("FW_CACHE_DB_URL", "")
+    if not env_db:
+        raise ValueError("FW_CACHE_DB_URL must be set — e.g. postgresql://fw_cache:<password>@localhost:5432")
     return SYSTEMD_UNIT_TEMPLATE.format(
         user=user or "fw-cache",
-        db_url=db_url or os.environ.get("FW_CACHE_DB_URL", "postgresql://fw_cache:changeme@localhost:5432"),
-        port=port or int(os.environ.get("FW_CACHE_PORT", "8000")),
+        db_url=env_db,
+        port=env_port,
         executable=_server_executable(),
     )
 
@@ -74,8 +82,8 @@ def install_systemd_unit(unit_text: str) -> None:
             print("  sudo systemctl daemon-reload")
             print("  sudo systemctl enable --now fw-cache-server")
             return
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"Failed to install unit file: {e}", file=sys.stderr)
     # Fallback: print for manual install
     print(unit_text)
     print(f"\nSave the above to {unit_path}, then run:")
@@ -123,12 +131,16 @@ def generate_launchd_plist(
     db_url: str | None = None,
 ) -> str:
     """Generate a launchd plist file content."""
+    env_port = int(os.environ.get("FW_CACHE_PORT", str(port)))
+    env_db = db_url or os.environ.get("FW_CACHE_DB_URL", "")
+    if not env_db:
+        raise ValueError("FW_CACHE_DB_URL must be set — e.g. postgresql://fw_cache:<password>@localhost:5432")
     return LAUNCHD_PLIST_TEMPLATE.format(
         executable=_server_executable(),
         host=host,
-        port=port,
-        db_url=db_url or os.environ.get("FW_CACHE_DB_URL", "postgresql://fw_cache:changeme@localhost:5432"),
-        log_dir=os.path.expanduser("~"),
+        port=env_port,
+        db_url=env_db,
+        log_dir="/var/log",
     )
 
 

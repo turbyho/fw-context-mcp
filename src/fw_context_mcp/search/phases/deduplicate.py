@@ -22,6 +22,13 @@ class DeduplicatePhase(Phase):
     name = "deduplicate"  #: Phase identifier used in pipeline configuration.
 
     def should_run(self, ctx: PipelineContext) -> bool:
+        """Run only when ``final_results`` is still empty.
+
+        In ``SMART_SEARCH``, ``RRFFusionPhase`` runs first and populates
+        ``final_results`` — deduplication is then redundant.  Only run
+        when no earlier phase produced final results (e.g. embedding-only
+        pipelines or fallback paths).
+        """
         return not ctx.final_results
 
     async def run(self, ctx: PipelineContext) -> PipelineContext:

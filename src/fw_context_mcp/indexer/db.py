@@ -1746,7 +1746,11 @@ def search_similar_hybrid(
 
     from fw_context_mcp.indexer.db import search_symbols
 
-    # Phase 1 — text recall
+    # Phase 1 — text recall (includes declarations + definitions).
+    # The direct KNN path filters is_definition=1 but the hybrid path
+    # intentionally doesn't — RRF fusion prefers definitions anyway,
+    # and including declarations in the recall set catches cases
+    # where a definition was renamed but the old declaration persists.
     text_candidates = search_symbols(conn, fts5_query, config_hash, limit=200)
     if not text_candidates:
         return []
