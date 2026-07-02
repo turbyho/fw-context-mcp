@@ -389,7 +389,7 @@ def _build_llm_analysis(
 
     from ..indexer.prompts import build_analysis_prompt, parse_analysis_response
     from ..utils import compute_content_hash
-    from .db import lookup_llm_analysis_cache, upsert_llm_analysis_batch, upsert_llm_analysis_cache
+    from .db import upsert_llm_analysis_batch
 
     # Suppress httpx INFO logs (one per symbol — noisy during analysis)
     logging.getLogger("httpx").setLevel(logging.WARNING)
@@ -474,24 +474,21 @@ def _build_llm_analysis(
             batch_dicts = _enrich_batch(conn, [row], config_hash)
             d = batch_dicts[0]
 
-            # ── Cache check — 3 tiers: per-project → local global → remote ──
+            # ── Cache check — 2 tiers: local global → remote ──
             h = compute_content_hash(d["body"], d["qualified_name"], d["signature"], d["docstring"])
 
-            # Tier 1: per-project cache (in this conn's index.db)
-            cached = lookup_llm_analysis_cache(conn, h)
+            # Tier 1: local global cache (~/.fw-context/llm_cache.db)
+            cached = None
+            try:
+                from ..cache_client import get_local_cache_db, local_cache_lookup
+                local_db = get_local_cache_db(readonly=True)
+                local_hits = local_cache_lookup(local_db, [h])
+                local_db.close()
+                cached = local_hits.get(h)
+            except Exception as e:
+                log.debug("Local global cache lookup failed: %s", e)
 
-            # Tier 2: local global cache (~/.fw-context/llm_cache.db)
-            if not cached:
-                try:
-                    from ..cache_client import get_local_cache_db, local_cache_lookup
-                    local_db = get_local_cache_db(readonly=True)
-                    local_hits = local_cache_lookup(local_db, [h])
-                    local_db.close()
-                    cached = local_hits.get(h)
-                except Exception as e:
-                    log.debug("Local global cache lookup failed: %s", e)
-
-            # Tier 3: remote cache server
+            # Tier 2: remote cache server
             if not cached and cache_client is not None:
                 try:
                     remote_hits = cache_client.batch_get([h])
@@ -593,10 +590,6 @@ def _build_llm_analysis(
                 with transaction(conn):
                     db_rows = [(r["symbol_id"], r["summary"], r["inputs"], r["outputs"], model)]
                     inserted = upsert_llm_analysis_batch(conn, db_rows)
-                    # Store in per-project cache
-                    upsert_llm_analysis_cache(conn, [(
-                        h, r["summary"], r["inputs"], r["outputs"], model,
-                    )])
                     # Store in local global cache
                     try:
                         from ..cache_client import get_local_cache_db, local_cache_upsert
