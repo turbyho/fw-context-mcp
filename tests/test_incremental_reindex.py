@@ -1057,7 +1057,7 @@ class TestStoreSymbolsForUnitAnalysisRestore:
             (config_hash, file_id, "test.c",
              split_tokens("foo", "foo"),
              "usr::foo", "foo", "foo", "function",
-             1, 1, 3, 1, "void foo(void)", "", None, 0, 0, "", 0, ""),
+             1, 1, 3, 1, "void foo(void)", "", None, 0, 0, "", 0, "", 0, 0.0),
         ])
         sym_id = conn.execute(
             "SELECT id FROM symbols WHERE usr='usr::foo' AND config_hash=?",
@@ -1144,7 +1144,7 @@ class TestStoreSymbolsForUnitAnalysisRestore:
             (config_hash, file_id, "test2.c",
              split_tokens("bar", "bar"),
              "usr::bar", "bar", "bar", "function",
-             1, 1, 3, 1, "int bar(int x)", "", None, 0, 0, "", 0, ""),
+             1, 1, 3, 1, "int bar(int x)", "", None, 0, 0, "", 0, "", 0, 0.0),
         ])
         sym_id = conn.execute(
             "SELECT id FROM symbols WHERE usr='usr::bar' AND config_hash=?",
@@ -1224,7 +1224,7 @@ class TestStoreSymbolsForUnitAnalysisRestore:
             (config_hash, file_id, "test3.c",
              split_tokens("helper", "helper"),
              "usr::helper", "helper", "helper", "function",
-             1, 1, 3, 1, "void helper(void)", "", None, 0, 0, "", 0, ""),
+             1, 1, 3, 1, "void helper(void)", "", None, 0, 0, "", 0, "", 0, 0.0),
         ])
         conn.commit()
 
@@ -1278,7 +1278,7 @@ class TestStoreSymbolsForUnitAnalysisRestore:
             (config_hash, file_id, "test4.c",
              split_tokens("calc", "calc"),
              "usr::calc", "calc", "calc", "function",
-             1, 1, 3, 1, "int calc(void)", "", None, 0, 0, "", 0, ""),
+             1, 1, 3, 1, "int calc(void)", "", None, 0, 0, "", 0, "", 0, 0.0),
         ])
         sym_id = conn.execute("SELECT id FROM symbols WHERE usr='usr::calc'").fetchone()["id"]
 

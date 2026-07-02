@@ -215,8 +215,9 @@ class Symbol:
             return type, name, and parameter list.  Empty string for
             non-callable symbols.
         docstring: Raw comment text from above the symbol, with comment
-            markers (``/**``, ``//``, ``*``) stripped and collapsed into
-            a single line.
+            markers (``/**``, ``//``, ``*``) stripped.  Line breaks are
+            preserved so Doxygen tags (``@brief``, ``@param``, ``@return``)
+            remain structured for LLM analysis.
         usr: libclang Unified Symbol Resolution — a cross-translation-unit
             identifier that links declarations and definitions of the
             same symbol.
@@ -360,7 +361,7 @@ def _docstring(cursor: cx.Cursor) -> str:
         line = line.rstrip()
         if line:
             cleaned.append(line)
-    return " ".join(cleaned)
+    return "\n".join(cleaned)
 
 
 def _find_fn_refs_in_expr(

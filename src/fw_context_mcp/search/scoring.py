@@ -76,7 +76,9 @@ def score_result(
             s += 1
 
     # Bonus for symbols under project source roots
-    if source_roots and _is_project_local(fpath, source_roots):
+    if row.get("is_project"):
+        s += 1
+    elif source_roots and _is_project_local(fpath, source_roots):
         s += 1
 
     s += KIND_WEIGHT.get(kind, 0)

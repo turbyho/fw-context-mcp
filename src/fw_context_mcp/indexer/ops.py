@@ -27,22 +27,9 @@ from fw_context_mcp.indexer.db import (
     upsert_file,
     upsert_llm_analysis_batch,
 )
-from fw_context_mcp.utils import compute_content_hash
+from fw_context_mcp.utils import compute_content_hash, read_file_lines
 
 log = logging.getLogger(__name__)
-
-
-def _read_file_lines(abs_path: str) -> list[str] | None:
-    """Read all lines from a source file, or ``None`` on failure.
-
-    Used by ``_compute_content_hash`` to read symbol bodies for
-    change detection during incremental reindex.
-    """
-    try:
-        with open(abs_path) as f:
-            return f.readlines()
-    except (FileNotFoundError, OSError):
-        return None
 
 
 def _read_body(lines: list[str], start_line: int, end_line: int) -> str:
@@ -70,8 +57,6 @@ def _compute_content_hash(
     even a refactor preserving line count is detected.  Whitespace is stripped
     so formatting-only changes are ignored.
     """
-    from fw_context_mcp.utils import compute_content_hash
-
     body = _read_body(lines, start_line, end_line)
     return compute_content_hash(body, qualified_name, signature, docstring)
 
@@ -154,7 +139,7 @@ def store_symbols_for_unit(
 
     def _cached_lines(abs_path: str) -> list[str] | None:
         if abs_path not in _body_cache:
-            _body_cache[abs_path] = _read_file_lines(abs_path)
+            _body_cache[abs_path] = read_file_lines(abs_path)
         return _body_cache[abs_path]
 
 
@@ -182,6 +167,8 @@ def store_symbols_for_unit(
 
     if syms:
         file_id_cache: dict[str, int] = {}
+        # Pre-compute source_roots as strings for is_project checks
+        source_root_strs = [str(r) for r in source_roots] if source_roots else []
         rows = []
         for s in syms:
             sym_file = s.file
@@ -201,6 +188,15 @@ def store_symbols_for_unit(
                 rel_path = str(Path(sym_file).resolve().relative_to(project_root))
             except ValueError:
                 rel_path = sym_file
+            # Determine is_project using the same logic as _is_project_local
+            is_proj = 0
+            if source_root_strs:
+                rp = rel_path.rstrip("/")
+                for root_s in source_root_strs:
+                    root_n = root_s.rstrip("/")
+                    if rp.startswith(root_n + "/") or rp == root_n:
+                        is_proj = 1
+                        break
             rows.append((
                 config_hash,
                 file_id_cache[sym_file],
@@ -222,6 +218,8 @@ def store_symbols_for_unit(
                 s.parent_usr,
                 int(s.is_template),
                 s.template_usr,
+                is_proj,
+                0.0,  # pagerank (computed later by _build_pagerank)
             ))
         insert_symbols_batch(conn, rows)
         syms_added = len(rows)

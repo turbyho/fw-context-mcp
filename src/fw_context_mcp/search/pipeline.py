@@ -24,11 +24,13 @@ def _build_registry() -> dict[str, Phase]:
 
     from fw_context_mcp.search.phases.deduplicate import DeduplicatePhase
     from fw_context_mcp.search.phases.embedding import EmbeddingPhase
+    from fw_context_mcp.search.phases.expand_context import ExpandContextPhase
     from fw_context_mcp.search.phases.format import FormatPhase
     from fw_context_mcp.search.phases.fts5_search import FTS5SearchPhase
     from fw_context_mcp.search.phases.llm_query import LLMQueryPhase
     from fw_context_mcp.search.phases.refine import RefinePhase
     from fw_context_mcp.search.phases.rough_search import RoughSearchPhase
+    from fw_context_mcp.search.phases.rrf_fusion import RRFFusionPhase
     from fw_context_mcp.search.phases.translate import TranslatePhase
 
     for cls in [
@@ -39,6 +41,8 @@ def _build_registry() -> dict[str, Phase]:
         FTS5SearchPhase,
         EmbeddingPhase,
         DeduplicatePhase,
+        RRFFusionPhase,
+        ExpandContextPhase,
         FormatPhase,
     ]:
         instance = cls()  # type: ignore[abstract]
@@ -54,11 +58,14 @@ def _build_registry() -> dict[str, Phase]:
 class PipelineConfig:
     """Which phases to run, in what order.
 
-    Use the predefined constants ``SEARCH_CODE`` and ``SMART_SEARCH`` for
-    standard configurations, or build a custom one.
+    Each element can be either a phase name string (looked up in the registry)
+    or a pre-configured ``Phase`` instance (for custom parameters).
+
+    Use the predefined constants ``SEARCH_CODE`` and ``SMART_SEARCH``
+    for standard configurations, or build a custom one.
     """
 
-    phases: list[str] = field(default_factory=list)
+    phases: list = field(default_factory=list)
 
 
 # Predefined pipelines
@@ -66,18 +73,25 @@ SEARCH_CODE = PipelineConfig(
     phases=["rough_search", "fts5_search", "deduplicate", "format"],
 )
 
-SMART_SEARCH = PipelineConfig(
-    phases=[
-        "translate",
-        "rough_search",
-        "llm_query",
-        "fts5_search",
-        "refine",
-        "embedding",
-        "deduplicate",
-        "format",
-    ],
-)
+
+def _build_smart_search() -> PipelineConfig:
+    """Lazy-built SMART_SEARCH config — imports Phase classes on first use."""
+    from fw_context_mcp.search.phases.embedding import EmbeddingPhase
+
+    return PipelineConfig(
+        phases=[
+            "translate",
+            "rough_search",
+            "llm_query",
+            "fts5_search",
+            "refine",
+            EmbeddingPhase(independent=True, threshold=0.5, overfetch=50),
+            "rrf_fusion",
+            "deduplicate",
+            "expand_context",
+            "format",
+        ],
+    )
 
 
 # ── Runner ──────────────────────────────────────────────────────────────────
@@ -89,7 +103,7 @@ class PipelineRunner:
     Usage::
 
         ctx = PipelineContext.create(query="modem init", project_root="/path")
-        config = SMART_SEARCH
+        config = _build_smart_search()
         runner = PipelineRunner(config)
         result_ctx = await runner.run(ctx)
         return result_ctx.formatted_results
@@ -105,8 +119,14 @@ class PipelineRunner:
         Each phase that ``should_run()`` returns True for receives the context,
         runs, and returns an updated context.  Skipped phases pass through.
         """
-        for phase_name in self.config.phases:
-            phase = self.registry.get(phase_name)
+        for item in self.config.phases:
+            if isinstance(item, Phase):
+                phase = item
+                phase_name = item.name
+            else:
+                phase = self.registry.get(item)
+                phase_name = item
+
             if phase is None:
                 log.warning("Unknown phase %r — skipping", phase_name)
                 continue
