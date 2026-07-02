@@ -16,7 +16,7 @@ from pathlib import Path
 
 from ..indexer.build import BuildConfig
 
-__all__ = ["Config", "LLMConfig", "IndexConfig", "ProjectMeta", "load", "derive_project_id"]
+__all__ = ["CacheServerConfig", "Config", "LLMConfig", "IndexConfig", "ProjectMeta", "load", "derive_project_id"]
 
 _GLOBAL_CONFIG_PATH = Path.home() / ".fw-context" / "config.toml"
 _PROJECT_CONFIG_DIR = ".fw-context"
@@ -209,6 +209,27 @@ class ProjectMeta:
 
 
 @dataclass
+class CacheServerConfig:
+    """Optional centralized LLM analysis cache server.
+
+    When ``url`` is set, the ``CacheClient`` is created and used during
+    ``fw-context index --analyze`` to check remote cache before calling
+    Ollama and to upload results after analysis.
+
+    Attributes:
+        url: Base URL of the cache server (e.g. ``https://fw-cache.example.com``).
+        token: Bearer token for authentication (read+write or read-only).
+        batch_size: Maximum hashes/entries per HTTP request (default 100).
+        force: When ``True``, sends ``X-Cache-Overwrite`` header on write
+            requests (requires ``can_overwrite`` on the server).
+    """
+    url: str = ""
+    token: str = ""
+    batch_size: int = 100
+    force: bool = False
+
+
+@dataclass
 class Config:
     """Top-level configuration container aggregating all sub-configs.
 
@@ -227,6 +248,7 @@ class Config:
     build: BuildConfig = field(default_factory=BuildConfig)
     index: IndexConfig = field(default_factory=IndexConfig)
     llm: LLMConfig = field(default_factory=LLMConfig)
+    cache_server: CacheServerConfig | None = None
 
     def source_root_paths(self, project_root: Path) -> list[Path]:
         """Resolve and validate source root directories against *project_root*.
@@ -328,6 +350,14 @@ def _from_dict(data: dict) -> Config:
             cfg.llm.analyze_symbols = bool(llm["analyze_symbols"])
         if "analyze_vendor" in llm:
             cfg.llm.analyze_vendor = bool(llm["analyze_vendor"])
+
+    if cs := data.get("cache_server", {}):
+        cfg.cache_server = CacheServerConfig(
+            url=cs.get("url", ""),
+            token=cs.get("token", ""),
+            batch_size=cs.get("batch_size", 100),
+            force=cs.get("force", False),
+        )
 
     return cfg
 

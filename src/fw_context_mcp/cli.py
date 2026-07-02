@@ -93,6 +93,12 @@ def cmd_index(args: argparse.Namespace) -> int:
     source_roots = [Path(r) for r in args.source_roots] if args.source_roots else cfg.source_root_paths(project_root)
     exclude_paths = cfg.exclude_root_paths(project_root)
 
+    # Override force flag from CLI
+    cs_config = cfg.cache_server
+    if cs_config is not None and getattr(args, 'force', False):
+        from dataclasses import replace
+        cs_config = replace(cs_config, force=True)
+
     config_hash = run(
         compile_commands=compile_commands,
         db_path=db_path,
@@ -112,6 +118,7 @@ def cmd_index(args: argparse.Namespace) -> int:
         project_root=project_root,
         project_id=project_id,
         llm_config=cfg.llm,
+        cache_server_config=cs_config,
     )
     print(f"Indexed. config_hash={config_hash[:16]}…  db={db_path}")
     return 0
@@ -945,7 +952,24 @@ def cmd_analyze(args: argparse.Namespace) -> int:
     # Re-open connection for the analysis (uses its own transactions)
     conn = open_db(db_path)
     try:
-        _build_llm_analysis(conn, config_hash, cfg.llm, db_path.parent, exclude_like=exclude_like)
+        # Create CacheClient from config if available
+        cc = None
+        if cfg.cache_server and cfg.cache_server.url:
+            try:
+                from fw_context_mcp.cache_client import CacheClient
+                cc = CacheClient(
+                    url=cfg.cache_server.url,
+                    token=cfg.cache_server.token,
+                    force=cfg.cache_server.force,
+                    batch_size=cfg.cache_server.batch_size,
+                )
+            except Exception as e:
+                logging.getLogger(__name__).warning("Failed to create CacheClient: %s", e)
+
+        _build_llm_analysis(conn, config_hash, cfg.llm, db_path.parent,
+                           exclude_like=exclude_like, cache_client=cc)
+        if cc:
+            cc.close()
         _build_overrides(conn, config_hash, db_path.parent)
         conn.commit()
     finally:
@@ -959,6 +983,31 @@ def cmd_version(args: argparse.Namespace) -> int:
     """Print version and exit."""
     from . import __version__
     print(f"fw-context-mcp {__version__}")
+    return 0
+
+
+def cmd_cache_stats(args: argparse.Namespace) -> int:
+    """Show local cache statistics."""
+    from fw_context_mcp.cache_client import local_cache_stats
+    stats = local_cache_stats()
+    print(f"Local cache: {stats['path']}")
+    print(f"  Total entries: {stats['total_entries']}")
+    return 0
+
+
+def cmd_cache_clear(args: argparse.Namespace) -> int:
+    """Delete the local LLM analysis cache."""
+    from fw_context_mcp.cache_client import local_cache_clear
+    if not args.yes:
+        answer = input("Delete local cache? This is safe — it will be rebuilt on next --analyze. [y/N] ")
+        if answer.strip().lower() not in ("y", "yes"):
+            print("Aborted.")
+            return 1
+    result = local_cache_clear()
+    if result == 0:
+        print("Local cache deleted.")
+    else:
+        print("No local cache found.")
     return 0
 
 
@@ -993,6 +1042,7 @@ def main() -> None:
     p_index.add_argument("--analyze", action="store_true", dest="analyze", default=False,
                          help="Generate LLM-based symbol analysis (summary, inputs, outputs)")
     p_index.add_argument("--no-analyze", action="store_true", dest="no_analyze", help="Skip LLM analysis generation")
+    p_index.add_argument("--force", action="store_true", help="With --analyze: overwrite existing cache entries (requires can_overwrite on server)")
     p_index.set_defaults(func=cmd_index)
 
     p_search = sub.add_parser("search", help="Search indexed symbols")
@@ -1037,6 +1087,17 @@ def main() -> None:
     p_analyze = sub.add_parser("analyze", help="Re-run LLM symbol analysis on existing index (idempotent)")
     p_analyze.add_argument("--project", metavar="DIR", help="Project root (default: cwd)")
     p_analyze.set_defaults(func=cmd_analyze)
+
+    # Cache management subcommands
+    p_cache = sub.add_parser("cache", help="Manage local LLM analysis cache")
+    p_cache_sub = p_cache.add_subparsers(dest="cache_command")
+
+    p_cache_stats = p_cache_sub.add_parser("stats", help="Show local cache statistics")
+    p_cache_stats.set_defaults(func=cmd_cache_stats)
+
+    p_cache_clear = p_cache_sub.add_parser("clear", help="Delete local cache")
+    p_cache_clear.add_argument("-y", "--yes", action="store_true", help="Skip confirmation prompt")
+    p_cache_clear.set_defaults(func=cmd_cache_clear)
 
     p_version = sub.add_parser("version", help="Show version information")
     p_version.set_defaults(func=cmd_version)

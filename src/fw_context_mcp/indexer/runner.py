@@ -360,7 +360,16 @@ def _enrich_batch(conn, batch_rows, config_hash: str) -> list[dict]:
     return enriched
 
 
-def _build_llm_analysis(conn, config_hash: str, llm_config, db_dir: Path, *, exclude_like: list[str] | None = None, write_lock_held: bool = False) -> None:
+def _build_llm_analysis(
+    conn,
+    config_hash: str,
+    llm_config,
+    db_dir: Path,
+    *,
+    exclude_like: list[str] | None = None,
+    write_lock_held: bool = False,
+    cache_client=None,
+) -> None:
     """Generate structured LLM analysis (summary, inputs, outputs) for each
     project-definition symbol using Ollama, one symbol per request.
 
@@ -465,9 +474,39 @@ def _build_llm_analysis(conn, config_hash: str, llm_config, db_dir: Path, *, exc
             batch_dicts = _enrich_batch(conn, [row], config_hash)
             d = batch_dicts[0]
 
-            # ── Cache check ──
+            # ── Cache check — 3 tiers: per-project → local global → remote ──
             h = compute_content_hash(d["body"], d["qualified_name"], d["signature"], d["docstring"])
+
+            # Tier 1: per-project cache (in this conn's index.db)
             cached = lookup_llm_analysis_cache(conn, h)
+
+            # Tier 2: local global cache (~/.fw-context/llm_cache.db)
+            if not cached:
+                try:
+                    from ..cache_client import get_local_cache_db, local_cache_lookup
+                    local_db = get_local_cache_db(readonly=True)
+                    local_hits = local_cache_lookup(local_db, [h])
+                    local_db.close()
+                    cached = local_hits.get(h)
+                except Exception as e:
+                    log.debug("Local global cache lookup failed: %s", e)
+
+            # Tier 3: remote cache server
+            if not cached and cache_client is not None:
+                try:
+                    remote_hits = cache_client.batch_get([h])
+                    cached = remote_hits.get(h)
+                    if cached:
+                        # Store in local global cache for next time
+                        try:
+                            local_db = get_local_cache_db()
+                            from ..cache_client import local_cache_upsert
+                            local_cache_upsert(local_db, [{"hash": h, **cached}])
+                            local_db.close()
+                        except Exception as e:
+                            log.debug("Local global cache write failed: %s", e)
+                except Exception as e:
+                    log.debug("Remote cache lookup failed: %s", e)
 
             if cached:
                 # Cache hit — re-use existing analysis
@@ -554,10 +593,32 @@ def _build_llm_analysis(conn, config_hash: str, llm_config, db_dir: Path, *, exc
                 with transaction(conn):
                     db_rows = [(r["symbol_id"], r["summary"], r["inputs"], r["outputs"], model)]
                     inserted = upsert_llm_analysis_batch(conn, db_rows)
-                    # Store in cache for next time
+                    # Store in per-project cache
                     upsert_llm_analysis_cache(conn, [(
                         h, r["summary"], r["inputs"], r["outputs"], model,
                     )])
+                    # Store in local global cache
+                    try:
+                        from ..cache_client import get_local_cache_db, local_cache_upsert
+                        local_db = get_local_cache_db()
+                        local_cache_upsert(local_db, [{
+                            "hash": h, "summary": r["summary"],
+                            "inputs": r["inputs"], "outputs": r["outputs"],
+                            "model": model,
+                        }])
+                        local_db.close()
+                    except Exception as e:
+                        log.debug("Local global cache write failed: %s", e)
+                    # Store on remote cache server (fire-and-forget)
+                    if cache_client is not None:
+                        try:
+                            cache_client.batch_put([{
+                                "hash": h, "summary": r["summary"],
+                                "inputs": r["inputs"], "outputs": r["outputs"],
+                                "model": model,
+                            }])
+                        except Exception as e:
+                            log.debug("Remote cache write failed: %s", e)
                     total += inserted
 
             elapsed = time.monotonic() - t0
@@ -1021,6 +1082,7 @@ def run(
     project_root: Path | None = None,
     project_id: str | None = None,
     llm_config=None,
+    cache_server_config=None,
     parallel: bool = True,
 ) -> str:
     """Index a project: parse translation units, extract symbols, and store to SQLite.
@@ -1233,9 +1295,25 @@ def run(
 
     # LLM analysis generation (opt-in)
     if analyze_symbols and llm_config is not None and llm_config.enabled:
+        # Create CacheClient from cache_server_config if available
+        cc = None
+        if cache_server_config is not None and cache_server_config.url:
+            try:
+                from ..cache_client import CacheClient
+                cc = CacheClient(
+                    url=cache_server_config.url,
+                    token=cache_server_config.token,
+                    force=cache_server_config.force,
+                    batch_size=cache_server_config.batch_size,
+                )
+            except Exception as e:
+                log.warning("Failed to create CacheClient: %s", e)
+
         log.info("Generating LLM analysis for project symbols...")
         _build_llm_analysis(conn, config_hash, llm_config, db_path.parent,
-                           exclude_like=exclude_like)
+                           exclude_like=exclude_like, cache_client=cc)
+        if cc:
+            cc.close()
         conn.commit()
 
     # Method override tracking (post-processing, no LLM needed)
