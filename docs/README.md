@@ -203,7 +203,7 @@ graph LR
 - **Indirect call detection** — resolves function-pointer arguments at direct call sites, uncovering call-graph edges that grep/cscope miss
 - **Incremental indexing** — by default, only changed files are re-parsed (seconds, not minutes). The file watcher auto-reindexes on save — use `--build` for a full re-index when needed
 - **Offline-first** — index is a file on disk at `~/.fw-context/index/`. No daemon, no cloud, no network.
-- **Shared LLM cache** — three-tier analysis cache (per-project → local global → remote server). Analysis generated once — all projects on all machines benefit. Optional remote server (FastAPI + PostgreSQL), deployed in minutes with `fw-cache-server setup`.
+- **Shared LLM cache** — two-tier analysis cache (local SQLite → remote server). Analysis generated once — all projects on all machines benefit. Optional FastAPI + PostgreSQL server, deployed in minutes with `fw-cache-server setup`.
 - **`#ifdef`-aware** — uses real compiler flags; sees exactly what your compiler sees
 
 ## Supported ecosystems
@@ -238,14 +238,14 @@ making subsequent runs **incremental** — seconds for a few changed files.
 ```
 ~/.fw-context/
 ├── config.toml              # global defaults
-├── llm_cache.db             # local global LLM analysis cache (shared across all projects)
+├── llm_cache.db             # shared LLM analysis cache (all projects, same machine)
 ├── .venv/                   # Python virtual environment
 │   └── bin/
 │       ├── fw-context       # CLI
 │       └── fw-context-mcp   # MCP server
 └── index/
     └── <project-id>/
-        └── index.db         # SQLite + FTS5 + vec0 + refs + project cache
+        └── index.db         # SQLite + FTS5 + vec0 + refs
 
 your-firmware/
 ├── .fw-context/

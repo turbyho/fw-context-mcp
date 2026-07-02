@@ -22,7 +22,6 @@ from fw_context_mcp.indexer.db import (
     insert_inheritance_batch,
     insert_refs_batch,
     insert_symbols_batch,
-    lookup_llm_analysis_cache,
     split_tokens,
     upsert_file,
     upsert_llm_analysis_batch,
@@ -224,16 +223,19 @@ def store_symbols_for_unit(
         insert_symbols_batch(conn, rows)
         syms_added = len(rows)
 
-        # ── Phase 3: Restore LLM analysis from content-addressable cache ──
+        # ── Phase 3: Restore LLM analysis from local global cache ──
         restored = 0
         if syms:
+            from fw_context_mcp.cache_client import get_local_cache_db, local_cache_lookup
+
+            local_db = get_local_cache_db(readonly=True)
             for s in syms:
                 lines = _cached_lines(s.file)
                 if lines is None:
                     continue
                 body = _read_body(lines, s.line, s.end_line)
                 ch = compute_content_hash(body, s.qualified_name, s.signature, s.docstring)
-                cached = lookup_llm_analysis_cache(conn, ch)
+                cached = local_cache_lookup(local_db, [ch]).get(ch)
                 if not cached:
                     continue  # not in cache — _build_llm_analysis will handle it
                 new_id = conn.execute(
@@ -247,6 +249,7 @@ def store_symbols_for_unit(
                     cached["outputs"], cached["model"],
                 )])
                 restored += 1
+            local_db.close()
         if restored:
             log.debug(
                 "Restored LLM analysis for %d symbols from cache in %s",

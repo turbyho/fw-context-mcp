@@ -28,18 +28,17 @@ fw-context index --analyze
         └── return stored result
 ```
 
-Three-tier lookup, each tier caches the answer for next time:
+Two-tier lookup, each tier caches the answer for next time:
 
 | Tier | Storage | Scope | Lookup cost |
 |------|---------|-------|-------------|
-| 1 | `llm_analysis_cache` in project `index.db` | Per-project | SQLite (fastest) |
-| 2 | `~/.fw-context/llm_cache.db` | All projects, same machine | SQLite (fast) |
-| 3 | Remote cache server (PostgreSQL) | All developers, all machines | HTTPS (network) |
+| 1 | `~/.fw-context/llm_cache.db` | All projects, same machine | SQLite (fast) |
+| 2 | Remote cache server (PostgreSQL) | All developers, all machines | HTTPS (network) |
 
 Each content hash is computed from the function body + signature — identical
 code produces identical hashes regardless of project. An analysis generated
 for *birdie1* is automatically available to *zbox-ecb* and *HA_Boiler*.
-Re-indexing a project with `[cache_server]` configured skips Ollama entirely
+Re-indexing any project with `[cache_server]` configured skips Ollama entirely
 for symbols already cached.
 
 ## API Endpoints
@@ -314,36 +313,30 @@ to local-only on failure.
 
 On `fw-context index --analyze`:
 
-1. **Per-project local index** (Tier 1)
-   — checked first (fastest, always available).
-2. **Local global cache** (Tier 2, `~/.fw-context/llm_cache.db`)
-   — shared across all projects on the same machine.
-3. **Remote cache server** (Tier 3)
+1. **Local global cache** (Tier 1, `~/.fw-context/llm_cache.db`)
+   — shared across all projects on the same machine. SQLite.
+2. **Remote cache server** (Tier 2)
    — only if `[cache_server]` is configured.
-   Cache misses from the server are stored back into tiers 1 and 2.
+   Cache misses from the server are stored back into the local cache.
 
 ### Cache management commands
 
 ```bash
-# Show cache statistics for all tiers
-fw-context cache stats
+# Show cache statistics
+fw-context cache stats                   # both tiers
+fw-context cache stats --remote          # Tier 2 only
 
-# Show only specific tiers
-fw-context cache stats --global           # Tier 2 only
-fw-context cache stats --remote           # Tier 3 only
-
-# Clear cache (no flags = Tier 1 + 2)
-fw-context cache clear                    # per-project + global local
-fw-context cache clear --global           # Tier 2 only
-fw-context cache clear --remote           # project's entries from server
-fw-context cache clear --all              # all three tiers
-fw-context cache clear --remote -y        # skip confirmation
+# Clear cache
+fw-context cache clear                   # local cache only (Tier 1)
+fw-context cache clear --remote          # project's entries from server (Tier 2)
+fw-context cache clear --all             # both tiers
+fw-context cache clear --remote -y       # skip confirmation
 ```
 
 The `--remote` flag reads all content hashes from the project's per-project
-cache and sends them to the server's `POST /cache/clear` endpoint. Only the
-current project's entries are deleted — entries shared with other projects
-remain on the server.
+`llm_analysis_cache` table and sends them to the server's `POST /cache/clear`
+endpoint. Only the current project's entries are deleted — entries shared
+with other projects remain on the server.
 
 ## Hardening (production)
 
@@ -488,7 +481,7 @@ fw-cache-admin token create my-project --overwrite
 | `/etc/nginx/sites-available/fw-cache` | root | nginx site config |
 | `/etc/nginx/sites-enabled/fw-cache` | root | nginx site symlink |
 | `/etc/letsencrypt/live/<domain>/` | root | TLS certificates |
-| `~/.fw-context/llm_cache.db` | user | Local global cache, shared across all projects (SQLite) |
+| `~/.fw-context/llm_cache.db` | user | Local cache, shared across all projects (SQLite) |
 | `<project>/.fw-context/config.toml` | user | Shared project config (commit to git) |
 | `<project>/.fw-context/local.toml` | user | Local developer overrides (`[cache_server]`, `[llm]`) |
 
