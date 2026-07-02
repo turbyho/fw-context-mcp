@@ -66,7 +66,7 @@ class RRFFusionPhase(Phase):
             if key not in all_rows or (r.get("is_definition") and not all_rows[key].get("is_definition")):
                 all_rows[key] = dict(r)
 
-        ranked = sorted(scores.items(), key=lambda x: -x[1])
+        ranked = sorted(scores.items(), key=lambda x: (-x[1], x[0][0]))
         final = [dict(all_rows[key]) for key, _ in ranked[: ctx.limit]]
 
         return ctx.evolve(final_results=final)

@@ -215,15 +215,13 @@ def cmd_reset(args: argparse.Namespace) -> int:
 
     conn = open_db(db_path)
     active = get_active_config(conn, project_id)
-    conn.close()
-
     sym_count = 0
     if active:
-        from .indexer.db import open_db as _open
-        sym_count = _open(db_path).execute(
+        sym_count = conn.execute(
             "SELECT COUNT(*) FROM symbols WHERE config_hash=?",
             (active["config_hash"],),
         ).fetchone()[0]
+    conn.close()
 
     print(f"Project : {project_root}")
     print(f"DB      : {db_path}")
@@ -554,11 +552,17 @@ def cmd_project_init(args: argparse.Namespace) -> int:
                 ).fetchone()[0]
                 print(f"  [ok] index: {sym_count} symbols")
                 # Check embeddings
-                emb_count = conn.execute("SELECT COUNT(*) FROM embeddings").fetchone()[0]
+                emb_count = conn.execute(
+                    "SELECT COUNT(*) FROM embeddings e JOIN symbols s ON s.id = e.symbol_id WHERE s.config_hash = ?",
+                    (active["config_hash"],),
+                ).fetchone()[0]
                 if emb_count == 0:
                     print("  [info] no embeddings yet — run 'fw-context index' to generate")
                 # Check LLM analysis
-                ana_count = conn.execute("SELECT COUNT(*) FROM llm_analysis").fetchone()[0]
+                ana_count = conn.execute(
+                    "SELECT COUNT(*) FROM llm_analysis a JOIN symbols s ON s.id = a.symbol_id WHERE s.config_hash = ?",
+                    (active["config_hash"],),
+                ).fetchone()[0]
                 if ana_count == 0:
                     print("  [info] no LLM symbol analysis yet — run 'fw-context index' to generate")
             conn.close()
@@ -1111,7 +1115,7 @@ def main() -> None:
     p_index.add_argument("--analyze", action="store_true", dest="analyze", default=False,
                          help="Generate LLM-based symbol analysis (summary, inputs, outputs)")
     p_index.add_argument("--no-analyze", action="store_true", dest="no_analyze", help="Skip LLM analysis generation")
-    p_index.add_argument("--force", action="store_true", help="With --analyze: overwrite existing cache entries (requires can_overwrite on server)")
+    p_index.add_argument("--force", action="store_true", help="Overwrite existing LLM analysis cache entries (local + remote server; requires can_overwrite)")
     p_index.set_defaults(func=cmd_index)
 
     p_search = sub.add_parser("search", help="Search indexed symbols")

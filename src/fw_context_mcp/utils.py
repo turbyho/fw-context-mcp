@@ -65,6 +65,8 @@ def read_file_lines(abs_path: str) -> list[str] | None:
                 return f.readlines()
         except (UnicodeDecodeError, UnicodeError):
             continue
+        except (FileNotFoundError, OSError):
+            return None
     # Last resort — replace invalid bytes
     try:
         with open(abs_path, encoding="utf-8", errors="replace") as f:

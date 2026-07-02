@@ -31,24 +31,13 @@ def cmd_init(args: argparse.Namespace) -> int:
     import asyncio
 
     async def _init() -> int:
-        import hashlib
-        import secrets
-
         from .backend import CacheBackend
 
         backend = CacheBackend(db_url)
         try:
             await backend.connect()
             await backend.init_schema()
-            token = secrets.token_hex(32)
-            token_hash = hashlib.sha256(token.encode()).digest()
-            pool = backend._meta_pool
-            async with pool.acquire() as conn:
-                await conn.execute(
-                    "INSERT INTO tokens (token_hash, project_id, can_read, can_write, can_overwrite, description) "
-                    "VALUES ($1, NULL, true, true, true, 'admin (setup)')",
-                    token_hash,
-                )
+            token = await backend.create_admin_token()
             print("Admin token:", token)
             print()
             print("Use this token as FW_CACHE_ADMIN_TOKEN for fw-cache-admin commands.")
@@ -72,7 +61,8 @@ def cmd_run(args: argparse.Namespace) -> int:
 
     from .app import create_app
 
-    app = create_app(db_url)
+    os.environ["FW_CACHE_DB_URL"] = db_url
+    app = create_app()
 
     import uvicorn
 

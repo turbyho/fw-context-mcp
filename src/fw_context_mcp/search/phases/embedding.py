@@ -29,6 +29,8 @@ from fw_context_mcp.search.phases.embedding_helpers import (
 log = logging.getLogger(__name__)
 
 _table_exists = table_exists  # backward-compat alias
+_table_has_rows = table_has_rows
+_brute_force_search = brute_force_search
 
 
 class EmbeddingPhase(Phase):
@@ -100,11 +102,13 @@ class EmbeddingPhase(Phase):
                 # merged results than running an independent KNN query.
                 if ctx.fts5_results and has_vec0 and not self.independent:
                     queries = ctx.generated_queries if ctx.generated_queries else ctx.rough_queries
+                    if not queries:
+                        queries = ctx.query.split()
                     # Expand to prefix match — _expand_query skips wildcards when
                     # the query already contains OR, so we add * per-term here.
                     fts5_query = " OR ".join(
                         (q if q.endswith("*") else f"{q}*") for q in queries
-                    ) if queries else ctx.query
+                    )
                     rows = search_similar_hybrid(
                         conn,
                         query_vec,
@@ -157,7 +161,3 @@ class EmbeddingPhase(Phase):
             conn.close()
 
         return ctx
-
-
-_table_has_rows = table_has_rows
-_brute_force_search = brute_force_search

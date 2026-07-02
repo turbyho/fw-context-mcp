@@ -142,14 +142,32 @@ def store_symbols_for_unit(
         return _body_cache[abs_path]
 
 
-    # ── Phase 1: Save USRs of old symbols (Phase 4 needs this for move detection) ──
+    # ── Phase 1: Save USRs + analysis of old symbols ──
+    # Phase 3 restores per-build LLM analysis for symbols whose body
+    # didn't change; Phase 4 detects file-moves.  ON DELETE CASCADE
+    # removes llm_analysis when old symbols are deleted, so we save
+    # it beforehand and restore it by USR match (preferred over the
+    # global cache which may contain stale entries from other projects).
     old_usrs: set[str] = set()
+    saved_analyses: dict[str, dict] = {}  # usr → {summary, inputs, output, model, content_hash}
     if file_path in known:
         file_id_old, _ = known[file_path]
-        rows = conn.execute(
-            "SELECT usr FROM symbols WHERE file_id = ?", (file_id_old,),
+        old_rows = conn.execute(
+            """SELECT s.usr, a.summary, a.inputs, a.outputs, a.model, a.content_hash
+               FROM symbols s
+               LEFT JOIN llm_analysis a ON a.symbol_id = s.id
+               WHERE s.file_id = ?""", (file_id_old,),
         ).fetchall()
-        old_usrs = {r["usr"] for r in rows}
+        for r in old_rows:
+            old_usrs.add(r["usr"])
+            if r["summary"]:
+                saved_analyses[r["usr"]] = {
+                    "summary": r["summary"],
+                    "inputs": r["inputs"],
+                    "outputs": r["outputs"],
+                    "model": r["model"],
+                    "content_hash": r["content_hash"],
+                }
 
     # ── Phase 2: Delete old symbols (existing logic) ──
     if file_path in known:
@@ -223,7 +241,7 @@ def store_symbols_for_unit(
         insert_symbols_batch(conn, rows)
         syms_added = len(rows)
 
-        # ── Phase 3: Restore LLM analysis from local global cache ──
+        # ── Phase 3: Restore LLM analysis — per-build first, then global cache ──
         restored = 0
         if syms:
             from fw_context_mcp.cache_client import get_local_cache_db, local_cache_lookup
@@ -234,10 +252,26 @@ def store_symbols_for_unit(
                 if lines is None:
                     continue
                 body = _read_body(lines, s.line, s.end_line)
-                ch = compute_content_hash(body, s.qualified_name, s.signature, s.docstring)
-                cached = local_cache_lookup(local_db, [ch]).get(ch)
+                new_ch = compute_content_hash(body, s.qualified_name, s.signature, s.docstring)
+
+                cached: dict | None = None
+                # Prefer per-build saved analysis — exact USR match.
+                # When content_hash is present, also verify it matches
+                # the new body.  When empty (analysis from older index
+                # before content_hash was populated), accept the saved
+                # analysis as authoritative for the same USR.
+                saved = saved_analyses.get(s.usr)
+                if saved is not None and (
+                    saved.get("content_hash") == new_ch
+                    or not saved.get("content_hash")
+                ):
+                    cached = saved
+                else:
+                    # Fall back to local global cache
+                    cached = local_cache_lookup(local_db, [new_ch]).get(new_ch)
+
                 if not cached:
-                    continue  # not in cache — _build_llm_analysis will handle it
+                    continue
                 new_id = conn.execute(
                     "SELECT id FROM symbols WHERE config_hash = ? AND usr = ?",
                     (config_hash, s.usr),
@@ -246,7 +280,7 @@ def store_symbols_for_unit(
                     continue
                 upsert_llm_analysis_batch(conn, [(
                     new_id[0], cached["summary"], cached["inputs"],
-                    cached["outputs"], cached["model"], ch,
+                    cached["outputs"], cached["model"], new_ch,
                 )])
                 restored += 1
             local_db.close()

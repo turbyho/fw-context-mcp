@@ -191,6 +191,6 @@ class TestInstall:
 
     def test_generate_launchd_plist(self) -> None:
         from fw_context_mcp.cache_server.install import generate_launchd_plist
-        plist = generate_launchd_plist(host="0.0.0.0", port=9000)
+        plist = generate_launchd_plist(host="0.0.0.0", port=9000, db_url="postgresql://user:pass@localhost:5432")
         assert "com.fwcontext.cache-server" in plist
         assert "9000" in plist

@@ -53,12 +53,13 @@ class ExpandContextPhase(Phase):
         seed_usrs: list[str] = []
         seed_set: set[tuple] = set()
         for r in seeds:
-            seed_set.add((r["name"], r.get("file_path")))
+            seed_set.add((r["name"], r.get("file_path", "")))
             usr = r.get("usr")
             if usr:
                 seed_usrs.append(usr)
 
         if not seed_usrs:
+            log.debug("ExpandContext: no seeds have USR — skipping")
             return ctx
 
         conn = open_db(ctx.db_path)
@@ -84,8 +85,9 @@ class ExpandContextPhase(Phase):
         if not neighbors:
             return ctx
 
-        # Mixed strategy: original seeds + new neighbors appended
-        final = list(seeds) + neighbors
+        # Mixed strategy: original seeds + new neighbors + remaining results
+        remaining = results[self.SEEDS:][: ctx.limit - len(seeds) - len(neighbors)]
+        final = list(seeds) + neighbors + list(remaining)
         return ctx.evolve(final_results=final)
 
 
@@ -129,7 +131,8 @@ def _resolve_project_defs(
     rows = conn.execute(
         f"SELECT usr, name, qualified_name, kind, file_path, file_id, line, "
         f"  signature, is_definition, is_project, docstring, is_virtual, "
-        f"  is_pure_virtual, parent_usr, is_template, template_usr "
+        f"  is_pure_virtual, parent_usr, is_template, template_usr, "
+        f"  summary, inputs, outputs "
         f"FROM symbols WHERE config_hash = ? AND usr IN ({ph}) "
         f"AND is_definition = 1 AND is_project = 1 "
         f"ORDER BY CASE kind WHEN 'function' THEN 0 WHEN 'method' THEN 1 "

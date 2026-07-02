@@ -4,7 +4,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from fw_context_mcp.indexer.ops import _compute_content_hash, _read_body, _read_file_lines
+from fw_context_mcp.indexer.ops import _compute_content_hash, _read_body
+from fw_context_mcp.utils import read_file_lines as _read_file_lines
 
 
 class TestReadFileLines:

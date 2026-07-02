@@ -13,6 +13,7 @@ Startup/shutdown hooks manage the asyncpg connection pool lifecycle.
 from __future__ import annotations
 
 import logging
+import os
 from contextlib import asynccontextmanager
 from typing import Any
 
@@ -48,17 +49,18 @@ class BatchPutRequest(BaseModel):
 
 # -- Application factory --
 
-def create_app(db_url: str = "", *, backend: Any = None) -> FastAPI:
+def create_app(*, backend: Any = None) -> FastAPI:
     """Create and configure the FastAPI app.
-
-    *db_url* must be the base PostgreSQL connection string (without a
-    database name).  The backend will append ``/fw_cache_meta`` and
-    ``/fw_cache`` internally.
 
     *backend* is for testing — when provided, it is used as
     ``app.state.backend`` instead of creating a new ``CacheBackend``.
+    ``FW_CACHE_DB_URL`` must be set in the environment when *backend*
+    is ``None``.
     """
     if backend is None:
+        db_url = os.environ.get("FW_CACHE_DB_URL", "")
+        if not db_url:
+            raise RuntimeError("FW_CACHE_DB_URL environment variable is required")
         from .backend import CacheBackend
 
         backend = CacheBackend(db_url)
@@ -95,8 +97,9 @@ def create_app(db_url: str = "", *, backend: Any = None) -> FastAPI:
             return error
 
         hashes = body.hashes[:1000]  # hard cap
+        truncated = len(body.hashes) > 1000
         results = await request.app.state.backend.batch_get(hashes)
-        return {"results": results}
+        return {"results": results, "truncated": truncated}
 
     @app.put("/cache/batch")
     async def batch_put(request: Request, body: BatchPutRequest) -> dict[str, Any]:
@@ -112,13 +115,14 @@ def create_app(db_url: str = "", *, backend: Any = None) -> FastAPI:
         if error is not None:
             return error
 
-        overwrite = request.headers.get("X-Cache-Overwrite", "").lower() in ("true", "1", "yes")
+        overwrite = getattr(request.state, "can_overwrite", False)
+        truncated = len(body.entries) > 1000
         entries = [
             {"hash": e.hash, "summary": e.summary, "inputs": e.inputs, "outputs": e.outputs, "model": e.model}
             for e in body.entries[:1000]  # hard cap
         ]
         inserted = await request.app.state.backend.batch_put(entries, can_overwrite=overwrite)
-        return {"inserted": inserted, "total": len(entries)}
+        return {"inserted": inserted, "total": len(entries), "truncated": truncated}
 
     @app.post("/cache/clear")
     async def cache_clear(request: Request, body: CacheClearRequest) -> dict[str, Any]:

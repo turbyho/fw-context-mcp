@@ -75,7 +75,11 @@ def score_result(
         elif stem in fpath:
             s += 1
 
-    # Bonus for symbols under project source roots
+    # Bonus for symbols under project source roots.
+    # Prefer the indexed is_project flag (set during indexing with the
+    # exact source_roots at that time).  Fall back to local path check
+    # for older indexes built before is_project was populated — the
+    # current config's source_roots may differ, so this is best-effort.
     if row.get("is_project"):
         s += 1
     elif source_roots and _is_project_local(fpath, source_roots):
