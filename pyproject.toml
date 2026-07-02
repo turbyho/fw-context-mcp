@@ -20,6 +20,11 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+cache-server = [
+    "fastapi>=0.110",
+    "uvicorn[standard]>=0.27",
+    "asyncpg>=0.29",
+]
 dev = [
     "pytest>=8",
     "ruff>=0.4",
@@ -29,6 +34,8 @@ dev = [
 [project.scripts]
 fw-context = "fw_context_mcp.cli:main"
 fw-context-mcp = "fw_context_mcp.mcp.server:main"
+fw-cache-server = "fw_context_mcp.cache_server.cli:main"
+fw-cache-admin = "fw_context_mcp.cache_server.admin:main"
 
 [build-system]
 requires = ["hatchling"]
