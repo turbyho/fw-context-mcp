@@ -102,24 +102,6 @@ def local_cache_clear() -> int:
     return 0
 
 
-def local_cache_clear_project(project_db_path: Path) -> int:
-    """Delete ``llm_analysis_cache`` entries from a per-project index DB.
-
-    Returns the number of entries deleted.
-    """
-    if not project_db_path.exists():
-        return 0
-    try:
-        conn = sqlite3.connect(str(project_db_path))
-        count = conn.execute("SELECT COUNT(*) FROM llm_analysis_cache").fetchone()[0]
-        conn.execute("DELETE FROM llm_analysis_cache")
-        conn.commit()
-        conn.close()
-        return count
-    except Exception:
-        return 0
-
-
 def local_cache_stats() -> dict[str, Any]:
     """Return statistics about the local cache."""
     if not _LOCAL_CACHE_PATH.exists():
@@ -130,44 +112,6 @@ def local_cache_stats() -> dict[str, Any]:
         return {"total_entries": total, "path": str(_LOCAL_CACHE_PATH)}
     finally:
         conn.close()
-
-
-def migrate_from_index_db(index_db_path: Path) -> int:
-    """Copy ``llm_analysis_cache`` rows from a per-project ``index.db``
-    to the local global cache.  Deduplicates by content_hash.
-
-    Returns the number of rows migrated.
-    """
-    if not index_db_path.exists():
-        return 0
-    try:
-        src = sqlite3.connect(str(index_db_path))
-        rows = src.execute(
-            "SELECT content_hash, summary, inputs, outputs, model FROM llm_analysis_cache"
-        ).fetchall()
-        src.close()
-    except Exception:
-        return 0
-
-    if not rows:
-        return 0
-
-    local = get_local_cache_db()
-    inserted = 0
-    for r in rows:
-        try:
-            local.execute(
-                "INSERT OR IGNORE INTO llm_analysis_cache "
-                "(content_hash, summary, inputs, outputs, model) VALUES (?, ?, ?, ?, ?)",
-                r,
-            )
-            inserted += 1
-        except Exception:
-            pass
-    local.commit()
-    local.close()
-    logger.info("Migrated %d cache entries from %s", inserted, index_db_path)
-    return inserted
 
 
 class CacheClient:

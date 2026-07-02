@@ -246,7 +246,7 @@ def store_symbols_for_unit(
                     continue
                 upsert_llm_analysis_batch(conn, [(
                     new_id[0], cached["summary"], cached["inputs"],
-                    cached["outputs"], cached["model"],
+                    cached["outputs"], cached["model"], ch,
                 )])
                 restored += 1
             local_db.close()

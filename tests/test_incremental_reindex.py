@@ -1075,18 +1075,31 @@ class TestStoreSymbolsForUnitAnalysisRestore:
             (sym_id,),
         )
 
-        # Populate content-addressable cache — Phase 3 now reads from cache
+        # Populate global cache — Phase 3 reads from ~/.fw-context/llm_cache.db.
+        # Redirect HOME so get_local_cache_db uses tmp_path.
         from fw_context_mcp.utils import compute_content_hash
         content_hash = compute_content_hash(
             "void foo(void) {\n    return;\n}\n", "foo", "void foo(void)", "",
         )
-        conn.execute(
-            """INSERT OR REPLACE INTO llm_analysis_cache
-               (content_hash, summary, inputs, outputs, model, analyzed_at)
-               VALUES (?, ?, ?, ?, ?, datetime('now'))""",
-            (content_hash, "Test function.", "none", "void", "test"),
-        )
-        conn.commit()
+        import os as _os
+        _saved_home = _os.environ.get("HOME")
+        _os.environ["HOME"] = str(tmp_path)
+        try:
+            from fw_context_mcp.cache_client import get_local_cache_db
+            global_db = get_local_cache_db()
+            global_db.execute(
+                """INSERT OR REPLACE INTO llm_analysis_cache
+                   (content_hash, summary, inputs, outputs, model, analyzed_at)
+                   VALUES (?, ?, ?, ?, ?, datetime('now'))""",
+                (content_hash, "Test function.", "none", "void", "test"),
+            )
+            global_db.commit()
+            global_db.close()
+        finally:
+            if _saved_home is None:
+                _os.environ.pop("HOME", None)
+            else:
+                _os.environ["HOME"] = _saved_home
 
         # Verify analysis exists before
         ana_before = conn.execute("SELECT COUNT(*) FROM llm_analysis").fetchone()[0]
@@ -1297,13 +1310,25 @@ class TestStoreSymbolsForUnitAnalysisRestore:
         content_hash = compute_content_hash(
             "int calc(void) {\n    return 42;\n}\n", "calc", "int calc(void)", "",
         )
-        conn.execute(
-            """INSERT OR REPLACE INTO llm_analysis_cache
-               (content_hash, summary, inputs, outputs, model, analyzed_at)
-               VALUES (?, 'Returns magic number.', 'none', '42', 'test', datetime('now'))""",
-            (content_hash,),
-        )
-        conn.commit()
+        import os as _os2
+        _saved_home2 = _os2.environ.get("HOME")
+        _os2.environ["HOME"] = str(tmp_path)
+        try:
+            from fw_context_mcp.cache_client import get_local_cache_db as _get_db2
+            global_db2 = _get_db2()
+            global_db2.execute(
+                """INSERT OR REPLACE INTO llm_analysis_cache
+                   (content_hash, summary, inputs, outputs, model, analyzed_at)
+                   VALUES (?, 'Returns magic number.', 'none', '42', 'test', datetime('now'))""",
+                (content_hash,),
+            )
+            global_db2.commit()
+            global_db2.close()
+        finally:
+            if _saved_home2 is None:
+                _os2.environ.pop("HOME", None)
+            else:
+                _os2.environ["HOME"] = _saved_home2
 
         from fw_context_mcp.indexer.compile_commands import CompilationUnit
         from fw_context_mcp.indexer.symbols import Symbol

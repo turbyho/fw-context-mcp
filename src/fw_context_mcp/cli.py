@@ -1059,7 +1059,7 @@ def cmd_cache_clear(args: argparse.Namespace) -> int:
                 conn = open_db(db_path)
                 try:
                     hashes = [r[0] for r in conn.execute(
-                        "SELECT content_hash FROM llm_analysis_cache"
+                        "SELECT DISTINCT content_hash FROM llm_analysis WHERE content_hash != ''"
                     ).fetchall()]
                 finally:
                     conn.close()
