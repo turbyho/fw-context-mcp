@@ -87,6 +87,28 @@ go in the shared `config.toml` — LLM configuration is developer-specific.
 |-----|---------|-------|-------------|
 | `name` | *(directory name)* | project | Human-readable project name shown in `fw-context list` and status output. |
 
+### `[cache_server]` — Shared LLM Analysis Cache
+
+Configure a remote cache server for sharing `llm_analysis` across developers.
+**Optional** — without this section, analysis stays local.
+
+| Key | Default | Scope | Description |
+|-----|---------|-------|-------------|
+| `url` | *(none)* | global, local | Cache server URL. Example: `"https://fw-cache.example.com"`. |
+| `token` | *(none)* | global, local | Bearer token with `can_read` + `can_write` permissions. Created via `fw-cache-admin token create`. |
+| `batch_size` | `100` | global, local | Max hashes/entries per HTTP request. |
+| `force` | `false` | global, local | When `true`, sends `X-Cache-Overwrite` header — overwrites existing entries. Requires `can_overwrite` token. |
+
+```toml
+[cache_server]
+url = "https://fw-cache.example.com"
+token = "<your-token>"
+# batch_size = 100
+# force = false
+```
+
+See **[Cache Server →](cache-server.md)** for setup, deployment, and management.
+
 ## Examples
 
 ### Global config (`~/.fw-context/config.toml`)

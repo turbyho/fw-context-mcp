@@ -229,6 +229,7 @@ making subsequent runs **incremental** — seconds for a few changed files.
 | **[Installation](docs/installation.md)** | Prerequisites, install, upgrade, Ollama setup, AI assistant integration |
 | **[Tools Reference](docs/tools.md)** | All 29 MCP tools, 10 CLI commands, internal workings, search pipeline |
 | **[Configuration](docs/configuration.md)** | `.fw-context/config.toml` + `local.toml` — shared project config and local developer overrides |
+| **[Cache Server](docs/cache-server.md)** | Shared LLM analysis cache — FastAPI + PostgreSQL deployment, nginx reverse proxy, token management |
 | **[MCP Server](README-MCP.md)** | JSON-RPC protocol, tool schemas, error handling, debugging |
 
 ## Directory layout
