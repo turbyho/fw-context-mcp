@@ -173,6 +173,43 @@ index — symbols become searchable by their purpose, not just their name.
 Configure with `[llm] analyze_symbols`, `[llm] analysis_model`, and
 `[llm] num_ctx` in `~/.fw-context/config.toml`.
 
+### `fw-context cache stats`
+
+Show cache statistics for one or all three tiers.
+
+```bash
+fw-context cache stats                    # all tiers
+fw-context cache stats --global           # Tier 2 only (local global cache)
+fw-context cache stats --remote           # Tier 3 only (remote server)
+```
+
+Output:
+```
+Project cache (Tier 1): 7674 entries
+Global local cache (Tier 2): 11831 entries  (/home/user/.fw-context/llm_cache.db)
+Remote cache (Tier 3): https://fw-cache.example.com (token: abcd1234...)
+```
+
+### `fw-context cache clear`
+
+Delete cache entries for one or more tiers.
+
+```bash
+fw-context cache clear                    # Tier 1 + 2 (local project + global)
+fw-context cache clear --global           # Tier 2 only
+fw-context cache clear --remote           # Tier 3 only (project's entries from server)
+fw-context cache clear --all              # all three tiers
+fw-context cache clear --remote -y        # skip confirmation prompt
+```
+
+The `--remote` flag reads all content hashes from the project's per-project
+cache and sends them to the server's `POST /cache/clear` endpoint. Requires
+`[cache_server]` configured in `.fw-context/local.toml` and a token with
+`can_write` permission.
+
+All clear operations are safe — cache entries are rebuilt automatically
+on the next `fw-context index --analyze` or `fw-context analyze`.
+
 ### `fw-context version`
 
 Show version information.

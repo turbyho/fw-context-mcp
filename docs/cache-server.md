@@ -28,7 +28,39 @@ fw-context index --analyze
         └── return stored result
 ```
 
-Three-tier lookup, each tier caches the answer for next time.
+Three-tier lookup, each tier caches the answer for next time:
+
+| Tier | Storage | Scope | Lookup cost |
+|------|---------|-------|-------------|
+| 1 | `llm_analysis_cache` in project `index.db` | Per-project | SQLite (fastest) |
+| 2 | `~/.fw-context/llm_cache.db` | All projects, same machine | SQLite (fast) |
+| 3 | Remote cache server (PostgreSQL) | All developers, all machines | HTTPS (network) |
+
+Each content hash is computed from the function body + signature — identical
+code produces identical hashes regardless of project. An analysis generated
+for *birdie1* is automatically available to *zbox-ecb* and *HA_Boiler*.
+Re-indexing a project with `[cache_server]` configured skips Ollama entirely
+for symbols already cached.
+
+## API Endpoints
+
+| Method | Path | Auth | Description |
+|--------|------|------|-------------|
+| `GET` | `/health` | none | Public health check |
+| `POST` | `/cache/batch` | `can_read` | Batch lookup by content hash |
+| `PUT` | `/cache/batch` | `can_write` | Batch write cache entries |
+| `POST` | `/cache/clear` | `can_write` | Delete entries by content hash |
+
+### POST /cache/clear
+
+```json
+{"hashes": ["abc123...", "def456..."]}
+→ {"deleted": 2, "total": 2}
+```
+
+Deletes cache entries matching the given content hashes. Used by
+`fw-context cache clear --remote` to purge a project's entries from
+the shared server. Hashes are uploaded in chunks of `batch_size`.
 
 ## Quickstart
 
@@ -114,7 +146,7 @@ source /var/lib/fw-cache-server/db.env
 fw-cache-server init
 ```
 
-### Option 3: Docker-free container
+### Option 3: Wheel-based deployment
 
 For deployment without `pip` or venv management:
 
@@ -257,13 +289,13 @@ SHA-256 hashed in the database and cannot be recovered.
 ### Cache maintenance
 
 ```bash
-fw-cache-admin cache stats
-fw-cache-admin cache purge --older-than 90d
+fw-cache-admin cache stats                         # overview
+fw-cache-admin cache purge --older-than 90d        # remove entries older than 90 days
 ```
 
 ## Client configuration
 
-Each developer configures their `~/.fw-context/config.toml`:
+Each developer configures their `<project>/.fw-context/local.toml`:
 
 ```toml
 [cache_server]
@@ -273,31 +305,45 @@ token = "<your-read-write-token>"
 # force = false           # set true to overwrite existing entries
 ```
 
-The client uses `url` for `POST /cache/batch` (read) and `PUT /cache/batch`
-(write). It chunks requests by `batch_size`. Retries network errors 3×
-with exponential backoff; falls back gracefully to local-only on failure.
+The client uses `url` for `POST /cache/batch` (read), `PUT /cache/batch`
+(write), and `POST /cache/clear` (delete). It chunks requests by `batch_size`.
+Retries network errors 3× with exponential backoff; falls back gracefully
+to local-only on failure.
 
 ### How the client uses the cache
 
 On `fw-context index --analyze`:
 
-1. **Per-project local index** (`project/.fw-context/index/<config_hash>.db`)
+1. **Per-project local index** (Tier 1)
    — checked first (fastest, always available).
-2. **Local global cache** (`~/.fw-context/llm_cache.db`)
-   — shared across projects on the same machine. SQLite.
-3. **Remote cache server** — only if `[cache_server]` is configured.
+2. **Local global cache** (Tier 2, `~/.fw-context/llm_cache.db`)
+   — shared across all projects on the same machine.
+3. **Remote cache server** (Tier 3)
+   — only if `[cache_server]` is configured.
    Cache misses from the server are stored back into tiers 1 and 2.
 
+### Cache management commands
+
 ```bash
-# View local cache
+# Show cache statistics for all tiers
 fw-context cache stats
 
-# Clear local cache
-fw-context cache clear
+# Show only specific tiers
+fw-context cache stats --global           # Tier 2 only
+fw-context cache stats --remote           # Tier 3 only
 
-# Migrate from old per-project indexes
-fw-context index --analyze    # auto-migrates on first run
+# Clear cache (no flags = Tier 1 + 2)
+fw-context cache clear                    # per-project + global local
+fw-context cache clear --global           # Tier 2 only
+fw-context cache clear --remote           # project's entries from server
+fw-context cache clear --all              # all three tiers
+fw-context cache clear --remote -y        # skip confirmation
 ```
+
+The `--remote` flag reads all content hashes from the project's per-project
+cache and sends them to the server's `POST /cache/clear` endpoint. Only the
+current project's entries are deleted — entries shared with other projects
+remain on the server.
 
 ## Hardening (production)
 
@@ -442,8 +488,9 @@ fw-cache-admin token create my-project --overwrite
 | `/etc/nginx/sites-available/fw-cache` | root | nginx site config |
 | `/etc/nginx/sites-enabled/fw-cache` | root | nginx site symlink |
 | `/etc/letsencrypt/live/<domain>/` | root | TLS certificates |
-| `~/.fw-context/llm_cache.db` | user | Local global cache (SQLite) |
-| `<project>/.fw-context/config.toml` | user | Client config (`[cache_server]`) |
+| `~/.fw-context/llm_cache.db` | user | Local global cache, shared across all projects (SQLite) |
+| `<project>/.fw-context/config.toml` | user | Shared project config (commit to git) |
+| `<project>/.fw-context/local.toml` | user | Local developer overrides (`[cache_server]`, `[llm]`) |
 
 ## Upgrading
 
