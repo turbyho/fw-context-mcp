@@ -348,6 +348,21 @@ class CacheBackend:
             "models": {r["model"]: r["cnt"] for r in models},
         }
 
+    async def cache_clear_by_hashes(self, hashes: list[str]) -> int:
+        """Delete cache entries by content hash. Returns number deleted."""
+        if not hashes:
+            return 0
+        deleted = 0
+        async with self._cache_pool.acquire() as conn:  # type: ignore[union-attr]
+            result = await conn.execute(
+                "DELETE FROM llm_analysis_cache WHERE content_hash = ANY($1::text[])",
+                hashes,
+            )
+            tag = result.split()
+            if len(tag) >= 2:
+                deleted = int(tag[1])
+        return deleted
+
     async def cache_purge_older_than(self, days: int) -> int:
         """Delete cache entries older than *days*.  Returns rows deleted."""
         async with self._cache_pool.acquire() as conn:  # type: ignore[union-attr]

@@ -30,6 +30,10 @@ class BatchGetRequest(BaseModel):
     hashes: list[str]
 
 
+class CacheClearRequest(BaseModel):
+    hashes: list[str]
+
+
 class CacheEntry(BaseModel):
     hash: str
     summary: str
@@ -115,5 +119,19 @@ def create_app(db_url: str = "", *, backend: Any = None) -> FastAPI:
         ]
         inserted = await request.app.state.backend.batch_put(entries, can_overwrite=overwrite)
         return {"inserted": inserted, "total": len(entries)}
+
+    @app.post("/cache/clear")
+    async def cache_clear(request: Request, body: CacheClearRequest) -> dict[str, Any]:
+        """Delete cache entries by content hash.
+
+        Requires ``can_write``. Returns the number of deleted entries.
+        """
+        error = require_can_write(request)
+        if error is not None:
+            return error
+
+        hashes = body.hashes[:10000]  # hard cap
+        deleted = await request.app.state.backend.cache_clear_by_hashes(hashes)
+        return {"deleted": deleted, "total": len(hashes)}
 
     return app

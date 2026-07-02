@@ -92,7 +92,7 @@ def local_cache_upsert(conn: sqlite3.Connection, entries: list[dict]) -> int:
 
 
 def local_cache_clear() -> int:
-    """Delete the local cache database.  Returns 0 on success, 1 on error."""
+    """Delete the entire local cache database.  Returns 0 on success, 1 on error."""
     if _LOCAL_CACHE_PATH.exists():
         try:
             _LOCAL_CACHE_PATH.unlink()
@@ -100,6 +100,24 @@ def local_cache_clear() -> int:
         except OSError:
             return 1
     return 0
+
+
+def local_cache_clear_project(project_db_path: Path) -> int:
+    """Delete ``llm_analysis_cache`` entries from a per-project index DB.
+
+    Returns the number of entries deleted.
+    """
+    if not project_db_path.exists():
+        return 0
+    try:
+        conn = sqlite3.connect(str(project_db_path))
+        count = conn.execute("SELECT COUNT(*) FROM llm_analysis_cache").fetchone()[0]
+        conn.execute("DELETE FROM llm_analysis_cache")
+        conn.commit()
+        conn.close()
+        return count
+    except Exception:
+        return 0
 
 
 def local_cache_stats() -> dict[str, Any]:
@@ -298,5 +316,45 @@ class CacheClient:
                     time.sleep(wait)
                     continue
                 logger.warning("Cache server write failed: %s", e)
+
+        return 0
+
+    def clear_remote(self, hashes: list[str]) -> int:
+        """Delete cache entries from the remote server by content hash.
+
+        Retries on transient errors. Returns the number of entries deleted
+        (best-effort — may be 0 if the server is unreachable).
+        """
+        if not hashes:
+            return 0
+
+        total_deleted = 0
+        for chunk_start in range(0, len(hashes), self.batch_size):
+            chunk = hashes[chunk_start:chunk_start + self.batch_size]
+            total_deleted += self._clear_remote_chunk(chunk)
+        return total_deleted
+
+    def _clear_remote_chunk(self, hashes: list[str]) -> int:
+        """Internal: POST one chunk of hashes to /cache/clear, with retries."""
+        for attempt in range(_MAX_RETRIES):
+            try:
+                session = self._get_session()
+                resp = session.post("/cache/clear", json={"hashes": hashes})
+                if resp.status_code == 200:
+                    data = resp.json()
+                    return data.get("deleted", 0)
+                if resp.status_code in (401, 403):
+                    logger.warning("Cache server auth error (%d) on clear — check token", resp.status_code)
+                    return 0
+                if attempt < _MAX_RETRIES - 1:
+                    wait = _RETRY_BACKOFF ** (attempt + 1)
+                    time.sleep(wait)
+                    continue
+            except Exception as e:
+                if attempt < _MAX_RETRIES - 1:
+                    wait = _RETRY_BACKOFF ** (attempt + 1)
+                    time.sleep(wait)
+                    continue
+                logger.warning("Cache server clear failed: %s", e)
 
         return 0

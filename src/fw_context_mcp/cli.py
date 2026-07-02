@@ -987,27 +987,132 @@ def cmd_version(args: argparse.Namespace) -> int:
 
 
 def cmd_cache_stats(args: argparse.Namespace) -> int:
-    """Show local cache statistics."""
+    """Show cache statistics for one or all tiers."""
+    from .config import derive_project_id
+    from .config import load as load_config
+    from .indexer.db import open_db
     from fw_context_mcp.cache_client import local_cache_stats
-    stats = local_cache_stats()
-    print(f"Local cache: {stats['path']}")
-    print(f"  Total entries: {stats['total_entries']}")
+
+    show_all = not (args.global_cache or args.remote)
+    project_root = Path(args.project or ".").resolve() if hasattr(args, "project") else None
+
+    # Tier 1: per-project cache
+    if show_all and project_root:
+        cfg = load_config(project_root=project_root)
+        project_id = derive_project_id(project_root)
+        db_path = cfg.index.db_dir / project_id / "index.db"
+        if db_path.exists():
+            conn = open_db(db_path)
+            try:
+                count = conn.execute("SELECT COUNT(*) FROM llm_analysis_cache").fetchone()[0]
+                print(f"Project cache (Tier 1): {count} entries")
+            finally:
+                conn.close()
+        else:
+            print("Project cache (Tier 1): not indexed")
+    elif not show_all and not project_root:
+        print("Project cache (Tier 1): no project resolved")
+
+    # Tier 2: global local cache
+    if show_all or args.global_cache:
+        stats = local_cache_stats()
+        print(f"Global local cache (Tier 2): {stats['total_entries']} entries  ({stats['path']})")
+
+    # Tier 3: remote cache
+    if show_all or args.remote:
+        if project_root:
+            cfg = load_config(project_root=project_root)
+            cs = cfg.cache_server
+            if cs and cs.url:
+                token_preview = cs.token[:8] + "..." if cs.token else "n/a"
+                print(f"Remote cache (Tier 3): {cs.url} (token: {token_preview})")
+            else:
+                print("Remote cache (Tier 3): not configured (set [cache_server] in .fw-context/local.toml)")
+        else:
+            print("Remote cache (Tier 3): no project, cannot read config")
+
     return 0
 
 
 def cmd_cache_clear(args: argparse.Namespace) -> int:
-    """Delete the local LLM analysis cache."""
-    from fw_context_mcp.cache_client import local_cache_clear
+    """Delete cache entries for one or all tiers."""
+    from .config import derive_project_id
+    from .config import load as load_config
+    from .indexer.db import open_db
+    from fw_context_mcp.cache_client import local_cache_clear, local_cache_clear_project, CacheClient
+
+    project_root = Path(args.project or ".").resolve() if hasattr(args, "project") else None
+
+    # Determine which tiers to clear
+    clear_tier1 = args.all or (not args.global_cache and not args.remote)
+    clear_tier2 = args.all or args.global_cache or (not args.global_cache and not args.remote)
+    clear_tier3 = args.all or args.remote
+
     if not args.yes:
-        answer = input("Delete local cache? This is safe — it will be rebuilt on next --analyze. [y/N] ")
+        tiers = []
+        if clear_tier1:
+            tiers.append("project (Tier 1)")
+        if clear_tier2:
+            tiers.append("global local (Tier 2)")
+        if clear_tier3:
+            tiers.append("remote server (Tier 3)")
+        answer = input(f"Delete cache for: {', '.join(tiers)}? This is safe — cache will be rebuilt. [y/N] ")
         if answer.strip().lower() not in ("y", "yes"):
             print("Aborted.")
             return 1
-    result = local_cache_clear()
-    if result == 0:
-        print("Local cache deleted.")
-    else:
-        print("No local cache found.")
+
+    # Tier 1: per-project cache
+    if clear_tier1 and project_root:
+        cfg = load_config(project_root=project_root)
+        project_id = derive_project_id(project_root)
+        db_path = cfg.index.db_dir / project_id / "index.db"
+        if db_path.exists():
+            n = local_cache_clear_project(db_path)
+            print(f"Project cache (Tier 1): deleted {n} entries")
+        else:
+            print("Project cache (Tier 1): not indexed, nothing to delete")
+    elif clear_tier1:
+        print("Project cache (Tier 1): no project resolved")
+
+    # Tier 2: global local cache
+    if clear_tier2:
+        result = local_cache_clear()
+        if result == 0:
+            print("Global local cache (Tier 2): deleted")
+        else:
+            print("Global local cache (Tier 2): not found")
+
+    # Tier 3: remote cache
+    if clear_tier3 and project_root:
+        cfg = load_config(project_root=project_root)
+        cs = cfg.cache_server
+        if cs and cs.url:
+            project_id = derive_project_id(project_root)
+            db_path = cfg.index.db_dir / project_id / "index.db"
+            if db_path.exists():
+                conn = open_db(db_path)
+                try:
+                    hashes = [r[0] for r in conn.execute(
+                        "SELECT content_hash FROM llm_analysis_cache"
+                    ).fetchall()]
+                finally:
+                    conn.close()
+                if hashes:
+                    cc = CacheClient(url=cs.url, token=cs.token)
+                    try:
+                        n = cc.clear_remote(hashes)
+                        print(f"Remote cache (Tier 3): cleared {n}/{len(hashes)} entries")
+                    finally:
+                        cc.close()
+                else:
+                    print("Remote cache (Tier 3): no local entries to clear")
+            else:
+                print("Remote cache (Tier 3): not indexed, cannot determine hashes")
+        else:
+            print("Remote cache (Tier 3): not configured (set [cache_server] in .fw-context/local.toml)")
+    elif clear_tier3:
+        print("Remote cache (Tier 3): no project resolved")
+
     return 0
 
 
@@ -1089,13 +1194,20 @@ def main() -> None:
     p_analyze.set_defaults(func=cmd_analyze)
 
     # Cache management subcommands
-    p_cache = sub.add_parser("cache", help="Manage local LLM analysis cache")
+    p_cache = sub.add_parser("cache", help="Manage LLM analysis cache (local + remote)")
     p_cache_sub = p_cache.add_subparsers(dest="cache_command")
 
-    p_cache_stats = p_cache_sub.add_parser("stats", help="Show local cache statistics")
+    p_cache_stats = p_cache_sub.add_parser("stats", help="Show cache statistics")
+    p_cache_stats.add_argument("--project", metavar="DIR", help="Project root (default: cwd)")
+    p_cache_stats.add_argument("--global", dest="global_cache", action="store_true", help="Show only global local cache (Tier 2)")
+    p_cache_stats.add_argument("--remote", action="store_true", help="Show remote server cache (Tier 3)")
     p_cache_stats.set_defaults(func=cmd_cache_stats)
 
-    p_cache_clear = p_cache_sub.add_parser("clear", help="Delete local cache")
+    p_cache_clear = p_cache_sub.add_parser("clear", help="Delete cache entries")
+    p_cache_clear.add_argument("--project", metavar="DIR", help="Project root (default: cwd)")
+    p_cache_clear.add_argument("--global", dest="global_cache", action="store_true", help="Clear only global local cache (Tier 2)")
+    p_cache_clear.add_argument("--remote", action="store_true", help="Clear remote server cache for this project (Tier 3)")
+    p_cache_clear.add_argument("--all", action="store_true", help="Clear all three tiers")
     p_cache_clear.add_argument("-y", "--yes", action="store_true", help="Skip confirmation prompt")
     p_cache_clear.set_defaults(func=cmd_cache_clear)
 
