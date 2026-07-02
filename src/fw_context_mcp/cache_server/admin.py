@@ -284,7 +284,7 @@ def main() -> None:
     p_proj_sub = p_proj.add_subparsers(dest="project_command")
 
     p_create = p_proj_sub.add_parser("create", help="Create a new project")
-    p_create.add_argument("project_id", help="Project ID (e.g. firma/zbox)")
+    p_create.add_argument("project_id", help="Project ID (e.g. my-firmware)")
     p_create.add_argument("--description", help="Optional description")
     p_create.set_defaults(func=cmd_project_create)
 
