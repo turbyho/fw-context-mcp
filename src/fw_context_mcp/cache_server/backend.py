@@ -106,7 +106,7 @@ class CacheBackend:
                 CREATE TABLE IF NOT EXISTS tokens (
                     id            SERIAL PRIMARY KEY,
                     token_hash    BYTEA NOT NULL UNIQUE,
-                    project_id    TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+                    project_id    TEXT REFERENCES projects(id) ON DELETE CASCADE,
                     can_read      BOOLEAN NOT NULL DEFAULT true,
                     can_write     BOOLEAN NOT NULL DEFAULT false,
                     can_overwrite BOOLEAN NOT NULL DEFAULT false,

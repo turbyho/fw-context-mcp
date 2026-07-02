@@ -31,16 +31,28 @@ def cmd_init(args: argparse.Namespace) -> int:
     import asyncio
 
     async def _init() -> int:
+        import hashlib
+        import secrets
+
         from .backend import CacheBackend
 
         backend = CacheBackend(db_url)
         try:
             await backend.connect()
             await backend.init_schema()
-            token = await backend.create_project("default")
-            if token is None:
-                token = "project 'default' already exists — use fw-cache-admin to manage"
+            token = secrets.token_hex(32)
+            token_hash = hashlib.sha256(token.encode()).digest()
+            pool = backend._meta_pool
+            async with pool.acquire() as conn:
+                await conn.execute(
+                    "INSERT INTO tokens (token_hash, project_id, can_read, can_write, can_overwrite, description) "
+                    "VALUES ($1, NULL, true, true, true, 'admin (setup)')",
+                    token_hash,
+                )
             print("Admin token:", token)
+            print()
+            print("Use this token as FW_CACHE_ADMIN_TOKEN for fw-cache-admin commands.")
+            print("Then create projects with: fw-cache-admin project create <id>")
             return 0
         finally:
             await backend.close()
