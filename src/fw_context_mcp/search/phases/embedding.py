@@ -37,9 +37,24 @@ class EmbeddingPhase(Phase):
     Embeddings are generated during ``fw-context index`` and stored in both
     the ``embeddings`` table (BLOB, for backward compat) and the ``vec_symbols``
     vec0 virtual table (sqlite-vec, for KNN queries).
+
+    When ``independent=True`` the phase always runs a standalone KNN query via
+    ``search_similar_vec()``, ignoring any ``fts5_results`` already in the
+    context.  This is used by ``SMART_SEARCH`` for separate FTS5 + Vec
+    retrieval prior to RRF fusion.
     """
 
     name = "embedding"  #: Phase identifier used in pipeline configuration.
+
+    def __init__(
+        self,
+        independent: bool = False,
+        threshold: float = 0.5,
+        overfetch: int = 30,
+    ):
+        self.independent = independent
+        self.threshold = threshold
+        self.overfetch = overfetch
 
     def should_run(self, ctx) -> bool:
         """Only run when LLM is enabled and no Ollama warning occurred earlier."""
@@ -79,11 +94,11 @@ class EmbeddingPhase(Phase):
                 except OllamaError:
                     return ctx  # Embedding model unavailable
 
-                # ---- Hybrid re-rank path ----
+                # ---- Hybrid re-rank path (default) ----
                 # When FTS5 already produced candidates, re-rank them by
                 # vector distance.  This is both faster and produces better
                 # merged results than running an independent KNN query.
-                if ctx.fts5_results and has_vec0:
+                if ctx.fts5_results and has_vec0 and not self.independent:
                     queries = ctx.generated_queries if ctx.generated_queries else ctx.rough_queries
                     # Expand to prefix match — _expand_query skips wildcards when
                     # the query already contains OR, so we add * per-term here.
@@ -95,8 +110,8 @@ class EmbeddingPhase(Phase):
                         query_vec,
                         ctx.config_hash,
                         fts5_query=fts5_query,
-                        threshold=0.5,
-                        limit=30,
+                        threshold=self.threshold,
+                        limit=self.overfetch,
                     )
                     return ctx.evolve(embedding_results=rows)
 
@@ -106,8 +121,8 @@ class EmbeddingPhase(Phase):
                         conn,
                         query_vec,
                         ctx.config_hash,
-                        threshold=0.5,
-                        limit=30,
+                        threshold=self.threshold,
+                        limit=self.overfetch,
                     )
                     if vec_rows:
                         sym_ids = [r["symbol_id"] for r in vec_rows]
@@ -126,8 +141,8 @@ class EmbeddingPhase(Phase):
                     stored = get_embeddings(conn, ctx.config_hash, ctx.config.llm.embed_model)
                     if not stored:
                         return ctx
-                    scored = _brute_force_search(query_vec, stored, threshold=0.5)
-                    top_ids = [s[0] for s in scored[:30]]
+                    scored = _brute_force_search(query_vec, stored, threshold=self.threshold)
+                    top_ids = [s[0] for s in scored[: self.overfetch]]
                     if not top_ids:
                         return ctx
                     placeholders = ",".join("?" * len(top_ids))

@@ -77,7 +77,7 @@ context window before you got to the interesting part.
 
 ## Why LLMs Struggle With Embedded C/C++
 
-The problem isn't model capability. Claude, GPT-4, Gemini — they can all read
+The problem isn't model capability. Claude, GPT, Gemini, Deepseek — they can all read
 and understand C code. The problem is that **reading source files is the wrong
 way to understand compiled firmware**.
 

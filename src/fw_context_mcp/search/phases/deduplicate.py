@@ -14,9 +14,15 @@ if TYPE_CHECKING:
 class DeduplicatePhase(Phase):
     """Merge FTS5 and embedding results, deduplicate by (name, file_path),
     prefer definitions, and sort by score.
+
+    Only runs when ``final_results`` is still empty — i.e. ``RRFFusionPhase``
+    did not produce output (e.g. no vec0 embeddings available).
     """
 
     name = "deduplicate"  #: Phase identifier used in pipeline configuration.
+
+    def should_run(self, ctx: PipelineContext) -> bool:
+        return not ctx.final_results
 
     async def run(self, ctx: PipelineContext) -> PipelineContext:
         """Merge FTS5 and embedding results, deduplicate, score, and sort.

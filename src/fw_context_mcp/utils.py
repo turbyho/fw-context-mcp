@@ -10,7 +10,7 @@ import hashlib
 import os
 from pathlib import Path
 
-__all__ = ["MTIME_TOLERANCE_S", "abs_path", "compute_content_hash", "resolve_project_root"]
+__all__ = ["MTIME_TOLERANCE_S", "abs_path", "compute_content_hash", "read_file_lines", "resolve_project_root"]
 
 # Seconds of tolerance when comparing file mtimes to account for
 # clock skew between the indexer and the filesystem.
@@ -49,6 +49,28 @@ def abs_path(root: Path, path: str) -> str:
     if p.is_absolute():
         return str(p)
     return str(root / p)
+
+
+def read_file_lines(abs_path: str) -> list[str] | None:
+    """Read all lines from a source file, detecting the encoding.
+
+    Tries a sequence of common encodings for embedded C/C++ projects
+    (UTF-8 first, then regional code pages, then repair mode as last
+    resort).  Returns ``None`` when the file cannot be read at all.
+    """
+    encodings = ["utf-8", "cp1252", "latin1"]
+    for encoding in encodings:
+        try:
+            with open(abs_path, encoding=encoding) as f:
+                return f.readlines()
+        except (UnicodeDecodeError, UnicodeError):
+            continue
+    # Last resort — replace invalid bytes
+    try:
+        with open(abs_path, encoding="utf-8", errors="replace") as f:
+            return f.readlines()
+    except (FileNotFoundError, OSError):
+        return None
 
 
 def compute_content_hash(body: str, qualified_name: str, signature: str, docstring: str) -> str:

@@ -118,11 +118,17 @@ def split_tokens(name: str, qualified_name: str = "") -> str:
         ZBLE::onConnectionComplete → "zble on connection complete"
         _last_ble_connected        → "last ble connected"
     """
+    # Noise words that pollute FTS5 — strip before tokenizing
+    _NOISE_WORDS = frozenset(("at", "unnamed"))
+
     def _tokenize(s: str) -> list[str]:
+        # Strip anonymous struct/enum/union markers — these inject noise tokens
+        # like "mbed", "include", "enum" that match thousands of irrelevant symbols.
+        s = re.sub(r"\(unnamed\s+(struct|enum|union)\s+at\s+[^)]+\)", "", s)
         s = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", s)      # camelCase split
         s = re.sub(r"([A-Z]+)([A-Z][a-z])", r"\1 \2", s)   # HTTPResponse → HTTP Response
         parts = re.split(r"[^a-zA-Z0-9]+", s)               # split on non-alnum
-        return [p.lower() for p in parts if len(p) > 1]
+        return [p.lower() for p in parts if len(p) > 1 and p.lower() not in _NOISE_WORDS]
 
     tokens: list[str] = []
     seen: set[str] = set()
@@ -133,6 +139,31 @@ def split_tokens(name: str, qualified_name: str = "") -> str:
                     seen.add(tok)
                     tokens.append(tok)
     return " ".join(tokens)
+
+
+def _backfill_is_project(conn: sqlite3.Connection, db_path: Path) -> None:
+    """Backfill ``symbols.is_project`` for existing indexes.
+
+    Detects project source directories from the project-root directory
+    structure and marks symbols whose ``file_path`` falls underneath.
+
+    This is a best-effort migration — any missed symbols are corrected
+    on the next ``fw-context index`` run which sets is_project during
+    normal indexing.
+    """
+    project_root = db_path.parent.parent
+    _COMMON_SRC = ["src", "lib", "app", "drivers", "include", "modules"]
+    patterns: list[str] = []
+    params: list[str] = []
+    for name in _COMMON_SRC:
+        if (project_root / name).is_dir():
+            patterns.append("file_path LIKE ?")
+            params.append(f"{name}/%")
+    if not patterns:
+        return
+    clause = " OR ".join(patterns)
+    conn.execute(f"UPDATE symbols SET is_project = 1 WHERE {clause}", params)
+
 
 def _parse_expected_columns(schema_sql: str, migration_statements: list[str]) -> dict[str, set[str]]:
     """Extract expected table→columns from CREATE TABLE and ALTER TABLE statements.
@@ -230,6 +261,8 @@ _MIGRATION_ADD_COLUMNS = [
     "ALTER TABLE symbols ADD COLUMN parent_usr TEXT NOT NULL DEFAULT ''",
     "ALTER TABLE symbols ADD COLUMN is_template INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE symbols ADD COLUMN template_usr TEXT NOT NULL DEFAULT ''",
+    "ALTER TABLE symbols ADD COLUMN is_project INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE symbols ADD COLUMN pagerank REAL NOT NULL DEFAULT 0.0",
 ]
 
 _SCHEMA = """
@@ -277,6 +310,7 @@ CREATE TABLE IF NOT EXISTS symbols (
     parent_usr     TEXT    NOT NULL DEFAULT '',
     is_template    INTEGER NOT NULL DEFAULT 0,
     template_usr   TEXT    NOT NULL DEFAULT '',
+    pagerank       REAL    NOT NULL DEFAULT 0.0,
     UNIQUE(config_hash, usr)
 );
 
@@ -286,6 +320,7 @@ CREATE INDEX IF NOT EXISTS idx_symbols_kind        ON symbols(kind);
 CREATE INDEX IF NOT EXISTS idx_symbols_file        ON symbols(file_id);
 CREATE INDEX IF NOT EXISTS idx_symbols_parent     ON symbols(config_hash, parent_usr);
 CREATE INDEX IF NOT EXISTS idx_symbols_template  ON symbols(config_hash, template_usr);
+CREATE INDEX IF NOT EXISTS idx_symbols_filepath  ON symbols(config_hash, file_path);
 CREATE INDEX IF NOT EXISTS idx_files_config        ON files(config_hash);
 
 CREATE VIRTUAL TABLE IF NOT EXISTS symbols_fts USING fts5(
@@ -454,6 +489,16 @@ CREATE TABLE IF NOT EXISTS overrides (
 );
 CREATE INDEX IF NOT EXISTS idx_overrides_derived ON overrides(config_hash, derived_usr);
 CREATE INDEX IF NOT EXISTS idx_overrides_base    ON overrides(config_hash, base_usr);
+
+-- Pre-computed hotspot cache — caller counts for instant find_hotspots queries.
+CREATE TABLE IF NOT EXISTS hotspot_cache (
+    id           INTEGER PRIMARY KEY,
+    config_hash  TEXT    NOT NULL REFERENCES build_configs(config_hash),
+    symbol_id    INTEGER NOT NULL REFERENCES symbols(id) ON DELETE CASCADE,
+    caller_count INTEGER NOT NULL DEFAULT 0,
+    UNIQUE(config_hash, symbol_id)
+);
+CREATE INDEX IF NOT EXISTS idx_hotspot_cache_config ON hotspot_cache(config_hash);
 """
 
 CURRENT_SCHEMA_VERSION = _derive_schema_version(_SCHEMA, _MIGRATION_ADD_COLUMNS)
@@ -567,6 +612,11 @@ def open_db(path: Path, *, skip_integrity_check: bool = False) -> sqlite3.Connec
         conn.close()
         raise DatabaseCorruptionError(str(path), str(e)) from e
 
+    # Performance pragmas — read-heavy workload, WAL mode safe
+    conn.execute("PRAGMA cache_size = -64000")       # 64 MB page cache
+    conn.execute("PRAGMA mmap_size = 268435456")     # 256 MB memory-mapped I/O
+    conn.execute("PRAGMA synchronous = 1")           # NORMAL — safe with WAL
+
     # Load sqlite-vec extension for vector search (graceful when missing)
     try:
         conn.enable_load_extension(True)
@@ -601,6 +651,15 @@ def open_db(path: Path, *, skip_integrity_check: bool = False) -> sqlite3.Connec
                     # Only skip "duplicate column" — re-raise disk-full etc.
                     if "duplicate column" not in str(e):
                         raise
+
+            # Migration: is_project backfill — column added by
+            # _MIGRATION_ADD_COLUMNS loop.  Backfill for existing indexes
+            # where all rows were inserted with DEFAULT 0.
+            if conn.execute(
+                "SELECT COUNT(*) FROM symbols WHERE is_project = 0"
+            ).fetchone()[0] > 0:
+                _backfill_is_project(conn, path)
+                conn.commit()
 
             # Migration: file_path backfill — column added by
             # _MIGRATION_ADD_COLUMNS loop.  Backfill empties left over from
@@ -738,6 +797,9 @@ def open_db(path: Path, *, skip_integrity_check: bool = False) -> sqlite3.Connec
                 conn.execute("PRAGMA busy_timeout = 10000")
                 conn.execute("PRAGMA foreign_keys = ON")
                 conn.execute("PRAGMA journal_mode = WAL")
+                conn.execute("PRAGMA cache_size = -64000")
+                conn.execute("PRAGMA mmap_size = 268435456")
+                conn.execute("PRAGMA synchronous = 1")
                 conn.executescript(_SCHEMA)
                 for stmt in _MIGRATION_ADD_COLUMNS:
                     try:
@@ -850,6 +912,15 @@ def open_db(path: Path, *, skip_integrity_check: bool = False) -> sqlite3.Connec
     );
     CREATE INDEX IF NOT EXISTS idx_overrides_derived ON overrides(config_hash, derived_usr);
     CREATE INDEX IF NOT EXISTS idx_overrides_base    ON overrides(config_hash, base_usr);
+
+    CREATE TABLE IF NOT EXISTS hotspot_cache (
+        id           INTEGER PRIMARY KEY,
+        config_hash  TEXT    NOT NULL REFERENCES build_configs(config_hash),
+        symbol_id    INTEGER NOT NULL REFERENCES symbols(id) ON DELETE CASCADE,
+        caller_count INTEGER NOT NULL DEFAULT 0,
+        UNIQUE(config_hash, symbol_id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_hotspot_cache_config ON hotspot_cache(config_hash);
     """
     conn.executescript(_CRITICAL_TABLES)
 
@@ -1102,7 +1173,7 @@ def insert_symbols_batch(
     Each row: (config_hash, file_id, file_path, name_tokens, usr, name,
                qualified_name, kind, line, col, end_line, is_definition,
                signature, docstring, enum_value, is_virtual, is_pure_virtual,
-               parent_usr, is_template, template_usr)
+               parent_usr, is_template, template_usr, is_project, pagerank)
 
     Returns count of rows inserted or upgraded to definition.
     """
@@ -1110,8 +1181,8 @@ def insert_symbols_batch(
         """INSERT INTO symbols
            (config_hash, file_id, file_path, name_tokens, usr, name, qualified_name, kind,
             line, col, end_line, is_definition, signature, docstring, enum_value,
-            is_virtual, is_pure_virtual, parent_usr, is_template, template_usr)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            is_virtual, is_pure_virtual, parent_usr, is_template, template_usr, is_project, pagerank)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
            ON CONFLICT(config_hash, usr) DO UPDATE SET
                file_id       = excluded.file_id,
                file_path     = excluded.file_path,
@@ -1127,7 +1198,9 @@ def insert_symbols_batch(
                is_pure_virtual = excluded.is_pure_virtual,
                parent_usr    = excluded.parent_usr,
                is_template   = excluded.is_template,
-               template_usr  = excluded.template_usr
+               template_usr  = excluded.template_usr,
+               is_project    = excluded.is_project,
+               pagerank      = excluded.pagerank
            WHERE excluded.is_definition = 1 AND symbols.is_definition = 0""",
         rows,
     )
@@ -2252,17 +2325,49 @@ def find_hotspots(
     plain references and member-access expressions are excluded so enum
     constants and fields don't appear as "hot" call targets.
 
+    When ``hotspot_cache`` is populated for this config, returns instantly
+    from the pre-computed cache.  Falls back to a live COUNT+GROUP BY
+    query when the cache is missing or stale.
+
     When *exclude_paths* is given, symbols whose ``file_path`` matches any
     of the LIKE patterns are excluded.
     """
+    # Try cache first
+    cached = conn.execute(
+        "SELECT COUNT(*) FROM hotspot_cache WHERE config_hash = ?", (config_hash,)
+    ).fetchone()
+    if cached and cached[0] > 0:
+        path_clauses = ""
+        params: list = [config_hash]
+        if exclude_paths:
+            path_clauses = "AND " + " AND ".join(
+                "s.file_path NOT LIKE ?" for _ in exclude_paths
+            )
+            params.extend(exclude_paths)
+        params.append(limit)
+        rows = conn.execute(
+            f"""SELECT s.name, s.qualified_name, s.kind, s.file_path,
+                      s.signature, s.line,
+                      h.caller_count
+               FROM hotspot_cache h
+               JOIN symbols s ON s.id = h.symbol_id AND s.config_hash = h.config_hash
+               WHERE h.config_hash = ?
+                 {path_clauses}
+               ORDER BY h.caller_count DESC
+               LIMIT ?""",
+            params,
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    # Live query fallback
     path_clauses = ""
-    params: list = [config_hash]
+    p: list = [config_hash]
     if exclude_paths:
         path_clauses = "AND " + " AND ".join(
             "s.file_path NOT LIKE ?" for _ in exclude_paths
         )
-        params.extend(exclude_paths)
-    params.append(limit)
+        p.extend(exclude_paths)
+    p.append(limit)
 
     rows = conn.execute(
         f"""SELECT s.name, s.qualified_name, s.kind, s.file_path,
@@ -2277,7 +2382,7 @@ def find_hotspots(
            GROUP BY s.usr
            ORDER BY caller_count DESC
            LIMIT ?""",
-        params,
+        p,
     ).fetchall()
 
     return [dict(r) for r in rows]
@@ -2465,7 +2570,7 @@ def search_symbols(
            FROM symbols_fts
            JOIN symbols s ON s.id = symbols_fts.rowid
            WHERE symbols_fts MATCH ? AND s.config_hash = ? {kind_filter}
-           ORDER BY rank
+            ORDER BY bm25(symbols_fts, 1.2, 0.75, 10.0, 1.0, 3.0, 2.0, 1.0, 5.0, 1.0, 1.0, 1.0)
            LIMIT ?""",
         params,
     ).fetchall()

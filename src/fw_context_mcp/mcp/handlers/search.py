@@ -356,8 +356,9 @@ async def smart_search(
     """Natural-language search: Ollama generates FTS5 keywords, then searches the index.
 
     Read-only. No side effects. Slow (10-30 s) — delegates to the full
-    ``SMART_SEARCH`` pipeline (8 phases: translate → rough_search → llm_query →
-    fts5_search → refine → embedding → deduplicate → format).
+    ``SMART_SEARCH`` pipeline (translate → rough_search → llm_query →
+    fts5_search → refine → embedding → rrf_fusion → deduplicate →
+    expand_context → format).
 
     Multi-phase approach:
     1) Translate non-English queries
@@ -386,16 +387,16 @@ async def smart_search(
         _translated_from) followed by symbol results with name, qualified_name,
         kind, file, line, is_definition, signature, docstring.
     """
-    from fw_context_mcp.search import SMART_SEARCH
     from fw_context_mcp.search.context import PipelineContext
-    from fw_context_mcp.search.pipeline import PipelineRunner
+    from fw_context_mcp.search.pipeline import PipelineRunner, _build_smart_search
 
     try:
         ctx = PipelineContext.create(query=query, project_root=project_root, limit=limit)
     except ValueError as e:
         return [{"error": str(e)}]
 
-    runner = PipelineRunner(SMART_SEARCH)
+    config = _build_smart_search()
+    runner = PipelineRunner(config)
     ctx = await runner.run(ctx)
 
     # Add staleness warning if applicable
