@@ -51,15 +51,18 @@ num_ctx = 16384
 # timeout = 600.0   # HTTP timeout for Ollama requests in seconds (default 600)
 # debug_log = "~/.fw-context/llm-debug.jsonl"   # write LLM prompts/responses to JSONL
 
-# Embedding model for semantic_search.  Must be pulled first:  ollama pull <model>
+# Embedding model for semantic_search.
+# Pull with:  ollama pull <model>
+# Uncomment exactly ONE of the sections below.
 #
-# Recommended models:
-#   mxbai-embed-large:latest  (~670 MB VRAM, fast, no GPU needed)   — default
-#   qwen3-embedding:8b        (~4.7 GB VRAM, best quality, GPU recommended)
+# ── Default: mxbai-embed-large (~670 MB VRAM, no GPU needed) ──
 # embed_model = "mxbai-embed-large:latest"
-#
-# Instruction prompts (auto-detected from model, override only if needed):
 # embed_query_prompt = "Represent this sentence for searching relevant passages: "
+# embed_doc_prompt = ""
+#
+# ── Higher quality: qwen3-embedding:8b (~4.7 GB VRAM, GPU recommended) ──
+# embed_model = "qwen3-embedding:8b"
+# embed_query_prompt = "Retrieve C/C++ functions, types, symbols, and implementation code relevant to the query."
 # embed_doc_prompt = ""
 
 analyze_symbols = true
@@ -133,9 +136,18 @@ _PROJECT_LOCAL_DEFAULTS_TEMPLATE = """\
 # keep_alive = "10m"   # how long to keep model loaded in VRAM after each request
 # timeout = 600.0   # HTTP timeout for Ollama requests in seconds (default 600)
 # debug_log = "~/.fw-context/llm-debug.jsonl"   # write LLM prompts/responses to JSONL
-# embed_model = "mxbai-embed-large:latest"   # embedding model for semantic search (~670 MB VRAM)
-# For better quality with a GPU:  embed_model = "qwen3-embedding:8b"  (~4.7 GB VRAM)
+# Embedding model for semantic_search.
+# Pull with:  ollama pull <model>
+# Uncomment exactly ONE of the sections below.
+#
+# ── Default: mxbai-embed-large (~670 MB VRAM, no GPU needed) ──
+# embed_model = "mxbai-embed-large:latest"
 # embed_query_prompt = "Represent this sentence for searching relevant passages: "
+# embed_doc_prompt = ""
+#
+# ── Higher quality: qwen3-embedding:8b (~4.7 GB VRAM, GPU recommended) ──
+# embed_model = "qwen3-embedding:8b"
+# embed_query_prompt = "Retrieve C/C++ functions, types, symbols, and implementation code relevant to the query."
 # embed_doc_prompt = ""
 # analyze_symbols = true    # generate structured symbol descriptions (summary, inputs, outputs) — enabled by default
 # analyze_vendor = false    # when true, also analyze vendor/SDK code (mbed-os, Zephyr, etc.) — can add hours
