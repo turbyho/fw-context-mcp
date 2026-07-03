@@ -290,6 +290,11 @@ def _build_embeddings(conn, config_hash: str, llm_config, db_dir: Path) -> None:
         if embedding_dim is None and embs:
             embedding_dim = len(embs[0])
             log.info("Embedding dimension detected: %d (model=%s)", embedding_dim, model)
+            from .db import init_vec_table
+            try:
+                init_vec_table(conn, embedding_dim)
+            except Exception as e:
+                log.warning("vec0 table recreation failed (non-fatal): %s", e)
 
         # Store in legacy BLOB table (backward compatibility)
         with write_lock(db_dir, timeout=5.0):
@@ -312,11 +317,6 @@ def _build_embeddings(conn, config_hash: str, llm_config, db_dir: Path) -> None:
             "UPDATE build_configs SET embedding_dim = ? WHERE config_hash = ?",
             (embedding_dim, config_hash),
         )
-        from .db import init_vec_table
-        try:
-            init_vec_table(conn, embedding_dim)
-        except Exception as e:
-            log.warning("vec0 table recreation failed (non-fatal): %s", e)
 
 # SDK path patterns for filtering (mbed-os, Zephyr, PlatformIO, build dirs)
 _SDK_PATH_PATTERNS = ("mbed-os/", ".pio/", "zephyr/", "build/", "modules/")
