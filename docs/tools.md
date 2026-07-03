@@ -11,6 +11,9 @@ Build or update the symbol index from `compile_commands.json`.
 > **Incremental by default.**  An existing `compile_commands.json` is reused
 > — only changed files are re-parsed.  Use `--build` to force a clean build
 > and full re-index when needed (e.g. after SDK update or build system changes).
+> Use `--force` to bypass mtime checks and force re-index of all files,
+> embeddings, LLM analysis, overrides, and caches without rebuilding
+> (e.g. after schema changes or tool updates).
 
 ```bash
 # Incremental (default) — reuse existing compile_commands.json, fast:
@@ -18,6 +21,10 @@ fw-context index
 
 # Force clean build + full re-index:
 fw-context index --build
+
+# Force full re-index of all files, embeddings, analysis, and caches
+# (skips mtime checks — use after schema changes or tool updates):
+fw-context index --force
 
 # Explicit path, verbose
 fw-context index compile_commands.json -v
@@ -47,6 +54,7 @@ fw-context index --source-roots src lib drivers
 | `--no-embeddings` | off | Skip embedding generation |
 | `--no-analyze` | off | Skip LLM symbol analysis |
 | `--analyze` | on | Force LLM symbol analysis (negates --no-analyze) |
+| `--force` | off | Force re-index of all files, embeddings, LLM analysis, overrides, PageRank, and hotspot cache (bypasses mtime checks) |
 | `-v` | off | Verbose progress output |
 
 **Generating `compile_commands.json`:**

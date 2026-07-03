@@ -976,7 +976,7 @@ def _build_hotspot_cache(conn, config_hash: str) -> None:
     log.info("Hotspot cache stored: %d entries", cnt)
 
 
-def _process_unit(unit, config_hash, project_root, source_roots, exclude_paths, index_refs, db_path, existing_files, lock=None, conn=None):
+def _process_unit(unit, config_hash, project_root, source_roots, exclude_paths, index_refs, db_path, existing_files, lock=None, conn=None, force=False):
     """Process one translation unit: check staleness, parse, store.
 
     Opens its own DB connection when *conn* is ``None``, otherwise reuses
@@ -1016,7 +1016,7 @@ def _process_unit(unit, config_hash, project_root, source_roots, exclude_paths, 
         return ("unchanged", 0, 0, (0.0, 0.0, 0.0))
 
     file_path = str(unit.file)
-    force_refs = os.environ.get("FW_CONTEXT_FORCE_REFINDEX") == "1"
+    force_refs = force or os.environ.get("FW_CONTEXT_FORCE_REFINDEX") == "1"
     if not force_refs and file_path in existing_files:
         _, stored_mtime = existing_files[file_path]
         try:
@@ -1103,6 +1103,7 @@ def run(
     llm_config=None,
     cache_server_config=None,
     parallel: bool = True,
+    force: bool = False,
 ) -> str:
     """Index a project: parse translation units, extract symbols, and store to SQLite.
 
@@ -1256,6 +1257,7 @@ def run(
             status, syms, refs, timing = _process_unit(
                 unit, config_hash, project_root,
                 source_roots, exclude_paths, index_refs, db_path, existing_files,
+                force=force,
             )
             processed = i + 1
             if status == "updated":
@@ -1308,6 +1310,13 @@ def run(
 
     # Embedding generation (opt-in)
     if index_embeddings and llm_config is not None and llm_config.enabled:
+        if force:
+            conn.execute("DELETE FROM embeddings WHERE symbol_id IN (SELECT id FROM symbols WHERE config_hash = ?)", (config_hash,))
+            try:
+                conn.execute("DELETE FROM embeddings_vec WHERE symbol_id IN (SELECT id FROM symbols WHERE config_hash = ?)", (config_hash,))
+            except Exception:
+                pass  # sqlite-vec table may not exist for legacy indexes
+            conn.commit()
         log.info("Generating embeddings...")
         _build_embeddings(conn, config_hash, llm_config, db_path.parent)
         conn.commit()
@@ -1328,6 +1337,9 @@ def run(
             except Exception as e:
                 log.warning("Failed to create CacheClient: %s", e)
 
+        if force:
+            conn.execute("DELETE FROM llm_analysis WHERE symbol_id IN (SELECT id FROM symbols WHERE config_hash = ?)", (config_hash,))
+            conn.commit()
         log.info("Generating LLM analysis for project symbols...")
         _build_llm_analysis(conn, config_hash, llm_config, db_path.parent,
                            exclude_like=exclude_like, cache_client=cc)
@@ -1337,12 +1349,19 @@ def run(
 
     # Method override tracking (post-processing, no LLM needed)
     if analyze_overrides:
+        if force:
+            conn.execute("DELETE FROM overrides WHERE config_hash = ?", (config_hash,))
+            conn.commit()
         log.info("Building method override graph...")
         _build_overrides(conn, config_hash, db_path.parent)
         conn.commit()
 
     # PageRank computation (post-processing, requires reference index)
     if index_refs:
+        if force:
+            conn.execute("UPDATE symbols SET pagerank = 0.0 WHERE config_hash = ?", (config_hash,))
+            conn.execute("DELETE FROM hotspot_cache WHERE config_hash = ?", (config_hash,))
+            conn.commit()
         log.info("Computing PageRank on call graph...")
         _build_pagerank(conn, config_hash)
         conn.commit()

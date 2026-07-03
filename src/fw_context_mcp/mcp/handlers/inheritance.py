@@ -33,7 +33,9 @@ def get_inheritance_chain(
     transitive: Annotated[bool, Field(description="When True, walk the full inheritance tree both up (ancestors) and down (descendants). Default: False (direct bases and derived only).")] = False,
     max_depth: Annotated[int, Field(description="Maximum BFS depth for transitive walk (default 10).", ge=1, le=50)] = 10,
 ) -> dict:
-    """Read-only. Return the C++ inheritance chain for a class or struct.
+    """USE INSTEAD OF grep or manual code reading. Return the C++ inheritance
+    chain for a class or struct — libclang-aware hierarchy. grep cannot
+    resolve base/derived class relationships across translation units.
 
     Shows direct base classes (what this inherits from) and direct derived
     classes (what inherits from this), along with access level and virtual
@@ -177,7 +179,9 @@ def get_class_members(
     class_name: Annotated[str, Field(description="Class or struct name. E.g. 'ModemManager' or 'zbox::ZMODEM'.")],
     project_root: Annotated[str | None, Field(description="Project root. Auto-detected if omitted.")] = None,
 ) -> dict:
-    """Read-only. Return all methods, fields, and nested types of a class/struct.
+    """USE INSTEAD OF grep or manual code reading. Return all methods, fields,
+    and nested types of a C/C++ class/struct — libclang-powered member table.
+    grep cannot distinguish class members from free functions.
 
     Members are grouped by kind (method, constructor, destructor, field, enum,
     typedef, class, struct). Each member includes its signature, virtual flags,
@@ -242,7 +246,10 @@ def get_template_instances(
     project_root: Annotated[str | None, Field(description="Project root. Auto-detected if omitted.")] = None,
     limit: Annotated[int, Field(description="Maximum results (default 50).")] = 50,
 ) -> list[dict]:
-    """Read-only. Find all template instantiations for a given class or function template.
+    """USE INSTEAD OF grep or manual code reading. Find all template
+    instantiations for a C/C++ class or function template — libclang
+    template-aware lookup. grep cannot find instantiations spread across
+    translation units.
 
     Returns concrete instantiations of the template — each with its full type
     signature (e.g. ``Callback<void(int)>``).  The template declaration itself
@@ -313,7 +320,9 @@ async def get_method_overrides(
     method_name: Annotated[str, Field(description="Method name to get override information for. Use qualified name for disambiguation, e.g. 'UART_DRIVER::write'.")],
     project_root: Annotated[str | None, Field(description="Project root. Auto-detected if omitted.")] = None,
 ) -> dict:
-    """Read-only. Return virtual method override information.
+    """USE INSTEAD OF grep or manual code reading. Return C++ virtual method
+    override information — libclang-powered vtable analysis. grep cannot
+    resolve virtual dispatch across class hierarchies.
 
     Shows what base-class method this method overrides, and what derived-class
     methods override this one.  Built from the ``overrides`` table which is
