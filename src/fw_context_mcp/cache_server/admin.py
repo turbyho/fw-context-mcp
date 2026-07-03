@@ -29,15 +29,6 @@ def _check_env() -> tuple[str, str]:
     return db_url, admin_token
 
 
-async def _verify_admin(backend, admin_token: str) -> bool:
-    from .backend import CacheBackend
-
-    b: CacheBackend = backend  # type: ignore[assignment]
-    perms = await b.validate_token(admin_token)
-    if perms is None or not perms.get("can_overwrite", False):
-        print("Error: admin token is invalid or lacks can_overwrite permission", file=sys.stderr)
-        return False
-    return True
 
 
 def admin_command(fn: Callable[[Any, argparse.Namespace], Any]) -> Callable[[argparse.Namespace], int]:
@@ -45,7 +36,8 @@ def admin_command(fn: Callable[[Any, argparse.Namespace], Any]) -> Callable[[arg
 
     Handles the repeated boilerplate: DB connection, admin auth, and
     ``asyncio.run``.  The decorated function receives ``(backend, args)``
-    and returns an exit code.
+    and returns an exit code.  Also attaches ``admin_project_id`` to args
+    so command handlers know which project the admin token is scoped to.
     """
 
     @functools.wraps(fn)
@@ -58,8 +50,11 @@ def admin_command(fn: Callable[[Any, argparse.Namespace], Any]) -> Callable[[arg
             backend = CacheBackend(db_url)
             try:
                 await backend.connect()
-                if not await _verify_admin(backend, admin_token):
+                perms = await backend.validate_token(admin_token)
+                if perms is None or not perms.get("can_overwrite", False):
+                    print("Error: admin token is invalid or lacks can_overwrite permission", file=sys.stderr)
                     return 1
+                args._admin_project_id = perms.get("project_id")
                 return await fn(backend, args)
             finally:
                 await backend.close()
@@ -82,14 +77,19 @@ async def cmd_project_create(backend, args: argparse.Namespace) -> int:
 
 @admin_command
 async def cmd_project_remove(backend, args: argparse.Namespace) -> int:
+    admin_proj = getattr(args, "_admin_project_id", None)
+    if admin_proj == args.project_id:
+        print(f"Error: cannot remove project '{args.project_id}' — your admin token is scoped to it", file=sys.stderr)
+        return 1
     if not args.confirm:
-        print(f"Dry-run: would delete project '{args.project_id}' (cache stays intact)")
+        print(f"Dry-run: would delete project '{args.project_id}' (all tokens cascade-deleted, cache stays intact)")
+        print("  Add --confirm to execute.")
         return 0
     ok = await backend.remove_project(args.project_id)
     if not ok:
         print(f"Error: project '{args.project_id}' not found", file=sys.stderr)
         return 1
-    print(f"Project '{args.project_id}' removed")
+    print(f"Project '{args.project_id}' removed (tokens deleted, cache preserved)")
     return 0
 
 
