@@ -117,6 +117,8 @@ class CacheBackend:
                 """
             )
             await meta.execute("CREATE INDEX IF NOT EXISTS idx_tokens_project ON tokens(project_id)")
+            # Ensure project_id is nullable (admin tokens use NULL)
+            await meta.execute("ALTER TABLE tokens ALTER COLUMN project_id DROP NOT NULL")
         finally:
             await self._meta_pool.release(meta)  # type: ignore[union-attr]
 
@@ -304,8 +306,9 @@ class CacheBackend:
                 "UPDATE tokens SET revoked_at = now() WHERE token_hash = $1 AND revoked_at IS NULL",
                 token_hash,
             )
+            # UPDATE returns "UPDATE N" (2 elements, unlike INSERT's 3)
             tag = result.split()
-            return len(tag) >= 3 and int(tag[2]) > 0
+            return len(tag) >= 2 and int(tag[1]) > 0
 
     async def list_projects(self) -> list[dict[str, Any]]:
         """List all projects."""
@@ -331,8 +334,9 @@ class CacheBackend:
         """Delete a project and its tokens. Cache entries are NOT deleted."""
         async with self._meta_pool.acquire() as conn:  # type: ignore[union-attr]
             result = await conn.execute("DELETE FROM projects WHERE id = $1", project_id)
+            # DELETE returns "DELETE N" (2 elements, unlike INSERT's 3)
             tag = result.split()
-            return len(tag) >= 3 and int(tag[2]) > 0
+            return len(tag) >= 2 and int(tag[1]) > 0
 
     async def cache_stats(self) -> dict[str, Any]:
         """Return cache statistics."""
@@ -370,8 +374,9 @@ class CacheBackend:
                 "DELETE FROM llm_analysis_cache WHERE analyzed_at < now() - make_interval(days => $1)",
                 days,
             )
+            # DELETE returns "DELETE N" (2 elements)
             tag = result.split()
-            return int(tag[2]) if len(tag) >= 3 else 0
+            return int(tag[1]) if len(tag) >= 2 else 0
 
     async def create_admin_token(self) -> str:
         """Create an admin token not scoped to any project (``project_id IS NULL``).
