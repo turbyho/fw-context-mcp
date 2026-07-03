@@ -254,6 +254,7 @@ class Symbol:
     parent_usr: str = ""    # USR of enclosing class/struct (empty for free functions)
     is_template: bool = False  # True for CLASS_TEMPLATE, FUNCTION_TEMPLATE declarations
     template_usr: str = ""   # USR of the primary template (non-empty = this is an instantiation)
+    source: str = ""        # function/method body text (from libclang extent, only for is_definition=True)
 
 
 def _cursor_kind_label(kind: cx.CursorKind) -> str:

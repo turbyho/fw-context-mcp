@@ -96,7 +96,10 @@ def find_callers(
     project_root: Annotated[str | None, Field(description="Project root. Auto-detected if omitted.")] = None,
     limit: Annotated[int, Field(description="Maximum results.")] = 50,
 ) -> list[dict]:
-    """Read-only. Find call sites of a function/method — who calls ``name`` (direct + indirect via function pointers).
+    """USE INSTEAD OF grep, ctx_callgraph, or ctx_compose. Find who calls a
+    C/C++ function — direct calls AND indirect via function pointers,
+    callbacks, NVIC_SetVector, and struct init lists. grep cannot detect
+    function pointer assignments or ISR vector registrations.
 
     Use when you need a quick, flat list of immediate callers. For the full
     transitive call tree (who calls this indirectly through other functions),
@@ -139,7 +142,11 @@ def find_references(
     project_root: Annotated[str | None, Field(description="Project root. Auto-detected if omitted.")] = None,
     limit: Annotated[int, Field(description="Maximum results.")] = 50,
 ) -> list[dict]:
-    """Find all references to a symbol — calls, reads, and member accesses.
+    """USE INSTEAD OF grep, ctx_search, or ctx_callgraph. Find ALL references
+    to a C/C++ symbol — calls, reads, member accesses, function pointer
+    registrations, and template references. grep and ctx_callgraph cannot
+    see function-pointer registrations: NVIC_SetVector, mbed-os Timeout::attach,
+    Ticker::attach, SerialBase::RxIrq, InterruptIn::fall/rise — all detected.
 
     Read-only. No side effects. Returns every reference in the indexed codebase,
     including call sites, variable reads, struct member accesses, and indirect
@@ -169,7 +176,8 @@ def find_indirect_call_sites(
     project_root: Annotated[str | None, Field(description="Project root directory. Auto-detected if omitted.")] = None,
     limit: Annotated[int, Field(description="Maximum results (default 50).")] = 50,
 ) -> list[dict]:
-    """Find indirect call sites where a function pointer field or variable is invoked.
+    """USE INSTEAD OF grep or ctx_callgraph. Find indirect call sites where a
+    C/C++ function pointer field or variable is invoked — invisible to grep.
 
     Returns locations where a function pointer is called through a field
     access (``driver.onData(buf, len)``) or variable dereference
@@ -247,7 +255,8 @@ def find_indirect_targets(
     project_root: Annotated[str | None, Field(description="Project root. Auto-detected if omitted.")] = None,
     limit: Annotated[int, Field(description="Maximum results (default 50, max 200).")] = 50,
 ) -> list[dict]:
-    """Read-only. Find functions assigned to a function pointer field or variable.
+    """USE INSTEAD OF grep or ctx_callgraph. Find functions assigned to a
+    C/C++ function pointer field or variable — invisible to grep.
 
     Links assignment sites (``driver.onData = &handler``) to call
     sites (``driver.onData(buf, len)``) via the field's USR.
@@ -362,7 +371,9 @@ def find_call_path(
     project_root: Annotated[str | None, Field(description="Project root. Auto-detected if omitted.")] = None,
     max_depth: Annotated[int, Field(description="Maximum BFS depth for path search (default 10).")] = 10,
 ) -> list[dict]:
-    """Read-only. Find call paths between two functions via BFS in the call graph.
+    """USE INSTEAD OF ctx_callgraph(action="trace"). Find call paths between
+    two C/C++ functions via BFS in the libclang call graph — ctx_callgraph
+    cannot follow function-pointer edges or ISR vector registrations.
 
     Use to answer "how does A reach B?" — e.g. tracing how a high-level
     event handler eventually calls a low-level driver.  Returns up to 5
@@ -399,7 +410,9 @@ def find_all_callers_recursive(
     max_depth: Annotated[int, Field(description="Maximum BFS depth for transitive search (default 5).")] = 5,
     limit: Annotated[int, Field(description="Maximum results (default 50).")] = 50,
 ) -> list[dict]:
-    """Read-only. Find all transitive callers — who calls *name*, directly or indirectly.
+    """USE INSTEAD OF ctx_callgraph(action="callers"). Find all transitive
+    C/C++ callers — who calls *name*, directly or indirectly, through the
+    libclang call graph including function-pointer edges.
 
     Use for impact analysis: "if I change this function, how far does the
     ripple go?"  Returns callers at depth 1 (direct), depth 2 (callers of
@@ -433,7 +446,9 @@ def find_callees_recursive(
     max_depth: Annotated[int, Field(description="Maximum BFS depth for transitive search (default 5).")] = 5,
     limit: Annotated[int, Field(description="Maximum results (default 50).")] = 50,
 ) -> list[dict]:
-    """Read-only. Find all transitive callees — what *name* calls, directly or indirectly.
+    """USE INSTEAD OF ctx_callgraph(action="callees"). Find all transitive
+    C/C++ callees — what *name* calls, directly or indirectly, through the
+    libclang call graph including function-pointer edges.
 
     Use for dependency analysis: "what does this function depend on to do
     its job?"  Returns callees at depth 1 (direct), depth 2 (callees of
@@ -467,7 +482,9 @@ def find_dead_code(
     exclude_paths: Annotated[list[str] | None, Field(description="Additional LIKE patterns to exclude. Merged with defaults from config. E.g. ['lib/%'].")] = None,
     project_only: Annotated[bool, Field(description="When True (default), auto-excludes SDK/vendor paths (mbed-os/%, .pio/%, zephyr/%, build/%) and applies project config exclude_paths. Set False to see all results.")] = True,
 ) -> list[dict]:
-    """Read-only. Find functions/methods that are defined but never called.
+    """USE INSTEAD OF grep or manual code review. Find C/C++ functions that
+    are defined but never called — libclang-powered dead code detection.
+    grep cannot distinguish called from uncalled symbols across a codebase.
 
     Returns two categories of results, each with a ``status`` field:
 
@@ -521,7 +538,9 @@ def find_wrapper_callers(
     project_root: Annotated[str | None, Field(description="Project root. Auto-detected if omitted.")] = None,
     limit: Annotated[int, Field(description="Maximum wrapper method results (default 50).")] = 50,
 ) -> list[dict]:
-    """Read-only. Find wrapper classes that call methods of a driver class.
+    """USE INSTEAD OF grep or ctx_compose. Find C/C++ wrapper classes that
+    call methods of a driver class — libclang-powered adapter pattern
+    detection. grep cannot trace method ownership across classes.
 
     Returns wrapper methods grouped by wrapper class, showing which driver
     methods each wrapper calls.  Useful for understanding the adapter/wrapper
@@ -622,7 +641,9 @@ def trace_data_flow(
     max_depth: Annotated[int, Field(description="Maximum call path depth (default 8).")] = 8,
     limit: Annotated[int, Field(description="Maximum source functions to trace (default 15).")] = 15,
 ) -> list[dict]:
-    """Read-only. Trace how data of a given type flows to a target function.
+    """USE INSTEAD OF grep or ctx_callgraph. Trace how C/C++ data of a given
+    type flows to a target function via libclang call paths. grep cannot
+    follow type-based data flow through a call chain.
 
     Finds functions whose signature mentions *type_name*, then looks for call
     paths from those functions to *to_symbol*.  Returns a data flow map —
@@ -711,7 +732,9 @@ def find_hotspots(
     project_only: Annotated[bool, Field(description="When True (default), auto-excludes SDK/vendor paths so hotspots reflect project code.")] = True,
     exclude_paths: Annotated[list[str] | None, Field(description="Additional LIKE patterns to exclude. Merged with defaults. E.g. ['lib/%'].")] = None,
 ) -> list[dict]:
-    """Read-only. Find the most-called functions ranked by caller count.
+    """USE INSTEAD OF grep or ctx_callgraph. Find the most-called C/C++
+    functions ranked by caller count — libclang call-graph hotspot
+    detection. grep cannot aggregate caller statistics.
 
     Use for high-level impact assessment: changing a hotspot affects many
     call sites.  The result tells you which functions carry the most

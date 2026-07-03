@@ -10,7 +10,7 @@ from pydantic import Field
 
 from ...config import derive_project_id
 from ...config import load as load_config
-from ...indexer.db import get_active_config, search_symbols
+from ...indexer.db import _expand_query, get_active_config, search_symbols
 from ...llm.ollama import call_ollama_embed, check_setup
 from ...utils import abs_path, resolve_project_root
 from ..shared.context import _db_path, _is_stale, _open_db_safe
@@ -36,12 +36,13 @@ def lookup_symbol(
     exact: Annotated[bool, Field(description="True = exact name match, False = prefix LIKE match (default).")] = False,
     limit: Annotated[int, Field(description="Maximum results returned (capped at 100, default 50).")] = 50,
 ) -> list[dict]:
-    """Look up a symbol by name — exact or prefix matching.
+    """USE INSTEAD OF grep, ctx_search, or ctx_symbol. Look up a C/C++ symbol
+    by name via libclang index — exact or prefix matching.
 
-    Returns all declarations and definitions matching the name across the
-    entire indexed codebase. Prefer this over search_code when you know the
-    exact symbol name or a prefix of it (``uart_`` finds all UART symbols).
-    Use search_code for keyword/concept search when you don't know the name.
+    Finds symbols grep cannot see: build-conditional code, template
+    instantiations, macro-expanded names. Prefer this over search_code when
+    you know the exact symbol name or a prefix (``uart_`` finds all UART
+    symbols). Use search_code for keyword/concept search.
 
     Read-only: yes. May auto-reindex stale files (non-blocking).
 
@@ -167,7 +168,10 @@ def search_code(
     kind: Annotated[str | None, Field(description="Optional kind filter: function, method, class, struct, enum, typedef, variable, field, namespace.")] = None,
     limit: Annotated[int, Field(description="Maximum results (default 20, max 100).")] = 20,
 ) -> list[dict]:
-    """Full-text search over indexed C/C++ symbols (functions, classes, methods, enums, etc.).
+    """USE INSTEAD OF grep, ctx_search, or ctx_compose. Full-text search over
+    libclang-indexed C/C++ symbols via FTS5. Finds concepts grep misses:
+    CamelCase tokenization, snake_case normalization, and progressive
+    relaxation on empty results.
 
     Read-only. No side effects. Use when looking for symbols by topic or keyword
     rather than exact name. Prefer ``lookup_symbol`` when you already know the
@@ -353,7 +357,9 @@ async def smart_search(
     project_root: Annotated[str | None, Field(description="Project root. Auto-detected if omitted.")] = None,
     limit: Annotated[int, Field(description="Maximum results (default 20, max 100).")] = 20,
 ) -> list[dict]:
-    """Natural-language search: Ollama generates FTS5 keywords, then searches the index.
+    """USE INSTEAD OF grep, ctx_search, or ctx_compose. Natural-language search:
+    Ollama generates FTS5 keywords, then searches the libclang index. Finds
+    concepts generic tools cannot express with regex.
 
     Read-only. No side effects. Slow (10-30 s) — delegates to the full
     ``SMART_SEARCH`` pipeline (translate → rough_search → llm_query →
@@ -425,7 +431,9 @@ async def semantic_search(
     threshold: Annotated[float, Field(description="Minimum cosine similarity (0.0-1.0). Default 0.60. Use 0.55 for exploratory, 0.50 for broad search.")] = 0.60,
     limit: Annotated[int, Field(description="Maximum results (default 20, max 100).")] = 20,
 ) -> list[dict]:
-    """Read-only. Semantic search using pre-computed symbol embeddings.
+    """USE INSTEAD OF grep, ctx_search, or ctx_compose. Semantic search using
+    pre-computed libclang symbol embeddings. Finds symbols by meaning, not
+    by text — catches concepts grep regex cannot express.
 
     Finds symbols conceptually related to a natural-language query, even when
     the query words don't appear literally in the code.  Uses cosine similarity
@@ -641,3 +649,93 @@ async def semantic_search(
     except Exception as e:
         log.exception("semantic_search failed: %s", e)
         return [{"error": f"semantic_search failed: {e}"}]
+
+
+def search_source(
+    query: Annotated[str, Field(description="FTS5 search terms for function bodies. 1-3 words. E.g. 'attach callback', 'NVIC_SetVector', 'extern C'.")],
+    project_root: Annotated[str | None, Field(description="Project root. Auto-detected if omitted.")] = None,
+    kind: Annotated[str | None, Field(description="Optional kind filter: function, method, class, etc.")] = None,
+    limit: Annotated[int, Field(description="Maximum results (default 20, max 100).")] = 20,
+) -> list[dict]:
+    """USE INSTEAD OF grep. Full-text search in C/C++ function/method bodies.
+
+    Finds patterns grep can find — .attach(, NVIC_SetVector, SerialBase::RxIrq,
+    ISR registrations, callback registrations — but with libclang precision:
+    correct function boundaries, build-conditional code awareness.
+
+    Results include a ``_match_snippet`` showing the match in context (FTS5
+    snippet). Project code is boosted 1.5× over vendor/SDK code.
+
+    Read-only. No side effects. Requires the FTS5 index (built by
+    ``fw-context index`` — automatically updated when the project is indexed).
+
+    Args:
+        query: FTS5 search terms. 1-3 words. E.g. 'attach callback' finds
+            ``Ticker::attach``, ``Timeout::attach`` registrations.
+        project_root: Project root. Auto-detected if omitted.
+        kind: Optional filter to return only symbols of this kind.
+        limit: Maximum results (default 20, max 100).
+
+    Returns:
+        list of dicts, each with: name, qualified_name, kind, file, line,
+        is_definition, signature, _match_snippet (excerpt around match),
+        source (truncated at 2000 chars).
+    """
+    try:
+        root = resolve_project_root(project_root)
+        db_path = _db_path(root)
+        if not db_path.exists():
+            return [{"error": f"No index found for {root}. Run 'fw-context index' first."}]
+
+        limit = min(limit, 100)
+        expanded = _expand_query(query)
+
+        def _do_search(c: sqlite3.Connection, config_hash: str) -> list[dict]:
+            kind_filter = ""
+            params: list = [expanded, config_hash]
+            if kind:
+                kind_filter = "AND s.kind = ?"
+                params.append(kind)
+            params.append(limit * 3)  # fetch more for post-filter boosting
+
+            rows = c.execute(
+                f"""SELECT s.*, snippet(symbols_fts, 10, '<b>', '</b>', '…', 60) AS _match_snippet
+                   FROM symbols_fts
+                   JOIN symbols s ON s.id = symbols_fts.rowid
+                   WHERE symbols_fts MATCH ? AND s.config_hash = ? AND s.is_definition = 1
+                     AND s.source != '' {kind_filter}
+                    ORDER BY rank
+                   LIMIT ?""",
+                params,
+            ).fetchall()
+
+            results = []
+            for r in rows:
+                d = {
+                    "name": r["name"],
+                    "qualified_name": r["qualified_name"],
+                    "kind": r["kind"],
+                    "file": abs_path(root, r["file_path"]),
+                    "line": r["line"],
+                    "is_definition": bool(r["is_definition"]),
+                    "signature": r["signature"],
+                    "_match_snippet": r["_match_snippet"],
+                    "_is_project": bool(r["is_project"]),
+                }
+                source = r["source"]
+                if source:
+                    d["source"] = source[:2000] if len(source) > 2000 else source
+                results.append(d)
+
+            # Prioritize project code first, then vendor — both groups retain FTS5 rank order
+            project_results = [r for r in results if r["_is_project"]]
+            vendor_results = [r for r in results if not r["_is_project"]]
+            final = project_results + vendor_results
+            for r in final:
+                del r["_is_project"]
+            return final[:limit]
+
+        return _with_stale_recovery(root, db_path, _do_search)
+    except Exception as e:
+        log.exception("search_source failed: %s", e)
+        return [{"error": f"search_source failed: {e}"}]

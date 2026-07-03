@@ -86,6 +86,22 @@ from pathlib import Path
 log = logging.getLogger(__name__)
 
 
+def _ensure_column(conn: sqlite3.Connection, table: str, column: str, type_def: str) -> None:
+    """Idempotently add a column to a table if it doesn't exist.
+
+    Used as a belt-and-suspenders guard in functions that write to columns
+    added by schema migrations — handles the case where the migration ran
+    for one project's database but not another.
+    """
+    cols = [r[1] for r in conn.execute(f"PRAGMA table_info({table})").fetchall()]
+    if column not in cols:
+        try:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {type_def}")
+            conn.commit()
+        except sqlite3.OperationalError:
+            pass  # column already exists (race condition)
+
+
 class DatabaseCorruptionError(sqlite3.DatabaseError):
     """Raised when the SQLite database fails integrity check.
 
@@ -261,6 +277,7 @@ _MIGRATION_ADD_COLUMNS = [
     "ALTER TABLE symbols ADD COLUMN template_usr TEXT NOT NULL DEFAULT ''",
     "ALTER TABLE symbols ADD COLUMN is_project INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE symbols ADD COLUMN pagerank REAL NOT NULL DEFAULT 0.0",
+    "ALTER TABLE symbols ADD COLUMN source TEXT NOT NULL DEFAULT ''",
     "ALTER TABLE llm_analysis ADD COLUMN content_hash TEXT NOT NULL DEFAULT ''",
     "ALTER TABLE build_configs ADD COLUMN embedding_dim INTEGER",
 ]
@@ -311,6 +328,7 @@ CREATE TABLE IF NOT EXISTS symbols (
     is_template    INTEGER NOT NULL DEFAULT 0,
     template_usr   TEXT    NOT NULL DEFAULT '',
     pagerank       REAL    NOT NULL DEFAULT 0.0,
+    source         TEXT    NOT NULL DEFAULT '',
     UNIQUE(config_hash, usr)
 );
 
@@ -333,25 +351,26 @@ CREATE VIRTUAL TABLE IF NOT EXISTS symbols_fts USING fts5(
     summary,
     inputs,
     outputs,
+    source,
     content='symbols',
     content_rowid='id'
 );
 
 CREATE TRIGGER IF NOT EXISTS symbols_ai AFTER INSERT ON symbols BEGIN
-    INSERT INTO symbols_fts(rowid, name, qualified_name, signature, docstring, file_path, name_tokens, summary, inputs, outputs)
-    VALUES (new.id, new.name, new.qualified_name, new.signature, new.docstring, new.file_path, new.name_tokens, new.summary, new.inputs, new.outputs);
+    INSERT INTO symbols_fts(rowid, name, qualified_name, signature, docstring, file_path, name_tokens, summary, inputs, outputs, source)
+    VALUES (new.id, new.name, new.qualified_name, new.signature, new.docstring, new.file_path, new.name_tokens, new.summary, new.inputs, new.outputs, new.source);
 END;
 
 CREATE TRIGGER IF NOT EXISTS symbols_ad AFTER DELETE ON symbols BEGIN
-    INSERT INTO symbols_fts(symbols_fts, rowid, name, qualified_name, signature, docstring, file_path, name_tokens, summary, inputs, outputs)
-    VALUES ('delete', old.id, old.name, old.qualified_name, old.signature, old.docstring, old.file_path, old.name_tokens, old.summary, old.inputs, old.outputs);
+    INSERT INTO symbols_fts(symbols_fts, rowid, name, qualified_name, signature, docstring, file_path, name_tokens, summary, inputs, outputs, source)
+    VALUES ('delete', old.id, old.name, old.qualified_name, old.signature, old.docstring, old.file_path, old.name_tokens, old.summary, old.inputs, old.outputs, old.source);
 END;
 
 CREATE TRIGGER IF NOT EXISTS symbols_au AFTER UPDATE ON symbols BEGIN
-    INSERT INTO symbols_fts(symbols_fts, rowid, name, qualified_name, signature, docstring, file_path, name_tokens, summary, inputs, outputs)
-    VALUES ('delete', old.id, old.name, old.qualified_name, old.signature, old.docstring, old.file_path, old.name_tokens, old.summary, old.inputs, old.outputs);
-    INSERT INTO symbols_fts(rowid, name, qualified_name, signature, docstring, file_path, name_tokens, summary, inputs, outputs)
-    VALUES (new.id, new.name, new.qualified_name, new.signature, new.docstring, new.file_path, new.name_tokens, new.summary, new.inputs, new.outputs);
+    INSERT INTO symbols_fts(symbols_fts, rowid, name, qualified_name, signature, docstring, file_path, name_tokens, summary, inputs, outputs, source)
+    VALUES ('delete', old.id, old.name, old.qualified_name, old.signature, old.docstring, old.file_path, old.name_tokens, old.summary, old.inputs, old.outputs, old.source);
+    INSERT INTO symbols_fts(rowid, name, qualified_name, signature, docstring, file_path, name_tokens, summary, inputs, outputs, source)
+    VALUES (new.id, new.name, new.qualified_name, new.signature, new.docstring, new.file_path, new.name_tokens, new.summary, new.inputs, new.outputs, new.source);
 END;
 
 -- Cross-reference / call graph (on by default; disable with [index] index_refs = false).
@@ -776,6 +795,46 @@ def open_db(path: Path, *, skip_integrity_check: bool = False) -> sqlite3.Connec
                 """)
                 conn.commit()
 
+            # Migration: FTS5 rebuild — add source column (function body text).
+            fts_cols3 = [r[1] for r in conn.execute("PRAGMA table_info(symbols_fts)").fetchall()]
+            if "source" not in fts_cols3:
+                conn.executescript("""
+                    DROP TRIGGER IF EXISTS symbols_ai;
+                    DROP TRIGGER IF EXISTS symbols_ad;
+                    DROP TRIGGER IF EXISTS symbols_au;
+                    DROP TABLE IF EXISTS symbols_fts;
+                """)
+                conn.executescript("""
+                    CREATE VIRTUAL TABLE symbols_fts USING fts5(
+                        name, qualified_name, signature, docstring, file_path, name_tokens,
+                        summary, inputs, outputs, source,
+                        content='symbols', content_rowid='id'
+                    );
+                    CREATE TRIGGER symbols_ai AFTER INSERT ON symbols BEGIN
+                        INSERT INTO symbols_fts(rowid, name, qualified_name, signature, docstring, file_path, name_tokens, summary, inputs, outputs, source)
+                        VALUES (new.id, new.name, new.qualified_name, new.signature, new.docstring, new.file_path, new.name_tokens, new.summary, new.inputs, new.outputs, new.source);
+                    END;
+                    CREATE TRIGGER symbols_ad AFTER DELETE ON symbols BEGIN
+                        INSERT INTO symbols_fts(symbols_fts, rowid, name, qualified_name, signature, docstring, file_path, name_tokens, summary, inputs, outputs, source)
+                        VALUES ('delete', old.id, old.name, old.qualified_name, old.signature, old.docstring, old.file_path, old.name_tokens, old.summary, old.inputs, old.outputs, old.source);
+                    END;
+                    CREATE TRIGGER symbols_au AFTER UPDATE ON symbols BEGIN
+                        INSERT INTO symbols_fts(symbols_fts, rowid, name, qualified_name, signature, docstring, file_path, name_tokens, summary, inputs, outputs, source)
+                        VALUES ('delete', old.id, old.name, old.qualified_name, old.signature, old.docstring, old.file_path, old.name_tokens, old.summary, old.inputs, old.outputs, old.source);
+                        INSERT INTO symbols_fts(rowid, name, qualified_name, signature, docstring, file_path, name_tokens, summary, inputs, outputs, source)
+                        VALUES (new.id, new.name, new.qualified_name, new.signature, new.docstring, new.file_path, new.name_tokens, new.summary, new.inputs, new.outputs, new.source);
+                    END;
+                """)
+                conn.execute("""
+                    INSERT INTO symbols_fts(rowid, name, qualified_name, signature, docstring, file_path, name_tokens, summary, inputs, outputs, source)
+                    SELECT id, name, qualified_name, COALESCE(signature,''), COALESCE(docstring,''),
+                           COALESCE(file_path,''), COALESCE(name_tokens,''),
+                           COALESCE(summary,''), COALESCE(inputs,''), COALESCE(outputs,''),
+                           COALESCE(source,'')
+                    FROM symbols
+                """)
+                conn.commit()
+
         except sqlite3.OperationalError as e:
             if "locked" in str(e).lower():
                 conn.close()
@@ -978,7 +1037,16 @@ def rebuild_fts(conn: sqlite3.Connection) -> None:
 
     Idempotent — safe to call on an already-healthy FTS table.
     """
-    conn.executescript("""
+    _ensure_column(conn, "symbols", "source", "TEXT NOT NULL DEFAULT ''")
+    cols = [r[1] for r in conn.execute("PRAGMA table_info(symbols)").fetchall()]
+    has_source = "source" in cols
+
+    source_col = ", source" if has_source else ""
+    source_sel = ", COALESCE(source,'')" if has_source else ""
+    source_val_new = ", new.source" if has_source else ""
+    source_val_old = ", old.source" if has_source else ""
+
+    conn.executescript(f"""
         DROP TRIGGER IF EXISTS symbols_ai;
         DROP TRIGGER IF EXISTS symbols_ad;
         DROP TRIGGER IF EXISTS symbols_au;
@@ -986,40 +1054,40 @@ def rebuild_fts(conn: sqlite3.Connection) -> None:
 
         CREATE VIRTUAL TABLE symbols_fts USING fts5(
             name, qualified_name, signature, docstring, file_path, name_tokens,
-            summary, inputs, outputs,
+            summary, inputs, outputs{source_col},
             content='symbols', content_rowid='id'
         );
 
         INSERT INTO symbols_fts(rowid, name, qualified_name, signature, docstring,
-                                file_path, name_tokens, summary, inputs, outputs)
+                                file_path, name_tokens, summary, inputs, outputs{source_col})
         SELECT id, name, qualified_name, COALESCE(signature,''), COALESCE(docstring,''),
                COALESCE(file_path,''), COALESCE(name_tokens,''),
-               COALESCE(summary,''), COALESCE(inputs,''), COALESCE(outputs,'')
+               COALESCE(summary,''), COALESCE(inputs,''), COALESCE(outputs,''){source_sel}
         FROM symbols;
 
         CREATE TRIGGER symbols_ai AFTER INSERT ON symbols BEGIN
             INSERT INTO symbols_fts(rowid, name, qualified_name, signature, docstring,
-                                    file_path, name_tokens, summary, inputs, outputs)
+                                    file_path, name_tokens, summary, inputs, outputs{source_col})
             VALUES (new.id, new.name, new.qualified_name, new.signature, new.docstring,
-                    new.file_path, new.name_tokens, new.summary, new.inputs, new.outputs);
+                    new.file_path, new.name_tokens, new.summary, new.inputs, new.outputs{source_val_new});
         END;
 
         CREATE TRIGGER symbols_ad AFTER DELETE ON symbols BEGIN
             INSERT INTO symbols_fts(symbols_fts, rowid, name, qualified_name, signature,
-                                    docstring, file_path, name_tokens, summary, inputs, outputs)
+                                    docstring, file_path, name_tokens, summary, inputs, outputs{source_col})
             VALUES ('delete', old.id, old.name, old.qualified_name, old.signature,
-                    old.docstring, old.file_path, old.name_tokens, old.summary, old.inputs, old.outputs);
+                    old.docstring, old.file_path, old.name_tokens, old.summary, old.inputs, old.outputs{source_val_old});
         END;
 
         CREATE TRIGGER symbols_au AFTER UPDATE ON symbols BEGIN
             INSERT INTO symbols_fts(symbols_fts, rowid, name, qualified_name, signature,
-                                    docstring, file_path, name_tokens, summary, inputs, outputs)
+                                    docstring, file_path, name_tokens, summary, inputs, outputs{source_col})
             VALUES ('delete', old.id, old.name, old.qualified_name, old.signature,
-                    old.docstring, old.file_path, old.name_tokens, old.summary, old.inputs, old.outputs);
+                    old.docstring, old.file_path, old.name_tokens, old.summary, old.inputs, old.outputs{source_val_old});
             INSERT INTO symbols_fts(rowid, name, qualified_name, signature, docstring,
-                                    file_path, name_tokens, summary, inputs, outputs)
+                                    file_path, name_tokens, summary, inputs, outputs{source_col})
             VALUES (new.id, new.name, new.qualified_name, new.signature, new.docstring,
-                    new.file_path, new.name_tokens, new.summary, new.inputs, new.outputs);
+                    new.file_path, new.name_tokens, new.summary, new.inputs, new.outputs{source_val_new});
         END;
     """)
 
@@ -1166,16 +1234,20 @@ def insert_symbols_batch(
     Each row: (config_hash, file_id, file_path, name_tokens, usr, name,
                qualified_name, kind, line, col, end_line, is_definition,
                signature, docstring, enum_value, is_virtual, is_pure_virtual,
-               parent_usr, is_template, template_usr, is_project, pagerank)
+               parent_usr, is_template, template_usr, is_project, pagerank, source)
 
     Returns count of rows inserted or upgraded to definition.
     """
+    # Belt-and-suspenders: ensure source column exists (migration may not
+    # have run for databases indexed before the column was added).
+    _ensure_column(conn, "symbols", "source", "TEXT NOT NULL DEFAULT ''")
+
     cur = conn.executemany(
         """INSERT INTO symbols
            (config_hash, file_id, file_path, name_tokens, usr, name, qualified_name, kind,
             line, col, end_line, is_definition, signature, docstring, enum_value,
-            is_virtual, is_pure_virtual, parent_usr, is_template, template_usr, is_project, pagerank)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            is_virtual, is_pure_virtual, parent_usr, is_template, template_usr, is_project, pagerank, source)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
            ON CONFLICT(config_hash, usr) DO UPDATE SET
                file_id       = excluded.file_id,
                file_path     = excluded.file_path,
@@ -1193,7 +1265,8 @@ def insert_symbols_batch(
                is_template   = excluded.is_template,
                template_usr  = excluded.template_usr,
                is_project    = excluded.is_project,
-               pagerank      = excluded.pagerank
+               pagerank      = excluded.pagerank,
+               source        = excluded.source
            WHERE excluded.is_definition = 1 AND symbols.is_definition = 0""",
         rows,
     )
@@ -2576,7 +2649,7 @@ def search_symbols(
            FROM symbols_fts
            JOIN symbols s ON s.id = symbols_fts.rowid
            WHERE symbols_fts MATCH ? AND s.config_hash = ? {kind_filter}
-            ORDER BY bm25(symbols_fts, 1.2, 0.75, 10.0, 1.0, 3.0, 2.0, 1.0, 5.0, 1.0, 1.0, 1.0)
+            ORDER BY bm25(symbols_fts, 1.2, 0.75, 10.0, 1.0, 3.0, 2.0, 1.0, 5.0, 1.0, 0.5, 1.0, 1.0)
            LIMIT ?""",
         params,
     ).fetchall()

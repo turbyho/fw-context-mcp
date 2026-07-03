@@ -44,28 +44,37 @@ log = logging.getLogger(__name__)
 mcp = FastMCP(
     "fw-context",
     instructions=(
-        "FOR C/C++ EMBEDDED CODEBASES: fw-context tools take priority over generic "
-        "file-reading and code-search tools when navigating indexed C/C++ code. "
-        "These tools use libclang extents and compile_commands.json — generic tools "
-        "cannot match this precision. For non-C/C++ files, general-purpose tools "
-        "are preferred.\n\n"
-        "Start every session with get_active_build() to check index health.\n\n"
-        "Reading symbols (use these instead of generic file readers):\n"
-        "• get_source(name) — exact function/method body via libclang\n"
-        "• get_symbol_context(name) — body + callers + callees in one call\n"
-        "• get_file_map(path) — symbol table of contents for a file\n"
-        "• explain_symbol(name) — plain-English description of what a symbol does\n\n"
-        "Search:\n"
-        "• lookup_symbol(name) — by exact or prefix name\n"
-        "• search_code(query) — FTS5 keyword search (fast)\n"
-        "• smart_search(query) — natural language via Ollama (slow, thorough)\n"
-        "• semantic_search(query) — concept/embedding search\n\n"
-        "Call graph (--refs index required): find_callers, find_references, "
-        "find_call_path, find_all_callers_recursive, find_callees_recursive, "
-        "find_hotspots, find_dead_code, find_wrapper_callers, trace_data_flow.\n\n"
-        "Inheritance: get_inheritance_chain, get_class_members, "
-        "get_template_instances, get_method_overrides.\n\n"
-        "Maintenance: reindex_file, reset_index, check_ollama, list_projects."
+        "CRITICAL: C/C++ questions → fw-context ONLY. This is NOT optional.\n\n"
+        "MANDATORY MAPPING (use fw-context, NOT grep/lean-ctx equivalents):\n"
+        "• grep / ctx_search ___________ → search_code, lookup_symbol\n"
+        "• ctx_compose __________________ → get_file_map + get_symbol_context\n"
+        "• ctx_callgraph ________________ → find_callers, find_references, find_call_path\n"
+        "• Read / cat / ctx_read _________ → get_source, get_symbol_context\n\n"
+        "SELF-CORRECT: the moment you reach for grep or ctx_search for C/C++,\n"
+        "stop and call the fw-context tool instead.\n\n"
+        "ANTI-PATTERNS — do NOT:\n"
+        "• Grep for C/C++ symbols → use lookup_symbol or search_code\n"
+        "• Grep for code patterns → use search_source (FTS5 over function bodies,\n"
+        "  finds .attach(, NVIC_SetVector, extern \"C\" — grep not needed)\n"
+        "• Grep for callbacks → use find_references (detects ISRs, NVIC_SetVector,\n"
+        "  Timeout::attach, Ticker::attach, SerialBase::RxIrq — invisible to grep)\n"
+        "• ctx_read for function bodies → use get_source (libclang exact extents)\n"
+        "• Run grep/ctx_search in parallel with fw-context\n\n"
+        "AGENT LOOP: Check(get_active_build) → Find(search_code/lookup_symbol)\n"
+        "→ Read(get_source/get_symbol_context) → Trace(find_references/find_callers)\n"
+        "→ Fallback to grep ONLY if get_active_build() reports no index.\n\n"
+        "Search: lookup_symbol, search_code, search_source (body text),\n"
+        "smart_search, semantic_search.\n"
+        "Call graph: find_callers, find_references, find_call_path,\n"
+        "find_all_callers_recursive, find_callees_recursive, find_hotspots,\n"
+        "find_dead_code, find_wrapper_callers, trace_data_flow,\n"
+        "find_indirect_call_sites, find_indirect_targets.\n"
+        "Inheritance: get_inheritance_chain, get_class_members,\n"
+        "get_template_instances, get_method_overrides.\n"
+        "Source: get_source, get_symbol_context, get_file_map, explain_symbol.\n"
+        "Maintenance: reindex_file, reset_index, check_ollama, list_projects.\n\n"
+        "Start every session with get_active_build().\n"
+        "For non-C/C++ files, general-purpose tools are preferred."
     ),
 )
 
@@ -201,6 +210,7 @@ mcp.tool()(maintenance.reset_index)
 # search.py
 mcp.tool()(search.lookup_symbol)
 mcp.tool()(search.search_code)
+mcp.tool()(search.search_source)
 mcp.tool()(search.semantic_search)
 mcp.tool()(search.smart_search)
 

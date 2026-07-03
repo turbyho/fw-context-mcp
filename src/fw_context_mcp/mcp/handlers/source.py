@@ -172,7 +172,8 @@ async def explain_symbol(
     project_root: Annotated[str | None, Field(description="Project root. Auto-detected if omitted.")] = None,
     context_lines: Annotated[int, Field(description="Lines of source context around the symbol definition.")] = 40,
 ) -> dict:
-    """Explain what a C/C++ symbol does in plain English.
+    """USE INSTEAD OF reading code manually with grep/ctx_read. Explain what a
+    C/C++ symbol does in plain English — libclang-aware analysis.
 
     Read-only. No side effects — uses pre-computed LLM analysis when available
     (instant, generated during ``fw-context index --analyze``), falls back to
@@ -285,11 +286,13 @@ def get_source(
     name: Annotated[str, Field(description="Fully qualified symbol name. Returns exact function body via libclang extent.")],
     project_root: Annotated[str | None, Field(description="Project root. Auto-detected if omitted.")] = None,
 ) -> dict:
-    """Read-only. Preferred way to read a function/method/enum body — uses libclang
-    for exact extents instead of guessing from line numbers. No LLM, fast.
+    """USE INSTEAD OF generic file readers (ctx_read, cat, read). Read a
+    C/C++ function/method/enum body using libclang exact extents — no
+    guessing line numbers. No LLM, fast.
 
-    For enums, includes a ``constants`` array listing all member constants
-    with their names and integer values.
+    Generic readers don't know where a function actually ends — libclang
+    tracks exact {start, end} from the AST. For enums, includes a
+    ``constants`` array listing all member constants with their values.
 
     For rich context (who calls this, what does it call) use
     get_symbol_context instead. For the full file, use a normal file read.
@@ -373,7 +376,8 @@ def get_file_map(
     signatures: Annotated[bool, Field(description="Include full function signatures in output.")] = False,
     max_per_kind: Annotated[int, Field(description="Max items per symbol kind group (default 30, 0 = unlimited).")] = 30,
 ) -> dict:
-    """Return all symbols in a file grouped by kind — fast structural overview.
+    """USE INSTEAD OF grep/ctx_read for file overview. Fast structural map of all
+    C/C++ symbols in a file grouped by kind — libclang-powered table of contents.
 
     Like a table of contents before reading a chapter. Pass a path relative
     to the project root (``src/main.cpp``) or just the filename (``main.cpp``).
@@ -444,9 +448,10 @@ def get_symbol_context(
     project_root: Annotated[str | None, Field(description="Project root. Auto-detected if omitted.")] = None,
     project_only: Annotated[bool, Field(description="When True (default), filters callers and callees to project paths (excludes SDK/vendor).")] = True,
 ) -> dict:
-    """Read-only. Rich one-shot context for a symbol: body, signature, all direct
-    callers and callees. Answers "what does this do and how does it fit in the
-    system?" in a single response.
+    """USE INSTEAD OF ctx_compose, grep, or manual code reading. Rich one-shot
+    context for a C/C++ symbol: body, signature, all direct callers and callees.
+    Answers "what does this do and how does it fit in the system?" in a single
+    response — libclang powers the call graph, not regex.
 
     For body-only use get_source (faster). For transitive call-graph exploration
     use find_all_callers_recursive or find_callees_recursive.

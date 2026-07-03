@@ -20,31 +20,50 @@ from pathlib import Path
 BASE_INSTRUCTIONS = """\
 ## fw-context — Build-aware code intelligence
 
-`fw-context` MCP tools are available globally. **Use them only in embedded firmware
-projects built with Mbed OS, Zephyr, or PlatformIO.** Do not use in Python, JS,
-Go, or other projects — the index is built from `compile_commands.json` and only
-covers C/C++ translation units.
+CRITICAL: C/C++ questions → fw-context ONLY. This is NOT optional.
+
+MANDATORY MAPPING (use fw-context, NOT these):
+| Instead of | Use |
+|---|---|
+| grep / ctx_search | search_code, lookup_symbol, search_source |
+| grep for patterns  | search_source (FTS5 over function bodies) |
+| ctx_compose | get_file_map + get_symbol_context |
+| ctx_callgraph | find_callers, find_references, find_call_path |
+| Read / cat / ctx_read | get_source, get_symbol_context |
+
+SELF-CORRECT: the moment you reach for grep/ctx_search for C/C++,
+stop and call the fw-context tool instead.
+
+ANTI-PATTERNS:
+• grep for C/C++ symbols → use lookup_symbol or search_code
+• grep for code patterns → use search_source (FTS5 over function bodies,
+  finds .attach(, NVIC_SetVector, extern "C" — grep not needed)
+• grep for callbacks → use find_references (detects ISRs, NVIC_SetVector,
+  Timeout::attach, Ticker::attach, SerialBase::RxIrq — invisible to grep)
+• ctx_read for function bodies → use get_source (libclang exact extents)
+• Run grep or ctx_search in parallel with fw-context
+
+AGENT LOOP: Check(get_active_build) → Find(search_code/lookup_symbol)
+→ Read(get_source/get_symbol_context) → Trace(find_references/find_callers)
+→ Fallback to grep ONLY if get_active_build() reports no index.
+
+Do NOT use fw-context in Python, JS, Go, or other non-C/C++ projects.
 
 {lean_ctx_carveout}
-### Session start
-
-Call `get_active_build()` first. If `stale: true`, remind the user to run
-`fw-context index`.  If the index is missing, show the setup commands below.
-
-### Code reading
-
-Prefer `get_source`, `get_file_map`, and `get_symbol_context` for reading
-symbols and functions — they use libclang extents and understand build flags.
-Use normal file reads for broader file context outside indexed symbols.
 
 ### Tool categories
 
 - **Search:** `lookup_symbol` (exact/prefix name), `search_code` (FTS5 keywords),
-  `smart_search` (natural language via Ollama, slow), `semantic_search` (concept
-  embedding, cosine similarity), `explain_symbol` (plain-English via Ollama)
+  `search_source` (FTS5 over function bodies — replaces grep for patterns like
+  `.attach(`, `NVIC_SetVector`, `extern "C"`), `smart_search` (natural language
+  via Ollama, slow), `semantic_search` (concept embedding), `explain_symbol`
+  (plain-English via Ollama)
 - **Call graph** (refs must be indexed): `find_callers`, `find_references`,
   `find_call_path`, `find_all_callers_recursive`, `find_callees_recursive`,
-  `find_hotspots`, `find_dead_code`, `find_wrapper_callers`, `trace_data_flow`
+  `find_hotspots`, `find_dead_code`, `find_wrapper_callers`, `trace_data_flow`,
+  `find_indirect_call_sites`, `find_indirect_targets`
+- **Inheritance:** `get_inheritance_chain`, `get_class_members`,
+  `get_template_instances`, `get_method_overrides`
 - **Maintenance:** `reindex_file` (after editing a file), `reset_index`
   (destructive! re-index from scratch), `check_ollama` (before smart_search/
   explain_symbol/semantic_search), `list_projects` (discover indexed projects)
@@ -72,14 +91,22 @@ fw-context index
 LEAN_CTX_CARVEOUT = """\
 ### lean-ctx compatibility
 
-fw-context query results (`search_code`, `lookup_symbol`, `explain_symbol`,
-`smart_search`, `semantic_search`, `reindex_file`) return structured C/C++
-symbol data. Do NOT pipe this structured output through lean-ctx compression
-— display it with native tools. C/C++ code results must stay uncompressed.
+For C/C++ code navigation, fw-context tools MUST be used instead of their
+lean-ctx equivalents. The mapping is:
 
-Reading source files referenced by fw-context results IS fine with `ctx_read`
-— those are regular files on disk, not query output.
+| Instead of lean-ctx | Use fw-context |
+|---|---|
+| ctx_search(action="regex") | `search_code` |
+| ctx_search(action="symbol") | `lookup_symbol` |
+| ctx_compose(task=...) | `get_file_map` + `get_symbol_context` |
+| ctx_callgraph(action="callers") | `find_callers` |
+| ctx_callgraph(action="callees") | `find_callees_recursive` |
+| ctx_callgraph(action="trace") | `find_call_path` |
 
+Read source files referenced by fw-context results with `ctx_read` —
+those are regular files on disk, not query output.
+
+Do NOT pipe fw-context structured results through lean-ctx compression.
 When working on the `fw-context-mcp` source code itself, do NOT use
 lean-ctx for C/C++ code.
 """

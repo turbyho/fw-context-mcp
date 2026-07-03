@@ -40,7 +40,9 @@ log = logging.getLogger(__name__)
 def get_active_build(
     project_root: Annotated[str | None, Field(description="Project root directory. Auto-detected from CWD if omitted.")] = None,
 ) -> dict:
-    """Return metadata about the most recently indexed build configuration.
+    """MANDATORY FIRST CALL for C/C++ projects. Return metadata about the
+    most recently indexed build configuration — check index health before
+    using any other fw-context tools.
 
     Read-only: yes. Call at session start to check if the index exists,
     how many symbols it contains, and whether it is stale (needs re-index).

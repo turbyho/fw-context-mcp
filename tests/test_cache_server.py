@@ -127,7 +127,7 @@ class TestBatchGet:
         mock_backend.add_token("token", can_read=True)
         response = client.post("/cache/batch", json={"hashes": []}, headers=_auth("token"))
         assert response.status_code == 200
-        assert response.json() == {"results": {}}
+        assert response.json() == {"results": {}, "truncated": False}
 
     def test_cache_hit(self, client: TestClient, mock_backend: MockBackend) -> None:
         mock_backend.add_token("token", can_read=True)

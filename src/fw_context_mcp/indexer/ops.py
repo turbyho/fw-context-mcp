@@ -214,6 +214,12 @@ def store_symbols_for_unit(
                     if rp.startswith(root_n + "/") or rp == root_n:
                         is_proj = 1
                         break
+            # Read source body for definitions (for FTS5 search_source).
+            body = ""
+            if s.is_definition and s.end_line > s.line:
+                file_lines = _cached_lines(s.file)
+                if file_lines is not None:
+                    body = _read_body(file_lines, s.line, s.end_line)
             rows.append((
                 config_hash,
                 file_id_cache[sym_file],
@@ -237,6 +243,7 @@ def store_symbols_for_unit(
                 s.template_usr,
                 is_proj,
                 0.0,  # pagerank (computed later by _build_pagerank)
+                body,
             ))
         insert_symbols_batch(conn, rows)
         syms_added = len(rows)
