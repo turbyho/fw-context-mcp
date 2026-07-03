@@ -177,7 +177,7 @@ graph TB
 
 ```mermaid
 graph LR
-    cli[CLI: fw-context<br/>index, export, watch, status]
+    cli[CLI: fw-context<br/>index, export, status]
     server[MCP Server: fw-context-mcp<br/>29 tools across search, source,<br/>graph, and maintenance categories]
     ollama[Ollama<br/>optional]
     db[(SQLite + FTS5<br/>+ vec0 + refs)]
@@ -189,7 +189,7 @@ graph LR
 
 | Component | Runs as | Purpose |
 |-----------|---------|---------|
-| **CLI** (`fw-context`) | User command | Index, export, watch, status, reset, init, search |
+| **CLI** (`fw-context`) | User command | Index, export, status, reset, init, search |
 | **Indexer** | Called by CLI | libclang parses every TU, stores in SQLite + FTS5 + vec0 |
 | **MCP server** (`fw-context-mcp`) | Subprocess (AI assistant) | 29 tools over JSON-RPC — search, graph, source, maintenance |
 | **Ollama** *(optional)* | Local daemon | NL search, symbol explanation, embedding generation |

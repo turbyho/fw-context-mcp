@@ -429,7 +429,8 @@ async def semantic_search(
 
     Finds symbols conceptually related to a natural-language query, even when
     the query words don't appear literally in the code.  Uses cosine similarity
-    over 1024-dimensional embeddings generated during ``fw-context index``.
+    over variable-dimension embeddings generated during ``fw-context index``.
+    Dimensions vary by model: mxbai-embed-large → 1024, qwen3-embedding → 4096.
 
     **When to prefer over search_code:** When you're describing a *concept*
     rather than searching for a known keyword.  Examples:
@@ -445,8 +446,8 @@ async def semantic_search(
 
     **Threshold guidance (mxbai-embed-large model):**
     - ``0.50`` — exploratory: more results, lower precision
-    - ``0.55`` — balanced (default, ~1000 results)
-    - ``0.60`` — precise: ~175 avg, high precision
+    - ``0.55`` — balanced (~1000 results)
+    - ``0.60`` — precise: ~175 avg, high precision (default)
     - ``0.65`` — strict: few results, may miss relevant symbols
 
     **Source-aware ranking:** Project code (``src/``) boosted 1.2×,
