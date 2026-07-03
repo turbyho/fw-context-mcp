@@ -51,8 +51,16 @@ num_ctx = 16384
 # timeout = 600.0   # HTTP timeout for Ollama requests in seconds (default 600)
 # debug_log = "~/.fw-context/llm-debug.jsonl"   # write LLM prompts/responses to JSONL
 
-# Embedding model for semantic_search.  Must be pulled first:  ollama pull mxbai-embed-large
+# Embedding model for semantic_search.  Must be pulled first:  ollama pull <model>
+#
+# Recommended models:
+#   mxbai-embed-large:latest  (~670 MB VRAM, fast, no GPU needed)   — default
+#   qwen3-embedding:8b        (~4.7 GB VRAM, best quality, GPU recommended)
 # embed_model = "mxbai-embed-large:latest"
+#
+# Instruction prompts (auto-detected from model, override only if needed):
+# embed_query_prompt = "Represent this sentence for searching relevant passages: "
+# embed_doc_prompt = ""
 
 analyze_symbols = true
 """
@@ -125,7 +133,10 @@ _PROJECT_LOCAL_DEFAULTS_TEMPLATE = """\
 # keep_alive = "10m"   # how long to keep model loaded in VRAM after each request
 # timeout = 600.0   # HTTP timeout for Ollama requests in seconds (default 600)
 # debug_log = "~/.fw-context/llm-debug.jsonl"   # write LLM prompts/responses to JSONL
-# embed_model = "mxbai-embed-large:latest"   # embedding model for semantic search
+# embed_model = "mxbai-embed-large:latest"   # embedding model for semantic search (~670 MB VRAM)
+# For better quality with a GPU:  embed_model = "qwen3-embedding:8b"  (~4.7 GB VRAM)
+# embed_query_prompt = "Represent this sentence for searching relevant passages: "
+# embed_doc_prompt = ""
 # analyze_symbols = true    # generate structured symbol descriptions (summary, inputs, outputs) — enabled by default
 # analyze_vendor = false    # when true, also analyze vendor/SDK code (mbed-os, Zephyr, etc.) — can add hours
 
@@ -145,7 +156,17 @@ class LLMConfig:
             accept that source-code snippets will be sent externally).
         model: Chat model for analysis and search query generation.
             Minimum 14B parameters recommended for C++ embedded code.
-        embed_model: Embedding model for semantic search (mxbai-embed-large).
+        embed_model: Embedding model for semantic search.
+            Default ``mxbai-embed-large:latest`` (~670 MB VRAM, no GPU needed).
+            For better quality with a GPU use ``qwen3-embedding:8b`` (~4.7 GB).
+        embed_query_prompt: Instruction prepended to query text before embedding.
+            Auto-detected from model prefix when empty.  ``mxbai-*`` uses
+            ``"Represent this sentence for searching relevant passages: "``,
+            ``qwen3-embedding*`` uses a code-specific retrieval instruction.
+            Set explicitly in TOML to override or disable (empty string).
+        embed_doc_prompt: Instruction prepended to symbol descriptions during
+            indexing.  Most models work best with an empty doc prompt — only
+            set when the model's training expects a per-document instruction.
         num_ctx: Context window size in tokens.
         timeout: HTTP request timeout in seconds for Ollama API calls.
             Default 600 s (10 min) — analysis batches with large prompts and
@@ -167,12 +188,38 @@ class LLMConfig:
     ollama_url: str = "http://localhost:11434"
     model: str = "qwen2.5-coder:14b"
     embed_model: str = "mxbai-embed-large:latest"
+    embed_query_prompt: str = ""
+    embed_doc_prompt: str = ""
     num_ctx: int = 16384
     timeout: float = 600.0
     keep_alive: str = "10m"
     debug_log: Path | None = None
     analyze_symbols: bool = True
     analyze_vendor: bool = False
+
+
+def _apply_embed_prompt_defaults(llm_cfg: LLMConfig) -> None:
+    """Set embed prompt defaults based on model prefix when the field is empty.
+
+    Called by ``_from_dict`` after loading TOML — only fills defaults when
+    the user hasn't explicitly configured a prompt value.
+    """
+    model_lower = llm_cfg.embed_model.lower()
+    if llm_cfg.embed_query_prompt == "":
+        if model_lower.startswith("qwen3-embedding"):
+            llm_cfg.embed_query_prompt = (
+                "Retrieve C/C++ functions, types, symbols, and implementation "
+                "code relevant to the query."
+            )
+        elif model_lower.startswith("mxbai"):
+            llm_cfg.embed_query_prompt = (
+                "Represent this sentence for searching relevant passages: "
+            )
+    if llm_cfg.embed_doc_prompt == "":
+        if model_lower.startswith("qwen3-embedding"):
+            llm_cfg.embed_doc_prompt = ""
+        elif model_lower.startswith("mxbai"):
+            llm_cfg.embed_doc_prompt = ""
 
 
 @dataclass
@@ -338,6 +385,11 @@ def _from_dict(data: dict) -> Config:
             cfg.llm.model = model
         if embed_model := llm.get("embed_model"):
             cfg.llm.embed_model = embed_model
+        if embed_qp := llm.get("embed_query_prompt"):
+            cfg.llm.embed_query_prompt = embed_qp
+        if embed_dp := llm.get("embed_doc_prompt"):
+            cfg.llm.embed_doc_prompt = embed_dp
+        _apply_embed_prompt_defaults(cfg.llm)
         if num_ctx := llm.get("num_ctx"):
             cfg.llm.num_ctx = int(num_ctx)
         if timeout := llm.get("timeout"):

@@ -262,6 +262,7 @@ _MIGRATION_ADD_COLUMNS = [
     "ALTER TABLE symbols ADD COLUMN is_project INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE symbols ADD COLUMN pagerank REAL NOT NULL DEFAULT 0.0",
     "ALTER TABLE llm_analysis ADD COLUMN content_hash TEXT NOT NULL DEFAULT ''",
+    "ALTER TABLE build_configs ADD COLUMN embedding_dim INTEGER",
 ]
 
 _SCHEMA = """
@@ -1073,6 +1074,7 @@ def upsert_build_config(
     config_hash: str,
     project_id: str,
     compile_commands_path: str,
+    embedding_dim: int | None = None,
 ) -> None:
     """Insert or update a build configuration record.
 
@@ -1084,17 +1086,20 @@ def upsert_build_config(
         config_hash: Content-addressable hash of the compile_commands.json.
         project_id: Foreign key to ``projects``.
         compile_commands_path: Absolute path to ``compile_commands.json``.
+        embedding_dim: Embedding vector dimension detected from the model.
+            ``None`` when embeddings are disabled or not yet generated.
 
     Returns:
         None.
     """
     conn.execute(
-        """INSERT INTO build_configs(config_hash, project_id, compile_commands_path)
-           VALUES (?,?,?)
+        """INSERT INTO build_configs(config_hash, project_id, compile_commands_path, embedding_dim)
+           VALUES (?,?,?,?)
            ON CONFLICT(config_hash) DO UPDATE SET
                created_at = datetime('now'),
-               compile_commands_path = excluded.compile_commands_path""",
-        (config_hash, project_id, compile_commands_path),
+               compile_commands_path = excluded.compile_commands_path,
+               embedding_dim = coalesce(excluded.embedding_dim, build_configs.embedding_dim)""",
+        (config_hash, project_id, compile_commands_path, embedding_dim),
     )
 
 
@@ -1570,17 +1575,17 @@ def get_template_instances(
 
 # ---------------------------------------------------------------------------
 # Embedding helpers — pack/unpack float vectors as BLOBs for the embeddings
-# table.  1024 float32 values = 4096 bytes per embedding with mxbai-embed-large.
+# table.  Vector dimension is detected at runtime from the Ollama response;
+# no hardcoded value.  The ``build_configs.embedding_dim`` column stores
+# the detected dimension per build for vec0 table compatibility.
 # ---------------------------------------------------------------------------
-
-_EMBEDDING_DIM = 1024
 
 
 def _vec_to_blob(vec: list[float]) -> bytes:
     """Pack a float vector into a BLOB for storage.
 
     Uses ``struct.pack("f" * N, *vec)`` where each float32 is 4 bytes.
-    The embedding dimension is ``_EMBEDDING_DIM`` (1024 for mxbai-embed-large).
+    The embedding dimension is determined at runtime from the model response.
 
     Args:
         vec: Float vector (list of float32 values).
@@ -1659,15 +1664,39 @@ CREATE VIRTUAL TABLE IF NOT EXISTS vec_symbols USING vec0(
 """
 
 
-def init_vec_table(conn: sqlite3.Connection) -> None:
+def init_vec_table(conn: sqlite3.Connection, dim: int = 1024) -> None:
     """Create the vec0 virtual table if it does not exist.
 
     Must be called after ``sqlite_vec.load(conn)``.
     The table stores embeddings keyed by ``symbol_id`` with a per-build
     ``config_hash`` metadata column for filtered KNN queries.
+
+    When the table already exists but with a different embedding dimension,
+    it is dropped and recreated to match *dim*.  Dimension is stored in
+    ``build_configs.embedding_dim`` during indexing.
     """
-    conn.execute(_VEC_SCHEMA.format(dim=_EMBEDDING_DIM))
+    current_dim = _get_vec_table_dim(conn)
+    if current_dim is not None and current_dim != dim:
+        log.info("Recreating vec0 table: dimension changed %d → %d", current_dim, dim)
+        conn.execute("DROP TABLE IF EXISTS vec_symbols")
+        conn.commit()
+    conn.execute(_VEC_SCHEMA.format(dim=dim))
     conn.commit()
+
+
+def _get_vec_table_dim(conn: sqlite3.Connection) -> int | None:
+    """Return the embedding dimension of the existing vec0 table, or None."""
+    try:
+        info = conn.execute("PRAGMA table_info(vec_symbols)").fetchall()
+        for col in info:
+            if col["name"] == "embedding":
+                dim_str = col.get("type", "")
+                import re
+                m = re.search(r"\[(\d+)\]", dim_str)
+                return int(m.group(1)) if m else None
+        return None
+    except sqlite3.OperationalError:
+        return None
 
 
 def upsert_embeddings_vec(

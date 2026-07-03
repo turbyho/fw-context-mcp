@@ -504,7 +504,7 @@ async def semantic_search(
         # Generate query embedding
         try:
             query_embs = await asyncio.to_thread(
-                call_ollama_embed, [query], cfg.llm
+                call_ollama_embed, [query], cfg.llm, query=True
             )
             query_vec = query_embs[0]
         except Exception as e:

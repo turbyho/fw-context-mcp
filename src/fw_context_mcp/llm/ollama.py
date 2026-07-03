@@ -142,24 +142,35 @@ def call_ollama(
         raise OllamaError(str(e)) from e
 
 
-def call_ollama_embed(inputs: list[str], cfg: LLMConfig) -> list[list[float]]:
+def call_ollama_embed(inputs: list[str], cfg: LLMConfig, *, query: bool = True) -> list[list[float]]:
     """Generate embeddings for a batch of texts via Ollama.
 
     Uses the configured embedding model (e.g. ``mxbai-embed-large``).
     Batching is handled by Ollama — send all texts in one request.
 
+    When ``cfg.embed_query_prompt`` (query=True) or ``cfg.embed_doc_prompt``
+    (query=False) is non-empty, the instruction is prepended to each input
+    text before sending to Ollama.
+
     Args:
         inputs: List of text strings to embed.
-        cfg: LLM configuration (ollama_url, embed_model, debug_log).
+        cfg: LLM configuration (ollama_url, embed_model, debug_log,
+            embed_query_prompt, embed_doc_prompt).
+        query: When True (default), prepend ``embed_query_prompt``.
+            When False, prepend ``embed_doc_prompt`` (used during indexing).
 
     Returns:
-        List of embedding vectors, each a list of floats (typically 1024-dim).
+        List of embedding vectors, each a list of floats (dimension varies
+        by model — typically 1024 for mxbai-embed-large).
 
     Raises:
         OllamaError: On network failure. Auto-pulls the model on HTTP 404,
             then retries once.
     """
     url = cfg.ollama_url.rstrip("/") + "/api/embed"
+    prompt = cfg.embed_query_prompt if query else cfg.embed_doc_prompt
+    if prompt:
+        inputs = [prompt + inp for inp in inputs]
     payload = {
         "model": cfg.embed_model,
         "input": inputs,
