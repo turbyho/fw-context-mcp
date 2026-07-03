@@ -494,7 +494,7 @@ def reindex_file_impl(
                 if cfg.llm.enabled and cfg.llm.analyze_symbols and total_symbols > 0:
                     try:
                         from ...indexer.runner import _build_llm_analysis
-                        _build_llm_analysis(conn, config_hash, cfg.llm, db_path.parent, write_lock_held=True)
+                        _build_llm_analysis(conn, config_hash, cfg.llm, db_path.parent, write_lock_held=True, retry_unparseable=True)
                         conn.commit()
                         analyzed_count = conn.execute(
                             "SELECT COUNT(*) FROM llm_analysis a JOIN symbols s ON s.id = a.symbol_id WHERE s.config_hash = ?",
