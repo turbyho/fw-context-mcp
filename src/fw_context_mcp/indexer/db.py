@@ -1664,39 +1664,24 @@ CREATE VIRTUAL TABLE IF NOT EXISTS vec_symbols USING vec0(
 """
 
 
-def init_vec_table(conn: sqlite3.Connection, dim: int = 1024) -> None:
+def init_vec_table(conn: sqlite3.Connection, dim: int | None = None) -> None:
     """Create the vec0 virtual table if it does not exist.
 
     Must be called after ``sqlite_vec.load(conn)``.
     The table stores embeddings keyed by ``symbol_id`` with a per-build
     ``config_hash`` metadata column for filtered KNN queries.
 
-    When the table already exists but with a different embedding dimension,
-    it is dropped and recreated to match *dim*.  Dimension is stored in
-    ``build_configs.embedding_dim`` during indexing.
+    When *dim* is passed explicitly (during indexing after the embedding
+    dimension is known), the table is dropped and recreated to match.
+    When *dim* is ``None`` (called from ``open_db``), the table is only
+    created if it does not already exist — the real dimension is applied
+    later by ``_build_embeddings``.
     """
-    current_dim = _get_vec_table_dim(conn)
-    if current_dim is not None and current_dim != dim:
-        log.info("Recreating vec0 table: dimension changed %d → %d", current_dim, dim)
+    if dim is not None:
         conn.execute("DROP TABLE IF EXISTS vec_symbols")
         conn.commit()
-    conn.execute(_VEC_SCHEMA.format(dim=dim))
+    conn.execute(_VEC_SCHEMA.format(dim=dim or 1024))
     conn.commit()
-
-
-def _get_vec_table_dim(conn: sqlite3.Connection) -> int | None:
-    """Return the embedding dimension of the existing vec0 table, or None."""
-    try:
-        info = conn.execute("PRAGMA table_info(vec_symbols)").fetchall()
-        for col in info:
-            if col["name"] == "embedding":
-                dim_str = col.get("type", "")
-                import re
-                m = re.search(r"\[(\d+)\]", dim_str)
-                return int(m.group(1)) if m else None
-        return None
-    except sqlite3.OperationalError:
-        return None
 
 
 def upsert_embeddings_vec(
