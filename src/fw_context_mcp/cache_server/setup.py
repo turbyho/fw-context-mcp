@@ -138,6 +138,7 @@ def _ensure_server_venv() -> bool:
             venv_dir = Path(candidate).parent.parent
             print(f"  [✓] Server venv — {venv_dir}")
             os.environ["FW_CACHE_VENV"] = str(venv_dir)
+            _install_cli_symlinks(venv_dir)
             return True
 
     print("  [!] Server venv — not found")
@@ -161,9 +162,10 @@ def _ensure_server_venv() -> bool:
     pip = str(venv_dir / "bin" / "pip")
 
     # Install fw-context-mcp from local wheel (same version as running)
+    from fw_context_mcp import __version__ as _current_version
     wheel_candidates = [
-        Path.home() / "fw_context_mcp-0.11.1-py3-none-any.whl",
-        Path("/tmp/fw_context_mcp-0.11.1-py3-none-any.whl"),
+        Path.home() / f"fw_context_mcp-{_current_version}-py3-none-any.whl",
+        Path("/tmp") / f"fw_context_mcp-{_current_version}-py3-none-any.whl",
     ]
     wheel_path = None
     for w in wheel_candidates:
@@ -182,8 +184,21 @@ def _ensure_server_venv() -> bool:
     _run(["sudo", "chown", "-R", "fw-cache:fw-cache", str(venv_dir)], timeout=10)
 
     os.environ["FW_CACHE_VENV"] = str(venv_dir)
+    _install_cli_symlinks(venv_dir)
     print(f"  [✓] Server venv — {venv_dir}")
     return True
+
+
+def _install_cli_symlinks(venv_dir: Path) -> None:
+    """Create symlinks in /usr/local/bin for fw-cache-server and fw-cache-admin."""
+    bindir = Path("/usr/local/bin")
+    for cmd in ("fw-cache-server", "fw-cache-admin"):
+        target = venv_dir / "bin" / cmd
+        link = bindir / cmd
+        if link.exists() or link.is_symlink():
+            continue
+        if _run(["sudo", "ln", "-s", str(target), str(link)], timeout=10):
+            print(f"  [✓] Symlink — {link} -> {target}")
 
 
 # -- PostgreSQL --
