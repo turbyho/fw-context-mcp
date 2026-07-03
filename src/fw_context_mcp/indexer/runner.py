@@ -274,17 +274,22 @@ def _build_embeddings(conn, config_hash: str, llm_config, db_dir: Path) -> None:
     total = 0
     chunk_size = 100
     total_batches = (len(rows) + chunk_size - 1) // chunk_size
+    embedding_dim: int | None = None
     for i in range(0, len(rows), chunk_size):
         batch_num = i // chunk_size
         chunk_rows = rows[i:i + chunk_size]
         chunk_descs = descriptions[i:i + chunk_size]
         t0 = time.monotonic()
         try:
-            embs = call_ollama_embed(chunk_descs, llm_config)
+            embs = call_ollama_embed(chunk_descs, llm_config, query=False)
         except Exception as e:
             elapsed = time.monotonic() - t0
             log.warning("[%d/%d] embedding batch failed %s: %s", batch_num + 1, total_batches, _fmt_dur(elapsed), e)
             continue
+
+        if embedding_dim is None and embs:
+            embedding_dim = len(embs[0])
+            log.info("Embedding dimension detected: %d (model=%s)", embedding_dim, model)
 
         # Store in legacy BLOB table (backward compatibility)
         with write_lock(db_dir, timeout=5.0):
@@ -302,6 +307,16 @@ def _build_embeddings(conn, config_hash: str, llm_config, db_dir: Path) -> None:
         elapsed = time.monotonic() - t0
         log.info("[%d/%d] %d symbols embedded %s", batch_num + 1, total_batches, len(chunk_rows), _fmt_dur(elapsed))
     log.info("Embeddings stored: %d symbols (model=%s)", total, model)
+    if embedding_dim is not None:
+        conn.execute(
+            "UPDATE build_configs SET embedding_dim = ? WHERE config_hash = ?",
+            (embedding_dim, config_hash),
+        )
+        from .db import init_vec_table
+        try:
+            init_vec_table(conn, embedding_dim)
+        except Exception as e:
+            log.warning("vec0 table recreation failed (non-fatal): %s", e)
 
 # SDK path patterns for filtering (mbed-os, Zephyr, PlatformIO, build dirs)
 _SDK_PATH_PATTERNS = ("mbed-os/", ".pio/", "zephyr/", "build/", "modules/")

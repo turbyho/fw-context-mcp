@@ -91,7 +91,7 @@ class EmbeddingPhase(Phase):
 
                 # Generate query embedding
                 try:
-                    query_embs = call_ollama_embed([ctx.query], ctx.config.llm)
+                    query_embs = call_ollama_embed([ctx.query], ctx.config.llm, query=True)
                     query_vec = query_embs[0]
                 except OllamaError:
                     return ctx  # Embedding model unavailable

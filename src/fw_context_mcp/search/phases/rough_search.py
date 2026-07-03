@@ -134,7 +134,7 @@ async def _try_embedding_samples(ctx) -> list[dict] | None:
                 return None
 
             try:
-                query_embs = call_ollama_embed([ctx.query], ctx.config.llm)
+                query_embs = call_ollama_embed([ctx.query], ctx.config.llm, query=True)
                 query_vec = query_embs[0]
             except OllamaError:
                 return None
