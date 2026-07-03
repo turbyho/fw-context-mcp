@@ -213,7 +213,7 @@ Not the text on disk.
 | **Symbols** | SQLite | name, kind, file, line, signature, docstring for every function/method/class/enum/variable |
 | **Full-text** | FTS5 | inverted index over names, qualified names, tokens, summaries — prefix and phrase search |
 | **Call graph** | refs table | every call edge: who calls whom, who reads which variable |
-| **Vectors** | sqlite-vec | 1024-dimensional embeddings for semantic/concept search |
+| **Vectors** | sqlite-vec | Variable-dimension embeddings for semantic/concept search (mxbai 1024-dim, qwen3 4096-dim) |
 | **Analysis** | llm_analysis table | pre-computed plain-English explanations of every function |
 
 ### The 29 Tools
@@ -255,6 +255,7 @@ querying the index:
 **🔧 Maintenance** — Keep the index healthy
 - `get_active_build` — health check: is the index stale?
 - `reindex_file` — update one file after editing
+- `reindex_file_impl` — internal variant with explicit `with_analysis` control
 - `reset_index` — delete and rebuild
 - `list_projects` — what's indexed on this machine?
 - `check_ollama` — is Ollama available for smart_search?
@@ -528,7 +529,6 @@ Your AI now queries the index instead of grepping files.
 ### 4. Stay Fresh
 
 ```bash
-fw-context reindex src/control.cpp    # after editing — incremental, fast
 fw-context index                       # after a big merge
 # Or just work — auto-reindex detects stale files on query
 ```

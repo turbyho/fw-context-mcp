@@ -161,7 +161,7 @@ def call_ollama_embed(inputs: list[str], cfg: LLMConfig, *, query: bool = True) 
 
     Returns:
         List of embedding vectors, each a list of floats (dimension varies
-        by model — typically 1024 for mxbai-embed-large).
+        by model — 1024 for mxbai-embed-large, 4096 for qwen3-embedding).
 
     Raises:
         OllamaError: On network failure. Auto-pulls the model on HTTP 404,

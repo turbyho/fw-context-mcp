@@ -76,8 +76,12 @@ go in the shared `config.toml` — LLM configuration is developer-specific.
 | `enabled` | `true` | global, local | Enable Ollama. When `false`, `smart_search` falls back to word-split FTS5, `explain_symbol` returns source + prompt for the AI assistant. |
 | `ollama_url` | `"http://localhost:11434"` | global, local | Ollama API base URL. Change for remote GPU servers. |
 | `model` | `"qwen2.5-coder:14b"` | global, local | LLM model tag. Override per-project for different codebases. |
-| `embed_model` | `"mxbai-embed-large:latest"` | global, local | Embedding model for vector search. Auto-pulled on first use. |
+| `embed_model` | `"mxbai-embed-large:latest"` | global, local | Embedding model for vector search. Auto-pulled on first use. ``mxbai-embed-large`` runs on CPU; for GPU, use ``qwen3-embedding:8b`` (~4.7 GB VRAM, 4096-dim vectors). |
+| `embed_query_prompt` | *(auto-detect)* | global, local | Instruction prepended to query text before embedding. Auto-detected from model prefix: ``mxbai-*`` → ``"Represent this sentence for searching relevant passages: "``, ``qwen3-embedding*`` → code retrieval instruction. Set explicitly to override, or ``""`` to disable. |
+| `embed_doc_prompt` | *(empty)* | global, local | Instruction prepended to symbol descriptions during indexing. Most models work best with an empty prompt — only set when the model's training expects a per-document instruction. |
 | `num_ctx` | `16384` | global, local | Context window in tokens. Accommodates full function bodies during analysis generation. |
+| `keep_alive` | `"10m"` | global, local | How long to keep the model loaded in VRAM after a request (minutes, seconds, or ``-1`` for indefinite). During indexing, prevents per-request model loading (~2–5 s each). |
+| `timeout` | `600.0` | global, local | HTTP request timeout in seconds for Ollama API calls. Embed requests use ``timeout × 2``. |
 | `analyze_symbols` | `true` | global, local | Generate per-symbol LLM analysis (summary, inputs, outputs) during indexing. Stored in `llm_analysis` table — symbols become searchable by purpose. |
 | `debug_log` | *(none)* | global, local | Path to JSONL debug log for Ollama prompts + responses. Example: `"~/.fw-context/llm-debug.jsonl"`. |
 
@@ -197,7 +201,11 @@ Keep this file out of git (add to `.gitignore`). It overrides settings from
 # ollama_url = "http://localhost:11434"
 # model = "qwen2.5-coder:14b"           # override if you have a different model
 # analyze_symbols = true
-# analyze_files = true
+#
+# ── Embedding model ──
+# Uncomment for better search quality with a GPU:
+# embed_model = "qwen3-embedding:8b"
+# embed_query_prompt = "Retrieve C/C++ functions, types, symbols, and implementation code relevant to the query."
 
 [index]
 # db_dir = "~/.fw-context/index"        # override if you store indexes elsewhere

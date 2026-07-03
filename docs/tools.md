@@ -162,7 +162,6 @@ or when you want to re-generate analysis for all symbols.
 ```bash
 fw-context analyze                        # analyze current project
 fw-context analyze --project /path        # specific project
-fw-context analyze --retry-failed         # retry only symbols where analysis failed
 ```
 
 Analysis is generated per function/method using the full function body
@@ -213,7 +212,7 @@ Show version information.
 
 ```bash
 $ fw-context version
-fw-context-mcp 0.2.3
+fw-context-mcp <version>
 ```
 
 ---
@@ -253,17 +252,19 @@ include `summary`, `inputs`, and `outputs` fields with plain-English
 descriptions.
 
 **Progressive relaxation:** when the initial FTS5 search returns nothing, the
-tool automatically broadens the search in four fallback steps:
+tool automatically broadens the search in up to five steps:
 
-1. *FTS5 without kind filter* — drops the `kind` constraint (users often guess
+1. *FTS5 with kind filter* — the original query with the user-provided `kind`
+   constraint.
+2. *FTS5 without kind filter* — drops the `kind` constraint (users often guess
    the wrong kind for a symbol).
-2. *`name_tokens` substring match* — searches the pre-computed CamelCase/
+3. *`name_tokens` substring match* — searches the pre-computed CamelCase/
    snake_case token column (e.g. `BuildType` is indexed as `"build type"`).
    Requires at least N‑1 of N query terms to match.
-3. *Single-term docstring LIKE* — when only one query term was given and the
+4. *Single-term docstring LIKE* — when only one query term was given and the
    token-based steps found nothing, does a raw LIKE over the docstring column
    to catch terms the FTS5 tokeniser may have missed.
-4. *Individual term FTS5* — searches each query word separately and merges
+5. *Individual term FTS5* — searches each query word separately and merges
    the results.
 
 Results from fallback steps carry `_fallback` indicating which method
@@ -320,13 +321,14 @@ related to a natural-language query, even when the query words don't appear
 literally in the code.
 
 ```
-Input:  {"query": "parcel locker state machine", "project_root?": "/path/to/project", "threshold?": 0.55, "limit?": 20}
+Input:  {"query": "parcel locker state machine", "project_root?": "/path/to/project", "threshold?": 0.60, "limit?": 20}
 Output: [{"name": "set_shipment", "qualified_name": "Locker::set_shipment",
           "_similarity": 0.72, "_method": "embedding", …}, …]
 ```
 
-Uses cosine similarity over 1024-dimensional embeddings (generated during
-`fw-context index --embeddings`). **When to prefer over `search_code`:**
+Uses cosine similarity over variable-dimension embeddings (generated during
+`fw-context index --embeddings`). Models: mxbai-embed-large → 1024-dim,
+qwen3-embedding → 4096-dim. **When to prefer over `search_code`:**
 conceptual queries ("power consumption" → `get_load_power`) where keywords
 don't match. **When to prefer `search_code`:** known keywords or symbol names
 (`"fram_write"`, `"cbor encode"`).
@@ -337,7 +339,7 @@ project code (1.2×) over vendored SDK paths (0.85×).
 
 **Threshold guidance** (mxbai-embed-large):
 - `0.50` — exploratory, more results
-- `0.55` — balanced
+- `0.55` — balanced, ~1000 results
 - `0.60` — high precision (default)
 - `0.65` — strict, may miss relevant symbols
 
@@ -813,9 +815,7 @@ disabled, empty when all symbols are analyzed).
 - `compile_commands.json` changed since the index was built, or
 - any indexed source file has a newer on-disk mtime (`modified_files_count > 0`), or
 - `schema_version < current_schema` — the index was built with an older
-  DB schema, or
-- `unanalyzed_symbols > 0` — some symbols lack LLM analysis (index built
-  with `--no-analyze`).
+  DB schema
 
 #### `reindex_file`
 
@@ -827,9 +827,28 @@ Output: {"file": "/abs/path/to/src/main.c", "translation_units": 1,
          "symbols_updated": 28, "elapsed_s": 2.5}
 ```
 
-**Limitation:** The file must appear in `compile_commands.json`. Header-only
-files without a corresponding `.c`/`.cpp` entry cannot be re-indexed this way —
-run `fw-context index` instead.
+**Limitation:** The file must appear in `compile_commands.json`. Headers are
+re-indexed via the translation unit that includes them — a single header
+included by multiple TUs may need a full `fw-context index` for completeness.
+
+#### `reindex_file_impl`
+
+Shared implementation used by ``reindex_file`` (public tool, full analysis)
+and background auto-reindex (fast path, no LLM). Prefer ``reindex_file``
+for interactive use; use this only when you need to control
+`with_analysis` explicitly.
+
+```
+Input:  {"file_path": "/abs/path/to/src/main.c", "project_root?": "/path/to/project", "with_analysis?": true}
+Output: {"file": "/abs/path/to/src/main.c", "translation_units": 1,
+         "symbols_updated": 28, "elapsed_s": 2.5,
+         "analysis_updated": 12, "analysis_warning": null}
+```
+
+When ``with_analysis=True`` (default), also regenerates LLM symbol analysis
+and method override relationships — slower but produces a fully up-to-date
+index. Set ``False`` for a fast symbol-only update. Requires an existing
+index; the file must appear in ``compile_commands.json``.
 
 #### `reset_index`
 
@@ -1047,7 +1066,7 @@ symbols are stored in two tables:
 
 | Table | Storage | Query method |
 |-------|---------|-------------|
-| `embeddings` | BLOB (4096 bytes per 1024-dim vector) | Legacy brute-force (Python) |
+| `embeddings` | BLOB (4 bytes × dim floats — 4096 for mxbai 1024-dim, 16384 for qwen3 4096-dim) | Legacy brute-force (Python) |
 | `vec_symbols` (vec0) | sqlite-vec virtual table | KNN via `MATCH` (C implementation) |
 
 The `EmbeddingPhase` prefers `vec0` when available (index built after this

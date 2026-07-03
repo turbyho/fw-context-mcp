@@ -296,10 +296,10 @@ def reset_index(
 
 # ── moved from server.py ──
 def reindex_file_impl(
-    file_path: str,
-    project_root: str | None = None,
+    file_path: Annotated[str, Field(description="Absolute or project-relative path to the source file to re-parse. Must have a matching entry in compile_commands.json.")],
+    project_root: Annotated[str | None, Field(description="Project root directory. Auto-detected from cwd if omitted.")] = None,
     *,
-    with_analysis: bool = True,
+    with_analysis: Annotated[bool, Field(description="When True (default), also regenerates LLM symbol analysis and method override relationships — slower but produces a fully up-to-date index. Set False for a fast symbol-only update (used by background auto-reindex).")] = True,
 ) -> dict:
     """Re-parse a single source file with libclang and update its symbols in the index.
 

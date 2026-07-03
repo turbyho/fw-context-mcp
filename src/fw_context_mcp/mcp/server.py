@@ -2,23 +2,24 @@
 
 Serves 29 MCP tools and 3 MCP resources via FastMCP (stdio transport).
 
-**Search tools** (delegate to ``fw_context_mcp.search`` pipeline):
-``search_code`` (FTS5), ``smart_search`` (Ollama-driven), ``semantic_search``
-(embeddings + cosine similarity).
+**Search & lookup tools** (delegate to ``fw_context_mcp.search`` pipeline):
+``search_code`` (FTS5), ``lookup_symbol`` (exact/prefix), ``smart_search``
+(Ollama-driven), ``semantic_search`` (embeddings + cosine similarity).
 
-**Symbol reading tools:** ``lookup_symbol``, ``get_source``, ``get_file_map``,
-``get_symbol_context``, ``explain_symbol``.
+**Symbol reading tools:** ``get_source``, ``get_file_map``, ``get_symbol_context``,
+``explain_symbol``.
 
 **Call graph tools** (require ``--refs`` index): ``find_callers``,
 ``find_references``, ``find_call_path``, ``find_all_callers_recursive``,
 ``find_callees_recursive``, ``find_hotspots``, ``find_dead_code``,
-``find_wrapper_callers``, ``trace_data_flow``.
+``find_wrapper_callers``, ``find_indirect_call_sites``,
+``find_indirect_targets``, ``trace_data_flow``.
 
 **Inheritance tools:** ``get_inheritance_chain``, ``get_class_members``,
 ``get_template_instances``, ``get_method_overrides``.
 
 **Maintenance tools:** ``get_active_build``, ``list_projects``, ``check_ollama``,
-``reindex_file``, ``reset_index``.
+``reindex_file``, ``reindex_file_impl``, ``reset_index``.
 
 **MCP Resources:** ``fw-context://stats``, ``fw-context://projects``,
 ``fw-context://symbols/{name}``.

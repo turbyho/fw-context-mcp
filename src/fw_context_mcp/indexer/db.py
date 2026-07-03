@@ -413,7 +413,8 @@ CREATE INDEX IF NOT EXISTS idx_fpa_config_rhs ON fp_assignments(config_hash, rhs
 CREATE INDEX IF NOT EXISTS idx_fpa_config_file ON fp_assignments(config_hash, from_file);
 
 -- Symbol embeddings for semantic search (opt-in via [index] index_embeddings = true).
--- Stored as BLOB: 1024 float32 values packed with struct.pack('f', ...).
+-- Stored as BLOB: variable-dimension float32 values packed with struct.pack('f', ...).
+-- Common: mxbai-embed-large → 1024 floats (4096 bytes), qwen3-embedding → 4096 floats (16384 bytes).
 -- ON DELETE CASCADE: when a symbol row is deleted, its embedding is removed.
 CREATE TABLE IF NOT EXISTS embeddings (
     symbol_id    INTEGER PRIMARY KEY REFERENCES symbols(id) ON DELETE CASCADE,
