@@ -260,11 +260,11 @@ def _build_platformio(project_root: Path, cfg: BuildConfig) -> Path:
 
     pio_bin = "pio" if shutil.which("pio") else "platformio"
 
-    cmd: list[str] = [pio_bin, "run", "--target", "compiledb"]
+    cmd: list[str] = [pio_bin, "run", "--project-dir", str(project_root), "--target", "compiledb"]
 
     if cfg.clean:
         # pio run --target clean && pio run --target compiledb
-        clean_cmd = [pio_bin, "run", "--target", "clean"]
+        clean_cmd = [pio_bin, "run", "--project-dir", str(project_root), "--target", "clean"]
         log.info("platformio clean: %s", " ".join(clean_cmd))
         subprocess.run(clean_cmd, cwd=project_root)
 

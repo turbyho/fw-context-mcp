@@ -25,7 +25,9 @@ def cmd_index(args: argparse.Namespace) -> int:
     """
     from .config import derive_project_id
     from .config import load as load_config
+    from .indexer.build import detect_build_system
     from .indexer.runner import run
+    from .utils import resolve_project_root
 
     logging.basicConfig(
         level=logging.DEBUG if args.verbose else logging.INFO,
@@ -33,8 +35,16 @@ def cmd_index(args: argparse.Namespace) -> int:
         datefmt="%H:%M:%S",
     )
 
-    project_root = Path(args.project or ".").resolve()
+    project_root = resolve_project_root(args.project)
     cfg = load_config(project_root=project_root)
+
+    # Early validation: confirm we detected a known build system
+    # Prominent banner so the user can verify the right project is being indexed
+    detected_system = detect_build_system(project_root)
+    if detected_system:
+        print(f"Project: {project_root.name}  path={project_root}  build={detected_system}")
+    else:
+        print(f"Project: {project_root.name}  path={project_root}  build=unknown")
 
     # Resolve compile_commands.json path
     explicit_cc = bool(args.compile_commands)
@@ -119,6 +129,7 @@ def cmd_index(args: argparse.Namespace) -> int:
         project_id=project_id,
         llm_config=cfg.llm,
         cache_server_config=cs_config,
+        force=args.force,
     )
     print(f"Indexed. config_hash={config_hash[:16]}…  db={db_path}")
     return 0
@@ -133,8 +144,9 @@ def cmd_search(args: argparse.Namespace) -> int:
     from .config import derive_project_id
     from .config import load as load_config
     from .indexer.db import get_active_config, open_db, search_symbols
+    from .utils import resolve_project_root
 
-    project_root = Path(args.project or ".").resolve()
+    project_root = resolve_project_root(args.project)
     cfg = load_config(project_root=project_root)
     project_id = derive_project_id(project_root)
 
@@ -202,8 +214,9 @@ def cmd_reset(args: argparse.Namespace) -> int:
     from .config import derive_project_id
     from .config import load as load_config
     from .indexer.db import get_active_config, open_db
+    from .utils import resolve_project_root
 
-    project_root = Path(args.project or ".").resolve()
+    project_root = resolve_project_root(args.project)
     cfg = load_config(project_root=project_root)
 
     project_id = derive_project_id(project_root)
@@ -249,8 +262,9 @@ def cmd_status(args: argparse.Namespace) -> int:
     from .config import derive_project_id
     from .config import load as load_config
     from .indexer.db import get_active_config, open_db
+    from .utils import resolve_project_root
 
-    project_root = Path(args.project or ".").resolve()
+    project_root = resolve_project_root(args.project)
     cfg = load_config(project_root=project_root)
 
     project_id = derive_project_id(project_root)
@@ -485,8 +499,9 @@ def cmd_project_init(args: argparse.Namespace) -> int:
         _PROJECT_DEFAULTS_TEMPLATE,
         _PROJECT_LOCAL_DEFAULTS_TEMPLATE,
     )
+    from .utils import resolve_project_root
 
-    project_root = Path(args.project or ".").resolve()
+    project_root = resolve_project_root(args.project)
     cfg = load_config(project_root=project_root)
     fix = args.fix
 
@@ -824,8 +839,9 @@ def cmd_export(args: argparse.Namespace) -> int:
     from .config import load as load_config
     from .indexer.build import detect_build_system
     from .indexer.db import count_refs, get_active_config, open_db
+    from .utils import resolve_project_root
 
-    project_root = Path(args.project or ".").resolve()
+    project_root = resolve_project_root(args.project)
     cfg = load_config(project_root=project_root)
     project_id = derive_project_id(project_root)
     db_path = cfg.index.db_dir / project_id / "index.db"
@@ -911,6 +927,7 @@ def cmd_analyze(args: argparse.Namespace) -> int:
     from .config import load as load_config
     from .indexer.db import get_active_config, open_db
     from .indexer.runner import _build_llm_analysis, _build_overrides
+    from .utils import resolve_project_root
 
     logging.basicConfig(
         level=logging.DEBUG if args.verbose else logging.INFO,
@@ -918,7 +935,7 @@ def cmd_analyze(args: argparse.Namespace) -> int:
         datefmt="%H:%M:%S",
     )
 
-    project_root = Path(args.project or ".").resolve()
+    project_root = resolve_project_root(args.project)
     cfg = load_config(project_root=project_root)
 
     if not cfg.llm.enabled:
@@ -993,10 +1010,11 @@ def cmd_version(args: argparse.Namespace) -> int:
 def cmd_cache_stats(args: argparse.Namespace) -> int:
     """Show cache statistics for one or both tiers."""
     from .config import load as load_config
+    from .utils import resolve_project_root
     from fw_context_mcp.cache_client import local_cache_stats
 
     show_local = not args.remote
-    project_root = Path(args.project or ".").resolve() if hasattr(args, "project") else None
+    project_root = resolve_project_root(args.project) if hasattr(args, "project") else None
 
     # Tier 1: local global cache
     if show_local:
@@ -1023,9 +1041,10 @@ def cmd_cache_clear(args: argparse.Namespace) -> int:
     """Delete cache entries for one or both tiers."""
     from .config import derive_project_id
     from .config import load as load_config
+    from .utils import resolve_project_root
     from fw_context_mcp.cache_client import local_cache_clear, CacheClient
 
-    project_root = Path(args.project or ".").resolve() if hasattr(args, "project") else None
+    project_root = resolve_project_root(args.project) if hasattr(args, "project") else None
 
     # Determine which tiers to clear
     clear_local = args.all or not args.remote
@@ -1115,7 +1134,7 @@ def main() -> None:
     p_index.add_argument("--analyze", action="store_true", dest="analyze", default=False,
                          help="Generate LLM-based symbol analysis (summary, inputs, outputs)")
     p_index.add_argument("--no-analyze", action="store_true", dest="no_analyze", help="Skip LLM analysis generation")
-    p_index.add_argument("--force", action="store_true", help="Overwrite existing LLM analysis cache entries (local + remote server; requires can_overwrite)")
+    p_index.add_argument("--force", action="store_true", help="Force re-index of all files, embeddings, LLM analysis, overrides, and caches (skip mtime/checksum checks)")
     p_index.set_defaults(func=cmd_index)
 
     p_search = sub.add_parser("search", help="Search indexed symbols")
