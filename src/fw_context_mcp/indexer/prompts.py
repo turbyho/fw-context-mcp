@@ -161,7 +161,9 @@ def _flatten_value(value: Any) -> str:
 # Valid JSON escape sequences.  Anything else (e.g. ``\'``, ``\x``) is a
 # model error — the backslash is stripped so the character passes through
 # literally.
-_INVALID_JSON_ESCAPE = re.compile(r"\\(?![\"\\/bfnrt]|u[0-9a-fA-F]{4})")
+# Negative lookbehind (?<!\\\\) prevents stripping the second backslash of
+# a valid \\\\ pair (e.g. '\\\\' → '\\\\' stays valid; '\\' alone IS stripped).
+_INVALID_JSON_ESCAPE = re.compile(r"(?<!\\)\\(?![\"\\/bfnrt]|u[0-9a-fA-F]{4})")
 
 
 def _extract_first_json_array(text: str) -> str | None:

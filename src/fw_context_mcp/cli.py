@@ -988,7 +988,8 @@ def cmd_analyze(args: argparse.Namespace) -> int:
                 logging.getLogger(__name__).warning("Failed to create CacheClient: %s", e)
 
         _build_llm_analysis(conn, config_hash, cfg.llm, db_path.parent,
-                           exclude_like=exclude_like, cache_client=cc)
+                           exclude_like=exclude_like, cache_client=cc,
+                           retry_unparseable=True)
         if cc:
             cc.close()
         _build_overrides(conn, config_hash, db_path.parent)

@@ -395,6 +395,7 @@ def _build_llm_analysis(
     exclude_like: list[str] | None = None,
     write_lock_held: bool = False,
     cache_client=None,
+    retry_unparseable: bool = False,
 ) -> None:
     """Generate structured LLM analysis (summary, inputs, outputs) for each
     project-definition symbol using Ollama, one symbol per request.
@@ -410,6 +411,9 @@ def _build_llm_analysis(
     write lock that serializes DB access across processes.
     *exclude_like* are LIKE patterns for SDK/vendor paths to skip
     (auto-detected from project structure when omitted).
+    *retry_unparseable* when True clears all ``skip:unparseable`` sentinels
+    so previously-failed symbols are re-attempted. Set True for manual
+    indexing, False for background reindex (safe: retries only on model change).
     """
     import httpx
 
@@ -451,14 +455,19 @@ def _build_llm_analysis(
     )
 
     # Un-skip symbols that were skipped due to unparseable output.
-    # The sentinel is "skip:unparseable:<model>" — clear when the
-    # current model differs so a different model can retry.
-    conn.execute(
-        """DELETE FROM llm_analysis
-           WHERE model LIKE 'skip:unparseable:%'
-             AND SUBSTR(model, 18) != ?""",
-        (model,),
-    )
+    # The sentinel is "skip:unparseable:<model>".
+    # Background reindex keeps sentinels (retry only on model change);
+    # manual fw-context index / reindex_file clears all sentinels so
+    # the fixed parser/LLM gets another chance.
+    if retry_unparseable:
+        conn.execute("DELETE FROM llm_analysis WHERE model LIKE 'skip:unparseable:%'")
+    else:
+        conn.execute(
+            """DELETE FROM llm_analysis
+               WHERE model LIKE 'skip:unparseable:%'
+                 AND SUBSTR(model, 18) != ?""",
+            (model,),
+        )
 
     if exclude_like is None:
         exclude_like = []
@@ -1342,7 +1351,8 @@ def run(
             conn.commit()
         log.info("Generating LLM analysis for project symbols...")
         _build_llm_analysis(conn, config_hash, llm_config, db_path.parent,
-                           exclude_like=exclude_like, cache_client=cc)
+                           exclude_like=exclude_like, cache_client=cc,
+                           retry_unparseable=True)
         if cc:
             cc.close()
         conn.commit()
