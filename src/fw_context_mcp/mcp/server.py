@@ -289,6 +289,9 @@ def resource_stats() -> str:
         return "No indexed projects found."
     lines = [f"# fw-context — {len(projects)} project(s)", ""]
     for p in projects:
+        if "info" in p:
+            lines.append(p["info"])
+            continue
         if "error" in p:
             lines.append(f"- **{p.get('db', '?')}**: ERROR — {p['error']}")
             continue
