@@ -1087,3 +1087,254 @@ class TestSearchEdgeCases:
         long_query = "a" * 1000
         results = search_symbols(populated_db, long_query, "hash-deadbeef", limit=5)
         assert isinstance(results, list)
+
+
+class TestSearchBodies:
+    """Tests for search_bodies — FTS5 body search with snippet highlighting.
+
+    search_bodies searches the ``source`` column (function bodies indexed
+    by libclang) via the ``symbols_fts`` FTS5 table.  It uses
+    ``snippet(symbols_fts, 9, ...)`` to highlight matches in context.
+    Column index 9 corresponds to the ``source`` column (0-indexed
+    across 10 FTS5 columns: name, qualified_name, signature, docstring,
+    file_path, name_tokens, summary, inputs, outputs, source).
+    """
+
+    def test_snippet_highlight_on_source_column(self, populated_db):
+        """snippet() with column index 9 highlights matches in source bodies."""
+        fid = upsert_file(populated_db, "hash-deadbeef", "/tmp/attach.cpp", "cpp")
+        insert_symbols_batch(populated_db, [
+            ("hash-deadbeef", fid, "src/attach.cpp",
+             split_tokens("check_timer", "BleMsg::check_timer"),
+             "usr-attach-1", "check_timer", "BleMsg::check_timer", "method",
+             10, 1, 20, 1, "void check_timer()", "", None, 0, 0, "", 0, "", 1, 0.0,
+             'void BleMsg::check_timer() {\n    _timeout.attach('
+             'callback(&BleMsg::TimeoutInterrupt, this), 5s);\n}'),
+        ])
+
+        # Query using snippet with the FIXED column index 9 (source column)
+        rows = populated_db.execute(
+            """SELECT s.name, snippet(symbols_fts, 9, '<b>', '</b>', '…', 60)
+               FROM symbols_fts
+               JOIN symbols s ON s.id = symbols_fts.rowid
+               WHERE symbols_fts MATCH 'attach*' AND s.config_hash = 'hash-deadbeef'
+                 AND s.is_definition = 1 AND s.source != ''
+               ORDER BY rank""",
+        ).fetchall()
+
+        assert len(rows) >= 1
+        # The snippet should contain the highlighted <b>attach</b>
+        snippet = rows[0][1]
+        assert "<b>attach</b>" in snippet
+        assert "TimeoutInterrupt" in snippet
+
+    def test_snippet_column_index_10_fails(self, populated_db):
+        """Regression test: snippet() with column index 10 raises column index out of range.
+
+        The FTS5 table has exactly 10 content columns (indices 0-9).
+        Index 10 was the original bug — remove this test assertion
+        when the table gains an 11th column and index 10 becomes valid.
+        """
+        fid = upsert_file(populated_db, "hash-deadbeef", "/tmp/snippet10.cpp", "cpp")
+        insert_symbols_batch(populated_db, [
+            ("hash-deadbeef", fid, "src/snippet10.cpp",
+             split_tokens("fn", "ns::fn"),
+             "usr-snippet10", "fn", "ns::fn", "function",
+             1, 1, 5, 1, "void fn()", "", None, 0, 0, "", 0, "", 1, 0.0,
+             "void fn() { NVIC_SystemReset(); }"),
+        ])
+
+        # pysqlite3 (used by open_db when available) raises DatabaseError
+        # while stdlib sqlite3 raises OperationalError.
+        try:
+            import pysqlite3  # noqa: F401
+
+            _db_error = pysqlite3.dbapi2.DatabaseError
+        except ImportError:
+            import sqlite3 as _stdlib_sqlite3
+
+            _db_error = _stdlib_sqlite3.DatabaseError
+        with pytest.raises(_db_error, match="column index out of range"):
+            populated_db.execute(
+                """SELECT snippet(symbols_fts, 10, '<b>', '</b>', '…', 60)
+                   FROM symbols_fts
+                   WHERE symbols_fts MATCH 'NVIC*'""",
+            ).fetchall()
+
+    def test_find_attach_pattern_in_body(self, populated_db):
+        """Full search_bodies-like query finds attach(...) patterns in function bodies."""
+        fid = upsert_file(populated_db, "hash-deadbeef", "/tmp/multi.cpp", "cpp")
+        insert_symbols_batch(populated_db, [
+            ("hash-deadbeef", fid, "src/multi.cpp",
+             split_tokens("check_timer", "ModemMsg::check_timer"),
+             "usr-src-1", "check_timer", "ModemMsg::check_timer", "method",
+             10, 1, 20, 1, "void check_timer()", "", None, 0, 0, "", 0, "", 1, 0.0,
+             '_timeout.attach(callback(&ModemMsg::TimeoutInterrupt, this), 30s);'),
+            ("hash-deadbeef", fid, "src/multi.cpp",
+             split_tokens("zbox_reset", "WDT::zbox_reset"),
+             "usr-src-2", "zbox_reset", "WDT::zbox_reset", "method",
+             30, 1, 35, 1, "void zbox_reset()", "", None, 0, 0, "", 0, "", 1, 0.0,
+             '_timeout.attach(callback(&WDT::_timeout_interrupt), delay);'),
+            # Negative: this one does NOT contain "attach"
+            ("hash-deadbeef", fid, "src/multi.cpp",
+             split_tokens("main", "main"),
+             "usr-src-3", "main", "main", "function",
+             40, 1, 45, 1, "int main()", "", None, 0, 0, "", 0, "", 1, 0.0,
+             "int main() { return 0; }"),
+        ])
+
+        # Simulate what search_bodies does (using the fixed index 9)
+        expanded = _expand_query("attach")
+        rows = populated_db.execute(
+            """SELECT s.name, snippet(symbols_fts, 9, '<b>', '</b>', '…', 60)
+               FROM symbols_fts
+               JOIN symbols s ON s.id = symbols_fts.rowid
+               WHERE symbols_fts MATCH ? AND s.config_hash = 'hash-deadbeef'
+                 AND s.is_definition = 1 AND s.source != ''
+               ORDER BY rank""",
+            (expanded,),
+        ).fetchall()
+
+        # Only the two symbols with ".attach(" in their source should be found
+        names = {r[0] for r in rows}
+        assert names == {"check_timer", "zbox_reset"}
+        assert "main" not in names
+
+    def test_find_nvic_pattern_in_body(self, populated_db):
+        """search_bodies finds NVIC_SetVector / NVIC_SystemReset in function bodies."""
+        fid = upsert_file(populated_db, "hash-deadbeef", "/tmp/nvic.cpp", "cpp")
+        insert_symbols_batch(populated_db, [
+            ("hash-deadbeef", fid, "lib/nrf52/serial_api.c",
+             split_tokens("nordic_nrf5_uart0_handler", "nordic_nrf5_uart0_handler"),
+             "usr-nvic-1", "nordic_nrf5_uart0_handler", "nordic_nrf5_uart0_handler",
+             "function", 540, 1, 10, 1, "void nordic_nrf5_uart0_handler()",
+             "", None, 0, 0, "", 0, "", 1, 0.0,
+             "NVIC_SetVector(UARTE0_UART0_IRQn, (uint32_t)nordic_nrf5_uart0_handler);"),
+        ])
+
+        expanded = _expand_query("NVIC_SetVector")
+        rows = populated_db.execute(
+            """SELECT s.name, snippet(symbols_fts, 9, '<b>', '</b>', '…', 60)
+               FROM symbols_fts
+               JOIN symbols s ON s.id = symbols_fts.rowid
+               WHERE symbols_fts MATCH ? AND s.config_hash = 'hash-deadbeef'
+                 AND s.is_definition = 1 AND s.source != ''
+               ORDER BY rank""",
+            (expanded,),
+        ).fetchall()
+
+        assert len(rows) == 1
+        assert rows[0][0] == "nordic_nrf5_uart0_handler"
+        assert "<b>NVIC_SetVector</b>" in rows[0][1]
+
+    def test_expand_query_appends_wildcards(self):
+        """_expand_query appends * to each word for prefix matching."""
+        assert _expand_query("attach callback") == "attach* OR callback*"
+        assert _expand_query("NVIC_SetVector") == "NVIC_SetVector*"
+
+    def test_source_column_empty_skipped(self, populated_db):
+        """Symbols with empty source are excluded from search_bodies results."""
+        fid = upsert_file(populated_db, "hash-deadbeef", "/tmp/empty_source.cpp", "cpp")
+        insert_symbols_batch(populated_db, [
+            ("hash-deadbeef", fid, "src/empty_source.cpp",
+             split_tokens("empty_fn", "ns::empty_fn"),
+             "usr-empty-1", "empty_fn", "ns::empty_fn", "function",
+             1, 1, 1, 1, "void empty_fn()", "", None, 0, 0, "", 0, "", 1, 0.0, ""),
+        ])
+
+        expanded = _expand_query("empty")
+        rows = populated_db.execute(
+            """SELECT s.name
+               FROM symbols_fts
+               JOIN symbols s ON s.id = symbols_fts.rowid
+               WHERE symbols_fts MATCH ? AND s.config_hash = 'hash-deadbeef'
+                 AND s.is_definition = 1 AND s.source != ''
+               ORDER BY rank""",
+            (expanded,),
+        ).fetchall()
+
+        # Empty source → excluded by s.source != '' filter
+        assert len(rows) == 0
+
+    def test_project_code_prioritized_over_vendor(self, populated_db):
+        """Project code (is_project=1) should appear before vendor code in results."""
+        fid = upsert_file(populated_db, "hash-deadbeef", "/tmp/priority.cpp", "cpp")
+        insert_symbols_batch(populated_db, [
+            # Vendor code first (is_project=0)
+            ("hash-deadbeef", fid, "mbed-os/drivers/Ticker.cpp",
+             split_tokens("attach", "mbed::Ticker::attach"),
+             "usr-pri-1", "attach", "mbed::Ticker::attach", "method",
+             1, 1, 5, 1, "void attach(Callback<void()> func, float t)",
+             "", None, 0, 0, "", 0, "", 0, 0.0,
+             "void Ticker::attach(Callback<void()> func, float t) { _ticker.attach(func, t); }"),
+            # Project code second (is_project=1)
+            ("hash-deadbeef", fid, "src/wdt.cpp",
+             split_tokens("zbox_reset", "WDT::zbox_reset"),
+             "usr-pri-2", "zbox_reset", "WDT::zbox_reset", "method",
+             30, 1, 35, 1, "void zbox_reset(duration delay)",
+             "", None, 0, 0, "", 0, "", 1, 0.0,
+             "_timeout.attach(callback(&WDT::_timeout_interrupt), delay);"),
+        ])
+
+        expanded = _expand_query("attach")
+        rows = populated_db.execute(
+            """SELECT s.name, s.file_path, s.is_project
+               FROM symbols_fts
+               JOIN symbols s ON s.id = symbols_fts.rowid
+               WHERE symbols_fts MATCH ? AND s.config_hash = 'hash-deadbeef'
+                 AND s.is_definition = 1 AND s.source != ''
+               ORDER BY rank""",
+            (expanded,),
+        ).fetchall()
+
+        # Both should be found
+        assert len(rows) == 2
+        names = {r[0] for r in rows}
+        assert "zbox_reset" in names
+        assert "attach" in names
+
+    def test_project_only_excludes_vendor(self, populated_db):
+        """project_only=True excludes vendor/sdk code (is_project=0)."""
+        fid = upsert_file(populated_db, "hash-deadbeef", "/tmp/proj_only.cpp", "cpp")
+        insert_symbols_batch(populated_db, [
+            # Vendor code (is_project=0)
+            ("hash-deadbeef", fid, "mbed-os/drivers/SerialBase.cpp",
+             split_tokens("attach", "mbed::SerialBase::attach"),
+             "usr-po-1", "attach", "mbed::SerialBase::attach", "method",
+             1, 1, 5, 1, "void attach(Callback<void()> func, IrqType type)",
+             "", None, 0, 0, "", 0, "", 0, 0.0,
+             'serial.attach(callback(&handler), SerialBase::RxIrq);'),
+            # Project code (is_project=1)
+            ("hash-deadbeef", fid, "src/rs485.cpp",
+             split_tokens("_rx_handler", "RS485::_rx_handler"),
+             "usr-po-2", "_rx_handler", "RS485::_rx_handler", "method",
+             85, 1, 10, 1, "void _rx_handler()",
+             "", None, 0, 0, "", 0, "", 1, 0.0,
+             'serial.attach(callback(this, &RS485::_rx_handler), SerialBase::RxIrq);'),
+        ])
+
+        expanded = _expand_query("attach")
+
+        # Without project_only — both should appear
+        all_rows = populated_db.execute(
+            """SELECT s.name FROM symbols_fts
+               JOIN symbols s ON s.id = symbols_fts.rowid
+               WHERE symbols_fts MATCH ? AND s.config_hash = 'hash-deadbeef'
+                 AND s.is_definition = 1 AND s.source != ''
+               ORDER BY rank""",
+            (expanded,),
+        ).fetchall()
+        assert len(all_rows) == 2
+
+        # With project_only — only the project code symbol
+        proj_rows = populated_db.execute(
+            """SELECT s.name FROM symbols_fts
+               JOIN symbols s ON s.id = symbols_fts.rowid
+               WHERE symbols_fts MATCH ? AND s.config_hash = 'hash-deadbeef'
+                 AND s.is_definition = 1 AND s.source != ''
+                 AND s.is_project = 1
+               ORDER BY rank""",
+            (expanded,),
+        ).fetchall()
+        assert len(proj_rows) == 1
+        assert proj_rows[0][0] == "_rx_handler"

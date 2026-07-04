@@ -2335,6 +2335,26 @@ class TestModifiedFilesCache:
         try:
             ch = _config_hash(conn)
 
+            # Fix mtime=0 rows (pre-migration artifact) — set to actual disk mtime
+            # so the bump-test below works correctly.
+            zero_rows = conn.execute(
+                "SELECT path FROM files WHERE config_hash=? AND (mtime IS NULL OR mtime=0)",
+                (ch,),
+            ).fetchall()
+            for r in zero_rows:
+                try:
+                    p = Path(r["path"])
+                    if not p.is_absolute():
+                        p = (indexed_project / p).resolve()
+                    actual = p.stat().st_mtime
+                    conn.execute(
+                        "UPDATE files SET mtime=? WHERE config_hash=? AND path=?",
+                        (actual, ch, r["path"]),
+                    )
+                except OSError:
+                    pass
+            conn.commit()
+
             count1 = _count_modified_files(conn, ch, indexed_project, use_cache=False)
 
             # Bump mtimes — should be reflected immediately without cache

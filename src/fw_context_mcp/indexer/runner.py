@@ -24,13 +24,14 @@ from .db import (
     drop_fts_triggers,
     get_file_mtimes,
     open_db,
+    rebuild_files_fts,
     rebuild_fts,
     transaction,
     upsert_build_config,
     upsert_project,
     write_lock,
 )
-from .ops import store_symbols_for_unit
+from .ops import _build_filtered_file_content, store_symbols_for_unit
 
 log = logging.getLogger(__name__)
 
@@ -1222,6 +1223,7 @@ def run(
     acc_parse = 0.0
     acc_lock = 0.0
     acc_write = 0.0
+    content_filled = 0
     t0 = time.monotonic()
 
     def _wait_if_paused() -> None:
@@ -1282,6 +1284,9 @@ def run(
                 )
             elif status == "unchanged":
                 unchanged += 1
+                # Fill ifdef-filtered file content via tokenization
+                # (skipped by store_symbols_for_unit since TU wasn't re-parsed)
+                content_filled += _build_filtered_file_content(conn, unit, config_hash, project_root)
                 log.info("[%d/%d] %s: unchanged", processed, len(units), fname)
             elif status == "skipped":
                 skipped += 1
@@ -1292,6 +1297,7 @@ def run(
     log.info("Rebuilding FTS5 index...")
     t_fts_start = time.monotonic()
     rebuild_fts(conn)
+    rebuild_files_fts(conn)
     t_fts = time.monotonic() - t_fts_start
 
     elapsed = time.monotonic() - t0
@@ -1303,6 +1309,8 @@ def run(
         total_syms, total_refs, elapsed,
         acc_parse, acc_lock, acc_write, t_fts,
     )
+    if content_filled:
+        log.info("ifdef-filtered content: %d files filled", content_filled)
 
     # Post-processing — each function handles its own idempotency
     # (returns immediately when data already exists).
