@@ -7,6 +7,7 @@ __all__ = [
     "DatabaseCorruptionError",
     "drop_fts_triggers",
     "rebuild_fts",
+    "rebuild_files_fts",
     "count_fp_assignments",
     "count_indirect_call_sites",
     "count_llm_analysis",
@@ -102,6 +103,14 @@ def _ensure_column(conn: sqlite3.Connection, table: str, column: str, type_def: 
             pass  # column already exists (race condition)
 
 
+def _table_exists(conn: sqlite3.Connection, table: str) -> bool:
+    """Return True if the named table exists in the database."""
+    result = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)
+    ).fetchone()
+    return result is not None
+
+
 class DatabaseCorruptionError(sqlite3.DatabaseError):
     """Raised when the SQLite database fails integrity check.
 
@@ -152,6 +161,14 @@ def split_tokens(name: str, qualified_name: str = "") -> str:
                 if tok not in seen:
                     seen.add(tok)
                     tokens.append(tok)
+    # Semantic hints for well-known embedded conventions.
+    # Cortex-M exception handlers use _Handler suffix (HardFault_Handler, NMI_Handler, ...)
+    # and don't contain "irq"/"isr" in their names. Add searchable concept tokens.
+    if name.endswith("_Handler"):
+        for tag in ("interrupt", "exception", "isr"):
+            if tag not in seen:
+                seen.add(tag)
+                tokens.append(tag)
     return " ".join(tokens)
 
 
@@ -280,6 +297,7 @@ _MIGRATION_ADD_COLUMNS = [
     "ALTER TABLE symbols ADD COLUMN source TEXT NOT NULL DEFAULT ''",
     "ALTER TABLE llm_analysis ADD COLUMN content_hash TEXT NOT NULL DEFAULT ''",
     "ALTER TABLE build_configs ADD COLUMN embedding_dim INTEGER",
+    "ALTER TABLE files ADD COLUMN content TEXT NOT NULL DEFAULT ''",
 ]
 
 _SCHEMA = """
@@ -371,6 +389,30 @@ CREATE TRIGGER IF NOT EXISTS symbols_au AFTER UPDATE ON symbols BEGIN
     VALUES ('delete', old.id, old.name, old.qualified_name, old.signature, old.docstring, old.file_path, old.name_tokens, old.summary, old.inputs, old.outputs, old.source);
     INSERT INTO symbols_fts(rowid, name, qualified_name, signature, docstring, file_path, name_tokens, summary, inputs, outputs, source)
     VALUES (new.id, new.name, new.qualified_name, new.signature, new.docstring, new.file_path, new.name_tokens, new.summary, new.inputs, new.outputs, new.source);
+END;
+
+CREATE VIRTUAL TABLE IF NOT EXISTS files_fts USING fts5(
+    path,
+    content,
+    content='files',
+    content_rowid='id'
+);
+
+CREATE TRIGGER IF NOT EXISTS files_ai AFTER INSERT ON files BEGIN
+    INSERT INTO files_fts(rowid, path, content)
+    VALUES (new.id, new.path, new.content);
+END;
+
+CREATE TRIGGER IF NOT EXISTS files_ad AFTER DELETE ON files BEGIN
+    INSERT INTO files_fts(files_fts, rowid, path, content)
+    VALUES ('delete', old.id, old.path, old.content);
+END;
+
+CREATE TRIGGER IF NOT EXISTS files_au AFTER UPDATE ON files BEGIN
+    INSERT INTO files_fts(files_fts, rowid, path, content)
+    VALUES ('delete', old.id, old.path, old.content);
+    INSERT INTO files_fts(rowid, path, content)
+    VALUES (new.id, new.path, new.content);
 END;
 
 -- Cross-reference / call graph (on by default; disable with [index] index_refs = false).
@@ -579,12 +621,15 @@ def open_db(path: Path, *, skip_integrity_check: bool = False) -> sqlite3.Connec
        (SQLite cannot call Python functions).
     5. Rebuilds ``symbols_fts`` FTS5 virtual table when it lacks the
        ``name_tokens`` column (older schema).
-    6. Backfills ``symbols.summary/inputs/outputs`` from ``llm_analysis``
-       table, then rebuilds FTS5 again when it lacks those columns.
-    7. Initialises the ``vec_symbols`` vec0 table (best-effort).
-    8. Runs ``PRAGMA integrity_check`` (unless *skip_integrity_check*
-       is ``True``) — raises ``DatabaseCorruptionError`` on failure
-       (detected before any tool reads the data).
+     6. Backfills ``symbols.summary/inputs/outputs`` from ``llm_analysis``
+        table, then rebuilds FTS5 again when it lacks those columns.
+     7. Initialises the ``vec_symbols`` vec0 table (best-effort).
+     8. Unconditionally ensures ``files_fts`` FTS5 table exists (self-healing
+        when a migration was interrupted — see ``_CRITICAL_TABLES`` for the
+        same pattern applied to regular tables).
+     9. Runs ``PRAGMA integrity_check`` (unless *skip_integrity_check*
+        is ``True``) — raises ``DatabaseCorruptionError`` on failure
+        (detected before any tool reads the data).
 
     On ``OperationalError('locked')`` the connection is retried once after a
     short sleep.  Other ``OperationalError`` and ``DatabaseError`` are
@@ -982,6 +1027,14 @@ def open_db(path: Path, *, skip_integrity_check: bool = False) -> sqlite3.Connec
             e,
         )
 
+    # Unconditional files_fts self-healing — the FTS5 table and its triggers
+    # may be missing when a migration was interrupted (user_version stamped
+    # but files_fts never created).  rebuild_files_fts is idempotent and
+    # uses existing files.content — it does NOT re-read files from disk.
+    if not _table_exists(conn, "files_fts"):
+        log.info("files_fts missing — rebuilding (self-healing)")
+        rebuild_files_fts(conn)
+
     # Integrity check — detect corruption early, before any tool uses the DB.
     # Skip for auxiliary connections (worker threads, pooled connections)
     # where the check already ran on the primary connection.
@@ -1015,15 +1068,19 @@ def get_db_schema_version(conn: sqlite3.Connection) -> int:
 
 
 def drop_fts_triggers(conn: sqlite3.Connection) -> None:
-    """Drop the three FTS5 content-sync triggers (ai, ad, au).
+    """Drop FTS5 content-sync triggers for symbols and files tables.
 
     Call before bulk indexing to eliminate the per-row FTS index overhead.
-    After all TUs are processed, call ``rebuild_fts()`` to recreate the FTS
-    table and triggers in one pass.
+    After all TUs are processed, call ``rebuild_fts()`` and
+    ``rebuild_files_fts()`` to recreate the FTS tables and triggers
+    in one pass.
     """
     conn.execute("DROP TRIGGER IF EXISTS symbols_ai")
     conn.execute("DROP TRIGGER IF EXISTS symbols_ad")
     conn.execute("DROP TRIGGER IF EXISTS symbols_au")
+    conn.execute("DROP TRIGGER IF EXISTS files_ai")
+    conn.execute("DROP TRIGGER IF EXISTS files_ad")
+    conn.execute("DROP TRIGGER IF EXISTS files_au")
 
 
 def rebuild_fts(conn: sqlite3.Connection) -> None:
@@ -1088,6 +1145,54 @@ def rebuild_fts(conn: sqlite3.Connection) -> None:
                                     file_path, name_tokens, summary, inputs, outputs{source_col})
             VALUES (new.id, new.name, new.qualified_name, new.signature, new.docstring,
                     new.file_path, new.name_tokens, new.summary, new.inputs, new.outputs{source_val_new});
+        END;
+    """)
+
+
+def rebuild_files_fts(conn: sqlite3.Connection) -> None:
+    """Rebuild the files_fts FTS5 index from existing files.content.
+
+    Uses the already-populated ``files.content`` column (ifdef-filtered by
+    ``_build_filtered_file_content`` during indexing).  Does NOT re-read
+    files from disk — the content in the DB is authoritative.
+
+    Drops triggers first, recreates the FTS5 table, backfills from
+    ``files``, then reinstates content-sync triggers.
+    """
+    _ensure_column(conn, "files", "content", "TEXT NOT NULL DEFAULT ''")
+
+    conn.executescript("""
+        DROP TRIGGER IF EXISTS files_ai;
+        DROP TRIGGER IF EXISTS files_ad;
+        DROP TRIGGER IF EXISTS files_au;
+        DROP TABLE IF EXISTS files_fts;
+
+        CREATE VIRTUAL TABLE files_fts USING fts5(
+            path, content,
+            content='files', content_rowid='id'
+        );
+    """)
+
+    conn.execute("""
+        INSERT INTO files_fts(rowid, path, content)
+        SELECT id, path, COALESCE(content,'') FROM files
+    """)
+    conn.commit()
+
+    conn.executescript("""
+        CREATE TRIGGER files_ai AFTER INSERT ON files BEGIN
+            INSERT INTO files_fts(rowid, path, content)
+            VALUES (new.id, new.path, new.content);
+        END;
+        CREATE TRIGGER files_ad AFTER DELETE ON files BEGIN
+            INSERT INTO files_fts(files_fts, rowid, path, content)
+            VALUES ('delete', old.id, old.path, old.content);
+        END;
+        CREATE TRIGGER files_au AFTER UPDATE ON files BEGIN
+            INSERT INTO files_fts(files_fts, rowid, path, content)
+            VALUES ('delete', old.id, old.path, old.content);
+            INSERT INTO files_fts(rowid, path, content)
+            VALUES (new.id, new.path, new.content);
         END;
     """)
 
@@ -2617,6 +2722,7 @@ def search_symbols(
     limit: int = 20,
     kind: str | None = None,
     exclude_variables: bool = False,
+    project_only: bool = False,
 ) -> list[sqlite3.Row]:
     """FTS5 search over symbols for a given build config.
 
@@ -2629,6 +2735,8 @@ def search_symbols(
     from results.  Set True in topic-search tools (``search_code``) to prevent
     low-signal entries from cluttering the top results; leave False in recall
     phases (hybrid / embedding search) where vector re-ranking handles relevance.
+    When *project_only* is True, SDK/vendor paths are excluded
+    (only src/, lib/, app/, include/ are retained).
     Note: file_path is read from the denormalized symbols.file_path column,
     not re-joined from files — the JOIN was removed to avoid the redundant
     round-trip and the shadowing hazard.
@@ -2640,6 +2748,13 @@ def search_symbols(
         kind_filter = "AND s.kind != 'variable'"
     else:
         kind_filter = ""
+    if project_only:
+        project_filter = (
+            "AND (s.file_path LIKE 'src/%' OR s.file_path LIKE 'lib/%'"
+            " OR s.file_path LIKE 'app/%' OR s.file_path LIKE 'include/%')"
+        )
+    else:
+        project_filter = ""
     params: list = [expanded, config_hash]
     if kind:
         params.append(kind)
@@ -2648,7 +2763,7 @@ def search_symbols(
         f"""SELECT s.*
            FROM symbols_fts
            JOIN symbols s ON s.id = symbols_fts.rowid
-           WHERE symbols_fts MATCH ? AND s.config_hash = ? {kind_filter}
+           WHERE symbols_fts MATCH ? AND s.config_hash = ? {kind_filter} {project_filter}
             ORDER BY bm25(symbols_fts, 1.2, 0.75, 10.0, 1.0, 3.0, 2.0, 1.0, 5.0, 1.0, 0.5, 1.0, 1.0)
            LIMIT ?""",
         params,

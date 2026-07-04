@@ -19,6 +19,11 @@ from ..shared.stale import _with_stale_recovery
 
 log = logging.getLogger(__name__)
 
+# Directories considered "application code" by project_only filters.
+_PROJECT_DIRS = ("src", "lib", "app", "include")
+_PROJECT_PATH_FILTER = " OR ".join(f"s.file_path LIKE '{d}/%'" for d in _PROJECT_DIRS)
+_PROJECT_PATH_FILTER_FILES = " OR ".join(f"f.path LIKE '{d}/%'" for d in _PROJECT_DIRS)
+
 LOOKUP_EXACT_SQL = """SELECT s.* FROM symbols s
    WHERE s.config_hash=? AND (s.name=? OR s.qualified_name=?)
    ORDER BY s.is_definition DESC, s.line
@@ -167,21 +172,27 @@ def search_code(
     project_root: Annotated[str | None, Field(description="Project root. Auto-detected if omitted.")] = None,
     kind: Annotated[str | None, Field(description="Optional kind filter: function, method, class, struct, enum, typedef, variable, field, namespace.")] = None,
     limit: Annotated[int, Field(description="Maximum results (default 20, max 100).")] = 20,
+    project_only: Annotated[bool, Field(description="Exclude vendor SDK code (mbed-os/, .pio/, zephyr/). When True, only application code (src/, lib/, app/). Default False.")] = False,
 ) -> list[dict]:
-    """USE INSTEAD OF grep, ctx_search, or ctx_compose. Full-text search over
-    libclang-indexed C/C++ symbols via FTS5. Finds concepts grep misses:
-    CamelCase tokenization, snake_case normalization, and progressive
-    relaxation on empty results.
+    """Find C/C++ symbols by name — searches function/class/enum NAMES.
 
-    Read-only. No side effects. Use when looking for symbols by topic or keyword
-    rather than exact name. Prefer ``lookup_symbol`` when you already know the
-    symbol name.
+    Searches symbol names, qualified names, signatures, docstrings, and
+    pre-computed name tokens (CamelCase/snake_case split).  Does NOT search
+    function bodies — for patterns in code like ``.attach(``,
+    ``NVIC_SetVector``, ``SerialBase::RxIrq`` use ``search_bodies`` instead.
+
+    Use when you know the concept but not the exact name
+    (``"interrupt handler"``, ``"modem init"``).  Prefer ``lookup_symbol``
+    when you already know the exact or prefix name.
+
+    Results include names, file locations, signatures, and docstrings —
+    the metadata about each symbol, not the symbol's implementation code.
 
     **FTS5 syntax:**
     - ``init*`` matches init, init_uart, initialize (trailing wildcard)
     - ``"spi init"`` matches the exact phrase "spi init"
     - Do NOT use underscore in queries — ``modem_init`` is split into
-      ``modem AND init``. Use ``modem init`` instead.
+      ``modem AND init``. Write ``modem init`` instead.
 
     **Progressive relaxation:** when the initial FTS5 search returns nothing,
     the tool automatically broadens the search in up to five steps:
@@ -213,10 +224,13 @@ def search_code(
     parameters/data it receives, and what it returns/produces.
 
     Args:
-        query: Search term(s) with FTS5 syntax. Keep queries short — 1–3 words.
+        query: FTS5 search terms. Keep queries short — 1–3 words.
         project_root: Project root directory. Auto-detected from CWD if omitted.
         kind: Optional filter to return only symbols of this kind.
-        limit: Maximum number of results (default 20, max 100).
+        limit: Maximum results (default 20, max 100).
+        project_only: When True, exclude vendor SDK directories
+            (mbed-os/, .pio/, zephyr/, build/) and return only
+            application code (src/, lib/, app/, include/). Default False.
 
     Returns:
         list of dicts, each with: name, qualified_name, kind, file, line,
@@ -311,6 +325,10 @@ def search_code(
                 rows = ind_rows[:limit]
                 if rows:
                     method = "individual_terms"
+
+            # Filter to application code when project_only=True
+            if project_only:
+                rows = [r for r in rows if r["file_path"].startswith(_PROJECT_DIRS)][:limit]
 
             fallback_used = (method != "fts5+kind")
 
@@ -651,35 +669,83 @@ async def semantic_search(
         return [{"error": f"semantic_search failed: {e}"}]
 
 
-def search_source(
-    query: Annotated[str, Field(description="FTS5 search terms for function bodies. 1-3 words. E.g. 'attach callback', 'NVIC_SetVector', 'extern C'.")],
+def search_bodies(
+    query: Annotated[str, Field(description="FTS5 search terms for function bodies. 1-3 words. E.g. 'attach', 'NVIC_SetVector', 'rise'.")],
     project_root: Annotated[str | None, Field(description="Project root. Auto-detected if omitted.")] = None,
     kind: Annotated[str | None, Field(description="Optional kind filter: function, method, class, etc.")] = None,
     limit: Annotated[int, Field(description="Maximum results (default 20, max 100).")] = 20,
+    project_only: Annotated[bool, Field(description="Exclude vendor SDK code (mbed-os/, .pio/, zephyr/, build/). When True, only your application code (src/, lib/). Default False.")] = False,
 ) -> list[dict]:
-    """USE INSTEAD OF grep. Full-text search in C/C++ function/method bodies.
+    """Find patterns in C/C++ function BODIES — the implementation code inside ``{ }``.
 
-    Finds patterns grep can find — .attach(, NVIC_SetVector, SerialBase::RxIrq,
-    ISR registrations, callback registrations — but with libclang precision:
-    correct function boundaries, build-conditional code awareness.
+    Searches ONLY the text between ``{`` and ``}`` of function/method
+    definitions.  Does NOT search file-scope constructs (see Limitations
+    below).
 
-    Results include a ``_match_snippet`` showing the match in context (FTS5
-    snippet). Project code is boosted 1.5× over vendor/SDK code.
+    **When to use ``search_bodies`` vs ``search_code``:**
 
-    Read-only. No side effects. Requires the FTS5 index (built by
-    ``fw-context index`` — automatically updated when the project is indexed).
+    - ``search_bodies`` — patterns in function BODIES (what the code DOES):
+      ``.attach(``, ``NVIC_SetVector(``, ``.rise(``, ``.fall(``,
+      ``SerialBase::RxIrq``, ``callback(&``, ISR registration code.
+    - ``search_code`` — find symbols by NAME (what the code IS):
+      ``modem init``, ``interrupt handler``, ``uart send``.
+
+    **Limitations — what ``search_bodies`` CANNOT find:**
+
+    Only function/method definition bodies are indexed (``is_definition=1``
+    symbols with source text).  The following are at FILE SCOPE and are
+    NEVER in the ``source`` column:
+
+    - ``extern "C"`` — linkage specifier at file scope
+    - Type declarations in headers — ``InterruptIn _pin;`` in class bodies
+    - ``#include``, ``#define``, ``#ifdef`` — preprocessor directives
+    - Global/static variable definitions outside functions
+    - Namespace declarations
+    - Any code outside ``{ }`` of a function definition
+
+    **LIMITATION — search_bodies ONLY searches function bodies ({ }):**
+    If your pattern might be at file scope (class member declarations like
+    ``InterruptIn _pin``, function declarations, ``#define``, ``extern "C"``,
+    global variables), use ``search_content`` instead.  search_bodies returns
+    empty for any pattern outside function bodies.
+
+    For these patterns, use ``search_content`` which indexes full file
+    content (not limited to function bodies).
+
+    **When to set ``project_only=True``:**
+    Your project contains two kinds of code:
+    - Application code: ``src/``, ``lib/`` — code your team wrote.
+    - Vendor SDK: ``mbed-os/``, ``.pio/``, ``zephyr/``, ``build/`` —
+      framework/OS code shipped by a vendor, NOT written by your team.
+
+    Set ``project_only=True`` when the question is about YOUR code
+    (``"where do we register interrupt handlers?"``,
+    ``"which functions call .attach()?"``).  Leave it ``False`` (default)
+    when the vendor code is also relevant (``"how does mbed's Ticker::attach work?"``).
+
+    Results include ``_match_snippet`` — a highlighted excerpt showing
+    each match in context (e.g. ``_timeout.<b>attach</b>(callback(...))``).
+    Project code sorts before vendor code in the output.
+
+    Read-only. No side effects. Requires the FTS5 index.
 
     Args:
-        query: FTS5 search terms. 1-3 words. E.g. 'attach callback' finds
-            ``Ticker::attach``, ``Timeout::attach`` registrations.
+        query: FTS5 search terms. 1-3 words. Bare multi-word queries are
+            OR-joined (each term prefixed with ``*``).  Prefer single-word
+            queries for broad matching: ``'attach'`` finds ``.attach(...)``
+            patterns including Ticker::attach, Timeout::attach, etc.
+            For exact phrases wrap in double quotes: ``'\"attach callback\"'``.
         project_root: Project root. Auto-detected if omitted.
         kind: Optional filter to return only symbols of this kind.
         limit: Maximum results (default 20, max 100).
+        project_only: When True, exclude vendor SDK directories
+            (mbed-os/, .pio/, zephyr/, build/) and return only
+            application code (src/, lib/). Default False.
 
     Returns:
         list of dicts, each with: name, qualified_name, kind, file, line,
         is_definition, signature, _match_snippet (excerpt around match),
-        source (truncated at 2000 chars).
+        source (function body, truncated at 2000 chars).
     """
     try:
         root = resolve_project_root(project_root)
@@ -692,18 +758,21 @@ def search_source(
 
         def _do_search(c: sqlite3.Connection, config_hash: str) -> list[dict]:
             kind_filter = ""
+            project_filter = ""
             params: list = [expanded, config_hash]
             if kind:
                 kind_filter = "AND s.kind = ?"
                 params.append(kind)
+            if project_only:
+                project_filter = f"AND ({_PROJECT_PATH_FILTER})"
             params.append(limit * 3)  # fetch more for post-filter boosting
 
             rows = c.execute(
-                f"""SELECT s.*, snippet(symbols_fts, 10, '<b>', '</b>', '…', 60) AS _match_snippet
+                f"""SELECT s.*, snippet(symbols_fts, 9, '<b>', '</b>', '…', 60) AS _match_snippet
                    FROM symbols_fts
                    JOIN symbols s ON s.id = symbols_fts.rowid
                    WHERE symbols_fts MATCH ? AND s.config_hash = ? AND s.is_definition = 1
-                     AND s.source != '' {kind_filter}
+                     AND s.source != '' {kind_filter} {project_filter}
                     ORDER BY rank
                    LIMIT ?""",
                 params,
@@ -728,14 +797,166 @@ def search_source(
                 results.append(d)
 
             # Prioritize project code first, then vendor — both groups retain FTS5 rank order
-            project_results = [r for r in results if r["_is_project"]]
-            vendor_results = [r for r in results if not r["_is_project"]]
-            final = project_results + vendor_results
+            if project_only:
+                final = results
+            else:
+                project_results = [r for r in results if r["_is_project"]]
+                vendor_results = [r for r in results if not r["_is_project"]]
+                final = project_results + vendor_results
             for r in final:
                 del r["_is_project"]
             return final[:limit]
 
         return _with_stale_recovery(root, db_path, _do_search)
     except Exception as e:
-        log.exception("search_source failed: %s", e)
-        return [{"error": f"search_source failed: {e}"}]
+        log.exception("search_bodies failed: %s", e)
+        return [{"error": f"search_bodies failed: {e}"}]
+
+
+def search_content(
+    query: Annotated[str, Field(description="FTS5 search terms for full file content. 1-3 words. E.g. 'InterruptIn', 'extern C'. Bare multi-word = OR-joined.")],
+    project_root: Annotated[str | None, Field(description="Project root. Auto-detected if omitted.")] = None,
+    limit: Annotated[int, Field(description="Maximum results (default 20, max 100).")] = 20,
+    project_only: Annotated[bool, Field(description="Exclude vendor SDK code (mbed-os/, .pio/, zephyr/, build/). When True, only your application code (src/, lib/). Default False.")] = False,
+) -> list[dict]:
+    """Find patterns in FULL file content — not limited to function bodies.
+
+    Searches **ifdef-filtered** file text — only code that actually compiles
+    for the current build configuration.  Inactive ``#ifdef`` branches are
+    replaced with blank lines (preserving original line numbers).
+
+    Covers file-scope constructs that ``search_bodies`` cannot see:
+    ``extern "C"``, type declarations in headers, ``#include``, ``#define``,
+    global variables, namespace blocks.  Also covers function bodies, but
+    ``search_bodies`` is preferred for body-level patterns (per-function
+    context, snippet highlights per match).
+
+    **When to use ``search_content`` vs ``search_bodies`` vs ``search_code``:**
+
+    - ``search_content`` — patterns anywhere in FILES (file scope + bodies):
+      ``extern "C"``, ``InterruptIn``, ``#define``, type declarations.
+    - ``search_bodies`` — patterns in function BODIES only:
+      ``.attach(``, ``NVIC_SetVector(``, ``callback(&``.
+    - ``search_code`` — find symbols by NAME:
+      ``interrupt handler``, ``modem init``.
+
+    **project_only=True** filters to application paths (src/, lib/).
+    Default False includes vendor SDK files.
+
+    Results are file-level (one entry per matching file) — use
+    ``search_bodies`` for per-function granularity.
+
+    When ``files_fts`` is missing (legacy index), falls back to LIKE
+    search on ``files.content`` — results include ``_fallback: "like"``
+    and no snippet highlighting. Run ``fw-context index`` to upgrade.
+
+    Read-only. No side effects. Requires the FTS5 index with file content.
+
+    Args:
+        query: FTS5 search terms. 1-3 words. Bare multi-word queries are
+            OR-joined (prefix-wildcarded). Prefer single-word queries.
+            E.g. ``'InterruptIn'``, ``'extern C'``, ``'#define'``.
+        project_root: Project root. Auto-detected if omitted.
+        limit: Maximum results (default 20, max 100).
+        project_only: When True, exclude vendor SDK directories.
+
+    Returns:
+        list of dicts, each with: file, language, mtime,
+        _match_snippet (highlighted excerpt around the match).
+    """
+    try:
+        root = resolve_project_root(project_root)
+        db_path = _db_path(root)
+        if not db_path.exists():
+            return [{"error": f"No index found for {root}. Run 'fw-context index' first."}]
+
+        limit = min(limit, 100)
+        expanded = _expand_query(query)
+
+        def _do_search(c: sqlite3.Connection, config_hash: str) -> list[dict]:
+            project_filter = ""
+            if project_only:
+                project_filter = f"AND ({_PROJECT_PATH_FILTER_FILES})"
+
+            # Check if files_fts table exists — may be missing on indexes
+            # that predate the files_fts feature.  Fall back to LIKE on
+            # files.content with a _fallback marker so the caller knows
+            # results are approximate (no snippet highlighting).
+            table_row = c.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='files_fts'"
+            ).fetchone()
+
+            if table_row is not None:
+                rows = c.execute(
+                    f"""SELECT f.*, snippet(files_fts, 1, '<b>', '</b>', '…', 80) AS _match_snippet
+                       FROM files_fts
+                       JOIN files f ON f.id = files_fts.rowid
+                       WHERE files_fts MATCH ? AND f.config_hash = ?
+                         AND f.content != '' {project_filter}
+                        ORDER BY rank
+                       LIMIT ?""",
+                    (expanded, config_hash, limit * 3),
+                ).fetchall()
+            else:
+                # Fallback: LIKE search on files.content — no FTS5 index.
+                # Split the raw query into individual terms and AND them via
+                # multiple LIKE conditions.
+                terms = [t.strip() for t in query.replace("_", " ").split() if t.strip()]
+                if not terms:
+                    return []
+                like_clauses = " AND ".join(["f.content LIKE ?" for _ in terms])
+                like_params = [f"%{t}%" for t in terms]
+                rows = c.execute(
+                    f"""SELECT f.*,
+                               substr(f.content, 0, 200) || '…' AS _match_snippet
+                          FROM files f
+                         WHERE f.config_hash = ?
+                           AND f.content != ''
+                           AND {like_clauses}
+                           {project_filter}
+                         LIMIT ?""",
+                    (config_hash, *like_params, limit * 3),
+                ).fetchall()
+
+            results = []
+            for r in rows:
+                d = {
+                    "file": abs_path(root, r["path"]),
+                    "language": r["language"],
+                    "mtime": r["mtime"],
+                    "_match_snippet": r["_match_snippet"],
+                }
+                if table_row is None:
+                    d["_fallback"] = "like"  # no FTS5 — approximate results
+                results.append(d)
+            return results[:limit]
+
+        return _with_stale_recovery(root, db_path, _do_search)
+    except Exception as e:
+        log.exception("search_content failed: %s", e)
+        return [{"error": f"search_content failed: {e}"}]
+
+
+# ── Backward-compatible aliases (deprecated — remove after 2 releases) ──
+
+def search_source(
+    query: Annotated[str, Field(description="DEPRECATED — use search_bodies instead.")],
+    project_root: Annotated[str | None, Field(description="Project root.")] = None,
+    kind: Annotated[str | None, Field(description="Kind filter.")] = None,
+    limit: Annotated[int, Field(description="Max results.")] = 20,
+    project_only: Annotated[bool, Field(description="Project-only filter.")] = False,
+) -> list[dict]:
+    import warnings
+    warnings.warn("search_source is deprecated, use search_bodies instead", DeprecationWarning, stacklevel=2)
+    return search_bodies(query, project_root=project_root, kind=kind, limit=limit, project_only=project_only)
+
+
+def search_files(
+    query: Annotated[str, Field(description="DEPRECATED — use search_content instead.")],
+    project_root: Annotated[str | None, Field(description="Project root.")] = None,
+    limit: Annotated[int, Field(description="Max results.")] = 20,
+    project_only: Annotated[bool, Field(description="Project-only filter.")] = False,
+) -> list[dict]:
+    import warnings
+    warnings.warn("search_files is deprecated, use search_content instead", DeprecationWarning, stacklevel=2)
+    return search_content(query, project_root=project_root, limit=limit, project_only=project_only)

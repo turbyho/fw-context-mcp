@@ -1,6 +1,6 @@
 """fw-context MCP server — build-aware code intelligence for embedded C/C++ projects.
 
-Serves 29 MCP tools and 3 MCP resources via FastMCP (stdio transport).
+Serves 31 MCP tools and 3 MCP resources via FastMCP (stdio transport).
 
 **Search & lookup tools** (delegate to ``fw_context_mcp.search`` pipeline):
 ``search_code`` (FTS5), ``lookup_symbol`` (exact/prefix), ``smart_search``
@@ -45,26 +45,56 @@ mcp = FastMCP(
     "fw-context",
     instructions=(
         "CRITICAL: C/C++ questions → fw-context ONLY. This is NOT optional.\n\n"
-        "MANDATORY MAPPING (use fw-context, NOT grep/lean-ctx equivalents):\n"
-        "• grep / ctx_search ___________ → search_code, lookup_symbol\n"
-        "• ctx_compose __________________ → get_file_map + get_symbol_context\n"
-        "• ctx_callgraph ________________ → find_callers, find_references, find_call_path\n"
-        "• Read / cat / ctx_read _________ → get_source, get_symbol_context\n\n"
-        "SELF-CORRECT: the moment you reach for grep or ctx_search for C/C++,\n"
-        "stop and call the fw-context tool instead.\n\n"
+        "For C/C++ code, use fw-context instead of ANY external search or\n"
+        "file-reading tool.\n\n"
+        "SELF-CORRECT: the moment you reach for a tool that is NOT fw-context\n"
+        "for C/C++ code, stop and use the fw-context equivalent instead.\n\n"
+        "TOOL SELECTION (pick the right one):\n"
+        "• Symbol by exact/prefix name _____ → lookup_symbol (e.g. \"uart_\", \"main\")\n"
+        "• Symbols by concept/topic _________ → search_code (e.g. \"interrupt handler\")\n"
+        "• Patterns in function BODIES ______ → search_bodies (e.g. \"attach\", \"rise\")\n"
+        "• Patterns in full FILE content _____ → search_content (e.g. \"extern C\", \"InterruptIn\")\n"
+        "• Natural-language question ________ → smart_search (slow, thorough)\n\n"
+        "IMPORTANT: search_code searches symbol NAMES (what the code IS).\n"
+        "search_bodies searches function BODIES (what the code DOES — inside {}).\n"
+        "search_content searches FULL FILE content — file-scope declarations,\n"
+        "type definitions in headers, preprocessor directives, namespace blocks.\n"
+        "For patterns like extern \"C\", InterruptIn declarations, #define —\n"
+        "use search_content, NOT search_bodies.\n\n"
+        "FTS5 QUERY TIPS:\n"
+        "• Multi-word queries are OR-joined: \"attach callback\" becomes attach* OR callback*\n"
+        "  (matches functions containing EITHER word, not both).\n"
+        "• Prefer SINGLE-WORD queries for broad matching: \"attach\" not \"attach callback\".\n"
+        "• For exact phrases use double quotes: '\"interrupt handler\"'.\n"
+        "• Underscores are word separators: \"modem_init\" → modem AND init.\n"
+        "  Write \"modem init\" instead.\n\n"
+        "EMPTY RESULT STRATEGY — if a fw-context tool returns nothing:\n"
+        "1. Try a simpler/single-word query in the SAME tool first.\n"
+        "2. Switch to a DIFFERENT fw-context tool (search_bodies → search_code, etc.).\n"
+        "3. Use lookup_symbol for known symbol names.\n"
+        "4. If search_bodies returns empty, switch to search_content — it covers\n"
+        "   file scope (type declarations, #define, extern \"C\") that search_bodies\n"
+        "   cannot reach.\n"
+        "5. If all fw-context tools return empty, simplify query or use different tool.\n"
+        "6. Only AFTER exhausting fw-context — use other available tools.\n\n"
+        "project_only=True (on search_code, search_bodies, search_content, and\n"
+        "callgraph tools) excludes vendor SDK code — use when asking about YOUR code.\n\n"
         "ANTI-PATTERNS — do NOT:\n"
-        "• Grep for C/C++ symbols → use lookup_symbol or search_code\n"
-        "• Grep for code patterns → use search_source (FTS5 over function bodies,\n"
-        "  finds .attach(, NVIC_SetVector, extern \"C\" — grep not needed)\n"
-        "• Grep for callbacks → use find_references (detects ISRs, NVIC_SetVector,\n"
-        "  Timeout::attach, Ticker::attach, SerialBase::RxIrq — invisible to grep)\n"
-        "• ctx_read for function bodies → use get_source (libclang exact extents)\n"
-        "• Run grep/ctx_search in parallel with fw-context\n\n"
+        "• Use external search tools for C/C++ symbols → use lookup_symbol or search_code\n"
+        "• Use external search tools for code patterns → use search_bodies (function\n"
+        "  bodies) or search_content (full file content)\n"
+        "• Use external tools for callbacks, ISRs → use find_references or\n"
+        "  search_bodies(project_only=True)\n"
+        "• Use file readers for function bodies → use get_source (libclang exact extents)\n"
+        "• Run external search tools in parallel with fw-context\n"
+        "• Give up on fw-context after one empty result → try simpler query or\n"
+        "  different fw-context tool first\n\n"
         "AGENT LOOP: Check(get_active_build) → Find(search_code/lookup_symbol)\n"
         "→ Read(get_source/get_symbol_context) → Trace(find_references/find_callers)\n"
-        "→ Fallback to grep ONLY if get_active_build() reports no index.\n\n"
-        "Search: lookup_symbol, search_code, search_source (body text),\n"
-        "smart_search, semantic_search.\n"
+        "→ For body patterns use search_bodies.\n"
+        "→ If get_active_build() reports no index, use other available tools.\n\n"
+        "Search: lookup_symbol, search_code, search_bodies (body text),\n"
+        "search_content (full file content), smart_search, semantic_search.\n"
         "Call graph: find_callers, find_references, find_call_path,\n"
         "find_all_callers_recursive, find_callees_recursive, find_hotspots,\n"
         "find_dead_code, find_wrapper_callers, trace_data_flow,\n"
@@ -210,7 +240,11 @@ mcp.tool()(maintenance.reset_index)
 # search.py
 mcp.tool()(search.lookup_symbol)
 mcp.tool()(search.search_code)
+mcp.tool()(search.search_bodies)
+mcp.tool()(search.search_content)
+# Deprecated aliases — remove after 2 releases
 mcp.tool()(search.search_source)
+mcp.tool()(search.search_files)
 mcp.tool()(search.semantic_search)
 mcp.tool()(search.smart_search)
 

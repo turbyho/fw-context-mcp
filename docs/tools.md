@@ -283,9 +283,72 @@ succeeded: `"fts5"`, `"name_tokens_like"`, `"docstring_like"`, or
 **FTS5 syntax:**
 - `uart*` — prefix wildcard
 - `"spi transfer"` — exact phrase match
-- `modem init` — both terms (AND). Underscore is a word separator — `modem_init` is treated as `modem AND init`
+- `modem init` — both terms (AND for `search_code`). Underscore is a word separator — `modem_init` is treated as `modem AND init`
+- **For `search_bodies` and `search_content`:** bare multi-word queries are OR-joined (each term prefix-wildcarded) — prefer single-word queries
 
 **Kind filter:** `function`, `method`, `constructor`, `destructor`, `class`, `struct`, `enum`, `enum_constant`, `typedef`, `variable`, `field`, `namespace`
+
+#### `search_bodies`
+
+Find patterns in C/C++ function **bodies** — the implementation code inside `{ }`.
+
+Searches ONLY the text between `{` and `}` of function/method definitions.
+Does NOT search file-scope constructs (`extern "C"`, `#include`, `#define`,
+type declarations in headers).
+
+```
+Input:  {"query": "attach", "project_root?": "/path/to/project", "kind?": "function", "limit?": 20, "project_only?": true}
+Output: [{"name": "setup", "qualified_name": "setup", "kind": "function",
+          "file": "/path/src/main.cpp", "line": 55, "is_definition": true,
+          "signature": "void setup()",
+          "_match_snippet": "…_timeout.<b>attach</b>(callback(&led_blink, 1000))…",
+          "source": "… (function body, truncated at 2000 chars)"}]
+```
+
+- **When to use `search_bodies` vs `search_code` vs `search_content`:**
+  - `search_bodies` — patterns in function BODIES (what the code DOES):
+    `.attach(`, `NVIC_SetVector(`, `.rise(`, `.fall(`, `callback(&`
+  - `search_content` — patterns anywhere in FILES:
+    `extern "C"`, `InterruptIn`, `#define`, type declarations
+  - `search_code` — find symbols by NAME:
+    `modem init`, `interrupt handler`
+
+**FTS5 query tips for `search_bodies`:**
+Bare multi-word queries are OR-joined (each term prefix-wildcarded):
+`"attach callback"` → `attach* OR callback*`. Prefer single-word queries
+for broad matching — `"attach"` finds all `.attach(...)` patterns across
+the codebase.
+
+Results include `_match_snippet` — a highlighted excerpt showing each
+match in context with `<b>…</b>` tags. Project code sorts before vendor
+code. Set `project_only=True` to filter to application code only.
+
+#### `search_content`
+
+Find patterns in **full file content** — file-scope + function bodies, not
+limited to function bodies.
+
+Searches **ifdef-filtered** file text — only code that actually compiles
+for the current build configuration. Inactive `#ifdef` branches are replaced
+with blank lines (preserving original line numbers).
+
+```
+Input:  {"query": "InterruptIn", "project_root?": "/path/to/project", "limit?": 20, "project_only?": false}
+Output: [{"file": "/path/src/main.cpp", "language": "cpp",
+          "mtime": "2026-06-05T09:35:18", "_match_snippet": "…InterruptIn…"}]
+```
+
+Covers file-scope constructs that `search_bodies` cannot see:
+`extern "C"`, type declarations in headers, `#include`, `#define`,
+global variables, namespace blocks. Results are file-level (one entry
+per matching file) — use `search_bodies` for per-function granularity.
+
+When `files_fts` is missing (legacy index), falls back to LIKE search
+on `files.content` — results include `_fallback: "like"` and no snippet
+highlighting. Run `fw-context index` to upgrade.
+
+**FTS5 query tips for `search_content`:** Bare multi-word queries are
+OR-joined (prefix-wildcarded). Prefer single-word queries.
 
 #### `lookup_symbol`
 

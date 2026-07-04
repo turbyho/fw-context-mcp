@@ -11,6 +11,7 @@ import logging
 from pathlib import Path
 
 from fw_context_mcp.indexer.db import (
+    _ensure_column,
     delete_fp_assignments_for_file,
     delete_indirect_call_sites_for_file,
     delete_inheritance_for_file,
@@ -58,6 +59,104 @@ def _compute_content_hash(
     """
     body = _read_body(lines, start_line, end_line)
     return compute_content_hash(body, qualified_name, signature, docstring)
+
+
+def _build_filtered_file_content(
+    conn, unit, config_hash: str, project_root: Path
+) -> int:
+    """Tokenize TU, extract active lines per file, store ifdef-filtered content.
+
+    Parses *unit* (a ``CompilationUnit`` data class) with libclang, then
+    tokenizes to find which source lines are active (not ``#ifdef``-dead).
+    Only processes files whose ``content`` column is still empty — once set,
+    content is trusted until the next full reindex.
+
+    Inactive lines are replaced with ``\\n`` so line numbers stay
+    consistent with the original source.
+
+    Returns the number of files whose content was filled.
+    """
+    # Fast path: skip if no files need content filling
+    _ensure_column(conn, "files", "content", "TEXT NOT NULL DEFAULT ''")
+    remaining = conn.execute(
+        "SELECT COUNT(*) FROM files WHERE config_hash=? AND content=''",
+        (config_hash,),
+    ).fetchone()[0]
+    if remaining == 0:
+        return 0
+
+    from clang import cindex as cx
+
+    from fw_context_mcp.indexer.symbols import _get_index
+
+    try:
+        tu = _get_index().parse(
+            str(unit.file),
+            args=unit.clang_args,
+            options=cx.TranslationUnit.PARSE_DETAILED_PROCESSING_RECORD,
+        )
+        tokens = list(tu.cursor.get_tokens())
+    except Exception:
+        log.debug("_build_filtered_file_content: parse/tokenization failed for %s", unit.file.name)
+        return 0
+
+    # Collect active lines -> (abs_path, set of line numbers)
+    active: dict[str, set[int]] = {}
+    for tok in tokens:
+        loc = tok.location
+        if loc.file is not None:
+            fname = str(loc.file.name)
+            active.setdefault(fname, set()).add(loc.line)
+
+    filled = 0
+    for abs_path, active_lines in active.items():
+        if not active_lines:
+            continue
+
+        try:
+            rel_path = str(Path(abs_path).resolve().relative_to(project_root))
+        except ValueError:
+            continue  # file outside project tree
+
+        # Already processed?
+        row = conn.execute(
+            "SELECT content FROM files WHERE config_hash=? AND path=?",
+            (config_hash, rel_path),
+        ).fetchone()
+        if row and row[0]:
+            continue  # already have filtered content
+
+        # Read original file
+        try:
+            with open(abs_path, encoding="utf-8", errors="replace") as f:
+                original = f.readlines()
+        except Exception:
+            continue
+
+        if not original:
+            continue
+
+        # Replace inactive lines with \n to preserve line numbers
+        max_line = max(active_lines)
+        filtered = [
+            original[i - 1] if (i in active_lines) else "\n"
+            for i in range(1, min(len(original), max_line) + 1)
+        ]
+        content = "".join(filtered)
+
+        # Insert or update — file rows may not exist for headers-only files.
+        lang = "cpp" if rel_path.endswith((".cpp", ".cc", ".cxx", ".hpp", ".hxx")) else "c"
+        conn.execute(
+            "INSERT INTO files (config_hash, path, language, content) "
+            "VALUES (?, ?, ?, ?) "
+            "ON CONFLICT (config_hash, path) DO UPDATE SET content = excluded.content",
+            (config_hash, rel_path, lang, content),
+        )
+        filled += 1
+
+    if filled:
+        log.info("content fill: %d files from TU %s", filled, unit.file.name)
+    return filled
 
 
 def store_symbols_for_unit(
@@ -214,7 +313,7 @@ def store_symbols_for_unit(
                     if rp.startswith(root_n + "/") or rp == root_n:
                         is_proj = 1
                         break
-            # Read source body for definitions (for FTS5 search_source).
+            # Read source body for definitions (for FTS5 search_bodies).
             body = ""
             if s.is_definition and s.end_line > s.line:
                 file_lines = _cached_lines(s.file)
@@ -411,5 +510,8 @@ def store_symbols_for_unit(
             for i in inheritance
         ]
         insert_inheritance_batch(conn, inheritance_rows)
+
+    # Fill files.content with ifdef-filtered content (tokenization pass)
+    _build_filtered_file_content(conn, unit, config_hash, project_root)
 
     return syms_added, refs_added

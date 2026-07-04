@@ -38,7 +38,8 @@ def _stale_files(conn, config_hash: str, file_paths: list[str]) -> list[str]:
     for path in dict.fromkeys(file_paths):
         try:
             stored = get_file_mtime_indexed(conn, config_hash, path)
-            if stored is None:
+            if not stored:
+                # stored=0.0 (pre-migration) or None (not indexed) — skip
                 continue
             if os.path.getmtime(path) > stored + MTIME_TOLERANCE_S:
                 stale.append(path)
@@ -58,7 +59,8 @@ def _count_modified_files(
 ) -> int:
     """Count files whose on-disk mtime is newer than the stored mtime.
 
-    Files with mtime=0 (pre-migration databases) are always counted as modified.
+    Files with mtime=0 (pre-migration databases) are skipped — their
+    mtime is unknown, not "modified".
 
     When *use_cache* is True and a cached value is less than
     ``_MTIME_CACHE_TTL`` seconds old, the cached value is returned.
@@ -80,8 +82,7 @@ def _count_modified_files(
         path = r["path"]
         stored = r["mtime"]
         if not stored:
-            # mtime=0 from a pre-migration database — unknown, treat as stale
-            modified += 1
+            # mtime=0 from a pre-migration database — unknown, skip
             continue
         p = Path(path)
         if not p.is_absolute():

@@ -191,7 +191,7 @@ libclang parses every file     ← same -I, -D, --target as your compiler
 SQLite index on disk           ← symbols + call graph + FTS5 + embeddings
     │                              + pre-computed LLM analysis
     ▼
-29 MCP tools                   ← your AI queries the index, not files
+31 MCP tools                   ← your AI queries the index, not files
     │
     ▼
 Your AI assistant              ← Claude, OpenCode, Cursor, Codex, Kilo Code
@@ -216,7 +216,7 @@ Not the text on disk.
 | **Vectors** | sqlite-vec | Variable-dimension embeddings for semantic/concept search (mxbai 1024-dim, qwen3 4096-dim) |
 | **Analysis** | llm_analysis table | pre-computed plain-English explanations of every function |
 
-### The 29 Tools
+### The 31 Tools
 
 Your AI assistant gets these capabilities — not by reading files, but by
 querying the index:
@@ -224,6 +224,8 @@ querying the index:
 **🔍 Search & Discovery** — Find anything without grepping
 - `search_code` — FTS5 full-text with progressive fallback (5 strategies tried automatically)
 - `lookup_symbol` — by name or prefix, definitions prioritized
+- `search_bodies` — search function BODIES for patterns like `.attach(`, `NVIC_SetVector(`
+- `search_content` — search FULL file content (headers, declarations, defines)
 - `smart_search` — natural language → FTS5 via Ollama (*"how does the modem connect?"*)
 - `semantic_search` — find code by concept, not keyword (*"power saving modes"*)
 
@@ -446,7 +448,7 @@ Confidence: High — every reference is compiler-verified, every edge is from th
 | Callback discovery | Manual grep + luck | `find_callers` returning empty — explicit signal |
 | Macro resolution | Manual config.h reading | libclang already resolved them |
 | Data flow confidence | Mental model, could miss references | 25 references enumerated, every one accounted for |
-| **Questions you can ask** | Limited by token budget | Limited by tool coverage (29 tools, wide) |
+| **Questions you can ask** | Limited by token budget | Limited by tool coverage (31 tools, wide) |
 
 ---
 
@@ -663,7 +665,7 @@ occasional smart_search queries.
 
 ### Can I use it without Ollama at all?
 
-Yes. All 29 tools work without Ollama. `smart_search` falls back to word-split
+Yes. All 31 tools work without Ollama. `smart_search` falls back to word-split
 FTS5. `semantic_search` falls back to `search_code`. `explain_symbol` returns
 source + prompt for your AI to process itself. The index and call graph are
 fully functional without any LLM dependency.
@@ -715,7 +717,7 @@ window become practical.
 |----------|--------|
 | **[Technical Overview](docs/README.md)** | Architecture diagrams, directory layout, features, supported ecosystems — the original README |
 | **[Installation Guide](docs/installation.md)** | Prerequisites, install, upgrade, Ollama setup, AI assistant integration |
-| **[Tools Reference](docs/tools.md)** | All 29 MCP tools, 10 CLI commands, search pipeline internals |
+| **[Tools Reference](docs/tools.md)** | All 31 MCP tools, 10 CLI commands, search pipeline internals |
 | **[Configuration](docs/configuration.md)** | `.fw-context/config.toml` + `local.toml` — shared project config and local developer overrides |
 | **[MCP Server](README-MCP.md)** | JSON-RPC protocol, tool schemas, error handling, debugging |
 
