@@ -10,7 +10,7 @@ from pydantic import Field
 
 from ...config import derive_project_id
 from ...config import load as load_config
-from ...indexer.db import _expand_query, get_active_config, search_symbols
+from ...indexer.db import _expand_query, get_active_config, lookup_macro, search_symbols
 from ...llm.ollama import call_ollama_embed, check_setup
 from ...utils import abs_path, resolve_project_root
 from ..shared.context import _db_path, _is_stale, _open_db_safe
@@ -119,6 +119,26 @@ LOOKUP_PREFIX_SQL,
                     _suggestions = suggest_names(c, config_hash, name, limit=5)
                 except Exception:
                     pass  # suggestions are best-effort
+
+            # Macro fallback: check the macros table
+            if not rows:
+                _macro_rows = lookup_macro(c, config_hash, name, exact=exact, limit=limit)
+                if _macro_rows:
+                    result = [
+                        {
+                            "name": m["name"],
+                            "qualified_name": m["name"],
+                            "kind": "macro",
+                            "file": abs_path(root, m["file_path"]),
+                            "line": m["line"],
+                            "value": m["value"],
+                            **({"expanded_value": m["expanded_value"]} if m["expanded_value"] else {}),
+                        }
+                        for m in _macro_rows
+                    ]
+                    if _suggestions:
+                        result.append({"_did_you_mean": _suggestions})
+                    return result
 
             # Auto-fallback: when exact/prefix lookup found nothing but we have
             # did-you-mean suggestions, try the top match so the user doesn't
@@ -325,6 +345,45 @@ def search_code(
                 rows = ind_rows[:limit]
                 if rows:
                     method = "individual_terms"
+
+            # Step 6: macro FTS5 fallback — when no symbols matched, also search
+            # the macros_fts table for #define macro names and values.
+            if not rows:
+                try:
+                    expanded = _expand_query(query)
+                    m_rows = c.execute(
+                        """SELECT m.*, f.path AS file_path
+                           FROM macros_fts
+                           JOIN macros m ON m.id = macros_fts.rowid
+                           JOIN files f ON f.id = m.file_id
+                           WHERE macros_fts MATCH ? AND m.config_hash = ?
+                           ORDER BY rank
+                           LIMIT ?""",
+                        (expanded, config_hash, limit),
+                    ).fetchall()
+                    if m_rows:
+                        for r in m_rows:
+                            d = {
+                                "name": r["name"],
+                                "qualified_name": r["name"],
+                                "kind": "macro",
+                                "file": abs_path(root, r["file_path"]),
+                                "line": r["line"],
+                                "is_definition": True,
+                                "signature": f"#define {r['name']}",
+                                "docstring": "",
+                                "is_template": False,
+                                "is_virtual": False,
+                                "is_pure_virtual": False,
+                                "_fallback": "macros_fts",
+                            }
+                            if r["value"]:
+                                d["_macro_value"] = r["value"]
+                            if r.get("expanded_value"):
+                                d["_macro_expanded_value"] = r["expanded_value"]
+                            rows.append(d)
+                except (sqlite3.OperationalError, Exception):
+                    pass  # macros_fts may not exist on older indexes
 
             # Filter to application code when project_only=True
             if project_only:

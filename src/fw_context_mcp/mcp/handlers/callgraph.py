@@ -15,8 +15,10 @@ from ...indexer.db import (
     count_fp_assignments,
     count_indirect_call_sites,
     count_refs,
+    find_macro_refs,
     find_refs,
     get_active_config,
+    lookup_macro,
 )
 from ...indexer.db import (
     find_indirect_call_sites as query_indirect_call_sites,
@@ -64,6 +66,33 @@ def _references_result(name: str, project_root: str | None, ref_kind: str | list
             config_hash = cfg_data["config_hash"]
             symbol = _lookup_definition(conn, config_hash, name)
             if symbol is None:
+                # Macro fallback: check if name is a macro definition
+                macros = lookup_macro(conn, config_hash, name, exact=True, limit=1)
+                if macros:
+                    macro = macros[0]
+                    # Use find_macro_refs for file-level usage tracking
+                    ref_rows = find_macro_refs(conn, config_hash, name, limit=limit)
+                    macro_def = {
+                        "kind": "macro",
+                        "name": macro["name"],
+                        "file": abs_path(root, macro["file_path"]),
+                        "line": macro["line"],
+                        "value": macro["value"],
+                        **({"expanded_value": macro["expanded_value"]} if macro["expanded_value"] else {}),
+                    }
+                    if not ref_rows:
+                        label = "callers" if caller_mode else "references"
+                        return [{"info": f"No {label} (macro) found for '{name}'.", **macro_def}]
+                    result: list[dict] = [
+                        {
+                            "file": abs_path(root, r["file_path"]),
+                            "ref_kind": "macro_use",
+                            "_match_snippet": r["_match_snippet"],
+                        }
+                        for r in ref_rows
+                    ]
+                    result.insert(0, macro_def)
+                    return result
                 return [{"error": f"Symbol not found: {name}"}]
             if count_refs(conn, config_hash) == 0:
                 return [{"info": (
@@ -130,11 +159,11 @@ def find_callers(
         limit: Maximum results (default 50).
 
     Returns:
-        list of dicts, each with: file, line, ref_kind (``"call"`` or
-        ``"indirect"``), caller (enclosing function name), caller_kind
-        (``"function"``, ``"method"``, …).
+        list of dicts, each with: file, line, ref_kind (``"call"``,
+        ``"indirect"``, or ``"implicit_construct"``), caller (enclosing
+        function name), caller_kind (``"function"``, ``"method"``, …).
     """
-    return _references_result(name, project_root, ref_kind=["call", "indirect"], limit=limit, caller_mode=True)
+    return _references_result(name, project_root, ref_kind=["call", "indirect", "implicit_construct"], limit=limit, caller_mode=True)
 
 # ── moved from server.py ──
 def find_references(
@@ -166,7 +195,9 @@ def find_references(
         list of dicts, each with: file, line, ref_kind, caller, caller_kind.
         ``ref_kind`` is one of: ``"call"``, ``"ref"``, ``"member"``,
         ``"indirect"`` (function-pointer reference in arguments, assignments,
-        initializers, or init lists), ``"template_ref"``.
+        initializers, or init lists), ``"implicit_construct"`` (implicit
+        constructor call from global/static object or member-field
+        initialization), ``"template_ref"``.
     """
     return _references_result(name, project_root, ref_kind=None, limit=limit)
 
@@ -498,9 +529,11 @@ def find_dead_code(
       code.  Verify each hit with ``find_indirect_targets`` before
       deleting.
 
-    Expect additional false positives from constructors called via
-    factories, ISRs, virtual method overrides, and weak-aliased symbols.
-    Always verify before deleting.
+    Implicit constructor calls through global/static object and member-field
+    initialization are detected as ``implicit_construct`` references. Known
+    remaining false positives: constructors called via factories, ISRs,
+    virtual method overrides, and weak-aliased symbols. Always verify before
+    deleting.
 
     By default, SDK/vendor paths are auto-excluded based on the build
     system (mbed-os/ for Mbed OS, .pio/ for PlatformIO, zephyr/ + build/

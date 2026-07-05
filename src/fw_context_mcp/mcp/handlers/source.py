@@ -15,6 +15,7 @@ from ...indexer.db import (
     get_active_config,
     get_llm_analysis_for_symbol,
     get_overrides_for_method,
+    lookup_macro,
 )
 from ...llm.ollama import OllamaError, OllamaModelNotFoundError, call_ollama_async
 from ...utils import abs_path
@@ -209,6 +210,20 @@ async def explain_symbol(
             config_hash = cfg_data["config_hash"]
             row = _lookup_definition(conn, config_hash, name)
             if not row:
+                # Macro fallback
+                macros = lookup_macro(conn, config_hash, name, exact=True, limit=1)
+                if macros:
+                    m = macros[0]
+                    return {
+                        "name": m["name"],
+                        "kind": "macro",
+                        "file": abs_path(root, m["file_path"]),
+                        "line": m["line"],
+                        "signature": f"#define {m['name']}",
+                        "source": f"#define {m['name']} {m['value']}",
+                        **({"value": m["value"]}),
+                        **({"expanded_value": m["expanded_value"]} if m["expanded_value"] else {}),
+                    }
                 return {"error": f"Symbol not found: {name}"}
             file_path = abs_path(root, row["file_path"])
             line_no = row["line"]
@@ -319,6 +334,20 @@ def get_source(
                 return {"error": "No build config indexed."}
             row = _lookup_definition(conn, cfg_data["config_hash"], name)
             if not row:
+                # Macro fallback
+                macros = lookup_macro(conn, cfg_data["config_hash"], name, exact=True, limit=1)
+                if macros:
+                    m = macros[0]
+                    return {
+                        "name": m["name"],
+                        "kind": "macro",
+                        "file": abs_path(root, m["file_path"]),
+                        "line": m["line"],
+                        "signature": f"#define {m['name']}",
+                        "source": f"#define {m['name']} {m['value']}",
+                        **({"value": m["value"]}),
+                        **({"expanded_value": m["expanded_value"]} if m["expanded_value"] else {}),
+                    }
                 return {"error": f"Symbol not found: {name}"}
             file_path = abs_path(root, row["file_path"])
             result: dict = {
@@ -489,6 +518,22 @@ def get_symbol_context(
             config_hash = cfg_data["config_hash"]
             row = _lookup_definition(conn, config_hash, name)
             if not row:
+                # Macro fallback — macros have no callers/callees, return basic info
+                macros = lookup_macro(conn, config_hash, name, exact=True, limit=1)
+                if macros:
+                    m = macros[0]
+                    return {
+                        "name": m["name"],
+                        "kind": "macro",
+                        "file": abs_path(root, m["file_path"]),
+                        "line": m["line"],
+                        "signature": f"#define {m['name']}",
+                        "source": f"#define {m['name']} {m['value']}",
+                        "value": m["value"],
+                        "expanded_value": m["expanded_value"] or None,
+                        "callers": [],
+                        "callees": [],
+                    }
                 return {"error": f"Symbol not found: {name}"}
             file_path = abs_path(root, row["file_path"])
             symbol_usr = row["usr"]

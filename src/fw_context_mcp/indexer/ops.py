@@ -21,6 +21,7 @@ from fw_context_mcp.indexer.db import (
     insert_fp_assignments_batch,
     insert_indirect_call_sites_batch,
     insert_inheritance_batch,
+    insert_macros_batch,
     insert_refs_batch,
     insert_symbols_batch,
     split_tokens,
@@ -146,11 +147,16 @@ def _build_filtered_file_content(
 
         # Insert or update — file rows may not exist for headers-only files.
         lang = "cpp" if rel_path.endswith((".cpp", ".cc", ".cxx", ".hpp", ".hxx")) else "c"
+        # Grab real mtime so _count_modified_files won't flag this as stale.
+        try:
+            file_mtime = Path(abs_path).stat().st_mtime
+        except OSError:
+            file_mtime = 0.0
         conn.execute(
-            "INSERT INTO files (config_hash, path, language, content) "
-            "VALUES (?, ?, ?, ?) "
+            "INSERT INTO files (config_hash, path, language, content, mtime) "
+            "VALUES (?, ?, ?, ?, ?) "
             "ON CONFLICT (config_hash, path) DO UPDATE SET content = excluded.content",
-            (config_hash, rel_path, lang, content),
+            (config_hash, rel_path, lang, content, file_mtime),
         )
         filled += 1
 
@@ -207,10 +213,14 @@ def store_symbols_for_unit(
 
     # Parse (or use caller-supplied pre-parsed data)
     if pre_parsed is not None:
-        syms, refs, inheritance, indirect_call_sites, fp_assignments = pre_parsed
+        if len(pre_parsed) == 6:
+            syms, refs, inheritance, indirect_call_sites, fp_assignments, macros = pre_parsed
+        else:
+            syms, refs, inheritance, indirect_call_sites, fp_assignments = pre_parsed
+            macros = []
     else:
         try:
-            syms, refs, inheritance, indirect_call_sites, fp_assignments = extract_all(
+            syms, refs, inheritance, indirect_call_sites, fp_assignments, macros = extract_all(
                 unit,
                 source_roots=source_roots,
                 exclude_paths=exclude_paths,
@@ -510,6 +520,33 @@ def store_symbols_for_unit(
             for i in inheritance
         ]
         insert_inheritance_batch(conn, inheritance_rows)
+
+    # Macros
+    if macros:
+        macro_rows: list[tuple] = []
+        for m in macros:
+            m_abs = str(m.file) if m.file else file_path
+            # Use absolute path as files table key (consistent with symbol storage).
+            if m_abs not in file_id_cache:
+                lang = "cpp" if Path(m_abs).suffix.lower() in {".cpp", ".cc", ".cxx", ".c++"} else "c"
+                m_mtime = current_mtime if m_abs == file_path else 0.0
+                try:
+                    m_mtime = Path(m_abs).stat().st_mtime
+                except OSError:
+                    pass
+                file_id_cache[m_abs] = upsert_file(conn, config_hash, m_abs, lang, mtime=m_mtime)
+            m_file_id = file_id_cache[m_abs]
+            macro_rows.append((
+                config_hash,
+                m_file_id,
+                m.name,
+                m.value,
+                m.expanded_value,
+                m.line,
+                int(m.is_function_like),
+            ))
+        if macro_rows:
+            insert_macros_batch(conn, macro_rows)
 
     # Fill files.content with ifdef-filtered content (tokenization pass)
     _build_filtered_file_content(conn, unit, config_hash, project_root)

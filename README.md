@@ -23,6 +23,7 @@ With fw-context, the LLM can ask questions about the program your compiler actua
 - Where is this callback registered?
 - Which implementation is active for this build?
 - Which code is excluded by preprocessing?
+- Which macros are defined with what values?
 - Which symbols reference this API?
 - What will break if this function signature changes?
 - How does data flow from the ISR to the application?
@@ -59,7 +60,7 @@ compiler-accurate semantic index
         LLM
 ```
 
-The index stores symbols, source extents, references, call relationships, active source content, function pointer assignments, inheritance information, documentation and optional LLM-generated summaries. The MCP server exposes this information as tools that coding agents and other LLM clients can call during analysis, review and navigation.
+The index stores symbols, source extents, references, call relationships, active source content, function pointer assignments, inheritance information, macro definitions with expanded values, documentation and optional LLM-generated summaries. The MCP server exposes this information as tools that coding agents and other LLM clients can call during analysis, review and navigation.
 
 fw-context does not replace the model. It gives the model better input.
 

@@ -8,6 +8,8 @@ from __future__ import annotations
 import pytest
 from fastapi.testclient import TestClient
 
+from fw_context_mcp import __version__ as fw_context_version
+
 
 class MockBackend:
     """In-memory mock of CacheBackend for testing."""
@@ -89,7 +91,7 @@ class TestHealthEndpoint:
     def test_health_public(self, client: TestClient) -> None:
         response = client.get("/health")
         assert response.status_code == 200
-        assert response.json() == {"status": "ok"}
+        assert response.json() == {"status": "ok", "version": fw_context_version}
 
 
 class TestAuth:

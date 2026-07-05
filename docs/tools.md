@@ -352,7 +352,8 @@ OR-joined (prefix-wildcarded). Prefer single-word queries.
 
 #### `lookup_symbol`
 
-Find a symbol by name (exact or prefix match).
+Find a symbol by name (exact or prefix match). Searches functions, methods,
+classes, enums, typedefs, variables, fields, and **macros**.
 
 ```
 Input:  {"name": "uart_init", "project_root?": "/path/to/project", "exact?": true, "limit?": 50}
@@ -361,10 +362,21 @@ Output: [{"name": "uart_init", "qualified_name": "drv::uart_init", "kind": "func
           "signature": "void uart_init(int baudrate)", "docstring": "Initialize UART"}]
 ```
 
+Macro example:
+```
+Input:  {"name": "CONFIG_UART_BAUDRATE", "project_root?": "/path/to/project", "exact?": true}
+Output: [{"name": "CONFIG_UART_BAUDRATE", "kind": "macro",
+          "file": "/path/include/config.h", "line": 15,
+          "value": "115200", "expanded_value": "115200"}]
+```
+
 Definitions are sorted before declarations. Use `exact: true` for exact name
 match; the default is prefix match (`uart` → `uart_init`, `uart_write`, …).
 
-Enum constants include `enum_value` when non-None.
+Macros are extracted via `clang -dM -E` with the compiler flags from
+`compile_commands.json`, so `#ifdef`-conditional macros resolve correctly
+for the indexed build configuration. Enum constants include `enum_value`
+when non-None.
 
 #### `smart_search`
 
@@ -488,7 +500,8 @@ Output: {"name": "StatusCode", "kind": "enum", "file": "/path/src/ble_cmd.h",
 #### `explain_symbol`
 
 Look up a symbol and get a plain-English explanation of its purpose, inputs,
-outputs, and side effects.
+outputs, and side effects. Falls back to **macro explanation** when the name
+matches a macro definition — returns `kind: "macro"` with the expanded value.
 
 ```
 Input:  {"name": "spi_transfer", "project_root?": "/path/to/project", "context_lines?": 40}
@@ -497,6 +510,16 @@ Output: {"name": "spi_transfer", "kind": "function", "file": "/path/src/spi.c",
          "explanation": "This function performs a full-duplex SPI transfer…\n\nInputs: …\nOutputs: …",
          "llm_analysis": {"summary": "…", "inputs": "…", "outputs": "…",
                           "model": "qwen2.5-coder:14b", "analyzed_at": "2026-06-21T17:51:14"}}
+```
+
+Macro fallback:
+```
+Input:  {"name": "CONFIG_UART_BAUDRATE", "project_root?": "/path/to/project"}
+Output: {"name": "CONFIG_UART_BAUDRATE", "kind": "macro",
+         "file": "/path/include/config.h", "line": 15,
+         "signature": "#define CONFIG_UART_BAUDRATE",
+         "value": "115200", "expanded_value": "115200",
+         "source": "#define CONFIG_UART_BAUDRATE 115200"}
 ```
 
 **Pre-computed (instant):** When the index was built with `--analyze` (default),
@@ -576,7 +599,8 @@ if you don't need them.
 
 Who calls this function? Direct callers and indirect calls via function pointers
 detected in call arguments, assignments, variable initializers, and struct/array
-init lists.
+init lists. Automatically falls back to **macro lookup** when the symbol is not
+found as a function/method.
 
 ```
 Input:  {"name": "uart_write", "project_root?": "/path/to/project", "limit?": 50}
@@ -599,6 +623,8 @@ specific functions can run at a given call site — use
 #### `find_references`
 
 All uses of a symbol — calls, reads, member access, indirect references.
+When the symbol is not found, automatically falls back to **macro lookup**
+(returns `ref_kind: "macro_use"` for files that use the macro).
 
 ```
 Input:  {"name": "g_sensor_data", "project_root?": "/path/to/project", "limit?": 50}
@@ -606,9 +632,17 @@ Output: [{"file": "/path/src/sensor.c", "line": 12, "ref_kind": "ref",
           "caller": "sensor_task", "caller_kind": "function"}, …]
 ```
 
+Macro fallback:
+```
+Input:  {"name": "CONFIG_BUFFER_SIZE", "project_root?": "/path/to/project"}
+Output: [{"kind": "macro", "name": "CONFIG_BUFFER_SIZE", "file": "…", "line": 42, …},
+         {"file": "…", "ref_kind": "macro_use", "_match_snippet": "…CONFIG_BUFFER_SIZE…"}, …]
+```
+
 ``ref_kind`` values: ``"call"`` (direct call), ``"ref"`` (variable read/write),
 ``"member"`` (member access), ``"indirect"`` (function pointer reference in
-arguments, assignments, initializers, or init lists), ``"template_ref"``.
+arguments, assignments, initializers, or init lists), ``"template_ref"``,
+``"macro_use"`` (macro usage in file).
 
 #### `find_call_path`
 
@@ -868,25 +902,30 @@ Output: {"config_hash": "a1b2…", "project_id": "c3d4…", "project_root": "/pa
          "schema_version": 84935291, "current_schema": 84935291,
          "analyzed_symbols": 8450, "unanalyzed_symbols": 120,
          "analysis_model": "qwen2.5-coder:14b",
-         "bg_reindex_running": false, "reindex_progress": null, "stale": false}
+         "bg_reindex_running": false, "reindex_progress": null,
+         "status": "ready", "reindex_needed": false, "reindex_reasons": [],
+         "index_message": "Index is up to date — 12430 symbols in 1502 files."}
 ```
 
 **Read-only.** No side effects — does not spawn background tasks.
 Background reindex is managed by the server startup thread and the file
-watcher.  ``bg_reindex_running`` and ``reindex_progress`` report whether
+watcher. ``bg_reindex_running`` and ``reindex_progress`` report whether
 a background reindex is active and its last log line.
 
-``modified_files_count`` is cached for 30 seconds (calls within that window
-return the same value).  The ``stale`` field is True when at least one
-detection condition is met (see below).  ``unanalyzed_symbols`` counts
-definition symbols that still need LLM analysis (zero when analysis is
-disabled, empty when all symbols are analyzed).
+**``status`` field (use for decision-making):**
 
-`stale: true` when:
-- `compile_commands.json` changed since the index was built, or
-- any indexed source file has a newer on-disk mtime (`modified_files_count > 0`), or
-- `schema_version < current_schema` — the index was built with an older
-  DB schema
+| Status | Meaning | What to do |
+|--------|---------|------------|
+| ``"ready"`` | Fully up to date, no issues | Continue normally |
+| ``"reindexing"`` | Background reindex in progress | Index is still usable — continue normally |
+| ``"reindex_needed"`` | compile_commands.json changed or schema mismatch | Queries still work, but schedule ``fw-context index`` |
+| ``"no_index"`` | No build config indexed | Use other tools |
+| ``"error"`` | DB corruption or access error | Use other tools |
+
+``modified_files_count`` is cached for 30 seconds (calls within that window
+return the same value). ``unanalyzed_symbols`` counts definition symbols that
+still need LLM analysis (zero when analysis is disabled, empty when all
+symbols are analyzed).
 
 #### `reindex_file`
 
@@ -1117,6 +1156,7 @@ For manual recovery, use `reindex_file` or `fw-context index`.
    Traverse AST → extract symbols within source_roots
    Category: function, method, class, enum, typedef, variable, field, …
    Extract cross-references within source_roots (on by default; skip with --no-refs)
+   Extract macros via clang -dM -E (preprocessor dump; stored in macro_defs table)
    Release write lock between TUs — manual operations (``reindex_file``)
    can interleave via the pause marker mechanism without blocking.
 
@@ -1124,10 +1164,11 @@ For manual recovery, use `reindex_file` or `fw-context index`.
    Delete old symbols for this TU
    Insert new symbols + FTS5 triggers
    Insert references (on by default; skip with --no-refs)
+   Insert macros with expanded values
    Generate + store vector embeddings (on by default; skip with --no-embeddings)
 
 5. Write build metadata:
-   compile_commands.json hash, file mtimes, symbol/file/ref counts
+   compile_commands.json hash, file mtimes, symbol/file/ref/macro counts
 ```
 
 ### Vector search
