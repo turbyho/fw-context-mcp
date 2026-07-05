@@ -42,6 +42,7 @@ _SYMBOL_KINDS = frozenset({
     cx.CursorKind.CLASS_TEMPLATE,
     cx.CursorKind.CLASS_TEMPLATE_PARTIAL_SPECIALIZATION,
     cx.CursorKind.STRUCT_DECL,
+    cx.CursorKind.UNION_DECL,
     cx.CursorKind.ENUM_DECL,
     cx.CursorKind.ENUM_CONSTANT_DECL,
     cx.CursorKind.TYPEDEF_DECL,
@@ -274,6 +275,7 @@ def _cursor_kind_label(kind: cx.CursorKind) -> str:
         cx.CursorKind.CLASS_TEMPLATE: "class",
         cx.CursorKind.CLASS_TEMPLATE_PARTIAL_SPECIALIZATION: "class",
         cx.CursorKind.STRUCT_DECL: "struct",
+        cx.CursorKind.UNION_DECL: "union",
         cx.CursorKind.ENUM_DECL: "enum",
         cx.CursorKind.ENUM_CONSTANT_DECL: "enum_constant",
         cx.CursorKind.TYPEDEF_DECL: "typedef",
@@ -285,7 +287,63 @@ def _cursor_kind_label(kind: cx.CursorKind) -> str:
     return mapping.get(kind, kind.name.lower())
 
 
-def _qualified_name(cursor: cx.Cursor) -> str:
+def _is_anonymous_struct_or_union(cursor: cx.Cursor) -> bool:
+    """True when *cursor* is an anonymous (unnamed) struct or union.
+
+    libclang reports the spelling as ``""`` for some compilers or as
+    ``"struct (unnamed at file:line)"`` / ``"union (anonymous at file:line)"``
+    on others.  Both are treated as anonymous.
+    """
+    if cursor.kind not in (cx.CursorKind.STRUCT_DECL, cx.CursorKind.UNION_DECL):
+        return False
+    spelling = cursor.spelling
+    if not spelling:
+        return True
+    if "(unnamed" in spelling or "(anonymous" in spelling:
+        return True
+    return False
+
+
+def _build_anon_usr_to_field(tu_cursor: cx.Cursor) -> dict[str, str]:
+    """Build a mapping from anonymous struct/union USR → enclosing field name.
+
+    Walks struct/union/class/namespace bodies (skipping function bodies)
+    and for each FIELD_DECL whose immediate child is an anonymous struct
+    or union, records the anon USR → field name association.
+
+    This is used as a pre-scan before symbol extraction so that anonymous
+    structs defined as ``struct { ... } _payload;`` get indexed with the
+    field name (``_payload``) instead of ``"(unnamed struct at ...)"``.
+    """
+    mapping: dict[str, str] = {}
+
+    def _walk(cursor: cx.Cursor) -> None:
+        if cursor.kind == cx.CursorKind.FIELD_DECL:
+            for child in cursor.get_children():
+                if _is_anonymous_struct_or_union(child):
+                    child_usr = child.get_usr()
+                    if child_usr:
+                        mapping[child_usr] = cursor.spelling
+            return  # don't walk into field children (they're the anon struct members)
+
+        if cursor.kind in (
+            cx.CursorKind.STRUCT_DECL,
+            cx.CursorKind.UNION_DECL,
+            cx.CursorKind.CLASS_DECL,
+            cx.CursorKind.NAMESPACE,
+            cx.CursorKind.TRANSLATION_UNIT,
+        ):
+            for child in cursor.get_children():
+                _walk(child)
+
+    _walk(tu_cursor)
+    return mapping
+
+
+def _qualified_name(
+    cursor: cx.Cursor,
+    anon_map: dict[str, str] | None = None,
+) -> str:
     """Build the fully qualified name of a cursor via semantic parent traversal.
 
     Walks up the semantic parent chain (skipping the translation unit root)
@@ -293,14 +351,24 @@ def _qualified_name(cursor: cx.Cursor) -> str:
     and unnamed entities produce empty segments which are collapsed by
     the join.
 
+    When *anon_map* is provided and *cursor* is an anonymous struct/union
+    with a recorded field name, the field name is used in place of the
+    anonymous marker (e.g. ``"_ble_cmd"`` instead of
+    ``"struct (unnamed at ...)"``).
+
     Returns a string like ``"namespace::Class::method"``, or an empty
     string for the translation unit root.
     """
     parts: list[str] = []
     c = cursor
     while c and c.kind != cx.CursorKind.TRANSLATION_UNIT:
-        if c.spelling:
-            parts.append(c.spelling)
+        spelling = c.spelling
+        usr = c.get_usr() if anon_map else None
+        field_name = anon_map.get(usr) if usr and anon_map else None
+        if field_name:
+            parts.append(field_name)
+        elif spelling:
+            parts.append(spelling)
         c = c.semantic_parent
     parts.reverse()
     return "::".join(parts)
@@ -524,6 +592,10 @@ def extract_all(
     seen_usrs: dict[str, bool] = {}  # USR → is_definition (allows decl→def promotion)
     class_cursors: list[cx.Cursor] = []  # class/struct def cursors for inheritance extraction
 
+    # Pre-scan: map anonymous struct/union USRs to their field names
+    # (e.g. struct { ... } _ble_cmd;  →  anon_usr → "_ble_cmd")
+    anon_usr_to_field = _build_anon_usr_to_field(tu.cursor)
+
     for cursor in tu.cursor.walk_preorder():
         if cursor.kind not in _SYMBOL_KINDS:
             continue
@@ -561,6 +633,7 @@ def extract_all(
         if sem_parent and sem_parent.kind in (
             cx.CursorKind.CLASS_DECL,
             cx.CursorKind.STRUCT_DECL,
+            cx.CursorKind.UNION_DECL,
             cx.CursorKind.CLASS_TEMPLATE,
             cx.CursorKind.CLASS_TEMPLATE_PARTIAL_SPECIALIZATION,
         ):
@@ -600,9 +673,17 @@ def extract_all(
         else:
             seen_usrs[usr] = is_def
 
+        # For anonymous structs/unions with a named field, use the field name
+        # as the display name and qualified-name segment (e.g. "_ble_cmd"
+        # instead of "struct (unnamed at ...)").
+        is_anon = _is_anonymous_struct_or_union(cursor)
+        field_name = anon_usr_to_field.get(usr) if is_anon else None
+        symbol_name = field_name if field_name else cursor.spelling
+        symbol_qname = _qualified_name(cursor, anon_usr_to_field) if is_anon else _qualified_name(cursor)
+
         symbols.append(Symbol(
-            name=cursor.spelling,
-            qualified_name=_qualified_name(cursor),
+            name=symbol_name,
+            qualified_name=symbol_qname,
             kind=_cursor_kind_label(cursor.kind),
             file=loc.file.name,
             line=loc.line,

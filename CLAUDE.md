@@ -189,6 +189,24 @@ compile_commands.json
 - `indexer/config_hash.py` — content-addressable config fingerprint for
   staleness detection
 
+**Anonymous struct/union handling** (in `indexer/symbols.py`):
+
+- Anonymous structs and unions (``struct { ... } _payload;``) used to get
+  names like ``"(unnamed struct at file.h:64)"`` from libclang, which the
+  LLM analysis pipeline skipped as meaningless.
+- The indexer now does a **pre-scan** over FIELD_DECL cursors
+  (`_build_anon_usr_to_field()`) to build a ``anon_USR → field_name`` mapping.
+- During symbol extraction, anonymous structs/unions with a matching field
+  name use it as their display name (e.g. ``_ble_cmd``) and in the qualified
+  name path (e.g. ``MsgToLBThread::(unnamed union)::_ble_cmd``).
+- Anonymous structs/unions *without* a named field (standalone ``union { };``
+  members) keep the libclang-generated name.
+- **Unions** (`UNION_DECL`) are now indexed — they were previously excluded
+  from ``_SYMBOL_KINDS``.
+- Changed files are re-indexed on next ``fw-context index``; use ``--force``
+  to re-index all files regardless of mtime and pick up the new names in an
+  existing index.
+
 ### Search pipeline
 
 `search/pipeline.py` runs a multi-phase pipeline. Each phase in
