@@ -130,6 +130,10 @@ def find_callers(
     callbacks, NVIC_SetVector, and struct init lists. grep cannot detect
     function pointer assignments or ISR vector registrations.
 
+    Falls back to macro lookup when the symbol is not found as a
+    function/method: returns the macro definition (kind="macro") and
+    files that use it (ref_kind="macro_use").
+
     Use when you need a quick, flat list of immediate callers. For the full
     transitive call tree (who calls this indirectly through other functions),
     use ``find_all_callers_recursive``.  For all references including reads
@@ -160,8 +164,10 @@ def find_callers(
 
     Returns:
         list of dicts, each with: file, line, ref_kind (``"call"``,
-        ``"indirect"``, or ``"implicit_construct"``), caller (enclosing
-        function name), caller_kind (``"function"``, ``"method"``, …).
+        ``"indirect"``, ``"implicit_construct"``, or ``"macro_use"``),
+        caller (enclosing function name), caller_kind (``"function"``,
+        ``"method"``, …). Macro fallback includes a leading dict with
+        ``kind="macro"``, ``value``, and ``expanded_value``.
     """
     return _references_result(name, project_root, ref_kind=["call", "indirect", "implicit_construct"], limit=limit, caller_mode=True)
 
@@ -173,14 +179,19 @@ def find_references(
 ) -> list[dict]:
     """USE INSTEAD OF grep, ctx_search, or ctx_callgraph. Find ALL references
     to a C/C++ symbol — calls, reads, member accesses, function pointer
-    registrations, and template references. grep and ctx_callgraph cannot
-    see function-pointer registrations: NVIC_SetVector, mbed-os Timeout::attach,
-    Ticker::attach, SerialBase::RxIrq, InterruptIn::fall/rise — all detected.
+    registrations, template references, and macro usages. grep and
+    ctx_callgraph cannot see function-pointer registrations: NVIC_SetVector,
+    mbed-os Timeout::attach, Ticker::attach, SerialBase::RxIrq,
+    InterruptIn::fall/rise — all detected.
+
+    Falls back to macro lookup when the symbol is not found as a
+    function/method: returns the macro definition (kind="macro") and
+    files that reference it (ref_kind="macro_use").
 
     Read-only. No side effects. Returns every reference in the indexed codebase,
-    including call sites, variable reads, struct member accesses, and indirect
-    function-pointer references.  Requires the reference index
-    (``fw-context index`` — refs on by default).
+    including call sites, variable reads, struct member accesses, indirect
+    function-pointer references, and macro usages. Requires the reference
+    index (``fw-context index`` — refs on by default).
 
     For direct callers only use ``find_callers``. For transitive callers use
     ``find_all_callers_recursive``. For call paths between two symbols use
@@ -197,7 +208,9 @@ def find_references(
         ``"indirect"`` (function-pointer reference in arguments, assignments,
         initializers, or init lists), ``"implicit_construct"`` (implicit
         constructor call from global/static object or member-field
-        initialization), ``"template_ref"``.
+        initialization), ``"template_ref"``, ``"macro_use"`` (macro usage
+        in file). Macro fallback includes a leading dict with
+        ``kind="macro"``, ``value``, and ``expanded_value``.
     """
     return _references_result(name, project_root, ref_kind=None, limit=limit)
 
