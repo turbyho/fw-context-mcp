@@ -20,7 +20,12 @@ log = logging.getLogger(__name__)
 # write operations (reindex_file_impl, file watcher).  The background
 # reindex is a separate OS process and cannot invalidate this cache;
 # the TTL ensures staleness is bounded to at most 30 seconds.
-_modified_cache: dict[str, tuple[float, int]] = {}
+#
+# Cache entries are (timestamp, count, max_stored_mtime) — the last
+# field is the MAX(mtime) from the files table at cache time.  Before
+# serving a cached value we verify this hasn't changed, catching
+# external DB modifications by bg-reindex / manual fw-context index.
+_modified_cache: dict[str, tuple[float, int, float]] = {}
 _MTIME_CACHE_TTL: float = 30.0
 
 
@@ -63,16 +68,31 @@ def _count_modified_files(
     mtime is unknown, not "modified".
 
     When *use_cache* is True and a cached value is less than
-    ``_MTIME_CACHE_TTL`` seconds old, the cached value is returned.
+    ``_MTIME_CACHE_TTL`` seconds old AND the DB hasn't been modified
+    externally (verified via ``MAX(mtime)`` from the files table),
+    the cached value is returned.
     Call ``_invalidate_modified_cache(config_hash)`` after any write
     operation that changes file mtimes.
     """
     if use_cache:
         cached = _modified_cache.get(config_hash)
         if cached is not None:
-            ts, count = cached
+            ts, count, max_stored = cached
             if time.monotonic() - ts < _MTIME_CACHE_TTL:
-                return count
+                # Verify DB hasn't been modified externally (bg reindex,
+                # manual fw-context index from another process, etc.)
+                try:
+                    row = conn.execute(
+                        "SELECT MAX(mtime) FROM files WHERE config_hash=? AND mtime > 0",
+                        (config_hash,),
+                    ).fetchone()
+                    current_max = row[0] if row else 0.0
+                    if current_max == max_stored:
+                        return count
+                except Exception:
+                    pass  # query failed — fall through to recompute
+            # Cache stale — remove and recompute
+            _modified_cache.pop(config_hash, None)
 
     modified = 0
     rows = conn.execute(
@@ -94,7 +114,8 @@ def _count_modified_files(
             pass
 
     if use_cache:
-        _modified_cache[config_hash] = (time.monotonic(), modified)
+        max_stored = max((r["mtime"] for r in rows if r["mtime"] > 0), default=0.0)
+        _modified_cache[config_hash] = (time.monotonic(), modified, max_stored)
     return modified
 
 

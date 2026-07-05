@@ -104,7 +104,36 @@ class Reference:
     from_file: str     # file containing the reference (absolute, as clang reports)
     from_line: int
     from_usr: str | None   # USR of the enclosing function/method (caller), or None
-    ref_kind: str      # "call" | "ref" | "member" | "indirect"
+    ref_kind: str      # "call" | "ref" | "member" | "indirect" | "implicit_construct"
+
+
+@dataclass
+class Macro:
+    """A preprocessor macro definition (``#define``).
+
+    Only collected when ``PARSE_DETAILED_PROCESSING_RECORD`` is active
+    (enabled by default for all translation units).
+
+    Attributes:
+        config_hash: Build configuration fingerprint.
+        file_id: Foreign key to ``files.id`` in the index database.
+        name: The macro name (without leading ``#define``).
+        value: Raw value text from the ``#define`` directive.
+        expanded_value: Fully expanded value from ``clang -dM -E`` (set
+            later by the macros.py driver; empty during initial parsing).
+        line: Source line number (1-based) of the ``#define`` directive.
+        is_function_like: ``True`` for function-like macros
+            (``#define SQUARE(x) ((x)*(x))``).
+        file: Absolute path of the file containing the macro definition.
+    """
+    config_hash: str = ""
+    file_id: int = 0
+    name: str = ""
+    value: str = ""
+    expanded_value: str = ""
+    line: int = 0
+    is_function_like: bool = False
+    file: str = ""
 
 
 @dataclass
@@ -512,7 +541,7 @@ def extract(
 
     Thin backward-compatible wrapper over ``extract_all`` (symbols only).
     """
-    symbols, _, _, _, _ = extract_all(unit, source_roots, exclude_paths, with_refs=False)
+    symbols, _, _, _, _, _ = extract_all(unit, source_roots, exclude_paths, with_refs=False)
     return iter(symbols)
 
 
@@ -521,12 +550,12 @@ def extract_all(
     source_roots: list[Path] | None = None,
     exclude_paths: list[Path] | None = None,
     with_refs: bool = False,
-) -> tuple[list[Symbol], list[Reference], list[InheritanceRecord], list[IndirectCallSite], list[FnPointerAssignment]]:
+) -> tuple[list[Symbol], list[Reference], list[InheritanceRecord], list[IndirectCallSite], list[FnPointerAssignment], list[Macro]]:
     """Parse one translation unit and return extracted symbols, references, and inheritance.
 
     This is the single-pass entry point for all data extraction from a
     ``CompilationUnit``.  It parses the file with libclang, walks the AST
-    once, and produces four outputs simultaneously.
+    once, and produces five outputs simultaneously.
 
     Args:
         unit: The translation unit to parse (file path + compiler flags).
@@ -540,7 +569,7 @@ def extract_all(
             regardless of this flag.
 
     Returns:
-        A tuple ``(symbols, references, inheritance, indirect_call_sites, fp_assignments)``:
+        A tuple ``(symbols, references, inheritance, indirect_call_sites, fp_assignments, macros)``:
             symbols — all matching declarations and definitions.
             references — when ``with_refs`` is True, project-internal
                 call/ref/member/indirect edges whose both ends are under
@@ -556,6 +585,10 @@ def extract_all(
                 ``void (*fp)(...) = &fn``) recording both the left-hand
                 field/variable/parameter and the right-hand function;
                 enables Phase 3 linking of assignment sites to call sites.
+            macros — ``#define`` macro definitions found in the
+                translation unit under ``source_roots``, always extracted.
+                ``expanded_value`` is empty at this stage; populated later
+                by the ``clang -dM -E`` driver.
     """
     if not source_roots:
         source_roots = [unit.file.parent]
@@ -748,9 +781,48 @@ def extract_all(
         except Exception:
             continue  # skip malformed cursors
 
+    # --- Macro definitions (#define) ---
+    # CXCursor_MacroDefinition cursors are emitted by
+    # PARSE_DETAILED_PROCESSING_RECORD and appear as top-level children
+    # of the translation unit cursor (NOT in the AST walk above).
+    macros: list[Macro] = []
+    for child in tu.cursor.get_children():
+        if child.kind != cx.CursorKind.MACRO_DEFINITION:
+            continue
+        loc = child.location
+        if not loc.file:
+            continue
+        if not _in_roots(loc.file.name):
+            continue
+        if not _not_excluded(loc.file.name):
+            continue
+
+        try:
+            is_fn_like = child.is_macro_function_like()
+        except Exception:
+            is_fn_like = False
+
+        # Extract the value text from the macro definition tokens
+        value = ""
+        try:
+            tokens = list(child.get_tokens())
+            # Skip the macro name itself (token 0) and gather the value tokens
+            if len(tokens) > 1:
+                value = " ".join(t.spelling for t in tokens[1:])
+        except Exception:
+            value = ""
+
+        macros.append(Macro(
+            name=child.spelling,
+            value=value,
+            line=loc.line,
+            is_function_like=is_fn_like,
+            file=str(_resolve(loc.file.name)),
+        ))
+
     if not with_refs:
-        _log.debug("  parse=%.1fs symwalk=%.1fs syms=%d", _t_parse, _t_symwalk, len(symbols))
-        return symbols, [], inheritance, [], []
+        _log.debug("  parse=%.1fs symwalk=%.1fs syms=%d macros=%d", _t_parse, _t_symwalk, len(symbols), len(macros))
+        return symbols, [], inheritance, [], [], macros
 
     # Build qualified-name → USR lookup for token-based fallback
     # (UNEXPOSED_EXPR nodes hide template expansions like mbed::callback(...)
@@ -777,10 +849,56 @@ def extract_all(
     # Track function spans: [(usr, start_line, end_line)] for source-line fallback
     _fn_spans: list[tuple[str, int, int]] = []
 
+    def _class_match_score(hint: str, class_part: str) -> int:
+        """Score how well a field-name hint matches a class name.
+
+        Multi-level matching designed for the fallback path where field
+        names use snake_case (``_ble_msg_manager``) but class names use
+        CamelCase (``BleMsgManager``), or where the field name is a
+        superset of the class name (``_uart_driver`` → ``UART_DRIVER``).
+
+        Returns 0 = no match, 1 = weak (token-level), 2 = good.
+        """
+        if not hint or not class_part:
+            return 0
+        class_lower = class_part.lower()
+
+        # Level 1: direct substring match (case-insensitive)
+        if hint in class_lower:
+            return 2
+        if class_lower in hint:
+            return 1
+
+        # Level 2: snake_case → flattened match (remove underscores)
+        # "ble_msg_manager" → "blemsgmanager" matches "BleMsgManager"
+        hint_flat = hint.replace("_", "")
+        if hint_flat and hint_flat in class_lower:
+            return 2
+        if hint_flat and class_lower in hint_flat:
+            return 1
+
+        # Level 3: token-level match (individual underscore-separated words)
+        hint_tokens = [t for t in hint.split("_") if t]
+        if not hint_tokens:
+            return 0
+        match_count = sum(1 for t in hint_tokens if t in class_lower)
+        if match_count == len(hint_tokens):
+            return 2
+        if match_count > 0:
+            return 1
+
+        return 0
+
     def _resolve_method_usr(
         method_name: str, field_name: str = ""
     ) -> str | None:
-        """Find USR for *method_name*, preferring classes matching *field_name*."""
+        """Find USR for *method_name*, preferring classes matching *field_name*.
+
+        Scoring for *field_name* uses multi-level matching so that
+        snake_case field names (``_ble_msg_manager``) can match
+        CamelCase class names (``BleMsgManager``) that libclang
+        cannot resolve directly inside template-heavy translation units.
+        """
         usr = _qn_to_usr.get(method_name)
         if usr:
             return usr
@@ -794,10 +912,10 @@ def extract_all(
             return candidates[0][1]
         if field_name:
             _hint = field_name.lstrip("_").lower()
-            _scored = []
+            _scored: list[tuple[int, str, str]] = []
             for qn, u in candidates:
                 _class_part = qn.rsplit("::", 2)[-2] if "::" in qn else ""
-                _score = 1 if _hint in _class_part.lower() else 0
+                _score = _class_match_score(_hint, _class_part)
                 _scored.append((_score, qn, u))
             _scored.sort(key=lambda x: -x[0])
             if _scored[0][0] > 0:
@@ -1116,6 +1234,50 @@ def extract_all(
                 _child_lhs_usr, _child_lhs_name = _extract_lhs_field(child)
                 _emit_fn_ptr_targets(child, cur_fn, lhs_usr=_child_lhs_usr, lhs_name=_child_lhs_name, method="init_list")
 
+        # --- Implicit constructor calls from VAR_DECL / FIELD_DECL ---
+        # Global/static variables and member fields with class/struct types
+        # trigger implicit constructor calls that libclang does not expose
+        # as CALL_EXPR nodes. Without this, constructors used only through
+        # global-object or member-field initialization are falsely reported
+        # as dead code by find_dead_code.
+        #
+        # For each VAR_DECL / FIELD_DECL whose canonical type is RECORD,
+        # walk the class declaration's children looking for CONSTRUCTORs
+        # and emit implicit_construct references for each one in project
+        # source paths.
+        if cursor.kind in (cx.CursorKind.VAR_DECL, cx.CursorKind.FIELD_DECL):
+            loc = cursor.location
+            if loc.file and _in_roots(loc.file.name) and _not_excluded(loc.file.name):
+                try:
+                    canon = cursor.type.get_canonical()
+                except Exception:
+                    canon = None
+                if canon is not None and canon.kind == cx.TypeKind.RECORD:
+                    try:
+                        class_cursor = canon.get_declaration()
+                    except Exception:
+                        class_cursor = None
+                    if class_cursor is not None:
+                        for child in class_cursor.get_children():
+                            if child.kind != cx.CursorKind.CONSTRUCTOR:
+                                continue
+                            ctor_usr = child.get_usr()
+                            if not ctor_usr:
+                                continue
+                            ctor_loc = child.location
+                            if not ctor_loc.file or not _in_roots(ctor_loc.file.name) or not _not_excluded(ctor_loc.file.name):
+                                continue
+                            key = (ctor_usr, loc.file.name, loc.line, cur_fn, "implicit_construct")
+                            if key not in seen_ref:
+                                seen_ref.add(key)
+                                refs.append(Reference(
+                                    to_usr=ctor_usr,
+                                    from_file=loc.file.name,
+                                    from_line=loc.line,
+                                    from_usr=cur_fn,
+                                    ref_kind="implicit_construct",
+                                ))
+
         # --- Token fallback for UNEXPOSED_EXPR ---
         # When libclang cannot decompose a template expression (e.g. Mbed OS
         # callback(&Class::method, this)), the entire expression becomes an
@@ -1195,6 +1357,13 @@ def extract_all(
                                     from_usr=cur_fn,
                                     ref_kind="call",
                                 ))
+                        else:
+                            _log.warning(
+                                "Token fallback: pattern %s.%s() at %s:%d – "
+                                "could not resolve method USR",
+                                field_name, method_name,
+                                loc.file.name, loc.line,
+                            )
                     # Pattern 2: bare method( → IDENTIFIER LPAREN
                     if (tok.kind.name == "IDENTIFIER"
                             and i + 1 < len(tokens)
@@ -1263,11 +1432,17 @@ def extract_all(
                             from_usr=_line_fn,
                             ref_kind="call",
                         ))
+                else:
+                    _log.warning(
+                        "Source-line fallback: pattern %s.%s() at %s:%d – "
+                        "could not resolve method USR",
+                        _field_name, _method_name, _tu_file, _lineno,
+                    )
 
     _t_total = _time.monotonic() - _t_start
     _t_refwalk = _t_total - _t_parse - _t_symwalk
     _log.debug(
-        "  parse=%.1fs symwalk=%.1fs refwalk=%.1fs syms=%d refs=%d",
-        _t_parse, _t_symwalk, _t_refwalk, len(symbols), len(refs),
+        "  parse=%.1fs symwalk=%.1fs refwalk=%.1fs syms=%d refs=%d macros=%d",
+        _t_parse, _t_symwalk, _t_refwalk, len(symbols), len(refs), len(macros),
     )
-    return symbols, refs, inheritance, indirect_call_sites, fp_assignments
+    return symbols, refs, inheritance, indirect_call_sites, fp_assignments, macros

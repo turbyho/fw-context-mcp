@@ -26,6 +26,7 @@ from ...indexer.symbols import (
     FnPointerAssignment,
     IndirectCallSite,
     InheritanceRecord,
+    Macro,
     Symbol,
 )
 from ...llm.ollama import check_setup
@@ -45,14 +46,25 @@ def get_active_build(
     using any other fw-context tools.
 
     Read-only: yes. Call at session start to check if the index exists,
-    how many symbols it contains, and whether it is stale (needs re-index).
+    how many symbols it contains, and whether a reindex is needed.
 
-    ``stale`` is True when any of: (1) ``compile_commands.json`` changed
-    since the last index, (2) source files were modified after indexing,
-    or (3) the index schema is older than the current code expects
-    (``schema_version < current_schema``).  Cases (1) and (2) are handled
-    transparently by auto-reindex on query; case (3) requires a full
-    ``fw-context index`` — remind the user.
+    Use the ``status`` field for decision-making:
+
+    * ``"ready"`` — fully up to date, no issues. Continue normally.
+    * ``"reindexing"`` — background reindex in progress. Index is still
+      usable — all queries return accurate results. Continue normally.
+    * ``"reindex_needed"`` — compile_commands.json changed or schema
+      mismatch. Run ``fw-context index``, but queries still work on
+      existing data.
+    * ``"no_index"`` — no build config indexed. Use other tools.
+    * ``"error"`` — DB corruption or access error. Use other tools.
+
+    ``reindex_needed`` is True when a structural mismatch exists: schema
+    version outdated or compile_commands.json changed since indexing.
+    Modified source files are auto-handled per-query and do NOT cause
+    ``reindex_needed=True``.
+
+    ``index_message`` is a human-readable summary of the index state.
 
     When ``modified_files_count > 0``, a background ``fw-context index``
     subprocess is spawned automatically (non-blocking, at most one at a time).
@@ -68,12 +80,22 @@ def get_active_build(
         analysis_model (str or None), bg_reindex_running (bool),
         reindex_progress (str or None — last log line when reindex is running),
         schema_version (int — DB schema version),
-        current_schema (int — code expects), stale (bool — any staleness condition)}
+        current_schema (int — code expects), status (str — "ready"|"reindexing"|
+        "reindex_needed"|"no_index"|"error"), reindex_needed (bool —
+        structural mismatch requiring a full reindex),
+        reindex_reasons (list[str] — why reindex is needed, empty when False),
+        index_message (str — human-readable summary of index state)}
     """
     root = resolve_project_root(project_root)
     db_path = _db_path(root)
     if not db_path.exists():
         return {"error": f"No index found for {root}. Run 'fw-context index' first."}
+
+    # Check bg reindex status BEFORE querying the DB — when a bg reindex
+    # is running, the _modified_cache may contain stale counts from before
+    # the reindex started.  Skipping the cache ensures accurate counts.
+    bg_running = _is_bg_reindex_running(root)
+
     conn, err = _open_db_safe(db_path)
     if err:
         return err
@@ -92,7 +114,7 @@ def get_active_build(
                 "SELECT COUNT(*) FROM files WHERE config_hash=?", (config_hash,)
             ).fetchone()[0]
             ref_count = count_refs(conn, config_hash)
-            modified_count = _count_modified_files(conn, config_hash, root, use_cache=True)
+            modified_count = _count_modified_files(conn, config_hash, root, use_cache=False)
             db_schema_ver = get_db_schema_version(conn)
 
             # LLM analysis statistics
@@ -128,6 +150,50 @@ def get_active_build(
                 (config_hash,),
             ).fetchone()[0]
 
+            cc_changed = _is_stale(cfg, cfg["compile_commands_path"])
+            schema_old = db_schema_ver < CURRENT_SCHEMA_VERSION
+            needs_reindex = cc_changed or schema_old
+
+            # Build reindex_reasons — only when reindex is actually needed
+            reindex_reasons: list[str] = []
+            if schema_old:
+                reindex_reasons.append(f"schema_mismatch: {db_schema_ver} < {CURRENT_SCHEMA_VERSION}")
+            if cc_changed:
+                reindex_reasons.append("compile_commands_changed")
+
+            # Determine status
+            if needs_reindex:
+                status = "reindex_needed"
+            elif bg_running:
+                status = "reindexing"
+            else:
+                status = "ready"
+
+            # Build human-readable index message
+            if status == "ready":
+                index_message = f"Index is fully up to date ({sym_count} symbols)"
+            elif status == "reindexing":
+                if modified_count:
+                    index_message = (
+                        f"Index is usable — {modified_count} file(s) being reindexed "
+                        f"in background. All queries return accurate results."
+                    )
+                else:
+                    index_message = "Index is usable — background reindex in progress. All queries return accurate results."
+            elif schema_old and cc_changed:
+                index_message = (
+                    f"Schema version mismatch ({db_schema_ver} < {CURRENT_SCHEMA_VERSION}) "
+                    f"and compile_commands.json changed. Run fw-context index. "
+                    f"Queries still work on existing data."
+                )
+            elif schema_old:
+                index_message = (
+                    f"Schema version mismatch ({db_schema_ver} < {CURRENT_SCHEMA_VERSION}). "
+                    f"Run fw-context index. Queries still work on existing data."
+                )
+            else:
+                index_message = "Compile commands changed — run fw-context index. Queries still work on existing data."
+
             result: dict = {
                 "config_hash": config_hash,
                 "project_id": project_id,
@@ -144,13 +210,14 @@ def get_active_build(
                 "analyzed_symbols": analyzed_count,
                 "unanalyzed_symbols": unanalyzed_count,
                 "analysis_model": analysis_model_row["model"] if analysis_model_row else None,
-                "stale": _is_stale(cfg, cfg["compile_commands_path"]) or modified_count > 0
-                or db_schema_ver < CURRENT_SCHEMA_VERSION,
+                "status": status,
+                "reindex_needed": needs_reindex,
+                "reindex_reasons": reindex_reasons,
+                "index_message": index_message,
             }
         # Background reindex is managed by the startup daemon thread and the
         # file watcher — get_active_build() is a read-only tool and should
         # not spawn subprocesses.
-        bg_running = _is_bg_reindex_running(root)
         result["bg_reindex_running"] = bg_running
         if bg_running:
             log_file = db_path.parent / "reindex.log"
@@ -165,6 +232,12 @@ def get_active_build(
         conn.close()
 
 # ── moved from server.py ──
+def _list_status(db_schema_ver: int, cc_stale: bool) -> str:
+    """Return a status string for list_projects."""
+    needs = (db_schema_ver < CURRENT_SCHEMA_VERSION) or cc_stale
+    return "reindex_needed" if needs else "ready"
+
+
 def list_projects(
     project_root: Annotated[str | None, Field(description="Project root. Auto-detected if omitted. Pass to distinguish multiple indexed projects.")] = None,
 ) -> list[dict]:
@@ -176,7 +249,7 @@ def list_projects(
     Returns:
         list of dicts, each with: project_id, name, root_path, build_system,
         symbol_count, file_count, indexed_at, schema_version, current_schema,
-        stale (bool), db (path to SQLite database file).
+        reindex_needed (bool), status (str), db (path to SQLite database file).
     """
     cfg = load_config(project_root=Path(project_root).resolve() if project_root else None)
     index_dir = cfg.index.db_dir
@@ -213,7 +286,8 @@ def list_projects(
                     "indexed_at": r["created_at"],
                     "schema_version": db_schema_ver,
                     "current_schema": CURRENT_SCHEMA_VERSION,
-                    "stale": cc_stale or db_schema_ver < CURRENT_SCHEMA_VERSION,
+                    "reindex_needed": cc_stale or db_schema_ver < CURRENT_SCHEMA_VERSION,
+                    "status": _list_status(db_schema_ver, cc_stale),
                     "db": str(db_path),
                 })
         except Exception as e:
@@ -445,7 +519,7 @@ def reindex_file_impl(
         # libclang is CPU-bound; running it inside the lock serialises
         # parsing when multiple TUs match (e.g. reindexing a header
         # included by several .cpp files).
-        parsed_units: list[tuple[TU, tuple[list[Symbol], list[Reference], list[InheritanceRecord], list[IndirectCallSite], list[FnPointerAssignment]]]] = []
+        parsed_units: list[tuple[TU, tuple[list[Symbol], list[Reference], list[InheritanceRecord], list[IndirectCallSite], list[FnPointerAssignment], list[Macro]]]] = []
         for unit in matching:
             try:
                 parsed = extract_all(

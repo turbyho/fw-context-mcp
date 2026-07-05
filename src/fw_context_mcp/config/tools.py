@@ -109,7 +109,24 @@ Leave ``project_only=False`` (default) when vendor code is relevant
  AGENT LOOP: Check(get_active_build) → Find(search_code/lookup_symbol)
 → Read(get_source/get_symbol_context) → Trace(find_references/find_callers)
 → For pattern-in-body searches use search_bodies.
-→ If get_active_build() reports no index, use other available tools.
+→ DECISION after get_active_build():
+  • status="ready" or "reindexing" — fw-context is fully operational.
+    bg_reindex_running does NOT mean the index is unavailable. Continue.
+  • status="reindex_needed" — queries still work, but schedule fw-context index.
+  • status="no_index" or "error" — use other available tools.
+
+DIFF → FW-CONTEXT VERIFICATION RULE:
+→ When you analyze code via diff (git diff, file diff, patch review),
+  diff shows ONLY what changed — it cannot reveal the impact across
+  the full codebase.
+→ After inspecting a diff: verify your findings with fw-context:
+  • find_references("<symbol>") — all callers/readers, not just diff context
+  • search_bodies("<pattern>") — pattern consistency across entire codebase
+  • find_call_path / find_all_callers_recursive — cross-module impact
+  • find_dead_code / find_hotspots — structural effects of changes
+→ Do NOT draw conclusions from diff results alone — diff is for SCOPE
+  discovery, fw-context is for IMPACT verification. They complement each
+  other; neither replaces the other.
 
 Do NOT use fw-context in Python, JS, Go, or other non-C/C++ projects.
 

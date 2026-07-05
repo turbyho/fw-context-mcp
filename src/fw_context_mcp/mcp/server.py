@@ -92,7 +92,23 @@ mcp = FastMCP(
         "AGENT LOOP: Check(get_active_build) → Find(search_code/lookup_symbol)\n"
         "→ Read(get_source/get_symbol_context) → Trace(find_references/find_callers)\n"
         "→ For body patterns use search_bodies.\n"
-        "→ If get_active_build() reports no index, use other available tools.\n\n"
+        "→ DECISION after get_active_build():\n"
+        "  • status=\"ready\" or \"reindexing\" — fw-context is fully operational.\n"
+        "    bg_reindex_running does NOT mean the index is unavailable. Continue.\n"
+        "  • status=\"reindex_needed\" — queries still work, but schedule fw-context index.\n"
+        "  • status=\"no_index\" or \"error\" — use other available tools.\n\n"
+        "DIFF → FW-CONTEXT VERIFICATION RULE:\n"
+        "→ When you analyze code via diff (git diff, file diff, patch review),\n"
+        "  diff shows ONLY what changed — it cannot reveal the impact across\n"
+        "  the full codebase.\n"
+        "→ After inspecting a diff: verify your findings with fw-context:\n"
+        "  • find_references(\"<symbol>\") — all callers/readers, not just diff context\n"
+        "  • search_bodies(\"<pattern>\") — pattern consistency across entire codebase\n"
+        "  • find_call_path / find_all_callers_recursive — cross-module impact\n"
+        "  • find_dead_code / find_hotspots — structural effects of changes\n"
+        "→ Do NOT draw conclusions from diff results alone — diff is for SCOPE\n"
+        "  discovery, fw-context is for IMPACT verification. They complement each\n"
+        "  other; neither replaces the other.\n\n"
         "Search: lookup_symbol, search_code, search_bodies (body text),\n"
         "search_content (full file content), smart_search, semantic_search.\n"
         "Call graph: find_callers, find_references, find_call_path,\n"
@@ -295,7 +311,7 @@ def resource_stats() -> str:
         if "error" in p:
             lines.append(f"- **{p.get('db', '?')}**: ERROR — {p['error']}")
             continue
-        stale = "⚠ stale" if p.get("stale") else "✓ fresh"
+        stale = "⚠ reindex_needed" if p.get("reindex_needed") else "✓ ready"
         lines.append(
             f"- **{p['name']}** ({p['project_id']}) — "
             f"{p['symbol_count']} symbols, {p['file_count']} files, "

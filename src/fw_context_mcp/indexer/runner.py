@@ -1114,6 +1114,7 @@ def run(
     cache_server_config=None,
     parallel: bool = True,
     force: bool = False,
+    index_macros_expanded: bool = True,
 ) -> str:
     """Index a project: parse translation units, extract symbols, and store to SQLite.
 
@@ -1311,6 +1312,27 @@ def run(
     )
     if content_filled:
         log.info("ifdef-filtered content: %d files filled", content_filled)
+
+    # Resolve expanded macro values via clang -dM -E (opt-in, best-effort).
+    # Each TU's flags are used to preprocess — the compiler resolves
+    # #ifdef-conditional macros correctly for the build configuration.
+    if index_macros_expanded:
+        log.info("Resolving expanded macro values via clang -dM -E...")
+        t_macro = time.monotonic()
+        macro_updated = 0
+        for unit in units:
+            try:
+                from .macros import resolve_and_update
+                macro_updated += resolve_and_update(
+                    conn, config_hash, unit.clang_args, unit.file.resolve(),
+                )
+            except Exception:
+                continue  # best-effort per TU
+        if macro_updated:
+            log.info(
+                "Macro expansion: %d values resolved in %.1fs",
+                macro_updated, time.monotonic() - t_macro,
+            )
 
     # Post-processing — each function handles its own idempotency
     # (returns immediately when data already exists).

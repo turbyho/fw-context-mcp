@@ -463,21 +463,22 @@ class TestFallbackToSearchCode:
         # Must return a dict (error) or list (results), not crash
         assert isinstance(result, (list, dict))
 
-    def test_get_active_build_docstring_covers_schema_staleness(self):
-        """get_active_build docstring explains all three stale conditions."""
+    def test_get_active_build_docstring_covers_staleness(self):
+        """get_active_build docstring explains reindex_needed and status."""
         from fw_context_mcp.mcp.handlers.maintenance import get_active_build
 
         doc = get_active_build.__doc__ or ""
         assert "schema_version" in doc, "docstring must mention schema_version"
         assert "current_schema" in doc, "docstring must mention current_schema"
-        assert "full" in doc.lower(), (
-            "Docstring should mention that schema staleness needs a full re-index"
+        assert "reindex" in doc.lower(), (
+            "Docstring should mention re-index"
         )
+        assert "status" in doc, "docstring must mention status field"
 
-    def test_get_active_build_docstring_stale_field(self):
-        """get_active_build docstring mentions stale is a bool union."""
+    def test_get_active_build_docstring_reindex_field(self):
+        """get_active_build docstring mentions reindex_needed field."""
         from fw_context_mcp.mcp.handlers.maintenance import get_active_build
 
         doc = get_active_build.__doc__ or ""
-        assert "stale" in doc, "docstring must mention stale field"
+        assert "reindex_needed" in doc, "docstring must mention reindex_needed field"
         assert "modified_files_count" in doc, "docstring must mention modified_files_count"

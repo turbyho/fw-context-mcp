@@ -15,6 +15,7 @@ __all__ = [
     "delete_fp_assignments_for_file",
     "delete_inheritance_for_file",
     "delete_indirect_call_sites_for_file",
+    "delete_macros_for_file",
     "delete_refs_for_file",
     "delete_symbols_for_file",
     "find_all_callers_recursive",
@@ -24,6 +25,7 @@ __all__ = [
     "find_hotspots",
     "find_indirect_call_sites",
     "find_indirect_targets",
+    "find_macro_refs",
     "find_refs",
     "get_active_config",
     "get_all_projects",
@@ -42,9 +44,11 @@ __all__ = [
     "insert_fp_assignments_batch",
     "insert_indirect_call_sites_batch",
     "insert_inheritance_batch",
+    "insert_macros_batch",
     "insert_overrides_batch",
     "insert_refs_batch",
     "insert_symbols_batch",
+    "lookup_macro",
     "open_db",
     "search_similar_hybrid",
     "search_similar_vec",
@@ -540,6 +544,48 @@ CREATE TABLE IF NOT EXISTS overrides (
 CREATE INDEX IF NOT EXISTS idx_overrides_derived ON overrides(config_hash, derived_usr);
 CREATE INDEX IF NOT EXISTS idx_overrides_base    ON overrides(config_hash, base_usr);
 
+-- Preprocessor macro definitions (#define).
+-- Collected via CXCursor_MacroDefinition during TU parsing.
+-- expanded_value is populated by the clang -dM -E driver (opt-in).
+CREATE TABLE IF NOT EXISTS macros (
+    id               INTEGER PRIMARY KEY,
+    config_hash      TEXT    NOT NULL REFERENCES build_configs(config_hash),
+    file_id          INTEGER NOT NULL REFERENCES files(id),
+    name             TEXT    NOT NULL,
+    value            TEXT    NOT NULL DEFAULT '',
+    expanded_value   TEXT    NOT NULL DEFAULT '',
+    line             INTEGER NOT NULL,
+    is_function_like INTEGER NOT NULL DEFAULT 0,
+    UNIQUE(config_hash, file_id, line)
+);
+CREATE INDEX IF NOT EXISTS idx_macros_name ON macros(name, config_hash);
+CREATE INDEX IF NOT EXISTS idx_macros_file ON macros(file_id);
+
+CREATE VIRTUAL TABLE IF NOT EXISTS macros_fts USING fts5(
+    name,
+    value,
+    expanded_value,
+    content='macros',
+    content_rowid='id'
+);
+
+CREATE TRIGGER IF NOT EXISTS macros_ai AFTER INSERT ON macros BEGIN
+    INSERT INTO macros_fts(rowid, name, value, expanded_value)
+    VALUES (new.id, new.name, new.value, new.expanded_value);
+END;
+
+CREATE TRIGGER IF NOT EXISTS macros_ad AFTER DELETE ON macros BEGIN
+    INSERT INTO macros_fts(macros_fts, rowid, name, value, expanded_value)
+    VALUES ('delete', old.id, old.name, old.value, old.expanded_value);
+END;
+
+CREATE TRIGGER IF NOT EXISTS macros_au AFTER UPDATE ON macros BEGIN
+    INSERT INTO macros_fts(macros_fts, rowid, name, value, expanded_value)
+    VALUES ('delete', old.id, old.name, old.value, old.expanded_value);
+    INSERT INTO macros_fts(rowid, name, value, expanded_value)
+    VALUES (new.id, new.name, new.value, new.expanded_value);
+END;
+
 -- Pre-computed hotspot cache — caller counts for instant find_hotspots queries.
 CREATE TABLE IF NOT EXISTS hotspot_cache (
     id           INTEGER PRIMARY KEY,
@@ -1014,6 +1060,20 @@ def open_db(path: Path, *, skip_integrity_check: bool = False) -> sqlite3.Connec
         UNIQUE(config_hash, symbol_id)
     );
     CREATE INDEX IF NOT EXISTS idx_hotspot_cache_config ON hotspot_cache(config_hash);
+
+    CREATE TABLE IF NOT EXISTS macros (
+        id               INTEGER PRIMARY KEY,
+        config_hash      TEXT    NOT NULL REFERENCES build_configs(config_hash),
+        file_id          INTEGER NOT NULL REFERENCES files(id),
+        name             TEXT    NOT NULL,
+        value            TEXT    NOT NULL DEFAULT '',
+        expanded_value   TEXT    NOT NULL DEFAULT '',
+        line             INTEGER NOT NULL,
+        is_function_like INTEGER NOT NULL DEFAULT 0,
+        UNIQUE(config_hash, file_id, line)
+    );
+    CREATE INDEX IF NOT EXISTS idx_macros_name ON macros(name, config_hash);
+    CREATE INDEX IF NOT EXISTS idx_macros_file ON macros(file_id);
     """
     conn.executescript(_CRITICAL_TABLES)
 
@@ -1030,10 +1090,15 @@ def open_db(path: Path, *, skip_integrity_check: bool = False) -> sqlite3.Connec
     # Unconditional files_fts self-healing — the FTS5 table and its triggers
     # may be missing when a migration was interrupted (user_version stamped
     # but files_fts never created).  rebuild_files_fts is idempotent and
-    # uses existing files.content — it does NOT re-read files from disk.
+    # fast when the table already exists.
     if not _table_exists(conn, "files_fts"):
         log.info("files_fts missing — rebuilding (self-healing)")
         rebuild_files_fts(conn)
+
+    # Unconditional macros_fts self-healing — same pattern.
+    if not _table_exists(conn, "macros_fts"):
+        log.info("macros_fts missing — rebuilding (self-healing)")
+        _rebuild_macros_fts(conn)
 
     # Integrity check — detect corruption early, before any tool uses the DB.
     # Skip for auxiliary connections (worker threads, pooled connections)
@@ -1193,6 +1258,50 @@ def rebuild_files_fts(conn: sqlite3.Connection) -> None:
             VALUES ('delete', old.id, old.path, old.content);
             INSERT INTO files_fts(rowid, path, content)
             VALUES (new.id, new.path, new.content);
+        END;
+    """)
+
+
+def _rebuild_macros_fts(conn: sqlite3.Connection) -> None:
+    """Rebuild the macros_fts FTS5 index from existing macros rows.
+
+    Drops triggers first, recreates the FTS5 table, backfills from
+    ``macros``, then reinstates content-sync triggers.
+    """
+    _ensure_column(conn, "macros", "expanded_value", "TEXT NOT NULL DEFAULT ''")
+
+    conn.executescript("""
+        DROP TRIGGER IF EXISTS macros_ai;
+        DROP TRIGGER IF EXISTS macros_ad;
+        DROP TRIGGER IF EXISTS macros_au;
+        DROP TABLE IF EXISTS macros_fts;
+
+        CREATE VIRTUAL TABLE macros_fts USING fts5(
+            name, value, expanded_value,
+            content='macros', content_rowid='id'
+        );
+    """)
+
+    conn.execute("""
+        INSERT INTO macros_fts(rowid, name, value, expanded_value)
+        SELECT id, name, COALESCE(value,''), COALESCE(expanded_value,'') FROM macros
+    """)
+    conn.commit()
+
+    conn.executescript("""
+        CREATE TRIGGER macros_ai AFTER INSERT ON macros BEGIN
+            INSERT INTO macros_fts(rowid, name, value, expanded_value)
+            VALUES (new.id, new.name, new.value, new.expanded_value);
+        END;
+        CREATE TRIGGER macros_ad AFTER DELETE ON macros BEGIN
+            INSERT INTO macros_fts(macros_fts, rowid, name, value, expanded_value)
+            VALUES ('delete', old.id, old.name, old.value, old.expanded_value);
+        END;
+        CREATE TRIGGER macros_au AFTER UPDATE ON macros BEGIN
+            INSERT INTO macros_fts(macros_fts, rowid, name, value, expanded_value)
+            VALUES ('delete', old.id, old.name, old.value, old.expanded_value);
+            INSERT INTO macros_fts(rowid, name, value, expanded_value)
+            VALUES (new.id, new.name, new.value, new.expanded_value);
         END;
     """)
 
@@ -1376,6 +1485,35 @@ def insert_symbols_batch(
         rows,
     )
     return cur.rowcount
+
+
+def insert_macros_batch(
+    conn: sqlite3.Connection,
+    rows: list[tuple],
+) -> int:
+    """Insert macro rows, updating on (config_hash, file_id, line) conflict.
+
+    Each row: (config_hash, file_id, name, value, expanded_value, line, is_function_like)
+
+    Returns count of rows inserted or updated.
+    """
+    cur = conn.executemany(
+        """INSERT INTO macros
+           (config_hash, file_id, name, value, expanded_value, line, is_function_like)
+           VALUES (?,?,?,?,?,?,?)
+           ON CONFLICT(config_hash, file_id, line) DO UPDATE SET
+               name           = excluded.name,
+               value          = excluded.value,
+               expanded_value = CASE WHEN excluded.expanded_value != '' THEN excluded.expanded_value ELSE macros.expanded_value END,
+               is_function_like = excluded.is_function_like""",
+        rows,
+    )
+    return cur.rowcount
+
+
+def delete_macros_for_file(conn: sqlite3.Connection, file_id: int) -> None:
+    """Delete all macros for a file (FTS ad trigger cleans up FTS index)."""
+    conn.execute("DELETE FROM macros WHERE file_id=?", (file_id,))
 
 
 def insert_refs_batch(conn: sqlite3.Connection, rows: list[tuple]) -> int:
@@ -2671,6 +2809,78 @@ def find_refs(
             LIMIT ?""",
         params,
     ).fetchall()
+
+
+def lookup_macro(
+    conn: sqlite3.Connection,
+    config_hash: str,
+    name: str,
+    exact: bool = False,
+    limit: int = 50,
+) -> list[sqlite3.Row]:
+    """Look up macros by name — exact or prefix match.
+
+    Returns rows from the ``macros`` table joined with ``files`` to get
+    the file path.  Same three-tier name resolution as ``lookup_symbol``
+    for symbols (exact name, exact name with definition preference,
+    prefix LIKE).
+    """
+    limit = min(limit, 100)
+    if exact:
+        return conn.execute(
+            """SELECT m.*, f.path AS file_path
+               FROM macros m
+               JOIN files f ON f.id = m.file_id
+               WHERE m.config_hash = ? AND m.name = ?
+               ORDER BY m.line
+               LIMIT ?""",
+            (config_hash, name, limit),
+        ).fetchall()
+
+    esc = name.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    return conn.execute(
+        r"""SELECT m.*, f.path AS file_path
+           FROM macros m
+           JOIN files f ON f.id = m.file_id
+           WHERE m.config_hash = ? AND m.name LIKE ? ESCAPE '\'
+           ORDER BY m.name, m.line
+           LIMIT ?""",
+        (config_hash, f"{esc}%", limit),
+    ).fetchall()
+
+
+def find_macro_refs(
+    conn: sqlite3.Connection,
+    config_hash: str,
+    name: str,
+    limit: int = 50,
+) -> list[sqlite3.Row]:
+    """Find file-level references to a macro using the files_fts index.
+
+    Searches ifdef-filtered file content for occurrences of *name*.
+    Returns file-level matches with highlighted snippets.
+    """
+    limit = min(limit, 100)
+    table_row = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='files_fts'"
+    ).fetchone()
+    if table_row is None:
+        return []
+
+    expanded = _expand_query(name)
+    try:
+        return conn.execute(
+            """SELECT f.path AS file_path, f.language,
+                      snippet(files_fts, 1, '<b>', '</b>', '…', 80) AS _match_snippet
+               FROM files_fts
+               JOIN files f ON f.id = files_fts.rowid
+               WHERE files_fts MATCH ? AND f.config_hash = ? AND f.content != ''
+               ORDER BY rank
+               LIMIT ?""",
+            (expanded, config_hash, limit),
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return []
 
 
 def count_refs(conn: sqlite3.Connection, config_hash: str) -> int:
