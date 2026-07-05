@@ -122,6 +122,8 @@ def get_active_build(
                      AND s.file_path NOT LIKE 'zephyr/%'
                      AND s.file_path NOT LIKE 'build/%'
                      AND s.file_path NOT LIKE 'modules/%'
+                     AND s.name NOT LIKE '%(anonymous%'
+                     AND s.name NOT LIKE '%(unnamed%'
                      AND s.id NOT IN (SELECT symbol_id FROM llm_analysis)""",
                 (config_hash,),
             ).fetchone()[0]
