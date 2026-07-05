@@ -68,13 +68,10 @@ reading entire source files, for example:
 
 Continue with the detailed documentation:
 
--   Installation
--   Configuration
--   AI client integration
--   Indexing
--   MCP tools
--   Architecture
--   FAQ
+-   [Installation](installation.md)
+-   [Configuration](configuration.md)
+-   [Tools Reference](tools.md)
+-   [MCP Server](../README-MCP.md)
 
 The documentation in this directory is intended as a reference. The
 recommended starting point for new users is the repository `README.md`.
