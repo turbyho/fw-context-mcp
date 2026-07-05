@@ -21,6 +21,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
+from .. import __version__
 from .auth import CacheAuthMiddleware, require_can_read, require_can_write
 
 logger = logging.getLogger(__name__)
@@ -75,7 +76,7 @@ def create_app(*, backend: Any = None) -> FastAPI:
         await app.state.backend.close()
         logger.info("Cache server stopped")
 
-    app = FastAPI(title="fw-context Cache Server", version="0.1.0", lifespan=lifespan)
+    app = FastAPI(title="fw-context Cache Server", version=__version__, lifespan=lifespan)
     app.state.backend = backend
     app.add_middleware(CacheAuthMiddleware)
 
@@ -84,7 +85,7 @@ def create_app(*, backend: Any = None) -> FastAPI:
     @app.get("/health")
     async def health(request: Request) -> dict[str, str]:
         """Public health check — no auth required."""
-        return {"status": "ok"}
+        return {"status": "ok", "version": __version__}
 
     @app.post("/cache/batch", response_model=None)
     async def batch_get(request: Request, body: BatchGetRequest) -> dict[str, Any] | JSONResponse:
