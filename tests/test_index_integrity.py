@@ -732,10 +732,309 @@ class TestIndexingEdgeCases:
         cc.append({
             "directory": str(c_project_extended / "src"),
             "file": "config_defs.c",
-            "arguments": ["gcc", "-std=c11", "-c", "config_defs.c", "-o", "build/config_defs.o"],
+             "arguments": ["gcc", "-std=c11", "-c", "config_defs.c", "-o", "build/config_defs.o"],
         })
         cc_json.write_text(json.dumps(cc, indent=2), encoding="utf-8")
 
         result = _cli(["index", "--no-refs", "--no-analyze", "--no-embeddings", str(cc_json)],
                       cwd=c_project_extended, timeout=180)
         assert result.returncode == 0
+
+
+# ── Anonymous struct / union fixtures and tests ────────────────────────────
+
+
+@pytest.fixture(scope="class")
+def c_project_anon(tmp_path_factory):
+    """C project with anonymous structs and unions — tests field-name resolution."""
+    proj = tmp_path_factory.mktemp("proj_anon")
+
+    src = proj / "src"
+    src.mkdir()
+
+    _write_file(src / "main.c", """\
+#include "data.h"
+
+SensorData g_sensor;
+
+int main(void) {
+    init_sensor(&g_sensor);
+    return g_sensor._payload.x + g_sensor._data.a;
+}
+""")
+
+    _write_file(src / "data.h", """\
+#ifndef DATA_H
+#define DATA_H
+
+typedef struct {
+    struct {
+        int x;
+        int y;
+    } _payload;
+    union {
+        int a;
+        float b;
+    } _data;
+    int id;
+} SensorData;
+
+void init_sensor(SensorData* s);
+
+#endif
+""")
+
+    _write_file(src / "data.c", """\
+#include "data.h"
+
+void init_sensor(SensorData* s) {
+    s->_payload.x = 0;
+    s->_payload.y = 0;
+    s->_data.a = 0;
+    s->id = -1;
+}
+""")
+
+    cc = [
+        {"directory": str(src), "file": "main.c",
+         "arguments": ["gcc", "-std=c11", "-O2", "-Isrc", "-c", "main.c", "-o", "build/main.o"]},
+        {"directory": str(src), "file": "data.c",
+         "arguments": ["gcc", "-std=c11", "-O2", "-Isrc", "-c", "data.c", "-o", "build/data.o"]},
+    ]
+    cc_json = proj / "compile_commands.json"
+    cc_json.write_text(json.dumps(cc, indent=2), encoding="utf-8")
+
+    return proj
+
+
+@pytest.fixture(scope="class")
+def indexed_anon(c_project_anon: Path):
+    """Index the anonymous-struct project and return the project root."""
+    cc_json = c_project_anon / "compile_commands.json"
+    result = _cli(
+        ["index", "--no-refs", "--no-analyze", "--no-embeddings", str(cc_json)],
+        cwd=c_project_anon,
+        timeout=180,
+    )
+    if result.returncode != 0:
+        pytest.fail(f"Index failed:\nSTDOUT:\n{result.stdout}\nSTDERR:\n{result.stderr}")
+
+    db_path = _db_path_for_project(c_project_anon)
+    assert db_path.exists(), f"DB not created at {db_path}"
+    return c_project_anon
+
+
+class TestAnonymousStructUnionIndexing:
+    """Verify that anonymous structs/unions are indexed with correct field names."""
+
+    def test_anonymous_struct_uses_field_name(self, indexed_anon: Path):
+        """`struct { int x; int y; } _payload;` is indexed as `_payload`, not unnamed."""
+        db_path = _db_path_for_project(indexed_anon)
+        conn = open_db(db_path)
+        try:
+            ch = _config_hash(conn)
+            symbols = conn.execute(
+                """SELECT name, qualified_name, kind FROM symbols
+                   WHERE config_hash=? AND name='_payload'""",
+                (ch,),
+            ).fetchall()
+            assert len(symbols) >= 1, (
+                f"Expected symbol '_payload' (anonymous struct via field name)"
+            )
+            assert symbols[0]["kind"] == "struct"
+            assert "_payload" in symbols[0]["qualified_name"]
+        finally:
+            conn.close()
+
+    def test_anonymous_union_uses_field_name(self, indexed_anon: Path):
+        """`union { int a; float b; } _data;` is indexed as `_data`, not unnamed."""
+        db_path = _db_path_for_project(indexed_anon)
+        conn = open_db(db_path)
+        try:
+            ch = _config_hash(conn)
+            symbols = conn.execute(
+                """SELECT name, qualified_name, kind FROM symbols
+                   WHERE config_hash=? AND name='_data'""",
+                (ch,),
+            ).fetchall()
+            assert len(symbols) >= 1, (
+                "Expected symbol '_data' (anonymous union via field name)"
+            )
+            assert symbols[0]["kind"] == "union"
+        finally:
+            conn.close()
+
+    def test_no_unnamed_or_anonymous_in_names(self, indexed_anon: Path):
+        """No symbol name should contain '(unnamed' or '(anonymous'."""
+        db_path = _db_path_for_project(indexed_anon)
+        conn = open_db(db_path)
+        try:
+            ch = _config_hash(conn)
+            unnamed = conn.execute(
+                """SELECT name FROM symbols
+                   WHERE config_hash=? AND (name LIKE '%(unnamed%' OR name LIKE '%(anonymous%')""",
+                (ch,),
+            ).fetchall()
+            assert len(unnamed) == 0, f"Found unnamed symbols: {[r['name'] for r in unnamed]}"
+        finally:
+            conn.close()
+
+    def test_union_declarations_exist(self, indexed_anon: Path):
+        """Union symbols are present in the index with kind='union'."""
+        db_path = _db_path_for_project(indexed_anon)
+        conn = open_db(db_path)
+        try:
+            ch = _config_hash(conn)
+            unions = conn.execute(
+                """SELECT name, qualified_name, kind FROM symbols
+                   WHERE config_hash=? AND kind='union'""",
+                (ch,),
+            ).fetchall()
+            union_names = {r["name"] for r in unions}
+            assert "_data" in union_names, f"Union '_data' not in index. Found: {union_names}"
+        finally:
+            conn.close()
+
+    def test_anonymous_struct_fields_are_indexed(self, indexed_anon: Path):
+        """Fields inside anonymous structs are still indexed (x, y inside _payload)."""
+        db_path = _db_path_for_project(indexed_anon)
+        conn = open_db(db_path)
+        try:
+            ch = _config_hash(conn)
+            fields = conn.execute(
+                """SELECT name, qualified_name, kind FROM symbols
+                   WHERE config_hash=? AND name IN ('x', 'y') AND kind='field'""",
+                (ch,),
+            ).fetchall()
+            field_names = {r["name"] for r in fields}
+            assert "x" in field_names, f"Field 'x' not indexed. Fields: {field_names}"
+            assert "y" in field_names, f"Field 'y' not indexed. Fields: {field_names}"
+            for f in fields:
+                assert "_payload" in f["qualified_name"], (
+                    f"Field {f['name']} should be under _payload, got: {f['qualified_name']}"
+                )
+        finally:
+            conn.close()
+
+    def test_union_kind_filter_works(self, indexed_anon: Path):
+        """Querying symbols with kind='union' returns union declarations."""
+        db_path = _db_path_for_project(indexed_anon)
+        conn = open_db(db_path)
+        try:
+            ch = _config_hash(conn)
+            rows = conn.execute(
+                """SELECT name, kind FROM symbols
+                   WHERE config_hash=? AND kind='union'""",
+                (ch,),
+            ).fetchall()
+            for r in rows:
+                assert r["kind"] == "union"
+        finally:
+            conn.close()
+
+    def test_named_struct_alongside_anonymous_still_works(self, indexed_anon: Path):
+        """Named structs (SensorData) coexist correctly with anonymous ones."""
+        db_path = _db_path_for_project(indexed_anon)
+        conn = open_db(db_path)
+        try:
+            ch = _config_hash(conn)
+            sensor = conn.execute(
+                """SELECT name, kind FROM symbols
+                   WHERE config_hash=? AND name='SensorData'""",
+                (ch,),
+            ).fetchall()
+            assert len(sensor) >= 1, "Named struct SensorData not found"
+        finally:
+            conn.close()
+
+
+class TestToolIntegrationWithAnonymousSymbols:
+    """Verify that MCP tools return correct results for anonymous symbols."""
+
+    def test_lookup_symbol_finds_anonymous_struct(self, indexed_anon: Path):
+        """lookup_symbol finds anonymous struct by field name."""
+        from fw_context_mcp.mcp.handlers.search import lookup_symbol
+
+        results = lookup_symbol(name="_payload", project_root=str(indexed_anon), exact=True)
+        errors = [r for r in results if "error" in r]
+        assert not errors, f"lookup_symbol returned errors: {errors}"
+        assert len(results) >= 1
+        names = [r["name"] for r in results if "name" in r]
+        assert "_payload" in names
+
+    def test_lookup_symbol_finds_anonymous_union(self, indexed_anon: Path):
+        """lookup_symbol finds anonymous union by field name."""
+        from fw_context_mcp.mcp.handlers.search import lookup_symbol
+
+        results = lookup_symbol(name="_data", project_root=str(indexed_anon), exact=True)
+        errors = [r for r in results if "error" in r]
+        assert not errors, f"lookup_symbol returned errors: {errors}"
+        matches = [r for r in results if r.get("name") == "_data"]
+        assert len(matches) >= 1
+        assert any(r.get("kind") == "union" for r in matches), (
+            f"_data should have kind='union', got: {matches}"
+        )
+
+    def test_get_source_returns_anonymous_struct_body(self, indexed_anon: Path):
+        """get_source returns the body of the anonymous struct."""
+        from fw_context_mcp.mcp.handlers.source import get_source
+
+        result = get_source(name="_payload", project_root=str(indexed_anon))
+        assert "error" not in result, f"get_source returned error: {result}"
+        source = result.get("source", "")
+        assert "x" in source or "int" in source, f"Source missing struct body: {source}"
+
+    def test_get_source_returns_anonymous_union_body(self, indexed_anon: Path):
+        """get_source returns the body of the anonymous union."""
+        from fw_context_mcp.mcp.handlers.source import get_source
+
+        result = get_source(name="_data", project_root=str(indexed_anon))
+        assert "error" not in result, f"get_source returned error: {result}"
+        source = result.get("source", "")
+        assert "a" in source or "float" in source or "int" in source, (
+            f"Source missing union body: {source}"
+        )
+
+    def test_get_file_map_includes_union_kind(self, indexed_anon: Path):
+        """get_file_map returns union symbols grouped under their kind."""
+        from fw_context_mcp.mcp.handlers.source import get_file_map
+
+        result = get_file_map(file_path="data.h", project_root=str(indexed_anon))
+        assert "error" not in result, f"get_file_map returned error: {result}"
+        symbols = result.get("symbols", {})
+
+    def test_get_symbol_context_for_anonymous_struct(self, indexed_anon: Path):
+        """get_symbol_context returns context for anonymous struct symbol."""
+        from fw_context_mcp.mcp.handlers.source import get_symbol_context
+
+        result = get_symbol_context(name="_payload", project_root=str(indexed_anon))
+        assert "error" not in result, f"get_symbol_context returned error: {result}"
+        assert result.get("kind") == "struct"
+
+    def test_get_symbol_context_for_anonymous_union(self, indexed_anon: Path):
+        """get_symbol_context returns context for anonymous union symbol."""
+        from fw_context_mcp.mcp.handlers.source import get_symbol_context
+
+        result = get_symbol_context(name="_data", project_root=str(indexed_anon))
+        assert "error" not in result, f"get_symbol_context returned error: {result}"
+        assert result.get("kind") == "union"
+
+    def test_search_code_finds_union_by_kind_filter(self, indexed_anon: Path):
+        """search_code with kind='union' returns union symbols."""
+        from fw_context_mcp.mcp.handlers.search import search_code
+
+        results = search_code(query="_data", project_root=str(indexed_anon), kind="union")
+        errors = [r for r in results if "error" in r]
+        assert not errors, f"search_code returned errors: {errors}"
+        found = [r for r in results if r.get("kind") == "union"]
+        assert len(found) >= 1
+
+    def test_search_code_finds_struct_by_kind_filter(self, indexed_anon: Path):
+        """search_code with kind='struct' returns anonymous struct symbols."""
+        from fw_context_mcp.mcp.handlers.search import search_code
+
+        results = search_code(query="_payload", project_root=str(indexed_anon), kind="struct")
+        errors = [r for r in results if "error" in r]
+        assert not errors, f"search_code returned errors: {errors}"
+        found = [r for r in results if r.get("kind") == "struct"]
+        assert len(found) >= 1

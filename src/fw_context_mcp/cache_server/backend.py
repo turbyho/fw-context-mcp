@@ -90,7 +90,7 @@ class CacheBackend:
     async def init_schema(self) -> None:
         """Create tables in both databases (idempotent)."""
 
-        meta = await self._meta_pool.acquire()  # type: ignore[union-attr]
+        meta = await self._meta_pool.acquire()
         try:
             await meta.execute(
                 """
@@ -120,9 +120,9 @@ class CacheBackend:
             # Ensure project_id is nullable (admin tokens use NULL)
             await meta.execute("ALTER TABLE tokens ALTER COLUMN project_id DROP NOT NULL")
         finally:
-            await self._meta_pool.release(meta)  # type: ignore[union-attr]
+            await self._meta_pool.release(meta)
 
-        cache = await self._cache_pool.acquire()  # type: ignore[union-attr]
+        cache = await self._cache_pool.acquire()
         try:
             await cache.execute(
                 """
@@ -137,7 +137,7 @@ class CacheBackend:
                 """
             )
         finally:
-            await self._cache_pool.release(cache)  # type: ignore[union-attr]
+            await self._cache_pool.release(cache)
 
         logger.info("Schema initialized in meta + cache databases")
 
@@ -151,7 +151,7 @@ class CacheBackend:
         import hashlib
 
         token_hash = hashlib.sha256(token.encode()).digest()
-        async with self._meta_pool.acquire() as conn:  # type: ignore[union-attr]
+        async with self._meta_pool.acquire() as conn:
             row = await conn.fetchrow(
                 "SELECT project_id, can_read, can_write, can_overwrite "
                 "FROM tokens WHERE token_hash = $1 AND revoked_at IS NULL",
@@ -174,7 +174,7 @@ class CacheBackend:
         """
         if not hashes:
             return {}
-        async with self._cache_pool.acquire() as conn:  # type: ignore[union-attr]
+        async with self._cache_pool.acquire() as conn:
             rows = await conn.fetch(
                 "SELECT content_hash, summary, inputs, outputs, model, "
                 "analyzed_at::text AS analyzed_at "
@@ -228,7 +228,7 @@ class CacheBackend:
             )
 
         inserted = 0
-        async with self._cache_pool.acquire() as conn:  # type: ignore[union-attr]
+        async with self._cache_pool.acquire() as conn:
             for entry in entries:
                 result = await conn.execute(
                     stmt,
@@ -256,7 +256,7 @@ class CacheBackend:
 
         token_hash = hashlib.sha256(token.encode()).digest()
 
-        async with self._meta_pool.acquire() as conn:  # type: ignore[union-attr]
+        async with self._meta_pool.acquire() as conn:
             try:
                 await conn.execute(
                     "INSERT INTO projects (id, description) VALUES ($1, $2)",
@@ -288,7 +288,7 @@ class CacheBackend:
 
         token_hash = hashlib.sha256(token.encode()).digest()
 
-        async with self._meta_pool.acquire() as conn:  # type: ignore[union-attr]
+        async with self._meta_pool.acquire() as conn:
             await conn.execute(
                 "INSERT INTO tokens (token_hash, project_id, can_read, can_write, can_overwrite, description) "
                 "VALUES ($1, $2, $3, $4, $5, $6)",
@@ -301,7 +301,7 @@ class CacheBackend:
         import hashlib
 
         token_hash = hashlib.sha256(token.encode()).digest()
-        async with self._meta_pool.acquire() as conn:  # type: ignore[union-attr]
+        async with self._meta_pool.acquire() as conn:
             result = await conn.execute(
                 "UPDATE tokens SET revoked_at = now() WHERE token_hash = $1 AND revoked_at IS NULL",
                 token_hash,
@@ -312,7 +312,7 @@ class CacheBackend:
 
     async def list_projects(self) -> list[dict[str, Any]]:
         """List all projects."""
-        async with self._meta_pool.acquire() as conn:  # type: ignore[union-attr]
+        async with self._meta_pool.acquire() as conn:
             rows = await conn.fetch(
                 "SELECT id, description, created_at::text AS created_at FROM projects ORDER BY id"
             )
@@ -320,7 +320,7 @@ class CacheBackend:
 
     async def list_tokens(self, project_id: str) -> list[dict[str, Any]]:
         """List tokens for a project (shows last 8 chars of hash)."""
-        async with self._meta_pool.acquire() as conn:  # type: ignore[union-attr]
+        async with self._meta_pool.acquire() as conn:
             rows = await conn.fetch(
                 "SELECT id, encode(token_hash, 'hex') AS token_hash, can_read, can_write, "
                 "can_overwrite, description, created_at::text AS created_at, "
@@ -332,7 +332,7 @@ class CacheBackend:
 
     async def remove_project(self, project_id: str) -> bool:
         """Delete a project and its tokens. Cache entries are NOT deleted."""
-        async with self._meta_pool.acquire() as conn:  # type: ignore[union-attr]
+        async with self._meta_pool.acquire() as conn:
             result = await conn.execute("DELETE FROM projects WHERE id = $1", project_id)
             # DELETE returns "DELETE N" (2 elements, unlike INSERT's 3)
             tag = result.split()
@@ -340,7 +340,7 @@ class CacheBackend:
 
     async def cache_stats(self) -> dict[str, Any]:
         """Return cache statistics."""
-        async with self._cache_pool.acquire() as conn:  # type: ignore[union-attr]
+        async with self._cache_pool.acquire() as conn:
             total = await conn.fetchval("SELECT count(*) FROM llm_analysis_cache")
             newest = await conn.fetchval("SELECT max(analyzed_at) FROM llm_analysis_cache")
             oldest = await conn.fetchval("SELECT min(analyzed_at) FROM llm_analysis_cache")
@@ -357,7 +357,7 @@ class CacheBackend:
         if not hashes:
             return 0
         deleted = 0
-        async with self._cache_pool.acquire() as conn:  # type: ignore[union-attr]
+        async with self._cache_pool.acquire() as conn:
             result = await conn.execute(
                 "DELETE FROM llm_analysis_cache WHERE content_hash = ANY($1::text[])",
                 hashes,
@@ -369,7 +369,7 @@ class CacheBackend:
 
     async def cache_purge_older_than(self, days: int) -> int:
         """Delete cache entries older than *days*.  Returns rows deleted."""
-        async with self._cache_pool.acquire() as conn:  # type: ignore[union-attr]
+        async with self._cache_pool.acquire() as conn:
             result = await conn.execute(
                 "DELETE FROM llm_analysis_cache WHERE analyzed_at < now() - make_interval(days => $1)",
                 days,
@@ -390,7 +390,7 @@ class CacheBackend:
         token = secrets.token_hex(32)
         token_hash = hashlib.sha256(token.encode()).digest()
 
-        async with self._meta_pool.acquire() as conn:  # type: ignore[union-attr]
+        async with self._meta_pool.acquire() as conn:
             await conn.execute(
                 "INSERT INTO tokens (token_hash, project_id, can_read, can_write, can_overwrite, description) "
                 "VALUES ($1, NULL, true, true, true, 'admin (setup)')",

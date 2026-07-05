@@ -15,6 +15,7 @@ import secrets
 import subprocess
 import sys
 from pathlib import Path
+from typing import Any
 
 
 def setup_wizard() -> int:
@@ -113,12 +114,12 @@ def _ask(msg: str, default: str = "y") -> bool:
             return False
 
 
-def _run(cmd: list[str], **kwargs: object) -> bool:
+def _run(cmd: list[str], **kwargs: Any) -> bool:
     """Run a shell command.  Returns True on success."""
     # Suppress "could not change directory" noise from sudo commands
     scwd = kwargs.pop("cwd", "/tmp") if cmd[0] == "sudo" and "cwd" not in kwargs else kwargs.pop("cwd", None)
     try:
-        subprocess.run(cmd, check=True, cwd=scwd, **kwargs)  # type: ignore[arg-type]
+        subprocess.run(cmd, check=True, cwd=scwd, **kwargs)
         return True
     except subprocess.CalledProcessError as e:
         print(f"    Error: {e}", file=sys.stderr)

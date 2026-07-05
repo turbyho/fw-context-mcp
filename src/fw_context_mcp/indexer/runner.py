@@ -184,8 +184,8 @@ def _detect_sdk_exclude_like(project_root: Path, extra_exclude: list[str] | None
 def _build_embeddings(conn, config_hash: str, llm_config, db_dir: Path) -> None:
     """Generate and store vector embeddings for all definition symbols.
 
-    Selects all function, method, constructor, destructor, class, and struct
-    definitions from the current build, builds a human-readable description
+    Selects all function, method, constructor, destructor, class, struct,
+    and union definitions from the current build, builds a human-readable description
     for each (combining file path, class, name, signature, docstring, and
     LLM summary), and produces embeddings via Ollama.
 
@@ -224,7 +224,7 @@ def _build_embeddings(conn, config_hash: str, llm_config, db_dir: Path) -> None:
                WHERE s.config_hash = ?
                  AND s.is_definition = 1
                   AND s.kind IN ('function', 'method', 'constructor', 'destructor',
-                                'class', 'struct', 'typedef', 'enum')
+                                'class', 'struct', 'union', 'typedef', 'enum')
                   AND s.id NOT IN (SELECT symbol_id FROM embeddings WHERE model = ?)
                ORDER BY CASE WHEN s.docstring IS NOT NULL AND LENGTH(s.docstring) > 30
                           THEN 0 ELSE 1 END""",
@@ -374,7 +374,7 @@ def _enrich_batch(conn, batch_rows, config_hash: str) -> list[dict]:
 
         # Read body for symbols with meaningful extents.  Enums and typedefs
         # benefit from body text during LLM analysis (enum constants, type alias).
-        if kind in ("function", "method", "constructor", "destructor", "class", "struct", "enum", "typedef") and abs_path and end_line > start_line:
+        if kind in ("function", "method", "constructor", "destructor", "class", "struct", "union", "enum", "typedef") and abs_path and end_line > start_line:
             body = _read_body(abs_path, start_line, end_line)
 
         # Fetch callees from the reference index
@@ -482,9 +482,9 @@ def _build_llm_analysis(
                JOIN files f ON s.file_id = f.id
                WHERE s.config_hash = ?
                  AND s.is_definition = 1
-                 AND s.kind IN ('function', 'method', 'constructor', 'destructor',
-                                'class', 'struct', 'typedef', 'enum')
-                 AND s.name NOT LIKE '%(anonymous%'
+                  AND s.kind IN ('function', 'method', 'constructor', 'destructor',
+                                 'class', 'struct', 'union', 'typedef', 'enum')
+                  AND s.name NOT LIKE '%(anonymous%'
                  AND s.name NOT LIKE '%(unnamed%'"""
     if exclude_clauses:
         query += f" AND {exclude_clauses}"

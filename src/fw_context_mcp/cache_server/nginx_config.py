@@ -10,19 +10,20 @@ import shutil
 import subprocess
 import sys
 from pathlib import Path
+from typing import Any
 
 NGINX_SITES_AVAILABLE = Path("/etc/nginx/sites-available")
 NGINX_SITES_ENABLED = Path("/etc/nginx/sites-enabled")
 NGINX_CONFIG_NAME = "fw-cache"
 
 
-def detect_nginx() -> dict:
+def detect_nginx() -> dict[str, Any]:
     """Detect the current nginx state on the system.
 
     Returns a dict with keys:
         installed (bool), running (bool), has_https (bool), domains (list[str])
     """
-    result = {"installed": False, "running": False, "has_https": False, "domains": []}
+    result: dict[str, Any] = {"installed": False, "running": False, "has_https": False, "domains": []}
 
     # Check if nginx binary exists
     if shutil.which("nginx"):
@@ -61,13 +62,13 @@ def detect_nginx() -> dict:
     return result
 
 
-def detect_certbot() -> dict:
+def detect_certbot() -> dict[str, Any]:
     """Check certbot availability.
 
     Returns a dict with keys:
         installed (bool), has_certificates (bool)
     """
-    result = {"installed": False, "has_certificates": False}
+    result: dict[str, Any] = {"installed": False, "has_certificates": False}
 
     if shutil.which("certbot"):
         result["installed"] = True

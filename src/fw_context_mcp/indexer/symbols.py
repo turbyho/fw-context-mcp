@@ -679,7 +679,7 @@ def extract_all(
         is_anon = _is_anonymous_struct_or_union(cursor)
         field_name = anon_usr_to_field.get(usr) if is_anon else None
         symbol_name = field_name if field_name else cursor.spelling
-        symbol_qname = _qualified_name(cursor, anon_usr_to_field) if is_anon else _qualified_name(cursor)
+        symbol_qname = _qualified_name(cursor, anon_usr_to_field)
 
         symbols.append(Symbol(
             name=symbol_name,
