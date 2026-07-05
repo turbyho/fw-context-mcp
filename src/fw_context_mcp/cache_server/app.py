@@ -18,6 +18,7 @@ from contextlib import asynccontextmanager
 from typing import Any
 
 from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 from .auth import CacheAuthMiddleware, require_can_read, require_can_write
@@ -85,8 +86,8 @@ def create_app(*, backend: Any = None) -> FastAPI:
         """Public health check — no auth required."""
         return {"status": "ok"}
 
-    @app.post("/cache/batch")
-    async def batch_get(request: Request, body: BatchGetRequest) -> dict[str, Any]:
+    @app.post("/cache/batch", response_model=None)
+    async def batch_get(request: Request, body: BatchGetRequest) -> dict[str, Any] | JSONResponse:
         """Batch lookup content hashes.
 
         Returns ``{"results": {hash: entry | null, ...}}``.
@@ -101,8 +102,8 @@ def create_app(*, backend: Any = None) -> FastAPI:
         results = await request.app.state.backend.batch_get(hashes)
         return {"results": results, "truncated": truncated}
 
-    @app.put("/cache/batch")
-    async def batch_put(request: Request, body: BatchPutRequest) -> dict[str, Any]:
+    @app.put("/cache/batch", response_model=None)
+    async def batch_put(request: Request, body: BatchPutRequest) -> dict[str, Any] | JSONResponse:
         """Batch write cache entries.
 
         Normal behaviour: ``INSERT ON CONFLICT DO NOTHING`` (first write wins).
@@ -124,8 +125,8 @@ def create_app(*, backend: Any = None) -> FastAPI:
         inserted = await request.app.state.backend.batch_put(entries, can_overwrite=overwrite)
         return {"inserted": inserted, "total": len(entries), "truncated": truncated}
 
-    @app.post("/cache/clear")
-    async def cache_clear(request: Request, body: CacheClearRequest) -> dict[str, Any]:
+    @app.post("/cache/clear", response_model=None)
+    async def cache_clear(request: Request, body: CacheClearRequest) -> dict[str, Any] | JSONResponse:
         """Delete cache entries by content hash.
 
         Requires ``can_write``. Returns the number of deleted entries.

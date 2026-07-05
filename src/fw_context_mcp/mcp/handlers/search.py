@@ -170,7 +170,7 @@ LOOKUP_PREFIX_SQL,
 def search_code(
     query: Annotated[str, Field(description="FTS5 search terms. 1-3 words, omit underscores. E.g. 'modem init' not 'modem_init'. Supports trailing wildcard 'modem*'.")],
     project_root: Annotated[str | None, Field(description="Project root. Auto-detected if omitted.")] = None,
-    kind: Annotated[str | None, Field(description="Optional kind filter: function, method, class, struct, enum, typedef, variable, field, namespace.")] = None,
+    kind: Annotated[str | None, Field(description="Optional kind filter: function, method, class, struct, union, enum, typedef, variable, field, namespace.")] = None,
     limit: Annotated[int, Field(description="Maximum results (default 20, max 100).")] = 20,
     project_only: Annotated[bool, Field(description="Exclude vendor SDK code (mbed-os/, .pio/, zephyr/). When True, only application code (src/, lib/, app/). Default False.")] = False,
 ) -> list[dict]:
@@ -215,7 +215,7 @@ def search_code(
     ``"individual_terms"``).
 
     **Kind filter values:** ``function``, ``method``, ``constructor``,
-    ``destructor``, ``class``, ``struct``, ``enum``, ``enum_constant``,
+    ``destructor``, ``class``, ``struct``, ``union``, ``enum``, ``enum_constant``,
     ``typedef``, ``variable``, ``field``, ``namespace``.
 
     Each result may include ``summary``, ``inputs``, ``outputs``
