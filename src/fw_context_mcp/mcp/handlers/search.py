@@ -42,12 +42,17 @@ def lookup_symbol(
     limit: Annotated[int, Field(description="Maximum results returned (capped at 100, default 50).")] = 50,
 ) -> list[dict]:
     """USE INSTEAD OF grep, ctx_search, or ctx_symbol. Look up a C/C++ symbol
-    by name via libclang index — exact or prefix matching.
+    by name via libclang index — exact or prefix matching. Falls back to
+    macro lookup when no symbol matches: returns macro definitions with
+    fully expanded values (kind="macro").
 
     Finds symbols grep cannot see: build-conditional code, template
-    instantiations, macro-expanded names. Prefer this over search_code when
-    you know the exact symbol name or a prefix (``uart_`` finds all UART
-    symbols). Use search_code for keyword/concept search.
+    instantiations, macro-expanded names. Macros are extracted via
+    ``clang -dM -E`` during indexing so ``#ifdef``-conditional macros
+    resolve correctly for the active build config. Prefer this over
+    search_code when you know the exact symbol name or a prefix
+    (``uart_`` finds all UART symbols). Use search_code for
+    keyword/concept search.
 
     Read-only: yes. May auto-reindex stale files (non-blocking).
 
@@ -63,7 +68,9 @@ def lookup_symbol(
         list[dict]: Symbols with name, qualified_name, kind, file, line,
         signature, docstring, is_definition, is_template, is_virtual,
         is_pure_virtual fields. Enum constants include ``enum_value``
-        with the integer value. May also include ``template_usr``,
+        with the integer value. Macro results include ``kind="macro"``,
+        ``value`` (raw definition), and ``expanded_value`` (preprocessor-
+        resolved value). May also include ``template_usr``,
         ``parent_usr``, ``summary``, ``inputs``, ``outputs`` when available.
         When no results found, may include ``_did_you_mean`` with suggested
         symbol names. Empty list if not found.
@@ -215,7 +222,7 @@ def search_code(
       ``modem AND init``. Write ``modem init`` instead.
 
     **Progressive relaxation:** when the initial FTS5 search returns nothing,
-    the tool automatically broadens the search in up to five steps:
+    the tool automatically broadens the search in up to six steps:
 
     1. *FTS5 with kind filter* — the original query with the user-provided
        ``kind`` constraint.
@@ -229,10 +236,12 @@ def search_code(
        column to catch terms the FTS5 tokeniser may have missed.
     5. *Individual term FTS5* — searches each query word separately and merges
        the results.
+    6. *Macro FTS5 fallback* — searches the ``macros_fts`` table for matching
+       ``#define`` names and values (kind="macro", ``_fallback="macros_fts"``).
 
     Results from fallback steps carry ``_fallback`` indicating which method
     succeeded (``"fts5"``, ``"name_tokens_like"``, ``"docstring_like"``,
-    ``"individual_terms"``).
+    ``"individual_terms"``, ``"macros_fts"``).
 
     **Kind filter values:** ``function``, ``method``, ``constructor``,
     ``destructor``, ``class``, ``struct``, ``union``, ``enum``, ``enum_constant``,

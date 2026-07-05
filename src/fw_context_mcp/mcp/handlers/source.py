@@ -174,7 +174,9 @@ async def explain_symbol(
     context_lines: Annotated[int, Field(description="Lines of source context around the symbol definition.")] = 40,
 ) -> dict:
     """USE INSTEAD OF reading code manually with grep/ctx_read. Explain what a
-    C/C++ symbol does in plain English — libclang-aware analysis.
+    C/C++ symbol does in plain English — libclang-aware analysis. Falls
+    back to macro explanation when the name matches a ``#define``: returns
+    kind="macro" with raw value and preprocessor-expanded value.
 
     Read-only. No side effects — uses pre-computed LLM analysis when available
     (instant, generated during ``fw-context index --analyze``), falls back to
@@ -193,7 +195,9 @@ async def explain_symbol(
 
     Returns:
         dict: {name, kind, file, line, signature, explanation, llm_analysis
-        (if pre-computed)}, plus source/explain_prompt on fallback.
+        (if pre-computed)}, plus source/explain_prompt on fallback. Macro
+        fallback returns ``kind="macro"``, ``signature`` (as ``#define NAME``),
+        ``value`` (raw definition), and ``expanded_value``.
     """
     db_path, cfg, project_id, root = _resolve_context(project_root)
     if not db_path.exists():
@@ -302,12 +306,14 @@ def get_source(
     project_root: Annotated[str | None, Field(description="Project root. Auto-detected if omitted.")] = None,
 ) -> dict:
     """USE INSTEAD OF generic file readers (ctx_read, cat, read). Read a
-    C/C++ function/method/enum body using libclang exact extents — no
-    guessing line numbers. No LLM, fast.
+    C/C++ function/method/enum/macro body using libclang exact extents —
+    no guessing line numbers. No LLM, fast.
 
     Generic readers don't know where a function actually ends — libclang
     tracks exact {start, end} from the AST. For enums, includes a
     ``constants`` array listing all member constants with their values.
+    For macros, returns kind="macro" with ``value`` (raw definition)
+    and ``expanded_value`` (preprocessor-resolved).
 
     For rich context (who calls this, what does it call) use
     get_symbol_context instead. For the full file, use a normal file read.
@@ -315,10 +321,11 @@ def get_source(
     Returns:
         dict: {name, qualified_name, kind, file, line, signature,
         is_definition, is_template, is_virtual, is_pure_virtual,
-        source (str — the function/enum body, truncated at 8000 chars),
+        source (str — the function/enum/macro body, truncated at 8000 chars),
         warning (str, optional — when source file cannot be read)}.
         May also include ``template_usr``, ``parent_usr``, ``enum_value``,
-        ``constants`` (list for enums) when applicable.
+        ``constants`` (list for enums), ``value`` (raw macro definition),
+        ``expanded_value`` (preprocessor-resolved macro value) when applicable.
     """
     db_path, cfg, project_id, root = _resolve_context(project_root)
     if not db_path.exists():
@@ -480,7 +487,9 @@ def get_symbol_context(
     """USE INSTEAD OF ctx_compose, grep, or manual code reading. Rich one-shot
     context for a C/C++ symbol: body, signature, all direct callers and callees.
     Answers "what does this do and how does it fit in the system?" in a single
-    response — libclang powers the call graph, not regex.
+    response — libclang powers the call graph, not regex. Falls back to macro
+    display when the symbol is not found: returns kind="macro" with
+    value and expanded_value (macros have no callers/callees).
 
     For body-only use get_source (faster). For transitive call-graph exploration
     use find_all_callers_recursive or find_callees_recursive.
@@ -498,6 +507,8 @@ def get_symbol_context(
     linked (Phase 3).  ``resolved=False`` with a note when parts are
     missing — LLM can detect uncertainty.
     For enums also returns constants and enum_value.
+    For macros returns ``kind="macro"``, ``value`` (raw definition), and
+    ``expanded_value`` (preprocessor-resolved).
     When LLM analysis has been generated (``fw-context index --analyze``),
     includes ``llm_analysis``: {summary, inputs, outputs, model, analyzed_at}
     with a structured description of the symbol's purpose, parameters, and
