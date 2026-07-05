@@ -46,8 +46,8 @@ _ANALYSIS_SYSTEM = """You are a senior C/C++ embedded engineer writing comprehen
 
 For each symbol, output a JSON object with EXACTLY these three string fields:
   "summary": a detailed description (3-6 sentences). Explain the purpose, behavior, key design patterns, and embedded-system context.
-  "inputs": a single string describing all inputs. For functions: list each parameter with type and role. For classes: describe dependencies and configuration. For typedefs: the underlying type. For enums: not applicable, use "-". Format as "param1 (type): role; param2 (type): role". Write everything inline as ONE STRING, not a JSON object.
-  "outputs": a single string describing all outputs and side effects. For functions: return value, error codes, and all side effects. For classes: what the class provides and manages. For typedefs: what the type alias represents. For enums: what each constant means and how it's used. Format as ONE STRING, not a JSON object.
+   "inputs": a single string describing all inputs. For functions: list each parameter with type and role. For classes/structs/unions: describe dependencies and configuration. For typedefs: the underlying type. For enums: not applicable, use "-". Format as "param1 (type): role; param2 (type): role". Write everything inline as ONE STRING, not a JSON object.
+   "outputs": a single string describing all outputs and side effects. For functions: return value, error codes, and all side effects. For classes/structs/unions: what the type provides and manages. For typedefs: what the type alias represents. For enums: what each constant means and how it's used. Format as ONE STRING, not a JSON object.
 
 CRITICAL: "inputs" and "outputs" MUST be plain text strings. DO NOT use nested JSON objects like {"param": "desc"}. Write everything as a single string separated by semicolons or newlines.
 CRITICAL: NEVER output literal backslash or double-quote characters inside JSON string values. These break JSON syntax. Describe them by name instead: write "backslash" not backslash, write "double-quote" not double-quote.
@@ -56,6 +56,11 @@ CRITICAL: DO NOT enumerate individual fields, members, or constants. Describe th
 The symbol description always includes a ``doc`` field (documentation comment — when present this is the AUTHORITATIVE source written by the developer), a ``body`` (the full source or declaration — use this to verify/expand on the documentation), and may include ``called functions`` (supplementary context only — to help you understand dependencies and the surrounding system).
 
 **Documentation (doc:):** When present, prioritize the developer's own description. ``@brief`` describes the purpose, ``@param`` describes each parameter, ``@return`` describes the return value. Use this as the primary source — it reflects the developer's intent. If the doc field shows "(NO DOCSTRING — ...)", fall back to inferring from body, signature, file_path, and callee names.
+
+**Union analysis:** Inspect the body before deciding the pattern. Unions are used for TWO distinct purposes:
+1) **Type-punning** — different representations of the SAME memory: a raw integer/array member alongside a struct (named or anonymous) containing bit-fields (e.g. ``uint32_t flags;`` + ``struct { uint32_t field:1; ... }``). The raw integer provides efficient storage/transfer; the bit-field struct provides named access to individual bits. Also used for register access, version encoding, protocol parsing. The bit-field struct may be anonymous or named — BOTH indicate type-punning when paired with a raw type.
+2) **Organizational grouping** — distinct, unrelated members sharing a namespace WITHOUT memory overlap. Members are enums, standalone structs, or sub-types that would otherwise clutter the parent scope. NO raw-type/bit-field member pairs present. The union keyword here is just a grouping mechanism — each member is independently used, never reinterpreted as another type.
+ALWAYS state which pattern applies in the summary. If ANY member is a raw integer/array AND another member contains bit-fields (even inside an anonymous struct), it IS type-punning (pattern 1). Otherwise it is grouping (pattern 2).
 
 EXAMPLES:
 
@@ -80,11 +85,25 @@ Typedef:
   "outputs": "Provides a portable uint32_t type name used for register values, bitfields, and protocol data structures"
 }
 
-Enum:
+ Enum:
 {
   "summary": "Defines the possible states of the modem state machine. Each constant represents a distinct operational phase. The state machine transitions linearly through the states during connection establishment, with IDLE and ERROR as the terminal entry/exit points. Designed so that ISRs and the main loop can check state via a single variable rather than multiple flags.",
   "inputs": "-",
   "outputs": "IDLE: modem powered off or not yet initialized; RESETTING: modem is being reset; WAIT_URC_AT_READY: waiting for AT ready unsolicited response; WAIT_CFUN: waiting for full functionality confirmation; WAIT_NETWORK: waiting for network registration; CONNECTED: fully operational, ready for data; ERROR: unrecoverable fault, requires power cycle"
+}
+
+Union (type-punning — two views of the same memory):
+{
+  "summary": "Provides dual access to a firmware version number stored in flash. The raw 32-bit integer enables efficient storage and comparison, while the packed bit-field struct within the union lets code read individual major/minor/patch components without manual bit shifting. The 8 reserved bits allow future extension without changing the storage format.",
+  "inputs": "-",
+  "outputs": "As raw integer (_fw_bl_version_int): the full version as uint32_t for flash read/write and comparison. As bit fields: _major (8 bits), _minor (8 bits), _patch (8 bits), plus 8 reserved bits."
+}
+
+Union (grouping — organizing related types without memory overlap):
+{
+  "summary": "Groups related BLE command enums into a single namespace. This union does NOT share memory — each member is a standalone enum defining command codes for a different operational context. Dispatch handles courier delivery workflows, Pickup covers customer retrieval, and Service lists diagnostic and maintenance operations. The union keyword here serves purely as organizational grouping, not type-punning.",
+  "inputs": "-",
+  "outputs": "CmdsDispatch: courier workflow commands (slot open, state query, size change, cancel). CmdsPickup: customer pickup commands (slot open, state query). CmdsService: 22 diagnostic/maintenance commands including LOCKER_REBOOT, SDCARD_DELETE, GET_FW_VERSION, GET_NET_INFO, GET_SHUTDOWN_REASON, SERVICE_MODE_SET."
 }
 
 Output ONLY the JSON array. No markdown fences, no commentary.
