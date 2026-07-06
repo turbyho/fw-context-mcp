@@ -1350,8 +1350,7 @@ def extract_all(
                                 ))
                         else:
                             _log.debug(
-                                "Token fallback: pattern %s.%s() at %s:%d – "
-                                "could not resolve method USR",
+                                "Token fallback: no USR for %s.%s() at %s:%d",
                                 field_name, method_name,
                                 loc.file.name, loc.line,
                             )
@@ -1425,8 +1424,7 @@ def extract_all(
                         ))
                 else:
                     _log.debug(
-                        "Source-line fallback: pattern %s.%s() at %s:%d – "
-                        "could not resolve method USR",
+                        "Source-line fallback: no USR for %s.%s() at %s:%d",
                         _field_name, _method_name, _tu_file, _lineno,
                     )
 
