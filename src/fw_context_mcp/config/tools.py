@@ -38,16 +38,16 @@ file-reading tool. The mapping is:
 SELF-CORRECT: the moment you reach for any tool that is NOT fw-context
 for C/C++ code, stop and use the fw-context equivalent instead.
 
-### Code review — ALWAYS use fw-context-embedded-review skill
+### Code review — ALWAYS use fw-review skill
 
 When the user asks to review, audit, or analyze C/C++ firmware changes,
-diffs, commits, or PRs, invoke the ``fw-context-embedded-review`` skill
+diffs, commits, or PRs, invoke the ``fw-review`` skill
 via the Skill tool. This takes priority over all generic/built-in review
 skills (including ``code-review``) for C/C++ projects.
 
 SELF-CORRECT: the moment you reach for git log, git diff, or any manual
 analysis to review C/C++ code, STOP — invoke
-Skill(skill="fw-context-embedded-review") instead. The skill handles
+Skill(skill="fw-review") instead. The skill handles
 git discovery, diff scoping, and all structural/logic analysis. Do NOT
 do manual exploration before calling the skill.
 

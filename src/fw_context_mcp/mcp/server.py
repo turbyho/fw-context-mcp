@@ -99,7 +99,7 @@ mcp = FastMCP(
         "  causing false matches on unrelated symbols containing those tokens.\n"
         "  search_code is for concept/keyword DISCOVERY only.\n"
         "• Use generic review agents/skills for C/C++ code → use\n"
-        "  fw-context-embedded-review skill (see REVIEW SKILL section below).\n\n"
+        "  fw-review skill (see REVIEW SKILL section below).\n\n"
         "AGENT LOOP: Check(get_active_build) → Find(search_code/lookup_symbol)\n"
         "→ Read(get_source/get_symbol_context) → Trace(find_references/find_callers)\n"
         "→ For body patterns use search_bodies.\n"
@@ -153,7 +153,7 @@ mcp = FastMCP(
         "Maintenance: reindex_file, reset_index, check_ollama, list_projects.\n\n"
         "REVIEW SKILL — MANDATORY (not optional): When reviewing C/C++ firmware\n"
         "code (diffs, commits, PRs, changed files), your FIRST action MUST be:\n"
-        "  skill(name=\"fw-context-embedded-review\")\n"
+        "  skill(name=\"fw-review\")\n"
         "Do NOT use generic review agents (code-explorer, general, etc.) for\n"
         "C/C++ firmware reviews — they do not know fw-context tool selection rules.\n"
         "Do NOT start inline review without the skill. The skill provides:\n"
@@ -170,7 +170,7 @@ mcp = FastMCP(
         "analysis, impact analysis, examine changes, inspect this code, look\n"
         "at this diff, check this PR, check these changes, analyze this\n"
         "commit, verify this change.\n"
-        "If the project has a LOCAL fw-context-embedded-review skill, that overrides\n"
+        "If the project has a LOCAL fw-review skill, that overrides\n"
         "the global default — the user has intentionally customized it.\n\n"
         "Start every session with get_active_build().\n"
         "For non-C/C++ files, general-purpose tools are preferred."
@@ -333,22 +333,22 @@ def resource_symbol(name: str) -> str:
 
 
 def _load_skill_md() -> str | None:
-    """Return the fw-context-embedded-review SKILL.md content, or None."""
+    """Return the fw-review SKILL.md content, or None."""
     from pathlib import Path
 
     from .. import __file__ as _pkg_init
 
     pkg_dir = Path(_pkg_init).parent
-    skill_path = pkg_dir / "data" / "skills" / "fw-context-embedded-review" / "SKILL.md"
+    skill_path = pkg_dir / "data" / "skills" / "fw-review" / "SKILL.md"
     try:
         return skill_path.read_text(encoding="utf-8")
     except OSError:
         return None
 
 
-@mcp.resource("fw-context://skills/fw-context-embedded-review")
+@mcp.resource("fw-context://skills/fw-review")
 def resource_embedded_review_skill() -> str:
-    """Return the fw-context-embedded-review SKILL.md as an MCP resource.
+    """Return the fw-review SKILL.md as an MCP resource.
 
     Read-only. Makes the embedded firmware review methodology available
     to any MCP client via a well-known resource URI."""

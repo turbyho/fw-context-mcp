@@ -231,7 +231,7 @@ By default (`--scope project`), it configures ONLY the current project:
 
 | Tool | Detection | Action |
 |------|-----------|--------|
-| **Claude Code** | `.claude/` dir in project | Injects `<!-- fw-context -->` into `CLAUDE.md`, installs agents (`code-explorer`, `general-purpose`), installs `fw-context-embedded-review` skill |
+| **Claude Code** | `.claude/` dir in project | Injects `<!-- fw-context -->` into `CLAUDE.md`, installs agents (`code-explorer`, `general-purpose`), installs `fw-review` skill |
 | **OpenCode** | `.opencode/` dir in project | Writes rules file, installs skill |
 | **Codex** | `.codex/` dir in project | Writes rules file |
 | **Cursor** | `.cursor/` dir in project | Writes `.cursor/rules/fw-context.mdc` |
@@ -246,7 +246,7 @@ By default (`--scope project`), it configures ONLY the current project:
 For existing agents, the CRITICAL block is injected without touching the
 rest of the file — custom domain knowledge is preserved.
 
-**Project skill:** The `fw-context-embedded-review` skill is installed in
+**Project skill:** The `fw-review` skill is installed in
 the project's `.claude/skills/` directory alongside the global copy.
 
 **If no AI tool is detected in the project** (no `.claude/`, `.opencode/`,

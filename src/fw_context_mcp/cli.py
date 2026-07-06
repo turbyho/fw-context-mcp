@@ -378,7 +378,7 @@ def _install_skills(
 ) -> bool:
     """Copy fw-context skills to AI tool skills directories.
 
-    Installs the fw-context-embedded-review skill globally (when scope is
+    Installs the fw-review skill globally (when scope is
     ``"global"`` or ``"all"``) and at the project level (when scope is
     ``"project"`` or ``"all"``, and ``project_root`` is provided).
 
@@ -390,7 +390,7 @@ def _install_skills(
     from . import __file__ as _pkg_init
 
     pkg_dir = Path(_pkg_init).parent
-    skill_dir = pkg_dir / "data" / "skills" / "fw-context-embedded-review"
+    skill_dir = pkg_dir / "data" / "skills" / "fw-review"
 
     if not (skill_dir / "SKILL.md").exists():
         return False
@@ -400,17 +400,17 @@ def _install_skills(
     # Global targets
     if scope in ("global", "all"):
         targets.extend([
-            Path.home() / ".config" / "opencode" / "skills" / "fw-context-embedded-review",
-            Path.home() / ".claude" / "skills" / "fw-context-embedded-review",
-            Path.home() / ".agents" / "skills" / "fw-context-embedded-review",
+            Path.home() / ".config" / "opencode" / "skills" / "fw-review",
+            Path.home() / ".claude" / "skills" / "fw-review",
+            Path.home() / ".agents" / "skills" / "fw-review",
         ])
 
     # Project-level targets
     if project_root is not None and scope in ("project", "all"):
         targets.extend([
-            project_root / ".claude" / "skills" / "fw-context-embedded-review",
-            project_root / ".opencode" / "skills" / "fw-context-embedded-review",
-            project_root / ".agents" / "skills" / "fw-context-embedded-review",
+            project_root / ".claude" / "skills" / "fw-review",
+            project_root / ".opencode" / "skills" / "fw-review",
+            project_root / ".agents" / "skills" / "fw-review",
         ])
 
     installed = False

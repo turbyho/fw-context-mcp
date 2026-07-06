@@ -1,5 +1,5 @@
 ---
-name: fw-context-embedded-review
+name: fw-review
 description: Review embedded C/C++ firmware changes using fw-context MCP tools. Three-phase workflow: (0) create a review plan from the diff, (1) structural verification via callers/callees/types, (2) logic review across 9 embedded-specific domains. Takes priority over generic review skills for C/C++ code. If project has a local copy, that overrides this global default.
 ---
 
