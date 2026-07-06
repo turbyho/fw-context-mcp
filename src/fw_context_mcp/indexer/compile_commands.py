@@ -258,7 +258,7 @@ def normalize_args(
 
     # Resolve relative -I paths to absolute (libclang uses process CWD, not
     # compile_commands.json directory, so -I. would resolve to wrong location).
-    _INC_FLAGS = frozenset({"-I", "-isystem", "-idirafter", "-iquote", "-imacros"})
+    _INC_FLAGS = frozenset({"-I", "-isystem", "-idirafter", "-iquote", "-imacros", "-include"})
     resolved: list[str] = []
     skip_next = False
     for token in result:
@@ -276,9 +276,9 @@ def normalize_args(
             if path and not Path(path).is_absolute():
                 path = str((cwd / path).resolve())
             resolved.append(f"-I{path}")
-        elif any(token.startswith(f) for f in ("-isystem", "-idirafter", "-iquote", "-imacros")):
-            # Attached form: -isystem/path
-            for f in ("-isystem", "-idirafter", "-iquote", "-imacros"):
+        elif any(token.startswith(f) for f in ("-isystem", "-idirafter", "-iquote", "-imacros", "-include")):
+            # Attached form: -isystem/path, -include/path
+            for f in ("-isystem", "-idirafter", "-iquote", "-imacros", "-include"):
                 if token.startswith(f):
                     path = token[len(f):]
                     if path and not Path(path).is_absolute():
@@ -289,6 +289,41 @@ def normalize_args(
             resolved.append(token)
 
     return resolved
+
+
+def validate_include_files(clang_args: list[str]) -> None:
+    """Check that all -include and -imacros referenced files exist.
+
+    *clang_args* should already be normalized by ``normalize_args()`` (paths
+    resolved to absolute).  Raises ``RuntimeError`` listing every missing file
+    so the user can fix them all at once rather than one at a time.
+    """
+    _FILE_FLAGS = frozenset({"-include", "-imacros"})
+    missing: list[str] = []
+    skip_next = False
+    for token in clang_args:
+        if skip_next:
+            skip_next = False
+            p = Path(token)
+            if not p.exists():
+                missing.append(str(p))
+            continue
+        if token in _FILE_FLAGS:
+            skip_next = True
+        elif token.startswith("-include") or token.startswith("-imacros"):
+            for prefix in ("-include", "-imacros"):
+                if token.startswith(prefix):
+                    p = Path(token[len(prefix) :])
+                    if not p.exists():
+                        missing.append(str(p))
+                    break
+    if missing:
+        raise RuntimeError(
+            "Build-generated configuration files referenced by -include/-imacros "
+            "were not found:\n  "
+            + "\n  ".join(missing)
+            + "\n\nRun 'fw-context index --build' to regenerate the build output."
+        )
 
 
 def _safe_iterdir(path: Path) -> list[Path]:
