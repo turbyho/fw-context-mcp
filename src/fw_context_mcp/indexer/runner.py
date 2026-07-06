@@ -16,7 +16,7 @@ from pathlib import Path
 from ..config.settings import derive_project_id
 from ..llm.ollama import call_ollama
 from ..utils import MTIME_TOLERANCE_S, read_file_lines
-from .compile_commands import _SOURCE_EXTS
+from .compile_commands import _SOURCE_EXTS, validate_include_files
 from .compile_commands import parse as parse_compile_commands
 from .config_hash import compute as compute_config_hash
 from .db import (
@@ -1177,6 +1177,7 @@ def run(
     parallel: bool = True,
     force: bool = False,
     index_macros_expanded: bool = True,
+    config_header: str = "",
 ) -> str:
     """Index a project: parse translation units, extract symbols, and store to SQLite.
 
@@ -1269,6 +1270,27 @@ def run(
     units = list(parse_compile_commands(compile_commands))
     units = [u for u in units if u.file.suffix.lower() in _SOURCE_EXTS]
     log.info("TUs to index: %d", len(units))
+
+    # Inject user-configured config header when the build system doesn't emit
+    # -include flags (custom builds, legacy Makefiles, etc.).
+    if config_header:
+        ch = project_root / config_header
+        if not ch.exists():
+            raise RuntimeError(
+                f"Configured config_header not found: {ch}\n"
+                "Check [index] config_header in .fw-context/config.toml"
+            )
+        ch_abs = ch.resolve()
+        for unit in units:
+            unit.clang_args.extend(("-include", str(ch_abs)))
+
+    # Validate that all -include/-imacros referenced files exist BEFORE
+    # starting any libclang parsing.  A missing build-generated config
+    # header (e.g. BUILD/.../mbed_config.h) would otherwise cause libclang
+    # to fail for every TU that includes the SDK, producing a partial index
+    # and wasting ~seconds per TU on doomed parse attempts.
+    for unit in units:
+        validate_include_files(unit.clang_args)
 
     existing_files = get_file_mtimes(conn, config_hash)
 

@@ -104,6 +104,7 @@ _PROJECT_DEFAULTS_TEMPLATE = """\
 [index]
 compile_commands = "compile_commands.json"
 # Generate it with:  fw-context index --build  (auto-detects build system)
+# config_header = "config/my_build_config.h"   # path to config.h for custom build systems
 # source_roots: directories to index symbols from.
 #   Empty list = auto-detect (scans for src, lib, app, include, zephyr, mbed-os,
 #   modules + top-level directories from compile_commands.json).
@@ -241,6 +242,11 @@ class IndexConfig:
     Attributes:
         db_dir: Directory where per-project SQLite databases are stored.
         compile_commands: Path to compile_commands.json (relative to project root).
+        config_header: Path to a build-generated configuration header (e.g.
+            ``config.h``) for projects whose build system does not emit
+            ``-include`` flags in compile_commands.json.  When set, the file
+            is force-included in every translation unit via ``-include``.
+            Useful for custom build systems where auto-detection fails.
         source_roots: Directories to index symbols from. Empty = auto-detect.
         exclude_paths: Directories to exclude from indexing (LIKE patterns).
         index_refs: Build cross-reference index for call-graph tools
@@ -250,6 +256,7 @@ class IndexConfig:
     """
     db_dir: Path = field(default_factory=lambda: Path.home() / ".fw-context" / "index")
     compile_commands: Path = field(default_factory=lambda: Path("compile_commands.json"))
+    config_header: str = ""  # path to build-generated config.h for custom build systems
     source_roots: list[str] = field(default_factory=list)
     exclude_paths: list[str] = field(default_factory=lambda: ["build", "BUILD"])
     index_refs: bool = True

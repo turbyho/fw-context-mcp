@@ -139,6 +139,7 @@ def cmd_index(args: argparse.Namespace) -> int:
             project_id=project_id,
             llm_config=cfg.llm,
             cache_server_config=cs_config,
+            config_header=cfg.index.config_header,
             force=args.force,
         )
         print(f"Indexed. config_hash={config_hash[:16]}…  db={db_path}")
