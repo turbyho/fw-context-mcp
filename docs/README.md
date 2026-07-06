@@ -64,6 +64,18 @@ reading entire source files, for example:
 -   Show the code path from the ISR to this function.
 -   Which functions are never used?
 
+## Optional: Remote cache
+
+If your team runs a [shared cache server](cache-server.md), configure
+it to share LLM analysis results across developers:
+
+``` bash
+fw-context cache remote-init
+```
+
+The interactive wizard asks for your server URL and token, verifies
+the connection, and writes the configuration to your project.
+
 ## Next steps
 
 Continue with the detailed documentation:

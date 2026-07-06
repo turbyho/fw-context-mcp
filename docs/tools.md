@@ -242,6 +242,42 @@ fw-context cache push --batch 500           # larger batches for faster transfer
 Requires ``[cache_server]`` configured with ``can_write`` and ``can_overwrite``
 permissions. Progress is reported in batches.
 
+### `fw-context cache remote-init`
+
+Interactive wizard to configure the remote cache server connection.
+Prompts for URL, token, verifies connectivity, and writes ``[cache_server]``
+to ``.fw-context/local.toml``.
+
+```bash
+fw-context cache remote-init                 # configure for current project
+fw-context cache remote-init --project DIR   # configure for specific project
+```
+
+The wizard:
+
+1. Shows the currently configured URL (if any)
+2. Prompts for the server URL (press Enter to keep current or accept default)
+3. Prompts for the authentication token (required — paste your read+write token)
+4. Verifies the connection: calls ``/health`` then ``/cache/stats`` with the token
+5. Writes the ``[cache_server]`` section to ``local.toml`` (idempotent)
+
+Typical output:
+
+```
+No remote cache configured.
+
+Cache server URL [https://fw-cache.example.com]: https://fw-cache.montyho.com
+
+Token (paste your read+write token): <token>
+
+Verifying connection to https://fw-cache.montyho.com ...
+  Connected. Server has 14486 cached entries.
+
+Remote cache configured: https://fw-cache.montyho.com
+Config written to: /path/to/project/.fw-context/local.toml
+Run 'fw-context cache stats --remote' to verify.
+```
+
 ### `fw-context version`
 
 Show version information.

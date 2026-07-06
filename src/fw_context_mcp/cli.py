@@ -15,6 +15,35 @@ from pathlib import Path
 from . import __version__
 
 
+class VerboseFormatter(logging.Formatter):
+    """Structured output with phase headers for ``--verbose`` mode.
+
+    Phase headers are emitted via ``log.info("", extra={"phase": "name"})``
+    and rendered as framed separators.  Body messages are indented.  Phase
+    results (single-line summaries) use ``extra={"result": True}`` to align
+    timing info right after the phase header on the same line.
+    """
+
+    WIDTH: int = 60
+
+    def format(self, record: logging.LogRecord) -> str:
+        msg = record.getMessage()
+
+        # Phase header
+        phase = getattr(record, "phase", None)
+        if phase:
+            header = f"── {phase} "
+            padding = max(2, self.WIDTH - len(header))
+            return "\n" + header + ("─" * padding)
+
+        # Phase result (same-line summary)
+        if getattr(record, "result", False):
+            return f"  {msg}"
+
+        # Regular message within a phase
+        return f"  {msg}"
+
+
 def cmd_index(args: argparse.Namespace) -> int:
     """Build or rebuild the symbol index from compile_commands.json.
 
@@ -30,11 +59,16 @@ def cmd_index(args: argparse.Namespace) -> int:
     from .indexer.runner import run
     from .utils import resolve_project_root
 
-    logging.basicConfig(
-        level=logging.DEBUG if args.verbose else logging.INFO,
-        format="%(asctime)s %(levelname)s %(message)s",
-        datefmt="%H:%M:%S",
-    )
+    if args.verbose:
+        handler = logging.StreamHandler()
+        handler.setFormatter(VerboseFormatter())
+        logging.basicConfig(level=logging.DEBUG, handlers=[handler])
+    else:
+        logging.basicConfig(
+            level=logging.INFO,
+            format="%(asctime)s %(levelname)s %(message)s",
+            datefmt="%H:%M:%S",
+        )
 
     project_root = resolve_project_root(args.project)
     cfg = load_config(project_root=project_root)
@@ -948,11 +982,16 @@ def cmd_analyze(args: argparse.Namespace) -> int:
     from .indexer.runner import _build_llm_analysis, _build_overrides
     from .utils import resolve_project_root
 
-    logging.basicConfig(
-        level=logging.DEBUG if args.verbose else logging.INFO,
-        format="%(asctime)s %(levelname)s %(message)s",
-        datefmt="%H:%M:%S",
-    )
+    if args.verbose:
+        handler = logging.StreamHandler()
+        handler.setFormatter(VerboseFormatter())
+        logging.basicConfig(level=logging.DEBUG, handlers=[handler])
+    else:
+        logging.basicConfig(
+            level=logging.INFO,
+            format="%(asctime)s %(levelname)s %(message)s",
+            datefmt="%H:%M:%S",
+        )
 
     project_root = resolve_project_root(args.project)
     cfg = load_config(project_root=project_root)
@@ -1146,6 +1185,116 @@ def cmd_cache_push(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_cache_remote_init(args: argparse.Namespace) -> int:
+    """Interactive wizard: configure remote cache server connection.
+
+    Prompts for URL and token, verifies the connection, and writes
+    [cache_server] to the project's local.toml.
+    """
+    import re
+    import httpx
+
+    from .config.settings import _ensure_project_local_config
+    from .utils import resolve_project_root
+
+    project_root = resolve_project_root(args.project)
+
+    # Resolve local.toml
+    local_path = _ensure_project_local_config(project_root)
+
+    # Read existing config
+    existing = local_path.read_text(encoding="utf-8")
+
+    # Show current config if any
+    current_url = ""
+    url_match = re.search(r'\[cache_server\].*?\nurl\s*=\s*"([^"]*)"', existing, re.DOTALL)
+    if url_match:
+        current_url = url_match.group(1)
+
+    if current_url:
+        print(f"Current remote cache: {current_url}")
+    else:
+        print("No remote cache configured.")
+
+    # --- Step 1: URL ---
+    print()
+    url_default = current_url or "https://fw-cache.example.com"
+    url_input = input(f"Cache server URL [{url_default}]: ").strip()
+    url = url_input if url_input else url_default
+
+    # --- Step 2: Token ---
+    print()
+    token_input = input("Token (paste your read+write token): ").strip()
+    if not token_input:
+        print("error: token is required", file=sys.stderr)
+        return 1
+    token = token_input
+
+    # --- Step 3: Verify connection ---
+    print(f"\nVerifying connection to {url} ...")
+    try:
+        with httpx.Client(base_url=url, timeout=10.0) as client:
+            # Check health first
+            health_resp = client.get("/health")
+            if health_resp.status_code != 200:
+                print(f"error: server returned {health_resp.status_code}", file=sys.stderr)
+                return 1
+
+            # Check auth
+            auth_resp = client.get(
+                "/cache/stats",
+                headers={"Authorization": f"Bearer {token}"},
+            )
+            if auth_resp.status_code == 401:
+                print("error: authentication failed (401) — check your token", file=sys.stderr)
+                return 1
+            if auth_resp.status_code == 403:
+                print("error: access denied (403) — token may lack permissions", file=sys.stderr)
+                return 1
+            if auth_resp.status_code != 200:
+                print(f"error: server returned {auth_resp.status_code}", file=sys.stderr)
+                return 1
+
+            stats = auth_resp.json()
+            total = stats.get("total_entries", 0)
+            print(f"  Connected. Server has {total} cached entries.")
+    except httpx.ConnectError:
+        print(f"error: cannot connect to {url} — check the URL and network", file=sys.stderr)
+        return 1
+    except httpx.TimeoutException:
+        print(f"error: connection to {url} timed out", file=sys.stderr)
+        return 1
+    except Exception as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 1
+
+    # --- Step 4: Write config ---
+    cache_section = f"""
+[cache_server]
+url = "{url}"
+token = "{token}"
+"""
+
+    if "[cache_server]" in existing:
+        # Replace existing section
+        new_content = re.sub(
+            r'\[cache_server\].*?(?=\[|$)',
+            cache_section.strip(),
+            existing,
+            flags=re.DOTALL,
+        )
+    else:
+        # Append
+        new_content = existing.rstrip("\n") + "\n" + cache_section.strip() + "\n"
+
+    local_path.write_text(new_content, encoding="utf-8")
+    print(f"\nRemote cache configured: {url}")
+    print(f"Config written to: {local_path}")
+    print("Run 'fw-context cache stats --remote' to verify.")
+
+    return 0
+
+
 def cmd_cache_clear(args: argparse.Namespace) -> int:
     """Delete cache entries for one or both tiers."""
     from .config import derive_project_id
@@ -1230,6 +1379,7 @@ def main() -> None:
     sub = parser.add_subparsers(dest="cmd")
 
     p_index = sub.add_parser("index", help="Build the symbol index from compile_commands.json (reuses existing compile_commands.json, builds only if missing)")
+    p_index.add_argument("-v", "--verbose", action="store_true")
     p_index.add_argument("compile_commands", nargs="?", default=None, metavar="compile_commands.json",
                          help="Use an explicit compile_commands.json (skips build)")
     p_index.add_argument("--project", metavar="DIR", help="Project root (default: cwd)")
@@ -1247,6 +1397,7 @@ def main() -> None:
     p_index.set_defaults(func=cmd_index)
 
     p_search = sub.add_parser("search", help="Search indexed symbols")
+    p_search.add_argument("-v", "--verbose", action="store_true")
     p_search.add_argument("query")
     p_search.add_argument("--project", metavar="DIR")
     p_search.add_argument("--limit", type=int, default=20)
@@ -1263,6 +1414,7 @@ def main() -> None:
     p_init.set_defaults(func=cmd_init, tool=None, dry_run=False, force=False, instructions_only=False, list_tools=False)
 
     p_list = sub.add_parser("list", help="List all indexed projects")
+    p_list.add_argument("-v", "--verbose", action="store_true")
     p_list.set_defaults(func=cmd_list)
 
     p_reset = sub.add_parser("reset", help="Delete the index for a project")
@@ -1286,6 +1438,7 @@ def main() -> None:
     p_project_init.set_defaults(func=cmd_project_init)
 
     p_analyze = sub.add_parser("analyze", help="Re-run LLM symbol analysis on existing index (idempotent)")
+    p_analyze.add_argument("-v", "--verbose", action="store_true")
     p_analyze.add_argument("--project", metavar="DIR", help="Project root (default: cwd)")
     p_analyze.set_defaults(func=cmd_analyze)
 
@@ -1309,6 +1462,10 @@ def main() -> None:
     p_cache_push.add_argument("--project", metavar="DIR", help="Project root for remote config (default: cwd)")
     p_cache_push.add_argument("--batch", type=int, metavar="N", help="Batch size (default: from config, 100)")
     p_cache_push.set_defaults(func=cmd_cache_push)
+
+    p_cache_remote = p_cache_sub.add_parser("remote-init", help="Interactive setup: configure remote cache URL and token")
+    p_cache_remote.add_argument("--project", metavar="DIR", help="Project root (default: cwd)")
+    p_cache_remote.set_defaults(func=cmd_cache_remote_init)
 
     p_version = sub.add_parser("version", help="Show version information")
     p_version.set_defaults(func=cmd_version)

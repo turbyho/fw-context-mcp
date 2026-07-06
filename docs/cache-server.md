@@ -346,7 +346,27 @@ fw-context cache clear --remote -y       # skip confirmation
 # Push local cache to remote server (with overwrite)
 fw-context cache push                    # push all, batch size 100
 fw-context cache push --batch 500        # larger batches for faster transfer
+
+# Interactive remote cache setup
+fw-context cache remote-init             # configure URL and token interactively
+fw-context cache remote-init --project /path/to/project
 ```
+
+### `fw-context cache remote-init`
+
+Interactive wizard that configures the remote cache server connection.
+Prompts for the server URL (defaults to existing value) and authentication
+token, verifies the connection, and writes the `[cache_server]` section
+to `.fw-context/local.toml`.
+
+1. **URL** — server base URL (e.g. `https://fw-cache.example.com`)
+2. **Token** — read+write token created with `fw-cache-admin token create`
+3. **Verify** — calls `/health` and `/cache/stats` to confirm connectivity
+4. **Write** — idempotently updates `local.toml` (replaces existing section
+   or appends a new one)
+
+Re-run to update the URL or rotate the token — the wizard detects existing
+configuration and shows the current value as the default.
 
 The `--remote` flag reads all content hashes from the project's per-project
 `llm_analysis_cache` table and sends them to the server's `POST /cache/clear`
