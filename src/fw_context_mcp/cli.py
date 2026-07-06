@@ -1224,7 +1224,7 @@ def cmd_cache_remote_init(args: argparse.Namespace) -> int:
 
     # --- Step 2: Token ---
     print()
-    token_input = input("Token (paste your read+write token): ").strip()
+    token_input = input("Token (paste your read or read+write token): ").strip()
     if not token_input:
         print("error: token is required", file=sys.stderr)
         return 1

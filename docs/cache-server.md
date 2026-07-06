@@ -360,7 +360,7 @@ token, verifies the connection, and writes the `[cache_server]` section
 to `.fw-context/local.toml`.
 
 1. **URL** — server base URL (e.g. `https://fw-cache.example.com`)
-2. **Token** — read+write token created with `fw-cache-admin token create`
+2. **Token** — read or read+write token created with `fw-cache-admin token create`
 3. **Verify** — calls `/health` and `/cache/stats` to confirm connectivity
 4. **Write** — idempotently updates `local.toml` (replaces existing section
    or appends a new one)

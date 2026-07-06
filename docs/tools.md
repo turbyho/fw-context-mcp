@@ -257,7 +257,7 @@ The wizard:
 
 1. Shows the currently configured URL (if any)
 2. Prompts for the server URL (press Enter to keep current or accept default)
-3. Prompts for the authentication token (required — paste your read+write token)
+3. Prompts for the authentication token (required — paste your read or read+write token)
 4. Verifies the connection: calls ``/health`` then ``/cache/stats`` with the token
 5. Writes the ``[cache_server]`` section to ``local.toml`` (idempotent)
 
@@ -268,7 +268,7 @@ No remote cache configured.
 
 Cache server URL [https://fw-cache.example.com]: https://fw-cache.montyho.com
 
-Token (paste your read+write token): <token>
+Token (paste your read or read+write token): <token>
 
 Verifying connection to https://fw-cache.montyho.com ...
   Connected. Server has 14486 cached entries.
