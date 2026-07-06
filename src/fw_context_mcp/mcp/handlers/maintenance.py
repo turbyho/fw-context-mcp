@@ -555,6 +555,16 @@ def reindex_file_impl(
                         )
                         total_symbols += syms_added
 
+                # Resolve expanded macro values for the re-indexed TUs.
+                # Single call is sufficient — all TUs share the same flags.
+                if parsed_units:
+                    try:
+                        from ...indexer.macros import resolve_and_update
+                        first_unit = parsed_units[0][0]
+                        resolve_and_update(conn, config_hash, first_unit.clang_args, first_unit.file.resolve())
+                    except Exception:
+                        pass
+
                 elapsed = round(time.monotonic() - t0, 2)
                 result: dict = {
                     "file": str(target),

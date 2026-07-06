@@ -532,6 +532,72 @@ def _find_fn_refs_in_expr(
     return results
 
 
+def _is_fn_ptr_type(t: cx.Type) -> bool:
+    """True when *t* is (or resolves via typedef to) a function pointer."""
+    try:
+        canon = t.get_canonical()
+        if canon.kind == cx.TypeKind.POINTER:
+            pointee = canon.get_pointee()
+            return pointee.kind in (cx.TypeKind.FUNCTIONPROTO, cx.TypeKind.FUNCTIONNOPROTO)
+    except Exception:
+        pass
+    return False
+
+
+def _call_expr_text(cursor: cx.Cursor) -> str:
+    """Extract callee expression text from a CALL_EXPR's token stream.
+
+    Returns everything before the opening ``(``, space-joined.
+    ``driver->onData(buf, len)`` → ``"driver->onData"``
+    ``stored_callback(42)``      → ``"stored_callback"``
+    """
+    parts: list[str] = []
+    try:
+        for tok in cursor.get_tokens():
+            if tok.spelling == "(":
+                break
+            parts.append(tok.spelling)
+    except Exception:
+        return ""
+    return " ".join(parts)
+
+
+def _extract_lhs_field(
+    expr_cursor: cx.Cursor,
+) -> tuple[str | None, str]:
+    """Extract the USR and name of the field or variable on the LHS.
+
+    ``obj->onData = &handler`` returns ``(USR_FIELD_onData, "onData")``.
+    ``global_cb = &handler`` returns ``(USR_VAR_global_cb, "global_cb")``.
+
+    Walks children recursively so it works through ``UNEXPOSED_EXPR``
+    wrappers (common in designated initializers like ``.field = &fn``
+    inside ``INIT_LIST_EXPR``).
+
+    Returns ``(None, "")`` when the LHS is not a recognizable field
+    or variable.
+    """
+    def _walk(c: cx.Cursor) -> tuple[str | None, str]:
+        if c.kind in (cx.CursorKind.MEMBER_REF_EXPR, cx.CursorKind.MEMBER_REF):
+            ref = c.referenced
+            if ref is not None and ref.kind == cx.CursorKind.FIELD_DECL:
+                return (ref.get_usr(), ref.spelling)
+        elif c.kind == cx.CursorKind.DECL_REF_EXPR:
+            ref = c.referenced
+            if ref is not None and ref.kind in (
+                cx.CursorKind.VAR_DECL, cx.CursorKind.PARM_DECL,
+            ):
+                return (ref.get_usr(), ref.spelling)
+        # Recurse into UNEXPOSED_EXPR and other wrappers
+        for grandchild in c.get_children():
+            result = _walk(grandchild)
+            if result[0] is not None:
+                return result
+        return (None, "")
+
+    return _walk(expr_cursor)
+
+
 def extract(
     unit: CompilationUnit,
     source_roots: list[Path] | None = None,
@@ -928,6 +994,55 @@ def extract_all(
     # generator pays that cost once per cursor internally and just yields.
     fn_stack: list[tuple[str, int]] = []  # [(usr, end_line)]
 
+    def _emit_fn_ptr_targets(
+        expr_cursor: cx.Cursor,
+        caller_usr: str | None,
+        skip_usr: str | None = None,
+        lhs_usr: str | None = None,
+        lhs_name: str = "",
+        method: str = "assignment",
+    ) -> None:
+        loc = expr_cursor.location
+        if not loc.file or not _in_roots(loc.file.name) or not _not_excluded(loc.file.name):
+            return
+        for child in expr_cursor.get_children():
+            targets = _find_fn_refs_in_expr(child, _in_roots, _not_excluded, skip_usr)
+            for target in targets:
+                target_usr = target.get_usr()
+                if not target_usr:
+                    continue
+                if target_usr == skip_usr:
+                    continue
+                target_loc = target.location
+                if target_loc.file and _in_roots(target_loc.file.name) and _not_excluded(target_loc.file.name):
+                    key = (target_usr, loc.file.name, loc.line, caller_usr, "indirect")
+                    if key not in seen_ref:
+                        seen_ref.add(key)
+                        refs.append(Reference(
+                            to_usr=target_usr,
+                            from_file=loc.file.name,
+                            from_line=loc.line,
+                            from_usr=caller_usr,
+                            ref_kind="indirect",
+                        ))
+                    # Phase 3: emit FnPointerAssignment when we have LHS info
+                    if lhs_usr and lhs_usr != target_usr:
+                        try:
+                            _fp_type = child.type.spelling
+                        except Exception:
+                            _fp_type = ""
+                        fp_assignments.append(FnPointerAssignment(
+                            from_file=loc.file.name,
+                            from_line=loc.line,
+                            lhs_usr=lhs_usr,
+                            lhs_name=lhs_name,
+                            rhs_usr=target_usr,
+                            rhs_name=target.spelling,
+                            fn_ptr_type=_fp_type,
+                            method=method,
+                            from_usr=caller_usr,
+                        ))
+
     for cursor in tu.cursor.walk_preorder():
         # Pop enclosing functions whose body extent we've left.
         # walk_preorder() visits all descendants before any sibling, so
@@ -1016,35 +1131,6 @@ def extract_all(
                                         ))
                                     break  # one resolved callee per CALL_EXPR
 
-        # --- Helper: function pointer type check ---
-        def _is_fn_ptr_type(t: cx.Type) -> bool:
-            """True when *t* is (or resolves via typedef to) a function pointer."""
-            try:
-                canon = t.get_canonical()
-                if canon.kind == cx.TypeKind.POINTER:
-                    pointee = canon.get_pointee()
-                    return pointee.kind in (cx.TypeKind.FUNCTIONPROTO, cx.TypeKind.FUNCTIONNOPROTO)
-            except Exception:
-                pass
-            return False
-
-        def _call_expr_text(cursor: cx.Cursor) -> str:
-            """Extract callee expression text from a CALL_EXPR's token stream.
-
-            Returns everything before the opening ``(``, space-joined.
-            ``driver->onData(buf, len)`` → ``"driver->onData"``
-            ``stored_callback(42)``      → ``"stored_callback"``
-            """
-            parts: list[str] = []
-            try:
-                for tok in cursor.get_tokens():
-                    if tok.spelling == "(":
-                        break
-                    parts.append(tok.spelling)
-            except Exception:
-                return ""
-            return " ".join(parts)
-
         # --- Indirect function pointer invocation detection ---
         # Detect CALL_EXPR where the callee is a function pointer field,
         # variable, or parameter.  libclang resolves cursor.referenced to the
@@ -1068,101 +1154,6 @@ def extract_all(
                             target_name=callee.spelling,
                             fn_ptr_type=callee.type.spelling,
                         ))
-
-        # --- Helper: extract left-hand side field/variable from assignment ---
-        def _extract_lhs_field(
-            expr_cursor: cx.Cursor,
-        ) -> tuple[str | None, str]:
-            """Extract the USR and name of the field or variable on the LHS.
-
-            ``obj->onData = &handler`` returns ``(USR_FIELD_onData, "onData")``.
-            ``global_cb = &handler`` returns ``(USR_VAR_global_cb, "global_cb")``.
-
-            Walks children recursively so it works through ``UNEXPOSED_EXPR``
-            wrappers (common in designated initializers like ``.field = &fn``
-            inside ``INIT_LIST_EXPR``).
-
-            Returns ``(None, "")`` when the LHS is not a recognizable field
-            or variable.
-            """
-            def _walk(c: cx.Cursor) -> tuple[str | None, str]:
-                if c.kind in (cx.CursorKind.MEMBER_REF_EXPR, cx.CursorKind.MEMBER_REF):
-                    ref = c.referenced
-                    if ref is not None and ref.kind == cx.CursorKind.FIELD_DECL:
-                        return (ref.get_usr(), ref.spelling)
-                elif c.kind == cx.CursorKind.DECL_REF_EXPR:
-                    ref = c.referenced
-                    if ref is not None and ref.kind in (
-                        cx.CursorKind.VAR_DECL, cx.CursorKind.PARM_DECL,
-                    ):
-                        return (ref.get_usr(), ref.spelling)
-                # Recurse into UNEXPOSED_EXPR and other wrappers
-                for grandchild in c.get_children():
-                    result = _walk(grandchild)
-                    if result[0] is not None:
-                        return result
-                return (None, "")
-
-            return _walk(expr_cursor)
-
-        # --- Helper: emit "indirect" refs for function pointers in expression children ---
-        # Shared by CALL_EXPR (callback arguments), BINARY_OPERATOR
-        # (assignments), VAR_DECL (initializers), and INIT_LIST_EXPR
-        # (struct/array init).  The recursive walk is handled by
-        # _find_fn_refs_in_expr; this helper only iterates the top-level
-        # children of *expr_cursor* and emits References.
-        #
-        # When *lhs_usr* / *lhs_name* are provided (from a BINARY_OPERATOR,
-        # VAR_DECL, or INIT_LIST_EXPR LHS), also emits FnPointerAssignment
-        # records to enable Phase 3 linking of assignment sites to call sites.
-        def _emit_fn_ptr_targets(
-            expr_cursor: cx.Cursor,
-            caller_usr: str | None,
-            skip_usr: str | None = None,
-            lhs_usr: str | None = None,
-            lhs_name: str = "",
-            method: str = "assignment",
-        ) -> None:
-            loc = expr_cursor.location
-            if not loc.file or not _in_roots(loc.file.name) or not _not_excluded(loc.file.name):
-                return
-            for child in expr_cursor.get_children():
-                targets = _find_fn_refs_in_expr(child, _in_roots, _not_excluded, skip_usr)
-                for target in targets:
-                    target_usr = target.get_usr()
-                    if not target_usr:
-                        continue
-                    if target_usr == skip_usr:
-                        continue
-                    target_loc = target.location
-                    if target_loc.file and _in_roots(target_loc.file.name) and _not_excluded(target_loc.file.name):
-                        key = (target_usr, loc.file.name, loc.line, caller_usr, "indirect")
-                        if key not in seen_ref:
-                            seen_ref.add(key)
-                            refs.append(Reference(
-                                to_usr=target_usr,
-                                from_file=loc.file.name,
-                                from_line=loc.line,
-                                from_usr=caller_usr,
-                                ref_kind="indirect",
-                            ))
-                        # Phase 3: emit FnPointerAssignment when we have LHS info
-                        if lhs_usr and lhs_usr != target_usr:
-                            try:
-                                _fp_type = child.type.spelling
-                            except Exception:
-                                _fp_type = ""
-                            fp_assignments.append(FnPointerAssignment(
-                                from_file=loc.file.name,
-                                from_line=loc.line,
-                                lhs_usr=lhs_usr,
-                                lhs_name=lhs_name,
-                                rhs_usr=target_usr,
-                                rhs_name=target.spelling,
-                                fn_ptr_type=_fp_type,
-                                method=method,
-                                from_usr=caller_usr,
-                            ))
 
         # --- Indirect calls: function pointers passed as arguments ---
         # e.g. callback(&Class::method, this), Thread::start(callback(...)),

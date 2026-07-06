@@ -256,7 +256,39 @@ def normalize_args(
     if target:
         result = [f"--target={target}"] + result
 
-    return result
+    # Resolve relative -I paths to absolute (libclang uses process CWD, not
+    # compile_commands.json directory, so -I. would resolve to wrong location).
+    _INC_FLAGS = frozenset({"-I", "-isystem", "-idirafter", "-iquote", "-imacros"})
+    resolved: list[str] = []
+    skip_next = False
+    for token in result:
+        if skip_next:
+            skip_next = False
+            if not Path(token).is_absolute():
+                token = str((cwd / token).resolve())
+            resolved.append(token)
+            continue
+        if token in _INC_FLAGS:
+            resolved.append(token)
+            skip_next = True
+        elif token.startswith("-I"):
+            path = token[2:]
+            if path and not Path(path).is_absolute():
+                path = str((cwd / path).resolve())
+            resolved.append(f"-I{path}")
+        elif any(token.startswith(f) for f in ("-isystem", "-idirafter", "-iquote", "-imacros")):
+            # Attached form: -isystem/path
+            for f in ("-isystem", "-idirafter", "-iquote", "-imacros"):
+                if token.startswith(f):
+                    path = token[len(f):]
+                    if path and not Path(path).is_absolute():
+                        path = str((cwd / path).resolve())
+                    resolved.append(f"{f}{path}")
+                    break
+        else:
+            resolved.append(token)
+
+    return resolved
 
 
 def _safe_iterdir(path: Path) -> list[Path]:

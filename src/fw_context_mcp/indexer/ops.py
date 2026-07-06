@@ -8,6 +8,7 @@ same code path.
 from __future__ import annotations
 
 import logging
+import time
 from pathlib import Path
 
 from fw_context_mcp.indexer.db import (
@@ -86,6 +87,9 @@ def _build_filtered_file_content(
     if remaining == 0:
         return 0
 
+    import time as _time
+    _t0 = _time.monotonic()
+
     from clang import cindex as cx
 
     from fw_context_mcp.indexer.symbols import _get_index
@@ -161,7 +165,7 @@ def _build_filtered_file_content(
         filled += 1
 
     if filled:
-        log.info("content fill: %d files from TU %s", filled, unit.file.name)
+        log.info("content fill: %d files from TU %s in %.1fs", filled, unit.file.name, _time.monotonic() - _t0)
     return filled
 
 
@@ -522,6 +526,7 @@ def store_symbols_for_unit(
         insert_inheritance_batch(conn, inheritance_rows)
 
     # Macros
+    _t_macros = time.monotonic()
     if macros:
         macro_rows: list[tuple] = []
         for m in macros:
@@ -547,8 +552,14 @@ def store_symbols_for_unit(
             ))
         if macro_rows:
             insert_macros_batch(conn, macro_rows)
+    _t_macros = time.monotonic() - _t_macros
 
     # Fill files.content with ifdef-filtered content (tokenization pass)
+    _t_content = time.monotonic()
     _build_filtered_file_content(conn, unit, config_hash, project_root)
+    _t_content = time.monotonic() - _t_content
+
+    if _t_macros > 0.1 or _t_content > 0.1:
+        log.info("store_symbols_for_unit %s: macros=%.2fs content_fill=%.2fs", Path(file_path).name, _t_macros, _t_content)
 
     return syms_added, refs_added
