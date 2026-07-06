@@ -560,6 +560,6 @@ def store_symbols_for_unit(
     _t_content = time.monotonic() - _t_content
 
     if _t_macros > 0.1 or _t_content > 0.1:
-        log.info("store_symbols_for_unit %s: macros=%.2fs content_fill=%.2fs", Path(file_path).name, _t_macros, _t_content)
+        log.debug("store_symbols_for_unit %s: macros=%.2fs content_fill=%.2fs", Path(file_path).name, _t_macros, _t_content)
 
     return syms_added, refs_added

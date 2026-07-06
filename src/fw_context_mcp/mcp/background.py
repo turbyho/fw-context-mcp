@@ -207,11 +207,20 @@ def _request_bg_reindex_pause(root: Path) -> None:
 
 # ── _resume_bg_reindex (was at server.py:430) ──
 def _resume_bg_reindex(root: Path) -> None:
-    """Remove the pause marker — the bg reindex may now resume."""
+    """Remove the pause marker — the bg reindex may now resume.
+
+    Only removes the marker when it was written by this process.
+    A concurrent caller (e.g. ``fw-context index --force``) may have
+    overwritten the marker with its own PID — in that case the marker
+    must stay so the bg reindex remains paused for that caller.
+    """
     db_path = _db_path(root)
     pause_file = db_path.parent / "reindex.pause"
     try:
-        pause_file.unlink(missing_ok=True)
+        if pause_file.exists():
+            content = pause_file.read_text(encoding="utf-8").strip()
+            if content == str(os.getpid()):
+                pause_file.unlink(missing_ok=True)
     except OSError:
         pass
 

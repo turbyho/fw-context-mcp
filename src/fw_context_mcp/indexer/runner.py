@@ -986,7 +986,52 @@ def _build_hotspot_cache(conn, config_hash: str) -> None:
     log.info("Hotspot cache stored: %d entries", cnt)
 
 
-def _process_unit(unit, config_hash, project_root, source_roots, exclude_paths, index_refs, db_path, existing_files, lock=None, conn=None, force=False):
+def _check_and_parse_unit(unit, config_hash, project_root, source_roots, exclude_paths, index_refs, existing_files, force=False):
+    """Check whether *unit* needs re-parsing and parse it if so.
+
+    Does NOT write to the database — the caller is responsible for
+    acquiring ``write_lock`` and calling ``_process_unit(pre_parsed=...)``
+    to persist the result.
+
+    Returns:
+        * ``("unchanged", None, None)`` — mtime matched, no re-parse needed.
+        * ``("skipped", None, None)`` — excluded path or parse failed.
+        * ``("updated", parsed, (t_start, t_end))`` — parsed successfully,
+          ready for ``_process_unit(pre_parsed=parsed, parse_timing=...)``.
+    """
+    resolved_tu = unit.file.resolve()
+    if any(resolved_tu == ep or resolved_tu.is_relative_to(ep) for ep in exclude_paths):
+        return ("unchanged", None, None)
+
+    file_path = str(unit.file)
+    force_refs = force or os.environ.get("FW_CONTEXT_FORCE_REFINDEX") == "1"
+    if not force_refs and file_path in existing_files:
+        _, stored_mtime = existing_files[file_path]
+        try:
+            current_mtime = unit.file.stat().st_mtime if unit.file.exists() else 0.0
+        except OSError:
+            current_mtime = 0.0
+        if current_mtime <= stored_mtime + MTIME_TOLERANCE_S:
+            return ("unchanged", None, None)
+
+    from .symbols import extract_all
+
+    t_parse_start = time.monotonic()
+    try:
+        parsed = extract_all(
+            unit,
+            source_roots=source_roots,
+            exclude_paths=exclude_paths,
+            with_refs=index_refs,
+        )
+    except Exception as exc:
+        log.warning("skip TU %s: %s", unit.file.name, exc)
+        return ("skipped", None, None)
+    t_parse_end = time.monotonic()
+    return ("updated", parsed, (t_parse_start, t_parse_end))
+
+
+def _process_unit(unit, config_hash, project_root, source_roots, exclude_paths, index_refs, db_path, existing_files, lock=None, conn=None, force=False, pre_parsed=None, parse_timing=(0.0, 0.0)):
     """Process one translation unit: check staleness, parse, store.
 
     Opens its own DB connection when *conn* is ``None``, otherwise reuses
@@ -995,6 +1040,11 @@ def _process_unit(unit, config_hash, project_root, source_roots, exclude_paths, 
     Serializes DB writes via *lock* when supplied (``threading.Lock`` for
     intra-process synchronization).  When *lock* is ``None``, the caller
     is responsible for serialisation (sequential path with fcntl wrap).
+
+    When *pre_parsed* is not ``None``, the staleness check and libclang
+    parsing are skipped — the caller already performed them and the lock
+    is only held for the DB write.  *parse_timing* provides the
+    ``(t_start, t_end)`` values for the summary statistics.
 
     Args:
         unit: The ``CompilationUnit`` to parse (file path + clang flags).
@@ -1014,6 +1064,13 @@ def _process_unit(unit, config_hash, project_root, source_roots, exclude_paths, 
             caller manages its lifecycle (open once per worker thread,
             close after all TUs).  When ``None``, a connection is opened
             and closed for this call.
+        pre_parsed: When not ``None``, the result of ``extract_all()``
+            from a prior parse.  Staleness check, parse, and exception
+            handling on the parsing step are skipped — the caller already
+            decided the TU needs storing.
+        parse_timing: ``(t_start, t_end)`` tuple from the caller's
+            ``time.monotonic()`` measurements around the parse step.
+            Ignored when *pre_parsed* is ``None``.
 
     Returns:
         A tuple ``(status, symbols_added, refs_added)`` where ``status`` is
@@ -1025,33 +1082,38 @@ def _process_unit(unit, config_hash, project_root, source_roots, exclude_paths, 
     if any(resolved_tu == ep or resolved_tu.is_relative_to(ep) for ep in exclude_paths):
         return ("unchanged", 0, 0, (0.0, 0.0, 0.0))
 
-    file_path = str(unit.file)
-    force_refs = force or os.environ.get("FW_CONTEXT_FORCE_REFINDEX") == "1"
-    if not force_refs and file_path in existing_files:
-        _, stored_mtime = existing_files[file_path]
+    if pre_parsed is not None:
+        parsed = pre_parsed
+        t_parse_start = parse_timing[0]
+        t_parse_end = parse_timing[1]
+    else:
+        file_path = str(unit.file)
+        force_refs = force or os.environ.get("FW_CONTEXT_FORCE_REFINDEX") == "1"
+        if not force_refs and file_path in existing_files:
+            _, stored_mtime = existing_files[file_path]
+            try:
+                current_mtime = unit.file.stat().st_mtime if unit.file.exists() else 0.0
+            except OSError:
+                current_mtime = 0.0
+            if current_mtime <= stored_mtime + MTIME_TOLERANCE_S:
+                return ("unchanged", 0, 0, (0.0, 0.0, 0.0))
+
+        # Parse with libclang outside any lock — this is the expensive
+        # CPU-bound step.  Only serialise DB writes, not parsing.
+        from .symbols import extract_all
+
+        t_parse_start = time.monotonic()
         try:
-            current_mtime = unit.file.stat().st_mtime if unit.file.exists() else 0.0
-        except OSError:
-            current_mtime = 0.0
-        if current_mtime <= stored_mtime + MTIME_TOLERANCE_S:
-            return ("unchanged", 0, 0, (0.0, 0.0, 0.0))
-
-    # Parse with libclang outside any lock — this is the expensive
-    # CPU-bound step.  Only serialise DB writes, not parsing.
-    from .symbols import extract_all
-
-    t_parse_start = time.monotonic()
-    try:
-        parsed = extract_all(
-            unit,
-            source_roots=source_roots,
-            exclude_paths=exclude_paths,
-            with_refs=index_refs,
-        )
-    except Exception as exc:
-        log.warning("skip TU %s: %s", unit.file.name, exc)
-        return ("skipped", 0, 0, (0.0, 0.0, 0.0))
-    t_parse_end = time.monotonic()
+            parsed = extract_all(
+                unit,
+                source_roots=source_roots,
+                exclude_paths=exclude_paths,
+                with_refs=index_refs,
+            )
+        except Exception as exc:
+            log.warning("skip TU %s: %s", unit.file.name, exc)
+            return ("skipped", 0, 0, (0.0, 0.0, 0.0))
+        t_parse_end = time.monotonic()
 
     # Resolve connection: persistent (callable → lazy open, don't close),
     # explicit, or own (open now, close after).
@@ -1233,8 +1295,14 @@ def run(
         The MCP server writes ``<pid>`` to ``reindex.pause`` before a manual
         ``reindex_file`` or ``reset_index``.  This function blocks until the
         pause is lifted or the requesting process dies (stale marker cleanup).
+
+        When the current process wrote the marker itself (e.g. ``fw-context
+        index --force`` was invoked from the CLI while a background reindex
+        is running), the marker is skipped so the foreground process does not
+        pause itself.
         """
         pause_file = db_path.parent / "reindex.pause"
+        our_pid = os.getpid()
         while True:
             if not pause_file.exists():
                 return
@@ -1246,6 +1314,10 @@ def run(
                     pause_file.unlink(missing_ok=True)
                 except OSError:
                     pass
+                return
+            # Never pause on our own marker — this process created it
+            # to signal the background reindex, not to block itself.
+            if requester_pid == our_pid:
                 return
             try:
                 os.kill(requester_pid, 0)
@@ -1262,16 +1334,44 @@ def run(
     # The lock is acquired and released for each translation unit so that
     # manual operations (reindex_file, reset_index) can interleave via
     # the pause marker mechanism instead of blocking for 60+ seconds.
+    #
+    # Libclang parsing runs OUTSIDE the write lock — a single TU can take
+    # seconds to minutes on large codebases (mbed-os, Zephyr).  Holding the
+    # lock during parsing starves other indexers (bg reindex, concurrent
+    # ``fw-context index --force``) and causes WriteLockTimeout errors.
     for i, unit in enumerate(units):
         _wait_if_paused()  # Check pause marker before each TU
+        fname = unit.file.name
+        processed = i + 1
+
+        # ── Phase 1: staleness check + libclang parse (no lock) ──
+        check_status, parsed_data, parse_timing = _check_and_parse_unit(
+            unit, config_hash, project_root,
+            source_roots, exclude_paths, index_refs, existing_files,
+            force=force,
+        )
+
+        if check_status == "unchanged":
+            unchanged += 1
+            # Fill ifdef-filtered file content via tokenization
+            # (skipped by store_symbols_for_unit since TU wasn't re-parsed)
+            with write_lock(db_path.parent, timeout=120.0):
+                content_filled += _build_filtered_file_content(conn, unit, config_hash, project_root)
+            log.info("[%d/%d] %s: unchanged", processed, len(units), fname)
+            continue
+
+        if check_status == "skipped":
+            skipped += 1
+            log.info("[%d/%d] %s: skipped", processed, len(units), fname)
+            continue
+
+        # ── Phase 2: DB store (inside lock) ──
         with write_lock(db_path.parent, timeout=120.0):
-            fname = unit.file.name
             status, syms, refs, timing = _process_unit(
                 unit, config_hash, project_root,
                 source_roots, exclude_paths, index_refs, db_path, existing_files,
-                force=force,
+                force=force, pre_parsed=parsed_data, parse_timing=parse_timing,
             )
-            processed = i + 1
             if status == "updated":
                 updated += 1
                 total_syms += syms
@@ -1283,13 +1383,7 @@ def run(
                     "[%d/%d] %s: %d syms, %d refs, %.1fs",
                     processed, len(units), fname, syms, refs, sum(timing),
                 )
-            elif status == "unchanged":
-                unchanged += 1
-                # Fill ifdef-filtered file content via tokenization
-                # (skipped by store_symbols_for_unit since TU wasn't re-parsed)
-                content_filled += _build_filtered_file_content(conn, unit, config_hash, project_root)
-                log.info("[%d/%d] %s: unchanged", processed, len(units), fname)
-            elif status == "skipped":
+            else:
                 skipped += 1
                 log.info("[%d/%d] %s: skipped", processed, len(units), fname)
 
