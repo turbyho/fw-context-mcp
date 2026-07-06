@@ -1073,6 +1073,57 @@ def cmd_cache_stats(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_cache_push(args: argparse.Namespace) -> int:
+    """Push all local cache entries to the remote cache server.
+
+    Uses ``--force`` by default (X-Cache-Overwrite) so newer local entries
+    replace older remote ones.  Progress is reported in batches.
+    """
+    from .config import load as load_config
+    from .utils import resolve_project_root
+    from fw_context_mcp.cache_client import get_local_cache_db, CacheClient
+
+    project_root = resolve_project_root(args.project) if hasattr(args, "project") else None
+    if not project_root:
+        print("error: --project required for remote cache push", file=sys.stderr)
+        return 1
+
+    cfg = load_config(project_root=project_root)
+    cs = cfg.cache_server
+    if not cs or not cs.url:
+        print("error: [cache_server] not configured", file=sys.stderr)
+        return 1
+
+    local_db = get_local_cache_db(readonly=True)
+    try:
+        rows = local_db.execute("SELECT content_hash, summary, inputs, outputs, model FROM llm_analysis_cache").fetchall()
+        total = len(rows)
+        if total == 0:
+            print("Local cache is empty — nothing to push.")
+            return 0
+
+        batch_size = args.batch or cs.batch_size
+        cc = CacheClient(url=cs.url, token=cs.token, force=True, batch_size=batch_size)
+        try:
+            pushed = 0
+            for i in range(0, total, batch_size):
+                chunk = rows[i:i + batch_size]
+                entries = [
+                    {"hash": r[0], "summary": r[1], "inputs": r[2], "outputs": r[3], "model": r[4]}
+                    for r in chunk
+                ]
+                n = cc.batch_put(entries)
+                pushed += n
+                print(f"  [{i + len(chunk)}/{total}] pushed {n} entries")
+            print(f"Done: {pushed}/{total} entries pushed to {cs.url}")
+        finally:
+            cc.close()
+    finally:
+        local_db.close()
+
+    return 0
+
+
 def cmd_cache_clear(args: argparse.Namespace) -> int:
     """Delete cache entries for one or both tiers."""
     from .config import derive_project_id
@@ -1231,6 +1282,11 @@ def main() -> None:
     p_cache_clear.add_argument("--all", action="store_true", help="Clear both local and remote")
     p_cache_clear.add_argument("-y", "--yes", action="store_true", help="Skip confirmation prompt")
     p_cache_clear.set_defaults(func=cmd_cache_clear)
+
+    p_cache_push = p_cache_sub.add_parser("push", help="Push all local cache entries to remote server")
+    p_cache_push.add_argument("--project", metavar="DIR", help="Project root for remote config (default: cwd)")
+    p_cache_push.add_argument("--batch", type=int, metavar="N", help="Batch size (default: from config, 100)")
+    p_cache_push.set_defaults(func=cmd_cache_push)
 
     p_version = sub.add_parser("version", help="Show version information")
     p_version.set_defaults(func=cmd_version)
