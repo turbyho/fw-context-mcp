@@ -258,9 +258,6 @@ mcp.tool()(search.lookup_symbol)
 mcp.tool()(search.search_code)
 mcp.tool()(search.search_bodies)
 mcp.tool()(search.search_content)
-# Deprecated aliases — remove after 2 releases
-mcp.tool()(search.search_source)
-mcp.tool()(search.search_files)
 mcp.tool()(search.semantic_search)
 mcp.tool()(search.smart_search)
 

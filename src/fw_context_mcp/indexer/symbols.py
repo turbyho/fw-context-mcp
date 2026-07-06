@@ -1349,7 +1349,7 @@ def extract_all(
                                     ref_kind="call",
                                 ))
                         else:
-                            _log.warning(
+                            _log.debug(
                                 "Token fallback: pattern %s.%s() at %s:%d – "
                                 "could not resolve method USR",
                                 field_name, method_name,
@@ -1424,7 +1424,7 @@ def extract_all(
                             ref_kind="call",
                         ))
                 else:
-                    _log.warning(
+                    _log.debug(
                         "Source-line fallback: pattern %s.%s() at %s:%d – "
                         "could not resolve method USR",
                         _field_name, _method_name, _tu_file, _lineno,
@@ -1432,7 +1432,7 @@ def extract_all(
 
     _t_total = _time.monotonic() - _t_start
     _t_refwalk = _t_total - _t_parse - _t_symwalk
-    _log.info(
+    _log.debug(
         "  parse=%.1fs symwalk=%.1fs refwalk=%.1fs syms=%d refs=%d macros=%d",
         _t_parse, _t_symwalk, _t_refwalk, len(symbols), len(refs), len(macros),
     )

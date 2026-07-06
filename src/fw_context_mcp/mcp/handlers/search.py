@@ -1003,28 +1003,3 @@ def search_content(
     except Exception as e:
         log.exception("search_content failed: %s", e)
         return [{"error": f"search_content failed: {e}"}]
-
-
-# ── Backward-compatible aliases (deprecated — remove after 2 releases) ──
-
-def search_source(
-    query: Annotated[str, Field(description="DEPRECATED — use search_bodies instead.")],
-    project_root: Annotated[str | None, Field(description="Project root.")] = None,
-    kind: Annotated[str | None, Field(description="Kind filter.")] = None,
-    limit: Annotated[int, Field(description="Max results.")] = 20,
-    project_only: Annotated[bool, Field(description="Project-only filter.")] = False,
-) -> list[dict]:
-    import warnings
-    warnings.warn("search_source is deprecated, use search_bodies instead", DeprecationWarning, stacklevel=2)
-    return search_bodies(query, project_root=project_root, kind=kind, limit=limit, project_only=project_only)
-
-
-def search_files(
-    query: Annotated[str, Field(description="DEPRECATED — use search_content instead.")],
-    project_root: Annotated[str | None, Field(description="Project root.")] = None,
-    limit: Annotated[int, Field(description="Max results.")] = 20,
-    project_only: Annotated[bool, Field(description="Project-only filter.")] = False,
-) -> list[dict]:
-    import warnings
-    warnings.warn("search_files is deprecated, use search_content instead", DeprecationWarning, stacklevel=2)
-    return search_content(query, project_root=project_root, limit=limit, project_only=project_only)

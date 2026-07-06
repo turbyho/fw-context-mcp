@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 import re
 import sys
 from datetime import UTC, datetime
@@ -109,30 +110,47 @@ def cmd_index(args: argparse.Namespace) -> int:
         from dataclasses import replace
         cs_config = replace(cs_config, force=True)
 
-    config_hash = run(
-        compile_commands=compile_commands,
-        db_path=db_path,
-        source_roots=source_roots,
-        exclude_paths=exclude_paths,
-        project_name=args.name or cfg.project.name,
-        index_refs=False if args.no_refs else cfg.index.index_refs,
-        index_embeddings=(
-            False if getattr(args, 'no_embeddings', False)
-            else getattr(args, 'embeddings', None) or cfg.index.index_embeddings
-        ),
-        analyze_symbols=(
-            False if getattr(args, 'no_analyze', False)
-            else getattr(args, 'analyze', False) or cfg.llm.analyze_symbols
-        ),
-        analyze_overrides=True,
-        project_root=project_root,
-        project_id=project_id,
-        llm_config=cfg.llm,
-        cache_server_config=cs_config,
-        force=args.force,
-    )
-    print(f"Indexed. config_hash={config_hash[:16]}…  db={db_path}")
-    return 0
+    # Pause background reindex so it releases the write lock.
+    # Without this, a concurrent bg reindex holds the lock and the
+    # foreground ``fw-context index`` times out after 120 s.
+    pause_file = db_path.parent / "reindex.pause"
+    try:
+        pause_file.write_text(str(os.getpid()), encoding="utf-8")
+    except OSError:
+        pass
+    try:
+        config_hash = run(
+            compile_commands=compile_commands,
+            db_path=db_path,
+            source_roots=source_roots,
+            exclude_paths=exclude_paths,
+            project_name=args.name or cfg.project.name,
+            index_refs=False if args.no_refs else cfg.index.index_refs,
+            index_embeddings=(
+                False if getattr(args, 'no_embeddings', False)
+                else getattr(args, 'embeddings', None) or cfg.index.index_embeddings
+            ),
+            analyze_symbols=(
+                False if getattr(args, 'no_analyze', False)
+                else getattr(args, 'analyze', False) or cfg.llm.analyze_symbols
+            ),
+            analyze_overrides=True,
+            project_root=project_root,
+            project_id=project_id,
+            llm_config=cfg.llm,
+            cache_server_config=cs_config,
+            force=args.force,
+        )
+        print(f"Indexed. config_hash={config_hash[:16]}…  db={db_path}")
+        return 0
+    finally:
+        try:
+            if pause_file.exists():
+                content = pause_file.read_text(encoding="utf-8").strip()
+                if content == str(os.getpid()):
+                    pause_file.unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 def cmd_search(args: argparse.Namespace) -> int:
