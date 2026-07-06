@@ -1038,8 +1038,8 @@ def cmd_cache_stats(args: argparse.Namespace) -> int:
 
     # Tier 1: local global cache
     if show_local:
-        stats = local_cache_stats()
-        print(f"Local cache (Tier 1): {stats['total_entries']} entries  ({stats['path']})")
+        local_stats = local_cache_stats()
+        print(f"Local cache (Tier 1): {local_stats['total_entries']} entries  ({local_stats['path']})")
 
     # Tier 2: remote cache
     if args.remote:
@@ -1048,7 +1048,23 @@ def cmd_cache_stats(args: argparse.Namespace) -> int:
             cs = cfg.cache_server
             if cs and cs.url:
                 token_preview = cs.token[:8] + "..." if cs.token else "n/a"
-                print(f"Remote cache (Tier 2): {cs.url} (token: {token_preview})")
+                from fw_context_mcp.cache_client import CacheClient
+                cc = CacheClient(url=cs.url, token=cs.token)
+                try:
+                    remote_stats = cc.stats()
+                finally:
+                    cc.close()
+                if remote_stats:
+                    print(f"Remote cache (Tier 2): {cs.url}")
+                    print(f"  Total entries: {remote_stats.get('total_entries', 0)}")
+                    if remote_stats.get("newest_entry"):
+                        print(f"  Newest entry:  {remote_stats['newest_entry']}")
+                    if remote_stats.get("models"):
+                        for model, cnt in sorted(remote_stats["models"].items()):
+                            print(f"  {model}: {cnt}")
+                else:
+                    print(f"Remote cache (Tier 2): {cs.url} (token: {token_preview})")
+                    print("  Server unreachable — check connectivity")
             else:
                 print("Remote cache (Tier 2): not configured (set [cache_server] in .fw-context/local.toml)")
         else:

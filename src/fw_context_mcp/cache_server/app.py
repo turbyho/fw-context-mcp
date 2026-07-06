@@ -126,6 +126,18 @@ def create_app(*, backend: Any = None) -> FastAPI:
         inserted = await request.app.state.backend.batch_put(entries, can_overwrite=overwrite)
         return {"inserted": inserted, "total": len(entries), "truncated": truncated}
 
+    @app.get("/cache/stats", response_model=None)
+    async def cache_stats(request: Request) -> dict[str, Any] | JSONResponse:
+        """Return cache statistics (total entries, models breakdown).
+
+        Requires ``can_read``.
+        """
+        error = require_can_read(request)
+        if error is not None:
+            return error
+
+        return await request.app.state.backend.cache_stats()
+
     @app.post("/cache/clear", response_model=None)
     async def cache_clear(request: Request, body: CacheClearRequest) -> dict[str, Any] | JSONResponse:
         """Delete cache entries by content hash.

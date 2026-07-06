@@ -263,6 +263,34 @@ class CacheClient:
 
         return 0
 
+    def stats(self) -> dict[str, Any] | None:
+        """Fetch cache statistics from the remote server.
+
+        Returns a dict with ``total_entries``, ``newest_entry``, ``oldest_entry``,
+        ``models`` breakdown, or ``None`` if the server is unreachable.
+        """
+        for attempt in range(_MAX_RETRIES):
+            try:
+                session = self._get_session()
+                resp = session.get("/cache/stats")
+                if resp.status_code == 200:
+                    return resp.json()
+                if resp.status_code in (401, 403):
+                    logger.warning("Cache server auth error (%d) on stats — check token", resp.status_code)
+                    return None
+                if attempt < _MAX_RETRIES - 1:
+                    wait = _RETRY_BACKOFF ** (attempt + 1)
+                    time.sleep(wait)
+                    continue
+            except Exception as e:
+                if attempt < _MAX_RETRIES - 1:
+                    wait = _RETRY_BACKOFF ** (attempt + 1)
+                    time.sleep(wait)
+                    continue
+                logger.warning("Cache server stats request failed: %s", e)
+
+        return None
+
     def clear_remote(self, hashes: list[str]) -> int:
         """Delete cache entries from the remote server by content hash.
 
