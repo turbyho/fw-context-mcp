@@ -214,6 +214,19 @@ table and sends them to the server's `POST /cache/clear` endpoint. Requires
 All clear operations are safe — cache entries are rebuilt automatically
 on the next `fw-context index --analyze` or `fw-context analyze`.
 
+### `fw-context cache push`
+
+Push all local cache entries to the remote cache server. Uses overwrite mode
+(``X-Cache-Overwrite``) by default — newer local entries replace older remote ones.
+
+```bash
+fw-context cache push                       # push all, batch size from config (100)
+fw-context cache push --batch 500           # larger batches for faster transfer
+```
+
+Requires ``[cache_server]`` configured with ``can_write`` and ``can_overwrite``
+permissions. Progress is reported in batches.
+
 ### `fw-context version`
 
 Show version information.

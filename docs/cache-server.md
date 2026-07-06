@@ -46,9 +46,20 @@ for symbols already cached.
 | Method | Path | Auth | Description |
 |--------|------|------|-------------|
 | `GET` | `/health` | none | Public health check |
+| `GET` | `/cache/stats` | `can_read` | Cache statistics (entries, models) |
 | `POST` | `/cache/batch` | `can_read` | Batch lookup by content hash |
 | `PUT` | `/cache/batch` | `can_write` | Batch write cache entries |
 | `POST` | `/cache/clear` | `can_write` | Delete entries by content hash |
+
+### GET /cache/stats
+
+Returns cache-wide statistics: total entries, newest/oldest timestamps,
+and per-model entry counts. Used by ``fw-context cache stats --remote``.
+
+```json
+→ {"total_entries": 13391, "newest_entry": "...", "oldest_entry": "...",
+   "models": {"qwen2.5-coder:14b": 13383, ...}}
+```
 
 ### POST /cache/clear
 
@@ -324,19 +335,29 @@ On `fw-context index --analyze`:
 ```bash
 # Show cache statistics
 fw-context cache stats                   # both tiers
-fw-context cache stats --remote          # Tier 2 only
+fw-context cache stats --remote          # Tier 2 only (queries server in real-time)
 
 # Clear cache
 fw-context cache clear                   # local cache only (Tier 1)
 fw-context cache clear --remote          # project's entries from server (Tier 2)
 fw-context cache clear --all             # both tiers
 fw-context cache clear --remote -y       # skip confirmation
+
+# Push local cache to remote server (with overwrite)
+fw-context cache push                    # push all, batch size 100
+fw-context cache push --batch 500        # larger batches for faster transfer
 ```
 
 The `--remote` flag reads all content hashes from the project's per-project
 `llm_analysis_cache` table and sends them to the server's `POST /cache/clear`
 endpoint. Only the current project's entries are deleted — entries shared
 with other projects remain on the server.
+
+`fw-context cache push` uploads ALL entries from the local global cache
+(``~/.fw-context/llm_cache.db``) to the remote server with overwrite enabled
+(``X-Cache-Overwrite: true``). This is useful for seeding a newly-deployed
+server or migrating cache between machines. Requires ``can_write`` and
+``can_overwrite`` on the token.
 
 ## Hardening (production)
 
