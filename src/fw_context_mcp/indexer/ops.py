@@ -294,9 +294,9 @@ def store_symbols_for_unit(
 
     syms_added = 0
     refs_added = 0
+    file_id_cache: dict[str, int] = {}
 
     if syms:
-        file_id_cache: dict[str, int] = {}
         # Pre-compute source_roots as strings for is_project checks
         source_root_strs = [str(r) for r in source_roots] if source_roots else []
         rows = []
