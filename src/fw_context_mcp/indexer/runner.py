@@ -1314,20 +1314,21 @@ def run(
         log.info("ifdef-filtered content: %d files filled", content_filled)
 
     # Resolve expanded macro values via clang -dM -E (opt-in, best-effort).
-    # Each TU's flags are used to preprocess — the compiler resolves
-    # #ifdef-conditional macros correctly for the build configuration.
-    if index_macros_expanded:
+    # All TUs in the same build share identical preprocessor flags (same
+    # config_hash), so clang -dM -E produces identical output regardless
+    # of which source file is passed.  One call is sufficient — running it
+    # per TU would re-parse all system headers N times for no benefit.
+    if index_macros_expanded and units:
         log.info("Resolving expanded macro values via clang -dM -E...")
         t_macro = time.monotonic()
         macro_updated = 0
-        for unit in units:
-            try:
-                from .macros import resolve_and_update
-                macro_updated += resolve_and_update(
-                    conn, config_hash, unit.clang_args, unit.file.resolve(),
-                )
-            except Exception:
-                continue  # best-effort per TU
+        try:
+            from .macros import resolve_and_update
+            macro_updated = resolve_and_update(
+                conn, config_hash, units[0].clang_args, units[0].file.resolve(),
+            )
+        except Exception:
+            pass  # best-effort
         if macro_updated:
             log.info(
                 "Macro expansion: %d values resolved in %.1fs",
