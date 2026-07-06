@@ -1117,7 +1117,11 @@ def _process_unit(unit, config_hash, project_root, source_roots, exclude_paths, 
 
     # Resolve connection: persistent (callable → lazy open, don't close),
     # explicit, or own (open now, close after).
-    if callable(conn):
+    # Must detect already-opened connections first — sqlite3/pysqlite3
+    # Connection objects became callable in Python 3.14 (conn("SQL") shortcut).
+    if hasattr(conn, "execute"):
+        own_conn = False       # caller-supplied, don't close
+    elif callable(conn):
         conn = conn()          # lazy thread-local — caller manages lifecycle
         own_conn = False
     elif conn is None:
@@ -1392,7 +1396,7 @@ def run(
             status, syms, refs, timing = _process_unit(
                 unit, config_hash, project_root,
                 source_roots, exclude_paths, index_refs, db_path, existing_files,
-                force=force, pre_parsed=parsed_data, parse_timing=parse_timing,
+                conn=conn, force=force, pre_parsed=parsed_data, parse_timing=parse_timing,
             )
             if status == "updated":
                 updated += 1
