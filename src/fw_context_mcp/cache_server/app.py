@@ -136,7 +136,12 @@ def create_app(*, backend: Any = None) -> FastAPI:
         if error is not None:
             return error
 
-        return await request.app.state.backend.cache_stats()
+        perms = getattr(request.state, "permissions", {})
+        stats = await request.app.state.backend.cache_stats()
+        stats["can_read"] = perms.get("can_read", False)
+        stats["can_write"] = perms.get("can_write", False)
+        stats["can_overwrite"] = perms.get("can_overwrite", False)
+        return stats
 
     @app.post("/cache/clear", response_model=None)
     async def cache_clear(request: Request, body: CacheClearRequest) -> dict[str, Any] | JSONResponse:

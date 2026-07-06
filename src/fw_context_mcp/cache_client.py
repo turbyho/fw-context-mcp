@@ -145,6 +145,43 @@ class CacheClient:
         self.batch_size = batch_size
         self._session: Any = None
         self._connected = False
+        self._can_write: bool | None = None
+        self._can_overwrite: bool | None = None
+
+    def _ensure_capabilities(self) -> None:
+        """Discover token permissions via ``stats()``, once per client.
+
+        Called lazily on the first write attempt.  When the client is
+        created from config where the token may be read-only, the first
+        ``batch_put`` / ``clear_remote`` triggers a ``stats()`` call to
+        discover ``can_write``.  Subsequent writes are silently skipped
+        when the token is read-only — no wasted network round-trips.
+        """
+        if self._can_write is None:
+            self.stats()
+
+    @classmethod
+    def from_config(cls, cfg: object) -> CacheClient | None:
+        """Create a CacheClient from a config object if cache_server URL is set.
+
+        Returns ``None`` when ``cache_server`` is not configured or the
+        URL is empty — no special config class dependency, works with
+        any config object that has a ``cache_server`` attribute.
+        """
+        from .config.settings import CacheServerConfig
+
+        cs: CacheServerConfig | None = getattr(cfg, "cache_server", None)
+        if cs is not None and cs.url:
+            try:
+                return cls(
+                    url=cs.url,
+                    token=cs.token,
+                    force=cs.force,
+                    batch_size=cs.batch_size,
+                )
+            except Exception:
+                return None
+        return None
 
     def _get_session(self) -> Any:
         """Lazy-init an httpx client with keep-alive."""
@@ -216,10 +253,18 @@ class CacheClient:
         Retries on transient errors.  With ``self.force=True``, sends the
         ``X-Cache-Overwrite`` header (requires ``can_overwrite`` on server).
 
+        When the token is known to be read-only (``_can_write is False``),
+        skips the write entirely and returns 0 — no network round-trip.
+
         Returns the number of entries inserted (best-effort — may be 0
-        if the server is unreachable).
+        if the server is unreachable or the token is read-only).
         """
         if not entries:
+            return 0
+
+        self._ensure_capabilities()
+        if self._can_write is False:
+            logger.debug("Skipping remote cache write — token is read-only (%d entries)", len(entries))
             return 0
 
         total_inserted = 0
@@ -248,7 +293,8 @@ class CacheClient:
                     data = resp.json()
                     return data.get("inserted", 0)
                 if resp.status_code in (401, 403):
-                    logger.warning("Cache server auth error (%d) on write — check token", resp.status_code)
+                    self._can_write = False
+                    logger.warning("Cache server auth error (%d) on write — token is read-only", resp.status_code)
                     return 0
                 if attempt < _MAX_RETRIES - 1:
                     wait = _RETRY_BACKOFF ** (attempt + 1)
@@ -267,14 +313,22 @@ class CacheClient:
         """Fetch cache statistics from the remote server.
 
         Returns a dict with ``total_entries``, ``newest_entry``, ``oldest_entry``,
-        ``models`` breakdown, or ``None`` if the server is unreachable.
+        ``models`` breakdown, plus ``can_read``, ``can_write``, ``can_overwrite``
+        from the server's token permission check.  Stores the write capability
+        internally so subsequent ``batch_put`` / ``clear_remote`` calls are
+        silently skipped when the token is read-only.
+
+        Returns ``None`` if the server is unreachable.
         """
         for attempt in range(_MAX_RETRIES):
             try:
                 session = self._get_session()
                 resp = session.get("/cache/stats")
                 if resp.status_code == 200:
-                    return resp.json()
+                    data = resp.json()
+                    self._can_write = data.get("can_write", False)
+                    self._can_overwrite = data.get("can_overwrite", False)
+                    return data
                 if resp.status_code in (401, 403):
                     logger.warning("Cache server auth error (%d) on stats — check token", resp.status_code)
                     return None
@@ -294,10 +348,15 @@ class CacheClient:
     def clear_remote(self, hashes: list[str]) -> int:
         """Delete cache entries from the remote server by content hash.
 
-        Retries on transient errors. Returns the number of entries deleted
-        (best-effort — may be 0 if the server is unreachable).
+        Retries on transient errors. When the token is known to be
+        read-only, skips the request entirely.
         """
         if not hashes:
+            return 0
+
+        self._ensure_capabilities()
+        if self._can_write is False:
+            logger.debug("Skipping remote cache clear — token is read-only (%d hashes)", len(hashes))
             return 0
 
         total_deleted = 0
@@ -316,7 +375,8 @@ class CacheClient:
                     data = resp.json()
                     return data.get("deleted", 0)
                 if resp.status_code in (401, 403):
-                    logger.warning("Cache server auth error (%d) on clear — check token", resp.status_code)
+                    self._can_write = False
+                    logger.warning("Cache server auth error (%d) on clear — token is read-only", resp.status_code)
                     return 0
                 if attempt < _MAX_RETRIES - 1:
                     wait = _RETRY_BACKOFF ** (attempt + 1)

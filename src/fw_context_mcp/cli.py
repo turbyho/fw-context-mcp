@@ -1257,7 +1257,25 @@ def cmd_cache_remote_init(args: argparse.Namespace) -> int:
 
             stats = auth_resp.json()
             total = stats.get("total_entries", 0)
+            can_read = stats.get("can_read", False)
+            can_write = stats.get("can_write", False)
+            can_overwrite = stats.get("can_overwrite", False)
+
             print(f"  Connected. Server has {total} cached entries.")
+            perms = []
+            if can_read:
+                perms.append("read")
+            if can_write:
+                perms.append("write")
+            if can_overwrite:
+                perms.append("overwrite")
+            perm_str = ", ".join(perms) if perms else "none"
+            print(f"  Token permissions: {perm_str}")
+
+            if not can_write:
+                print()
+                print("  NOTE: Your token is read-only. Remote cache push and clear")
+                print("  will be skipped. To write, use a read+write token instead.")
     except httpx.ConnectError:
         print(f"error: cannot connect to {url} — check the URL and network", file=sys.stderr)
         return 1
