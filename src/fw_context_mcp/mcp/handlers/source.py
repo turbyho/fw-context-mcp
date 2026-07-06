@@ -491,8 +491,11 @@ def get_symbol_context(
     display when the symbol is not found: returns kind="macro" with
     value and expanded_value (macros have no callers/callees).
 
-    For body-only use get_source (faster). For transitive call-graph exploration
-    use find_all_callers_recursive or find_callees_recursive.
+    Prefer this over get_source when you also need callers, callees, indirect
+    call sites, or LLM analysis — all returned in a single call. If you only
+    need the raw function body (no metadata), get_source is slightly faster.
+    For transitive call-graph exploration use find_all_callers_recursive or
+    find_callees_recursive.
 
     By default, SDK/vendor callers and callees are filtered out for clarity.
     Use ``project_only=False`` to see all callers/callees.
@@ -716,5 +719,5 @@ def get_symbol_context(
         result["overrides"] = overrides_info["overrides"]
         result["overridden_by"] = overrides_info["overridden_by"]
     if source:
-        result["source"] = source[:6000] if len(source) > 6000 else source
+        result["source"] = source[:8000] if len(source) > 8000 else source
     return result

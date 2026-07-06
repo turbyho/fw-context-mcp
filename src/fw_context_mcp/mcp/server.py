@@ -54,6 +54,8 @@ mcp = FastMCP(
         '• Symbols by concept/topic _________ → search_code (e.g. "interrupt handler")\n'
         '• Patterns in function BODIES ______ → search_bodies (e.g. "attach", "rise")\n'
         '• Patterns in full FILE content _____ → search_content (e.g. "extern C", "InterruptIn")\n'
+        "• Read function body + callers/callees → get_symbol_context (preferred) / get_source\n"
+        "• Function pointer assignments/calls _ → find_indirect_call_sites / find_indirect_targets\n"
         "• Natural-language question ________ → smart_search (slow, thorough)\n\n"
         "IMPORTANT: search_code searches symbol NAMES (what the code IS).\n"
         "search_bodies searches function BODIES (what the code DOES — inside {}).\n"
@@ -91,6 +93,8 @@ mcp = FastMCP(
         "• Use external tools for callbacks, ISRs → use find_references or\n"
         "  search_bodies(project_only=True)\n"
         "• Use file readers for function bodies → use get_source (libclang exact extents)\n"
+        "• Call get_source + find_callers separately → use get_symbol_context for body,\n"
+        "  callers, and callees in one call (fewer round-trips, richer data)\n"
         "• Run external search tools in parallel with fw-context\n"
         "• Give up on fw-context after one empty result → try simpler query or\n"
         "  different fw-context tool first\n"
@@ -101,7 +105,9 @@ mcp = FastMCP(
         "• Use generic review agents/skills for C/C++ code → use\n"
         "  fw-review skill (see REVIEW SKILL section below).\n\n"
         "AGENT LOOP: Check(get_active_build) → Find(search_code/lookup_symbol)\n"
-        "→ Read(get_source/get_symbol_context) → Trace(find_references/find_callers)\n"
+        "→ Read(get_symbol_context) ← preferred (body+callers+callees in one call).\n"
+        "  Fallback: get_source (body only).\n"
+        "→ Trace(find_references/find_callers) — skip if context already from get_symbol_context.\n"
         "→ For body patterns use search_bodies.\n"
         "→ DECISION after get_active_build():\n"
         '  • status="ready" or "reindexing" — fw-context is fully operational.\n'
@@ -111,22 +117,25 @@ mcp = FastMCP(
         "REVIEW WORKFLOW — when reviewing C/C++ code changes (per changed symbol):\n"
         "0. find_hotspots(project_only=True) — identify highest-impact functions FIRST.\n"
         "   Prioritize review of hotspots (20+ callers) over leaf functions.\n"
-        "1. lookup_symbol(exact=true) → verify symbol existence and new signature.\n"
-        "2. find_callers() → direct callers (upstream impact).\n"
-        '3. If find_callers returns empty → search_bodies("name") (fallback).\n'
-        "   Also try find_indirect_call_sites(field_name) and\n"
-        "   find_indirect_targets(field_name) — callbacks/function pointers.\n"
-        "4. find_all_callers_recursive() → transitive upstream impact (full call tree).\n"
-        "5. find_callees_recursive() → transitive downstream check.\n"
+        "1. get_symbol_context(name) — body + direct callers + callees + LLM analysis\n"
+        "   in one call. Replaces lookup_symbol + find_callers + find_callees_recursive.\n"
+        '2. If get_symbol_context callers are empty → search_bodies("name") and\n'
+        "   find_indirect_call_sites / find_indirect_targets (function pointers,\n"
+        "   callbacks, ISRs invisible to the call graph).\n"
+        "3. find_all_callers_recursive() → transitive upstream impact (full call tree).\n"
+        "4. find_callees_recursive() → transitive downstream check.\n"
         "   After a logic change, verify compatibility with everything this function\n"
         "   calls — arguments, init order, error paths may have changed.\n"
         '6. find_references("SymbolName") → all reads/writes/calls of changed types.\n'
         '7. search_content("PATTERN") → confirm removal of #define/#ifdef/board names.\n'
         "8. find_dead_code() → detect newly dead functions after removal.\n"
-        "9. For each search_bodies result set: scan ALL results — the 3rd match\n"
+        "9. trace_data_flow(type_name, to_symbol) → cross-module data dependencies.\n"
+        "   Use when a changed function produces or consumes typed data that flows\n"
+        '   through other modules. E.g. trace_data_flow("SlotPin", "InventoryWriter").\n'
+        "10. For each search_bodies result set: scan ALL results — the 3rd match\n"
         "   may reveal an implementation the diff didn't touch (e.g. duplicate CRC\n"
         "   in a private method).\n"
-        "10. When analyzing BOTH a diff AND fw-context results: diff shows SCOPE\n"
+        "11. When analyzing BOTH a diff AND fw-context results: diff shows SCOPE\n"
         "   (what changed), fw-context verifies CORRECTNESS in full project context.\n"
         "   ALWAYS verify diff discoveries recursively with fw-context.\n\n"
         "DIFF → FW-CONTEXT VERIFICATION RULE:\n"
@@ -137,6 +146,7 @@ mcp = FastMCP(
         '  • find_references("<symbol>") — all callers/readers, not just diff context\n'
         '  • search_bodies("<pattern>") — pattern consistency across entire codebase\n'
         "  • find_call_path / find_all_callers_recursive — cross-module impact\n"
+        '  • trace_data_flow("<type>", "<target>") — cross-module data dependencies\n'
         "  • find_dead_code / find_hotspots — structural effects of changes\n"
         "→ Do NOT draw conclusions from diff results alone — diff is for SCOPE\n"
         "  discovery, fw-context is for IMPACT verification. They complement each\n"

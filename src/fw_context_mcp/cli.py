@@ -982,6 +982,21 @@ def _register_mcp_cli(tool, mcp_bin: str) -> None:
             print(f"  [warn] {tool.name}: {msg}", file=sys.stderr)
 
 
+def _ensure_subagent_mcp_permission(data: dict, tool_id: str) -> bool:
+    """Ensure general subagent has fw-context MCP tool permissions (OpenCode)."""
+    if "agent" not in data:
+        data["agent"] = {}
+    if "general" not in data["agent"]:
+        data["agent"]["general"] = {}
+    if "permission" not in data["agent"]["general"]:
+        data["agent"]["general"]["permission"] = {}
+    general_perm = data["agent"]["general"]["permission"]
+    if "mcp__fw-context__*" not in general_perm:
+        general_perm["mcp__fw-context__*"] = "allow"
+        return True
+    return False
+
+
 def _register_mcp_file(tool, mcp_bin: str, dry_run: bool = False) -> None:
     """Register fw-context as an MCP server by editing a JSON config file.
 
@@ -989,6 +1004,7 @@ def _register_mcp_file(tool, mcp_bin: str, dry_run: bool = False) -> None:
     rather than exposing a CLI command (e.g. OpenCode's ``opencode.json``).
     Preserves existing file structure (schema, other MCP servers, etc.)
     and marks fw-context as ``enabled: true`` with ``type: local``.
+    Also ensures the general subagent has fw-context MCP tool permissions.
     """
     import json
     import os
@@ -1011,8 +1027,18 @@ def _register_mcp_file(tool, mcp_bin: str, dry_run: bool = False) -> None:
     key = tool.mcp_config_key or "fw-context"
 
     existing = mcp_servers.get(key)
-    if isinstance(existing, dict) and existing.get("command") == [mcp_bin]:
-        print(f"  [ok] {tool.name}: fw-context already registered")
+    mcp_already_registered = isinstance(existing, dict) and existing.get("command") == [mcp_bin]
+
+    # Always ensure subagent permissions, even if MCP is already registered
+    perm_added = _ensure_subagent_mcp_permission(data, tool.id)
+
+    if mcp_already_registered:
+        if perm_added:
+            config_path.parent.mkdir(parents=True, exist_ok=True)
+            config_path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+            print(f"  [ok] {tool.name}: fw-context already registered, added general subagent permission")
+        else:
+            print(f"  [ok] {tool.name}: fw-context already registered")
         return
 
     if dry_run:
@@ -1020,6 +1046,8 @@ def _register_mcp_file(tool, mcp_bin: str, dry_run: bool = False) -> None:
             print(f"  [dry-run] {tool.name}: {config_path}: would UPDATE fw-context → {mcp_bin}")
         else:
             print(f"  [dry-run] {tool.name}: {config_path}: would ADD fw-context → {mcp_bin}")
+        if not mcp_already_registered or perm_added:
+            print(f"  [dry-run] {tool.name}: would ensure general subagent fw-context permission")
         return
 
     mcp_servers[key] = {
