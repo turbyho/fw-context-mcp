@@ -182,7 +182,10 @@ Configure with `[llm] analyze_symbols`, `[llm] analysis_model`, and
 
 ### `fw-context cache stats`
 
-Show cache statistics for one or both tiers.
+Show cache statistics for one or both tiers. The ``--remote`` flag queries
+the server in real-time and shows a per-model breakdown with percentages.
+When run inside a project directory with an existing index, it also shows
+how many of that project's symbols are cached on the server.
 
 ```bash
 fw-context cache stats                    # both tiers
@@ -191,8 +194,20 @@ fw-context cache stats --remote           # Tier 2 only (remote server)
 
 Output:
 ```
-Local cache (Tier 1): 11831 entries  (/home/user/.fw-context/llm_cache.db)
-Remote cache (Tier 2): https://fw-cache.example.com (token: abcd1234...)
+$ fw-context cache stats --remote
+Remote cache (Tier 2): https://fw-cache.montyho.com
+  Total entries: 14486
+  Newest entry:  2026-07-06 11:32:23
+  Models:
+    qwen2.5-coder:14b: 14476 (100%)
+  Project cache: 3138/3138 cached (452361ffbf84f774)
+
+$ fw-context cache stats
+Local cache (Tier 1): 3160 entries  (/home/user/.fw-context/llm_cache.db)
+Remote cache (Tier 2): https://fw-cache.montyho.com
+  Total entries: 14486
+  ...
+  Project cache: 3138/3138 cached (452361ffbf84f774)
 ```
 
 ### `fw-context cache clear`
