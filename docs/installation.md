@@ -217,21 +217,55 @@ num_ctx      = 16384
 ## AI assistant setup
 
 ```bash
-fw-context init                    # all detected assistants
+fw-context init                    # detect & configure current project (default)
 fw-context init --list-tools       # show what's supported and detected
 fw-context init --dry-run          # preview without writing
 fw-context init --tool claude-code # specific tool only
+fw-context init --scope global     # global install (all projects)
+fw-context init --scope all        # both global and project
 ```
 
 **What `fw-context init` does:**
 
-| Tool | Action |
-|------|--------|
-| **Claude Code** | Registers MCP server (`claude mcp add`), injects instructions into `~/.claude/CLAUDE.md` |
-| **OpenCode** | Writes `~/.config/opencode/rules/fw-context.md` |
-| **Kilo Code** | Inherits from Claude Code automatically |
-| **Codex** | Writes `~/.codex/rules/fw-context.md` |
-| **Cursor** | Writes `.cursor/rules/fw-context.mdc` (project-scoped) |
+By default (`--scope project`), it configures ONLY the current project:
+
+| Tool | Detection | Action |
+|------|-----------|--------|
+| **Claude Code** | `.claude/` dir in project | Injects `<!-- fw-context -->` into `CLAUDE.md`, installs agents (`code-explorer`, `general-purpose`), installs `fw-context-embedded-review` skill |
+| **OpenCode** | `.opencode/` dir in project | Writes rules file, installs skill |
+| **Codex** | `.codex/` dir in project | Writes rules file |
+| **Cursor** | `.cursor/` dir in project | Writes `.cursor/rules/fw-context.mdc` |
+| **Kilo Code** | Inherits from Claude Code | No separate action needed |
+
+**Project agents:** Two agent definitions are created in `.claude/agents/`:
+- `code-explorer` — includes a `CRITICAL — C/C++ source access` block that
+  enforces fw-context for all C/C++ code reading
+- `general-purpose` — same enforcement for any general task that touches
+  C/C++ source
+
+For existing agents, the CRITICAL block is injected without touching the
+rest of the file — custom domain knowledge is preserved.
+
+**Project skill:** The `fw-context-embedded-review` skill is installed in
+the project's `.claude/skills/` directory alongside the global copy.
+
+**If no AI tool is detected in the project** (no `.claude/`, `.opencode/`,
+etc. directory), `fw-context init` prints instructions instead of falling
+back to a global install:
+
+```
+No AI assistant detected in this project.
+
+Run an AI assistant (Claude Code, OpenCode, etc.) in this project
+directory first — it will create its config directory. Then re-run
+'fw-context init'.
+
+Alternatively, use --scope global to install fw-context for all
+projects, or --tool to target a specific assistant.
+```
+
+**Global install** (`--scope global` or `--scope all`) is still available
+and works as before — injects instructions into `~/.claude/CLAUDE.md` etc.
 
 The command is **idempotent** — safe to re-run after updates.
 Collision detection warns before overwriting existing content.

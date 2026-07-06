@@ -109,6 +109,7 @@ def cmd_index(args: argparse.Namespace) -> int:
 
         # Warn if compile_commands.json looks incomplete
         from .indexer.build import check_completeness
+
         for warning in check_completeness(compile_commands, project_root):
             print(f"warning: {warning}", file=sys.stderr)
     else:
@@ -140,8 +141,9 @@ def cmd_index(args: argparse.Namespace) -> int:
 
     # Override force flag from CLI
     cs_config = cfg.cache_server
-    if cs_config is not None and getattr(args, 'force', False):
+    if cs_config is not None and getattr(args, "force", False):
         from dataclasses import replace
+
         cs_config = replace(cs_config, force=True)
 
     # Pause background reindex so it releases the write lock.
@@ -161,12 +163,14 @@ def cmd_index(args: argparse.Namespace) -> int:
             project_name=args.name or cfg.project.name,
             index_refs=False if args.no_refs else cfg.index.index_refs,
             index_embeddings=(
-                False if getattr(args, 'no_embeddings', False)
-                else getattr(args, 'embeddings', None) or cfg.index.index_embeddings
+                False
+                if getattr(args, "no_embeddings", False)
+                else getattr(args, "embeddings", None) or cfg.index.index_embeddings
             ),
             analyze_symbols=(
-                False if getattr(args, 'no_analyze', False)
-                else getattr(args, 'analyze', False) or cfg.llm.analyze_symbols
+                False
+                if getattr(args, "no_analyze", False)
+                else getattr(args, "analyze", False) or cfg.llm.analyze_symbols
             ),
             analyze_overrides=True,
             project_root=project_root,
@@ -333,12 +337,8 @@ def cmd_status(args: argparse.Namespace) -> int:
         print("No build config indexed.")
         return 1
 
-    sym_count = conn.execute(
-        "SELECT COUNT(*) FROM symbols WHERE config_hash=?", (active["config_hash"],)
-    ).fetchone()[0]
-    file_count = conn.execute(
-        "SELECT COUNT(*) FROM files WHERE config_hash=?", (active["config_hash"],)
-    ).fetchone()[0]
+    sym_count = conn.execute("SELECT COUNT(*) FROM symbols WHERE config_hash=?", (active["config_hash"],)).fetchone()[0]
+    file_count = conn.execute("SELECT COUNT(*) FROM files WHERE config_hash=?", (active["config_hash"],)).fetchone()[0]
 
     stale = _cli_is_stale(active)
 
@@ -359,6 +359,7 @@ def _cli_is_stale(row) -> bool:
     import os
 
     from .utils import MTIME_TOLERANCE_S as _MTS
+
     try:
         cc = row["compile_commands_path"]
         if not cc or not Path(cc).exists():
@@ -368,6 +369,168 @@ def _cli_is_stale(row) -> bool:
         return cc_mtime > indexed_at.timestamp() + _MTS
     except Exception:
         return False
+
+
+def _install_skills(
+    dry_run: bool = False,
+    project_root: Path | None = None,
+    scope: str = "project",
+) -> bool:
+    """Copy fw-context skills to AI tool skills directories.
+
+    Installs the fw-context-embedded-review skill globally (when scope is
+    ``"global"`` or ``"all"``) and at the project level (when scope is
+    ``"project"`` or ``"all"``, and ``project_root`` is provided).
+
+    Project-local skills override global ones — if a project has its
+    own copy the user intentionally customized it.
+    """
+    import shutil
+
+    from . import __file__ as _pkg_init
+
+    pkg_dir = Path(_pkg_init).parent
+    skill_dir = pkg_dir / "data" / "skills" / "fw-context-embedded-review"
+
+    if not (skill_dir / "SKILL.md").exists():
+        return False
+
+    targets: list[Path] = []
+
+    # Global targets
+    if scope in ("global", "all"):
+        targets.extend([
+            Path.home() / ".config" / "opencode" / "skills" / "fw-context-embedded-review",
+            Path.home() / ".claude" / "skills" / "fw-context-embedded-review",
+            Path.home() / ".agents" / "skills" / "fw-context-embedded-review",
+        ])
+
+    # Project-level targets
+    if project_root is not None and scope in ("project", "all"):
+        targets.extend([
+            project_root / ".claude" / "skills" / "fw-context-embedded-review",
+            project_root / ".opencode" / "skills" / "fw-context-embedded-review",
+            project_root / ".agents" / "skills" / "fw-context-embedded-review",
+        ])
+
+    installed = False
+    for target in targets:
+        if target.exists():
+            # Check if source is newer — reinstall when skill was updated
+            try:
+                src_mtime = (skill_dir / "SKILL.md").stat().st_mtime
+                dst_mtime = (target / "SKILL.md").stat().st_mtime
+                if src_mtime <= dst_mtime:
+                    if not dry_run:
+                        print(f"  [skip] Skill already up-to-date: {target}")
+                    continue
+            except OSError:
+                pass
+            if not dry_run:
+                print(f"  [update] Updating skill: {target}")
+        if dry_run:
+            print(f"  [dry-run] Would install skill to {target}")
+            installed = True
+            continue
+
+        target.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(skill_dir / "SKILL.md", target / "SKILL.md")
+        print(f"  [ok] Skill installed: {target / 'SKILL.md'}")
+        installed = True
+
+    return installed
+
+
+# Per-tool project directory indicators — checked by _detect_project_ai_tools
+_PROJECT_TOOL_DIRS: dict[str, list[str]] = {
+    "claude-code": [".claude"],
+    "opencode": [".opencode"],
+    "codex": [".codex"],
+    "cursor": [".cursor"],
+}
+
+
+def _detect_project_ai_tools(project_root: Path) -> list[str]:
+    """Return AI tool IDs detected in the project directory."""
+    found: list[str] = []
+    for tool_id, dirs in _PROJECT_TOOL_DIRS.items():
+        for d in dirs:
+            if (project_root / d).is_dir():
+                found.append(tool_id)
+                break
+    return found
+
+
+def _install_agents(dry_run: bool = False, project_root: Path | None = None, scope: str = "project") -> bool:
+    """Ensure project agents have fw-context CRITICAL block.
+
+    Copies agent templates from ``data/agents/`` into AI tool agent
+    directories.  For agents that already exist, injects the CRITICAL
+    block via ``_inject_agent_section`` instead of overwriting the whole
+    file — this preserves any project-specific domain knowledge.
+
+    For Claude Code the template is used as-is (``name:`` in frontmatter
+    determines the agent name).  For OpenCode the ``name:`` field is
+    stripped — OpenCode derives the agent name from the filename.
+    """
+    import re
+
+    from . import __file__ as _pkg_init
+    from .config.tools import AGENT_CRITICAL_BLOCK
+
+    pkg_dir = Path(_pkg_init).parent
+    agents_src = pkg_dir / "data" / "agents"
+
+    if not agents_src.is_dir():
+        return False
+
+    templates = sorted(agents_src.glob("*.md"))
+    if not templates:
+        return False
+
+    # Build target directories keyed by tool_id so we know which
+    # post-processing to apply (OpenCode strips the name: field).
+    targets: list[tuple[Path, str]] = []  # (dir, tool_id)
+
+    if scope in ("global", "all"):
+        targets.append((Path.home() / ".claude" / "agents", "claude-code"))
+        targets.append((Path.home() / ".config" / "opencode" / "agents", "opencode"))
+        targets.append((Path.home() / ".agents" / "agents", "opencode"))
+
+    if project_root is not None and scope in ("project", "all"):
+        targets.append((project_root / ".claude" / "agents", "claude-code"))
+        targets.append((project_root / ".opencode" / "agents", "opencode"))
+        targets.append((project_root / ".agents" / "agents", "opencode"))
+
+    installed = False
+    for agents_dir, tool_id in targets:
+        for template_path in templates:
+            agent_path = agents_dir / template_path.name
+
+            if dry_run:
+                if agent_path.exists():
+                    print(f"  [dry-run] {agent_path}: would UPDATE fw-context section")
+                else:
+                    print(f"  [dry-run] {agent_path}: would CREATE with fw-context section")
+                installed = True
+                continue
+
+            if agent_path.exists():
+                _inject_agent_section(agent_path, AGENT_CRITICAL_BLOCK, "fw-context")
+                print(f"  [ok] {agent_path}: updated fw-context section")
+            else:
+                agents_dir.mkdir(parents=True, exist_ok=True)
+                template_text = template_path.read_text(encoding="utf-8")
+                if tool_id != "claude-code":
+                    # Non-Claude clients (OpenCode, .agents/ standard) derive
+                    # the agent name from the filename — strip the ``name:``
+                    # field which only Claude Code recognizes.
+                    template_text = re.sub(r"^name:.*\n", "", template_text, flags=re.MULTILINE)
+                agent_path.write_text(template_text, encoding="utf-8")
+                print(f"  [ok] {agent_path}: created with fw-context section")
+            installed = True
+
+    return installed
 
 
 def cmd_init(args: argparse.Namespace) -> int:
@@ -413,6 +576,8 @@ def cmd_init(args: argparse.Namespace) -> int:
         if dev_candidate.exists():
             mcp_bin = str(dev_candidate)
 
+    project_root = Path.cwd() if not args.project else Path(args.project).resolve()
+
     # Select tools to act on
     selected: list[str] = []
     if args.tool:
@@ -423,14 +588,34 @@ def cmd_init(args: argparse.Namespace) -> int:
                 print(f"        Supported: {', '.join(TOOLS.keys())}", file=sys.stderr)
                 return 1
     else:
-        # Default: all detected tools
-        selected = [tid for tid, t in TOOLS.items() if t.is_detected()]
+        # Detect tools based on scope
+        project_tools = _detect_project_ai_tools(project_root)
+        if args.scope == "project":
+            selected = project_tools
+        elif args.scope == "global":
+            selected = [tid for tid, t in TOOLS.items() if t.is_detected()]
+        else:  # all
+            global_tools = [tid for tid, t in TOOLS.items() if t.is_detected()]
+            seen: set[str] = set()
+            for tid in global_tools + project_tools:
+                if tid not in seen:
+                    seen.add(tid)
+                    selected.append(tid)
 
     if not selected:
-        print("No AI assistants detected. Use --list-tools to see supported tools.")
+        if args.scope == "project":
+            print("No AI assistant detected in this project.")
+            print()
+            print("Run an AI assistant (Claude Code, OpenCode, etc.) in this project")
+            print("directory first — it will create its config directory. Then re-run")
+            print("'fw-context init'.")
+            print()
+            print("Alternatively, use --scope global to install fw-context for all")
+            print("projects, or --tool to target a specific assistant.")
+        else:
+            print("No AI assistants detected. Use --list-tools to see supported tools.")
         return 1
 
-    project_root = Path.cwd() if not args.project else Path(args.project).resolve()
     ok = False
     warnings: list[str] = []
 
@@ -472,9 +657,7 @@ def cmd_init(args: argparse.Namespace) -> int:
             continue
 
         for target in tool.targets:
-            if target.scope == "project" and args.scope == "global":
-                continue
-            if target.scope == "global" and args.scope == "project":
+            if args.scope != "all" and target.scope != args.scope:
                 continue
 
             collision = check_target(target, project_root if target.scope == "project" else None)
@@ -515,13 +698,17 @@ def cmd_init(args: argparse.Namespace) -> int:
                 print(f"  [ok] {resolved}: written")
             ok = True
 
-    # Project-level config (only when something was actually done)
-    if ok and not args.instructions_only and not args.dry_run:
-        proj_config = _ensure_project_config(project_root)
-        local_config = _ensure_project_local_config(project_root)
-        print(f"\n[ok] {proj_config}: shared project config ready — edit source_roots, excludes, etc. (commit to git)")
-        print(f"[ok] {local_config}: local developer config ready — edit ollama_url, model, etc. (gitignore)")
-        print("  Run 'fw-context project-init' to set up .gitignore and verify project configuration.")
+    # Project-level config and assets (skills, agents)
+    if ok and not args.dry_run:
+        if not args.instructions_only:
+            proj_config = _ensure_project_config(project_root)
+            local_config = _ensure_project_local_config(project_root)
+            print(f"\n[ok] {proj_config}: shared project config ready — edit source_roots, excludes, etc. (commit to git)")
+            print(f"[ok] {local_config}: local developer config ready — edit ollama_url, model, etc. (gitignore)")
+            print("  Run 'fw-context project-init' to set up .gitignore and verify project configuration.")
+            print()
+        _install_skills(dry_run=False, project_root=project_root, scope=args.scope)
+        _install_agents(dry_run=False, project_root=project_root, scope=args.scope)
 
     if warnings:
         print("\nWarnings:")
@@ -529,6 +716,8 @@ def cmd_init(args: argparse.Namespace) -> int:
             print(f"  ⚠ {w}")
     if ok:
         if args.dry_run:
+            _install_skills(dry_run=True, project_root=project_root, scope=args.scope)
+            _install_agents(dry_run=True, project_root=project_root, scope=args.scope)
             print("\nDry-run complete. Run without --dry-run to apply changes.")
         else:
             print("\nSetup complete. Restart your AI assistant to pick up changes.")
@@ -567,12 +756,16 @@ def cmd_project_init(args: argparse.Namespace) -> int:
 
     # ── 1. Config files ──
     _check_config_file(
-        project_root, ".fw-context/config.toml",
-        _PROJECT_DEFAULTS_TEMPLATE, fix,
+        project_root,
+        ".fw-context/config.toml",
+        _PROJECT_DEFAULTS_TEMPLATE,
+        fix,
     )
     _check_config_file(
-        project_root, ".fw-context/local.toml",
-        _PROJECT_LOCAL_DEFAULTS_TEMPLATE, fix,
+        project_root,
+        ".fw-context/local.toml",
+        _PROJECT_LOCAL_DEFAULTS_TEMPLATE,
+        fix,
     )
 
     # ── 2. .gitignore entries ──
@@ -580,6 +773,7 @@ def cmd_project_init(args: argparse.Namespace) -> int:
 
     # ── 3. Build system ──
     from .indexer.build import detect_build_system
+
     build_system = detect_build_system(project_root)
     if build_system:
         print(f"  [ok] build system: {build_system}")
@@ -594,6 +788,7 @@ def cmd_project_init(args: argparse.Namespace) -> int:
         cc = (project_root / cc).resolve()
     if cc.exists():
         from .indexer.build import check_completeness
+
         issues = list(check_completeness(cc, project_root))
         if issues:
             print(f"  [warn] {cc}:")
@@ -607,6 +802,7 @@ def cmd_project_init(args: argparse.Namespace) -> int:
     # ── 5. Index health ──
     from .config import derive_project_id
     from .indexer.db import get_active_config, open_db as db_open
+
     project_id = derive_project_id(project_root)
     db_path = cfg.index.db_dir / project_id / "index.db"
     if db_path.exists():
@@ -660,19 +856,20 @@ def _check_config_file(project_root: Path, rel_path: str, template: str, fix: bo
 
     # Parse template for option keys (lines like "# key = value" or "key = value")
     import re
+
     template_keys: set[str] = set()
     for line in template.splitlines():
         # Match both "# key = ..." and "key = ..." lines
-        m = re.match(r'^#?\s*(\w+)\s*=', line)
+        m = re.match(r"^#?\s*(\w+)\s*=", line)
         if m:
             template_keys.add(m.group(1))
 
     existing_text = path.read_text(encoding="utf-8")
     missing: list[str] = []
     for key in sorted(template_keys):
-        if not re.search(rf'^\s*#?\s*{key}\s*=', existing_text, re.MULTILINE):
+        if not re.search(rf"^\s*#?\s*{key}\s*=", existing_text, re.MULTILINE):
             # Also check if key appears under a [section] (TOML scoped)
-            if not re.search(rf'^\s*{key}\s*=', existing_text, re.MULTILINE):
+            if not re.search(rf"^\s*{key}\s*=", existing_text, re.MULTILINE):
                 missing.append(key)
 
     if missing:
@@ -680,7 +877,7 @@ def _check_config_file(project_root: Path, rel_path: str, template: str, fix: bo
             with path.open("a", encoding="utf-8") as f:
                 f.write("\n")
                 for line in template.splitlines():
-                    m = re.match(r'^#?\s*(\w+)\s*=', line)
+                    m = re.match(r"^#?\s*(\w+)\s*=", line)
                     if m and m.group(1) in missing:
                         f.write(line + "\n")
             print(f"  [fix] {path}: added {', '.join(missing)}")
@@ -734,6 +931,7 @@ def _ensure_gitignore(project_root: Path, *, fix: bool = False) -> None:
             print(f"  [fix] {gitignore}: added {', '.join(missing)}")
         except (OSError, PermissionError) as e:
             import logging
+
             logging.getLogger(__name__).warning("Could not update %s: %s", gitignore, e)
     else:
         print(f"  [info] {gitignore}: missing entries: {', '.join(missing)}")
@@ -845,16 +1043,12 @@ def _update_marked_section(path: Path, content: str, marker: str) -> None:
 
     if start_tag in existing and end_tag in existing:
         # Replace the existing marked block (keep markers for idempotency)
-        before = existing[:existing.index(start_tag)]
-        after = existing[existing.index(end_tag) + len(end_tag):]
-        updated = (
-            before.rstrip("\n") + "\n\n"
-            + start_tag + "\n" + content + "\n" + end_tag + "\n"
-            + after.lstrip("\n")
-        )
+        before = existing[: existing.index(start_tag)]
+        after = existing[existing.index(end_tag) + len(end_tag) :]
+        updated = before.rstrip("\n") + "\n\n" + start_tag + "\n" + content + "\n" + end_tag + "\n" + after.lstrip("\n")
     else:
         # Remove any unmarked section with the same heading (idempotency for manual installs)
-        heading_match = re.search(r'^## .+', content, re.MULTILINE)
+        heading_match = re.search(r"^## .+", content, re.MULTILINE)
         if heading_match:
             heading = heading_match.group()
             lines = existing.splitlines()
@@ -872,10 +1066,75 @@ def _update_marked_section(path: Path, content: str, marker: str) -> None:
                         result_lines.append(line)
             existing = "\n".join(result_lines)
         updated = (
-            existing.rstrip("\n") + ("\n\n" if existing.strip() else "")
-            + start_tag + "\n" + content + "\n" + end_tag + "\n"
+            existing.rstrip("\n")
+            + ("\n\n" if existing.strip() else "")
+            + start_tag
+            + "\n"
+            + content
+            + "\n"
+            + end_tag
+            + "\n"
         )
 
+    path.write_text(updated, encoding="utf-8")
+
+
+def _inject_agent_section(path: Path, content: str, marker: str) -> None:
+    """Insert or replace a ``<!-- marker --> ... <!-- /marker -->`` block in an agent markdown file.
+
+    Unlike ``_update_marked_section``, when no existing marker is found this
+    inserts the block right after the YAML frontmatter (``---`` delimiters)
+    so the CRITICAL instructions are the first thing the agent sees.
+    """
+    start_tag = f"<!-- {marker} -->"
+    end_tag = f"<!-- /{marker} -->"
+
+    existing = path.read_text(encoding="utf-8") if path.exists() else ""
+
+    if start_tag in existing and end_tag in existing:
+        # Replace the existing marked block (keep markers for idempotency)
+        before = existing[: existing.index(start_tag)]
+        after = existing[existing.index(end_tag) + len(end_tag):]
+        updated = before.rstrip("\n") + "\n\n" + start_tag + "\n" + content + "\n" + end_tag + "\n" + after.lstrip("\n")
+    else:
+        # Insert right after YAML frontmatter (after second "---").
+        # Only count --- delimiters that appear in the document preamble —
+        # once we pass the closing --- (or see non-YAML content before any
+        # opening ---), we stop looking.  This avoids false matches on ---
+        # inside fenced code blocks later in the file.
+        lines = existing.splitlines()
+        result_lines: list[str] = []
+        frontmatter_dashes = 0
+        in_preamble = True
+        inserted = False
+
+        for line in lines:
+            result_lines.append(line)
+            stripped = line.strip()
+            if not in_preamble:
+                continue
+            if stripped == "---":
+                frontmatter_dashes += 1
+                if frontmatter_dashes == 2 and not inserted:
+                    result_lines.append("")
+                    result_lines.append(start_tag)
+                    result_lines.append(content)
+                    result_lines.append(end_tag)
+                    inserted = True
+                    in_preamble = False
+            elif frontmatter_dashes == 0 and stripped:
+                # Non-blank, non---- line before opening --- → no frontmatter
+                in_preamble = False
+            # If frontmatter_dashes == 1 and stripped is non-blank, it's
+            # YAML keys inside the frontmatter — stay in_preamble.
+
+        if inserted:
+            updated = "\n".join(result_lines) + "\n"
+        else:
+            # No frontmatter found — prepend to file
+            updated = start_tag + "\n" + content + "\n" + end_tag + "\n\n" + existing
+
+    path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(updated, encoding="utf-8")
 
 
@@ -959,9 +1218,11 @@ def cmd_export(args: argparse.Namespace) -> int:
 
     if args.output:
         Path(args.output).write_text(json_text, encoding="utf-8")
-        print(f"Exported {output['symbol_count']} symbols"
-              f"{' + ' + str(output.get('reference_count', 0)) + ' references' if 'reference_count' in output else ''}"
-              f" → {args.output}")
+        print(
+            f"Exported {output['symbol_count']} symbols"
+            f"{' + ' + str(output.get('reference_count', 0)) + ' references' if 'reference_count' in output else ''}"
+            f" → {args.output}"
+        )
     else:
         print(json_text)
 
@@ -1020,12 +1281,14 @@ def cmd_analyze(args: argparse.Namespace) -> int:
     # Compute SDK exclude patterns for this project.
     # When analyze_vendor is True, analyze everything.
     from .indexer.runner import _detect_sdk_exclude_like
+
     if cfg.llm.analyze_vendor:
         exclude_like: list[str] = []
     else:
         exclude_paths = cfg.exclude_root_paths(project_root)
-        config_exclude_strs = [str(p.relative_to(project_root)) for p in exclude_paths
-                               if p.is_relative_to(project_root)]
+        config_exclude_strs = [
+            str(p.relative_to(project_root)) for p in exclude_paths if p.is_relative_to(project_root)
+        ]
         exclude_like = _detect_sdk_exclude_like(project_root, config_exclude_strs)
 
     # Re-open connection for the analysis (uses its own transactions)
@@ -1036,6 +1299,7 @@ def cmd_analyze(args: argparse.Namespace) -> int:
         if cfg.cache_server and cfg.cache_server.url:
             try:
                 from fw_context_mcp.cache_client import CacheClient
+
                 cc = CacheClient(
                     url=cfg.cache_server.url,
                     token=cfg.cache_server.token,
@@ -1045,9 +1309,15 @@ def cmd_analyze(args: argparse.Namespace) -> int:
             except Exception as e:
                 logging.getLogger(__name__).warning("Failed to create CacheClient: %s", e)
 
-        _build_llm_analysis(conn, config_hash, cfg.llm, db_path.parent,
-                           exclude_like=exclude_like, cache_client=cc,
-                           retry_unparseable=True)
+        _build_llm_analysis(
+            conn,
+            config_hash,
+            cfg.llm,
+            db_path.parent,
+            exclude_like=exclude_like,
+            cache_client=cc,
+            retry_unparseable=True,
+        )
         if cc:
             cc.close()
         _build_overrides(conn, config_hash, db_path.parent)
@@ -1062,6 +1332,7 @@ def cmd_analyze(args: argparse.Namespace) -> int:
 def cmd_version(args: argparse.Namespace) -> int:
     """Print version and exit."""
     from . import __version__
+
     print(f"fw-context-mcp {__version__}")
     return 0
 
@@ -1116,12 +1387,16 @@ def cmd_cache_stats(args: argparse.Namespace) -> int:
             db_path = cfg.index.db_dir / project_id / "index.db"
             if db_path.exists():
                 from .indexer.db import open_db
+
                 conn = open_db(db_path)
                 hashes: list[str] = []
                 try:
-                    hashes = [r[0] for r in conn.execute(
-                        "SELECT DISTINCT content_hash FROM llm_analysis WHERE content_hash != ''"
-                    ).fetchall()]
+                    hashes = [
+                        r[0]
+                        for r in conn.execute(
+                            "SELECT DISTINCT content_hash FROM llm_analysis WHERE content_hash != ''"
+                        ).fetchall()
+                    ]
                 finally:
                     conn.close()
                 if hashes:
@@ -1157,7 +1432,9 @@ def cmd_cache_push(args: argparse.Namespace) -> int:
 
     local_db = get_local_cache_db(readonly=True)
     try:
-        rows = local_db.execute("SELECT content_hash, summary, inputs, outputs, model FROM llm_analysis_cache").fetchall()
+        rows = local_db.execute(
+            "SELECT content_hash, summary, inputs, outputs, model FROM llm_analysis_cache"
+        ).fetchall()
         total = len(rows)
         if total == 0:
             print("Local cache is empty — nothing to push.")
@@ -1168,10 +1445,9 @@ def cmd_cache_push(args: argparse.Namespace) -> int:
         try:
             pushed = 0
             for i in range(0, total, batch_size):
-                chunk = rows[i:i + batch_size]
+                chunk = rows[i : i + batch_size]
                 entries = [
-                    {"hash": r[0], "summary": r[1], "inputs": r[2], "outputs": r[3], "model": r[4]}
-                    for r in chunk
+                    {"hash": r[0], "summary": r[1], "inputs": r[2], "outputs": r[3], "model": r[4]} for r in chunk
                 ]
                 n = cc.batch_put(entries)
                 pushed += n
@@ -1296,7 +1572,7 @@ token = "{token}"
     if "[cache_server]" in existing:
         # Replace existing section
         new_content = re.sub(
-            r'\[cache_server\].*?(?=\[|$)',
+            r"\[cache_server\].*?(?=\[|$)",
             cache_section.strip(),
             existing,
             flags=re.DOTALL,
@@ -1355,11 +1631,15 @@ def cmd_cache_clear(args: argparse.Namespace) -> int:
             hashes = []
             if db_path.exists():
                 from .indexer.db import open_db
+
                 conn = open_db(db_path)
                 try:
-                    hashes = [r[0] for r in conn.execute(
-                        "SELECT DISTINCT content_hash FROM llm_analysis WHERE content_hash != ''"
-                    ).fetchall()]
+                    hashes = [
+                        r[0]
+                        for r in conn.execute(
+                            "SELECT DISTINCT content_hash FROM llm_analysis WHERE content_hash != ''"
+                        ).fetchall()
+                    ]
                 finally:
                     conn.close()
             if hashes:
@@ -1396,22 +1676,51 @@ def main() -> None:
     )
     sub = parser.add_subparsers(dest="cmd")
 
-    p_index = sub.add_parser("index", help="Build the symbol index from compile_commands.json (reuses existing compile_commands.json, builds only if missing)")
+    p_index = sub.add_parser(
+        "index",
+        help="Build the symbol index from compile_commands.json (reuses existing compile_commands.json, builds only if missing)",
+    )
     p_index.add_argument("-v", "--verbose", action="store_true")
-    p_index.add_argument("compile_commands", nargs="?", default=None, metavar="compile_commands.json",
-                         help="Use an explicit compile_commands.json (skips build)")
+    p_index.add_argument(
+        "compile_commands",
+        nargs="?",
+        default=None,
+        metavar="compile_commands.json",
+        help="Use an explicit compile_commands.json (skips build)",
+    )
     p_index.add_argument("--project", metavar="DIR", help="Project root (default: cwd)")
-    p_index.add_argument("--build", action="store_true", help="Force a clean build and regenerate compile_commands.json")
-    p_index.add_argument("--no-clean", action="store_true", help="With --build: skip clean, do incremental build (may produce incomplete compile_commands.json)")
+    p_index.add_argument(
+        "--build", action="store_true", help="Force a clean build and regenerate compile_commands.json"
+    )
+    p_index.add_argument(
+        "--no-clean",
+        action="store_true",
+        help="With --build: skip clean, do incremental build (may produce incomplete compile_commands.json)",
+    )
     p_index.add_argument("--source-roots", nargs="+", metavar="DIR")
     p_index.add_argument("--name", metavar="NAME", help="Project name override")
     p_index.add_argument("--no-refs", action="store_true", help="Skip cross-reference indexing (on by default)")
     p_index.add_argument("--no-embeddings", action="store_true", dest="no_embeddings", help="Skip embedding generation")
-    p_index.add_argument("--embeddings", action="store_true", dest="embeddings", default=None, help="Generate symbol embeddings (default)")
-    p_index.add_argument("--analyze", action="store_true", dest="analyze", default=False,
-                         help="Generate LLM-based symbol analysis (summary, inputs, outputs)")
+    p_index.add_argument(
+        "--embeddings",
+        action="store_true",
+        dest="embeddings",
+        default=None,
+        help="Generate symbol embeddings (default)",
+    )
+    p_index.add_argument(
+        "--analyze",
+        action="store_true",
+        dest="analyze",
+        default=False,
+        help="Generate LLM-based symbol analysis (summary, inputs, outputs)",
+    )
     p_index.add_argument("--no-analyze", action="store_true", dest="no_analyze", help="Skip LLM analysis generation")
-    p_index.add_argument("--force", action="store_true", help="Force re-index of all files, embeddings, LLM analysis, overrides, and caches (skip mtime/checksum checks)")
+    p_index.add_argument(
+        "--force",
+        action="store_true",
+        help="Force re-index of all files, embeddings, LLM analysis, overrides, and caches (skip mtime/checksum checks)",
+    )
     p_index.set_defaults(func=cmd_index)
 
     p_search = sub.add_parser("search", help="Search indexed symbols")
@@ -1422,13 +1731,22 @@ def main() -> None:
     p_search.set_defaults(func=cmd_search)
 
     p_init = sub.add_parser("init", help="Register fw-context with AI assistants and inject instructions")
-    p_init.add_argument("--tool", metavar="ID", help="Set up a specific tool (claude-code, opencode, kilocode, codex, cursor)")
+    p_init.add_argument(
+        "--tool", metavar="ID", help="Set up a specific tool (claude-code, opencode, kilocode, codex, cursor)"
+    )
     p_init.add_argument("--dry-run", action="store_true", help="Show what would be done without making changes")
     p_init.add_argument("--force", action="store_true", help="Overwrite even when collisions are detected")
-    p_init.add_argument("--instructions-only", action="store_true", help="Only inject instructions, skip MCP registration")
-    p_init.add_argument("--scope", choices=["global", "project"], default="global", help="Which scope to inject (default: global)")
+    p_init.add_argument(
+        "--instructions-only", action="store_true", help="Only inject instructions, skip MCP registration"
+    )
+    p_init.add_argument(
+        "--scope", choices=["all", "global", "project"], default="project",
+        help="Which scope to inject (default: project — only the current project)",
+    )
     p_init.add_argument("--project", metavar="DIR", help="Project root (for project-scoped targets)")
-    p_init.add_argument("--list-tools", action="store_true", help="List supported AI assistants and their detection status")
+    p_init.add_argument(
+        "--list-tools", action="store_true", help="List supported AI assistants and their detection status"
+    )
     p_init.set_defaults(func=cmd_init, tool=None, dry_run=False, force=False, instructions_only=False, list_tools=False)
 
     p_list = sub.add_parser("list", help="List all indexed projects")
@@ -1450,7 +1768,9 @@ def main() -> None:
     p_export.add_argument("--no-refs", action="store_true", help="Omit cross-references")
     p_export.set_defaults(func=cmd_export)
 
-    p_project_init = sub.add_parser("project-init", help="Verify or fix project setup (config, .gitignore, build system)")
+    p_project_init = sub.add_parser(
+        "project-init", help="Verify or fix project setup (config, .gitignore, build system)"
+    )
     p_project_init.add_argument("--project", metavar="DIR", help="Project root (default: cwd)")
     p_project_init.add_argument("--fix", action="store_true", help="Apply fixes for detected issues")
     p_project_init.set_defaults(func=cmd_project_init)
@@ -1471,7 +1791,9 @@ def main() -> None:
 
     p_cache_clear = p_cache_sub.add_parser("clear", help="Delete cache entries")
     p_cache_clear.add_argument("--project", metavar="DIR", help="Project root for remote config (default: cwd)")
-    p_cache_clear.add_argument("--remote", action="store_true", help="Clear remote server cache for this project (Tier 2)")
+    p_cache_clear.add_argument(
+        "--remote", action="store_true", help="Clear remote server cache for this project (Tier 2)"
+    )
     p_cache_clear.add_argument("--all", action="store_true", help="Clear both local and remote")
     p_cache_clear.add_argument("-y", "--yes", action="store_true", help="Skip confirmation prompt")
     p_cache_clear.set_defaults(func=cmd_cache_clear)
@@ -1481,7 +1803,9 @@ def main() -> None:
     p_cache_push.add_argument("--batch", type=int, metavar="N", help="Batch size (default: from config, 100)")
     p_cache_push.set_defaults(func=cmd_cache_push)
 
-    p_cache_remote = p_cache_sub.add_parser("remote-init", help="Interactive setup: configure remote cache URL and token")
+    p_cache_remote = p_cache_sub.add_parser(
+        "remote-init", help="Interactive setup: configure remote cache URL and token"
+    )
     p_cache_remote.add_argument("--project", metavar="DIR", help="Project root (default: cwd)")
     p_cache_remote.set_defaults(func=cmd_cache_remote_init)
 

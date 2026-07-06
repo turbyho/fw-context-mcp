@@ -1442,9 +1442,18 @@ def run(
         macro_updated = 0
         try:
             from .macros import resolve_and_update
-            macro_updated = resolve_and_update(
-                conn, config_hash, units[0].clang_args, units[0].file.resolve(),
-            )
+            seen_flags: set[tuple] = set()
+            for unit in units:
+                flag_key = tuple(sorted(unit.clang_args))
+                if flag_key in seen_flags:
+                    continue
+                seen_flags.add(flag_key)
+                try:
+                    macro_updated += resolve_and_update(
+                        conn, config_hash, unit.clang_args, unit.file.resolve(),
+                    )
+                except Exception:
+                    pass  # best-effort per TU
         except Exception:
             pass  # best-effort
         elapsed_macro = time.monotonic() - t_macro

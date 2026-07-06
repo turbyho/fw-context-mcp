@@ -50,33 +50,38 @@ mcp = FastMCP(
         "SELF-CORRECT: the moment you reach for a tool that is NOT fw-context\n"
         "for C/C++ code, stop and use the fw-context equivalent instead.\n\n"
         "TOOL SELECTION (pick the right one):\n"
-        "• Symbol by exact/prefix name _____ → lookup_symbol (e.g. \"uart_\", \"main\")\n"
-        "• Symbols by concept/topic _________ → search_code (e.g. \"interrupt handler\")\n"
-        "• Patterns in function BODIES ______ → search_bodies (e.g. \"attach\", \"rise\")\n"
-        "• Patterns in full FILE content _____ → search_content (e.g. \"extern C\", \"InterruptIn\")\n"
+        '• Symbol by exact/prefix name _____ → lookup_symbol (e.g. "uart_", "main")\n'
+        '• Symbols by concept/topic _________ → search_code (e.g. "interrupt handler")\n'
+        '• Patterns in function BODIES ______ → search_bodies (e.g. "attach", "rise")\n'
+        '• Patterns in full FILE content _____ → search_content (e.g. "extern C", "InterruptIn")\n'
         "• Natural-language question ________ → smart_search (slow, thorough)\n\n"
         "IMPORTANT: search_code searches symbol NAMES (what the code IS).\n"
         "search_bodies searches function BODIES (what the code DOES — inside {}).\n"
         "search_content searches FULL FILE content — file-scope declarations,\n"
         "type definitions in headers, preprocessor directives, namespace blocks.\n"
-        "For patterns like extern \"C\", InterruptIn declarations, #define —\n"
+        'For patterns like extern "C", InterruptIn declarations, #define —\n'
         "use search_content, NOT search_bodies.\n\n"
         "FTS5 QUERY TIPS:\n"
-        "• Multi-word queries are OR-joined: \"attach callback\" becomes attach* OR callback*\n"
+        '• Multi-word queries are OR-joined: "attach callback" becomes attach* OR callback*\n'
         "  (matches functions containing EITHER word, not both).\n"
-        "• Prefer SINGLE-WORD queries for broad matching: \"attach\" not \"attach callback\".\n"
+        '• Prefer SINGLE-WORD queries for broad matching: "attach" not "attach callback".\n'
         "• For exact phrases use double quotes: '\"interrupt handler\"'.\n"
-        "• Underscores are word separators: \"modem_init\" → modem AND init.\n"
-        "  Write \"modem init\" instead.\n\n"
+        '• Underscores are word separators: "modem_init" → modem AND init.\n'
+        '  Write "modem init" instead.\n\n'
         "EMPTY RESULT STRATEGY — if a fw-context tool returns nothing:\n"
         "1. Try a simpler/single-word query in the SAME tool first.\n"
         "2. Switch to a DIFFERENT fw-context tool (search_bodies → search_code, etc.).\n"
         "3. Use lookup_symbol for known symbol names.\n"
         "4. If search_bodies returns empty, switch to search_content — it covers\n"
-        "   file scope (type declarations, #define, extern \"C\") that search_bodies\n"
+        '   file scope (type declarations, #define, extern "C") that search_bodies\n'
         "   cannot reach.\n"
-        "5. If all fw-context tools return empty, simplify query or use different tool.\n"
-        "6. Only AFTER exhausting fw-context — use other available tools.\n\n"
+        "5. find_callers empty → callers exist through member-field accesses\n"
+        "   (obj.method()) or base-class pointers. Fall back to\n"
+        '   search_bodies("function_name") which text-searches function bodies\n'
+        "   independently of the call graph. If still empty, try\n"
+        '   search_content("function_name").\n'
+        "6. If all fw-context tools return empty, simplify query or use different tool.\n"
+        "7. Only AFTER exhausting fw-context — use other available tools.\n\n"
         "project_only=True (on search_code, search_bodies, search_content, and\n"
         "callgraph tools) excludes vendor SDK code — use when asking about YOUR code.\n\n"
         "ANTI-PATTERNS — do NOT:\n"
@@ -88,22 +93,49 @@ mcp = FastMCP(
         "• Use file readers for function bodies → use get_source (libclang exact extents)\n"
         "• Run external search tools in parallel with fw-context\n"
         "• Give up on fw-context after one empty result → try simpler query or\n"
-        "  different fw-context tool first\n\n"
+        "  different fw-context tool first\n"
+        "• search_code for a SINGLE KNOWN symbol → use lookup_symbol(exact=true).\n"
+        '  search_code FTS5-tokenizes names: "kb_open_disp" → "kb"+"open"+"disp",\n'
+        "  causing false matches on unrelated symbols containing those tokens.\n"
+        "  search_code is for concept/keyword DISCOVERY only.\n"
+        "• Use generic review agents/skills for C/C++ code → use\n"
+        "  fw-context-embedded-review skill (see REVIEW SKILL section below).\n\n"
         "AGENT LOOP: Check(get_active_build) → Find(search_code/lookup_symbol)\n"
         "→ Read(get_source/get_symbol_context) → Trace(find_references/find_callers)\n"
         "→ For body patterns use search_bodies.\n"
         "→ DECISION after get_active_build():\n"
-        "  • status=\"ready\" or \"reindexing\" — fw-context is fully operational.\n"
+        '  • status="ready" or "reindexing" — fw-context is fully operational.\n'
         "    bg_reindex_running does NOT mean the index is unavailable. Continue.\n"
-        "  • status=\"reindex_needed\" — queries still work, but schedule fw-context index.\n"
-        "  • status=\"no_index\" or \"error\" — use other available tools.\n\n"
+        '  • status="reindex_needed" — queries still work, but schedule fw-context index.\n'
+        '  • status="no_index" or "error" — use other available tools.\n\n'
+        "REVIEW WORKFLOW — when reviewing C/C++ code changes (per changed symbol):\n"
+        "0. find_hotspots(project_only=True) — identify highest-impact functions FIRST.\n"
+        "   Prioritize review of hotspots (20+ callers) over leaf functions.\n"
+        "1. lookup_symbol(exact=true) → verify symbol existence and new signature.\n"
+        "2. find_callers() → direct callers (upstream impact).\n"
+        '3. If find_callers returns empty → search_bodies("name") (fallback).\n'
+        "   Also try find_indirect_call_sites(field_name) and\n"
+        "   find_indirect_targets(field_name) — callbacks/function pointers.\n"
+        "4. find_all_callers_recursive() → transitive upstream impact (full call tree).\n"
+        "5. find_callees_recursive() → transitive downstream check.\n"
+        "   After a logic change, verify compatibility with everything this function\n"
+        "   calls — arguments, init order, error paths may have changed.\n"
+        '6. find_references("SymbolName") → all reads/writes/calls of changed types.\n'
+        '7. search_content("PATTERN") → confirm removal of #define/#ifdef/board names.\n'
+        "8. find_dead_code() → detect newly dead functions after removal.\n"
+        "9. For each search_bodies result set: scan ALL results — the 3rd match\n"
+        "   may reveal an implementation the diff didn't touch (e.g. duplicate CRC\n"
+        "   in a private method).\n"
+        "10. When analyzing BOTH a diff AND fw-context results: diff shows SCOPE\n"
+        "   (what changed), fw-context verifies CORRECTNESS in full project context.\n"
+        "   ALWAYS verify diff discoveries recursively with fw-context.\n\n"
         "DIFF → FW-CONTEXT VERIFICATION RULE:\n"
         "→ When you analyze code via diff (git diff, file diff, patch review),\n"
         "  diff shows ONLY what changed — it cannot reveal the impact across\n"
         "  the full codebase.\n"
         "→ After inspecting a diff: verify your findings with fw-context:\n"
-        "  • find_references(\"<symbol>\") — all callers/readers, not just diff context\n"
-        "  • search_bodies(\"<pattern>\") — pattern consistency across entire codebase\n"
+        '  • find_references("<symbol>") — all callers/readers, not just diff context\n'
+        '  • search_bodies("<pattern>") — pattern consistency across entire codebase\n'
         "  • find_call_path / find_all_callers_recursive — cross-module impact\n"
         "  • find_dead_code / find_hotspots — structural effects of changes\n"
         "→ Do NOT draw conclusions from diff results alone — diff is for SCOPE\n"
@@ -119,6 +151,27 @@ mcp = FastMCP(
         "get_template_instances, get_method_overrides.\n"
         "Source: get_source, get_symbol_context, get_file_map, explain_symbol.\n"
         "Maintenance: reindex_file, reset_index, check_ollama, list_projects.\n\n"
+        "REVIEW SKILL — MANDATORY (not optional): When reviewing C/C++ firmware\n"
+        "code (diffs, commits, PRs, changed files), your FIRST action MUST be:\n"
+        "  skill(name=\"fw-context-embedded-review\")\n"
+        "Do NOT use generic review agents (code-explorer, general, etc.) for\n"
+        "C/C++ firmware reviews — they do not know fw-context tool selection rules.\n"
+        "Do NOT start inline review without the skill. The skill provides:\n"
+        "  • Phase 0: mandatory review plan creation from diff stat\n"
+        "  • Phase 1: structural verification (callers, callees, types, inheritance)\n"
+        "  • Phase 2: logic & memory review (deep code reading — ODR, null deref,\n"
+        "    call ordering, truncation, state reset, watchdog, edge cases)\n"
+        "  • Anti-pattern checklist (7 common mistakes with fw-context tools)\n"
+        "  • Tool selection decision tree (search_code vs lookup_symbol, etc.)\n"
+        "Trigger phrases — this skill applies to ALL review types regardless\n"
+        "of what the user calls it: review, code review, PR review, diff\n"
+        "review, deep review, recursive review, exhaustive review,\n"
+        "comprehensive review, safety review, audit, change analysis, commit\n"
+        "analysis, impact analysis, examine changes, inspect this code, look\n"
+        "at this diff, check this PR, check these changes, analyze this\n"
+        "commit, verify this change.\n"
+        "If the project has a LOCAL fw-context-embedded-review skill, that overrides\n"
+        "the global default — the user has intentionally customized it.\n\n"
         "Start every session with get_active_build().\n"
         "For non-C/C++ files, general-purpose tools are preferred."
     ),
@@ -131,10 +184,6 @@ mcp = FastMCP(
 # _db_path, _resolve_context, _open_db_safe, _is_stale — see mcp/shared/context.py
 
 
-
-
-
-
 # _stale_files, _count_modified_files, _auto_reindex_stale — re-exported from .shared.stale
 
 # ── Background reindex ──────────────────────────────────────────────────────
@@ -144,66 +193,10 @@ mcp = FastMCP(
 _SOURCE_EXTS_WATCH = {".c", ".cpp", ".h", ".hpp"}
 
 
-
-
-
-
-
-
-
-
-
-
-
-
 # ── Tools (non-search) ──────────────────────────────────────────────────────
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 # ── Graph analytics tools ─────────────────────────────────────────────────────
-
-
-
-
-
-
-
-
 
 
 # ── Shared helpers for SDK path filtering ──────────────────────────────────
@@ -212,32 +205,10 @@ _SOURCE_EXTS_WATCH = {".c", ".cpp", ".h", ".hpp"}
 # _path_matches, _build_sdk_excludes, _merge_excludes — re-exported from .shared.filtering
 
 
-
-
-
-
-
-
-
-
 # ── Inheritance tool ──────────────────────────────────────────────────────
 
 
-
-
-
-
-
-
-
-
 # ── Pipeline-based search tools ─────────────────────────────────────────────
-
-
-
-
-
-
 
 
 # _fallback_to_search_code, _fallback_to_search_code_inner — re-exported from .shared.fallback
@@ -325,6 +296,7 @@ def resource_projects() -> str:
     indented JSON.
     """
     import json
+
     return json.dumps(list_projects(), indent=2, ensure_ascii=False, default=str)
 
 
@@ -355,6 +327,46 @@ def resource_symbol(name: str) -> str:
         "```",
     ]
     return "\n".join(lines)
+
+
+# ── Embedded review skill ───────────────────────────────────────────────────
+
+
+def _load_skill_md() -> str | None:
+    """Return the fw-context-embedded-review SKILL.md content, or None."""
+    from pathlib import Path
+
+    from .. import __file__ as _pkg_init
+
+    pkg_dir = Path(_pkg_init).parent
+    skill_path = pkg_dir / "data" / "skills" / "fw-context-embedded-review" / "SKILL.md"
+    try:
+        return skill_path.read_text(encoding="utf-8")
+    except OSError:
+        return None
+
+
+@mcp.resource("fw-context://skills/fw-context-embedded-review")
+def resource_embedded_review_skill() -> str:
+    """Return the fw-context-embedded-review SKILL.md as an MCP resource.
+
+    Read-only. Makes the embedded firmware review methodology available
+    to any MCP client via a well-known resource URI."""
+    content = _load_skill_md()
+    if content is None:
+        return "Skill not found — reinstall with 'fw-context init --force'."
+    return content
+
+
+# @mcp.tool()
+# def fw_embedded_review() -> str:
+#     """Embedded C/C++ firmware review methodology.
+#
+#     Read-only. Three-phase review workflow: plan → structural verification
+#     (callers/callees/types) → logic review across 9 embedded-specific
+#     domains (memory, concurrency, RTOS, peripherals, etc.). Call when the
+#     user asks to review embedded firmware changes."""
+#     return resource_embedded_review_skill()
 
 
 # ── main ────────────────────────────────────────────────────────────────────
@@ -398,6 +410,7 @@ def main() -> None:
         # and stats files — on large projects (3+ GB, 100k+ files)
         # this takes 5-30 s and would cause MCP tool-discovery timeouts.
         import threading
+
         threading.Thread(
             target=_start_bg_reindex_if_stale,
             args=(root,),
@@ -405,9 +418,6 @@ def main() -> None:
             name="fw-context-startup",
         ).start()
     except Exception:
-        log.exception(
-            "Background service startup failed — "
-            "auto-reindex and file watching unavailable"
-        )
+        log.exception("Background service startup failed — auto-reindex and file watching unavailable")
 
     mcp.run()

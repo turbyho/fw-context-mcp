@@ -38,6 +38,19 @@ file-reading tool. The mapping is:
 SELF-CORRECT: the moment you reach for any tool that is NOT fw-context
 for C/C++ code, stop and use the fw-context equivalent instead.
 
+### Code review — ALWAYS use fw-context-embedded-review skill
+
+When the user asks to review, audit, or analyze C/C++ firmware changes,
+diffs, commits, or PRs, invoke the ``fw-context-embedded-review`` skill
+via the Skill tool. This takes priority over all generic/built-in review
+skills (including ``code-review``) for C/C++ projects.
+
+SELF-CORRECT: the moment you reach for git log, git diff, or any manual
+analysis to review C/C++ code, STOP — invoke
+Skill(skill="fw-context-embedded-review") instead. The skill handles
+git discovery, diff scoping, and all structural/logic analysis. Do NOT
+do manual exploration before calling the skill.
+
 SEARCH TOOL SELECTION (use the right tool for the job):
 
 | You want to find… | Use | Example query |
@@ -130,8 +143,6 @@ DIFF → FW-CONTEXT VERIFICATION RULE:
 
 Do NOT use fw-context in Python, JS, Go, or other non-C/C++ projects.
 
-{lean_ctx_carveout}
-
 ### Tool categories
 
 - **Search:** `lookup_symbol` (exact/prefix name), `search_code` (FTS5 over
@@ -172,30 +183,49 @@ fw-context index
 ```
 """
 
-LEAN_CTX_CARVEOUT = """\
-### lean-ctx compatibility
+AGENT_CRITICAL_BLOCK = """\
+## CRITICAL — C/C++ source access (fw-context)
 
-For C/C++ code navigation, fw-context tools MUST be used instead of their
-lean-ctx equivalents. The mapping is:
+ALL C/C++ source code access MUST go through fw-context MCP tools.
+Raw source files contain unprocessed #ifdef noise; fw-context shows only
+what actually compiles for the active build configuration.
 
-| Instead of lean-ctx | Use fw-context |
-|---|---|
-| ctx_search(action="regex") | `search_code` |
-| ctx_search(action="symbol") | `lookup_symbol` |
-| ctx_compose(task=...) | `get_file_map` + `get_symbol_context` |
-| ctx_callgraph(action="callers") | `find_callers` |
-| ctx_callgraph(action="callees") | `find_callees_recursive` |
-| ctx_callgraph(action="trace") | `find_call_path` |
+PROHIBITED for .c/.cpp/.h/.hpp/.s/.inc files:
+- Read, cat — raw preprocessor noise, not compiled code
+- Grep, git grep — cannot resolve build-conditional code
+- Bash find/ls for discovering source files
 
-Read source files referenced by fw-context results with `ctx_read` —
-those are regular files on disk, not query output.
+REQUIRED for ALL C/C++ code access:
+- lookup_symbol → find symbol by exact or prefix name
+- search_code → find symbols by concept/topic
+- search_bodies → search function implementations (inside { })
+- search_content → search full file content (file-scope patterns)
+- get_source → read function body (libclang exact extents)
+- get_symbol_context → body + callers + callees in one call
+- find_callers / find_references → impact analysis
+- find_all_callers_recursive → full transitive call tree
 
-Do NOT pipe fw-context structured results through lean-ctx compression.
-When working on the `fw-context-mcp` source code itself, do NOT use
-lean-ctx for C/C++ code.
+SELF-CORRECT: the moment you reach for Read/grep on C/C++ → STOP → use fw-context.
 """
 
-NO_LEAN_CTX_CARVEOUT = ""
+SUBAGENT_INSTRUCTIONS = """
+## SUBAGENT INSTRUCTIONS (applies to ALL subagents)
+
+When you are launched as a subagent in a C/C++ project, the fw-context rules
+above are MANDATORY for you — no exceptions, no excuses:
+
+- NEVER read C/C++ source files (.c, .cpp, .h, .hpp, .s, .inc) with
+  Read, cat, grep, or any non-fw-context tool.
+- Raw source files contain unprocessed #ifdef noise — only fw-context shows
+  what actually compiles for the active build configuration.
+- If fw-context MCP tools are available, they are the ONLY allowed way to
+  access C/C++ source code. No fallback to raw file reads.
+- If you don't have fw-context tools available, state that limitation and
+  stop — do NOT fall back to raw file reads.
+
+The rules in the fw-context section above apply to you exactly as they apply
+to the main session. There is no exemption for subagents.
+"""
 
 # Marker tags for marked-section injection
 MARKER_START = "<!-- fw-context -->"
@@ -215,13 +245,10 @@ class InstructionTarget:
                 ``"separate_file"`` writes the entire file.
         scope: ``"global"`` writes to home dir; ``"project"`` writes relative to
                the project root.
-        include_lean_ctx_carveout: If True, include the lean-ctx compatibility
-               section. Should be True for tools that also use lean-ctx.
     """
     path: str
     method: str = "marked_section"
     scope: str = "global"
-    include_lean_ctx_carveout: bool = True
 
     def resolve(self, project_root: Path | None = None) -> Path:
         """Return the absolute path for this target."""
@@ -239,8 +266,7 @@ class InstructionTarget:
         the caller (``_update_marked_section``) adds them.
         For ``separate_file`` method, returns the full file content.
         """
-        carveout = LEAN_CTX_CARVEOUT if self.include_lean_ctx_carveout else NO_LEAN_CTX_CARVEOUT
-        return BASE_INSTRUCTIONS.format(lean_ctx_carveout=carveout)
+        return BASE_INSTRUCTIONS + SUBAGENT_INSTRUCTIONS
 
 
 # ── AI tool definition ──────────────────────────────────────────────────────
@@ -325,7 +351,11 @@ TOOLS: dict[str, AiTool] = {
                 path="~/.claude/CLAUDE.md",
                 method="marked_section",
                 scope="global",
-                include_lean_ctx_carveout=True,
+            ),
+            InstructionTarget(
+                path="{project}/CLAUDE.md",
+                method="marked_section",
+                scope="project",
             ),
         ],
     ),
@@ -340,7 +370,6 @@ TOOLS: dict[str, AiTool] = {
                 path="~/.config/opencode/rules/fw-context.md",
                 method="separate_file",
                 scope="global",
-                include_lean_ctx_carveout=True,
             ),
         ],
     ),
@@ -360,7 +389,6 @@ TOOLS: dict[str, AiTool] = {
                 path="~/.codex/rules/fw-context.md",
                 method="separate_file",
                 scope="global",
-                include_lean_ctx_carveout=True,
             ),
         ],
     ),
@@ -373,7 +401,6 @@ TOOLS: dict[str, AiTool] = {
                 path="{project}/.cursor/rules/fw-context.mdc",
                 method="separate_file",
                 scope="project",
-                include_lean_ctx_carveout=False,
             ),
         ],
     ),

@@ -992,7 +992,7 @@ def extract_all(
     # is orders of magnitude faster than the equivalent manual stack DFS.
     # Each Python-level cursor.get_children() call crosses ctypes; the C
     # generator pays that cost once per cursor internally and just yields.
-    fn_stack: list[tuple[str, int]] = []  # [(usr, end_line)]
+    fn_stack: list[tuple[str, int, str]] = []  # [(usr, end_line, file_path)]
 
     def _emit_fn_ptr_targets(
         expr_cursor: cx.Cursor,
@@ -1048,7 +1048,16 @@ def extract_all(
         # walk_preorder() visits all descendants before any sibling, so
         # comparing line > end_line reliably detects scope exit.
         _cl = cursor.location
-        while fn_stack and fn_stack[-1][1] > 0 and _cl is not None and _cl.line > fn_stack[-1][1]:
+        _cl_file = str(Path(_cl.file.name).resolve()) if _cl and _cl.file else None
+        _cl_line = _cl.line if _cl else -1
+        # Pop entries whose file doesn't match the current cursor — when
+        # walk_preorder crosses from a .cpp function into #included header
+        # nodes, stale fn_stack entries must be removed because header
+        # declarations (class members, globals) are not inside that function.
+        while fn_stack and fn_stack[-1][2] and _cl_file and fn_stack[-1][2] != _cl_file:
+            fn_stack.pop()
+        # Pop entries whose body extent we've passed (same-file check).
+        while fn_stack and fn_stack[-1][1] > 0 and _cl is not None and _cl_line > fn_stack[-1][1]:
             fn_stack.pop()
         cur_fn = fn_stack[-1][0] if fn_stack else None
 
@@ -1064,13 +1073,13 @@ def extract_all(
                     _ext_file = _ext.start.file.name
                     if str(Path(_ext_file).resolve()) == str(Path(tu.spelling).resolve()):
                         _fn_spans.append((cur_fn or '', _ext.start.line, _ext.end.line))
-                        fn_stack.append((cur_fn or '', _ext.end.line))
+                        fn_stack.append((cur_fn or '', _ext.end.line, str(Path(_ext_file).resolve())))
                     else:
-                        fn_stack.append((cur_fn or '', 0))
+                        fn_stack.append((cur_fn or '', 0, ""))
                 else:
-                    fn_stack.append((cur_fn or '', 0))
+                    fn_stack.append((cur_fn or '', 0, ""))
             except Exception:
-                fn_stack.append((cur_fn or '', 0))
+                fn_stack.append((cur_fn or '', 0, ""))
 
         ref_kind = _REF_KINDS.get(cursor.kind)
         if ref_kind is not None:
@@ -1130,6 +1139,60 @@ def extract_all(
                                             ref_kind="call",
                                         ))
                                     break  # one resolved callee per CALL_EXPR
+
+            # --- Constructor call fallback ---
+            # When a CALL_EXPR's referenced cursor is None or its definition
+            # is not in project roots (can happen for constructor calls in
+            # member initializer lists like ``_member(args)``), walk the
+            # CALL_EXPR's children for a DECL_REF_EXPR to a FIELD_DECL or
+            # VAR_DECL whose type is RECORD.  Resolve the type's class
+            # declaration and emit ``call`` references for each constructor.
+            if cursor.kind == cx.CursorKind.CALL_EXPR:
+                _callee_resolved = referenced is not None
+                _callee_in_roots = False
+                if _callee_resolved:
+                    try:
+                        _crl = referenced.location
+                        if _crl.file and _in_roots(_crl.file.name) and _not_excluded(_crl.file.name):
+                            _callee_in_roots = True
+                    except Exception:
+                        pass
+                if not _callee_in_roots:
+                    for child in cursor.get_children():
+                        if child.kind == cx.CursorKind.DECL_REF_EXPR:
+                            child_ref = child.referenced
+                            if child_ref is not None and child_ref.kind in (cx.CursorKind.FIELD_DECL, cx.CursorKind.VAR_DECL):
+                                try:
+                                    child_type = child_ref.type.get_canonical()
+                                except Exception:
+                                    continue
+                                if child_type.kind == cx.TypeKind.RECORD:
+                                    try:
+                                        class_cursor = child_type.get_declaration()
+                                    except Exception:
+                                        continue
+                                    if class_cursor is not None:
+                                        for ctor in class_cursor.get_children():
+                                            if ctor.kind != cx.CursorKind.CONSTRUCTOR:
+                                                continue
+                                            ctor_usr = ctor.get_usr()
+                                            if not ctor_usr:
+                                                continue
+                                            ctor_loc = ctor.location
+                                            if not ctor_loc.file or not _in_roots(ctor_loc.file.name) or not _not_excluded(ctor_loc.file.name):
+                                                continue
+                                            key = (ctor_usr, loc.file.name, loc.line, cur_fn, "call")
+                                            if key not in seen_ref:
+                                                seen_ref.add(key)
+                                                refs.append(Reference(
+                                                    to_usr=ctor_usr,
+                                                    from_file=loc.file.name,
+                                                    from_line=loc.line,
+                                                    from_usr=cur_fn,
+                                                    ref_kind="call",
+                                                ))
+                                    # Process all record-typed fields — a CALL_EXPR may
+                                    # initialize multiple fields with different types.
 
         # --- Indirect function pointer invocation detection ---
         # Detect CALL_EXPR where the callee is a function pointer field,
