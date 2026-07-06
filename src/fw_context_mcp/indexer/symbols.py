@@ -887,7 +887,7 @@ def extract_all(
         ))
 
     if not with_refs:
-        _log.debug("  parse=%.1fs symwalk=%.1fs syms=%d macros=%d", _t_parse, _t_symwalk, len(symbols), len(macros))
+        _log.info("  parse=%.1fs symwalk=%.1fs syms=%d macros=%d", _t_parse, _t_symwalk, len(symbols), len(macros))
         return symbols, [], inheritance, [], [], macros
 
     # Build qualified-name → USR lookup for token-based fallback
@@ -1432,7 +1432,7 @@ def extract_all(
 
     _t_total = _time.monotonic() - _t_start
     _t_refwalk = _t_total - _t_parse - _t_symwalk
-    _log.debug(
+    _log.info(
         "  parse=%.1fs symwalk=%.1fs refwalk=%.1fs syms=%d refs=%d macros=%d",
         _t_parse, _t_symwalk, _t_refwalk, len(symbols), len(refs), len(macros),
     )
