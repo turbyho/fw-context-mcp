@@ -98,6 +98,7 @@ The detailed quick start, installation instructions and configuration guide are 
 - [Installation](docs/installation.md)
 - [MCP tool reference](docs/tools.md)
 - [MCP server notes](README-MCP.md)
+- [Case study: firmware code review](docs/examples/firmware-review/) — 108× token savings, 19 findings from 8 parallel subagents
 
 The usual workflow is:
 
