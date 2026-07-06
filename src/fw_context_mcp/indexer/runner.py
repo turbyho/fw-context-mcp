@@ -1264,6 +1264,7 @@ def run(
         _hb_thread = threading.Thread(target=_heartbeat, daemon=True)
         _hb_thread.start()
 
+    log.info("", extra={"phase": f"Indexing {name} ({config_hash[:12]})"})
     log.info("project=%s config_hash=%s", name, config_hash[:12])
 
     conn = open_db(db_path)
@@ -1314,6 +1315,8 @@ def run(
     acc_write = 0.0
     content_filled = 0
     t0 = time.monotonic()
+
+    log.info("", extra={"phase": f"Parsing ({len(units)} TUs)"})
 
     def _wait_if_paused() -> None:
         """If a manual operation requested pause, wait until it finishes.
@@ -1415,31 +1418,26 @@ def run(
 
     # Rebuild FTS5 table from the now-complete symbols table — restores
     # full-text search after the triggers were dropped before indexing.
-    log.info("Rebuilding FTS5 index...")
+    log.info("", extra={"phase": "FTS5 rebuild"})
     t_fts_start = time.monotonic()
     rebuild_fts(conn)
     rebuild_files_fts(conn)
     t_fts = time.monotonic() - t_fts_start
+    log.info("fts5 + files_fts rebuilt  %s", _fmt_dur(t_fts))
 
-    elapsed = time.monotonic() - t0
+    elapsed_parse = time.monotonic() - t0
     log.info(
-        "Index summary: %d updated, %d unchanged, %d skipped, "
-        "%d syms, %d refs, %.1fs total | "
-        "parse=%.1fs lock_wait=%.1fs write=%.1fs fts_rebuild=%.1fs",
+        "Parsing done: %d updated, %d unchanged, %d skipped — "
+        "parse=%.1fs  lock=%.1fs  write=%.1fs  %s",
         updated, unchanged, skipped,
-        total_syms, total_refs, elapsed,
-        acc_parse, acc_lock, acc_write, t_fts,
+        acc_parse, acc_lock, acc_write, _fmt_dur(elapsed_parse),
     )
     if content_filled:
         log.info("ifdef-filtered content: %d files filled", content_filled)
 
     # Resolve expanded macro values via clang -dM -E (opt-in, best-effort).
-    # All TUs in the same build share identical preprocessor flags (same
-    # config_hash), so clang -dM -E produces identical output regardless
-    # of which source file is passed.  One call is sufficient — running it
-    # per TU would re-parse all system headers N times for no benefit.
     if index_macros_expanded and units:
-        log.info("Resolving expanded macro values via clang -dM -E...")
+        log.info("", extra={"phase": "Macro expansion"})
         t_macro = time.monotonic()
         macro_updated = 0
         try:
@@ -1449,11 +1447,11 @@ def run(
             )
         except Exception:
             pass  # best-effort
+        elapsed_macro = time.monotonic() - t_macro
         if macro_updated:
-            log.info(
-                "Macro expansion: %d values resolved in %.1fs",
-                macro_updated, time.monotonic() - t_macro,
-            )
+            log.info("%d values resolved  %s", macro_updated, _fmt_dur(elapsed_macro))
+        else:
+            log.info("nothing to resolve  %s", _fmt_dur(elapsed_macro))
 
     # Post-processing — each function handles its own idempotency
     # (returns immediately when data already exists).
@@ -1477,9 +1475,11 @@ def run(
             except Exception:
                 pass  # sqlite-vec table may not exist for legacy indexes
             conn.commit()
-        log.info("Generating embeddings...")
+        log.info("", extra={"phase": "Embeddings"})
+        t_emb = time.monotonic()
         _build_embeddings(conn, config_hash, llm_config, db_path.parent)
         conn.commit()
+        log.info("done  %s", _fmt_dur(time.monotonic() - t_emb))
 
     # LLM analysis generation (opt-in)
     if analyze_symbols and llm_config is not None and llm_config.enabled:
@@ -1500,22 +1500,26 @@ def run(
         if force:
             conn.execute("DELETE FROM llm_analysis WHERE symbol_id IN (SELECT id FROM symbols WHERE config_hash = ?)", (config_hash,))
             conn.commit()
-        log.info("Generating LLM analysis for project symbols...")
+        log.info("", extra={"phase": f"LLM Analysis ({llm_config.model})"})
+        t_llm = time.monotonic()
         _build_llm_analysis(conn, config_hash, llm_config, db_path.parent,
                            exclude_like=exclude_like, cache_client=cc,
                            retry_unparseable=True)
         if cc:
             cc.close()
         conn.commit()
+        log.info("done  %s", _fmt_dur(time.monotonic() - t_llm))
 
     # Method override tracking (post-processing, no LLM needed)
     if analyze_overrides:
         if force:
             conn.execute("DELETE FROM overrides WHERE config_hash = ?", (config_hash,))
             conn.commit()
-        log.info("Building method override graph...")
+        log.info("", extra={"phase": "Override graph"})
+        t_ov = time.monotonic()
         _build_overrides(conn, config_hash, db_path.parent)
         conn.commit()
+        log.info("done  %s", _fmt_dur(time.monotonic() - t_ov))
 
     # PageRank computation (post-processing, requires reference index)
     if index_refs:
@@ -1523,13 +1527,17 @@ def run(
             conn.execute("UPDATE symbols SET pagerank = 0.0 WHERE config_hash = ?", (config_hash,))
             conn.execute("DELETE FROM hotspot_cache WHERE config_hash = ?", (config_hash,))
             conn.commit()
-        log.info("Computing PageRank on call graph...")
+        log.info("", extra={"phase": "PageRank"})
+        t_pr = time.monotonic()
         _build_pagerank(conn, config_hash)
         conn.commit()
+        log.info("done  %s", _fmt_dur(time.monotonic() - t_pr))
 
-        log.info("Building hotspot cache...")
+        log.info("", extra={"phase": "Hotspot cache"})
+        t_hs = time.monotonic()
         _build_hotspot_cache(conn, config_hash)
         conn.commit()
+        log.info("done  %s", _fmt_dur(time.monotonic() - t_hs))
 
     elapsed = time.monotonic() - t0
     try:
@@ -1541,8 +1549,7 @@ def run(
     # PRAGMA does not support bound parameters; CURRENT_SCHEMA_VERSION is
     # an integer constant — no injection risk.
     conn.execute(f"PRAGMA user_version = {CURRENT_SCHEMA_VERSION}")
-    log.info(
-        "Done: %d updated, %d unchanged, %d skipped — %d symbols, %d refs in %.1fs (config_hash=%s)",
-        updated, unchanged, skipped, total_syms, total_refs, elapsed, config_hash[:12],
-    )
+    log.info("", extra={"phase": f"Done — {total_syms} symbols, {total_refs} refs, {_fmt_dur(elapsed)}"})
+    log.info("%d updated, %d unchanged, %d skipped  config_hash=%s",
+             updated, unchanged, skipped, config_hash[:12])
     return config_hash
