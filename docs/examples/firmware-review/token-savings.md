@@ -166,7 +166,6 @@ Traditional alternative for each operation:
 
 ### 5.1 Without fw-context, this review would not be possible in a single session
 
-- Maximum context window of current LLMs: ~200 000 tokens
 - The traditional approach would produce **~5.8 million tokens** — that's **29× more** than context capacity
 - The review would have to be split into **at least 30 separate conversations**, each with partial context
 - Each conversation would lack the overall picture → risk of missing cross-module impacts

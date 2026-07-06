@@ -100,6 +100,8 @@ Leave ``project_only=False`` (default) when vendor code is relevant
     project_only=True (detects ISRs, callback registrations, Timeout::attach
     patterns)
  • Use file readers for function bodies → use get_source (libclang exact extents)
+ • Call get_source + find_callers separately → use get_symbol_context for
+   body, callers, and callees in one call (fewer round-trips, richer data)
  • Run external search tools in parallel with fw-context tools
  • Give up on fw-context after one empty result → try simpler query or
    different fw-context tool first
@@ -120,7 +122,9 @@ Leave ``project_only=False`` (default) when vendor code is relevant
  5. Only AFTER exhausting all fw-context tools — use other available tools.
 
  AGENT LOOP: Check(get_active_build) → Find(search_code/lookup_symbol)
-→ Read(get_source/get_symbol_context) → Trace(find_references/find_callers)
+→ Read(get_symbol_context) ← preferred (body+callers+callees in one call).
+  Fallback: get_source (body only).
+→ Trace(find_references/find_callers) — skip if context already from get_symbol_context.
 → For pattern-in-body searches use search_bodies.
 → DECISION after get_active_build():
   • status="ready" or "reindexing" — fw-context is fully operational.
@@ -136,6 +140,7 @@ DIFF → FW-CONTEXT VERIFICATION RULE:
   • find_references("<symbol>") — all callers/readers, not just diff context
   • search_bodies("<pattern>") — pattern consistency across entire codebase
   • find_call_path / find_all_callers_recursive — cross-module impact
+  • trace_data_flow("<type>", "<target>") — cross-module data dependencies
   • find_dead_code / find_hotspots — structural effects of changes
 → Do NOT draw conclusions from diff results alone — diff is for SCOPE
   discovery, fw-context is for IMPACT verification. They complement each
