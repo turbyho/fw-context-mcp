@@ -45,6 +45,7 @@ build-backend = "hatchling.build"
 packages = ["src/fw_context_mcp"]
 include = [
     "README.md",
+    "src/fw_context_mcp/data/**/*.md",
 ]
 
 [tool.ruff]

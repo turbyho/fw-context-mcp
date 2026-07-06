@@ -23,28 +23,6 @@ from .shared.context import _db_path
 log = logging.getLogger(__name__)
 
 
-def _make_cache_client(cfg: object):
-    """Create a CacheClient from config if a cache server URL is configured.
-
-    Returns None when cache_server is not configured or creation fails.
-    """
-    from ..cache_client import CacheClient
-    from ..config.settings import CacheServerConfig
-
-    cs: CacheServerConfig | None = getattr(cfg, "cache_server", None)
-    if cs is not None and cs.url:
-        try:
-            return CacheClient(
-                url=cs.url,
-                token=cs.token,
-                force=cs.force,
-                batch_size=cs.batch_size,
-            )
-        except Exception as exc:
-            log.warning("Failed to create CacheClient: %s", exc)
-    return None
-
-
 # ── Per-module cache ──
 _SOURCE_EXTS_WATCH = {".c", ".cpp", ".cc", ".cxx", ".h", ".hpp", ".hh", ".hxx"}
 
@@ -145,7 +123,8 @@ def _start_bg_watcher(root: Path) -> None:
                             if cfg_data:
                                 cfg = load_config(project_root=root)
                                 if cfg.llm.enabled and cfg.llm.analyze_symbols:
-                                    cc = _make_cache_client(cfg)
+                                    from ..cache_client import CacheClient
+                                    cc = CacheClient.from_config(cfg)
                                     try:
                                         _build_llm_analysis(conn, cfg_data["config_hash"], cfg.llm, db_path.parent,
                                                            cache_client=cc)

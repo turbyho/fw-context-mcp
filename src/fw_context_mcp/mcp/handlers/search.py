@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 import sqlite3
-from typing import Annotated
+from typing import Annotated, Any
 
 from pydantic import Field
 
@@ -371,8 +371,9 @@ def search_code(
                         (expanded, config_hash, limit),
                     ).fetchall()
                     if m_rows:
+                        macro_dicts: list[dict[str, Any]] = []
                         for r in m_rows:
-                            d = {
+                            d: dict[str, Any] = {
                                 "name": r["name"],
                                 "qualified_name": r["name"],
                                 "kind": "macro",
@@ -390,7 +391,8 @@ def search_code(
                                 d["_macro_value"] = r["value"]
                             if r.get("expanded_value"):
                                 d["_macro_expanded_value"] = r["expanded_value"]
-                            rows.append(d)
+                            macro_dicts.append(d)
+                        rows.extend(macro_dicts)
                 except (sqlite3.OperationalError, Exception):
                     pass  # macros_fts may not exist on older indexes
 

@@ -38,28 +38,6 @@ from ..shared.stale import _count_modified_files
 log = logging.getLogger(__name__)
 
 
-def _make_cache_client(cfg: object):
-    """Create a CacheClient from config if a cache server URL is configured.
-
-    Returns None when cache_server is not configured or creation fails.
-    """
-    from ...cache_client import CacheClient
-    from ...config.settings import CacheServerConfig
-
-    cs: CacheServerConfig | None = getattr(cfg, "cache_server", None)
-    if cs is not None and cs.url:
-        try:
-            return CacheClient(
-                url=cs.url,
-                token=cs.token,
-                force=cs.force,
-                batch_size=cs.batch_size,
-            )
-        except Exception as exc:
-            log.warning("Failed to create CacheClient: %s", exc)
-    return None
-
-
 # ── moved from server.py ──
 def get_active_build(
     project_root: Annotated[str | None, Field(description="Project root directory. Auto-detected from CWD if omitted.")] = None,
@@ -602,8 +580,9 @@ def reindex_file_impl(
                 # ── Phase 2: LLM analysis ──
                 if cfg.llm.enabled and cfg.llm.analyze_symbols and total_symbols > 0:
                     try:
+                        from ...cache_client import CacheClient
                         from ...indexer.runner import _build_llm_analysis
-                        cc = _make_cache_client(cfg)
+                        cc = CacheClient.from_config(cfg)
                         try:
                             _build_llm_analysis(conn, config_hash, cfg.llm, db_path.parent,
                                                write_lock_held=True, retry_unparseable=True,

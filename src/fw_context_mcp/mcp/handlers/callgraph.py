@@ -83,7 +83,7 @@ def _references_result(name: str, project_root: str | None, ref_kind: str | list
                     if not ref_rows:
                         label = "callers" if caller_mode else "references"
                         return [{"info": f"No {label} (macro) found for '{name}'.", **macro_def}]
-                    result: list[dict] = [
+                    macro_refs: list[dict] = [
                         {
                             "file": abs_path(root, r["file_path"]),
                             "ref_kind": "macro_use",
@@ -91,8 +91,8 @@ def _references_result(name: str, project_root: str | None, ref_kind: str | list
                         }
                         for r in ref_rows
                     ]
-                    result.insert(0, macro_def)
-                    return result
+                    macro_refs.insert(0, macro_def)
+                    return macro_refs
                 return [{"error": f"Symbol not found: {name}"}]
             if count_refs(conn, config_hash) == 0:
                 return [{"info": (
