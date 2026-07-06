@@ -1029,12 +1029,13 @@ def cmd_version(args: argparse.Namespace) -> int:
 
 def cmd_cache_stats(args: argparse.Namespace) -> int:
     """Show cache statistics for one or both tiers."""
+    from .config import derive_project_id
     from .config import load as load_config
     from .utils import resolve_project_root
-    from fw_context_mcp.cache_client import local_cache_stats
+    from fw_context_mcp.cache_client import local_cache_stats, CacheClient
 
     show_local = not args.remote
-    project_root = resolve_project_root(args.project) if hasattr(args, "project") else None
+    project_root = resolve_project_root(args.project) if hasattr(args, "project") and args.project else Path.cwd()
 
     # Tier 1: local global cache
     if show_local:
@@ -1043,32 +1044,53 @@ def cmd_cache_stats(args: argparse.Namespace) -> int:
 
     # Tier 2: remote cache
     if args.remote:
-        if project_root:
-            cfg = load_config(project_root=project_root)
-            cs = cfg.cache_server
-            if cs and cs.url:
-                token_preview = cs.token[:8] + "..." if cs.token else "n/a"
-                from fw_context_mcp.cache_client import CacheClient
-                cc = CacheClient(url=cs.url, token=cs.token)
+        cfg = load_config(project_root=project_root)
+        cs = cfg.cache_server
+        if not cs or not cs.url:
+            print("Remote cache (Tier 2): not configured (set [cache_server] in config)")
+            return 0
+
+        cc = CacheClient(url=cs.url, token=cs.token)
+        try:
+            remote_stats = cc.stats()
+            if not remote_stats:
+                print(f"Remote cache (Tier 2): {cs.url}")
+                print("  Server unreachable — check connectivity")
+                return 0
+
+            print(f"Remote cache (Tier 2): {cs.url}")
+            total = remote_stats.get("total_entries", 0)
+            newest = remote_stats.get("newest_entry", "")
+            models = remote_stats.get("models", {})
+
+            print(f"  Total entries: {total}")
+            if newest:
+                print(f"  Newest entry:  {newest}")
+            if models:
+                print("  Models:")
+                for model, cnt in sorted(models.items()):
+                    pct = f" ({cnt / total * 100:.0f}%)" if total else ""
+                    print(f"    {model}: {cnt}{pct}")
+
+            # Per-project breakdown: batch-lookup all sym's hash in this project
+            project_id = derive_project_id(project_root)
+            db_path = cfg.index.db_dir / project_id / "index.db"
+            if db_path.exists():
+                from .indexer.db import open_db
+                conn = open_db(db_path)
+                hashes: list[str] = []
                 try:
-                    remote_stats = cc.stats()
+                    hashes = [r[0] for r in conn.execute(
+                        "SELECT DISTINCT content_hash FROM llm_analysis WHERE content_hash != ''"
+                    ).fetchall()]
                 finally:
-                    cc.close()
-                if remote_stats:
-                    print(f"Remote cache (Tier 2): {cs.url}")
-                    print(f"  Total entries: {remote_stats.get('total_entries', 0)}")
-                    if remote_stats.get("newest_entry"):
-                        print(f"  Newest entry:  {remote_stats['newest_entry']}")
-                    if remote_stats.get("models"):
-                        for model, cnt in sorted(remote_stats["models"].items()):
-                            print(f"  {model}: {cnt}")
-                else:
-                    print(f"Remote cache (Tier 2): {cs.url} (token: {token_preview})")
-                    print("  Server unreachable — check connectivity")
-            else:
-                print("Remote cache (Tier 2): not configured (set [cache_server] in .fw-context/local.toml)")
-        else:
-            print("Remote cache (Tier 2): no project, cannot read config")
+                    conn.close()
+                if hashes:
+                    hits = cc.batch_get(hashes)
+                    cached_count = sum(1 for v in hits.values() if v is not None)
+                    print(f"  Project cache: {cached_count}/{len(hashes)} cached ({project_id})")
+        finally:
+            cc.close()
 
     return 0
 
