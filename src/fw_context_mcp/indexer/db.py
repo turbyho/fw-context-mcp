@@ -69,21 +69,8 @@ import fcntl
 import logging
 import os
 import re
-import struct
-import sys
-
-# Replace stdlib sqlite3 with pysqlite3 when available.
-# The stdlib sqlite3 on macOS (pyenv without --enable-loadable-sqlite-extensions)
-# lacks enable_load_extension(), which is required by sqlite-vec.
-# pysqlite3 provides a build of SQLite with extension support and pre-built
-# wheels for macOS, Linux, and Windows.
-try:
-    import pysqlite3
-
-    sys.modules["sqlite3"] = pysqlite3
-except ImportError:
-    pass
 import sqlite3
+import struct
 from collections.abc import Generator
 from contextlib import contextmanager
 from pathlib import Path

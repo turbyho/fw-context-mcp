@@ -30,3 +30,7 @@ htmlcov/
 work/
 tests/results/
 docs/examples/raw/
+
+# fw-context
+compile_commands.json
+.fw-context/local.toml

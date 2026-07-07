@@ -1493,21 +1493,18 @@ def cmd_cache_remote_init(args: argparse.Namespace) -> int:
     """Interactive wizard: configure remote cache server connection.
 
     Prompts for URL and token, verifies the connection, and writes
-    [cache_server] to the project's local.toml.
+    [cache_server] to the global config (~/.fw-context/config.toml).
     """
     import re
     import httpx
 
-    from .config.settings import _ensure_project_local_config
-    from .utils import resolve_project_root
+    from .config.settings import _ensure_global_config
 
-    project_root = resolve_project_root(args.project)
-
-    # Resolve local.toml
-    local_path = _ensure_project_local_config(project_root)
+    # Resolve global config
+    config_path = _ensure_global_config()
 
     # Read existing config
-    existing = local_path.read_text(encoding="utf-8")
+    existing = config_path.read_text(encoding="utf-8")
 
     # Show current config if any
     current_url = ""
@@ -1609,9 +1606,9 @@ token = "{token}"
         # Append
         new_content = existing.rstrip("\n") + "\n" + cache_section.strip() + "\n"
 
-    local_path.write_text(new_content, encoding="utf-8")
+    config_path.write_text(new_content, encoding="utf-8")
     print(f"\nRemote cache configured: {url}")
-    print(f"Config written to: {local_path}")
+    print(f"Config written to: {config_path}")
     print("Run 'fw-context cache stats --remote' to verify.")
 
     return 0
