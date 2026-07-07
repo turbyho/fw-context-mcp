@@ -139,6 +139,38 @@ class TestUpsertBuildConfig:
         ).fetchone()[0]
         assert count == 1
 
+    def test_insert_with_missing_embedding_dim_column(self, temp_db):
+        """UpsertBuildConfig must work even when embedding_dim column is missing.
+
+        Simulates an old database where the migration hasn't run yet by
+        creating the build_configs table WITHOUT the embedding_dim column,
+        then calling upsert_build_config. Exercises the _ensure_column fallback.
+        """
+        with transaction(temp_db):
+            upsert_project(temp_db, "proj-002", "old-project", "/tmp/old-project")
+        # Simulate pre-migration schema: drop and recreate build_configs
+        # without embedding_dim. Foreign keys must be off because
+        # files/symbols/etc. reference build_configs.
+        temp_db.execute("PRAGMA foreign_keys = OFF")
+        temp_db.execute("DROP TABLE build_configs")
+        temp_db.execute("""CREATE TABLE build_configs (
+            config_hash             TEXT PRIMARY KEY,
+            project_id              TEXT NOT NULL REFERENCES projects(project_id),
+            created_at              TEXT NOT NULL DEFAULT (datetime('now')),
+            compile_commands_path   TEXT NOT NULL
+        )""")
+        temp_db.execute("PRAGMA foreign_keys = ON")
+        temp_db.commit()
+
+        with transaction(temp_db):
+            upsert_build_config(temp_db, "hash-xyz", "proj-002", "/tmp/cc.json", embedding_dim=768)
+
+        row = temp_db.execute(
+            "SELECT * FROM build_configs WHERE config_hash=?", ("hash-xyz",)
+        ).fetchone()
+        assert row is not None
+        assert row["embedding_dim"] == 768
+
 
 class TestUpsertFile:
     def test_insert_new(self, populated_db):

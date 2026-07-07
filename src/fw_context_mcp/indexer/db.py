@@ -94,6 +94,42 @@ def _ensure_column(conn: sqlite3.Connection, table: str, column: str, type_def: 
             pass  # column already exists (race condition)
 
 
+def _ensure_migrated_columns(conn: sqlite3.Connection) -> None:
+    """Apply all ALTER TABLE ADD COLUMN migrations idempotently.
+
+    Runs UNCONDITIONALLY on every ``open_db()`` call, not just when the
+    schema version is outdated.  Handles edge cases where the version
+    was stamped but individual migrations were skipped or interrupted.
+
+    Fast path: checks all expected columns via ``PRAGMA table_info``
+    (read-only, no write lock).  On a fully migrated DB this returns
+    in sub-milliseconds.  Only falls through to the write transaction
+    when columns are genuinely missing.
+    """
+    # Fast path — read-only, no write lock.
+    for table, expected in _MIGRATED_COLUMNS.items():
+        actual = {r[1] for r in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+        if not expected.issubset(actual):
+            break
+    else:
+        return  # all columns present
+
+    # Slow path — some columns missing, apply migrations.
+    conn.execute("BEGIN")
+    try:
+        for stmt in _MIGRATION_ADD_COLUMNS:
+            try:
+                conn.execute(stmt)
+            except sqlite3.OperationalError as e:
+                if "duplicate column" not in str(e) and "no such table" not in str(e):
+                    raise
+    except Exception:
+        conn.rollback()
+        raise
+    else:
+        conn.commit()
+
+
 def _table_exists(conn: sqlite3.Connection, table: str) -> bool:
     """Return True if the named table exists in the database."""
     result = conn.execute(
@@ -291,6 +327,15 @@ _MIGRATION_ADD_COLUMNS = [
     "ALTER TABLE files ADD COLUMN content TEXT NOT NULL DEFAULT ''",
 ]
 
+# Pre-computed {table: {columns}} from _MIGRATION_ADD_COLUMNS.
+# Used by _ensure_migrated_columns() for a fast read-only check that
+# skips the write transaction when all columns already exist.
+_MIGRATED_COLUMNS: dict[str, set[str]] = {}
+for _stmt in _MIGRATION_ADD_COLUMNS:
+    _m = re.match(r"ALTER TABLE (\w+) ADD COLUMN (\w+)", _stmt, re.IGNORECASE)
+    if _m:
+        _MIGRATED_COLUMNS.setdefault(_m.group(1), set()).add(_m.group(2))
+
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS projects (
     project_id   TEXT PRIMARY KEY,
@@ -302,7 +347,8 @@ CREATE TABLE IF NOT EXISTS build_configs (
     config_hash             TEXT PRIMARY KEY,
     project_id              TEXT NOT NULL REFERENCES projects(project_id),
     created_at              TEXT NOT NULL DEFAULT (datetime('now')),
-    compile_commands_path   TEXT NOT NULL
+    compile_commands_path   TEXT NOT NULL,
+    embedding_dim           INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS files (
@@ -726,17 +772,9 @@ def open_db(path: Path, *, skip_integrity_check: bool = False) -> sqlite3.Connec
         try:
             conn.executescript(_SCHEMA)
 
-            # Simple add-column migrations — idempotent, run from
-            # _MIGRATION_ADD_COLUMNS so the schema fingerprint
-            # (CURRENT_SCHEMA_VERSION) stays in sync automatically.
-            for stmt in _MIGRATION_ADD_COLUMNS:
-                try:
-                    conn.execute(stmt)
-                    conn.commit()
-                except sqlite3.OperationalError as e:
-                    # Only skip "duplicate column" — re-raise disk-full etc.
-                    if "duplicate column" not in str(e):
-                        raise
+            # Simple add-column migrations — idempotent, delegated to
+            # _ensure_migrated_columns which runs in a single transaction.
+            _ensure_migrated_columns(conn)
 
             # Migration: is_project backfill — column added by
             # _MIGRATION_ADD_COLUMNS loop.  Backfill for existing indexes
@@ -927,13 +965,7 @@ def open_db(path: Path, *, skip_integrity_check: bool = False) -> sqlite3.Connec
                 conn.execute("PRAGMA mmap_size = 268435456")
                 conn.execute("PRAGMA synchronous = 1")
                 conn.executescript(_SCHEMA)
-                for stmt in _MIGRATION_ADD_COLUMNS:
-                    try:
-                        conn.execute(stmt)
-                        conn.commit()
-                    except sqlite3.OperationalError as e2:
-                        if "duplicate column" not in str(e2):
-                            raise
+                _ensure_migrated_columns(conn)
             elif "no such column" in str(e):
                 # Old database — _SCHEMA contains CREATE INDEX statements
                 # that reference columns (e.g. parent_usr) which don't exist
@@ -943,13 +975,7 @@ def open_db(path: Path, *, skip_integrity_check: bool = False) -> sqlite3.Connec
                 # Strategy: apply add-column migrations (skip tables that
                 # don't exist yet), then retry _SCHEMA to create remaining
                 # tables and indexes.
-                for stmt in _MIGRATION_ADD_COLUMNS:
-                    try:
-                        conn.execute(stmt)
-                        conn.commit()
-                    except sqlite3.OperationalError as e2:
-                        if "duplicate column" not in str(e2) and "no such table" not in str(e2):
-                            raise
+                _ensure_migrated_columns(conn)
                 try:
                     conn.executescript(_SCHEMA)
                 except sqlite3.OperationalError as e3:
@@ -971,6 +997,12 @@ def open_db(path: Path, *, skip_integrity_check: bool = False) -> sqlite3.Connec
         # PRAGMA does not support bound parameters, so we use an f-string.
         # CURRENT_SCHEMA_VERSION is an integer constant — no injection risk.
         conn.execute(f"PRAGMA user_version = {CURRENT_SCHEMA_VERSION}")
+
+    # ── Unconditional column sanity check ──────────────────────────────────
+    # Belt-and-suspenders: ensure all columns from _MIGRATION_ADD_COLUMNS
+    # exist, even when the version gate skipped the main migration block.
+    # Idempotent — on a fully migrated DB this is a single empty commit.
+    _ensure_migrated_columns(conn)
 
     # ── Defensive table creation ──────────────────────────────────────────
     # Critical tables that were added after the initial _SCHEMA definition.
@@ -1362,6 +1394,11 @@ def upsert_build_config(
     Returns:
         None.
     """
+    # Belt-and-suspenders: ensure embedding_dim column exists.
+    # Handles the edge case where open_db() skipped migrations because
+    # PRAGMA user_version already matched CURRENT_SCHEMA_VERSION.
+    _ensure_column(conn, "build_configs", "embedding_dim", "INTEGER")
+
     conn.execute(
         """INSERT INTO build_configs(config_hash, project_id, compile_commands_path, embedding_dim)
            VALUES (?,?,?,?)
