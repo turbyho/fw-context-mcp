@@ -8,6 +8,7 @@ same code path.
 from __future__ import annotations
 
 import logging
+import sqlite3
 import time
 from pathlib import Path
 
@@ -230,7 +231,14 @@ def store_symbols_for_unit(
                 exclude_paths=exclude_paths,
                 with_refs=index_refs,
             )
+        except sqlite3.Error:
+            log.error("Fatal DB error parsing %s — stopping indexer", unit.file.name)
+            raise
         except Exception as exc:
+            msg = str(exc)
+            if "unable to open database file" in msg:
+                log.error("Fatal DB error parsing %s: %s — stopping indexer", unit.file.name, exc)
+                raise
             log.warning("skip TU %s: %s", unit.file.name, exc)
             return 0, 0
 

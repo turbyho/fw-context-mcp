@@ -31,6 +31,11 @@ def get_local_cache_db(readonly: bool = False) -> sqlite3.Connection:
     The database and schema are created on first access.
     """
     _LOCAL_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    # SQLite mode=ro (read-only) requires the file to already exist.
+    # If the cache DB hasn't been created yet, silently switch to rwc
+    # mode so the file is created and the schema is initialized.
+    if readonly and not _LOCAL_CACHE_PATH.exists():
+        readonly = False
     uri = f"file:{_LOCAL_CACHE_PATH}?mode={'ro' if readonly else 'rwc'}"
     conn = sqlite3.connect(uri, uri=True)
     conn.execute("PRAGMA journal_mode=WAL")
@@ -233,8 +238,12 @@ class CacheClient:
                 # 5xx or 429 — retry with backoff
                 if attempt < _MAX_RETRIES - 1:
                     wait = _RETRY_BACKOFF ** (attempt + 1)
+                    logger.debug("Cache server returned %d (attempt %d/%d), retrying in %.1fs",
+                                 resp.status_code, attempt + 1, _MAX_RETRIES, wait)
                     time.sleep(wait)
                     continue
+                logger.warning("Cache server returned %d after %d retries — giving up",
+                              resp.status_code, _MAX_RETRIES)
             except Exception as e:
                 if attempt < _MAX_RETRIES - 1:
                     wait = _RETRY_BACKOFF ** (attempt + 1)
@@ -298,8 +307,12 @@ class CacheClient:
                     return 0
                 if attempt < _MAX_RETRIES - 1:
                     wait = _RETRY_BACKOFF ** (attempt + 1)
+                    logger.debug("Cache server write returned %d (attempt %d/%d), retrying in %.1fs",
+                                 resp.status_code, attempt + 1, _MAX_RETRIES, wait)
                     time.sleep(wait)
                     continue
+                logger.warning("Cache server write returned %d after %d retries — giving up",
+                              resp.status_code, _MAX_RETRIES)
             except Exception as e:
                 if attempt < _MAX_RETRIES - 1:
                     wait = _RETRY_BACKOFF ** (attempt + 1)

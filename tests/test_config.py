@@ -212,7 +212,7 @@ class TestSourceRootPaths:
         cfg = Config()
         cfg.index.exclude_paths = ["build", "BUILD"]
         (tmpdir / "build").mkdir()
-        (tmpdir / "BUILD").mkdir()
+        (tmpdir / "BUILD").mkdir(exist_ok=True)
         paths = cfg.exclude_root_paths(tmpdir)
         assert len(paths) == 2
         assert paths[0] == (tmpdir / "build").resolve()

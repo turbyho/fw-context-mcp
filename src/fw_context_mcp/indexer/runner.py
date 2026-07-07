@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import logging
 import os
+import sqlite3
 import threading
 import time
 from contextlib import nullcontext
@@ -538,8 +539,10 @@ def _build_llm_analysis(
                             local_db.close()
                         except Exception as e:
                             log.debug("Local global cache write failed: %s", e)
+                    else:
+                        log.debug("Remote cache miss for %s (hash=%s…)", qname, h[:12])
                 except Exception as e:
-                    log.debug("Remote cache lookup failed: %s", e)
+                    log.debug("Remote cache lookup failed for %s: %s", qname, e)
 
             if cached:
                 # Cache hit — re-use existing analysis
@@ -1024,7 +1027,14 @@ def _check_and_parse_unit(unit, config_hash, project_root, source_roots, exclude
             exclude_paths=exclude_paths,
             with_refs=index_refs,
         )
+    except sqlite3.Error:
+        log.error("Fatal DB error parsing %s — stopping indexer", unit.file.name)
+        raise
     except Exception as exc:
+        msg = str(exc)
+        if "unable to open database file" in msg:
+            log.error("Fatal DB error parsing %s: %s — stopping indexer", unit.file.name, exc)
+            raise
         log.warning("skip TU %s: %s", unit.file.name, exc)
         return ("skipped", None, None)
     t_parse_end = time.monotonic()
@@ -1156,7 +1166,14 @@ def _process_unit(unit, config_hash, project_root, source_roots, exclude_paths, 
             )
         timing = (t_parse, t_lock, t_write)
         return ("updated", syms_added, refs_added, timing)
+    except sqlite3.Error:
+        log.error("Fatal DB error storing %s — stopping indexer", unit.file.name)
+        raise
     except Exception as exc:
+        msg = str(exc)
+        if "unable to open database file" in msg:
+            log.error("Fatal DB error storing %s: %s — stopping indexer", unit.file.name, exc)
+            raise
         log.warning("skip TU %s: %s", unit.file.name, exc)
         return ("skipped", 0, 0, (0.0, 0.0, 0.0))
     finally:
@@ -1505,6 +1522,9 @@ def run(
                 )
             except Exception as e:
                 log.warning("Failed to create CacheClient: %s", e)
+        else:
+            log.info("Remote LLM cache server not configured — all symbols will be analyzed locally. "
+                     "Run 'fw-context cache-remote-init' to configure.")
 
         if force:
             conn.execute("DELETE FROM llm_analysis WHERE symbol_id IN (SELECT id FROM symbols WHERE config_hash = ?)", (config_hash,))

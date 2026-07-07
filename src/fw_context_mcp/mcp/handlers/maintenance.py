@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import sqlite3
 import time
 from pathlib import Path
 from typing import Annotated
@@ -530,7 +531,12 @@ def reindex_file_impl(
                     with_refs=cfg.index.index_refs,
                 )
                 parsed_units.append((unit, parsed))
+            except sqlite3.Error as exc:
+                return {"error": f"DB error during parse of {unit.file.name}: {exc}"}
             except Exception as exc:
+                msg = str(exc)
+                if "unable to open database file" in msg:
+                    return {"error": f"DB error during parse of {unit.file.name}: {exc}"}
                 log.warning("skip TU %s during reindex: %s", unit.file.name, exc)
 
         # Request bg reindex to pause — manual operations take priority.
@@ -612,6 +618,8 @@ def reindex_file_impl(
                     result["warning"] = "Header re-indexed via one TU. Other TUs including this header may still have stale symbols — run 'fw-context index' for full accuracy."
 
                 return result
+        except sqlite3.Error as exc:
+            return {"error": f"DB error during reindex: {exc}"}
         finally:
             _resume_bg_reindex(root)
             from ...mcp.shared.stale import _invalidate_modified_cache
