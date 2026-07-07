@@ -376,6 +376,11 @@ TOOLS: dict[str, AiTool] = {
                 method="separate_file",
                 scope="global",
             ),
+            InstructionTarget(
+                path="{project}/AGENTS.md",
+                method="marked_section",
+                scope="project",
+            ),
         ],
     ),
     "kilocode": AiTool(
@@ -394,6 +399,11 @@ TOOLS: dict[str, AiTool] = {
                 path="~/.codex/rules/fw-context.md",
                 method="separate_file",
                 scope="global",
+            ),
+            InstructionTarget(
+                path="{project}/.codex/rules/fw-context.md",
+                method="separate_file",
+                scope="project",
             ),
         ],
     ),

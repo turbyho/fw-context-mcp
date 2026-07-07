@@ -588,23 +588,31 @@ def cmd_init(args: argparse.Namespace) -> int:
                 print(f"        Supported: {', '.join(TOOLS.keys())}", file=sys.stderr)
                 return 1
     else:
-        # Detect tools based on scope
+        # Detect tools based on scope.
+        # For project scope: system-wide tools are always included — if a
+        # tool is installed but has no project files yet, we create them.
         project_tools = _detect_project_ai_tools(project_root)
+        system_wide = [tid for tid, t in TOOLS.items() if t.is_detected()]
         if args.scope == "project":
-            selected = project_tools
+            seen: set[str] = set(project_tools)
+            selected = list(project_tools)
+            for tid in system_wide:
+                if tid not in seen:
+                    seen.add(tid)
+                    selected.append(tid)
         elif args.scope == "global":
-            selected = [tid for tid, t in TOOLS.items() if t.is_detected()]
+            selected = system_wide
         else:  # all
-            global_tools = [tid for tid, t in TOOLS.items() if t.is_detected()]
-            seen: set[str] = set()
-            for tid in global_tools + project_tools:
+            seen = set()
+            selected = []
+            for tid in system_wide + project_tools:
                 if tid not in seen:
                     seen.add(tid)
                     selected.append(tid)
 
     if not selected:
         if args.scope == "project":
-            print("No AI assistant detected in this project.")
+            print("No AI assistant detected in this project or system-wide.")
             print()
             print("Run an AI assistant (Claude Code, OpenCode, etc.) in this project")
             print("directory first — it will create its config directory. Then re-run")
