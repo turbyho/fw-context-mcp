@@ -33,4 +33,5 @@ docs/examples/raw/
 
 # fw-context
 compile_commands.json
+mbed_config.h
 .fw-context/local.toml
