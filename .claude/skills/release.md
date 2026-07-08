@@ -56,6 +56,8 @@ Breaking changes: (omit this entire section if none)
 ```
 1. BUMP VERSION
    python3 bump.py <new-version>
+   # Updates pyproject.toml, server.json, glama.json:
+   #   version fields + description tool count (auto-detected from server.py)
 
 2. TESTS
    python3 -m pytest tests/ -x -q
@@ -83,6 +85,9 @@ Breaking changes: (omit this entire section if none)
 
 8. PYPI UPLOAD
    ~/.pyenv/versions/3.11.8/bin/python3 -m twine upload dist/*
+
+9. PUBLISH TO MCP REGISTRY (optional — after PyPI is live)
+   mcp-publisher publish
 ```
 
 ## Release notes format
@@ -117,7 +122,7 @@ Breaking changes: (omit this entire section if none)
 ## Pre-commit checks
 
 Before committing for release, verify:
-- [ ] Version bumped in `pyproject.toml` (and `server.json` if applicable)
+- [ ] Version bumped in `pyproject.toml`, `server.json`, and `glama.json` (run `python3 bump.py --check` to verify)
 - [ ] All tests pass
 - [ ] No debugging artifacts, commented-out code, or temporary files
 - [ ] `README.md` and `docs/` are up to date with the changes
