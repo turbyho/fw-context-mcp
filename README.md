@@ -1,3 +1,5 @@
+<!-- mcp-name: io.github.turbyho/fw-context-mcp -->
+
 # fw-context
 
 Modern large language models are remarkably good at understanding C and C++. Yet before they can reason about your code, they first have to reconstruct the program from source files.
