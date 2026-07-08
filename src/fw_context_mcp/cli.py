@@ -777,12 +777,12 @@ def cmd_project_init(args: argparse.Namespace) -> int:
     )
 
     # ── 2. .gitignore entries ──
-    _ensure_gitignore(project_root, fix=fix)
-
-    # ── 3. Build system ──
     from .indexer.build import detect_build_system
 
     build_system = detect_build_system(project_root)
+    _ensure_gitignore(project_root, fix=fix, build_system=build_system)
+
+    # ── 3. Build system ──
     if build_system:
         print(f"  [ok] build system: {build_system}")
     elif fix:
@@ -895,9 +895,12 @@ def _check_config_file(project_root: Path, rel_path: str, template: str, fix: bo
         print(f"  [ok] {path}")
 
 
-def _ensure_gitignore(project_root: Path, *, fix: bool = False) -> None:
+def _ensure_gitignore(project_root: Path, *, fix: bool = False, build_system: str | None = None) -> None:
     """Add ``compile_commands.json`` and ``.fw-context/local.toml`` to the
     project's ``.gitignore`` if they aren't already listed.
+
+    For Mbed OS projects, also adds ``mbed_config.h`` — the build-generated
+    config header that ends up in the project root.
 
     Reads the existing file (when present), checks each entry as a literal
     line, and appends missing entries.  Idempotent — running multiple times
@@ -908,9 +911,10 @@ def _ensure_gitignore(project_root: Path, *, fix: bool = False) -> None:
     """
     entries = [
         "compile_commands.json",
-        "mbed_config.h",
         ".fw-context/local.toml",
     ]
+    if build_system == "mbed-os":
+        entries.insert(1, "mbed_config.h")
 
     gitignore = project_root / ".gitignore"
     try:
