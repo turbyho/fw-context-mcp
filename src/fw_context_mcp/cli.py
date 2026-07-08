@@ -908,6 +908,7 @@ def _ensure_gitignore(project_root: Path, *, fix: bool = False) -> None:
     """
     entries = [
         "compile_commands.json",
+        "mbed_config.h",
         ".fw-context/local.toml",
     ]
 
