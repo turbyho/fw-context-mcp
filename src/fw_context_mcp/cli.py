@@ -461,74 +461,162 @@ def _detect_project_ai_tools(project_root: Path) -> list[str]:
     return found
 
 
+def _inject_agent_toml_section(path: Path, content: str, marker: str) -> None:
+    """Inject a ``# marker ... # /marker`` block into a Codex TOML agent file.
+
+    Codex agent files use TOML format with an ``[instructions]`` key that
+    holds freeform text.  The fw-context block is inserted into the
+    ``[instructions]`` section using ``# fw-context`` comment markers.
+    When no ``[instructions]`` section exists, one is created at the end
+    of the file.
+    """
+    import re
+
+    start_comment = f"# {marker}"
+    end_comment = f"# /{marker}"
+
+    existing = path.read_text(encoding="utf-8") if path.exists() else ""
+
+    # If markers already exist, replace between them
+    if start_comment in existing and end_comment in existing:
+        before = existing[: existing.index(start_comment)]
+        after = existing[existing.index(end_comment) + len(end_comment):]
+        updated = before.rstrip("\n") + "\n" + start_comment + "\n" + content + "\n" + end_comment + "\n" + after.lstrip("\n")
+    else:
+        # Find [instructions] section and insert the block there
+        instructions_match = re.search(r"^\[instructions\]\s*$", existing, re.MULTILINE)
+        if instructions_match:
+            # Find end of instructions section (next TOML section or EOF)
+            section_end = len(existing)
+            next_section = re.search(r"^\[", existing[instructions_match.end():], re.MULTILINE)
+            if next_section:
+                section_end = instructions_match.end() + next_section.start()
+            before = existing[:section_end]
+            after = existing[section_end:]
+            updated = before.rstrip("\n") + "\n" + start_comment + "\n" + content + "\n" + end_comment + "\n" + after
+        else:
+            # No [instructions] section — create one at end of file
+            updated = existing.rstrip("\n") + "\n\n[instructions]\n" + start_comment + "\n" + content + "\n" + end_comment + "\n"
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(updated, encoding="utf-8")
+
+
 def _install_agents(dry_run: bool = False, project_root: Path | None = None, scope: str = "project") -> bool:
-    """Ensure project agents have fw-context CRITICAL block.
+    """Inject fw-context CRITICAL block into ALL agent files across ALL AI tools.
 
-    Copies agent templates from ``data/agents/`` into AI tool agent
-    directories.  For agents that already exist, injects the CRITICAL
-    block via ``_inject_agent_section`` instead of overwriting the whole
-    file — this preserves any project-specific domain knowledge.
+    Scans agent directories for every registered tool (and cross-tool
+    ``.agents/`` standard directories), injecting ``AGENT_CRITICAL_BLOCK``
+    into each existing agent file.  Also installs template agents from
+    ``data/agents/`` into compatible directories where the template does
+    not yet exist.
 
-    For Claude Code the template is used as-is (``name:`` in frontmatter
-    determines the agent name).  For OpenCode the ``name:`` field is
-    stripped — OpenCode derives the agent name from the filename.
+    Agent directories and file patterns are driven by the ``TOOLS``
+    registry — no tool paths are hardcoded here.
     """
     import re
 
     from . import __file__ as _pkg_init
-    from .config.tools import AGENT_CRITICAL_BLOCK
+    from .config.tools import (
+        AGENT_CRITICAL_BLOCK,
+        CROSS_TOOL_AGENT_DIRS_GLOBAL,
+        CROSS_TOOL_AGENT_DIRS_PROJECT,
+        TOOLS,
+    )
 
     pkg_dir = Path(_pkg_init).parent
     agents_src = pkg_dir / "data" / "agents"
 
-    if not agents_src.is_dir():
-        return False
+    # Collect templates (may be empty if data/agents/ doesn't exist)
+    templates = sorted(agents_src.glob("*.md")) if agents_src.is_dir() else []
 
-    templates = sorted(agents_src.glob("*.md"))
-    if not templates:
-        return False
-
-    # Build target directories keyed by tool_id so we know which
-    # post-processing to apply (OpenCode strips the name: field).
-    targets: list[tuple[Path, str]] = []  # (dir, tool_id)
+    # Build target tuples: (directory, tool_id, file_patterns, strip_name)
+    targets: list[tuple[Path, str, list[str], bool]] = []
+    processed_dirs: set[Path] = set()
 
     if scope in ("global", "all"):
-        targets.append((Path.home() / ".claude" / "agents", "claude-code"))
-        targets.append((Path.home() / ".config" / "opencode" / "agents", "opencode"))
-        targets.append((Path.home() / ".agents" / "agents", "opencode"))
+        for tool_id, tool in TOOLS.items():
+            for dir_template in tool.agent_dirs_global:
+                resolved = Path(os.path.expanduser(dir_template))
+                if resolved in processed_dirs:
+                    continue
+                if resolved.exists() or scope == "all":
+                    targets.append((resolved, tool_id, tool.agent_file_patterns, tool.agent_strip_name))
+                    processed_dirs.add(resolved)
+        # Cross-tool standard directories
+        for dir_template in CROSS_TOOL_AGENT_DIRS_GLOBAL:
+            resolved = Path(os.path.expanduser(dir_template))
+            if resolved not in processed_dirs:
+                targets.append((resolved, "_cross", ["*.md"], True))
+                processed_dirs.add(resolved)
 
     if project_root is not None and scope in ("project", "all"):
-        targets.append((project_root / ".claude" / "agents", "claude-code"))
-        targets.append((project_root / ".opencode" / "agents", "opencode"))
-        targets.append((project_root / ".agents" / "agents", "opencode"))
+        for tool_id, tool in TOOLS.items():
+            for dir_template in tool.agent_dirs_project:
+                resolved = Path(dir_template.replace("{project}", str(project_root)))
+                if resolved in processed_dirs:
+                    continue
+                if resolved.exists() or scope == "all":
+                    targets.append((resolved, tool_id, tool.agent_file_patterns, tool.agent_strip_name))
+                    processed_dirs.add(resolved)
+        # Cross-tool standard directories
+        for dir_template in CROSS_TOOL_AGENT_DIRS_PROJECT:
+            resolved = Path(dir_template.replace("{project}", str(project_root)))
+            if resolved not in processed_dirs:
+                targets.append((resolved, "_cross", ["*.md"], True))
+                processed_dirs.add(resolved)
 
     installed = False
-    for agents_dir, tool_id in targets:
-        for template_path in templates:
-            agent_path = agents_dir / template_path.name
+    for agents_dir, _tool_id, patterns, strip_name in targets:
+        # ── Step 1: Inject CRITICAL block into ALL existing agent files ──
+        existing_files: list[Path] = []
+        for pattern in patterns:
+            existing_files.extend(sorted(agents_dir.glob(pattern)))
 
+        for agent_path in existing_files:
             if dry_run:
-                if agent_path.exists():
-                    print(f"  [dry-run] {agent_path}: would UPDATE fw-context section")
-                else:
-                    print(f"  [dry-run] {agent_path}: would CREATE with fw-context section")
+                print(f"  [dry-run] {agent_path}: would UPDATE fw-context section")
                 installed = True
                 continue
 
-            if agent_path.exists():
-                _inject_agent_section(agent_path, AGENT_CRITICAL_BLOCK, "fw-context")
-                print(f"  [ok] {agent_path}: updated fw-context section")
+            if agent_path.suffix == ".toml":
+                _inject_agent_toml_section(agent_path, AGENT_CRITICAL_BLOCK, "fw-context")
             else:
+                _inject_agent_section(agent_path, AGENT_CRITICAL_BLOCK, "fw-context")
+            print(f"  [ok] {agent_path}: updated fw-context section")
+            installed = True
+
+        # ── Step 2: Install template agents for compatible directories ──
+        if not templates:
+            continue
+        if not agents_dir.exists() and scope != "all":
+            continue
+
+        for template_path in templates:
+            # Only install .md templates into dirs with compatible patterns
+            template_suffix = template_path.suffix  # ".md"
+            is_compatible = any(
+                template_suffix in p or template_suffix == p.lstrip("*") for p in patterns
+            )
+            if not is_compatible:
+                continue
+
+            target_path = agents_dir / template_path.name
+
+            if dry_run:
+                if not target_path.exists():
+                    print(f"  [dry-run] {target_path}: would CREATE with fw-context section")
+                    installed = True
+                continue
+
+            if not target_path.exists():
                 agents_dir.mkdir(parents=True, exist_ok=True)
                 template_text = template_path.read_text(encoding="utf-8")
-                if tool_id != "claude-code":
-                    # Non-Claude clients (OpenCode, .agents/ standard) derive
-                    # the agent name from the filename — strip the ``name:``
-                    # field which only Claude Code recognizes.
+                if strip_name:
                     template_text = re.sub(r"^name:.*\n", "", template_text, flags=re.MULTILINE)
-                agent_path.write_text(template_text, encoding="utf-8")
-                print(f"  [ok] {agent_path}: created with fw-context section")
-            installed = True
+                target_path.write_text(template_text, encoding="utf-8")
+                print(f"  [ok] {target_path}: created with fw-context section")
+                installed = True
 
     return installed
 

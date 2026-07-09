@@ -309,6 +309,14 @@ class AiTool:
     mcp_config_file: str | None = None
     mcp_config_key: str | None = None
     targets: list[InstructionTarget] = field(default_factory=list)
+    agent_dirs_global: list[str] = field(default_factory=list)
+    """Global agent directories for this tool. Supports ``~`` home expansion."""
+    agent_dirs_project: list[str] = field(default_factory=list)
+    """Project agent directories for this tool. Supports ``{project}`` substitution."""
+    agent_file_patterns: list[str] = field(default_factory=lambda: ["*.md"])
+    """Glob patterns for agent files in the agent directories."""
+    agent_strip_name: bool = False
+    """Strip ``name:`` from YAML frontmatter when creating template agents."""
 
     def is_detected(self) -> bool:
         """Return True if the tool appears to be installed."""
@@ -351,6 +359,9 @@ TOOLS: dict[str, AiTool] = {
         detection_binaries=["claude"],
         detection_dirs=["~/.claude"],
         mcp_registration="claude mcp add --scope user fw-context {bin}",
+        agent_dirs_global=["~/.claude/agents"],
+        agent_dirs_project=["{project}/.claude/agents"],
+        agent_file_patterns=["*.md"],
         targets=[
             InstructionTarget(
                 path="~/.claude/CLAUDE.md",
@@ -370,6 +381,10 @@ TOOLS: dict[str, AiTool] = {
         detection_dirs=["~/.config/opencode"],
         mcp_config_file="~/.config/opencode/opencode.json",
         mcp_config_key="fw-context",
+        agent_dirs_global=["~/.config/opencode/agents"],
+        agent_dirs_project=["{project}/.opencode/agents"],
+        agent_file_patterns=["*.md"],
+        agent_strip_name=True,
         targets=[
             InstructionTarget(
                 path="~/.config/opencode/rules/fw-context.md",
@@ -394,6 +409,10 @@ TOOLS: dict[str, AiTool] = {
         id="codex",
         name="Codex",
         detection_dirs=["~/.codex"],
+        agent_dirs_global=["~/.codex/agents"],
+        agent_dirs_project=["{project}/.codex/agents"],
+        agent_file_patterns=["*.toml"],
+        agent_strip_name=True,
         targets=[
             InstructionTarget(
                 path="~/.codex/rules/fw-context.md",
@@ -411,6 +430,9 @@ TOOLS: dict[str, AiTool] = {
         id="cursor",
         name="Cursor",
         detection_dirs=["~/.cursor", "~/.config/Cursor"],
+        agent_dirs_global=["~/.cursor/agents"],
+        agent_dirs_project=["{project}/.cursor/agents"],
+        agent_file_patterns=["*.mdc"],
         targets=[
             InstructionTarget(
                 path="{project}/.cursor/rules/fw-context.mdc",
@@ -420,6 +442,12 @@ TOOLS: dict[str, AiTool] = {
         ],
     ),
 }
+
+
+# ── Cross-tool agent directories ─────────────────────────────────────────────
+
+CROSS_TOOL_AGENT_DIRS_GLOBAL = ["~/.agents/agents"]
+CROSS_TOOL_AGENT_DIRS_PROJECT = ["{project}/.agents/agents"]
 
 
 # ── Collision detection ─────────────────────────────────────────────────────
