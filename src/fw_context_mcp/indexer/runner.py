@@ -6,6 +6,7 @@ that runner, reindex_file, and auto-reindex all use the same code path.
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
 import sqlite3
@@ -20,10 +21,11 @@ from ..utils import MTIME_TOLERANCE_S, read_file_lines
 from .compile_commands import _SOURCE_EXTS, validate_include_files
 from .compile_commands import parse as parse_compile_commands
 from .config_hash import compute as compute_config_hash
+from .config_hash import compute_flags_hash, compute_tu_content_hash, normalize_entry
 from .db import (
     CURRENT_SCHEMA_VERSION,
     drop_fts_triggers,
-    get_file_mtimes,
+    get_file_hashes,
     open_db,
     rebuild_files_fts,
     rebuild_fts,
@@ -989,34 +991,188 @@ def _build_hotspot_cache(conn, config_hash: str) -> None:
     log.info("Hotspot cache stored: %d entries", cnt)
 
 
-def _check_and_parse_unit(unit, config_hash, project_root, source_roots, exclude_paths, index_refs, existing_files, force=False):
+# ── Content-hash helpers ────────────────────────────────────────────
+
+
+def _compute_source_hash(file_path: Path) -> str:
+    """Return SHA-256 hex digest of file content."""
+    return hashlib.sha256(file_path.read_bytes()).hexdigest()
+
+
+def _parse_dep_file(d_path: Path) -> list[Path]:
+    """Parse a gcc-generated ``.d`` dependency file and return absolute header paths.
+
+    Format::
+
+        build/main.o: src/main.cpp src/main.h lib/utils.h
+
+    Returns an empty list for malformed or missing files.
+    """
+    try:
+        text = d_path.read_text()
+    except OSError:
+        return []
+    # First line: "target: dep1 dep2 dep3 \"
+    # Continuation lines: "  dep4 dep5"
+    # Join all lines, strip the target part
+    text = text.replace("\\\n", " ")
+    if ":" in text:
+        _, deps_part = text.split(":", 1)
+    else:
+        deps_part = text
+    headers: list[Path] = []
+    for token in deps_part.split():
+        token = token.strip()
+        if not token:
+            continue
+        p = Path(token)
+        if not p.is_absolute():
+            p = d_path.parent / p
+        p = p.resolve()
+        if p.exists() and p.suffix.lower() in {".h", ".hpp", ".hxx", ".hh", ".inl"}:
+            headers.append(p)
+    return headers
+
+
+def _compute_deps_hash(headers: list[Path], cache: dict[str, str]) -> str:
+    """Return SHA-256 hex digest of the concatenated SHA-256 hashes of all headers.
+
+    Uses *cache* to avoid re-reading and re-hashing common headers within
+    a single indexing run (``stdio.h`` may be included by hundreds of TUs).
+    Entries whose cached hash is the empty string were unreadable — they
+    are counted toward the hash so a missing file is treated as a change.
+    """
+    parts: list[str] = []
+    for h in sorted(headers, key=lambda p: str(p)):
+        key = str(h)
+        if key not in cache:
+            try:
+                cache[key] = hashlib.sha256(h.read_bytes()).hexdigest()
+            except OSError:
+                cache[key] = ""  # sentinel for unreadable → force reparse
+        parts.append(cache[key])
+    return hashlib.sha256("".join(parts).encode()).hexdigest()
+
+
+def _find_dep_path(unit) -> Path | None:
+    """Locate the ``.d`` dependency file for a translation unit.
+
+    Scans the raw compile_commands entry for ``-MF <path>``, then falls
+    back to replacing the source file extension with ``.d``.
+    """
+    # Try -MF flag from raw entry first
+    if unit.raw_entry is not None:
+        raw_args: list[str] = unit.raw_entry.get("arguments") or []
+        for i, token in enumerate(raw_args):
+            if token == "-MF" and i + 1 < len(raw_args):
+                d = Path(raw_args[i + 1])
+                if not d.is_absolute() and unit.directory:
+                    d = unit.directory / d
+                d = d.resolve()
+                if d.exists():
+                    return d
+        # Also try with expanded response files in normalize_entry
+        norm = normalize_entry(unit.raw_entry)
+        for i, arg in enumerate(norm["args"]):
+            if arg == "-MF" and i + 1 < len(norm["args"]):
+                d = Path(norm["args"][i + 1])
+                if not d.is_absolute() and unit.directory:
+                    d = unit.directory / d
+                d = d.resolve()
+                if d.exists():
+                    return d
+
+    # Fallback: replace source extension with .d next to the source
+    d = unit.file.with_suffix(".d")
+    if d.exists():
+        return d
+    # Also try the object directory pattern: build/obj/main.o → build/obj/main.d
+    # Not needed when -MF is present, but helpful for simple setups
+    return None
+
+
+def _check_and_parse_unit(unit, config_hash, project_root, source_roots, exclude_paths, index_refs, existing_files, force=False, header_hash_cache=None):
     """Check whether *unit* needs re-parsing and parse it if so.
+
+    Uses a three-tier staleness check:
+    1. **mtime fast-path** — unchanged mtime → skip (no I/O).
+    2. **content-hash check** — mtime differs but hashes match → skip
+       (the source, flags, and header dependencies have not changed).
+    3. **libclang parse** — content hashes differ → parse.
 
     Does NOT write to the database — the caller is responsible for
     acquiring ``write_lock`` and calling ``_process_unit(pre_parsed=...)``
     to persist the result.
 
+    Args:
+        header_hash_cache: Optional ``dict[str, str]`` for per-run header
+            SHA-256 caching.  When ``None``, a new cache is created.
+
     Returns:
-        * ``("unchanged", None, None)`` — mtime matched, no re-parse needed.
-        * ``("skipped", None, None)`` — excluded path or parse failed.
-        * ``("updated", parsed, (t_start, t_end))`` — parsed successfully,
-          ready for ``_process_unit(pre_parsed=parsed, parse_timing=...)``.
+        * ``("unchanged", None, None, hashes)`` — no re-parse needed.
+          *hashes* is a ``(source_hash, flags_hash, deps_hash, deps_exist)``
+          tuple, or ``None`` when the fast-path mtime check succeeded.
+        * ``("skipped", None, None, None)`` — excluded path or parse failed.
+        * ``("updated", parsed, (t_start, t_end), hashes)`` — parsed
+          successfully, ready for ``_process_unit(pre_parsed=parsed)``.
+          *hashes* is ``(source_hash, flags_hash, deps_hash, deps_exist)``.
     """
+    if header_hash_cache is None:
+        header_hash_cache = {}
+
     resolved_tu = unit.file.resolve()
     if any(resolved_tu == ep or resolved_tu.is_relative_to(ep) for ep in exclude_paths):
-        return ("unchanged", None, None)
+        return ("unchanged", None, None, None)
 
     file_path = str(unit.file)
     force_refs = force or os.environ.get("FW_CONTEXT_FORCE_REFINDEX") == "1"
+
+    # ── Tier 1: mtime fast-path ──
     if not force_refs and file_path in existing_files:
-        _, stored_mtime = existing_files[file_path]
+        rec = existing_files[file_path]
+        stored_mtime = rec[1]
         try:
             current_mtime = unit.file.stat().st_mtime if unit.file.exists() else 0.0
         except OSError:
             current_mtime = 0.0
         if current_mtime <= stored_mtime + MTIME_TOLERANCE_S:
-            return ("unchanged", None, None)
+            return ("unchanged", None, None, None)
 
+    # ── Tier 2: content-hash check (mtime differs) ──
+    # Compute source and flags hashes first — cheap operations.
+    try:
+        source_hash = _compute_source_hash(unit.file)
+    except OSError:
+        source_hash = ""
+
+    if unit.raw_entry is not None:
+        flags_hash = compute_flags_hash(unit.raw_entry)
+    else:
+        flags_hash = ""
+
+    # Locate and hash header dependencies from .d file
+    dep_path = _find_dep_path(unit)
+    deps_exist = dep_path is not None
+    if deps_exist:
+        headers = _parse_dep_file(dep_path)
+        deps_hash = _compute_deps_hash(headers, header_hash_cache)
+    else:
+        deps_hash = ""
+
+    content_hash = compute_tu_content_hash(source_hash, flags_hash, deps_hash)
+    hashes = (source_hash, flags_hash, deps_hash, deps_exist)
+
+    if not force_refs and file_path in existing_files:
+        rec = existing_files[file_path]
+        # rec layout from get_file_hashes():
+        # (file_id, mtime, stored_content_hash, stored_source_hash,
+        #  stored_flags_hash, stored_deps_hash, stored_deps_exist)
+        if len(rec) >= 3 and rec[2] == content_hash:
+            # Content unchanged — just the mtime was bumped by a rebuild.
+            # Logged as "unchanged (content)" to distinguish from mtime skip.
+            return ("unchanged", None, None, hashes)
+
+    # ── Tier 3: libclang parse ──
     from .symbols import extract_all
 
     t_parse_start = time.monotonic()
@@ -1036,12 +1192,12 @@ def _check_and_parse_unit(unit, config_hash, project_root, source_roots, exclude
             log.error("Fatal DB error parsing %s: %s — stopping indexer", unit.file.name, exc)
             raise
         log.warning("skip TU %s: %s", unit.file.name, exc)
-        return ("skipped", None, None)
+        return ("skipped", None, None, None)
     t_parse_end = time.monotonic()
-    return ("updated", parsed, (t_parse_start, t_parse_end))
+    return ("updated", parsed, (t_parse_start, t_parse_end), hashes)
 
 
-def _process_unit(unit, config_hash, project_root, source_roots, exclude_paths, index_refs, db_path, existing_files, lock=None, conn=None, force=False, pre_parsed=None, parse_timing=(0.0, 0.0)):
+def _process_unit(unit, config_hash, project_root, source_roots, exclude_paths, index_refs, db_path, existing_files, lock=None, conn=None, force=False, pre_parsed=None, parse_timing=(0.0, 0.0), hashes=None):
     """Process one translation unit: check staleness, parse, store.
 
     Opens its own DB connection when *conn* is ``None``, otherwise reuses
@@ -1100,7 +1256,8 @@ def _process_unit(unit, config_hash, project_root, source_roots, exclude_paths, 
         file_path = str(unit.file)
         force_refs = force or os.environ.get("FW_CONTEXT_FORCE_REFINDEX") == "1"
         if not force_refs and file_path in existing_files:
-            _, stored_mtime = existing_files[file_path]
+            rec = existing_files[file_path]
+            stored_mtime = rec[1]  # mtime is always index 1 (handles old 2-tuple and new 7-tuple format)
             try:
                 current_mtime = unit.file.stat().st_mtime if unit.file.exists() else 0.0
             except OSError:
@@ -1155,6 +1312,7 @@ def _process_unit(unit, config_hash, project_root, source_roots, exclude_paths, 
                     index_refs=index_refs,
                     pre_parsed=parsed,
                     existing_files=existing_files,
+                    hashes=hashes,
                 )
             t_write_end = time.monotonic()
             t_parse = t_parse_end - t_parse_start
@@ -1314,7 +1472,11 @@ def run(
     for unit in units:
         validate_include_files(unit.clang_args)
 
-    existing_files = get_file_mtimes(conn, config_hash)
+    existing_files = get_file_hashes(conn, config_hash)
+
+    # Per-run cache for header SHA-256 hashes — avoids re-reading
+    # common headers (e.g. stdio.h) for every translation unit.
+    header_hash_cache: dict[str, str] = {}
 
     # Drop FTS5 content-sync triggers before bulk indexing — each symbol
     # INSERT/DELETE/UPDATE would otherwise pay per-row FTS index overhead
@@ -1391,19 +1553,38 @@ def run(
         processed = i + 1
 
         # ── Phase 1: staleness check + libclang parse (no lock) ──
-        check_status, parsed_data, parse_timing = _check_and_parse_unit(
+        check_status, parsed_data, parse_timing, hashes = _check_and_parse_unit(
             unit, config_hash, project_root,
             source_roots, exclude_paths, index_refs, existing_files,
             force=force,
+            header_hash_cache=header_hash_cache,
         )
 
         if check_status == "unchanged":
             unchanged += 1
-            # Fill ifdef-filtered file content via tokenization
-            # (skipped by store_symbols_for_unit since TU wasn't re-parsed)
+            # If hashes are present (content-hash match, not mtime match),
+            # update stored mtime so future mtime checks still fast-path.
             with write_lock(db_path.parent, timeout=120.0):
+                if hashes is not None:
+                    source_hash, flags_hash, deps_hash, deps_exist = hashes
+                    content_hash_val = compute_tu_content_hash(source_hash, flags_hash, deps_hash)
+                    file_id = existing_files[str(unit.file)][0]
+                    try:
+                        current_mtime = unit.file.stat().st_mtime if unit.file.exists() else 0.0
+                    except OSError:
+                        current_mtime = 0.0
+                    conn.execute(
+                        """UPDATE files SET mtime=?, content_hash=?, source_hash=?,
+                           flags_hash=?, deps_hash=?, deps_exist=?
+                           WHERE id=?""",
+                        (current_mtime, content_hash_val, source_hash, flags_hash,
+                         deps_hash, int(deps_exist), file_id),
+                    )
+                # Fill ifdef-filtered file content via tokenization
+                # (skipped by store_symbols_for_unit since TU wasn't re-parsed)
                 content_filled += _build_filtered_file_content(conn, unit, config_hash, project_root)
-            log.info("[%d/%d] %s: unchanged", processed, len(units), fname)
+            terse = "unchanged (content)" if hashes is not None else "unchanged"
+            log.info("[%d/%d] %s: %s", processed, len(units), fname, terse)
             continue
 
         if check_status == "skipped":
@@ -1417,6 +1598,7 @@ def run(
                 unit, config_hash, project_root,
                 source_roots, exclude_paths, index_refs, db_path, existing_files,
                 conn=conn, force=force, pre_parsed=parsed_data, parse_timing=parse_timing,
+                hashes=hashes,
             )
             if status == "updated":
                 updated += 1
@@ -1567,6 +1749,20 @@ def run(
         _build_hotspot_cache(conn, config_hash)
         conn.commit()
         log.info("done  %s", _fmt_dur(time.monotonic() - t_hs))
+
+    # Determine deps verification level after all TUs are processed
+    deps_total, deps_with_d = conn.execute(
+        "SELECT COUNT(*), SUM(CASE WHEN deps_exist THEN 1 ELSE 0 END) FROM files WHERE config_hash=?",
+        (config_hash,),
+    ).fetchone()
+    if deps_total == 0 or deps_with_d is None:
+        deps_verification = "none"
+    elif deps_with_d >= deps_total:
+        deps_verification = "full"
+    else:
+        deps_verification = "partial"
+    upsert_build_config(conn, config_hash, project_id, str(compile_commands),
+                        deps_verification=deps_verification)
 
     elapsed = time.monotonic() - t0
     try:

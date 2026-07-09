@@ -12,6 +12,7 @@ import sqlite3
 import time
 from pathlib import Path
 
+from fw_context_mcp.indexer.config_hash import compute_tu_content_hash
 from fw_context_mcp.indexer.db import (
     _ensure_column,
     delete_fp_assignments_for_file,
@@ -180,6 +181,7 @@ def store_symbols_for_unit(
     index_refs: bool = False,
     pre_parsed=None,
     existing_files: dict[str, tuple[int, float]] | None = None,
+    hashes=None,
 ) -> tuple[int, int]:
     """Parse one translation unit and store its symbols + refs in the DB.
 
@@ -272,7 +274,7 @@ def store_symbols_for_unit(
     old_usrs: set[str] = set()
     saved_analyses: dict[str, dict] = {}  # usr → {summary, inputs, output, model, content_hash}
     if file_path in known:
-        file_id_old, _ = known[file_path]
+        file_id_old = known[file_path][0]
         old_rows = conn.execute(
             """SELECT s.usr, a.summary, a.inputs, a.outputs, a.model, a.content_hash
                FROM symbols s
@@ -292,13 +294,25 @@ def store_symbols_for_unit(
 
     # ── Phase 2: Delete old symbols (existing logic) ──
     if file_path in known:
-        file_id_old, _ = known[file_path]
+        file_id_old = known[file_path][0]
         delete_inheritance_for_file(conn, config_hash, file_id_old)
         delete_symbols_for_file(conn, file_id_old)
         # ON DELETE CASCADE → llm_analysis, embeddings removed
 
     # Upsert the TU file record
-    upsert_file(conn, config_hash, file_path, unit.language, mtime=current_mtime)
+    if hashes is not None:
+        source_hash, flags_hash, deps_hash, deps_exist = hashes
+        content_hash_val = compute_tu_content_hash(source_hash, flags_hash, deps_hash)
+        upsert_file(
+            conn, config_hash, file_path, unit.language, mtime=current_mtime,
+            content_hash=content_hash_val,
+            source_hash=source_hash,
+            flags_hash=flags_hash,
+            deps_hash=deps_hash,
+            deps_exist=deps_exist,
+        )
+    else:
+        upsert_file(conn, config_hash, file_path, unit.language, mtime=current_mtime)
 
     syms_added = 0
     refs_added = 0

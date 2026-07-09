@@ -37,6 +37,7 @@ __all__ = [
     "get_file_map",
     "get_file_mtime_indexed",
     "get_file_mtimes",
+    "get_file_hashes",
     "get_llm_analysis_for_symbol",
     "get_overrides_for_method",
     "get_template_instances",
@@ -325,6 +326,12 @@ _MIGRATION_ADD_COLUMNS = [
     "ALTER TABLE llm_analysis ADD COLUMN content_hash TEXT NOT NULL DEFAULT ''",
     "ALTER TABLE build_configs ADD COLUMN embedding_dim INTEGER",
     "ALTER TABLE files ADD COLUMN content TEXT NOT NULL DEFAULT ''",
+    "ALTER TABLE files ADD COLUMN content_hash TEXT NOT NULL DEFAULT ''",
+    "ALTER TABLE files ADD COLUMN source_hash TEXT NOT NULL DEFAULT ''",
+    "ALTER TABLE files ADD COLUMN flags_hash TEXT NOT NULL DEFAULT ''",
+    "ALTER TABLE files ADD COLUMN deps_hash TEXT NOT NULL DEFAULT ''",
+    "ALTER TABLE files ADD COLUMN deps_exist INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE build_configs ADD COLUMN deps_verification TEXT NOT NULL DEFAULT 'none'",
 ]
 
 # Pre-computed {table: {columns}} from _MIGRATION_ADD_COLUMNS.
@@ -1377,6 +1384,7 @@ def upsert_build_config(
     project_id: str,
     compile_commands_path: str,
     embedding_dim: int | None = None,
+    deps_verification: str = "none",
 ) -> None:
     """Insert or update a build configuration record.
 
@@ -1390,6 +1398,9 @@ def upsert_build_config(
         compile_commands_path: Absolute path to ``compile_commands.json``.
         embedding_dim: Embedding vector dimension detected from the model.
             ``None`` when embeddings are disabled or not yet generated.
+        deps_verification: ``"full"``, ``"partial"``, or ``"none"`` —
+            indicates whether .d dependency files were available during
+            indexing.
 
     Returns:
         None.
@@ -1398,15 +1409,18 @@ def upsert_build_config(
     # Handles the edge case where open_db() skipped migrations because
     # PRAGMA user_version already matched CURRENT_SCHEMA_VERSION.
     _ensure_column(conn, "build_configs", "embedding_dim", "INTEGER")
+    _ensure_column(conn, "build_configs", "deps_verification", "TEXT")
 
     conn.execute(
-        """INSERT INTO build_configs(config_hash, project_id, compile_commands_path, embedding_dim)
-           VALUES (?,?,?,?)
+        """INSERT INTO build_configs(config_hash, project_id, compile_commands_path,
+                                     embedding_dim, deps_verification)
+           VALUES (?,?,?,?,?)
            ON CONFLICT(config_hash) DO UPDATE SET
                created_at = datetime('now'),
                compile_commands_path = excluded.compile_commands_path,
-               embedding_dim = coalesce(excluded.embedding_dim, build_configs.embedding_dim)""",
-        (config_hash, project_id, compile_commands_path, embedding_dim),
+               embedding_dim = coalesce(excluded.embedding_dim, build_configs.embedding_dim),
+               deps_verification = excluded.deps_verification""",
+        (config_hash, project_id, compile_commands_path, embedding_dim, deps_verification),
     )
 
 
@@ -1417,6 +1431,11 @@ def upsert_file(
     language: str,
     generated: bool = False,
     mtime: float = 0.0,
+    content_hash: str = "",
+    source_hash: str = "",
+    flags_hash: str = "",
+    deps_hash: str = "",
+    deps_exist: bool = False,
 ) -> int:
     """Insert or update a file record, returning its row id.
 
@@ -1433,29 +1452,73 @@ def upsert_file(
         language: ``"c"`` or ``"cpp"`` — set during compilation database parsing.
         generated: Whether the file is auto-generated (default False).
         mtime: Last-modified timestamp (float, seconds since epoch).
+        content_hash: SHA-256 hash of source + flags + deps content (default "").
+        source_hash: SHA-256 hash of the source file content.
+        flags_hash: SHA-256 hash of normalized compiler flags for this TU.
+        deps_hash: SHA-256 hash of all header dependencies (from .d file).
+        deps_exist: Whether .d dependency file was available for this TU.
 
     Returns:
         int: The ``files.id`` of the inserted or updated row.
     """
     cur = conn.execute(
-        """INSERT INTO files(config_hash, path, language, generated, mtime)
-           VALUES (?,?,?,?,?)
+        """INSERT INTO files(config_hash, path, language, generated, mtime,
+                             content_hash, source_hash, flags_hash, deps_hash, deps_exist)
+           VALUES (?,?,?,?,?,?,?,?,?,?)
            ON CONFLICT(config_hash, path) DO UPDATE SET
                language=excluded.language,
-               mtime=excluded.mtime
+               mtime=excluded.mtime,
+               content_hash=excluded.content_hash,
+               source_hash=excluded.source_hash,
+               flags_hash=excluded.flags_hash,
+               deps_hash=excluded.deps_hash,
+               deps_exist=excluded.deps_exist
            RETURNING id""",
-        (config_hash, path, language, int(generated), mtime),
+        (
+            config_hash, path, language, int(generated), mtime,
+            content_hash, source_hash, flags_hash, deps_hash, int(deps_exist),
+        ),
     )
     row = cur.fetchone()
     return row[0]
 
 
 def get_file_mtimes(conn: sqlite3.Connection, config_hash: str) -> dict[str, tuple[int, float]]:
-    """Return {path: (file_id, mtime)} for all files under config_hash."""
+    """Return {path: (file_id, mtime)} for all files under config_hash.
+
+    .. deprecated::
+        Use :func:`get_file_hashes` instead — it returns content hashes
+        needed for content-addressable staleness detection.
+    """
     rows = conn.execute(
         "SELECT id, path, mtime FROM files WHERE config_hash=?", (config_hash,)
     ).fetchall()
     return {r["path"]: (r["id"], r["mtime"]) for r in rows}
+
+
+def get_file_hashes(conn: sqlite3.Connection, config_hash: str) -> dict[str, tuple[int, float, str, str, str, str, bool]]:
+    """Return ``{path: (file_id, mtime, content_hash, source_hash, flags_hash, deps_hash, deps_exist)}``.
+
+    Used by the runner for content-addressable staleness detection — even
+    when mtime differs, a matching content_hash means the TU can be skipped.
+    """
+    rows = conn.execute(
+        """SELECT id, path, mtime, content_hash, source_hash, flags_hash, deps_hash, deps_exist
+           FROM files WHERE config_hash=?""",
+        (config_hash,),
+    ).fetchall()
+    return {
+        r["path"]: (
+            r["id"],
+            r["mtime"],
+            r["content_hash"],
+            r["source_hash"],
+            r["flags_hash"],
+            r["deps_hash"],
+            bool(r["deps_exist"]),
+        )
+        for r in rows
+    }
 
 
 def delete_symbols_for_file(conn: sqlite3.Connection, file_id: int) -> None:
