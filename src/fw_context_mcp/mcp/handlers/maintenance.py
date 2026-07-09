@@ -171,6 +171,9 @@ def get_active_build(
             else:
                 status = "ready"
 
+            # Read deps verification level from the build config
+            deps_verification = cfg["deps_verification"] if "deps_verification" in cfg else "none"
+
             # Build human-readable index message
             if status == "ready":
                 index_message = f"Index is fully up to date ({sym_count} symbols)"
@@ -196,6 +199,24 @@ def get_active_build(
             else:
                 index_message = "Compile commands changed — run fw-context index. Queries still work on existing data."
 
+            # When deps are not fully verified, emit a strict warning that the
+            # LLM MUST relay to the user — header changes cannot be detected
+            # without .d files, so the index may be silently stale.
+            _warning = None
+            if deps_verification != "full":
+                _warning = (
+                    "⚠️ INDEX DEGRADED — STOP ALL C/C++ ANALYSIS IMMEDIATELY.\n\n"
+                    "Header dependency (.d) files are NOT available for this index "
+                    f"(deps verification: {deps_verification}). "
+                    "The index may contain STALE data — header changes cannot be "
+                    "detected without .d files. Continuing analysis with a stale "
+                    "index WILL produce incorrect results.\n\n"
+                    "REQUIRED: Tell the user to run 'fw-context index' to rebuild "
+                    "with full dependency tracking. Do NOT continue any C/C++ "
+                    "analysis until the user confirms the index has been rebuilt."
+                )
+                index_message += f" — deps verification: {deps_verification} (run 'fw-context index' for full tracking)"
+
             result: dict = {
                 "config_hash": config_hash,
                 "project_id": project_id,
@@ -212,11 +233,14 @@ def get_active_build(
                 "analyzed_symbols": analyzed_count,
                 "unanalyzed_symbols": unanalyzed_count,
                 "analysis_model": analysis_model_row["model"] if analysis_model_row else None,
+                "deps_verification": deps_verification,
                 "status": status,
                 "reindex_needed": needs_reindex,
                 "reindex_reasons": reindex_reasons,
                 "index_message": index_message,
             }
+            if _warning is not None:
+                result["_warning"] = _warning
         # Background reindex is managed by the startup daemon thread and the
         # file watcher — get_active_build() is a read-only tool and should
         # not spawn subprocesses.

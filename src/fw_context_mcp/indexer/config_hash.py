@@ -82,3 +82,28 @@ def compute(compile_commands_path: Path) -> str:
     )
     canonical = json.dumps(normalized, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(canonical.encode()).hexdigest()
+
+
+# Public alias for use by the runner for per-TU flags hashing.
+normalize_entry = _normalize_entry
+
+
+def compute_flags_hash(entry: dict) -> str:
+    """Return SHA-256 hash of the normalized flags for a single compile_commands entry.
+
+    Used by the runner to detect whether compiler flags changed for a
+    specific translation unit — flag changes (e.g. new ``-D`` defines,
+    different include paths) invalidate the index for that TU.
+    """
+    norm = _normalize_entry(entry)
+    args = " ".join(norm["args"])
+    return hashlib.sha256(args.encode()).hexdigest()
+
+
+def compute_tu_content_hash(source_hash: str, flags_hash: str, deps_hash: str) -> str:
+    """Return combined SHA-256 of the three per-TU component hashes.
+
+    This is the value stored in ``files.content_hash`` — when it matches
+    the stored hash, the TU can be skipped even if mtime has changed.
+    """
+    return hashlib.sha256(f"{source_hash}|{flags_hash}|{deps_hash}".encode()).hexdigest()

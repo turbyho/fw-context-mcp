@@ -177,6 +177,7 @@ class CompilationUnit:
     directory: Path
     language: str        # "c" or "cpp"
     clang_args: list[str] = field(default_factory=list)
+    raw_entry: dict | None = None
 
 
 def _expand_response_file(token: str, cwd: Path) -> list[str]:
@@ -403,4 +404,5 @@ def parse(path: Path) -> Iterator[CompilationUnit]:
             directory=cwd,
             language=lang,
             clang_args=clang_args,
+            raw_entry=entry,
         )
