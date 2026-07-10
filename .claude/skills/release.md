@@ -86,7 +86,7 @@ Breaking changes: (omit this entire section if none)
 8. PYPI UPLOAD
    ~/.pyenv/versions/3.11.8/bin/python3 -m twine upload dist/*
 
-9. PUBLISH TO MCP REGISTRY (optional — after PyPI is live)
+9. PUBLISH TO MCP REGISTRY
    mcp-publisher publish
 ```
 
