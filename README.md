@@ -111,6 +111,13 @@ fw-context index --build
 
 Then restart your LLM client and ask questions about your firmware.
 
+## Background
+
+This project was motivated by a recurring failure mode in AI-assisted embedded firmware review: coding agents often spend much of their effort reconstructing the program before they can reason about it.
+
+Read the background essay:
+[Why AI Coding Agents Keep Making the Same Mistakes When Analyzing Embedded Firmware](https://medium.com/@turbyho/why-ai-coding-agents-keep-making-the-same-mistakes-when-analyzing-embedded-firmware-6c0d8ff1a636)
+
 ## Project status
 
 fw-context is primarily built for real embedded C/C++ work where source-level text search is not enough. It is designed to be local-first, build-aware and useful with existing LLM coding workflows.
