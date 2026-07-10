@@ -102,6 +102,13 @@ The detailed quick start, installation instructions and configuration guide are 
 - [MCP server notes](README-MCP.md)
 - [Case study: firmware code review](docs/examples/firmware-review/) — 108× token savings, 19 findings from 8 parallel subagents
 
+## Background
+
+This project was motivated by a recurring failure mode in AI-assisted embedded firmware review: coding agents often spend much of their effort reconstructing the program before they can reason about it.
+
+Read the background essay:
+[Why AI Coding Agents Keep Making the Same Mistakes When Analyzing Embedded Firmware](https://medium.com/@turbyho/why-ai-coding-agents-keep-making-the-same-mistakes-when-analyzing-embedded-firmware-6c0d8ff1a636)
+
 The usual workflow is:
 
 ```
