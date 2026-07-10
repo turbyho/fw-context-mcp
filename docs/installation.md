@@ -233,9 +233,6 @@ By default (`--scope project`), it configures ONLY the current project:
 |------|-----------|--------|
 | **Claude Code** | `.claude/` dir in project | Injects `<!-- fw-context -->` into `CLAUDE.md`, installs agents (`code-explorer`, `general-purpose`), installs `fw-review` skill |
 | **OpenCode** | `.opencode/` dir in project | Writes rules file, installs skill |
-| **Codex** | `.codex/` dir in project | Writes rules file |
-| **Cursor** | `.cursor/` dir in project | Writes `.cursor/rules/fw-context.mdc` |
-| **Kilo Code** | Inherits from Claude Code | No separate action needed |
 
 **Project agents:** Two agent definitions are created in `.claude/agents/`:
 - `code-explorer` — includes a `CRITICAL — C/C++ source access` block that

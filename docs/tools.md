@@ -144,9 +144,6 @@ fw-context init --list-tools            # show supported tools
 |------|----|-------|
 | Claude Code | `claude-code` | global (`~/.claude/`) |
 | OpenCode | `opencode` | global (`~/.config/opencode/`) |
-| Kilo Code | `kilocode` | inherits from Claude Code |
-| Codex | `codex` | global (`~/.codex/`) |
-| Cursor | `cursor` | project (`.cursor/`) |
 
 ### `fw-context export`
 
