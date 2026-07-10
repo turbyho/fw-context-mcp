@@ -41,12 +41,12 @@ def lookup_symbol(
     exact: Annotated[bool, Field(description="True = exact name match, False = prefix LIKE match (default).")] = False,
     limit: Annotated[int, Field(description="Maximum results returned (capped at 100, default 50).")] = 50,
 ) -> list[dict]:
-    """USE INSTEAD OF grep, ctx_search, or ctx_symbol. Look up a C/C++ symbol
-    by name via libclang index — exact or prefix matching. Falls back to
-    macro lookup when no symbol matches: returns macro definitions with
-    fully expanded values (kind="macro").
+    """Look up a C/C++ symbol by name via libclang index — exact or prefix
+    matching. Finds symbols text-based search can miss: build-conditional
+    code, template instantiations, macro-expanded names. Prefer this when
+    you know the exact symbol name or prefix. Falls back to macro lookup.
 
-    Finds symbols grep cannot see: build-conditional code, template
+    Finds symbols text-based search can miss: build-conditional code, template
     instantiations, macro-expanded names. Macros are extracted via
     ``clang -dM -E`` during indexing so ``#ifdef``-conditional macros
     resolve correctly for the active build config. Prefer this over
@@ -199,14 +199,14 @@ def search_code(
     project_root: Annotated[str | None, Field(description="Project root. Auto-detected if omitted.")] = None,
     kind: Annotated[str | None, Field(description="Optional kind filter: function, method, class, struct, union, enum, typedef, variable, field, namespace.")] = None,
     limit: Annotated[int, Field(description="Maximum results (default 20, max 100).")] = 20,
-    project_only: Annotated[bool, Field(description="Exclude vendor SDK code (mbed-os/, .pio/, zephyr/). When True, only application code (src/, lib/, app/). Default False.")] = False,
+    project_only: Annotated[bool, Field(description="Exclude vendor SDK code. When True, only application code. Default False.")] = False,
 ) -> list[dict]:
     """Find C/C++ symbols by name — searches function/class/enum NAMES.
 
     Searches symbol names, qualified names, signatures, docstrings, and
     pre-computed name tokens (CamelCase/snake_case split).  Does NOT search
     function bodies — for patterns in code like ``.attach(``,
-    ``NVIC_SetVector``, ``SerialBase::RxIrq`` use ``search_bodies`` instead.
+    interrupt handler registrations, callback attachments use ``search_bodies`` instead.
 
     Use when you know the concept but not the exact name
     (``"interrupt handler"``, ``"modem init"``).  Prefer ``lookup_symbol``
@@ -257,9 +257,8 @@ def search_code(
         project_root: Project root directory. Auto-detected from CWD if omitted.
         kind: Optional filter to return only symbols of this kind.
         limit: Maximum results (default 20, max 100).
-        project_only: When True, exclude vendor SDK directories
-            (mbed-os/, .pio/, zephyr/, build/) and return only
-            application code (src/, lib/, app/, include/). Default False.
+        project_only: When True, exclude vendor SDK directories and return only
+            application code. Default False.
 
     Returns:
         list of dicts, each with: name, qualified_name, kind, file, line,
@@ -445,9 +444,11 @@ async def smart_search(
     project_root: Annotated[str | None, Field(description="Project root. Auto-detected if omitted.")] = None,
     limit: Annotated[int, Field(description="Maximum results (default 20, max 100).")] = 20,
 ) -> list[dict]:
-    """USE INSTEAD OF grep, ctx_search, or ctx_compose. Natural-language search:
-    Ollama generates FTS5 keywords, then searches the libclang index. Finds
-    concepts generic tools cannot express with regex.
+    """Natural-language search: an LLM generates FTS5 keywords, then searches
+    the libclang index. Finds concepts by meaning rather than exact text
+    match. Prefer this when you don't know the exact keywords and want to
+    describe what you're looking for ("how does the modem connect?",
+    "handle BLE pairing failure").
 
     Read-only. No side effects. Slow (10-30 s) — delegates to the full
     ``SMART_SEARCH`` pipeline (translate → rough_search → llm_query →
@@ -457,9 +458,9 @@ async def smart_search(
     Multi-phase approach:
     1) Translate non-English queries
     2) Rough search to gather sample symbols for naming conventions
-    3) Ollama sees those samples + query and generates FTS5 terms
+    3) LLM sees those samples + query and generates FTS5 terms
     4) FTS5 search with generated terms
-    5) Refine: Ollama checks results and course-corrects query terms
+    5) Refine: LLM checks results and course-corrects query terms
     6) Semantic embedding search (cosine similarity re-rank)
     7) Deduplicate, score, and format results
 
@@ -467,7 +468,7 @@ async def smart_search(
     and want to describe what you're looking for ("how does the modem connect?",
     "handle BLE pairing failure").
 
-    **Fallback:** When Ollama is unavailable, falls back to direct FTS5 search
+    **Fallback:** When LLM is unavailable, falls back to direct FTS5 search
     with word-split terms from the query.
 
     Args:
@@ -519,9 +520,10 @@ async def semantic_search(
     threshold: Annotated[float, Field(description="Minimum cosine similarity (0.0-1.0). Default 0.60. Use 0.55 for exploratory, 0.50 for broad search.")] = 0.60,
     limit: Annotated[int, Field(description="Maximum results (default 20, max 100).")] = 20,
 ) -> list[dict]:
-    """USE INSTEAD OF grep, ctx_search, or ctx_compose. Semantic search using
-    pre-computed libclang symbol embeddings. Finds symbols by meaning, not
-    by text — catches concepts grep regex cannot express.
+    """Semantic search using pre-computed libclang symbol embeddings. Finds
+    symbols by meaning, not by text — matches concepts even when query
+    words don't appear literally in the code. Prefer this when describing
+    a concept rather than searching for a known keyword.
 
     Finds symbols conceptually related to a natural-language query, even when
     the query words don't appear literally in the code.  Uses cosine similarity
@@ -546,11 +548,11 @@ async def semantic_search(
     - ``0.60`` — precise: ~175 avg, high precision (default)
     - ``0.65`` — strict: few results, may miss relevant symbols
 
-    **Source-aware ranking:** Project code (``src/``) boosted 1.2×,
-    library code (``lib/``) 1.1×, vendored SDK (``mbed-os/``) 0.85×.
+    **Source-aware ranking:** Project code boosted 1.2×, library code
+    1.1×, vendored SDK code 0.85×.
 
-    **Requires Ollama** with an embedding model (``mxbai-embed-large``).
-    Falls back to ``search_code`` with a warning if Ollama is unavailable.
+    **Requires an LLM** with an embedding model.
+    Falls back to ``search_code`` with a warning if the LLM is unavailable.
 
     Args:
         query: Natural language description of what you're looking for.
@@ -583,7 +585,7 @@ async def semantic_search(
         if not cfg.llm.enabled:
             return _fallback_to_search_code(
                 root, db_path, query, limit,
-                warning="Ollama is disabled in config. "
+                warning="LLM is disabled in config. "
                         "Enable it with `[llm] enabled = true` to use semantic search.",
             )
 
@@ -595,7 +597,7 @@ async def semantic_search(
         if not setup.get("ollama_running"):
             return _fallback_to_search_code(
                 root, db_path, query, limit,
-                warning="Ollama is not running. Start it to use semantic search.",
+                warning="LLM is not running. Start it to use semantic search.",
             )
 
         # Generate query embedding
@@ -608,7 +610,7 @@ async def semantic_search(
             log.warning("semantic_search: Ollama embed failed: %s", e)
             return _fallback_to_search_code(
                 root, db_path, query, limit,
-                warning=f"Ollama embedding failed: {e}. "
+                warning=f"LLM embedding failed: {e}. "
                         "Showing lexical search results instead.",
             )
 
@@ -740,11 +742,11 @@ async def semantic_search(
 
 
 def search_bodies(
-    query: Annotated[str, Field(description="FTS5 search terms for function bodies. 1-3 words. E.g. 'attach', 'NVIC_SetVector', 'rise'.")],
+    query: Annotated[str, Field(description="FTS5 search terms for function bodies. 1-3 words. E.g. 'attach', 'callback', 'rise'.")],
     project_root: Annotated[str | None, Field(description="Project root. Auto-detected if omitted.")] = None,
     kind: Annotated[str | None, Field(description="Optional kind filter: function, method, class, etc.")] = None,
     limit: Annotated[int, Field(description="Maximum results (default 20, max 100).")] = 20,
-    project_only: Annotated[bool, Field(description="Exclude vendor SDK code (mbed-os/, .pio/, zephyr/, build/). When True, only your application code (src/, lib/). Default False.")] = False,
+    project_only: Annotated[bool, Field(description="Exclude vendor SDK code. When True, only application code. Default False.")] = False,
 ) -> list[dict]:
     """Find patterns in C/C++ function BODIES — the implementation code inside ``{ }``.
 
@@ -755,8 +757,8 @@ def search_bodies(
     **When to use ``search_bodies`` vs ``search_code``:**
 
     - ``search_bodies`` — patterns in function BODIES (what the code DOES):
-      ``.attach(``, ``NVIC_SetVector(``, ``.rise(``, ``.fall(``,
-      ``SerialBase::RxIrq``, ``callback(&``, ISR registration code.
+      function call patterns (``.attach(``, ``.rise(``, ``.fall(``,
+      ``callback(&``), ISR registration code.
     - ``search_code`` — find symbols by NAME (what the code IS):
       ``modem init``, ``interrupt handler``, ``uart send``.
 
@@ -784,14 +786,14 @@ def search_bodies(
 
     **When to set ``project_only=True``:**
     Your project contains two kinds of code:
-    - Application code: ``src/``, ``lib/`` — code your team wrote.
-    - Vendor SDK: ``mbed-os/``, ``.pio/``, ``zephyr/``, ``build/`` —
-      framework/OS code shipped by a vendor, NOT written by your team.
+    - Application code — code your team wrote.
+    - Vendor SDK — framework/OS code shipped by a vendor, NOT written by
+      your team.
 
     Set ``project_only=True`` when the question is about YOUR code
     (``"where do we register interrupt handlers?"``,
     ``"which functions call .attach()?"``).  Leave it ``False`` (default)
-    when the vendor code is also relevant (``"how does mbed's Ticker::attach work?"``).
+    when the vendor code is also relevant.
 
     Results include ``_match_snippet`` — a highlighted excerpt showing
     each match in context (e.g. ``_timeout.<b>attach</b>(callback(...))``).
@@ -803,14 +805,13 @@ def search_bodies(
         query: FTS5 search terms. 1-3 words. Bare multi-word queries are
             OR-joined (each term prefixed with ``*``).  Prefer single-word
             queries for broad matching: ``'attach'`` finds ``.attach(...)``
-            patterns including Ticker::attach, Timeout::attach, etc.
+            patterns including callback attachments, timer registrations, etc.
             For exact phrases wrap in double quotes: ``'\"attach callback\"'``.
         project_root: Project root. Auto-detected if omitted.
         kind: Optional filter to return only symbols of this kind.
         limit: Maximum results (default 20, max 100).
-        project_only: When True, exclude vendor SDK directories
-            (mbed-os/, .pio/, zephyr/, build/) and return only
-            application code (src/, lib/). Default False.
+        project_only: When True, exclude vendor SDK directories and return only
+            application code. Default False.
 
     Returns:
         list of dicts, each with: name, qualified_name, kind, file, line,
@@ -887,7 +888,7 @@ def search_content(
     query: Annotated[str, Field(description="FTS5 search terms for full file content. 1-3 words. E.g. 'InterruptIn', 'extern C'. Bare multi-word = OR-joined.")],
     project_root: Annotated[str | None, Field(description="Project root. Auto-detected if omitted.")] = None,
     limit: Annotated[int, Field(description="Maximum results (default 20, max 100).")] = 20,
-    project_only: Annotated[bool, Field(description="Exclude vendor SDK code (mbed-os/, .pio/, zephyr/, build/). When True, only your application code (src/, lib/). Default False.")] = False,
+    project_only: Annotated[bool, Field(description="Exclude vendor SDK code. When True, only application code. Default False.")] = False,
 ) -> list[dict]:
     """Find patterns in FULL file content — not limited to function bodies.
 
@@ -906,7 +907,7 @@ def search_content(
     - ``search_content`` — patterns anywhere in FILES (file scope + bodies):
       ``extern "C"``, ``InterruptIn``, ``#define``, type declarations.
     - ``search_bodies`` — patterns in function BODIES only:
-      ``.attach(``, ``NVIC_SetVector(``, ``callback(&``.
+      ``.attach(``, ``callback(&``, ISR registration patterns.
     - ``search_code`` — find symbols by NAME:
       ``interrupt handler``, ``modem init``.
 

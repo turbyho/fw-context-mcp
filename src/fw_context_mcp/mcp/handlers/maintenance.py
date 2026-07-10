@@ -680,11 +680,12 @@ def reindex_file(
 def check_ollama(
     project_root: Annotated[str | None, Field(description="Project root. Auto-detected if omitted. Ignored by this tool.")] = None,
 ) -> dict:
-    """Check whether Ollama is running and the configured embedding/chat model is installed.
+    """Check whether the LLM backend is running and the configured embedding/chat model is installed.
 
     Read-only: yes. No side effects. Call before smart_search,
     semantic_search, or explain_symbol (when on-demand fallback is
-    expected — pre-computed analysis returns instantly without Ollama).
+    expected — pre-computed analysis returns instantly without the LLM
+    backend).
 
     Returns:
         dict: {ollama_enabled (bool), status (str — "ok"|"disabled"|"error"|"model_missing"),
@@ -703,7 +704,7 @@ def check_ollama(
             "configured_model": cfg.llm.model,
             "num_ctx": cfg.llm.num_ctx,
             "message": (
-                "Ollama is disabled in config ([llm] enabled = false). "
+                "LLM backend is disabled in config ([llm] enabled = false). "
                 "explain_symbol with pre-computed analysis (default) returns instantly. "
                 "Without analysis, it returns source + explain_prompt for the agent to answer. "
                 "smart_search will use raw text queries."
