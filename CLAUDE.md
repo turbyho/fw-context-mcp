@@ -20,7 +20,7 @@ Project instructions for all AI tooling. Dynamic project memory belongs in
   `compile_commands.json` + libclang
 - 31 MCP tools: symbol lookup, full-text search, call-graph traversal, vector
   search, source code retrieval
-- Serves AI assistants (Claude Code, Cursor, OpenCode) as an MCP server
+- Serves AI assistants (Claude Code, OpenCode) as an MCP server
 - Python 3.11+, distributed as a PyPI package + GitHub release
 - SQLite + FTS5 for indexing, libclang for parsing, optional Ollama for
   semantic search
