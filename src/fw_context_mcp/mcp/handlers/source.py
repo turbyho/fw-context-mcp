@@ -173,14 +173,14 @@ async def explain_symbol(
     project_root: Annotated[str | None, Field(description="Project root. Auto-detected if omitted.")] = None,
     context_lines: Annotated[int, Field(description="Lines of source context around the symbol definition.")] = 40,
 ) -> dict:
-    """USE INSTEAD OF reading code manually with grep/ctx_read. Explain what a
-    C/C++ symbol does in plain English — libclang-aware analysis. Falls
-    back to macro explanation when the name matches a ``#define``: returns
-    kind="macro" with raw value and preprocessor-expanded value.
+    """Explain what a C/C++ symbol does in plain English — libclang-aware
+    analysis. Uses pre-computed LLM analysis when available (instant),
+    falls back to on-demand LLM. Falls back to macro explanation when
+    the name matches a ``#define``.
 
     Read-only. No side effects — uses pre-computed LLM analysis when available
     (instant, generated during ``fw-context index --analyze``), falls back to
-    calling Ollama on-demand. Returns the symbol's purpose, inputs, outputs,
+    calling an LLM on-demand. Returns the symbol's purpose, inputs, outputs,
     and side effects.
 
     For raw source code use ``get_source``. For symbol metadata without
@@ -286,12 +286,12 @@ async def explain_symbol(
             result["explanation"] = await call_ollama_async(prompt, cfg.llm)
         except OllamaModelNotFoundError as e:
             result["warning"] = (
-                f"{e}. No Ollama model available — interpret the 'source' and "
+                f"{e}. No LLM model available — interpret the 'source' and "
                 f"'explain_prompt' fields below with your own LLM to provide the explanation."
             )
         except OllamaError as e:
             result["warning"] = (
-                f"Ollama unavailable: {e}. No local LLM — interpret the 'source' and "
+                f"LLM unavailable: {e}. No local LLM — interpret the 'source' and "
                 f"'explain_prompt' fields below with your own LLM to provide the explanation."
             )
         else:
@@ -305,9 +305,10 @@ def get_source(
     name: Annotated[str, Field(description="Fully qualified symbol name. Returns exact function body via libclang extent.")],
     project_root: Annotated[str | None, Field(description="Project root. Auto-detected if omitted.")] = None,
 ) -> dict:
-    """USE INSTEAD OF generic file readers (ctx_read, cat, read). Read a
-    C/C++ function/method/enum/macro body using libclang exact extents —
-    no guessing line numbers. No LLM, fast.
+    """Read a C/C++ function/method/enum/macro body using libclang exact
+    extents — no guessing line numbers. Uses AST-precise {start, end}
+    extents so you get exactly the function body. For rich context
+    (callers, callees, analysis) use ``get_symbol_context`` instead.
 
     Generic readers don't know where a function actually ends — libclang
     tracks exact {start, end} from the AST. For enums, includes a
@@ -412,8 +413,10 @@ def get_file_map(
     signatures: Annotated[bool, Field(description="Include full function signatures in output.")] = False,
     max_per_kind: Annotated[int, Field(description="Max items per symbol kind group (default 30, 0 = unlimited).")] = 30,
 ) -> dict:
-    """USE INSTEAD OF grep/ctx_read for file overview. Fast structural map of all
-    C/C++ symbols in a file grouped by kind — libclang-powered table of contents.
+    """Fast structural map of all C/C++ symbols in a file grouped by kind —
+    libclang-powered table of contents. Like a table of contents before
+    reading a chapter: see what functions, classes, and enums a file
+    defines at a glance.
 
     Like a table of contents before reading a chapter. Pass a path relative
     to the project root (``src/main.cpp``) or just the filename (``main.cpp``).
@@ -484,12 +487,10 @@ def get_symbol_context(
     project_root: Annotated[str | None, Field(description="Project root. Auto-detected if omitted.")] = None,
     project_only: Annotated[bool, Field(description="When True (default), filters callers and callees to project paths (excludes SDK/vendor).")] = True,
 ) -> dict:
-    """USE INSTEAD OF ctx_compose, grep, or manual code reading. Rich one-shot
-    context for a C/C++ symbol: body, signature, all direct callers and callees.
-    Answers "what does this do and how does it fit in the system?" in a single
-    response — libclang powers the call graph, not regex. Falls back to macro
-    display when the symbol is not found: returns kind="macro" with
-    value and expanded_value (macros have no callers/callees).
+    """Rich one-shot context for a C/C++ symbol: body, signature, all direct
+    callers and callees. Answers "what does this do and how does it fit in
+    the system?" in a single response — libclang powers the call graph,
+    not regex. Falls back to macro display when the symbol is not found.
 
     Prefer this over get_source when you also need callers, callees, indirect
     call sites, or LLM analysis — all returned in a single call. If you only
