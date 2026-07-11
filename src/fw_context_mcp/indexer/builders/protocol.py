@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Protocol
 
 if TYPE_CHECKING:
-    from ...config.settings import Config
+    from ..build import BuildConfig
 
 
 @dataclass
@@ -61,7 +61,7 @@ class BuildSystem(Protocol):
 
     # ── Instance methods (require configuration) ──
 
-    def build(self, project_root: Path, cfg: Config) -> Path:
+    def build(self, project_root: Path, cfg: BuildConfig) -> Path:
         """Run the build and return the path to ``compile_commands.json``."""
         ...
 
