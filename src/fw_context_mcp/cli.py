@@ -1124,15 +1124,6 @@ def _check_config_file(project_root: Path, rel_path: str, template: str, fix: bo
         print(f"  [ok] {path}")
 
 
-def _ensure_platformio_dep_tracking(project_root: Path, *, fix: bool = False) -> None:
-    """Deprecated thin wrapper — delegates to ``PlatformIOBuildSystem.ensure_dep_tracking()``."""
-    from .indexer.builders.platformio import PlatformIOBuildSystem
-    builder = PlatformIOBuildSystem()
-    for msg in builder.ensure_dep_tracking(project_root, fix=fix):
-        if msg:
-            print(msg)
-
-
 def _ensure_gitignore(project_root: Path, *, fix: bool = False, build_system: str | None = None) -> None:
     """Add ``compile_commands.json`` and ``.fw-context/local.toml`` to the
     project's ``.gitignore`` if they aren't already listed.
