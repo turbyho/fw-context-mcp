@@ -415,7 +415,7 @@ def _start_bg_reindex_if_stale(root: Path) -> None:
         if force_refs:
             env["FW_CONTEXT_FORCE_REFINDEX"] = "1"
         proc = subprocess.Popen(
-            [sys.executable, "-u", "-m", "fw_context_mcp.cli", "index"],
+            [sys.executable, "-u", "-m", "fw_context_mcp.cli", "index", "--background"],
             cwd=str(root),
             stdout=stdout_fh,
             stderr=subprocess.STDOUT,
