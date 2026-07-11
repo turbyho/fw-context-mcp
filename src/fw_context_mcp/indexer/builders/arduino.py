@@ -57,10 +57,23 @@ class ArduinoBuildSystem:
                 "  [build]\n  fqbn = \"arduino:avr:uno\""
             )
 
+        # --only-compilation-database is the flag in arduino-cli 1.x;
+        # --export-compile-commands is the renamed flag in newer versions.
+        # Detect which one is supported by inspecting the help output.
+        help_result = subprocess.run(
+            ["arduino-cli", "compile", "--help"],
+            capture_output=True, text=True, timeout=10,
+        )
+        export_flag = (
+            "--export-compile-commands"
+            if "--export-compile-commands" in help_result.stdout
+            else "--only-compilation-database"
+        )
+
         cmd: list[str] = [
             "arduino-cli", "compile",
             "--fqbn", cfg.fqbn,
-            "--export-compile-commands",
+            export_flag,
             "--build-path", str(project_root / "build"),
         ]
 
@@ -83,7 +96,7 @@ class ArduinoBuildSystem:
                 return cc_in_root
             raise RuntimeError(
                 "compile_commands.json not generated. "
-                "Ensure arduino-cli version supports --export-compile-commands (>= 0.35.0)."
+                "Ensure arduino-cli supports --only-compilation-database or --export-compile-commands."
             )
 
         # Copy to project root for consistency
