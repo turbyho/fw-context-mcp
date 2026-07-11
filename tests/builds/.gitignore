@@ -1,0 +1,21 @@
+# Build artifacts
+BUILD/
+build/
+cmake_build/
+_deps/
+compile_commands.json
+test_app
+*.o
+*.d
+sdkconfig.old
+
+# fw-context init artifacts (generated at test time)
+.fw-context/
+.agents/
+.claude/
+.codex/
+.cursor/
+.kilo/
+.opencode/
+AGENTS.md
+CLAUDE.md
