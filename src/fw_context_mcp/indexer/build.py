@@ -8,7 +8,6 @@ complete compile_commands.json.
 from __future__ import annotations
 
 import logging
-import shutil
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -99,103 +98,35 @@ def detect_build_system(project_root: Path) -> str | None:
 
 
 def _parse_mbed_dotfile(project_root: Path) -> dict[str, str]:
-    """Parse ``.mbed`` into a dict of KEY=VALUE pairs."""
-    dotfile = project_root / ".mbed"
-    result: dict[str, str] = {}
-    if not dotfile.exists():
-        return result
-    for line in dotfile.read_text(encoding="utf-8").splitlines():
-        line = line.strip()
-        if not line or line.startswith("#"):
-            continue
-        if "=" in line:
-            key, _, value = line.partition("=")
-            result[key.strip()] = value.strip()
-    return result
+    """Parse ``.mbed`` into a dict of KEY=VALUE pairs.
+
+    Deprecated: use ``MbedOSBuildSystem._parse_mbed_dotfile`` instead.
+    This wrapper is kept for backward compat and will be removed in Phase 6.
+    """
+    from .builders.mbed_os import _parse_mbed_dotfile as _fn
+    return _fn(project_root)
 
 
 def _mbed_target_from_custom_targets(project_root: Path) -> str | None:
-    """Extract the first board name from custom_targets.json."""
-    import json
+    """Extract the first board name from custom_targets.json.
 
-    ct = project_root / "custom_targets.json"
-    if not ct.exists():
-        return None
-    try:
-        data = json.loads(ct.read_text(encoding="utf-8"))
-        for key in data:
-            if isinstance(data[key], dict) and "inherits" in data[key]:
-                return key
-    except (json.JSONDecodeError, KeyError):
-        pass
-    return None
+    Deprecated: use ``MbedOSBuildSystem._mbed_target_from_custom_targets`` instead.
+    This wrapper is kept for backward compat and will be removed in Phase 6.
+    """
+    from .builders.mbed_os import _mbed_target_from_custom_targets as _fn
+    return _fn(project_root)
 
 
 def _resolve_mbed_extra_profiles(project_root: Path, extra: list[str]) -> list[str]:
-    """Resolve extra profile paths — prefixes ``mbed-os/tools/profiles/extensions/``
-    for bare filenames so users can write ``lto.json`` instead of the full path."""
-    resolved: list[str] = []
-    for p in extra:
-        if "/" in p or p.startswith("."):
-            resolved.append(p)
-        else:
-            candidate = f"mbed-os/tools/profiles/extensions/{p}"
-            if (project_root / candidate).exists():
-                resolved.append(candidate)
-            else:
-                resolved.append(p)  # pass through, let mbed CLI fail if wrong
-    return resolved
+    """Deprecated — delegates to the MbedOSBuildSystem helper."""
+    from .builders.mbed_os import _resolve_mbed_extra_profiles as _fn
+    return _fn(project_root, extra)
 
 
 def _build_mbed_os(project_root: Path, cfg: BuildConfig) -> Path:
-    """Generate compile_commands.json via ``bear -- mbed compile --clean``."""
-    if not shutil.which("bear"):
-        raise RuntimeError(
-            "bear is required to generate compile_commands.json. "
-            "Install it:  sudo pacman -S bear   (or your distro's equivalent)"
-        )
-
-    dot = _parse_mbed_dotfile(project_root)
-    target = cfg.target or dot.get("TARGET") or _mbed_target_from_custom_targets(project_root)
-    toolchain = cfg.toolchain or dot.get("TOOLCHAIN") or "GCC_ARM"
-
-    if not target:
-        raise RuntimeError(
-            "Cannot determine target board.  Set it in .mbed (mbed config target <BOARD>), "
-            "in custom_targets.json, or in .fw-context/config.toml [build] target = \"...\""
-        )
-
-    cmd: list[str] = [
-        "bear",
-        "--output", "compile_commands.json",
-        "--",
-        "mbed", "compile",
-        "-t", toolchain,
-        "-m", target,
-        "--profile", cfg.profile,
-        "--app-config", cfg.app_config,
-    ]
-
-    for ep in _resolve_mbed_extra_profiles(project_root, cfg.extra_profiles):
-        cmd += ["--profile", ep]
-
-    for d in cfg.defines:
-        cmd += ["-D", d]
-
-    if cfg.clean:
-        cmd.append("--clean")
-
-    log.info("mbed-os build: %s", " ".join(cmd))
-    result = subprocess.run(cmd, cwd=project_root)
-
-    if result.returncode != 0:
-        raise RuntimeError(f"mbed compile failed with exit code {result.returncode}")
-
-    cc_path = project_root / "compile_commands.json"
-    if not cc_path.exists():
-        raise RuntimeError("compile_commands.json was not generated — bear may have failed silently")
-
-    return cc_path
+    """Deprecated thin wrapper — delegates to ``MbedOSBuildSystem.build()``."""
+    from .builders.mbed_os import MbedOSBuildSystem
+    return MbedOSBuildSystem().build(project_root, cfg)
 
 
 # ---------------------------------------------------------------------------
@@ -204,50 +135,9 @@ def _build_mbed_os(project_root: Path, cfg: BuildConfig) -> Path:
 
 
 def _build_zephyr(project_root: Path, cfg: BuildConfig) -> Path:
-    """Generate compile_commands.json via ``west build``."""
-    if not shutil.which("west"):
-        raise RuntimeError(
-            "west is required for Zephyr builds.  Install the Zephyr SDK and west tool."
-        )
-
-    if not cfg.board:
-        raise RuntimeError(
-            "Zephyr requires a board name.  Set it in .fw-context/config.toml:\n"
-            "  [build]\n  board = \"your_board\""
-        )
-
-    build_dir = project_root / "build"
-
-    cmd: list[str] = [
-        "west", "build",
-        "-b", cfg.board,
-        "-d", str(build_dir),
-    ]
-
-    if cfg.clean:
-        cmd.append("--pristine")
-    cmd.append("--")
-    cmd.append("-DCMAKE_EXPORT_COMPILE_COMMANDS=ON")
-
-    log.info("zephyr build: %s", " ".join(cmd))
-    result = subprocess.run(cmd, cwd=project_root)
-
-    if result.returncode != 0:
-        raise RuntimeError(f"west build failed with exit code {result.returncode}")
-
-    cc_in_build = build_dir / "compile_commands.json"
-    if not cc_in_build.exists():
-        raise RuntimeError(
-            "compile_commands.json not found in build directory. "
-            "Ensure CMAKE_EXPORT_COMPILE_COMMANDS is enabled."
-        )
-
-    # Copy to project root for consistency
-    target_cc = project_root / "compile_commands.json"
-    shutil.copy2(cc_in_build, target_cc)
-    log.info("Copied %s → %s", cc_in_build, target_cc)
-
-    return target_cc
+    """Deprecated thin wrapper — delegates to ``ZephyrBuildSystem.build()``."""
+    from .builders.zephyr import ZephyrBuildSystem
+    return ZephyrBuildSystem().build(project_root, cfg)
 
 
 # ---------------------------------------------------------------------------
@@ -256,44 +146,14 @@ def _build_zephyr(project_root: Path, cfg: BuildConfig) -> Path:
 
 
 def _build_platformio(project_root: Path, cfg: BuildConfig) -> Path:
-    """Generate compile_commands.json via ``pio run --target compiledb``."""
-    if not shutil.which("pio") and not shutil.which("platformio"):
-        raise RuntimeError(
-            "PlatformIO CLI is required.  Install it:  pip install platformio"
-        )
-
-    pio_bin = "pio" if shutil.which("pio") else "platformio"
-
-    cmd: list[str] = [pio_bin, "run", "--project-dir", str(project_root), "--target", "compiledb"]
-
-    if cfg.clean:
-        # pio run --target clean && pio run --target compiledb
-        clean_cmd = [pio_bin, "run", "--project-dir", str(project_root), "--target", "clean"]
-        log.info("platformio clean: %s", " ".join(clean_cmd))
-        subprocess.run(clean_cmd, cwd=project_root)
-
-    log.info("platformio build: %s", " ".join(cmd))
-    result = subprocess.run(cmd, cwd=project_root)
-
-    if result.returncode != 0:
-        raise RuntimeError(f"pio run --target compiledb failed with exit code {result.returncode}")
-
-    cc_path = project_root / "compile_commands.json"
-    if not cc_path.exists():
-        raise RuntimeError("compile_commands.json was not generated — pio run may have failed silently")
-
-    return cc_path
+    """Deprecated thin wrapper — delegates to ``PlatformIOBuildSystem.build()``."""
+    from .builders.platformio import PlatformIOBuildSystem
+    return PlatformIOBuildSystem().build(project_root, cfg)
 
 
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
-
-_BUILDERS = {
-    "mbed-os": _build_mbed_os,
-    "zephyr": _build_zephyr,
-    "platformio": _build_platformio,
-}
 
 
 def check_completeness(cc_path: Path, project_root: Path) -> list[str]:
@@ -343,6 +203,8 @@ def generate_compile_commands(
     """Generate a fresh compile_commands.json and return its path.
 
     Auto-detects the build system when ``cfg.system`` is ``None``.
+    Delegates to the registered ``BuildSystem`` implementation via
+    ``BuildSystemRegistry``.
     Raises ``RuntimeError`` when detection or build fails.
     """
     root = project_root.resolve()
@@ -369,11 +231,12 @@ def generate_compile_commands(
             "  [build]\n  command = \"bear -- make\""
         )
 
-    builder = _BUILDERS.get(system)
-    if not builder:
+    builder_cls = _builder_registry.get(system)
+    if builder_cls is None:
         raise RuntimeError(
-            f"Unknown build system '{system}'.  Supported: {', '.join(sorted(_BUILDERS))}"
+            f"Unknown build system '{system}'.  Supported: {', '.join(sorted(_builder_registry.keys()))}"
         )
 
     log.info("Detected build system: %s (clean=%s)", system, cfg.clean)
-    return builder(root, cfg)
+    builder = builder_cls()
+    return builder.build(root, cfg)
