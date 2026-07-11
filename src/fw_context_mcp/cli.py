@@ -74,24 +74,41 @@ def cmd_index(args: argparse.Namespace) -> int:
     project_root = resolve_project_root(args.project)
     cfg = load_config(project_root=project_root)
 
+    # ── Background mode: skip build, validation, and dep-tracking fixes ──
+    bg = getattr(args, "background", False)
+
     # Early validation: confirm we detected a known build system
     # Prominent banner so the user can verify the right project is being indexed
     detected_system = detect_build_system(project_root)
     if detected_system:
         print(f"Project: {project_root.name}  path={project_root}  build={detected_system}")
-        if detected_system == "platformio":
+        if detected_system == "platformio" and not bg:
             from .indexer.builders.platformio import PlatformIOBuildSystem
             builder = PlatformIOBuildSystem()
             for msg in builder.ensure_dep_tracking(project_root, fix=True):
                 if msg:
                     print(msg)
     else:
-        print(f"Project: {project_root.name}  path={project_root}  build=unknown")
+        if bg:
+            # In background mode, an existing compile_commands.json is sufficient —
+            # we don't need to know the build system to reindex.
+            cc_fallback = project_root / "compile_commands.json"
+            if cc_fallback.exists():
+                print(f"Project: {project_root.name}  path={project_root}  build=unknown (bg, reusing cc)")
+            else:
+                print(f"error: No build system detected and no compile_commands.json for {project_root}.", file=sys.stderr)
+                print("  Run 'fw-context index --build' first.", file=sys.stderr)
+                return 1
+        else:
+            print(f"Project: {project_root.name}  path={project_root}  build=unknown")
 
     # Resolve compile_commands.json path
     explicit_cc = bool(args.compile_commands)
 
     if args.build:
+        if bg:
+            print("error: --build and --background are mutually exclusive", file=sys.stderr)
+            return 1
         # Explicit build requested — always run build
         from .indexer.build import generate_compile_commands
 
@@ -127,6 +144,11 @@ def cmd_index(args: argparse.Namespace) -> int:
         if not compile_commands.is_absolute():
             compile_commands = (project_root / compile_commands).resolve()
         if not compile_commands.exists():
+            if bg:
+                print(f"error: compile_commands.json not found at {compile_commands}", file=sys.stderr)
+                print("  Background reindex requires an existing compile_commands.json.", file=sys.stderr)
+                print("  Run 'fw-context index --build' first to set up the project.", file=sys.stderr)
+                return 1
             print("compile_commands.json not found, running build...", file=sys.stderr)
             try:
                 compile_commands = generate_compile_commands(project_root, cfg.build)
@@ -149,17 +171,19 @@ def cmd_index(args: argparse.Namespace) -> int:
         builder_cls = builder_registry.get(detected_system)
         if builder_cls is not None:
             builder_instance = builder_cls()
-            # Check staleness
-            stale, stale_reasons = is_compile_commands_stale(compile_commands, project_root)
-            if stale:
-                print(f"compile_commands.json is stale ({'; '.join(stale_reasons)}).")
-                if args.build:
-                    print("  Rebuilding (--build flag)...")
-                elif not explicit_cc:
-                    print("  Run 'fw-context index --build' to regenerate.")
-            # Validate artifacts
+            if not bg:
+                # Foreground mode: full staleness check + auto-fix
+                stale, stale_reasons = is_compile_commands_stale(compile_commands, project_root)
+                if stale:
+                    print(f"compile_commands.json is stale ({'; '.join(stale_reasons)}).")
+                    if args.build:
+                        print("  Rebuilding (--build flag)...")
+                    elif not explicit_cc:
+                        print("  Run 'fw-context index --build' to regenerate.")
+            # Validate artifacts — in bg mode, report only (no auto-fix)
             issues = validate_and_fix(
-                compile_commands, project_root, builder_instance, cfg.build, fix=True,
+                compile_commands, project_root, builder_instance, cfg.build,
+                fix=not bg,
             )
             errors = [i for i in issues if i.severity == "error"]
             warnings_list = [i for i in issues if i.severity == "warning"]
@@ -168,7 +192,9 @@ def cmd_index(args: argparse.Namespace) -> int:
             if errors:
                 for e in errors:
                     print(f"error: {e.message}", file=sys.stderr)
-                if not args.build:
+                if bg:
+                    print("Run 'fw-context index' to resolve issues.", file=sys.stderr)
+                elif not args.build:
                     print("Run 'fw-context index --build' to rebuild and fix issues.", file=sys.stderr)
                 return 1
 
@@ -1974,6 +2000,13 @@ def main() -> None:
         "--force",
         action="store_true",
         help="Force re-index of all files, embeddings, LLM analysis, overrides, and caches (skip mtime/checksum checks)",
+    )
+    p_index.add_argument(
+        "--background",
+        action="store_true",
+        dest="background",
+        default=False,
+        help="Background reindex mode — skip build, validation, and dep-tracking fixes (safe for automated runs)",
     )
     p_index.set_defaults(func=cmd_index)
 
