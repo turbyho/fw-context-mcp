@@ -13,6 +13,11 @@ import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
 
+# Import builders package so the registry is populated with all registered
+# build system backends before ``detect_build_system()`` is called.
+from . import builders  # noqa: F401 — side-effect import
+from .builders import registry as _builder_registry
+
 log = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
@@ -58,13 +63,13 @@ class BuildConfig:
 # Detection
 # ---------------------------------------------------------------------------
 
-_MBED_MARKERS = [".mbed", "mbed-os", "mbed_app.json"]
-_ZEPHYR_MARKERS = ["west.yml", "zephyr"]
-_PIO_MARKERS = ["platformio.ini"]
-
 
 def detect_build_system(project_root: Path) -> str | None:
     """Detect the build system from project markers.
+
+    Delegates to the ``BuildSystemRegistry`` — each registered builder's
+    ``markers`` list is scored by how many markers exist in *project_root*.
+    The builder with the highest score wins.
 
     Returns one of ``"mbed-os"``, ``"zephyr"``, ``"platformio"``, or
     ``None`` when nothing is recognised.
@@ -72,15 +77,14 @@ def detect_build_system(project_root: Path) -> str | None:
     root = project_root.resolve()
     scores: dict[str, int] = {}
 
-    for marker in _MBED_MARKERS:
-        if (root / marker).exists():
-            scores["mbed-os"] = scores.get("mbed-os", 0) + 1
-    for marker in _ZEPHYR_MARKERS:
-        if (root / marker).exists():
-            scores["zephyr"] = scores.get("zephyr", 0) + 1
-    for marker in _PIO_MARKERS:
-        if (root / marker).exists():
-            scores["platformio"] = scores.get("platformio", 0) + 1
+    for config_key in _builder_registry.keys():
+        builder_cls = _builder_registry.get(config_key)
+        if builder_cls is None:
+            continue
+        markers: list[str] = getattr(builder_cls, "markers", [])
+        for marker in markers:
+            if (root / marker).exists():
+                scores[config_key] = scores.get(config_key, 0) + 1
 
     if not scores:
         return None
