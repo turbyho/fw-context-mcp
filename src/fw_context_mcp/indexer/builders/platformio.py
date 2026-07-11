@@ -214,7 +214,52 @@ class PlatformIOBuildSystem:
     # ── Validation ──
 
     def validate_artifacts(self, compile_commands: Path, project_root: Path) -> list[BuildIssue]:
-        return []
+        issues: list[BuildIssue] = []
+        # Check: do .d dep files exist?  PlatformIO toolchains that lack -MMD
+        # won't emit .d files — header change detection won't work.
+        try:
+            import json
+            cc_data = json.loads(compile_commands.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            return issues  # Handled by generic validation
+
+        cc_has_mmd = False
+        missing_d_files: list[str] = []
+        for entry in cc_data:
+            args = entry.get("arguments") or entry.get("command", "").split()
+            has_mmd = any("-MMD" in a for a in args)
+            if has_mmd:
+                cc_has_mmd = True
+            # Check if corresponding .d file exists
+            output_flag = False
+            for idx, arg in enumerate(args):
+                if arg in ("-o", "-MF"):
+                    output_flag = True
+                elif output_flag and arg.endswith((".o", ".obj")):
+                    d_file = arg.rsplit(".", 1)[0] + ".d"
+                    if not Path(d_file).exists():
+                        missing_d_files.append(Path(d_file).name)
+                    output_flag = False
+                else:
+                    output_flag = False
+
+        if missing_d_files:
+            missing_uniq = sorted(set(missing_d_files))[:5]
+            suffix = f" ({len(missing_uniq)} more...)" if len(missing_d_files) > 5 else ""
+            issues.append(BuildIssue(
+                severity="warning",
+                category="dep_files_missing",
+                message=f".d files missing (header change detection limited): "
+                        f"{', '.join(missing_uniq)}{suffix}",
+                auto_fixable=not cc_has_mmd,
+                fix_hint=(
+                    "Run 'fw-context index' to auto-configure -MMD"
+                    if not cc_has_mmd
+                    else "Run 'fw-context index --build' to regenerate"
+                ),
+            ))
+
+        return issues
 
     # ── Auto-fix ──
 
