@@ -380,6 +380,12 @@ def _from_dict(data: dict) -> Config:
             cfg.build.defines = list(defines)
         if board := build.get("board"):
             cfg.build.board = board
+        if idf_path := build.get("idf_path"):
+            cfg.build.idf_path = idf_path
+        if fqbn := build.get("fqbn"):
+            cfg.build.fqbn = fqbn
+        if cmake_generator := build.get("cmake_generator"):
+            cfg.build.cmake_generator = cmake_generator
 
     if idx := data.get("index", {}):
         if db_dir := idx.get("db_dir"):
