@@ -109,8 +109,7 @@ def detect_build_system(project_root: Path) -> str | None:
 def _parse_mbed_dotfile(project_root: Path) -> dict[str, str]:
     """Parse ``.mbed`` into a dict of KEY=VALUE pairs.
 
-    Deprecated: use ``MbedOSBuildSystem._parse_mbed_dotfile`` instead.
-    This wrapper is kept for backward compat and will be removed in Phase 6.
+    Re-exported from ``MbedOSBuildSystem`` for backward compatibility.
     """
     from .builders.mbed_os import _parse_mbed_dotfile as _fn
     return _fn(project_root)
@@ -119,45 +118,10 @@ def _parse_mbed_dotfile(project_root: Path) -> dict[str, str]:
 def _mbed_target_from_custom_targets(project_root: Path) -> str | None:
     """Extract the first board name from custom_targets.json.
 
-    Deprecated: use ``MbedOSBuildSystem._mbed_target_from_custom_targets`` instead.
-    This wrapper is kept for backward compat and will be removed in Phase 6.
+    Re-exported from ``MbedOSBuildSystem`` for backward compatibility.
     """
     from .builders.mbed_os import _mbed_target_from_custom_targets as _fn
     return _fn(project_root)
-
-
-def _resolve_mbed_extra_profiles(project_root: Path, extra: list[str]) -> list[str]:
-    """Deprecated — delegates to the MbedOSBuildSystem helper."""
-    from .builders.mbed_os import _resolve_mbed_extra_profiles as _fn
-    return _fn(project_root, extra)
-
-
-def _build_mbed_os(project_root: Path, cfg: BuildConfig) -> Path:
-    """Deprecated thin wrapper — delegates to ``MbedOSBuildSystem.build()``."""
-    from .builders.mbed_os import MbedOSBuildSystem
-    return MbedOSBuildSystem().build(project_root, cfg)
-
-
-# ---------------------------------------------------------------------------
-# Zephyr helpers
-# ---------------------------------------------------------------------------
-
-
-def _build_zephyr(project_root: Path, cfg: BuildConfig) -> Path:
-    """Deprecated thin wrapper — delegates to ``ZephyrBuildSystem.build()``."""
-    from .builders.zephyr import ZephyrBuildSystem
-    return ZephyrBuildSystem().build(project_root, cfg)
-
-
-# ---------------------------------------------------------------------------
-# PlatformIO helpers
-# ---------------------------------------------------------------------------
-
-
-def _build_platformio(project_root: Path, cfg: BuildConfig) -> Path:
-    """Deprecated thin wrapper — delegates to ``PlatformIOBuildSystem.build()``."""
-    from .builders.platformio import PlatformIOBuildSystem
-    return PlatformIOBuildSystem().build(project_root, cfg)
 
 
 # ---------------------------------------------------------------------------
