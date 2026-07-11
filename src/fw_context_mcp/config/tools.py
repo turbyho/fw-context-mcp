@@ -317,6 +317,10 @@ class AiTool:
     """Glob patterns for agent files in the agent directories."""
     agent_strip_name: bool = False
     """Strip ``name:`` from YAML frontmatter when creating template agents."""
+    skill_dirs_global: list[str] = field(default_factory=list)
+    """Global skill directories for this tool. Supports ``~`` home expansion."""
+    skill_dirs_project: list[str] = field(default_factory=list)
+    """Project skill directories for this tool. Supports ``{project}`` substitution."""
 
     def is_detected(self) -> bool:
         """Return True if the tool appears to be installed."""
@@ -362,6 +366,8 @@ TOOLS: dict[str, AiTool] = {
         agent_dirs_global=["~/.claude/agents"],
         agent_dirs_project=["{project}/.claude/agents"],
         agent_file_patterns=["*.md"],
+        skill_dirs_global=["~/.claude/skills"],
+        skill_dirs_project=["{project}/.claude/skills"],
         targets=[
             InstructionTarget(
                 path="~/.claude/CLAUDE.md",
@@ -385,6 +391,8 @@ TOOLS: dict[str, AiTool] = {
         agent_dirs_project=["{project}/.opencode/agents"],
         agent_file_patterns=["*.md"],
         agent_strip_name=True,
+        skill_dirs_global=["~/.config/opencode/skills"],
+        skill_dirs_project=["{project}/.opencode/skills"],
         targets=[
             InstructionTarget(
                 path="~/.config/opencode/rules/fw-context.md",
@@ -401,18 +409,40 @@ TOOLS: dict[str, AiTool] = {
     "kilocode": AiTool(
         id="kilocode",
         name="Kilo Code",
-        detection_dirs=["~/.kilocode"],
-        inherits_from="claude-code",
-        targets=[],
+        detection_dirs=["~/.kilo"],
+        inherits_from="opencode",
+        mcp_config_file="~/.config/kilo/kilo.json",
+        mcp_config_key="fw-context",
+        agent_dirs_global=["~/.kilo/agents"],
+        agent_dirs_project=["{project}/.kilo/agents"],
+        agent_file_patterns=["*.md"],
+        agent_strip_name=True,
+        skill_dirs_global=["~/.kilo/skills"],
+        skill_dirs_project=["{project}/.kilo/skills"],
+        targets=[
+            InstructionTarget(
+                path="~/.kilo/rules/fw-context.md",
+                method="separate_file",
+                scope="global",
+            ),
+            InstructionTarget(
+                path="{project}/AGENTS.md",
+                method="marked_section",
+                scope="project",
+            ),
+        ],
     ),
     "codex": AiTool(
         id="codex",
         name="Codex",
         detection_dirs=["~/.codex"],
+        mcp_registration="codex mcp add fw-context -- {bin}",
         agent_dirs_global=["~/.codex/agents"],
         agent_dirs_project=["{project}/.codex/agents"],
         agent_file_patterns=["*.toml"],
         agent_strip_name=True,
+        skill_dirs_global=["~/.codex/skills"],
+        skill_dirs_project=["{project}/.codex/skills"],
         targets=[
             InstructionTarget(
                 path="~/.codex/rules/fw-context.md",
@@ -430,10 +460,19 @@ TOOLS: dict[str, AiTool] = {
         id="cursor",
         name="Cursor",
         detection_dirs=["~/.cursor", "~/.config/Cursor"],
+        mcp_config_file="~/.cursor/mcp.json",
+        mcp_config_key="fw-context",
         agent_dirs_global=["~/.cursor/agents"],
         agent_dirs_project=["{project}/.cursor/agents"],
         agent_file_patterns=["*.mdc"],
+        skill_dirs_global=["~/.cursor/skills"],
+        skill_dirs_project=["{project}/.cursor/skills"],
         targets=[
+            InstructionTarget(
+                path="~/.cursor/rules/fw-context.mdc",
+                method="separate_file",
+                scope="global",
+            ),
             InstructionTarget(
                 path="{project}/.cursor/rules/fw-context.mdc",
                 method="separate_file",
@@ -448,6 +487,9 @@ TOOLS: dict[str, AiTool] = {
 
 CROSS_TOOL_AGENT_DIRS_GLOBAL = ["~/.agents/agents"]
 CROSS_TOOL_AGENT_DIRS_PROJECT = ["{project}/.agents/agents"]
+
+CROSS_TOOL_SKILL_DIRS_GLOBAL = ["~/.agents/skills"]
+CROSS_TOOL_SKILL_DIRS_PROJECT = ["{project}/.agents/skills"]
 
 
 # ── Collision detection ─────────────────────────────────────────────────────
