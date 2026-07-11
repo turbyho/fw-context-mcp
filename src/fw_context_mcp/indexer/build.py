@@ -57,6 +57,15 @@ class BuildConfig:
     # Zephyr override (required, no safe auto-detection)
     board: str | None = None
 
+    # ESP-IDF (optional — auto-detected from environment)
+    idf_path: str | None = None  # Path to ESP-IDF install (usually $IDF_PATH)
+
+    # Arduino (required for build — no safe auto-detection)
+    fqbn: str | None = None  # Fully Qualified Board Name, e.g. "arduino:avr:uno"
+
+    # Generic CMake (optional)
+    cmake_generator: str | None = None  # e.g. "Ninja", "Unix Makefiles"
+
 
 # ---------------------------------------------------------------------------
 # Detection

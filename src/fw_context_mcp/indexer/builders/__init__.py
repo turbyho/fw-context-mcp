@@ -60,7 +60,14 @@ class BuildSystemRegistry:
 registry = BuildSystemRegistry()
 
 # Import builder modules so they self-register via ``registry.register()``.
-# isort: split
+# Order matters: first-registered builder wins ties in the scoring system.
+# Tier 1: already-supported build systems
 from . import mbed_os  # noqa: F401, E402, I001
 from . import platformio  # noqa: F401, E402, I001
 from . import zephyr  # noqa: F401, E402, I001
+# Tier 2: new first-class builders
+from . import arduino  # noqa: F401, E402, I001
+from . import esp_idf  # noqa: F401, E402, I001
+from . import generic_cmake  # noqa: F401, E402, I001
+# Tier 3/4: stubs (detect-only, no automated build)
+from . import stubs  # noqa: F401, E402, I001
