@@ -40,6 +40,26 @@ class BuildConfig:
         extra_profiles: Additional Mbed OS profiles merged on top (default ``["lto.json"]``).
         defines: Extra ``-D`` preprocessor macros passed to the compiler.
         board: Zephyr board name (e.g. ``"nrf52840dk_nrf52840"``). Required for Zephyr.
+        idf_path: Path to ESP-IDF install (usually ``$IDF_PATH``).
+        fqbn: Arduino Fully Qualified Board Name (e.g. ``"arduino:avr:uno"``).
+        cmake_generator: CMake generator (e.g. ``"Ninja"``, ``"Unix Makefiles"``).
+        keil_project: Path to Keil MDK ``.uvprojx`` file (relative to project root).
+        keil_target: Keil target name within the project (optional).
+        keil_cmsis_path: Path to CMSIS headers for Keil projects.
+        iar_project: Path to IAR EWARM ``.ewp`` file (relative to project root).
+        iar_target: IAR target name within the project (optional).
+        makefile: Path to Makefile (default: ``Makefile`` in project root).
+        make_target: Make build target (default: ``"all"``).
+        make_vars: Extra variables passed to make (e.g. ``{V: "1"}``).
+        make_dry_run: Use ``compiledb -n`` dry-run instead of real build.
+        toolchain_path: Path to toolchain binaries (shared by Keil, IAR, Makefile).
+        toolchain_prefix: Toolchain prefix (e.g. ``"arm-none-eabi-"``).
+        include_dirs: Directories added via ``-I`` (manual/bare mode).
+        system_include_dirs: Directories added via ``-isystem`` (manual/bare mode).
+        extra_flags: Extra compiler flags (manual/bare mode).
+        source_dirs: Directories scanned for ``.c``/``.cpp`` files (manual/bare mode).
+        compiler: Compiler executable name (manual/bare mode, default ``"gcc"``).
+        pre_build: Shell command run before build/convert/generate.
     """
 
     system: str | None = None  # "mbed-os", "zephyr", "platformio", or None (auto-detect)
@@ -65,6 +85,35 @@ class BuildConfig:
 
     # Generic CMake (optional)
     cmake_generator: str | None = None  # e.g. "Ninja", "Unix Makefiles"
+
+    # ── Keil MDK (convert path — no build needed) ──
+    keil_project: str | None = None  # path to .uvprojx
+    keil_target: str | None = None  # target name within the project
+    keil_cmsis_path: str | None = None  # path to CMSIS headers
+
+    # ── IAR EWARM (convert path — no build needed) ──
+    iar_project: str | None = None  # path to .ewp
+    iar_target: str | None = None  # target name within the project
+
+    # ── Makefile (generate via compiledb) ──
+    makefile: str | None = None  # path to Makefile (default: project_root/Makefile)
+    make_target: str = "all"  # build target
+    make_vars: dict[str, str] = field(default_factory=dict)  # extra vars for make
+    make_dry_run: bool = True  # use compiledb -n (dry-run, no real build)
+
+    # ── Toolchain (shared by Keil, IAR, Makefile) ──
+    toolchain_path: str | None = None  # path to toolchain bin directory
+    toolchain_prefix: str | None = None  # e.g. "arm-none-eabi-"
+
+    # ── Manual / bare mode ──
+    include_dirs: list[str] = field(default_factory=list)  # -I directories
+    system_include_dirs: list[str] = field(default_factory=list)  # -isystem directories
+    extra_flags: list[str] = field(default_factory=list)  # extra compiler flags
+    source_dirs: list[str] = field(default_factory=list)  # directories to scan for sources
+    compiler: str = "gcc"  # compiler executable name
+
+    # ── Pre-build hooks ──
+    pre_build: str | None = None  # shell command run before build/convert/generate
 
 
 # ---------------------------------------------------------------------------
@@ -169,6 +218,23 @@ def check_completeness(cc_path: Path, project_root: Path) -> list[str]:
     return warnings
 
 
+def _run_pre_build(cfg: BuildConfig, cwd: Path) -> None:
+    """Execute the pre-build hook if configured."""
+    if not cfg.pre_build:
+        return
+    log.warning(
+        "Running pre-build hook: %s\n"
+        "Pre-build hooks execute arbitrary shell commands.  For security, "
+        "configure pre_build only in .fw-context/local.toml (gitignored), "
+        "not in .fw-context/config.toml (committed).",
+        cfg.pre_build,
+    )
+    import shlex
+    result = subprocess.run(shlex.split(cfg.pre_build), shell=False, cwd=cwd)
+    if result.returncode != 0:
+        raise RuntimeError(f"Pre-build command failed with exit code {result.returncode}")
+
+
 def generate_compile_commands(
     project_root: Path,
     cfg: BuildConfig,
@@ -176,14 +242,20 @@ def generate_compile_commands(
     """Generate a fresh compile_commands.json and return its path.
 
     Auto-detects the build system when ``cfg.system`` is ``None``.
-    Delegates to the registered ``BuildSystem`` implementation via
-    ``BuildSystemRegistry``.
-    Raises ``RuntimeError`` when detection or build fails.
+    The generation path is chosen by builder capability:
+
+    1. **Shell override** — ``cfg.command`` runs as-is, highest priority.
+    2. **Convert** — builder has ``convert()`` (Keil, IAR — no build).
+    3. **Generate** — builder has ``generate()`` (Makefile/compiledb, manual/bare).
+    4. **Build** — builder has ``build()`` (PlatformIO, Zephyr, Mbed OS, …).
+
+    Raises ``RuntimeError`` when detection or generation fails.
     """
     root = project_root.resolve()
 
-    # Full command override
+    # Full command override — highest priority
     if cfg.command:
+        _run_pre_build(cfg, root)
         log.info("Running custom build command: %s", cfg.command)
         import shlex
         result = subprocess.run(shlex.split(cfg.command), shell=False, cwd=root)
@@ -212,4 +284,38 @@ def generate_compile_commands(
 
     log.info("Detected build system: %s (clean=%s)", system, cfg.clean)
     builder = builder_cls()
+
+    # Run pre-build hook before any generation path
+    _run_pre_build(cfg, root)
+
+    # ── Path 2: Convert (Keil, IAR — no build needed) ──
+    if hasattr(builder, "convert") and _can_convert(cfg, system):
+        log.info("Using convert path for %s", system)
+        return builder.convert(root, cfg)
+
+    # ── Path 3: Generate (Makefile/compiledb, manual/bare) ──
+    if hasattr(builder, "generate") and _can_generate(cfg, system):
+        log.info("Using generate path for %s", system)
+        return builder.generate(root, cfg)
+
+    # ── Path 1: Build (PlatformIO, Zephyr, Mbed OS, ESP-IDF, CMake, Arduino) ──
     return builder.build(root, cfg)
+
+
+def _can_convert(cfg: BuildConfig, system: str) -> bool:
+    """Check whether the configuration supports the convert path."""
+    if system == "keil-mdk":
+        return cfg.keil_project is not None
+    if system == "iar-ewarm":
+        return cfg.iar_project is not None
+    return False
+
+
+def _can_generate(cfg: BuildConfig, system: str) -> bool:
+    """Check whether the configuration supports the generate path."""
+    if system == "makefile":
+        # compiledb needs a Makefile
+        return True  # Makefile builder always supports generate
+    if system == "bare":
+        return bool(cfg.source_dirs)
+    return False

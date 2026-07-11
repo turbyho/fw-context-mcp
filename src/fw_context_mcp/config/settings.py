@@ -366,6 +366,7 @@ def _from_dict(data: dict) -> Config:
             cfg.build.clean = bool(build["clean"])
         if command := build.get("command"):
             cfg.build.command = command
+        # Mbed OS
         if target := build.get("target"):
             cfg.build.target = target
         if toolchain := build.get("toolchain"):
@@ -378,14 +379,58 @@ def _from_dict(data: dict) -> Config:
             cfg.build.extra_profiles = list(extra)
         if defines := build.get("defines"):
             cfg.build.defines = list(defines)
+        # Zephyr
         if board := build.get("board"):
             cfg.build.board = board
+        # ESP-IDF
         if idf_path := build.get("idf_path"):
             cfg.build.idf_path = idf_path
+        # Arduino
         if fqbn := build.get("fqbn"):
             cfg.build.fqbn = fqbn
+        # Generic CMake
         if cmake_generator := build.get("cmake_generator"):
             cfg.build.cmake_generator = cmake_generator
+        # Keil MDK
+        if keil_project := build.get("keil_project"):
+            cfg.build.keil_project = keil_project
+        if keil_target := build.get("keil_target"):
+            cfg.build.keil_target = keil_target
+        if keil_cmsis_path := build.get("keil_cmsis_path"):
+            cfg.build.keil_cmsis_path = keil_cmsis_path
+        # IAR EWARM
+        if iar_project := build.get("iar_project"):
+            cfg.build.iar_project = iar_project
+        if iar_target := build.get("iar_target"):
+            cfg.build.iar_target = iar_target
+        # Makefile
+        if makefile := build.get("makefile"):
+            cfg.build.makefile = makefile
+        if make_target := build.get("make_target"):
+            cfg.build.make_target = make_target
+        if make_vars := build.get("make_vars"):
+            cfg.build.make_vars = dict(make_vars)
+        if "make_dry_run" in build:
+            cfg.build.make_dry_run = bool(build["make_dry_run"])
+        # Toolchain
+        if toolchain_path := build.get("toolchain_path"):
+            cfg.build.toolchain_path = toolchain_path
+        if toolchain_prefix := build.get("toolchain_prefix"):
+            cfg.build.toolchain_prefix = toolchain_prefix
+        # Manual / bare mode
+        if include_dirs := build.get("include_dirs"):
+            cfg.build.include_dirs = list(include_dirs)
+        if system_include_dirs := build.get("system_include_dirs"):
+            cfg.build.system_include_dirs = list(system_include_dirs)
+        if extra_flags := build.get("extra_flags"):
+            cfg.build.extra_flags = list(extra_flags)
+        if source_dirs := build.get("source_dirs"):
+            cfg.build.source_dirs = list(source_dirs)
+        if compiler := build.get("compiler"):
+            cfg.build.compiler = compiler
+        # Pre-build hooks
+        if pre_build := build.get("pre_build"):
+            cfg.build.pre_build = pre_build
 
     if idx := data.get("index", {}):
         if db_dir := idx.get("db_dir"):
@@ -547,6 +592,19 @@ def load(project_root: Path | None = None) -> Config:
             data = _deep_merge(data, proj_data)
         except Exception:
             log.exception("Failed to parse %s — ignoring project config", proj_path)
+
+        # Security: pre_build in committed config.toml is a risk — anyone
+        # who can commit can run arbitrary shell commands on other devs'
+        # machines.  pre_build should only be in local.toml (gitignored).
+        if (proj_data.get("build") or {}).get("pre_build"):
+            msg = (
+                "⚠ SECURITY: pre_build is set in .fw-context/config.toml "
+                "(committed).  This allows anyone with commit access to run "
+                "arbitrary shell commands.  Move pre_build to "
+                ".fw-context/local.toml (gitignored) instead."
+            )
+            log.warning(msg)
+            print(msg, file=sys.stderr)
 
         assert local_path is not None
         try:
