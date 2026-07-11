@@ -1057,8 +1057,13 @@ def _compute_deps_hash(headers: list[Path], cache: dict[str, str]) -> str:
 def _find_dep_path(unit) -> Path | None:
     """Locate the ``.d`` dependency file for a translation unit.
 
-    Scans the raw compile_commands entry for ``-MF <path>``, then falls
-    back to replacing the source file extension with ``.d``.
+    Tries three strategies in order:
+    1. ``-MF <path>`` flag in the compile command (raw args, then
+       response-file-expanded).
+    2. ``<source>.d`` next to the source file (in-tree builds).
+    3. ``<output>.d`` next to the object file — derived from the
+       compile_commands.json ``output`` field (out-of-tree builds,
+       e.g. PlatformIO with ``-MMD`` and no ``-MF``).
     """
     # Try -MF flag from raw entry first
     if unit.raw_entry is not None:
@@ -1086,8 +1091,23 @@ def _find_dep_path(unit) -> Path | None:
     d = unit.file.with_suffix(".d")
     if d.exists():
         return d
-    # Also try the object directory pattern: build/obj/main.o → build/obj/main.d
-    # Not needed when -MF is present, but helpful for simple setups
+
+    # Fallback: derive .d path from the object file (compile_commands.json
+    # "output" field) — needed for build systems that use -MMD without -MF
+    # (e.g. PlatformIO).  GCC with -MMD and no -MF puts the .d next to the
+    # .o file, replacing .o with .d.
+    if unit.raw_entry is not None:
+        output = unit.raw_entry.get("output", "")
+        if output:
+            o_path = Path(output)
+            if not o_path.is_absolute() and unit.directory:
+                o_path = unit.directory / o_path
+            o_path = o_path.resolve()
+            # Replace trailing .o with .d: Esp.cpp.o → Esp.cpp.d
+            dep_from_obj = o_path.with_suffix(".d")
+            if dep_from_obj.exists():
+                return dep_from_obj
+
     return None
 
 
@@ -1750,14 +1770,21 @@ def run(
         conn.commit()
         log.info("done  %s", _fmt_dur(time.monotonic() - t_hs))
 
-    # Determine deps verification level after all TUs are processed
-    deps_total, deps_with_d = conn.execute(
-        "SELECT COUNT(*), SUM(CASE WHEN deps_exist THEN 1 ELSE 0 END) FROM files WHERE config_hash=?",
-        (config_hash,),
+    # Determine deps verification level after all TUs are processed.
+    # Only count translation units (source files from compile_commands.json),
+    # not header files — .d files are only meaningful for TUs.
+    tu_count = len(units)
+    tu_paths = [str(u.file.resolve()) for u in units]
+    placeholders = ",".join(["?"] * len(tu_paths))
+    tu_with_deps_row = conn.execute(
+        f"SELECT COUNT(*) FROM files WHERE config_hash = ? AND deps_exist AND path IN ({placeholders})",
+        (config_hash, *tu_paths),
     ).fetchone()
-    if deps_total == 0 or deps_with_d is None:
+    tu_with_deps = tu_with_deps_row[0] if tu_with_deps_row else 0
+
+    if tu_count == 0:
         deps_verification = "none"
-    elif deps_with_d >= deps_total:
+    elif tu_with_deps >= tu_count:
         deps_verification = "full"
     else:
         deps_verification = "partial"

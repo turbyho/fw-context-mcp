@@ -299,11 +299,13 @@ def store_symbols_for_unit(
         delete_symbols_for_file(conn, file_id_old)
         # ON DELETE CASCADE → llm_analysis, embeddings removed
 
-    # Upsert the TU file record
+    # Upsert the TU file record and capture its id — symbols defined in the
+    # TU itself reuse this id instead of calling upsert_file again, which
+    # would overwrite deps_exist/hashes with defaults.
     if hashes is not None:
         source_hash, flags_hash, deps_hash, deps_exist = hashes
         content_hash_val = compute_tu_content_hash(source_hash, flags_hash, deps_hash)
-        upsert_file(
+        tu_file_id = upsert_file(
             conn, config_hash, file_path, unit.language, mtime=current_mtime,
             content_hash=content_hash_val,
             source_hash=source_hash,
@@ -312,11 +314,14 @@ def store_symbols_for_unit(
             deps_exist=deps_exist,
         )
     else:
-        upsert_file(conn, config_hash, file_path, unit.language, mtime=current_mtime)
+        tu_file_id = upsert_file(conn, config_hash, file_path, unit.language, mtime=current_mtime)
 
     syms_added = 0
     refs_added = 0
     file_id_cache: dict[str, int] = {}
+    # Pre-populate the cache with the TU file itself so we don't re-upsert
+    # it below (which would reset deps_exist to its default).
+    file_id_cache[file_path] = tu_file_id
 
     if syms:
         # Pre-compute source_roots as strings for is_project checks
@@ -326,13 +331,10 @@ def store_symbols_for_unit(
             sym_file = s.file
             if sym_file not in file_id_cache:
                 lang = "cpp" if Path(sym_file).suffix.lower() in {".cpp", ".cc", ".cxx", ".c++"} else "c"
-                if sym_file == file_path:
-                    sym_mtime = current_mtime
-                else:
-                    try:
-                        sym_mtime = Path(sym_file).stat().st_mtime
-                    except OSError:
-                        sym_mtime = 0.0
+                try:
+                    sym_mtime = Path(sym_file).stat().st_mtime
+                except OSError:
+                    sym_mtime = 0.0
                 file_id_cache[sym_file] = upsert_file(
                     conn, config_hash, sym_file, lang, mtime=sym_mtime,
                 )

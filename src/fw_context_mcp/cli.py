@@ -78,6 +78,8 @@ def cmd_index(args: argparse.Namespace) -> int:
     detected_system = detect_build_system(project_root)
     if detected_system:
         print(f"Project: {project_root.name}  path={project_root}  build={detected_system}")
+        if detected_system == "platformio":
+            _ensure_platformio_dep_tracking(project_root, fix=True)
     else:
         print(f"Project: {project_root.name}  path={project_root}  build=unknown")
 
@@ -382,12 +384,20 @@ def _install_skills(
     ``"global"`` or ``"all"``) and at the project level (when scope is
     ``"project"`` or ``"all"``, and ``project_root`` is provided).
 
-    Project-local skills override global ones — if a project has its
-    own copy the user intentionally customized it.
+    Skill directories are driven by the ``TOOLS`` registry — no tool
+    paths are hardcoded here.  Project-local skills override global
+    ones — if a project has its own copy the user intentionally
+    customized it.
     """
+    import os
     import shutil
 
     from . import __file__ as _pkg_init
+    from .config.tools import (
+        CROSS_TOOL_SKILL_DIRS_GLOBAL,
+        CROSS_TOOL_SKILL_DIRS_PROJECT,
+        TOOLS,
+    )
 
     pkg_dir = Path(_pkg_init).parent
     skill_dir = pkg_dir / "data" / "skills" / "fw-review"
@@ -396,22 +406,35 @@ def _install_skills(
         return False
 
     targets: list[Path] = []
+    processed: set[Path] = set()
 
-    # Global targets
+    # Global targets — from tool definitions and cross-tool standard dirs
     if scope in ("global", "all"):
-        targets.extend([
-            Path.home() / ".config" / "opencode" / "skills" / "fw-review",
-            Path.home() / ".claude" / "skills" / "fw-review",
-            Path.home() / ".agents" / "skills" / "fw-review",
-        ])
+        for tool in TOOLS.values():
+            for dir_template in tool.skill_dirs_global:
+                resolved = Path(os.path.expanduser(dir_template)) / "fw-review"
+                if resolved not in processed:
+                    targets.append(resolved)
+                    processed.add(resolved)
+        for dir_template in CROSS_TOOL_SKILL_DIRS_GLOBAL:
+            resolved = Path(os.path.expanduser(dir_template)) / "fw-review"
+            if resolved not in processed:
+                targets.append(resolved)
+                processed.add(resolved)
 
-    # Project-level targets
+    # Project-level targets — from tool definitions and cross-tool standard dirs
     if project_root is not None and scope in ("project", "all"):
-        targets.extend([
-            project_root / ".claude" / "skills" / "fw-review",
-            project_root / ".opencode" / "skills" / "fw-review",
-            project_root / ".agents" / "skills" / "fw-review",
-        ])
+        for tool in TOOLS.values():
+            for dir_template in tool.skill_dirs_project:
+                resolved = Path(dir_template.replace("{project}", str(project_root))) / "fw-review"
+                if resolved not in processed:
+                    targets.append(resolved)
+                    processed.add(resolved)
+        for dir_template in CROSS_TOOL_SKILL_DIRS_PROJECT:
+            resolved = Path(dir_template.replace("{project}", str(project_root))) / "fw-review"
+            if resolved not in processed:
+                targets.append(resolved)
+                processed.add(resolved)
 
     installed = False
     for target in targets:
@@ -441,24 +464,15 @@ def _install_skills(
     return installed
 
 
-# Per-tool project directory indicators — checked by _detect_project_ai_tools
-_PROJECT_TOOL_DIRS: dict[str, list[str]] = {
-    "claude-code": [".claude"],
-    "opencode": [".opencode"],
-    "codex": [".codex"],
-    "cursor": [".cursor"],
-}
+def _detect_project_ai_tools(project_root: Path) -> list[str]:  # noqa: ARG001 — kept for API compat
+    """Return AI tool IDs detected as installed on the system.
 
+    Uses ``AiTool.is_detected()`` — checks for CLI binaries in PATH
+    and global config directories (``~/.claude``, ``~/.codex``, etc.).
+    """
+    from .config.tools import TOOLS
 
-def _detect_project_ai_tools(project_root: Path) -> list[str]:
-    """Return AI tool IDs detected in the project directory."""
-    found: list[str] = []
-    for tool_id, dirs in _PROJECT_TOOL_DIRS.items():
-        for d in dirs:
-            if (project_root / d).is_dir():
-                found.append(tool_id)
-                break
-    return found
+    return [tid for tid, t in TOOLS.items() if t.is_detected()]
 
 
 def _inject_agent_toml_section(path: Path, content: str, marker: str) -> None:
@@ -500,6 +514,40 @@ def _inject_agent_toml_section(path: Path, content: str, marker: str) -> None:
 
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(updated, encoding="utf-8")
+
+
+def _convert_agent_md_to_toml(md_content: str) -> str:
+    """Convert agent ``.md`` template to Codex ``.toml`` format.
+
+    YAML frontmatter → TOML comments, ``<!-- fw-context -->`` markers
+    → ``# fw-context``, body wrapped in ``[instructions]`` section.
+    """
+    import re
+
+    parts = md_content.split("---", 2)
+    if len(parts) >= 3:
+        frontmatter_text = parts[1]
+        body = parts[2]
+    else:
+        frontmatter_text = ""
+        body = md_content
+
+    lines: list[str] = []
+    for line in frontmatter_text.strip().splitlines():
+        m = re.match(r"^(name|description):\s*(.*)", line)
+        if m:
+            key = m.group(1)
+            value = m.group(2).strip()
+            lines.append(f"# {key}: {value}")
+    if lines:
+        lines.append("")
+
+    lines.append("[instructions]")
+    # Convert HTML comment markers to TOML hash-comment markers
+    body = body.replace("<!-- fw-context -->", "# fw-context")
+    body = body.replace("<!-- /fw-context -->", "# /fw-context")
+    lines.append(body.strip())
+    return "\n".join(lines) + "\n"
 
 
 def _install_agents(dry_run: bool = False, project_root: Path | None = None, scope: str = "project") -> bool:
@@ -593,12 +641,45 @@ def _install_agents(dry_run: bool = False, project_root: Path | None = None, sco
             continue
 
         for template_path in templates:
-            # Only install .md templates into dirs with compatible patterns
+            # Install .md templates into dirs with compatible patterns
             template_suffix = template_path.suffix  # ".md"
             is_compatible = any(
-                template_suffix in p or template_suffix == p.lstrip("*") for p in patterns
+                template_suffix == p.lstrip("*") for p in patterns
             )
             if not is_compatible:
+                # Convert .md → .toml when target uses TOML patterns (Codex)
+                has_toml = any(".toml" in p for p in patterns)
+                if has_toml:
+                    target_name = template_path.stem + ".toml"
+                    target_path = agents_dir / target_name
+                    template_text = _convert_agent_md_to_toml(template_path.read_text(encoding="utf-8"))
+                    if strip_name:
+                        template_text = re.sub(r"^# name:.*\n", "", template_text, flags=re.MULTILINE)
+                    if dry_run:
+                        if not target_path.exists():
+                            print(f"  [dry-run] {target_path}: would CREATE (TOML)")
+                            installed = True
+                        continue
+                    agents_dir.mkdir(parents=True, exist_ok=True)
+                    target_path.write_text(template_text, encoding="utf-8")
+                    print(f"  [ok] {target_path}: created (TOML)")
+                    installed = True
+                # Rename .md → .mdc when target uses Cursor patterns (same content)
+                elif any(".mdc" in p for p in patterns):
+                    target_name = template_path.stem + ".mdc"
+                    target_path = agents_dir / target_name
+                    template_text = template_path.read_text(encoding="utf-8")
+                    if strip_name:
+                        template_text = re.sub(r"^name:.*\n", "", template_text, flags=re.MULTILINE)
+                    if dry_run:
+                        if not target_path.exists():
+                            print(f"  [dry-run] {target_path}: would CREATE")
+                            installed = True
+                        continue
+                    agents_dir.mkdir(parents=True, exist_ok=True)
+                    target_path.write_text(template_text, encoding="utf-8")
+                    print(f"  [ok] {target_path}: created")
+                    installed = True
                 continue
 
             target_path = agents_dir / template_path.name
@@ -983,6 +1064,155 @@ def _check_config_file(project_root: Path, rel_path: str, template: str, fix: bo
         print(f"  [ok] {path}")
 
 
+def _ensure_platformio_dep_tracking(project_root: Path, *, fix: bool = False) -> None:
+    """Ensure the PlatformIO project generates ``.d`` dependency files.
+
+    PlatformIO toolchains that don't pass ``-MMD`` by default (STM32, etc.)
+    produce no ``.d`` files, which prevents fw-context from detecting header
+    changes.  This function configures the project to pull ``-MMD`` from a
+    shared config file so every platform benefits.
+
+    In fix mode (*fix=True*):
+    1. Creates ``~/.fw-context/platformio-shared.ini`` with ``-MMD``.
+    2. Adds ``[platformio] extra_configs`` referencing the shared file.
+    3. Appends ``${common.build_flags}`` to each ``[env:*]`` section.
+    """
+    import configparser
+    import re
+
+    log = logging.getLogger(__name__)
+    shared_dir = Path.home() / ".fw-context"
+    shared_ini = shared_dir / "platformio-shared.ini"
+    pio_ini = project_root / "platformio.ini"
+
+    if not pio_ini.exists():
+        return
+
+    # ── 1. Ensure shared config exists ──
+    shared_content = (
+        "; Shared PlatformIO configuration — header dependency tracking for fw-context.\n"
+        "; Generated by fw-context.  Include in each project with:\n"
+        ";   [platformio]\n"
+        ";   extra_configs = ~/.fw-context/platformio-shared.ini\n"
+        ";   [env:xxx]\n"
+        ";   build_flags = ${common.build_flags} ...your flags...\n"
+        "\n"
+        "[common]\n"
+        "build_flags = -MMD\n"
+    )
+    if fix:
+        try:
+            shared_dir.mkdir(parents=True, exist_ok=True)
+            if not shared_ini.exists():
+                shared_ini.write_text(shared_content, encoding="utf-8")
+                print(f"  [+] {shared_ini}")
+        except (OSError, PermissionError) as exc:
+            log.warning("Could not write %s: %s", shared_ini, exc)
+            return
+    elif not shared_ini.exists():
+        print(f"  [info] shared config missing, would create: {shared_ini}")
+
+    # ── 2. Parse platformio.ini with configparser ──
+    try:
+        raw = pio_ini.read_text(encoding="utf-8")
+    except (OSError, PermissionError) as exc:
+        log.warning("Could not read %s: %s", pio_ini, exc)
+        return
+
+    parser = configparser.ConfigParser(interpolation=None)
+    parser.read_string(raw)
+
+    needs_fix = False
+    extra_configs_line = "extra_configs = ~/.fw-context/platformio-shared.ini"
+    shared_build_flags_ref = "${common.build_flags}"
+
+    # Check [platformio] section
+    if parser.has_section("platformio"):
+        current_extra = parser.get("platformio", "extra_configs", fallback="")
+        if "platformio-shared.ini" not in current_extra:
+            needs_fix = True
+    else:
+        needs_fix = True
+
+    # Check each [env:*] section has ${common.build_flags}
+    if not needs_fix:
+        for section in parser.sections():
+            if section.startswith("env:") or section == "env":
+                build_flags = parser.get(section, "build_flags", fallback="")
+                if shared_build_flags_ref not in build_flags:
+                    needs_fix = True
+                    break
+
+    if not needs_fix:
+        print(f"  [ok] {pio_ini} already configured for dep tracking")
+        return
+
+    if not fix:
+        print(f"  [info] {pio_ini}: would add extra_configs + build_flags = {shared_build_flags_ref}")
+        return
+
+    # ── 3. Modify and write ──
+    lines = raw.splitlines(keepends=True)
+    result: list[str] = []
+
+    has_platformio_section = bool(re.search(r"(?m)^\[platformio\]", raw))
+    updated_sections: set[str] = set()
+
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        stripped = line.rstrip("\n").rstrip("\r")
+
+        # Detect section header
+        section_match = re.match(r"^\[(env(?::\S+)?|platformio)\]", stripped)
+        if section_match:
+            section_name = section_match.group(1)
+            result.append(line)
+            i += 1
+            updated_sections.add(section_name)
+
+            # Handle [platformio] section — add extra_configs if missing
+            if section_name == "platformio":
+                if "extra_configs" not in raw:
+                    result.append(f"{extra_configs_line}\n")
+                    has_platformio_section = True
+
+            # Handle [env:*] sections — add ${common.build_flags} if missing
+            elif section_name.startswith("env"):
+                # Scan ahead to find build_flags
+                has_build_flags = False
+                scan = i
+                while scan < len(lines):
+                    sline = lines[scan].rstrip("\n").rstrip("\r")
+                    if sline.startswith("[") or scan >= i + 20:
+                        break
+                    if sline.startswith("build_flags"):
+                        has_build_flags = True
+                        if shared_build_flags_ref not in sline:
+                            # Prepend ${common.build_flags} to existing build_flags
+                            indent = len(sline) - len(sline.lstrip())
+                            lines[scan] = f"{' ' * indent}build_flags = {shared_build_flags_ref} {sline.split('=', 1)[1].strip()}\n"
+                        break
+                    scan += 1
+                if not has_build_flags:
+                    # Add build_flags before the first key in this section
+                    result.append(f"build_flags = {shared_build_flags_ref}\n")
+            continue
+
+        result.append(line)
+        i += 1
+
+    # Add [platformio] section at the top if it doesn't exist
+    if not has_platformio_section:
+        result.insert(0, f"\n[platformio]\n{extra_configs_line}\n")
+
+    try:
+        pio_ini.write_text("".join(result), encoding="utf-8")
+        print(f"  [+] {pio_ini}: added dep tracking (extra_configs + -MMD)")
+    except (OSError, PermissionError) as exc:
+        log.warning("Could not write %s: %s", pio_ini, exc)
+
+
 def _ensure_gitignore(project_root: Path, *, fix: bool = False, build_system: str | None = None) -> None:
     """Add ``compile_commands.json`` and ``.fw-context/local.toml`` to the
     project's ``.gitignore`` if they aren't already listed.
@@ -1117,7 +1347,11 @@ def _register_mcp_file(tool, mcp_bin: str, dry_run: bool = False) -> None:
 
     try:
         if config_path.exists():
-            data = json.loads(config_path.read_text(encoding="utf-8"))
+            raw = config_path.read_text(encoding="utf-8")
+            # Strip JSONC comments (// and /* */) before parsing
+            raw = re.sub(r"/\*.*?\*/", "", raw, flags=re.DOTALL)
+            raw = re.sub(r"//.*$", "", raw, flags=re.MULTILINE)
+            data = json.loads(raw)
         else:
             data = {}
     except (json.JSONDecodeError, OSError) as e:
