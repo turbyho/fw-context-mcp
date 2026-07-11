@@ -57,6 +57,7 @@ def cmd_index(args: argparse.Namespace) -> int:
     from .config import load as load_config
     from .indexer.build import detect_build_system
     from .indexer.runner import run
+    from .indexer.validator import is_compile_commands_stale, validate_and_fix
     from .utils import resolve_project_root
 
     if args.verbose:
@@ -141,6 +142,35 @@ def cmd_index(args: argparse.Namespace) -> int:
     project_id = derive_project_id(project_root)
 
     db_path = cfg.index.db_dir / project_id / "index.db"
+
+    # ── Validate build artifacts before indexing ──
+    if detected_system:
+        from .indexer.builders import registry as builder_registry
+        builder_cls = builder_registry.get(detected_system)
+        if builder_cls is not None:
+            builder_instance = builder_cls()
+            # Check staleness
+            stale, stale_reasons = is_compile_commands_stale(compile_commands, project_root)
+            if stale:
+                print(f"compile_commands.json is stale ({'; '.join(stale_reasons)}).")
+                if args.build:
+                    print("  Rebuilding (--build flag)...")
+                elif not explicit_cc:
+                    print("  Run 'fw-context index --build' to regenerate.")
+            # Validate artifacts
+            issues = validate_and_fix(
+                compile_commands, project_root, builder_instance, cfg.build, fix=True,
+            )
+            errors = [i for i in issues if i.severity == "error"]
+            warnings_list = [i for i in issues if i.severity == "warning"]
+            for w in warnings_list:
+                print(f"warning: {w.message}", file=sys.stderr)
+            if errors:
+                for e in errors:
+                    print(f"error: {e.message}", file=sys.stderr)
+                if not args.build:
+                    print("Run 'fw-context index --build' to rebuild and fix issues.", file=sys.stderr)
+                return 1
 
     source_roots = [Path(r) for r in args.source_roots] if args.source_roots else cfg.source_root_paths(project_root)
     exclude_paths = cfg.exclude_root_paths(project_root)

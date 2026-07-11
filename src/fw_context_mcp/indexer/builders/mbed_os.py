@@ -142,7 +142,11 @@ class MbedOSBuildSystem:
     # ── Validation ──
 
     def validate_artifacts(self, compile_commands: Path, project_root: Path) -> list[BuildIssue]:
-        return []
+        issues: list[BuildIssue] = []
+        # Mbed OS via bear: .d files are generated alongside .o files in the
+        # build directory.  If bear ran successfully, .d files should exist.
+        # No extra validation beyond the generic checks in validate_and_fix().
+        return issues
 
     # ── Auto-fix ──
 

@@ -90,7 +90,10 @@ class ZephyrBuildSystem:
     # ── Validation ──
 
     def validate_artifacts(self, compile_commands: Path, project_root: Path) -> list[BuildIssue]:
-        return []
+        issues: list[BuildIssue] = []
+        # Zephyr via CMake: CMAKE_EXPORT_COMPILE_COMMANDS is enabled so
+        # compile_commands.json is complete.  No extra builder-specific checks.
+        return issues
 
     # ── Auto-fix ──
 
