@@ -48,6 +48,11 @@ include = [
     "src/fw_context_mcp/data/**/*.md",
 ]
 
+[tool.hatch.build.targets.sdist]
+exclude = [
+    "tests/builds/",
+]
+
 [tool.ruff]
 target-version = "py311"
 line-length = 120
