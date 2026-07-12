@@ -78,6 +78,11 @@ def _build_filtered_file_content(
     Inactive lines are replaced with ``\\n`` so line numbers stay
     consistent with the original source.
 
+    Files inside *project_root* are stored with a relative path; files
+    outside (framework headers from PlatformIO, ESP-IDF, Zephyr modules)
+    are stored with their absolute path so ``search_content`` can find
+    them.
+
     Returns the number of files whose content was filled.
     """
     # Fast path: skip if no files need content filling
@@ -120,22 +125,23 @@ def _build_filtered_file_content(
         if not active_lines:
             continue
 
+        resolved = Path(abs_path).resolve()
         try:
-            rel_path = str(Path(abs_path).resolve().relative_to(project_root))
+            db_path = str(resolved.relative_to(project_root))
         except ValueError:
-            continue  # file outside project tree
+            db_path = str(resolved)  # absolute path for files outside project tree
 
         # Already processed?
         row = conn.execute(
             "SELECT content FROM files WHERE config_hash=? AND path=?",
-            (config_hash, rel_path),
+            (config_hash, db_path),
         ).fetchone()
         if row and row[0]:
             continue  # already have filtered content
 
         # Read original file
         try:
-            with open(abs_path, encoding="utf-8", errors="replace") as f:
+            with open(resolved, encoding="utf-8", errors="replace") as f:
                 original = f.readlines()
         except Exception:
             continue
@@ -152,17 +158,17 @@ def _build_filtered_file_content(
         content = "".join(filtered)
 
         # Insert or update — file rows may not exist for headers-only files.
-        lang = "cpp" if rel_path.endswith((".cpp", ".cc", ".cxx", ".hpp", ".hxx")) else "c"
+        lang = "cpp" if db_path.endswith((".cpp", ".cc", ".cxx", ".hpp", ".hxx")) else "c"
         # Grab real mtime so _count_modified_files won't flag this as stale.
         try:
-            file_mtime = Path(abs_path).stat().st_mtime
+            file_mtime = resolved.stat().st_mtime
         except OSError:
             file_mtime = 0.0
         conn.execute(
             "INSERT INTO files (config_hash, path, language, content, mtime) "
             "VALUES (?, ?, ?, ?, ?) "
             "ON CONFLICT (config_hash, path) DO UPDATE SET content = excluded.content",
-            (config_hash, rel_path, lang, content, file_mtime),
+            (config_hash, db_path, lang, content, file_mtime),
         )
         filled += 1
 
