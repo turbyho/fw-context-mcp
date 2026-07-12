@@ -45,6 +45,21 @@ def get_inheritance_chain(
     and down to all descendants (bounded by ``max_depth``). Uses BFS with
     cycle detection to handle diamond inheritance.
 
+    For class members use ``get_class_members``. For virtual method
+    override chains use ``get_method_overrides``.
+
+    Read-only. No side effects.
+
+    Args:
+        class_name: Class or struct name to get inheritance information for.
+            E.g. ``'UART_DRIVER'`` or ``'zbox::ZMODEM'``.
+        project_root: Project root. Auto-detected if omitted.
+        transitive: When True, walk the full inheritance tree both up
+            (ancestors) and down (descendants). Default: False (direct
+            bases and derived only).
+        max_depth: Maximum BFS depth for transitive walk (default 10,
+            clamped to 1–50).
+
     Returns:
         dict: {
             name, qualified_name, kind, file, line,
@@ -188,8 +203,20 @@ def get_class_members(
     typedef, class, struct). Each member includes its signature, virtual flags,
     and source line. Works for C structs too — they just won't have methods.
 
+    For inheritance hierarchy use ``get_inheritance_chain``. For individual
+    method details use ``get_symbol_context``.
+
+    Read-only. No side effects.
+
+    Args:
+        class_name: Class or struct name. E.g. ``'ModemManager'`` or
+            ``'zbox::ZMODEM'``.
+        project_root: Project root. Auto-detected if omitted.
+
     Returns:
-        dict: {name, qualified_name, kind, file, line, members: {kind: [...]}, member_count}
+        dict: {name, qualified_name, kind, file, line, members: {kind:
+        [{name, qualified_name, signature, is_virtual, is_pure_virtual,
+        line}]}, member_count}
     """
     db_path, cfg, project_id, root = _resolve_context(project_root)
     if not db_path.exists():
@@ -250,7 +277,8 @@ def get_template_instances(
     """Find all template instantiations for a C/C++ class or function
     template — libclang template-aware lookup. Finds concrete
     instantiations spread across all translation units, each with its
-    full type signature.
+    full type signature. Text-based search cannot resolve template
+    specializations across translation units.
 
     Returns concrete instantiations of the template — each with its full type
     signature (e.g. ``Callback<void(int)>``).  The template declaration itself
@@ -258,6 +286,16 @@ def get_template_instances(
 
     Uses the ``template_usr`` column populated during indexing via libclang's
     ``cursor.specialized_template``.
+
+    For finding the template declaration itself use ``lookup_symbol``.
+
+    Read-only. No side effects.
+
+    Args:
+        template_name: Template name to find instantiations for.
+            E.g. ``'Callback'`` or ``'mbed::Callback'``.
+        project_root: Project root. Auto-detected if omitted.
+        limit: Maximum results (default 50).
 
     Returns:
         list[dict] with one element wrapping the template declaration:
@@ -324,7 +362,8 @@ async def get_method_overrides(
     """Return C++ virtual method override information — libclang-powered
     vtable analysis. Resolves virtual dispatch across class hierarchies:
     shows which base-class method this overrides, and which derived-class
-    methods override this one.
+    methods override this one. Text-based search cannot resolve virtual
+    dispatch across translation units.
 
     Shows what base-class method this method overrides, and what derived-class
     methods override this one.  Built from the ``overrides`` table which is
@@ -333,6 +372,14 @@ async def get_method_overrides(
 
     For class-level inheritance, use ``get_inheritance_chain``.  For symbol
     details, use ``get_symbol_context``.
+
+    Read-only. No side effects.
+
+    Args:
+        method_name: Method name to get override information for. Use
+            qualified name for disambiguation, e.g.
+            ``'UART_DRIVER::write'``.
+        project_root: Project root. Auto-detected if omitted.
 
     Returns:
         dict: {

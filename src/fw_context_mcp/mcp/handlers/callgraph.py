@@ -141,9 +141,9 @@ def find_callers(
     and member accesses, use ``find_references``.  For a path between two
     specific symbols, use ``find_call_path``.
 
-    Requires the reference index (``fw-context index`` — refs are on by
-    default).  Only direct call sites are returned; callers more than one
-    hop away are not included.
+    Read-only. No side effects. Requires the reference index
+    (``fw-context index`` — refs are on by default).  Only direct call
+    sites are returned; callers more than one hop away are not included.
 
     Indirect edges (``ref_kind: "indirect"``) are detected when a function
     pointer references a function through:
@@ -421,8 +421,8 @@ def find_call_path(
 ) -> list[dict]:
     """Find call paths between two C/C++ functions via BFS in the libclang
     call graph, including function-pointer edges and ISR vector
-    registrations. Use to answer "how does A reach B?" — e.g. tracing
-    how a high-level event handler eventually calls a low-level driver.
+    registrations. libclang-powered: follows function-pointer edges and
+    ISR vector registrations that text-based search cannot resolve.
 
     Use to answer "how does A reach B?" — e.g. tracing how a high-level
     event handler eventually calls a low-level driver.  Returns up to 5
@@ -431,8 +431,22 @@ def find_call_path(
 
     For one-sided exploration use ``find_all_callers_recursive`` (who reaches
     this?) or ``find_callees_recursive`` (what does this reach?).
-    Requires both symbols to be in the index and refs enabled
-    (``fw-context index`` — refs on by default).
+    For exact call-graph verification use ``find_callers`` or
+    ``find_references``.
+
+    Read-only. No side effects. Requires both symbols to be in the index
+    and refs enabled (``fw-context index`` — refs on by default).
+
+    Args:
+        from_name: Starting symbol for path search.
+        to_name: Target symbol to find path to.
+        project_root: Project root. Auto-detected if omitted.
+        max_depth: Maximum BFS depth for path search (default 10).
+
+    Returns:
+        list of dicts, each with: depth (edge count, int), chain (str —
+        e.g. ``"main → app_run → modem_init"``). Empty list when no
+        path exists within the depth limit.
     """
     conn, root, config_hash, err = _refs_guard(project_root)
     if err:
@@ -461,7 +475,8 @@ def find_all_callers_recursive(
 ) -> list[dict]:
     """Find all transitive C/C++ callers — who calls *name*, directly or
     indirectly, through the libclang call graph including
-    function-pointer edges.
+    function-pointer edges. libclang-powered: follows function-pointer
+    assignments and ISR vector registrations across the full call tree.
 
     Use for impact analysis: "if I change this function, how far does the
     ripple go?"  Returns callers at depth 1 (direct), depth 2 (callers of
@@ -469,8 +484,22 @@ def find_all_callers_recursive(
     each caller appears once at its shortest distance to the target.
 
     For a flat, single-level caller list use ``find_callers`` (faster).
-    Requires the reference index (``fw-context index`` — refs on by default).
-    BFS from the target outward; performance scales with call-graph fan-out.
+    For the reverse direction use ``find_callees_recursive``.
+
+    Read-only. No side effects. Requires the reference index
+    (``fw-context index`` — refs on by default). BFS from the target
+    outward; performance scales with call-graph fan-out.
+
+    Args:
+        name: Symbol name to find transitive callers of.
+        project_root: Project root. Auto-detected if omitted.
+        max_depth: Maximum BFS depth for transitive search (default 5).
+        limit: Maximum results (default 50).
+
+    Returns:
+        list of dicts, each with: caller (str — caller name),
+        caller_qualified_name (str), depth (int — distance from target),
+        file (str), line (int), ref_kind (``"call"`` or ``"indirect"``).
     """
     conn, root, config_hash, err = _refs_guard(project_root)
     if err:
@@ -497,7 +526,8 @@ def find_callees_recursive(
 ) -> list[dict]:
     """Find all transitive C/C++ callees — what *name* calls, directly or
     indirectly, through the libclang call graph including
-    function-pointer edges.
+    function-pointer edges. libclang-powered: follows function-pointer
+    calls and indirect invocations across the full dependency tree.
 
     Use for dependency analysis: "what does this function depend on to do
     its job?"  Returns callees at depth 1 (direct), depth 2 (callees of
@@ -505,8 +535,22 @@ def find_callees_recursive(
     by shortest distance.
 
     For direct callees only, ``get_symbol_context`` gives a faster flat
-    list along with the function body and callers.
-    Requires the reference index (``fw-context index`` — refs on by default).
+    list along with the function body and callers. For the reverse
+    direction use ``find_all_callers_recursive``.
+
+    Read-only. No side effects. Requires the reference index
+    (``fw-context index`` — refs on by default).
+
+    Args:
+        name: Symbol name to find transitive callees of.
+        project_root: Project root. Auto-detected if omitted.
+        max_depth: Maximum BFS depth for transitive search (default 5).
+        limit: Maximum results (default 50).
+
+    Returns:
+        list of dicts, each with: callee (str — callee name),
+        callee_qualified_name (str), depth (int — distance from source),
+        file (str), line (int), ref_kind (``"call"`` or ``"indirect"``).
     """
     conn, root, config_hash, err = _refs_guard(project_root)
     if err:
@@ -534,7 +578,8 @@ def find_dead_code(
     """Find C/C++ functions that are defined but never called —
     libclang-powered dead code detection across the entire indexed
     codebase. Distinguishes called from uncalled symbols globally, not
-    just within a single file.
+    just within a single file — text-based search cannot determine
+    whether a function is actually reachable.
 
     Returns two categories of results, each with a ``status`` field:
 
@@ -557,7 +602,23 @@ def find_dead_code(
     By default, SDK/vendor paths are auto-excluded based on the detected
     build system, and project config exclude_paths are applied.
     Use ``project_only=False`` to see all results including vendor code.
-    Requires the reference index.
+
+    Read-only. No side effects. Requires the reference index
+    (``fw-context index`` — refs on by default).
+
+    Args:
+        project_root: Project root. Auto-detected if omitted.
+        limit: Maximum results (default 100).
+        exclude_paths: Additional LIKE patterns to exclude. Merged with
+            defaults from config. E.g. ``['lib/%']``.
+        project_only: When True (default), auto-excludes SDK/vendor paths
+            based on the detected build system and applies project config
+            exclude_paths. Set False to see all results.
+
+    Returns:
+        list of dicts, each with: name, qualified_name, kind, file, line,
+        status (``"dead"`` or ``"possibly_dead"``), and reason (str —
+        explains why the function is classified as dead or possibly dead).
     """
     _conn, root, config_hash, err = _refs_guard(project_root)
     if err:
@@ -592,11 +653,30 @@ def find_wrapper_callers(
     """Find C/C++ wrapper classes that call methods of a driver class —
     libclang-powered adapter pattern detection. Traces method ownership
     across class boundaries to reveal the wrapper/adapter architecture
-    (e.g. ``UART`` wraps ``UART_DRIVER``).
+    (e.g. ``UART`` wraps ``UART_DRIVER``). Text-based search cannot
+    distinguish which class owns each method call.
 
     Returns wrapper methods grouped by wrapper class, showing which driver
     methods each wrapper calls.  Useful for understanding the adapter/wrapper
     architecture (e.g. ``UART`` wraps ``UART_DRIVER``).
+
+    For the reverse perspective — finding who calls a specific driver method
+    — use ``find_callers``. For class member listing use
+    ``get_class_members``.
+
+    Read-only. No side effects. Requires the reference index
+    (``fw-context index`` — refs on by default).
+
+    Args:
+        class_name: Driver class name to find wrappers for.
+            E.g. ``'UART_DRIVER'`` or ``'hal::UART_DRIVER'``.
+        project_root: Project root. Auto-detected if omitted.
+        limit: Maximum wrapper method results (default 50).
+
+    Returns:
+        list of dicts, each with: wrapper_class (str), method_count (int),
+        methods (list of dicts — each with method, qualified_name, kind,
+        and calls (list of driver methods called)).
     """
     conn, root, config_hash, err = _refs_guard(project_root)
     if err:
@@ -694,9 +774,9 @@ def trace_data_flow(
     limit: Annotated[int, Field(description="Maximum source functions to trace (default 15).")] = 15,
 ) -> list[dict]:
     """Trace how C/C++ data of a given type flows to a target function via
-    libclang call paths. Finds functions whose signature mentions the
-    type, then maps call paths to the target — useful for understanding
-    how a data structure travels through the system to its destination.
+    libclang call paths. libclang-powered: finds functions by type
+    signature and maps call paths through the full call graph, which
+    text-based search cannot trace across translation units.
 
     Finds functions whose signature mentions *type_name*, then looks for call
     paths from those functions to *to_symbol*.  Returns a data flow map —
@@ -707,6 +787,25 @@ def trace_data_flow(
     Cannot follow async flows (message queues, interrupts, RS485 callbacks).
     For exact call-graph queries use the ``find_*`` family;
     verify specific paths with ``find_call_path``.
+
+    Read-only. No side effects. Requires the reference index
+    (``fw-context index`` — refs on by default).
+
+    Args:
+        type_name: Type name to trace. E.g. ``'SensorData'`` or
+            ``'Config::SensorData'``.
+        to_symbol: Target symbol name. E.g. ``'uart_send'`` or
+            ``'UART_DRIVER::send'``.
+        project_root: Project root. Auto-detected if omitted.
+        max_depth: Maximum call path depth (default 8).
+        limit: Maximum source functions to trace (default 15).
+
+    Returns:
+        list of dicts with a leading ``_summary`` entry:
+        {_summary (str), _type (str), _target (str)}, followed by source
+        entries each with: source_name, source_qualified_name, source_kind,
+        source_file, source_line, caller_count, reachable (bool), and
+        paths (list of call path dicts — empty when unreachable).
     """
     conn, root, config_hash, err = _refs_guard(project_root)
     if err:
@@ -788,19 +887,34 @@ def find_hotspots(
     """Find the most-called C/C++ functions ranked by caller count —
     libclang call-graph hotspot detection. Identifies functions with
     the most architectural weight — good targets for refactoring,
-    optimization, or extra testing.
+    optimization, or extra testing. Text-based search cannot aggregate
+    caller statistics across the full call graph.
 
     Use for high-level impact assessment: changing a hotspot affects many
-    call sites.  The result tells you which functions carry the most
-    "architectural weight" — good targets for refactoring, optimization,
-    or extra testing.
+    call sites. The result tells you which functions carry the most
+    "architectural weight" across the entire codebase.
 
-    By default, SDK/vendor paths are auto-excluded. Use ``project_only=False``
-    to see all results including vendor code.
+    By default, SDK/vendor paths are auto-excluded so hotspots reflect
+    project code. Use ``project_only=False`` to see all results including
+    vendor code.
 
-    Requires the reference index (``fw-context index`` — refs on by default).
     For the callers of a specific hotspot, follow up with ``find_callers``
     or ``find_all_callers_recursive``.
+
+    Read-only. No side effects. Requires the reference index
+    (``fw-context index`` — refs on by default).
+
+    Args:
+        project_root: Project root. Auto-detected if omitted.
+        limit: Number of top-called functions to return (default 20).
+        project_only: When True (default), auto-excludes SDK/vendor paths
+            so hotspots reflect project code.
+        exclude_paths: Additional LIKE patterns to exclude. Merged with
+            defaults. E.g. ``['lib/%']``.
+
+    Returns:
+        list of dicts, each with: name, qualified_name, kind, file, line,
+        caller_count (int — total number of call sites), signature.
     """
     _conn, root, config_hash, err = _refs_guard(project_root)
     if err:

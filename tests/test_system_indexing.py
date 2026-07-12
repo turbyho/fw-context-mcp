@@ -347,7 +347,8 @@ class TestBareInitAndIndex:
     """End-to-end: init + index for a bare (manual mode) C project."""
 
     @pytest.fixture(scope="class")
-    def indexed(self):
+    @classmethod
+    def indexed(cls):
         return _init_and_index(
             _BUILDS / "bare",
             replacements={
@@ -432,7 +433,8 @@ class TestCMakeInitAndIndex:
     """End-to-end: init + index for a CMake C project (detection works out of the box)."""
 
     @pytest.fixture(scope="class")
-    def indexed(self):
+    @classmethod
+    def indexed(cls):
         return _init_and_index(_BUILDS / "generic_cmake", clean_db=True)
 
     def test_compile_commands_generated(self, indexed):
@@ -482,7 +484,8 @@ class TestMakefileInitAndIndex:
     """End-to-end: init + index for a Makefile C project (detection works out of the box)."""
 
     @pytest.fixture(scope="class")
-    def indexed(self):
+    @classmethod
+    def indexed(cls):
         return _init_and_index(
             _BUILDS / "makefile",
             replacements={"[build] make_dry_run": "false"},
@@ -543,7 +546,8 @@ class TestPlatformIOInitAndIndex:
     """End-to-end: init + index for a PlatformIO project."""
 
     @pytest.fixture(scope="class")
-    def indexed(self):
+    @classmethod
+    def indexed(cls):
         return _init_and_index(_BUILDS / "platformio", clean_db=True)
 
     def test_compile_commands_has_entries(self, indexed):
@@ -608,7 +612,8 @@ class TestArduinoInitAndIndex:
     """End-to-end: init + index for an Arduino project (needs fqbn)."""
 
     @pytest.fixture(scope="class")
-    def indexed(self):
+    @classmethod
+    def indexed(cls):
         return _init_and_index(
             _BUILDS / "arduino",
             replacements={
@@ -663,18 +668,19 @@ class TestMbedOSInitAndIndex:
     _GCC_ARM = _read_mbed_gcc_arm_path()
 
     @pytest.fixture(scope="class")
-    def indexed(self):
+    @classmethod
+    def indexed(cls):
         if not shutil.which("bear"):
             pytest.skip("bear not installed")
-        if not self._MBED_BIN.exists():
-            pytest.skip(f"mbed-cli not found (expected at {self._MBED_BIN})")
-        if not self._GCC_ARM:
+        if not cls._MBED_BIN.exists():
+            pytest.skip(f"mbed-cli not found (expected at {cls._MBED_BIN})")
+        if not cls._GCC_ARM:
             pytest.skip("GCC_ARM_PATH not found in ~/.mbed/.mbed")
-        if not Path(self._GCC_ARM, "arm-none-eabi-gcc").exists():
-            pytest.skip(f"ARM GCC not found at {self._GCC_ARM}")
+        if not Path(cls._GCC_ARM, "arm-none-eabi-gcc").exists():
+            pytest.skip(f"ARM GCC not found at {cls._GCC_ARM}")
         return _init_and_index(
             _BUILDS / "mbed_os",
-            extra_env=self._MBED_ENV,
+            extra_env=cls._MBED_ENV,
             clean_db=True,
         )
 
@@ -736,19 +742,20 @@ class TestZephyrInitAndIndex:
     }
 
     @pytest.fixture(scope="class")
-    def indexed(self):
-        if not self._ZEPHYR_BASE.is_dir():
+    @classmethod
+    def indexed(cls):
+        if not cls._ZEPHYR_BASE.is_dir():
             pytest.skip("Zephyr base not found")
-        if not self._ZEPHYR_SDK.is_dir():
+        if not cls._ZEPHYR_SDK.is_dir():
             pytest.skip("Zephyr SDK not found")
-        if not self._WEST_BIN.exists():
-            pytest.skip(f"west not installed (expected at {self._WEST_BIN})")
+        if not cls._WEST_BIN.exists():
+            pytest.skip(f"west not installed (expected at {cls._WEST_BIN})")
         return _init_and_index(
             _BUILDS / "zephyr",
             replacements={
                 "[build] board": '"nrf52840dk/nrf52840"',
             },
-            extra_env=self._ZEPHYR_ENV,
+            extra_env=cls._ZEPHYR_ENV,
             clean_db=True,
         )
 
@@ -839,16 +846,17 @@ class TestESPIDFInitAndIndex:
     }
 
     @pytest.fixture(scope="class")
-    def indexed(self):
-        if not self._IDF_PATH.is_dir():
-            pytest.skip(f"ESP-IDF not found (expected at {self._IDF_PATH})")
-        if not self._IDF_PY_WRAPPER.exists():
-            pytest.skip(f"idf.py wrapper not found (expected at {self._IDF_PY_WRAPPER})")
+    @classmethod
+    def indexed(cls):
+        if not cls._IDF_PATH.is_dir():
+            pytest.skip(f"ESP-IDF not found (expected at {cls._IDF_PATH})")
+        if not cls._IDF_PY_WRAPPER.exists():
+            pytest.skip(f"idf.py wrapper not found (expected at {cls._IDF_PY_WRAPPER})")
         # Use fw-context builder directly — CMake 3.30.2 is on PATH
         # (via _IDF_ENV) and the idf.py wrapper also prepends it.
         return _init_and_index(
             _BUILDS / "esp_idf",
-            extra_env=self._IDF_ENV,
+            extra_env=cls._IDF_ENV,
             clean_db=True,
         )
 
