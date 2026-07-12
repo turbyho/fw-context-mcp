@@ -207,15 +207,21 @@ Run everything that the local machine supports:
 
 ```bash
 python3 -m pytest tests/test_system_indexing.py -x -v
-# 49 tests: detection + bare + cmake + makefile + config hash
+# 71 tests: detection + registry + bare + cmake + makefile + platformio +
+#           arduino + mbed-os + zephyr + esp-idf + config hash + statistics
 ```
 
 Run a single project's tests:
 
 ```bash
-python3 -m pytest tests/test_system_indexing.py -x -v -k "BareProject"     # bare
-python3 -m pytest tests/test_system_indexing.py -x -v -k "CMakeProject"    # cmake
-python3 -m pytest tests/test_system_indexing.py -x -v -k "MakefileProject" # makefile
+python3 -m pytest tests/test_system_indexing.py -x -v -k "BareInit"       # bare
+python3 -m pytest tests/test_system_indexing.py -x -v -k "CMakeInit"      # cmake
+python3 -m pytest tests/test_system_indexing.py -x -v -k "MakefileInit"   # makefile
+python3 -m pytest tests/test_system_indexing.py -x -v -k "PlatformIOInit" # platformio
+python3 -m pytest tests/test_system_indexing.py -x -v -k "ArduinoInit"    # arduino
+python3 -m pytest tests/test_system_indexing.py -x -v -k "MbedOS"         # mbed-os
+python3 -m pytest tests/test_system_indexing.py -x -v -k "ZephyrInit"     # zephyr
+python3 -m pytest tests/test_system_indexing.py -x -v -k "ESPIDF"         # esp-idf
 ```
 
 ### Testing individual fixtures by hand
@@ -382,8 +388,7 @@ tests/builds/
 │   ├── main.cpp               # must be in root for mbed-cli detection
 │   ├── mbed-os.lib
 │   ├── mbed_app.json
-│   ├── mbed-os -> <symlink>
-│   └── src/                   # additional source files
+│   └── mbed-os -> <symlink>
 ├── arduino/                  # Arduino AVR sketch
 │   ├── .fw-context/config.toml
 │   ├── arduino.ino

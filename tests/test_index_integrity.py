@@ -165,12 +165,30 @@ Response driver_get_status(void) {
     cc_json = proj / "compile_commands.json"
     cc_json.write_text(json.dumps(cc, indent=2), encoding="utf-8")
 
+    # Initialize project to generate UUID4 project ID
+    init_result = _cli(
+        ["init", "--project", str(proj)],
+        cwd=proj,
+        timeout=60,
+    )
+    if init_result.returncode != 0:
+        pytest.fail(f"Init failed:\nSTDOUT:\n{init_result.stdout}\nSTDERR:\n{init_result.stderr}")
+
     return proj
 
 
 @pytest.fixture(scope="class")
 def indexed_extended(c_project_extended: Path):
     """Index the extended C project (once per class) and return the project root."""
+    # Initialize project first — generates UUID4 project ID
+    init_result = _cli(
+        ["init", "--project", str(c_project_extended)],
+        cwd=c_project_extended,
+        timeout=60,
+    )
+    if init_result.returncode != 0:
+        pytest.fail(f"Init failed:\nSTDOUT:\n{init_result.stdout}\nSTDERR:\n{init_result.stderr}")
+
     cc_json = c_project_extended / "compile_commands.json"
     result = _cli(
         ["index", "--no-refs", "--no-analyze", "--no-embeddings", str(cc_json)],
@@ -803,6 +821,15 @@ void init_sensor(SensorData* s) {
     ]
     cc_json = proj / "compile_commands.json"
     cc_json.write_text(json.dumps(cc, indent=2), encoding="utf-8")
+
+    # Initialize project to generate UUID4 project ID
+    init_result = _cli(
+        ["init", "--project", str(proj)],
+        cwd=proj,
+        timeout=60,
+    )
+    if init_result.returncode != 0:
+        pytest.fail(f"Init failed:\nSTDOUT:\n{init_result.stdout}\nSTDERR:\n{init_result.stderr}")
 
     return proj
 

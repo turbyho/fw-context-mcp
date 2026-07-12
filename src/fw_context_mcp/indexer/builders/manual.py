@@ -2,8 +2,9 @@
 
 No build system required.  The user specifies include directories, defines,
 source directories, and compiler flags in ``.fw-context/config.toml`` under
-``[build]``.  ``fw-context`` generates a ``compile_commands.json`` entry for
-every ``.c``/``.cpp`` file found in ``source_dirs``, each with the same flags.
+``[build]``.  ``fw-context`` runs a syntax-only compilation of every
+``.c``/``.cpp`` file found in ``source_dirs`` with ``-MD -MF`` so that
+``.d`` dependency files are available for header-change detection.
 
 Useful for simple projects with a handful of files, or when the real build
 system cannot generate ``compile_commands.json`` at all.
@@ -13,6 +14,8 @@ from __future__ import annotations
 
 import json
 import logging
+import shutil
+import subprocess
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -103,11 +106,11 @@ class ManualBuildSystem:
         )
 
     def generate(self, project_root: Path, cfg: BuildConfig) -> Path:
-        """Generate compile_commands.json from configured flags.
+        """Generate compile_commands.json and .d dependency files.
 
-        Scans ``source_dirs`` for ``.c``/``.cpp`` files and creates one
-        entry per file with the flags from ``include_dirs``, ``defines``,
-        ``extra_flags``, and ``compiler``.
+        Scans ``source_dirs`` for ``.c``/``.cpp`` files, runs a syntax-only
+        compilation of each source with ``-MD -MF`` to produce ``.d`` dependency
+        files, then generates ``compile_commands.json`` with one entry per file.
         """
         root = project_root.resolve()
         source_dirs = [root / d for d in cfg.source_dirs]
@@ -119,26 +122,49 @@ class ManualBuildSystem:
             )
 
         flags = _build_flags(cfg)
-        compiler = cfg.compiler or "gcc"
+        compiler_name = cfg.compiler or "gcc"
+        compiler_path = shutil.which(compiler_name)
+        if compiler_path is None:
+            raise RuntimeError(
+                f"Compiler '{compiler_name}' not found in PATH. "
+                "Install gcc or set [build] compiler in .fw-context/config.toml"
+            )
+        compiler = str(compiler_path)
 
+        # Compile each source with -MD -MF -fsyntax-only to generate .d files.
+        # -fsyntax-only: check syntax but produce no object file (fast).
+        # -MD -MF <path>.d: emit dependency file for header change detection.
+        # -MP: add phony targets for each header (prevents errors if headers move).
         entries: list[dict] = []
         for src in sources:
+            d_file = src.with_suffix(".d")
+            dep_args = ["-MD", "-MF", str(d_file), "-MP"]
+            cmd = [compiler] + dep_args + flags + ["-fsyntax-only", str(src)]
+            log.debug("Compile: %s", " ".join(cmd))
+            try:
+                subprocess.run(cmd, cwd=root, capture_output=True, check=True)
+            except subprocess.CalledProcessError as exc:
+                stderr = exc.stderr.decode(errors="replace") if exc.stderr else ""
+                raise RuntimeError(
+                    f"Syntax check failed for {src.name}: {stderr.strip()}"
+                ) from exc
+
             entries.append({
                 "directory": str(root),
-                "command": " ".join([compiler] + flags + ["-c", str(src)]),
+                "arguments": [compiler] + dep_args + flags + ["-c", str(src)],
                 "file": str(src),
             })
 
         cc_path = root / "compile_commands.json"
         cc_path.write_text(json.dumps(entries, indent=2, ensure_ascii=False), encoding="utf-8")
         log.info(
-            "Generated compile_commands.json (%d entries, compiler=%s)",
-            len(entries), compiler,
+            "Generated compile_commands.json + .d files (%d entries, compiler=%s)",
+            len(entries), compiler_name,
         )
         return cc_path
 
     def ensure_dep_tracking(self, project_root: Path, *, fix: bool = False) -> list[str]:
-        """Manual mode does not support automatic dependency tracking."""
+        """.d dependency files are generated during the syntax-only compile step."""
         return []
 
     def validate_artifacts(self, compile_commands: Path, project_root: Path) -> list[BuildIssue]:

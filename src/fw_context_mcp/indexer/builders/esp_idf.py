@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import shutil
 import subprocess
 from pathlib import Path
@@ -69,9 +70,54 @@ class ESPIDFBuildSystem:
             log.info("esp-idf clean: %s", " ".join(clean_cmd))
             subprocess.run(clean_cmd, cwd=project_root)
 
-        env = None
+        # Ninja deletes .d depfiles after reading them by default.
+        # Create a wrapper that adds -d keepdepfile so .d files persist
+        # for incremental re-indexing.
+        ninja = shutil.which("ninja")
+        if ninja is None:
+            raise RuntimeError("ninja is required for ESP-IDF builds")
+        wrapper_dir = project_root / ".fw-context"
+        wrapper_dir.mkdir(parents=True, exist_ok=True)
+        ninja_wrapper = wrapper_dir / "ninja"
+        ninja_wrapper.write_text(
+            f"#!/bin/sh\nexec {ninja} -d keepdepfile \"$@\"\n", encoding="utf-8"
+        )
+        ninja_wrapper.chmod(0o755)
+
+        env = dict(os.environ)
         if cfg.idf_path:
-            env = {"IDF_PATH": cfg.idf_path}
+            env["IDF_PATH"] = cfg.idf_path
+
+        # CMake 3.30+ misparses file(TO_CMAKE_PATH $ENV{ESP_ROM_ELF_DIR} ...)
+        # when ESP_ROM_ELF_DIR is unset or empty — it treats the first argument
+        # as a path instead of a subcommand keyword.  Set a non-empty default
+        # so ESP-IDF's gdbinit.cmake does not crash.
+        if not os.environ.get("ESP_ROM_ELF_DIR"):
+            env["ESP_ROM_ELF_DIR"] = "/dev/null"
+
+        # Prepend our ninja wrapper directory to PATH so Ninja keeps .d files.
+        # Also enable ccache depend_mode so .d files are regenerated on cache hits.
+        env["PATH"] = f"{wrapper_dir}{os.pathsep}{env['PATH']}"
+        env["CCACHE_DEPEND"] = "1"
+
+        # Inject .d dependency tracking via EXTRA_CFLAGS / EXTRA_CXXFLAGS.
+        # These environment variables are respected by the ESP-IDF build system
+        # and appended to compiler flags without overriding the toolchain.
+        env.setdefault("EXTRA_CFLAGS", "")
+        env.setdefault("EXTRA_CXXFLAGS", "")
+        if "-MMD" not in env["EXTRA_CFLAGS"]:
+            env["EXTRA_CFLAGS"] += " -MMD" if env["EXTRA_CFLAGS"] else "-MMD"
+        if "-MMD" not in env["EXTRA_CXXFLAGS"]:
+            env["EXTRA_CXXFLAGS"] += " -MMD" if env["EXTRA_CXXFLAGS"] else "-MMD"
+
+        # Ensure the target is configured — idf.py build without a prior
+        # set-target fails when the cmake cache is missing (e.g. after fullclean
+        # or a fresh clone).  set-target reads the target from sdkconfig.
+        build_dir = project_root / "build"
+        if not build_dir.exists():
+            set_target_cmd = [idf_py, "set-target", "esp32"]
+            log.info("esp-idf set-target: %s", " ".join(set_target_cmd))
+            subprocess.run(set_target_cmd, cwd=project_root)
 
         log.info("esp-idf build: %s", " ".join(cmd))
         result = subprocess.run(cmd, cwd=project_root, env=env)
@@ -97,8 +143,24 @@ class ESPIDFBuildSystem:
     # ── Dep tracking ──
 
     def ensure_dep_tracking(self, project_root: Path, *, fix: bool = False) -> list[str]:
-        # CMake + GCC always emits .d files with ESP-IDF.
-        return []
+        """Ensure the ESP-IDF build generates ``.d`` dependency files.
+
+        ESP-IDF respects ``EXTRA_CFLAGS`` / ``EXTRA_CXXFLAGS`` environment
+        variables, which are automatically set during ``idf.py build``.
+        No configuration needed — the flags are always injected.
+        """
+        messages: list[str] = []
+        if fix:
+            messages.append(
+                "ESP-IDF build will inject -MMD via EXTRA_CFLAGS / EXTRA_CXXFLAGS "
+                "environment variables so .d dependency files are generated."
+            )
+        else:
+            messages.append(
+                "ESP-IDF build injects -MMD via EXTRA_CFLAGS / EXTRA_CXXFLAGS "
+                "environment variables for .d dependency file generation."
+            )
+        return messages
 
     # ── Validation ──
 
@@ -106,13 +168,15 @@ class ESPIDFBuildSystem:
         issues: list[BuildIssue] = []
         build_dir = project_root / "build"
         if not build_dir.exists():
-            issues.append(BuildIssue(
-                severity="error",
-                category="missing_build_dir",
-                message="ESP-IDF build/ directory not found",
-                auto_fixable=False,
-                fix_hint="Run 'fw-context index --build' to compile the project.",
-            ))
+            issues.append(
+                BuildIssue(
+                    severity="error",
+                    category="missing_build_dir",
+                    message="ESP-IDF build/ directory not found",
+                    auto_fixable=False,
+                    fix_hint="Run 'fw-context index --build' to compile the project.",
+                )
+            )
         return issues
 
     # ── Auto-fix ──

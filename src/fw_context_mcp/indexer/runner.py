@@ -21,7 +21,7 @@ from ..utils import MTIME_TOLERANCE_S, read_file_lines
 from .compile_commands import _SOURCE_EXTS, validate_include_files
 from .compile_commands import parse as parse_compile_commands
 from .config_hash import compute as compute_config_hash
-from .config_hash import compute_flags_hash, compute_tu_content_hash, normalize_entry
+from .config_hash import compute_flags_hash, compute_tu_content_hash
 from .db import (
     CURRENT_SCHEMA_VERSION,
     drop_fts_triggers,
@@ -34,6 +34,7 @@ from .db import (
     upsert_project,
     write_lock,
 )
+from .dep_files import resolve_dep_path_for_entry
 from .ops import _build_filtered_file_content, store_symbols_for_unit
 
 log = logging.getLogger(__name__)
@@ -84,6 +85,21 @@ def _detect_source_roots(project_root: Path, compile_commands: Path) -> list[Pat
                 _add_external_root(resolved, roots, seen)
     except Exception:
         pass
+    # If there are source files directly in the project root (e.g. main.cpp
+    # for Mbed OS), the cc.json loop above won't add project_root because
+    # rel.parts[0] is a file, not a directory.  Scan for such files and add
+    # the root so they are not silently excluded.
+    if project_root not in seen:
+        try:
+            for entry in project_root.iterdir():
+                if entry.is_file() and entry.suffix in _SOURCE_EXTS:
+                    if project_root not in seen:
+                        roots.append(project_root)
+                        seen.add(project_root)
+                    break
+        except OSError:
+            pass
+
     if not roots:
         roots = [project_root]
         log.info("No source directories detected, falling back to project root")
@@ -281,8 +297,8 @@ def _build_embeddings(conn, config_hash: str, llm_config, db_dir: Path) -> None:
     embedding_dim: int | None = None
     for i in range(0, len(rows), chunk_size):
         batch_num = i // chunk_size
-        chunk_rows = rows[i:i + chunk_size]
-        chunk_descs = descriptions[i:i + chunk_size]
+        chunk_rows = rows[i : i + chunk_size]
+        chunk_descs = descriptions[i : i + chunk_size]
         t0 = time.monotonic()
         try:
             embs = call_ollama_embed(chunk_descs, llm_config, query=False)
@@ -295,6 +311,7 @@ def _build_embeddings(conn, config_hash: str, llm_config, db_dir: Path) -> None:
             embedding_dim = len(embs[0])
             log.info("Embedding dimension detected: %d (model=%s)", embedding_dim, model)
             from .db import init_vec_table
+
             try:
                 init_vec_table(conn, embedding_dim)
             except Exception as e:
@@ -321,6 +338,7 @@ def _build_embeddings(conn, config_hash: str, llm_config, db_dir: Path) -> None:
             "UPDATE build_configs SET embedding_dim = ? WHERE config_hash = ?",
             (embedding_dim, config_hash),
         )
+
 
 # SDK path patterns for filtering (mbed-os, Zephyr, PlatformIO, build dirs)
 _SDK_PATH_PATTERNS = ("mbed-os/", ".pio/", "zephyr/", "build/", "modules/")
@@ -377,7 +395,11 @@ def _enrich_batch(conn, batch_rows, config_hash: str) -> list[dict]:
 
         # Read body for symbols with meaningful extents.  Enums and typedefs
         # benefit from body text during LLM analysis (enum constants, type alias).
-        if kind in ("function", "method", "constructor", "destructor", "class", "struct", "union", "enum", "typedef") and abs_path and end_line > start_line:
+        if (
+            kind in ("function", "method", "constructor", "destructor", "class", "struct", "union", "enum", "typedef")
+            and abs_path
+            and end_line > start_line
+        ):
             body = _read_body(abs_path, start_line, end_line)
 
         # Fetch callees from the reference index
@@ -520,6 +542,7 @@ def _build_llm_analysis(
             cached = None
             try:
                 from ..cache_client import get_local_cache_db, local_cache_lookup
+
                 local_db = get_local_cache_db(readonly=True)
                 local_hits = local_cache_lookup(local_db, [h])
                 local_db.close()
@@ -537,6 +560,7 @@ def _build_llm_analysis(
                         try:
                             local_db = get_local_cache_db()
                             from ..cache_client import local_cache_upsert
+
                             local_cache_upsert(local_db, [{"hash": h, **cached}])
                             local_db.close()
                         except Exception as e:
@@ -548,12 +572,21 @@ def _build_llm_analysis(
 
             if cached:
                 # Cache hit — re-use existing analysis
-                with (write_lock(db_dir, timeout=5.0) if not write_lock_held else nullcontext()):
+                with write_lock(db_dir, timeout=5.0) if not write_lock_held else nullcontext():
                     with transaction(conn):
-                        upsert_llm_analysis_batch(conn, [(
-                            d["id"], cached["summary"], cached["inputs"],
-                            cached["outputs"], cached["model"], h,
-                        )])
+                        upsert_llm_analysis_batch(
+                            conn,
+                            [
+                                (
+                                    d["id"],
+                                    cached["summary"],
+                                    cached["inputs"],
+                                    cached["outputs"],
+                                    cached["model"],
+                                    h,
+                                )
+                            ],
+                        )
                 total += 1
                 elapsed = time.monotonic() - t0
                 log.info("[%d/%d] %s: ok %s", idx + 1, total_symbols, qname, _fmt_dur(elapsed))
@@ -578,8 +611,15 @@ def _build_llm_analysis(
                 d["body"] = truncated
                 prompt = build_analysis_prompt(batch_dicts)
                 _est_prompt_tokens = len(prompt) / 3.5
-                log.debug("[%d/%d] %s: body truncated %d → %d chars, prompt %d chars",
-                         idx + 1, total_symbols, qname, len(body), len(truncated), len(prompt))
+                log.debug(
+                    "[%d/%d] %s: body truncated %d → %d chars, prompt %d chars",
+                    idx + 1,
+                    total_symbols,
+                    qname,
+                    len(body),
+                    len(truncated),
+                    len(prompt),
+                )
 
             # Compute response budget — how many tokens remain after the prompt
             # inside the model context window.
@@ -591,13 +631,20 @@ def _build_llm_analysis(
             # If the prompt STILL doesn't fit after truncation, skip.
             # The model needs at least 300 tokens of response space.
             if _est_prompt_tokens + 300 + _safety_margin > _ctx_size:
-                with (write_lock(db_dir, timeout=5.0) if not write_lock_held else nullcontext()):
+                with write_lock(db_dir, timeout=5.0) if not write_lock_held else nullcontext():
                     with transaction(conn):
                         upsert_llm_analysis_batch(conn, [(d["id"], "", "", "", f"skip:toolarge:{_model_ctx_size}", h)])
                 total += 1
                 elapsed = time.monotonic() - t0
-                log.warning("[%d/%d] %s: skip %s (body too large even after trunc, prompt=%d chars, ctx=%d tokens)",
-                          idx + 1, total_symbols, qname, _fmt_dur(elapsed), len(prompt), _ctx_size)
+                log.warning(
+                    "[%d/%d] %s: skip %s (body too large even after trunc, prompt=%d chars, ctx=%d tokens)",
+                    idx + 1,
+                    total_symbols,
+                    qname,
+                    _fmt_dur(elapsed),
+                    len(prompt),
+                    _ctx_size,
+                )
                 continue
 
             try:
@@ -618,39 +665,55 @@ def _build_llm_analysis(
                 # from infinite retries; the cache protects across builds
                 # and should only hold successful analyses.
                 total += 1
-                with (write_lock(db_dir, timeout=5.0) if not write_lock_held else nullcontext()):
+                with write_lock(db_dir, timeout=5.0) if not write_lock_held else nullcontext():
                     with transaction(conn):
                         sentinel = f"skip:unparseable:{model}"
                         upsert_llm_analysis_batch(conn, [(d["id"], "", "", "", sentinel, h)])
                 elapsed = time.monotonic() - t0
-                log.warning("[%d/%d] %s: err %s: unparseable response", idx + 1, total_symbols, qname, _fmt_dur(elapsed))
+                log.warning(
+                    "[%d/%d] %s: err %s: unparseable response", idx + 1, total_symbols, qname, _fmt_dur(elapsed)
+                )
                 continue
 
             r = parsed[0]
-            with (write_lock(db_dir, timeout=5.0) if not write_lock_held else nullcontext()):
+            with write_lock(db_dir, timeout=5.0) if not write_lock_held else nullcontext():
                 with transaction(conn):
                     db_rows = [(r["symbol_id"], r["summary"], r["inputs"], r["outputs"], model, h)]
                     inserted = upsert_llm_analysis_batch(conn, db_rows)
                     # Store in local global cache
                     try:
                         from ..cache_client import get_local_cache_db, local_cache_upsert
+
                         local_db = get_local_cache_db()
-                        local_cache_upsert(local_db, [{
-                            "hash": h, "summary": r["summary"],
-                            "inputs": r["inputs"], "outputs": r["outputs"],
-                            "model": model,
-                        }])
+                        local_cache_upsert(
+                            local_db,
+                            [
+                                {
+                                    "hash": h,
+                                    "summary": r["summary"],
+                                    "inputs": r["inputs"],
+                                    "outputs": r["outputs"],
+                                    "model": model,
+                                }
+                            ],
+                        )
                         local_db.close()
                     except Exception as e:
                         log.debug("Local global cache write failed: %s", e)
                     # Store on remote cache server (fire-and-forget)
                     if cache_client is not None:
                         try:
-                            cache_client.batch_put([{
-                                "hash": h, "summary": r["summary"],
-                                "inputs": r["inputs"], "outputs": r["outputs"],
-                                "model": model,
-                            }])
+                            cache_client.batch_put(
+                                [
+                                    {
+                                        "hash": h,
+                                        "summary": r["summary"],
+                                        "inputs": r["inputs"],
+                                        "outputs": r["outputs"],
+                                        "model": model,
+                                    }
+                                ]
+                            )
                         except Exception as e:
                             log.debug("Remote cache write failed: %s", e)
                     total += inserted
@@ -694,7 +757,7 @@ def _extract_param_types(signature: str) -> str:
             if paren_depth == 0:
                 paren_end = i
                 break
-    params_str = signature[paren_start + 1:paren_end].strip()
+    params_str = signature[paren_start + 1 : paren_end].strip()
     if not params_str:
         return ""
     # In C++, foo(void) and foo() are semantically identical — normalize both to empty
@@ -743,7 +806,7 @@ def _extract_param_types(signature: str) -> str:
             # NOT parameter names — keep them.
             _CPP_TYPE_QUALIFIERS = frozenset({"const", "volatile", "constexpr", "noexcept"})
             if stripped and stripped.replace("_", "").isalnum() and stripped not in _CPP_TYPE_QUALIFIERS:
-                ptr_prefix = last[:len(last) - len(stripped)]
+                ptr_prefix = last[: len(last) - len(stripped)]
                 if ptr_prefix:
                     # Pointer/ref on the name token (e.g. "*buf") — move markers
                     # to the type by keeping them as a separate token
@@ -769,9 +832,7 @@ def _build_overrides(conn, config_hash: str, db_dir: Path, *, write_lock_held: b
     from .db import insert_overrides_batch
 
     # Idempotency: if overrides were already built for this config, skip
-    row = conn.execute(
-        "SELECT COUNT(*) FROM overrides WHERE config_hash = ?", (config_hash,)
-    ).fetchone()
+    row = conn.execute("SELECT COUNT(*) FROM overrides WHERE config_hash = ?", (config_hash,)).fetchone()
     if row and row[0] > 0:
         log.info("Override graph already built (%d relationships) — nothing to do", row[0])
         return
@@ -866,14 +927,17 @@ def _build_overrides(conn, config_hash: str, db_dir: Path, *, write_lock_held: b
                 override_rows.append((config_hash, vrow["usr"], bm["usr"]))
 
     if override_rows:
-        with (write_lock(db_dir, timeout=5.0) if not write_lock_held else nullcontext()):
+        with write_lock(db_dir, timeout=5.0) if not write_lock_held else nullcontext():
             with transaction(conn):
                 insert_overrides_batch(conn, override_rows)
                 total += len(override_rows)
 
     log.info(
         "Overrides stored: %d relationships (%d virtual, %d no-base, %d no-match)",
-        total, len(virtual_rows), skipped_no_base, skipped_no_match,
+        total,
+        len(virtual_rows),
+        skipped_no_base,
+        skipped_no_match,
     )
 
 
@@ -964,9 +1028,7 @@ def _build_hotspot_cache(conn, config_hash: str) -> None:
     Idempotent — skips when cache already exists for this config.
     Requires the reference index.
     """
-    row = conn.execute(
-        "SELECT COUNT(*) FROM hotspot_cache WHERE config_hash = ?", (config_hash,)
-    ).fetchone()
+    row = conn.execute("SELECT COUNT(*) FROM hotspot_cache WHERE config_hash = ?", (config_hash,)).fetchone()
     if row and row[0] > 0:
         log.info("Hotspot cache already built — nothing to do")
         return
@@ -985,13 +1047,26 @@ def _build_hotspot_cache(conn, config_hash: str) -> None:
             (config_hash,),
         )
 
-    cnt = conn.execute(
-        "SELECT COUNT(*) FROM hotspot_cache WHERE config_hash = ?", (config_hash,)
-    ).fetchone()[0]
+    cnt = conn.execute("SELECT COUNT(*) FROM hotspot_cache WHERE config_hash = ?", (config_hash,)).fetchone()[0]
     log.info("Hotspot cache stored: %d entries", cnt)
 
 
 # ── Content-hash helpers ────────────────────────────────────────────
+
+
+def _is_excluded(file_path: Path, exclude_paths: list[Path], source_roots: list[Path]) -> bool:
+    """Return True when *file_path* should be excluded from indexing.
+
+    Source roots take priority over exclude paths — a file inside a
+    source root is never excluded, even when it also falls under an
+    exclude path.  This handles build systems that place preprocessed
+    source files inside the build directory (Arduino, PlatformIO).
+    """
+    resolved = file_path.resolve()
+    in_source = any(resolved == sr or resolved.is_relative_to(sr) for sr in source_roots)
+    if in_source:
+        return False
+    return any(resolved == ep or resolved.is_relative_to(ep) for ep in exclude_paths)
 
 
 def _compute_source_hash(file_path: Path) -> str:
@@ -1058,60 +1133,35 @@ def _find_dep_path(unit) -> Path | None:
     """Locate the ``.d`` dependency file for a translation unit.
 
     Tries three strategies in order:
-    1. ``-MF <path>`` flag in the compile command (raw args, then
-       response-file-expanded).
+    1. ``resolve_dep_path_for_entry()`` — ``-MF`` flag and ``output``
+       field from the raw compile_commands.json entry.
     2. ``<source>.d`` next to the source file (in-tree builds).
-    3. ``<output>.d`` next to the object file — derived from the
-       compile_commands.json ``output`` field (out-of-tree builds,
-       e.g. PlatformIO with ``-MMD`` and no ``-MF``).
     """
-    # Try -MF flag from raw entry first
     if unit.raw_entry is not None:
-        raw_args: list[str] = unit.raw_entry.get("arguments") or []
-        for i, token in enumerate(raw_args):
-            if token == "-MF" and i + 1 < len(raw_args):
-                d = Path(raw_args[i + 1])
-                if not d.is_absolute() and unit.directory:
-                    d = unit.directory / d
-                d = d.resolve()
-                if d.exists():
-                    return d
-        # Also try with expanded response files in normalize_entry
-        norm = normalize_entry(unit.raw_entry)
-        for i, arg in enumerate(norm["args"]):
-            if arg == "-MF" and i + 1 < len(norm["args"]):
-                d = Path(norm["args"][i + 1])
-                if not d.is_absolute() and unit.directory:
-                    d = unit.directory / d
-                d = d.resolve()
-                if d.exists():
-                    return d
+        directory = unit.directory if unit.directory else Path()
+        result = resolve_dep_path_for_entry(unit.raw_entry, directory)
+        if result is not None:
+            return result
 
     # Fallback: replace source extension with .d next to the source
     d = unit.file.with_suffix(".d")
     if d.exists():
         return d
 
-    # Fallback: derive .d path from the object file (compile_commands.json
-    # "output" field) — needed for build systems that use -MMD without -MF
-    # (e.g. PlatformIO).  GCC with -MMD and no -MF puts the .d next to the
-    # .o file, replacing .o with .d.
-    if unit.raw_entry is not None:
-        output = unit.raw_entry.get("output", "")
-        if output:
-            o_path = Path(output)
-            if not o_path.is_absolute() and unit.directory:
-                o_path = unit.directory / o_path
-            o_path = o_path.resolve()
-            # Replace trailing .o with .d: Esp.cpp.o → Esp.cpp.d
-            dep_from_obj = o_path.with_suffix(".d")
-            if dep_from_obj.exists():
-                return dep_from_obj
-
     return None
 
 
-def _check_and_parse_unit(unit, config_hash, project_root, source_roots, exclude_paths, index_refs, existing_files, force=False, header_hash_cache=None):
+def _check_and_parse_unit(
+    unit,
+    config_hash,
+    project_root,
+    source_roots,
+    exclude_paths,
+    index_refs,
+    existing_files,
+    force=False,
+    header_hash_cache=None,
+):
     """Check whether *unit* needs re-parsing and parse it if so.
 
     Uses a three-tier staleness check:
@@ -1141,7 +1191,7 @@ def _check_and_parse_unit(unit, config_hash, project_root, source_roots, exclude
         header_hash_cache = {}
 
     resolved_tu = unit.file.resolve()
-    if any(resolved_tu == ep or resolved_tu.is_relative_to(ep) for ep in exclude_paths):
+    if _is_excluded(resolved_tu, exclude_paths, source_roots):
         return ("unchanged", None, None, None)
 
     file_path = str(unit.file)
@@ -1217,7 +1267,22 @@ def _check_and_parse_unit(unit, config_hash, project_root, source_roots, exclude
     return ("updated", parsed, (t_parse_start, t_parse_end), hashes)
 
 
-def _process_unit(unit, config_hash, project_root, source_roots, exclude_paths, index_refs, db_path, existing_files, lock=None, conn=None, force=False, pre_parsed=None, parse_timing=(0.0, 0.0), hashes=None):
+def _process_unit(
+    unit,
+    config_hash,
+    project_root,
+    source_roots,
+    exclude_paths,
+    index_refs,
+    db_path,
+    existing_files,
+    lock=None,
+    conn=None,
+    force=False,
+    pre_parsed=None,
+    parse_timing=(0.0, 0.0),
+    hashes=None,
+):
     """Process one translation unit: check staleness, parse, store.
 
     Opens its own DB connection when *conn* is ``None``, otherwise reuses
@@ -1265,7 +1330,7 @@ def _process_unit(unit, config_hash, project_root, source_roots, exclude_paths, 
         ``exclude_paths`` or failed during parsing).
     """
     resolved_tu = unit.file.resolve()
-    if any(resolved_tu == ep or resolved_tu.is_relative_to(ep) for ep in exclude_paths):
+    if _is_excluded(resolved_tu, exclude_paths, source_roots):
         return ("unchanged", 0, 0, (0.0, 0.0, 0.0))
 
     if pre_parsed is not None:
@@ -1307,15 +1372,15 @@ def _process_unit(unit, config_hash, project_root, source_roots, exclude_paths, 
     # Must detect already-opened connections first — sqlite3/pysqlite3
     # Connection objects became callable in Python 3.14 (conn("SQL") shortcut).
     if hasattr(conn, "execute"):
-        own_conn = False       # caller-supplied, don't close
+        own_conn = False  # caller-supplied, don't close
     elif callable(conn):
-        conn = conn()          # lazy thread-local — caller manages lifecycle
+        conn = conn()  # lazy thread-local — caller manages lifecycle
         own_conn = False
     elif conn is None:
         conn = open_db(db_path)
         own_conn = True
     else:
-        own_conn = False       # caller-supplied, don't close
+        own_conn = False  # caller-supplied, don't close
 
     t_lock_start = time.monotonic()
     try:
@@ -1326,7 +1391,10 @@ def _process_unit(unit, config_hash, project_root, source_roots, exclude_paths, 
             t_write_start = time.monotonic()
             with transaction(conn, checkpoint=False):
                 syms_added, refs_added = store_symbols_for_unit(
-                    conn, unit, config_hash, project_root,
+                    conn,
+                    unit,
+                    config_hash,
+                    project_root,
                     source_roots=source_roots,
                     exclude_paths=exclude_paths,
                     index_refs=index_refs,
@@ -1340,7 +1408,12 @@ def _process_unit(unit, config_hash, project_root, source_roots, exclude_paths, 
             t_write = t_write_end - t_write_start
             log.debug(
                 "  TU %s: parse=%.1fs lock_wait=%.2fs write=%.1fs syms=%d refs=%d",
-                unit.file.name, t_parse, t_lock, t_write, syms_added, refs_added,
+                unit.file.name,
+                t_parse,
+                t_lock,
+                t_write,
+                syms_added,
+                refs_added,
             )
         timing = (t_parse, t_lock, t_write)
         return ("updated", syms_added, refs_added, timing)
@@ -1460,7 +1533,7 @@ def run(
         _hb_thread.start()
 
     log.info("", extra={"phase": f"Indexing {name} ({config_hash[:12]})"})
-    log.info("project=%s config_hash=%s", name, config_hash[:12])
+    log.info("project=%s project_id=%s config_hash=%s", name, project_id, config_hash[:12])
 
     conn = open_db(db_path)
     with transaction(conn):
@@ -1477,8 +1550,7 @@ def run(
         ch = project_root / config_header
         if not ch.exists():
             raise RuntimeError(
-                f"Configured config_header not found: {ch}\n"
-                "Check [index] config_header in .fw-context/config.toml"
+                f"Configured config_header not found: {ch}\nCheck [index] config_header in .fw-context/config.toml"
             )
         ch_abs = ch.resolve()
         for unit in units:
@@ -1574,8 +1646,13 @@ def run(
 
         # ── Phase 1: staleness check + libclang parse (no lock) ──
         check_status, parsed_data, parse_timing, hashes = _check_and_parse_unit(
-            unit, config_hash, project_root,
-            source_roots, exclude_paths, index_refs, existing_files,
+            unit,
+            config_hash,
+            project_root,
+            source_roots,
+            exclude_paths,
+            index_refs,
+            existing_files,
             force=force,
             header_hash_cache=header_hash_cache,
         )
@@ -1597,8 +1674,7 @@ def run(
                         """UPDATE files SET mtime=?, content_hash=?, source_hash=?,
                            flags_hash=?, deps_hash=?, deps_exist=?
                            WHERE id=?""",
-                        (current_mtime, content_hash_val, source_hash, flags_hash,
-                         deps_hash, int(deps_exist), file_id),
+                        (current_mtime, content_hash_val, source_hash, flags_hash, deps_hash, int(deps_exist), file_id),
                     )
                 # Fill ifdef-filtered file content via tokenization
                 # (skipped by store_symbols_for_unit since TU wasn't re-parsed)
@@ -1615,9 +1691,18 @@ def run(
         # ── Phase 2: DB store (inside lock) ──
         with write_lock(db_path.parent, timeout=120.0):
             status, syms, refs, timing = _process_unit(
-                unit, config_hash, project_root,
-                source_roots, exclude_paths, index_refs, db_path, existing_files,
-                conn=conn, force=force, pre_parsed=parsed_data, parse_timing=parse_timing,
+                unit,
+                config_hash,
+                project_root,
+                source_roots,
+                exclude_paths,
+                index_refs,
+                db_path,
+                existing_files,
+                conn=conn,
+                force=force,
+                pre_parsed=parsed_data,
+                parse_timing=parse_timing,
                 hashes=hashes,
             )
             if status == "updated":
@@ -1629,7 +1714,12 @@ def run(
                 acc_write += timing[2]
                 log.info(
                     "[%d/%d] %s: %d syms, %d refs, %.1fs",
-                    processed, len(units), fname, syms, refs, sum(timing),
+                    processed,
+                    len(units),
+                    fname,
+                    syms,
+                    refs,
+                    sum(timing),
                 )
             else:
                 skipped += 1
@@ -1646,10 +1736,14 @@ def run(
 
     elapsed_parse = time.monotonic() - t0
     log.info(
-        "Parsing done: %d updated, %d unchanged, %d skipped — "
-        "parse=%.1fs  lock=%.1fs  write=%.1fs  %s",
-        updated, unchanged, skipped,
-        acc_parse, acc_lock, acc_write, _fmt_dur(elapsed_parse),
+        "Parsing done: %d updated, %d unchanged, %d skipped — parse=%.1fs  lock=%.1fs  write=%.1fs  %s",
+        updated,
+        unchanged,
+        skipped,
+        acc_parse,
+        acc_lock,
+        acc_write,
+        _fmt_dur(elapsed_parse),
     )
     if content_filled:
         log.info("ifdef-filtered content: %d files filled", content_filled)
@@ -1661,6 +1755,7 @@ def run(
         macro_updated = 0
         try:
             from .macros import resolve_and_update
+
             seen_flags: set[tuple] = set()
             for unit in units:
                 flag_key = tuple(sorted(unit.clang_args))
@@ -1669,7 +1764,10 @@ def run(
                 seen_flags.add(flag_key)
                 try:
                     macro_updated += resolve_and_update(
-                        conn, config_hash, unit.clang_args, unit.file.resolve(),
+                        conn,
+                        config_hash,
+                        unit.clang_args,
+                        unit.file.resolve(),
                     )
                 except Exception:
                     pass  # best-effort per TU
@@ -1690,16 +1788,23 @@ def run(
     if llm_config is not None and llm_config.analyze_vendor:
         exclude_like: list[str] = []
     else:
-        config_exclude_strs = [str(p.relative_to(project_root)) for p in exclude_paths
-                               if p.is_relative_to(project_root)]
+        config_exclude_strs = [
+            str(p.relative_to(project_root)) for p in exclude_paths if p.is_relative_to(project_root)
+        ]
         exclude_like = _detect_sdk_exclude_like(project_root, config_exclude_strs)
 
     # Embedding generation (opt-in)
     if index_embeddings and llm_config is not None and llm_config.enabled:
         if force:
-            conn.execute("DELETE FROM embeddings WHERE symbol_id IN (SELECT id FROM symbols WHERE config_hash = ?)", (config_hash,))
+            conn.execute(
+                "DELETE FROM embeddings WHERE symbol_id IN (SELECT id FROM symbols WHERE config_hash = ?)",
+                (config_hash,),
+            )
             try:
-                conn.execute("DELETE FROM embeddings_vec WHERE symbol_id IN (SELECT id FROM symbols WHERE config_hash = ?)", (config_hash,))
+                conn.execute(
+                    "DELETE FROM embeddings_vec WHERE symbol_id IN (SELECT id FROM symbols WHERE config_hash = ?)",
+                    (config_hash,),
+                )
             except Exception:
                 pass  # sqlite-vec table may not exist for legacy indexes
             conn.commit()
@@ -1716,6 +1821,7 @@ def run(
         if cache_server_config is not None and cache_server_config.url:
             try:
                 from ..cache_client import CacheClient
+
                 cc = CacheClient(
                     url=cache_server_config.url,
                     token=cache_server_config.token,
@@ -1725,17 +1831,28 @@ def run(
             except Exception as e:
                 log.warning("Failed to create CacheClient: %s", e)
         else:
-            log.info("Remote LLM cache server not configured — all symbols will be analyzed locally. "
-                     "Run 'fw-context cache-remote-init' to configure.")
+            log.info(
+                "Remote LLM cache server not configured — all symbols will be analyzed locally. "
+                "Run 'fw-context cache-remote-init' to configure."
+            )
 
         if force:
-            conn.execute("DELETE FROM llm_analysis WHERE symbol_id IN (SELECT id FROM symbols WHERE config_hash = ?)", (config_hash,))
+            conn.execute(
+                "DELETE FROM llm_analysis WHERE symbol_id IN (SELECT id FROM symbols WHERE config_hash = ?)",
+                (config_hash,),
+            )
             conn.commit()
         log.info("", extra={"phase": f"LLM Analysis ({llm_config.model})"})
         t_llm = time.monotonic()
-        _build_llm_analysis(conn, config_hash, llm_config, db_path.parent,
-                           exclude_like=exclude_like, cache_client=cc,
-                           retry_unparseable=True)
+        _build_llm_analysis(
+            conn,
+            config_hash,
+            llm_config,
+            db_path.parent,
+            exclude_like=exclude_like,
+            cache_client=cc,
+            retry_unparseable=True,
+        )
         if cc:
             cc.close()
         conn.commit()
@@ -1773,23 +1890,42 @@ def run(
     # Determine deps verification level after all TUs are processed.
     # Only count translation units (source files from compile_commands.json),
     # not header files — .d files are only meaningful for TUs.
-    tu_count = len(units)
+    #
+    # Some TUs may be excluded from indexing (e.g. build/sketch/ for Arduino
+    # where the sketch is preprocessed into the build directory).  We count
+    # only TUs that were actually indexed (present in the ``files`` table)
+    # so excluded TUs don't drag the verification level down to "partial".
     tu_paths = [str(u.file.resolve()) for u in units]
-    placeholders = ",".join(["?"] * len(tu_paths))
-    tu_with_deps_row = conn.execute(
-        f"SELECT COUNT(*) FROM files WHERE config_hash = ? AND deps_exist AND path IN ({placeholders})",
-        (config_hash, *tu_paths),
-    ).fetchone()
-    tu_with_deps = tu_with_deps_row[0] if tu_with_deps_row else 0
-
-    if tu_count == 0:
+    # Exclude empty source files — they contain no includes and produce no
+    # dependency output from -MMD / -MD (e.g. Zephyr's misc/empty_file.c).
+    tu_paths = [
+        p for p in tu_paths
+        if not (Path(p).is_file() and Path(p).stat().st_size == 0)
+    ]
+    if not tu_paths:
         deps_verification = "none"
-    elif tu_with_deps >= tu_count:
-        deps_verification = "full"
     else:
-        deps_verification = "partial"
-    upsert_build_config(conn, config_hash, project_id, str(compile_commands),
-                        deps_verification=deps_verification)
+        placeholders = ",".join(["?"] * len(tu_paths))
+        tu_indexed_row = conn.execute(
+            f"SELECT COUNT(*) FROM files WHERE config_hash = ? AND path IN ({placeholders})",
+            (config_hash, *tu_paths),
+        ).fetchone()
+        tu_indexed = tu_indexed_row[0] if tu_indexed_row else 0
+
+        tu_with_deps_row = conn.execute(
+            f"SELECT COUNT(*) FROM files WHERE config_hash = ? AND deps_exist AND path IN ({placeholders})",
+            (config_hash, *tu_paths),
+        ).fetchone()
+        tu_with_deps = tu_with_deps_row[0] if tu_with_deps_row else 0
+
+        if tu_indexed == 0 or tu_with_deps == 0:
+            deps_verification = "none"
+        elif tu_with_deps >= tu_indexed:
+            deps_verification = "full"
+        else:
+            deps_verification = "partial"
+    with transaction(conn):
+        upsert_build_config(conn, config_hash, project_id, str(compile_commands), deps_verification=deps_verification)
 
     elapsed = time.monotonic() - t0
     try:
@@ -1802,6 +1938,5 @@ def run(
     # an integer constant — no injection risk.
     conn.execute(f"PRAGMA user_version = {CURRENT_SCHEMA_VERSION}")
     log.info("", extra={"phase": f"Done — {total_syms} symbols, {total_refs} refs, {_fmt_dur(elapsed)}"})
-    log.info("%d updated, %d unchanged, %d skipped  config_hash=%s",
-             updated, unchanged, skipped, config_hash[:12])
+    log.info("%d updated, %d unchanged, %d skipped  config_hash=%s", updated, unchanged, skipped, config_hash[:12])
     return config_hash

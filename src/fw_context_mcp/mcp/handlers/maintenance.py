@@ -713,3 +713,28 @@ def check_ollama(
     result = check_setup(cfg.llm)
     result["ollama_enabled"] = True
     return result
+
+
+def get_project_info(
+    project_id: Annotated[str, Field(description="Project ID (UUID4 hex) to look up.")] = "",
+) -> dict:
+    """Return project metadata (name, type, root_path) for a project ID.
+
+    Looks up the global project registry at ``~/.fw-context/projects.db``.
+    Use this to identify a project from its UUID4 — find out what build
+    system it uses, its name, and where it was last indexed.
+
+    Read-only. No side effects.
+
+    Returns:
+        dict: {project_id, name, project_type, root_path, created_at, updated_at}
+        or {"error": "..."} when the project_id is not registered.
+    """
+    from ...config.global_db import get_project_by_id
+
+    if not project_id:
+        return {"error": "project_id is required — provide a UUID4 hex string from fw-context init."}
+    result = get_project_by_id(project_id)
+    if result is None:
+        return {"error": f"Project '{project_id}' not found in the global registry."}
+    return result

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import logging
-import os
 import shutil
 import subprocess
 from pathlib import Path
@@ -44,7 +43,14 @@ class ArduinoBuildSystem:
     # ── Build ──
 
     def build(self, project_root: Path, cfg: BuildConfig) -> Path:
-        """Generate compile_commands.json via ``arduino-cli compile --export-compile-commands``."""
+        """Generate compile_commands.json via ``arduino-cli compile``.
+
+        Runs two passes:
+        1. ``--only-compilation-database`` — dry-run that generates
+           ``compile_commands.json`` (but no ``.o`` / ``.d`` files).
+        2. Real compile (no special flags) — produces ``.d`` dependency
+           files so the indexer can track header changes.
+        """
         if not shutil.which("arduino-cli"):
             raise RuntimeError(
                 "arduino-cli is required for Arduino builds.  Install it:\n"
@@ -57,59 +63,60 @@ class ArduinoBuildSystem:
                 "  [build]\n  fqbn = \"arduino:avr:uno\""
             )
 
-        # --only-compilation-database is the flag in arduino-cli 1.x;
-        # --export-compile-commands is the renamed flag in newer versions.
-        # Detect which one is supported by inspecting the help output.
-        help_result = subprocess.run(
-            ["arduino-cli", "compile", "--help"],
-            capture_output=True, text=True, timeout=10,
-        )
-        export_flag = (
-            "--export-compile-commands"
-            if "--export-compile-commands" in help_result.stdout
-            else "--only-compilation-database"
-        )
+        build_dir = project_root / "build"
+        if cfg.clean and build_dir.exists():
+            shutil.rmtree(build_dir)
 
-        cmd: list[str] = [
+        build_path_flag = str(build_dir)
+        base_cmd: list[str] = [
             "arduino-cli", "compile",
             "--fqbn", cfg.fqbn,
-            export_flag,
-            "--build-path", str(project_root / "build"),
+            "--build-path", build_path_flag,
         ]
 
-        if cfg.clean:
-            build_dir = project_root / "build"
-            if build_dir.exists():
-                shutil.rmtree(build_dir)
+        # ── Pass 1: dry-run to generate compile_commands.json ──
+        log.info("arduino build (dry-run): %s --only-compilation-database", " ".join(base_cmd))
+        dry_run = subprocess.run(
+            base_cmd + ["--only-compilation-database"],
+            cwd=project_root,
+        )
+        if dry_run.returncode != 0:
+            raise RuntimeError(f"arduino-cli compile --only-compilation-database failed with exit code {dry_run.returncode}")
 
-        log.info("arduino build: %s", " ".join(cmd))
-        result = subprocess.run(cmd, cwd=project_root)
-
-        if result.returncode != 0:
-            raise RuntimeError(f"arduino-cli compile failed with exit code {result.returncode}")
-
-        cc_in_build = project_root / "build" / "compile_commands.json"
+        cc_in_build = build_dir / "compile_commands.json"
         if not cc_in_build.exists():
-            # Arduino CLI sometimes puts it in project root
             cc_in_root = project_root / "compile_commands.json"
             if cc_in_root.exists():
-                return cc_in_root
-            raise RuntimeError(
-                "compile_commands.json not generated. "
-                "Ensure arduino-cli supports --only-compilation-database or --export-compile-commands."
-            )
+                cc_in_build = cc_in_root
+            else:
+                raise RuntimeError(
+                    "compile_commands.json not generated. "
+                    "Ensure arduino-cli supports --only-compilation-database."
+                )
 
-        # Copy to project root for consistency
+        # Copy to project root for consistency BEFORE the real compile,
+        # which may overwrite build/compile_commands.json (or not — but
+        # without --only-compilation-database it typically won't).
         target_cc = project_root / "compile_commands.json"
         shutil.copy2(cc_in_build, target_cc)
         log.info("Copied %s → %s", cc_in_build, target_cc)
+
+        # ── Pass 2: real compile to produce .d dependency files ──
+        log.info("arduino build (compile): %s", " ".join(base_cmd))
+        real = subprocess.run(base_cmd, cwd=project_root)
+        if real.returncode != 0:
+            # Real compile failed — but we already have the compilation
+            # database.  Warn and continue (the indexer can still work,
+            # it just won't have .d files for incremental reindexing).
+            log.warning("arduino-cli real compile failed with exit code %d — .d files may be missing", real.returncode)
 
         return target_cc
 
     # ── Dep tracking ──
 
     def ensure_dep_tracking(self, project_root: Path, *, fix: bool = False) -> list[str]:
-        # GCC always emits .d files with Arduino.
+        # .d files are produced by the real compile pass in build().
+        # Nothing to fix here — if they're missing, rebuild.
         return []
 
     # ── Validation ──
