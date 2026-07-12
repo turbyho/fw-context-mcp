@@ -209,6 +209,15 @@ void log_message(const char* msg) {
     ]
     cc_json.write_text(json.dumps(cc, indent=2), encoding="utf-8")
 
+    # Initialize project to generate UUID4 project ID
+    init_result = _cli(
+        ["init", "--project", str(proj)],
+        cwd=proj,
+        timeout=60,
+    )
+    if init_result.returncode != 0:
+        pytest.fail(f"Init failed:\nSTDOUT:\n{init_result.stdout}\nSTDERR:\n{init_result.stderr}")
+
     return proj
 
 
@@ -218,6 +227,15 @@ def indexed_project(c_project: Path):
 
     Cleans up the index database directory after the test finishes.
     """
+    # Initialize project first — generates UUID4 project ID
+    init_result = _cli(
+        ["init", "--project", str(c_project)],
+        cwd=c_project,
+        timeout=60,
+    )
+    if init_result.returncode != 0:
+        pytest.fail(f"Init failed:\nSTDOUT:\n{init_result.stdout}\nSTDERR:\n{init_result.stderr}")
+
     cc_json = c_project / "compile_commands.json"
     result = _cli(["index", "--no-refs", "--no-analyze", "--no-embeddings", str(cc_json)], cwd=c_project)
     if result.returncode != 0:
@@ -946,6 +964,15 @@ class TestReindexFileImplEdgeCases:
         """Calling reindex on a project without index returns error."""
         from fw_context_mcp.mcp.handlers.maintenance import reindex_file_impl
 
+        # Initialize project first — required for derive_project_id()
+        init_result = _cli(
+            ["init", "--project", str(tmp_path)],
+            cwd=tmp_path,
+            timeout=60,
+        )
+        if init_result.returncode != 0:
+            pytest.fail(f"Init failed:\n{init_result.stderr}")
+
         result = reindex_file_impl("src/main.c", str(tmp_path), with_analysis=False)
         assert "error" in result
         assert "no index" in result["error"].lower() or "run" in result["error"].lower()
@@ -1471,6 +1498,15 @@ void log_message(const char* msg) {
     ]
     cc_json = proj / "compile_commands.json"
     cc_json.write_text(json.dumps(cc, indent=2), encoding="utf-8")
+
+    # Initialize project first — generates UUID4 project ID
+    init_result = _cli(
+        ["init", "--project", str(proj)],
+        cwd=proj,
+        timeout=60,
+    )
+    if init_result.returncode != 0:
+        pytest.fail(f"Init failed:\nSTDOUT:\n{init_result.stdout}\nSTDERR:\n{init_result.stderr}")
 
     result = _cli(
         ["index", "--no-refs", "--analyze", "--no-embeddings", str(cc_json)],

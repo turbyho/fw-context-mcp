@@ -38,7 +38,14 @@ class PlatformIOBuildSystem:
     # ── Build ──
 
     def build(self, project_root: Path, cfg: BuildConfig) -> Path:
-        """Generate compile_commands.json via ``pio run --target compiledb``."""
+        """Generate compile_commands.json via ``pio run --target compiledb``
+        and then run a full build to generate ``.d`` dependency files.
+
+        The ``compiledb`` target captures compile commands from SCons
+        internals but may not invoke GCC — ``.d`` files are only emitted
+        during actual compilation.  A subsequent ``pio run`` ensures they
+        exist for header-change detection.
+        """
         if not shutil.which("pio") and not shutil.which("platformio"):
             raise RuntimeError(
                 "PlatformIO CLI is required.  Install it:  pip install platformio"
@@ -62,6 +69,22 @@ class PlatformIOBuildSystem:
         cc_path = project_root / "compile_commands.json"
         if not cc_path.exists():
             raise RuntimeError("compile_commands.json was not generated — pio run may have failed silently")
+
+        # ── Full build for .d file generation ──
+        # compiledb only writes compile_commands.json — GCC may not have
+        # run.  A full pio run compiles and emits .d files that the indexer
+        # uses for header-change staleness detection.  When the build is
+        # already up-to-date, pio run exits quickly (no-op).
+        build_cmd = [pio_bin, "run", "--project-dir", str(project_root)]
+        log.info("platformio compile: %s", " ".join(build_cmd))
+        build_result = subprocess.run(build_cmd, cwd=project_root)
+        if build_result.returncode != 0:
+            log.warning(
+                "Full build failed (exit code %d) — .d files may be missing. "
+                "Header change detection will be limited. "
+                "Fix compilation errors and re-run 'fw-context index --build'.",
+                build_result.returncode,
+            )
 
         return cc_path
 
@@ -214,44 +237,53 @@ class PlatformIOBuildSystem:
     # ── Validation ──
 
     def validate_artifacts(self, compile_commands: Path, project_root: Path) -> list[BuildIssue]:
+        """Check whether ``.d`` dependency files exist for each TU.
+
+        Uses ``resolve_dep_path_for_entry`` — the same resolution logic
+        that ``_find_dep_path`` uses during indexing — so the validator
+        and the indexer agree on where ``.d`` files should be.
+        """
         issues: list[BuildIssue] = []
-        # Check: do .d dep files exist?  PlatformIO toolchains that lack -MMD
-        # won't emit .d files — header change detection won't work.
         try:
             import json
             cc_data = json.loads(compile_commands.read_text(encoding="utf-8"))
         except (json.JSONDecodeError, OSError):
             return issues  # Handled by generic validation
 
+        # Lazy import to avoid circular dependency (runner imports builders)
+        from fw_context_mcp.indexer.dep_files import resolve_dep_path_for_entry
+
         cc_has_mmd = False
         missing_d_files: list[str] = []
         for entry in cc_data:
             args = entry.get("arguments") or entry.get("command", "").split()
-            has_mmd = any("-MMD" in a for a in args)
+            has_mmd = any(a in ("-MD", "-MMD") for a in args)
+            has_mf = "-MF" in args
             if has_mmd:
                 cc_has_mmd = True
-            # Check if corresponding .d file exists
-            output_flag = False
-            for idx, arg in enumerate(args):
-                if arg in ("-o", "-MF"):
-                    output_flag = True
-                elif output_flag and arg.endswith((".o", ".obj")):
-                    d_file = arg.rsplit(".", 1)[0] + ".d"
-                    if not Path(d_file).exists():
-                        missing_d_files.append(Path(d_file).name)
-                    output_flag = False
+
+            directory = Path(entry.get("directory", str(project_root)))
+            dep_path = resolve_dep_path_for_entry(entry, directory)
+
+            if dep_path is None and (has_mmd or has_mf):
+                # Dep tracking is configured but .d file is missing.
+                # Derive a user-friendly name for the diagnostic message.
+                output = entry.get("output", "")
+                if output:
+                    missing_name = Path(output).with_suffix(".d").name
                 else:
-                    output_flag = False
+                    missing_name = Path(entry.get("file", "?")).with_suffix(".d").name
+                missing_d_files.append(missing_name)
 
         if missing_d_files:
             missing_uniq = sorted(set(missing_d_files))[:5]
-            suffix = f" ({len(missing_uniq)} more...)" if len(missing_d_files) > 5 else ""
+            suffix = f" ({len(missing_d_files) - 5} more...)" if len(missing_d_files) > 5 else ""
             issues.append(BuildIssue(
                 severity="warning",
                 category="dep_files_missing",
                 message=f".d files missing (header change detection limited): "
                         f"{', '.join(missing_uniq)}{suffix}",
-                auto_fixable=not cc_has_mmd,
+                auto_fixable=cc_has_mmd,
                 fix_hint=(
                     "Run 'fw-context index' to auto-configure -MMD"
                     if not cc_has_mmd
@@ -264,6 +296,20 @@ class PlatformIOBuildSystem:
     # ── Auto-fix ──
 
     def auto_fix(self, issue: BuildIssue, project_root: Path) -> bool:
+        """Run a full PlatformIO build when ``.d`` files are missing.
+
+        The ``compiledb`` target only generates compile_commands.json —
+        GCC never runs, so ``.d`` files are not emitted.  A full
+        ``pio run`` triggers compilation and generates them.
+        """
+        if issue.category == "dep_files_missing":
+            pio_bin = "pio" if shutil.which("pio") else "platformio"
+            cmd = [pio_bin, "run", "--project-dir", str(project_root)]
+            log.info("auto-fix dep_files_missing: %s", " ".join(cmd))
+            result = subprocess.run(cmd, cwd=project_root)
+            if result.returncode == 0:
+                return True
+            log.warning("Full build failed (exit code %d)", result.returncode)
         return False
 
     # ── Tools ──

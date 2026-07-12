@@ -5,6 +5,7 @@ from __future__ import annotations
 import re
 from collections.abc import Iterator
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 
 import clang.cindex as cx
@@ -674,6 +675,7 @@ def extract_all(
 
     cwd = unit.directory
 
+    @lru_cache(maxsize=4096)
     def _resolve(path: str) -> Path:
         p = Path(path)
         return (cwd / p).resolve() if not p.is_absolute() else p.resolve()
@@ -694,6 +696,8 @@ def extract_all(
     # Pre-scan: map anonymous struct/union USRs to their field names
     # (e.g. struct { ... } _ble_cmd;  →  anon_usr → "_ble_cmd")
     anon_usr_to_field = _build_anon_usr_to_field(tu.cursor)
+
+    tu_path_str = str(_resolve(tu.spelling))
 
     for cursor in tu.cursor.walk_preorder():
         if cursor.kind not in _SYMBOL_KINDS:
@@ -1071,9 +1075,9 @@ def extract_all(
                 _ext = cursor.extent
                 if _ext.start.file:
                     _ext_file = _ext.start.file.name
-                    if str(Path(_ext_file).resolve()) == str(Path(tu.spelling).resolve()):
+                    if str(_resolve(_ext_file)) == tu_path_str:
                         _fn_spans.append((cur_fn or '', _ext.start.line, _ext.end.line))
-                        fn_stack.append((cur_fn or '', _ext.end.line, str(Path(_ext_file).resolve())))
+                        fn_stack.append((cur_fn or '', _ext.end.line, tu_path_str))
                     else:
                         fn_stack.append((cur_fn or '', 0, ""))
                 else:

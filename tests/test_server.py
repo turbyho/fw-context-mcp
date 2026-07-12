@@ -427,13 +427,17 @@ class TestLikeEscaping:
 class TestFallbackToSearchCode:
     """Test _fallback_to_search_code error handling and stale detection."""
 
-    def test_missing_db_returns_graceful_error(self):
+    def test_missing_db_returns_graceful_error(self, tmp_path):
         """When no index exists, fallback returns structured error as list[dict]."""
+        from fw_context_mcp.config.settings import _write_project_id
         from fw_context_mcp.mcp.shared.fallback import _fallback_to_search_code
 
-        nonexistent = Path("/tmp/nonexistent_fwctx_test.db")
+        # Initialize project first — required for derive_project_id()
+        _write_project_id(tmp_path, "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6")
+
+        nonexistent = tmp_path / "nonexistent_fwctx_test.db"
         result = _fallback_to_search_code(
-            root=Path("/tmp"),
+            root=tmp_path,
             db_path=nonexistent,
             query="uart_init",
             limit=10,
@@ -449,13 +453,16 @@ class TestFallbackToSearchCode:
             f"Error message should be descriptive, got: {err_msg}"
         )
 
-    def test_empty_query_fallback(self):
+    def test_empty_query_fallback(self, tmp_path):
         """Empty query doesn't crash the fallback."""
+        from fw_context_mcp.config.settings import _write_project_id
         from fw_context_mcp.mcp.shared.fallback import _fallback_to_search_code
 
+        _write_project_id(tmp_path, "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6")
+
         result = _fallback_to_search_code(
-            root=Path("/tmp"),
-            db_path=Path("/tmp/nonexistent_fwctx_test_2.db"),
+            root=tmp_path,
+            db_path=tmp_path / "nonexistent_fwctx_test_2.db",
             query="",
             limit=10,
             warning="Empty query",

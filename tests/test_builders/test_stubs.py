@@ -1,6 +1,7 @@
 """Tests for Tier 3/4 stub builders — detection only, no automated build."""
 
 import pytest
+
 from fw_context_mcp.indexer.builders.manual import ManualBuildSystem
 from fw_context_mcp.indexer.builders.stubs import (
     STM32CubeIDEStub,
@@ -60,13 +61,16 @@ class TestManualBuildSystem:
         (src_dir / "main.c").write_text("int main() { return 0; }\n")
         (src_dir / "utils.cpp").write_text("void f() {}\n")
 
+        import shutil
+
+        compiler = "gcc" if shutil.which("gcc") else "cc"
         cfg = BuildConfig(
             system="bare",
             source_dirs=["src"],
             include_dirs=["include"],
             defines=["FOO", "BAR=1"],
-            extra_flags=["-mcpu=cortex-m4", "-mthumb"],
-            compiler="arm-none-eabi-gcc",
+            extra_flags=["-Wall", "-O2"],
+            compiler=compiler,
         )
 
         cc_path = ManualBuildSystem().generate(tmp_path, cfg)
@@ -76,13 +80,16 @@ class TestManualBuildSystem:
         assert len(data) == 2
 
         main_entry = next(e for e in data if e["file"].endswith("main.c"))
-        assert "arm-none-eabi-gcc" in main_entry["command"]
-        assert "-I" in main_entry["command"]
-        assert "include" in main_entry["command"]
-        assert "-D" in main_entry["command"]
-        assert "FOO" in main_entry["command"]
-        assert "BAR=1" in main_entry["command"]
-        assert "-mcpu=cortex-m4" in main_entry["command"]
+        # New code uses "arguments" (not "command") — array form for better tool support
+        args = main_entry["arguments"]
+        assert compiler in " ".join(args)
+        assert any("-I" in a for a in args)
+        assert any("include" in a for a in args)
+        assert any("-D" in a for a in args)
+        assert "FOO" in args
+        assert "BAR=1" in args
+        assert "-Wall" in args
+        assert "-O2" in args
 
     def test_generate_empty_source_dirs_raises(self, tmp_path):
         from fw_context_mcp.indexer.build import BuildConfig
@@ -111,8 +118,10 @@ class TestManualBuildSystem:
         import json
         data = json.loads(cc_path.read_text(encoding="utf-8"))
         entry = data[0]
-        assert "-I include" in entry["command"]
-        assert "-I lib/CMSIS/Include" in entry["command"]
+        args = entry["arguments"]
+        assert "-I" in args
+        assert "include" in args
+        assert "lib/CMSIS/Include" in args
 
     def test_generate_system_include_dirs_become_isystem(self, tmp_path):
         from fw_context_mcp.indexer.build import BuildConfig
@@ -130,7 +139,9 @@ class TestManualBuildSystem:
         import json
         data = json.loads(cc_path.read_text(encoding="utf-8"))
         entry = data[0]
-        assert "-isystem /opt/toolchain/include" in entry["command"]
+        args = entry["arguments"]
+        assert "-isystem" in args
+        assert "/opt/toolchain/include" in args
 
     def test_required_tools_empty(self):
         assert ManualBuildSystem().required_tools() == []

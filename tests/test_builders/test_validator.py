@@ -82,8 +82,18 @@ class TestValidateAndFix:
         from fw_context_mcp.indexer.builders.platformio import PlatformIOBuildSystem
 
         cc = tmp_path / "compile_commands.json"
+        # Create a .d file so validate_artifacts can find it
+        obj_dir = tmp_path / "build"
+        obj_dir.mkdir()
+        d_path = obj_dir / "main.d"
+        d_path.write_text("main.o: main.cpp\n")
         cc.write_text(json.dumps([
-            {"file": "main.cpp", "directory": str(tmp_path), "arguments": ["gcc", "-c", "-MMD", "main.cpp"]}
+            {
+                "file": "main.cpp",
+                "directory": str(tmp_path),
+                "arguments": ["gcc", "-c", "-MMD", "main.cpp"],
+                "output": "build/main.o",
+            }
         ]))
         builder = PlatformIOBuildSystem()
         issues = validate_and_fix(cc, tmp_path, builder)

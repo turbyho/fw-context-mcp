@@ -82,12 +82,14 @@ def cmd_index(args: argparse.Namespace) -> int:
     detected_system = detect_build_system(project_root)
     if detected_system:
         print(f"Project: {project_root.name}  path={project_root}  build={detected_system}")
-        if detected_system == "platformio" and not bg:
-            from .indexer.builders.platformio import PlatformIOBuildSystem
-            builder = PlatformIOBuildSystem()
-            for msg in builder.ensure_dep_tracking(project_root, fix=True):
-                if msg:
-                    print(msg)
+        if not bg:
+            from .indexer.builders import registry as builder_registry
+            builder_cls = builder_registry.get(detected_system)
+            if builder_cls is not None:
+                builder = builder_cls()
+                for msg in builder.ensure_dep_tracking(project_root, fix=True):
+                    if msg:
+                        print(msg)
     else:
         if bg:
             # In background mode, an existing compile_commands.json is sufficient —
@@ -172,14 +174,34 @@ def cmd_index(args: argparse.Namespace) -> int:
         if builder_cls is not None:
             builder_instance = builder_cls()
             if not bg:
-                # Foreground mode: full staleness check + auto-fix
+                # Foreground mode: staleness check + auto-rebuild.
+                # A stale compile_commands.json means the index would be
+                # inconsistent — we MUST rebuild before proceeding.
                 stale, stale_reasons = is_compile_commands_stale(compile_commands, project_root)
                 if stale:
-                    print(f"compile_commands.json is stale ({'; '.join(stale_reasons)}).")
-                    if args.build:
-                        print("  Rebuilding (--build flag)...")
-                    elif not explicit_cc:
-                        print("  Run 'fw-context index --build' to regenerate.")
+                    if explicit_cc:
+                        # User passed an explicit --compile_commands path —
+                        # warn but respect their choice.
+                        print(
+                            f"warning: explicit compile_commands.json is stale "
+                            f"({'; '.join(stale_reasons)})",
+                            file=sys.stderr,
+                        )
+                    else:
+                        print(
+                            f"compile_commands.json is stale ({'; '.join(stale_reasons)}), "
+                            "rebuilding..."
+                        )
+                        try:
+                            compile_commands = generate_compile_commands(project_root, cfg.build)
+                            print(f"Generated: {compile_commands}")
+                        except RuntimeError as exc:
+                            print(f"error: {exc}", file=sys.stderr)
+                            print(
+                                "  Run 'fw-context index --build' to retry.",
+                                file=sys.stderr,
+                            )
+                            return 1
             # Validate artifacts — in bg mode, report only (no auto-fix)
             issues = validate_and_fix(
                 compile_commands, project_root, builder_instance, cfg.build,
@@ -192,11 +214,37 @@ def cmd_index(args: argparse.Namespace) -> int:
             if errors:
                 for e in errors:
                     print(f"error: {e.message}", file=sys.stderr)
-                if bg:
-                    print("Run 'fw-context index' to resolve issues.", file=sys.stderr)
-                elif not args.build:
-                    print("Run 'fw-context index --build' to rebuild and fix issues.", file=sys.stderr)
-                return 1
+                if not bg and not explicit_cc and not args.build:
+                    # Auto-rebuild to fix artifact errors (missing .d files, etc.)
+                    print("Rebuilding to fix issues...")
+                    try:
+                        compile_commands = generate_compile_commands(project_root, cfg.build)
+                        print(f"Generated: {compile_commands}")
+                        issues = validate_and_fix(
+                            compile_commands, project_root, builder_instance, cfg.build,
+                            fix=True,
+                        )
+                        errors = [i for i in issues if i.severity == "error"]
+                        for i in issues:
+                            if i.severity == "warning":
+                                print(f"warning: {i.message}", file=sys.stderr)
+                    except RuntimeError as exc:
+                        print(f"error: {exc}", file=sys.stderr)
+                        return 1
+                if errors:
+                    for e in errors:
+                        print(f"error: {e.message}", file=sys.stderr)
+                    if bg:
+                        print(
+                            "Run 'fw-context index' to resolve issues.",
+                            file=sys.stderr,
+                        )
+                    else:
+                        print(
+                            "Run 'fw-context index --build' to rebuild and fix issues.",
+                            file=sys.stderr,
+                        )
+                    return 1
 
     source_roots = [Path(r) for r in args.source_roots] if args.source_roots else cfg.source_root_paths(project_root)
     exclude_paths = cfg.exclude_root_paths(project_root)
@@ -243,6 +291,14 @@ def cmd_index(args: argparse.Namespace) -> int:
             force=args.force,
         )
         print(f"Indexed. config_hash={config_hash[:16]}…  db={db_path}")
+
+        # ── Update project type in global registry ──
+        from .config.global_db import open_global_db, upsert_project_registry
+
+        _ptype = detected_system or "unknown"
+        _gconn = open_global_db()
+        upsert_project_registry(_gconn, project_id, getattr(args, "name", None) or project_root.name, _ptype, str(project_root))
+
         return 0
     finally:
         try:
@@ -806,6 +862,27 @@ def cmd_init(args: argparse.Namespace) -> int:
             mcp_bin = str(dev_candidate)
 
     project_root = Path.cwd() if not args.project else Path(args.project).resolve()
+
+    # ── Generate project ID if missing ──
+    from .config.settings import _write_project_id, generate_project_id as _gen_pid
+    from .config import load as load_project_config
+
+    _proj_cfg = load_project_config(project_root=project_root)
+    if not _proj_cfg.project.id:
+        new_id = _gen_pid()
+        _write_project_id(project_root, new_id)
+        print(f"Project ID: {new_id}")
+        proj_id = new_id
+    else:
+        print(f"Project ID: {_proj_cfg.project.id} (existing)")
+        proj_id = _proj_cfg.project.id
+
+    # ── Register project in global registry ──
+    from .config.global_db import open_global_db, upsert_project_registry
+
+    proj_name = getattr(args, "name", None) or _proj_cfg.project.name or project_root.name
+    glob_conn = open_global_db()
+    upsert_project_registry(glob_conn, proj_id, proj_name, "unknown", str(project_root))
 
     # Select tools to act on
     selected: list[str] = []
@@ -2094,7 +2171,16 @@ def main() -> None:
     if not hasattr(args, "func"):
         parser.print_help()
         sys.exit(0)
-    sys.exit(args.func(args))
+    try:
+        sys.exit(args.func(args))
+    except Exception as exc:
+        # ProjectNotInitializedError — lazy import to avoid circular deps
+        from .config.settings import ProjectNotInitializedError
+
+        if isinstance(exc, ProjectNotInitializedError):
+            print(f"error: {exc}", file=sys.stderr)
+            sys.exit(1)
+        raise
 
 
 if __name__ == "__main__":

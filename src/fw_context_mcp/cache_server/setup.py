@@ -419,10 +419,8 @@ def _ensure_cache_server_init() -> str | None:
                 print("      Re-run 'fw-cache-server init' manually if you need a new admin token")
                 return os.environ.get("FW_CACHE_ADMIN_TOKEN", "unknown")
 
-            # Create default project
-            token = await backend.create_project("default")
-            if token is None:
-                token = "unknown"
+            # Create admin token (not scoped to any project — project_id IS NULL)
+            token = await backend.create_admin_token()
             os.environ["FW_CACHE_ADMIN_TOKEN"] = token
             return token
         finally:
@@ -442,6 +440,23 @@ def _ensure_cache_server_init() -> str | None:
 
 
 # -- Project and tokens --
+
+def _detect_project_id_from_cwd() -> str | None:
+    """Read project ID from .fw-context/config.toml in the current directory."""
+    config_path = Path.cwd() / ".fw-context" / "config.toml"
+    if not config_path.exists():
+        return None
+    try:
+        import tomllib
+        with open(config_path, "rb") as f:
+            data = tomllib.load(f)
+        pid = data.get("project", {}).get("id")
+        if pid:
+            return pid
+    except Exception:
+        pass
+    return None
+
 
 def _setup_project_and_tokens(admin_token: str) -> tuple[str, str, str] | None:
     """Interactively create a project and its read/write tokens."""
@@ -466,11 +481,25 @@ def _setup_project_and_tokens(admin_token: str) -> tuple[str, str, str] | None:
         if not _ask("Create another project?"):
             return None
 
+    # ── Auto-detect project ID from .fw-context/config.toml ──
+    detected_id = _detect_project_id_from_cwd()
+
     print()
-    try:
-        project_id = input("  Project ID (e.g. my-firmware): ").strip()
-    except (EOFError, KeyboardInterrupt):
-        return None
+    if detected_id:
+        print(f"  Detected project ID: {detected_id}")
+        if _ask("Use this ID?"):
+            project_id = detected_id
+        else:
+            try:
+                project_id = input("  Project ID (UUID4 hex): ").strip()
+            except (EOFError, KeyboardInterrupt):
+                return None
+    else:
+        print("  No .fw-context/config.toml detected in current directory.")
+        try:
+            project_id = input("  Project ID (UUID4 hex): ").strip()
+        except (EOFError, KeyboardInterrupt):
+            return None
 
     if not project_id:
         print("    Empty project ID — skipping")

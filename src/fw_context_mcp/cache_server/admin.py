@@ -66,11 +66,16 @@ def admin_command(fn: Callable[[Any, argparse.Namespace], Any]) -> Callable[[arg
 
 @admin_command
 async def cmd_project_create(backend, args: argparse.Namespace) -> int:
-    token = await backend.create_project(args.project_id, args.description or "")
-    if token is None:
-        print(f"Error: project '{args.project_id}' already exists", file=sys.stderr)
+    pid = args.project_id
+    if len(pid) != 32 or not all(c in "0123456789abcdef" for c in pid):
+        print(f"Error: project ID must be 32 hex characters (UUID4), got: {pid}", file=sys.stderr)
+        print("  Run 'fw-context init' to generate a valid project ID.", file=sys.stderr)
         return 1
-    print(f"Project '{args.project_id}' created")
+    token = await backend.create_project(pid, args.description or "")
+    if token is None:
+        print(f"Error: project '{pid}' already exists", file=sys.stderr)
+        return 1
+    print(f"Project '{pid}' created")
     print(f"  Admin token: {token}")
     return 0
 
@@ -207,7 +212,7 @@ def main() -> None:
     p_proj_sub = p_proj.add_subparsers(dest="project_command")
 
     p_create = p_proj_sub.add_parser("create", help="Create a new project")
-    p_create.add_argument("project_id", help="Project ID (e.g. my-firmware)")
+    p_create.add_argument("project_id", help="Project ID (UUID4 hex from fw-context init)")
     p_create.add_argument("--description", help="Optional description")
     p_create.set_defaults(func=cmd_project_create)
 

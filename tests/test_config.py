@@ -2,6 +2,8 @@
 
 from pathlib import Path
 
+import pytest
+
 from fw_context_mcp.config.settings import (
     Config,
     _deep_merge,
@@ -84,23 +86,31 @@ class TestFromDict:
 
 
 class TestDeriveProjectId:
-    def test_git_repo_produces_stable_id(self):
-        """In the fw-context-mcp repo itself, project_id should be stable."""
-        pid1 = derive_project_id(Path(__file__).resolve().parent.parent)
-        pid2 = derive_project_id(Path(__file__).resolve().parent.parent)
-        assert len(pid1) == 16
+    def test_returns_id_from_config(self, tmpdir):
+        """derive_project_id reads [project].id from config.toml."""
+        from fw_context_mcp.config.settings import _write_project_id
+
+        test_id = "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6"
+        _write_project_id(tmpdir, test_id)
+        assert derive_project_id(tmpdir) == test_id
+
+    def test_stable_id_from_config(self, tmpdir):
+        """derive_project_id returns the same ID on repeated calls."""
+        from fw_context_mcp.config.settings import _write_project_id
+
+        test_id = "f6e5d4c3b2a10987a6b5c4d3e2f1a0b9"
+        _write_project_id(tmpdir, test_id)
+        pid1 = derive_project_id(tmpdir)
+        pid2 = derive_project_id(tmpdir)
+        assert len(pid1) == 32
         assert pid1 == pid2
 
-    def test_non_git_directory(self, tmpdir):
-        pid = derive_project_id(tmpdir)
-        assert len(pid) == 16
+    def test_raises_when_no_id(self, tmpdir):
+        """derive_project_id raises ProjectNotInitializedError when [project].id is missing."""
+        from fw_context_mcp.config.settings import ProjectNotInitializedError
 
-    def test_different_dirs_produce_different_ids(self, tmpdir):
-        a = tmpdir / "a"
-        b = tmpdir / "b"
-        a.mkdir()
-        b.mkdir()
-        assert derive_project_id(a) != derive_project_id(b)
+        with pytest.raises(ProjectNotInitializedError):
+            derive_project_id(tmpdir)
 
 
 class TestLocalConfig:

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import shutil
 import subprocess
 from pathlib import Path
@@ -38,41 +39,80 @@ class ZephyrBuildSystem:
     def build(self, project_root: Path, cfg: BuildConfig) -> Path:
         """Generate compile_commands.json via ``west build``."""
         if not shutil.which("west"):
-            raise RuntimeError(
-                "west is required for Zephyr builds.  Install the Zephyr SDK and west tool."
-            )
+            raise RuntimeError("west is required for Zephyr builds.  Install the Zephyr SDK and west tool.")
 
         if not cfg.board:
             raise RuntimeError(
-                "Zephyr requires a board name.  Set it in .fw-context/config.toml:\n"
-                "  [build]\n  board = \"your_board\""
+                'Zephyr requires a board name.  Set it in .fw-context/config.toml:\n  [build]\n  board = "your_board"'
             )
 
         build_dir = project_root / "build"
 
+        # Ninja deletes .d depfiles after reading them by default.
+        # Create a wrapper that adds -d keepdepfile so .d files persist
+        # on disk for incremental re-indexing.
+        # We place the wrapper at $PATH priority (not CMAKE_MAKE_PROGRAM)
+        # because sysbuild's ExternalProject_Add does not forward
+        # CMAKE_MAKE_PROGRAM to the inner Zephyr CMake project.
+        ninja = shutil.which("ninja")
+        if ninja is None:
+            raise RuntimeError("ninja is required for Zephyr builds")
+        wrapper_dir = project_root / ".fw-context"
+        wrapper_dir.mkdir(parents=True, exist_ok=True)
+        ninja_wrapper = wrapper_dir / "ninja"
+        ninja_wrapper.write_text(
+            f"#!/bin/sh\nexec {ninja} -d keepdepfile \"$@\"\n", encoding="utf-8"
+        )
+        ninja_wrapper.chmod(0o755)
+
         cmd: list[str] = [
-            "west", "build",
-            "-b", cfg.board,
-            "-d", str(build_dir),
+            "west",
+            "build",
+            "-b",
+            cfg.board,
+            "-d",
+            str(build_dir),
         ]
 
         if cfg.clean:
             cmd.append("--pristine")
+
         cmd.append("--")
         cmd.append("-DCMAKE_EXPORT_COMPILE_COMMANDS=ON")
+        # Inject .d dependency tracking via Zephyr's built-in EXTRA_CPPFLAGS
+        # mechanism (cmake/extra_flags.cmake).  This propagates -MMD through
+        # zephyr_interface to all Zephyr targets and survives sysbuild.
+        cmd.append("-DEXTRA_CPPFLAGS=-MMD")
 
         log.info("zephyr build: %s", " ".join(cmd))
-        result = subprocess.run(cmd, cwd=project_root)
+        # ccache with depend_mode=false (default) skips .d file regeneration
+        # on cache hits.  CCACHE_DEPEND=1 forces ccache to cache dependency
+        # info so .d files are present after every build.
+        # Prepend the .fw-context wrapper directory to PATH so our ninja
+        # wrapper (which adds -d keepdepfile) shadows the real ninja binary
+        # in both sysbuild (outer) and Zephyr (inner) CMake projects.
+        env = {
+            **os.environ,
+            "CCACHE_DEPEND": "1",
+            "PATH": f"{wrapper_dir}{os.pathsep}{os.environ.get('PATH', '')}",
+        }
+        result = subprocess.run(cmd, cwd=project_root, env=env)
 
         if result.returncode != 0:
             raise RuntimeError(f"west build failed with exit code {result.returncode}")
 
         cc_in_build = build_dir / "compile_commands.json"
         if not cc_in_build.exists():
-            raise RuntimeError(
-                "compile_commands.json not found in build directory. "
-                "Ensure CMAKE_EXPORT_COMPILE_COMMANDS is enabled."
-            )
+            # Sysbuild (NCS ≥2.0) puts cc.json one level deeper:
+            #   build/zephyr/compile_commands.json
+            cc_sysbuild = build_dir / "zephyr" / "compile_commands.json"
+            if cc_sysbuild.exists():
+                cc_in_build = cc_sysbuild
+            else:
+                raise RuntimeError(
+                    "compile_commands.json not found in build directory. "
+                    "Ensure CMAKE_EXPORT_COMPILE_COMMANDS is enabled."
+                )
 
         # Copy to project root for consistency
         target_cc = project_root / "compile_commands.json"
@@ -84,8 +124,25 @@ class ZephyrBuildSystem:
     # ── Dep tracking ──
 
     def ensure_dep_tracking(self, project_root: Path, *, fix: bool = False) -> list[str]:
-        # CMake + GCC always emits .d files — nothing to configure.
-        return []
+        """Ensure the Zephyr build generates ``.d`` dependency files.
+
+        Zephyr injects ``-MMD`` via its built-in ``EXTRA_CPPFLAGS`` CMake
+        variable (``cmake/extra_flags.cmake``), which propagates through
+        ``zephyr_interface`` to all targets.  No configuration file is
+        needed — the flag is passed directly at build time.
+        """
+        messages: list[str] = []
+        if fix:
+            messages.append(
+                "Zephyr passes EXTRA_CPPFLAGS=-MMD to CMake — "
+                ".d dependency files will be generated during build."
+            )
+        else:
+            messages.append(
+                "Will pass EXTRA_CPPFLAGS=-MMD to CMake "
+                "(applied automatically during 'fw-context index --build')."
+            )
+        return messages
 
     # ── Validation ──
 

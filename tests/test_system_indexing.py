@@ -35,12 +35,24 @@ from fw_context_mcp.indexer.db import open_db
 _BUILDS = Path(__file__).resolve().parent / "builds"
 
 
+def _read_mbed_gcc_arm_path() -> str:
+    """Read GCC_ARM_PATH from the global mbed config (``~/.mbed/.mbed``)."""
+    mbed_config = Path(os.path.expanduser("~/.mbed/.mbed"))
+    if not mbed_config.exists():
+        return ""
+    for line in mbed_config.read_text(encoding="utf-8").splitlines():
+        if line.startswith("GCC_ARM_PATH="):
+            return line.split("=", 1)[1].strip()
+    return ""
+
+
 def _project_root() -> Path:
     return Path(__file__).resolve().parents[1]
 
 
-def _cli(args: list[str], cwd: Path | None = None, timeout: int = 180,
-         extra_env: dict[str, str] | None = None) -> subprocess.CompletedProcess:
+def _cli(
+    args: list[str], cwd: Path | None = None, timeout: int = 180, extra_env: dict[str, str] | None = None
+) -> subprocess.CompletedProcess:
     """Run fw-context CLI in a subprocess."""
     env = dict(os.environ)
     env["PYTHONPATH"] = str(_project_root() / "src")
@@ -112,7 +124,7 @@ def _patch_config(config_path: Path, replacements: dict[str, str]) -> None:
             full_key = f"[{current_section}] {key}"
             if full_key in replacements:
                 value = replacements[full_key]
-                indent = line[:len(line) - len(line.lstrip())]
+                indent = line[: len(line) - len(line.lstrip())]
                 result.append(f"{indent}{key} = {value}")
                 seen.add(full_key)
                 del replacements[full_key]
@@ -140,9 +152,15 @@ def _patch_config(config_path: Path, replacements: dict[str, str]) -> None:
     config_path.write_text("\n".join(result) + "\n", encoding="utf-8")
 
 
-def _init_and_index(proj: Path, *, replacements: dict[str, str] | None = None,
-                    timeout: int = 300,
-                    extra_env: dict[str, str] | None = None) -> Path:
+def _init_and_index(
+    proj: Path,
+    *,
+    replacements: dict[str, str] | None = None,
+    timeout: int | None = None,
+    extra_env: dict[str, str] | None = None,
+    keep_build: bool = False,
+    clean_db: bool = False,
+) -> Path:
     """Run fw-context init, patch config, then fw-context index.
 
     Returns *proj* on success, fails the test on error.
@@ -153,21 +171,49 @@ def _init_and_index(proj: Path, *, replacements: dict[str, str] | None = None,
 
     # Clean up previous state
     cc = proj / "compile_commands.json"
-    if cc.exists():
+    if not keep_build and cc.exists():
         cc.unlink()
-    build_dir = proj / "build"
-    if build_dir.exists():
-        import shutil
-        shutil.rmtree(build_dir)
+    if not keep_build:
+        build_dir = proj / "build"
+        if build_dir.exists():
+            import shutil
+
+            shutil.rmtree(build_dir)
+        # PlatformIO uses .pio/ instead of build/
+        pio_dir = proj / ".pio"
+        if pio_dir.exists():
+            import shutil
+
+            shutil.rmtree(pio_dir)
+        # Arduino uses a build/ dir inside its sketch folder,
+        # but the builder cleans that automatically.
     fwctx_dir = proj / ".fw-context"
     if fwctx_dir.exists():
         import shutil
+
         shutil.rmtree(fwctx_dir)
 
-    # Step 1: fw-context init
+    # Step 1: fw-context init — generates a unique UUID4 project ID
+    # and writes it to .fw-context/config.toml.  Each test project
+    # gets its own ID, independent of git remote or filesystem path.
     result = _cli(["init", "--project", str(proj)], cwd=proj, timeout=timeout)
     if result.returncode != 0:
         pytest.fail(f"init failed:\nSTDOUT:\n{result.stdout}\nSTDERR:\n{result.stderr}")
+
+    # Clean the SQLite database when requested (SDK tests).
+    # Stale mtimes from a previous run with the same config_hash
+    # would cause the mtime fast-path to skip all TUs.
+    if clean_db:
+        from fw_context_mcp.config import derive_project_id
+        from fw_context_mcp.config import load as load_config
+
+        _cfg = load_config(project_root=proj)
+        _pid = derive_project_id(proj)
+        db_path = _cfg.index.db_dir / _pid / "index.db"
+        for suffix in ("", "-wal", "-shm"):
+            p = db_path.with_name(db_path.name + suffix)
+            if p.exists():
+                p.unlink()
 
     # Step 2: ensure config.toml exists and patch it
     config_path = proj / ".fw-context" / "config.toml"
@@ -246,25 +292,41 @@ class TestBuilderRegistry:
     @pytest.mark.parametrize(
         "config_key",
         [
-            "bare", "cmake", "makefile", "platformio", "mbed-os", "arduino",
-            "zephyr", "esp-idf", "keil-mdk", "iar-ewarm", "ti-ccs", "stm32cubeide",
+            "bare",
+            "cmake",
+            "makefile",
+            "platformio",
+            "mbed-os",
+            "arduino",
+            "zephyr",
+            "esp-idf",
+            "keil-mdk",
+            "iar-ewarm",
+            "ti-ccs",
+            "stm32cubeide",
         ],
     )
     def test_builder_has_required_attrs(self, config_key):
         builder_cls = builder_registry.get(config_key)
         assert builder_cls is not None, f"Builder '{config_key}' not registered"
         for attr in self._REQUIRED_ATTRS:
-            assert hasattr(builder_cls, attr), (
-                f"Builder '{config_key}' missing attribute '{attr}'"
-            )
+            assert hasattr(builder_cls, attr), f"Builder '{config_key}' missing attribute '{attr}'"
 
     @pytest.mark.parametrize(
         "config_key,expected_marker_count",
         [
-            ("bare", 0), ("cmake", 1), ("makefile", 1),
-            ("platformio", 1), ("mbed-os", 3), ("arduino", 1),
-            ("zephyr", 2), ("esp-idf", 1), ("keil-mdk", 1),
-            ("iar-ewarm", 2), ("ti-ccs", 1), ("stm32cubeide", 2),
+            ("bare", 0),
+            ("cmake", 1),
+            ("makefile", 1),
+            ("platformio", 1),
+            ("mbed-os", 3),
+            ("arduino", 1),
+            ("zephyr", 2),
+            ("esp-idf", 1),
+            ("keil-mdk", 1),
+            ("iar-ewarm", 2),
+            ("ti-ccs", 1),
+            ("stm32cubeide", 2),
         ],
     )
     def test_builder_marker_count(self, config_key, expected_marker_count):
@@ -286,11 +348,15 @@ class TestBareInitAndIndex:
 
     @pytest.fixture(scope="class")
     def indexed(self):
-        return _init_and_index(_BUILDS / "bare", replacements={
-            '[build] system': '"bare"',
-            '[build] source_dirs': '["src"]',
-            '[build] include_dirs': '["src"]',
-        })
+        return _init_and_index(
+            _BUILDS / "bare",
+            replacements={
+                "[build] system": '"bare"',
+                "[build] source_dirs": '["src"]',
+                "[build] include_dirs": '["src"]',
+            },
+            clean_db=True,
+        )
 
     def test_compile_commands_generated(self, indexed):
         entries = json.loads((indexed / "compile_commands.json").read_text())
@@ -301,9 +367,7 @@ class TestBareInitAndIndex:
         conn = open_db(db_path)
         try:
             ch = _config_hash(conn, indexed)
-            count = conn.execute(
-                "SELECT COUNT(*) FROM symbols WHERE config_hash=?", (ch,)
-            ).fetchone()[0]
+            count = conn.execute("SELECT COUNT(*) FROM symbols WHERE config_hash=?", (ch,)).fetchone()[0]
             assert count >= 3
         finally:
             conn.close()
@@ -314,7 +378,8 @@ class TestBareInitAndIndex:
         try:
             ch = _config_hash(conn, indexed)
             functions = [
-                r[0] for r in conn.execute(
+                r[0]
+                for r in conn.execute(
                     "SELECT name FROM symbols WHERE config_hash=? AND kind='function' AND is_definition=1",
                     (ch,),
                 )
@@ -329,9 +394,7 @@ class TestBareInitAndIndex:
         conn = open_db(db_path)
         try:
             ch = _config_hash(conn, indexed)
-            enums = [r[0] for r in conn.execute(
-                "SELECT name FROM symbols WHERE config_hash=? AND kind='enum'", (ch,)
-            )]
+            enums = [r[0] for r in conn.execute("SELECT name FROM symbols WHERE config_hash=? AND kind='enum'", (ch,))]
             assert "OperationMode" in enums
         finally:
             conn.close()
@@ -341,10 +404,26 @@ class TestBareInitAndIndex:
         conn = open_db(db_path)
         try:
             ch = _config_hash(conn, indexed)
-            structs = [r[0] for r in conn.execute(
-                "SELECT name FROM symbols WHERE config_hash=? AND kind='struct'", (ch,)
-            )]
+            structs = [
+                r[0] for r in conn.execute("SELECT name FROM symbols WHERE config_hash=? AND kind='struct'", (ch,))
+            ]
             assert "Config" in structs
+        finally:
+            conn.close()
+
+    def test_deps_files_indexed(self, indexed):
+        db_path = _db_path_for_project(indexed)
+        conn = open_db(db_path)
+        try:
+            ch = _config_hash(conn, indexed)
+            row = conn.execute(
+                "SELECT deps_verification FROM build_configs WHERE config_hash=?",
+                (ch,),
+            ).fetchone()
+            assert row is not None, "build_config not found"
+            assert row["deps_verification"] == "full", (
+                f"Expected full deps, got '{row['deps_verification']}'"
+            )
         finally:
             conn.close()
 
@@ -354,7 +433,7 @@ class TestCMakeInitAndIndex:
 
     @pytest.fixture(scope="class")
     def indexed(self):
-        return _init_and_index(_BUILDS / "generic_cmake")
+        return _init_and_index(_BUILDS / "generic_cmake", clean_db=True)
 
     def test_compile_commands_generated(self, indexed):
         entries = json.loads((indexed / "compile_commands.json").read_text())
@@ -365,9 +444,7 @@ class TestCMakeInitAndIndex:
         conn = open_db(db_path)
         try:
             ch = _config_hash(conn, indexed)
-            count = conn.execute(
-                "SELECT COUNT(*) FROM symbols WHERE config_hash=?", (ch,)
-            ).fetchone()[0]
+            count = conn.execute("SELECT COUNT(*) FROM symbols WHERE config_hash=?", (ch,)).fetchone()[0]
             assert count >= 1
         finally:
             conn.close()
@@ -377,10 +454,26 @@ class TestCMakeInitAndIndex:
         conn = open_db(db_path)
         try:
             ch = _config_hash(conn, indexed)
-            names = [r[0] for r in conn.execute(
-                "SELECT name FROM symbols WHERE config_hash=? AND kind='function'", (ch,)
-            )]
+            names = [
+                r[0] for r in conn.execute("SELECT name FROM symbols WHERE config_hash=? AND kind='function'", (ch,))
+            ]
             assert "factorial" in names
+        finally:
+            conn.close()
+
+    def test_deps_files_indexed(self, indexed):
+        db_path = _db_path_for_project(indexed)
+        conn = open_db(db_path)
+        try:
+            ch = _config_hash(conn, indexed)
+            row = conn.execute(
+                "SELECT deps_verification FROM build_configs WHERE config_hash=?",
+                (ch,),
+            ).fetchone()
+            assert row is not None, "build_config not found"
+            assert row["deps_verification"] == "full", (
+                f"Expected full deps, got '{row['deps_verification']}'"
+            )
         finally:
             conn.close()
 
@@ -390,7 +483,11 @@ class TestMakefileInitAndIndex:
 
     @pytest.fixture(scope="class")
     def indexed(self):
-        return _init_and_index(_BUILDS / "makefile")
+        return _init_and_index(
+            _BUILDS / "makefile",
+            replacements={"[build] make_dry_run": "false"},
+            clean_db=True,
+        )
 
     def test_compile_commands_generated(self, indexed):
         entries = json.loads((indexed / "compile_commands.json").read_text())
@@ -401,10 +498,13 @@ class TestMakefileInitAndIndex:
         conn = open_db(db_path)
         try:
             ch = _config_hash(conn, indexed)
-            functions = [r[0] for r in conn.execute(
-                "SELECT name FROM symbols WHERE config_hash=? AND kind='function' AND is_definition=1",
-                (ch,),
-            )]
+            functions = [
+                r[0]
+                for r in conn.execute(
+                    "SELECT name FROM symbols WHERE config_hash=? AND kind='function' AND is_definition=1",
+                    (ch,),
+                )
+            ]
             assert "register_device" in functions
             assert "find_device" in functions
         finally:
@@ -415,10 +515,26 @@ class TestMakefileInitAndIndex:
         conn = open_db(db_path)
         try:
             ch = _config_hash(conn, indexed)
-            structs = [r[0] for r in conn.execute(
-                "SELECT name FROM symbols WHERE config_hash=? AND kind='struct'", (ch,)
-            )]
+            structs = [
+                r[0] for r in conn.execute("SELECT name FROM symbols WHERE config_hash=? AND kind='struct'", (ch,))
+            ]
             assert "Device" in structs
+        finally:
+            conn.close()
+
+    def test_deps_files_indexed(self, indexed):
+        db_path = _db_path_for_project(indexed)
+        conn = open_db(db_path)
+        try:
+            ch = _config_hash(conn, indexed)
+            row = conn.execute(
+                "SELECT deps_verification FROM build_configs WHERE config_hash=?",
+                (ch,),
+            ).fetchone()
+            assert row is not None, "build_config not found"
+            assert row["deps_verification"] == "full", (
+                f"Expected full deps, got '{row['deps_verification']}'"
+            )
         finally:
             conn.close()
 
@@ -428,7 +544,7 @@ class TestPlatformIOInitAndIndex:
 
     @pytest.fixture(scope="class")
     def indexed(self):
-        return _init_and_index(_BUILDS / "platformio", timeout=300)
+        return _init_and_index(_BUILDS / "platformio", clean_db=True)
 
     def test_compile_commands_has_entries(self, indexed):
         entries = json.loads((indexed / "compile_commands.json").read_text())
@@ -439,9 +555,7 @@ class TestPlatformIOInitAndIndex:
         conn = open_db(db_path)
         try:
             ch = _config_hash(conn, indexed)
-            count = conn.execute(
-                "SELECT COUNT(*) FROM symbols WHERE config_hash=?", (ch,)
-            ).fetchone()[0]
+            count = conn.execute("SELECT COUNT(*) FROM symbols WHERE config_hash=?", (ch,)).fetchone()[0]
             assert count > 50
         finally:
             conn.close()
@@ -451,10 +565,13 @@ class TestPlatformIOInitAndIndex:
         conn = open_db(db_path)
         try:
             ch = _config_hash(conn, indexed)
-            functions = [r[0] for r in conn.execute(
-                "SELECT name FROM symbols WHERE config_hash=? AND kind='function' AND is_definition=1",
-                (ch,),
-            )]
+            functions = [
+                r[0]
+                for r in conn.execute(
+                    "SELECT name FROM symbols WHERE config_hash=? AND kind='function' AND is_definition=1",
+                    (ch,),
+                )
+            ]
             assert "sensor_init" in functions
             assert "sensor_read" in functions
         finally:
@@ -465,10 +582,24 @@ class TestPlatformIOInitAndIndex:
         conn = open_db(db_path)
         try:
             ch = _config_hash(conn, indexed)
-            enums = [r[0] for r in conn.execute(
-                "SELECT name FROM symbols WHERE config_hash=? AND kind='enum'", (ch,)
-            )]
+            enums = [r[0] for r in conn.execute("SELECT name FROM symbols WHERE config_hash=? AND kind='enum'", (ch,))]
             assert "SensorState" in enums
+        finally:
+            conn.close()
+
+    def test_deps_files_indexed(self, indexed):
+        db_path = _db_path_for_project(indexed)
+        conn = open_db(db_path)
+        try:
+            ch = _config_hash(conn, indexed)
+            row = conn.execute(
+                "SELECT deps_verification FROM build_configs WHERE config_hash=?",
+                (ch,),
+            ).fetchone()
+            assert row is not None, "build_config not found"
+            assert row["deps_verification"] == "full", (
+                f"Expected full deps, got '{row['deps_verification']}'"
+            )
         finally:
             conn.close()
 
@@ -478,9 +609,13 @@ class TestArduinoInitAndIndex:
 
     @pytest.fixture(scope="class")
     def indexed(self):
-        return _init_and_index(_BUILDS / "arduino", replacements={
-            '[build] fqbn': '"arduino:avr:uno"',
-        }, timeout=120)
+        return _init_and_index(
+            _BUILDS / "arduino",
+            replacements={
+                "[build] fqbn": '"arduino:avr:uno"',
+            },
+            clean_db=True,
+        )
 
     def test_compile_commands_generated(self, indexed):
         entries = json.loads((indexed / "compile_commands.json").read_text())
@@ -491,10 +626,24 @@ class TestArduinoInitAndIndex:
         conn = open_db(db_path)
         try:
             ch = _config_hash(conn, indexed)
-            count = conn.execute(
-                "SELECT COUNT(*) FROM symbols WHERE config_hash=?", (ch,)
-            ).fetchone()[0]
+            count = conn.execute("SELECT COUNT(*) FROM symbols WHERE config_hash=?", (ch,)).fetchone()[0]
             assert count >= 3
+        finally:
+            conn.close()
+
+    def test_deps_files_indexed(self, indexed):
+        db_path = _db_path_for_project(indexed)
+        conn = open_db(db_path)
+        try:
+            ch = _config_hash(conn, indexed)
+            row = conn.execute(
+                "SELECT deps_verification FROM build_configs WHERE config_hash=?",
+                (ch,),
+            ).fetchone()
+            assert row is not None, "build_config not found"
+            assert row["deps_verification"] == "full", (
+                f"Expected full deps, got '{row['deps_verification']}'"
+            )
         finally:
             conn.close()
 
@@ -502,24 +651,32 @@ class TestArduinoInitAndIndex:
 class TestMbedOSInitAndIndex:
     """End-to-end: init + index for an Mbed OS 6 project.
 
-    Requires ARM GCC on PATH (~/.local/bin symlinks), bear, and mbed-cli (pyenv 3.11).
-    Skipped when any tool is missing.
+    Requires bear, mbed-cli (pyenv 3.11), and ARM GCC configured in
+    ``~/.mbed/.mbed`` (GCC_ARM_PATH).  Skipped when any tool is missing.
     """
 
     _MBED_ENV = {
         "PYENV_VERSION": "3.11.8",
-        "PATH": os.path.expanduser("~/.pyenv/versions/3.11.8/bin")
-                + ":" + os.path.expanduser("~/.local/bin")
-                + ":" + os.environ.get("PATH", ""),
+        "PATH": os.path.expanduser("~/.pyenv/versions/3.11.8/bin") + ":" + os.environ.get("PATH", ""),
     }
+    _MBED_BIN = Path(os.path.expanduser("~/.pyenv/versions/3.11.8/bin/mbed"))
+    _GCC_ARM = _read_mbed_gcc_arm_path()
 
     @pytest.fixture(scope="class")
     def indexed(self):
         if not shutil.which("bear"):
             pytest.skip("bear not installed")
-        if not Path(os.path.expanduser("~/.local/bin/arm-none-eabi-gcc")).exists():
-            pytest.skip("ARM GCC not found in ~/.local/bin")
-        return _init_and_index(_BUILDS / "mbed_os", extra_env=self._MBED_ENV, timeout=600)
+        if not self._MBED_BIN.exists():
+            pytest.skip(f"mbed-cli not found (expected at {self._MBED_BIN})")
+        if not self._GCC_ARM:
+            pytest.skip("GCC_ARM_PATH not found in ~/.mbed/.mbed")
+        if not Path(self._GCC_ARM, "arm-none-eabi-gcc").exists():
+            pytest.skip(f"ARM GCC not found at {self._GCC_ARM}")
+        return _init_and_index(
+            _BUILDS / "mbed_os",
+            extra_env=self._MBED_ENV,
+            clean_db=True,
+        )
 
     def test_compile_commands_generated(self, indexed):
         entries = json.loads((indexed / "compile_commands.json").read_text())
@@ -530,10 +687,25 @@ class TestMbedOSInitAndIndex:
         conn = open_db(db_path)
         try:
             ch = _config_hash(conn, indexed)
-            count = conn.execute(
-                "SELECT COUNT(*) FROM symbols WHERE config_hash=?", (ch,)
-            ).fetchone()[0]
-            assert count > 500, f"Expected >500 symbols, got {count}"
+            count = conn.execute("SELECT COUNT(*) FROM symbols WHERE config_hash=?", (ch,)).fetchone()[0]
+            # Full index including mbed-os SDK — expect thousands of symbols.
+            assert count > 20000, f"Expected >20000 symbols, got {count}"
+        finally:
+            conn.close()
+
+    def test_deps_files_indexed(self, indexed):
+        db_path = _db_path_for_project(indexed)
+        conn = open_db(db_path)
+        try:
+            ch = _config_hash(conn, indexed)
+            row = conn.execute(
+                "SELECT deps_verification FROM build_configs WHERE config_hash=?",
+                (ch,),
+            ).fetchone()
+            assert row is not None, "build_config not found"
+            assert row["deps_verification"] == "full", (
+                f"Expected full deps, got '{row['deps_verification']}'"
+            )
         finally:
             conn.close()
 
@@ -547,12 +719,20 @@ class TestZephyrInitAndIndex:
 
     _ZEPHYR_BASE = Path(os.path.expanduser("~/ncs/v3.2.3/zephyr"))
     _ZEPHYR_SDK = Path(os.path.expanduser("~/ncs/toolchains/2ac5840438/opt/zephyr-sdk"))
+    _WEST_BIN = Path(os.path.expanduser("~/.pyenv/versions/3.11.8/bin/west"))
 
     _ZEPHYR_ENV = {
         "PYENV_VERSION": "3.11.8",
         "ZEPHYR_BASE": str(_ZEPHYR_BASE),
         "ZEPHYR_SDK_INSTALL_DIR": str(_ZEPHYR_SDK),
-        "PATH": os.environ.get("PATH", ""),
+        "ZEPHYR_TOOLCHAIN_VARIANT": "zephyr",
+        "PATH": (
+            os.path.expanduser("~/.pyenv/versions/3.11.8/bin")
+            + ":"
+            + str(_ZEPHYR_SDK / "arm-zephyr-eabi/bin")
+            + ":"
+            + os.environ.get("PATH", "")
+        ),
     }
 
     @pytest.fixture(scope="class")
@@ -561,11 +741,16 @@ class TestZephyrInitAndIndex:
             pytest.skip("Zephyr base not found")
         if not self._ZEPHYR_SDK.is_dir():
             pytest.skip("Zephyr SDK not found")
-        if not shutil.which("west"):
-            pytest.skip("west not installed")
-        return _init_and_index(_BUILDS / "zephyr", replacements={
-            '[build] board': '"nrf52840dk/nrf52840"',
-        }, extra_env=self._ZEPHYR_ENV, timeout=600)
+        if not self._WEST_BIN.exists():
+            pytest.skip(f"west not installed (expected at {self._WEST_BIN})")
+        return _init_and_index(
+            _BUILDS / "zephyr",
+            replacements={
+                "[build] board": '"nrf52840dk/nrf52840"',
+            },
+            extra_env=self._ZEPHYR_ENV,
+            clean_db=True,
+        )
 
     def test_compile_commands_generated(self, indexed):
         entries = json.loads((indexed / "compile_commands.json").read_text())
@@ -576,10 +761,9 @@ class TestZephyrInitAndIndex:
         conn = open_db(db_path)
         try:
             ch = _config_hash(conn, indexed)
-            count = conn.execute(
-                "SELECT COUNT(*) FROM symbols WHERE config_hash=?", (ch,)
-            ).fetchone()[0]
-            assert count > 200, f"Expected >200 symbols, got {count}"
+            count = conn.execute("SELECT COUNT(*) FROM symbols WHERE config_hash=?", (ch,)).fetchone()[0]
+            # Full index including Zephyr SDK — expect thousands of symbols.
+            assert count > 5000, f"Expected >5000 symbols, got {count}"
         finally:
             conn.close()
 
@@ -588,13 +772,32 @@ class TestZephyrInitAndIndex:
         conn = open_db(db_path)
         try:
             ch = _config_hash(conn, indexed)
-            functions = [r[0] for r in conn.execute(
-                "SELECT name FROM symbols WHERE config_hash=? AND kind='function' AND is_definition=1",
-                (ch,),
-            )]
+            functions = [
+                r[0]
+                for r in conn.execute(
+                    "SELECT name FROM symbols WHERE config_hash=? AND kind='function' AND is_definition=1",
+                    (ch,),
+                )
+            ]
             assert "msg_init" in functions
             assert "msg_send" in functions
             assert "msg_recv" in functions
+        finally:
+            conn.close()
+
+    def test_deps_files_indexed(self, indexed):
+        db_path = _db_path_for_project(indexed)
+        conn = open_db(db_path)
+        try:
+            ch = _config_hash(conn, indexed)
+            row = conn.execute(
+                "SELECT deps_verification FROM build_configs WHERE config_hash=?",
+                (ch,),
+            ).fetchone()
+            assert row is not None, "build_config not found"
+            assert row["deps_verification"] == "full", (
+                f"Expected full deps, got '{row['deps_verification']}'"
+            )
         finally:
             conn.close()
 
@@ -603,26 +806,51 @@ class TestESPIDFInitAndIndex:
     """End-to-end: init + index for an ESP-IDF project.
 
     Requires ESP-IDF environment (idf.py on PATH, IDF_PATH set).
-    Skipped when idf.py is not available.
+    Uses the IDF-bundled CMake 3.30 to work around CMake 4.x incompatibility.
+    Skipped when tools are not available.
     """
 
     _IDF_PATH = Path(os.path.expanduser("~/.espressif/v5.2.5/esp-idf"))
+    _IDF_PYTHON_ENV = Path(os.path.expanduser("~/.espressif/tools/python/v5.2.5/venv"))
+    _IDF_TOOLS = Path(os.path.expanduser("~/.espressif/tools"))
+    _IDF_PY_WRAPPER = Path(os.path.expanduser("~/.local/bin/idf.py"))
+    _IDF_TOOLCHAIN_BIN = Path(
+        os.path.expanduser("~/.espressif/tools/xtensa-esp-elf/esp-13.2.0_20230928/xtensa-esp-elf/bin")
+    )
+    _IDF_CMAKE_BIN = Path(os.path.expanduser("~/.espressif/tools/cmake/3.30.2/bin"))
 
     _IDF_ENV = {
         "IDF_PATH": str(_IDF_PATH),
-        "IDF_TOOLS_PATH": os.path.expanduser("~/.espressif/tools"),
-        "IDF_PYTHON_ENV_PATH": os.path.expanduser("~/.espressif/tools/python/v5.2.5/venv"),
+        "IDF_TOOLS_PATH": str(_IDF_TOOLS),
+        "IDF_PYTHON_ENV_PATH": str(_IDF_PYTHON_ENV),
         "ESP_IDF_VERSION": "5.2",
-        "PATH": os.environ.get("PATH", ""),
+        "IDF_COMPONENT_LOCAL_STORAGE_URL": f"file://{_IDF_TOOLS}",
+        "PATH": (
+            str(_IDF_CMAKE_BIN)
+            + ":"
+            + str(_IDF_TOOLCHAIN_BIN)
+            + ":"
+            + str(_IDF_PYTHON_ENV / "bin")
+            + ":"
+            + os.path.expanduser("~/.local/bin")
+            + ":"
+            + os.environ.get("PATH", "")
+        ),
     }
 
     @pytest.fixture(scope="class")
     def indexed(self):
         if not self._IDF_PATH.is_dir():
-            pytest.skip("ESP-IDF not found")
-        if not shutil.which("idf.py"):
-            pytest.skip("idf.py not installed")
-        return _init_and_index(_BUILDS / "esp_idf", extra_env=self._IDF_ENV, timeout=600)
+            pytest.skip(f"ESP-IDF not found (expected at {self._IDF_PATH})")
+        if not self._IDF_PY_WRAPPER.exists():
+            pytest.skip(f"idf.py wrapper not found (expected at {self._IDF_PY_WRAPPER})")
+        # Use fw-context builder directly — CMake 3.30.2 is on PATH
+        # (via _IDF_ENV) and the idf.py wrapper also prepends it.
+        return _init_and_index(
+            _BUILDS / "esp_idf",
+            extra_env=self._IDF_ENV,
+            clean_db=True,
+        )
 
     def test_compile_commands_generated(self, indexed):
         entries = json.loads((indexed / "compile_commands.json").read_text())
@@ -633,10 +861,25 @@ class TestESPIDFInitAndIndex:
         conn = open_db(db_path)
         try:
             ch = _config_hash(conn, indexed)
-            count = conn.execute(
-                "SELECT COUNT(*) FROM symbols WHERE config_hash=?", (ch,)
-            ).fetchone()[0]
-            assert count > 500, f"Expected >500 symbols, got {count}"
+            count = conn.execute("SELECT COUNT(*) FROM symbols WHERE config_hash=?", (ch,)).fetchone()[0]
+            # Full index including IDF components — expect thousands of symbols.
+            assert count > 20000, f"Expected >20000 symbols, got {count}"
+        finally:
+            conn.close()
+
+    def test_deps_files_indexed(self, indexed):
+        db_path = _db_path_for_project(indexed)
+        conn = open_db(db_path)
+        try:
+            ch = _config_hash(conn, indexed)
+            row = conn.execute(
+                "SELECT deps_verification FROM build_configs WHERE config_hash=?",
+                (ch,),
+            ).fetchone()
+            assert row is not None, "build_config not found"
+            assert row["deps_verification"] == "full", (
+                f"Expected full deps, got '{row['deps_verification']}'"
+            )
         finally:
             conn.close()
 
@@ -659,10 +902,155 @@ class TestConfigHashStability:
 
         cc1 = tmp_path / "cc1.json"
         cc2 = tmp_path / "cc2.json"
-        cc1.write_text(json.dumps([
-            {"file": "a.c", "directory": str(tmp_path), "arguments": ["gcc", "-c", "a.c"]}
-        ]))
-        cc2.write_text(json.dumps([
-            {"file": "b.c", "directory": str(tmp_path), "arguments": ["gcc", "-c", "b.c"]}
-        ]))
+        cc1.write_text(json.dumps([{"file": "a.c", "directory": str(tmp_path), "arguments": ["gcc", "-c", "a.c"]}]))
+        cc2.write_text(json.dumps([{"file": "b.c", "directory": str(tmp_path), "arguments": ["gcc", "-c", "b.c"]}]))
         assert compute(cc1) != compute(cc2)
+
+
+# ── Index statistics ─────────────────────────────────────────────────────────
+
+
+def _collect_project_stats(project_root: Path) -> dict | None:
+    """Collect indexing statistics for a single project."""
+    from fw_context_mcp.config import derive_project_id
+    from fw_context_mcp.config import load as load_config
+
+    cfg = load_config(project_root=project_root)
+    project_id = derive_project_id(project_root)
+    db_path = cfg.index.db_dir / project_id / "index.db"
+
+    if not db_path.exists():
+        return None
+
+    conn = open_db(db_path)
+    try:
+        ch_row = conn.execute(
+            "SELECT config_hash, deps_verification FROM build_configs ORDER BY rowid DESC LIMIT 1"
+        ).fetchone()
+        if ch_row is None:
+            return None
+        config_hash = ch_row["config_hash"]
+        deps = ch_row["deps_verification"]
+
+        file_count = conn.execute(
+            "SELECT COUNT(*) FROM files WHERE config_hash=?", (config_hash,)
+        ).fetchone()[0]
+
+        sym_count = conn.execute(
+            "SELECT COUNT(*) FROM symbols WHERE config_hash=?", (config_hash,)
+        ).fetchone()[0]
+
+        ref_count = conn.execute(
+            "SELECT COUNT(*) FROM refs WHERE config_hash=?", (config_hash,)
+        ).fetchone()[0]
+
+        # File extensions (from files table)
+        ext_rows = conn.execute(
+            "SELECT path FROM files WHERE config_hash=?",
+            (config_hash,),
+        ).fetchall()
+        exts: dict[str, int] = {}
+        for (path,) in ext_rows:
+            suffix = Path(path).suffix.lower()
+            if suffix:
+                exts[suffix] = exts.get(suffix, 0) + 1
+
+        # Symbol kinds (definitions only)
+        kind_rows = conn.execute(
+            """SELECT kind, COUNT(*) FROM symbols
+               WHERE config_hash=? AND is_definition=1
+               GROUP BY kind ORDER BY COUNT(*) DESC""",
+            (config_hash,),
+        ).fetchall()
+        kinds: dict[str, int] = dict(kind_rows)
+
+        return {
+            "name": project_root.name,
+            "deps": deps,
+            "files": file_count,
+            "symbols": sym_count,
+            "refs": ref_count,
+            "exts": exts,
+            "kinds": kinds,
+        }
+    finally:
+        conn.close()
+
+
+def _print_stats_table(all_stats: list[dict]) -> None:
+    """Print a formatted ASCII table of indexing statistics."""
+    if not all_stats:
+        print("\nNo indexed projects found.")
+        return
+
+    # Collect all extension and kind keys for column headers
+    ext_keys: list[str] = []
+    kind_keys: list[str] = []
+    for s in all_stats:
+        for k in s["exts"]:
+            if k not in ext_keys:
+                ext_keys.append(k)
+        for k in s["kinds"]:
+            if k not in kind_keys:
+                kind_keys.append(k)
+    ext_keys.sort()
+    kind_keys.sort()
+
+    # Column definitions: (header, width, key_fn)
+    columns = [
+        ("Project", 16, lambda s: s["name"][:15]),
+        ("Files", 6, lambda s: str(s["files"])),
+        ("Syms", 6, lambda s: str(s["symbols"])),
+        ("Refs", 6, lambda s: str(s["refs"])),
+    ]
+    for ek in ext_keys:
+        columns.append((ek, len(ek) + 1, lambda s, ek=ek: str(s["exts"].get(ek, 0))))
+    for kk in kind_keys:
+        columns.append((kk, len(kk) + 1, lambda s, kk=kk: str(s["kinds"].get(kk, 0))))
+    columns.append(("deps", 8, lambda s: s["deps"]))
+
+    # Build separator and header
+    parts = []
+    header_parts = []
+    for label, width, _fn in columns:
+        parts.append("-" * width)
+        header_parts.append(label.ljust(width))
+    separator = "-+-".join(parts)
+    header = " | ".join(header_parts)
+
+    print("\n" + "=" * len(header))
+    print("Index statistics")
+    print("=" * len(header))
+    print(header)
+    print(separator)
+
+    for s in all_stats:
+        row_parts = []
+        for _label, width, fn in columns:
+            row_parts.append(fn(s).ljust(width))
+        print(" | ".join(row_parts))
+
+    print(separator)
+    print()
+
+
+class TestIndexStatistics:
+    """Print indexing statistics for all test projects that have been indexed."""
+
+    def test_print_statistics(self):
+        """Collect and print statistics for all indexed test projects."""
+        all_stats = []
+        for proj_dir in sorted(_BUILDS.iterdir()):
+            if not proj_dir.is_dir():
+                continue
+            # Skip non-project directories
+            if proj_dir.name.startswith("."):
+                continue
+            if (proj_dir / ".git").exists() or (proj_dir / "src").exists():
+                stats = _collect_project_stats(proj_dir)
+                if stats is not None:
+                    all_stats.append(stats)
+
+        _print_stats_table(all_stats)
+        # Always passes — informational only
+        assert True

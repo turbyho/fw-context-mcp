@@ -229,6 +229,7 @@ _SOURCE_EXTS_WATCH = {".c", ".cpp", ".h", ".hpp"}
 # maintenance.py
 mcp.tool()(maintenance.check_ollama)
 mcp.tool()(maintenance.get_active_build)
+mcp.tool()(maintenance.get_project_info)
 mcp.tool()(maintenance.list_projects)
 mcp.tool()(maintenance.reindex_file)
 mcp.tool()(maintenance.reindex_file_impl)
