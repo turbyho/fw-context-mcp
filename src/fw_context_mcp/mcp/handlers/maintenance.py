@@ -74,6 +74,10 @@ def get_active_build(
     is being built.  ``reindex_progress`` contains the last log line from
     the reindex subprocess when ``bg_reindex_running`` is True.
 
+    Args:
+        project_root: Project root directory. Auto-detected from CWD if
+            omitted.
+
     Returns:
         dict: {config_hash, project_id, project_root, build_system,
         compile_commands, indexed_at (ISO timestamp), symbol_count, file_count,
@@ -271,6 +275,10 @@ def list_projects(
 
     Read-only. No side effects. Use at session start to discover available
     projects; use ``get_active_build`` for details on the currently active project.
+
+    Args:
+        project_root: Project root. Auto-detected if omitted. Pass to
+            distinguish multiple indexed projects.
 
     Returns:
         list of dicts, each with: project_id, name, root_path, build_system,
@@ -687,6 +695,10 @@ def check_ollama(
     expected — pre-computed analysis returns instantly without the LLM
     backend).
 
+    Args:
+        project_root: Project root. Auto-detected if omitted. Ignored
+            by this tool.
+
     Returns:
         dict: {ollama_enabled (bool), status (str — "ok"|"disabled"|"error"|"model_missing"),
         ollama_running (bool), ollama_url (str), configured_model (str),
@@ -725,6 +737,9 @@ def get_project_info(
     system it uses, its name, and where it was last indexed.
 
     Read-only. No side effects.
+
+    Args:
+        project_id: Project ID (UUID4 hex) to look up.
 
     Returns:
         dict: {project_id, name, project_type, root_path, created_at, updated_at}

@@ -252,6 +252,8 @@ def search_code(
     These provide structured descriptions: what the symbol does, what
     parameters/data it receives, and what it returns/produces.
 
+    Read-only. No side effects.
+
     Args:
         query: FTS5 search terms. Keep queries short — 1–3 words.
         project_root: Project root directory. Auto-detected from CWD if omitted.
@@ -522,13 +524,10 @@ async def semantic_search(
 ) -> list[dict]:
     """Semantic search using pre-computed libclang symbol embeddings. Finds
     symbols by meaning, not by text — matches concepts even when query
-    words don't appear literally in the code. Prefer this when describing
-    a concept rather than searching for a known keyword.
-
-    Finds symbols conceptually related to a natural-language query, even when
-    the query words don't appear literally in the code.  Uses cosine similarity
-    over variable-dimension embeddings generated during ``fw-context index``.
-    Dimensions vary by model: mxbai-embed-large → 1024, qwen3-embedding → 4096.
+    words don't appear literally in the code. Uses cosine similarity over
+    variable-dimension embeddings generated during ``fw-context index``.
+    Dimensions vary by model: mxbai-embed-large → 1024,
+    qwen3-embedding → 4096.
 
     **When to prefer over search_code:** When you're describing a *concept*
     rather than searching for a known keyword.  Examples:
@@ -553,6 +552,8 @@ async def semantic_search(
 
     **Requires an LLM** with an embedding model.
     Falls back to ``search_code`` with a warning if the LLM is unavailable.
+
+    Read-only. No side effects.
 
     Args:
         query: Natural language description of what you're looking for.

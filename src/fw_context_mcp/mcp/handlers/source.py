@@ -307,17 +307,24 @@ def get_source(
 ) -> dict:
     """Read a C/C++ function/method/enum/macro body using libclang exact
     extents — no guessing line numbers. Uses AST-precise {start, end}
-    extents so you get exactly the function body. For rich context
-    (callers, callees, analysis) use ``get_symbol_context`` instead.
+    extents so you get exactly the function body. Generic file readers
+    don't know where a function actually ends — libclang tracks exact
+    {start, end} from the AST.
 
-    Generic readers don't know where a function actually ends — libclang
-    tracks exact {start, end} from the AST. For enums, includes a
-    ``constants`` array listing all member constants with their values.
-    For macros, returns kind="macro" with ``value`` (raw definition)
-    and ``expanded_value`` (preprocessor-resolved).
+    For enums, includes a ``constants`` array listing all member constants
+    with their values. For macros, returns kind="macro" with ``value``
+    (raw definition) and ``expanded_value`` (preprocessor-resolved).
 
     For rich context (who calls this, what does it call) use
-    get_symbol_context instead. For the full file, use a normal file read.
+    ``get_symbol_context`` instead — it returns body, callers, and callees
+    in a single call. For the full file, use a normal file read.
+
+    Read-only. No side effects.
+
+    Args:
+        name: Fully qualified symbol name. Returns exact function body
+            via libclang extent.
+        project_root: Project root. Auto-detected if omitted.
 
     Returns:
         dict: {name, qualified_name, kind, file, line, signature,
@@ -418,11 +425,10 @@ def get_file_map(
     reading a chapter: see what functions, classes, and enums a file
     defines at a glance.
 
-    Like a table of contents before reading a chapter. Pass a path relative
-    to the project root (``src/main.cpp``) or just the filename (``main.cpp``).
-    Returns symbols keyed by kind (function, method, class, struct, enum, ...).
-    Each kind has count (total) and items (first N, default 30).
-    Set max_per_kind=0 for unlimited, signatures=true for full sigs.
+    Pass a path relative to the project root (``src/main.cpp``) or just the
+    filename (``main.cpp``). Returns symbols keyed by kind (function, method,
+    class, struct, enum, ...). Each kind has count (total) and items (first N,
+    default 30). Set max_per_kind=0 for unlimited, signatures=true for full sigs.
 
     Enum constants (``enum_constant``) are grouped into ``subgroups`` by
     parent enum. Each subgroup has ``name``, ``count``, and ``constants``
@@ -430,7 +436,10 @@ def get_file_map(
     count reflects the real total even when ``max_per_kind`` limits the
     constants list.
 
-    Read-only: yes. No side effects. Use before reading a large file to
+    For detailed symbol information use ``get_symbol_context`` or
+    ``lookup_symbol``.
+
+    Read-only. No side effects. Use before reading a large file to
     orient yourself — see what functions, classes, and enums it defines.
 
     Args:
@@ -492,16 +501,26 @@ def get_symbol_context(
     the system?" in a single response — libclang powers the call graph,
     not regex. Falls back to macro display when the symbol is not found.
 
-    Prefer this over get_source when you also need callers, callees, indirect
-    call sites, or LLM analysis — all returned in a single call. If you only
-    need the raw function body (no metadata), get_source is slightly faster.
-    For transitive call-graph exploration use find_all_callers_recursive or
-    find_callees_recursive.
+    Prefer this over ``get_source`` when you also need callers, callees,
+    indirect call sites, or LLM analysis — all returned in a single call.
+    If you only need the raw function body (no metadata), ``get_source`` is
+    slightly faster. For transitive call-graph exploration use
+    ``find_all_callers_recursive`` or ``find_callees_recursive``.
 
     By default, SDK/vendor callers and callees are filtered out for clarity.
     Use ``project_only=False`` to see all callers/callees.
 
-    Returns dict with: name, qualified_name, kind, file, line, signature,
+    Read-only. No side effects.
+
+    Args:
+        name: Symbol name. Returns body, signature, all direct callers
+            and callees.
+        project_root: Project root. Auto-detected if omitted.
+        project_only: When True (default), filters callers and callees
+            to project paths (excludes SDK/vendor).
+
+    Returns:
+        dict with: name, qualified_name, kind, file, line, signature,
     is_definition, callers (list), callees (list), source (body text),
     indirect_call_sites (list, for field/variable symbols — where the
     function pointer is actually invoked).
