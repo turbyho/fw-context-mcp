@@ -2,6 +2,9 @@
 BUILD/
 build/
 cmake_build/
+arduino-build/
+.pio/
+mbed-os
 _deps/
 compile_commands.json
 test_app
