@@ -124,7 +124,7 @@ uv pip install -e ".[dev]"
 ### Test
 
 ```bash
-# All tests
+# All tests (test_system_indexing.py is auto-ignored via pyproject.toml addopts)
 python3 -m pytest tests/ -x -q
 
 # Single test file
@@ -136,8 +136,14 @@ python3 -m pytest tests/test_db.py::test_<name> -x -q
 # With verbose output
 python3 -m pytest tests/ -v
 
-# Skip slow tests (quality tests over real projects)
-python3 -m pytest tests/ -x -q -k "not comprehensive"
+# Skip heavy quality tests (comprehensive_quality_check, quality_eval, etc.)
+python3 -m pytest tests/ -x -q -k "not comprehensive and not quality_eval and not search_quality"
+
+# Run only the system indexing tests (takes ~1h — run separately when needed)
+python3 -m pytest tests/test_system_indexing.py -v
+
+# Run only the mbed-os fixture tests
+python3 -m pytest tests/ --ignore=tests/test_system_indexing.py --ignore=tests/comprehensive_quality_check.py --ignore=tests/quality_eval.py --ignore=tests/search_quality_check.py -x -q
 ```
 
 ### Lint and type check

@@ -1,6 +1,6 @@
 [project]
 name = "fw-context-mcp"
-version = "0.18.2"
+version = "0.19.0"
 description = "Build-aware code intelligence MCP server for embedded C/C++ firmware"
 requires-python = ">=3.11"
 license = {text = "MIT"}
@@ -75,6 +75,7 @@ warn_unused_ignores = true
 warn_redundant_casts = true
 
 [tool.pytest.ini_options]
+addopts = ["--ignore=tests/test_system_indexing.py"]
 testpaths = ["tests"]
 markers = [
     "slow: tests that take longer than 2 seconds (full index/reindex via libclang)",
