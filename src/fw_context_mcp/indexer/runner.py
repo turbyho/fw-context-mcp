@@ -34,7 +34,7 @@ from .db import (
     upsert_project,
     write_lock,
 )
-from .dep_files import resolve_dep_path_for_entry
+from .dep_files import parse_dep_file, resolve_dep_path_for_entry
 from .ops import _build_filtered_file_content, store_symbols_for_unit
 
 log = logging.getLogger(__name__)
@@ -1075,38 +1075,60 @@ def _compute_source_hash(file_path: Path) -> str:
 
 
 def _parse_dep_file(d_path: Path) -> list[Path]:
-    """Parse a gcc-generated ``.d`` dependency file and return absolute header paths.
+    """Backward-compatible alias — delegates to :func:`dep_files.parse_dep_file`."""
+    return parse_dep_file(d_path)
 
-    Format::
 
-        build/main.o: src/main.cpp src/main.h lib/utils.h
+def _refresh_header_mtimes(
+    conn: sqlite3.Connection,
+    config_hash: str,
+    project_root: Path,
+    existing_files: dict,
+) -> None:
+    """Refresh stored mtimes for header files that drifted due to VCS operations.
 
-    Returns an empty list for malformed or missing files.
+    Headers in the ``files`` table that are NOT translation units (their
+    ``deps_exist`` column is 0, or they aren't in *existing_files*) may
+    have stale mtimes from ``git checkout`` / ``git merge``.  When every
+    TU passes the Tier 1 mtime fast-path, these headers never get
+    updated — and ``_count_modified_files`` reports them as modified
+    even though no content changed.
+
+    This pass updates the stored mtime to the current on-disk value for
+    any header whose mtime has drifted, is not a TU, and whose path is
+    already tracked in ``files``.
     """
-    try:
-        text = d_path.read_text()
-    except OSError:
-        return []
-    # First line: "target: dep1 dep2 dep3 \"
-    # Continuation lines: "  dep4 dep5"
-    # Join all lines, strip the target part
-    text = text.replace("\\\n", " ")
-    if ":" in text:
-        _, deps_part = text.split(":", 1)
-    else:
-        deps_part = text
-    headers: list[Path] = []
-    for token in deps_part.split():
-        token = token.strip()
-        if not token:
+    rows = conn.execute(
+        "SELECT path, mtime FROM files WHERE config_hash=? AND mtime > 0",
+        (config_hash,),
+    ).fetchall()
+
+    refreshed = 0
+    for r in rows:
+        path = r["path"]
+        stored = r["mtime"]
+        if not stored:
             continue
-        p = Path(token)
+        # Skip TUs — their mtimes are updated during the main loop.
+        # Headers are identified by their extension (not in _SOURCE_EXTS).
+        if Path(path).suffix.lower() in _SOURCE_EXTS:
+            continue
+        p = Path(path)
         if not p.is_absolute():
-            p = d_path.parent / p
-        p = p.resolve()
-        if p.exists() and p.suffix.lower() in {".h", ".hpp", ".hxx", ".hh", ".inl"}:
-            headers.append(p)
-    return headers
+            p = (project_root / path).resolve()
+        try:
+            cur = p.stat().st_mtime
+        except OSError:
+            continue
+        if cur > stored + MTIME_TOLERANCE_S:
+            conn.execute(
+                "UPDATE files SET mtime=? WHERE config_hash=? AND path=?",
+                (cur, config_hash, path),
+            )
+            refreshed += 1
+
+    if refreshed:
+        log.info("header mtimes refreshed: %d", refreshed)
 
 
 def _compute_deps_hash(headers: list[Path], cache: dict[str, str]) -> str:
@@ -1659,23 +1681,61 @@ def run(
 
         if check_status == "unchanged":
             unchanged += 1
-            # If hashes are present (content-hash match, not mtime match),
-            # update stored mtime so future mtime checks still fast-path.
+            # Always update stored mtime so future checks still fast-path —
+            # even when the TU itself didn't change (Tier 1 mtime match),
+            # header dependencies may have been touched by VCS operations
+            # (git checkout/merge) and need their mtimes refreshed.
+            file_path_str = str(unit.file)
+            rec = existing_files.get(file_path_str)
+            file_id = rec[0] if rec else None
+            stored_deps_exist = bool(rec[6]) if rec and len(rec) > 6 else False
+            try:
+                current_mtime = unit.file.stat().st_mtime if unit.file.exists() else 0.0
+            except OSError:
+                current_mtime = 0.0
+
+            deps_exist = False
             with write_lock(db_path.parent, timeout=120.0):
                 if hashes is not None:
+                    # Tier 2: content-hash match — full update including hashes
                     source_hash, flags_hash, deps_hash, deps_exist = hashes
                     content_hash_val = compute_tu_content_hash(source_hash, flags_hash, deps_hash)
-                    file_id = existing_files[str(unit.file)][0]
-                    try:
-                        current_mtime = unit.file.stat().st_mtime if unit.file.exists() else 0.0
-                    except OSError:
-                        current_mtime = 0.0
+                    if file_id is not None:
+                        conn.execute(
+                            """UPDATE files SET mtime=?, content_hash=?, source_hash=?,
+                               flags_hash=?, deps_hash=?, deps_exist=?
+                               WHERE id=?""",
+                            (current_mtime, content_hash_val, source_hash, flags_hash, deps_hash, int(deps_exist), file_id),
+                        )
+                elif file_id is not None:
+                    # Tier 1: mtime match — just refresh stored mtime.
+                    # Without this, _count_modified_files would flag TUs whose
+                    # on-disk mtime drifted even though content didn't change.
                     conn.execute(
-                        """UPDATE files SET mtime=?, content_hash=?, source_hash=?,
-                           flags_hash=?, deps_hash=?, deps_exist=?
-                           WHERE id=?""",
-                        (current_mtime, content_hash_val, source_hash, flags_hash, deps_hash, int(deps_exist), file_id),
+                        "UPDATE files SET mtime=? WHERE id=?",
+                        (current_mtime, file_id),
                     )
+                    deps_exist = stored_deps_exist
+
+                # Refresh dependency header mtimes so _count_modified_files
+                # doesn't keep flagging headers touched by git checkout/merge.
+                # Without this, headers whose content didn't change but got a
+                # new mtime from a VCS operation would remain "stale" until
+                # the next full re-parse (Tier 3) of every including TU.
+                if deps_exist:
+                    dep_path = _find_dep_path(unit)
+                    if dep_path is not None:
+                        for h in _parse_dep_file(dep_path):
+                            try:
+                                h_mtime = h.stat().st_mtime
+                            except OSError:
+                                continue
+                            conn.execute(
+                                """UPDATE files SET mtime=?
+                                   WHERE config_hash=? AND path=?
+                                     AND mtime < ?""",
+                                (h_mtime, config_hash, str(h), h_mtime),
+                            )
                 # Fill ifdef-filtered file content via tokenization
                 # (skipped by store_symbols_for_unit since TU wasn't re-parsed)
                 content_filled += _build_filtered_file_content(conn, unit, config_hash, project_root)
@@ -1747,6 +1807,14 @@ def run(
     )
     if content_filled:
         log.info("ifdef-filtered content: %d files filled", content_filled)
+
+    # ── Refresh header mtimes ──
+    # When only header mtimes have drifted (e.g. from git checkout/merge)
+    # but no TU content changed, the Tier 1 mtime fast-path skips every TU
+    # and the dependency-header mtimes above are never updated (the .d file
+    # may not even exist anymore).  This final pass catches those stragglers
+    # so _count_modified_files doesn't report phantom modifications.
+    _refresh_header_mtimes(conn, config_hash, project_root, existing_files)
 
     # Resolve expanded macro values via clang -dM -E (opt-in, best-effort).
     if index_macros_expanded and units:

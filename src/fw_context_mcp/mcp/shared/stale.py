@@ -9,6 +9,7 @@ from pathlib import Path
 
 from ...config import derive_project_id
 from ...indexer.db import get_active_config, get_file_mtime_indexed
+from ...indexer.dep_files import parse_dep_file
 from ...utils import MTIME_TOLERANCE_S, abs_path
 from .context import _open_db_safe
 
@@ -67,6 +68,11 @@ def _count_modified_files(
     Files with mtime=0 (pre-migration databases) are skipped — their
     mtime is unknown, not "modified".
 
+    Deduplicates by resolved absolute path, keeping the maximum stored
+    mtime.  This prevents false positives from duplicate ``files`` rows
+    (e.g. one with an absolute path whose mtime was updated and one with
+    a relative path whose mtime is stale).
+
     When *use_cache* is True and a cached value is less than
     ``_MTIME_CACHE_TTL`` seconds old AND the DB hasn't been modified
     externally (verified via ``MAX(mtime)`` from the files table),
@@ -94,7 +100,11 @@ def _count_modified_files(
             # Cache stale — remove and recompute
             _modified_cache.pop(config_hash, None)
 
-    modified = 0
+    # Deduplicate by resolved absolute path, keeping the newest stored mtime.
+    # Duplicate rows arise when the same file was indexed under different
+    # path formats (absolute vs relative) — e.g. after a reindex with a
+    # different working directory or compile_commands.json format.
+    best_mtime: dict[str, float] = {}
     rows = conn.execute(
         "SELECT path, mtime FROM files WHERE config_hash=?", (config_hash,)
     ).fetchall()
@@ -102,19 +112,24 @@ def _count_modified_files(
         path = r["path"]
         stored = r["mtime"]
         if not stored:
-            # mtime=0 from a pre-migration database — unknown, skip
             continue
         p = Path(path)
         if not p.is_absolute():
             p = (root / path).resolve()
+        key = str(p)
+        if key not in best_mtime or stored > best_mtime[key]:
+            best_mtime[key] = stored
+
+    modified = 0
+    for key, stored_mtime in best_mtime.items():
         try:
-            if p.stat().st_mtime > stored + MTIME_TOLERANCE_S:
+            if Path(key).stat().st_mtime > stored_mtime + MTIME_TOLERANCE_S:
                 modified += 1
         except OSError:
             pass
 
     if use_cache:
-        max_stored = max((r["mtime"] for r in rows if r["mtime"] > 0), default=0.0)
+        max_stored = max(best_mtime.values(), default=0.0)
         _modified_cache[config_hash] = (time.monotonic(), modified, max_stored)
     return modified
 
@@ -151,6 +166,88 @@ def _auto_reindex_stale(
     return succeeded, failed
 
 
+# ── Header dependency staleness ──
+# Cache for _check_header_staleness results.  Keyed as "deps:{config_hash}".
+# Uses the same TTL as _modified_cache (30 seconds).
+_header_staleness_cache: dict[str, tuple[float, int]] = {}
+
+
+def _check_header_staleness(
+    conn,
+    config_hash: str,
+    root: Path,
+    *,
+    max_files: int = 200,
+    use_cache: bool = True,
+) -> tuple[int, list[str]]:
+    """Count TUs whose header dependencies have changed since indexing.
+
+    Queries the ``files`` table for entries with ``deps_exist=1``,
+    locates the corresponding ``.d`` file on disk, parses it to find
+    included headers, and compares each header's current on-disk mtime
+    against the source file's stored mtime.
+
+    Returns ``(count, affected_files)`` where *count* is the number of
+    TUs with stale headers and *affected_files* is the list of source
+    file paths.
+
+    Performance is bounded by *max_files* (default 200).  When
+    *use_cache* is True (default), results are cached for 30 seconds.
+    Callers that need fresh results (e.g. ``get_active_build``) should
+    pass ``use_cache=False``.
+    """
+    if use_cache:
+        cache_key = f"deps:{config_hash}"
+        cached = _header_staleness_cache.get(cache_key)
+        if cached is not None:
+            ts, count = cached
+            if time.monotonic() - ts < _MTIME_CACHE_TTL:
+                return count, []
+
+    rows = conn.execute(
+        """SELECT path, mtime FROM files
+           WHERE config_hash = ? AND deps_exist = 1
+           ORDER BY path
+           LIMIT ?""",
+        (config_hash, max_files),
+    ).fetchall()
+
+    stale_count = 0
+    affected: list[str] = []
+
+    for r in rows:
+        source_path = r["path"]
+        stored_mtime = r["mtime"]
+        if not stored_mtime:
+            continue
+
+        source_file = Path(source_path)
+        if not source_file.is_absolute():
+            source_file = (root / source_path).resolve()
+
+        # .d file next to the source file (GCC/PlatformIO convention)
+        d_path = source_file.with_suffix(".d")
+        if not d_path.exists():
+            # CMake convention: source.ext.d (e.g. main.c.o.d)
+            d_path = source_file.parent / (source_file.name + ".d")
+            if not d_path.exists():
+                continue
+
+        headers = parse_dep_file(d_path)
+        for header_path in headers:
+            try:
+                if header_path.stat().st_mtime > stored_mtime + MTIME_TOLERANCE_S:
+                    stale_count += 1
+                    affected.append(source_path)
+                    break  # One stale header is enough per TU
+            except OSError:
+                continue
+
+    if use_cache:
+        _header_staleness_cache[cache_key] = (time.monotonic(), stale_count)
+    return stale_count, affected
+
+
 def _with_stale_recovery(
     root: Path,
     db_path: Path,
@@ -167,7 +264,7 @@ def _with_stale_recovery(
 
     Connections are always closed before returning.
     """
-    from ..background import _start_bg_reindex_if_stale  # lazy — avoids circular import
+    from ..background import _ensure_daemon_running  # lazy — avoids circular import
 
     conn, err = _open_db_safe(db_path)
     if err:
@@ -192,7 +289,7 @@ def _with_stale_recovery(
 
     results: list[dict] = []
     if stale_f:
-        _start_bg_reindex_if_stale(root)
+        _ensure_daemon_running(root)
         results.append({"warning": f"Results may be stale — {len(stale_f)} file(s) changed. Background reindex in progress. Run 'fw-context index' to force full update."})
     results += safe_rows
     return results
