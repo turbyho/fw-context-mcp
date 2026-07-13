@@ -82,7 +82,8 @@ def get_inheritance_chain(
             if not cfg_data:
                 return {"error": "No build config indexed."}
             config_hash = cfg_data["config_hash"]
-            row = _lookup_definition(conn, config_hash, class_name)
+            row = _lookup_definition(conn, config_hash, class_name,
+                                     preferred_kinds=("class", "struct"))
             if not row:
                 return {"error": f"Symbol not found: {class_name}"}
             if row["kind"] not in ("class", "struct"):
@@ -231,7 +232,8 @@ def get_class_members(
             if not cfg_data:
                 return {"error": "No build config indexed."}
             config_hash = cfg_data["config_hash"]
-            row = _lookup_definition(conn, config_hash, class_name)
+            row = _lookup_definition(conn, config_hash, class_name,
+                                     preferred_kinds=("class", "struct"))
             if not row:
                 return {"error": f"Symbol not found: {class_name}"}
             if row["kind"] not in ("class", "struct"):
@@ -317,7 +319,8 @@ def get_template_instances(
             if not cfg_data:
                 return [{"error": "No build config indexed."}]
             config_hash = cfg_data["config_hash"]
-            row = _lookup_definition(conn, config_hash, template_name)
+            row = _lookup_definition(conn, config_hash, template_name,
+                                     preferred_kinds=None)
             if not row:
                 return [{"error": f"Symbol not found: {template_name}"}]
             if not row["is_template"]:
@@ -401,7 +404,8 @@ async def get_method_overrides(
             if not cfg_data:
                 return {"error": "No build config indexed."}
             config_hash = cfg_data["config_hash"]
-            row = _lookup_definition(conn, config_hash, method_name)
+            row = _lookup_definition(conn, config_hash, method_name,
+                                     preferred_kinds=("method", "destructor"))
             if not row:
                 return {"error": f"Symbol not found: {method_name}"}
             if row["kind"] not in ("method", "destructor"):

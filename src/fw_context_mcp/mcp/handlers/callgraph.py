@@ -64,7 +64,7 @@ def _references_result(name: str, project_root: str | None, ref_kind: str | list
             if not cfg_data:
                 return [{"error": "No build config indexed."}]
             config_hash = cfg_data["config_hash"]
-            symbol = _lookup_definition(conn, config_hash, name)
+            symbol = _lookup_definition(conn, config_hash, name, preferred_kinds=None)
             if symbol is None:
                 # Macro fallback: check if name is a macro definition
                 macros = lookup_macro(conn, config_hash, name, exact=True, limit=1)
@@ -455,9 +455,9 @@ def find_call_path(
     assert root is not None
     assert config_hash is not None
     try:
-        if _lookup_definition(conn, config_hash, from_name) is None:
+        if _lookup_definition(conn, config_hash, from_name, preferred_kinds=None) is None:
             return [{"error": f"Symbol not found: {from_name}"}]
-        if _lookup_definition(conn, config_hash, to_name) is None:
+        if _lookup_definition(conn, config_hash, to_name, preferred_kinds=None) is None:
             return [{"error": f"Symbol not found: {to_name}"}]
         rows = index_db.find_call_path(conn, config_hash, from_name, to_name, max_depth=max_depth)
         if not rows:
@@ -508,7 +508,7 @@ def find_all_callers_recursive(
     assert root is not None
     assert config_hash is not None
     try:
-        if _lookup_definition(conn, config_hash, name) is None:
+        if _lookup_definition(conn, config_hash, name, preferred_kinds=None) is None:
             return [{"error": f"Symbol not found: {name}"}]
         rows = index_db.find_all_callers_recursive(conn, config_hash, name, max_depth=max_depth, limit=limit)
         if not rows:
@@ -559,7 +559,7 @@ def find_callees_recursive(
     assert root is not None
     assert config_hash is not None
     try:
-        if _lookup_definition(conn, config_hash, name) is None:
+        if _lookup_definition(conn, config_hash, name, preferred_kinds=None) is None:
             return [{"error": f"Symbol not found: {name}"}]
         rows = index_db.find_callees_recursive(conn, config_hash, name, max_depth=max_depth, limit=limit)
         if not rows:
@@ -686,7 +686,7 @@ def find_wrapper_callers(
     assert config_hash is not None
     try:
         # Resolve driver class — check it exists in the index
-        if _lookup_definition(conn, config_hash, class_name) is None:
+        if _lookup_definition(conn, config_hash, class_name, preferred_kinds=None) is None:
             return [{"error": f"Symbol not found: {class_name}"}]
 
         # Find all methods of the class
