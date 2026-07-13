@@ -1,13 +1,13 @@
 """fw-context MCP server — build-aware code intelligence for embedded C/C++ projects.
 
-Serves 31 MCP tools and 3 MCP resources via FastMCP (stdio transport).
+Serves 32 MCP tools and 3 MCP resources via FastMCP (stdio transport).
 
 **Search & lookup tools** (delegate to ``fw_context_mcp.search`` pipeline):
 ``search_code`` (FTS5), ``lookup_symbol`` (exact/prefix), ``smart_search``
 (Ollama-driven), ``semantic_search`` (embeddings + cosine similarity).
 
 **Symbol reading tools:** ``get_source``, ``get_file_map``, ``get_symbol_context``,
-``explain_symbol``.
+``explain_symbol``, ``read_file``.
 
 **Call graph tools** (require ``--refs`` index): ``find_callers``,
 ``find_references``, ``find_call_path``, ``find_all_callers_recursive``,
@@ -54,6 +54,7 @@ mcp = FastMCP(
         '• Symbols by concept/topic _________ → search_code (e.g. "interrupt handler")\n'
         '• Patterns in function BODIES ______ → search_bodies (e.g. "attach", "rise")\n'
         '• Patterns in full FILE content _____ → search_content (e.g. "extern C", "InterruptIn")\n'
+        "• Read a complete file ______________ → read_file\n"
         "• Read function body + callers/callees → get_symbol_context (preferred) / get_source\n"
         "• Function pointer assignments/calls _ → find_indirect_call_sites / find_indirect_targets\n"
         "• Natural-language question ________ → smart_search (slow, thorough)\n\n"
@@ -93,6 +94,8 @@ mcp = FastMCP(
         "• Use external tools for callbacks, ISRs → use find_references or\n"
         "  search_bodies(project_only=True)\n"
         "• Use file readers for function bodies → use get_source (libclang exact extents)\n"
+        "• Use external file readers for C/C++ files → use read_file (returns\n"
+        "  ifdef-filtered content)\n"
         "• Call get_source + find_callers separately → use get_symbol_context for body,\n"
         "  callers, and callees in one call (fewer round-trips, richer data)\n"
         "• Run external search tools in parallel with fw-context\n"
@@ -106,7 +109,7 @@ mcp = FastMCP(
         "  fw-review skill (see REVIEW SKILL section below).\n\n"
         "AGENT LOOP: Check(get_active_build) → Find(search_code/lookup_symbol)\n"
         "→ Read(get_symbol_context) ← preferred (body+callers+callees in one call).\n"
-        "  Fallback: get_source (body only).\n"
+        "  Fallback: get_source (body only). For whole-file reads: read_file.\n"
         "→ Trace(find_references/find_callers) — skip if context already from get_symbol_context.\n"
         "→ For body patterns use search_bodies.\n"
         "→ DECISION after get_active_build():\n"
@@ -159,7 +162,7 @@ mcp = FastMCP(
         "find_indirect_call_sites, find_indirect_targets.\n"
         "Inheritance: get_inheritance_chain, get_class_members,\n"
         "get_template_instances, get_method_overrides.\n"
-        "Source: get_source, get_symbol_context, get_file_map, explain_symbol.\n"
+        "Source: get_source, get_symbol_context, get_file_map, explain_symbol, read_file.\n"
         "Maintenance: reindex_file, reset_index, check_ollama, list_projects.\n\n"
         "REVIEW SKILL — MANDATORY (not optional): When reviewing C/C++ firmware\n"
         "code (diffs, commits, PRs, changed files), your FIRST action MUST be:\n"
@@ -261,6 +264,7 @@ mcp.tool()(source.explain_symbol)
 mcp.tool()(source.get_file_map)
 mcp.tool()(source.get_source)
 mcp.tool()(source.get_symbol_context)
+mcp.tool()(source.read_file)
 
 # inheritance.py
 mcp.tool()(inheritance.get_class_members)
