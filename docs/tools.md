@@ -275,6 +275,48 @@ Config written to: /path/to/project/.fw-context/local.toml
 Run 'fw-context cache stats --remote' to verify.
 ```
 
+### `fw-context watch`
+
+Manage the background watcher daemon that auto-reindexes changed source files.
+
+```bash
+fw-context watch status              # show daemon status
+fw-context watch restart             # restart the daemon
+fw-context watch restart --project /path  # specific project
+```
+
+#### `fw-context watch status`
+
+Show the watcher daemon status for the current project — whether it's running,
+its PID and uptime, the modified file count, and whether a background reindex
+is in progress.
+
+```bash
+$ fw-context watch status
+Project:    my-zephyr-app
+Path:       /home/user/zephyr-app
+DB dir:     /home/user/.fw-context/index/a1b2c3d4
+Daemon:     running (pid 12345, uptime 3600s)
+Socket:     /home/user/.fw-context/index/a1b2c3d4/daemon.sock (active)
+Modified:   3 file(s)
+Index:      idle
+Last index: [45/45] main.cpp: unchanged
+```
+
+#### `fw-context watch restart`
+
+Stop the current watcher daemon (SIGTERM, falls back to SIGKILL after 3 s),
+clean up leftover socket/pid/lock files, and spawn a fresh daemon. Verifies
+the new daemon responds to a ping before returning.
+
+```bash
+$ fw-context watch restart
+Stopping daemon (pid 12345)...
+Old daemon stopped.
+Starting new daemon...
+Daemon restarted successfully.
+```
+
 ### `fw-context version`
 
 Show version information.
@@ -321,7 +363,7 @@ include `summary`, `inputs`, and `outputs` fields with plain-English
 descriptions.
 
 **Progressive relaxation:** when the initial FTS5 search returns nothing, the
-tool automatically broadens the search in up to five steps:
+tool automatically broadens the search in up to six steps:
 
 1. *FTS5 with kind filter* — the original query with the user-provided `kind`
    constraint.
@@ -335,10 +377,12 @@ tool automatically broadens the search in up to five steps:
    to catch terms the FTS5 tokeniser may have missed.
 5. *Individual term FTS5* — searches each query word separately and merges
    the results.
+6. *Macro FTS5 fallback* — searches the ``macros_fts`` table for matching
+   ``#define`` names and values (``kind="macro"``, ``_fallback="macros_fts"``).
 
 Results from fallback steps carry `_fallback` indicating which method
-succeeded: `"fts5"`, `"name_tokens_like"`, `"docstring_like"`, or
-`"individual_terms"`. Results from the primary FTS5 path have
+succeeded: `"fts5"`, `"name_tokens_like"`, `"docstring_like"`,
+`"individual_terms"`, or `"macros_fts"`. Results from the primary FTS5 path have
 `"_fallback": "fts5+kind"` or omit the field.
 
 **FTS5 syntax:**
@@ -347,7 +391,7 @@ succeeded: `"fts5"`, `"name_tokens_like"`, `"docstring_like"`, or
 - `modem init` — both terms (AND for `search_code`). Underscore is a word separator — `modem_init` is treated as `modem AND init`
 - **For `search_bodies` and `search_content`:** bare multi-word queries are OR-joined (each term prefix-wildcarded) — prefer single-word queries
 
-**Kind filter:** `function`, `method`, `constructor`, `destructor`, `class`, `struct`, `enum`, `enum_constant`, `typedef`, `variable`, `field`, `namespace`
+**Kind filter:** `function`, `method`, `constructor`, `destructor`, `class`, `struct`, `union`, `enum`, `enum_constant`, `typedef`, `variable`, `field`, `namespace`
 
 #### `search_bodies`
 
@@ -981,12 +1025,13 @@ Output: {"config_hash": "a1b2…", "project_id": "c3d4…", "project_root": "/pa
          "build_system": "zephyr", "compile_commands": "/path/build/compile_commands.json",
          "indexed_at": "2026-06-05T09:35:18", "symbol_count": 12430, "file_count": 1502,
          "reference_count": 8900, "modified_files_count": 3,
+         "header_affected_tus": 0, "deps_verification": "full",
          "schema_version": 84935291, "current_schema": 84935291,
          "analyzed_symbols": 8450, "unanalyzed_symbols": 120,
          "analysis_model": "qwen2.5-coder:14b",
          "bg_reindex_running": false, "reindex_progress": null,
          "status": "ready", "reindex_needed": false, "reindex_reasons": [],
-         "index_message": "Index is up to date — 12430 symbols in 1502 files."}
+         "index_message": "Index is fully up to date (12430 symbols)"}
 ```
 
 **Read-only.** No side effects — does not spawn background tasks.
@@ -1005,9 +1050,14 @@ a background reindex is active and its last log line.
 | ``"error"`` | DB corruption or access error | Use other tools |
 
 ``modified_files_count`` is cached for 30 seconds (calls within that window
-return the same value). ``unanalyzed_symbols`` counts definition symbols that
-still need LLM analysis (zero when analysis is disabled, empty when all
-symbols are analyzed).
+return the same value). ``header_affected_tus`` reports how many translation
+units have stale header dependencies — non-zero when headers changed since the
+last index with ``deps_verification: "full"``. ``deps_verification`` is
+``"full"`` (``.d`` dependency files available — header staleness is tracked),
+``"partial"`` (some ``.d`` files exist but not all), or ``"none"``
+(no dependency tracking — header changes cannot be detected).
+``unanalyzed_symbols`` counts definition symbols that still need LLM analysis
+(zero when analysis is disabled, empty when all symbols are analyzed).
 
 #### `reindex_file`
 
@@ -1061,6 +1111,22 @@ Output: [{"project_id": "a1b2…", "name": "my-zephyr-app", "root_path": "/path"
           "build_system": "zephyr", "symbol_count": 12430, "file_count": 1502,
           "indexed_at": "2026-06-05T09:35:18", "stale": false, "db": "…"}, …]
 ```
+
+#### `get_project_info`
+
+Look up project metadata from the global project registry.
+
+```
+Input:  {"project_id": "a1b2c3d4…"}
+Output: {"project_id": "a1b2c3d4…", "name": "my-zephyr-app",
+         "project_type": "zephyr", "root_path": "/path/to/project",
+         "created_at": "2026-06-01T12:00:00", "updated_at": "2026-06-05T09:35:18"}
+```
+
+Looks up the global project registry at ``~/.fw-context/projects.db``. Use this
+to identify a project from its UUID4 — find out what build system it uses, its
+name, and where it was last indexed. Returns an error when the `project_id` is
+not registered.
 
 #### `check_ollama`
 
