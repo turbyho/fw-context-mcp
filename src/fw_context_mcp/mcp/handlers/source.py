@@ -18,7 +18,7 @@ from ...indexer.db import (
     lookup_macro,
 )
 from ...llm.ollama import OllamaError, OllamaModelNotFoundError, call_ollama_async
-from ...utils import abs_path
+from ...utils import abs_path, read_file_lines
 from ..shared.context import _open_db_safe, _resolve_context
 from ..shared.filtering import _build_sdk_excludes, _path_matches
 
@@ -740,4 +740,112 @@ def get_symbol_context(
         result["overridden_by"] = overrides_info["overridden_by"]
     if source:
         result["source"] = source[:8000] if len(source) > 8000 else source
+    return result
+
+
+# ── moved from server.py ──
+def read_file(
+    file_path: Annotated[str, Field(description="Path to source file — relative to project root or just filename.")],
+    project_root: Annotated[str | None, Field(description="Project root. Auto-detected if omitted.")] = None,
+) -> dict:
+    """Read a complete C/C++ source file with **ifdef-filtered** content —
+    only code that actually compiles for the current build configuration.
+    Inactive ``#ifdef`` branches are replaced with blank lines (preserving
+    original line numbers).
+
+    Use this to read a file without leaving the fw-context ecosystem.
+    Unlike generic file readers, this tool returns build-accurate content:
+    code gated behind ``#ifdef BOARD_V2`` stays visible only when
+    ``BOARD_V2`` is actually defined for this build.  Line numbers match
+    the original file — inactive branches appear as blank lines.
+
+    For reading a single function body with libclang exact extents use
+    ``get_source``.  For body + callers + callees in one call use
+    ``get_symbol_context``.  For a structural overview without content use
+    ``get_file_map``.  For searching patterns across files use
+    ``search_content``.
+
+    Read-only. No side effects.  Falls back to raw disk content (with a
+    warning) when the indexed ``files.content`` column is empty — e.g. on
+    a legacy index that predates this feature.  Run ``fw-context index``
+    to populate the ifdef-filtered content.
+
+    Args:
+        file_path: Path relative to project root, or just the filename.
+            E.g. ``src/main.cpp`` or ``main.cpp``.
+        project_root: Project root. Auto-detected if omitted.
+
+    Returns:
+        dict: {file (str), language (str — ``"c"`` or ``"cpp"``),
+        mtime (float), lines (int — total line count),
+        content (str — the complete ifdef-filtered file text),
+        warning (str, optional — when reading from raw disk instead of
+        indexed content)}.
+    """
+    db_path, cfg, project_id, root = _resolve_context(project_root)
+    if not db_path.exists():
+        return {"error": f"No index found for {root}. Run 'fw-context index' first."}
+    conn, err = _open_db_safe(db_path)
+    if err:
+        return err
+    assert conn is not None
+    try:
+        with conn:
+            cfg_data = get_active_config(conn, project_id)
+            if not cfg_data:
+                return {"error": "No build config indexed."}
+            config_hash = cfg_data["config_hash"]
+
+            # Resolve file_path: try exact match first, then suffix match
+            exact = conn.execute(
+                "SELECT COUNT(*) FROM files WHERE config_hash=? AND path=?",
+                (config_hash, file_path),
+            ).fetchone()[0]
+            if not exact:
+                candidates = conn.execute(
+                    "SELECT path FROM files WHERE config_hash=? AND path LIKE ? LIMIT 3",
+                    (config_hash, f"%{file_path}"),
+                ).fetchall()
+                if not candidates:
+                    return {
+                        "error": f"File not found in index: {file_path}. "
+                        f"Check the path — use relative paths like 'src/main.cpp'."
+                    }
+                resolved = min((c["path"] for c in candidates), key=len)
+            else:
+                resolved = file_path
+
+            row = conn.execute(
+                "SELECT content, language, path, mtime FROM files WHERE config_hash=? AND path=?",
+                (config_hash, resolved),
+            ).fetchone()
+    finally:
+        conn.close()
+
+    if not row:
+        return {"error": f"File not found in index: {file_path}"}
+
+    content = row["content"] or ""
+    result: dict = {
+        "file": abs_path(root, row["path"]),
+        "language": row["language"],
+        "mtime": row["mtime"],
+    }
+
+    if content:
+        lines_list = content.splitlines()
+        result["lines"] = len(lines_list)
+        result["content"] = content
+    else:
+        # Fallback: raw disk read for legacy indexes without ifdef-filtered content
+        disk_lines = read_file_lines(abs_path(root, resolved))
+        if disk_lines is None:
+            return {"error": f"Could not read file: {abs_path(root, resolved)}"}
+        result["lines"] = len(disk_lines)
+        result["content"] = "".join(disk_lines)
+        result["warning"] = (
+            "Raw disk content — ifdef-filtered content not available. "
+            "Run 'fw-context index' to populate build-accurate content."
+        )
+
     return result

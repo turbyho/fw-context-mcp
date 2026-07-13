@@ -650,6 +650,27 @@ can detect uncertainty from this signal.
 For enums, includes a ``constants`` array with all member constants and their
 values (same shape as `get_source`). Enum constants include `enum_value`.
 
+#### `read_file`
+
+Read a complete source file with ifdef-filtered content — only code that
+actually compiles for the current build configuration. Inactive `#ifdef`
+branches are replaced with blank lines (preserving original line numbers).
+
+```
+Input:  {"file_path": "src/modem.c", "project_root?": "/path/to/project"}
+Output: {"file": "/path/src/modem.c", "language": "c", "mtime": 1748534400.0,
+         "lines": 512, "content": "/* Modem driver */\n\n#include \"modem.h\"\n…"}
+```
+
+Unlike generic file readers, this returns build-accurate content — code
+gated behind `#ifdef BOARD_V2` is visible only when `BOARD_V2` is defined
+for this build.
+
+The path can be relative to the project root (`src/main.cpp`) or just the
+filename (`main.cpp`). Falls back to raw disk content (with a `warning`)
+when the indexed `files.content` column is empty — run
+`fw-context index` to populate ifdef-filtered content.
+
 ### Call graph
 
 All graph tools use the cross-reference index. Enabled by default —
