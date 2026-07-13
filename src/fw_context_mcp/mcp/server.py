@@ -1,6 +1,6 @@
 """fw-context MCP server — build-aware code intelligence for embedded C/C++ projects.
 
-Serves 32 MCP tools and 3 MCP resources via FastMCP (stdio transport).
+Serves 33 MCP tools and 3 MCP resources via FastMCP (stdio transport).
 
 **Search & lookup tools** (delegate to ``fw_context_mcp.search`` pipeline):
 ``search_code`` (FTS5), ``lookup_symbol`` (exact/prefix), ``smart_search``
