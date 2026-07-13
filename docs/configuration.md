@@ -25,7 +25,7 @@ to git. `local.toml` holds developer-specific settings — which Ollama model yo
 have installed, where your index database lives, whether you want LLM analysis
 enabled. Keep it out of git.
 
-Run ``fw-context project-init`` to auto-create the config files and add the
+Run ``fw-context init`` to auto-create the config files and add the
 necessary entries to ``.gitignore``. All files are created with commented-out
 defaults on first use.
 

@@ -68,23 +68,6 @@ fw-context index --source-roots src lib drivers
 | **Make** | `bear -- make` |
 | **Custom** | `bear -- <your-build-command>` |
 
-### `fw-context project-init`
-
-Initialize or verify project-level configuration.
-
-```bash
-fw-context project-init                     # create configs, update .gitignore
-fw-context project-init --project /path     # specific project
-```
-
-What it does:
-1. Creates `.fw-context/config.toml` and `.fw-context/local.toml` with defaults (idempotent)
-2. Adds `compile_commands.json` and `.fw-context/local.toml` to `.gitignore`
-3. Auto-detects the build system
-4. Checks `compile_commands.json` for completeness
-
-Run after `fw-context init` or when setting up a new clone.
-
 ### `fw-context search`
 
 Full-text search over indexed symbols from the command line.
