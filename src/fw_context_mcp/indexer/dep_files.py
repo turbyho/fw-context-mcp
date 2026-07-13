@@ -111,3 +111,41 @@ def resolve_dep_path_for_entry(entry: dict, directory: Path) -> Path | None:
                 return dep
 
     return None
+
+
+def parse_dep_file(d_path: Path) -> list[Path]:
+    """Parse a gcc-generated ``.d`` dependency file and return absolute header paths.
+
+    Format::
+
+        build/main.o: src/main.cpp src/main.h lib/utils.h
+
+    Returns an empty list for malformed or missing files.
+
+    This is a public utility shared between the indexer (``runner.py``) and
+    query-time staleness detection (``mcp/shared/stale.py``).
+    """
+    try:
+        text = d_path.read_text()
+    except OSError:
+        return []
+    # First line: "target: dep1 dep2 dep3 \\"
+    # Continuation lines: "  dep4 dep5"
+    # Join all lines, strip the target part
+    text = text.replace("\\\n", " ")
+    if ":" in text:
+        _, deps_part = text.split(":", 1)
+    else:
+        deps_part = text
+    headers: list[Path] = []
+    for token in deps_part.split():
+        token = token.strip()
+        if not token:
+            continue
+        p = Path(token)
+        if not p.is_absolute():
+            p = d_path.parent / p
+        p = p.resolve()
+        if p.exists() and p.suffix.lower() in {".h", ".hpp", ".hxx", ".hh", ".inl"}:
+            headers.append(p)
+    return headers

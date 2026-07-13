@@ -34,7 +34,7 @@ from ...llm.ollama import check_setup
 from ...utils import resolve_project_root
 from ..background import _is_bg_reindex_running
 from ..shared.context import _db_path, _detect_build_system, _is_stale, _open_db_safe, _resolve_context
-from ..shared.stale import _count_modified_files
+from ..shared.stale import _check_header_staleness, _count_modified_files
 
 log = logging.getLogger(__name__)
 
@@ -120,7 +120,15 @@ def get_active_build(
                 "SELECT COUNT(*) FROM files WHERE config_hash=?", (config_hash,)
             ).fetchone()[0]
             ref_count = count_refs(conn, config_hash)
+            deps_verification = cfg["deps_verification"] if "deps_verification" in cfg else "none"
             modified_count = _count_modified_files(conn, config_hash, root, use_cache=False)
+            # Check header dependencies separately (different metric: TUs, not files)
+            if deps_verification == "full":
+                header_affected_tus, _ = _check_header_staleness(
+                    conn, config_hash, root, use_cache=False,
+                )
+            else:
+                header_affected_tus = 0
             db_schema_ver = get_db_schema_version(conn)
 
             # LLM analysis statistics
@@ -175,9 +183,6 @@ def get_active_build(
             else:
                 status = "ready"
 
-            # Read deps verification level from the build config
-            deps_verification = cfg["deps_verification"] if "deps_verification" in cfg else "none"
-
             # Build human-readable index message
             if status == "ready":
                 index_message = f"Index is fully up to date ({sym_count} symbols)"
@@ -221,6 +226,12 @@ def get_active_build(
                 )
                 index_message += f" — deps verification: {deps_verification} (run 'fw-context index' for full tracking)"
 
+            if header_affected_tus:
+                index_message += (
+                    f" | {header_affected_tus} TU(s) have stale header "
+                    f"dependencies — header changes since last index"
+                )
+
             result: dict = {
                 "config_hash": config_hash,
                 "project_id": project_id,
@@ -232,6 +243,7 @@ def get_active_build(
                 "file_count": file_count,
                 "reference_count": ref_count,
                 "modified_files_count": modified_count,
+                "header_affected_tus": header_affected_tus,
                 "schema_version": db_schema_ver,
                 "current_schema": CURRENT_SCHEMA_VERSION,
                 "analyzed_symbols": analyzed_count,
