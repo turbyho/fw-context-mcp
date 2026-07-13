@@ -841,6 +841,8 @@ def cmd_init(args: argparse.Namespace) -> int:
 
     from .config.settings import _ensure_project_config, _ensure_project_local_config
     from .config.tools import TOOLS, check_target
+    from .indexer.build import detect_build_system
+    from .utils import resolve_project_root
 
     # --list-tools: show supported tools and detection status
     if args.list_tools:
@@ -866,7 +868,7 @@ def cmd_init(args: argparse.Namespace) -> int:
         if dev_candidate.exists():
             mcp_bin = str(dev_candidate)
 
-    project_root = Path.cwd() if not args.project else Path(args.project).resolve()
+    project_root = resolve_project_root(args.project)
 
     # ── Generate project ID if missing ──
     from .config.settings import _write_project_id, generate_project_id as _gen_pid
@@ -1017,17 +1019,83 @@ def cmd_init(args: argparse.Namespace) -> int:
                 print(f"  [ok] {resolved}: written")
             ok = True
 
-    # Project-level config and assets (skills, agents)
+    # ── Project-level config and assets (skills, agents) ──
+    _build_system = detect_build_system(project_root)
     if ok and not args.dry_run:
         if not args.instructions_only:
             proj_config = _ensure_project_config(project_root)
             local_config = _ensure_project_local_config(project_root)
             print(f"\n[ok] {proj_config}: shared project config ready — edit source_roots, excludes, etc. (commit to git)")
             print(f"[ok] {local_config}: local developer config ready — edit ollama_url, model, etc. (gitignore)")
-            print("  Run 'fw-context project-init' to set up .gitignore and verify project configuration.")
-            print()
+            # Check config files for missing template keys
+            from .config.settings import (
+                _PROJECT_DEFAULTS_TEMPLATE,
+                _PROJECT_LOCAL_DEFAULTS_TEMPLATE,
+            )
+            _check_config_file(project_root, ".fw-context/config.toml", _PROJECT_DEFAULTS_TEMPLATE, fix=True)
+            _check_config_file(project_root, ".fw-context/local.toml", _PROJECT_LOCAL_DEFAULTS_TEMPLATE, fix=True)
+            # .gitignore management
+            _ensure_gitignore(project_root, fix=True, build_system=_build_system)
         _install_skills(dry_run=False, project_root=project_root, scope=args.scope)
         _install_agents(dry_run=False, project_root=project_root, scope=args.scope)
+
+    # ── Diagnostic output (always shown, independent of AI tool detection) ──
+    if not args.dry_run:
+        print()
+        if _build_system:
+            print(f"  Build system: {_build_system}")
+        else:
+            print("  Build system: none detected — set [build] system in config.toml")
+
+        # compile_commands.json status
+        _cc = _proj_cfg.index.compile_commands
+        if not _cc.is_absolute():
+            _cc = (project_root / _cc).resolve()
+        if _cc.exists():
+            from .indexer.build import check_completeness
+            _issues = list(check_completeness(_cc, project_root))
+            if _issues:
+                print("  compile_commands.json: present but incomplete")
+                for w in _issues:
+                    print(f"    {w}")
+            else:
+                print("  compile_commands.json: ok")
+        else:
+            print("  compile_commands.json: not found — run 'fw-context index --build'")
+
+        # Index health
+        from .indexer.db import get_active_config, open_db as _db_open
+        _db_path = _proj_cfg.index.db_dir / proj_id / "index.db"
+        if _db_path.exists():
+            _conn = None
+            try:
+                _conn = _db_open(_db_path)
+                _active = get_active_config(_conn, proj_id)
+                if _active:
+                    _sym_count = _conn.execute(
+                        "SELECT COUNT(*) FROM symbols WHERE config_hash=?",
+                        (_active["config_hash"],),
+                    ).fetchone()[0]
+                    print(f"  index: {_sym_count} symbols")
+                    _emb_count = _conn.execute(
+                        "SELECT COUNT(*) FROM embeddings e JOIN symbols s ON s.id = e.symbol_id WHERE s.config_hash = ?",
+                        (_active["config_hash"],),
+                    ).fetchone()[0]
+                    if _emb_count == 0:
+                        print("  index: no embeddings yet — run 'fw-context index' to generate")
+                    _ana_count = _conn.execute(
+                        "SELECT COUNT(*) FROM llm_analysis a JOIN symbols s ON s.id = a.symbol_id WHERE s.config_hash = ?",
+                        (_active["config_hash"],),
+                    ).fetchone()[0]
+                    if _ana_count == 0:
+                        print("  index: no LLM symbol analysis yet — run 'fw-context index' to generate")
+            except Exception as e:
+                print(f"  index: cannot read — {e}")
+            finally:
+                if _conn is not None:
+                    _conn.close()
+        else:
+            print("  index: not yet built — run 'fw-context index'")
 
     if warnings:
         print("\nWarnings:")
@@ -1043,122 +1111,6 @@ def cmd_init(args: argparse.Namespace) -> int:
     else:
         print("\nNo changes made.", file=sys.stderr)
     return 0 if ok else 1
-
-
-def cmd_project_init(args: argparse.Namespace) -> int:
-    """Verify or fix project-level fw-context configuration.
-
-    Without ``--fix``: reports the current state of config files,
-    ``.gitignore`` entries, build system detection, and index freshness.
-
-    With ``--fix``: creates missing config files, adds missing
-    ``.gitignore`` entries, and appends missing config options to
-    existing files.
-    """
-    from .config import load as load_config
-    from .config.settings import (
-        _PROJECT_DEFAULTS_TEMPLATE,
-        _PROJECT_LOCAL_DEFAULTS_TEMPLATE,
-    )
-    from .utils import resolve_project_root
-
-    project_root = resolve_project_root(args.project)
-    cfg = load_config(project_root=project_root)
-    fix = args.fix
-
-    label = "[fix]" if fix else "[info]"
-    print(f"{label} Project: {project_root}")
-    if fix:
-        print("Mode: fix — applying corrections\n")
-    else:
-        print("Mode: verify — use --fix to apply corrections\n")
-
-    # ── 1. Config files ──
-    _check_config_file(
-        project_root,
-        ".fw-context/config.toml",
-        _PROJECT_DEFAULTS_TEMPLATE,
-        fix,
-    )
-    _check_config_file(
-        project_root,
-        ".fw-context/local.toml",
-        _PROJECT_LOCAL_DEFAULTS_TEMPLATE,
-        fix,
-    )
-
-    # ── 2. .gitignore entries ──
-    from .indexer.build import detect_build_system
-
-    build_system = detect_build_system(project_root)
-    _ensure_gitignore(project_root, fix=fix, build_system=build_system)
-
-    # ── 3. Build system ──
-    if build_system:
-        print(f"  [ok] build system: {build_system}")
-    elif fix:
-        print("  [warn] no build system detected — set [build] system in config.toml")
-    else:
-        print("  [warn] no build system detected — set [build] system in config.toml")
-
-    # ── 4. compile_commands.json ──
-    cc = cfg.index.compile_commands
-    if not cc.is_absolute():
-        cc = (project_root / cc).resolve()
-    if cc.exists():
-        from .indexer.build import check_completeness
-
-        issues = list(check_completeness(cc, project_root))
-        if issues:
-            print(f"  [warn] {cc}:")
-            for w in issues:
-                print(f"         {w}")
-        else:
-            print(f"  [ok] {cc}")
-    else:
-        print(f"  [info] {cc} not found — run 'fw-context index --build' to build and index")
-
-    # ── 5. Index health ──
-    from .config import derive_project_id
-    from .indexer.db import get_active_config, open_db as db_open
-
-    project_id = derive_project_id(project_root)
-    db_path = cfg.index.db_dir / project_id / "index.db"
-    if db_path.exists():
-        try:
-            conn = db_open(db_path)
-            active = get_active_config(conn, project_id)
-            if active:
-                sym_count = conn.execute(
-                    "SELECT COUNT(*) FROM symbols WHERE config_hash=?",
-                    (active["config_hash"],),
-                ).fetchone()[0]
-                print(f"  [ok] index: {sym_count} symbols")
-                # Check embeddings
-                emb_count = conn.execute(
-                    "SELECT COUNT(*) FROM embeddings e JOIN symbols s ON s.id = e.symbol_id WHERE s.config_hash = ?",
-                    (active["config_hash"],),
-                ).fetchone()[0]
-                if emb_count == 0:
-                    print("  [info] no embeddings yet — run 'fw-context index' to generate")
-                # Check LLM analysis
-                ana_count = conn.execute(
-                    "SELECT COUNT(*) FROM llm_analysis a JOIN symbols s ON s.id = a.symbol_id WHERE s.config_hash = ?",
-                    (active["config_hash"],),
-                ).fetchone()[0]
-                if ana_count == 0:
-                    print("  [info] no LLM symbol analysis yet — run 'fw-context index' to generate")
-            conn.close()
-        except Exception as e:
-            print(f"  [warn] cannot read index: {e}")
-    else:
-        print("  [info] no index yet — run 'fw-context index' to build")
-
-    if fix:
-        print("\nProject fixed. Run 'fw-context index' to (re)build the index.")
-    else:
-        print("\nProject verified. Run 'fw-context project-init --fix' to apply corrections.")
-    return 0
 
 
 def _check_config_file(project_root: Path, rel_path: str, template: str, fix: bool) -> None:
@@ -2283,13 +2235,6 @@ def main() -> None:
     p_export.add_argument("-o", "--output", metavar="PATH", help="Output file (default: stdout)")
     p_export.add_argument("--no-refs", action="store_true", help="Omit cross-references")
     p_export.set_defaults(func=cmd_export)
-
-    p_project_init = sub.add_parser(
-        "project-init", help="Verify or fix project setup (config, .gitignore, build system)"
-    )
-    p_project_init.add_argument("--project", metavar="DIR", help="Project root (default: cwd)")
-    p_project_init.add_argument("--fix", action="store_true", help="Apply fixes for detected issues")
-    p_project_init.set_defaults(func=cmd_project_init)
 
     p_analyze = sub.add_parser("analyze", help="Re-run LLM symbol analysis on existing index (idempotent)")
     p_analyze.add_argument("-v", "--verbose", action="store_true")
