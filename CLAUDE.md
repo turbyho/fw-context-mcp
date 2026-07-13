@@ -84,6 +84,7 @@ Don't introduce new top-level modules without a plan.
 - Commit messages are in English
 - Conventional Commits prefix: `feat:`, `fix:`, `chore:`, `docs:`, `refactor:`,
   `test:`, `perf:`, `ci:`, `build:`
+- **GPG-signed** — all commits must be signed (`-S` flag, `commit.gpgsign = true`)
 - **UTF-8 without BOM** — no byte order mark at the start of files
 - **LF** (`\n`) — Unix line endings, never CRLF
 - **Unicode normalization NFC** — normalize Unicode characters to NFC form
