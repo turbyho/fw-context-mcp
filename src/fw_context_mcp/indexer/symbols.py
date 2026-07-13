@@ -545,6 +545,33 @@ def _is_fn_ptr_type(t: cx.Type) -> bool:
     return False
 
 
+def _first_child_unwrapped(cursor: cx.Cursor) -> cx.Cursor | None:
+    """Return the first child of *cursor*, unwrapping ``UNEXPOSED_EXPR`` nodes.
+
+    Used to extract the callee expression from a ``CALL_EXPR`` when
+    ``cursor.referenced`` is ``None`` — the first child is the callee,
+    subsequent children are arguments.  ``UNEXPOSED_EXPR`` wrappers
+    (common in template instantiations and macro expansions) are
+    unwrapped recursively until a concrete expression kind is reached.
+    """
+    try:
+        children = list(cursor.get_children())
+    except Exception:
+        return None
+    if not children:
+        return None
+    first = children[0]
+    while first.kind == cx.CursorKind.UNEXPOSED_EXPR:
+        try:
+            grandkids = list(first.get_children())
+        except Exception:
+            break
+        if not grandkids:
+            break
+        first = grandkids[0]
+    return first
+
+
 def _call_expr_text(cursor: cx.Cursor) -> str:
     """Extract callee expression text from a CALL_EXPR's token stream.
 
@@ -1203,6 +1230,15 @@ def extract_all(
         # variable, or parameter.  libclang resolves cursor.referenced to the
         # FIELD_DECL / VAR_DECL / PARM_DECL (not a FUNCTION_DECL), so we
         # check the type directly on the callee cursor.
+        #
+        # Two paths:
+        #   1) cursor.referenced → direct decl (field/variable/parameter)
+        #      e.g. obj->callback(args), stored_cb(args)
+        #   2) Fallback — the callee is an expression that cursor.referenced
+        #      cannot resolve.  Walk the CALL_EXPR's first child (the callee
+        #      expression) and extract the underlying variable/field USR:
+        #      e.g. handlers[irq](args)        (ArraySubscriptExpr)
+        #           obj->callbacks[idx](args)   (ArraySubscriptExpr over member)
         if cursor.kind == cx.CursorKind.CALL_EXPR:
             loc = cursor.location
             if loc.file and _in_roots(loc.file.name) and _not_excluded(loc.file.name):
@@ -1221,6 +1257,30 @@ def extract_all(
                             target_name=callee.spelling,
                             fn_ptr_type=callee.type.spelling,
                         ))
+                else:
+                    # Fallback: callee is an expression (ArraySubscriptExpr,
+                    # UNEXPOSED_EXPR, etc.) that cursor.referenced cannot
+                    # resolve.  Only inspect the first child of CALL_EXPR
+                    # (the callee expression) — not arguments — unwrapping
+                    # UNEXPOSED_EXPR.  Then extract the underlying variable
+                    # or field USR so the call site links to fp_assignments.
+                    callee_expr = _first_child_unwrapped(cursor)
+                    if callee_expr is not None and _is_fn_ptr_type(callee_expr.type):
+                        target_usr, target_name = _extract_lhs_field(callee_expr)
+                        if target_usr:
+                            try:
+                                _fn_ptr_spelling = callee_expr.type.spelling
+                            except Exception:
+                                _fn_ptr_spelling = ""
+                            indirect_call_sites.append(IndirectCallSite(
+                                from_file=loc.file.name,
+                                from_line=loc.line,
+                                from_usr=cur_fn,
+                                expr_text=_call_expr_text(cursor),
+                                target_usr=target_usr,
+                                target_name=target_name,
+                                fn_ptr_type=_fn_ptr_spelling,
+                            ))
 
         # --- Indirect calls: function pointers passed as arguments ---
         # e.g. callback(&Class::method, this), Thread::start(callback(...)),

@@ -1370,3 +1370,178 @@ class TestSearchBodies:
         ).fetchall()
         assert len(proj_rows) == 1
         assert proj_rows[0][0] == "_rx_handler"
+
+
+class TestIndirectCallSitesArraySubscript:
+    """Verify that ``extract_all`` detects indirect calls through array subscripts.
+
+    Regression test: ``handlers[irq](args)`` (ArraySubscriptExpr callee) was
+    not detected because ``cursor.referenced`` is ``None`` for indirect calls
+    through array elements — only direct decl references (field/variable/
+    parameter) were checked.
+    """
+
+    @pytest.mark.libclang
+    def test_extract_all_detects_array_subscript_call(self, tmp_path):
+        """``handlers[irq](irq)`` should produce an IndirectCallSite."""
+        from fw_context_mcp.indexer.compile_commands import CompilationUnit
+        from fw_context_mcp.indexer.symbols import extract_all
+
+        src = tmp_path / "src"
+        src.mkdir()
+        interrupt_c = src / "interrupt.c"
+        interrupt_c.write_text("""\
+typedef void (*isr_handler_t)(int irq);
+
+static isr_handler_t handlers[32];
+
+void interrupt_dispatch(int irq) {
+    if (handlers[irq]) {
+        handlers[irq](irq);
+    }
+}
+""", encoding="utf-8")
+
+        unit = CompilationUnit(
+            file=interrupt_c,
+            directory=src,
+            language="c",
+            clang_args=["-std=c11"],
+        )
+        _, _, _, indirect, fp_assignments, _ = extract_all(
+            unit, source_roots=[src], exclude_paths=[], with_refs=True,
+        )
+
+        # There should be at least one indirect call site for the array call
+        assert len(indirect) >= 1, (
+            f"Expected at least 1 indirect call site for handlers[irq](irq), "
+            f"got {len(indirect)}"
+        )
+
+        # Verify the call site references the handlers array variable
+        handlers_calls = [c for c in indirect if c.target_name == "handlers"]
+        assert len(handlers_calls) == 1, (
+            f"Expected exactly 1 indirect call site targeting 'handlers', "
+            f"got {len(handlers_calls)}: {[(c.target_name, c.from_line) for c in indirect]}"
+        )
+        call = handlers_calls[0]
+        assert "handlers" in call.expr_text
+        assert "interrupt.c" in call.from_file
+        # target_usr should match the USR of the handlers variable
+        assert call.target_usr, "target_usr must not be empty"
+
+    @pytest.mark.libclang
+    def test_extract_all_detects_struct_array_subscript_call(self, tmp_path):
+        """``obj->callbacks[idx](args)`` should produce an IndirectCallSite."""
+        from fw_context_mcp.indexer.compile_commands import CompilationUnit
+        from fw_context_mcp.indexer.symbols import extract_all
+
+        src = tmp_path / "src"
+        src.mkdir()
+        dispatcher_c = src / "dispatcher.c"
+        dispatcher_c.write_text("""\
+typedef void (*event_handler_t)(int event_id);
+
+struct Dispatcher {
+    event_handler_t callbacks[16];
+};
+
+void dispatch_event(struct Dispatcher* d, int event_id) {
+    if (d->callbacks[event_id]) {
+        d->callbacks[event_id](event_id);
+    }
+}
+""", encoding="utf-8")
+
+        unit = CompilationUnit(
+            file=dispatcher_c,
+            directory=src,
+            language="c",
+            clang_args=["-std=c11"],
+        )
+        _, _, _, indirect, fp_assignments, _ = extract_all(
+            unit, source_roots=[src], exclude_paths=[], with_refs=True,
+        )
+
+        callbacks_calls = [c for c in indirect if c.target_name == "callbacks"]
+        assert len(callbacks_calls) == 1, (
+            f"Expected exactly 1 indirect call site targeting 'callbacks', "
+            f"got {len(callbacks_calls)}: {[(c.target_name, c.expr_text) for c in indirect]}"
+        )
+        call = callbacks_calls[0]
+        assert "callbacks" in call.expr_text
+        assert call.target_usr, "target_usr must not be empty"
+        assert "dispatcher.c" in call.from_usr.lower() or "dispatch_event" in call.from_usr
+
+    @pytest.mark.libclang
+    def test_no_false_positive_on_regular_function_call(self, tmp_path):
+        """Regular function calls should NOT produce indirect call sites."""
+        from fw_context_mcp.indexer.compile_commands import CompilationUnit
+        from fw_context_mcp.indexer.symbols import extract_all
+
+        src = tmp_path / "src"
+        src.mkdir()
+        regular_c = src / "regular.c"
+        regular_c.write_text("""\
+void regular_func(int x) {
+    (void)x;
+}
+
+void caller(void) {
+    regular_func(42);
+}
+""", encoding="utf-8")
+
+        unit = CompilationUnit(
+            file=regular_c,
+            directory=src,
+            language="c",
+            clang_args=["-std=c11"],
+        )
+        _, _, _, indirect, _, _ = extract_all(
+            unit, source_roots=[src], exclude_paths=[], with_refs=True,
+        )
+
+        # No indirect call sites for regular function calls
+        assert len(indirect) == 0, (
+            f"Expected 0 indirect call sites for regular function call, got {len(indirect)}"
+        )
+
+    @pytest.mark.libclang
+    def test_extract_all_detects_member_call_still_works(self, tmp_path):
+        """``driver->onData(args)`` (member access) should still be detected."""
+        from fw_context_mcp.indexer.compile_commands import CompilationUnit
+        from fw_context_mcp.indexer.symbols import extract_all
+
+        src = tmp_path / "src"
+        src.mkdir()
+        driver_c = src / "driver.c"
+        driver_c.write_text("""\
+typedef void (*data_handler_t)(const char* data, int len);
+
+struct Driver {
+    data_handler_t onData;
+};
+
+void process_data(struct Driver* driver, const char* data, int len) {
+    if (driver->onData) {
+        driver->onData(data, len);
+    }
+}
+""", encoding="utf-8")
+
+        unit = CompilationUnit(
+            file=driver_c,
+            directory=src,
+            language="c",
+            clang_args=["-std=c11"],
+        )
+        _, _, _, indirect, _, _ = extract_all(
+            unit, source_roots=[src], exclude_paths=[], with_refs=True,
+        )
+
+        ondata_calls = [c for c in indirect if c.target_name == "onData"]
+        assert len(ondata_calls) == 1, (
+            f"Expected exactly 1 indirect call site targeting 'onData', "
+            f"got {len(ondata_calls)}: {[(c.target_name, c.expr_text) for c in indirect]}"
+        )
