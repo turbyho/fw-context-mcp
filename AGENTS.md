@@ -25,7 +25,7 @@ uv venv --seed && uv pip install -e ".[dev]"
 ```
 src/fw_context_mcp/
   cli.py              — CLI entrypoint (fw-context index, init)
-  mcp/server.py       — FastMCP stdio server, 32 tools
+  mcp/server.py       — FastMCP stdio server, 33 tools
   indexer/            — libclang parse → SQLite + FTS5 + vec
   search/             — multi-phase search pipeline (phases/, pipeline.py, scoring.py)
   config/             — TOML config loading (settings.py)
