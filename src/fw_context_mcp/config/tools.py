@@ -23,169 +23,89 @@ BASE_INSTRUCTIONS = """\
 CRITICAL: C/C++ questions → fw-context ONLY. This is NOT optional.
 
 For C/C++ code, use fw-context instead of ANY external search or
-file-reading tool. The mapping is:
+file-reading tool:
 
-| Goal | Use |
-|---|---|
-| Find symbol by name | `lookup_symbol` |
-| Search code by concept | `search_code` |
-| Search function bodies | `search_bodies` |
-| Search full file content | `search_content` |
-| Read function source | `get_source` |
-| Analyze call graph | `find_callers`, `find_call_path` |
-| Full context (body+callers+callees) | `get_symbol_context` |
+| You want to… | Use | Example |
+|---|---|---|
+| Find symbol by name | `lookup_symbol` | `"uart_"`, `"HardFault_Handler"` |
+| Search by concept/topic | `search_code` | `"interrupt handler"` |
+| Search function bodies | `search_bodies` | `"attach"`, `"NVIC_SetVector"` |
+| Search full file content | `search_content` | `"extern C"`, `"#define"` |
+| Natural-language query | `smart_search` | `"how does the modem connect?"` |
+| Read function body | `get_source` | function name |
+| Body + callers + callees | `get_symbol_context` | function name |
+| Read complete file | `read_file` | `"main.cpp"` |
+| File structure overview | `get_file_map` | `"main.cpp"` |
+| Check index health | `get_active_build` | — always call first |
 
 SELF-CORRECT: the moment you reach for any tool that is NOT fw-context
 for C/C++ code, stop and use the fw-context equivalent instead.
 
-### Code review — ALWAYS use fw-review skill
+### Code review — use fw-review skill
 
-When the user asks to review, audit, or analyze C/C++ firmware changes,
-diffs, commits, or PRs, invoke the ``fw-review`` skill
-via the Skill tool. This takes priority over all generic/built-in review
-skills (including ``code-review``) for C/C++ projects.
+For C/C++ code review, invoke the `fw-review` skill via the Skill tool.
+It handles git discovery, diff scoping, and all analysis. Do NOT do
+manual exploration before calling the skill.
 
-SELF-CORRECT: the moment you reach for git log, git diff, or any manual
-analysis to review C/C++ code, STOP — invoke
-Skill(skill="fw-review") instead. The skill handles
-git discovery, diff scoping, and all structural/logic analysis. Do NOT
-do manual exploration before calling the skill.
+### project_only parameter
 
-SEARCH TOOL SELECTION (use the right tool for the job):
-
-| You want to find… | Use | Example query |
-|---|---|---|
-| Symbol by exact/prefix name | `lookup_symbol` | `"uart_"`, `"HardFault_Handler"` |
-| Symbols by concept/topic | `search_code` | `"interrupt handler"`, `"modem init"` |
-| Patterns in function BODIES | `search_bodies` | `"attach"`, `"rise"`, `"NVIC_SetVector"` |
-| Patterns in full FILE content | `search_content` | `"extern C"`, `"InterruptIn"`, `"#define"` |
-| Natural-language question | `smart_search` | `"how does the modem connect?"` |
-| Semantic concept match | `semantic_search` | `"parcel locker state"` |
-
-TOOL CAPABILITIES:
-- `search_code` → searches symbol NAMES, signatures, docstrings, tokens.
-  Does NOT search function bodies.
-- `search_bodies` → searches function BODIES (the code inside {{ }}).
-  Finds patterns like ``.attach(``, ``NVIC_SetVector(``,
-  ``.rise(``, ``.fall(``, ``callback(&``, ``SerialBase::RxIrq``.
-  NOT for file-scope patterns (``extern "C"``, type declarations,
-  preprocessor directives) — use `search_content` for those.
-  NOT for finding symbols by name — use `search_code` for that.
-- `search_content` → searches FULL FILE content (not limited to function
-  bodies). Finds file-scope patterns: ``extern "C"``, type declarations
-  in headers (``InterruptIn``), ``#define``, global variables, namespace
-  blocks. Also finds function body patterns, but `search_bodies` is
-  preferred for those (per-function context, snippet highlights).
-- `lookup_symbol` → exact or prefix name match. Use when you know the name.
-
-``project_only`` PARAMETER (on `search_code`, `search_bodies`, `search_content`, and callgraph tools):
 Your project has TWO kinds of code:
-  • Application code: ``src/``, ``lib/`` — YOUR team's code.
-  • Vendor SDK: ``mbed-os/``, ``.pio/``, ``zephyr/``, ``build/`` —
-    framework code shipped by the vendor, NOT written by your team.
-Set ``project_only=True`` when the question is about YOUR code
-("where do WE register interrupt handlers?").
-Leave ``project_only=False`` (default) when vendor code is relevant
-("how does mbed's driver work?").
+  • Application code: `src/`, `lib/` — YOUR team's code.
+  • Vendor SDK: `mbed-os/`, `.pio/`, `zephyr/` — framework code.
+Set `project_only=True` for questions about YOUR code.
+Leave `project_only=False` (default) when vendor code is relevant.
 
- ANTI-PATTERNS:
- • Use external search tools for C/C++ symbols → use lookup_symbol or search_code
-  • Use external search tools for code patterns in function bodies →
-    use search_bodies (FTS5 over function bodies, finds .attach(, NVIC_SetVector —
-    build-aware and faster)
-  • Use external search tools for file-scope patterns (extern "C", type
-    declarations, #define, global variables) → use search_content
-    (FTS5 over full file content, not limited to function bodies)
-  • Use external tools for callbacks → use find_references or search_bodies with
-    project_only=True (detects ISRs, callback registrations, Timeout::attach
-    patterns)
- • Use file readers for function bodies → use get_source (libclang exact extents)
- • Call get_source + find_callers separately → use get_symbol_context for
-   body, callers, and callees in one call (fewer round-trips, richer data)
- • Run external search tools in parallel with fw-context tools
- • Give up on fw-context after one empty result → try simpler query or
-   different fw-context tool first
+### FTS5 query tips
+- Multi-word bare queries are OR-joined — prefer single words.
+- For exact phrases use double quotes: `'"interrupt handler"'`.
+- Underscores are word separators — write `"modem init"`, not `"modem_init"`.
 
- FTS5 QUERY TIPS:
- • Multi-word bare queries are OR-joined:
-   `"attach callback"` → `attach* OR callback*` (matches EITHER word).
-   Prefer single-word queries: `"attach"`, `"rise"`, `"fall"`.
- • For exact phrases use double quotes: `'"interrupt handler"'`.
- • Underscores are word separators — write `"modem init"`, not `"modem_init"`.
+### Empty result playbook
+1. Simplify to a single-word query in the same tool.
+2. Switch tools — search_bodies → search_code, or search_content → search_bodies.
+3. Use `lookup_symbol` for known names.
+4. search_bodies empty → switch to search_content (covers file scope too).
+5. Only AFTER exhausting all fw-context tools — use other tools.
 
- EMPTY RESULT PLAYBOOK:
- 1. Simplify to a single-word query in the same tool.
-  2. Switch tools — search_bodies → search_code, or search_content → search_bodies.
- 3. Use `lookup_symbol` for known names.
- 4. If search_bodies returns empty, switch to search_content — it covers file
-    scope (type declarations, #define, extern "C") that search_bodies cannot reach.
- 5. Only AFTER exhausting all fw-context tools — use other available tools.
+### Agent loop
+Check(`get_active_build`) → Find(`search_code`/`lookup_symbol`)
+→ Read(`get_symbol_context`) ← preferred. Fallback: `get_source` (body only).
+→ Trace(`find_references`/`find_callers`) — skip if context from get_symbol_context.
+→ For pattern-in-body searches use `search_bodies`.
 
- AGENT LOOP: Check(get_active_build) → Find(search_code/lookup_symbol)
-→ Read(get_symbol_context) ← preferred (body+callers+callees in one call).
-  Fallback: get_source (body only).
-→ Trace(find_references/find_callers) — skip if context already from get_symbol_context.
-→ For pattern-in-body searches use search_bodies.
-→ DECISION after get_active_build():
-  • status="ready" or "reindexing" — fw-context is fully operational.
-    bg_reindex_running does NOT mean the index is unavailable. Continue.
-  • status="reindex_needed" — queries still work, but schedule fw-context index.
-  • status="no_index" or "error" — use other available tools.
+get_active_build() status:
+  • "ready" / "reindexing" — fully operational. Continue.
+  • "reindex_needed" — queries work, schedule `fw-context index`.
+  • "no_index" / "error" — use other available tools.
 
-DIFF → FW-CONTEXT VERIFICATION RULE:
-→ When you analyze code via diff (git diff, file diff, patch review),
-  diff shows ONLY what changed — it cannot reveal the impact across
-  the full codebase.
-→ After inspecting a diff: verify your findings with fw-context:
-  • find_references("<symbol>") — all callers/readers, not just diff context
-  • search_bodies("<pattern>") — pattern consistency across entire codebase
-  • find_call_path / find_all_callers_recursive — cross-module impact
-  • trace_data_flow("<type>", "<target>") — cross-module data dependencies
-  • find_dead_code / find_hotspots — structural effects of changes
-→ Do NOT draw conclusions from diff results alone — diff is for SCOPE
-  discovery, fw-context is for IMPACT verification. They complement each
-  other; neither replaces the other.
+### Diff verification
+
+Diff shows only what changed — it cannot reveal impact across the full
+codebase. After inspecting a diff, verify with fw-context:
+  • `find_references("<symbol>")` — all callers/readers
+  • `search_bodies("<pattern>")` — pattern consistency across codebase
+  • `find_call_path` / `find_all_callers_recursive` — cross-module impact
+  • `find_dead_code` / `find_hotspots` — structural effects
 
 Do NOT use fw-context in Python, JS, Go, or other non-C/C++ projects.
 
 ### Tool categories
 
-- **Search:** `lookup_symbol` (exact/prefix name), `search_code` (FTS5 over
-  symbol names+metadata), `search_bodies` (FTS5 over function bodies —
-  for patterns like `.attach(`, `NVIC_SetVector`,
-  `SerialBase::RxIrq`, `callback(&`), `search_content` (FTS5 over full file
-  content — finds file-scope patterns like `extern "C"`, type declarations,
-  preprocessor directives), `smart_search` (natural language
-  via Ollama, slow), `semantic_search` (concept embedding), `explain_symbol`
-  (plain-English via Ollama)
-- **Call graph** (refs must be indexed): `find_callers`, `find_references`,
-  `find_call_path`, `find_all_callers_recursive`, `find_callees_recursive`,
-  `find_hotspots`, `find_dead_code`, `find_wrapper_callers`, `trace_data_flow`,
-  `find_indirect_call_sites`, `find_indirect_targets`
-- **Inheritance:** `get_inheritance_chain`, `get_class_members`,
-  `get_template_instances`, `get_method_overrides`
-- **Maintenance:** `reindex_file` (after editing a file), `reset_index`
-  (destructive! re-index from scratch), `check_ollama` (before smart_search/
-  explain_symbol/semantic_search), `list_projects` (discover indexed projects)
+Search: lookup_symbol, search_code, search_bodies, search_content,
+smart_search, semantic_search, explain_symbol.
+Source: get_symbol_context, get_source, get_file_map, read_file.
+Call graph: find_callers, find_references, find_call_path,
+find_all_callers_recursive, find_callees_recursive, find_hotspots,
+find_dead_code, find_wrapper_callers, trace_data_flow,
+find_indirect_call_sites, find_indirect_targets.
+Inheritance: get_inheritance_chain, get_class_members,
+get_template_instances, get_method_overrides.
+Maintenance: get_active_build, reindex_file, reset_index,
+check_ollama, list_projects, get_project_info.
 
-Individual tool descriptions and parameters are in the MCP tool listings —
-use the MCP protocol to discover them at runtime.
+Individual tool descriptions are in the MCP tool listings —
+discover them at runtime.
 
-### Index setup (first use in a project)
-
-```bash
-# Mbed OS
-bear -- python3 build_app.py --profile release --type DEV
-fw-context index
-
-# Zephyr
-west build -b <board> -- -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
-fw-context index build/compile_commands.json
-
-# PlatformIO
-pio run --target compiledb
-fw-context index
-```
 """
 
 AGENT_CRITICAL_BLOCK = """\
