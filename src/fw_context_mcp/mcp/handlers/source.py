@@ -642,6 +642,32 @@ def get_symbol_context(
                     }
                     for r in ics_rows
                 ]
+            elif row["kind"] in ("function", "method"):
+                # Indirect calls made BY this function (via from_usr),
+                # e.g. handlers[irq](arg), driver->onData(args), cb(args).
+                ics_rows = conn.execute(
+                    """SELECT ics.*, caller.name AS caller_name,
+                              caller.qualified_name AS caller_qname,
+                              caller.kind AS caller_kind
+                       FROM indirect_call_sites ics
+                       LEFT JOIN symbols caller
+                         ON caller.config_hash = ics.config_hash
+                        AND caller.usr = ics.from_usr
+                       WHERE ics.config_hash = ? AND ics.from_usr = ?
+                       ORDER BY ics.from_file, ics.from_line
+                       LIMIT 200""",
+                    (config_hash, symbol_usr),
+                ).fetchall()
+                indirect_calls_list = [
+                    {
+                        "file": abs_path(root, r["from_file"]),
+                        "line": r["from_line"],
+                        "expr_text": r["expr_text"],
+                        "fn_ptr_type": r["fn_ptr_type"],
+                        "caller": r["caller_qname"] or r["caller_name"] or "<file scope>",
+                    }
+                    for r in ics_rows
+                ]
 
             # Resolution info — for function pointer fields/variables
             resolution: dict | None = None
