@@ -25,17 +25,44 @@ from ..shared.filtering import _build_sdk_excludes, _path_matches
 log = logging.getLogger(__name__)
 
 # ── moved from server.py ──
-def _lookup_definition(conn, config_hash: str, name: str):
+def _lookup_definition(
+    conn,
+    config_hash: str,
+    name: str,
+    *,
+    preferred_kinds: tuple[str, ...] | None = ("class", "struct"),
+):
     """Find the best-matching symbol definition, trying exact then suffix match.
 
     Tries exact name match (preferring definitions), then qualified name match.
     Falls back to suffix-filtering by short name when ``::`` is present and
     the full name didn't match (e.g. ``Foo::bar`` → match ``bar``, then
     filter by ``qualified_name`` ending with ``Foo::bar``).
+
+    When *preferred_kinds* is set, a ``CASE s.kind`` expression is prepended
+    to ``ORDER BY`` so each listed kind sorts before any other kind.  Callers
+    that need a specific kind (e.g. ``get_inheritance_chain`` needs
+    ``("class", "struct")``) should pass it explicitly.  Pass ``None`` for
+    bare ``ORDER BY s.line`` (no kind priority).
     """
-    BASE_QUERY = """SELECT s.* FROM symbols s
+    # Build kind priority fragment — None means no priority, empty tuple is a no-op
+    if preferred_kinds:
+        # Validate: kind values are internal constants, but guard against
+        # future accidental injection of user input.
+        for k in preferred_kinds:
+            if not isinstance(k, str) or "'" in k:
+                raise ValueError(
+                    f"Invalid preferred_kinds value: {k!r}. "
+                    f"Must be a valid symbol kind string (no quotes)."
+                )
+        whens = " ".join(f"WHEN '{k}' THEN 0" for k in preferred_kinds)
+        _kind_priority = f"CASE s.kind {whens} ELSE 1 END, "
+    else:
+        _kind_priority = ""
+
+    BASE_QUERY = f"""SELECT s.* FROM symbols s
        WHERE s.config_hash=? AND %s
-       ORDER BY CASE s.kind WHEN 'class' THEN 0 WHEN 'struct' THEN 0 ELSE 1 END, %s s.line
+       ORDER BY {_kind_priority}%s s.line
        LIMIT 1"""
     for column in ("s.name", "s.qualified_name"):
         row = conn.execute(
@@ -54,9 +81,9 @@ def _lookup_definition(conn, config_hash: str, name: str):
     # Fallback: "Foo::bar" without namespace — extract short name, suffix-filter
     if "::" in name:
         short_name = name.rsplit("::", 1)[-1]
-        FALLBACK_QUERY = """SELECT s.* FROM symbols s
+        FALLBACK_QUERY = f"""SELECT s.* FROM symbols s
            WHERE s.config_hash=? AND %s
-           ORDER BY CASE s.kind WHEN 'class' THEN 0 WHEN 'struct' THEN 0 ELSE 1 END, %s s.line"""
+           ORDER BY {_kind_priority}%s s.line"""
         for column in ("s.name", "s.qualified_name"):
             rows = conn.execute(
                 FALLBACK_QUERY % (f"{column}=? AND s.is_definition=1", ""),
