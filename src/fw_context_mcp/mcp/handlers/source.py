@@ -35,7 +35,7 @@ def _lookup_definition(conn, config_hash: str, name: str):
     """
     BASE_QUERY = """SELECT s.* FROM symbols s
        WHERE s.config_hash=? AND %s
-       ORDER BY %s s.line
+       ORDER BY CASE s.kind WHEN 'class' THEN 0 WHEN 'struct' THEN 0 ELSE 1 END, %s s.line
        LIMIT 1"""
     for column in ("s.name", "s.qualified_name"):
         row = conn.execute(
@@ -56,7 +56,7 @@ def _lookup_definition(conn, config_hash: str, name: str):
         short_name = name.rsplit("::", 1)[-1]
         FALLBACK_QUERY = """SELECT s.* FROM symbols s
            WHERE s.config_hash=? AND %s
-           ORDER BY %s s.line"""
+           ORDER BY CASE s.kind WHEN 'class' THEN 0 WHEN 'struct' THEN 0 ELSE 1 END, %s s.line"""
         for column in ("s.name", "s.qualified_name"):
             rows = conn.execute(
                 FALLBACK_QUERY % (f"{column}=? AND s.is_definition=1", ""),
