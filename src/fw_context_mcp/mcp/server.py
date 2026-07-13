@@ -26,14 +26,12 @@ Serves 33 MCP tools and 3 MCP resources via FastMCP (stdio transport).
 """
 
 import logging
+from pathlib import Path
 
 from mcp.server.fastmcp import FastMCP
 
 from ..utils import resolve_project_root
-from .background import (
-    _start_bg_reindex_if_stale,
-    _start_bg_watcher,
-)
+from .background import _ensure_daemon_running
 from .handlers import callgraph, inheritance, maintenance, search, source
 from .handlers.maintenance import get_active_build, list_projects, reindex_file_impl  # noqa: F401 — backward compat
 from .handlers.source import _read_symbol_body, get_source  # noqa: F401 — backward compat
@@ -391,15 +389,10 @@ def main() -> None:
     """Start the FastMCP stdio server — entry point for the ``fw-context-mcp`` command.
 
     On startup:
-    1. Pre-marks the database as integrity-checked so ``_open_db_safe`` never
-       blocks on ``PRAGMA integrity_check`` (10-30 s on large DBs).  The check
-       already ran during ``fw-context index``; re-running it at every server
-       start would saturate disk I/O and delay the first MCP query.
-    2. Spawns a file-watch daemon that reindexes changed source files on the fly.
-    3. If the CWD project index needs work, kicks off a background
-       ``fw-context index`` in a daemon thread — ``mcp.run()`` starts
-       immediately regardless of index size.  The staleness check uses
-       only lightweight COUNT queries and at most one ``stat()`` call.
+    1. Pre-marks the database as integrity-checked.
+    2. Ensures the persistent watcher daemon is running for the project
+       (spawns it if this is the first MCP server).
+    3. Starts a ping thread that keeps the daemon alive.
     """
     try:
         root = resolve_project_root(None)
@@ -419,20 +412,31 @@ def main() -> None:
         _integrity_checked.add(str(db_path.resolve()))
 
     try:
-        _start_bg_watcher(root)
-        # Defer staleness check to a daemon thread so mcp.run() starts
-        # immediately.  _start_bg_reindex_if_stale opens the database
-        # and stats files — on large projects (3+ GB, 100k+ files)
-        # this takes 5-30 s and would cause MCP tool-discovery timeouts.
-        import threading
-
-        threading.Thread(
-            target=_start_bg_reindex_if_stale,
-            args=(root,),
-            daemon=True,
-            name="fw-context-startup",
-        ).start()
+        _ensure_daemon_running(root)
+        _start_ping_thread(root)
     except Exception:
         log.exception("Background service startup failed — auto-reindex and file watching unavailable")
 
     mcp.run()
+
+
+def _start_ping_thread(root: Path) -> None:
+    """Start a daemon thread that pings the watcher daemon every 15 s."""
+    import threading
+    import time
+
+    from .daemon import PING_INTERVAL, ping_daemon
+
+    def _ping_loop() -> None:
+        while True:
+            time.sleep(PING_INTERVAL)
+            try:
+                alive = ping_daemon(root)
+                if not alive:
+                    log.debug("Daemon ping failed — daemon may have exited")
+            except Exception:
+                log.debug("Daemon ping error", exc_info=True)
+
+    t = threading.Thread(target=_ping_loop, daemon=True, name="fw-context-ping")
+    t.start()
+    log.debug("Daemon ping thread started for %s", root)

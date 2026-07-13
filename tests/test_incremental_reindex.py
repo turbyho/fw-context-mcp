@@ -2497,22 +2497,18 @@ class TestBgReindexEndToEnd:
     def test_missing_refs_reindex_no_false_positive_cycle(
         self, indexed_project: Path,
     ):
-        """The full cycle that used to loop forever now completes cleanly.
+        """The full cycle: missing refs → reindex via runner.run() → no false positive.
 
         1. Fill refs via run() API, then delete them to simulate the problem
         2. _fast_staleness_check detects "refs missing"
-        3. _start_bg_reindex_if_stale spawns subprocess with FW_CONTEXT_FORCE_REFINDEX
-        4. After the subprocess completes, _fast_staleness_check returns clean for refs
+        3. runner.run() with FW_CONTEXT_FORCE_REFINDEX=1 refills refs
+        4. After completion, _fast_staleness_check returns clean for refs
         5. _count_modified_files returns 0 (no false positive mtime detection)
         """
         import os as _os
-        import time
 
         from fw_context_mcp.indexer.runner import run
-        from fw_context_mcp.mcp.background import (
-            _fast_staleness_check,
-            _start_bg_reindex_if_stale,
-        )
+        from fw_context_mcp.mcp.background import _fast_staleness_check
         from fw_context_mcp.mcp.shared.stale import (
             _count_modified_files,
             _invalidate_modified_cache,
@@ -2551,24 +2547,18 @@ class TestBgReindexEndToEnd:
         assert "refs missing" in reasons, f"Should detect refs missing, got: {reasons}"
         print(f"  Detected before reindex: {reasons}")
 
-        # ── Step 3: Trigger bg reindex (spawns subprocess with FORCE_REFINDEX) ──
-        _start_bg_reindex_if_stale(indexed_project)
-
-        # Wait for subprocess to complete (on this small test project,
-        # the reindex finishes in seconds; waiter checks every 30s)
-        deadline = time.monotonic() + 120.0
-        while time.monotonic() < deadline:
-            reindex_lock = db_path.parent / "reindex.lock"
-            try:
-                lock_fd = _os.open(reindex_lock, _os.O_CREAT | _os.O_RDWR)
-                import fcntl
-                fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                fcntl.flock(lock_fd, fcntl.LOCK_UN)
-                _os.close(lock_fd)
-                break  # Lock free → subprocess done
-            except BlockingIOError:
-                _os.close(lock_fd)
-                time.sleep(0.5)
+        # ── Step 3: Force reindex via runner.run() (simulates daemon's startup reindex) ──
+        _os.environ["FW_CONTEXT_FORCE_REFINDEX"] = "1"
+        try:
+            run(
+                compile_commands=cc_json, db_path=db_path,
+                source_roots=[], exclude_paths=[],
+                project_root=indexed_project,
+                index_refs=True, index_embeddings=False,
+                analyze_symbols=False, analyze_overrides=False,
+            )
+        finally:
+            del _os.environ["FW_CONTEXT_FORCE_REFINDEX"]
 
         # ── Step 4: Verify refs were refilled ──
         needs_after, reasons_after = _fast_staleness_check(indexed_project)

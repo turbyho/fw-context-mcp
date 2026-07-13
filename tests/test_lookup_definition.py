@@ -583,3 +583,151 @@ class TestIntegrationInheritanceChain:
         for kind_group in result["members"].values():
             all_members.extend(m["name"] for m in kind_group)
         assert "init" in all_members, f"Method 'init' not found in members: {all_members}"
+
+
+# ── prefer_project tests ─────────────────────────────────────────────────────
+
+
+class TestPreferProjectParameter:
+    """``prefer_project=True`` prioritises project symbols over SDK symbols."""
+
+    def test_prefer_project_wins_over_sdk_same_name(self, tmp_path):
+        """Two 'Foo' definitions — project (is_project=1) wins over SDK (is_project=0)
+        with prefer_project=True, even though the SDK symbol has a lower line number."""
+        conn, ch = _setup_db(tmp_path)
+        try:
+            file_sdk = upsert_file(conn, ch, "mbed-os/foo.h", "cpp")
+            file_proj = upsert_file(conn, ch, "src/foo.h", "cpp")
+            # SDK symbol — earlier line, is_project=0
+            # Project symbol — later line, is_project=1
+            insert_symbols_batch(conn, [
+                (ch, file_sdk, "mbed-os/foo.h",
+                 split_tokens("Foo", "Foo"),
+                 "U_Foo_sdk", "Foo", "Foo", "class",
+                 10, 1, 30, 1, "", "", None, 0, 0, "", 0, "", 0, 0.0, ""),
+                (ch, file_proj, "src/foo.h",
+                 split_tokens("Foo", "Foo"),
+                 "U_Foo_proj", "Foo", "Foo", "class",
+                 50, 1, 30, 1, "", "", None, 0, 0, "", 0, "", 1, 0.0, ""),
+            ])
+
+            # prefer_project=True: project wins despite higher line
+            row = _lookup_definition(conn, ch, "Foo", prefer_project=True)
+            assert row is not None
+            assert row["kind"] == "class"
+            assert row["is_project"] == 1, (
+                f"Expected project symbol (is_project=1), "
+                f"got is_project={row['is_project']}, file={row['file_path']}"
+            )
+            assert row["file_path"] == "src/foo.h"
+
+            # prefer_project=False (default): old behavior — SDK wins by line
+            row_default = _lookup_definition(conn, ch, "Foo")
+            assert row_default is not None
+            assert row_default["is_project"] == 0, (
+                f"Default (prefer_project=False) should return SDK symbol "
+                f"(lower line), got is_project={row_default['is_project']}"
+            )
+            assert row_default["file_path"] == "mbed-os/foo.h"
+        finally:
+            conn.close()
+
+    def test_prefer_project_qualified_name_collision(self, tmp_path):
+        """Project 'hal::Device' (is_project=1) beats SDK 'hal::Device' (is_project=0)
+        with prefer_project=True when looking up by qualified name."""
+        conn, ch = _setup_db(tmp_path)
+        try:
+            file_sdk = upsert_file(conn, ch, "mbed-os/device.h", "cpp")
+            file_proj = upsert_file(conn, ch, "src/my_device.h", "cpp")
+            insert_symbols_batch(conn, [
+                (ch, file_sdk, "mbed-os/device.h",
+                 split_tokens("Device", "hal::Device"),
+                 "U_dev_sdk", "Device", "hal::Device", "class",
+                 20, 1, 100, 1, "", "", None, 0, 0, "", 0, "", 0, 0.0, ""),
+                (ch, file_proj, "src/my_device.h",
+                 split_tokens("Device", "hal::Device"),
+                 "U_dev_proj", "Device", "hal::Device", "class",
+                 30, 1, 80, 1, "", "", None, 0, 0, "", 0, "", 1, 0.0, ""),
+            ])
+
+            row = _lookup_definition(conn, ch, "hal::Device", prefer_project=True)
+            assert row is not None
+            assert row["is_project"] == 1, (
+                f"Expected project symbol, got is_project={row['is_project']}, "
+                f"file={row['file_path']}"
+            )
+            assert "src/" in row["file_path"]
+        finally:
+            conn.close()
+
+    def test_prefer_project_combined_with_preferred_kinds(self, tmp_path):
+        """prefer_project=True + preferred_kinds: project class beats SDK class
+        (same kind), but SDK class still beats project function
+        (kind priority comes before project priority)."""
+        conn, ch = _setup_db(tmp_path)
+        try:
+            file_sdk_cls = upsert_file(conn, ch, "mbed-os/init.h", "cpp")
+            file_proj_fn = upsert_file(conn, ch, "src/my_init.cpp", "cpp")
+            file_proj_cls = upsert_file(conn, ch, "src/my_init.h", "cpp")
+            insert_symbols_batch(conn, [
+                # SDK class — is_project=0, kind=class (preferred), line=10
+                (ch, file_sdk_cls, "mbed-os/init.h",
+                 split_tokens("init", "init"),
+                 "U_init_sdk", "init", "init", "class",
+                 10, 1, 20, 1, "", "", None, 0, 0, "", 0, "", 0, 0.0, ""),
+                # Project function — is_project=1, kind=function (not preferred), line=5
+                (ch, file_proj_fn, "src/my_init.cpp",
+                 split_tokens("init", "init"),
+                 "U_init_proj_fn", "init", "init", "function",
+                 5, 1, 15, 1, "int init()", "", None, 0, 0, "", 0, "", 1, 0.0, ""),
+                # Project class — is_project=1, kind=class (preferred), line=50
+                (ch, file_proj_cls, "src/my_init.h",
+                 split_tokens("init", "MyInit"),
+                 "U_init_proj_cls", "init", "MyInit", "class",
+                 50, 1, 30, 1, "", "", None, 0, 0, "", 0, "", 1, 0.0, ""),
+            ])
+
+            # With prefer_project=True + preferred_kinds=("class","struct"):
+            # kind priority first → class wins over function.
+            # Then within classes, is_project priority → project class wins over SDK class.
+            row = _lookup_definition(conn, ch, "init",
+                                     preferred_kinds=("class", "struct"),
+                                     prefer_project=True)
+            assert row is not None
+            assert row["kind"] == "class", (
+                f"Kind priority should come first: class beats function. "
+                f"Got kind={row['kind']}"
+            )
+            assert row["is_project"] == 1, (
+                f"Within same kind, project should beat SDK. "
+                f"Got is_project={row['is_project']}, file={row['file_path']}"
+            )
+
+            # Without prefer_project: SDK class wins (lower line within same kind)
+            row_default = _lookup_definition(conn, ch, "init",
+                                             preferred_kinds=("class", "struct"))
+            assert row_default is not None
+            assert row_default["is_project"] == 0
+            assert row_default["file_path"] == "mbed-os/init.h"
+        finally:
+            conn.close()
+
+    def test_prefer_project_no_collision_still_works(self, tmp_path):
+        """prefer_project=True works normally when only one symbol exists."""
+        conn, ch = _setup_db(tmp_path)
+        try:
+            file_id = upsert_file(conn, ch, "src/main.cpp", "cpp")
+            insert_symbols_batch(conn, [
+                (ch, file_id, "src/main.cpp",
+                 split_tokens("main", "main"),
+                 "U_main", "main", "main", "function",
+                 1, 1, 5, 1, "int main()", "", None, 0, 0, "", 0, "", 1, 0.0, ""),
+            ])
+
+            row = _lookup_definition(conn, ch, "main", prefer_project=True)
+            assert row is not None
+            assert row["kind"] == "function"
+            assert row["name"] == "main"
+            assert row["is_project"] == 1
+        finally:
+            conn.close()

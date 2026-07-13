@@ -31,6 +31,7 @@ def _lookup_definition(
     name: str,
     *,
     preferred_kinds: tuple[str, ...] | None = ("class", "struct"),
+    prefer_project: bool = False,
 ):
     """Find the best-matching symbol definition, trying exact then suffix match.
 
@@ -44,8 +45,16 @@ def _lookup_definition(
     that need a specific kind (e.g. ``get_inheritance_chain`` needs
     ``("class", "struct")``) should pass it explicitly.  Pass ``None`` for
     bare ``ORDER BY s.line`` (no kind priority).
+
+    When *prefer_project* is True, ``s.is_project DESC`` is inserted before
+    the kind-priority clause so project-code symbols (``is_project=1``) sort
+    before vendor/SDK symbols.  This prevents base-class definitions in SDK
+    headers from shadowing project overrides when both share the same name.
     """
-    # Build kind priority fragment — None means no priority, empty tuple is a no-op
+    # Build ORDER BY fragments — assembled left to right in priority order.
+    _order_parts: list[str] = []
+
+    # 1. Kind priority — None means no priority, empty tuple is a no-op
     if preferred_kinds:
         # Validate: kind values are internal constants, but guard against
         # future accidental injection of user input.
@@ -56,13 +65,17 @@ def _lookup_definition(
                     f"Must be a valid symbol kind string (no quotes)."
                 )
         whens = " ".join(f"WHEN '{k}' THEN 0" for k in preferred_kinds)
-        _kind_priority = f"CASE s.kind {whens} ELSE 1 END, "
-    else:
-        _kind_priority = ""
+        _order_parts.append(f"CASE s.kind {whens} ELSE 1 END")
+
+    # 2. Project-code priority (within same kind, project overrides before SDK)
+    if prefer_project:
+        _order_parts.append("s.is_project DESC")
+
+    _order_prefix = ", ".join(_order_parts) + ", " if _order_parts else ""
 
     BASE_QUERY = f"""SELECT s.* FROM symbols s
        WHERE s.config_hash=? AND %s
-       ORDER BY {_kind_priority}%s s.line
+       ORDER BY {_order_prefix}%s s.line
        LIMIT 1"""
     for column in ("s.name", "s.qualified_name"):
         row = conn.execute(
@@ -83,7 +96,7 @@ def _lookup_definition(
         short_name = name.rsplit("::", 1)[-1]
         FALLBACK_QUERY = f"""SELECT s.* FROM symbols s
            WHERE s.config_hash=? AND %s
-           ORDER BY {_kind_priority}%s s.line"""
+           ORDER BY {_order_prefix}%s s.line"""
         for column in ("s.name", "s.qualified_name"):
             rows = conn.execute(
                 FALLBACK_QUERY % (f"{column}=? AND s.is_definition=1", ""),
@@ -239,7 +252,7 @@ async def explain_symbol(
             if not cfg_data:
                 return {"error": "No build config indexed."}
             config_hash = cfg_data["config_hash"]
-            row = _lookup_definition(conn, config_hash, name)
+            row = _lookup_definition(conn, config_hash, name, prefer_project=True)
             if not row:
                 # Macro fallback
                 macros = lookup_macro(conn, config_hash, name, exact=True, limit=1)
@@ -374,7 +387,7 @@ def get_source(
             cfg_data = get_active_config(conn, project_id)
             if not cfg_data:
                 return {"error": "No build config indexed."}
-            row = _lookup_definition(conn, cfg_data["config_hash"], name)
+            row = _lookup_definition(conn, cfg_data["config_hash"], name, prefer_project=True)
             if not row:
                 # Macro fallback
                 macros = lookup_macro(conn, cfg_data["config_hash"], name, exact=True, limit=1)
@@ -577,7 +590,7 @@ def get_symbol_context(
             if not cfg_data:
                 return {"error": "No build config indexed."}
             config_hash = cfg_data["config_hash"]
-            row = _lookup_definition(conn, config_hash, name)
+            row = _lookup_definition(conn, config_hash, name, prefer_project=True)
             if not row:
                 # Macro fallback — macros have no callers/callees, return basic info
                 macros = lookup_macro(conn, config_hash, name, exact=True, limit=1)
