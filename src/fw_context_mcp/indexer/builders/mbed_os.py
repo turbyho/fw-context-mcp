@@ -98,18 +98,24 @@ class MbedOSBuildSystem:
         if not target:
             raise RuntimeError(
                 "Cannot determine target board.  Set it in .mbed (mbed config target <BOARD>), "
-                "in custom_targets.json, or in .fw-context/config.toml [build] target = \"...\""
+                'in custom_targets.json, or in .fw-context/config.toml [build] target = "..."'
             )
 
         cmd: list[str] = [
             "bear",
-            "--output", "compile_commands.json",
+            "--output",
+            "compile_commands.json",
             "--",
-            "mbed", "compile",
-            "-t", toolchain,
-            "-m", target,
-            "--profile", cfg.profile,
-            "--app-config", cfg.app_config,
+            "mbed",
+            "compile",
+            "-t",
+            toolchain,
+            "-m",
+            target,
+            "--profile",
+            cfg.profile,
+            "--app-config",
+            cfg.app_config,
         ]
 
         for ep in _resolve_mbed_extra_profiles(project_root, cfg.extra_profiles):
@@ -133,11 +139,11 @@ class MbedOSBuildSystem:
 
         return cc_path
 
-    # ── Dep tracking ──
+    # ── Build dir patterns ──
 
-    def ensure_dep_tracking(self, project_root: Path, *, fix: bool = False) -> list[str]:
-        # GCC always emits .d files with Mbed OS — nothing to configure.
-        return []
+    def get_build_dir_patterns(self, project_root: Path) -> list[str]:
+        """Return build-output directory patterns for staleness filtering."""
+        return ["BUILD/"]
 
     # ── Validation ──
 

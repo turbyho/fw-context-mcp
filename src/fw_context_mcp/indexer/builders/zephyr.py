@@ -60,9 +60,7 @@ class ZephyrBuildSystem:
         wrapper_dir = project_root / ".fw-context"
         wrapper_dir.mkdir(parents=True, exist_ok=True)
         ninja_wrapper = wrapper_dir / "ninja"
-        ninja_wrapper.write_text(
-            f"#!/bin/sh\nexec {ninja} -d keepdepfile \"$@\"\n", encoding="utf-8"
-        )
+        ninja_wrapper.write_text(f'#!/bin/sh\nexec {ninja} -d keepdepfile "$@"\n', encoding="utf-8")
         ninja_wrapper.chmod(0o755)
 
         cmd: list[str] = [
@@ -121,28 +119,11 @@ class ZephyrBuildSystem:
 
         return target_cc
 
-    # ── Dep tracking ──
+    # ── Build dir patterns ──
 
-    def ensure_dep_tracking(self, project_root: Path, *, fix: bool = False) -> list[str]:
-        """Ensure the Zephyr build generates ``.d`` dependency files.
-
-        Zephyr injects ``-MMD`` via its built-in ``EXTRA_CPPFLAGS`` CMake
-        variable (``cmake/extra_flags.cmake``), which propagates through
-        ``zephyr_interface`` to all targets.  No configuration file is
-        needed — the flag is passed directly at build time.
-        """
-        messages: list[str] = []
-        if fix:
-            messages.append(
-                "Zephyr passes EXTRA_CPPFLAGS=-MMD to CMake — "
-                ".d dependency files will be generated during build."
-            )
-        else:
-            messages.append(
-                "Will pass EXTRA_CPPFLAGS=-MMD to CMake "
-                "(applied automatically during 'fw-context index --build')."
-            )
-        return messages
+    def get_build_dir_patterns(self, project_root: Path) -> list[str]:
+        """Return build-output directory patterns for staleness filtering."""
+        return ["build/"]
 
     # ── Validation ──
 

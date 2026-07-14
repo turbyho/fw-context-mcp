@@ -41,7 +41,9 @@ log = logging.getLogger(__name__)
 
 # ── moved from server.py ──
 def get_active_build(
-    project_root: Annotated[str | None, Field(description="Project root directory. Auto-detected from CWD if omitted.")] = None,
+    project_root: Annotated[
+        str | None, Field(description="Project root directory. Auto-detected from CWD if omitted.")
+    ] = None,
 ) -> dict:
     """MANDATORY FIRST CALL for C/C++ projects. Return metadata about the
     most recently indexed build configuration — check index health before
@@ -81,7 +83,9 @@ def get_active_build(
     Returns:
         dict: {config_hash, project_id, project_root, build_system,
         compile_commands, indexed_at (ISO timestamp), symbol_count, file_count,
-        reference_count, modified_files_count (int), analyzed_symbols (int),
+        reference_count, modified_files_count (int), header_affected_tus (int —
+        number of TUs with stale header dependencies), manifest_verification (str —
+        "full" when manifest.json exists, "none" otherwise), analyzed_symbols (int),
         unanalyzed_symbols (int — definition symbols still needing LLM analysis),
         analysis_model (str or None), bg_reindex_running (bool),
         reindex_progress (str or None — last log line when reindex is running),
@@ -113,19 +117,18 @@ def get_active_build(
             if not cfg:
                 return {"error": f"No build config indexed for project at {root}."}
             config_hash = cfg["config_hash"]
-            sym_count = conn.execute(
-                "SELECT COUNT(*) FROM symbols WHERE config_hash=?", (config_hash,)
-            ).fetchone()[0]
-            file_count = conn.execute(
-                "SELECT COUNT(*) FROM files WHERE config_hash=?", (config_hash,)
-            ).fetchone()[0]
+            sym_count = conn.execute("SELECT COUNT(*) FROM symbols WHERE config_hash=?", (config_hash,)).fetchone()[0]
+            file_count = conn.execute("SELECT COUNT(*) FROM files WHERE config_hash=?", (config_hash,)).fetchone()[0]
             ref_count = count_refs(conn, config_hash)
-            deps_verification = cfg["deps_verification"] if "deps_verification" in cfg else "none"
+            manifest_verification = cfg["manifest_verification"] if "manifest_verification" in cfg else "none"
             modified_count = _count_modified_files(conn, config_hash, root, use_cache=False)
             # Check header dependencies separately (different metric: TUs, not files)
-            if deps_verification == "full":
+            if manifest_verification == "full":
                 header_affected_tus, _ = _check_header_staleness(
-                    conn, config_hash, root, use_cache=False,
+                    conn,
+                    config_hash,
+                    root,
+                    use_cache=False,
                 )
             else:
                 header_affected_tus = 0
@@ -193,7 +196,9 @@ def get_active_build(
                         f"in background. All queries return accurate results."
                     )
                 else:
-                    index_message = "Index is usable — background reindex in progress. All queries return accurate results."
+                    index_message = (
+                        "Index is usable — background reindex in progress. All queries return accurate results."
+                    )
             elif schema_old and cc_changed:
                 index_message = (
                     f"Schema version mismatch ({db_schema_ver} < {CURRENT_SCHEMA_VERSION}) "
@@ -208,38 +213,31 @@ def get_active_build(
             else:
                 index_message = "Compile commands changed — run fw-context index. Queries still work on existing data."
 
-            # When deps are not fully verified, warn the LLM.
-            # Two levels:
-            # - Soft warning: a reindex IS running — the index will be
-            #   updated once it completes.  The LLM may continue analysis
-            #   but should note the temporary degradation.
-            # - Hard warning: no reindex is running — the LLM MUST stop
-            #   analysis and tell the user to run 'fw-context index'.
+            # When manifest verification is not full, warn the LLM.
             _warning = None
-            if deps_verification != "full":
+            if manifest_verification != "full":
                 if bg_running:
                     _warning = (
                         "Index was built without full header dependency "
-                        "tracking (deps verification: "
-                        f"{deps_verification}). A reindex is currently "
+                        "tracking (manifest verification: "
+                        f"{manifest_verification}). A reindex is currently "
                         "running — the index will be updated once it "
                         "completes. You may continue analysis, but note "
                         "that header changes since the last completed "
                         "index may not be reflected."
                     )
                     index_message += (
-                        f" — deps verification: {deps_verification} "
-                        f"(reindex in progress — wait for completion)"
+                        f" — manifest verification: {manifest_verification} (reindex in progress — wait for completion)"
                     )
                 else:
                     _warning = (
                         "⚠️ INDEX DEGRADED — STOP ALL C/C++ ANALYSIS "
                         "IMMEDIATELY.\n\n"
-                        "Header dependency (.d) files are NOT available "
-                        "for this index (deps verification: "
-                        f"{deps_verification}). The index may contain "
+                        "manifest.json is NOT available "
+                        "for this index (manifest verification: "
+                        f"{manifest_verification}). The index may contain "
                         "STALE data — header changes cannot be detected "
-                        "without .d files. Continuing analysis with a "
+                        "without manifest.json. Continuing analysis with a "
                         "stale index WILL produce incorrect results.\n\n"
                         "REQUIRED: Tell the user to run 'fw-context index' "
                         "to rebuild with full dependency tracking. Do NOT "
@@ -247,14 +245,12 @@ def get_active_build(
                         "confirms the index has been rebuilt."
                     )
                     index_message += (
-                        f" — deps verification: {deps_verification} "
-                        f"(run 'fw-context index' for full tracking)"
+                        f" — manifest verification: {manifest_verification} (run 'fw-context index' for full tracking)"
                     )
 
             if header_affected_tus:
                 index_message += (
-                    f" | {header_affected_tus} TU(s) have stale header "
-                    f"dependencies — header changes since last index"
+                    f" | {header_affected_tus} TU(s) have stale header dependencies — header changes since last index"
                 )
 
             result: dict = {
@@ -274,7 +270,7 @@ def get_active_build(
                 "analyzed_symbols": analyzed_count,
                 "unanalyzed_symbols": unanalyzed_count,
                 "analysis_model": analysis_model_row["model"] if analysis_model_row else None,
-                "deps_verification": deps_verification,
+                "manifest_verification": manifest_verification,
                 "status": status,
                 "reindex_needed": needs_reindex,
                 "reindex_reasons": reindex_reasons,
@@ -289,7 +285,7 @@ def get_active_build(
         if bg_running:
             log_file = db_path.parent / "reindex.log"
             try:
-                with open(log_file) as fh:
+                with open(log_file, encoding="utf-8") as fh:
                     lines = fh.readlines()
                     result["reindex_progress"] = lines[-1].strip() if lines else None
             except (OSError, IndexError):
@@ -297,6 +293,7 @@ def get_active_build(
         return result
     finally:
         conn.close()
+
 
 # ── moved from server.py ──
 def _list_status(db_schema_ver: int, cc_stale: bool) -> str:
@@ -306,7 +303,10 @@ def _list_status(db_schema_ver: int, cc_stale: bool) -> str:
 
 
 def list_projects(
-    project_root: Annotated[str | None, Field(description="Project root. Auto-detected if omitted. Pass to distinguish multiple indexed projects.")] = None,
+    project_root: Annotated[
+        str | None,
+        Field(description="Project root. Auto-detected if omitted. Pass to distinguish multiple indexed projects."),
+    ] = None,
 ) -> list[dict]:
     """List all indexed firmware projects with their statistics.
 
@@ -342,33 +342,42 @@ def list_projects(
             finally:
                 conn.close()
             for r in rows:
-                cc_stale = _is_stale(
-                    {"created_at": r["created_at"]},
-                    r["compile_commands_path"],
-                ) if r["compile_commands_path"] else False
+                cc_stale = (
+                    _is_stale(
+                        {"created_at": r["created_at"]},
+                        r["compile_commands_path"],
+                    )
+                    if r["compile_commands_path"]
+                    else False
+                )
                 root = Path(r["root_path"]) if r["root_path"] else None
-                results.append({
-                    "project_id": r["project_id"],
-                    "name": r["name"],
-                    "root_path": r["root_path"],
-                    "build_system": _detect_build_system(root) if root else "unknown",
-                    "symbol_count": r["symbol_count"],
-                    "file_count": r["file_count"],
-                    "indexed_at": r["created_at"],
-                    "schema_version": db_schema_ver,
-                    "current_schema": CURRENT_SCHEMA_VERSION,
-                    "reindex_needed": cc_stale or db_schema_ver < CURRENT_SCHEMA_VERSION,
-                    "status": _list_status(db_schema_ver, cc_stale),
-                    "db": str(db_path),
-                })
+                results.append(
+                    {
+                        "project_id": r["project_id"],
+                        "name": r["name"],
+                        "root_path": r["root_path"],
+                        "build_system": _detect_build_system(root) if root else "unknown",
+                        "symbol_count": r["symbol_count"],
+                        "file_count": r["file_count"],
+                        "indexed_at": r["created_at"],
+                        "schema_version": db_schema_ver,
+                        "current_schema": CURRENT_SCHEMA_VERSION,
+                        "reindex_needed": cc_stale or db_schema_ver < CURRENT_SCHEMA_VERSION,
+                        "status": _list_status(db_schema_ver, cc_stale),
+                        "db": str(db_path),
+                    }
+                )
         except Exception as e:
             results.append({"db": str(db_path), "error": str(e)})
     return results
 
+
 # ── moved from server.py ──
 def reset_index(
     project_root: Annotated[str | None, Field(description="Project root. Auto-detected if omitted.")] = None,
-    confirm: Annotated[bool, Field(description="Must be True to execute. Call without confirm first as dry-run.")] = False,
+    confirm: Annotated[
+        bool, Field(description="Must be True to execute. Call without confirm first as dry-run.")
+    ] = False,
 ) -> dict:
     """Delete the entire symbol index for a project.
 
@@ -429,10 +438,7 @@ def reset_index(
                 "then run 'fw-context index' to rebuild."
             )
         else:
-            info["message"] = (
-                f"Would delete {db_path}. "
-                "Call reset_index(confirm=True) to proceed."
-            )
+            info["message"] = f"Would delete {db_path}. Call reset_index(confirm=True) to proceed."
         return info
     db_path.unlink()
     for suffix in ("-wal", "-shm"):
@@ -443,12 +449,25 @@ def reset_index(
     info["message"] = f"Index deleted. Run 'fw-context index' in {root} to rebuild."
     return info
 
+
 # ── moved from server.py ──
 def reindex_file_impl(
-    file_path: Annotated[str, Field(description="Absolute or project-relative path to the source file to re-parse. Must have a matching entry in compile_commands.json.")],
-    project_root: Annotated[str | None, Field(description="Project root directory. Auto-detected from cwd if omitted.")] = None,
+    file_path: Annotated[
+        str,
+        Field(
+            description="Absolute or project-relative path to the source file to re-parse. Must have a matching entry in compile_commands.json."
+        ),
+    ],
+    project_root: Annotated[
+        str | None, Field(description="Project root directory. Auto-detected from cwd if omitted.")
+    ] = None,
     *,
-    with_analysis: Annotated[bool, Field(description="When True (default), also regenerates LLM symbol analysis and method override relationships — slower but produces a fully up-to-date index. Set False for a fast symbol-only update (used by background auto-reindex).")] = True,
+    with_analysis: Annotated[
+        bool,
+        Field(
+            description="When True (default), also regenerates LLM symbol analysis and method override relationships — slower but produces a fully up-to-date index. Set False for a fast symbol-only update (used by background auto-reindex)."
+        ),
+    ] = True,
 ) -> dict:
     """Re-parse a single source file with libclang and update its symbols in the index.
 
@@ -536,9 +555,7 @@ def reindex_file_impl(
                 return {"error": f"File not found on disk or in index: {target}"}
 
             file_id_old, _ = known[file_path_str]
-            symbol_count = conn.execute(
-                "SELECT COUNT(*) FROM symbols WHERE file_id = ?", (file_id_old,)
-            ).fetchone()[0]
+            symbol_count = conn.execute("SELECT COUNT(*) FROM symbols WHERE file_id = ?", (file_id_old,)).fetchone()[0]
 
             try:
                 tu_rel = str(target.relative_to(root))
@@ -564,6 +581,7 @@ def reindex_file_impl(
             finally:
                 _resume_bg_reindex(root)
                 from ...mcp.shared.stale import _invalidate_modified_cache
+
                 _invalidate_modified_cache(config_hash)
 
         cc_path = Path(cfg_data["compile_commands_path"])
@@ -590,7 +608,19 @@ def reindex_file_impl(
         # libclang is CPU-bound; running it inside the lock serialises
         # parsing when multiple TUs match (e.g. reindexing a header
         # included by several .cpp files).
-        parsed_units: list[tuple[TU, tuple[list[Symbol], list[Reference], list[InheritanceRecord], list[IndirectCallSite], list[FnPointerAssignment], list[Macro]]]] = []
+        parsed_units: list[
+            tuple[
+                TU,
+                tuple[
+                    list[Symbol],
+                    list[Reference],
+                    list[InheritanceRecord],
+                    list[IndirectCallSite],
+                    list[FnPointerAssignment],
+                    list[Macro],
+                ],
+            ]
+        ] = []
         for unit in matching:
             try:
                 parsed = extract_all(
@@ -622,8 +652,11 @@ def reindex_file_impl(
                 # ── Phase 1: main symbol write ──
                 for unit, parsed in parsed_units:
                     with transaction(conn):
-                        syms_added, _ = store_symbols_for_unit(
-                            conn, unit, config_hash, root,
+                        syms_added, _, _headers = store_symbols_for_unit(
+                            conn,
+                            unit,
+                            config_hash,
+                            root,
                             source_roots=source_roots,
                             exclude_paths=exclude_paths,
                             index_refs=cfg.index.index_refs,
@@ -636,10 +669,69 @@ def reindex_file_impl(
                 if parsed_units:
                     try:
                         from ...indexer.macros import resolve_and_update
+
                         first_unit = parsed_units[0][0]
                         resolve_and_update(conn, config_hash, first_unit.clang_args, first_unit.file.resolve())
                     except Exception:
                         pass
+
+                # ── Phase 1b: orphan file cleanup ──
+                # Remove file records that no longer have symbols or macros —
+                # cheap DELETE that keeps the files table from accumulating
+                # stale entries across incremental reindexes.
+                from ...indexer.db import delete_orphan_files
+
+                deleted_orphans = delete_orphan_files(conn, config_hash)
+                if deleted_orphans:
+                    log.debug("Orphan files cleaned up: %d", deleted_orphans)
+
+                # ── Phase 1c: update manifest.json ──
+                # Keep header hashes in sync after reindexing a single file.
+                # Without this, _check_header_staleness reports false-positive
+                # stale TUs after every reindex_file call.
+                try:
+                    from fw_context_mcp.utils import compute_source_hash
+
+                    from ...indexer.manifest import (
+                        _collect_headers_from_tokens,
+                        update_entry,
+                    )
+                    from ...indexer.manifest import (
+                        load as load_manifest,
+                    )
+                    from ...indexer.manifest import (
+                        save as save_manifest,
+                    )
+
+                    manifest_data = load_manifest(db_path.parent)
+                    if manifest_data is not None:
+                        for unit, _parsed in parsed_units:
+                            headers = _collect_headers_from_tokens(
+                                unit, root,
+                                build_dir_patterns=None,
+                            )
+                            source_hash = compute_source_hash(unit.file.resolve())
+                            try:
+                                tu_rel = str(unit.file.resolve().relative_to(root))
+                            except ValueError:
+                                tu_rel = str(unit.file.resolve())
+                            # Find entry index by file path
+                            for idx, entry in enumerate(manifest_data.get("entries", [])):
+                                if entry.get("file") == tu_rel:
+                                    update_entry(manifest_data, idx, source_hash, headers)
+                                    break
+                            else:
+                                # TU not in manifest yet — append new entry
+                                manifest_data.setdefault("entries", []).append({
+                                    "file": tu_rel,
+                                    "directory": str(unit.directory) if unit.directory else str(root),
+                                    "arguments": unit.clang_args,
+                                    "source_hash": source_hash,
+                                    "headers": headers,
+                                })
+                        save_manifest(manifest_data, db_path.parent)
+                except Exception:
+                    log.debug("manifest.json update skipped during reindex_file", exc_info=True)
 
                 elapsed = round(time.monotonic() - t0, 2)
                 result: dict = {
@@ -657,11 +749,18 @@ def reindex_file_impl(
                     try:
                         from ...cache_client import CacheClient
                         from ...indexer.runner import _build_llm_analysis
+
                         cc = CacheClient.from_config(cfg)
                         try:
-                            _build_llm_analysis(conn, config_hash, cfg.llm, db_path.parent,
-                                               write_lock_held=True, retry_unparseable=True,
-                                               cache_client=cc)
+                            _build_llm_analysis(
+                                conn,
+                                config_hash,
+                                cfg.llm,
+                                db_path.parent,
+                                write_lock_held=True,
+                                retry_unparseable=True,
+                                cache_client=cc,
+                            )
                             conn.commit()
                         finally:
                             if cc:
@@ -678,13 +777,27 @@ def reindex_file_impl(
                 if total_symbols > 0:
                     try:
                         from ...indexer.runner import _build_overrides
-                        _build_overrides(conn, config_hash, db_path.parent, write_lock_held=True)
+
+                        _build_overrides(conn, config_hash, db_path.parent, write_lock_held=True, force=True)
                         conn.commit()
                     except Exception as exc:
                         result["overrides_warning"] = f"Override analysis skipped: {exc}"
 
+                # ── Phase 4: pagerank + hotspot cache ──
+                if cfg.index.index_refs and total_symbols > 0:
+                    try:
+                        from ...indexer.runner import _build_hotspot_cache, _build_pagerank
+
+                        _build_pagerank(conn, config_hash, write_lock_held=True, force=True)
+                        _build_hotspot_cache(conn, config_hash, force=True)
+                        conn.commit()
+                    except Exception as exc:
+                        result["pagerank_warning"] = f"PageRank/hotspot recompute skipped: {exc}"
+
                 if len(matching) == 1 and target.suffix.lower() in {".h", ".hpp"}:
-                    result["warning"] = "Header re-indexed via one TU. Other TUs including this header may still have stale symbols — run 'fw-context index' for full accuracy."
+                    result["warning"] = (
+                        "Header re-indexed via one TU. Other TUs including this header may still have stale symbols — run 'fw-context index' for full accuracy."
+                    )
 
                 return result
         except sqlite3.Error as exc:
@@ -692,9 +805,11 @@ def reindex_file_impl(
         finally:
             _resume_bg_reindex(root)
             from ...mcp.shared.stale import _invalidate_modified_cache
+
             _invalidate_modified_cache(config_hash)
     finally:
         conn.close()
+
 
 # ── moved from server.py ──
 def reindex_file(
@@ -721,9 +836,12 @@ def reindex_file(
     """
     return reindex_file_impl(file_path, project_root, with_analysis=True)
 
+
 # ── moved from server.py ──
 def check_ollama(
-    project_root: Annotated[str | None, Field(description="Project root. Auto-detected if omitted. Ignored by this tool.")] = None,
+    project_root: Annotated[
+        str | None, Field(description="Project root. Auto-detected if omitted. Ignored by this tool.")
+    ] = None,
 ) -> dict:
     """Check whether the LLM backend is running and the configured embedding/chat model is installed.
 

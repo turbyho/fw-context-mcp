@@ -1008,7 +1008,7 @@ Output: {"config_hash": "a1b2…", "project_id": "c3d4…", "project_root": "/pa
          "build_system": "zephyr", "compile_commands": "/path/build/compile_commands.json",
          "indexed_at": "2026-06-05T09:35:18", "symbol_count": 12430, "file_count": 1502,
          "reference_count": 8900, "modified_files_count": 3,
-         "header_affected_tus": 0, "deps_verification": "full",
+         "header_affected_tus": 0, "manifest_verification": "full",
          "schema_version": 84935291, "current_schema": 84935291,
          "analyzed_symbols": 8450, "unanalyzed_symbols": 120,
          "analysis_model": "qwen2.5-coder:14b",
@@ -1035,10 +1035,11 @@ a background reindex is active and its last log line.
 ``modified_files_count`` is cached for 30 seconds (calls within that window
 return the same value). ``header_affected_tus`` reports how many translation
 units have stale header dependencies — non-zero when headers changed since the
-last index with ``deps_verification: "full"``. ``deps_verification`` is
-``"full"`` (``.d`` dependency files available — header staleness is tracked),
-``"partial"`` (some ``.d`` files exist but not all), or ``"none"``
-(no dependency tracking — header changes cannot be detected).
+last index with ``manifest_verification: "full"``. ``manifest_verification`` is
+``"full"`` (``manifest.json`` available — header staleness is tracked via
+SHA-256 hashes collected during indexing), or ``"none"`` (no manifest —
+header changes cannot be detected; run ``fw-context index --build`` to
+regenerate with full dependency tracking).
 ``unanalyzed_symbols`` counts definition symbols that still need LLM analysis
 (zero when analysis is disabled, empty when all symbols are analyzed).
 

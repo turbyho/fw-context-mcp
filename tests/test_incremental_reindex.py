@@ -1152,7 +1152,7 @@ class TestStoreSymbolsForUnitAnalysisRestore:
 
         # Call store_symbols_for_unit — this triggers Phase 1 save → Phase 2 delete → Phase 3 restore
         with transaction(conn):
-            syms_added, _ = store_symbols_for_unit(
+            syms_added, _, _ = store_symbols_for_unit(
                 conn, unit, config_hash, tmp_path,
                 source_roots=[tmp_path],
                 index_refs=False,
@@ -1225,7 +1225,7 @@ class TestStoreSymbolsForUnitAnalysisRestore:
         )
 
         with transaction(conn):
-            syms_added, _ = store_symbols_for_unit(
+            syms_added, _, _ = store_symbols_for_unit(
                 conn, unit, config_hash, tmp_path,
                 source_roots=[tmp_path],
                 index_refs=False,
@@ -1288,7 +1288,7 @@ class TestStoreSymbolsForUnitAnalysisRestore:
         )
 
         with transaction(conn):
-            syms_added, _ = store_symbols_for_unit(
+            syms_added, _, _ = store_symbols_for_unit(
                 conn, unit, config_hash, tmp_path,
                 source_roots=[tmp_path],
                 index_refs=False,
@@ -1373,7 +1373,7 @@ class TestStoreSymbolsForUnitAnalysisRestore:
         )
 
         with transaction(conn):
-            syms_added, _ = store_symbols_for_unit(
+            syms_added, _, _ = store_symbols_for_unit(
                 conn, unit, config_hash, tmp_path,
                 source_roots=[tmp_path],
                 index_refs=False,
@@ -2434,7 +2434,7 @@ class TestForceRefindex:
 
         # ── Without env var: should return "unchanged" ──
         _os.environ.pop("FW_CONTEXT_FORCE_REFINDEX", None)
-        status, _, _, _ = _process_unit(
+        status, _, _, _, _ = _process_unit(
             modem_unit[0], ch, indexed_project, [indexed_project], [], False,
             db_path, existing_files=existing,
         )
@@ -2445,7 +2445,7 @@ class TestForceRefindex:
         # ── With env var: should NOT return "unchanged" ──
         _os.environ["FW_CONTEXT_FORCE_REFINDEX"] = "1"
         try:
-            status_forced, syms, _, _ = _process_unit(
+            status_forced, syms, _, _, _ = _process_unit(
                 modem_unit[0], ch, indexed_project, [indexed_project], [], False,
                 db_path, existing_files=existing,
             )
@@ -2480,7 +2480,7 @@ class TestForceRefindex:
 
         _os.environ["FW_CONTEXT_FORCE_REFINDEX"] = "0"
         try:
-            status, _, _, _ = _process_unit(
+            status, _, _, _, _ = _process_unit(
                 modem_unit[0], ch, indexed_project, [indexed_project], [], False,
                 db_path, existing_files=existing,
             )

@@ -183,7 +183,8 @@ Requires `fqbn` (fully qualified board name) in `.fw-context/config.toml`:
 `fqbn = "arduino:avr:uno"`.
 
 `fw-context` runs `arduino-cli compile --export-compile-commands` (two passes:
-database only, then real compile for `.d` dependency files).
+database only, then real compile for object files).  Header dependency tracking
+uses ``manifest.json`` (built from libclang token stream) — no ``.d`` files needed.
 
 ### ESP-IDF
 

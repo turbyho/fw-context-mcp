@@ -26,9 +26,7 @@ def _normalize_entry(entry: dict) -> dict:
     ``{file, args}`` dict that produces the same hash for the same
     build configuration regardless of timestamps or output paths.
     """
-    raw_args: list[str] = entry.get("arguments") or shlex.split(
-        entry.get("command", "")
-    )
+    raw_args: list[str] = entry.get("arguments") or shlex.split(entry.get("command", ""))
 
     entry_file = entry.get("file", "")
     source_basename = Path(entry_file).name
@@ -100,10 +98,13 @@ def compute_flags_hash(entry: dict) -> str:
     return hashlib.sha256(args.encode()).hexdigest()
 
 
-def compute_tu_content_hash(source_hash: str, flags_hash: str, deps_hash: str) -> str:
+def compute_tu_content_hash(source_hash: str, flags_hash: str, manifest_entry_hash: str) -> str:
     """Return combined SHA-256 of the three per-TU component hashes.
 
     This is the value stored in ``files.content_hash`` — when it matches
     the stored hash, the TU can be skipped even if mtime has changed.
+
+    *manifest_entry_hash* is the hash of the TU's manifest entry
+    (source + headers), replacing the old ``deps_hash`` from ``.d`` files.
     """
-    return hashlib.sha256(f"{source_hash}|{flags_hash}|{deps_hash}".encode()).hexdigest()
+    return hashlib.sha256(f"{source_hash}|{flags_hash}|{manifest_entry_hash}".encode()).hexdigest()

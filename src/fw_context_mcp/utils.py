@@ -10,7 +10,14 @@ import hashlib
 import os
 from pathlib import Path
 
-__all__ = ["MTIME_TOLERANCE_S", "abs_path", "compute_content_hash", "read_file_lines", "resolve_project_root"]
+__all__ = [
+    "MTIME_TOLERANCE_S",
+    "abs_path",
+    "compute_content_hash",
+    "compute_source_hash",
+    "read_file_lines",
+    "resolve_project_root",
+]
 
 # Seconds of tolerance when comparing file mtimes to account for
 # clock skew between the indexer and the filesystem.
@@ -83,3 +90,11 @@ def compute_content_hash(body: str, qualified_name: str, signature: str, docstri
     """
     raw = f"{body.strip()}|{qualified_name}|{signature or ''}|{(docstring or '').strip()}"
     return hashlib.sha256(raw.encode()).hexdigest()
+
+
+def compute_source_hash(file_path: Path) -> str:
+    """Return SHA-256 hex digest of file content, or empty string on error."""
+    try:
+        return hashlib.sha256(file_path.read_bytes()).hexdigest()
+    except OSError:
+        return ""

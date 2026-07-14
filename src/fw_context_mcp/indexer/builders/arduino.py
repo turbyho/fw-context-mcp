@@ -60,7 +60,7 @@ class ArduinoBuildSystem:
         if not cfg.fqbn:
             raise RuntimeError(
                 "Arduino requires a board FQBN.  Set it in .fw-context/config.toml:\n"
-                "  [build]\n  fqbn = \"arduino:avr:uno\""
+                '  [build]\n  fqbn = "arduino:avr:uno"'
             )
 
         build_dir = project_root / "build"
@@ -69,9 +69,12 @@ class ArduinoBuildSystem:
 
         build_path_flag = str(build_dir)
         base_cmd: list[str] = [
-            "arduino-cli", "compile",
-            "--fqbn", cfg.fqbn,
-            "--build-path", build_path_flag,
+            "arduino-cli",
+            "compile",
+            "--fqbn",
+            cfg.fqbn,
+            "--build-path",
+            build_path_flag,
         ]
 
         # ── Pass 1: dry-run to generate compile_commands.json ──
@@ -81,7 +84,9 @@ class ArduinoBuildSystem:
             cwd=project_root,
         )
         if dry_run.returncode != 0:
-            raise RuntimeError(f"arduino-cli compile --only-compilation-database failed with exit code {dry_run.returncode}")
+            raise RuntimeError(
+                f"arduino-cli compile --only-compilation-database failed with exit code {dry_run.returncode}"
+            )
 
         cc_in_build = build_dir / "compile_commands.json"
         if not cc_in_build.exists():
@@ -90,8 +95,7 @@ class ArduinoBuildSystem:
                 cc_in_build = cc_in_root
             else:
                 raise RuntimeError(
-                    "compile_commands.json not generated. "
-                    "Ensure arduino-cli supports --only-compilation-database."
+                    "compile_commands.json not generated. Ensure arduino-cli supports --only-compilation-database."
                 )
 
         # Copy to project root for consistency BEFORE the real compile,
@@ -112,12 +116,11 @@ class ArduinoBuildSystem:
 
         return target_cc
 
-    # ── Dep tracking ──
+    # ── Build dir patterns ──
 
-    def ensure_dep_tracking(self, project_root: Path, *, fix: bool = False) -> list[str]:
-        # .d files are produced by the real compile pass in build().
-        # Nothing to fix here — if they're missing, rebuild.
-        return []
+    def get_build_dir_patterns(self, project_root: Path) -> list[str]:
+        """Return build-output directory patterns for staleness filtering."""
+        return ["build/"]
 
     # ── Validation ──
 
