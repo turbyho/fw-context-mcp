@@ -35,7 +35,7 @@ from .background import _ensure_daemon_running
 from .handlers import callgraph, inheritance, maintenance, search, source
 from .handlers.maintenance import get_active_build, list_projects, reindex_file_impl  # noqa: F401 — backward compat
 from .handlers.source import _read_symbol_body, get_source  # noqa: F401 — backward compat
-from .shared.context import _db_path, _integrity_checked
+from .shared.context import _integrity_checked, _set_server_init_error
 
 log = logging.getLogger(__name__)
 
@@ -389,32 +389,71 @@ def main() -> None:
     """Start the FastMCP stdio server — entry point for the ``fw-context-mcp`` command.
 
     On startup:
-    1. Pre-marks the database as integrity-checked.
-    2. Ensures the persistent watcher daemon is running for the project
+    1. Validates that the project is initialized (``fw-context init`` has run)
+       and that a symbol index exists (``fw-context index`` has run).
+       If either is missing, sets a server-level sentinel that causes all
+       tool handlers to return a clear error with user instructions.
+    2. Pre-marks the database as integrity-checked.
+    3. Ensures the persistent watcher daemon is running for the project
        (spawns it if this is the first MCP server).
-    3. Starts a ping thread that keeps the daemon alive.
+    4. Starts a ping thread that keeps the daemon alive.
     """
     try:
         root = resolve_project_root(None)
     except Exception:
         log.exception("Failed to resolve project root, server starting without DB")
+        _set_server_init_error(
+            "Cannot resolve project root. Are you running inside a project directory?\n"
+            "Run 'fw-context init' then 'fw-context index --build' in your project root."
+        )
         mcp.run()
         return
 
+    # Check 1: is the project initialized?
+    from ..config import derive_project_id
+    from ..config import load as load_config
+    from ..config.settings import ProjectNotInitializedError as PIE
+
     try:
-        # GOTCHA — integrity_check on large DBs is I/O-bound (10-30 s for
-        # 3+ GB).  If it runs here via _open_db_safe during MCP server startup,
-        # the MCP client times out during tool discovery and fw-context tools
-        # never appear.  The check already ran during ``fw-context index``, so
-        # we skip it by pre-marking the DB — a corrupt DB will be caught by
-        # individual queries via _open_db_safe.
-        db_path = _db_path(root)
-        if db_path.exists():
-            _integrity_checked.add(str(db_path.resolve()))
-    except Exception:
-        log.exception("Project not initialized, server starting without DB")
+        project_id = derive_project_id(root)
+    except PIE:
+        log.info("Project not initialized at %s — tools will report setup instructions", root)
+        _set_server_init_error(
+            f"Project at {root} is not initialized.\n\n"
+            "Run these commands in your terminal:\n"
+            "  1. fw-context init\n"
+            "  2. fw-context index --build\n"
+            "  3. Restart your AI tool\n\n"
+            "fw-context init creates a project ID (stored in .fw-context/config.toml).\n"
+            "fw-context index --build compiles and indexes your C/C++ codebase."
+        )
         mcp.run()
         return
+
+    # Check 2: does the index database exist?
+    cfg = load_config(project_root=root)
+    db_path = cfg.index.db_dir / project_id / "index.db"
+    if not db_path.exists():
+        log.info("No index found at %s — tools will report setup instructions", db_path)
+        _set_server_init_error(
+            f"No symbol index found for project at {root}.\n\n"
+            "Run these commands in your terminal:\n"
+            "  1. fw-context index --build\n"
+            "  2. Restart your AI tool\n\n"
+            "fw-context index --build compiles and indexes your C/C++ codebase\n"
+            "for code intelligence (symbol lookup, call graph, search, etc.)."
+        )
+        mcp.run()
+        return
+
+    # Project is ready — pre-mark integrity check and start normally.
+    # GOTCHA — integrity_check on large DBs is I/O-bound (10-30 s for
+    # 3+ GB).  If it runs here via _open_db_safe during MCP server startup,
+    # the MCP client times out during tool discovery and fw-context tools
+    # never appear.  The check already ran during ``fw-context index``, so
+    # we skip it by pre-marking the DB — a corrupt DB will be caught by
+    # individual queries via _open_db_safe.
+    _integrity_checked.add(str(db_path.resolve()))
 
     try:
         _ensure_daemon_running(root)

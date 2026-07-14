@@ -20,9 +20,35 @@ log = logging.getLogger(__name__)
 # subsequent opens — corruption is rare and read queries cannot cause it.
 _integrity_checked: set[str] = set()
 
+# Sentry pro detekci nepřipraveného projektu při startu MCP serveru.
+# Nastavuje se v main() před mcp.run() — pokud projekt není inicializovaný
+# nebo nemá index, všechny tool handlery vrací jednotnou chybovou zprávu.
+_server_init_error: str | None = None
+
+
+def _set_server_init_error(message: str) -> None:
+    """Nastav chybovou zprávu, kterou uvidí všechny tool handlery.
+
+    Volej pouze v main() před spuštěním serveru. Po nastavení sentinelu
+    každý tool handler skončí s touto zprávou — LLM ji přepošle uživateli.
+    """
+    global _server_init_error
+    _server_init_error = message
+
+
+def _check_server_ready() -> None:
+    """Zkontroluj, že projekt je připravený (inicializovaný + indexovaný).
+
+    Vyhazuje RuntimeError s instrukcemi pro uživatele, pokud server
+    detekoval nepřipravený projekt při startu.
+    """
+    if _server_init_error is not None:
+        raise RuntimeError(_server_init_error)
+
 
 def _db_path(project_root: Path) -> Path:
     """Resolve the SQLite database path for a project root."""
+    _check_server_ready()
     cfg = load_config(project_root=project_root)
     project_id = derive_project_id(project_root)
     return cfg.index.db_dir / project_id / "index.db"
@@ -30,6 +56,7 @@ def _db_path(project_root: Path) -> Path:
 
 def _resolve_context(project_root: str | None) -> tuple[Path, Config, str, Path]:
     """Resolve all context needed by most tools: db_path, config, project_id, root."""
+    _check_server_ready()
     root = resolve_project_root(project_root)
     cfg = load_config(project_root=root)
     project_id = derive_project_id(root)
