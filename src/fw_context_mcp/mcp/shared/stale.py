@@ -44,9 +44,10 @@ def _path_matches_patterns(path: str, patterns: list[str]) -> bool:
     return any(pat in path for pat in patterns)
 
 
-def _stale_files(conn, config_hash: str, file_paths: list[str]) -> list[str]:
+def _stale_files(conn, config_hash: str, file_paths: list[str], root: Path) -> list[str]:
     """Return the subset of *file_paths* whose on-disk mtime is newer than the index."""
     from ...indexer.manifest import load as load_manifest
+    from ...indexer.ops import _normalize_file_path
 
     db_path = Path(conn.execute("PRAGMA database_list").fetchone()["file"])
     manifest = load_manifest(db_path.parent)
@@ -56,8 +57,11 @@ def _stale_files(conn, config_hash: str, file_paths: list[str]) -> list[str]:
     for path in dict.fromkeys(file_paths):
         if _path_matches_patterns(path, build_patterns):
             continue
+        # Normalize the lookup path to match files.path format
+        # (relative for project files, absolute for external files)
+        db_key = _normalize_file_path(path, root)
         try:
-            stored = get_file_mtime_indexed(conn, config_hash, path)
+            stored = get_file_mtime_indexed(conn, config_hash, db_key)
             if not stored:
                 # stored=0.0 (pre-migration) or None (not indexed) — skip
                 continue
@@ -306,6 +310,7 @@ def _with_stale_recovery(
                 conn,
                 config_hash,
                 [abs_path(root, r["file"]) for r in result_rows if "file" in r],
+                root,
             )
     finally:
         conn.close()

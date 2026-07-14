@@ -33,7 +33,7 @@ from .db import (
     upsert_project,
     write_lock,
 )
-from .ops import _build_filtered_file_content, store_symbols_for_unit
+from .ops import _build_filtered_file_content, _normalize_file_path, store_symbols_for_unit
 
 log = logging.getLogger(__name__)
 
@@ -818,7 +818,9 @@ def _extract_param_types(signature: str) -> str:
     return ",".join(normalized)
 
 
-def _build_overrides(conn, config_hash: str, db_dir: Path, *, write_lock_held: bool = False, force: bool = False) -> None:
+def _build_overrides(
+    conn, config_hash: str, db_dir: Path, *, write_lock_held: bool = False, force: bool = False
+) -> None:
     """Build the method override graph by matching virtual methods to their
     base-class counterparts through the inheritance chain.
 
@@ -1069,7 +1071,10 @@ def _build_hotspot_cache(conn, config_hash: str, *, force: bool = False) -> None
 
 
 def _refresh_header_mtimes_from_manifest(
-    conn, config_hash: str, project_root: Path, manifest: dict | None,
+    conn,
+    config_hash: str,
+    project_root: Path,
+    manifest: dict | None,
 ) -> int:
     """Refresh stored mtimes for headers touched by VCS operations.
 
@@ -1090,16 +1095,20 @@ def _refresh_header_mtimes_from_manifest(
     refreshed = 0
     for entry in manifest.get("entries", []):
         for h in entry.get("headers", []):
+            # Resolve absolute path for stat() — h["path"] may be relative
             p = Path(h["path"])
             if not p.is_absolute():
-                p = (project_root / p).resolve()
+                p_resolved = (project_root / p).resolve()
+            else:
+                p_resolved = p.resolve()
             try:
-                cur_mtime = p.stat().st_mtime
+                cur_mtime = p_resolved.stat().st_mtime
             except OSError:
                 continue
+            # Use the manifest path directly — it already matches files.path format
             cur_obj = conn.execute(
                 "UPDATE files SET mtime=? WHERE config_hash=? AND path=? AND mtime < ?",
-                (cur_mtime, config_hash, str(p), cur_mtime),
+                (cur_mtime, config_hash, h["path"], cur_mtime),
             )
             if cur_obj.rowcount:
                 refreshed += 1
@@ -1121,7 +1130,6 @@ def _is_excluded(file_path: Path, exclude_paths: list[Path], source_roots: list[
     if in_source:
         return False
     return any(resolved == ep or resolved.is_relative_to(ep) for ep in exclude_paths)
-
 
 
 def _update_manifest_after_index(
@@ -1197,13 +1205,15 @@ def _update_manifest_after_index(
 
             if tu_rel in tu_headers:
                 source_hash = compute_source_hash(unit.file.resolve())
-                entries.append({
-                    "file": tu_rel,
-                    "directory": str(unit.directory) if unit.directory else str(project_root),
-                    "arguments": unit.clang_args,
-                    "source_hash": source_hash,
-                    "headers": tu_headers[tu_rel],
-                })
+                entries.append(
+                    {
+                        "file": tu_rel,
+                        "directory": str(unit.directory) if unit.directory else str(project_root),
+                        "arguments": unit.clang_args,
+                        "source_hash": source_hash,
+                        "headers": tu_headers[tu_rel],
+                    }
+                )
                 updated += 1
             elif tu_rel in old_entries:
                 entries.append(old_entries[tu_rel])
@@ -1211,13 +1221,15 @@ def _update_manifest_after_index(
             else:
                 headers = _collect_headers_from_tokens(unit, project_root, build_dir_patterns)
                 source_hash = compute_source_hash(unit.file.resolve())
-                entries.append({
-                    "file": tu_rel,
-                    "directory": str(unit.directory) if unit.directory else str(project_root),
-                    "arguments": unit.clang_args,
-                    "source_hash": source_hash,
-                    "headers": headers,
-                })
+                entries.append(
+                    {
+                        "file": tu_rel,
+                        "directory": str(unit.directory) if unit.directory else str(project_root),
+                        "arguments": unit.clang_args,
+                        "source_hash": source_hash,
+                        "headers": headers,
+                    }
+                )
                 updated += 1
 
         log.info("manifest.json: %d updated (from tu_headers), %d reused", updated, reused)
@@ -1245,13 +1257,15 @@ def _update_manifest_after_index(
             else:
                 headers = _collect_headers_from_tokens(unit, project_root, build_dir_patterns)
                 source_hash = compute_source_hash(unit.file.resolve())
-                entries.append({
-                    "file": tu_rel,
-                    "directory": str(unit.directory) if unit.directory else str(project_root),
-                    "arguments": unit.clang_args,
-                    "source_hash": source_hash,
-                    "headers": headers,
-                })
+                entries.append(
+                    {
+                        "file": tu_rel,
+                        "directory": str(unit.directory) if unit.directory else str(project_root),
+                        "arguments": unit.clang_args,
+                        "source_hash": source_hash,
+                        "headers": headers,
+                    }
+                )
                 updated += 1
 
         log.info("manifest.json incremental: %d updated, %d reused", updated, reused)
@@ -1320,7 +1334,7 @@ def _check_and_parse_unit(
     if _is_excluded(resolved_tu, exclude_paths, source_roots):
         return ("unchanged", None, None, None)
 
-    file_path = str(unit.file)
+    file_path = _normalize_file_path(str(resolved_tu), project_root)
     force_refs = force or os.environ.get("FW_CONTEXT_FORCE_REFINDEX") == "1"
 
     # ── Tier 1: mtime fast-path ──
@@ -1350,7 +1364,10 @@ def _check_and_parse_unit(
     # When manifest.json exists, use check_tu_staleness() — fast hash comparison
     # against stored values.  When not, fall back to source-only hash.
     manifest_entry_hash = _get_manifest_entry_hash_for_unit(
-        unit, project_root, source_roots, manifest,
+        unit,
+        project_root,
+        source_roots,
+        manifest,
     )
 
     content_hash = compute_tu_content_hash(source_hash, flags_hash, manifest_entry_hash)
@@ -1420,7 +1437,9 @@ def _get_manifest_entry_hash_for_unit(
                 return _entry_hash(entry)
             # Stale — compute hash from CURRENT disk content (both source and headers)
             return compute_current_entry_hash(
-                entry, project_root, source_roots,
+                entry,
+                project_root,
+                source_roots,
                 new_source_hash=current_source_hash,
             )
 
@@ -1506,7 +1525,7 @@ def _process_unit(
         t_parse_start = parse_timing[0]
         t_parse_end = parse_timing[1]
     else:
-        file_path = str(unit.file)
+        file_path = _normalize_file_path(str(unit.file.resolve()), project_root)
         force_refs = force or os.environ.get("FW_CONTEXT_FORCE_REFINDEX") == "1"
         if not force_refs and file_path in existing_files:
             rec = existing_files[file_path]
@@ -1704,13 +1723,20 @@ def run(
 
     manifest = load_manifest(db_path.parent)
     expected_hash = compute_structural_hash(
-        compile_commands, project_root, units, build_dir_patterns,
+        compile_commands,
+        project_root,
+        units,
+        build_dir_patterns,
     )
     if manifest is not None and manifest.get("config_hash") == expected_hash:
         config_hash = manifest["config_hash"]
     else:
         config_hash = build_preliminary(
-            compile_commands, db_path.parent, project_root, units, build_dir_patterns,
+            compile_commands,
+            db_path.parent,
+            project_root,
+            units,
+            build_dir_patterns,
         )
         # Reload manifest from disk — build_preliminary may have overwritten
         # manifest.json.  The in-memory manifest must reflect what _update_manifest_after_index
@@ -1882,7 +1908,7 @@ def run(
 
         if check_status == "unchanged":
             unchanged += 1
-            file_path_str = str(unit.file)
+            file_path_str = _normalize_file_path(str(unit.file.resolve()), project_root)
             rec = existing_files.get(file_path_str)
             file_id = rec.file_id if rec else None
             try:
@@ -2022,7 +2048,6 @@ def run(
         tu_headers=tu_headers if tu_headers else None,
         build_dir_patterns=build_dir_patterns,
     )
-
 
     # Resolve expanded macro values via clang -dM -E (opt-in, best-effort).
     if index_macros_expanded and units:
