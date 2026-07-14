@@ -9,6 +9,7 @@ Fixtures are class-scoped to avoid repeated indexing.
 from __future__ import annotations
 
 import json
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -29,6 +30,12 @@ def _db_path_for_project(project_root: Path) -> Path:
     cfg = load_config(project_root=project_root)
     project_id = derive_project_id(project_root)
     return cfg.index.db_dir / project_id / "index.db"
+
+
+def _cleanup_index_db(project_root: Path) -> None:
+    """Delete the index database directory for a project."""
+    db_path = _db_path_for_project(project_root)
+    shutil.rmtree(db_path.parent, ignore_errors=True)
 
 
 def _project_root() -> Path:
@@ -200,7 +207,8 @@ def indexed_extended(c_project_extended: Path):
 
     db_path = _db_path_for_project(c_project_extended)
     assert db_path.exists(), f"DB not created at {db_path}"
-    return c_project_extended
+    yield c_project_extended
+    _cleanup_index_db(c_project_extended)
 
 
 # ── Tests: Symbol counts ───────────────────────────────────────────────────
@@ -729,9 +737,12 @@ class TestIndexingEdgeCases:
         })
         cc_json.write_text(json.dumps(cc, indent=2), encoding="utf-8")
 
-        result = _cli(["index", "--no-refs", "--no-analyze", "--no-embeddings", str(cc_json)],
-                      cwd=c_project_extended, timeout=180)
-        assert result.returncode == 0, f"Index with empty file failed:\n{result.stderr}"
+        try:
+            result = _cli(["index", "--no-refs", "--no-analyze", "--no-embeddings", str(cc_json)],
+                          cwd=c_project_extended, timeout=180)
+            assert result.returncode == 0, f"Index with empty file failed:\n{result.stderr}"
+        finally:
+            _cleanup_index_db(c_project_extended)
 
     def test_file_with_only_preprocessor(self, c_project_extended: Path):
         """A source file with only preprocessor directives should not crash indexing."""
@@ -754,9 +765,12 @@ class TestIndexingEdgeCases:
         })
         cc_json.write_text(json.dumps(cc, indent=2), encoding="utf-8")
 
-        result = _cli(["index", "--no-refs", "--no-analyze", "--no-embeddings", str(cc_json)],
-                      cwd=c_project_extended, timeout=180)
-        assert result.returncode == 0
+        try:
+            result = _cli(["index", "--no-refs", "--no-analyze", "--no-embeddings", str(cc_json)],
+                          cwd=c_project_extended, timeout=180)
+            assert result.returncode == 0
+        finally:
+            _cleanup_index_db(c_project_extended)
 
 
 # ── Anonymous struct / union fixtures and tests ────────────────────────────
@@ -848,7 +862,8 @@ def indexed_anon(c_project_anon: Path):
 
     db_path = _db_path_for_project(c_project_anon)
     assert db_path.exists(), f"DB not created at {db_path}"
-    return c_project_anon
+    yield c_project_anon
+    _cleanup_index_db(c_project_anon)
 
 
 class TestAnonymousStructUnionIndexing:

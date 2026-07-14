@@ -86,6 +86,12 @@ def _config_hash(conn, project_root):
     return active["config_hash"] if active else None
 
 
+def _cleanup_index_db(project_root: Path) -> None:
+    """Delete the index database directory for a project."""
+    db_path = _db_path_for_project(project_root)
+    shutil.rmtree(db_path.parent, ignore_errors=True)
+
+
 def _patch_config(config_path: Path, replacements: dict[str, str]) -> None:
     """Edit an existing TOML config in-place.
 
@@ -360,7 +366,7 @@ class TestBareInitAndIndex:
     @pytest.fixture(scope="class")
     @classmethod
     def indexed(cls):
-        return _init_and_index(
+        proj = _init_and_index(
             _BUILDS / "bare",
             replacements={
                 "[build] system": '"bare"',
@@ -369,6 +375,8 @@ class TestBareInitAndIndex:
             },
             clean_db=True,
         )
+        yield proj
+        _cleanup_index_db(proj)
 
     def test_compile_commands_generated(self, indexed):
         entries = json.loads((indexed / "compile_commands.json").read_text())
@@ -446,7 +454,9 @@ class TestCMakeInitAndIndex:
     @pytest.fixture(scope="class")
     @classmethod
     def indexed(cls):
-        return _init_and_index(_BUILDS / "generic_cmake", clean_db=True)
+        proj = _init_and_index(_BUILDS / "generic_cmake", clean_db=True)
+        yield proj
+        _cleanup_index_db(proj)
 
     def test_compile_commands_generated(self, indexed):
         entries = json.loads((indexed / "compile_commands.json").read_text())
@@ -497,11 +507,13 @@ class TestMakefileInitAndIndex:
     @pytest.fixture(scope="class")
     @classmethod
     def indexed(cls):
-        return _init_and_index(
+        proj = _init_and_index(
             _BUILDS / "makefile",
             replacements={"[build] make_dry_run": "false"},
             clean_db=True,
         )
+        yield proj
+        _cleanup_index_db(proj)
 
     def test_compile_commands_generated(self, indexed):
         entries = json.loads((indexed / "compile_commands.json").read_text())
@@ -559,7 +571,9 @@ class TestPlatformIOInitAndIndex:
     @pytest.fixture(scope="class")
     @classmethod
     def indexed(cls):
-        return _init_and_index(_BUILDS / "platformio", clean_db=True)
+        proj = _init_and_index(_BUILDS / "platformio", clean_db=True)
+        yield proj
+        _cleanup_index_db(proj)
 
     def test_compile_commands_has_entries(self, indexed):
         entries = json.loads((indexed / "compile_commands.json").read_text())
@@ -625,13 +639,15 @@ class TestArduinoInitAndIndex:
     @pytest.fixture(scope="class")
     @classmethod
     def indexed(cls):
-        return _init_and_index(
+        proj = _init_and_index(
             _BUILDS / "arduino",
             replacements={
                 "[build] fqbn": '"arduino:avr:uno"',
             },
             clean_db=True,
         )
+        yield proj
+        _cleanup_index_db(proj)
 
     def test_compile_commands_generated(self, indexed):
         entries = json.loads((indexed / "compile_commands.json").read_text())
@@ -689,11 +705,13 @@ class TestMbedOSInitAndIndex:
             pytest.skip("GCC_ARM_PATH not found in ~/.mbed/.mbed")
         if not Path(cls._GCC_ARM, "arm-none-eabi-gcc").exists():
             pytest.skip(f"ARM GCC not found at {cls._GCC_ARM}")
-        return _init_and_index(
+        proj = _init_and_index(
             _BUILDS / "mbed_os",
             extra_env=cls._MBED_ENV,
             clean_db=True,
         )
+        yield proj
+        _cleanup_index_db(proj)
 
     def test_compile_commands_generated(self, indexed):
         entries = json.loads((indexed / "compile_commands.json").read_text())
@@ -761,7 +779,7 @@ class TestZephyrInitAndIndex:
             pytest.skip("Zephyr SDK not found")
         if not cls._WEST_BIN.exists():
             pytest.skip(f"west not installed (expected at {cls._WEST_BIN})")
-        return _init_and_index(
+        proj = _init_and_index(
             _BUILDS / "zephyr",
             replacements={
                 "[build] board": '"nrf52840dk/nrf52840"',
@@ -769,6 +787,8 @@ class TestZephyrInitAndIndex:
             extra_env=cls._ZEPHYR_ENV,
             clean_db=True,
         )
+        yield proj
+        _cleanup_index_db(proj)
 
     def test_compile_commands_generated(self, indexed):
         entries = json.loads((indexed / "compile_commands.json").read_text())
@@ -865,11 +885,13 @@ class TestESPIDFInitAndIndex:
             pytest.skip(f"idf.py wrapper not found (expected at {cls._IDF_PY_WRAPPER})")
         # Use fw-context builder directly — CMake 3.30.2 is on PATH
         # (via _IDF_ENV) and the idf.py wrapper also prepends it.
-        return _init_and_index(
+        proj = _init_and_index(
             _BUILDS / "esp_idf",
             extra_env=cls._IDF_ENV,
             clean_db=True,
         )
+        yield proj
+        _cleanup_index_db(proj)
 
     def test_compile_commands_generated(self, indexed):
         entries = json.loads((indexed / "compile_commands.json").read_text())

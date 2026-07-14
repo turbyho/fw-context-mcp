@@ -65,17 +65,18 @@ def _compute_content_hash(
     return compute_content_hash(body, qualified_name, signature, docstring)
 
 
-def _normalize_file_path(abs_path: str, project_root: Path) -> str:
-    """Convert an absolute file path to a project-relative path when inside *project_root*.
+def _normalize_file_path(file_path: str, project_root: Path) -> str:
+    """Convert a file path to project-relative when inside *project_root*.
 
     Files outside *project_root* (SDK, framework) keep their absolute path.
     This is the canonical path normalization for the ``files.path`` column —
     consistent with :func:`_build_filtered_file_content`.
     """
+    resolved_root = project_root.resolve()
     try:
-        return str(Path(abs_path).resolve().relative_to(project_root))
+        return str(Path(file_path).resolve().relative_to(resolved_root))
     except ValueError:
-        return abs_path
+        return file_path
 
 
 def _build_filtered_file_content(
@@ -680,16 +681,16 @@ def store_symbols_for_unit(
         macro_rows: list[tuple] = []
         for m in macros:
             m_raw = str(m.file) if m.file else file_path
-            m_abs = _normalize_file_path(m_raw, project_root)
-            if m_abs not in file_id_cache:
+            m_path = _normalize_file_path(m_raw, project_root)
+            if m_path not in file_id_cache:
                 lang = "cpp" if Path(m_raw).suffix.lower() in {".cpp", ".cc", ".cxx", ".c++"} else "c"
-                m_mtime = current_mtime if m_abs == normalized_tu_path else 0.0
+                m_mtime = current_mtime if m_path == normalized_tu_path else 0.0
                 try:
                     m_mtime = Path(m_raw).stat().st_mtime
                 except OSError:
                     pass
-                file_id_cache[m_abs] = upsert_file(conn, config_hash, m_abs, lang, mtime=m_mtime)
-            m_file_id = file_id_cache[m_abs]
+                file_id_cache[m_path] = upsert_file(conn, config_hash, m_path, lang, mtime=m_mtime)
+            m_file_id = file_id_cache[m_path]
             macro_rows.append(
                 (
                     config_hash,
