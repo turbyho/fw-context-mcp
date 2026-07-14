@@ -189,21 +189,42 @@ void log_message(const char* msg) {
             "directory": str(src),
             "file": "main.c",
             "arguments": [
-                "gcc", "-std=c11", "-O2", "-Isrc", "-c", "main.c", "-o", "build/main.o",
+                "gcc",
+                "-std=c11",
+                "-O2",
+                "-Isrc",
+                "-c",
+                "main.c",
+                "-o",
+                "build/main.o",
             ],
         },
         {
             "directory": str(src),
             "file": "modem.c",
             "arguments": [
-                "gcc", "-std=c11", "-O2", "-Isrc", "-c", "modem.c", "-o", "build/modem.o",
+                "gcc",
+                "-std=c11",
+                "-O2",
+                "-Isrc",
+                "-c",
+                "modem.c",
+                "-o",
+                "build/modem.o",
             ],
         },
         {
             "directory": str(src),
             "file": "utils.c",
             "arguments": [
-                "gcc", "-std=c11", "-O2", "-Isrc", "-c", "utils.c", "-o", "build/utils.o",
+                "gcc",
+                "-std=c11",
+                "-O2",
+                "-Isrc",
+                "-c",
+                "utils.c",
+                "-o",
+                "build/utils.o",
             ],
         },
     ]
@@ -265,6 +286,7 @@ class TestContentHashHelpers:
 
     def test_read_file_lines_not_found(self):
         from fw_context_mcp.utils import read_file_lines
+
         assert read_file_lines("/nonexistent/path/file.c") is None
 
     def test_read_body_normal(self):
@@ -377,15 +399,12 @@ class TestIncrementalReindex:
         db_path = _db_path_for_project(indexed_project)
         conn = open_db(db_path)
         try:
-            ch = (
-                conn.execute(
-                    "SELECT config_hash FROM build_configs ORDER BY created_at DESC LIMIT 1"
-                ).fetchone()["config_hash"]
-            )
+            ch = conn.execute("SELECT config_hash FROM build_configs ORDER BY created_at DESC LIMIT 1").fetchone()[
+                "config_hash"
+            ]
 
             # Check main functions exist
-            for name in ["modem_init", "modem_send", "modem_recv",
-                         "compute_checksum", "log_message", "main"]:
+            for name in ["modem_init", "modem_send", "modem_recv", "compute_checksum", "log_message", "main"]:
                 row = conn.execute(
                     "SELECT name, kind, file_path FROM symbols WHERE config_hash=? AND name=?",
                     (ch, name),
@@ -401,11 +420,9 @@ class TestIncrementalReindex:
         db_path = _db_path_for_project(indexed_project)
         conn = open_db(db_path)
         try:
-            ch = (
-                conn.execute(
-                    "SELECT config_hash FROM build_configs ORDER BY created_at DESC LIMIT 1"
-                ).fetchone()["config_hash"]
-            )
+            ch = conn.execute("SELECT config_hash FROM build_configs ORDER BY created_at DESC LIMIT 1").fetchone()[
+                "config_hash"
+            ]
 
             # ── Insert fake LLM analysis for modem_send ──
             sym_row = conn.execute(
@@ -418,14 +435,22 @@ class TestIncrementalReindex:
                 """INSERT OR REPLACE INTO llm_analysis
                    (symbol_id, summary, inputs, outputs, model, analyzed_at)
                    VALUES (?, ?, ?, ?, ?, datetime('now'))""",
-                (sym_row["id"], "Sends data over modem.",
-                 "data: buffer, len: bytes to send",
-                 "bytes sent or -1 on error", "test-model"),
+                (
+                    sym_row["id"],
+                    "Sends data over modem.",
+                    "data: buffer, len: bytes to send",
+                    "bytes sent or -1 on error",
+                    "test-model",
+                ),
             )
             conn.execute(
                 "UPDATE symbols SET summary=?, inputs=?, outputs=? WHERE id=?",
-                ("Sends data over modem.", "data: buffer, len: bytes to send",
-                 "bytes sent or -1 on error", sym_row["id"]),
+                (
+                    "Sends data over modem.",
+                    "data: buffer, len: bytes to send",
+                    "bytes sent or -1 on error",
+                    sym_row["id"],
+                ),
             )
             conn.commit()
 
@@ -437,9 +462,7 @@ class TestIncrementalReindex:
             assert ana is not None
 
             # ── Get count of symbols with analysis ──
-            analyzed_before = conn.execute(
-                "SELECT COUNT(*) FROM llm_analysis"
-            ).fetchone()[0]
+            analyzed_before = conn.execute("SELECT COUNT(*) FROM llm_analysis").fetchone()[0]
             print(f"  Analysis rows before: {analyzed_before}")
 
         finally:
@@ -465,11 +488,9 @@ class TestIncrementalReindex:
         # ── Verify: modem_send was CHANGED → old analysis should be gone ──
         conn = open_db(db_path)
         try:
-            ch = (
-                conn.execute(
-                    "SELECT config_hash FROM build_configs ORDER BY created_at DESC LIMIT 1"
-                ).fetchone()["config_hash"]
-            )
+            ch = conn.execute("SELECT config_hash FROM build_configs ORDER BY created_at DESC LIMIT 1").fetchone()[
+                "config_hash"
+            ]
             sym_row = conn.execute(
                 "SELECT id FROM symbols WHERE config_hash=? AND name='modem_send'",
                 (ch,),
@@ -497,11 +518,9 @@ class TestIncrementalReindex:
         db_path = _db_path_for_project(indexed_project)
         conn = open_db(db_path)
         try:
-            ch = (
-                conn.execute(
-                    "SELECT config_hash FROM build_configs ORDER BY created_at DESC LIMIT 1"
-                ).fetchone()["config_hash"]
-            )
+            ch = conn.execute("SELECT config_hash FROM build_configs ORDER BY created_at DESC LIMIT 1").fetchone()[
+                "config_hash"
+            ]
 
             # Insert fake LLM analysis for compute_checksum
             sym_row = conn.execute(
@@ -514,15 +533,22 @@ class TestIncrementalReindex:
                 """INSERT OR REPLACE INTO llm_analysis
                    (symbol_id, summary, inputs, outputs, model, analyzed_at)
                    VALUES (?, ?, ?, ?, ?, datetime('now'))""",
-                (sym_row["id"], "Computes XOR checksum of data buffer.",
-                 "data: input, len: buffer length",
-                 "8-bit checksum value", "test-model"),
+                (
+                    sym_row["id"],
+                    "Computes XOR checksum of data buffer.",
+                    "data: input, len: buffer length",
+                    "8-bit checksum value",
+                    "test-model",
+                ),
             )
             conn.execute(
                 "UPDATE symbols SET summary=?, inputs=?, outputs=? WHERE id=?",
-                ("Computes XOR checksum of data buffer.",
-                 "data: input, len: buffer length",
-                 "8-bit checksum value", sym_row["id"]),
+                (
+                    "Computes XOR checksum of data buffer.",
+                    "data: input, len: buffer length",
+                    "8-bit checksum value",
+                    sym_row["id"],
+                ),
             )
             conn.commit()
 
@@ -541,8 +567,8 @@ class TestIncrementalReindex:
         original = utils_c.read_text(encoding="utf-8")
         # Add a comment line — changes file but NOT compute_checksum body
         modified = original.replace(
-            "#include \"utils.h\"",
-            "#include \"utils.h\"\n/* incremental reindex test marker */",
+            '#include "utils.h"',
+            '#include "utils.h"\n/* incremental reindex test marker */',
         )
         utils_c.write_text(modified, encoding="utf-8")
 
@@ -556,11 +582,9 @@ class TestIncrementalReindex:
         # ── Verify: compute_checksum unchanged → analysis preserved ──
         conn = open_db(db_path)
         try:
-            ch = (
-                conn.execute(
-                    "SELECT config_hash FROM build_configs ORDER BY created_at DESC LIMIT 1"
-                ).fetchone()["config_hash"]
-            )
+            ch = conn.execute("SELECT config_hash FROM build_configs ORDER BY created_at DESC LIMIT 1").fetchone()[
+                "config_hash"
+            ]
             sym_row = conn.execute(
                 "SELECT id FROM symbols WHERE config_hash=? AND name='compute_checksum'",
                 (ch,),
@@ -610,11 +634,9 @@ int modem_flush(void) {
         db_path = _db_path_for_project(indexed_project)
         conn = open_db(db_path)
         try:
-            ch = (
-                conn.execute(
-                    "SELECT config_hash FROM build_configs ORDER BY created_at DESC LIMIT 1"
-                ).fetchone()["config_hash"]
-            )
+            ch = conn.execute("SELECT config_hash FROM build_configs ORDER BY created_at DESC LIMIT 1").fetchone()[
+                "config_hash"
+            ]
             row = conn.execute(
                 "SELECT name, kind FROM symbols WHERE config_hash=? AND name='modem_flush'",
                 (ch,),
@@ -671,16 +693,16 @@ int modem_flush(void) {
         db_path = _db_path_for_project(indexed_project)
         conn = open_db(db_path)
         try:
-            ch = (
-                conn.execute(
-                    "SELECT config_hash FROM build_configs ORDER BY created_at DESC LIMIT 1"
-                ).fetchone()["config_hash"]
-            )
+            ch = conn.execute("SELECT config_hash FROM build_configs ORDER BY created_at DESC LIMIT 1").fetchone()[
+                "config_hash"
+            ]
             row = conn.execute(
                 "SELECT name FROM symbols WHERE config_hash=? AND name='modem_recv' AND is_definition=1",
                 (ch,),
             ).fetchone()
-            assert row is None, f"modem_recv definition should be deleted but still exists: {dict(row) if row else None}"
+            assert row is None, (
+                f"modem_recv definition should be deleted but still exists: {dict(row) if row else None}"
+            )
         finally:
             conn.close()
 
@@ -712,11 +734,9 @@ class TestMoveDetection:
         conn = open_db(db_path)
         ch = ""
         try:
-            ch = (
-                conn.execute(
-                    "SELECT config_hash FROM build_configs ORDER BY created_at DESC LIMIT 1"
-                ).fetchone()["config_hash"]
-            )
+            ch = conn.execute("SELECT config_hash FROM build_configs ORDER BY created_at DESC LIMIT 1").fetchone()[
+                "config_hash"
+            ]
 
             # Insert fake LLM analysis for log_message (currently in utils.c)
             sym_row = conn.execute(
@@ -731,14 +751,11 @@ class TestMoveDetection:
                 """INSERT OR REPLACE INTO llm_analysis
                    (symbol_id, summary, inputs, outputs, model, analyzed_at)
                    VALUES (?, ?, ?, ?, ?, datetime('now'))""",
-                (sym_row["id"], "Logs a message to UART.",
-                 "msg: null-terminated string",
-                 "void", "test-model"),
+                (sym_row["id"], "Logs a message to UART.", "msg: null-terminated string", "void", "test-model"),
             )
             conn.execute(
                 "UPDATE symbols SET summary=?, inputs=?, outputs=? WHERE id=?",
-                ("Logs a message to UART.", "msg: null-terminated string",
-                 "void", sym_row["id"]),
+                ("Logs a message to UART.", "msg: null-terminated string", "void", sym_row["id"]),
             )
             conn.commit()
         finally:
@@ -779,11 +796,9 @@ class TestMoveDetection:
         # ── Verify log_message is in modem.c ──
         conn = open_db(db_path)
         try:
-            ch = (
-                conn.execute(
-                    "SELECT config_hash FROM build_configs ORDER BY created_at DESC LIMIT 1"
-                ).fetchone()["config_hash"]
-            )
+            ch = conn.execute("SELECT config_hash FROM build_configs ORDER BY created_at DESC LIMIT 1").fetchone()[
+                "config_hash"
+            ]
             row = conn.execute(
                 "SELECT id, file_path FROM symbols WHERE config_hash=? AND name='log_message'",
                 (ch,),
@@ -791,9 +806,7 @@ class TestMoveDetection:
             assert row is not None, "log_message disappeared"
             print(f"  log_message now in: {row['file_path']}")
             # Should now be in modem.c
-            assert "modem.c" in row["file_path"], (
-                f"Expected log_message in modem.c, got {row['file_path']}"
-            )
+            assert "modem.c" in row["file_path"], f"Expected log_message in modem.c, got {row['file_path']}"
 
             # Check if analysis was preserved (Phase 4 move)
             ana = conn.execute(
@@ -846,11 +859,9 @@ class TestMoveDetection:
         db_path = _db_path_for_project(indexed_project)
         conn = open_db(db_path)
         try:
-            ch = (
-                conn.execute(
-                    "SELECT config_hash FROM build_configs ORDER BY created_at DESC LIMIT 1"
-                ).fetchone()["config_hash"]
-            )
+            ch = conn.execute("SELECT config_hash FROM build_configs ORDER BY created_at DESC LIMIT 1").fetchone()[
+                "config_hash"
+            ]
             rows = conn.execute(
                 "SELECT file_path FROM symbols WHERE config_hash=? AND name='compute_checksum'",
                 (ch,),
@@ -877,11 +888,9 @@ class TestAutoReindexStale:
         db_path = _db_path_for_project(indexed_project)
         conn = open_db(db_path)
         try:
-            ch = (
-                conn.execute(
-                    "SELECT config_hash FROM build_configs ORDER BY created_at DESC LIMIT 1"
-                ).fetchone()["config_hash"]
-            )
+            ch = conn.execute("SELECT config_hash FROM build_configs ORDER BY created_at DESC LIMIT 1").fetchone()[
+                "config_hash"
+            ]
 
             from fw_context_mcp.mcp.shared.stale import _count_modified_files
 
@@ -913,9 +922,7 @@ class TestAutoReindexStale:
         utils_c.touch()
 
         # Run auto-reindex
-        ok, failed = _auto_reindex_stale(
-            ["src/utils.c"], str(indexed_project), max_files=5, timeout_s=30.0
-        )
+        ok, failed = _auto_reindex_stale(["src/utils.c"], str(indexed_project), max_files=5, timeout_s=30.0)
         print(f"  OK: {ok}, Failed: {failed}")
         # utils.c should reindex successfully
         assert len(ok) >= 1, f"No files reindexed: ok={ok}, failed={failed}"
@@ -988,21 +995,19 @@ class TestReindexFileImplEdgeCases:
 
         db_path = _db_path_for_project(indexed_project)
         target = (indexed_project / "src" / "utils.c").resolve()
-        target_str = str(target)
+        target_str = "src/utils.c"  # normalized path (relative to project_root)
 
         # ── Precondition: file exists in index ──
         conn = _open_db(db_path)
         try:
-            config_hash = conn.execute(
-                "SELECT config_hash FROM build_configs LIMIT 1"
-            ).fetchone()["config_hash"]
+            config_hash = conn.execute("SELECT config_hash FROM build_configs LIMIT 1").fetchone()["config_hash"]
 
             known = get_file_mtimes(conn, config_hash)
             assert target_str in known, f"{target_str} not in files table before test"
             old_file_id = known[target_str][0]
-            sym_count_before = conn.execute(
-                "SELECT COUNT(*) FROM symbols WHERE file_id=?", (old_file_id,)
-            ).fetchone()[0]
+            sym_count_before = conn.execute("SELECT COUNT(*) FROM symbols WHERE file_id=?", (old_file_id,)).fetchone()[
+                0
+            ]
             assert sym_count_before > 0, "Expected symbols for utils.c before deletion"
         finally:
             conn.close()
@@ -1074,18 +1079,40 @@ class TestStoreSymbolsForUnitAnalysisRestore:
 
         # Create a source file on disk (needed for content hashing)
         src_file = tmp_path / "test.c"
-        src_file.write_text(
-            "void foo(void) {\n    return;\n}\n", encoding="utf-8"
-        )
+        src_file.write_text("void foo(void) {\n    return;\n}\n", encoding="utf-8")
 
         # Manually upsert file and symbol with analysis
         file_id = upsert_file(conn, config_hash, str(src_file), "c")
-        insert_symbols_batch(conn, [
-            (config_hash, file_id, "test.c",
-             split_tokens("foo", "foo"),
-             "usr::foo", "foo", "foo", "function",
-             1, 1, 3, 1, "void foo(void)", "", None, 0, 0, "", 0, "", 0, 0.0, ""),
-        ])
+        insert_symbols_batch(
+            conn,
+            [
+                (
+                    config_hash,
+                    file_id,
+                    "test.c",
+                    split_tokens("foo", "foo"),
+                    "usr::foo",
+                    "foo",
+                    "foo",
+                    "function",
+                    1,
+                    1,
+                    3,
+                    1,
+                    "void foo(void)",
+                    "",
+                    None,
+                    0,
+                    0,
+                    "",
+                    0,
+                    "",
+                    0,
+                    0.0,
+                    "",
+                ),
+            ],
+        )
         sym_id = conn.execute(
             "SELECT id FROM symbols WHERE usr='usr::foo' AND config_hash=?",
             (config_hash,),
@@ -1105,14 +1132,20 @@ class TestStoreSymbolsForUnitAnalysisRestore:
         # Populate global cache — Phase 3 reads from ~/.fw-context/llm_cache.db.
         # Redirect HOME so get_local_cache_db uses tmp_path.
         from fw_context_mcp.utils import compute_content_hash
+
         content_hash = compute_content_hash(
-            "void foo(void) {\n    return;\n}\n", "foo", "void foo(void)", "",
+            "void foo(void) {\n    return;\n}\n",
+            "foo",
+            "void foo(void)",
+            "",
         )
         import os as _os
+
         _saved_home = _os.environ.get("HOME")
         _os.environ["HOME"] = str(tmp_path)
         try:
             from fw_context_mcp.cache_client import get_local_cache_db
+
             global_db = get_local_cache_db()
             global_db.execute(
                 """INSERT OR REPLACE INTO llm_analysis_cache
@@ -1137,23 +1170,40 @@ class TestStoreSymbolsForUnitAnalysisRestore:
         from fw_context_mcp.indexer.symbols import Symbol
 
         unit = CompilationUnit(
-            file=Path(src_file), directory=tmp_path, language="c",
+            file=Path(src_file),
+            directory=tmp_path,
+            language="c",
             clang_args=["gcc", "-c", "test.c"],
         )
 
         # Build a Symbol that matches the existing one
         sym = Symbol(
-            usr="usr::foo", name="foo", qualified_name="foo", kind="function",
-            file=str(src_file), line=1, column=1, end_line=3, is_definition=True,
-            signature="void foo(void)", docstring="", enum_value=None,
-            is_virtual=False, is_pure_virtual=False,
-            parent_usr="", is_template=False, template_usr="",
+            usr="usr::foo",
+            name="foo",
+            qualified_name="foo",
+            kind="function",
+            file=str(src_file),
+            line=1,
+            column=1,
+            end_line=3,
+            is_definition=True,
+            signature="void foo(void)",
+            docstring="",
+            enum_value=None,
+            is_virtual=False,
+            is_pure_virtual=False,
+            parent_usr="",
+            is_template=False,
+            template_usr="",
         )
 
         # Call store_symbols_for_unit — this triggers Phase 1 save → Phase 2 delete → Phase 3 restore
         with transaction(conn):
             syms_added, _, _ = store_symbols_for_unit(
-                conn, unit, config_hash, tmp_path,
+                conn,
+                unit,
+                config_hash,
+                tmp_path,
                 source_roots=[tmp_path],
                 index_refs=False,
                 pre_parsed=([sym], [], [], [], []),
@@ -1175,17 +1225,39 @@ class TestStoreSymbolsForUnitAnalysisRestore:
 
         src_file = tmp_path / "test2.c"
         # Write ORIGINAL content
-        src_file.write_text(
-            "int bar(int x) {\n    return x * 2;\n}\n", encoding="utf-8"
-        )
+        src_file.write_text("int bar(int x) {\n    return x * 2;\n}\n", encoding="utf-8")
 
         file_id = upsert_file(conn, config_hash, str(src_file), "c")
-        insert_symbols_batch(conn, [
-            (config_hash, file_id, "test2.c",
-             split_tokens("bar", "bar"),
-             "usr::bar", "bar", "bar", "function",
-             1, 1, 3, 1, "int bar(int x)", "", None, 0, 0, "", 0, "", 0, 0.0, ""),
-        ])
+        insert_symbols_batch(
+            conn,
+            [
+                (
+                    config_hash,
+                    file_id,
+                    "test2.c",
+                    split_tokens("bar", "bar"),
+                    "usr::bar",
+                    "bar",
+                    "bar",
+                    "function",
+                    1,
+                    1,
+                    3,
+                    1,
+                    "int bar(int x)",
+                    "",
+                    None,
+                    0,
+                    0,
+                    "",
+                    0,
+                    "",
+                    0,
+                    0.0,
+                    "",
+                ),
+            ],
+        )
         sym_id = conn.execute(
             "SELECT id FROM symbols WHERE usr='usr::bar' AND config_hash=?",
             (config_hash,),
@@ -1204,29 +1276,44 @@ class TestStoreSymbolsForUnitAnalysisRestore:
         conn.commit()
 
         # NOW modify the file on disk — change the function body AFTER analysis was saved
-        src_file.write_text(
-            "int bar(int x) {\n    return x * 3;\n}\n", encoding="utf-8"
-        )
+        src_file.write_text("int bar(int x) {\n    return x * 3;\n}\n", encoding="utf-8")
 
         from fw_context_mcp.indexer.compile_commands import CompilationUnit
         from fw_context_mcp.indexer.symbols import Symbol
 
         unit = CompilationUnit(
-            file=Path(src_file), directory=tmp_path, language="c",
+            file=Path(src_file),
+            directory=tmp_path,
+            language="c",
             clang_args=["gcc", "-c", "test2.c"],
         )
 
         sym = Symbol(
-            usr="usr::bar", name="bar", qualified_name="bar", kind="function",
-            file=str(src_file), line=1, column=1, end_line=3, is_definition=True,
-            signature="int bar(int x)", docstring="", enum_value=None,
-            is_virtual=False, is_pure_virtual=False,
-            parent_usr="", is_template=False, template_usr="",
+            usr="usr::bar",
+            name="bar",
+            qualified_name="bar",
+            kind="function",
+            file=str(src_file),
+            line=1,
+            column=1,
+            end_line=3,
+            is_definition=True,
+            signature="int bar(int x)",
+            docstring="",
+            enum_value=None,
+            is_virtual=False,
+            is_pure_virtual=False,
+            parent_usr="",
+            is_template=False,
+            template_usr="",
         )
 
         with transaction(conn):
             syms_added, _, _ = store_symbols_for_unit(
-                conn, unit, config_hash, tmp_path,
+                conn,
+                unit,
+                config_hash,
+                tmp_path,
                 source_roots=[tmp_path],
                 index_refs=False,
                 pre_parsed=([sym], [], [], [], []),
@@ -1254,18 +1341,40 @@ class TestStoreSymbolsForUnitAnalysisRestore:
         conn, config_hash, root = store_db
 
         src_file = tmp_path / "test3.c"
-        src_file.write_text(
-            "void helper(void) {\n    return;\n}\n", encoding="utf-8"
-        )
+        src_file.write_text("void helper(void) {\n    return;\n}\n", encoding="utf-8")
 
         file_id = upsert_file(conn, config_hash, str(src_file), "c")
         # Insert symbol WITHOUT analysis
-        insert_symbols_batch(conn, [
-            (config_hash, file_id, "test3.c",
-             split_tokens("helper", "helper"),
-             "usr::helper", "helper", "helper", "function",
-             1, 1, 3, 1, "void helper(void)", "", None, 0, 0, "", 0, "", 0, 0.0, ""),
-        ])
+        insert_symbols_batch(
+            conn,
+            [
+                (
+                    config_hash,
+                    file_id,
+                    "test3.c",
+                    split_tokens("helper", "helper"),
+                    "usr::helper",
+                    "helper",
+                    "helper",
+                    "function",
+                    1,
+                    1,
+                    3,
+                    1,
+                    "void helper(void)",
+                    "",
+                    None,
+                    0,
+                    0,
+                    "",
+                    0,
+                    "",
+                    0,
+                    0.0,
+                    "",
+                ),
+            ],
+        )
         conn.commit()
 
         # Verify no analysis
@@ -1276,20 +1385,37 @@ class TestStoreSymbolsForUnitAnalysisRestore:
         from fw_context_mcp.indexer.symbols import Symbol
 
         unit = CompilationUnit(
-            file=Path(src_file), directory=tmp_path, language="c",
+            file=Path(src_file),
+            directory=tmp_path,
+            language="c",
             clang_args=["gcc", "-c", "test3.c"],
         )
         sym = Symbol(
-            usr="usr::helper", name="helper", qualified_name="helper", kind="function",
-            file=str(src_file), line=1, column=1, end_line=3, is_definition=True,
-            signature="void helper(void)", docstring="", enum_value=None,
-            is_virtual=False, is_pure_virtual=False,
-            parent_usr="", is_template=False, template_usr="",
+            usr="usr::helper",
+            name="helper",
+            qualified_name="helper",
+            kind="function",
+            file=str(src_file),
+            line=1,
+            column=1,
+            end_line=3,
+            is_definition=True,
+            signature="void helper(void)",
+            docstring="",
+            enum_value=None,
+            is_virtual=False,
+            is_pure_virtual=False,
+            parent_usr="",
+            is_template=False,
+            template_usr="",
         )
 
         with transaction(conn):
             syms_added, _, _ = store_symbols_for_unit(
-                conn, unit, config_hash, tmp_path,
+                conn,
+                unit,
+                config_hash,
+                tmp_path,
                 source_roots=[tmp_path],
                 index_refs=False,
                 pre_parsed=([sym], [], [], [], []),
@@ -1309,17 +1435,39 @@ class TestStoreSymbolsForUnitAnalysisRestore:
         conn, config_hash, root = store_db
 
         src_file = tmp_path / "test4.c"
-        src_file.write_text(
-            "int calc(void) {\n    return 42;\n}\n", encoding="utf-8"
-        )
+        src_file.write_text("int calc(void) {\n    return 42;\n}\n", encoding="utf-8")
 
         file_id = upsert_file(conn, config_hash, str(src_file), "c")
-        insert_symbols_batch(conn, [
-            (config_hash, file_id, "test4.c",
-             split_tokens("calc", "calc"),
-             "usr::calc", "calc", "calc", "function",
-             1, 1, 3, 1, "int calc(void)", "", None, 0, 0, "", 0, "", 0, 0.0, ""),
-        ])
+        insert_symbols_batch(
+            conn,
+            [
+                (
+                    config_hash,
+                    file_id,
+                    "test4.c",
+                    split_tokens("calc", "calc"),
+                    "usr::calc",
+                    "calc",
+                    "calc",
+                    "function",
+                    1,
+                    1,
+                    3,
+                    1,
+                    "int calc(void)",
+                    "",
+                    None,
+                    0,
+                    0,
+                    "",
+                    0,
+                    "",
+                    0,
+                    0.0,
+                    "",
+                ),
+            ],
+        )
         sym_id = conn.execute("SELECT id FROM symbols WHERE usr='usr::calc'").fetchone()["id"]
 
         conn.execute(
@@ -1334,14 +1482,20 @@ class TestStoreSymbolsForUnitAnalysisRestore:
         )
 
         from fw_context_mcp.utils import compute_content_hash
+
         content_hash = compute_content_hash(
-            "int calc(void) {\n    return 42;\n}\n", "calc", "int calc(void)", "",
+            "int calc(void) {\n    return 42;\n}\n",
+            "calc",
+            "int calc(void)",
+            "",
         )
         import os as _os2
+
         _saved_home2 = _os2.environ.get("HOME")
         _os2.environ["HOME"] = str(tmp_path)
         try:
             from fw_context_mcp.cache_client import get_local_cache_db as _get_db2
+
             global_db2 = _get_db2()
             global_db2.execute(
                 """INSERT OR REPLACE INTO llm_analysis_cache
@@ -1361,20 +1515,37 @@ class TestStoreSymbolsForUnitAnalysisRestore:
         from fw_context_mcp.indexer.symbols import Symbol
 
         unit = CompilationUnit(
-            file=Path(src_file), directory=tmp_path, language="c",
+            file=Path(src_file),
+            directory=tmp_path,
+            language="c",
             clang_args=["gcc", "-c", "test4.c"],
         )
         sym = Symbol(
-            usr="usr::calc", name="calc", qualified_name="calc", kind="function",
-            file=str(src_file), line=1, column=1, end_line=3, is_definition=True,
-            signature="int calc(void)", docstring="", enum_value=None,
-            is_virtual=False, is_pure_virtual=False,
-            parent_usr="", is_template=False, template_usr="",
+            usr="usr::calc",
+            name="calc",
+            qualified_name="calc",
+            kind="function",
+            file=str(src_file),
+            line=1,
+            column=1,
+            end_line=3,
+            is_definition=True,
+            signature="int calc(void)",
+            docstring="",
+            enum_value=None,
+            is_virtual=False,
+            is_pure_virtual=False,
+            parent_usr="",
+            is_template=False,
+            template_usr="",
         )
 
         with transaction(conn):
             syms_added, _, _ = store_symbols_for_unit(
-                conn, unit, config_hash, tmp_path,
+                conn,
+                unit,
+                config_hash,
+                tmp_path,
                 source_roots=[tmp_path],
                 index_refs=False,
                 pre_parsed=([sym], [], [], [], []),
@@ -1413,7 +1584,9 @@ def indexed_project_with_analysis(tmp_path_factory):
     _repo_tests = Path(__file__).resolve().parent
     _fixture_src = _repo_tests.parent / "src"  # not used, write inline
 
-    _write_file(src / "main.c", """\
+    _write_file(
+        src / "main.c",
+        """\
 #include <stdio.h>
 #include "modem.h"
 #include "utils.h"
@@ -1424,9 +1597,12 @@ int main(void) {
     printf("result=%d\\n", result);
     return 0;
 }
-""")
+""",
+    )
 
-    _write_file(src / "modem.h", """\
+    _write_file(
+        src / "modem.h",
+        """\
 #ifndef MODEM_H
 #define MODEM_H
 
@@ -1435,9 +1611,12 @@ int modem_send(const char* data, int len);
 int modem_recv(char* buf, int max_len);
 
 #endif
-""")
+""",
+    )
 
-    _write_file(src / "modem.c", """\
+    _write_file(
+        src / "modem.c",
+        """\
 #include "modem.h"
 #include <string.h>
 
@@ -1457,9 +1636,12 @@ int modem_recv(char* buf, int max_len) {
     memset(buf, 0, max_len);
     return 0;
 }
-""")
+""",
+    )
 
-    _write_file(src / "utils.h", """\
+    _write_file(
+        src / "utils.h",
+        """\
 #ifndef UTILS_H
 #define UTILS_H
 
@@ -1467,9 +1649,12 @@ int compute_checksum(const char* data, int len);
 void log_message(const char* msg);
 
 #endif
-""")
+""",
+    )
 
-    _write_file(src / "utils.c", """\
+    _write_file(
+        src / "utils.c",
+        """\
 #include "utils.h"
 #include <string.h>
 
@@ -1486,15 +1671,25 @@ void log_message(const char* msg) {
     if (!msg) return;
     (void)strlen(msg);
 }
-""")
+""",
+    )
 
     cc = [
-        {"directory": str(src), "file": "main.c",
-         "arguments": ["gcc", "-std=c11", "-O2", "-Isrc", "-c", "main.c", "-o", "build/main.o"]},
-        {"directory": str(src), "file": "modem.c",
-         "arguments": ["gcc", "-std=c11", "-O2", "-Isrc", "-c", "modem.c", "-o", "build/modem.o"]},
-        {"directory": str(src), "file": "utils.c",
-         "arguments": ["gcc", "-std=c11", "-O2", "-Isrc", "-c", "utils.c", "-o", "build/utils.o"]},
+        {
+            "directory": str(src),
+            "file": "main.c",
+            "arguments": ["gcc", "-std=c11", "-O2", "-Isrc", "-c", "main.c", "-o", "build/main.o"],
+        },
+        {
+            "directory": str(src),
+            "file": "modem.c",
+            "arguments": ["gcc", "-std=c11", "-O2", "-Isrc", "-c", "modem.c", "-o", "build/modem.o"],
+        },
+        {
+            "directory": str(src),
+            "file": "utils.c",
+            "arguments": ["gcc", "-std=c11", "-O2", "-Isrc", "-c", "utils.c", "-o", "build/utils.o"],
+        },
     ]
     cc_json = proj / "compile_commands.json"
     cc_json.write_text(json.dumps(cc, indent=2), encoding="utf-8")
@@ -1526,9 +1721,9 @@ void log_message(const char* msg) {
 
 def _config_hash(conn):
     """Return the latest config_hash from the database."""
-    return conn.execute(
-        "SELECT config_hash FROM build_configs ORDER BY created_at DESC LIMIT 1"
-    ).fetchone()["config_hash"]
+    return conn.execute("SELECT config_hash FROM build_configs ORDER BY created_at DESC LIMIT 1").fetchone()[
+        "config_hash"
+    ]
 
 
 # ── LLM analysis consistency tests (requires Ollama) ──────────────────
@@ -1565,9 +1760,7 @@ class TestLlvmAnalysisConsistency:
             ).fetchall()
             for r in rows:
                 assert r["summary"], f"Empty summary for {r['name']}"
-                assert len(r["summary"]) > 10, (
-                    f"Summary too short for {r['name']}: {r['summary']!r}"
-                )
+                assert len(r["summary"]) > 10, f"Summary too short for {r['name']}: {r['summary']!r}"
                 assert r["model"], f"Empty model for {r['name']}"
                 print(f"  {r['name']} ({r['kind']}): model={r['model']} summary={r['summary'][:80]}...")
 
@@ -1593,9 +1786,7 @@ class TestLlvmAnalysisConsistency:
                 print(f"  {r['name']:20s} kind={r['kind']:10s} line={r['line']:3d} end={r['end_line']:3d}")
                 assert r["line"] > 0, f"Invalid line for {r['name']}"
                 if r["end_line"] > 0:
-                    assert r["end_line"] >= r["line"], (
-                        f"end_line < line for {r['name']}: {r['end_line']} < {r['line']}"
-                    )
+                    assert r["end_line"] >= r["line"], f"end_line < line for {r['name']}: {r['end_line']} < {r['line']}"
 
             names = {r["name"] for r in rows}
             for fn in ["modem_init", "modem_send", "modem_recv"]:
@@ -1863,9 +2054,7 @@ int compute_average(const int* values, int count) {
                 assert name in new_lines, f"{name} disappeared"
                 expected = old_line + INSERTED_LINES
                 actual = new_lines[name]
-                assert actual == expected, (
-                    f"{name}: expected line {expected}, got {actual} (old={old_line})"
-                )
+                assert actual == expected, f"{name}: expected line {expected}, got {actual} (old={old_line})"
             print(f"  ✓ All line numbers shifted correctly by +{INSERTED_LINES}")
 
         finally:
@@ -1896,10 +2085,12 @@ int compute_average(const int* values, int count) {
         for i in range(3):
             time.sleep(1.2)
             result = reindex_file_impl(
-                "src/modem.c", str(indexed_project_with_analysis), with_analysis=True,
+                "src/modem.c",
+                str(indexed_project_with_analysis),
+                with_analysis=True,
             )
-            assert "error" not in result, f"Reindex {i+1} failed: {result.get('error')}"
-            print(f"  Reindex {i+1}: symbols={result.get('symbols_updated')}")
+            assert "error" not in result, f"Reindex {i + 1} failed: {result.get('error')}"
+            print(f"  Reindex {i + 1}: symbols={result.get('symbols_updated')}")
 
         conn = open_db(db_path)
         try:
@@ -1909,9 +2100,7 @@ int compute_average(const int* values, int count) {
                 (ch,),
             ).fetchone()[0]
             print(f"  Final analysis count: {final_count}")
-            assert final_count >= initial_count, (
-                f"Analysis count decreased: {initial_count} → {final_count}"
-            )
+            assert final_count >= initial_count, f"Analysis count decreased: {initial_count} → {final_count}"
 
             dups = conn.execute(
                 """SELECT usr, COUNT(*) as cnt FROM symbols
@@ -1931,10 +2120,7 @@ int compute_average(const int* values, int count) {
 def _symbol_names(conn, config_hash: str) -> set[str]:
     """Return the set of symbol names for a given config_hash."""
     return {
-        r["name"]
-        for r in conn.execute(
-            "SELECT name FROM symbols WHERE config_hash = ?", (config_hash,)
-        ).fetchall()
+        r["name"] for r in conn.execute("SELECT name FROM symbols WHERE config_hash = ?", (config_hash,)).fetchall()
     }
 
 
@@ -1991,9 +2177,7 @@ class TestBackgroundReindex:
             conn = open_db(db_path)
             try:
                 ch_after = _config_hash(conn)
-                assert ch_after == ch_before, (
-                    f"config_hash changed unexpectedly: {ch_before[:12]} → {ch_after[:12]}"
-                )
+                assert ch_after == ch_before, f"config_hash changed unexpectedly: {ch_before[:12]} → {ch_after[:12]}"
                 row = conn.execute(
                     "SELECT line, end_line FROM symbols WHERE config_hash=? AND name='modem_send'",
                     (ch_after,),
@@ -2046,13 +2230,22 @@ int sensor_read(void) {
         # ── Add to compile_commands.json ──
         cc_json = indexed_project / "compile_commands.json"
         cc = json.loads(cc_json.read_text(encoding="utf-8"))
-        cc.append({
-            "directory": str(indexed_project / "src"),
-            "file": "sensor.c",
-            "arguments": [
-                "gcc", "-std=c11", "-O2", "-Isrc", "-c", "sensor.c", "-o", "build/sensor.o",
-            ],
-        })
+        cc.append(
+            {
+                "directory": str(indexed_project / "src"),
+                "file": "sensor.c",
+                "arguments": [
+                    "gcc",
+                    "-std=c11",
+                    "-O2",
+                    "-Isrc",
+                    "-c",
+                    "sensor.c",
+                    "-o",
+                    "build/sensor.o",
+                ],
+            }
+        )
         cc_json.write_text(json.dumps(cc, indent=2), encoding="utf-8")
 
         try:
@@ -2069,7 +2262,7 @@ int sensor_read(void) {
                 index_refs=False,
                 index_embeddings=False,
                 analyze_symbols=False,
-                               analyze_overrides=False,
+                analyze_overrides=False,
             )
             print(f"  New config_hash: {config_hash_new[:16]}…")
 
@@ -2127,7 +2320,7 @@ int sensor_read(void) {
                 index_refs=False,
                 index_embeddings=False,
                 analyze_symbols=False,
-                               analyze_overrides=False,
+                analyze_overrides=False,
             )
             print(f"  New config_hash: {config_hash_new[:16]}…")
 
@@ -2208,16 +2401,14 @@ class TestFastStalenessCheck:
                 index_refs=True,
                 index_embeddings=False,
                 analyze_symbols=False,
-                               analyze_overrides=False,
+                analyze_overrides=False,
             )
         finally:
             _os.environ.pop("FW_CONTEXT_FORCE_REFINDEX", None)
 
         # Now check — refs should be present
         needs, reasons = _fast_staleness_check(indexed_project)
-        assert "refs missing" not in reasons, (
-            f"Refs should be populated after reindex with --refs, got: {reasons}"
-        )
+        assert "refs missing" not in reasons, f"Refs should be populated after reindex with --refs, got: {reasons}"
         # Note: "indirect call sites missing" may be legitimate — the test
         # project has no function pointer calls, so the table is empty.
         # mtimes must not be false-positive detected as changed
@@ -2225,9 +2416,7 @@ class TestFastStalenessCheck:
         try:
             ch = _config_hash(conn)
             mod_count = _count_modified_files(conn, ch, indexed_project)
-            assert mod_count == 0, (
-                f"After reindex, 0 files should be detected as modified, got {mod_count}"
-            )
+            assert mod_count == 0, f"After reindex, 0 files should be detected as modified, got {mod_count}"
         finally:
             conn.close()
 
@@ -2245,11 +2434,15 @@ class TestFastStalenessCheck:
         _os.environ["FW_CONTEXT_FORCE_REFINDEX"] = "1"
         try:
             run(
-                compile_commands=cc_json, db_path=db_path,
-                source_roots=[], exclude_paths=[],
+                compile_commands=cc_json,
+                db_path=db_path,
+                source_roots=[],
+                exclude_paths=[],
                 project_root=indexed_project,
-                index_refs=True, index_embeddings=False,
-                analyze_symbols=False, analyze_overrides=False,
+                index_refs=True,
+                index_embeddings=False,
+                analyze_symbols=False,
+                analyze_overrides=False,
             )
         finally:
             _os.environ.pop("FW_CONTEXT_FORCE_REFINDEX", None)
@@ -2280,9 +2473,7 @@ class TestFastStalenessCheck:
 
         needs, reasons = _fast_staleness_check(indexed_project)
         assert needs, "Should detect schema mismatch"
-        assert any("schema" in r for r in reasons), (
-            f"Expected schema-related reason, got: {reasons}"
-        )
+        assert any("schema" in r for r in reasons), f"Expected schema-related reason, got: {reasons}"
 
     def test_compile_commands_changed_detection(self, indexed_project: Path):
         """When compile_commands.json mtime is newer than index, it's detected."""
@@ -2329,8 +2520,7 @@ class TestModifiedFilesCache:
             # Second call — must hit cache
             count2 = _count_modified_files(conn, ch, indexed_project, use_cache=True)
             assert count2 == count1, (
-                f"Cache should return {count1}, got {count2} "
-                "(stored mtimes were bumped, so fresh count would be 0)"
+                f"Cache should return {count1}, got {count2} (stored mtimes were bumped, so fresh count would be 0)"
             )
         finally:
             conn.close()
@@ -2397,9 +2587,7 @@ class TestModifiedFilesCache:
             conn.execute("UPDATE files SET mtime = mtime + 100000 WHERE config_hash=?", (ch,))
             conn.commit()
             count2 = _count_modified_files(conn, ch, indexed_project, use_cache=False)
-            assert count2 == 0, (
-                f"Without cache, bumped mtimes should give 0 modified, got {count2}"
-            )
+            assert count2 == 0, f"Without cache, bumped mtimes should give 0 modified, got {count2}"
             _ = count1  # used only for reference
         finally:
             conn.close()
@@ -2435,8 +2623,14 @@ class TestForceRefindex:
         # ── Without env var: should return "unchanged" ──
         _os.environ.pop("FW_CONTEXT_FORCE_REFINDEX", None)
         status, _, _, _, _ = _process_unit(
-            modem_unit[0], ch, indexed_project, [indexed_project], [], False,
-            db_path, existing_files=existing,
+            modem_unit[0],
+            ch,
+            indexed_project,
+            [indexed_project],
+            [],
+            False,
+            db_path,
+            existing_files=existing,
         )
         assert status == "unchanged", (
             f"Without FORCE_REFINDEX, unchanged file should return 'unchanged', got '{status}'"
@@ -2446,8 +2640,14 @@ class TestForceRefindex:
         _os.environ["FW_CONTEXT_FORCE_REFINDEX"] = "1"
         try:
             status_forced, syms, _, _, _ = _process_unit(
-                modem_unit[0], ch, indexed_project, [indexed_project], [], False,
-                db_path, existing_files=existing,
+                modem_unit[0],
+                ch,
+                indexed_project,
+                [indexed_project],
+                [],
+                False,
+                db_path,
+                existing_files=existing,
             )
             assert status_forced == "updated", (
                 f"With FORCE_REFINDEX, unchanged file should return 'updated', got '{status_forced}'"
@@ -2481,12 +2681,16 @@ class TestForceRefindex:
         _os.environ["FW_CONTEXT_FORCE_REFINDEX"] = "0"
         try:
             status, _, _, _, _ = _process_unit(
-                modem_unit[0], ch, indexed_project, [indexed_project], [], False,
-                db_path, existing_files=existing,
+                modem_unit[0],
+                ch,
+                indexed_project,
+                [indexed_project],
+                [],
+                False,
+                db_path,
+                existing_files=existing,
             )
-            assert status == "unchanged", (
-                f"FORCE_REFINDEX=0 should still do mtime check, got '{status}'"
-            )
+            assert status == "unchanged", f"FORCE_REFINDEX=0 should still do mtime check, got '{status}'"
         finally:
             _os.environ.pop("FW_CONTEXT_FORCE_REFINDEX", None)
 
@@ -2495,7 +2699,8 @@ class TestBgReindexEndToEnd:
     """End-to-end: simulate the missing-refs → reindex → no-false-positive cycle."""
 
     def test_missing_refs_reindex_no_false_positive_cycle(
-        self, indexed_project: Path,
+        self,
+        indexed_project: Path,
     ):
         """The full cycle: missing refs → reindex via runner.run() → no false positive.
 
@@ -2519,11 +2724,15 @@ class TestBgReindexEndToEnd:
 
         # ── First, establish a baseline with refs filled ──
         run(
-            compile_commands=cc_json, db_path=db_path,
-            source_roots=[], exclude_paths=[],
+            compile_commands=cc_json,
+            db_path=db_path,
+            source_roots=[],
+            exclude_paths=[],
             project_root=indexed_project,
-            index_refs=True, index_embeddings=False,
-            analyze_symbols=False, analyze_overrides=False,
+            index_refs=True,
+            index_embeddings=False,
+            analyze_symbols=False,
+            analyze_overrides=False,
         )
 
         # ── Step 1: Delete refs (simulate db corruption or pre-refs index) ──
@@ -2533,9 +2742,7 @@ class TestBgReindexEndToEnd:
             conn.execute("DELETE FROM refs WHERE config_hash=?", (ch,))
             conn.execute("DELETE FROM indirect_call_sites WHERE config_hash=?", (ch,))
             conn.commit()
-            ref_count = conn.execute(
-                "SELECT COUNT(*) FROM refs WHERE config_hash=?", (ch,)
-            ).fetchone()[0]
+            ref_count = conn.execute("SELECT COUNT(*) FROM refs WHERE config_hash=?", (ch,)).fetchone()[0]
             assert ref_count == 0
         finally:
             conn.close()
@@ -2551,20 +2758,22 @@ class TestBgReindexEndToEnd:
         _os.environ["FW_CONTEXT_FORCE_REFINDEX"] = "1"
         try:
             run(
-                compile_commands=cc_json, db_path=db_path,
-                source_roots=[], exclude_paths=[],
+                compile_commands=cc_json,
+                db_path=db_path,
+                source_roots=[],
+                exclude_paths=[],
                 project_root=indexed_project,
-                index_refs=True, index_embeddings=False,
-                analyze_symbols=False, analyze_overrides=False,
+                index_refs=True,
+                index_embeddings=False,
+                analyze_symbols=False,
+                analyze_overrides=False,
             )
         finally:
             del _os.environ["FW_CONTEXT_FORCE_REFINDEX"]
 
         # ── Step 4: Verify refs were refilled ──
         needs_after, reasons_after = _fast_staleness_check(indexed_project)
-        assert "refs missing" not in reasons_after, (
-            f"Refs should be populated after bg reindex, got: {reasons_after}"
-        )
+        assert "refs missing" not in reasons_after, f"Refs should be populated after bg reindex, got: {reasons_after}"
         assert "indirect call sites missing" not in reasons_after, (
             f"Indirect call sites should be populated, got: {reasons_after}"
         )
@@ -2582,9 +2791,7 @@ class TestBgReindexEndToEnd:
             )
 
             # Also verify refs are actually populated
-            ref_count_after = conn.execute(
-                "SELECT COUNT(*) FROM refs WHERE config_hash=?", (ch,)
-            ).fetchone()[0]
+            ref_count_after = conn.execute("SELECT COUNT(*) FROM refs WHERE config_hash=?", (ch,)).fetchone()[0]
             assert ref_count_after > 0, "Refs table should be populated after reindex"
             print(f"  After reindex: reasons={reasons_after}, modified={mod_count}, refs={ref_count_after}")
         finally:

@@ -550,7 +550,10 @@ def reindex_file_impl(
             from ..background import _request_bg_reindex_pause, _resume_bg_reindex
 
             known = get_file_mtimes(conn, config_hash)
-            file_path_str = str(target)
+            try:
+                file_path_str = str(target.relative_to(root))
+            except ValueError:
+                file_path_str = str(target)
             if file_path_str not in known:
                 return {"error": f"File not found on disk or in index: {target}"}
 
@@ -707,7 +710,8 @@ def reindex_file_impl(
                     if manifest_data is not None:
                         for unit, _parsed in parsed_units:
                             headers = _collect_headers_from_tokens(
-                                unit, root,
+                                unit,
+                                root,
                                 build_dir_patterns=None,
                             )
                             source_hash = compute_source_hash(unit.file.resolve())
@@ -722,13 +726,15 @@ def reindex_file_impl(
                                     break
                             else:
                                 # TU not in manifest yet — append new entry
-                                manifest_data.setdefault("entries", []).append({
-                                    "file": tu_rel,
-                                    "directory": str(unit.directory) if unit.directory else str(root),
-                                    "arguments": unit.clang_args,
-                                    "source_hash": source_hash,
-                                    "headers": headers,
-                                })
+                                manifest_data.setdefault("entries", []).append(
+                                    {
+                                        "file": tu_rel,
+                                        "directory": str(unit.directory) if unit.directory else str(root),
+                                        "arguments": unit.clang_args,
+                                        "source_hash": source_hash,
+                                        "headers": headers,
+                                    }
+                                )
                         save_manifest(manifest_data, db_path.parent)
                 except Exception:
                     log.debug("manifest.json update skipped during reindex_file", exc_info=True)

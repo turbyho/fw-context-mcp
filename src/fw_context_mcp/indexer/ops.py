@@ -65,6 +65,19 @@ def _compute_content_hash(
     return compute_content_hash(body, qualified_name, signature, docstring)
 
 
+def _normalize_file_path(abs_path: str, project_root: Path) -> str:
+    """Convert an absolute file path to a project-relative path when inside *project_root*.
+
+    Files outside *project_root* (SDK, framework) keep their absolute path.
+    This is the canonical path normalization for the ``files.path`` column —
+    consistent with :func:`_build_filtered_file_content`.
+    """
+    try:
+        return str(Path(abs_path).resolve().relative_to(project_root))
+    except ValueError:
+        return abs_path
+
+
 def _build_filtered_file_content(
     conn, unit, config_hash: str, project_root: Path, *, build_dir_patterns: list[str] | None = None
 ) -> tuple[int, list[dict]]:
@@ -121,9 +134,7 @@ def _build_filtered_file_content(
     from fw_context_mcp.indexer.manifest import HEADER_EXTS as _HEADER_EXTS
     from fw_context_mcp.indexer.manifest import _is_generated_header
 
-    _patterns: tuple[str, ...] = (
-        tuple(build_dir_patterns) if build_dir_patterns else _FALLBACK_BUILD_DIR_PATTERNS
-    )
+    _patterns: tuple[str, ...] = tuple(build_dir_patterns) if build_dir_patterns else _FALLBACK_BUILD_DIR_PATTERNS
 
     # ── Collect included header paths + SHA-256 hashes (always needed for manifest) ──
     headers: list[dict] = []
@@ -184,11 +195,8 @@ def _build_filtered_file_content(
         if not active_lines:
             continue
 
+        db_path = _normalize_file_path(abs_path, project_root)
         resolved = Path(abs_path).resolve()
-        try:
-            db_path = str(resolved.relative_to(project_root))
-        except ValueError:
-            db_path = str(resolved)  # absolute path for files outside project tree
 
         # Already processed?
         row = conn.execute(
@@ -280,6 +288,7 @@ def store_symbols_for_unit(
         exclude_paths = []
 
     file_path = str(unit.file.resolve())
+    normalized_tu_path = _normalize_file_path(file_path, project_root)
     try:
         current_mtime = unit.file.stat().st_mtime if unit.file.exists() else 0.0
     except OSError:
@@ -339,8 +348,8 @@ def store_symbols_for_unit(
     # global cache which may contain stale entries from other projects).
     old_usrs: set[str] = set()
     saved_analyses: dict[str, dict] = {}  # usr → {summary, inputs, output, model, content_hash}
-    if file_path in known:
-        file_id_old = known[file_path][0]
+    if normalized_tu_path in known:
+        file_id_old = known[normalized_tu_path][0]
         old_rows = conn.execute(
             """SELECT s.usr, a.summary, a.inputs, a.outputs, a.model, a.content_hash
                FROM symbols s
@@ -376,8 +385,8 @@ def store_symbols_for_unit(
                 "DELETE FROM inheritance WHERE config_hash = ? AND derived_usr = ?",
                 (config_hash, usr),
             )
-    if file_path in known:
-        file_id_old = known[file_path][0]
+    if normalized_tu_path in known:
+        file_id_old = known[normalized_tu_path][0]
         delete_inheritance_for_file(conn, config_hash, file_id_old)
         delete_symbols_for_file(conn, file_id_old)
         # ON DELETE CASCADE → llm_analysis, embeddings removed
@@ -390,7 +399,7 @@ def store_symbols_for_unit(
         tu_file_id = upsert_file(
             conn,
             config_hash,
-            file_path,
+            normalized_tu_path,
             unit.language,
             mtime=current_mtime,
             content_hash=content_hash_val,
@@ -398,14 +407,14 @@ def store_symbols_for_unit(
             flags_hash=flags_hash,
         )
     else:
-        tu_file_id = upsert_file(conn, config_hash, file_path, unit.language, mtime=current_mtime)
+        tu_file_id = upsert_file(conn, config_hash, normalized_tu_path, unit.language, mtime=current_mtime)
 
     syms_added = 0
     refs_added = 0
     file_id_cache: dict[str, int] = {}
     # Pre-populate the cache with the TU file itself so we don't re-upsert
     # it below.
-    file_id_cache[file_path] = tu_file_id
+    file_id_cache[normalized_tu_path] = tu_file_id
 
     if syms:
         # Pre-compute source_roots as strings for is_project checks
@@ -413,23 +422,21 @@ def store_symbols_for_unit(
         rows = []
         for s in syms:
             sym_file = s.file
-            if sym_file not in file_id_cache:
+            normalized_sym_file = _normalize_file_path(sym_file, project_root)
+            if normalized_sym_file not in file_id_cache:
                 lang = "cpp" if Path(sym_file).suffix.lower() in {".cpp", ".cc", ".cxx", ".c++"} else "c"
                 try:
                     sym_mtime = Path(sym_file).stat().st_mtime
                 except OSError:
                     sym_mtime = 0.0
-                file_id_cache[sym_file] = upsert_file(
+                file_id_cache[normalized_sym_file] = upsert_file(
                     conn,
                     config_hash,
-                    sym_file,
+                    normalized_sym_file,
                     lang,
                     mtime=sym_mtime,
                 )
-            try:
-                rel_path = str(Path(sym_file).resolve().relative_to(project_root))
-            except ValueError:
-                rel_path = sym_file
+            rel_path = normalized_sym_file
             # Determine is_project using the same logic as _is_project_local
             is_proj = 0
             if source_root_strs:
@@ -448,7 +455,7 @@ def store_symbols_for_unit(
             rows.append(
                 (
                     config_hash,
-                    file_id_cache[sym_file],
+                    file_id_cache[normalized_sym_file],
                     rel_path,
                     split_tokens(s.name, s.qualified_name),
                     s.usr,
@@ -553,7 +560,7 @@ def store_symbols_for_unit(
                 continue  # genuine new symbol
             if old_row["summary"] is None:
                 continue  # no analysis to preserve — nothing to move
-            if old_row["file_id"] == file_id_cache[s.file]:
+            if old_row["file_id"] == file_id_cache[normalized_sym_file]:
                 continue  # same file, wasn't in saved_analyses → new symbol
 
             # Same USR, different file — check if content matches
@@ -591,7 +598,7 @@ def store_symbols_for_unit(
                 """UPDATE symbols SET file_id = ?, file_path = ?,
                    line = ?, col = ?, end_line = ?
                    WHERE id = ?""",
-                (file_id_cache[s.file], new_rel, s.line, s.column, s.end_line, old_row["id"]),
+                (file_id_cache[normalized_sym_file], new_rel, s.line, s.column, s.end_line, old_row["id"]),
             )
             # Delete the duplicate row just inserted by insert_symbols_batch
             dup_id = conn.execute(
@@ -672,13 +679,13 @@ def store_symbols_for_unit(
     if macros:
         macro_rows: list[tuple] = []
         for m in macros:
-            m_abs = str(m.file) if m.file else file_path
-            # Use absolute path as files table key (consistent with symbol storage).
+            m_raw = str(m.file) if m.file else file_path
+            m_abs = _normalize_file_path(m_raw, project_root)
             if m_abs not in file_id_cache:
-                lang = "cpp" if Path(m_abs).suffix.lower() in {".cpp", ".cc", ".cxx", ".c++"} else "c"
-                m_mtime = current_mtime if m_abs == file_path else 0.0
+                lang = "cpp" if Path(m_raw).suffix.lower() in {".cpp", ".cc", ".cxx", ".c++"} else "c"
+                m_mtime = current_mtime if m_abs == normalized_tu_path else 0.0
                 try:
-                    m_mtime = Path(m_abs).stat().st_mtime
+                    m_mtime = Path(m_raw).stat().st_mtime
                 except OSError:
                     pass
                 file_id_cache[m_abs] = upsert_file(conn, config_hash, m_abs, lang, mtime=m_mtime)
