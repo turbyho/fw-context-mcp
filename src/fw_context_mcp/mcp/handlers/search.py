@@ -279,7 +279,7 @@ def search_code(
         limit = min(limit, 100)
 
         def _do_search(c: sqlite3.Connection, config_hash: str) -> list[dict]:
-            rows = search_symbols(
+            rows: list = search_symbols(
                 c, query, config_hash, limit=limit, kind=kind,
                 exclude_variables=False,
             )

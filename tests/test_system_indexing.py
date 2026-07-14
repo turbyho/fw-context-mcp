@@ -206,6 +206,7 @@ def _init_and_index(
         config_toml = fwctx / "config.toml"
         if not config_toml.exists():
             import uuid
+
             config_toml.write_text(
                 f'[project]\nid = "{uuid.uuid4().hex}"\n',
                 encoding="utf-8",
@@ -422,18 +423,18 @@ class TestBareInitAndIndex:
         finally:
             conn.close()
 
-    def test_deps_files_indexed(self, indexed):
+    def test_manifest_verification(self, indexed):
         db_path = _db_path_for_project(indexed)
         conn = open_db(db_path)
         try:
             ch = _config_hash(conn, indexed)
             row = conn.execute(
-                "SELECT deps_verification FROM build_configs WHERE config_hash=?",
+                "SELECT manifest_verification FROM build_configs WHERE config_hash=?",
                 (ch,),
             ).fetchone()
             assert row is not None, "build_config not found"
-            assert row["deps_verification"] == "full", (
-                f"Expected full deps, got '{row['deps_verification']}'"
+            assert row["manifest_verification"] == "full", (
+                f"Expected full manifest verification, got '{row['manifest_verification']}'"
             )
         finally:
             conn.close()
@@ -473,18 +474,18 @@ class TestCMakeInitAndIndex:
         finally:
             conn.close()
 
-    def test_deps_files_indexed(self, indexed):
+    def test_manifest_verification(self, indexed):
         db_path = _db_path_for_project(indexed)
         conn = open_db(db_path)
         try:
             ch = _config_hash(conn, indexed)
             row = conn.execute(
-                "SELECT deps_verification FROM build_configs WHERE config_hash=?",
+                "SELECT manifest_verification FROM build_configs WHERE config_hash=?",
                 (ch,),
             ).fetchone()
             assert row is not None, "build_config not found"
-            assert row["deps_verification"] == "full", (
-                f"Expected full deps, got '{row['deps_verification']}'"
+            assert row["manifest_verification"] == "full", (
+                f"Expected full manifest verification, got '{row['manifest_verification']}'"
             )
         finally:
             conn.close()
@@ -535,18 +536,18 @@ class TestMakefileInitAndIndex:
         finally:
             conn.close()
 
-    def test_deps_files_indexed(self, indexed):
+    def test_manifest_verification(self, indexed):
         db_path = _db_path_for_project(indexed)
         conn = open_db(db_path)
         try:
             ch = _config_hash(conn, indexed)
             row = conn.execute(
-                "SELECT deps_verification FROM build_configs WHERE config_hash=?",
+                "SELECT manifest_verification FROM build_configs WHERE config_hash=?",
                 (ch,),
             ).fetchone()
             assert row is not None, "build_config not found"
-            assert row["deps_verification"] == "full", (
-                f"Expected full deps, got '{row['deps_verification']}'"
+            assert row["manifest_verification"] == "full", (
+                f"Expected full manifest verification, got '{row['manifest_verification']}'"
             )
         finally:
             conn.close()
@@ -601,18 +602,18 @@ class TestPlatformIOInitAndIndex:
         finally:
             conn.close()
 
-    def test_deps_files_indexed(self, indexed):
+    def test_manifest_verification(self, indexed):
         db_path = _db_path_for_project(indexed)
         conn = open_db(db_path)
         try:
             ch = _config_hash(conn, indexed)
             row = conn.execute(
-                "SELECT deps_verification FROM build_configs WHERE config_hash=?",
+                "SELECT manifest_verification FROM build_configs WHERE config_hash=?",
                 (ch,),
             ).fetchone()
             assert row is not None, "build_config not found"
-            assert row["deps_verification"] == "full", (
-                f"Expected full deps, got '{row['deps_verification']}'"
+            assert row["manifest_verification"] == "full", (
+                f"Expected full manifest verification, got '{row['manifest_verification']}'"
             )
         finally:
             conn.close()
@@ -646,18 +647,18 @@ class TestArduinoInitAndIndex:
         finally:
             conn.close()
 
-    def test_deps_files_indexed(self, indexed):
+    def test_manifest_verification(self, indexed):
         db_path = _db_path_for_project(indexed)
         conn = open_db(db_path)
         try:
             ch = _config_hash(conn, indexed)
             row = conn.execute(
-                "SELECT deps_verification FROM build_configs WHERE config_hash=?",
+                "SELECT manifest_verification FROM build_configs WHERE config_hash=?",
                 (ch,),
             ).fetchone()
             assert row is not None, "build_config not found"
-            assert row["deps_verification"] == "full", (
-                f"Expected full deps, got '{row['deps_verification']}'"
+            assert row["manifest_verification"] == "full", (
+                f"Expected full manifest verification, got '{row['manifest_verification']}'"
             )
         finally:
             conn.close()
@@ -709,18 +710,18 @@ class TestMbedOSInitAndIndex:
         finally:
             conn.close()
 
-    def test_deps_files_indexed(self, indexed):
+    def test_manifest_verification(self, indexed):
         db_path = _db_path_for_project(indexed)
         conn = open_db(db_path)
         try:
             ch = _config_hash(conn, indexed)
             row = conn.execute(
-                "SELECT deps_verification FROM build_configs WHERE config_hash=?",
+                "SELECT manifest_verification FROM build_configs WHERE config_hash=?",
                 (ch,),
             ).fetchone()
             assert row is not None, "build_config not found"
-            assert row["deps_verification"] == "full", (
-                f"Expected full deps, got '{row['deps_verification']}'"
+            assert row["manifest_verification"] == "full", (
+                f"Expected full manifest verification, got '{row['manifest_verification']}'"
             )
         finally:
             conn.close()
@@ -802,18 +803,18 @@ class TestZephyrInitAndIndex:
         finally:
             conn.close()
 
-    def test_deps_files_indexed(self, indexed):
+    def test_manifest_verification(self, indexed):
         db_path = _db_path_for_project(indexed)
         conn = open_db(db_path)
         try:
             ch = _config_hash(conn, indexed)
             row = conn.execute(
-                "SELECT deps_verification FROM build_configs WHERE config_hash=?",
+                "SELECT manifest_verification FROM build_configs WHERE config_hash=?",
                 (ch,),
             ).fetchone()
             assert row is not None, "build_config not found"
-            assert row["deps_verification"] == "full", (
-                f"Expected full deps, got '{row['deps_verification']}'"
+            assert row["manifest_verification"] == "full", (
+                f"Expected full manifest verification, got '{row['manifest_verification']}'"
             )
         finally:
             conn.close()
@@ -885,18 +886,18 @@ class TestESPIDFInitAndIndex:
         finally:
             conn.close()
 
-    def test_deps_files_indexed(self, indexed):
+    def test_manifest_verification(self, indexed):
         db_path = _db_path_for_project(indexed)
         conn = open_db(db_path)
         try:
             ch = _config_hash(conn, indexed)
             row = conn.execute(
-                "SELECT deps_verification FROM build_configs WHERE config_hash=?",
+                "SELECT manifest_verification FROM build_configs WHERE config_hash=?",
                 (ch,),
             ).fetchone()
             assert row is not None, "build_config not found"
-            assert row["deps_verification"] == "full", (
-                f"Expected full deps, got '{row['deps_verification']}'"
+            assert row["manifest_verification"] == "full", (
+                f"Expected full manifest verification, got '{row['manifest_verification']}'"
             )
         finally:
             conn.close()
@@ -943,24 +944,18 @@ def _collect_project_stats(project_root: Path) -> dict | None:
     conn = open_db(db_path)
     try:
         ch_row = conn.execute(
-            "SELECT config_hash, deps_verification FROM build_configs ORDER BY rowid DESC LIMIT 1"
+            "SELECT config_hash, manifest_verification FROM build_configs ORDER BY rowid DESC LIMIT 1"
         ).fetchone()
         if ch_row is None:
             return None
         config_hash = ch_row["config_hash"]
-        deps = ch_row["deps_verification"]
+        manifest_verification = ch_row["manifest_verification"]
 
-        file_count = conn.execute(
-            "SELECT COUNT(*) FROM files WHERE config_hash=?", (config_hash,)
-        ).fetchone()[0]
+        file_count = conn.execute("SELECT COUNT(*) FROM files WHERE config_hash=?", (config_hash,)).fetchone()[0]
 
-        sym_count = conn.execute(
-            "SELECT COUNT(*) FROM symbols WHERE config_hash=?", (config_hash,)
-        ).fetchone()[0]
+        sym_count = conn.execute("SELECT COUNT(*) FROM symbols WHERE config_hash=?", (config_hash,)).fetchone()[0]
 
-        ref_count = conn.execute(
-            "SELECT COUNT(*) FROM refs WHERE config_hash=?", (config_hash,)
-        ).fetchone()[0]
+        ref_count = conn.execute("SELECT COUNT(*) FROM refs WHERE config_hash=?", (config_hash,)).fetchone()[0]
 
         # File extensions (from files table)
         ext_rows = conn.execute(
@@ -984,7 +979,7 @@ def _collect_project_stats(project_root: Path) -> dict | None:
 
         return {
             "name": project_root.name,
-            "deps": deps,
+            "manifest_verification": manifest_verification,
             "files": file_count,
             "symbols": sym_count,
             "refs": ref_count,
@@ -1025,7 +1020,7 @@ def _print_stats_table(all_stats: list[dict]) -> None:
         columns.append((ek, len(ek) + 1, lambda s, ek=ek: str(s["exts"].get(ek, 0))))
     for kk in kind_keys:
         columns.append((kk, len(kk) + 1, lambda s, kk=kk: str(s["kinds"].get(kk, 0))))
-    columns.append(("deps", 8, lambda s: s["deps"]))
+    columns.append(("manifest_verification", 12, lambda s: s["manifest_verification"]))
 
     # Build separator and header
     parts = []

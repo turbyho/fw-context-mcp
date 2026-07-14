@@ -79,9 +79,7 @@ class ESPIDFBuildSystem:
         wrapper_dir = project_root / ".fw-context"
         wrapper_dir.mkdir(parents=True, exist_ok=True)
         ninja_wrapper = wrapper_dir / "ninja"
-        ninja_wrapper.write_text(
-            f"#!/bin/sh\nexec {ninja} -d keepdepfile \"$@\"\n", encoding="utf-8"
-        )
+        ninja_wrapper.write_text(f'#!/bin/sh\nexec {ninja} -d keepdepfile "$@"\n', encoding="utf-8")
         ninja_wrapper.chmod(0o755)
 
         env = dict(os.environ)
@@ -140,27 +138,11 @@ class ESPIDFBuildSystem:
 
         return target_cc
 
-    # ── Dep tracking ──
+    # ── Build dir patterns ──
 
-    def ensure_dep_tracking(self, project_root: Path, *, fix: bool = False) -> list[str]:
-        """Ensure the ESP-IDF build generates ``.d`` dependency files.
-
-        ESP-IDF respects ``EXTRA_CFLAGS`` / ``EXTRA_CXXFLAGS`` environment
-        variables, which are automatically set during ``idf.py build``.
-        No configuration needed — the flags are always injected.
-        """
-        messages: list[str] = []
-        if fix:
-            messages.append(
-                "ESP-IDF build will inject -MMD via EXTRA_CFLAGS / EXTRA_CXXFLAGS "
-                "environment variables so .d dependency files are generated."
-            )
-        else:
-            messages.append(
-                "ESP-IDF build injects -MMD via EXTRA_CFLAGS / EXTRA_CXXFLAGS "
-                "environment variables for .d dependency file generation."
-            )
-        return messages
+    def get_build_dir_patterns(self, project_root: Path) -> list[str]:
+        """Return build-output directory patterns for staleness filtering."""
+        return ["build/"]
 
     # ── Validation ──
 

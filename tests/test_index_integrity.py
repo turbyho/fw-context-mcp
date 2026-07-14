@@ -866,7 +866,7 @@ class TestAnonymousStructUnionIndexing:
                 (ch,),
             ).fetchall()
             assert len(symbols) >= 1, (
-                f"Expected symbol '_payload' (anonymous struct via field name)"
+                "Expected symbol '_payload' (anonymous struct via field name)"
             )
             assert symbols[0]["kind"] == "struct"
             assert "_payload" in symbols[0]["qualified_name"]
@@ -1028,7 +1028,7 @@ class TestToolIntegrationWithAnonymousSymbols:
 
         result = get_file_map(file_path="data.h", project_root=str(indexed_anon))
         assert "error" not in result, f"get_file_map returned error: {result}"
-        symbols = result.get("symbols", {})
+        _symbols = result.get("symbols", {})
 
     def test_get_symbol_context_for_anonymous_struct(self, indexed_anon: Path):
         """get_symbol_context returns context for anonymous struct symbol."""

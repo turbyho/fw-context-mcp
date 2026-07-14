@@ -31,7 +31,7 @@ from fw_context_mcp.indexer.db import (
     upsert_file,
     upsert_llm_analysis_batch,
 )
-from fw_context_mcp.utils import compute_content_hash, read_file_lines
+from fw_context_mcp.utils import compute_content_hash, compute_source_hash, read_file_lines
 
 log = logging.getLogger(__name__)
 
@@ -66,14 +66,17 @@ def _compute_content_hash(
 
 
 def _build_filtered_file_content(
-    conn, unit, config_hash: str, project_root: Path
-) -> int:
+    conn, unit, config_hash: str, project_root: Path, *, build_dir_patterns: list[str] | None = None
+) -> tuple[int, list[dict]]:
     """Tokenize TU, extract active lines per file, store ifdef-filtered content.
 
     Parses *unit* (a ``CompilationUnit`` data class) with libclang, then
     tokenizes to find which source lines are active (not ``#ifdef``-dead).
     Only processes files whose ``content`` column is still empty — once set,
     content is trusted until the next full reindex.
+
+    Also collects included header paths and their SHA-256 hashes — used by
+    the manifest update phase to avoid a second tokenization pass.
 
     Inactive lines are replaced with ``\\n`` so line numbers stay
     consistent with the original source.
@@ -83,19 +86,22 @@ def _build_filtered_file_content(
     are stored with their absolute path so ``search_content`` can find
     them.
 
-    Returns the number of files whose content was filled.
+    Returns:
+        ``(filled_count, headers)`` where *filled_count* is the number of
+        files whose ifdef-filtered content was newly stored, and *headers*
+        is a list of ``{path, hash, generated}`` dicts for included header
+        files.
     """
-    # Fast path: skip if no files need content filling
+    import time as _time
+
+    _t0 = _time.monotonic()
+
+    # ── Fast-path: skip tokenization + AST walk when all files already have content ──
     _ensure_column(conn, "files", "content", "TEXT NOT NULL DEFAULT ''")
     remaining = conn.execute(
         "SELECT COUNT(*) FROM files WHERE config_hash=? AND content=''",
         (config_hash,),
     ).fetchone()[0]
-    if remaining == 0:
-        return 0
-
-    import time as _time
-    _t0 = _time.monotonic()
 
     from clang import cindex as cx
 
@@ -107,12 +113,52 @@ def _build_filtered_file_content(
             args=unit.clang_args,
             options=cx.TranslationUnit.PARSE_DETAILED_PROCESSING_RECORD,
         )
-        tokens = list(tu.cursor.get_tokens())
     except Exception:
-        log.debug("_build_filtered_file_content: parse/tokenization failed for %s", unit.file.name)
-        return 0
+        log.debug("_build_filtered_file_content: parse failed for %s", unit.file.name)
+        return 0, []
 
-    # Collect active lines -> (abs_path, set of line numbers)
+    from fw_context_mcp.indexer.manifest import _BUILD_DIR_PATTERNS as _FALLBACK_BUILD_DIR_PATTERNS
+    from fw_context_mcp.indexer.manifest import HEADER_EXTS as _HEADER_EXTS
+    from fw_context_mcp.indexer.manifest import _is_generated_header
+
+    _patterns: tuple[str, ...] = (
+        tuple(build_dir_patterns) if build_dir_patterns else _FALLBACK_BUILD_DIR_PATTERNS
+    )
+
+    # ── Collect included header paths + SHA-256 hashes (always needed for manifest) ──
+    headers: list[dict] = []
+    seen_headers: set[str] = set()
+
+    for inc in tu.get_includes():
+        abs_path = str(inc.include.name)
+        if abs_path in seen_headers:
+            continue
+        seen_headers.add(abs_path)
+
+        resolved = Path(abs_path).resolve()
+        if resolved.suffix.lower() not in _HEADER_EXTS:
+            continue
+
+        try:
+            rel = str(resolved.relative_to(project_root))
+        except ValueError:
+            rel = str(resolved)
+
+        h = compute_source_hash(resolved)
+        generated = _is_generated_header(rel, build_dir_patterns)
+        headers.append({"path": rel, "hash": h, "generated": generated})
+
+    # ── Fast-path return: all files already have filtered content ──
+    # Skip tokenization and AST walk — they're only needed for content-fill,
+    # not for header collection (which only needs get_includes, already done).
+    filled = 0
+    if remaining == 0:
+        return 0, headers
+
+    # ── Build ifdef-filtered content for files that still need it ──
+    tokens = list(tu.cursor.get_tokens())
+
+    # ── Collect active lines from the main source file via tokenization ──
     active: dict[str, set[int]] = {}
     for tok in tokens:
         loc = tok.location
@@ -120,7 +166,20 @@ def _build_filtered_file_content(
             fname = str(loc.file.name)
             active.setdefault(fname, set()).add(loc.line)
 
-    filled = 0
+    # ── Collect active lines from all header files in a single AST traversal ──
+    def _collect_all_active_lines(cursor: object) -> None:
+        """Walk the AST once and add extent line ranges keyed by source file."""
+        if cursor.location.file:
+            fname = str(cursor.location.file.name)
+            extent = cursor.extent
+            if extent.start.file and extent.end.file:
+                for line in range(extent.start.line, extent.end.line + 1):
+                    active.setdefault(fname, set()).add(line)
+        for child in cursor.get_children():
+            _collect_all_active_lines(child)
+
+    _collect_all_active_lines(tu.cursor)
+
     for abs_path, active_lines in active.items():
         if not active_lines:
             continue
@@ -152,8 +211,7 @@ def _build_filtered_file_content(
         # Replace inactive lines with \n to preserve line numbers
         max_line = max(active_lines)
         filtered = [
-            original[i - 1] if (i in active_lines) else "\n"
-            for i in range(1, min(len(original), max_line) + 1)
+            original[i - 1] if (i in active_lines) else "\n" for i in range(1, min(len(original), max_line) + 1)
         ]
         content = "".join(filtered)
 
@@ -174,7 +232,7 @@ def _build_filtered_file_content(
 
     if filled:
         log.info("content fill: %d files from TU %s in %.1fs", filled, unit.file.name, _time.monotonic() - _t0)
-    return filled
+    return filled, headers
 
 
 def store_symbols_for_unit(
@@ -188,7 +246,8 @@ def store_symbols_for_unit(
     pre_parsed=None,
     existing_files: dict[str, tuple[int, float]] | None = None,
     hashes=None,
-) -> tuple[int, int]:
+    build_dir_patterns: list[str] | None = None,
+) -> tuple[int, int, list[dict]]:
     """Parse one translation unit and store its symbols + refs in the DB.
 
     Handles:
@@ -198,7 +257,9 @@ def store_symbols_for_unit(
     - Building and inserting symbol rows
     - Building and inserting reference rows
 
-    Returns ``(symbols_added, refs_added)``.
+    Returns ``(symbols_added, refs_added, headers)`` where *headers* is a
+    list of ``{path, hash, generated}`` dicts for included header files,
+    collected during the ifdef-filtered content pass.
 
     *conn* must be open; the caller is responsible for transactions.
 
@@ -248,7 +309,7 @@ def store_symbols_for_unit(
                 log.error("Fatal DB error parsing %s: %s — stopping indexer", unit.file.name, exc)
                 raise
             log.warning("skip TU %s: %s", unit.file.name, exc)
-            return 0, 0
+            return 0, 0, []
 
     # ── Resolve known files for this TU ──
     # When the caller provides *existing_files* (bulk indexing path), use it
@@ -270,7 +331,6 @@ def store_symbols_for_unit(
             _body_cache[abs_path] = read_file_lines(abs_path)
         return _body_cache[abs_path]
 
-
     # ── Phase 1: Save USRs + analysis of old symbols ──
     # Phase 3 restores per-build LLM analysis for symbols whose body
     # didn't change; Phase 4 detects file-moves.  ON DELETE CASCADE
@@ -285,7 +345,8 @@ def store_symbols_for_unit(
             """SELECT s.usr, a.summary, a.inputs, a.outputs, a.model, a.content_hash
                FROM symbols s
                LEFT JOIN llm_analysis a ON a.symbol_id = s.id
-               WHERE s.file_id = ?""", (file_id_old,),
+               WHERE s.file_id = ?""",
+            (file_id_old,),
         ).fetchall()
         for r in old_rows:
             old_usrs.add(r["usr"])
@@ -298,7 +359,23 @@ def store_symbols_for_unit(
                     "content_hash": r["content_hash"],
                 }
 
-    # ── Phase 2: Delete old symbols (existing logic) ──
+    # ── Phase 2: Delete old symbols ──
+    # Delete inheritance edges in two layers:
+    # 1. By current USR — covers classes defined in HEADERS included by this TU.
+    #    When a header class changes its base, the old edge must go even though
+    #    the header's file_id differs from the TU file.
+    # 2. By TU file_id — safety net for classes REMOVED from the TU file.
+    #    A wiped class is absent from the new syms so its USR won't appear in
+    #    layer 1, but the old edge still references it.  The file_id-based
+    #    delete catches these stragglers.
+    _class_kinds = frozenset({"class", "struct"})
+    _class_usrs = {s.usr for s in syms if s.kind in _class_kinds}
+    if _class_usrs:
+        for usr in _class_usrs:
+            conn.execute(
+                "DELETE FROM inheritance WHERE config_hash = ? AND derived_usr = ?",
+                (config_hash, usr),
+            )
     if file_path in known:
         file_id_old = known[file_path][0]
         delete_inheritance_for_file(conn, config_hash, file_id_old)
@@ -306,18 +383,19 @@ def store_symbols_for_unit(
         # ON DELETE CASCADE → llm_analysis, embeddings removed
 
     # Upsert the TU file record and capture its id — symbols defined in the
-    # TU itself reuse this id instead of calling upsert_file again, which
-    # would overwrite deps_exist/hashes with defaults.
+    # TU itself reuse this id instead of calling upsert_file again.
     if hashes is not None:
-        source_hash, flags_hash, deps_hash, deps_exist = hashes
-        content_hash_val = compute_tu_content_hash(source_hash, flags_hash, deps_hash)
+        source_hash, flags_hash, manifest_entry_hash = hashes
+        content_hash_val = compute_tu_content_hash(source_hash, flags_hash, manifest_entry_hash)
         tu_file_id = upsert_file(
-            conn, config_hash, file_path, unit.language, mtime=current_mtime,
+            conn,
+            config_hash,
+            file_path,
+            unit.language,
+            mtime=current_mtime,
             content_hash=content_hash_val,
             source_hash=source_hash,
             flags_hash=flags_hash,
-            deps_hash=deps_hash,
-            deps_exist=deps_exist,
         )
     else:
         tu_file_id = upsert_file(conn, config_hash, file_path, unit.language, mtime=current_mtime)
@@ -326,7 +404,7 @@ def store_symbols_for_unit(
     refs_added = 0
     file_id_cache: dict[str, int] = {}
     # Pre-populate the cache with the TU file itself so we don't re-upsert
-    # it below (which would reset deps_exist to its default).
+    # it below.
     file_id_cache[file_path] = tu_file_id
 
     if syms:
@@ -342,7 +420,11 @@ def store_symbols_for_unit(
                 except OSError:
                     sym_mtime = 0.0
                 file_id_cache[sym_file] = upsert_file(
-                    conn, config_hash, sym_file, lang, mtime=sym_mtime,
+                    conn,
+                    config_hash,
+                    sym_file,
+                    lang,
+                    mtime=sym_mtime,
                 )
             try:
                 rel_path = str(Path(sym_file).resolve().relative_to(project_root))
@@ -363,31 +445,33 @@ def store_symbols_for_unit(
                 file_lines = _cached_lines(s.file)
                 if file_lines is not None:
                     body = _read_body(file_lines, s.line, s.end_line)
-            rows.append((
-                config_hash,
-                file_id_cache[sym_file],
-                rel_path,
-                split_tokens(s.name, s.qualified_name),
-                s.usr,
-                s.name,
-                s.qualified_name,
-                s.kind,
-                s.line,
-                s.column,
-                s.end_line,
-                int(s.is_definition),
-                s.signature,
-                s.docstring,
-                s.enum_value,
-                int(s.is_virtual),
-                int(s.is_pure_virtual),
-                s.parent_usr,
-                int(s.is_template),
-                s.template_usr,
-                is_proj,
-                0.0,  # pagerank (computed later by _build_pagerank)
-                body,
-            ))
+            rows.append(
+                (
+                    config_hash,
+                    file_id_cache[sym_file],
+                    rel_path,
+                    split_tokens(s.name, s.qualified_name),
+                    s.usr,
+                    s.name,
+                    s.qualified_name,
+                    s.kind,
+                    s.line,
+                    s.column,
+                    s.end_line,
+                    int(s.is_definition),
+                    s.signature,
+                    s.docstring,
+                    s.enum_value,
+                    int(s.is_virtual),
+                    int(s.is_pure_virtual),
+                    s.parent_usr,
+                    int(s.is_template),
+                    s.template_usr,
+                    is_proj,
+                    0.0,  # pagerank (computed later by _build_pagerank)
+                    body,
+                )
+            )
         insert_symbols_batch(conn, rows)
         syms_added = len(rows)
 
@@ -411,10 +495,7 @@ def store_symbols_for_unit(
                 # before content_hash was populated), accept the saved
                 # analysis as authoritative for the same USR.
                 saved = saved_analyses.get(s.usr)
-                if saved is not None and (
-                    saved.get("content_hash") == new_ch
-                    or not saved.get("content_hash")
-                ):
+                if saved is not None and (saved.get("content_hash") == new_ch or not saved.get("content_hash")):
                     cached = saved
                 else:
                     # Fall back to local global cache
@@ -428,16 +509,26 @@ def store_symbols_for_unit(
                 ).fetchone()
                 if not new_id:
                     continue
-                upsert_llm_analysis_batch(conn, [(
-                    new_id[0], cached["summary"], cached["inputs"],
-                    cached["outputs"], cached["model"], new_ch,
-                )])
+                upsert_llm_analysis_batch(
+                    conn,
+                    [
+                        (
+                            new_id[0],
+                            cached["summary"],
+                            cached["inputs"],
+                            cached["outputs"],
+                            cached["model"],
+                            new_ch,
+                        )
+                    ],
+                )
                 restored += 1
             local_db.close()
         if restored:
             log.debug(
                 "Restored LLM analysis for %d symbols from cache in %s",
-                restored, Path(file_path).name,
+                restored,
+                Path(file_path).name,
             )
 
         # ── Phase 4: Detect and fix moved symbols ──
@@ -473,11 +564,20 @@ def store_symbols_for_unit(
             if old_lines is None:
                 continue
             old_ch = _compute_content_hash(
-                old_lines, old_row["line"], old_row["end_line"],
-                old_row["signature"], old_row["qualified_name"], old_row["docstring"],
+                old_lines,
+                old_row["line"],
+                old_row["end_line"],
+                old_row["signature"],
+                old_row["qualified_name"],
+                old_row["docstring"],
             )
             new_ch = _compute_content_hash(
-                lines, s.line, s.end_line, s.signature, s.qualified_name, s.docstring,
+                lines,
+                s.line,
+                s.end_line,
+                s.signature,
+                s.qualified_name,
+                s.docstring,
             )
             if old_ch != new_ch:
                 continue  # content changed — treat as new symbol
@@ -491,8 +591,7 @@ def store_symbols_for_unit(
                 """UPDATE symbols SET file_id = ?, file_path = ?,
                    line = ?, col = ?, end_line = ?
                    WHERE id = ?""",
-                (file_id_cache[s.file], new_rel, s.line, s.column,
-                 s.end_line, old_row["id"]),
+                (file_id_cache[s.file], new_rel, s.line, s.column, s.end_line, old_row["id"]),
             )
             # Delete the duplicate row just inserted by insert_symbols_batch
             dup_id = conn.execute(
@@ -504,7 +603,9 @@ def store_symbols_for_unit(
             moved += 1
         if moved:
             log.debug(
-                "Detected %d moved symbols in %s", moved, Path(file_path).name,
+                "Detected %d moved symbols in %s",
+                moved,
+                Path(file_path).name,
             )
 
     # Path-relative helper used by refs and indirect_call_sites blocks
@@ -519,10 +620,7 @@ def store_symbols_for_unit(
     # References
     if index_refs and refs:
         delete_refs_for_file(conn, config_hash, tu_rel)
-        ref_rows = [
-            (config_hash, r.to_usr, _rel(r.from_file), r.from_line, r.from_usr, r.ref_kind)
-            for r in refs
-        ]
+        ref_rows = [(config_hash, r.to_usr, _rel(r.from_file), r.from_line, r.from_usr, r.ref_kind) for r in refs]
         insert_refs_batch(conn, ref_rows)
         refs_added = len(ref_rows)
 
@@ -530,8 +628,16 @@ def store_symbols_for_unit(
     if index_refs and indirect_call_sites:
         delete_indirect_call_sites_for_file(conn, config_hash, tu_rel)
         ics_rows = [
-            (config_hash, _rel(ics.from_file), ics.from_line, ics.from_usr,
-             ics.expr_text, ics.target_usr, ics.target_name, ics.fn_ptr_type)
+            (
+                config_hash,
+                _rel(ics.from_file),
+                ics.from_line,
+                ics.from_usr,
+                ics.expr_text,
+                ics.target_usr,
+                ics.target_name,
+                ics.fn_ptr_type,
+            )
             for ics in indirect_call_sites
         ]
         insert_indirect_call_sites_batch(conn, ics_rows)
@@ -540,19 +646,25 @@ def store_symbols_for_unit(
     if index_refs and fp_assignments:
         delete_fp_assignments_for_file(conn, config_hash, tu_rel)
         fpa_rows = [
-            (config_hash, _rel(fpa.from_file), fpa.from_line,
-             fpa.lhs_usr, fpa.lhs_name, fpa.rhs_usr, fpa.rhs_name,
-             fpa.fn_ptr_type, fpa.method, fpa.from_usr)
+            (
+                config_hash,
+                _rel(fpa.from_file),
+                fpa.from_line,
+                fpa.lhs_usr,
+                fpa.lhs_name,
+                fpa.rhs_usr,
+                fpa.rhs_name,
+                fpa.fn_ptr_type,
+                fpa.method,
+                fpa.from_usr,
+            )
             for fpa in fp_assignments
         ]
         insert_fp_assignments_batch(conn, fpa_rows)
 
     # Inheritance
     if inheritance:
-        inheritance_rows = [
-            (config_hash, i.derived_usr, i.base_usr, i.access, int(i.is_virtual))
-            for i in inheritance
-        ]
+        inheritance_rows = [(config_hash, i.derived_usr, i.base_usr, i.access, int(i.is_virtual)) for i in inheritance]
         insert_inheritance_batch(conn, inheritance_rows)
 
     # Macros
@@ -571,25 +683,31 @@ def store_symbols_for_unit(
                     pass
                 file_id_cache[m_abs] = upsert_file(conn, config_hash, m_abs, lang, mtime=m_mtime)
             m_file_id = file_id_cache[m_abs]
-            macro_rows.append((
-                config_hash,
-                m_file_id,
-                m.name,
-                m.value,
-                m.expanded_value,
-                m.line,
-                int(m.is_function_like),
-            ))
+            macro_rows.append(
+                (
+                    config_hash,
+                    m_file_id,
+                    m.name,
+                    m.value,
+                    m.expanded_value,
+                    m.line,
+                    int(m.is_function_like),
+                )
+            )
         if macro_rows:
             insert_macros_batch(conn, macro_rows)
     _t_macros = time.monotonic() - _t_macros
 
     # Fill files.content with ifdef-filtered content (tokenization pass)
     _t_content = time.monotonic()
-    _build_filtered_file_content(conn, unit, config_hash, project_root)
+    _, headers = _build_filtered_file_content(
+        conn, unit, config_hash, project_root, build_dir_patterns=build_dir_patterns
+    )
     _t_content = time.monotonic() - _t_content
 
     if _t_macros > 0.1 or _t_content > 0.1:
-        log.debug("store_symbols_for_unit %s: macros=%.2fs content_fill=%.2fs", Path(file_path).name, _t_macros, _t_content)
+        log.debug(
+            "store_symbols_for_unit %s: macros=%.2fs content_fill=%.2fs", Path(file_path).name, _t_macros, _t_content
+        )
 
-    return syms_added, refs_added
+    return syms_added, refs_added, headers

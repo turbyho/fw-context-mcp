@@ -9,7 +9,6 @@ from pathlib import Path
 
 from ...config import derive_project_id
 from ...indexer.db import get_active_config, get_file_mtime_indexed
-from ...indexer.dep_files import parse_dep_file
 from ...utils import MTIME_TOLERANCE_S, abs_path
 from .context import _open_db_safe
 
@@ -38,10 +37,25 @@ def _invalidate_modified_cache(config_hash: str | None = None) -> None:
         _modified_cache.clear()
 
 
+def _path_matches_patterns(path: str, patterns: list[str]) -> bool:
+    """Return True if *path* contains any of the build-directory *patterns*."""
+    if not patterns:
+        return False
+    return any(pat in path for pat in patterns)
+
+
 def _stale_files(conn, config_hash: str, file_paths: list[str]) -> list[str]:
     """Return the subset of *file_paths* whose on-disk mtime is newer than the index."""
+    from ...indexer.manifest import load as load_manifest
+
+    db_path = Path(conn.execute("PRAGMA database_list").fetchone()["file"])
+    manifest = load_manifest(db_path.parent)
+    build_patterns = manifest.get("build_dir_patterns", []) if manifest else []
+
     stale = []
     for path in dict.fromkeys(file_paths):
+        if _path_matches_patterns(path, build_patterns):
+            continue
         try:
             stored = get_file_mtime_indexed(conn, config_hash, path)
             if not stored:
@@ -105,9 +119,7 @@ def _count_modified_files(
     # path formats (absolute vs relative) — e.g. after a reindex with a
     # different working directory or compile_commands.json format.
     best_mtime: dict[str, float] = {}
-    rows = conn.execute(
-        "SELECT path, mtime FROM files WHERE config_hash=?", (config_hash,)
-    ).fetchall()
+    rows = conn.execute("SELECT path, mtime FROM files WHERE config_hash=?", (config_hash,)).fetchall()
     for r in rows:
         path = r["path"]
         stored = r["mtime"]
@@ -120,8 +132,17 @@ def _count_modified_files(
         if key not in best_mtime or stored > best_mtime[key]:
             best_mtime[key] = stored
 
+    # Load build_dir_patterns from manifest to skip build-generated files
+    from ...indexer.manifest import load as load_manifest
+
+    db_path = Path(conn.execute("PRAGMA database_list").fetchone()["file"])
+    manifest = load_manifest(db_path.parent)
+    build_patterns = manifest.get("build_dir_patterns", []) if manifest else []
+
     modified = 0
     for key, stored_mtime in best_mtime.items():
+        if build_patterns and _path_matches_patterns(key, build_patterns):
+            continue  # build-generated file — skip
         try:
             if Path(key).stat().st_mtime > stored_mtime + MTIME_TOLERANCE_S:
                 modified += 1
@@ -167,7 +188,7 @@ def _auto_reindex_stale(
 
 
 # ── Header dependency staleness ──
-# Cache for _check_header_staleness results.  Keyed as "deps:{config_hash}".
+# Cache for _check_header_staleness results.  Keyed as "headers:{config_hash}".
 # Uses the same TTL as _modified_cache (30 seconds).
 _header_staleness_cache: dict[str, tuple[float, int]] = {}
 
@@ -182,10 +203,8 @@ def _check_header_staleness(
 ) -> tuple[int, list[str]]:
     """Count TUs whose header dependencies have changed since indexing.
 
-    Queries the ``files`` table for entries with ``deps_exist=1``,
-    locates the corresponding ``.d`` file on disk, parses it to find
-    included headers, and compares each header's current on-disk mtime
-    against the source file's stored mtime.
+    Loads ``manifest.json`` from the index directory, compares stored
+    header hashes against current on-disk content for project headers.
 
     Returns ``(count, affected_files)`` where *count* is the number of
     TUs with stale headers and *affected_files* is the list of source
@@ -197,55 +216,58 @@ def _check_header_staleness(
     pass ``use_cache=False``.
     """
     if use_cache:
-        cache_key = f"deps:{config_hash}"
+        cache_key = f"headers:{config_hash}"
         cached = _header_staleness_cache.get(cache_key)
         if cached is not None:
             ts, count = cached
             if time.monotonic() - ts < _MTIME_CACHE_TTL:
                 return count, []
 
-    rows = conn.execute(
-        """SELECT path, mtime FROM files
-           WHERE config_hash = ? AND deps_exist = 1
-           ORDER BY path
-           LIMIT ?""",
-        (config_hash, max_files),
-    ).fetchall()
+    from ...indexer.manifest import check_tu_staleness
+    from ...indexer.manifest import load as load_manifest
+
+    # Find the DB dir from the conn's path
+    db_path = Path(conn.execute("PRAGMA database_list").fetchone()["file"])
+    manifest = load_manifest(db_path.parent)
+    if not manifest:
+        return 0, []
+
+    project_root = Path(manifest.get("project_root", str(root)))
+    source_roots = _get_source_roots_from_manifest(manifest, project_root)
 
     stale_count = 0
     affected: list[str] = []
 
-    for r in rows:
-        source_path = r["path"]
-        stored_mtime = r["mtime"]
-        if not stored_mtime:
-            continue
-
-        source_file = Path(source_path)
-        if not source_file.is_absolute():
-            source_file = (root / source_path).resolve()
-
-        # .d file next to the source file (GCC/PlatformIO convention)
-        d_path = source_file.with_suffix(".d")
-        if not d_path.exists():
-            # CMake convention: source.ext.d (e.g. main.c.o.d)
-            d_path = source_file.parent / (source_file.name + ".d")
-            if not d_path.exists():
-                continue
-
-        headers = parse_dep_file(d_path)
-        for header_path in headers:
-            try:
-                if header_path.stat().st_mtime > stored_mtime + MTIME_TOLERANCE_S:
-                    stale_count += 1
-                    affected.append(source_path)
-                    break  # One stale header is enough per TU
-            except OSError:
-                continue
+    for entry in manifest.get("entries", [])[:max_files]:
+        stale, _ = check_tu_staleness(entry, project_root, source_roots)
+        if stale:
+            stale_count += 1
+            affected.append(entry["file"])
 
     if use_cache:
         _header_staleness_cache[cache_key] = (time.monotonic(), stale_count)
     return stale_count, affected
+
+
+def _get_source_roots_from_manifest(manifest: dict, project_root: Path) -> list[Path]:
+    """Auto-detect source roots from manifest entries.
+
+    Only relative paths are used — absolute paths (framework TUs outside the
+    project tree) are skipped because ``f.parts[0]`` would return ``'/'``
+    and ``project_root / '/'`` resolves to the filesystem root, incorrectly
+    treating all files as project code.
+    """
+    roots: set[Path] = set()
+    for entry in manifest.get("entries", []):
+        f = Path(entry.get("file", ""))
+        if not f.parts or f.is_absolute():
+            continue
+        top = project_root / f.parts[0]
+        if top.is_dir():
+            roots.add(top)
+    if not roots:
+        roots = {project_root}
+    return list(roots)
 
 
 def _with_stale_recovery(
@@ -281,7 +303,8 @@ def _with_stale_recovery(
             # Ensure plain dicts — sqlite3.Row objects become invalid after conn.close()
             safe_rows: list[dict] = [dict(r) for r in result_rows]
             stale_f = _stale_files(
-                conn, config_hash,
+                conn,
+                config_hash,
                 [abs_path(root, r["file"]) for r in result_rows if "file" in r],
             )
     finally:
@@ -290,6 +313,10 @@ def _with_stale_recovery(
     results: list[dict] = []
     if stale_f:
         _ensure_daemon_running(root)
-        results.append({"warning": f"Results may be stale — {len(stale_f)} file(s) changed. Background reindex in progress. Run 'fw-context index' to force full update."})
+        results.append(
+            {
+                "warning": f"Results may be stale — {len(stale_f)} file(s) changed. Background reindex in progress. Run 'fw-context index' to force full update."
+            }
+        )
     results += safe_rows
     return results

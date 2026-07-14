@@ -1,6 +1,7 @@
 """Tests for KeilBuildSystem — convert .uvprojx via keil2clangd."""
 
 import pytest
+
 from fw_context_mcp.indexer.builders.keil import KeilBuildSystem
 
 
@@ -32,10 +33,10 @@ class TestKeilBuildSystem:
 
     def test_convert_no_uvprojx_found_raises(self, tmp_path, monkeypatch):
         """When no .uvprojx exists and none configured, raise helpful error."""
-        from fw_context_mcp.indexer.build import BuildConfig
-
         # Mock shutil.which so we skip the "keil2clangd not found" check
         import shutil
+
+        from fw_context_mcp.indexer.build import BuildConfig
         monkeypatch.setattr(shutil, "which", lambda x: "/usr/bin/keil2clangd")
 
         cfg = BuildConfig(system="keil-mdk")
@@ -45,8 +46,9 @@ class TestKeilBuildSystem:
 
     def test_convert_missing_project_file_raises(self, tmp_path, monkeypatch):
         """When specified .uvprojx doesn't exist, raise error."""
-        from fw_context_mcp.indexer.build import BuildConfig
         import shutil
+
+        from fw_context_mcp.indexer.build import BuildConfig
         monkeypatch.setattr(shutil, "which", lambda x: "/usr/bin/keil2clangd")
 
         cfg = BuildConfig(system="keil-mdk", keil_project="Nonexistent.uvprojx")

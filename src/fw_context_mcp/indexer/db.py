@@ -5,6 +5,7 @@ from __future__ import annotations
 __all__ = [
     "CURRENT_SCHEMA_VERSION",
     "DatabaseCorruptionError",
+    "FileHashRecord",
     "drop_fts_triggers",
     "rebuild_fts",
     "rebuild_files_fts",
@@ -16,6 +17,7 @@ __all__ = [
     "delete_inheritance_for_file",
     "delete_indirect_call_sites_for_file",
     "delete_macros_for_file",
+    "delete_orphan_files",
     "delete_refs_for_file",
     "delete_symbols_for_file",
     "find_all_callers_recursive",
@@ -75,6 +77,7 @@ import struct
 from collections.abc import Generator
 from contextlib import contextmanager
 from pathlib import Path
+from typing import NamedTuple
 
 log = logging.getLogger(__name__)
 
@@ -133,9 +136,7 @@ def _ensure_migrated_columns(conn: sqlite3.Connection) -> None:
 
 def _table_exists(conn: sqlite3.Connection, table: str) -> bool:
     """Return True if the named table exists in the database."""
-    result = conn.execute(
-        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)
-    ).fetchone()
+    result = conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)).fetchone()
     return result is not None
 
 
@@ -149,9 +150,7 @@ class DatabaseCorruptionError(sqlite3.DatabaseError):
     def __init__(self, db_path: str, details: str = ""):
         self.db_path = db_path
         self.details = details
-        super().__init__(
-            f"Database corruption detected at {db_path}: {details}"
-        )
+        super().__init__(f"Database corruption detected at {db_path}: {details}")
 
 
 def split_tokens(name: str, qualified_name: str = "") -> str:
@@ -176,9 +175,9 @@ def split_tokens(name: str, qualified_name: str = "") -> str:
         # Strip anonymous struct/enum/union markers — these inject noise tokens
         # like "mbed", "include", "enum" that match thousands of irrelevant symbols.
         s = re.sub(r"\(unnamed\s+(struct|enum|union)\s+at\s+[^)]+\)", "", s)
-        s = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", s)      # camelCase split
-        s = re.sub(r"([A-Z]+)([A-Z][a-z])", r"\1 \2", s)   # HTTPResponse → HTTP Response
-        parts = re.split(r"[^a-zA-Z0-9]+", s)               # split on non-alnum
+        s = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", s)  # camelCase split
+        s = re.sub(r"([A-Z]+)([A-Z][a-z])", r"\1 \2", s)  # HTTPResponse → HTTP Response
+        parts = re.split(r"[^a-zA-Z0-9]+", s)  # split on non-alnum
         return [p.lower() for p in parts if len(p) > 1 and p.lower() not in _NOISE_WORDS]
 
     tokens: list[str] = []
@@ -239,7 +238,8 @@ def _parse_expected_columns(schema_sql: str, migration_statements: list[str]) ->
     # Parse CREATE TABLE statements from _SCHEMA
     for match in re.finditer(
         r"CREATE TABLE.*?(\w+)\s*\((.*?)\);",
-        schema_sql, re.DOTALL | re.IGNORECASE,
+        schema_sql,
+        re.DOTALL | re.IGNORECASE,
     ):
         table = match.group(1)
         if table.startswith("idx_"):
@@ -254,7 +254,11 @@ def _parse_expected_columns(schema_sql: str, migration_statements: list[str]) ->
             if not col_name:
                 continue
             if col_name.upper() in (
-                "PRIMARY", "UNIQUE", "FOREIGN", "CHECK", "CONSTRAINT",
+                "PRIMARY",
+                "UNIQUE",
+                "FOREIGN",
+                "CHECK",
+                "CONSTRAINT",
             ):
                 continue
             if col_name.upper().startswith("UNIQUE"):
@@ -266,7 +270,8 @@ def _parse_expected_columns(schema_sql: str, migration_statements: list[str]) ->
     for stmt in migration_statements:
         alt_match = re.match(
             r"ALTER TABLE (\w+) ADD COLUMN (\w+)",
-            stmt.strip(), re.IGNORECASE,
+            stmt.strip(),
+            re.IGNORECASE,
         )
         if alt_match:
             table, col = alt_match.group(1), alt_match.group(2)
@@ -294,10 +299,7 @@ def _derive_schema_version(
     import hashlib
 
     tables = _parse_expected_columns(schema_sql, migration_statements)
-    canonical = "".join(
-        f"{table}:{','.join(sorted(cols))};"
-        for table, cols in sorted(tables.items())
-    )
+    canonical = "".join(f"{table}:{','.join(sorted(cols))};" for table, cols in sorted(tables.items()))
     return int.from_bytes(hashlib.sha256(canonical.encode()).digest()[:4], "big") & 0x7FFFFFFF
 
 
@@ -329,9 +331,7 @@ _MIGRATION_ADD_COLUMNS = [
     "ALTER TABLE files ADD COLUMN content_hash TEXT NOT NULL DEFAULT ''",
     "ALTER TABLE files ADD COLUMN source_hash TEXT NOT NULL DEFAULT ''",
     "ALTER TABLE files ADD COLUMN flags_hash TEXT NOT NULL DEFAULT ''",
-    "ALTER TABLE files ADD COLUMN deps_hash TEXT NOT NULL DEFAULT ''",
-    "ALTER TABLE files ADD COLUMN deps_exist INTEGER NOT NULL DEFAULT 0",
-    "ALTER TABLE build_configs ADD COLUMN deps_verification TEXT NOT NULL DEFAULT 'none'",
+    "ALTER TABLE build_configs ADD COLUMN manifest_verification TEXT NOT NULL DEFAULT 'none'",
 ]
 
 # Pre-computed {table: {columns}} from _MIGRATION_ADD_COLUMNS.
@@ -678,9 +678,7 @@ def write_lock(db_dir: Path, timeout: float = 60.0) -> Generator[None, None, Non
                 break
             except BlockingIOError:
                 if _time.monotonic() > deadline:
-                    raise WriteLockTimeout(
-                        f"Could not acquire write lock for {db_dir} within {timeout:.0f}s"
-                    ) from None
+                    raise WriteLockTimeout(f"Could not acquire write lock for {db_dir} within {timeout:.0f}s") from None
                 _time.sleep(0.5)
         yield
     finally:
@@ -752,9 +750,9 @@ def open_db(path: Path, *, skip_integrity_check: bool = False) -> sqlite3.Connec
         raise DatabaseCorruptionError(str(path), str(e)) from e
 
     # Performance pragmas — read-heavy workload, WAL mode safe
-    conn.execute("PRAGMA cache_size = -64000")       # 64 MB page cache
-    conn.execute("PRAGMA mmap_size = 268435456")     # 256 MB memory-mapped I/O
-    conn.execute("PRAGMA synchronous = 1")           # NORMAL — safe with WAL
+    conn.execute("PRAGMA cache_size = -64000")  # 64 MB page cache
+    conn.execute("PRAGMA mmap_size = 268435456")  # 256 MB memory-mapped I/O
+    conn.execute("PRAGMA synchronous = 1")  # NORMAL — safe with WAL
 
     # Load sqlite-vec extension for vector search (graceful when missing)
     try:
@@ -786,18 +784,14 @@ def open_db(path: Path, *, skip_integrity_check: bool = False) -> sqlite3.Connec
             # Migration: is_project backfill — column added by
             # _MIGRATION_ADD_COLUMNS loop.  Backfill for existing indexes
             # where all rows were inserted with DEFAULT 0.
-            if conn.execute(
-                "SELECT COUNT(*) FROM symbols WHERE is_project = 0"
-            ).fetchone()[0] > 0:
+            if conn.execute("SELECT COUNT(*) FROM symbols WHERE is_project = 0").fetchone()[0] > 0:
                 _backfill_is_project(conn, path)
                 conn.commit()
 
             # Migration: file_path backfill — column added by
             # _MIGRATION_ADD_COLUMNS loop.  Backfill empties left over from
             # old indexes or the DEFAULT ''.
-            if conn.execute(
-                "SELECT COUNT(*) FROM symbols WHERE file_path = ''"
-            ).fetchone()[0] > 0:
+            if conn.execute("SELECT COUNT(*) FROM symbols WHERE file_path = ''").fetchone()[0] > 0:
                 conn.execute("""
                     UPDATE symbols SET file_path = COALESCE(
                         (SELECT f.path FROM files f WHERE f.id = symbols.file_id), ''
@@ -809,16 +803,12 @@ def open_db(path: Path, *, skip_integrity_check: bool = False) -> sqlite3.Connec
             # _MIGRATION_ADD_COLUMNS loop.  Backfill using Python split_tokens
             # (SQLite can't call Python functions).  Use a generator to avoid
             # materialising all rows in memory at once.
-            if conn.execute(
-                "SELECT COUNT(*) FROM symbols WHERE name_tokens = ''"
-            ).fetchone()[0] > 0:
+            if conn.execute("SELECT COUNT(*) FROM symbols WHERE name_tokens = ''").fetchone()[0] > 0:
                 conn.executemany(
                     "UPDATE symbols SET name_tokens = ? WHERE id = ?",
                     (
                         (split_tokens(r["name"], r["qualified_name"]), r["id"])
-                        for r in conn.execute(
-                            "SELECT id, name, qualified_name FROM symbols WHERE name_tokens = ''"
-                        )
+                        for r in conn.execute("SELECT id, name, qualified_name FROM symbols WHERE name_tokens = ''")
                     ),
                 )
                 conn.commit()
@@ -867,9 +857,7 @@ def open_db(path: Path, *, skip_integrity_check: bool = False) -> sqlite3.Connec
                     pass  # another process already backfilled
 
             # Migration: summary/inputs/outputs — backfill from llm_analysis table.
-            if conn.execute(
-                "SELECT COUNT(*) FROM symbols WHERE summary = ''"
-            ).fetchone()[0] > 0:
+            if conn.execute("SELECT COUNT(*) FROM symbols WHERE summary = ''").fetchone()[0] > 0:
                 conn.execute(
                     """UPDATE symbols SET
                            summary = COALESCE((SELECT a.summary FROM llm_analysis a WHERE a.symbol_id = symbols.id), ''),
@@ -962,6 +950,7 @@ def open_db(path: Path, *, skip_integrity_check: bool = False) -> sqlite3.Connec
             if "locked" in str(e).lower():
                 conn.close()
                 import time as _time
+
                 _time.sleep(1)
                 conn = sqlite3.connect(str(path))
                 conn.row_factory = sqlite3.Row
@@ -1108,8 +1097,7 @@ def open_db(path: Path, *, skip_integrity_check: bool = False) -> sqlite3.Connec
         init_vec_table(conn)
     except Exception as e:
         log.warning(
-            "sqlite-vec vector table initialization failed — "
-            "semantic search will use legacy BLOB fallback: %s",
+            "sqlite-vec vector table initialization failed — semantic search will use legacy BLOB fallback: %s",
             e,
         )
 
@@ -1333,9 +1321,7 @@ def _rebuild_macros_fts(conn: sqlite3.Connection) -> None:
 
 
 @contextmanager
-def transaction(
-    conn: sqlite3.Connection, checkpoint: bool = True
-) -> Generator[sqlite3.Connection, None, None]:
+def transaction(conn: sqlite3.Connection, checkpoint: bool = True) -> Generator[sqlite3.Connection, None, None]:
     """Commit-or-rollback context manager.
 
     By default a WAL truncate-checkpoint runs after each successful commit to
@@ -1384,7 +1370,7 @@ def upsert_build_config(
     project_id: str,
     compile_commands_path: str,
     embedding_dim: int | None = None,
-    deps_verification: str = "none",
+    manifest_verification: str = "none",
 ) -> None:
     """Insert or update a build configuration record.
 
@@ -1398,29 +1384,28 @@ def upsert_build_config(
         compile_commands_path: Absolute path to ``compile_commands.json``.
         embedding_dim: Embedding vector dimension detected from the model.
             ``None`` when embeddings are disabled or not yet generated.
-        deps_verification: ``"full"``, ``"partial"``, or ``"none"`` —
-            indicates whether .d dependency files were available during
-            indexing.
+        manifest_verification: ``"full"`` or ``"none"`` —
+            indicates whether manifest.json was available during indexing.
 
     Returns:
         None.
     """
-    # Belt-and-suspenders: ensure embedding_dim column exists.
+    # Belt-and-suspenders: ensure columns exist.
     # Handles the edge case where open_db() skipped migrations because
     # PRAGMA user_version already matched CURRENT_SCHEMA_VERSION.
     _ensure_column(conn, "build_configs", "embedding_dim", "INTEGER")
-    _ensure_column(conn, "build_configs", "deps_verification", "TEXT")
+    _ensure_column(conn, "build_configs", "manifest_verification", "TEXT")
 
     conn.execute(
         """INSERT INTO build_configs(config_hash, project_id, compile_commands_path,
-                                     embedding_dim, deps_verification)
+                                     embedding_dim, manifest_verification)
            VALUES (?,?,?,?,?)
            ON CONFLICT(config_hash) DO UPDATE SET
                created_at = datetime('now'),
                compile_commands_path = excluded.compile_commands_path,
                embedding_dim = coalesce(excluded.embedding_dim, build_configs.embedding_dim),
-               deps_verification = excluded.deps_verification""",
-        (config_hash, project_id, compile_commands_path, embedding_dim, deps_verification),
+               manifest_verification = excluded.manifest_verification""",
+        (config_hash, project_id, compile_commands_path, embedding_dim, manifest_verification),
     )
 
 
@@ -1434,8 +1419,6 @@ def upsert_file(
     content_hash: str = "",
     source_hash: str = "",
     flags_hash: str = "",
-    deps_hash: str = "",
-    deps_exist: bool = False,
 ) -> int:
     """Insert or update a file record, returning its row id.
 
@@ -1452,31 +1435,33 @@ def upsert_file(
         language: ``"c"`` or ``"cpp"`` — set during compilation database parsing.
         generated: Whether the file is auto-generated (default False).
         mtime: Last-modified timestamp (float, seconds since epoch).
-        content_hash: SHA-256 hash of source + flags + deps content (default "").
+        content_hash: SHA-256 hash of source + flags + manifest_entry content (default "").
         source_hash: SHA-256 hash of the source file content.
         flags_hash: SHA-256 hash of normalized compiler flags for this TU.
-        deps_hash: SHA-256 hash of all header dependencies (from .d file).
-        deps_exist: Whether .d dependency file was available for this TU.
 
     Returns:
         int: The ``files.id`` of the inserted or updated row.
     """
     cur = conn.execute(
         """INSERT INTO files(config_hash, path, language, generated, mtime,
-                             content_hash, source_hash, flags_hash, deps_hash, deps_exist)
-           VALUES (?,?,?,?,?,?,?,?,?,?)
+                             content_hash, source_hash, flags_hash)
+           VALUES (?,?,?,?,?,?,?,?)
            ON CONFLICT(config_hash, path) DO UPDATE SET
                language=excluded.language,
                mtime=excluded.mtime,
                content_hash=excluded.content_hash,
                source_hash=excluded.source_hash,
-               flags_hash=excluded.flags_hash,
-               deps_hash=excluded.deps_hash,
-               deps_exist=excluded.deps_exist
+               flags_hash=excluded.flags_hash
            RETURNING id""",
         (
-            config_hash, path, language, int(generated), mtime,
-            content_hash, source_hash, flags_hash, deps_hash, int(deps_exist),
+            config_hash,
+            path,
+            language,
+            int(generated),
+            mtime,
+            content_hash,
+            source_hash,
+            flags_hash,
         ),
     )
     row = cur.fetchone()
@@ -1490,32 +1475,40 @@ def get_file_mtimes(conn: sqlite3.Connection, config_hash: str) -> dict[str, tup
         Use :func:`get_file_hashes` instead — it returns content hashes
         needed for content-addressable staleness detection.
     """
-    rows = conn.execute(
-        "SELECT id, path, mtime FROM files WHERE config_hash=?", (config_hash,)
-    ).fetchall()
+    rows = conn.execute("SELECT id, path, mtime FROM files WHERE config_hash=?", (config_hash,)).fetchall()
     return {r["path"]: (r["id"], r["mtime"]) for r in rows}
 
 
-def get_file_hashes(conn: sqlite3.Connection, config_hash: str) -> dict[str, tuple[int, float, str, str, str, str, bool]]:
-    """Return ``{path: (file_id, mtime, content_hash, source_hash, flags_hash, deps_hash, deps_exist)}``.
+class FileHashRecord(NamedTuple):
+    """Stored file metadata for content-addressable staleness detection."""
+    file_id: int
+    mtime: float
+    content_hash: str
+    source_hash: str
+    flags_hash: str
+
+
+def get_file_hashes(conn: sqlite3.Connection, config_hash: str) -> dict[str, FileHashRecord]:
+    """Return ``{path: FileHashRecord}`` for content-addressable staleness detection.
 
     Used by the runner for content-addressable staleness detection — even
     when mtime differs, a matching content_hash means the TU can be skipped.
+
+    The old ``deps_hash`` and ``deps_exist`` columns are deprecated and no
+    longer populated — staleness is now determined from ``manifest.json``.
     """
     rows = conn.execute(
-        """SELECT id, path, mtime, content_hash, source_hash, flags_hash, deps_hash, deps_exist
+        """SELECT id, path, mtime, content_hash, source_hash, flags_hash
            FROM files WHERE config_hash=?""",
         (config_hash,),
     ).fetchall()
     return {
-        r["path"]: (
+        r["path"]: FileHashRecord(
             r["id"],
             r["mtime"],
             r["content_hash"],
             r["source_hash"],
             r["flags_hash"],
-            r["deps_hash"],
-            bool(r["deps_exist"]),
         )
         for r in rows
     }
@@ -1725,7 +1718,9 @@ def insert_fp_assignments_batch(conn: sqlite3.Connection, rows: list[tuple]) -> 
 
 
 def delete_fp_assignments_for_file(
-    conn: sqlite3.Connection, config_hash: str, from_file: str,
+    conn: sqlite3.Connection,
+    config_hash: str,
+    from_file: str,
 ) -> None:
     """Delete fp_assignments rows for *from_file* under *config_hash*.
 
@@ -1832,6 +1827,27 @@ def delete_inheritance_for_file(conn: sqlite3.Connection, config_hash: str, file
         )""",
         (config_hash, config_hash, file_id),
     )
+
+
+def delete_orphan_files(conn: sqlite3.Connection, config_hash: str) -> int:
+    """Delete file records that have no symbols, no macros, and no ifdef-filtered
+    content for *config_hash*.
+
+    Only deletes truly empty file entries — files with filled ``content``
+    are preserved even when they have no symbols (forward-declaration
+    headers are still useful for ``search_content``).
+
+    Called after indexing or reindex to clean up stale entries from
+    removed source files.  Returns the number of rows deleted.
+    """
+    cur = conn.execute(
+        """DELETE FROM files WHERE config_hash = ?
+           AND id NOT IN (SELECT DISTINCT file_id FROM symbols WHERE config_hash = ?)
+           AND id NOT IN (SELECT DISTINCT file_id FROM macros WHERE config_hash = ?)
+           AND content = ''""",
+        (config_hash, config_hash, config_hash),
+    )
+    return cur.rowcount
 
 
 def get_direct_bases(conn: sqlite3.Connection, config_hash: str, usr: str) -> list[dict]:
@@ -2105,8 +2121,7 @@ def upsert_embeddings_vec(
     for symbol_id, config_hash, vec in rows:
         conn.execute("DELETE FROM vec_symbols WHERE rowid = ?", (symbol_id,))
         conn.execute(
-            "INSERT INTO vec_symbols(rowid, embedding, config_hash, symbol_id) "
-            "VALUES (?, ?, ?, ?)",
+            "INSERT INTO vec_symbols(rowid, embedding, config_hash, symbol_id) VALUES (?, ?, ?, ?)",
             (symbol_id, json.dumps(vec), config_hash, symbol_id),
         )
         count += 1
@@ -2193,19 +2208,12 @@ def search_similar_hybrid(
             dist_map[r["symbol_id"]] = d
 
     # Re-rank candidates by vector distance
-    scored = [
-        (dist_map[r["id"]], r)
-        for r in text_candidates
-        if r["id"] in dist_map
-    ]
+    scored = [(dist_map[r["id"]], r) for r in text_candidates if r["id"] in dist_map]
     scored.sort(key=lambda x: x[0])
 
     top = scored[:limit]
     # Embed distance into result dict
-    return [
-        dict(r, _vector_distance=d)
-        for d, r in top
-    ]
+    return [dict(r, _vector_distance=d) for d, r in top]
 
 
 # ---------------------------------------------------------------------------
@@ -2213,9 +2221,7 @@ def search_similar_hybrid(
 # ---------------------------------------------------------------------------
 
 
-def _resolve_target_usr(
-    conn: sqlite3.Connection, config_hash: str, name: str
-) -> str | None:
+def _resolve_target_usr(conn: sqlite3.Connection, config_hash: str, name: str) -> str | None:
     """Look up the USR of a symbol by name.
 
     When multiple USRs exist for the same name (e.g. C++ inline functions
@@ -2245,9 +2251,7 @@ def _resolve_target_usr(
     return rows["usr"] if rows else None
 
 
-def _get_alias_pairs(
-    conn: sqlite3.Connection, config_hash: str
-) -> list[tuple[str, str]]:
+def _get_alias_pairs(conn: sqlite3.Connection, config_hash: str) -> list[tuple[str, str]]:
     """Return [(decl_usr, def_usr)] for weak-alias declarations → definitions.
 
     Detects the ``__attribute__((weak, alias(\"__func\")))`` pattern by finding
@@ -2304,10 +2308,7 @@ def _escape_usr_values(alias_pairs: list[tuple[str, str]]) -> str:
     but we escape defensively to prevent SQL syntax errors or injection.
     """
     _q = "'"  # single quote
-    return ", ".join(
-        f"({_q}{d.replace(_q, _q * 2)}{_q}, {_q}{f.replace(_q, _q * 2)}{_q})"
-        for d, f in alias_pairs
-    )
+    return ", ".join(f"({_q}{d.replace(_q, _q * 2)}{_q}, {_q}{f.replace(_q, _q * 2)}{_q})" for d, f in alias_pairs)
 
 
 def _bridge_weak_aliases(
@@ -2373,9 +2374,7 @@ def find_call_path(
            GROUP BY r.from_usr, r.to_usr""",
         (config_hash,),
     ):
-        all_edges.setdefault(row["from_usr"], []).append(
-            (row["to_usr"], row["callee_name"])
-        )
+        all_edges.setdefault(row["from_usr"], []).append((row["to_usr"], row["callee_name"]))
 
     # Also load symbol names for USRs (needed for caller names in base step).
     # Prefer definition names, fall back to declaration names.
@@ -2402,6 +2401,7 @@ def find_call_path(
 
     # BFS queue: (current_usr, depth, chain)
     from collections import deque
+
     queue: deque = deque()
     visited: set[str] = {from_usr}  # cycle prevention — never revisit a USR
 
@@ -2456,17 +2456,15 @@ def find_all_callers_recursive(
     # When someone calls decl_usr (alias), they also effectively call def_usr.
     alias_pairs = _get_alias_pairs(conn, config_hash)
     alias_values = _escape_usr_values(alias_pairs)
-    alias_cte = (
-        f"""alias_pairs(decl_usr, def_usr) AS (VALUES {alias_values}),"""
-        if alias_values else ""
-    )
+    alias_cte = f"""alias_pairs(decl_usr, def_usr) AS (VALUES {alias_values}),""" if alias_values else ""
     alias_join = (
         """UNION ALL
         SELECT r.from_usr, ap.def_usr
         FROM refs r
         JOIN alias_pairs ap ON r.to_usr = ap.decl_usr
         WHERE r.config_hash = ?"""
-        if alias_values else ""
+        if alias_values
+        else ""
     )
 
     query = f"""WITH {alias_cte}
@@ -2534,17 +2532,15 @@ def find_callees_recursive(
     # also be reachable from decl_usr.
     alias_pairs = _get_alias_pairs(conn, config_hash)
     alias_values = _escape_usr_values(alias_pairs)
-    alias_cte = (
-        f"""alias_pairs(decl_usr, def_usr) AS (VALUES {alias_values}),"""
-        if alias_values else ""
-    )
+    alias_cte = f"""alias_pairs(decl_usr, def_usr) AS (VALUES {alias_values}),""" if alias_values else ""
     alias_join = (
         """UNION ALL
         SELECT ap.decl_usr, r.to_usr
         FROM refs r
         JOIN alias_pairs ap ON r.from_usr = ap.def_usr
         WHERE r.config_hash = ?"""
-        if alias_values else ""
+        if alias_values
+        else ""
     )
 
     query = f"""WITH {alias_cte}
@@ -2619,9 +2615,7 @@ def find_dead_code(
     (e.g. ``["mbed-os/%", "cmsis/%"]``).  When omitted, no paths are excluded.
     """
     if exclude_paths:
-        path_clause = "AND " + " AND ".join(
-            "s.file_path NOT LIKE ?" for _ in exclude_paths
-        )
+        path_clause = "AND " + " AND ".join("s.file_path NOT LIKE ?" for _ in exclude_paths)
         exclude_params = list(exclude_paths)
     else:
         path_clause = ""
@@ -2649,16 +2643,18 @@ def find_dead_code(
     dead_usr_set: set[str] = set()
     for r in dead_rows:
         dead_usr_set.add(r["usr"])
-        results.append({
-            "name": r["name"],
-            "qualified_name": r["qualified_name"],
-            "kind": r["kind"],
-            "file_path": r["file_path"],
-            "signature": r["signature"],
-            "line": r["line"],
-            "status": "dead",
-            "reason": "no references found — likely unused",
-        })
+        results.append(
+            {
+                "name": r["name"],
+                "qualified_name": r["qualified_name"],
+                "kind": r["kind"],
+                "file_path": r["file_path"],
+                "signature": r["signature"],
+                "line": r["line"],
+                "status": "dead",
+                "reason": "no references found — likely unused",
+            }
+        )
 
     # Category 2: possibly dead — indirect refs exist but no resolved call site.
     # A symbol is possibly dead when it has ref_kind='indirect' entries
@@ -2666,9 +2662,16 @@ def find_dead_code(
     # via fp_assignments → indirect_call_sites linking.
     remaining_slots = limit - len(results)
     if remaining_slots > 0:
-        possibly_params: list[object] = [
-            config_hash, config_hash, config_hash, config_hash,
-        ] + exclude_params + [remaining_slots]
+        possibly_params: list[object] = (
+            [
+                config_hash,
+                config_hash,
+                config_hash,
+                config_hash,
+            ]
+            + exclude_params
+            + [remaining_slots]
+        )
         possibly_rows = conn.execute(
             f"""SELECT s.name, s.qualified_name, s.kind, s.file_path,
                       s.signature, s.line, s.usr,
@@ -2707,17 +2710,19 @@ def find_dead_code(
         for r in possibly_rows:
             if r["usr"] in dead_usr_set:
                 continue
-            results.append({
-                "name": r["name"],
-                "qualified_name": r["qualified_name"],
-                "kind": r["kind"],
-                "file_path": r["file_path"],
-                "signature": r["signature"],
-                "line": r["line"],
-                "status": "possibly_dead",
-                "reason": "assigned as function pointer but call sites unresolved",
-                "indirect_refs": r["indirect_sites"] or "",
-            })
+            results.append(
+                {
+                    "name": r["name"],
+                    "qualified_name": r["qualified_name"],
+                    "kind": r["kind"],
+                    "file_path": r["file_path"],
+                    "signature": r["signature"],
+                    "line": r["line"],
+                    "status": "possibly_dead",
+                    "reason": "assigned as function pointer but call sites unresolved",
+                    "indirect_refs": r["indirect_sites"] or "",
+                }
+            )
 
     return results
 
@@ -2742,16 +2747,12 @@ def find_hotspots(
     of the LIKE patterns are excluded.
     """
     # Try cache first
-    cached = conn.execute(
-        "SELECT COUNT(*) FROM hotspot_cache WHERE config_hash = ?", (config_hash,)
-    ).fetchone()
+    cached = conn.execute("SELECT COUNT(*) FROM hotspot_cache WHERE config_hash = ?", (config_hash,)).fetchone()
     if cached and cached[0] > 0:
         path_clauses = ""
         params: list = [config_hash]
         if exclude_paths:
-            path_clauses = "AND " + " AND ".join(
-                "s.file_path NOT LIKE ?" for _ in exclude_paths
-            )
+            path_clauses = "AND " + " AND ".join("s.file_path NOT LIKE ?" for _ in exclude_paths)
             params.extend(exclude_paths)
         params.append(limit)
         rows = conn.execute(
@@ -2772,9 +2773,7 @@ def find_hotspots(
     path_clauses = ""
     p: list = [config_hash]
     if exclude_paths:
-        path_clauses = "AND " + " AND ".join(
-            "s.file_path NOT LIKE ?" for _ in exclude_paths
-        )
+        path_clauses = "AND " + " AND ".join("s.file_path NOT LIKE ?" for _ in exclude_paths)
         p.extend(exclude_paths)
     p.append(limit)
 
@@ -2948,9 +2947,7 @@ def find_macro_refs(
     Returns file-level matches with highlighted snippets.
     """
     limit = min(limit, 100)
-    table_row = conn.execute(
-        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='files_fts'"
-    ).fetchone()
+    table_row = conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='files_fts'").fetchone()
     if table_row is None:
         return []
 
@@ -2972,16 +2969,14 @@ def find_macro_refs(
 
 def count_refs(conn: sqlite3.Connection, config_hash: str) -> int:
     """Return total reference count for a build config (0 when refs not indexed)."""
-    return conn.execute(
-        "SELECT COUNT(*) FROM refs WHERE config_hash=?", (config_hash,)
-    ).fetchone()[0]
+    return conn.execute("SELECT COUNT(*) FROM refs WHERE config_hash=?", (config_hash,)).fetchone()[0]
 
 
 def get_active_config(conn: sqlite3.Connection, project_id: str) -> sqlite3.Row | None:
     """Return the most recently indexed build_config for a project."""
     return conn.execute(
         """SELECT * FROM build_configs WHERE project_id=?
-           ORDER BY created_at DESC LIMIT 1""",
+           ORDER BY created_at DESC, rowid DESC LIMIT 1""",
         (project_id,),
     ).fetchone()
 
@@ -2997,19 +2992,19 @@ def _expand_query(query: str) -> str:
     # Tokens that already are FTS5 syntax — don't touch them.
     # Single colon (not part of ::) covers column-filter expressions like
     # "name_tokens : term*" which would be corrupted by wildcard appending.
-    _bare_syntax = ('"', 'NEAR', 'AND', 'OR', '(', ')')
-    _has_col_filter = re.search(r'(?<!:):(?!:)', query)
+    _bare_syntax = ('"', "NEAR", "AND", "OR", "(", ")")
+    _has_col_filter = re.search(r"(?<!:):(?!:)", query)
     if any(c in query for c in _bare_syntax) or _has_col_filter:
         return query
 
     parts = query.replace("::", " ").split()
     expanded = []
     for p in parts:
-        if p.endswith('*'):
+        if p.endswith("*"):
             expanded.append(p)
         else:
-            expanded.append(f'{p}*')
-    return ' OR '.join(expanded)
+            expanded.append(f"{p}*")
+    return " OR ".join(expanded)
 
 
 def search_symbols(
@@ -3154,9 +3149,7 @@ def get_file_map(
     # Convert enum_constant subgroups from dict to sorted list
     for group in groups.values():
         if "_subgroups" in group:
-            group["subgroups"] = sorted(
-                group.pop("_subgroups").values(), key=lambda g: g["name"]
-            )
+            group["subgroups"] = sorted(group.pop("_subgroups").values(), key=lambda g: g["name"])
 
     return {
         "file": file_path,
@@ -3168,6 +3161,7 @@ def get_file_map(
 # ---------------------------------------------------------------------------
 # LLM analysis helpers — structured symbol descriptions from Ollama
 # ---------------------------------------------------------------------------
+
 
 def upsert_llm_analysis_batch(
     conn: sqlite3.Connection,

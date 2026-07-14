@@ -17,10 +17,9 @@ from pathlib import Path
 
 from ..config.settings import derive_project_id
 from ..llm.ollama import call_ollama
-from ..utils import MTIME_TOLERANCE_S, read_file_lines
+from ..utils import MTIME_TOLERANCE_S, compute_source_hash, read_file_lines
 from .compile_commands import _SOURCE_EXTS, validate_include_files
 from .compile_commands import parse as parse_compile_commands
-from .config_hash import compute as compute_config_hash
 from .config_hash import compute_flags_hash, compute_tu_content_hash
 from .db import (
     CURRENT_SCHEMA_VERSION,
@@ -34,7 +33,6 @@ from .db import (
     upsert_project,
     write_lock,
 )
-from .dep_files import parse_dep_file, resolve_dep_path_for_entry
 from .ops import _build_filtered_file_content, store_symbols_for_unit
 
 log = logging.getLogger(__name__)
@@ -820,7 +818,7 @@ def _extract_param_types(signature: str) -> str:
     return ",".join(normalized)
 
 
-def _build_overrides(conn, config_hash: str, db_dir: Path, *, write_lock_held: bool = False) -> None:
+def _build_overrides(conn, config_hash: str, db_dir: Path, *, write_lock_held: bool = False, force: bool = False) -> None:
     """Build the method override graph by matching virtual methods to their
     base-class counterparts through the inheritance chain.
 
@@ -828,14 +826,22 @@ def _build_overrides(conn, config_hash: str, db_dir: Path, *, write_lock_held: b
     the ``inheritance`` table and matches methods by name.  Parameter-type
     comparison provides a basic guard against accidental name collisions
     (overloads, not overrides).
+
+    Set *force* to True to recompute even when overrides already exist
+    (e.g. after incremental reindex).
     """
     from .db import insert_overrides_batch
 
     # Idempotency: if overrides were already built for this config, skip
-    row = conn.execute("SELECT COUNT(*) FROM overrides WHERE config_hash = ?", (config_hash,)).fetchone()
-    if row and row[0] > 0:
-        log.info("Override graph already built (%d relationships) — nothing to do", row[0])
-        return
+    if not force:
+        row = conn.execute("SELECT COUNT(*) FROM overrides WHERE config_hash = ?", (config_hash,)).fetchone()
+        if row and row[0] > 0:
+            log.info("Override graph already built (%d relationships) — nothing to do", row[0])
+            return
+    else:
+        # Start from a clean slate — old overrides may reference removed
+        # virtual methods or changed inheritance chains.
+        conn.execute("DELETE FROM overrides WHERE config_hash = ?", (config_hash,))
 
     total = 0
 
@@ -941,23 +947,26 @@ def _build_overrides(conn, config_hash: str, db_dir: Path, *, write_lock_held: b
     )
 
 
-def _build_pagerank(conn, config_hash: str, *, write_lock_held: bool = False) -> None:
+def _build_pagerank(conn, config_hash: str, *, write_lock_held: bool = False, force: bool = False) -> None:
     """Compute PageRank scores for function/method symbols from the call graph.
 
     Iterates until convergence (max 50 iterations, damping factor 0.85).
     Scores are normalized to 0.0–1.0 and stored in ``symbols.pagerank``.
 
     Idempotent — skips when pagerank already exists for this config.
+    Set *force* to True to recompute even when pagerank data already exists
+    (e.g. after incremental reindex).
     Requires the reference index (``fw-context index`` — refs on by default).
     """
     # Check already computed
-    row = conn.execute(
-        "SELECT COUNT(*) FROM symbols WHERE config_hash = ? AND pagerank > 0",
-        (config_hash,),
-    ).fetchone()
-    if row and row[0] > 0:
-        log.info("PageRank already computed — nothing to do")
-        return
+    if not force:
+        row = conn.execute(
+            "SELECT COUNT(*) FROM symbols WHERE config_hash = ? AND pagerank > 0",
+            (config_hash,),
+        ).fetchone()
+        if row and row[0] > 0:
+            log.info("PageRank already computed — nothing to do")
+            return
 
     edges = conn.execute(
         """SELECT DISTINCT r.from_usr, r.to_usr
@@ -1022,18 +1031,23 @@ def _build_pagerank(conn, config_hash: str, *, write_lock_held: bool = False) ->
     log.info("PageRank stored: %d nodes", n)
 
 
-def _build_hotspot_cache(conn, config_hash: str) -> None:
+def _build_hotspot_cache(conn, config_hash: str, *, force: bool = False) -> None:
     """Pre-compute hotspot caller counts for instant ``find_hotspots`` queries.
 
     Idempotent — skips when cache already exists for this config.
+    Set *force* to True to recompute even when cache data already exists
+    (e.g. after incremental reindex).
     Requires the reference index.
     """
-    row = conn.execute("SELECT COUNT(*) FROM hotspot_cache WHERE config_hash = ?", (config_hash,)).fetchone()
-    if row and row[0] > 0:
-        log.info("Hotspot cache already built — nothing to do")
-        return
+    if not force:
+        row = conn.execute("SELECT COUNT(*) FROM hotspot_cache WHERE config_hash = ?", (config_hash,)).fetchone()
+        if row and row[0] > 0:
+            log.info("Hotspot cache already built — nothing to do")
+            return
 
     with transaction(conn):
+        if force:
+            conn.execute("DELETE FROM hotspot_cache WHERE config_hash = ?", (config_hash,))
         conn.execute(
             """INSERT INTO hotspot_cache (config_hash, symbol_id, caller_count)
                SELECT r.config_hash, s.id, COUNT(r.rowid)
@@ -1054,6 +1068,46 @@ def _build_hotspot_cache(conn, config_hash: str) -> None:
 # ── Content-hash helpers ────────────────────────────────────────────
 
 
+def _refresh_header_mtimes_from_manifest(
+    conn, config_hash: str, project_root: Path, manifest: dict | None,
+) -> int:
+    """Refresh stored mtimes for headers touched by VCS operations.
+
+    After ``git checkout`` / ``git merge``, header files get new mtimes
+    even when their content hasn't changed.  The stored ``files.mtime``
+    values fall behind, causing ``_count_modified_files`` to report phantom
+    modifications and spawn unnecessary background reindexes.
+
+    This function scans the manifest's header entries and updates the
+    stored mtime whenever the on-disk mtime is newer but the stored mtime
+    is stale — fixing the drift without a full Tier-3 reparse.
+
+    Called once after the main TU loop, before the manifest update phase.
+    Returns the number of refreshed header records.
+    """
+    if manifest is None:
+        return 0
+    refreshed = 0
+    for entry in manifest.get("entries", []):
+        for h in entry.get("headers", []):
+            p = Path(h["path"])
+            if not p.is_absolute():
+                p = (project_root / p).resolve()
+            try:
+                cur_mtime = p.stat().st_mtime
+            except OSError:
+                continue
+            cur_obj = conn.execute(
+                "UPDATE files SET mtime=? WHERE config_hash=? AND path=? AND mtime < ?",
+                (cur_mtime, config_hash, str(p), cur_mtime),
+            )
+            if cur_obj.rowcount:
+                refreshed += 1
+    if refreshed:
+        log.info("header mtimes refreshed from manifest: %d", refreshed)
+    return refreshed
+
+
 def _is_excluded(file_path: Path, exclude_paths: list[Path], source_roots: list[Path]) -> bool:
     """Return True when *file_path* should be excluded from indexing.
 
@@ -1069,108 +1123,159 @@ def _is_excluded(file_path: Path, exclude_paths: list[Path], source_roots: list[
     return any(resolved == ep or resolved.is_relative_to(ep) for ep in exclude_paths)
 
 
-def _compute_source_hash(file_path: Path) -> str:
-    """Return SHA-256 hex digest of file content."""
-    return hashlib.sha256(file_path.read_bytes()).hexdigest()
 
-
-def _parse_dep_file(d_path: Path) -> list[Path]:
-    """Backward-compatible alias — delegates to :func:`dep_files.parse_dep_file`."""
-    return parse_dep_file(d_path)
-
-
-def _refresh_header_mtimes(
-    conn: sqlite3.Connection,
-    config_hash: str,
+def _update_manifest_after_index(
+    *,
+    manifest: dict | None,
+    units: list,
     project_root: Path,
-    existing_files: dict,
-) -> None:
-    """Refresh stored mtimes for header files that drifted due to VCS operations.
+    db_dir: Path,
+    compile_commands: Path,
+    updated_count: int,
+    tu_headers: dict[str, list[dict]] | None = None,
+    build_dir_patterns: list[str] | None = None,
+) -> dict | None:
+    """Update ``manifest.json`` after an indexing run.
 
-    Headers in the ``files`` table that are NOT translation units (their
-    ``deps_exist`` column is 0, or they aren't in *existing_files*) may
-    have stale mtimes from ``git checkout`` / ``git merge``.  When every
-    TU passes the Tier 1 mtime fast-path, these headers never get
-    updated — and ``_count_modified_files`` reports them as modified
-    even though no content changed.
+    Strategy:
+    - No existing manifest → build from scratch (tokenize all TUs).
+    - Manifest exists, nothing changed → skip (manifest is still valid).
+    - Manifest exists, TUs changed, *tu_headers* provided → incremental:
+      reuse stored entries for unchanged TUs, update only changed ones.
+    - Manifest exists, TUs changed, no *tu_headers* → fallback to full
+      rebuild (re-tokenize all TUs).
 
-    This pass updates the stored mtime to the current on-disk value for
-    any header whose mtime has drifted, is not a TU, and whose path is
-    already tracked in ``files``.
+    Returns the updated manifest dict, or ``None`` when no update needed.
     """
-    rows = conn.execute(
-        "SELECT path, mtime FROM files WHERE config_hash=? AND mtime > 0",
-        (config_hash,),
-    ).fetchall()
+    from .manifest import MANIFEST_FORMAT, _collect_headers_from_tokens, save
 
-    refreshed = 0
-    for r in rows:
-        path = r["path"]
-        stored = r["mtime"]
-        if not stored:
-            continue
-        # Skip TUs — their mtimes are updated during the main loop.
-        # Headers are identified by their extension (not in _SOURCE_EXTS).
-        if Path(path).suffix.lower() in _SOURCE_EXTS:
-            continue
-        p = Path(path)
-        if not p.is_absolute():
-            p = (project_root / path).resolve()
-        try:
-            cur = p.stat().st_mtime
-        except OSError:
-            continue
-        if cur > stored + MTIME_TOLERANCE_S:
-            conn.execute(
-                "UPDATE files SET mtime=? WHERE config_hash=? AND path=?",
-                (cur, config_hash, path),
-            )
-            refreshed += 1
+    # Nothing changed — keep existing manifest as-is, but only when all
+    # of these hold:
+    #   - TU list hasn't changed (same number of entries)
+    #   - No stale header hashes were collected (tu_headers empty)
+    #   - Manifest entries have real source_hash data (not a preliminary
+    #     manifest written by build_preliminary with empty hashes)
+    # A different TU count means files were added/removed from
+    # compile_commands.json.  A preliminary manifest means the on-disk
+    # file was overwritten by build_preliminary and needs regeneration.
+    if manifest is not None and updated_count == 0 and not tu_headers:
+        # Check for degraded (preliminary) manifest — entries with empty
+        # source_hash mean build_preliminary overwrote the real manifest.
+        entries = manifest.get("entries", [])
+        if entries and not entries[0].get("source_hash"):
+            log.info("Manifest has preliminary entries — regenerating with full hashes")
+            # Fall through to full regeneration below (don't return early)
+        else:
+            old_count = len(entries)
+            if old_count == len(units):
+                return manifest
+            log.info("Rebuilding manifest.json (TU count changed: %d → %d)", old_count, len(units))
 
-    if refreshed:
-        log.info("header mtimes refreshed: %d", refreshed)
+    # ── Build/update manifest entries ──
+    # Priority: 1) tu_headers (pre-collected during main loop — no extra I/O),
+    # 2) old manifest entries (unchanged), 3) libclang tokenization (slow fallback).
+    from .manifest import generate as generate_manifest
+    from .manifest import load as reload_manifest
 
+    if tu_headers is not None:
+        # Use pre-collected header hashes from _build_filtered_file_content.
+        # Avoids a second libclang parse — tu_headers was populated during
+        # the main TU loop for every unchanged/updated TU.
+        log.info("Building manifest.json from %d pre-collected TU headers...", len(tu_headers))
+        old_entries: dict[str, dict] = {}
+        if manifest is not None:
+            old_entries = {e.get("file", ""): e for e in manifest.get("entries", [])}
+        entries = []
+        reused = 0
+        updated = 0
 
-def _compute_deps_hash(headers: list[Path], cache: dict[str, str]) -> str:
-    """Return SHA-256 hex digest of the concatenated SHA-256 hashes of all headers.
-
-    Uses *cache* to avoid re-reading and re-hashing common headers within
-    a single indexing run (``stdio.h`` may be included by hundreds of TUs).
-    Entries whose cached hash is the empty string were unreadable — they
-    are counted toward the hash so a missing file is treated as a change.
-    """
-    parts: list[str] = []
-    for h in sorted(headers, key=lambda p: str(p)):
-        key = str(h)
-        if key not in cache:
+        for unit in units:
             try:
-                cache[key] = hashlib.sha256(h.read_bytes()).hexdigest()
-            except OSError:
-                cache[key] = ""  # sentinel for unreadable → force reparse
-        parts.append(cache[key])
-    return hashlib.sha256("".join(parts).encode()).hexdigest()
+                tu_rel = str(unit.file.resolve().relative_to(project_root))
+            except ValueError:
+                tu_rel = str(unit.file.resolve())
 
+            if tu_rel in tu_headers:
+                source_hash = compute_source_hash(unit.file.resolve())
+                entries.append({
+                    "file": tu_rel,
+                    "directory": str(unit.directory) if unit.directory else str(project_root),
+                    "arguments": unit.clang_args,
+                    "source_hash": source_hash,
+                    "headers": tu_headers[tu_rel],
+                })
+                updated += 1
+            elif tu_rel in old_entries:
+                entries.append(old_entries[tu_rel])
+                reused += 1
+            else:
+                headers = _collect_headers_from_tokens(unit, project_root, build_dir_patterns)
+                source_hash = compute_source_hash(unit.file.resolve())
+                entries.append({
+                    "file": tu_rel,
+                    "directory": str(unit.directory) if unit.directory else str(project_root),
+                    "arguments": unit.clang_args,
+                    "source_hash": source_hash,
+                    "headers": headers,
+                })
+                updated += 1
 
-def _find_dep_path(unit) -> Path | None:
-    """Locate the ``.d`` dependency file for a translation unit.
+        log.info("manifest.json: %d updated (from tu_headers), %d reused", updated, reused)
+    elif manifest is None:
+        # No manifest and no tu_headers — full rebuild via libclang (slow)
+        log.info("Generating manifest.json from %d TUs...", len(units))
+        generate_manifest(compile_commands, db_dir, project_root, units, build_dir_patterns=build_dir_patterns)
+        return reload_manifest(db_dir)
+    else:
+        # ── Incremental update (tu_headers=None, manifest exists) ──
+        old_entries = {e.get("file", ""): e for e in manifest.get("entries", [])}
+        entries = []
+        reused = 0
+        updated = 0
 
-    Tries three strategies in order:
-    1. ``resolve_dep_path_for_entry()`` — ``-MF`` flag and ``output``
-       field from the raw compile_commands.json entry.
-    2. ``<source>.d`` next to the source file (in-tree builds).
-    """
-    if unit.raw_entry is not None:
-        directory = unit.directory if unit.directory else Path()
-        result = resolve_dep_path_for_entry(unit.raw_entry, directory)
-        if result is not None:
-            return result
+        for unit in units:
+            try:
+                tu_rel = str(unit.file.resolve().relative_to(project_root))
+            except ValueError:
+                tu_rel = str(unit.file.resolve())
 
-    # Fallback: replace source extension with .d next to the source
-    d = unit.file.with_suffix(".d")
-    if d.exists():
-        return d
+            if tu_rel in old_entries:
+                entries.append(old_entries[tu_rel])
+                reused += 1
+            else:
+                headers = _collect_headers_from_tokens(unit, project_root, build_dir_patterns)
+                source_hash = compute_source_hash(unit.file.resolve())
+                entries.append({
+                    "file": tu_rel,
+                    "directory": str(unit.directory) if unit.directory else str(project_root),
+                    "arguments": unit.clang_args,
+                    "source_hash": source_hash,
+                    "headers": headers,
+                })
+                updated += 1
 
-    return None
+        log.info("manifest.json incremental: %d updated, %d reused", updated, reused)
+
+    log.info("manifest.json incremental: %d updated, %d reused", updated, reused)
+
+    manifest_data = {
+        "_format": MANIFEST_FORMAT,
+        "compile_commands_path": str(compile_commands),
+        "project_root": str(project_root),
+        "entries": entries,
+    }
+    # Preserve build_dir_patterns across incremental updates
+    if build_dir_patterns:
+        manifest_data["build_dir_patterns"] = build_dir_patterns
+    elif manifest and manifest.get("build_dir_patterns"):
+        manifest_data["build_dir_patterns"] = manifest["build_dir_patterns"]
+    # Preserve macros from old manifest
+    if manifest and manifest.get("macros"):
+        manifest_data["macros"] = manifest["macros"]
+    config_hash = save(manifest_data, db_dir)
+    header_count = sum(len(e.get("headers", [])) for e in entries)
+    log.info("manifest.json saved: %d TUs, %d headers, config_hash=%s", len(entries), header_count, config_hash[:12])
+    return manifest_data
 
 
 def _check_and_parse_unit(
@@ -1182,7 +1287,7 @@ def _check_and_parse_unit(
     index_refs,
     existing_files,
     force=False,
-    header_hash_cache=None,
+    manifest=None,
 ):
     """Check whether *unit* needs re-parsing and parse it if so.
 
@@ -1190,6 +1295,7 @@ def _check_and_parse_unit(
     1. **mtime fast-path** — unchanged mtime → skip (no I/O).
     2. **content-hash check** — mtime differs but hashes match → skip
        (the source, flags, and header dependencies have not changed).
+       Uses ``manifest.json`` for header hashes when available — no libclang needed.
     3. **libclang parse** — content hashes differ → parse.
 
     Does NOT write to the database — the caller is responsible for
@@ -1197,21 +1303,19 @@ def _check_and_parse_unit(
     to persist the result.
 
     Args:
-        header_hash_cache: Optional ``dict[str, str]`` for per-run header
-            SHA-256 caching.  When ``None``, a new cache is created.
+        manifest: Optional ``{file_path: entry}`` lookup dict built from
+            ``manifest.load()`` entries.  When provided, header staleness
+            is checked via hash comparison against the manifest (fast —
+            file reads + SHA-256 only).  When ``None``, falls back to
+            source-hash-only comparison.
 
     Returns:
-        * ``("unchanged", None, None, hashes)`` — no re-parse needed.
-          *hashes* is a ``(source_hash, flags_hash, deps_hash, deps_exist)``
-          tuple, or ``None`` when the fast-path mtime check succeeded.
+        * ``("unchanged", None, None, None)`` — no re-parse needed.
         * ``("skipped", None, None, None)`` — excluded path or parse failed.
         * ``("updated", parsed, (t_start, t_end), hashes)`` — parsed
           successfully, ready for ``_process_unit(pre_parsed=parsed)``.
-          *hashes* is ``(source_hash, flags_hash, deps_hash, deps_exist)``.
+          *hashes* is ``(source_hash, flags_hash, manifest_entry_hash)``.
     """
-    if header_hash_cache is None:
-        header_hash_cache = {}
-
     resolved_tu = unit.file.resolve()
     if _is_excluded(resolved_tu, exclude_paths, source_roots):
         return ("unchanged", None, None, None)
@@ -1222,7 +1326,7 @@ def _check_and_parse_unit(
     # ── Tier 1: mtime fast-path ──
     if not force_refs and file_path in existing_files:
         rec = existing_files[file_path]
-        stored_mtime = rec[1]
+        stored_mtime = rec.mtime
         try:
             current_mtime = unit.file.stat().st_mtime if unit.file.exists() else 0.0
         except OSError:
@@ -1231,9 +1335,9 @@ def _check_and_parse_unit(
             return ("unchanged", None, None, None)
 
     # ── Tier 2: content-hash check (mtime differs) ──
-    # Compute source and flags hashes first — cheap operations.
+    # Compute source hash first — cheap, no libclang.
     try:
-        source_hash = _compute_source_hash(unit.file)
+        source_hash = compute_source_hash(unit.file)
     except OSError:
         source_hash = ""
 
@@ -1242,26 +1346,21 @@ def _check_and_parse_unit(
     else:
         flags_hash = ""
 
-    # Locate and hash header dependencies from .d file
-    dep_path = _find_dep_path(unit)
-    deps_exist = dep_path is not None
-    if deps_exist:
-        headers = _parse_dep_file(dep_path)
-        deps_hash = _compute_deps_hash(headers, header_hash_cache)
-    else:
-        deps_hash = ""
+    # Determine manifest entry hash for Tier 2 comparison.
+    # When manifest.json exists, use check_tu_staleness() — fast hash comparison
+    # against stored values.  When not, fall back to source-only hash.
+    manifest_entry_hash = _get_manifest_entry_hash_for_unit(
+        unit, project_root, source_roots, manifest,
+    )
 
-    content_hash = compute_tu_content_hash(source_hash, flags_hash, deps_hash)
-    hashes = (source_hash, flags_hash, deps_hash, deps_exist)
+    content_hash = compute_tu_content_hash(source_hash, flags_hash, manifest_entry_hash)
+    hashes = (source_hash, flags_hash, manifest_entry_hash)
 
     if not force_refs and file_path in existing_files:
         rec = existing_files[file_path]
-        # rec layout from get_file_hashes():
-        # (file_id, mtime, stored_content_hash, stored_source_hash,
-        #  stored_flags_hash, stored_deps_hash, stored_deps_exist)
-        if len(rec) >= 3 and rec[2] == content_hash:
+        # rec is a FileHashRecord from get_file_hashes() — attribute access
+        if rec.content_hash and rec.content_hash == content_hash:
             # Content unchanged — just the mtime was bumped by a rebuild.
-            # Logged as "unchanged (content)" to distinguish from mtime skip.
             return ("unchanged", None, None, hashes)
 
     # ── Tier 3: libclang parse ──
@@ -1289,6 +1388,50 @@ def _check_and_parse_unit(
     return ("updated", parsed, (t_parse_start, t_parse_end), hashes)
 
 
+def _get_manifest_entry_hash_for_unit(
+    unit,
+    project_root: Path,
+    source_roots: list[Path],
+    manifest_lookup: dict[str, dict] | None,
+) -> str:
+    """Return the manifest entry hash for a TU for Tier 2 staleness comparison.
+
+    When *manifest_lookup* is available (``{file_path: entry}`` dict from
+    ``manifest.json``), checks header staleness via ``check_tu_staleness()``
+    — fast file reads + SHA-256 only, no libclang.
+
+    When *manifest_lookup* is ``None``, falls back to a source-only hash
+    (no header tracking possible).
+    """
+    from .manifest import check_tu_staleness, compute_current_entry_hash
+    from .manifest import get_manifest_entry_hash as _entry_hash
+
+    # ── Manifest path (fast — no libclang, O(1) lookup) ──
+    if manifest_lookup is not None:
+        try:
+            tu_rel = str(unit.file.resolve().relative_to(project_root))
+        except ValueError:
+            tu_rel = str(unit.file.resolve())
+
+        entry = manifest_lookup.get(tu_rel)
+        if entry is not None:
+            stale, current_source_hash = check_tu_staleness(entry, project_root, source_roots)
+            if not stale:
+                return _entry_hash(entry)
+            # Stale — compute hash from CURRENT disk content (both source and headers)
+            return compute_current_entry_hash(
+                entry, project_root, source_roots,
+                new_source_hash=current_source_hash,
+            )
+
+    # ── Fallback: source-only hash (no manifest, no header tracking) ──
+    try:
+        source_hash = hashlib.sha256(unit.file.resolve().read_bytes()).hexdigest()
+    except OSError:
+        source_hash = ""
+    return source_hash
+
+
 def _process_unit(
     unit,
     config_hash,
@@ -1304,6 +1447,7 @@ def _process_unit(
     pre_parsed=None,
     parse_timing=(0.0, 0.0),
     hashes=None,
+    build_dir_patterns=None,
 ):
     """Process one translation unit: check staleness, parse, store.
 
@@ -1346,14 +1490,16 @@ def _process_unit(
             Ignored when *pre_parsed* is ``None``.
 
     Returns:
-        A tuple ``(status, symbols_added, refs_added)`` where ``status`` is
-        ``"updated"`` (new or modified symbols stored), ``"unchanged"``
-        (mtime matched — no work needed), or ``"skipped"`` (excluded by
-        ``exclude_paths`` or failed during parsing).
+        A tuple ``(status, symbols_added, refs_added, timing, headers)`` where
+        *status* is ``"updated"`` (new or modified symbols stored),
+        ``"unchanged"`` (mtime matched — no work needed), or ``"skipped"``
+        (excluded by ``exclude_paths`` or failed during parsing), and
+        *headers* is a list of ``{path, hash, generated}`` dicts for included
+        header files (empty list for unchanged/skipped).
     """
     resolved_tu = unit.file.resolve()
     if _is_excluded(resolved_tu, exclude_paths, source_roots):
-        return ("unchanged", 0, 0, (0.0, 0.0, 0.0))
+        return ("unchanged", 0, 0, (0.0, 0.0, 0.0), [])
 
     if pre_parsed is not None:
         parsed = pre_parsed
@@ -1364,13 +1510,15 @@ def _process_unit(
         force_refs = force or os.environ.get("FW_CONTEXT_FORCE_REFINDEX") == "1"
         if not force_refs and file_path in existing_files:
             rec = existing_files[file_path]
-            stored_mtime = rec[1]  # mtime is always index 1 (handles old 2-tuple and new 7-tuple format)
+            # get_file_hashes returns FileHashRecord (attribute access),
+            # get_file_mtimes returns tuple[int, float] (positional).
+            stored_mtime = rec.mtime if hasattr(rec, "mtime") else rec[1]
             try:
                 current_mtime = unit.file.stat().st_mtime if unit.file.exists() else 0.0
             except OSError:
                 current_mtime = 0.0
             if current_mtime <= stored_mtime + MTIME_TOLERANCE_S:
-                return ("unchanged", 0, 0, (0.0, 0.0, 0.0))
+                return ("unchanged", 0, 0, (0.0, 0.0, 0.0), [])
 
         # Parse with libclang outside any lock — this is the expensive
         # CPU-bound step.  Only serialise DB writes, not parsing.
@@ -1386,7 +1534,7 @@ def _process_unit(
             )
         except Exception as exc:
             log.warning("skip TU %s: %s", unit.file.name, exc)
-            return ("skipped", 0, 0, (0.0, 0.0, 0.0))
+            return ("skipped", 0, 0, (0.0, 0.0, 0.0), [])
         t_parse_end = time.monotonic()
 
     # Resolve connection: persistent (callable → lazy open, don't close),
@@ -1412,7 +1560,7 @@ def _process_unit(
         with lock_ctx:
             t_write_start = time.monotonic()
             with transaction(conn, checkpoint=False):
-                syms_added, refs_added = store_symbols_for_unit(
+                syms_added, refs_added, headers = store_symbols_for_unit(
                     conn,
                     unit,
                     config_hash,
@@ -1423,6 +1571,7 @@ def _process_unit(
                     pre_parsed=parsed,
                     existing_files=existing_files,
                     hashes=hashes,
+                    build_dir_patterns=build_dir_patterns,
                 )
             t_write_end = time.monotonic()
             t_parse = t_parse_end - t_parse_start
@@ -1438,7 +1587,7 @@ def _process_unit(
                 refs_added,
             )
         timing = (t_parse, t_lock, t_write)
-        return ("updated", syms_added, refs_added, timing)
+        return ("updated", syms_added, refs_added, timing, headers)
     except sqlite3.Error:
         log.error("Fatal DB error storing %s — stopping indexer", unit.file.name)
         raise
@@ -1448,7 +1597,7 @@ def _process_unit(
             log.error("Fatal DB error storing %s: %s — stopping indexer", unit.file.name, exc)
             raise
         log.warning("skip TU %s: %s", unit.file.name, exc)
-        return ("skipped", 0, 0, (0.0, 0.0, 0.0))
+        return ("skipped", 0, 0, (0.0, 0.0, 0.0), [])
     finally:
         if own_conn:
             conn.close()
@@ -1472,6 +1621,7 @@ def run(
     force: bool = False,
     index_macros_expanded: bool = True,
     config_header: str = "",
+    build_dir_patterns: list[str] | None = None,
 ) -> str:
     """Index a project: parse translation units, extract symbols, and store to SQLite.
 
@@ -1533,7 +1683,40 @@ def run(
     if project_id is None:
         project_id = derive_project_id(project_root)
     name = project_name or project_root.name
-    config_hash = compute_config_hash(compile_commands)
+    # Parse compile_commands.json to discover translation units.  Must
+    # happen before config_hash computation so the manifest can be built
+    # from the actual TU list.
+    units = list(parse_compile_commands(compile_commands))
+    units = [u for u in units if u.file.suffix.lower() in _SOURCE_EXTS]
+    log.info("TUs to index: %d", len(units))
+
+    # Determine config_hash from manifest.json.  The manifest captures the
+    # full structural build identity (files, directories, compiler flags) —
+    # more comprehensive than hashing compile_commands.json alone.
+    #
+    # When a manifest exists, compute the expected structural hash from the
+    # current units and compare.  If they match, reuse the stored hash so
+    # _update_manifest_after_index() can do an incremental header update.
+    # If they differ (compile_commands.json changed), rebuild the preliminary
+    # manifest.  When no manifest exists yet (first index), build one.
+    from .manifest import build_preliminary, compute_structural_hash
+    from .manifest import load as load_manifest
+
+    manifest = load_manifest(db_path.parent)
+    expected_hash = compute_structural_hash(
+        compile_commands, project_root, units, build_dir_patterns,
+    )
+    if manifest is not None and manifest.get("config_hash") == expected_hash:
+        config_hash = manifest["config_hash"]
+    else:
+        config_hash = build_preliminary(
+            compile_commands, db_path.parent, project_root, units, build_dir_patterns,
+        )
+        # Reload manifest from disk — build_preliminary may have overwritten
+        # manifest.json.  The in-memory manifest must reflect what _update_manifest_after_index
+        # will find on disk (degraded or fresh), so the early-return guard can detect
+        # preliminary (empty source_hash) entries and fall through to regeneration.
+        manifest = load_manifest(db_path.parent)
 
     # Heartbeat for background reindex watchdog.  When the subprocess is
     # stuck (deadlock / hung syscall), this daemon thread stops writing
@@ -1558,30 +1741,25 @@ def run(
     log.info("project=%s project_id=%s config_hash=%s", name, project_id, config_hash[:12])
 
     conn = open_db(db_path)
-    # Preserve the previous deps_verification value so get_active_build()
-    # always returns the result of the last COMPLETED index, not an
-    # intermediate "none" that would be set during the current run.
+    # Determine initial manifest verification for this config.
     # For a new config_hash (first index), default to "none".
-    old_deps_row = conn.execute(
-        "SELECT deps_verification FROM build_configs WHERE config_hash=?",
+    # For an existing config, preserve the previous value.
+    old_row = conn.execute(
+        "SELECT manifest_verification FROM build_configs WHERE config_hash=?",
         (config_hash,),
     ).fetchone()
-    initial_deps = old_deps_row["deps_verification"] if old_deps_row else "none"
+    initial_manifest_verification = old_row["manifest_verification"] if old_row else "none"
     # Serialize with any concurrent writer (background reindex, daemon)
-    # so SQLite busy_timeout is never the sole coordination mechanism.
-    # The foreground CLI writes reindex.pause before calling run() to
-    # signal the background reindex to pause at its next TU boundary.
-    # Acquiring write_lock ensures we wait until the background releases
-    # its current per-TU lock and sees the pause marker.
     with write_lock(db_path.parent, timeout=120.0):
         with transaction(conn):
             upsert_project(conn, project_id, name, str(project_root))
-            upsert_build_config(conn, config_hash, project_id, str(compile_commands),
-                                deps_verification=initial_deps)
-
-    units = list(parse_compile_commands(compile_commands))
-    units = [u for u in units if u.file.suffix.lower() in _SOURCE_EXTS]
-    log.info("TUs to index: %d", len(units))
+            upsert_build_config(
+                conn,
+                config_hash,
+                project_id,
+                str(compile_commands),
+                manifest_verification=initial_manifest_verification,
+            )
 
     # Inject user-configured config header when the build system doesn't emit
     # -include flags (custom builds, legacy Makefiles, etc.).
@@ -1605,9 +1783,12 @@ def run(
 
     existing_files = get_file_hashes(conn, config_hash)
 
-    # Per-run cache for header SHA-256 hashes — avoids re-reading
-    # common headers (e.g. stdio.h) for every translation unit.
-    header_hash_cache: dict[str, str] = {}
+    # Pre-build lookup dict for O(1) manifest entry access during Tier 2 checks.
+    # *manifest* was loaded above (before config_hash computation) — reuse it.
+    manifest_lookup: dict[str, dict] = {}
+    if manifest is not None:
+        for e in manifest.get("entries", []):
+            manifest_lookup[e.get("file", "")] = e
 
     # Drop FTS5 content-sync triggers before bulk indexing — each symbol
     # INSERT/DELETE/UPDATE would otherwise pay per-row FTS index overhead
@@ -1624,6 +1805,9 @@ def run(
     acc_lock = 0.0
     acc_write = 0.0
     content_filled = 0
+    # Collect headers during tokenization for incremental manifest update.
+    # Maps file_path → list of {path, hash, generated} header dicts.
+    tu_headers: dict[str, list[dict]] = {}
     t0 = time.monotonic()
 
     log.info("", extra={"phase": f"Parsing ({len(units)} TUs)"})
@@ -1693,69 +1877,48 @@ def run(
             index_refs,
             existing_files,
             force=force,
-            header_hash_cache=header_hash_cache,
+            manifest=manifest_lookup,
         )
 
         if check_status == "unchanged":
             unchanged += 1
-            # Always update stored mtime so future checks still fast-path —
-            # even when the TU itself didn't change (Tier 1 mtime match),
-            # header dependencies may have been touched by VCS operations
-            # (git checkout/merge) and need their mtimes refreshed.
             file_path_str = str(unit.file)
             rec = existing_files.get(file_path_str)
-            file_id = rec[0] if rec else None
-            stored_deps_exist = bool(rec[6]) if rec and len(rec) > 6 else False
+            file_id = rec.file_id if rec else None
             try:
                 current_mtime = unit.file.stat().st_mtime if unit.file.exists() else 0.0
             except OSError:
                 current_mtime = 0.0
 
-            deps_exist = False
             with write_lock(db_path.parent, timeout=120.0):
                 if hashes is not None:
-                    # Tier 2: content-hash match — full update including hashes
-                    source_hash, flags_hash, deps_hash, deps_exist = hashes
-                    content_hash_val = compute_tu_content_hash(source_hash, flags_hash, deps_hash)
+                    # Tier 2: content-hash match — update all hashes
+                    source_hash, flags_hash, manifest_entry_hash = hashes
+                    content_hash_val = compute_tu_content_hash(source_hash, flags_hash, manifest_entry_hash)
                     if file_id is not None:
                         conn.execute(
                             """UPDATE files SET mtime=?, content_hash=?, source_hash=?,
-                               flags_hash=?, deps_hash=?, deps_exist=?
+                               flags_hash=?
                                WHERE id=?""",
-                            (current_mtime, content_hash_val, source_hash, flags_hash, deps_hash, int(deps_exist), file_id),
+                            (current_mtime, content_hash_val, source_hash, flags_hash, file_id),
                         )
                 elif file_id is not None:
-                    # Tier 1: mtime match — just refresh stored mtime.
-                    # Without this, _count_modified_files would flag TUs whose
-                    # on-disk mtime drifted even though content didn't change.
+                    # Tier 1: mtime match — just refresh stored mtime
                     conn.execute(
                         "UPDATE files SET mtime=? WHERE id=?",
                         (current_mtime, file_id),
                     )
-                    deps_exist = stored_deps_exist
-
-                # Refresh dependency header mtimes so _count_modified_files
-                # doesn't keep flagging headers touched by git checkout/merge.
-                # Without this, headers whose content didn't change but got a
-                # new mtime from a VCS operation would remain "stale" until
-                # the next full re-parse (Tier 3) of every including TU.
-                if deps_exist:
-                    dep_path = _find_dep_path(unit)
-                    if dep_path is not None:
-                        for h in _parse_dep_file(dep_path):
-                            try:
-                                h_mtime = h.stat().st_mtime
-                            except OSError:
-                                continue
-                            conn.execute(
-                                """UPDATE files SET mtime=?
-                                   WHERE config_hash=? AND path=?
-                                     AND mtime < ?""",
-                                (h_mtime, config_hash, str(h), h_mtime),
-                            )
                 # Fill ifdef-filtered file content via tokenization
-                # (skipped by store_symbols_for_unit since TU wasn't re-parsed)
-                content_filled += _build_filtered_file_content(conn, unit, config_hash, project_root)
+                fc, headers = _build_filtered_file_content(
+                    conn, unit, config_hash, project_root, build_dir_patterns=build_dir_patterns
+                )
+                content_filled += fc
+                if headers:
+                    try:
+                        tu_key = str(unit.file.resolve().relative_to(project_root))
+                    except ValueError:
+                        tu_key = str(unit.file.resolve())
+                    tu_headers[tu_key] = headers
             terse = "unchanged (content)" if hashes is not None else "unchanged"
             log.info("[%d/%d] %s: %s", processed, len(units), fname, terse)
             continue
@@ -1767,7 +1930,7 @@ def run(
 
         # ── Phase 2: DB store (inside lock) ──
         with write_lock(db_path.parent, timeout=120.0):
-            status, syms, refs, timing = _process_unit(
+            status, syms, refs, timing, tu_headers_list = _process_unit(
                 unit,
                 config_hash,
                 project_root,
@@ -1781,6 +1944,7 @@ def run(
                 pre_parsed=parsed_data,
                 parse_timing=parse_timing,
                 hashes=hashes,
+                build_dir_patterns=build_dir_patterns,
             )
             if status == "updated":
                 updated += 1
@@ -1789,6 +1953,12 @@ def run(
                 acc_parse += timing[0]
                 acc_lock += timing[1]
                 acc_write += timing[2]
+                if tu_headers_list:
+                    try:
+                        tu_key = str(unit.file.resolve().relative_to(project_root))
+                    except ValueError:
+                        tu_key = str(unit.file.resolve())
+                    tu_headers[tu_key] = tu_headers_list
                 log.info(
                     "[%d/%d] %s: %d syms, %d refs, %.1fs",
                     processed,
@@ -1811,6 +1981,13 @@ def run(
     t_fts = time.monotonic() - t_fts_start
     log.info("fts5 + files_fts rebuilt  %s", _fmt_dur(t_fts))
 
+    # Clean up file records that no longer have symbols or macros.
+    from .db import delete_orphan_files
+
+    orphans = delete_orphan_files(conn, config_hash)
+    if orphans:
+        log.info("Orphan files cleaned up: %d", orphans)
+
     elapsed_parse = time.monotonic() - t0
     log.info(
         "Parsing done: %d updated, %d unchanged, %d skipped — parse=%.1fs  lock=%.1fs  write=%.1fs  %s",
@@ -1825,13 +2002,27 @@ def run(
     if content_filled:
         log.info("ifdef-filtered content: %d files filled", content_filled)
 
-    # ── Refresh header mtimes ──
-    # When only header mtimes have drifted (e.g. from git checkout/merge)
-    # but no TU content changed, the Tier 1 mtime fast-path skips every TU
-    # and the dependency-header mtimes above are never updated (the .d file
-    # may not even exist anymore).  This final pass catches those stragglers
-    # so _count_modified_files doesn't report phantom modifications.
-    _refresh_header_mtimes(conn, config_hash, project_root, existing_files)
+    # ── Refresh header mtimes from manifest ──
+    # VCS operations (git checkout/merge) update header file mtimes without
+    # changing content.  Refresh stored mtimes so _count_modified_files
+    # doesn't report phantom modifications and trigger unnecessary reindexes.
+    _refresh_header_mtimes_from_manifest(conn, config_hash, project_root, manifest)
+
+    # ── Update manifest.json ──
+    # Rebuild/update the manifest with fresh header hashes after indexing.
+    # For incremental runs (no --build), only updated TUs get new entries;
+    # unchanged TUs keep their stored entries from the previous manifest.
+    _update_manifest_after_index(
+        manifest=manifest,
+        units=units,
+        project_root=project_root,
+        db_dir=db_path.parent,
+        compile_commands=compile_commands,
+        updated_count=updated,
+        tu_headers=tu_headers if tu_headers else None,
+        build_dir_patterns=build_dir_patterns,
+    )
+
 
     # Resolve expanded macro values via clang -dM -E (opt-in, best-effort).
     if index_macros_expanded and units:
@@ -1972,45 +2163,15 @@ def run(
         conn.commit()
         log.info("done  %s", _fmt_dur(time.monotonic() - t_hs))
 
-    # Determine deps verification level after all TUs are processed.
-    # Only count translation units (source files from compile_commands.json),
-    # not header files — .d files are only meaningful for TUs.
-    #
-    # Some TUs may be excluded from indexing (e.g. build/sketch/ for Arduino
-    # where the sketch is preprocessed into the build directory).  We count
-    # only TUs that were actually indexed (present in the ``files`` table)
-    # so excluded TUs don't drag the verification level down to "partial".
-    tu_paths = [str(u.file.resolve()) for u in units]
-    # Exclude empty source files — they contain no includes and produce no
-    # dependency output from -MMD / -MD (e.g. Zephyr's misc/empty_file.c).
-    tu_paths = [
-        p for p in tu_paths
-        if not (Path(p).is_file() and Path(p).stat().st_size == 0)
-    ]
-    if not tu_paths:
-        deps_verification = "none"
-    else:
-        placeholders = ",".join(["?"] * len(tu_paths))
-        tu_indexed_row = conn.execute(
-            f"SELECT COUNT(*) FROM files WHERE config_hash = ? AND path IN ({placeholders})",
-            (config_hash, *tu_paths),
-        ).fetchone()
-        tu_indexed = tu_indexed_row[0] if tu_indexed_row else 0
-
-        tu_with_deps_row = conn.execute(
-            f"SELECT COUNT(*) FROM files WHERE config_hash = ? AND deps_exist AND path IN ({placeholders})",
-            (config_hash, *tu_paths),
-        ).fetchone()
-        tu_with_deps = tu_with_deps_row[0] if tu_with_deps_row else 0
-
-        if tu_indexed == 0 or tu_with_deps == 0:
-            deps_verification = "none"
-        elif tu_with_deps >= tu_indexed:
-            deps_verification = "full"
-        else:
-            deps_verification = "partial"
+    # Manifest verification — "full" when we have a manifest.json, "none" otherwise.
+    # The manifest is generated during `fw-context index --build` and provides
+    # header dependency hashes without needing .d files.
+    manifest_path = db_path.parent / "manifest.json"
+    manifest_verification: str = "full" if manifest_path.exists() else "none"
     with transaction(conn):
-        upsert_build_config(conn, config_hash, project_id, str(compile_commands), deps_verification=deps_verification)
+        upsert_build_config(
+            conn, config_hash, project_id, str(compile_commands), manifest_verification=manifest_verification
+        )
 
     elapsed = time.monotonic() - t0
     try:

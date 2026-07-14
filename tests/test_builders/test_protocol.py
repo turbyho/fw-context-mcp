@@ -18,7 +18,7 @@ class TestBuildIssue:
     def test_auto_fixable(self):
         issue = BuildIssue(
             severity="warning",
-            category="dep_files_missing",
+            category="incomplete_compile_commands",
             message="No .d files",
             auto_fixable=True,
             fix_hint="Run --build",
