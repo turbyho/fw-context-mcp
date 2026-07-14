@@ -401,15 +401,20 @@ def main() -> None:
         mcp.run()
         return
 
-    # GOTCHA — integrity_check on large DBs is I/O-bound (10-30 s for
-    # 3+ GB).  If it runs here via _open_db_safe during MCP server startup,
-    # the MCP client times out during tool discovery and fw-context tools
-    # never appear.  The check already ran during ``fw-context index``, so
-    # we skip it by pre-marking the DB — a corrupt DB will be caught by
-    # individual queries via _open_db_safe.
-    db_path = _db_path(root)
-    if db_path.exists():
-        _integrity_checked.add(str(db_path.resolve()))
+    try:
+        # GOTCHA — integrity_check on large DBs is I/O-bound (10-30 s for
+        # 3+ GB).  If it runs here via _open_db_safe during MCP server startup,
+        # the MCP client times out during tool discovery and fw-context tools
+        # never appear.  The check already ran during ``fw-context index``, so
+        # we skip it by pre-marking the DB — a corrupt DB will be caught by
+        # individual queries via _open_db_safe.
+        db_path = _db_path(root)
+        if db_path.exists():
+            _integrity_checked.add(str(db_path.resolve()))
+    except Exception:
+        log.exception("Project not initialized, server starting without DB")
+        mcp.run()
+        return
 
     try:
         _ensure_daemon_running(root)
