@@ -95,7 +95,15 @@ def get_active_build(
     root = resolve_project_root(project_root)
     db_path = _db_path(root)
     if not db_path.exists():
-        return {"error": f"No index found for {root}. Run 'fw-context index' first."}
+        return {
+            "status": "no_index",
+            "project_root": str(root),
+            "index_message": (
+                f"No symbol index found for {root}. "
+                "Run `fw-context index <path/to/compile_commands.json>` via bash "
+                "to build the index, then call get_active_build() again."
+            ),
+        }
 
     # Check bg reindex status BEFORE querying the DB — when a bg reindex
     # is running, the _modified_cache may contain stale counts from before

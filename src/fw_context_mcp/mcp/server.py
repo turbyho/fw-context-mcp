@@ -114,7 +114,12 @@ mcp = FastMCP(
         '  • status="ready" or "reindexing" — fw-context is fully operational.\n'
         "    bg_reindex_running does NOT mean the index is unavailable. Continue.\n"
         '  • status="reindex_needed" — queries still work, but schedule fw-context index.\n'
-        '  • status="no_index" or "error" — use other available tools.\n\n'
+        '  • status="no_index" or "error" — you MUST run `fw-context index` via bash\n'
+        '    tool IMMEDIATELY (use `fw-context index <path/to/compile_commands.json>`\n'
+        '    if the project has one, or `fw-context index --build` to auto-detect).\n'
+        '    Do NOT ask the user to do it manually. Do NOT fall back to grep/other\n'
+        '    tools. After indexing completes, call get_active_build() again to\n'
+        '    confirm status="ready", then proceed with fw-context query tools.\n\n'
         "REVIEW WORKFLOW — when reviewing C/C++ code changes (per changed symbol):\n"
         "0. find_hotspots(project_only=True) — identify highest-impact functions FIRST.\n"
         "   Prioritize review of hotspots (20+ callers) over leaf functions.\n"
@@ -431,18 +436,14 @@ def main() -> None:
         return
 
     # Check 2: does the index database exist?
+    # If not, we DON'T set the sentinel — the server starts normally so
+    # that get_active_build() can return status="no_index", allowing the
+    # agent to detect the missing index and run `fw-context index` via
+    # bash automatically (self-bootstrapping).
     cfg = load_config(project_root=root)
     db_path = cfg.index.db_dir / project_id / "index.db"
     if not db_path.exists():
-        log.info("No index found at %s — tools will report setup instructions", db_path)
-        _set_server_init_error(
-            f"No symbol index found for project at {root}.\n\n"
-            "Run these commands in your terminal:\n"
-            "  1. fw-context index --build\n"
-            "  2. Restart your AI tool\n\n"
-            "fw-context index --build compiles and indexes your C/C++ codebase\n"
-            "for code intelligence (symbol lookup, call graph, search, etc.)."
-        )
+        log.info("No index found at %s — get_active_build() will report no_index", db_path)
         mcp.run()
         return
 
