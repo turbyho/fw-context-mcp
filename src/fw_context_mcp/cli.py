@@ -8,7 +8,9 @@ import argparse
 import logging
 import os
 import re
+import signal
 import sys
+import time
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -256,17 +258,41 @@ def cmd_index(args: argparse.Namespace) -> int:
 
         cs_config = replace(cs_config, force=True)
 
-    # Pause background reindex so it releases the write lock.
-    # Without this, a concurrent bg reindex holds the lock and the
-    # foreground ``fw-context index`` times out after 120 s.
+    # Manual index always wins — kill any running background reindex and
+    # prevent the daemon from starting a new one until we're done.
     pause_file = db_path.parent / "reindex.pause"
     reindex_pid_file = db_path.parent / "reindex.pid"
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # 1. Kill the background reindex subprocess if one is running
+    if reindex_pid_file.exists():
+        try:
+            bg_pid = int(reindex_pid_file.read_text(encoding="utf-8").strip())
+            if bg_pid != os.getpid():
+                os.kill(bg_pid, signal.SIGTERM)
+                # Wait up to 5 s for graceful exit, then force kill
+                deadline = time.monotonic() + 5.0
+                while time.monotonic() < deadline:
+                    try:
+                        os.kill(bg_pid, 0)
+                    except OSError:
+                        break
+                    time.sleep(0.1)
+                else:
+                    try:
+                        os.kill(bg_pid, signal.SIGKILL)
+                    except OSError:
+                        pass
+                reindex_pid_file.unlink(missing_ok=True)
+        except (OSError, ValueError):
+            reindex_pid_file.unlink(missing_ok=True)
+
+    # 2. Write pause marker so the daemon skips spawning new bg reindexes
     try:
         pause_file.write_text(str(os.getpid()), encoding="utf-8")
     except OSError:
         pass
-    # Signal that an index is running — _is_bg_reindex_running reads this
-    db_path.parent.mkdir(parents=True, exist_ok=True)
+    # 3. Signal that an index is running — _is_bg_reindex_running reads this
     reindex_pid_file.write_text(str(os.getpid()), encoding="utf-8")
     try:
         config_hash = run(
