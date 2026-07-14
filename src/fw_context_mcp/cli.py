@@ -924,18 +924,14 @@ def cmd_init(args: argparse.Namespace) -> int:
                     selected.append(tid)
 
     if not selected:
-        if args.scope == "project":
-            print("No AI assistant detected in this project or system-wide.")
-            print()
-            print("Run an AI assistant (Claude Code, OpenCode, etc.) in this project")
-            print("directory first — it will create its config directory. Then re-run")
-            print("'fw-context init'.")
-            print()
-            print("Alternatively, use --scope global to install fw-context for all")
-            print("projects, or --tool to target a specific assistant.")
-        else:
-            print("No AI assistants detected. Use --list-tools to see supported tools.")
-        return 1
+        # Fallback: when no AI assistants are detected, default to Claude Code.
+        # This ensures the project is fully initialized (project ID, config files,
+        # skills, agents) even in minimal environments without any AI tooling
+        # installed (Docker containers, CI, headless build servers).
+        # _register_mcp_cli will skip MCP registration gracefully when the
+        # 'claude' binary is not found.
+        print("No AI assistants detected — falling back to Claude Code configuration.")
+        selected = ["claude-code"]
 
     ok = False
     warnings: list[str] = []
