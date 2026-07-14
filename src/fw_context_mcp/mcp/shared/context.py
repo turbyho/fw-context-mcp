@@ -115,28 +115,3 @@ def _detect_build_system(root: Path) -> str:
         return "platformio"
     return "unknown"
 
-
-def _check_degraded(conn: sqlite3.Connection, config_hash: str) -> str | None:
-    """Check whether the index was built without ``.d`` dependency files.
-
-    Returns a strict warning string when ``deps_verification != "full"``,
-    ``None`` otherwise.  The warning instructs the LLM to stop all C/C++
-    analysis immediately — a stale index cannot detect header changes.
-    """
-    row = conn.execute(
-        "SELECT deps_verification FROM build_configs WHERE config_hash=?",
-        (config_hash,),
-    ).fetchone()
-    if row is None or row["deps_verification"] == "full":
-        return None
-    return (
-        "⚠️ INDEX DEGRADED — STOP ALL C/C++ ANALYSIS IMMEDIATELY.\n\n"
-        "Header dependency (.d) files are NOT available for this index "
-        f"(deps verification: {row['deps_verification']}). "
-        "The index may contain STALE data — header changes cannot be "
-        "detected without .d files. Continuing analysis with a stale "
-        "index WILL produce incorrect results.\n\n"
-        "REQUIRED: Tell the user to run 'fw-context index' to rebuild "
-        "with full dependency tracking. Do NOT continue any C/C++ "
-        "analysis until the user confirms the index has been rebuilt."
-    )

@@ -1558,9 +1558,26 @@ def run(
     log.info("project=%s project_id=%s config_hash=%s", name, project_id, config_hash[:12])
 
     conn = open_db(db_path)
-    with transaction(conn):
-        upsert_project(conn, project_id, name, str(project_root))
-        upsert_build_config(conn, config_hash, project_id, str(compile_commands))
+    # Preserve the previous deps_verification value so get_active_build()
+    # always returns the result of the last COMPLETED index, not an
+    # intermediate "none" that would be set during the current run.
+    # For a new config_hash (first index), default to "none".
+    old_deps_row = conn.execute(
+        "SELECT deps_verification FROM build_configs WHERE config_hash=?",
+        (config_hash,),
+    ).fetchone()
+    initial_deps = old_deps_row["deps_verification"] if old_deps_row else "none"
+    # Serialize with any concurrent writer (background reindex, daemon)
+    # so SQLite busy_timeout is never the sole coordination mechanism.
+    # The foreground CLI writes reindex.pause before calling run() to
+    # signal the background reindex to pause at its next TU boundary.
+    # Acquiring write_lock ensures we wait until the background releases
+    # its current per-TU lock and sees the pause marker.
+    with write_lock(db_path.parent, timeout=120.0):
+        with transaction(conn):
+            upsert_project(conn, project_id, name, str(project_root))
+            upsert_build_config(conn, config_hash, project_id, str(compile_commands),
+                                deps_verification=initial_deps)
 
     units = list(parse_compile_commands(compile_commands))
     units = [u for u in units if u.file.suffix.lower() in _SOURCE_EXTS]
