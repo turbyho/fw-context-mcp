@@ -547,13 +547,11 @@ def reindex_file_impl(
             from ...indexer.db import (
                 write_lock as _db_write_lock,
             )
+            from ...indexer.ops import _normalize_file_path
             from ..background import _request_bg_reindex_pause, _resume_bg_reindex
 
             known = get_file_mtimes(conn, config_hash)
-            try:
-                file_path_str = str(target.relative_to(root))
-            except ValueError:
-                file_path_str = str(target)
+            file_path_str = _normalize_file_path(str(target), root)
             if file_path_str not in known:
                 return {"error": f"File not found on disk or in index: {target}"}
 
