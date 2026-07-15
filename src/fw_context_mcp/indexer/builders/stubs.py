@@ -47,9 +47,6 @@ class STM32CubeIDEStub:
             "Then run 'fw-context index' with the generated file."
         )
 
-    def ensure_dep_tracking(self, project_root: Path, *, fix: bool = False) -> list[str]:
-        return []
-
     def validate_artifacts(self, compile_commands: Path, project_root: Path) -> list[BuildIssue]:
         return []
 
@@ -57,6 +54,12 @@ class STM32CubeIDEStub:
         return False
 
     def required_tools(self) -> list[str]:
+        return []
+
+    # ── Build dir patterns ──
+
+    def get_build_dir_patterns(self, project_root: Path) -> list[str]:
+        """Return build-output directory patterns for staleness filtering."""
         return []
 
 
@@ -84,9 +87,6 @@ class TICCSStub:
             "  bear -- eclipse -nosplash -application com.ti.ccstudio.apps.projectBuild ..."
         )
 
-    def ensure_dep_tracking(self, project_root: Path, *, fix: bool = False) -> list[str]:
-        return []
-
     def validate_artifacts(self, compile_commands: Path, project_root: Path) -> list[BuildIssue]:
         return []
 
@@ -94,6 +94,12 @@ class TICCSStub:
         return False
 
     def required_tools(self) -> list[str]:
+        return []
+
+    # ── Build dir patterns ──
+
+    def get_build_dir_patterns(self, project_root: Path) -> list[str]:
+        """Return build-output directory patterns for staleness filtering."""
         return []
 
 

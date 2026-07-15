@@ -86,6 +86,12 @@ def _config_hash(conn, project_root):
     return active["config_hash"] if active else None
 
 
+def _cleanup_index_db(project_root: Path) -> None:
+    """Delete the index database directory for a project."""
+    db_path = _db_path_for_project(project_root)
+    shutil.rmtree(db_path.parent, ignore_errors=True)
+
+
 def _patch_config(config_path: Path, replacements: dict[str, str]) -> None:
     """Edit an existing TOML config in-place.
 
@@ -206,6 +212,7 @@ def _init_and_index(
         config_toml = fwctx / "config.toml"
         if not config_toml.exists():
             import uuid
+
             config_toml.write_text(
                 f'[project]\nid = "{uuid.uuid4().hex}"\n',
                 encoding="utf-8",
@@ -359,7 +366,7 @@ class TestBareInitAndIndex:
     @pytest.fixture(scope="class")
     @classmethod
     def indexed(cls):
-        return _init_and_index(
+        proj = _init_and_index(
             _BUILDS / "bare",
             replacements={
                 "[build] system": '"bare"',
@@ -368,6 +375,8 @@ class TestBareInitAndIndex:
             },
             clean_db=True,
         )
+        yield proj
+        _cleanup_index_db(proj)
 
     def test_compile_commands_generated(self, indexed):
         entries = json.loads((indexed / "compile_commands.json").read_text())
@@ -422,18 +431,18 @@ class TestBareInitAndIndex:
         finally:
             conn.close()
 
-    def test_deps_files_indexed(self, indexed):
+    def test_manifest_verification(self, indexed):
         db_path = _db_path_for_project(indexed)
         conn = open_db(db_path)
         try:
             ch = _config_hash(conn, indexed)
             row = conn.execute(
-                "SELECT deps_verification FROM build_configs WHERE config_hash=?",
+                "SELECT manifest_verification FROM build_configs WHERE config_hash=?",
                 (ch,),
             ).fetchone()
             assert row is not None, "build_config not found"
-            assert row["deps_verification"] == "full", (
-                f"Expected full deps, got '{row['deps_verification']}'"
+            assert row["manifest_verification"] == "full", (
+                f"Expected full manifest verification, got '{row['manifest_verification']}'"
             )
         finally:
             conn.close()
@@ -445,7 +454,9 @@ class TestCMakeInitAndIndex:
     @pytest.fixture(scope="class")
     @classmethod
     def indexed(cls):
-        return _init_and_index(_BUILDS / "generic_cmake", clean_db=True)
+        proj = _init_and_index(_BUILDS / "generic_cmake", clean_db=True)
+        yield proj
+        _cleanup_index_db(proj)
 
     def test_compile_commands_generated(self, indexed):
         entries = json.loads((indexed / "compile_commands.json").read_text())
@@ -473,18 +484,18 @@ class TestCMakeInitAndIndex:
         finally:
             conn.close()
 
-    def test_deps_files_indexed(self, indexed):
+    def test_manifest_verification(self, indexed):
         db_path = _db_path_for_project(indexed)
         conn = open_db(db_path)
         try:
             ch = _config_hash(conn, indexed)
             row = conn.execute(
-                "SELECT deps_verification FROM build_configs WHERE config_hash=?",
+                "SELECT manifest_verification FROM build_configs WHERE config_hash=?",
                 (ch,),
             ).fetchone()
             assert row is not None, "build_config not found"
-            assert row["deps_verification"] == "full", (
-                f"Expected full deps, got '{row['deps_verification']}'"
+            assert row["manifest_verification"] == "full", (
+                f"Expected full manifest verification, got '{row['manifest_verification']}'"
             )
         finally:
             conn.close()
@@ -496,11 +507,13 @@ class TestMakefileInitAndIndex:
     @pytest.fixture(scope="class")
     @classmethod
     def indexed(cls):
-        return _init_and_index(
+        proj = _init_and_index(
             _BUILDS / "makefile",
             replacements={"[build] make_dry_run": "false"},
             clean_db=True,
         )
+        yield proj
+        _cleanup_index_db(proj)
 
     def test_compile_commands_generated(self, indexed):
         entries = json.loads((indexed / "compile_commands.json").read_text())
@@ -535,18 +548,18 @@ class TestMakefileInitAndIndex:
         finally:
             conn.close()
 
-    def test_deps_files_indexed(self, indexed):
+    def test_manifest_verification(self, indexed):
         db_path = _db_path_for_project(indexed)
         conn = open_db(db_path)
         try:
             ch = _config_hash(conn, indexed)
             row = conn.execute(
-                "SELECT deps_verification FROM build_configs WHERE config_hash=?",
+                "SELECT manifest_verification FROM build_configs WHERE config_hash=?",
                 (ch,),
             ).fetchone()
             assert row is not None, "build_config not found"
-            assert row["deps_verification"] == "full", (
-                f"Expected full deps, got '{row['deps_verification']}'"
+            assert row["manifest_verification"] == "full", (
+                f"Expected full manifest verification, got '{row['manifest_verification']}'"
             )
         finally:
             conn.close()
@@ -558,7 +571,9 @@ class TestPlatformIOInitAndIndex:
     @pytest.fixture(scope="class")
     @classmethod
     def indexed(cls):
-        return _init_and_index(_BUILDS / "platformio", clean_db=True)
+        proj = _init_and_index(_BUILDS / "platformio", clean_db=True)
+        yield proj
+        _cleanup_index_db(proj)
 
     def test_compile_commands_has_entries(self, indexed):
         entries = json.loads((indexed / "compile_commands.json").read_text())
@@ -601,18 +616,18 @@ class TestPlatformIOInitAndIndex:
         finally:
             conn.close()
 
-    def test_deps_files_indexed(self, indexed):
+    def test_manifest_verification(self, indexed):
         db_path = _db_path_for_project(indexed)
         conn = open_db(db_path)
         try:
             ch = _config_hash(conn, indexed)
             row = conn.execute(
-                "SELECT deps_verification FROM build_configs WHERE config_hash=?",
+                "SELECT manifest_verification FROM build_configs WHERE config_hash=?",
                 (ch,),
             ).fetchone()
             assert row is not None, "build_config not found"
-            assert row["deps_verification"] == "full", (
-                f"Expected full deps, got '{row['deps_verification']}'"
+            assert row["manifest_verification"] == "full", (
+                f"Expected full manifest verification, got '{row['manifest_verification']}'"
             )
         finally:
             conn.close()
@@ -624,13 +639,15 @@ class TestArduinoInitAndIndex:
     @pytest.fixture(scope="class")
     @classmethod
     def indexed(cls):
-        return _init_and_index(
+        proj = _init_and_index(
             _BUILDS / "arduino",
             replacements={
                 "[build] fqbn": '"arduino:avr:uno"',
             },
             clean_db=True,
         )
+        yield proj
+        _cleanup_index_db(proj)
 
     def test_compile_commands_generated(self, indexed):
         entries = json.loads((indexed / "compile_commands.json").read_text())
@@ -646,18 +663,18 @@ class TestArduinoInitAndIndex:
         finally:
             conn.close()
 
-    def test_deps_files_indexed(self, indexed):
+    def test_manifest_verification(self, indexed):
         db_path = _db_path_for_project(indexed)
         conn = open_db(db_path)
         try:
             ch = _config_hash(conn, indexed)
             row = conn.execute(
-                "SELECT deps_verification FROM build_configs WHERE config_hash=?",
+                "SELECT manifest_verification FROM build_configs WHERE config_hash=?",
                 (ch,),
             ).fetchone()
             assert row is not None, "build_config not found"
-            assert row["deps_verification"] == "full", (
-                f"Expected full deps, got '{row['deps_verification']}'"
+            assert row["manifest_verification"] == "full", (
+                f"Expected full manifest verification, got '{row['manifest_verification']}'"
             )
         finally:
             conn.close()
@@ -688,11 +705,13 @@ class TestMbedOSInitAndIndex:
             pytest.skip("GCC_ARM_PATH not found in ~/.mbed/.mbed")
         if not Path(cls._GCC_ARM, "arm-none-eabi-gcc").exists():
             pytest.skip(f"ARM GCC not found at {cls._GCC_ARM}")
-        return _init_and_index(
+        proj = _init_and_index(
             _BUILDS / "mbed_os",
             extra_env=cls._MBED_ENV,
             clean_db=True,
         )
+        yield proj
+        _cleanup_index_db(proj)
 
     def test_compile_commands_generated(self, indexed):
         entries = json.loads((indexed / "compile_commands.json").read_text())
@@ -709,18 +728,18 @@ class TestMbedOSInitAndIndex:
         finally:
             conn.close()
 
-    def test_deps_files_indexed(self, indexed):
+    def test_manifest_verification(self, indexed):
         db_path = _db_path_for_project(indexed)
         conn = open_db(db_path)
         try:
             ch = _config_hash(conn, indexed)
             row = conn.execute(
-                "SELECT deps_verification FROM build_configs WHERE config_hash=?",
+                "SELECT manifest_verification FROM build_configs WHERE config_hash=?",
                 (ch,),
             ).fetchone()
             assert row is not None, "build_config not found"
-            assert row["deps_verification"] == "full", (
-                f"Expected full deps, got '{row['deps_verification']}'"
+            assert row["manifest_verification"] == "full", (
+                f"Expected full manifest verification, got '{row['manifest_verification']}'"
             )
         finally:
             conn.close()
@@ -760,7 +779,7 @@ class TestZephyrInitAndIndex:
             pytest.skip("Zephyr SDK not found")
         if not cls._WEST_BIN.exists():
             pytest.skip(f"west not installed (expected at {cls._WEST_BIN})")
-        return _init_and_index(
+        proj = _init_and_index(
             _BUILDS / "zephyr",
             replacements={
                 "[build] board": '"nrf52840dk/nrf52840"',
@@ -768,6 +787,8 @@ class TestZephyrInitAndIndex:
             extra_env=cls._ZEPHYR_ENV,
             clean_db=True,
         )
+        yield proj
+        _cleanup_index_db(proj)
 
     def test_compile_commands_generated(self, indexed):
         entries = json.loads((indexed / "compile_commands.json").read_text())
@@ -802,18 +823,18 @@ class TestZephyrInitAndIndex:
         finally:
             conn.close()
 
-    def test_deps_files_indexed(self, indexed):
+    def test_manifest_verification(self, indexed):
         db_path = _db_path_for_project(indexed)
         conn = open_db(db_path)
         try:
             ch = _config_hash(conn, indexed)
             row = conn.execute(
-                "SELECT deps_verification FROM build_configs WHERE config_hash=?",
+                "SELECT manifest_verification FROM build_configs WHERE config_hash=?",
                 (ch,),
             ).fetchone()
             assert row is not None, "build_config not found"
-            assert row["deps_verification"] == "full", (
-                f"Expected full deps, got '{row['deps_verification']}'"
+            assert row["manifest_verification"] == "full", (
+                f"Expected full manifest verification, got '{row['manifest_verification']}'"
             )
         finally:
             conn.close()
@@ -864,11 +885,13 @@ class TestESPIDFInitAndIndex:
             pytest.skip(f"idf.py wrapper not found (expected at {cls._IDF_PY_WRAPPER})")
         # Use fw-context builder directly — CMake 3.30.2 is on PATH
         # (via _IDF_ENV) and the idf.py wrapper also prepends it.
-        return _init_and_index(
+        proj = _init_and_index(
             _BUILDS / "esp_idf",
             extra_env=cls._IDF_ENV,
             clean_db=True,
         )
+        yield proj
+        _cleanup_index_db(proj)
 
     def test_compile_commands_generated(self, indexed):
         entries = json.loads((indexed / "compile_commands.json").read_text())
@@ -885,18 +908,18 @@ class TestESPIDFInitAndIndex:
         finally:
             conn.close()
 
-    def test_deps_files_indexed(self, indexed):
+    def test_manifest_verification(self, indexed):
         db_path = _db_path_for_project(indexed)
         conn = open_db(db_path)
         try:
             ch = _config_hash(conn, indexed)
             row = conn.execute(
-                "SELECT deps_verification FROM build_configs WHERE config_hash=?",
+                "SELECT manifest_verification FROM build_configs WHERE config_hash=?",
                 (ch,),
             ).fetchone()
             assert row is not None, "build_config not found"
-            assert row["deps_verification"] == "full", (
-                f"Expected full deps, got '{row['deps_verification']}'"
+            assert row["manifest_verification"] == "full", (
+                f"Expected full manifest verification, got '{row['manifest_verification']}'"
             )
         finally:
             conn.close()
@@ -943,24 +966,18 @@ def _collect_project_stats(project_root: Path) -> dict | None:
     conn = open_db(db_path)
     try:
         ch_row = conn.execute(
-            "SELECT config_hash, deps_verification FROM build_configs ORDER BY rowid DESC LIMIT 1"
+            "SELECT config_hash, manifest_verification FROM build_configs ORDER BY rowid DESC LIMIT 1"
         ).fetchone()
         if ch_row is None:
             return None
         config_hash = ch_row["config_hash"]
-        deps = ch_row["deps_verification"]
+        manifest_verification = ch_row["manifest_verification"]
 
-        file_count = conn.execute(
-            "SELECT COUNT(*) FROM files WHERE config_hash=?", (config_hash,)
-        ).fetchone()[0]
+        file_count = conn.execute("SELECT COUNT(*) FROM files WHERE config_hash=?", (config_hash,)).fetchone()[0]
 
-        sym_count = conn.execute(
-            "SELECT COUNT(*) FROM symbols WHERE config_hash=?", (config_hash,)
-        ).fetchone()[0]
+        sym_count = conn.execute("SELECT COUNT(*) FROM symbols WHERE config_hash=?", (config_hash,)).fetchone()[0]
 
-        ref_count = conn.execute(
-            "SELECT COUNT(*) FROM refs WHERE config_hash=?", (config_hash,)
-        ).fetchone()[0]
+        ref_count = conn.execute("SELECT COUNT(*) FROM refs WHERE config_hash=?", (config_hash,)).fetchone()[0]
 
         # File extensions (from files table)
         ext_rows = conn.execute(
@@ -984,7 +1001,7 @@ def _collect_project_stats(project_root: Path) -> dict | None:
 
         return {
             "name": project_root.name,
-            "deps": deps,
+            "manifest_verification": manifest_verification,
             "files": file_count,
             "symbols": sym_count,
             "refs": ref_count,
@@ -1025,7 +1042,7 @@ def _print_stats_table(all_stats: list[dict]) -> None:
         columns.append((ek, len(ek) + 1, lambda s, ek=ek: str(s["exts"].get(ek, 0))))
     for kk in kind_keys:
         columns.append((kk, len(kk) + 1, lambda s, kk=kk: str(s["kinds"].get(kk, 0))))
-    columns.append(("deps", 8, lambda s: s["deps"]))
+    columns.append(("manifest_verification", 12, lambda s: s["manifest_verification"]))
 
     # Build separator and header
     parts = []

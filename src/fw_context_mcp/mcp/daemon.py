@@ -182,9 +182,12 @@ def daemon_main(project_root: Path) -> None:
     log.info("Daemon started  root=%s  pid=%d  socket=%s", project_root, os.getpid(), sock_path)
 
     try:
-        # Initial staleness check — run index at startup if needed
+        # Initial staleness check — run index at startup if needed.
+        # Skip when a manual fw-context index holds the pause marker
+        # (manual index always wins over background reindex).
+        from .background import _check_bg_pause as _bg_paused
         needs, reasons = _staleness_check(project_root)
-        if needs:
+        if needs and not _bg_paused(project_root):
             log.info("Initial index needed (%s)", ", ".join(reasons))
             force_refs = "refs missing" in ", ".join(reasons)
             index_proc = _run_index_async(project_root, db_dir, force_refs=force_refs)
@@ -226,9 +229,14 @@ def daemon_main(project_root: Path) -> None:
                 continue
 
             if changed and not shutdown.is_set():
-                index_proc = _run_index_async(project_root, db_dir)
-                _wait_index(index_proc, shutdown, db_dir=db_dir)
-                index_proc = None
+                # Skip when a manual fw-context index holds the pause marker
+                from .background import _check_bg_pause as _bg_paused
+                if _bg_paused(project_root):
+                    log.info("Manual index in progress — skipping background reindex")
+                else:
+                    index_proc = _run_index_async(project_root, db_dir)
+                    _wait_index(index_proc, shutdown, db_dir=db_dir)
+                    index_proc = None
 
     finally:
         log.info("Daemon shutting down for %s", project_root)

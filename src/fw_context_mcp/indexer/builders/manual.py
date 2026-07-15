@@ -96,13 +96,13 @@ class ManualBuildSystem:
             "Manual (bare) mode requires source_dirs in .fw-context/config.toml.\n"
             "Configure at minimum:\n"
             "  [build]\n"
-            "  system = \"bare\"\n"
-            "  source_dirs = [\"src\", \"lib\"]\n"
-            "  include_dirs = [\"include\"]\n"
+            '  system = "bare"\n'
+            '  source_dirs = ["src", "lib"]\n'
+            '  include_dirs = ["include"]\n'
             "Or provide a generic compile_commands.json and run:\n"
             "  fw-context index compile_commands.json\n"
             "Or configure a custom build command:\n"
-            "  [build]\n  command = \"bear -- make\""
+            '  [build]\n  command = "bear -- make"'
         )
 
     def generate(self, project_root: Path, cfg: BuildConfig) -> Path:
@@ -117,9 +117,7 @@ class ManualBuildSystem:
         sources = _scan_source_files(source_dirs)
 
         if not sources:
-            raise RuntimeError(
-                f"No source files (.c/.cpp) found in source_dirs: {cfg.source_dirs}"
-            )
+            raise RuntimeError(f"No source files (.c/.cpp) found in source_dirs: {cfg.source_dirs}")
 
         flags = _build_flags(cfg)
         compiler_name = cfg.compiler or "gcc"
@@ -145,27 +143,24 @@ class ManualBuildSystem:
                 subprocess.run(cmd, cwd=root, capture_output=True, check=True)
             except subprocess.CalledProcessError as exc:
                 stderr = exc.stderr.decode(errors="replace") if exc.stderr else ""
-                raise RuntimeError(
-                    f"Syntax check failed for {src.name}: {stderr.strip()}"
-                ) from exc
+                raise RuntimeError(f"Syntax check failed for {src.name}: {stderr.strip()}") from exc
 
-            entries.append({
-                "directory": str(root),
-                "arguments": [compiler] + dep_args + flags + ["-c", str(src)],
-                "file": str(src),
-            })
+            entries.append(
+                {
+                    "directory": str(root),
+                    "arguments": [compiler] + dep_args + flags + ["-c", str(src)],
+                    "file": str(src),
+                }
+            )
 
         cc_path = root / "compile_commands.json"
         cc_path.write_text(json.dumps(entries, indent=2, ensure_ascii=False), encoding="utf-8")
         log.info(
             "Generated compile_commands.json + .d files (%d entries, compiler=%s)",
-            len(entries), compiler_name,
+            len(entries),
+            compiler_name,
         )
         return cc_path
-
-    def ensure_dep_tracking(self, project_root: Path, *, fix: bool = False) -> list[str]:
-        """.d dependency files are generated during the syntax-only compile step."""
-        return []
 
     def validate_artifacts(self, compile_commands: Path, project_root: Path) -> list[BuildIssue]:
         """No extra validation beyond generic checks."""
@@ -177,6 +172,12 @@ class ManualBuildSystem:
 
     def required_tools(self) -> list[str]:
         """Manual mode does not require any external tools."""
+        return []
+
+    # ── Build dir patterns ──
+
+    def get_build_dir_patterns(self, project_root: Path) -> list[str]:
+        """Return build-output directory patterns for staleness filtering."""
         return []
 
 

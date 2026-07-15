@@ -59,7 +59,7 @@ class MakefileBuildSystem:
                 "compiledb is required for Makefile projects.\n"
                 "Install it:  pip install compiledb\n"
                 "Or use bear instead with a custom command:\n"
-                "  [build]\n  command = \"bear -- make\""
+                '  [build]\n  command = "bear -- make"'
             )
 
         target = cfg.make_target or "all"
@@ -70,10 +70,12 @@ class MakefileBuildSystem:
             cmd.append("-n")
 
         cmd += [
-            "-o", str(root / "compile_commands.json"),
+            "-o",
+            str(root / "compile_commands.json"),
             "-f",  # overwrite
             "make",
-            "-C", str(root),
+            "-C",
+            str(root),
         ]
 
         if cfg.makefile:
@@ -100,9 +102,6 @@ class MakefileBuildSystem:
 
         return cc_path
 
-    def ensure_dep_tracking(self, project_root: Path, *, fix: bool = False) -> list[str]:
-        return []
-
     def validate_artifacts(self, compile_commands: Path, project_root: Path) -> list[BuildIssue]:
         return []
 
@@ -111,6 +110,12 @@ class MakefileBuildSystem:
 
     def required_tools(self) -> list[str]:
         return ["compiledb", "make"]
+
+    # ── Build dir patterns ──
+
+    def get_build_dir_patterns(self, project_root: Path) -> list[str]:
+        """Return build-output directory patterns for staleness filtering."""
+        return ["build/"]
 
 
 # Register

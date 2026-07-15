@@ -70,7 +70,7 @@ class KeilBuildSystem:
                 raise RuntimeError(
                     "No .uvprojx file found in project root.\n"
                     "Set keil_project in .fw-context/config.toml:\n"
-                    "  [build]\n  keil_project = \"Project.uvprojx\""
+                    '  [build]\n  keil_project = "Project.uvprojx"'
                 )
             proj_path = candidates[0]
 
@@ -104,15 +104,10 @@ class KeilBuildSystem:
             )
 
         if not cc_path.exists():
-            raise RuntimeError(
-                "compile_commands.json was not generated — keil2clangd may have failed silently"
-            )
+            raise RuntimeError("compile_commands.json was not generated — keil2clangd may have failed silently")
 
         log.info("Keil convert produced %s", cc_path)
         return cc_path
-
-    def ensure_dep_tracking(self, project_root: Path, *, fix: bool = False) -> list[str]:
-        return []
 
     def validate_artifacts(self, compile_commands: Path, project_root: Path) -> list[BuildIssue]:
         return []
@@ -122,6 +117,12 @@ class KeilBuildSystem:
 
     def required_tools(self) -> list[str]:
         return ["keil2clangd"]
+
+    # ── Build dir patterns ──
+
+    def get_build_dir_patterns(self, project_root: Path) -> list[str]:
+        """Return build-output directory patterns for staleness filtering."""
+        return []
 
 
 # Register

@@ -8,7 +8,9 @@ import argparse
 import logging
 import os
 import re
+import signal
 import sys
+import time
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -82,14 +84,6 @@ def cmd_index(args: argparse.Namespace) -> int:
     detected_system = detect_build_system(project_root)
     if detected_system:
         print(f"Project: {project_root.name}  path={project_root}  build={detected_system}")
-        if not bg:
-            from .indexer.builders import registry as builder_registry
-            builder_cls = builder_registry.get(detected_system)
-            if builder_cls is not None:
-                builder = builder_cls()
-                for msg in builder.ensure_dep_tracking(project_root, fix=True):
-                    if msg:
-                        print(msg)
     else:
         if bg:
             # In background mode, an existing compile_commands.json is sufficient —
@@ -98,7 +92,9 @@ def cmd_index(args: argparse.Namespace) -> int:
             if cc_fallback.exists():
                 print(f"Project: {project_root.name}  path={project_root}  build=unknown (bg, reusing cc)")
             else:
-                print(f"error: No build system detected and no compile_commands.json for {project_root}.", file=sys.stderr)
+                print(
+                    f"error: No build system detected and no compile_commands.json for {project_root}.", file=sys.stderr
+                )
                 print("  Run 'fw-context index --build' first.", file=sys.stderr)
                 return 1
         else:
@@ -168,11 +164,14 @@ def cmd_index(args: argparse.Namespace) -> int:
     db_path = cfg.index.db_dir / project_id / "index.db"
 
     # ── Validate build artifacts before indexing ──
+    build_dir_patterns: list[str] | None = None
     if detected_system:
         from .indexer.builders import registry as builder_registry
+
         builder_cls = builder_registry.get(detected_system)
         if builder_cls is not None:
             builder_instance = builder_cls()
+            build_dir_patterns = builder_instance.get_build_dir_patterns(project_root)
             if not bg:
                 # Foreground mode: staleness check + auto-rebuild.
                 # A stale compile_commands.json means the index would be
@@ -183,15 +182,11 @@ def cmd_index(args: argparse.Namespace) -> int:
                         # User passed an explicit --compile_commands path —
                         # warn but respect their choice.
                         print(
-                            f"warning: explicit compile_commands.json is stale "
-                            f"({'; '.join(stale_reasons)})",
+                            f"warning: explicit compile_commands.json is stale ({'; '.join(stale_reasons)})",
                             file=sys.stderr,
                         )
                     else:
-                        print(
-                            f"compile_commands.json is stale ({'; '.join(stale_reasons)}), "
-                            "rebuilding..."
-                        )
+                        print(f"compile_commands.json is stale ({'; '.join(stale_reasons)}), rebuilding...")
                         try:
                             compile_commands = generate_compile_commands(project_root, cfg.build)
                             print(f"Generated: {compile_commands}")
@@ -204,7 +199,10 @@ def cmd_index(args: argparse.Namespace) -> int:
                             return 1
             # Validate artifacts — in bg mode, report only (no auto-fix)
             issues = validate_and_fix(
-                compile_commands, project_root, builder_instance, cfg.build,
+                compile_commands,
+                project_root,
+                builder_instance,
+                cfg.build,
                 fix=not bg,
             )
             errors = [i for i in issues if i.severity == "error"]
@@ -221,7 +219,10 @@ def cmd_index(args: argparse.Namespace) -> int:
                         compile_commands = generate_compile_commands(project_root, cfg.build)
                         print(f"Generated: {compile_commands}")
                         issues = validate_and_fix(
-                            compile_commands, project_root, builder_instance, cfg.build,
+                            compile_commands,
+                            project_root,
+                            builder_instance,
+                            cfg.build,
                             fix=True,
                         )
                         errors = [i for i in issues if i.severity == "error"]
@@ -256,17 +257,41 @@ def cmd_index(args: argparse.Namespace) -> int:
 
         cs_config = replace(cs_config, force=True)
 
-    # Pause background reindex so it releases the write lock.
-    # Without this, a concurrent bg reindex holds the lock and the
-    # foreground ``fw-context index`` times out after 120 s.
+    # Manual index always wins — kill any running background reindex and
+    # prevent the daemon from starting a new one until we're done.
     pause_file = db_path.parent / "reindex.pause"
     reindex_pid_file = db_path.parent / "reindex.pid"
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # 1. Kill the background reindex subprocess if one is running
+    if reindex_pid_file.exists():
+        try:
+            bg_pid = int(reindex_pid_file.read_text(encoding="utf-8").strip())
+            if bg_pid != os.getpid():
+                os.kill(bg_pid, signal.SIGTERM)
+                # Wait up to 5 s for graceful exit, then force kill
+                deadline = time.monotonic() + 5.0
+                while time.monotonic() < deadline:
+                    try:
+                        os.kill(bg_pid, 0)
+                    except OSError:
+                        break
+                    time.sleep(0.1)
+                else:
+                    try:
+                        os.kill(bg_pid, signal.SIGKILL)
+                    except OSError:
+                        pass
+                reindex_pid_file.unlink(missing_ok=True)
+        except (OSError, ValueError):
+            reindex_pid_file.unlink(missing_ok=True)
+
+    # 2. Write pause marker so the daemon skips spawning new bg reindexes
     try:
         pause_file.write_text(str(os.getpid()), encoding="utf-8")
     except OSError:
         pass
-    # Signal that an index is running — _is_bg_reindex_running reads this
-    db_path.parent.mkdir(parents=True, exist_ok=True)
+    # 3. Signal that an index is running — _is_bg_reindex_running reads this
     reindex_pid_file.write_text(str(os.getpid()), encoding="utf-8")
     try:
         config_hash = run(
@@ -293,6 +318,7 @@ def cmd_index(args: argparse.Namespace) -> int:
             cache_server_config=cs_config,
             config_header=cfg.index.config_header,
             force=args.force,
+            build_dir_patterns=build_dir_patterns,
         )
         print(f"Indexed. config_hash={config_hash[:16]}…  db={db_path}")
 
@@ -301,7 +327,9 @@ def cmd_index(args: argparse.Namespace) -> int:
 
         _ptype = detected_system or "unknown"
         _gconn = open_global_db()
-        upsert_project_registry(_gconn, project_id, getattr(args, "name", None) or project_root.name, _ptype, str(project_root))
+        upsert_project_registry(
+            _gconn, project_id, getattr(args, "name", None) or project_root.name, _ptype, str(project_root)
+        )
 
         return 0
     finally:
@@ -615,15 +643,17 @@ def _inject_agent_toml_section(path: Path, content: str, marker: str) -> None:
     # If markers already exist, replace between them
     if start_comment in existing and end_comment in existing:
         before = existing[: existing.index(start_comment)]
-        after = existing[existing.index(end_comment) + len(end_comment):]
-        updated = before.rstrip("\n") + "\n" + start_comment + "\n" + content + "\n" + end_comment + "\n" + after.lstrip("\n")
+        after = existing[existing.index(end_comment) + len(end_comment) :]
+        updated = (
+            before.rstrip("\n") + "\n" + start_comment + "\n" + content + "\n" + end_comment + "\n" + after.lstrip("\n")
+        )
     else:
         # Find [instructions] section and insert the block there
         instructions_match = re.search(r"^\[instructions\]\s*$", existing, re.MULTILINE)
         if instructions_match:
             # Find end of instructions section (next TOML section or EOF)
             section_end = len(existing)
-            next_section = re.search(r"^\[", existing[instructions_match.end():], re.MULTILINE)
+            next_section = re.search(r"^\[", existing[instructions_match.end() :], re.MULTILINE)
             if next_section:
                 section_end = instructions_match.end() + next_section.start()
             before = existing[:section_end]
@@ -631,7 +661,16 @@ def _inject_agent_toml_section(path: Path, content: str, marker: str) -> None:
             updated = before.rstrip("\n") + "\n" + start_comment + "\n" + content + "\n" + end_comment + "\n" + after
         else:
             # No [instructions] section — create one at end of file
-            updated = existing.rstrip("\n") + "\n\n[instructions]\n" + start_comment + "\n" + content + "\n" + end_comment + "\n"
+            updated = (
+                existing.rstrip("\n")
+                + "\n\n[instructions]\n"
+                + start_comment
+                + "\n"
+                + content
+                + "\n"
+                + end_comment
+                + "\n"
+            )
 
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(updated, encoding="utf-8")
@@ -764,9 +803,7 @@ def _install_agents(dry_run: bool = False, project_root: Path | None = None, sco
         for template_path in templates:
             # Install .md templates into dirs with compatible patterns
             template_suffix = template_path.suffix  # ".md"
-            is_compatible = any(
-                template_suffix == p.lstrip("*") for p in patterns
-            )
+            is_compatible = any(template_suffix == p.lstrip("*") for p in patterns)
             if not is_compatible:
                 # Convert .md → .toml when target uses TOML patterns (Codex)
                 has_toml = any(".toml" in p for p in patterns)
@@ -1021,13 +1058,16 @@ def cmd_init(args: argparse.Namespace) -> int:
         if not args.instructions_only:
             proj_config = _ensure_project_config(project_root)
             local_config = _ensure_project_local_config(project_root)
-            print(f"\n[ok] {proj_config}: shared project config ready — edit source_roots, excludes, etc. (commit to git)")
+            print(
+                f"\n[ok] {proj_config}: shared project config ready — edit source_roots, excludes, etc. (commit to git)"
+            )
             print(f"[ok] {local_config}: local developer config ready — edit ollama_url, model, etc. (gitignore)")
             # Check config files for missing template keys
             from .config.settings import (
                 _PROJECT_DEFAULTS_TEMPLATE,
                 _PROJECT_LOCAL_DEFAULTS_TEMPLATE,
             )
+
             _check_config_file(project_root, ".fw-context/config.toml", _PROJECT_DEFAULTS_TEMPLATE, fix=True)
             _check_config_file(project_root, ".fw-context/local.toml", _PROJECT_LOCAL_DEFAULTS_TEMPLATE, fix=True)
             # .gitignore management
@@ -1049,6 +1089,7 @@ def cmd_init(args: argparse.Namespace) -> int:
             _cc = (project_root / _cc).resolve()
         if _cc.exists():
             from .indexer.build import check_completeness
+
             _issues = list(check_completeness(_cc, project_root))
             if _issues:
                 print("  compile_commands.json: present but incomplete")
@@ -1061,6 +1102,7 @@ def cmd_init(args: argparse.Namespace) -> int:
 
         # Index health
         from .indexer.db import get_active_config, open_db as _db_open
+
         _db_path = _proj_cfg.index.db_dir / proj_id / "index.db"
         if _db_path.exists():
             _conn = None
@@ -1398,7 +1440,7 @@ def _inject_agent_section(path: Path, content: str, marker: str) -> None:
     if start_tag in existing and end_tag in existing:
         # Replace the existing marked block (keep markers for idempotency)
         before = existing[: existing.index(start_tag)]
-        after = existing[existing.index(end_tag) + len(end_tag):]
+        after = existing[existing.index(end_tag) + len(end_tag) :]
         updated = before.rstrip("\n") + "\n\n" + start_tag + "\n" + content + "\n" + end_tag + "\n" + after.lstrip("\n")
     else:
         # Insert right after YAML frontmatter (after second "---").
@@ -2000,6 +2042,7 @@ def cmd_watch_status(args: argparse.Namespace) -> int:
             try:
                 pid = int(pid_file.read_text().strip())
                 import time as _time
+
                 uptime_s = _time.time() - pid_file.stat().st_mtime
                 print(f"Daemon:     running (pid {pid}, uptime {int(uptime_s)}s)")
             except Exception:
@@ -2204,7 +2247,9 @@ def main() -> None:
         "--instructions-only", action="store_true", help="Only inject instructions, skip MCP registration"
     )
     p_init.add_argument(
-        "--scope", choices=["all", "global", "project"], default="project",
+        "--scope",
+        choices=["all", "global", "project"],
+        default="project",
         help="Which scope to inject (default: project — only the current project)",
     )
     p_init.add_argument("--project", metavar="DIR", help="Project root (for project-scoped targets)")

@@ -22,7 +22,7 @@ class BuildIssue:
     Attributes:
         severity: ``"error"`` (blocks indexing) or ``"warning"`` (advisory).
         category: Machine-readable tag — ``"missing_compile_commands"``,
-            ``"dep_files_missing"``, ``"incomplete_compile_commands"``, etc.
+            ``"incomplete_compile_commands"``, etc.
         message: Human-readable description of the issue.
         auto_fixable: Whether ``auto_fix()`` can resolve this issue.
         fix_hint: Brief description of the fix, shown to the user.
@@ -65,14 +65,6 @@ class BuildSystem(Protocol):
         """Run the build and return the path to ``compile_commands.json``."""
         ...
 
-    def ensure_dep_tracking(self, project_root: Path, *, fix: bool = False) -> list[str]:
-        """Ensure the build system generates ``.d`` dependency files.
-
-        Returns a list of human-readable messages describing what was done
-        or would be done (in dry-run mode with *fix=False*).
-        """
-        ...
-
     def validate_artifacts(self, compile_commands: Path, project_root: Path) -> list[BuildIssue]:
         """Check build artifacts for completeness and correctness."""
         ...
@@ -83,4 +75,16 @@ class BuildSystem(Protocol):
 
     def required_tools(self) -> list[str]:
         """Return the CLI tool names required by this build system."""
+        ...
+
+    def get_build_dir_patterns(self, project_root: Path) -> list[str]:
+        """Return path patterns for build-output directories.
+
+        Patterns are relative to *project_root* and used to identify
+        generated/transient files that should not trigger staleness
+        (e.g. ``["BUILD/"]`` for Mbed OS, ``[".pio/"]`` for PlatformIO,
+        ``["build/", "cmake-build-"]`` for CMake).
+
+        An empty list means no build-directory filtering is needed.
+        """
         ...

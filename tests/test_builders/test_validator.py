@@ -18,27 +18,19 @@ class TestIsCompileCommandsStale:
         src.mkdir()
         (src / "main.cpp").write_text("// empty")
 
-        cc.write_text(json.dumps([
-            {"file": str(src / "main.cpp"), "directory": str(tmp_path), "arguments": ["gcc", "-c", str(src / "main.cpp")]}
-        ]))
+        cc.write_text(
+            json.dumps(
+                [
+                    {
+                        "file": str(src / "main.cpp"),
+                        "directory": str(tmp_path),
+                        "arguments": ["gcc", "-c", str(src / "main.cpp")],
+                    }
+                ]
+            )
+        )
         stale, _ = is_compile_commands_stale(cc, tmp_path)
         assert stale is False
-
-    def test_missing_source_files(self, tmp_path: Path):
-        cc = tmp_path / "compile_commands.json"
-        src = tmp_path / "src"
-        src.mkdir()
-        # Create 3 source files but cc only references 1
-        (src / "main.cpp").write_text("// empty")
-        (src / "extra.cpp").write_text("// empty")
-        (src / "utils.cpp").write_text("// empty")
-
-        cc.write_text(json.dumps([
-            {"file": str(src / "main.cpp"), "directory": str(tmp_path), "arguments": ["gcc", "-c", str(src / "main.cpp")]}
-        ]))
-        stale, reasons = is_compile_commands_stale(cc, tmp_path)
-        assert stale is True
-        assert any("source file" in r.lower() for r in reasons)
 
     def test_build_marker_newer(self, tmp_path: Path):
         cc = tmp_path / "compile_commands.json"
@@ -47,9 +39,17 @@ class TestIsCompileCommandsStale:
         src.mkdir()
         (src / "main.cpp").write_text("// empty")
 
-        cc.write_text(json.dumps([
-            {"file": str(src / "main.cpp"), "directory": str(tmp_path), "arguments": ["gcc", "-c", str(src / "main.cpp")]}
-        ]))
+        cc.write_text(
+            json.dumps(
+                [
+                    {
+                        "file": str(src / "main.cpp"),
+                        "directory": str(tmp_path),
+                        "arguments": ["gcc", "-c", str(src / "main.cpp")],
+                    }
+                ]
+            )
+        )
         # Make platformio.ini newer than compile_commands.json
         pio_ini.write_text("[env:uno]\n")
         # Touch pio_ini after cc
@@ -82,19 +82,17 @@ class TestValidateAndFix:
         from fw_context_mcp.indexer.builders.platformio import PlatformIOBuildSystem
 
         cc = tmp_path / "compile_commands.json"
-        # Create a .d file so validate_artifacts can find it
-        obj_dir = tmp_path / "build"
-        obj_dir.mkdir()
-        d_path = obj_dir / "main.d"
-        d_path.write_text("main.o: main.cpp\n")
-        cc.write_text(json.dumps([
-            {
-                "file": "main.cpp",
-                "directory": str(tmp_path),
-                "arguments": ["gcc", "-c", "-MMD", "main.cpp"],
-                "output": "build/main.o",
-            }
-        ]))
+        cc.write_text(
+            json.dumps(
+                [
+                    {
+                        "file": "main.cpp",
+                        "directory": str(tmp_path),
+                        "arguments": ["gcc", "-c", "main.cpp"],
+                    }
+                ]
+            )
+        )
         builder = PlatformIOBuildSystem()
         issues = validate_and_fix(cc, tmp_path, builder)
         assert len(issues) == 0

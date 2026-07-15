@@ -55,15 +55,15 @@ class GenericCMakeBuildSystem:
     def build(self, project_root: Path, cfg: BuildConfig) -> Path:
         """Generate compile_commands.json via CMake configure + build."""
         if not shutil.which("cmake"):
-            raise RuntimeError(
-                "cmake is required.  Install it:  sudo pacman -S cmake"
-            )
+            raise RuntimeError("cmake is required.  Install it:  sudo pacman -S cmake")
 
         build_dir = project_root / "build"
 
         # Configure
         configure_cmd: list[str] = [
-            "cmake", "-B", str(build_dir),
+            "cmake",
+            "-B",
+            str(build_dir),
             "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON",
         ]
         if cfg.cmake_generator:
@@ -87,8 +87,7 @@ class GenericCMakeBuildSystem:
         cc_in_build = build_dir / "compile_commands.json"
         if not cc_in_build.exists():
             raise RuntimeError(
-                "compile_commands.json not found in build/ directory. "
-                "Ensure CMAKE_EXPORT_COMPILE_COMMANDS is enabled."
+                "compile_commands.json not found in build/ directory. Ensure CMAKE_EXPORT_COMPILE_COMMANDS is enabled."
             )
 
         # Copy to project root for consistency
@@ -98,11 +97,11 @@ class GenericCMakeBuildSystem:
 
         return target_cc
 
-    # ── Dep tracking ──
+    # ── Build dir patterns ──
 
-    def ensure_dep_tracking(self, project_root: Path, *, fix: bool = False) -> list[str]:
-        # CMake + GCC/Clang always emits .d files.
-        return []
+    def get_build_dir_patterns(self, project_root: Path) -> list[str]:
+        """Return build-output directory patterns for staleness filtering."""
+        return ["build/", "cmake-build-"]
 
     # ── Validation ──
 

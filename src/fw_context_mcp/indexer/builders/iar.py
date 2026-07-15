@@ -37,10 +37,7 @@ class IARBuildSystem:
     @classmethod
     def detect(cls, project_root: Path) -> bool:
         root = project_root.resolve()
-        return (
-            bool(list(root.glob("*.ewp")))
-            or bool(list(root.glob("*.eww")))
-        )
+        return bool(list(root.glob("*.ewp"))) or bool(list(root.glob("*.eww")))
 
     def build(self, project_root: Path, cfg: BuildConfig) -> Path:
         """Delegates to convert() — IAR projects don't need a build."""
@@ -73,7 +70,7 @@ class IARBuildSystem:
                 raise RuntimeError(
                     "No .ewp file found in project root.\n"
                     "Set iar_project in .fw-context/config.toml:\n"
-                    "  [build]\n  iar_project = \"Project.ewp\""
+                    '  [build]\n  iar_project = "Project.ewp"'
                 )
             proj_path = candidates[0]
 
@@ -104,15 +101,10 @@ class IARBuildSystem:
             )
 
         if not cc_path.exists():
-            raise RuntimeError(
-                "compile_commands.json was not generated — keil2clangd may have failed silently"
-            )
+            raise RuntimeError("compile_commands.json was not generated — keil2clangd may have failed silently")
 
         log.info("IAR convert produced %s", cc_path)
         return cc_path
-
-    def ensure_dep_tracking(self, project_root: Path, *, fix: bool = False) -> list[str]:
-        return []
 
     def validate_artifacts(self, compile_commands: Path, project_root: Path) -> list[BuildIssue]:
         return []
@@ -122,6 +114,12 @@ class IARBuildSystem:
 
     def required_tools(self) -> list[str]:
         return ["keil2clangd"]
+
+    # ── Build dir patterns ──
+
+    def get_build_dir_patterns(self, project_root: Path) -> list[str]:
+        """Return build-output directory patterns for staleness filtering."""
+        return []
 
 
 # Register
