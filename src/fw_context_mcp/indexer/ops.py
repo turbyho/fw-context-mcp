@@ -131,11 +131,8 @@ def _build_filtered_file_content(
         log.debug("_build_filtered_file_content: parse failed for %s", unit.file.name)
         return 0, []
 
-    from fw_context_mcp.indexer.manifest import _BUILD_DIR_PATTERNS as _FALLBACK_BUILD_DIR_PATTERNS
     from fw_context_mcp.indexer.manifest import HEADER_EXTS as _HEADER_EXTS
     from fw_context_mcp.indexer.manifest import _is_generated_header
-
-    _patterns: tuple[str, ...] = tuple(build_dir_patterns) if build_dir_patterns else _FALLBACK_BUILD_DIR_PATTERNS
 
     # ── Collect included header paths + SHA-256 hashes (always needed for manifest) ──
     headers: list[dict] = []

@@ -71,17 +71,6 @@ def _normalize_entry(entry: dict) -> dict:
     return {"file": file, "args": sorted(result)}
 
 
-def compute(compile_commands_path: Path) -> str:
-    """Return lowercase hex sha256 of the normalized compile_commands content."""
-    entries = json.loads(compile_commands_path.read_text())
-    normalized = sorted(
-        (_normalize_entry(e) for e in entries),
-        key=lambda e: e["file"],
-    )
-    canonical = json.dumps(normalized, sort_keys=True, separators=(",", ":"))
-    return hashlib.sha256(canonical.encode()).hexdigest()
-
-
 # Public alias for use by the runner for per-TU flags hashing.
 normalize_entry = _normalize_entry
 

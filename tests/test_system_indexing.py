@@ -932,20 +932,30 @@ class TestConfigHashStability:
     """Verify config_hash is stable across repeated indexing of the same project."""
 
     def test_same_project_same_config_hash(self):
-        from fw_context_mcp.indexer.config_hash import compute
+        from fw_context_mcp.indexer.compile_commands import parse as parse_cc
+        from fw_context_mcp.indexer.manifest import compute_structural_hash
 
         cc = _BUILDS / "generic_cmake" / "compile_commands.json"
         assert cc.exists(), "Run CMake init+index test first to generate cc.json"
-        assert compute(cc) == compute(cc)
+        units1 = list(parse_cc(cc))
+        units2 = list(parse_cc(cc))
+        h1 = compute_structural_hash(cc, cc.parent.parent, units1)
+        h2 = compute_structural_hash(cc, cc.parent.parent, units2)
+        assert h1 == h2
 
     def test_config_hash_changes_with_different_cc(self, tmp_path):
-        from fw_context_mcp.indexer.config_hash import compute
+        from fw_context_mcp.indexer.compile_commands import parse as parse_cc
+        from fw_context_mcp.indexer.manifest import compute_structural_hash
 
         cc1 = tmp_path / "cc1.json"
         cc2 = tmp_path / "cc2.json"
         cc1.write_text(json.dumps([{"file": "a.c", "directory": str(tmp_path), "arguments": ["gcc", "-c", "a.c"]}]))
         cc2.write_text(json.dumps([{"file": "b.c", "directory": str(tmp_path), "arguments": ["gcc", "-c", "b.c"]}]))
-        assert compute(cc1) != compute(cc2)
+        units1 = list(parse_cc(cc1))
+        units2 = list(parse_cc(cc2))
+        h1 = compute_structural_hash(cc1, tmp_path, units1)
+        h2 = compute_structural_hash(cc2, tmp_path, units2)
+        assert h1 != h2
 
 
 # ── Index statistics ─────────────────────────────────────────────────────────

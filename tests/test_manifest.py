@@ -30,100 +30,141 @@ class TestManifestEntryHash:
 
 
 class TestComputeConfigHash:
-    def test_deterministic(self):
+    @staticmethod
+    def _make_unit(file_path: str, clang_args: list[str] | None = None):
+        """Create a fake CompilationUnit for testing."""
+        from unittest.mock import MagicMock
+
+        if clang_args is None:
+            clang_args = ["gcc", "-c", file_path]
+        unit = MagicMock()
+        unit.file = MagicMock()
+        unit.file.resolve.return_value = Path(file_path)
+        unit.clang_args = clang_args
+        return unit
+
+    def test_deterministic(self, tmp_path: Path):
         from fw_context_mcp.indexer.manifest import compute_config_hash
 
-        manifest = {
-            "_format": "fw-context-manifest/1",
-            "project_root": "/tmp/test",
-            "entries": [],
-        }
-        h1 = compute_config_hash(manifest)
-        h2 = compute_config_hash(manifest)
+        units = []
+        h1 = compute_config_hash(units, tmp_path, "test-project")
+        h2 = compute_config_hash(units, tmp_path, "test-project")
         assert h1 == h2
+        assert len(h1) == 64
 
-    def test_config_hash_excluded(self):
+    def test_different_files_produce_different_hash(self, tmp_path: Path):
         from fw_context_mcp.indexer.manifest import compute_config_hash
 
-        m1 = {"_format": "fw-context-manifest/1", "project_root": "/tmp", "entries": [], "config_hash": "old"}
-        m2 = {"_format": "fw-context-manifest/1", "project_root": "/tmp", "entries": [], "config_hash": "new"}
-        assert compute_config_hash(m1) == compute_config_hash(m2)
+        u1 = [self._make_unit(str(tmp_path / "a.cpp"))]
+        u2 = [self._make_unit(str(tmp_path / "b.cpp"))]
+        h1 = compute_config_hash(u1, tmp_path, "test")
+        h2 = compute_config_hash(u2, tmp_path, "test")
+        assert h1 != h2
 
-    def test_build_dir_patterns_excluded(self):
+    def test_different_flags_produce_different_hash(self, tmp_path: Path):
         from fw_context_mcp.indexer.manifest import compute_config_hash
 
-        m1 = {"_format": "fw-context-manifest/1", "project_root": "/tmp", "entries": [], "build_dir_patterns": ["BUILD/"]}
-        m2 = {"_format": "fw-context-manifest/1", "project_root": "/tmp", "entries": [], "build_dir_patterns": [".pio/"]}
-        assert compute_config_hash(m1) == compute_config_hash(m2)
+        u1 = [self._make_unit(str(tmp_path / "a.cpp"), ["gcc", "-O2", "-c", "a.cpp"])]
+        u2 = [self._make_unit(str(tmp_path / "a.cpp"), ["gcc", "-Os", "-c", "a.cpp"])]
+        h1 = compute_config_hash(u1, tmp_path, "test")
+        h2 = compute_config_hash(u2, tmp_path, "test")
+        assert h1 != h2
 
-    def test_different_entries_produce_different_hash(self):
+    def test_flag_order_independent(self, tmp_path: Path):
         from fw_context_mcp.indexer.manifest import compute_config_hash
 
-        m1 = {"_format": "fw-context-manifest/1", "project_root": "/tmp", "entries": [{"file": "a.cpp"}]}
-        m2 = {"_format": "fw-context-manifest/1", "project_root": "/tmp", "entries": [{"file": "b.cpp"}]}
-        assert compute_config_hash(m1) != compute_config_hash(m2)
+        u1 = [self._make_unit(str(tmp_path / "a.cpp"), ["gcc", "-O2", "-DFOO=1", "-c", "a.cpp"])]
+        u2 = [self._make_unit(str(tmp_path / "a.cpp"), ["gcc", "-DFOO=1", "-O2", "-c", "a.cpp"])]
+        h1 = compute_config_hash(u1, tmp_path, "test")
+        h2 = compute_config_hash(u2, tmp_path, "test")
+        assert h1 == h2  # arguments are sorted alphabetically
 
-    def test_source_hash_does_not_affect_config_hash(self):
+    def test_hash_is_hex_string(self, tmp_path: Path):
         from fw_context_mcp.indexer.manifest import compute_config_hash
 
-        m1 = {
-            "_format": "fw-context-manifest/1",
-            "project_root": "/tmp",
-            "entries": [
-                {"file": "a.cpp", "directory": "/tmp", "arguments": ["gcc", "-c", "a.cpp"], "source_hash": "abc123", "headers": []}
-            ],
-        }
-        m2 = {
-            "_format": "fw-context-manifest/1",
-            "project_root": "/tmp",
-            "entries": [
-                {"file": "a.cpp", "directory": "/tmp", "arguments": ["gcc", "-c", "a.cpp"], "source_hash": "different", "headers": []}
-            ],
-        }
-        assert compute_config_hash(m1) == compute_config_hash(m2)
+        h = compute_config_hash([], tmp_path, "test")
+        assert len(h) == 64
+        assert all(c in "0123456789abcdef" for c in h)
 
-    def test_headers_do_not_affect_config_hash(self):
+    def test_transient_mbed_build_timestamp_stripped(self, tmp_path: Path):
+        """-DMBED_BUILD_TIMESTAMP=<float> must be stripped — it changes every build."""
         from fw_context_mcp.indexer.manifest import compute_config_hash
 
-        m1 = {
-            "_format": "fw-context-manifest/1",
-            "project_root": "/tmp",
-            "entries": [
-                {"file": "a.cpp", "directory": "/tmp", "arguments": ["gcc", "-c", "a.cpp"], "source_hash": "abc", "headers": [{"path": "x.h", "hash": "hash1"}]}
-            ],
-        }
-        m2 = {
-            "_format": "fw-context-manifest/1",
-            "project_root": "/tmp",
-            "entries": [
-                {"file": "a.cpp", "directory": "/tmp", "arguments": ["gcc", "-c", "a.cpp"], "source_hash": "abc", "headers": [{"path": "x.h", "hash": "hash2"}]}
-            ],
-        }
-        assert compute_config_hash(m1) == compute_config_hash(m2)
+        u1 = [self._make_unit(str(tmp_path / "a.cpp"),
+              ["gcc", "-c", str(tmp_path / "a.cpp"),
+               "-DMBED_BUILD_TIMESTAMP=1784146370.289386"])]
+        u2 = [self._make_unit(str(tmp_path / "a.cpp"),
+              ["gcc", "-c", str(tmp_path / "a.cpp"),
+               "-DMBED_BUILD_TIMESTAMP=1784145526.0657399"])]
+        h1 = compute_config_hash(u1, tmp_path, "test")
+        h2 = compute_config_hash(u2, tmp_path, "test")
+        assert h1 == h2  # timestamp value differs but macro should be stripped
 
-    def test_arguments_change_affects_config_hash(self):
+    def test_transient_mbed_build_timestamp_space_form(self, tmp_path: Path):
+        """-D MBED_BUILD_TIMESTAMP=<float> (space-separated) must also be stripped."""
         from fw_context_mcp.indexer.manifest import compute_config_hash
 
-        m1 = {
-            "_format": "fw-context-manifest/1",
-            "project_root": "/tmp",
-            "entries": [
-                {"file": "a.cpp", "directory": "/tmp", "arguments": ["gcc", "-c", "a.cpp"], "source_hash": "abc", "headers": []}
-            ],
-        }
-        m2 = {
-            "_format": "fw-context-manifest/1",
-            "project_root": "/tmp",
-            "entries": [
-                {"file": "a.cpp", "directory": "/tmp", "arguments": ["gcc", "-O2", "-c", "a.cpp"], "source_hash": "abc", "headers": []}
-            ],
-        }
-        assert compute_config_hash(m1) != compute_config_hash(m2)
+        u1 = [self._make_unit(str(tmp_path / "a.cpp"),
+              ["gcc", "-c", str(tmp_path / "a.cpp"),
+               "-D", "MBED_BUILD_TIMESTAMP=1784146370.289386"])]
+        u2 = [self._make_unit(str(tmp_path / "a.cpp"),
+              ["gcc", "-c", str(tmp_path / "a.cpp"),
+               "-D", "MBED_BUILD_TIMESTAMP=9999999999.0"])]
+        h1 = compute_config_hash(u1, tmp_path, "test")
+        h2 = compute_config_hash(u2, tmp_path, "test")
+        assert h1 == h2  # space-separated form is also stripped
+
+    def test_transient_mbed_build_timestamp_value_only(self, tmp_path: Path):
+        """-DMBED_BUILD_TIMESTAMP (no =value) should also be stripped."""
+        from fw_context_mcp.indexer.manifest import compute_config_hash
+
+        u1 = [self._make_unit(str(tmp_path / "a.cpp"),
+              ["gcc", "-c", str(tmp_path / "a.cpp"),
+               "-DMBED_BUILD_TIMESTAMP"])]
+        u2 = [self._make_unit(str(tmp_path / "a.cpp"),
+              ["gcc", "-c", str(tmp_path / "a.cpp")])]
+        h1 = compute_config_hash(u1, tmp_path, "test")
+        h2 = compute_config_hash(u2, tmp_path, "test")
+        assert h1 == h2  # with and without the transient define must match
+
+    def test_other_defines_preserved(self, tmp_path: Path):
+        """Non-transient -D macros must NOT be stripped."""
+        from fw_context_mcp.indexer.manifest import compute_config_hash
+
+        u1 = [self._make_unit(str(tmp_path / "a.cpp"),
+              ["gcc", "-c", str(tmp_path / "a.cpp"), "-DDEBUG=1"])]
+        u2 = [self._make_unit(str(tmp_path / "a.cpp"),
+              ["gcc", "-c", str(tmp_path / "a.cpp"),
+               "-DNDEBUG"])]
+        h1 = compute_config_hash(u1, tmp_path, "test")
+        h2 = compute_config_hash(u2, tmp_path, "test")
+        assert h1 != h2  # different non-transient defines → different hash
+
+    def test_generic_transient_defines_stripped(self, tmp_path: Path):
+        """BUILD_TIMESTAMP, BUILD_TIME, BUILD_DATE, BUILD_ID, BUILD_NUMBER are stripped."""
+        from fw_context_mcp.indexer.manifest import compute_config_hash
+
+        base_args = ["gcc", "-c", str(tmp_path / "a.cpp")]
+        # All of these should produce the same hash — the transient macros are stripped
+        hashes = set()
+        for dflag in [
+            "-DBUILD_TIMESTAMP=2026-07-15T12:00:00",
+            "-DBUILD_TIME=12:00:00",
+            "-DBUILD_DATE=2026-07-15",
+            "-DBUILD_ID=12345",
+            "-DBUILD_NUMBER=42",
+        ]:
+            u = [self._make_unit(str(tmp_path / "a.cpp"), base_args + [dflag])]
+            hashes.add(compute_config_hash(u, tmp_path, "test"))
+        # Without any transient macros
+        u_base = [self._make_unit(str(tmp_path / "a.cpp"), base_args)]
+        hashes.add(compute_config_hash(u_base, tmp_path, "test"))
+        assert len(hashes) == 1  # all produce the same hash
 
 
 class TestSaveAndLoad:
     def test_roundtrip(self, tmp_path: Path):
-        from fw_context_mcp.indexer.manifest import load, save
+        from fw_context_mcp.indexer.manifest import compute_config_hash, load, save
 
         manifest = {
             "_format": "fw-context-manifest/1",
@@ -142,7 +183,14 @@ class TestSaveAndLoad:
                 }
             ],
         }
-        config_hash = save(manifest, tmp_path)
+        # Compute config_hash from a mock unit list (backward compat path)
+        from unittest.mock import MagicMock
+
+        mock_unit = MagicMock()
+        mock_unit.file.resolve.return_value = Path(str(tmp_path / "src/main.cpp"))
+        mock_unit.clang_args = ["gcc", "-c", "src/main.cpp"]
+        config_hash = compute_config_hash([mock_unit], tmp_path, "test")
+        config_hash = save(manifest, tmp_path, config_hash)
         assert len(config_hash) == 64
 
         loaded = load(tmp_path)
@@ -302,11 +350,19 @@ class TestIsGeneratedHeader:
     def test_build_dir_is_generated(self):
         from fw_context_mcp.indexer.manifest import _is_generated_header
 
-        assert _is_generated_header("BUILD/mbed_config.h") is True
-        assert _is_generated_header("build/config.h") is True
-        assert _is_generated_header(".pio/lib/foo.h") is True
-        assert _is_generated_header("src/main.h") is False
-        assert _is_generated_header("lib/utils.h") is False
+        patterns = ["BUILD/", "build/", ".pio/", "cmake-build-", "_build/"]
+
+        assert _is_generated_header("BUILD/mbed_config.h", patterns) is True
+        assert _is_generated_header("build/config.h", patterns) is True
+        assert _is_generated_header(".pio/lib/foo.h", patterns) is True
+        assert _is_generated_header("src/main.h", patterns) is False
+        assert _is_generated_header("lib/utils.h", patterns) is False
+
+    def test_no_patterns_returns_false(self):
+        from fw_context_mcp.indexer.manifest import _is_generated_header
+
+        assert _is_generated_header("BUILD/mbed_config.h") is False
+        assert _is_generated_header("build/config.h", None) is False
 
 
 class TestUpdateEntry:

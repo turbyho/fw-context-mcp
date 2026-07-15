@@ -4,7 +4,7 @@ import json
 
 import pytest
 
-from fw_context_mcp.indexer.config_hash import _normalize_entry, compute
+from fw_context_mcp.indexer.config_hash import _normalize_entry
 
 
 class TestNormalizeEntry:
@@ -74,101 +74,3 @@ class TestNormalizeEntry:
         assert "-DEXTRA=1" in result["args"]
 
 
-class TestCompute:
-    def test_identical_inputs_produce_same_hash(self, tmpdir):
-        data = [
-            {"directory": str(tmpdir), "file": "src/a.cpp",
-             "arguments": ["g++", "-std=c++14", "-Os", "src/a.cpp"]},
-        ]
-        path1 = tmpdir / "cc1.json"
-        path2 = tmpdir / "cc2.json"
-        path1.write_text(json.dumps(data))
-        path2.write_text(json.dumps(data))
-        assert compute(path1) == compute(path2)
-
-    def test_different_flags_produce_different_hash(self, tmpdir):
-        data1 = [{"file": "a.cpp", "arguments": ["g++", "-Os", "a.cpp"]}]
-        data2 = [{"file": "a.cpp", "arguments": ["g++", "-O2", "a.cpp"]}]
-        p1 = tmpdir / "cc1.json"
-        p2 = tmpdir / "cc2.json"
-        p1.write_text(json.dumps(data1))
-        p2.write_text(json.dumps(data2))
-        assert compute(p1) != compute(p2)
-
-    def test_transient_flags_dont_affect_hash(self, tmpdir):
-        """-MD/-MP etc. should be ignored in hash computation."""
-        data1 = [{"file": "a.cpp", "arguments": ["g++", "-O2", "-MD", "-MP", "a.cpp"]}]
-        data2 = [{"file": "a.cpp", "arguments": ["g++", "-O2", "a.cpp"]}]
-        p1 = tmpdir / "cc1.json"
-        p2 = tmpdir / "cc2.json"
-        p1.write_text(json.dumps(data1))
-        p2.write_text(json.dumps(data2))
-        assert compute(p1) == compute(p2)
-
-    def test_output_path_doesnt_affect_hash(self, tmpdir):
-        """Different -o paths should produce the same hash."""
-        data1 = [{"file": "a.cpp", "arguments": ["g++", "-O2", "-o", "/tmp/a.o", "a.cpp"]}]
-        data2 = [{"file": "a.cpp", "arguments": ["g++", "-O2", "-o", "/tmp/b.o", "a.cpp"]}]
-        p1 = tmpdir / "cc1.json"
-        p2 = tmpdir / "cc2.json"
-        p1.write_text(json.dumps(data1))
-        p2.write_text(json.dumps(data2))
-        assert compute(p1) == compute(p2)
-
-    def test_hash_is_hex_string(self, tmpdir):
-        data = [{"file": "a.cpp", "arguments": ["g++", "-O2", "a.cpp"]}]
-        p = tmpdir / "cc.json"
-        p.write_text(json.dumps(data))
-        result = compute(p)
-        assert len(result) == 64
-        assert all(c in "0123456789abcdef" for c in result)
-
-    def test_empty_compile_commands(self, tmpdir):
-        """Empty compile_commands.json should produce a hash."""
-        p = tmpdir / "cc.json"
-        p.write_text("[]")
-        result = compute(p)
-        assert len(result) == 64
-
-    def test_single_entry_minimal(self, tmpdir):
-        """Single entry with minimal fields should produce a hash."""
-        data = [{"directory": str(tmpdir), "file": "a.c", "command": "gcc -c a.c"}]
-        p = tmpdir / "cc.json"
-        p.write_text(json.dumps(data))
-        result = compute(p)
-        assert len(result) == 64
-
-    def test_compile_commands_with_null_fields(self, tmpdir):
-        """Entries with null fields should not crash."""
-        data = [
-            {
-                "directory": str(tmpdir),
-                "file": "a.c",
-                "arguments": ["gcc", "-c", "a.c"],
-            },
-            {
-                "directory": None,
-                "file": "b.c",
-                "arguments": ["gcc", "-c", "b.c"],
-            },
-        ]
-        p = tmpdir / "cc.json"
-        p.write_text(json.dumps(data))
-        result = compute(p)
-        assert len(result) == 64
-
-    def test_file_with_only_whitespace(self, tmpdir):
-        """Whitespace-only compile_commands.json should fail gracefully."""
-        p = tmpdir / "cc.json"
-        p.write_text("   \n  \n  ")
-        try:
-            compute(p)
-        except (json.JSONDecodeError, ValueError):
-            pass  # Expected — invalid JSON or empty parse
-
-    def test_malformed_json(self, tmpdir):
-        """Malformed JSON should raise an error."""
-        p = tmpdir / "cc.json"
-        p.write_text("{this is not json}")
-        with pytest.raises((json.JSONDecodeError, ValueError)):
-            compute(p)

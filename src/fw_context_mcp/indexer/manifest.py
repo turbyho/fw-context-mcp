@@ -20,29 +20,22 @@ import logging
 import time
 from pathlib import Path
 
+from fw_context_mcp.indexer.config_hash import compute_flags_hash
 from fw_context_mcp.utils import compute_source_hash
 
 log = logging.getLogger(__name__)
 
 MANIFEST_FORMAT = "fw-context-manifest/1"
 
-# Build output directories whose headers should be marked as ``generated``.
-# Changes to generated headers do NOT trigger a reparse — they are
-# rebuild artifacts, not source code the developer edits.
-_BUILD_DIR_PATTERNS = ("BUILD/", "build/", ".pio/", "cmake-build-", "_build/")
-
-
 def _is_generated_header(header_path: str, build_dir_patterns: list[str] | None = None) -> bool:
     """Return True when *header_path* looks like a build-generated file.
 
-    Uses *build_dir_patterns* from the manifest when available (dynamic detection
-    per build system), falling back to ``_BUILD_DIR_PATTERNS`` for backward
-    compatibility with manifests that predate the ``build_dir_patterns`` field.
+    Uses *build_dir_patterns* passed from the caller (detected per build
+    system).  When no patterns are provided, no header is treated as generated.
     """
-    patterns: tuple[str, ...] = (
-        tuple(build_dir_patterns) if build_dir_patterns else _BUILD_DIR_PATTERNS
-    )
-    return any(pat in header_path for pat in patterns)
+    if not build_dir_patterns:
+        return False
+    return any(pat in header_path for pat in build_dir_patterns)
 
 
 
@@ -119,6 +112,7 @@ def generate(
     units: list,
     macros: dict[str, str] | None = None,
     build_dir_patterns: list[str] | None = None,
+    config_hash: str = "",
 ) -> str:
     """Generate ``manifest.json`` from compile_commands + libclang token stream.
 
@@ -130,10 +124,14 @@ def generate(
         macros: Optional pre-computed macro dictionary from ``clang -dM -E``.
         build_dir_patterns: Optional patterns for build-output directories
             (e.g. ``["BUILD/", ".pio/"]``).  Used to mark generated headers.
+        config_hash: Optional pre-computed config_hash.  When empty, the hash
+            is computed from the manifest dict (backward-compatible fallback).
 
     Returns:
         The ``config_hash`` — SHA-256 of the structural part of the manifest.
     """
+    from fw_context_mcp.config.settings import derive_project_id
+
     entries: list[dict] = []
     t0 = time.monotonic()
 
@@ -153,6 +151,7 @@ def generate(
             "arguments": unit.clang_args,
             "source_hash": source_hash,
             "headers": headers,
+            "flags_hash": compute_flags_hash(unit.raw_entry) if unit.raw_entry else "",
         }
         entries.append(entry)
 
@@ -167,9 +166,13 @@ def generate(
     if build_dir_patterns:
         manifest["build_dir_patterns"] = build_dir_patterns
 
-    # Compute config_hash from manifest content (without config_hash itself),
-    # then save with the hash embedded.
-    config_hash = compute_config_hash(manifest)
+    if not config_hash:
+        # Backward-compatible fallback — compute hash from manifest dict.
+        # New callers should pass config_hash computed from the normalized
+        # compile_commands.json instead.
+        project_id = derive_project_id(project_root)
+        config_hash = compute_config_hash(units, project_root, project_id, build_dir_patterns)
+
     manifest["config_hash"] = config_hash
     manifest_json = json.dumps(manifest, sort_keys=True, indent=2, ensure_ascii=False)
     manifest_path = db_dir / "manifest.json"
@@ -205,42 +208,22 @@ def compute_structural_hash(
     project_root: Path,
     units: list,
     build_dir_patterns: list[str] | None = None,
+    project_id: str = "",
 ) -> str:
     """Compute the config_hash from structural build identity — no I/O, no libclang.
 
-    Builds the same structural manifest dict that :func:`build_preliminary`
-    produces, computes its hash via :func:`compute_config_hash`, but does
-    **not** write ``manifest.json`` to disk.  Useful for comparing against a
-    stored manifest to detect structural changes without overwriting headers.
+    Uses the normalized compile_commands.json hashing via
+    :func:`compute_config_hash`.  Does **not** write ``manifest.json``
+    to disk.  Useful for comparing against a stored manifest to detect
+    structural changes.
 
     Returns the *config_hash* string.
     """
-    entries: list[dict] = []
-    for unit in units:
-        source_file = str(unit.file.resolve())
-        try:
-            source_rel = str(unit.file.resolve().relative_to(project_root))
-        except ValueError:
-            source_rel = source_file
+    from fw_context_mcp.config.settings import derive_project_id
 
-        entries.append({
-            "file": source_rel,
-            "directory": str(unit.directory) if unit.directory else str(project_root),
-            "arguments": unit.clang_args,
-            "source_hash": "",
-            "headers": [],
-        })
-
-    manifest: dict = {
-        "_format": MANIFEST_FORMAT,
-        "compile_commands_path": str(compile_commands_path),
-        "project_root": str(project_root),
-        "entries": entries,
-    }
-    if build_dir_patterns:
-        manifest["build_dir_patterns"] = build_dir_patterns
-
-    return compute_config_hash(manifest)
+    if not project_id:
+        project_id = derive_project_id(project_root)
+    return compute_config_hash(units, project_root, project_id, build_dir_patterns)
 
 
 def build_preliminary(
@@ -249,12 +232,13 @@ def build_preliminary(
     project_root: Path,
     units: list,
     build_dir_patterns: list[str] | None = None,
+    project_id: str = "",
 ) -> str:
     """Build a preliminary ``manifest.json`` from structural data only — no libclang.
 
     Creates a manifest with ``file``, ``directory``, and ``arguments`` for each
     translation unit, leaving ``source_hash`` and ``headers`` empty.  The
-    config_hash is computed from these structural fields via
+    config_hash is computed from the normalized compile_commands.json via
     :func:`compute_config_hash`, so it stays stable when the real manifest
     (with headers) is generated later.
 
@@ -263,6 +247,14 @@ def build_preliminary(
 
     Returns the *config_hash* string.
     """
+    from fw_context_mcp.config.settings import derive_project_id
+
+    if not project_id:
+        project_id = derive_project_id(project_root)
+
+    config_hash = compute_config_hash(units, project_root, project_id, build_dir_patterns)
+
+    # Build entries for the manifest file
     entries: list[dict] = []
     for unit in units:
         source_file = str(unit.file.resolve())
@@ -288,7 +280,6 @@ def build_preliminary(
     if build_dir_patterns:
         manifest["build_dir_patterns"] = build_dir_patterns
 
-    config_hash = compute_config_hash(manifest)
     manifest["config_hash"] = config_hash
     manifest_json = json.dumps(manifest, sort_keys=True, indent=2, ensure_ascii=False)
     db_dir.mkdir(parents=True, exist_ok=True)
@@ -319,36 +310,185 @@ def build_preliminary(
     return config_hash
 
 
-def compute_config_hash(manifest: dict) -> str:
-    """Return the SHA-256 hash of the **structural** part of the manifest.
+def compute_config_hash(
+    units: list,
+    project_root: Path,
+    project_id: str,
+    build_dir_patterns: list[str] | None = None,
+) -> str:
+    """Return SHA-256 of the **normalized** compile_commands.json.
 
-    Only build-configuration fields are hashed — file, directory, arguments,
-    macros, format, project_root, compile_commands_path.  Per-TU content
-    fields (source_hash, headers) and build_dir_patterns are EXCLUDED so
-    that header/content changes do not trigger a full reindex.
+    Instead of hashing the manifest dict (which created a circular dependency
+    and caused unnecessary config_hash churn when flag order changed), this
+    function normalizes the raw TU list directly:
 
-    The manifest's own ``config_hash`` key is also excluded to avoid a
-    circular dependency.
+    1. Sort entries by *file* — removes TU order dependence.
+    2. Sort *arguments* alphabetically per entry — removes flag order dependence.
+    3. Normalize paths in path-bearing arguments (``-I``, ``-isystem``, etc.)
+       to be relative to *project_root*; paths outside the project are
+       resolved through ``Path.resolve()`` for symlink/collapse stability.
+    4. Drop arguments pointing into build-output directories
+       (detected via *build_dir_patterns* from the build system) so that
+       per-build temporary directories don't destabilize the hash.
+    5. Drop transient ``-D`` macros that vary per build (timestamps, build
+       IDs injected by the build system).
+
+    The canonical JSON is written to
+    ``~/.fw-context/index/<project_id>/compile_commands.<hash>.json``
+    as a debug artifact — ``diff`` between two versions shows only
+    semantic differences, without flag-ordering or path-format noise.
+
+    Returns the *config_hash* hex string.
     """
-    excluded = {"config_hash", "build_dir_patterns"}
-    stripped: dict = {}
-    for k, v in manifest.items():
-        if k in excluded:
-            continue
-        if k == "entries":
-            # Exclude per-TU content fields — only keep structural identity
-            stripped[k] = [
-                {
-                    ek: ev
-                    for ek, ev in e.items()
-                    if ek not in ("source_hash", "headers")
-                }
-                for e in v
-            ]
+    # Path arguments whose value should be normalized
+    _PATH_PREFIXES = ("-I", "-isystem", "-idirafter", "-iquote", "-include", "-imacros")
+    _PATH_EQ_PREFIXES = ("--sysroot=",)
+
+    # Build-output directory patterns from the build system.
+    # When no patterns are provided, no arguments are filtered.
+    _markers: tuple[str, ...] = tuple(build_dir_patterns) if build_dir_patterns else ()
+
+    # ``-D`` macros that contain per-build transient values (timestamps,
+    # build counter, etc.) — their presence destabilizes the config_hash
+    # without changing compilation semantics.  Drop them during normalization.
+    _TRANSIENT_DEFINES: frozenset[str] = frozenset({
+        "MBED_BUILD_TIMESTAMP",  # Mbed OS — Python time.time() float
+        "BUILD_TIMESTAMP",       # generic timestamp
+        "BUILD_TIME",            # generic build time
+        "BUILD_DATE",            # generic build date
+        "BUILD_ID",              # CI build number
+        "BUILD_NUMBER",          # CI build counter
+    })
+
+    def _is_build_output(arg_value: str) -> bool:
+        return any(marker in arg_value for marker in _markers)
+
+    def _normalize_path(arg_value: str) -> str:
+        """Resolve a path argument value relative to *project_root*.
+
+        Paths inside *project_root* become relative; paths outside are
+        resolved via ``Path.resolve()`` for symlink/``..`` collapse.
+        """
+        p = Path(arg_value)
+        if not p.is_absolute():
+            p = (project_root / p).resolve()
         else:
-            stripped[k] = v
-    canonical = json.dumps(stripped, sort_keys=True, indent=2, ensure_ascii=False)
-    return hashlib.sha256(canonical.encode()).hexdigest()
+            p = p.resolve()
+        try:
+            return str(p.relative_to(project_root))
+        except ValueError:
+            return str(p)
+
+    entries: list[dict] = []
+    for unit in units:
+        # ── Pre-pass: collapse space-separated -D NAME=VALUE → -DNAME=VALUE ──
+        # Sorting alphabetically (next step) would separate "-D" from its value
+        # token — join them first so the sort is semantically safe.  Also
+        # drops transient -D macros in the same pass.
+        raw_args = unit.clang_args
+        collapsed_args: list[str] = []
+        j = 0
+        while j < len(raw_args):
+            a = raw_args[j]
+            if a == "-D" and j + 1 < len(raw_args):
+                val = raw_args[j + 1]
+                eq_idx = val.find("=")
+                name = val[:eq_idx] if eq_idx != -1 else val
+                if name in _TRANSIENT_DEFINES:
+                    j += 2
+                    continue
+                collapsed_args.append(f"-D{val}")
+                j += 2
+            elif a.startswith("-D") and len(a) > 2:
+                name_part = a[2:]
+                if "=" in name_part:
+                    name = name_part.split("=", 1)[0]
+                else:
+                    name = name_part
+                if name in _TRANSIENT_DEFINES:
+                    j += 1
+                    continue
+                collapsed_args.append(a)
+                j += 1
+            else:
+                collapsed_args.append(a)
+                j += 1
+
+        # Normalize arguments: sort, then process path-bearing flags
+        args = sorted(collapsed_args)
+        normalized_args: list[str] = []
+
+        i = 0
+        while i < len(args):
+            arg = args[i]
+            handled = False
+
+            for prefix in _PATH_PREFIXES:
+                if arg == prefix and i + 1 < len(args):
+                    val = args[i + 1]
+                    if not _is_build_output(val):
+                        normalized_args.append(prefix)
+                        normalized_args.append(_normalize_path(val))
+                    i += 2
+                    handled = True
+                    break
+                elif arg.startswith(prefix) and len(arg) > len(prefix):
+                    # Concatenated form: -I/path/to/include
+                    val = arg[len(prefix):]
+                    if not _is_build_output(val):
+                        normalized_args.append(prefix + _normalize_path(val))
+                    i += 1
+                    handled = True
+                    break
+
+            if handled:
+                continue
+
+            for prefix in _PATH_EQ_PREFIXES:
+                if arg.startswith(prefix):
+                    val = arg[len(prefix):]
+                    if not _is_build_output(val):
+                        normalized_args.append(prefix + _normalize_path(val))
+                    i += 1
+                    handled = True
+                    break
+
+            if handled:
+                continue
+
+            # Non-path argument — keep as-is
+            normalized_args.append(arg)
+            i += 1
+
+        try:
+            file_rel = str(unit.file.resolve().relative_to(project_root))
+        except ValueError:
+            file_rel = str(unit.file.resolve())
+
+        entries.append({"file": file_rel, "arguments": normalized_args})
+
+    # Sort entries by file path for deterministic ordering
+    entries.sort(key=lambda e: e["file"])
+
+    canonical: dict = {
+        "_format": "fw-context-cc/1",
+        "project_root": str(project_root),
+        "entries": entries,
+    }
+
+    canonical_json = json.dumps(canonical, sort_keys=True, indent=2, ensure_ascii=False)
+    config_hash = hashlib.sha256(canonical_json.encode()).hexdigest()
+
+    # Write canonical JSON as a debug artifact
+    cc_dir = Path.home() / ".fw-context" / "index" / project_id
+    cc_dir.mkdir(parents=True, exist_ok=True)
+    out_path = cc_dir / f"compile_commands.{config_hash}.json"
+    try:
+        out_path.write_text(canonical_json, encoding="utf-8")
+    except OSError:
+        pass  # best-effort — hash is already computed
+
+    return config_hash
 
 
 def check_tu_staleness(
@@ -425,9 +565,13 @@ def update_entry(
         manifest["entries"][entry_index]["headers"] = headers
 
 
-def save(manifest: dict, db_dir: Path) -> str:
-    """Recompute config_hash, save manifest.json, return the new config_hash."""
-    config_hash = compute_config_hash(manifest)
+def save(manifest: dict, db_dir: Path, config_hash: str) -> str:
+    """Save manifest.json with the given *config_hash*, return it.
+
+    The caller is responsible for computing *config_hash* — save() no
+    longer calls ``compute_config_hash()`` internally.  This removes the
+    circular dependency between manifest content and config_hash.
+    """
     manifest["config_hash"] = config_hash
     manifest_json = json.dumps(manifest, sort_keys=True, indent=2, ensure_ascii=False)
     (db_dir / "manifest.json").write_text(manifest_json, encoding="utf-8")

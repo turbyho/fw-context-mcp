@@ -23,13 +23,16 @@ from .compile_commands import parse as parse_compile_commands
 from .config_hash import compute_flags_hash, compute_tu_content_hash
 from .db import (
     CURRENT_SCHEMA_VERSION,
+    delete_build_data,
     drop_fts_triggers,
     get_file_hashes,
     open_db,
     rebuild_files_fts,
     rebuild_fts,
+    rebuild_macros_fts,
     transaction,
     upsert_build_config,
+    upsert_file,
     upsert_project,
     write_lock,
 )
@@ -160,6 +163,55 @@ def _add_external_root(tu_path: Path, roots: list[Path], seen: set[Path]) -> Non
                 roots.append(candidate)
                 seen.add(candidate)
                 return
+
+
+def _cleanup_orphaned_cc_artifacts(db_path: Path, project_id: str) -> int:
+    """Delete ``compile_commands.<hash>.json`` files that don't match any active build_config.
+
+    These files are written by :func:`compute_config_hash` as debug artifacts
+    and can become orphaned when ``fw-context index`` is interrupted before
+    the end-of-run cleanup.  Call this at the START of a new index run so
+    orphans from a previous crashed run are cleaned up immediately.
+
+    Returns the number of deleted files.
+    """
+    cc_dir = Path.home() / ".fw-context" / "index" / project_id
+    if not cc_dir.is_dir():
+        return 0
+
+    # Collect active config_hashes from the database (best-effort — DB may
+    # not exist yet on first index or after reset_index).
+    active_hashes: set[str] = set()
+    if db_path.exists():
+        try:
+            conn = open_db(db_path, skip_integrity_check=True)
+            rows = conn.execute("SELECT config_hash FROM build_configs WHERE project_id = ?", (project_id,)).fetchall()
+            conn.close()
+            active_hashes = {r["config_hash"] for r in rows}
+        except Exception:
+            pass  # DB may be corrupt or schema not yet initialized
+
+    deleted = 0
+    for f in cc_dir.iterdir():
+        if not f.is_file():
+            continue
+        name = f.name
+        if not name.startswith("compile_commands.") or not name.endswith(".json"):
+            continue
+        # Extract hash from filename: compile_commands.<64-char-hex>.json
+        hash_part = name[len("compile_commands."): -len(".json")]
+        if len(hash_part) != 64 or not all(c in "0123456789abcdef" for c in hash_part):
+            continue
+        if hash_part not in active_hashes:
+            try:
+                f.unlink()
+                deleted += 1
+            except OSError:
+                pass
+
+    if deleted:
+        log.info("Cleaned up %d orphaned compile_commands artifacts in %s", deleted, cc_dir)
+    return deleted
 
 
 def _detect_sdk_exclude_like(project_root: Path, extra_exclude: list[str] | None = None) -> list[str]:
@@ -1142,6 +1194,7 @@ def _update_manifest_after_index(
     updated_count: int,
     tu_headers: dict[str, list[dict]] | None = None,
     build_dir_patterns: list[str] | None = None,
+    config_hash: str = "",
 ) -> dict | None:
     """Update ``manifest.json`` after an indexing run.
 
@@ -1212,6 +1265,7 @@ def _update_manifest_after_index(
                         "arguments": unit.clang_args,
                         "source_hash": source_hash,
                         "headers": tu_headers[tu_rel],
+                        "flags_hash": compute_flags_hash(unit.raw_entry) if unit.raw_entry else "",
                     }
                 )
                 updated += 1
@@ -1228,6 +1282,7 @@ def _update_manifest_after_index(
                         "arguments": unit.clang_args,
                         "source_hash": source_hash,
                         "headers": headers,
+                        "flags_hash": compute_flags_hash(unit.raw_entry) if unit.raw_entry else "",
                     }
                 )
                 updated += 1
@@ -1264,13 +1319,12 @@ def _update_manifest_after_index(
                         "arguments": unit.clang_args,
                         "source_hash": source_hash,
                         "headers": headers,
+                        "flags_hash": compute_flags_hash(unit.raw_entry) if unit.raw_entry else "",
                     }
                 )
                 updated += 1
 
         log.info("manifest.json incremental: %d updated, %d reused", updated, reused)
-
-    log.info("manifest.json incremental: %d updated, %d reused", updated, reused)
 
     manifest_data = {
         "_format": MANIFEST_FORMAT,
@@ -1286,10 +1340,168 @@ def _update_manifest_after_index(
     # Preserve macros from old manifest
     if manifest and manifest.get("macros"):
         manifest_data["macros"] = manifest["macros"]
-    config_hash = save(manifest_data, db_dir)
+    if not config_hash:
+        from fw_context_mcp.config.settings import derive_project_id as _derive_id
+
+        from .manifest import compute_config_hash as _compute_cc_hash
+
+        config_hash = _compute_cc_hash(units, project_root, _derive_id(project_root), build_dir_patterns)
+    config_hash = save(manifest_data, db_dir, config_hash)
     header_count = sum(len(e.get("headers", [])) for e in entries)
     log.info("manifest.json saved: %d TUs, %d headers, config_hash=%s", len(entries), header_count, config_hash[:12])
     return manifest_data
+
+
+def _reassign_symbols_for_file(
+    conn,
+    new_config_hash: str,
+    new_file_id: int,
+    file_path: str,
+) -> int:
+    """Reassign data for *file_path* from an old config_hash to *new_config_hash* using UPDATE.
+
+    Unlike the old ``_migrate_symbols_for_file`` which copied data via
+    INSERT OR REPLACE (allocating new rows, rebuilding indexes), this
+    function updates ``config_hash`` and ``file_id`` in-place on existing
+    rows.  No new rows are allocated, indexes are updated only for the
+    changed columns.
+
+    Rows that would collide with already-indexed symbols (shared headers
+    across TUs) are left under the old config_hash and cleaned up later
+    by :func:`delete_build_data`.
+
+    When no previous build exists (Scenario C — first index), returns 0
+    and the caller falls through to normal libclang parsing.
+
+    Runs inside the caller's transaction — atomic UPDATE across all tables.
+    """
+    # Find the most recent old config_hash that has symbols for this file
+    old = conn.execute(
+        "SELECT config_hash, id FROM files WHERE path=? AND config_hash!=? ORDER BY rowid DESC LIMIT 1",
+        (file_path, new_config_hash),
+    ).fetchone()
+    if old is None:
+        return 0  # Scenario C — first index, nothing to reassign
+
+    old_ch, old_fid = old
+
+    # ── symbols ──
+    # UPDATE only those that don't collide with already-existing symbols
+    # under the new config_hash.  NOT IN subselect: symbols shared across
+    # TUs (headers) may already have been indexed under new_config_hash by
+    # another TU.
+    cur = conn.execute(
+        """UPDATE symbols SET config_hash=?, file_id=?
+           WHERE config_hash=? AND file_id=?
+           AND usr NOT IN (SELECT usr FROM symbols WHERE config_hash=?)""",
+        (new_config_hash, new_file_id, old_ch, old_fid, new_config_hash),
+    )
+    symbol_count = cur.rowcount
+    # Reset pagerank — _build_pagerank() skips when pagerank > 0.
+    # Values from the previous build are stale because the call graph
+    # may have changed in other (updated) files.
+    conn.execute(
+        "UPDATE symbols SET pagerank = 0.0 WHERE config_hash = ? AND file_id = ?",
+        (new_config_hash, new_file_id),
+    )
+
+    # ── macros ──
+    # UNIQUE(config_hash, file_id, line) — on collision, keep the old version.
+    conn.execute(
+        """UPDATE macros SET config_hash=?, file_id=?
+           WHERE config_hash=? AND file_id=?
+           AND NOT EXISTS (
+               SELECT 1 FROM macros m2
+               WHERE m2.config_hash = ?
+                 AND m2.file_id = ?
+                 AND m2.line = macros.line
+           )""",
+        (new_config_hash, new_file_id, old_ch, old_fid, new_config_hash, new_file_id),
+    )
+
+    # ── refs ──
+    # Delete anything already under new_config_hash for this file so
+    # UPDATE won't create duplicates (refs has no UNIQUE constraint).
+    conn.execute(
+        "DELETE FROM refs WHERE config_hash=? AND from_file=?",
+        (new_config_hash, file_path),
+    )
+    conn.execute(
+        """UPDATE refs SET config_hash=?
+           WHERE config_hash=? AND from_file=?""",
+        (new_config_hash, old_ch, file_path),
+    )
+
+    # ── fp_assignments ──
+    conn.execute(
+        "DELETE FROM fp_assignments WHERE config_hash=? AND from_file=?",
+        (new_config_hash, file_path),
+    )
+    conn.execute(
+        """UPDATE fp_assignments SET config_hash=?
+           WHERE config_hash=? AND from_file=?""",
+        (new_config_hash, old_ch, file_path),
+    )
+
+    # ── indirect_call_sites ──
+    conn.execute(
+        "DELETE FROM indirect_call_sites WHERE config_hash=? AND from_file=?",
+        (new_config_hash, file_path),
+    )
+    conn.execute(
+        """UPDATE indirect_call_sites SET config_hash=?
+           WHERE config_hash=? AND from_file=?""",
+        (new_config_hash, old_ch, file_path),
+    )
+
+    # ── vec_symbols (sqlite-vec KNN) ──
+    # vec0 virtual table has a config_hash column for filtered KNN queries.
+    # After updating symbols we must also update config_hash in vec0.
+    # DELETE before UPDATE — safer; vec0 virtual tables may not support
+    # UPDATE with WHERE subselect.
+    try:
+        conn.execute(
+            """DELETE FROM vec_symbols WHERE symbol_id IN (
+                   SELECT id FROM symbols WHERE config_hash=? AND file_id=?
+               )""",
+            (new_config_hash, new_file_id),
+        )
+        conn.execute(
+            """UPDATE vec_symbols SET config_hash=?
+               WHERE symbol_id IN (
+                   SELECT id FROM symbols WHERE config_hash=? AND file_id=?
+               )""",
+            (new_config_hash, new_config_hash, new_file_id),
+        )
+    except Exception:
+        pass  # sqlite-vec may not be available
+
+    # ── inheritance ──
+    # UPDATE inheritance edges for classes defined in this file.
+    # derived_usr must belong to symbols we just reassigned (they already
+    # have the new config_hash).
+    # NOT EXISTS: prevents UNIQUE constraint violation when another TU
+    # (changed, Tier 3) already created the same (derived_usr, base_usr)
+    # edge under the new config_hash.
+    conn.execute(
+        """UPDATE inheritance SET config_hash=?
+           WHERE config_hash=? AND derived_usr IN (
+               SELECT usr FROM symbols WHERE config_hash=? AND file_id=?
+           )
+           AND NOT EXISTS (
+               SELECT 1 FROM inheritance i2
+               WHERE i2.config_hash = ?
+                 AND i2.derived_usr = inheritance.derived_usr
+                 AND i2.base_usr = inheritance.base_usr
+           )""",
+        (new_config_hash, old_ch, new_config_hash, new_file_id, new_config_hash),
+    )
+
+    # ── overrides ──
+    # NOT migrated — _build_overrides() rebuilds from scratch for the new
+    # config_hash in post-processing.  No reassignment needed.
+
+    return symbol_count
 
 
 def _check_and_parse_unit(
@@ -1324,7 +1536,11 @@ def _check_and_parse_unit(
             source-hash-only comparison.
 
     Returns:
-        * ``("unchanged", None, None, None)`` — no re-parse needed.
+        * ``("unchanged", None, None, None)`` — no re-parse needed (Tier 1 mtime match).
+        * ``("unchanged", None, None, hashes)`` — no re-parse needed (Tier 2 content-hash match).
+        * ``("reuse", None, None, hashes)`` — TU is unchanged across config_hash
+          change; caller must copy symbols from the old config_hash and create
+          a file record for the new config_hash (Tier 2b manifest-based match).
         * ``("skipped", None, None, None)`` — excluded path or parse failed.
         * ``("updated", parsed, (t_start, t_end), hashes)`` — parsed
           successfully, ready for ``_process_unit(pre_parsed=parsed)``.
@@ -1379,6 +1595,35 @@ def _check_and_parse_unit(
         if rec.content_hash and rec.content_hash == content_hash:
             # Content unchanged — just the mtime was bumped by a rebuild.
             return ("unchanged", None, None, hashes)
+
+    # ── Tier 2b: manifest-based fallback for new config_hash ──
+    # When file_path has no record in the current config_hash (e.g. after
+    # --build with a new compile_commands.json), the manifest entry from
+    # the PREVIOUS index provides source_hash, header hashes, and flags_hash.
+    # If all three match current disk content, the TU is unchanged despite
+    # the new config_hash — skip the expensive libclang parse.
+    if not force_refs and file_path not in existing_files and manifest is not None:
+        from .manifest import check_tu_staleness
+        from .manifest import get_manifest_entry_hash as _entry_hash
+
+        try:
+            tu_rel = str(unit.file.resolve().relative_to(project_root))
+        except ValueError:
+            tu_rel = str(unit.file.resolve())
+        entry = manifest.get(tu_rel)
+        # Guard: only trust entries with real source_hash AND flags_hash.
+        # Preliminary (degraded) manifests have empty source_hash; old
+        # manifests from before this feature lack flags_hash.
+        if entry is not None and entry.get("source_hash") and entry.get("flags_hash"):
+            stale, _ = check_tu_staleness(entry, project_root, source_roots)
+            if not stale:
+                current_flags = compute_flags_hash(unit.raw_entry) if unit.raw_entry else ""
+                if entry["flags_hash"] == current_flags:
+                    mh = _entry_hash(entry)
+                    hashes = (source_hash, current_flags, mh)
+                    # Return "reuse" — caller must copy symbols from old
+                    # config_hash and create a file record for the new one.
+                    return ("reuse", None, None, hashes)
 
     # ── Tier 3: libclang parse ──
     from .symbols import extract_all
@@ -1702,6 +1947,13 @@ def run(
     if project_id is None:
         project_id = derive_project_id(project_root)
     name = project_name or project_root.name
+    # Collect git context for build description (branch + last tag).
+    from .git_context import get_git_description
+
+    git_description = get_git_description(project_root)
+    # Clean up compile_commands.<hash>.json artifacts left by a previous
+    # interrupted run before computing a new config_hash.
+    _cleanup_orphaned_cc_artifacts(db_path, project_id)
     # Parse compile_commands.json to discover translation units.  Must
     # happen before config_hash computation so the manifest can be built
     # from the actual TU list.
@@ -1727,6 +1979,7 @@ def run(
         project_root,
         units,
         build_dir_patterns,
+        project_id=project_id,
     )
     if manifest is not None and manifest.get("config_hash") == expected_hash:
         config_hash = manifest["config_hash"]
@@ -1737,6 +1990,7 @@ def run(
             project_root,
             units,
             build_dir_patterns,
+            project_id=project_id,
         )
         # Reload manifest from disk — build_preliminary may have overwritten
         # manifest.json.  The in-memory manifest must reflect what _update_manifest_after_index
@@ -1768,13 +2022,16 @@ def run(
 
     conn = open_db(db_path)
     # Determine initial manifest verification for this config.
-    # For a new config_hash (first index), default to "none".
-    # For an existing config, preserve the previous value.
+    # New config_hash → 'indexing' (hidden from MCP queries until complete).
+    # Existing config → preserve the previous value (in-place update).
     old_row = conn.execute(
         "SELECT manifest_verification FROM build_configs WHERE config_hash=?",
         (config_hash,),
     ).fetchone()
-    initial_manifest_verification = old_row["manifest_verification"] if old_row else "none"
+    if old_row is None:
+        initial_manifest_verification = "indexing"
+    else:
+        initial_manifest_verification = old_row["manifest_verification"]
     # Serialize with any concurrent writer (background reindex, daemon)
     with write_lock(db_path.parent, timeout=120.0):
         with transaction(conn):
@@ -1784,6 +2041,7 @@ def run(
                 config_hash,
                 project_id,
                 str(compile_commands),
+                description=git_description,
                 manifest_verification=initial_manifest_verification,
             )
 
@@ -1826,6 +2084,7 @@ def run(
     total_refs = 0
     skipped = 0
     unchanged = 0
+    reused = 0
     updated = 0
     acc_parse = 0.0
     acc_lock = 0.0
@@ -1906,8 +2165,8 @@ def run(
             manifest=manifest_lookup,
         )
 
-        if check_status == "unchanged":
-            unchanged += 1
+        if check_status in ("unchanged", "reuse"):
+            is_reuse = check_status == "reuse"
             file_path_str = _normalize_file_path(str(unit.file.resolve()), project_root)
             rec = existing_files.get(file_path_str)
             file_id = rec.file_id if rec else None
@@ -1916,38 +2175,87 @@ def run(
             except OSError:
                 current_mtime = 0.0
 
+            # When "reuse" migration produces 0 symbols (no old data for this
+            # TU), we must fall through to Phase 2 for a real libclang parse
+            # instead of skipping the TU permanently.
+            fallthrough = False
+
             with write_lock(db_path.parent, timeout=120.0):
-                if hashes is not None:
-                    # Tier 2: content-hash match — update all hashes
-                    source_hash, flags_hash, manifest_entry_hash = hashes
-                    content_hash_val = compute_tu_content_hash(source_hash, flags_hash, manifest_entry_hash)
-                    if file_id is not None:
+                with transaction(conn, checkpoint=False):
+                    if hashes is not None:
+                        # Tier 2 / Tier 2b: content-hash match — update or create file record
+                        source_hash, flags_hash, manifest_entry_hash = hashes
+                        content_hash_val = compute_tu_content_hash(source_hash, flags_hash, manifest_entry_hash)
+                        if file_id is not None:
+                            conn.execute(
+                                """UPDATE files SET mtime=?, content_hash=?, source_hash=?,
+                                   flags_hash=?
+                                   WHERE id=?""",
+                                (current_mtime, content_hash_val, source_hash, flags_hash, file_id),
+                            )
+                        else:
+                            # New config_hash — create file record for this TU
+                            file_id = upsert_file(
+                                conn,
+                                config_hash,
+                                file_path_str,
+                                unit.language,
+                                mtime=current_mtime,
+                                content_hash=content_hash_val,
+                                source_hash=source_hash,
+                                flags_hash=flags_hash,
+                            )
+                    elif file_id is not None:
+                        # Tier 1: mtime match — just refresh stored mtime
                         conn.execute(
-                            """UPDATE files SET mtime=?, content_hash=?, source_hash=?,
-                               flags_hash=?
-                               WHERE id=?""",
-                            (current_mtime, content_hash_val, source_hash, flags_hash, file_id),
+                            "UPDATE files SET mtime=? WHERE id=?",
+                            (current_mtime, file_id),
                         )
-                elif file_id is not None:
-                    # Tier 1: mtime match — just refresh stored mtime
-                    conn.execute(
-                        "UPDATE files SET mtime=? WHERE id=?",
-                        (current_mtime, file_id),
-                    )
-                # Fill ifdef-filtered file content via tokenization
-                fc, headers = _build_filtered_file_content(
-                    conn, unit, config_hash, project_root, build_dir_patterns=build_dir_patterns
-                )
-                content_filled += fc
-                if headers:
+                    # For "reuse": copy symbols + refs from old config_hash
+                    if is_reuse and file_id is not None:
+                        syms_copied = _reassign_symbols_for_file(
+                            conn, config_hash, file_id, file_path_str,
+                        )
+                        if syms_copied > 0:
+                            total_syms += syms_copied
+                            reused += 1
+                        else:
+                            # No old data to migrate — clear the file record
+                            # so orphan cleanup handles it, then fall through
+                            # to Phase 2 for a real libclang parse.
+                            log.info(
+                                "[%d/%d] %s: reuse produced 0 symbols — re-parsing",
+                                processed, len(units), fname,
+                            )
+                            conn.execute("UPDATE files SET content = '' WHERE id = ?", (file_id,))
+                            fallthrough = True
+                    elif not is_reuse:
+                        unchanged += 1
+
+                    if not fallthrough:
+                        # Fill ifdef-filtered file content via tokenization
+                        fc, headers = _build_filtered_file_content(
+                            conn, unit, config_hash, project_root, build_dir_patterns=build_dir_patterns
+                        )
+                        content_filled += fc
+                if not fallthrough and headers:
                     try:
                         tu_key = str(unit.file.resolve().relative_to(project_root))
                     except ValueError:
                         tu_key = str(unit.file.resolve())
                     tu_headers[tu_key] = headers
-            terse = "unchanged (content)" if hashes is not None else "unchanged"
-            log.info("[%d/%d] %s: %s", processed, len(units), fname, terse)
-            continue
+            if fallthrough:
+                # Fall through to Phase 2 — _process_unit will re-parse with libclang
+                pass
+            else:
+                if is_reuse:
+                    terse = "reused (manifest)"
+                elif hashes is not None:
+                    terse = "unchanged (content)"
+                else:
+                    terse = "unchanged"
+                log.info("[%d/%d] %s: %s", processed, len(units), fname, terse)
+                continue
 
         if check_status == "skipped":
             skipped += 1
@@ -2004,8 +2312,9 @@ def run(
     t_fts_start = time.monotonic()
     rebuild_fts(conn)
     rebuild_files_fts(conn)
+    rebuild_macros_fts(conn)
     t_fts = time.monotonic() - t_fts_start
-    log.info("fts5 + files_fts rebuilt  %s", _fmt_dur(t_fts))
+    log.info("fts5 + files_fts + macros_fts rebuilt  %s", _fmt_dur(t_fts))
 
     # Clean up file records that no longer have symbols or macros.
     from .db import delete_orphan_files
@@ -2016,9 +2325,10 @@ def run(
 
     elapsed_parse = time.monotonic() - t0
     log.info(
-        "Parsing done: %d updated, %d unchanged, %d skipped — parse=%.1fs  lock=%.1fs  write=%.1fs  %s",
+        "Parsing done: %d updated, %d unchanged, %d reused, %d skipped — parse=%.1fs  lock=%.1fs  write=%.1fs  %s",
         updated,
         unchanged,
+        reused,
         skipped,
         acc_parse,
         acc_lock,
@@ -2028,17 +2338,11 @@ def run(
     if content_filled:
         log.info("ifdef-filtered content: %d files filled", content_filled)
 
-    # ── Refresh header mtimes from manifest ──
-    # VCS operations (git checkout/merge) update header file mtimes without
-    # changing content.  Refresh stored mtimes so _count_modified_files
-    # doesn't report phantom modifications and trigger unnecessary reindexes.
-    _refresh_header_mtimes_from_manifest(conn, config_hash, project_root, manifest)
-
     # ── Update manifest.json ──
     # Rebuild/update the manifest with fresh header hashes after indexing.
     # For incremental runs (no --build), only updated TUs get new entries;
     # unchanged TUs keep their stored entries from the previous manifest.
-    _update_manifest_after_index(
+    updated_manifest = _update_manifest_after_index(
         manifest=manifest,
         units=units,
         project_root=project_root,
@@ -2047,7 +2351,17 @@ def run(
         updated_count=updated,
         tu_headers=tu_headers if tu_headers else None,
         build_dir_patterns=build_dir_patterns,
+        config_hash=config_hash,
     )
+
+    # ── Refresh header mtimes from manifest ──
+    # VCS operations (git checkout/merge) update header file mtimes without
+    # changing content.  Refresh stored mtimes so _count_modified_files
+    # doesn't report phantom modifications and trigger unnecessary reindexes.
+    # Must run AFTER _update_manifest_after_index so it works with the
+    # current manifest, not the one loaded at the start of run().
+    if updated_manifest is not None:
+        _refresh_header_mtimes_from_manifest(conn, config_hash, project_root, updated_manifest)
 
     # Resolve expanded macro values via clang -dM -E (opt-in, best-effort).
     if index_macros_expanded and units:
@@ -2103,11 +2417,11 @@ def run(
             )
             try:
                 conn.execute(
-                    "DELETE FROM embeddings_vec WHERE symbol_id IN (SELECT id FROM symbols WHERE config_hash = ?)",
+                    "DELETE FROM vec_symbols WHERE symbol_id IN (SELECT id FROM symbols WHERE config_hash = ?)",
                     (config_hash,),
                 )
-            except Exception:
-                pass  # sqlite-vec table may not exist for legacy indexes
+            except sqlite3.OperationalError:
+                pass  # sqlite-vec not loaded — vec_symbols table doesn't exist
             conn.commit()
         log.info("", extra={"phase": "Embeddings"})
         t_emb = time.monotonic()
@@ -2134,7 +2448,7 @@ def run(
         else:
             log.info(
                 "Remote LLM cache server not configured — all symbols will be analyzed locally. "
-                "Run 'fw-context cache-remote-init' to configure."
+                "Run 'fw-context cache remote-init' to configure."
             )
 
         if force:
@@ -2195,8 +2509,57 @@ def run(
     manifest_verification: str = "full" if manifest_path.exists() else "none"
     with transaction(conn):
         upsert_build_config(
-            conn, config_hash, project_id, str(compile_commands), manifest_verification=manifest_verification
+            conn, config_hash, project_id, str(compile_commands),
+            description=git_description, manifest_verification=manifest_verification
         )
+
+    # ── Cleanup old build data ──
+    # Delete data from previous config_hashes.  The current build is now
+    # fully indexed — old data is obsolete.  Skip cleanup when a
+    # reindex_file operation is in progress (pause marker).
+    old_hashes = conn.execute(
+        """SELECT config_hash FROM build_configs
+           WHERE project_id = ? AND config_hash != ?
+           ORDER BY created_at DESC""",
+        (project_id, config_hash),
+    ).fetchall()
+
+    if old_hashes:
+        pause_file = db_path.parent / "reindex.pause"
+        skip_cleanup = False
+        if pause_file.exists():
+            try:
+                pause_pid = int(pause_file.read_text(encoding="utf-8").strip())
+                try:
+                    os.kill(pause_pid, 0)
+                    log.warning(
+                        "Skipping cleanup — reindex_file (pid=%d) is running. "
+                        "Old data will be cleaned on next successful index.",
+                        pause_pid,
+                    )
+                    skip_cleanup = True
+                except OSError:
+                    pause_file.unlink(missing_ok=True)
+            except (OSError, ValueError):
+                pause_file.unlink(missing_ok=True)
+
+        if not skip_cleanup:
+            for row in old_hashes:
+                old_ch = row["config_hash"]
+                with transaction(conn):
+                    delete_build_data(conn, old_ch)
+                log.info("Cleaned up old build data: %s", old_ch[:12])
+
+            # Clean up old canonical compile_commands artifacts
+            cc_dir = Path.home() / ".fw-context" / "index" / project_id
+            if cc_dir.exists():
+                for old_row in old_hashes:
+                    old_ch = old_row["config_hash"]
+                    old_cc = cc_dir / f"compile_commands.{old_ch}.json"
+                    try:
+                        old_cc.unlink(missing_ok=True)
+                    except OSError:
+                        pass
 
     elapsed = time.monotonic() - t0
     try:
@@ -2209,5 +2572,5 @@ def run(
     # an integer constant — no injection risk.
     conn.execute(f"PRAGMA user_version = {CURRENT_SCHEMA_VERSION}")
     log.info("", extra={"phase": f"Done — {total_syms} symbols, {total_refs} refs, {_fmt_dur(elapsed)}"})
-    log.info("%d updated, %d unchanged, %d skipped  config_hash=%s", updated, unchanged, skipped, config_hash[:12])
+    log.info("%d updated, %d unchanged, %d reused, %d skipped  config_hash=%s", updated, unchanged, reused, skipped, config_hash[:12])
     return config_hash
