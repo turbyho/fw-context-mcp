@@ -2,6 +2,8 @@
 
 # fw-context
 
+_The whole texts are translated from my native language into EN and also automatically generated using LLM._
+
 Modern large language models are remarkably good at understanding C and C++. Yet before they can reason about your code, they first have to reconstruct the program from source files.
 
 For many software projects this works surprisingly well. For embedded firmware, it often does not.
