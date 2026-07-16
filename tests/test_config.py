@@ -21,11 +21,11 @@ class TestDeepMerge:
         assert _deep_merge(base, override) == {"a": 1, "b": 99}
 
     def test_nested_merge(self):
-        base = {"index": {"db_dir": "/a", "source_roots": ["src"]}}
+        base = {"index": {"db_dir": "/a", "vendor_paths": ["third_party"]}}
         override = {"index": {"db_dir": "/b"}}
         result = _deep_merge(base, override)
         assert result["index"]["db_dir"] == "/b"
-        assert result["index"]["source_roots"] == ["src"]  # preserved
+        assert result["index"]["vendor_paths"] == ["third_party"]  # preserved
 
     def test_new_key(self):
         base = {"a": 1}
@@ -54,14 +54,14 @@ class TestFromDict:
             "index": {
                 "db_dir": "/tmp/db",
                 "compile_commands": "build/cc.json",
-                "source_roots": ["src", "lib"],
-                "exclude_paths": ["build", "BUILD"],
+                "vendor_paths": ["third_party", "vendor_libs"],
+                "project_paths": ["src/old_hal"],
             }
         })
         assert cfg.index.db_dir == Path("/tmp/db")
         assert cfg.index.compile_commands == Path("build/cc.json")
-        assert cfg.index.source_roots == ["src", "lib"]
-        assert cfg.index.exclude_paths == ["build", "BUILD"]
+        assert cfg.index.vendor_paths == ["third_party", "vendor_libs"]
+        assert cfg.index.project_paths == ["src/old_hal"]
 
     def test_llm_settings(self):
         cfg = _from_dict({
@@ -147,11 +147,10 @@ class TestLocalConfig:
 
     def test_local_index_db_dir_override(self):
         """local.toml can override db_dir regardless of config.toml."""
-        shared = {"index": {"source_roots": ["src"], "exclude_paths": ["build"]}}
+        shared = {"index": {"vendor_paths": ["third_party"]}}
         local = {"index": {"db_dir": "/custom/db/path"}}
         merged = _deep_merge(shared, local)
-        assert merged["index"]["source_roots"] == ["src"]  # preserved
-        assert merged["index"]["exclude_paths"] == ["build"]  # preserved
+        assert merged["index"]["vendor_paths"] == ["third_party"]  # preserved
         assert merged["index"]["db_dir"] == "/custom/db/path"  # from local
 
     def test_ensure_project_local_config_creates_file(self, tmpdir):
@@ -188,7 +187,7 @@ class TestLocalConfig:
 board = "nrf52840"
 
 [index]
-source_roots = ["src"]
+vendor_paths = ["third_party"]
 """)
 
         # Create local config
@@ -199,30 +198,25 @@ model = "my-local-model"
 
         cfg = load(proj_dir)
         assert cfg.build.board == "nrf52840"
-        assert cfg.index.source_roots == ["src"]
+        assert cfg.index.vendor_paths == ["third_party"]
         assert cfg.llm.model == "my-local-model"
 
 
-class TestSourceRootPaths:
-    def test_existing_roots(self, tmpdir):
-        cfg = Config()
-        cfg.index.source_roots = ["src", "lib"]
-        (tmpdir / "src").mkdir()
-        paths = cfg.source_root_paths(tmpdir)
-        assert len(paths) == 1  # only "src" exists
-        assert paths[0] == (tmpdir / "src").resolve()
+class TestVendorProjectPaths:
+    def test_vendor_paths_parsing(self):
+        cfg = _from_dict({"index": {"vendor_paths": ["third_party", "generated"]}})
+        assert cfg.index.vendor_paths == ["third_party", "generated"]
 
-    def test_no_existing_roots(self, tmpdir):
-        cfg = Config()
-        cfg.index.source_roots = ["nonexistent"]
-        paths = cfg.source_root_paths(tmpdir)
-        assert paths == []
+    def test_project_paths_parsing(self):
+        cfg = _from_dict({"index": {"project_paths": ["src/old_hal"]}})
+        assert cfg.index.project_paths == ["src/old_hal"]
 
-    def test_exclude_root_paths(self, tmpdir):
-        cfg = Config()
-        cfg.index.exclude_paths = ["build", "BUILD"]
-        (tmpdir / "build").mkdir()
-        (tmpdir / "BUILD").mkdir(exist_ok=True)
-        paths = cfg.exclude_root_paths(tmpdir)
-        assert len(paths) == 2
-        assert paths[0] == (tmpdir / "build").resolve()
+    def test_both_paths_parsing(self):
+        cfg = _from_dict({
+            "index": {
+                "vendor_paths": ["lib"],
+                "project_paths": ["lib/muj_modul"],
+            }
+        })
+        assert cfg.index.vendor_paths == ["lib"]
+        assert cfg.index.project_paths == ["lib/muj_modul"]

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import re
-from collections.abc import Iterator
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
@@ -465,8 +464,6 @@ def _docstring(cursor: cx.Cursor) -> str:
 
 def _find_fn_refs_in_expr(
     cursor: cx.Cursor,
-    in_roots_fn,
-    not_excluded_fn,
     _skip_usr: str | None = None,
 ) -> list[cx.Cursor]:
     """Recursively extract function/method declarations referenced inside an expression.
@@ -482,11 +479,10 @@ def _find_fn_refs_in_expr(
     INIT_LIST_EXPR).
 
     ``_skip_usr`` is the callee USR of the nearest enclosing CALL_EXPR whose
-    callee is a project function; its children (the callee's own DECL_REF_EXPR
+    callee is a known function; its children (the callee's own DECL_REF_EXPR
     wrappers) are skipped to avoid re-emitting direct calls as indirect edges.
 
-    Returns a list of resolved ``FUNCTION_DECL`` / ``CXX_METHOD`` cursors whose
-    definition location passes ``in_roots_fn`` and ``not_excluded_fn``.
+    Returns a list of resolved ``FUNCTION_DECL`` / ``CXX_METHOD`` cursors.
     """
     results: list[cx.Cursor] = []
 
@@ -494,23 +490,23 @@ def _find_fn_refs_in_expr(
     if cursor.kind in (cx.CursorKind.DECL_REF_EXPR, cx.CursorKind.MEMBER_REF_EXPR):
         ref = cursor.referenced
         if ref is not None and ref.kind in _INDIRECT_TARGET_KINDS:
-            # Skip if this is the callee of the enclosing project-function call
+            # Skip if this is the callee of the enclosing function call
             if _skip_usr and ref.get_usr() == _skip_usr:
                 return results
             loc = ref.location
-            if loc.file and in_roots_fn(loc.file.name) and not_excluded_fn(loc.file.name):
+            if loc.file:
                 results.append(ref)
         return results
 
     # Address-of operator (&) — peel and recurse into the operand
     if cursor.kind == cx.CursorKind.UNARY_OPERATOR:
         for child in cursor.get_children():
-            results.extend(_find_fn_refs_in_expr(child, in_roots_fn, not_excluded_fn, _skip_usr))
+            results.extend(_find_fn_refs_in_expr(child, _skip_usr))
         return results
 
     # Nested call expression — e.g. callback(&Class::method, this).
     # Always recurse into arguments to find function pointer targets.
-    # When the nested callee is itself a project function (not a callback
+    # When the nested callee is itself a known function (not a callback
     # wrapper like mbed::callback), propagate its USR as _skip_usr so its
     # own callee-reference children are not emitted as indirect edges.
     if cursor.kind == cx.CursorKind.CALL_EXPR:
@@ -520,15 +516,15 @@ def _find_fn_refs_in_expr(
             nested_callee_usr = nested_callee.get_usr()
             if nested_callee_usr:
                 loc = nested_callee.location
-                if loc.file and in_roots_fn(loc.file.name) and not_excluded_fn(loc.file.name):
+                if loc.file:
                     nested_skip = nested_callee_usr
         for child in cursor.get_children():
-            results.extend(_find_fn_refs_in_expr(child, in_roots_fn, not_excluded_fn, nested_skip))
+            results.extend(_find_fn_refs_in_expr(child, nested_skip))
         return results
 
     # Default: recurse into all children (handles implicit casts, parentheses, etc.)
     for child in cursor.get_children():
-        results.extend(_find_fn_refs_in_expr(child, in_roots_fn, not_excluded_fn, _skip_usr))
+        results.extend(_find_fn_refs_in_expr(child, _skip_usr))
 
     return results
 
@@ -626,23 +622,8 @@ def _extract_lhs_field(
     return _walk(expr_cursor)
 
 
-def extract(
-    unit: CompilationUnit,
-    source_roots: list[Path] | None = None,
-    exclude_paths: list[Path] | None = None,
-) -> Iterator[Symbol]:
-    """Parse unit and yield Symbol records for definitions in source_roots.
-
-    Thin backward-compatible wrapper over ``extract_all`` (symbols only).
-    """
-    symbols, _, _, _, _, _ = extract_all(unit, source_roots, exclude_paths, with_refs=False)
-    return iter(symbols)
-
-
 def extract_all(
     unit: CompilationUnit,
-    source_roots: list[Path] | None = None,
-    exclude_paths: list[Path] | None = None,
     with_refs: bool = False,
 ) -> tuple[list[Symbol], list[Reference], list[InheritanceRecord], list[IndirectCallSite], list[FnPointerAssignment], list[Macro]]:
     """Parse one translation unit and return extracted symbols, references, and inheritance.
@@ -651,12 +632,12 @@ def extract_all(
     ``CompilationUnit``.  It parses the file with libclang, walks the AST
     once, and produces five outputs simultaneously.
 
+    No filtering is done at the extraction level — all symbols and references
+    from all included files are extracted.  Filtering (project vs vendor)
+    happens downstream in ``store_symbols_for_unit`` via ``is_project``.
+
     Args:
         unit: The translation unit to parse (file path + compiler flags).
-        source_roots: Only emit symbols and references whose file is under
-            one of these directories.  Defaults to ``[unit.file.parent]``.
-        exclude_paths: Skip any file that falls under one of these paths
-            (applied after ``source_roots`` filtering).
         with_refs: When True, also extract call, reference, and member-access
             edges and embed a source-line token fallback pass for
             template-obscured expressions.  Inheritance is always extracted
@@ -664,12 +645,10 @@ def extract_all(
 
     Returns:
         A tuple ``(symbols, references, inheritance, indirect_call_sites, fp_assignments, macros)``:
-            symbols — all matching declarations and definitions.
-            references — when ``with_refs`` is True, project-internal
-                call/ref/member/indirect edges whose both ends are under
-                ``source_roots``; empty list otherwise.
-            inheritance — C++ base class edges for class/struct
-                definitions under ``source_roots``, always extracted.
+            symbols — all declarations and definitions from all included files.
+            references — when ``with_refs`` is True, all call/ref/member/indirect
+                edges; empty list otherwise.
+            inheritance — C++ base class edges for class/struct definitions.
             indirect_call_sites — when ``with_refs`` is True, call sites
                 where a function pointer field or variable is invoked
                 (``obj->onData(args)``, ``stored_callback(args)``);
@@ -680,14 +659,10 @@ def extract_all(
                 field/variable/parameter and the right-hand function;
                 enables Phase 3 linking of assignment sites to call sites.
             macros — ``#define`` macro definitions found in the
-                translation unit under ``source_roots``, always extracted.
+                translation unit, always extracted.
                 ``expanded_value`` is empty at this stage; populated later
                 by the ``clang -dM -E`` driver.
     """
-    if not source_roots:
-        source_roots = [unit.file.parent]
-    if exclude_paths is None:
-        exclude_paths = []
 
     import logging
     import time as _time
@@ -707,14 +682,6 @@ def extract_all(
         p = Path(path)
         return (cwd / p).resolve() if not p.is_absolute() else p.resolve()
 
-    def _in_roots(path: str) -> bool:
-        p = _resolve(path)
-        return any(p == r or p.is_relative_to(r) for r in source_roots)
-
-    def _not_excluded(path: str) -> bool:
-        p = _resolve(path)
-        return not any(p == e or p.is_relative_to(e) for e in exclude_paths)
-
     # --- Symbols ---
     symbols: list[Symbol] = []
     seen_usrs: dict[str, bool] = {}  # USR → is_definition (allows decl→def promotion)
@@ -731,10 +698,6 @@ def extract_all(
             continue
         loc = cursor.location
         if not loc.file:
-            continue
-        if not _in_roots(loc.file.name):
-            continue
-        if not _not_excluded(loc.file.name):
             continue
 
         is_def = cursor.is_definition()
@@ -857,9 +820,8 @@ def extract_all(
                     base_usr = base_ref.get_usr()
                     if not base_usr:
                         continue
-                    # Only record edges where the base class is in project sources
                     base_loc = base_ref.location
-                    if base_loc.file and (not _in_roots(base_loc.file.name) or not _not_excluded(base_loc.file.name)):
+                    if not base_loc.file:
                         continue
                     # Access specifier
                     access = _access_map.get(child.access_specifier, "public")
@@ -888,10 +850,6 @@ def extract_all(
             continue
         loc = child.location
         if not loc.file:
-            continue
-        if not _in_roots(loc.file.name):
-            continue
-        if not _not_excluded(loc.file.name):
             continue
 
         try:
@@ -1034,10 +992,10 @@ def extract_all(
         method: str = "assignment",
     ) -> None:
         loc = expr_cursor.location
-        if not loc.file or not _in_roots(loc.file.name) or not _not_excluded(loc.file.name):
+        if not loc.file:
             return
         for child in expr_cursor.get_children():
-            targets = _find_fn_refs_in_expr(child, _in_roots, _not_excluded, skip_usr)
+            targets = _find_fn_refs_in_expr(child, skip_usr)
             for target in targets:
                 target_usr = target.get_usr()
                 if not target_usr:
@@ -1045,7 +1003,7 @@ def extract_all(
                 if target_usr == skip_usr:
                     continue
                 target_loc = target.location
-                if target_loc.file and _in_roots(target_loc.file.name) and _not_excluded(target_loc.file.name):
+                if target_loc.file:
                     key = (target_usr, loc.file.name, loc.line, caller_usr, "indirect")
                     if key not in seen_ref:
                         seen_ref.add(key)
@@ -1116,13 +1074,10 @@ def extract_all(
         if ref_kind is not None:
             referenced = cursor.referenced
             loc = cursor.location
-            if referenced is not None and loc.file and _in_roots(loc.file.name) and _not_excluded(loc.file.name):
+            if referenced is not None and loc.file:
                 to_usr = referenced.get_usr()
-                # Only keep references whose target is itself project-indexable
-                # (its declaration lives under source_roots) — bounds index size
-                # by dropping refs into system/framework headers.
                 ref_loc = referenced.location
-                if to_usr and ref_loc.file and _in_roots(ref_loc.file.name) and _not_excluded(ref_loc.file.name):
+                if to_usr and ref_loc.file:
                     key = (to_usr, loc.file.name, loc.line, cur_fn, ref_kind)
                     if key not in seen_ref:
                         seen_ref.add(key)
@@ -1140,25 +1095,25 @@ def extract_all(
             # member variables like ``_zmodem_driver.send()`` where libclang
             # cannot resolve the callee through the field type), walk the
             # CALL_EXPR's children looking for a MEMBER_REF_EXPR whose
-            # referenced cursor points to a valid definition under source_roots.
+            # referenced cursor points to a valid definition with file location.
             if cursor.kind == cx.CursorKind.CALL_EXPR:
                 _callee_resolved = referenced is not None
-                _callee_in_roots = False
+                _callee_has_file = False
                 if _callee_resolved:
                     try:
                         _crl = referenced.location
-                        if _crl.file and _in_roots(_crl.file.name) and _not_excluded(_crl.file.name):
-                            _callee_in_roots = True
+                        if _crl.file:
+                            _callee_has_file = True
                     except Exception:
                         pass
-                if not _callee_in_roots:
+                if not _callee_has_file:
                     for child in cursor.get_children():
                         if child.kind == cx.CursorKind.MEMBER_REF_EXPR:
                             child_ref = child.referenced
                             if child_ref is not None and child_ref.kind in _CALLABLE_KINDS:
                                 child_usr = child_ref.get_usr()
                                 child_loc = child_ref.location
-                                if child_usr and child_loc.file and _in_roots(child_loc.file.name) and _not_excluded(child_loc.file.name):
+                                if child_usr and child_loc.file:
                                     key = (child_usr, loc.file.name, loc.line, cur_fn, "call")
                                     if key not in seen_ref:
                                         seen_ref.add(key)
@@ -1173,22 +1128,22 @@ def extract_all(
 
             # --- Constructor call fallback ---
             # When a CALL_EXPR's referenced cursor is None or its definition
-            # is not in project roots (can happen for constructor calls in
+            # has no file location (can happen for constructor calls in
             # member initializer lists like ``_member(args)``), walk the
             # CALL_EXPR's children for a DECL_REF_EXPR to a FIELD_DECL or
             # VAR_DECL whose type is RECORD.  Resolve the type's class
             # declaration and emit ``call`` references for each constructor.
             if cursor.kind == cx.CursorKind.CALL_EXPR:
                 _callee_resolved = referenced is not None
-                _callee_in_roots = False
+                _callee_has_file = False
                 if _callee_resolved:
                     try:
                         _crl = referenced.location
-                        if _crl.file and _in_roots(_crl.file.name) and _not_excluded(_crl.file.name):
-                            _callee_in_roots = True
+                        if _crl.file:
+                            _callee_has_file = True
                     except Exception:
                         pass
-                if not _callee_in_roots:
+                if not _callee_has_file:
                     for child in cursor.get_children():
                         if child.kind == cx.CursorKind.DECL_REF_EXPR:
                             child_ref = child.referenced
@@ -1210,7 +1165,7 @@ def extract_all(
                                             if not ctor_usr:
                                                 continue
                                             ctor_loc = ctor.location
-                                            if not ctor_loc.file or not _in_roots(ctor_loc.file.name) or not _not_excluded(ctor_loc.file.name):
+                                            if not ctor_loc.file:
                                                 continue
                                             key = (ctor_usr, loc.file.name, loc.line, cur_fn, "call")
                                             if key not in seen_ref:
@@ -1241,7 +1196,7 @@ def extract_all(
         #           obj->callbacks[idx](args)   (ArraySubscriptExpr over member)
         if cursor.kind == cx.CursorKind.CALL_EXPR:
             loc = cursor.location
-            if loc.file and _in_roots(loc.file.name) and _not_excluded(loc.file.name):
+            if loc.file:
                 callee = cursor.referenced
                 if (callee is not None
                         and callee.kind in (cx.CursorKind.FIELD_DECL, cx.CursorKind.VAR_DECL, cx.CursorKind.PARM_DECL)
@@ -1300,7 +1255,7 @@ def extract_all(
                     callee_params = []
                 callee_args = list(cursor.get_arguments())
                 for i, arg in enumerate(callee_args):
-                    targets = _find_fn_refs_in_expr(arg, _in_roots, _not_excluded, direct_callee_usr)
+                    targets = _find_fn_refs_in_expr(arg, direct_callee_usr)
                     if targets and i < len(callee_params):
                         param = callee_params[i]
                         if _is_fn_ptr_type(param.type):
@@ -1365,7 +1320,7 @@ def extract_all(
         # source paths.
         if cursor.kind in (cx.CursorKind.VAR_DECL, cx.CursorKind.FIELD_DECL):
             loc = cursor.location
-            if loc.file and _in_roots(loc.file.name) and _not_excluded(loc.file.name):
+            if loc.file:
                 try:
                     canon = cursor.type.get_canonical()
                 except Exception:
@@ -1383,7 +1338,7 @@ def extract_all(
                             if not ctor_usr:
                                 continue
                             ctor_loc = child.location
-                            if not ctor_loc.file or not _in_roots(ctor_loc.file.name) or not _not_excluded(ctor_loc.file.name):
+                            if not ctor_loc.file:
                                 continue
                             key = (ctor_usr, loc.file.name, loc.line, cur_fn, "implicit_construct")
                             if key not in seen_ref:
@@ -1408,7 +1363,7 @@ def extract_all(
         # prefix).  We match by suffix against the full qualified-name map.
         if cursor.kind == cx.CursorKind.UNEXPOSED_EXPR:
             loc = cursor.location
-            if loc.file and _in_roots(loc.file.name) and _not_excluded(loc.file.name):
+            if loc.file:
                 tokens = list(cursor.get_tokens())
                 for i, tok in enumerate(tokens):
                     if tok.spelling == "&" and i + 3 < len(tokens):
@@ -1452,7 +1407,7 @@ def extract_all(
         # name against the symbol table built from this translation unit.
         if cursor.kind == cx.CursorKind.CALL_EXPR:
             loc = cursor.location
-            if loc.file and _in_roots(loc.file.name) and _not_excluded(loc.file.name):
+            if loc.file:
                 tokens = list(cursor.get_tokens())
                 # Pattern 1: obj.method( → IDENTIFIER DOT IDENTIFIER LPAREN
                 for i, tok in enumerate(tokens):

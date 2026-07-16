@@ -105,13 +105,10 @@ def _is_stale(cfg, compile_commands_path: str) -> bool:
 def _detect_build_system(root: Path) -> str:
     """Detect the build system in use from well-known project files.
 
-    Returns one of ``"mbed-os"``, ``"zephyr"``, ``"platformio"``, or ``"unknown"``.
+    Delegates to :func:`fw_context_mcp.indexer.build.detect_build_system`
+    and returns its result or ``"unknown"`` when nothing is recognised.
     """
-    if (root / "mbed-os").is_dir() or (root / "mbed_app.json").exists():
-        return "mbed-os"
-    if (root / "west.yml").exists() or (root / "prj.conf").exists():
-        return "zephyr"
-    if (root / "platformio.ini").exists():
-        return "platformio"
-    return "unknown"
+    from ...indexer.build import detect_build_system
+
+    return detect_build_system(root) or "unknown"
 

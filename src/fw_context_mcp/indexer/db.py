@@ -201,30 +201,6 @@ def split_tokens(name: str, qualified_name: str = "") -> str:
     return " ".join(tokens)
 
 
-def _backfill_is_project(conn: sqlite3.Connection, db_path: Path) -> None:
-    """Backfill ``symbols.is_project`` for existing indexes.
-
-    Detects project source directories from the project-root directory
-    structure and marks symbols whose ``file_path`` falls underneath.
-
-    This is a best-effort migration — any missed symbols are corrected
-    on the next ``fw-context index`` run which sets is_project during
-    normal indexing.
-    """
-    project_root = db_path.parent.parent
-    _COMMON_SRC = ["src", "lib", "app", "drivers", "include", "modules"]
-    patterns: list[str] = []
-    params: list[str] = []
-    for name in _COMMON_SRC:
-        if (project_root / name).is_dir():
-            patterns.append("file_path LIKE ?")
-            params.append(f"{name}/%")
-    if not patterns:
-        return
-    clause = " OR ".join(patterns)
-    conn.execute(f"UPDATE symbols SET is_project = 1 WHERE {clause}", params)
-
-
 def _parse_expected_columns(schema_sql: str, migration_statements: list[str]) -> dict[str, set[str]]:
     """Extract expected table→columns from CREATE TABLE and ALTER TABLE statements.
 
@@ -337,6 +313,7 @@ _MIGRATION_ADD_COLUMNS = [
     "ALTER TABLE build_configs ADD COLUMN description TEXT NOT NULL DEFAULT ''",
     "ALTER TABLE build_configs ADD COLUMN first_indexed_at TEXT NOT NULL DEFAULT ''",
     "ALTER TABLE build_configs ADD COLUMN analyze_vendor INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE files ADD COLUMN is_project INTEGER NOT NULL DEFAULT 0",
 ]
 
 # Pre-computed {table: {columns}} from _MIGRATION_ADD_COLUMNS.
@@ -373,6 +350,7 @@ CREATE TABLE IF NOT EXISTS files (
     path         TEXT NOT NULL,
     language     TEXT NOT NULL,     -- 'c' | 'cpp'
     generated    INTEGER NOT NULL DEFAULT 0,
+    is_project   INTEGER NOT NULL DEFAULT 0,
     mtime        REAL    NOT NULL DEFAULT 0,
     UNIQUE(config_hash, path)
 );
@@ -398,6 +376,7 @@ CREATE TABLE IF NOT EXISTS symbols (
     parent_usr     TEXT    NOT NULL DEFAULT '',
     is_template    INTEGER NOT NULL DEFAULT 0,
     template_usr   TEXT    NOT NULL DEFAULT '',
+    is_project     INTEGER NOT NULL DEFAULT 0,
     pagerank       REAL    NOT NULL DEFAULT 0.0,
     source         TEXT    NOT NULL DEFAULT '',
     UNIQUE(config_hash, usr)
@@ -411,6 +390,7 @@ CREATE INDEX IF NOT EXISTS idx_symbols_parent     ON symbols(config_hash, parent
 CREATE INDEX IF NOT EXISTS idx_symbols_template  ON symbols(config_hash, template_usr);
 CREATE INDEX IF NOT EXISTS idx_symbols_filepath  ON symbols(config_hash, file_path);
 CREATE INDEX IF NOT EXISTS idx_files_config        ON files(config_hash);
+CREATE INDEX IF NOT EXISTS idx_files_is_project    ON files(is_project);
 
 CREATE VIRTUAL TABLE IF NOT EXISTS symbols_fts USING fts5(
     name,
@@ -789,13 +769,6 @@ def open_db(path: Path, *, skip_integrity_check: bool = False) -> sqlite3.Connec
             # Simple add-column migrations — idempotent, delegated to
             # _ensure_migrated_columns which runs in a single transaction.
             _ensure_migrated_columns(conn)
-
-            # Migration: is_project backfill — column added by
-            # _MIGRATION_ADD_COLUMNS loop.  Backfill for existing indexes
-            # where all rows were inserted with DEFAULT 0.
-            if conn.execute("SELECT COUNT(*) FROM symbols WHERE is_project = 0").fetchone()[0] > 0:
-                _backfill_is_project(conn, path)
-                conn.commit()
 
             # Migration: file_path backfill — column added by
             # _MIGRATION_ADD_COLUMNS loop.  Backfill empties left over from
@@ -1720,7 +1693,9 @@ def find_indirect_call_sites(
         """SELECT ics.*,
                   caller.name            AS caller_name,
                   caller.qualified_name  AS caller_qname,
-                  caller.kind            AS caller_kind
+                  caller.kind            AS caller_kind,
+                  caller.file_path       AS caller_file,
+                  caller.is_project      AS caller_is_project
            FROM indirect_call_sites ics
            LEFT JOIN symbols caller
              ON caller.config_hash = ics.config_hash AND caller.usr = ics.from_usr
@@ -1808,7 +1783,9 @@ def find_indirect_targets(
                   ics.from_file AS call_file, ics.from_line AS call_line,
                   ics.expr_text AS call_expr_text,
                   rhs_sym.qualified_name AS rhs_qname,
-                  caller_sym.name AS assign_caller
+                  caller_sym.name AS assign_caller,
+                  caller_sym.file_path AS caller_file,
+                  caller_sym.is_project AS caller_is_project
            FROM fp_assignments fpa
            LEFT JOIN indirect_call_sites ics
              ON ics.target_usr = fpa.lhs_usr
@@ -2649,6 +2626,7 @@ def find_dead_code(
     config_hash: str,
     limit: int = 100,
     exclude_paths: list[str] | None = None,
+    project_only: bool = False,
 ) -> list[dict]:
     """Find functions/methods that are defined but never called.
 
@@ -2670,6 +2648,7 @@ def find_dead_code(
     *exclude_paths* is a list of LIKE patterns for file paths to exclude
     (e.g. ``["mbed-os/%", "cmsis/%"]``).  When omitted, no paths are excluded.
     """
+    project_only_clause = "AND s.is_project = 1" if project_only else ""
     if exclude_paths:
         path_clause = "AND " + " AND ".join("s.file_path NOT LIKE ?" for _ in exclude_paths)
         exclude_params = list(exclude_paths)
@@ -2690,6 +2669,7 @@ def find_dead_code(
                  SELECT DISTINCT to_usr FROM refs WHERE config_hash = ?
              )
              {path_clause}
+             {project_only_clause}
            ORDER BY s.kind, s.name
            LIMIT ?""",
         dead_params,
@@ -2759,6 +2739,7 @@ def find_dead_code(
                      SELECT to_usr FROM refs WHERE config_hash = ? AND ref_kind = 'call'
                  )
                  {path_clause}
+                 {project_only_clause}
                ORDER BY s.kind, s.name
                LIMIT ?""",
             possibly_params,
@@ -2788,6 +2769,7 @@ def find_hotspots(
     config_hash: str,
     limit: int = 20,
     exclude_paths: list[str] | None = None,
+    project_only: bool = False,
 ) -> list[dict]:
     """Find the most-called functions (hotspots) ranked by caller count.
 
@@ -2801,7 +2783,10 @@ def find_hotspots(
 
     When *exclude_paths* is given, symbols whose ``file_path`` matches any
     of the LIKE patterns are excluded.
+    When *project_only* is True, only project symbols (``is_project = 1``)
+    are returned.
     """
+    proj_clause = "AND s.is_project = 1" if project_only else ""
     # Try cache first
     cached = conn.execute("SELECT COUNT(*) FROM hotspot_cache WHERE config_hash = ?", (config_hash,)).fetchone()
     if cached and cached[0] > 0:
@@ -2819,6 +2804,7 @@ def find_hotspots(
                JOIN symbols s ON s.id = h.symbol_id AND s.config_hash = h.config_hash
                WHERE h.config_hash = ?
                  {path_clauses}
+                 {proj_clause}
                ORDER BY h.caller_count DESC
                LIMIT ?""",
             params,
@@ -2843,6 +2829,7 @@ def find_hotspots(
              AND s.is_definition = 1
              AND r.ref_kind IN ('call', 'indirect')
              {path_clauses}
+             {proj_clause}
            GROUP BY s.usr
            ORDER BY caller_count DESC
            LIMIT ?""",
@@ -2919,7 +2906,8 @@ def find_refs(
                         caller.name           AS caller_name,
                         caller.qualified_name AS caller_qname,
                         caller.kind           AS caller_kind,
-                        caller.file_path      AS caller_file
+                        caller.file_path      AS caller_file,
+                        caller.is_project     AS caller_is_project
                  FROM refs r
                  LEFT JOIN symbols caller
                    ON caller.config_hash = r.config_hash AND caller.usr = r.from_usr
@@ -3103,10 +3091,7 @@ def search_symbols(
     else:
         kind_filter = ""
     if project_only:
-        project_filter = (
-            "AND (s.file_path LIKE 'src/%' OR s.file_path LIKE 'lib/%'"
-            " OR s.file_path LIKE 'app/%' OR s.file_path LIKE 'include/%')"
-        )
+        project_filter = "AND s.is_project = 1"
     else:
         project_filter = ""
     params: list = [expanded, config_hash]

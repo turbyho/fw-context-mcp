@@ -219,7 +219,7 @@ class TestCheckTuStaleness:
             "source_hash": "old_hash_that_differs",
             "headers": [],
         }
-        stale, new_hash = check_tu_staleness(entry, tmp_path, [tmp_path / "src"])
+        stale, new_hash = check_tu_staleness(entry, tmp_path, [])
         assert stale is True
         assert new_hash is not None
         assert len(new_hash) == 64
@@ -240,7 +240,7 @@ class TestCheckTuStaleness:
             "source_hash": source_hash,
             "headers": [],
         }
-        stale, new_hash = check_tu_staleness(entry, tmp_path, [tmp_path / "src"])
+        stale, new_hash = check_tu_staleness(entry, tmp_path, [])
         assert stale is False
         assert new_hash is None
 
@@ -267,7 +267,7 @@ class TestCheckTuStaleness:
                 {"path": "src/config.h", "hash": old_header_hash, "generated": False},
             ],
         }
-        stale, _ = check_tu_staleness(entry, tmp_path, [tmp_path / "src"])
+        stale, _ = check_tu_staleness(entry, tmp_path, [])
         assert stale is True  # header hash differs
 
     def test_generated_header_skipped(self, tmp_path: Path):
@@ -287,7 +287,7 @@ class TestCheckTuStaleness:
                 {"path": "BUILD/mbed_config.h", "hash": "nonexistent_hash", "generated": True},
             ],
         }
-        stale, _ = check_tu_staleness(entry, tmp_path, [tmp_path / "src"])
+        stale, _ = check_tu_staleness(entry, tmp_path, [])
         assert stale is False  # generated header is skipped
 
     def test_sdk_header_trusted(self, tmp_path: Path):
@@ -311,8 +311,8 @@ class TestCheckTuStaleness:
                 {"path": "mbed-os/mbed.h", "hash": "nonexistent_hash", "generated": False},
             ],
         }
-        # source_roots only includes src/ — mbed-os/ is SDK, should be trusted
-        stale, _ = check_tu_staleness(entry, tmp_path, [tmp_path / "src"])
+        # mbed-os/% is a vendor pattern — SDK header is trusted from manifest
+        stale, _ = check_tu_staleness(entry, tmp_path, ["mbed-os/%"])
         assert stale is False  # SDK header is trusted from manifest
 
 

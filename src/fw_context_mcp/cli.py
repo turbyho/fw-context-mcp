@@ -247,8 +247,8 @@ def cmd_index(args: argparse.Namespace) -> int:
                         )
                     return 1
 
-    source_roots = [Path(r) for r in args.source_roots] if args.source_roots else cfg.source_root_paths(project_root)
-    exclude_paths = cfg.exclude_root_paths(project_root)
+    vendor_paths = list(getattr(args, "vendor_paths", None) or cfg.index.vendor_paths)
+    project_paths = list(getattr(args, "project_paths", None) or cfg.index.project_paths)
 
     # Override force flag from CLI
     cs_config = cfg.cache_server
@@ -297,8 +297,8 @@ def cmd_index(args: argparse.Namespace) -> int:
         config_hash = run(
             compile_commands=compile_commands,
             db_path=db_path,
-            source_roots=source_roots,
-            exclude_paths=exclude_paths,
+            vendor_paths=vendor_paths,
+            project_paths=project_paths,
             project_name=args.name or cfg.project.name,
             index_refs=False if args.no_refs else cfg.index.index_refs,
             index_embeddings=(
@@ -1088,7 +1088,7 @@ def cmd_init(args: argparse.Namespace) -> int:
             proj_config = _ensure_project_config(project_root)
             local_config = _ensure_project_local_config(project_root)
             print(
-                f"\n[ok] {proj_config}: shared project config ready — edit source_roots, excludes, etc. (commit to git)"
+                f"\n[ok] {proj_config}: shared project config ready — edit vendor_paths, project_paths, etc. (commit to git)"
             )
             print(f"[ok] {local_config}: local developer config ready — edit ollama_url, model, etc. (gitignore)")
             # Check config files for missing template keys
@@ -1653,21 +1653,11 @@ def cmd_analyze(args: argparse.Namespace) -> int:
     finally:
         conn.close()
 
-    # Compute SDK exclude patterns for this project.
-    # When analyze_vendor is True, analyze everything.
-    from .mcp.shared.filtering import compute_exclude_like
-
     # Resolve analyze_vendor: CLI flag takes precedence, config falls back.
     analyze_vendor = (
         False
         if getattr(args, "no_analyze_vendor", False)
         else getattr(args, "analyze_vendor", False) or cfg.llm.analyze_vendor
-    )
-
-    exclude_like = compute_exclude_like(
-        project_root,
-        analyze_vendor=analyze_vendor,
-        exclude_paths=cfg.exclude_root_paths(project_root),
     )
 
     # Re-open connection for the analysis (uses its own transactions)
@@ -1693,7 +1683,7 @@ def cmd_analyze(args: argparse.Namespace) -> int:
             config_hash,
             cfg.llm,
             db_path.parent,
-            exclude_like=exclude_like,
+            project_only=not analyze_vendor,
             cache_client=cc,
             retry_unparseable=True,
         )
@@ -2604,7 +2594,10 @@ def main() -> None:
         action="store_true",
         help="With --build: skip clean, do incremental build (may produce incomplete compile_commands.json)",
     )
-    p_index.add_argument("--source-roots", nargs="+", metavar="DIR")
+    p_index.add_argument("--vendor-paths", nargs="*", default=None,
+                         help="Additional vendor/SDK directories (additive to auto-detection)")
+    p_index.add_argument("--project-paths", nargs="*", default=None,
+                         help="Manual project directories (overrides auto-detection)")
     p_index.add_argument("--name", metavar="NAME", help="Project name override")
     p_index.add_argument("--no-refs", action="store_true", help="Skip cross-reference indexing (on by default)")
     p_index.add_argument("--no-embeddings", action="store_true", dest="no_embeddings", help="Skip embedding generation")

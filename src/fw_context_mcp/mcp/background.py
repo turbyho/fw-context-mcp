@@ -282,30 +282,20 @@ def _fast_staleness_check(root: Path) -> tuple[bool, list[str]]:
                         (config_hash,),
                     ).fetchone()[0]
                 else:
-                    from .shared.filtering import compute_exclude_like
-
-                    exclude_like = compute_exclude_like(
-                        root,
-                        analyze_vendor=False,
-                        exclude_paths=proj_cfg.index.exclude_paths,
-                    )
-                    exclude_clauses = " AND ".join(
-                        ["s.file_path NOT LIKE ?"] * len(exclude_like)
-                    )
-                    exclude_clause = (" AND " + exclude_clauses) if exclude_clauses else ""
-                    query = f"""SELECT COUNT(*)
+                    # Use is_project column directly for unanalyzed symbol count
+                    unanalyzed = conn.execute(
+                        """SELECT COUNT(*)
                            FROM symbols s
                            WHERE s.config_hash = ?
                              AND s.is_definition = 1
+                             AND s.is_project = 1
                              AND s.kind IN ('function', 'method',
                                             'constructor', 'destructor',
                                             'class', 'struct')
-                             {exclude_clause}
                              AND s.name NOT LIKE '%(anonymous%'
                              AND s.name NOT LIKE '%(unnamed%'
-                             AND s.id NOT IN (SELECT symbol_id FROM llm_analysis)"""
-                    unanalyzed = conn.execute(
-                        query, (config_hash, *exclude_like),
+                             AND s.id NOT IN (SELECT symbol_id FROM llm_analysis)""",
+                        (config_hash,),
                     ).fetchone()[0]
                 if unanalyzed > 0:
                     reasons.append(f"{unanalyzed} unanalyzed symbols")

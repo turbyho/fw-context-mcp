@@ -214,7 +214,7 @@ _SOURCE_EXTS_WATCH = {".c", ".cpp", ".h", ".hpp"}
 # ── Shared helpers for SDK path filtering ──────────────────────────────────
 
 
-# _path_matches, _build_sdk_excludes, _merge_excludes — re-exported from .shared.filtering
+# _path_matches, _build_sdk_excludes, _normalize_path_pattern — re-exported from .shared.filtering
 
 
 # ── Inheritance tool ──────────────────────────────────────────────────────

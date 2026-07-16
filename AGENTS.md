@@ -71,3 +71,10 @@ src/fw_context_mcp/
 - Python explicitly via `~/.pyenv/versions/3.11.8/bin/python3` for build/twine
 - Push to both remotes: `origin` (git.montyho.com) and `github`
 - No emoji, no AI attribution footer
+
+<!-- lean-ctx -->
+## lean-ctx
+
+lean-ctx is active — the MCP tools replace native equivalents.
+Full rules: LEAN-CTX.md (open on demand — do not auto-load).
+<!-- /lean-ctx -->

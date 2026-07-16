@@ -246,8 +246,8 @@ def store_symbols_for_unit(
     unit,
     config_hash: str,
     project_root: Path,
-    source_roots: list[Path],
-    exclude_paths: list[Path] | None = None,
+    vendor_patterns: list[str] | None = None,
+    project_patterns: list[str] | None = None,
     index_refs: bool = False,
     pre_parsed=None,
     existing_files: dict[str, tuple[int, float]] | None = None,
@@ -260,14 +260,21 @@ def store_symbols_for_unit(
     - Running libclang ``extract_all`` (unless *pre_parsed* is provided)
     - Managing file_id cache and mtimes
     - Deleting old symbols for the TU
-    - Building and inserting symbol rows
+    - Building and inserting symbol rows with ``is_project`` computed from
+      *vendor_patterns* and *project_patterns*
     - Building and inserting reference rows
+    - Updating ``files.is_project`` for all files touched by this TU
 
     Returns ``(symbols_added, refs_added, headers)`` where *headers* is a
     list of ``{path, hash, generated}`` dicts for included header files,
     collected during the ifdef-filtered content pass.
 
     *conn* must be open; the caller is responsible for transactions.
+
+    *vendor_patterns* and *project_patterns* are LIKE patterns (with ``%``
+    wildcard) used to compute ``is_project`` for each symbol and file.
+    Patterns must already be normalized (``third_party`` → ``third_party/%``).
+    ``project_patterns`` take priority over ``vendor_patterns``.
 
     *pre_parsed* is an optional tuple ``(syms, refs, inheritance,
     indirect_call_sites, fp_assignments)`` from a prior ``extract_all``
@@ -282,8 +289,10 @@ def store_symbols_for_unit(
     """
     from fw_context_mcp.indexer.symbols import extract_all
 
-    if exclude_paths is None:
-        exclude_paths = []
+    if vendor_patterns is None:
+        vendor_patterns = []
+    if project_patterns is None:
+        project_patterns = []
 
     file_path = str(unit.file.resolve())
     normalized_tu_path = _normalize_file_path(file_path, project_root)
@@ -303,8 +312,6 @@ def store_symbols_for_unit(
         try:
             syms, refs, inheritance, indirect_call_sites, fp_assignments, macros = extract_all(
                 unit,
-                source_roots=source_roots,
-                exclude_paths=exclude_paths,
                 with_refs=index_refs,
             )
         except sqlite3.Error:
@@ -415,9 +422,10 @@ def store_symbols_for_unit(
     file_id_cache[normalized_tu_path] = tu_file_id
 
     if syms:
-        # Pre-compute source_roots as strings for is_project checks
-        source_root_strs = [str(r) for r in source_roots] if source_roots else []
+        from .sdk_detect import _path_matches
+
         rows = []
+        file_proj: dict[int, int] = {}  # file_id → max(is_project) for files.is_project update
         for s in syms:
             sym_file = s.file
             normalized_sym_file = _normalize_file_path(sym_file, project_root)
@@ -435,21 +443,38 @@ def store_symbols_for_unit(
                     mtime=sym_mtime,
                 )
             rel_path = normalized_sym_file
-            # Determine is_project using the same logic as _is_project_local
-            is_proj = 0
-            if source_root_strs:
-                rp = rel_path.rstrip("/")
-                for root_s in source_root_strs:
-                    root_n = root_s.rstrip("/")
-                    if rp.startswith(root_n + "/") or rp == root_n:
-                        is_proj = 1
-                        break
+            # Determine is_project — priority (first wins):
+            #   1. project_patterns → 1 (even for paths outside project root)
+            #   2. outside project_root → 0
+            #   3. vendor_patterns → 0
+            #   4. otherwise → 1
+            try:
+                resolved_sym = Path(sym_file).resolve()
+                rel = str(resolved_sym.relative_to(project_root))
+                if any(_path_matches(rel, p) for p in project_patterns):
+                    is_proj = 1
+                elif any(_path_matches(rel, p) for p in vendor_patterns):
+                    is_proj = 0
+                else:
+                    is_proj = 1
+            except ValueError:
+                # Outside project root — always vendor, unless project_paths
+                # explicitly marks the path as project.
+                abs_path = str(resolved_sym)
+                if any(_path_matches(abs_path, p) for p in project_patterns):
+                    is_proj = 1
+                else:
+                    is_proj = 0
             # Read source body for definitions (for FTS5 search_bodies).
             body = ""
             if s.is_definition and s.end_line > s.line:
                 file_lines = _cached_lines(s.file)
                 if file_lines is not None:
                     body = _read_body(file_lines, s.line, s.end_line)
+            # Aggregate files.is_project: use max so shared headers with both
+            # project and vendor symbols get is_project=1 (correct).
+            fid = file_id_cache[normalized_sym_file]
+            file_proj[fid] = max(file_proj.get(fid, 0), is_proj)
             rows.append(
                 (
                     config_hash,
@@ -479,6 +504,14 @@ def store_symbols_for_unit(
             )
         insert_symbols_batch(conn, rows)
         syms_added = len(rows)
+
+        # Update files.is_project with max(is_project) per file.
+        # Guard with AND is_project < ? so later TUs can only raise (0→1), never lower.
+        for fid, ip in file_proj.items():
+            conn.execute(
+                "UPDATE files SET is_project = ? WHERE id = ? AND is_project < ?",
+                (ip, fid, ip),
+            )
 
         # ── Phase 3: Restore LLM analysis — per-build first, then global cache ──
         restored = 0

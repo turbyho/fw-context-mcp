@@ -107,10 +107,6 @@ class TestDetectBuildSystem:
         (tmp_path / "west.yml").write_text("manifest:")
         assert _detect_build_system(tmp_path) == "zephyr"
 
-    def test_zephyr_prj_conf(self, tmp_path: Path):
-        (tmp_path / "prj.conf").write_text("")
-        assert _detect_build_system(tmp_path) == "zephyr"
-
     def test_platformio_ini(self, tmp_path: Path):
         (tmp_path / "platformio.ini").write_text("[env:board]")
         assert _detect_build_system(tmp_path) == "platformio"

@@ -80,6 +80,26 @@ class TestOpenDb:
         assert "file_path" in fts_cols
         conn.close()
 
+    def test_is_project_columns(self, tmpdir):
+        """is_project column exists in both files and symbols tables."""
+        db_path = tmpdir / "test.db"
+        conn = open_db(db_path)
+        files_cols = [r[1] for r in conn.execute("PRAGMA table_info(files)").fetchall()]
+        sym_cols = [r[1] for r in conn.execute("PRAGMA table_info(symbols)").fetchall()]
+        assert "is_project" in files_cols, "files.is_project column missing"
+        assert "is_project" in sym_cols, "symbols.is_project column missing"
+        # DEFAULT values
+        fi = conn.execute("PRAGMA table_info(files)").fetchall()
+        si = conn.execute("PRAGMA table_info(symbols)").fetchall()
+        files_is_proj = [r for r in fi if r[1] == "is_project"][0]
+        syms_is_proj = [r for r in si if r[1] == "is_project"][0]
+        # dflt_value from PRAGMA is returned as string (e.g. "0")
+        assert files_is_proj[4] in (0, "0"), f"files.is_project default: {files_is_proj[4]}"
+        assert syms_is_proj[4] in (0, "0"), f"symbols.is_project default: {syms_is_proj[4]}"
+        assert files_is_proj[3] == 1, "files.is_project should be NOT NULL"
+        assert syms_is_proj[3] == 1, "symbols.is_project should be NOT NULL"
+        conn.close()
+
 
 class TestTransaction:
     def test_commit(self, temp_db):
@@ -381,6 +401,53 @@ class TestSearchSymbols:
         results = search_symbols(populated_db, "func*", "hash-deadbeef", limit=3)
         assert len(results) == 3
 
+    def test_project_only_excludes_vendor_symbols(self, populated_db):
+        """search_symbols with project_only=True returns only is_project=1 symbols."""
+        file_id = upsert_file(populated_db, "hash-deadbeef", "/tmp/proj.cpp", "cpp")
+        # Vendor symbol (is_project=0 in column 20)
+        insert_symbols_batch(populated_db, [
+            ("hash-deadbeef", file_id, "mbed-os/drivers/Driver.cpp",
+             split_tokens("mbed_driver_init", "mbed::driver_init"),
+             "usr-pto-1", "mbed_driver_init", "mbed::driver_init", "function",
+             1, 1, 0, 1, "void driver_init()", "", None, 0, 0, "", 0, "", 0, 0.0, ""),
+            # Project symbol (is_project=1 in column 20)
+            ("hash-deadbeef", file_id, "src/my_driver.cpp",
+             split_tokens("my_driver_init", "my_driver_init"),
+             "usr-pto-2", "my_driver_init", "my_driver_init", "function",
+             1, 1, 0, 1, "void my_driver_init()", "", None, 0, 0, "", 0, "", 1, 0.0, ""),
+        ])
+
+        # Without project_only — both symbols
+        all_results = search_symbols(populated_db, "driver_init", "hash-deadbeef")
+        assert len(all_results) == 2
+        names = {r["name"] for r in all_results}
+        assert names == {"mbed_driver_init", "my_driver_init"}
+
+        # With project_only — only the project symbol
+        proj_results = search_symbols(populated_db, "driver_init", "hash-deadbeef", project_only=True)
+        assert len(proj_results) == 1
+        assert proj_results[0]["name"] == "my_driver_init"
+        assert proj_results[0]["file_path"] == "src/my_driver.cpp"
+
+    def test_project_only_no_results_when_all_vendor(self, populated_db):
+        """search_symbols with project_only returns empty when all matches are vendor."""
+        file_id = upsert_file(populated_db, "hash-deadbeef", "/tmp/vendor_only.cpp", "cpp")
+        # Only vendor symbols (is_project=0)
+        insert_symbols_batch(populated_db, [
+            ("hash-deadbeef", file_id, "mbed-os/drivers/I2C.cpp",
+             split_tokens("i2c_read", "mbed::I2C::read"),
+             "usr-pto-3", "i2c_read", "mbed::I2C::read", "method",
+             1, 1, 0, 1, "int read(int address, char* data, int length)", "", None, 0, 0, "", 0, "", 0, 0.0, ""),
+        ])
+
+        # Without project_only — found
+        all_results = search_symbols(populated_db, "i2c_read", "hash-deadbeef")
+        assert len(all_results) == 1
+
+        # With project_only — no results
+        proj_results = search_symbols(populated_db, "i2c_read", "hash-deadbeef", project_only=True)
+        assert proj_results == []
+
 
 class TestExpandQuery:
     """Tests for _expand_query — wildcard expansion with FTS5 syntax awareness."""
@@ -558,6 +625,37 @@ class TestRefs:
         rows = find_refs(populated_db, "hash-deadbeef", "DRIVER")
         assert len(rows) == 1
         assert rows[0]["caller_name"] == "main"
+
+    def test_find_refs_caller_is_project(self, populated_db):
+        """find_refs returns caller_is_project via LEFT JOIN on symbols.from_usr."""
+        # Insert callee (vendor, is_project=0)
+        callee_fid = upsert_file(populated_db, "hash-deadbeef", "/tmp/vendor_drv.cpp", "cpp")
+        insert_symbols_batch(populated_db, [
+            ("hash-deadbeef", callee_fid, "mbed-os/drivers/I2C.cpp",
+             split_tokens("i2c_write", "mbed::I2C::write"),
+             "U_callee_i2c", "i2c_write", "mbed::I2C::write", "method",
+             10, 1, 0, 1, "int write(int address, const char* data, int length)",
+             "", None, 0, 0, "", 0, "", 0, 0.0, ""),
+        ])
+        # Insert caller (project, is_project=1)
+        caller_fid = upsert_file(populated_db, "hash-deadbeef", "/tmp/app.cpp", "cpp")
+        insert_symbols_batch(populated_db, [
+            ("hash-deadbeef", caller_fid, "src/app.cpp",
+             split_tokens("app_run", "App::app_run"),
+             "U_caller_app", "app_run", "App::app_run", "method",
+             50, 1, 0, 1, "void app_run()", "", None, 0, 0, "", 0, "", 1, 0.0, ""),
+        ])
+        insert_refs_batch(populated_db, [
+            ("hash-deadbeef", "U_callee_i2c", "src/app.cpp", 55, "U_caller_app", "call"),
+        ])
+
+        rows = find_refs(populated_db, "hash-deadbeef", "i2c_write", ref_kind="call")
+        assert len(rows) == 1
+        assert rows[0]["caller_name"] == "app_run"
+        assert "caller_is_project" in rows[0].keys(), "caller_is_project not in find_refs result"
+        assert rows[0]["caller_is_project"] == 1, (
+            f"Expected caller_is_project=1, got {rows[0]['caller_is_project']}"
+        )
 
 
 class TestEnumValue:
@@ -1372,6 +1470,138 @@ class TestSearchBodies:
         assert proj_rows[0][0] == "_rx_handler"
 
 
+class TestFilesIsProject:
+    """Tests for automatic files.is_project setting via store_symbols_for_unit."""
+
+    @pytest.mark.libclang
+    def test_files_is_project_set_during_indexing(self, tmp_path):
+        """store_symbols_for_unit sets files.is_project based on vendor_patterns."""
+        from fw_context_mcp.indexer.compile_commands import CompilationUnit
+        from fw_context_mcp.indexer.db import open_db, upsert_build_config, upsert_project
+        from fw_context_mcp.indexer.ops import store_symbols_for_unit
+        from fw_context_mcp.indexer.symbols import extract_all
+
+        src = tmp_path / "src"
+        src.mkdir()
+        vendor = tmp_path / "mbed-os" / "drivers"
+        vendor.mkdir(parents=True)
+
+        # Project file
+        proj_file = src / "app.cpp"
+        proj_file.write_text("void app_init(void) {}", encoding="utf-8")
+        # Vendor file (inside mbed-os/)
+        vendor_file = vendor / "Tick.cpp"
+        vendor_file.write_text("void tick_init(void) {}", encoding="utf-8")
+
+        db_path = tmp_path / "test.db"
+        conn = open_db(db_path)
+        upsert_project(conn, "proj-001", "test-project", str(tmp_path))
+        upsert_build_config(conn, "hash-proj1", "proj-001", str(tmp_path / "compile_commands.json"))
+        config_hash = "hash-proj1"
+
+        vendor_patterns = ["mbed-os/%"]
+        project_patterns: list[str] = []
+
+        # Index project file
+        unit_proj = CompilationUnit(
+            file=proj_file,
+            directory=src,
+            language="cpp",
+            clang_args=["-std=c++17"],
+        )
+        syms, refs, inheritance, indirect, fp_assigns, macros = extract_all(unit_proj, with_refs=False)
+        conn.execute("DELETE FROM symbols WHERE config_hash = ?", (config_hash,))
+        store_symbols_for_unit(
+            conn, unit_proj, config_hash, tmp_path,
+            vendor_patterns=vendor_patterns,
+            project_patterns=project_patterns,
+            pre_parsed=(syms, refs, inheritance, indirect, fp_assigns, macros),
+        )
+        conn.commit()
+
+        # Check files.is_project for project file
+        proj_fid_row = conn.execute(
+            "SELECT id, is_project FROM files WHERE path LIKE '%app.cpp'"
+        ).fetchone()
+        assert proj_fid_row is not None, "Project file not found in files table"
+        assert proj_fid_row[1] == 1, f"Expected is_project=1, got {proj_fid_row[1]}"
+
+        # Index vendor file
+        unit_vendor = CompilationUnit(
+            file=vendor_file,
+            directory=vendor,
+            language="cpp",
+            clang_args=["-std=c++17"],
+        )
+        syms_v, refs_v, inh_v, ind_v, fpa_v, mac_v = extract_all(unit_vendor, with_refs=False)
+        store_symbols_for_unit(
+            conn, unit_vendor, config_hash, tmp_path,
+            vendor_patterns=vendor_patterns,
+            project_patterns=project_patterns,
+            pre_parsed=(syms_v, refs_v, inh_v, ind_v, fpa_v, mac_v),
+        )
+        conn.commit()
+
+        # Check files.is_project for vendor file
+        vendor_fid_row = conn.execute(
+            "SELECT id, path, is_project FROM files WHERE path LIKE '%Tick.cpp'"
+        ).fetchone()
+        assert vendor_fid_row is not None, "Vendor file not found in files table"
+        assert vendor_fid_row[2] == 0, (
+            f"Expected is_project=0 for vendor file {vendor_fid_row[1]}, got {vendor_fid_row[2]}"
+        )
+
+        conn.close()
+
+    @pytest.mark.libclang
+    def test_project_patterns_override_vendor(self, tmp_path):
+        """project_patterns take priority over vendor_patterns in is_project calc."""
+        from fw_context_mcp.indexer.compile_commands import CompilationUnit
+        from fw_context_mcp.indexer.db import open_db, upsert_build_config, upsert_project
+        from fw_context_mcp.indexer.ops import store_symbols_for_unit
+        from fw_context_mcp.indexer.symbols import extract_all
+
+        src = tmp_path / "lib" / "muj_modul"
+        src.mkdir(parents=True)
+        proj_file = src / "override.cpp"
+        proj_file.write_text("void custom_init(void) {}", encoding="utf-8")
+
+        db_path = tmp_path / "test.db"
+        conn = open_db(db_path)
+        upsert_project(conn, "proj-002", "test-project-2", str(tmp_path))
+        upsert_build_config(conn, "hash-proj2", "proj-002", str(tmp_path / "compile_commands.json"))
+        config_hash = "hash-proj2"
+
+        # "lib" is vendor, but "lib/muj_modul" is project
+        vendor_patterns = ["lib/%"]
+        project_patterns = ["lib/muj_modul/%"]
+
+        unit = CompilationUnit(
+            file=proj_file,
+            directory=src,
+            language="cpp",
+            clang_args=["-std=c++17"],
+        )
+        syms, refs, inheritance, indirect, fp_assigns, macros = extract_all(unit, with_refs=False)
+        store_symbols_for_unit(
+            conn, unit, config_hash, tmp_path,
+            vendor_patterns=vendor_patterns,
+            project_patterns=project_patterns,
+            pre_parsed=(syms, refs, inheritance, indirect, fp_assigns, macros),
+        )
+        conn.commit()
+
+        fid_row = conn.execute(
+            "SELECT path, is_project FROM files WHERE path LIKE '%override.cpp'"
+        ).fetchone()
+        assert fid_row is not None
+        assert fid_row[1] == 1, (
+            f"project_paths should override vendor_paths: "
+            f"expected is_project=1, got {fid_row[1]}"
+        )
+        conn.close()
+
+
 class TestIndirectCallSitesArraySubscript:
     """Verify that ``extract_all`` detects indirect calls through array subscripts.
 
@@ -1409,7 +1639,7 @@ void interrupt_dispatch(int irq) {
             clang_args=["-std=c11"],
         )
         _, _, _, indirect, fp_assignments, _ = extract_all(
-            unit, source_roots=[src], exclude_paths=[], with_refs=True,
+            unit, with_refs=True,
         )
 
         # There should be at least one indirect call site for the array call
@@ -1460,7 +1690,7 @@ void dispatch_event(struct Dispatcher* d, int event_id) {
             clang_args=["-std=c11"],
         )
         _, _, _, indirect, fp_assignments, _ = extract_all(
-            unit, source_roots=[src], exclude_paths=[], with_refs=True,
+            unit, with_refs=True,
         )
 
         callbacks_calls = [c for c in indirect if c.target_name == "callbacks"]
@@ -1499,7 +1729,7 @@ void caller(void) {
             clang_args=["-std=c11"],
         )
         _, _, _, indirect, _, _ = extract_all(
-            unit, source_roots=[src], exclude_paths=[], with_refs=True,
+            unit, with_refs=True,
         )
 
         # No indirect call sites for regular function calls
@@ -1537,7 +1767,7 @@ void process_data(struct Driver* driver, const char* data, int len) {
             clang_args=["-std=c11"],
         )
         _, _, _, indirect, _, _ = extract_all(
-            unit, source_roots=[src], exclude_paths=[], with_refs=True,
+            unit, with_refs=True,
         )
 
         ondata_calls = [c for c in indirect if c.target_name == "onData"]

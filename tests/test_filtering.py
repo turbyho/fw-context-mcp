@@ -4,9 +4,9 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from fw_context_mcp.indexer.sdk_detect import _normalize_path_pattern
 from fw_context_mcp.mcp.shared.filtering import (
     _build_sdk_excludes,
-    _merge_excludes,
     _path_matches,
     compute_exclude_like,
 )
@@ -70,7 +70,6 @@ class TestBuildSdkExcludes:
         (tmp_path / "west.yml").write_text("")
         excludes = _build_sdk_excludes(tmp_path)
         assert "zephyr/%" in excludes
-        assert "build/%" in excludes
         assert "modules/%" in excludes
 
     def test_platformio_detected(self, tmp_path: Path):
@@ -88,115 +87,64 @@ class TestBuildSdkExcludes:
         assert len(excludes) == 0
 
 
-class TestMergeExcludes:
-    def test_project_only_false_passes_through(self, tmp_path: Path):
-        result = _merge_excludes(["custom/%"], project_only=False, root=tmp_path)
-        assert result == ["custom/%"]
-
-    def test_project_only_false_none_passes_through(self, tmp_path: Path):
-        result = _merge_excludes(None, project_only=False, root=tmp_path)
-        assert result is None
-
-    def test_project_only_mbed_sdk(self, tmp_path: Path):
-        (tmp_path / "mbed-os").mkdir()
-        result = _merge_excludes(None, project_only=True, root=tmp_path)
-        assert result is not None
-        assert "mbed-os/%" in result
-
-    def test_merge_user_excludes(self, tmp_path: Path):
-        result = _merge_excludes(["tests/%", "examples/%"], project_only=True, root=tmp_path)
-        assert "tests/%" in (result or [])
-        assert "examples/%" in (result or [])
-
-    def test_deduplication(self, tmp_path: Path, isolation):
-        result = _merge_excludes(["mbed-os/%", "mbed-os/%"], project_only=True, root=tmp_path)
-        # Deduplication happens in project_only=True path
-        assert result is not None
-        assert result.count("mbed-os/%") == 1
-
-    def test_empty_result_when_no_excludes(self, tmp_path: Path, isolation):
-        result = _merge_excludes(None, project_only=True, root=tmp_path)
-        # Default config has exclude_paths = ["build", "BUILD"]
-        # Unknown build system + no user excludes → just the defaults
-        assert result is not None
-        assert "build" in result
-        assert "BUILD" in result
-
-    def test_config_excludes_appended(self, tmp_path: Path, monkeypatch):
-        """Config excludes from .fw-context/config.toml are appended."""
-        # We test that user-provided excludes are preserved
-        result = _merge_excludes(["my_lib/%"], project_only=True, root=tmp_path)
-        assert "my_lib/%" in (result or [])
-
-
 class TestComputeExcludeLike:
     """Tests for the centralized compute_exclude_like() function."""
 
     def test_analyze_vendor_true_returns_empty(self, tmp_path: Path):
         """When analyze_vendor=True, return empty list — no exclusion."""
-        result = compute_exclude_like(tmp_path, analyze_vendor=True)
+        result = compute_exclude_like(tmp_path, analyze_vendor=True, vendor_paths=None)
         assert result == []
 
     def test_analyze_vendor_false_auto_detects(self, tmp_path: Path):
         """When analyze_vendor=False, auto-detect from build system."""
         (tmp_path / "mbed-os").mkdir()
-        result = compute_exclude_like(tmp_path, analyze_vendor=False)
+        result = compute_exclude_like(tmp_path, analyze_vendor=False, vendor_paths=None)
         assert len(result) > 0
-        # Should include the auto-detected mbed-os pattern with % prefix
         assert any("mbed-os" in p for p in result)
 
-    def test_no_exclude_paths(self, tmp_path: Path):
-        """When exclude_paths is None, only auto-detected patterns returned."""
+    def test_no_vendor_paths(self, tmp_path: Path):
+        """When vendor_paths is None, only auto-detected patterns returned."""
         (tmp_path / "mbed-os").mkdir()
-        result = compute_exclude_like(tmp_path, analyze_vendor=False)
+        result = compute_exclude_like(tmp_path, analyze_vendor=False, vendor_paths=None)
         assert isinstance(result, list)
 
-    def test_exclude_paths_with_strings(self, tmp_path: Path):
-        """exclude_paths=list[str] is merged correctly."""
+    def test_vendor_paths_with_strings(self, tmp_path: Path):
+        """vendor_paths=list[str] is merged correctly."""
         (tmp_path / "mbed-os").mkdir()
         result = compute_exclude_like(
             tmp_path,
             analyze_vendor=False,
-            exclude_paths=["build", "BUILD"],
+            vendor_paths=["third_party"],
         )
-        # Auto-detected mbed-os + user-configured build, BUILD
         assert any("mbed-os" in p for p in result)
-        assert any("build" in p for p in result)
-        assert any("BUILD" in p for p in result)
-
-    def test_exclude_paths_with_path_objects(self, tmp_path: Path):
-        """exclude_paths=list[Path] is converted to relative strings."""
-        (tmp_path / "mbed-os").mkdir()
-        abs_paths = [
-            tmp_path / "build",
-            tmp_path / "extra_lib",
-        ]
-        result = compute_exclude_like(
-            tmp_path,
-            analyze_vendor=False,
-            exclude_paths=abs_paths,
-        )
-        assert any("build" in p for p in result)
-        assert any("extra_lib" in p for p in result)
-
-    def test_path_outside_project_root_skipped(self, tmp_path: Path):
-        """Path outside project_root is silently skipped."""
-        (tmp_path / "mbed-os").mkdir()
-        outside = Path("/some/other/dir")
-        result = compute_exclude_like(
-            tmp_path,
-            analyze_vendor=False,
-            exclude_paths=[outside],
-        )
-        # Should still work — outside path just isn't included
-        assert isinstance(result, list)
+        assert any("third_party" in p for p in result)
 
     def test_unknown_build_system_no_extra(self, tmp_path: Path):
         """Unknown build system + no extra paths → only config defaults apply."""
         result = compute_exclude_like(
             tmp_path,
             analyze_vendor=False,
+            vendor_paths=None,
         )
-        # For unknown build system, _build_sdk_excludes returns []
-        # and no extra exclude_paths → result is empty
         assert isinstance(result, list)
+
+
+class TestNormalizePathPattern:
+    """Tests for _normalize_path_pattern from sdk_detect."""
+
+    def test_no_wildcard_gets_suffix(self):
+        assert _normalize_path_pattern("third_party") == "third_party/%"
+
+    def test_trailing_slash_handled(self):
+        assert _normalize_path_pattern("third_party/") == "third_party/%"
+
+    def test_has_wildcard_unchanged(self):
+        assert _normalize_path_pattern("mbed-os/%") == "mbed-os/%"
+
+    def test_absolute_path(self):
+        result = _normalize_path_pattern("/home/user/esp/components/muj_fork")
+        assert result == "/home/user/esp/components/muj_fork/%"
+
+    def test_absolute_path_with_wildcard(self):
+        result = _normalize_path_pattern("/home/user/esp/%")
+        assert result == "/home/user/esp/%"
