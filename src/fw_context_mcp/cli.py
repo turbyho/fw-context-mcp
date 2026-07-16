@@ -319,6 +319,11 @@ def cmd_index(args: argparse.Namespace) -> int:
             config_header=cfg.index.config_header,
             force=args.force,
             build_dir_patterns=build_dir_patterns,
+            analyze_vendor=(
+                False
+                if getattr(args, "no_analyze_vendor", False)
+                else getattr(args, "analyze_vendor", False) or cfg.llm.analyze_vendor
+            ),
         )
         print(f"Indexed. config_hash={config_hash[:16]}…  db={db_path}")
 
@@ -381,13 +386,33 @@ def cmd_search(args: argparse.Namespace) -> int:
     return 0
 
 
+def _truncate_path_middle(path: str, max_len: int) -> str:
+    """Truncate a path by removing the middle, keeping start and end visible.
+
+    Example: ``/home/turbyho/dev/sw/…/privat/HA_Boiler``
+    """
+    if len(path) <= max_len:
+        return path
+    # Keep ~40% from start, ~60% from end so the project dir is fully visible
+    keep_start = max(max_len // 3, 12)
+    keep_end = max_len - keep_start - 1  # -1 for the ellipsis
+    return path[:keep_start] + "…" + path[-keep_end:]
+
+
+def _fmt_count(n: int) -> str:
+    """Format a count with thousand separators (non-breaking thin spaces)."""
+    return f"{n:_d}".replace("_", " ")
+
+
 def cmd_list(args: argparse.Namespace) -> int:
     """List all indexed firmware projects found under the configured index directory.
 
-    Prints each project's name, root path, symbol count, file count,
-    and index timestamp. Marks stale projects (compile_commands.json
-    changed since last index).
+    Prints a table with project name, root path, symbol count, file count,
+    and index timestamp. Stale projects (compile_commands.json changed since
+    last index) are marked with ``*``.
     """
+    import shutil
+
     from .config import load as load_config
     from .indexer.db import get_all_projects, open_db
 
@@ -399,19 +424,68 @@ def cmd_list(args: argparse.Namespace) -> int:
         print(f"No indexed projects under {index_dir}.")
         return 0
 
+    # --- Collect all rows first so we can compute column widths ---
+    header = ("PROJECT", "PATH", "SYMBOLS", "FILES", "INDEXED")
+    rows: list[tuple[str, str, str, str, str]] = []
+
     for db_path in db_files:
         try:
             conn = open_db(db_path)
-            rows = get_all_projects(conn)
-            for r in rows:
-                stale_marker = " [STALE]" if _cli_is_stale(r) else ""
-                print(f"{r['name'] or r['project_id']}  {r['root_path']}{stale_marker}")
-                print(f"  symbols={r['symbol_count']}  files={r['file_count']}  indexed={r['created_at']}")
+            for r in get_all_projects(conn):
+                name = r["name"] or r["project_id"]
+                if _cli_is_stale(r):
+                    name += " *"
+                rows.append((
+                    name,
+                    r["root_path"] or "",
+                    _fmt_count(r["symbol_count"]),
+                    _fmt_count(r["file_count"]),
+                    r["created_at"] or "",
+                ))
                 if args.verbose:
-                    print(f"  db={db_path}")
-                    print(f"  compile_commands={r['compile_commands_path']}")
+                    rows.append(("", f"  db={db_path}", "", "", ""))
+                    rows.append(("", f"  cc={r['compile_commands_path']}", "", "", ""))
         except Exception as e:
             print(f"[error] {db_path}: {e}", file=sys.stderr)
+
+    if not rows:
+        return 0
+
+    # --- Compute column widths ---
+    col_widths = [len(h) for h in header]
+    for row in rows:
+        for i, cell in enumerate(row):
+            col_widths[i] = max(col_widths[i], len(cell))
+
+    # Constrain PATH width to terminal width
+    term_width = shutil.get_terminal_size((120, 24)).columns
+    # 3 chars between columns, plus some margin
+    separator_width = 2 * (len(header) - 1)
+    fixed_width = sum(col_widths[i] for i in range(len(header)) if i != 1) + separator_width
+    max_path_width = max(term_width - fixed_width - 2, 30)  # min 30 chars for path
+    col_widths[1] = min(col_widths[1], max_path_width)
+
+    # --- Print header ---
+    def _fmt_row(vals: tuple[str, ...]) -> str:
+        parts: list[str] = []
+        for i, val in enumerate(vals):
+            w = col_widths[i]
+            # Left-align everything except SYMBOLS and FILES (right-align)
+            align = ">" if header[i] in ("SYMBOLS", "FILES") else "<"
+            parts.append(f"{val:{align}{w}}")
+        return "  ".join(parts)
+
+    print(_fmt_row(header))
+
+    # --- Print rows ---
+    for row in rows:
+        # Truncate path in the middle if needed
+        vals = list(row)
+        path = vals[1]
+        if len(path) > col_widths[1]:
+            vals[1] = _truncate_path_middle(path, col_widths[1])
+        print(_fmt_row(tuple(vals)))
+
     return 0
 
 
@@ -1540,7 +1614,7 @@ def cmd_analyze(args: argparse.Namespace) -> int:
     """
     from .config import derive_project_id
     from .config import load as load_config
-    from .indexer.db import get_active_config, open_db
+    from .indexer.db import get_active_config, open_db, upsert_build_config
     from .indexer.runner import _build_llm_analysis, _build_overrides
     from .utils import resolve_project_root
 
@@ -1581,16 +1655,20 @@ def cmd_analyze(args: argparse.Namespace) -> int:
 
     # Compute SDK exclude patterns for this project.
     # When analyze_vendor is True, analyze everything.
-    from .indexer.runner import _detect_sdk_exclude_like
+    from .mcp.shared.filtering import compute_exclude_like
 
-    if cfg.llm.analyze_vendor:
-        exclude_like: list[str] = []
-    else:
-        exclude_paths = cfg.exclude_root_paths(project_root)
-        config_exclude_strs = [
-            str(p.relative_to(project_root)) for p in exclude_paths if p.is_relative_to(project_root)
-        ]
-        exclude_like = _detect_sdk_exclude_like(project_root, config_exclude_strs)
+    # Resolve analyze_vendor: CLI flag takes precedence, config falls back.
+    analyze_vendor = (
+        False
+        if getattr(args, "no_analyze_vendor", False)
+        else getattr(args, "analyze_vendor", False) or cfg.llm.analyze_vendor
+    )
+
+    exclude_like = compute_exclude_like(
+        project_root,
+        analyze_vendor=analyze_vendor,
+        exclude_paths=cfg.exclude_root_paths(project_root),
+    )
 
     # Re-open connection for the analysis (uses its own transactions)
     conn = open_db(db_path)
@@ -1623,6 +1701,16 @@ def cmd_analyze(args: argparse.Namespace) -> int:
             cc.close()
         _build_overrides(conn, config_hash, db_path.parent)
         conn.commit()
+
+        # Update stored analyze_vendor so get_active_build reports
+        # consistent state.  Only manifest_verification and description
+        # are preserved from the existing row (not overwritten).
+        upsert_build_config(
+            conn, config_hash, project_id, build_cfg["compile_commands_path"],
+            description=build_cfg["description"] if "description" in build_cfg.keys() else "",
+            manifest_verification=build_cfg["manifest_verification"] if "manifest_verification" in build_cfg.keys() else "none",
+            analyze_vendor=int(analyze_vendor),
+        )
     finally:
         conn.close()
 
@@ -2029,7 +2117,7 @@ def cmd_db_list(args: argparse.Namespace) -> int:
     # Multi-line block format — each build gets its own block of lines
     # so the description is fully readable without truncation.
     for b in builds:
-        ch = b["config_hash"] if args.verbose else b["config_hash"][:12]
+        ch = b["config_hash"] if args.verbose else b["config_hash"][:hash_width]
         desc = b["description"] or "-"
         first_at = b["first_indexed_at"] or "-"
         last_at = b["created_at"] or "-"
@@ -2536,6 +2624,14 @@ def main() -> None:
     )
     p_index.add_argument("--no-analyze", action="store_true", dest="no_analyze", help="Skip LLM analysis generation")
     p_index.add_argument(
+        "--analyze-vendor", action="store_true", dest="analyze_vendor", default=False,
+        help="Also analyze vendor/SDK code (mbed-os, Zephyr, etc.)",
+    )
+    p_index.add_argument(
+        "--no-analyze-vendor", action="store_true", dest="no_analyze_vendor",
+        help="Skip vendor/SDK analysis (overrides config)",
+    )
+    p_index.add_argument(
         "--force",
         action="store_true",
         help="Force re-index of all files, embeddings, LLM analysis, overrides, and caches (skip mtime/checksum checks)",
@@ -2594,6 +2690,14 @@ def main() -> None:
     p_analyze = sub.add_parser("analyze", help="Re-run LLM symbol analysis on existing index (idempotent)")
     p_analyze.add_argument("-v", "--verbose", action="store_true")
     p_analyze.add_argument("--project", metavar="DIR", help="Project root (default: cwd)")
+    p_analyze.add_argument(
+        "--analyze-vendor", action="store_true", dest="analyze_vendor", default=False,
+        help="Also analyze vendor/SDK code (mbed-os, Zephyr, etc.)",
+    )
+    p_analyze.add_argument(
+        "--no-analyze-vendor", action="store_true", dest="no_analyze_vendor",
+        help="Skip vendor/SDK analysis (overrides config)",
+    )
     p_analyze.set_defaults(func=cmd_analyze)
 
     # Cache management subcommands

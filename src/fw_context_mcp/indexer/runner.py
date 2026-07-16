@@ -17,6 +17,7 @@ from pathlib import Path
 
 from ..config.settings import derive_project_id
 from ..llm.ollama import call_ollama
+from ..mcp.shared.filtering import compute_exclude_like
 from ..utils import MTIME_TOLERANCE_S, compute_source_hash, read_file_lines
 from .compile_commands import _SOURCE_EXTS, validate_include_files
 from .compile_commands import parse as parse_compile_commands
@@ -214,42 +215,6 @@ def _cleanup_orphaned_cc_artifacts(db_path: Path, project_id: str) -> int:
     return deleted
 
 
-def _detect_sdk_exclude_like(project_root: Path, extra_exclude: list[str] | None = None) -> list[str]:
-    """Return LIKE patterns for SDK/vendor directories present in *project_root*.
-
-    Auto-detects known ecosystem markers and returns patterns with a ``%``
-    prefix so they match both relative (``mbed-os/...``) and absolute
-    (``/home/.../mbed-os/...``) paths in the files table.
-
-    Merges with *extra_exclude* from the project config (``exclude_paths``).
-    """
-    patterns: list[str] = []
-
-    _MARKERS: dict[str, str] = {
-        "mbed-os": "mbed-os",
-        "zephyr": "zephyr",
-        ".pio": ".pio",
-        "modules": "modules",
-    }
-
-    for marker_dir, pattern_base in _MARKERS.items():
-        if (project_root / marker_dir).is_dir():
-            patterns.append(f"%{pattern_base}/%")
-
-    # Build output directories (build/BUILD) — always added as they are
-    # common across all ecosystems and the config default includes them.
-    for build_dir in ("build", "BUILD"):
-        patterns.append(f"%{build_dir}/%")
-
-    if extra_exclude:
-        for p in extra_exclude:
-            p = p.strip("/")
-            if p and f"%{p}/%" not in patterns:
-                patterns.append(f"%{p}/%")
-
-    return patterns
-
-
 def _build_embeddings(conn, config_hash: str, llm_config, db_dir: Path) -> None:
     """Generate and store vector embeddings for all definition symbols.
 
@@ -390,9 +355,6 @@ def _build_embeddings(conn, config_hash: str, llm_config, db_dir: Path) -> None:
         )
 
 
-# SDK path patterns for filtering (mbed-os, Zephyr, PlatformIO, build dirs)
-_SDK_PATH_PATTERNS = ("mbed-os/", ".pio/", "zephyr/", "build/", "modules/")
-
 
 def _read_body(abs_path: str, start_line: int, end_line: int) -> str:
     """Read a function body from a source file using line numbers.
@@ -486,7 +448,9 @@ def _build_llm_analysis(
     *db_dir* is the directory containing the index database — used for the
     write lock that serializes DB access across processes.
     *exclude_like* are LIKE patterns for SDK/vendor paths to skip
-    (auto-detected from project structure when omitted).
+    (when omitted, no paths are excluded — all symbols including
+    SDK/vendor are analyzed).  Pre-compute via
+    :func:`compute_exclude_like`.
     *retry_unparseable* when True clears all ``skip:unparseable`` sentinels
     so previously-failed symbols are re-attempted. Set True for manual
     indexing, False for background reindex (safe: retries only on model change).
@@ -1886,6 +1850,7 @@ def run(
     index_macros_expanded: bool = True,
     config_header: str = "",
     build_dir_patterns: list[str] | None = None,
+    analyze_vendor: bool = False,
 ) -> str:
     """Index a project: parse translation units, extract symbols, and store to SQLite.
 
@@ -2032,6 +1997,15 @@ def run(
         initial_manifest_verification = "indexing"
     else:
         initial_manifest_verification = old_row["manifest_verification"]
+
+    # Resolve analyze_vendor: CLI flag takes precedence, config falls back.
+    # Only meaningful when analyze_symbols is True — otherwise analysis doesn't
+    # run and the flag is irrelevant (storing True would mislead get_active_build).
+    if analyze_symbols:
+        _analyze_vendor = analyze_vendor or (llm_config is not None and llm_config.analyze_vendor)
+    else:
+        _analyze_vendor = False
+
     # Serialize with any concurrent writer (background reindex, daemon)
     with write_lock(db_path.parent, timeout=120.0):
         with transaction(conn):
@@ -2043,6 +2017,7 @@ def run(
                 str(compile_commands),
                 description=git_description,
                 manifest_verification=initial_manifest_verification,
+                analyze_vendor=int(_analyze_vendor),
             )
 
     # Inject user-configured config header when the build system doesn't emit
@@ -2398,15 +2373,13 @@ def run(
     # (returns immediately when data already exists).
 
     # Compute SDK exclude patterns once (auto-detected from project structure
-    # + config exclude_paths).  When analyze_vendor is True, skip exclusion
+    # + config exclude_paths).  When _analyze_vendor is True, skip exclusion
     # so vendor/SDK code is also analyzed.
-    if llm_config is not None and llm_config.analyze_vendor:
-        exclude_like: list[str] = []
-    else:
-        config_exclude_strs = [
-            str(p.relative_to(project_root)) for p in exclude_paths if p.is_relative_to(project_root)
-        ]
-        exclude_like = _detect_sdk_exclude_like(project_root, config_exclude_strs)
+    exclude_like = compute_exclude_like(
+        project_root,
+        analyze_vendor=_analyze_vendor,
+        exclude_paths=exclude_paths,
+    )
 
     # Embedding generation (opt-in)
     if index_embeddings and llm_config is not None and llm_config.enabled:
@@ -2510,7 +2483,8 @@ def run(
     with transaction(conn):
         upsert_build_config(
             conn, config_hash, project_id, str(compile_commands),
-            description=git_description, manifest_verification=manifest_verification
+            description=git_description, manifest_verification=manifest_verification,
+            analyze_vendor=int(_analyze_vendor),
         )
 
     # ── Cleanup old build data ──

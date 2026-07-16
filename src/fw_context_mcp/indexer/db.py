@@ -336,6 +336,7 @@ _MIGRATION_ADD_COLUMNS = [
     "ALTER TABLE build_configs ADD COLUMN manifest_verification TEXT NOT NULL DEFAULT 'none'",
     "ALTER TABLE build_configs ADD COLUMN description TEXT NOT NULL DEFAULT ''",
     "ALTER TABLE build_configs ADD COLUMN first_indexed_at TEXT NOT NULL DEFAULT ''",
+    "ALTER TABLE build_configs ADD COLUMN analyze_vendor INTEGER NOT NULL DEFAULT 0",
 ]
 
 # Pre-computed {table: {columns}} from _MIGRATION_ADD_COLUMNS.
@@ -362,7 +363,8 @@ CREATE TABLE IF NOT EXISTS build_configs (
     embedding_dim           INTEGER,
     manifest_verification   TEXT NOT NULL DEFAULT 'none',
     description             TEXT NOT NULL DEFAULT '',
-    first_indexed_at        TEXT NOT NULL DEFAULT ''
+    first_indexed_at        TEXT NOT NULL DEFAULT '',
+    analyze_vendor          INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS files (
@@ -1409,6 +1411,7 @@ def upsert_build_config(
     embedding_dim: int | None = None,
     manifest_verification: str = "none",
     description: str = "",
+    analyze_vendor: int = 0,
 ) -> None:
     """Insert or update a build configuration record.
 
@@ -1439,12 +1442,14 @@ def upsert_build_config(
     _ensure_column(conn, "build_configs", "manifest_verification", "TEXT NOT NULL DEFAULT 'none'")
     _ensure_column(conn, "build_configs", "description", "TEXT NOT NULL DEFAULT ''")
     _ensure_column(conn, "build_configs", "first_indexed_at", "TEXT NOT NULL DEFAULT ''")
+    _ensure_column(conn, "build_configs", "analyze_vendor", "INTEGER NOT NULL DEFAULT 0")
 
     conn.execute(
         """INSERT INTO build_configs(config_hash, project_id, compile_commands_path,
                                      embedding_dim, manifest_verification,
-                                     description, first_indexed_at)
-           VALUES (?,?,?,?,?,?, datetime('now'))
+                                     description, first_indexed_at,
+                                     analyze_vendor)
+           VALUES (?,?,?,?,?,?, datetime('now'), ?)
            ON CONFLICT(config_hash) DO UPDATE SET
                created_at = datetime('now'),
                description = excluded.description,
@@ -1454,8 +1459,9 @@ def upsert_build_config(
                first_indexed_at = CASE WHEN build_configs.first_indexed_at = ''
                                        THEN datetime('now')
                                        ELSE build_configs.first_indexed_at
-                                  END""",
-        (config_hash, project_id, compile_commands_path, embedding_dim, manifest_verification, description),
+                                  END,
+               analyze_vendor = excluded.analyze_vendor""",
+        (config_hash, project_id, compile_commands_path, embedding_dim, manifest_verification, description, analyze_vendor),
     )
 
 

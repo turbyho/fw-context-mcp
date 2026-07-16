@@ -261,23 +261,52 @@ def _fast_staleness_check(root: Path) -> tuple[bool, list[str]]:
                         reasons.append("indirect call sites missing")
 
             # 4. Unanalyzed symbols?
+            # Uses CONFIG analyze_vendor (not stored) because this check
+            # predicts what the background reindex will do — and the
+            # background reindex uses config, not stored flags.  Using
+            # stored would cause an infinite reindex loop when a manual
+            # --analyze-vendor run stored True but config is False.
             if proj_cfg.llm.enabled and proj_cfg.llm.analyze_symbols:
-                unanalyzed = conn.execute(
-                    """SELECT COUNT(*)
-                       FROM symbols s
-                       WHERE s.config_hash = ?
-                         AND s.is_definition = 1
-                         AND s.kind IN ('function', 'method',
-                                        'constructor', 'destructor',
-                                        'class', 'struct')
-                         AND s.file_path NOT LIKE 'mbed-os/%'
-                         AND s.file_path NOT LIKE '.pio/%'
-                         AND s.file_path NOT LIKE 'zephyr/%'
-                         AND s.file_path NOT LIKE 'build/%'
-                         AND s.file_path NOT LIKE 'modules/%'
-                         AND s.id NOT IN (SELECT symbol_id FROM llm_analysis)""",
-                    (config_hash,),
-                ).fetchone()[0]
+                if proj_cfg.llm.analyze_vendor:
+                    unanalyzed = conn.execute(
+                        """SELECT COUNT(*)
+                           FROM symbols s
+                           WHERE s.config_hash = ?
+                             AND s.is_definition = 1
+                             AND s.kind IN ('function', 'method',
+                                            'constructor', 'destructor',
+                                            'class', 'struct')
+                             AND s.name NOT LIKE '%(anonymous%'
+                             AND s.name NOT LIKE '%(unnamed%'
+                             AND s.id NOT IN (SELECT symbol_id FROM llm_analysis)""",
+                        (config_hash,),
+                    ).fetchone()[0]
+                else:
+                    from .shared.filtering import compute_exclude_like
+
+                    exclude_like = compute_exclude_like(
+                        root,
+                        analyze_vendor=False,
+                        exclude_paths=proj_cfg.index.exclude_paths,
+                    )
+                    exclude_clauses = " AND ".join(
+                        ["s.file_path NOT LIKE ?"] * len(exclude_like)
+                    )
+                    exclude_clause = (" AND " + exclude_clauses) if exclude_clauses else ""
+                    query = f"""SELECT COUNT(*)
+                           FROM symbols s
+                           WHERE s.config_hash = ?
+                             AND s.is_definition = 1
+                             AND s.kind IN ('function', 'method',
+                                            'constructor', 'destructor',
+                                            'class', 'struct')
+                             {exclude_clause}
+                             AND s.name NOT LIKE '%(anonymous%'
+                             AND s.name NOT LIKE '%(unnamed%'
+                             AND s.id NOT IN (SELECT symbol_id FROM llm_analysis)"""
+                    unanalyzed = conn.execute(
+                        query, (config_hash, *exclude_like),
+                    ).fetchone()[0]
                 if unanalyzed > 0:
                     reasons.append(f"{unanalyzed} unanalyzed symbols")
     finally:

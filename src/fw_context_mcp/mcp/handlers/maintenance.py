@@ -148,24 +148,59 @@ def get_active_build(
                 (config_hash,),
             ).fetchone()
 
+            # Read stored analyze_vendor — what was actually indexed.
+            # Fall back to False for DBs that predate the column.
+            try:
+                stored_analyze_vendor = bool(
+                    conn.execute(
+                        "SELECT analyze_vendor FROM build_configs WHERE config_hash = ?",
+                        (config_hash,),
+                    ).fetchone()["analyze_vendor"]
+                )
+            except sqlite3.OperationalError:
+                stored_analyze_vendor = False
+
             # Count definition symbols that still need LLM analysis
-            unanalyzed_count = conn.execute(
-                """SELECT COUNT(*)
+            if stored_analyze_vendor:
+                # No exclusion — count all symbols including vendor/SDK
+                unanalyzed_count = conn.execute(
+                    """SELECT COUNT(*)
+                       FROM symbols s
+                       WHERE s.config_hash = ?
+                         AND s.is_definition = 1
+                         AND s.kind IN ('function', 'method', 'constructor',
+                                        'destructor', 'class', 'struct')
+                         AND s.name NOT LIKE '%(anonymous%'
+                         AND s.name NOT LIKE '%(unnamed%'
+                         AND s.id NOT IN (SELECT symbol_id FROM llm_analysis)""",
+                    (config_hash,),
+                ).fetchone()[0]
+            else:
+                from ..shared.filtering import compute_exclude_like
+
+                proj_cfg = load_config(project_root=root)
+                exclude_like = compute_exclude_like(
+                    root,
+                    analyze_vendor=False,
+                    exclude_paths=proj_cfg.index.exclude_paths,
+                )
+                exclude_clauses = " AND ".join(
+                    ["s.file_path NOT LIKE ?"] * len(exclude_like)
+                )
+                exclude_clause = (" AND " + exclude_clauses) if exclude_clauses else ""
+                query = f"""SELECT COUNT(*)
                    FROM symbols s
                    WHERE s.config_hash = ?
                      AND s.is_definition = 1
                      AND s.kind IN ('function', 'method', 'constructor',
                                     'destructor', 'class', 'struct')
-                     AND s.file_path NOT LIKE 'mbed-os/%'
-                     AND s.file_path NOT LIKE '.pio/%'
-                     AND s.file_path NOT LIKE 'zephyr/%'
-                     AND s.file_path NOT LIKE 'build/%'
-                     AND s.file_path NOT LIKE 'modules/%'
+                     {exclude_clause}
                      AND s.name NOT LIKE '%(anonymous%'
                      AND s.name NOT LIKE '%(unnamed%'
-                     AND s.id NOT IN (SELECT symbol_id FROM llm_analysis)""",
-                (config_hash,),
-            ).fetchone()[0]
+                     AND s.id NOT IN (SELECT symbol_id FROM llm_analysis)"""
+                unanalyzed_count = conn.execute(
+                    query, (config_hash, *exclude_like)
+                ).fetchone()[0]
 
             cc_changed = _is_stale(cfg, cfg["compile_commands_path"])
             schema_old = db_schema_ver < CURRENT_SCHEMA_VERSION
@@ -737,7 +772,7 @@ def reindex_file_impl(
                                         "headers": headers,
                                     }
                                 )
-                        save_manifest(manifest_data, db_path.parent)
+                        save_manifest(manifest_data, db_path.parent, config_hash)
                 except Exception:
                     log.debug("manifest.json update skipped during reindex_file", exc_info=True)
 
@@ -757,6 +792,25 @@ def reindex_file_impl(
                     try:
                         from ...cache_client import CacheClient
                         from ...indexer.runner import _build_llm_analysis
+                        from ..shared.filtering import compute_exclude_like
+
+                        # Read stored analyze_vendor for consistent filtering
+                        # with the original index run.
+                        try:
+                            stored_av = bool(
+                                conn.execute(
+                                    "SELECT analyze_vendor FROM build_configs WHERE config_hash = ?",
+                                    (config_hash,),
+                                ).fetchone()["analyze_vendor"]
+                            )
+                        except sqlite3.OperationalError:
+                            stored_av = False
+
+                        exclude_like = compute_exclude_like(
+                            root,
+                            analyze_vendor=stored_av,
+                            exclude_paths=cfg.index.exclude_paths,
+                        )
 
                         cc = CacheClient.from_config(cfg)
                         try:
@@ -768,6 +822,7 @@ def reindex_file_impl(
                                 write_lock_held=True,
                                 retry_unparseable=True,
                                 cache_client=cc,
+                                exclude_like=exclude_like,
                             )
                             conn.commit()
                         finally:
