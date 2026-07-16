@@ -625,10 +625,12 @@ Re-indexing a file (`reindex_file`) auto-regenerates its analysis.
 
 #### `get_symbol_context`
 
-Rich LLM context — body, callers, and callees in one response.
+Rich LLM context — body, callers, and callees in one response.  Returns ALL
+callers and callees including vendor/SDK code — call graph naturally spans
+project and vendor boundaries.
 
 ```
-Input:  {"name": "modem_connect", "project_root?": "/path/to/project", "project_only?": true}
+Input:  {"name": "modem_connect", "project_root?": "/path/to/project"}
 Output: {"name": "modem_connect", "kind": "function",
          "file": "/path/src/modem.c", "line": 210,
          "signature": "int modem_connect(const char* apn)",
@@ -791,7 +793,7 @@ Output: [{"name": "spi_init", "kind": "function", "file": "/path/src/spi.c", "de
 Functions defined but never called. Returns two categories:
 
 ```
-Input:  {"project_root?": "/path/to/project", "limit?": 100, "exclude_paths?": ["zephyr/%", "mbed-os/%"], "project_only?": true}
+Input:  {"project_root?": "/path/to/project", "limit?": 100, "project_only?": true, "exclude_paths?": ["lib/%"]}
 Output: [
   {"name": "orphan_fn", "kind": "function", "file": "/path/src/utils.c",
    "signature": "void orphan_fn()", "line": 200,
@@ -818,8 +820,10 @@ Expect additional false positives from entry points (`main`), ISRs,
 virtual method overrides, constructors called via factories, and
 weak-aliased symbols. Only definitions with
 `kind IN ('function', 'method', 'constructor', 'destructor')` are checked.
-Use `exclude_paths` to skip vendor SDK code (LIKE patterns — `%` matches
-any suffix).
+By default, SDK/vendor paths are auto-excluded via the ``is_project`` column
+(which respects project config ``vendor_paths`` and ``project_paths``).
+Use `exclude_paths` for additional LIKE patterns on top
+(``%`` matches any suffix, e.g. ``lib/%``).
 
 #### `find_hotspots`
 
@@ -1012,6 +1016,7 @@ Output: {"config_hash": "a1b2…", "project_id": "c3d4…", "project_root": "/pa
          "schema_version": 84935291, "current_schema": 84935291,
          "analyzed_symbols": 8450, "unanalyzed_symbols": 120,
          "analysis_model": "qwen2.5-coder:14b",
+         "vendor_paths": [], "project_paths": [],
          "bg_reindex_running": false, "reindex_progress": null,
          "status": "ready", "reindex_needed": false, "reindex_reasons": [],
          "index_message": "Index is fully up to date (12430 symbols)"}
@@ -1278,16 +1283,13 @@ For manual recovery, use `reindex_file` or `fw-context index`.
 ```
 1. Read compile_commands.json → extract translation units (file + compiler args)
 
-2. Auto-detect source_roots:
-   Scan for src/, lib/, app/, include/, modules/
-   Add framework dirs (zephyr/, mbed-os/)
-   Add top-level dirs from compile_commands.json entries
-
-3. For each translation unit (sequential, per-TU write lock):
+2. For each translation unit (sequential, per-TU write lock):
    Parse with libclang using exact compiler flags (-I, -D, -std, --target)
-   Traverse AST → extract symbols within source_roots
+   Traverse AST → extract ALL symbols (no source filtering — everything from
+   compile_commands.json + includes is indexed)
    Category: function, method, class, enum, typedef, variable, field, …
-   Extract cross-references within source_roots (on by default; skip with --no-refs)
+   Compute is_project per-symbol (project code = 1, vendor/SDK = 0)
+   Extract cross-references including vendor/SDK (on by default; skip with --no-refs)
    Extract macros via clang -dM -E (preprocessor dump; stored in macro_defs table)
    Release write lock between TUs — manual operations (``reindex_file``)
    can interleave via the pause marker mechanism without blocking.

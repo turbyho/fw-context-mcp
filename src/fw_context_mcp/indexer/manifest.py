@@ -494,7 +494,7 @@ def compute_config_hash(
 def check_tu_staleness(
     entry: dict,
     project_root: Path,
-    source_roots: list[Path],
+    vendor_patterns: list[str],
 ) -> tuple[bool, str | None]:
     """Check whether a translation unit's source or project headers have changed.
 
@@ -504,8 +504,9 @@ def check_tu_staleness(
     Args:
         entry: A single entry from the manifest's ``"entries"`` list.
         project_root: Project root for resolving relative paths.
-        source_roots: Directories considered project code — only headers
-            inside these roots are checked.  SDK/vendor headers are trusted.
+        vendor_patterns: LIKE patterns (with ``%``) for vendor/SDK directories.
+            Headers matching these patterns are trusted from the manifest.
+            Headers outside *project_root* are also trusted.
 
     Returns:
         ``(stale, new_source_hash)`` — *stale* is True when the TU needs
@@ -513,6 +514,8 @@ def check_tu_staleness(
         file (for updating the manifest after reparse), or None when stale
         is False.
     """
+    from .sdk_detect import _path_matches
+
     # ── Check source file hash ──
     source_file = Path(entry["file"])
     if not source_file.is_absolute():
@@ -523,24 +526,26 @@ def check_tu_staleness(
         return True, current_source_hash
 
     # ── Check project header hashes ──
-    # Only project headers (inside source_roots) are checked — SDK headers
-    # are trusted from the manifest.
-    source_root_strs = [str(r) for r in source_roots]
+    # Vendor/SDK headers and headers outside project_root are trusted from
+    # the manifest.  Only project headers inside project_root are re-hashed.
     for h in entry.get("headers", []):
         if h.get("generated"):
             continue  # build-generated headers are skipped
 
         header_path = h["path"]
-        # Resolve header path to absolute for reliable source root comparison
         p = Path(header_path)
         if not p.is_absolute():
             p = (project_root / header_path).resolve()
-        resolved_str = str(p)
 
-        # Check if this header is inside a source root
-        in_project = any(resolved_str.startswith(sr + "/") or resolved_str == sr for sr in source_root_strs)
-        if not in_project:
-            continue  # SDK/vendor header — trust the manifest
+        # Outside project_root → trust manifest (system/toolchain/external SDK)
+        try:
+            rel_path = str(p.relative_to(project_root))
+        except ValueError:
+            continue
+
+        # Matches vendor pattern → trust manifest
+        if any(_path_matches(rel_path, pat) for pat in vendor_patterns):
+            continue
 
         current_hash = compute_source_hash(p)
         if current_hash != h.get("hash", ""):
@@ -598,7 +603,7 @@ def get_manifest_entry_hash(entry: dict) -> str:
 def compute_current_entry_hash(
     entry: dict,
     project_root: Path,
-    source_roots: list[Path],
+    vendor_patterns: list[str],
     *,
     new_source_hash: str | None = None,
 ) -> str:
@@ -606,14 +611,15 @@ def compute_current_entry_hash(
 
     When *entry* is stale (headers or source changed), this function reads
     the actual on-disk hashes rather than trusting the stored values.
-    Headers outside *source_roots* (SDK/vendor) keep their stored hashes
-    — only project headers are re-hashed.
+    Headers matching *vendor_patterns* or outside *project_root* keep their
+    stored hashes — only project headers are re-hashed.
 
     *new_source_hash* overrides ``entry["source_hash"]`` when the source
     file content has also changed.
     """
+    from .sdk_detect import _path_matches
+
     source = new_source_hash if new_source_hash else entry.get("source_hash", "")
-    source_root_strs = [str(r) for r in source_roots]
 
     current_headers: list[dict] = []
     for h in entry.get("headers", []):
@@ -625,18 +631,20 @@ def compute_current_entry_hash(
         p = Path(header_path)
         if not p.is_absolute():
             p = (project_root / header_path).resolve()
-        resolved_str = str(p)
 
-        # Only re-hash project headers — SDK/vendor headers keep stored hash
-        in_project = any(
-            resolved_str.startswith(sr + "/") or resolved_str == sr
-            for sr in source_root_strs
-        )
-        if in_project:
+        # Outside project_root → keep stored hash
+        try:
+            rel_path = str(p.relative_to(project_root))
+        except ValueError:
+            current_headers.append(dict(h))
+            continue
+
+        # Matches vendor pattern → keep stored hash
+        if any(_path_matches(rel_path, pat) for pat in vendor_patterns):
+            current_headers.append(dict(h))
+        else:
             current_hash = compute_source_hash(p)
             current_headers.append({"path": h["path"], "hash": current_hash, "generated": h.get("generated", False)})
-        else:
-            current_headers.append(dict(h))
 
     header_hashes = "".join(
         h.get("hash", "")

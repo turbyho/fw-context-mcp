@@ -24,27 +24,9 @@ KIND_WEIGHT: dict[str, int] = {
 }
 
 
-def _is_project_local(fpath: str, source_roots: list[str] | None) -> bool:
-    """Check whether *fpath* is under one of the project source roots.
-
-    Uses case-sensitive comparison on Linux (correct for the filesystem);
-    on case-insensitive filesystems the paths will already match in the
-    correct case from ``compile_commands.json``.
-    """
-    if not source_roots or not fpath:
-        return False
-    fpath_normalized = fpath.rstrip("/")
-    for root in source_roots:
-        root_normalized = root.rstrip("/")
-        if fpath_normalized.startswith(root_normalized + "/") or fpath_normalized == root_normalized:
-            return True
-    return False
-
-
 def score_result(
     row: dict,
     query_stems: list[str],
-    source_roots: list[str] | None = None,
 ) -> int:
     """Score a single result row by how well it matches the query stems.
 
@@ -52,7 +34,7 @@ def score_result(
         name / name_tokens match  → +3
         qualified_name match      → +2
         file_path match           → +1
-        project-local code        → +1 (under any source_root)
+        project-local code        → +1 (is_project = 1)
         kind weight               → KIND_WEIGHT bonus
 
     ``query_stems`` are lowercased query terms with trailing ``*`` stripped
@@ -76,13 +58,7 @@ def score_result(
             s += 1
 
     # Bonus for symbols under project source roots.
-    # Prefer the indexed is_project flag (set during indexing with the
-    # exact source_roots at that time).  Fall back to local path check
-    # for older indexes built before is_project was populated — the
-    # current config's source_roots may differ, so this is best-effort.
-    if row.get("is_project"):
-        s += 1
-    elif source_roots and _is_project_local(fpath, source_roots):
+    if row.get("is_project") == 1:
         s += 1
 
     s += KIND_WEIGHT.get(kind, 0)

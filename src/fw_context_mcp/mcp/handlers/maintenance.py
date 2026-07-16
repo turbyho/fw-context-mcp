@@ -87,7 +87,9 @@ def get_active_build(
         number of TUs with stale header dependencies), manifest_verification (str —
         "full" when manifest.json exists, "none" otherwise), analyzed_symbols (int),
         unanalyzed_symbols (int — definition symbols still needing LLM analysis),
-        analysis_model (str or None), bg_reindex_running (bool),
+        analysis_model (str or None), vendor_paths (list[str] —
+        config index.vendor_paths), project_paths (list[str] —
+        config index.project_paths), bg_reindex_running (bool),
         reindex_progress (str or None — last log line when reindex is running),
         schema_version (int — DB schema version),
         current_schema (int — code expects), status (str — "ready"|"reindexing"|
@@ -160,6 +162,10 @@ def get_active_build(
             except sqlite3.OperationalError:
                 stored_analyze_vendor = False
 
+            # Load project config for vendor_paths/project_paths in the response
+            # and for unanalyzed_symbol count filtering.
+            proj_cfg = load_config(project_root=root)
+
             # Count definition symbols that still need LLM analysis
             if stored_analyze_vendor:
                 # No exclusion — count all symbols including vendor/SDK
@@ -178,11 +184,10 @@ def get_active_build(
             else:
                 from ..shared.filtering import compute_exclude_like
 
-                proj_cfg = load_config(project_root=root)
                 exclude_like = compute_exclude_like(
                     root,
                     analyze_vendor=False,
-                    exclude_paths=proj_cfg.index.exclude_paths,
+                    vendor_paths=proj_cfg.index.vendor_paths,
                 )
                 exclude_clauses = " AND ".join(
                     ["s.file_path NOT LIKE ?"] * len(exclude_like)
@@ -308,6 +313,8 @@ def get_active_build(
                 "manifest_verification": manifest_verification,
                 "description": cfg["description"] if "description" in cfg.keys() else "",
                 "first_indexed_at": cfg["first_indexed_at"] if "first_indexed_at" in cfg.keys() else "",
+                "vendor_paths": proj_cfg.index.vendor_paths,
+                "project_paths": proj_cfg.index.project_paths,
                 "status": status,
                 "reindex_needed": needs_reindex,
                 "reindex_reasons": reindex_reasons,
@@ -632,10 +639,14 @@ def reindex_file_impl(
         if not matching:
             return {"error": f"{target.name} not found in compile_commands.json — it may be a header-only file."}
         config_hash = cfg_data["config_hash"]
-        source_roots = cfg.source_root_paths(root)
-        exclude_paths = cfg.exclude_root_paths(root)
 
         from ...indexer.compile_commands import CompilationUnit as TU
+        from ...indexer.sdk_detect import _build_sdk_excludes, _normalize_patterns
+
+        vendor_patterns = list(_build_sdk_excludes(root))
+        if cfg.index.vendor_paths:
+            vendor_patterns.extend(_normalize_patterns(cfg.index.vendor_paths))
+        project_patterns_list = _normalize_patterns(list(cfg.index.project_paths)) if cfg.index.project_paths else []
         from ...indexer.db import write_lock as db_write_lock
         from ...indexer.ops import store_symbols_for_unit
         from ...indexer.symbols import (
@@ -665,8 +676,6 @@ def reindex_file_impl(
             try:
                 parsed = extract_all(
                     unit,
-                    source_roots=source_roots,
-                    exclude_paths=exclude_paths,
                     with_refs=cfg.index.index_refs,
                 )
                 parsed_units.append((unit, parsed))
@@ -697,8 +706,8 @@ def reindex_file_impl(
                             unit,
                             config_hash,
                             root,
-                            source_roots=source_roots,
-                            exclude_paths=exclude_paths,
+                            vendor_patterns=vendor_patterns,
+                            project_patterns=project_patterns_list,
                             index_refs=cfg.index.index_refs,
                             pre_parsed=parsed,
                         )
@@ -792,7 +801,6 @@ def reindex_file_impl(
                     try:
                         from ...cache_client import CacheClient
                         from ...indexer.runner import _build_llm_analysis
-                        from ..shared.filtering import compute_exclude_like
 
                         # Read stored analyze_vendor for consistent filtering
                         # with the original index run.
@@ -806,12 +814,6 @@ def reindex_file_impl(
                         except sqlite3.OperationalError:
                             stored_av = False
 
-                        exclude_like = compute_exclude_like(
-                            root,
-                            analyze_vendor=stored_av,
-                            exclude_paths=cfg.index.exclude_paths,
-                        )
-
                         cc = CacheClient.from_config(cfg)
                         try:
                             _build_llm_analysis(
@@ -822,7 +824,7 @@ def reindex_file_impl(
                                 write_lock_held=True,
                                 retry_unparseable=True,
                                 cache_client=cc,
-                                exclude_like=exclude_like,
+                                project_only=not stored_av,
                             )
                             conn.commit()
                         finally:

@@ -20,9 +20,8 @@ from ..shared.stale import _with_stale_recovery
 log = logging.getLogger(__name__)
 
 # Directories considered "application code" by project_only filters.
-_PROJECT_DIRS = ("src", "lib", "app", "include")
-_PROJECT_PATH_FILTER = " OR ".join(f"s.file_path LIKE '{d}/%'" for d in _PROJECT_DIRS)
-_PROJECT_PATH_FILTER_FILES = " OR ".join(f"f.path LIKE '{d}/%'" for d in _PROJECT_DIRS)
+# REMOVED: _PROJECT_DIRS, _PROJECT_PATH_FILTER, _PROJECT_PATH_FILTER_FILES
+# Replaced by s.is_project = 1 / f.is_project = 1 using the DB column.
 
 LOOKUP_EXACT_SQL = """SELECT s.* FROM symbols s
    WHERE s.config_hash=? AND (s.name=? OR s.qualified_name=?)
@@ -281,7 +280,7 @@ def search_code(
         def _do_search(c: sqlite3.Connection, config_hash: str) -> list[dict]:
             rows: list = search_symbols(
                 c, query, config_hash, limit=limit, kind=kind,
-                exclude_variables=False,
+                exclude_variables=False, project_only=project_only,
             )
             # Progressive fallback cascade when FTS5 returns nothing.
             # Each step broadens the search until we find results or exhaust options.
@@ -290,7 +289,7 @@ def search_code(
                 # Step 2: drop kind filter — users often guess the wrong kind
                 rows = search_symbols(
                     c, query, config_hash, limit=limit, kind=None,
-                    exclude_variables=False,
+                    exclude_variables=False, project_only=project_only,
                 )
                 if rows:
                     method = "fts5"
@@ -346,7 +345,7 @@ def search_code(
                     term_results = search_symbols(
                         c, term, config_hash,
                         limit=max(3, limit // len(terms)),
-                        kind=None, exclude_variables=True,
+                        kind=None, exclude_variables=True, project_only=project_only,
                     )
                     for r in term_results:
                         if r["usr"] not in seen_usr:
@@ -396,10 +395,6 @@ def search_code(
                         rows.extend(macro_dicts)
                 except (sqlite3.OperationalError, Exception):
                     pass  # macros_fts may not exist on older indexes
-
-            # Filter to application code when project_only=True
-            if project_only:
-                rows = [r for r in rows if r["file_path"].startswith(_PROJECT_DIRS)][:limit]
 
             fallback_used = (method != "fts5+kind")
 
@@ -633,14 +628,9 @@ async def semantic_search(
                             "Run `fw-context index --embeddings` to generate them.",
                 )
 
-            # Source-aware boost: project code > libraries > vendored SDK
-            def _source_boost(file_path: str) -> float:
-                if file_path.startswith("src/"):
-                    return 1.2
-                elif file_path.startswith("lib/"):
-                    return 1.1
-                else:
-                    return 0.85
+            # Source-aware boost: project code > vendored SDK
+            def _source_boost(row: dict) -> float:
+                return 1.2 if row.get("is_project") == 1 else 0.85
 
             # Compute cosine similarity + source boost for each embedding
             BATCH = 1000
@@ -650,7 +640,7 @@ async def semantic_search(
 
             for offset in range(0, total, BATCH):
                 rows = c.execute(
-                    """SELECT e.symbol_id, e.embedding, s.file_path
+                    """SELECT e.symbol_id, e.embedding, s.file_path, s.is_project
                        FROM embeddings e
                        JOIN symbols s ON s.id = e.symbol_id
                        WHERE s.config_hash = ? AND s.is_definition = 1
@@ -668,7 +658,7 @@ async def semantic_search(
                     norm_b = math.sqrt(sum(x * x for x in vec))
                     raw_sim = dot / (norm_a * norm_b) if norm_a and norm_b else 0.0
                     if raw_sim > threshold:
-                        boost = _source_boost(r["file_path"] or "")
+                        boost = _source_boost(r)
                         top_candidates.append((raw_sim * boost, raw_sim, r["symbol_id"]))
 
                 if len(top_candidates) > keep:
@@ -836,7 +826,7 @@ def search_bodies(
                 kind_filter = "AND s.kind = ?"
                 params.append(kind)
             if project_only:
-                project_filter = f"AND ({_PROJECT_PATH_FILTER})"
+                project_filter = "AND s.is_project = 1"
             params.append(limit * 3)  # fetch more for post-filter boosting
 
             rows = c.execute(
@@ -912,7 +902,7 @@ def search_content(
     - ``search_code`` — find symbols by NAME:
       ``interrupt handler``, ``modem init``.
 
-    **project_only=True** filters to application paths (src/, lib/).
+    **project_only=True** filters to files with ``is_project = 1`` (project code, excluding vendor/SDK).
     Default False includes vendor SDK files.
 
     Results are file-level (one entry per matching file) — use
@@ -930,7 +920,7 @@ def search_content(
             E.g. ``'InterruptIn'``, ``'extern C'``, ``'#define'``.
         project_root: Project root. Auto-detected if omitted.
         limit: Maximum results (default 20, max 100).
-        project_only: When True, exclude vendor SDK directories.
+        project_only: When True, filter to project code only (files with is_project = 1).
 
     Returns:
         list of dicts, each with: file, language, mtime,
@@ -948,7 +938,7 @@ def search_content(
         def _do_search(c: sqlite3.Connection, config_hash: str) -> list[dict]:
             project_filter = ""
             if project_only:
-                project_filter = f"AND ({_PROJECT_PATH_FILTER_FILES})"
+                project_filter = "AND f.is_project = 1"
 
             # Check if files_fts table exists — may be missing on indexes
             # that predate the files_fts feature.  Fall back to LIKE on

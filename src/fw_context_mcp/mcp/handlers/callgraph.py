@@ -28,7 +28,6 @@ from ...indexer.db import (
 )
 from ...utils import abs_path, resolve_project_root
 from ..shared.context import _db_path, _open_db_safe, _resolve_context
-from ..shared.filtering import _merge_excludes
 from .source import _lookup_definition
 
 log = logging.getLogger(__name__)
@@ -599,9 +598,10 @@ def find_dead_code(
     virtual method overrides, and weak-aliased symbols. Always verify before
     deleting.
 
-    By default, SDK/vendor paths are auto-excluded based on the detected
-    build system, and project config exclude_paths are applied.
-    Use ``project_only=False`` to see all results including vendor code.
+    By default, SDK/vendor paths are auto-excluded via the ``is_project``
+    column (which respects project config ``vendor_paths`` and
+    ``project_paths``).  Use ``project_only=False`` to see all results
+    including vendor code.
 
     Read-only. No side effects. Requires the reference index
     (``fw-context index`` — refs on by default).
@@ -609,11 +609,10 @@ def find_dead_code(
     Args:
         project_root: Project root. Auto-detected if omitted.
         limit: Maximum results (default 100).
-        exclude_paths: Additional LIKE patterns to exclude. Merged with
-            defaults from config. E.g. ``['lib/%']``.
-        project_only: When True (default), auto-excludes SDK/vendor paths
-            based on the detected build system and applies project config
-            exclude_paths. Set False to see all results.
+        exclude_paths: Additional LIKE patterns to exclude (user-supplied
+            tool parameter, not config). E.g. ``['lib/%']``.
+        project_only: When True (default), filters to ``is_project = 1``
+            symbols. Set False to see all results.
 
     Returns:
         list of dicts, each with: name, qualified_name, kind, file, line,
@@ -626,8 +625,6 @@ def find_dead_code(
     assert root is not None
     assert config_hash is not None
 
-    final_excludes = _merge_excludes(exclude_paths, project_only, root)
-
     db_path = _db_path(root)
     conn, open_err = _open_db_safe(db_path)
     if open_err:
@@ -636,7 +633,8 @@ def find_dead_code(
     try:
         rows = index_db.find_dead_code(
             conn, config_hash, limit=limit,
-            exclude_paths=final_excludes,
+            exclude_paths=exclude_paths,
+            project_only=project_only,
         )
         if not rows:
             return [{"info": "No dead or possibly-dead functions found — every defined function has at least one caller."}]
@@ -907,10 +905,10 @@ def find_hotspots(
     Args:
         project_root: Project root. Auto-detected if omitted.
         limit: Number of top-called functions to return (default 20).
-        project_only: When True (default), auto-excludes SDK/vendor paths
-            so hotspots reflect project code.
-        exclude_paths: Additional LIKE patterns to exclude. Merged with
-            defaults. E.g. ``['lib/%']``.
+        project_only: When True (default), filters to ``is_project = 1``
+            symbols so hotspots reflect project code.
+        exclude_paths: Additional LIKE patterns to exclude (user-supplied
+            tool parameter). E.g. ``['lib/%']``.
 
     Returns:
         list of dicts, each with: name, qualified_name, kind, file, line,
@@ -922,18 +920,24 @@ def find_hotspots(
     assert root is not None
     assert config_hash is not None
 
-    final_excludes = _merge_excludes(exclude_paths, project_only, root)
-
     db_path = _db_path(root)
     conn, open_err = _open_db_safe(db_path)
     if open_err:
         return [open_err]
     assert conn is not None
     try:
-        rows = index_db.find_hotspots(conn, config_hash, limit=limit, exclude_paths=final_excludes)
-        if not rows and final_excludes:
+        rows = index_db.find_hotspots(
+            conn, config_hash, limit=limit,
+            exclude_paths=exclude_paths,
+            project_only=project_only,
+        )
+        if not rows and project_only:
             # Nothing found with project filter — try without
-            rows = index_db.find_hotspots(conn, config_hash, limit=limit, exclude_paths=None)
+            rows = index_db.find_hotspots(
+                conn, config_hash, limit=limit,
+                exclude_paths=exclude_paths,
+                project_only=False,
+            )
         if not rows:
             return [{"info": "No references indexed — enable index_refs and re-index."}]
         return rows

@@ -80,18 +80,17 @@ board = "nrf52840dk_nrf52840"    # required
 ### PlatformIO / Arduino
 
 ```toml
+### PlatformIO / Arduino
+
+```toml
 [build]
 # nothing required — auto-detected from platformio.ini
 # clean = true
 
 [index]
-# PlatformIO frameworks live outside the project root:
-source_roots = [
-    "src",
-    "lib",
-    "/home/user/.platformio/packages/framework-arduinoespressif32",
-]
-exclude_paths = [".pio", "build", "BUILD"]
+# PlatformIO framework packages are auto-detected as vendor (is_project=0).
+# For vendored code your team maintains, use project_paths to mark it as project:
+# project_paths = ["src/my_customized_framework"]
 ```
 
 ### Mbed OS
@@ -113,8 +112,8 @@ defines = [
 ]
 
 [index]
-source_roots = []
-exclude_paths = ["build", "BUILD"]
+# vendor_paths = ["third_party"]          # additional vendor dirs (additive to auto-detection)
+# project_paths = ["src/old_hal"]        # manual project dirs (overrides auto-detection)
 ```
 
 > **`defines`** are passed as `-D` flags to the compiler. Use them for version

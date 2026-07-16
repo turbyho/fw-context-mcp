@@ -229,6 +229,7 @@ def _check_header_staleness(
 
     from ...indexer.manifest import check_tu_staleness
     from ...indexer.manifest import load as load_manifest
+    from ...indexer.sdk_detect import _build_sdk_excludes
 
     # Find the DB dir from the conn's path
     db_path = Path(conn.execute("PRAGMA database_list").fetchone()["file"])
@@ -237,13 +238,13 @@ def _check_header_staleness(
         return 0, []
 
     project_root = Path(manifest.get("project_root", str(root)))
-    source_roots = _get_source_roots_from_manifest(manifest, project_root)
+    vendor_patterns = list(_build_sdk_excludes(project_root))
 
     stale_count = 0
     affected: list[str] = []
 
     for entry in manifest.get("entries", [])[:max_files]:
-        stale, _ = check_tu_staleness(entry, project_root, source_roots)
+        stale, _ = check_tu_staleness(entry, project_root, vendor_patterns)
         if stale:
             stale_count += 1
             affected.append(entry["file"])
@@ -251,27 +252,6 @@ def _check_header_staleness(
     if use_cache:
         _header_staleness_cache[cache_key] = (time.monotonic(), stale_count)
     return stale_count, affected
-
-
-def _get_source_roots_from_manifest(manifest: dict, project_root: Path) -> list[Path]:
-    """Auto-detect source roots from manifest entries.
-
-    Only relative paths are used — absolute paths (framework TUs outside the
-    project tree) are skipped because ``f.parts[0]`` would return ``'/'``
-    and ``project_root / '/'`` resolves to the filesystem root, incorrectly
-    treating all files as project code.
-    """
-    roots: set[Path] = set()
-    for entry in manifest.get("entries", []):
-        f = Path(entry.get("file", ""))
-        if not f.parts or f.is_absolute():
-            continue
-        top = project_root / f.parts[0]
-        if top.is_dir():
-            roots.add(top)
-    if not roots:
-        roots = {project_root}
-    return list(roots)
 
 
 def _with_stale_recovery(

@@ -121,12 +121,10 @@ _PROJECT_DEFAULTS_TEMPLATE = """\
 compile_commands = "compile_commands.json"
 # Generate it with:  fw-context index --build  (auto-detects build system)
 # config_header = "config/my_build_config.h"   # path to config.h for custom build systems
-# source_roots: directories to index symbols from.
-#   Empty list = auto-detect (scans for src, lib, app, include, zephyr, mbed-os,
-#   modules + top-level directories from compile_commands.json).
-#   Set explicitly to narrow indexing to specific directories.
-source_roots = []
-exclude_paths = ["build", "BUILD"]
+#vendor_paths = ["third_party", "vendor_libs"]
+#project_paths = ["src/old_hal", "lib/muj_modul"]
+#  Pro cesty MIMO project_root používejte ABSOLUTNÍ cesty:
+#  project_paths = ["/home/user/esp/components/muj_fork"]
 
 # index_refs: build a cross-reference / call graph.
 #   On by default — enables find_callers, find_call_path, find_dead_code, etc.
@@ -263,8 +261,12 @@ class IndexConfig:
             ``-include`` flags in compile_commands.json.  When set, the file
             is force-included in every translation unit via ``-include``.
             Useful for custom build systems where auto-detection fails.
-        source_roots: Directories to index symbols from. Empty = auto-detect.
-        exclude_paths: Directories to exclude from indexing (LIKE patterns).
+        vendor_paths: Additional vendor/SDK directories (additive to auto-detection).
+            Paths matching these patterns get ``is_project=0``.
+        project_paths: Manual project directories that override auto-detection.
+            Paths matching these patterns get ``is_project=1``, even if they
+            would otherwise be detected as vendor/SDK.  Use absolute paths for
+            directories outside the project root.
         index_refs: Build cross-reference index for call-graph tools
             (find_callers, find_call_path, etc.). Enabled by default.
         index_embeddings: Generate vector embeddings during indexing for
@@ -273,8 +275,8 @@ class IndexConfig:
     db_dir: Path = field(default_factory=lambda: Path.home() / ".fw-context" / "index")
     compile_commands: Path = field(default_factory=lambda: Path("compile_commands.json"))
     config_header: str = ""  # path to build-generated config.h for custom build systems
-    source_roots: list[str] = field(default_factory=list)
-    exclude_paths: list[str] = field(default_factory=lambda: ["build", "BUILD"])
+    vendor_paths: list[str] = field(default_factory=list)
+    project_paths: list[str] = field(default_factory=list)
     index_refs: bool = True
     index_embeddings: bool = True
 
@@ -335,32 +337,6 @@ class Config:
     index: IndexConfig = field(default_factory=IndexConfig)
     llm: LLMConfig = field(default_factory=LLMConfig)
     cache_server: CacheServerConfig | None = None
-
-    def source_root_paths(self, project_root: Path) -> list[Path]:
-        """Resolve and validate source root directories against *project_root*.
-
-        Only directories that actually exist on disk are returned —
-        configured paths that don't exist are logged as warnings and skipped.
-        """
-        import logging
-        log = logging.getLogger(__name__)
-        result: list[Path] = []
-        for r in self.index.source_roots:
-            p = (project_root / r).resolve()
-            if p.exists():
-                result.append(p)
-            else:
-                log.warning("source_root %r does not exist — skipping", r)
-        return result
-
-    def exclude_root_paths(self, project_root: Path) -> list[Path]:
-        """Resolve exclude paths against *project_root*.
-
-        Note: This does NOT resolve glob patterns or validate existence —
-        the paths are used as SQL LIKE patterns downstream.
-        """
-        return [(project_root / p).resolve() for p in self.index.exclude_paths]
-
 
 def _deep_merge(base: dict, override: dict) -> dict:
     result = dict(base)
@@ -459,10 +435,12 @@ def _from_dict(data: dict) -> Config:
             cfg.index.db_dir = Path(db_dir).expanduser()
         if cc := idx.get("compile_commands"):
             cfg.index.compile_commands = Path(cc)
-        if "source_roots" in idx:
-            cfg.index.source_roots = idx["source_roots"]
-        if "exclude_paths" in idx:
-            cfg.index.exclude_paths = idx["exclude_paths"]
+        if config_header := idx.get("config_header"):
+            cfg.index.config_header = config_header
+        if "vendor_paths" in idx:
+            cfg.index.vendor_paths = idx["vendor_paths"]
+        if "project_paths" in idx:
+            cfg.index.project_paths = idx["project_paths"]
         if "index_refs" in idx:
             cfg.index.index_refs = bool(idx["index_refs"])
         if "index_embeddings" in idx:

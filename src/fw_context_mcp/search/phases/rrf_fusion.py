@@ -73,7 +73,7 @@ class RRFFusionPhase(Phase):
 
     def _boost(self, row: dict) -> float:
         b = 1.0
-        if row.get("is_project"):
+        if row.get("is_project") == 1:
             b *= self.PROJ_BOOST
         kind = row.get("kind", "")
         if kind in ("function", "method", "constructor", "destructor"):

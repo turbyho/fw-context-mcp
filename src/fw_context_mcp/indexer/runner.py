@@ -17,7 +17,6 @@ from pathlib import Path
 
 from ..config.settings import derive_project_id
 from ..llm.ollama import call_ollama
-from ..mcp.shared.filtering import compute_exclude_like
 from ..utils import MTIME_TOLERANCE_S, compute_source_hash, read_file_lines
 from .compile_commands import _SOURCE_EXTS, validate_include_files
 from .compile_commands import parse as parse_compile_commands
@@ -51,119 +50,9 @@ def _fmt_dur(seconds: float) -> str:
     return f"{seconds:.0f}s"
 
 
-_COMMON_SOURCE_DIRS = ["src", "lib", "app", "include", "drivers", "modules"]
-_COMMON_OS_DIRS = ["zephyr", "mbed-os"]
-
-
-def _detect_source_roots(project_root: Path, compile_commands: Path) -> list[Path]:
-    """Auto-detect source directories from project structure and compile_commands.json."""
-    roots: list[Path] = []
-    seen: set[Path] = set()
-
-    for name in _COMMON_SOURCE_DIRS:
-        p = project_root / name
-        if p.is_dir() and p not in seen:
-            roots.append(p)
-            seen.add(p)
-    for name in _COMMON_OS_DIRS:
-        p = project_root / name
-        if p.is_dir() and p not in seen:
-            roots.append(p)
-            seen.add(p)
-    try:
-        units = list(parse_compile_commands(compile_commands))
-        for unit in units:
-            resolved = unit.file.resolve()
-            try:
-                rel = resolved.relative_to(project_root)
-                top = project_root / rel.parts[0]
-                if top.is_dir() and top not in seen:
-                    roots.append(top)
-                    seen.add(top)
-            except ValueError:
-                # TU is outside the project root (e.g. PlatformIO packages,
-                # ESP-IDF framework, Zephyr modules). Walk up to find a
-                # sensible framework root directory.
-                _add_external_root(resolved, roots, seen)
-    except Exception:
-        pass
-    # If there are source files directly in the project root (e.g. main.cpp
-    # for Mbed OS), the cc.json loop above won't add project_root because
-    # rel.parts[0] is a file, not a directory.  Scan for such files and add
-    # the root so they are not silently excluded.
-    if project_root not in seen:
-        try:
-            for entry in project_root.iterdir():
-                if entry.is_file() and entry.suffix in _SOURCE_EXTS:
-                    if project_root not in seen:
-                        roots.append(project_root)
-                        seen.add(project_root)
-                    break
-        except OSError:
-            pass
-
-    if not roots:
-        roots = [project_root]
-        log.info("No source directories detected, falling back to project root")
-    log.info("Auto-detected source roots: %s", [str(r) for r in roots])
-    return roots
-
-
-def _add_external_root(tu_path: Path, roots: list[Path], seen: set[Path]) -> None:
-    """Add a framework root directory for a TU outside the project root.
-
-    Walks up looking for known markers (library.json, library.properties,
-    CMakeLists.txt with project()/idf_build, Kconfig), then falls back to
-    the grandparent or great-great-grandparent directory — whichever is the
-    smallest directory that still groups multiple TUs.
-    """
-    # Walk up looking for known framework/library markers
-    for ancestor in tu_path.parents:
-        if ancestor in seen:
-            return
-        # PlatformIO library markers
-        if (ancestor / "library.json").exists() or (ancestor / "library.properties").exists():
-            if ancestor not in seen:
-                roots.append(ancestor)
-                seen.add(ancestor)
-            return
-        # ESP-IDF component / Zephyr module marker
-        cmake = ancestor / "CMakeLists.txt"
-        if cmake.exists():
-            try:
-                text = cmake.read_text()
-                if "idf_build" in text or "idf_component" in text:
-                    # This is an ESP-IDF component dir — go one level up for
-                    # the IDF root (e.g. ~/esp/esp-idf/components/foo → ~/esp/esp-idf)
-                    parent = ancestor.parent
-                    if parent not in seen:
-                        roots.append(parent)
-                        seen.add(parent)
-                    return
-                if "zephyr_library" in text or "zephyr_module" in text:
-                    parent = ancestor.parent
-                    if parent not in seen:
-                        roots.append(parent)
-                        seen.add(parent)
-                    return
-            except (OSError, UnicodeDecodeError):
-                pass
-
-    # Fallback: walk up 2–4 levels and add the first directory not yet covered.
-    # For PlatformIO: ~/.platformio/packages/framework-arduinoespressif32/cores/esp32/foo.c
-    #   up 2 → framework-arduinoespressif32/cores/ (too deep)
-    #   up 3 → framework-arduinoespressif32/ (correct)
-    # For ESP-IDF:  ~/esp/esp-idf/components/esp_system/esp_err.c
-    #   up 2 → esp-idf/components/ (too deep)
-    #   up 3 → esp-idf/ (correct)
-    parents = list(tu_path.parents)
-    for level in (3, 2, 4):  # try level 3 first (best heuristic), then 2, then 4
-        if level < len(parents):
-            candidate = parents[level]
-            if candidate not in seen and not str(candidate).startswith("/usr"):
-                roots.append(candidate)
-                seen.add(candidate)
-                return
+# REMOVED: _COMMON_SOURCE_DIRS, _COMMON_OS_DIRS — replaced by is_project + vendor_patterns
+# REMOVED: _detect_source_roots — no longer needed; all files in compile_commands.json are indexed
+# REMOVED: _add_external_root — only called by _detect_source_roots, removed together
 
 
 def _cleanup_orphaned_cc_artifacts(db_path: Path, project_id: str) -> int:
@@ -430,7 +319,7 @@ def _build_llm_analysis(
     llm_config,
     db_dir: Path,
     *,
-    exclude_like: list[str] | None = None,
+    project_only: bool = True,
     write_lock_held: bool = False,
     cache_client=None,
     retry_unparseable: bool = False,
@@ -447,10 +336,10 @@ def _build_llm_analysis(
 
     *db_dir* is the directory containing the index database — used for the
     write lock that serializes DB access across processes.
-    *exclude_like* are LIKE patterns for SDK/vendor paths to skip
-    (when omitted, no paths are excluded — all symbols including
-    SDK/vendor are analyzed).  Pre-compute via
-    :func:`compute_exclude_like`.
+    *project_only* when True (default) filters to symbols where
+    ``s.is_project = 1`` (project code).  When False, all symbols
+    including vendor/SDK are analyzed.  Uses the ``is_project`` column
+    which is computed during indexing from vendor/project path patterns.
     *retry_unparseable* when True clears all ``skip:unparseable`` sentinels
     so previously-failed symbols are re-attempted. Set True for manual
     indexing, False for background reindex (safe: retries only on model change).
@@ -509,10 +398,11 @@ def _build_llm_analysis(
             (model,),
         )
 
-    if exclude_like is None:
-        exclude_like = []
+    if not project_only:
+        is_project_clause = ""
+    else:
+        is_project_clause = "AND s.is_project = 1"
 
-    exclude_clauses = " AND ".join(["s.file_path NOT LIKE ?"] * len(exclude_like))
     query = """SELECT s.id, s.name, s.qualified_name, s.kind, s.file_path,
                       s.signature, s.is_definition, s.docstring,
                       s.end_line, s.line, s.usr,
@@ -521,17 +411,18 @@ def _build_llm_analysis(
                JOIN files f ON s.file_id = f.id
                WHERE s.config_hash = ?
                  AND s.is_definition = 1
-                  AND s.kind IN ('function', 'method', 'constructor', 'destructor',
+                 AND s.kind IN ('function', 'method', 'constructor', 'destructor',
                                  'class', 'struct', 'union', 'typedef', 'enum')
-                  AND s.name NOT LIKE '%(anonymous%'
-                 AND s.name NOT LIKE '%(unnamed%'"""
-    if exclude_clauses:
-        query += f" AND {exclude_clauses}"
+                 AND s.name NOT LIKE '%(anonymous%'
+                 AND s.name NOT LIKE '%(unnamed%'
+                 """
+    if is_project_clause:
+        query += f" {is_project_clause}"
     query += """ AND s.id NOT IN (SELECT symbol_id FROM llm_analysis)
                ORDER BY s.kind, s.file_path, s.line"""
 
     with transaction(conn):
-        rows = conn.execute(query, (config_hash, *exclude_like)).fetchall()
+        rows = conn.execute(query, (config_hash,)).fetchall()
         if not rows:
             log.info("All project symbols already analyzed — nothing to do")
             return
@@ -1133,19 +1024,7 @@ def _refresh_header_mtimes_from_manifest(
     return refreshed
 
 
-def _is_excluded(file_path: Path, exclude_paths: list[Path], source_roots: list[Path]) -> bool:
-    """Return True when *file_path* should be excluded from indexing.
-
-    Source roots take priority over exclude paths — a file inside a
-    source root is never excluded, even when it also falls under an
-    exclude path.  This handles build systems that place preprocessed
-    source files inside the build directory (Arduino, PlatformIO).
-    """
-    resolved = file_path.resolve()
-    in_source = any(resolved == sr or resolved.is_relative_to(sr) for sr in source_roots)
-    if in_source:
-        return False
-    return any(resolved == ep or resolved.is_relative_to(ep) for ep in exclude_paths)
+# REMOVED: _is_excluded — no files are excluded from indexing; all are indexed
 
 
 def _update_manifest_after_index(
@@ -1472,8 +1351,7 @@ def _check_and_parse_unit(
     unit,
     config_hash,
     project_root,
-    source_roots,
-    exclude_paths,
+    vendor_patterns,
     index_refs,
     existing_files,
     force=False,
@@ -1492,7 +1370,11 @@ def _check_and_parse_unit(
     acquiring ``write_lock`` and calling ``_process_unit(pre_parsed=...)``
     to persist the result.
 
+    All translation units are indexed — no exclusion filtering.
+
     Args:
+        vendor_patterns: LIKE patterns for vendor/SDK directories (used for
+            manifest staleness checking — vendor headers are trusted).
         manifest: Optional ``{file_path: entry}`` lookup dict built from
             ``manifest.load()`` entries.  When provided, header staleness
             is checked via hash comparison against the manifest (fast —
@@ -1505,14 +1387,12 @@ def _check_and_parse_unit(
         * ``("reuse", None, None, hashes)`` — TU is unchanged across config_hash
           change; caller must copy symbols from the old config_hash and create
           a file record for the new config_hash (Tier 2b manifest-based match).
-        * ``("skipped", None, None, None)`` — excluded path or parse failed.
+        * ``("skipped", None, None, None)`` — parse failed.
         * ``("updated", parsed, (t_start, t_end), hashes)`` — parsed
           successfully, ready for ``_process_unit(pre_parsed=parsed)``.
           *hashes* is ``(source_hash, flags_hash, manifest_entry_hash)``.
     """
     resolved_tu = unit.file.resolve()
-    if _is_excluded(resolved_tu, exclude_paths, source_roots):
-        return ("unchanged", None, None, None)
 
     file_path = _normalize_file_path(str(resolved_tu), project_root)
     force_refs = force or os.environ.get("FW_CONTEXT_FORCE_REFINDEX") == "1"
@@ -1546,7 +1426,7 @@ def _check_and_parse_unit(
     manifest_entry_hash = _get_manifest_entry_hash_for_unit(
         unit,
         project_root,
-        source_roots,
+        vendor_patterns,
         manifest,
     )
 
@@ -1579,7 +1459,7 @@ def _check_and_parse_unit(
         # Preliminary (degraded) manifests have empty source_hash; old
         # manifests from before this feature lack flags_hash.
         if entry is not None and entry.get("source_hash") and entry.get("flags_hash"):
-            stale, _ = check_tu_staleness(entry, project_root, source_roots)
+            stale, _ = check_tu_staleness(entry, project_root, vendor_patterns)
             if not stale:
                 current_flags = compute_flags_hash(unit.raw_entry) if unit.raw_entry else ""
                 if entry["flags_hash"] == current_flags:
@@ -1596,8 +1476,6 @@ def _check_and_parse_unit(
     try:
         parsed = extract_all(
             unit,
-            source_roots=source_roots,
-            exclude_paths=exclude_paths,
             with_refs=index_refs,
         )
     except sqlite3.Error:
@@ -1617,7 +1495,7 @@ def _check_and_parse_unit(
 def _get_manifest_entry_hash_for_unit(
     unit,
     project_root: Path,
-    source_roots: list[Path],
+    vendor_patterns: list[str],
     manifest_lookup: dict[str, dict] | None,
 ) -> str:
     """Return the manifest entry hash for a TU for Tier 2 staleness comparison.
@@ -1641,14 +1519,14 @@ def _get_manifest_entry_hash_for_unit(
 
         entry = manifest_lookup.get(tu_rel)
         if entry is not None:
-            stale, current_source_hash = check_tu_staleness(entry, project_root, source_roots)
+            stale, current_source_hash = check_tu_staleness(entry, project_root, vendor_patterns)
             if not stale:
                 return _entry_hash(entry)
             # Stale — compute hash from CURRENT disk content (both source and headers)
             return compute_current_entry_hash(
                 entry,
                 project_root,
-                source_roots,
+                vendor_patterns,
                 new_source_hash=current_source_hash,
             )
 
@@ -1664,8 +1542,8 @@ def _process_unit(
     unit,
     config_hash,
     project_root,
-    source_roots,
-    exclude_paths,
+    vendor_patterns,
+    project_patterns,
     index_refs,
     db_path,
     existing_files,
@@ -1691,13 +1569,15 @@ def _process_unit(
     is only held for the DB write.  *parse_timing* provides the
     ``(t_start, t_end)`` values for the summary statistics.
 
+    All TUs are indexed — no exclusion filtering.
+
     Args:
         unit: The ``CompilationUnit`` to parse (file path + clang flags).
         config_hash: Content-addressable build fingerprint for scoping
             all DB operations to the current build configuration.
         project_root: Root directory used for path resolution.
-        source_roots: Directories whose symbols are considered project code.
-        exclude_paths: Directories to skip during extraction.
+        vendor_patterns: LIKE patterns for vendor/SDK directories.
+        project_patterns: LIKE patterns for user-declared project directories.
         index_refs: When True, extract call-graph references.
         db_path: Path to the SQLite database — used to open a connection
             when *conn* is ``None``.
@@ -1721,13 +1601,10 @@ def _process_unit(
         A tuple ``(status, symbols_added, refs_added, timing, headers)`` where
         *status* is ``"updated"`` (new or modified symbols stored),
         ``"unchanged"`` (mtime matched — no work needed), or ``"skipped"``
-        (excluded by ``exclude_paths`` or failed during parsing), and
+        (failed during parsing), and
         *headers* is a list of ``{path, hash, generated}`` dicts for included
         header files (empty list for unchanged/skipped).
     """
-    resolved_tu = unit.file.resolve()
-    if _is_excluded(resolved_tu, exclude_paths, source_roots):
-        return ("unchanged", 0, 0, (0.0, 0.0, 0.0), [])
 
     if pre_parsed is not None:
         parsed = pre_parsed
@@ -1756,8 +1633,6 @@ def _process_unit(
         try:
             parsed = extract_all(
                 unit,
-                source_roots=source_roots,
-                exclude_paths=exclude_paths,
                 with_refs=index_refs,
             )
         except Exception as exc:
@@ -1793,8 +1668,8 @@ def _process_unit(
                     unit,
                     config_hash,
                     project_root,
-                    source_roots=source_roots,
-                    exclude_paths=exclude_paths,
+                    vendor_patterns=vendor_patterns,
+                    project_patterns=project_patterns,
                     index_refs=index_refs,
                     pre_parsed=parsed,
                     existing_files=existing_files,
@@ -1834,8 +1709,8 @@ def _process_unit(
 def run(
     compile_commands: Path,
     db_path: Path,
-    source_roots: list[Path] | None = None,
-    exclude_paths: list[Path] | None = None,
+    vendor_paths: list[str] | None = None,
+    project_paths: list[str] | None = None,
     project_name: str | None = None,
     index_refs: bool = False,
     index_embeddings: bool = False,
@@ -1855,22 +1730,24 @@ def run(
     """Index a project: parse translation units, extract symbols, and store to SQLite.
 
     This is the main entry point for indexing a firmware project.  It reads
-    ``compile_commands.json``, filters translation units by their source root,
-    parses each with libclang, deduplicates symbols across files, and persists
-    the result to the SQLite database at ``db_path``.  Optionally builds
-    embeddings, LLM-based symbol analysis, file-level summaries, and the
-    method override graph.
+    ``compile_commands.json``, parses every translation unit with libclang,
+    deduplicates symbols across files, and persists the result to the SQLite
+    database at ``db_path``.  Optionally builds embeddings, LLM-based symbol
+    analysis, file-level summaries, and the method override graph.
+
+    All files from all included headers are indexed unconditionally.
+    ``is_project`` is computed per-symbol from *vendor_paths* (auto-detected
+    SDK dirs + user-configured) and *project_paths* (user-configured overrides).
 
     Args:
         compile_commands: Path to ``compile_commands.json`` (generated by
             ``bear``, ``compiledb``, or ``CMAKE_EXPORT_COMPILE_COMMANDS``).
         db_path: Path to the SQLite database file that will store the index.
-        source_roots: Directories whose files are considered project code.
-            Symbols outside these roots are not indexed.  Auto-detected from
-            common directory names and the compile_commands entries when not
-            provided.
-        exclude_paths: Directories to exclude from indexing (applied after
-            ``source_roots`` filtering).
+        vendor_paths: Additional vendor/SDK directory patterns (additive to
+            auto-detection).  Paths matching these get ``is_project=0``.
+        project_paths: Manual project directory patterns that override
+            auto-detection.  Paths matching these get ``is_project=1``.
+            Use absolute paths for directories outside the project root.
         project_name: Human-readable name for the project (defaults to the
             directory name of ``project_root``).
         index_refs: When True, extract call-graph references (call, ref,
@@ -1902,12 +1779,15 @@ def run(
         project_root = compile_commands.parent.resolve()
     else:
         project_root = project_root.resolve()
-    if not source_roots:
-        source_roots = _detect_source_roots(project_root, compile_commands)
-    source_roots = [r.resolve() for r in source_roots if r.exists()]
-    if exclude_paths is None:
-        exclude_paths = []
-    exclude_paths = [p.resolve() for p in exclude_paths]
+
+    # Prepare vendor/project patterns for is_project computation.
+    # Normalize patterns without % wildcard to match subdirectories.
+    from .sdk_detect import _build_sdk_excludes, _normalize_patterns
+
+    vendor_patterns = list(_build_sdk_excludes(project_root))
+    if vendor_paths:
+        vendor_patterns.extend(_normalize_patterns(vendor_paths))
+    project_patterns_list = _normalize_patterns(list(project_paths)) if project_paths else []
 
     if project_id is None:
         project_id = derive_project_id(project_root)
@@ -2132,8 +2012,7 @@ def run(
             unit,
             config_hash,
             project_root,
-            source_roots,
-            exclude_paths,
+            vendor_patterns,
             index_refs,
             existing_files,
             force=force,
@@ -2243,8 +2122,8 @@ def run(
                 unit,
                 config_hash,
                 project_root,
-                source_roots,
-                exclude_paths,
+                vendor_patterns,
+                project_patterns_list,
                 index_refs,
                 db_path,
                 existing_files,
@@ -2297,6 +2176,49 @@ def run(
     orphans = delete_orphan_files(conn, config_hash)
     if orphans:
         log.info("Orphan files cleaned up: %d", orphans)
+
+    # ── Post-index files.is_project alignment (3-step) ──
+    t_align_start = time.monotonic()
+
+    # Step 1: Symbol-based correction already done per-TU in store_symbols_for_unit.
+    # Step 2: Path-based fallback for explicit project_paths — files in
+    #         these directories are always project, even without symbols.
+    for pp in project_patterns_list:
+        fn_pp = pp.replace("%", "*")
+        conn.execute(
+            """UPDATE files SET is_project = 1
+               WHERE config_hash = ? AND is_project = 0
+                 AND path GLOB ?""",
+            (config_hash, fn_pp),
+        )
+
+    # Step 3: Blanket fallback — every file NOT matching a vendor pattern
+    #          is project code (matches "everything else → is_project=1").
+    #          External paths (outside project_root) are protected by the
+    #          NOT LIKE '/%' guard (Unix absolute paths).
+    external_guard = "AND path NOT LIKE '/%'"
+    if vendor_patterns:
+        sql_vendor_patterns = [p.replace("_", "\\_") for p in vendor_patterns]
+        not_like_clauses = " AND ".join(
+            ["path NOT LIKE ? ESCAPE '\\'"] * len(vendor_patterns)
+        )
+        conn.execute(
+            f"""UPDATE files SET is_project = 1
+                WHERE config_hash = ? AND is_project = 0
+                  AND ({not_like_clauses})
+                  {external_guard}""",
+            [config_hash] + sql_vendor_patterns,
+        )
+    else:
+        conn.execute(
+            f"""UPDATE files SET is_project = 1
+               WHERE config_hash = ? AND is_project = 0
+                 {external_guard}""",
+            [config_hash],
+        )
+    conn.commit()
+    t_align = time.monotonic() - t_align_start
+    log.info("files.is_project alignment  %s", _fmt_dur(t_align))
 
     elapsed_parse = time.monotonic() - t0
     log.info(
@@ -2372,14 +2294,7 @@ def run(
     # Post-processing — each function handles its own idempotency
     # (returns immediately when data already exists).
 
-    # Compute SDK exclude patterns once (auto-detected from project structure
-    # + config exclude_paths).  When _analyze_vendor is True, skip exclusion
-    # so vendor/SDK code is also analyzed.
-    exclude_like = compute_exclude_like(
-        project_root,
-        analyze_vendor=_analyze_vendor,
-        exclude_paths=exclude_paths,
-    )
+    # Use is_project column directly — respects project_paths/vendor_paths config.
 
     # Embedding generation (opt-in)
     if index_embeddings and llm_config is not None and llm_config.enabled:
@@ -2437,7 +2352,7 @@ def run(
             config_hash,
             llm_config,
             db_path.parent,
-            exclude_like=exclude_like,
+            project_only=not _analyze_vendor,
             cache_client=cc,
             retry_unparseable=True,
         )

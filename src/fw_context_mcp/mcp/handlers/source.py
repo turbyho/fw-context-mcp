@@ -20,7 +20,6 @@ from ...indexer.db import (
 from ...llm.ollama import OllamaError, OllamaModelNotFoundError, call_ollama_async
 from ...utils import abs_path, read_file_lines
 from ..shared.context import _open_db_safe, _resolve_context
-from ..shared.filtering import _build_sdk_excludes, _path_matches
 
 log = logging.getLogger(__name__)
 
@@ -534,7 +533,6 @@ def get_file_map(
 def get_symbol_context(
     name: Annotated[str, Field(description="Symbol name. Returns body, signature, all direct callers and callees.")],
     project_root: Annotated[str | None, Field(description="Project root. Auto-detected if omitted.")] = None,
-    project_only: Annotated[bool, Field(description="When True (default), filters callers and callees to project paths (excludes SDK/vendor).")] = True,
 ) -> dict:
     """Rich one-shot context for a C/C++ symbol: body, signature, all direct
     callers and callees. Answers "what does this do and how does it fit in
@@ -547,8 +545,9 @@ def get_symbol_context(
     slightly faster. For transitive call-graph exploration use
     ``find_all_callers_recursive`` or ``find_callees_recursive``.
 
-    By default, SDK/vendor callers and callees are filtered out for clarity.
-    Use ``project_only=False`` to see all callers/callees.
+    Returns ALL callers and callees including vendor/SDK code — the call
+    graph naturally spans project and vendor boundaries in both directions
+    (project → vendor API, vendor callback → project handler).
 
     Read-only. No side effects.
 
@@ -556,8 +555,6 @@ def get_symbol_context(
         name: Symbol name. Returns body, signature, all direct callers
             and callees.
         project_root: Project root. Auto-detected if omitted.
-        project_only: When True (default), filters callers and callees
-            to project paths (excludes SDK/vendor).
 
     Returns:
         dict with: name, qualified_name, kind, file, line, signature,
@@ -612,10 +609,11 @@ def get_symbol_context(
             file_path = abs_path(root, row["file_path"])
             symbol_usr = row["usr"]
 
-            # Build SDK exclude patterns for project filtering
-            sdk_excludes = _build_sdk_excludes(root) if project_only else []
-
-            # Immediate callers (who calls this symbol, direct + indirect)
+            # Immediate callers (who calls this symbol, direct + indirect).
+            # Returns ALL callers — the call graph naturally spans project
+            # and vendor boundaries in both directions (project → vendor API,
+            # vendor callback → project handler).  Filtering would distort
+            # the call graph and break transitive closure.
             callers = find_refs(conn, config_hash, name, ref_kind=["call", "indirect"])
             callers_list = [
                 {"name": c["caller_name"] or "?", "qualified_name": c["caller_qname"] or "",
@@ -623,48 +621,23 @@ def get_symbol_context(
                  "line": c["from_line"], "kind": c["caller_kind"] or "",
                  "ref_kind": c["ref_kind"]}
                 for c in callers
-                if not sdk_excludes or not any(
-                    _path_matches(c["caller_file"] or c["from_file"], p) for p in sdk_excludes
-                )
             ]
 
             # Immediate callees (what this symbol calls, direct + indirect).
-            # Push SDK excludes into SQL to avoid loading thousands of rows
-            # just to filter them in Python.
-            _callee_sql = """SELECT s.name, s.qualified_name, s.kind, s.file_path, r.ref_kind
+            callees_rows = conn.execute(
+                """SELECT s.name, s.qualified_name, s.kind, s.file_path, r.ref_kind
                    FROM refs r
                    JOIN symbols s ON s.usr = r.to_usr AND s.config_hash = r.config_hash
                    WHERE r.from_usr = ? AND r.config_hash = ?
-                     AND r.ref_kind IN ('call', 'indirect')"""
-            _callee_params: list = [symbol_usr, config_hash]
-            if sdk_excludes:
-                _callee_sql += " AND (" + " AND ".join(
-                    "s.file_path NOT LIKE ?" for _ in sdk_excludes
-                ) + ")"
-                _callee_params.extend(sdk_excludes)
-            callees_rows = conn.execute(_callee_sql, _callee_params).fetchall()
+                     AND r.ref_kind IN ('call', 'indirect')""",
+                (symbol_usr, config_hash),
+            ).fetchall()
             callees_list = [
                 {"name": c["name"], "qualified_name": c["qualified_name"] or "",
                  "kind": c["kind"], "file": abs_path(root, c["file_path"]),
                  "ref_kind": c["ref_kind"]}
                 for c in callees_rows
             ]
-
-            # Fallback: if project filtering removed everything, show all
-            if project_only and not callers_list and not callees_list:
-                callers_list = [
-                    {"name": c["caller_name"] or "?", "qualified_name": c["caller_qname"] or "",
-                     "file": abs_path(root, c["caller_file"] or c["from_file"]),
-                     "line": c["from_line"], "kind": c["caller_kind"] or "",
-                     "ref_kind": c["ref_kind"]}
-                    for c in callers
-                ]
-                callees_list = [
-                    {"name": c["name"], "qualified_name": c["qualified_name"] or "",
-                     "kind": c["kind"], "file": abs_path(root, c["file_path"]),
-                     "ref_kind": c["ref_kind"]}
-                    for c in callees_rows
-                ]
 
             # Indirect call sites — for function pointer fields and variables
             indirect_calls_list: list[dict] = []

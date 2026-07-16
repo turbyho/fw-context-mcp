@@ -1,8 +1,6 @@
 """Tests for fw_context_mcp.indexer.config_hash."""
 
-import json
 
-import pytest
 
 from fw_context_mcp.indexer.config_hash import _normalize_entry
 

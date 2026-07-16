@@ -60,8 +60,8 @@ doesn't exist yet.
 |-----|---------|-------|-------------|
 | `db_dir` | `"~/.fw-context/index"` | global, local | Directory for SQLite index databases. One subdirectory per project. |
 | `compile_commands` | `"compile_commands.json"` | project | Path to compilation database. Relative paths resolved from project root. |
-| `source_roots` | `[]` *(auto-detect)* | project | Directories to scan for symbols. **Empty = auto-detect** — scans `src`, `lib`, `app`, `include`, `modules`, `drivers` + framework dirs (`zephyr/`, `mbed-os/`) + top-level dirs from `compile_commands.json`. Set explicitly to narrow or extend: `["src", "lib", "/path/to/framework"]`. |
-| `exclude_paths` | `["build", "BUILD"]` | project | Directories to skip. Useful for generated code, test fixtures, vendored code. |
+| `vendor_paths` | `[]` | project | Additional vendor/SDK directory patterns (additive to auto-detection). Paths matching these get `is_project=0`. E.g. `["third_party", "generated"]`. |
+| `project_paths` | `[]` | project | Manual project directory patterns — overrides auto-detection. Paths matching these get `is_project=1`. Useful for vendored code your team maintains (e.g. `["src/old_hal"]`). For paths outside the project root, use absolute paths (e.g. `["/home/user/esp/components/muj_fork"]`). |
 | `index_refs` | `true` | project | Build cross-reference / call graph. On by default — enables `find_callers`, `find_call_path`, `find_dead_code`, etc. Set `false` or pass `--no-refs` for faster indexing on very large projects. |
 | `index_embeddings` | `true` | project | Generate vector embeddings during indexing. Requires Ollama. Embeddings power semantic search and hybrid FTS5+vector re-ranking. Disable with `false` or `--no-embeddings`. |
 
@@ -146,8 +146,8 @@ board = "nrf52840dk_nrf52840"            # required — your board name
 
 [index]
 compile_commands = "build/compile_commands.json"
-source_roots = []
-exclude_paths = ["build", "BUILD"]
+# vendor_paths = ["third_party"]          # additional vendor dirs (additive to auto-detection)
+# project_paths = ["src/old_hal"]        # manual project dirs (overrides auto-detection)
 ```
 
 #### PlatformIO / Arduino
@@ -161,12 +161,9 @@ name = "my-pio-project"
 
 [index]
 compile_commands = "compile_commands.json"
-source_roots = [
-    "src",
-    "lib",
-    "/home/user/.platformio/packages/framework-arduinoespressif32",
-]
-exclude_paths = [".pio", "build", "BUILD"]
+# PlatformIO framework packages are auto-detected as vendor (is_project=0).
+# For vendored code your team maintains, use project_paths to mark it as project:
+# project_paths = ["src/my_customized_framework"]
 ```
 
 #### Mbed OS
@@ -186,8 +183,8 @@ name = "my-mbed-app"
 
 [index]
 compile_commands = "compile_commands.json"
-source_roots = []
-exclude_paths = ["build", "BUILD"]
+# vendor_paths = ["third_party"]          # additional vendor dirs (additive to auto-detection)
+# project_paths = ["src/old_hal"]        # manual project dirs (overrides auto-detection)
 ```
 
 ### Local developer config (`<project>/.fw-context/local.toml`)
@@ -211,18 +208,17 @@ Keep this file out of git (add to `.gitignore`). It overrides settings from
 # db_dir = "~/.fw-context/index"        # override if you store indexes elsewhere
 ```
 
-## Source root auto-detection
+## Project vs vendor code detection
 
-When `source_roots` is empty (default), the indexer scans:
+Every indexed file gets an ``is_project`` flag during indexing, computed from
+path patterns in this priority order (first match wins):
 
-1. **Common source dirs:** `src`, `lib`, `app`, `include`, `drivers`, `modules`
-2. **Framework dirs:** `zephyr`, `mbed-os` (if present at project root)
-3. **Top-level dirs from `compile_commands.json`** — any directory containing
-   at least one translation unit
+1. **``project_paths`` config** → ``is_project=1`` (user says "this is project code")
+2. **Outside project root** → ``is_project=0`` (external SDK, toolchain, system headers)
+3. **``vendor_paths`` config + auto-detection** → ``is_project=0`` (SDK/vendor code)
+4. **Everything else** → ``is_project=1`` (project code)
 
-The `compile_commands.json` determines *which* translation units are parsed;
-the `#include` chain pulls in OS headers automatically. Result: framework
-symbols your project actually uses are indexed without manual configuration.
+Query-time ``project_only`` filtering uses this column directly
+(``WHERE is_project = 1``), so it always respects your config.
 
-Set `source_roots` explicitly only when you need to narrow the scope or
-include directories outside the project root (e.g. PlatformIO frameworks).
+See ``vendor_paths`` and ``project_paths`` in the ``[index]`` section above.

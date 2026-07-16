@@ -2,42 +2,7 @@
 
 from __future__ import annotations
 
-from fw_context_mcp.search.scoring import _is_project_local, score_result, stems_from_queries
-
-
-class TestIsProjectLocal:
-    def test_empty_source_roots_returns_false(self):
-        assert _is_project_local("src/main.c", None) is False
-        assert _is_project_local("src/main.c", []) is False
-
-    def test_empty_path_returns_false(self):
-        assert _is_project_local("", ["src/"]) is False
-
-    def test_exact_root_match(self):
-        assert _is_project_local("src/main.c", ["src"]) is True
-
-    def test_directory_prefix_match(self):
-        assert _is_project_local("src/module/file.c", ["src/"]) is True
-
-    def test_non_prefix_substring_not_match(self):
-        # "other_src" should NOT match source_root "src"
-        assert _is_project_local("other_src/main.c", ["src/"]) is False
-
-    def test_trailing_slash_normalized(self):
-        assert _is_project_local("src/main.c", ["src/"]) is True
-        assert _is_project_local("src/main.c//", ["src"]) is True
-
-    def test_multiple_roots_first_matches(self):
-        assert _is_project_local("lib/util.c", ["src/", "lib/"]) is True
-
-    def test_multiple_roots_none_match(self):
-        assert _is_project_local("vendor/sdk.c", ["src/", "lib/"]) is False
-
-    def test_exact_path_matches_root(self):
-        assert _is_project_local("src", ["src"]) is True
-
-    def test_trailing_slash_on_path(self):
-        assert _is_project_local("src/", ["src"]) is True
+from fw_context_mcp.search.scoring import score_result, stems_from_queries
 
 
 class TestScoreResult:
@@ -72,25 +37,27 @@ class TestScoreResult:
         s = score_result(row, ["modem"])
         assert s == 1 + 2
 
-    def test_project_local_bonus(self):
+    def test_project_local_bonus_is_project(self):
         row = {
             "name": "fn",
             "name_tokens": "fn",
             "file_path": "src/main.c",
             "kind": "function",
+            "is_project": 1,
         }
-        s = score_result(row, ["fn"], source_roots=["src"])
-        # 3 (name) + 1 (project-local) + 2 (function kind)
+        s = score_result(row, ["fn"])
+        # 3 (name) + 1 (project-local via is_project) + 2 (function kind)
         assert s == 6
 
-    def test_no_project_local_bonus_outside_roots(self):
+    def test_no_project_local_bonus_outside_project(self):
         row = {
             "name": "fn",
             "name_tokens": "fn",
             "file_path": "vendor/sdk.c",
             "kind": "function",
+            "is_project": 0,
         }
-        s = score_result(row, ["fn"], source_roots=["src"])
+        s = score_result(row, ["fn"])
         assert s == 3 + 2  # no local bonus
 
     def test_kind_weight_applied(self):
@@ -146,8 +113,9 @@ class TestScoreResult:
             "name_tokens": "modem init",
             "file_path": "modem/driver.c",
             "kind": "function",
+            "is_project": 1,
         }
-        s = score_result(row, ["modem", "init"], source_roots=["modem"])
+        s = score_result(row, ["modem", "init"])
         # modem: matches name (+3), init: matches name (+3)
         # project-local +1, function +2
         assert s == 3 + 3 + 1 + 2  # = 9
