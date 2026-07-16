@@ -7,7 +7,6 @@ timestamps, output paths, or dependency file names.
 from __future__ import annotations
 
 import hashlib
-import json
 import shlex
 from pathlib import Path
 

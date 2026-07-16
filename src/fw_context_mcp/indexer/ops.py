@@ -176,7 +176,7 @@ def _build_filtered_file_content(
             active.setdefault(fname, set()).add(loc.line)
 
     # ── Collect active lines from all header files in a single AST traversal ──
-    def _collect_all_active_lines(cursor: object) -> None:
+    def _collect_all_active_lines(cursor) -> None:
         """Walk the AST once and add extent line ranges keyed by source file."""
         if cursor.location.file:
             fname = str(cursor.location.file.name)
