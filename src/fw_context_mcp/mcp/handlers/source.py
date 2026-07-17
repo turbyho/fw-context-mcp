@@ -367,7 +367,7 @@ def get_source(
 
     Returns:
         dict: {name, qualified_name, kind, file, line, signature,
-        is_definition, is_template, is_virtual, is_pure_virtual,
+        docstring, is_definition, is_template, is_virtual, is_pure_virtual,
         source (str — the function/enum/macro body, truncated at 8000 chars),
         warning (str, optional — when source file cannot be read)}.
         May also include ``template_usr``, ``parent_usr``, ``enum_value``,
@@ -415,6 +415,7 @@ def get_source(
                 "is_template": bool(row["is_template"]),
                 "is_virtual": bool(row["is_virtual"]),
                 "is_pure_virtual": bool(row["is_pure_virtual"]),
+                "docstring": row["docstring"] or "",
             }
             if row["template_usr"]:
                 result["template_usr"] = row["template_usr"]
@@ -558,21 +559,22 @@ def get_symbol_context(
 
     Returns:
         dict with: name, qualified_name, kind, file, line, signature,
-    is_definition, callers (list), callees (list), source (body text),
-    indirect_call_sites (list, for field/variable symbols — where the
-    function pointer is actually invoked).
-    For field and variable symbols that have function pointer type,
-    also includes ``resolution``: {assignments_found, call_sites_found,
-    resolved, note} indicating whether assignments and call sites are
-    linked (Phase 3).  ``resolved=False`` with a note when parts are
-    missing — LLM can detect uncertainty.
-    For enums also returns constants and enum_value.
-    For macros returns ``kind="macro"``, ``value`` (raw definition), and
-    ``expanded_value`` (preprocessor-resolved).
-    When LLM analysis has been generated (``fw-context index --analyze``),
-    includes ``llm_analysis``: {summary, inputs, outputs, model, analyzed_at}
-    with a structured description of the symbol's purpose, parameters, and
-    return values/side effects.
+        docstring (raw Doxygen comment text), is_definition, callers (list),
+        callees (list), source (body text),
+        indirect_call_sites (list, for field/variable symbols — where the
+        function pointer is actually invoked).
+        For field and variable symbols that have function pointer type,
+        also includes ``resolution``: {assignments_found, call_sites_found,
+        resolved, note} indicating whether assignments and call sites are
+        linked (Phase 3).  ``resolved=False`` with a note when parts are
+        missing — LLM can detect uncertainty.
+        For enums also returns constants and enum_value.
+        For macros returns ``kind="macro"``, ``value`` (raw definition), and
+        ``expanded_value`` (preprocessor-resolved).
+        When LLM analysis has been generated (``fw-context index --analyze``),
+        includes ``llm_analysis``: {summary, inputs, outputs, model, analyzed_at}
+        with a structured description of the symbol's purpose, parameters, and
+        return values/side effects.
     """
     db_path, cfg, project_id, root = _resolve_context(project_root)
     if not db_path.exists():
@@ -761,6 +763,7 @@ def get_symbol_context(
         "callers": callers_list,
         "callees": callees_list,
         "indirect_call_sites": indirect_calls_list,
+        "docstring": row["docstring"] or "",
     }
     if resolution:
         result["resolution"] = resolution
