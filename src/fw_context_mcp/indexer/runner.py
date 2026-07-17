@@ -357,19 +357,28 @@ def _build_llm_analysis(
     # /api/tags response includes details.context_length per model —
     # authoritative for both local and cloud-proxied models.
     _model_ctx_size = llm_config.num_ctx
-    try:
-        resp = httpx.get(llm_config.ollama_url.rstrip("/") + "/api/tags", timeout=5.0)
-        resp.raise_for_status()
-        for m in resp.json().get("models", []):
-            if m.get("name") == llm_config.model:
-                ctx = m.get("details", {}).get("context_length", 0)
-                if ctx > 0:
-                    _model_ctx_size = ctx
-                    log.debug("Resolved model context from Ollama: %d tokens", ctx)
-                break
-    except Exception:
-        log.warning("Ollama not reachable — skipping LLM analysis generation")
-        return
+    if llm_config.chat_api_base:
+        # Chat is on an external API — skip Ollama reachability check,
+        # use configured num_ctx directly (no /api/tags context_length probe)
+        log.debug(
+            "Chat on external API (%s) — using cfg.num_ctx=%d",
+            llm_config.chat_api_base,
+            _model_ctx_size,
+        )
+    else:
+        try:
+            resp = httpx.get(llm_config.ollama_url.rstrip("/") + "/api/tags", timeout=5.0)
+            resp.raise_for_status()
+            for m in resp.json().get("models", []):
+                if m.get("name") == llm_config.model:
+                    ctx = m.get("details", {}).get("context_length", 0)
+                    if ctx > 0:
+                        _model_ctx_size = ctx
+                        log.debug("Resolved model context from Ollama: %d tokens", ctx)
+                    break
+        except Exception:
+            log.warning("Ollama not reachable — skipping LLM analysis generation")
+            return
 
     model = llm_config.model
 

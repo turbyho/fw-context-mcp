@@ -114,7 +114,23 @@ mcp = FastMCP(
         '  • status="ready" or "reindexing" — fw-context is fully operational.\n'
         "    bg_reindex_running does NOT mean the index is unavailable. Continue.\n"
         '  • status="reindex_needed" — queries still work, but schedule fw-context index.\n'
-        '  • status="no_index" or "error" — use other available tools.\n\n'
+        '  • status="not_initialized" — project not set up. ASK the operator:\n'
+        '    "Initialize fw-context? Runs `fw-context init` — creates project ID,\n'
+        "    config files (.fw-context/config.toml), and registers with AI tools.\"\n"
+        "    Do NOT run without operator confirmation. On approval → run\n"
+        "    `fw-context init` via bash, then call get_active_build() again\n"
+        "    (returns no_index). init and index are SEPARATE steps — after init,\n"
+        "    ask AGAIN before indexing (see no_index below).\n"
+        '  • status="no_index" — project initialized but no symbol index. ASK the\n'
+        '    operator: "Build the symbol index? Runs `fw-context index --build` which\n'
+        "    compiles and parses ALL C/C++ source with libclang — takes several minutes\n"
+        "    and uses gigabytes of disk.\" Do NOT run without operator confirmation.\n"
+        "    On approval → run `fw-context index --build` via bash (or\n"
+        "    `fw-context index <compile_commands.json>` if one exists), then call\n"
+        '    get_active_build() again to confirm status="ready".\n'
+        "    NOTE: init and index are NEVER combined — each requires its own\n"
+        "    operator confirmation before execution.\n"
+        '  • status="error" — DB corruption or access error. Use other tools.\n\n'
         "REVIEW WORKFLOW — when reviewing C/C++ code changes (per changed symbol):\n"
         "0. find_hotspots(project_only=True) — identify highest-impact functions FIRST.\n"
         "   Prioritize review of hotspots (20+ callers) over leaf functions.\n"
@@ -162,7 +178,8 @@ mcp = FastMCP(
         "get_template_instances, get_method_overrides.\n"
         "Source: get_source, get_symbol_context, get_file_map, explain_symbol, read_file.\n"
         "Maintenance: get_active_build, list_projects, get_project_info,\n"
-        "check_ollama, reindex_file, reindex_file_impl, reset_index.\n\n"
+        "check_ollama, configure_llm, reindex_file, reindex_file_impl,\n"
+        "reset_index.\n\n"
         "REVIEW SKILL — MANDATORY (not optional): When reviewing C/C++ firmware\n"
         "code (diffs, commits, PRs, changed files), your FIRST action MUST be:\n"
         "  skill(name=\"fw-review\")\n"
@@ -185,7 +202,45 @@ mcp = FastMCP(
         "If the project has a LOCAL fw-review skill, that overrides\n"
         "the global default — the user has intentionally customized it.\n\n"
         "Start every session with get_active_build().\n"
-        "For non-C/C++ files, general-purpose tools are preferred."
+        "For non-C/C++ files, general-purpose tools are preferred.\n\n"
+        "LLM SETUP — after get_active_build returns status='ready', call\n"
+        "check_ollama to verify the LLM backend:\n"
+        "  • status='ok' — LLM ready. Continue.\n"
+        "  • status='not_configured' — Ollama not running, no chat API. ASK:\n"
+        "    'Use local Ollama or a cloud API?'\n"
+        "    - Local: guide operator to install from https://ollama.com.\n"
+        "      For intranet: download installer on an internet machine,\n"
+        "      copy to local. Do NOT install Ollama yourself.\n"
+        "      After operator confirms Ollama is running, call check_ollama.\n"
+        "    - Cloud: ask for URL, key, model. Call configure_llm.\n"
+        "      If URL is external, ALWAYS warn: source code will be sent\n"
+        "      to that endpoint — ensure compliance with data security.\n"
+        "  • status='model_missing' — Chat model not installed.\n"
+        "    YOU estimate download size from model name (your knowledge).\n"
+        "    Report to operator with caveat: size may be inaccurate.\n"
+        "    ALWAYS ASK: 'Download this model, or configure a separate\n"
+        "    cloud chat API (no download needed)?'\n"
+        "    - Download by me: run `ollama pull {model}` via bash.\n"
+        "      On failure, check stderr for network errors (timeout,\n"
+        "      unreachable, no such host). If network issue: suggest\n"
+        "      offline install — pull on internet machine, copy\n"
+        "      ~/.ollama/models/, or download GGUF + ollama create.\n"
+        "    - Download manually: tell operator to run `ollama pull\n"
+        "      {model}` (NOTE: outside normal flow). Include offline\n"
+        "      instructions for intranet.\n"
+        "    - Cloud API: ask URL/key/model, call configure_llm.\n"
+        "  • status='model_missing' + suggest_cloud=true — No suitable\n"
+        "    code model installed. Emphasize cloud API option.\n"
+        "  • status='embedding_unavailable' — Chat works (cloud) but\n"
+        "    embedding needs Ollama. Warn: semantic search disabled.\n"
+        "    Offer to guide Ollama setup.\n"
+        "  • chat_api.compliance_warning present — ALWAYS show to operator.\n"
+        "    Recommend local or internal API first.\n"
+        "Model downloads are LARGE (multi-GB). ALWAYS ask before pulling.\n"
+        "auto_pull defaults to false — no automatic downloads on 404.\n"
+        "Model size estimates are YOUR judgment — always caveat to operator.\n"
+        "configure_llm writes ONLY to <project>/.fw-context/local.toml\n"
+        "(gitignored). It does NOT modify global or shared config files."
     ),
 )
 
@@ -230,6 +285,7 @@ _SOURCE_EXTS_WATCH = {".c", ".cpp", ".h", ".hpp"}
 
 # maintenance.py
 mcp.tool()(maintenance.check_ollama)
+mcp.tool()(maintenance.configure_llm)
 mcp.tool()(maintenance.get_active_build)
 mcp.tool()(maintenance.get_project_info)
 mcp.tool()(maintenance.list_projects)
@@ -390,11 +446,17 @@ def main() -> None:
     """Start the FastMCP stdio server — entry point for the ``fw-context-mcp`` command.
 
     On startup:
-    1. Validates that the project is initialized (``fw-context init`` has run)
-       and that a symbol index exists (``fw-context index`` has run).
-       If either is missing, sets a server-level sentinel that causes all
-       tool handlers to return a clear error with user instructions.
-    2. Pre-marks the database as integrity-checked.
+    1. Resolves the project root and validates initialization state.
+       - If project root cannot be resolved: sets a sentinel so all tools
+         return a clear error (fatal — server cannot operate).
+       - If project is not initialized (``fw-context init`` not run): server
+         starts normally — ``get_active_build()`` returns ``not_initialized``
+         so the agent can ask the operator and run init via bash.  Other
+         tools raise ``ProjectNotInitializedError`` (fail-fast).
+       - If project is initialized but no index exists: server starts
+         normally — ``get_active_build()`` returns ``no_index`` so the
+         agent can ask the operator and run index via bash.
+    2. When ready, pre-marks the database as integrity-checked.
     3. Ensures the persistent watcher daemon is running for the project
        (spawns it if this is the first MCP server).
     4. Starts a ping thread that keeps the daemon alive.
@@ -418,32 +480,18 @@ def main() -> None:
     try:
         project_id = derive_project_id(root)
     except PIE:
-        log.info("Project not initialized at %s — tools will report setup instructions", root)
-        _set_server_init_error(
-            f"Project at {root} is not initialized.\n\n"
-            "Run these commands in your terminal:\n"
-            "  1. fw-context init\n"
-            "  2. fw-context index --build\n"
-            "  3. Restart your AI tool\n\n"
-            "fw-context init creates a project ID (stored in .fw-context/config.toml).\n"
-            "fw-context index --build compiles and indexes your C/C++ codebase."
-        )
+        log.info("Project not initialized at %s — get_active_build() will report not_initialized", root)
         mcp.run()
         return
 
     # Check 2: does the index database exist?
+    # If not, we DON'T set the sentinel — the server starts normally so
+    # that get_active_build() can return status="no_index", allowing the
+    # agent to ask the operator and run `fw-context index` via bash.
     cfg = load_config(project_root=root)
     db_path = cfg.index.db_dir / project_id / "index.db"
     if not db_path.exists():
-        log.info("No index found at %s — tools will report setup instructions", db_path)
-        _set_server_init_error(
-            f"No symbol index found for project at {root}.\n\n"
-            "Run these commands in your terminal:\n"
-            "  1. fw-context index --build\n"
-            "  2. Restart your AI tool\n\n"
-            "fw-context index --build compiles and indexes your C/C++ codebase\n"
-            "for code intelligence (symbol lookup, call graph, search, etc.)."
-        )
+        log.info("No index found at %s — get_active_build() will report no_index", db_path)
         mcp.run()
         return
 
