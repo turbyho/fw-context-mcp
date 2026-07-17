@@ -76,7 +76,9 @@ Check(`get_active_build`) → Find(`search_code`/`lookup_symbol`)
 get_active_build() status:
   • "ready" / "reindexing" — fully operational. Continue.
   • "reindex_needed" — queries work, schedule `fw-context index`.
-  • "no_index" / "error" — use other available tools.
+  • "not_initialized" — ask operator, then run `fw-context init` via bash.
+  • "no_index" — ask operator, then run `fw-context index --build` via bash.
+  • "error" — DB corruption. Use other tools.
 
 ### Diff verification
 

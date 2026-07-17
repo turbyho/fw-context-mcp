@@ -59,9 +59,7 @@ def _pull_model(model: str, base_url: str) -> None:
             for _ in resp.iter_lines():
                 pass  # consume stream
     except httpx.HTTPStatusError as e:
-        raise OllamaError(
-            f"Failed to pull model '{model}': HTTP {e.response.status_code}"
-        ) from e
+        raise OllamaError(f"Failed to pull model '{model}': HTTP {e.response.status_code}") from e
     except Exception as e:
         raise OllamaError(f"Failed to pull model '{model}': {e}") from e
 
@@ -83,7 +81,12 @@ def call_ollama(
     temperature: float = 0.0,
     num_predict: int | None = None,
 ) -> str:
-    """Send a prompt to Ollama and return the response text.
+    """Send a prompt to the configured chat backend and return the response text.
+
+    When ``cfg.chat_api_base`` is set, the call is routed to an external
+    endpoint (OpenAI-compatible or Ollama-native, auto-detected from the URL).
+    When ``cfg.chat_api_base`` is None, the local Ollama ``/api/generate``
+    endpoint is used (original behaviour).
 
     Args:
         prompt: The full prompt text to send.
@@ -93,7 +96,25 @@ def call_ollama(
 
     Raises OllamaError on network or API failure.
     """
-    url = cfg.ollama_url.rstrip("/") + "/api/generate"
+    if cfg.chat_api_base:
+        from .chat_router import call_openai_chat, detect_chat_endpoint
+
+        fmt, endpoint = detect_chat_endpoint(cfg)
+        if fmt == "openai":
+            return call_openai_chat(
+                prompt,
+                cfg,
+                endpoint,
+                temperature=temperature,
+                num_predict=num_predict,
+            )
+        # fmt == "ollama": use the detected endpoint (may be a remote Ollama)
+        url = endpoint
+        base_url = cfg.chat_api_base
+    else:
+        url = cfg.ollama_url.rstrip("/") + "/api/generate"
+        base_url = cfg.ollama_url
+
     options: dict = {"num_ctx": cfg.num_ctx, "temperature": temperature}
     if num_predict is not None:
         options["num_predict"] = num_predict
@@ -109,32 +130,37 @@ def call_ollama(
         with ollama_guard():
             resp = httpx.post(url, json=payload, timeout=cfg.timeout)
         if resp.status_code == 404:
-            log.info("LLM model '%s' not found, pulling...", cfg.model)
-            _pull_model(cfg.model, cfg.ollama_url)
-            with ollama_guard():
-                resp = httpx.post(url, json=payload, timeout=cfg.timeout)
+            if cfg.auto_pull:
+                log.info("LLM model '%s' not found, pulling...", cfg.model)
+                _pull_model(cfg.model, base_url)
+                with ollama_guard():
+                    resp = httpx.post(url, json=payload, timeout=cfg.timeout)
+            else:
+                raise OllamaModelNotFoundError(cfg.model, base_url) from None
         resp.raise_for_status()
         response_text = resp.json()["response"]
         if cfg.debug_log:
-            _write_debug_log(cfg.debug_log, {
-                "ts": datetime.now(UTC).isoformat(),
-                "model": cfg.model,
-                "num_ctx": cfg.num_ctx,
-                "latency_s": round(time.monotonic() - t0, 2),
-                "prompt": prompt,
-                "response": response_text,
-            })
+            _write_debug_log(
+                cfg.debug_log,
+                {
+                    "ts": datetime.now(UTC).isoformat(),
+                    "model": cfg.model,
+                    "num_ctx": cfg.num_ctx,
+                    "latency_s": round(time.monotonic() - t0, 2),
+                    "prompt": prompt,
+                    "response": response_text,
+                },
+            )
         return response_text
     except httpx.ConnectError as e:
         raise OllamaError(
-            f"Cannot connect to Ollama at {cfg.ollama_url}. "
-            "Make sure Ollama is running: https://ollama.com"
+            f"Cannot connect to Ollama at {base_url}. Make sure Ollama is running: https://ollama.com"
         ) from e
     except httpx.TimeoutException:
         raise OllamaError(f"Ollama request timed out after {cfg.timeout:.0f}s") from None
     except httpx.HTTPStatusError as e:
         if e.response.status_code == 404:
-            raise OllamaModelNotFoundError(cfg.model, cfg.ollama_url) from e
+            raise OllamaModelNotFoundError(cfg.model, base_url) from e
         raise OllamaError(f"Ollama HTTP {e.response.status_code}: {e.response.text[:200]}") from e
     except OllamaError:
         raise  # Pass through — prevents wrapping by the broad except Exception below
@@ -164,8 +190,8 @@ def call_ollama_embed(inputs: list[str], cfg: LLMConfig, *, query: bool = True) 
         by model — 1024 for mxbai-embed-large, 4096 for qwen3-embedding).
 
     Raises:
-        OllamaError: On network failure. Auto-pulls the model on HTTP 404,
-            then retries once.
+        OllamaError: On network failure. When ``cfg.auto_pull`` is True,
+            auto-pulls the model on HTTP 404 then retries once.
     """
     url = cfg.ollama_url.rstrip("/") + "/api/embed"
     prompt = cfg.embed_query_prompt if query else cfg.embed_doc_prompt
@@ -183,38 +209,44 @@ def call_ollama_embed(inputs: list[str], cfg: LLMConfig, *, query: bool = True) 
         resp.raise_for_status()
         embeddings = resp.json()["embeddings"]
         if cfg.debug_log:
-            _write_debug_log(cfg.debug_log, {
-                "ts": datetime.now(UTC).isoformat(),
-                "model": cfg.embed_model,
-                "latency_s": round(time.monotonic() - t0, 2),
-                "num_inputs": len(inputs),
-                "embedding_dims": [len(e) for e in embeddings],
-            })
-        return embeddings
-    except httpx.HTTPStatusError as e:
-        if e.response.status_code == 404:
-            # Model not installed — pull it, then retry
-            log.info("Embedding model '%s' not found, pulling...", cfg.embed_model)
-            _pull_model(cfg.embed_model, cfg.ollama_url)
-            with ollama_guard():
-                resp = httpx.post(url, json=payload, timeout=cfg.timeout * 2)
-            resp.raise_for_status()
-            embeddings = resp.json()["embeddings"]
-            if cfg.debug_log:
-                _write_debug_log(cfg.debug_log, {
+            _write_debug_log(
+                cfg.debug_log,
+                {
                     "ts": datetime.now(UTC).isoformat(),
                     "model": cfg.embed_model,
                     "latency_s": round(time.monotonic() - t0, 2),
                     "num_inputs": len(inputs),
                     "embedding_dims": [len(e) for e in embeddings],
-                    "note": "pulled model first",
-                })
-            return embeddings
+                },
+            )
+        return embeddings
+    except httpx.HTTPStatusError as e:
+        if e.response.status_code == 404:
+            if cfg.auto_pull:
+                log.info("Embedding model '%s' not found, pulling...", cfg.embed_model)
+                _pull_model(cfg.embed_model, cfg.ollama_url)
+                with ollama_guard():
+                    resp = httpx.post(url, json=payload, timeout=cfg.timeout * 2)
+                resp.raise_for_status()
+                embeddings = resp.json()["embeddings"]
+                if cfg.debug_log:
+                    _write_debug_log(
+                        cfg.debug_log,
+                        {
+                            "ts": datetime.now(UTC).isoformat(),
+                            "model": cfg.embed_model,
+                            "latency_s": round(time.monotonic() - t0, 2),
+                            "num_inputs": len(inputs),
+                            "embedding_dims": [len(e) for e in embeddings],
+                            "note": "pulled model first",
+                        },
+                    )
+                return embeddings
+            raise OllamaModelNotFoundError(cfg.embed_model, cfg.ollama_url) from e
         raise OllamaError(f"Ollama HTTP {e.response.status_code}: {e.response.text[:200]}") from e
     except httpx.ConnectError as e:
         raise OllamaError(
-            f"Cannot connect to Ollama at {cfg.ollama_url}. "
-            "Make sure Ollama is running: https://ollama.com"
+            f"Cannot connect to Ollama at {cfg.ollama_url}. Make sure Ollama is running: https://ollama.com"
         ) from e
     except httpx.TimeoutException:
         raise OllamaError("Ollama embed request timed out") from None
@@ -245,84 +277,146 @@ async def call_ollama_async(
     Returns:
         The model's text response.
     """
-    return await asyncio.to_thread(
-        call_ollama, prompt, cfg, temperature=temperature, num_predict=num_predict
-    )
+    return await asyncio.to_thread(call_ollama, prompt, cfg, temperature=temperature, num_predict=num_predict)
+
+
+def _check_model_installed(model: str, installed: list[str]) -> bool:
+    """True if *model* is in *installed* (exact or prefix match)."""
+    if model in installed:
+        return True
+    return any(m.startswith(model.split(":")[0]) for m in installed)
+
+
+def _filter_code_models(installed: list[str]) -> list[str]:
+    """Return installed models that look like code-capable chat models."""
+    keywords = ("coder", "codestral", "code", "deepseek", "starcoder", "qwen")
+    return [m for m in installed if any(kw in m.lower() for kw in keywords)]
 
 
 def check_setup(cfg: LLMConfig) -> dict:
-    """Check Ollama connectivity and model availability.
+    """Check LLM backend connectivity and model availability.
+
+    Reports on both the chat API (Ollama native or external) and the
+    embedding API (always Ollama).  When ``chat_api_base`` points to an
+    external host, a compliance warning is included.
 
     Args:
         cfg: LLM configuration.
 
     Returns:
-        dict: {ollama_running (bool), model_installed (bool), model (str),
-        message (str, on error), latency_s, embedding_model,
-        embedding_installed}.
+        dict with keys varying by status:
+
+        ``status`` values:
+            - ``"ok"`` — chat and embedding backends ready.
+            - ``"disabled"`` — ``cfg.enabled`` is False.
+            - ``"not_configured"`` — Ollama not running and no chat_api_base.
+            - ``"embedding_unavailable"`` — Ollama down but chat on external API.
+            - ``"model_missing"`` — Ollama running but chat model not installed.
+            - ``"error"`` — unexpected error probing Ollama.
+
+        Common keys: ``chat_api`` (dict), ``ollama_running`` (bool),
+        ``installed_models`` (list, when Ollama is up), ``message`` (str),
+        ``compliance_warning`` (str, when chat_api_base is external).
     """
+    from ..config.settings import _is_loopback_url
+
+    result: dict = {}
+
+    # ── Chat API configuration info ──
+    if cfg.chat_api_base:
+        from .chat_router import detect_chat_endpoint
+
+        fmt, endpoint = detect_chat_endpoint(cfg)
+        result["chat_api"] = {
+            "configured": True,
+            "endpoint": endpoint,
+            "format": fmt,
+            "model": cfg.model,
+        }
+        if not _is_loopback_url(cfg.chat_api_base):
+            result["chat_api"]["compliance_warning"] = (
+                "External cloud API detected. Source code snippets in chat "
+                "prompts WILL be sent to this external endpoint. Ensure this "
+                "complies with your organization's data security policies. "
+                "Consider using local Ollama or an internal API proxy."
+            )
+    else:
+        result["chat_api"] = {"configured": False, "model": cfg.model}
+
+    # ── Ollama connectivity (for embedding + possibly chat) ──
     base_url = cfg.ollama_url.rstrip("/")
     try:
         resp = httpx.get(base_url + "/api/tags", timeout=5.0)
         resp.raise_for_status()
     except httpx.ConnectError:
-        return {
-            "status": "error",
-            "ollama_running": False,
-            "message": (
-                f"Ollama is not running at {cfg.ollama_url}. "
-                "Install and start: https://ollama.com"
-            ),
-        }
+        result["ollama_running"] = False
+        if cfg.chat_api_base:
+            result["status"] = "embedding_unavailable"
+            result["message"] = (
+                "Ollama is not running. Chat is configured on an external "
+                "API, but embedding requires local Ollama. Semantic search "
+                "will be disabled. Start Ollama: https://ollama.com"
+            )
+        else:
+            result["status"] = "not_configured"
+            result["message"] = (
+                "Ollama is not running and no chat API is configured. "
+                "Options: (1) install and start Ollama, (2) configure a "
+                "cloud API via the configure_llm tool."
+            )
+        return result
     except Exception as e:
-        return {"status": "error", "ollama_running": False, "message": str(e)}
+        result["ollama_running"] = False
+        result["status"] = "error"
+        result["message"] = str(e)
+        return result
 
+    # ── Ollama running — check models ──
     models = resp.json().get("models", [])
     installed = [m["name"] for m in models]
-    model_found = cfg.model in installed
+    result["ollama_running"] = True
+    result["ollama_url"] = cfg.ollama_url
+    result["installed_models"] = installed
+    result["num_ctx"] = cfg.num_ctx
 
-    if not model_found:
-        # Try prefix match (e.g. "codestral" matches "codestral:latest")
-        model_found = any(m.startswith(cfg.model.split(":")[0]) for m in installed)
+    # Embedding model check (embedding always uses Ollama)
+    embed_found = _check_model_installed(cfg.embed_model, installed)
+    result["configured_embed_model"] = cfg.embed_model
+    result["embedding_installed"] = embed_found
 
-    # Check embedding model too — semantic_search will fail at query time if it's missing
-    embed_found = cfg.embed_model in installed
-    if not embed_found:
-        embed_found = any(m.startswith(cfg.embed_model.split(":")[0]) for m in installed)
+    if cfg.chat_api_base:
+        # Chat goes to external API — Ollama only needs embedding model
+        if embed_found:
+            result["status"] = "ok"
+        else:
+            result["status"] = "model_missing"
+            result["message"] = (
+                f"Embedding model '{cfg.embed_model}' is not installed. Run: ollama pull {cfg.embed_model}"
+            )
+    else:
+        # Chat on Ollama — check chat model too
+        model_found = _check_model_installed(cfg.model, installed)
+        result["configured_model"] = cfg.model
 
-    result: dict = {
-        "status": "ok" if model_found else "model_missing",
-        "ollama_running": True,
-        "ollama_url": cfg.ollama_url,
-        "configured_model": cfg.model,
-        "num_ctx": cfg.num_ctx,
-        "installed_models": installed,
-        "configured_embed_model": cfg.embed_model,
-        "embedding_installed": embed_found,
-    }
+        if model_found and embed_found:
+            result["status"] = "ok"
+        else:
+            result["status"] = "model_missing"
+            messages: list[str] = []
+            if not model_found:
+                messages.append(f"Chat model '{cfg.model}' is not installed. Run: ollama pull {cfg.model}")
+                code_models = _filter_code_models(installed)
+                result["available_code_models"] = code_models
+                if not code_models:
+                    result["suggest_cloud"] = True
+            if not embed_found:
+                messages.append(
+                    f"Embedding model '{cfg.embed_model}' is not installed. Run: ollama pull {cfg.embed_model}"
+                )
+            result["message"] = " ".join(messages)
 
     if cfg.debug_log:
         result["debug_log"] = str(cfg.debug_log)
-
-    if not model_found:
-        result["message"] = (
-            f"Model '{cfg.model}' is not installed. "
-            f"Run: ollama pull {cfg.model}"
-        )
-        result["available_code_models"] = [
-            m for m in installed
-            if any(kw in m for kw in ("coder", "codestral", "code", "deepseek", "starcoder"))
-        ]
-
-    if not embed_found:
-        embed_msg = (
-            f"Embedding model '{cfg.embed_model}' is not installed. "
-            f"Run: ollama pull {cfg.embed_model}"
-        )
-        if "message" in result:
-            result["message"] += " " + embed_msg
-        else:
-            result["message"] = embed_msg
 
     return result
 
@@ -339,7 +433,4 @@ class OllamaModelNotFoundError(OllamaError):
 
     def __init__(self, model: str, url: str) -> None:
         self.model = model
-        super().__init__(
-            f"Model '{model}' not found in Ollama at {url}. "
-            f"Run: ollama pull {model}"
-        )
+        super().__init__(f"Model '{model}' not found in Ollama at {url}. Run: ollama pull {model}")
