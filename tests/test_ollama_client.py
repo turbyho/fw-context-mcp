@@ -20,6 +20,7 @@ from fw_context_mcp.config.settings import LLMConfig
 from fw_context_mcp.llm.ollama import (
     OllamaError,
     OllamaModelNotFoundError,
+    _parse_parameter_size,
     call_ollama,
     call_ollama_embed,
     check_setup,
@@ -500,12 +501,18 @@ class TestCheckSetupChatApi:
 
 class TestCheckSetupSuggestCloud:
     @patch("fw_context_mcp.llm.ollama.httpx.get")
-    def test_suggest_cloud_true_when_no_code_model(self, mock_get):
+    def test_suggest_cloud_true_when_no_large_model(self, mock_get):
         mock_get.return_value = _mock_get_response(
             json_body={
                 "models": [
-                    {"name": "llama3:8b"},
-                    {"name": "test-embed"},
+                    {
+                        "name": "llama3.2:latest",
+                        "details": {"parameter_size": "3.2B", "family": "llama", "quantization_level": "Q4_K_M"},
+                    },
+                    {
+                        "name": "test-embed",
+                        "details": {"parameter_size": "0.7B", "family": "bert", "quantization_level": "F16"},
+                    },
                 ]
             }
         )
@@ -514,20 +521,71 @@ class TestCheckSetupSuggestCloud:
         assert result.get("suggest_cloud") is True
 
     @patch("fw_context_mcp.llm.ollama.httpx.get")
-    def test_suggest_cloud_false_when_code_model_present(self, mock_get):
+    def test_suggest_cloud_false_when_large_model_present(self, mock_get):
         mock_get.return_value = _mock_get_response(
             json_body={
                 "models": [
-                    {"name": "qwen2.5-coder:14b"},
-                    {"name": "test-embed"},
+                    {
+                        "name": "llama3.1:70b",
+                        "details": {"parameter_size": "70B", "family": "llama", "quantization_level": "Q4_K_M"},
+                    },
+                    {
+                        "name": "test-embed",
+                        "details": {"parameter_size": "0.7B", "family": "bert", "quantization_level": "F16"},
+                    },
                 ]
             }
         )
         cfg = _cfg(chat_api_base=None, model="test-model", embed_model="test-embed")
         result = check_setup(cfg)
-        # model_missing because test-model != qwen2.5-coder:14b
         assert result["status"] == "model_missing"
-        assert "suggest_cloud" not in result or result.get("suggest_cloud") is False
+        assert result.get("suggest_cloud") is False
+
+    @patch("fw_context_mcp.llm.ollama.httpx.get")
+    def test_suggest_cloud_false_when_model_found(self, mock_get):
+        mock_get.return_value = _mock_get_response(
+            json_body={
+                "models": [
+                    {
+                        "name": "test-model",
+                        "details": {"parameter_size": "3.2B", "family": "llama", "quantization_level": "Q4_K_M"},
+                    },
+                    {
+                        "name": "test-embed",
+                        "details": {"parameter_size": "0.7B", "family": "bert", "quantization_level": "F16"},
+                    },
+                ]
+            }
+        )
+        cfg = _cfg(chat_api_base=None, model="test-model", embed_model="test-embed")
+        result = check_setup(cfg)
+        assert result["status"] == "ok"
+        assert result.get("suggest_cloud") is False
+
+    @patch("fw_context_mcp.llm.ollama.httpx.get")
+    def test_model_details_included(self, mock_get):
+        mock_get.return_value = _mock_get_response(
+            json_body={
+                "models": [
+                    {
+                        "name": "qwen2.5-coder:14b",
+                        "details": {"parameter_size": "14B", "family": "qwen2", "quantization_level": "Q4_K_M"},
+                    },
+                    {
+                        "name": "test-embed",
+                        "details": {"parameter_size": "0.7B", "family": "bert", "quantization_level": "F16"},
+                    },
+                ]
+            }
+        )
+        cfg = _cfg(chat_api_base=None, model="qwen2.5-coder:14b", embed_model="test-embed")
+        result = check_setup(cfg)
+        assert "model_details" in result
+        assert len(result["model_details"]) == 2
+        assert result["model_details"][0]["name"] == "qwen2.5-coder:14b"
+        assert result["model_details"][0]["parameter_size"] == "14B"
+        assert result["model_details"][0]["family"] == "qwen2"
+        assert result["model_details"][0]["quantization"] == "Q4_K_M"
 
     @patch("fw_context_mcp.llm.ollama.httpx.get")
     def test_does_not_estimate_download_sizes(self, mock_get):
@@ -539,23 +597,20 @@ class TestCheckSetupSuggestCloud:
         assert "model_download_info" not in result
 
     @patch("fw_context_mcp.llm.ollama.httpx.get")
-    def test_available_code_models_listed(self, mock_get):
+    def test_suggest_cloud_false_when_chat_api_external(self, mock_get):
         mock_get.return_value = _mock_get_response(
             json_body={
                 "models": [
-                    {"name": "qwen2.5-coder:14b"},
-                    {"name": "deepseek-coder-v2:16b"},
-                    {"name": "llama3:8b"},
-                    {"name": "test-embed"},
+                    {
+                        "name": "test-embed",
+                        "details": {"parameter_size": "0.7B", "family": "bert", "quantization_level": "F16"},
+                    },
                 ]
             }
         )
-        cfg = _cfg(chat_api_base=None, model="test-model", embed_model="test-embed")
+        cfg = _cfg(chat_api_base="https://api.deepseek.com/v1", embed_model="test-embed")
         result = check_setup(cfg)
-        assert "available_code_models" in result
-        assert "qwen2.5-coder:14b" in result["available_code_models"]
-        assert "deepseek-coder-v2:16b" in result["available_code_models"]
-        assert "llama3:8b" not in result["available_code_models"]
+        assert result.get("suggest_cloud") is False
 
 
 # ── check_setup: debug_log ───────────────────────────────────────────────────
@@ -589,3 +644,69 @@ class TestCheckSetupDebugLog:
         cfg = _cfg(chat_api_base=None, debug_log=None)
         result = check_setup(cfg)
         assert "debug_log" not in result
+
+
+# ── _parse_parameter_size: unit tests ─────────────────────────────────────────
+
+
+class TestParseParameterSize:
+    def test_decimal_billions(self):
+        assert _parse_parameter_size("7.6B") == 7.6
+
+    def test_integer_billions(self):
+        assert _parse_parameter_size("13B") == 13.0
+
+    def test_large_model(self):
+        assert _parse_parameter_size("70B") == 70.0
+
+    def test_small_model(self):
+        assert _parse_parameter_size("0.7B") == 0.7
+
+    def test_strips_whitespace(self):
+        assert _parse_parameter_size("  7.6B  ") == 7.6
+
+    def test_empty_string_returns_zero(self):
+        assert _parse_parameter_size("") == 0.0
+
+    def test_unknown_string_returns_zero(self):
+        assert _parse_parameter_size("unknown") == 0.0
+
+    def test_missing_b_suffix_returns_zero(self):
+        assert _parse_parameter_size("7.6") == 0.0
+
+    def test_only_b_returns_zero(self):
+        assert _parse_parameter_size("B") == 0.0
+
+
+# ── check_setup: missing details field (defensive) ────────────────────────────
+
+
+class TestCheckSetupMissingDetails:
+    @patch("fw_context_mcp.llm.ollama.httpx.get")
+    def test_no_crash_when_details_missing(self, mock_get):
+        mock_get.return_value = _mock_get_response(
+            json_body={
+                "models": [
+                    {"name": "mystery-model"},
+                    {"name": "test-embed"},
+                ]
+            }
+        )
+        cfg = _cfg(chat_api_base=None, model="test-model", embed_model="test-embed")
+        result = check_setup(cfg)
+        assert result["status"] == "model_missing"
+        assert "model_details" in result
+
+    @patch("fw_context_mcp.llm.ollama.httpx.get")
+    def test_suggest_cloud_true_when_all_details_missing(self, mock_get):
+        mock_get.return_value = _mock_get_response(
+            json_body={
+                "models": [
+                    {"name": "mystery-model"},
+                    {"name": "test-embed"},
+                ]
+            }
+        )
+        cfg = _cfg(chat_api_base=None, model="test-model", embed_model="test-embed")
+        result = check_setup(cfg)
+        assert result.get("suggest_cloud") is True

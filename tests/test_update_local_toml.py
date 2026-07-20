@@ -202,3 +202,52 @@ class TestUpdateLocalTomlValueTypes:
         original = _read_local_toml(root)
         _update_local_toml(root, {"chat_api_base": None, "model": None})
         assert _read_local_toml(root) == original
+
+
+# ── Keys without spaces around = ──────────────────────────────────────────────
+
+
+class TestUpdateLocalTomlNoSpaces:
+    def test_updates_key_value_without_spaces(self, tmp_path):
+        root = _make_project(tmp_path, '[llm]\nmodel="old"\n')
+        _update_local_toml(root, {"model": "new"})
+        content = _read_local_toml(root)
+        assert 'model = "new"' in content
+        assert 'model="old"' not in content
+
+    def test_updates_key_no_space_before_equals(self, tmp_path):
+        root = _make_project(tmp_path, '[llm]\nmodel ="old"\n')
+        _update_local_toml(root, {"model": "new"})
+        content = _read_local_toml(root)
+        assert 'model = "new"' in content
+        assert 'model ="old"' not in content
+
+    def test_updates_key_no_space_after_equals(self, tmp_path):
+        root = _make_project(tmp_path, '[llm]\nmodel= "old"\n')
+        _update_local_toml(root, {"model": "new"})
+        content = _read_local_toml(root)
+        assert 'model = "new"' in content
+        assert 'model= "old"' not in content
+
+    def test_updates_commented_key_without_spaces(self, tmp_path):
+        root = _make_project(tmp_path, '[llm]\n#model="old"\n')
+        _update_local_toml(root, {"model": "new"})
+        content = _read_local_toml(root)
+        assert 'model = "new"' in content
+        assert '#model="old"' not in content
+
+    def test_no_duplicate_line_when_key_without_spaces(self, tmp_path):
+        root = _make_project(tmp_path, '[llm]\nmodel="old"\n')
+        _update_local_toml(root, {"model": "new"})
+        content = _read_local_toml(root)
+        assert content.count("model") == 1  # only one line with "model"
+
+    def test_mixed_space_and_no_space_keys(self, tmp_path):
+        local = '[llm]\nmodel="old"\nchat_api_base = "old_url"\n'
+        root = _make_project(tmp_path, local)
+        _update_local_toml(root, {"model": "new", "chat_api_base": "https://new.example.com/v1"})
+        content = _read_local_toml(root)
+        assert 'model = "new"' in content
+        assert 'chat_api_base = "https://new.example.com/v1"' in content
+        assert 'model="old"' not in content
+        assert 'chat_api_base = "old_url"' not in content

@@ -229,8 +229,10 @@ mcp = FastMCP(
         "      {model}` (NOTE: outside normal flow). Include offline\n"
         "      instructions for intranet.\n"
         "    - Cloud API: ask URL/key/model, call configure_llm.\n"
-        "  • status='model_missing' + suggest_cloud=true — No suitable\n"
-        "    code model installed. Emphasize cloud API option.\n"
+        "  • status='model_missing' + suggest_cloud=true — No model\n"
+        "    ≥7B parameters installed (too small for code tasks).\n"
+        "    Check model_details for installed models. Emphasize cloud\n"
+        "    API option.\n"
         "  • status='embedding_unavailable' — Chat works (cloud) but\n"
         "    embedding needs Ollama. Warn: semantic search disabled.\n"
         "    Offer to guide Ollama setup.\n"
@@ -240,7 +242,13 @@ mcp = FastMCP(
         "auto_pull defaults to false — no automatic downloads on 404.\n"
         "Model size estimates are YOUR judgment — always caveat to operator.\n"
         "configure_llm writes ONLY to <project>/.fw-context/local.toml\n"
-        "(gitignored). It does NOT modify global or shared config files."
+        "(gitignored). It does NOT modify global or shared config files.\n"
+        "configure_llm returns status='error' — report the error message\n"
+        "to the operator. If the test call failed, check API URL/key/model.\n"
+        "The config was still written to local.toml — fix the issue and\n"
+        "call configure_llm again, or call check_ollama to verify.\n"
+        "configure_llm returns status='error' with 'not initialized' —\n"
+        "tell operator to run 'fw-context init' in the project root first."
     ),
 )
 

@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import threading
 import time
 from collections.abc import Generator
@@ -287,10 +288,13 @@ def _check_model_installed(model: str, installed: list[str]) -> bool:
     return any(m.startswith(model.split(":")[0]) for m in installed)
 
 
-def _filter_code_models(installed: list[str]) -> list[str]:
-    """Return installed models that look like code-capable chat models."""
-    keywords = ("coder", "codestral", "code", "deepseek", "starcoder", "qwen")
-    return [m for m in installed if any(kw in m.lower() for kw in keywords)]
+def _parse_parameter_size(size_str: str) -> float:
+    """Parse Ollama parameter_size string (e.g. '7.6B', '13B', '70B') to float billions.
+
+    Returns 0.0 for unparseable strings.
+    """
+    m = re.match(r"(\d+\.?\d*)B", size_str.strip())
+    return float(m.group(1)) if m else 0.0
 
 
 def check_setup(cfg: LLMConfig) -> dict:
@@ -320,7 +324,7 @@ def check_setup(cfg: LLMConfig) -> dict:
     """
     from ..config.settings import _is_loopback_url
 
-    result: dict = {}
+    result: dict = {"suggest_cloud": False}
 
     # ── Chat API configuration info ──
     if cfg.chat_api_base:
@@ -378,6 +382,16 @@ def check_setup(cfg: LLMConfig) -> dict:
     result["ollama_url"] = cfg.ollama_url
     result["installed_models"] = installed
     result["num_ctx"] = cfg.num_ctx
+    model_details = [
+        {
+            "name": m["name"],
+            "parameter_size": m.get("details", {}).get("parameter_size", "unknown"),
+            "family": m.get("details", {}).get("family", "unknown"),
+            "quantization": m.get("details", {}).get("quantization_level", "unknown"),
+        }
+        for m in models
+    ]
+    result["model_details"] = model_details
 
     # Embedding model check (embedding always uses Ollama)
     embed_found = _check_model_installed(cfg.embed_model, installed)
@@ -405,9 +419,11 @@ def check_setup(cfg: LLMConfig) -> dict:
             messages: list[str] = []
             if not model_found:
                 messages.append(f"Chat model '{cfg.model}' is not installed. Run: ollama pull {cfg.model}")
-                code_models = _filter_code_models(installed)
-                result["available_code_models"] = code_models
-                if not code_models:
+                max_size = max(
+                    (_parse_parameter_size(md["parameter_size"]) for md in model_details),
+                    default=0.0,
+                )
+                if max_size < 7.0:
                     result["suggest_cloud"] = True
             if not embed_found:
                 messages.append(

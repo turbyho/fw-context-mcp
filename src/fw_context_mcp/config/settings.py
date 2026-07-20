@@ -9,6 +9,7 @@ Hierarchy (later overrides earlier):
 
 from __future__ import annotations
 
+import re
 import sys
 import tomllib
 from dataclasses import dataclass, field
@@ -819,7 +820,7 @@ def _update_local_toml(project_root: Path, updates: dict[str, object]) -> None:
         found = False
         for i in range(llm_start, llm_end):
             stripped = lines[i].strip()
-            if stripped.startswith(f"{key} ") or stripped.startswith(f"# {key} "):
+            if re.match(rf"^#?\s*{re.escape(key)}\s*=", stripped):
                 lines[i] = _format_toml_value(key, value)
                 found = True
                 break
