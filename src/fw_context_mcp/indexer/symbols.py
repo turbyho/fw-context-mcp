@@ -1409,11 +1409,11 @@ def extract_all(
             loc = cursor.location
             if loc.file:
                 tokens = list(cursor.get_tokens())
-                # Pattern 1: obj.method( → IDENTIFIER DOT IDENTIFIER LPAREN
+                # Pattern 1: obj.method( or obj->method( → IDENTIFIER (DOT|ARROW) IDENTIFIER LPAREN
                 for i, tok in enumerate(tokens):
                     if (tok.kind.name == "IDENTIFIER"
                             and i + 3 < len(tokens)
-                            and tokens[i + 1].spelling == "."
+                            and tokens[i + 1].spelling in (".", "->")
                             and tokens[i + 2].kind.name == "IDENTIFIER"
                             and tokens[i + 3].spelling == "("):
                         field_name = tok.spelling
@@ -1440,7 +1440,7 @@ def extract_all(
                     if (tok.kind.name == "IDENTIFIER"
                             and i + 1 < len(tokens)
                             and tokens[i + 1].spelling == "("
-                            and (i == 0 or tokens[i - 1].spelling != ".")):
+                            and (i == 0 or tokens[i - 1].spelling not in (".", "->"))):
                         method_name = tok.spelling
                         target_usr = _resolve_method_usr(method_name)
                         if target_usr:
@@ -1488,8 +1488,8 @@ def extract_all(
                     break
             if _line_fn is None:
                 continue
-            # Scan for obj.method( patterns
-            for _m in re.finditer(r'(\w+)\.(\w+)\s*\(', _line):
+            # Scan for obj.method( and obj->method( patterns
+            for _m in re.finditer(r'(\w+)(?:\.|->)(\w+)\s*\(', _line):
                 _field_name = _m.group(1)
                 _method_name = _m.group(2)
                 _target_usr = _resolve_method_usr(_method_name, _field_name)

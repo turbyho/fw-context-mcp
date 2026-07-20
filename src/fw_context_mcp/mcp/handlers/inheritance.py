@@ -289,6 +289,13 @@ def get_template_instances(
     Uses the ``template_usr`` column populated during indexing via libclang's
     ``cursor.specialized_template``.
 
+    **Known limitation:** libclang's ``specialized_template`` does not
+    reliably resolve implicit instantiations or template methods of
+    template classes.  Header-only templates (e.g. ``RingBuffer<T>``)
+    may report zero instances even when used in the codebase.  Explicit
+    specializations and class/struct instantiations are detected more
+    reliably than method-level instantiations.
+
     For finding the template declaration itself use ``lookup_symbol``.
 
     Read-only. No side effects.
