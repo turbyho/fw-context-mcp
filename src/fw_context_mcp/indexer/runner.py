@@ -2268,21 +2268,21 @@ def run(
         try:
             from .macros import resolve_and_update
 
-            seen_flags: set[tuple] = set()
+            # Process all TUs — different TUs include different headers,
+            # so each contributes a different set of expanded macro values.
+            # Deduplicating by flags would miss macros only visible from
+            # TUs that include project config headers.
             for unit in units:
-                flag_key = tuple(sorted(unit.clang_args))
-                if flag_key in seen_flags:
-                    continue
-                seen_flags.add(flag_key)
                 try:
                     macro_updated += resolve_and_update(
                         conn,
                         config_hash,
                         unit.clang_args,
                         unit.file.resolve(),
+                        cwd=project_root,
                     )
-                except Exception:
-                    pass  # best-effort per TU
+                except Exception as e:
+                    log.debug("macro expansion failed for %s: %s", unit.file.name, e)
         except Exception:
             pass  # best-effort
         elapsed_macro = time.monotonic() - t_macro
@@ -2371,6 +2371,19 @@ def run(
         _build_overrides(conn, config_hash, db_path.parent)
         conn.commit()
         log.info("done  %s", _fmt_dur(time.monotonic() - t_ov))
+
+    # Cross-TU ref backfill (post-processing, requires complete symbols table)
+    # Resolves call references that per-TU _qn_to_usr could not find because
+    # the callee was defined in another translation unit.  Uses the global
+    # symbols table (via _resolve_target_usr) which is complete after the
+    # TU loop.  Must run BEFORE PageRank so the graph is complete.
+    if index_refs:
+        log.info("", extra={"phase": "Cross-TU ref backfill"})
+        t_bt = time.monotonic()
+        from .ops import backfill_cross_tu_refs
+        added = backfill_cross_tu_refs(conn, config_hash, project_root)
+        conn.commit()
+        log.info("done  %s  (%d refs backfilled)", _fmt_dur(time.monotonic() - t_bt), added)
 
     # PageRank computation (post-processing, requires reference index)
     if index_refs:

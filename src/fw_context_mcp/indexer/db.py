@@ -1953,11 +1953,17 @@ def get_overrides_for_method(
     Returns:
         dict with ``overrides`` (base methods this method overrides) and
         ``overridden_by`` (derived methods that override this one).
+
+    Uses LEFT JOIN so that override edges are preserved even when the
+    base/derived method's USR is not in the ``symbols`` table (e.g. the
+    method is declared in an unindexed SDK header).  In that case,
+    ``name``/``qualified_name``/``kind``/``file_path``/``line`` will be
+    ``None`` but the ``usr`` field is still populated.
     """
     overrides_rows = conn.execute(
         """SELECT o.base_usr, s.name, s.qualified_name, s.kind, s.file_path, s.line
            FROM overrides o
-           JOIN symbols s ON s.usr = o.base_usr AND s.config_hash = ?
+           LEFT JOIN symbols s ON s.usr = o.base_usr AND s.config_hash = ?
            WHERE o.config_hash = ? AND o.derived_usr = ?
            ORDER BY s.qualified_name""",
         (config_hash, config_hash, usr),
@@ -1966,7 +1972,7 @@ def get_overrides_for_method(
     overridden_by_rows = conn.execute(
         """SELECT o.derived_usr, s.name, s.qualified_name, s.kind, s.file_path, s.line
            FROM overrides o
-           JOIN symbols s ON s.usr = o.derived_usr AND s.config_hash = ?
+           LEFT JOIN symbols s ON s.usr = o.derived_usr AND s.config_hash = ?
            WHERE o.config_hash = ? AND o.base_usr = ?
            ORDER BY s.qualified_name""",
         (config_hash, config_hash, usr),

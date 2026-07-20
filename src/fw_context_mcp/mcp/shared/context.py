@@ -102,6 +102,24 @@ def _is_stale(cfg, compile_commands_path: str) -> bool:
         return False
 
 
+def _normalize_file_path_query(path: str) -> str:
+    """Normalize a file path for DB lookup.
+
+    The index stores paths with OS-native separators (backslash on Windows,
+    forward slash on Linux/macOS).  LLMs and cross-platform tools typically
+    use forward slashes (``src/main.cpp``).  On Windows this causes exact
+    matches and ``LIKE`` suffix matches to fail because the stored path is
+    ``src\\main.cpp``.
+
+    This function converts forward slashes to backslashes on Windows so
+    user-supplied paths match the stored format.  On Linux/macOS it is a
+    no-op (the stored separator is already ``/``).
+    """
+    if os.name == "nt":
+        return path.replace("/", "\\")
+    return path
+
+
 def _detect_build_system(root: Path) -> str:
     """Detect the build system in use from well-known project files.
 
