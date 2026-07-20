@@ -260,3 +260,41 @@ class TestConfigureLlmResult:
         assert result["status"] == "error"
         assert "No configuration changes" in result["message"]
         mock_post.assert_not_called()
+
+
+# ── Uninitialized project ────────────────────────────────────────────────────
+
+
+class TestConfigureLlmUninitialized:
+    def test_uninitialized_project_returns_error_dict(self, tmp_path):
+        root = tmp_path / "uninit"
+        root.mkdir()
+        result = configure_llm(
+            project_root=str(root),
+            chat_api_base="https://api.example.com/v1",
+        )
+        assert result["status"] == "error"
+        assert "not initialized" in result["message"].lower()
+
+    def test_uninitialized_project_no_config_dir(self, tmp_path):
+        root = tmp_path / "empty"
+        root.mkdir()
+        result = configure_llm(project_root=str(root))
+        assert result["status"] == "error"
+
+
+# ── Test-call timeout ────────────────────────────────────────────────────────
+
+
+class TestConfigureLlmTimeout:
+    @patch("fw_context_mcp.llm.chat_router.httpx.post")
+    def test_test_call_uses_short_timeout(self, mock_post, tmp_path):
+        mock_post.return_value = _mock_openai_response()
+        root = _make_project(tmp_path)
+        configure_llm(
+            project_root=str(root),
+            chat_api_base="https://api.example.com/v1",
+            chat_api_key="sk-test",
+        )
+        _, kwargs = mock_post.call_args
+        assert kwargs["timeout"] == 30.0

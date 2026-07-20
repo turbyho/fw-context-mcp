@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import logging
 import sqlite3
 import time
@@ -948,8 +949,8 @@ def check_ollama(
         ollama_running (bool), ollama_url (str), configured_model (str),
         num_ctx (int), installed_models (list[str]),
         configured_embed_model (str), embedding_installed (bool),
-        message (str, on error/disabled), available_code_models (list[str], when model missing),
-        debug_log (str, optional — only when debug logging is enabled)}
+        message (str, on error/disabled), model_details (list[dict], when Ollama running),
+        suggest_cloud (bool), debug_log (str, optional — only when debug logging is enabled)}
     """
     _, cfg, _, _ = _resolve_context(project_root)
     if not cfg.llm.enabled:
@@ -1060,9 +1061,18 @@ def configure_llm(
     Returns:
         dict: {status ("ok"|"error"), chat_api (dict), model, test_latency_s (float, on success), message (str, on error)}
     """
-    from ...config.settings import _is_loopback_url, _update_local_toml
+    from ...config.settings import ProjectNotInitializedError, _is_loopback_url, _update_local_toml
 
-    _, cfg, _, root = _resolve_context(project_root)
+    try:
+        _, cfg, _, root = _resolve_context(project_root)
+    except ProjectNotInitializedError as e:
+        return {
+            "status": "error",
+            "message": (
+                f"Project is not initialized. Run 'fw-context init' in the "
+                f"project root first. ({e.root})"
+            ),
+        }
 
     # Build updates dict — only non-None values are written
     updates: dict[str, object] = {}
@@ -1125,9 +1135,10 @@ def configure_llm(
         from ...llm.ollama import call_ollama
 
         t0 = time.monotonic()
+        test_cfg = dataclasses.replace(new_cfg.llm, timeout=30.0)
         response = call_ollama(
             "Reply with exactly: OK",
-            new_cfg.llm,
+            test_cfg,
             temperature=0.0,
             num_predict=10,
         )
