@@ -38,3 +38,7 @@ mbed_config.h
 .fw-context/local.toml
 eim_config.toml
 test-firmware/
+
+# Backup and temporary files
+*.bak
+LEAN-CTX.md
