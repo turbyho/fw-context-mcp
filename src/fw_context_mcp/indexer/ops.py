@@ -8,6 +8,7 @@ same code path.
 from __future__ import annotations
 
 import logging
+import re
 import sqlite3
 import time
 from pathlib import Path
@@ -15,6 +16,7 @@ from pathlib import Path
 from fw_context_mcp.indexer.config_hash import compute_tu_content_hash
 from fw_context_mcp.indexer.db import (
     _ensure_column,
+    _resolve_target_usr,
     delete_fp_assignments_for_file,
     delete_indirect_call_sites_for_file,
     delete_inheritance_for_file,
@@ -749,3 +751,120 @@ def store_symbols_for_unit(
         )
 
     return syms_added, refs_added, headers
+
+
+# ---------------------------------------------------------------------------
+# Cross-TU reference backfill — post-processing phase
+# ---------------------------------------------------------------------------
+
+# Regex matching obj.method( and obj->method( patterns in source lines.
+# Used by backfill_cross_tu_refs to find call sites that per-TU fallback
+# could not resolve (because the callee was defined in another TU and not
+# declared in any included header).
+_CALL_PATTERN_RE = re.compile(r"(\w+)(?:\.|->)(\w+)\s*\(")
+
+
+def backfill_cross_tu_refs(
+    conn: sqlite3.Connection,
+    config_hash: str,
+    project_root: Path,
+) -> int:
+    """Post-processing: backfill cross-TU call references.
+
+    Scans project source files for ``obj.method(`` and ``obj->method(``
+    patterns on lines inside known function bodies that have no existing
+    call/indirect reference.  Resolves the callee via the global symbols
+    table (``_resolve_target_usr``) — which has visibility across ALL TUs
+    after the TU loop completes.
+
+    This fills the gap left by per-TU ``_qn_to_usr`` which only contains
+    symbols from the current translation unit.  Cross-TU method calls
+    (e.g. a private method defined in another ``.cpp`` file) are resolved
+    here using the complete symbols table.
+
+    Returns:
+        Number of new references inserted.
+    """
+    total_added = 0
+
+    # 1. Get all project source files (.c/.cpp) with indexed content.
+    source_files = conn.execute(
+        """SELECT f.path, f.content, f.language
+           FROM files f
+           WHERE f.config_hash = ? AND f.is_project = 1
+             AND f.content != ''
+             AND (f.path LIKE '%.cpp' OR f.path LIKE '%.c'
+                  OR f.path LIKE '%.cc' OR f.path LIKE '%.cxx')""",
+        (config_hash,),
+    ).fetchall()
+
+    for frow in source_files:
+        file_path_rel = frow["path"]
+        content = frow["content"]
+        if not content:
+            continue
+
+        lines = content.splitlines()
+        n_lines = len(lines)
+
+        # 2. Get function/method definitions in this file → fn_spans.
+        #    Only definitions (is_definition=1) with valid end_line.
+        fn_rows = conn.execute(
+            """SELECT usr, line, end_line
+               FROM symbols
+               WHERE config_hash = ? AND file_path = ?
+                 AND is_definition = 1
+                 AND kind IN ('function', 'method', 'constructor', 'destructor')
+                 AND end_line > line""",
+            (config_hash, file_path_rel),
+        ).fetchall()
+
+        if not fn_rows:
+            continue  # No function bodies in this file
+
+        # Build function spans: [(usr, start_line, end_line)]
+        fn_spans: list[tuple[str, int, int]] = [
+            (r["usr"], r["line"], r["end_line"]) for r in fn_rows
+        ]
+
+        # 3. Get lines that already have call/indirect refs in this file.
+        existing_ref_lines = {
+            r["from_line"]
+            for r in conn.execute(
+                """SELECT DISTINCT from_line FROM refs
+                   WHERE config_hash = ? AND from_file = ?
+                     AND ref_kind IN ('call', 'indirect')""",
+                (config_hash, file_path_rel),
+            ).fetchall()
+        }
+
+        # 4. For each function span, scan lines without existing refs.
+        new_refs: list[tuple] = []
+        for fn_usr, fn_start, fn_end in fn_spans:
+            # Clamp to actual line count
+            span_end = min(fn_end, n_lines)
+            for lineno in range(fn_start, span_end + 1):
+                if lineno in existing_ref_lines:
+                    continue
+                line_text = lines[lineno - 1] if 0 < lineno <= n_lines else ""
+                if not line_text:
+                    continue
+                # Scan for obj.method( and obj->method( patterns
+                for m in _CALL_PATTERN_RE.finditer(line_text):
+                    method_name = m.group(2)
+                    # Skip common false positives
+                    if method_name in ("if", "for", "while", "switch", "sizeof", "return"):
+                        continue
+                    target_usr = _resolve_target_usr(conn, config_hash, method_name)
+                    if target_usr and target_usr != fn_usr:
+                        new_refs.append(
+                            (config_hash, target_usr, file_path_rel, lineno, fn_usr, "call")
+                        )
+                        # Mark this line as having a ref to avoid duplicates
+                        existing_ref_lines.add(lineno)
+
+        if new_refs:
+            insert_refs_batch(conn, new_refs)
+            total_added += len(new_refs)
+
+    return total_added

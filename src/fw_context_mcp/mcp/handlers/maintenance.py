@@ -745,7 +745,7 @@ def reindex_file_impl(
                         from ...indexer.macros import resolve_and_update
 
                         first_unit = parsed_units[0][0]
-                        resolve_and_update(conn, config_hash, first_unit.clang_args, first_unit.file.resolve())
+                        resolve_and_update(conn, config_hash, first_unit.clang_args, first_unit.file.resolve(), cwd=root)
                     except Exception:
                         pass
 

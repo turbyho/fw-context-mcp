@@ -73,6 +73,11 @@ def lookup_symbol(
         ``parent_usr``, ``summary``, ``inputs``, ``outputs`` when available.
         When no results found, may include ``_did_you_mean`` with suggested
         symbol names. Empty list if not found.
+
+        **Note:** C++ constructors share their name with the enclosing
+        class, so ``lookup_symbol("Foo")`` may return both ``class Foo``
+        and ``constructor Foo::Foo()``.  Use the ``kind`` field to
+        filter when you need a specific symbol type.
     """
     try:
         root = resolve_project_root(project_root)

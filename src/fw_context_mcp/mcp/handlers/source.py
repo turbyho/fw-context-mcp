@@ -19,7 +19,7 @@ from ...indexer.db import (
 )
 from ...llm.ollama import OllamaError, OllamaModelNotFoundError, call_ollama_async
 from ...utils import abs_path, read_file_lines
-from ..shared.context import _open_db_safe, _resolve_context
+from ..shared.context import _normalize_file_path_query, _open_db_safe, _resolve_context
 
 log = logging.getLogger(__name__)
 
@@ -505,6 +505,8 @@ def get_file_map(
             if not cfg_data:
                 return {"error": "No build config indexed."}
             config_hash = cfg_data["config_hash"]
+            # Normalize file path separators for DB lookup (Windows stores backslashes)
+            file_path = _normalize_file_path_query(file_path)
             # Resolve file_path: try exact match first, then suffix
             exact = conn.execute(
                 "SELECT COUNT(*) FROM symbols WHERE config_hash=? AND file_path=?",
@@ -837,6 +839,9 @@ def read_file(
             if not cfg_data:
                 return {"error": "No build config indexed."}
             config_hash = cfg_data["config_hash"]
+
+            # Normalize file path separators for DB lookup (Windows stores backslashes)
+            file_path = _normalize_file_path_query(file_path)
 
             # Resolve file_path: try exact match first, then suffix match
             exact = conn.execute(
