@@ -248,7 +248,13 @@ mcp = FastMCP(
         "The config was still written to local.toml — fix the issue and\n"
         "call configure_llm again, or call check_ollama to verify.\n"
         "configure_llm returns status='error' with 'not initialized' —\n"
-        "tell operator to run 'fw-context init' in the project root first."
+        "tell operator to run 'fw-context init' in the project root first.\n"
+        "Stream option: when the chat API is behind a reverse proxy (nginx,\n"
+        "Cloudflare, corporate proxy) that kills idle connections, set\n"
+        "stream=true via configure_llm. This sends stream:true and consumes\n"
+        "SSE chunks, keeping the connection alive. Default false — non-streaming\n"
+        "is sufficient for local Ollama. When false, SSE responses are still\n"
+        "auto-detected and parsed as a fallback."
     ),
 )
 

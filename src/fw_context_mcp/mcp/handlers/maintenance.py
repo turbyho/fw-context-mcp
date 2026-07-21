@@ -1036,6 +1036,16 @@ def configure_llm(
         bool,
         Field(description="Auto-pull models on 404 (Ollama only). False for intranet."),
     ] = False,
+    stream: Annotated[
+        bool | None,
+        Field(
+            description=(
+                "Stream chat responses via SSE (both OpenAI-compatible and Ollama-native). "
+                "True = send stream:true, consume SSE chunks — avoids reverse-proxy idle "
+                "timeouts (nginx 60s, Cloudflare 100s). None = keep current setting."
+            )
+        ),
+    ] = None,
 ) -> dict:
     """Configure LLM settings for the current project.
 
@@ -1057,6 +1067,7 @@ def configure_llm(
         model: Chat model name.
         embed_model: Embedding model name (Ollama only).
         auto_pull: Whether to auto-pull models on 404.
+        stream: Stream chat responses via SSE. True avoids reverse-proxy idle timeouts.
 
     Returns:
         dict: {status ("ok"|"error"), chat_api (dict), model, test_latency_s (float, on success), message (str, on error)}
@@ -1088,6 +1099,8 @@ def configure_llm(
         updates["embed_model"] = embed_model
     if auto_pull != cfg.llm.auto_pull:
         updates["auto_pull"] = auto_pull
+    if stream is not None:
+        updates["stream"] = stream
 
     if not updates:
         return {
@@ -1124,6 +1137,7 @@ def configure_llm(
     }
     result["model"] = new_cfg.llm.model
     result["auto_pull"] = new_cfg.llm.auto_pull
+    result["stream"] = new_cfg.llm.stream
 
     # Test the configuration with a simple API call
     if not new_cfg.llm.enabled:

@@ -460,11 +460,16 @@ class TestCallOpenaiChatErrors:
             call_openai_chat("p", cfg, "endpoint")
 
     @patch("fw_context_mcp.llm.chat_router.httpx.post")
-    def test_missing_content_key_raises(self, mock_post):
+    def test_missing_content_key_returns_empty(self, mock_post):
+        """Empty message dict (no content, no reasoning_content) returns empty string.
+
+        Previously this raised KeyError; now _extract_openai_text gracefully
+        returns '' as a reasoning_content fallback base case.
+        """
         mock_post.return_value = _mock_response(json_body={"choices": [{"message": {}}]})
         cfg = _cfg("https://api.example.com/v1")
-        with pytest.raises(OllamaError, match="Unexpected chat API response format"):
-            call_openai_chat("p", cfg, "endpoint")
+        result = call_openai_chat("p", cfg, "endpoint")
+        assert result == ""
 
     @patch("fw_context_mcp.llm.chat_router.httpx.post")
     def test_ollama_error_passes_through(self, mock_post):
