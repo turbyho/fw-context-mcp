@@ -65,6 +65,133 @@ def _pull_model(model: str, base_url: str) -> None:
         raise OllamaError(f"Failed to pull model '{model}': {e}") from e
 
 
+def _accumulate_ollama_sse(resp: httpx.Response) -> str:
+    """Parse a completed Ollama streaming response body and extract content.
+
+    Ollama streaming format: each line is a complete JSON object with
+    ``{"response": "chunk", "done": false}``.  The final line has
+    ``"done": true`` and an empty or absent ``response`` field.
+
+    This handles Plan A for the Ollama-native path: when the API returns
+    a streaming response despite ``stream: false`` being requested.
+    """
+    chunks: list[str] = []
+    for line in resp.text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+            chunk = obj.get("response", "")
+            if chunk:
+                chunks.append(chunk)
+        except json.JSONDecodeError:
+            continue
+    if not chunks:
+        raise OllamaError("Ollama SSE stream contained no content")
+    return "".join(chunks)
+
+
+def _stream_ollama_generate(
+    url: str,
+    payload: dict,
+    cfg: LLMConfig,
+    prompt: str,
+    base_url: str,
+    t0: float,
+) -> str:
+    """Send a streaming Ollama /api/generate request and accumulate response.
+
+    Uses ``httpx.stream()`` to consume newline-delimited JSON chunks as they
+    arrive (Plan B for the Ollama-native path).  This keeps the HTTP connection
+    alive with continuous data flow, avoiding reverse-proxy idle timeouts
+    when using a remote Ollama instance behind a proxy.
+
+    Args:
+        url: Full Ollama /api/generate URL.
+        payload: Request payload (stream will be set to True).
+        cfg: LLM configuration.
+        prompt: Original prompt text (for debug logging).
+        base_url: Ollama base URL (for error messages).
+        t0: Start time (monotonic) for latency logging.
+
+    Returns:
+        The accumulated text response.
+
+    Raises:
+        OllamaError / OllamaModelNotFoundError on failure.
+    """
+    payload["stream"] = True
+    chunks: list[str] = []
+    try:
+        with ollama_guard():
+            with httpx.stream("POST", url, json=payload, timeout=cfg.timeout) as resp:
+                if resp.status_code == 404:
+                    if cfg.auto_pull:
+                        log.info("LLM model '%s' not found, pulling...", cfg.model)
+                        _pull_model(cfg.model, base_url)
+                        # Retry with streaming
+                        with httpx.stream("POST", url, json=payload, timeout=cfg.timeout) as resp2:
+                            resp2.raise_for_status()
+                            for line in resp2.iter_lines():
+                                _extract_ollama_chunk(line, chunks)
+                    else:
+                        raise OllamaModelNotFoundError(cfg.model, base_url) from None
+                else:
+                    resp.raise_for_status()
+                    for line in resp.iter_lines():
+                        _extract_ollama_chunk(line, chunks)
+    except httpx.ConnectError as e:
+        raise OllamaError(
+            f"Cannot connect to Ollama at {base_url}. Make sure Ollama is running: https://ollama.com"
+        ) from e
+    except httpx.TimeoutException:
+        raise OllamaError(f"Ollama request timed out after {cfg.timeout:.0f}s") from None
+    except httpx.HTTPStatusError as e:
+        if e.response.status_code == 404:
+            raise OllamaModelNotFoundError(cfg.model, base_url) from e
+        raise OllamaError(f"Ollama HTTP {e.response.status_code}: {e.response.text[:200]}") from e
+    except OllamaError:
+        raise
+    except Exception as e:
+        raise OllamaError(str(e)) from e
+
+    if not chunks:
+        raise OllamaError("Streaming Ollama request returned no content")
+
+    response_text = "".join(chunks)
+    if cfg.debug_log:
+        _write_debug_log(
+            cfg.debug_log,
+            {
+                "ts": datetime.now(UTC).isoformat(),
+                "model": cfg.model,
+                "num_ctx": cfg.num_ctx,
+                "latency_s": round(time.monotonic() - t0, 2),
+                "prompt": prompt,
+                "response": response_text,
+                "streamed": True,
+            },
+        )
+    return response_text
+
+
+def _extract_ollama_chunk(line: str | None, chunks: list[str]) -> None:
+    """Extract a content chunk from an Ollama streaming JSON line."""
+    if not line:
+        return
+    line = line.strip()
+    if not line:
+        return
+    try:
+        obj = json.loads(line)
+        chunk = obj.get("response", "")
+        if chunk:
+            chunks.append(chunk)
+    except json.JSONDecodeError:
+        pass
+
+
 def _write_debug_log(path: Path, entry: dict) -> None:
     """Append a JSON line to the LLM debug log file."""
     try:
@@ -88,6 +215,17 @@ def call_ollama(
     endpoint (OpenAI-compatible or Ollama-native, auto-detected from the URL).
     When ``cfg.chat_api_base`` is None, the local Ollama ``/api/generate``
     endpoint is used (original behaviour).
+
+    Streaming behavior (when ``cfg.stream`` is True):
+
+    * OpenAI-compatible path: delegates to ``call_openai_chat`` which uses
+      ``httpx.stream()`` with SSE chunks (Plan B).
+    * Ollama-native path (local or remote): uses ``httpx.stream()`` with
+      newline-delimited JSON chunks (Plan B).
+
+    When ``cfg.stream`` is False (default): sends ``stream: false``.  If the
+    API returns a streaming response anyway, it is auto-detected and parsed
+    transparently (Plan A fallback).
 
     Args:
         prompt: The full prompt text to send.
@@ -126,6 +264,13 @@ def call_ollama(
         "keep_alive": cfg.keep_alive,
         "options": options,
     }
+
+    # Plan B: active streaming for the Ollama-native path
+    if cfg.stream:
+        t0 = time.monotonic()
+        return _stream_ollama_generate(url, payload, cfg, prompt, base_url, t0)
+
+    # Non-streaming request (Plan A: SSE auto-detection below)
     t0 = time.monotonic()
     try:
         with ollama_guard():
@@ -139,7 +284,15 @@ def call_ollama(
             else:
                 raise OllamaModelNotFoundError(cfg.model, base_url) from None
         resp.raise_for_status()
-        response_text = resp.json()["response"]
+
+        # Plan A: detect streaming response even when stream:false was requested
+        ct = resp.headers.get("content-type", "").lower()
+        if "text/event-stream" in ct or "application/x-ndjson" in ct:
+            log.debug("Ollama returned streaming response despite stream:false — parsing (Plan A fallback)")
+            response_text = _accumulate_ollama_sse(resp)
+        else:
+            response_text = resp.json()["response"]
+
         if cfg.debug_log:
             _write_debug_log(
                 cfg.debug_log,

@@ -194,6 +194,14 @@ _PROJECT_LOCAL_DEFAULTS_TEMPLATE = """\
 # pulls must be done explicitly via `ollama pull` or the agent flow.
 # auto_pull = false
 
+# Stream chat responses (both OpenAI-compatible and Ollama-native).
+# When true, sends stream:true and consumes SSE chunks — keeps the HTTP
+# connection alive with continuous data flow, avoiding reverse-proxy idle
+# timeouts (nginx 60s, Cloudflare 100s). Default false — non-streaming is
+# sufficient for local Ollama. When false, SSE responses are still
+# auto-detected and parsed as a fallback.
+# stream = false
+
 [index]
 # db_dir = "~/.fw-context/index"   # where to store the SQLite index database
 """
@@ -237,6 +245,12 @@ class LLMConfig:
         analyze_vendor: When False (default), skip LLM analysis for vendor/SDK code
             (mbed-os, Zephyr, PlatformIO, etc.) — only project code is analyzed.
             Set True to analyze every indexed symbol regardless of origin.
+        stream: When True, send ``stream: true`` and consume SSE chunks for chat
+            requests (both OpenAI-compatible and Ollama-native paths).  Keeps the
+            HTTP connection alive with continuous data flow, avoiding reverse-proxy
+            idle timeouts (nginx default 60s, Cloudflare 100s).  Default False —
+            non-streaming is simpler and sufficient for local Ollama.  When False,
+            SSE responses are still auto-detected and parsed (Plan A fallback).
     """
 
     enabled: bool = True
@@ -255,6 +269,7 @@ class LLMConfig:
     chat_api_key: str | None = None
     chat_api_format: str = "auto"
     auto_pull: bool = False
+    stream: bool = False
 
 
 def _apply_embed_prompt_defaults(llm_cfg: LLMConfig) -> None:
@@ -514,6 +529,8 @@ def _from_dict(data: dict) -> Config:
             cfg.llm.chat_api_format = fmt
         if "auto_pull" in llm:
             cfg.llm.auto_pull = bool(llm["auto_pull"])
+        if "stream" in llm:
+            cfg.llm.stream = bool(llm["stream"])
 
     if cs := data.get("cache_server", {}):
         cfg.cache_server = CacheServerConfig(

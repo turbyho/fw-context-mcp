@@ -394,7 +394,7 @@ def search_code(
                             }
                             if r["value"]:
                                 d["_macro_value"] = r["value"]
-                            if r.get("expanded_value"):
+                            if r["expanded_value"]:
                                 d["_macro_expanded_value"] = r["expanded_value"]
                             macro_dicts.append(d)
                         rows.extend(macro_dicts)
@@ -634,8 +634,8 @@ async def semantic_search(
                 )
 
             # Source-aware boost: project code > vendored SDK
-            def _source_boost(row: dict) -> float:
-                return 1.2 if row.get("is_project") == 1 else 0.85
+            def _source_boost(row) -> float:
+                return 1.2 if row["is_project"] == 1 else 0.85
 
             # Compute cosine similarity + source boost for each embedding
             BATCH = 1000
