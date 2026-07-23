@@ -2,6 +2,10 @@
 
 # fw-context
 
+> [!NOTE]
+> The project is functional but still evolving — not everything is fully stable.
+> Bug reports, shortcomings, and unexpected behavior reports are welcome. Issues and PRs appreciated.
+
 _All documentation is generated automatically using an LLM._
 
 Modern large language models are remarkably good at understanding C and C++. Yet before they can reason about your code, they first have to reconstruct the program from source files.
