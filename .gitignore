@@ -19,6 +19,18 @@ plans/
 
 .lean-ctx
 
+# AI tools
+.claude/
+.opencode/
+.agents/
+.codex/
+.kilo/
+.cursor/
+.copilot/
+.windsurf/
+CLAUDE.md
+AGENTS.md
+
 # IDE
 .vscode/
 .idea/
