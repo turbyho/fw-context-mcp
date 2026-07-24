@@ -52,23 +52,43 @@ That is why an LLM can produce a convincing firmware review and still miss the i
 
 fw-context indexes the project through the same compilation database used by your build tooling.
 
-```
-compile_commands.json
-        |
-        v
-     libclang
-        |
-        v
-compiler-accurate semantic index
-        |
-        v
-      MCP server
-        |
-        v
-        LLM
+```mermaid
+flowchart TD
+    CCJ[compile_commands.json<br/><i>flags, includes, defines</i>] --> LIBCLANG
+    SRC[(source files)] --> LIBCLANG
+
+    subgraph PARSER[" libclang "]
+        LIBCLANG[TranslationUnit per source file]
+    end
+
+    subgraph INDEX[" SQLite index "]
+        SYMBOLS[symbols<br/>name, kind, USR, signature, source body]
+        FILES[files<br/>path, ifdef-filtered content]
+        FTS5[FTS5 full-text search<br/>names, bodies, file content, macros]
+        REFS[references &amp; call graph<br/>refs, fp_assignments, indirect_call_sites]
+        INHERIT[inheritance &amp; overrides]
+        MACROS[macros<br/>#define name, raw &amp; expanded value]
+        ENRICH[enrichment<br/>embeddings<br/>LLM analysis<br/>hotspot cache]
+    end
+
+    MCP[MCP server<br/>33 tools: search, call graph,<br/>source, inheritance, maintenance]
+    LLM[LLM coding agent]
+
+    LIBCLANG --> SYMBOLS
+    LIBCLANG --> FILES
+    LIBCLANG --> REFS
+    LIBCLANG --> INHERIT
+    LIBCLANG --> MACROS
+    SYMBOLS --> FTS5
+    SYMBOLS --> ENRICH
+    FILES --> FTS5
+    MACROS --> FTS5
+    REFS --> ENRICH
+    INDEX --> MCP
+    MCP --> LLM
 ```
 
-The index stores symbols, source extents, references, call relationships, active source content, function pointer assignments, inheritance information, macro definitions with expanded values, documentation and optional LLM-generated summaries. The MCP server exposes this information as tools that coding agents and other LLM clients can call during analysis, review and navigation.
+The index stores symbols, source extents, references, call relationships, active source content, function pointer assignments, inheritance information, macro definitions with expanded values, documentation and optional LLM-generated summaries. The MCP server exposes this information as 33 tools that coding agents and other LLM clients can call during analysis, review and navigation.
 
 fw-context does not replace the model. It gives the model better input.
 
