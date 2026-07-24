@@ -421,7 +421,7 @@ def _build_llm_analysis(
     query += """ AND s.id NOT IN (SELECT symbol_id FROM llm_analysis)
                ORDER BY s.kind, s.file_path, s.line"""
 
-    with transaction(conn):
+    with transaction(conn, checkpoint=False):
         rows = conn.execute(query, (config_hash,)).fetchall()
         if not rows:
             log.info("All project symbols already analyzed — nothing to do")
@@ -478,7 +478,7 @@ def _build_llm_analysis(
             if cached:
                 # Cache hit — re-use existing analysis
                 with write_lock(db_dir, timeout=5.0) if not write_lock_held else nullcontext():
-                    with transaction(conn):
+                    with transaction(conn, checkpoint=False):
                         upsert_llm_analysis_batch(
                             conn,
                             [
@@ -537,7 +537,7 @@ def _build_llm_analysis(
             # The model needs at least 300 tokens of response space.
             if _est_prompt_tokens + 300 + _safety_margin > _ctx_size:
                 with write_lock(db_dir, timeout=5.0) if not write_lock_held else nullcontext():
-                    with transaction(conn):
+                    with transaction(conn, checkpoint=False):
                         upsert_llm_analysis_batch(conn, [(d["id"], "", "", "", f"skip:toolarge:{_model_ctx_size}", h)])
                 total += 1
                 elapsed = time.monotonic() - t0
@@ -571,7 +571,7 @@ def _build_llm_analysis(
                 # and should only hold successful analyses.
                 total += 1
                 with write_lock(db_dir, timeout=5.0) if not write_lock_held else nullcontext():
-                    with transaction(conn):
+                    with transaction(conn, checkpoint=False):
                         sentinel = f"skip:unparseable:{model}"
                         upsert_llm_analysis_batch(conn, [(d["id"], "", "", "", sentinel, h)])
                 elapsed = time.monotonic() - t0
@@ -582,7 +582,7 @@ def _build_llm_analysis(
 
             r = parsed[0]
             with write_lock(db_dir, timeout=5.0) if not write_lock_held else nullcontext():
-                with transaction(conn):
+                with transaction(conn, checkpoint=False):
                     db_rows = [(r["symbol_id"], r["summary"], r["inputs"], r["outputs"], model, h)]
                     inserted = upsert_llm_analysis_batch(conn, db_rows)
                     # Store in local global cache
@@ -632,6 +632,11 @@ def _build_llm_analysis(
             elapsed = time.monotonic() - t0
             log.warning("[%d/%d] %s: err %s: %s", idx + 1, total_symbols, qname, _fmt_dur(elapsed), e)
             continue
+
+    try:
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    except Exception:
+        pass
 
     log.info("LLM analysis stored: %d/%d symbols (model=%s)", total, total_symbols, model)
 
