@@ -55,7 +55,7 @@ fw-context indexes the project through the same compilation database used by you
 ```mermaid
 flowchart LR
     CCJ[compile_commands.json] & SRC[(source files)] --> LIBCLANG[libclang<br/>AST parser]
-    LIBCLANG --> SYMBOLS[symbols] & FILES[files] & REFS[refs &amp;<br/>call graph] & INHERIT[inheritance<br/>&amp; overrides] & MACROS[macros] & ENRICH[enrichment]
+    LIBCLANG --> SYMBOLS[symbols<br/>name, kind, USR<br/>signature, source body<br/>docstring, tokens] & FILES[files<br/>path, language<br/>ifdef-filtered content<br/>project/SDK sources] & REFS[refs &amp; call graph<br/>refs, fp_assignments<br/>indirect_call_sites] & INHERIT[inheritance<br/>&amp; overrides<br/>base/derived edges<br/>virtual dispatch] & MACROS[macros<br/>#define name<br/>raw &amp; expanded value<br/>FTS5 searchable] & ENRICH[enrichment<br/>embeddings &amp; semantic search<br/>LLM analysis &amp; summaries<br/>hotspot cache]
     SYMBOLS & FILES & REFS & INHERIT & MACROS & ENRICH --> MCP[MCP server<br/>33 tools]
     MCP --> LLM[LLM coding agent]
 ```
