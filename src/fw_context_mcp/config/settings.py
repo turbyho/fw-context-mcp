@@ -22,6 +22,12 @@ __all__ = [
     "update_global_config",
 ]
 
+# ── Embedding description format version — bump when the text changes ──
+# desc-v1: original — "kind name : in class : in path : sig : doc : llm"
+# desc-v2: body text appended for function/method/constructor/destructor
+# desc-v3: file name prefix added
+DESCRIPTION_VERSION = "desc-v3"
+
 
 class ProjectNotInitializedError(RuntimeError):
     """Raised when a project has not been initialized with ``fw-context init``."""
@@ -224,6 +230,11 @@ class LLMConfig:
     debug_log: Path | None = None
     analyze_symbols: bool = True
     analyze_vendor: bool = False
+    reranker_model: str | None = None  # "cross-encoder/ms-marco-MiniLM-L6-v2" to enable
+
+    def embed_key(self) -> str:
+        """Return ``embed_model`` with description version for cache disambiguation."""
+        return f"{self.embed_model}:{DESCRIPTION_VERSION}"
 
 
 def _apply_embed_prompt_defaults(llm_cfg: LLMConfig) -> None:
@@ -280,6 +291,8 @@ class IndexConfig:
     project_paths: list[str] = field(default_factory=list)
     index_refs: bool = True
     index_embeddings: bool = True
+    rerank_top_k: int = 50
+    rrf_weights: str = "fixed"  # "fixed" or "adaptive"
 
 
 @dataclass
@@ -446,6 +459,10 @@ def _from_dict(data: dict) -> Config:
             cfg.index.index_refs = bool(idx["index_refs"])
         if "index_embeddings" in idx:
             cfg.index.index_embeddings = bool(idx["index_embeddings"])
+        if "rerank_top_k" in idx:
+            cfg.index.rerank_top_k = int(idx["rerank_top_k"])
+        if "rrf_weights" in idx:
+            cfg.index.rrf_weights = idx["rrf_weights"]
 
     if llm := data.get("llm", {}):
         if "enabled" in llm:
@@ -473,6 +490,8 @@ def _from_dict(data: dict) -> Config:
             cfg.llm.analyze_symbols = bool(llm["analyze_symbols"])
         if "analyze_vendor" in llm:
             cfg.llm.analyze_vendor = bool(llm["analyze_vendor"])
+        if reranker_model := llm.get("reranker_model"):
+            cfg.llm.reranker_model = reranker_model
 
     if cs := data.get("cache_server", {}):
         cfg.cache_server = CacheServerConfig(

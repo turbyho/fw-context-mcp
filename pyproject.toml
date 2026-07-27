@@ -25,6 +25,9 @@ cache-server = [
     "uvicorn[standard]>=0.27",
     "asyncpg>=0.29",
 ]
+st = [
+    "sentence-transformers>=3.0.0",
+]
 dev = [
     "pytest>=8",
     "ruff>=0.4",

@@ -15,6 +15,7 @@ from pathlib import Path
 import httpx
 
 from ..config.settings import LLMConfig
+from .embedder import Embedder
 
 log = logging.getLogger(__name__)
 
@@ -142,30 +143,16 @@ def call_ollama(
         raise OllamaError(str(e)) from e
 
 
-def call_ollama_embed(inputs: list[str], cfg: LLMConfig, *, query: bool = True) -> list[list[float]]:
+def _call_ollama_embed_impl(
+    inputs: list[str], cfg: LLMConfig, *, query: bool = True, embedder: OllamaEmbedder | None = None
+) -> list[list[float]]:
     """Generate embeddings for a batch of texts via Ollama.
 
-    Uses the configured embedding model (e.g. ``mxbai-embed-large``).
-    Batching is handled by Ollama — send all texts in one request.
+    Internal implementation shared by ``OllamaEmbedder`` and the
+    backward-compat ``call_ollama_embed`` wrapper.
 
-    When ``cfg.embed_query_prompt`` (query=True) or ``cfg.embed_doc_prompt``
-    (query=False) is non-empty, the instruction is prepended to each input
-    text before sending to Ollama.
-
-    Args:
-        inputs: List of text strings to embed.
-        cfg: LLM configuration (ollama_url, embed_model, debug_log,
-            embed_query_prompt, embed_doc_prompt).
-        query: When True (default), prepend ``embed_query_prompt``.
-            When False, prepend ``embed_doc_prompt`` (used during indexing).
-
-    Returns:
-        List of embedding vectors, each a list of floats (dimension varies
-        by model — 1024 for mxbai-embed-large, 4096 for qwen3-embedding).
-
-    Raises:
-        OllamaError: On network failure. Auto-pulls the model on HTTP 404,
-            then retries once.
+    When *embedder* is passed, :attr:`OllamaEmbedder.dim` is updated after
+    the first successful batch so the caller can detect dimensions lazily.
     """
     url = cfg.ollama_url.rstrip("/") + "/api/embed"
     prompt = cfg.embed_query_prompt if query else cfg.embed_doc_prompt
@@ -182,6 +169,8 @@ def call_ollama_embed(inputs: list[str], cfg: LLMConfig, *, query: bool = True) 
             resp = httpx.post(url, json=payload, timeout=cfg.timeout * 2)
         resp.raise_for_status()
         embeddings = resp.json()["embeddings"]
+        if embedder is not None and embeddings:
+            embedder._dim = len(embeddings[0])
         if cfg.debug_log:
             _write_debug_log(cfg.debug_log, {
                 "ts": datetime.now(UTC).isoformat(),
@@ -200,6 +189,8 @@ def call_ollama_embed(inputs: list[str], cfg: LLMConfig, *, query: bool = True) 
                 resp = httpx.post(url, json=payload, timeout=cfg.timeout * 2)
             resp.raise_for_status()
             embeddings = resp.json()["embeddings"]
+            if embedder is not None and embeddings:
+                embedder._dim = len(embeddings[0])
             if cfg.debug_log:
                 _write_debug_log(cfg.debug_log, {
                     "ts": datetime.now(UTC).isoformat(),
@@ -219,9 +210,55 @@ def call_ollama_embed(inputs: list[str], cfg: LLMConfig, *, query: bool = True) 
     except httpx.TimeoutException:
         raise OllamaError("Ollama embed request timed out") from None
     except OllamaError:
-        raise  # Pass through — prevents wrapping by the broad except Exception below
+        raise
     except Exception as e:
         raise OllamaError(str(e)) from e
+
+
+def call_ollama_embed(inputs: list[str], cfg: LLMConfig, *, query: bool = True) -> list[list[float]]:
+    """Backward-compatible wrapper — delegates to ``_call_ollama_embed_impl``.
+
+    Kept for ``experiments/`` scripts that import this directly.
+    New code should use :class:`OllamaEmbedder` via :func:`get_embedder`.
+    """
+    return _call_ollama_embed_impl(inputs, cfg, query=query)
+
+
+class OllamaEmbedder(Embedder):
+    """Embedding backend that delegates to Ollama's HTTP API.
+
+    Thin wrapper around ``call_ollama_embed`` that satisfies the ``Embedder``
+    interface.  The standalone ``call_ollama_embed`` function is kept for
+    backward compatibility with ``experiments/`` scripts — it simply
+    forwards to :meth:`embed_documents` / :meth:`embed_queries`.
+    """
+
+    def __init__(self, cfg: LLMConfig) -> None:
+        self._cfg = cfg
+        self._dim: int | None = None
+
+    def embed_documents(self, texts: list[str]) -> list[list[float]]:
+        return _call_ollama_embed_impl(texts, self._cfg, query=False, embedder=self)
+
+    def embed_queries(self, texts: list[str]) -> list[list[float]]:
+        return _call_ollama_embed_impl(texts, self._cfg, query=True, embedder=self)
+
+    @property
+    def name(self) -> str:
+        return self._cfg.embed_model
+
+    @property
+    def dim(self) -> int | None:
+        return self._dim
+
+    @property
+    def max_tokens(self) -> int:
+        # mxbai-embed-large ~512 tokens, qwen3-embedding ~8192 tokens.
+        # Conservative default: 512.
+        model = self._cfg.embed_model.lower()
+        if "qwen3-embedding" in model:
+            return 8192
+        return 512
 
 
 async def call_ollama_async(

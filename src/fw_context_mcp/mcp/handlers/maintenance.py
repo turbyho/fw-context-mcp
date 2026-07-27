@@ -613,6 +613,15 @@ def reindex_file_impl(
             try:
                 with _db_write_lock(db_path.parent, timeout=60.0):
                     with transaction(conn):
+                        # Clean vec0 before deleting symbols — vec0 has no CASCADE
+                        try:
+                            conn.execute(
+                                "DELETE FROM vec_symbols WHERE symbol_id IN "
+                                "(SELECT id FROM symbols WHERE file_id = ?)",
+                                (file_id_old,),
+                            )
+                        except sqlite3.OperationalError:
+                            pass  # sqlite-vec not loaded
                         _del_inh(conn, config_hash, file_id_old)
                         _del_syms(conn, file_id_old)
                         # ON DELETE CASCADE → llm_analysis, embeddings removed

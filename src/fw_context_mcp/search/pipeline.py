@@ -29,6 +29,7 @@ def _build_registry() -> dict[str, Phase]:
     from fw_context_mcp.search.phases.fts5_search import FTS5SearchPhase
     from fw_context_mcp.search.phases.llm_query import LLMQueryPhase
     from fw_context_mcp.search.phases.refine import RefinePhase
+    from fw_context_mcp.search.phases.rerank import RerankPhase
     from fw_context_mcp.search.phases.rough_search import RoughSearchPhase
     from fw_context_mcp.search.phases.rrf_fusion import RRFFusionPhase
     from fw_context_mcp.search.phases.translate import TranslatePhase
@@ -42,6 +43,7 @@ def _build_registry() -> dict[str, Phase]:
         EmbeddingPhase,
         DeduplicatePhase,
         RRFFusionPhase,
+        RerankPhase,
         ExpandContextPhase,
         FormatPhase,
     ]:
@@ -87,6 +89,7 @@ def _build_smart_search() -> PipelineConfig:
             "refine",
             EmbeddingPhase(independent=True, threshold=0.5, overfetch=50),
             "rrf_fusion",
+            "rerank",
             "deduplicate",
             "expand_context",
             "format",

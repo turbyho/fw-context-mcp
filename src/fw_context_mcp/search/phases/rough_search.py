@@ -119,7 +119,8 @@ async def _try_embedding_samples(ctx) -> list[dict] | None:
         from fw_context_mcp.indexer.db import (
             open_db as _open_db,
         )
-        from fw_context_mcp.llm.ollama import OllamaError, call_ollama_embed
+        from fw_context_mcp.llm.embedder import get_embedder
+        from fw_context_mcp.llm.ollama import OllamaError
     except Exception:
         log.warning("Embedding rough search unavailable — import failed", exc_info=True)
         return None
@@ -134,7 +135,8 @@ async def _try_embedding_samples(ctx) -> list[dict] | None:
                 return None
 
             try:
-                query_embs = call_ollama_embed([ctx.query], ctx.config.llm, query=True)
+                embedder = get_embedder(ctx.config.llm)
+                query_embs = embedder.embed_queries([ctx.query])
                 query_vec = query_embs[0]
             except OllamaError:
                 return None

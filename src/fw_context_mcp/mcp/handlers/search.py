@@ -11,7 +11,7 @@ from pydantic import Field
 from ...config import derive_project_id
 from ...config import load as load_config
 from ...indexer.db import _expand_query, get_active_config, lookup_macro, search_symbols
-from ...llm.ollama import call_ollama_embed, check_setup
+from ...llm.ollama import check_setup
 from ...utils import abs_path, resolve_project_root
 from ..shared.context import _db_path, _is_stale, _open_db_safe
 from ..shared.fallback import _fallback_to_search_code, _fallback_to_search_code_inner
@@ -390,7 +390,7 @@ def search_code(
                             }
                             if r["value"]:
                                 d["_macro_value"] = r["value"]
-                            if r.get("expanded_value"):
+                            if r["expanded_value"]:
                                 d["_macro_expanded_value"] = r["expanded_value"]
                             macro_dicts.append(d)
                         rows.extend(macro_dicts)
@@ -599,8 +599,11 @@ async def semantic_search(
 
         # Generate query embedding
         try:
+            from fw_context_mcp.llm.embedder import get_embedder
+
+            embedder = get_embedder(cfg.llm)
             query_embs = await asyncio.to_thread(
-                call_ollama_embed, [query], cfg.llm, query=True
+                embedder.embed_queries, [query]
             )
             query_vec = query_embs[0]
         except Exception as e:
@@ -613,13 +616,15 @@ async def semantic_search(
 
         # Load embeddings and run cosine search
         def _do_semantic(c: sqlite3.Connection, config_hash: str) -> list[dict]:
+            model_key = cfg.llm.embed_key()
             # Count embeddings first so we can paginate
             total = c.execute(
                 """SELECT COUNT(*)
                    FROM embeddings e
                    JOIN symbols s ON s.id = e.symbol_id
-                   WHERE s.config_hash = ? AND s.is_definition = 1""",
-                (config_hash,),
+                   WHERE s.config_hash = ? AND s.is_definition = 1
+                     AND e.model = ?""",
+                (config_hash, model_key),
             ).fetchone()[0]
 
             if total == 0:
@@ -631,7 +636,10 @@ async def semantic_search(
 
             # Source-aware boost: project code > vendored SDK
             def _source_boost(row: dict) -> float:
-                return 1.2 if row.get("is_project") == 1 else 0.85
+                try:
+                    return 1.2 if row["is_project"] == 1 else 0.85
+                except (KeyError, IndexError):
+                    return 0.85
 
             # Compute cosine similarity + source boost for each embedding
             BATCH = 1000
@@ -645,9 +653,10 @@ async def semantic_search(
                        FROM embeddings e
                        JOIN symbols s ON s.id = e.symbol_id
                        WHERE s.config_hash = ? AND s.is_definition = 1
+                         AND e.model = ?
                        ORDER BY e.symbol_id
                        LIMIT ? OFFSET ?""",
-                    (config_hash, BATCH, offset),
+                    (config_hash, model_key, BATCH, offset),
                 ).fetchall()
 
                 for r in rows:
@@ -723,6 +732,17 @@ async def semantic_search(
                 if sr["outputs"]:
                     d["outputs"] = sr["outputs"]
                 results.append(d)
+
+            # Apply reranker when configured — improves precision at
+            # the cost of a small latency increase (cross-encoder pass).
+            if cfg.llm.reranker_model and results:
+                try:
+                    from fw_context_mcp.search.reranker import get_reranker
+                    reranker = get_reranker(cfg.llm.reranker_model)
+                    if reranker is not None:
+                        results = reranker.rank(query, results, min(limit, len(results)))
+                except Exception:
+                    pass  # Rerank is best-effort
 
             return results
 

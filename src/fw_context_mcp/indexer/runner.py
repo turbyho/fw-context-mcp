@@ -15,7 +15,7 @@ import time
 from contextlib import nullcontext
 from pathlib import Path
 
-from ..config.settings import derive_project_id
+from ..config.settings import DESCRIPTION_VERSION, derive_project_id
 from ..llm.ollama import call_ollama
 from ..utils import MTIME_TOLERANCE_S, compute_source_hash, read_file_lines
 from .compile_commands import _SOURCE_EXTS, validate_include_files
@@ -39,6 +39,23 @@ from .db import (
 from .ops import _build_filtered_file_content, _normalize_file_path, store_symbols_for_unit
 
 log = logging.getLogger(__name__)
+
+
+def _embed_model_key(embed_model: str, embed_bodies: bool) -> str:
+    """Return the cache-disambiguating model key including the description version."""
+    version = DESCRIPTION_VERSION if embed_bodies else "desc-v1"
+    return f"{embed_model}:{version}"
+
+
+def _truncate_body(source: str, *, head: int = 1200, tail: int = 800) -> str:
+    """Head+tail truncation for function bodies — preserves both opening
+    logic and closing statements (position bias robustness).
+
+    Short bodies (< head + tail) are returned unchanged.
+    """
+    if len(source) <= head + tail:
+        return source
+    return source[:head] + "\n// ...\n" + source[-tail:]
 
 
 def _fmt_dur(seconds: float) -> str:
@@ -125,7 +142,7 @@ def _build_embeddings(conn, config_hash: str, llm_config, db_dir: Path) -> None:
 
     import httpx
 
-    from ..llm.ollama import call_ollama_embed
+    from ..llm.embedder import get_embedder
     from .db import _vec_to_blob, upsert_embeddings, upsert_embeddings_vec
 
     # Suppress httpx INFO logs (one per batch — noisy during embedding)
@@ -138,11 +155,13 @@ def _build_embeddings(conn, config_hash: str, llm_config, db_dir: Path) -> None:
         log.warning("Ollama not reachable — skipping embedding generation")
         return
 
-    model = llm_config.embed_model
+    embedder = get_embedder(llm_config)
+    model = _embed_model_key(embedder.name, True)
     with transaction(conn):
         rows = conn.execute(
             """SELECT s.id, s.name, s.qualified_name, s.kind, s.file_path,
-                      s.signature, s.is_definition, s.docstring, s.summary
+                      s.signature, s.is_definition, s.docstring, s.summary,
+                      s.source, s.is_project
                FROM symbols s
                WHERE s.config_hash = ?
                  AND s.is_definition = 1
@@ -170,9 +189,9 @@ def _build_embeddings(conn, config_hash: str, llm_config, db_dir: Path) -> None:
         kind = r["kind"] or ""
         class_ = "::".join(qname.split("::")[:-1]) if "::" in qname else ""
         sig = r["signature"] or ""
-        is_os = "mbed-os" in fp.lower()
+        is_vendor = r["is_project"] == 0
         doc = ""
-        if not is_os:
+        if not is_vendor:
             doc = (r["docstring"] or "").strip()
             if doc and len(doc) > 20:
                 doc = doc[:150]
@@ -187,12 +206,24 @@ def _build_embeddings(conn, config_hash: str, llm_config, db_dir: Path) -> None:
             parts.append(f"in {class_}")
         if path:
             parts.append(f"in {path}")
+        if fp:
+            parts.append(f"file: {fp}")
         if sig:
             parts.append(sig)
         if doc:
             parts.append(doc)
         if llm:
             parts.append(llm)
+
+        # Append body for function/method kinds — enables retrieval by
+        # implementation patterns (e.g. "DMA timeout" → dma_irq body)
+        body_kinds = frozenset({"function", "method", "constructor", "destructor"})
+        if kind in body_kinds:
+            source = (r["source"] or "").strip()
+            if source:
+                body = _truncate_body(source, head=1200, tail=800)
+                parts.append(f"body: {body}")
+
         descriptions.append(" : ".join(parts))
 
     total = 0
@@ -205,7 +236,7 @@ def _build_embeddings(conn, config_hash: str, llm_config, db_dir: Path) -> None:
         chunk_descs = descriptions[i : i + chunk_size]
         t0 = time.monotonic()
         try:
-            embs = call_ollama_embed(chunk_descs, llm_config, query=False)
+            embs = embedder.embed_documents(chunk_descs)
         except Exception as e:
             elapsed = time.monotonic() - t0
             log.warning("[%d/%d] embedding batch failed %s: %s", batch_num + 1, total_batches, _fmt_dur(elapsed), e)
@@ -242,6 +273,13 @@ def _build_embeddings(conn, config_hash: str, llm_config, db_dir: Path) -> None:
             "UPDATE build_configs SET embedding_dim = ? WHERE config_hash = ?",
             (embedding_dim, config_hash),
         )
+    # Prune embeddings with non-versioned model keys (pre-desc-v1 or unknown)
+    # to prevent old vectors from bloating storage and polluting query results.
+    try:
+        conn.execute("DELETE FROM embeddings WHERE model NOT LIKE '%:desc-v%'")
+    except sqlite3.OperationalError:
+        pass
+    conn.commit()
 
 
 

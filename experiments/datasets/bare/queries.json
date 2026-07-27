@@ -1,0 +1,56 @@
+{
+  "project": "bare",
+  "description": "Query dataset for tests/builds/bare — trivial C project with 4 functions, 1 struct, 1 enum",
+  "queries": [
+    {
+      "query": "uart init baudrate",
+      "split": "sig",
+      "relevant": [["uart_init", "src/lib.c"]]
+    },
+    {
+      "query": "checksum data validation",
+      "split": "sig",
+      "relevant": [["compute_checksum", "src/lib.c"]]
+    },
+    {
+      "query": "set device mode",
+      "split": "sig",
+      "relevant": [["set_mode", "src/lib.c"]]
+    },
+    {
+      "query": "configuration settings struct",
+      "split": "sig",
+      "relevant": [["Config", "src/lib.h"]]
+    },
+    {
+      "query": "operation mode enum",
+      "split": "sig",
+      "relevant": [["OperationMode", "src/lib.h"]]
+    },
+    {
+      "query": "global initialized flag",
+      "split": "sig",
+      "relevant": [["g_initialized", "src/lib.c"]]
+    },
+    {
+      "query": "main entry point",
+      "split": "sig",
+      "relevant": [["main", "src/main.c"]]
+    },
+    {
+      "query": "return negative one on error",
+      "split": "impl",
+      "relevant": [["compute_checksum", "src/lib.c"], ["uart_init", "src/lib.c"]]
+    },
+    {
+      "query": "cast to unsigned char",
+      "split": "impl",
+      "relevant": [["compute_checksum", "src/lib.c"]]
+    },
+    {
+      "query": "assign one to initialized flag",
+      "split": "impl",
+      "relevant": [["uart_init", "src/lib.c"]]
+    }
+  ]
+}
