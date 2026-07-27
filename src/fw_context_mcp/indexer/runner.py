@@ -176,14 +176,20 @@ def _build_embeddings(conn, config_hash: str, llm_config, db_dir: Path) -> None:
             log.info("All definition symbols already embedded (model=%s) — nothing to do", model)
             return
 
-    # Build descriptions using the same format as embed phase
+    # Build contextual descriptions — flowing sentences instead of token lists.
+    # Anthropic Contextual Retrieval: chunk-specific context as sentences improves
+    # embedding recall by -35% failures vs token-boundary lists.
+    body_kinds = frozenset({"function", "method", "constructor", "destructor"})
+    _max_body_chars = embedder.max_tokens * 4 if embedder.max_tokens >= 16000 else None
     descriptions = []
     for r in rows:
         fp = (r["file_path"] or "").replace("\\", "/")
         path = ""
+        module = ""
         if "/" in fp:
-            *dirs, _ = fp.split("/")
+            *dirs, fname = fp.split("/")
             path = "/".join(dirs[-2:])
+            module = dirs[-1] if dirs else ""
         qname = r["qualified_name"] or ""
         name = r["name"] or ""
         kind = r["kind"] or ""
@@ -199,32 +205,41 @@ def _build_embeddings(conn, config_hash: str, llm_config, db_dir: Path) -> None:
         if llm:
             llm = llm[:200]
 
-        # Structured description: kind prefix helps embeddings distinguish
-        # e.g. "function", "class", "typedef" from each other
-        parts = [f"{kind} {name}"]
+        # ---- context_prefix: kind + name + location as natural sentence ----
+        clauses = [f"{kind} {name}"]
         if class_:
-            parts.append(f"in {class_}")
+            clauses.append(f"in class {class_}")
+        if module:
+            clauses.append(f"in module {module}")
         if path:
-            parts.append(f"in {path}")
+            clauses.append(f"at {path}")
         if fp:
-            parts.append(f"file: {fp}")
-        if sig:
-            parts.append(sig)
-        if doc:
-            parts.append(doc)
-        if llm:
-            parts.append(llm)
+            clauses.append(f"file: {fp}")
+        context_prefix = ", ".join(clauses) + "."
 
-        # Append body for function/method kinds — enables retrieval by
-        # implementation patterns (e.g. "DMA timeout" → dma_irq body)
-        body_kinds = frozenset({"function", "method", "constructor", "destructor"})
+        # ---- sig line ----
+        sig_line = f" Signature: {sig}." if sig else ""
+
+        # ---- doc/summary as flowing text ----
+        extra = []
+        if doc:
+            extra.append(doc)
+        if llm:
+            extra.append(llm)
+        extra_text = " ".join(extra) if extra else ""
+
+        # ---- body (for function-like kinds) ----
+        body_text = ""
         if kind in body_kinds:
             source = (r["source"] or "").strip()
             if source:
-                body = _truncate_body(source, head=1200, tail=800)
-                parts.append(f"body: {body}")
+                if _max_body_chars and len(source) <= _max_body_chars:
+                    body = source
+                else:
+                    body = _truncate_body(source, head=1200, tail=800)
+                body_text = f"\n\nBody:\n{body}"
 
-        descriptions.append(" : ".join(parts))
+        descriptions.append(f"{context_prefix}{sig_line} {extra_text}{body_text}".rstrip() + "\n")
 
     total = 0
     chunk_size = 100

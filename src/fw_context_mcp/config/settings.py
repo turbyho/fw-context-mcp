@@ -26,7 +26,8 @@ __all__ = [
 # desc-v1: original — "kind name : in class : in path : sig : doc : llm"
 # desc-v2: body text appended for function/method/constructor/destructor
 # desc-v3: file name prefix added
-DESCRIPTION_VERSION = "desc-v3"
+# desc-v4: contextual sentence format (flowing text vs token-boundary lists)
+DESCRIPTION_VERSION = "desc-v4"
 
 
 class ProjectNotInitializedError(RuntimeError):
@@ -201,6 +202,11 @@ class LLMConfig:
         embed_doc_prompt: Instruction prepended to symbol descriptions during
             indexing.  Most models work best with an empty doc prompt — only
             set when the model's training expects a per-document instruction.
+        embed_dim: Override output embedding dimension for Matryoshka models.
+            When set and smaller than the model's native dimension, vectors
+            are truncated to this size and re-normalized.  E.g. set to 128
+            for granite-embedding-r2 to get 6× smaller storage with only -1.6
+            MTEB Code points loss.
         num_ctx: Context window size in tokens.
         timeout: HTTP request timeout in seconds for Ollama API calls.
             Default 600 s (10 min) — analysis batches with large prompts and
@@ -224,6 +230,7 @@ class LLMConfig:
     embed_model: str = "mxbai-embed-large:latest"
     embed_query_prompt: str = ""
     embed_doc_prompt: str = ""
+    embed_dim: int | None = None
     num_ctx: int = 16384
     timeout: float = 600.0
     keep_alive: str = "10m"
@@ -254,10 +261,16 @@ def _apply_embed_prompt_defaults(llm_cfg: LLMConfig) -> None:
             llm_cfg.embed_query_prompt = (
                 "Represent this sentence for searching relevant passages: "
             )
+        elif model_lower.startswith("ibm-granite"):
+            llm_cfg.embed_query_prompt = (
+                "Represent this sentence for searching relevant passages: "
+            )
     if llm_cfg.embed_doc_prompt == "":
         if model_lower.startswith("qwen3-embedding"):
             llm_cfg.embed_doc_prompt = ""
         elif model_lower.startswith("mxbai"):
+            llm_cfg.embed_doc_prompt = ""
+        elif model_lower.startswith("ibm-granite"):
             llm_cfg.embed_doc_prompt = ""
 
 
@@ -477,6 +490,8 @@ def _from_dict(data: dict) -> Config:
             cfg.llm.embed_query_prompt = embed_qp
         if embed_dp := llm.get("embed_doc_prompt"):
             cfg.llm.embed_doc_prompt = embed_dp
+        if embed_dim := llm.get("embed_dim"):
+            cfg.llm.embed_dim = int(embed_dim)
         _apply_embed_prompt_defaults(cfg.llm)
         if num_ctx := llm.get("num_ctx"):
             cfg.llm.num_ctx = int(num_ctx)

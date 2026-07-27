@@ -84,14 +84,15 @@ class TestGetEmbedder:
         e = get_embedder(cfg)
         assert e.max_tokens == 512  # conservative default
 
-    @pytest.mark.parametrize("model", [
-        "ibm-granite/granite-embedding-311m-multilingual-r2",
-        "lightonai/LateOn-Code-edge",
-        "BAAI/bge-small-en-v1.5",
-        "cross-encoder/ms-marco-MiniLM-L6-v2",
-        "sentence-transformers/all-MiniLM-L6-v2",
+    @pytest.mark.parametrize("model,max_tokens", [
+        ("ibm-granite/granite-embedding-311m-multilingual-r2", 32768),
+        ("ibm-granite/granite-embedding-97m-multilingual-r2", 32768),
+        ("lightonai/LateOn-Code-edge", 2048),
+        ("BAAI/bge-small-en-v1.5", 512),
+        ("cross-encoder/ms-marco-MiniLM-L6-v2", 32768),
+        ("sentence-transformers/all-MiniLM-L6-v2", 32768),
     ])
-    def test_st_prefix_routing(self, model: str) -> None:
+    def test_st_prefix_routing(self, model: str, max_tokens: int) -> None:
         """ST prefix should route to ST backend.  The type is checked before
         lazy-loading — actual import failure (no sentence-transformers) is
         deferred to first embed call and not tested here."""
@@ -102,7 +103,7 @@ class TestGetEmbedder:
         cfg = LLMConfig(embed_model=model)
         e = get_embedder(cfg)
         assert e.name == model
-        assert e.max_tokens == 32768
+        assert e.max_tokens == max_tokens
 
 
 class TestModelKey:
