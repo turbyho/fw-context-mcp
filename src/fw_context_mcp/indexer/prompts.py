@@ -46,14 +46,16 @@ _ANALYSIS_SYSTEM = """You are a senior C/C++ embedded engineer writing comprehen
 
 For each symbol, output a JSON object with EXACTLY these three string fields:
   "summary": a detailed description (3-6 sentences). Explain the purpose, behavior, key design patterns, and embedded-system context.
-   "inputs": a single string describing all inputs. For functions: list each parameter with type and role. For classes/structs/unions: describe dependencies and configuration. For typedefs: the underlying type. For enums: not applicable, use "-". Format as "param1 (type): role; param2 (type): role". Write everything inline as ONE STRING, not a JSON object.
-   "outputs": a single string describing all outputs and side effects. For functions: return value, error codes, and all side effects. For classes/structs/unions: what the type provides and manages. For typedefs: what the type alias represents. For enums: what each constant means and how it's used. Format as ONE STRING, not a JSON object.
+    "inputs": a single string describing all inputs. For functions: list each parameter with type and role. For classes/structs/unions: describe dependencies and configuration. For typedefs: the underlying type. For enums: not applicable, use "-". For variables: describe who writes/initializes the value and what subsystem it belongs to. Format as "param1 (type): role; param2 (type): role". Write everything inline as ONE STRING, not a JSON object.
+    "outputs": a single string describing all outputs and side effects. For functions: return value, error codes, and all side effects. For classes/structs/unions: what the type provides and manages. For typedefs: what the type alias represents. For enums: what each constant means and how it's used. For variables: describe what depends on this variable's value and the consequence of changing it. Format as ONE STRING, not a JSON object.
 
 CRITICAL: "inputs" and "outputs" MUST be plain text strings. DO NOT use nested JSON objects like {"param": "desc"}. Write everything as a single string separated by semicolons or newlines.
 CRITICAL: NEVER output literal backslash or double-quote characters inside JSON string values. These break JSON syntax. Describe them by name instead: write "backslash" not backslash, write "double-quote" not double-quote.
 CRITICAL: DO NOT enumerate individual fields, members, or constants. Describe the symbol's PURPOSE and ROLE — what problem it solves, what subsystem it belongs to, how it's used. For large structs with many fields, summarize the CATEGORIES of data it holds (e.g. "system config, comm settings, sensor thresholds") rather than listing every field.
 
 The symbol description always includes a ``doc`` field (documentation comment — when present this is the AUTHORITATIVE source written by the developer), a ``body`` (the full source or declaration — use this to verify/expand on the documentation), and may include ``called functions`` (supplementary context only — to help you understand dependencies and the surrounding system).
+
+For variables: describe what the variable stores, who modifies it, who reads it, and what subsystem it belongs to. Use the "referenced by" list to identify reader/writer functions.
 
 **Documentation (doc:):** When present, prioritize the developer's own description. ``@brief`` describes the purpose, ``@param`` describes each parameter, ``@return`` describes the return value. Use this as the primary source — it reflects the developer's intent. If the doc field shows "(NO DOCSTRING — ...)", fall back to inferring from body, signature, file_path, and callee names.
 
@@ -106,6 +108,13 @@ Union (grouping — organizing related types without memory overlap):
   "outputs": "CmdsDispatch: courier workflow commands (slot open, state query, size change, cancel). CmdsPickup: customer pickup commands (slot open, state query). CmdsService: 22 diagnostic/maintenance commands including LOCKER_REBOOT, SDCARD_DELETE, GET_FW_VERSION, GET_NET_INFO, GET_SHUTDOWN_REASON, SERVICE_MODE_SET."
 }
 
+Variable:
+{
+  "summary": "Global debug verbosity level controlling log output across all subsystems. Set at boot from flash configuration by config_manager_load(). Read by log_write() in the logging subsystem to decide which messages to emit. A value of 0 means no debug output; higher values enable progressively more verbose logging.",
+  "inputs": "Written by config_manager_load() at boot and set_debug_level() via serial console. Belongs to the logging subsystem.",
+  "outputs": "Read by log_write() in the logging module. Changing this value affects runtime log verbosity — higher values produce more serial output, which can impact timing in real-time paths."
+}
+
 Output ONLY the JSON array. No markdown fences, no commentary.
 """
 
@@ -145,7 +154,10 @@ def build_analysis_prompt(batch: list[dict[str, Any]]) -> str:
         if body:
             entry += f"\n   body:\n```cpp\n{body}\n```"
         if callees:
-            entry += f"\n   called functions (supplementary context): {', '.join(callees[:30])}"
+            if kind == "varglobal":
+                entry += f"\n   referenced by (supplementary context): {', '.join(callees[:30])}"
+            else:
+                entry += f"\n   called functions (supplementary context): {', '.join(callees[:30])}"
             if len(callees) > 30:
                 entry += f" (and {len(callees) - 30} more)"
 

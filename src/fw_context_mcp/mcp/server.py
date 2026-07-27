@@ -1,6 +1,6 @@
 """fw-context MCP server — build-aware code intelligence for embedded C/C++ projects.
 
-Serves 33 MCP tools and 3 MCP resources via FastMCP (stdio transport).
+Serves 34 MCP tools and 4 MCP resources via FastMCP (stdio transport).
 
 **Search & lookup tools** (delegate to ``fw_context_mcp.search`` pipeline):
 ``search_code`` (FTS5), ``lookup_symbol`` (exact/prefix), ``smart_search``
@@ -32,7 +32,7 @@ from mcp.server.fastmcp import FastMCP
 
 from ..utils import resolve_project_root
 from .background import _ensure_daemon_running
-from .handlers import callgraph, inheritance, maintenance, search, source
+from .handlers import callgraph, inheritance, maintenance, search, source, variables
 from .handlers.maintenance import get_active_build, list_projects, reindex_file_impl  # noqa: F401 — backward compat
 from .handlers.source import _read_symbol_body, get_source  # noqa: F401 — backward compat
 from .shared.context import _integrity_checked, _set_server_init_error
@@ -270,6 +270,9 @@ mcp.tool()(inheritance.get_class_members)
 mcp.tool()(inheritance.get_inheritance_chain)
 mcp.tool()(inheritance.get_method_overrides)
 mcp.tool()(inheritance.get_template_instances)
+
+# variables.py
+mcp.tool()(variables.find_variables)
 
 # ── MCP Resources ──────────────────────────────────────────────────────────
 

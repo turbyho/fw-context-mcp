@@ -3087,7 +3087,7 @@ def search_symbols(
     if kind:
         kind_filter = "AND s.kind = ?"
     elif exclude_variables:
-        kind_filter = "AND s.kind != 'variable'"
+        kind_filter = "AND s.kind NOT IN ('variable', 'varlocal')"
     else:
         kind_filter = ""
     if project_only:

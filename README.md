@@ -56,11 +56,11 @@ fw-context indexes the project through the same compilation database used by you
 flowchart LR
     CCJ[compile_commands.json] & SRC[(source files)] --> LIBCLANG[libclang<br/>AST parser]
     LIBCLANG --> SYMBOLS[symbols<br/>name, kind, USR<br/>signature, source body<br/>docstring, tokens] & FILES[files<br/>path, language<br/>ifdef-filtered content<br/>project/SDK sources] & REFS[refs &amp; call graph<br/>refs, fp_assignments<br/>indirect_call_sites] & INHERIT[inheritance<br/>&amp; overrides<br/>base/derived edges<br/>virtual dispatch] & MACROS[macros<br/>#define name<br/>raw &amp; expanded value<br/>FTS5 searchable] & ENRICH[enrichment<br/>embeddings &amp; semantic search<br/>LLM analysis &amp; summaries<br/>hotspot cache]
-    SYMBOLS & FILES & REFS & INHERIT & MACROS & ENRICH --> MCP[MCP server<br/>33 tools]
+    SYMBOLS & FILES & REFS & INHERIT & MACROS & ENRICH --> MCP[MCP server<br/>34 tools]
     MCP --> LLM[LLM coding agent]
 ```
 
-The index stores symbols, source extents, references, call relationships, active source content, function pointer assignments, inheritance information, macro definitions with expanded values, documentation and optional LLM-generated summaries. The MCP server exposes this information as 33 tools that coding agents and other LLM clients can call during analysis, review and navigation.
+The index stores symbols, source extents, references, call relationships, active source content, function pointer assignments, inheritance information, macro definitions with expanded values, documentation and optional LLM-generated summaries. The MCP server exposes this information as 34 tools that coding agents and other LLM clients can call during analysis, review and navigation.
 
 fw-context does not replace the model. It gives the model better input.
 
