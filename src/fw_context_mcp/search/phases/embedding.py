@@ -77,7 +77,8 @@ class EmbeddingPhase(Phase):
             search_similar_hybrid,
             search_similar_vec,
         )
-        from fw_context_mcp.llm.ollama import OllamaError, call_ollama_embed
+        from fw_context_mcp.llm.embedder import get_embedder
+        from fw_context_mcp.llm.ollama import OllamaError
 
         conn = open_db(ctx.db_path)
         try:
@@ -91,7 +92,8 @@ class EmbeddingPhase(Phase):
 
                 # Generate query embedding
                 try:
-                    query_embs = call_ollama_embed([ctx.query], ctx.config.llm, query=True)
+                    embedder = get_embedder(ctx.config.llm)
+                    query_embs = embedder.embed_queries([ctx.query])
                     query_vec = query_embs[0]
                 except OllamaError:
                     return ctx  # Embedding model unavailable
