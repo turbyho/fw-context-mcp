@@ -147,7 +147,7 @@ def _build_embeddings(conn, config_hash: str, llm_config, db_dir: Path) -> None:
                WHERE s.config_hash = ?
                  AND s.is_definition = 1
                   AND s.kind IN ('function', 'method', 'constructor', 'destructor',
-                                'class', 'struct', 'union', 'typedef', 'enum')
+                                'class', 'struct', 'union', 'typedef', 'enum', 'varglobal')
                   AND s.id NOT IN (SELECT symbol_id FROM embeddings WHERE model = ?)
                ORDER BY CASE WHEN s.docstring IS NOT NULL AND LENGTH(s.docstring) > 30
                           THEN 0 ELSE 1 END""",
@@ -275,6 +275,22 @@ def _fetch_callees(conn, symbol_usr: str, config_hash: str) -> list[str]:
     return [r[0] for r in rows]
 
 
+def _fetch_referencers(conn, symbol_usr: str, config_hash: str) -> list[str]:
+    """Return qualified names of functions that reference (read/write) *symbol_usr*."""
+    rows = conn.execute(
+        """SELECT DISTINCT s.qualified_name
+           FROM refs r
+           JOIN symbols s ON s.usr = r.from_usr AND s.config_hash = ?
+           WHERE r.to_usr = ?
+             AND r.config_hash = ?
+             AND s.qualified_name != ''
+           ORDER BY s.qualified_name
+           LIMIT 35""",
+        (config_hash, symbol_usr, config_hash),
+    ).fetchall()
+    return [r[0] for r in rows]
+
+
 def _enrich_batch(conn, batch_rows, config_hash: str) -> list[dict]:
     """Augment symbol rows with ``body`` and ``callees`` keys.
 
@@ -303,9 +319,14 @@ def _enrich_batch(conn, batch_rows, config_hash: str) -> list[dict]:
         ):
             body = _read_body(abs_path, start_line, end_line)
 
-        # Fetch callees from the reference index
+        # Fetch callees / referencers from the reference index
         if usr:
-            callees = _fetch_callees(conn, usr, config_hash)
+            if kind == "varglobal":
+                callees = _fetch_referencers(conn, usr, config_hash)
+            elif kind in ("varlocal", "variable", "field"):
+                callees = []
+            else:
+                callees = _fetch_callees(conn, usr, config_hash)
 
         d["body"] = body
         d["callees"] = callees
@@ -411,8 +432,8 @@ def _build_llm_analysis(
                JOIN files f ON s.file_id = f.id
                WHERE s.config_hash = ?
                  AND s.is_definition = 1
-                 AND s.kind IN ('function', 'method', 'constructor', 'destructor',
-                                 'class', 'struct', 'union', 'typedef', 'enum')
+                  AND s.kind IN ('function', 'method', 'constructor', 'destructor',
+                                  'class', 'struct', 'union', 'typedef', 'enum', 'varglobal')
                  AND s.name NOT LIKE '%(anonymous%'
                  AND s.name NOT LIKE '%(unnamed%'
                  """

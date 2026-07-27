@@ -231,10 +231,14 @@ class Symbol:
         qualified_name: Fully qualified name with ``::`` separators,
             built by traversing semantic parents
             (e.g. ``namespace::Class::method``).
-        kind: Symbol kind string — one of ``"function"``, ``"method"``,
-            ``"constructor"``, ``"destructor"``, ``"class"``, ``"struct"``,
-            ``"enum"``, ``"enum_constant"``, ``"typedef"``, ``"variable"``,
-            ``"field"``, or ``"namespace"``.
+         kind: Symbol kind string — one of ``"function"``, ``"method"``,
+             ``"constructor"``, ``"destructor"``, ``"class"``, ``"struct"``,
+             ``"enum"``, ``"enum_constant"``, ``"typedef"``,
+             ``"varglobal"`` (file/namespace-scope, static class member),
+             ``"varlocal"`` (function-local),
+             ``"variable"`` (legacy, pre-split),
+             ``"field"`` (class/struct member),
+             or ``"namespace"``.
         file: Absolute path to the source file containing this symbol.
         line: Start line of the declaration or definition (1-based).
         column: Start column of the declaration or definition (0-based).
@@ -259,8 +263,9 @@ class Symbol:
         is_virtual: True for virtual ``CXX_METHOD`` and destructor
             declarations.
         is_pure_virtual: True for pure virtual methods (marked ``= 0``).
-        parent_usr: USR of the enclosing class, struct, or template.
-            Empty string for free functions and file-scope symbols.
+         parent_usr: USR of the enclosing class, struct, template,
+             or function (for varlocal).  Empty for free functions
+             and file-scope symbols.
         is_template: True when this is a ``CLASS_TEMPLATE``,
             ``FUNCTION_TEMPLATE``, or partial specialization declaration.
         template_usr: USR of the primary template.  Non-empty only when
@@ -404,12 +409,20 @@ def _qualified_name(
 
 
 def _signature(cursor: cx.Cursor) -> str:
-    """Build a human-readable signature for callables.
+    """Build a human-readable signature.
 
-    Returns an empty string for non-callable cursors (classes, enums,
-    variables, etc.) so callers can unconditionally assign it to
-    ``Symbol.signature``.
+    For callables returns ``"return_type name(param1, param2)"``.
+    For variables and fields returns ``"type name"``.
+    Returns an empty string for other non-callable cursors.
     """
+    # Variables and fields: return type + name
+    if cursor.kind in (cx.CursorKind.VAR_DECL, cx.CursorKind.FIELD_DECL):
+        try:
+            return f"{cursor.type.spelling} {cursor.spelling}"
+        except Exception:
+            return cursor.spelling
+
+    # Callables only beyond this point
     if cursor.kind not in (
         cx.CursorKind.FUNCTION_DECL,
         cx.CursorKind.FUNCTION_TEMPLATE,
@@ -720,9 +733,28 @@ def extract_all(
         is_virtual = bool(cursor.is_virtual_method()) if cursor.kind in (cx.CursorKind.CXX_METHOD, cx.CursorKind.DESTRUCTOR) else False
         is_pure = bool(cursor.is_pure_virtual_method()) if cursor.kind in (cx.CursorKind.CXX_METHOD, cx.CursorKind.DESTRUCTOR) else False
 
+        # Compute kind string early (before parent_usr block) so the
+        # expanded parent_usr logic below can use it.  Also extract
+        # sem_parent ONCE — reuse in both blocks below.
+        sem_parent = cursor.semantic_parent
+        kind = _cursor_kind_label(cursor.kind)
+        if kind == "variable":
+            if sem_parent and sem_parent.kind in (
+                cx.CursorKind.TRANSLATION_UNIT,
+                cx.CursorKind.NAMESPACE,
+                cx.CursorKind.LINKAGE_SPEC,
+                cx.CursorKind.CLASS_DECL,
+                cx.CursorKind.STRUCT_DECL,
+                cx.CursorKind.UNION_DECL,
+                cx.CursorKind.CLASS_TEMPLATE,
+                cx.CursorKind.CLASS_TEMPLATE_PARTIAL_SPECIALIZATION,
+            ):
+                kind = "varglobal"
+            else:
+                kind = "varlocal"
+
         # Parent class/struct USR — set for methods, fields, and nested types
         parent_usr = ""
-        sem_parent = cursor.semantic_parent
         if sem_parent and sem_parent.kind in (
             cx.CursorKind.CLASS_DECL,
             cx.CursorKind.STRUCT_DECL,
@@ -731,6 +763,11 @@ def extract_all(
             cx.CursorKind.CLASS_TEMPLATE_PARTIAL_SPECIALIZATION,
         ):
             parent_usr = sem_parent.get_usr() or ""
+
+        # Also store parent_usr for local variables (needed by find_variables)
+        if not parent_usr and kind in ("varlocal", "variable"):
+            if sem_parent and sem_parent.kind in _CALLABLE_KINDS:
+                parent_usr = sem_parent.get_usr() or ""
 
         # Template tracking: detect template declarations and instantiations
         is_template = cursor.kind in (
@@ -777,7 +814,7 @@ def extract_all(
         symbols.append(Symbol(
             name=symbol_name,
             qualified_name=symbol_qname,
-            kind=_cursor_kind_label(cursor.kind),
+            kind=kind,
             file=loc.file.name,
             line=loc.line,
             column=loc.column,
