@@ -23,6 +23,12 @@ from ..shared.context import _open_db_safe, _resolve_context
 
 log = logging.getLogger(__name__)
 
+# ── Truncation limits ──
+_SOURCE_TRUNCATE_CHARS = 8000   # max chars for get_source / get_symbol_context body
+_EXPLAIN_SNIPPET_CHARS = 4000   # max chars for explain_symbol source snippet
+_CONTEXT_LINES_MAX = 200        # max context_lines parameter for explain_symbol
+_MAX_SYMBOL_BODY_LINES = 1000   # hard cap on _read_symbol_body to prevent runaway reads
+
 # ── moved from server.py ──
 def _lookup_definition(
     conn,
@@ -128,6 +134,7 @@ def _read_symbol_body(file_path: str, line_no: int, end_line: int = 0, max_lines
         start_idx = max(0, line_no - 1)
         read_start = max(0, start_idx - 5)  # small margin for brace matching
         read_end = end_line + 5 if end_line else start_idx + max_lines + 5
+        read_end = min(read_end, start_idx + _MAX_SYMBOL_BODY_LINES)
         window: list[str] = []
         with p.open(errors="replace") as fh:
             for i, line in enumerate(fh):
@@ -298,7 +305,7 @@ async def explain_symbol(
         result["llm_analysis"] = llm_analysis
         return result
 
-    context_lines = min(context_lines, 200)
+        context_lines = min(context_lines, _CONTEXT_LINES_MAX)
     source_snippet = ""
     try:
         lines = Path(file_path).read_text(errors="replace").splitlines()
@@ -335,7 +342,7 @@ async def explain_symbol(
             )
         else:
             return result
-    result["source"] = source_snippet[:4000] if len(source_snippet) > 4000 else source_snippet
+        result["source"] = source_snippet[:_EXPLAIN_SNIPPET_CHARS] if len(source_snippet) > _EXPLAIN_SNIPPET_CHARS else source_snippet
     result["explain_prompt"] = prompt
     return result
 
@@ -450,7 +457,7 @@ def get_source(
     if not source:
         result["warning"] = f"Could not read source from {file_path}"
     else:
-        result["source"] = source[:8000] if len(source) > 8000 else source
+        result["source"] = source[:_SOURCE_TRUNCATE_CHARS] if len(source) > _SOURCE_TRUNCATE_CHARS else source
     return result
 
 # ── moved from server.py ──
@@ -781,7 +788,7 @@ def get_symbol_context(
         result["overrides"] = overrides_info["overrides"]
         result["overridden_by"] = overrides_info["overridden_by"]
     if source:
-        result["source"] = source[:8000] if len(source) > 8000 else source
+        result["source"] = source[:_SOURCE_TRUNCATE_CHARS] if len(source) > _SOURCE_TRUNCATE_CHARS else source
     return result
 
 

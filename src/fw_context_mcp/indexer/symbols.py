@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import re
 from dataclasses import dataclass
 from functools import lru_cache
@@ -10,6 +11,8 @@ from pathlib import Path
 import clang.cindex as cx
 
 from .compile_commands import CompilationUnit
+
+_log = logging.getLogger(__name__)
 
 _INDEX: cx.Index | None = None
 _index_lock = None
@@ -420,6 +423,7 @@ def _signature(cursor: cx.Cursor) -> str:
         try:
             return f"{cursor.type.spelling} {cursor.spelling}"
         except Exception:
+            _log.debug("_signature: type.spelling failed for %s", cursor.spelling)
             return cursor.spelling
 
     # Callables only beyond this point
@@ -439,6 +443,7 @@ def _signature(cursor: cx.Cursor) -> str:
         )
         return f"{result_type} {cursor.spelling}({params})"
     except Exception:
+        _log.debug("_signature: get_arguments failed for %s", cursor.spelling)
         return cursor.displayname
 
 
@@ -456,6 +461,7 @@ def _end_line(cursor: cx.Cursor, loc) -> int:
         if end.file and loc.file and end.file.name == loc.file.name and end.line >= loc.line:
             return end.line
     except Exception:
+        _log.debug("_end_line: extent failed for %s", cursor.spelling)
         pass
     return 0
 
@@ -550,6 +556,7 @@ def _is_fn_ptr_type(t: cx.Type) -> bool:
             pointee = canon.get_pointee()
             return pointee.kind in (cx.TypeKind.FUNCTIONPROTO, cx.TypeKind.FUNCTIONNOPROTO)
     except Exception:
+        _log.debug("_is_fn_ptr_type: get_canonical failed")
         pass
     return False
 
@@ -566,6 +573,7 @@ def _first_child_unwrapped(cursor: cx.Cursor) -> cx.Cursor | None:
     try:
         children = list(cursor.get_children())
     except Exception:
+        _log.debug("_first_child_unwrapped: get_children failed")
         return None
     if not children:
         return None
@@ -574,6 +582,7 @@ def _first_child_unwrapped(cursor: cx.Cursor) -> cx.Cursor | None:
         try:
             grandkids = list(first.get_children())
         except Exception:
+            _log.debug("_first_child_unwrapped: UNEXPOSED_EXPR children failed")
             break
         if not grandkids:
             break
@@ -595,6 +604,7 @@ def _call_expr_text(cursor: cx.Cursor) -> str:
                 break
             parts.append(tok.spelling)
     except Exception:
+        _log.debug("_call_expr_text: get_tokens failed")
         return ""
     return " ".join(parts)
 
@@ -633,6 +643,84 @@ def _extract_lhs_field(
         return (None, "")
 
     return _walk(expr_cursor)
+
+
+def _extract_inheritance(class_cursors: list[cx.Cursor]) -> list[InheritanceRecord]:
+    """Extract C++ inheritance edges from collected class/struct definition cursors."""
+    inheritance: list[InheritanceRecord] = []
+    _access_map = {
+        cx.AccessSpecifier.PUBLIC: "public",
+        cx.AccessSpecifier.PROTECTED: "protected",
+        cx.AccessSpecifier.PRIVATE: "private",
+    }
+    for cls_cursor in class_cursors:
+        cls_usr = cls_cursor.get_usr()
+        if not cls_usr:
+            continue
+        try:
+            for child in cls_cursor.get_children():
+                if child.kind == cx.CursorKind.CXX_BASE_SPECIFIER:
+                    base_ref = child.referenced
+                    if base_ref is None:
+                        continue
+                    base_usr = base_ref.get_usr()
+                    if not base_usr:
+                        continue
+                    base_loc = base_ref.location
+                    if not base_loc.file:
+                        continue
+                    access = _access_map.get(child.access_specifier, "public")
+                    try:
+                        from clang.cindex import conf
+                        is_virt = bool(conf.lib.clang_isVirtualBase(child))
+                    except Exception:
+                        _log.debug("clang_isVirtualBase failed for %s", cls_cursor.spelling)
+                        is_virt = False
+                    inheritance.append(InheritanceRecord(
+                        derived_usr=cls_usr,
+                        base_usr=base_usr,
+                        access=access,
+                        is_virtual=is_virt,
+                    ))
+        except Exception:
+            _log.debug("base class traversal failed for %s", cls_cursor.spelling)
+            continue
+    return inheritance
+
+
+def _extract_macros(tu_cursor: cx.Cursor, resolve_fn) -> list[Macro]:
+    """Extract ``#define`` macro definitions from a translation unit cursor."""
+    macros: list[Macro] = []
+    for child in tu_cursor.get_children():
+        if child.kind != cx.CursorKind.MACRO_DEFINITION:
+            continue
+        loc = child.location
+        if not loc.file:
+            continue
+
+        try:
+            is_fn_like = child.is_macro_function_like()
+        except Exception:
+            _log.debug("is_macro_function_like failed for %s", child.spelling)
+            is_fn_like = False
+
+        value = ""
+        try:
+            tokens = list(child.get_tokens())
+            if len(tokens) > 1:
+                value = " ".join(t.spelling for t in tokens[1:])
+        except Exception:
+            _log.debug("macro token extraction failed for %s", child.spelling)
+            value = ""
+
+        macros.append(Macro(
+            name=child.spelling,
+            value=value,
+            line=loc.line,
+            is_function_like=is_fn_like,
+            file=str(resolve_fn(loc.file.name)),
+        ))
+    return macros
 
 
 def extract_all(
@@ -727,6 +815,7 @@ def extract_all(
             try:
                 enum_val = cursor.enum_value
             except Exception:
+                _log.debug("enum_value failed for %s at %s:%d", cursor.spelling, loc.file.name, loc.line)
                 enum_val = None
 
         # Virtual method flags (CXX_METHOD and DESTRUCTOR; destructors can be virtual too)
@@ -792,7 +881,7 @@ def extract_all(
                     if specialized is not None:
                         template_usr = specialized.get_usr() or ""
                 except Exception:
-                    pass  # specialized_template may fail for some cursor kinds
+                    _log.debug("specialized_template failed for %s", cursor.spelling)
 
         prev = seen_usrs.get(usr)
         if prev is not None:
@@ -838,79 +927,10 @@ def extract_all(
     _t_symwalk = _time.monotonic() - _t_start - _t_parse  # subtract parse time
 
     # --- Inheritance: examine base specifiers of collected class cursors ---
-    inheritance: list[InheritanceRecord] = []
-    _access_map = {
-        cx.AccessSpecifier.PUBLIC: "public",
-        cx.AccessSpecifier.PROTECTED: "protected",
-        cx.AccessSpecifier.PRIVATE: "private",
-    }
-    for cls_cursor in class_cursors:
-        cls_usr = cls_cursor.get_usr()
-        if not cls_usr:
-            continue
-        try:
-            for child in cls_cursor.get_children():
-                if child.kind == cx.CursorKind.CXX_BASE_SPECIFIER:
-                    base_ref = child.referenced
-                    if base_ref is None:
-                        continue
-                    base_usr = base_ref.get_usr()
-                    if not base_usr:
-                        continue
-                    base_loc = base_ref.location
-                    if not base_loc.file:
-                        continue
-                    # Access specifier
-                    access = _access_map.get(child.access_specifier, "public")
-                    # Virtual inheritance (uses C API via ctypes — not exposed in Python bindings)
-                    try:
-                        from clang.cindex import conf
-                        is_virt = bool(conf.lib.clang_isVirtualBase(child))
-                    except Exception:
-                        is_virt = False
-                    inheritance.append(InheritanceRecord(
-                        derived_usr=cls_usr,
-                        base_usr=base_usr,
-                        access=access,
-                        is_virtual=is_virt,
-                    ))
-        except Exception:
-            continue  # skip malformed cursors
+    inheritance = _extract_inheritance(class_cursors)
 
     # --- Macro definitions (#define) ---
-    # CXCursor_MacroDefinition cursors are emitted by
-    # PARSE_DETAILED_PROCESSING_RECORD and appear as top-level children
-    # of the translation unit cursor (NOT in the AST walk above).
-    macros: list[Macro] = []
-    for child in tu.cursor.get_children():
-        if child.kind != cx.CursorKind.MACRO_DEFINITION:
-            continue
-        loc = child.location
-        if not loc.file:
-            continue
-
-        try:
-            is_fn_like = child.is_macro_function_like()
-        except Exception:
-            is_fn_like = False
-
-        # Extract the value text from the macro definition tokens
-        value = ""
-        try:
-            tokens = list(child.get_tokens())
-            # Skip the macro name itself (token 0) and gather the value tokens
-            if len(tokens) > 1:
-                value = " ".join(t.spelling for t in tokens[1:])
-        except Exception:
-            value = ""
-
-        macros.append(Macro(
-            name=child.spelling,
-            value=value,
-            line=loc.line,
-            is_function_like=is_fn_like,
-            file=str(_resolve(loc.file.name)),
-        ))
+    macros = _extract_macros(tu.cursor, _resolve)
 
     if not with_refs:
         _log.info("  parse=%.1fs symwalk=%.1fs syms=%d macros=%d", _t_parse, _t_symwalk, len(symbols), len(macros))
@@ -1056,6 +1076,7 @@ def extract_all(
                         try:
                             _fp_type = child.type.spelling
                         except Exception:
+                            _log.debug("_emit_fn_ptr_targets: type.spelling failed for %s", target.spelling)
                             _fp_type = ""
                         fp_assignments.append(FnPointerAssignment(
                             from_file=loc.file.name,
@@ -1105,6 +1126,7 @@ def extract_all(
                 else:
                     fn_stack.append((cur_fn or '', 0, ""))
             except Exception:
+                _log.debug("cursor.extent failed for %s at %s:%d", cursor.spelling, loc.file.name if loc.file else "?", loc.line)
                 fn_stack.append((cur_fn or '', 0, ""))
 
         ref_kind = _REF_KINDS.get(cursor.kind)
@@ -1142,6 +1164,7 @@ def extract_all(
                         if _crl.file:
                             _callee_has_file = True
                     except Exception:
+                        _log.debug("referenced.location failed (field-access fallback) at %s:%d", loc.file.name, loc.line)
                         pass
                 if not _callee_has_file:
                     for child in cursor.get_children():
@@ -1179,6 +1202,7 @@ def extract_all(
                         if _crl.file:
                             _callee_has_file = True
                     except Exception:
+                        _log.debug("referenced.location failed (constructor fallback) at %s:%d", loc.file.name, loc.line)
                         pass
                 if not _callee_has_file:
                     for child in cursor.get_children():
@@ -1188,11 +1212,13 @@ def extract_all(
                                 try:
                                     child_type = child_ref.type.get_canonical()
                                 except Exception:
+                                    _log.debug("get_canonical failed for %s", child_ref.spelling)
                                     continue
                                 if child_type.kind == cx.TypeKind.RECORD:
                                     try:
                                         class_cursor = child_type.get_declaration()
                                     except Exception:
+                                        _log.debug("get_declaration failed for record type")
                                         continue
                                     if class_cursor is not None:
                                         for ctor in class_cursor.get_children():
@@ -1263,6 +1289,7 @@ def extract_all(
                             try:
                                 _fn_ptr_spelling = callee_expr.type.spelling
                             except Exception:
+                                _log.debug("type.spelling failed for indirect call callee expr")
                                 _fn_ptr_spelling = ""
                             indirect_call_sites.append(IndirectCallSite(
                                 from_file=loc.file.name,
@@ -1289,6 +1316,7 @@ def extract_all(
                 try:
                     callee_params = list(direct_callee.get_arguments())
                 except Exception:
+                    _log.debug("get_arguments failed for %s", direct_callee.spelling)
                     callee_params = []
                 callee_args = list(cursor.get_arguments())
                 for i, arg in enumerate(callee_args):
@@ -1304,6 +1332,7 @@ def extract_all(
                                         try:
                                             _fp_type = param.type.spelling
                                         except Exception:
+                                            _log.debug("param type.spelling failed for %s", param.spelling)
                                             _fp_type = ""
                                         fp_assignments.append(FnPointerAssignment(
                                             from_file=loc.file.name if (loc := cursor.location) else "",
@@ -1361,11 +1390,13 @@ def extract_all(
                 try:
                     canon = cursor.type.get_canonical()
                 except Exception:
+                    _log.debug("implicit_construct: get_canonical failed for %s", cursor.spelling)
                     canon = None
                 if canon is not None and canon.kind == cx.TypeKind.RECORD:
                     try:
                         class_cursor = canon.get_declaration()
                     except Exception:
+                        _log.debug("implicit_construct: get_declaration failed")
                         class_cursor = None
                     if class_cursor is not None:
                         for child in class_cursor.get_children():

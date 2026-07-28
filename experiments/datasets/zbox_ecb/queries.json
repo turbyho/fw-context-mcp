@@ -1,0 +1,325 @@
+{
+  "project": "zbox-ecb-fw",
+  "queries": [
+    {
+      "query": "lock",
+      "split": "sig",
+      "relevant": [
+        [
+          "lock",
+          "lib/MutexSectionLock.cpp"
+        ]
+      ]
+    },
+    {
+      "query": "unlocks mutex associated sdblockdevice instance",
+      "split": "impl",
+      "relevant": [
+        [
+          "unlock",
+          "lib/COMPONENT_SD/include/SD/SDBlockDevice.h"
+        ]
+      ]
+    },
+    {
+      "query": "initialise card",
+      "split": "sig",
+      "relevant": [
+        [
+          "_initialise_card",
+          "lib/COMPONENT_SD/source/SDBlockDevice.cpp"
+        ]
+      ]
+    },
+    {
+      "query": "reads data ina260 sensor specified",
+      "split": "impl",
+      "relevant": [
+        [
+          "rawRead",
+          "lib/INA260/INA260.cpp"
+        ]
+      ]
+    },
+    {
+      "query": "rtc set time",
+      "split": "sig",
+      "relevant": [
+        [
+          "rtc_set_time",
+          "lib/RV3149C3/RV3149C3.cpp"
+        ]
+      ]
+    },
+    {
+      "query": "provides access (generic access profile)",
+      "split": "impl",
+      "relevant": [
+        [
+          "getGapImpl",
+          "lib/ble/BLEInstanceBaseImpl.cpp"
+        ]
+      ]
+    },
+    {
+      "query": "dir read",
+      "split": "sig",
+      "relevant": [
+        [
+          "dir_read",
+          "lib/fat/ChaN/ff.cpp"
+        ]
+      ]
+    },
+    {
+      "query": "reformats file system specified block",
+      "split": "impl",
+      "relevant": [
+        [
+          "reformat",
+          "lib/fat/include/fat/FATFileSystem.h"
+        ]
+      ]
+    },
+    {
+      "query": "unmount",
+      "split": "sig",
+      "relevant": [
+        [
+          "unmount",
+          "lib/fat/source/FATFileSystem.cpp"
+        ]
+      ]
+    },
+    {
+      "query": "adds element fifo buffer method",
+      "split": "impl",
+      "relevant": [
+        [
+          "put",
+          "lib/fifo/fifo.cpp"
+        ]
+      ]
+    },
+    {
+      "query": "size",
+      "split": "sig",
+      "relevant": [
+        [
+          "size",
+          "lib/mbed-os-retarget-segger-rtt/retarget_segger_rtt.h"
+        ]
+      ]
+    },
+    {
+      "query": "configures name specific up-buffer segger",
+      "split": "impl",
+      "relevant": [
+        [
+          "SEGGER_RTT_SetNameUpBuffer",
+          "lib/mbed-os-retarget-segger-rtt/SeggerRTT/SEGGER_RTT.c"
+        ]
+      ]
+    },
+    {
+      "query": "receive",
+      "split": "sig",
+      "relevant": [
+        [
+          "receive",
+          "lib/modem/zmodem_driver_QUECTEL_EG9X.cpp"
+        ]
+      ]
+    },
+    {
+      "query": "aborts ongoing transaction serial object",
+      "split": "impl",
+      "relevant": [
+        [
+          "serial_tx_abort_asynch",
+          "lib/nrf52/serial_api.c"
+        ]
+      ]
+    },
+    {
+      "query": "getaverage",
+      "split": "sig",
+      "relevant": [
+        [
+          "getAverage",
+          "lib/rm/RunningMedian.cpp"
+        ]
+      ]
+    },
+    {
+      "query": "retrieves diff_en value lps22hb sensor's",
+      "split": "impl",
+      "relevant": [
+        [
+          "LPS22HB_Get_InterruptDifferentialGeneration",
+          "lib/sensors/LPS22HB/LPS22HB_driver.c"
+        ]
+      ]
+    },
+    {
+      "query": "lsm6dsl acc gyro r",
+      "split": "sig",
+      "relevant": [
+        [
+          "LSM6DSL_ACC_GYRO_R_SIXD_THS",
+          "lib/sensors/LSM6DSL/LSM6DSL_acc_gyro_driver.c"
+        ]
+      ]
+    },
+    {
+      "query": "converts current temperature celsius fahrenheit",
+      "split": "impl",
+      "relevant": [
+        [
+          "get_fahrenheit",
+          "lib/sensors/ST_INTERFACES/Sensors/TempSensor.h"
+        ]
+      ]
+    },
+    {
+      "query": "i2c write",
+      "split": "sig",
+      "relevant": [
+        [
+          "i2c_write",
+          "lib/sensors/X_NUCLEO_COMMON/DevI2C/DevI2C.h"
+        ]
+      ]
+    },
+    {
+      "query": "calculates addresses sizes storage areas",
+      "split": "impl",
+      "relevant": [
+        [
+          "calc_area_params",
+          "lib/tdbstore/source/TDBStore.cpp"
+        ]
+      ]
+    },
+    {
+      "query": "zcbor get ble state",
+      "split": "sig",
+      "relevant": [
+        [
+          "zcbor_get_ble_state_buffer",
+          "lib/zcbor/generation/contracts_state.c"
+        ]
+      ]
+    },
+    {
+      "query": "resets state cbor decoder telemetry",
+      "split": "impl",
+      "relevant": [
+        [
+          "cbor_decode_telemetry_cons_clean",
+          "lib/zcbor/generation/include/contracts_telemetry_cons_decode.h"
+        ]
+      ]
+    },
+    {
+      "query": "encode endpoint offrsrv prod",
+      "split": "sig",
+      "relevant": [
+        [
+          "encode_endpoint_offrsrv_prod",
+          "lib/zcbor/generation/src/contracts_offline_reservation_prod_encode.cpp"
+        ]
+      ]
+    },
+    {
+      "query": "compares binary strings byte byte",
+      "split": "impl",
+      "relevant": [
+        [
+          "zcbor_print_compare_strings",
+          "lib/zcbor/include/zcbor_print.h"
+        ]
+      ]
+    },
+    {
+      "query": "zcbor tstr encode ptr",
+      "split": "sig",
+      "relevant": [
+        [
+          "zcbor_tstr_encode_ptr",
+          "lib/zcbor/src/zcbor_encode.c"
+        ]
+      ]
+    },
+    {
+      "query": "checks software watchdog timer (swdt)",
+      "split": "impl",
+      "relevant": [
+        [
+          "swdt_check",
+          "src/wdt.cpp"
+        ]
+      ]
+    },
+    {
+      "query": "zcbor encode decode tstr map",
+      "split": "impl",
+      "relevant": [
+        [
+          "zcbor_tstr_encode",
+          "lib/zcbor/zcbor_encode.c"
+        ],
+        [
+          "zcbor_map_start_encode",
+          "lib/zcbor/zcbor_encode.c"
+        ],
+        [
+          "zcbor_list_start_encode",
+          "lib/zcbor/zcbor_encode.c"
+        ]
+      ]
+    },
+    {
+      "query": "LSM6DSL read write register sensor",
+      "split": "sig",
+      "relevant": [
+        [
+          "LSM6DSL_ACC_GYRO_read_reg",
+          "lib/sensors/LSM6DSL/LSM6DSL_acc_gyro_driver.c"
+        ],
+        [
+          "LSM6DSL_ACC_GYRO_write_reg",
+          "lib/sensors/LSM6DSL/LSM6DSL_acc_gyro_driver.c"
+        ]
+      ]
+    },
+    {
+      "query": "inventory slot parcel locker",
+      "split": "sig",
+      "relevant": [
+        [
+          "InvSync",
+          "src/inventory.cpp"
+        ],
+        [
+          "inv_open_slot",
+          "src/inventory.cpp"
+        ]
+      ]
+    },
+    {
+      "query": "BLE command handler advertising connection",
+      "split": "sig",
+      "relevant": [
+        [
+          "ble_cmd_handler",
+          "src/ble_cmd.cpp"
+        ],
+        [
+          "ble_reconnect",
+          "src/ble_reconnect.cpp"
+        ]
+      ]
+    }
+  ]
+}

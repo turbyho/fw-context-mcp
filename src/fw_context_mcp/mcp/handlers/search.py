@@ -10,7 +10,7 @@ from pydantic import Field
 
 from ...config import derive_project_id
 from ...config import load as load_config
-from ...indexer.db import _expand_query, get_active_config, lookup_macro, search_symbols
+from ...indexer.db import _cosine_sim, _expand_query, get_active_config, lookup_macro, search_symbols
 from ...llm.ollama import check_setup
 from ...utils import abs_path, resolve_project_root
 from ..shared.context import _db_path, _is_stale, _open_db_safe
@@ -307,18 +307,19 @@ def search_code(
                 if terms:
                     min_matches = max(1, len(terms) - 1)
                     like_cases = []
+                    like_params = []
                     for term in terms:
-                        esc = term.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_").replace("'", "''")
                         like_cases.append(
-                            f"CASE WHEN s.name_tokens LIKE '%{esc}%' ESCAPE '\\' THEN 1 ELSE 0 END"
+                            "CASE WHEN s.name_tokens LIKE ? ESCAPE '\\' THEN 1 ELSE 0 END"
                         )
+                        like_params.append(f"%{term}%")
                     match_sum = " + ".join(like_cases)
                     rows = c.execute(
                         f"""SELECT s.*, ({match_sum}) AS _match_cnt FROM symbols s
                            WHERE s.config_hash = ? AND ({match_sum}) >= ?
                            ORDER BY s.is_definition DESC, _match_cnt DESC, s.line
                            LIMIT ?""",
-                        (config_hash, min_matches, limit),
+                        (config_hash, *like_params, min_matches, limit),
                     ).fetchall()
                     if rows:
                         method = "name_tokens_like"
@@ -326,13 +327,12 @@ def search_code(
             if not rows and len(terms) == 1:
                 # Step 4: single-term last resort — LIKE on docstring (in
                 # case FTS5 tokenizer missed something the raw text contains).
-                esc = terms[0].replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_").replace("'", "''")
                 rows = c.execute(
-                    f"""SELECT s.* FROM symbols s
-                       WHERE s.config_hash = ? AND s.docstring LIKE '%{esc}%' ESCAPE '\\'
+                    """SELECT s.* FROM symbols s
+                       WHERE s.config_hash = ? AND s.docstring LIKE ? ESCAPE '\\'
                        ORDER BY s.is_definition DESC, s.line
                        LIMIT ?""",
-                    (config_hash, limit),
+                    (config_hash, f"%{terms[0]}%", limit),
                 ).fetchall()
                 if rows:
                     method = "docstring_like"
@@ -450,7 +450,7 @@ async def smart_search(
 
     Read-only. No side effects. Slow (10-30 s) — delegates to the full
     ``SMART_SEARCH`` pipeline (translate → rough_search → llm_query →
-    fts5_search → refine → embedding → rrf_fusion → deduplicate →
+    fts5_search → refine → embedding → adaptive_fusion → deduplicate →
     expand_context → format).
 
     Multi-phase approach:
@@ -565,8 +565,6 @@ async def semantic_search(
         ``"search_code_fallback"``).
     """
     import asyncio
-    import math
-    import struct
 
     try:
         root = resolve_project_root(project_root)
@@ -617,13 +615,16 @@ async def semantic_search(
         # Load embeddings and run cosine search
         def _do_semantic(c: sqlite3.Connection, config_hash: str) -> list[dict]:
             model_key = cfg.llm.embed_key()
-            # Count embeddings first so we can paginate
+            # Count primary embeddings (chunk_index=0) for pagination.
+            # Filtering to chunk_index=0 ensures one row per symbol so
+            # COUNT matches the actual row count for LIMIT/OFFSET.
             total = c.execute(
                 """SELECT COUNT(*)
                    FROM embeddings e
                    JOIN symbols s ON s.id = e.symbol_id
                    WHERE s.config_hash = ? AND s.is_definition = 1
-                     AND e.model = ?""",
+                     AND e.model = ?
+                     AND e.chunk_index = 0""",
                 (config_hash, model_key),
             ).fetchone()[0]
 
@@ -643,9 +644,9 @@ async def semantic_search(
 
             # Compute cosine similarity + source boost for each embedding
             BATCH = 1000
-            norm_a = math.sqrt(sum(x * x for x in query_vec))
             keep = limit * 10
-            top_candidates: list[tuple[float, float, int]] = []
+            # Dict keyed by symbol_id → (score, raw_sim) for O(1) dedup
+            top_map: dict[int, tuple[float, float]] = {}
 
             for offset in range(0, total, BATCH):
                 rows = c.execute(
@@ -654,35 +655,36 @@ async def semantic_search(
                        JOIN symbols s ON s.id = e.symbol_id
                        WHERE s.config_hash = ? AND s.is_definition = 1
                          AND e.model = ?
+                         AND e.chunk_index = 0
                        ORDER BY e.symbol_id
                        LIMIT ? OFFSET ?""",
                     (config_hash, model_key, BATCH, offset),
                 ).fetchall()
 
                 for r in rows:
-                    try:
-                        vec = struct.unpack(f'{len(query_vec)}f', r["embedding"])
-                    except Exception:
+                    raw_sim = _cosine_sim(query_vec, r["embedding"])
+                    if raw_sim is None or raw_sim <= threshold:
                         continue
-                    dot = sum(x * y for x, y in zip(query_vec, vec, strict=True))
-                    norm_b = math.sqrt(sum(x * x for x in vec))
-                    raw_sim = dot / (norm_a * norm_b) if norm_a and norm_b else 0.0
-                    if raw_sim > threshold:
-                        boost = _source_boost(r)
-                        top_candidates.append((raw_sim * boost, raw_sim, r["symbol_id"]))
+                    boost = _source_boost(r)
+                    score = raw_sim * boost
+                    sid = r["symbol_id"]
+                    prev = top_map.get(sid)
+                    if prev is None or score > prev[0]:
+                        top_map[sid] = (score, raw_sim)
 
-                if len(top_candidates) > keep:
-                    top_candidates.sort(key=lambda x: -x[0])
+                if len(top_map) > keep:
+                    top_candidates = sorted(top_map.items(), key=lambda kv: -kv[1][0])
                     top_candidates = top_candidates[:keep]
+                    top_map = dict(top_candidates)
 
-            if not top_candidates:
+            if not top_map:
                 return [{
                     "warning": f"No symbols matched with similarity > {threshold}. "
                                "Try lowering the threshold or rephrasing the query.",
                     "hint": "Use search_code for lexical/keyword search.",
                 }]
 
-            top_candidates.sort(key=lambda x: -x[0])
+            top_candidates = sorted(top_map.items(), key=lambda kv: -kv[1][0])
             top = top_candidates[:limit]
 
             if not top:
@@ -693,7 +695,7 @@ async def semantic_search(
                 }]
 
             # Resolve symbol details
-            sym_ids = [r[2] for r in top]  # r[2] is symbol_id
+            sym_ids = [sid for sid, _ in top]
             placeholders = ",".join("?" * len(sym_ids))
             sym_rows = c.execute(
                 f"""SELECT * FROM symbols
@@ -703,8 +705,7 @@ async def semantic_search(
             ).fetchall()
 
             sym_map = {r["id"]: r for r in sym_rows}
-            # Map symbol_id → raw similarity (r[1] from scored tuple)
-            sim_map = {r[2]: r[1] for r in top}  # symbol_id → raw_sim
+            sim_map = {sid: info[1] for sid, info in top}  # symbol_id → raw_sim
 
             results: list[dict] = []
             for sid in sym_ids:
@@ -740,9 +741,12 @@ async def semantic_search(
                     from fw_context_mcp.search.reranker import get_reranker
                     reranker = get_reranker(cfg.llm.reranker_model)
                     if reranker is not None:
-                        results = reranker.rank(query, results, min(limit, len(results)))
-                except Exception:
-                    pass  # Rerank is best-effort
+                        results = reranker.rank(
+                            query, results,
+                            min(cfg.index.rerank_top_k, len(results)),
+                        )
+                except Exception as e:
+                    log.warning("Reranker failed, returning unranked results: %s", e)
 
             return results
 

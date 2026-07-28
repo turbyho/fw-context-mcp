@@ -5,9 +5,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-import pytest
-
-from tests.quality_eval import evaluate, aggregate, EvalMetrics, EvalReport
+from tests.quality_eval import EvalMetrics, aggregate, evaluate
 
 
 class TestHarnessIntegration:

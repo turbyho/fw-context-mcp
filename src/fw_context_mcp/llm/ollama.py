@@ -19,31 +19,46 @@ from .embedder import Embedder
 
 log = logging.getLogger(__name__)
 
-# Per-process lock serializing Ollama HTTP calls.  Multiple concurrent
-# requests to a single Ollama instance can cause timeouts, OOM, or hangs
-# when the GPU is saturated.  This lock ensures at most one in-flight
-# Ollama request per process.
+# Per-process semaphore controlling concurrent Ollama HTTP calls.
+# Multiple concurrent requests to a single Ollama instance can cause
+# timeouts, OOM, or hangs when the GPU is saturated — this semaphore
+# caps in-flight Ollama requests per process.
 #
-# NOTE: this is NOT about httpx thread-safety (httpx.Client is thread-safe).
-# It prevents saturating the Ollama server, which typically runs with one
-# GPU and limited VRAM.  In the MCP stdio transport (one request at a time),
-# this lock has no throughput impact.  If you switch to a multi-client
-# transport (SSE/streamable), consider replacing with a semaphore to allow
-# limited concurrency for embedding requests (small model, fast).
-_ollama_lock = threading.Lock()
+# Default value 1 = serial (identical to a Lock).  Bump to 2–4 for
+# multi-client transports (SSE/streamable) where embedding requests
+# (small model, ~100 ms) can overlap without saturating the GPU.
+#
+# httpx.Client IS thread-safe — this semaphore is about Ollama server
+# capacity, not about httpx correctness.
+_ollama_sem: threading.BoundedSemaphore = threading.BoundedSemaphore(1)
+_sem_value: int = 1
+
+
+def _reconfigure_ollama_sem(max_concurrent: int) -> None:
+    """Replace the semaphore when *max_concurrent* changes.
+
+    Called from ``OllamaEmbedder.__init__`` when config provides a
+    non-default ``ollama_max_concurrent``.  Idempotent — a semaphore
+    with the same value is not recreated.
+    """
+    global _ollama_sem, _sem_value
+    if max_concurrent < 1:
+        max_concurrent = 1
+    if max_concurrent != _sem_value:
+        _ollama_sem = threading.BoundedSemaphore(max_concurrent)
+        _sem_value = max_concurrent
 
 
 @contextmanager
 def ollama_guard() -> Generator[None, None, None]:
-    """Context manager serializing Ollama access within this process.
+    """Context manager capping concurrent Ollama requests within this process.
 
     All ``call_ollama`` and ``call_ollama_embed`` calls should be wrapped
-    in this guard to prevent concurrent requests from overwhelming the
-    local Ollama instance.  Cross-process serialization is handled
-    indirectly through the write lock (``db.write_lock``) — only the
-    process that holds the write lock can perform LLM analysis writes.
+    in this guard.  Cross-process serialization is handled indirectly
+    through the write lock (``db.write_lock``) — only the process that
+    holds the write lock can perform LLM analysis writes.
     """
-    with _ollama_lock:
+    with _ollama_sem:
         yield
 
 
@@ -94,6 +109,8 @@ def call_ollama(
 
     Raises OllamaError on network or API failure.
     """
+    if not cfg.ollama_url.startswith(("http://", "https://")):
+        raise OllamaError(f"Invalid ollama_url scheme: {cfg.ollama_url} — must be http:// or https://")
     url = cfg.ollama_url.rstrip("/") + "/api/generate"
     options: dict = {"num_ctx": cfg.num_ctx, "temperature": temperature}
     if num_predict is not None:
@@ -154,6 +171,8 @@ def _call_ollama_embed_impl(
     When *embedder* is passed, :attr:`OllamaEmbedder.dim` is updated after
     the first successful batch so the caller can detect dimensions lazily.
     """
+    if not cfg.ollama_url.startswith(("http://", "https://")):
+        raise OllamaError(f"Invalid ollama_url scheme: {cfg.ollama_url} — must be http:// or https://")
     url = cfg.ollama_url.rstrip("/") + "/api/embed"
     prompt = cfg.embed_query_prompt if query else cfg.embed_doc_prompt
     if prompt:
@@ -169,8 +188,8 @@ def _call_ollama_embed_impl(
             resp = httpx.post(url, json=payload, timeout=cfg.timeout * 2)
         resp.raise_for_status()
         embeddings = resp.json()["embeddings"]
-        if embedder is not None and embeddings:
-            embedder._dim = len(embeddings[0])
+        if embedder is not None:
+            embedder._update_dim(embeddings)
         if cfg.debug_log:
             _write_debug_log(cfg.debug_log, {
                 "ts": datetime.now(UTC).isoformat(),
@@ -189,8 +208,8 @@ def _call_ollama_embed_impl(
                 resp = httpx.post(url, json=payload, timeout=cfg.timeout * 2)
             resp.raise_for_status()
             embeddings = resp.json()["embeddings"]
-            if embedder is not None and embeddings:
-                embedder._dim = len(embeddings[0])
+            if embedder is not None:
+                embedder._update_dim(embeddings)
             if cfg.debug_log:
                 _write_debug_log(cfg.debug_log, {
                     "ts": datetime.now(UTC).isoformat(),
@@ -236,6 +255,13 @@ class OllamaEmbedder(Embedder):
     def __init__(self, cfg: LLMConfig) -> None:
         self._cfg = cfg
         self._dim: int | None = None
+        if cfg.ollama_max_concurrent > 1:
+            _reconfigure_ollama_sem(cfg.ollama_max_concurrent)
+
+    def _update_dim(self, embeddings: list[list[float]]) -> None:
+        """Lazily detect embedding dimension from the first batch."""
+        if self._dim is None and embeddings:
+            self._dim = len(embeddings[0])
 
     def embed_documents(self, texts: list[str]) -> list[list[float]]:
         return _call_ollama_embed_impl(texts, self._cfg, query=False, embedder=self)
@@ -253,11 +279,13 @@ class OllamaEmbedder(Embedder):
 
     @property
     def max_tokens(self) -> int:
-        # mxbai-embed-large ~512 tokens, qwen3-embedding ~8192 tokens.
-        # Conservative default: 512.
         model = self._cfg.embed_model.lower()
-        if "qwen3-embedding" in model:
+        if "qwen3-embedding:0.6b" in model or "qwen3-embedding:4b" in model:
+            return 32768
+        if "qwen3-embedding:8b" in model:
             return 8192
+        if "mxbai" in model:
+            return 512
         return 512
 
 

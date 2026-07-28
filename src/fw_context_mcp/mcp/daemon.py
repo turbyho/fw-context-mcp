@@ -189,7 +189,7 @@ def daemon_main(project_root: Path) -> None:
         needs, reasons = _staleness_check(project_root)
         if needs and not _bg_paused(project_root):
             log.info("Initial index needed (%s)", ", ".join(reasons))
-            force_refs = "refs missing" in ", ".join(reasons)
+            force_refs = "refs missing" in reasons
             index_proc = _run_index_async(project_root, db_dir, force_refs=force_refs)
             _wait_index(index_proc, shutdown, db_dir=db_dir)
             index_proc = None

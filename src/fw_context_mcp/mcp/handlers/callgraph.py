@@ -619,17 +619,12 @@ def find_dead_code(
         status (``"dead"`` or ``"possibly_dead"``), and reason (str —
         explains why the function is classified as dead or possibly dead).
     """
-    _conn, root, config_hash, err = _refs_guard(project_root)
+    conn, root, config_hash, err = _refs_guard(project_root)
     if err:
         return err
+    assert conn is not None
     assert root is not None
     assert config_hash is not None
-
-    db_path = _db_path(root)
-    conn, open_err = _open_db_safe(db_path)
-    if open_err:
-        return [open_err]
-    assert conn is not None
     try:
         rows = index_db.find_dead_code(
             conn, config_hash, limit=limit,
@@ -914,17 +909,12 @@ def find_hotspots(
         list of dicts, each with: name, qualified_name, kind, file, line,
         caller_count (int — total number of call sites), signature.
     """
-    _conn, root, config_hash, err = _refs_guard(project_root)
+    conn, root, config_hash, err = _refs_guard(project_root)
     if err:
         return err
+    assert conn is not None
     assert root is not None
     assert config_hash is not None
-
-    db_path = _db_path(root)
-    conn, open_err = _open_db_safe(db_path)
-    if open_err:
-        return [open_err]
-    assert conn is not None
     try:
         rows = index_db.find_hotspots(
             conn, config_hash, limit=limit,

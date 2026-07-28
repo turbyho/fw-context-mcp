@@ -12,6 +12,7 @@ vector is the smaller dimension; this avoids the 6× storage cost.
 from __future__ import annotations
 
 import logging
+import threading
 from typing import TYPE_CHECKING
 
 from .embedder import Embedder
@@ -45,30 +46,35 @@ class SentenceTransformerEmbedder(Embedder):
         self._model = None
         self._dim: int | None = None
         self._native_dim: int | None = None  # model's full dim before MRL truncation
+        self._lock = threading.Lock()
 
     def _ensure_model(self):
         if self._model is not None:
             return
-        try:
-            from sentence_transformers import SentenceTransformer
-        except ImportError as err:
-            raise ImportError(
-                "sentence-transformers is required for this model. "
-                "Install it with: pip install fw-context-mcp[st]"
-            ) from err
-        model_path = self._cfg.embed_model
-        log.info("Loading embedding model: %s ...", model_path)
-        self._model = SentenceTransformer(model_path)
-        self._native_dim = self._model.get_sentence_embedding_dimension()
-        if self._cfg.embed_dim and self._cfg.embed_dim < self._native_dim:
-            log.info("MRL: truncating %d → %d (model=%s)", self._native_dim, self._cfg.embed_dim, model_path)
-            self._dim = self._cfg.embed_dim
-        else:
-            self._dim = self._native_dim
+        with self._lock:
+            if self._model is not None:
+                return
+            try:
+                from sentence_transformers import SentenceTransformer
+            except ImportError as err:
+                raise ImportError(
+                    "sentence-transformers is required for this model. "
+                    "Install it with: pip install fw-context-mcp[st]"
+                ) from err
+            model_path = self._cfg.embed_model
+            log.info("Loading embedding model: %s ...", model_path)
+            self._model = SentenceTransformer(model_path)
+            self._native_dim = self._model.get_sentence_embedding_dimension()
+            if self._cfg.embed_dim and self._cfg.embed_dim < self._native_dim:
+                log.info("MRL: truncating %d → %d (model=%s)", self._native_dim, self._cfg.embed_dim, model_path)
+                self._dim = self._cfg.embed_dim
+            else:
+                self._dim = self._native_dim
 
     def _encode(self, texts: list[str]) -> list[list[float]]:
         """Encode and optionally MRL-truncate + normalize."""
-        assert self._model is not None and self._native_dim is not None
+        if self._model is None:
+            raise RuntimeError("_encode called before _ensure_model()")
         result = self._model.encode(texts, normalize_embeddings=True)
         if self._cfg.embed_dim and self._cfg.embed_dim < len(result[0]):
             result = result[:, : self._cfg.embed_dim]
@@ -99,6 +105,17 @@ class SentenceTransformerEmbedder(Embedder):
     @property
     def dim(self) -> int | None:
         return self._dim
+
+    @property
+    def model(self):
+        """Return the loaded :class:`SentenceTransformer` model, loading it lazily.
+
+        This is the public accessor for ``_model`` — use this instead of
+        reaching into the private attribute.  Returns None before the first
+        embed call.
+        """
+        self._ensure_model()
+        return self._model
 
     @property
     def max_tokens(self) -> int:

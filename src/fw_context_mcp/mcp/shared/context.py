@@ -3,15 +3,13 @@
 from __future__ import annotations
 
 import logging
-import os
 import sqlite3
-from datetime import UTC, datetime
 from pathlib import Path
 
 from ...config import Config, derive_project_id
 from ...config import load as load_config
 from ...indexer.db import DatabaseCorruptionError, open_db
-from ...utils import MTIME_TOLERANCE_S, resolve_project_root
+from ...utils import resolve_project_root
 
 log = logging.getLogger(__name__)
 
@@ -20,27 +18,28 @@ log = logging.getLogger(__name__)
 # subsequent opens — corruption is rare and read queries cannot cause it.
 _integrity_checked: set[str] = set()
 
-# Sentry pro detekci nepřipraveného projektu při startu MCP serveru.
-# Nastavuje se v main() před mcp.run() — pokud projekt není inicializovaný
-# nebo nemá index, všechny tool handlery vrací jednotnou chybovou zprávu.
+# Sentinel for detecting an uninitialized project at MCP server startup.
+# Set in main() before mcp.run() — if the project is not initialized
+# or has no index, all tool handlers return a uniform error message.
 _server_init_error: str | None = None
 
 
 def _set_server_init_error(message: str) -> None:
-    """Nastav chybovou zprávu, kterou uvidí všechny tool handlery.
+    """Set the error message that all tool handlers will see.
 
-    Volej pouze v main() před spuštěním serveru. Po nastavení sentinelu
-    každý tool handler skončí s touto zprávou — LLM ji přepošle uživateli.
+    Call only in main() before starting the server. After the sentinel
+    is set, every tool handler will terminate with this message — the LLM
+    forwards it to the user.
     """
     global _server_init_error
     _server_init_error = message
 
 
 def _check_server_ready() -> None:
-    """Zkontroluj, že projekt je připravený (inicializovaný + indexovaný).
+    """Check that the project is ready (initialized + indexed).
 
-    Vyhazuje RuntimeError s instrukcemi pro uživatele, pokud server
-    detekoval nepřipravený projekt při startu.
+    Raises RuntimeError with user instructions if the server detected
+    an uninitialized project at startup.
     """
     if _server_init_error is not None:
         raise RuntimeError(_server_init_error)
@@ -77,6 +76,9 @@ def _open_db_safe(db_path: Path) -> tuple[sqlite3.Connection | None, dict | None
         _integrity_checked.add(db_key)
         return conn, None
     except DatabaseCorruptionError as e:
+        # Remove from cache so the user can see the full error on retry
+        _integrity_checked.discard(db_key)
+    except DatabaseCorruptionError as e:
         return None, {
             "error": f"Database corruption detected: {e.details}",
             "action": "reset_index",
@@ -87,19 +89,19 @@ def _open_db_safe(db_path: Path) -> tuple[sqlite3.Connection | None, dict | None
 def _is_stale(cfg, compile_commands_path: str) -> bool:
     """Check if compile_commands.json is newer than the index timestamp.
 
+    Delegates to :func:`fw_context_mcp.utils.is_compile_commands_stale`.
     Returns False on any error (missing file, bad timestamp) to avoid
     blocking queries when the staleness check itself fails.
     """
+    from fw_context_mcp.utils import is_compile_commands_stale
+
     try:
-        cc_mtime = os.path.getmtime(compile_commands_path)
-        indexed_at = datetime.fromisoformat(cfg["created_at"]).replace(tzinfo=UTC)
-        return cc_mtime > indexed_at.timestamp() + MTIME_TOLERANCE_S
-    except (FileNotFoundError, KeyError, ValueError, OSError) as e:
-        # Return False on error: a broken compile_commands.json or missing
-        # timestamp should not block all queries with stale warnings.
-        # The index metadata check (schema_version) still catches real staleness.
-        log.warning("Staleness check failed: %s", e)
+        created_at = cfg["created_at"]
+    except (KeyError, IndexError):
         return False
+    if not created_at:
+        return False
+    return is_compile_commands_stale(created_at, compile_commands_path)
 
 
 def _detect_build_system(root: Path) -> str:

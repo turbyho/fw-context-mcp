@@ -11,7 +11,6 @@ import re
 import signal
 import sys
 import time
-from datetime import UTC, datetime
 from pathlib import Path
 
 from . import __version__
@@ -534,21 +533,15 @@ def cmd_status(args: argparse.Namespace) -> int:
 def _cli_is_stale(row) -> bool:
     """Check if a project's compile_commands.json is newer than its index timestamp.
 
+    Delegates to :func:`fw_context_mcp.utils.is_compile_commands_stale`.
     Returns False on any error so staleness checks don't block CLI output.
     """
-    import os
+    from .utils import is_compile_commands_stale
 
-    from .utils import MTIME_TOLERANCE_S as _MTS
-
-    try:
-        cc = row["compile_commands_path"]
-        if not cc or not Path(cc).exists():
-            return False
-        cc_mtime = os.path.getmtime(cc)
-        indexed_at = datetime.fromisoformat(row["created_at"]).replace(tzinfo=UTC)
-        return cc_mtime > indexed_at.timestamp() + _MTS
-    except Exception:
+    cc = row.get("compile_commands_path", "")
+    if not cc:
         return False
+    return is_compile_commands_stale(row["created_at"], cc)
 
 
 def _install_skills(
@@ -1104,12 +1097,14 @@ def cmd_init(args: argparse.Namespace) -> int:
                 f"\n[ok] {proj_config}: shared project config ready — edit vendor_paths, project_paths, etc. (commit to git)"
             )
             print(f"[ok] {local_config}: local developer config ready — edit ollama_url, model, etc. (gitignore)")
-            # .gitignore management
+            if _proj_cfg.llm.enabled:
+                from .llm.auto_model import resolve_embed_model
+                resolve_embed_model(_proj_cfg.llm)
             _ensure_gitignore(project_root, fix=True, build_system=_build_system)
         _install_skills(dry_run=False, project_root=project_root, scope=args.scope)
         _install_agents(dry_run=False, project_root=project_root, scope=args.scope)
 
-    # ── Diagnostic output (always shown, independent of AI tool detection) ──
+    # ── Diagnostic output ──
     if not args.dry_run:
         print()
         if _build_system:
@@ -1117,57 +1112,10 @@ def cmd_init(args: argparse.Namespace) -> int:
         else:
             print("  Build system: none detected — set [build] system in config.toml")
 
-        # compile_commands.json status
-        _cc = _proj_cfg.index.compile_commands
-        if not _cc.is_absolute():
-            _cc = (project_root / _cc).resolve()
-        if _cc.exists():
-            from .indexer.build import check_completeness
-
-            _issues = list(check_completeness(_cc, project_root))
-            if _issues:
-                print("  compile_commands.json: present but incomplete")
-                for w in _issues:
-                    print(f"    {w}")
-            else:
-                print("  compile_commands.json: ok")
+        if _proj_cfg.llm.enabled:
+            print(f"  Embed model: {_proj_cfg.llm.embed_model}")
         else:
-            print("  compile_commands.json: not found — run 'fw-context index --build'")
-
-        # Index health
-        from .indexer.db import get_active_config, open_db as _db_open
-
-        _db_path = _proj_cfg.index.db_dir / proj_id / "index.db"
-        if _db_path.exists():
-            _conn = None
-            try:
-                _conn = _db_open(_db_path)
-                _active = get_active_config(_conn, proj_id)
-                if _active:
-                    _sym_count = _conn.execute(
-                        "SELECT COUNT(*) FROM symbols WHERE config_hash=?",
-                        (_active["config_hash"],),
-                    ).fetchone()[0]
-                    print(f"  index: {_sym_count} symbols")
-                    _emb_count = _conn.execute(
-                        "SELECT COUNT(*) FROM embeddings e JOIN symbols s ON s.id = e.symbol_id WHERE s.config_hash = ?",
-                        (_active["config_hash"],),
-                    ).fetchone()[0]
-                    if _emb_count == 0:
-                        print("  index: no embeddings yet — run 'fw-context index' to generate")
-                    _ana_count = _conn.execute(
-                        "SELECT COUNT(*) FROM llm_analysis a JOIN symbols s ON s.id = a.symbol_id WHERE s.config_hash = ?",
-                        (_active["config_hash"],),
-                    ).fetchone()[0]
-                    if _ana_count == 0:
-                        print("  index: no LLM symbol analysis yet — run 'fw-context index' to generate")
-            except Exception as e:
-                print(f"  index: cannot read — {e}")
-            finally:
-                if _conn is not None:
-                    _conn.close()
-        else:
-            print("  index: not yet built — run 'fw-context index'")
+            print("  LLM: disabled — Ollama calls will return raw prompts")
 
     if warnings:
         print("\nWarnings:")
@@ -2609,7 +2557,7 @@ def cmd_finetune(args: argparse.Namespace) -> int:
     print(f"\nFine-tuned model saved to: {result}")
     print("To use it, set in .fw-context/local.toml:")
     print("  [llm]")
-    print(f"  embed_model = \"{result}\"")
+    print(f"  embed_model = \"ft://{result}\"")
     return 0
 
 

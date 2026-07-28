@@ -1,11 +1,11 @@
 """Phase: Context expansion via call graph — add relevant neighbors to results.
 
-After RRF fusion, takes the top seeds and walks their callers + callees to
+After adaptive fusion, takes the top seeds and walks their callers + callees to
 find project-local symbols that are contextually related but were missed by
 lexical and semantic search.
 
 Parameters confirmed by experiment E‑B (both_s10_mixed):
-- 10 seeds (top‑10 RRF results)
+- 10 seeds (top‑10 adaptive fusion results)
 - Both directions (callers + callees)
 - Mixed strategy (10 original + 5 new neighbors at positions 11–15)
 - Filter: project definitions only (is_project=True, is_definition=1)
@@ -27,7 +27,7 @@ log = logging.getLogger(__name__)
 class ExpandContextPhase(Phase):
     """Walk the call graph around top results to surface related symbols.
 
-    Reads ``final_results`` from the context (populated by RRF fusion), takes
+    Reads ``final_results`` from the context (populated by adaptive fusion), takes
     the first ``seeds`` of them, and queries the ``refs`` table for callers
     and callees.  Neighbors are filtered to project-local definitions only
     and inserted after the original results.
@@ -36,7 +36,7 @@ class ExpandContextPhase(Phase):
     name = "expand_context"
 
     # ── Parameters (confirmed by experiment E-B) ────────────────────
-    SEEDS: int = 10        # top-N RRF results used as seeds
+    SEEDS: int = 10        # top-N adaptive fusion results used as seeds
     MAX_NEIGHBORS: int = 5  # max new neighbors inserted
     DIRECTION: str = "both"  # "callers", "callees", or "both"
 

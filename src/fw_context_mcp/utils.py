@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+from datetime import UTC, datetime
 from pathlib import Path
 
 __all__ = [
@@ -15,6 +16,7 @@ __all__ = [
     "abs_path",
     "compute_content_hash",
     "compute_source_hash",
+    "is_compile_commands_stale",
     "read_file_lines",
     "resolve_project_root",
 ]
@@ -98,3 +100,24 @@ def compute_source_hash(file_path: Path) -> str:
         return hashlib.sha256(file_path.read_bytes()).hexdigest()
     except OSError:
         return ""
+
+
+def is_compile_commands_stale(
+    created_at: str,
+    compile_commands_path: str | Path,
+    tolerance_s: float = MTIME_TOLERANCE_S,
+) -> bool:
+    """Check if compile_commands.json is newer than *created_at* timestamp.
+
+    Returns False on any error (missing file, bad timestamp, OSError)
+    so staleness checks don't block queries or CLI output.
+    """
+    try:
+        cc_path = Path(compile_commands_path)
+        if not cc_path.exists():
+            return False
+        cc_mtime = os.path.getmtime(cc_path)
+        indexed_at = datetime.fromisoformat(created_at).replace(tzinfo=UTC)
+        return cc_mtime > indexed_at.timestamp() + tolerance_s
+    except (FileNotFoundError, KeyError, ValueError, OSError):
+        return False

@@ -96,8 +96,9 @@ def _ensure_column(conn: sqlite3.Connection, table: str, column: str, type_def: 
     if column not in cols:
         try:
             conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {type_def}")
-        except sqlite3.OperationalError:
-            pass  # column already exists (race condition)
+        except sqlite3.OperationalError as e:
+            if "duplicate column" not in str(e):
+                raise
 
 
 def _ensure_migrated_columns(conn: sqlite3.Connection) -> None:
@@ -172,8 +173,12 @@ def split_tokens(name: str, qualified_name: str = "") -> str:
     """
     # Noise words that pollute FTS5 — strip before tokenizing
     _NOISE_WORDS = frozenset(("at", "unnamed"))
+    # Guard against pathological inputs that cause ReDoS in regex processing
+    _MAX_NAME_LEN = 500
 
     def _tokenize(s: str) -> list[str]:
+        if len(s) > _MAX_NAME_LEN:
+            s = s[:_MAX_NAME_LEN]
         # Strip anonymous struct/enum/union markers — these inject noise tokens
         # like "mbed", "include", "enum" that match thousands of irrelevant symbols.
         s = re.sub(r"\(unnamed\s+(struct|enum|union)\s+at\s+[^)]+\)", "", s)
@@ -314,6 +319,10 @@ _MIGRATION_ADD_COLUMNS = [
     "ALTER TABLE build_configs ADD COLUMN first_indexed_at TEXT NOT NULL DEFAULT ''",
     "ALTER TABLE build_configs ADD COLUMN analyze_vendor INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE files ADD COLUMN is_project INTEGER NOT NULL DEFAULT 0",
+    # Dummy column: exists solely to bump CURRENT_SCHEMA_VERSION
+    # when embeddings PK changed from symbol_id to (symbol_id, chunk_index).
+    # DO NOT REMOVE — removal drops the schema version and breaks migration detection.
+    "ALTER TABLE build_configs ADD COLUMN _schema_bump_emb_chunk_idx INTEGER NOT NULL DEFAULT 0",
 ]
 
 # Pre-computed {table: {columns}} from _MIGRATION_ADD_COLUMNS.
@@ -509,12 +518,14 @@ CREATE INDEX IF NOT EXISTS idx_fpa_config_file ON fp_assignments(config_hash, fr
 -- Symbol embeddings for semantic search (opt-in via [index] index_embeddings = true).
 -- Stored as BLOB: variable-dimension float32 values packed with struct.pack('f', ...).
 -- Common: mxbai-embed-large → 1024 floats (4096 bytes), qwen3-embedding → 4096 floats (16384 bytes).
--- ON DELETE CASCADE: when a symbol row is deleted, its embedding is removed.
+-- ON DELETE CASCADE: when a symbol row is deleted, all of its embedding chunks are removed.
 CREATE TABLE IF NOT EXISTS embeddings (
-    symbol_id    INTEGER PRIMARY KEY REFERENCES symbols(id) ON DELETE CASCADE,
-    embedding    BLOB   NOT NULL,
-    model        TEXT   NOT NULL,
-    updated_at   TEXT   NOT NULL DEFAULT (datetime('now'))
+    symbol_id    INTEGER NOT NULL REFERENCES symbols(id) ON DELETE CASCADE,
+    chunk_index  INTEGER NOT NULL DEFAULT 0,
+    embedding    BLOB    NOT NULL,
+    model        TEXT    NOT NULL,
+    updated_at   TEXT    NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (symbol_id, chunk_index)
 );
 CREATE INDEX IF NOT EXISTS idx_embeddings_symbol ON embeddings(symbol_id);
 
@@ -969,6 +980,40 @@ def open_db(path: Path, *, skip_integrity_check: bool = False) -> sqlite3.Connec
         except sqlite3.DatabaseError as e:
             conn.close()
             raise DatabaseCorruptionError(str(path), str(e)) from e
+
+        # Migration: embeddings → composite PK (symbol_id, chunk_index).
+        # SQLite can't ALTER TABLE to change PK — recreate preserving data.
+        # Old rows get chunk_index=0 (single-chunk compatible).
+        if _table_exists(conn, "embeddings"):
+            emb_cols = [r[1] for r in conn.execute("PRAGMA table_info(embeddings)").fetchall()]
+            if "chunk_index" not in emb_cols:
+                log.info("Migrating embeddings table to composite PK (symbol_id, chunk_index)...")
+                # executescript auto-commits, rendering BEGIN/ROLLBACK useless.
+                # Use individual execute() calls inside a single transaction
+                # so a failure at any step can ROLLBACK atomically.
+                conn.execute("BEGIN IMMEDIATE")
+                try:
+                    conn.execute("""
+                        CREATE TABLE IF NOT EXISTS embeddings_v2 (
+                            symbol_id    INTEGER NOT NULL REFERENCES symbols(id) ON DELETE CASCADE,
+                            chunk_index  INTEGER NOT NULL DEFAULT 0,
+                            embedding    BLOB    NOT NULL,
+                            model        TEXT    NOT NULL,
+                            updated_at   TEXT    NOT NULL DEFAULT (datetime('now')),
+                            PRIMARY KEY (symbol_id, chunk_index)
+                        )
+                    """)
+                    conn.execute("""
+                        INSERT OR IGNORE INTO embeddings_v2 (symbol_id, chunk_index, embedding, model, updated_at)
+                            SELECT symbol_id, 0, embedding, model, updated_at FROM embeddings
+                    """)
+                    conn.execute("DROP TABLE IF EXISTS embeddings")
+                    conn.execute("ALTER TABLE embeddings_v2 RENAME TO embeddings")
+                    conn.commit()
+                except Exception:
+                    conn.execute("ROLLBACK")
+                    log.exception("Embeddings migration failed — rolled back")
+                    raise
 
         # Stamp the database with the current schema version so we can detect
         # stale indexes — PRAGMA user_version is the standard SQLite mechanism.
@@ -2064,13 +2109,37 @@ def _blob_to_vec(blob: bytes) -> list[float]:
     return list(struct.unpack("f" * (len(blob) // 4), blob))
 
 
+def _cosine_sim(query_vec: list[float], blob: bytes) -> float | None:
+    """Compute cosine similarity between a query vector and a stored BLOB.
+
+    Returns None when the BLOB cannot be unpacked (dimension mismatch,
+    corruption, etc.).  Returns 0.0 when either vector has zero norm.
+    """
+    import math as _math
+
+    try:
+        vec_b = struct.unpack(f"{len(query_vec)}f", blob)
+    except (struct.error, TypeError):
+        log.debug(
+            "Embedding dimension mismatch: query=%d floats, stored=%d bytes",
+            len(query_vec), len(blob),
+        )
+        return None
+    dot = sum(x * y for x, y in zip(query_vec, vec_b, strict=True))
+    norm_a = _math.sqrt(sum(x * x for x in query_vec))
+    norm_b = _math.sqrt(sum(x * x for x in vec_b))
+    if norm_a == 0.0 or norm_b == 0.0:
+        return 0.0
+    return dot / (norm_a * norm_b)
+
+
 def upsert_embeddings(
     conn: sqlite3.Connection,
-    rows: list[tuple[int, bytes, str]],
+    rows: list[tuple[int, int, bytes, str]],
 ) -> int:
     """Insert or replace embedding rows.
 
-    Each row is (symbol_id, embedding_blob, model).
+    Each row is (symbol_id, chunk_index, embedding_blob, model).
     Returns number of rows inserted.
     """
     # Clean orphaned embeddings whose symbol no longer exists (can happen
@@ -2081,8 +2150,8 @@ def upsert_embeddings(
         )"""
     )
     cur = conn.executemany(
-        """INSERT OR REPLACE INTO embeddings(symbol_id, embedding, model, updated_at)
-           VALUES (?, ?, ?, datetime('now'))""",
+        """INSERT OR REPLACE INTO embeddings(symbol_id, chunk_index, embedding, model, updated_at)
+           VALUES (?, ?, ?, ?, datetime('now'))""",
         rows,
     )
     return cur.rowcount
@@ -2093,12 +2162,15 @@ def get_embeddings(
     config_hash: str,
     model: str,
 ) -> dict[int, list[float]]:
-    """Return {symbol_id: embedding_vector} for a build config and model."""
+    """Return {symbol_id: embedding_vector} for a build config and model.
+
+    For multi-chunk symbols, returns only chunk_index=0 (the primary embedding).
+    """
     rows = conn.execute(
         """SELECT e.symbol_id, e.embedding
            FROM embeddings e
            JOIN symbols s ON s.id = e.symbol_id
-           WHERE s.config_hash = ? AND e.model = ?""",
+           WHERE s.config_hash = ? AND e.model = ? AND e.chunk_index = 0""",
         (config_hash, model),
     ).fetchall()
     return {r["symbol_id"]: _blob_to_vec(r["embedding"]) for r in rows}
@@ -2112,7 +2184,8 @@ _VEC_SCHEMA = """
 CREATE VIRTUAL TABLE IF NOT EXISTS vec_symbols USING vec0(
     embedding float[{dim}] distance_metric=cosine,
     config_hash TEXT,
-    symbol_id INTEGER
+    symbol_id INTEGER,
+    chunk_index INTEGER
 );
 """
 
@@ -2139,23 +2212,36 @@ def init_vec_table(conn: sqlite3.Connection, dim: int | None = None) -> None:
 
 def upsert_embeddings_vec(
     conn: sqlite3.Connection,
-    rows: list[tuple[int, str, list[float]]],
+    rows: list[tuple[int, int, str, list[float]]],
 ) -> int:
     """Insert or replace embeddings into the vec0 vector table.
 
-    Each row is ``(symbol_id, config_hash, embedding_vector)``.
-    Uses DELETE + INSERT because ``vec0`` virtual tables do not reliably
-    support ``INSERT OR REPLACE`` conflict resolution.
+    Each row is ``(symbol_id, chunk_index, config_hash, embedding_vector)``.
+    Uses ``symbol_id * 1000 + chunk_index`` as rowid for uniqueness.
     Returns number of rows inserted.
     """
     import json
 
-    count = 0
-    for symbol_id, config_hash, vec in rows:
-        conn.execute("DELETE FROM vec_symbols WHERE rowid = ?", (symbol_id,))
+    # Clean orphaned vec0 rows whose symbol no longer exists (vec_symbols
+    # lacks ON DELETE CASCADE — orphan rows survive after reindex_file
+    # or partial reindex that re-creates symbols with new IDs).
+    try:
         conn.execute(
-            "INSERT INTO vec_symbols(rowid, embedding, config_hash, symbol_id) VALUES (?, ?, ?, ?)",
-            (symbol_id, json.dumps(vec), config_hash, symbol_id),
+            """DELETE FROM vec_symbols WHERE symbol_id NOT IN (
+                SELECT id FROM symbols
+            )"""
+        )
+    except sqlite3.OperationalError:
+        pass  # vec_symbols table doesn't exist (sqlite-vec not loaded)
+
+    count = 0
+    for symbol_id, chunk_index, config_hash, vec in rows:
+        rowid = symbol_id * 1000 + chunk_index
+        conn.execute("DELETE FROM vec_symbols WHERE rowid = ?", (rowid,))
+        conn.execute(
+            "INSERT INTO vec_symbols(rowid, embedding, config_hash, symbol_id, chunk_index) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (rowid, json.dumps(vec), config_hash, symbol_id, chunk_index),
         )
         count += 1
     return count
@@ -2172,11 +2258,16 @@ def search_similar_vec(
 
     Returns rows with ``symbol_id`` and ``distance`` (cosine distance,
     range [0, 2], where 0 = identical).  Results are post-filtered by
-    *threshold* so only sufficiently similar vectors are returned.
+    *threshold* and deduplicated by ``symbol_id`` (best distance kept
+    for multi-chunk symbols).
     """
     import json
 
     query_json = json.dumps(query_vec)
+    # Overfetch by 5× to compensate for multi-chunk dedup (worst case: all
+    # candidates have max chunks, but symbols with many chunks don't usually
+    # cluster at the top).  Still iterate in the dedup loop below until we
+    # collect *limit* unique symbols.
     rows = conn.execute(
         """SELECT symbol_id, distance
            FROM vec_symbols
@@ -2184,12 +2275,23 @@ def search_similar_vec(
              AND config_hash = ?
              AND k = ?
            ORDER BY distance""",
-        (query_json, config_hash, limit),
+        (query_json, config_hash, limit * 5),
     ).fetchall()
 
-    # Post-filter by threshold (vec0 does not natively support distance < N
-    # in the WHERE clause — distance is available only after MATCH)
-    return [r for r in rows if r["distance"] <= (1.0 - threshold)]
+    # Post-filter by threshold and deduplicate by symbol_id
+    seen: set[int] = set()
+    results: list[sqlite3.Row] = []
+    for r in rows:
+        if r["distance"] > (1.0 - threshold):
+            continue
+        sid = r["symbol_id"]
+        if sid in seen:
+            continue
+        seen.add(sid)
+        results.append(r)
+        if len(results) >= limit:
+            break
+    return results
 
 
 def search_similar_hybrid(
@@ -2214,7 +2316,7 @@ def search_similar_hybrid(
 
     # Phase 1 — text recall (includes declarations + definitions).
     # The direct KNN path filters is_definition=1 but the hybrid path
-    # intentionally doesn't — RRF fusion prefers definitions anyway,
+    # intentionally doesn't — adaptive fusion prefers definitions anyway,
     # and including declarations in the recall set catches cases
     # where a definition was renamed but the old declaration persists.
     text_candidates = search_symbols(conn, fts5_query, config_hash, limit=200)
@@ -2233,12 +2335,15 @@ def search_similar_hybrid(
         (*candidate_ids, config_hash),
     ).fetchall()
 
-    # Build distance map, filter by threshold
+    # Build distance map, filter by threshold — keep best (lowest) distance
+    # per symbol_id for multi-chunk symbols.
     dist_map: dict[int, float] = {}
     for r in rows:
         d = r["distance"]
         if d <= (1.0 - threshold):
-            dist_map[r["symbol_id"]] = d
+            sid = r["symbol_id"]
+            if sid not in dist_map or d < dist_map[sid]:
+                dist_map[sid] = d
 
     # Re-rank candidates by vector distance
     scored = [(dist_map[r["id"]], r) for r in text_candidates if r["id"] in dist_map]

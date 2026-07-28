@@ -20,6 +20,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from .db import search_symbols
+
 if TYPE_CHECKING:
     from ..config.settings import Config
     from ..llm.embedder import Embedder
@@ -61,9 +63,16 @@ class MiningResult:
 def _generate_queries(conn: sqlite3.Connection, config_hash: str) -> list[tuple[str, int]]:
     """Generate synthetic queries from symbol descriptions.
 
+    Each symbol produces ONE query via weighted-random template selection
+    (not all 6 templates — ``_QUERY_TEMPLATES`` weights bias toward
+    summary-based templates which produce more meaningful queries, and
+    one-per-symbol avoids bloating the training set with near-duplicates).
+
     Returns ``(query_text, symbol_id)`` pairs — the symbol_id anchors
     to compute disagreement later.
     """
+    import random as _random
+
     rows = conn.execute(
         """SELECT id, name, kind, docstring, summary, is_project
            FROM symbols
@@ -71,8 +80,8 @@ def _generate_queries(conn: sqlite3.Connection, config_hash: str) -> list[tuple[
              AND is_definition = 1
              AND kind IN ('function', 'method',
                           'constructor', 'destructor')
-             AND summary IS NOT NULL
-           ORDER BY is_project DESC, name""",
+             AND (summary IS NOT NULL OR docstring IS NOT NULL)
+           ORDER BY is_project DESC, name, id""",
         (config_hash,),
     ).fetchall()
 
@@ -87,17 +96,20 @@ def _generate_queries(conn: sqlite3.Connection, config_hash: str) -> list[tuple[
         doc = doc[:120]
         summary = summary[:120]
 
-        for template, _weight in _QUERY_TEMPLATES:
-            try:
-                q = template.format(
-                    name=name, kind=kind, docstring=doc, summary=summary
-                )
-            except (KeyError, ValueError):
-                continue
-            q = q.strip().rstrip(".")
-            if len(q) < 8:
-                continue
-            queries.append((q, r["id"]))
+        templates = [t[0] for t in _QUERY_TEMPLATES]
+        weights = [t[1] for t in _QUERY_TEMPLATES]
+        template = _random.choices(templates, weights=weights, k=1)[0]
+        try:
+            q = template.format(
+                name=name, kind=kind, docstring=doc, summary=summary
+            )
+        except (KeyError, ValueError) as e:
+            log.warning("Template format failed for %r: %s", template, e)
+            continue
+        q = q.strip().rstrip(".")
+        if len(q) < 8:
+            continue
+        queries.append((q, r["id"]))
 
     log.info(
         "Generated %d synthetic queries from %d symbol descriptions",
@@ -110,8 +122,6 @@ def _fts5_search(
     conn: sqlite3.Connection, query: str, config_hash: str, limit: int = DISAGREEMENT_TOP_K
 ) -> list[int]:
     """FTS5 search — returns top *limit* symbol IDs."""
-    from .db import search_symbols
-
     rows = search_symbols(conn, query, config_hash, limit=limit)
     return [r["id"] for r in rows]
 
@@ -152,9 +162,9 @@ def mine_disagreements(
     *sample_limit* caps the number of queries to process (avoiding
     excessive time on large projects with thousands of symbols).
     """
-    import random as _random
+    import random as _random_import
 
-    _random.seed(seed)
+    _random = _random_import.Random(seed)
 
     t0 = time.monotonic()
     result = MiningResult()
@@ -164,93 +174,100 @@ def mine_disagreements(
     except sqlite3.OperationalError as e:
         log.warning("Cannot open database %s: %s", db_path, e)
         return result
-    conn.row_factory = sqlite3.Row
 
-    config_hash = conn.execute(
-        "SELECT config_hash FROM build_configs ORDER BY indexed_at DESC LIMIT 1"
-    ).fetchone()
-    if config_hash is None:
-        conn.close()
-        log.warning("No build config found in database — skipping mining")
+    with conn:
+        conn.row_factory = sqlite3.Row
+
+        config_hash = conn.execute(
+            "SELECT config_hash FROM build_configs ORDER BY indexed_at DESC LIMIT 1"
+        ).fetchone()
+        if config_hash is None:
+            log.warning("No build config found in database — skipping mining")
+            return result
+        config_hash = config_hash["config_hash"]
+
+        queries = _generate_queries(conn, config_hash)
+        result.queries_generated = len(queries)
+
+        if len(queries) > sample_limit:
+            queries = _random.sample(queries, sample_limit)
+            log.info("Sampled %d queries from %d total", len(queries), result.queries_generated)
+
+        if not queries:
+            return result
+
+        # Batch-embed all queries (much faster than one at a time)
+        query_texts = [q[0] for q in queries]
+        query_symbol_ids = [q[1] for q in queries]
+        try:
+            query_vecs = embedder.embed_queries(query_texts)
+        except Exception as e:
+            log.error("Failed to embed queries: %s", e)
+            return result
+
+        if len(query_vecs) != len(query_texts):
+            log.error(
+                "Embedder returned %d vectors for %d texts — mismatch",
+                len(query_vecs), len(query_texts),
+            )
+            return result
+
+        model_key = config.llm.embed_key()
+        skipped = 0
+
+        for i, (qid, qvec) in enumerate(zip(query_symbol_ids, query_vecs, strict=True)):
+            query_text = query_texts[i]
+
+            fts_ids = _fts5_search(conn, query_text, config_hash)
+            dense_ids = _dense_search(conn, qvec, config_hash, model_key)
+
+            if qid in fts_ids:
+                fts_ids.remove(qid)
+            if qid in dense_ids:
+                dense_ids.remove(qid)
+
+            fts_set = set(fts_ids[:DISAGREEMENT_TOP_K])
+            dense_set = set(dense_ids[:DISAGREEMENT_TOP_K])
+
+            # Skip queries where dense returned too few results
+            if len(dense_set) < 3 or len(fts_set) < 3:
+                skipped += 1
+                continue
+
+            # Disagreement: dense-wins symbols (in dense but not in FTS5)
+            dense_wins = dense_set - fts_set
+            fts_wins = fts_set - dense_set
+
+            if not dense_wins or not fts_wins:
+                continue
+
+            # Build triples: (query, positive_dense, negative_fts)
+            positive = _random.choice(list(dense_wins))
+            negative = _random.choice(list(fts_wins))
+
+            result.triples.append({
+                "query": query_text,
+                "positive_id": positive,
+                "negative_id": negative,
+            })
+            result.disagreements_found += 1
+
+        result.queries_skipped = skipped
+        result.elapsed_s = time.monotonic() - t0
+
+        log.info(
+            "Mined %d triples from %d queries (skipped %d) in %.1fs",
+            result.disagreements_found, len(queries), skipped, result.elapsed_s,
+        )
         return result
-    config_hash = config_hash["config_hash"]
-
-    queries = _generate_queries(conn, config_hash)
-    result.queries_generated = len(queries)
-
-    if len(queries) > sample_limit:
-        queries = _random.sample(queries, sample_limit)
-        log.info("Sampled %d queries from %d total", len(queries), result.queries_generated)
-
-    if not queries:
-        conn.close()
-        return result
-
-    # Batch-embed all queries (much faster than one at a time)
-    query_texts = [q[0] for q in queries]
-    query_symbol_ids = [q[1] for q in queries]
-    try:
-        query_vecs = embedder.embed_queries(query_texts)
-    except Exception as e:
-        log.error("Failed to embed queries: %s", e)
-        conn.close()
-        return result
-
-    model_key = config.llm.embed_key()
-    skipped = 0
-
-    for i, (qid, qvec) in enumerate(zip(query_symbol_ids, query_vecs, strict=True)):
-        query_text = query_texts[i]
-
-        fts_ids = _fts5_search(conn, query_text, config_hash)
-        dense_ids = _dense_search(conn, qvec, config_hash, model_key)
-
-        if qid in fts_ids:
-            fts_ids.remove(qid)
-        if qid in dense_ids:
-            dense_ids.remove(qid)
-
-        fts_set = set(fts_ids[:DISAGREEMENT_TOP_K])
-        dense_set = set(dense_ids[:DISAGREEMENT_TOP_K])
-
-        # Skip queries where dense returned too few results
-        if len(dense_set) < 3 or len(fts_set) < 3:
-            skipped += 1
-            continue
-
-        # Disagreement: dense-wins symbols (in dense but not in FTS5)
-        dense_wins = dense_set - fts_set
-        fts_wins = fts_set - dense_set
-
-        if not dense_wins or not fts_wins:
-            continue
-
-        # Build triples: (query, positive_dense, negative_fts)
-        positive = _random.choice(list(dense_wins))
-        negative = _random.choice(list(fts_wins))
-
-        result.triples.append({
-            "query": query_text,
-            "positive_id": positive,
-            "negative_id": negative,
-        })
-        result.disagreements_found += 1
-
-    result.queries_skipped = skipped
-    result.elapsed_s = time.monotonic() - t0
-    conn.close()
-
-    log.info(
-        "Mined %d triples from %d queries (skipped %d) in %.1fs",
-        result.disagreements_found, len(queries), skipped, result.elapsed_s,
-    )
-    return result
 
 
 def _load_triple_bodies(
     conn: sqlite3.Connection, config_hash: str, triple_ids: set[int]
 ) -> dict[int, str]:
     """Load description text for symbol IDs referenced in triples."""
+    if not triple_ids:
+        return {}
     rows = conn.execute(
         """SELECT id, name, kind, signature, docstring, summary
            FROM symbols
@@ -305,20 +322,23 @@ def train_step(
         )
         return None
 
-    conn = sqlite3.connect(str(db_path))
-    conn.row_factory = sqlite3.Row
-    config_hash = conn.execute(
-        "SELECT config_hash FROM build_configs ORDER BY indexed_at DESC LIMIT 1"
-    ).fetchone()["config_hash"]
+    with sqlite3.connect(str(db_path)) as conn:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute(
+            "SELECT config_hash FROM build_configs ORDER BY indexed_at DESC LIMIT 1"
+        ).fetchone()
+        if row is None:
+            log.error("No build config found in database")
+            return None
+        config_hash = row["config_hash"]
 
-    all_ids = set()
-    for t in triples:
-        all_ids.add(t["positive_id"])
-        all_ids.add(t["negative_id"])
-    bodies = _load_triple_bodies(conn, config_hash, all_ids)
-    conn.close()
+        all_ids = set()
+        for t in triples:
+            all_ids.add(t["positive_id"])
+            all_ids.add(t["negative_id"])
+        bodies = _load_triple_bodies(conn, config_hash, all_ids)
 
-    st_model: Any = getattr(embedder, "_model", None)
+    st_model: Any = getattr(embedder, "model", None)
     if st_model is None:
         log.error("Embedder has no loaded model — must be SentenceTransformerEmbedder")
         return None
@@ -348,7 +368,7 @@ def train_step(
         output_dir=output_path,
         num_train_epochs=epochs,
         per_device_train_batch_size=batch_size,
-        warmup_steps=min(warmup_steps, len(query_texts) // 2),
+        warmup_steps=max(1, min(warmup_steps, len(query_texts) // 2)),
         logging_steps=10,
         save_strategy="epoch",
         save_total_limit=2,
@@ -371,6 +391,7 @@ def train_step(
         "created_at": time.time(),
         "desc_version": config_hash,
     }
+    out_dir.mkdir(parents=True, exist_ok=True)
     (out_dir / "metadata.json").write_text(json.dumps(metadata, indent=2))
     log.info("Fine-tuned model saved to %s", out_dir)
 
@@ -397,12 +418,14 @@ def run_finetune(
         return None
 
     embedder = get_embedder(config.llm)
-    if embedder.name.lower().startswith(("ibm-granite", "baai", "lightonai")):
+    from ..llm.st_embedder import SentenceTransformerEmbedder
+
+    if isinstance(embedder, SentenceTransformerEmbedder):
         pass  # ST-based — ok
-    elif embedder.max_tokens <= 1024:
+    else:
         # Ollama-based models can't be fine-tuned locally
         log.warning(
-            "Ollama model '%s' cannot be fine-tuned with sentence-transformers. "
+            "Model '%s' cannot be fine-tuned with sentence-transformers. "
             "Use an ST-compatible base model (e.g., BAAI/bge-large-en-v1.5).",
             embedder.name,
         )

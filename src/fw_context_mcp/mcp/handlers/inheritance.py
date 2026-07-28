@@ -358,7 +358,7 @@ def get_template_instances(
         conn.close()
 
 # ── moved from server.py ──
-async def get_method_overrides(
+def get_method_overrides(
     method_name: Annotated[str, Field(description="Method name to get override information for. Use qualified name for disambiguation, e.g. 'UART_DRIVER::write'.")],
     project_root: Annotated[str | None, Field(description="Project root. Auto-detected if omitted.")] = None,
 ) -> dict:
