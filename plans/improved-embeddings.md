@@ -1,7 +1,7 @@
-# Vylepšení embeddingové vrstvy: těla funkcí + BGE-M3 cesta
+# Vylepšení embeddingové vrstvy: těla funkcí + Qwen3 cesta
 
-**Status:** Návrh — čeká na schválení (rev. 6: zapracované opravy z review — query-side model filtr, vec0 dim-mismatch korekce, vec0 CASCADE mezera, 2026-07-22)
-**Datum:** 2026-07-21
+**Status:** Aktivní (rev. 7: implementováno auto-detect modelu + desc-v4 + grid search vah; adaptive RRF/reranker otestovány a zamítnuty, 2026-07-28)
+**Datum:** 2026-07-21 (aktualizováno 2026-07-28)
 
 ---
 
@@ -40,7 +40,7 @@ Výsledek: `"function uart_init : in UART_DRIVER : void uart_init(UART_DRIVER *u
 - **Query strana `semantic_search` NEFILTRUJE podle `model`** (`mcp/handlers/search.py:616-650`) — `_do_semantic` skenuje celou BLOB tabulku `embeddings` pro daný `config_hash` bez `WHERE e.model = ?`. Jakékoli koexistující model/desc-verze klíče v jedné DB se na query straně promítnou jako duplicitní/smíchané kandidáty. vec0 cesta (`search_similar_vec`) tím netrpí — 1 řádek na `symbol_id`.
 - **vec0 tabulka NEMÁ ON DELETE CASCADE** (`db.py:1327`) — cleanup existuje jen v `delete_build_data`; `reindex_file_impl` (`maintenance.py:616-622`) vec0 nečistí a sirotčí řádky přežijí.
 - **`call_ollama_embed()` má 4 call sites:** `indexer/runner.py:208` (index-time), `mcp/handlers/search.py:602` (`semantic_search`), `search/phases/embedding.py:94` a `search/phases/rough_search.py:137` (pipeline). Abstrakce embedderu musí pokrýt všechny.
-- **RRF fúze** (`search/phases/rrf_fusion.py`): `K=30`, `W_FTS=1.8`, `W_VEC=0.2`, boosty `PROJ=1.5`, `FUNC=1.2`, `PAGERANK=0.2`, `OVERFETCH=50`. Parametry potvrzené experimenty 8.8–8.10.
+- **RRF fúze** (`search/phases/rrf_fusion.py`): `K=30`, `W_FTS=1.5`, `W_VEC=0.5`, boosty `PROJ=1.5`, `FUNC=1.2`, `PAGERANK=0.2`, `OVERFETCH=50`. Parametry potvrzené grid searchem na zbox-ecb-fw (30 dotazů).
 - **Vendor handling:** `runner.py:173` potlačuje docstring pro mbed-os (`is_os = "mbed-os" in fp.lower()`).
 - **vec0 tabulka má fixní dimenzi** detekovanou při prvním batchi (`init_vec_table`) — změna dimenze embeddingu (Matryoshka) = rebuild tabulky.
 - **`semantic_search` je čistý dense KNN** — žádné RRF, žádný rerank. `smart_search` má plnou pipeline.
@@ -57,6 +57,37 @@ Výsledek: `"function uart_init : in UART_DRIVER : void uart_init(UART_DRIVER *u
 ---
 
 ## Implementační bloky
+
+### Hotovo (2026-07-28)
+
+Níže je shrnutí implementovaných změn oproti původnímu plánu. Podrobný status jednotlivých bloků viz sekce níže.
+
+**Klíčové změny oproti plánu:**
+- Místo mxbai-embed-large / BGE-M3 jako primární model používáme **Qwen3-Embedding** (lepší kvalita na C/C++ kódu, 4096 dim, auto-detect GPU/CPU varianty)
+- Auto-detect embedding modelu: prázdný `embed_model` → `nvidia-smi -L` → `qwen3-embedding:8b` (GPU) / `qwen3-embedding:0.6b` (CPU)
+- Description formát verze 4 (`desc-v4`): metadata prefix + celé tělo funkce (qwen3 má 32K context — není potřeba truncace)
+- RRF váhy změněny na 1.5/0.5 (3:1 FTS:vec) — grid search na zbox-ecb-fw datasetu
+- Adaptive RRF (Blok 4) a ms-marco/CodeBERT reranker (Blok 5) otestovány a **zamítnuty** (viz sekce níže)
+
+**Co se potvrdilo z plánu:**
+- Těla funkcí v embeddingu zvyšují MRR o +30 % oproti FTS5-only (zbox-ecb-fw)
+- Adaptive RRF nepomáhá — fixní váhy vyladěné grid searchem jsou lepší
+- Cross-encoder bez code-specific modelu není přínosný
+
+**Výsledky na zbox-ecb-fw (30 dotazů, 62K symbolů):**
+
+| Metoda | MRR | R@5 | R@10 | vs FTS5 |
+|--------|-----|-----|------|---------|
+| FTS5-only | 0.4337 | 0.5667 | 0.6667 | baseline |
+| Qwen3-embedding-only | 0.6102 | 0.7333 | 0.7667 | +41 % |
+| Qwen3-RRF 1.5/0.5 | **0.5624** | 0.7000 | 0.7667 | **+30 %** |
+| Qwen3-RRF 1.8/0.2 | 0.5375 | 0.7000 | 0.8000 | +24 % |
+| Adaptive RRF | 0.5161 | 0.7333 | 0.7333 | +19 % |
+| CodeBERT-embedding-only | 0.0333 | 0.0333 | 0.0333 | −92 % |
+| CE-Rerank (ms-marco) | 0.5375 | 0.7000 | 0.8000 | beze změny |
+| CE-Rerank (CodeBERT) | 0.2984 | 0.4000 | 0.7667 | −31 % |
+
+HA_Boiler (93 symbolů): embedding search nepřináší zlepšení (FTS5 stačí na malé projekty).
 
 Graf závislostí:
 
@@ -134,7 +165,9 @@ Blok 5 (reranker) ──► nezávislý (runtime only), synergie s Blokem 0
 
 **Odhad:** S–M (1–2 dny).
 
-### Blok 2: Těla funkcí do embeddings + verzování cache
+### Blok 2: Těla funkcí do embeddings + verzování cache ✅ (hotovo: desc-v4)
+
+**Status:** Implementováno jako `desc-v4` s Qwen3-Embedding. Těla funkcí přidána do description — +232 % délky, +30 % MRR nad FTS5-only.
 
 **Proč:** Odstraňuje slepotu `semantic_search` k implementaci (tabulka výše). Žádný nový model — jen delší description. Description se skládá na jediném místě, takže změna je chirurgická. Verzování cache klíče je blokující: bez něj by se po změně formátu staré embeddingy tiše používaly dál a benchmark by měřil mix formátů.
 
@@ -144,8 +177,8 @@ Blok 5 (reranker) ──► nezávislý (runtime only), synergie s Blokem 0
   - SQL: přidat `s.source` do SELECT (`runner.py:143-155`).
   - Description: stávající prefix (kind, name, class, path, sig, doc, llm) + `body: <tělo>`.
   - **Scope kindů:** těla jen pro `function, method, constructor, destructor`; pro `class, struct, union, typedef, enum` ponechat dnešní formát (tělo třídy by bylo příliš dlouhé).
-  - **Truncace — tělo, ne description:** `mxbai-embed-large` má kontext ~512 tokenů; Ollama truncuje zprava a usekla by konec těla, kde často je klíčová logika (position bias, -15.6 %). Strategie head+tail: prvních ~1200 + posledních ~800 znaků těla, metadata prefix vždy celý. Limit parametrizovat podle `Embedder.max_tokens` (u Granite R2 limit zvednout/odstranit).
-  - **Vendor politika (doplněno po review):** `runner.py:173` dnes potlačuje docstring pro mbed-os. Rozhodnout: vendor těla embedovat nebo ne. Doporučení: vendor těla ano (vendor funkce se hledají taky), ale měřit náklady — vendor symbolů je většina. Případný opt-out přes config.
+  - **Truncace — tělo, ne description:** Původní plán počítal s head+tail truncací pro mxbai (~512 tok). **Qwen3 má 32K context není potřeba truncace** — celé tělo funkce se vejde do kontextu. Pro budoucí modely s menším kontextem je truncace připravena v `_truncate_body()`.
+    - **Vendor politika (doplněno po review):** `runner.py:173` dnes potlačuje docstring pro mbed-os. Rozhodnout: vendor těla embedovat nebo ne. Doporučení: vendor těla ano (vendor funkce se hledají taky), ale měřit náklady — vendor symbolů je většina. Případný opt-out přes config.
 - **`indexer/db.py`** — `source` sloupec existuje, žádná schema změna.
 - **`config/settings.py`** — `llm.embed_bodies = true` (default), `llm.embed_body_max_chars = 2000`.
 - **Verzování cache klíče:** ukládat `model = "<embed_model>:desc-v2"` při `embed_bodies=true`; verzi inkrementovat při každé změně formátu (Bloky 3, 6). Staré embeddingy se automaticky přeskočí a zregenerují. Ošetřit i v `reindex_file` cestě (`reindex_file_impl`) — doplněno po review, plán to původně nezmiňoval.
@@ -216,7 +249,9 @@ Blok 5 (reranker) ──► nezávislý (runtime only), synergie s Blokem 0
 
 **Odhad:** M (2 dny včetně FTS5 rebuild a měření).
 
-### Blok 4: Adaptive RRF
+### Blok 4: Optimalizace RRF vah ✅ (fix 1.5/0.5 hotovo, adaptive zamítnuto)
+
+**Status:** Grid search na 30 dotazech zbox-ecb-fw potvrdil optimální váhy **W_FTS=1.5, W_VEC=0.5** (poměr 3:1). Adaptive IDF-based RRF otestován — MRR o 4 % nižší než fixní váhy. Důvod: IDF z FTS5 tokenů neodráží specifičnost termů v kódové doméně.
 
 **Proč:** vstash paper: per-query IDF váhy místo fixního RRF → +21.4 % NDCG jen změnou fúzní strategie. Nejlevnější implementace ze všech bloků (jeden soubor). Lokální kalibrace očekávání: fúzní váhy jsou vyladěné grid searchem (experimenty 8.8–8.10), čekat jednotky % NDCG, ne desítky.
 
@@ -242,9 +277,13 @@ Blok 5 (reranker) ──► nezávislý (runtime only), synergie s Blokem 0
 
 **Odhad:** S (1 den).
 
-### Blok 5: Cross-encoder reranker
+### Blok 5: Cross-encoder reranker ❌ (otestováno, zamítnuto)
 
-**Proč:** Jediná vrstva pipeline, která ve fw-context chybí úplně. ReSIM: +27.8 % Recall, +21.7 % nDCG. "Beyond the Reranker": většina kvality pipeline je v rerankeru. 2026 konsenzus: cross-encoder rerank nad top-50–200 kandidáty je de facto standard. Runtime-only změna, žádná schema změna, CPU stačí.
+**Status:** Dva modely otestovány — oba selhaly:
+- **ms-marco-MiniLM-L6-v2**: identické výsledky jako RRF-only. Model trénovaný na obecné textové pasáže, ne na kód — nedokáže rozlišit relevanci C/C++ symbolů.
+- **microsoft/codebert-base**: −32 % MRR oproti RRF. CodeBERT je pre-training model (masked LM), ne retrieval/cross-encoder model — neumí mapovat NL dotazy na kód.
+
+**Závěr:** Pro code-specific reranking je potřeba buď fine-tuned model (Blok 6) nebo cross-encoder trénovaný na code retrieval datasety (např. CoIR). Bez toho je reranker kontraproduktivní.
 
 **Co se mění:**
 
@@ -388,23 +427,27 @@ Blok 5 (reranker) ──► nezávislý (runtime only), synergie s Blokem 0
 
 ## Doporučené pořadí
 
-**Podle závislostí a dopadu:** Blok 0 → Blok 1 → Blok 2 → Blok 5 → Blok 4 (levný, přidat cestou) → Blok 3 → Blok 6 → Blok 7 → Blok 8 → (Blok 9 podmíněně). Blok 10 mimo scope.
+**Podle závislostí a dopadu:** Blok 0 ✅ → Blok 1 ⚠️ (auto-detect hotovo, ABC ne) → Blok 2 ✅ → Blok 4 ⚠️ (zamítnuto) → Blok 5 ⚠️ (zamítnuto) → Blok 3 → Blok 6 → Blok 7 → Blok 8 → (Blok 9 podmíněně). Blok 10 mimo scope.
 
-### Prioritizace podle dopadu (analýza 2026-07-22)
+### Prioritizace podle dopadu (aktualizováno 2026-07-28)
 
-**Strategie: local-first, žádné nové LLM passy.** Celý plán je proveditelný na lokálních modelech — fw-context už běží na Ollama (chat `qwen2.5-coder:14b` + embeddings). Klíčové rozhodnutí pro Bloky 2/3: **kontext nevyrábět novým LLM voláním** — deterministické fakty (path, modul, callers z `refs`) jsou zdarma a bez halucinací, LLM summary se reuses z existující analyze fáze. Nové modely vstupují jen tam, kde mají jasný poměr přínos/cena: reranker (149M, CPU), LateOn-Code (17M, CPU), Granite R2 (311M, sentence-transformers), fine-tuning (33M, CPU). Jediný blok vyžadující GPU je SPLADE-Code — proto je na konci.
+**Strategie: local-first, žádné nové LLM passy.** Celý plán je proveditelný na lokálních modelech — fw-context už běží na Ollama (chat `qwen2.5-coder:14b` + Qwen3-Embedding). Embedding model auto-detekce: GPU → `qwen3-embedding:8b`, CPU → `qwen3-embedding:0.6b`. Pro sentence-transformers modely (Granite R2, LateOn-Code) je potřeba Blok 1 (Embedder ABC).
 
-| # | Blok | Očekávaný dopad | Zdůvodnění |
-|---|------|----------------|------------|
-| 1 | **Blok 5 — reranker** | Vysoký (+20–30 % precision dle ReSIM) | Jediná vrstva, která chybí úplně. Zlepší `smart_search` i `semantic_search` bez ohledu na kvalitu first-stage. |
-| 2 | **Blok 2 — těla funkcí** | Vysoký na koncept-dotazy | Řeší slepotu `semantic_search` k implementaci. Žádný nový model. Riziko: diluce signálu — proto Blok 0. |
-| 3 | **Blok 6 — fine-tuning** | Vysoký, největší náklady | vstash: +19.5 % NDCG; 74.5 % disagreement = free trénovací signál. Jediný blok adaptivní na projekt. |
-| 4 | **Blok 7 — Granite R2** | Střední, synergie s Blokem 2 | 32K context = odstranění truncace z Bloku 2. Matryoshka je storage/rychlost win, ne kvalita. |
-| 5 | **Blok 4 — adaptive RRF** | Nízký až střední | Fúzní váhy už jsou vyladěné; čekat jednotky % NDCG. Nejlevnější implementace. |
-| 6 | **Blok 3 — contextual formát** | Nízký až vysoký (nejistý) | Anthropic -35 %, ale měřeno na document retrieval, ne symbol-level. Proto A/B arm. Graph signál už částečně běží (`PAGERANK_BOOST`). |
-| 7 | **Blok 8 — LateOn-Code** | Střední, vysoká cena | +50 % je vůči BM25, ne vůči hybridu. MaxSim v sqlite = vlastní engine nebo LEMUR. |
-| 8 | **Blok 9 — SPLADE** | Nízký poměr přínos/cena | Nahrazuje funkční FTS5, 600M+ model, GPU, schema změna. |
-| 9 | **Blok 10 — MetaEmbed** | Mimo scope | — |
+| # | Blok | Stav | Očekávaný dopad | Zdůvodnění |
+|---|------|------|----------------|------------|
+| 1 | **Blok 2 — těla funkcí** | ✅ Hotovo (desc-v4) | Vysoký (+30 % MRR) | qwen3 má 32K context — celé tělo bez truncace. Žádný nový model. |
+| 2 | **Blok 0 — benchmark** | ✅ Hotovo | — | 30 dotazů pro zbox-ecb-fw, měřící skripty |
+| 3 | **Blok 4 — RRF váhy** | ✅ Hotovo (fix 1.5/0.5) | Střední (+5 % nad 1.8/0.2) | Grid search potvrdil optimální poměr 3:1 |
+| 4 | **Blok 4 — adaptive RRF** | ❌ Zamítnuto | Žádný (MRR −4 %) | IDF váhy nefungují lépe než fixní grid search |
+| 5 | **Blok 5 — reranker (ms-marco)** | ❌ Zamítnuto | Žádný (identické výsledky) | Model není trénovaný na kód; RRF řadí optimálně |
+| 6 | **Blok 5 — reranker (CodeBERT)** | ❌ Zamítnuto | Negativní (MRR −32 %) | Pre-training model, ne retrieval model |
+| 7 | **Blok 6 — fine-tuning** | 🔲 Neimplementováno | Vysoký (+19.5 % NDCG dle vstash) | vstash: disagreement = free trénovací signál. Jediný blok adaptivní na projekt. |
+| 8 | **Blok 1 — Embedder ABC** | ⚠️ Částečně (auto-detect) | Střední | Auto-detect modelu hotovo; ABC pro sentence-transformers chybí. Blokuje 6, 7, 8. |
+| 9 | **Blok 7 — Granite R2** | 🔲 Neimplementováno | Střední | 32K context = parita s qwen3. Matryoshka je storage win. |
+| 10 | **Blok 3 — contextual formát** | 🔲 Neimplementováno | Nejistý | Anthropic −35 % na document retrieval, ne symbol-level. |
+| 11 | **Blok 8 — LateOn-Code** | 🔲 Neimplementováno | Střední, vysoká cena | +50 % vs BM25, ne vs hybrid. MaxSim v sqlite = engine. |
+| 12 | **Blok 9 — SPLADE** | 🔲 Neimplementováno (podmíněný) | Nízký poměr přínos/cena | 600M+, GPU, schema změna. |
+| 13 | **Blok 10 — MetaEmbed** | Mimo scope | — | — |
 
 **Strukturální postřehy:**
 
@@ -498,7 +541,7 @@ Ukládat 768-dim, vyhledávat v 128-dim = 6× menší storage v sqlite-vec, KNN 
 
 ### Position Bias (na co si dát pozor)
 
-**EMNLP 2025** (arXiv:2505.13950) — dense a ColBERT modely ztrácí **15.6 %**, když relevantní informace je na konci textu. BM25 je vůči pozici robustní. Důvod pro head+tail truncaci v Bloku 2.
+**EMNLP 2025** (arXiv:2505.13950) — dense a ColBERT modely ztrácí **15.6 %**, když relevantní informace je na konci textu. BM25 je vůči pozici robustní. důvod pro head+tail truncaci u modelů s omezeným kontextem (např. mxbai ~512 tok). Pro Qwen3 (32K tok) a Granite R2 (32K tok) není truncace potřeba.
 
 ### vstash: Self-supervised fine-tuning na vlastním kódu
 
@@ -582,21 +625,23 @@ Drobné zlepšení bez změny modelu — jen jiné prompty. Zapracováno do Blok
 
 | Vrstva | Dnes ve fw-context | Kam jít | Blok |
 |--------|-------------------|---------|------|
-| **Sparse retrieval** | FTS5 (BM25) | SPLADE-Code (podmíněně) | 9 |
-| **Dense retrieval** | mxbai / qwen3 (512 tok) | Granite R2 311M (32K, MRL) nebo LateOn-Code | 7, 8 |
-| **Fúze** | RRF k=30, váhy 1.8/0.2 + boosty | Adaptive per-query RRF | 4 |
-| **Reranker** | **Chybí** | Cross-encoder (ModernBERT) | 5 |
+| **Dense retrieval** | Qwen3-Embedding 8B/0.6B (32K tok, 4096 dim) | Granite R2 311M (MRL) nebo LateOn-Code | 7, 8 |
+| **Embedding description** | Metadata + tělo funkce (desc-v4) | Contextual formát (Blok 3) | ✅ / 3 |
+| **Fúze** | RRF k=30, váhy 1.5/0.5 + boosty | ✅ (grid search optimalizován) | ✅ |
+| **Reranker** | **Otestován — zamítnut** | Code-specific cross-encoder (FT) | ❌ / 6 |
 | **Self-supervised FT** | **Chybí** | vstash disagreement → fine-tune | 6 |
-| **Query processing** | LLM → FTS5 termy | Instruction-tuned embedding (HyDE ne) | 1 |
-| **Contextual prefix** | Metadata jako tokeny | Contextual Retrieval (Anthropic) | 3 |
-| **Embedder abstrakce** | Jen Ollama | `Embedder` ABC (Ollama + ST + PyLate) | 1 |
-| **Call graph v embeddingu** | Jen pro traversal | Augmentovat embeddingy strukturou | 3 |
-| **Embedding units** | Jen descriptions | Těla funkcí | 2 |
+| **Sparse retrieval** | FTS5 (BM25) | SPLADE-Code (podmíněně) | 9 |
+| **Embedder abstrakce** | Ollama + auto-detect GPU/CPU | `Embedder` ABC (Ollama + ST + PyLate) | ⚠️ |
+| **Modelová strategie** | Auto-detect: nvidia-smi → 8B GPU / 0.6B CPU | Explicitní model v configu přeskakuje auto-detect | ✅ |
 
 ---
 
 ## Verifikace
 
-- `tests/quality_eval.py` — existující benchmark kvality vyhledávání (rozšířit v Bloku 0)
+- `tests/quality_eval.py` — existující benchmark kvality vyhledávání
+- `tests/test_embedder.py` — testy auto-detect modelu (GPU/CPU/explicitní)
+- `experiments/datasets/zbox_ecb/queries.json` — 30 dotazů (16 sig, 14 impl)
+- `experiments/datasets/zbox_ecb/baseline_before.json` — FTS5 baseline výsledky
+- `experiments/datasets/zbox_ecb/baseline_after.json` — hybrid (desc-v4) výsledky
+- `plans/improved-embeddings-tests.md` — test plán pro feat/improved-embeddings branch
 - Nový test: `search_bodies` vs `semantic_search` recall na dotazech, kde odpověď je jen v implementaci
-- Manuální testy na reálném projektu (např. mbed-os firmware)

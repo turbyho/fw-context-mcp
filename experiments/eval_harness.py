@@ -17,14 +17,12 @@ from __future__ import annotations
 import argparse
 import json
 import logging
-import math
-import sqlite3
-import struct
 import sys
 from pathlib import Path
 
-from fw_context_mcp.config import derive_project_id, load as load_config
-from fw_context_mcp.indexer.db import open_db, get_active_config
+from fw_context_mcp.config import derive_project_id
+from fw_context_mcp.config import load as load_config
+from fw_context_mcp.indexer.db import _cosine_sim, get_active_config, open_db
 from fw_context_mcp.llm.embedder import get_embedder
 from fw_context_mcp.llm.ollama import OllamaError
 
@@ -32,14 +30,13 @@ log = logging.getLogger(__name__)
 
 
 def _add_sys_path():
-    import os
     project_root = Path(__file__).resolve().parent.parent
     if str(project_root) not in sys.path:
         sys.path.insert(0, str(project_root))
 
 
 _add_sys_path()
-from tests.quality_eval import evaluate, aggregate, compare, EvalMetrics, EvalReport  # noqa: E402
+from tests.quality_eval import EvalMetrics, EvalReport, aggregate, compare, evaluate  # noqa: E402
 
 
 class EvalHarness:
@@ -66,7 +63,8 @@ class EvalHarness:
     # ── FTS5-only retrieval ──────────────────────────────────────────
 
     def run_fts5(self, query: str, limit: int = 20) -> list[dict]:
-        from fw_context_mcp.indexer.db import open_db as _open_db, _expand_query, search_symbols
+        from fw_context_mcp.indexer.db import _expand_query, search_symbols
+        from fw_context_mcp.indexer.db import open_db as _open_db
 
         conn = _open_db(self.db_path)
         try:
@@ -95,7 +93,8 @@ class EvalHarness:
                    FROM embeddings e
                    JOIN symbols s ON s.id = e.symbol_id
                    WHERE s.config_hash = ? AND s.is_definition = 1
-                     AND e.model = ?""",
+                     AND e.model = ?
+                     AND e.chunk_index = 0""",
                 (self.config_hash, model_key),
             ).fetchone()[0]
 
@@ -103,7 +102,6 @@ class EvalHarness:
                 return []
 
             BATCH = 1000
-            norm_a = math.sqrt(sum(x * x for x in query_vec))
             keep = limit * 5
             top_candidates: list[tuple[float, int]] = []
 
@@ -114,19 +112,16 @@ class EvalHarness:
                        JOIN symbols s ON s.id = e.symbol_id
                        WHERE s.config_hash = ? AND s.is_definition = 1
                          AND e.model = ?
+                         AND e.chunk_index = 0
                        ORDER BY e.symbol_id
                        LIMIT ? OFFSET ?""",
                     (self.config_hash, model_key, BATCH, offset),
                 ).fetchall()
 
                 for r in rows:
-                    try:
-                        vec = struct.unpack(f'{len(query_vec)}f', r["embedding"])
-                    except Exception:
+                    raw_sim = _cosine_sim(query_vec, r["embedding"])
+                    if raw_sim is None:
                         continue
-                    dot = sum(x * y for x, y in zip(query_vec, vec, strict=True))
-                    norm_b = math.sqrt(sum(x * x for x in vec))
-                    raw_sim = dot / (norm_a * norm_b) if norm_a and norm_b else 0.0
                     top_candidates.append((raw_sim, r["symbol_id"]))
 
                 top_candidates.sort(key=lambda x: -x[0])
@@ -155,7 +150,6 @@ class EvalHarness:
     # ── Hybrid retrieval (smart_search pipeline) ─────────────────────
 
     async def run_hybrid(self, query: str, limit: int = 20) -> list[dict]:
-        import asyncio
         from fw_context_mcp.search.context import PipelineContext
         from fw_context_mcp.search.pipeline import PipelineRunner, _build_smart_search
 
@@ -184,6 +178,7 @@ class EvalHarness:
 
         import asyncio
         loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
 
         for qd in queries:
             query = qd["query"]

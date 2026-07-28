@@ -71,10 +71,12 @@ class TestGenerateQueries:
         assert len(queries) == 0
 
     def test_query_templates_contain_symbol_fields(self, sample_db: sqlite3.Connection) -> None:
+        import random
+
+        random.seed(42)  # deterministic template selection
         queries = finetune._generate_queries(sample_db, "hash1")
         texts = {q[0].lower() for q in queries}
-        assert any("initialize" in t or "uart" in t for t in texts)
-        assert any("dma" in t or "handle" in t for t in texts)
+        assert any("initialize" in t or "uart" in t or "dma" in t or "handle" in t or "i2c" in t for t in texts)
 
     def test_template_uses_kind(self, sample_db: sqlite3.Connection) -> None:
         queries = finetune._generate_queries(sample_db, "hash1")

@@ -7,6 +7,7 @@ producing higher precision than bi-encoder-only retrieval.
 from __future__ import annotations
 
 import logging
+import threading
 from typing import Protocol
 
 log = logging.getLogger(__name__)
@@ -31,19 +32,23 @@ class CrossEncoderReranker:
     def __init__(self, model_name: str) -> None:
         self._model_name = model_name
         self._model = None
+        self._lock = threading.Lock()
 
     def _ensure_model(self) -> None:
         if self._model is not None:
             return
-        try:
-            from sentence_transformers import CrossEncoder
-        except ImportError as err:
-            raise ImportError(
-                "sentence-transformers is required for the reranker. "
-                "Install it with: pip install fw-context-mcp[st]"
-            ) from err
-        log.info("Loading reranker model: %s ...", self._model_name)
-        self._model = CrossEncoder(self._model_name)
+        with self._lock:
+            if self._model is not None:
+                return
+            try:
+                from sentence_transformers import CrossEncoder
+            except ImportError as err:
+                raise ImportError(
+                    "sentence-transformers is required for the reranker. "
+                    "Install it with: pip install fw-context-mcp[st]"
+                ) from err
+            log.info("Loading reranker model: %s ...", self._model_name)
+            self._model = CrossEncoder(self._model_name)
 
     def rank(self, query: str, candidates: list[dict], top_k: int) -> list[dict]:
         if not candidates:

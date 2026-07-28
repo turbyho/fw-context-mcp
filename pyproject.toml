@@ -83,7 +83,10 @@ warn_unused_ignores = true
 warn_redundant_casts = true
 
 [tool.pytest.ini_options]
-addopts = ["--ignore=tests/test_system_indexing.py"]
+addopts = [
+    "--ignore=tests/test_system_indexing.py",
+    "--ignore=tests/builds/mbed_os/mbed-os/tools",
+]
 testpaths = ["tests"]
 markers = [
     "slow: tests that take longer than 2 seconds (full index/reindex via libclang)",

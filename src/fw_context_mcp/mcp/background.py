@@ -13,6 +13,37 @@ from .shared.context import _db_path
 
 log = logging.getLogger(__name__)
 
+
+def _pid_exists(pid: int) -> bool:
+    """Check whether a process with the given PID is running.
+
+    Uses ``os.kill(pid, 0)`` on POSIX (signal 0 = existence check only).
+    """
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
+def _spawn_daemon(root: Path) -> None:
+    """Spawn the watcher daemon, logging output to a file.
+
+    Must be called without holding ``watcher.lock`` so the daemon can
+    acquire it on startup.
+    """
+    db_path = _db_path(root)
+    log_file = db_path.parent / "daemon.log"
+    try:
+        subprocess.Popen(
+            [sys.executable, "-u", "-m", "fw_context_mcp.mcp.daemon", str(root)],
+            start_new_session=True,
+            stdout=open(log_file, "a", encoding="utf-8"),
+            stderr=subprocess.STDOUT,
+        )
+    except Exception:
+        log.exception("Failed to spawn watcher daemon for %s", root)
+
 # ── _is_bg_reindex_running (was at server.py:367) ──
 def _is_bg_reindex_running(root: Path) -> bool:
     """Check whether any index process is running for *root*.
@@ -57,11 +88,12 @@ def _is_bg_reindex_running(root: Path) -> bool:
     if reindex_pid_file.exists():
         try:
             pid = int(reindex_pid_file.read_text(encoding="utf-8").strip())
-            os.kill(pid, 0)  # Signal 0 = existence check only
-            return True
+            if _pid_exists(pid):
+                return True
         except (OSError, ValueError):
-            # PID not alive or garbage — clean up stale file
-            reindex_pid_file.unlink(missing_ok=True)
+            pass
+        # PID not alive or garbage — clean up stale file
+        reindex_pid_file.unlink(missing_ok=True)
 
     # 2. General write lock — held during reindex_file, reset_index, etc.
     if _lock_held(db_path.parent / "write.lock"):
@@ -114,15 +146,7 @@ def _ensure_daemon_running(root: Path) -> None:
     os.close(lock_fd)
 
     log.info("Spawning watcher daemon for %s", root)
-    try:
-        subprocess.Popen(
-            [sys.executable, "-u", "-m", "fw_context_mcp.mcp.daemon", str(root)],
-            start_new_session=True,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-    except Exception:
-        log.exception("Failed to spawn watcher daemon for %s", root)
+    _spawn_daemon(root)
 
 # ── _request_bg_reindex_pause (was at server.py:414) ──
 def _request_bg_reindex_pause(root: Path) -> None:
@@ -182,9 +206,7 @@ def _check_bg_pause(root: Path) -> bool:
             pass
         return False
     # Check if the requesting process is still alive
-    try:
-        os.kill(requester_pid, 0)
-    except OSError:
+    if not _pid_exists(requester_pid):
         # Process dead — clean up stale marker
         try:
             pause_file.unlink(missing_ok=True)

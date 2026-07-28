@@ -49,8 +49,6 @@ class PipelineContext:
     embedding_results: list[dict] = field(default_factory=list)
 
     # ── Phase 6 output ────────────────────────────────────────────────────
-    # ranked_candidates: top-K from RRF before truncation to limit
-    ranked_candidates: list[dict] = field(default_factory=list)
     final_results: list[dict] = field(default_factory=list)
 
     # ── Phase 7 output ────────────────────────────────────────────────────

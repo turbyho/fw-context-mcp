@@ -49,12 +49,17 @@ def get_embedder(cfg: LLMConfig) -> Embedder:
     """Return the appropriate :class:`Embedder` for *cfg*.
 
     Auto-detects the backend from ``cfg.embed_model``:
+    - Empty string (default) → auto-detect best model for this system
+      (GPU available → qwen3-embedding:8b, CPU-only → qwen3-embedding:0.6b)
     - ``ft://latest`` or ``ft://<path>`` — resolve a fine-tuned local model
       (loads via sentence-transformers from ~/.fw-context/models/)
     - ``ibm-granite/*``, ``lightonai/*``, ``BAAI/*``, ``cross-encoder/*`` →
       sentence-transformers (requires optional ``[st]`` extra)
     - Everything else → OllamaEmbedder
     """
+    from .auto_model import resolve_embed_model
+
+    resolve_embed_model(cfg)  # empty → auto-detect, explicit → no-op
     model = cfg.embed_model.lower()
     if model.startswith("ft://"):
         return _get_ft_embedder(cfg)
@@ -97,7 +102,11 @@ def _get_ft_embedder(cfg: LLMConfig) -> Embedder:
         for proj_dir in models_root.iterdir():
             if not proj_dir.is_dir():
                 continue
-            for ft_dir in proj_dir.iterdir():
+            try:
+                ft_items = list(proj_dir.iterdir())
+            except OSError:
+                continue
+            for ft_dir in ft_items:
                 metadata = ft_dir / "metadata.json"
                 if metadata.exists():
                     try:

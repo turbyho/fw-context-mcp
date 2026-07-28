@@ -47,15 +47,93 @@ def _embed_model_key(embed_model: str, embed_bodies: bool) -> str:
     return f"{embed_model}:{version}"
 
 
-def _truncate_body(source: str, *, head: int = 1200, tail: int = 800) -> str:
-    """Head+tail truncation for function bodies — preserves both opening
-    logic and closing statements (position bias robustness).
+def _chunk_body(source: str, max_chars: int) -> list[str]:
+    """Split a C/C++ function body into semantic chunks at statement boundaries.
 
-    Short bodies (< head + tail) are returned unchanged.
+    Split points (highest to lowest priority):
+    1. Closing brace ``}`` at end of line (end of block)
+    2. Semicolon ``;`` at end of line (end of statement)
+    3. Blank line (paragraph boundary)
+    4. Line boundary (fallback — any ``\\n``)
+
+    Never splits inside a brace block — the closing brace is always the
+    last line of a chunk.
+
+    **Limitation:** does not parse string literals or comments — a semicolon
+    inside ``printf("hello; world")`` or ``// comment;`` may trigger an
+    early split.  This is acceptable because chunks are used only for
+    embedding generation (not code transformation), so suboptimal chunk
+    boundaries degrade embedding quality locally without causing functional
+    errors.
+
+    Returns list of body chunks (1 chunk when *source* <= *max_chars*).
     """
-    if len(source) <= head + tail:
-        return source
-    return source[:head] + "\n// ...\n" + source[-tail:]
+    if len(source) <= max_chars:
+        return [source]
+
+    lines = source.split("\n")
+    chunks: list[str] = []
+
+    # Find indices of preferred split points
+    split_prio: dict[int, int] = {}  # line_idx → priority (1=best, 4=worst)
+    for idx, raw in enumerate(lines):
+        stripped = raw.rstrip()
+        if stripped.endswith("}"):
+            split_prio[idx] = 1  # closing brace
+        elif stripped.endswith(";"):
+            split_prio[idx] = 2  # semicolon
+        elif stripped == "":
+            split_prio[idx] = 3  # blank line
+        else:
+            split_prio[idx] = 4  # arbitrary line
+
+    chunk_start = 0
+    while chunk_start < len(lines):
+        chunk_end = chunk_start
+        current_len = 0
+
+        # Find the furthest line that fits within max_chars
+        # (trading off: we'd rather go a bit past max_chars than split mid-statement)
+        last_split_idx = chunk_start
+        last_split_prio = 4  # lower = better
+
+        for i in range(chunk_start, len(lines)):
+            line_len = len(lines[i]) + 1  # +1 for newline
+            if i > chunk_start and current_len + line_len > max_chars:
+                # Would overflow — split at the last good split point
+                if last_split_idx > chunk_start:
+                    chunk_end = last_split_idx
+                else:
+                    chunk_end = i  # no split point found, hard cut
+                break
+            current_len += line_len
+            if split_prio[i] <= last_split_prio and i + 1 < len(lines):
+                last_split_idx = i + 1  # split AFTER this line (good boundary)
+                last_split_prio = split_prio[i]
+            chunk_end = i + 1  # tentatively include this line
+        else:
+            chunk_end = len(lines)  # all remaining lines fit
+
+        chunk = "\n".join(lines[chunk_start:chunk_end])
+        # Safety: head+tail truncation for chunks that still exceed max_chars
+        # (happens when a single long line has no split boundary)
+        if len(chunk) > max_chars:
+            chunk = _truncate_body(chunk, max_chars)
+        chunks.append(chunk)
+        chunk_start = chunk_end
+
+    return chunks if chunks else [source]
+
+
+def _truncate_body(body: str, max_chars: int, *, head_frac: float = 0.6) -> str:
+    """Truncate a body string with head+tail split when it exceeds *max_chars*."""
+    if len(body) <= max_chars:
+        return body
+    head = int(max_chars * head_frac)
+    tail = max_chars - head - 8  # 8 for the separator
+    if tail < 0:
+        return body[:max_chars]
+    return body[:head] + "\n// ...\n" + body[-tail:]
 
 
 def _fmt_dur(seconds: float) -> str:
@@ -121,13 +199,21 @@ def _cleanup_orphaned_cc_artifacts(db_path: Path, project_id: str) -> int:
     return deleted
 
 
-def _build_embeddings(conn, config_hash: str, llm_config, db_dir: Path) -> None:
-    """Generate and store vector embeddings for all definition symbols.
+def _build_embeddings(
+    conn: sqlite3.Connection, config_hash: str, llm_config, db_dir: Path,
+    *,
+    symbol_ids: list[int] | None = None,
+) -> None:
+    """Generate and store vector embeddings for definition symbols.
 
     Selects all function, method, constructor, destructor, class, struct,
     and union definitions from the current build, builds a human-readable description
     for each (combining file path, class, name, signature, docstring, and
     LLM summary), and produces embeddings via Ollama.
+
+    When *symbol_ids* is provided, only those symbols are cleaned and re-embedded
+    (used by ``reindex_file`` for fast per-file updates).  When None, all
+    definition symbols are processed (full index rebuild).
 
     Descriptions are processed in chunks of 100 to stay within model context
     limits.  Each batch is stored in two tables simultaneously:
@@ -148,40 +234,100 @@ def _build_embeddings(conn, config_hash: str, llm_config, db_dir: Path) -> None:
     # Suppress httpx INFO logs (one per batch — noisy during embedding)
     logging.getLogger("httpx").setLevel(logging.WARNING)
 
-    try:
-        resp = httpx.get(llm_config.ollama_url.rstrip("/") + "/api/tags", timeout=5.0)
-        resp.raise_for_status()
-    except Exception:
-        log.warning("Ollama not reachable — skipping embedding generation")
-        return
-
     embedder = get_embedder(llm_config)
+
+    from ..llm.ollama import OllamaEmbedder
+    if isinstance(embedder, OllamaEmbedder):
+        try:
+            resp = httpx.get(llm_config.ollama_url.rstrip("/") + "/api/tags", timeout=5.0)
+            resp.raise_for_status()
+        except Exception:
+            log.warning("Ollama not reachable — skipping embedding generation")
+            return
     model = _embed_model_key(embedder.name, True)
     with transaction(conn):
-        rows = conn.execute(
-            """SELECT s.id, s.name, s.qualified_name, s.kind, s.file_path,
-                      s.signature, s.is_definition, s.docstring, s.summary,
-                      s.source, s.is_project
-               FROM symbols s
-               WHERE s.config_hash = ?
-                 AND s.is_definition = 1
-                  AND s.kind IN ('function', 'method', 'constructor', 'destructor',
-                                'class', 'struct', 'union', 'typedef', 'enum', 'varglobal')
-                  AND s.id NOT IN (SELECT symbol_id FROM embeddings WHERE model = ?)
-               ORDER BY CASE WHEN s.docstring IS NOT NULL AND LENGTH(s.docstring) > 30
-                          THEN 0 ELSE 1 END""",
-            (config_hash, model),
-        ).fetchall()
+        # Clean embeddings for symbols whose body text may have changed
+        # (chunk count can differ after source edits — a symbol with
+        # chunk_index=0 may now split into 3 chunks, or vice versa).
+        # Also removes stale rows from interrupted prior runs.
+        # When symbol_ids is provided, only those symbols are cleaned.
+        if symbol_ids:
+            id_placeholders = ",".join("?" * len(symbol_ids))
+            conn.execute(
+                f"""DELETE FROM embeddings
+                   WHERE model = ?
+                     AND symbol_id IN ({id_placeholders})""",
+                (model, *symbol_ids),
+            )
+            try:
+                conn.execute(
+                    f"DELETE FROM vec_symbols WHERE config_hash = ? AND symbol_id IN ({id_placeholders})",
+                    (config_hash, *symbol_ids),
+                )
+            except sqlite3.OperationalError:
+                pass
+        else:
+            conn.execute(
+                """DELETE FROM embeddings
+                   WHERE model = ?
+                     AND symbol_id IN (
+                         SELECT s.id FROM symbols s
+                         WHERE s.config_hash = ?
+                           AND s.is_definition = 1
+                           AND s.kind IN ('function', 'method', 'constructor', 'destructor',
+                                          'class', 'struct', 'union', 'typedef', 'enum', 'varglobal')
+                     )""",
+                (model, config_hash),
+            )
+            try:
+                conn.execute("DELETE FROM vec_symbols WHERE config_hash = ?", (config_hash,))
+            except sqlite3.OperationalError:
+                pass
+
+        if symbol_ids:
+            id_placeholders = ",".join("?" * len(symbol_ids))
+            rows = conn.execute(
+                f"""SELECT s.id, s.name, s.qualified_name, s.kind, s.file_path,
+                           s.signature, s.is_definition, s.docstring, s.summary,
+                           s.source, s.is_project
+                    FROM symbols s
+                    WHERE s.config_hash = ?
+                      AND s.is_definition = 1
+                      AND s.id IN ({id_placeholders})
+                      AND s.kind IN ('function', 'method', 'constructor', 'destructor',
+                                    'class', 'struct', 'union', 'typedef', 'enum', 'varglobal')
+                    ORDER BY CASE WHEN s.docstring IS NOT NULL AND LENGTH(s.docstring) > 30
+                              THEN 0 ELSE 1 END""",
+                (config_hash, *symbol_ids),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                """SELECT s.id, s.name, s.qualified_name, s.kind, s.file_path,
+                          s.signature, s.is_definition, s.docstring, s.summary,
+                          s.source, s.is_project
+                   FROM symbols s
+                   WHERE s.config_hash = ?
+                     AND s.is_definition = 1
+                     AND s.kind IN ('function', 'method', 'constructor', 'destructor',
+                                   'class', 'struct', 'union', 'typedef', 'enum', 'varglobal')
+                   ORDER BY CASE WHEN s.docstring IS NOT NULL AND LENGTH(s.docstring) > 30
+                             THEN 0 ELSE 1 END""",
+                (config_hash,),
+            ).fetchall()
         if not rows:
-            log.info("All definition symbols already embedded (model=%s) — nothing to do", model)
+            log.info("No definition symbols to embed (model=%s)", model)
             return
 
     # Build contextual descriptions — flowing sentences instead of token lists.
     # Anthropic Contextual Retrieval: chunk-specific context as sentences improves
     # embedding recall by -35% failures vs token-boundary lists.
     body_kinds = frozenset({"function", "method", "constructor", "destructor"})
-    _max_body_chars = embedder.max_tokens * 4 if embedder.max_tokens >= 16000 else None
-    descriptions = []
+    max_body_chars = embedder.max_tokens * 4
+
+    # Build description rows — one per (symbol, chunk).
+    # Most symbols produce a single chunk; long functions get split into
+    # multiple chunks, each with its own embedding.
+    desc_rows: list[tuple[dict, int, str]] = []  # (symbol_row, chunk_idx, description)
     for r in rows:
         fp = (r["file_path"] or "").replace("\\", "/")
         path = ""
@@ -229,26 +375,36 @@ def _build_embeddings(conn, config_hash: str, llm_config, db_dir: Path) -> None:
         extra_text = " ".join(extra) if extra else ""
 
         # ---- body (for function-like kinds) ----
-        body_text = ""
+        body_chunks: list[str] = []
         if kind in body_kinds:
             source = (r["source"] or "").strip()
             if source:
-                if _max_body_chars and len(source) <= _max_body_chars:
-                    body = source
-                else:
-                    body = _truncate_body(source, head=1200, tail=800)
-                body_text = f"\n\nBody:\n{body}"
+                body_chunks = _chunk_body(source, max_body_chars)
 
-        descriptions.append(f"{context_prefix}{sig_line} {extra_text}{body_text}".rstrip() + "\n")
+        if not body_chunks:
+            body_chunks = [""]  # single description, no body
+
+        n_chunks = len(body_chunks)
+        for ci, body in enumerate(body_chunks):
+            body_text = ""
+            if body:
+                if n_chunks > 1:
+                    body_text = f"\n\nBody [part {ci + 1}/{n_chunks}]:\n{body}"
+                else:
+                    body_text = f"\n\nBody:\n{body}"
+            desc_rows.append((
+                r, ci,
+                f"{context_prefix}{sig_line} {extra_text}{body_text}".rstrip() + "\n",
+            ))
 
     total = 0
     chunk_size = 100
-    total_batches = (len(rows) + chunk_size - 1) // chunk_size
+    total_batches = (len(desc_rows) + chunk_size - 1) // chunk_size
     embedding_dim: int | None = None
-    for i in range(0, len(rows), chunk_size):
+    for i in range(0, len(desc_rows), chunk_size):
         batch_num = i // chunk_size
-        chunk_rows = rows[i : i + chunk_size]
-        chunk_descs = descriptions[i : i + chunk_size]
+        batch = desc_rows[i : i + chunk_size]
+        chunk_descs = [d for _, _, d in batch]
         t0 = time.monotonic()
         try:
             embs = embedder.embed_documents(chunk_descs)
@@ -269,20 +425,26 @@ def _build_embeddings(conn, config_hash: str, llm_config, db_dir: Path) -> None:
 
         # Store in legacy BLOB table (backward compatibility)
         with write_lock(db_dir, timeout=5.0):
-            blob_batch = [(r["id"], _vec_to_blob(emb), model) for r, emb in zip(chunk_rows, embs, strict=True)]
+            blob_batch = [
+                (r["id"], ci, _vec_to_blob(emb), model)
+                for (r, ci, _), emb in zip(batch, embs, strict=True)
+            ]
             upsert_embeddings(conn, blob_batch)
 
             # Store in vec0 table (sqlite-vec KNN search)
             try:
-                vec_batch = [(r["id"], config_hash, emb) for r, emb in zip(chunk_rows, embs, strict=True)]
+                vec_batch = [
+                    (r["id"], ci, config_hash, emb)
+                    for (r, ci, _), emb in zip(batch, embs, strict=True)
+                ]
                 upsert_embeddings_vec(conn, vec_batch)
             except Exception as e:
                 log.warning("vec0 batch insert failed (sqlite-vec may not be loaded): %s", e)
 
         total += len(blob_batch)
         elapsed = time.monotonic() - t0
-        log.info("[%d/%d] %d symbols embedded %s", batch_num + 1, total_batches, len(chunk_rows), _fmt_dur(elapsed))
-    log.info("Embeddings stored: %d symbols (model=%s)", total, model)
+        log.info("[%d/%d] %d symbols embedded %s", batch_num + 1, total_batches, len(batch), _fmt_dur(elapsed))
+    log.info("Embeddings stored: %d embedding rows (model=%s)", total, model)
     if embedding_dim is not None:
         conn.execute(
             "UPDATE build_configs SET embedding_dim = ? WHERE config_hash = ?",
@@ -291,7 +453,11 @@ def _build_embeddings(conn, config_hash: str, llm_config, db_dir: Path) -> None:
     # Prune embeddings with non-versioned model keys (pre-desc-v1 or unknown)
     # to prevent old vectors from bloating storage and polluting query results.
     try:
-        conn.execute("DELETE FROM embeddings WHERE model NOT LIKE '%:desc-v%'")
+        conn.execute(
+            "DELETE FROM embeddings WHERE model NOT LIKE '%:desc-v%'"
+            " AND symbol_id IN (SELECT id FROM symbols WHERE config_hash = ?)",
+            (config_hash,),
+        )
     except sqlite3.OperationalError:
         pass
     conn.commit()
@@ -1785,6 +1951,225 @@ def _process_unit(
             conn.close()
 
 
+def _run_postprocess(
+    conn,
+    config_hash: str,
+    project_root: Path,
+    db_dir: Path,
+    units: list,
+    tu_headers: dict,
+    manifest: dict | None,
+    compile_commands: Path,
+    updated: int,
+    build_dir_patterns: list[str] | None,
+    vendor_patterns: list[str],
+    project_patterns_list: list[str],
+    project_id: str,
+    git_description: str,
+    *,
+    index_refs: bool,
+    index_embeddings: bool,
+    index_macros_expanded: bool,
+    analyze_symbols: bool,
+    analyze_overrides: bool,
+    analyze_vendor: bool,
+    llm_config=None,
+    cache_server_config=None,
+    force: bool = False,
+) -> None:
+    """Post-processing phases: FTS5 rebuild, macros, embeddings, LLM, overrides, pagerank."""
+
+    # ── FTS5 rebuild ──
+    rebuild_fts(conn)
+    rebuild_files_fts(conn)
+    rebuild_macros_fts(conn)
+
+    # ── Orphan cleanup ──
+    from .db import delete_orphan_files
+
+    delete_orphan_files(conn, config_hash)
+
+    # ── is_project alignment ──
+    for pp in project_patterns_list:
+        fn_pp = pp.replace("%", "*")
+        conn.execute(
+            """UPDATE files SET is_project = 1
+               WHERE config_hash = ? AND is_project = 0 AND path GLOB ?""",
+            (config_hash, fn_pp),
+        )
+    external_guard = "AND path NOT LIKE '/%'"
+    if vendor_patterns:
+        sql_vendor_patterns = [p.replace("_", "\\_") for p in vendor_patterns]
+        not_like_clauses = " AND ".join(
+            ["path NOT LIKE ? ESCAPE '\\'"] * len(vendor_patterns)
+        )
+        conn.execute(
+            f"""UPDATE files SET is_project = 1
+                WHERE config_hash = ? AND is_project = 0
+                  AND ({not_like_clauses}) {external_guard}""",
+            [config_hash] + sql_vendor_patterns,
+        )
+    else:
+        conn.execute(
+            f"""UPDATE files SET is_project = 1
+               WHERE config_hash = ? AND is_project = 0
+                 {external_guard}""",
+            [config_hash],
+        )
+    conn.commit()
+
+    # ── Manifest update ──
+    updated_manifest = _update_manifest_after_index(
+        manifest=manifest,
+        units=units,
+        project_root=project_root,
+        db_dir=db_dir,
+        compile_commands=compile_commands,
+        updated_count=updated,
+        tu_headers=tu_headers if tu_headers else None,
+        build_dir_patterns=build_dir_patterns,
+        config_hash=config_hash,
+    )
+    if updated_manifest is not None:
+        _refresh_header_mtimes_from_manifest(conn, config_hash, project_root, updated_manifest)
+
+    # ── Macro expansion ──
+    if index_macros_expanded and units:
+        from .macros import resolve_and_update
+
+        seen_flags: set[tuple] = set()
+        for unit in units:
+            flag_key = tuple(sorted(unit.clang_args))
+            if flag_key in seen_flags:
+                continue
+            seen_flags.add(flag_key)
+            try:
+                resolve_and_update(
+                    conn, config_hash, unit.clang_args, unit.file.resolve(),
+                )
+            except Exception:
+                pass
+
+    # ── Embeddings ──
+    if index_embeddings and llm_config is not None and llm_config.enabled:
+        if force:
+            conn.execute(
+                "DELETE FROM embeddings WHERE symbol_id IN (SELECT id FROM symbols WHERE config_hash = ?)",
+                (config_hash,),
+            )
+            try:
+                conn.execute(
+                    "DELETE FROM vec_symbols WHERE symbol_id IN (SELECT id FROM symbols WHERE config_hash = ?)",
+                    (config_hash,),
+                )
+            except sqlite3.OperationalError:
+                pass
+            conn.commit()
+        _build_embeddings(conn, config_hash, llm_config, db_dir)
+        conn.commit()
+
+    # ── LLM analysis ──
+    if analyze_symbols and llm_config is not None and llm_config.enabled:
+        from ..cache_client import CacheClient
+
+        cc = None
+        if cache_server_config is not None and cache_server_config.url:
+            try:
+                cc = CacheClient(
+                    url=cache_server_config.url,
+                    token=cache_server_config.token,
+                    force=cache_server_config.force,
+                    batch_size=cache_server_config.batch_size,
+                )
+            except Exception:
+                pass
+        if force:
+            conn.execute(
+                "DELETE FROM llm_analysis WHERE symbol_id IN (SELECT id FROM symbols WHERE config_hash = ?)",
+                (config_hash,),
+            )
+            conn.commit()
+        _build_llm_analysis(
+            conn, config_hash, llm_config, db_dir,
+            project_only=not analyze_vendor,
+            cache_client=cc,
+            retry_unparseable=True,
+        )
+        if cc:
+            cc.close()
+        conn.commit()
+
+    # ── Override graph ──
+    if analyze_overrides:
+        if force:
+            conn.execute("DELETE FROM overrides WHERE config_hash = ?", (config_hash,))
+            conn.commit()
+        _build_overrides(conn, config_hash, db_dir)
+        conn.commit()
+
+    # ── PageRank + hotspot ──
+    if index_refs:
+        if force:
+            conn.execute("UPDATE symbols SET pagerank = 0.0 WHERE config_hash = ?", (config_hash,))
+            conn.execute("DELETE FROM hotspot_cache WHERE config_hash = ?", (config_hash,))
+            conn.commit()
+        _build_pagerank(conn, config_hash)
+        conn.commit()
+        _build_hotspot_cache(conn, config_hash)
+        conn.commit()
+
+    # ── Manifest verification upgrade ──
+    manifest_path = db_dir / "manifest.json"
+    manifest_verification: str = "full" if manifest_path.exists() else "none"
+    with transaction(conn):
+        upsert_build_config(
+            conn, config_hash, project_id, str(compile_commands),
+            description=git_description, manifest_verification=manifest_verification,
+            analyze_vendor=int(analyze_vendor),
+        )
+
+    # ── Cleanup old build data ──
+    old_hashes = conn.execute(
+        """SELECT config_hash FROM build_configs
+           WHERE project_id = ? AND config_hash != ?
+           ORDER BY created_at DESC""",
+        (project_id, config_hash),
+    ).fetchall()
+    if old_hashes:
+        pause_file = db_dir / "reindex.pause"
+        skip_cleanup = False
+        if pause_file.exists():
+            try:
+                pause_pid = int(pause_file.read_text(encoding="utf-8").strip())
+                try:
+                    os.kill(pause_pid, 0)
+                    skip_cleanup = True
+                except OSError:
+                    pause_file.unlink(missing_ok=True)
+            except (OSError, ValueError):
+                pause_file.unlink(missing_ok=True)
+        if not skip_cleanup:
+            for row in old_hashes:
+                old_ch = row["config_hash"]
+                with transaction(conn):
+                    delete_build_data(conn, old_ch)
+            cc_dir = Path.home() / ".fw-context" / "index" / project_id
+            if cc_dir.exists():
+                for row in old_hashes:
+                    old_ch = row["config_hash"]
+                    try:
+                        (cc_dir / f"compile_commands.{old_ch}.json").unlink(missing_ok=True)
+                    except OSError:
+                        pass
+
+    # ── WAL checkpoint + schema stamp ──
+    try:
+        conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
+    except Exception:
+        pass
+    conn.execute(f"PRAGMA user_version = {CURRENT_SCHEMA_VERSION}")
+
+
 def run(
     compile_commands: Path,
     db_path: Path,
@@ -2239,306 +2624,35 @@ def run(
                 skipped += 1
                 log.info("[%d/%d] %s: skipped", processed, len(units), fname)
 
-    # Rebuild FTS5 table from the now-complete symbols table — restores
-    # full-text search after the triggers were dropped before indexing.
-    log.info("", extra={"phase": "FTS5 rebuild"})
-    t_fts_start = time.monotonic()
-    rebuild_fts(conn)
-    rebuild_files_fts(conn)
-    rebuild_macros_fts(conn)
-    t_fts = time.monotonic() - t_fts_start
-    log.info("fts5 + files_fts + macros_fts rebuilt  %s", _fmt_dur(t_fts))
 
-    # Clean up file records that no longer have symbols or macros.
-    from .db import delete_orphan_files
-
-    orphans = delete_orphan_files(conn, config_hash)
-    if orphans:
-        log.info("Orphan files cleaned up: %d", orphans)
-
-    # ── Post-index files.is_project alignment (3-step) ──
-    t_align_start = time.monotonic()
-
-    # Step 1: Symbol-based correction already done per-TU in store_symbols_for_unit.
-    # Step 2: Path-based fallback for explicit project_paths — files in
-    #         these directories are always project, even without symbols.
-    for pp in project_patterns_list:
-        fn_pp = pp.replace("%", "*")
-        conn.execute(
-            """UPDATE files SET is_project = 1
-               WHERE config_hash = ? AND is_project = 0
-                 AND path GLOB ?""",
-            (config_hash, fn_pp),
-        )
-
-    # Step 3: Blanket fallback — every file NOT matching a vendor pattern
-    #          is project code (matches "everything else → is_project=1").
-    #          External paths (outside project_root) are protected by the
-    #          NOT LIKE '/%' guard (Unix absolute paths).
-    external_guard = "AND path NOT LIKE '/%'"
-    if vendor_patterns:
-        sql_vendor_patterns = [p.replace("_", "\\_") for p in vendor_patterns]
-        not_like_clauses = " AND ".join(
-            ["path NOT LIKE ? ESCAPE '\\'"] * len(vendor_patterns)
-        )
-        conn.execute(
-            f"""UPDATE files SET is_project = 1
-                WHERE config_hash = ? AND is_project = 0
-                  AND ({not_like_clauses})
-                  {external_guard}""",
-            [config_hash] + sql_vendor_patterns,
-        )
-    else:
-        conn.execute(
-            f"""UPDATE files SET is_project = 1
-               WHERE config_hash = ? AND is_project = 0
-                 {external_guard}""",
-            [config_hash],
-        )
-    conn.commit()
-    t_align = time.monotonic() - t_align_start
-    log.info("files.is_project alignment  %s", _fmt_dur(t_align))
-
-    elapsed_parse = time.monotonic() - t0
-    log.info(
-        "Parsing done: %d updated, %d unchanged, %d reused, %d skipped — parse=%.1fs  lock=%.1fs  write=%.1fs  %s",
-        updated,
-        unchanged,
-        reused,
-        skipped,
-        acc_parse,
-        acc_lock,
-        acc_write,
-        _fmt_dur(elapsed_parse),
-    )
-    if content_filled:
-        log.info("ifdef-filtered content: %d files filled", content_filled)
-
-    # ── Update manifest.json ──
-    # Rebuild/update the manifest with fresh header hashes after indexing.
-    # For incremental runs (no --build), only updated TUs get new entries;
-    # unchanged TUs keep their stored entries from the previous manifest.
-    updated_manifest = _update_manifest_after_index(
-        manifest=manifest,
-        units=units,
+    # ── Post-processing ──
+    _run_postprocess(
+        conn=conn,
+        config_hash=config_hash,
         project_root=project_root,
         db_dir=db_path.parent,
+        units=units,
+        tu_headers=tu_headers,
+        manifest=manifest,
         compile_commands=compile_commands,
-        updated_count=updated,
-        tu_headers=tu_headers if tu_headers else None,
+        updated=updated,
         build_dir_patterns=build_dir_patterns,
-        config_hash=config_hash,
+        vendor_patterns=vendor_patterns,
+        project_patterns_list=project_patterns_list,
+        project_id=project_id,
+        git_description=git_description,
+        index_refs=index_refs,
+        index_embeddings=index_embeddings,
+        index_macros_expanded=index_macros_expanded,
+        analyze_symbols=analyze_symbols,
+        analyze_overrides=analyze_overrides,
+        analyze_vendor=_analyze_vendor,
+        llm_config=llm_config,
+        cache_server_config=cache_server_config,
+        force=force,
     )
 
-    # ── Refresh header mtimes from manifest ──
-    # VCS operations (git checkout/merge) update header file mtimes without
-    # changing content.  Refresh stored mtimes so _count_modified_files
-    # doesn't report phantom modifications and trigger unnecessary reindexes.
-    # Must run AFTER _update_manifest_after_index so it works with the
-    # current manifest, not the one loaded at the start of run().
-    if updated_manifest is not None:
-        _refresh_header_mtimes_from_manifest(conn, config_hash, project_root, updated_manifest)
-
-    # Resolve expanded macro values via clang -dM -E (opt-in, best-effort).
-    if index_macros_expanded and units:
-        log.info("", extra={"phase": "Macro expansion"})
-        t_macro = time.monotonic()
-        macro_updated = 0
-        try:
-            from .macros import resolve_and_update
-
-            seen_flags: set[tuple] = set()
-            for unit in units:
-                flag_key = tuple(sorted(unit.clang_args))
-                if flag_key in seen_flags:
-                    continue
-                seen_flags.add(flag_key)
-                try:
-                    macro_updated += resolve_and_update(
-                        conn,
-                        config_hash,
-                        unit.clang_args,
-                        unit.file.resolve(),
-                    )
-                except Exception:
-                    pass  # best-effort per TU
-        except Exception:
-            pass  # best-effort
-        elapsed_macro = time.monotonic() - t_macro
-        if macro_updated:
-            log.info("%d values resolved  %s", macro_updated, _fmt_dur(elapsed_macro))
-        else:
-            log.info("nothing to resolve  %s", _fmt_dur(elapsed_macro))
-
-    # Post-processing — each function handles its own idempotency
-    # (returns immediately when data already exists).
-
-    # Use is_project column directly — respects project_paths/vendor_paths config.
-
-    # Embedding generation (opt-in)
-    if index_embeddings and llm_config is not None and llm_config.enabled:
-        if force:
-            conn.execute(
-                "DELETE FROM embeddings WHERE symbol_id IN (SELECT id FROM symbols WHERE config_hash = ?)",
-                (config_hash,),
-            )
-            try:
-                conn.execute(
-                    "DELETE FROM vec_symbols WHERE symbol_id IN (SELECT id FROM symbols WHERE config_hash = ?)",
-                    (config_hash,),
-                )
-            except sqlite3.OperationalError:
-                pass  # sqlite-vec not loaded — vec_symbols table doesn't exist
-            conn.commit()
-        log.info("", extra={"phase": "Embeddings"})
-        t_emb = time.monotonic()
-        _build_embeddings(conn, config_hash, llm_config, db_path.parent)
-        conn.commit()
-        log.info("done  %s", _fmt_dur(time.monotonic() - t_emb))
-
-    # LLM analysis generation (opt-in)
-    if analyze_symbols and llm_config is not None and llm_config.enabled:
-        # Create CacheClient from cache_server_config if available
-        cc = None
-        if cache_server_config is not None and cache_server_config.url:
-            try:
-                from ..cache_client import CacheClient
-
-                cc = CacheClient(
-                    url=cache_server_config.url,
-                    token=cache_server_config.token,
-                    force=cache_server_config.force,
-                    batch_size=cache_server_config.batch_size,
-                )
-            except Exception as e:
-                log.warning("Failed to create CacheClient: %s", e)
-        else:
-            log.info(
-                "Remote LLM cache server not configured — all symbols will be analyzed locally. "
-                "Run 'fw-context cache remote-init' to configure."
-            )
-
-        if force:
-            conn.execute(
-                "DELETE FROM llm_analysis WHERE symbol_id IN (SELECT id FROM symbols WHERE config_hash = ?)",
-                (config_hash,),
-            )
-            conn.commit()
-        log.info("", extra={"phase": f"LLM Analysis ({llm_config.model})"})
-        t_llm = time.monotonic()
-        _build_llm_analysis(
-            conn,
-            config_hash,
-            llm_config,
-            db_path.parent,
-            project_only=not _analyze_vendor,
-            cache_client=cc,
-            retry_unparseable=True,
-        )
-        if cc:
-            cc.close()
-        conn.commit()
-        log.info("done  %s", _fmt_dur(time.monotonic() - t_llm))
-
-    # Method override tracking (post-processing, no LLM needed)
-    if analyze_overrides:
-        if force:
-            conn.execute("DELETE FROM overrides WHERE config_hash = ?", (config_hash,))
-            conn.commit()
-        log.info("", extra={"phase": "Override graph"})
-        t_ov = time.monotonic()
-        _build_overrides(conn, config_hash, db_path.parent)
-        conn.commit()
-        log.info("done  %s", _fmt_dur(time.monotonic() - t_ov))
-
-    # PageRank computation (post-processing, requires reference index)
-    if index_refs:
-        if force:
-            conn.execute("UPDATE symbols SET pagerank = 0.0 WHERE config_hash = ?", (config_hash,))
-            conn.execute("DELETE FROM hotspot_cache WHERE config_hash = ?", (config_hash,))
-            conn.commit()
-        log.info("", extra={"phase": "PageRank"})
-        t_pr = time.monotonic()
-        _build_pagerank(conn, config_hash)
-        conn.commit()
-        log.info("done  %s", _fmt_dur(time.monotonic() - t_pr))
-
-        log.info("", extra={"phase": "Hotspot cache"})
-        t_hs = time.monotonic()
-        _build_hotspot_cache(conn, config_hash)
-        conn.commit()
-        log.info("done  %s", _fmt_dur(time.monotonic() - t_hs))
-
-    # Manifest verification — "full" when we have a manifest.json, "none" otherwise.
-    # The manifest is generated during `fw-context index --build` and provides
-    # header dependency hashes without needing .d files.
-    manifest_path = db_path.parent / "manifest.json"
-    manifest_verification: str = "full" if manifest_path.exists() else "none"
-    with transaction(conn):
-        upsert_build_config(
-            conn, config_hash, project_id, str(compile_commands),
-            description=git_description, manifest_verification=manifest_verification,
-            analyze_vendor=int(_analyze_vendor),
-        )
-
-    # ── Cleanup old build data ──
-    # Delete data from previous config_hashes.  The current build is now
-    # fully indexed — old data is obsolete.  Skip cleanup when a
-    # reindex_file operation is in progress (pause marker).
-    old_hashes = conn.execute(
-        """SELECT config_hash FROM build_configs
-           WHERE project_id = ? AND config_hash != ?
-           ORDER BY created_at DESC""",
-        (project_id, config_hash),
-    ).fetchall()
-
-    if old_hashes:
-        pause_file = db_path.parent / "reindex.pause"
-        skip_cleanup = False
-        if pause_file.exists():
-            try:
-                pause_pid = int(pause_file.read_text(encoding="utf-8").strip())
-                try:
-                    os.kill(pause_pid, 0)
-                    log.warning(
-                        "Skipping cleanup — reindex_file (pid=%d) is running. "
-                        "Old data will be cleaned on next successful index.",
-                        pause_pid,
-                    )
-                    skip_cleanup = True
-                except OSError:
-                    pause_file.unlink(missing_ok=True)
-            except (OSError, ValueError):
-                pause_file.unlink(missing_ok=True)
-
-        if not skip_cleanup:
-            for row in old_hashes:
-                old_ch = row["config_hash"]
-                with transaction(conn):
-                    delete_build_data(conn, old_ch)
-                log.info("Cleaned up old build data: %s", old_ch[:12])
-
-            # Clean up old canonical compile_commands artifacts
-            cc_dir = Path.home() / ".fw-context" / "index" / project_id
-            if cc_dir.exists():
-                for old_row in old_hashes:
-                    old_ch = old_row["config_hash"]
-                    old_cc = cc_dir / f"compile_commands.{old_ch}.json"
-                    try:
-                        old_cc.unlink(missing_ok=True)
-                    except OSError:
-                        pass
-
     elapsed = time.monotonic() - t0
-    try:
-        conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
-    except Exception:
-        pass
-    # Stamp schema version — marks the index as current (get_active_build
-    # compares PRAGMA user_version against CURRENT_SCHEMA_VERSION).
-    # PRAGMA does not support bound parameters; CURRENT_SCHEMA_VERSION is
-    # an integer constant — no injection risk.
-    conn.execute(f"PRAGMA user_version = {CURRENT_SCHEMA_VERSION}")
     log.info("", extra={"phase": f"Done — {total_syms} symbols, {total_refs} refs, {_fmt_dur(elapsed)}"})
     log.info("%d updated, %d unchanged, %d reused, %d skipped  config_hash=%s", updated, unchanged, reused, skipped, config_hash[:12])
     return config_hash

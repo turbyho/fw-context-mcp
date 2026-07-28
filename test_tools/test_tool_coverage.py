@@ -870,7 +870,7 @@ def run_tests_for_project(proj: dict, results: CheckResults) -> None:
     if has_virt:
         results.section("20. Method Overrides")
 
-        mo = _async(results, get_method_overrides, sym["virtual_method"], project_root=root)
+        mo = _call(results, get_method_overrides, sym["virtual_method"], project_root=root)
         if mo and "error" not in mo:
             results.check("method_overrides → has name", "name" in mo)
             results.check("method_overrides → has overrides", "overrides" in mo)
@@ -878,7 +878,7 @@ def run_tests_for_project(proj: dict, results: CheckResults) -> None:
 
         # Non-method
         if sym.get("function"):
-            mo_err = _async(results, get_method_overrides, sym["function"], project_root=root)
+            mo_err = _call(results, get_method_overrides, sym["function"], project_root=root)
             if mo_err:
                 results.check("method_overrides non-method → error", "error" in mo_err)
 

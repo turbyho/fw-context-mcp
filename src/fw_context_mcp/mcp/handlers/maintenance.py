@@ -12,6 +12,7 @@ from pydantic import Field
 
 from ...config import derive_project_id
 from ...config import load as load_config
+from ...config.settings import Config
 from ...indexer.compile_commands import parse as parse_cc
 from ...indexer.db import (
     CURRENT_SCHEMA_VERSION,
@@ -330,8 +331,15 @@ def get_active_build(
             log_file = db_path.parent / "reindex.log"
             try:
                 with open(log_file, encoding="utf-8") as fh:
-                    lines = fh.readlines()
-                    result["reindex_progress"] = lines[-1].strip() if lines else None
+                    fh.seek(0, 2)
+                    file_size = fh.tell()
+                    if file_size == 0:
+                        result["reindex_progress"] = None
+                    else:
+                        fh.seek(max(0, file_size - 4096))
+                        last_chunk = fh.read()
+                        lines = last_chunk.splitlines()
+                        result["reindex_progress"] = lines[-1].strip() if lines else None
             except (OSError, IndexError):
                 result["reindex_progress"] = None
         return result
@@ -487,13 +495,306 @@ def reset_index(
             info["message"] = f"Would delete {db_path}. Call reset_index(confirm=True) to proceed."
         return info
     db_path.unlink()
-    for suffix in ("-wal", "-shm"):
+    for suffix in ("-wal", "-shm", "-journal"):
         p = db_path.with_name(db_path.name + suffix)
         if p.exists():
             p.unlink()
     info["action"] = "deleted"
     info["message"] = f"Index deleted. Run 'fw-context index' in {root} to rebuild."
     return info
+
+
+# ── moved from server.py ──
+def _reindex_cleanup_deleted_file(
+    conn: sqlite3.Connection,
+    cfg_data: sqlite3.Row,
+    target: Path,
+    root: Path,
+    db_path: Path,
+) -> dict:
+    """Clean up index records for a file that no longer exists on disk."""
+    config_hash = cfg_data["config_hash"]
+    from ...indexer.db import (
+        delete_fp_assignments_for_file as _del_fpa,
+    )
+    from ...indexer.db import (
+        delete_indirect_call_sites_for_file as _del_ics,
+    )
+    from ...indexer.db import (
+        delete_inheritance_for_file as _del_inh,
+    )
+    from ...indexer.db import (
+        delete_refs_for_file as _del_refs,
+    )
+    from ...indexer.db import (
+        delete_symbols_for_file as _del_syms,
+    )
+    from ...indexer.db import (
+        get_file_mtimes,
+    )
+    from ...indexer.db import (
+        write_lock as _db_write_lock,
+    )
+    from ...indexer.ops import _normalize_file_path
+    from ..background import _request_bg_reindex_pause, _resume_bg_reindex
+
+    known = get_file_mtimes(conn, config_hash)
+    file_path_str = _normalize_file_path(str(target), root)
+    if file_path_str not in known:
+        return {"error": f"File not found on disk or in index: {target}"}
+
+    file_id_old, _ = known[file_path_str]
+    symbol_count = conn.execute(
+        "SELECT COUNT(*) FROM symbols WHERE file_id = ?", (file_id_old,)
+    ).fetchone()[0]
+
+    try:
+        tu_rel = str(target.relative_to(root))
+    except ValueError:
+        tu_rel = file_path_str
+
+    _request_bg_reindex_pause(root)
+    try:
+        with _db_write_lock(db_path.parent, timeout=60.0):
+            with transaction(conn):
+                try:
+                    conn.execute(
+                        "DELETE FROM vec_symbols WHERE symbol_id IN "
+                        "(SELECT id FROM symbols WHERE file_id = ?)",
+                        (file_id_old,),
+                    )
+                except sqlite3.OperationalError:
+                    pass
+                _del_inh(conn, config_hash, file_id_old)
+                _del_syms(conn, file_id_old)
+                _del_refs(conn, config_hash, tu_rel)
+                _del_ics(conn, config_hash, tu_rel)
+                _del_fpa(conn, config_hash, tu_rel)
+                conn.execute("DELETE FROM files WHERE id = ?", (file_id_old,))
+        return {
+            "file": str(target),
+            "symbols_removed": symbol_count,
+            "action": "deleted",
+        }
+    finally:
+        _resume_bg_reindex(root)
+        from ...mcp.shared.stale import _invalidate_modified_cache
+
+        _invalidate_modified_cache(config_hash)
+
+
+def _reindex_parse_and_store(
+    conn: sqlite3.Connection,
+    matching: list,
+    cfg_data: sqlite3.Row,
+    cfg_refs: bool,
+    root: Path,
+    db_path: Path,
+    target: Path,
+    vendor_patterns: list[str],
+    project_patterns_list: list[str],
+) -> tuple[int, dict]:
+    """Parse matching TUs with libclang, store symbols, update manifest.
+
+    Returns (total_symbols, partial_result_dict with elapsed time info).
+    """
+    from ...indexer.compile_commands import CompilationUnit as TU
+    from ...indexer.db import write_lock as db_write_lock
+    from ...indexer.ops import store_symbols_for_unit
+    from ...indexer.symbols import (
+        Reference,
+        extract_all,
+    )
+    from ..background import _request_bg_reindex_pause, _resume_bg_reindex
+
+    config_hash = cfg_data["config_hash"]
+
+    parsed_units: list[tuple[TU, tuple[list[Symbol], list[Reference], list[InheritanceRecord], list[IndirectCallSite], list[FnPointerAssignment], list[Macro]]]] = []
+    for unit in matching:
+        try:
+            parsed = extract_all(unit, with_refs=cfg_refs)
+            parsed_units.append((unit, parsed))
+        except sqlite3.Error as exc:
+            return 0, {"error": f"DB error during parse of {unit.file.name}: {exc}"}
+        except Exception as exc:
+            if "unable to open database file" in str(exc):
+                return 0, {"error": f"DB error during parse of {unit.file.name}: {exc}"}
+            log.warning("skip TU %s during reindex: %s", unit.file.name, exc)
+
+    _request_bg_reindex_pause(root)
+    t0 = time.monotonic()
+    total_symbols = 0
+
+    try:
+        with db_write_lock(db_path.parent, timeout=60.0):
+            for unit, parsed in parsed_units:
+                with transaction(conn):
+                    syms_added, _, _headers = store_symbols_for_unit(
+                        conn, unit, config_hash, root,
+                        vendor_patterns=vendor_patterns,
+                        project_patterns=project_patterns_list,
+                        index_refs=cfg_refs,
+                        pre_parsed=parsed,
+                    )
+                    total_symbols += syms_added
+
+            if parsed_units:
+                try:
+                    from ...indexer.macros import resolve_and_update
+                    first_unit = parsed_units[0][0]
+                    resolve_and_update(conn, config_hash, first_unit.clang_args, first_unit.file.resolve())
+                except Exception:
+                    pass
+
+            from ...indexer.db import delete_orphan_files
+            deleted_orphans = delete_orphan_files(conn, config_hash)
+            if deleted_orphans:
+                log.debug("Orphan files cleaned up: %d", deleted_orphans)
+
+            try:
+                from fw_context_mcp.utils import compute_source_hash
+
+                from ...indexer.manifest import (
+                    _collect_headers_from_tokens,
+                    update_entry,
+                )
+                from ...indexer.manifest import (
+                    load as load_manifest,
+                )
+                from ...indexer.manifest import (
+                    save as save_manifest,
+                )
+                manifest_data = load_manifest(db_path.parent)
+                if manifest_data is not None:
+                    for unit, _parsed in parsed_units:
+                        headers = _collect_headers_from_tokens(unit, root, build_dir_patterns=None)
+                        source_hash = compute_source_hash(unit.file.resolve())
+                        try:
+                            tu_rel = str(unit.file.resolve().relative_to(root))
+                        except ValueError:
+                            tu_rel = str(unit.file.resolve())
+                        for idx, entry in enumerate(manifest_data.get("entries", [])):
+                            if entry.get("file") == tu_rel:
+                                update_entry(manifest_data, idx, source_hash, headers)
+                                break
+                        else:
+                            manifest_data.setdefault("entries", []).append({
+                                "file": tu_rel,
+                                "directory": str(unit.directory) if unit.directory else str(root),
+                                "arguments": unit.clang_args,
+                                "source_hash": source_hash,
+                                "headers": headers,
+                            })
+                    save_manifest(manifest_data, db_path.parent, config_hash)
+            except Exception:
+                log.debug("manifest.json update skipped during reindex_file", exc_info=True)
+
+            elapsed = round(time.monotonic() - t0, 2)
+            result = {
+                "file": str(target),
+                "translation_units": len(matching),
+                "symbols_updated": total_symbols,
+                "elapsed_s": elapsed,
+            }
+        return total_symbols, result
+    except sqlite3.Error as exc:
+        return 0, {"error": f"DB error during reindex: {exc}"}
+    finally:
+        _resume_bg_reindex(root)
+        from ...mcp.shared.stale import _invalidate_modified_cache
+        _invalidate_modified_cache(config_hash)
+
+
+def _reindex_post_write_phases(
+    conn: sqlite3.Connection,
+    config_hash: str,
+    cfg: Config,
+    total_symbols: int,
+    db_dir: Path,
+    target: Path,
+    matching: list,
+    result: dict,
+    root: Path,
+) -> dict:
+    """Run post-write enrichment phases: LLM analysis, overrides, pagerank, embeddings."""
+    if cfg.llm.enabled and cfg.llm.analyze_symbols and total_symbols > 0:
+        try:
+            from ...cache_client import CacheClient
+            from ...indexer.runner import _build_llm_analysis
+            try:
+                stored_av = bool(
+                    conn.execute(
+                        "SELECT analyze_vendor FROM build_configs WHERE config_hash = ?",
+                        (config_hash,),
+                    ).fetchone()["analyze_vendor"]
+                )
+            except sqlite3.OperationalError:
+                stored_av = False
+            cc = CacheClient.from_config(cfg)
+            try:
+                _build_llm_analysis(
+                    conn, config_hash, cfg.llm, db_dir,
+                    write_lock_held=True, retry_unparseable=True,
+                    cache_client=cc, project_only=not stored_av,
+                )
+                conn.commit()
+            finally:
+                if cc:
+                    cc.close()
+            analyzed_count = conn.execute(
+                "SELECT COUNT(*) FROM llm_analysis a JOIN symbols s ON s.id = a.symbol_id WHERE s.config_hash = ?",
+                (config_hash,),
+            ).fetchone()[0]
+            result["analysis_updated"] = analyzed_count
+        except Exception as exc:
+            result["analysis_warning"] = f"LLM analysis skipped: {exc}"
+
+    if total_symbols > 0:
+        try:
+            from ...indexer.runner import _build_overrides
+            _build_overrides(conn, config_hash, db_dir, write_lock_held=True, force=True)
+            conn.commit()
+        except Exception as exc:
+            result["overrides_warning"] = f"Override analysis skipped: {exc}"
+
+    if cfg.index.index_refs and total_symbols > 0:
+        try:
+            from ...indexer.runner import _build_hotspot_cache, _build_pagerank
+            _build_pagerank(conn, config_hash, write_lock_held=True, force=True)
+            _build_hotspot_cache(conn, config_hash, force=True)
+            conn.commit()
+        except Exception as exc:
+            result["pagerank_warning"] = f"PageRank/hotspot recompute skipped: {exc}"
+
+    if len(matching) == 1 and target.suffix.lower() in {".h", ".hpp"}:
+        result["warning"] = (
+            "Header re-indexed via one TU. Other TUs including this header may still have stale symbols — run 'fw-context index' for full accuracy."
+        )
+
+    if cfg.llm.enabled and total_symbols > 0:
+        try:
+            from ...indexer.runner import _build_embeddings as _reembed
+            file_symbol_ids = [
+                r[0] for r in conn.execute(
+                    "SELECT id FROM symbols WHERE config_hash = ? AND file_path = ?",
+                    (config_hash, str(target.relative_to(root))),
+                ).fetchall()
+            ]
+            if file_symbol_ids:
+                _reembed(conn, config_hash, cfg.llm, db_dir, symbol_ids=file_symbol_ids)
+            else:
+                _reembed(conn, config_hash, cfg.llm, db_dir)
+            conn.commit()
+            reembedded = conn.execute(
+                "SELECT COUNT(DISTINCT symbol_id) FROM embeddings e "
+                "JOIN symbols s ON s.id = e.symbol_id WHERE s.config_hash = ?",
+                (config_hash,),
+            ).fetchone()[0]
+            result["embeddings_updated"] = reembedded
+        except Exception as exc:
+            result["embedding_warning"] = f"Embedding regeneration skipped: {exc}"
+
+    return result
 
 
 # ── moved from server.py ──
@@ -515,44 +816,7 @@ def reindex_file_impl(
         ),
     ] = True,
 ) -> dict:
-    """Re-parse a single source file with libclang and update its symbols in the index.
-
-    Shared implementation used by ``reindex_file`` (public tool, full analysis) and
-    ``_auto_reindex_stale`` (background fast path, no LLM). Prefer ``reindex_file``
-    for interactive use; call this directly only when you need to control
-    *with_analysis* explicitly.
-
-    Requires an existing index (``fw-context index`` must have been run first).
-    The file must appear in ``compile_commands.json`` — header-only files are
-    re-indexed via the ``.cpp`` translation unit that includes them.
-
-    Args:
-        file_path: Absolute or project-relative path to the source file to
-            re-parse. Must have a matching entry in compile_commands.json.
-        project_root: Project root directory. Auto-detected from cwd if omitted.
-        with_analysis: When True (default), also regenerates LLM symbol analysis
-            and method override relationships — slower but
-            produces a fully up-to-date index. Set to False for a fast
-            symbol-only update (used by background auto-reindex).
-
-    Returns:
-        On success — dict with keys:
-            file (str): Resolved absolute path to the re-indexed file.
-            translation_units (int): Number of TUs that include this file.
-            symbols_updated (int): Number of symbols written/updated.
-            elapsed_s (float): Parse + store time in seconds.
-            analysis_updated (int, optional): Symbol count with fresh LLM
-                analysis (only present when LLM analysis is enabled and
-                with_analysis=True).
-            analysis_warning (str, optional): Reason LLM analysis was skipped.
-            overrides_warning (str, optional): Reason override analysis was skipped.
-            warning (str, optional): Header re-indexed via a single TU — other
-                TUs including this header may still have stale symbols; run
-                ``fw-context index`` for full accuracy.
-        On error — dict with key:
-            error (str): Human-readable reason (no index found, file not found,
-                file not in compile_commands.json, no build config indexed).
-    """
+    """Re-parse a single source file with libclang and update its symbols in the index."""
     db_path, cfg, project_id, root = _resolve_context(project_root)
     if not db_path.exists():
         return {"error": f"No index found for {root}. Run 'fw-context index' first."}
@@ -569,76 +833,9 @@ def reindex_file_impl(
             target = (root / target).resolve()
         else:
             target = target.resolve()
+
         if not target.exists():
-            # File deleted from disk — clean up its records from the index.
-            config_hash = cfg_data["config_hash"]
-            from ...indexer.db import (
-                delete_fp_assignments_for_file as _del_fpa,
-            )
-            from ...indexer.db import (
-                delete_indirect_call_sites_for_file as _del_ics,
-            )
-            from ...indexer.db import (
-                delete_inheritance_for_file as _del_inh,
-            )
-            from ...indexer.db import (
-                delete_refs_for_file as _del_refs,
-            )
-            from ...indexer.db import (
-                delete_symbols_for_file as _del_syms,
-            )
-            from ...indexer.db import (
-                get_file_mtimes,
-            )
-            from ...indexer.db import (
-                write_lock as _db_write_lock,
-            )
-            from ...indexer.ops import _normalize_file_path
-            from ..background import _request_bg_reindex_pause, _resume_bg_reindex
-
-            known = get_file_mtimes(conn, config_hash)
-            file_path_str = _normalize_file_path(str(target), root)
-            if file_path_str not in known:
-                return {"error": f"File not found on disk or in index: {target}"}
-
-            file_id_old, _ = known[file_path_str]
-            symbol_count = conn.execute("SELECT COUNT(*) FROM symbols WHERE file_id = ?", (file_id_old,)).fetchone()[0]
-
-            try:
-                tu_rel = str(target.relative_to(root))
-            except ValueError:
-                tu_rel = file_path_str
-
-            _request_bg_reindex_pause(root)
-            try:
-                with _db_write_lock(db_path.parent, timeout=60.0):
-                    with transaction(conn):
-                        # Clean vec0 before deleting symbols — vec0 has no CASCADE
-                        try:
-                            conn.execute(
-                                "DELETE FROM vec_symbols WHERE symbol_id IN "
-                                "(SELECT id FROM symbols WHERE file_id = ?)",
-                                (file_id_old,),
-                            )
-                        except sqlite3.OperationalError:
-                            pass  # sqlite-vec not loaded
-                        _del_inh(conn, config_hash, file_id_old)
-                        _del_syms(conn, file_id_old)
-                        # ON DELETE CASCADE → llm_analysis, embeddings removed
-                        _del_refs(conn, config_hash, tu_rel)
-                        _del_ics(conn, config_hash, tu_rel)
-                        _del_fpa(conn, config_hash, tu_rel)
-                        conn.execute("DELETE FROM files WHERE id = ?", (file_id_old,))
-                return {
-                    "file": str(target),
-                    "symbols_removed": symbol_count,
-                    "action": "deleted",
-                }
-            finally:
-                _resume_bg_reindex(root)
-                from ...mcp.shared.stale import _invalidate_modified_cache
-
-                _invalidate_modified_cache(config_hash)
+            return _reindex_cleanup_deleted_file(conn, cfg_data, target, root, db_path)
 
         cc_path = Path(cfg_data["compile_commands_path"])
         if not cc_path.exists():
@@ -649,238 +846,28 @@ def reindex_file_impl(
             return {"error": f"{target.name} not found in compile_commands.json — it may be a header-only file."}
         config_hash = cfg_data["config_hash"]
 
-        from ...indexer.compile_commands import CompilationUnit as TU
         from ...indexer.sdk_detect import _build_sdk_excludes, _normalize_patterns
 
         vendor_patterns = list(_build_sdk_excludes(root))
         if cfg.index.vendor_paths:
             vendor_patterns.extend(_normalize_patterns(cfg.index.vendor_paths))
-        project_patterns_list = _normalize_patterns(list(cfg.index.project_paths)) if cfg.index.project_paths else []
-        from ...indexer.db import write_lock as db_write_lock
-        from ...indexer.ops import store_symbols_for_unit
-        from ...indexer.symbols import (
-            Reference,
-            extract_all,
+        project_patterns_list = (
+            _normalize_patterns(list(cfg.index.project_paths)) if cfg.index.project_paths else []
         )
-        from ..background import _request_bg_reindex_pause, _resume_bg_reindex
 
-        # ── Parse outside the write lock ──
-        # libclang is CPU-bound; running it inside the lock serialises
-        # parsing when multiple TUs match (e.g. reindexing a header
-        # included by several .cpp files).
-        parsed_units: list[
-            tuple[
-                TU,
-                tuple[
-                    list[Symbol],
-                    list[Reference],
-                    list[InheritanceRecord],
-                    list[IndirectCallSite],
-                    list[FnPointerAssignment],
-                    list[Macro],
-                ],
-            ]
-        ] = []
-        for unit in matching:
-            try:
-                parsed = extract_all(
-                    unit,
-                    with_refs=cfg.index.index_refs,
-                )
-                parsed_units.append((unit, parsed))
-            except sqlite3.Error as exc:
-                return {"error": f"DB error during parse of {unit.file.name}: {exc}"}
-            except Exception as exc:
-                msg = str(exc)
-                if "unable to open database file" in msg:
-                    return {"error": f"DB error during parse of {unit.file.name}: {exc}"}
-                log.warning("skip TU %s during reindex: %s", unit.file.name, exc)
+        total_symbols, result = _reindex_parse_and_store(
+            conn, matching, cfg_data, cfg.index.index_refs,
+            root, db_path, target, vendor_patterns, project_patterns_list,
+        )
+        if "error" in result:
+            return result
+        if not with_analysis:
+            return result
 
-        # Request bg reindex to pause — manual operations take priority.
-        # The bg process checks for the pause marker between TUs and
-        # releases the write lock, allowing this operation to proceed
-        # without erroring or killing anything.
-        _request_bg_reindex_pause(root)
-
-        t0 = time.monotonic()
-        total_symbols = 0
-
-        try:
-            with db_write_lock(db_path.parent, timeout=60.0):
-                # ── Phase 1: main symbol write ──
-                for unit, parsed in parsed_units:
-                    with transaction(conn):
-                        syms_added, _, _headers = store_symbols_for_unit(
-                            conn,
-                            unit,
-                            config_hash,
-                            root,
-                            vendor_patterns=vendor_patterns,
-                            project_patterns=project_patterns_list,
-                            index_refs=cfg.index.index_refs,
-                            pre_parsed=parsed,
-                        )
-                        total_symbols += syms_added
-
-                # Resolve expanded macro values for the re-indexed TUs.
-                # Single call is sufficient — all TUs share the same flags.
-                if parsed_units:
-                    try:
-                        from ...indexer.macros import resolve_and_update
-
-                        first_unit = parsed_units[0][0]
-                        resolve_and_update(conn, config_hash, first_unit.clang_args, first_unit.file.resolve())
-                    except Exception:
-                        pass
-
-                # ── Phase 1b: orphan file cleanup ──
-                # Remove file records that no longer have symbols or macros —
-                # cheap DELETE that keeps the files table from accumulating
-                # stale entries across incremental reindexes.
-                from ...indexer.db import delete_orphan_files
-
-                deleted_orphans = delete_orphan_files(conn, config_hash)
-                if deleted_orphans:
-                    log.debug("Orphan files cleaned up: %d", deleted_orphans)
-
-                # ── Phase 1c: update manifest.json ──
-                # Keep header hashes in sync after reindexing a single file.
-                # Without this, _check_header_staleness reports false-positive
-                # stale TUs after every reindex_file call.
-                try:
-                    from fw_context_mcp.utils import compute_source_hash
-
-                    from ...indexer.manifest import (
-                        _collect_headers_from_tokens,
-                        update_entry,
-                    )
-                    from ...indexer.manifest import (
-                        load as load_manifest,
-                    )
-                    from ...indexer.manifest import (
-                        save as save_manifest,
-                    )
-
-                    manifest_data = load_manifest(db_path.parent)
-                    if manifest_data is not None:
-                        for unit, _parsed in parsed_units:
-                            headers = _collect_headers_from_tokens(
-                                unit,
-                                root,
-                                build_dir_patterns=None,
-                            )
-                            source_hash = compute_source_hash(unit.file.resolve())
-                            try:
-                                tu_rel = str(unit.file.resolve().relative_to(root))
-                            except ValueError:
-                                tu_rel = str(unit.file.resolve())
-                            # Find entry index by file path
-                            for idx, entry in enumerate(manifest_data.get("entries", [])):
-                                if entry.get("file") == tu_rel:
-                                    update_entry(manifest_data, idx, source_hash, headers)
-                                    break
-                            else:
-                                # TU not in manifest yet — append new entry
-                                manifest_data.setdefault("entries", []).append(
-                                    {
-                                        "file": tu_rel,
-                                        "directory": str(unit.directory) if unit.directory else str(root),
-                                        "arguments": unit.clang_args,
-                                        "source_hash": source_hash,
-                                        "headers": headers,
-                                    }
-                                )
-                        save_manifest(manifest_data, db_path.parent, config_hash)
-                except Exception:
-                    log.debug("manifest.json update skipped during reindex_file", exc_info=True)
-
-                elapsed = round(time.monotonic() - t0, 2)
-                result: dict = {
-                    "file": str(target),
-                    "translation_units": len(matching),
-                    "symbols_updated": total_symbols,
-                    "elapsed_s": elapsed,
-                }
-
-                if not with_analysis:
-                    return result
-
-                # ── Phase 2: LLM analysis ──
-                if cfg.llm.enabled and cfg.llm.analyze_symbols and total_symbols > 0:
-                    try:
-                        from ...cache_client import CacheClient
-                        from ...indexer.runner import _build_llm_analysis
-
-                        # Read stored analyze_vendor for consistent filtering
-                        # with the original index run.
-                        try:
-                            stored_av = bool(
-                                conn.execute(
-                                    "SELECT analyze_vendor FROM build_configs WHERE config_hash = ?",
-                                    (config_hash,),
-                                ).fetchone()["analyze_vendor"]
-                            )
-                        except sqlite3.OperationalError:
-                            stored_av = False
-
-                        cc = CacheClient.from_config(cfg)
-                        try:
-                            _build_llm_analysis(
-                                conn,
-                                config_hash,
-                                cfg.llm,
-                                db_path.parent,
-                                write_lock_held=True,
-                                retry_unparseable=True,
-                                cache_client=cc,
-                                project_only=not stored_av,
-                            )
-                            conn.commit()
-                        finally:
-                            if cc:
-                                cc.close()
-                        analyzed_count = conn.execute(
-                            "SELECT COUNT(*) FROM llm_analysis a JOIN symbols s ON s.id = a.symbol_id WHERE s.config_hash = ?",
-                            (config_hash,),
-                        ).fetchone()[0]
-                        result["analysis_updated"] = analyzed_count
-                    except Exception as exc:
-                        result["analysis_warning"] = f"LLM analysis skipped: {exc}"
-
-                # ── Phase 3: method override graph ──
-                if total_symbols > 0:
-                    try:
-                        from ...indexer.runner import _build_overrides
-
-                        _build_overrides(conn, config_hash, db_path.parent, write_lock_held=True, force=True)
-                        conn.commit()
-                    except Exception as exc:
-                        result["overrides_warning"] = f"Override analysis skipped: {exc}"
-
-                # ── Phase 4: pagerank + hotspot cache ──
-                if cfg.index.index_refs and total_symbols > 0:
-                    try:
-                        from ...indexer.runner import _build_hotspot_cache, _build_pagerank
-
-                        _build_pagerank(conn, config_hash, write_lock_held=True, force=True)
-                        _build_hotspot_cache(conn, config_hash, force=True)
-                        conn.commit()
-                    except Exception as exc:
-                        result["pagerank_warning"] = f"PageRank/hotspot recompute skipped: {exc}"
-
-                if len(matching) == 1 and target.suffix.lower() in {".h", ".hpp"}:
-                    result["warning"] = (
-                        "Header re-indexed via one TU. Other TUs including this header may still have stale symbols — run 'fw-context index' for full accuracy."
-                    )
-
-                return result
-        except sqlite3.Error as exc:
-            return {"error": f"DB error during reindex: {exc}"}
-        finally:
-            _resume_bg_reindex(root)
-            from ...mcp.shared.stale import _invalidate_modified_cache
-
-            _invalidate_modified_cache(config_hash)
+        return _reindex_post_write_phases(
+            conn, config_hash, cfg, total_symbols, db_path.parent,
+            target, matching, result, root,
+        )
     finally:
         conn.close()
 

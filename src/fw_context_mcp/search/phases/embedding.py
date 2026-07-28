@@ -43,7 +43,7 @@ class EmbeddingPhase(Phase):
     When ``independent=True`` the phase always runs a standalone KNN query via
     ``search_similar_vec()``, ignoring any ``fts5_results`` already in the
     context.  This is used by ``SMART_SEARCH`` for separate FTS5 + Vec
-    retrieval prior to RRF fusion.
+    retrieval prior to adaptive fusion.
     """
 
     name = "embedding"  #: Phase identifier used in pipeline configuration.

@@ -27,7 +27,9 @@ __all__ = [
 # desc-v2: body text appended for function/method/constructor/destructor
 # desc-v3: file name prefix added
 # desc-v4: contextual sentence format (flowing text vs token-boundary lists)
-DESCRIPTION_VERSION = "desc-v4"
+# desc-v5: multi-chunk embeddings with semantic body splitting (chunk_index,
+#   Body [part N/M] markers), composite PK (symbol_id, chunk_index)
+DESCRIPTION_VERSION = "desc-v5"
 
 
 class ProjectNotInitializedError(RuntimeError):
@@ -74,17 +76,21 @@ num_ctx = 16384
 # timeout = 600.0   # HTTP timeout for Ollama requests in seconds (default 600)
 # debug_log = "~/.fw-context/llm-debug.jsonl"   # write LLM prompts/responses to JSONL
 
-# Embedding model for semantic_search.
+# Embedding model for semantic_search (auto-detected when not set).
+# Auto-detect: GPU available → qwen3-embedding:8b, CPU-only → qwen3-embedding:0.6b.
+# Set explicitly below to override.
 # Pull with:  ollama pull <model>
-# Uncomment exactly ONE of the sections below.
 #
-# ── Default: mxbai-embed-large (~670 MB VRAM, no GPU needed) ──
-# embed_model = "mxbai-embed-large:latest"
-# embed_query_prompt = "Represent this sentence for searching relevant passages: "
-# embed_doc_prompt = ""
+# ── CPU-only, 32K context (~400 MB), 4096-d vectors ──
+# embed_model = "qwen3-embedding:0.6b"
 #
-# ── Higher quality: qwen3-embedding:8b (~4.7 GB VRAM, GPU recommended) ──
+# ── CPU/GPU, 32K context (~2.4 GB), 5120-d vectors ──
+# embed_model = "qwen3-embedding:4b"
+#
+# ── GPU, 8K context (~4.7 GB), 4096-d vectors ──
 # embed_model = "qwen3-embedding:8b"
+#
+# ── Custom query/doc prompts (auto-detected per model, override if needed) ──
 # embed_query_prompt = "Retrieve C/C++ functions, types, symbols, and implementation code relevant to the query."
 # embed_doc_prompt = ""
 
@@ -159,17 +165,21 @@ _PROJECT_LOCAL_DEFAULTS_TEMPLATE = """\
 # keep_alive = "10m"   # how long to keep model loaded in VRAM after each request
 # timeout = 600.0   # HTTP timeout for Ollama requests in seconds (default 600)
 # debug_log = "~/.fw-context/llm-debug.jsonl"   # write LLM prompts/responses to JSONL
-# Embedding model for semantic_search.
+# Embedding model for semantic_search (auto-detected when not set).
+# Auto-detect: GPU available → qwen3-embedding:8b, CPU-only → qwen3-embedding:0.6b.
+# Set explicitly below to override.
 # Pull with:  ollama pull <model>
-# Uncomment exactly ONE of the sections below.
 #
-# ── Default: mxbai-embed-large (~670 MB VRAM, no GPU needed) ──
-# embed_model = "mxbai-embed-large:latest"
-# embed_query_prompt = "Represent this sentence for searching relevant passages: "
-# embed_doc_prompt = ""
+# ── CPU-only, 32K context (~400 MB), 4096-d vectors ──
+# embed_model = "qwen3-embedding:0.6b"
 #
-# ── Higher quality: qwen3-embedding:8b (~4.7 GB VRAM, GPU recommended) ──
+# ── CPU/GPU, 32K context (~2.4 GB), 5120-d vectors ──
+# embed_model = "qwen3-embedding:4b"
+#
+# ── GPU, 8K context (~4.7 GB), 4096-d vectors ──
 # embed_model = "qwen3-embedding:8b"
+#
+# ── Custom query/doc prompts (auto-detected per model, override if needed) ──
 # embed_query_prompt = "Retrieve C/C++ functions, types, symbols, and implementation code relevant to the query."
 # embed_doc_prompt = ""
 # analyze_symbols = true    # generate structured symbol descriptions (summary, inputs, outputs) — enabled by default
@@ -192,12 +202,13 @@ class LLMConfig:
         model: Chat model for analysis and search query generation.
             Minimum 14B parameters recommended for C++ embedded code.
         embed_model: Embedding model for semantic search.
-            Default ``mxbai-embed-large:latest`` (~670 MB VRAM, no GPU needed).
-            For better quality with a GPU use ``qwen3-embedding:8b`` (~4.7 GB).
+            Empty (default, ``""``) auto-detects: GPU available →
+            ``qwen3-embedding:8b``, CPU-only → ``qwen3-embedding:0.6b``.
+            Set explicitly to override (see config template for options).
         embed_query_prompt: Instruction prepended to query text before embedding.
-            Auto-detected from model prefix when empty.  ``mxbai-*`` uses
-            ``"Represent this sentence for searching relevant passages: "``,
-            ``qwen3-embedding*`` uses a code-specific retrieval instruction.
+            Auto-detected from model prefix when empty.  ``qwen3-embedding*`` uses
+            a code-specific retrieval instruction, ``mxbai-*`` and ``ibm-granite/*``
+            use ``"Represent this sentence for searching relevant passages: "``.
             Set explicitly in TOML to override or disable (empty string).
         embed_doc_prompt: Instruction prepended to symbol descriptions during
             indexing.  Most models work best with an empty doc prompt — only
@@ -220,14 +231,19 @@ class LLMConfig:
             Set ``"0"`` to unload immediately (saves VRAM, adds latency).
             Set ``"-1"`` to keep loaded indefinitely.
         analyze_symbols: Generate per-symbol summaries, inputs, and outputs during indexing.
-        analyze_vendor: When False (default), skip LLM analysis for vendor/SDK code
-            (mbed-os, Zephyr, PlatformIO, etc.) — only project code is analyzed.
-            Set True to analyze every indexed symbol regardless of origin.
+         analyze_vendor: When False (default), skip LLM analysis for vendor/SDK code
+             (mbed-os, Zephyr, PlatformIO, etc.) — only project code is analyzed.
+             Set True to analyze every indexed symbol regardless of origin.
+         ollama_max_concurrent: Maximum concurrent in-flight Ollama HTTP calls per
+             process.  Default 1 (serial, identical to a Lock).  Increase to 2–4
+             for multi-client MCP transports (SSE/streamable) where embedding
+             requests (small model, ~100 ms) can overlap without saturating the
+             GPU.  Chat requests are GPU-heavy — keep this low.
     """
     enabled: bool = True
     ollama_url: str = "http://localhost:11434"
     model: str = "qwen2.5-coder:14b"
-    embed_model: str = "mxbai-embed-large:latest"
+    embed_model: str = ""  # empty = auto-detect (GPU → qwen3:8b, CPU → qwen3:0.6b)
     embed_query_prompt: str = ""
     embed_doc_prompt: str = ""
     embed_dim: int | None = None
@@ -238,10 +254,16 @@ class LLMConfig:
     analyze_symbols: bool = True
     analyze_vendor: bool = False
     reranker_model: str | None = None  # "cross-encoder/ms-marco-MiniLM-L6-v2" to enable
+    ollama_max_concurrent: int = 1  # max concurrent Ollama HTTP calls (1=serial, 2–4 for SSE transport)
 
     def embed_key(self) -> str:
-        """Return ``embed_model`` with description version for cache disambiguation."""
-        return f"{self.embed_model}:{DESCRIPTION_VERSION}"
+        """Return ``embed_model`` with description version for cache disambiguation.
+
+        Returns ``"auto:desc-v5"`` when *embed_model* is empty (auto-detect not
+        yet resolved — ``resolve_embed_model`` fills the field at config load time).
+        """
+        model = self.embed_model or "auto"
+        return f"{model}:{DESCRIPTION_VERSION}"
 
 
 def _apply_embed_prompt_defaults(llm_cfg: LLMConfig) -> None:
@@ -296,6 +318,12 @@ class IndexConfig:
             (find_callers, find_call_path, etc.). Enabled by default.
         index_embeddings: Generate vector embeddings during indexing for
             semantic search. Enabled by default.
+        rerank_top_k: Number of candidates to feed to the cross-encoder
+            reranker (default 50).
+        min_dense_count: Minimum number of embedding results required to
+            trust dense-only routing in ``AdaptiveFusionPhase``.  Below this
+            threshold FTS5 is used as fallback.  Set higher for projects
+            with immature embedding quality (default 3, tuned on zbox-ecb-fw).
     """
     db_dir: Path = field(default_factory=lambda: Path.home() / ".fw-context" / "index")
     compile_commands: Path = field(default_factory=lambda: Path("compile_commands.json"))
@@ -305,7 +333,7 @@ class IndexConfig:
     index_refs: bool = True
     index_embeddings: bool = True
     rerank_top_k: int = 50
-    rrf_weights: str = "fixed"  # "fixed" or "adaptive"
+    min_dense_count: int = 3
 
 
 @dataclass
@@ -373,6 +401,20 @@ def _deep_merge(base: dict, override: dict) -> dict:
         else:
             result[k] = v
     return result
+
+
+def _safe_int(val, default: int = 0) -> int:
+    try:
+        return int(val)
+    except (ValueError, TypeError):
+        return default
+
+
+def _safe_float(val, default: float = 0.0) -> float:
+    try:
+        return float(val)
+    except (ValueError, TypeError):
+        return default
 
 
 def _from_dict(data: dict) -> Config:
@@ -473,9 +515,16 @@ def _from_dict(data: dict) -> Config:
         if "index_embeddings" in idx:
             cfg.index.index_embeddings = bool(idx["index_embeddings"])
         if "rerank_top_k" in idx:
-            cfg.index.rerank_top_k = int(idx["rerank_top_k"])
+            cfg.index.rerank_top_k = _safe_int(idx["rerank_top_k"], 50)
+        if "min_dense_count" in idx:
+            cfg.index.min_dense_count = _safe_int(idx["min_dense_count"], 3)
         if "rrf_weights" in idx:
-            cfg.index.rrf_weights = idx["rrf_weights"]
+            import logging as _log
+
+            _log.getLogger(__name__).warning(
+                "[index] rrf_weights is deprecated — RRF fusion has been replaced by adaptive_fusion. "
+                "Remove rrf_weights from config.toml."
+            )
 
     if llm := data.get("llm", {}):
         if "enabled" in llm:
@@ -491,12 +540,12 @@ def _from_dict(data: dict) -> Config:
         if embed_dp := llm.get("embed_doc_prompt"):
             cfg.llm.embed_doc_prompt = embed_dp
         if embed_dim := llm.get("embed_dim"):
-            cfg.llm.embed_dim = int(embed_dim)
+            cfg.llm.embed_dim = _safe_int(embed_dim)
         _apply_embed_prompt_defaults(cfg.llm)
         if num_ctx := llm.get("num_ctx"):
-            cfg.llm.num_ctx = int(num_ctx)
+            cfg.llm.num_ctx = _safe_int(num_ctx, 16384)
         if timeout := llm.get("timeout"):
-            cfg.llm.timeout = float(timeout)
+            cfg.llm.timeout = _safe_float(timeout, 600.0)
         if keep_alive := llm.get("keep_alive"):
             cfg.llm.keep_alive = keep_alive
         if debug_log := llm.get("debug_log"):
@@ -507,6 +556,10 @@ def _from_dict(data: dict) -> Config:
             cfg.llm.analyze_vendor = bool(llm["analyze_vendor"])
         if reranker_model := llm.get("reranker_model"):
             cfg.llm.reranker_model = reranker_model
+
+    from ..llm.auto_model import resolve_embed_model
+
+    resolve_embed_model(cfg.llm)
 
     if cs := data.get("cache_server", {}):
         cfg.cache_server = CacheServerConfig(
@@ -560,7 +613,7 @@ def update_global_config(fix: bool = False) -> None:
     section_map: dict[str, str] = {}  # key → section
     current_section = ""
     for line in _GLOBAL_DEFAULTS.splitlines():
-        header_m = re.match(r"^\[(\w+)\]", line)
+        header_m = re.match(r"^\[([^\]]+)\]", line)
         if header_m:
             current_section = header_m.group(1)
             continue
@@ -582,7 +635,7 @@ def update_global_config(fix: bool = False) -> None:
             appended_sections: set[str] = set()
 
             existing_sections: set[str] = set(
-                re.findall(r"^\[(\w+)\]", existing_text, re.MULTILINE)
+                re.findall(r"^\[([^\]]+)\]", existing_text, re.MULTILINE)
             )
 
             lines_to_append: list[str] = []

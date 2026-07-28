@@ -22,6 +22,7 @@ def _build_registry() -> dict[str, Phase]:
     if _REGISTRY:
         return _REGISTRY
 
+    from fw_context_mcp.search.phases.adaptive_fusion import AdaptiveFusionPhase
     from fw_context_mcp.search.phases.deduplicate import DeduplicatePhase
     from fw_context_mcp.search.phases.embedding import EmbeddingPhase
     from fw_context_mcp.search.phases.expand_context import ExpandContextPhase
@@ -29,9 +30,7 @@ def _build_registry() -> dict[str, Phase]:
     from fw_context_mcp.search.phases.fts5_search import FTS5SearchPhase
     from fw_context_mcp.search.phases.llm_query import LLMQueryPhase
     from fw_context_mcp.search.phases.refine import RefinePhase
-    from fw_context_mcp.search.phases.rerank import RerankPhase
     from fw_context_mcp.search.phases.rough_search import RoughSearchPhase
-    from fw_context_mcp.search.phases.rrf_fusion import RRFFusionPhase
     from fw_context_mcp.search.phases.translate import TranslatePhase
 
     for cls in [
@@ -41,9 +40,8 @@ def _build_registry() -> dict[str, Phase]:
         RefinePhase,
         FTS5SearchPhase,
         EmbeddingPhase,
+        AdaptiveFusionPhase,
         DeduplicatePhase,
-        RRFFusionPhase,
-        RerankPhase,
         ExpandContextPhase,
         FormatPhase,
     ]:
@@ -88,8 +86,7 @@ def _build_smart_search() -> PipelineConfig:
             "fts5_search",
             "refine",
             EmbeddingPhase(independent=True, threshold=0.5, overfetch=50),
-            "rrf_fusion",
-            "rerank",
+            "adaptive_fusion",
             "deduplicate",
             "expand_context",
             "format",

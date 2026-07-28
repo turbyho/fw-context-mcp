@@ -1,0 +1,380 @@
+{
+  "project": "zbox-ecb-fw",
+  "phase": "before_reindex",
+  "queries_count": 30,
+  "aggregate": {
+    "mrr": 0.4336507936507937,
+    "recall_at_5": 0.5666666666666667,
+    "recall_at_10": 0.6666666666666666,
+    "ndcg_at_10": 0.6244619707766412,
+    "precision_at_5": 0.335,
+    "precision_at_1": 0.3333333333333333
+  },
+  "per_query": [
+    {
+      "query": "lock",
+      "split": "sig",
+      "mrr": 1.0,
+      "recall_at_5": 1.0,
+      "recall_at_10": 1.0,
+      "ndcg_at_10": 3.4819530264434952,
+      "found": [
+        "lock"
+      ],
+      "missed": []
+    },
+    {
+      "query": "unlocks mutex associated sdblockdevice instance",
+      "split": "impl",
+      "mrr": 1.0,
+      "recall_at_5": 1.0,
+      "recall_at_10": 1.0,
+      "ndcg_at_10": 1.0,
+      "found": [
+        "unlock"
+      ],
+      "missed": []
+    },
+    {
+      "query": "initialise card",
+      "split": "sig",
+      "mrr": 0.3333333333333333,
+      "recall_at_5": 1.0,
+      "recall_at_10": 1.0,
+      "ndcg_at_10": 0.5,
+      "found": [
+        "_initialise_card"
+      ],
+      "missed": []
+    },
+    {
+      "query": "reads data ina260 sensor specified",
+      "split": "impl",
+      "mrr": 1.0,
+      "recall_at_5": 1.0,
+      "recall_at_10": 1.0,
+      "ndcg_at_10": 1.0,
+      "found": [
+        "rawRead"
+      ],
+      "missed": []
+    },
+    {
+      "query": "rtc set time",
+      "split": "sig",
+      "mrr": 0.0,
+      "recall_at_5": 0.0,
+      "recall_at_10": 0.0,
+      "ndcg_at_10": 0.0,
+      "found": [],
+      "missed": [
+        "rtc_set_time"
+      ]
+    },
+    {
+      "query": "provides access (generic access profile)",
+      "split": "impl",
+      "mrr": 0.0,
+      "recall_at_5": 0.0,
+      "recall_at_10": 0.0,
+      "ndcg_at_10": 0.0,
+      "found": [],
+      "missed": [
+        "getGapImpl"
+      ]
+    },
+    {
+      "query": "dir read",
+      "split": "sig",
+      "mrr": 0.125,
+      "recall_at_5": 0.0,
+      "recall_at_10": 1.0,
+      "ndcg_at_10": 0.31546487678572877,
+      "found": [
+        "dir_read"
+      ],
+      "missed": []
+    },
+    {
+      "query": "reformats file system specified block",
+      "split": "impl",
+      "mrr": 1.0,
+      "recall_at_5": 1.0,
+      "recall_at_10": 1.0,
+      "ndcg_at_10": 1.6309297535714575,
+      "found": [
+        "reformat"
+      ],
+      "missed": []
+    },
+    {
+      "query": "unmount",
+      "split": "sig",
+      "mrr": 0.3333333333333333,
+      "recall_at_5": 1.0,
+      "recall_at_10": 1.0,
+      "ndcg_at_10": 0.5,
+      "found": [
+        "unmount"
+      ],
+      "missed": []
+    },
+    {
+      "query": "adds element fifo buffer method",
+      "split": "impl",
+      "mrr": 1.0,
+      "recall_at_5": 1.0,
+      "recall_at_10": 1.0,
+      "ndcg_at_10": 1.0,
+      "found": [
+        "put"
+      ],
+      "missed": []
+    },
+    {
+      "query": "size",
+      "split": "sig",
+      "mrr": 0.2,
+      "recall_at_5": 1.0,
+      "recall_at_10": 1.0,
+      "ndcg_at_10": 0.38685280723454163,
+      "found": [
+        "size"
+      ],
+      "missed": []
+    },
+    {
+      "query": "configures name specific up-buffer segger",
+      "split": "impl",
+      "mrr": 0.0,
+      "recall_at_5": 0.0,
+      "recall_at_10": 0.0,
+      "ndcg_at_10": 0.0,
+      "found": [],
+      "missed": [
+        "SEGGER_RTT_SetNameUpBuffer"
+      ]
+    },
+    {
+      "query": "receive",
+      "split": "sig",
+      "mrr": 0.25,
+      "recall_at_5": 1.0,
+      "recall_at_10": 1.0,
+      "ndcg_at_10": 0.43067655807339306,
+      "found": [
+        "receive"
+      ],
+      "missed": []
+    },
+    {
+      "query": "aborts ongoing transaction serial object",
+      "split": "impl",
+      "mrr": 0.5,
+      "recall_at_5": 1.0,
+      "recall_at_10": 1.0,
+      "ndcg_at_10": 0.6309297535714575,
+      "found": [
+        "serial_tx_abort_asynch"
+      ],
+      "missed": []
+    },
+    {
+      "query": "getaverage",
+      "split": "sig",
+      "mrr": 1.0,
+      "recall_at_5": 1.0,
+      "recall_at_10": 1.0,
+      "ndcg_at_10": 1.3154648767857289,
+      "found": [
+        "getAverage"
+      ],
+      "missed": []
+    },
+    {
+      "query": "retrieves diff_en value lps22hb sensor's",
+      "split": "impl",
+      "mrr": 0.0,
+      "recall_at_5": 0.0,
+      "recall_at_10": 0.0,
+      "ndcg_at_10": 0.0,
+      "found": [],
+      "missed": [
+        "LPS22HB_Get_InterruptDifferentialGeneration"
+      ]
+    },
+    {
+      "query": "lsm6dsl acc gyro r",
+      "split": "sig",
+      "mrr": 0.0,
+      "recall_at_5": 0.0,
+      "recall_at_10": 0.0,
+      "ndcg_at_10": 0.0,
+      "found": [],
+      "missed": [
+        "LSM6DSL_ACC_GYRO_R_SIXD_THS"
+      ]
+    },
+    {
+      "query": "converts current temperature celsius fahrenheit",
+      "split": "impl",
+      "mrr": 0.5,
+      "recall_at_5": 1.0,
+      "recall_at_10": 1.0,
+      "ndcg_at_10": 0.6309297535714575,
+      "found": [
+        "get_fahrenheit"
+      ],
+      "missed": []
+    },
+    {
+      "query": "i2c write",
+      "split": "sig",
+      "mrr": 0.125,
+      "recall_at_5": 0.0,
+      "recall_at_10": 1.0,
+      "ndcg_at_10": 0.31546487678572877,
+      "found": [
+        "i2c_write"
+      ],
+      "missed": []
+    },
+    {
+      "query": "calculates addresses sizes storage areas",
+      "split": "impl",
+      "mrr": 1.0,
+      "recall_at_5": 1.0,
+      "recall_at_10": 1.0,
+      "ndcg_at_10": 1.0,
+      "found": [
+        "calc_area_params"
+      ],
+      "missed": []
+    },
+    {
+      "query": "zcbor get ble state",
+      "split": "sig",
+      "mrr": 1.0,
+      "recall_at_5": 1.0,
+      "recall_at_10": 1.0,
+      "ndcg_at_10": 1.0,
+      "found": [
+        "zcbor_get_ble_state_buffer"
+      ],
+      "missed": []
+    },
+    {
+      "query": "resets state cbor decoder telemetry",
+      "split": "impl",
+      "mrr": 1.0,
+      "recall_at_5": 1.0,
+      "recall_at_10": 1.0,
+      "ndcg_at_10": 1.0,
+      "found": [
+        "cbor_decode_telemetry_cons_clean"
+      ],
+      "missed": []
+    },
+    {
+      "query": "encode endpoint offrsrv prod",
+      "split": "sig",
+      "mrr": 0.14285714285714285,
+      "recall_at_5": 0.0,
+      "recall_at_10": 1.0,
+      "ndcg_at_10": 0.3333333333333333,
+      "found": [
+        "encode_endpoint_offrsrv_prod"
+      ],
+      "missed": []
+    },
+    {
+      "query": "compares binary strings byte byte",
+      "split": "impl",
+      "mrr": 1.0,
+      "recall_at_5": 1.0,
+      "recall_at_10": 1.0,
+      "ndcg_at_10": 1.6309297535714575,
+      "found": [
+        "zcbor_print_compare_strings"
+      ],
+      "missed": []
+    },
+    {
+      "query": "zcbor tstr encode ptr",
+      "split": "sig",
+      "mrr": 0.5,
+      "recall_at_5": 1.0,
+      "recall_at_10": 1.0,
+      "ndcg_at_10": 0.6309297535714575,
+      "found": [
+        "zcbor_tstr_encode_ptr"
+      ],
+      "missed": []
+    },
+    {
+      "query": "checks software watchdog timer (swdt)",
+      "split": "impl",
+      "mrr": 0.0,
+      "recall_at_5": 0.0,
+      "recall_at_10": 0.0,
+      "ndcg_at_10": 0.0,
+      "found": [],
+      "missed": [
+        "swdt_check"
+      ]
+    },
+    {
+      "query": "zcbor encode decode tstr map",
+      "split": "impl",
+      "mrr": 0.0,
+      "recall_at_5": 0.0,
+      "recall_at_10": 0.0,
+      "ndcg_at_10": 0.0,
+      "found": [],
+      "missed": [
+        "zcbor_list_start_encode",
+        "zcbor_map_start_encode",
+        "zcbor_tstr_encode"
+      ]
+    },
+    {
+      "query": "LSM6DSL read write register sensor",
+      "split": "sig",
+      "mrr": 0.0,
+      "recall_at_5": 0.0,
+      "recall_at_10": 0.0,
+      "ndcg_at_10": 0.0,
+      "found": [],
+      "missed": [
+        "LSM6DSL_ACC_GYRO_read_reg",
+        "LSM6DSL_ACC_GYRO_write_reg"
+      ]
+    },
+    {
+      "query": "inventory slot parcel locker",
+      "split": "sig",
+      "mrr": 0.0,
+      "recall_at_5": 0.0,
+      "recall_at_10": 0.0,
+      "ndcg_at_10": 0.0,
+      "found": [],
+      "missed": [
+        "InvSync",
+        "inv_open_slot"
+      ]
+    },
+    {
+      "query": "BLE command handler advertising connection",
+      "split": "sig",
+      "mrr": 0.0,
+      "recall_at_5": 0.0,
+      "recall_at_10": 0.0,
+      "ndcg_at_10": 0.0,
+      "found": [],
+      "missed": [
+        "ble_cmd_handler",
+        "ble_reconnect"
+      ]
+    }
+  ]
+}

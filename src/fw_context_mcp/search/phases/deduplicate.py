@@ -15,8 +15,9 @@ class DeduplicatePhase(Phase):
     """Merge FTS5 and embedding results, deduplicate by (name, file_path),
     prefer definitions, and sort by score.
 
-    Only runs when ``final_results`` is still empty — i.e. ``RRFFusionPhase``
-    did not produce output (e.g. no vec0 embeddings available).
+    Only runs when ``final_results`` is still empty — i.e.
+    ``AdaptiveFusionPhase`` did not produce output (e.g. no embeddings
+    available).
     """
 
     name = "deduplicate"  #: Phase identifier used in pipeline configuration.
@@ -24,7 +25,7 @@ class DeduplicatePhase(Phase):
     def should_run(self, ctx: PipelineContext) -> bool:
         """Run only when ``final_results`` is still empty.
 
-        In ``SMART_SEARCH``, ``RRFFusionPhase`` runs first and populates
+        In ``SMART_SEARCH``, ``AdaptiveFusionPhase`` runs first and populates
         ``final_results`` — deduplication is then redundant.  Only run
         when no earlier phase produced final results (e.g. embedding-only
         pipelines or fallback paths).

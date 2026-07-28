@@ -26,7 +26,7 @@ log = logging.getLogger(__name__)
 # serving a cached value we verify this hasn't changed, catching
 # external DB modifications by bg-reindex / manual fw-context index.
 _modified_cache: dict[str, tuple[float, int, float]] = {}
-_MTIME_CACHE_TTL: float = 30.0
+_CACHE_TTL_S: float = 30.0  # shared TTL for mtime cache and header staleness cache
 
 
 def _invalidate_modified_cache(config_hash: str | None = None) -> None:
@@ -92,7 +92,7 @@ def _count_modified_files(
     a relative path whose mtime is stale).
 
     When *use_cache* is True and a cached value is less than
-    ``_MTIME_CACHE_TTL`` seconds old AND the DB hasn't been modified
+    ``_CACHE_TTL_S`` seconds old AND the DB hasn't been modified
     externally (verified via ``MAX(mtime)`` from the files table),
     the cached value is returned.
     Call ``_invalidate_modified_cache(config_hash)`` after any write
@@ -102,7 +102,7 @@ def _count_modified_files(
         cached = _modified_cache.get(config_hash)
         if cached is not None:
             ts, count, max_stored = cached
-            if time.monotonic() - ts < _MTIME_CACHE_TTL:
+            if time.monotonic() - ts < _CACHE_TTL_S:
                 # Verify DB hasn't been modified externally (bg reindex,
                 # manual fw-context index from another process, etc.)
                 try:
@@ -224,7 +224,7 @@ def _check_header_staleness(
         cached = _header_staleness_cache.get(cache_key)
         if cached is not None:
             ts, count = cached
-            if time.monotonic() - ts < _MTIME_CACHE_TTL:
+            if time.monotonic() - ts < _CACHE_TTL_S:
                 return count, []
 
     from ...indexer.manifest import check_tu_staleness

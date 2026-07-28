@@ -105,7 +105,14 @@ def _sanitize_flags(cmd: list[str]) -> list[str]:
     ``-fmacro-prefix-map=``, and similar preprocessor-level flags.
     Strips object-file flags (``-o``, ``-c``), warning flags (``-W...``),
     and optimization/debug flags that have no effect on preprocessing.
+
+    Also strips dangerous flags that should never reach the compiler
+    from compile_commands.json (supply-chain defense-in-depth).
     """
+    _DANGEROUS = frozenset({
+        "-Xclang", "-plugin", "-cc1", "-emit-llvm", "-emit-ast",
+        "-fplugin=", "-fplugin-arg-",
+    })
     keep_with_value = (  # flags whose next arg is a value
         "-I", "-D", "-U", "-include", "-isystem", "-imacros",
         "-idirafter", "-iquote",
@@ -123,6 +130,8 @@ def _sanitize_flags(cmd: list[str]) -> list[str]:
         arg = cmd[i]
         if arg in drop_with_value:
             skip_next = True  # next arg is the value
+        elif arg in _DANGEROUS or any(arg.startswith(d) for d in _DANGEROUS if d.endswith("=")):
+            skip_next = arg in ("-Xclang",)  # -Xclang consumes next arg as sub-flag
         elif arg.startswith(keep_no_value) or arg.startswith("-std=") or arg.startswith("-fmacro-prefix-map="):
             stripped.append(arg)
         elif arg.startswith(keep_with_value):
