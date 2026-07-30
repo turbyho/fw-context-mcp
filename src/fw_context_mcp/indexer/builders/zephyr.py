@@ -60,8 +60,14 @@ class ZephyrBuildSystem:
         wrapper_dir = project_root / ".fw-context"
         wrapper_dir.mkdir(parents=True, exist_ok=True)
         ninja_wrapper = wrapper_dir / "ninja"
-        ninja_wrapper.write_text(f'#!/bin/sh\nexec {ninja} -d keepdepfile "$@"\n', encoding="utf-8")
-        ninja_wrapper.chmod(0o755)
+        expected = f'#!/bin/sh\nexec "{ninja}" -d keepdepfile "$@"\n'
+        # Atomic write via temp file + rename — prevents TOCTOU between
+        # check and write where another process could replace the wrapper.
+        if not ninja_wrapper.exists() or ninja_wrapper.read_text(encoding="utf-8") != expected:
+            tmp_wrapper = wrapper_dir / ".ninja.tmp"
+            tmp_wrapper.write_text(expected, encoding="utf-8")
+            tmp_wrapper.chmod(0o755)
+            tmp_wrapper.rename(ninja_wrapper)
 
         cmd: list[str] = [
             "west",
@@ -94,6 +100,8 @@ class ZephyrBuildSystem:
             "CCACHE_DEPEND": "1",
             "PATH": f"{wrapper_dir}{os.pathsep}{os.environ.get('PATH', '')}",
         }
+        # NOTE: no timeout= — build commands can run for minutes; adding a fixed
+        # timeout would break long builds.  Network-filesystem stalls remain a risk.
         result = subprocess.run(cmd, cwd=project_root, env=env)
 
         if result.returncode != 0:

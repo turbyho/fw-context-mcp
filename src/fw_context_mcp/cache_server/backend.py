@@ -11,13 +11,55 @@ Write behaviour is controlled by *can_overwrite*:
 from __future__ import annotations
 
 import logging
+import re
+import hashlib
+import secrets
 from typing import Any
 
 logger = logging.getLogger(__name__)
 
 
-class CacheBackend:
-    """Async PostgreSQL backend for the shared LLM analysis cache.
+def _redact_url(url: str) -> str:
+    """Replace password in a PostgreSQL URL with '****' for logging."""
+    return re.sub(r'://([^:]+):([^@]+)@', r'://\1:****@', url)
+
+
+
+class CacheStorageBackend:
+    """Abstract interface for the LLM analysis cache storage.
+
+    Implementations must provide async connection management and
+    batch read/write operations.  The default implementation is
+    ``CacheBackend`` which uses PostgreSQL via ``asyncpg``.
+
+    To swap the storage backend (e.g. SQLite, Redis), implement
+    this interface and pass your instance to ``create_app(backend=...)``.
+    """
+
+    async def connect(self) -> None:
+        raise NotImplementedError
+
+    async def close(self) -> None:
+        raise NotImplementedError
+
+    async def init_schema(self) -> None:
+        raise NotImplementedError
+
+    async def batch_get(self, hashes: list[str]) -> dict:
+        raise NotImplementedError
+
+    async def batch_put(self, entries: list, *, can_overwrite: bool = False) -> int:
+        raise NotImplementedError
+
+    async def cache_stats(self) -> dict:
+        raise NotImplementedError
+
+    async def cache_clear_by_hashes(self, hashes: list[str]) -> int:
+        raise NotImplementedError
+
+
+class CacheBackend(CacheStorageBackend):
+    """Async PostgreSQL backend implementing the CacheStorageBackend interface.
 
     Manages two connection pools — one for ``fw_cache_meta`` and one for
     ``fw_cache`` — derived from a single *base_url* by appending the
@@ -71,13 +113,20 @@ class CacheBackend:
         import asyncpg
 
         self._meta_pool = await asyncpg.create_pool(
-            self.meta_url, min_size=self._min_size, max_size=self._max_size
+            self.meta_url, min_size=self._min_size, max_size=self._max_size,
+            command_timeout=30,
         )
         self._cache_pool = await asyncpg.create_pool(
-            self.cache_url, min_size=self._min_size, max_size=self._max_size
+            self.cache_url, min_size=self._min_size, max_size=self._max_size,
+            command_timeout=30,
         )
+        # Validate connections — create_pool is lazy, this catches bad credentials early
+        async with self._meta_pool.acquire() as conn:
+            await conn.fetchval("SELECT 1")
+        async with self._cache_pool.acquire() as conn:
+            await conn.fetchval("SELECT 1")
         self._connected = True
-        logger.info("CacheBackend connected — meta=%s cache=%s", self.meta_url, self.cache_url)
+        logger.info("CacheBackend connected — meta=%s cache=%s", _redact_url(self.meta_url), _redact_url(self.cache_url))
 
     async def close(self) -> None:
         """Close both pools (call at shutdown)."""
@@ -117,12 +166,29 @@ class CacheBackend:
                 """
             )
             await meta.execute("CREATE INDEX IF NOT EXISTS idx_tokens_project ON tokens(project_id)")
-            # Ensure project_id is nullable (admin tokens use NULL)
-            await meta.execute("ALTER TABLE tokens ALTER COLUMN project_id DROP NOT NULL")
-        finally:
+            # Ensure project_id is nullable (admin tokens use NULL).
+            # Check information_schema first — skip ALTER when already nullable
+            # to avoid an ACCESS EXCLUSIVE lock on every startup.
+            is_nullable = await meta.fetchval(
+                "SELECT is_nullable FROM information_schema.columns "
+                "WHERE table_name='tokens' AND column_name='project_id'"
+            )
+            if is_nullable and is_nullable.upper() != "YES":
+                await meta.execute("ALTER TABLE tokens ALTER COLUMN project_id DROP NOT NULL")
             await self._meta_pool.release(meta)
 
+        # ── llm_analysis_cache ──────────────────────────────────────────
+        # DESIGN NOTE: This table intentionally has NO project_id scoping.
+        # Analyses are keyed by content_hash (SHA-256 of symbol body +
+        # qualified_name + signature + docstring) and SHARED across all
+        # projects.  Two projects indexing the same SDK symbol (same hash)
+        # will share the same cached analysis — no duplicate LLM work.
+        #
+        # Token-scoped project_id exists in the meta.tokens table for
+        # auth/permission control only.  Cache reads/writes are global —
+        # "first write wins" per content_hash across all projects.
         cache = await self._cache_pool.acquire()
+
         try:
             await cache.execute(
                 """
@@ -148,7 +214,6 @@ class CacheBackend:
         ``can_write``, ``can_overwrite``, or ``None`` if the token is
         not found / revoked.
         """
-        import hashlib
 
         token_hash = hashlib.sha256(token.encode()).digest()
         async with self._meta_pool.acquire() as conn:
@@ -206,11 +271,12 @@ class CacheBackend:
         When *can_overwrite* is ``True``, uses ``INSERT ON CONFLICT DO
         UPDATE`` — overwrites existing entries with newer analysis.
 
-        Returns the number of rows inserted or updated.
+        Returns the actual number of rows newly inserted or updated.
         """
         if not entries:
             return 0
 
+        stmt: str
         if can_overwrite:
             stmt = (
                 "INSERT INTO llm_analysis_cache (content_hash, summary, inputs, outputs, model) "
@@ -218,30 +284,27 @@ class CacheBackend:
                 "ON CONFLICT (content_hash) DO UPDATE SET "
                 "summary = EXCLUDED.summary, inputs = EXCLUDED.inputs, "
                 "outputs = EXCLUDED.outputs, model = EXCLUDED.model, "
-                "analyzed_at = now()"
+                "analyzed_at = now() "
+                "RETURNING content_hash"
             )
         else:
             stmt = (
                 "INSERT INTO llm_analysis_cache (content_hash, summary, inputs, outputs, model) "
                 "VALUES ($1, $2, $3, $4, $5) "
-                "ON CONFLICT (content_hash) DO NOTHING"
+                "ON CONFLICT (content_hash) DO NOTHING "
+                "RETURNING content_hash"
             )
 
         inserted = 0
         async with self._cache_pool.acquire() as conn:
             for entry in entries:
-                result = await conn.execute(
+                result = await conn.fetchrow(
                     stmt,
-                    entry["hash"],
-                    entry["summary"],
-                    entry["inputs"],
-                    entry["outputs"],
-                    entry["model"],
+                    entry["hash"], entry["summary"], entry["inputs"],
+                    entry["outputs"], entry["model"],
                 )
-                # Parse the command tag — "INSERT 0 1" or "INSERT 0 0"
-                tag = result.split()
-                if len(tag) >= 3:
-                    inserted += int(tag[2])
+                if result is not None:
+                    inserted += 1
 
         return inserted
 
@@ -249,26 +312,27 @@ class CacheBackend:
 
     async def create_project(self, project_id: str, description: str = "") -> str | None:
         """Create a project and return a generated write token, or ``None`` if exists."""
-        import secrets
 
         token = secrets.token_hex(32)
-        import hashlib
-
         token_hash = hashlib.sha256(token.encode()).digest()
 
         async with self._meta_pool.acquire() as conn:
             try:
-                await conn.execute(
-                    "INSERT INTO projects (id, description) VALUES ($1, $2)",
-                    project_id, description,
-                )
-            except Exception:
-                return None  # already exists
-            await conn.execute(
-                "INSERT INTO tokens (token_hash, project_id, can_read, can_write, can_overwrite) "
-                "VALUES ($1, $2, true, true, true)",
-                token_hash, project_id,
-            )
+                async with conn.transaction():
+                    await conn.execute(
+                        "INSERT INTO projects (id, description) VALUES ($1, $2)",
+                        project_id, description,
+                    )
+                    await conn.execute(
+                        "INSERT INTO tokens (token_hash, project_id, can_read, can_write, can_overwrite) "
+                        "VALUES ($1, $2, true, true, true)",
+                        token_hash, project_id,
+                    )
+            except Exception as e:
+                # Only mask duplicate key violations — let other errors propagate
+                if hasattr(e, "sqlstate") and getattr(e, "sqlstate", None) == "23505":
+                    return None  # project already exists
+                raise
         return token
 
     async def create_token(
@@ -281,34 +345,35 @@ class CacheBackend:
         description: str = "",
     ) -> str:
         """Create a token for a project.  Returns the plain-text token."""
-        import secrets
 
         token = secrets.token_hex(32)
-        import hashlib
 
         token_hash = hashlib.sha256(token.encode()).digest()
 
         async with self._meta_pool.acquire() as conn:
-            await conn.execute(
-                "INSERT INTO tokens (token_hash, project_id, can_read, can_write, can_overwrite, description) "
-                "VALUES ($1, $2, $3, $4, $5, $6)",
-                token_hash, project_id, can_read, can_write, can_overwrite, description,
-            )
+            try:
+                await conn.execute(
+                    "INSERT INTO tokens (token_hash, project_id, can_read, can_write, can_overwrite, description) "
+                    "VALUES ($1, $2, $3, $4, $5, $6)",
+                    token_hash, project_id, can_read, can_write, can_overwrite, description,
+                )
+            except Exception as e:
+                if hasattr(e, "sqlstate") and getattr(e, "sqlstate", None) == "23503":
+                    raise ValueError(f"Project '{project_id}' does not exist") from e
+                raise
         return token
 
     async def revoke_token(self, token: str) -> bool:
         """Revoke a token by its plain-text value.  Returns True if found."""
-        import hashlib
 
         token_hash = hashlib.sha256(token.encode()).digest()
         async with self._meta_pool.acquire() as conn:
-            result = await conn.execute(
-                "UPDATE tokens SET revoked_at = now() WHERE token_hash = $1 AND revoked_at IS NULL",
+            row = await conn.fetchrow(
+                "UPDATE tokens SET revoked_at = now() WHERE token_hash = $1 AND revoked_at IS NULL "
+                "RETURNING 1",
                 token_hash,
             )
-            # UPDATE returns "UPDATE N" (2 elements, unlike INSERT's 3)
-            tag = result.split()
-            return len(tag) >= 2 and int(tag[1]) > 0
+            return row is not None
 
     async def list_projects(self) -> list[dict[str, Any]]:
         """List all projects."""
@@ -371,7 +436,7 @@ class CacheBackend:
         """Delete cache entries older than *days*.  Returns rows deleted."""
         async with self._cache_pool.acquire() as conn:
             result = await conn.execute(
-                "DELETE FROM llm_analysis_cache WHERE analyzed_at < now() - make_interval(days => $1)",
+                "DELETE FROM llm_analysis_cache WHERE analyzed_at < now() - interval '1 day' * $1",
                 days,
             )
             # DELETE returns "DELETE N" (2 elements)
@@ -384,8 +449,6 @@ class CacheBackend:
         Used once during ``fw-cache-server init`` to bootstrap the first
         admin token.  Returns the plain-text token.
         """
-        import hashlib
-        import secrets
 
         token = secrets.token_hex(32)
         token_hash = hashlib.sha256(token.encode()).digest()

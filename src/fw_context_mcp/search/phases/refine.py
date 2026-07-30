@@ -7,6 +7,7 @@ import re
 from typing import TYPE_CHECKING
 
 from fw_context_mcp.search.phases.base import Phase
+from fw_context_mcp.search._llm_parse import parse_llm_search_terms as _parse_search_terms
 
 if TYPE_CHECKING:
     from fw_context_mcp.search.context import PipelineContext
@@ -28,7 +29,8 @@ class RefinePhase(Phase):
     def should_run(self, ctx) -> bool:
         """Only run when LLM is enabled, we have generated queries, and no Ollama warning."""
         return (
-            ctx.config.llm.enabled
+            ctx.config.llm is not None
+            and ctx.config.llm.enabled
             and bool(ctx.generated_queries)
             and ctx.ollama_warning is None
         )
@@ -88,28 +90,3 @@ class RefinePhase(Phase):
         return ctx
 
 
-def _parse_search_terms(raw: str) -> list[str]:
-    """Parse LLM response into FTS5 keyword search terms.
-
-    Tries JSON array first, falls back to line-by-line regex.
-    """
-    terms: list[str] = []
-    try:
-        start = raw.index("[")
-        end = raw.rindex("]") + 1
-        parsed = json.loads(raw[start:end])
-        if isinstance(parsed, list):
-            for item in parsed:
-                if isinstance(item, str) and item.strip():
-                    terms.append(item.strip())
-    except (ValueError, json.JSONDecodeError):
-        pass
-    if not terms:
-        for line in raw.splitlines():
-            line = re.sub(r"\s*\(.*\)\s*$", "", line)
-            cleaned = re.sub(r"^[\s\d\.\-\*]+", "", line).strip().strip("`'\"*")
-            if cleaned and not cleaned.startswith("#"):
-                terms.append(cleaned)
-    _BOGUS = frozenset({"json", "[]"})
-    return [t.replace("_", " ").strip() for t in terms
-            if t and t.lower() not in _BOGUS]

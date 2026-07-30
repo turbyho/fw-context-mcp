@@ -46,7 +46,8 @@ class LLMQueryPhase(Phase):
         cache_key = (ctx.query, ctx.config_hash)
         cached = keyword_cache.get(cache_key)
         if cached is not None:
-            return ctx.evolve(generated_queries=list(cached), llm_understanding="")
+            queries, understanding = cached
+            return ctx.evolve(generated_queries=list(queries), llm_understanding=understanding)
 
         query = ctx.query
         rough_samples = ctx.rough_samples
@@ -109,14 +110,15 @@ class LLMQueryPhase(Phase):
             raw = await call_ollama_async(prompt, ctx.config.llm)
             understanding, queries = _parse_understanding_response(raw)
             all_queries = queries[:5] if queries else ctx.rough_queries
+            is_fallback = not queries  # don't cache LLM failures — retry next time
         except (OllamaModelNotFoundError, OllamaError) as e:
-            keyword_cache.set(cache_key, ctx.rough_queries)
             return ctx.evolve(
                 generated_queries=list(ctx.rough_queries),
                 ollama_warning={"warning": str(e)},
             )
 
-        keyword_cache.set(cache_key, all_queries)
+        if not is_fallback:
+            keyword_cache.set(cache_key, all_queries, understanding)
         return ctx.evolve(
             generated_queries=list(all_queries),
             llm_understanding=understanding,

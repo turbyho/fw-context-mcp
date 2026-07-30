@@ -10,11 +10,11 @@ from __future__ import annotations
 import logging
 import sqlite3
 import time
+from collections import OrderedDict
 from pathlib import Path
 
 from fw_context_mcp.indexer.config_hash import compute_tu_content_hash
 from fw_context_mcp.indexer.db import (
-    _ensure_column,
     delete_fp_assignments_for_file,
     delete_indirect_call_sites_for_file,
     delete_inheritance_for_file,
@@ -34,6 +34,25 @@ from fw_context_mcp.indexer.db import (
 from fw_context_mcp.utils import compute_content_hash, compute_source_hash, read_file_lines
 
 log = logging.getLogger(__name__)
+
+# TODO: Each header is opened/read/closed individually — 500+ headers = 500+
+# open/read/close cycles per TU.  Consider batch I/O for read_file_lines.
+_body_cache: OrderedDict[str, list[str] | None] = OrderedDict()
+_BODY_CACHE_MAX_ENTRIES = 200
+
+
+def _cached_read_lines(abs_path: str) -> list[str] | None:
+    if abs_path not in _body_cache:
+        if len(_body_cache) >= _BODY_CACHE_MAX_ENTRIES:
+            _body_cache.popitem(last=False)
+        _body_cache[abs_path] = read_file_lines(abs_path)
+    else:
+        _body_cache.move_to_end(abs_path)
+    return _body_cache[abs_path]
+
+
+def _clear_body_cache() -> None:
+    _body_cache.clear()
 
 
 def _read_body(lines: list[str], start_line: int, end_line: int) -> str:
@@ -80,7 +99,7 @@ def _normalize_file_path(file_path: str, project_root: Path) -> str:
 
 
 def _build_filtered_file_content(
-    conn, unit, config_hash: str, project_root: Path, *, build_dir_patterns: list[str] | None = None
+    conn, unit, config_hash: str, project_root: Path, *, build_dir_patterns: list[str] | None = None, existing_tu=None
 ) -> tuple[int, list[dict]]:
     """Tokenize TU, extract active lines per file, store ifdef-filtered content.
 
@@ -111,7 +130,10 @@ def _build_filtered_file_content(
     _t0 = _time.monotonic()
 
     # ── Fast-path: skip tokenization + AST walk when all files already have content ──
-    _ensure_column(conn, "files", "content", "TEXT NOT NULL DEFAULT ''")
+    # The files.content column is guaranteed to exist — it was added by
+    # _MIGRATION_ADD_COLUMNS during open_db().  We avoid _ensure_column()
+    # here because it's DDL that auto-commits in SQLite, which breaks
+    # any transaction the caller may be holding.
     remaining = conn.execute(
         "SELECT COUNT(*) FROM files WHERE config_hash=? AND content=''",
         (config_hash,),
@@ -121,15 +143,18 @@ def _build_filtered_file_content(
 
     from fw_context_mcp.indexer.symbols import _get_index
 
-    try:
-        tu = _get_index().parse(
-            str(unit.file),
-            args=unit.clang_args,
-            options=cx.TranslationUnit.PARSE_DETAILED_PROCESSING_RECORD,
-        )
-    except Exception:
-        log.debug("_build_filtered_file_content: parse failed for %s", unit.file.name)
-        return 0, []
+    if existing_tu is not None:
+        tu = existing_tu  # reuse TU from extract_all — avoid double parse
+    else:
+        try:
+            tu = _get_index().parse(
+                str(unit.file),
+                args=unit.clang_args,
+                options=cx.TranslationUnit.PARSE_DETAILED_PROCESSING_RECORD,
+            )
+        except Exception:
+            log.debug("_build_filtered_file_content: parse failed for %s", unit.file.name)
+            return 0, []
 
     from fw_context_mcp.indexer.manifest import HEADER_EXTS as _HEADER_EXTS
     from fw_context_mcp.indexer.manifest import _is_generated_header
@@ -176,16 +201,19 @@ def _build_filtered_file_content(
             active.setdefault(fname, set()).add(loc.line)
 
     # ── Collect active lines from all header files in a single AST traversal ──
-    def _collect_all_active_lines(cursor) -> None:
-        """Walk the AST once and add extent line ranges keyed by source file."""
-        if cursor.location.file:
-            fname = str(cursor.location.file.name)
-            extent = cursor.extent
-            if extent.start.file and extent.end.file:
-                for line in range(extent.start.line, extent.end.line + 1):
-                    active.setdefault(fname, set()).add(line)
-        for child in cursor.get_children():
-            _collect_all_active_lines(child)
+    def _collect_all_active_lines(root_cursor) -> None:
+        """Walk the AST iteratively and add extent line ranges keyed by source file."""
+        stack: list[object] = [root_cursor]
+        while stack:
+            cursor = stack.pop()
+            if cursor.location.file:
+                fname = str(cursor.location.file.name)
+                extent = cursor.extent
+                if extent.start.file and extent.end.file:
+                    for line in range(extent.start.line, extent.end.line + 1):
+                        active.setdefault(fname, set()).add(line)
+            for child in cursor.get_children():
+                stack.append(child)
 
     _collect_all_active_lines(tu.cursor)
 
@@ -239,6 +267,227 @@ def _build_filtered_file_content(
     if filled:
         log.info("content fill: %d files from TU %s in %.1fs", filled, unit.file.name, _time.monotonic() - _t0)
     return filled, headers
+
+
+def _store_symbol_rows(
+    conn: sqlite3.Connection,
+    config_hash: str,
+    syms: list,
+    file_id_cache: dict[str, int],
+    project_root: Path,
+    vendor_patterns: list[str],
+    project_patterns: list[str],
+) -> tuple[int, dict[int, int]]:
+    """Build symbol rows for every symbol in *syms*, insert them in a batch,
+    and return ``(syms_added, file_proj)``.
+
+    *file_proj* maps ``file_id → max(is_project)`` so the caller can update
+    ``files.is_project`` across all files touched by this TU.
+    """
+    from .sdk_detect import _path_matches
+
+    rows = []
+    file_proj: dict[int, int] = {}
+    for s in syms:
+        sym_file = s.file
+        normalized_sym_file = _normalize_file_path(sym_file, project_root)
+        if normalized_sym_file not in file_id_cache:
+            lang = "cpp" if Path(sym_file).suffix.lower() in {".cpp", ".cc", ".cxx", ".c++"} else "c"
+            try:
+                sym_mtime = Path(sym_file).stat().st_mtime
+            except OSError:
+                sym_mtime = 0.0
+            file_id_cache[normalized_sym_file] = upsert_file(
+                conn, config_hash, normalized_sym_file, lang, mtime=sym_mtime,
+            )
+        rel_path = normalized_sym_file
+        try:
+            resolved_sym = Path(sym_file).resolve()
+            rel = str(resolved_sym.relative_to(project_root))
+            if any(_path_matches(rel, p) for p in project_patterns):
+                is_proj = 1
+            elif any(_path_matches(rel, p) for p in vendor_patterns):
+                is_proj = 0
+            else:
+                is_proj = 1
+        except ValueError:
+            abs_path = str(resolved_sym)
+            if any(_path_matches(abs_path, p) for p in project_patterns):
+                is_proj = 1
+            else:
+                is_proj = 0
+        body = ""
+        if s.is_definition and s.end_line > s.line:
+            file_lines = _cached_read_lines(s.file)
+            if file_lines is not None:
+                body = _read_body(file_lines, s.line, s.end_line)
+        fid = file_id_cache[normalized_sym_file]
+        file_proj[fid] = max(file_proj.get(fid, 0), is_proj)
+        rows.append(
+            (
+                config_hash,
+                file_id_cache[normalized_sym_file],
+                rel_path,
+                split_tokens(s.name, s.qualified_name),
+                s.usr,
+                s.name,
+                s.qualified_name,
+                s.kind,
+                s.line,
+                s.column,
+                s.end_line,
+                int(s.is_definition),
+                s.signature,
+                s.docstring,
+                s.enum_value,
+                int(s.is_virtual),
+                int(s.is_pure_virtual),
+                s.parent_usr,
+                int(s.is_template),
+                s.template_usr,
+                is_proj,
+                0.0,
+                body,
+            )
+        )
+    if rows:
+        insert_symbols_batch(conn, rows)
+    return len(rows), file_proj
+
+
+def _restore_llm_analysis(
+    conn: sqlite3.Connection,
+    config_hash: str,
+    syms: list,
+    saved_analyses: dict[str, dict],
+) -> None:
+    """Restore LLM analysis for symbols whose body didn't change.
+
+    Uses per-build saved analysis (exact USR match) as the primary source,
+    then falls back to the global local cache.
+    """
+    from fw_context_mcp.cache_client import get_local_cache_db, local_cache_lookup
+
+    local_db = get_local_cache_db(readonly=True)
+    restored = 0
+    try:
+        for s in syms:
+            lines = _cached_read_lines(s.file)
+            if lines is None:
+                continue
+            body = _read_body(lines, s.line, s.end_line)
+            new_ch = compute_content_hash(body, s.qualified_name, s.signature, s.docstring)
+
+            cached: dict | None = None
+            saved = saved_analyses.get(s.usr)
+            if saved is not None and (saved.get("content_hash") == new_ch or not saved.get("content_hash")):
+                cached = saved
+            else:
+                cached = local_cache_lookup(local_db, [new_ch]).get(new_ch)
+
+            if not cached:
+                continue
+            new_id = conn.execute(
+                "SELECT id FROM symbols WHERE config_hash = ? AND usr = ?",
+                (config_hash, s.usr),
+            ).fetchone()
+            if not new_id:
+                continue
+            upsert_llm_analysis_batch(
+                conn,
+                [
+                    (
+                        new_id[0],
+                        cached["summary"],
+                        cached["inputs"],
+                        cached["outputs"],
+                        cached["model"],
+                        new_ch,
+                    )
+                ],
+            )
+            restored += 1
+        if restored:
+            log.debug("Restored LLM analysis for %d symbols from cache", restored)
+    finally:
+        local_db.close()
+
+
+def _detect_moved_symbols(
+    conn: sqlite3.Connection,
+    config_hash: str,
+    syms: list,
+    old_usrs: set[str],
+    file_id_cache: dict[str, int],
+    project_root: Path,
+) -> None:
+    """Detect symbols that moved between files without content changes.
+
+    When a symbol has the same USR, same content hash, but a different file_id
+    compared to the previous index, update its file_id in place and delete
+    the duplicate row created by the current batch insert.
+    """
+    moved = 0
+    for s in syms:
+        if s.usr in old_usrs:
+            continue
+        normalized_sym_file = _normalize_file_path(s.file, project_root)
+        old_row = conn.execute(
+            """SELECT s.id, s.file_id, s.qualified_name, s.signature, s.line, s.end_line,
+                      s.docstring, f.path as abs_path,
+                      a.summary, a.inputs, a.outputs, a.model, a.analyzed_at
+               FROM symbols s
+               LEFT JOIN llm_analysis a ON a.symbol_id = s.id
+               JOIN files f ON f.id = s.file_id
+               WHERE s.usr = ? AND s.config_hash = ?""",
+            (s.usr, config_hash),
+        ).fetchone()
+        if old_row is None:
+            continue
+        if old_row["summary"] is None:
+            continue
+        if old_row["file_id"] == file_id_cache[normalized_sym_file]:
+            continue
+
+        lines = _cached_read_lines(s.file)
+        if lines is None:
+            continue
+        old_lines = _cached_read_lines(old_row["abs_path"])
+        if old_lines is None:
+            continue
+        old_ch = _compute_content_hash(
+            old_lines,
+            old_row["line"],
+            old_row["end_line"],
+            old_row["signature"],
+            old_row["qualified_name"],
+            old_row["docstring"],
+        )
+        new_ch = _compute_content_hash(
+            lines, s.line, s.end_line, s.signature, s.qualified_name, s.docstring,
+        )
+        if old_ch != new_ch:
+            continue
+
+        try:
+            new_rel = str(Path(s.file).resolve().relative_to(project_root))
+        except ValueError:
+            new_rel = s.file
+        conn.execute(
+            """UPDATE symbols SET file_id = ?, file_path = ?,
+               line = ?, col = ?, end_line = ?
+               WHERE id = ?""",
+            (file_id_cache[normalized_sym_file], new_rel, s.line, s.column, s.end_line, old_row["id"]),
+        )
+        dup_id = conn.execute(
+            "SELECT id FROM symbols WHERE config_hash = ? AND usr = ? AND id != ?",
+            (config_hash, s.usr, old_row["id"]),
+        ).fetchone()
+        if dup_id:
+            conn.execute("DELETE FROM symbols WHERE id = ?", (dup_id[0],))
+        moved += 1
+    if moved:
+        log.debug("Detected %d moved symbols", moved)
 
 
 def store_symbols_for_unit(
@@ -302,6 +551,7 @@ def store_symbols_for_unit(
         current_mtime = 0.0
 
     # Parse (or use caller-supplied pre-parsed data)
+    tu = None
     if pre_parsed is not None:
         if len(pre_parsed) == 6:
             syms, refs, inheritance, indirect_call_sites, fp_assignments, macros = pre_parsed
@@ -310,10 +560,13 @@ def store_symbols_for_unit(
             macros = []
     else:
         try:
-            syms, refs, inheritance, indirect_call_sites, fp_assignments, macros = extract_all(
+            result = extract_all(
                 unit,
                 with_refs=index_refs,
+                return_tu=True,
             )
+            tu = result[0]
+            syms, refs, inheritance, indirect_call_sites, fp_assignments, macros = result[1:]
         except sqlite3.Error:
             log.error("Fatal DB error parsing %s — stopping indexer", unit.file.name)
             raise
@@ -335,24 +588,12 @@ def store_symbols_for_unit(
     else:
         known = get_file_mtimes(conn, config_hash)
 
-    # ── File-content cache for body hashing ──
-    # Each source file is read at most once per TU; all symbols from
-    # the same file share the cached lines.
-    _body_cache: dict[str, list[str] | None] = {}
-
-    def _cached_lines(abs_path: str) -> list[str] | None:
-        if abs_path not in _body_cache:
-            _body_cache[abs_path] = read_file_lines(abs_path)
-        return _body_cache[abs_path]
+    # ── Clear body cache per TU — fresh reads for each translation unit ──
+    _clear_body_cache()
 
     # ── Phase 1: Save USRs + analysis of old symbols ──
-    # Phase 3 restores per-build LLM analysis for symbols whose body
-    # didn't change; Phase 4 detects file-moves.  ON DELETE CASCADE
-    # removes llm_analysis when old symbols are deleted, so we save
-    # it beforehand and restore it by USR match (preferred over the
-    # global cache which may contain stale entries from other projects).
     old_usrs: set[str] = set()
-    saved_analyses: dict[str, dict] = {}  # usr → {summary, inputs, output, model, content_hash}
+    saved_analyses: dict[str, dict] = {}
     if normalized_tu_path in known:
         file_id_old = known[normalized_tu_path][0]
         old_rows = conn.execute(
@@ -374,14 +615,6 @@ def store_symbols_for_unit(
                 }
 
     # ── Phase 2: Delete old symbols ──
-    # Delete inheritance edges in two layers:
-    # 1. By current USR — covers classes defined in HEADERS included by this TU.
-    #    When a header class changes its base, the old edge must go even though
-    #    the header's file_id differs from the TU file.
-    # 2. By TU file_id — safety net for classes REMOVED from the TU file.
-    #    A wiped class is absent from the new syms so its USR won't appear in
-    #    layer 1, but the old edge still references it.  The file_id-based
-    #    delete catches these stragglers.
     _class_kinds = frozenset({"class", "struct"})
     _class_usrs = {s.usr for s in syms if s.kind in _class_kinds}
     if _class_usrs:
@@ -394,257 +627,35 @@ def store_symbols_for_unit(
         file_id_old = known[normalized_tu_path][0]
         delete_inheritance_for_file(conn, config_hash, file_id_old)
         delete_symbols_for_file(conn, file_id_old)
-        # ON DELETE CASCADE → llm_analysis, embeddings removed
 
-    # Upsert the TU file record and capture its id — symbols defined in the
-    # TU itself reuse this id instead of calling upsert_file again.
+    # Upsert the TU file record and capture its id
     if hashes is not None:
         source_hash, flags_hash, manifest_entry_hash = hashes
         content_hash_val = compute_tu_content_hash(source_hash, flags_hash, manifest_entry_hash)
         tu_file_id = upsert_file(
-            conn,
-            config_hash,
-            normalized_tu_path,
-            unit.language,
-            mtime=current_mtime,
-            content_hash=content_hash_val,
-            source_hash=source_hash,
-            flags_hash=flags_hash,
+            conn, config_hash, normalized_tu_path, unit.language,
+            mtime=current_mtime, content_hash=content_hash_val,
+            source_hash=source_hash, flags_hash=flags_hash,
         )
     else:
         tu_file_id = upsert_file(conn, config_hash, normalized_tu_path, unit.language, mtime=current_mtime)
 
     syms_added = 0
     refs_added = 0
-    file_id_cache: dict[str, int] = {}
-    # Pre-populate the cache with the TU file itself so we don't re-upsert
-    # it below.
-    file_id_cache[normalized_tu_path] = tu_file_id
+    file_id_cache: dict[str, int] = {normalized_tu_path: tu_file_id}
 
     if syms:
-        from .sdk_detect import _path_matches
-
-        rows = []
-        file_proj: dict[int, int] = {}  # file_id → max(is_project) for files.is_project update
-        for s in syms:
-            sym_file = s.file
-            normalized_sym_file = _normalize_file_path(sym_file, project_root)
-            if normalized_sym_file not in file_id_cache:
-                lang = "cpp" if Path(sym_file).suffix.lower() in {".cpp", ".cc", ".cxx", ".c++"} else "c"
-                try:
-                    sym_mtime = Path(sym_file).stat().st_mtime
-                except OSError:
-                    sym_mtime = 0.0
-                file_id_cache[normalized_sym_file] = upsert_file(
-                    conn,
-                    config_hash,
-                    normalized_sym_file,
-                    lang,
-                    mtime=sym_mtime,
-                )
-            rel_path = normalized_sym_file
-            # Determine is_project — priority (first wins):
-            #   1. project_patterns → 1 (even for paths outside project root)
-            #   2. outside project_root → 0
-            #   3. vendor_patterns → 0
-            #   4. otherwise → 1
-            try:
-                resolved_sym = Path(sym_file).resolve()
-                rel = str(resolved_sym.relative_to(project_root))
-                if any(_path_matches(rel, p) for p in project_patterns):
-                    is_proj = 1
-                elif any(_path_matches(rel, p) for p in vendor_patterns):
-                    is_proj = 0
-                else:
-                    is_proj = 1
-            except ValueError:
-                # Outside project root — always vendor, unless project_paths
-                # explicitly marks the path as project.
-                abs_path = str(resolved_sym)
-                if any(_path_matches(abs_path, p) for p in project_patterns):
-                    is_proj = 1
-                else:
-                    is_proj = 0
-            # Read source body for definitions (for FTS5 search_bodies).
-            body = ""
-            if s.is_definition and s.end_line > s.line:
-                file_lines = _cached_lines(s.file)
-                if file_lines is not None:
-                    body = _read_body(file_lines, s.line, s.end_line)
-            # Aggregate files.is_project: use max so shared headers with both
-            # project and vendor symbols get is_project=1 (correct).
-            fid = file_id_cache[normalized_sym_file]
-            file_proj[fid] = max(file_proj.get(fid, 0), is_proj)
-            rows.append(
-                (
-                    config_hash,
-                    file_id_cache[normalized_sym_file],
-                    rel_path,
-                    split_tokens(s.name, s.qualified_name),
-                    s.usr,
-                    s.name,
-                    s.qualified_name,
-                    s.kind,
-                    s.line,
-                    s.column,
-                    s.end_line,
-                    int(s.is_definition),
-                    s.signature,
-                    s.docstring,
-                    s.enum_value,
-                    int(s.is_virtual),
-                    int(s.is_pure_virtual),
-                    s.parent_usr,
-                    int(s.is_template),
-                    s.template_usr,
-                    is_proj,
-                    0.0,  # pagerank (computed later by _build_pagerank)
-                    body,
-                )
-            )
-        insert_symbols_batch(conn, rows)
-        syms_added = len(rows)
-
-        # Update files.is_project with max(is_project) per file.
-        # Guard with AND is_project < ? so later TUs can only raise (0→1), never lower.
+        syms_added, file_proj = _store_symbol_rows(
+            conn, config_hash, syms, file_id_cache, project_root,
+            vendor_patterns, project_patterns,
+        )
         for fid, ip in file_proj.items():
             conn.execute(
                 "UPDATE files SET is_project = ? WHERE id = ? AND is_project < ?",
                 (ip, fid, ip),
             )
-
-        # ── Phase 3: Restore LLM analysis — per-build first, then global cache ──
-        restored = 0
-        if syms:
-            from fw_context_mcp.cache_client import get_local_cache_db, local_cache_lookup
-
-            local_db = get_local_cache_db(readonly=True)
-            for s in syms:
-                lines = _cached_lines(s.file)
-                if lines is None:
-                    continue
-                body = _read_body(lines, s.line, s.end_line)
-                new_ch = compute_content_hash(body, s.qualified_name, s.signature, s.docstring)
-
-                cached: dict | None = None
-                # Prefer per-build saved analysis — exact USR match.
-                # When content_hash is present, also verify it matches
-                # the new body.  When empty (analysis from older index
-                # before content_hash was populated), accept the saved
-                # analysis as authoritative for the same USR.
-                saved = saved_analyses.get(s.usr)
-                if saved is not None and (saved.get("content_hash") == new_ch or not saved.get("content_hash")):
-                    cached = saved
-                else:
-                    # Fall back to local global cache
-                    cached = local_cache_lookup(local_db, [new_ch]).get(new_ch)
-
-                if not cached:
-                    continue
-                new_id = conn.execute(
-                    "SELECT id FROM symbols WHERE config_hash = ? AND usr = ?",
-                    (config_hash, s.usr),
-                ).fetchone()
-                if not new_id:
-                    continue
-                upsert_llm_analysis_batch(
-                    conn,
-                    [
-                        (
-                            new_id[0],
-                            cached["summary"],
-                            cached["inputs"],
-                            cached["outputs"],
-                            cached["model"],
-                            new_ch,
-                        )
-                    ],
-                )
-                restored += 1
-            local_db.close()
-        if restored:
-            log.debug(
-                "Restored LLM analysis for %d symbols from cache in %s",
-                restored,
-                Path(file_path).name,
-            )
-
-        # ── Phase 4: Detect and fix moved symbols ──
-        # Symbols not in old_usrs may have moved from another file.
-        # Find existing row with same USR, same content_hash, but different
-        # file_id → update file_id, keep analysis, delete duplicate.
-        moved = 0
-        for s in syms:
-            if s.usr in old_usrs:
-                continue  # already handled in Phase 3
-            old_row = conn.execute(
-                """SELECT s.id, s.file_id, s.qualified_name, s.signature, s.line, s.end_line,
-                          s.docstring, f.path as abs_path,
-                          a.summary, a.inputs, a.outputs, a.model, a.analyzed_at
-                   FROM symbols s
-                   LEFT JOIN llm_analysis a ON a.symbol_id = s.id
-                   JOIN files f ON f.id = s.file_id
-                   WHERE s.usr = ? AND s.config_hash = ?""",
-                (s.usr, config_hash),
-            ).fetchone()
-            if old_row is None:
-                continue  # genuine new symbol
-            if old_row["summary"] is None:
-                continue  # no analysis to preserve — nothing to move
-            if old_row["file_id"] == file_id_cache[normalized_sym_file]:
-                continue  # same file, wasn't in saved_analyses → new symbol
-
-            # Same USR, different file — check if content matches
-            lines = _cached_lines(s.file)
-            if lines is None:
-                continue
-            old_lines = _cached_lines(old_row["abs_path"])
-            if old_lines is None:
-                continue
-            old_ch = _compute_content_hash(
-                old_lines,
-                old_row["line"],
-                old_row["end_line"],
-                old_row["signature"],
-                old_row["qualified_name"],
-                old_row["docstring"],
-            )
-            new_ch = _compute_content_hash(
-                lines,
-                s.line,
-                s.end_line,
-                s.signature,
-                s.qualified_name,
-                s.docstring,
-            )
-            if old_ch != new_ch:
-                continue  # content changed — treat as new symbol
-
-            # Same content, different file — moved
-            try:
-                new_rel = str(Path(s.file).resolve().relative_to(project_root))
-            except ValueError:
-                new_rel = s.file
-            conn.execute(
-                """UPDATE symbols SET file_id = ?, file_path = ?,
-                   line = ?, col = ?, end_line = ?
-                   WHERE id = ?""",
-                (file_id_cache[normalized_sym_file], new_rel, s.line, s.column, s.end_line, old_row["id"]),
-            )
-            # Delete the duplicate row just inserted by insert_symbols_batch
-            dup_id = conn.execute(
-                "SELECT id FROM symbols WHERE config_hash = ? AND usr = ? AND id != ?",
-                (config_hash, s.usr, old_row["id"]),
-            ).fetchone()
-            if dup_id:
-                conn.execute("DELETE FROM symbols WHERE id = ?", (dup_id[0],))
-            moved += 1
-        if moved:
-            log.debug(
-                "Detected %d moved symbols in %s",
-                moved,
-                Path(file_path).name,
-            )
+        _restore_llm_analysis(conn, config_hash, syms, saved_analyses)
+        _detect_moved_symbols(conn, config_hash, syms, old_usrs, file_id_cache, project_root)
 
     # Path-relative helper used by refs and indirect_call_sites blocks
     def _rel(p: str) -> str:
@@ -739,7 +750,7 @@ def store_symbols_for_unit(
     # Fill files.content with ifdef-filtered content (tokenization pass)
     _t_content = time.monotonic()
     _, headers = _build_filtered_file_content(
-        conn, unit, config_hash, project_root, build_dir_patterns=build_dir_patterns
+        conn, unit, config_hash, project_root, build_dir_patterns=build_dir_patterns, existing_tu=tu
     )
     _t_content = time.monotonic() - _t_content
 

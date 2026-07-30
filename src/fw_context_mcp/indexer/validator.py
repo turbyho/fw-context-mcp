@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import logging
+import shlex
 from pathlib import Path
 
 from .build import BuildConfig
@@ -130,7 +131,16 @@ def validate_and_fix(
     for entry in cc_data:
         try:
             cwd = Path(entry.get("directory", str(root)))
-            args = normalize_args(entry, cwd)
+            file_path = entry.get("file", "")
+            raw_args: list[str] = entry.get("arguments") or shlex.split(
+                entry.get("command", "")
+            )
+            if raw_args and not raw_args[0].startswith("-"):
+                compiler = Path(raw_args[0])
+                raw_args = raw_args[1:]
+            else:
+                compiler = None
+            args = normalize_args(raw_args, cwd, file_path, compiler)
             validate_include_files(args)
         except RuntimeError as exc:
             missing_includes.add(str(exc))

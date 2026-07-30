@@ -28,7 +28,7 @@ log = logging.getLogger(__name__)
 
 # ── moved from server.py ──
 def get_inheritance_chain(
-    class_name: Annotated[str, Field(description="Class or struct name to get inheritance information for. E.g. 'UART_DRIVER' or 'zbox::ZMODEM'.")],
+    class_name: Annotated[str, Field(description="Class or struct name to get inheritance information for. E.g. 'UART_DRIVER' or 'comm::MODEM'.")],
     project_root: Annotated[str | None, Field(description="Project root. Auto-detected if omitted.")] = None,
     transitive: Annotated[bool, Field(description="When True, walk the full inheritance tree both up (ancestors) and down (descendants). Default: False (direct bases and derived only).")] = False,
     max_depth: Annotated[int, Field(description="Maximum BFS depth for transitive walk (default 10).", ge=1, le=50)] = 10,
@@ -52,7 +52,7 @@ def get_inheritance_chain(
 
     Args:
         class_name: Class or struct name to get inheritance information for.
-            E.g. ``'UART_DRIVER'`` or ``'zbox::ZMODEM'``.
+            E.g. ``'UART_DRIVER'`` or ``'comm::MODEM'``.
         project_root: Project root. Auto-detected if omitted.
         transitive: When True, walk the full inheritance tree both up
             (ancestors) and down (descendants). Default: False (direct
@@ -188,7 +188,7 @@ def get_inheritance_chain(
 
         return result
     finally:
-        conn.close()
+        pass  # connection managed by connection.py cache
 
 # ── moved from server.py ──
 def get_class_members(
@@ -211,7 +211,7 @@ def get_class_members(
 
     Args:
         class_name: Class or struct name. E.g. ``'ModemManager'`` or
-            ``'zbox::ZMODEM'``.
+            ``'comm::MODEM'``.
         project_root: Project root. Auto-detected if omitted.
 
     Returns:
@@ -268,7 +268,7 @@ def get_class_members(
 
             return result
     finally:
-        conn.close()
+        pass  # connection managed by connection.py cache
 
 # ── moved from server.py ──
 def get_template_instances(
@@ -355,7 +355,7 @@ def get_template_instances(
             ]
             return result
     finally:
-        conn.close()
+        pass  # connection managed by connection.py cache
 
 # ── moved from server.py ──
 def get_method_overrides(
@@ -444,5 +444,5 @@ def get_method_overrides(
                 for o in ov["overridden_by"]
             ]
     finally:
-        conn.close()
+        pass  # connection managed by connection.py cache
     return result

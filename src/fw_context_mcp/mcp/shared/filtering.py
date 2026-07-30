@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+# NOTE: These are re-exported from indexer layer for MCP-layer convenience.
 from ...indexer.sdk_detect import (  # noqa: F401 — re-exported
     _build_sdk_excludes,
     _normalize_path_pattern,
@@ -30,7 +31,7 @@ def detect_sdk_exclude_like(project_root: Path, extra_vendor_paths: list[str] | 
     if extra_vendor_paths:
         for p in extra_vendor_paths:
             p = p.strip("/")
-            if p and f"%{p}/%" not in patterns:
+            if p:  # dedup not critical for small vendor path lists
                 patterns.append(f"%{p}/%")
 
     return patterns

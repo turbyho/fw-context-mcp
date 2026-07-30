@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from pathlib import Path
 from typing import Annotated
@@ -56,13 +57,8 @@ def _lookup_definition(
     before vendor/SDK symbols.  This prevents base-class definitions in SDK
     headers from shadowing project overrides when both share the same name.
     """
-    # Build ORDER BY fragments — assembled left to right in priority order.
     _order_parts: list[str] = []
-
-    # 1. Kind priority — None means no priority, empty tuple is a no-op
     if preferred_kinds:
-        # Validate: kind values are internal constants, but guard against
-        # future accidental injection of user input.
         for k in preferred_kinds:
             if not isinstance(k, str) or "'" in k:
                 raise ValueError(
@@ -71,51 +67,58 @@ def _lookup_definition(
                 )
         whens = " ".join(f"WHEN '{k}' THEN 0" for k in preferred_kinds)
         _order_parts.append(f"CASE s.kind {whens} ELSE 1 END")
-
-    # 2. Project-code priority (within same kind, project overrides before SDK)
     if prefer_project:
         _order_parts.append("s.is_project DESC")
-
     _order_prefix = ", ".join(_order_parts) + ", " if _order_parts else ""
 
-    BASE_QUERY = f"""SELECT s.* FROM symbols s
+    QUERY = f"""SELECT s.* FROM symbols s
        WHERE s.config_hash=? AND %s
-       ORDER BY {_order_prefix}%s s.line
-       LIMIT 1"""
-    for column in ("s.name", "s.qualified_name"):
-        row = conn.execute(
-            BASE_QUERY % (f"{column}=? AND s.is_definition=1", ""),
-            (config_hash, name),
-        ).fetchone()
-        if row:
-            return row
-        row = conn.execute(
-            BASE_QUERY % (f"{column}=?", "s.is_definition DESC,"),
-            (config_hash, name),
-        ).fetchone()
-        if row:
-            return row
+       ORDER BY {_order_prefix}%s s.line"""
 
-    # Fallback: "Foo::bar" without namespace — extract short name, suffix-filter
+    result = _lookup_try_columns(
+        conn, QUERY + " LIMIT 1", config_hash, name,
+        ("s.name", "s.qualified_name"),
+    )
+    if result:
+        return result
+
     if "::" in name:
         short_name = name.rsplit("::", 1)[-1]
-        FALLBACK_QUERY = f"""SELECT s.* FROM symbols s
-           WHERE s.config_hash=? AND %s
-           ORDER BY {_order_prefix}%s s.line"""
-        for column in ("s.name", "s.qualified_name"):
+        return _lookup_try_columns(
+            conn, QUERY, config_hash, short_name,
+            ("s.name", "s.qualified_name"),
+            suffix_filter=name,
+        )
+    return None
+
+
+def _lookup_try_columns(
+    conn,
+    query_template: str,
+    config_hash: str,
+    search_name: str,
+    columns: tuple[str, ...],
+    *,
+    suffix_filter: str | None = None,
+):
+    """Try *search_name* against each column in *columns*.
+
+    For each column, tries ``is_definition=1`` first, then without the filter
+    (with ``is_definition DESC`` sort).  Returns the first matching row or
+    ``None``.
+
+    When *suffix_filter* is set, only rows whose ``qualified_name`` ends with
+    that string are returned.
+    """
+    for column in columns:
+        for is_def, replace in ((True, ""), (False, "s.is_definition DESC,")):
+            where = f"{column}=? AND s.is_definition=1" if is_def else f"{column}=?"
             rows = conn.execute(
-                FALLBACK_QUERY % (f"{column}=? AND s.is_definition=1", ""),
-                (config_hash, short_name),
+                query_template % (where, replace),
+                (config_hash, search_name),
             ).fetchall()
             for row in rows:
-                if row["qualified_name"].endswith(name):
-                    return row
-            rows = conn.execute(
-                FALLBACK_QUERY % (f"{column}=?", "s.is_definition DESC,"),
-                (config_hash, short_name),
-            ).fetchall()
-            for row in rows:
-                if row["qualified_name"].endswith(name):
+                if suffix_filter is None or row["qualified_name"].endswith(suffix_filter):
                     return row
     return None
 
@@ -159,6 +162,10 @@ def _read_symbol_body(file_path: str, line_no: int, end_line: int = 0, max_lines
     # Brace matching with basic string/comment awareness.
     # Tracks whether we're inside a string literal, char literal, or comment
     # to avoid miscounting braces in those contexts.
+    #
+    # LIMITATION: C++11 raw string literals (R"(...)" and R"delim(...)delim")
+    # are NOT handled — braces and quotes inside them may cause miscounts.
+    # Embedded C/C++ code rarely uses raw strings, so this is acceptable.
     NORMAL, STRING, CHAR, LINE_COMMENT, BLOCK_COMMENT = 0, 1, 2, 3, 4
     state = NORMAL
     depth = 0
@@ -276,6 +283,12 @@ async def explain_symbol(
                     }
                 return {"error": f"Symbol not found: {name}"}
             file_path = abs_path(root, row["file_path"])
+            # Defense-in-depth: validate path is within project root
+            try:
+                from pathlib import Path as _Path
+                _Path(file_path).resolve().relative_to(root.resolve())
+            except ValueError:
+                return {"error": f"Path {file_path} outside project root"}
             line_no = row["line"]
             signature = row["signature"] or ""
             kind = row["kind"]
@@ -284,7 +297,7 @@ async def explain_symbol(
             # Check for pre-computed LLM analysis (instant, no Ollama call)
             llm_analysis = get_llm_analysis_for_symbol(conn, symbol_id)
     finally:
-        conn.close()
+        pass  # connection managed by connection.py cache
 
     result: dict = {
         "name": name,
@@ -305,7 +318,7 @@ async def explain_symbol(
         result["llm_analysis"] = llm_analysis
         return result
 
-        context_lines = min(context_lines, _CONTEXT_LINES_MAX)
+    context_lines = min(context_lines, _CONTEXT_LINES_MAX)
     source_snippet = ""
     try:
         lines = Path(file_path).read_text(errors="replace").splitlines()
@@ -329,7 +342,16 @@ async def explain_symbol(
         prompt += f"\nSource context:\n```cpp\n{source_snippet}\n```\n"
     if cfg.llm.enabled:
         try:
-            result["explanation"] = await call_ollama_async(prompt, cfg.llm)
+            result["explanation"] = await asyncio.wait_for(
+                call_ollama_async(prompt, cfg.llm),
+                timeout=cfg.llm.timeout,
+            )
+        except asyncio.TimeoutError:
+            result["warning"] = (
+                f"LLM request timed out after {cfg.llm.timeout:.0f}s. "
+                "No local LLM — interpret the 'source' and "
+                "'explain_prompt' fields below with your own LLM to provide the explanation."
+            )
         except OllamaModelNotFoundError as e:
             result["warning"] = (
                 f"{e}. No LLM model available — interpret the 'source' and "
@@ -411,6 +433,12 @@ def get_source(
                     }
                 return {"error": f"Symbol not found: {name}"}
             file_path = abs_path(root, row["file_path"])
+            # Defense-in-depth: validate path is within project root
+            try:
+                from pathlib import Path as _Path
+                _Path(file_path).resolve().relative_to(root.resolve())
+            except ValueError:
+                return {"error": f"Path {file_path} outside project root"}
             result: dict = {
                 "name": row["name"],
                 "qualified_name": row["qualified_name"],
@@ -452,7 +480,7 @@ def get_source(
             end_line = row["end_line"] or 0
             line_no = row["line"]
     finally:
-        conn.close()
+        pass  # connection managed by connection.py cache
     source = _read_symbol_body(file_path, line_no, end_line=end_line)
     if not source:
         result["warning"] = f"Could not read source from {file_path}"
@@ -469,6 +497,8 @@ def get_file_map(
 ) -> dict:
     """Fast structural map of all C/C++ symbols in a file grouped by kind —
     libclang-powered table of contents. Like a table of contents before
+    NOTE: No path-traversal validation — the DB stores only relative paths
+    from indexing, so absolute-path escaping is not a realistic attack vector.
     reading a chapter: see what functions, classes, and enums a file
     defines at a glance.
 
@@ -534,7 +564,7 @@ def get_file_map(
                 signatures=signatures, max_per_kind=max_per_kind,
             )
     finally:
-        conn.close()
+        pass  # connection managed by connection.py cache
     return result
 
 # ── moved from server.py ──
@@ -616,6 +646,12 @@ def get_symbol_context(
                     }
                 return {"error": f"Symbol not found: {name}"}
             file_path = abs_path(root, row["file_path"])
+            # Defense-in-depth: validate path is within project root
+            try:
+                from pathlib import Path as _Path
+                _Path(file_path).resolve().relative_to(root.resolve())
+            except ValueError:
+                return {"error": f"Path {file_path} outside project root"}
             symbol_usr = row["usr"]
 
             # Immediate callers (who calls this symbol, direct + indirect).
@@ -753,7 +789,7 @@ def get_symbol_context(
             if row["kind"] in ("method", "destructor") and (row["is_virtual"] or row["is_pure_virtual"]):
                 overrides_info = get_overrides_for_method(conn, config_hash, symbol_usr)
     finally:
-        conn.close()
+        pass  # connection managed by connection.py cache
 
     source = _read_symbol_body(file_path, row["line"], end_line=row["end_line"] or 0)
     result: dict = {
@@ -864,12 +900,18 @@ def read_file(
             else:
                 resolved = file_path
 
+            # Defense-in-depth: validate resolved path stays within project root
+            try:
+                Path(root, resolved).resolve().relative_to(root.resolve())
+            except ValueError:
+                return {"error": f"Path escapes project root: {resolved}"}
+
             row = conn.execute(
                 "SELECT content, language, path, mtime FROM files WHERE config_hash=? AND path=?",
                 (config_hash, resolved),
             ).fetchone()
     finally:
-        conn.close()
+        pass  # connection managed by connection.py cache
 
     if not row:
         return {"error": f"File not found in index: {file_path}"}

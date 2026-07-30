@@ -65,7 +65,12 @@ class CrossEncoderReranker:
         scores = self._model.predict(pairs)  # type: ignore[union-attr]
 
         # Attach scores and sort descending
-        scored = list(zip(candidates, scores, strict=True))
+        if len(scores) != len(candidates):
+            log.warning("Reranker: score/candidate count mismatch (%d vs %d)", len(scores), len(candidates))
+            min_len = min(len(scores), len(candidates))
+            candidates = candidates[:min_len]
+            scores = scores[:min_len]
+        scored = list(zip(candidates, scores, strict=False))
         scored.sort(key=lambda x: -x[1])
 
         results = []

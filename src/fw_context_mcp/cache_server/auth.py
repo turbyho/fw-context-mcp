@@ -21,7 +21,11 @@ from starlette.responses import JSONResponse
 def _extract_bearer(request: Request) -> str | None:
     auth = request.headers.get("Authorization", "")
     if auth.startswith("Bearer "):
-        return auth[7:].strip()
+        token = auth[7:].strip()
+        # Reject unreasonably large tokens before hashing
+        if len(token) > 1024:
+            return None
+        return token
     return None
 
 
@@ -40,7 +44,7 @@ class CacheAuthMiddleware(BaseHTTPMiddleware):
 
         token = _extract_bearer(request)
         if token is None:
-            return JSONResponse({"detail": "Missing Authorization: Bearer <token>"}, status_code=401)
+            return JSONResponse({"detail": "Missing Authorization header"}, status_code=401)
 
         perms = await _lookup_permissions(request, token)
         if perms is None:
@@ -62,16 +66,31 @@ def require_can_read(request: Request) -> JSONResponse | None:
 def require_can_write(request: Request) -> JSONResponse | None:
     """Check that the authenticated token has ``can_write``.
 
-    Also parses ``X-Cache-Overwrite`` once and stores the result in
-    ``request.state.can_overwrite`` so route handlers don't re-parse it.
+    Pure permission check — no side effects on request.state.
+    For write endpoints that need overwrite support, use
+    ``require_can_write_with_overwrite`` instead.
     """
     perms = getattr(request.state, "permissions", {})
     if not perms.get("can_write", False):
         return JSONResponse({"detail": "Token does not have write permission"}, status_code=403)
+    return None
 
+
+def require_can_write_with_overwrite(request: Request) -> JSONResponse | None:
+    """Check ``can_write`` AND parse ``X-Cache-Overwrite`` header.
+
+    Parses the header once and stores the boolean result in
+    ``request.state.can_overwrite`` so route handlers don't re-parse it.
+    Also checks ``can_overwrite`` — returns 403 when the header is set
+    but the token lacks the permission.
+    """
+    error = require_can_write(request)
+    if error is not None:
+        return error
+
+    perms = getattr(request.state, "permissions", {})
     overwrite = request.headers.get("X-Cache-Overwrite", "").lower() in ("true", "1", "yes")
     request.state.can_overwrite = overwrite
     if overwrite and not perms.get("can_overwrite", False):
         return JSONResponse({"detail": "Token does not have overwrite permission"}, status_code=403)
-
     return None

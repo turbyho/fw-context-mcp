@@ -12,8 +12,10 @@ from __future__ import annotations
 import logging
 import re
 import sqlite3
+from functools import lru_cache
 import time
 from collections import defaultdict
+import threading
 
 log = logging.getLogger(__name__)
 
@@ -21,12 +23,14 @@ log = logging.getLogger(__name__)
 _cache: dict[str, tuple[float, list[str]]] = {}
 _MAX_CACHE = 128
 _CACHE_TTL_S = 300  # Invalidate after 5 minutes (matches keyword_cache)
+_cache_lock = threading.Lock()
 
 # Characters that delimit tokens in symbol names
 _TOKEN_SPLIT = re.compile(r"[_]+")
 
 
-def _tokenize(name: str) -> list[str]:
+@lru_cache(maxsize=20000)
+def _tokenize(name: str) -> tuple[str, ...]:
     """Split a symbol name into lowercase tokens.
 
     Splits on ``_`` first, then splits each part on camelCase boundaries.
@@ -44,7 +48,7 @@ def _tokenize(name: str) -> list[str]:
             t = t.lower()
             if t and t not in tokens:
                 tokens.append(t)
-    return tokens
+    return tuple(tokens)
 
 
 def suggest(
@@ -70,12 +74,15 @@ def suggest(
         List of similar symbol names, best match first.
     """
     cache_key = f"{config_hash}:{name}"
-    if cache_key in _cache:
-        ts, cached = _cache[cache_key]
-        if time.monotonic() - ts < _CACHE_TTL_S:
-            return cached[:limit]
-        # TTL expired — remove stale entry
-        del _cache[cache_key]
+    with _cache_lock:
+        if cache_key in _cache:
+            cached_val = _cache[cache_key]
+            if cached_val is not None:  # guard against stampede sentinel
+                ts, cached = cached_val
+                if time.monotonic() - ts < _CACHE_TTL_S:
+                    return cached[:limit]
+            del _cache[cache_key]
+        _cache[cache_key] = None  # stampede prevention
 
     t0 = time.monotonic()
     candidates = _load_names(conn, config_hash)
@@ -121,10 +128,11 @@ def suggest(
 
     matches = [r[0] for r in results[:limit]]
 
-    # Maintain cache size
-    if len(_cache) >= _MAX_CACHE:
-        _cache.pop(next(iter(_cache)))
-    _cache[cache_key] = (time.monotonic(), matches)
+    with _cache_lock:
+        if _cache:
+            if len(_cache) >= _MAX_CACHE:
+                _cache.pop(next(iter(_cache)))
+        _cache[cache_key] = (time.monotonic(), matches)
 
     return matches
 
@@ -163,18 +171,28 @@ def _token_score(query_tokens: list[str], candidate_tokens: list[str]) -> float:
     return score if matched_any else 0.0
 
 
+_names_cache: dict[str, list[str]] = {}
+
+
 def _load_names(conn: sqlite3.Connection, config_hash: str) -> list[str]:
     """Load all definition names from the index for fuzzy matching.
 
     Only loads definition symbols (is_definition=1) of callable kinds to keep
     the set small and relevant — these are what users typically search for.
+    Results are cached at module level per *config_hash* to avoid reloading
+    on every uncached query.
     """
+    if config_hash in _names_cache:
+        return _names_cache[config_hash]
     rows = conn.execute(
         """SELECT DISTINCT name FROM symbols
            WHERE config_hash = ?
              AND is_definition = 1
              AND kind IN ('function', 'method', 'constructor', 'destructor')
-           ORDER BY name""",
+           ORDER BY name
+           LIMIT 50000""",
         (config_hash,),
     ).fetchall()
-    return [r["name"] for r in rows]
+    names = [r["name"] for r in rows]
+    _names_cache[config_hash] = names
+    return names

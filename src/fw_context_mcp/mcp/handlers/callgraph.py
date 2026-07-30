@@ -116,7 +116,7 @@ def _references_result(name: str, project_root: str | None, ref_kind: str | list
             ]
         return result
     finally:
-        conn.close()
+        pass  # connection managed by connection.py cache
 
 # ── moved from server.py ──
 def find_callers(
@@ -291,7 +291,7 @@ def find_indirect_call_sites(
                 for r in rows
             ]
     finally:
-        conn.close()
+        pass  # connection managed by connection.py cache
 
 # ── moved from server.py ──
 def find_indirect_targets(
@@ -374,7 +374,7 @@ def find_indirect_targets(
                 for r in rows
             ]
     finally:
-        conn.close()
+        pass  # connection managed by connection.py cache
 
 # ── moved from server.py ──
 def _refs_guard(project_root: str | None) -> tuple[sqlite3.Connection, Path, str, None] | tuple[None, None, None, list[dict]]:
@@ -399,11 +399,9 @@ def _refs_guard(project_root: str | None) -> tuple[sqlite3.Connection, Path, str
     with conn:
         cfg_data = get_active_config(conn, project_id)
         if not cfg_data:
-            conn.close()
             return None, None, None, [{"error": "No build config indexed."}]
         config_hash = cfg_data["config_hash"]
         if count_refs(conn, config_hash) == 0:
-            conn.close()
             return None, None, None, [{"info": (
                 "No references indexed. Refs are on by default — "
                 "they may have been disabled with [index] index_refs = false. "
@@ -463,7 +461,7 @@ def find_call_path(
             return [{"info": f"No path found from '{from_name}' to '{to_name}' within depth {max_depth}."}]
         return rows
     finally:
-        conn.close()
+        pass  # connection managed by connection.py cache
 
 # ── moved from server.py ──
 def find_all_callers_recursive(
@@ -514,7 +512,7 @@ def find_all_callers_recursive(
             return [{"info": f"No callers found for '{name}'."}]
         return rows
     finally:
-        conn.close()
+        pass  # connection managed by connection.py cache
 
 # ── moved from server.py ──
 def find_callees_recursive(
@@ -565,7 +563,7 @@ def find_callees_recursive(
             return [{"info": f"No callees found for '{name}'."}]
         return rows
     finally:
-        conn.close()
+        pass  # connection managed by connection.py cache
 
 # ── moved from server.py ──
 def find_dead_code(
@@ -635,7 +633,7 @@ def find_dead_code(
             return [{"info": "No dead or possibly-dead functions found — every defined function has at least one caller."}]
         return rows
     finally:
-        conn.close()
+        pass  # connection managed by connection.py cache
 
 # ── moved from server.py ──
 def find_wrapper_callers(
@@ -756,7 +754,7 @@ def find_wrapper_callers(
             })
         return result
     finally:
-        conn.close()
+        pass  # connection managed by connection.py cache
 
 # ── moved from server.py ──
 def trace_data_flow(
@@ -868,7 +866,7 @@ def trace_data_flow(
             *results,
         ]
     finally:
-        conn.close()
+        pass  # connection managed by connection.py cache
 
 # ── moved from server.py ──
 def find_hotspots(
@@ -922,14 +920,9 @@ def find_hotspots(
             project_only=project_only,
         )
         if not rows and project_only:
-            # Nothing found with project filter — try without
-            rows = index_db.find_hotspots(
-                conn, config_hash, limit=limit,
-                exclude_paths=exclude_paths,
-                project_only=False,
-            )
+            return [{"info": "No project hotspots found. Try project_only=False to include vendor code."}]
         if not rows:
             return [{"info": "No references indexed — enable index_refs and re-index."}]
         return rows
     finally:
-        conn.close()
+        pass  # connection managed by connection.py cache

@@ -109,19 +109,32 @@ def daemon_main(project_root: Path) -> None:
         sys.exit(1)
 
     pid_file = db_dir / "watcher.pid"
-    pid_file.write_text(str(os.getpid()), encoding="utf-8")
+    # O_EXCL | O_CREAT does not follow symlinks — defense against symlink attack
+    try:
+        wfd = os.open(str(pid_file), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+    except FileExistsError:
+        # Stale PID file from a previous crash — clean up and retry
+        pid_file.unlink(missing_ok=True)
+        wfd = os.open(str(pid_file), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+    with os.fdopen(wfd, "w", encoding="utf-8") as pf:
+        pf.write(str(os.getpid()))
 
     # ── Socket setup ─────────────────────────────────────────────────────
     sock_path = _socket_path(db_dir)
-    _cleanup_stale_socket(sock_path, project_root)
 
     server_sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     try:
         server_sock.bind(str(sock_path))
     except OSError:
-        log.error("Cannot bind socket %s — daemon already running?", sock_path)
-        _cleanup_lock_and_exit(lock_fd, lock_file, pid_file)
+        # Socket exists but nobody listening — clean up and retry
+        sock_path.unlink(missing_ok=True)
+        try:
+            server_sock.bind(str(sock_path))
+        except OSError:
+            log.error("Cannot bind socket %s — daemon already running?", sock_path)
+            _cleanup_lock_and_exit(lock_fd, lock_file, pid_file)
     server_sock.listen(8)
+    os.chmod(sock_path, 0o600)
     server_sock.settimeout(1.0)  # accept() timeout → check shutdown flag
 
     # ── Shared state ─────────────────────────────────────────────────────
@@ -163,15 +176,24 @@ def daemon_main(project_root: Path) -> None:
 
     # ── Index subprocess handle (for signal forwarding) ──────────────────
     index_proc: subprocess.Popen | None = None
+    _proc_lock = threading.Lock()  # guards index_proc reads/writes
+
+    # ── Wakeup pipe for async-signal-safe shutdown notification ─────────
+    _wakeup_r, _wakeup_w = os.pipe()
+    signal.set_wakeup_fd(_wakeup_w)
 
     def _handle_shutdown(signum: int, _frame) -> None:
-        log.info("Daemon received signal %d, shutting down", signum)
+        """Async-signal-safe: only set shutdown and write to wakeup fd.
+
+        Does NOT call log.info(), proc.terminate(), or any other
+        non-async-signal-safe function.  All cleanup happens in the
+        main loop when shutdown.is_set() is detected.
+        """
         shutdown.set()
-        # Forward signal to running index subprocess
-        proc = index_proc  # local ref to avoid race
-        if proc is not None and proc.poll() is None:
-            log.info("Forwarding signal to index subprocess (pid %d)", proc.pid)
-            proc.terminate()
+        try:
+            os.write(_wakeup_w, b"\x00")  # os.write() is async-signal-safe
+        except OSError:
+            pass  # pipe full — shutdown flag already set
 
     signal.signal(signal.SIGTERM, _handle_shutdown)
     signal.signal(signal.SIGINT, _handle_shutdown)
@@ -223,8 +245,8 @@ def daemon_main(project_root: Path) -> None:
                             break
                     if changed:
                         break  # Exit watch loop → run index
-            except Exception:
-                log.warning("watchfiles error", exc_info=True)
+            except (OSError, RuntimeError) as exc:
+                log.warning("watchfiles error: %s", exc)
                 time.sleep(5)
                 continue
 
@@ -272,30 +294,21 @@ def _ping_timeout(last_ping_time: float, lock: threading.Lock) -> bool:
         return (time.monotonic() - last_ping_time) > PING_TIMEOUT
 
 
-def _cleanup_stale_socket(sock_path: Path, project_root: Path) -> None:
-    """Remove *sock_path* when it exists but no daemon is listening."""
-    if not sock_path.exists():
-        return
-    try:
-        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        sock.settimeout(1.0)
-        sock.connect(str(sock_path))
-        sock.close()
-        # Socket is live — another daemon is running
-        raise RuntimeError(f"Daemon socket {sock_path} is already in use")
-    except (OSError, ConnectionRefusedError, FileNotFoundError):
-        # Socket exists but nobody listening — clean up
-        sock_path.unlink(missing_ok=True)
-
 
 def _cleanup_lock_and_exit(
     lock_fd: int, lock_file: Path, pid_file: Path,
+    server_sock=None,
 ) -> None:
     """Release lock, remove files, exit."""
+    if server_sock is not None:
+        try:
+            server_sock.close()
+        except OSError:
+            pass
     fcntl.flock(lock_fd, fcntl.LOCK_UN)
     os.close(lock_fd)
     pid_file.unlink(missing_ok=True)
-    sys.exit(1)
+    os._exit(1)
 
 
 def _cleanup_files(sock_path: Path, pid_file: Path) -> None:
@@ -409,10 +422,15 @@ def _run_index_async(
             env=env,
         )
         # Write PID for health checks — _is_bg_reindex_running reads this
-        (db_dir / "reindex.pid").write_text(str(proc.pid), encoding="utf-8")
+        rp = db_dir / "reindex.pid"
+        rfd = os.open(str(rp), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+        with os.fdopen(rfd, "w", encoding="utf-8") as pf:
+            pf.write(str(proc.pid))
+        if log_fh != subprocess.DEVNULL:
+            log_fh.close()
     except Exception:
         log.exception("Failed to spawn index subprocess")
-        if log_fh is not subprocess.DEVNULL:
+        if log_fh != subprocess.DEVNULL:
             log_fh.close()
         raise
     return proc
@@ -439,15 +457,11 @@ def _wait_index(proc: subprocess.Popen, shutdown: threading.Event, *, db_dir: Pa
             time.sleep(0.5)
     finally:
         (db_dir / "reindex.pid").unlink(missing_ok=True)
-        # Close the log file handle (opened by _run_index_async)
-        if proc.stdout is not None and proc.stdout is not subprocess.DEVNULL:
-            try:
-                proc.stdout.close()
-            except OSError:
-                pass
+        # log file handle already closed in _run_index_async (stdout=PIPE never used)
 
     if proc.returncode == 0:
         log.info("Background index completed")
+        _optimize_db(db_dir)
     else:
         log.warning("Background index exited with %d", proc.returncode)
 
@@ -466,6 +480,22 @@ def _open_db(db_path: Path):
         return None
 
 
+def _optimize_db(db_dir: Path) -> None:
+    """Run PRAGMA optimize to shrink the WAL file and defragment indexes."""
+    db_path = db_dir / "index.db"
+    if not db_path.exists():
+        return
+    conn = _open_db(db_path)
+    if conn is None:
+        return
+    try:
+        conn.execute("PRAGMA optimize")
+    except Exception:
+        log.debug("PRAGMA optimize failed", exc_info=True)
+    finally:
+        conn.close()
+
+
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 
@@ -479,4 +509,8 @@ if __name__ == "__main__":
     if len(_sys.argv) < 2:
         print("Usage: python -m fw_context_mcp.mcp.daemon <project_root>", file=_sys.stderr)
         _sys.exit(1)
-    daemon_main(Path(_sys.argv[1]).resolve())
+    target = Path(_sys.argv[1]).resolve()
+    if not target.is_dir():
+        print(f"Error: {target} is not a valid directory", file=_sys.stderr)
+        _sys.exit(1)
+    daemon_main(target)

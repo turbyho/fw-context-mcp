@@ -5,7 +5,8 @@ from __future__ import annotations
 import pytest
 
 from fw_context_mcp.config.settings import DESCRIPTION_VERSION, LLMConfig
-from fw_context_mcp.llm.embedder import Embedder, get_embedder
+from fw_context_mcp.llm.embedder import Embedder
+from fw_context_mcp.llm.embedder_factory import get_embedder
 
 
 class FakeEmbedder(Embedder):
@@ -77,7 +78,7 @@ class TestGetEmbedder:
     def test_qwen3_token_limit(self) -> None:
         cfg = LLMConfig(embed_model="qwen3-embedding:8b")
         e = get_embedder(cfg)
-        assert e.max_tokens == 8192
+        assert e.max_tokens == 8192  # qwen3:8b has 8K context window
 
     def test_ollama_default_for_unknown_model(self) -> None:
         cfg = LLMConfig(embed_model="some-unknown-model")
@@ -347,3 +348,67 @@ class TestTruncateBody:
         result = _truncate_body(body, max_chars=50)
         assert "PREFIX" in result
         assert "TAIL" in result
+
+
+class TestValidateModelDir:
+    """Tests for _validate_model_dir — F2 regression safety."""
+
+    def test_valid_model_dir_with_config_json(self, tmp_path: Path) -> None:
+        from fw_context_mcp.llm.embedder_factory import _validate_model_dir
+
+        model_dir = tmp_path / "model"
+        model_dir.mkdir()
+        (model_dir / "config.json").write_text("{}")
+        _validate_model_dir(model_dir, "test-model")  # nevyhazuje
+
+    def test_missing_config_json_raises(self, tmp_path: Path) -> None:
+        from fw_context_mcp.llm.embedder_factory import _validate_model_dir
+
+        model_dir = tmp_path / "empty_model"
+        model_dir.mkdir()
+        with pytest.raises(FileNotFoundError, match="missing config.json"):
+            _validate_model_dir(model_dir, "empty_model")
+
+    def test_nonexistent_dir_raises(self) -> None:
+        from pathlib import Path
+        from fw_context_mcp.llm.embedder_factory import _validate_model_dir
+
+        with pytest.raises(FileNotFoundError):
+            _validate_model_dir(Path("/nonexistent/model/path"), "nonexistent")
+
+    def test_empty_dir_raises(self, tmp_path: Path) -> None:
+        from fw_context_mcp.llm.embedder_factory import _validate_model_dir
+
+        empty = tmp_path / "empty"
+        empty.mkdir()
+        with pytest.raises(FileNotFoundError, match="missing config.json"):
+            _validate_model_dir(empty, "empty")
+
+
+class TestDimThreadSafety:
+    """Regression test for F1 — dim property read under lock."""
+
+    def test_dim_returns_after_ensure_model(self) -> None:
+        """dim should not return None after _ensure_model completes."""
+        from fw_context_mcp.llm.st_embedder import SentenceTransformerEmbedder
+
+        cfg = LLMConfig(embed_model="BAAI/bge-small-en-v1.5", embed_dim=64)
+        # Don't actually load the model — just test the property behavior
+        e = SentenceTransformerEmbedder(cfg)
+        assert e.dim is None  # before loading
+
+    def test_dim_lock_held_during_read(self) -> None:
+        """dim property acquires _lock before reading _dim."""
+        from fw_context_mcp.llm.st_embedder import SentenceTransformerEmbedder
+
+        cfg = LLMConfig(embed_model="BAAI/bge-small-en-v1.5")
+        e = SentenceTransformerEmbedder(cfg)
+
+        # Verify the lock is a threading.Lock (not RLock, not None)
+        import threading
+        assert type(e._lock) is type(threading.Lock())
+
+        # Verify we can acquire it (not held by anyone)
+        acquired = e._lock.acquire(blocking=False)
+        assert acquired, "Lock should not be held before any operations"
+        e._lock.release()

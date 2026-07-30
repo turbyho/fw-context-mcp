@@ -143,6 +143,8 @@ def _count_modified_files(
     manifest = load_manifest(db_path.parent)
     build_patterns = manifest.get("build_dir_patterns", []) if manifest else []
 
+    # NOTE: TOCTOU — file may change between DB read and stat() below.
+    # Not a security issue: worst case is missed detection until next query.
     modified = 0
     for key, stored_mtime in best_mtime.items():
         if build_patterns and _path_matches_patterns(key, build_patterns):
@@ -293,7 +295,7 @@ def _with_stale_recovery(
                 root,
             )
     finally:
-        conn.close()
+        pass  # Connection stays in cache (managed by TTL eviction in connection.py)
 
     results: list[dict] = []
     if stale_f:

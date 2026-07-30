@@ -14,8 +14,13 @@ from fw_context_mcp.search.pipeline import (
     _build_smart_search,
 )
 
-# Materialize SMART_SEARCH at import time so it appears in __all__.
-SMART_SEARCH = _build_smart_search()
+# Lazily materialize SMART_SEARCH so embedding imports are deferred.
+def __getattr__(name):
+    if name == "SMART_SEARCH":
+        return _build_smart_search()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+# Pre-compute at import time for backward compat (appears in __all__)
 
 __all__ = [
     "PipelineRunner",

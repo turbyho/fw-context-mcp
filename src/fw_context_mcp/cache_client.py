@@ -83,15 +83,15 @@ def local_cache_upsert(conn: sqlite3.Connection, entries: list[dict]) -> int:
     inserted = 0
     for e in entries:
         try:
-            conn.execute(
+            cur = conn.execute(
                 "INSERT OR IGNORE INTO llm_analysis_cache "
                 "(content_hash, summary, inputs, outputs, model) VALUES (?, ?, ?, ?, ?)",
                 (e["hash"], e["summary"], e["inputs"], e["outputs"], e["model"]),
             )
-            if conn.total_changes > inserted:
+            if cur.rowcount:
                 inserted += 1
         except Exception:
-            pass
+            logger.debug("local_cache_upsert: failed to insert entry", exc_info=True)
     conn.commit()
     return inserted
 
@@ -184,7 +184,8 @@ class CacheClient:
                     force=cs.force,
                     batch_size=cs.batch_size,
                 )
-            except Exception:
+            except Exception as e:
+                logger.debug("CacheClient.from_config: failed to create client — %s", e)
                 return None
         return None
 

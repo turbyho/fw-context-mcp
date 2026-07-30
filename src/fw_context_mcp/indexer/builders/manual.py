@@ -39,9 +39,9 @@ def _scan_source_files(dirs: list[Path]) -> list[Path]:
             log.warning("source directory does not exist: %s", d)
             continue
         for f in sorted(d.rglob("*")):
-            if f.suffix in _SOURCE_EXTENSIONS and f.name not in seen:
-                # Deduplicate by filename — two source_dirs might overlap
-                seen.add(f.name)
+            if f.suffix in _SOURCE_EXTENSIONS and str(f) not in seen:
+                # Deduplicate by full path — two source_dirs might contain same-named files
+                seen.add(str(f))
                 result.append(f)
     return result
 

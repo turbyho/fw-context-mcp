@@ -11,9 +11,13 @@ from __future__ import annotations
 
 import os
 import platform
+import pwd
+import re
 import secrets
+import shutil
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -51,14 +55,88 @@ def setup_wizard() -> int:
     if not _ensure_databases():
         return 1
 
-    # 5. Initialize cache server
-    token_result = _ensure_cache_server_init()
-    if token_result is None:
-        return 1
-    admin_token = token_result
+    # 5-6. DB operations — SINGLE asyncio.run(), all user input collected first
+    db_url = _find_db_url()
+    if not db_url:
+        print("    FW_CACHE_DB_URL not available — run 'fw-cache-server init' manually")
+        admin_token = os.environ.get("FW_CACHE_ADMIN_TOKEN", "unknown")
+        project_tokens = None
+    else:
+        import asyncio
+        from .backend import CacheBackend
 
-    # 6. Create project and tokens
-    project_tokens = _setup_project_and_tokens(admin_token)
+        # Collect ALL user input BEFORE the async block
+        detected_id = _detect_project_id_from_cwd()
+        create_project = True
+        project_id = ""
+
+        if detected_id:
+            print()
+            print(f"  Detected project ID: {detected_id}")
+            if _ask("Use this ID?"):
+                project_id = detected_id
+            else:
+                try:
+                    project_id = input("  Project ID (UUID4 hex): ").strip()
+                except (EOFError, KeyboardInterrupt):
+                    project_id = ""
+        else:
+            print()
+            print("  No .fw-context/config.toml detected in current directory.")
+            try:
+                project_id = input("  Enter project ID (UUID4 hex, or leave empty to skip): ").strip()
+            except (EOFError, KeyboardInterrupt):
+                project_id = ""
+
+        if not project_id:
+            print("    No project ID — skipping project creation")
+            create_project = False
+
+        # Single asyncio.run() for ALL DB operations
+        async def _all_db_ops():
+            backend = CacheBackend(db_url)
+            try:
+                await backend.connect()
+
+                # Init cache server
+                token = await _async_init_cache_server(backend)
+                if token is None:
+                    return None, None
+                if token != "unknown":
+                    print("  [✓] Cache server — initialized")
+                    print(f"      Admin token: {token}")
+                    print("      ⚠  Save this token — it's needed for admin operations!")
+
+                # List existing projects
+                existing = await _async_list_projects(backend)
+                if existing:
+                    existing_ids = ", ".join(p["id"] for p in existing)
+                    print(f"  Projects: {existing_ids}")
+
+                # Create project if user requested one
+                tokens = None
+                if create_project and project_id:
+                    result = await _async_create_project(backend, project_id)
+                    if result:
+                        proj_id, write_token, read_token = result
+                        print(f"    [✓] Project '{proj_id}' created")
+                        print(f"      Write token:  {write_token}")
+                        print(f"      Read token:   {read_token}")
+                        tokens = result
+                    else:
+                        print(f"    [!] Failed to create project '{project_id}'")
+
+                return token, tokens
+            finally:
+                await backend.close()
+
+        try:
+            admin_token, project_tokens = asyncio.run(_all_db_ops())
+            if admin_token is None:
+                return 1
+        except Exception as e:
+            print(f"  [!] DB setup failed: {e}")
+            return 1
 
     print()
 
@@ -76,7 +154,7 @@ def setup_wizard() -> int:
 
     # 9. Finish
     print("  [✓] Installation complete!\n")
-    print("    Server port:    8000")
+    print(f"    Server port:    {os.environ.get('FW_CACHE_PORT', '8000')}")
     print(f"    Admin token:    {admin_token}")
     if project_tokens:
         proj_id, write_token, read_token = project_tokens
@@ -181,6 +259,11 @@ def _ensure_server_venv() -> bool:
         return False
     subprocess.run([pip, "install", "fastapi", "uvicorn[standard]", "asyncpg"], check=True, timeout=120)
 
+    # Ensure fw-cache system user exists before chown
+    try:
+        pwd.getpwnam("fw-cache")
+    except KeyError:
+        _run(["sudo", "useradd", "-r", "-s", shutil.which("nologin") or "/usr/sbin/nologin", "-d", "/nonexistent", "fw-cache"], timeout=10)
     # Ensure fw-cache user can read the venv
     _run(["sudo", "chown", "-R", "fw-cache:fw-cache", str(venv_dir)], timeout=10)
 
@@ -268,11 +351,15 @@ def _ensure_db_user() -> bool:
         if not _ask("Create user 'fw_cache'?"):
             return False
         password = secrets.token_urlsafe(24)
-        if not _run(
-            ["sudo", "-u", "postgres", "psql", "-c",
-             f"CREATE USER fw_cache WITH PASSWORD '{password}' CREATEDB"],
-            timeout=10,
-        ):
+        # Pipe SQL via stdin to avoid password in command-line arguments
+        # where it would be visible in ps output and shell history.
+        sql = f"CREATE USER fw_cache WITH PASSWORD E'{password}' CREATEDB"
+        result = subprocess.run(
+            ["sudo", "-u", "postgres", "psql", "-q"],
+            input=sql + ";\n", text=True, capture_output=True, timeout=10,
+        )
+        if result.returncode != 0:
+            print(f"    Error: {result.stderr.strip()}", file=sys.stderr)
             return False
         _save_credentials(password)
         return True
@@ -284,13 +371,15 @@ def _ensure_db_user() -> bool:
 
     # User exists but no saved password — regenerate
     print("  [!] Database user 'fw_cache' exists but no saved credentials")
-    if _ask("Reset password and save credentials?"):
         password = secrets.token_urlsafe(24)
-        _run(
-            ["sudo", "-u", "postgres", "psql", "-c",
-             f"ALTER USER fw_cache WITH PASSWORD '{password}'"],
-            timeout=10,
+        sql = f"ALTER USER fw_cache WITH PASSWORD E'{password}'"
+        result = subprocess.run(
+            ["sudo", "-u", "postgres", "psql", "-q"],
+            input=sql + ";\n", text=True, capture_output=True, timeout=10,
         )
+        if result.returncode != 0:
+            print(f"    Error: {result.stderr.strip()}", file=sys.stderr)
+            return False
         _save_credentials(password)
         return True
 
@@ -314,7 +403,7 @@ def _save_credentials(password: str) -> None:
             input=db_url_line, text=True, capture_output=True, timeout=10, check=True,
         )
         _run(["sudo", "chown", "root:fw-cache", str(lib_path / "db.env")], timeout=10)
-        _run(["sudo", "chmod", "644", str(lib_path / "db.env")], timeout=10)
+        _run(["sudo", "chmod", "640", str(lib_path / "db.env")], timeout=10)
         print(f"  [✓] Credentials saved to {lib_path / 'db.env'}")
         os.environ["FW_CACHE_DB_URL"] = db_url
         return
@@ -338,7 +427,6 @@ def _find_db_url() -> str:
         return db_url
     for env_path in (Path("/var/lib/fw-cache-server/db.env"), Path.home() / ".fw-context" / "db.env"):
         if env_path.exists():
-            import re
             content = env_path.read_text()
             m = re.search(r'FW_CACHE_DB_URL="([^"]+)"', content)
             if m:
@@ -389,45 +477,65 @@ def _ensure_databases() -> bool:
     return True
 
 
-# -- Cache server init --
+# -- Cache server init + project/token creation (single async context) --
+
+async def _async_init_cache_server(backend) -> str | None:
+    """Initialize schema + admin token using an already-connected *backend*."""
+    await backend.init_schema()
+
+    existing = await backend.list_projects()
+    if existing:
+        _ = await backend.list_tokens(existing[0]["id"])
+        return os.environ.get("FW_CACHE_ADMIN_TOKEN", "unknown")
+
+    token = await backend.create_admin_token()
+    os.environ["FW_CACHE_ADMIN_TOKEN"] = token
+    return token
+
+
+async def _async_list_projects(backend) -> list[dict]:
+    """List existing projects using an already-connected *backend*."""
+    return await backend.list_projects()
+
+
+async def _async_create_project(
+    backend, project_id: str
+) -> tuple[str, str, str] | None:
+    """Create a project + tokens using an already-connected *backend*."""
+    result = await backend.create_project(project_id)
+    if result is None:
+        print(f"    Project '{project_id}' already exists — creating additional tokens")
+
+    write_token = await backend.create_token(
+        project_id, can_read=True, can_write=True, can_overwrite=True, description="admin"
+    )
+    read_token = await backend.create_token(
+        project_id, can_read=True, can_write=False, can_overwrite=False, description="read-only"
+    )
+    return project_id, write_token, read_token
+
 
 def _ensure_cache_server_init() -> str | None:
-    """Initialize the cache server schema and return the admin token, or None on failure."""
+    """Standalone wrapper — used by CLI. Delegates to :func:`_async_init_cache_server`."""
     db_url = _find_db_url()
-
     print("  [ ] Cache server — checking...")
-
     if not db_url:
         print("    FW_CACHE_DB_URL not available — run 'fw-cache-server init' manually")
-        return os.environ.get("FW_CACHE_DB_URL", "unknown")
+        return os.environ.get("FW_CACHE_ADMIN_TOKEN", "unknown")
 
     import asyncio
+    from .backend import CacheBackend
 
-    async def _init() -> str | None:
-        from .backend import CacheBackend
-
+    async def _standalone():
         backend = CacheBackend(db_url)
         try:
             await backend.connect()
-            await backend.init_schema()
-
-            # Check if "default" project already exists
-            existing = await backend.list_projects()
-            if existing:
-                _ = await backend.list_tokens(existing[0]["id"])
-                print("  [✓] Cache server — already initialized")
-                print("      Re-run 'fw-cache-server init' manually if you need a new admin token")
-                return os.environ.get("FW_CACHE_ADMIN_TOKEN", "unknown")
-
-            # Create admin token (not scoped to any project — project_id IS NULL)
-            token = await backend.create_admin_token()
-            os.environ["FW_CACHE_ADMIN_TOKEN"] = token
-            return token
+            return await _async_init_cache_server(backend)
         finally:
             await backend.close()
 
     try:
-        token = asyncio.run(_init())
+        token = asyncio.run(_standalone())
     except Exception as e:
         print(f"  [!] Failed to init cache server: {e}")
         return None
@@ -439,7 +547,7 @@ def _ensure_cache_server_init() -> str | None:
     return token
 
 
-# -- Project and tokens --
+# -- Project and tokens (interactive UI, no asyncio.run inside) --
 
 def _detect_project_id_from_cwd() -> str | None:
     """Read project ID from .fw-context/config.toml in the current directory."""
@@ -458,80 +566,70 @@ def _detect_project_id_from_cwd() -> str | None:
     return None
 
 
-def _setup_project_and_tokens(admin_token: str) -> tuple[str, str, str] | None:
-    """Interactively create a project and its read/write tokens."""
-    import asyncio
+def _setup_project_and_tokens(
+    admin_token: str,
+) -> tuple[str, str, str] | None:
+    """Standalone project+token creation — used by CLI, not the wizard.
 
+    Opens its own database connection.  The wizard uses the inline
+    ``_all_db_ops()`` path instead (single ``asyncio.run()`` call).
+    """
+    import asyncio
+    from .backend import CacheBackend
     db_url = _find_db_url()
 
-    async def _list_existing() -> list[dict]:
-        from .backend import CacheBackend
+    existing: list[dict] = []
+
+    async def _standalone():
         backend = CacheBackend(db_url)
         try:
             await backend.connect()
-            return await backend.list_projects()
-        finally:
-            await backend.close()
+            projects = await _async_list_projects(backend)
 
-    existing = asyncio.run(_list_existing())
-    if existing:
-        print()
-        existing_ids = ", ".join(p["id"] for p in existing)
-        print(f"  Projects: {existing_ids}")
-        if not _ask("Create another project?"):
-            return None
+            # Show existing projects
+            if projects:
+                print()
+                existing_ids = ", ".join(p["id"] for p in projects)
+                print(f"  Projects: {existing_ids}")
+                if not _ask("Create another project?"):
+                    return None
 
-    # ── Auto-detect project ID from .fw-context/config.toml ──
-    detected_id = _detect_project_id_from_cwd()
+            # Get project ID
+            detected_id = _detect_project_id_from_cwd()
+            print()
+            if detected_id:
+                print(f"  Detected project ID: {detected_id}")
+                if _ask("Use this ID?"):
+                    pid = detected_id
+                else:
+                    try:
+                        pid = input("  Project ID (UUID4 hex): ").strip()
+                    except (EOFError, KeyboardInterrupt):
+                        return None
+            else:
+                print("  No .fw-context/config.toml detected in current directory.")
+                try:
+                    pid = input("  Project ID (UUID4 hex): ").strip()
+                except (EOFError, KeyboardInterrupt):
+                    return None
 
-    print()
-    if detected_id:
-        print(f"  Detected project ID: {detected_id}")
-        if _ask("Use this ID?"):
-            project_id = detected_id
-        else:
-            try:
-                project_id = input("  Project ID (UUID4 hex): ").strip()
-            except (EOFError, KeyboardInterrupt):
+            if not pid:
+                print("    Empty project ID — skipping")
                 return None
-    else:
-        print("  No .fw-context/config.toml detected in current directory.")
-        try:
-            project_id = input("  Project ID (UUID4 hex): ").strip()
-        except (EOFError, KeyboardInterrupt):
-            return None
 
-    if not project_id:
-        print("    Empty project ID — skipping")
-        return None
-
-    async def _create() -> tuple[str, str, str] | None:
-        from .backend import CacheBackend
-        backend = CacheBackend(db_url)
-        try:
-            await backend.connect()
-            result = await backend.create_project(project_id)
-            if result is None:
-                print(f"    Project '{project_id}' already exists — creating additional tokens")
-
-            write_token = await backend.create_token(
-                project_id, can_read=True, can_write=True, can_overwrite=True, description="admin"
-            )
-            read_token = await backend.create_token(
-                project_id, can_read=True, can_write=False, can_overwrite=False, description="read-only"
-            )
-            return project_id, write_token, read_token
+            # Create project + tokens
+            result = await _async_create_project(backend, pid)
+            if result:
+                proj_id, write_token, read_token = result
+                print(f"    [✓] Project '{proj_id}' created")
+                print(f"      Write token:  {write_token}")
+                print(f"      Read token:   {read_token}")
+            return result
         finally:
             await backend.close()
 
     try:
-        result = asyncio.run(_create())
-        if result:
-            proj_id, write_token, read_token = result
-            print(f"    [✓] Project '{proj_id}' created")
-            print(f"      Write token:  {write_token}")
-            print(f"      Read token:   {read_token}")
-            return result
+        return asyncio.run(_standalone())
     except Exception as e:
         print(f"    [!] Failed to create project: {e}")
     return None
@@ -554,7 +652,7 @@ def _ensure_systemd_service() -> None:
     try:
         pwd.getpwnam("fw-cache")
     except KeyError:
-        _run(["sudo", "useradd", "-r", "-s", "/usr/sbin/nologin", "-d", "/nonexistent", "fw-cache"], timeout=10)
+        _run(["sudo", "useradd", "-r", "-s", shutil.which("nologin") or "/usr/sbin/nologin", "-d", "/nonexistent", "fw-cache"], timeout=10)
 
     from .install import generate_systemd_unit, install_systemd_unit
 
@@ -681,6 +779,9 @@ def _ensure_nginx() -> None:
         subprocess.run(["sudo", "tee", tmp_path], input=http_config, text=True,
                        capture_output=True, timeout=10)
         enable_nginx_site()
+        if not test_nginx_config():
+            print("  [!] nginx config test failed — skipping reload", file=sys.stderr)
+            return
         subprocess.run(["sudo", "nginx", "-s", "reload"], capture_output=True, timeout=10)
 
         # Run certbot (tries standalone first, then nginx)

@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import logging
+import re
 from typing import TYPE_CHECKING
 
 from fw_context_mcp.search.phases.base import Phase
+
+_SAFE_FTS5_TOKEN = re.compile(r"^[\w*]+$")  # cached at module level
 
 if TYPE_CHECKING:
     from fw_context_mcp.search.context import PipelineContext
@@ -40,7 +43,8 @@ class FTS5SearchPhase(Phase):
         return ctx.evolve(fts5_results=rows)
 
 
-def _search_queries(conn, queries: list[str], config_hash: str, fetch_limit: int) -> list[dict]:
+def _search_queries(  # TODO(Perf-L14): combine OR + name_tokens into single FTS5 expression
+        conn, queries: list[str], config_hash: str, fetch_limit: int) -> list[dict]:
     """Execute both OR query and name_tokens query, merge with dedup.
 
     The name_tokens column filter is applied to each space-separated token
@@ -50,9 +54,12 @@ def _search_queries(conn, queries: list[str], config_hash: str, fetch_limit: int
     if not queries:
         return []
 
-    import re
 
-    or_query = " OR ".join(queries)
+    # Sanitize queries through safe token pattern (guard against LLM-generated
+    # FTS5 syntax that could alter query semantics)
+    safe_queries = [" ".join(t for t in q.split() if _SAFE_FTS5_TOKEN.match(t)) for q in queries]
+    safe_queries = [q for q in safe_queries if q]
+    or_query = " OR ".join(safe_queries) if safe_queries else ""
 
     # FTS5 column-filter syntax applies only to the immediately following
     # token.  Split multi-word queries so each token gets its own filter:
@@ -61,10 +68,9 @@ def _search_queries(conn, queries: list[str], config_hash: str, fetch_limit: int
     # Sanitize tokens: only allow alphanumeric, underscore, and wildcard.
     # LLM-generated terms may contain FTS5 syntax that would change query
     # semantics if interpolated directly into the column filter.
-    _SAFE_TOKEN = re.compile(r"^[\w*]+$")
     _nt_parts: list[str] = []
     for kq in queries:
-        tokens = [t for t in kq.split() if _SAFE_TOKEN.match(t)]
+        tokens = [t for t in kq.split() if _SAFE_FTS5_TOKEN.match(t)]
         if not tokens:
             continue
         if len(tokens) >= 2:
@@ -89,6 +95,6 @@ def _search_queries(conn, queries: list[str], config_hash: str, fetch_limit: int
                 elif r["is_definition"] and not rows[prev_idx].get("is_definition"):
                     rows[prev_idx] = dict(r)
         except Exception as e:
-            log.warning("FTS5 query failed (q=%r): %s", q[:60], e)
+            log.warning("FTS5 query failed (q=%r)", q[:60], exc_info=True)
 
     return rows

@@ -15,6 +15,8 @@ import logging
 import threading
 from typing import TYPE_CHECKING
 
+import numpy as np
+
 from .embedder import Embedder
 
 if TYPE_CHECKING:
@@ -24,6 +26,11 @@ log = logging.getLogger(__name__)
 
 # Model-specific max token limits (fallback when model card not loaded)
 _MODEL_MAX_TOKENS: dict[str, int] = {
+    # Ollama-hosted models (included for documentation — resolved via OllamaEmbedder)
+    "qwen3-embedding:0.6b": 32768,
+    "qwen3-embedding:4b": 32768,
+    "qwen3-embedding:8b": 8192,
+    # HuggingFace SentenceTransformer models
     "ibm-granite/granite-embedding-311m-multilingual-r2": 32768,
     "ibm-granite/granite-embedding-97m-multilingual-r2": 32768,
     "ibm-granite/granite-embedding-278m-multilingual": 8192,
@@ -46,6 +53,9 @@ class SentenceTransformerEmbedder(Embedder):
         self._model = None
         self._dim: int | None = None
         self._native_dim: int | None = None  # model's full dim before MRL truncation
+        # NOTE: Lock() (non-reentrant) is correct here — _ensure_model() uses
+        # double-checked locking and SentenceTransformer.__init__ doesn't call
+        # back into the embedder's own properties (no deadlock risk).
         self._lock = threading.Lock()
 
     def _ensure_model(self):
@@ -75,10 +85,11 @@ class SentenceTransformerEmbedder(Embedder):
         """Encode and optionally MRL-truncate + normalize."""
         if self._model is None:
             raise RuntimeError("_encode called before _ensure_model()")
+        if not texts:
+            return []
         result = self._model.encode(texts, normalize_embeddings=True)
         if self._cfg.embed_dim and self._cfg.embed_dim < len(result[0]):
             result = result[:, : self._cfg.embed_dim]
-            import numpy as np
             norms = np.linalg.norm(result, axis=1, keepdims=True)
             norms[norms == 0] = 1.0
             result = result / norms
@@ -104,7 +115,8 @@ class SentenceTransformerEmbedder(Embedder):
 
     @property
     def dim(self) -> int | None:
-        return self._dim
+        with self._lock:
+            return self._dim
 
     @property
     def model(self):

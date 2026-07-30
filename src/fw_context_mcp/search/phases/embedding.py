@@ -16,6 +16,9 @@ import logging
 from typing import TYPE_CHECKING
 
 from fw_context_mcp.search.phases.base import Phase
+from fw_context_mcp.indexer.db import get_embeddings, open_db, search_similar_hybrid, search_similar_vec
+from fw_context_mcp.llm.embedder_factory import get_embedder
+from fw_context_mcp.llm.ollama import OllamaError
 
 if TYPE_CHECKING:
     from fw_context_mcp.search.context import PipelineContext
@@ -60,7 +63,7 @@ class EmbeddingPhase(Phase):
 
     def should_run(self, ctx) -> bool:
         """Only run when LLM is enabled and no Ollama warning occurred earlier."""
-        return ctx.config.llm.enabled and ctx.ollama_warning is None
+        return ctx.config.llm is not None and ctx.config.llm.enabled and ctx.ollama_warning is None
 
     async def run(self, ctx: PipelineContext) -> PipelineContext:
         """Run semantic search via cosine similarity as a re-rank or standalone KNN.
@@ -71,14 +74,7 @@ class EmbeddingPhase(Phase):
         brute-force BLOB search for legacy indexes.
         """
 
-        from fw_context_mcp.indexer.db import (
-            get_embeddings,
-            open_db,
-            search_similar_hybrid,
-            search_similar_vec,
-        )
-        from fw_context_mcp.llm.embedder import get_embedder
-        from fw_context_mcp.llm.ollama import OllamaError
+        # imports at module level
 
         conn = open_db(ctx.db_path)
         try:
@@ -119,6 +115,8 @@ class EmbeddingPhase(Phase):
                         threshold=self.threshold,
                         limit=self.overfetch,
                     )
+                    # NOTE: hybrid results are FTS5-filtered, not purely dense —
+                    # AdaptiveFusionPhase should treat them as hybrid, not embedding-only.
                     return ctx.evolve(embedding_results=rows)
 
                 # ---- Direct KNN path ----
@@ -131,16 +129,22 @@ class EmbeddingPhase(Phase):
                         limit=self.overfetch,
                     )
                     if vec_rows:
-                        sym_ids = [r["symbol_id"] for r in vec_rows]
-                        placeholders = ",".join("?" * len(sym_ids))
+                        distance_map = {r["symbol_id"]: r.get("distance", 0.0) for r in vec_rows}
+                        sym_ids = list(distance_map.keys())
+                        placeholders = ",".join("?" * len(sym_ids))  # SAFE: values in params, not f-string
                         emb_rows = conn.execute(
                             f"""SELECT * FROM symbols
                                 WHERE config_hash = ? AND id IN ({placeholders})
                                 AND is_definition = 1""",
                             (ctx.config_hash, *sym_ids),
                         ).fetchall()
-                        return ctx.evolve(embedding_results=[dict(r) for r in emb_rows])
-                    return ctx
+                        results: list[dict] = []
+                        for r in emb_rows:
+                            d = dict(r)
+                            dist = distance_map.get(d.get("id", -1), 0.0)
+                            d["_similarity"] = round(float(1.0 - dist), 4)
+                            results.append(d)
+                        return ctx.evolve(embedding_results=results)
 
                 # ---- Brute-force fallback (legacy BLOB table) ----
                 if has_blob:
@@ -151,7 +155,7 @@ class EmbeddingPhase(Phase):
                     top_ids = [s[0] for s in scored[: self.overfetch]]
                     if not top_ids:
                         return ctx
-                    placeholders = ",".join("?" * len(top_ids))
+                    placeholders = ",".join("?" * len(top_ids))  # SAFE: values in params, not f-string
                     emb_rows = conn.execute(
                         f"""SELECT * FROM symbols
                             WHERE config_hash = ? AND id IN ({placeholders})

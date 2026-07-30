@@ -35,12 +35,15 @@ def _spawn_daemon(root: Path) -> None:
     db_path = _db_path(root)
     log_file = db_path.parent / "daemon.log"
     try:
-        subprocess.Popen(
+        log_fh = open(log_file, "a", encoding="utf-8")
+        proc = subprocess.Popen(
             [sys.executable, "-u", "-m", "fw_context_mcp.mcp.daemon", str(root)],
             start_new_session=True,
-            stdout=open(log_file, "a", encoding="utf-8"),
+            stdout=log_fh,
             stderr=subprocess.STDOUT,
         )
+        log_fh.close()
+        # Daemon process runs independently via start_new_session=True — no detach needed
     except Exception:
         log.exception("Failed to spawn watcher daemon for %s", root)
 
@@ -142,6 +145,10 @@ def _ensure_daemon_running(root: Path) -> None:
 
     # Spawn the daemon.  It acquires its own watcher.lock on startup.
     # Release our lock before spawning so the daemon can take it.
+    # NOTE: There is a narrow race window between unlock and spawn where
+    # another MCP server could also spawn a daemon.  The daemon's own
+    # fcntl lock guards against duplicate processes — the second spawn
+    # will fail at its own lock acquisition and exit.
     fcntl.flock(lock_fd, fcntl.LOCK_UN)
     os.close(lock_fd)
 
@@ -243,34 +250,34 @@ def _fast_staleness_check(root: Path) -> tuple[bool, list[str]]:
     conn, err = _open_db_safe(db_path)
     if err:
         return False, []
-    assert conn is not None
+    if conn is None:
+        return False, []
     reasons: list[str] = []
     try:
-        with conn:
-            project_id = derive_project_id(root)
-            cfg = get_active_config(conn, project_id)
-            if not cfg:
-                return False, []
-            config_hash = cfg["config_hash"]
+        project_id = derive_project_id(root)
+        cfg = get_active_config(conn, project_id)
+        if not cfg:
+            return False, []
+        config_hash = cfg["config_hash"]
 
-            # 1. compile_commands.json changed? (one stat call)
-            cc_path = cfg["compile_commands_path"]
-            if _is_stale(cfg, cc_path):
-                reasons.append("compile_commands.json changed")
+        # 1. compile_commands.json changed? (one stat call)
+        cc_path = cfg["compile_commands_path"]
+        if _is_stale(cfg, cc_path):
+            reasons.append("compile_commands.json changed")
 
-            # 2. Schema version mismatch?
-            schema_ver = get_db_schema_version(conn)
-            if schema_ver < CURRENT_SCHEMA_VERSION:
-                reasons.append(f"schema {schema_ver} < {CURRENT_SCHEMA_VERSION}")
+        # 2. Schema version mismatch?
+        schema_ver = get_db_schema_version(conn)
+        if schema_ver < CURRENT_SCHEMA_VERSION:
+            reasons.append(f"schema {schema_ver} < {CURRENT_SCHEMA_VERSION}")
 
-            # 3. Missing refs or indirect call sites?
-            proj_cfg = load_config(root)
-            if proj_cfg.index.index_refs:
-                ref_count = conn.execute(
+        # 3. Missing refs or indirect call sites?
+        proj_cfg = load_config(root)
+        if proj_cfg.index.index_refs:
+            ref_count = conn.execute(
                     "SELECT COUNT(*) FROM refs WHERE config_hash=?",
                     (config_hash,),
-                ).fetchone()[0]
-                if ref_count == 0:
+            ).fetchone()[0]
+            if ref_count == 0:
                     reasons.append("refs missing")
                     # Also check indirect call sites — but only flag them
                     # when refs are missing (if refs were populated, the
@@ -282,14 +289,14 @@ def _fast_staleness_check(root: Path) -> tuple[bool, list[str]]:
                     if ics_count == 0:
                         reasons.append("indirect call sites missing")
 
-            # 4. Unanalyzed symbols?
-            # Uses CONFIG analyze_vendor (not stored) because this check
-            # predicts what the background reindex will do — and the
-            # background reindex uses config, not stored flags.  Using
-            # stored would cause an infinite reindex loop when a manual
-            # --analyze-vendor run stored True but config is False.
-            if proj_cfg.llm.enabled and proj_cfg.llm.analyze_symbols:
-                if proj_cfg.llm.analyze_vendor:
+        # 4. Unanalyzed symbols?
+        # Uses CONFIG analyze_vendor (not stored) because this check
+        # predicts what the background reindex will do — and the
+        # background reindex uses config, not stored flags.  Using
+        # stored would cause an infinite reindex loop when a manual
+        # --analyze-vendor run stored True but config is False.
+        if proj_cfg.llm.enabled and proj_cfg.llm.analyze_symbols:
+            if proj_cfg.llm.analyze_vendor:
                     unanalyzed = conn.execute(
                         """SELECT COUNT(*)
                            FROM symbols s
@@ -300,10 +307,10 @@ def _fast_staleness_check(root: Path) -> tuple[bool, list[str]]:
                                             'class', 'struct')
                              AND s.name NOT LIKE '%(anonymous%'
                              AND s.name NOT LIKE '%(unnamed%'
-                             AND s.id NOT IN (SELECT symbol_id FROM llm_analysis)""",
+                             AND NOT EXISTS (SELECT 1 FROM llm_analysis a WHERE a.symbol_id = s.id)""",
                         (config_hash,),
                     ).fetchone()[0]
-                else:
+            else:
                     # Use is_project column directly for unanalyzed symbol count
                     unanalyzed = conn.execute(
                         """SELECT COUNT(*)
@@ -316,10 +323,10 @@ def _fast_staleness_check(root: Path) -> tuple[bool, list[str]]:
                                             'class', 'struct')
                              AND s.name NOT LIKE '%(anonymous%'
                              AND s.name NOT LIKE '%(unnamed%'
-                             AND s.id NOT IN (SELECT symbol_id FROM llm_analysis)""",
+                             AND NOT EXISTS (SELECT 1 FROM llm_analysis a WHERE a.symbol_id = s.id)""",
                         (config_hash,),
                     ).fetchone()[0]
-                if unanalyzed > 0:
+            if unanalyzed > 0:
                     reasons.append(f"{unanalyzed} unanalyzed symbols")
     finally:
         conn.close()

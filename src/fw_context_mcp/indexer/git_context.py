@@ -11,7 +11,7 @@ log = logging.getLogger(__name__)
 # Hard-coded UTF-8 — git outputs UTF-8 on all modern platforms regardless of
 # locale, and branch/tag names can contain Unicode characters.
 _GIT_ENCODING = "utf-8"
-_GIT_TIMEOUT = 5  # seconds — prevents hangs on NFS or corrupt .git directories
+_GIT_TIMEOUT = 5  # seconds; may fail on repos with 20K+ tags or NFS — degrades gracefully — prevents hangs on NFS or corrupt .git directories
 
 
 def get_git_description(project_root: Path) -> str:
@@ -36,7 +36,7 @@ def get_git_description(project_root: Path) -> str:
             text=True,
             encoding=_GIT_ENCODING,
             timeout=_GIT_TIMEOUT,
-            stderr=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
         ).strip()
         # Detached HEAD reports "HEAD" — semantically misleading in a
         # description, so treat it as no branch.
@@ -53,7 +53,7 @@ def get_git_description(project_root: Path) -> str:
             text=True,
             encoding=_GIT_ENCODING,
             timeout=_GIT_TIMEOUT,
-            stderr=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
         ).strip()
         if tag:
             parts.append(f"tag: {tag}")

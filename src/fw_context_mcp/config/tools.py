@@ -467,6 +467,9 @@ def check_target(target: InstructionTarget, project_root: Path | None = None) ->
 
     try:
         content = resolved.read_text(encoding="utf-8")
+    except PermissionError:
+        # File exists but is not readable (e.g. root-owned)
+        return collision
     except (UnicodeDecodeError, OSError):
         return collision
 

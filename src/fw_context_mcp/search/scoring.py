@@ -6,6 +6,11 @@ apply the same scoring rules.
 
 from __future__ import annotations
 
+import re
+
+# Regex cache for _stem_matches — avoids re.compile() on every call
+_STEM_PATTERN_CACHE: dict[str, re.Pattern] = {}
+
 # Bonus for definition-level symbol kinds (functions, methods, classes, etc.)
 # vs lightweight kinds (variables, fields, namespaces).
 KIND_WEIGHT: dict[str, int] = {
@@ -24,6 +29,33 @@ KIND_WEIGHT: dict[str, int] = {
     "variable": 0,
     "field": 0,
 }
+
+
+def _stem_matches(stem: str, name: str, name_tokens: str) -> bool:
+    """Check if *stem* matches at token boundaries — not as substring.
+
+    Matches when *stem* appears as a whole token in *name_tokens*
+    (space-separated) or at underscore/case boundaries in *name*.
+    Avoids false positives like stem ``"tim"`` matching ``"optimization"``.
+    """
+    # Fast path: exact match in space-separated tokens
+    if stem in name_tokens.split():
+        return True
+    # Check underscore/case boundaries in the raw name
+    if stem == name:
+        return True
+    # Check for stem at underscore boundaries: _stem_ or stem_ or _stem
+    if f"_{stem}_" in name or name.startswith(f"{stem}_") or name.endswith(f"_{stem}"):
+        return True
+    # Check for stem at double-underscore boundaries (GNU/C extensions: __wrap_malloc)
+    if f"__{stem}__" in name:
+        return True
+    # Check for stem at case boundaries (camelCase/PascalCase) — cached regex
+    pattern = _STEM_PATTERN_CACHE.get(stem)
+    if pattern is None:
+        pattern = re.compile(rf'(?:^|_|[a-z])({re.escape(stem)})(?:$|_|[A-Z])')
+        _STEM_PATTERN_CACHE[stem] = pattern
+    return bool(pattern.search(name))
 
 
 def score_result(
@@ -50,9 +82,11 @@ def score_result(
 
     s = 0
     for stem in query_stems:
-        if len(stem) < 2:  # skip single-char stems — too noisy
+        if len(stem) < 2:  # skip single-char stems
             continue
-        if stem in name or stem in ntoks:
+        # Token-boundary match: stem must match a whole token in name_tokens
+        # (space-separated), or appear at underscore/case boundaries in name.
+        if _stem_matches(stem, name, ntoks):
             s += 3
         elif stem in qname:
             s += 2

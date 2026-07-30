@@ -53,8 +53,10 @@ def resolve_macros_via_preprocessor(
             tmp_path = tmp.name
         cmd = [clang_binary, "-dM", "-E", *flags, tmp_path]
         try:
+            cmd = _sanitize_flags(cmd)
             result = subprocess.run(
                 cmd, capture_output=True, text=True, timeout=timeout,
+            cwd=file_path.parent if file_path.parent.exists() else Path.cwd(),
             )
         finally:
             Path(tmp_path).unlink(missing_ok=True)
@@ -196,5 +198,5 @@ def resolve_and_update(
         )
         updated += cur.rowcount
     if updated:
-        conn.commit()
+        conn.commit()  # defensive: _run_postprocess doesn't commit after this point
     return updated
