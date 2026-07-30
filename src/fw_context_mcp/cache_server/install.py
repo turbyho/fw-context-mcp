@@ -35,7 +35,7 @@ After=network.target postgresql.service
 [Service]
 Type=simple
 User={user}
-Environment=FW_CACHE_DB_URL={db_url}
+EnvironmentFile=/var/lib/fw-cache-server/db.env
 Environment=FW_CACHE_PORT={port}
 ExecStart={executable} run
 Restart=always
@@ -51,17 +51,16 @@ WantedBy=multi-user.target
 
 def generate_systemd_unit(
     user: str | None = None,
-    db_url: str | None = None,
     port: int = 8000,
 ) -> str:
-    """Generate a systemd unit file content."""
+    """Generate a systemd unit file content.
+
+    Database credentials are read from ``/var/lib/fw-cache-server/db.env``
+    via ``EnvironmentFile=`` — they are NOT embedded in the unit file.
+    """
     env_port = int(os.environ.get("FW_CACHE_PORT", str(port)))
-    env_db = db_url or os.environ.get("FW_CACHE_DB_URL", "")
-    if not env_db:
-        raise ValueError("FW_CACHE_DB_URL must be set — e.g. postgresql://fw_cache:<password>@localhost:5432")
     return SYSTEMD_UNIT_TEMPLATE.format(
         user=user or "fw-cache",
-        db_url=env_db,
         port=env_port,
         executable=_server_executable(),
     )
@@ -71,6 +70,18 @@ def install_systemd_unit(unit_text: str) -> None:
     """Write the unit file to /etc/systemd/system/fw-cache-server.service (via sudo)."""
     import subprocess
     unit_path = "/etc/systemd/system/fw-cache-server.service"
+
+    # Check passwordless sudo before attempting tee
+    try:
+        subprocess.run(["sudo", "-n", "true"], capture_output=True, timeout=5, check=True)
+    except (subprocess.CalledProcessError, FileNotFoundError, subprocess.TimeoutExpired):
+        print("Passwordless sudo not available — printing unit for manual install:", file=sys.stderr)
+        print(unit_text)
+        print(f"\nSave the above to {unit_path}, then run:")
+        print("  sudo systemctl daemon-reload")
+        print("  sudo systemctl enable --now fw-cache-server")
+        return
+
     try:
         result = subprocess.run(
             ["sudo", "tee", unit_path],
@@ -100,18 +111,12 @@ LAUNCHD_PLIST_TEMPLATE = """<?xml version="1.0" encoding="UTF-8"?>
     <string>com.fwcontext.cache-server</string>
     <key>ProgramArguments</key>
     <array>
-        <string>{executable}</string>
-        <string>run</string>
-        <string>--host</string>
-        <string>{host}</string>
-        <string>--port</string>
-        <string>{port}</string>
+        <string>/bin/sh</string>
+        <string>-c</string>
+        <string>. /var/lib/fw-cache-server/db.env 2>/dev/null \
+         || . ~/.fw-context/db.env 2>/dev/null; \
+         exec {executable} run --host {host} --port {port}</string>
     </array>
-    <key>EnvironmentVariables</key>
-    <dict>
-        <key>FW_CACHE_DB_URL</key>
-        <string>{db_url}</string>
-    </dict>
     <key>RunAtLoad</key>
     <true/>
     <key>KeepAlive</key>
@@ -128,18 +133,18 @@ LAUNCHD_PLIST_TEMPLATE = """<?xml version="1.0" encoding="UTF-8"?>
 def generate_launchd_plist(
     host: str = "127.0.0.1",
     port: int = 8000,
-    db_url: str | None = None,
 ) -> str:
-    """Generate a launchd plist file content."""
+    """Generate a launchd plist file content.
+
+    Database credentials are read from ``/var/lib/fw-cache-server/db.env``
+    (or ``~/.fw-context/db.env`` as fallback) at launch time — they are
+    NOT embedded in the plist file.
+    """
     env_port = int(os.environ.get("FW_CACHE_PORT", str(port)))
-    env_db = db_url or os.environ.get("FW_CACHE_DB_URL", "")
-    if not env_db:
-        raise ValueError("FW_CACHE_DB_URL must be set — e.g. postgresql://fw_cache:<password>@localhost:5432")
     return LAUNCHD_PLIST_TEMPLATE.format(
         executable=_server_executable(),
         host=host,
         port=env_port,
-        db_url=env_db,
         log_dir="/var/log",
     )
 

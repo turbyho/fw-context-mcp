@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import logging
 import subprocess
+import threading
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -31,6 +32,7 @@ _DEFAULT_GPU_MODEL = "qwen3-embedding:8b"
 # (e.g. MCP tool workers) resolve once each.
 _cached_model: str | None = None
 _cached_gpu: bool | None = None
+_auto_model_lock = threading.Lock()
 
 
 def _reset_auto_model_cache() -> None:
@@ -79,7 +81,9 @@ def _model_installed(ollama_url: str, model: str) -> bool:
 
 
 def _try_pull(model: str, ollama_url: str) -> bool:
-    """Pull *model*, return True on success.  Never raises."""
+    """Best-effort pre-warm pull with 5s read timeout.
+    Real pull (in ollama.py) uses 600s timeout — this just tries to
+    start the download early so it's ready when embedder initializes."""
     import httpx
 
     url = ollama_url.rstrip("/") + "/api/pull"
@@ -118,18 +122,33 @@ def resolve_embed_model(cfg: LLMConfig) -> None:
     if cfg.embed_model:
         return
 
+    # Fast path: cache already populated (no lock needed for reads after
+    # the first write — Python GIL makes the reference assignment atomic).
     if _cached_model is not None:
         cfg.embed_model = _cached_model
         _apply_prompt_defaults(cfg)
         return
 
-    gpu = _gpu_available()
-    target = _DEFAULT_GPU_MODEL if gpu else _DEFAULT_CPU_MODEL
-    cfg.embed_model = target
-    _cached_model = target
-    _cached_gpu = gpu
+    with _auto_model_lock:
+        if _cached_model is not None:
+            cfg.embed_model = _cached_model
+            _apply_prompt_defaults(cfg)
+            return
 
+        gpu = _gpu_available()
+        target = _DEFAULT_GPU_MODEL if gpu else _DEFAULT_CPU_MODEL
+        cfg.embed_model = target
+        _cached_model = target
+        _cached_gpu = gpu
+
+    # NOTE: _apply_prompt_defaults, _model_installed, and _try_pull are outside
+    # _auto_model_lock.  This is intentional — they perform HTTP requests which
+    # would serialize all config loads.  The cache is already populated above
+    # (inside the lock) so subsequent calls take the fast path at line 127.
+    # Worst case on first call: two threads both check/pull — harmless
+    # best-effort operations with short timeouts.
     _apply_prompt_defaults(cfg)
+
 
     if _model_installed(cfg.ollama_url, target):
         log.info("Auto-detected embed model: %s (GPU=%s, already installed)", target, gpu)

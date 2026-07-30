@@ -15,7 +15,7 @@ from fw_context_mcp.config import load as load_config
 from fw_context_mcp.utils import resolve_project_root
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class PipelineContext:
     """State object flowing through every search phase.
 
@@ -103,5 +103,5 @@ class PipelineContext:
             query=query,
             original_query=query,
             config=cfg,
-            limit=min(limit, 100),
+            limit=max(5, min(limit, 100)),
         )

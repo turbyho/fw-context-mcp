@@ -18,7 +18,7 @@ import sqlite3
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
 from .db import search_symbols
 
@@ -85,6 +85,9 @@ def _generate_queries(conn: sqlite3.Connection, config_hash: str) -> list[tuple[
         (config_hash,),
     ).fetchall()
 
+    templates = [t[0] for t in _QUERY_TEMPLATES]
+    weights = [t[1] for t in _QUERY_TEMPLATES]
+
     queries: list[tuple[str, int]] = []
     for r in rows:
         name = r["name"] or ""
@@ -96,8 +99,6 @@ def _generate_queries(conn: sqlite3.Connection, config_hash: str) -> list[tuple[
         doc = doc[:120]
         summary = summary[:120]
 
-        templates = [t[0] for t in _QUERY_TEMPLATES]
-        weights = [t[1] for t in _QUERY_TEMPLATES]
         template = _random.choices(templates, weights=weights, k=1)[0]
         try:
             q = template.format(
@@ -170,13 +171,18 @@ def mine_disagreements(
     result = MiningResult()
 
     try:
+        import sqlite_vec
         conn = sqlite3.connect(str(db_path))
-    except sqlite3.OperationalError as e:
+        conn.enable_load_extension(True)
+        sqlite_vec.load(conn)
+        conn.enable_load_extension(False)
+    except (sqlite3.OperationalError, ImportError, AttributeError) as e:
         log.warning("Cannot open database %s: %s", db_path, e)
         return result
 
-    with conn:
-        conn.row_factory = sqlite3.Row
+    try:
+        with conn:
+            conn.row_factory = sqlite3.Row
 
         config_hash = conn.execute(
             "SELECT config_hash FROM build_configs ORDER BY indexed_at DESC LIMIT 1"
@@ -201,7 +207,7 @@ def mine_disagreements(
         query_symbol_ids = [q[1] for q in queries]
         try:
             query_vecs = embedder.embed_queries(query_texts)
-        except Exception as e:
+        except (RuntimeError, ConnectionError, OSError) as e:
             log.error("Failed to embed queries: %s", e)
             return result
 
@@ -252,6 +258,12 @@ def mine_disagreements(
             })
             result.disagreements_found += 1
 
+            if result.disagreements_found % 100 == 0:
+                elapsed = time.monotonic() - t0
+                log.info(
+                    "Mining: %d/%d queries, %d triples (%.1fs)",
+                    i + 1, len(query_texts), result.disagreements_found, elapsed,
+                )
         result.queries_skipped = skipped
         result.elapsed_s = time.monotonic() - t0
 
@@ -260,7 +272,8 @@ def mine_disagreements(
             result.disagreements_found, len(queries), skipped, result.elapsed_s,
         )
         return result
-
+    finally:
+        conn.close()
 
 def _load_triple_bodies(
     conn: sqlite3.Connection, config_hash: str, triple_ids: set[int]
@@ -268,12 +281,11 @@ def _load_triple_bodies(
     """Load description text for symbol IDs referenced in triples."""
     if not triple_ids:
         return {}
+    placeholders = ",".join("?" * len(triple_ids))
     rows = conn.execute(
-        """SELECT id, name, kind, signature, docstring, summary
+        f"""SELECT id, name, kind, signature, docstring, summary
            FROM symbols
-           WHERE config_hash = ? AND id IN ({})""".format(
-            ",".join("?" * len(triple_ids))
-        ),
+           WHERE config_hash = ? AND id IN ({placeholders})""",
         (config_hash, *triple_ids),
     ).fetchall()
     bodies: dict[int, str] = {}
@@ -338,9 +350,16 @@ def train_step(
             all_ids.add(t["negative_id"])
         bodies = _load_triple_bodies(conn, config_hash, all_ids)
 
-    st_model: Any = getattr(embedder, "model", None)
-    if st_model is None:
-        log.error("Embedder has no loaded model — must be SentenceTransformerEmbedder")
+    from ..llm.st_embedder import SentenceTransformerEmbedder
+
+    if not isinstance(embedder, SentenceTransformerEmbedder):
+        log.error("Embedder must be a SentenceTransformerEmbedder for fine-tuning")
+        return None
+
+    try:
+        st_model = embedder.model
+    except Exception as e:
+        log.error("Failed to load embedding model: %s", e)
         return None
 
     query_texts: list[str] = []

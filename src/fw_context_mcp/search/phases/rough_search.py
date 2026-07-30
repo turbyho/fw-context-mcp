@@ -22,11 +22,13 @@ from fw_context_mcp.search.phases.embedding_helpers import (
     brute_force_search,
     table_exists,
     table_has_rows,
+    round_robin_by_kind,
 )
 
 log = logging.getLogger(__name__)
 
 _table_exists = table_exists  # backward-compat alias
+_table_has_rows = table_has_rows
 
 # Words that add no search signal
 _STOP_WORDS = frozenset({
@@ -63,7 +65,7 @@ class RoughSearchPhase(Phase):
         back to FTS5 word-pair + single-word search. Extracts keyword
         terms from sample names for downstream FTS5 fallback use.
         """
-        from fw_context_mcp.indexer.db import open_db as _open_db
+        from fw_context_mcp.indexer.db import get_embeddings, open_db as _open_db, search_similar_vec
 
         query = ctx.query
         config_hash = ctx.config_hash
@@ -83,7 +85,7 @@ class RoughSearchPhase(Phase):
                     rough_terms.append(w)
 
         # ── Try embedding-based rough search ──────────────────────────────
-        if ctx.config.llm.enabled:
+        if ctx.config.llm is not None and ctx.config.llm.enabled:
             emb_samples = await _try_embedding_samples(ctx)
             if emb_samples and len(emb_samples) >= 5:
                 # Extract rough_terms from sample names for FTS5 fallback
@@ -112,14 +114,12 @@ class RoughSearchPhase(Phase):
 async def _try_embedding_samples(ctx) -> list[dict] | None:
     """Try embedding search for rough samples. Returns None on failure."""
     try:
+        # open_db imported at module level as _open_db
         from fw_context_mcp.indexer.db import (
             get_embeddings,
             search_similar_vec,
         )
-        from fw_context_mcp.indexer.db import (
-            open_db as _open_db,
-        )
-        from fw_context_mcp.llm.embedder import get_embedder
+        from fw_context_mcp.llm.embedder_factory import get_embedder
         from fw_context_mcp.llm.ollama import OllamaError
     except Exception:
         log.warning("Embedding rough search unavailable — import failed", exc_info=True)
@@ -127,7 +127,6 @@ async def _try_embedding_samples(ctx) -> list[dict] | None:
 
     conn = _open_db(ctx.db_path)
     try:
-        with conn:
             has_vec0 = _table_exists(conn, "vec_symbols")
             has_blob = _table_has_rows(conn, "embeddings")
 
@@ -150,22 +149,16 @@ async def _try_embedding_samples(ctx) -> list[dict] | None:
                 )
                 if rows:
                     sym_ids = [r["symbol_id"] for r in rows]
-                    placeholders = ",".join("?" * len(sym_ids))
+                    placeholders = ",".join("?" * len(sym_ids))  # SAFE: values in params, not f-string
                     sym_rows = conn.execute(
                         f"""SELECT * FROM symbols
                             WHERE config_hash = ? AND id IN ({placeholders})
-                            AND is_definition = 1
-                            ORDER BY CASE WHEN kind = 'function' THEN 0
-                                          WHEN kind = 'method' THEN 1
-                                          WHEN kind = 'class' THEN 2
-                                          WHEN kind = 'struct' THEN 3
-                                          WHEN kind = 'varglobal' THEN 4
-                                          ELSE 5 END
-                            LIMIT 20""",
+                            AND is_definition = 1""",
                         (ctx.config_hash, *sym_ids),
                     ).fetchall()
                     if sym_rows:
-                        return [dict(r) for r in sym_rows]
+                        result = round_robin_by_kind(sym_rows, limit=20)
+                        return [dict(r) for r in result]
                 # vec0 had no matches for this config_hash — fall through to BLOB
 
             # Legacy BLOB fallback
@@ -177,7 +170,7 @@ async def _try_embedding_samples(ctx) -> list[dict] | None:
                 top_ids = [s[0] for s in scored[:20]]
                 if not top_ids:
                     return None
-                placeholders = ",".join("?" * len(top_ids))
+                placeholders = ",".join("?" * len(top_ids))  # SAFE: values in params, not f-string
                 sym_rows = conn.execute(
                     f"""SELECT * FROM symbols
                         WHERE config_hash = ? AND id IN ({placeholders})
@@ -197,6 +190,44 @@ async def _try_embedding_samples(ctx) -> list[dict] | None:
         conn.close()
 
 
+def _round_robin_by_kind(rows: list[sqlite3.Row], limit: int = 20) -> list[sqlite3.Row]:
+    """Select *limit* rows with kind diversity via round-robin.
+
+    Groups rows by kind (function, method, class, struct, varglobal, other),
+    then round-robins one from each group until *limit* is reached.  Avoids
+    the ORDER BY CASE problem where functions crowd out structs/globals.
+    Preserves the original order within each group (already sorted by
+    vector similarity from search_similar_vec).
+    """
+    import sqlite3 as _sqlite3
+
+    groups: dict[str, list[_sqlite3.Row]] = {
+        "function": [], "method": [], "class": [], "struct": [],
+        "varglobal": [], "other": [],
+    }
+    for r in rows:
+        kind = r["kind"] or "other"
+        if kind in groups:
+            groups[kind].append(r)
+        else:
+            groups["other"].append(r)
+
+    result: list[_sqlite3.Row] = []
+    indices = {k: 0 for k in groups}
+    while len(result) < limit:
+        added = False
+        for kind in ("function", "method", "class", "struct", "varglobal", "other"):
+            idx = indices[kind]
+            if idx < len(groups[kind]):
+                result.append(groups[kind][idx])
+                indices[kind] += 1
+                added = True
+                if len(result) >= limit:
+                    break
+        if not added:
+            break  # all groups exhausted
+    return result
+
 def _extract_terms_from_samples(samples: list[dict]) -> list[str]:
     """Extract content-bearing search terms from symbol names.
 
@@ -205,9 +236,9 @@ def _extract_terms_from_samples(samples: list[dict]) -> list[str]:
     """
     seen: set[str] = set()
     terms: list[str] = []
-    _noise = {"get", "set", "is", "has", "do", "can", "new", "init", "del",
+    _noise = {"get", "set", "is", "has", "do", "new", "init", "del",
               "the", "for", "and", "not", "are", "was", "were", "all", "any",
-              "app", "from", "ret", "end", "len", "val", "int", "void", "bool"}
+              "app", "from", "ret", "end", "int", "void", "bool"}
     for s in samples[:12]:
         name = s.get("name", "").strip("_")
         # Step 1: split on underscores (snake_case)
@@ -285,5 +316,3 @@ def _fts5_rough_samples(conn, query: str, content_words: list[str], config_hash:
     return rough_samples
 
 
-# ---------------------------------------------------------------------------
-_table_has_rows = table_has_rows

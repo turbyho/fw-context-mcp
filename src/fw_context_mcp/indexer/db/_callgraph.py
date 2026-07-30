@@ -1,0 +1,603 @@
+"""Call-graph analysis — call path, recursive callers/callees, dead code, hotspots."""
+
+from __future__ import annotations
+
+import sqlite3
+from collections import deque
+
+# ---------------------------------------------------------------------------
+# Graph analytics — call-graph traversal via recursive CTE
+# ---------------------------------------------------------------------------
+
+
+def _resolve_target_usr(conn: sqlite3.Connection, config_hash: str, name: str) -> str | None:
+    """Look up the USR of a symbol by name.
+
+    When multiple USRs exist for the same name (e.g. C++ inline functions
+    with ``#*1C.#`` ABI tags), pick the one with the most incoming
+    references — that is the variant actually called throughout the codebase.
+
+    Tiebreaker: prefer symbols that have outgoing refs (they call other
+    functions — i.e. they have a body) over symbols with no outgoing refs
+    (framework struct fields, declaration-only symbols, etc.).
+    """
+    esc_name = name.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    suffix_pattern = f"%::{esc_name}"
+    rows = conn.execute(
+        """SELECT s.usr,
+                  COUNT(r_in.rowid) AS ref_count,
+                  COUNT(r_out.rowid) AS out_count
+           FROM symbols s
+           LEFT JOIN refs r_in ON r_in.to_usr = s.usr AND r_in.config_hash = s.config_hash
+           LEFT JOIN refs r_out ON r_out.from_usr = s.usr AND r_out.config_hash = s.config_hash
+           WHERE s.config_hash = ?
+             AND (s.name = ? OR s.qualified_name = ? OR s.qualified_name LIKE ? ESCAPE '\\')
+           GROUP BY s.usr
+           ORDER BY s.is_definition DESC, ref_count DESC, out_count DESC
+           LIMIT 1""",
+        (config_hash, name, name, suffix_pattern),
+    ).fetchone()
+    return rows["usr"] if rows else None
+
+
+def _get_alias_pairs(conn: sqlite3.Connection, config_hash: str) -> list[tuple[str, str]]:
+    """Return [(decl_usr, def_usr)] for weak-alias declarations → definitions.
+
+    Detects the ``__attribute__((weak, alias(\"__func\")))`` pattern by finding
+    declaration-only symbols that have a ``__``-prefixed sibling definition
+    with the same parameter signature.
+    """
+    # Declarations that appear as callees but have no outgoing refs themselves.
+    # Use NOT EXISTS instead of NOT IN — the refs table has NULL from_usr
+    # (2760 file-scope references with no enclosing function), and NOT IN
+    # returns NULL (falsy) when the subquery contains NULLs.
+    rows = conn.execute(
+        """SELECT s.usr, s.name, s.signature
+           FROM symbols s
+           WHERE s.config_hash = ?
+             AND s.is_definition = 0
+             AND s.kind IN ('function', 'method', 'constructor', 'destructor')
+             AND EXISTS (SELECT 1 FROM refs r WHERE r.to_usr = s.usr AND r.config_hash = ?)
+             AND NOT EXISTS (SELECT 1 FROM refs r WHERE r.from_usr = s.usr AND r.config_hash = ?)
+        """,
+        (config_hash, config_hash, config_hash),
+    ).fetchall()
+
+    if not rows:
+        return []
+
+    # Build index of __-prefixed definitions by (name, param_count)
+    def_rows = conn.execute(
+        """SELECT usr, name, signature FROM symbols
+           WHERE config_hash = ? AND is_definition = 1 AND name LIKE '__%'
+        """,
+        (config_hash,),
+    ).fetchall()
+
+    def_index: dict[tuple[str, int], str] = {}
+    for r in def_rows:
+        pc = (r["signature"] or "").count(",") + 1 if r["signature"] else 0
+        def_index[(r["name"], pc)] = r["usr"]
+
+    pairs: list[tuple[str, str]] = []
+    for r in rows:
+        pc = (r["signature"] or "").count(",") + 1 if r["signature"] else 0
+        for candidate in (f"__{r['name']}", f"_{r['name']}"):
+            def_usr = def_index.get((candidate, pc))
+            if def_usr:
+                pairs.append((r["usr"], def_usr))
+                break
+    return pairs
+
+
+def _build_alias_values(alias_pairs: list[tuple[str, str]]) -> tuple[str, list[str]]:
+    """Build parameterized VALUES clause for alias pairs CTE.
+
+    Returns ``(values_clause, params)`` where *values_clause* is a SQL
+    VALUES expression with ``?`` placeholders and *params* is the
+    flattened list of USR values.  Returns ``("", [])`` when
+    *alias_pairs* is empty.
+    """
+    if not alias_pairs:
+        return "", []
+    placeholders = ", ".join("(?, ?)" for _ in alias_pairs)
+    params = [v for pair in alias_pairs for v in pair]
+    return f"({placeholders})", params
+
+
+def _bridge_weak_aliases(
+    conn: sqlite3.Connection,
+    config_hash: str,
+    all_edges: dict[str, list[tuple[str, str]]],
+) -> None:
+    """Add synthetic edges from weak-alias declarations to their definitions.
+
+    Embedded firmware uses ``__attribute__((weak, alias(\"__func\")))`` for
+    user-overridable hooks (e.g. ``digitalWrite`` → ``__digitalWrite``).
+    Libclang sees these as two different USRs with no connection.  We inject
+    synthetic edges so the BFS can traverse past the declaration.
+    """
+    pairs = _get_alias_pairs(conn, config_hash)
+    for decl_usr, def_usr in pairs:
+        # Get the definition name for display in chains
+        def_name = conn.execute(
+            "SELECT name FROM symbols WHERE config_hash=? AND usr=? LIMIT 1",
+            (config_hash, def_usr),
+        ).fetchone()
+        label = def_name["name"] if def_name else "?"
+        all_edges.setdefault(decl_usr, []).append((def_usr, label))
+
+
+def find_call_path(
+    conn: sqlite3.Connection,
+    config_hash: str,
+    from_name: str,
+    to_name: str,
+    max_depth: int = 10,
+) -> list[dict]:
+    """Find call paths from *from_name* to *to_name* via BFS in the refs table.
+
+    Uses Python BFS with cycle detection — avoids the exponential explosion
+    of a recursive CTE over 1M+ reference edges.  Returns up to 5 shortest
+    paths, each with ``depth`` (number of edges) and ``chain``
+    (human-readable ``A → B → C`` string).
+    """
+    from_usr = _resolve_target_usr(conn, config_hash, from_name)
+    to_usr = _resolve_target_usr(conn, config_hash, to_name)
+    if not from_usr or not to_usr:
+        return []
+
+    # ── Lazy edge / name caches (avoid loading all refs into memory) ──
+    _edge_cache: dict[str, list[tuple[str, str]]] = {}
+    _name_cache: dict[str, str] = {}
+
+    def _get_name(usr: str) -> str:
+        """Resolve USR → name, preferring definitions.  Cached per call."""
+        if usr not in _name_cache:
+            row = conn.execute(
+                """SELECT name FROM symbols
+                   WHERE config_hash = ? AND usr = ?
+                   ORDER BY is_definition DESC LIMIT 1""",
+                (config_hash, usr),
+            ).fetchone()
+            _name_cache[usr] = row["name"] if row else "?"
+        return _name_cache[usr]
+
+    def _get_edges(usr: str) -> list[tuple[str, str]]:
+        """Return [(to_usr, callee_name), ...] for *usr*.  Cached per call."""
+        if usr not in _edge_cache:
+            rows = conn.execute(
+                """SELECT r.to_usr,
+                          COALESCE(
+                              (SELECT name FROM symbols s
+                               WHERE s.usr = r.to_usr AND s.config_hash = r.config_hash
+                                 AND s.is_definition = 1 LIMIT 1),
+                              (SELECT name FROM symbols s
+                               WHERE s.usr = r.to_usr AND s.config_hash = r.config_hash LIMIT 1),
+                              '?'
+                          ) AS callee_name
+                   FROM refs r
+                   WHERE r.config_hash = ? AND r.from_usr = ?
+                     AND r.ref_kind IN ('call', 'indirect')
+                   GROUP BY r.to_usr""",
+                (config_hash, usr),
+            ).fetchall()
+            _edge_cache[usr] = [(r["to_usr"], r["callee_name"]) for r in rows]
+        return _edge_cache[usr]
+
+    # ── Weak-alias bridging ──
+    # Inject synthetic edges from alias declarations → their definitions
+    # into _edge_cache so the BFS can traverse past weak aliases.
+    alias_pairs = _get_alias_pairs(conn, config_hash)
+    for decl_usr, def_usr in alias_pairs:
+        label = _get_name(def_usr)
+        _edge_cache.setdefault(decl_usr, []).append((def_usr, label))
+
+    from_name_resolved = _get_name(from_usr)
+    found: list[dict] = []
+
+    # ── BFS queue: (current_usr, depth, chain) ──
+    queue: deque = deque()
+    visited: set[str] = {from_usr}
+
+    # Seed: direct edges from source
+    for to_usr_edge, callee_name in _get_edges(from_usr):
+        if to_usr_edge not in visited:
+            chain = f"{from_name_resolved} → {callee_name}"
+            if to_usr_edge == to_usr:
+                found.append({"depth": 1, "chain": chain, "target_usr": to_usr})
+            else:
+                queue.append((to_usr_edge, 1, chain))
+            visited.add(to_usr_edge)
+
+    # BFS main loop — expand until we have 5 paths or the queue is empty
+    while queue and len(found) < 5:
+        current, depth, chain = queue.popleft()
+        if current == to_usr:
+            found.append({"depth": depth, "chain": chain, "target_usr": current})
+            continue
+        if depth >= max_depth:
+            continue
+        for next_usr, next_name in _get_edges(current):
+            if next_usr not in visited:
+                visited.add(next_usr)
+                new_chain = f"{chain} → {next_name}"
+                if next_usr == to_usr:
+                    found.append({"depth": depth + 1, "chain": new_chain, "target_usr": next_usr})
+                    if len(found) >= 5:
+                        break
+                else:
+                    queue.append((next_usr, depth + 1, new_chain))
+
+    return found
+
+
+
+def find_all_callers_recursive(
+    conn: sqlite3.Connection,
+    config_hash: str,
+    name: str,
+    max_depth: int = 5,
+    limit: int = 50,
+) -> list[dict]:
+    """Find all transitive callers of *name* (who calls it, directly or indirectly).
+
+    Returns deduplicated results with ``depth`` (shortest distance to target)
+    and the callee's ``name``, ``qualified_name``, ``kind``, ``file_path``.
+    """
+    target_usr = _resolve_target_usr(conn, config_hash, name)
+    if not target_usr:
+        return []
+
+    # Build extended refs: real refs + synthetic weak-alias edges.
+    # When someone calls decl_usr (alias), they also effectively call def_usr.
+    alias_pairs = _get_alias_pairs(conn, config_hash)
+    alias_values, alias_params = _build_alias_values(alias_pairs)
+    alias_cte = f"""alias_pairs(decl_usr, def_usr) AS (VALUES {alias_values}),""" if alias_values else ""
+    alias_join = (
+        """UNION ALL
+        SELECT r.from_usr, ap.def_usr
+        FROM refs r
+        JOIN alias_pairs ap ON r.to_usr = ap.decl_usr
+        WHERE r.config_hash = ?"""
+        if alias_values
+        else ""
+    )
+
+    query = f"""WITH {alias_cte}
+        extended_refs(from_usr, to_usr) AS (
+            SELECT from_usr, to_usr FROM refs
+            WHERE config_hash = ? AND ref_kind IN ('call', 'indirect')
+            {alias_join}
+        ),
+        callers(usr, depth) AS (
+            SELECT from_usr, 1
+            FROM extended_refs
+            WHERE to_usr = ?
+            UNION
+            SELECT er.from_usr, c.depth + 1
+            FROM extended_refs er
+            JOIN callers c ON er.to_usr = c.usr
+            WHERE c.depth < ?
+        ),
+        dedup AS (
+            SELECT usr, MIN(depth) AS depth
+            FROM callers
+            GROUP BY usr
+        )
+        SELECT COALESCE(s_def.name, s_any.name, '?') AS name,
+               COALESCE(s_def.qualified_name, s_any.qualified_name) AS qualified_name,
+               COALESCE(s_def.kind, s_any.kind) AS kind,
+               COALESCE(s_def.file_path, s_any.file_path) AS file_path,
+               COALESCE(s_def.signature, s_any.signature) AS signature,
+               d.depth
+        FROM dedup d
+        LEFT JOIN symbols s_def ON s_def.usr = d.usr AND s_def.config_hash = ?
+                                   AND s_def.is_definition = 1
+        LEFT JOIN symbols s_any ON s_any.usr = d.usr AND s_any.config_hash = ?
+        WHERE COALESCE(s_def.name, s_any.name) IS NOT NULL
+        ORDER BY d.depth, COALESCE(s_def.name, s_any.name)
+        LIMIT ?"""
+
+    params: list[object] = [*alias_params, config_hash]
+    if alias_values:
+        params.append(config_hash)
+    params.extend([target_usr, max_depth, config_hash, config_hash, limit])
+
+    rows = conn.execute(query, params).fetchall()
+
+    return [dict(r) for r in rows]
+
+
+def find_callees_recursive(
+    conn: sqlite3.Connection,
+    config_hash: str,
+    name: str,
+    max_depth: int = 5,
+    limit: int = 50,
+) -> list[dict]:
+    """Find all transitive callees of *name* (what it calls, directly or indirectly).
+
+    Inverse of ``find_all_callers_recursive`` — walks edges from caller to callee.
+    """
+    source_usr = _resolve_target_usr(conn, config_hash, name)
+    if not source_usr:
+        return []
+
+    # Build extended refs: real refs + synthetic weak-alias edges.
+    # When decl_usr is an alias for def_usr, anything def_usr calls should
+    # also be reachable from decl_usr.
+    alias_pairs = _get_alias_pairs(conn, config_hash)
+    alias_values, alias_params = _build_alias_values(alias_pairs)
+    alias_cte = f"""alias_pairs(decl_usr, def_usr) AS (VALUES {alias_values}),""" if alias_values else ""
+    alias_join = (
+        """UNION ALL
+        SELECT ap.decl_usr, r.to_usr
+        FROM refs r
+        JOIN alias_pairs ap ON r.from_usr = ap.def_usr
+        WHERE r.config_hash = ?"""
+        if alias_values
+        else ""
+    )
+
+    query = f"""WITH {alias_cte}
+        extended_refs(from_usr, to_usr) AS (
+            SELECT from_usr, to_usr FROM refs
+            WHERE config_hash = ? AND ref_kind IN ('call', 'indirect')
+            {alias_join}
+        ),
+        callees(usr, depth) AS (
+            SELECT to_usr, 1
+            FROM extended_refs
+            WHERE from_usr = ?
+            UNION
+            SELECT er.to_usr, c.depth + 1
+            FROM extended_refs er
+            JOIN callees c ON er.from_usr = c.usr
+            WHERE c.depth < ?
+        ),
+        dedup AS (
+            SELECT usr, MIN(depth) AS depth
+            FROM callees
+            GROUP BY usr
+        )
+        SELECT COALESCE(s_def.name, s_any.name, '?') AS name,
+               COALESCE(s_def.qualified_name, s_any.qualified_name) AS qualified_name,
+               COALESCE(s_def.kind, s_any.kind) AS kind,
+               COALESCE(s_def.file_path, s_any.file_path) AS file_path,
+               COALESCE(s_def.signature, s_any.signature) AS signature,
+               d.depth
+        FROM dedup d
+        LEFT JOIN symbols s_def ON s_def.usr = d.usr AND s_def.config_hash = ?
+                                   AND s_def.is_definition = 1
+        LEFT JOIN symbols s_any ON s_any.usr = d.usr AND s_any.config_hash = ?
+        WHERE COALESCE(s_def.name, s_any.name) IS NOT NULL
+        ORDER BY d.depth, COALESCE(s_def.name, s_any.name)
+        LIMIT ?"""
+
+    params: list[object] = [*alias_params, config_hash]
+    if alias_values:
+        params.append(config_hash)
+    params.extend([source_usr, max_depth, config_hash, config_hash, limit])
+
+    rows = conn.execute(query, params).fetchall()
+
+    return [dict(r) for r in rows]
+
+
+def find_dead_code(
+    conn: sqlite3.Connection,
+    config_hash: str,
+    limit: int = 100,
+    exclude_paths: list[str] | None = None,
+    project_only: bool = False,
+) -> list[dict]:
+    """Find functions/methods that are defined but never called.
+
+    Returns two categories of results, each with a ``status`` field:
+
+    * ``"dead"`` — the symbol's USR has no entry at all in ``refs.to_usr``
+      (neither direct calls nor indirect function pointer assignments).
+    * ``"possibly_dead"`` — the symbol has at least one indirect reference
+      (``ref_kind = 'indirect'``, a function pointer assignment) but the
+      assignment is not linked to any call site via ``fp_assignments``.
+      This means the function IS assigned to a function pointer somewhere,
+      but the invocation site is unknown — it may be called through
+      unindexed code or a type-erased API.  LLM should treat this as
+      uncertain, not as confirmed dead code.
+
+    Each result dict includes: name, qualified_name, kind, file_path,
+    signature, line, status, reason.
+
+    *exclude_paths* is a list of LIKE patterns for file paths to exclude
+    (e.g. ``["mbed-os/%", "cmsis/%"]``).  When omitted, no paths are excluded.
+    """
+    project_only_clause = "AND s.is_project = 1" if project_only else ""
+    if exclude_paths:
+        path_clause = "AND " + " AND ".join("s.file_path NOT LIKE ?" for _ in exclude_paths)
+        exclude_params = list(exclude_paths)
+    else:
+        path_clause = ""
+        exclude_params = []
+
+    # Category 1: truly dead — no refs at all
+    dead_params: list[object] = [config_hash, config_hash] + exclude_params + [limit]
+    dead_rows = conn.execute(
+        f"""SELECT s.name, s.qualified_name, s.kind, s.file_path,
+                  s.signature, s.line, s.usr
+           FROM symbols s
+           WHERE s.config_hash = ?
+             AND s.is_definition = 1
+             AND s.kind IN ('function', 'method', 'constructor', 'destructor')
+             AND s.usr NOT IN (
+                 SELECT DISTINCT to_usr FROM refs WHERE config_hash = ?
+             )
+             {path_clause}
+             {project_only_clause}
+           ORDER BY s.kind, s.name
+           LIMIT ?""",
+        dead_params,
+    ).fetchall()
+
+    results: list[dict] = []
+    dead_usr_set: set[str] = set()
+    for r in dead_rows:
+        dead_usr_set.add(r["usr"])
+        results.append(
+            {
+                "name": r["name"],
+                "qualified_name": r["qualified_name"],
+                "kind": r["kind"],
+                "file_path": r["file_path"],
+                "signature": r["signature"],
+                "line": r["line"],
+                "status": "dead",
+                "reason": "no references found — likely unused",
+            }
+        )
+
+    # Category 2: possibly dead — indirect refs exist but no resolved call site.
+    # A symbol is possibly dead when it has ref_kind='indirect' entries
+    # (function pointer assignments) but is NOT found as a resolved target
+    # via fp_assignments → indirect_call_sites linking.
+    remaining_slots = limit - len(results)
+    if remaining_slots > 0:
+        possibly_params: list[object] = (
+            [
+                config_hash,
+                config_hash,
+                config_hash,
+                config_hash,
+            ]
+            + exclude_params
+            + [remaining_slots]
+        )
+        possibly_rows = conn.execute(
+            f"""SELECT s.name, s.qualified_name, s.kind, s.file_path,
+                      s.signature, s.line, s.usr,
+                      (SELECT GROUP_CONCAT(site, ', ')
+                       FROM (SELECT DISTINCT r2.from_file || ':' || r2.from_line AS site
+                             FROM refs r2
+                             WHERE r2.to_usr = s.usr AND r2.config_hash = s.config_hash
+                               AND r2.ref_kind = 'indirect'
+                             LIMIT 3)) AS indirect_sites
+               FROM symbols s
+               WHERE s.config_hash = ?
+                 AND s.is_definition = 1
+                 AND s.kind IN ('function', 'method', 'constructor', 'destructor')
+                 -- has indirect refs
+                 AND s.usr IN (
+                     SELECT DISTINCT to_usr FROM refs
+                     WHERE config_hash = ? AND ref_kind = 'indirect'
+                 )
+                 -- but NOT in fp_assignments that link to a call site
+                 AND s.usr NOT IN (
+                     SELECT fpa.rhs_usr FROM fp_assignments fpa
+                     JOIN indirect_call_sites ics
+                       ON ics.target_usr = fpa.lhs_usr
+                      AND ics.config_hash = fpa.config_hash
+                     WHERE fpa.config_hash = ?
+                 )
+                 -- exclude truly dead (already covered)
+                 AND s.usr NOT IN (
+                     SELECT to_usr FROM refs WHERE config_hash = ? AND ref_kind = 'call'
+                 )
+                 {path_clause}
+                 {project_only_clause}
+               ORDER BY s.kind, s.name
+               LIMIT ?""",
+            possibly_params,
+        ).fetchall()
+        for r in possibly_rows:
+            if r["usr"] in dead_usr_set:
+                continue
+            results.append(
+                {
+                    "name": r["name"],
+                    "qualified_name": r["qualified_name"],
+                    "kind": r["kind"],
+                    "file_path": r["file_path"],
+                    "signature": r["signature"],
+                    "line": r["line"],
+                    "status": "possibly_dead",
+                    "reason": "assigned as function pointer but call sites unresolved",
+                    "indirect_refs": r["indirect_sites"] or "",
+                }
+            )
+
+    return results
+
+
+def find_hotspots(
+    conn: sqlite3.Connection,
+    config_hash: str,
+    limit: int = 20,
+    exclude_paths: list[str] | None = None,
+    project_only: bool = False,
+) -> list[dict]:
+    """Find the most-called functions (hotspots) ranked by caller count.
+
+    Only counts actual call edges (``ref_kind IN ('call', 'indirect')``) —
+    plain references and member-access expressions are excluded so enum
+    constants and fields don't appear as "hot" call targets.
+
+    When ``hotspot_cache`` is populated for this config, returns instantly
+    from the pre-computed cache.  Falls back to a live COUNT+GROUP BY
+    query when the cache is missing or stale.
+
+    When *exclude_paths* is given, symbols whose ``file_path`` matches any
+    of the LIKE patterns are excluded.
+    When *project_only* is True, only project symbols (``is_project = 1``)
+    are returned.
+    """
+    proj_clause = "AND s.is_project = 1" if project_only else ""
+    # Try cache first
+    cached = conn.execute("SELECT COUNT(*) FROM hotspot_cache WHERE config_hash = ?", (config_hash,)).fetchone()
+    if cached and cached[0] > 0:
+        path_clauses = ""
+        params: list = [config_hash]
+        if exclude_paths:
+            path_clauses = "AND " + " AND ".join("s.file_path NOT LIKE ?" for _ in exclude_paths)
+            params.extend(exclude_paths)
+        params.append(limit)
+        rows = conn.execute(
+            f"""SELECT s.name, s.qualified_name, s.kind, s.file_path,
+                      s.signature, s.line,
+                      h.caller_count
+               FROM hotspot_cache h
+               JOIN symbols s ON s.id = h.symbol_id AND s.config_hash = h.config_hash
+               WHERE h.config_hash = ?
+                 {path_clauses}
+                 {proj_clause}
+               ORDER BY h.caller_count DESC
+               LIMIT ?""",
+            params,
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    # Live query fallback
+    path_clauses = ""
+    p: list = [config_hash]
+    if exclude_paths:
+        path_clauses = "AND " + " AND ".join("s.file_path NOT LIKE ?" for _ in exclude_paths)
+        p.extend(exclude_paths)
+    p.append(limit)
+
+    rows = conn.execute(
+        f"""SELECT s.name, s.qualified_name, s.kind, s.file_path,
+                  s.signature, s.line,
+                  COUNT(r.rowid) AS caller_count
+           FROM refs r
+           JOIN symbols s ON s.usr = r.to_usr AND s.config_hash = r.config_hash
+           WHERE r.config_hash = ?
+             AND s.is_definition = 1
+             AND r.ref_kind IN ('call', 'indirect')
+             {path_clauses}
+             {proj_clause}
+           GROUP BY s.usr
+           ORDER BY caller_count DESC
+           LIMIT ?""",
+        p,
+    ).fetchall()
+
+    return [dict(r) for r in rows]

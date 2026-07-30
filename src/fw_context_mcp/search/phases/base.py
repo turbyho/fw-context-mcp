@@ -18,6 +18,11 @@ class Phase(ABC):
 
     name: str = ""
 
+    def __init_subclass__(cls, **kwargs):
+        super().__init_subclass__(**kwargs)
+        if not cls.name:
+            raise TypeError(f"{cls.__name__} must set a non-empty 'name' class variable")
+
     @abstractmethod
     async def run(self, ctx: PipelineContext) -> PipelineContext:
         """Execute this phase and return the updated context."""

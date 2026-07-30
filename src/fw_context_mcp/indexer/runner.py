@@ -41,6 +41,11 @@ from .ops import _build_filtered_file_content, _normalize_file_path, store_symbo
 log = logging.getLogger(__name__)
 
 
+
+# ═══════════════════════════════════════════════════════════════
+# SECTION: Embedding building (→ llm_analysis.py)
+# ═══════════════════════════════════════════════════════════════
+
 def _embed_model_key(embed_model: str, embed_bodies: bool) -> str:
     """Return the cache-disambiguating model key including the description version."""
     version = DESCRIPTION_VERSION if embed_bodies else "desc-v1"
@@ -245,6 +250,8 @@ def _build_embeddings(
             log.warning("Ollama not reachable — skipping embedding generation")
             return
     model = _embed_model_key(embedder.name, True)
+    # NOTE: DELETE-then-INSERT has a data-loss window — if interrupted,
+    # embeddings are lost.  Run `fw-context index --embeddings` to recover.
     with transaction(conn):
         # Clean embeddings for symbols whose body text may have changed
         # (chunk count can differ after source edits — a symbol with
@@ -464,6 +471,11 @@ def _build_embeddings(
 
 
 
+
+# ═══════════════════════════════════════════════════════════════
+# SECTION: LLM analysis (→ llm_analysis.py)
+# ═══════════════════════════════════════════════════════════════
+
 def _read_body(abs_path: str, start_line: int, end_line: int) -> str:
     """Read a function body from a source file using line numbers.
 
@@ -568,6 +580,8 @@ def _build_llm_analysis(
     project-definition symbol using Ollama, one symbol per request.
 
     Processes symbols individually — one Ollama request per symbol — for
+    maximum isolation and retry-ability.  TODO: Ollama batching API would
+    reduce ~10K symbols from ~10K HTTP round trips to O(batches).
     reliable format adherence. Only project symbols (non-SDK) are analyzed.
 
     The prompt includes the full function body (read from disk via exact
@@ -673,6 +687,10 @@ def _build_llm_analysis(
 
     log.info("LLM analysis: %d symbols (model=%s)", total_symbols, model)
 
+    from ..cache_client import get_local_cache_db, local_cache_lookup
+
+    local_db = get_local_cache_db()  # single connection for all symbols
+
     for idx, row in enumerate(rows):
         t0 = time.monotonic()
         qname = row["qualified_name"] or row["name"]
@@ -686,11 +704,7 @@ def _build_llm_analysis(
             # Tier 1: local global cache (~/.fw-context/llm_cache.db)
             cached = None
             try:
-                from ..cache_client import get_local_cache_db, local_cache_lookup
-
-                local_db = get_local_cache_db(readonly=True)
                 local_hits = local_cache_lookup(local_db, [h])
-                local_db.close()
                 cached = local_hits.get(h)
             except Exception as e:
                 log.debug("Local global cache lookup failed: %s", e)
@@ -703,11 +717,7 @@ def _build_llm_analysis(
                     if cached:
                         # Store in local global cache for next time
                         try:
-                            local_db = get_local_cache_db()
-                            from ..cache_client import local_cache_upsert
-
                             local_cache_upsert(local_db, [{"hash": h, **cached}])
-                            local_db.close()
                         except Exception as e:
                             log.debug("Local global cache write failed: %s", e)
                     else:
@@ -755,7 +765,7 @@ def _build_llm_analysis(
                 truncated += f"\n// ... ({len(body)} total chars, {len(body_lines)} lines — truncated for analysis)\n"
                 d["body"] = truncated
                 prompt = build_analysis_prompt(batch_dicts)
-                _est_prompt_tokens = len(prompt) / 3.5
+                _est_prompt_tokens = len(prompt) / 2.5  # conservative for C++ code
                 log.debug(
                     "[%d/%d] %s: body truncated %d → %d chars, prompt %d chars",
                     idx + 1,
@@ -768,7 +778,7 @@ def _build_llm_analysis(
 
             # Compute response budget — how many tokens remain after the prompt
             # inside the model context window.
-            _est_prompt_tokens = len(prompt) / 3.5
+            _est_prompt_tokens = len(prompt) / 2.5  # conservative for C++ code
             _safety_margin = 300
             _ctx_size = _model_ctx_size
             num_predict = max(500, int(_ctx_size - _est_prompt_tokens - _safety_margin))
@@ -827,9 +837,6 @@ def _build_llm_analysis(
                     inserted = upsert_llm_analysis_batch(conn, db_rows)
                     # Store in local global cache
                     try:
-                        from ..cache_client import get_local_cache_db, local_cache_upsert
-
-                        local_db = get_local_cache_db()
                         local_cache_upsert(
                             local_db,
                             [
@@ -842,7 +849,6 @@ def _build_llm_analysis(
                                 }
                             ],
                         )
-                        local_db.close()
                     except Exception as e:
                         log.debug("Local global cache write failed: %s", e)
                     # Store on remote cache server (fire-and-forget)
@@ -879,6 +885,7 @@ def _build_llm_analysis(
         pass
 
     log.info("LLM analysis stored: %d/%d symbols (model=%s)", total, total_symbols, model)
+    local_db.close()
 
 
 def _extract_param_types(signature: str) -> str:
@@ -969,6 +976,11 @@ def _extract_param_types(signature: str) -> str:
 
     return ",".join(normalized)
 
+
+
+# ═══════════════════════════════════════════════════════════════
+# SECTION: Post-processing pipeline (→ postprocessor.py)
+# ═══════════════════════════════════════════════════════════════
 
 def _build_overrides(
     conn, config_hash: str, db_dir: Path, *, write_lock_held: bool = False, force: bool = False
@@ -1222,6 +1234,11 @@ def _build_hotspot_cache(conn, config_hash: str, *, force: bool = False) -> None
 # ── Content-hash helpers ────────────────────────────────────────────
 
 
+
+# ═══════════════════════════════════════════════════════════════
+# SECTION: Manifest management
+# ═══════════════════════════════════════════════════════════════
+
 def _refresh_header_mtimes_from_manifest(
     conn,
     config_hash: str,
@@ -1440,6 +1457,13 @@ def _update_manifest_after_index(
     return manifest_data
 
 
+
+# ═══════════════════════════════════════════════════════════════
+# SECTION: Core per-TU indexing
+# ═══════════════════════════════════════════════════════════════
+
+# INVARIANT: symbols.usr has UNIQUE NOT NULL, refs has no UNIQUE constraint.
+# UPDATE + DELETE pattern prevents duplicates via NOT IN subquery on symbols.usr.
 def _reassign_symbols_for_file(
     conn,
     new_config_hash: str,
@@ -1989,6 +2013,16 @@ def _run_postprocess(
 
     delete_orphan_files(conn, config_hash)
 
+    from .db import clean_orphan_embeddings, clean_orphan_embeddings_vec
+
+    clean_orphan_embeddings(conn)
+    clean_orphan_embeddings_vec(conn)
+
+    # Clean orphaned LLM analysis (was O(n) per batch — now once, see _llm.py)
+    conn.execute(
+        "DELETE FROM llm_analysis WHERE symbol_id NOT IN (SELECT id FROM symbols)"
+    )
+
     # ── is_project alignment ──
     for pp in project_patterns_list:
         fn_pp = pp.replace("%", "*")
@@ -2430,7 +2464,11 @@ def run(
         """
         pause_file = db_path.parent / "reindex.pause"
         our_pid = os.getpid()
+        deadline = time.monotonic() + 300  # 5-minute timeout
         while True:
+            if time.monotonic() > deadline:
+                log.warning("_wait_if_paused: timeout after 300s — resuming")
+                return
             if not pause_file.exists():
                 return
             try:

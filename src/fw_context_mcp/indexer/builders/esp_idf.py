@@ -79,8 +79,12 @@ class ESPIDFBuildSystem:
         wrapper_dir = project_root / ".fw-context"
         wrapper_dir.mkdir(parents=True, exist_ok=True)
         ninja_wrapper = wrapper_dir / "ninja"
-        ninja_wrapper.write_text(f'#!/bin/sh\nexec {ninja} -d keepdepfile "$@"\n', encoding="utf-8")
-        ninja_wrapper.chmod(0o755)
+        expected = f'#!/bin/sh\nexec "{ninja}" -d keepdepfile "$@"\n'
+        if not ninja_wrapper.exists() or ninja_wrapper.read_text(encoding="utf-8") != expected:
+            tmp_wrapper = wrapper_dir / ".ninja.tmp"
+            tmp_wrapper.write_text(expected, encoding="utf-8")
+            tmp_wrapper.chmod(0o755)
+            tmp_wrapper.rename(ninja_wrapper)
 
         env = dict(os.environ)
         if cfg.idf_path:
@@ -101,8 +105,10 @@ class ESPIDFBuildSystem:
         # Inject .d dependency tracking via EXTRA_CFLAGS / EXTRA_CXXFLAGS.
         # These environment variables are respected by the ESP-IDF build system
         # and appended to compiler flags without overriding the toolchain.
-        env.setdefault("EXTRA_CFLAGS", "")
-        env.setdefault("EXTRA_CXXFLAGS", "")
+        env.pop("EXTRA_CFLAGS", None)  # Don't inherit from parent env
+        env["EXTRA_CFLAGS"] = ""
+        env.pop("EXTRA_CXXFLAGS", None)  # Don't inherit from parent env
+        env["EXTRA_CXXFLAGS"] = ""
         if "-MMD" not in env["EXTRA_CFLAGS"]:
             env["EXTRA_CFLAGS"] += " -MMD" if env["EXTRA_CFLAGS"] else "-MMD"
         if "-MMD" not in env["EXTRA_CXXFLAGS"]:
@@ -113,7 +119,23 @@ class ESPIDFBuildSystem:
         # or a fresh clone).  set-target reads the target from sdkconfig.
         build_dir = project_root / "build"
         if not build_dir.exists():
-            set_target_cmd = [idf_py, "set-target", "esp32"]
+            target = "esp32"
+            sdkconfig = project_root / "sdkconfig"
+            if sdkconfig.exists():
+                import re
+                try:
+                    content = sdkconfig.read_text(encoding="utf-8")
+                    m = re.search(r'CONFIG_IDF_TARGET="(\w+)"', content)
+                    if m:
+                        target = m.group(1)
+                except OSError:
+                    pass
+            if target == "esp32":
+                log.warning(
+                    "Could not detect ESP-IDF target from sdkconfig — defaulting to esp32. "
+                    "Set target explicitly with 'idf.py set-target <chip>' if using a different variant."
+                )
+            set_target_cmd = [idf_py, "set-target", target]
             log.info("esp-idf set-target: %s", " ".join(set_target_cmd))
             subprocess.run(set_target_cmd, cwd=project_root)
 

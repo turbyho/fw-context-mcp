@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import shlex
+import re
 from collections.abc import Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -66,6 +67,9 @@ _SUPPORTED_TARGET_PREFIXES = frozenset({
     # LoongArch
     "loongarch32-", "loongarch64-",
     # WebAssembly
+    # NOTE: standard libclang distributions may lack the WebAssembly backend.
+    # If wasm32/wasm64 targets cause TranslationUnitLoadError, rebuild
+    # libclang with -DLLVM_EXPERIMENTAL_TARGETS_TO_BUILD=WebAssembly.
     "wasm32-", "wasm64-",
     # AVR
     "avr-",
@@ -87,8 +91,19 @@ _SUPPORTED_TARGET_PREFIXES = frozenset({
 # the flag alone is sufficient to identify the target.
 _MCPU_TO_TRIPLE: dict[str, str] = {
     "cortex-m": "arm-none-eabi",
-    "cortex-a": "aarch64-none-elf",
     "cortex-r": "arm-none-eabi",
+    # 32-bit Cortex-A (ARMv7-A)
+    "cortex-a5": "arm-none-eabi",
+    "cortex-a7": "arm-none-eabi",
+    "cortex-a8": "arm-none-eabi",
+    "cortex-a9": "arm-none-eabi",
+    "cortex-a15": "arm-none-eabi",
+    "cortex-a17": "arm-none-eabi",
+    # 64-bit Cortex-A (AArch64)
+    "cortex-a53": "aarch64-none-elf",
+    "cortex-a57": "aarch64-none-elf",
+    "cortex-a72": "aarch64-none-elf",
+    "cortex-a": "aarch64-none-elf",
 }
 
 
@@ -113,6 +128,8 @@ def _detect_target_triple(
     # 1 — Compiler name: strip trailing -gcc/-g++/-clang suffix
     if compiler is not None:
         name = compiler.name
+        # Strip version suffix: arm-none-eabi-g++-12 → arm-none-eabi-g++
+        name = re.sub(r'-\d+(\.\d+)*$', '', name)
         for suffix in ("-g++", "-gcc", "-clang", "-clang++"):
             if name.endswith(suffix):
                 triple = name[: -len(suffix)]
@@ -155,7 +172,7 @@ def _detect_target_triple(
         return None
 
     # Only inject --target for triples the installed libclang actually supports.
-    # Unspported targets (xtensa, msp430, avr, etc.) cause
+    # Unsupported targets (xtensa, msp430, avr, etc.) cause
     # TranslationUnitLoadError — libclang parses them fine as host target.
     for prefix in _SUPPORTED_TARGET_PREFIXES:
         if triple.startswith(prefix):
@@ -203,6 +220,7 @@ def _detect_language(file: Path, clang_args: list[str]) -> str:
 
 
 def normalize_args(
+
     raw_args: list[str],
     cwd: Path,
     source_file: str | None = None,
@@ -334,42 +352,53 @@ def _safe_iterdir(path: Path) -> list[Path]:
         return []
 
 
-def _gcc_system_includes(compiler: Path) -> list[str]:
-    """Return -isystem flags for a GCC ARM cross-compiler's built-in headers."""
-    # compiler: .../gcc-arm-none-eabi-X/bin/arm-none-eabi-g++
-    # lib dir:  .../gcc-arm-none-eabi-X/lib/gcc/arm-none-eabi/<ver>/include
+def _gcc_system_includes(compiler: Path, triple: str) -> list[str]:
+    """Return -isystem flags for a GCC cross-compiler's built-in headers.
+
+    *triple* is the GNU target triple (e.g. ``arm-none-eabi``) detected
+    by :func:`_detect_target_triple`.  Only include directories matching
+    this triple are added — host GCC includes are filtered out.
+
+    For toolchains installed in a dedicated directory (e.g.
+    ``/opt/gcc-arm-none-eabi/``), the root is ``compiler.parent.parent``.
+    For system-installed cross-compilers (e.g. ``/usr/bin/arm-none-eabi-g++``),
+    the root is ``/usr`` and the triple-directories live under
+    ``/usr/lib/gcc/<triple>/`` and ``/usr/<triple>/include``.
+    """
     toolchain_root = compiler.parent.parent
     lib_gcc = toolchain_root / "lib" / "gcc"
     result: list[str] = []
-    triple_dirs = _safe_iterdir(lib_gcc)
-    for triple_dir in triple_dirs:
-        for ver_dir in _safe_iterdir(triple_dir):
-            inc = ver_dir / "include"
-            if inc.is_dir():
-                result += ["-isystem", str(inc)]
-            inc_fixed = ver_dir / "include-fixed"
-            if inc_fixed.is_dir():
-                result += ["-isystem", str(inc_fixed)]
-    for triple_dir in triple_dirs:
-        triple = triple_dir.name
-        libc_inc = toolchain_root / triple / "include"
-        if libc_inc.is_dir():
-            result += ["-isystem", str(libc_inc)]
-        # C++ standard library headers (arm-none-eabi/include/c++/<ver>)
-        cxx_inc_base = toolchain_root / triple / "include" / "c++"
-        for ver_dir in _safe_iterdir(cxx_inc_base):
-            if ver_dir.is_dir():
-                result += ["-isystem", str(ver_dir)]
-                # Per-target subdir (e.g. arm-none-eabi, thumb, ...)
-                for sub in _safe_iterdir(ver_dir):
-                    if sub.is_dir():
-                        result += ["-isystem", str(sub)]
+
+    # Scan only the directory matching the detected triple
+    triple_gcc = lib_gcc / triple
+    for ver_dir in _safe_iterdir(triple_gcc):
+        inc = ver_dir / "include"
+        if inc.is_dir():
+            result += ["-isystem", str(inc)]
+        inc_fixed = ver_dir / "include-fixed"
+        if inc_fixed.is_dir():
+            result += ["-isystem", str(inc_fixed)]
+
+    # Newlib/libc headers: <toolchain_root>/<triple>/include
+    libc_inc = toolchain_root / triple / "include"
+    if libc_inc.is_dir():
+        result += ["-isystem", str(libc_inc)]
+
+    # C++ standard library headers: <triple>/include/c++/<ver>
+    cxx_inc_base = toolchain_root / triple / "include" / "c++"
+    for ver_dir in _safe_iterdir(cxx_inc_base):
+        if ver_dir.is_dir():
+            result += ["-isystem", str(ver_dir)]
+            # Per-target subdir (e.g. arm-none-eabi, thumb, ...)
+            for sub in _safe_iterdir(ver_dir):
+                if sub.is_dir():
+                    result += ["-isystem", str(sub)]
     return result
 
 
 def parse(path: Path) -> Iterator[CompilationUnit]:
     """Yield one CompilationUnit per entry in compile_commands.json."""
-    entries = json.loads(path.read_text())
+    entries = json.loads(path.read_text(encoding="utf-8-sig"))
     for entry in entries:
         file = Path(entry["file"])
         cwd = Path(entry.get("directory", path.parent))
@@ -395,7 +424,7 @@ def parse(path: Path) -> Iterator[CompilationUnit]:
         if compiler is not None:
             triple = _detect_target_triple(compiler, raw_args)
             if triple is not None:
-                clang_args = clang_args + _gcc_system_includes(compiler)
+                clang_args = clang_args + _gcc_system_includes(compiler, triple)
 
         lang = _detect_language(file, clang_args)
 

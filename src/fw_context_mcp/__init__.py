@@ -21,5 +21,20 @@ try:
     import pysqlite3
 
     sys.modules["sqlite3"] = pysqlite3
+
+    # pysqlite3.dbapi2.Row (C extension) lacks .get() method that stdlib
+    # sqlite3.Row has in Python 3.13+.  Replace with a Python subclass
+    # that adds .get() compatibility.
+    _OrigRow = pysqlite3.dbapi2.Row
+    class _CompatRow(_OrigRow):
+        if not hasattr(_OrigRow, "get"):
+            def get(self, key, default=None):
+                try:
+                    return self[key]
+                except (KeyError, IndexError):
+                    return default
+    pysqlite3.dbapi2.Row = _CompatRow
+    pysqlite3.Row = _CompatRow
 except ImportError:
+    pass
     pass

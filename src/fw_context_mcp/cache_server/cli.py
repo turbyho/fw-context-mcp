@@ -10,7 +10,7 @@ Commands:
 
 Configuration is read from the ``FW_CACHE_DB_URL`` environment variable
 (required) and ``FW_CACHE_HOST`` / ``FW_CACHE_PORT`` (optional, defaults
-to ``0.0.0.0:8000``).
+to ``127.0.0.1:8000``).
 """
 
 from __future__ import annotations
@@ -56,7 +56,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         print("Error: FW_CACHE_DB_URL environment variable is required", file=sys.stderr)
         return 1
 
-    host = args.host or os.environ.get("FW_CACHE_HOST", "0.0.0.0")
+    host = args.host or os.environ.get("FW_CACHE_HOST", "127.0.0.1")
     port = int(args.port or os.environ.get("FW_CACHE_PORT", "8000"))
 
     from .app import create_app
@@ -112,7 +112,7 @@ def main() -> None:
     p_init.set_defaults(func=cmd_init)
 
     p_run = sub.add_parser("run", help="Start the cache server")
-    p_run.add_argument("--host", default=None, help="Bind address (default: 0.0.0.0)")
+    p_run.add_argument("--host", default=None, help="Bind address (default: 127.0.0.1)")
     p_run.add_argument("--port", default=None, help="Bind port (default: 8000)")
     p_run.set_defaults(func=cmd_run)
 

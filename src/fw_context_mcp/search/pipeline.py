@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import threading
 import time
 from dataclasses import dataclass, field
 
@@ -15,6 +16,7 @@ log = logging.getLogger(__name__)
 # imports don't pull in libclang before it's needed.
 
 _REGISTRY: dict[str, Phase] = {}
+_REGISTRY_LOCK = threading.Lock()
 
 
 def _build_registry() -> dict[str, Phase]:
@@ -22,31 +24,35 @@ def _build_registry() -> dict[str, Phase]:
     if _REGISTRY:
         return _REGISTRY
 
-    from fw_context_mcp.search.phases.adaptive_fusion import AdaptiveFusionPhase
-    from fw_context_mcp.search.phases.deduplicate import DeduplicatePhase
-    from fw_context_mcp.search.phases.embedding import EmbeddingPhase
-    from fw_context_mcp.search.phases.expand_context import ExpandContextPhase
-    from fw_context_mcp.search.phases.format import FormatPhase
-    from fw_context_mcp.search.phases.fts5_search import FTS5SearchPhase
-    from fw_context_mcp.search.phases.llm_query import LLMQueryPhase
-    from fw_context_mcp.search.phases.refine import RefinePhase
-    from fw_context_mcp.search.phases.rough_search import RoughSearchPhase
-    from fw_context_mcp.search.phases.translate import TranslatePhase
+    with _REGISTRY_LOCK:
+        if _REGISTRY:  # double-check: another thread may have populated
+            return _REGISTRY
 
-    for cls in [
-        TranslatePhase,
-        RoughSearchPhase,
-        LLMQueryPhase,
-        RefinePhase,
-        FTS5SearchPhase,
-        EmbeddingPhase,
-        AdaptiveFusionPhase,
-        DeduplicatePhase,
-        ExpandContextPhase,
-        FormatPhase,
-    ]:
-        instance = cls()  # type: ignore[abstract]
-        _REGISTRY[instance.name] = instance
+        from fw_context_mcp.search.phases.adaptive_fusion import AdaptiveFusionPhase
+        from fw_context_mcp.search.phases.deduplicate import DeduplicatePhase
+        from fw_context_mcp.search.phases.embedding import EmbeddingPhase
+        from fw_context_mcp.search.phases.expand_context import ExpandContextPhase
+        from fw_context_mcp.search.phases.format import FormatPhase
+        from fw_context_mcp.search.phases.fts5_search import FTS5SearchPhase
+        from fw_context_mcp.search.phases.llm_query import LLMQueryPhase
+        from fw_context_mcp.search.phases.refine import RefinePhase
+        from fw_context_mcp.search.phases.rough_search import RoughSearchPhase
+        from fw_context_mcp.search.phases.translate import TranslatePhase
+
+        for cls in [
+            TranslatePhase,
+            RoughSearchPhase,
+            LLMQueryPhase,
+            RefinePhase,
+            FTS5SearchPhase,
+            EmbeddingPhase,
+            AdaptiveFusionPhase,
+            DeduplicatePhase,
+            ExpandContextPhase,
+            FormatPhase,
+        ]:
+            instance = cls()  # type: ignore[abstract]
+            _REGISTRY[instance.name] = instance
 
     return _REGISTRY
 
@@ -111,7 +117,7 @@ class PipelineRunner:
 
     def __init__(self, config: PipelineConfig) -> None:
         self.config = config
-        self.registry = _build_registry()
+        self.registry = _build_registry()  # lazy on first use
 
     async def run(self, ctx):
         """Run all configured phases sequentially, returning the final context.
@@ -140,7 +146,7 @@ class PipelineRunner:
                 ctx = await phase.run(ctx)
                 elapsed = time.monotonic() - t0
                 log.debug("Phase %r completed in %.2fs", phase_name, elapsed)
-            except Exception as exc:
+            except (OSError, RuntimeError, ValueError) as exc:
                 log.warning("Phase %r failed: %s", phase_name, exc)
                 # Continue with remaining phases — one phase failure
                 # shouldn't break the entire search.

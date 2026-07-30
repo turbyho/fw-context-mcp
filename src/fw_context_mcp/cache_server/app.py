@@ -17,12 +17,12 @@ import os
 from contextlib import asynccontextmanager
 from typing import Any
 
-from fastapi import FastAPI, Request
+from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from .. import __version__
-from .auth import CacheAuthMiddleware, require_can_read, require_can_write
+from .auth import CacheAuthMiddleware, require_can_read, require_can_write, require_can_write_with_overwrite
 
 logger = logging.getLogger(__name__)
 
@@ -39,10 +39,10 @@ class CacheClearRequest(BaseModel):
 
 class CacheEntry(BaseModel):
     hash: str
-    summary: str
-    inputs: str
-    outputs: str
-    model: str
+    summary: str = Field(max_length=5000)
+    inputs: str = Field(max_length=100000)
+    outputs: str = Field(max_length=100000)
+    model: str = Field(max_length=100)
 
 
 class BatchPutRequest(BaseModel):
@@ -51,7 +51,7 @@ class BatchPutRequest(BaseModel):
 
 # -- Application factory --
 
-def create_app(*, backend: Any = None) -> FastAPI:
+def create_app(*, backend: "CacheStorageBackend | None" = None) -> FastAPI:
     """Create and configure the FastAPI app.
 
     *backend* is for testing — when provided, it is used as
@@ -80,6 +80,30 @@ def create_app(*, backend: Any = None) -> FastAPI:
     app.state.backend = backend
     app.add_middleware(CacheAuthMiddleware)
 
+    # -- Auth dependencies (run BEFORE body parsing via FastAPI Depends) --
+
+    async def _auth_read(request: Request):
+        """Require can_read — raises HTTPException so body is not parsed on auth failure."""
+        error = require_can_read(request)
+        if error is not None:
+            raise HTTPException(status_code=403, detail="Token does not have read permission")
+
+    async def _auth_write(request: Request):
+        """Require can_write — raises HTTPException so body is not parsed on auth failure."""
+        error = require_can_write(request)
+        if error is not None:
+            raise HTTPException(status_code=403, detail="Token does not have write permission")
+
+
+    async def _auth_write_with_overwrite(request: Request):
+        """Require can_write AND parse X-Cache-Overwrite header.
+
+        Raises HTTPException so body is not parsed on auth failure.
+        Sets ``request.state.can_overwrite`` so route handlers don't re-parse.
+        """
+        error = require_can_write_with_overwrite(request)
+        if error is not None:
+            raise HTTPException(status_code=403, detail="Token does not have write/overwrite permission")
     # -- Endpoints --
 
     @app.get("/health")
@@ -88,23 +112,20 @@ def create_app(*, backend: Any = None) -> FastAPI:
         return {"status": "ok", "version": __version__}
 
     @app.post("/cache/batch", response_model=None)
-    async def batch_get(request: Request, body: BatchGetRequest) -> dict[str, Any] | JSONResponse:
+    async def batch_get(request: Request, body: BatchGetRequest, _auth=Depends(_auth_read)) -> dict[str, Any]:
         """Batch lookup content hashes.
 
         Returns ``{"results": {hash: entry | null, ...}}``.
         Requires ``can_read``.
         """
-        error = require_can_read(request)
-        if error is not None:
-            return error
 
-        hashes = body.hashes[:1000]  # hard cap
+        lookup_hashes = body.hashes[:1000]  # hard cap
         truncated = len(body.hashes) > 1000
-        results = await request.app.state.backend.batch_get(hashes)
+        results = await request.app.state.backend.batch_get(lookup_hashes)
         return {"results": results, "truncated": truncated}
 
     @app.put("/cache/batch", response_model=None)
-    async def batch_put(request: Request, body: BatchPutRequest) -> dict[str, Any] | JSONResponse:
+    async def batch_put(request: Request, body: BatchPutRequest, _auth=Depends(_auth_write_with_overwrite)) -> dict[str, Any]:
         """Batch write cache entries.
 
         Normal behaviour: ``INSERT ON CONFLICT DO NOTHING`` (first write wins).
@@ -113,9 +134,6 @@ def create_app(*, backend: Any = None) -> FastAPI:
 
         Requires ``can_write``.
         """
-        error = require_can_write(request)
-        if error is not None:
-            return error
 
         overwrite = getattr(request.state, "can_overwrite", False)
         truncated = len(body.entries) > 1000
@@ -127,14 +145,11 @@ def create_app(*, backend: Any = None) -> FastAPI:
         return {"inserted": inserted, "total": len(entries), "truncated": truncated}
 
     @app.get("/cache/stats", response_model=None)
-    async def cache_stats(request: Request) -> dict[str, Any] | JSONResponse:
+    async def cache_stats(request: Request, _auth=Depends(_auth_read)) -> dict[str, Any]:
         """Return cache statistics (total entries, models breakdown).
 
         Requires ``can_read``.
         """
-        error = require_can_read(request)
-        if error is not None:
-            return error
 
         perms = getattr(request.state, "permissions", {})
         stats = await request.app.state.backend.cache_stats()
@@ -144,14 +159,11 @@ def create_app(*, backend: Any = None) -> FastAPI:
         return stats
 
     @app.post("/cache/clear", response_model=None)
-    async def cache_clear(request: Request, body: CacheClearRequest) -> dict[str, Any] | JSONResponse:
+    async def cache_clear(request: Request, body: CacheClearRequest, _auth=Depends(_auth_write)) -> dict[str, Any]:
         """Delete cache entries by content hash.
 
         Requires ``can_write``. Returns the number of deleted entries.
         """
-        error = require_can_write(request)
-        if error is not None:
-            return error
 
         hashes = body.hashes[:10000]  # hard cap
         deleted = await request.app.state.backend.cache_clear_by_hashes(hashes)

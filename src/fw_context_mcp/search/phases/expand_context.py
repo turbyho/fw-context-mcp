@@ -17,6 +17,7 @@ import logging
 from typing import TYPE_CHECKING
 
 from fw_context_mcp.search.phases.base import Phase
+from fw_context_mcp.search.phases.embedding_helpers import round_robin_by_kind
 
 if TYPE_CHECKING:
     from fw_context_mcp.search.context import PipelineContext
@@ -66,16 +67,11 @@ class ExpandContextPhase(Phase):
         try:
             with conn:
                 neighbor_usrs = _get_neighbors(conn, ctx.config_hash, seed_usrs, self.DIRECTION)
-        finally:
-            conn.close()
 
-        if not neighbor_usrs:
-            return ctx
+                if not neighbor_usrs:
+                    return ctx
 
-        # Resolve neighbor USRs to symbol rows — project definitions only
-        conn = open_db(ctx.db_path)
-        try:
-            with conn:
+                # Resolve neighbor USRs to symbol rows — project definitions only
                 neighbors = _resolve_project_defs(
                     conn, ctx.config_hash, neighbor_usrs, seed_set, self.MAX_NEIGHBORS
                 )
@@ -86,7 +82,8 @@ class ExpandContextPhase(Phase):
             return ctx
 
         # Mixed strategy: original seeds + new neighbors + remaining results
-        remaining = results[self.SEEDS:][: ctx.limit - len(seeds) - len(neighbors)]
+        remaining_budget = max(0, ctx.limit - len(seeds) - len(neighbors))
+        remaining = results[self.SEEDS:][:remaining_budget]
         final = list(seeds) + neighbors + list(remaining)
         return ctx.evolve(final_results=final)
 
@@ -102,7 +99,7 @@ def _get_neighbors(
         rows = conn.execute(
             f"SELECT DISTINCT from_usr FROM refs "
             f"WHERE config_hash = ? AND to_usr IN ({ph}) "
-            f"AND ref_kind = 'call' AND from_usr IS NOT NULL",
+            f"AND ref_kind = 'call' AND from_usr IS NOT NULL LIMIT 200",
             (config_hash, *usrs),
         ).fetchall()
         for r in rows:
@@ -113,7 +110,7 @@ def _get_neighbors(
         rows = conn.execute(
             f"SELECT DISTINCT to_usr FROM refs "
             f"WHERE config_hash = ? AND from_usr IN ({ph}) "
-            f"AND ref_kind = 'call'",
+            f"AND ref_kind = 'call' LIMIT 200",
             (config_hash, *usrs),
         ).fetchall()
         for r in rows:
@@ -134,12 +131,11 @@ def _resolve_project_defs(
         f"  is_pure_virtual, parent_usr, is_template, template_usr, "
         f"  summary, inputs, outputs "
         f"FROM symbols WHERE config_hash = ? AND usr IN ({ph}) "
-        f"AND is_definition = 1 AND is_project = 1 "
-        f"ORDER BY CASE kind WHEN 'function' THEN 0 WHEN 'method' THEN 1 "
-        f"  WHEN 'constructor' THEN 2 WHEN 'destructor' THEN 3 "
-        f"  WHEN 'varglobal' THEN 4 ELSE 5 END",
+        f"AND is_definition = 1 AND is_project = 1",
         (config_hash, *usrs),
     ).fetchall()
+
+    rows = round_robin_by_kind(rows, limit=limit)
 
     neighbors: list[dict] = []
     for r in rows:

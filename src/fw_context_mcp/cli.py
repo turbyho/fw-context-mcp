@@ -15,6 +15,8 @@ from pathlib import Path
 
 from . import __version__
 
+log = logging.getLogger(__name__)
+
 
 class VerboseFormatter(logging.Formatter):
     """Structured output with phase headers for ``--verbose`` mode.
@@ -45,6 +47,216 @@ class VerboseFormatter(logging.Formatter):
         return f"  {msg}"
 
 
+def _resolve_compile_commands(
+    args: argparse.Namespace,
+    project_root: Path,
+    cfg,
+    detected_system: str | None,
+    bg: bool,
+) -> tuple[Path | None, bool]:
+    """Resolve the compile_commands.json path.
+
+    Returns (path, is_explicit) or (None, False) on fatal error.
+    Caller checks for None → return 1.
+    """
+    explicit_cc = bool(args.compile_commands)
+
+    if args.build:
+        if bg:
+            print("error: --build and --background are mutually exclusive", file=sys.stderr)
+            return None, False
+        from .indexer.build import generate_compile_commands
+
+        build_cfg = cfg.build
+        if args.no_clean:
+            build_cfg.clean = False
+        try:
+            return generate_compile_commands(project_root, build_cfg), False
+        except RuntimeError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return None, False
+
+    if explicit_cc:
+        cc = Path(args.compile_commands)
+        if not cc.is_absolute():
+            cc = (project_root / cc).resolve()
+        if not cc.exists():
+            print(f"error: {cc} not found", file=sys.stderr)
+            print("  Run 'fw-context index --build' to build and index automatically.", file=sys.stderr)
+            return None, False
+        from .indexer.build import check_completeness
+        for warning in check_completeness(cc, project_root):
+            print(f"warning: {warning}", file=sys.stderr)
+        return cc, True
+
+    # Default: reuse existing, build only if missing
+    from .indexer.build import check_completeness, generate_compile_commands
+
+    cc = cfg.index.compile_commands
+    if not cc.is_absolute():
+        cc = (project_root / cc).resolve()
+    if not cc.exists():
+        if bg:
+            print(f"error: compile_commands.json not found at {cc}", file=sys.stderr)
+            print("  Background reindex requires an existing compile_commands.json.", file=sys.stderr)
+            print("  Run 'fw-context index --build' first to set up the project.", file=sys.stderr)
+            return None, False
+        print("compile_commands.json not found, running build...", file=sys.stderr)
+        try:
+            return generate_compile_commands(project_root, cfg.build), False
+        except RuntimeError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return None, False
+
+    for warning in check_completeness(cc, project_root):
+        print(f"warning: {warning}", file=sys.stderr)
+    return cc, False
+
+
+def _validate_and_fix_artifacts(
+    compile_commands: Path,
+    project_root: Path,
+    detected_system: str | None,
+    cfg,
+    bg: bool,
+    explicit_cc: bool,
+    args: argparse.Namespace,
+) -> tuple[Path | None, list[str] | None, bool]:
+    """Validate build artifacts and optionally auto-fix.
+
+    Returns (compile_commands, build_dir_patterns, ok).
+    compile_commands may be updated if a rebuild was triggered.
+    Caller returns 1 when ok is False.
+    """
+    if not detected_system:
+        return compile_commands, None, True
+
+    from .indexer.builders import registry as builder_registry
+    from .indexer.build import generate_compile_commands
+    from .indexer.validator import is_compile_commands_stale, validate_and_fix
+
+    builder_cls = builder_registry.get(detected_system)
+    if builder_cls is None:
+        return compile_commands, None, True
+
+    builder_instance = builder_cls()
+    build_dir_patterns = builder_instance.get_build_dir_patterns(project_root)
+
+    if not bg:
+        stale, stale_reasons = is_compile_commands_stale(compile_commands, project_root)
+        if stale:
+            if explicit_cc:
+                print(f"warning: explicit compile_commands.json is stale ({'; '.join(stale_reasons)})", file=sys.stderr)
+            else:
+                print(f"compile_commands.json is stale ({'; '.join(stale_reasons)}), rebuilding...")
+                try:
+                    compile_commands_new = generate_compile_commands(project_root, cfg.build)
+                    print(f"Generated: {compile_commands_new}")
+                    compile_commands = compile_commands_new
+                except RuntimeError as exc:
+                    print(f"error: {exc}", file=sys.stderr)
+                    print("  Run 'fw-context index --build' to retry.", file=sys.stderr)
+                    return compile_commands, None, False
+
+    issues = validate_and_fix(compile_commands, project_root, builder_instance, cfg.build, fix=not bg)
+    errors = [i for i in issues if i.severity == "error"]
+    for w in [i for i in issues if i.severity == "warning"]:
+        print(f"warning: {w.message}", file=sys.stderr)
+
+    if errors:
+        for e in errors:
+            print(f"error: {e.message}", file=sys.stderr)
+        if not bg and not explicit_cc and not args.build:
+            print("Rebuilding to fix issues...")
+            try:
+                compile_commands_new = generate_compile_commands(project_root, cfg.build)
+                print(f"Generated: {compile_commands_new}")
+                issues = validate_and_fix(compile_commands_new, project_root, builder_instance, cfg.build, fix=True)
+                errors = [i for i in issues if i.severity == "error"]
+                for i in issues:
+                    if i.severity == "warning":
+                        print(f"warning: {i.message}", file=sys.stderr)
+            except RuntimeError as exc:
+                print(f"error: {exc}", file=sys.stderr)
+                return compile_commands, None, False
+        if errors:
+            for e in errors:
+                print(f"error: {e.message}", file=sys.stderr)
+            if bg:
+                print("Run 'fw-context index' to resolve issues.", file=sys.stderr)
+            else:
+                print("Run 'fw-context index --build' to rebuild and fix issues.", file=sys.stderr)
+            return compile_commands, None, False
+
+    return compile_commands, build_dir_patterns, True
+
+
+# NOTE: PID file access could benefit from fcntl.flock() for multi-process
+# safety. Currently uses os.kill(pid, 0) for liveness checks which has
+# a TOCTOU race with PID reuse.  flock would eliminate this entirely.
+def _manage_bg_reindex(db_path: Path) -> None:
+    """Kill any running background reindex and write pause/pid files."""
+    pause_file = db_path.parent / "reindex.pause"
+    reindex_pid_file = db_path.parent / "reindex.pid"
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+
+    if reindex_pid_file.exists():
+        try:
+            bg_pid = int(reindex_pid_file.read_text(encoding="utf-8").strip())
+            if bg_pid != os.getpid():
+                os.kill(bg_pid, signal.SIGTERM)
+                deadline = time.monotonic() + 5.0
+                while time.monotonic() < deadline:
+                    try:
+                        os.kill(bg_pid, 0)
+                    except OSError:
+                        break
+                    time.sleep(0.1)
+                else:
+                    try:
+                        os.kill(bg_pid, signal.SIGKILL)
+                    except OSError:
+                        log.debug("SIGKILL on bg reindex process %d failed", bg_pid)
+                reindex_pid_file.unlink(missing_ok=True)
+        except (OSError, ValueError):
+            reindex_pid_file.unlink(missing_ok=True)
+
+    try:
+        pause_file.write_text(str(os.getpid()), encoding="utf-8")
+    except OSError:
+        log.debug("Failed to write pause marker %s", pause_file)
+    reindex_pid_file.write_text(str(os.getpid()), encoding="utf-8")
+
+
+def _post_index_optimize(
+    db_path: Path,
+    project_root: Path,
+    project_id: str,
+    detected_system: str | None,
+    args: argparse.Namespace,
+) -> None:
+    """Run PRAGMA optimize and update the global project registry."""
+    try:
+        import sqlite3 as _sqlite3
+
+        _opt_conn = _sqlite3.connect(str(db_path))
+        _opt_conn.execute("PRAGMA optimize")
+        _opt_conn.close()
+    except Exception:
+        log.debug("PRAGMA optimize failed for %s", db_path, exc_info=True)
+
+    from .config.global_db import open_global_db, upsert_project_registry
+
+    _ptype = detected_system or "unknown"
+    _gconn = open_global_db()
+    try:
+        upsert_project_registry(
+            _gconn, project_id, getattr(args, "name", None) or project_root.name, _ptype, str(project_root)
+        )
+    finally:
+        _gconn.close()
+
+
 def cmd_index(args: argparse.Namespace) -> int:
     """Build or rebuild the symbol index from compile_commands.json.
 
@@ -58,7 +270,6 @@ def cmd_index(args: argparse.Namespace) -> int:
     from .config import load as load_config
     from .indexer.build import detect_build_system
     from .indexer.runner import run
-    from .indexer.validator import is_compile_commands_stale, validate_and_fix
     from .utils import resolve_project_root
 
     if args.verbose:
@@ -74,224 +285,51 @@ def cmd_index(args: argparse.Namespace) -> int:
 
     project_root = resolve_project_root(args.project)
     cfg = load_config(project_root=project_root)
-
-    # ── Background mode: skip build, validation, and dep-tracking fixes ──
     bg = getattr(args, "background", False)
-
-    # Early validation: confirm we detected a known build system
-    # Prominent banner so the user can verify the right project is being indexed
     detected_system = detect_build_system(project_root)
+
     if detected_system:
         print(f"Project: {project_root.name}  path={project_root}  build={detected_system}")
-    else:
-        if bg:
-            # In background mode, an existing compile_commands.json is sufficient —
-            # we don't need to know the build system to reindex.
-            cc_fallback = project_root / "compile_commands.json"
-            if cc_fallback.exists():
-                print(f"Project: {project_root.name}  path={project_root}  build=unknown (bg, reusing cc)")
-            else:
-                print(
-                    f"error: No build system detected and no compile_commands.json for {project_root}.", file=sys.stderr
-                )
-                print("  Run 'fw-context index --build' first.", file=sys.stderr)
-                return 1
+    elif bg:
+        cc_fallback = project_root / "compile_commands.json"
+        if cc_fallback.exists():
+            print(f"Project: {project_root.name}  path={project_root}  build=unknown (bg, reusing cc)")
         else:
-            print(f"Project: {project_root.name}  path={project_root}  build=unknown")
-
-    # Resolve compile_commands.json path
-    explicit_cc = bool(args.compile_commands)
-
-    if args.build:
-        if bg:
-            print("error: --build and --background are mutually exclusive", file=sys.stderr)
+            print(f"error: No build system detected and no compile_commands.json for {project_root}.", file=sys.stderr)
+            print("  Run 'fw-context index --build' first.", file=sys.stderr)
             return 1
-        # Explicit build requested — always run build
-        from .indexer.build import generate_compile_commands
-
-        build_cfg = cfg.build
-        if args.no_clean:
-            build_cfg.clean = False
-        try:
-            compile_commands = generate_compile_commands(project_root, build_cfg)
-            print(f"Generated: {compile_commands}")
-        except RuntimeError as exc:
-            print(f"error: {exc}", file=sys.stderr)
-            return 1
-    elif explicit_cc:
-        # Explicit compile_commands.json path given — use as-is
-        compile_commands = Path(args.compile_commands)
-        if not compile_commands.is_absolute():
-            compile_commands = (project_root / compile_commands).resolve()
-        if not compile_commands.exists():
-            print(f"error: {compile_commands} not found", file=sys.stderr)
-            print("  Run 'fw-context index --build' to build and index automatically.", file=sys.stderr)
-            return 1
-
-        # Warn if compile_commands.json looks incomplete
-        from .indexer.build import check_completeness
-
-        for warning in check_completeness(compile_commands, project_root):
-            print(f"warning: {warning}", file=sys.stderr)
     else:
-        # Default: reuse existing compile_commands.json, build only if missing
-        from .indexer.build import check_completeness, generate_compile_commands
+        print(f"Project: {project_root.name}  path={project_root}  build=unknown")
 
-        compile_commands = cfg.index.compile_commands
-        if not compile_commands.is_absolute():
-            compile_commands = (project_root / compile_commands).resolve()
-        if not compile_commands.exists():
-            if bg:
-                print(f"error: compile_commands.json not found at {compile_commands}", file=sys.stderr)
-                print("  Background reindex requires an existing compile_commands.json.", file=sys.stderr)
-                print("  Run 'fw-context index --build' first to set up the project.", file=sys.stderr)
-                return 1
-            print("compile_commands.json not found, running build...", file=sys.stderr)
-            try:
-                compile_commands = generate_compile_commands(project_root, cfg.build)
-                print(f"Generated: {compile_commands}")
-            except RuntimeError as exc:
-                print(f"error: {exc}", file=sys.stderr)
-                return 1
-        else:
-            # Warn if compile_commands.json looks incomplete
-            for warning in check_completeness(compile_commands, project_root):
-                print(f"warning: {warning}", file=sys.stderr)
+    # ── Resolve compile_commands.json ──
+    cc_result = _resolve_compile_commands(args, project_root, cfg, detected_system, bg)
+    if cc_result[0] is None:
+        return 1
+    compile_commands, explicit_cc = cc_result
+
+    # ── Validate build artifacts ──
+    compile_commands, build_dir_patterns, ok = _validate_and_fix_artifacts(
+        compile_commands, project_root, detected_system, cfg, bg, explicit_cc, args
+    )
+    if not ok:
+        return 1
 
     project_id = derive_project_id(project_root)
-
     db_path = cfg.index.db_dir / project_id / "index.db"
-
-    # ── Validate build artifacts before indexing ──
-    build_dir_patterns: list[str] | None = None
-    if detected_system:
-        from .indexer.builders import registry as builder_registry
-
-        builder_cls = builder_registry.get(detected_system)
-        if builder_cls is not None:
-            builder_instance = builder_cls()
-            build_dir_patterns = builder_instance.get_build_dir_patterns(project_root)
-            if not bg:
-                # Foreground mode: staleness check + auto-rebuild.
-                # A stale compile_commands.json means the index would be
-                # inconsistent — we MUST rebuild before proceeding.
-                stale, stale_reasons = is_compile_commands_stale(compile_commands, project_root)
-                if stale:
-                    if explicit_cc:
-                        # User passed an explicit --compile_commands path —
-                        # warn but respect their choice.
-                        print(
-                            f"warning: explicit compile_commands.json is stale ({'; '.join(stale_reasons)})",
-                            file=sys.stderr,
-                        )
-                    else:
-                        print(f"compile_commands.json is stale ({'; '.join(stale_reasons)}), rebuilding...")
-                        try:
-                            compile_commands = generate_compile_commands(project_root, cfg.build)
-                            print(f"Generated: {compile_commands}")
-                        except RuntimeError as exc:
-                            print(f"error: {exc}", file=sys.stderr)
-                            print(
-                                "  Run 'fw-context index --build' to retry.",
-                                file=sys.stderr,
-                            )
-                            return 1
-            # Validate artifacts — in bg mode, report only (no auto-fix)
-            issues = validate_and_fix(
-                compile_commands,
-                project_root,
-                builder_instance,
-                cfg.build,
-                fix=not bg,
-            )
-            errors = [i for i in issues if i.severity == "error"]
-            warnings_list = [i for i in issues if i.severity == "warning"]
-            for w in warnings_list:
-                print(f"warning: {w.message}", file=sys.stderr)
-            if errors:
-                for e in errors:
-                    print(f"error: {e.message}", file=sys.stderr)
-                if not bg and not explicit_cc and not args.build:
-                    # Auto-rebuild to fix artifact errors (missing .d files, etc.)
-                    print("Rebuilding to fix issues...")
-                    try:
-                        compile_commands = generate_compile_commands(project_root, cfg.build)
-                        print(f"Generated: {compile_commands}")
-                        issues = validate_and_fix(
-                            compile_commands,
-                            project_root,
-                            builder_instance,
-                            cfg.build,
-                            fix=True,
-                        )
-                        errors = [i for i in issues if i.severity == "error"]
-                        for i in issues:
-                            if i.severity == "warning":
-                                print(f"warning: {i.message}", file=sys.stderr)
-                    except RuntimeError as exc:
-                        print(f"error: {exc}", file=sys.stderr)
-                        return 1
-                if errors:
-                    for e in errors:
-                        print(f"error: {e.message}", file=sys.stderr)
-                    if bg:
-                        print(
-                            "Run 'fw-context index' to resolve issues.",
-                            file=sys.stderr,
-                        )
-                    else:
-                        print(
-                            "Run 'fw-context index --build' to rebuild and fix issues.",
-                            file=sys.stderr,
-                        )
-                    return 1
 
     vendor_paths = list(getattr(args, "vendor_paths", None) or cfg.index.vendor_paths)
     project_paths = list(getattr(args, "project_paths", None) or cfg.index.project_paths)
 
-    # Override force flag from CLI
     cs_config = cfg.cache_server
     if cs_config is not None and getattr(args, "force", False):
         from dataclasses import replace
-
         cs_config = replace(cs_config, force=True)
 
-    # Manual index always wins — kill any running background reindex and
-    # prevent the daemon from starting a new one until we're done.
-    pause_file = db_path.parent / "reindex.pause"
+    # ── Manage background reindex ──
+    _manage_bg_reindex(db_path)
     reindex_pid_file = db_path.parent / "reindex.pid"
-    db_path.parent.mkdir(parents=True, exist_ok=True)
+    pause_file = db_path.parent / "reindex.pause"
 
-    # 1. Kill the background reindex subprocess if one is running
-    if reindex_pid_file.exists():
-        try:
-            bg_pid = int(reindex_pid_file.read_text(encoding="utf-8").strip())
-            if bg_pid != os.getpid():
-                os.kill(bg_pid, signal.SIGTERM)
-                # Wait up to 5 s for graceful exit, then force kill
-                deadline = time.monotonic() + 5.0
-                while time.monotonic() < deadline:
-                    try:
-                        os.kill(bg_pid, 0)
-                    except OSError:
-                        break
-                    time.sleep(0.1)
-                else:
-                    try:
-                        os.kill(bg_pid, signal.SIGKILL)
-                    except OSError:
-                        pass
-                reindex_pid_file.unlink(missing_ok=True)
-        except (OSError, ValueError):
-            reindex_pid_file.unlink(missing_ok=True)
-
-    # 2. Write pause marker so the daemon skips spawning new bg reindexes
-    try:
-        pause_file.write_text(str(os.getpid()), encoding="utf-8")
-    except OSError:
-        pass
-    # 3. Signal that an index is running — _is_bg_reindex_running reads this
-    reindex_pid_file.write_text(str(os.getpid()), encoding="utf-8")
     try:
         config_hash = run(
             compile_commands=compile_commands,
@@ -326,18 +364,7 @@ def cmd_index(args: argparse.Namespace) -> int:
         )
         print(f"Indexed. config_hash={config_hash[:16]}…  db={db_path}")
 
-        # ── Update project type in global registry ──
-        from .config.global_db import open_global_db, upsert_project_registry
-
-        _ptype = detected_system or "unknown"
-        _gconn = open_global_db()
-        try:
-            upsert_project_registry(
-                _gconn, project_id, getattr(args, "name", None) or project_root.name, _ptype, str(project_root)
-            )
-        finally:
-            _gconn.close()
-
+        _post_index_optimize(db_path, project_root, project_id, detected_system, args)
         return 0
     finally:
         reindex_pid_file.unlink(missing_ok=True)
@@ -347,7 +374,7 @@ def cmd_index(args: argparse.Namespace) -> int:
                 if content == str(os.getpid()):
                     pause_file.unlink(missing_ok=True)
         except OSError:
-            pass
+            log.debug("Failed to unlink pause file %s", pause_file)
 
 
 def cmd_search(args: argparse.Namespace) -> int:
@@ -385,24 +412,6 @@ def cmd_search(args: argparse.Namespace) -> int:
     return 0
 
 
-def _truncate_path_middle(path: str, max_len: int) -> str:
-    """Truncate a path by removing the middle, keeping start and end visible.
-
-    Example: ``/home/turbyho/dev/sw/…/privat/HA_Boiler``
-    """
-    if len(path) <= max_len:
-        return path
-    # Keep ~40% from start, ~60% from end so the project dir is fully visible
-    keep_start = max(max_len // 3, 12)
-    keep_end = max_len - keep_start - 1  # -1 for the ellipsis
-    return path[:keep_start] + "…" + path[-keep_end:]
-
-
-def _fmt_count(n: int) -> str:
-    """Format a count with thousand separators (non-breaking thin spaces)."""
-    return f"{n:_d}".replace("_", " ")
-
-
 def cmd_list(args: argparse.Namespace) -> int:
     """List all indexed firmware projects found under the configured index directory.
 
@@ -414,6 +423,7 @@ def cmd_list(args: argparse.Namespace) -> int:
 
     from .config import load as load_config
     from .indexer.db import get_all_projects, open_db
+    from .utils import fmt_count, truncate_path_middle
 
     cfg = load_config()
     index_dir = cfg.index.db_dir
@@ -437,8 +447,8 @@ def cmd_list(args: argparse.Namespace) -> int:
                 rows.append((
                     name,
                     r["root_path"] or "",
-                    _fmt_count(r["symbol_count"]),
-                    _fmt_count(r["file_count"]),
+                    fmt_count(r["symbol_count"]),
+                    fmt_count(r["file_count"]),
                     r["created_at"] or "",
                 ))
                 if args.verbose:
@@ -482,7 +492,7 @@ def cmd_list(args: argparse.Namespace) -> int:
         vals = list(row)
         path = vals[1]
         if len(path) > col_widths[1]:
-            vals[1] = _truncate_path_middle(path, col_widths[1])
+            vals[1] = truncate_path_middle(path, col_widths[1])
         print(_fmt_row(tuple(vals)))
 
     return 0
@@ -732,35 +742,12 @@ def _convert_agent_md_to_toml(md_content: str) -> str:
     return "\n".join(lines) + "\n"
 
 
-def _install_agents(dry_run: bool = False, project_root: Path | None = None, scope: str = "project") -> bool:
-    """Inject fw-context CRITICAL block into ALL agent files across ALL AI tools.
+def _build_agent_targets(
+    scope: str, project_root: Path | None
+) -> list[tuple[Path, str, list[str], bool]]:
+    """Build the list of (directory, tool_id, file_patterns, strip_name) tuples."""
+    from .config.tools import CROSS_TOOL_AGENT_DIRS_GLOBAL, CROSS_TOOL_AGENT_DIRS_PROJECT, TOOLS
 
-    Scans agent directories for every registered tool (and cross-tool
-    ``.agents/`` standard directories), injecting ``AGENT_CRITICAL_BLOCK``
-    into each existing agent file.  Also installs template agents from
-    ``data/agents/`` into compatible directories where the template does
-    not yet exist.
-
-    Agent directories and file patterns are driven by the ``TOOLS``
-    registry — no tool paths are hardcoded here.
-    """
-    import re
-
-    from . import __file__ as _pkg_init
-    from .config.tools import (
-        AGENT_CRITICAL_BLOCK,
-        CROSS_TOOL_AGENT_DIRS_GLOBAL,
-        CROSS_TOOL_AGENT_DIRS_PROJECT,
-        TOOLS,
-    )
-
-    pkg_dir = Path(_pkg_init).parent
-    agents_src = pkg_dir / "data" / "agents"
-
-    # Collect templates (may be empty if data/agents/ doesn't exist)
-    templates = sorted(agents_src.glob("*.md")) if agents_src.is_dir() else []
-
-    # Build target tuples: (directory, tool_id, file_patterns, strip_name)
     targets: list[tuple[Path, str, list[str], bool]] = []
     processed_dirs: set[Path] = set()
 
@@ -773,7 +760,6 @@ def _install_agents(dry_run: bool = False, project_root: Path | None = None, sco
                 if resolved.exists() or scope == "all":
                     targets.append((resolved, tool_id, tool.agent_file_patterns, tool.agent_strip_name))
                     processed_dirs.add(resolved)
-        # Cross-tool standard directories
         for dir_template in CROSS_TOOL_AGENT_DIRS_GLOBAL:
             resolved = Path(os.path.expanduser(dir_template))
             if resolved not in processed_dirs:
@@ -789,12 +775,37 @@ def _install_agents(dry_run: bool = False, project_root: Path | None = None, sco
                 if resolved.exists() or scope == "all":
                     targets.append((resolved, tool_id, tool.agent_file_patterns, tool.agent_strip_name))
                     processed_dirs.add(resolved)
-        # Cross-tool standard directories
         for dir_template in CROSS_TOOL_AGENT_DIRS_PROJECT:
             resolved = Path(dir_template.replace("{project}", str(project_root)))
             if resolved not in processed_dirs:
                 targets.append((resolved, "_cross", ["*.md"], True))
                 processed_dirs.add(resolved)
+
+    return targets
+
+
+def _install_agents(dry_run: bool = False, project_root: Path | None = None, scope: str = "project") -> bool:
+    """Inject fw-context CRITICAL block into ALL agent files across ALL AI tools.
+
+    Scans agent directories for every registered tool (and cross-tool
+    ``.agents/`` standard directories), injecting ``AGENT_CRITICAL_BLOCK``
+    into each existing agent file.  Also installs template agents from
+    ``data/agents/`` into compatible directories where the template does
+    not yet exist.
+
+    Agent directories and file patterns are driven by the ``TOOLS``
+    registry — no tool paths are hardcoded here.
+    """
+    import re
+
+    from . import __file__ as _pkg_init
+    from .config.tools import AGENT_CRITICAL_BLOCK
+
+    pkg_dir = Path(_pkg_init).parent
+    agents_src = pkg_dir / "data" / "agents"
+    templates = sorted(agents_src.glob("*.md")) if agents_src.is_dir() else []
+
+    targets = _build_agent_targets(scope, project_root)
 
     installed = False
     for agents_dir, _tool_id, patterns, strip_name in targets:
@@ -882,6 +893,157 @@ def _install_agents(dry_run: bool = False, project_root: Path | None = None, sco
     return installed
 
 
+def _resolve_mcp_bin() -> str | None:
+    """Find the fw-context-mcp binary, preferring canonical install over dev venv."""
+    import shutil
+
+    for candidate in [
+        Path.home() / ".local" / "bin" / "fw-context-mcp",
+        Path.home() / ".fw-context" / ".venv" / "bin" / "fw-context-mcp",
+    ]:
+        if candidate.exists():
+            return str(candidate)
+    mcp_bin = shutil.which("fw-context-mcp")
+    if mcp_bin:
+        return mcp_bin
+    dev_candidate = Path(sys.executable).parent / "fw-context-mcp"
+    if dev_candidate.exists():
+        return str(dev_candidate)
+    return None
+
+
+def _select_init_tools(args: argparse.Namespace, project_root: Path) -> list[str] | None:
+    """Select which AI tools to act on.
+
+    Returns a list of tool IDs, or None if a fatal error occurred (caller returns 1).
+    """
+    from .config.tools import TOOLS
+
+    selected: list[str] = []
+    if args.tool:
+        selected = [t.strip() for t in args.tool.split(",")]
+        for tid in selected:
+            if tid not in TOOLS:
+                print(f"[error] Unknown tool: {tid}", file=sys.stderr)
+                print(f"        Supported: {', '.join(TOOLS.keys())}", file=sys.stderr)
+                return None
+    else:
+        project_tools = _detect_project_ai_tools(project_root)
+        system_wide = [tid for tid, t in TOOLS.items() if t.is_detected()]
+        if args.scope == "project":
+            seen: set[str] = set(project_tools)
+            selected = list(project_tools)
+            for tid in system_wide:
+                if tid not in seen:
+                    seen.add(tid)
+                    selected.append(tid)
+        elif args.scope == "global":
+            selected = system_wide
+        else:
+            seen = set()
+            selected = []
+            for tid in system_wide + project_tools:
+                if tid not in seen:
+                    seen.add(tid)
+                    selected.append(tid)
+
+    if not selected:
+        print("No AI assistants detected — falling back to Claude Code configuration.")
+        selected = ["claude-code"]
+
+    return selected
+
+
+def _init_one_tool(
+    tool_id: str,
+    args: argparse.Namespace,
+    project_root: Path,
+    mcp_bin: str | None,
+    selected: list[str],
+) -> tuple[bool, list[str]]:
+    """Initialize a single AI tool: MCP registration + instruction injection.
+
+    Returns (ok, warnings).  ok=True if at least one action succeeded;
+    an inherited tool that requires no action is also considered ok.
+    """
+    from .config.tools import TOOLS, check_target
+
+    tool = TOOLS[tool_id]
+    print(f"\n── {tool.name} ({tool_id}) ──")
+    warnings: list[str] = []
+    ok = False
+
+    if tool.inherits_from:
+        parent = TOOLS.get(tool.inherits_from)
+        parent_name = parent.name if parent else tool.inherits_from
+        parent_ok = parent and parent.is_detected()
+        if parent_ok and tool_id in selected and tool.inherits_from in selected:
+            print(f"  [info] Inherits from {parent_name} — already handled above, skipping")
+            return True, warnings
+        elif parent_ok:
+            print(f"  [info] Inherits from {parent_name} which has fw-context instructions")
+            ok = True
+            if not args.force:
+                print("  [skip] Nothing to do. Use --force to inject anyway.")
+                return ok, warnings
+            print("  [force] Injecting despite inheritance...")
+        else:
+            print(f"  [warn] Inherits from {parent_name} but parent NOT DETECTED")
+            print("  [info] Injecting instructions anyway...")
+
+    if not args.instructions_only and mcp_bin and (tool.mcp_registration or tool.mcp_config_file):
+        if args.dry_run:
+            _register_mcp(tool, mcp_bin, dry_run=True)
+        else:
+            _register_mcp(tool, mcp_bin)
+
+    if not tool.targets:
+        if not tool.mcp_registration and not tool.mcp_config_file:
+            print("  [skip] No instruction targets defined")
+        return ok, warnings
+
+    for target in tool.targets:
+        if args.scope != "all" and target.scope != args.scope:
+            continue
+
+        collision = check_target(target, project_root if target.scope == "project" else None)
+        resolved = collision.path
+        instructions = target.render_instructions()
+
+        if collision.is_skillshare_managed and not args.force:
+            print(f"  [warn] {resolved}: directory managed by skillshare — skipping")
+            warnings.append(f"{tool.name}: {resolved} is skillshare-managed, use --force to overwrite")
+            continue
+
+        if collision.has_unmarked_content and not args.force:
+            print(f"  [warn] {resolved}: found unmarked fw-context content — skipping")
+            print("         Use --force to overwrite, or remove the existing section manually")
+            warnings.append(f"{tool.name}: {resolved} has unmarked fw-context content")
+            continue
+
+        if args.dry_run:
+            if collision.has_marked_section:
+                print(f"  [dry-run] {resolved}: would UPDATE marked section")
+            else:
+                print(f"  [dry-run] {resolved}: would CREATE ({target.method})")
+            ok = True
+            continue
+
+        if target.method == "marked_section":
+            _update_marked_section(resolved, instructions, marker="fw-context")
+            if collision.has_marked_section:
+                print(f"  [ok] {resolved}: updated fw-context section")
+            else:
+                print(f"  [ok] {resolved}: added fw-context section")
+        elif target.method == "separate_file":
+            resolved.parent.mkdir(parents=True, exist_ok=True)
+            resolved.write_text(instructions, encoding="utf-8")
+            print(f"  [ok] {resolved}: written")
+        ok = True
+
+    return ok, warnings
+
+
 def cmd_init(args: argparse.Namespace) -> int:
     """Register fw-context with AI assistants and inject usage instructions.
 
@@ -896,14 +1058,13 @@ def cmd_init(args: argparse.Namespace) -> int:
     Writes ``.fw-context/config.toml`` and ``.fw-context/local.toml`` in the
     project root when using project-scoped injection.
     """
-    import shutil
-
+    from .config import load as load_project_config
     from .config.settings import _ensure_project_config, _ensure_project_local_config
-    from .config.tools import TOOLS, check_target
+    from .config.settings import _write_project_id, generate_project_id as _gen_pid
+    from .config.tools import TOOLS
     from .indexer.build import detect_build_system
     from .utils import resolve_project_root
 
-    # --list-tools: show supported tools and detection status
     if args.list_tools:
         print("Supported AI assistants:\n")
         for tool in TOOLS.values():
@@ -911,28 +1072,10 @@ def cmd_init(args: argparse.Namespace) -> int:
         print("\nRun 'fw-context init --tool <id>' to set up a specific tool.")
         return 0
 
-    # Resolve fw-context-mcp binary — prefer canonical install over dev venv
-    mcp_bin = None
-    for candidate in [
-        Path.home() / ".local" / "bin" / "fw-context-mcp",
-        Path.home() / ".fw-context" / ".venv" / "bin" / "fw-context-mcp",
-    ]:
-        if candidate.exists():
-            mcp_bin = str(candidate)
-            break
-    if not mcp_bin:
-        mcp_bin = shutil.which("fw-context-mcp")
-    if not mcp_bin:
-        dev_candidate = Path(sys.executable).parent / "fw-context-mcp"
-        if dev_candidate.exists():
-            mcp_bin = str(dev_candidate)
-
+    mcp_bin = _resolve_mcp_bin()
     project_root = resolve_project_root(args.project)
 
-    # ── Generate project ID if missing ──
-    from .config.settings import _write_project_id, generate_project_id as _gen_pid
-    from .config import load as load_project_config
-
+    # ── Project ID + global registry ──
     _proj_cfg = load_project_config(project_root=project_root)
     if not _proj_cfg.project.id:
         new_id = _gen_pid()
@@ -943,148 +1086,34 @@ def cmd_init(args: argparse.Namespace) -> int:
         print(f"Project ID: {_proj_cfg.project.id} (existing)")
         proj_id = _proj_cfg.project.id
 
-    # ── Register project in global registry ──
     from .config.global_db import open_global_db, upsert_project_registry
 
     proj_name = getattr(args, "name", None) or _proj_cfg.project.name or project_root.name
     glob_conn = open_global_db()
     upsert_project_registry(glob_conn, proj_id, proj_name, "unknown", str(project_root))
 
-    # Select tools to act on
-    selected: list[str] = []
-    if args.tool:
-        selected = [t.strip() for t in args.tool.split(",")]
-        for tid in selected:
-            if tid not in TOOLS:
-                print(f"[error] Unknown tool: {tid}", file=sys.stderr)
-                print(f"        Supported: {', '.join(TOOLS.keys())}", file=sys.stderr)
-                return 1
-    else:
-        # Detect tools based on scope.
-        # For project scope: system-wide tools are always included — if a
-        # tool is installed but has no project files yet, we create them.
-        project_tools = _detect_project_ai_tools(project_root)
-        system_wide = [tid for tid, t in TOOLS.items() if t.is_detected()]
-        if args.scope == "project":
-            seen: set[str] = set(project_tools)
-            selected = list(project_tools)
-            for tid in system_wide:
-                if tid not in seen:
-                    seen.add(tid)
-                    selected.append(tid)
-        elif args.scope == "global":
-            selected = system_wide
-        else:  # all
-            seen = set()
-            selected = []
-            for tid in system_wide + project_tools:
-                if tid not in seen:
-                    seen.add(tid)
-                    selected.append(tid)
+    # ── Tool selection ──
+    selected = _select_init_tools(args, project_root)
+    if selected is None:
+        return 1
 
-    if not selected:
-        # Fallback: when no AI assistants are detected, default to Claude Code.
-        # This ensures the project is fully initialized (project ID, config files,
-        # skills, agents) even in minimal environments without any AI tooling
-        # installed (Docker containers, CI, headless build servers).
-        # _register_mcp_cli will skip MCP registration gracefully when the
-        # 'claude' binary is not found.
-        print("No AI assistants detected — falling back to Claude Code configuration.")
-        selected = ["claude-code"]
-
+    # ── Per-tool initialization ──
     ok = False
-    warnings: list[str] = []
-
+    all_warnings: list[str] = []
     for tool_id in selected:
-        tool = TOOLS[tool_id]
-        print(f"\n── {tool.name} ({tool_id}) ──")
-
-        # Inheritance check
-        if tool.inherits_from:
-            parent = TOOLS.get(tool.inherits_from)
-            parent_name = parent.name if parent else tool.inherits_from
-            parent_ok = parent and parent.is_detected()
-            if parent_ok and tool_id in selected and tool.inherits_from in selected:
-                print(f"  [info] Inherits from {parent_name} — already handled above, skipping")
-                ok = True  # Inheritance is a valid configuration
-                continue
-            elif parent_ok:
-                print(f"  [info] Inherits from {parent_name} which has fw-context instructions")
-                ok = True  # Inheritance is a valid configuration — not an error
-                if not args.force:
-                    print("  [skip] Nothing to do. Use --force to inject anyway.")
-                    continue
-                print("  [force] Injecting despite inheritance...")
-            else:
-                print(f"  [warn] Inherits from {parent_name} but parent NOT DETECTED")
-                print("  [info] Injecting instructions anyway...")
-
-        # MCP registration (only if not --instructions-only)
-        if not args.instructions_only and mcp_bin and (tool.mcp_registration or tool.mcp_config_file):
-            if args.dry_run:
-                _register_mcp(tool, mcp_bin, dry_run=True)
-            else:
-                _register_mcp(tool, mcp_bin)
-
-        # Instruction injection
-        if not tool.targets:
-            if not tool.mcp_registration and not tool.mcp_config_file:
-                print("  [skip] No instruction targets defined")
-            continue
-
-        for target in tool.targets:
-            if args.scope != "all" and target.scope != args.scope:
-                continue
-
-            collision = check_target(target, project_root if target.scope == "project" else None)
-            resolved = collision.path
-            instructions = target.render_instructions()
-
-            # Collision handling
-            if collision.is_skillshare_managed and not args.force:
-                print(f"  [warn] {resolved}: directory managed by skillshare — skipping")
-                warnings.append(f"{tool.name}: {resolved} is skillshare-managed, use --force to overwrite")
-                continue
-
-            if collision.has_unmarked_content and not args.force:
-                print(f"  [warn] {resolved}: found unmarked fw-context content — skipping")
-                print("         Use --force to overwrite, or remove the existing section manually")
-                warnings.append(f"{tool.name}: {resolved} has unmarked fw-context content")
-                continue
-
-            # Dry-run
-            if args.dry_run:
-                if collision.has_marked_section:
-                    print(f"  [dry-run] {resolved}: would UPDATE marked section")
-                else:
-                    print(f"  [dry-run] {resolved}: would CREATE ({target.method})")
-                ok = True
-                continue
-
-            # Write
-            if target.method == "marked_section":
-                _update_marked_section(resolved, instructions, marker="fw-context")
-                if collision.has_marked_section:
-                    print(f"  [ok] {resolved}: updated fw-context section")
-                else:
-                    print(f"  [ok] {resolved}: added fw-context section")
-            elif target.method == "separate_file":
-                resolved.parent.mkdir(parents=True, exist_ok=True)
-                resolved.write_text(instructions, encoding="utf-8")
-                print(f"  [ok] {resolved}: written")
-            ok = True
+        tool_ok, w = _init_one_tool(tool_id, args, project_root, mcp_bin, selected)
+        ok = ok or tool_ok
+        all_warnings.extend(w)
 
     # ── Project-level config and assets (skills, agents) ──
     _build_system = detect_build_system(project_root)
 
-    # Config file checks — always run, independent of AI tool injection success
     if not args.dry_run and not args.instructions_only:
         from .config.settings import (
             _PROJECT_DEFAULTS_TEMPLATE,
             _PROJECT_LOCAL_DEFAULTS_TEMPLATE,
             update_global_config,
         )
-
         update_global_config(fix=True)
         _check_config_file(project_root, ".fw-context/config.toml", _PROJECT_DEFAULTS_TEMPLATE, fix=True)
         _check_config_file(project_root, ".fw-context/local.toml", _PROJECT_LOCAL_DEFAULTS_TEMPLATE, fix=True)
@@ -1117,10 +1146,11 @@ def cmd_init(args: argparse.Namespace) -> int:
         else:
             print("  LLM: disabled — Ollama calls will return raw prompts")
 
-    if warnings:
+    if all_warnings:
         print("\nWarnings:")
-        for w in warnings:
+        for w in all_warnings:
             print(f"  ⚠ {w}")
+
     if ok:
         if args.dry_run:
             _install_skills(dry_run=True, project_root=project_root, scope=args.scope)
@@ -1368,6 +1398,12 @@ def _update_marked_section(path: Path, content: str, marker: str) -> None:
 
     path.parent.mkdir(parents=True, exist_ok=True)
     existing = path.read_text(encoding="utf-8") if path.exists() else ""
+
+    # Always create a backup before modifying, so users can recover
+    # their custom content if the section detection is wrong.
+    if path.exists() and existing.strip():
+        backup = path.with_suffix(path.suffix + ".bak")
+        backup.write_text(existing, encoding="utf-8")
 
     if start_tag in existing and end_tag in existing:
         # Replace the existing marked block (keep markers for idempotency)
@@ -1620,7 +1656,7 @@ def cmd_analyze(args: argparse.Namespace) -> int:
         cc = None
         if cfg.cache_server and cfg.cache_server.url:
             try:
-                from fw_context_mcp.cache_client import CacheClient
+                from .cache_client import CacheClient
 
                 cc = CacheClient(
                     url=cfg.cache_server.url,
@@ -1674,7 +1710,7 @@ def cmd_cache_stats(args: argparse.Namespace) -> int:
     from .config import derive_project_id
     from .config import load as load_config
     from .utils import resolve_project_root
-    from fw_context_mcp.cache_client import local_cache_stats, CacheClient
+    from .cache_client import local_cache_stats, CacheClient
 
     show_local = not args.remote
     project_root = resolve_project_root(args.project) if hasattr(args, "project") and args.project else Path.cwd()
@@ -1749,7 +1785,7 @@ def cmd_cache_push(args: argparse.Namespace) -> int:
     """
     from .config import load as load_config
     from .utils import resolve_project_root
-    from fw_context_mcp.cache_client import get_local_cache_db, CacheClient
+    from .cache_client import get_local_cache_db, CacheClient
 
     project_root = resolve_project_root(args.project) if hasattr(args, "project") else None
     if not project_root:
@@ -1892,10 +1928,17 @@ def cmd_cache_remote_init(args: argparse.Namespace) -> int:
         return 1
 
     # --- Step 4: Write config ---
+    # Store the token in a separate file with restricted permissions (0600)
+    # so it never appears in plaintext inside the shared config.toml.
+    token_dir = Path.home() / ".fw-context"
+    token_dir.mkdir(parents=True, exist_ok=True)
+    token_file = token_dir / ".cache_token"
+    token_file.write_text(token, encoding="utf-8")
+    os.chmod(token_file, 0o600)
+
     cache_section = f"""
 [cache_server]
 url = "{url}"
-token = "{token}"
 """
 
     if "[cache_server]" in existing:
@@ -1923,7 +1966,7 @@ def cmd_cache_clear(args: argparse.Namespace) -> int:
     from .config import derive_project_id
     from .config import load as load_config
     from .utils import resolve_project_root
-    from fw_context_mcp.cache_client import local_cache_clear, CacheClient
+    from .cache_client import local_cache_clear, CacheClient
 
     project_root = resolve_project_root(args.project) if hasattr(args, "project") else None
 

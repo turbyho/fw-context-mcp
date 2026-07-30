@@ -32,6 +32,7 @@ def _check_env() -> tuple[str, str]:
 
 
 def admin_command(fn: Callable[[Any, argparse.Namespace], Any]) -> Callable[[argparse.Namespace], int]:
+    # NOTE: wrapper drops the first arg (backend) — functools.wraps copies __name__/__doc__ but the signature differs intentionally
     """Decorator that wraps async admin command handlers.
 
     Handles the repeated boilerplate: DB connection, admin auth, and

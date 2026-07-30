@@ -1,0 +1,295 @@
+"""Symbol and macro storage / search routines for fw-context-mcp index."""
+
+from __future__ import annotations
+
+import logging
+import re
+import sqlite3
+
+
+log = logging.getLogger(__name__)
+
+
+def split_tokens(name: str, qualified_name: str = "") -> str:
+    """Normalize camelCase/snake_case names to space-separated lowercase tokens.
+
+    Builds a searchable token graph in FTS5 where each camelCase component
+    becomes an independent node, so ``connect*`` finds ``onConnectionComplete``,
+    ``modem*`` finds ``ModemMsgManager``, etc.
+
+    Examples:
+        onConnectionComplete       → "on connection complete"
+        modem_parser_oob_init      → "modem parser oob init"
+        ZCfgDataManager            → "cfg data manager"
+        HTTPResponse               → "http response"
+        ZBLE::onConnectionComplete → "zble on connection complete"
+        _last_ble_connected        → "last ble connected"
+    """
+    # Noise words that pollute FTS5 — strip before tokenizing
+    _NOISE_WORDS = frozenset(("at", "unnamed"))
+    # Guard against pathological inputs that cause ReDoS in regex processing.
+    # 500 chars is sufficient for 99.9% of C/C++ identifiers — nested template
+    # instantiations (e.g. std::map<std::string, std::vector<int>>) may exceed
+    # this limit, but the truncation is safe (token-quality loss is negligible).
+    _MAX_NAME_LEN = 500
+
+    def _tokenize(s: str) -> list[str]:
+        if len(s) > _MAX_NAME_LEN:
+            log.debug("Truncated long name from %d to %d chars for tokenization", len(s), _MAX_NAME_LEN)
+            s = s[:_MAX_NAME_LEN]
+        # Strip anonymous struct/enum/union markers — these inject noise tokens
+        # like "mbed", "include", "enum" that match thousands of irrelevant symbols.
+        s = re.sub(r"\(unnamed\s+(struct|enum|union)\s+at\s+[^)]+\)", "", s)
+        s = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", s)  # camelCase split
+        s = re.sub(r"([A-Z]+)([A-Z][a-z])", r"\1 \2", s)  # HTTPResponse → HTTP Response
+        parts = re.split(r"[^a-zA-Z0-9]+", s)  # split on non-alnum
+        return [p.lower() for p in parts if len(p) > 1 and p.lower() not in _NOISE_WORDS]
+
+    tokens: list[str] = []
+    seen: set[str] = set()
+    for src in (name, qualified_name):
+        if src:
+            for tok in _tokenize(src):
+                if tok not in seen:
+                    seen.add(tok)
+                    tokens.append(tok)
+    # Semantic hints for well-known embedded conventions.
+    # Cortex-M exception handlers use _Handler suffix (HardFault_Handler, NMI_Handler, ...)
+    # and don't contain "irq"/"isr" in their names. Add searchable concept tokens.
+    if name.endswith("_Handler"):
+        for tag in ("interrupt", "exception", "isr"):
+            if tag not in seen:
+                seen.add(tag)
+                tokens.append(tag)
+    return " ".join(tokens)
+
+
+def insert_symbols_batch(
+    conn: sqlite3.Connection,
+    rows: list[tuple],
+) -> int:
+    """Insert symbol rows, promoting declaration→definition on USR conflict.
+
+    Each row: (config_hash, file_id, file_path, name_tokens, usr, name,
+               qualified_name, kind, line, col, end_line, is_definition,
+               signature, docstring, enum_value, is_virtual, is_pure_virtual,
+               parent_usr, is_template, template_usr, is_project, pagerank, source)
+
+    Returns count of rows inserted or upgraded to definition.
+    """
+
+    cur = conn.executemany(
+        """INSERT INTO symbols
+           (config_hash, file_id, file_path, name_tokens, usr, name, qualified_name, kind,
+            line, col, end_line, is_definition, signature, docstring, enum_value,
+            is_virtual, is_pure_virtual, parent_usr, is_template, template_usr, is_project, pagerank, source)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+           ON CONFLICT(config_hash, usr) DO UPDATE SET
+               file_id       = excluded.file_id,
+               file_path     = excluded.file_path,
+               name_tokens   = excluded.name_tokens,
+               line          = excluded.line,
+               col           = excluded.col,
+               end_line      = excluded.end_line,
+               is_definition = 1,
+               signature     = excluded.signature,
+               docstring     = excluded.docstring,
+               enum_value    = excluded.enum_value,
+               is_virtual    = excluded.is_virtual,
+               is_pure_virtual = excluded.is_pure_virtual,
+               parent_usr    = excluded.parent_usr,
+               is_template   = excluded.is_template,
+               template_usr  = excluded.template_usr,
+               is_project    = excluded.is_project,
+               pagerank      = excluded.pagerank,
+               source        = excluded.source
+           WHERE excluded.is_definition = 1 AND symbols.is_definition = 0""",
+        rows,
+    )
+    return cur.rowcount  # approximate with ON CONFLICT DO UPDATE WHERE (used for logging only)
+
+
+def insert_macros_batch(
+    conn: sqlite3.Connection,
+    rows: list[tuple],
+) -> int:
+    """Insert macro rows, updating on (config_hash, file_id, line) conflict.
+
+    Each row: (config_hash, file_id, name, value, expanded_value, line, is_function_like)
+
+    Returns count of rows inserted or updated.
+    """
+    cur = conn.executemany(
+        """INSERT INTO macros
+           (config_hash, file_id, name, value, expanded_value, line, is_function_like)
+           VALUES (?,?,?,?,?,?,?)
+           ON CONFLICT(config_hash, file_id, line) DO UPDATE SET
+               name           = excluded.name,
+               value          = excluded.value,
+               expanded_value = CASE WHEN excluded.expanded_value != '' THEN excluded.expanded_value ELSE macros.expanded_value END,
+               is_function_like = excluded.is_function_like""",
+        rows,
+    )
+    return cur.rowcount  # approximate with ON CONFLICT DO UPDATE WHERE (used for logging only)
+
+
+def delete_macros_for_file(conn: sqlite3.Connection, file_id: int) -> None:
+    """Delete all macros for a file (FTS ad trigger cleans up FTS index)."""
+    conn.execute("DELETE FROM macros WHERE file_id=?", (file_id,))
+
+
+def lookup_macro(
+    conn: sqlite3.Connection,
+    config_hash: str,
+    name: str,
+    exact: bool = False,
+    limit: int = 50,
+) -> list[sqlite3.Row]:
+    """Look up macros by name — exact or prefix match.
+
+    Returns rows from the ``macros`` table joined with ``files`` to get
+    the file path.  Same three-tier name resolution as ``lookup_symbol``
+    for symbols (exact name, exact name with definition preference,
+    prefix LIKE).
+    """
+    limit = min(limit, 100)
+    if exact:
+        return conn.execute(
+            """SELECT m.*, f.path AS file_path
+               FROM macros m
+               JOIN files f ON f.id = m.file_id
+               WHERE m.config_hash = ? AND m.name = ?
+               ORDER BY m.line
+               LIMIT ?""",
+            (config_hash, name, limit),
+        ).fetchall()
+
+    esc = name.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    return conn.execute(
+        r"""SELECT m.*, f.path AS file_path
+           FROM macros m
+           JOIN files f ON f.id = m.file_id
+           WHERE m.config_hash = ? AND m.name LIKE ? ESCAPE '\'
+           ORDER BY m.name, m.line
+           LIMIT ?""",
+        (config_hash, f"{esc}%", limit),
+    ).fetchall()
+
+
+def find_macro_refs(
+    conn: sqlite3.Connection,
+    config_hash: str,
+    name: str,
+    limit: int = 50,
+) -> list[sqlite3.Row]:
+    """Find file-level references to a macro using the files_fts index.
+
+    Searches ifdef-filtered file content for occurrences of *name*.
+    Returns file-level matches with highlighted snippets.
+    """
+    limit = min(limit, 100)
+    table_row = conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='files_fts'").fetchone()
+    if table_row is None:
+        return []
+
+    expanded = _expand_query(name)
+    try:
+        return conn.execute(
+            """SELECT f.path AS file_path, f.language,
+                      snippet(files_fts, 1, '<b>', '</b>', '…', 80) AS _match_snippet
+               FROM files_fts
+               JOIN files f ON f.id = files_fts.rowid
+               WHERE files_fts MATCH ? AND f.config_hash = ? AND f.content != ''
+               ORDER BY rank
+               LIMIT ?""",
+            (expanded, config_hash, limit),
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return []
+
+
+def _expand_query(query: str) -> str:
+    """Add trailing wildcard to each bare word for broader prefix matching.
+
+    Leaves existing wildcards (*) and FTS5 syntax (NEAR, ", parentheses,
+    column filters with ``name_tokens : term*``) intact.  Single colons in
+    column-filter syntax are detected via regex; C++ ``::`` passes through
+    so its tokens get wildcard expansion.
+    """
+    # Tokens that already are FTS5 syntax — don't touch them.
+    # Single colon (not part of ::) covers column-filter expressions like
+    # "name_tokens : term*" which would be corrupted by wildcard appending.
+    _bare_syntax = ('"', "NEAR", "AND", "OR", "(", ")")
+    _has_col_filter = re.search(r"(?<!:):(?!:)", query)
+    if any(c in query for c in _bare_syntax) or _has_col_filter:
+        return query
+
+    parts = query.replace("::", " ").split()
+    expanded = []
+    for p in parts:
+        if p.endswith("*"):
+            expanded.append(p)
+        else:
+            expanded.append(f"{p}*")
+    return " OR ".join(expanded)
+
+
+def search_symbols(
+    conn: sqlite3.Connection,
+    query: str,
+    config_hash: str,
+    limit: int = 20,
+    kind: str | None = None,
+    exclude_variables: bool = False,
+    project_only: bool = False,
+) -> list[sqlite3.Row]:
+    """FTS5 search over symbols for a given build config.
+
+    Bare words are expanded to trailing-wildcard prefix queries so that
+    ``modem init`` matches ``modem_parser_oob_init``.
+    When *kind* is given, the filter is applied in SQL (before LIMIT) so the
+    caller reliably gets up to *limit* matching rows — filtering after the fact
+    in Python would silently under-return.
+    When *exclude_variables* is True, local/file-scope variables are excluded
+    from results.  Set True in topic-search tools (``search_code``) to prevent
+    low-signal entries from cluttering the top results; leave False in recall
+    phases (hybrid / embedding search) where vector re-ranking handles relevance.
+    When *project_only* is True, SDK/vendor paths are excluded
+    (only src/, lib/, app/, include/ are retained).
+    Note: file_path is read from the denormalized symbols.file_path column,
+    not re-joined from files — the JOIN was removed to avoid the redundant
+    round-trip and the shadowing hazard.
+    """
+    expanded = _expand_query(query)
+    if kind:
+        kind_filter = "AND s.kind = ?"
+    elif exclude_variables:
+        kind_filter = "AND s.kind NOT IN ('variable', 'varlocal')"
+    else:
+        kind_filter = ""
+    if project_only:
+        project_filter = "AND s.is_project = 1"
+    else:
+        project_filter = ""
+    params: list = [expanded, config_hash]
+    if kind:
+        params.append(kind)
+    params.append(limit)
+    # Build bm25 weights dynamically — the number of indexed columns varies
+    # based on whether ``source`` column exists in the symbols table.
+    # Base 9 columns: name, qualified_name, signature, docstring, file_path,
+    #                name_tokens, summary, inputs, outputs
+    _BASE_WEIGHTS = [1.2, 0.75, 10.0, 1.0, 3.0, 2.0, 1.0, 5.0, 1.0]
+    fts_cols = [r[1] for r in conn.execute("PRAGMA table_info(symbols_fts)").fetchall()]
+    n_extra = len(fts_cols) - len(_BASE_WEIGHTS)
+    weights = _BASE_WEIGHTS + [1.0] * max(0, n_extra)
+    bm25_expr = f"bm25(symbols_fts, {', '.join(str(w) for w in weights)})"
+    return conn.execute(
+        f"""SELECT s.*
+           FROM symbols_fts
+           JOIN symbols s ON s.id = symbols_fts.rowid
+           WHERE symbols_fts MATCH ? AND s.config_hash = ? {kind_filter} {project_filter}
+            ORDER BY {bm25_expr}
+           LIMIT ?""",
+        params,
+    ).fetchall()

@@ -34,7 +34,14 @@ from ...indexer.symbols import (
 from ...llm.ollama import check_setup
 from ...utils import resolve_project_root
 from ..background import _is_bg_reindex_running
-from ..shared.context import _db_path, _detect_build_system, _is_stale, _open_db_safe, _resolve_context
+from ..shared.context import (
+    _db_path,
+    _detect_build_system,
+    _invalidate_conn_cache,
+    _is_stale,
+    _open_db_safe,
+    _resolve_context,
+)
 from ..shared.stale import _check_header_staleness, _count_modified_files
 
 log = logging.getLogger(__name__)
@@ -344,7 +351,7 @@ def get_active_build(
                 result["reindex_progress"] = None
         return result
     finally:
-        conn.close()
+        pass  # connection managed by connection.py cache
 
 
 # ── moved from server.py ──
@@ -392,7 +399,7 @@ def list_projects(
                     rows = get_all_projects(conn)
                     db_schema_ver = get_db_schema_version(conn)
             finally:
-                conn.close()
+                pass  # connection managed by connection.py cache
             for r in rows:
                 cc_stale = (
                     _is_stale(
@@ -472,7 +479,7 @@ def reset_index(
                         (cfg_data["config_hash"],),
                     ).fetchone()[0]
         finally:
-            conn.close()
+            pass  # connection managed by connection.py cache
     info: dict[str, object] = {
         "project_root": str(root),
         "db": str(db_path),
@@ -497,8 +504,8 @@ def reset_index(
     db_path.unlink()
     for suffix in ("-wal", "-shm", "-journal"):
         p = db_path.with_name(db_path.name + suffix)
-        if p.exists():
-            p.unlink()
+        p.unlink(missing_ok=True)
+    _invalidate_conn_cache(str(db_path.resolve()))
     info["action"] = "deleted"
     info["message"] = f"Index deleted. Run 'fw-context index' in {root} to rebuild."
     return info
@@ -610,16 +617,20 @@ def _reindex_parse_and_store(
     config_hash = cfg_data["config_hash"]
 
     parsed_units: list[tuple[TU, tuple[list[Symbol], list[Reference], list[InheritanceRecord], list[IndirectCallSite], list[FnPointerAssignment], list[Macro]]]] = []
+    skipped_tus: list[str] = []
     for unit in matching:
         try:
             parsed = extract_all(unit, with_refs=cfg_refs)
             parsed_units.append((unit, parsed))
         except sqlite3.Error as exc:
             return 0, {"error": f"DB error during parse of {unit.file.name}: {exc}"}
+            # NOTE: _request_bg_reindex_pause is called AFTER this loop —
+            # early return here is safe (pause was never requested).
+            # Do NOT move _request_bg_reindex_pause before this loop
+            # without wrapping it in try/finally.
         except Exception as exc:
-            if "unable to open database file" in str(exc):
-                return 0, {"error": f"DB error during parse of {unit.file.name}: {exc}"}
             log.warning("skip TU %s during reindex: %s", unit.file.name, exc)
+            skipped_tus.append(str(unit.file.name))
 
     _request_bg_reindex_pause(root)
     t0 = time.monotonic()
@@ -696,6 +707,11 @@ def _reindex_parse_and_store(
                 "symbols_updated": total_symbols,
                 "elapsed_s": elapsed,
             }
+            if skipped_tus:
+                result["skipped_tus"] = skipped_tus
+                result["skipped_count"] = len(skipped_tus)
+            if not parsed_units and skipped_tus:
+                return 0, {"error": f"All {len(matching)} translation unit(s) failed to parse", "skipped_tus": skipped_tus}
         return total_symbols, result
     except sqlite3.Error as exc:
         return 0, {"error": f"DB error during reindex: {exc}"}
@@ -749,7 +765,7 @@ def _reindex_post_write_phases(
         except Exception as exc:
             result["analysis_warning"] = f"LLM analysis skipped: {exc}"
 
-    if total_symbols > 0:
+    if total_symbols > 0 and cfg.index.index_refs:
         try:
             from ...indexer.runner import _build_overrides
             _build_overrides(conn, config_hash, db_dir, write_lock_held=True, force=True)
@@ -772,18 +788,23 @@ def _reindex_post_write_phases(
         )
 
     if cfg.llm.enabled and total_symbols > 0:
+        from ...indexer.ops import _normalize_file_path
         try:
             from ...indexer.runner import _build_embeddings as _reembed
             file_symbol_ids = [
                 r[0] for r in conn.execute(
                     "SELECT id FROM symbols WHERE config_hash = ? AND file_path = ?",
-                    (config_hash, str(target.relative_to(root))),
+                    (config_hash, _normalize_file_path(str(target), root)),
                 ).fetchall()
             ]
             if file_symbol_ids:
                 _reembed(conn, config_hash, cfg.llm, db_dir, symbol_ids=file_symbol_ids)
             else:
-                _reembed(conn, config_hash, cfg.llm, db_dir)
+                log.warning(
+                    "No symbols found for path %s in DB — skipping embedding regeneration "
+                    "(this may happen for files outside the project root or after a symlink change)",
+                    target,
+                )
             conn.commit()
             reembedded = conn.execute(
                 "SELECT COUNT(DISTINCT symbol_id) FROM embeddings e "
@@ -817,7 +838,7 @@ def reindex_file_impl(
     ] = True,
 ) -> dict:
     """Re-parse a single source file with libclang and update its symbols in the index."""
-    db_path, cfg, project_id, root = _resolve_context(project_root)
+    db_path, cfg, project_id, root = _resolve_context(project_root, skip_ready_check=True)
     if not db_path.exists():
         return {"error": f"No index found for {root}. Run 'fw-context index' first."}
     conn, err = _open_db_safe(db_path)
@@ -828,33 +849,18 @@ def reindex_file_impl(
         cfg_data = get_active_config(conn, project_id)
         if not cfg_data:
             return {"error": "No build config indexed."}
-        target = Path(file_path)
-        if not target.is_absolute():
-            target = (root / target).resolve()
-        else:
-            target = target.resolve()
 
+        target, error = _reindex_resolve_target(file_path, root)
+        if error:
+            return error
         if not target.exists():
             return _reindex_cleanup_deleted_file(conn, cfg_data, target, root, db_path)
 
-        cc_path = Path(cfg_data["compile_commands_path"])
-        if not cc_path.exists():
-            return {"error": f"compile_commands.json not found: {cc_path}"}
-        units = parse_cc(cc_path)
-        matching = [u for u in units if Path(u.file).resolve() == target]
-        if not matching:
-            return {"error": f"{target.name} not found in compile_commands.json — it may be a header-only file."}
-        config_hash = cfg_data["config_hash"]
+        matching, error = _reindex_match_tus(target, cfg_data)
+        if error:
+            return error
 
-        from ...indexer.sdk_detect import _build_sdk_excludes, _normalize_patterns
-
-        vendor_patterns = list(_build_sdk_excludes(root))
-        if cfg.index.vendor_paths:
-            vendor_patterns.extend(_normalize_patterns(cfg.index.vendor_paths))
-        project_patterns_list = (
-            _normalize_patterns(list(cfg.index.project_paths)) if cfg.index.project_paths else []
-        )
-
+        vendor_patterns, project_patterns_list = _reindex_build_patterns(cfg, root)
         total_symbols, result = _reindex_parse_and_store(
             conn, matching, cfg_data, cfg.index.index_refs,
             root, db_path, target, vendor_patterns, project_patterns_list,
@@ -864,12 +870,68 @@ def reindex_file_impl(
         if not with_analysis:
             return result
 
+        config_hash = cfg_data["config_hash"]
         return _reindex_post_write_phases(
             conn, config_hash, cfg, total_symbols, db_path.parent,
             target, matching, result, root,
         )
     finally:
-        conn.close()
+        try:
+            conn.execute("PRAGMA optimize")
+        except Exception:
+            pass
+        pass  # connection managed by connection.py cache
+        _invalidate_conn_cache(str(db_path.resolve()))
+
+
+def _reindex_resolve_target(
+    file_path: str, root: Path
+) -> tuple[Path, dict | None]:
+    """Resolve *file_path* to an absolute path relative to *root*.
+
+    Returns ``(target, None)`` on success or ``(target, error_dict)``
+    when the path cannot be resolved.
+    """
+    target = Path(file_path)
+    if not target.is_absolute():
+        target = (root / target).resolve()
+    else:
+        target = target.resolve()
+    return target, None
+
+
+def _reindex_match_tus(
+    target: Path, cfg_data: sqlite3.Row
+) -> tuple[list, dict | None]:
+    """Find compilation units in compile_commands.json that build *target*.
+
+    Returns ``(matching_tus, None)`` or ``(None, error_dict)``.
+    """
+    cc_path = Path(cfg_data["compile_commands_path"])
+    if not cc_path.exists():
+        return [], {"error": f"compile_commands.json not found: {cc_path}"}
+    units = parse_cc(cc_path)
+    matching = [u for u in units if Path(u.file).resolve() == target]
+    if not matching:
+        return [], {"error": f"{target.name} not found in compile_commands.json — it may be a header-only file."}
+    return matching, None
+
+
+def _reindex_build_patterns(
+    cfg, root: Path
+) -> tuple[list[str], list[str]]:
+    """Collect vendor-exclude and project-include file path patterns."""
+    from ...indexer.sdk_detect import _build_sdk_excludes, _normalize_patterns
+
+    vendor_patterns = list(_build_sdk_excludes(root))
+    if cfg.index.vendor_paths:
+        vendor_patterns.extend(_normalize_patterns(cfg.index.vendor_paths))
+    project_patterns_list = (
+        _normalize_patterns(list(cfg.index.project_paths))
+        if cfg.index.project_paths
+        else []
+    )
+    return vendor_patterns, project_patterns_list
 
 
 # ── moved from server.py ──

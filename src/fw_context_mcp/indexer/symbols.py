@@ -12,10 +12,11 @@ import clang.cindex as cx
 
 from .compile_commands import CompilationUnit
 
+import threading
 _log = logging.getLogger(__name__)
 
 _INDEX: cx.Index | None = None
-_index_lock = None
+_index_lock = threading.Lock()
 
 
 def _get_index() -> cx.Index:
@@ -25,10 +26,7 @@ def _get_index() -> cx.Index:
     serialize concurrent ``parse()`` calls, so a single shared instance
     is sufficient.
     """
-    global _INDEX, _index_lock
-    import threading
-    if _index_lock is None:
-        _index_lock = threading.Lock()
+    global _INDEX
     if _INDEX is None:
         with _index_lock:
             if _INDEX is None:
@@ -87,212 +85,15 @@ _INDIRECT_TARGET_KINDS = frozenset({
 })
 
 
-@dataclass
-class Reference:
-    """An edge from a call or reference site to the symbol it refers to.
+from .models import (
+    FnPointerAssignment,
+    IndirectCallSite,
+    InheritanceRecord,
+    Macro,
+    Reference,
+    Symbol,
+)
 
-    Attributes:
-        to_usr: USR of the referenced definition (links to ``Symbol.usr``).
-        from_file: Absolute path of the file containing the reference.
-        from_line: Source line of the reference expression.
-        from_usr: USR of the enclosing function or method (the caller), or
-            None when the reference appears at file scope.
-        ref_kind: Classification of the reference — ``"call"`` for direct
-            function calls, ``"ref"`` for variable/enum reads, ``"member"``
-            for member accesses, ``"indirect"`` for function pointers found
-            in call arguments, assignments, variable initializers, or
-            struct/array init lists.
-    """
-    to_usr: str        # USR of the referenced definition (links to Symbol.usr)
-    from_file: str     # file containing the reference (absolute, as clang reports)
-    from_line: int
-    from_usr: str | None   # USR of the enclosing function/method (caller), or None
-    ref_kind: str      # "call" | "ref" | "member" | "indirect" | "implicit_construct"
-
-
-@dataclass
-class Macro:
-    """A preprocessor macro definition (``#define``).
-
-    Only collected when ``PARSE_DETAILED_PROCESSING_RECORD`` is active
-    (enabled by default for all translation units).
-
-    Attributes:
-        config_hash: Build configuration fingerprint.
-        file_id: Foreign key to ``files.id`` in the index database.
-        name: The macro name (without leading ``#define``).
-        value: Raw value text from the ``#define`` directive.
-        expanded_value: Fully expanded value from ``clang -dM -E`` (set
-            later by the macros.py driver; empty during initial parsing).
-        line: Source line number (1-based) of the ``#define`` directive.
-        is_function_like: ``True`` for function-like macros
-            (``#define SQUARE(x) ((x)*(x))``).
-        file: Absolute path of the file containing the macro definition.
-    """
-    config_hash: str = ""
-    file_id: int = 0
-    name: str = ""
-    value: str = ""
-    expanded_value: str = ""
-    line: int = 0
-    is_function_like: bool = False
-    file: str = ""
-
-
-@dataclass
-class InheritanceRecord:
-    """A C++ inheritance edge: ``class Derived : public Base { ... }``."""
-    derived_usr: str   # USR of the derived class (child)
-    base_usr: str      # USR of the base class (parent)
-    access: str        # "public", "protected", or "private"
-    is_virtual: bool   # True for virtual inheritance
-
-
-@dataclass
-class IndirectCallSite:
-    """A call site where a function pointer is invoked through a field or variable.
-
-    Unlike ``Reference`` (which points to a resolved FUNCTION_DECL), this
-    records the FIELD_DECL or VAR_DECL that holds the function pointer —
-    the actual function called depends on runtime state.
-
-    Attributes:
-        from_file: Absolute path of the file containing the call.
-        from_line: Source line of the call expression.
-        from_usr: USR of the enclosing function or method, or None.
-        expr_text: Callee expression text, e.g. ``"driver.onData"`` or
-            ``"stored_callback"``.
-        target_usr: USR of the function pointer field or variable being
-            called (the FIELD_DECL / VAR_DECL, not the target function).
-        target_name: Display name of the field or variable, e.g. ``"onData"``.
-        fn_ptr_type: Function pointer type signature string,
-            e.g. ``"void (*)(uint8_t *, size_t)"``.
-    """
-    from_file: str
-    from_line: int
-    from_usr: str | None
-    expr_text: str
-    target_usr: str
-    target_name: str
-    fn_ptr_type: str
-
-
-@dataclass
-class FnPointerAssignment:
-    """A function assigned to a function pointer field, variable, or parameter.
-
-    Records both sides of ``field = &function`` and ``register(&function)``
-    patterns.  The *lhs_usr* links to the FIELD_DECL, VAR_DECL, or PARM_DECL
-    that receives the function pointer; *rhs_usr* links to the FUNCTION_DECL
-    that is assigned.
-
-    Together with ``IndirectCallSite``, this enables Phase 3 linking:
-    ``fp_assignments.lhs_usr = indirect_call_sites.target_usr`` answers
-    "which functions can be called through this field?"
-
-    Attributes:
-        from_file: Absolute path of the file containing the assignment.
-        from_line: Source line of the assignment expression.
-        lhs_usr: USR of the field, variable, or parameter that receives
-            the function pointer.
-        lhs_name: Display name of the left-hand side, e.g. ``"onData"``
-            or ``"cb"``.
-        rhs_usr: USR of the function being assigned.
-        rhs_name: Display name of the assigned function, e.g. ``"handler"``.
-        fn_ptr_type: Function pointer type signature string,
-            e.g. ``"void (*)(uint8_t *, size_t)"``.
-        method: How the assignment was detected — ``"assignment"``
-            (BINARY_OPERATOR), ``"call_arg"`` (CALL_EXPR argument),
-            ``"var_init"`` (VAR_DECL initializer), or ``"init_list"``
-            (INIT_LIST_EXPR struct/array init).
-        from_usr: USR of the enclosing function or method, or None.
-    """
-    from_file: str
-    from_line: int
-    lhs_usr: str
-    lhs_name: str
-    rhs_usr: str
-    rhs_name: str
-    fn_ptr_type: str
-    method: str
-    from_usr: str | None
-
-
-@dataclass
-class Symbol:
-    """A parsed C/C++ symbol extracted from a translation unit.
-
-    Represents a single declaration or definition encountered during
-    libclang AST traversal.  Every symbol carries a ``usr`` that uniquely
-    identifies it across translation units, a ``qualified_name`` built
-    from semantic parent traversal, and metadata specific to its kind
-    (signature for callables, enum values for constants, virtual flags
-    for methods, and template relationships for specializations).
-
-    Attributes:
-        name: Unqualified symbol name (e.g. ``uart_init``).
-        qualified_name: Fully qualified name with ``::`` separators,
-            built by traversing semantic parents
-            (e.g. ``namespace::Class::method``).
-         kind: Symbol kind string — one of ``"function"``, ``"method"``,
-             ``"constructor"``, ``"destructor"``, ``"class"``, ``"struct"``,
-             ``"enum"``, ``"enum_constant"``, ``"typedef"``,
-             ``"varglobal"`` (file/namespace-scope, static class member),
-             ``"varlocal"`` (function-local),
-             ``"variable"`` (legacy, pre-split),
-             ``"field"`` (class/struct member),
-             or ``"namespace"``.
-        file: Absolute path to the source file containing this symbol.
-        line: Start line of the declaration or definition (1-based).
-        column: Start column of the declaration or definition (0-based).
-        is_definition: True when the cursor is a definition; for
-            ``_DECL_KINDS`` (function, function template, method) the
-            declaration is indexed even without a definition.
-        signature: Human-readable signature for callables — combines
-            return type, name, and parameter list.  Empty string for
-            non-callable symbols.
-        docstring: Raw comment text from above the symbol, with comment
-            markers (``/**``, ``//``, ``*``) stripped.  Line breaks are
-            preserved so Doxygen tags (``@brief``, ``@param``, ``@return``)
-            remain structured for LLM analysis.
-        usr: libclang Unified Symbol Resolution — a cross-translation-unit
-            identifier that links declarations and definitions of the
-            same symbol.
-        end_line: Last source line of the definition extent, or 0 when
-            the extent is unavailable (e.g. the end lies in a different
-            file due to macro expansion).
-        enum_value: Integer value for ``enum_constant`` symbols.
-            ``None`` for all other symbol kinds.
-        is_virtual: True for virtual ``CXX_METHOD`` and destructor
-            declarations.
-        is_pure_virtual: True for pure virtual methods (marked ``= 0``).
-         parent_usr: USR of the enclosing class, struct, template,
-             or function (for varlocal).  Empty for free functions
-             and file-scope symbols.
-        is_template: True when this is a ``CLASS_TEMPLATE``,
-            ``FUNCTION_TEMPLATE``, or partial specialization declaration.
-        template_usr: USR of the primary template.  Non-empty only when
-            this symbol is an instantiation of a template (e.g. a
-            ``CLASS_DECL`` that was generated from a ``CLASS_TEMPLATE``).
-    """
-    name: str
-    qualified_name: str      # namespace::Class::method
-    kind: str                # "function", "class", "struct", "enum", etc.
-    file: str                # absolute path
-    line: int
-    column: int
-    is_definition: bool
-    signature: str           # return type + params for callables
-    docstring: str           # raw comment above the symbol
-    usr: str                 # libclang Unified Symbol Resolution
-    end_line: int = 0        # last line of the definition extent (0 if unknown)
-    enum_value: int | None = None  # value of enum constant (ENUM_CONSTANT_DECL only)
-    is_virtual: bool = False          # True for virtual CXX_METHOD
-    is_pure_virtual: bool = False     # True for pure virtual (= 0) CXX_METHOD
-    parent_usr: str = ""    # USR of enclosing class/struct (empty for free functions)
-    is_template: bool = False  # True for CLASS_TEMPLATE, FUNCTION_TEMPLATE declarations
-    template_usr: str = ""   # USR of the primary template (non-empty = this is an instantiation)
-    source: str = ""        # function/method body text (from libclang extent, only for is_definition=True)
 
 
 def _cursor_kind_label(kind: cx.CursorKind) -> str:
@@ -484,25 +285,17 @@ def _docstring(cursor: cx.Cursor) -> str:
 def _find_fn_refs_in_expr(
     cursor: cx.Cursor,
     _skip_usr: str | None = None,
+    _depth: int = 0,
 ) -> list[cx.Cursor]:
     """Recursively extract function/method declarations referenced inside an expression.
 
-    Walks into UNARY_OPERATOR (address-of ``&``), nested CALL_EXPR (callback
-    wrappers like ``mbed::callback(...)``), and other intermediate nodes to find
-    function pointer targets that libclang can resolve.
-
-    Used both for function pointers passed as call arguments (via
-    ``_emit_fn_ptr_targets`` on CALL_EXPR) and for function pointers in
-    assignments, variable initializers, and struct/array init lists
-    (via ``_emit_fn_ptr_targets`` on BINARY_OPERATOR, VAR_DECL, and
-    INIT_LIST_EXPR).
-
-    ``_skip_usr`` is the callee USR of the nearest enclosing CALL_EXPR whose
-    callee is a known function; its children (the callee's own DECL_REF_EXPR
-    wrappers) are skipped to avoid re-emitting direct calls as indirect edges.
-
-    Returns a list of resolved ``FUNCTION_DECL`` / ``CXX_METHOD`` cursors.
+    Depth-limited to prevent stack overflow on deeply nested C++ expressions.
     """
+    _FN_REF_MAX_DEPTH = 500
+    if _depth > _FN_REF_MAX_DEPTH:
+        _log.warning("_find_fn_refs_in_expr: max depth %d exceeded", _FN_REF_MAX_DEPTH)
+        return []
+
     results: list[cx.Cursor] = []
 
     # Direct reference to a callable (bare function name, method ref, etc.)
@@ -520,7 +313,7 @@ def _find_fn_refs_in_expr(
     # Address-of operator (&) — peel and recurse into the operand
     if cursor.kind == cx.CursorKind.UNARY_OPERATOR:
         for child in cursor.get_children():
-            results.extend(_find_fn_refs_in_expr(child, _skip_usr))
+            results.extend(_find_fn_refs_in_expr(child, _skip_usr, _depth + 1))
         return results
 
     # Nested call expression — e.g. callback(&Class::method, this).
@@ -538,12 +331,12 @@ def _find_fn_refs_in_expr(
                 if loc.file:
                     nested_skip = nested_callee_usr
         for child in cursor.get_children():
-            results.extend(_find_fn_refs_in_expr(child, nested_skip))
+            results.extend(_find_fn_refs_in_expr(child, nested_skip, _depth + 1))
         return results
 
     # Default: recurse into all children (handles implicit casts, parentheses, etc.)
     for child in cursor.get_children():
-        results.extend(_find_fn_refs_in_expr(child, _skip_usr))
+        results.extend(_find_fn_refs_in_expr(child, _skip_usr, _depth + 1))
 
     return results
 
@@ -645,6 +438,38 @@ def _extract_lhs_field(
     return _walk(expr_cursor)
 
 
+def _process_one_base_specifier(
+    child: cx.Cursor,
+    cls_usr: str,
+    cls_spelling: str,
+    access_map: dict[cx.AccessSpecifier, str],
+) -> InheritanceRecord | None:
+    if child.kind != cx.CursorKind.CXX_BASE_SPECIFIER:
+        return None
+    base_ref = child.referenced
+    if base_ref is None:
+        return None
+    base_usr = base_ref.get_usr()
+    if not base_usr:
+        return None
+    base_loc = base_ref.location
+    if not base_loc.file:
+        return None
+    access = access_map.get(child.access_specifier, "public")
+    try:
+        from clang.cindex import conf as _ciconf
+        is_virt = bool(_ciconf.lib.clang_isVirtualBase(child))
+    except Exception:
+        _log.debug("clang_isVirtualBase failed for %s", cls_spelling)
+        is_virt = False
+    return InheritanceRecord(
+        derived_usr=cls_usr,
+        base_usr=base_usr,
+        access=access,
+        is_virtual=is_virt,
+    )
+
+
 def _extract_inheritance(class_cursors: list[cx.Cursor]) -> list[InheritanceRecord]:
     """Extract C++ inheritance edges from collected class/struct definition cursors."""
     inheritance: list[InheritanceRecord] = []
@@ -659,29 +484,9 @@ def _extract_inheritance(class_cursors: list[cx.Cursor]) -> list[InheritanceReco
             continue
         try:
             for child in cls_cursor.get_children():
-                if child.kind == cx.CursorKind.CXX_BASE_SPECIFIER:
-                    base_ref = child.referenced
-                    if base_ref is None:
-                        continue
-                    base_usr = base_ref.get_usr()
-                    if not base_usr:
-                        continue
-                    base_loc = base_ref.location
-                    if not base_loc.file:
-                        continue
-                    access = _access_map.get(child.access_specifier, "public")
-                    try:
-                        from clang.cindex import conf
-                        is_virt = bool(conf.lib.clang_isVirtualBase(child))
-                    except Exception:
-                        _log.debug("clang_isVirtualBase failed for %s", cls_cursor.spelling)
-                        is_virt = False
-                    inheritance.append(InheritanceRecord(
-                        derived_usr=cls_usr,
-                        base_usr=base_usr,
-                        access=access,
-                        is_virtual=is_virt,
-                    ))
+                rec = _process_one_base_specifier(child, cls_usr, cls_cursor.spelling, _access_map)
+                if rec is not None:
+                    inheritance.append(rec)
         except Exception:
             _log.debug("base class traversal failed for %s", cls_cursor.spelling)
             continue
@@ -723,10 +528,688 @@ def _extract_macros(tu_cursor: cx.Cursor, resolve_fn) -> list[Macro]:
     return macros
 
 
+def _class_match_score(hint: str, class_part: str) -> int:
+    """Score how well a field-name hint matches a class name.
+
+    Multi-level matching designed for the fallback path where field
+    names use snake_case (``_ble_msg_manager``) but class names use
+    CamelCase (``BleMsgManager``), or where the field name is a
+    superset of the class name (``_uart_driver`` → ``UART_DRIVER``).
+
+    Returns 0 = no match, 1 = weak (token-level), 2 = good.
+    """
+    if not hint or not class_part:
+        return 0
+    class_lower = class_part.lower()
+
+    if hint in class_lower:
+        return 2
+    if class_lower in hint:
+        return 1
+
+    hint_flat = hint.replace("_", "")
+    if hint_flat and hint_flat in class_lower:
+        return 2
+    if hint_flat and class_lower in hint_flat:
+        return 1
+
+    hint_tokens = [t for t in hint.split("_") if t]
+    if not hint_tokens:
+        return 0
+    match_count = sum(1 for t in hint_tokens if t in class_lower)
+    if match_count == len(hint_tokens):
+        return 2
+    if match_count > 0:
+        return 1
+
+    return 0
+
+
+def _resolve_method_usr(
+    method_name: str,
+    qn_to_usr: dict[str, str],
+    field_name: str = "",
+) -> str | None:
+    """Find USR for *method_name* in *qn_to_usr*, preferring classes matching *field_name*."""
+    usr = qn_to_usr.get(method_name)
+    if usr:
+        return usr
+    suffix = f"::{method_name}"
+    candidates: list[tuple[str, str]] = [
+        (qn, u) for qn, u in qn_to_usr.items() if qn.endswith(suffix)
+    ]
+    if not candidates:
+        return None
+    if len(candidates) == 1:
+        return candidates[0][1]
+    if field_name:
+        _hint = field_name.lstrip("_").lower()
+        _scored: list[tuple[int, str, str]] = []
+        for qn, u in candidates:
+            _class_part = qn.rsplit("::", 2)[-2] if "::" in qn else ""
+            _score = _class_match_score(_hint, _class_part)
+            _scored.append((_score, qn, u))
+        _scored.sort(key=lambda x: -x[0])
+        if _scored[0][0] > 0:
+            return _scored[0][2]
+    return candidates[0][1]
+
+
+def _emit_fn_ptr_targets(
+    expr_cursor: cx.Cursor,
+    caller_usr: str | None,
+    seen_ref: set,
+    refs: list[Reference],
+    fp_assignments: list[FnPointerAssignment],
+    skip_usr: str | None = None,
+    lhs_usr: str | None = None,
+    lhs_name: str = "",
+    method: str = "assignment",
+) -> None:
+    """Emit indirect refs and FnPointerAssignment records for function pointer assignments.
+
+    Walks the children of *expr_cursor* looking for function declarations
+    (including those nested inside unary operators and casts), then records:
+    - An indirect reference via one of the *refs* / *seen_ref* lists.
+    - An ``FnPointerAssignment`` when *lhs_usr* is provided (Phase 3 linking).
+    """
+    import logging as _logging
+    _log = _logging.getLogger(__name__)
+    loc = expr_cursor.location
+    if not loc.file:
+        return
+    for child in expr_cursor.get_children():
+        targets = _find_fn_refs_in_expr(child, skip_usr)
+        if not targets:
+            continue
+        for target in targets:
+            target_usr = target.get_usr()
+            if target_usr == skip_usr:
+                continue
+            target_loc = target.location
+            if target_loc.file:
+                key = (target_usr, loc.file.name, loc.line, caller_usr, "indirect")
+                if key not in seen_ref:
+                    seen_ref.add(key)
+                    refs.append(Reference(
+                        to_usr=target_usr,
+                        from_file=loc.file.name,
+                        from_line=loc.line,
+                        from_usr=caller_usr,
+                        ref_kind="indirect",
+                    ))
+                if lhs_usr and lhs_usr != target_usr:
+                    try:
+                        _fp_type = child.type.spelling
+                    except Exception:
+                        _log.debug(
+                            "_emit_fn_ptr_targets: type.spelling failed for %s",
+                            target.spelling,
+                        )
+                        _fp_type = ""
+                    fp_assignments.append(FnPointerAssignment(
+                        from_file=loc.file.name,
+                        from_line=loc.line,
+                        lhs_usr=lhs_usr,
+                        lhs_name=lhs_name,
+                        rhs_usr=target_usr,
+                        rhs_name=target.spelling,
+                        fn_ptr_type=_fp_type,
+                        method=method,
+                        from_usr=caller_usr,
+                    ))
+
+
+def _build_refs_and_fp_assignments(
+    tu: cx.TranslationUnit,
+    tu_path_str: str,
+    symbols: list[Symbol],
+    resolve_fn,
+    anon_usr_to_field: dict[str, str],
+    _log,
+) -> tuple[list[Reference], list[IndirectCallSite], list[FnPointerAssignment]]:
+    """Walk the TU AST extracting references, indirect call sites, and function pointer assignments.
+
+    Returns (refs, indirect_call_sites, fp_assignments).
+    """
+    import logging as _logging
+    _log = _logging.getLogger(__name__)
+
+    _callable_kind_strs = frozenset({"function", "method", "constructor", "destructor"})
+    qn_to_usr: dict[str, str] = {}
+    for s in symbols:
+        if s.qualified_name and s.kind in _callable_kind_strs:
+            qn_to_usr[s.qualified_name] = s.usr
+
+    refs: list[Reference] = []
+    indirect_call_sites: list[IndirectCallSite] = []
+    fp_assignments: list[FnPointerAssignment] = []
+    seen_ref: set[tuple] = set()
+    _fn_spans: list[tuple[str, int, int]] = []
+
+    fn_stack: list[tuple[str, int, str]] = []
+
+    for cursor in tu.cursor.walk_preorder():
+        _cl = cursor.location
+        _cl_file = str(Path(_cl.file.name).resolve()) if _cl and _cl.file else None
+        _cl_line = _cl.line if _cl else -1
+        while fn_stack and fn_stack[-1][2] and _cl_file and fn_stack[-1][2] != _cl_file:
+            fn_stack.pop()
+        while fn_stack and fn_stack[-1][1] > 0 and _cl is not None and _cl_line > fn_stack[-1][1]:
+            fn_stack.pop()
+        cur_fn = fn_stack[-1][0] if fn_stack else None
+
+        if cursor.kind in _CALLABLE_KINDS and cursor.is_definition():
+            own_usr = cursor.get_usr()
+            if own_usr:
+                cur_fn = own_usr
+            try:
+                _ext = cursor.extent
+                if _ext.start.file:
+                    _ext_file = _ext.start.file.name
+                    if str(resolve_fn(_ext_file)) == tu_path_str:
+                        _fn_spans.append((cur_fn or '', _ext.start.line, _ext.end.line))
+                        fn_stack.append((cur_fn or '', _ext.end.line, tu_path_str))
+                    else:
+                        fn_stack.append((cur_fn or '', 0, ""))
+                else:
+                    fn_stack.append((cur_fn or '', 0, ""))
+            except Exception:
+                _log.debug(
+                    "cursor.extent failed for %s",
+                    cursor.spelling,
+                )
+                fn_stack.append((cur_fn or '', 0, ""))
+
+        _process_ref_cursor(
+            cursor, cur_fn, refs, indirect_call_sites, fp_assignments,
+            seen_ref, qn_to_usr, tu_path_str, resolve_fn, _log,
+        )
+
+    # Source-line fallback for template-obscured method calls
+    _run_source_line_fallback(
+        tu, refs, seen_ref, _fn_spans, qn_to_usr, _log,
+    )
+
+    return refs, indirect_call_sites, fp_assignments
+
+
+def _process_one_symbol(
+    cursor: cx.Cursor,
+    symbols: list[Symbol],
+    seen_usrs: dict[str, bool],
+    class_cursors: list[cx.Cursor],
+    anon_usr_to_field: dict[str, str],
+    _log,
+) -> bool:
+    """Process a single cursor during AST walk for symbol extraction.
+
+    Returns True if the cursor was added as a new symbol.
+    """
+    loc = cursor.location
+    if not loc.file:
+        return False
+
+    is_def = cursor.is_definition()
+    if not is_def and cursor.kind not in _DECL_KINDS:
+        return False
+
+    usr = cursor.get_usr()
+    if not usr:
+        return False
+
+    enum_val: int | None = None
+    if cursor.kind == cx.CursorKind.ENUM_CONSTANT_DECL:
+        try:
+            enum_val = cursor.enum_value
+        except Exception:
+            _log.debug("enum_value failed for %s at %s:%d", cursor.spelling, loc.file.name, loc.line)
+
+    is_virtual = bool(cursor.is_virtual_method()) if cursor.kind in (cx.CursorKind.CXX_METHOD, cx.CursorKind.DESTRUCTOR) else False
+    is_pure = bool(cursor.is_pure_virtual_method()) if cursor.kind in (cx.CursorKind.CXX_METHOD, cx.CursorKind.DESTRUCTOR) else False
+
+    sem_parent = cursor.semantic_parent
+    kind = _cursor_kind_label(cursor.kind)
+    if kind == "variable":
+        if sem_parent and sem_parent.kind in (
+            cx.CursorKind.TRANSLATION_UNIT,
+            cx.CursorKind.NAMESPACE,
+            cx.CursorKind.LINKAGE_SPEC,
+            cx.CursorKind.CLASS_DECL,
+            cx.CursorKind.STRUCT_DECL,
+            cx.CursorKind.UNION_DECL,
+            cx.CursorKind.CLASS_TEMPLATE,
+            cx.CursorKind.CLASS_TEMPLATE_PARTIAL_SPECIALIZATION,
+        ):
+            kind = "varglobal"
+        else:
+            kind = "varlocal"
+
+    parent_usr = ""
+    if sem_parent and sem_parent.kind in (
+        cx.CursorKind.CLASS_DECL,
+        cx.CursorKind.STRUCT_DECL,
+        cx.CursorKind.UNION_DECL,
+        cx.CursorKind.CLASS_TEMPLATE,
+        cx.CursorKind.CLASS_TEMPLATE_PARTIAL_SPECIALIZATION,
+    ):
+        parent_usr = sem_parent.get_usr() or ""
+
+    if not parent_usr and kind in ("varlocal", "variable"):
+        if sem_parent and sem_parent.kind in _CALLABLE_KINDS:
+            parent_usr = sem_parent.get_usr() or ""
+
+    is_template = cursor.kind in (
+        cx.CursorKind.CLASS_TEMPLATE,
+        cx.CursorKind.FUNCTION_TEMPLATE,
+        cx.CursorKind.CLASS_TEMPLATE_PARTIAL_SPECIALIZATION,
+    )
+    template_usr = ""
+    if not is_template:
+        if cursor.kind in (cx.CursorKind.CLASS_DECL, cx.CursorKind.STRUCT_DECL, cx.CursorKind.FUNCTION_DECL):
+            try:
+                specialized = cursor.specialized_template
+                if specialized is not None:
+                    template_usr = specialized.get_usr() or ""
+            except Exception:
+                _log.debug("specialized_template failed for %s", cursor.spelling)
+
+    prev = seen_usrs.get(usr)
+    if prev is not None:
+        if is_def and not prev:
+            seen_usrs[usr] = True
+        else:
+            return False
+    else:
+        seen_usrs[usr] = is_def
+
+    is_anon = _is_anonymous_struct_or_union(cursor)
+    field_name = anon_usr_to_field.get(usr) if is_anon else None
+    symbol_name = field_name if field_name else cursor.spelling
+    symbol_qname = _qualified_name(cursor, anon_usr_to_field)
+
+    symbols.append(Symbol(
+        name=symbol_name,
+        qualified_name=symbol_qname,
+        kind=kind,
+        file=loc.file.name,
+        line=loc.line,
+        column=loc.column,
+        is_definition=is_def,
+        signature=_signature(cursor),
+        docstring=_docstring(cursor),
+        usr=usr,
+        end_line=_end_line(cursor, loc),
+        enum_value=enum_val,
+        is_virtual=is_virtual,
+        is_pure_virtual=is_pure,
+        parent_usr=parent_usr,
+        is_template=is_template,
+        template_usr=template_usr,
+    ))
+
+    if cursor.kind in (cx.CursorKind.CLASS_DECL, cx.CursorKind.STRUCT_DECL) and is_def:
+        class_cursors.append(cursor)
+
+    return True
+
+
+def _process_ref_cursor(
+    cursor: cx.Cursor,
+    cur_fn: str | None,
+    refs: list[Reference],
+    indirect_call_sites: list[IndirectCallSite],
+    fp_assignments: list[FnPointerAssignment],
+    seen_ref: set,
+    qn_to_usr: dict[str, str],
+    tu_path_str: str,
+    resolve_fn,
+    _log,
+) -> None:
+    """Process a single cursor for references and indirect calls — dispatcher."""
+    loc = cursor.location
+    if not loc.file:
+        return
+
+    _handle_direct_refs(cursor, cur_fn, refs, seen_ref, tu_path_str, resolve_fn)
+    _handle_indirect_invocations(cursor, cur_fn, refs, indirect_call_sites,
+                                 fp_assignments, seen_ref, tu_path_str, resolve_fn, _log)
+    _handle_fn_ptr_cases(cursor, cur_fn, refs, fp_assignments, seen_ref, tu_path_str, _log)
+    _handle_implicit_constructors(cursor, cur_fn, refs, seen_ref, _log)
+    _handle_token_fallbacks(cursor, cur_fn, refs, seen_ref, qn_to_usr, tu_path_str, _log)
+
+
+def _add_ref(refs, seen_ref, to_usr, from_file, from_line, from_usr, ref_kind):
+    """Deduplicated append to refs list."""
+    key = (to_usr, from_file, from_line, from_usr, ref_kind)
+    if key not in seen_ref:
+        seen_ref.add(key)
+        refs.append(Reference(to_usr=to_usr, from_file=from_file, from_line=from_line,
+                              from_usr=from_usr, ref_kind=ref_kind))
+        return True
+    return False
+
+
+def _callee_has_file(referenced) -> bool:
+    """Check a referenced cursor has a valid file location."""
+    if referenced is None:
+        return False
+    try:
+        rl = referenced.location
+        return rl is not None and rl.file is not None
+    except Exception:
+        return False
+
+
+def _handle_direct_refs(cursor, cur_fn, refs, seen_ref, tu_path_str, resolve_fn):
+    """Direct call/ref/member references + field-access fallback + constructor fallback."""
+    loc = cursor.location
+    ref_kind = _REF_KINDS.get(cursor.kind)
+    if ref_kind is not None:
+        referenced = cursor.referenced
+        if referenced is not None:
+            to_usr = referenced.get_usr()
+            ref_loc = referenced.location
+            if to_usr and ref_loc.file:
+                _add_ref(refs, seen_ref, to_usr, loc.file.name, loc.line, cur_fn, ref_kind)
+
+        if cursor.kind == cx.CursorKind.CALL_EXPR:
+            _handle_field_call_fallback(cursor, cur_fn, refs, seen_ref, tu_path_str)
+            _handle_constructor_fallback(cursor, cur_fn, refs, seen_ref, tu_path_str, resolve_fn)
+
+
+def _handle_field_call_fallback(cursor, cur_fn, refs, seen_ref, tu_path_str):
+    """Field-access call fallback: obj.method() where method is not directly resolved."""
+    loc = cursor.location
+    if _callee_has_file(cursor.referenced):
+        return
+    for child in cursor.get_children():
+        if child.kind == cx.CursorKind.MEMBER_REF_EXPR:
+            child_ref = child.referenced
+            if child_ref is not None and child_ref.kind in _CALLABLE_KINDS:
+                child_usr = child_ref.get_usr()
+                child_loc = child_ref.location
+                if child_usr and child_loc.file:
+                    _add_ref(refs, seen_ref, child_usr, loc.file.name, loc.line, cur_fn, "call")
+                    return
+
+
+def _collect_ctor_refs_from_type(
+    child_type, loc_file: str, loc_line: int, cur_fn: str,
+    refs: list[Reference], seen_ref: set[tuple],
+) -> None:
+    if child_type.kind != cx.TypeKind.RECORD:
+        return
+    try:
+        class_cursor = child_type.get_declaration()
+    except Exception:
+        _log.debug("get_declaration failed for record type")
+        return
+    if class_cursor is None:
+        return
+    for ctor in class_cursor.get_children():
+        if ctor.kind != cx.CursorKind.CONSTRUCTOR:
+            continue
+        ctor_usr = ctor.get_usr()
+        if not ctor_usr:
+            continue
+        ctor_loc = ctor.location
+        if not ctor_loc.file:
+            continue
+        _add_ref(refs, seen_ref, ctor_usr, loc_file, loc_line, cur_fn, "call")
+
+
+def _handle_constructor_fallback(cursor, cur_fn, refs, seen_ref, tu_path_str, resolve_fn):
+    """Constructor call fallback: detecting implicit constructor invocations."""
+    loc = cursor.location
+    if _callee_has_file(cursor.referenced):
+        return
+    for child in cursor.get_children():
+        if child.kind != cx.CursorKind.DECL_REF_EXPR:
+            continue
+        child_ref = child.referenced
+        if child_ref is None:
+            continue
+        if child_ref.kind not in (cx.CursorKind.FIELD_DECL, cx.CursorKind.VAR_DECL):
+            continue
+        try:
+            child_type = child_ref.type.get_canonical()
+        except Exception:
+            _log.debug("get_canonical failed for %s", child_ref.spelling)
+            continue
+        _collect_ctor_refs_from_type(
+            child_type, loc.file.name, loc.line, cur_fn, refs, seen_ref,
+        )
+
+
+def _handle_indirect_invocations(cursor, cur_fn, refs, indirect_call_sites,
+                                 fp_assignments, seen_ref, tu_path_str, resolve_fn, _log):
+    """Indirect calls: function pointers invoked directly or passed as call arguments."""
+    if cursor.kind != cx.CursorKind.CALL_EXPR:
+        return
+    loc = cursor.location
+
+    callee = cursor.referenced
+    if (callee is not None
+            and callee.kind in (cx.CursorKind.FIELD_DECL, cx.CursorKind.VAR_DECL, cx.CursorKind.PARM_DECL)
+            and _is_fn_ptr_type(callee.type)):
+        target_usr = callee.get_usr()
+        if target_usr:
+            indirect_call_sites.append(IndirectCallSite(
+                from_file=loc.file.name, from_line=loc.line, from_usr=cur_fn,
+                expr_text=_call_expr_text(cursor), target_usr=target_usr,
+                target_name=callee.spelling, fn_ptr_type=callee.type.spelling,
+            ))
+    else:
+        callee_expr = _first_child_unwrapped(cursor)
+        if callee_expr is not None and _is_fn_ptr_type(callee_expr.type):
+            target_usr, target_name = _extract_lhs_field(callee_expr)
+            if target_usr:
+                try:
+                    _fn_ptr_spelling = callee_expr.type.spelling
+                except Exception:
+                    _log.debug("type.spelling failed for indirect call callee expr")
+                    _fn_ptr_spelling = ""
+                indirect_call_sites.append(IndirectCallSite(
+                    from_file=loc.file.name, from_line=loc.line, from_usr=cur_fn,
+                    expr_text=_call_expr_text(cursor), target_usr=target_usr,
+                    target_name=target_name, fn_ptr_type=_fn_ptr_spelling,
+                ))
+
+    _handle_fn_ptr_as_argument(cursor, cur_fn, refs, fp_assignments, seen_ref, tu_path_str, _log)
+
+
+def _handle_fn_ptr_as_argument(cursor, cur_fn, refs, fp_assignments, seen_ref, tu_path_str, _log):
+    """Function pointers passed as call arguments."""
+    loc = cursor.location
+    direct_callee = cursor.referenced
+    direct_callee_usr = direct_callee.get_usr() if direct_callee else None
+    if direct_callee is not None:
+        try:
+            callee_params = list(direct_callee.get_arguments())
+        except Exception:
+            _log.debug("get_arguments failed for %s", direct_callee.spelling)
+            callee_params = []
+        callee_args = list(cursor.get_arguments())
+        for i, arg in enumerate(callee_args):
+            targets = _find_fn_refs_in_expr(arg, direct_callee_usr)
+            if targets and i < len(callee_params):
+                param = callee_params[i]
+                if _is_fn_ptr_type(param.type):
+                    param_usr = param.get_usr()
+                    if param_usr:
+                        for target in targets:
+                            target_usr = target.get_usr()
+                            if target_usr and target_usr != direct_callee_usr:
+                                try:
+                                    _fp_type = param.type.spelling
+                                except Exception:
+                                    _log.debug("param type.spelling failed for %s", param.spelling)
+                                    _fp_type = ""
+                                fp_assignments.append(FnPointerAssignment(
+                                    from_file=loc.file.name, from_line=loc.line,
+                                    lhs_usr=param_usr, lhs_name=param.spelling,
+                                    rhs_usr=target_usr, rhs_name=target.spelling,
+                                    fn_ptr_type=_fp_type, method="call_arg", from_usr=cur_fn,
+                                ))
+    _emit_fn_ptr_targets(cursor, cur_fn, seen_ref, refs, fp_assignments, direct_callee_usr)
+
+
+def _handle_fn_ptr_cases(cursor, cur_fn, refs, fp_assignments, seen_ref, tu_path_str, _log):
+    """Function pointers in assignments, variable initializers, and init lists."""
+
+    if cursor.kind == cx.CursorKind.BINARY_OPERATOR:
+        lhs_usr, lhs_name = _extract_lhs_field(cursor)
+        _emit_fn_ptr_targets(cursor, cur_fn, seen_ref, refs, fp_assignments,
+                             lhs_usr=lhs_usr, lhs_name=lhs_name, method="assignment")
+    elif cursor.kind == cx.CursorKind.VAR_DECL and _is_fn_ptr_type(cursor.type):
+        _emit_fn_ptr_targets(cursor, cur_fn, seen_ref, refs, fp_assignments,
+                             lhs_usr=cursor.get_usr(), lhs_name=cursor.spelling, method="var_init")
+    elif cursor.kind == cx.CursorKind.INIT_LIST_EXPR:
+        for child in cursor.get_children():
+            child_usr, child_name = _extract_lhs_field(child)
+            _emit_fn_ptr_targets(child, cur_fn, seen_ref, refs, fp_assignments,
+                                 lhs_usr=child_usr, lhs_name=child_name, method="init_list")
+
+
+def _handle_implicit_constructors(cursor, cur_fn, refs, seen_ref, _log):
+    """Implicit constructor calls from global/static objects and member fields."""
+    if cursor.kind not in (cx.CursorKind.VAR_DECL, cx.CursorKind.FIELD_DECL):
+        return
+    loc = cursor.location
+    try:
+        canon = cursor.type.get_canonical()
+    except Exception:
+        _log.debug("implicit_construct: get_canonical failed for %s", cursor.spelling)
+        return
+    if canon is None or canon.kind != cx.TypeKind.RECORD:
+        return
+    try:
+        class_cursor = canon.get_declaration()
+    except Exception:
+        _log.debug("implicit_construct: get_declaration failed")
+        return
+    if class_cursor is None:
+        return
+    for child in class_cursor.get_children():
+        if child.kind != cx.CursorKind.CONSTRUCTOR:
+            continue
+        ctor_usr = child.get_usr()
+        if not ctor_usr:
+            continue
+        ctor_loc = child.location
+        if not ctor_loc.file:
+            continue
+        _add_ref(refs, seen_ref, ctor_usr, loc.file.name, loc.line, cur_fn, "implicit_construct")
+
+
+def _handle_token_fallbacks(cursor, cur_fn, refs, seen_ref, qn_to_usr, tu_path_str, _log):
+    """Token-based fallback detection: UNEXPOSED_EXPR and template-obscured calls."""
+    loc = cursor.location
+
+    if cursor.kind == cx.CursorKind.UNEXPOSED_EXPR:
+        tokens = list(cursor.get_tokens())
+        for i, tok in enumerate(tokens):
+            if tok.spelling == "&" and i + 3 < len(tokens):
+                t1, t2, t3 = tokens[i + 1], tokens[i + 2], tokens[i + 3]
+                if t1.kind.name == "IDENTIFIER" and t2.spelling == "::" and t3.kind.name == "IDENTIFIER":
+                    partial = f"{t1.spelling}::{t3.spelling}"
+                    target_usr = qn_to_usr.get(partial)
+                    if not target_usr:
+                        suffix = f"::{partial}"
+                        for qn, usr in qn_to_usr.items():
+                            if qn.endswith(suffix):
+                                target_usr = usr
+                                break
+                    if target_usr:
+                        _add_ref(refs, seen_ref, target_usr, loc.file.name, loc.line, cur_fn, "indirect")
+
+    if cursor.kind == cx.CursorKind.CALL_EXPR:
+        tokens = list(cursor.get_tokens())
+        for i, tok in enumerate(tokens):
+            if (tok.kind.name == "IDENTIFIER"
+                    and i + 3 < len(tokens)
+                    and tokens[i + 1].spelling == "."
+                    and tokens[i + 2].kind.name == "IDENTIFIER"
+                    and tokens[i + 3].spelling == "("):
+                target_usr = _resolve_method_usr(tokens[i + 2].spelling, qn_to_usr, tok.spelling)
+                if target_usr:
+                    _add_ref(refs, seen_ref, target_usr, loc.file.name, loc.line, cur_fn, "call")
+                else:
+                    _log.debug("Token fallback: no USR for %s.%s() at %s:%d",
+                               tok.spelling, tokens[i + 2].spelling, loc.file.name, loc.line)
+            if (tok.kind.name == "IDENTIFIER"
+                    and i + 1 < len(tokens)
+                    and tokens[i + 1].spelling == "("
+                    and (i == 0 or tokens[i - 1].spelling != ".")):
+                target_usr = _resolve_method_usr(tok.spelling, qn_to_usr)
+                if target_usr:
+                    _add_ref(refs, seen_ref, target_usr, loc.file.name, loc.line, cur_fn, "call")
+
+
+def _run_source_line_fallback(
+    tu: cx.TranslationUnit,
+    refs: list[Reference],
+    seen_ref: set,
+    _fn_spans: list[tuple[str, int, int]],
+    qn_to_usr: dict[str, str],
+    _log,
+) -> None:
+    """Post-processing: scan source lines inside known function bodies for
+    template-obscured ``obj.method(`` patterns and emit missing references."""
+    import logging as _logging
+    _log = _logging.getLogger(__name__)
+    import re as _re
+
+    _tu_file = tu.spelling
+    _lines_with_calls: set[int] = {
+        r.from_line for r in refs
+        if r.ref_kind in ("call", "indirect") and r.from_file == _tu_file
+    }
+    try:
+        _source_text = Path(_tu_file).read_text(encoding="utf-8", errors="replace")
+        _source_lines = _source_text.splitlines()
+    except Exception:
+        _source_lines = []
+    for _lineno_0, _line in enumerate(_source_lines):
+        _lineno = _lineno_0 + 1
+        if _lineno in _lines_with_calls:
+            continue
+        _line_fn = None
+        for _fn_usr, _fn_start, _fn_end in _fn_spans:
+            if _fn_start <= _lineno <= _fn_end:
+                _line_fn = _fn_usr
+                break
+        if _line_fn is None:
+            continue
+        for _m in _re.finditer(r'(\w+)\.(\w+)\s*\(', _line):
+            _field_name = _m.group(1)
+            _method_name = _m.group(2)
+            _target_usr = _resolve_method_usr(_method_name, qn_to_usr, _field_name)
+            if _target_usr:
+                _key = (_target_usr, _tu_file, _lineno, _line_fn, "call")
+                if _key not in seen_ref:
+                    seen_ref.add(_key)
+                    refs.append(Reference(
+                        to_usr=_target_usr,
+                        from_file=_tu_file,
+                        from_line=_lineno,
+                        from_usr=_line_fn,
+                        ref_kind="call",
+                    ))
+            else:
+                _log.debug(
+                    "Source-line fallback: no USR for %s.%s() at %s:%d",
+                    _field_name, _method_name, _tu_file, _lineno,
+                )
+
+
 def extract_all(
     unit: CompilationUnit,
     with_refs: bool = False,
-) -> tuple[list[Symbol], list[Reference], list[InheritanceRecord], list[IndirectCallSite], list[FnPointerAssignment], list[Macro]]:
+    *,
+    return_tu: bool = False,
+) -> tuple:
     """Parse one translation unit and return extracted symbols, references, and inheritance.
 
     This is the single-pass entry point for all data extraction from a
@@ -797,132 +1280,7 @@ def extract_all(
     for cursor in tu.cursor.walk_preorder():
         if cursor.kind not in _SYMBOL_KINDS:
             continue
-        loc = cursor.location
-        if not loc.file:
-            continue
-
-        is_def = cursor.is_definition()
-        if not is_def and cursor.kind not in _DECL_KINDS:
-            continue
-
-        usr = cursor.get_usr()
-        if not usr:
-            continue
-
-        # Extract enum constant value (signed int, works for negative values too)
-        enum_val: int | None = None
-        if cursor.kind == cx.CursorKind.ENUM_CONSTANT_DECL:
-            try:
-                enum_val = cursor.enum_value
-            except Exception:
-                _log.debug("enum_value failed for %s at %s:%d", cursor.spelling, loc.file.name, loc.line)
-                enum_val = None
-
-        # Virtual method flags (CXX_METHOD and DESTRUCTOR; destructors can be virtual too)
-        is_virtual = bool(cursor.is_virtual_method()) if cursor.kind in (cx.CursorKind.CXX_METHOD, cx.CursorKind.DESTRUCTOR) else False
-        is_pure = bool(cursor.is_pure_virtual_method()) if cursor.kind in (cx.CursorKind.CXX_METHOD, cx.CursorKind.DESTRUCTOR) else False
-
-        # Compute kind string early (before parent_usr block) so the
-        # expanded parent_usr logic below can use it.  Also extract
-        # sem_parent ONCE — reuse in both blocks below.
-        sem_parent = cursor.semantic_parent
-        kind = _cursor_kind_label(cursor.kind)
-        if kind == "variable":
-            if sem_parent and sem_parent.kind in (
-                cx.CursorKind.TRANSLATION_UNIT,
-                cx.CursorKind.NAMESPACE,
-                cx.CursorKind.LINKAGE_SPEC,
-                cx.CursorKind.CLASS_DECL,
-                cx.CursorKind.STRUCT_DECL,
-                cx.CursorKind.UNION_DECL,
-                cx.CursorKind.CLASS_TEMPLATE,
-                cx.CursorKind.CLASS_TEMPLATE_PARTIAL_SPECIALIZATION,
-            ):
-                kind = "varglobal"
-            else:
-                kind = "varlocal"
-
-        # Parent class/struct USR — set for methods, fields, and nested types
-        parent_usr = ""
-        if sem_parent and sem_parent.kind in (
-            cx.CursorKind.CLASS_DECL,
-            cx.CursorKind.STRUCT_DECL,
-            cx.CursorKind.UNION_DECL,
-            cx.CursorKind.CLASS_TEMPLATE,
-            cx.CursorKind.CLASS_TEMPLATE_PARTIAL_SPECIALIZATION,
-        ):
-            parent_usr = sem_parent.get_usr() or ""
-
-        # Also store parent_usr for local variables (needed by find_variables)
-        if not parent_usr and kind in ("varlocal", "variable"):
-            if sem_parent and sem_parent.kind in _CALLABLE_KINDS:
-                parent_usr = sem_parent.get_usr() or ""
-
-        # Template tracking: detect template declarations and instantiations
-        is_template = cursor.kind in (
-            cx.CursorKind.CLASS_TEMPLATE,
-            cx.CursorKind.FUNCTION_TEMPLATE,
-            cx.CursorKind.CLASS_TEMPLATE_PARTIAL_SPECIALIZATION,
-        )
-        template_usr = ""
-        if not is_template:
-            # Check if this is an instantiation of a template.  Only resolve
-            # for class/struct/function-level symbols — methods of template
-            # classes are excluded (the template_usr would point to the
-            # template method, not the template class, which is misleading).
-            _TEMPLATE_INSTANCE_KINDS = frozenset({
-                cx.CursorKind.CLASS_DECL,
-                cx.CursorKind.STRUCT_DECL,
-                cx.CursorKind.FUNCTION_DECL,
-            })
-            if cursor.kind in _TEMPLATE_INSTANCE_KINDS:
-                try:
-                    specialized = cursor.specialized_template
-                    if specialized is not None:
-                        template_usr = specialized.get_usr() or ""
-                except Exception:
-                    _log.debug("specialized_template failed for %s", cursor.spelling)
-
-        prev = seen_usrs.get(usr)
-        if prev is not None:
-            if is_def and not prev:
-                seen_usrs[usr] = True
-            else:
-                continue
-        else:
-            seen_usrs[usr] = is_def
-
-        # For anonymous structs/unions with a named field, use the field name
-        # as the display name and qualified-name segment (e.g. "_ble_cmd"
-        # instead of "struct (unnamed at ...)").
-        is_anon = _is_anonymous_struct_or_union(cursor)
-        field_name = anon_usr_to_field.get(usr) if is_anon else None
-        symbol_name = field_name if field_name else cursor.spelling
-        symbol_qname = _qualified_name(cursor, anon_usr_to_field)
-
-        symbols.append(Symbol(
-            name=symbol_name,
-            qualified_name=symbol_qname,
-            kind=kind,
-            file=loc.file.name,
-            line=loc.line,
-            column=loc.column,
-            is_definition=is_def,
-            signature=_signature(cursor),
-            docstring=_docstring(cursor),
-            usr=usr,
-            end_line=_end_line(cursor, loc),
-            enum_value=enum_val,
-            is_virtual=is_virtual,
-            is_pure_virtual=is_pure,
-            parent_usr=parent_usr,
-            is_template=is_template,
-            template_usr=template_usr,
-        ))
-
-        # Collect class/struct definition cursors for inheritance extraction
-        if cursor.kind in (cx.CursorKind.CLASS_DECL, cx.CursorKind.STRUCT_DECL) and is_def:
-            class_cursors.append(cursor)
+        _process_one_symbol(cursor, symbols, seen_usrs, class_cursors, anon_usr_to_field, _log)
 
     _t_symwalk = _time.monotonic() - _t_start - _t_parse  # subtract parse time
 
@@ -934,649 +1292,11 @@ def extract_all(
 
     if not with_refs:
         _log.info("  parse=%.1fs symwalk=%.1fs syms=%d macros=%d", _t_parse, _t_symwalk, len(symbols), len(macros))
-        return symbols, [], inheritance, [], [], macros
+        return (tu, symbols, [], inheritance, [], [], macros) if return_tu else (symbols, [], inheritance, [], [], macros)
 
-    # Build qualified-name → USR lookup for token-based fallback
-    # (UNEXPOSED_EXPR nodes hide template expansions like mbed::callback(...)
-    #  so we fall back to scanning raw tokens for &Class::method patterns)
-    # Only include callable symbols — token-based fallbacks resolve
-    # method/function names, so including fields/variables/enum_constants
-    # would create spurious "call"/"indirect" references to non-callable
-    # targets, polluting call-graph queries like find_hotspots.
-    _callable_kind_strs = frozenset({"function", "method", "constructor", "destructor"})
-    # Build qualified-name → USR map for template-obscured call resolution.
-    # Limitation: overloaded functions share the same qualified_name (e.g. two
-    # void send(int) / void send(char) specializations); the last one wins.
-    # In practice, overloaded function templates are rare in embedded C/C++.
-    _qn_to_usr: dict[str, str] = {}
-    for s in symbols:
-        if s.qualified_name and s.kind in _callable_kind_strs:
-            _qn_to_usr[s.qualified_name] = s.usr
-
-    # --- References (explicit stack DFS to track the enclosing function) ---
-    refs: list[Reference] = []
-    indirect_call_sites: list[IndirectCallSite] = []
-    fp_assignments: list[FnPointerAssignment] = []
-    seen_ref: set[tuple] = set()
-    # Track function spans: [(usr, start_line, end_line)] for source-line fallback
-    _fn_spans: list[tuple[str, int, int]] = []
-
-    def _class_match_score(hint: str, class_part: str) -> int:
-        """Score how well a field-name hint matches a class name.
-
-        Multi-level matching designed for the fallback path where field
-        names use snake_case (``_ble_msg_manager``) but class names use
-        CamelCase (``BleMsgManager``), or where the field name is a
-        superset of the class name (``_uart_driver`` → ``UART_DRIVER``).
-
-        Returns 0 = no match, 1 = weak (token-level), 2 = good.
-        """
-        if not hint or not class_part:
-            return 0
-        class_lower = class_part.lower()
-
-        # Level 1: direct substring match (case-insensitive)
-        if hint in class_lower:
-            return 2
-        if class_lower in hint:
-            return 1
-
-        # Level 2: snake_case → flattened match (remove underscores)
-        # "ble_msg_manager" → "blemsgmanager" matches "BleMsgManager"
-        hint_flat = hint.replace("_", "")
-        if hint_flat and hint_flat in class_lower:
-            return 2
-        if hint_flat and class_lower in hint_flat:
-            return 1
-
-        # Level 3: token-level match (individual underscore-separated words)
-        hint_tokens = [t for t in hint.split("_") if t]
-        if not hint_tokens:
-            return 0
-        match_count = sum(1 for t in hint_tokens if t in class_lower)
-        if match_count == len(hint_tokens):
-            return 2
-        if match_count > 0:
-            return 1
-
-        return 0
-
-    def _resolve_method_usr(
-        method_name: str, field_name: str = ""
-    ) -> str | None:
-        """Find USR for *method_name*, preferring classes matching *field_name*.
-
-        Scoring for *field_name* uses multi-level matching so that
-        snake_case field names (``_ble_msg_manager``) can match
-        CamelCase class names (``BleMsgManager``) that libclang
-        cannot resolve directly inside template-heavy translation units.
-        """
-        usr = _qn_to_usr.get(method_name)
-        if usr:
-            return usr
-        suffix = f"::{method_name}"
-        candidates: list[tuple[str, str]] = [
-            (qn, u) for qn, u in _qn_to_usr.items() if qn.endswith(suffix)
-        ]
-        if not candidates:
-            return None
-        if len(candidates) == 1:
-            return candidates[0][1]
-        if field_name:
-            _hint = field_name.lstrip("_").lower()
-            _scored: list[tuple[int, str, str]] = []
-            for qn, u in candidates:
-                _class_part = qn.rsplit("::", 2)[-2] if "::" in qn else ""
-                _score = _class_match_score(_hint, _class_part)
-                _scored.append((_score, qn, u))
-            _scored.sort(key=lambda x: -x[0])
-            if _scored[0][0] > 0:
-                return _scored[0][2]
-        return candidates[0][1]
-
-    # Track enclosing function via walk_preorder() — the C implementation
-    # is orders of magnitude faster than the equivalent manual stack DFS.
-    # Each Python-level cursor.get_children() call crosses ctypes; the C
-    # generator pays that cost once per cursor internally and just yields.
-    fn_stack: list[tuple[str, int, str]] = []  # [(usr, end_line, file_path)]
-
-    def _emit_fn_ptr_targets(
-        expr_cursor: cx.Cursor,
-        caller_usr: str | None,
-        skip_usr: str | None = None,
-        lhs_usr: str | None = None,
-        lhs_name: str = "",
-        method: str = "assignment",
-    ) -> None:
-        loc = expr_cursor.location
-        if not loc.file:
-            return
-        for child in expr_cursor.get_children():
-            targets = _find_fn_refs_in_expr(child, skip_usr)
-            for target in targets:
-                target_usr = target.get_usr()
-                if not target_usr:
-                    continue
-                if target_usr == skip_usr:
-                    continue
-                target_loc = target.location
-                if target_loc.file:
-                    key = (target_usr, loc.file.name, loc.line, caller_usr, "indirect")
-                    if key not in seen_ref:
-                        seen_ref.add(key)
-                        refs.append(Reference(
-                            to_usr=target_usr,
-                            from_file=loc.file.name,
-                            from_line=loc.line,
-                            from_usr=caller_usr,
-                            ref_kind="indirect",
-                        ))
-                    # Phase 3: emit FnPointerAssignment when we have LHS info
-                    if lhs_usr and lhs_usr != target_usr:
-                        try:
-                            _fp_type = child.type.spelling
-                        except Exception:
-                            _log.debug("_emit_fn_ptr_targets: type.spelling failed for %s", target.spelling)
-                            _fp_type = ""
-                        fp_assignments.append(FnPointerAssignment(
-                            from_file=loc.file.name,
-                            from_line=loc.line,
-                            lhs_usr=lhs_usr,
-                            lhs_name=lhs_name,
-                            rhs_usr=target_usr,
-                            rhs_name=target.spelling,
-                            fn_ptr_type=_fp_type,
-                            method=method,
-                            from_usr=caller_usr,
-                        ))
-
-    for cursor in tu.cursor.walk_preorder():
-        # Pop enclosing functions whose body extent we've left.
-        # walk_preorder() visits all descendants before any sibling, so
-        # comparing line > end_line reliably detects scope exit.
-        _cl = cursor.location
-        _cl_file = str(Path(_cl.file.name).resolve()) if _cl and _cl.file else None
-        _cl_line = _cl.line if _cl else -1
-        # Pop entries whose file doesn't match the current cursor — when
-        # walk_preorder crosses from a .cpp function into #included header
-        # nodes, stale fn_stack entries must be removed because header
-        # declarations (class members, globals) are not inside that function.
-        while fn_stack and fn_stack[-1][2] and _cl_file and fn_stack[-1][2] != _cl_file:
-            fn_stack.pop()
-        # Pop entries whose body extent we've passed (same-file check).
-        while fn_stack and fn_stack[-1][1] > 0 and _cl is not None and _cl_line > fn_stack[-1][1]:
-            fn_stack.pop()
-        cur_fn = fn_stack[-1][0] if fn_stack else None
-
-        # If this is a callable definition, it becomes the new enclosing
-        # function for its children (which walk_preorder visits next).
-        if cursor.kind in _CALLABLE_KINDS and cursor.is_definition():
-            own_usr = cursor.get_usr()
-            if own_usr:
-                cur_fn = own_usr
-            try:
-                _ext = cursor.extent
-                if _ext.start.file:
-                    _ext_file = _ext.start.file.name
-                    if str(_resolve(_ext_file)) == tu_path_str:
-                        _fn_spans.append((cur_fn or '', _ext.start.line, _ext.end.line))
-                        fn_stack.append((cur_fn or '', _ext.end.line, tu_path_str))
-                    else:
-                        fn_stack.append((cur_fn or '', 0, ""))
-                else:
-                    fn_stack.append((cur_fn or '', 0, ""))
-            except Exception:
-                _log.debug("cursor.extent failed for %s at %s:%d", cursor.spelling, loc.file.name if loc.file else "?", loc.line)
-                fn_stack.append((cur_fn or '', 0, ""))
-
-        ref_kind = _REF_KINDS.get(cursor.kind)
-        if ref_kind is not None:
-            referenced = cursor.referenced
-            loc = cursor.location
-            if referenced is not None and loc.file:
-                to_usr = referenced.get_usr()
-                ref_loc = referenced.location
-                if to_usr and ref_loc.file:
-                    key = (to_usr, loc.file.name, loc.line, cur_fn, ref_kind)
-                    if key not in seen_ref:
-                        seen_ref.add(key)
-                        refs.append(Reference(
-                            to_usr=to_usr,
-                            from_file=loc.file.name,
-                            from_line=loc.line,
-                            from_usr=cur_fn,
-                            ref_kind=ref_kind,
-                        ))
-
-            # --- Field-access call fallback ---
-            # When a CALL_EXPR's direct referenced cursor is None or its
-            # definition location is unresolvable (common for method calls on
-            # member variables like ``_zmodem_driver.send()`` where libclang
-            # cannot resolve the callee through the field type), walk the
-            # CALL_EXPR's children looking for a MEMBER_REF_EXPR whose
-            # referenced cursor points to a valid definition with file location.
-            if cursor.kind == cx.CursorKind.CALL_EXPR:
-                _callee_resolved = referenced is not None
-                _callee_has_file = False
-                if _callee_resolved:
-                    try:
-                        _crl = referenced.location
-                        if _crl.file:
-                            _callee_has_file = True
-                    except Exception:
-                        _log.debug("referenced.location failed (field-access fallback) at %s:%d", loc.file.name, loc.line)
-                        pass
-                if not _callee_has_file:
-                    for child in cursor.get_children():
-                        if child.kind == cx.CursorKind.MEMBER_REF_EXPR:
-                            child_ref = child.referenced
-                            if child_ref is not None and child_ref.kind in _CALLABLE_KINDS:
-                                child_usr = child_ref.get_usr()
-                                child_loc = child_ref.location
-                                if child_usr and child_loc.file:
-                                    key = (child_usr, loc.file.name, loc.line, cur_fn, "call")
-                                    if key not in seen_ref:
-                                        seen_ref.add(key)
-                                        refs.append(Reference(
-                                            to_usr=child_usr,
-                                            from_file=loc.file.name,
-                                            from_line=loc.line,
-                                            from_usr=cur_fn,
-                                            ref_kind="call",
-                                        ))
-                                    break  # one resolved callee per CALL_EXPR
-
-            # --- Constructor call fallback ---
-            # When a CALL_EXPR's referenced cursor is None or its definition
-            # has no file location (can happen for constructor calls in
-            # member initializer lists like ``_member(args)``), walk the
-            # CALL_EXPR's children for a DECL_REF_EXPR to a FIELD_DECL or
-            # VAR_DECL whose type is RECORD.  Resolve the type's class
-            # declaration and emit ``call`` references for each constructor.
-            if cursor.kind == cx.CursorKind.CALL_EXPR:
-                _callee_resolved = referenced is not None
-                _callee_has_file = False
-                if _callee_resolved:
-                    try:
-                        _crl = referenced.location
-                        if _crl.file:
-                            _callee_has_file = True
-                    except Exception:
-                        _log.debug("referenced.location failed (constructor fallback) at %s:%d", loc.file.name, loc.line)
-                        pass
-                if not _callee_has_file:
-                    for child in cursor.get_children():
-                        if child.kind == cx.CursorKind.DECL_REF_EXPR:
-                            child_ref = child.referenced
-                            if child_ref is not None and child_ref.kind in (cx.CursorKind.FIELD_DECL, cx.CursorKind.VAR_DECL):
-                                try:
-                                    child_type = child_ref.type.get_canonical()
-                                except Exception:
-                                    _log.debug("get_canonical failed for %s", child_ref.spelling)
-                                    continue
-                                if child_type.kind == cx.TypeKind.RECORD:
-                                    try:
-                                        class_cursor = child_type.get_declaration()
-                                    except Exception:
-                                        _log.debug("get_declaration failed for record type")
-                                        continue
-                                    if class_cursor is not None:
-                                        for ctor in class_cursor.get_children():
-                                            if ctor.kind != cx.CursorKind.CONSTRUCTOR:
-                                                continue
-                                            ctor_usr = ctor.get_usr()
-                                            if not ctor_usr:
-                                                continue
-                                            ctor_loc = ctor.location
-                                            if not ctor_loc.file:
-                                                continue
-                                            key = (ctor_usr, loc.file.name, loc.line, cur_fn, "call")
-                                            if key not in seen_ref:
-                                                seen_ref.add(key)
-                                                refs.append(Reference(
-                                                    to_usr=ctor_usr,
-                                                    from_file=loc.file.name,
-                                                    from_line=loc.line,
-                                                    from_usr=cur_fn,
-                                                    ref_kind="call",
-                                                ))
-                                    # Process all record-typed fields — a CALL_EXPR may
-                                    # initialize multiple fields with different types.
-
-        # --- Indirect function pointer invocation detection ---
-        # Detect CALL_EXPR where the callee is a function pointer field,
-        # variable, or parameter.  libclang resolves cursor.referenced to the
-        # FIELD_DECL / VAR_DECL / PARM_DECL (not a FUNCTION_DECL), so we
-        # check the type directly on the callee cursor.
-        #
-        # Two paths:
-        #   1) cursor.referenced → direct decl (field/variable/parameter)
-        #      e.g. obj->callback(args), stored_cb(args)
-        #   2) Fallback — the callee is an expression that cursor.referenced
-        #      cannot resolve.  Walk the CALL_EXPR's first child (the callee
-        #      expression) and extract the underlying variable/field USR:
-        #      e.g. handlers[irq](args)        (ArraySubscriptExpr)
-        #           obj->callbacks[idx](args)   (ArraySubscriptExpr over member)
-        if cursor.kind == cx.CursorKind.CALL_EXPR:
-            loc = cursor.location
-            if loc.file:
-                callee = cursor.referenced
-                if (callee is not None
-                        and callee.kind in (cx.CursorKind.FIELD_DECL, cx.CursorKind.VAR_DECL, cx.CursorKind.PARM_DECL)
-                        and _is_fn_ptr_type(callee.type)):
-                    target_usr = callee.get_usr()
-                    if target_usr:
-                        indirect_call_sites.append(IndirectCallSite(
-                            from_file=loc.file.name,
-                            from_line=loc.line,
-                            from_usr=cur_fn,
-                            expr_text=_call_expr_text(cursor),
-                            target_usr=target_usr,
-                            target_name=callee.spelling,
-                            fn_ptr_type=callee.type.spelling,
-                        ))
-                else:
-                    # Fallback: callee is an expression (ArraySubscriptExpr,
-                    # UNEXPOSED_EXPR, etc.) that cursor.referenced cannot
-                    # resolve.  Only inspect the first child of CALL_EXPR
-                    # (the callee expression) — not arguments — unwrapping
-                    # UNEXPOSED_EXPR.  Then extract the underlying variable
-                    # or field USR so the call site links to fp_assignments.
-                    callee_expr = _first_child_unwrapped(cursor)
-                    if callee_expr is not None and _is_fn_ptr_type(callee_expr.type):
-                        target_usr, target_name = _extract_lhs_field(callee_expr)
-                        if target_usr:
-                            try:
-                                _fn_ptr_spelling = callee_expr.type.spelling
-                            except Exception:
-                                _log.debug("type.spelling failed for indirect call callee expr")
-                                _fn_ptr_spelling = ""
-                            indirect_call_sites.append(IndirectCallSite(
-                                from_file=loc.file.name,
-                                from_line=loc.line,
-                                from_usr=cur_fn,
-                                expr_text=_call_expr_text(cursor),
-                                target_usr=target_usr,
-                                target_name=target_name,
-                                fn_ptr_type=_fn_ptr_spelling,
-                            ))
-
-        # --- Indirect calls: function pointers passed as arguments ---
-        # e.g. callback(&Class::method, this), Thread::start(callback(...)),
-        # EventQueue::call_every(ms, obj, &Class::handler).
-        # Phase 3: also emits FnPointerAssignment for call-argument param flow —
-        # when argument *i* carries a function pointer and callee parameter *i*
-        # is a function pointer type, we record ``param_usr → function`` so
-        # indirect invocation through that parameter can be linked back.
-        if cursor.kind == cx.CursorKind.CALL_EXPR:
-            direct_callee = cursor.referenced
-            direct_callee_usr = direct_callee.get_usr() if direct_callee else None
-            # Phase 3 param-flow: match arguments to callee parameters
-            if direct_callee is not None:
-                try:
-                    callee_params = list(direct_callee.get_arguments())
-                except Exception:
-                    _log.debug("get_arguments failed for %s", direct_callee.spelling)
-                    callee_params = []
-                callee_args = list(cursor.get_arguments())
-                for i, arg in enumerate(callee_args):
-                    targets = _find_fn_refs_in_expr(arg, direct_callee_usr)
-                    if targets and i < len(callee_params):
-                        param = callee_params[i]
-                        if _is_fn_ptr_type(param.type):
-                            param_usr = param.get_usr()
-                            if param_usr:
-                                for target in targets:
-                                    target_usr = target.get_usr()
-                                    if target_usr and target_usr != direct_callee_usr:
-                                        try:
-                                            _fp_type = param.type.spelling
-                                        except Exception:
-                                            _log.debug("param type.spelling failed for %s", param.spelling)
-                                            _fp_type = ""
-                                        fp_assignments.append(FnPointerAssignment(
-                                            from_file=loc.file.name if (loc := cursor.location) else "",
-                                            from_line=loc.line if (loc := cursor.location) else 0,
-                                            lhs_usr=param_usr,
-                                            lhs_name=param.spelling,
-                                            rhs_usr=target_usr,
-                                            rhs_name=target.spelling,
-                                            fn_ptr_type=_fp_type,
-                                            method="call_arg",
-                                            from_usr=cur_fn,
-                                        ))
-            _emit_fn_ptr_targets(cursor, cur_fn, direct_callee_usr)
-
-        # --- Indirect calls: function pointers in assignments ---
-        # field = &function, global = &function, *ptr = &function.
-        # BINARY_OPERATOR covers =, +=, -= etc.; _find_fn_refs_in_expr only
-        # returns function declarations so comparisons (==, !=) are harmless.
-        if cursor.kind == cx.CursorKind.BINARY_OPERATOR:
-            _lhs_usr, _lhs_name = _extract_lhs_field(cursor)
-            _emit_fn_ptr_targets(cursor, cur_fn, lhs_usr=_lhs_usr, lhs_name=_lhs_name, method="assignment")
-
-        # --- Indirect calls: function pointers in variable initializers ---
-        # static void (*cb)(int) = &handler;  or local fn-ptr init.
-        # Only emit FnPointerAssignment when the variable itself is a
-        # function pointer type (avoids noise from struct/array variables
-        # whose initializers happen to contain function references).
-        if cursor.kind == cx.CursorKind.VAR_DECL and _is_fn_ptr_type(cursor.type):
-            _lhs_usr = cursor.get_usr()
-            _lhs_name = cursor.spelling
-            _emit_fn_ptr_targets(cursor, cur_fn, lhs_usr=_lhs_usr, lhs_name=_lhs_name, method="var_init")
-
-        # --- Indirect calls: function pointers in struct/array init lists ---
-        # .on_data = &handler, {EV_DATA, &handler}, {&fn_a, &fn_b}.
-        if cursor.kind == cx.CursorKind.INIT_LIST_EXPR:
-            # For designated initializers (.field = &fn), extract LHS per child
-            for child in cursor.get_children():
-                _child_lhs_usr, _child_lhs_name = _extract_lhs_field(child)
-                _emit_fn_ptr_targets(child, cur_fn, lhs_usr=_child_lhs_usr, lhs_name=_child_lhs_name, method="init_list")
-
-        # --- Implicit constructor calls from VAR_DECL / FIELD_DECL ---
-        # Global/static variables and member fields with class/struct types
-        # trigger implicit constructor calls that libclang does not expose
-        # as CALL_EXPR nodes. Without this, constructors used only through
-        # global-object or member-field initialization are falsely reported
-        # as dead code by find_dead_code.
-        #
-        # For each VAR_DECL / FIELD_DECL whose canonical type is RECORD,
-        # walk the class declaration's children looking for CONSTRUCTORs
-        # and emit implicit_construct references for each one in project
-        # source paths.
-        if cursor.kind in (cx.CursorKind.VAR_DECL, cx.CursorKind.FIELD_DECL):
-            loc = cursor.location
-            if loc.file:
-                try:
-                    canon = cursor.type.get_canonical()
-                except Exception:
-                    _log.debug("implicit_construct: get_canonical failed for %s", cursor.spelling)
-                    canon = None
-                if canon is not None and canon.kind == cx.TypeKind.RECORD:
-                    try:
-                        class_cursor = canon.get_declaration()
-                    except Exception:
-                        _log.debug("implicit_construct: get_declaration failed")
-                        class_cursor = None
-                    if class_cursor is not None:
-                        for child in class_cursor.get_children():
-                            if child.kind != cx.CursorKind.CONSTRUCTOR:
-                                continue
-                            ctor_usr = child.get_usr()
-                            if not ctor_usr:
-                                continue
-                            ctor_loc = child.location
-                            if not ctor_loc.file:
-                                continue
-                            key = (ctor_usr, loc.file.name, loc.line, cur_fn, "implicit_construct")
-                            if key not in seen_ref:
-                                seen_ref.add(key)
-                                refs.append(Reference(
-                                    to_usr=ctor_usr,
-                                    from_file=loc.file.name,
-                                    from_line=loc.line,
-                                    from_usr=cur_fn,
-                                    ref_kind="implicit_construct",
-                                ))
-
-        # --- Token fallback for UNEXPOSED_EXPR ---
-        # When libclang cannot decompose a template expression (e.g. Mbed OS
-        # callback(&Class::method, this)), the entire expression becomes an
-        # opaque UNEXPOSED_EXPR with no children.  We scan the raw tokens for
-        # &ClassName::methodName patterns and resolve them against the symbols
-        # already extracted from this translation unit.
-        #
-        # The token sequence "& ClassName :: methodName" yields a partial
-        # qualified name (e.g. "ZMODEM::thread_app" without the namespace
-        # prefix).  We match by suffix against the full qualified-name map.
-        if cursor.kind == cx.CursorKind.UNEXPOSED_EXPR:
-            loc = cursor.location
-            if loc.file:
-                tokens = list(cursor.get_tokens())
-                for i, tok in enumerate(tokens):
-                    if tok.spelling == "&" and i + 3 < len(tokens):
-                        t1 = tokens[i + 1]
-                        t2 = tokens[i + 2]
-                        t3 = tokens[i + 3]
-                        if (t1.kind.name == "IDENTIFIER"
-                                and t2.spelling == "::"
-                                and t3.kind.name == "IDENTIFIER"):
-                            partial = f"{t1.spelling}::{t3.spelling}"
-                            # Try exact match first, then suffix match for
-                            # namespace-qualified symbols (e.g. token
-                            # "ZMODEM::thread_app" → "zbox::ZMODEM::thread_app")
-                            target_usr = _qn_to_usr.get(partial)
-                            if not target_usr:
-                                suffix = f"::{partial}"
-                                for qn, usr in _qn_to_usr.items():
-                                    if qn.endswith(suffix):
-                                        target_usr = usr
-                                        break
-                            if target_usr:
-                                key = (target_usr, loc.file.name, loc.line, cur_fn, "indirect")
-                                if key not in seen_ref:
-                                    seen_ref.add(key)
-                                    refs.append(Reference(
-                                        to_usr=target_usr,
-                                        from_file=loc.file.name,
-                                        from_line=loc.line,
-                                        from_usr=cur_fn,
-                                        ref_kind="indirect",
-                                    ))
-
-        # --- Token fallback for template-obscured CALL_EXPR ---
-        # When a CALL_EXPR is obscured by C++ standard library template
-        # expansions (e.g. ``_zmodem_driver.network_init() != MODEM_RET_SUCCESS``
-        # where the ``operator!=`` template dominates the AST), libclang
-        # cannot resolve the callee through cursor.referenced or children.
-        #
-        # We scan the raw tokens of the CALL_EXPR for method-call patterns
-        # (``field.method(`` or bare ``method(``) and resolve the callee
-        # name against the symbol table built from this translation unit.
-        if cursor.kind == cx.CursorKind.CALL_EXPR:
-            loc = cursor.location
-            if loc.file:
-                tokens = list(cursor.get_tokens())
-                # Pattern 1: obj.method( → IDENTIFIER DOT IDENTIFIER LPAREN
-                for i, tok in enumerate(tokens):
-                    if (tok.kind.name == "IDENTIFIER"
-                            and i + 3 < len(tokens)
-                            and tokens[i + 1].spelling == "."
-                            and tokens[i + 2].kind.name == "IDENTIFIER"
-                            and tokens[i + 3].spelling == "("):
-                        field_name = tok.spelling
-                        method_name = tokens[i + 2].spelling
-                        target_usr = _resolve_method_usr(method_name, field_name)
-                        if target_usr:
-                            key = (target_usr, loc.file.name, loc.line, cur_fn, "call")
-                            if key not in seen_ref:
-                                seen_ref.add(key)
-                                refs.append(Reference(
-                                    to_usr=target_usr,
-                                    from_file=loc.file.name,
-                                    from_line=loc.line,
-                                    from_usr=cur_fn,
-                                    ref_kind="call",
-                                ))
-                        else:
-                            _log.debug(
-                                "Token fallback: no USR for %s.%s() at %s:%d",
-                                field_name, method_name,
-                                loc.file.name, loc.line,
-                            )
-                    # Pattern 2: bare method( → IDENTIFIER LPAREN
-                    if (tok.kind.name == "IDENTIFIER"
-                            and i + 1 < len(tokens)
-                            and tokens[i + 1].spelling == "("
-                            and (i == 0 or tokens[i - 1].spelling != ".")):
-                        method_name = tok.spelling
-                        target_usr = _resolve_method_usr(method_name)
-                        if target_usr:
-                            key = (target_usr, loc.file.name, loc.line, cur_fn, "call")
-                            if key not in seen_ref:
-                                seen_ref.add(key)
-                                refs.append(Reference(
-                                    to_usr=target_usr,
-                                    from_file=loc.file.name,
-                                    from_line=loc.line,
-                                    from_usr=cur_fn,
-                                    ref_kind="call",
-                                ))
-
-    # --- Source-line fallback for template-obscured method calls ---
-    # When C++ standard library template expansions dominate the AST
-    # (e.g. ``_zmodem_driver.network_init() != MODEM_RET_SUCCESS`` where
-    # ``operator!=`` templates consume all CALL_EXPR nodes at the same source
-    # line), libclang cannot resolve the project-level callee.
-    #
-    # Post-processing pass: scan the original source file for lines that are
-    # inside a known function body but have no ``call`` / ``indirect``
-    # reference, and emit references for ``obj.method(`` patterns found there.
-    #
-    if with_refs:
-        _tu_file = tu.spelling  # absolute path to the source file
-        _lines_with_calls: set[int] = {
-            r.from_line for r in refs if r.ref_kind in ("call", "indirect")
-            and r.from_file == _tu_file
-        }
-        try:
-            _source_text = Path(_tu_file).read_text(encoding="utf-8", errors="replace")
-            _source_lines = _source_text.splitlines()
-        except Exception:
-            _source_lines = []
-        for _lineno_0, _line in enumerate(_source_lines):
-            _lineno = _lineno_0 + 1  # 1-based
-            if _lineno in _lines_with_calls:
-                continue
-            # Find enclosing function for this line
-            _line_fn = None
-            for _fn_usr, _fn_start, _fn_end in _fn_spans:
-                if _fn_start <= _lineno <= _fn_end:
-                    _line_fn = _fn_usr
-                    break
-            if _line_fn is None:
-                continue
-            # Scan for obj.method( patterns
-            for _m in re.finditer(r'(\w+)\.(\w+)\s*\(', _line):
-                _field_name = _m.group(1)
-                _method_name = _m.group(2)
-                _target_usr = _resolve_method_usr(_method_name, _field_name)
-                if _target_usr:
-                    _key = (_target_usr, _tu_file, _lineno, _line_fn, "call")
-                    if _key not in seen_ref:
-                        seen_ref.add(_key)
-                        refs.append(Reference(
-                            to_usr=_target_usr,
-                            from_file=_tu_file,
-                            from_line=_lineno,
-                            from_usr=_line_fn,
-                            ref_kind="call",
-                        ))
-                else:
-                    _log.debug(
-                        "Source-line fallback: no USR for %s.%s() at %s:%d",
-                        _field_name, _method_name, _tu_file, _lineno,
-                    )
+    refs, indirect_call_sites, fp_assignments = _build_refs_and_fp_assignments(
+        tu, tu_path_str, symbols, _resolve, anon_usr_to_field, _log,
+    )
 
     _t_total = _time.monotonic() - _t_start
     _t_refwalk = _t_total - _t_parse - _t_symwalk
@@ -1584,4 +1304,4 @@ def extract_all(
         "  parse=%.1fs symwalk=%.1fs refwalk=%.1fs syms=%d refs=%d macros=%d",
         _t_parse, _t_symwalk, _t_refwalk, len(symbols), len(refs), len(macros),
     )
-    return symbols, refs, inheritance, indirect_call_sites, fp_assignments, macros
+    return (tu, symbols, refs, inheritance, indirect_call_sites, fp_assignments, macros) if return_tu else (symbols, refs, inheritance, indirect_call_sites, fp_assignments, macros)

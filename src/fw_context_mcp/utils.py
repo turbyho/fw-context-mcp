@@ -6,6 +6,11 @@ other small helpers that were copied into multiple modules.
 
 from __future__ import annotations
 
+
+import logging
+
+log = logging.getLogger(__name__)
+from collections import OrderedDict
 import hashlib
 import os
 from datetime import UTC, datetime
@@ -16,9 +21,11 @@ __all__ = [
     "abs_path",
     "compute_content_hash",
     "compute_source_hash",
+    "fmt_count",
     "is_compile_commands_stale",
     "read_file_lines",
     "resolve_project_root",
+    "truncate_path_middle",
 ]
 
 # Seconds of tolerance when comparing file mtimes to account for
@@ -60,28 +67,55 @@ def abs_path(root: Path, path: str) -> str:
     return str(root / p)
 
 
+# Cache with mtime-based invalidation — avoids stale data in daemon/server processes.
+# Keyed by (path, mtime) so file changes are automatically detected.
+_read_cache: OrderedDict[tuple[str, float], list[str]] = OrderedDict()
+_read_cache_max = 500
+
+
 def read_file_lines(abs_path: str) -> list[str] | None:
     """Read all lines from a source file, detecting the encoding.
 
     Tries a sequence of common encodings for embedded C/C++ projects
     (UTF-8 first, then regional code pages, then repair mode as last
     resort).  Returns ``None`` when the file cannot be read at all.
+
+    Results are cached by (path, mtime) — file changes invalidate the cache.
     """
+    try:
+        mtime = os.path.getmtime(abs_path)
+    except OSError:
+        return None
+    cache_key = (abs_path, mtime)
+    if cache_key in _read_cache:
+        _read_cache.move_to_end(cache_key)
+        return _read_cache[cache_key]
+
+    # NOTE: UTF-16 files will produce garbled content; extremely low risk
+    # in embedded C/C++ projects.
     encodings = ["utf-8", "cp1252", "latin1"]
     for encoding in encodings:
         try:
             with open(abs_path, encoding=encoding) as f:
-                return f.readlines()
+                result = f.readlines()
+                break
         except (UnicodeDecodeError, UnicodeError):
             continue
         except (FileNotFoundError, OSError):
             return None
-    # Last resort — replace invalid bytes
-    try:
-        with open(abs_path, encoding="utf-8", errors="replace") as f:
-            return f.readlines()
-    except (FileNotFoundError, OSError):
-        return None
+    else:
+        # Last resort — replace invalid bytes
+        try:
+            with open(abs_path, encoding="utf-8", errors="replace") as f:
+                result = f.readlines()
+        except (FileNotFoundError, OSError):
+            return None
+
+    # Evict oldest entry if at capacity (LRU via OrderedDict — move_to_end on hit)
+    if len(_read_cache) >= _read_cache_max:
+        _read_cache.popitem(last=False)
+    _read_cache[cache_key] = result
+    return result
 
 
 def compute_content_hash(body: str, qualified_name: str, signature: str, docstring: str) -> str:
@@ -90,7 +124,7 @@ def compute_content_hash(body: str, qualified_name: str, signature: str, docstri
     Used for content-addressable LLM analysis caching — survives
     re-indexes, config changes, and branch switches.
     """
-    raw = f"{body.strip()}|{qualified_name}|{signature or ''}|{(docstring or '').strip()}"
+    raw = f"{body.strip()}\x1f{qualified_name}\x1f{signature or ''}\x1f{(docstring or '').strip()}"
     return hashlib.sha256(raw.encode()).hexdigest()
 
 
@@ -117,7 +151,28 @@ def is_compile_commands_stale(
         if not cc_path.exists():
             return False
         cc_mtime = os.path.getmtime(cc_path)
-        indexed_at = datetime.fromisoformat(created_at).replace(tzinfo=UTC)
+        dt = datetime.fromisoformat(created_at)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=UTC)
+        indexed_at = dt
         return cc_mtime > indexed_at.timestamp() + tolerance_s
-    except (FileNotFoundError, KeyError, ValueError, OSError):
+    except (FileNotFoundError, KeyError, ValueError, OSError) as e:
+        log.warning("is_compile_commands_stale failed for %s: %s", compile_commands_path, e)
         return False
+
+
+def truncate_path_middle(path: str, max_len: int) -> str:
+    """Truncate a path by removing the middle, keeping start and end visible.
+
+    Example: ``/home/turbyho/dev/sw/…/privat/HA_Boiler``
+    """
+    if len(path) <= max_len:
+        return path
+    keep_start = max(max_len // 3, 12)
+    keep_end = max_len - keep_start - 1
+    return path[:keep_start] + "…" + path[-keep_end:]
+
+
+def fmt_count(n: int) -> str:
+    """Format a count with thousand separators (non-breaking thin spaces)."""
+    return f"{n:_d}".replace("_", " ")

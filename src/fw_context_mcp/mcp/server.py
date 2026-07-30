@@ -32,161 +32,28 @@ from mcp.server.fastmcp import FastMCP
 
 from ..utils import resolve_project_root
 from .background import _ensure_daemon_running
-from .handlers import callgraph, inheritance, maintenance, search, source, variables
+from .handlers import callgraph, inheritance, maintenance, search, _search_fallbacks, _lookup, _semantic, source, variables
 from .handlers.maintenance import get_active_build, list_projects, reindex_file_impl  # noqa: F401 — backward compat
 from .handlers.source import _read_symbol_body, get_source  # noqa: F401 — backward compat
-from .shared.context import _integrity_checked, _set_server_init_error
+from .shared.context import _check_server_ready, _integrity_checked
 
 log = logging.getLogger(__name__)
 
+_DATA_DIR = Path(__file__).resolve().parent.parent / "data"
+
+
+def _load_instructions() -> str:
+    path = _DATA_DIR / "instructions.md"
+    try:
+        return path.read_text(encoding="utf-8")
+    except OSError:
+        log.warning("Could not read instructions from %s", path)
+        return "fw-context — C/C++ code intelligence server."
+
+
 mcp = FastMCP(
     "fw-context",
-    instructions=(
-        "CRITICAL: C/C++ questions → fw-context ONLY. This is NOT optional.\n\n"
-        "For C/C++ code, use fw-context instead of ANY external search or\n"
-        "file-reading tool.\n\n"
-        "SELF-CORRECT: the moment you reach for a tool that is NOT fw-context\n"
-        "for C/C++ code, stop and use the fw-context equivalent instead.\n\n"
-        "TOOL SELECTION (pick the right one):\n"
-        '• Symbol by exact/prefix name _____ → lookup_symbol (e.g. "uart_", "main")\n'
-        '• Symbols by concept/topic _________ → search_code (e.g. "interrupt handler")\n'
-        '• Patterns in function BODIES ______ → search_bodies (e.g. "attach", "rise")\n'
-        '• Patterns in full FILE content _____ → search_content (e.g. "extern C", "InterruptIn")\n'
-        "• Read a complete file ______________ → read_file\n"
-        "• Read function body + callers/callees → get_symbol_context (preferred) / get_source\n"
-        "• Function pointer assignments/calls _ → find_indirect_call_sites / find_indirect_targets\n"
-        "• Natural-language question ________ → smart_search (slow, thorough)\n\n"
-        "IMPORTANT: search_code searches symbol NAMES (what the code IS).\n"
-        "search_bodies searches function BODIES (what the code DOES — inside {}).\n"
-        "search_content searches FULL FILE content — file-scope declarations,\n"
-        "type definitions in headers, preprocessor directives, namespace blocks.\n"
-        'For patterns like extern "C", InterruptIn declarations, #define —\n'
-        "use search_content, NOT search_bodies.\n\n"
-        "FTS5 QUERY TIPS:\n"
-        '• Multi-word queries are OR-joined: "attach callback" becomes attach* OR callback*\n'
-        "  (matches functions containing EITHER word, not both).\n"
-        '• Prefer SINGLE-WORD queries for broad matching: "attach" not "attach callback".\n'
-        "• For exact phrases use double quotes: '\"interrupt handler\"'.\n"
-        '• Underscores are word separators: "modem_init" → modem AND init.\n'
-        '  Write "modem init" instead.\n\n'
-        "EMPTY RESULT STRATEGY — if a fw-context tool returns nothing:\n"
-        "1. Try a simpler/single-word query in the SAME tool first.\n"
-        "2. Switch to a DIFFERENT fw-context tool (search_bodies → search_code, etc.).\n"
-        "3. Use lookup_symbol for known symbol names.\n"
-        "4. If search_bodies returns empty, switch to search_content — it covers\n"
-        '   file scope (type declarations, #define, extern "C") that search_bodies\n'
-        "   cannot reach.\n"
-        "5. find_callers empty → callers exist through member-field accesses\n"
-        "   (obj.method()) or base-class pointers. Fall back to\n"
-        '   search_bodies("function_name") which text-searches function bodies\n'
-        "   independently of the call graph. If still empty, try\n"
-        '   search_content("function_name").\n'
-        "6. If all fw-context tools return empty, simplify query or use different tool.\n"
-        "7. Only AFTER exhausting fw-context — use other available tools.\n\n"
-        "project_only=True (on search_code, search_bodies, search_content, and\n"
-        "callgraph tools) excludes vendor SDK code — use when asking about YOUR code.\n\n"
-        "ANTI-PATTERNS — do NOT:\n"
-        "• Use external search tools for C/C++ symbols → use lookup_symbol or search_code\n"
-        "• Use external search tools for code patterns → use search_bodies (function\n"
-        "  bodies) or search_content (full file content)\n"
-        "• Use external tools for callbacks, ISRs → use find_references or\n"
-        "  search_bodies(project_only=True)\n"
-        "• Use file readers for function bodies → use get_source (libclang exact extents)\n"
-        "• Use external file readers for C/C++ files → use read_file (returns\n"
-        "  ifdef-filtered content)\n"
-        "• Call get_source + find_callers separately → use get_symbol_context for body,\n"
-        "  callers, and callees in one call (fewer round-trips, richer data)\n"
-        "• Run external search tools in parallel with fw-context\n"
-        "• Give up on fw-context after one empty result → try simpler query or\n"
-        "  different fw-context tool first\n"
-        "• search_code for a SINGLE KNOWN symbol → use lookup_symbol(exact=true).\n"
-        '  search_code FTS5-tokenizes names: "kb_open_disp" → "kb"+"open"+"disp",\n'
-        "  causing false matches on unrelated symbols containing those tokens.\n"
-        "  search_code is for concept/keyword DISCOVERY only.\n"
-        "• Use generic review agents/skills for C/C++ code → use\n"
-        "  fw-review skill (see REVIEW SKILL section below).\n\n"
-        "AGENT LOOP: Check(get_active_build) → Find(search_code/lookup_symbol)\n"
-        "→ Read(get_symbol_context) ← preferred (body+callers+callees in one call).\n"
-        "  Fallback: get_source (body only). For whole-file reads: read_file.\n"
-        "→ Trace(find_references/find_callers) — skip if context already from get_symbol_context.\n"
-        "→ For body patterns use search_bodies.\n"
-        "→ DECISION after get_active_build():\n"
-        '  • status="ready" or "reindexing" — fw-context is fully operational.\n'
-        "    bg_reindex_running does NOT mean the index is unavailable. Continue.\n"
-        '  • status="reindex_needed" — queries still work, but schedule fw-context index.\n'
-        '  • status="no_index" or "error" — use other available tools.\n\n'
-        "REVIEW WORKFLOW — when reviewing C/C++ code changes (per changed symbol):\n"
-        "0. find_hotspots(project_only=True) — identify highest-impact functions FIRST.\n"
-        "   Prioritize review of hotspots (20+ callers) over leaf functions.\n"
-        "1. get_symbol_context(name) — body + direct callers + callees + LLM analysis\n"
-        "   in one call. Replaces lookup_symbol + find_callers + find_callees_recursive.\n"
-        '2. If get_symbol_context callers are empty → search_bodies("name") and\n'
-        "   find_indirect_call_sites / find_indirect_targets (function pointers,\n"
-        "   callbacks, ISRs invisible to the call graph).\n"
-        "3. find_all_callers_recursive() → transitive upstream impact (full call tree).\n"
-        "4. find_callees_recursive() → transitive downstream check.\n"
-        "   After a logic change, verify compatibility with everything this function\n"
-        "   calls — arguments, init order, error paths may have changed.\n"
-        '6. find_references("SymbolName") → all reads/writes/calls of changed types.\n'
-        '7. search_content("PATTERN") → confirm removal of #define/#ifdef/board names.\n'
-        "8. find_dead_code() → detect newly dead functions after removal.\n"
-        "9. trace_data_flow(type_name, to_symbol) → cross-module data dependencies.\n"
-        "   Use when a changed function produces or consumes typed data that flows\n"
-        '   through other modules. E.g. trace_data_flow("SlotPin", "InventoryWriter").\n'
-        "10. For each search_bodies result set: scan ALL results — the 3rd match\n"
-        "   may reveal an implementation the diff didn't touch (e.g. duplicate CRC\n"
-        "   in a private method).\n"
-        "11. When analyzing BOTH a diff AND fw-context results: diff shows SCOPE\n"
-        "   (what changed), fw-context verifies CORRECTNESS in full project context.\n"
-        "   ALWAYS verify diff discoveries recursively with fw-context.\n\n"
-        "DIFF → FW-CONTEXT VERIFICATION RULE:\n"
-        "→ When you analyze code via diff (git diff, file diff, patch review),\n"
-        "  diff shows ONLY what changed — it cannot reveal the impact across\n"
-        "  the full codebase.\n"
-        "→ After inspecting a diff: verify your findings with fw-context:\n"
-        '  • find_references("<symbol>") — all callers/readers, not just diff context\n'
-        '  • search_bodies("<pattern>") — pattern consistency across entire codebase\n'
-        "  • find_call_path / find_all_callers_recursive — cross-module impact\n"
-        '  • trace_data_flow("<type>", "<target>") — cross-module data dependencies\n'
-        "  • find_dead_code / find_hotspots — structural effects of changes\n"
-        "→ Do NOT draw conclusions from diff results alone — diff is for SCOPE\n"
-        "  discovery, fw-context is for IMPACT verification. They complement each\n"
-        "  other; neither replaces the other.\n\n"
-        "Search: lookup_symbol, search_code, search_bodies (body text),\n"
-        "search_content (full file content), smart_search, semantic_search.\n"
-        "Call graph: find_callers, find_references, find_call_path,\n"
-        "find_all_callers_recursive, find_callees_recursive, find_hotspots,\n"
-        "find_dead_code, find_wrapper_callers, trace_data_flow,\n"
-        "find_indirect_call_sites, find_indirect_targets.\n"
-        "Inheritance: get_inheritance_chain, get_class_members,\n"
-        "get_template_instances, get_method_overrides.\n"
-        "Source: get_source, get_symbol_context, get_file_map, explain_symbol, read_file.\n"
-        "Maintenance: get_active_build, list_projects, get_project_info,\n"
-        "check_ollama, reindex_file, reindex_file_impl, reset_index.\n\n"
-        "REVIEW SKILL — MANDATORY (not optional): When reviewing C/C++ firmware\n"
-        "code (diffs, commits, PRs, changed files), your FIRST action MUST be:\n"
-        "  skill(name=\"fw-review\")\n"
-        "Do NOT use generic review agents (code-explorer, general, etc.) for\n"
-        "C/C++ firmware reviews — they do not know fw-context tool selection rules.\n"
-        "Do NOT start inline review without the skill. The skill provides:\n"
-        "  • Phase 0: mandatory review plan creation from diff stat\n"
-        "  • Phase 1: structural verification (callers, callees, types, inheritance)\n"
-        "  • Phase 2: logic & memory review (deep code reading — ODR, null deref,\n"
-        "    call ordering, truncation, state reset, watchdog, edge cases)\n"
-        "  • Anti-pattern checklist (7 common mistakes with fw-context tools)\n"
-        "  • Tool selection decision tree (search_code vs lookup_symbol, etc.)\n"
-        "Trigger phrases — this skill applies to ALL review types regardless\n"
-        "of what the user calls it: review, code review, PR review, diff\n"
-        "review, deep review, recursive review, exhaustive review,\n"
-        "comprehensive review, safety review, audit, change analysis, commit\n"
-        "analysis, impact analysis, examine changes, inspect this code, look\n"
-        "at this diff, check this PR, check these changes, analyze this\n"
-        "commit, verify this change.\n"
-        "If the project has a LOCAL fw-review skill, that overrides\n"
-        "the global default — the user has intentionally customized it.\n\n"
-        "Start every session with get_active_build().\n"
-        "For non-C/C++ files, general-purpose tools are preferred."
-    ),
+    instructions=_load_instructions(),
 )
 
 # ── Shared helpers ──────────────────────────────────────────────────────────
@@ -351,12 +218,7 @@ def resource_symbol(name: str) -> str:
 
 def _load_skill_md() -> str | None:
     """Return the fw-review SKILL.md content, or None."""
-    from pathlib import Path
-
-    from .. import __file__ as _pkg_init
-
-    pkg_dir = Path(_pkg_init).parent
-    skill_path = pkg_dir / "data" / "skills" / "fw-review" / "SKILL.md"
+    skill_path = _DATA_DIR / "skills" / "fw-review" / "SKILL.md"
     try:
         return skill_path.read_text(encoding="utf-8")
     except OSError:
@@ -393,71 +255,44 @@ def main() -> None:
     """Start the FastMCP stdio server — entry point for the ``fw-context-mcp`` command.
 
     On startup:
-    1. Validates that the project is initialized (``fw-context init`` has run)
-       and that a symbol index exists (``fw-context index`` has run).
-       If either is missing, sets a server-level sentinel that causes all
-       tool handlers to return a clear error with user instructions.
+    1. Pre-populates the project-ready cache (validates init + index existence).
+       Tools will re-evaluate periodically (30 s TTL) so that running
+       ``fw-context init`` / ``fw-context index`` while the server is active
+       is picked up automatically without a restart.
     2. Pre-marks the database as integrity-checked.
     3. Ensures the persistent watcher daemon is running for the project
        (spawns it if this is the first MCP server).
     4. Starts a ping thread that keeps the daemon alive.
     """
+    log.info("fw-context MCP server starting")
+
+    # Pre-populate the project-ready cache with a one-shot check.
+    # _check_server_ready() raises RuntimeError when the project isn't
+    # ready — we catch it here so the server can still start (tools will
+    # surface the error to the LLM on first call).
+    try:
+        _check_server_ready()
+    except RuntimeError as exc:
+        log.info("Project not ready at startup: %s", exc)
+
+    # If the project IS ready, pre-mark integrity check and ensure daemon.
     try:
         root = resolve_project_root(None)
     except Exception:
-        log.exception("Failed to resolve project root, server starting without DB")
-        _set_server_init_error(
-            "Cannot resolve project root. Are you running inside a project directory?\n"
-            "Run 'fw-context init' then 'fw-context index --build' in your project root."
-        )
+        log.exception("Failed to resolve project root for daemon setup")
         mcp.run()
         return
-
-    # Check 1: is the project initialized?
-    from ..config import derive_project_id
-    from ..config import load as load_config
-    from ..config.settings import ProjectNotInitializedError as PIE
 
     try:
+        from ..config import derive_project_id
+        from ..config import load as load_config
         project_id = derive_project_id(root)
-    except PIE:
-        log.info("Project not initialized at %s — tools will report setup instructions", root)
-        _set_server_init_error(
-            f"Project at {root} is not initialized.\n\n"
-            "Run these commands in your terminal:\n"
-            "  1. fw-context init\n"
-            "  2. fw-context index --build\n"
-            "  3. Restart your AI tool\n\n"
-            "fw-context init creates a project ID (stored in .fw-context/config.toml).\n"
-            "fw-context index --build compiles and indexes your C/C++ codebase."
-        )
-        mcp.run()
-        return
-
-    # Check 2: does the index database exist?
-    cfg = load_config(project_root=root)
-    db_path = cfg.index.db_dir / project_id / "index.db"
-    if not db_path.exists():
-        log.info("No index found at %s — tools will report setup instructions", db_path)
-        _set_server_init_error(
-            f"No symbol index found for project at {root}.\n\n"
-            "Run these commands in your terminal:\n"
-            "  1. fw-context index --build\n"
-            "  2. Restart your AI tool\n\n"
-            "fw-context index --build compiles and indexes your C/C++ codebase\n"
-            "for code intelligence (symbol lookup, call graph, search, etc.)."
-        )
-        mcp.run()
-        return
-
-    # Project is ready — pre-mark integrity check and start normally.
-    # GOTCHA — integrity_check on large DBs is I/O-bound (10-30 s for
-    # 3+ GB).  If it runs here via _open_db_safe during MCP server startup,
-    # the MCP client times out during tool discovery and fw-context tools
-    # never appear.  The check already ran during ``fw-context index``, so
-    # we skip it by pre-marking the DB — a corrupt DB will be caught by
-    # individual queries via _open_db_safe.
-    _integrity_checked.add(str(db_path.resolve()))
+        cfg = load_config(project_root=root)
+        db_path = cfg.index.db_dir / project_id / "index.db"
+        if db_path.exists():
+            _integrity_checked.add(str(db_path.resolve()))
+    except Exception:
+        log.warning("Failed to pre-mark integrity check — will run on first query", exc_info=True)
 
     try:
         _ensure_daemon_running(root)
@@ -485,6 +320,7 @@ def _start_ping_thread(root: Path) -> None:
             except Exception:
                 log.debug("Daemon ping error", exc_info=True)
 
+    # daemon=True: killed on process exit — no explicit stop mechanism needed
     t = threading.Thread(target=_ping_loop, daemon=True, name="fw-context-ping")
     t.start()
     log.debug("Daemon ping thread started for %s", root)

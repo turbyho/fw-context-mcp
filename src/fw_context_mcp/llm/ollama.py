@@ -19,6 +19,9 @@ from .embedder import Embedder
 
 log = logging.getLogger(__name__)
 
+# Cache for Ollama model context lengths — populated lazily by OllamaEmbedder.max_tokens
+_max_tokens_cache: dict[str, int] = {}
+
 # Per-process semaphore controlling concurrent Ollama HTTP calls.
 # Multiple concurrent requests to a single Ollama instance can cause
 # timeouts, OOM, or hangs when the GPU is saturated — this semaphore
@@ -279,14 +282,34 @@ class OllamaEmbedder(Embedder):
 
     @property
     def max_tokens(self) -> int:
-        model = self._cfg.embed_model.lower()
-        if "qwen3-embedding:0.6b" in model or "qwen3-embedding:4b" in model:
-            return 32768
-        if "qwen3-embedding:8b" in model:
-            return 8192
-        if "mxbai" in model:
-            return 512
-        return 512
+        model = self._cfg.embed_model
+        cached = _max_tokens_cache.get(model)
+        if cached is not None:
+            return cached
+        try:
+            resp = httpx.get(
+                f"{self._cfg.ollama_url.rstrip('/')}/api/show",
+                params={"name": model}, timeout=5.0,
+            )
+            if resp.status_code == 200:
+                info = resp.json().get("model_info", {})
+                ctx_len = info.get("context_length")
+                if isinstance(ctx_len, int) and ctx_len > 0:
+                    _max_tokens_cache[model] = ctx_len
+                    return ctx_len
+        except Exception:
+            pass
+        model_lower = model.lower()
+        if "qwen3-embedding:0.6b" in model_lower or "qwen3-embedding:4b" in model_lower:
+            tokens = 32768
+        elif "qwen3-embedding:8b" in model_lower:
+            tokens = 8192
+        elif "mxbai" in model_lower:
+            tokens = 512
+        else:
+            tokens = 512
+        _max_tokens_cache[model] = tokens
+        return tokens
 
 
 async def call_ollama_async(
@@ -314,82 +337,7 @@ async def call_ollama_async(
         call_ollama, prompt, cfg, temperature=temperature, num_predict=num_predict
     )
 
-
-def check_setup(cfg: LLMConfig) -> dict:
-    """Check Ollama connectivity and model availability.
-
-    Args:
-        cfg: LLM configuration.
-
-    Returns:
-        dict: {ollama_running (bool), model_installed (bool), model (str),
-        message (str, on error), latency_s, embedding_model,
-        embedding_installed}.
-    """
-    base_url = cfg.ollama_url.rstrip("/")
-    try:
-        resp = httpx.get(base_url + "/api/tags", timeout=5.0)
-        resp.raise_for_status()
-    except httpx.ConnectError:
-        return {
-            "status": "error",
-            "ollama_running": False,
-            "message": (
-                f"Ollama is not running at {cfg.ollama_url}. "
-                "Install and start: https://ollama.com"
-            ),
-        }
-    except Exception as e:
-        return {"status": "error", "ollama_running": False, "message": str(e)}
-
-    models = resp.json().get("models", [])
-    installed = [m["name"] for m in models]
-    model_found = cfg.model in installed
-
-    if not model_found:
-        # Try prefix match (e.g. "codestral" matches "codestral:latest")
-        model_found = any(m.startswith(cfg.model.split(":")[0]) for m in installed)
-
-    # Check embedding model too — semantic_search will fail at query time if it's missing
-    embed_found = cfg.embed_model in installed
-    if not embed_found:
-        embed_found = any(m.startswith(cfg.embed_model.split(":")[0]) for m in installed)
-
-    result: dict = {
-        "status": "ok" if model_found else "model_missing",
-        "ollama_running": True,
-        "ollama_url": cfg.ollama_url,
-        "configured_model": cfg.model,
-        "num_ctx": cfg.num_ctx,
-        "installed_models": installed,
-        "configured_embed_model": cfg.embed_model,
-        "embedding_installed": embed_found,
-    }
-
-    if cfg.debug_log:
-        result["debug_log"] = str(cfg.debug_log)
-
-    if not model_found:
-        result["message"] = (
-            f"Model '{cfg.model}' is not installed. "
-            f"Run: ollama pull {cfg.model}"
-        )
-        result["available_code_models"] = [
-            m for m in installed
-            if any(kw in m for kw in ("coder", "codestral", "code", "deepseek", "starcoder"))
-        ]
-
-    if not embed_found:
-        embed_msg = (
-            f"Embedding model '{cfg.embed_model}' is not installed. "
-            f"Run: ollama pull {cfg.embed_model}"
-        )
-        if "message" in result:
-            result["message"] += " " + embed_msg
-        else:
-            result["message"] = embed_msg
-
-    return result
+from ._diag import check_setup
 
 
 class OllamaError(RuntimeError):

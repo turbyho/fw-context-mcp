@@ -20,8 +20,15 @@ class TranslatePhase(Phase):
     name = "translate"  #: Phase identifier used in pipeline configuration.
 
     def should_run(self, ctx) -> bool:
-        """Only run when Ollama is enabled in config."""
-        return ctx.config.llm.enabled
+        """Only run when Ollama is enabled and query might not be English."""
+        if not ctx.config.llm.enabled:
+            return False
+        # Skip LLM translation for queries that are purely ASCII —
+        # source code is written in English and queries follow suit.
+        # NOTE: iterates entire query per search; microsecond cost, acceptable
+        if not any(ord(c) > 127 for c in ctx.query):
+            return False
+        return True
 
     async def run(self, ctx: PipelineContext) -> PipelineContext:
         """Send the query to Ollama for language detection and translation.
@@ -57,6 +64,8 @@ class TranslatePhase(Phase):
                     translated = translated[len(prefix):]
                     break
             translated = translated.strip()
+            # Guard against LLM hallucination — cap at 200 characters
+            translated = translated[:200]
             if translated and translated != query:
                 return ctx.evolve(query=translated, translated_from=query)
         except OllamaError:

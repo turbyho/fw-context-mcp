@@ -48,6 +48,7 @@ class DeduplicatePhase(Phase):
 
         # Score all rows and keep best per (name, file_path)
         scored: list[tuple[int, dict]] = []
+        scored_index: dict[tuple, int] = {}
         for r in all_rows:
             name = r.get("name") or ""
             # Filter noise
@@ -61,16 +62,14 @@ class DeduplicatePhase(Phase):
             if prev is None:
                 s = score_result(r, stems)
                 seen[key] = r
+                scored_index[key] = len(scored)
                 scored.append((s, r))
             elif r.get("is_definition") and not prev.get("is_definition"):
-                # Replace declaration with definition
+                # Replace declaration with definition — O(1) via scored_index
                 seen[key] = r
-                # Rescore
-                for i, (_, existing) in enumerate(scored):
-                    if (existing.get("name") == name
-                            and (existing.get("file_path") or "") == (r.get("file_path") or "")):
-                        scored[i] = (score_result(r, stems), r)
-                        break
+                idx = scored_index.get(key)
+                if idx is not None:
+                    scored[idx] = (score_result(r, stems), r)
 
         scored.sort(key=lambda x: -x[0])
         final = [r for _, r in scored[:ctx.limit]]

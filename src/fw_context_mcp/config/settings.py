@@ -9,8 +9,10 @@ Hierarchy (later overrides earlier):
 
 from __future__ import annotations
 
+import os
 import sys
 import tomllib
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -418,159 +420,162 @@ def _safe_float(val, default: float = 0.0) -> float:
 
 
 def _from_dict(data: dict) -> Config:
+    """Convert merged TOML dict to Config with field mapping tables.
+
+    Each mapping entry: (toml_key, attr_name, converter).
+    Converters: "str" | "bool" | "list" | "dict" | "path" | "int(N)" | "float(N)"
+    """
     cfg = Config()
 
+    # ── [project] ──
     if proj := data.get("project", {}):
-        if name := proj.get("name"):
-            cfg.project.name = name
-        if pid := proj.get("id"):
-            cfg.project.id = pid
+        for key, attr, conv in _PROJECT_FIELDS:
+            if key in proj:
+                setattr(cfg.project, attr, _convert(proj[key], conv))
 
+    # ── [build] ──
     if build := data.get("build", {}):
-        if system := build.get("system"):
-            cfg.build.system = system
-        if "clean" in build:
-            cfg.build.clean = bool(build["clean"])
-        if command := build.get("command"):
-            cfg.build.command = command
-        # Mbed OS
-        if target := build.get("target"):
-            cfg.build.target = target
-        if toolchain := build.get("toolchain"):
-            cfg.build.toolchain = toolchain
-        if profile := build.get("profile"):
-            cfg.build.profile = profile
-        if app_config := build.get("app_config"):
-            cfg.build.app_config = app_config
-        if extra := build.get("extra_profiles"):
-            cfg.build.extra_profiles = list(extra)
-        if defines := build.get("defines"):
-            cfg.build.defines = list(defines)
-        # Zephyr
-        if board := build.get("board"):
-            cfg.build.board = board
-        # ESP-IDF
-        if idf_path := build.get("idf_path"):
-            cfg.build.idf_path = idf_path
-        # Arduino
-        if fqbn := build.get("fqbn"):
-            cfg.build.fqbn = fqbn
-        # Generic CMake
-        if cmake_generator := build.get("cmake_generator"):
-            cfg.build.cmake_generator = cmake_generator
-        # Keil MDK
-        if keil_project := build.get("keil_project"):
-            cfg.build.keil_project = keil_project
-        if keil_target := build.get("keil_target"):
-            cfg.build.keil_target = keil_target
-        if keil_cmsis_path := build.get("keil_cmsis_path"):
-            cfg.build.keil_cmsis_path = keil_cmsis_path
-        # IAR EWARM
-        if iar_project := build.get("iar_project"):
-            cfg.build.iar_project = iar_project
-        if iar_target := build.get("iar_target"):
-            cfg.build.iar_target = iar_target
-        # Makefile
-        if makefile := build.get("makefile"):
-            cfg.build.makefile = makefile
-        if make_target := build.get("make_target"):
-            cfg.build.make_target = make_target
-        if make_vars := build.get("make_vars"):
-            cfg.build.make_vars = dict(make_vars)
-        if "make_dry_run" in build:
-            cfg.build.make_dry_run = bool(build["make_dry_run"])
-        # Toolchain
-        if toolchain_path := build.get("toolchain_path"):
-            cfg.build.toolchain_path = toolchain_path
-        if toolchain_prefix := build.get("toolchain_prefix"):
-            cfg.build.toolchain_prefix = toolchain_prefix
-        # Manual / bare mode
-        if include_dirs := build.get("include_dirs"):
-            cfg.build.include_dirs = list(include_dirs)
-        if system_include_dirs := build.get("system_include_dirs"):
-            cfg.build.system_include_dirs = list(system_include_dirs)
-        if extra_flags := build.get("extra_flags"):
-            cfg.build.extra_flags = list(extra_flags)
-        if source_dirs := build.get("source_dirs"):
-            cfg.build.source_dirs = list(source_dirs)
-        if compiler := build.get("compiler"):
-            cfg.build.compiler = compiler
-        # Pre-build hooks
-        if pre_build := build.get("pre_build"):
-            cfg.build.pre_build = pre_build
+        for key, attr, conv in _BUILD_FIELDS:
+            if key in build:
+                setattr(cfg.build, attr, _convert(build[key], conv))
 
+    # ── [index] ──
     if idx := data.get("index", {}):
-        if db_dir := idx.get("db_dir"):
-            cfg.index.db_dir = Path(db_dir).expanduser()
-        if cc := idx.get("compile_commands"):
-            cfg.index.compile_commands = Path(cc)
-        if config_header := idx.get("config_header"):
-            cfg.index.config_header = config_header
-        if "vendor_paths" in idx:
-            cfg.index.vendor_paths = idx["vendor_paths"]
-        if "project_paths" in idx:
-            cfg.index.project_paths = idx["project_paths"]
-        if "index_refs" in idx:
-            cfg.index.index_refs = bool(idx["index_refs"])
-        if "index_embeddings" in idx:
-            cfg.index.index_embeddings = bool(idx["index_embeddings"])
-        if "rerank_top_k" in idx:
-            cfg.index.rerank_top_k = _safe_int(idx["rerank_top_k"], 50)
-        if "min_dense_count" in idx:
-            cfg.index.min_dense_count = _safe_int(idx["min_dense_count"], 3)
-        if "rrf_weights" in idx:
-            import logging as _log
+        for key, attr, conv in _INDEX_FIELDS:
+            if key in idx:
+                setattr(cfg.index, attr, _convert(idx[key], conv))
 
-            _log.getLogger(__name__).warning(
-                "[index] rrf_weights is deprecated — RRF fusion has been replaced by adaptive_fusion. "
-                "Remove rrf_weights from config.toml."
-            )
-
+    # ── [llm] ──
     if llm := data.get("llm", {}):
-        if "enabled" in llm:
-            cfg.llm.enabled = bool(llm["enabled"])
-        if url := llm.get("ollama_url"):
-            cfg.llm.ollama_url = url
-        if model := llm.get("model"):
-            cfg.llm.model = model
-        if embed_model := llm.get("embed_model"):
-            cfg.llm.embed_model = embed_model
-        if embed_qp := llm.get("embed_query_prompt"):
-            cfg.llm.embed_query_prompt = embed_qp
-        if embed_dp := llm.get("embed_doc_prompt"):
-            cfg.llm.embed_doc_prompt = embed_dp
-        if embed_dim := llm.get("embed_dim"):
-            cfg.llm.embed_dim = _safe_int(embed_dim)
-        _apply_embed_prompt_defaults(cfg.llm)
-        if num_ctx := llm.get("num_ctx"):
-            cfg.llm.num_ctx = _safe_int(num_ctx, 16384)
-        if timeout := llm.get("timeout"):
-            cfg.llm.timeout = _safe_float(timeout, 600.0)
-        if keep_alive := llm.get("keep_alive"):
-            cfg.llm.keep_alive = keep_alive
-        if debug_log := llm.get("debug_log"):
-            cfg.llm.debug_log = Path(debug_log).expanduser()
-        if "analyze_symbols" in llm:
-            cfg.llm.analyze_symbols = bool(llm["analyze_symbols"])
-        if "analyze_vendor" in llm:
-            cfg.llm.analyze_vendor = bool(llm["analyze_vendor"])
-        if reranker_model := llm.get("reranker_model"):
-            cfg.llm.reranker_model = reranker_model
+        for key, attr, conv in _LLM_FIELDS:
+            if key in llm:
+                setattr(cfg.llm, attr, _convert(llm[key], conv))
 
     from ..llm.auto_model import resolve_embed_model
 
     resolve_embed_model(cfg.llm)
+    _apply_embed_prompt_defaults(cfg.llm)
 
+    # ── [cache_server] ──
     if cs := data.get("cache_server", {}):
+        token = cs.get("token", "")
+        if not token:
+            token_file = Path.home() / ".fw-context" / ".cache_token"
+            if token_file.exists():
+                try:
+                    token = token_file.read_text(encoding="utf-8").strip()
+                except OSError:
+                    pass
         cfg.cache_server = CacheServerConfig(
             url=cs.get("url", ""),
-            token=cs.get("token", ""),
+            token=token,
             batch_size=cs.get("batch_size", 100),
             force=cs.get("force", False),
         )
 
+    # Warn about unknown top-level keys
+    _KNOWN_SECTIONS = {"project", "build", "index", "llm", "cache_server"}
+    for key in data:
+        if key not in _KNOWN_SECTIONS:
+            log.warning(
+                "Unknown config section [%s] — check for typos (valid: %s)",
+                key, ", ".join(sorted(_KNOWN_SECTIONS)),
+            )
+
     return cfg
 
+
+def _convert(value, conv: str):
+    """Convert a TOML value using the converter specification."""
+    if conv == "str":
+        return value
+    if conv == "bool":
+        return bool(value)
+    if conv == "list":
+        return list(value)
+    if conv == "dict":
+        return dict(value)
+    if conv == "path":
+        return Path(value).expanduser()
+    if conv.startswith("int("):
+        default = int(conv[4:-1])
+        return _safe_int(value, default)
+    if conv.startswith("float("):
+        default = float(conv[6:-1])
+        return _safe_float(value, default)
+    return value  # fallback
+
+
+# ── Field mapping tables ──
+
+_PROJECT_FIELDS: list[tuple[str, str, str]] = [
+    ("name", "name", "str"),
+    ("id", "id", "str"),
+]
+
+_BUILD_FIELDS: list[tuple[str, str, str]] = [
+    ("system", "system", "str"),
+    ("clean", "clean", "bool"),
+    ("command", "command", "str"),
+    ("target", "target", "str"),
+    ("toolchain", "toolchain", "str"),
+    ("profile", "profile", "str"),
+    ("app_config", "app_config", "str"),
+    ("extra_profiles", "extra_profiles", "list"),
+    ("defines", "defines", "list"),
+    ("board", "board", "str"),
+    ("idf_path", "idf_path", "str"),
+    ("fqbn", "fqbn", "str"),
+    ("cmake_generator", "cmake_generator", "str"),
+    ("keil_project", "keil_project", "str"),
+    ("keil_target", "keil_target", "str"),
+    ("keil_cmsis_path", "keil_cmsis_path", "str"),
+    ("iar_project", "iar_project", "str"),
+    ("iar_target", "iar_target", "str"),
+    ("makefile", "makefile", "str"),
+    ("make_target", "make_target", "str"),
+    ("make_vars", "make_vars", "dict"),
+    ("make_dry_run", "make_dry_run", "bool"),
+    ("toolchain_path", "toolchain_path", "str"),
+    ("toolchain_prefix", "toolchain_prefix", "str"),
+    ("include_dirs", "include_dirs", "list"),
+    ("system_include_dirs", "system_include_dirs", "list"),
+    ("extra_flags", "extra_flags", "list"),
+    ("source_dirs", "source_dirs", "list"),
+    ("compiler", "compiler", "str"),
+    ("pre_build", "pre_build", "str"),
+]
+
+_INDEX_FIELDS: list[tuple[str, str, str]] = [
+    ("db_dir", "db_dir", "path"),
+    ("compile_commands", "compile_commands", "path"),
+    ("config_header", "config_header", "str"),
+    ("vendor_paths", "vendor_paths", "list"),
+    ("project_paths", "project_paths", "list"),
+    ("index_refs", "index_refs", "bool"),
+    ("index_embeddings", "index_embeddings", "bool"),
+    ("rerank_top_k", "rerank_top_k", "int(50)"),
+    ("min_dense_count", "min_dense_count", "int(3)"),
+]
+
+_LLM_FIELDS: list[tuple[str, str, str]] = [
+    ("enabled", "enabled", "bool"),
+    ("ollama_url", "ollama_url", "str"),
+    ("model", "model", "str"),
+    ("embed_model", "embed_model", "str"),
+    ("embed_query_prompt", "embed_query_prompt", "str"),
+    ("embed_doc_prompt", "embed_doc_prompt", "str"),
+    ("embed_dim", "embed_dim", "int(0)"),
+    ("num_ctx", "num_ctx", "int(16384)"),
+    ("timeout", "timeout", "float(600.0)"),
+    ("keep_alive", "keep_alive", "str"),
+    ("debug_log", "debug_log", "path"),
+    ("analyze_symbols", "analyze_symbols", "bool"),
+    ("analyze_vendor", "analyze_vendor", "bool"),
+    ("reranker_model", "reranker_model", "str"),
+    ("ollama_max_concurrent", "ollama_max_concurrent", "int(1)"),
+    ("allow_external_llm", "allow_external_llm", "bool"),
+]
 
 def _ensure_global_config() -> Path:
     path = _GLOBAL_CONFIG_PATH
@@ -717,7 +722,8 @@ def _is_loopback_url(url: str) -> bool:
 # Module-level config cache with mtime-based invalidation.
 # load_config() is called 20+ times per MCP session; caching avoids redundant
 # TOML parsing when config files haven't changed.
-_config_cache: dict[tuple, tuple[float, Config]] = {}
+_config_cache: OrderedDict[tuple, tuple[float, Config]] = OrderedDict()
+_CONFIG_CACHE_MAX = 50
 
 
 def load(project_root: Path | None = None) -> Config:
@@ -809,6 +815,8 @@ def load(project_root: Path | None = None) -> Config:
         newest_mtime = max(
             p.stat().st_mtime for p in cache_key if p is not None
         )
+        if len(_config_cache) >= _CONFIG_CACHE_MAX:
+            _config_cache.popitem(last=False)
         _config_cache[cache_key] = (newest_mtime, cfg)
     except OSError:
         pass  # Can't cache if we can't stat files
@@ -871,4 +879,15 @@ def _write_project_id(project_root: Path, project_id: str) -> None:
             # id not found, append at end of [project] section (end of file)
             lines.append(f'id = "{project_id}"\n')
 
-    config_path.write_text("".join(lines), encoding="utf-8")
+    # Atomic write: temp file + rename — prevents corruption on partial write
+    import tempfile
+    tmp = tempfile.NamedTemporaryFile(
+        mode="w", encoding="utf-8", dir=config_path.parent, delete=False,
+    )
+    try:
+        tmp.write("".join(lines))
+        tmp.flush()
+        os.fsync(tmp.fileno())
+    finally:
+        tmp.close()
+    Path(tmp.name).replace(config_path)

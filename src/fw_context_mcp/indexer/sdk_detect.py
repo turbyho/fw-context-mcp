@@ -8,14 +8,14 @@ from pathlib import Path
 def _path_matches(file_path: str, pattern: str) -> bool:
     """Check if *file_path* matches a SQL LIKE pattern (supports % wildcard).
 
-    ``%`` matchuje jakoukoliv sekvenci znaků **včetně ``/``** (na rozdíl od
-    fnmatch ``*``).  Používá regex pro korektní matchování vnořených adresářů:
-    ``mbed-os/%`` matchuje ``mbed-os/targets/TARGET_NORDIC/foo.cpp``.
+    ``%`` matches any sequence of characters **including ``/``** (unlike
+    fnmatch ``*``).  Uses regex for correct matching of nested directories:
+    ``mbed-os/%`` matches ``mbed-os/targets/TARGET_NORDIC/foo.cpp``.
 
-    Pro absolutni cesty (``project_paths`` mimo project root) funguje prvni
-    vetev — druha vetev (prefixovy match ``*/pattern`` proti ``/file_path``)
-    zachovava kompatibilitu s ``detect_sdk_exclude_like`` prefixovanymi patterny
-    (``%mbed-os/%``).
+    For absolute paths (``project_paths`` outside project root) the first
+    branch is used — the second branch (prefix match ``*/pattern`` against
+    ``/file_path``) preserves compatibility with ``detect_sdk_exclude_like``
+    prefixed patterns (``%mbed-os/%``).
     """
     import re
 
@@ -26,23 +26,21 @@ def _path_matches(file_path: str, pattern: str) -> bool:
     # in file names is essentially nonexistent.
     placeholder = "\x00"
     escaped = re.escape(pattern.replace("%", placeholder))
-    # Replace placeholder with .* (match anything incl /)
     regex = escaped.replace(placeholder, ".*")
-    # Anchor: full match from start to end
     regex = "^" + regex + "$"
     if re.match(regex, file_path):
         return True
-    # Taky matchuj "*/pattern" proti "/file_path" — zachovava puvodni
-    # prefixove chovani pro absolutni cesty a detect_sdk_exclude_like
-    # prefixovane patterny (napr. %mbed-os/%)
+    # Also match "*/pattern" against "/file_path" — preserves original
+    # prefix behavior for absolute paths and detect_sdk_exclude_like
+    # prefixed patterns (e.g. %mbed-os/%)
     return bool(re.match("^.*/" + regex.lstrip("^"), "/" + file_path))
 
 
 def _normalize_path_pattern(pattern: str) -> str:
-    """Doplni '/%' k patternu bez wildcard, aby _path_matches (regex) matchoval podadresare.
+    """Append '/%' to patterns without a wildcard so _path_matches (regex) matches subdirectories.
 
-    ``"third_party"`` → ``"third_party/%"`` (matchuje vsechny soubory v adresari)
-    ``"mbed-os/%"`` → ``"mbed-os/%"`` (uz ma wildcard, beze zmeny)
+    ``"third_party"`` → ``"third_party/%"`` (matches all files in the directory)
+    ``"mbed-os/%"`` → ``"mbed-os/%"`` (already has wildcard, unchanged)
     ``"/home/user/esp/components/muj_fork"`` → ``"/home/user/esp/components/muj_fork/%"``
     """
     if "%" not in pattern:
@@ -51,14 +49,14 @@ def _normalize_path_pattern(pattern: str) -> str:
 
 
 def _normalize_patterns(patterns: list[str]) -> list[str]:
-    """Normalizuje seznam patternů pro _path_matches — každý pattern bez wildcard dostane '/%'.
+    """Normalize patterns for _path_matches — each wildcard-less pattern gets '/%' appended.
 
-    Centralizovaný wrapper volající _normalize_path_pattern pro každý pattern.
-    Používaný z runner.py i maintenance.py.
+    Centralized wrapper calling _normalize_path_pattern for each pattern.
+    Used by both runner.py and maintenance.py.
 
     ``"third_party"`` → ``"third_party/%"``
     ``"/home/user/esp/components/muj_fork"`` → ``"/home/user/esp/components/muj_fork/%"``
-    ``"mbed-os/%"`` → ``"mbed-os/%"`` (už má wildcard, beze změny)
+    ``"mbed-os/%"`` → ``"mbed-os/%"`` (already has wildcard, unchanged)
     """
     return [_normalize_path_pattern(p) for p in patterns]
 

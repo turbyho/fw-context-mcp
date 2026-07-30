@@ -24,7 +24,7 @@ log = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 
-@dataclass
+@dataclass(slots=True)
 class BuildConfig:
     """Build system configuration for compile_commands.json generation.
 
@@ -230,7 +230,7 @@ def _run_pre_build(cfg: BuildConfig, cwd: Path) -> None:
         cfg.pre_build,
     )
     import shlex
-    result = subprocess.run(shlex.split(cfg.pre_build), shell=False, cwd=cwd)
+    result = subprocess.run(shlex.split(cfg.pre_build), shell=False, cwd=cwd, timeout=600)
     if result.returncode != 0:
         raise RuntimeError(f"Pre-build command failed with exit code {result.returncode}")
 

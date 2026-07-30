@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import logging
 import sqlite3
+import threading
 from pathlib import Path
 
 log = logging.getLogger(__name__)
@@ -36,6 +37,7 @@ CREATE INDEX IF NOT EXISTS idx_projects_updated_at ON projects(updated_at);
 # init and index time, read on every MCP tool invocation), so a long-lived
 # connection is safe.
 _global_conn: sqlite3.Connection | None = None
+_global_lock = threading.Lock()  # guards initialization
 
 
 def _global_db_path() -> Path:
@@ -50,22 +52,27 @@ def open_global_db() -> sqlite3.Connection:
     long-lived connection is safe and avoids per-call open overhead.
     """
     global _global_conn
-    if _global_conn is not None:
-        try:
-            _global_conn.execute("SELECT 1")
-        except sqlite3.Error:
-            _global_conn = None  # stale connection, reopen
+    with _global_lock:
+        if _global_conn is not None:
+            try:
+                _global_conn.execute("SELECT 1")
+            except sqlite3.Error:
+                try:
+                    _global_conn.close()
+                except Exception:
+                    pass
+                _global_conn = None  # stale connection, reopen
 
-    if _global_conn is None:
-        db_path = _global_db_path()
-        db_path.parent.mkdir(parents=True, exist_ok=True)
+        if _global_conn is None:
+            db_path = _global_db_path()
+            db_path.parent.mkdir(parents=True, exist_ok=True)
 
-        _global_conn = sqlite3.connect(str(db_path))
-        _global_conn.row_factory = sqlite3.Row
-        _global_conn.execute("PRAGMA journal_mode=WAL")
-        _global_conn.execute("PRAGMA foreign_keys=ON")
-        _global_conn.executescript(_SCHEMA)
-        _global_conn.commit()
+            _global_conn = sqlite3.connect(str(db_path))
+            _global_conn.row_factory = sqlite3.Row
+            _global_conn.execute("PRAGMA journal_mode=WAL")
+            _global_conn.execute("PRAGMA foreign_keys=ON")
+            _global_conn.executescript(_SCHEMA)
+            _global_conn.commit()
 
     return _global_conn
 
