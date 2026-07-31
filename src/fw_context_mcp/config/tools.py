@@ -14,6 +14,7 @@ import os
 import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
+from fw_context_mcp.utils import SAFE_EXCEPT, is_fatal
 
 # ── Instruction templates ───────────────────────────────────────────────────
 
@@ -457,7 +458,8 @@ def check_target(target: InstructionTarget, project_root: Path | None = None) ->
                 managed = data.get("managed", {})
                 if managed:  # Non-empty managed dict = skillshare active here
                     collision.is_skillshare_managed = True
-            except (ValueError, TypeError, RuntimeError, AttributeError):
+            except SAFE_EXCEPT as e:
+                if is_fatal(e): raise
                 pass
             break
         parent = parent.parent

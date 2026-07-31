@@ -15,6 +15,7 @@ import logging
 import sqlite3
 import threading
 from pathlib import Path
+from fw_context_mcp.utils import SAFE_EXCEPT, is_fatal
 
 log = logging.getLogger(__name__)
 
@@ -59,7 +60,8 @@ def open_global_db() -> sqlite3.Connection:
             except sqlite3.Error:
                 try:
                     _global_conn.close()
-                except (ValueError, TypeError, RuntimeError, sqlite3.Error):
+                except SAFE_EXCEPT as e:
+                    if is_fatal(e): raise
                     pass
                 _global_conn = None  # stale connection, reopen
 

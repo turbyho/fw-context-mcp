@@ -18,7 +18,7 @@ from pathlib import Path
 
 from ..cache_client import get_local_cache_db, local_cache_lookup, local_cache_upsert
 from ..llm.ollama import call_ollama
-from ..utils import read_file_lines
+from ..utils import SAFE_EXCEPT, is_fatal, read_file_lines
 from ..config.settings import DESCRIPTION_VERSION
 from ._embedding import _chunk_body, _fmt_dur
 from .db import open_db, transaction, upsert_llm_analysis_batch
@@ -171,7 +171,8 @@ def _build_llm_analysis(
                     _model_ctx_size = ctx
                     log.debug("Resolved model context from Ollama: %d tokens", ctx)
                 break
-    except (ValueError, TypeError, RuntimeError, AttributeError, sqlite3.Error):
+    except SAFE_EXCEPT as e:
+        if is_fatal(e): raise
         log.warning("Ollama not reachable — skipping LLM analysis generation")
         return
 
@@ -256,7 +257,8 @@ def _build_llm_analysis(
             try:
                 local_hits = local_cache_lookup(local_db, [h])
                 cached = local_hits.get(h)
-            except (ValueError, TypeError, RuntimeError, AttributeError, sqlite3.Error) as e:
+            except SAFE_EXCEPT as e:
+                if is_fatal(e): raise
                 log.debug("Local global cache lookup failed: %s", e)
 
             # Tier 2: remote cache server
@@ -268,11 +270,13 @@ def _build_llm_analysis(
                         # Store in local global cache for next time
                         try:
                             local_cache_upsert(local_db, [{"hash": h, **cached}])
-                        except (ValueError, TypeError, RuntimeError, AttributeError, sqlite3.Error) as e:
+                        except SAFE_EXCEPT as e:
+                            if is_fatal(e): raise
                             log.debug("Local global cache write failed: %s", e)
                     else:
                         log.debug("Remote cache miss for %s (hash=%s…)", qname, h[:12])
-                except (ValueError, TypeError, RuntimeError, AttributeError, sqlite3.Error) as e:
+                except SAFE_EXCEPT as e:
+                    if is_fatal(e): raise
                     log.debug("Remote cache lookup failed for %s: %s", qname, e)
 
             if cached:
@@ -354,7 +358,7 @@ def _build_llm_analysis(
 
             try:
                 response = call_ollama(prompt, llm_config, temperature=0.1, num_predict=num_predict)
-            except (ValueError, TypeError, RuntimeError, AttributeError, sqlite3.Error) as e:
+            except SAFE_EXCEPT as e:
                 elapsed = time.monotonic() - t0
                 log.warning("[%d/%d] %s: err %s: %s", idx + 1, total_symbols, qname, _fmt_dur(elapsed), e)
                 continue
@@ -399,7 +403,8 @@ def _build_llm_analysis(
                                 }
                             ],
                         )
-                    except (ValueError, TypeError, RuntimeError, AttributeError, sqlite3.Error) as e:
+                    except SAFE_EXCEPT as e:
+                        if is_fatal(e): raise
                         log.debug("Local global cache write failed: %s", e)
                     # Store on remote cache server (fire-and-forget)
                     if cache_client is not None:
@@ -415,7 +420,8 @@ def _build_llm_analysis(
                                     }
                                 ]
                             )
-                        except (ValueError, TypeError, RuntimeError, AttributeError, sqlite3.Error) as e:
+                        except SAFE_EXCEPT as e:
+                            if is_fatal(e): raise
                             log.debug("Remote cache write failed: %s", e)
                     total += inserted
 
@@ -424,14 +430,15 @@ def _build_llm_analysis(
             log.debug("  summary: %s", r["summary"])
             log.debug("  inputs : %s", r["inputs"])
             log.debug("  outputs: %s", r["outputs"])
-        except (ValueError, TypeError, RuntimeError, AttributeError, sqlite3.Error) as e:
+        except SAFE_EXCEPT as e:
             elapsed = time.monotonic() - t0
             log.warning("[%d/%d] %s: err %s: %s", idx + 1, total_symbols, qname, _fmt_dur(elapsed), e)
             continue
 
     try:
         conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-    except (ValueError, TypeError, RuntimeError, AttributeError, sqlite3.Error):
+    except SAFE_EXCEPT as e:
+        if is_fatal(e): raise
         pass  # libclang/SQLite fallback
 
     log.info("LLM analysis stored: %d/%d symbols (model=%s)", total, total_symbols, model)
