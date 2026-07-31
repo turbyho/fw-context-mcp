@@ -87,9 +87,12 @@ def _pull_model(model: str, base_url: str) -> None:
 
 def _write_debug_log(path: Path, entry: dict) -> None:
     """Append a JSON line to the LLM debug log file."""
+    import os as _os
+
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
-        with path.open("a", encoding="utf-8") as f:
+        fd = _os.open(str(path), _os.O_WRONLY | _os.O_CREAT | _os.O_APPEND, 0o600)
+        with _os.fdopen(fd, "a", encoding="utf-8") as f:
             f.write(json.dumps(entry, ensure_ascii=False) + "\n")
     except (OSError, ValueError) as e:
         log.warning("LLM debug log write failed: %s", e)
