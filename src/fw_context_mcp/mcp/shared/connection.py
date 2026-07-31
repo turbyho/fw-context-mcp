@@ -29,7 +29,6 @@ log = logging.getLogger(__name__)
 class _ConnCacheEntry:
     conn: sqlite3.Connection
     opened_at: float
-    active_users: int = 0  #: Number of handlers currently using this connection
 
 
 _conn_cache: dict[str, _ConnCacheEntry] = {}
