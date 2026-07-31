@@ -455,8 +455,11 @@ def _from_dict(data: dict) -> Config:
             if key in llm:
                 setattr(cfg.llm, attr, _convert(llm[key], conv))
 
-    from ..llm.auto_model import resolve_embed_model
+    # Normalize sentinel values: -1 means "not set" for embed_dim
+    if cfg.llm.embed_dim is not None and cfg.llm.embed_dim < 0:
+        cfg.llm.embed_dim = None
 
+    from ..llm.auto_model import resolve_embed_model
     resolve_embed_model(cfg.llm)
     _apply_embed_prompt_defaults(cfg.llm)
 
@@ -569,7 +572,7 @@ _LLM_FIELDS: list[tuple[str, str, str]] = [
     ("embed_model", "embed_model", "str"),
     ("embed_query_prompt", "embed_query_prompt", "str"),
     ("embed_doc_prompt", "embed_doc_prompt", "str"),
-    ("embed_dim", "embed_dim", "int(0)"),
+    ("embed_dim", "embed_dim", "int(-1)"),
     ("num_ctx", "num_ctx", "int(16384)"),
     ("timeout", "timeout", "float(600.0)"),
     ("keep_alive", "keep_alive", "str"),
