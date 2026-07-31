@@ -288,7 +288,7 @@ async def explain_symbol(
             f"{i + start + 1:4d}  {lines[i + start]}" for i in range(end - start)
         )
         source_snippet = numbered
-    except (IndexError, ValueError):
+    except (IndexError, ValueError, OSError):
         pass
     prompt = (
         f"You are a C/C++ embedded firmware expert.\n"

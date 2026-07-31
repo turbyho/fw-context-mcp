@@ -231,13 +231,19 @@ def cmd_cache_remote_init(args: argparse.Namespace) -> int:
         return 1
 
     # --- Step 4: Write config ---
-    # Store the token in a separate file with restricted permissions (0600)
-    # so it never appears in plaintext inside the shared config.toml.
+    # Store the token atomically with restricted permissions (0600)
+    # so it never appears in plaintext inside the shared config.toml
+    # and never exists with world-readable permissions, even for a moment.
     token_dir = Path.home() / ".fw-context"
     token_dir.mkdir(parents=True, exist_ok=True)
     token_file = token_dir / ".cache_token"
-    token_file.write_text(token, encoding="utf-8")
-    os.chmod(token_file, 0o600)
+    tmp_file = token_file.with_suffix(token_file.suffix + ".tmp")
+    fd = os.open(str(tmp_file), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        os.write(fd, token.encode("utf-8"))
+    finally:
+        os.close(fd)
+    os.replace(tmp_file, token_file)
 
     cache_section = f"""
 [cache_server]

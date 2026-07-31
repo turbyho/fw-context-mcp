@@ -282,13 +282,16 @@ def main() -> None:
     try:
         sys.exit(args.func(args))
     except Exception as exc:
+        if isinstance(exc, (KeyboardInterrupt, SystemExit)):
+            raise
         # ProjectNotInitializedError — lazy import to avoid circular deps
         from ..config.settings import ProjectNotInitializedError
 
         if isinstance(exc, ProjectNotInitializedError):
             print(f"error: {exc}", file=sys.stderr)
-            sys.exit(1)
-        raise
+        else:
+            print(f"fw-context: error: {exc}", file=sys.stderr)
+        sys.exit(1)
 
 
 if __name__ == "__main__":
