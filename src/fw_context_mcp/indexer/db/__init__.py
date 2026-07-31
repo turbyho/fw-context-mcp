@@ -75,6 +75,7 @@ __all__ = [
     "upsert_llm_analysis_batch",
     "upsert_project",
     "write_lock",
+    "SymbolRepository",
 ]
 
 import logging
@@ -173,5 +174,6 @@ from ._symbols import (
     search_symbols,
     split_tokens,
 )
+from ._repository import SymbolRepository
 
 log = logging.getLogger(__name__)
