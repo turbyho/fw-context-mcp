@@ -233,7 +233,7 @@ def _build_embeddings(
 
     import httpx
 
-    from ..llm.embedder import get_embedder
+    from ..llm.embedder_factory import get_embedder
     from .db import _vec_to_blob, upsert_embeddings, upsert_embeddings_vec
 
     # Suppress httpx INFO logs (one per batch — noisy during embedding)
@@ -687,7 +687,7 @@ def _build_llm_analysis(
 
     log.info("LLM analysis: %d symbols (model=%s)", total_symbols, model)
 
-    from ..cache_client import get_local_cache_db, local_cache_lookup
+    from ..cache_client import get_local_cache_db, local_cache_lookup, local_cache_upsert
 
     local_db = get_local_cache_db()  # single connection for all symbols
 
