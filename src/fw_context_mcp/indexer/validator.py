@@ -166,17 +166,6 @@ def validate_and_fix(
     if not issues:
         return []
 
-    # ── Auto-fix loop (max 1 cycle) ──
-    if not fix:
-        return issues
-
-    fixed_count = 0
-    unfixed: list[BuildIssue] = []
-    for issue in issues:
-        # Removed: auto-fix loop was unreachable — no builder sets auto_fixable=True
-        unfixed.append(issue)
-
-    if fixed_count > 0:
-        log.info("Auto-fixed %d issue(s), %d remain", fixed_count, len(unfixed))
-
-    return unfixed
+    # Auto-fix was never implemented — no builder sets auto_fixable=True.
+    # The `fix` parameter and auto_fix loop were dead code and have been removed.
+    return issues
