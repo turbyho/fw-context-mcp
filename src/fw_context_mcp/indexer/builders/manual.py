@@ -15,9 +15,9 @@ from __future__ import annotations
 import json
 import logging
 import shutil
-import subprocess
 from pathlib import Path
 from typing import TYPE_CHECKING
+from fw_context_mcp.utils import run_build_command
 
 from . import registry
 from .protocol import BuildIssue
@@ -140,10 +140,9 @@ class ManualBuildSystem:
             cmd = [compiler] + dep_args + flags + ["-fsyntax-only", str(src)]
             log.debug("Compile: %s", " ".join(cmd))
             try:
-                subprocess.run(cmd, cwd=root, capture_output=True, check=True)
-            except subprocess.CalledProcessError as exc:
-                stderr = exc.stderr.decode(errors="replace") if exc.stderr else ""
-                raise RuntimeError(f"Syntax check failed for {src.name}: {stderr.strip()}") from exc
+                run_build_command(cmd, cwd=root, description=f"Syntax check: {src.name}")
+            except RuntimeError as exc:
+                raise RuntimeError(f"Syntax check failed for {src.name}: {exc}") from exc
 
             entries.append(
                 {

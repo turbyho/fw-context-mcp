@@ -14,7 +14,7 @@ import re
 import sqlite3
 from functools import lru_cache
 import time
-from collections import defaultdict
+from collections import defaultdict, OrderedDict
 import threading
 
 log = logging.getLogger(__name__)
@@ -177,7 +177,8 @@ def _token_score(query_tokens: list[str], candidate_tokens: list[str]) -> float:
     return score if matched_any else 0.0
 
 
-_names_cache: dict[str, list[str]] = {}
+_names_cache: OrderedDict[str, list[str]] = OrderedDict()
+_MAX_NAMES_CACHE = 8  # config_hash entries — rarely more than 1 per process
 
 
 def _load_names(conn: sqlite3.Connection, config_hash: str) -> list[str]:
@@ -186,9 +187,10 @@ def _load_names(conn: sqlite3.Connection, config_hash: str) -> list[str]:
     Only loads definition symbols (is_definition=1) of callable kinds to keep
     the set small and relevant — these are what users typically search for.
     Results are cached at module level per *config_hash* to avoid reloading
-    on every uncached query.
+    on every uncached query.  Cache is LRU-bounded at _MAX_NAMES_CACHE entries.
     """
     if config_hash in _names_cache:
+        _names_cache.move_to_end(config_hash)
         return _names_cache[config_hash]
     rows = conn.execute(
         """SELECT DISTINCT name FROM symbols
@@ -200,5 +202,7 @@ def _load_names(conn: sqlite3.Connection, config_hash: str) -> list[str]:
         (config_hash,),
     ).fetchall()
     names = [r["name"] for r in rows]
+    if len(_names_cache) >= _MAX_NAMES_CACHE:
+        _names_cache.popitem(last=False)  # evict oldest (LRU)
     _names_cache[config_hash] = names
     return names
