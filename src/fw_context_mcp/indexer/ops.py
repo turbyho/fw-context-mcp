@@ -554,7 +554,9 @@ def store_symbols_for_unit(
     # Parse (or use caller-supplied pre-parsed data)
     tu = None
     if pre_parsed is not None:
-        if len(pre_parsed) == 6:
+        if len(pre_parsed) == 7:
+            tu, syms, refs, inheritance, indirect_call_sites, fp_assignments, macros = pre_parsed
+        elif len(pre_parsed) == 6:
             syms, refs, inheritance, indirect_call_sites, fp_assignments, macros = pre_parsed
         else:
             syms, refs, inheritance, indirect_call_sites, fp_assignments = pre_parsed
