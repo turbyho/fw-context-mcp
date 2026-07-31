@@ -97,8 +97,13 @@ def upsert_project_registry(
         root_path: Absolute path to the project root directory (last known).
     """
     conn.execute(
-        """INSERT OR REPLACE INTO projects(project_id, name, project_type, root_path, updated_at)
-           VALUES (?, ?, ?, ?, datetime('now'))""",
+        """INSERT INTO projects(project_id, name, project_type, root_path, created_at, updated_at)
+           VALUES (?, ?, ?, ?, datetime('now'), datetime('now'))
+           ON CONFLICT(project_id) DO UPDATE SET
+               name = excluded.name,
+               project_type = excluded.project_type,
+               root_path = excluded.root_path,
+               updated_at = excluded.updated_at""",
         (project_id, name, project_type, root_path),
     )
     conn.commit()

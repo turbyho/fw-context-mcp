@@ -15,6 +15,7 @@ import hashlib
 import os
 from datetime import UTC, datetime
 from pathlib import Path
+import subprocess
 
 __all__ = [
     "MTIME_TOLERANCE_S",
@@ -32,6 +33,48 @@ __all__ = [
 # clock skew between the indexer and the filesystem.
 MTIME_TOLERANCE_S: float = 1.0
 
+
+
+def run_build_command(
+    cmd: list[str],
+    cwd: Path,
+    timeout: float = 600,
+    description: str = "",
+) -> subprocess.CompletedProcess:
+    """Run a build command with consistent timeout and output capture.
+
+    All build-system invocations should use this helper instead of raw
+    ``subprocess.run()`` to ensure consistent timeout and output capture
+    behaviour across the nine builders.
+
+    Args:
+        cmd: Command and arguments as a list (shell=False is enforced).
+        cwd: Working directory.
+        timeout: Maximum time in seconds.
+        description: Human-readable description for error messages.
+
+    Returns:
+        CompletedProcess with captured stdout/stderr.
+
+    Raises:
+        RuntimeError: On non-zero exit or timeout.
+    """
+    try:
+        result = subprocess.run(
+            cmd, cwd=cwd, capture_output=True, text=True, timeout=timeout
+        )
+    except subprocess.TimeoutExpired:
+        raise RuntimeError(
+            f"Build command timed out after {timeout}s: "
+            f"{description or ' '.join(cmd)}"
+        ) from None
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"Build command failed (exit {result.returncode}): "
+            f"{description or ' '.join(cmd)}\n"
+            f"stderr: {result.stderr[:500]}"
+        )
+    return result
 
 def resolve_project_root(explicit: str | None = None) -> Path:
     """Return the project root directory.

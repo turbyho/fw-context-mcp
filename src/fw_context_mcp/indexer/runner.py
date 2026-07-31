@@ -2316,6 +2316,18 @@ def run(
     # _update_manifest_after_index() can do an incremental header update.
     # If they differ (compile_commands.json changed), rebuild the preliminary
     # manifest.  When no manifest exists yet (first index), build one.
+    # Inject user-configured config header when the build system doesn't emit
+    # -include flags (custom builds, legacy Makefiles, etc.).
+    if config_header:
+        ch = project_root / config_header
+        if not ch.exists():
+            raise RuntimeError(
+                f"Configured config_header not found: {ch}\nCheck [index] config_header in .fw-context/config.toml"
+            )
+        ch_abs = ch.resolve()
+        for unit in units:
+            unit.clang_args.extend(("-include", str(ch_abs)))
+
     from .manifest import build_preliminary, compute_structural_hash
     from .manifest import load as load_manifest
 
@@ -2400,18 +2412,6 @@ def run(
                 manifest_verification=initial_manifest_verification,
                 analyze_vendor=int(_analyze_vendor),
             )
-
-    # Inject user-configured config header when the build system doesn't emit
-    # -include flags (custom builds, legacy Makefiles, etc.).
-    if config_header:
-        ch = project_root / config_header
-        if not ch.exists():
-            raise RuntimeError(
-                f"Configured config_header not found: {ch}\nCheck [index] config_header in .fw-context/config.toml"
-            )
-        ch_abs = ch.resolve()
-        for unit in units:
-            unit.clang_args.extend(("-include", str(ch_abs)))
 
     # Validate that all -include/-imacros referenced files exist BEFORE
     # starting any libclang parsing.  A missing build-generated config
