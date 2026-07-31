@@ -4,7 +4,7 @@
 **Výchozí revize:** Hluboká rekurzivní revize celého projektu (bez `experiments/`)
 **Výchozí větev:** `fix/comprehensive-review-fixes`
 **Rozsah:** 17 nálezů (4 kritické + 5 středních + 6 minor + 2 návazné z revize) + 7 refaktoringových návrhů
-**Stav:** 17/17 nálezů + 6/7 refaktoringů (R5 odloženo)
+**Stav:** 17/17 nálezů + 7/7 refaktoringů ✅
 
 ---
 
@@ -64,7 +64,7 @@
 - [x] R1: `_run_postprocess` — data-driven pipeline (12 kroků) ✅ R1
 - [x] R2+R3: `HandlerContext` + `_resolve_handler_context` — `_refs_guard` migrován ✅ R2+R3
 - [x] R4: Konfigurační caching — aktuální implementace je dostatečně čistá (LRU + mtime) ✅ R4
-- [ ] R5: `daemon_main` přepsat na asyncio — odloženo
+- [x] R5: `daemon_main` přepsat na asyncio ✅
 - [x] R6: Sjednocení `except` bloků — `SAFE_EXCEPT` + `is_fatal()` konzistentně použity ✅ R6
 - [x] R7: Extrakce brace matcheru do `mcp/shared/brace_matcher.py` ✅ R7
 

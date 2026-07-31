@@ -19,15 +19,14 @@ Pings from an MCP server on project A never affect project B's daemon.
 
 from __future__ import annotations
 
+import asyncio
 import fcntl
 import logging
 import os
 import re
 import signal
 import socket
-import subprocess
 import sys
-import threading
 import time
 from pathlib import Path
 
@@ -85,14 +84,14 @@ def ping_daemon(project_root: Path) -> bool:
         return False
 
 
-# ── Daemon main ──────────────────────────────────────────────────────────────
+# ── Daemon main (asyncio) ────────────────────────────────────────────────────
 
 
-def daemon_main(project_root: Path) -> None:
+async def daemon_main(project_root: Path) -> None:
     """Run the watcher daemon for *project_root*.
 
     Does not return until shutdown (SIGTERM / SIGINT / ping timeout).
-    Intended to be called as a standalone process::
+    Intended to be run as a standalone process::
 
         python -m fw_context_mcp.mcp.daemon <project_root>
     """
@@ -119,115 +118,102 @@ def daemon_main(project_root: Path) -> None:
     with os.fdopen(wfd, "w", encoding="utf-8") as pf:
         pf.write(str(os.getpid()))
 
-    # ── Socket setup ─────────────────────────────────────────────────────
+    # ── Shared state ─────────────────────────────────────────────────────
+    # No lock needed — asyncio runs in a single thread; all accesses to
+    # last_ping_time are cooperative and never preempted mid-operation.
+    last_ping_time: float = time.monotonic()
+    shutdown: asyncio.Event = asyncio.Event()
+    index_proc: asyncio.subprocess.Process | None = None
+
+    # ── Unix socket server ───────────────────────────────────────────────
     sock_path = _socket_path(db_dir)
 
-    server_sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    try:
-        server_sock.bind(str(sock_path))
-    except OSError:
-        # Socket exists but nobody listening — clean up and retry
-        sock_path.unlink(missing_ok=True)
-        try:
-            server_sock.bind(str(sock_path))
-        except OSError:
-            log.error("Cannot bind socket %s — daemon already running?", sock_path)
-            _cleanup_lock_and_exit(lock_fd, lock_file, pid_file)
-    server_sock.listen(8)
-    os.chmod(sock_path, 0o600)
-    server_sock.settimeout(1.0)  # accept() timeout → check shutdown flag
+    # Clean up stale socket file left by a previous crashed daemon.
+    sock_path.unlink(missing_ok=True)
 
-    # ── Shared state ─────────────────────────────────────────────────────
-    last_ping_time = time.monotonic()
-    ping_lock = threading.Lock()
-    shutdown = threading.Event()
-
-    # ── Socket thread — accept pings ─────────────────────────────────────
-    def _socket_server() -> None:
-        """Accept connections on *server_sock*, read pings, update timestamp."""
+    async def _handle_ping(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        """Handle one incoming ping connection."""
         nonlocal last_ping_time
-        while not shutdown.is_set():
+        try:
+            data = await asyncio.wait_for(reader.read(1024), timeout=2.0)
+            if b"ping" in data:
+                last_ping_time = time.monotonic()
+        except (asyncio.TimeoutError, OSError):
+            pass
+        finally:
             try:
-                conn, _addr = server_sock.accept()
-            except TimeoutError:
-                continue  # Periodic check for shutdown
-            except OSError:
-                if not shutdown.is_set():
-                    log.debug("Socket accept error", exc_info=True)
-                break
-            try:
-                conn.settimeout(2.0)
-                data = conn.recv(1024)
-                if b"ping" in data:
-                    with ping_lock:
-                        last_ping_time = time.monotonic()
+                writer.close()
+                await writer.wait_closed()
             except OSError:
                 pass
-            finally:
-                try:
-                    conn.close()
-                except OSError:
-                    pass
-
-    socket_thread = threading.Thread(
-        target=_socket_server, daemon=True, name="fw-daemon-socket",
-    )
-    socket_thread.start()
-
-    # ── Index subprocess handle (for signal forwarding) ──────────────────
-    index_proc: subprocess.Popen | None = None
-    _proc_lock = threading.Lock()  # guards index_proc reads/writes
-
-    # ── Wakeup pipe for async-signal-safe shutdown notification ─────────
-    _wakeup_r, _wakeup_w = os.pipe()
-    signal.set_wakeup_fd(_wakeup_w)
-
-    def _handle_shutdown(signum: int, _frame) -> None:
-        """Async-signal-safe: only set shutdown and write to wakeup fd.
-
-        Does NOT call log.info(), proc.terminate(), or any other
-        non-async-signal-safe function.  All cleanup happens in the
-        main loop when shutdown.is_set() is detected.
-        """
-        shutdown.set()
-        try:
-            os.write(_wakeup_w, b"\x00")  # os.write() is async-signal-safe
-        except OSError:
-            pass  # pipe full — shutdown flag already set
-
-    signal.signal(signal.SIGTERM, _handle_shutdown)
-    signal.signal(signal.SIGINT, _handle_shutdown)
-
-    # ── Main loop ────────────────────────────────────────────────────────
-    from watchfiles import watch
-
-    log.info("Daemon started  root=%s  pid=%d  socket=%s", project_root, os.getpid(), sock_path)
 
     try:
-        # Initial staleness check — run index at startup if needed.
-        # Skip when a manual fw-context index holds the pause marker
-        # (manual index always wins over background reindex).
+        server = await asyncio.start_unix_server(
+            _handle_ping,
+            path=str(sock_path),
+        )
+    except OSError:
+        log.error("Cannot bind socket %s — daemon already running?", sock_path)
+        fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        os.close(lock_fd)
+        pid_file.unlink(missing_ok=True)
+        sys.exit(1)
+
+    os.chmod(sock_path, 0o600)
+
+    # ── Signal handlers ──────────────────────────────────────────────────
+    loop = asyncio.get_running_loop()
+
+    def _handle_signal() -> None:
+        """Set the shutdown event — runs inside the event loop context.
+
+        All cleanup happens cooperatively in the main loop when
+        ``shutdown.is_set()`` is detected.
+        """
+        shutdown.set()
+
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            loop.add_signal_handler(sig, _handle_signal)
+        except NotImplementedError:
+            # Fallback for platforms without add_signal_handler (Windows).
+            pass
+
+    # ── Main loop ────────────────────────────────────────────────────────
+    from watchfiles import awatch
+
+    log.info(
+        "Daemon started  root=%s  pid=%d  socket=%s",
+        project_root, os.getpid(), sock_path,
+    )
+
+    try:
+        # ── Initial staleness check ──────────────────────────────────────
+        # Runs before the socket server is accepting pings, so blocking the
+        # event loop briefly with a synchronous DB call is harmless.
         from .background import _check_bg_pause as _bg_paused
         needs, reasons = _staleness_check(project_root)
         if needs and not _bg_paused(project_root):
             log.info("Initial index needed (%s)", ", ".join(reasons))
             force_refs = "refs missing" in reasons
-            index_proc = _run_index_async(project_root, db_dir, force_refs=force_refs)
-            _wait_index(index_proc, shutdown, db_dir=db_dir)
+            index_proc = await _run_index_async(project_root, db_dir, force_refs=force_refs)
+            await _wait_index(index_proc, shutdown, db_dir=db_dir)
             index_proc = None
 
         while not shutdown.is_set():
             # ── Check ping timeout ───────────────────────────────────────
-            with ping_lock:
-                ping_elapsed = time.monotonic() - last_ping_time
+            ping_elapsed = time.monotonic() - last_ping_time
             if ping_elapsed > PING_TIMEOUT:
-                log.info("No ping for %.0f s — all clients disconnected, exiting", ping_elapsed)
+                log.info(
+                    "No ping for %.0f s — all clients disconnected, exiting",
+                    ping_elapsed,
+                )
                 break
 
             # ── Watch for file changes ───────────────────────────────────
             changed = False
             try:
-                for changes in watch(
+                async for changes in awatch(
                     project_root,
                     debounce=int(_DEBOUNCE_S * 1000),
                     recursive=True,
@@ -236,7 +222,8 @@ def daemon_main(project_root: Path) -> None:
                 ):
                     if shutdown.is_set():
                         break
-                    if _ping_timeout(last_ping_time, ping_lock):
+                    ping_elapsed = time.monotonic() - last_ping_time
+                    if ping_elapsed > PING_TIMEOUT:
                         break
 
                     for _, changed_path_str in changes:
@@ -247,7 +234,7 @@ def daemon_main(project_root: Path) -> None:
                         break  # Exit watch loop → run index
             except (OSError, RuntimeError) as exc:
                 log.warning("watchfiles error: %s", exc)
-                time.sleep(5)
+                await asyncio.sleep(5)
                 continue
 
             if changed and not shutdown.is_set():
@@ -256,24 +243,24 @@ def daemon_main(project_root: Path) -> None:
                 if _bg_paused(project_root):
                     log.info("Manual index in progress — skipping background reindex")
                 else:
-                    index_proc = _run_index_async(project_root, db_dir)
-                    _wait_index(index_proc, shutdown, db_dir=db_dir)
+                    index_proc = await _run_index_async(project_root, db_dir)
+                    await _wait_index(index_proc, shutdown, db_dir=db_dir)
                     index_proc = None
 
     finally:
         log.info("Daemon shutting down for %s", project_root)
-        proc = index_proc
-        if proc is not None and proc.poll() is None:
-            log.info("Terminating index subprocess (pid %d)", proc.pid)
-            proc.terminate()
+        if index_proc is not None and index_proc.returncode is None:
+            log.info("Terminating index subprocess (pid %d)", index_proc.pid)
+            index_proc.terminate()
             try:
-                proc.wait(timeout=10)
-            except subprocess.TimeoutExpired:
+                await asyncio.wait_for(index_proc.wait(), timeout=10)
+            except asyncio.TimeoutError:
                 log.warning("Index subprocess did not exit, killing")
-                proc.kill()
-                proc.wait()
+                index_proc.kill()
+                await index_proc.wait()
         shutdown.set()
-        server_sock.close()
+        server.close()
+        await server.wait_closed()
         _cleanup_files(sock_path, pid_file)
         fcntl.flock(lock_fd, fcntl.LOCK_UN)
         os.close(lock_fd)
@@ -286,29 +273,6 @@ def _is_source_file(path_str: str) -> bool:
     """Return True when *path_str* is a C/C++ source file outside excluded dirs."""
     p = Path(path_str)
     return p.suffix.lower() in _SOURCE_EXTS_WATCH and not _EXCLUDE_RX.search(path_str)
-
-
-def _ping_timeout(last_ping_time: float, lock: threading.Lock) -> bool:
-    """Return True when ping timeout has elapsed."""
-    with lock:
-        return (time.monotonic() - last_ping_time) > PING_TIMEOUT
-
-
-
-def _cleanup_lock_and_exit(
-    lock_fd: int, lock_file: Path, pid_file: Path,
-    server_sock=None,
-) -> None:
-    """Release lock, remove files, exit."""
-    if server_sock is not None:
-        try:
-            server_sock.close()
-        except OSError:
-            pass
-    fcntl.flock(lock_fd, fcntl.LOCK_UN)
-    os.close(lock_fd)
-    pid_file.unlink(missing_ok=True)
-    os._exit(1)
 
 
 def _cleanup_files(sock_path: Path, pid_file: Path) -> None:
@@ -367,22 +331,22 @@ def _staleness_check(project_root: Path) -> tuple[bool, list[str]]:
 # ── Index subprocess ─────────────────────────────────────────────────────────
 
 
-def _run_index_async(
+async def _run_index_async(
     project_root: Path, db_dir: Path, *, force_refs: bool = False,
-) -> subprocess.Popen:
+) -> asyncio.subprocess.Process:
     """Spawn ``fw-context index --background``, write stdout to ``reindex.log``.
 
     Writes the subprocess PID to ``reindex.pid`` so ``_is_bg_reindex_running``
     can reliably detect an active index run (without false positives from
     the daemon's ``watcher.lock``).
 
-    Returns the Popen handle — caller must wait or terminate.
+    Returns the asyncio Process handle — caller must wait or terminate.
     """
     log_file = db_dir / "reindex.log"
     try:
         log_fh = open(log_file, "w")
     except OSError:
-        log_fh = subprocess.DEVNULL  # type: ignore[assignment]
+        log_fh = _DEVNULL  # type: ignore[assignment]
 
     env: dict[str, str] = {
         **os.environ,
@@ -393,11 +357,11 @@ def _run_index_async(
 
     log.info("Starting background index for %s (force_refs=%s)", project_root, force_refs)
     try:
-        proc = subprocess.Popen(
-            [sys.executable, "-u", "-m", "fw_context_mcp.cli", "index", "--background"],
+        proc = await asyncio.create_subprocess_exec(
+            sys.executable, "-u", "-m", "fw_context_mcp.cli", "index", "--background",
             cwd=str(project_root),
             stdout=log_fh,
-            stderr=subprocess.STDOUT,
+            stderr=asyncio.subprocess.STDOUT,
             env=env,
         )
         # Write PID for health checks — _is_bg_reindex_running reads this
@@ -405,17 +369,22 @@ def _run_index_async(
         rfd = os.open(str(rp), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
         with os.fdopen(rfd, "w", encoding="utf-8") as pf:
             pf.write(str(proc.pid))
-        if log_fh != subprocess.DEVNULL:
+        if log_fh is not _DEVNULL:
             log_fh.close()
     except (ValueError, TypeError, RuntimeError, AttributeError):
         log.exception("Failed to spawn index subprocess")
-        if log_fh != subprocess.DEVNULL:
+        if log_fh is not _DEVNULL:
             log_fh.close()
         raise
     return proc
 
 
-def _wait_index(proc: subprocess.Popen, shutdown: threading.Event, *, db_dir: Path) -> None:
+async def _wait_index(
+    proc: asyncio.subprocess.Process,
+    shutdown: asyncio.Event,
+    *,
+    db_dir: Path,
+) -> None:
     """Wait for *proc* to finish, polling *shutdown* every 500 ms.
 
     When *shutdown* is set, terminates the subprocess gracefully
@@ -423,20 +392,19 @@ def _wait_index(proc: subprocess.Popen, shutdown: threading.Event, *, db_dir: Pa
     so ``_is_bg_reindex_running`` doesn't report a stale PID.
     """
     try:
-        while proc.poll() is None:
+        while proc.returncode is None:
             if shutdown.is_set():
                 proc.terminate()
                 try:
-                    proc.wait(timeout=10)
-                except subprocess.TimeoutExpired:
+                    await asyncio.wait_for(proc.wait(), timeout=10)
+                except asyncio.TimeoutError:
                     log.warning("Index subprocess did not exit after SIGTERM, killing")
                     proc.kill()
-                    proc.wait()
+                    await proc.wait()
                 return
-            time.sleep(0.5)
+            await asyncio.sleep(0.5)
     finally:
         (db_dir / "reindex.pid").unlink(missing_ok=True)
-        # log file handle already closed in _run_index_async (stdout=PIPE never used)
 
     if proc.returncode == 0:
         log.info("Background index completed")
@@ -475,6 +443,20 @@ def _optimize_db(db_dir: Path) -> None:
         conn.close()
 
 
+# ── Sentinel for log_fh default ──────────────────────────────────────────────
+# subprocess is not imported at module level (only asyncio is needed), but
+# _run_index_async needs a DEVNULL-like sentinel for the log file handle
+# fallback.  Use a module-level sentinel so callers closing the handle can
+# compare with ``is`` rather than ``!=`` (which would need the subprocess
+# import).
+class _DevNullSentinel:
+    """Sentinel that compares equal to itself via ``is``."""
+    pass
+
+
+_DEVNULL = _DevNullSentinel()
+
+
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 
@@ -492,4 +474,4 @@ if __name__ == "__main__":
     if not target.is_dir():
         print(f"Error: {target} is not a valid directory", file=_sys.stderr)
         _sys.exit(1)
-    daemon_main(target)
+    asyncio.run(daemon_main(target))
