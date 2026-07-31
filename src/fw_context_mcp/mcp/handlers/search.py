@@ -523,7 +523,7 @@ def search_bodies(
     """
     root = resolve_project_root(project_root)
     limit = min(limit, 100)
-    expanded = _expand_query(query)
+    expanded = _expand_query(query, for_body_search=True)
 
     def _do_search(c: sqlite3.Connection, config_hash: str) -> list[dict]:
         kind_filter = ""

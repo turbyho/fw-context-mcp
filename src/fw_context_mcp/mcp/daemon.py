@@ -73,15 +73,16 @@ def ping_daemon(project_root: Path) -> bool:
     sock_path = _socket_path(db_dir)
     if not sock_path.exists():
         return False
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     try:
-        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         sock.settimeout(2.0)
         sock.connect(str(sock_path))
         sock.sendall(b"ping\n")
-        sock.close()
         return True
     except OSError:
         return False
+    finally:
+        sock.close()
 
 
 # ── Daemon main (asyncio) ────────────────────────────────────────────────────
@@ -192,7 +193,9 @@ async def daemon_main(project_root: Path) -> None:
         # Runs before the socket server is accepting pings, so blocking the
         # event loop briefly with a synchronous DB call is harmless.
         from .background import _check_bg_pause as _bg_paused
-        needs, reasons = _staleness_check(project_root)
+        needs, reasons = await asyncio.get_running_loop().run_in_executor(
+            None, _staleness_check, project_root
+        )
         if needs and not _bg_paused(project_root):
             log.info("Initial index needed (%s)", ", ".join(reasons))
             force_refs = "refs missing" in reasons
@@ -319,7 +322,7 @@ def _staleness_check(project_root: Path) -> tuple[bool, list[str]]:
         # 4. Modified source files — files changed before daemon started.
         #    watchfiles only detects NEW events, so without this check
         #    already-stale files would never be reindexed.
-        modified = _count_modified_files(conn, config_hash, project_root)
+        modified = _count_modified_files(conn, config_hash, project_root, use_cache=True)
         if modified > 0:
             reasons.append(f"{modified} modified files")
     finally:
@@ -365,8 +368,23 @@ async def _run_index_async(
             env=env,
         )
         # Write PID for health checks — _is_bg_reindex_running reads this
+        from .background import _pid_exists
         rp = db_dir / "reindex.pid"
-        rfd = os.open(str(rp), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+        try:
+            rfd = os.open(str(rp), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+        except FileExistsError:
+            # Stale PID file from a previous crashed index subprocess.
+            # Check if the old process is still alive before removing.
+            try:
+                old_pid = int(rp.read_text(encoding="utf-8").strip())
+                if _pid_exists(old_pid):
+                    raise RuntimeError(
+                        f"Another index process (pid {old_pid}) is already running for {project_root}"
+                    ) from None
+            except (OSError, ValueError):
+                pass
+            rp.unlink(missing_ok=True)
+            rfd = os.open(str(rp), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
         with os.fdopen(rfd, "w", encoding="utf-8") as pf:
             pf.write(str(proc.pid))
         if log_fh is not _DEVNULL:
@@ -444,17 +462,8 @@ def _optimize_db(db_dir: Path) -> None:
 
 
 # ── Sentinel for log_fh default ──────────────────────────────────────────────
-# subprocess is not imported at module level (only asyncio is needed), but
-# _run_index_async needs a DEVNULL-like sentinel for the log file handle
-# fallback.  Use a module-level sentinel so callers closing the handle can
-# compare with ``is`` rather than ``!=`` (which would need the subprocess
-# import).
-class _DevNullSentinel:
-    """Sentinel that compares equal to itself via ``is``."""
-    pass
-
-
-_DEVNULL = _DevNullSentinel()
+# ``object()`` suffices — all call sites use ``is`` comparison.
+_DEVNULL = object()
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────

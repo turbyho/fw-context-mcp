@@ -202,8 +202,7 @@ def _symbol_row_to_dict(r, root: Path, **extra) -> dict:
 
 
 def _fmt_symbol_rows(rows: list, root: Path, method: str) -> tuple[list[dict], str]:
-    fallback_used = (method != "fts5+kind")
-    extra = {"_fallback": method} if fallback_used else {}
+    extra = {"_fallback": method} if method != "fts5+kind" else {}
     result = [_symbol_row_to_dict(r, root, **extra) for r in rows]
     return result, method
 

@@ -37,6 +37,31 @@ def _retry_sleep(attempt: int) -> float:
     return _RETRY_BACKOFF ** (attempt + 1)
 
 
+def _get_retry_after(resp, default: float) -> float:
+    """Extract ``Retry-After`` header value, falling back to *default*.
+
+    Respects server-specified delay for 429 Rate Limit responses.
+    Parses both integer-second and HTTP-date formats.
+    """
+    value = resp.headers.get("Retry-After", "")
+    if not value:
+        return default
+    try:
+        return float(value)
+    except ValueError:
+        # HTTP-date format — parse with email.utils
+        try:
+            from email.utils import parsedate_to_datetime
+            dt = parsedate_to_datetime(value)
+            import time as _time_module
+            now = _time_module.time()
+            from calendar import timegm
+            wait = timegm(dt.utctimetuple()) - now
+            return max(0.0, wait)
+        except (ValueError, TypeError, ImportError):
+            return default
+
+
 def get_local_cache_db(readonly: bool = False) -> sqlite3.Connection:
     """Open (or create) the local cross-project LLM analysis cache.
 
@@ -49,7 +74,7 @@ def get_local_cache_db(readonly: bool = False) -> sqlite3.Connection:
     # mode so the file is created and the schema is initialized.
     if readonly and not _LOCAL_CACHE_PATH.exists():
         readonly = False
-    uri = f"file:{_LOCAL_CACHE_PATH}?mode={'ro' if readonly else 'rwc'}"
+    uri = f"file://{_LOCAL_CACHE_PATH}?mode={'ro' if readonly else 'rwc'}"
     conn = sqlite3.connect(uri, uri=True)
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA busy_timeout=5000")
@@ -252,7 +277,7 @@ class CacheClient:
                     return {h: None for h in hashes}
                 # Retryable (429, 5xx) — backoff. Non-retryable 4xx — fail immediately.
                 if attempt < _MAX_RETRIES - 1:
-                    wait = _retry_sleep(attempt)
+                    wait = _get_retry_after(resp, _retry_sleep(attempt))
                     logger.debug("Cache server returned %d (attempt %d/%d), retrying in %.1fs",
                                  resp.status_code, attempt + 1, _MAX_RETRIES, wait)
                     time.sleep(wait)
@@ -324,7 +349,7 @@ class CacheClient:
                     logger.warning("Cache server auth error (%d) on write — token is read-only", resp.status_code)
                     return 0
                 if attempt < _MAX_RETRIES - 1:
-                    wait = _retry_sleep(attempt)
+                    wait = _get_retry_after(resp, _retry_sleep(attempt))
                     logger.debug("Cache server write returned %d (attempt %d/%d), retrying in %.1fs",
                                  resp.status_code, attempt + 1, _MAX_RETRIES, wait)
                     time.sleep(wait)
@@ -364,7 +389,7 @@ class CacheClient:
                     logger.warning("Cache server auth error (%d) on stats — check token", resp.status_code)
                     return None
                 if attempt < _MAX_RETRIES - 1:
-                    wait = _retry_sleep(attempt)
+                    wait = _get_retry_after(resp, _retry_sleep(attempt))
                     time.sleep(wait)
                     continue
             except (httpx.HTTPError, OSError) as e:
@@ -410,7 +435,7 @@ class CacheClient:
                     logger.warning("Cache server auth error (%d) on clear — token is read-only", resp.status_code)
                     return 0
                 if attempt < _MAX_RETRIES - 1:
-                    wait = _retry_sleep(attempt)
+                    wait = _get_retry_after(resp, _retry_sleep(attempt))
                     time.sleep(wait)
                     continue
             except (httpx.HTTPError, OSError) as e:

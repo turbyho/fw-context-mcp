@@ -100,6 +100,7 @@ def check_structural_staleness(
 
 def _stale_files(conn, config_hash: str, file_paths: list[str], root: Path) -> list[str]:
     """Return the subset of *file_paths* whose on-disk mtime is newer than the index."""
+    from concurrent.futures import ThreadPoolExecutor, as_completed
     from ...indexer.manifest import load as load_manifest
     from ...indexer.ops import _normalize_file_path
 
@@ -107,25 +108,46 @@ def _stale_files(conn, config_hash: str, file_paths: list[str], root: Path) -> l
     manifest = load_manifest(db_path.parent)
     build_patterns = manifest.get("build_dir_patterns", []) if manifest else []
 
-    stale = []
+    # Build work items: deduplicate paths, resolve DB keys
+    work_items: list[tuple[str, str, float]] = []  # (abs_path, db_key, stored_mtime)
+    seen: set[str] = set()
     for path in dict.fromkeys(file_paths):
+        if path in seen:
+            continue
+        seen.add(path)
         if _path_matches_patterns(path, build_patterns):
             continue
-        # Normalize the lookup path to match files.path format
-        # (relative for project files, absolute for external files)
         db_key = _normalize_file_path(path, root)
-        try:
-            stored = get_file_mtime_indexed(conn, config_hash, db_key)
-            if not stored:
-                # stored=0.0 (pre-migration) or None (not indexed) — skip
-                continue
-            if os.path.getmtime(path) > stored + MTIME_TOLERANCE_S:
-                stale.append(path)
-        except FileNotFoundError:
-            log.debug("Stale check skipped deleted file: %s", path)
-        except OSError:
-            pass
+        stored = get_file_mtime_indexed(conn, config_hash, db_key)
+        if not stored:
+            continue
+        work_items.append((path, db_key, stored))
+
+    if not work_items:
+        return []
+
+    # Parallel stat() — beneficial for NFS/CIFS where each stat() is high-latency
+    stale: list[str] = []
+    with ThreadPoolExecutor(max_workers=min(8, len(work_items))) as ex:
+        futures = {
+            ex.submit(_check_file_stale, path, stored): path
+            for path, _db_key, stored in work_items
+        }
+        for f in as_completed(futures):
+            try:
+                if f.result():
+                    stale.append(futures[f])
+            except OSError:
+                pass
     return stale
+
+
+def _check_file_stale(path: str, stored_mtime: float) -> bool:
+    """Return True if *path* on-disk mtime is newer than *stored_mtime*."""
+    try:
+        return os.path.getmtime(path) > stored_mtime + MTIME_TOLERANCE_S
+    except (FileNotFoundError, OSError):
+        return False
 
 
 def _count_modified_files(

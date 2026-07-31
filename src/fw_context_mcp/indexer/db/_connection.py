@@ -179,24 +179,15 @@ def open_db(path: Path, *, skip_integrity_check: bool = False, check_same_thread
             _run_data_migrations(conn)
             conn.execute(f"PRAGMA user_version = {CURRENT_SCHEMA_VERSION}")
         except sqlite3.OperationalError as e:
-            if "locked" in str(e).lower():
+            # SQLITE_BUSY (5) = database is locked (another process has a
+            # write lock).  SQLITE_LOCKED (6) = a table within the database
+            # is locked (another process is modifying it right now).
+            if getattr(e, "sqlite_errorcode", 0) in (5, 6):
                 conn.close()
                 import time as _time
                 _time.sleep(1)
-                conn = sqlite3.connect(str(path), check_same_thread=check_same_thread)
-                try:
-                    conn.row_factory = sqlite3.Row
-                    conn.execute("PRAGMA busy_timeout = 10000")
-                    conn.execute("PRAGMA foreign_keys = ON")
-                    conn.execute("PRAGMA journal_mode = WAL")
-                    _configure_connection(conn)
-                    conn.executescript(_SCHEMA)
-                    _ensure_migrated_columns(conn)
-                    _run_data_migrations(conn)
-                    conn.execute(f"PRAGMA user_version = {CURRENT_SCHEMA_VERSION}")
-                except sqlite3.Error:
-                    conn.close()
-                    raise
+                return open_db(path, skip_integrity_check=skip_integrity_check,
+                               check_same_thread=check_same_thread)
             elif "no such column" in str(e):
                 _ensure_migrated_columns(conn)
                 try:

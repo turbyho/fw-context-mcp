@@ -9,6 +9,18 @@ import sqlite3
 
 log = logging.getLogger(__name__)
 
+# Compiled regex patterns — module-level to avoid re-compilation on every call.
+# _RE_UNNAMED strips anonymous struct/enum/union markers from libclang names.
+_RE_UNNAMED = re.compile(r"\(unnamed\s+(struct|enum|union)\s+at\s+[^)]+\)")
+# _RE_CAMEL splits camelCase: "onConnectionComplete" → "on Connection Complete"
+_RE_CAMEL = re.compile(r"([a-z0-9])([A-Z])")
+# _RE_ACRONYM splits ACRONYMWords: "HTTPResponse" → "HTTP Response"
+_RE_ACRONYM = re.compile(r"([A-Z]+)([A-Z][a-z])")
+# _RE_SEPARATOR splits on any non-alphanumeric character (underscores, ::, etc.)
+_RE_SEPARATOR = re.compile(r"[^a-zA-Z0-9]+")
+# _RE_COL_FILTER detects column-filter syntax in FTS5 queries (single colon not part of ::)
+_RE_COL_FILTER = re.compile(r"(?<!:):(?!:)")
+
 
 def split_tokens(name: str, qualified_name: str = "") -> str:
     """Normalize camelCase/snake_case names to space-separated lowercase tokens.
@@ -39,10 +51,10 @@ def split_tokens(name: str, qualified_name: str = "") -> str:
             s = s[:_MAX_NAME_LEN]
         # Strip anonymous struct/enum/union markers — these inject noise tokens
         # like "mbed", "include", "enum" that match thousands of irrelevant symbols.
-        s = re.sub(r"\(unnamed\s+(struct|enum|union)\s+at\s+[^)]+\)", "", s)
-        s = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", s)  # camelCase split
-        s = re.sub(r"([A-Z]+)([A-Z][a-z])", r"\1 \2", s)  # HTTPResponse → HTTP Response
-        parts = re.split(r"[^a-zA-Z0-9]+", s)  # split on non-alnum
+        s = _RE_UNNAMED.sub("", s)
+        s = _RE_CAMEL.sub(r"\1 \2", s)  # camelCase split
+        s = _RE_ACRONYM.sub(r"\1 \2", s)  # HTTPResponse → HTTP Response
+        parts = _RE_SEPARATOR.split(s)  # split on non-alnum
         return [p.lower() for p in parts if len(p) > 1 and p.lower() not in _NOISE_WORDS]
 
     tokens: list[str] = []
@@ -208,19 +220,26 @@ def find_macro_refs(
         return []
 
 
-def _expand_query(query: str) -> str:
+def _expand_query(query: str, *, for_body_search: bool = False) -> str:
     """Add trailing wildcard to each bare word for broader prefix matching.
 
     Leaves existing wildcards (*) and FTS5 syntax (NEAR, ", parentheses,
     column filters with ``name_tokens : term*``) intact.  Single colons in
     column-filter syntax are detected via regex; C++ ``::`` passes through
     so its tokens get wildcard expansion.
+
+    When *for_body_search* is True, the query is returned as-is — body
+    search patterns like ``.attach(`` should not be wildcard-expanded.
     """
+    if for_body_search:
+        return query
+
+    # Tokens that already are FTS5 syntax — don't touch them.
     # Tokens that already are FTS5 syntax — don't touch them.
     # Single colon (not part of ::) covers column-filter expressions like
     # "name_tokens : term*" which would be corrupted by wildcard appending.
     _bare_syntax = ('"', "NEAR", "AND", "OR", "(", ")")
-    _has_col_filter = re.search(r"(?<!:):(?!:)", query)
+    _has_col_filter = _RE_COL_FILTER.search(query)
     if any(c in query for c in _bare_syntax) or _has_col_filter:
         return query
 
