@@ -337,8 +337,6 @@ async def call_ollama_async(
         call_ollama, prompt, cfg, temperature=temperature, num_predict=num_predict
     )
 
-from ._diag import check_setup
-
 
 class OllamaError(RuntimeError):
     """Base exception for Ollama API and network failures."""
@@ -356,3 +354,6 @@ class OllamaModelNotFoundError(OllamaError):
             f"Model '{model}' not found in Ollama at {url}. "
             f"Run: ollama pull {model}"
         )
+
+from ._diag import check_setup
+

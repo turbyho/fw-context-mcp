@@ -92,20 +92,3 @@ def check_setup(cfg: LLMConfig) -> dict:
     return result
 
 
-class OllamaError(RuntimeError):
-    """Base exception for Ollama API and network failures."""
-
-
-class OllamaModelNotFoundError(OllamaError):
-    """Raised when the requested model is not installed in Ollama.
-
-    The error message includes the exact ``ollama pull`` command to run.
-    """
-
-    def __init__(self, model: str, url: str) -> None:
-        self.model = model
-        super().__init__(
-            f"Model '{model}' not found in Ollama at {url}. "
-            f"Run: ollama pull {model}"
-        )
-
