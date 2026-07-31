@@ -42,7 +42,7 @@ class BuildSystemRegistry:
                 if builder_cls.detect(root):
                     log.debug("Detected build system: %s", key)
                     return key
-            except Exception:
+            except (ValueError, TypeError, RuntimeError, AttributeError):
                 log.debug("Builder %s raised during detection", key, exc_info=True)
                 continue
         return None
