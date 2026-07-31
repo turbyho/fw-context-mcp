@@ -119,6 +119,30 @@ def _build_smart_search() -> PipelineConfig:
     )
 
 
+# Semantic search pipeline — built lazily because threshold & overfetch
+# depend on the caller's parameters.
+
+
+def _build_semantic_search(threshold: float, overfetch: int) -> PipelineConfig:
+    """Lazy-built SEMANTIC_SEARCH config.
+
+    Standalone embedding with source boosting for project-code ranking.
+    """
+    from fw_context_mcp.search.phases.embedding import EmbeddingPhase
+
+    return PipelineConfig(
+        phases=[
+            EmbeddingPhase(
+                independent=True,
+                threshold=threshold,
+                overfetch=overfetch,
+                source_boost=True,
+            ),
+            "format",
+        ],
+    )
+
+
 # ── Runner ──────────────────────────────────────────────────────────────────
 
 

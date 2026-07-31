@@ -56,10 +56,12 @@ class EmbeddingPhase(Phase):
         independent: bool = False,
         threshold: float = 0.5,
         overfetch: int = 30,
+        source_boost: bool = False,
     ):
         self.independent = independent
         self.threshold = threshold
         self.overfetch = overfetch
+        self.source_boost = source_boost
 
     def should_run(self, ctx) -> bool:
         """Only run when LLM is enabled and no Ollama warning occurred earlier."""
@@ -131,7 +133,7 @@ class EmbeddingPhase(Phase):
                     if vec_rows:
                         distance_map = {r["symbol_id"]: r.get("distance", 0.0) for r in vec_rows}
                         sym_ids = list(distance_map.keys())
-                        placeholders = ",".join("?" * len(sym_ids))  # SAFE: values in params, not f-string
+                        placeholders = ",".join("?" * len(sym_ids))
                         emb_rows = conn.execute(
                             f"""SELECT * FROM symbols
                                 WHERE config_hash = ? AND id IN ({placeholders})
@@ -144,6 +146,19 @@ class EmbeddingPhase(Phase):
                             dist = distance_map.get(d.get("id", -1), 0.0)
                             d["_similarity"] = round(float(1.0 - dist), 4)
                             results.append(d)
+                        if self.source_boost:
+                            sym_proj: dict[int, int] = {r["id"]: r.get("is_project", 0) for r in emb_rows}
+                            scored: list[tuple[float, int, float, dict]] = []
+                            for d in results:
+                                sid = d.get("id", -1)
+                                if sid not in sym_proj:
+                                    continue
+                                raw_sim = d["_similarity"]
+                                boost = 1.2 if sym_proj[sid] == 1 else 0.85
+                                d["_similarity"] = round(raw_sim * boost, 4)
+                                scored.append((d["_similarity"], sid, raw_sim, d))
+                            scored.sort(key=lambda x: -x[0])
+                            results = [d for _, _, _, d in scored[:ctx.limit]]
                         return ctx.evolve(embedding_results=results)
 
                 # ---- Brute-force fallback (legacy BLOB table) ----
