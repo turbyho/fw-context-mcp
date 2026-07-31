@@ -143,17 +143,15 @@ def _ensure_daemon_running(root: Path) -> None:
         os.close(lock_fd)
         return
 
-    # Spawn the daemon.  It acquires its own watcher.lock on startup.
-    # Release our lock before spawning so the daemon can take it.
-    # NOTE: There is a narrow race window between unlock and spawn where
-    # another MCP server could also spawn a daemon.  The daemon's own
-    # fcntl lock guards against duplicate processes — the second spawn
-    # will fail at its own lock acquisition and exit.
-    fcntl.flock(lock_fd, fcntl.LOCK_UN)
-    os.close(lock_fd)
-
+    # Spawn the daemon BEFORE releasing the lock.  The daemon blocks on
+    # its own watcher.lock acquisition (LOCK_EX without LOCK_NB) until we
+    # release the lock, then acquires it immediately — no race window
+    # where another MCP server could also try to spawn a daemon.
     log.info("Spawning watcher daemon for %s", root)
     _spawn_daemon(root)
+
+    fcntl.flock(lock_fd, fcntl.LOCK_UN)
+    os.close(lock_fd)
 
 # ── _request_bg_reindex_pause (was at server.py:414) ──
 def _request_bg_reindex_pause(root: Path) -> None:
