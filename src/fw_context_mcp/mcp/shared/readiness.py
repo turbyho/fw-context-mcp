@@ -110,18 +110,22 @@ def _resolve_context(project_root: Path | None, *, skip_ready_check: bool = Fals
     return db_path, cfg, cfg.project.id, root
 
 
-def _is_stale(cfg, compile_commands_path: Path) -> bool:
+def _is_stale(cfg, compile_commands_path: Path) -> tuple[bool, str | None]:
     """Check if compile_commands.json is newer than the index timestamp.
 
     *cfg* is a ``sqlite3.Row`` from ``get_active_config()`` or a dict
     with ``created_at`` and ``compile_commands_path`` keys.
+
+    Returns ``(is_stale, reason)`` — *reason* is one of
+    ``"compile_commands_missing"``, ``"compile_commands_newer"``, or
+    ``None`` when the file is present and up to date.
     """
     try:
         from fw_context_mcp.utils import is_compile_commands_stale
         created_at = cfg.get("created_at") if hasattr(cfg, "get") else cfg["created_at"]
         return is_compile_commands_stale(created_at, compile_commands_path)
     except (KeyError, Exception):
-        return False
+        return False, None
 
 
 def _detect_build_system(root: Path) -> str:

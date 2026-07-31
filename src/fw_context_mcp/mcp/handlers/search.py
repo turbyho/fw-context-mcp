@@ -229,7 +229,7 @@ async def smart_search(
         try:
             with conn:
                 cfg_data = get_active_config(conn, derive_project_id(ctx.project_root))
-                if cfg_data and _is_stale(cfg_data, cfg_data["compile_commands_path"]):
+                if cfg_data and _is_stale(cfg_data, cfg_data["compile_commands_path"])[0]:
                     results.append({
                         "warning": "Index may be stale — compile_commands.json changed since last index.",
                         "hint": "Call reindex_file() on modified files or run 'fw-context index' to update.",

@@ -185,25 +185,33 @@ def is_compile_commands_stale(
     created_at: str,
     compile_commands_path: str | Path,
     tolerance_s: float = MTIME_TOLERANCE_S,
-) -> bool:
+) -> tuple[bool, str | None]:
     """Check if compile_commands.json is newer than *created_at* timestamp.
 
-    Returns False on any error (missing file, bad timestamp, OSError)
-    so staleness checks don't block queries or CLI output.
+    Returns ``(is_stale, reason)`` where *reason* is ``None`` when the
+    compile_commands file is present and up to date, or a string like
+    ``"compile_commands_missing"`` or ``"compile_commands_newer"`` when
+    the index should be considered stale.
+
+    A missing ``compile_commands.json`` returns ``(True,
+    "compile_commands_missing")`` — the index IS stale when its source
+    of truth has disappeared.
     """
     try:
         cc_path = Path(compile_commands_path)
         if not cc_path.exists():
-            return False
+            return True, "compile_commands_missing"
         cc_mtime = os.path.getmtime(cc_path)
         dt = datetime.fromisoformat(created_at)
         if dt.tzinfo is None:
             dt = dt.replace(tzinfo=UTC)
         indexed_at = dt
-        return cc_mtime > indexed_at.timestamp() + tolerance_s
+        if cc_mtime > indexed_at.timestamp() + tolerance_s:
+            return True, "compile_commands_newer"
+        return False, None
     except (FileNotFoundError, KeyError, ValueError, OSError) as e:
         log.warning("is_compile_commands_stale failed for %s: %s", compile_commands_path, e)
-        return False
+        return True, f"stale_check_error: {e}"
 
 
 def truncate_path_middle(path: str, max_len: int) -> str:

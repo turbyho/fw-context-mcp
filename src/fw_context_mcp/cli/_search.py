@@ -181,4 +181,5 @@ def _cli_is_stale(row) -> bool:
     cc = row.get("compile_commands_path", "")
     if not cc:
         return False
-    return is_compile_commands_stale(row["created_at"], cc)
+    stale, _ = is_compile_commands_stale(row["created_at"], cc)
+    return stale

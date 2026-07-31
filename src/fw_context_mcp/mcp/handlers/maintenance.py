@@ -215,7 +215,7 @@ def get_active_build(
                     query, (config_hash, *exclude_like)
                 ).fetchone()[0]
 
-            cc_changed = _is_stale(cfg, cfg["compile_commands_path"])
+            cc_changed, stale_reason = _is_stale(cfg, cfg["compile_commands_path"])
             schema_old = db_schema_ver < CURRENT_SCHEMA_VERSION
             needs_reindex = cc_changed or schema_old
 
@@ -224,7 +224,7 @@ def get_active_build(
             if schema_old:
                 reindex_reasons.append(f"schema_mismatch: {db_schema_ver} < {CURRENT_SCHEMA_VERSION}")
             if cc_changed:
-                reindex_reasons.append("compile_commands_changed")
+                reindex_reasons.append(stale_reason or "compile_commands_changed")
 
             # Determine status
             if needs_reindex:
@@ -404,7 +404,7 @@ def list_projects(
                     _is_stale(
                         {"created_at": r["created_at"]},
                         r["compile_commands_path"],
-                    )
+                    )[0]
                     if r["compile_commands_path"]
                     else False
                 )
