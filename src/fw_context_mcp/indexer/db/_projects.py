@@ -135,10 +135,12 @@ def get_all_projects(conn: sqlite3.Connection) -> list[sqlite3.Row]:
                   COUNT(DISTINCT f.id) AS file_count
            FROM projects p
            LEFT JOIN build_configs b ON b.project_id = p.project_id
-               AND b.created_at = (
-                   SELECT MAX(created_at) FROM build_configs
+               AND b.rowid = (
+                   SELECT rowid FROM build_configs
                    WHERE project_id = p.project_id
                      AND (manifest_verification IS NULL OR manifest_verification != 'indexing')
+                   ORDER BY created_at DESC, rowid DESC
+                   LIMIT 1
                )
            LEFT JOIN symbols s ON s.config_hash = b.config_hash
            LEFT JOIN files f ON f.config_hash = b.config_hash
