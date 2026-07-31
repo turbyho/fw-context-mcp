@@ -37,6 +37,12 @@ def _build_registry() -> dict[str, Phase]:
         from fw_context_mcp.search.phases.llm_query import LLMQueryPhase
         from fw_context_mcp.search.phases.refine import RefinePhase
         from fw_context_mcp.search.phases.rough_search import RoughSearchPhase
+        from fw_context_mcp.search.phases.search_fallbacks import (
+            DocstringFallbackPhase,
+            IndividualTermsFallbackPhase,
+            MacrosFtsFallbackPhase,
+            NameTokensFallbackPhase,
+        )
         from fw_context_mcp.search.phases.translate import TranslatePhase
 
         for cls in [
@@ -50,6 +56,10 @@ def _build_registry() -> dict[str, Phase]:
             DeduplicatePhase,
             ExpandContextPhase,
             FormatPhase,
+            NameTokensFallbackPhase,
+            DocstringFallbackPhase,
+            IndividualTermsFallbackPhase,
+            MacrosFtsFallbackPhase,
         ]:
             instance = cls()  # type: ignore[abstract]
             _REGISTRY[instance.name] = instance
@@ -76,7 +86,16 @@ class PipelineConfig:
 
 # Predefined pipelines
 SEARCH_CODE = PipelineConfig(
-    phases=["rough_search", "fts5_search", "deduplicate", "format"],
+    phases=[
+        "rough_search",
+        "fts5_search",
+        "name_tokens_fallback",
+        "docstring_fallback",
+        "individual_terms_fallback",
+        "macros_fts_fallback",
+        "deduplicate",
+        "format",
+    ],
 )
 
 
