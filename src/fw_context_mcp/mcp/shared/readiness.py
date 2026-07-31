@@ -10,6 +10,7 @@ which re-exports everything from this module.
 from __future__ import annotations
 
 import logging
+import sqlite3
 import threading
 from pathlib import Path
 

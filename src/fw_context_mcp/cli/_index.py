@@ -210,7 +210,7 @@ def _post_index_optimize(
         _opt_conn = _sqlite3.connect(str(db_path))
         _opt_conn.execute("PRAGMA optimize")
         _opt_conn.close()
-    except sqlite3.Error:
+    except _sqlite3.Error:
         log.debug("PRAGMA optimize failed for %s", db_path, exc_info=True)
 
     from ..config.global_db import open_global_db, upsert_project_registry
