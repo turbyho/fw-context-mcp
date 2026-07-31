@@ -9,8 +9,8 @@ from typing import Annotated
 from pydantic import Field
 
 from ...utils import abs_path
-from ..shared.context import _resolve_context
-from ..shared.stale import _with_stale_recovery
+from ..shared.context import _resolve_handler_context
+from ..shared.stale import _stale_files
 
 log = logging.getLogger(__name__)
 
@@ -75,9 +75,11 @@ def find_variables(
         return [{"error": f"Invalid kind: {kind!r}. Expected 'varglobal', 'varlocal', or None."}]
     limit = min(limit, 100)
 
-    db_path, cfg, project_id, root = _resolve_context(project_root)
-    if not db_path.exists():
-        return [{"error": f"No index found for {root}. Run 'fw-context index' first."}]
+    ctx, err = _resolve_handler_context(project_root)
+    if err:
+        return err
+
+    root = ctx.root
 
     def _do_find(c: sqlite3.Connection, config_hash: str) -> list[dict]:
         if kind:
@@ -183,4 +185,19 @@ def find_variables(
 
         return results
 
-    return _with_stale_recovery(root, db_path, _do_find)
+    try:
+        with ctx.conn:
+            results = _do_find(ctx.conn, ctx.config_hash)
+            file_paths = [abs_path(ctx.root, r["file"]) for r in results if "file" in r]
+            if file_paths:
+                stale = _stale_files(ctx.conn, ctx.config_hash, file_paths, ctx.root)
+                if stale:
+                    from fw_context_mcp.mcp.background import _ensure_daemon_running
+                    _ensure_daemon_running(ctx.root)
+                    return [{"warning": (
+                        f"Results may be stale — {len(stale)} file(s) changed. "
+                        "Background reindex in progress. Run 'fw-context index' to force full update."
+                    )}] + results
+            return results
+    finally:
+        pass  # connection managed by connection.py cache
