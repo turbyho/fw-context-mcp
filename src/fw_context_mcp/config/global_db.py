@@ -69,7 +69,7 @@ def open_global_db() -> sqlite3.Connection:
             db_path = _global_db_path()
             db_path.parent.mkdir(parents=True, exist_ok=True)
 
-            _global_conn = sqlite3.connect(str(db_path))
+            _global_conn = sqlite3.connect(str(db_path), check_same_thread=False)
             _global_conn.row_factory = sqlite3.Row
             _global_conn.execute("PRAGMA journal_mode=WAL")
             _global_conn.execute("PRAGMA foreign_keys=ON")

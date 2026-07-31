@@ -662,6 +662,9 @@ def _run_data_migrations(conn: sqlite3.Connection) -> None:
                 conn.execute(
                     "ALTER TABLE embeddings_v2 RENAME TO embeddings"
                 )
+                conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_embeddings_symbol ON embeddings(symbol_id)"
+                )
                 conn.commit()
             except sqlite3.Error:
                 conn.execute("ROLLBACK")
