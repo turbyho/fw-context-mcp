@@ -135,3 +135,48 @@ class TestDisagreementMiningEmpty:
         assert isinstance(result, finetune.MiningResult)
         assert result.triples == []
         assert result.disagreements_found == 0
+
+
+class TestTrainStepTypeCheck:
+    """Regression for F4 — train_step rejects non-ST embedders."""
+
+    def test_rejects_ollama_embedder(self, tmp_path: Path) -> None:
+        """train_step with OllamaEmbedder must return None."""
+        from fw_context_mcp.config.settings import LLMConfig
+        from fw_context_mcp.llm.embedder import Embedder
+        from fw_context_mcp.indexer.finetune import train_step
+
+        cfg = LLMConfig(embed_model="mxbai-embed-large:latest")
+        from fw_context_mcp.llm.ollama import OllamaEmbedder
+        ollama = OllamaEmbedder(cfg)
+
+        result = train_step(
+            triples=[{"query": "test", "positive_id": 1, "negative_id": 2}],
+            db_path=tmp_path / "test.db",
+            embedder=ollama,
+            out_dir=tmp_path / "out",
+        )
+        assert result is None  # rejected
+
+    def test_rejects_unknown_embedder(self, tmp_path: Path) -> None:
+        from fw_context_mcp.llm.embedder import Embedder
+        from fw_context_mcp.indexer.finetune import train_step
+
+        class PlainEmbedder(Embedder):
+            def embed_documents(self, texts): return [[0.0]]
+            def embed_queries(self, texts): return [[0.0]]
+            @property
+            def name(self): return "plain"
+            @property
+            def dim(self): return 1
+            @property
+            def max_tokens(self): return 512
+
+        plain = PlainEmbedder()
+        result = train_step(
+            triples=[{"query": "test", "positive_id": 1, "negative_id": 2}],
+            db_path=tmp_path / "test.db",
+            embedder=plain,
+            out_dir=tmp_path / "out",
+        )
+        assert result is None  # rejected — not an ST embedder

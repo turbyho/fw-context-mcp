@@ -1,12 +1,12 @@
-"""Edge case tests for shared utilities — resolve_project_root, abs_path."""
+"""Edge case tests for shared utilities — resolve_project_root, abs_path, and new utils."""
 
 from __future__ import annotations
 
 import os
+from datetime import UTC, datetime
 from pathlib import Path
 
 from fw_context_mcp.utils import MTIME_TOLERANCE_S, abs_path, resolve_project_root
-
 
 class TestResolveProjectRoot:
     def test_explicit_path_returns_resolved(self, tmp_path: Path):
@@ -127,3 +127,95 @@ class TestMtimeTolerance:
     def test_tolerance_is_reasonable(self):
         # Tolerance should be between 0.1 and 10 seconds
         assert 0.1 <= MTIME_TOLERANCE_S <= 10.0
+
+
+class TestIsCompileCommandsStale:
+    """Tests for is_compile_commands_stale — moved from cli.py."""
+
+    def test_cc_newer_than_index(self, tmp_path: Path) -> None:
+        from fw_context_mcp.utils import is_compile_commands_stale
+
+        cc = tmp_path / "compile_commands.json"
+        cc.write_text("[]")
+        past = datetime.now(UTC).timestamp() - 3600
+        created_at = datetime.fromtimestamp(past, tz=UTC).isoformat()
+        assert is_compile_commands_stale(created_at, str(cc)) is True
+
+    def test_index_newer_than_cc(self, tmp_path: Path) -> None:
+        from fw_context_mcp.utils import is_compile_commands_stale
+
+        cc = tmp_path / "compile_commands.json"
+        cc.write_text("[]")
+        future = datetime.now(UTC).timestamp() + 3600
+        created_at = datetime.fromtimestamp(future, tz=UTC).isoformat()
+        assert is_compile_commands_stale(created_at, str(cc)) is False
+
+    def test_missing_file_returns_false(self, tmp_path: Path) -> None:
+        from fw_context_mcp.utils import is_compile_commands_stale
+
+        created_at = datetime.now(UTC).isoformat()
+        assert is_compile_commands_stale(created_at, str(tmp_path / "nope.json")) is False
+
+    def test_bad_timestamp_returns_false(self) -> None:
+        from fw_context_mcp.utils import is_compile_commands_stale
+
+        assert is_compile_commands_stale("not-a-date", "/some/file") is False
+
+    def test_empty_timestamp_returns_false(self) -> None:
+        from fw_context_mcp.utils import is_compile_commands_stale
+
+        assert is_compile_commands_stale("", "/some/file") is False
+
+
+class TestTruncatePathMiddle:
+    """Tests for truncate_path_middle."""
+
+    def test_short_path_unchanged(self) -> None:
+        from fw_context_mcp.utils import truncate_path_middle
+
+        assert truncate_path_middle("/short/path", 50) == "/short/path"
+
+    def test_long_path_truncated(self) -> None:
+        from fw_context_mcp.utils import truncate_path_middle
+
+        path = "/home/user/very/long/path/to/some/project/src/main.cpp"
+        result = truncate_path_middle(path, 40)
+        assert len(result) <= 40
+        assert "…" in result
+        assert result.startswith("/home/user/")
+
+    def test_exact_length_not_truncated(self) -> None:
+        from fw_context_mcp.utils import truncate_path_middle
+
+        path = "/exactly/twenty/chars"
+        result = truncate_path_middle(path, len(path))
+        assert result == path
+
+
+class TestFmtCount:
+    """Tests for fmt_count."""
+
+    def test_zero(self) -> None:
+        from fw_context_mcp.utils import fmt_count
+
+        assert fmt_count(0) == "0"
+
+    def test_hundreds(self) -> None:
+        from fw_context_mcp.utils import fmt_count
+
+        assert fmt_count(123) == "123"
+
+    def test_thousands(self) -> None:
+        from fw_context_mcp.utils import fmt_count
+
+        assert fmt_count(1234) == "1 234"
+
+    def test_millions(self) -> None:
+        from fw_context_mcp.utils import fmt_count
+
+        assert fmt_count(1_234_567) == "1 234 567"
+
+    def test_negative_thousands(self) -> None:
+        from fw_context_mcp.utils import fmt_count
+
+        assert fmt_count(-1234) == "-1 234"

@@ -4,6 +4,11 @@ Requires libclang and a C compiler (gcc). Uses a real C project fixture
 indexed via the CLI, then reads the DB and compares against source files.
 
 Fixtures are class-scoped to avoid repeated indexing.
+
+NOTE: Tests use ``~/.fw-context/index/<project_id>/index.db`` (global
+index directory from ``IndexConfig.db_dir``).  The index is NOT stored
+in the project's local ``.fw-context/`` directory.  ``readiness.py`` cache
+is per-project (keyed by root path) — multiple test projects coexist safely.
 """
 
 from __future__ import annotations

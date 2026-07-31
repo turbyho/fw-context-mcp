@@ -7,13 +7,13 @@ from fw_context_mcp.search.did_you_mean import _token_score, _tokenize, suggest
 
 class TestTokenize:
     def test_snake_case(self):
-        assert _tokenize("modem_init") == ["modem", "init"]
+        assert _tokenize("modem_init") == ("modem", "init")
 
     def test_camel_case(self):
-        assert _tokenize("modemInit") == ["modem", "init"]
+        assert _tokenize("modemInit") == ("modem", "init")
 
     def test_pascal_case(self):
-        assert _tokenize("ModemManager") == ["modem", "manager"]
+        assert _tokenize("ModemManager") == ("modem", "manager")
 
     def test_mixed_snake_camel(self):
         tokens = _tokenize("nrfxUarte_Init")
@@ -28,19 +28,19 @@ class TestTokenize:
         assert "config" in tokens
 
     def test_empty_string(self):
-        assert _tokenize("") == []
+        assert _tokenize("") == ()
 
     def test_underscore_only(self):
-        assert _tokenize("___") == []
+        assert _tokenize("___") == ()
 
     def test_double_underscore(self):
-        assert _tokenize("a__b") == ["a", "b"]
+        assert _tokenize("a__b") == ("a", "b")
 
     def test_leading_underscore(self):
-        assert _tokenize("_private") == ["private"]
+        assert _tokenize("_private") == ("private",)
 
     def test_trailing_underscore(self):
-        assert _tokenize("value_") == ["value"]
+        assert _tokenize("value_") == ("value",)
 
     def test_all_caps_acronym(self):
         tokens = _tokenize("UARTInit")
