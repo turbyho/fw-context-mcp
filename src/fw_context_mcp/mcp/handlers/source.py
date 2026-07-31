@@ -40,7 +40,17 @@ def _validate_path_in_root(resolved_path: str, root: Path) -> str | None:
 _SOURCE_TRUNCATE_CHARS = 8000   # max chars for get_source / get_symbol_context body
 _EXPLAIN_SNIPPET_CHARS = 4000   # max chars for explain_symbol source snippet
 _CONTEXT_LINES_MAX = 200        # max context_lines parameter for explain_symbol
-_MAX_SYMBOL_BODY_LINES = 1000   # hard cap on _read_symbol_body to prevent runaway reads
+_MAX_SYMBOL_BODY_LINES = 1000   # fallback cap on _read_symbol_body; config overrides via IndexConfig.max_symbol_body_lines
+
+
+def _get_max_body_lines() -> int:
+    """Return the max body line cap from config, falling back to _MAX_SYMBOL_BODY_LINES."""
+    try:
+        from fw_context_mcp import config
+        cfg = config.load()
+        return cfg.index.max_symbol_body_lines
+    except (ValueError, TypeError, RuntimeError, OSError):
+        return _MAX_SYMBOL_BODY_LINES
 
 # ── moved from server.py ──
 def _lookup_definition(
@@ -149,7 +159,7 @@ def _read_symbol_body(file_path: str, line_no: int, end_line: int = 0, max_lines
         start_idx = max(0, line_no - 1)
         read_start = max(0, start_idx - 5)  # small margin for brace matching
         read_end = end_line + 5 if end_line else start_idx + max_lines + 5
-        read_end = min(read_end, start_idx + _MAX_SYMBOL_BODY_LINES)
+        read_end = min(read_end, start_idx + _get_max_body_lines())
         from itertools import islice
 
         with p.open(errors="replace") as fh:

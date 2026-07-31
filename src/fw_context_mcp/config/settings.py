@@ -338,6 +338,7 @@ class IndexConfig:
     index_embeddings: bool = True
     rerank_top_k: int = 50
     min_dense_count: int = 3
+    max_symbol_body_lines: int = 1000
 
 
 @dataclass
@@ -563,6 +564,7 @@ _INDEX_FIELDS: list[tuple[str, str, str]] = [
     ("index_embeddings", "index_embeddings", "bool"),
     ("rerank_top_k", "rerank_top_k", "int(50)"),
     ("min_dense_count", "min_dense_count", "int(3)"),
+    ("max_symbol_body_lines", "max_symbol_body_lines", "int(1000)"),
 ]
 
 _LLM_FIELDS: list[tuple[str, str, str]] = [
