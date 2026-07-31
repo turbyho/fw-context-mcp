@@ -160,7 +160,7 @@ def validate_and_fix(
     try:
         builder_issues = build_system.validate_artifacts(compile_commands, root)
         issues.extend(builder_issues)
-    except Exception as exc:
+    except (RuntimeError, OSError, ValueError) as exc:
         log.warning("Builder validation raised: %s", exc)
 
     if not issues:

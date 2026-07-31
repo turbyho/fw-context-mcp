@@ -39,7 +39,7 @@ def _with_search_context(root: Path, tool_name: str, do_search) -> list[dict]:
         if not db_path.exists():
             return [{"error": f"No index found for {root}. Run 'fw-context index' first."}]
         return _with_stale_recovery(root, db_path, do_search)
-    except Exception as e:
+    except (sqlite3.Error, OSError, RuntimeError) as e:
         log.exception("%s failed: %s", tool_name, e)
         return [{"error": f"{tool_name} failed: {e}"}]
 
@@ -205,7 +205,7 @@ async def smart_search(
         from fw_context_mcp.config.settings import load as load_settings
         cfg = load_settings()
         timeout = cfg.llm.timeout if cfg and cfg.llm else 120.0
-    except Exception:
+    except (OSError, ValueError):
         timeout = 120.0
 
     try:
@@ -314,7 +314,7 @@ async def semantic_search(
 
         try:
             setup = check_setup(cfg.llm)
-        except Exception:
+        except (RuntimeError, OSError):
             setup = {"ollama_running": False}
 
         if not setup.get("ollama_running"):
@@ -332,7 +332,7 @@ async def semantic_search(
                 embedder.embed_queries, [query]
             )
             query_vec = query_embs[0]
-        except Exception as e:
+        except (RuntimeError, OSError, ValueError) as e:
             log.warning("semantic_search: Ollama embed failed: %s", e)
             return _fallback_to_search_code(
                 root, db_path, query, limit,
@@ -432,14 +432,14 @@ async def semantic_search(
                             query, results,
                             min(cfg.index.rerank_top_k, len(results)),
                         )
-                except Exception as e:
+                except (RuntimeError, ValueError) as e:
                     log.warning("Reranker failed, returning unranked results: %s", e)
 
             return results
 
         return await asyncio.to_thread(_with_stale_recovery, root, db_path, _do_semantic)
 
-    except Exception as e:
+    except (sqlite3.Error, OSError, RuntimeError) as e:
         log.exception("semantic_search failed: %s", e)
         return [{"error": f"semantic_search failed: {e}"}]
 

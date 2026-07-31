@@ -652,7 +652,7 @@ def _run_data_migrations(conn: sqlite3.Connection) -> None:
             conn.execute("SAVEPOINT data_migration")
 
         conn.execute("RELEASE data_migration")
-    except Exception:
+    except sqlite3.Error:
         try:
             conn.execute("ROLLBACK TO data_migration")
         except sqlite3.OperationalError:
@@ -702,7 +702,7 @@ def _run_data_migrations(conn: sqlite3.Connection) -> None:
                     "ALTER TABLE embeddings_v2 RENAME TO embeddings"
                 )
                 conn.commit()
-            except Exception:
+            except sqlite3.Error:
                 conn.execute("ROLLBACK")
                 raise
 

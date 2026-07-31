@@ -428,7 +428,7 @@ def list_projects(
                         "db": str(db_path),
                     }
                 )
-        except Exception as e:
+        except (sqlite3.Error, OSError) as e:
             results.append({"db": str(db_path), "error": str(e)})
     return results
 
@@ -634,7 +634,7 @@ def _reindex_parse_and_store(
             # early return here is safe (pause was never requested).
             # Do NOT move _request_bg_reindex_pause before this loop
             # without wrapping it in try/finally.
-        except Exception as exc:
+        except (RuntimeError, sqlite3.Error) as exc:
             log.warning("skip TU %s during reindex: %s", unit.file.name, exc)
             skipped_tus.append(str(unit.file.name))
 
@@ -660,7 +660,7 @@ def _reindex_parse_and_store(
                     from ...indexer.macros import resolve_and_update
                     first_unit = parsed_units[0][0]
                     resolve_and_update(conn, config_hash, first_unit.clang_args, first_unit.file.resolve())
-                except Exception:
+                except (RuntimeError, sqlite3.Error):
                     pass
 
             from ...indexer.db import delete_orphan_files
@@ -703,7 +703,7 @@ def _reindex_parse_and_store(
                                 "headers": headers,
                             })
                     save_manifest(manifest_data, db_path.parent, config_hash)
-            except Exception:
+            except OSError:
                 log.debug("manifest.json update skipped during reindex_file", exc_info=True)
 
             elapsed = round(time.monotonic() - t0, 2)
@@ -768,7 +768,7 @@ def _reindex_post_write_phases(
                 (config_hash,),
             ).fetchone()[0]
             result["analysis_updated"] = analyzed_count
-        except Exception as exc:
+        except (sqlite3.Error, RuntimeError, OSError) as exc:
             result["analysis_warning"] = f"LLM analysis skipped: {exc}"
 
     if total_symbols > 0 and cfg.index.index_refs:
@@ -776,7 +776,7 @@ def _reindex_post_write_phases(
             from ...indexer.runner import _build_overrides
             _build_overrides(conn, config_hash, db_dir, write_lock_held=True, force=True)
             conn.commit()
-        except Exception as exc:
+        except (sqlite3.Error, RuntimeError) as exc:
             result["overrides_warning"] = f"Override analysis skipped: {exc}"
 
     if cfg.index.index_refs and total_symbols > 0:
@@ -785,7 +785,7 @@ def _reindex_post_write_phases(
             _build_pagerank(conn, config_hash, write_lock_held=True, force=True)
             _build_hotspot_cache(conn, config_hash, force=True)
             conn.commit()
-        except Exception as exc:
+        except (sqlite3.Error, RuntimeError) as exc:
             result["pagerank_warning"] = f"PageRank/hotspot recompute skipped: {exc}"
 
     if len(matching) == 1 and target.suffix.lower() in {".h", ".hpp"}:
@@ -818,7 +818,7 @@ def _reindex_post_write_phases(
                 (config_hash,),
             ).fetchone()[0]
             result["embeddings_updated"] = reembedded
-        except Exception as exc:
+        except (sqlite3.Error, RuntimeError, OSError) as exc:
             result["embedding_warning"] = f"Embedding regeneration skipped: {exc}"
 
     return result
@@ -884,7 +884,7 @@ def reindex_file_impl(
     finally:
         try:
             conn.execute("PRAGMA optimize")
-        except Exception:
+        except sqlite3.Error:
             pass
         pass  # connection managed by connection.py cache
         _invalidate_conn_cache(str(db_path.resolve()))

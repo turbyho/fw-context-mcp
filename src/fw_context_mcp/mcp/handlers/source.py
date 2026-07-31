@@ -154,7 +154,7 @@ def _read_symbol_body(file_path: str, line_no: int, end_line: int = 0, max_lines
 
         with p.open(errors="replace") as fh:
             window = [line.rstrip("\n\r") for line in islice(fh, read_start, read_end)]
-    except Exception:
+    except OSError:
         return ""
 
     if start_idx < read_start or not window:
@@ -336,7 +336,7 @@ async def explain_symbol(
             f"{i + start + 1:4d}  {lines[i + start]}" for i in range(end - start)
         )
         source_snippet = numbered
-    except Exception:
+    except (IndexError, ValueError):
         pass
     prompt = (
         f"You are a C/C++ embedded firmware expert.\n"

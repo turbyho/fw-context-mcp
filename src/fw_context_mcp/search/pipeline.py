@@ -146,7 +146,7 @@ class PipelineRunner:
                 ctx = await phase.run(ctx)
                 elapsed = time.monotonic() - t0
                 log.debug("Phase %r completed in %.2fs", phase_name, elapsed)
-            except Exception as exc:
+            except (RuntimeError, sqlite3.Error, OSError, ValueError) as exc:
                 if isinstance(exc, (KeyboardInterrupt, SystemExit)):
                     raise
                 log.warning("Phase %r failed: %s", phase_name, exc)

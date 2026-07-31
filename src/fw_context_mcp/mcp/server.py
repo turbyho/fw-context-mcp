@@ -195,7 +195,7 @@ def resource_symbol(name: str) -> str:
 
     try:
         result = get_source(name)
-    except Exception as exc:
+    except (sqlite3.Error, OSError, ValueError) as exc:
         return json.dumps({"error": f"Failed to read symbol '{name}': {exc}"})
     if "error" in result:
         return json.dumps(result)
@@ -281,7 +281,7 @@ def main() -> None:
     # If the project IS ready, pre-mark integrity check and ensure daemon.
     try:
         root = resolve_project_root(None)
-    except Exception:
+    except OSError:
         log.exception("Failed to resolve project root for daemon setup")
         mcp.run()
         return
@@ -294,13 +294,13 @@ def main() -> None:
         db_path = cfg.index.db_dir / project_id / "index.db"
         if db_path.exists():
             _integrity_checked.add(str(db_path.resolve()))
-    except Exception:
+    except (OSError, ValueError):
         log.warning("Failed to pre-mark integrity check — will run on first query", exc_info=True)
 
     try:
         _ensure_daemon_running(root)
         _start_ping_thread(root)
-    except Exception:
+    except (RuntimeError, OSError):
         log.exception("Background service startup failed — auto-reindex and file watching unavailable")
 
     mcp.run()
@@ -320,7 +320,7 @@ def _start_ping_thread(root: Path) -> None:
                 alive = ping_daemon(root)
                 if not alive:
                     log.debug("Daemon ping failed — daemon may have exited")
-            except Exception:
+            except OSError:
                 log.debug("Daemon ping error", exc_info=True)
 
     # daemon=True: killed on process exit — no explicit stop mechanism needed

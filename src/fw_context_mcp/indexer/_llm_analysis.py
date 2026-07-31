@@ -10,8 +10,11 @@ import hashlib
 import json
 import logging
 import os
+import sqlite3
 import time
+from contextlib import nullcontext
 from pathlib import Path
+
 
 from ..cache_client import get_local_cache_db, local_cache_lookup, local_cache_upsert
 from ..llm.ollama import call_ollama
