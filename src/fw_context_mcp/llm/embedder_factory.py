@@ -96,9 +96,8 @@ def _get_ft_embedder(cfg: LLMConfig) -> Embedder:
             )
         _validate_model_dir(best, "ft://latest resolved to " + str(best))
         log.info("Resolved ft://latest → %s", best)
-        resolved_cfg = copy.copy(cfg)
-        resolved_cfg.embed_model = str(best)
-        embedder = SentenceTransformerEmbedder(resolved_cfg)
+        cfg.embed_model = str(best)  # mutate so embed_key() uses resolved path
+        embedder = SentenceTransformerEmbedder(cfg)
         _FT_EMBEDDER_CACHE[model] = embedder
         return embedder
 

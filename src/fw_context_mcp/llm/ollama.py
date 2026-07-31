@@ -204,25 +204,28 @@ def _call_ollama_embed_impl(
         return embeddings
     except httpx.HTTPStatusError as e:
         if e.response.status_code == 404:
-            # Model not installed — pull it, then retry
+            # Model not installed — pull it, then retry once
             log.info("Embedding model '%s' not found, pulling...", cfg.embed_model)
             _pull_model(cfg.embed_model, cfg.ollama_url)
-            with ollama_guard():
-                resp = httpx.post(url, json=payload, timeout=cfg.timeout * 2)
-            resp.raise_for_status()
-            embeddings = resp.json()["embeddings"]
-            if embedder is not None:
-                embedder._update_dim(embeddings)
-            if cfg.debug_log:
-                _write_debug_log(cfg.debug_log, {
-                    "ts": datetime.now(UTC).isoformat(),
-                    "model": cfg.embed_model,
-                    "latency_s": round(time.monotonic() - t0, 2),
-                    "num_inputs": len(inputs),
-                    "embedding_dims": [len(e) for e in embeddings],
-                    "note": "pulled model first",
-                })
-            return embeddings
+            try:
+                with ollama_guard():
+                    resp = httpx.post(url, json=payload, timeout=cfg.timeout * 2)
+                resp.raise_for_status()
+                embeddings = resp.json()["embeddings"]
+                if embedder is not None:
+                    embedder._update_dim(embeddings)
+                if cfg.debug_log:
+                    _write_debug_log(cfg.debug_log, {
+                        "ts": datetime.now(UTC).isoformat(),
+                        "model": cfg.embed_model,
+                        "latency_s": round(time.monotonic() - t0, 2),
+                        "num_inputs": len(inputs),
+                        "embedding_dims": [len(e) for e in embeddings],
+                        "note": "pulled model first",
+                    })
+                return embeddings
+            except httpx.HTTPStatusError as e2:
+                raise OllamaModelNotFoundError(cfg.embed_model, cfg.ollama_url) from e2
         raise OllamaError(f"Ollama HTTP {e.response.status_code}: {e.response.text[:200]}") from e
     except httpx.ConnectError as e:
         raise OllamaError(
@@ -243,6 +246,8 @@ def call_ollama_embed(inputs: list[str], cfg: LLMConfig, *, query: bool = True) 
     Kept for ``experiments/`` scripts that import this directly.
     New code should use :class:`OllamaEmbedder` via :func:`get_embedder`.
     """
+    from .auto_model import resolve_embed_model
+    resolve_embed_model(cfg)
     return _call_ollama_embed_impl(inputs, cfg, query=query)
 
 
