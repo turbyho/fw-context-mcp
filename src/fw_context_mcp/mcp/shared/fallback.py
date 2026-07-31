@@ -40,7 +40,7 @@ def _fallback_to_search_code(
             # Collect file paths for staleness check before closing
             result_files = [abs_path(root, r["file"]) for r in results if "file" in r]
             stale_f = _stale_files(conn, config_hash, result_files, root)
-            is_stale = _is_stale(cfg, cfg["compile_commands_path"])
+            is_stale, _ = _is_stale(cfg, cfg["compile_commands_path"])
     finally:
         pass  # connection managed by connection.py cache
 

@@ -139,7 +139,9 @@ class TestIsCompileCommandsStale:
         cc.write_text("[]")
         past = datetime.now(UTC).timestamp() - 3600
         created_at = datetime.fromtimestamp(past, tz=UTC).isoformat()
-        assert is_compile_commands_stale(created_at, str(cc)) is True
+        stale, reason = is_compile_commands_stale(created_at, str(cc))
+        assert stale is True
+        assert reason == "compile_commands_newer"
 
     def test_index_newer_than_cc(self, tmp_path: Path) -> None:
         from fw_context_mcp.utils import is_compile_commands_stale
@@ -148,23 +150,31 @@ class TestIsCompileCommandsStale:
         cc.write_text("[]")
         future = datetime.now(UTC).timestamp() + 3600
         created_at = datetime.fromtimestamp(future, tz=UTC).isoformat()
-        assert is_compile_commands_stale(created_at, str(cc)) is False
+        stale, reason = is_compile_commands_stale(created_at, str(cc))
+        assert stale is False
+        assert reason is None
 
-    def test_missing_file_returns_false(self, tmp_path: Path) -> None:
+    def test_missing_file_returns_stale(self, tmp_path: Path) -> None:
         from fw_context_mcp.utils import is_compile_commands_stale
 
         created_at = datetime.now(UTC).isoformat()
-        assert is_compile_commands_stale(created_at, str(tmp_path / "nope.json")) is False
+        stale, reason = is_compile_commands_stale(created_at, str(tmp_path / "nope.json"))
+        assert stale is True
+        assert reason == "compile_commands_missing"
 
-    def test_bad_timestamp_returns_false(self) -> None:
+    def test_bad_timestamp_returns_error(self) -> None:
         from fw_context_mcp.utils import is_compile_commands_stale
 
-        assert is_compile_commands_stale("not-a-date", "/some/file") is False
+        stale, reason = is_compile_commands_stale("not-a-date", "/some/file")
+        assert stale is True
+        assert reason is not None
 
-    def test_empty_timestamp_returns_false(self) -> None:
+    def test_empty_timestamp_returns_error(self) -> None:
         from fw_context_mcp.utils import is_compile_commands_stale
 
-        assert is_compile_commands_stale("", "/some/file") is False
+        stale, reason = is_compile_commands_stale("", "/some/file")
+        assert stale is True
+        assert reason is not None
 
 
 class TestTruncatePathMiddle:

@@ -71,7 +71,7 @@ def check_structural_staleness(
 
     # 1. compile_commands.json changed? (one stat call)
     cc_path = cfg["compile_commands_path"]
-    if _is_stale(cfg, cc_path):
+    if _is_stale(cfg, cc_path)[0]:
         reasons.append("compile_commands.json changed")
 
     # 2. Schema version mismatch?
