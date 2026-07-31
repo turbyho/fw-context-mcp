@@ -40,7 +40,13 @@ class _BodySizeLimitMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request, call_next):
         content_length = request.headers.get("content-length")
         if content_length:
-            if int(content_length) > self.MAX_BYTES:
+            try:
+                content_len = int(content_length)
+            except (ValueError, TypeError):
+                return JSONResponse(
+                    {"detail": "Invalid Content-Length header"}, status_code=400,
+                )
+            if content_len > self.MAX_BYTES:
                 return JSONResponse(
                     {"detail": "Request body too large (max 10 MB)"}, status_code=413,
                 )
@@ -210,5 +216,20 @@ def create_app(*, backend: "CacheStorageBackend | None" = None) -> FastAPI:
         hashes = body.hashes[:10000]  # hard cap
         deleted = await request.app.state.backend.cache_clear_by_hashes(hashes)
         return {"deleted": deleted, "total": len(hashes)}
+
+    @app.exception_handler(Exception)
+    async def _global_exception_handler(request: Request, exc: Exception) -> JSONResponse:
+        """Convert unhandled exceptions to 503 to avoid leaking stack traces."""
+        import traceback
+
+        logger.error(
+            "Unhandled exception in %s %s: %s\n%s",
+            request.method, request.url.path, exc,
+            traceback.format_exc(),
+        )
+        return JSONResponse(
+            status_code=503,
+            content={"detail": "Internal server error"},
+        )
 
     return app

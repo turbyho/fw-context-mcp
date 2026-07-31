@@ -263,6 +263,12 @@ class CacheClient:
                     if on_auth_failure is not None:
                         on_auth_failure()
                     return None
+                # Non-retryable client errors (404, 413, 422, 400) — fail immediately.
+                if resp.status_code in _NON_RETRYABLE:
+                    logger.warning("Cache server %s returned non-retryable %d",
+                                   label, resp.status_code)
+                    return None
+                # Retryable errors (429, 5xx) with backoff.
                 if attempt < _MAX_RETRIES - 1:
                     wait = _get_retry_after(resp, _retry_sleep(attempt))
                     logger.debug("Cache server %s returned %d (attempt %d/%d), retrying",
