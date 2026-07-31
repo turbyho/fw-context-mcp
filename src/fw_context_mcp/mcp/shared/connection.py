@@ -111,6 +111,8 @@ def _open_and_cache(db_key: str, db_path: Path) -> sqlite3.Connection:
     Double-checked locking: re-checks the cache after acquiring the lock.
     Runs ``PRAGMA integrity_check`` once per database path per process
     (outside the cache lock so other tools are not blocked).
+    Note: calls open_db() while holding _conn_cache_lock -- IO under
+    lock is acceptable for read-heavy workloads (open <1ms on modern FS).
     """
     should_check = False
     with _conn_cache_lock:

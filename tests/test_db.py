@@ -7,6 +7,7 @@ from fw_context_mcp.indexer.db import (
     _expand_query,
     count_refs,
     delete_inheritance_for_file,
+    delete_macros_for_file,
     delete_refs_for_file,
     delete_symbols_for_file,
     find_refs,
@@ -20,10 +21,13 @@ from fw_context_mcp.indexer.db import (
     get_overrides_for_method,
     get_template_instances,
     insert_inheritance_batch,
+    insert_macros_batch,
     insert_overrides_batch,
     insert_refs_batch,
     insert_symbols_batch,
+    lookup_macro,
     open_db,
+    rebuild_macros_fts,
     search_symbols,
     split_tokens,
     transaction,
@@ -183,6 +187,8 @@ class TestUpsertBuildConfig:
         temp_db.commit()
 
         with transaction(temp_db):
+            from fw_context_mcp.indexer.db._schema import _ensure_migrated_columns
+            _ensure_migrated_columns(temp_db)
             upsert_build_config(temp_db, "hash-xyz", "proj-002", "/tmp/cc.json", embedding_dim=768)
 
         row = temp_db.execute(
@@ -1775,3 +1781,97 @@ void process_data(struct Driver* driver, const char* data, int len) {
             f"Expected exactly 1 indirect call site targeting 'onData', "
             f"got {len(ondata_calls)}: {[(c.target_name, c.expr_text) for c in indirect]}"
         )
+
+
+class TestMacros:
+    """Preprocessor macro storage, lookup, FTS search, and rebuild."""
+
+    def test_insert_macros_batch(self, populated_db):
+        conn = populated_db
+        fid = upsert_file(conn, "hash-deadbeef", "/tmp/test.h", "cpp")
+        insert_macros_batch(conn, [
+            ("hash-deadbeef", fid, "MAX_BUF", "256", "256", 10, 0),
+            ("hash-deadbeef", fid, "MIN(a,b)", "((a)<(b)?(a):(b))", "((a)<(b)?(a):(b))", 11, 1),
+        ])
+        rows = conn.execute(
+            "SELECT name, value, expanded_value, line, is_function_like FROM macros WHERE file_id=? ORDER BY line",
+            (fid,),
+        ).fetchall()
+        assert len(rows) == 2
+        assert rows[0]["name"] == "MAX_BUF"
+        assert rows[0]["value"] == "256"
+        assert rows[0]["is_function_like"] == 0
+        assert rows[1]["name"] == "MIN(a,b)"
+        assert rows[1]["is_function_like"] == 1
+
+    def test_macro_on_conflict_update(self, populated_db):
+        """Re-inserting same (config_hash, file_id, line) updates values."""
+        conn = populated_db
+        fid = upsert_file(conn, "hash-deadbeef", "/tmp/test.h", "cpp")
+        insert_macros_batch(conn, [
+            ("hash-deadbeef", fid, "VAL", "1", "1", 5, 0),
+        ])
+        insert_macros_batch(conn, [
+            ("hash-deadbeef", fid, "VAL", "2", "2", 5, 0),
+        ])
+        rows = conn.execute("SELECT name, value FROM macros WHERE file_id=?", (fid,)).fetchall()
+        assert len(rows) == 1
+        assert rows[0]["value"] == "2"
+
+    def test_macro_fts_search(self, populated_db):
+        """Macros are searchable via FTS5 after insert (trigger-driven)."""
+        conn = populated_db
+        fid = upsert_file(conn, "hash-deadbeef", "/tmp/test.h", "cpp")
+        insert_macros_batch(conn, [
+            ("hash-deadbeef", fid, "UART_BAUD", "115200", "115200", 1, 0),
+            ("hash-deadbeef", fid, "I2C_ADDR", "0x50", "0x50", 2, 0),
+        ])
+        results = conn.execute(
+            "SELECT name FROM macros_fts WHERE macros_fts MATCH 'name:uart*'"
+        ).fetchall()
+        assert len(results) >= 1
+        names = [r[0] for r in results]
+        assert "UART_BAUD" in names
+
+    def test_rebuild_macros_fts(self, populated_db):
+        """rebuild_macros_fts reindexes all macros from scratch."""
+        conn = populated_db
+        fid = upsert_file(conn, "hash-deadbeef", "/tmp/test.h", "cpp")
+        insert_macros_batch(conn, [
+            ("hash-deadbeef", fid, "REBUILD_TEST", "1", "1", 1, 0),
+        ])
+        rebuild_macros_fts(conn)
+        results = conn.execute(
+            "SELECT name FROM macros_fts WHERE macros_fts MATCH 'name:rebuild*'"
+        ).fetchall()
+        assert len(results) == 1
+        assert results[0][0] == "REBUILD_TEST"
+
+    def test_delete_macros_for_file(self, populated_db):
+        """Deleting by file_id removes macros and FTS entries."""
+        conn = populated_db
+        fid = upsert_file(conn, "hash-deadbeef", "/tmp/test.h", "cpp")
+        insert_macros_batch(conn, [
+            ("hash-deadbeef", fid, "TO_DELETE", "42", "42", 1, 0),
+        ])
+        count_before = conn.execute(
+            "SELECT COUNT(*) FROM macros_fts WHERE macros_fts MATCH 'name:to_delete'"
+        ).fetchone()[0]
+        assert count_before == 1
+        delete_macros_for_file(conn, fid)
+        count_after = conn.execute(
+            "SELECT COUNT(*) FROM macros WHERE file_id=?", (fid,)
+        ).fetchone()[0]
+        assert count_after == 0
+
+    def test_lookup_macro_by_exact_name(self, populated_db):
+        """lookup_macro returns matching macro with value and expanded_value."""
+        conn = populated_db
+        fid = upsert_file(conn, "hash-deadbeef", "/tmp/test.h", "cpp")
+        insert_macros_batch(conn, [
+            ("hash-deadbeef", fid, "API_KEY", "0xABCD", "0xABCD", 3, 0),
+        ])
+        results = lookup_macro(conn, "hash-deadbeef", "API_KEY", exact=True)
+        assert len(results) == 1
+        assert results[0]["name"] == "API_KEY"
+        assert results[0]["value"] == "0xABCD"

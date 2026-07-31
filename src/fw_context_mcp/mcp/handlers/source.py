@@ -138,14 +138,10 @@ def _read_symbol_body(file_path: str, line_no: int, end_line: int = 0, max_lines
         read_start = max(0, start_idx - 5)  # small margin for brace matching
         read_end = end_line + 5 if end_line else start_idx + max_lines + 5
         read_end = min(read_end, start_idx + _MAX_SYMBOL_BODY_LINES)
-        window: list[str] = []
+        from itertools import islice
+
         with p.open(errors="replace") as fh:
-            for i, line in enumerate(fh):
-                if i < read_start:
-                    continue
-                if i >= read_end:
-                    break
-                window.append(line.rstrip("\n\r"))
+            window = [line.rstrip("\n\r") for line in islice(fh, read_start, read_end)]
     except Exception:
         return ""
 

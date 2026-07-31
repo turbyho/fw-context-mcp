@@ -193,7 +193,10 @@ def resource_symbol(name: str) -> str:
     """
     import json
 
-    result = get_source(name)
+    try:
+        result = get_source(name)
+    except Exception as exc:
+        return json.dumps({"error": f"Failed to read symbol '{name}': {exc}"})
     if "error" in result:
         return json.dumps(result)
     source = result.pop("source", "")
