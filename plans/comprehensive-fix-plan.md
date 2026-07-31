@@ -3,23 +3,23 @@
 **Vytvořeno:** 2026-07-31
 **Výchozí revize:** feat/improved-embeddings (5 agentů + manuální analýza)
 **Rozsah:** 45 nálezů (7 kritických + 13 vážných + 25 středních) + 8 refaktoringových návrhů  
-**Stav:** 26 commitů, 868 testů, 7/7 K + 13/13 V + 25/25 M + 2/8 R
+**Stav:** 31 commitů, 868 testů, 7/7 K + 13/13 V + 25/25 M + 8/8 R ✅
 **Princip:** Každá oprava → review změn → oprava review nálezů → iterovat dokud review není čisté → teprve pak další oprava
 
 ---
 
 
-> **Dokončeno:** 2026-07-31 — 26 commitů na `fix/comprehensive-review-fixes`
+> **Dokončeno:** 2026-07-31 — 29 commitů na `fix/comprehensive-review-fixes`
 > - Kritické: 7/7 — všechny hotové ✅
 > - Vážné: 13/13 — všechny hotové ✅
 > - Střední: 25/25 — všechny hotové ✅
-> - Refaktoring: 2/8 (R2, R3, R6 zbývají)
+> - Refaktoring: 8/8 — všechny hotové ✅
 > - Runner: 2700→500 řádků, 26→1 funkce
-> - CLI: modul → package (sub-moduly neextrahovány — R2)
+> - CLI: modul → package (9 sub-modulů, 2843→294 řádků)
 > - `except Exception`: 144→4 (↓97%, V1 dokončeno)
 > - Dvojitý libclang parse: opraven (V13)
 >
-> **Zbývá:** CLI sub-moduly (R2), R3, R6
+> **Zbývá:** Nic — všechny položky plánu jsou hotové ✅
 
 
 ## ⚠️ KRITICKÁ PRAVIDLA (platí pro celý plán)
@@ -79,7 +79,7 @@
 - [x] M2: Duplicitní `OllamaError`/`OllamaModelNotFoundError` v `_diag.py` a `ollama.py` ✅
 - [x] M3: Embed retry path leakuje raw `httpx.HTTPStatusError` ✅
 - [x] M4: `call_ollama_embed()` nikdy nevolá `resolve_embed_model()` ✅
-- [~] M5: `_STEM_PATTERN_CACHE` (scoring) a `_names_cache` (did_you_mean) — neomezený růst ⚠️ (částečně (_STEM_PATTERN_CACHE opraveno, _names_cache ne))
+- [x] M5: `_STEM_PATTERN_CACHE` (scoring) a `_names_cache` (did_you_mean) — neomezený růst ✅
 - [x] M6: `KeywordCache` používá FIFO, ne LRU; `get()` nerefreshuje ✅
 - [x] M7: `did_you_mean` prefix shortlist O(Q × distinct-tokens) ✅
 - [x] M8: Rate limiting nefunguje za nginxem (127.0.0.1) ✅
@@ -103,12 +103,12 @@
 
 ### Refaktoringové návrhy (R1–R8)
 - [x] R1: Dekomponovat `runner.py` na 5 modulů ✅
-- [~] R2: Dekomponovat `cli.py` na 9 sub-modulů ⚠️ (částečně (package infrastruktura hotova, sub-moduly neextrahovány))
-- [ ] R3: Data Access Layer pro SQL dotazy ❌
+- [x] R2: Dekomponovat `cli.py` na 9 sub-modulů ✅
+- [x] R3: Data Access Layer pro SQL dotazy ✅
 - [x] R4: Nahradit `except Exception` → specifické výjimky (⊂ V1) ✅
-  - [x] R5: Přidat timeout a capture_output do builderů (⊂ V6) ⚠️ (částečně (helper přidán))
-- [ ] R6: Extrahovat shared handler logic ❌
-- [~] R7: Odstranit mrtvý kód (⊂ Fáze 2) ⚠️ (částečně)
+  - [x] R5: Přidat timeout a capture_output do builderů (⊂ V6) ✅
+- [x] R6: Extrahovat shared handler logic ✅
+- [x] R7: Odstranit mrtvý kód (⊂ Fáze 2) ✅
 - [x] R8: Extrakce/přesun experimentů ✅
 
 ---

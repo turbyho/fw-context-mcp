@@ -5,7 +5,6 @@ from __future__ import annotations
 import logging
 import os
 import shutil
-import subprocess
 from pathlib import Path
 
 from fw_context_mcp.utils import run_build_command
@@ -70,7 +69,10 @@ class ESPIDFBuildSystem:
             # idf.py fullclean removes all build artifacts
             clean_cmd = [idf_py, "fullclean"]
             log.info("esp-idf clean: %s", " ".join(clean_cmd))
-            subprocess.run(clean_cmd, cwd=project_root, capture_output=True, text=True)
+            try:
+                run_build_command(clean_cmd, cwd=project_root, description="idf.py fullclean")
+            except RuntimeError:
+                pass  # clean is best-effort — build dir may not exist yet
 
         # Ninja deletes .d depfiles after reading them by default.
         # Create a wrapper that adds -d keepdepfile so .d files persist
@@ -139,7 +141,10 @@ class ESPIDFBuildSystem:
                 )
             set_target_cmd = [idf_py, "set-target", target]
             log.info("esp-idf set-target: %s", " ".join(set_target_cmd))
-            subprocess.run(set_target_cmd, cwd=project_root, capture_output=True, text=True)
+            try:
+                run_build_command(set_target_cmd, cwd=project_root, description="idf.py set-target")
+            except RuntimeError:
+                log.warning("idf.py set-target failed — build may use wrong target")
 
         log.info("esp-idf build: %s", " ".join(cmd))
         run_build_command(cmd, cwd=project_root, description="idf.py build", env=env)

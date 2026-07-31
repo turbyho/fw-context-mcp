@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import logging
 import shutil
-import subprocess
 from pathlib import Path
 
 from fw_context_mcp.utils import run_build_command
@@ -106,12 +105,13 @@ class ArduinoBuildSystem:
 
         # ── Pass 2: real compile to produce .d dependency files ──
         log.info("arduino build (compile): %s", " ".join(base_cmd))
-        real = subprocess.run(base_cmd, cwd=project_root, capture_output=True, text=True)
-        if real.returncode != 0:
+        try:
+            run_build_command(base_cmd, cwd=project_root, description="arduino-cli compile (real build for .d files)")
+        except RuntimeError:
             # Real compile failed — but we already have the compilation
             # database.  Warn and continue (the indexer can still work,
             # it just won't have .d files for incremental reindexing).
-            log.warning("arduino-cli real compile failed with exit code %d — .d files may be missing", real.returncode)
+            log.warning("arduino-cli real compile failed — .d files may be missing")
 
         return target_cc
 

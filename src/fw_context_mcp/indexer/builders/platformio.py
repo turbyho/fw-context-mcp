@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import logging
 import shutil
-import subprocess
 from pathlib import Path
 
 from fw_context_mcp.utils import run_build_command
@@ -56,7 +55,10 @@ class PlatformIOBuildSystem:
         if cfg.clean:
             clean_cmd = [pio_bin, "run", "--project-dir", str(project_root), "--target", "clean"]
             log.info("platformio clean: %s", " ".join(clean_cmd))
-            subprocess.run(clean_cmd, cwd=project_root, capture_output=True, text=True)
+            try:
+                run_build_command(clean_cmd, cwd=project_root, description="pio run --target clean")
+            except RuntimeError:
+                pass  # clean is best-effort — build dir may not exist yet
 
         log.info("platformio build: %s", " ".join(cmd))
         run_build_command(cmd, cwd=project_root, description="pio run --target compiledb")
@@ -72,13 +74,13 @@ class PlatformIOBuildSystem:
         # already up-to-date, pio run exits quickly (no-op).
         build_cmd = [pio_bin, "run", "--project-dir", str(project_root)]
         log.info("platformio compile: %s", " ".join(build_cmd))
-        build_result = subprocess.run(build_cmd, cwd=project_root, capture_output=True, text=True)
-        if build_result.returncode != 0:
+        try:
+            run_build_command(build_cmd, cwd=project_root, description="pio run (full build for .d files)")
+        except RuntimeError:
             log.warning(
-                "Full build failed (exit code %d) — .d files may be missing. "
+                "Full build failed — .d files may be missing. "
                 "Header change detection will be limited. "
-                "Fix compilation errors and re-run 'fw-context index --build'.",
-                build_result.returncode,
+                "Fix compilation errors and re-run 'fw-context index --build'."
             )
 
         return cc_path
