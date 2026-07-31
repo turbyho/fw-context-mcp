@@ -32,7 +32,7 @@ from mcp.server.fastmcp import FastMCP
 
 from ..utils import resolve_project_root
 from .background import _ensure_daemon_running
-from .handlers import callgraph, inheritance, maintenance, search, _search_fallbacks, _lookup, _semantic, source, variables
+from .handlers import callgraph, inheritance, maintenance, search, _search_fallbacks, _lookup, source, variables
 from .handlers.maintenance import get_active_build, list_projects, reindex_file_impl  # noqa: F401 — backward compat
 from .handlers.source import _read_symbol_body, get_source  # noqa: F401 — backward compat
 from .shared.context import _check_server_ready, _integrity_checked
