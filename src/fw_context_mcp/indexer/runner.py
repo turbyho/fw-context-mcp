@@ -1746,6 +1746,7 @@ def _check_and_parse_unit(
         parsed = extract_all(
             unit,
             with_refs=index_refs,
+            return_tu=True,
         )
     except sqlite3.Error:
         log.error("Fatal DB error parsing %s — stopping indexer", unit.file.name)
@@ -1906,6 +1907,7 @@ def _process_unit(
             parsed = extract_all(
                 unit,
                 with_refs=index_refs,
+                return_tu=True,
             )
         except (ValueError, TypeError, RuntimeError, AttributeError, sqlite3.Error) as exc:
             log.warning("skip TU %s: %s", unit.file.name, exc)
