@@ -20,7 +20,6 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from ..indexer.build import BuildConfig
-from ..indexer.build import BuildConfig
 log = logging.getLogger(__name__)
 
 __all__ = [
@@ -901,6 +900,9 @@ def _write_project_id(project_root: Path, project_id: str) -> None:
         if in_project:
             # id not found, append at end of [project] section (end of file)
             lines.append(f'id = "{project_id}"\n')
+        else:
+            # [project] section doesn't exist — prepend one
+            lines.insert(0, f'[project]\nid = "{project_id}"\n\n')
 
     # Atomic write: temp file + rename — prevents corruption on partial write
     import tempfile
