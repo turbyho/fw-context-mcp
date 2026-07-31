@@ -192,10 +192,10 @@ def init_vec_table(conn: sqlite3.Connection, dim: int | None = None) -> None:
     later by ``_build_embeddings``.
     """
     if dim is not None:
-        conn.execute("DROP TABLE IF EXISTS vec_symbols")
-        conn.commit()
         if not isinstance(dim, int) or dim < 1:
             raise ValueError(f"Invalid embedding dimension: {dim!r} — must be a positive integer")
+        conn.execute("DROP TABLE IF EXISTS vec_symbols")
+        conn.commit()
     # NOTE: .format() is used because SQLite CREATE VIRTUAL TABLE does not
     # support parameterized dimension.  *dim* is validated as positive int
     # above — no SQL injection risk.
@@ -227,20 +227,21 @@ def upsert_embeddings_vec(
                 f"— rowid encoding would collide"
             )
 
-    # Bulk DELETE using executemany
-    conn.executemany(
-        "DELETE FROM vec_symbols WHERE rowid = ?",
-        [(symbol_id * 1_000_000 + chunk_index,) for symbol_id, chunk_index, _, _ in rows],
-    )
-    # Bulk INSERT using executemany
-    conn.executemany(
-        "INSERT INTO vec_symbols(rowid, embedding, config_hash, symbol_id, chunk_index) "
-        "VALUES (?, ?, ?, ?, ?)",
-        [
-            (symbol_id * 1_000_000 + chunk_index, json.dumps(vec), config_hash, symbol_id, chunk_index)
-            for symbol_id, chunk_index, config_hash, vec in rows
-        ],
-    )
+    # Bulk DELETE + INSERT wrapped in a transaction — a crash between
+    # DELETE and INSERT would otherwise cause data loss.
+    with conn:
+        conn.executemany(
+            "DELETE FROM vec_symbols WHERE rowid = ?",
+            [(symbol_id * 1_000_000 + chunk_index,) for symbol_id, chunk_index, _, _ in rows],
+        )
+        conn.executemany(
+            "INSERT INTO vec_symbols(rowid, embedding, config_hash, symbol_id, chunk_index) "
+            "VALUES (?, ?, ?, ?, ?)",
+            [
+                (symbol_id * 1_000_000 + chunk_index, json.dumps(vec), config_hash, symbol_id, chunk_index)
+                for symbol_id, chunk_index, config_hash, vec in rows
+            ],
+        )
     return len(rows)
 
 
