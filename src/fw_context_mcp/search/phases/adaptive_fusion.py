@@ -43,11 +43,8 @@ class AdaptiveFusionPhase(Phase):
 
     def _get_threshold(self, ctx: PipelineContext) -> int:
         """Return the minimum dense count from config or module default."""
-        try:
-            return max(1, ctx.config.index.min_dense_count)
-        except AttributeError:
-            log.warning("config.index.min_dense_count not found, using default %d", MIN_DENSE_COUNT)
-            return MIN_DENSE_COUNT
+        min_count = getattr(ctx.config.index, "min_dense_count", MIN_DENSE_COUNT)
+        return max(1, min_count)
 
     def should_run(self, ctx: PipelineContext) -> bool:
         return bool(ctx.fts5_results) or bool(ctx.embedding_results)

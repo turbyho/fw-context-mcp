@@ -336,9 +336,8 @@ CREATE INDEX IF NOT EXISTS idx_refs_to_usr   ON refs(config_hash, to_usr);
 CREATE INDEX IF NOT EXISTS idx_refs_from_usr ON refs(config_hash, from_usr);
 CREATE INDEX IF NOT EXISTS idx_refs_fromfile ON refs(config_hash, from_file);
 
--- Indirect function-pointer call sites (Phase 2).
+-- Indirect function-pointer call sites (Phase 2). -- CRITICAL_TABLE
 -- Records locations where a function pointer field or variable is invoked --
--- NOTE: keep in sync with _CRITICAL_TABLES below (defensive re-creation block). --
 -- unlike refs, there is no resolved target function (the callee is a
 -- FIELD_DECL or VAR_DECL, not a FUNCTION_DECL).
 CREATE TABLE IF NOT EXISTS indirect_call_sites (
@@ -356,10 +355,9 @@ CREATE INDEX IF NOT EXISTS idx_ics_config_target ON indirect_call_sites(config_h
 CREATE INDEX IF NOT EXISTS idx_ics_config_file   ON indirect_call_sites(config_hash, from_file);
 CREATE INDEX IF NOT EXISTS idx_ics_config_usr    ON indirect_call_sites(config_hash, from_usr);
 
--- Function pointer assignments (Phase 3).
+-- Function pointer assignments (Phase 3). -- CRITICAL_TABLE
 -- Records both sides of "field = &function" so Phase 3 can link
 -- fp_assignments.lhs_usr = indirect_call_sites.target_usr to answer
--- NOTE: keep in sync with _CRITICAL_TABLES below.
 -- "which functions can be called through this field?"
 CREATE TABLE IF NOT EXISTS fp_assignments (
     id           INTEGER PRIMARY KEY,
@@ -417,10 +415,9 @@ CREATE TABLE IF NOT EXISTS file_analysis (
     analyzed_at  TEXT    NOT NULL DEFAULT (datetime('now'))
 );
 
--- C++ inheritance hierarchy edges.
+-- C++ inheritance hierarchy edges. -- CRITICAL_TABLE
 -- derived_usr → base_usr: class Derived : public Base { ... }
 -- access: "public", "protected", "private"
--- NOTE: keep in sync with _CRITICAL_TABLES below.
 CREATE TABLE IF NOT EXISTS inheritance (
     id           INTEGER PRIMARY KEY,
     config_hash  TEXT    NOT NULL REFERENCES build_configs(config_hash),
@@ -433,10 +430,9 @@ CREATE TABLE IF NOT EXISTS inheritance (
 CREATE INDEX IF NOT EXISTS idx_inheritance_derived ON inheritance(config_hash, derived_usr);
 CREATE INDEX IF NOT EXISTS idx_inheritance_base    ON inheritance(config_hash, base_usr);
 
--- Virtual method override tracking.
+-- Virtual method override tracking. -- CRITICAL_TABLE
 -- derived_usr → base_usr: DerivedClass::method overrides BaseClass::method.
 -- Built as a post-processing step after inheritance chains are indexed.
--- NOTE: keep in sync with _CRITICAL_TABLES below.
 CREATE TABLE IF NOT EXISTS overrides (
     id           INTEGER PRIMARY KEY,
     config_hash  TEXT    NOT NULL REFERENCES build_configs(config_hash),
@@ -447,7 +443,7 @@ CREATE TABLE IF NOT EXISTS overrides (
 CREATE INDEX IF NOT EXISTS idx_overrides_derived ON overrides(config_hash, derived_usr);
 CREATE INDEX IF NOT EXISTS idx_overrides_base    ON overrides(config_hash, base_usr);
 
--- Preprocessor macro definitions (#define).
+-- Preprocessor macro definitions (#define). -- CRITICAL_TABLE
 -- Collected via CXCursor_MacroDefinition during TU parsing.
 -- expanded_value is populated by the clang -dM -E driver (opt-in).
 CREATE TABLE IF NOT EXISTS macros (
@@ -489,7 +485,7 @@ CREATE TRIGGER IF NOT EXISTS macros_au AFTER UPDATE ON macros BEGIN
     VALUES (new.id, new.name, new.value, new.expanded_value);
 END;
 
--- Pre-computed hotspot cache — caller counts for instant find_hotspots queries.
+-- Pre-computed hotspot cache — caller counts for instant find_hotspots queries. -- CRITICAL_TABLE
 CREATE TABLE IF NOT EXISTS hotspot_cache (
     id           INTEGER PRIMARY KEY,
     config_hash  TEXT    NOT NULL REFERENCES build_configs(config_hash),
@@ -500,91 +496,56 @@ CREATE TABLE IF NOT EXISTS hotspot_cache (
 CREATE INDEX IF NOT EXISTS idx_hotspot_cache_config ON hotspot_cache(config_hash);
 """
 
-# ── Self-healing critical-tables block ─────────────────────────────────────
+# ── Self-healing critical-tables block ───────────────────────────────────────────────────
 # Executed unconditionally on every connection open (CREATE TABLE IF NOT EXISTS
 # is idempotent, taking microseconds when the table already exists).  This
 # guarantees that tables survive a crashed migration or partial index.
 #
-# Every table below MUST match its corresponding CREATE TABLE in _SCHEMA above.
-# When you change one, change the other.
-_CRITICAL_TABLES = """
-CREATE TABLE IF NOT EXISTS indirect_call_sites (
-    id           INTEGER PRIMARY KEY,
-    config_hash  TEXT    NOT NULL,
-    from_file    TEXT    NOT NULL,
-    from_line    INTEGER NOT NULL,
-    from_usr     TEXT,
-    expr_text    TEXT    NOT NULL DEFAULT '',
-    target_usr   TEXT    NOT NULL,
-    target_name  TEXT    NOT NULL DEFAULT '',
-    fn_ptr_type  TEXT    NOT NULL DEFAULT ''
-);
-CREATE INDEX IF NOT EXISTS idx_ics_config_target ON indirect_call_sites(config_hash, target_usr);
-CREATE INDEX IF NOT EXISTS idx_ics_config_file   ON indirect_call_sites(config_hash, from_file);
-CREATE INDEX IF NOT EXISTS idx_ics_config_usr    ON indirect_call_sites(config_hash, from_usr);
+# _CRITICAL_TABLES is auto-generated from _SCHEMA.  Tables annotated with
+# ``-- CRITICAL_TABLE`` in the comment immediately preceding their CREATE
+# statement are automatically included.  No manual synchronization needed.
 
-CREATE TABLE IF NOT EXISTS fp_assignments (
-    id           INTEGER PRIMARY KEY,
-    config_hash  TEXT    NOT NULL,
-    from_file    TEXT    NOT NULL,
-    from_line    INTEGER NOT NULL,
-    lhs_usr      TEXT    NOT NULL,
-    lhs_name     TEXT    NOT NULL DEFAULT '',
-    rhs_usr      TEXT    NOT NULL,
-    rhs_name     TEXT    NOT NULL DEFAULT '',
-    fn_ptr_type  TEXT    NOT NULL DEFAULT '',
-    method       TEXT    NOT NULL,
-    from_usr     TEXT
-);
-CREATE INDEX IF NOT EXISTS idx_fpa_config_lhs ON fp_assignments(config_hash, lhs_usr);
-CREATE INDEX IF NOT EXISTS idx_fpa_config_rhs ON fp_assignments(config_hash, rhs_usr);
-CREATE INDEX IF NOT EXISTS idx_fpa_config_file ON fp_assignments(config_hash, from_file);
 
-CREATE TABLE IF NOT EXISTS inheritance (
-    id           INTEGER PRIMARY KEY,
-    config_hash  TEXT    NOT NULL REFERENCES build_configs(config_hash),
-    derived_usr  TEXT    NOT NULL,
-    base_usr     TEXT    NOT NULL,
-    access       TEXT    NOT NULL DEFAULT 'public',
-    is_virtual   INTEGER NOT NULL DEFAULT 0,
-    UNIQUE(config_hash, derived_usr, base_usr)
-);
-CREATE INDEX IF NOT EXISTS idx_inheritance_derived ON inheritance(config_hash, derived_usr);
-CREATE INDEX IF NOT EXISTS idx_inheritance_base    ON inheritance(config_hash, base_usr);
+def _build_critical_tables() -> str:
+    """Extract CRITICAL_TABLE-annotated CREATE statements from _SCHEMA.
 
-CREATE TABLE IF NOT EXISTS overrides (
-    id           INTEGER PRIMARY KEY,
-    config_hash  TEXT    NOT NULL REFERENCES build_configs(config_hash),
-    derived_usr  TEXT    NOT NULL,
-    base_usr     TEXT    NOT NULL,
-    UNIQUE(config_hash, derived_usr, base_usr)
-);
-CREATE INDEX IF NOT EXISTS idx_overrides_derived ON overrides(config_hash, derived_usr);
-CREATE INDEX IF NOT EXISTS idx_overrides_base    ON overrides(config_hash, base_usr);
+    Every CREATE TABLE / CREATE INDEX whose preceding comment line
+    contains ``CRITICAL_TABLE`` is included in the self-healing block.
+    Captures the full multi-line statement body through the matching
+    ``);`` terminator.
+    """
+    lines = _SCHEMA.split("\n")
+    parts: list[str] = []
+    capture = False
+    paren_depth = 0
+    for line in lines:
+        stripped = line.strip()
+        if "CRITICAL_TABLE" in stripped and stripped.startswith("--"):
+            capture = True
+            continue
+        if capture:
+            if stripped.upper().startswith("CREATE TABLE"):
+                parts.append(line)
+                paren_depth = line.count("(") - line.count(")")
+            elif stripped.upper().startswith("CREATE INDEX"):
+                parts.append(line)
+            elif paren_depth > 0:
+                parts.append(line)
+                paren_depth += line.count("(") - line.count(")")
+                if paren_depth == 0:
+                    capture = False
+            elif stripped == "" or stripped.startswith("--"):
+                # Blank lines and comments between CRITICAL_TABLE marker
+                # and the actual CREATE statement — keep capturing.
+                pass
+            else:
+                capture = False
+    result = "\n".join(parts).rstrip("\n") + "\n"
+    return result
 
-CREATE TABLE IF NOT EXISTS hotspot_cache (
-    id           INTEGER PRIMARY KEY,
-    config_hash  TEXT    NOT NULL REFERENCES build_configs(config_hash),
-    symbol_id    INTEGER NOT NULL REFERENCES symbols(id) ON DELETE CASCADE,
-    caller_count INTEGER NOT NULL DEFAULT 0,
-    UNIQUE(config_hash, symbol_id)
-);
-CREATE INDEX IF NOT EXISTS idx_hotspot_cache_config ON hotspot_cache(config_hash);
 
-CREATE TABLE IF NOT EXISTS macros (
-    id               INTEGER PRIMARY KEY,
-    config_hash      TEXT    NOT NULL REFERENCES build_configs(config_hash),
-    file_id          INTEGER NOT NULL REFERENCES files(id),
-    name             TEXT    NOT NULL,
-    value            TEXT    NOT NULL DEFAULT '',
-    expanded_value   TEXT    NOT NULL DEFAULT '',
-    line             INTEGER NOT NULL,
-    is_function_like INTEGER NOT NULL DEFAULT 0,
-    UNIQUE(config_hash, file_id, line)
-);
-CREATE INDEX IF NOT EXISTS idx_macros_name ON macros(name, config_hash);
-CREATE INDEX IF NOT EXISTS idx_macros_file ON macros(file_id);
-"""
+_CRITICAL_TABLES = _build_critical_tables()
+
 
 CURRENT_SCHEMA_VERSION = _derive_schema_version(_SCHEMA, _MIGRATION_ADD_COLUMNS)
 
