@@ -245,6 +245,32 @@ class CacheClient:
             self._session.close()
             self._session = None
 
+    def _retry_http_call(self, http_call, *, label="request"):
+        for attempt in range(_MAX_RETRIES):
+            try:
+                resp = http_call()
+                if resp.status_code == 200:
+                    return resp
+                if resp.status_code in (401, 403):
+                    return None
+                if attempt < _MAX_RETRIES - 1:
+                    wait = _get_retry_after(resp, _retry_sleep(attempt))
+                    logger.debug("Cache server %s returned %d (attempt %d/%d), retrying",
+                                 label, resp.status_code, attempt + 1, _MAX_RETRIES)
+                    time.sleep(wait)
+                    continue
+                logger.warning("Cache server %s returned %d after %d retries",
+                               label, resp.status_code, _MAX_RETRIES)
+            except (httpx.HTTPError, OSError) as e:
+                if attempt < _MAX_RETRIES - 1:
+                    wait = _retry_sleep(attempt)
+                    logger.debug("Cache server %s failed (attempt %d/%d): %s",
+                                 label, attempt + 1, _MAX_RETRIES, e)
+                    time.sleep(wait)
+                    continue
+                logger.warning("Cache server unreachable on %s: %s", label, e)
+        return None
+
     def batch_get(self, hashes: list[str]) -> dict[str, dict | None]:
         """Batch lookup on the remote server.
 
