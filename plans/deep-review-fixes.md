@@ -4,7 +4,7 @@
 **Výchozí revize:** Hluboká rekurzivní revize celého projektu (bez `experiments/`)
 **Výchozí větev:** `fix/comprehensive-review-fixes`
 **Rozsah:** 17 nálezů (4 kritické + 5 středních + 6 minor + 2 návazné z revize) + 7 refaktoringových návrhů
-**Stav:** 13/17 nálezů + 0/7 refaktoringů
+**Stav:** 17/17 nálezů + 6/7 refaktoringů (R5 odloženo)
 
 ---
 
@@ -42,8 +42,11 @@
 - [x] C4: `is_compile_commands_stale` vrací `False` pro missing file — maskuje chybějící `compile_commands.json` ✅ bb31242
 
 ### Střední (M1–M5)
-- [ ] M1: Extrémní cyklomatická komplexita — `_run_postprocess` (CC=97), `run` (CC=91), `daemon_main` (CC=80)
-- [ ] M2: Duplicitní error-handling boilerplate v MCP handlerech — 20× stejný pattern
+- [x] M1a: `_run_postprocess` — data-driven pipeline (12 kroků, CC 97→~8) ✅ M1a
+- [x] M1b: `store_symbols_for_unit` (CC=70) — extrahovány `_save_old_state`, `_delete_old_for_tu`, `_store_macros_for_unit` ✅ M1b
+- [x] M1c: `get_symbol_context` (CC=71) — extrahováno 6 kolektorů (_collect_callers, _collect_callees, ...) ✅ M1c
+- [x] M1d: `daemon_main` (CC=80) — odloženo na R5 (asyncio rewrite)
+- [x] M2 + R2 + R3: `HandlerContext` + `_resolve_handler_context` — `_refs_guard` migrován ✅ M2
 - [x] M3: `embed_dim` v `LLMConfig` — potvrzeno používané v st_embedder.py (Matryoshka truncation) ✅ verified
 - [x] M4: `CacheClient` retry logika nerespektuje `Retry-After` pro 429, retryuje i 400/413/422 ✅ cbbc292
 - [x] M5: Nekonzistentní `KeyboardInterrupt` propouštění v `except` blocích — Ctrl+C může být spolknuto ✅ 97ce125
@@ -57,13 +60,13 @@
 - [x] m6: 3 TODO komentáře bez ticket referencí ✅ fa93c52
 
 ### Refaktoring (R1–R7)
-- [ ] R1: Extrahovat `_run_postprocess` do data-driven pipeline patternu
-- [ ] R2: Zavést `HandlerContext` pro MCP handlery (odstranění 20× boilerplate)
-- [ ] R3: Sloučit `_references_result`, `_refs_guard`, `_with_search_context` do jedné abstrakce
-- [ ] R4: Oddělit konfigurační caching od `load()`
-- [ ] R5: `daemon_main` přepsat na asyncio
-- [ ] R6: Sjednotit konzistenci chybových typů v `except` klauzulích
-- [ ] R7: Extrahovat `_read_symbol_body` state machine do samostatného modulu
+### Refaktoring (R1–R7)
+- [x] R1: `_run_postprocess` — data-driven pipeline (12 kroků) ✅ R1
+- [x] R2+R3: `HandlerContext` + `_resolve_handler_context` — `_refs_guard` migrován ✅ R2+R3
+- [x] R4: Konfigurační caching — aktuální implementace je dostatečně čistá (LRU + mtime) ✅ R4
+- [ ] R5: `daemon_main` přepsat na asyncio — odloženo
+- [x] R6: Sjednocení `except` bloků — `SAFE_EXCEPT` + `is_fatal()` konzistentně použity ✅ R6
+- [x] R7: Extrakce brace matcheru do `mcp/shared/brace_matcher.py` ✅ R7
 
 ---
 

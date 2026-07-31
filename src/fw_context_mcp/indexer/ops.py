@@ -508,6 +508,114 @@ def _detect_moved_symbols(
         log.debug("Detected %d moved symbols", moved)
 
 
+def _save_old_state(
+    conn: sqlite3.Connection,
+    config_hash: str,
+    normalized_tu_path: str,
+    known: dict[str, tuple[int, float]],
+) -> tuple[set[str], dict[str, dict]]:
+    """Save USRs and LLM analysis of symbols that existed in a previous build.
+
+    Returns (old_usrs, saved_analyses) for use by _restore_llm_analysis
+    and _detect_moved_symbols later in the pipeline.
+    """
+    old_usrs: set[str] = set()
+    saved_analyses: dict[str, dict] = {}
+    if normalized_tu_path not in known:
+        return old_usrs, saved_analyses
+    file_id_old = known[normalized_tu_path][0]
+    old_rows = conn.execute(
+        """SELECT s.usr, a.summary, a.inputs, a.outputs, a.model, a.content_hash
+           FROM symbols s
+           LEFT JOIN llm_analysis a ON a.symbol_id = s.id
+           WHERE s.file_id = ?""",
+        (file_id_old,),
+    ).fetchall()
+    for r in old_rows:
+        old_usrs.add(r["usr"])
+        if r["summary"]:
+            saved_analyses[r["usr"]] = {
+                "summary": r["summary"],
+                "inputs": r["inputs"],
+                "outputs": r["outputs"],
+                "model": r["model"],
+                "content_hash": r["content_hash"],
+            }
+    return old_usrs, saved_analyses
+
+
+def _delete_old_for_tu(
+    conn: sqlite3.Connection,
+    config_hash: str,
+    normalized_tu_path: str,
+    known: dict[str, tuple[int, float]],
+    syms: list,
+) -> None:
+    """Delete stale inheritance and symbol rows for a TU before re-insertion.
+
+    Removes inheritance edges for classes being re-parsed, then drops all
+    symbols and inheritance records tied to the TU's file_id.
+    """
+    _class_kinds = frozenset({"class", "struct"})
+    _class_usrs = {s.usr for s in syms if s.kind in _class_kinds}
+    if _class_usrs:
+        for usr in _class_usrs:
+            conn.execute(
+                "DELETE FROM inheritance WHERE config_hash = ? AND derived_usr = ?",
+                (config_hash, usr),
+            )
+    if normalized_tu_path in known:
+        file_id_old = known[normalized_tu_path][0]
+        delete_inheritance_for_file(conn, config_hash, file_id_old)
+        delete_symbols_for_file(conn, file_id_old)
+
+
+def _store_macros_for_unit(
+    conn: sqlite3.Connection,
+    config_hash: str,
+    macros: list,
+    file_path: str,
+    normalized_tu_path: str,
+    current_mtime: float,
+    tu_file_id: int,
+    file_id_cache: dict[str, int],
+    project_root: Path,
+) -> None:
+    """Insert or update macro definitions for one translation unit.
+
+    Upserts file records for header files that contain macros, then
+    replaces all macros previously stored for this TU with the fresh set.
+    """
+    if not macros:
+        return
+    macro_rows: list[tuple] = []
+    for m in macros:
+        m_raw = str(m.file) if m.file else file_path
+        m_path = _normalize_file_path(m_raw, project_root)
+        if m_path not in file_id_cache:
+            lang = "cpp" if Path(m_raw).suffix.lower() in {".cpp", ".cc", ".cxx", ".c++"} else "c"
+            m_mtime = current_mtime if m_path == normalized_tu_path else 0.0
+            try:
+                m_mtime = Path(m_raw).stat().st_mtime
+            except OSError:
+                pass
+            file_id_cache[m_path] = upsert_file(conn, config_hash, m_path, lang, mtime=m_mtime)
+        m_file_id = file_id_cache[m_path]
+        macro_rows.append(
+            (
+                config_hash,
+                m_file_id,
+                m.name,
+                m.value,
+                m.expanded_value,
+                m.line,
+                int(m.is_function_like),
+            )
+        )
+    delete_macros_for_file(conn, tu_file_id)
+    if macro_rows:
+        insert_macros_batch(conn, macro_rows)
+
 def store_symbols_for_unit(
     conn,
     unit,
@@ -627,41 +735,10 @@ def store_symbols_for_unit(
     _clear_body_cache()
 
     # ── Phase 1: Save USRs + analysis of old symbols ──
-    old_usrs: set[str] = set()
-    saved_analyses: dict[str, dict] = {}
-    if normalized_tu_path in known:
-        file_id_old = known[normalized_tu_path][0]
-        old_rows = conn.execute(
-            """SELECT s.usr, a.summary, a.inputs, a.outputs, a.model, a.content_hash
-               FROM symbols s
-               LEFT JOIN llm_analysis a ON a.symbol_id = s.id
-               WHERE s.file_id = ?""",
-            (file_id_old,),
-        ).fetchall()
-        for r in old_rows:
-            old_usrs.add(r["usr"])
-            if r["summary"]:
-                saved_analyses[r["usr"]] = {
-                    "summary": r["summary"],
-                    "inputs": r["inputs"],
-                    "outputs": r["outputs"],
-                    "model": r["model"],
-                    "content_hash": r["content_hash"],
-                }
+    old_usrs, saved_analyses = _save_old_state(conn, config_hash, normalized_tu_path, known)
 
     # ── Phase 2: Delete old symbols ──
-    _class_kinds = frozenset({"class", "struct"})
-    _class_usrs = {s.usr for s in syms if s.kind in _class_kinds}
-    if _class_usrs:
-        for usr in _class_usrs:
-            conn.execute(
-                "DELETE FROM inheritance WHERE config_hash = ? AND derived_usr = ?",
-                (config_hash, usr),
-            )
-    if normalized_tu_path in known:
-        file_id_old = known[normalized_tu_path][0]
-        delete_inheritance_for_file(conn, config_hash, file_id_old)
-        delete_symbols_for_file(conn, file_id_old)
+    _delete_old_for_tu(conn, config_hash, normalized_tu_path, known, syms)
 
     # Upsert the TU file record and capture its id
     if hashes is not None:
@@ -753,35 +830,10 @@ def store_symbols_for_unit(
 
     # Macros
     _t_macros = time.monotonic()
-    if macros:
-        macro_rows: list[tuple] = []
-        for m in macros:
-            m_raw = str(m.file) if m.file else file_path
-            m_path = _normalize_file_path(m_raw, project_root)
-            if m_path not in file_id_cache:
-                lang = "cpp" if Path(m_raw).suffix.lower() in {".cpp", ".cc", ".cxx", ".c++"} else "c"
-                m_mtime = current_mtime if m_path == normalized_tu_path else 0.0
-                try:
-                    m_mtime = Path(m_raw).stat().st_mtime
-                except OSError:
-                    pass
-                file_id_cache[m_path] = upsert_file(conn, config_hash, m_path, lang, mtime=m_mtime)
-            m_file_id = file_id_cache[m_path]
-            macro_rows.append(
-                (
-                    config_hash,
-                    m_file_id,
-                    m.name,
-                    m.value,
-                    m.expanded_value,
-                    m.line,
-                    int(m.is_function_like),
-                )
-            )
-        # Delete existing macros for the TU's file before inserting (stale prevention)
-        delete_macros_for_file(conn, tu_file_id)
-        if macro_rows:
-            insert_macros_batch(conn, macro_rows)
+    _store_macros_for_unit(
+        conn, config_hash, macros, file_path, normalized_tu_path,
+        current_mtime, tu_file_id, file_id_cache, project_root,
+    )
     _t_macros = time.monotonic() - _t_macros
 
     # Fill files.content with ifdef-filtered content (tokenization pass)

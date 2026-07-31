@@ -24,6 +24,8 @@ from .connection import (
     _open_and_cache,
     _open_db_or_return,
     _open_db_safe,
+    _resolve_handler_context,
+    HandlerContext,
 )
 
 from .readiness import (
@@ -45,4 +47,6 @@ __all__ = [
     "_open_db_safe",
     "_resolve_context",
     "_invalidate_conn_cache",
+    "_resolve_handler_context",
+    "HandlerContext",
 ]

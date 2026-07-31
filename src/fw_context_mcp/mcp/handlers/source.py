@@ -177,65 +177,11 @@ def _read_symbol_body(file_path: str, line_no: int, end_line: int = 0, max_lines
         local_end = min(len(window) - 1, end_line - 1 - read_start)
         return "\n".join(f"{read_start + i + 1:4d}  {window[i]}" for i in range(local_start, local_end + 1))
 
-    # Brace matching with basic string/comment awareness.
-    # Tracks whether we're inside a string literal, char literal, or comment
-    # to avoid miscounting braces in those contexts.
-    #
-    # LIMITATION: C++11 raw string literals (R"(...)" and R"delim(...)delim")
-    # are NOT handled — braces and quotes inside them may cause miscounts.
-    # Embedded C/C++ code rarely uses raw strings, so this is acceptable.
-    NORMAL, STRING, CHAR, LINE_COMMENT, BLOCK_COMMENT = 0, 1, 2, 3, 4
-    state = NORMAL
-    depth = 0
-    seen_open = False
-    local_end = local_start
-    for i in range(local_start, len(window)):
-        line = window[i]
-        j = 0
-        while j < len(line):
-            ch = line[j]
-            if state == NORMAL:
-                if ch == '"':
-                    state = STRING
-                elif ch == "'":
-                    state = CHAR
-                elif ch == '/' and j + 1 < len(line) and line[j + 1] == '/':
-                    state = LINE_COMMENT
-                    j += 1
-                elif ch == '/' and j + 1 < len(line) and line[j + 1] == '*':
-                    state = BLOCK_COMMENT
-                    j += 1
-                elif ch == '{':
-                    depth += 1
-                    seen_open = True
-                elif ch == '}':
-                    depth -= 1
-            elif state == STRING:
-                if ch == '\\' and j + 1 < len(line):
-                    j += 1  # skip escaped character
-                elif ch == '"':
-                    state = NORMAL
-            elif state == CHAR:
-                if ch == '\\' and j + 1 < len(line):
-                    j += 1  # skip escaped character
-                elif ch == "'":
-                    state = NORMAL
-            elif state == LINE_COMMENT:
-                # Line comment ends at end of line
-                pass
-            elif state == BLOCK_COMMENT:
-                if ch == '*' and j + 1 < len(line) and line[j + 1] == '/':
-                    state = NORMAL
-                    j += 1
-            j += 1
-        # Line comments reset at end of line
-        if state == LINE_COMMENT:
-            state = NORMAL
-        local_end = i
-        if seen_open and depth <= 0 and state == NORMAL:
-            break
-    if not seen_open:
-        local_end = min(len(window) - 1, local_start + 2)
+    # Brace matching with basic string/comment awareness —
+    # delegated to the shared brace_matcher module.
+    from fw_context_mcp.mcp.shared.brace_matcher import find_closing_brace
+
+    local_end = find_closing_brace(window, local_start)
     return "\n".join(f"{read_start + i + 1:4d}  {window[i]}" for i in range(local_start, local_end + 1))
 
 # ── moved from server.py ──
@@ -587,6 +533,176 @@ def get_file_map(
     return result
 
 # ── moved from server.py ──
+# ── get_symbol_context collectors ───────────────────────────────────
+
+
+def _collect_callers(
+    conn: sqlite3.Connection, config_hash: str, name: str, root: Path
+) -> list[dict]:
+    """Return immediate callers (direct + indirect) for a symbol."""
+    callers = find_refs(conn, config_hash, name, ref_kind=["call", "indirect"])
+    return [
+        {"name": c["caller_name"] or "?", "qualified_name": c["caller_qname"] or "",
+         "file": abs_path(root, c["caller_file"] or c["from_file"]),
+         "line": c["from_line"], "kind": c["caller_kind"] or "",
+         "ref_kind": c["ref_kind"]}
+        for c in callers
+    ]
+
+
+def _collect_callees(
+    conn: sqlite3.Connection, config_hash: str, symbol_usr: str, root: Path
+) -> list[dict]:
+    """Return immediate callees (direct + indirect calls made by this symbol)."""
+    callees_rows = conn.execute(
+        """SELECT s.name, s.qualified_name, s.kind, s.file_path, r.ref_kind
+           FROM refs r
+           JOIN symbols s ON s.usr = r.to_usr AND s.config_hash = r.config_hash
+           WHERE r.from_usr = ? AND r.config_hash = ?
+             AND r.ref_kind IN ('call', 'indirect')""",
+        (symbol_usr, config_hash),
+    ).fetchall()
+    return [
+        {"name": c["name"], "qualified_name": c["qualified_name"] or "",
+         "kind": c["kind"], "file": abs_path(root, c["file_path"]),
+         "ref_kind": c["ref_kind"]}
+        for c in callees_rows
+    ]
+
+
+def _collect_indirect_calls(
+    conn: sqlite3.Connection,
+    config_hash: str,
+    row: sqlite3.Row,
+    symbol_usr: str,
+    root: Path,
+) -> list[dict]:
+    """Return indirect call sites: either who calls this field/variable,
+    or what this function calls indirectly."""
+    kind = row["kind"]
+    if kind in ("field", "variable", "varglobal", "varlocal"):
+        ics_rows = find_indirect_call_sites(
+            conn, config_hash, row["qualified_name"] or row["name"], limit=200
+        )
+        return [
+            {
+                "file": abs_path(root, r["from_file"]),
+                "line": r["from_line"],
+                "expr_text": r["expr_text"],
+                "fn_ptr_type": r["fn_ptr_type"],
+                "caller": r["caller_qname"] or r["caller_name"] or "<file scope>",
+            }
+            for r in ics_rows
+        ]
+    if kind in ("function", "method"):
+        ics_rows = conn.execute(
+            """SELECT ics.*, caller.name AS caller_name,
+                      caller.qualified_name AS caller_qname,
+                      caller.kind AS caller_kind
+               FROM indirect_call_sites ics
+               LEFT JOIN symbols caller
+                 ON caller.config_hash = ics.config_hash
+                AND caller.usr = ics.from_usr
+               WHERE ics.config_hash = ? AND ics.from_usr = ?
+               ORDER BY ics.from_file, ics.from_line
+               LIMIT 200""",
+            (config_hash, symbol_usr),
+        ).fetchall()
+        return [
+            {
+                "file": abs_path(root, r["from_file"]),
+                "line": r["from_line"],
+                "expr_text": r["expr_text"],
+                "fn_ptr_type": r["fn_ptr_type"],
+                "caller": r["caller_qname"] or r["caller_name"] or "<file scope>",
+            }
+            for r in ics_rows
+        ]
+    return []
+
+
+def _collect_resolution_info(
+    conn: sqlite3.Connection,
+    config_hash: str,
+    row: sqlite3.Row,
+    symbol_usr: str,
+    indirect_calls_list: list[dict],
+) -> dict | None:
+    """Build Phase 3 resolution metadata for function-pointer symbols."""
+    kind = row["kind"]
+    if kind not in ("field", "variable", "varglobal", "varlocal"):
+        return None
+    assign_count = conn.execute(
+        "SELECT COUNT(*) FROM fp_assignments WHERE config_hash = ? AND lhs_usr = ?",
+        (config_hash, symbol_usr),
+    ).fetchone()[0]
+    ics_count = len(indirect_calls_list)
+    if assign_count == 0 and ics_count == 0:
+        return None
+    resolved = assign_count > 0 and ics_count > 0
+    note_parts: list[str] = []
+    if assign_count > 0:
+        note_parts.append(f"{assign_count} function(s) assigned")
+    else:
+        note_parts.append("no assignments found")
+    if ics_count > 0:
+        note_parts.append(f"{ics_count} call site(s)")
+    else:
+        note_parts.append("no call sites found")
+    if resolved:
+        note_parts.append("fully resolved")
+    else:
+        note_parts.append(
+            "not fully resolved — "
+            + ("assignment may be in unindexed code or through type-erased API"
+               if assign_count == 0
+               else "call sites may be in unindexed code")
+        )
+    return {
+        "assignments_found": assign_count,
+        "call_sites_found": ics_count,
+        "resolved": resolved,
+        "note": "; ".join(note_parts),
+    }
+
+
+def _collect_enum_constants(
+    conn: sqlite3.Connection, config_hash: str, row: sqlite3.Row
+) -> list[dict]:
+    """Return enum member constants (name + value) for an enum symbol."""
+    if row["kind"] != "enum":
+        return []
+    qn = row["qualified_name"]
+    const_rows = conn.execute(
+        """SELECT name, qualified_name, line, enum_value
+           FROM symbols
+           WHERE config_hash = ? AND kind = 'enum_constant'
+             AND (qualified_name LIKE ? OR qualified_name LIKE ?)
+           ORDER BY line""",
+        (config_hash, f"{qn}::%", f"%{qn}::%"),
+    ).fetchall()
+    return [
+        {
+            "name": c["name"],
+            **({"enum_value": c["enum_value"]} if c["enum_value"] is not None else {}),
+        }
+        for c in const_rows
+    ]
+
+
+def _collect_override_info(
+    conn: sqlite3.Connection, config_hash: str, row: sqlite3.Row
+) -> dict | None:
+    """Return virtual-method override metadata when applicable."""
+    kind = row["kind"]
+    if kind not in ("method", "destructor"):
+        return None
+    if not (row["is_virtual"] or row["is_pure_virtual"]):
+        return None
+    return get_overrides_for_method(conn, config_hash, row["usr"])
+
+
+# ── moved from server.py ──
 def get_symbol_context(
     name: Annotated[str, Field(description="Symbol name. Returns body, signature, all direct callers and callees.")],
     project_root: Annotated[str | None, Field(description="Project root. Auto-detected if omitted.")] = None,
@@ -673,139 +789,26 @@ def get_symbol_context(
             symbol_usr = row["usr"]
 
             # Immediate callers (who calls this symbol, direct + indirect).
-            # Returns ALL callers — the call graph naturally spans project
-            # and vendor boundaries in both directions (project → vendor API,
-            # vendor callback → project handler).  Filtering would distort
-            # the call graph and break transitive closure.
-            callers = find_refs(conn, config_hash, name, ref_kind=["call", "indirect"])
-            callers_list = [
-                {"name": c["caller_name"] or "?", "qualified_name": c["caller_qname"] or "",
-                 "file": abs_path(root, c["caller_file"] or c["from_file"]),
-                 "line": c["from_line"], "kind": c["caller_kind"] or "",
-                 "ref_kind": c["ref_kind"]}
-                for c in callers
-            ]
+            callers_list = _collect_callers(conn, config_hash, name, root)
 
             # Immediate callees (what this symbol calls, direct + indirect).
-            callees_rows = conn.execute(
-                """SELECT s.name, s.qualified_name, s.kind, s.file_path, r.ref_kind
-                   FROM refs r
-                   JOIN symbols s ON s.usr = r.to_usr AND s.config_hash = r.config_hash
-                   WHERE r.from_usr = ? AND r.config_hash = ?
-                     AND r.ref_kind IN ('call', 'indirect')""",
-                (symbol_usr, config_hash),
-            ).fetchall()
-            callees_list = [
-                {"name": c["name"], "qualified_name": c["qualified_name"] or "",
-                 "kind": c["kind"], "file": abs_path(root, c["file_path"]),
-                 "ref_kind": c["ref_kind"]}
-                for c in callees_rows
-            ]
+            callees_list = _collect_callees(conn, config_hash, symbol_usr, root)
 
-            # Indirect call sites — for function pointer fields and variables
-            indirect_calls_list: list[dict] = []
-            if row["kind"] in ("field", "variable", "varglobal", "varlocal"):
-                ics_rows = find_indirect_call_sites(
-                    conn, config_hash, row["qualified_name"] or row["name"], limit=200
-                )
-                indirect_calls_list = [
-                    {
-                        "file": abs_path(root, r["from_file"]),
-                        "line": r["from_line"],
-                        "expr_text": r["expr_text"],
-                        "fn_ptr_type": r["fn_ptr_type"],
-                        "caller": r["caller_qname"] or r["caller_name"] or "<file scope>",
-                    }
-                    for r in ics_rows
-                ]
-            elif row["kind"] in ("function", "method"):
-                # Indirect calls made BY this function (via from_usr),
-                # e.g. handlers[irq](arg), driver->onData(args), cb(args).
-                ics_rows = conn.execute(
-                    """SELECT ics.*, caller.name AS caller_name,
-                              caller.qualified_name AS caller_qname,
-                              caller.kind AS caller_kind
-                       FROM indirect_call_sites ics
-                       LEFT JOIN symbols caller
-                         ON caller.config_hash = ics.config_hash
-                        AND caller.usr = ics.from_usr
-                       WHERE ics.config_hash = ? AND ics.from_usr = ?
-                       ORDER BY ics.from_file, ics.from_line
-                       LIMIT 200""",
-                    (config_hash, symbol_usr),
-                ).fetchall()
-                indirect_calls_list = [
-                    {
-                        "file": abs_path(root, r["from_file"]),
-                        "line": r["from_line"],
-                        "expr_text": r["expr_text"],
-                        "fn_ptr_type": r["fn_ptr_type"],
-                        "caller": r["caller_qname"] or r["caller_name"] or "<file scope>",
-                    }
-                    for r in ics_rows
-                ]
+            # Indirect call sites — for function pointer fields and variables,
+            # and indirect calls made BY functions/methods.
+            indirect_calls_list = _collect_indirect_calls(conn, config_hash, row, symbol_usr, root)
 
             # Resolution info — for function pointer fields/variables
-            resolution: dict | None = None
-            if row["kind"] in ("field", "variable", "varglobal", "varlocal"):
-                # Count assignments to this field
-                assign_count = conn.execute(
-                    "SELECT COUNT(*) FROM fp_assignments WHERE config_hash = ? AND lhs_usr = ?",
-                    (config_hash, symbol_usr),
-                ).fetchone()[0]
-                ics_count = len(indirect_calls_list)
-                resolved = assign_count > 0 and ics_count > 0
-                if assign_count > 0 or ics_count > 0:
-                    note_parts: list[str] = []
-                    if assign_count > 0:
-                        note_parts.append(f"{assign_count} function(s) assigned")
-                    else:
-                        note_parts.append("no assignments found")
-                    if ics_count > 0:
-                        note_parts.append(f"{ics_count} call site(s)")
-                    else:
-                        note_parts.append("no call sites found")
-                    if resolved:
-                        note_parts.append("fully resolved")
-                    else:
-                        note_parts.append(
-                            "not fully resolved — "
-                            "assignment may be in unindexed code or through type-erased API"
-                            if assign_count == 0
-                            else "call sites may be in unindexed code"
-                        )
-                    resolution = {
-                        "assignments_found": assign_count,
-                        "call_sites_found": ics_count,
-                        "resolved": resolved,
-                        "note": "; ".join(note_parts),
-                    }
+            resolution = _collect_resolution_info(conn, config_hash, row, symbol_usr, indirect_calls_list)
 
             # For enums, collect all constants with their values
-            enum_constants: list[dict] = []
-            if row["kind"] == "enum":
-                qn = row["qualified_name"]
-                const_rows = conn.execute(
-                    """SELECT name, qualified_name, line, enum_value
-                       FROM symbols
-                       WHERE config_hash = ? AND kind = 'enum_constant'
-                         AND (qualified_name LIKE ? OR qualified_name LIKE ?)
-                       ORDER BY line""",
-                    (config_hash, f"{qn}::%", f"%{qn}::%"),
-                ).fetchall()
-                enum_constants = [
-                    {
-                        "name": c["name"],
-                        **({"enum_value": c["enum_value"]} if c["enum_value"] is not None else {}),
-                    }
-                    for c in const_rows
-                ]
+            enum_constants = _collect_enum_constants(conn, config_hash, row)
+
             # Pre-computed LLM analysis (if available)
             llm_analysis = get_llm_analysis_for_symbol(conn, row["id"])
+
             # Override info for virtual methods
-            overrides_info = None
-            if row["kind"] in ("method", "destructor") and (row["is_virtual"] or row["is_pure_virtual"]):
-                overrides_info = get_overrides_for_method(conn, config_hash, symbol_usr)
+            overrides_info = _collect_override_info(conn, config_hash, row)
     finally:
         pass  # connection managed by connection.py cache
 
