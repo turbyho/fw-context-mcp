@@ -9,6 +9,7 @@ Hierarchy (later overrides earlier):
 
 from __future__ import annotations
 
+import logging
 import os
 import sys
 import tomllib
@@ -19,6 +20,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from ..indexer.build import BuildConfig
+from ..indexer.build import BuildConfig
+log = logging.getLogger(__name__)
 
 __all__ = [
     "CacheServerConfig", "Config", "LLMConfig", "IndexConfig", "ProjectMeta",
@@ -412,6 +415,7 @@ def _safe_int(val, default: int = 0) -> int:
     try:
         return int(val)
     except (ValueError, TypeError):
+        log.warning("Invalid int value %r — using default %d", val, default)
         return default
 
 
@@ -419,6 +423,7 @@ def _safe_float(val, default: float = 0.0) -> float:
     try:
         return float(val)
     except (ValueError, TypeError):
+        log.warning("Invalid float value %r — using default %.3f", val, default)
         return default
 
 
@@ -498,8 +503,20 @@ def _convert(value, conv: str):
     if conv == "str":
         return value
     if conv == "bool":
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            v = value.strip().lower()
+            if v in ("true", "yes", "1", "on"):
+                return True
+            if v in ("false", "no", "0", "off", ""):
+                return False
         return bool(value)
     if conv == "list":
+        if isinstance(value, list):
+            return value
+        if isinstance(value, str):
+            return [value]
         return list(value)
     if conv == "dict":
         return dict(value)
