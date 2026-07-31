@@ -1,4 +1,9 @@
-"""Schema definitions, migrations, and data backfills for fw-context-mcp index."""
+"""Schema definitions, migrations, and data backfills for fw-context-mcp index.
+
+Note: SQL DEFAULT (datetime('now')) captures per-row INSERT timestamps.
+Rows inserted in the same transaction may share identical timestamps —
+this is expected and harmless.  Use first_indexed_at for the earliest event.
+"""
 
 from __future__ import annotations
 

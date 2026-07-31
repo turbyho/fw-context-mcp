@@ -2464,7 +2464,8 @@ def run(
         """
         pause_file = db_path.parent / "reindex.pause"
         our_pid = os.getpid()
-        deadline = time.monotonic() + 300  # 5-minute timeout
+        # 1s polling — exits immediately when no pause file exists
+        deadline = time.monotonic() + 300  # 5-min timeout
         while True:
             if time.monotonic() > deadline:
                 log.warning("_wait_if_paused: timeout after 300s — resuming")

@@ -686,7 +686,7 @@ def find_wrapper_callers(
                FROM symbols s
                WHERE s.config_hash = ?
                  AND s.kind = 'method'
-                 AND (s.qualified_name LIKE ? OR s.qualified_name LIKE ?)
+                 AND (s.qualified_name LIKE ? OR s.qualified_name LIKE ?)  -- full table scan: LIKE with leading % cannot use index
                ORDER BY s.name""",
             (config_hash, f"{class_name}::%", f"%{class_name}::%"),
         ).fetchall()
