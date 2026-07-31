@@ -130,5 +130,5 @@ def _detect_build_system(root: Path) -> str:
         from fw_context_mcp.indexer.build import detect_build_system
         result = detect_build_system(root)
         return result if result is not None else "unknown"
-    except Exception:
+    except (ValueError, TypeError, RuntimeError, sqlite3.Error):
         return "unknown"

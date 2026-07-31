@@ -44,7 +44,7 @@ def _spawn_daemon(root: Path) -> None:
         )
         log_fh.close()
         # Daemon process runs independently via start_new_session=True — no detach needed
-    except Exception:
+    except (ValueError, TypeError, RuntimeError, AttributeError):
         log.exception("Failed to spawn watcher daemon for %s", root)
 
 # ── _is_bg_reindex_running (was at server.py:367) ──

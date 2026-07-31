@@ -90,7 +90,7 @@ def local_cache_upsert(conn: sqlite3.Connection, entries: list[dict]) -> int:
             )
             if cur.rowcount:
                 inserted += 1
-        except Exception:
+        except (ValueError, TypeError, RuntimeError, sqlite3.Error):
             logger.debug("local_cache_upsert: failed to insert entry", exc_info=True)
     conn.commit()
     return inserted

@@ -59,7 +59,7 @@ def open_global_db() -> sqlite3.Connection:
             except sqlite3.Error:
                 try:
                     _global_conn.close()
-                except Exception:
+                except (ValueError, TypeError, RuntimeError, sqlite3.Error):
                     pass
                 _global_conn = None  # stale connection, reopen
 
