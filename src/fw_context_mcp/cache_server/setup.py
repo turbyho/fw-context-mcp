@@ -396,7 +396,7 @@ def _save_credentials(password: str) -> None:
     lib_path = Path("/var/lib/fw-cache-server")
     try:
         _run(["sudo", "mkdir", "-p", str(lib_path)], timeout=10)
-        lib_path.chmod(0o750)
+        _run(["sudo", "chmod", "0750", str(lib_path)], timeout=10)
         import subprocess
         subprocess.run(
             ["sudo", "tee", str(lib_path / "db.env")],
