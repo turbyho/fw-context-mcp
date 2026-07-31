@@ -501,13 +501,19 @@ def reset_index(
         else:
             info["message"] = f"Would delete {db_path}. Call reset_index(confirm=True) to proceed."
         return info
-    db_path.unlink()
-    for suffix in ("-wal", "-shm", "-journal"):
-        p = db_path.with_name(db_path.name + suffix)
-        p.unlink(missing_ok=True)
-    _invalidate_conn_cache(str(db_path.resolve()))
-    info["action"] = "deleted"
-    info["message"] = f"Index deleted. Run 'fw-context index' in {root} to rebuild."
+    from ..background import _request_bg_reindex_pause, _resume_bg_reindex
+
+    _request_bg_reindex_pause(root)
+    try:
+        db_path.unlink()
+        for suffix in ("-wal", "-shm", "-journal"):
+            p = db_path.with_name(db_path.name + suffix)
+            p.unlink(missing_ok=True)
+        _invalidate_conn_cache(str(db_path.resolve()))
+        info["action"] = "deleted"
+        info["message"] = f"Index deleted. Run 'fw-context index' in {root} to rebuild."
+    finally:
+        _resume_bg_reindex(root)
     return info
 
 
