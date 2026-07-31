@@ -20,7 +20,7 @@ from ...indexer.db import (
 )
 from ...llm.ollama import OllamaError, OllamaModelNotFoundError, call_ollama_async
 from ...utils import abs_path, read_file_lines
-from ..shared.context import _open_db_safe, _resolve_context
+from ..shared.context import _open_db_or_return, _resolve_context
 
 log = logging.getLogger(__name__)
 def _validate_path_in_root(resolved_path: str, root: Path) -> str | None:
@@ -263,10 +263,9 @@ async def explain_symbol(
     db_path, cfg, project_id, root = _resolve_context(project_root)
     if not db_path.exists():
         return {"error": f"No index found for {root}. Run 'fw-context index' first."}
-    conn, err = _open_db_safe(db_path)
-    if err:
-        return err
-    assert conn is not None
+    conn, err_result = _open_db_or_return(db_path)
+    if err_result:
+        return err_result[0]
     try:
         with conn:
             cfg_data = get_active_config(conn, project_id)
@@ -414,10 +413,9 @@ def get_source(
     db_path, cfg, project_id, root = _resolve_context(project_root)
     if not db_path.exists():
         return {"error": f"No index found for {root}. Run 'fw-context index' first."}
-    conn, err = _open_db_safe(db_path)
-    if err:
-        return err
-    assert conn is not None
+    conn, err_result = _open_db_or_return(db_path)
+    if err_result:
+        return err_result[0]
     try:
         with conn:
             cfg_data = get_active_config(conn, project_id)
@@ -540,10 +538,9 @@ def get_file_map(
     db_path, cfg, project_id, root = _resolve_context(project_root)
     if not db_path.exists():
         return {"error": f"No index found for {root}. Run 'fw-context index' first."}
-    conn, err = _open_db_safe(db_path)
-    if err:
-        return err
-    assert conn is not None
+    conn, err_result = _open_db_or_return(db_path)
+    if err_result:
+        return err_result[0]
     try:
         with conn:
             cfg_data = get_active_config(conn, project_id)
@@ -628,10 +625,9 @@ def get_symbol_context(
     db_path, cfg, project_id, root = _resolve_context(project_root)
     if not db_path.exists():
         return {"error": f"No index found for {root}. Run 'fw-context index' first."}
-    conn, err = _open_db_safe(db_path)
-    if err:
-        return err
-    assert conn is not None
+    conn, err_result = _open_db_or_return(db_path)
+    if err_result:
+        return err_result[0]
     try:
         with conn:
             cfg_data = get_active_config(conn, project_id)
@@ -882,10 +878,9 @@ def read_file(
     db_path, cfg, project_id, root = _resolve_context(project_root)
     if not db_path.exists():
         return {"error": f"No index found for {root}. Run 'fw-context index' first."}
-    conn, err = _open_db_safe(db_path)
-    if err:
-        return err
-    assert conn is not None
+    conn, err_result = _open_db_or_return(db_path)
+    if err_result:
+        return err_result[0]
     try:
         with conn:
             cfg_data = get_active_config(conn, project_id)

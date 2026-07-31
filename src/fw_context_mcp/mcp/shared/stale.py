@@ -10,7 +10,7 @@ from pathlib import Path
 from ...config import derive_project_id
 from ...indexer.db import get_active_config, get_file_mtime_indexed
 from ...utils import MTIME_TOLERANCE_S, abs_path
-from .context import _open_db_safe
+from .context import _open_db_or_return
 
 log = logging.getLogger(__name__)
 
@@ -331,10 +331,9 @@ def _with_stale_recovery(
     """
     from ..background import _ensure_daemon_running  # lazy — avoids circular import
 
-    conn, err = _open_db_safe(db_path)
-    if err:
-        return [err]
-    assert conn is not None
+    conn, err_result = _open_db_or_return(db_path)
+    if err_result:
+        return err_result
     try:
         with conn:
             project_id = derive_project_id(root)

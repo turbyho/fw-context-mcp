@@ -27,7 +27,7 @@ from ...indexer.db import (
     find_indirect_targets as query_indirect_targets,
 )
 from ...utils import abs_path, resolve_project_root
-from ..shared.context import _db_path, _open_db_safe, _resolve_context
+from ..shared.context import _db_path, _open_db_or_return, _open_db_safe, _resolve_context
 from .source import _lookup_definition
 
 log = logging.getLogger(__name__)
@@ -53,10 +53,9 @@ def _references_result(name: str, project_root: str | None, ref_kind: str | list
     db_path, cfg, project_id, root = _resolve_context(project_root)
     if not db_path.exists():
         return [{"error": f"No index found for {root}. Run 'fw-context index' first."}]
-    conn, err = _open_db_safe(db_path)
-    if err:
-        return [err]
-    assert conn is not None
+    conn, err_result = _open_db_or_return(db_path)
+    if err_result:
+        return err_result
     try:
         with conn:
             cfg_data = get_active_config(conn, project_id)
@@ -255,10 +254,9 @@ def find_indirect_call_sites(
     db_path, cfg, project_id, root = _resolve_context(project_root)
     if not db_path.exists():
         return [{"error": f"No index found for {root}. Run 'fw-context index' first."}]
-    conn, err = _open_db_safe(db_path)
-    if err:
-        return [err]
-    assert conn is not None
+    conn, err_result = _open_db_or_return(db_path)
+    if err_result:
+        return err_result
     try:
         with conn:
             cfg_data = get_active_config(conn, project_id)
@@ -336,10 +334,9 @@ def find_indirect_targets(
     db_path, cfg, project_id, root = _resolve_context(project_root)
     if not db_path.exists():
         return [{"error": f"No index found for {root}. Run 'fw-context index' first."}]
-    conn, err = _open_db_safe(db_path)
-    if err:
-        return [err]
-    assert conn is not None
+    conn, err_result = _open_db_or_return(db_path)
+    if err_result:
+        return err_result
     try:
         with conn:
             cfg_data = get_active_config(conn, project_id)
@@ -392,10 +389,9 @@ def _refs_guard(project_root: str | None) -> tuple[sqlite3.Connection, Path, str
     db_path = _db_path(root)
     if not db_path.exists():
         return None, None, None, [{"error": f"No index found for {root}. Run 'fw-context index' first."}]
-    conn, err = _open_db_safe(db_path)
-    if err:
-        return None, None, None, [err]
-    assert conn is not None
+    conn, err_result = _open_db_or_return(db_path)
+    if err_result:
+        return None, None, None, err_result
     project_id = derive_project_id(root)
     with conn:
         cfg_data = get_active_config(conn, project_id)

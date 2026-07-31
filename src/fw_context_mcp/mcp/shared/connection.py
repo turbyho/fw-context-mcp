@@ -187,6 +187,21 @@ def _open_db_safe(db_path: Path) -> tuple[sqlite3.Connection | None, dict | None
         }
 
 
+def _open_db_or_return(db_path: Path) -> tuple[sqlite3.Connection | None, list[dict] | None]:
+    """Open DB via ``_open_db_safe`` and return ``(conn, None)`` or ``(None, error_result)``.
+
+    Unlike ``_open_db_safe``, this never returns ``(None, None)`` — the
+    error result is always a ready-to-return list of error dicts.
+    Handlers can use this instead of the ``assert conn is not None`` pattern.
+    """
+    conn, err = _open_db_safe(db_path)
+    if err:
+        return None, [err]
+    if conn is None:
+        return None, [{"error": "Database connection failed. Try reset_index() then fw-context index."}]
+    return conn, None
+
+
 def _cleanup_conn_cache_atexit() -> None:
     """Close all cached connections on process exit."""
     _invalidate_conn_cache(None)

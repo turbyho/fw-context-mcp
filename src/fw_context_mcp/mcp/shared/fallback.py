@@ -8,7 +8,7 @@ from pathlib import Path
 from ...config import derive_project_id
 from ...indexer.db import get_active_config
 from ...utils import abs_path
-from .context import _is_stale, _open_db_safe
+from .context import _is_stale, _open_db_or_return
 from .stale import _stale_files
 
 
@@ -24,10 +24,9 @@ def _fallback_to_search_code(
     Uses the same DB-safe open path as regular tools so migrations and
     integrity checks run.  Adds a stale warning when the index is out of date.
     """
-    conn, err = _open_db_safe(db_path)
-    if err:
-        return [err]
-    assert conn is not None
+    conn, err_result = _open_db_or_return(db_path)
+    if err_result:
+        return err_result
     try:
         with conn:
             project_id = derive_project_id(root)
