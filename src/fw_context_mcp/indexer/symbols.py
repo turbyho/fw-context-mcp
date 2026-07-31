@@ -1202,6 +1202,21 @@ def _run_source_line_fallback(
                 )
 
 
+
+from dataclasses import dataclass, field
+
+
+@dataclass
+class ExtractionResult:
+    """Result of a single extract_all() call on one translation unit."""
+    tu: "cx.TranslationUnit | None" = None
+    symbols: list = field(default_factory=list)
+    references: list = field(default_factory=list)
+    inheritance: list = field(default_factory=list)
+    indirect_call_sites: list = field(default_factory=list)
+    fp_assignments: list = field(default_factory=list)
+    macros: list = field(default_factory=list)
+
 def extract_all(
     unit: CompilationUnit,
     with_refs: bool = False,
@@ -1290,7 +1305,8 @@ def extract_all(
 
     if not with_refs:
         _log.info("  parse=%.1fs symwalk=%.1fs syms=%d macros=%d", _t_parse, _t_symwalk, len(symbols), len(macros))
-        return (tu, symbols, [], inheritance, [], [], macros) if return_tu else (symbols, [], inheritance, [], [], macros)
+        result = ExtractionResult(tu=tu if return_tu else None, symbols=symbols, references=[], inheritance=inheritance, indirect_call_sites=[], fp_assignments=[], macros=macros)
+        return result
 
     refs, indirect_call_sites, fp_assignments = _build_refs_and_fp_assignments(
         tu, tu_path_str, symbols, _resolve, anon_usr_to_field, _log,
@@ -1302,4 +1318,5 @@ def extract_all(
         "  parse=%.1fs symwalk=%.1fs refwalk=%.1fs syms=%d refs=%d macros=%d",
         _t_parse, _t_symwalk, _t_refwalk, len(symbols), len(refs), len(macros),
     )
-    return (tu, symbols, refs, inheritance, indirect_call_sites, fp_assignments, macros) if return_tu else (symbols, refs, inheritance, indirect_call_sites, fp_assignments, macros)
+    result = ExtractionResult(tu=tu if return_tu else None, symbols=symbols, references=refs, inheritance=inheritance, indirect_call_sites=indirect_call_sites, fp_assignments=fp_assignments, macros=macros)
+    return result

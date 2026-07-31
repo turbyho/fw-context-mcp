@@ -1515,7 +1515,8 @@ class TestFilesIsProject:
             language="cpp",
             clang_args=["-std=c++17"],
         )
-        syms, refs, inheritance, indirect, fp_assigns, macros = extract_all(unit_proj, with_refs=False)
+        r = extract_all(unit_proj, with_refs=False)
+        syms, refs, inheritance, indirect, fp_assigns, macros = r.symbols, r.references, r.inheritance, r.indirect_call_sites, r.fp_assignments, r.macros
         conn.execute("DELETE FROM symbols WHERE config_hash = ?", (config_hash,))
         store_symbols_for_unit(
             conn, unit_proj, config_hash, tmp_path,
@@ -1539,7 +1540,8 @@ class TestFilesIsProject:
             language="cpp",
             clang_args=["-std=c++17"],
         )
-        syms_v, refs_v, inh_v, ind_v, fpa_v, mac_v = extract_all(unit_vendor, with_refs=False)
+        r = extract_all(unit_vendor, with_refs=False)
+        syms_v, refs_v, inh_v, ind_v, fpa_v, mac_v = r.symbols, r.references, r.inheritance, r.indirect_call_sites, r.fp_assignments, r.macros
         store_symbols_for_unit(
             conn, unit_vendor, config_hash, tmp_path,
             vendor_patterns=vendor_patterns,
@@ -1588,7 +1590,8 @@ class TestFilesIsProject:
             language="cpp",
             clang_args=["-std=c++17"],
         )
-        syms, refs, inheritance, indirect, fp_assigns, macros = extract_all(unit, with_refs=False)
+        r = extract_all(unit, with_refs=False)
+        syms, refs, inheritance, indirect, fp_assigns, macros = r.symbols, r.references, r.inheritance, r.indirect_call_sites, r.fp_assignments, r.macros
         store_symbols_for_unit(
             conn, unit, config_hash, tmp_path,
             vendor_patterns=vendor_patterns,
@@ -1644,9 +1647,10 @@ void interrupt_dispatch(int irq) {
             language="c",
             clang_args=["-std=c11"],
         )
-        _, _, _, indirect, fp_assignments, _ = extract_all(
+        r = extract_all(
             unit, with_refs=True,
         )
+        indirect, fp_assignments = r.indirect_call_sites, r.fp_assignments
 
         # There should be at least one indirect call site for the array call
         assert len(indirect) >= 1, (
@@ -1695,9 +1699,10 @@ void dispatch_event(struct Dispatcher* d, int event_id) {
             language="c",
             clang_args=["-std=c11"],
         )
-        _, _, _, indirect, fp_assignments, _ = extract_all(
+        r = extract_all(
             unit, with_refs=True,
         )
+        indirect, fp_assignments = r.indirect_call_sites, r.fp_assignments
 
         callbacks_calls = [c for c in indirect if c.target_name == "callbacks"]
         assert len(callbacks_calls) == 1, (
@@ -1734,9 +1739,10 @@ void caller(void) {
             language="c",
             clang_args=["-std=c11"],
         )
-        _, _, _, indirect, _, _ = extract_all(
+        r = extract_all(
             unit, with_refs=True,
         )
+        indirect = r.indirect_call_sites
 
         # No indirect call sites for regular function calls
         assert len(indirect) == 0, (
@@ -1772,9 +1778,10 @@ void process_data(struct Driver* driver, const char* data, int len) {
             language="c",
             clang_args=["-std=c11"],
         )
-        _, _, _, indirect, _, _ = extract_all(
+        r = extract_all(
             unit, with_refs=True,
         )
+        indirect = r.indirect_call_sites
 
         ondata_calls = [c for c in indirect if c.target_name == "onData"]
         assert len(ondata_calls) == 1, (

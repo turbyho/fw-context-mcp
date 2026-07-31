@@ -621,7 +621,7 @@ def _reindex_parse_and_store(
 
     config_hash = cfg_data["config_hash"]
 
-    parsed_units: list[tuple[TU, tuple[list[Symbol], list[Reference], list[InheritanceRecord], list[IndirectCallSite], list[FnPointerAssignment], list[Macro]]]] = []
+    parsed_units: list[tuple[TU, "ExtractionResult"]] = []
     skipped_tus: list[str] = []
     for unit in matching:
         try:
