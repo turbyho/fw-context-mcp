@@ -76,7 +76,7 @@ def _model_installed(ollama_url: str, model: str) -> bool:
             return True
         # Match suffixed variants of the same version (e.g. 8b → 8b-q4_K_M)
         return any(m.startswith(model + "-") for m in installed)
-    except (ValueError, TypeError, RuntimeError, AttributeError, OSError):
+    except (ValueError, TypeError, RuntimeError, AttributeError, OSError, httpx.HTTPError):
         return False
 
 
