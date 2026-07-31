@@ -20,7 +20,7 @@ def __getattr__(name):
         return _build_smart_search()
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
-# Pre-compute at import time for backward compat (appears in __all__)
+# Lazily materialized via __getattr__ for backward compat (appears in __all__)
 
 __all__ = [
     "PipelineRunner",

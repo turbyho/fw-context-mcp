@@ -20,6 +20,10 @@ class Reranker(Protocol):
         """Re-rank *candidates* by query relevance, returning *top_k* results."""
         ...
 
+    async def rank_async(self, query: str, candidates: list[dict], top_k: int) -> list[dict]:
+        """Async wrapper — delegates to :meth:`rank` via ``asyncio.to_thread``."""
+        ...
+
 
 class CrossEncoderReranker:
     """Cross-encoder reranker using sentence-transformers ``CrossEncoder``.
@@ -49,6 +53,11 @@ class CrossEncoderReranker:
                 ) from err
             log.info("Loading reranker model: %s ...", self._model_name)
             self._model = CrossEncoder(self._model_name)
+
+    async def rank_async(self, query: str, candidates: list[dict], top_k: int) -> list[dict]:
+        """Async wrapper — delegates to :meth:`rank` via ``asyncio.to_thread``."""
+        import asyncio
+        return await asyncio.to_thread(self.rank, query, candidates, top_k)
 
     def rank(self, query: str, candidates: list[dict], top_k: int) -> list[dict]:
         if not candidates:
