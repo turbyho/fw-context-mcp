@@ -215,6 +215,8 @@ def _build_kind_filter(ref_kind: str | list[str] | None) -> tuple[str, list[str]
     if ref_kind is None:
         return "", []
     if isinstance(ref_kind, list):
+        if len(ref_kind) == 0:
+            return "AND 1=0", []
         placeholders = ", ".join("?" * len(ref_kind))
         return f"AND r.ref_kind IN ({placeholders})", list(ref_kind)
     return "AND r.ref_kind = ?", [ref_kind]

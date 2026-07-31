@@ -185,7 +185,7 @@ def mine_disagreements(
             conn.row_factory = sqlite3.Row
 
         config_hash = conn.execute(
-            "SELECT config_hash FROM build_configs ORDER BY indexed_at DESC LIMIT 1"
+            "SELECT config_hash FROM build_configs ORDER BY first_indexed_at DESC LIMIT 1"
         ).fetchone()
         if config_hash is None:
             log.warning("No build config found in database — skipping mining")
@@ -337,7 +337,7 @@ def train_step(
     with sqlite3.connect(str(db_path)) as conn:
         conn.row_factory = sqlite3.Row
         row = conn.execute(
-            "SELECT config_hash FROM build_configs ORDER BY indexed_at DESC LIMIT 1"
+            "SELECT config_hash FROM build_configs ORDER BY first_indexed_at DESC LIMIT 1"
         ).fetchone()
         if row is None:
             log.error("No build config found in database")

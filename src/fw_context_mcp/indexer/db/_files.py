@@ -6,6 +6,12 @@ import sqlite3
 from typing import NamedTuple
 
 
+
+def _escape_like(value: str) -> str:
+    """Escape LIKE wildcards ``%``, ``_``, and the escape char ``\\``."""
+    return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
 def upsert_file(
     conn: sqlite3.Connection,
     config_hash: str,
@@ -64,8 +70,14 @@ def upsert_file(
     row = cur.fetchone()
     if row is not None:
         return row[0]
-    # Fallback for SQLite < 3.35 without RETURNING support
-    return conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+    # Fallback for SQLite < 3.35 without RETURNING support.
+    # Use SELECT instead of last_insert_rowid() — the latter returns
+    # the rowid of the last INSERT, which is wrong when ON CONFLICT
+    # triggered an UPDATE (rowid stays unchanged or is zero).
+    return conn.execute(
+        "SELECT id FROM files WHERE config_hash=? AND path=?",
+        (config_hash, path),
+    ).fetchone()[0]
 
 
 def get_file_mtimes(conn: sqlite3.Connection, config_hash: str) -> dict[str, tuple[int, float]]:
@@ -181,9 +193,9 @@ def get_file_map(
             """SELECT name, qualified_name, kind, line, col, end_line,
                       is_definition, signature, enum_value
                FROM symbols
-               WHERE config_hash = ? AND (file_path = ? OR file_path LIKE ?)
+               WHERE config_hash = ? AND (file_path = ? OR file_path LIKE ? ESCAPE '\')
                ORDER BY kind, line""",
-            (config_hash, f"%{file_path}"),
+            (config_hash, file_path, f"%{_escape_like(file_path)}"),
         ).fetchall()
 
     groups: dict[str, dict] = {}
