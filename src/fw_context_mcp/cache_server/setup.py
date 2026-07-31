@@ -371,17 +371,17 @@ def _ensure_db_user() -> bool:
 
     # User exists but no saved password — regenerate
     print("  [!] Database user 'fw_cache' exists but no saved credentials")
-        password = secrets.token_urlsafe(24)
-        sql = f"ALTER USER fw_cache WITH PASSWORD E'{password}'"
-        result = subprocess.run(
-            ["sudo", "-u", "postgres", "psql", "-q"],
-            input=sql + ";\n", text=True, capture_output=True, timeout=10,
-        )
-        if result.returncode != 0:
-            print(f"    Error: {result.stderr.strip()}", file=sys.stderr)
-            return False
-        _save_credentials(password)
-        return True
+    password = secrets.token_urlsafe(24)
+    sql = f"ALTER USER fw_cache WITH PASSWORD E'{password}'"
+    result = subprocess.run(
+        ["sudo", "-u", "postgres", "psql", "-q"],
+        input=sql + ";\n", text=True, capture_output=True, timeout=10,
+    )
+    if result.returncode != 0:
+        print(f"    Error: {result.stderr.strip()}", file=sys.stderr)
+        return False
+    _save_credentials(password)
+    return True
 
     print("    Set FW_CACHE_DB_URL manually to continue")
     return False

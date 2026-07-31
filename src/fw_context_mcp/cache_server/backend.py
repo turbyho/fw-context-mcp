@@ -179,6 +179,7 @@ class CacheBackend(CacheStorageBackend):
             )
             if is_nullable and is_nullable.upper() != "YES":
                 await meta.execute("ALTER TABLE tokens ALTER COLUMN project_id DROP NOT NULL")
+        finally:
             await self._meta_pool.release(meta)
 
         # ── llm_analysis_cache ──────────────────────────────────────────

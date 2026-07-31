@@ -430,7 +430,7 @@ def run_finetune(
     Returns the model output directory on success.
     """
     from ..config.settings import DESCRIPTION_VERSION
-    from ..llm.embedder import get_embedder
+    from ..llm.embedder_factory import get_embedder
 
     if not db_path.exists():
         log.error("Database not found: %s", db_path)
