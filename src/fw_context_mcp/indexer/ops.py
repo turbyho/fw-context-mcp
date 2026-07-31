@@ -24,6 +24,7 @@ from fw_context_mcp.indexer.db import (
     insert_fp_assignments_batch,
     insert_indirect_call_sites_batch,
     insert_inheritance_batch,
+    delete_macros_for_file,
     insert_macros_batch,
     insert_refs_batch,
     insert_symbols_batch,
@@ -743,6 +744,8 @@ def store_symbols_for_unit(
                     int(m.is_function_like),
                 )
             )
+        # Delete existing macros for the TU's file before inserting (stale prevention)
+        delete_macros_for_file(conn, tu_file_id)
         if macro_rows:
             insert_macros_batch(conn, macro_rows)
     _t_macros = time.monotonic() - _t_macros

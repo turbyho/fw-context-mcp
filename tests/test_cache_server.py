@@ -149,29 +149,29 @@ class TestBatchGet:
 class TestBatchPut:
     def test_put_requires_write(self, client: TestClient, mock_backend: MockBackend) -> None:
         mock_backend.add_token("write-token", can_read=True, can_write=True)
-        entry = {"hash": "h1", "summary": "s", "inputs": "i", "outputs": "o", "model": "m"}
+        entry = {"hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "summary": "s", "inputs": "i", "outputs": "o", "model": "m"}
         response = client.put("/cache/batch", json={"entries": [entry]}, headers=_auth("write-token"))
         assert response.status_code == 200
         assert response.json()["inserted"] == 1
 
     def test_put_no_overwrite_by_default(self, client: TestClient, mock_backend: MockBackend) -> None:
         mock_backend.add_token("write-token", can_read=True, can_write=True)
-        mock_backend._cache["h1"] = {"summary": "old", "inputs": "old", "outputs": "old", "model": "old",
+        mock_backend._cache["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"] = {"summary": "old", "inputs": "old", "outputs": "old", "model": "old",
                                       "analyzed_at": "2025-01-01"}
-        entry = {"hash": "h1", "summary": "new", "inputs": "new", "outputs": "new", "model": "new"}
+        entry = {"hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "summary": "new", "inputs": "new", "outputs": "new", "model": "new"}
         response = client.put("/cache/batch", json={"entries": [entry]}, headers=_auth("write-token"))
         assert response.json()["inserted"] == 0  # DO NOTHING
-        assert mock_backend._cache["h1"]["summary"] == "old"
+        assert mock_backend._cache["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]["summary"] == "old"
 
     def test_put_with_overwrite(self, client: TestClient, mock_backend: MockBackend) -> None:
         mock_backend.add_token("ow-token", can_read=True, can_write=True, can_overwrite=True)
-        mock_backend._cache["h1"] = {"summary": "old", "inputs": "old", "outputs": "old", "model": "old",
+        mock_backend._cache["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"] = {"summary": "old", "inputs": "old", "outputs": "old", "model": "old",
                                       "analyzed_at": "2025-01-01"}
-        entry = {"hash": "h1", "summary": "new", "inputs": "new", "outputs": "new", "model": "new"}
+        entry = {"hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "summary": "new", "inputs": "new", "outputs": "new", "model": "new"}
         headers = {**_auth("ow-token"), "X-Cache-Overwrite": "true"}
         response = client.put("/cache/batch", json={"entries": [entry]}, headers=headers)
         assert response.json()["inserted"] == 1
-        assert mock_backend._cache["h1"]["summary"] == "new"
+        assert mock_backend._cache["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]["summary"] == "new"
 
 
 class TestNginxConfig:

@@ -97,9 +97,13 @@ def suggest(
 
     # Build token → candidate index for efficient filtering
     token_index: dict[str, list[str]] = defaultdict(list)
+    # Prefix index: first 3 chars → set of tokens — narrows O(n) scan to O(1)
+    prefix_index: dict[str, set[str]] = defaultdict(set)
     for c in candidates:
         for t in _tokenize(c):
             token_index[t].append(c)
+            if len(t) >= 3:
+                prefix_index[t[:3]].add(t)
 
     # Score candidates that share at least one token with the query
     scored: dict[str, float] = {}
@@ -109,9 +113,11 @@ def suggest(
             if c not in scored:
                 scored[c] = 0.0
         # Prefix matches (e.g. query "uart" matches candidate token "uarte")
-        for token, cands in token_index.items():
+        # Narrow scan: only tokens starting with the same prefix (first 3 chars)
+        candidate_tokens = prefix_index.get(qt[:3], set()) if len(qt) >= 3 else set(token_index.keys())
+        for token in candidate_tokens:
             if token.startswith(qt) and token != qt:
-                for c in cands:
+                for c in token_index.get(token, []):
                     if c not in scored:
                         scored[c] = 0.0
 

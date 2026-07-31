@@ -13,13 +13,14 @@ Startup/shutdown hooks manage the asyncpg connection pool lifecycle.
 from __future__ import annotations
 
 import logging
+import re
 import os
 from contextlib import asynccontextmanager
 from typing import Any
 
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from .. import __version__
 from .auth import CacheAuthMiddleware, require_can_read, require_can_write, require_can_write_with_overwrite
@@ -43,6 +44,14 @@ class CacheEntry(BaseModel):
     inputs: str = Field(max_length=100000)
     outputs: str = Field(max_length=100000)
     model: str = Field(max_length=100)
+
+    @field_validator("hash")
+    @classmethod
+    def validate_hash(cls, v: str) -> str:
+        """Validate that *hash* is a 64-character hex string (SHA-256)."""
+        if not re.match(r"^[a-f0-9]{64}$", v):
+            raise ValueError("hash must be a 64-character hex string (SHA-256)")
+        return v
 
 
 class BatchPutRequest(BaseModel):
