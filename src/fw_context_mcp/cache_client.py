@@ -245,13 +245,23 @@ class CacheClient:
             self._session.close()
             self._session = None
 
-    def _retry_http_call(self, http_call, *, label="request"):
+    def _retry_http_call(self, http_call, *, label="request", on_auth_failure=None):
+        """Execute *http_call* with retry + exponential backoff.
+
+        Returns the ``Response`` on success (status 200), ``None`` on
+        persistent failure or auth error (401/403).  Calls
+        *on_auth_failure* before returning ``None`` on 401/403 —
+        callers can use this to mark the token as read-only.
+        Respects ``Retry-After`` header for 429 responses.
+        """
         for attempt in range(_MAX_RETRIES):
             try:
                 resp = http_call()
                 if resp.status_code == 200:
                     return resp
                 if resp.status_code in (401, 403):
+                    if on_auth_failure is not None:
+                        on_auth_failure()
                     return None
                 if attempt < _MAX_RETRIES - 1:
                     wait = _get_retry_after(resp, _retry_sleep(attempt))
@@ -291,40 +301,15 @@ class CacheClient:
 
     def _batch_get_chunk(self, hashes: list[str]) -> dict[str, dict | None]:
         """Internal: POST one chunk of hashes, with retries."""
-        for attempt in range(_MAX_RETRIES):
-            try:
-                session = self._get_session()
-                resp = session.post("/cache/batch", json={"hashes": hashes})
-                if resp.status_code == 200:
-                    data = resp.json()
-                    return data.get("results", {})
-                if resp.status_code in (401, 403):
-                    logger.warning("Cache server auth error (%d) — check token", resp.status_code)
-                    return {h: None for h in hashes}
-                # Retryable (429, 5xx) — backoff. Non-retryable 4xx — fail immediately.
-                if attempt < _MAX_RETRIES - 1:
-                    wait = _get_retry_after(resp, _retry_sleep(attempt))
-                    logger.debug("Cache server returned %d (attempt %d/%d), retrying in %.1fs",
-                                 resp.status_code, attempt + 1, _MAX_RETRIES, wait)
-                    time.sleep(wait)
-                    continue
-                logger.warning("Cache server returned %d after %d retries — giving up",
-                              resp.status_code, _MAX_RETRIES)
-            except (httpx.HTTPError, OSError) as e:
-                if attempt < _MAX_RETRIES - 1:
-                    wait = _retry_sleep(attempt)
-                    logger.debug("Cache server request failed (attempt %d/%d): %s",
-                                 attempt + 1, _MAX_RETRIES, e)
-                    time.sleep(wait)
-                    continue
-                logger.warning("Cache server unreachable — continuing offline: %s", e)
+        resp = self._retry_http_call(
+            lambda: self._get_session().post("/cache/batch", json={"hashes": hashes}),
+            label="batch_get"
+        )
+        if resp is None:
+            return {h: None for h in hashes}
+        data = resp.json()
+        return data.get("results", {})
 
-        # All retries exhausted
-        return {h: None for h in hashes}
-
-    # NOTE: retry logic treats all 5xx errors the same.  Ideally, 400/413/422
-    # should not be retried (client error), 429 should respect Retry-After,
-    # and only 500/502/503 should use exponential backoff.
     def batch_put(self, entries: list[dict]) -> int:
         """Batch write to the remote server.
 
@@ -363,33 +348,18 @@ class CacheClient:
             for e in chunk
         ]}
 
-        for attempt in range(_MAX_RETRIES):
-            try:
-                session = self._get_session()
-                resp = session.put("/cache/batch", json=payload, headers=headers)
-                if resp.status_code == 200:
-                    data = resp.json()
-                    return data.get("inserted", 0)
-                if resp.status_code in (401, 403):
-                    self._can_write = False
-                    logger.warning("Cache server auth error (%d) on write — token is read-only", resp.status_code)
-                    return 0
-                if attempt < _MAX_RETRIES - 1:
-                    wait = _get_retry_after(resp, _retry_sleep(attempt))
-                    logger.debug("Cache server write returned %d (attempt %d/%d), retrying in %.1fs",
-                                 resp.status_code, attempt + 1, _MAX_RETRIES, wait)
-                    time.sleep(wait)
-                    continue
-                logger.warning("Cache server write returned %d after %d retries — giving up",
-                              resp.status_code, _MAX_RETRIES)
-            except (httpx.HTTPError, OSError) as e:
-                if attempt < _MAX_RETRIES - 1:
-                    wait = _retry_sleep(attempt)
-                    time.sleep(wait)
-                    continue
-                logger.warning("Cache server write failed: %s", e)
+        def _on_auth():
+            self._can_write = False
 
-        return 0
+        resp = self._retry_http_call(
+            lambda: self._get_session().put("/cache/batch", json=payload, headers=headers),
+            label="batch_put",
+            on_auth_failure=_on_auth
+        )
+        if resp is None:
+            return 0
+        data = resp.json()
+        return data.get("inserted", 0)
 
     def stats(self) -> dict[str, Any] | None:
         """Fetch cache statistics from the remote server.
@@ -402,30 +372,16 @@ class CacheClient:
 
         Returns ``None`` if the server is unreachable.
         """
-        for attempt in range(_MAX_RETRIES):
-            try:
-                session = self._get_session()
-                resp = session.get("/cache/stats")
-                if resp.status_code == 200:
-                    data = resp.json()
-                    self._can_write = data.get("can_write", False)
-                    self._can_overwrite = data.get("can_overwrite", False)
-                    return data
-                if resp.status_code in (401, 403):
-                    logger.warning("Cache server auth error (%d) on stats — check token", resp.status_code)
-                    return None
-                if attempt < _MAX_RETRIES - 1:
-                    wait = _get_retry_after(resp, _retry_sleep(attempt))
-                    time.sleep(wait)
-                    continue
-            except (httpx.HTTPError, OSError) as e:
-                if attempt < _MAX_RETRIES - 1:
-                    wait = _retry_sleep(attempt)
-                    time.sleep(wait)
-                    continue
-                logger.warning("Cache server stats request failed: %s", e)
-
-        return None
+        resp = self._retry_http_call(
+            lambda: self._get_session().get("/cache/stats"),
+            label="stats"
+        )
+        if resp is None:
+            return None
+        data = resp.json()
+        self._can_write = data.get("can_write", False)
+        self._can_overwrite = data.get("can_overwrite", False)
+        return data
 
     def clear_remote(self, hashes: list[str]) -> int:
         """Delete cache entries from the remote server by content hash.
@@ -449,26 +405,15 @@ class CacheClient:
 
     def _clear_remote_chunk(self, hashes: list[str]) -> int:
         """Internal: POST one chunk of hashes to /cache/clear, with retries."""
-        for attempt in range(_MAX_RETRIES):
-            try:
-                session = self._get_session()
-                resp = session.post("/cache/clear", json={"hashes": hashes})
-                if resp.status_code == 200:
-                    data = resp.json()
-                    return data.get("deleted", 0)
-                if resp.status_code in (401, 403):
-                    self._can_write = False
-                    logger.warning("Cache server auth error (%d) on clear — token is read-only", resp.status_code)
-                    return 0
-                if attempt < _MAX_RETRIES - 1:
-                    wait = _get_retry_after(resp, _retry_sleep(attempt))
-                    time.sleep(wait)
-                    continue
-            except (httpx.HTTPError, OSError) as e:
-                if attempt < _MAX_RETRIES - 1:
-                    wait = _retry_sleep(attempt)
-                    time.sleep(wait)
-                    continue
-                logger.warning("Cache server clear failed: %s", e)
+        def _on_auth():
+            self._can_write = False
 
-        return 0
+        resp = self._retry_http_call(
+            lambda: self._get_session().post("/cache/clear", json={"hashes": hashes}),
+            label="clear",
+            on_auth_failure=_on_auth
+        )
+        if resp is None:
+            return 0
+        data = resp.json()
+        return data.get("deleted", 0)
