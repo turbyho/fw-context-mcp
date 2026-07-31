@@ -425,6 +425,8 @@ def _from_dict(data: dict) -> Config:
     Each mapping entry: (toml_key, attr_name, converter).
     Converters: "str" | "bool" | "list" | "dict" | "path" | "int(N)" | "float(N)"
     """
+    import logging
+    log = logging.getLogger(__name__)
     cfg = Config()
 
     # ── [project] ──
@@ -574,7 +576,6 @@ _LLM_FIELDS: list[tuple[str, str, str]] = [
     ("analyze_vendor", "analyze_vendor", "bool"),
     ("reranker_model", "reranker_model", "str"),
     ("ollama_max_concurrent", "ollama_max_concurrent", "int(1)"),
-    ("allow_external_llm", "allow_external_llm", "bool"),
 ]
 
 def _ensure_global_config() -> Path:
