@@ -30,6 +30,11 @@ from ...utils import abs_path, resolve_project_root
 from ..shared.context import _db_path, _open_db_or_return, _open_db_safe, _resolve_context
 from .source import _lookup_definition
 
+
+def _escape_like(value: str) -> str:
+    """Escape LIKE wildcards ``%``, ``_``, and the escape char ``\\``."""
+    return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
 log = logging.getLogger(__name__)
 
 # ── moved from server.py ──
@@ -98,7 +103,7 @@ def _references_result(name: str, project_root: str | None, ref_kind: str | list
                     "they may have been disabled with [index] index_refs = false. "
                     "Re-run 'fw-context index' to rebuild with refs enabled."
                 )}]
-            limit = min(limit, 200)
+            limit = max(0, min(limit, 200))
             rows = find_refs(conn, config_hash, name, ref_kind=ref_kind, limit=limit)
             if not rows:
                 label = "callers" if caller_mode else "references"
@@ -270,7 +275,7 @@ def find_indirect_call_sites(
                     "to populate the table (added in Phase 2)."
                 )}]
 
-            limit = min(limit, 200)
+            limit = max(0, min(limit, 200))
             rows = query_indirect_call_sites(conn, config_hash, name, limit=limit)
             if not rows:
                 return [{"info": f"No indirect call sites found for '{name}'."}]
@@ -350,7 +355,7 @@ def find_indirect_targets(
                     "'fw-context index' to populate the table (added in Phase 3)."
                 )}]
 
-            limit = min(limit, 200)
+            limit = max(0, min(limit, 200))
             rows = query_indirect_targets(conn, config_hash, name, limit=limit)
             if not rows:
                 return [{"info": f"No functions assigned to '{name}'."}]
@@ -602,6 +607,7 @@ def find_dead_code(
         status (``"dead"`` or ``"possibly_dead"``), and reason (str —
         explains why the function is classified as dead or possibly dead).
     """
+    limit = max(0, min(limit, 200))  # clamp
     conn, root, config_hash, err = _refs_guard(project_root)
     if err:
         return err
@@ -654,6 +660,7 @@ def find_wrapper_callers(
         methods (list of dicts — each with method, qualified_name, kind,
         and calls (list of driver methods called)).
     """
+    limit = max(0, min(limit, 50))  # clamp
     conn, root, config_hash, err = _refs_guard(project_root)
     if err:
         return err
@@ -783,6 +790,8 @@ def trace_data_flow(
         source_file, source_line, caller_count, reachable (bool), and
         paths (list of call path dicts — empty when unreachable).
     """
+    max_depth = max(1, min(max_depth, 20))  # clamp
+    limit = max(0, min(limit, 15))  # clamp
     conn, root, config_hash, err = _refs_guard(project_root)
     if err:
         return err
@@ -814,7 +823,7 @@ def trace_data_flow(
                  AND s.signature LIKE ?
                ORDER BY caller_count DESC
                LIMIT ?""",
-            (config_hash, f"%{type_name}%", limit),
+            (config_hash, f"%{_escape_like(type_name)}%", limit),
         ).fetchall()
 
         if not sources:
@@ -892,6 +901,7 @@ def find_hotspots(
         list of dicts, each with: name, qualified_name, kind, file, line,
         caller_count (int — total number of call sites), signature.
     """
+    limit = max(0, min(limit, 50))  # clamp
     conn, root, config_hash, err = _refs_guard(project_root)
     if err:
         return err
@@ -911,3 +921,4 @@ def find_hotspots(
         return rows
     finally:
         pass  # connection managed by connection.py cache
+

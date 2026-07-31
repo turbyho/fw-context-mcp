@@ -246,57 +246,54 @@ def _fast_staleness_check(root: Path) -> tuple[bool, list[str]]:
     if err_result:
         return False, []
     reasons: list[str] = []
-    try:
-        project_id = derive_project_id(root)
-        cfg = get_active_config(conn, project_id)
-        if not cfg:
-            return False, []
-        config_hash = cfg["config_hash"]
+    project_id = derive_project_id(root)
+    cfg = get_active_config(conn, project_id)
+    if not cfg:
+        return False, []
+    config_hash = cfg["config_hash"]
 
-        # 1-3. Structural checks (shared with daemon._staleness_check)
-        reasons.extend(check_structural_staleness(conn, config_hash, cfg, root))
+    # 1-3. Structural checks (shared with daemon._staleness_check)
+    reasons.extend(check_structural_staleness(conn, config_hash, cfg, root))
 
-        # 4. Unanalyzed symbols?
-        # Uses CONFIG analyze_vendor (not stored) because this check
-        # predicts what the background reindex will do — and the
-        # background reindex uses config, not stored flags.  Using
-        # stored would cause an infinite reindex loop when a manual
-        # --analyze-vendor run stored True but config is False.
-        proj_cfg = load_config(root)
-        if proj_cfg.llm.enabled and proj_cfg.llm.analyze_symbols:
-            if proj_cfg.llm.analyze_vendor:
-                unanalyzed = conn.execute(
-                    """SELECT COUNT(*)
-                       FROM symbols s
-                       WHERE s.config_hash = ?
-                         AND s.is_definition = 1
-                         AND s.kind IN ('function', 'method',
-                                        'constructor', 'destructor',
-                                        'class', 'struct')
-                         AND s.name NOT LIKE '%(anonymous%'
-                         AND s.name NOT LIKE '%(unnamed%'
-                         AND NOT EXISTS (SELECT 1 FROM llm_analysis a WHERE a.symbol_id = s.id)""",
-                    (config_hash,),
-                ).fetchone()[0]
-            else:
-                # Use is_project column directly for unanalyzed symbol count
-                unanalyzed = conn.execute(
-                    """SELECT COUNT(*)
-                       FROM symbols s
-                       WHERE s.config_hash = ?
-                         AND s.is_definition = 1
-                         AND s.is_project = 1
-                         AND s.kind IN ('function', 'method',
-                                        'constructor', 'destructor',
-                                        'class', 'struct')
-                         AND s.name NOT LIKE '%(anonymous%'
-                         AND s.name NOT LIKE '%(unnamed%'
-                         AND NOT EXISTS (SELECT 1 FROM llm_analysis a WHERE a.symbol_id = s.id)""",
-                    (config_hash,),
-                ).fetchone()[0]
-            if unanalyzed > 0:
-                reasons.append(f"{unanalyzed} unanalyzed symbols")
-    finally:
-        conn.close()
-
+    # 4. Unanalyzed symbols?
+    # Uses CONFIG analyze_vendor (not stored) because this check
+    # predicts what the background reindex will do — and the
+    # background reindex uses config, not stored flags.  Using
+    # stored would cause an infinite reindex loop when a manual
+    # --analyze-vendor run stored True but config is False.
+    proj_cfg = load_config(root)
+    if proj_cfg.llm.enabled and proj_cfg.llm.analyze_symbols:
+        if proj_cfg.llm.analyze_vendor:
+            unanalyzed = conn.execute(
+                """SELECT COUNT(*)
+                   FROM symbols s
+                   WHERE s.config_hash = ?
+                     AND s.is_definition = 1
+                     AND s.kind IN ('function', 'method',
+                                    'constructor', 'destructor',
+                                    'class', 'struct')
+                     AND s.name NOT LIKE '%(anonymous%'
+                     AND s.name NOT LIKE '%(unnamed%'
+                     AND NOT EXISTS (SELECT 1 FROM llm_analysis a WHERE a.symbol_id = s.id)""",
+                (config_hash,),
+            ).fetchone()[0]
+        else:
+            # Use is_project column directly for unanalyzed symbol count
+            unanalyzed = conn.execute(
+                """SELECT COUNT(*)
+                   FROM symbols s
+                   WHERE s.config_hash = ?
+                     AND s.is_definition = 1
+                     AND s.is_project = 1
+                     AND s.kind IN ('function', 'method',
+                                    'constructor', 'destructor',
+                                    'class', 'struct')
+                     AND s.name NOT LIKE '%(anonymous%'
+                     AND s.name NOT LIKE '%(unnamed%'
+                     AND NOT EXISTS (SELECT 1 FROM llm_analysis a WHERE a.symbol_id = s.id)""",
+                (config_hash,),
+            ).fetchone()[0]
+        if unanalyzed > 0:
+            reasons.append(f"{unanalyzed} unanalyzed symbols")
     return len(reasons) > 0, reasons
+

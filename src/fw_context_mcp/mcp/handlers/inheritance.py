@@ -293,6 +293,7 @@ def get_template_instances(
         qualified_name, kind, file, line, signature, is_definition),
         instance_count (int)}
     """
+    limit = max(0, min(limit, 200))  # clamp
     ctx, err = _resolve_handler_context(project_root)
     if err:
         return err
@@ -421,3 +422,4 @@ def get_method_overrides(
     finally:
         pass  # connection managed by connection.py cache
     return result
+

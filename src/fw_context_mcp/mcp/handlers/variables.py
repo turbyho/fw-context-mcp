@@ -73,7 +73,7 @@ def find_variables(
         return [{"error": "Variable name must be non-empty."}]
     if kind is not None and kind not in _VALID_KINDS:
         return [{"error": f"Invalid kind: {kind!r}. Expected 'varglobal', 'varlocal', or None."}]
-    limit = min(limit, 100)
+    limit = max(0, min(limit, 100))
 
     ctx, err = _resolve_handler_context(project_root)
     if err:

@@ -75,7 +75,7 @@ def lookup_symbol(
         if not db_path.exists():
             return [{"error": f"No index found for {root}."}]
 
-        limit = min(limit, 100)
+        limit = max(0, min(limit, 100))
 
         def _do_lookup(c: sqlite3.Connection, config_hash: str) -> list[dict]:
             if exact:
