@@ -41,10 +41,27 @@ _auth_failures: dict[str, list[float]] = {}
 import time as _time
 import threading as _threading
 _auth_lock = _threading.Lock()
+_auth_check_count: int = 0
+_AUTH_PRUNE_INTERVAL = 100  # prune stale entries every N checks
+
+
+def _prune_auth_failures(now: float, window_s: float = 120.0) -> None:
+    """Remove stale entries older than 2× the rate-limit window."""
+    stale = [
+        ip for ip, times in _auth_failures.items()
+        if not times or now - times[-1] > window_s
+    ]
+    for ip in stale:
+        del _auth_failures[ip]
+
 
 def _check_rate_limit(ip: str, max_failures: int = 20, window_s: float = 60.0) -> bool:
     """Return True if *ip* is under the rate limit, False if exceeded."""
+    nonlocal _auth_check_count
     now = _time.monotonic()
+    _auth_check_count += 1
+    if _auth_check_count % _AUTH_PRUNE_INTERVAL == 0:
+        _prune_auth_failures(now)
     with _auth_lock:
         failures = _auth_failures.get(ip, [])
         # Remove expired entries

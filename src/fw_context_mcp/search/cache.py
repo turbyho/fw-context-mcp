@@ -41,13 +41,14 @@ class KeywordCache:
             if time.monotonic() - ts > self._ttl_s:
                 del self._store[key]
                 return None
+            self._store.move_to_end(key)  # LRU refresh
             return value
 
     def set(self, key: tuple, queries: list[str], understanding: str = "") -> None:
         """Store (queries, understanding), evicting oldest if at capacity."""
         with self._lock:
             if len(self._store) >= self._max_entries:
-                # FIFO eviction via OrderedDict — O(1) instead of O(n) min() scan
+                # LRU eviction via OrderedDict — get() refreshes position, popitem(last=False) evicts LRU
                 self._store.popitem(last=False)
             self._store[key] = (time.monotonic(), (queries, understanding))
 

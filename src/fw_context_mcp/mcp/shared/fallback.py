@@ -43,7 +43,7 @@ def _fallback_to_search_code(
             stale_f = _stale_files(conn, config_hash, result_files, root)
             is_stale = _is_stale(cfg, cfg["compile_commands_path"])
     finally:
-        conn.close()
+        pass  # connection managed by connection.py cache
 
     if is_stale:
         results.insert(0, {

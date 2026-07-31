@@ -380,11 +380,12 @@ def find_indirect_targets(
 def _refs_guard(project_root: str | None) -> tuple[sqlite3.Connection, Path, str, None] | tuple[None, None, None, list[dict]]:
     """Shared guard for graph tools: resolve project, open DB, check refs exist.
 
-    Returns an OPEN connection on success — callers use it directly instead of
-    opening a second connection.  The caller is responsible for closing it.
+    Returns a cache-managed connection on success — callers must NOT close it.
+    The connection is owned by :mod:`fw_context_mcp.mcp.shared.connection` and
+    will be reused across handlers within the same MCP session.
 
     Returns:
-        ``(conn, root, config_hash, None)`` on success — caller reuses *conn*.
+        ``(conn, root, config_hash, None)`` on success — caller reuses *conn* (do not close).
         ``(None, None, None, error_list)`` on failure — caller propagates the error.
     """
     root = resolve_project_root(project_root)
