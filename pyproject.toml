@@ -32,7 +32,11 @@ dev = [
     "pytest>=8",
     "ruff>=0.4",
     "mypy>=1.10",
+    "bandit>=1.7",
 ]
+
+[tool.bandit]
+exclude_dirs = ["tests", "experiments"]
 
 [project.scripts]
 fw-context = "fw_context_mcp.cli:main"
