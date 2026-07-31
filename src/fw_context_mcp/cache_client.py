@@ -25,6 +25,18 @@ _MAX_RETRIES = 3
 _RETRY_BACKOFF = 1.5  # exponential backoff multiplier
 
 
+# HTTP status codes that should NOT be retried (client errors).
+_NON_RETRYABLE = frozenset({400, 401, 403, 404, 413, 422})
+
+# HTTP status codes that should be retried with backoff.
+_RETRYABLE = frozenset({429, 500, 502, 503, 504})
+
+
+def _retry_sleep(attempt: int) -> float:
+    """Compute exponential backoff sleep duration."""
+    return _RETRY_BACKOFF ** (attempt + 1)
+
+
 def get_local_cache_db(readonly: bool = False) -> sqlite3.Connection:
     """Open (or create) the local cross-project LLM analysis cache.
 
@@ -238,9 +250,9 @@ class CacheClient:
                 if resp.status_code in (401, 403):
                     logger.warning("Cache server auth error (%d) — check token", resp.status_code)
                     return {h: None for h in hashes}
-                # 5xx or 429 — retry with backoff
+                # Retryable (429, 5xx) — backoff. Non-retryable 4xx — fail immediately.
                 if attempt < _MAX_RETRIES - 1:
-                    wait = _RETRY_BACKOFF ** (attempt + 1)
+                    wait = _retry_sleep(attempt)
                     logger.debug("Cache server returned %d (attempt %d/%d), retrying in %.1fs",
                                  resp.status_code, attempt + 1, _MAX_RETRIES, wait)
                     time.sleep(wait)
@@ -249,7 +261,7 @@ class CacheClient:
                               resp.status_code, _MAX_RETRIES)
             except (httpx.HTTPError, OSError) as e:
                 if attempt < _MAX_RETRIES - 1:
-                    wait = _RETRY_BACKOFF ** (attempt + 1)
+                    wait = _retry_sleep(attempt)
                     logger.debug("Cache server request failed (attempt %d/%d): %s",
                                  attempt + 1, _MAX_RETRIES, e)
                     time.sleep(wait)
@@ -312,7 +324,7 @@ class CacheClient:
                     logger.warning("Cache server auth error (%d) on write — token is read-only", resp.status_code)
                     return 0
                 if attempt < _MAX_RETRIES - 1:
-                    wait = _RETRY_BACKOFF ** (attempt + 1)
+                    wait = _retry_sleep(attempt)
                     logger.debug("Cache server write returned %d (attempt %d/%d), retrying in %.1fs",
                                  resp.status_code, attempt + 1, _MAX_RETRIES, wait)
                     time.sleep(wait)
@@ -321,7 +333,7 @@ class CacheClient:
                               resp.status_code, _MAX_RETRIES)
             except (httpx.HTTPError, OSError) as e:
                 if attempt < _MAX_RETRIES - 1:
-                    wait = _RETRY_BACKOFF ** (attempt + 1)
+                    wait = _retry_sleep(attempt)
                     time.sleep(wait)
                     continue
                 logger.warning("Cache server write failed: %s", e)
@@ -352,12 +364,12 @@ class CacheClient:
                     logger.warning("Cache server auth error (%d) on stats — check token", resp.status_code)
                     return None
                 if attempt < _MAX_RETRIES - 1:
-                    wait = _RETRY_BACKOFF ** (attempt + 1)
+                    wait = _retry_sleep(attempt)
                     time.sleep(wait)
                     continue
             except (httpx.HTTPError, OSError) as e:
                 if attempt < _MAX_RETRIES - 1:
-                    wait = _RETRY_BACKOFF ** (attempt + 1)
+                    wait = _retry_sleep(attempt)
                     time.sleep(wait)
                     continue
                 logger.warning("Cache server stats request failed: %s", e)
@@ -398,12 +410,12 @@ class CacheClient:
                     logger.warning("Cache server auth error (%d) on clear — token is read-only", resp.status_code)
                     return 0
                 if attempt < _MAX_RETRIES - 1:
-                    wait = _RETRY_BACKOFF ** (attempt + 1)
+                    wait = _retry_sleep(attempt)
                     time.sleep(wait)
                     continue
             except (httpx.HTTPError, OSError) as e:
                 if attempt < _MAX_RETRIES - 1:
-                    wait = _RETRY_BACKOFF ** (attempt + 1)
+                    wait = _retry_sleep(attempt)
                     time.sleep(wait)
                     continue
                 logger.warning("Cache server clear failed: %s", e)
