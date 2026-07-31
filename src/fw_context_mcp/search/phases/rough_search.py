@@ -190,43 +190,7 @@ async def _try_embedding_samples(ctx) -> list[dict] | None:
         conn.close()
 
 
-def _round_robin_by_kind(rows: list[sqlite3.Row], limit: int = 20) -> list[sqlite3.Row]:
-    """Select *limit* rows with kind diversity via round-robin.
 
-    Groups rows by kind (function, method, class, struct, varglobal, other),
-    then round-robins one from each group until *limit* is reached.  Avoids
-    the ORDER BY CASE problem where functions crowd out structs/globals.
-    Preserves the original order within each group (already sorted by
-    vector similarity from search_similar_vec).
-    """
-    import sqlite3 as _sqlite3
-
-    groups: dict[str, list[_sqlite3.Row]] = {
-        "function": [], "method": [], "class": [], "struct": [],
-        "varglobal": [], "other": [],
-    }
-    for r in rows:
-        kind = r["kind"] or "other"
-        if kind in groups:
-            groups[kind].append(r)
-        else:
-            groups["other"].append(r)
-
-    result: list[_sqlite3.Row] = []
-    indices = {k: 0 for k in groups}
-    while len(result) < limit:
-        added = False
-        for kind in ("function", "method", "class", "struct", "varglobal", "other"):
-            idx = indices[kind]
-            if idx < len(groups[kind]):
-                result.append(groups[kind][idx])
-                indices[kind] += 1
-                added = True
-                if len(result) >= limit:
-                    break
-        if not added:
-            break  # all groups exhausted
-    return result
 
 def _extract_terms_from_samples(samples: list[dict]) -> list[str]:
     """Extract content-bearing search terms from symbol names.
