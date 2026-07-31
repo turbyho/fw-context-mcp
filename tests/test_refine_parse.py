@@ -26,27 +26,27 @@ class TestParseSearchTerms:
         assert result == []
 
     def test_fallback_line_by_line(self):
-        raw = "  modem init*\n  uart send*\n  spi transfer*"
+        raw = "  modem*\n  uart*\n  spi*"
         result = _parse_search_terms(raw)
-        # * stripped by line fallback, but spaces preserved
-        assert "modem init" in result
-        assert "uart send" in result
-        assert "spi transfer" in result
+        # * stripped by line fallback, single tokens extracted
+        assert "modem" in result
+        assert "uart" in result
+        assert "spi" in result
 
     def test_numbered_lines(self):
         raw = "1. modem_init*\n2. uart_send*\n3. gpio_toggle*"
         result = _parse_search_terms(raw)
-        # * stripped by line fallback, _ → space
-        assert "modem init" in result
-        assert "uart send" in result
-        assert "gpio toggle" in result
+        # * stripped by line fallback, underscores preserved (FTS5 tokenizes on _)
+        assert "modem_init" in result
+        assert "uart_send" in result
+        assert "gpio_toggle" in result
 
     def test_lines_with_parentheses(self):
         raw = "modem_init* (for modem)\nuart_send* (data transfer)"
         result = _parse_search_terms(raw)
-        # * stripped by line-by-line fallback
-        assert "modem init" in result
-        assert "uart send" in result
+        # * stripped by line-by-line fallback, underscores preserved
+        assert "modem_init" in result
+        assert "uart_send" in result
         # The parentheses content should be stripped
         for r in result:
             assert "(" not in r
@@ -57,28 +57,28 @@ class TestParseSearchTerms:
     def test_whitespace_only(self):
         assert _parse_search_terms("   \n  \n\t") == []
 
-    def test_underscore_replaced_with_space(self):
-        # * stripped by line-by-line fallback
+    def test_underscore_preserved(self):
+        # * stripped by line-by-line fallback, underscores preserved (FTS5 tokenizes on _)
         result = _parse_search_terms("modem_init*")
-        assert result == ["modem init"]
+        assert result == ["modem_init"]
 
     def test_quotes_stripped(self):
         raw = '  "modem_init*"  '
         result = _parse_search_terms(raw)
-        # Fallback strips quotes, *, and replaces _ with space
-        assert result == ["modem init"]
+        # Fallback strips quotes, *, underscores preserved
+        assert result == ["modem_init"]
 
     def test_backtick_stripped(self):
         raw = "`modem_init*`"
         result = _parse_search_terms(raw)
-        # Fallback strips backticks, *, and replaces _ with space
-        assert result == ["modem init"]
+        # Fallback strips backticks, *, underscores preserved
+        assert result == ["modem_init"]
 
     def test_comment_lines_ignored(self):
         raw = "# This is a comment\nmodem_init*\n# Another comment"
         result = _parse_search_terms(raw)
-        # "modem_init*" is on its own line, * stripped by fallback
-        assert "modem init" in result
+        # "modem_init*" is on its own line, * stripped by fallback, underscore preserved
+        assert "modem_init" in result
 
     def test_markdown_code_block(self):
         raw = '```json\n["modem*", "init*"]\n```'
@@ -124,9 +124,9 @@ class TestParseSearchTerms:
         assert result == ["uart"]
 
     def test_multiple_underscores(self):
-        # Line-by-line fallback: underscores→spaces, * stripped
+        # Line-by-line fallback: * stripped, underscores preserved
         result = _parse_search_terms("nrfx_uarte_init*")
-        assert result == ["nrfx uarte init"]
+        assert result == ["nrfx_uarte_init"]
 
     def test_trim_whitespace_result(self):
         # Line-by-line fallback: whitespace trimmed, * stripped

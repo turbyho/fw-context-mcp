@@ -186,13 +186,14 @@ class TestNginxConfig:
 class TestInstall:
     def test_generate_systemd_unit(self) -> None:
         from fw_context_mcp.cache_server.install import generate_systemd_unit
-        unit = generate_systemd_unit(user="fw-cache", db_url="postgresql://user:pass@localhost:5432")
+        unit = generate_systemd_unit(user="fw-cache")
         assert "User=fw-cache" in unit
-        assert "postgresql://user:pass@localhost:5432" in unit
+        assert "EnvironmentFile=/var/lib/fw-cache-server/db.env" in unit
         assert "ExecStart=" in unit
 
     def test_generate_launchd_plist(self) -> None:
         from fw_context_mcp.cache_server.install import generate_launchd_plist
-        plist = generate_launchd_plist(host="0.0.0.0", port=9000, db_url="postgresql://user:pass@localhost:5432")
+        plist = generate_launchd_plist(host="0.0.0.0", port=9000)
         assert "com.fwcontext.cache-server" in plist
         assert "9000" in plist
+        assert "FW_CACHE_DB_URL" not in plist  # credential leak regression guard

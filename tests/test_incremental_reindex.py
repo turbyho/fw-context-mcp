@@ -4,6 +4,11 @@ Creates a temporary C project, indexes it, modifies source files, and verifies
 that reindex correctly preserves LLM analysis for unchanged symbols, detects
 moved symbols, and handles new/deleted symbols.
 
+NOTE: Tests require ``libclang`` and a C compiler (gcc).  The test fixture
+``indexed_project`` builds a real index via ``fw-context init`` + ``fw-context index``.
+Tests that need an existing index MUST use this fixture — the index is stored
+in ``~/.fw-context/index/<project_id>/index.db`` (global ``IndexConfig.db_dir``).
+
 Run::
 
     python3 -m pytest tests/test_incremental_reindex.py -x -v

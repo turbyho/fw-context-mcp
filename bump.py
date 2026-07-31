@@ -19,6 +19,7 @@ from __future__ import annotations
 import json
 import re
 import sys
+import tomllib
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -49,11 +50,12 @@ def get_version_from_pyproject() -> str:
     """Read the current version from pyproject.toml."""
     path = PROJECT_ROOT / "pyproject.toml"
     content = path.read_text(encoding="utf-8")
-    m = re.search(r'^version\s*=\s*"(.*)"', content, re.MULTILINE)
-    if not m:
-        print("Error: version not found in pyproject.toml", file=sys.stderr)
+    try:
+        data = tomllib.loads(content)
+        return data["project"]["version"]
+    except (KeyError, tomllib.TOMLDecodeError) as e:
+        print(f"Error: version not found in pyproject.toml: {e}", file=sys.stderr)
         sys.exit(1)
-    return m.group(1)
 
 
 def _make_description(tool_count: int) -> str:

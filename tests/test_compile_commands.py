@@ -149,12 +149,12 @@ class TestGccSystemIncludes:
         bin_dir.mkdir()
         compiler = bin_dir / "arm-none-eabi-g++"
         compiler.touch()
-        result = _gcc_system_includes(compiler)
+        result = _gcc_system_includes(compiler, "arm-none-eabi")
         assert result == []
 
     def test_real_toolchain_structure(self, fake_arm_gcc_toolchain):
         toolchain, compiler = fake_arm_gcc_toolchain
-        result = _gcc_system_includes(compiler)
+        result = _gcc_system_includes(compiler, "arm-none-eabi")
         assert len(result) >= 4  # gcc include, include-fixed, libc, c++
         assert all(r.startswith("-isystem") for r in result[::2])
         assert any("include-fixed" in r for r in result)
@@ -256,12 +256,8 @@ class TestEdgeCases:
         path = tmpdir / "compile_commands_bom.json"
         content = json.dumps(data)
         path.write_bytes(b"\xef\xbb\xbf" + content.encode("utf-8"))
-        try:
-            units = list(parse(path))
-            assert len(units) == 1
-        except json.JSONDecodeError:
-            # Known limitation: BOM not handled
-            pass
+        units = list(parse(path))
+        assert len(units) == 1, f"Expected 1 unit, got {len(units)}; BOM should be handled"
 
     def test_parse_empty_list(self, tmpdir):
         """Empty compile_commands array should parse to no units."""

@@ -18,14 +18,14 @@ from fw_context_mcp.search.phases.adaptive_fusion import (
 )
 
 
-def _make_ctx(*, limit: int = 20, embedding_results=None, fts5_results=None) -> PipelineContext:
+def _make_ctx(*, limit: int = 20, embedding_results=None, fts5_results=None, config: Config | None = None) -> PipelineContext:
     return PipelineContext(
         config_hash="test",
         project_root=Path("/tmp"),
         db_path=Path("/tmp/test.db"),
         query="test",
         original_query="test",
-        config=Config(),
+        config=config if config is not None else Config(),
         limit=limit,
         embedding_results=embedding_results or [],
         fts5_results=fts5_results or [],
@@ -164,3 +164,15 @@ class TestAdaptiveFusionPhase:
         results = list(result.final_results)
         assert all(r["name"].startswith("sym") for r in results)
         assert not any(r["name"] == "should_be_ignored" for r in results)
+
+    def test_min_dense_count_from_config(self) -> None:
+        """Config index.min_dense_count overrides module default."""
+        from fw_context_mcp.config.settings import Config, IndexConfig
+
+        cfg = Config()
+        cfg.index = IndexConfig(min_dense_count=5)
+        ctx = _make_ctx(config=cfg, embedding_results=[{"name": f"x{i}"} for i in range(4)])
+        # 4 < config threshold 5 → fallback
+        phase = AdaptiveFusionPhase()
+        threshold = phase._get_threshold(ctx)
+        assert threshold == 5
