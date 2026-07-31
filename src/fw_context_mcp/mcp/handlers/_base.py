@@ -20,10 +20,7 @@ import logging
 import sqlite3
 from pathlib import Path
 
-from fw_context_mcp.config import derive_project_id
-from fw_context_mcp.config import load as load_config
-from fw_context_mcp.indexer.db import get_active_config
-from fw_context_mcp.mcp.shared.context import _open_db_or_return, _resolve_context
+from fw_context_mcp.mcp.shared.context import _resolve_handler_context
 from fw_context_mcp.mcp.shared.stale import _stale_files, _with_stale_recovery
 from fw_context_mcp.utils import abs_path, resolve_project_root
 
@@ -65,34 +62,24 @@ class BaseHandler:
     def resolve_db_context(project_root: str | None = None) -> DbContext:
         """Resolve project → config → db → connection → config_hash.
 
-        One call replaces the common handler preamble::
-
-            root = resolve_project_root(args.project)
-            db_path, cfg, project_id, root = _resolve_context(root)
-            conn, err = _open_db_safe(db_path)
-            config = get_active_config(conn, project_id)
-            config_hash = config["config_hash"]
+        Delegates to :func:`_resolve_handler_context` — one call replaces
+        the common handler preamble.
 
         Returns:
             A ``DbContext`` with all resolved fields.
         Raises:
             RuntimeError: Project not initialized or index missing.
         """
-        root = resolve_project_root(project_root)
-        db_path, cfg, project_id, root = _resolve_context(root)
-        conn, err_result = _open_db_or_return(db_path)
-        if err_result:
-            raise RuntimeError(err_result[0].get("error", "Failed to open database"))
-        config = get_active_config(conn, project_id)
-        if not config:
-            raise RuntimeError("No build config indexed.")
+        ctx, err = _resolve_handler_context(project_root)
+        if err:
+            raise RuntimeError(err[0].get("error", "Failed to resolve handler context"))
         return DbContext(
-            db_path=db_path,
-            conn=conn,
-            config_hash=config["config_hash"],
-            cfg=cfg,
-            project_id=project_id,
-            root=root,
+            db_path=ctx.db_path,
+            conn=ctx.conn,
+            config_hash=ctx.config_hash,
+            cfg=ctx.cfg,
+            project_id=ctx.project_id,
+            root=ctx.root,
         )
 
     @staticmethod

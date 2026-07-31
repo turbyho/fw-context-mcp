@@ -20,7 +20,7 @@ from ...indexer.db import (
 )
 from ...llm.ollama import OllamaError, OllamaModelNotFoundError, call_ollama_async
 from ...utils import abs_path, read_file_lines
-from ..shared.context import _open_db_or_return, _resolve_context
+from ..shared.context import _resolve_handler_context
 
 log = logging.getLogger(__name__)
 def _validate_path_in_root(resolved_path: str, root: Path) -> str | None:
@@ -216,18 +216,15 @@ async def explain_symbol(
         fallback returns ``kind="macro"``, ``signature`` (as ``#define NAME``),
         ``value`` (raw definition), and ``expanded_value``.
     """
-    db_path, cfg, project_id, root = _resolve_context(project_root)
-    if not db_path.exists():
-        return {"error": f"No index found for {root}. Run 'fw-context index' first."}
-    conn, err_result = _open_db_or_return(db_path)
-    if err_result:
-        return err_result[0]
+    ctx, err = _resolve_handler_context(project_root)
+    if err:
+        return err[0]
+    cfg = ctx.cfg
+    conn = ctx.conn
+    config_hash = ctx.config_hash
+    root = ctx.root
     try:
         with conn:
-            cfg_data = get_active_config(conn, project_id)
-            if not cfg_data:
-                return {"error": "No build config indexed."}
-            config_hash = cfg_data["config_hash"]
             row = _lookup_definition(conn, config_hash, name, prefer_project=True)
             if not row:
                 # Macro fallback
@@ -366,21 +363,18 @@ def get_source(
         ``constants`` (list for enums), ``value`` (raw macro definition),
         ``expanded_value`` (preprocessor-resolved macro value) when applicable.
     """
-    db_path, cfg, project_id, root = _resolve_context(project_root)
-    if not db_path.exists():
-        return {"error": f"No index found for {root}. Run 'fw-context index' first."}
-    conn, err_result = _open_db_or_return(db_path)
-    if err_result:
-        return err_result[0]
+    ctx, err = _resolve_handler_context(project_root)
+    if err:
+        return err[0]
+    conn = ctx.conn
+    config_hash = ctx.config_hash
+    root = ctx.root
     try:
         with conn:
-            cfg_data = get_active_config(conn, project_id)
-            if not cfg_data:
-                return {"error": "No build config indexed."}
-            row = _lookup_definition(conn, cfg_data["config_hash"], name, prefer_project=True)
+            row = _lookup_definition(conn, config_hash, name, prefer_project=True)
             if not row:
                 # Macro fallback
-                macros = lookup_macro(conn, cfg_data["config_hash"], name, exact=True, limit=1)
+                macros = lookup_macro(conn, config_hash, name, exact=True, limit=1)
                 if macros:
                     m = macros[0]
                     return {
@@ -429,7 +423,7 @@ def get_source(
                        WHERE config_hash = ? AND kind = 'enum_constant'
                          AND (qualified_name LIKE ? OR qualified_name LIKE ?)
                        ORDER BY line""",
-                    (cfg_data["config_hash"], f"{qn}::%", f"%{qn}::%"),
+                    (config_hash, f"{qn}::%", f"%{qn}::%"),
                 ).fetchall()
                 if const_rows:
                     result["constants"] = [
@@ -491,18 +485,14 @@ def get_file_map(
         dict: {file, total_symbols, symbols: {kind: {count, items[],
         subgroups?[]}}}
     """
-    db_path, cfg, project_id, root = _resolve_context(project_root)
-    if not db_path.exists():
-        return {"error": f"No index found for {root}. Run 'fw-context index' first."}
-    conn, err_result = _open_db_or_return(db_path)
-    if err_result:
-        return err_result[0]
+    ctx, err = _resolve_handler_context(project_root)
+    if err:
+        return err[0]
+    conn = ctx.conn
+    config_hash = ctx.config_hash
+    root = ctx.root
     try:
         with conn:
-            cfg_data = get_active_config(conn, project_id)
-            if not cfg_data:
-                return {"error": "No build config indexed."}
-            config_hash = cfg_data["config_hash"]
             # Resolve file_path: try exact match first, then suffix
             exact = conn.execute(
                 "SELECT COUNT(*) FROM symbols WHERE config_hash=? AND file_path=?",
@@ -748,18 +738,14 @@ def get_symbol_context(
         with a structured description of the symbol's purpose, parameters, and
         return values/side effects.
     """
-    db_path, cfg, project_id, root = _resolve_context(project_root)
-    if not db_path.exists():
-        return {"error": f"No index found for {root}. Run 'fw-context index' first."}
-    conn, err_result = _open_db_or_return(db_path)
-    if err_result:
-        return err_result[0]
+    ctx, err = _resolve_handler_context(project_root)
+    if err:
+        return err[0]
+    conn = ctx.conn
+    config_hash = ctx.config_hash
+    root = ctx.root
     try:
         with conn:
-            cfg_data = get_active_config(conn, project_id)
-            if not cfg_data:
-                return {"error": "No build config indexed."}
-            config_hash = cfg_data["config_hash"]
             row = _lookup_definition(conn, config_hash, name, prefer_project=True)
             if not row:
                 # Macro fallback — macros have no callers/callees, return basic info
@@ -888,18 +874,14 @@ def read_file(
         warning (str, optional — when reading from raw disk instead of
         indexed content)}.
     """
-    db_path, cfg, project_id, root = _resolve_context(project_root)
-    if not db_path.exists():
-        return {"error": f"No index found for {root}. Run 'fw-context index' first."}
-    conn, err_result = _open_db_or_return(db_path)
-    if err_result:
-        return err_result[0]
+    ctx, err = _resolve_handler_context(project_root)
+    if err:
+        return err[0]
+    conn = ctx.conn
+    config_hash = ctx.config_hash
+    root = ctx.root
     try:
         with conn:
-            cfg_data = get_active_config(conn, project_id)
-            if not cfg_data:
-                return {"error": "No build config indexed."}
-            config_hash = cfg_data["config_hash"]
 
             # Resolve file_path: try exact match first, then suffix match
             exact = conn.execute(

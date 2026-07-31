@@ -183,10 +183,13 @@ async def daemon_main(project_root: Path) -> None:
     # ── Main loop ────────────────────────────────────────────────────────
     from watchfiles import awatch
 
-    log.info(
-        "Daemon started  root=%s  pid=%d  socket=%s",
-        project_root, os.getpid(), sock_path,
+    # ── Structured logger — attach project context for log aggregation ──
+    dlog = logging.LoggerAdapter(
+        log,
+        {"project_root": str(project_root), "pid": os.getpid()},
     )
+
+    dlog.info("Daemon started  socket=%s", sock_path)
 
     try:
         # ── Initial staleness check ──────────────────────────────────────
@@ -197,7 +200,7 @@ async def daemon_main(project_root: Path) -> None:
             None, _staleness_check, project_root
         )
         if needs and not _bg_paused(project_root):
-            log.info("Initial index needed (%s)", ", ".join(reasons))
+            dlog.info("Initial index needed (%s)", ", ".join(reasons))
             force_refs = "refs missing" in reasons
             index_proc = await _run_index_async(project_root, db_dir, force_refs=force_refs)
             await _wait_index(index_proc, shutdown, db_dir=db_dir)
@@ -214,7 +217,7 @@ async def daemon_main(project_root: Path) -> None:
             # ── Check ping timeout ───────────────────────────────────────
             ping_elapsed = time.monotonic() - last_ping_time
             if ping_elapsed > PING_TIMEOUT:
-                log.info(
+                dlog.info(
                     "No ping for %.0f s — all clients disconnected, exiting",
                     ping_elapsed,
                 )
@@ -243,7 +246,7 @@ async def daemon_main(project_root: Path) -> None:
                     if changed:
                         break  # Exit watch loop → run index
             except (OSError, RuntimeError) as exc:
-                log.warning("watchfiles error: %s", exc)
+                dlog.warning("watchfiles error: %s", exc)
                 await asyncio.sleep(5)
                 continue
 
@@ -251,21 +254,21 @@ async def daemon_main(project_root: Path) -> None:
                 # Skip when a manual fw-context index holds the pause marker
                 from .background import _check_bg_pause as _bg_paused
                 if _bg_paused(project_root):
-                    log.info("Manual index in progress — skipping background reindex")
+                    dlog.info("Manual index in progress — skipping background reindex")
                 else:
                     index_proc = await _run_index_async(project_root, db_dir)
                     await _wait_index(index_proc, shutdown, db_dir=db_dir)
                     index_proc = None
 
     finally:
-        log.info("Daemon shutting down for %s", project_root)
+        dlog.info("Daemon shutting down")
         if index_proc is not None and index_proc.returncode is None:
-            log.info("Terminating index subprocess (pid %d)", index_proc.pid)
+            dlog.info("Terminating index subprocess (pid %d)", index_proc.pid)
             index_proc.terminate()
             try:
                 await asyncio.wait_for(index_proc.wait(), timeout=10)
             except asyncio.TimeoutError:
-                log.warning("Index subprocess did not exit, killing")
+                dlog.warning("Index subprocess did not exit, killing")
                 index_proc.kill()
                 await index_proc.wait()
         shutdown.set()
