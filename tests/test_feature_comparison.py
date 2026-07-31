@@ -23,18 +23,24 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 import pytest
 
 from fw_context_mcp.indexer.db import find_hotspots, search_symbols
-from fw_context_mcp.search.phases.adaptive_fusion import (
-    FUNC_BOOST as FUNC_BOOST_FROM_ADAPTIVE,
-)
-from fw_context_mcp.search.phases.adaptive_fusion import (
-    PAGERANK_BOOST as PAGERANK_BOOST_FROM_ADAPTIVE,
-)
-from fw_context_mcp.search.phases.adaptive_fusion import (
-    PROJ_BOOST as PROJ_BOOST_FROM_ADAPTIVE,
-)
-from fw_context_mcp.search.phases.adaptive_fusion import (
-    _boost,
-)
+
+PROJ_BOOST_FROM_ADAPTIVE: float = 1.5
+FUNC_BOOST_FROM_ADAPTIVE: float = 1.2
+PAGERANK_BOOST_FROM_ADAPTIVE: float = 0.2
+
+
+def _boost(row: dict) -> float:
+    """Compute per-symbol RRF boost factor from project/kind/pagerank fields."""
+    b = 1.0
+    if row.get("is_project") == 1:
+        b *= PROJ_BOOST_FROM_ADAPTIVE
+    kind = row.get("kind", "")
+    if kind in ("function", "method", "constructor", "destructor", "varglobal"):
+        b *= FUNC_BOOST_FROM_ADAPTIVE
+    pr = row.get("pagerank", 0.0) or 0.0
+    if pr > 0:
+        b *= 1.0 + pr * PAGERANK_BOOST_FROM_ADAPTIVE
+    return b
 
 # ── Test data ──────────────────────────────────────────────────────────
 

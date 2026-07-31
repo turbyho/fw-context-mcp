@@ -207,7 +207,7 @@ def find_references(
         ``"indirect"`` (function-pointer reference in arguments, assignments,
         initializers, or init lists), ``"implicit_construct"`` (implicit
         constructor call from global/static object or member-field
-        initialization), ``"template_ref"``, ``"macro_use"`` (macro usage
+        initialization), ``"macro_use"`` (macro usage
         in file). Macro fallback includes a leading dict with
         ``kind="macro"``, ``value``, and ``expanded_value``.
     """

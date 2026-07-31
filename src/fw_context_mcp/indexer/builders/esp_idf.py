@@ -7,6 +7,8 @@ import os
 import shutil
 import subprocess
 from pathlib import Path
+
+from fw_context_mcp.utils import run_build_command
 from typing import TYPE_CHECKING
 
 from . import registry
@@ -68,7 +70,7 @@ class ESPIDFBuildSystem:
             # idf.py fullclean removes all build artifacts
             clean_cmd = [idf_py, "fullclean"]
             log.info("esp-idf clean: %s", " ".join(clean_cmd))
-            subprocess.run(clean_cmd, cwd=project_root)
+            subprocess.run(clean_cmd, cwd=project_root, capture_output=True, text=True)
 
         # Ninja deletes .d depfiles after reading them by default.
         # Create a wrapper that adds -d keepdepfile so .d files persist
@@ -137,13 +139,10 @@ class ESPIDFBuildSystem:
                 )
             set_target_cmd = [idf_py, "set-target", target]
             log.info("esp-idf set-target: %s", " ".join(set_target_cmd))
-            subprocess.run(set_target_cmd, cwd=project_root)
+            subprocess.run(set_target_cmd, cwd=project_root, capture_output=True, text=True)
 
         log.info("esp-idf build: %s", " ".join(cmd))
-        result = subprocess.run(cmd, cwd=project_root, env=env)
-
-        if result.returncode != 0:
-            raise RuntimeError(f"idf.py build failed with exit code {result.returncode}")
+        run_build_command(cmd, cwd=project_root, description="idf.py build", env=env)
 
         # ESP-IDF puts compile_commands.json in the build directory
         cc_in_build = project_root / "build" / "compile_commands.json"

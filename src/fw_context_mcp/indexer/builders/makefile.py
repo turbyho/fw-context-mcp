@@ -10,8 +10,9 @@ from __future__ import annotations
 
 import logging
 import shutil
-import subprocess
 from pathlib import Path
+
+from fw_context_mcp.utils import run_build_command
 from typing import TYPE_CHECKING
 
 from . import registry
@@ -88,13 +89,7 @@ class MakefileBuildSystem:
         cmd.append(target)
 
         log.info("makefile build: %s", " ".join(cmd))
-        result = subprocess.run(cmd, cwd=root)
-
-        if result.returncode != 0:
-            raise RuntimeError(
-                f"compiledb make failed with exit code {result.returncode}.\n"
-                "Try with make_dry_run = false if the project needs a real build first."
-            )
+        run_build_command(cmd, cwd=root, description="compiledb make")
 
         cc_path = root / "compile_commands.json"
         if not cc_path.exists():

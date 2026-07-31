@@ -44,6 +44,60 @@ def _path_matches_patterns(path: str, patterns: list[str]) -> bool:
     return any(pat in path for pat in patterns)
 
 
+# ── Structural staleness ──────────────────────────────────────────────────
+# Shared by background._fast_staleness_check and daemon._staleness_check.
+
+
+def check_structural_staleness(
+    conn,
+    config_hash: str,
+    cfg: dict,
+    root: Path,
+) -> list[str]:
+    """Check structural staleness — compile_commands.json, schema, refs.
+
+    Returns a list of human-readable reasons the index needs a reindex.
+    These are the checks that both the background reindex trigger and the
+    daemon startup perform — file-level mtime checks are added separately
+    by callers that need them.
+
+    All imports are lazy to avoid circular dependencies at module level.
+    """
+    from ...config import load as load_config
+    from ...indexer.db import CURRENT_SCHEMA_VERSION, get_db_schema_version
+    from .context import _is_stale
+
+    reasons: list[str] = []
+
+    # 1. compile_commands.json changed? (one stat call)
+    cc_path = cfg["compile_commands_path"]
+    if _is_stale(cfg, cc_path):
+        reasons.append("compile_commands.json changed")
+
+    # 2. Schema version mismatch?
+    schema_ver = get_db_schema_version(conn)
+    if schema_ver < CURRENT_SCHEMA_VERSION:
+        reasons.append(f"schema {schema_ver} < {CURRENT_SCHEMA_VERSION}")
+
+    # 3. Missing refs (and indirect call sites when refs are missing)?
+    proj_cfg = load_config(root)
+    if proj_cfg.index.index_refs:
+        ref_count = conn.execute(
+            "SELECT COUNT(*) FROM refs WHERE config_hash=?",
+            (config_hash,),
+        ).fetchone()[0]
+        if ref_count == 0:
+            reasons.append("refs missing")
+            ics_count = conn.execute(
+                "SELECT COUNT(*) FROM indirect_call_sites WHERE config_hash=?",
+                (config_hash,),
+            ).fetchone()[0]
+            if ics_count == 0:
+                reasons.append("indirect call sites missing")
+
+    return reasons
+
+
 def _stale_files(conn, config_hash: str, file_paths: list[str], root: Path) -> list[str]:
     """Return the subset of *file_paths* whose on-disk mtime is newer than the index."""
     from ...indexer.manifest import load as load_manifest

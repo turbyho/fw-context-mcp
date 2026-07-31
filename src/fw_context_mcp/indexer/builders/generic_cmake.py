@@ -7,8 +7,9 @@ from __future__ import annotations
 
 import logging
 import shutil
-import subprocess
 from pathlib import Path
+
+from fw_context_mcp.utils import run_build_command
 from typing import TYPE_CHECKING
 
 from . import registry
@@ -73,16 +74,12 @@ class GenericCMakeBuildSystem:
             shutil.rmtree(build_dir)
 
         log.info("cmake configure: %s", " ".join(configure_cmd))
-        result = subprocess.run(configure_cmd, cwd=project_root)
-        if result.returncode != 0:
-            raise RuntimeError(f"cmake configure failed with exit code {result.returncode}")
+        run_build_command(configure_cmd, cwd=project_root, description="cmake configure")
 
         # Build
         build_cmd: list[str] = ["cmake", "--build", str(build_dir)]
         log.info("cmake build: %s", " ".join(build_cmd))
-        result = subprocess.run(build_cmd, cwd=project_root)
-        if result.returncode != 0:
-            raise RuntimeError(f"cmake build failed with exit code {result.returncode}")
+        run_build_command(build_cmd, cwd=project_root, description="cmake build")
 
         cc_in_build = build_dir / "compile_commands.json"
         if not cc_in_build.exists():

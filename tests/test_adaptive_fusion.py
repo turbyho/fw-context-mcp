@@ -10,12 +10,28 @@ import pytest
 from fw_context_mcp.config.settings import Config
 from fw_context_mcp.search.context import PipelineContext
 from fw_context_mcp.search.phases.adaptive_fusion import (
-    FUNC_BOOST,
-    PAGERANK_BOOST,
-    PROJ_BOOST,
     AdaptiveFusionPhase,
-    _boost,
 )
+
+# ── RRF boost constants (moved from adaptive_fusion.py — test-only) ──
+
+PROJ_BOOST: float = 1.5
+FUNC_BOOST: float = 1.2
+PAGERANK_BOOST: float = 0.2
+
+
+def _boost(row: dict) -> float:
+    """Compute per-symbol RRF boost factor from project/kind/pagerank fields."""
+    b = 1.0
+    if row.get("is_project") == 1:
+        b *= PROJ_BOOST
+    kind = row.get("kind", "")
+    if kind in ("function", "method", "constructor", "destructor", "varglobal"):
+        b *= FUNC_BOOST
+    pr = row.get("pagerank", 0.0) or 0.0
+    if pr > 0:
+        b *= 1.0 + pr * PAGERANK_BOOST
+    return b
 
 
 def _make_ctx(*, limit: int = 20, embedding_results=None, fts5_results=None, config: Config | None = None) -> PipelineContext:

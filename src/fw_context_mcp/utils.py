@@ -40,6 +40,7 @@ def run_build_command(
     cwd: Path,
     timeout: float = 600,
     description: str = "",
+    env: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess:
     """Run a build command with consistent timeout and output capture.
 
@@ -52,6 +53,7 @@ def run_build_command(
         cwd: Working directory.
         timeout: Maximum time in seconds.
         description: Human-readable description for error messages.
+        env: Optional environment variables dict (merged with os.environ).
 
     Returns:
         CompletedProcess with captured stdout/stderr.
@@ -61,7 +63,7 @@ def run_build_command(
     """
     try:
         result = subprocess.run(
-            cmd, cwd=cwd, capture_output=True, text=True, timeout=timeout
+            cmd, cwd=cwd, capture_output=True, text=True, timeout=timeout, env=env
         )
     except subprocess.TimeoutExpired:
         raise RuntimeError(

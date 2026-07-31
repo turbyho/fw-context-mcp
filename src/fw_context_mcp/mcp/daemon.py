@@ -328,8 +328,8 @@ def _staleness_check(project_root: Path) -> tuple[bool, list[str]]:
     the file-level check the daemon would never detect files that were
     modified BEFORE it started — watchfiles only detects NEW changes.
     """
-    from .shared.context import _db_path, _is_stale
-    from .shared.stale import _count_modified_files
+    from .shared.context import _db_path
+    from .shared.stale import _count_modified_files, check_structural_staleness
 
     db_path = _db_path(project_root)
     if not db_path.exists():
@@ -340,11 +340,7 @@ def _staleness_check(project_root: Path) -> tuple[bool, list[str]]:
         return False, []
     reasons: list[str] = []
     try:
-        from ..indexer.db import (
-            CURRENT_SCHEMA_VERSION,
-            get_active_config,
-            get_db_schema_version,
-        )
+        from ..indexer.db import get_active_config
 
         project_id = derive_project_id(project_root)
         cfg = get_active_config(conn, project_id)
@@ -353,25 +349,8 @@ def _staleness_check(project_root: Path) -> tuple[bool, list[str]]:
 
         config_hash = cfg["config_hash"]
 
-        # 1. compile_commands.json changed?
-        cc_path = cfg["compile_commands_path"]
-        if cc_path and _is_stale(cfg, cc_path):
-            reasons.append("compile_commands.json changed")
-
-        # 2. Schema version mismatch?
-        schema_ver = get_db_schema_version(conn)
-        if schema_ver < CURRENT_SCHEMA_VERSION:
-            reasons.append(f"schema {schema_ver} < {CURRENT_SCHEMA_VERSION}")
-
-        # 3. Missing refs?
-        proj_cfg = load_config(project_root)
-        if proj_cfg.index.index_refs:
-            ref_count = conn.execute(
-                "SELECT COUNT(*) FROM refs WHERE config_hash=?",
-                (config_hash,),
-            ).fetchone()[0]
-            if ref_count == 0:
-                reasons.append("refs missing")
+        # 1-3. Structural checks (shared with background._fast_staleness_check)
+        reasons.extend(check_structural_staleness(conn, config_hash, cfg, project_root))
 
         # 4. Modified source files — files changed before daemon started.
         #    watchfiles only detects NEW events, so without this check
