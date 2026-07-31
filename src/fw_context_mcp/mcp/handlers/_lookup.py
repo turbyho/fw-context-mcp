@@ -167,7 +167,7 @@ LOOKUP_PREFIX_SQL,
             return result
 
         return _with_stale_recovery(root, db_path, _do_lookup)
-    except Exception as e:
+    except (sqlite3.Error, OSError, RuntimeError) as e:
         log.exception("lookup_symbol failed: %s", e)
         return [{"error": f"lookup_symbol failed: {e}"}]
 

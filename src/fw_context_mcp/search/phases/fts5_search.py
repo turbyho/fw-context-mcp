@@ -94,7 +94,7 @@ def _search_queries(  # TODO(Perf-L14): combine OR + name_tokens into single FTS
                     rows.append(dict(r))
                 elif r["is_definition"] and not rows[prev_idx].get("is_definition"):
                     rows[prev_idx] = dict(r)
-        except Exception as e:
+        except sqlite3.Error as e:
             log.warning("FTS5 query failed (q=%r)", q[:60], exc_info=True)
 
     return rows

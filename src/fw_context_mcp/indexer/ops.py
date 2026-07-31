@@ -10,7 +10,12 @@ from __future__ import annotations
 import logging
 import sqlite3
 import time
+try:
+    from clang.cindex import TranslationUnitLoadError
+except ImportError:
+    TranslationUnitLoadError = RuntimeError  # clang not available — use fallback
 from collections import OrderedDict
+
 from pathlib import Path
 
 from fw_context_mcp.indexer.config_hash import compute_tu_content_hash
@@ -153,7 +158,7 @@ def _build_filtered_file_content(
                 args=unit.clang_args,
                 options=cx.TranslationUnit.PARSE_DETAILED_PROCESSING_RECORD,
             )
-        except Exception:
+        except (RuntimeError, cx.TranslationUnitLoadError):
             log.debug("_build_filtered_file_content: parse failed for %s", unit.file.name)
             return 0, []
 
@@ -237,7 +242,7 @@ def _build_filtered_file_content(
         try:
             with open(resolved, encoding="utf-8", errors="replace") as f:
                 original = f.readlines()
-        except Exception:
+        except OSError:
             continue
 
         if not original:
@@ -573,7 +578,7 @@ def store_symbols_for_unit(
         except sqlite3.Error:
             log.error("Fatal DB error parsing %s — stopping indexer", unit.file.name)
             raise
-        except Exception as exc:
+        except (RuntimeError, TranslationUnitLoadError) as exc:
             msg = str(exc)
             if "unable to open database file" in msg:
                 log.error("Fatal DB error parsing %s: %s — stopping indexer", unit.file.name, exc)

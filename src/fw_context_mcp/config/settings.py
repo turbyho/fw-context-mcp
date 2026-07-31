@@ -762,7 +762,7 @@ def load(project_root: Path | None = None) -> Config:
 
     try:
         data = tomllib.loads(global_path.read_text())
-    except Exception:
+    except (OSError, ValueError):
         log.exception("Failed to parse %s — using defaults", global_path)
 
     if project_root is not None:
@@ -770,7 +770,7 @@ def load(project_root: Path | None = None) -> Config:
         try:
             proj_data = tomllib.loads(proj_path.read_text())
             data = _deep_merge(data, proj_data)
-        except Exception:
+        except (OSError, ValueError):
             log.exception("Failed to parse %s — ignoring project config", proj_path)
 
         # Security: pre_build in committed config.toml is a risk — anyone
@@ -790,7 +790,7 @@ def load(project_root: Path | None = None) -> Config:
         try:
             local_data = tomllib.loads(local_path.read_text())
             data = _deep_merge(data, local_data)
-        except Exception:
+        except (OSError, ValueError):
             log.exception("Failed to parse %s — ignoring local config", local_path)
 
         # Security: a committed or local config can redirect LLM calls (which

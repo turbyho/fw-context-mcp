@@ -96,7 +96,7 @@ def _try_pull(model: str, ollama_url: str) -> bool:
             for _ in resp.iter_lines():
                 pass
         return True
-    except Exception as e:
+    except (httpx.HTTPError, OSError) as e:
         log.debug("Pull %s failed: %s", model, e)
         return False
 

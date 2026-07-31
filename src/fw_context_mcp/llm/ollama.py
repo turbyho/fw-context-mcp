@@ -81,7 +81,7 @@ def _pull_model(model: str, base_url: str) -> None:
         raise OllamaError(
             f"Failed to pull model '{model}': HTTP {e.response.status_code}"
         ) from e
-    except Exception as e:
+    except (httpx.HTTPError, OSError) as e:
         raise OllamaError(f"Failed to pull model '{model}': {e}") from e
 
 
@@ -91,7 +91,7 @@ def _write_debug_log(path: Path, entry: dict) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
         with path.open("a", encoding="utf-8") as f:
             f.write(json.dumps(entry, ensure_ascii=False) + "\n")
-    except Exception as e:
+    except (OSError, ValueError) as e:
         log.warning("LLM debug log write failed: %s", e)
 
 
@@ -159,7 +159,7 @@ def call_ollama(
         raise OllamaError(f"Ollama HTTP {e.response.status_code}: {e.response.text[:200]}") from e
     except OllamaError:
         raise  # Pass through — prevents wrapping by the broad except Exception below
-    except Exception as e:
+    except (httpx.HTTPError, OSError) as e:
         raise OllamaError(str(e)) from e
 
 
@@ -236,7 +236,7 @@ def _call_ollama_embed_impl(
         raise OllamaError("Ollama embed request timed out") from None
     except OllamaError:
         raise
-    except Exception as e:
+    except (httpx.HTTPError, OSError) as e:
         raise OllamaError(str(e)) from e
 
 

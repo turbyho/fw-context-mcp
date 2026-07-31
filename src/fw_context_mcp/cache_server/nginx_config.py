@@ -56,7 +56,7 @@ def detect_nginx() -> dict[str, Any]:
     try:
         subprocess.run(["systemctl", "is-active", "--quiet", "nginx"], check=True, timeout=5)
         result["running"] = True
-    except Exception:
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
         log.debug("Failed to check nginx running state", exc_info=True)
 
     # Detect existing HTTPS configs
@@ -73,7 +73,7 @@ def detect_nginx() -> dict[str, Any]:
                             if not line.lstrip().startswith("#") and line.startswith("server_name ") and ";" in line:
                                 names = line.replace("server_name ", "").replace(";", "").split()
                                 result["domains"].extend(names)
-                except Exception:
+                except OSError:
                     log.debug("Failed to read nginx config %s", conf, exc_info=True)
 
     return result
@@ -168,7 +168,7 @@ def write_nginx_config(domain: str, proxy_port: int = 8000) -> Path:
             ["sudo", "tee", str(config_path)],
             input=config_text, text=True, capture_output=True, timeout=10, check=True,
         )
-    except Exception as e:
+    except subprocess.CalledProcessError as e:
         print(f"Failed to write {config_path} — write it manually: {e}", file=sys.stderr)
         print(config_text)
 
@@ -180,7 +180,7 @@ def write_nginx_config(domain: str, proxy_port: int = 8000) -> Path:
             ["sudo", "tee", str(rate_limit_path)],
             input=rate_limit_conf, text=True, capture_output=True, timeout=10, check=True,
         )
-    except Exception as e:
+    except subprocess.CalledProcessError as e:
         print(f"Failed to write {rate_limit_path} — write it manually: {e}", file=sys.stderr)
 
     return config_path
@@ -193,7 +193,7 @@ def enable_nginx_site() -> None:
     dst = str(NGINX_SITES_ENABLED / NGINX_CONFIG_NAME)
     try:
         subprocess.run(["sudo", "ln", "-sf", src, dst], check=True, timeout=10)
-    except Exception as e:
+    except subprocess.CalledProcessError as e:
         print(f"Failed to enable site — run: sudo ln -s {src} {dst} ({e})", file=sys.stderr)
 
 
@@ -215,11 +215,11 @@ def reload_nginx() -> bool:
     try:
         subprocess.run(["systemctl", "reload", "nginx"], check=True, timeout=10)
         return True
-    except Exception:
+    except subprocess.CalledProcessError:
         try:
             subprocess.run(["nginx", "-s", "reload"], check=True, timeout=10)
             return True
-        except Exception:
+        except subprocess.CalledProcessError:
             return False
 
 
@@ -234,7 +234,7 @@ def cert_exists(domain: str) -> bool:
             capture_output=True, timeout=5,
         )
         return result.returncode == 0
-    except Exception:
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
         return False
 
 

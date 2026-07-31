@@ -194,7 +194,7 @@ def open_db(path: Path, *, skip_integrity_check: bool = False, check_same_thread
                     _ensure_migrated_columns(conn)
                     _run_data_migrations(conn)
                     conn.execute(f"PRAGMA user_version = {CURRENT_SCHEMA_VERSION}")
-                except Exception:
+                except sqlite3.Error:
                     conn.close()
                     raise
             elif "no such column" in str(e):
@@ -239,7 +239,7 @@ def open_db(path: Path, *, skip_integrity_check: bool = False, check_same_thread
     # Migrate vec0 table when sqlite-vec is available (idempotent CREATE IF NOT EXISTS)
     try:
         init_vec_table(conn)
-    except Exception as e:
+    except (sqlite3.Error, RuntimeError) as e:
         if isinstance(e, (KeyboardInterrupt, SystemExit)):
             raise
         log.warning(
@@ -314,5 +314,5 @@ def transaction(conn: sqlite3.Connection, checkpoint: bool = True) -> Generator[
     if checkpoint:
         try:
             conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-        except Exception:
+        except sqlite3.Error:
             pass  # best-effort — data was already committed; KeyboardInterrupt won't reach here (guarded above)

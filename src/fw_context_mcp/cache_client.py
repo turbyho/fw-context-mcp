@@ -184,7 +184,7 @@ class CacheClient:
                     force=cs.force,
                     batch_size=cs.batch_size,
                 )
-            except Exception as e:
+            except (ValueError, TypeError, AttributeError) as e:
                 logger.debug("CacheClient.from_config: failed to create client — %s", e)
                 return None
         return None
@@ -245,7 +245,7 @@ class CacheClient:
                     continue
                 logger.warning("Cache server returned %d after %d retries — giving up",
                               resp.status_code, _MAX_RETRIES)
-            except Exception as e:
+            except (httpx.HTTPError, OSError) as e:
                 if attempt < _MAX_RETRIES - 1:
                     wait = _RETRY_BACKOFF ** (attempt + 1)
                     logger.debug("Cache server request failed (attempt %d/%d): %s",
@@ -317,7 +317,7 @@ class CacheClient:
                     continue
                 logger.warning("Cache server write returned %d after %d retries — giving up",
                               resp.status_code, _MAX_RETRIES)
-            except Exception as e:
+            except (httpx.HTTPError, OSError) as e:
                 if attempt < _MAX_RETRIES - 1:
                     wait = _RETRY_BACKOFF ** (attempt + 1)
                     time.sleep(wait)
@@ -353,7 +353,7 @@ class CacheClient:
                     wait = _RETRY_BACKOFF ** (attempt + 1)
                     time.sleep(wait)
                     continue
-            except Exception as e:
+            except (httpx.HTTPError, OSError) as e:
                 if attempt < _MAX_RETRIES - 1:
                     wait = _RETRY_BACKOFF ** (attempt + 1)
                     time.sleep(wait)
@@ -399,7 +399,7 @@ class CacheClient:
                     wait = _RETRY_BACKOFF ** (attempt + 1)
                     time.sleep(wait)
                     continue
-            except Exception as e:
+            except (httpx.HTTPError, OSError) as e:
                 if attempt < _MAX_RETRIES - 1:
                     wait = _RETRY_BACKOFF ** (attempt + 1)
                     time.sleep(wait)

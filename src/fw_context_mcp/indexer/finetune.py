@@ -358,7 +358,7 @@ def train_step(
 
     try:
         st_model = embedder.model
-    except Exception as e:
+    except (RuntimeError, OSError) as e:
         log.error("Failed to load embedding model: %s", e)
         return None
 

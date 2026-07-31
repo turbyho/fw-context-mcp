@@ -33,7 +33,7 @@ def check_setup(cfg: LLMConfig) -> dict:
                 "Install and start: https://ollama.com"
             ),
         }
-    except Exception as e:
+    except (httpx.HTTPError, OSError) as e:
         return {"status": "error", "ollama_running": False, "message": str(e)}
 
     models = resp.json().get("models", [])

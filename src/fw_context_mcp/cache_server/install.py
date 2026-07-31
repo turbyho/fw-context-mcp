@@ -93,7 +93,7 @@ def install_systemd_unit(unit_text: str) -> None:
             print("  sudo systemctl daemon-reload")
             print("  sudo systemctl enable --now fw-cache-server")
             return
-    except Exception as e:
+    except (subprocess.CalledProcessError, OSError) as e:
         print(f"Failed to install unit file: {e}", file=sys.stderr)
     # Fallback: print for manual install
     print(unit_text)

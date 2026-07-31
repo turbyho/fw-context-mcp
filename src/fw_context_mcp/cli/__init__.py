@@ -242,7 +242,7 @@ def _post_index_optimize(
         _opt_conn = _sqlite3.connect(str(db_path))
         _opt_conn.execute("PRAGMA optimize")
         _opt_conn.close()
-    except Exception:
+    except sqlite3.Error:
         log.debug("PRAGMA optimize failed for %s", db_path, exc_info=True)
 
     from ..config.global_db import open_global_db, upsert_project_registry
@@ -454,7 +454,7 @@ def cmd_list(args: argparse.Namespace) -> int:
                 if args.verbose:
                     rows.append(("", f"  db={db_path}", "", "", ""))
                     rows.append(("", f"  cc={r['compile_commands_path']}", "", "", ""))
-        except Exception as e:
+        except (sqlite3.Error, OSError) as e:
             print(f"[error] {db_path}: {e}", file=sys.stderr)
 
     if not rows:
@@ -1664,7 +1664,7 @@ def cmd_analyze(args: argparse.Namespace) -> int:
                     force=cfg.cache_server.force,
                     batch_size=cfg.cache_server.batch_size,
                 )
-            except Exception as e:
+            except (ValueError, TypeError, AttributeError) as e:
                 logging.getLogger(__name__).warning("Failed to create CacheClient: %s", e)
 
         _build_llm_analysis(
@@ -1923,7 +1923,7 @@ def cmd_cache_remote_init(args: argparse.Namespace) -> int:
     except httpx.TimeoutException:
         print(f"error: connection to {url} timed out", file=sys.stderr)
         return 1
-    except Exception as e:
+    except httpx.HTTPError as e:
         print(f"error: {e}", file=sys.stderr)
         return 1
 
@@ -2438,7 +2438,7 @@ def cmd_watch_status(args: argparse.Namespace) -> int:
 
                 uptime_s = _time.time() - pid_file.stat().st_mtime
                 print(f"Daemon:     running (pid {pid}, uptime {int(uptime_s)}s)")
-            except Exception:
+            except (OSError, ValueError):
                 print("Daemon:     running")
         else:
             print("Daemon:     running")
@@ -2468,7 +2468,7 @@ def cmd_watch_status(args: argparse.Namespace) -> int:
                     print(f"Modified:   {mod_count} file(s)")
             finally:
                 conn.close()
-        except Exception:
+        except (sqlite3.Error, OSError):
             pass
 
     # Index subprocess

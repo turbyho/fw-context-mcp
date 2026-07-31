@@ -167,7 +167,7 @@ def _count_modified_files(
                     current_max = row[0] if row else 0.0
                     if current_max == max_stored:
                         return count
-                except Exception:
+                except sqlite3.Error:
                     pass  # query failed — fall through to recompute
             # Cache stale — remove and recompute
             _modified_cache.pop(config_hash, None)
@@ -245,7 +245,7 @@ def _auto_reindex_stale(
                 failed.append(fp)
             else:
                 succeeded.append(fp)
-        except Exception:
+        except (sqlite3.Error, RuntimeError, OSError):
             failed.append(fp)
     return succeeded, failed
 

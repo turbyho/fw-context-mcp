@@ -14,9 +14,10 @@ from pathlib import Path
 
 import httpx
 
+from ..config.settings import DESCRIPTION_VERSION
 from ..llm.embedder_factory import get_embedder
 from ..utils import compute_source_hash
-from .db import open_db
+from .db import open_db, transaction, write_lock
 from .db._embeddings import _vec_to_blob
 from .db import upsert_embeddings, upsert_embeddings_vec
 

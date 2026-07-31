@@ -134,7 +134,7 @@ def setup_wizard() -> int:
             admin_token, project_tokens = asyncio.run(_all_db_ops())
             if admin_token is None:
                 return 1
-        except Exception as e:
+        except (RuntimeError, OSError) as e:
             print(f"  [!] DB setup failed: {e}")
             return 1
 
@@ -296,7 +296,7 @@ def _detect_postgresql() -> bool:
     try:
         result = subprocess.run(["systemctl", "is-active", "--quiet", "postgresql"], capture_output=True, timeout=5)
         return result.returncode == 0
-    except Exception:
+    except subprocess.CalledProcessError:
         return False
 
 
@@ -343,7 +343,7 @@ def _ensure_db_user() -> bool:
         )
         if result.stdout.strip() == "1":
             user_exists = True
-    except Exception:
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
         pass
 
     if not user_exists:
@@ -407,7 +407,7 @@ def _save_credentials(password: str) -> None:
         print(f"  [✓] Credentials saved to {lib_path / 'db.env'}")
         os.environ["FW_CACHE_DB_URL"] = db_url
         return
-    except Exception:
+    except (subprocess.CalledProcessError, OSError):
         pass
 
     # Fallback: user home directory (single-user non-sudo setups)
@@ -458,7 +458,7 @@ def _ensure_databases() -> bool:
             )
             if result.stdout.strip() != "1":
                 missing.append(db_name)
-        except Exception:
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
             missing.append(db_name)
 
     if not missing:
@@ -536,7 +536,7 @@ def _ensure_cache_server_init() -> str | None:
 
     try:
         token = asyncio.run(_standalone())
-    except Exception as e:
+    except (RuntimeError, OSError) as e:
         print(f"  [!] Failed to init cache server: {e}")
         return None
 
@@ -561,7 +561,7 @@ def _detect_project_id_from_cwd() -> str | None:
         pid = data.get("project", {}).get("id")
         if pid:
             return pid
-    except Exception:
+    except (OSError, ValueError):
         pass
     return None
 
@@ -630,7 +630,7 @@ def _setup_project_and_tokens(
 
     try:
         return asyncio.run(_standalone())
-    except Exception as e:
+    except (RuntimeError, OSError) as e:
         print(f"    [!] Failed to create project: {e}")
     return None
 

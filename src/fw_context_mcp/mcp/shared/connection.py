@@ -48,7 +48,7 @@ def _invalidate_conn_cache(db_key: str | None = None) -> None:
             for entry in _conn_cache.values():
                 try:
                     entry.conn.close()
-                except Exception:
+                except sqlite3.Error:
                     pass
             _conn_cache.clear()
             with _integrity_lock:
@@ -56,7 +56,7 @@ def _invalidate_conn_cache(db_key: str | None = None) -> None:
         elif db_key in _conn_cache:
             try:
                 _conn_cache[db_key].conn.close()
-            except Exception:
+            except sqlite3.Error:
                 pass
             del _conn_cache[db_key]
             with _integrity_lock:
@@ -82,7 +82,7 @@ def _evict_stale_entry(db_key: str) -> None:
         if time.monotonic() - entry.opened_at > _CONN_TTL:
             try:
                 entry.conn.close()
-            except Exception:
+            except sqlite3.Error:
                 pass
             del _conn_cache[db_key]
             with _integrity_lock:
