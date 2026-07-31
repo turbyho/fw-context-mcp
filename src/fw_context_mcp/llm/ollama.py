@@ -302,7 +302,7 @@ class OllamaEmbedder(Embedder):
                 if isinstance(ctx_len, int) and ctx_len > 0:
                     _max_tokens_cache[model] = ctx_len
                     return ctx_len
-        except Exception:
+        except (ValueError, TypeError, RuntimeError, AttributeError, OSError):
             pass
         model_lower = model.lower()
         if "qwen3-embedding:0.6b" in model_lower or "qwen3-embedding:4b" in model_lower:

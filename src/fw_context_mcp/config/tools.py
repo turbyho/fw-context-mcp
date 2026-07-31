@@ -457,7 +457,7 @@ def check_target(target: InstructionTarget, project_root: Path | None = None) ->
                 managed = data.get("managed", {})
                 if managed:  # Non-empty managed dict = skillshare active here
                     collision.is_skillshare_managed = True
-            except Exception:
+            except (ValueError, TypeError, RuntimeError, AttributeError):
                 pass
             break
         parent = parent.parent

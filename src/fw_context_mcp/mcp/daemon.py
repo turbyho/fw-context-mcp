@@ -428,7 +428,7 @@ def _run_index_async(
             pf.write(str(proc.pid))
         if log_fh != subprocess.DEVNULL:
             log_fh.close()
-    except Exception:
+    except (ValueError, TypeError, RuntimeError, AttributeError):
         log.exception("Failed to spawn index subprocess")
         if log_fh != subprocess.DEVNULL:
             log_fh.close()
@@ -490,7 +490,7 @@ def _optimize_db(db_dir: Path) -> None:
         return
     try:
         conn.execute("PRAGMA optimize")
-    except Exception:
+    except (ValueError, TypeError, RuntimeError, AttributeError):
         log.debug("PRAGMA optimize failed", exc_info=True)
     finally:
         conn.close()

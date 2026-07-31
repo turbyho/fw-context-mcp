@@ -118,7 +118,7 @@ LOOKUP_PREFIX_SQL,
                 try:
                     from ...search.did_you_mean import suggest as suggest_names
                     _suggestions = suggest_names(c, config_hash, name, limit=5)
-                except Exception:
+                except (ValueError, TypeError, RuntimeError, AttributeError):
                     pass  # suggestions are best-effort
 
             # Macro fallback: check the macros table
