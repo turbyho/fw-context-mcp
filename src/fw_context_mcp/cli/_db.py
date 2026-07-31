@@ -338,7 +338,7 @@ def cmd_db_delete(args: argparse.Namespace) -> int:
         conn.close()
 
     # Clean up compile_commands.<hash>.json artifact (outside transaction)
-    cc_path = Path.home() / ".fw-context" / "index" / project_id / f"compile_commands.{config_hash}.json"
+    cc_path = cfg.index.db_dir / project_id / f"compile_commands.{config_hash}.json"
     if cc_path.exists():
         try:
             cc_path.unlink()
