@@ -26,6 +26,7 @@ Serves 34 MCP tools and 4 MCP resources via FastMCP (stdio transport).
 """
 
 import logging
+import sqlite3
 from pathlib import Path
 
 from mcp.server.fastmcp import FastMCP
