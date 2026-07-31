@@ -37,4 +37,3 @@ try:
     pysqlite3.Row = _CompatRow
 except ImportError:
     pass
-    pass

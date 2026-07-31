@@ -12,6 +12,8 @@ from __future__ import annotations
 import os
 import sys
 import tomllib
+import ipaddress
+from urllib.parse import urlparse
 from collections import OrderedDict
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -707,8 +709,6 @@ def _is_loopback_url(url: str) -> bool:
     Uses ``ipaddress`` for robust IPv4/IPv6 detection, including shortened
     IPv6 formats (``0:0:0:0:0:0:0:1``, ``::1``) and IPv4-mapped IPv6.
     """
-    import ipaddress
-    from urllib.parse import urlparse
 
     host = (urlparse(url).hostname or "").lower()
     if host == "localhost":

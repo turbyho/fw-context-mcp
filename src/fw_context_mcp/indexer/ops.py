@@ -41,7 +41,7 @@ from fw_context_mcp.utils import compute_content_hash, compute_source_hash, read
 
 log = logging.getLogger(__name__)
 
-# TODO: Each header is opened/read/closed individually — 500+ headers = 500+
+# NOTE(turbyho, 2026-07-31): Each header is opened/read/closed individually — 500+ headers = 500+
 # open/read/close cycles per TU.  Consider batch I/O for read_file_lines.
 _body_cache: OrderedDict[str, list[str] | None] = OrderedDict()
 _BODY_CACHE_MAX_ENTRIES = 200

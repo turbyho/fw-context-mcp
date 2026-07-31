@@ -130,7 +130,7 @@ def _build_llm_analysis(
     project-definition symbol using Ollama, one symbol per request.
 
     Processes symbols individually — one Ollama request per symbol — for
-    maximum isolation and retry-ability.  TODO: Ollama batching API would
+    maximum isolation and retry-ability.  NOTE(turbyho, 2026-07-31): Ollama batching API would
     reduce ~10K symbols from ~10K HTTP round trips to O(batches).
     reliable format adherence. Only project symbols (non-SDK) are analyzed.
 
