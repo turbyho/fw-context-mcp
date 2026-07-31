@@ -181,7 +181,12 @@ class InstructionTarget:
         p = self.path
         if p.startswith("~"):
             p = os.path.expanduser(p)
-        if "{project}" in p and project_root is not None:
+        if "{project}" in p:
+            if project_root is None:
+                raise ValueError(
+                    f"InstructionTarget path '{self.path}' contains '{{project}}' "
+                    "but no project_root was provided"
+                )
             p = p.replace("{project}", str(project_root))
         return Path(p)
 

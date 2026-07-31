@@ -65,7 +65,7 @@ def ollama_guard() -> Generator[None, None, None]:
         yield
 
 
-def _pull_model(model: str, base_url: str) -> None:
+def _pull_model(model: str, base_url: str, *, timeout: float = 600.0) -> None:
     """Pull a model via Ollama /api/pull (blocking, streaming).
 
     Downloads the model if not already installed.  The streaming response
@@ -73,7 +73,7 @@ def _pull_model(model: str, base_url: str) -> None:
     """
     url = base_url.rstrip("/") + "/api/pull"
     try:
-        with httpx.stream("POST", url, json={"name": model}, timeout=600.0) as resp:
+        with httpx.stream("POST", url, json={"name": model}, timeout=timeout) as resp:
             resp.raise_for_status()
             for _ in resp.iter_lines():
                 pass  # consume stream
@@ -134,7 +134,7 @@ def call_ollama(
             resp = httpx.post(url, json=payload, timeout=cfg.timeout)
         if resp.status_code == 404:
             log.info("LLM model '%s' not found, pulling...", cfg.model)
-            _pull_model(cfg.model, cfg.ollama_url)
+            _pull_model(cfg.model, cfg.ollama_url, timeout=cfg.timeout)
             with ollama_guard():
                 resp = httpx.post(url, json=payload, timeout=cfg.timeout)
         resp.raise_for_status()
@@ -209,7 +209,7 @@ def _call_ollama_embed_impl(
         if e.response.status_code == 404:
             # Model not installed — pull it, then retry once
             log.info("Embedding model '%s' not found, pulling...", cfg.embed_model)
-            _pull_model(cfg.embed_model, cfg.ollama_url)
+            _pull_model(cfg.embed_model, cfg.ollama_url, timeout=cfg.timeout)
             try:
                 with ollama_guard():
                     resp = httpx.post(url, json=payload, timeout=cfg.timeout * 2)

@@ -39,6 +39,8 @@ def find_closing_brace(
     Returns:
         0-based line index of the line containing the matching ``}``.
     """
+    if not lines or start_idx >= len(lines):
+        return start_idx
     state = _BraceState.NORMAL
     depth = 0
     seen_open = False
