@@ -236,12 +236,9 @@ def _fast_staleness_check(root: Path) -> tuple[bool, list[str]]:
     """
     from ..config import derive_project_id
     from ..config import load as load_config
-    from ..indexer.db import (
-        CURRENT_SCHEMA_VERSION,
-        get_active_config,
-        get_db_schema_version,
-    )
-    from .shared.context import _db_path, _is_stale, _open_db_safe
+    from ..indexer.db import get_active_config
+    from .shared.context import _db_path, _open_db_safe
+    from .shared.stale import check_structural_staleness
 
     db_path = _db_path(root)
     if not db_path.exists():
@@ -260,34 +257,8 @@ def _fast_staleness_check(root: Path) -> tuple[bool, list[str]]:
             return False, []
         config_hash = cfg["config_hash"]
 
-        # 1. compile_commands.json changed? (one stat call)
-        cc_path = cfg["compile_commands_path"]
-        if _is_stale(cfg, cc_path):
-            reasons.append("compile_commands.json changed")
-
-        # 2. Schema version mismatch?
-        schema_ver = get_db_schema_version(conn)
-        if schema_ver < CURRENT_SCHEMA_VERSION:
-            reasons.append(f"schema {schema_ver} < {CURRENT_SCHEMA_VERSION}")
-
-        # 3. Missing refs or indirect call sites?
-        proj_cfg = load_config(root)
-        if proj_cfg.index.index_refs:
-            ref_count = conn.execute(
-                    "SELECT COUNT(*) FROM refs WHERE config_hash=?",
-                    (config_hash,),
-            ).fetchone()[0]
-            if ref_count == 0:
-                    reasons.append("refs missing")
-                    # Also check indirect call sites — but only flag them
-                    # when refs are missing (if refs were populated, the
-                    # indirect extraction ran too; empty table is legitimate).
-                    ics_count = conn.execute(
-                        "SELECT COUNT(*) FROM indirect_call_sites WHERE config_hash=?",
-                        (config_hash,),
-                    ).fetchone()[0]
-                    if ics_count == 0:
-                        reasons.append("indirect call sites missing")
+        # 1-3. Structural checks (shared with daemon._staleness_check)
+        reasons.extend(check_structural_staleness(conn, config_hash, cfg, root))
 
         # 4. Unanalyzed symbols?
         # Uses CONFIG analyze_vendor (not stored) because this check
@@ -295,39 +266,40 @@ def _fast_staleness_check(root: Path) -> tuple[bool, list[str]]:
         # background reindex uses config, not stored flags.  Using
         # stored would cause an infinite reindex loop when a manual
         # --analyze-vendor run stored True but config is False.
+        proj_cfg = load_config(root)
         if proj_cfg.llm.enabled and proj_cfg.llm.analyze_symbols:
             if proj_cfg.llm.analyze_vendor:
-                    unanalyzed = conn.execute(
-                        """SELECT COUNT(*)
-                           FROM symbols s
-                           WHERE s.config_hash = ?
-                             AND s.is_definition = 1
-                             AND s.kind IN ('function', 'method',
-                                            'constructor', 'destructor',
-                                            'class', 'struct')
-                             AND s.name NOT LIKE '%(anonymous%'
-                             AND s.name NOT LIKE '%(unnamed%'
-                             AND NOT EXISTS (SELECT 1 FROM llm_analysis a WHERE a.symbol_id = s.id)""",
-                        (config_hash,),
-                    ).fetchone()[0]
+                unanalyzed = conn.execute(
+                    """SELECT COUNT(*)
+                       FROM symbols s
+                       WHERE s.config_hash = ?
+                         AND s.is_definition = 1
+                         AND s.kind IN ('function', 'method',
+                                        'constructor', 'destructor',
+                                        'class', 'struct')
+                         AND s.name NOT LIKE '%(anonymous%'
+                         AND s.name NOT LIKE '%(unnamed%'
+                         AND NOT EXISTS (SELECT 1 FROM llm_analysis a WHERE a.symbol_id = s.id)""",
+                    (config_hash,),
+                ).fetchone()[0]
             else:
-                    # Use is_project column directly for unanalyzed symbol count
-                    unanalyzed = conn.execute(
-                        """SELECT COUNT(*)
-                           FROM symbols s
-                           WHERE s.config_hash = ?
-                             AND s.is_definition = 1
-                             AND s.is_project = 1
-                             AND s.kind IN ('function', 'method',
-                                            'constructor', 'destructor',
-                                            'class', 'struct')
-                             AND s.name NOT LIKE '%(anonymous%'
-                             AND s.name NOT LIKE '%(unnamed%'
-                             AND NOT EXISTS (SELECT 1 FROM llm_analysis a WHERE a.symbol_id = s.id)""",
-                        (config_hash,),
-                    ).fetchone()[0]
+                # Use is_project column directly for unanalyzed symbol count
+                unanalyzed = conn.execute(
+                    """SELECT COUNT(*)
+                       FROM symbols s
+                       WHERE s.config_hash = ?
+                         AND s.is_definition = 1
+                         AND s.is_project = 1
+                         AND s.kind IN ('function', 'method',
+                                        'constructor', 'destructor',
+                                        'class', 'struct')
+                         AND s.name NOT LIKE '%(anonymous%'
+                         AND s.name NOT LIKE '%(unnamed%'
+                         AND NOT EXISTS (SELECT 1 FROM llm_analysis a WHERE a.symbol_id = s.id)""",
+                    (config_hash,),
+                ).fetchone()[0]
             if unanalyzed > 0:
-                    reasons.append(f"{unanalyzed} unanalyzed symbols")
+                reasons.append(f"{unanalyzed} unanalyzed symbols")
     finally:
         conn.close()
 

@@ -5,8 +5,9 @@ from __future__ import annotations
 import logging
 import os
 import shutil
-import subprocess
 from pathlib import Path
+
+from fw_context_mcp.utils import run_build_command
 from typing import TYPE_CHECKING
 
 from . import registry
@@ -102,10 +103,7 @@ class ZephyrBuildSystem:
         }
         # NOTE: no timeout= — build commands can run for minutes; adding a fixed
         # timeout would break long builds.  Network-filesystem stalls remain a risk.
-        result = subprocess.run(cmd, cwd=project_root, env=env)
-
-        if result.returncode != 0:
-            raise RuntimeError(f"west build failed with exit code {result.returncode}")
+        run_build_command(cmd, cwd=project_root, description="west build", env=env)
 
         cc_in_build = build_dir / "compile_commands.json"
         if not cc_in_build.exists():

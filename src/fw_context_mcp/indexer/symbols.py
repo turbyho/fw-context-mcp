@@ -73,7 +73,6 @@ _REF_KINDS = {
     cx.CursorKind.CALL_EXPR: "call",
     cx.CursorKind.DECL_REF_EXPR: "ref",
     cx.CursorKind.MEMBER_REF_EXPR: "member",
-    cx.CursorKind.TEMPLATE_REF: "template_ref",
 }
 
 # Cursor kinds that are valid targets for an indirect call (function pointers)

@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import logging
 import shutil
-import subprocess
 from pathlib import Path
+
+from fw_context_mcp.utils import run_build_command
 from typing import TYPE_CHECKING
 
 from . import registry
@@ -128,10 +129,7 @@ class MbedOSBuildSystem:
             cmd.append("--clean")
 
         log.info("mbed-os build: %s", " ".join(cmd))
-        result = subprocess.run(cmd, cwd=project_root)
-
-        if result.returncode != 0:
-            raise RuntimeError(f"mbed compile failed with exit code {result.returncode}")
+        run_build_command(cmd, cwd=project_root, description="mbed compile")
 
         cc_path = project_root / "compile_commands.json"
         if not cc_path.exists():

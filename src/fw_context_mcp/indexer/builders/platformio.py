@@ -6,6 +6,8 @@ import logging
 import shutil
 import subprocess
 from pathlib import Path
+
+from fw_context_mcp.utils import run_build_command
 from typing import TYPE_CHECKING
 
 from . import registry
@@ -54,13 +56,10 @@ class PlatformIOBuildSystem:
         if cfg.clean:
             clean_cmd = [pio_bin, "run", "--project-dir", str(project_root), "--target", "clean"]
             log.info("platformio clean: %s", " ".join(clean_cmd))
-            subprocess.run(clean_cmd, cwd=project_root)
+            subprocess.run(clean_cmd, cwd=project_root, capture_output=True, text=True)
 
         log.info("platformio build: %s", " ".join(cmd))
-        result = subprocess.run(cmd, cwd=project_root)
-
-        if result.returncode != 0:
-            raise RuntimeError(f"pio run --target compiledb failed with exit code {result.returncode}")
+        run_build_command(cmd, cwd=project_root, description="pio run --target compiledb")
 
         cc_path = project_root / "compile_commands.json"
         if not cc_path.exists():
@@ -73,7 +72,7 @@ class PlatformIOBuildSystem:
         # already up-to-date, pio run exits quickly (no-op).
         build_cmd = [pio_bin, "run", "--project-dir", str(project_root)]
         log.info("platformio compile: %s", " ".join(build_cmd))
-        build_result = subprocess.run(build_cmd, cwd=project_root)
+        build_result = subprocess.run(build_cmd, cwd=project_root, capture_output=True, text=True)
         if build_result.returncode != 0:
             log.warning(
                 "Full build failed (exit code %d) — .d files may be missing. "

@@ -224,95 +224,12 @@ def open_db(path: Path, *, skip_integrity_check: bool = False, check_same_thread
     _ensure_migrated_columns(conn)
 
     # ── Defensive table creation ──────────────────────────────────────────
-    # Critical tables that were added after the initial _SCHEMA definition.
-    # These run unconditionally (outside the version gate) so that a database
-    # whose migration was interrupted — leaving user_version stamped but
-    # tables missing — self-heals automatically.  CREATE TABLE IF NOT EXISTS
-    # is idempotent and takes microseconds when the table already exists.
-    #
-    # IMPORTANT: every table definition below MUST be kept in sync with the
-    # corresponding CREATE TABLE statement in _SCHEMA above.  When you change
-    # one, change the other.  The two copies exist because _CRITICAL_TABLES
-    # runs unconditionally (self-healing) while _SCHEMA runs only on fresh
-    # databases and schema-version migrations.
-    _CRITICAL_TABLES = """
-    CREATE TABLE IF NOT EXISTS indirect_call_sites (
-        id           INTEGER PRIMARY KEY,
-        config_hash  TEXT    NOT NULL,
-        from_file    TEXT    NOT NULL,
-        from_line    INTEGER NOT NULL,
-        from_usr     TEXT,
-        expr_text    TEXT    NOT NULL DEFAULT '',
-        target_usr   TEXT    NOT NULL,
-        target_name  TEXT    NOT NULL DEFAULT '',
-        fn_ptr_type  TEXT    NOT NULL DEFAULT ''
-    );
-    CREATE INDEX IF NOT EXISTS idx_ics_config_target ON indirect_call_sites(config_hash, target_usr);
-    CREATE INDEX IF NOT EXISTS idx_ics_config_file   ON indirect_call_sites(config_hash, from_file);
-    CREATE INDEX IF NOT EXISTS idx_ics_config_usr    ON indirect_call_sites(config_hash, from_usr);
+    # Self-healing: ensure critical tables exist even when a migration was
+    # interrupted.  CREATE TABLE IF NOT EXISTS is idempotent and takes
+    # microseconds when the table already exists.  Table definitions live
+    # in _schema._CRITICAL_TABLES — single source of truth.
+    from ._schema import _CRITICAL_TABLES
 
-    CREATE TABLE IF NOT EXISTS fp_assignments (
-        id           INTEGER PRIMARY KEY,
-        config_hash  TEXT    NOT NULL,
-        from_file    TEXT    NOT NULL,
-        from_line    INTEGER NOT NULL,
-        lhs_usr      TEXT    NOT NULL,
-        lhs_name     TEXT    NOT NULL DEFAULT '',
-        rhs_usr      TEXT    NOT NULL,
-        rhs_name     TEXT    NOT NULL DEFAULT '',
-        fn_ptr_type  TEXT    NOT NULL DEFAULT '',
-        method       TEXT    NOT NULL,
-        from_usr     TEXT
-    );
-    CREATE INDEX IF NOT EXISTS idx_fpa_config_lhs ON fp_assignments(config_hash, lhs_usr);
-    CREATE INDEX IF NOT EXISTS idx_fpa_config_rhs ON fp_assignments(config_hash, rhs_usr);
-    CREATE INDEX IF NOT EXISTS idx_fpa_config_file ON fp_assignments(config_hash, from_file);
-
-    CREATE TABLE IF NOT EXISTS inheritance (
-        id           INTEGER PRIMARY KEY,
-        config_hash  TEXT    NOT NULL REFERENCES build_configs(config_hash),
-        derived_usr  TEXT    NOT NULL,
-        base_usr     TEXT    NOT NULL,
-        access       TEXT    NOT NULL DEFAULT 'public',
-        is_virtual   INTEGER NOT NULL DEFAULT 0,
-        UNIQUE(config_hash, derived_usr, base_usr)
-    );
-    CREATE INDEX IF NOT EXISTS idx_inheritance_derived ON inheritance(config_hash, derived_usr);
-    CREATE INDEX IF NOT EXISTS idx_inheritance_base    ON inheritance(config_hash, base_usr);
-
-    CREATE TABLE IF NOT EXISTS overrides (
-        id           INTEGER PRIMARY KEY,
-        config_hash  TEXT    NOT NULL REFERENCES build_configs(config_hash),
-        derived_usr  TEXT    NOT NULL,
-        base_usr     TEXT    NOT NULL,
-        UNIQUE(config_hash, derived_usr, base_usr)
-    );
-    CREATE INDEX IF NOT EXISTS idx_overrides_derived ON overrides(config_hash, derived_usr);
-    CREATE INDEX IF NOT EXISTS idx_overrides_base    ON overrides(config_hash, base_usr);
-
-    CREATE TABLE IF NOT EXISTS hotspot_cache (
-        id           INTEGER PRIMARY KEY,
-        config_hash  TEXT    NOT NULL REFERENCES build_configs(config_hash),
-        symbol_id    INTEGER NOT NULL REFERENCES symbols(id) ON DELETE CASCADE,
-        caller_count INTEGER NOT NULL DEFAULT 0,
-        UNIQUE(config_hash, symbol_id)
-    );
-    CREATE INDEX IF NOT EXISTS idx_hotspot_cache_config ON hotspot_cache(config_hash);
-
-    CREATE TABLE IF NOT EXISTS macros (
-        id               INTEGER PRIMARY KEY,
-        config_hash      TEXT    NOT NULL REFERENCES build_configs(config_hash),
-        file_id          INTEGER NOT NULL REFERENCES files(id),
-        name             TEXT    NOT NULL,
-        value            TEXT    NOT NULL DEFAULT '',
-        expanded_value   TEXT    NOT NULL DEFAULT '',
-        line             INTEGER NOT NULL,
-        is_function_like INTEGER NOT NULL DEFAULT 0,
-        UNIQUE(config_hash, file_id, line)
-    );
-    CREATE INDEX IF NOT EXISTS idx_macros_name ON macros(name, config_hash);
-    CREATE INDEX IF NOT EXISTS idx_macros_file ON macros(file_id);
-    """
     conn.executescript(_CRITICAL_TABLES)
 
     # Lazy imports — these symbols are defined in __init__.py (sibling module).

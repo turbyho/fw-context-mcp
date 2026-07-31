@@ -6,6 +6,8 @@ import logging
 import shutil
 import subprocess
 from pathlib import Path
+
+from fw_context_mcp.utils import run_build_command
 from typing import TYPE_CHECKING
 
 from . import registry
@@ -79,14 +81,11 @@ class ArduinoBuildSystem:
 
         # ── Pass 1: dry-run to generate compile_commands.json ──
         log.info("arduino build (dry-run): %s --only-compilation-database", " ".join(base_cmd))
-        dry_run = subprocess.run(
+        run_build_command(
             base_cmd + ["--only-compilation-database"],
             cwd=project_root,
+            description="arduino-cli compile --only-compilation-database",
         )
-        if dry_run.returncode != 0:
-            raise RuntimeError(
-                f"arduino-cli compile --only-compilation-database failed with exit code {dry_run.returncode}"
-            )
 
         cc_in_build = build_dir / "compile_commands.json"
         if not cc_in_build.exists():
@@ -107,7 +106,7 @@ class ArduinoBuildSystem:
 
         # ── Pass 2: real compile to produce .d dependency files ──
         log.info("arduino build (compile): %s", " ".join(base_cmd))
-        real = subprocess.run(base_cmd, cwd=project_root)
+        real = subprocess.run(base_cmd, cwd=project_root, capture_output=True, text=True)
         if real.returncode != 0:
             # Real compile failed — but we already have the compilation
             # database.  Warn and continue (the indexer can still work,

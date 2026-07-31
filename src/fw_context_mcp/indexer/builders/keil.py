@@ -10,8 +10,9 @@ from __future__ import annotations
 
 import logging
 import shutil
-import subprocess
 from pathlib import Path
+
+from fw_context_mcp.utils import run_build_command
 from typing import TYPE_CHECKING
 
 from . import registry
@@ -95,13 +96,7 @@ class KeilBuildSystem:
         cmd += ["-o", str(cc_path)]
 
         log.info("keil convert: %s", " ".join(cmd))
-        result = subprocess.run(cmd, cwd=root)
-
-        if result.returncode != 0:
-            raise RuntimeError(
-                f"keil2clangd failed with exit code {result.returncode}.\n"
-                "Check that keil_project, keil_cmsis_path, and toolchain_path are correct."
-            )
+        run_build_command(cmd, cwd=root, description="keil convert")
 
         if not cc_path.exists():
             raise RuntimeError("compile_commands.json was not generated — keil2clangd may have failed silently")
