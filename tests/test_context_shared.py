@@ -20,7 +20,7 @@ class TestIsStale:
             "created_at": (datetime.now(UTC) - timedelta(hours=1)).isoformat(),
         }
         # compile_commands mtime is newer → stale
-        assert _is_stale(cfg, str(cc)) is True
+        assert _is_stale(cfg, str(cc))[0] is True
 
     def test_index_newer_than_compile_commands(self, tmp_path: Path):
         cc = tmp_path / "compile_commands.json"
@@ -29,31 +29,31 @@ class TestIsStale:
         cfg = {
             "created_at": (datetime.now(UTC) + timedelta(hours=1)).isoformat(),
         }
-        assert _is_stale(cfg, str(cc)) is False
+        assert _is_stale(cfg, str(cc))[0] is False
 
     def test_missing_compile_commands_returns_false(self, tmp_path: Path):
         cfg = {
             "created_at": datetime.now(UTC).isoformat(),
         }
-        assert _is_stale(cfg, str(tmp_path / "nonexistent.json")) is False
+        assert _is_stale(cfg, str(tmp_path / "nonexistent.json"))[0] is True
 
     def test_missing_created_at_key(self, tmp_path: Path):
         cc = tmp_path / "compile_commands.json"
         cc.write_text("[]")
         cfg: dict = {}
-        assert _is_stale(cfg, str(cc)) is False
+        assert _is_stale(cfg, str(cc))[0] is False
 
     def test_invalid_timestamp_format(self, tmp_path: Path):
         cc = tmp_path / "compile_commands.json"
         cc.write_text("[]")
         cfg = {"created_at": "not-a-valid-timestamp"}
-        assert _is_stale(cfg, str(cc)) is False
+        assert _is_stale(cfg, str(cc))[0] is True
 
     def test_empty_timestamp(self, tmp_path: Path):
         cc = tmp_path / "compile_commands.json"
         cc.write_text("[]")
         cfg = {"created_at": ""}
-        assert _is_stale(cfg, str(cc)) is False
+        assert _is_stale(cfg, str(cc))[0] is True
 
     def test_tolerance_margin(self, tmp_path: Path):
         cc = tmp_path / "compile_commands.json"
@@ -66,7 +66,7 @@ class TestIsStale:
         # If tolerance > difference, then NOT stale
         # cc.st_mtime = X, index = X + 0.5, tolerance = 1.0
         # X > (X + 0.5) + 1.0 → X > X + 1.5 → False → not stale
-        assert _is_stale(cfg, str(cc)) is False
+        assert _is_stale(cfg, str(cc))[0] is False
 
     def test_permission_error_handled(self, tmp_path: Path, monkeypatch):
         cc = tmp_path / "compile_commands.json"
@@ -77,7 +77,7 @@ class TestIsStale:
 
         monkeypatch.setattr(os.path, "getmtime", mock_getmtime)
         cfg = {"created_at": datetime.now(UTC).isoformat()}
-        assert _is_stale(cfg, str(cc)) is False
+        assert _is_stale(cfg, str(cc))[0] is True
 
     def test_future_mtime_handled(self, tmp_path: Path, monkeypatch):
         cc = tmp_path / "compile_commands.json"
@@ -91,7 +91,7 @@ class TestIsStale:
 
         monkeypatch.setattr(os.path, "getmtime", mock_getmtime)
         cfg = {"created_at": datetime.now(UTC).isoformat()}
-        assert _is_stale(cfg, str(cc)) is True
+        assert _is_stale(cfg, str(cc))[0] is True
 
 
 class TestDetectBuildSystem:

@@ -16,7 +16,7 @@ import httpx
 
 from ..config.settings import DESCRIPTION_VERSION
 from ..llm.embedder_factory import get_embedder
-from ..utils import compute_source_hash
+from ..utils import SAFE_EXCEPT, compute_source_hash, is_fatal
 from .db import open_db, transaction, write_lock
 from .db._embeddings import _vec_to_blob
 from .db import upsert_embeddings, upsert_embeddings_vec
@@ -156,7 +156,8 @@ def _cleanup_orphaned_cc_artifacts(db_path: Path, project_id: str) -> int:
             rows = conn.execute("SELECT config_hash FROM build_configs WHERE project_id = ?", (project_id,)).fetchall()
             conn.close()
             active_hashes = {r["config_hash"] for r in rows}
-        except (ValueError, TypeError, RuntimeError, AttributeError, sqlite3.Error):
+        except SAFE_EXCEPT as e:
+            if is_fatal(e): raise
             pass  # libclang/SQLite fallback  # DB may be corrupt or schema not yet initialized
 
     deleted = 0
@@ -226,7 +227,8 @@ def _build_embeddings(
         try:
             resp = httpx.get(llm_config.ollama_url.rstrip("/") + "/api/tags", timeout=5.0)
             resp.raise_for_status()
-        except (ValueError, TypeError, RuntimeError, AttributeError, sqlite3.Error):
+        except SAFE_EXCEPT as e:
+            if is_fatal(e): raise
             log.warning("Ollama not reachable — skipping embedding generation")
             return
     model = _embed_model_key(embedder.name, True)
@@ -395,7 +397,8 @@ def _build_embeddings(
         t0 = time.monotonic()
         try:
             embs = embedder.embed_documents(chunk_descs)
-        except (ValueError, TypeError, RuntimeError, AttributeError, sqlite3.Error) as e:
+        except SAFE_EXCEPT as e:
+            if is_fatal(e): raise
             elapsed = time.monotonic() - t0
             log.warning("[%d/%d] embedding batch failed %s: %s", batch_num + 1, total_batches, _fmt_dur(elapsed), e)
             continue
@@ -407,7 +410,8 @@ def _build_embeddings(
 
             try:
                 init_vec_table(conn, embedding_dim)
-            except (ValueError, TypeError, RuntimeError, AttributeError, sqlite3.Error) as e:
+            except SAFE_EXCEPT as e:
+                if is_fatal(e): raise
                 log.warning("vec0 table recreation failed (non-fatal): %s", e)
 
         # Store in legacy BLOB table (backward compatibility)
@@ -425,7 +429,8 @@ def _build_embeddings(
                     for (r, ci, _), emb in zip(batch, embs, strict=True)
                 ]
                 upsert_embeddings_vec(conn, vec_batch)
-            except (ValueError, TypeError, RuntimeError, AttributeError, sqlite3.Error) as e:
+            except SAFE_EXCEPT as e:
+                if is_fatal(e): raise
                 log.warning("vec0 batch insert failed (sqlite-vec may not be loaded): %s", e)
 
         total += len(blob_batch)

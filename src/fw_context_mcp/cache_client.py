@@ -13,6 +13,7 @@ import logging
 import sqlite3
 import time
 from pathlib import Path
+from fw_context_mcp.utils import SAFE_EXCEPT, is_fatal
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -90,7 +91,8 @@ def local_cache_upsert(conn: sqlite3.Connection, entries: list[dict]) -> int:
             )
             if cur.rowcount:
                 inserted += 1
-        except (ValueError, TypeError, RuntimeError, sqlite3.Error):
+        except SAFE_EXCEPT as e:
+            if is_fatal(e): raise
             logger.debug("local_cache_upsert: failed to insert entry", exc_info=True)
     conn.commit()
     return inserted

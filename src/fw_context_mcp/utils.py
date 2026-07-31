@@ -13,6 +13,7 @@ log = logging.getLogger(__name__)
 from collections import OrderedDict
 import hashlib
 import os
+import sqlite3
 from datetime import UTC, datetime
 from pathlib import Path
 import subprocess
@@ -24,8 +25,10 @@ __all__ = [
     "compute_source_hash",
     "fmt_count",
     "is_compile_commands_stale",
+    "is_fatal",
     "read_file_lines",
     "resolve_project_root",
+    "SAFE_EXCEPT",
     "truncate_path_middle",
 ]
 
@@ -33,7 +36,18 @@ __all__ = [
 # clock skew between the indexer and the filesystem.
 MTIME_TOLERANCE_S: float = 1.0
 
+# Standard exception tuple for non-fatal recoverable errors.
+# Use in all broad-except blocks where the operation can safely
+# continue or log+skip.  Always pair with is_fatal() check first.
+SAFE_EXCEPT = (
+    ValueError, TypeError, RuntimeError, AttributeError,
+    sqlite3.Error, OSError,
+)
 
+
+def is_fatal(exc: BaseException) -> bool:
+    """Return True for exceptions that must never be swallowed."""
+    return isinstance(exc, (KeyboardInterrupt, SystemExit, MemoryError, SystemError))
 
 def run_build_command(
     cmd: list[str],

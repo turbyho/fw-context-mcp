@@ -13,6 +13,7 @@ import sqlite3
 import time
 from pathlib import Path
 
+from ..utils import SAFE_EXCEPT, is_fatal
 from ._embedding import _build_embeddings
 from ._llm_analysis import _build_llm_analysis
 from ._manifest_updater import _refresh_header_mtimes_from_manifest, _update_manifest_after_index
@@ -490,7 +491,8 @@ def _run_postprocess(
                 resolve_and_update(
                     conn, config_hash, unit.clang_args, unit.file.resolve(),
                 )
-            except (ValueError, TypeError, RuntimeError, AttributeError, sqlite3.Error):
+            except SAFE_EXCEPT as e:
+                if is_fatal(e): raise
                 pass  # libclang/SQLite fallback
 
     # ── Embeddings ──
@@ -524,7 +526,8 @@ def _run_postprocess(
                     force=cache_server_config.force,
                     batch_size=cache_server_config.batch_size,
                 )
-            except (ValueError, TypeError, RuntimeError, AttributeError, sqlite3.Error):
+            except SAFE_EXCEPT as e:
+                if is_fatal(e): raise
                 pass  # libclang/SQLite fallback
         if force:
             conn.execute(
@@ -608,7 +611,8 @@ def _run_postprocess(
     # ── WAL checkpoint + schema stamp ──
     try:
         conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
-    except (ValueError, TypeError, RuntimeError, AttributeError, sqlite3.Error):
+    except SAFE_EXCEPT as e:
+        if is_fatal(e): raise
         pass  # libclang/SQLite fallback
     conn.execute(f"PRAGMA user_version = {CURRENT_SCHEMA_VERSION}")
 
