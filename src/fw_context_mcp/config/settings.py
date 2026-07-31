@@ -897,3 +897,11 @@ def _write_project_id(project_root: Path, project_id: str) -> None:
     finally:
         tmp.close()
     Path(tmp.name).replace(config_path)
+    # Ensure directory entry is persisted — belt-and-suspenders for older
+    # filesystems where rename() may not be atomic.
+    try:
+        dir_fd = os.open(str(config_path.parent), os.O_RDONLY)
+        os.fsync(dir_fd)
+        os.close(dir_fd)
+    except OSError:
+        pass

@@ -203,6 +203,13 @@ async def daemon_main(project_root: Path) -> None:
             await _wait_index(index_proc, shutdown, db_dir=db_dir)
             index_proc = None
 
+        # Load build-dir exclusion patterns from manifest (derived from
+        # SDK detection + [index] exclude_paths config).  Supplements the
+        # hardcoded _EXCLUDE_RX during file-change filtering.
+        build_patterns = await asyncio.get_running_loop().run_in_executor(
+            None, _load_build_patterns, db_dir
+        )
+
         while not shutdown.is_set():
             # ── Check ping timeout ───────────────────────────────────────
             ping_elapsed = time.monotonic() - last_ping_time
@@ -230,7 +237,7 @@ async def daemon_main(project_root: Path) -> None:
                         break
 
                     for _, changed_path_str in changes:
-                        if _is_source_file(changed_path_str):
+                        if _is_source_file(changed_path_str, build_patterns):
                             changed = True
                             break
                     if changed:
@@ -272,10 +279,33 @@ async def daemon_main(project_root: Path) -> None:
 # ── Internal helpers ─────────────────────────────────────────────────────────
 
 
-def _is_source_file(path_str: str) -> bool:
-    """Return True when *path_str* is a C/C++ source file outside excluded dirs."""
+def _is_source_file(path_str: str, build_patterns: list[str] | None = None) -> bool:
+    """Return True when *path_str* is a C/C++ source file outside excluded dirs.
+
+    Uses hardcoded ``_EXCLUDE_RX`` as baseline and supplements with
+    *build_patterns* from the project manifest when available (derived
+    from SDK detection and ``[index] exclude_paths`` config).
+    """
     p = Path(path_str)
-    return p.suffix.lower() in _SOURCE_EXTS_WATCH and not _EXCLUDE_RX.search(path_str)
+    if p.suffix.lower() not in _SOURCE_EXTS_WATCH:
+        return False
+    if _EXCLUDE_RX.search(path_str):
+        return False
+    if build_patterns and any(pat in path_str for pat in build_patterns):
+        return False
+    return True
+
+
+def _load_build_patterns(db_dir: Path) -> list[str]:
+    """Load ``build_dir_patterns`` from manifest.json, returning [] on any error."""
+    try:
+        from ..indexer.manifest import load as load_manifest
+        manifest = load_manifest(db_dir)
+        if manifest:
+            return manifest.get("build_dir_patterns", [])
+    except (OSError, ImportError, ValueError, KeyError):
+        pass
+    return []
 
 
 def _cleanup_files(sock_path: Path, pid_file: Path) -> None:
