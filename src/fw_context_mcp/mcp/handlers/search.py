@@ -129,7 +129,7 @@ def search_code(
         results include ``_fallback`` with the method name.
     """
     root = resolve_project_root(project_root)
-    limit = min(limit, 100)
+    limit = max(0, min(limit, 100))
 
     def _do_search(c: sqlite3.Connection, config_hash: str) -> list[dict]:
         result = _search_code_fts5_kind(c, query, config_hash, limit, kind, project_only, root)
@@ -299,7 +299,7 @@ async def semantic_search(
         if not db_path.exists():
             return [{"error": f"No index found for {root}. Run 'fw-context index' first."}]
 
-        limit = min(limit, 100)
+        limit = max(0, min(limit, 100))
         threshold = max(0.0, min(1.0, threshold))
 
         # Check Ollama availability
@@ -471,7 +471,7 @@ def search_bodies(
         source (function body, truncated at 2000 chars).
     """
     root = resolve_project_root(project_root)
-    limit = min(limit, 100)
+    limit = max(0, min(limit, 100))
     expanded = _expand_query(query, for_body_search=True)
 
     def _do_search(c: sqlite3.Connection, config_hash: str) -> list[dict]:
@@ -580,7 +580,7 @@ def search_content(
         _match_snippet (highlighted excerpt around the match).
     """
     root = resolve_project_root(project_root)
-    limit = min(limit, 100)
+    limit = max(0, min(limit, 100))
     expanded = _expand_query(query)
 
     def _do_search(c: sqlite3.Connection, config_hash: str) -> list[dict]:
