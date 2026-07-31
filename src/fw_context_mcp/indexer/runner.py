@@ -178,8 +178,8 @@ def _cleanup_orphaned_cc_artifacts(db_path: Path, project_id: str) -> int:
             rows = conn.execute("SELECT config_hash FROM build_configs WHERE project_id = ?", (project_id,)).fetchall()
             conn.close()
             active_hashes = {r["config_hash"] for r in rows}
-        except Exception:
-            pass  # DB may be corrupt or schema not yet initialized
+        except (ValueError, TypeError, RuntimeError, AttributeError, sqlite3.Error):
+            pass  # libclang/SQLite fallback  # DB may be corrupt or schema not yet initialized
 
     deleted = 0
     for f in cc_dir.iterdir():
@@ -246,7 +246,7 @@ def _build_embeddings(
         try:
             resp = httpx.get(llm_config.ollama_url.rstrip("/") + "/api/tags", timeout=5.0)
             resp.raise_for_status()
-        except Exception:
+        except (ValueError, TypeError, RuntimeError, AttributeError, sqlite3.Error):
             log.warning("Ollama not reachable — skipping embedding generation")
             return
     model = _embed_model_key(embedder.name, True)
@@ -415,7 +415,7 @@ def _build_embeddings(
         t0 = time.monotonic()
         try:
             embs = embedder.embed_documents(chunk_descs)
-        except Exception as e:
+        except (ValueError, TypeError, RuntimeError, AttributeError, sqlite3.Error) as e:
             elapsed = time.monotonic() - t0
             log.warning("[%d/%d] embedding batch failed %s: %s", batch_num + 1, total_batches, _fmt_dur(elapsed), e)
             continue
@@ -427,7 +427,7 @@ def _build_embeddings(
 
             try:
                 init_vec_table(conn, embedding_dim)
-            except Exception as e:
+            except (ValueError, TypeError, RuntimeError, AttributeError, sqlite3.Error) as e:
                 log.warning("vec0 table recreation failed (non-fatal): %s", e)
 
         # Store in legacy BLOB table (backward compatibility)
@@ -445,7 +445,7 @@ def _build_embeddings(
                     for (r, ci, _), emb in zip(batch, embs, strict=True)
                 ]
                 upsert_embeddings_vec(conn, vec_batch)
-            except Exception as e:
+            except (ValueError, TypeError, RuntimeError, AttributeError, sqlite3.Error) as e:
                 log.warning("vec0 batch insert failed (sqlite-vec may not be loaded): %s", e)
 
         total += len(blob_batch)
@@ -621,7 +621,7 @@ def _build_llm_analysis(
                     _model_ctx_size = ctx
                     log.debug("Resolved model context from Ollama: %d tokens", ctx)
                 break
-    except Exception:
+    except (ValueError, TypeError, RuntimeError, AttributeError, sqlite3.Error):
         log.warning("Ollama not reachable — skipping LLM analysis generation")
         return
 
@@ -706,7 +706,7 @@ def _build_llm_analysis(
             try:
                 local_hits = local_cache_lookup(local_db, [h])
                 cached = local_hits.get(h)
-            except Exception as e:
+            except (ValueError, TypeError, RuntimeError, AttributeError, sqlite3.Error) as e:
                 log.debug("Local global cache lookup failed: %s", e)
 
             # Tier 2: remote cache server
@@ -718,11 +718,11 @@ def _build_llm_analysis(
                         # Store in local global cache for next time
                         try:
                             local_cache_upsert(local_db, [{"hash": h, **cached}])
-                        except Exception as e:
+                        except (ValueError, TypeError, RuntimeError, AttributeError, sqlite3.Error) as e:
                             log.debug("Local global cache write failed: %s", e)
                     else:
                         log.debug("Remote cache miss for %s (hash=%s…)", qname, h[:12])
-                except Exception as e:
+                except (ValueError, TypeError, RuntimeError, AttributeError, sqlite3.Error) as e:
                     log.debug("Remote cache lookup failed for %s: %s", qname, e)
 
             if cached:
@@ -804,7 +804,7 @@ def _build_llm_analysis(
 
             try:
                 response = call_ollama(prompt, llm_config, temperature=0.1, num_predict=num_predict)
-            except Exception as e:
+            except (ValueError, TypeError, RuntimeError, AttributeError, sqlite3.Error) as e:
                 elapsed = time.monotonic() - t0
                 log.warning("[%d/%d] %s: err %s: %s", idx + 1, total_symbols, qname, _fmt_dur(elapsed), e)
                 continue
@@ -849,7 +849,7 @@ def _build_llm_analysis(
                                 }
                             ],
                         )
-                    except Exception as e:
+                    except (ValueError, TypeError, RuntimeError, AttributeError, sqlite3.Error) as e:
                         log.debug("Local global cache write failed: %s", e)
                     # Store on remote cache server (fire-and-forget)
                     if cache_client is not None:
@@ -865,7 +865,7 @@ def _build_llm_analysis(
                                     }
                                 ]
                             )
-                        except Exception as e:
+                        except (ValueError, TypeError, RuntimeError, AttributeError, sqlite3.Error) as e:
                             log.debug("Remote cache write failed: %s", e)
                     total += inserted
 
@@ -874,15 +874,15 @@ def _build_llm_analysis(
             log.debug("  summary: %s", r["summary"])
             log.debug("  inputs : %s", r["inputs"])
             log.debug("  outputs: %s", r["outputs"])
-        except Exception as e:
+        except (ValueError, TypeError, RuntimeError, AttributeError, sqlite3.Error) as e:
             elapsed = time.monotonic() - t0
             log.warning("[%d/%d] %s: err %s: %s", idx + 1, total_symbols, qname, _fmt_dur(elapsed), e)
             continue
 
     try:
         conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-    except Exception:
-        pass
+    except (ValueError, TypeError, RuntimeError, AttributeError, sqlite3.Error):
+        pass  # libclang/SQLite fallback
 
     log.info("LLM analysis stored: %d/%d symbols (model=%s)", total, total_symbols, model)
     local_db.close()
@@ -1585,8 +1585,8 @@ def _reassign_symbols_for_file(
                )""",
             (new_config_hash, new_config_hash, new_file_id),
         )
-    except Exception:
-        pass  # sqlite-vec may not be available
+    except (ValueError, TypeError, RuntimeError, AttributeError, sqlite3.Error):
+        pass  # libclang/SQLite fallback  # sqlite-vec may not be available
 
     # ── inheritance ──
     # UPDATE inheritance edges for classes defined in this file.
@@ -1750,7 +1750,7 @@ def _check_and_parse_unit(
     except sqlite3.Error:
         log.error("Fatal DB error parsing %s — stopping indexer", unit.file.name)
         raise
-    except Exception as exc:
+    except (ValueError, TypeError, RuntimeError, AttributeError, sqlite3.Error) as exc:
         msg = str(exc)
         if "unable to open database file" in msg:
             log.error("Fatal DB error parsing %s: %s — stopping indexer", unit.file.name, exc)
@@ -1907,7 +1907,7 @@ def _process_unit(
                 unit,
                 with_refs=index_refs,
             )
-        except Exception as exc:
+        except (ValueError, TypeError, RuntimeError, AttributeError, sqlite3.Error) as exc:
             log.warning("skip TU %s: %s", unit.file.name, exc)
             return ("skipped", 0, 0, (0.0, 0.0, 0.0), [])
         t_parse_end = time.monotonic()
@@ -1966,7 +1966,7 @@ def _process_unit(
     except sqlite3.Error:
         log.error("Fatal DB error storing %s — stopping indexer", unit.file.name)
         raise
-    except Exception as exc:
+    except (ValueError, TypeError, RuntimeError, AttributeError, sqlite3.Error) as exc:
         msg = str(exc)
         if "unable to open database file" in msg:
             log.error("Fatal DB error storing %s: %s — stopping indexer", unit.file.name, exc)
@@ -2084,8 +2084,8 @@ def _run_postprocess(
                 resolve_and_update(
                     conn, config_hash, unit.clang_args, unit.file.resolve(),
                 )
-            except Exception:
-                pass
+            except (ValueError, TypeError, RuntimeError, AttributeError, sqlite3.Error):
+                pass  # libclang/SQLite fallback
 
     # ── Embeddings ──
     if index_embeddings and llm_config is not None and llm_config.enabled:
@@ -2118,8 +2118,8 @@ def _run_postprocess(
                     force=cache_server_config.force,
                     batch_size=cache_server_config.batch_size,
                 )
-            except Exception:
-                pass
+            except (ValueError, TypeError, RuntimeError, AttributeError, sqlite3.Error):
+                pass  # libclang/SQLite fallback
         if force:
             conn.execute(
                 "DELETE FROM llm_analysis WHERE symbol_id IN (SELECT id FROM symbols WHERE config_hash = ?)",
@@ -2202,8 +2202,8 @@ def _run_postprocess(
     # ── WAL checkpoint + schema stamp ──
     try:
         conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
-    except Exception:
-        pass
+    except (ValueError, TypeError, RuntimeError, AttributeError, sqlite3.Error):
+        pass  # libclang/SQLite fallback
     conn.execute(f"PRAGMA user_version = {CURRENT_SCHEMA_VERSION}")
 
 
@@ -2369,8 +2369,8 @@ def run(
                 try:
                     with open(_hb_log, "a") as f:
                         f.write(f"{time.strftime('%H:%M:%S')} heartbeat\n")
-                except Exception:
-                    pass
+                except (ValueError, TypeError, RuntimeError, AttributeError, sqlite3.Error):
+                    pass  # libclang/SQLite fallback
 
         _hb_thread = threading.Thread(target=_heartbeat, daemon=True)
         _hb_thread.start()

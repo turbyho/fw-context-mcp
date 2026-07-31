@@ -97,10 +97,24 @@ def create_app(*, backend: "CacheStorageBackend | None" = None) -> FastAPI:
         async def dispatch(self, request, call_next):
             max_bytes = 10 * 1024 * 1024  # 10 MB
             content_length = request.headers.get("content-length")
-            if content_length and int(content_length) > max_bytes:
-                return JSONResponse(
-                    {"detail": "Request body too large (max 10 MB)"}, status_code=413,
-                )
+            if content_length:
+                if int(content_length) > max_bytes:
+                    return JSONResponse(
+                        {"detail": "Request body too large (max 10 MB)"}, status_code=413,
+                    )
+            else:
+                # No Content-Length — chunked transfer.  Read body with limit.
+                body = b""
+                async for chunk in request.stream():
+                    body += chunk
+                    if len(body) > max_bytes:
+                        return JSONResponse(
+                            {"detail": "Request body too large (max 10 MB)"}, status_code=413,
+                        )
+                # Reconstruct request with the read body for downstream consumers
+                from starlette.requests import Request as StarletteRequest
+                scope = dict(request.scope)
+                request = StarletteRequest(scope, receive=lambda: {"type": "http.request", "body": body})
             return await call_next(request)
 
     app.add_middleware(_BodySizeLimitMiddleware)
