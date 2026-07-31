@@ -323,6 +323,8 @@ def open_db(path: Path, *, skip_integrity_check: bool = False, check_same_thread
     try:
         init_vec_table(conn)
     except Exception as e:
+        if isinstance(e, (KeyboardInterrupt, SystemExit)):
+            raise
         log.warning(
             "sqlite-vec vector table initialization failed — semantic search will use legacy BLOB fallback: %s",
             e,
@@ -396,4 +398,4 @@ def transaction(conn: sqlite3.Connection, checkpoint: bool = True) -> Generator[
         try:
             conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
         except Exception:
-            pass  # best-effort — data was already committed
+            pass  # best-effort — data was already committed; KeyboardInterrupt won't reach here (guarded above)

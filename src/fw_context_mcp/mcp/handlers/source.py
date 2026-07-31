@@ -23,6 +23,18 @@ from ...utils import abs_path, read_file_lines
 from ..shared.context import _open_db_safe, _resolve_context
 
 log = logging.getLogger(__name__)
+def _validate_path_in_root(resolved_path: str, root: Path) -> str | None:
+    """Validate that *resolved_path* relative to *root* stays within the project.
+
+    Returns an error message string on failure, or ``None`` on success.
+    Used by ``read_file`` and ``get_file_map`` for consistent path-security checks.
+    """
+    try:
+        Path(root, resolved_path).resolve().relative_to(root.resolve())
+    except ValueError:
+        return f"Path escapes project root: {resolved_path}"
+    return None
+
 
 # ── Truncation limits ──
 _SOURCE_TRUNCATE_CHARS = 8000   # max chars for get_source / get_symbol_context body
@@ -555,6 +567,10 @@ def get_file_map(
                 resolved = min((c["path"] for c in candidates), key=len)
             else:
                 resolved = file_path
+            # Defense-in-depth: validate resolved path stays within project root
+            err = _validate_path_in_root(resolved, root)
+            if err:
+                return {"error": err}
             result = index_db.get_file_map(
                 conn, config_hash, resolved,
                 signatures=signatures, max_per_kind=max_per_kind,
@@ -897,10 +913,9 @@ def read_file(
                 resolved = file_path
 
             # Defense-in-depth: validate resolved path stays within project root
-            try:
-                Path(root, resolved).resolve().relative_to(root.resolve())
-            except ValueError:
-                return {"error": f"Path escapes project root: {resolved}"}
+            err = _validate_path_in_root(resolved, root)
+            if err:
+                return {"error": err}
 
             row = conn.execute(
                 "SELECT content, language, path, mtime FROM files WHERE config_hash=? AND path=?",
