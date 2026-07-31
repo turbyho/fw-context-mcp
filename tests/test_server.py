@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from fw_context_mcp.mcp.handlers.search import LOOKUP_EXACT_SQL, LOOKUP_PREFIX_SQL
+from fw_context_mcp.mcp.handlers._lookup import LOOKUP_EXACT_SQL, LOOKUP_PREFIX_SQL
 from fw_context_mcp.mcp.handlers.source import _read_symbol_body
 from fw_context_mcp.utils import abs_path as _abs_path
 

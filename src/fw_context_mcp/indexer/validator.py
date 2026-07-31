@@ -173,14 +173,7 @@ def validate_and_fix(
     fixed_count = 0
     unfixed: list[BuildIssue] = []
     for issue in issues:
-        if issue.auto_fixable:
-            try:
-                ok = build_system.auto_fix(issue, root)
-                if ok:
-                    fixed_count += 1
-                    continue
-            except Exception as exc:
-                log.warning("Auto-fix for %s raised: %s", issue.category, exc)
+        # Removed: auto-fix loop was unreachable — no builder sets auto_fixable=True
         unfixed.append(issue)
 
     if fixed_count > 0:

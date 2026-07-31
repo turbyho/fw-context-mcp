@@ -15,6 +15,7 @@ from fw_context_mcp.mcp.shared.context import _db_path, _open_db_safe
 from fw_context_mcp.mcp.shared.stale import _with_stale_recovery
 from fw_context_mcp.mcp.handlers._search_fallbacks import _symbol_row_to_dict
 
+
 LOOKUP_EXACT_SQL = """SELECT s.* FROM symbols s
    WHERE s.config_hash=? AND (s.name=? OR s.qualified_name=?)
    ORDER BY s.is_definition DESC, s.line
@@ -24,20 +25,8 @@ LOOKUP_PREFIX_SQL = r"""SELECT s.* FROM symbols s
    WHERE s.config_hash=? AND (s.name LIKE ? ESCAPE '\' OR s.qualified_name LIKE ? ESCAPE '\')
    ORDER BY s.is_definition DESC, s.line
    LIMIT ?"""
-log = logging.getLogger(__name__)
-
-LOOKUP_EXACT_SQL = """SELECT s.* FROM symbols s
-   WHERE s.config_hash=? AND (s.name=? OR s.qualified_name=?)
-   ORDER BY s.is_definition DESC, s.line
-   LIMIT ?"""
-
-LOOKUP_PREFIX_SQL = r"""SELECT s.* FROM symbols s
-   WHERE s.config_hash=? AND (s.name LIKE ? ESCAPE '\\' OR s.qualified_name LIKE ? ESCAPE '\\')
-   ORDER BY s.is_definition DESC, s.line
-   LIMIT ?"""
 
 log = logging.getLogger(__name__)
-from ._search_fallbacks import _fmt_symbol_rows
 
 
 def lookup_symbol(
