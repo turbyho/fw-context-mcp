@@ -70,7 +70,7 @@ def _collect_headers_from_tokens(tu, project_root: Path, build_dir_patterns: lis
             options=cx.TranslationUnit.PARSE_DETAILED_PROCESSING_RECORD,
         )
         includes = list(translation_unit.get_includes())
-    except Exception:
+    except (ValueError, TypeError, RuntimeError, AttributeError):
         log.debug("_collect_headers_from_tokens: parse failed for %s", tu.file.name)
         return []
 
