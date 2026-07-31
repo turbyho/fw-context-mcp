@@ -57,7 +57,7 @@ def _prune_auth_failures(now: float, window_s: float = 120.0) -> None:
 
 def _check_rate_limit(ip: str, max_failures: int = 20, window_s: float = 60.0) -> bool:
     """Return True if *ip* is under the rate limit, False if exceeded."""
-    nonlocal _auth_check_count
+    global _auth_check_count
     now = _time.monotonic()
     _auth_check_count += 1
     if _auth_check_count % _AUTH_PRUNE_INTERVAL == 0:
@@ -78,6 +78,14 @@ def _record_auth_failure(ip: str) -> None:
         _auth_failures.setdefault(ip, []).append(_time.monotonic())
 
 
+def _get_client_ip(request: Request) -> str:
+    """Extract client IP, preferring X-Forwarded-For when behind a proxy."""
+    forwarded = request.headers.get("X-Forwarded-For", "")
+    if forwarded:
+        return forwarded.split(",")[0].strip()
+    return request.client.host if request.client else "unknown"
+
+
 class CacheAuthMiddleware(BaseHTTPMiddleware):
     """Validates bearer tokens and attaches permissions to request.state."""
 
@@ -91,7 +99,7 @@ class CacheAuthMiddleware(BaseHTTPMiddleware):
             return JSONResponse({"detail": "Missing Authorization header"}, status_code=401)
 
         # Rate-limit auth failures per IP (defense-in-depth)
-        client_ip = request.client.host if request.client else "unknown"
+        client_ip = _get_client_ip(request)
         if not _check_rate_limit(client_ip):
             return JSONResponse({"detail": "Too many auth attempts"}, status_code=429)
 

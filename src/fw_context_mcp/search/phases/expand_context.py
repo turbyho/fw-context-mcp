@@ -99,7 +99,7 @@ def _get_neighbors(
         rows = conn.execute(
             f"SELECT DISTINCT from_usr FROM refs "
             f"WHERE config_hash = ? AND to_usr IN ({ph}) "
-            f"AND ref_kind = 'call' AND from_usr IS NOT NULL LIMIT 200",
+            f"AND ref_kind = 'call' AND from_usr IS NOT NULL LIMIT 500",
             (config_hash, *usrs),
         ).fetchall()
         for r in rows:
@@ -110,7 +110,7 @@ def _get_neighbors(
         rows = conn.execute(
             f"SELECT DISTINCT to_usr FROM refs "
             f"WHERE config_hash = ? AND from_usr IN ({ph}) "
-            f"AND ref_kind = 'call' LIMIT 200",
+            f"AND ref_kind = 'call' LIMIT 500",
             (config_hash, *usrs),
         ).fetchall()
         for r in rows:
