@@ -530,6 +530,7 @@ async def smart_search(
     # Add staleness warning if applicable
     results = list(ctx.formatted_results)
     if ctx.ollama_warning is None:
+        # Connection stays in cache — managed by TTL eviction (same as _with_stale_recovery)
         conn, err = _open_db_safe(ctx.db_path)
         if err:
             return [err]

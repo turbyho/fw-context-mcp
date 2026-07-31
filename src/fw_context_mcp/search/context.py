@@ -78,6 +78,8 @@ class PipelineContext:
         """
         from fw_context_mcp.indexer.db import get_active_config, open_db
 
+        # NOTE: opens DB just for config_hash — phases open their own connections.
+        # Acceptable trade-off for simplicity; deferred to Phase 28 refactoring.
         root = resolve_project_root(project_root)
         cfg = load_config(project_root=root)
         project_id = derive_project_id(root)

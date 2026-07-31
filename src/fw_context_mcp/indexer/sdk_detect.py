@@ -49,6 +49,8 @@ def _normalize_path_pattern(pattern: str) -> str:
 
 
 def _normalize_patterns(patterns: list[str]) -> list[str]:
+    # NOTE: vendor_patterns from _build_sdk_excludes() already contain % wildcards
+    # and do NOT go through this function. Only user-supplied paths need normalization.
     """Normalize patterns for _path_matches — each wildcard-less pattern gets '/%' appended.
 
     Centralized wrapper calling _normalize_path_pattern for each pattern.

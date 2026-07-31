@@ -1761,6 +1761,9 @@ def _check_and_parse_unit(
     return ("updated", parsed, (t_parse_start, t_parse_end), hashes)
 
 
+    # NOTE: falls back to computing source SHA-256 when manifest is absent.
+    # _check_and_parse_unit() also computes source hash — could be passed
+    # as parameter.  Overhead is one extra file read per TU (rare path).
 def _get_manifest_entry_hash_for_unit(
     unit,
     project_root: Path,
