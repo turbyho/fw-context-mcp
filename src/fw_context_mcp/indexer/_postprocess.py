@@ -13,7 +13,16 @@ import sqlite3
 import time
 from pathlib import Path
 
-from ..utils import SAFE_EXCEPT, is_fatal
+from ..utils import is_fatal
+from .db import WriteLockTimeout
+
+# Local SAFE_EXCEPT that includes WriteLockTimeout — cannot extend
+# utils.SAFE_EXCEPT directly because utils.py would need a circular import
+# from .db._connection.
+SAFE_EXCEPT = (
+    ValueError, TypeError, RuntimeError, AttributeError,
+    sqlite3.Error, OSError, WriteLockTimeout,
+)
 from ._embedding import _build_embeddings
 from ._llm_analysis import _build_llm_analysis
 from ._manifest_updater import _refresh_header_mtimes_from_manifest, _update_manifest_after_index

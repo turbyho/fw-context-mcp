@@ -392,6 +392,31 @@ async def _run_index_async(
         env["FW_CONTEXT_FORCE_REFINDEX"] = "1"
 
     log.info("Starting background index for %s (force_refs=%s)", project_root, force_refs)
+
+    # Write reindex.pid BEFORE spawning so a concurrent daemon
+    # restart sees the marker and doesn't spawn a duplicate.
+    from .background import _pid_exists
+    rp = db_dir / "reindex.pid"
+    try:
+        rfd = os.open(str(rp), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+    except FileExistsError:
+        # Stale PID file from a previous crashed index subprocess.
+        # Check if the old process is still alive before removing.
+        try:
+            old_pid = int(rp.read_text(encoding="utf-8").strip())
+            if _pid_exists(old_pid):
+                raise RuntimeError(
+                    f"Another index process (pid {old_pid}) is already running for {project_root}"
+                ) from None
+        except (OSError, ValueError):
+            pass
+        rp.unlink(missing_ok=True)
+        rfd = os.open(str(rp), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+    # Write a sentinel — real PID is filled in after spawn.
+    pf = os.fdopen(rfd, "w", encoding="utf-8")
+    pf.write(str(os.getpid()))
+    pf.flush()
+
     try:
         proc = await asyncio.create_subprocess_exec(
             sys.executable, "-u", "-m", "fw_context_mcp.cli", "index", "--background",
@@ -400,30 +425,17 @@ async def _run_index_async(
             stderr=asyncio.subprocess.STDOUT,
             env=env,
         )
-        # Write PID for health checks — _is_bg_reindex_running reads this
-        from .background import _pid_exists
-        rp = db_dir / "reindex.pid"
-        try:
-            rfd = os.open(str(rp), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
-        except FileExistsError:
-            # Stale PID file from a previous crashed index subprocess.
-            # Check if the old process is still alive before removing.
-            try:
-                old_pid = int(rp.read_text(encoding="utf-8").strip())
-                if _pid_exists(old_pid):
-                    raise RuntimeError(
-                        f"Another index process (pid {old_pid}) is already running for {project_root}"
-                    ) from None
-            except (OSError, ValueError):
-                pass
-            rp.unlink(missing_ok=True)
-            rfd = os.open(str(rp), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
-        with os.fdopen(rfd, "w", encoding="utf-8") as pf:
-            pf.write(str(proc.pid))
+        # Update PID file with the real subprocess PID.
+        pf.seek(0)
+        pf.truncate()
+        pf.write(str(proc.pid))
+        pf.close()
         if log_fh is not _DEVNULL:
             log_fh.close()
-    except (ValueError, TypeError, RuntimeError, AttributeError):
+    except (ValueError, TypeError, RuntimeError, AttributeError, FileExistsError, OSError):
         log.exception("Failed to spawn index subprocess")
+        pf.close()
+        rp.unlink(missing_ok=True)
         if log_fh is not _DEVNULL:
             log_fh.close()
         raise
