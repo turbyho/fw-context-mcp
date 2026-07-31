@@ -22,6 +22,7 @@ from .connection import (
     _invalidate_conn_cache,
     _invalidate_conn_cache_if_reindex_done,
     _open_and_cache,
+    _open_db_or_return,
     _open_db_safe,
 )
 
@@ -40,6 +41,7 @@ __all__ = [
     "_db_path",
     "_detect_build_system",
     "_is_stale",
+    "_open_db_or_return",
     "_open_db_safe",
     "_resolve_context",
     "_invalidate_conn_cache",

@@ -15,7 +15,7 @@ from ...config import load as load_config
 from ...indexer.db import _cosine_sim, _expand_query, get_active_config, lookup_macro, search_symbols
 from ...llm.ollama import check_setup
 from ...utils import abs_path, resolve_project_root
-from ..shared.context import _db_path, _is_stale, _open_db_safe
+from ..shared.context import _db_path, _is_stale, _open_db_or_return
 from ..shared.fallback import _fallback_to_search_code, _fallback_to_search_code_inner
 from ..shared.stale import _with_stale_recovery
 
@@ -223,10 +223,9 @@ async def smart_search(
     results = list(ctx.formatted_results)
     if ctx.ollama_warning is None:
         # Connection stays in cache — managed by TTL eviction (same as _with_stale_recovery)
-        conn, err = _open_db_safe(ctx.db_path)
-        if err:
-            return [err]
-        assert conn is not None
+        conn, err_result = _open_db_or_return(ctx.db_path)
+        if err_result:
+            return err_result
         try:
             with conn:
                 cfg_data = get_active_config(conn, derive_project_id(ctx.project_root))

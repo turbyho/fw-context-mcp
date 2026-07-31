@@ -237,17 +237,15 @@ def _fast_staleness_check(root: Path) -> tuple[bool, list[str]]:
     from ..config import derive_project_id
     from ..config import load as load_config
     from ..indexer.db import get_active_config
-    from .shared.context import _db_path, _open_db_safe
+    from .shared.context import _db_path, _open_db_or_return
     from .shared.stale import check_structural_staleness
 
     db_path = _db_path(root)
     if not db_path.exists():
         return False, []
 
-    conn, err = _open_db_safe(db_path)
-    if err:
-        return False, []
-    if conn is None:
+    conn, err_result = _open_db_or_return(db_path)
+    if err_result:
         return False, []
     reasons: list[str] = []
     try:

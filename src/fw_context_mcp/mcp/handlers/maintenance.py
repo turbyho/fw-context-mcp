@@ -39,6 +39,7 @@ from ..shared.context import (
     _detect_build_system,
     _invalidate_conn_cache,
     _is_stale,
+    _open_db_or_return,
     _open_db_safe,
     _resolve_context,
 )
@@ -116,10 +117,9 @@ def get_active_build(
     # the reindex started.  Skipping the cache ensures accurate counts.
     bg_running = _is_bg_reindex_running(root)
 
-    conn, err = _open_db_safe(db_path)
-    if err:
-        return err
-    assert conn is not None
+    conn, err_result = _open_db_or_return(db_path)
+    if err_result:
+        return err_result[0]
     try:
         with conn:
             project_id = derive_project_id(root)
@@ -389,11 +389,10 @@ def list_projects(
     results: list[dict] = []
     for db_path in sorted(db_files):
         try:
-            conn, err = _open_db_safe(db_path)
-            if err:
-                results.append(err)
+            conn, err_result = _open_db_or_return(db_path)
+            if err_result:
+                results.append(err_result[0])
                 continue
-            assert conn is not None
             try:
                 with conn:
                     rows = get_all_projects(conn)
@@ -847,10 +846,9 @@ def reindex_file_impl(
     db_path, cfg, project_id, root = _resolve_context(project_root, skip_ready_check=True)
     if not db_path.exists():
         return {"error": f"No index found for {root}. Run 'fw-context index' first."}
-    conn, err = _open_db_safe(db_path)
-    if err:
-        return err
-    assert conn is not None
+    conn, err_result = _open_db_or_return(db_path)
+    if err_result:
+        return err_result[0]
     try:
         cfg_data = get_active_config(conn, project_id)
         if not cfg_data:
