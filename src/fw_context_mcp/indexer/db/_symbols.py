@@ -21,6 +21,11 @@ _RE_SEPARATOR = re.compile(r"[^a-zA-Z0-9]+")
 # _RE_COL_FILTER detects column-filter syntax in FTS5 queries (single colon not part of ::)
 _RE_COL_FILTER = re.compile(r"(?<!:):(?!:)")
 
+# Noise words that pollute FTS5 — strip before tokenizing (module-level, cached)
+_NOISE_WORDS = frozenset(("at", "unnamed"))
+# Guard against pathological inputs that cause ReDoS in regex processing (module-level, cached)
+_MAX_NAME_LEN = 500
+
 
 def split_tokens(name: str, qualified_name: str = "") -> str:
     """Normalize camelCase/snake_case names to space-separated lowercase tokens.
