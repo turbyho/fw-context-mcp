@@ -49,6 +49,7 @@ For each symbol, output a JSON object with EXACTLY these three string fields:
     "inputs": a single string describing all inputs. For functions: list each parameter with type and role. For classes/structs/unions: describe dependencies and configuration. For typedefs: the underlying type. For enums: not applicable, use "-". For variables: describe who writes/initializes the value and what subsystem it belongs to. Format as "param1 (type): role; param2 (type): role". Write everything inline as ONE STRING, not a JSON object.
     "outputs": a single string describing all outputs and side effects. For functions: return value, error codes, and all side effects. For classes/structs/unions: what the type provides and manages. For typedefs: what the type alias represents. For enums: what each constant means and how it's used. For variables: describe what depends on this variable's value and the consequence of changing it. Format as ONE STRING, not a JSON object.
 
+CRITICAL: Each object MUST include an "id" field with the integer symbol ID shown in the prompt.
 CRITICAL: "inputs" and "outputs" MUST be plain text strings. DO NOT use nested JSON objects like {"param": "desc"}. Write everything as a single string separated by semicolons or newlines.
 CRITICAL: NEVER output literal backslash or double-quote characters inside JSON string values. These break JSON syntax. Describe them by name instead: write "backslash" not backslash, write "double-quote" not double-quote.
 CRITICAL: DO NOT enumerate individual fields, members, or constants. Describe the symbol's PURPOSE and ROLE — what problem it solves, what subsystem it belongs to, how it's used. For large structs with many fields, summarize the CATEGORIES of data it holds (e.g. "system config, comm settings, sensor thresholds") rather than listing every field.
@@ -145,7 +146,7 @@ def build_analysis_prompt(batch: list[dict[str, Any]]) -> str:
         doc_display = doc[:_MAX_DOCSTRING_CHARS] if doc else "(NO DOCSTRING — infer from name, signature, file path, body, and callees)"
 
         entry = (
-            f"{i}. [{kind}] {qname}\n"
+            f"{i}. [{kind}] {qname} (id: {sym['id']})\n"
             f"   file: {file_path}\n"
             f"   sig: {sig}\n"
             f"   doc: {doc_display}"
@@ -312,10 +313,11 @@ def parse_analysis_response(
             response,
         )
         return None
+    # Build lookup table for identity-based mapping (stable when LLM skips items)
+    batch_by_id: dict[int, dict[str, Any]] = {s["id"]: s for s in batch}
+
     result: list[dict[str, Any]] = []
-    for i, entry in enumerate(parsed):
-        if i >= len(batch):
-            break
+    for entry in parsed:
         if not isinstance(entry, dict):
             continue
         summary = _flatten_value(entry.get("summary", ""))
@@ -324,8 +326,23 @@ def parse_analysis_response(
         # At least one field must be non-empty to accept the entry
         if not summary and not inputs and not outputs:
             continue
+
+        # Identity-based mapping: use 'id' from LLM response when present
+        entry_id = entry.get("id")
+        if entry_id is not None and isinstance(entry_id, int) and entry_id in batch_by_id:
+            symbol_id = entry_id
+        else:
+            # Fallback to positional mapping with warning
+            idx = len(result)
+            if idx >= len(batch):
+                log.warning("LLM returned more results than batch; truncating")
+                break
+            symbol_id = batch[idx]["id"]
+            if entry_id is not None:
+                log.debug("LLM returned id=%s which doesn't match batch; using positional fallback", entry_id)
+
         result.append({
-            "symbol_id": batch[i]["id"],
+            "symbol_id": symbol_id,
             "summary": summary,
             "inputs": inputs,
             "outputs": outputs,

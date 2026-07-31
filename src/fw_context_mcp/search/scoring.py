@@ -8,8 +8,13 @@ from __future__ import annotations
 
 import re
 
-# Regex cache for _stem_matches — avoids re.compile() on every call
-_STEM_PATTERN_CACHE: dict[str, re.Pattern] = {}
+# Regex cache for _stem_matches — bounded LRU via functools
+from functools import lru_cache
+
+
+@lru_cache(maxsize=10000)
+def _compile_stem_pattern(stem: str) -> re.Pattern:
+    return re.compile(rf'(?:^|_|[a-z])({re.escape(stem)})(?:$|_|[A-Z])')
 
 # Bonus for definition-level symbol kinds (functions, methods, classes, etc.)
 # vs lightweight kinds (variables, fields, namespaces).
@@ -50,12 +55,8 @@ def _stem_matches(stem: str, name: str, name_tokens: str) -> bool:
     # Check for stem at double-underscore boundaries (GNU/C extensions: __wrap_malloc)
     if f"__{stem}__" in name:
         return True
-    # Check for stem at case boundaries (camelCase/PascalCase) — cached regex
-    pattern = _STEM_PATTERN_CACHE.get(stem)
-    if pattern is None:
-        pattern = re.compile(rf'(?:^|_|[a-z])({re.escape(stem)})(?:$|_|[A-Z])')
-        _STEM_PATTERN_CACHE[stem] = pattern
-    return bool(pattern.search(name))
+    # Check for stem at case boundaries (camelCase/PascalCase) — cached via lru_cache
+    return bool(_compile_stem_pattern(stem).search(name))
 
 
 def score_result(
