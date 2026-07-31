@@ -130,6 +130,18 @@ def _build_filtered_file_content(
         files whose ifdef-filtered content was newly stored, and *headers*
         is a list of ``{path, hash, generated}`` dicts for included header
         files.
+
+    Important:
+        The caller **MUST** hold an active transaction.  This function
+        performs ``INSERT … ON CONFLICT UPDATE`` on the ``files`` table
+        and does not manage its own transaction boundary.  Partial failure
+        during content fill leaves ``files.content`` empty for some files,
+        and the early-return guard (``content=''`` check) skips them on
+        subsequent calls — the content is never filled for those files.
+
+    Side effects:
+        - Modifies ``files.content`` and ``files.mtime`` in the database.
+        - Reads source files from disk via libclang.
     """
     import time as _time
 
