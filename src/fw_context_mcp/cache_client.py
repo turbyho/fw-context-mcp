@@ -257,6 +257,9 @@ class CacheClient:
         # All retries exhausted
         return {h: None for h in hashes}
 
+    # NOTE: retry logic treats all 5xx errors the same.  Ideally, 400/413/422
+    # should not be retried (client error), 429 should respect Retry-After,
+    # and only 500/502/503 should use exponential backoff.
     def batch_put(self, entries: list[dict]) -> int:
         """Batch write to the remote server.
 

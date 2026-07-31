@@ -150,6 +150,9 @@ def _count_modified_files(
         if build_patterns and _path_matches_patterns(key, build_patterns):
             continue  # build-generated file — skip
         try:
+        # NOTE: individual stat() calls — O(n) for n files. On modern NVMe
+        # filesystems this is <10ms for 10K files. If slow, consider os.scandir()
+        # batch processing or caching more aggressively.
             if Path(key).stat().st_mtime > stored_mtime + MTIME_TOLERANCE_S:
                 modified += 1
         except OSError:

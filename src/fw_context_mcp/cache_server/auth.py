@@ -34,6 +34,33 @@ async def _lookup_permissions(request: Request, token: str) -> dict[str, Any] | 
     return await backend.validate_token(token)
 
 
+
+# Simple in-memory IP-based rate limiter for auth failures.
+# Tracks failed attempts per IP with a sliding 60s window.
+_auth_failures: dict[str, list[float]] = {}
+import time as _time
+import threading as _threading
+_auth_lock = _threading.Lock()
+
+def _check_rate_limit(ip: str, max_failures: int = 20, window_s: float = 60.0) -> bool:
+    """Return True if *ip* is under the rate limit, False if exceeded."""
+    now = _time.monotonic()
+    with _auth_lock:
+        failures = _auth_failures.get(ip, [])
+        # Remove expired entries
+        failures = [t for t in failures if now - t < window_s]
+        if len(failures) >= max_failures:
+            _auth_failures[ip] = failures
+            return False
+        _auth_failures[ip] = failures
+        return True
+
+def _record_auth_failure(ip: str) -> None:
+    """Record a failed auth attempt for rate limiting."""
+    with _auth_lock:
+        _auth_failures.setdefault(ip, []).append(_time.monotonic())
+
+
 class CacheAuthMiddleware(BaseHTTPMiddleware):
     """Validates bearer tokens and attaches permissions to request.state."""
 
@@ -46,8 +73,14 @@ class CacheAuthMiddleware(BaseHTTPMiddleware):
         if token is None:
             return JSONResponse({"detail": "Missing Authorization header"}, status_code=401)
 
+        # Rate-limit auth failures per IP (defense-in-depth)
+        client_ip = request.client.host if request.client else "unknown"
+        if not _check_rate_limit(client_ip):
+            return JSONResponse({"detail": "Too many auth attempts"}, status_code=429)
+
         perms = await _lookup_permissions(request, token)
         if perms is None:
+            _record_auth_failure(client_ip)
             return JSONResponse({"detail": "Invalid or revoked token"}, status_code=401)
 
         request.state.permissions = perms

@@ -80,6 +80,22 @@ def create_app(*, backend: "CacheStorageBackend | None" = None) -> FastAPI:
     app.state.backend = backend
     app.add_middleware(CacheAuthMiddleware)
 
+    # Limit request body size to prevent DoS (10 MB max for batch operations)
+    from starlette.middleware.base import BaseHTTPMiddleware
+    from starlette.responses import JSONResponse
+
+    class _BodySizeLimitMiddleware(BaseHTTPMiddleware):
+        async def dispatch(self, request, call_next):
+            max_bytes = 10 * 1024 * 1024  # 10 MB
+            content_length = request.headers.get("content-length")
+            if content_length and int(content_length) > max_bytes:
+                return JSONResponse(
+                    {"detail": "Request body too large (max 10 MB)"}, status_code=413,
+                )
+            return await call_next(request)
+
+    app.add_middleware(_BodySizeLimitMiddleware)
+
     # -- Auth dependencies (run BEFORE body parsing via FastAPI Depends) --
 
     async def _auth_read(request: Request):

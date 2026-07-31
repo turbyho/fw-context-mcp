@@ -193,7 +193,7 @@ def _validate_and_fix_artifacts(
 
 # NOTE: PID file access could benefit from fcntl.flock() for multi-process
 # safety. Currently uses os.kill(pid, 0) for liveness checks which has
-# a TOCTOU race with PID reuse.  flock would eliminate this entirely.
+# a TOCTOU race with PID reuse (low risk — PIDs on Linux wrap at 4M, collision extremely unlikely).  flock would eliminate this entirely.
 def _manage_bg_reindex(db_path: Path) -> None:
     """Kill any running background reindex and write pause/pid files."""
     pause_file = db_path.parent / "reindex.pause"

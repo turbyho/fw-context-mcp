@@ -42,6 +42,8 @@ class CacheStorageBackend:
     async def close(self) -> None:
         raise NotImplementedError
 
+        # NOTE: checks is_nullable on every startup.  Could cache
+        # a schema_version flag to skip this after first migration.
     async def init_schema(self) -> None:
         raise NotImplementedError
 
@@ -136,6 +138,8 @@ class CacheBackend(CacheStorageBackend):
             await self._cache_pool.close()
         self._connected = False
 
+        # NOTE: checks is_nullable on every startup.  Could cache
+        # a schema_version flag to skip this after first migration.
     async def init_schema(self) -> None:
         """Create tables in both databases (idempotent)."""
 

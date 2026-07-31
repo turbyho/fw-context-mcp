@@ -71,7 +71,8 @@ def _get_ft_embedder(cfg: LLMConfig) -> Embedder:
             )
         best: Path | None = None
         best_mtime = 0.0
-        for proj_dir in models_root.iterdir():
+        # Limit scan to 100 project dirs to avoid hanging on slow filesystems
+        for proj_dir in list(models_root.iterdir())[:100]:
             if not proj_dir.is_dir():
                 continue
             try:
