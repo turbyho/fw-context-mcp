@@ -121,7 +121,7 @@ async def _try_embedding_samples(ctx) -> list[dict] | None:
         )
         from fw_context_mcp.llm.embedder_factory import get_embedder
         from fw_context_mcp.llm.ollama import OllamaError
-    except Exception:
+    except (ValueError, TypeError, RuntimeError, AttributeError):
         log.warning("Embedding rough search unavailable — import failed", exc_info=True)
         return None
 
@@ -183,7 +183,7 @@ async def _try_embedding_samples(ctx) -> list[dict] | None:
                 return None
 
             return None
-    except Exception:
+    except (ValueError, TypeError, RuntimeError, AttributeError):
         log.warning("Embedding rough search failed", exc_info=True)
         return None
     finally:
@@ -284,7 +284,7 @@ def _fts5_rough_samples(conn, query: str, content_words: list[str], config_hash:
             phrase = f'"{content_words[0]} {w}"'
             try:
                 rows = search_symbols(conn, phrase, config_hash, limit=per_pair_budget)
-            except Exception:
+            except (ValueError, TypeError, RuntimeError, AttributeError):
                 continue
             for r in rows:
                 name = r["name"]
@@ -302,7 +302,7 @@ def _fts5_rough_samples(conn, query: str, content_words: list[str], config_hash:
         for word in content_words:
             try:
                 rows = search_symbols(conn, word, config_hash, limit=per_word_budget)
-            except Exception:
+            except (ValueError, TypeError, RuntimeError, AttributeError):
                 continue
             for r in rows:
                 name = r["name"]

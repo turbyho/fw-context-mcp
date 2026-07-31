@@ -222,7 +222,7 @@ def _signature(cursor: cx.Cursor) -> str:
     if cursor.kind in (cx.CursorKind.VAR_DECL, cx.CursorKind.FIELD_DECL):
         try:
             return f"{cursor.type.spelling} {cursor.spelling}"
-        except Exception:
+        except (ValueError, TypeError, RuntimeError, AttributeError):
             _log.debug("_signature: type.spelling failed for %s", cursor.spelling)
             return cursor.spelling
 
@@ -242,7 +242,7 @@ def _signature(cursor: cx.Cursor) -> str:
             for p in cursor.get_arguments()
         )
         return f"{result_type} {cursor.spelling}({params})"
-    except Exception:
+    except (ValueError, TypeError, RuntimeError, AttributeError):
         _log.debug("_signature: get_arguments failed for %s", cursor.spelling)
         return cursor.displayname
 
@@ -260,7 +260,7 @@ def _end_line(cursor: cx.Cursor, loc) -> int:
         end = ext.end
         if end.file and loc.file and end.file.name == loc.file.name and end.line >= loc.line:
             return end.line
-    except Exception:
+    except (ValueError, TypeError, RuntimeError, AttributeError):
         _log.debug("_end_line: extent failed for %s", cursor.spelling)
         pass
     return 0
@@ -347,7 +347,7 @@ def _is_fn_ptr_type(t: cx.Type) -> bool:
         if canon.kind == cx.TypeKind.POINTER:
             pointee = canon.get_pointee()
             return pointee.kind in (cx.TypeKind.FUNCTIONPROTO, cx.TypeKind.FUNCTIONNOPROTO)
-    except Exception:
+    except (ValueError, TypeError, RuntimeError, AttributeError):
         _log.debug("_is_fn_ptr_type: get_canonical failed")
         pass
     return False
@@ -364,7 +364,7 @@ def _first_child_unwrapped(cursor: cx.Cursor) -> cx.Cursor | None:
     """
     try:
         children = list(cursor.get_children())
-    except Exception:
+    except (ValueError, TypeError, RuntimeError, AttributeError):
         _log.debug("_first_child_unwrapped: get_children failed")
         return None
     if not children:
@@ -373,7 +373,7 @@ def _first_child_unwrapped(cursor: cx.Cursor) -> cx.Cursor | None:
     while first.kind == cx.CursorKind.UNEXPOSED_EXPR:
         try:
             grandkids = list(first.get_children())
-        except Exception:
+        except (ValueError, TypeError, RuntimeError, AttributeError):
             _log.debug("_first_child_unwrapped: UNEXPOSED_EXPR children failed")
             break
         if not grandkids:
@@ -395,7 +395,7 @@ def _call_expr_text(cursor: cx.Cursor) -> str:
             if tok.spelling == "(":
                 break
             parts.append(tok.spelling)
-    except Exception:
+    except (ValueError, TypeError, RuntimeError, AttributeError):
         _log.debug("_call_expr_text: get_tokens failed")
         return ""
     return " ".join(parts)
@@ -458,7 +458,7 @@ def _process_one_base_specifier(
     try:
         from clang.cindex import conf as _ciconf
         is_virt = bool(_ciconf.lib.clang_isVirtualBase(child))
-    except Exception:
+    except (ValueError, TypeError, RuntimeError, AttributeError):
         _log.debug("clang_isVirtualBase failed for %s", cls_spelling)
         is_virt = False
     return InheritanceRecord(
@@ -486,7 +486,7 @@ def _extract_inheritance(class_cursors: list[cx.Cursor]) -> list[InheritanceReco
                 rec = _process_one_base_specifier(child, cls_usr, cls_cursor.spelling, _access_map)
                 if rec is not None:
                     inheritance.append(rec)
-        except Exception:
+        except (ValueError, TypeError, RuntimeError, AttributeError):
             _log.debug("base class traversal failed for %s", cls_cursor.spelling)
             continue
     return inheritance
@@ -504,7 +504,7 @@ def _extract_macros(tu_cursor: cx.Cursor, resolve_fn) -> list[Macro]:
 
         try:
             is_fn_like = child.is_macro_function_like()
-        except Exception:
+        except (ValueError, TypeError, RuntimeError, AttributeError):
             _log.debug("is_macro_function_like failed for %s", child.spelling)
             is_fn_like = False
 
@@ -513,7 +513,7 @@ def _extract_macros(tu_cursor: cx.Cursor, resolve_fn) -> list[Macro]:
             tokens = list(child.get_tokens())
             if len(tokens) > 1:
                 value = " ".join(t.spelling for t in tokens[1:])
-        except Exception:
+        except (ValueError, TypeError, RuntimeError, AttributeError):
             _log.debug("macro token extraction failed for %s", child.spelling)
             value = ""
 
@@ -640,7 +640,7 @@ def _emit_fn_ptr_targets(
                 if lhs_usr and lhs_usr != target_usr:
                     try:
                         _fp_type = child.type.spelling
-                    except Exception:
+                    except (ValueError, TypeError, RuntimeError, AttributeError):
                         _log.debug(
                             "_emit_fn_ptr_targets: type.spelling failed for %s",
                             target.spelling,
@@ -713,7 +713,7 @@ def _build_refs_and_fp_assignments(
                         fn_stack.append((cur_fn or '', 0, ""))
                 else:
                     fn_stack.append((cur_fn or '', 0, ""))
-            except Exception:
+            except (ValueError, TypeError, RuntimeError, AttributeError):
                 _log.debug(
                     "cursor.extent failed for %s",
                     cursor.spelling,
@@ -761,7 +761,7 @@ def _process_one_symbol(
     if cursor.kind == cx.CursorKind.ENUM_CONSTANT_DECL:
         try:
             enum_val = cursor.enum_value
-        except Exception:
+        except (ValueError, TypeError, RuntimeError, AttributeError):
             _log.debug("enum_value failed for %s at %s:%d", cursor.spelling, loc.file.name, loc.line)
 
     is_virtual = bool(cursor.is_virtual_method()) if cursor.kind in (cx.CursorKind.CXX_METHOD, cx.CursorKind.DESTRUCTOR) else False
@@ -810,7 +810,7 @@ def _process_one_symbol(
                 specialized = cursor.specialized_template
                 if specialized is not None:
                     template_usr = specialized.get_usr() or ""
-            except Exception:
+            except (ValueError, TypeError, RuntimeError, AttributeError):
                 _log.debug("specialized_template failed for %s", cursor.spelling)
 
     prev = seen_usrs.get(usr)
@@ -896,7 +896,7 @@ def _callee_has_file(referenced) -> bool:
     try:
         rl = referenced.location
         return rl is not None and rl.file is not None
-    except Exception:
+    except (ValueError, TypeError, RuntimeError, AttributeError):
         return False
 
 
@@ -941,7 +941,7 @@ def _collect_ctor_refs_from_type(
         return
     try:
         class_cursor = child_type.get_declaration()
-    except Exception:
+    except (ValueError, TypeError, RuntimeError, AttributeError):
         _log.debug("get_declaration failed for record type")
         return
     if class_cursor is None:
@@ -973,7 +973,7 @@ def _handle_constructor_fallback(cursor, cur_fn, refs, seen_ref, tu_path_str, re
             continue
         try:
             child_type = child_ref.type.get_canonical()
-        except Exception:
+        except (ValueError, TypeError, RuntimeError, AttributeError):
             _log.debug("get_canonical failed for %s", child_ref.spelling)
             continue
         _collect_ctor_refs_from_type(
@@ -1006,7 +1006,7 @@ def _handle_indirect_invocations(cursor, cur_fn, refs, indirect_call_sites,
             if target_usr:
                 try:
                     _fn_ptr_spelling = callee_expr.type.spelling
-                except Exception:
+                except (ValueError, TypeError, RuntimeError, AttributeError):
                     _log.debug("type.spelling failed for indirect call callee expr")
                     _fn_ptr_spelling = ""
                 indirect_call_sites.append(IndirectCallSite(
@@ -1026,7 +1026,7 @@ def _handle_fn_ptr_as_argument(cursor, cur_fn, refs, fp_assignments, seen_ref, t
     if direct_callee is not None:
         try:
             callee_params = list(direct_callee.get_arguments())
-        except Exception:
+        except (ValueError, TypeError, RuntimeError, AttributeError):
             _log.debug("get_arguments failed for %s", direct_callee.spelling)
             callee_params = []
         callee_args = list(cursor.get_arguments())
@@ -1042,7 +1042,7 @@ def _handle_fn_ptr_as_argument(cursor, cur_fn, refs, fp_assignments, seen_ref, t
                             if target_usr and target_usr != direct_callee_usr:
                                 try:
                                     _fp_type = param.type.spelling
-                                except Exception:
+                                except (ValueError, TypeError, RuntimeError, AttributeError):
                                     _log.debug("param type.spelling failed for %s", param.spelling)
                                     _fp_type = ""
                                 fp_assignments.append(FnPointerAssignment(
@@ -1078,14 +1078,14 @@ def _handle_implicit_constructors(cursor, cur_fn, refs, seen_ref, _log):
     loc = cursor.location
     try:
         canon = cursor.type.get_canonical()
-    except Exception:
+    except (ValueError, TypeError, RuntimeError, AttributeError):
         _log.debug("implicit_construct: get_canonical failed for %s", cursor.spelling)
         return
     if canon is None or canon.kind != cx.TypeKind.RECORD:
         return
     try:
         class_cursor = canon.get_declaration()
-    except Exception:
+    except (ValueError, TypeError, RuntimeError, AttributeError):
         _log.debug("implicit_construct: get_declaration failed")
         return
     if class_cursor is None:
@@ -1168,7 +1168,7 @@ def _run_source_line_fallback(
     try:
         _source_text = Path(_tu_file).read_text(encoding="utf-8", errors="replace")
         _source_lines = _source_text.splitlines()
-    except Exception:
+    except (ValueError, TypeError, RuntimeError, AttributeError):
         _source_lines = []
     for _lineno_0, _line in enumerate(_source_lines):
         _lineno = _lineno_0 + 1
