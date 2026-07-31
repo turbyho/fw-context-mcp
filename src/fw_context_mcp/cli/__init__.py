@@ -13,7 +13,7 @@ import sys
 import time
 from pathlib import Path
 
-from . import __version__
+from .. import __version__
 
 log = logging.getLogger(__name__)
 
@@ -65,7 +65,7 @@ def _resolve_compile_commands(
         if bg:
             print("error: --build and --background are mutually exclusive", file=sys.stderr)
             return None, False
-        from .indexer.build import generate_compile_commands
+        from ..indexer.build import generate_compile_commands
 
         build_cfg = cfg.build
         if args.no_clean:
@@ -84,13 +84,13 @@ def _resolve_compile_commands(
             print(f"error: {cc} not found", file=sys.stderr)
             print("  Run 'fw-context index --build' to build and index automatically.", file=sys.stderr)
             return None, False
-        from .indexer.build import check_completeness
+        from ..indexer.build import check_completeness
         for warning in check_completeness(cc, project_root):
             print(f"warning: {warning}", file=sys.stderr)
         return cc, True
 
     # Default: reuse existing, build only if missing
-    from .indexer.build import check_completeness, generate_compile_commands
+    from ..indexer.build import check_completeness, generate_compile_commands
 
     cc = cfg.index.compile_commands
     if not cc.is_absolute():
@@ -131,9 +131,9 @@ def _validate_and_fix_artifacts(
     if not detected_system:
         return compile_commands, None, True
 
-    from .indexer.builders import registry as builder_registry
-    from .indexer.build import generate_compile_commands
-    from .indexer.validator import is_compile_commands_stale, validate_and_fix
+    from ..indexer.builders import registry as builder_registry
+    from ..indexer.build import generate_compile_commands
+    from ..indexer.validator import is_compile_commands_stale, validate_and_fix
 
     builder_cls = builder_registry.get(detected_system)
     if builder_cls is None:
@@ -245,7 +245,7 @@ def _post_index_optimize(
     except Exception:
         log.debug("PRAGMA optimize failed for %s", db_path, exc_info=True)
 
-    from .config.global_db import open_global_db, upsert_project_registry
+    from ..config.global_db import open_global_db, upsert_project_registry
 
     _ptype = detected_system or "unknown"
     _gconn = open_global_db()
@@ -266,11 +266,11 @@ def cmd_index(args: argparse.Namespace) -> int:
 
     Pass ``--build`` to force a fresh build and full re-index.
     """
-    from .config import derive_project_id
-    from .config import load as load_config
-    from .indexer.build import detect_build_system
-    from .indexer.runner import run
-    from .utils import resolve_project_root
+    from ..config import derive_project_id
+    from ..config import load as load_config
+    from ..indexer.build import detect_build_system
+    from ..indexer.runner import run
+    from ..utils import resolve_project_root
 
     if args.verbose:
         handler = logging.StreamHandler()
@@ -383,10 +383,10 @@ def cmd_search(args: argparse.Namespace) -> int:
     Queries the FTS5 index for symbols matching the given keywords
     and prints each hit with its kind, qualified name, file, and line.
     """
-    from .config import derive_project_id
-    from .config import load as load_config
-    from .indexer.db import get_active_config, open_db, search_symbols
-    from .utils import resolve_project_root
+    from ..config import derive_project_id
+    from ..config import load as load_config
+    from ..indexer.db import get_active_config, open_db, search_symbols
+    from ..utils import resolve_project_root
 
     project_root = resolve_project_root(args.project)
     cfg = load_config(project_root=project_root)
@@ -421,9 +421,9 @@ def cmd_list(args: argparse.Namespace) -> int:
     """
     import shutil
 
-    from .config import load as load_config
-    from .indexer.db import get_all_projects, open_db
-    from .utils import fmt_count, truncate_path_middle
+    from ..config import load as load_config
+    from ..indexer.db import get_all_projects, open_db
+    from ..utils import fmt_count, truncate_path_middle
 
     cfg = load_config()
     index_dir = cfg.index.db_dir
@@ -505,10 +505,10 @@ def cmd_status(args: argparse.Namespace) -> int:
     and whether the index is stale (compile_commands.json changed
     since last index).
     """
-    from .config import derive_project_id
-    from .config import load as load_config
-    from .indexer.db import get_active_config, open_db
-    from .utils import resolve_project_root
+    from ..config import derive_project_id
+    from ..config import load as load_config
+    from ..indexer.db import get_active_config, open_db
+    from ..utils import resolve_project_root
 
     project_root = resolve_project_root(args.project)
     cfg = load_config(project_root=project_root)
@@ -546,7 +546,7 @@ def _cli_is_stale(row) -> bool:
     Delegates to :func:`fw_context_mcp.utils.is_compile_commands_stale`.
     Returns False on any error so staleness checks don't block CLI output.
     """
-    from .utils import is_compile_commands_stale
+    from ..utils import is_compile_commands_stale
 
     cc = row.get("compile_commands_path", "")
     if not cc:
@@ -574,7 +574,7 @@ def _install_skills(
     import shutil
 
     from . import __file__ as _pkg_init
-    from .config.tools import (
+    from ..config.tools import (
         CROSS_TOOL_SKILL_DIRS_GLOBAL,
         CROSS_TOOL_SKILL_DIRS_PROJECT,
         TOOLS,
@@ -651,7 +651,7 @@ def _detect_project_ai_tools(project_root: Path) -> list[str]:  # noqa: ARG001 �
     Uses ``AiTool.is_detected()`` — checks for CLI binaries in PATH
     and global config directories (``~/.claude``, ``~/.codex``, etc.).
     """
-    from .config.tools import TOOLS
+    from ..config.tools import TOOLS
 
     return [tid for tid, t in TOOLS.items() if t.is_detected()]
 
@@ -746,7 +746,7 @@ def _build_agent_targets(
     scope: str, project_root: Path | None
 ) -> list[tuple[Path, str, list[str], bool]]:
     """Build the list of (directory, tool_id, file_patterns, strip_name) tuples."""
-    from .config.tools import CROSS_TOOL_AGENT_DIRS_GLOBAL, CROSS_TOOL_AGENT_DIRS_PROJECT, TOOLS
+    from ..config.tools import CROSS_TOOL_AGENT_DIRS_GLOBAL, CROSS_TOOL_AGENT_DIRS_PROJECT, TOOLS
 
     targets: list[tuple[Path, str, list[str], bool]] = []
     processed_dirs: set[Path] = set()
@@ -799,7 +799,7 @@ def _install_agents(dry_run: bool = False, project_root: Path | None = None, sco
     import re
 
     from . import __file__ as _pkg_init
-    from .config.tools import AGENT_CRITICAL_BLOCK
+    from ..config.tools import AGENT_CRITICAL_BLOCK
 
     pkg_dir = Path(_pkg_init).parent
     agents_src = pkg_dir / "data" / "agents"
@@ -917,7 +917,7 @@ def _select_init_tools(args: argparse.Namespace, project_root: Path) -> list[str
 
     Returns a list of tool IDs, or None if a fatal error occurred (caller returns 1).
     """
-    from .config.tools import TOOLS
+    from ..config.tools import TOOLS
 
     selected: list[str] = []
     if args.tool:
@@ -966,7 +966,7 @@ def _init_one_tool(
     Returns (ok, warnings).  ok=True if at least one action succeeded;
     an inherited tool that requires no action is also considered ok.
     """
-    from .config.tools import TOOLS, check_target
+    from ..config.tools import TOOLS, check_target
 
     tool = TOOLS[tool_id]
     print(f"\n── {tool.name} ({tool_id}) ──")
@@ -1058,12 +1058,12 @@ def cmd_init(args: argparse.Namespace) -> int:
     Writes ``.fw-context/config.toml`` and ``.fw-context/local.toml`` in the
     project root when using project-scoped injection.
     """
-    from .config import load as load_project_config
-    from .config.settings import _ensure_project_config, _ensure_project_local_config
-    from .config.settings import _write_project_id, generate_project_id as _gen_pid
-    from .config.tools import TOOLS
-    from .indexer.build import detect_build_system
-    from .utils import resolve_project_root
+    from ..config import load as load_project_config
+    from ..config.settings import _ensure_project_config, _ensure_project_local_config
+    from ..config.settings import _write_project_id, generate_project_id as _gen_pid
+    from ..config.tools import TOOLS
+    from ..indexer.build import detect_build_system
+    from ..utils import resolve_project_root
 
     if args.list_tools:
         print("Supported AI assistants:\n")
@@ -1086,7 +1086,7 @@ def cmd_init(args: argparse.Namespace) -> int:
         print(f"Project ID: {_proj_cfg.project.id} (existing)")
         proj_id = _proj_cfg.project.id
 
-    from .config.global_db import open_global_db, upsert_project_registry
+    from ..config.global_db import open_global_db, upsert_project_registry
 
     proj_name = getattr(args, "name", None) or _proj_cfg.project.name or project_root.name
     glob_conn = open_global_db()
@@ -1109,7 +1109,7 @@ def cmd_init(args: argparse.Namespace) -> int:
     _build_system = detect_build_system(project_root)
 
     if not args.dry_run and not args.instructions_only:
-        from .config.settings import (
+        from ..config.settings import (
             _PROJECT_DEFAULTS_TEMPLATE,
             _PROJECT_LOCAL_DEFAULTS_TEMPLATE,
             update_global_config,
@@ -1127,7 +1127,7 @@ def cmd_init(args: argparse.Namespace) -> int:
             )
             print(f"[ok] {local_config}: local developer config ready — edit ollama_url, model, etc. (gitignore)")
             if _proj_cfg.llm.enabled:
-                from .llm.auto_model import resolve_embed_model
+                from ..llm.auto_model import resolve_embed_model
                 resolve_embed_model(_proj_cfg.llm)
             _ensure_gitignore(project_root, fix=True, build_system=_build_system)
         _install_skills(dry_run=False, project_root=project_root, scope=args.scope)
@@ -1511,11 +1511,11 @@ def cmd_export(args: argparse.Namespace) -> int:
     """
     import json
 
-    from .config import derive_project_id
-    from .config import load as load_config
-    from .indexer.build import detect_build_system
-    from .indexer.db import count_refs, get_active_config, open_db
-    from .utils import resolve_project_root
+    from ..config import derive_project_id
+    from ..config import load as load_config
+    from ..indexer.build import detect_build_system
+    from ..indexer.db import count_refs, get_active_config, open_db
+    from ..utils import resolve_project_root
 
     project_root = resolve_project_root(args.project)
     cfg = load_config(project_root=project_root)
@@ -1601,11 +1601,11 @@ def cmd_analyze(args: argparse.Namespace) -> int:
     and method override relationships. Existing analysis rows are skipped
     (idempotent) — only unanalyzed symbols are processed.
     """
-    from .config import derive_project_id
-    from .config import load as load_config
-    from .indexer.db import get_active_config, open_db, upsert_build_config
-    from .indexer.runner import _build_llm_analysis, _build_overrides
-    from .utils import resolve_project_root
+    from ..config import derive_project_id
+    from ..config import load as load_config
+    from ..indexer.db import get_active_config, open_db, upsert_build_config
+    from ..indexer.runner import _build_llm_analysis, _build_overrides
+    from ..utils import resolve_project_root
 
     if args.verbose:
         handler = logging.StreamHandler()
@@ -1656,7 +1656,7 @@ def cmd_analyze(args: argparse.Namespace) -> int:
         cc = None
         if cfg.cache_server and cfg.cache_server.url:
             try:
-                from .cache_client import CacheClient
+                from ..cache_client import CacheClient
 
                 cc = CacheClient(
                     url=cfg.cache_server.url,
@@ -1699,7 +1699,7 @@ def cmd_analyze(args: argparse.Namespace) -> int:
 
 def cmd_version(args: argparse.Namespace) -> int:
     """Print version and exit."""
-    from . import __version__
+    from .. import __version__
 
     print(f"fw-context-mcp {__version__}")
     return 0
@@ -1707,10 +1707,10 @@ def cmd_version(args: argparse.Namespace) -> int:
 
 def cmd_cache_stats(args: argparse.Namespace) -> int:
     """Show cache statistics for one or both tiers."""
-    from .config import derive_project_id
-    from .config import load as load_config
-    from .utils import resolve_project_root
-    from .cache_client import local_cache_stats, CacheClient
+    from ..config import derive_project_id
+    from ..config import load as load_config
+    from ..utils import resolve_project_root
+    from ..cache_client import local_cache_stats, CacheClient
 
     show_local = not args.remote
     project_root = resolve_project_root(args.project) if hasattr(args, "project") and args.project else Path.cwd()
@@ -1754,7 +1754,7 @@ def cmd_cache_stats(args: argparse.Namespace) -> int:
             project_id = derive_project_id(project_root)
             db_path = cfg.index.db_dir / project_id / "index.db"
             if db_path.exists():
-                from .indexer.db import open_db
+                from ..indexer.db import open_db
 
                 conn = open_db(db_path)
                 hashes: list[str] = []
@@ -1783,9 +1783,9 @@ def cmd_cache_push(args: argparse.Namespace) -> int:
     Uses ``--force`` by default (X-Cache-Overwrite) so newer local entries
     replace older remote ones.  Progress is reported in batches.
     """
-    from .config import load as load_config
-    from .utils import resolve_project_root
-    from .cache_client import get_local_cache_db, CacheClient
+    from ..config import load as load_config
+    from ..utils import resolve_project_root
+    from ..cache_client import get_local_cache_db, CacheClient
 
     project_root = resolve_project_root(args.project) if hasattr(args, "project") else None
     if not project_root:
@@ -1838,7 +1838,7 @@ def cmd_cache_remote_init(args: argparse.Namespace) -> int:
     import re
     import httpx
 
-    from .config.settings import _ensure_global_config
+    from ..config.settings import _ensure_global_config
 
     # Resolve global config
     config_path = _ensure_global_config()
@@ -1963,10 +1963,10 @@ url = "{url}"
 
 def cmd_cache_clear(args: argparse.Namespace) -> int:
     """Delete cache entries for one or both tiers."""
-    from .config import derive_project_id
-    from .config import load as load_config
-    from .utils import resolve_project_root
-    from .cache_client import local_cache_clear, CacheClient
+    from ..config import derive_project_id
+    from ..config import load as load_config
+    from ..utils import resolve_project_root
+    from ..cache_client import local_cache_clear, CacheClient
 
     project_root = resolve_project_root(args.project) if hasattr(args, "project") else None
 
@@ -2002,7 +2002,7 @@ def cmd_cache_clear(args: argparse.Namespace) -> int:
             db_path = cfg.index.db_dir / project_id / "index.db"
             hashes = []
             if db_path.exists():
-                from .indexer.db import open_db
+                from ..indexer.db import open_db
 
                 conn = open_db(db_path)
                 try:
@@ -2070,10 +2070,10 @@ def cmd_db(args: argparse.Namespace) -> int:
 
 def cmd_db_list(args: argparse.Namespace) -> int:
     """List all builds for a project with per-build statistics."""
-    from .config import derive_project_id
-    from .config import load as load_config
-    from .indexer.db import get_active_config, get_all_builds_for_project, open_db
-    from .utils import resolve_project_root
+    from ..config import derive_project_id
+    from ..config import load as load_config
+    from ..indexer.db import get_active_config, get_all_builds_for_project, open_db
+    from ..utils import resolve_project_root
 
     project_root = resolve_project_root(args.project)
     cfg = load_config(project_root=project_root)
@@ -2129,10 +2129,10 @@ def cmd_db_list(args: argparse.Namespace) -> int:
 
 def cmd_db_stats(args: argparse.Namespace) -> int:
     """Show detailed statistics for a specific build."""
-    from .config import derive_project_id
-    from .config import load as load_config
-    from .indexer.db import get_build_stats, open_db
-    from .utils import resolve_project_root
+    from ..config import derive_project_id
+    from ..config import load as load_config
+    from ..indexer.db import get_build_stats, open_db
+    from ..utils import resolve_project_root
 
     project_root = resolve_project_root(args.project)
     cfg = load_config(project_root=project_root)
@@ -2203,16 +2203,16 @@ def cmd_db_stats(args: argparse.Namespace) -> int:
 
 def cmd_db_delete(args: argparse.Namespace) -> int:
     """Delete a specific build or all builds (``--all``)."""
-    from .config import derive_project_id
-    from .config import load as load_config
-    from .indexer.db import (
+    from ..config import derive_project_id
+    from ..config import load as load_config
+    from ..indexer.db import (
         delete_build_data,
         get_active_config,
         get_all_builds_for_project,
         open_db,
         transaction,
     )
-    from .utils import resolve_project_root
+    from ..utils import resolve_project_root
 
     project_root = resolve_project_root(args.project)
     cfg = load_config(project_root=project_root)
@@ -2263,7 +2263,7 @@ def cmd_db_delete(args: argparse.Namespace) -> int:
             (db_path.parent / (db_path.name + "-wal")).unlink(missing_ok=True)
             (db_path.parent / (db_path.name + "-shm")).unlink(missing_ok=True)
             # Clean up compile_commands artifacts
-            from .indexer.runner import _cleanup_orphaned_cc_artifacts
+            from ..indexer.runner import _cleanup_orphaned_cc_artifacts
 
             _cleanup_orphaned_cc_artifacts(db_path, project_id)
         finally:
@@ -2377,10 +2377,10 @@ def cmd_db_delete(args: argparse.Namespace) -> int:
 
 def cmd_db_cleanup(args: argparse.Namespace) -> int:
     """Remove orphaned compile_commands artifacts."""
-    from .config import derive_project_id
-    from .config import load as load_config
-    from .indexer.runner import _cleanup_orphaned_cc_artifacts
-    from .utils import resolve_project_root
+    from ..config import derive_project_id
+    from ..config import load as load_config
+    from ..indexer.runner import _cleanup_orphaned_cc_artifacts
+    from ..utils import resolve_project_root
 
     project_root = resolve_project_root(args.project)
     cfg = load_config(project_root=project_root)
@@ -2409,11 +2409,11 @@ def cmd_watch(args: argparse.Namespace) -> int:
 def cmd_watch_status(args: argparse.Namespace) -> int:
     """Print the watcher daemon status for a project."""
 
-    from .config import derive_project_id
-    from .config import load as load_config
-    from .mcp.background import _is_bg_reindex_running
-    from .mcp.daemon import DAEMON_SOCK_NAME, ping_daemon
-    from .utils import resolve_project_root
+    from ..config import derive_project_id
+    from ..config import load as load_config
+    from ..mcp.background import _is_bg_reindex_running
+    from ..mcp.daemon import DAEMON_SOCK_NAME, ping_daemon
+    from ..utils import resolve_project_root
 
     root = resolve_project_root(args.project)
     cfg = load_config(project_root=root)
@@ -2457,8 +2457,8 @@ def cmd_watch_status(args: argparse.Namespace) -> int:
     db_path = db_dir / "index.db"
     if db_path.exists():
         try:
-            from .indexer.db import get_active_config, open_db
-            from .mcp.shared.stale import _count_modified_files
+            from ..indexer.db import get_active_config, open_db
+            from ..mcp.shared.stale import _count_modified_files
 
             conn = open_db(db_path)
             try:
@@ -2495,11 +2495,11 @@ def cmd_watch_restart(args: argparse.Namespace) -> int:
     import signal as _signal
     import time as _time
 
-    from .config import derive_project_id
-    from .config import load as load_config
-    from .mcp.background import _ensure_daemon_running
-    from .mcp.daemon import DAEMON_SOCK_NAME, ping_daemon
-    from .utils import resolve_project_root
+    from ..config import derive_project_id
+    from ..config import load as load_config
+    from ..mcp.background import _ensure_daemon_running
+    from ..mcp.daemon import DAEMON_SOCK_NAME, ping_daemon
+    from ..utils import resolve_project_root
 
     root = resolve_project_root(args.project)
     cfg = load_config(project_root=root)
@@ -2560,11 +2560,11 @@ def cmd_finetune(args: argparse.Namespace) -> int:
     MultipleNegativesRankingLoss.  The fine-tuned model is saved to
     ~/.fw-context/models/<project_id>/.
     """
-    from .config import derive_project_id
-    from .config import load as load_config
-    from .config.settings import DESCRIPTION_VERSION
-    from .indexer.finetune import FT_MODELS_DIR, run_finetune
-    from .utils import resolve_project_root
+    from ..config import derive_project_id
+    from ..config import load as load_config
+    from ..config.settings import DESCRIPTION_VERSION
+    from ..indexer.finetune import FT_MODELS_DIR, run_finetune
+    from ..utils import resolve_project_root
 
     root = resolve_project_root(args.project)
     cfg = load_config(project_root=root)
@@ -2831,7 +2831,7 @@ def main() -> None:
         sys.exit(args.func(args))
     except Exception as exc:
         # ProjectNotInitializedError — lazy import to avoid circular deps
-        from .config.settings import ProjectNotInitializedError
+        from ..config.settings import ProjectNotInitializedError
 
         if isinstance(exc, ProjectNotInitializedError):
             print(f"error: {exc}", file=sys.stderr)
