@@ -202,6 +202,84 @@ def _open_db_or_return(db_path: Path) -> tuple[sqlite3.Connection | None, list[d
     return conn, None
 
 
+# ── HandlerContext — shared setup for all MCP handlers ────────────────
+
+@dataclass
+class HandlerContext:
+    """Pre-resolved context for an MCP handler invocation.
+
+    All fields are guaranteed non-None — callers that receive a
+    ``HandlerContext`` can access every field without further checks.
+    """
+
+    conn: sqlite3.Connection
+    config_hash: str
+    root: Path
+    cfg: "Config"
+    project_id: str
+    db_path: Path
+
+
+def _resolve_handler_context(
+    project_root: str | None,
+    *,
+    require_refs: bool = False,
+) -> tuple[HandlerContext | None, list[dict] | None]:
+    """One-call setup for MCP handlers: resolve project, open DB, load config.
+
+    Returns ``(ctx, None)`` on success or ``(None, [error_dict])`` on failure.
+    The returned ``HandlerContext.conn`` is cache-managed — callers must NOT
+    close it.
+
+    When *require_refs* is ``True``, the call also verifies that the reference
+    index is populated (returns an ``info`` dict when empty).
+    """
+    from .readiness import _db_path, resolve_project_root
+
+    root = resolve_project_root(project_root)
+    db_path = _db_path(root)
+    if not db_path.exists():
+        return None, [{"error": f"No index found for {root}. Run 'fw-context index' first."}]
+
+    conn, err_result = _open_db_or_return(db_path)
+    if err_result:
+        return None, err_result
+
+    cfg = config.load(root)
+    from fw_context_mcp.mcp.shared._lookup import derive_project_id
+
+    project_id = derive_project_id(root)
+
+    from fw_context_mcp.indexer.db import get_active_config
+
+    with conn:
+        cfg_data = get_active_config(conn, project_id)
+        if not cfg_data:
+            return None, [{"error": "No build config indexed."}]
+        config_hash = cfg_data["config_hash"]
+
+        if require_refs:
+            from fw_context_mcp.indexer.db import count_refs
+
+            if count_refs(conn, config_hash) == 0:
+                return None, [{"info": (
+                    "No references indexed. Refs are on by default — "
+                    "they may have been disabled with [index] index_refs = false. "
+                    "Re-run 'fw-context index' to rebuild."
+                )}]
+
+    return HandlerContext(
+        conn=conn,
+        config_hash=config_hash,
+        root=root,
+        cfg=cfg,
+        project_id=project_id,
+        db_path=db_path,
+    ), None
+
+
+
+
 def _cleanup_conn_cache_atexit() -> None:
     """Close all cached connections on process exit."""
     _invalidate_conn_cache(None)

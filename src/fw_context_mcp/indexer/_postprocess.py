@@ -378,62 +378,35 @@ def _build_hotspot_cache(conn, config_hash: str, *, force: bool = False) -> None
 
 
 # ═══════════════════════════════════════════════════════════════
-# SECTION: Manifest management
+# SECTION: Post-processing pipeline steps
 # ═══════════════════════════════════════════════════════════════
 
 
-
-
-
-def _run_postprocess(
-    conn,
-    config_hash: str,
-    project_root: Path,
-    db_dir: Path,
-    units: list,
-    tu_headers: dict,
-    manifest: dict | None,
-    compile_commands: Path,
-    updated: int,
-    build_dir_patterns: list[str] | None,
-    vendor_patterns: list[str],
-    project_patterns_list: list[str],
-    project_id: str,
-    git_description: str,
-    *,
-    index_refs: bool,
-    index_embeddings: bool,
-    index_macros_expanded: bool,
-    analyze_symbols: bool,
-    analyze_overrides: bool,
-    analyze_vendor: bool,
-    llm_config=None,
-    cache_server_config=None,
-    force: bool = False,
-) -> None:
-    """Post-processing phases: FTS5 rebuild, macros, embeddings, LLM, overrides, pagerank."""
-
-    # ── FTS5 rebuild ──
+def _step_rebuild_fts(conn: sqlite3.Connection, ctx: dict) -> None:
+    """Rebuild FTS5 indexes for symbols, files, and macros."""
     rebuild_fts(conn)
     rebuild_files_fts(conn)
     rebuild_macros_fts(conn)
 
-    # ── Orphan cleanup ──
-    from .db import delete_orphan_files
 
-    delete_orphan_files(conn, config_hash)
+def _step_orphan_cleanup(conn: sqlite3.Connection, ctx: dict) -> None:
+    """Remove orphaned files, embeddings, and LLM analysis rows."""
+    from .db import delete_orphan_files, clean_orphan_embeddings, clean_orphan_embeddings_vec
 
-    from .db import clean_orphan_embeddings, clean_orphan_embeddings_vec
-
+    delete_orphan_files(conn, ctx["config_hash"])
     clean_orphan_embeddings(conn)
     clean_orphan_embeddings_vec(conn)
-
-    # Clean orphaned LLM analysis (was O(n) per batch — now once, see _llm.py)
     conn.execute(
         "DELETE FROM llm_analysis WHERE symbol_id NOT IN (SELECT id FROM symbols)"
     )
 
-    # ── is_project alignment ──
+
+def _step_align_is_project(conn: sqlite3.Connection, ctx: dict) -> None:
+    """Mark project files in the ``files`` table based on project/vendor patterns."""
+    config_hash = ctx["config_hash"]
+    project_patterns_list: list[str] = ctx["project_patterns_list"]
+    vendor_patterns: list[str] = ctx["vendor_patterns"]
+
     for pp in project_patterns_list:
         fn_pp = pp.replace("%", "*")
         conn.execute(
@@ -462,157 +435,285 @@ def _run_postprocess(
         )
     conn.commit()
 
-    # ── Manifest update ──
+
+def _step_update_manifest(conn: sqlite3.Connection, ctx: dict) -> None:
+    """Update manifest.json and refresh header mtimes from it."""
+    config_hash = ctx["config_hash"]
     updated_manifest = _update_manifest_after_index(
-        manifest=manifest,
-        units=units,
-        project_root=project_root,
-        db_dir=db_dir,
-        compile_commands=compile_commands,
-        updated_count=updated,
-        tu_headers=tu_headers if tu_headers else None,
-        build_dir_patterns=build_dir_patterns,
+        manifest=ctx["manifest"],
+        units=ctx["units"],
+        project_root=ctx["project_root"],
+        db_dir=ctx["db_dir"],
+        compile_commands=ctx["compile_commands"],
+        updated_count=ctx["updated"],
+        tu_headers=ctx["tu_headers"] if ctx["tu_headers"] else None,
+        build_dir_patterns=ctx["build_dir_patterns"],
         config_hash=config_hash,
     )
     if updated_manifest is not None:
-        _refresh_header_mtimes_from_manifest(conn, config_hash, project_root, updated_manifest)
+        _refresh_header_mtimes_from_manifest(conn, config_hash, ctx["project_root"], updated_manifest)
 
-    # ── Macro expansion ──
-    if index_macros_expanded and units:
-        from .macros import resolve_and_update
 
-        seen_flags: set[tuple] = set()
-        for unit in units:
-            flag_key = tuple(sorted(unit.clang_args))
-            if flag_key in seen_flags:
-                continue
-            seen_flags.add(flag_key)
-            try:
-                resolve_and_update(
-                    conn, config_hash, unit.clang_args, unit.file.resolve(),
-                )
-            except SAFE_EXCEPT as e:
-                if is_fatal(e): raise
-                pass  # libclang/SQLite fallback
+def _step_expand_macros(conn: sqlite3.Connection, ctx: dict) -> None:
+    """Resolve and store expanded macro values (libclang-powered)."""
+    from .macros import resolve_and_update
 
-    # ── Embeddings ──
-    if index_embeddings and llm_config is not None and llm_config.enabled:
-        if force:
-            conn.execute(
-                "DELETE FROM embeddings WHERE symbol_id IN (SELECT id FROM symbols WHERE config_hash = ?)",
-                (config_hash,),
+    seen_flags: set[tuple] = set()
+    for unit in ctx["units"]:
+        flag_key = tuple(sorted(unit.clang_args))
+        if flag_key in seen_flags:
+            continue
+        seen_flags.add(flag_key)
+        try:
+            resolve_and_update(
+                conn, ctx["config_hash"], unit.clang_args, unit.file.resolve(),
             )
-            try:
-                conn.execute(
-                    "DELETE FROM vec_symbols WHERE symbol_id IN (SELECT id FROM symbols WHERE config_hash = ?)",
-                    (config_hash,),
-                )
-            except sqlite3.OperationalError:
-                pass
-            conn.commit()
-        _build_embeddings(conn, config_hash, llm_config, db_dir)
-        conn.commit()
+        except SAFE_EXCEPT as e:
+            if is_fatal(e):
+                raise
+            pass  # libclang/SQLite fallback
 
-    # ── LLM analysis ──
-    if analyze_symbols and llm_config is not None and llm_config.enabled:
-        from ..cache_client import CacheClient
 
-        cc = None
-        if cache_server_config is not None and cache_server_config.url:
-            try:
-                cc = CacheClient(
-                    url=cache_server_config.url,
-                    token=cache_server_config.token,
-                    force=cache_server_config.force,
-                    batch_size=cache_server_config.batch_size,
-                )
-            except SAFE_EXCEPT as e:
-                if is_fatal(e): raise
-                pass  # libclang/SQLite fallback
-        if force:
-            conn.execute(
-                "DELETE FROM llm_analysis WHERE symbol_id IN (SELECT id FROM symbols WHERE config_hash = ?)",
-                (config_hash,),
-            )
-            conn.commit()
-        _build_llm_analysis(
-            conn, config_hash, llm_config, db_dir,
-            project_only=not analyze_vendor,
-            cache_client=cc,
-            retry_unparseable=True,
+def _step_build_embeddings(conn: sqlite3.Connection, ctx: dict) -> None:
+    """Compute symbol embeddings via the configured LLM backend."""
+    config_hash = ctx["config_hash"]
+    llm_config = ctx["llm_config"]
+    if ctx["force"]:
+        conn.execute(
+            "DELETE FROM embeddings WHERE symbol_id IN (SELECT id FROM symbols WHERE config_hash = ?)",
+            (config_hash,),
         )
-        if cc:
-            cc.close()
+        try:
+            conn.execute(
+                "DELETE FROM vec_symbols WHERE symbol_id IN (SELECT id FROM symbols WHERE config_hash = ?)",
+                (config_hash,),
+            )
+        except sqlite3.OperationalError:
+            pass
         conn.commit()
+    _build_embeddings(conn, config_hash, llm_config, ctx["db_dir"])
+    conn.commit()
 
-    # ── Override graph ──
-    if analyze_overrides:
-        if force:
-            conn.execute("DELETE FROM overrides WHERE config_hash = ?", (config_hash,))
-            conn.commit()
-        _build_overrides(conn, config_hash, db_dir)
-        conn.commit()
 
-    # ── PageRank + hotspot ──
-    if index_refs:
-        if force:
-            conn.execute("UPDATE symbols SET pagerank = 0.0 WHERE config_hash = ?", (config_hash,))
-            conn.execute("DELETE FROM hotspot_cache WHERE config_hash = ?", (config_hash,))
-            conn.commit()
-        _build_pagerank(conn, config_hash)
-        conn.commit()
-        _build_hotspot_cache(conn, config_hash)
-        conn.commit()
+def _step_llm_analysis(conn: sqlite3.Connection, ctx: dict) -> None:
+    """Generate natural-language symbol explanations via the configured LLM."""
+    from ..cache_client import CacheClient
 
-    # ── Manifest verification upgrade ──
-    manifest_path = db_dir / "manifest.json"
+    config_hash = ctx["config_hash"]
+    llm_config = ctx["llm_config"]
+    cache_server_config = ctx.get("cache_server_config")
+
+    cc = None
+    if cache_server_config is not None and cache_server_config.url:
+        try:
+            cc = CacheClient(
+                url=cache_server_config.url,
+                token=cache_server_config.token,
+                force=cache_server_config.force,
+                batch_size=cache_server_config.batch_size,
+            )
+        except SAFE_EXCEPT as e:
+            if is_fatal(e):
+                raise
+            pass
+    if ctx["force"]:
+        conn.execute(
+            "DELETE FROM llm_analysis WHERE symbol_id IN (SELECT id FROM symbols WHERE config_hash = ?)",
+            (config_hash,),
+        )
+        conn.commit()
+    _build_llm_analysis(
+        conn, config_hash, llm_config, ctx["db_dir"],
+        project_only=not ctx["analyze_vendor"],
+        cache_client=cc,
+        retry_unparseable=True,
+    )
+    if cc:
+        cc.close()
+    conn.commit()
+
+
+def _step_build_overrides(conn: sqlite3.Connection, ctx: dict) -> None:
+    """Build the virtual-method override graph from the inheritance table."""
+    config_hash = ctx["config_hash"]
+    if ctx["force"]:
+        conn.execute("DELETE FROM overrides WHERE config_hash = ?", (config_hash,))
+        conn.commit()
+    _build_overrides(conn, config_hash, ctx["db_dir"])
+    conn.commit()
+
+
+def _step_pagerank_hotspot(conn: sqlite3.Connection, ctx: dict) -> None:
+    """Compute PageRank scores and build the hotspot cache from the call graph."""
+    config_hash = ctx["config_hash"]
+    if ctx["force"]:
+        conn.execute("UPDATE symbols SET pagerank = 0.0 WHERE config_hash = ?", (config_hash,))
+        conn.execute("DELETE FROM hotspot_cache WHERE config_hash = ?", (config_hash,))
+        conn.commit()
+    _build_pagerank(conn, config_hash)
+    conn.commit()
+    _build_hotspot_cache(conn, config_hash)
+    conn.commit()
+
+
+def _step_finalize_manifest(conn: sqlite3.Connection, ctx: dict) -> None:
+    """Stamp the build config with manifest verification status."""
+    manifest_path = ctx["db_dir"] / "manifest.json"
     manifest_verification: str = "full" if manifest_path.exists() else "none"
     with transaction(conn):
         upsert_build_config(
-            conn, config_hash, project_id, str(compile_commands),
-            description=git_description, manifest_verification=manifest_verification,
-            analyze_vendor=int(analyze_vendor),
+            conn, ctx["config_hash"], ctx["project_id"],
+            str(ctx["compile_commands"]),
+            description=ctx["git_description"],
+            manifest_verification=manifest_verification,
+            analyze_vendor=int(ctx["analyze_vendor"]),
         )
 
-    # ── Cleanup old build data ──
+
+def _step_cleanup_old_builds(conn: sqlite3.Connection, ctx: dict) -> None:
+    """Delete data from previous builds, unless a reindex is paused."""
+    config_hash = ctx["config_hash"]
+    project_id = ctx["project_id"]
+    db_dir = ctx["db_dir"]
+
     old_hashes = conn.execute(
         """SELECT config_hash FROM build_configs
            WHERE project_id = ? AND config_hash != ?
            ORDER BY created_at DESC""",
         (project_id, config_hash),
     ).fetchall()
-    if old_hashes:
-        pause_file = db_dir / "reindex.pause"
-        skip_cleanup = False
-        if pause_file.exists():
-            try:
-                pause_pid = int(pause_file.read_text(encoding="utf-8").strip())
-                try:
-                    os.kill(pause_pid, 0)
-                    skip_cleanup = True
-                except OSError:
-                    pause_file.unlink(missing_ok=True)
-            except (OSError, ValueError):
-                pause_file.unlink(missing_ok=True)
-        if not skip_cleanup:
-            for row in old_hashes:
-                old_ch = row["config_hash"]
-                with transaction(conn):
-                    delete_build_data(conn, old_ch)
-            cc_dir = Path.home() / ".fw-context" / "index" / project_id
-            if cc_dir.exists():
-                for row in old_hashes:
-                    old_ch = row["config_hash"]
-                    try:
-                        (cc_dir / f"compile_commands.{old_ch}.json").unlink(missing_ok=True)
-                    except OSError:
-                        pass
+    if not old_hashes:
+        return
 
-    # ── WAL checkpoint + schema stamp ──
+    pause_file = db_dir / "reindex.pause"
+    skip_cleanup = False
+    if pause_file.exists():
+        try:
+            pause_pid = int(pause_file.read_text(encoding="utf-8").strip())
+            try:
+                os.kill(pause_pid, 0)
+                skip_cleanup = True
+            except OSError:
+                pause_file.unlink(missing_ok=True)
+        except (OSError, ValueError):
+            pause_file.unlink(missing_ok=True)
+    if skip_cleanup:
+        return
+
+    for row in old_hashes:
+        old_ch = row["config_hash"]
+        with transaction(conn):
+            delete_build_data(conn, old_ch)
+    cc_dir = Path.home() / ".fw-context" / "index" / project_id
+    if cc_dir.exists():
+        for row in old_hashes:
+            old_ch = row["config_hash"]
+            try:
+                (cc_dir / f"compile_commands.{old_ch}.json").unlink(missing_ok=True)
+            except OSError:
+                pass
+
+
+def _step_wal_checkpoint(conn: sqlite3.Connection, ctx: dict) -> None:
+    """Run a passive WAL checkpoint and stamp the schema version."""
     try:
         conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
     except SAFE_EXCEPT as e:
-        if is_fatal(e): raise
-        pass  # libclang/SQLite fallback
+        if is_fatal(e):
+            raise
+        pass
     conn.execute(f"PRAGMA user_version = {CURRENT_SCHEMA_VERSION}")
+
+
+# ── Pipeline definition ─────────────────────────────────────────────
+
+# Each entry: (step_name, step_fn, condition | None)
+# condition(ctx) → bool — when None, the step always runs.
+_STEPS: list[tuple[str, callable, callable | None]] = [
+    ("fts5",             _step_rebuild_fts,       None),
+    ("orphans",          _step_orphan_cleanup,     None),
+    ("is_project",       _step_align_is_project,   None),
+    ("manifest",         _step_update_manifest,    None),
+    ("macros",           _step_expand_macros,      lambda c: c["index_macros_expanded"] and c["units"]),
+    ("embeddings",       _step_build_embeddings,   lambda c: c["index_embeddings"] and c["llm_config"] is not None and c["llm_config"].enabled),
+    ("llm_analysis",     _step_llm_analysis,       lambda c: c["analyze_symbols"] and c["llm_config"] is not None and c["llm_config"].enabled),
+    ("overrides",        _step_build_overrides,    lambda c: c["analyze_overrides"]),
+    ("pagerank_hotspot", _step_pagerank_hotspot,   lambda c: c["index_refs"]),
+    ("finalize_manifest", _step_finalize_manifest,  None),
+    ("cleanup_old",      _step_cleanup_old_builds,  None),
+    ("wal_checkpoint",   _step_wal_checkpoint,      None),
+]
+
+
+def _run_postprocess(
+    conn,
+    config_hash: str,
+    project_root: Path,
+    db_dir: Path,
+    units: list,
+    tu_headers: dict,
+    manifest: dict | None,
+    compile_commands: Path,
+    updated: int,
+    build_dir_patterns: list[str] | None,
+    vendor_patterns: list[str],
+    project_patterns_list: list[str],
+    project_id: str,
+    git_description: str,
+    *,
+    index_refs: bool,
+    index_embeddings: bool,
+    index_macros_expanded: bool,
+    analyze_symbols: bool,
+    analyze_overrides: bool,
+    analyze_vendor: bool,
+    llm_config=None,
+    cache_server_config=None,
+    force: bool = False,
+) -> None:
+    """Run all post-processing phases via a data-driven pipeline.
+
+    Each step in ``_STEPS`` is executed in order.  Conditional steps
+    are skipped when their guard returns ``False``.  Runtime errors in
+    individual steps are logged (not fatal) so the remaining steps
+    always execute.
+    """
+    ctx = {
+        "config_hash": config_hash,
+        "project_root": project_root,
+        "db_dir": db_dir,
+        "units": units,
+        "tu_headers": tu_headers,
+        "manifest": manifest,
+        "compile_commands": compile_commands,
+        "updated": updated,
+        "build_dir_patterns": build_dir_patterns,
+        "vendor_patterns": vendor_patterns,
+        "project_patterns_list": project_patterns_list,
+        "project_id": project_id,
+        "git_description": git_description,
+        "index_refs": index_refs,
+        "index_embeddings": index_embeddings,
+        "index_macros_expanded": index_macros_expanded,
+        "analyze_symbols": analyze_symbols,
+        "analyze_overrides": analyze_overrides,
+        "analyze_vendor": analyze_vendor,
+        "llm_config": llm_config,
+        "cache_server_config": cache_server_config,
+        "force": force,
+    }
+
+    for step_name, step_fn, guard in _STEPS:
+        if guard is not None and not guard(ctx):
+            continue
+        t0 = time.monotonic()
+        try:
+            step_fn(conn, ctx)
+            elapsed = time.monotonic() - t0
+            if elapsed > 0.5:
+                log.debug("Postprocess step %s: %.1fs", step_name, elapsed)
+        except SAFE_EXCEPT as e:
+            if is_fatal(e):
+                raise
+            log.warning("Postprocess step %s failed: %s", step_name, e)
 

@@ -381,30 +381,18 @@ def _refs_guard(project_root: str | None) -> tuple[sqlite3.Connection, Path, str
     The connection is owned by :mod:`fw_context_mcp.mcp.shared.connection` and
     will be reused across handlers within the same MCP session.
 
+    Delegates to ``_resolve_handler_context`` — prefer that directly in new code.
+
     Returns:
         ``(conn, root, config_hash, None)`` on success — caller reuses *conn* (do not close).
         ``(None, None, None, error_list)`` on failure — caller propagates the error.
     """
-    root = resolve_project_root(project_root)
-    db_path = _db_path(root)
-    if not db_path.exists():
-        return None, None, None, [{"error": f"No index found for {root}. Run 'fw-context index' first."}]
-    conn, err_result = _open_db_or_return(db_path)
-    if err_result:
-        return None, None, None, err_result
-    project_id = derive_project_id(root)
-    with conn:
-        cfg_data = get_active_config(conn, project_id)
-        if not cfg_data:
-            return None, None, None, [{"error": "No build config indexed."}]
-        config_hash = cfg_data["config_hash"]
-        if count_refs(conn, config_hash) == 0:
-            return None, None, None, [{"info": (
-                "No references indexed. Refs are on by default — "
-                "they may have been disabled with [index] index_refs = false. "
-                "Re-run 'fw-context index' to rebuild."
-            )}]
-    return conn, root, config_hash, None
+    from fw_context_mcp.mcp.shared.context import _resolve_handler_context, HandlerContext
+
+    ctx, err = _resolve_handler_context(project_root, require_refs=True)
+    if err:
+        return None, None, None, err
+    return ctx.conn, ctx.root, ctx.config_hash, None
 
 # ── moved from server.py ──
 def find_call_path(

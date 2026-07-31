@@ -14,7 +14,7 @@ import time
 from contextlib import nullcontext
 from pathlib import Path
 
-from ..utils import MTIME_TOLERANCE_S, compute_source_hash
+from ..utils import MTIME_TOLERANCE_S, SAFE_EXCEPT, compute_source_hash, is_fatal
 from .ops import _build_filtered_file_content, _normalize_file_path, store_symbols_for_unit
 from .db import (
     get_file_hashes,
@@ -149,7 +149,9 @@ def _reassign_symbols_for_file(
                )""",
             (new_config_hash, new_config_hash, new_file_id),
         )
-    except (ValueError, TypeError, RuntimeError, AttributeError, sqlite3.Error):
+    except SAFE_EXCEPT as e:
+        if is_fatal(e):
+            raise
         pass  # libclang/SQLite fallback  # sqlite-vec may not be available
 
     # ── inheritance ──
@@ -315,7 +317,9 @@ def _check_and_parse_unit(
     except sqlite3.Error:
         log.error("Fatal DB error parsing %s — stopping indexer", unit.file.name)
         raise
-    except (ValueError, TypeError, RuntimeError, AttributeError, sqlite3.Error) as exc:
+    except SAFE_EXCEPT as exc:
+        if is_fatal(exc):
+            raise
         msg = str(exc)
         if "unable to open database file" in msg:
             log.error("Fatal DB error parsing %s: %s — stopping indexer", unit.file.name, exc)
@@ -473,7 +477,9 @@ def _process_unit(
                 with_refs=index_refs,
                 return_tu=True,
             )
-        except (ValueError, TypeError, RuntimeError, AttributeError, sqlite3.Error) as exc:
+        except SAFE_EXCEPT as exc:
+            if is_fatal(exc):
+                raise
             log.warning("skip TU %s: %s", unit.file.name, exc)
             return ("skipped", 0, 0, (0.0, 0.0, 0.0), [])
         t_parse_end = time.monotonic()
@@ -532,7 +538,9 @@ def _process_unit(
     except sqlite3.Error:
         log.error("Fatal DB error storing %s — stopping indexer", unit.file.name)
         raise
-    except (ValueError, TypeError, RuntimeError, AttributeError, sqlite3.Error) as exc:
+    except SAFE_EXCEPT as exc:
+        if is_fatal(exc):
+            raise
         msg = str(exc)
         if "unable to open database file" in msg:
             log.error("Fatal DB error storing %s: %s — stopping indexer", unit.file.name, exc)
