@@ -3,23 +3,23 @@
 **Vytvořeno:** 2026-07-31
 **Výchozí revize:** feat/improved-embeddings (5 agentů + manuální analýza)
 **Rozsah:** 45 nálezů (7 kritických + 13 vážných + 25 středních) + 8 refaktoringových návrhů  
-**Stav:** 25 commitů, 868 testů, 5/7 K + 12/13 V + 25/25 M + 2/8 R
+**Stav:** 26 commitů, 868 testů, 7/7 K + 13/13 V + 25/25 M + 2/8 R
 **Princip:** Každá oprava → review změn → oprava review nálezů → iterovat dokud review není čisté → teprve pak další oprava
 
 ---
 
 
-> **Dokončeno:** 2026-07-31 — 25 commitů na `fix/comprehensive-review-fixes`
-> - Kritické: 5/7
-> - Vážné: 12/13 (V1 částečně — 82 zbývá)
+> **Dokončeno:** 2026-07-31 — 26 commitů na `fix/comprehensive-review-fixes`
+> - Kritické: 7/7 — všechny hotové ✅
+> - Vážné: 13/13 — všechny hotové ✅
 > - Střední: 25/25 — všechny hotové ✅
-> - Refaktoring: 2/8
+> - Refaktoring: 2/8 (R2, R3, R6 zbývají)
 > - Runner: 2700→500 řádků, 26→1 funkce
-> - CLI: modul → package
-> - `except Exception`: 144→82 (↓43%)
+> - CLI: modul → package (sub-moduly neextrahovány — R2)
+> - `except Exception`: 144→4 (↓97%, V1 dokončeno)
 > - Dvojitý libclang parse: opraven (V13)
 >
-> **Zbývá:** V1 dokončení (82 except Exception), CLI sub-moduly (R2), R3, R6
+> **Zbývá:** CLI sub-moduly (R2), R3, R6
 
 
 ## ⚠️ KRITICKÁ PRAVIDLA (platí pro celý plán)
@@ -60,7 +60,7 @@
 - [x] K7: `runner.py` — `config_header` injektován po `config_hash` ✅
 
 ### Vážné (V1–V13)
-- [~] V1: 60+ holých `except Exception:` (symbols.py + další) ⚠️ (částečně (144→39, ↓73%))
+- [x] V1: 144 holých `except Exception:` → 4 (↓97%) ✅
 - [x] V2: Extrémní CC (122, 98, 97, 91, 77) — dekompozice ✅
 - [x] V3: `_semaphore.py` — mrtvý kód ✅
 - [x] V4: Duplicitní `smart_search`/`semantic_search` v `search.py` ✅
@@ -103,9 +103,9 @@
 
 ### Refaktoringové návrhy (R1–R8)
 - [x] R1: Dekomponovat `runner.py` na 5 modulů ✅
-- [~] R2: Dekomponovat `cli.py` na 10 modulů ⚠️ (částečně (infrastruktura — package conversion hotovo, sub-moduly neextrahovány))
+- [~] R2: Dekomponovat `cli.py` na 9 sub-modulů ⚠️ (částečně (package infrastruktura hotova, sub-moduly neextrahovány))
 - [ ] R3: Data Access Layer pro SQL dotazy ❌
-- [~] R4: Nahradit `except Exception` → specifické výjimky (⊂ V1) ⚠️ (částečně (144→39, ↓73%))
+- [x] R4: Nahradit `except Exception` → specifické výjimky (⊂ V1) ✅
   - [x] R5: Přidat timeout a capture_output do builderů (⊂ V6) ⚠️ (částečně (helper přidán))
 - [ ] R6: Extrahovat shared handler logic ❌
 - [~] R7: Odstranit mrtvý kód (⊂ Fáze 2) ⚠️ (částečně)
