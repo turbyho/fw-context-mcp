@@ -262,7 +262,8 @@ class TestSignatureForVariables:
 
         unit = CompilationUnit(file=src, directory=tmp_path, language="c",
                                clang_args=["-std=c11"])
-        syms, _, _, _, _, _ = extract_all(unit, with_refs=False)
+        r = extract_all(unit, with_refs=False)
+        syms = r.symbols
 
         count = next(s for s in syms if s.name == "g_count")
         assert count.signature == "int g_count", f"got {count.signature!r}"
@@ -276,7 +277,8 @@ class TestSignatureForVariables:
 
         unit = CompilationUnit(file=src, directory=tmp_path, language="c",
                                clang_args=["-std=c11"])
-        syms, _, _, _, _, _ = extract_all(unit, with_refs=False)
+        r = extract_all(unit, with_refs=False)
+        syms = r.symbols
 
         local = next(s for s in syms if s.name == "local")
         assert "int" in local.signature and "local" in local.signature, (
@@ -292,7 +294,8 @@ class TestSignatureForVariables:
 
         unit = CompilationUnit(file=src, directory=tmp_path, language="c++",
                                clang_args=["-std=c++17"])
-        syms, _, _, _, _, _ = extract_all(unit, with_refs=False)
+        r = extract_all(unit, with_refs=False)
+        syms = r.symbols
 
         x_field = next(s for s in syms if s.name == "x")
         assert "int" in x_field.signature and "x" in x_field.signature, (
@@ -315,7 +318,8 @@ class TestKindSplit:
 
         unit = CompilationUnit(file=src, directory=tmp_path, language="c",
                                clang_args=["-std=c11"])
-        syms, _, _, _, _, _ = extract_all(unit, with_refs=False)
+        r = extract_all(unit, with_refs=False)
+        syms = r.symbols
 
         g = next(s for s in syms if s.name == "g_debug_level")
         assert g.kind == "varglobal", f"got {g.kind}"
@@ -329,7 +333,8 @@ class TestKindSplit:
 
         unit = CompilationUnit(file=src, directory=tmp_path, language="c",
                                clang_args=["-std=c11"])
-        syms, _, _, _, _, _ = extract_all(unit, with_refs=False)
+        r = extract_all(unit, with_refs=False)
+        syms = r.symbols
 
         varlocals = [s for s in syms if s.name in ("i", "p")]
         assert len(varlocals) == 2, f"expected 2 varlocals, got {[s.name for s in varlocals]}"
@@ -345,7 +350,8 @@ class TestKindSplit:
 
         unit = CompilationUnit(file=src, directory=tmp_path, language="c",
                                clang_args=["-std=c11"])
-        syms, _, _, _, _, _ = extract_all(unit, with_refs=False)
+        r = extract_all(unit, with_refs=False)
+        syms = r.symbols
 
         local = next(s for s in syms if s.name == "local")
         assert local.kind == "varlocal"
@@ -360,7 +366,8 @@ class TestKindSplit:
 
         unit = CompilationUnit(file=src, directory=tmp_path, language="c",
                                clang_args=["-std=c11"])
-        syms, _, _, _, _, _ = extract_all(unit, with_refs=False)
+        r = extract_all(unit, with_refs=False)
+        syms = r.symbols
 
         counter = next(s for s in syms if s.name == "counter")
         assert counter.kind == "varlocal", (
@@ -376,7 +383,8 @@ class TestKindSplit:
 
         unit = CompilationUnit(file=src, directory=tmp_path, language="c++",
                                clang_args=["-std=c++17"])
-        syms, _, _, _, _, _ = extract_all(unit, with_refs=False)
+        r = extract_all(unit, with_refs=False)
+        syms = r.symbols
 
         ext_x = next(s for s in syms if s.name == "ext_x")
         assert ext_x.kind == "varglobal", (
@@ -392,7 +400,8 @@ class TestKindSplit:
 
         unit = CompilationUnit(file=src, directory=tmp_path, language="c++",
                                clang_args=["-std=c++17"])
-        syms, _, _, _, _, _ = extract_all(unit, with_refs=False)
+        r = extract_all(unit, with_refs=False)
+        syms = r.symbols
 
         count = next(s for s in syms if s.name == "count")
         assert count.kind == "varglobal", (
