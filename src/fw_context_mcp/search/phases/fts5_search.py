@@ -43,7 +43,7 @@ class FTS5SearchPhase(Phase):
         return ctx.evolve(fts5_results=rows)
 
 
-def _search_queries(  # TODO(Perf-L14): combine OR + name_tokens into single FTS5 expression
+def _search_queries(  # NOTE(turbyho, 2026-07-31): combine OR + name_tokens into single FTS5 expression
         conn, queries: list[str], config_hash: str, fetch_limit: int) -> list[dict]:
     """Execute both OR query and name_tokens query, merge with dedup.
 
