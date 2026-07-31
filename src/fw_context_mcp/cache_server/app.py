@@ -67,7 +67,7 @@ class BatchGetRequest(BaseModel):
 
 
 class CacheClearRequest(BaseModel):
-    hashes: list[str]
+    hashes: list[str] = Field(min_length=1, max_length=10000)
 
 
 class CacheEntry(BaseModel):
