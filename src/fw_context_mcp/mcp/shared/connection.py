@@ -136,6 +136,19 @@ def _open_and_cache(db_key: str, db_path: Path) -> sqlite3.Connection:
 
     # Integrity check outside the cache lock so concurrent tool calls are not blocked
     if should_check:
+        # Fast check first — PRAGMA quick_check is O(1), catches most corruption
+        try:
+            quick_result = conn.execute("PRAGMA quick_check").fetchone()
+            if quick_result and quick_result[0] != "ok":
+                log.warning("quick_check failed: %s — database may be corrupt", quick_result[0])
+                # Fall through to full integrity_check for details
+        except sqlite3.Error:
+            pass
+
+        # Full PRAGMA integrity_check runs once per process per DB.
+        # For large databases (>100 MB) this can take seconds, but it's the
+        # only way to catch subtle index corruption that quick_check misses.
+        # The result is cached so subsequent tool calls skip this entirely.
         try:
             result = conn.execute("PRAGMA integrity_check").fetchone()
             if result and result[0] != "ok":
