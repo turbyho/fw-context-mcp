@@ -9,7 +9,6 @@ from typing import Annotated
 from pydantic import Field
 
 from ...indexer.db import (
-    get_active_config,
     get_direct_bases,
     get_direct_derived,
     get_overrides_for_method,
@@ -21,7 +20,7 @@ from ...indexer.db import (
     get_template_instances as query_template_instances,
 )
 from ...utils import abs_path
-from ..shared.context import _open_db_or_return, _resolve_context
+from ..shared.context import _resolve_handler_context
 from .source import _lookup_definition
 
 log = logging.getLogger(__name__)
@@ -69,19 +68,14 @@ def get_inheritance_chain(
             all_derived: [...] (when transitive=True, descendants sorted by depth)
         }
     """
-    db_path, cfg, project_id, root = _resolve_context(project_root)
-    if not db_path.exists():
-        return {"error": f"No index found for {root}. Run 'fw-context index' first."}
-    conn, err_result = _open_db_or_return(db_path)
-    if err_result:
-        return err_result[0]
+    ctx, err = _resolve_handler_context(project_root)
+    if err:
+        return err[0]
     try:
-        with conn:
-            cfg_data = get_active_config(conn, project_id)
-            if not cfg_data:
-                return {"error": "No build config indexed."}
-            config_hash = cfg_data["config_hash"]
-            row = _lookup_definition(conn, config_hash, class_name,
+        with ctx.conn:
+            config_hash = ctx.config_hash
+            root = ctx.root
+            row = _lookup_definition(ctx.conn, config_hash, class_name,
                                      preferred_kinds=("class", "struct"))
             if not row:
                 return {"error": f"Symbol not found: {class_name}"}
@@ -98,7 +92,7 @@ def get_inheritance_chain(
             }
 
             # ── Direct base classes (parents) ──
-            bases = get_direct_bases(conn, config_hash, usr)
+            bases = get_direct_bases(ctx.conn, config_hash, usr)
             result["bases"] = [
                 {
                     "name": b.get("base_name") or "<unknown>",
@@ -111,7 +105,7 @@ def get_inheritance_chain(
             ]
 
             # ── Direct derived classes (children) ──
-            derived = get_direct_derived(conn, config_hash, usr)
+            derived = get_direct_derived(ctx.conn, config_hash, usr)
             result["derived"] = [
                 {
                     "name": d.get("derived_name") or "<unknown>",
@@ -136,7 +130,7 @@ def get_inheritance_chain(
                     if cur_usr in visited_up:
                         continue
                     visited_up.add(cur_usr)
-                    cur_row = conn.execute(
+                    cur_row = ctx.conn.execute(
                         "SELECT name, kind, file_path FROM symbols WHERE config_hash=? AND usr=? LIMIT 1",
                         (config_hash, cur_usr),
                     ).fetchone()
@@ -149,7 +143,7 @@ def get_inheritance_chain(
                         "file": abs_path(root, cur_row["file_path"]) if cur_row and cur_row["file_path"] else None,
                         "kind": cur_row["kind"] if cur_row else None,
                     })
-                    grand_bases = get_direct_bases(conn, config_hash, cur_usr)
+                    grand_bases = get_direct_bases(ctx.conn, config_hash, cur_usr)
                     for gb in grand_bases:
                         if gb["base_usr"] not in visited_up and depth < max_depth:
                             queue_up.append((gb["base_usr"], gb["access"], gb["is_virtual"], depth + 1))
@@ -166,7 +160,7 @@ def get_inheritance_chain(
                     if cur_usr in visited_down:
                         continue
                     visited_down.add(cur_usr)
-                    cur_row = conn.execute(
+                    cur_row = ctx.conn.execute(
                         "SELECT name, kind, file_path FROM symbols WHERE config_hash=? AND usr=? LIMIT 1",
                         (config_hash, cur_usr),
                     ).fetchone()
@@ -179,7 +173,7 @@ def get_inheritance_chain(
                         "file": abs_path(root, cur_row["file_path"]) if cur_row and cur_row["file_path"] else None,
                         "kind": cur_row["kind"] if cur_row else None,
                     })
-                    grand_derived = get_direct_derived(conn, config_hash, cur_usr)
+                    grand_derived = get_direct_derived(ctx.conn, config_hash, cur_usr)
                     for gd in grand_derived:
                         if gd["derived_usr"] not in visited_down and depth < max_depth:
                             queue_down.append((gd["derived_usr"], gd["access"], gd["is_virtual"], depth + 1))
@@ -218,19 +212,14 @@ def get_class_members(
         [{name, qualified_name, signature, is_virtual, is_pure_virtual,
         line}]}, member_count}
     """
-    db_path, cfg, project_id, root = _resolve_context(project_root)
-    if not db_path.exists():
-        return {"error": f"No index found for {root}. Run 'fw-context index' first."}
-    conn, err_result = _open_db_or_return(db_path)
-    if err_result:
-        return err_result[0]
+    ctx, err = _resolve_handler_context(project_root)
+    if err:
+        return err[0]
     try:
-        with conn:
-            cfg_data = get_active_config(conn, project_id)
-            if not cfg_data:
-                return {"error": "No build config indexed."}
-            config_hash = cfg_data["config_hash"]
-            row = _lookup_definition(conn, config_hash, class_name,
+        with ctx.conn:
+            config_hash = ctx.config_hash
+            root = ctx.root
+            row = _lookup_definition(ctx.conn, config_hash, class_name,
                                      preferred_kinds=("class", "struct"))
             if not row:
                 return {"error": f"Symbol not found: {class_name}"}
@@ -247,7 +236,7 @@ def get_class_members(
             }
 
             # ── Members grouped by kind ──
-            members = query_class_members(conn, config_hash, usr)
+            members = query_class_members(ctx.conn, config_hash, usr)
             grouped: dict[str, list[dict]] = {}
             for m in members:
                 k = m["kind"]
@@ -304,19 +293,14 @@ def get_template_instances(
         qualified_name, kind, file, line, signature, is_definition),
         instance_count (int)}
     """
-    db_path, cfg, project_id, root = _resolve_context(project_root)
-    if not db_path.exists():
-        return [{"error": f"No index found for {root}. Run 'fw-context index' first."}]
-    conn, err_result = _open_db_or_return(db_path)
-    if err_result:
-        return err_result
+    ctx, err = _resolve_handler_context(project_root)
+    if err:
+        return err
     try:
-        with conn:
-            cfg_data = get_active_config(conn, project_id)
-            if not cfg_data:
-                return [{"error": "No build config indexed."}]
-            config_hash = cfg_data["config_hash"]
-            row = _lookup_definition(conn, config_hash, template_name,
+        with ctx.conn:
+            config_hash = ctx.config_hash
+            root = ctx.root
+            row = _lookup_definition(ctx.conn, config_hash, template_name,
                                      preferred_kinds=None)
             if not row:
                 return [{"error": f"Symbol not found: {template_name}"}]
@@ -324,7 +308,7 @@ def get_template_instances(
                 return [{"error": f"'{template_name}' is not a template (kind: {row['kind']}, is_template: false)."}]
 
             template_usr = row["usr"]
-            instances = query_template_instances(conn, config_hash, template_usr, limit=limit)
+            instances = query_template_instances(ctx.conn, config_hash, template_usr, limit=limit)
 
             result: list[dict] = [
                 {
@@ -388,19 +372,14 @@ def get_method_overrides(
             overridden_by: [{usr, name, qualified_name, kind, file, line}]
         }
     """
-    db_path, cfg, project_id, root = _resolve_context(project_root)
-    if not db_path.exists():
-        return {"error": f"No index found for {root}. Run 'fw-context index' first."}
-    conn, err_result = _open_db_or_return(db_path)
-    if err_result:
-        return err_result[0]
+    ctx, err = _resolve_handler_context(project_root)
+    if err:
+        return err[0]
     try:
-        with conn:
-            cfg_data = get_active_config(conn, project_id)
-            if not cfg_data:
-                return {"error": "No build config indexed."}
-            config_hash = cfg_data["config_hash"]
-            row = _lookup_definition(conn, config_hash, method_name,
+        with ctx.conn:
+            config_hash = ctx.config_hash
+            root = ctx.root
+            row = _lookup_definition(ctx.conn, config_hash, method_name,
                                      preferred_kinds=("method", "destructor"))
             if not row:
                 return {"error": f"Symbol not found: {method_name}"}
@@ -416,7 +395,7 @@ def get_method_overrides(
                 "signature": row["signature"],
             }
 
-            ov = get_overrides_for_method(conn, config_hash, row["usr"])
+            ov = get_overrides_for_method(ctx.conn, config_hash, row["usr"])
             result["overrides"] = [
                 {
                     "usr": o["base_usr"],

@@ -246,7 +246,7 @@ def _resolve_handler_context(
         return None, err_result
 
     cfg = config.load(root)
-    from fw_context_mcp.mcp.shared._lookup import derive_project_id
+    from fw_context_mcp.config import derive_project_id
 
     project_id = derive_project_id(root)
 
