@@ -7,7 +7,6 @@ build/
 .venv/
 venv/
 .env
-uv.lock
 
 # Project memory and plans (local only)
 MEMORY.md

@@ -77,8 +77,20 @@ clean-path:
 		fi; \
 	done
 
-.PHONY: install update uninstall venv pip-install link-add clean-path
 
 # ---- security scan ----
 lint-security:
 	bandit -r src/ -c pyproject.toml
+
+# ---- test targets ----
+test:
+	pytest tests/ -q -m "not ollama and not libclang and not slow"
+
+lint:
+	ruff check src/
+	mypy src/
+
+test-all:
+	pytest tests/ -q
+
+.PHONY: install update uninstall venv pip-install link-add clean-path test lint test-all
