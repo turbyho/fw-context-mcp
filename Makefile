@@ -13,7 +13,7 @@
 # Auto-detect source directory (the directory containing this Makefile)
 SRC       := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))
 VENV      ?= $(HOME)/.fw-context/.venv
-PYTHON    ?= python3.12
+PYTHON    ?= python3
 UV        := $(shell command -v uv 2>/dev/null)
 
 # ---- install ----
@@ -78,3 +78,7 @@ clean-path:
 	done
 
 .PHONY: install update uninstall venv pip-install link-add clean-path
+
+# ---- security scan ----
+lint-security:
+	bandit -r src/ -c pyproject.toml
