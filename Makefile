@@ -78,19 +78,25 @@ clean-path:
 	done
 
 
+# ---- dev setup (install all deps including pytest, ruff, mypy, bandit) ----
+dev: venv
+	@cd $(SRC) && $(UV) sync --extra dev
+	@echo ""
+	@echo "Dev environment ready. Run: make test, make lint, make lint-security"
+
 # ---- security scan ----
 lint-security:
-	bandit -r src/ -c pyproject.toml
+	$(VENV)/bin/bandit -r src/ -c pyproject.toml
 
 # ---- test targets ----
 test:
-	pytest tests/ -q -m "not ollama and not libclang and not slow"
+	$(VENV)/bin/pytest tests/ -q -m "not ollama and not libclang and not slow"
 
 lint:
-	ruff check src/
-	mypy src/
+	$(VENV)/bin/ruff check src/
+	$(VENV)/bin/mypy src/
 
 test-all:
-	pytest tests/ -q
+	$(VENV)/bin/pytest tests/ -q
 
-.PHONY: install update uninstall venv pip-install link-add clean-path test lint test-all
+.PHONY: install update uninstall venv pip-install link-add clean-path dev test lint lint-security test-all
