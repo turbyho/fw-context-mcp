@@ -1,6 +1,7 @@
 """fw-context-mcp — build-aware code intelligence for embedded projects."""
 
 import importlib.metadata
+import sqlite3 as _stdlib_sqlite3  # noqa: F401 — used by utils.is_db_exception()
 import sys
 
 try:

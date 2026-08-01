@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Any
 
 from fw_context_mcp.indexer.db import _expand_query, search_symbols
-from fw_context_mcp.utils import abs_path, is_fatal
+from fw_context_mcp.utils import abs_path, is_db_exception
 
 # ── Row → dict conversion ───────────────────────────────────────────────────
 
@@ -201,7 +201,7 @@ def _search_code_macros_fts(
             macro_dicts.append(d)
         return macro_dicts, "macros_fts"
     except Exception as exc:
-        if is_fatal(exc):
+        if not is_db_exception(exc):
             raise
         return None
 
