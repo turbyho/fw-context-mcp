@@ -104,11 +104,15 @@ def suggest(
     token_index: dict[str, list[str]] = defaultdict(list)
     # Prefix index: first 3 chars → set of tokens — narrows O(n) scan to O(1)
     prefix_index: dict[str, set[str]] = defaultdict(set)
+    # Short prefix index for 2-char tokens — avoids O(n) scan over all tokens
+    prefix_index_short: dict[str, set[str]] = defaultdict(set)
     for c in candidates:
         for t in _tokenize(c):
             token_index[t].append(c)
             if len(t) >= 3:
                 prefix_index[t[:3]].add(t)
+            elif len(t) == 2:
+                prefix_index_short[t].add(t)
 
     # Score candidates that share at least one token with the query
     scored: dict[str, float] = {}
@@ -117,9 +121,13 @@ def suggest(
         for c in token_index.get(qt, []):
             if c not in scored:
                 scored[c] = 0.0
-        # Prefix matches (e.g. query "uart" matches candidate token "uarte")
-        # Narrow scan: only tokens starting with the same prefix (first 3 chars)
-        candidate_tokens = prefix_index.get(qt[:3], set()) if len(qt) >= 3 else set(token_index.keys())
+        # Narrow scan for prefix matches by token length tier
+        if len(qt) >= 3:
+            candidate_tokens = prefix_index.get(qt[:3], set())
+        elif len(qt) == 2:
+            candidate_tokens = prefix_index_short.get(qt, set())
+        else:
+            candidate_tokens = set()  # 1-char: exact matches only
         for token in candidate_tokens:
             if token.startswith(qt) and token != qt:
                 for c in token_index.get(token, []):
