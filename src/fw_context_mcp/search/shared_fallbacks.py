@@ -180,25 +180,18 @@ def _search_code_macros_fts(
             return None
         macro_dicts: list[dict[str, Any]] = []
         for r in m_rows:
-            d: dict[str, Any] = {
-                "name": r["name"],
-                "qualified_name": r["name"],
+            extra: dict[str, Any] = {
                 "kind": "macro",
-                "file": abs_path(root, r["file_path"]),
-                "line": r["line"],
-                "is_definition": True,
+                "qualified_name": r["name"],
                 "signature": f"#define {r['name']}",
-                "docstring": "",
-                "is_template": False,
-                "is_virtual": False,
-                "is_pure_virtual": False,
+                "is_definition": True,
                 "_fallback": "macros_fts",
             }
             if r["value"]:
-                d["_macro_value"] = r["value"]
+                extra["_macro_value"] = r["value"]
             if r["expanded_value"]:
-                d["_macro_expanded_value"] = r["expanded_value"]
-            macro_dicts.append(d)
+                extra["_macro_expanded_value"] = r["expanded_value"]
+            macro_dicts.append(_symbol_row_to_dict(r, root, **extra))
         return macro_dicts, "macros_fts"
     except Exception as exc:
         if not is_db_exception(exc):
