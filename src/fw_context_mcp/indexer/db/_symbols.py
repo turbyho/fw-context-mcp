@@ -255,7 +255,6 @@ def _expand_query(query: str, *, for_body_search: bool = False) -> str:
         return query
 
     # Tokens that already are FTS5 syntax — don't touch them.
-    # Tokens that already are FTS5 syntax — don't touch them.
     # Single colon (not part of ::) covers column-filter expressions like
     # "name_tokens : term*" which would be corrupted by wildcard appending.
     _bare_syntax = ('"', "NEAR", "AND", "OR", "(", ")")
