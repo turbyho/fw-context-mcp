@@ -19,6 +19,7 @@ from __future__ import annotations
 import shutil
 import subprocess
 import sys
+import os
 from pathlib import Path
 
 import pytest
@@ -88,6 +89,12 @@ def _isolate_index_db(project_root: Path, tmp_dir: Path) -> None:
         f'[index]\ndb_dir = "{index_dir}"\n',
         encoding="utf-8",
     )
+
+
+def _advance_mtime(path: Path, seconds: float = 2.0) -> None:
+    """Set file mtime to current time + seconds to bypass MTIME_TOLERANCE_S."""
+    now = path.stat().st_mtime
+    os.utime(path, (now + seconds, now + seconds))
 def _write_file(path: Path, content: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(content, encoding="utf-8")
@@ -911,7 +918,6 @@ class TestAutoReindexStale:
 
     def test_stale_files_detected(self, indexed_project: Path):
         """_count_modified_files detects touched files."""
-        import time
 
         db_path = _db_path_for_project(indexed_project)
         conn = open_db(db_path)
@@ -926,10 +932,10 @@ class TestAutoReindexStale:
             mod_before = _count_modified_files(conn, ch, indexed_project)
             assert mod_before == 0, f"Expected 0 modified files, got {mod_before}"
 
-            # Sleep past MTIME_TOLERANCE_S (1.0 s), then touch a source file
-            time.sleep(1.2)
+            # Touch source file and advance mtime past MTIME_TOLERANCE_S
             src_file = indexed_project / "src" / "utils.c"
             src_file.touch()
+            _advance_mtime(src_file)
 
             mod_after = _count_modified_files(conn, ch, indexed_project)
             assert mod_after > 0, f"Modified file should be detected (got {mod_after})"
@@ -940,14 +946,13 @@ class TestAutoReindexStale:
 
     def test_auto_reindex_stale_integration(self, indexed_project: Path):
         """_auto_reindex_stale reindexes changed files successfully."""
-        import time
 
         from fw_context_mcp.mcp.shared.stale import _auto_reindex_stale
 
-        # Sleep past MTIME_TOLERANCE_S, then touch utils.c
-        time.sleep(1.2)
+        # Touch utils.c and advance mtime past MTIME_TOLERANCE_S
         utils_c = indexed_project / "src" / "utils.c"
         utils_c.touch()
+        _advance_mtime(utils_c)
 
         # Run auto-reindex
         ok, failed = _auto_reindex_stale(["src/utils.c"], str(indexed_project), max_files=5, timeout_s=30.0)
@@ -1863,7 +1868,6 @@ class TestLlvmAnalysisConsistency:
 
     def test_reindex_with_analysis_regenerates_for_changed_symbol(self, indexed_project_with_analysis: Path):
         """After modifying a function and reindexing with analysis, changed symbol gets new analysis."""
-        import time
 
         db_path = _db_path_for_project(indexed_project_with_analysis)
         conn = open_db(db_path)
@@ -1892,7 +1896,7 @@ class TestLlvmAnalysisConsistency:
         assert modified != original, "Modification didn't change the file"
         modem_c.write_text(modified, encoding="utf-8")
 
-        time.sleep(1.2)
+        _advance_mtime(modem_c)
         from fw_context_mcp.mcp.handlers.maintenance import reindex_file_impl
 
         result = reindex_file_impl("src/modem.c", str(indexed_project_with_analysis), with_analysis=True)
@@ -1925,7 +1929,6 @@ class TestLlvmAnalysisConsistency:
 
     def test_unchanged_symbol_keeps_analysis_after_reindex(self, indexed_project_with_analysis: Path):
         """Phase 3: unchanged symbol preserves original LLM analysis timestamp."""
-        import time
 
         db_path = _db_path_for_project(indexed_project_with_analysis)
         conn = open_db(db_path)
@@ -1954,7 +1957,7 @@ class TestLlvmAnalysisConsistency:
         )
         utils_c.write_text(modified, encoding="utf-8")
 
-        time.sleep(1.2)
+        _advance_mtime(utils_c)
         from fw_context_mcp.mcp.handlers.maintenance import reindex_file_impl
 
         result = reindex_file_impl("src/utils.c", str(indexed_project_with_analysis), with_analysis=True)
@@ -1986,7 +1989,6 @@ class TestLlvmAnalysisConsistency:
 
     def test_new_symbol_gets_analysis_after_reindex(self, indexed_project_with_analysis: Path):
         """Adding a new function and reindexing with analysis generates LLM analysis."""
-        import time
 
         utils_c = indexed_project_with_analysis / "src" / "utils.c"
         original = utils_c.read_text(encoding="utf-8")
@@ -2005,7 +2007,7 @@ int compute_average(const int* values, int count) {
 """
         utils_c.write_text(original.rstrip() + new_func + "\n", encoding="utf-8")
 
-        time.sleep(1.2)
+        _advance_mtime(utils_c)
         from fw_context_mcp.mcp.handlers.maintenance import reindex_file_impl
 
         result = reindex_file_impl("src/utils.c", str(indexed_project_with_analysis), with_analysis=True)
@@ -2108,7 +2110,6 @@ int compute_average(const int* values, int count) {
 
     def test_analysis_consistency_after_multiple_reindexes(self, indexed_project_with_analysis: Path):
         """Multiple reindexes of the same file don't corrupt or duplicate analysis."""
-        import time
 
         db_path = _db_path_for_project(indexed_project_with_analysis)
         conn = open_db(db_path)
@@ -2125,7 +2126,7 @@ int compute_average(const int* values, int count) {
         from fw_context_mcp.mcp.handlers.maintenance import reindex_file_impl
 
         for i in range(3):
-            time.sleep(1.2)
+            _advance_mtime(indexed_project_with_analysis / "src" / "modem.c")
             result = reindex_file_impl(
                 "src/modem.c",
                 str(indexed_project_with_analysis),
@@ -2519,13 +2520,12 @@ class TestFastStalenessCheck:
 
     def test_compile_commands_changed_detection(self, indexed_project: Path):
         """When compile_commands.json mtime is newer than index, it's detected."""
-        import time
 
         from fw_context_mcp.mcp.background import _fast_staleness_check
 
-        time.sleep(1.1)
         cc_json = indexed_project / "compile_commands.json"
         cc_json.touch()
+        _advance_mtime(cc_json)
 
         needs, reasons = _fast_staleness_check(indexed_project)
         assert needs, "Should detect compile_commands.json changed"
