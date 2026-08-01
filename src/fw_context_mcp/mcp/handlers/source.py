@@ -184,6 +184,36 @@ def _read_symbol_body(file_path: str, line_no: int, end_line: int = 0, max_lines
     local_end = find_closing_brace(window, local_start)
     return "\n".join(f"{read_start + i + 1:4d}  {window[i]}" for i in range(local_start, local_end + 1))
 
+
+# ── shared macro fallback ──
+def _try_macro_fallback(
+    conn: sqlite3.Connection, config_hash: str, name: str, root: Path,
+    *, include_empty_refs: bool = False,
+) -> dict | None:
+    """Look up *name* as a macro and return a standardised result dict.
+
+    Returns ``None`` when no matching macro is found so callers can chain
+    with ``if (m := _try_macro_fallback(...)): return m``.
+    """
+    macros = lookup_macro(conn, config_hash, name, exact=True, limit=1)
+    if not macros:
+        return None
+    m = macros[0]
+    result: dict = {
+        "name": m["name"],
+        "kind": "macro",
+        "file": abs_path(root, m["file_path"]),
+        "line": m["line"],
+        "signature": f"#define {m['name']}",
+        "source": f"#define {m['name']} {m['value']}",
+        "value": m["value"],
+    }
+    if m["expanded_value"]:
+        result["expanded_value"] = m["expanded_value"]
+    if include_empty_refs:
+        result["callers"] = []
+        result["callees"] = []
+    return result
 # ── moved from server.py ──
 async def explain_symbol(
     name: Annotated[str, Field(description="Symbol name to explain. E.g. 'uart_init', 'ModemMsg::send'.")],
@@ -228,19 +258,8 @@ async def explain_symbol(
         row = _lookup_definition(conn, config_hash, name, prefer_project=True)
         if not row:
             # Macro fallback
-            macros = lookup_macro(conn, config_hash, name, exact=True, limit=1)
-            if macros:
-                m = macros[0]
-                return {
-                    "name": m["name"],
-                    "kind": "macro",
-                    "file": abs_path(root, m["file_path"]),
-                    "line": m["line"],
-                    "signature": f"#define {m['name']}",
-                    "source": f"#define {m['name']} {m['value']}",
-                    **({"value": m["value"]}),
-                    **({"expanded_value": m["expanded_value"]} if m["expanded_value"] else {}),
-                }
+            if (m := _try_macro_fallback(conn, config_hash, name, root)):
+                return m
             return {"error": f"Symbol not found: {name}"}
         file_path = abs_path(root, row["file_path"])
         # Defense-in-depth: validate path is within project root
@@ -372,19 +391,8 @@ def get_source(
         row = _lookup_definition(conn, config_hash, name, prefer_project=True)
         if not row:
             # Macro fallback
-            macros = lookup_macro(conn, config_hash, name, exact=True, limit=1)
-            if macros:
-                m = macros[0]
-                return {
-                    "name": m["name"],
-                    "kind": "macro",
-                    "file": abs_path(root, m["file_path"]),
-                    "line": m["line"],
-                    "signature": f"#define {m['name']}",
-                    "source": f"#define {m['name']} {m['value']}",
-                    **({"value": m["value"]}),
-                    **({"expanded_value": m["expanded_value"]} if m["expanded_value"] else {}),
-                }
+            if (m := _try_macro_fallback(conn, config_hash, name, root)):
+                return m
             return {"error": f"Symbol not found: {name}"}
         file_path = abs_path(root, row["file_path"])
         # Defense-in-depth: validate path is within project root
@@ -743,21 +751,8 @@ def get_symbol_context(
         row = _lookup_definition(conn, config_hash, name, prefer_project=True)
         if not row:
             # Macro fallback — macros have no callers/callees, return basic info
-            macros = lookup_macro(conn, config_hash, name, exact=True, limit=1)
-            if macros:
-                m = macros[0]
-                return {
-                    "name": m["name"],
-                    "kind": "macro",
-                    "file": abs_path(root, m["file_path"]),
-                    "line": m["line"],
-                    "signature": f"#define {m['name']}",
-                    "source": f"#define {m['name']} {m['value']}",
-                    "value": m["value"],
-                    "expanded_value": m["expanded_value"] or None,
-                    "callers": [],
-                    "callees": [],
-                }
+            if (m := _try_macro_fallback(conn, config_hash, name, root, include_empty_refs=True)):
+                return m
             return {"error": f"Symbol not found: {name}"}
         file_path = abs_path(root, row["file_path"])
         # Defense-in-depth: validate path is within project root
