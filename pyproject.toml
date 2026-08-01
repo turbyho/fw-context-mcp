@@ -82,19 +82,19 @@ ignore = [
 known-first-party = ["fw_context_mcp"]
 
 [tool.mypy]
-python_version = "3.11"
+python_version = "3.14"
 ignore_missing_imports = true
 warn_unused_ignores = true
 warn_redundant_casts = true
 
 [tool.pytest.ini_options]
 addopts = [
-    "-m", "not system",
+    "-m", "not system and not slow",
     "--ignore=tests/builds/mbed_os/mbed-os/tools",
 ]
 testpaths = ["tests"]
 markers = [
-    "slow: tests that take longer than 2 seconds (full index/reindex via libclang)",
+    "slow: tests that run full indexing and take 30+ minutes — manual invocation only (make test-slow)",
     "ollama: tests that require a running Ollama instance",
     "libclang: tests that require libclang and a C compiler (gcc/clang)",
     "system: tests that require real build tools (gcc/CMake/Make/PlatformIO) and run index on test fixtures",
