@@ -5,6 +5,14 @@ from __future__ import annotations
 import sqlite3
 from collections import deque
 
+__all__ = [
+    "find_all_callers_recursive",
+    "find_call_path",
+    "find_callees_recursive",
+    "find_dead_code",
+    "find_hotspots",
+]
+
 # ---------------------------------------------------------------------------
 # Graph analytics — call-graph traversal via recursive CTE
 # ---------------------------------------------------------------------------
@@ -90,19 +98,28 @@ def _get_alias_pairs(conn: sqlite3.Connection, config_hash: str) -> list[tuple[s
     return pairs
 
 
-def _build_alias_values(alias_pairs: list[tuple[str, str]]) -> tuple[str, list[str]]:
-    """Build parameterized VALUES clause for alias pairs CTE.
+def _build_alias_temp_table(
+    conn: sqlite3.Connection, alias_pairs: list[tuple[str, str]]
+) -> tuple[str, list[str]]:
+    """Populate temp table with alias pairs, return CTE fragment.
 
-    Returns ``(values_clause, params)`` where *values_clause* is a SQL
-    VALUES expression with ``?`` placeholders and *params* is the
-    flattened list of USR values.  Returns ``("", [])`` when
-    *alias_pairs* is empty.
+    Uses a temporary table instead of a VALUES clause to avoid hitting
+    ``SQLITE_LIMIT_COMPOUND_SELECT`` (default 500) when there are many
+    alias pairs.  Returns ``(cte_fragment, [])`` where *cte_fragment*
+    is ``"alias_pairs(decl_usr, def_usr) AS (SELECT * FROM _alias_pairs),"``
+    or ``""`` when *alias_pairs* is empty.
     """
     if not alias_pairs:
         return "", []
-    placeholders = ", ".join("(?, ?)" for _ in alias_pairs)
-    params = [v for pair in alias_pairs for v in pair]
-    return f"({placeholders})", params
+    conn.execute(
+        "CREATE TEMP TABLE IF NOT EXISTS _alias_pairs(decl_usr TEXT, def_usr TEXT)"
+    )
+    conn.execute("DELETE FROM _alias_pairs")
+    conn.executemany("INSERT INTO _alias_pairs VALUES (?, ?)", alias_pairs)
+    return (
+        "alias_pairs(decl_usr, def_usr) AS (SELECT * FROM _alias_pairs),",
+        [],
+    )
 
 
 def _bridge_weak_aliases(
@@ -252,15 +269,14 @@ def find_all_callers_recursive(
     # Build extended refs: real refs + synthetic weak-alias edges.
     # When someone calls decl_usr (alias), they also effectively call def_usr.
     alias_pairs = _get_alias_pairs(conn, config_hash)
-    alias_values, alias_params = _build_alias_values(alias_pairs)
-    alias_cte = f"""alias_pairs(decl_usr, def_usr) AS (VALUES {alias_values}),""" if alias_values else ""
+    alias_cte, alias_params = _build_alias_temp_table(conn, alias_pairs)
     alias_join = (
         """UNION ALL
         SELECT r.from_usr, ap.def_usr
         FROM refs r
         JOIN alias_pairs ap ON r.to_usr = ap.decl_usr
         WHERE r.config_hash = ?"""
-        if alias_values
+        if alias_cte
         else ""
     )
 
@@ -299,8 +315,8 @@ def find_all_callers_recursive(
         ORDER BY d.depth, COALESCE(s_def.name, s_any.name)
         LIMIT ?"""
 
-    params: list[object] = [*alias_params, config_hash]
-    if alias_values:
+    params: list[object] = [config_hash]
+    if alias_cte:
         params.append(config_hash)
     params.extend([target_usr, max_depth, config_hash, config_hash, limit])
 
@@ -328,15 +344,14 @@ def find_callees_recursive(
     # When decl_usr is an alias for def_usr, anything def_usr calls should
     # also be reachable from decl_usr.
     alias_pairs = _get_alias_pairs(conn, config_hash)
-    alias_values, alias_params = _build_alias_values(alias_pairs)
-    alias_cte = f"""alias_pairs(decl_usr, def_usr) AS (VALUES {alias_values}),""" if alias_values else ""
+    alias_cte, alias_params = _build_alias_temp_table(conn, alias_pairs)
     alias_join = (
         """UNION ALL
         SELECT ap.decl_usr, r.to_usr
         FROM refs r
         JOIN alias_pairs ap ON r.from_usr = ap.def_usr
         WHERE r.config_hash = ?"""
-        if alias_values
+        if alias_cte
         else ""
     )
 
@@ -375,8 +390,8 @@ def find_callees_recursive(
         ORDER BY d.depth, COALESCE(s_def.name, s_any.name)
         LIMIT ?"""
 
-    params: list[object] = [*alias_params, config_hash]
-    if alias_values:
+    params: list[object] = [config_hash]
+    if alias_cte:
         params.append(config_hash)
     params.extend([source_usr, max_depth, config_hash, config_hash, limit])
 

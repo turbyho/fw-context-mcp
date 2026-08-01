@@ -54,12 +54,27 @@ def _gpu_available() -> bool:
         return False
 
 
+def _model_name_matches(installed_name: str, configured_name: str) -> bool:
+    """Check if *installed_name* matches *configured_name*.
+
+    Matches exact name, tag variants (``model:tag``), and quantized
+    variants (``model-q4_K_M``).  Does NOT match different versions of
+    the same base model (``qwen3-embedding:0.6b`` does NOT match
+    ``qwen3-embedding:8b``).
+    """
+    return (
+        installed_name == configured_name
+        or installed_name.startswith(configured_name + ":")
+        or installed_name.startswith(configured_name + "-")
+    )
+
+
 def _model_installed(ollama_url: str, model: str) -> bool:
     """Check if *model* is installed in Ollama.
 
-    Matches exact name or suffixed variants (e.g. ``qwen3-embedding:8b-q4_K_M``
-    matches query ``qwen3-embedding:8b``).  Does NOT match different versions
-    of the same base model (``qwen3-embedding:0.6b`` does NOT match query
+    Matches exact name, tag variants (``model:tag``), and suffixed
+    variants (``model-q4_K_M``).  Does NOT match different versions
+    of the same base model (``qwen3-embedding:0.6b`` does NOT match
     ``qwen3-embedding:8b``).
     """
     import httpx
@@ -71,11 +86,8 @@ def _model_installed(ollama_url: str, model: str) -> bool:
         )
         resp.raise_for_status()
         models = resp.json().get("models", [])
-        installed = {m["name"] for m in models}
-        if model in installed:
-            return True
-        # Match suffixed variants of the same version (e.g. 8b → 8b-q4_K_M)
-        return any(m.startswith(model + "-") for m in installed)
+        installed = [m["name"] for m in models]
+        return any(_model_name_matches(m, model) for m in installed)
     except (ValueError, TypeError, RuntimeError, AttributeError, OSError, httpx.HTTPError):
         return False
 
@@ -148,7 +160,6 @@ def resolve_embed_model(cfg: LLMConfig) -> None:
     # Worst case on first call: two threads both check/pull — harmless
     # best-effort operations with short timeouts.
     _apply_prompt_defaults(cfg)
-
 
     if _model_installed(cfg.ollama_url, target):
         log.info("Auto-detected embed model: %s (GPU=%s, already installed)", target, gpu)
