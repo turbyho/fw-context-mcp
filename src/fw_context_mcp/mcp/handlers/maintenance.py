@@ -731,6 +731,124 @@ def _update_manifest_after_reindex(
         log.debug("manifest.json update skipped during reindex_file", exc_info=True)
 
 
+def _reindex_llm_analysis(
+    conn: sqlite3.Connection,
+    config_hash: str,
+    cfg: Config,
+    db_dir: Path,
+    result: dict,
+) -> None:
+    """Regenerate LLM symbol analysis for reindexed symbols."""
+    if not (cfg.llm.enabled and cfg.llm.analyze_symbols):
+        return
+    try:
+        from ...cache_client import CacheClient
+        from ...indexer._llm_analysis import _build_llm_analysis
+        try:
+            stored_av = bool(
+                conn.execute(
+                    "SELECT analyze_vendor FROM build_configs WHERE config_hash = ?",
+                    (config_hash,),
+                ).fetchone()["analyze_vendor"]
+            )
+        except sqlite3.OperationalError:
+            stored_av = False
+        cc = CacheClient.from_config(cfg)
+        try:
+            _build_llm_analysis(
+                conn, config_hash, cfg.llm, db_dir,
+                write_lock_held=False, retry_unparseable=True,
+                cache_client=cc, project_only=not stored_av,
+            )
+            conn.commit()
+        finally:
+            if cc:
+                cc.close()
+        analyzed_count = conn.execute(
+            "SELECT COUNT(*) FROM llm_analysis a JOIN symbols s ON s.id = a.symbol_id WHERE s.config_hash = ?",
+            (config_hash,),
+        ).fetchone()[0]
+        result["analysis_updated"] = analyzed_count
+    except (sqlite3.Error, RuntimeError, OSError) as exc:
+        result["analysis_warning"] = f"LLM analysis skipped: {exc}"
+
+
+def _reindex_overrides(
+    conn: sqlite3.Connection,
+    config_hash: str,
+    cfg: Config,
+    db_dir: Path,
+    result: dict,
+) -> None:
+    """Rebuild method override relationships."""
+    if not cfg.index.index_refs:
+        return
+    try:
+        from ...indexer.runner import _build_overrides
+        _build_overrides(conn, config_hash, db_dir, write_lock_held=False, force=True)
+        conn.commit()
+    except (sqlite3.Error, RuntimeError) as exc:
+        result["overrides_warning"] = f"Override analysis skipped: {exc}"
+
+
+def _reindex_pagerank(
+    conn: sqlite3.Connection,
+    config_hash: str,
+    cfg: Config,
+    result: dict,
+) -> None:
+    """Rebuild PageRank and hotspot cache."""
+    if not cfg.index.index_refs:
+        return
+    try:
+        from ...indexer.runner import _build_hotspot_cache, _build_pagerank
+        _build_pagerank(conn, config_hash, write_lock_held=False, force=True)
+        _build_hotspot_cache(conn, config_hash, force=True)
+        conn.commit()
+    except (sqlite3.Error, RuntimeError) as exc:
+        result["pagerank_warning"] = f"PageRank/hotspot recompute skipped: {exc}"
+
+
+def _reindex_embeddings(
+    conn: sqlite3.Connection,
+    config_hash: str,
+    cfg: Config,
+    db_dir: Path,
+    target: Path,
+    root: Path,
+    result: dict,
+) -> None:
+    """Regenerate vector embeddings for reindexed symbols."""
+    if not cfg.llm.enabled:
+        return
+    from ...indexer.ops import _normalize_file_path
+    try:
+        from ...indexer.runner import _build_embeddings as _reembed
+        file_symbol_ids = [
+            r[0] for r in conn.execute(
+                "SELECT id FROM symbols WHERE config_hash = ? AND file_path = ?",
+                (config_hash, _normalize_file_path(str(target), root)),
+            ).fetchall()
+        ]
+        if file_symbol_ids:
+            _reembed(conn, config_hash, cfg.llm, db_dir, symbol_ids=file_symbol_ids)
+        else:
+            log.warning(
+                "No symbols found for path %s in DB — skipping embedding regeneration "
+                "(this may happen for files outside the project root or after a symlink change)",
+                target,
+            )
+        conn.commit()
+        reembedded = conn.execute(
+            "SELECT COUNT(DISTINCT symbol_id) FROM embeddings e "
+            "JOIN symbols s ON s.id = e.symbol_id WHERE s.config_hash = ?",
+            (config_hash,),
+        ).fetchone()[0]
+        result["embeddings_updated"] = reembedded
+    except (sqlite3.Error, RuntimeError, OSError) as exc:
+        result["embedding_warning"] = f"Embedding regeneration skipped: {exc}"
+
+
 def _reindex_post_write_phases(
     conn: sqlite3.Connection,
     config_hash: str,
@@ -742,89 +860,24 @@ def _reindex_post_write_phases(
     result: dict,
     root: Path,
 ) -> dict:
-    """Run post-write enrichment phases: LLM analysis, overrides, pagerank, embeddings."""
-    if cfg.llm.enabled and cfg.llm.analyze_symbols and total_symbols > 0:
-        try:
-            from ...cache_client import CacheClient
-            from ...indexer._llm_analysis import _build_llm_analysis
-            try:
-                stored_av = bool(
-                    conn.execute(
-                        "SELECT analyze_vendor FROM build_configs WHERE config_hash = ?",
-                        (config_hash,),
-                    ).fetchone()["analyze_vendor"]
-                )
-            except sqlite3.OperationalError:
-                stored_av = False
-            cc = CacheClient.from_config(cfg)
-            try:
-                _build_llm_analysis(
-                    conn, config_hash, cfg.llm, db_dir,
-                    write_lock_held=False, retry_unparseable=True,
-                    cache_client=cc, project_only=not stored_av,
-                )
-                conn.commit()
-            finally:
-                if cc:
-                    cc.close()
-            analyzed_count = conn.execute(
-                "SELECT COUNT(*) FROM llm_analysis a JOIN symbols s ON s.id = a.symbol_id WHERE s.config_hash = ?",
-                (config_hash,),
-            ).fetchone()[0]
-            result["analysis_updated"] = analyzed_count
-        except (sqlite3.Error, RuntimeError, OSError) as exc:
-            result["analysis_warning"] = f"LLM analysis skipped: {exc}"
+    """Run post-write enrichment phases after reindex_file.
 
-    if total_symbols > 0 and cfg.index.index_refs:
-        try:
-            from ...indexer.runner import _build_overrides
-            _build_overrides(conn, config_hash, db_dir, write_lock_held=False, force=True)
-            conn.commit()
-        except (sqlite3.Error, RuntimeError) as exc:
-            result["overrides_warning"] = f"Override analysis skipped: {exc}"
+    Each phase is independent — failure in one does not prevent others.
+    """
+    if total_symbols <= 0:
+        return result
 
-    if cfg.index.index_refs and total_symbols > 0:
-        try:
-            from ...indexer.runner import _build_hotspot_cache, _build_pagerank
-            _build_pagerank(conn, config_hash, write_lock_held=False, force=True)
-            _build_hotspot_cache(conn, config_hash, force=True)
-            conn.commit()
-        except (sqlite3.Error, RuntimeError) as exc:
-            result["pagerank_warning"] = f"PageRank/hotspot recompute skipped: {exc}"
+    _reindex_llm_analysis(conn, config_hash, cfg, db_dir, result)
+    _reindex_overrides(conn, config_hash, cfg, db_dir, result)
+    _reindex_pagerank(conn, config_hash, cfg, result)
 
     if len(matching) == 1 and target.suffix.lower() in {".h", ".hpp"}:
         result["warning"] = (
-            "Header re-indexed via one TU. Other TUs including this header may still have stale symbols — run 'fw-context index' for full accuracy."
+            "Header re-indexed via one TU. Other TUs including this header "
+            "may still have stale symbols — run 'fw-context index' for full accuracy."
         )
 
-    if cfg.llm.enabled and total_symbols > 0:
-        from ...indexer.ops import _normalize_file_path
-        try:
-            from ...indexer.runner import _build_embeddings as _reembed
-            file_symbol_ids = [
-                r[0] for r in conn.execute(
-                    "SELECT id FROM symbols WHERE config_hash = ? AND file_path = ?",
-                    (config_hash, _normalize_file_path(str(target), root)),
-                ).fetchall()
-            ]
-            if file_symbol_ids:
-                _reembed(conn, config_hash, cfg.llm, db_dir, symbol_ids=file_symbol_ids)
-            else:
-                log.warning(
-                    "No symbols found for path %s in DB — skipping embedding regeneration "
-                    "(this may happen for files outside the project root or after a symlink change)",
-                    target,
-                )
-            conn.commit()
-            reembedded = conn.execute(
-                "SELECT COUNT(DISTINCT symbol_id) FROM embeddings e "
-                "JOIN symbols s ON s.id = e.symbol_id WHERE s.config_hash = ?",
-                (config_hash,),
-            ).fetchone()[0]
-            result["embeddings_updated"] = reembedded
-        except (sqlite3.Error, RuntimeError, OSError) as exc:
-            result["embedding_warning"] = f"Embedding regeneration skipped: {exc}"
-
+    _reindex_embeddings(conn, config_hash, cfg, db_dir, target, root, result)
     return result
 
 
