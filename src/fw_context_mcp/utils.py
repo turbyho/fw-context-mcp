@@ -18,6 +18,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 import subprocess
 
+from fw_context_mcp import _stdlib_sqlite3
+
 __all__ = [
     "MTIME_TOLERANCE_S",
     "abs_path",
@@ -25,6 +27,7 @@ __all__ = [
     "compute_source_hash",
     "fmt_count",
     "is_compile_commands_stale",
+    "is_db_exception",
     "is_fatal",
     "read_file_lines",
     "resolve_project_root",
@@ -48,6 +51,36 @@ SAFE_EXCEPT = (
 def is_fatal(exc: BaseException) -> bool:
     """Return True for exceptions that must never be swallowed."""
     return isinstance(exc, (KeyboardInterrupt, SystemExit, MemoryError, SystemError))
+
+
+def is_db_exception(exc: BaseException) -> bool:
+    """Return True for sqlite3 database exceptions from either stdlib or pysqlite3.
+
+    After :mod:`fw_context_mcp` redirects ``sqlite3`` → ``pysqlite3``, internal
+    ``sqlite3.Error`` resolves to ``pysqlite3.dbapi2.Error``, but
+    externally‑created connections raise stdlib ``sqlite3.Error`` — a
+    different C‑extension type.  This helper matches both.
+
+    Always call **before** :func:`is_fatal` — fatal exceptions
+    (:class:`KeyboardInterrupt`, :class:`SystemExit`, :class:`MemoryError`)
+    are not DB errors and must propagate.
+
+    Usage::
+
+        try:
+            rows = conn.execute(...).fetchall()
+        except Exception as exc:
+            if not is_db_exception(exc):
+                raise
+            return None
+    """
+    if is_fatal(exc):
+        return False
+    if isinstance(exc, sqlite3.Error):
+        return True
+    if _stdlib_sqlite3 is not None and isinstance(exc, _stdlib_sqlite3.Error):
+        return True
+    return False
 
 def run_build_command(
     cmd: list[str],

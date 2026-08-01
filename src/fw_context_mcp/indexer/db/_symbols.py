@@ -6,6 +6,8 @@ import logging
 import re
 import sqlite3
 
+from fw_context_mcp.utils import is_db_exception
+
 __all__ = [
     "_expand_query",
     "delete_macros_for_file",
@@ -232,7 +234,9 @@ def find_macro_refs(
                LIMIT ?""",
             (expanded, config_hash, limit),
         ).fetchall()
-    except sqlite3.OperationalError:
+    except Exception as exc:
+        if not is_db_exception(exc):
+            raise
         return []
 
 
