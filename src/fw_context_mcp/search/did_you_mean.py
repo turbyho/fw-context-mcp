@@ -24,6 +24,9 @@ _cache: dict[str, tuple[float, list[str]]] = {}
 _MAX_CACHE = 128
 _CACHE_TTL_S = 300  # Invalidate after 5 minutes (matches keyword_cache)
 _cache_lock = threading.Lock()
+# Set of cache keys currently being computed — prevents stampede when
+# multiple threads query the same unmatched name simultaneously.
+_in_flight: set[str] = set()
 
 # Characters that delimit tokens in symbol names
 _TOKEN_SPLIT = re.compile(r"[_]+")
@@ -76,13 +79,15 @@ def suggest(
     cache_key = f"{config_hash}:{name}"
     with _cache_lock:
         if cache_key in _cache:
-            cached_val = _cache[cache_key]
-            if cached_val is not None:  # guard against stampede sentinel
-                ts, cached = cached_val
-                if time.monotonic() - ts < _CACHE_TTL_S:
-                    return cached[:limit]
+            ts, cached = _cache[cache_key]
+            if time.monotonic() - ts < _CACHE_TTL_S:
+                return cached[:limit]
             del _cache[cache_key]
-        _cache[cache_key] = None  # type: ignore[assignment]  # stampede sentinel
+        # Stampede guard: another thread is already computing this key.
+        # Return empty early — the result will be cached for next time.
+        if cache_key in _in_flight:
+            return []
+        _in_flight.add(cache_key)
 
     t0 = time.monotonic()
     candidates = _load_names(conn, config_hash)
@@ -135,6 +140,7 @@ def suggest(
     matches = [r[0] for r in results[:limit]]
 
     with _cache_lock:
+        _in_flight.discard(cache_key)
         if _cache:
             if len(_cache) >= _MAX_CACHE:
                 _cache.pop(next(iter(_cache)))
