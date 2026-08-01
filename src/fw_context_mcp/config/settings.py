@@ -432,8 +432,6 @@ def _from_dict(data: dict) -> Config:
     Each mapping entry: (toml_key, attr_name, converter).
     Converters: "str" | "bool" | "list" | "dict" | "path" | "int(N)" | "float(N)"
     """
-    import logging
-    log = logging.getLogger(__name__)
     cfg = Config()
 
     # ── [project] ──
@@ -704,9 +702,6 @@ def load(project_root: Path | None = None) -> Config:
     Results are cached per (global_path, proj_path, local_path) tuple and
     invalidated when any source file's mtime changes.
     """
-    import logging
-
-    log = logging.getLogger(__name__)
     data: dict = {}
 
     global_path = _ensure_global_config()

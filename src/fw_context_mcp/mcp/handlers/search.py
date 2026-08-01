@@ -18,9 +18,14 @@ from ...utils import abs_path, resolve_project_root
 from ..shared.context import _db_path, _is_stale, _open_db_or_return
 from ..shared.fallback import _fallback_to_search_code
 from ..shared.stale import _with_stale_recovery
+from ._lookup import lookup_symbol
 from ._search_fallbacks import (
     _SEARCH_CODE_FALLBACKS,
+    _fmt_symbol_rows,
+    _search_code_docstring,
     _search_code_fts5_kind,
+    _search_code_macros_fts,
+    _search_code_name_tokens,
 )
 
 log = logging.getLogger(__name__)
@@ -314,6 +319,8 @@ async def semantic_search(
         # Delegate to the semantic search pipeline (EmbeddingPhase + FormatPhase).
         # The pipeline handles embedding generation, KNN search, and source-aware
         # boosting internally.
+        from fw_context_mcp.search.context import PipelineContext
+
         try:
             ctx = PipelineContext.create(
                 query=query, project_root=str(root), limit=limit
@@ -469,7 +476,7 @@ def search_bodies(
             params.append(kind)
         if project_only:
             project_filter = "AND s.is_project = 1"
-        params.append(limit if not project_only else limit * 3)
+        params.append(limit * 3 if not project_only else limit)
 
         rows = c.execute(
             f"""SELECT s.*, snippet(symbols_fts, 9, '<b>', '</b>', '…', 60) AS _match_snippet

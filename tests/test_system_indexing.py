@@ -940,22 +940,25 @@ class TestConfigHashStability:
         assert cc.exists(), "Run CMake init+index test first to generate cc.json"
         units1 = list(parse_cc(cc))
         units2 = list(parse_cc(cc))
-        h1 = compute_structural_hash(cc, cc.parent.parent, units1)
-        h2 = compute_structural_hash(cc, cc.parent.parent, units2)
+        h1 = compute_structural_hash(cc, cc.parent, units1)
+        h2 = compute_structural_hash(cc, cc.parent, units2)
         assert h1 == h2
 
     def test_config_hash_changes_with_different_cc(self, tmp_path):
+        from pathlib import Path
+
         from fw_context_mcp.indexer.compile_commands import parse as parse_cc
         from fw_context_mcp.indexer.manifest import compute_structural_hash
 
+        project_root = Path(__file__).parent / "builds" / "bare"
         cc1 = tmp_path / "cc1.json"
         cc2 = tmp_path / "cc2.json"
         cc1.write_text(json.dumps([{"file": "a.c", "directory": str(tmp_path), "arguments": ["gcc", "-c", "a.c"]}]))
         cc2.write_text(json.dumps([{"file": "b.c", "directory": str(tmp_path), "arguments": ["gcc", "-c", "b.c"]}]))
         units1 = list(parse_cc(cc1))
         units2 = list(parse_cc(cc2))
-        h1 = compute_structural_hash(cc1, tmp_path, units1)
-        h2 = compute_structural_hash(cc2, tmp_path, units2)
+        h1 = compute_structural_hash(cc1, project_root, units1)
+        h2 = compute_structural_hash(cc2, project_root, units2)
         assert h1 != h2
 
 

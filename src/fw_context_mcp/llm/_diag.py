@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import httpx
-
 from fw_context_mcp.config.settings import LLMConfig
 from fw_context_mcp.llm.auto_model import _model_name_matches
 
@@ -19,6 +17,7 @@ def check_setup(cfg: LLMConfig) -> dict:
         message (str, on error), latency_s, embedding_model,
         embedding_installed}.
     """
+    import httpx
     base_url = cfg.ollama_url.rstrip("/")
     try:
         resp = httpx.get(base_url + "/api/tags", timeout=5.0)
