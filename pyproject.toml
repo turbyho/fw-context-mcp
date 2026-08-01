@@ -16,6 +16,7 @@ dependencies = [
     "mcp[cli]>=1.0.0",
     "pysqlite3>=0.5.0",
     "sqlite-vec>=0.1.0",
+    "tomli-w>=1.2.0",
     "watchfiles>=0.21",
 ]
 
