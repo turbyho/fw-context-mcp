@@ -12,6 +12,7 @@ the strategy found no matches or is not applicable to the query shape.
 from __future__ import annotations
 
 import sqlite3
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -19,6 +20,12 @@ from fw_context_mcp.indexer.db import _expand_query, search_symbols
 from fw_context_mcp.utils import abs_path, is_db_exception
 
 # ── Row → dict conversion ───────────────────────────────────────────────────
+
+
+FallbackFunc = Callable[
+    [sqlite3.Connection, str, str, int, str | None, bool, Path],
+    tuple[list[dict[str, Any]], str] | None,
+]
 
 
 def _symbol_row_to_dict(r: sqlite3.Row, root: Path, **extra) -> dict[str, Any]:
@@ -75,7 +82,7 @@ def _fmt_symbol_rows(rows: list, root: Path, method: str) -> tuple[list[dict[str
 
 def _search_code_name_tokens(
     c: sqlite3.Connection, query: str, config_hash: str,
-    limit: int, _kind: str | None, _project_only: bool,
+    limit: int, _kind: str | None, project_only: bool,
     root: Path,
 ) -> tuple[list[dict[str, Any]], str] | None:
     """Token-based LIKE fallback — matches CamelCase/snake_case token splits."""
@@ -92,7 +99,7 @@ def _search_code_name_tokens(
         )
         like_params.append(f"%{escaped}%")
     match_sum = " + ".join(like_cases)
-    project_filter = "AND s.is_project = 1" if _project_only else ""
+    project_filter = "AND s.is_project = 1" if project_only else ""
     rows = c.execute(
         f"""SELECT * FROM (
             SELECT s.*, ({match_sum}) AS _match_cnt FROM symbols s
@@ -109,7 +116,7 @@ def _search_code_name_tokens(
 
 def _search_code_docstring(
     c: sqlite3.Connection, query: str, config_hash: str,
-    limit: int, _kind: str | None, _project_only: bool,
+    limit: int, _kind: str | None, project_only: bool,
     root: Path,
 ) -> tuple[list[dict[str, Any]], str] | None:
     """Single-term docstring LIKE fallback — only runs for 1-word queries."""
@@ -117,7 +124,7 @@ def _search_code_docstring(
     if len(terms) != 1:
         return None
     escaped = terms[0].replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
-    project_filter = "AND s.is_project = 1" if _project_only else ""
+    project_filter = "AND s.is_project = 1" if project_only else ""
     rows = c.execute(
         f"""SELECT s.* FROM symbols s
            WHERE s.config_hash = ? {project_filter} AND s.docstring LIKE ? ESCAPE '\\'
@@ -159,13 +166,13 @@ def _search_code_individual_terms(
 
 def _search_code_macros_fts(
     c: sqlite3.Connection, query: str, config_hash: str,
-    limit: int, _kind: str | None, _project_only: bool,
+    limit: int, _kind: str | None, project_only: bool,
     root: Path,
 ) -> tuple[list[dict[str, Any]], str] | None:
     """Macro FTS fallback — searches ``#define`` names and values."""
     try:
         expanded = _expand_query(query)
-        project_filter = "AND f.is_project = 1" if _project_only else ""
+        project_filter = "AND f.is_project = 1" if project_only else ""
         m_rows = c.execute(
             f"""SELECT m.*, f.path AS file_path
                FROM macros_fts
@@ -201,7 +208,7 @@ def _search_code_macros_fts(
 
 # ── Ordered fallback chain ───────────────────────────────────────────────────
 
-_SEARCH_CODE_FALLBACKS: list = [
+_SEARCH_CODE_FALLBACKS: list[FallbackFunc] = [
     _search_code_name_tokens,
     _search_code_docstring,
     _search_code_individual_terms,

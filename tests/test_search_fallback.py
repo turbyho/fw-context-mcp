@@ -79,7 +79,7 @@ class TestLikeEscaping:
 
         result = _search_code_name_tokens(
             search_conn, "normal", "test",
-            limit=10, _kind=None, _project_only=False,
+            limit=10, _kind=None, project_only=False,
             root=Path("/tmp"),
         )
         assert result is not None
@@ -93,7 +93,7 @@ class TestLikeEscaping:
 
         result = _search_code_name_tokens(
             search_conn, "zzzxyz", "test",
-            limit=10, _kind=None, _project_only=False,
+            limit=10, _kind=None, project_only=False,
             root=Path("/tmp"),
         )
         assert result is None
@@ -104,7 +104,7 @@ class TestLikeEscaping:
 
         result = _search_code_name_tokens(
             search_conn, "_", "test",
-            limit=10, _kind=None, _project_only=False,
+            limit=10, _kind=None, project_only=False,
             root=Path("/tmp"),
         )
         assert result is None
@@ -115,7 +115,7 @@ class TestLikeEscaping:
 
         result = _search_code_docstring(
             search_conn, "normal", "test",
-            limit=10, _kind=None, _project_only=False,
+            limit=10, _kind=None, project_only=False,
             root=Path("/tmp"),
         )
         assert result is not None
@@ -129,7 +129,7 @@ class TestLikeEscaping:
 
         result = _search_code_docstring(
             search_conn, "normal function", "test",
-            limit=10, _kind=None, _project_only=False,
+            limit=10, _kind=None, project_only=False,
             root=Path("/tmp"),
         )
         assert result is None
@@ -192,7 +192,7 @@ class TestFallbackChain:
 
         result = _search_code_macros_fts(
             conn, "DEBUG", "test", limit=10, _kind=None,
-            _project_only=False, root=Path("/tmp"),
+            project_only=False, root=Path("/tmp"),
         )
         assert result is None
 
@@ -224,7 +224,7 @@ class TestFallbackChain:
 
         # "%" alone is too short → filtered out → None
         result = _search_code_name_tokens(
-            conn, "%", "test", limit=10, _kind=None, _project_only=False,
+            conn, "%", "test", limit=10, _kind=None, project_only=False,
             root=Path("/tmp"),
         )
         assert result is None  # len <= 1 → filtered
