@@ -21,7 +21,7 @@ from ...indexer.db import (
     get_template_instances as query_template_instances,
 )
 from ...utils import abs_path
-from ..shared.context import _resolve_handler_context
+from ._base import BaseHandler
 from .source import _lookup_definition
 
 log = logging.getLogger(__name__)
@@ -69,14 +69,15 @@ def get_inheritance_chain(
             all_derived: [...] (when transitive=True, descendants sorted by depth)
         }
     """
-    ctx, err = _resolve_handler_context(project_root)
-    if err:
-        return err[0]
     try:
-        with ctx.conn:
-            config_hash = ctx.config_hash
-            root = ctx.root
-            row = _lookup_definition(ctx.conn, config_hash, class_name,
+        db = BaseHandler.resolve_db_context(project_root)
+    except RuntimeError as e:
+        return {"error": str(e)}
+    try:
+        with db.conn:
+            config_hash = db.config_hash
+            root = db.root
+            row = _lookup_definition(db.conn, config_hash, class_name,
                                      preferred_kinds=("class", "struct"))
             if not row:
                 return {"error": f"Symbol not found: {class_name}"}
@@ -93,7 +94,7 @@ def get_inheritance_chain(
             }
 
             # ── Direct base classes (parents) ──
-            bases = get_direct_bases(ctx.conn, config_hash, usr)
+            bases = get_direct_bases(db.conn, config_hash, usr)
             result["bases"] = [
                 {
                     "name": b.get("base_name") or "<unknown>",
@@ -106,7 +107,7 @@ def get_inheritance_chain(
             ]
 
             # ── Direct derived classes (children) ──
-            derived = get_direct_derived(ctx.conn, config_hash, usr)
+            derived = get_direct_derived(db.conn, config_hash, usr)
             result["derived"] = [
                 {
                     "name": d.get("derived_name") or "<unknown>",
@@ -147,14 +148,14 @@ def get_inheritance_chain(
                     level_usrs = [u for u, _, _ in current_level]
                     # Batch lookup symbols for all USRs at this depth
                     placeholders = ",".join("?" * len(level_usrs))
-                    symbol_rows = ctx.conn.execute(
+                    symbol_rows = db.conn.execute(
                         f"SELECT usr, name, kind, file_path FROM symbols WHERE config_hash=? AND usr IN ({placeholders})",
                         (config_hash, *level_usrs),
                     ).fetchall()
                     symbol_map: dict[str, sqlite3.Row] = {r["usr"]: r for r in symbol_rows}
 
                     # Batch lookup bases for the next depth
-                    bases_batch = get_direct_bases_batch(ctx.conn, config_hash, level_usrs)
+                    bases_batch = get_direct_bases_batch(db.conn, config_hash, level_usrs)
 
                     # Build results and next level
                     next_level: list[tuple[str, str, bool]] = []
@@ -199,13 +200,13 @@ def get_inheritance_chain(
 
                     level_usrs = [u for u, _, _ in current_level]
                     placeholders = ",".join("?" * len(level_usrs))
-                    symbol_rows = ctx.conn.execute(
+                    symbol_rows = db.conn.execute(
                         f"SELECT usr, name, kind, file_path FROM symbols WHERE config_hash=? AND usr IN ({placeholders})",
                         (config_hash, *level_usrs),
                     ).fetchall()
                     symbol_map = {r["usr"]: r for r in symbol_rows}
 
-                    derived_batch = get_direct_derived_batch(ctx.conn, config_hash, level_usrs)
+                    derived_batch = get_direct_derived_batch(db.conn, config_hash, level_usrs)
 
                     next_level = []
                     for cur_usr, access, is_virtual in current_level:
@@ -258,14 +259,15 @@ def get_class_members(
         [{name, qualified_name, signature, is_virtual, is_pure_virtual,
         line}]}, member_count}
     """
-    ctx, err = _resolve_handler_context(project_root)
-    if err:
-        return err[0]
     try:
-        with ctx.conn:
-            config_hash = ctx.config_hash
-            root = ctx.root
-            row = _lookup_definition(ctx.conn, config_hash, class_name,
+        db = BaseHandler.resolve_db_context(project_root)
+    except RuntimeError as e:
+        return {"error": str(e)}
+    try:
+        with db.conn:
+            config_hash = db.config_hash
+            root = db.root
+            row = _lookup_definition(db.conn, config_hash, class_name,
                                      preferred_kinds=("class", "struct"))
             if not row:
                 return {"error": f"Symbol not found: {class_name}"}
@@ -282,7 +284,7 @@ def get_class_members(
             }
 
             # ── Members grouped by kind ──
-            members = query_class_members(ctx.conn, config_hash, usr)
+            members = query_class_members(db.conn, config_hash, usr)
             grouped: dict[str, list[dict]] = {}
             for m in members:
                 k = m["kind"]
@@ -340,14 +342,15 @@ def get_template_instances(
         instance_count (int)}
     """
     limit = max(0, min(limit, 200))  # clamp
-    ctx, err = _resolve_handler_context(project_root)
-    if err:
-        return err
     try:
-        with ctx.conn:
-            config_hash = ctx.config_hash
-            root = ctx.root
-            row = _lookup_definition(ctx.conn, config_hash, template_name,
+        db = BaseHandler.resolve_db_context(project_root)
+    except RuntimeError as e:
+        return [{"error": str(e)}]
+    try:
+        with db.conn:
+            config_hash = db.config_hash
+            root = db.root
+            row = _lookup_definition(db.conn, config_hash, template_name,
                                      preferred_kinds=None)
             if not row:
                 return [{"error": f"Symbol not found: {template_name}"}]
@@ -355,7 +358,7 @@ def get_template_instances(
                 return [{"error": f"'{template_name}' is not a template (kind: {row['kind']}, is_template: false)."}]
 
             template_usr = row["usr"]
-            instances = query_template_instances(ctx.conn, config_hash, template_usr, limit=limit)
+            instances = query_template_instances(db.conn, config_hash, template_usr, limit=limit)
 
             result: list[dict] = [
                 {
@@ -419,14 +422,15 @@ def get_method_overrides(
             overridden_by: [{usr, name, qualified_name, kind, file, line}]
         }
     """
-    ctx, err = _resolve_handler_context(project_root)
-    if err:
-        return err[0]
     try:
-        with ctx.conn:
-            config_hash = ctx.config_hash
-            root = ctx.root
-            row = _lookup_definition(ctx.conn, config_hash, method_name,
+        db = BaseHandler.resolve_db_context(project_root)
+    except RuntimeError as e:
+        return {"error": str(e)}
+    try:
+        with db.conn:
+            config_hash = db.config_hash
+            root = db.root
+            row = _lookup_definition(db.conn, config_hash, method_name,
                                      preferred_kinds=("method", "destructor"))
             if not row:
                 return {"error": f"Symbol not found: {method_name}"}
@@ -442,7 +446,7 @@ def get_method_overrides(
                 "signature": row["signature"],
             }
 
-            ov = get_overrides_for_method(ctx.conn, config_hash, row["usr"])
+            ov = get_overrides_for_method(db.conn, config_hash, row["usr"])
             result["overrides"] = [
                 {
                     "usr": o["base_usr"],

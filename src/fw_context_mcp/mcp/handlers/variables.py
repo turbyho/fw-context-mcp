@@ -9,7 +9,7 @@ from typing import Annotated
 from pydantic import Field
 
 from ...utils import abs_path
-from ..shared.context import _resolve_handler_context
+from ._base import BaseHandler
 from ..shared.stale import _stale_files
 
 log = logging.getLogger(__name__)
@@ -75,11 +75,12 @@ def find_variables(
         return [{"error": f"Invalid kind: {kind!r}. Expected 'varglobal', 'varlocal', or None."}]
     limit = max(0, min(limit, 100))
 
-    ctx, err = _resolve_handler_context(project_root)
-    if err:
-        return err
+    try:
+        db = BaseHandler.resolve_db_context(project_root)
+    except RuntimeError as e:
+        return [{"error": str(e)}]
 
-    root = ctx.root
+    root = db.root
 
     def _do_find(c: sqlite3.Connection, config_hash: str) -> list[dict]:
         if kind:
@@ -186,14 +187,14 @@ def find_variables(
         return results
 
     try:
-        with ctx.conn:
-            results = _do_find(ctx.conn, ctx.config_hash)
-            file_paths = [abs_path(ctx.root, r["file"]) for r in results if "file" in r]
+        with db.conn:
+            results = _do_find(db.conn, db.config_hash)
+            file_paths = [abs_path(db.root, r["file"]) for r in results if "file" in r]
             if file_paths:
-                stale = _stale_files(ctx.conn, ctx.config_hash, file_paths, ctx.root)
+                stale = _stale_files(db.conn, db.config_hash, file_paths, db.root)
                 if stale:
                     from fw_context_mcp.mcp.background import _ensure_daemon_running
-                    _ensure_daemon_running(ctx.root)
+                    _ensure_daemon_running(db.root)
                     return [{"warning": (
                         f"Results may be stale — {len(stale)} file(s) changed. "
                         "Background reindex in progress. Run 'fw-context index' to force full update."
