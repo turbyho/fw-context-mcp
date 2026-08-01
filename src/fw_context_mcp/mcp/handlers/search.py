@@ -1,34 +1,27 @@
 """Search MCP tools — see mcp/server.py for registration."""
 
 from __future__ import annotations
-import asyncio
 
+import asyncio
 import logging
 import sqlite3
 from pathlib import Path
-from typing import Annotated, Any
+from typing import Annotated
 
 from pydantic import Field
 
 from ...config import derive_project_id
 from ...config import load as load_config
-from ...indexer.db import _cosine_sim, _expand_query, get_active_config, lookup_macro, search_symbols
-from ...llm.ollama import check_setup
+from ...indexer.db import _expand_query, get_active_config
+from ...llm._diag import check_setup
 from ...utils import abs_path, resolve_project_root
 from ..shared.context import _db_path, _is_stale, _open_db_or_return
-from ..shared.fallback import _fallback_to_search_code, _fallback_to_search_code_inner
+from ..shared.fallback import _fallback_to_search_code
 from ..shared.stale import _with_stale_recovery
-
 from ._search_fallbacks import (
-    _search_code_fts5_kind,
-    _search_code_name_tokens,
-    _search_code_docstring,
-    _search_code_individual_terms,
-    _search_code_macros_fts,
-    _fmt_symbol_rows,
     _SEARCH_CODE_FALLBACKS,
+    _search_code_fts5_kind,
 )
-from ._lookup import lookup_symbol
 
 log = logging.getLogger(__name__)
 
@@ -210,7 +203,7 @@ async def smart_search(
 
     try:
         ctx = await asyncio.wait_for(runner.run(ctx), timeout=timeout)
-    except asyncio.TimeoutError:
+    except TimeoutError:
         results = list(ctx.formatted_results) if ctx.formatted_results else []
         results.insert(0, {
             "warning": f"Smart search timed out after {timeout:.0f}s.",
@@ -226,16 +219,13 @@ async def smart_search(
         conn, err_result = _open_db_or_return(ctx.db_path)
         if err_result:
             return err_result
-        try:
-            with conn:
-                cfg_data = get_active_config(conn, derive_project_id(ctx.project_root))
-                if cfg_data and _is_stale(cfg_data, cfg_data["compile_commands_path"])[0]:
-                    results.append({
-                        "warning": "Index may be stale — compile_commands.json changed since last index.",
-                        "hint": "Call reindex_file() on modified files or run 'fw-context index' to update.",
-                    })
-        finally:
-            pass  # connection managed by connection.py cache
+        with conn:
+            cfg_data = get_active_config(conn, derive_project_id(ctx.project_root))
+            if cfg_data and _is_stale(cfg_data, cfg_data["compile_commands_path"])[0]:
+                results.append({
+                    "warning": "Index may be stale — compile_commands.json changed since last index.",
+                    "hint": "Call reindex_file() on modified files or run 'fw-context index' to update.",
+                })
     return results
 
 # ── moved from server.py ──
@@ -291,7 +281,6 @@ async def semantic_search(
         similarity score) and ``_method`` (``"embedding"`` or
         ``"search_code_fallback"``).
     """
-    import asyncio
 
     try:
         root = resolve_project_root(project_root)
@@ -375,16 +364,13 @@ async def semantic_search(
         conn, err_result = _open_db_or_return(ctx.db_path)
         if err_result:
             return err_result
-        try:
-            with conn:
-                cfg_data = get_active_config(conn, derive_project_id(ctx.project_root))
-                if cfg_data and _is_stale(cfg_data, cfg_data["compile_commands_path"])[0]:
-                    results.append({
-                        "warning": "Index may be stale — compile_commands.json changed since last index.",
-                        "hint": "Call reindex_file() on modified files or run 'fw-context index' to update.",
-                    })
-        finally:
-            pass  # connection managed by connection.py cache
+        with conn:
+            cfg_data = get_active_config(conn, derive_project_id(ctx.project_root))
+            if cfg_data and _is_stale(cfg_data, cfg_data["compile_commands_path"])[0]:
+                results.append({
+                    "warning": "Index may be stale — compile_commands.json changed since last index.",
+                    "hint": "Call reindex_file() on modified files or run 'fw-context index' to update.",
+                })
         return results
 
     except (sqlite3.Error, OSError, RuntimeError) as e:

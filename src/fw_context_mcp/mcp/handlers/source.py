@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import sqlite3
 from pathlib import Path
 from typing import Annotated
 
@@ -13,7 +14,6 @@ from ...indexer import db as index_db
 from ...indexer.db import (
     find_indirect_call_sites,
     find_refs,
-    get_active_config,
     get_llm_analysis_for_symbol,
     get_overrides_for_method,
     lookup_macro,
@@ -224,41 +224,38 @@ async def explain_symbol(
     conn = db.conn
     config_hash = db.config_hash
     root = db.root
-    try:
-        with conn:
-            row = _lookup_definition(conn, config_hash, name, prefer_project=True)
-            if not row:
-                # Macro fallback
-                macros = lookup_macro(conn, config_hash, name, exact=True, limit=1)
-                if macros:
-                    m = macros[0]
-                    return {
-                        "name": m["name"],
-                        "kind": "macro",
-                        "file": abs_path(root, m["file_path"]),
-                        "line": m["line"],
-                        "signature": f"#define {m['name']}",
-                        "source": f"#define {m['name']} {m['value']}",
-                        **({"value": m["value"]}),
-                        **({"expanded_value": m["expanded_value"]} if m["expanded_value"] else {}),
-                    }
-                return {"error": f"Symbol not found: {name}"}
-            file_path = abs_path(root, row["file_path"])
-            # Defense-in-depth: validate path is within project root
-            try:
-                from pathlib import Path as _Path
-                _Path(file_path).resolve().relative_to(root.resolve())
-            except ValueError:
-                return {"error": f"Path {file_path} outside project root"}
-            line_no = row["line"]
-            signature = row["signature"] or ""
-            kind = row["kind"]
-            symbol_id = row["id"]
+    with conn:
+        row = _lookup_definition(conn, config_hash, name, prefer_project=True)
+        if not row:
+            # Macro fallback
+            macros = lookup_macro(conn, config_hash, name, exact=True, limit=1)
+            if macros:
+                m = macros[0]
+                return {
+                    "name": m["name"],
+                    "kind": "macro",
+                    "file": abs_path(root, m["file_path"]),
+                    "line": m["line"],
+                    "signature": f"#define {m['name']}",
+                    "source": f"#define {m['name']} {m['value']}",
+                    **({"value": m["value"]}),
+                    **({"expanded_value": m["expanded_value"]} if m["expanded_value"] else {}),
+                }
+            return {"error": f"Symbol not found: {name}"}
+        file_path = abs_path(root, row["file_path"])
+        # Defense-in-depth: validate path is within project root
+        try:
+            from pathlib import Path as _Path
+            _Path(file_path).resolve().relative_to(root.resolve())
+        except ValueError:
+            return {"error": f"Path {file_path} outside project root"}
+        line_no = row["line"]
+        signature = row["signature"] or ""
+        kind = row["kind"]
+        symbol_id = row["id"]
 
-            # Check for pre-computed LLM analysis (instant, no Ollama call)
-            llm_analysis = get_llm_analysis_for_symbol(conn, symbol_id)
-    finally:
-        pass  # connection managed by connection.py cache
+        # Check for pre-computed LLM analysis (instant, no Ollama call)
+        llm_analysis = get_llm_analysis_for_symbol(conn, symbol_id)
 
     result: dict = {
         "name": name,
@@ -307,7 +304,7 @@ async def explain_symbol(
                 call_ollama_async(prompt, cfg.llm),
                 timeout=cfg.llm.timeout,
             )
-        except asyncio.TimeoutError:
+        except TimeoutError:
             result["warning"] = (
                 f"LLM request timed out after {cfg.llm.timeout:.0f}s. "
                 "No local LLM — interpret the 'source' and "
@@ -371,74 +368,71 @@ def get_source(
     conn = db.conn
     config_hash = db.config_hash
     root = db.root
-    try:
-        with conn:
-            row = _lookup_definition(conn, config_hash, name, prefer_project=True)
-            if not row:
-                # Macro fallback
-                macros = lookup_macro(conn, config_hash, name, exact=True, limit=1)
-                if macros:
-                    m = macros[0]
-                    return {
-                        "name": m["name"],
-                        "kind": "macro",
-                        "file": abs_path(root, m["file_path"]),
-                        "line": m["line"],
-                        "signature": f"#define {m['name']}",
-                        "source": f"#define {m['name']} {m['value']}",
-                        **({"value": m["value"]}),
-                        **({"expanded_value": m["expanded_value"]} if m["expanded_value"] else {}),
+    with conn:
+        row = _lookup_definition(conn, config_hash, name, prefer_project=True)
+        if not row:
+            # Macro fallback
+            macros = lookup_macro(conn, config_hash, name, exact=True, limit=1)
+            if macros:
+                m = macros[0]
+                return {
+                    "name": m["name"],
+                    "kind": "macro",
+                    "file": abs_path(root, m["file_path"]),
+                    "line": m["line"],
+                    "signature": f"#define {m['name']}",
+                    "source": f"#define {m['name']} {m['value']}",
+                    **({"value": m["value"]}),
+                    **({"expanded_value": m["expanded_value"]} if m["expanded_value"] else {}),
+                }
+            return {"error": f"Symbol not found: {name}"}
+        file_path = abs_path(root, row["file_path"])
+        # Defense-in-depth: validate path is within project root
+        try:
+            from pathlib import Path as _Path
+            _Path(file_path).resolve().relative_to(root.resolve())
+        except ValueError:
+            return {"error": f"Path {file_path} outside project root"}
+        result: dict = {
+            "name": row["name"],
+            "qualified_name": row["qualified_name"],
+            "kind": row["kind"],
+            "file": file_path,
+            "line": row["line"],
+            "signature": row["signature"] or "",
+            "is_definition": bool(row["is_definition"]),
+            "is_template": bool(row["is_template"]),
+            "is_virtual": bool(row["is_virtual"]),
+            "is_pure_virtual": bool(row["is_pure_virtual"]),
+            "docstring": row["docstring"] or "",
+        }
+        if row["template_usr"]:
+            result["template_usr"] = row["template_usr"]
+        if row["parent_usr"]:
+            result["parent_usr"] = row["parent_usr"]
+        if row["enum_value"] is not None:
+            result["enum_value"] = row["enum_value"]
+        # For enums, collect all constants with their values
+        if row["kind"] == "enum":
+            qn = row["qualified_name"]
+            const_rows = conn.execute(
+                """SELECT name, qualified_name, line, enum_value
+                   FROM symbols
+                   WHERE config_hash = ? AND kind = 'enum_constant'
+                     AND (qualified_name LIKE ? OR qualified_name LIKE ?)
+                   ORDER BY line""",
+                (config_hash, f"{qn}::%", f"%{qn}::%"),
+            ).fetchall()
+            if const_rows:
+                result["constants"] = [
+                    {
+                        "name": c["name"],
+                        **({"enum_value": c["enum_value"]} if c["enum_value"] is not None else {}),
                     }
-                return {"error": f"Symbol not found: {name}"}
-            file_path = abs_path(root, row["file_path"])
-            # Defense-in-depth: validate path is within project root
-            try:
-                from pathlib import Path as _Path
-                _Path(file_path).resolve().relative_to(root.resolve())
-            except ValueError:
-                return {"error": f"Path {file_path} outside project root"}
-            result: dict = {
-                "name": row["name"],
-                "qualified_name": row["qualified_name"],
-                "kind": row["kind"],
-                "file": file_path,
-                "line": row["line"],
-                "signature": row["signature"] or "",
-                "is_definition": bool(row["is_definition"]),
-                "is_template": bool(row["is_template"]),
-                "is_virtual": bool(row["is_virtual"]),
-                "is_pure_virtual": bool(row["is_pure_virtual"]),
-                "docstring": row["docstring"] or "",
-            }
-            if row["template_usr"]:
-                result["template_usr"] = row["template_usr"]
-            if row["parent_usr"]:
-                result["parent_usr"] = row["parent_usr"]
-            if row["enum_value"] is not None:
-                result["enum_value"] = row["enum_value"]
-            # For enums, collect all constants with their values
-            if row["kind"] == "enum":
-                qn = row["qualified_name"]
-                const_rows = conn.execute(
-                    """SELECT name, qualified_name, line, enum_value
-                       FROM symbols
-                       WHERE config_hash = ? AND kind = 'enum_constant'
-                         AND (qualified_name LIKE ? OR qualified_name LIKE ?)
-                       ORDER BY line""",
-                    (config_hash, f"{qn}::%", f"%{qn}::%"),
-                ).fetchall()
-                if const_rows:
-                    result["constants"] = [
-                        {
-                            "name": c["name"],
-                            **({"enum_value": c["enum_value"]} if c["enum_value"] is not None else {}),
-                        }
-                        for c in const_rows
-                    ]
-            end_line = row["end_line"] or 0
-            line_no = row["line"]
-    finally:
-        pass  # connection managed by connection.py cache
+                    for c in const_rows
+                ]
+        end_line = row["end_line"] or 0
+        line_no = row["line"]
     source = _read_symbol_body(file_path, line_no, end_line=end_line)
     if not source:
         result["warning"] = f"Could not read source from {file_path}"
@@ -494,35 +488,32 @@ def get_file_map(
     conn = db.conn
     config_hash = db.config_hash
     root = db.root
-    try:
-        with conn:
-            # Resolve file_path: try exact match first, then suffix
-            exact = conn.execute(
-                "SELECT COUNT(*) FROM symbols WHERE config_hash=? AND file_path=?",
-                (config_hash, file_path),
-            ).fetchone()[0]
-            if not exact:
-                # Try to find the canonical path from the files table
-                candidates = conn.execute(
-                    "SELECT path FROM files WHERE config_hash=? AND path LIKE ? LIMIT 3",
-                    (config_hash, f"%{file_path}"),
-                ).fetchall()
-                if not candidates:
-                    return {"error": f"File not found in index: {file_path}. Check the path — use relative paths like 'src/main.cpp'."}
-                # Pick the best match (shortest path that ends with file_path)
-                resolved = min((c["path"] for c in candidates), key=len)
-            else:
-                resolved = file_path
-            # Defense-in-depth: validate resolved path stays within project root
-            err = _validate_path_in_root(resolved, root)
-            if err:
-                return {"error": err}
-            result = index_db.get_file_map(
-                conn, config_hash, resolved,
-                signatures=signatures, max_per_kind=max_per_kind,
-            )
-    finally:
-        pass  # connection managed by connection.py cache
+    with conn:
+        # Resolve file_path: try exact match first, then suffix
+        exact = conn.execute(
+            "SELECT COUNT(*) FROM symbols WHERE config_hash=? AND file_path=?",
+            (config_hash, file_path),
+        ).fetchone()[0]
+        if not exact:
+            # Try to find the canonical path from the files table
+            candidates = conn.execute(
+                "SELECT path FROM files WHERE config_hash=? AND path LIKE ? LIMIT 3",
+                (config_hash, f"%{file_path}"),
+            ).fetchall()
+            if not candidates:
+                return {"error": f"File not found in index: {file_path}. Check the path — use relative paths like 'src/main.cpp'."}
+            # Pick the best match (shortest path that ends with file_path)
+            resolved = min((c["path"] for c in candidates), key=len)
+        else:
+            resolved = file_path
+        # Defense-in-depth: validate resolved path stays within project root
+        err = _validate_path_in_root(resolved, root)
+        if err:
+            return {"error": err}
+        result = index_db.get_file_map(
+            conn, config_hash, resolved,
+            signatures=signatures, max_per_kind=max_per_kind,
+        )
     return result
 
 # ── moved from server.py ──
@@ -748,59 +739,56 @@ def get_symbol_context(
     conn = db.conn
     config_hash = db.config_hash
     root = db.root
-    try:
-        with conn:
-            row = _lookup_definition(conn, config_hash, name, prefer_project=True)
-            if not row:
-                # Macro fallback — macros have no callers/callees, return basic info
-                macros = lookup_macro(conn, config_hash, name, exact=True, limit=1)
-                if macros:
-                    m = macros[0]
-                    return {
-                        "name": m["name"],
-                        "kind": "macro",
-                        "file": abs_path(root, m["file_path"]),
-                        "line": m["line"],
-                        "signature": f"#define {m['name']}",
-                        "source": f"#define {m['name']} {m['value']}",
-                        "value": m["value"],
-                        "expanded_value": m["expanded_value"] or None,
-                        "callers": [],
-                        "callees": [],
-                    }
-                return {"error": f"Symbol not found: {name}"}
-            file_path = abs_path(root, row["file_path"])
-            # Defense-in-depth: validate path is within project root
-            try:
-                from pathlib import Path as _Path
-                _Path(file_path).resolve().relative_to(root.resolve())
-            except ValueError:
-                return {"error": f"Path {file_path} outside project root"}
-            symbol_usr = row["usr"]
+    with conn:
+        row = _lookup_definition(conn, config_hash, name, prefer_project=True)
+        if not row:
+            # Macro fallback — macros have no callers/callees, return basic info
+            macros = lookup_macro(conn, config_hash, name, exact=True, limit=1)
+            if macros:
+                m = macros[0]
+                return {
+                    "name": m["name"],
+                    "kind": "macro",
+                    "file": abs_path(root, m["file_path"]),
+                    "line": m["line"],
+                    "signature": f"#define {m['name']}",
+                    "source": f"#define {m['name']} {m['value']}",
+                    "value": m["value"],
+                    "expanded_value": m["expanded_value"] or None,
+                    "callers": [],
+                    "callees": [],
+                }
+            return {"error": f"Symbol not found: {name}"}
+        file_path = abs_path(root, row["file_path"])
+        # Defense-in-depth: validate path is within project root
+        try:
+            from pathlib import Path as _Path
+            _Path(file_path).resolve().relative_to(root.resolve())
+        except ValueError:
+            return {"error": f"Path {file_path} outside project root"}
+        symbol_usr = row["usr"]
 
-            # Immediate callers (who calls this symbol, direct + indirect).
-            callers_list = _collect_callers(conn, config_hash, name, root)
+        # Immediate callers (who calls this symbol, direct + indirect).
+        callers_list = _collect_callers(conn, config_hash, name, root)
 
-            # Immediate callees (what this symbol calls, direct + indirect).
-            callees_list = _collect_callees(conn, config_hash, symbol_usr, root)
+        # Immediate callees (what this symbol calls, direct + indirect).
+        callees_list = _collect_callees(conn, config_hash, symbol_usr, root)
 
-            # Indirect call sites — for function pointer fields and variables,
-            # and indirect calls made BY functions/methods.
-            indirect_calls_list = _collect_indirect_calls(conn, config_hash, row, symbol_usr, root)
+        # Indirect call sites — for function pointer fields and variables,
+        # and indirect calls made BY functions/methods.
+        indirect_calls_list = _collect_indirect_calls(conn, config_hash, row, symbol_usr, root)
 
-            # Resolution info — for function pointer fields/variables
-            resolution = _collect_resolution_info(conn, config_hash, row, symbol_usr, indirect_calls_list)
+        # Resolution info — for function pointer fields/variables
+        resolution = _collect_resolution_info(conn, config_hash, row, symbol_usr, indirect_calls_list)
 
-            # For enums, collect all constants with their values
-            enum_constants = _collect_enum_constants(conn, config_hash, row)
+        # For enums, collect all constants with their values
+        enum_constants = _collect_enum_constants(conn, config_hash, row)
 
-            # Pre-computed LLM analysis (if available)
-            llm_analysis = get_llm_analysis_for_symbol(conn, row["id"])
+        # Pre-computed LLM analysis (if available)
+        llm_analysis = get_llm_analysis_for_symbol(conn, row["id"])
 
-            # Override info for virtual methods
-            overrides_info = _collect_override_info(conn, config_hash, row)
-    finally:
-        pass  # connection managed by connection.py cache
+        # Override info for virtual methods
+        overrides_info = _collect_override_info(conn, config_hash, row)
 
     source = _read_symbol_body(file_path, row["line"], end_line=row["end_line"] or 0)
     result: dict = {
@@ -885,39 +873,36 @@ def read_file(
     conn = db.conn
     config_hash = db.config_hash
     root = db.root
-    try:
-        with conn:
+    with conn:
 
-            # Resolve file_path: try exact match first, then suffix match
-            exact = conn.execute(
-                "SELECT COUNT(*) FROM files WHERE config_hash=? AND path=?",
-                (config_hash, file_path),
-            ).fetchone()[0]
-            if not exact:
-                candidates = conn.execute(
-                    "SELECT path FROM files WHERE config_hash=? AND path LIKE ? LIMIT 3",
-                    (config_hash, f"%{file_path}"),
-                ).fetchall()
-                if not candidates:
-                    return {
-                        "error": f"File not found in index: {file_path}. "
-                        f"Check the path — use relative paths like 'src/main.cpp'."
-                    }
-                resolved = min((c["path"] for c in candidates), key=len)
-            else:
-                resolved = file_path
+        # Resolve file_path: try exact match first, then suffix match
+        exact = conn.execute(
+            "SELECT COUNT(*) FROM files WHERE config_hash=? AND path=?",
+            (config_hash, file_path),
+        ).fetchone()[0]
+        if not exact:
+            candidates = conn.execute(
+                "SELECT path FROM files WHERE config_hash=? AND path LIKE ? LIMIT 3",
+                (config_hash, f"%{file_path}"),
+            ).fetchall()
+            if not candidates:
+                return {
+                    "error": f"File not found in index: {file_path}. "
+                    f"Check the path — use relative paths like 'src/main.cpp'."
+                }
+            resolved = min((c["path"] for c in candidates), key=len)
+        else:
+            resolved = file_path
 
-            # Defense-in-depth: validate resolved path stays within project root
-            err = _validate_path_in_root(resolved, root)
-            if err:
-                return {"error": err}
+        # Defense-in-depth: validate resolved path stays within project root
+        err = _validate_path_in_root(resolved, root)
+        if err:
+            return {"error": err}
 
-            row = conn.execute(
-                "SELECT content, language, path, mtime FROM files WHERE config_hash=? AND path=?",
-                (config_hash, resolved),
-            ).fetchone()
-    finally:
-        pass  # connection managed by connection.py cache
+        row = conn.execute(
+            "SELECT content, language, path, mtime FROM files WHERE config_hash=? AND path=?",
+            (config_hash, resolved),
+        ).fetchone()
 
     if not row:
         return {"error": f"File not found in index: {file_path}"}

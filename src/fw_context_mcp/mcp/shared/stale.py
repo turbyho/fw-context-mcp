@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import os
+import sqlite3
 import time
 from pathlib import Path
 
@@ -101,6 +102,7 @@ def check_structural_staleness(
 def _stale_files(conn, config_hash: str, file_paths: list[str], root: Path) -> list[str]:
     """Return the subset of *file_paths* whose on-disk mtime is newer than the index."""
     from concurrent.futures import ThreadPoolExecutor, as_completed
+
     from ...indexer.manifest import load as load_manifest
     from ...indexer.ops import _normalize_file_path
 
