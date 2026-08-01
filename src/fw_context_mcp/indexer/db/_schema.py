@@ -612,6 +612,30 @@ def _run_data_migrations(conn: sqlite3.Connection) -> None:
             conn.execute("RELEASE data_migration")
             conn.execute("SAVEPOINT data_migration")
 
+        # ── Deduplicate refs before creating unique index ──
+        dup_count = conn.execute(
+            """SELECT COUNT(*) FROM refs WHERE rowid NOT IN (
+                SELECT MIN(rowid) FROM refs
+                GROUP BY config_hash, to_usr, from_file, from_line, from_usr, ref_kind
+            )"""
+        ).fetchone()[0]
+        if dup_count > 0:
+            log.info("Deduplicating %d duplicate ref rows", dup_count)
+            conn.execute(
+                """DELETE FROM refs WHERE rowid NOT IN (
+                    SELECT MIN(rowid) FROM refs
+                    GROUP BY config_hash, to_usr, from_file, from_line, from_usr, ref_kind
+                )"""
+            )
+            conn.execute("RELEASE data_migration")
+            conn.execute("SAVEPOINT data_migration")
+
+        # ── Create unique index on refs (idempotent; dedup ran first) ──
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_refs_unique "
+            "ON refs(config_hash, to_usr, from_file, from_line, from_usr, ref_kind)"
+        )
+
         conn.execute("RELEASE data_migration")
     except sqlite3.Error:
         try:

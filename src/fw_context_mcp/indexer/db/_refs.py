@@ -12,7 +12,7 @@ def insert_refs_batch(conn: sqlite3.Connection, rows: list[tuple]) -> int:
     Returns number of rows inserted.
     """
     cur = conn.executemany(
-        """INSERT INTO refs (config_hash, to_usr, from_file, from_line, from_usr, ref_kind)
+        """INSERT OR IGNORE INTO refs (config_hash, to_usr, from_file, from_line, from_usr, ref_kind)
            VALUES (?,?,?,?,?,?)""",
         rows,
     )
