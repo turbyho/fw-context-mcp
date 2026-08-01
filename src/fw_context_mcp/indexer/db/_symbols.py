@@ -6,6 +6,17 @@ import logging
 import re
 import sqlite3
 
+__all__ = [
+    "_expand_query",
+    "delete_macros_for_file",
+    "find_macro_refs",
+    "insert_macros_batch",
+    "insert_symbols_batch",
+    "lookup_macro",
+    "search_symbols",
+    "split_tokens",
+]
+
 
 log = logging.getLogger(__name__)
 
@@ -50,14 +61,6 @@ def split_tokens(name: str, qualified_name: str = "") -> str:
         ZBLE::onConnectionComplete → "zble on connection complete"
         _last_ble_connected        → "last ble connected"
     """
-    # Noise words that pollute FTS5 — strip before tokenizing
-    _NOISE_WORDS = frozenset(("at", "unnamed"))
-    # Guard against pathological inputs that cause ReDoS in regex processing.
-    # 500 chars is sufficient for 99.9% of C/C++ identifiers — nested template
-    # instantiations (e.g. std::map<std::string, std::vector<int>>) may exceed
-    # this limit, but the truncation is safe (token-quality loss is negligible).
-    _MAX_NAME_LEN = 500
-
     def _tokenize(s: str) -> list[str]:
         if len(s) > _MAX_NAME_LEN:
             log.debug("Truncated long name from %d to %d chars for tokenization", len(s), _MAX_NAME_LEN)
