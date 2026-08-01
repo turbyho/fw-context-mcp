@@ -755,7 +755,7 @@ def _reindex_post_write_phases(
             try:
                 _build_llm_analysis(
                     conn, config_hash, cfg.llm, db_dir,
-                    write_lock_held=True, retry_unparseable=True,
+                    write_lock_held=False, retry_unparseable=True,
                     cache_client=cc, project_only=not stored_av,
                 )
                 conn.commit()
@@ -773,7 +773,7 @@ def _reindex_post_write_phases(
     if total_symbols > 0 and cfg.index.index_refs:
         try:
             from ...indexer.runner import _build_overrides
-            _build_overrides(conn, config_hash, db_dir, write_lock_held=True, force=True)
+            _build_overrides(conn, config_hash, db_dir, write_lock_held=False, force=True)
             conn.commit()
         except (sqlite3.Error, RuntimeError) as exc:
             result["overrides_warning"] = f"Override analysis skipped: {exc}"
@@ -781,7 +781,7 @@ def _reindex_post_write_phases(
     if cfg.index.index_refs and total_symbols > 0:
         try:
             from ...indexer.runner import _build_hotspot_cache, _build_pagerank
-            _build_pagerank(conn, config_hash, write_lock_held=True, force=True)
+            _build_pagerank(conn, config_hash, write_lock_held=False, force=True)
             _build_hotspot_cache(conn, config_hash, force=True)
             conn.commit()
         except (sqlite3.Error, RuntimeError) as exc:
