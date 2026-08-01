@@ -165,16 +165,24 @@ class TestAutoDetect:
         assert key == "auto:desc-v5"  # placeholder until resolve_embed_model runs
 
     def test_embed_model_resolved_by_from_dict(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """Config loading (from_dict) auto-resolves embed_model."""
+        """_from_dict does NOT resolve embed_model — that's a load() responsibility.
+        
+        _from_dict is a pure data transformation. resolve_embed_model is an I/O
+        side effect (GPU detection, Ollama API) and belongs in load().
+        """
         from fw_context_mcp.config.settings import _from_dict
         from fw_context_mcp.llm import auto_model
-        from fw_context_mcp.llm.auto_model import _reset_auto_model_cache
+        from fw_context_mcp.llm.auto_model import _reset_auto_model_cache, resolve_embed_model
 
         _reset_auto_model_cache()
         monkeypatch.setattr(auto_model, "_gpu_available", lambda: False)
         monkeypatch.setattr(auto_model, "_model_installed", lambda url, model: True)
 
         cfg = _from_dict({"llm": {}})
+        # _from_dict itself does not call resolve_embed_model
+        assert cfg.llm.embed_model == ""
+        # Explicit resolution
+        resolve_embed_model(cfg.llm)
         assert cfg.llm.embed_model == auto_model._DEFAULT_CPU_MODEL
         key = cfg.llm.embed_key()
         assert key == f"{auto_model._DEFAULT_CPU_MODEL}:{DESCRIPTION_VERSION}"

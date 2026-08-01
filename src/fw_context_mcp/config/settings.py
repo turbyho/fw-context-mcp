@@ -455,10 +455,8 @@ def _from_dict(data: dict) -> Config:
     # Normalize sentinel values: -1 means "not set" for embed_dim
     if cfg.llm.embed_dim is not None and cfg.llm.embed_dim < 0:
         cfg.llm.embed_dim = None
-
-    from ..llm.auto_model import resolve_embed_model
-    resolve_embed_model(cfg.llm)
     _apply_embed_prompt_defaults(cfg.llm)
+
 
     # ── [cache_server] ──
     if cs := data.get("cache_server", {}):
@@ -763,6 +761,8 @@ def load(project_root: Path | None = None) -> Config:
             )
 
     cfg = _from_dict(data)
+    from ..llm.auto_model import resolve_embed_model
+    resolve_embed_model(cfg.llm)
     cfg.index.db_dir = cfg.index.db_dir.expanduser().resolve()
 
     # Cache with current mtime
