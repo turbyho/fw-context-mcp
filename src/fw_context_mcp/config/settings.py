@@ -426,6 +426,18 @@ def _safe_float(val, default: float = 0.0) -> float:
         return default
 
 
+def _apply_section(
+    data: dict,
+    section_name: str,
+    fields: list[tuple[str, str, str]],
+    target: object,
+) -> None:
+    """Apply a TOML section's key-value pairs to a config dataclass."""
+    if section := data.get(section_name, {}):
+        for key, attr, conv in fields:
+            if key in section:
+                setattr(target, attr, _convert(section[key], conv))
+
 def _from_dict(data: dict) -> Config:
     """Convert merged TOML dict to Config with field mapping tables.
 
@@ -434,29 +446,11 @@ def _from_dict(data: dict) -> Config:
     """
     cfg = Config()
 
-    # ── [project] ──
-    if proj := data.get("project", {}):
-        for key, attr, conv in _PROJECT_FIELDS:
-            if key in proj:
-                setattr(cfg.project, attr, _convert(proj[key], conv))
-
-    # ── [build] ──
-    if build := data.get("build", {}):
-        for key, attr, conv in _BUILD_FIELDS:
-            if key in build:
-                setattr(cfg.build, attr, _convert(build[key], conv))
-
-    # ── [index] ──
-    if idx := data.get("index", {}):
-        for key, attr, conv in _INDEX_FIELDS:
-            if key in idx:
-                setattr(cfg.index, attr, _convert(idx[key], conv))
-
-    # ── [llm] ──
-    if llm := data.get("llm", {}):
-        for key, attr, conv in _LLM_FIELDS:
-            if key in llm:
-                setattr(cfg.llm, attr, _convert(llm[key], conv))
+    # ── Core sections ──
+    _apply_section(data, "project", _PROJECT_FIELDS, cfg.project)
+    _apply_section(data, "build", _BUILD_FIELDS, cfg.build)
+    _apply_section(data, "index", _INDEX_FIELDS, cfg.index)
+    _apply_section(data, "llm", _LLM_FIELDS, cfg.llm)
 
     # Normalize sentinel values: -1 means "not set" for embed_dim
     if cfg.llm.embed_dim is not None and cfg.llm.embed_dim < 0:
