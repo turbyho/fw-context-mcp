@@ -35,6 +35,7 @@ async def _lookup_permissions(request: Request, token: str) -> dict[str, Any] | 
 
 
 
+
 # Simple in-memory IP-based rate limiter for auth failures.
 # Tracks failed attempts per IP with a sliding 60s window.
 _auth_failures: dict[str, list[float]] = {}
@@ -43,6 +44,48 @@ import threading as _threading
 _auth_lock = _threading.Lock()
 _auth_check_count: int = 0
 _AUTH_PRUNE_INTERVAL = 100  # prune stale entries every N checks
+
+
+# Default trusted reverse-proxy CIDRs (loopback + private ranges).
+# Override via FW_CACHE_TRUSTED_PROXIES env var (comma-separated CIDRs).
+_DEFAULT_TRUSTED_PROXIES = frozenset({"127.0.0.0/8", "::1/128", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"})
+
+import ipaddress as _ipaddress
+import os as _os
+
+
+def _parse_trusted_proxies() -> frozenset[str]:
+    """Parse FW_CACHE_TRUSTED_PROXIES env var, fall back to defaults."""
+    raw = _os.environ.get("FW_CACHE_TRUSTED_PROXIES", "")
+    if not raw:
+        return _DEFAULT_TRUSTED_PROXIES
+    cidrs: set[str] = set()
+    for part in raw.split(","):
+        part = part.strip()
+        if part:
+            try:
+                _ipaddress.ip_network(part)  # validate
+                cidrs.add(part)
+            except ValueError:
+                pass
+    return frozenset(cidrs) if cidrs else _DEFAULT_TRUSTED_PROXIES
+
+
+_TRUSTED_PROXIES: frozenset[str] = _parse_trusted_proxies()
+
+
+def _is_trusted_proxy(ip: str) -> bool:
+    """Return True if *ip* is in the trusted proxy set."""
+    if not ip:
+        return False
+    try:
+        addr = _ipaddress.ip_address(ip)
+    except ValueError:
+        return False
+    for cidr in _TRUSTED_PROXIES:
+        if addr in _ipaddress.ip_network(cidr):
+            return True
+    return False
 
 
 def _prune_auth_failures(now: float, window_s: float = 120.0) -> None:
@@ -72,6 +115,7 @@ def _check_rate_limit(ip: str, max_failures: int = 20, window_s: float = 60.0) -
         _auth_failures[ip] = failures
         return True
 
+
 def _record_auth_failure(ip: str) -> None:
     """Record a failed auth attempt for rate limiting."""
     with _auth_lock:
@@ -79,11 +123,13 @@ def _record_auth_failure(ip: str) -> None:
 
 
 def _get_client_ip(request: Request) -> str:
-    """Extract client IP, preferring X-Forwarded-For when behind a proxy."""
-    forwarded = request.headers.get("X-Forwarded-For", "")
-    if forwarded:
-        return forwarded.split(",")[0].strip()
-    return request.client.host if request.client else "unknown"
+    """Extract client IP, trusting X-Forwarded-For only from trusted proxies."""
+    direct_ip = request.client.host if request.client else "unknown"
+    if _is_trusted_proxy(direct_ip):
+        forwarded = request.headers.get("X-Forwarded-For", "")
+        if forwarded:
+            return forwarded.split(",")[0].strip()
+    return direct_ip
 
 
 class CacheAuthMiddleware(BaseHTTPMiddleware):
@@ -98,13 +144,12 @@ class CacheAuthMiddleware(BaseHTTPMiddleware):
         if token is None:
             return JSONResponse({"detail": "Missing Authorization header"}, status_code=401)
 
-        # Rate-limit auth failures per IP (defense-in-depth)
-        client_ip = _get_client_ip(request)
-        if not _check_rate_limit(client_ip):
-            return JSONResponse({"detail": "Too many auth attempts"}, status_code=429)
-
+        # Validate token FIRST — only rate-limit actual failures
         perms = await _lookup_permissions(request, token)
         if perms is None:
+            client_ip = _get_client_ip(request)
+            if not _check_rate_limit(client_ip):
+                return JSONResponse({"detail": "Too many auth attempts"}, status_code=429)
             _record_auth_failure(client_ip)
             return JSONResponse({"detail": "Invalid or revoked token"}, status_code=401)
 
