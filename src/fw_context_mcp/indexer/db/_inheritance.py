@@ -75,6 +75,64 @@ def get_direct_derived(conn: sqlite3.Connection, config_hash: str, usr: str) -> 
     return [dict(r) for r in rows]
 
 
+def get_direct_bases_batch(
+    conn: sqlite3.Connection, config_hash: str, usrs: list[str]
+) -> dict[str, list[dict]]:
+    """Return direct base classes for multiple USRs in one query — avoids N+1.
+
+    Returns dict mapping each USR to its list of base class dicts
+    (same shape as ``get_direct_bases`` per USR).  USRs with no bases
+    get an empty list.
+    """
+    if not usrs:
+        return {}
+    placeholders = ",".join("?" * len(usrs))
+    rows = conn.execute(
+        f"""SELECT i.derived_usr, i.base_usr, i.access, i.is_virtual,
+                   s.name AS base_name, s.kind AS base_kind,
+                   s.file_path AS base_file
+            FROM inheritance i
+            LEFT JOIN symbols s ON s.usr = i.base_usr AND s.config_hash = i.config_hash
+            WHERE i.config_hash = ? AND i.derived_usr IN ({placeholders})
+            ORDER BY s.name""",
+        (config_hash, *usrs),
+    ).fetchall()
+    result: dict[str, list[dict]] = {u: [] for u in usrs}
+    for r in rows:
+        d = dict(r)
+        result[d["derived_usr"]].append(d)
+    return result
+
+
+def get_direct_derived_batch(
+    conn: sqlite3.Connection, config_hash: str, usrs: list[str]
+) -> dict[str, list[dict]]:
+    """Return direct derived classes for multiple USRs in one query — avoids N+1.
+
+    Returns dict mapping each USR to its list of derived class dicts
+    (same shape as ``get_direct_derived`` per USR).  USRs with no
+    derived classes get an empty list.
+    """
+    if not usrs:
+        return {}
+    placeholders = ",".join("?" * len(usrs))
+    rows = conn.execute(
+        f"""SELECT i.derived_usr, i.base_usr, i.access, i.is_virtual,
+                   s.name AS derived_name, s.kind AS derived_kind,
+                   s.file_path AS derived_file
+            FROM inheritance i
+            LEFT JOIN symbols s ON s.usr = i.derived_usr AND s.config_hash = i.config_hash
+            WHERE i.config_hash = ? AND i.base_usr IN ({placeholders})
+            ORDER BY s.name""",
+        (config_hash, *usrs),
+    ).fetchall()
+    result: dict[str, list[dict]] = {u: [] for u in usrs}
+    for r in rows:
+        d = dict(r)
+        result[d["base_usr"]].append(d)
+    return result
+
+
 def insert_overrides_batch(
     conn: sqlite3.Connection,
     rows: list[tuple[str, str, str]],
