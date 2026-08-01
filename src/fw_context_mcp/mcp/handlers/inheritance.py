@@ -27,6 +27,97 @@ from .source import _lookup_definition
 
 log = logging.getLogger(__name__)
 
+
+def _bfs_inheritance_walk(
+    conn: sqlite3.Connection,
+    config_hash: str,
+    root,
+    start_edges: list[tuple[str, str, bool]],
+    batch_fn,
+    edge_usr_key: str,
+    visited: set[str],
+    max_depth: int,
+) -> list[dict]:
+    """Generic BFS for inheritance graph traversal.
+
+    Walks the inheritance graph level by level, using *batch_fn* to
+    fetch edges for each level's USRs in a single SQL query.  Handles
+    diamond inheritance via deduplication within each level.
+
+    Args:
+        conn: Open SQLite connection.
+        config_hash: Build config hash.
+        root: Project root (passed to ``abs_path`` for file paths).
+        start_edges: Initial BFS level — tuples of ``(usr, access, is_virtual)``.
+        batch_fn: Edge lookup function — ``get_direct_bases_batch`` for
+            walking up (ancestors) or ``get_direct_derived_batch`` for
+            walking down (descendants).
+        edge_usr_key: Key to extract the next USR from each edge row
+            (``"base_usr"`` for ancestors, ``"derived_usr"`` for descendants).
+        visited: Set of already-visited USRs — mutated in place.
+        max_depth: Maximum BFS depth.
+
+    Returns:
+        List of dicts with: name, usr, access, is_virtual, depth, file, kind.
+        Sorted by depth ascending.
+    """
+    all_results: list[dict] = []
+    current_level = start_edges[:]
+
+    for depth in range(1, max_depth + 1):
+        if not current_level:
+            break
+
+        # 1. Deduplicate within level (diamond inheritance)
+        seen_level: set[str] = set()
+        unique_level: list[tuple[str, str, bool]] = []
+        for cur_usr, access, is_virtual in current_level:
+            if cur_usr not in seen_level and cur_usr not in visited:
+                seen_level.add(cur_usr)
+                visited.add(cur_usr)
+                unique_level.append((cur_usr, access, is_virtual))
+        current_level = unique_level
+        if not current_level:
+            break
+
+        level_usrs = [u for u, _, _ in current_level]
+
+        # 2. Batch lookup symbols
+        placeholders = ",".join("?" * len(level_usrs))
+        symbol_rows = conn.execute(
+            f"SELECT usr, name, kind, file_path FROM symbols "
+            f"WHERE config_hash=? AND usr IN ({placeholders})",
+            (config_hash, *level_usrs),
+        ).fetchall()
+        symbol_map: dict[str, sqlite3.Row] = {r["usr"]: r for r in symbol_rows}
+
+        # 3. Batch lookup edges
+        edges_batch = batch_fn(conn, config_hash, level_usrs)
+
+        # 4. Build results and prepare next level
+        next_level: list[tuple[str, str, bool]] = []
+        for cur_usr, access, is_virtual in current_level:
+            cur_row = symbol_map.get(cur_usr)
+            all_results.append({
+                "name": cur_row["name"] if cur_row else "<unknown>",
+                "usr": cur_usr,
+                "access": access,
+                "is_virtual": is_virtual,
+                "depth": depth,
+                "file": abs_path(root, cur_row["file_path"])
+                        if cur_row and cur_row["file_path"] else None,
+                "kind": cur_row["kind"] if cur_row else None,
+            })
+            for edge in edges_batch.get(cur_usr, []):
+                next_usr = edge[edge_usr_key]
+                if next_usr not in visited:
+                    next_level.append(
+                        (next_usr, edge["access"], bool(edge["is_virtual"]))
+                    )
+        current_level = next_level
+
+    return all_results
+
 # ── moved from server.py ──
 def get_inheritance_chain(
     class_name: Annotated[str, Field(description="Class or struct name to get inheritance information for. E.g. 'UART_DRIVER' or 'comm::MODEM'.")],
@@ -122,109 +213,36 @@ def get_inheritance_chain(
         # ── Transitive walk (level-by-level BFS with batched queries) ──
         if transitive:
             # ── Walk up — ancestors ──
-            all_bases: list[dict] = []
             visited_up: set[str] = {usr}
-            # Current BFS level: list of (usr, access, is_virtual)
-            current_level: list[tuple[str, str, bool]] = [
+            start_up = [
                 (b["base_usr"], b["access"], bool(b["is_virtual"]))
                 for b in bases
                 if b["base_usr"] not in visited_up
             ]
-            for depth in range(1, max_depth + 1):
-                if not current_level:
-                    break
-                # Deduplicate within level (diamond inheritance)
-                seen_level: set[str] = set()
-                unique_level: list[tuple[str, str, bool]] = []
-                for cur_usr, access, is_virtual in current_level:
-                    if cur_usr not in seen_level and cur_usr not in visited_up:
-                        seen_level.add(cur_usr)
-                        visited_up.add(cur_usr)
-                        unique_level.append((cur_usr, access, is_virtual))
-                current_level = unique_level
-                if not current_level:
-                    break
-
-                level_usrs = [u for u, _, _ in current_level]
-                # Batch lookup symbols for all USRs at this depth
-                placeholders = ",".join("?" * len(level_usrs))
-                symbol_rows = db.conn.execute(
-                    f"SELECT usr, name, kind, file_path FROM symbols WHERE config_hash=? AND usr IN ({placeholders})",
-                    (config_hash, *level_usrs),
-                ).fetchall()
-                symbol_map: dict[str, sqlite3.Row] = {r["usr"]: r for r in symbol_rows}
-
-                # Batch lookup bases for the next depth
-                bases_batch = get_direct_bases_batch(db.conn, config_hash, level_usrs)
-
-                # Build results and next level
-                next_level: list[tuple[str, str, bool]] = []
-                for cur_usr, access, is_virtual in current_level:
-                    cur_row = symbol_map.get(cur_usr)
-                    all_bases.append({
-                        "name": cur_row["name"] if cur_row else "<unknown>",
-                        "usr": cur_usr,
-                        "access": access,
-                        "is_virtual": is_virtual,
-                        "depth": depth,
-                        "file": abs_path(root, cur_row["file_path"]) if cur_row and cur_row["file_path"] else None,
-                        "kind": cur_row["kind"] if cur_row else None,
-                    })
-                    for gb in bases_batch.get(cur_usr, []):
-                        if gb["base_usr"] not in visited_up:
-                            next_level.append((gb["base_usr"], gb["access"], bool(gb["is_virtual"])))
-                current_level = next_level
-            result["all_bases"] = all_bases
+            result["all_bases"] = _bfs_inheritance_walk(
+                db.conn, config_hash, root,
+                start_edges=start_up,
+                batch_fn=get_direct_bases_batch,
+                edge_usr_key="base_usr",
+                visited=visited_up,
+                max_depth=max_depth,
+            )
 
             # ── Walk down — descendants ──
-            all_derived: list[dict] = []
             visited_down: set[str] = {usr}
-            current_level = [
+            start_down = [
                 (d["derived_usr"], d["access"], bool(d["is_virtual"]))
                 for d in derived
                 if d["derived_usr"] not in visited_down
             ]
-            for depth in range(1, max_depth + 1):
-                if not current_level:
-                    break
-                seen_level_down: set[str] = set()
-                unique_level_down: list[tuple[str, str, bool]] = []
-                for cur_usr, access, is_virtual in current_level:
-                    if cur_usr not in seen_level_down and cur_usr not in visited_down:
-                        seen_level_down.add(cur_usr)
-                        visited_down.add(cur_usr)
-                        unique_level_down.append((cur_usr, access, is_virtual))
-                current_level = unique_level_down
-                if not current_level:
-                    break
-
-                level_usrs = [u for u, _, _ in current_level]
-                placeholders = ",".join("?" * len(level_usrs))
-                symbol_rows = db.conn.execute(
-                    f"SELECT usr, name, kind, file_path FROM symbols WHERE config_hash=? AND usr IN ({placeholders})",
-                    (config_hash, *level_usrs),
-                ).fetchall()
-                symbol_map = {r["usr"]: r for r in symbol_rows}
-
-                derived_batch = get_direct_derived_batch(db.conn, config_hash, level_usrs)
-
-                next_level = []
-                for cur_usr, access, is_virtual in current_level:
-                    cur_row = symbol_map.get(cur_usr)
-                    all_derived.append({
-                        "name": cur_row["name"] if cur_row else "<unknown>",
-                        "usr": cur_usr,
-                        "access": access,
-                        "is_virtual": is_virtual,
-                        "depth": depth,
-                        "file": abs_path(root, cur_row["file_path"]) if cur_row and cur_row["file_path"] else None,
-                        "kind": cur_row["kind"] if cur_row else None,
-                    })
-                    for gd in derived_batch.get(cur_usr, []):
-                        if gd["derived_usr"] not in visited_down:
-                            next_level.append((gd["derived_usr"], gd["access"], bool(gd["is_virtual"])))
-                current_level = next_level
-            result["all_derived"] = all_derived
+            result["all_derived"] = _bfs_inheritance_walk(
+                db.conn, config_hash, root,
+                start_edges=start_down,
+                batch_fn=get_direct_derived_batch,
+                edge_usr_key="derived_usr",
+                visited=visited_down,
+                max_depth=max_depth,
+            )
 
     return result
 
