@@ -197,9 +197,9 @@ class CompilationUnit:
     raw_entry: dict | None = None
 
 
-def _expand_response_file(token: str, cwd: Path) -> list[str]:
+def expand_response_file(token: str, cwd: Path | None = None) -> list[str]:
     rsp = Path(token[1:])
-    if not rsp.is_absolute():
+    if cwd is not None and not rsp.is_absolute():
         rsp = cwd / rsp
     if not rsp.exists():
         return []
@@ -235,7 +235,7 @@ def normalize_args(
     expanded: list[str] = []
     for token in raw_args:
         if token.startswith("@"):
-            expanded.extend(_expand_response_file(token, cwd))
+            expanded.extend(expand_response_file(token, cwd))
         else:
             expanded.append(token)
 

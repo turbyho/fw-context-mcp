@@ -10,9 +10,10 @@ import hashlib
 import shlex
 from pathlib import Path
 
+from .compile_commands import _DROP_WITH_ARG, expand_response_file
+
 # Arguments that vary per-build but don't affect compilation semantics
 _TRANSIENT_DROP = frozenset({"-MD", "-MP", "-MMD", "-MG"})
-_TRANSIENT_DROP_WITH_ARG = frozenset({"-o", "-MF", "-MT", "-MQ"})
 
 
 def _normalize_entry(entry: dict) -> dict:
@@ -38,13 +39,8 @@ def _normalize_entry(entry: dict) -> dict:
     expanded: list[str] = []
     for token in raw_args:
         if token.startswith("@"):
-            rsp = Path(token[1:])
-            if rsp.exists():
-                try:
-                    expanded.extend(shlex.split(rsp.read_text()))
-                except (OSError, ValueError):
-                    pass  # unreadable: skip; hash will differ — intentional
-            # If missing: skip; hash will differ — intentional (build dir gone)
+            rsp_args = expand_response_file(token, None)
+            expanded.extend(rsp_args)
         else:
             expanded.append(token)
 
@@ -54,7 +50,7 @@ def _normalize_entry(entry: dict) -> dict:
         if skip_next:
             skip_next = False
             continue
-        if token in _TRANSIENT_DROP_WITH_ARG:
+        if token in _DROP_WITH_ARG:
             skip_next = True
             continue
         if token in _TRANSIENT_DROP:
@@ -69,9 +65,6 @@ def _normalize_entry(entry: dict) -> dict:
 
     return {"file": file, "args": sorted(result)}
 
-
-# Public alias for use by the runner for per-TU flags hashing.
-normalize_entry = _normalize_entry
 
 
 def compute_flags_hash(entry: dict) -> str:

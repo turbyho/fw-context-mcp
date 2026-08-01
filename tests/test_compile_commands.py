@@ -7,7 +7,7 @@ from fw_context_mcp.indexer.compile_commands import (
     _SOURCE_EXTS,
     _detect_language,
     _detect_target_triple,
-    _expand_response_file,
+    expand_response_file,
     _gcc_system_includes,
     _is_source_file,
     normalize_args,
@@ -70,17 +70,17 @@ class TestExpandResponseFile:
     def test_expands_valid_file(self, tmpdir):
         rsp = tmpdir / "flags.rsp"
         rsp.write_text("-DFOO=1 -DBAR=2\n")
-        result = _expand_response_file(f"@{rsp}", tmpdir)
+        result = expand_response_file(f"@{rsp}", tmpdir)
         assert result == ["-DFOO=1", "-DBAR=2"]
 
     def test_missing_file_returns_empty(self, tmpdir):
-        result = _expand_response_file("@/nonexistent.rsp", tmpdir)
+        result = expand_response_file("@/nonexistent.rsp", tmpdir)
         assert result == []
 
     def test_relative_path(self, tmpdir):
         rsp = tmpdir / "flags.rsp"
         rsp.write_text("-DBAZ=3\n")
-        result = _expand_response_file("@flags.rsp", tmpdir)
+        result = expand_response_file("@flags.rsp", tmpdir)
         assert result == ["-DBAZ=3"]
 
 
