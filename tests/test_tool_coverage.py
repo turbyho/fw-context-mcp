@@ -21,9 +21,20 @@ _src = _repo_root / "src"
 if str(_src) not in sys.path:
     sys.path.insert(0, str(_src))
 
-from fw_context_mcp.mcp.server import (  # noqa: E402 — sys.path setup must precede
+from fw_context_mcp.mcp.handlers.maintenance import (  # noqa: E402
     check_ollama,
-    explain_symbol,
+    get_active_build,
+    list_projects,
+    reindex_file,
+    reset_index,
+)
+from fw_context_mcp.mcp.handlers.search import (  # noqa: E402
+    lookup_symbol,
+    search_code,
+    semantic_search,
+    smart_search,
+)
+from fw_context_mcp.mcp.handlers.callgraph import (  # noqa: E402
     find_all_callers_recursive,
     find_call_path,
     find_callees_recursive,
@@ -32,22 +43,19 @@ from fw_context_mcp.mcp.server import (  # noqa: E402 — sys.path setup must pr
     find_hotspots,
     find_references,
     find_wrapper_callers,
-    get_active_build,
-    get_class_members,
+    trace_data_flow,
+)
+from fw_context_mcp.mcp.handlers.source import (  # noqa: E402
+    explain_symbol,
     get_file_map,
-    get_inheritance_chain,
-    get_method_overrides,
     get_source,
     get_symbol_context,
+)
+from fw_context_mcp.mcp.handlers.inheritance import (  # noqa: E402
+    get_class_members,
+    get_inheritance_chain,
+    get_method_overrides,
     get_template_instances,
-    list_projects,
-    lookup_symbol,
-    reindex_file,
-    reset_index,
-    search_code,
-    semantic_search,
-    smart_search,
-    trace_data_flow,
 )
 
 # ── Helpers ─────────────────────────────────────────────────────────────────────
