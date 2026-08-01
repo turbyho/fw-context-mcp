@@ -9,6 +9,10 @@ import re
 import shutil
 import sys
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from ..config.tools import AiTool
 
 
 def _install_skills(
@@ -152,6 +156,127 @@ def _build_agent_targets(
     return targets
 
 
+def _inject_critical_block(
+    agents_dir: Path,
+    patterns: list[str],
+    *,
+    dry_run: bool = False,
+    critical_block: str,
+) -> bool:
+    """Inject CRITICAL block into ALL existing agent files in *agents_dir*.
+
+    Scans *agents_dir* for files matching *patterns*, injecting
+    *critical_block* into each one (TOML vs markdown handled automatically).
+    Returns ``True`` if any files were updated (or would be in dry-run mode).
+    """
+    from ._mcp import _inject_agent_section, _inject_agent_toml_section
+
+    installed = False
+    existing_files: list[Path] = []
+    for pattern in patterns:
+        existing_files.extend(sorted(agents_dir.glob(pattern)))
+
+    for agent_path in existing_files:
+        if dry_run:
+            print(f"  [dry-run] {agent_path}: would UPDATE fw-context section")
+            installed = True
+            continue
+
+        if agent_path.suffix == ".toml":
+            _inject_agent_toml_section(agent_path, critical_block, "fw-context")
+        else:
+            _inject_agent_section(agent_path, critical_block, "fw-context")
+        print(f"  [ok] {agent_path}: updated fw-context section")
+        installed = True
+
+    return installed
+
+
+def _install_template_agents(
+    agents_dir: Path,
+    templates: list[Path],
+    patterns: list[str],
+    *,
+    strip_name: bool = False,
+    dry_run: bool = False,
+    scope: str = "project",
+) -> bool:
+    """Install template agents into *agents_dir* where not yet present.
+
+    Handles three formats:
+    - ``.md`` → ``.md`` (standard — Claude Code, Cursor, Windsurf)
+    - ``.md`` → ``.toml`` (Codex conversion)
+    - ``.md`` → ``.mdc`` (Cursor rules, same content)
+
+    Returns ``True`` if any templates were installed (or would be in dry-run).
+    """
+    from ._mcp import _convert_agent_md_to_toml
+
+    if not templates:
+        return False
+    if not agents_dir.exists() and scope != "all":
+        return False
+
+    installed = False
+    for template_path in templates:
+        template_suffix = template_path.suffix  # ".md"
+        is_compatible = any(template_suffix == p.lstrip("*") for p in patterns)
+        if not is_compatible:
+            # Convert .md → .toml when target uses TOML patterns (Codex)
+            has_toml = any(".toml" in p for p in patterns)
+            if has_toml:
+                target_name = template_path.stem + ".toml"
+                target_path = agents_dir / target_name
+                template_text = _convert_agent_md_to_toml(template_path.read_text(encoding="utf-8"))
+                if strip_name:
+                    template_text = re.sub(r"^# name:.*\n", "", template_text, flags=re.MULTILINE)
+                if dry_run:
+                    if not target_path.exists():
+                        print(f"  [dry-run] {target_path}: would CREATE (TOML)")
+                        installed = True
+                    continue
+                agents_dir.mkdir(parents=True, exist_ok=True)
+                target_path.write_text(template_text, encoding="utf-8")
+                print(f"  [ok] {target_path}: created (TOML)")
+                installed = True
+            # Rename .md → .mdc when target uses Cursor patterns (same content)
+            elif any(".mdc" in p for p in patterns):
+                target_name = template_path.stem + ".mdc"
+                target_path = agents_dir / target_name
+                template_text = template_path.read_text(encoding="utf-8")
+                if strip_name:
+                    template_text = re.sub(r"^name:.*\n", "", template_text, flags=re.MULTILINE)
+                if dry_run:
+                    if not target_path.exists():
+                        print(f"  [dry-run] {target_path}: would CREATE")
+                        installed = True
+                    continue
+                agents_dir.mkdir(parents=True, exist_ok=True)
+                target_path.write_text(template_text, encoding="utf-8")
+                print(f"  [ok] {target_path}: created")
+                installed = True
+            continue
+
+        target_path = agents_dir / template_path.name
+
+        if dry_run:
+            if not target_path.exists():
+                print(f"  [dry-run] {target_path}: would CREATE with fw-context section")
+                installed = True
+            continue
+
+        if not target_path.exists():
+            agents_dir.mkdir(parents=True, exist_ok=True)
+            template_text = template_path.read_text(encoding="utf-8")
+            if strip_name:
+                template_text = re.sub(r"^name:.*\n", "", template_text, flags=re.MULTILINE)
+            target_path.write_text(template_text, encoding="utf-8")
+            print(f"  [ok] {target_path}: created with fw-context section")
+            installed = True
+
+    return installed
+
+
 def _install_agents(dry_run: bool = False, project_root: Path | None = None, scope: str = "project") -> bool:
     """Inject fw-context CRITICAL block into ALL agent files across ALL AI tools.
 
@@ -166,7 +291,6 @@ def _install_agents(dry_run: bool = False, project_root: Path | None = None, sco
     """
     from ..config.tools import AGENT_CRITICAL_BLOCK
     from . import __file__ as _pkg_init
-    from ._mcp import _convert_agent_md_to_toml, _inject_agent_section, _inject_agent_toml_section
 
     pkg_dir = Path(_pkg_init).parent
     agents_src = pkg_dir / "data" / "agents"
@@ -176,86 +300,15 @@ def _install_agents(dry_run: bool = False, project_root: Path | None = None, sco
 
     installed = False
     for agents_dir, _tool_id, patterns, strip_name in targets:
-        # ── Step 1: Inject CRITICAL block into ALL existing agent files ──
-        existing_files: list[Path] = []
-        for pattern in patterns:
-            existing_files.extend(sorted(agents_dir.glob(pattern)))
-
-        for agent_path in existing_files:
-            if dry_run:
-                print(f"  [dry-run] {agent_path}: would UPDATE fw-context section")
-                installed = True
-                continue
-
-            if agent_path.suffix == ".toml":
-                _inject_agent_toml_section(agent_path, AGENT_CRITICAL_BLOCK, "fw-context")
-            else:
-                _inject_agent_section(agent_path, AGENT_CRITICAL_BLOCK, "fw-context")
-            print(f"  [ok] {agent_path}: updated fw-context section")
+        if _inject_critical_block(
+            agents_dir, patterns, dry_run=dry_run, critical_block=AGENT_CRITICAL_BLOCK
+        ):
             installed = True
-
-        # ── Step 2: Install template agents for compatible directories ──
-        if not templates:
-            continue
-        if not agents_dir.exists() and scope != "all":
-            continue
-
-        for template_path in templates:
-            # Install .md templates into dirs with compatible patterns
-            template_suffix = template_path.suffix  # ".md"
-            is_compatible = any(template_suffix == p.lstrip("*") for p in patterns)
-            if not is_compatible:
-                # Convert .md → .toml when target uses TOML patterns (Codex)
-                has_toml = any(".toml" in p for p in patterns)
-                if has_toml:
-                    target_name = template_path.stem + ".toml"
-                    target_path = agents_dir / target_name
-                    template_text = _convert_agent_md_to_toml(template_path.read_text(encoding="utf-8"))
-                    if strip_name:
-                        template_text = re.sub(r"^# name:.*\n", "", template_text, flags=re.MULTILINE)
-                    if dry_run:
-                        if not target_path.exists():
-                            print(f"  [dry-run] {target_path}: would CREATE (TOML)")
-                            installed = True
-                        continue
-                    agents_dir.mkdir(parents=True, exist_ok=True)
-                    target_path.write_text(template_text, encoding="utf-8")
-                    print(f"  [ok] {target_path}: created (TOML)")
-                    installed = True
-                # Rename .md → .mdc when target uses Cursor patterns (same content)
-                elif any(".mdc" in p for p in patterns):
-                    target_name = template_path.stem + ".mdc"
-                    target_path = agents_dir / target_name
-                    template_text = template_path.read_text(encoding="utf-8")
-                    if strip_name:
-                        template_text = re.sub(r"^name:.*\n", "", template_text, flags=re.MULTILINE)
-                    if dry_run:
-                        if not target_path.exists():
-                            print(f"  [dry-run] {target_path}: would CREATE")
-                            installed = True
-                        continue
-                    agents_dir.mkdir(parents=True, exist_ok=True)
-                    target_path.write_text(template_text, encoding="utf-8")
-                    print(f"  [ok] {target_path}: created")
-                    installed = True
-                continue
-
-            target_path = agents_dir / template_path.name
-
-            if dry_run:
-                if not target_path.exists():
-                    print(f"  [dry-run] {target_path}: would CREATE with fw-context section")
-                    installed = True
-                continue
-
-            if not target_path.exists():
-                agents_dir.mkdir(parents=True, exist_ok=True)
-                template_text = template_path.read_text(encoding="utf-8")
-                if strip_name:
-                    template_text = re.sub(r"^name:.*\n", "", template_text, flags=re.MULTILINE)
-                target_path.write_text(template_text, encoding="utf-8")
-                print(f"  [ok] {target_path}: created with fw-context section")
-                installed = True
+        if _install_template_agents(
+            agents_dir, templates, patterns,
+            strip_name=strip_name, dry_run=dry_run, scope=scope,
+        ):
+            installed = True
 
     return installed
 
@@ -302,49 +355,63 @@ def _select_init_tools(args: argparse.Namespace, project_root: Path) -> list[str
     return selected
 
 
-def _init_one_tool(
+def _handle_inheritance(
+    tool: AiTool,
     tool_id: str,
+    *,
+    force: bool,
+    selected: list[str],
+) -> tuple[bool, bool, list[str]]:
+    """Resolve tool inheritance — whether to skip, force, or proceed normally.
+
+    Returns ``(should_return, ok, warnings)``.  When *should_return* is
+    ``True`` the caller must return ``(ok, warnings)`` immediately.
+    Otherwise *ok* is the initial ok flag to carry forward.
+    """
+    from ..config.tools import TOOLS
+
+    if not tool.inherits_from:
+        return False, False, []
+
+    parent = TOOLS.get(tool.inherits_from)
+    parent_name = parent.name if parent else tool.inherits_from
+    parent_ok = parent and parent.is_detected()
+
+    if parent_ok and tool_id in selected and tool.inherits_from in selected:
+        print(f"  [info] Inherits from {parent_name} — already handled above, skipping")
+        return True, True, []
+
+    if parent_ok:
+        print(f"  [info] Inherits from {parent_name} which has fw-context instructions")
+        if not force:
+            print("  [skip] Nothing to do. Use --force to inject anyway.")
+            return True, True, []
+        print("  [force] Injecting despite inheritance...")
+        return False, True, []
+
+    print(f"  [warn] Inherits from {parent_name} but parent NOT DETECTED")
+    print("  [info] Injecting instructions anyway...")
+    return False, False, []
+
+
+def _inject_instructions(
+    tool: AiTool,
     args: argparse.Namespace,
     project_root: Path,
-    mcp_bin: str | None,
-    selected: list[str],
 ) -> tuple[bool, list[str]]:
-    """Initialize a single AI tool: MCP registration + instruction injection.
+    """Write rendered instructions into every configured target file.
 
-    Returns (ok, warnings).  ok=True if at least one action succeeded;
-    an inherited tool that requires no action is also considered ok.
+    Handles collision detection (skillshare-managed, unmarked content),
+    dry-run preview, and both ``marked_section`` and ``separate_file``
+    write methods.
+
+    Returns ``(ok, warnings)``.
     """
-    from ..config.tools import TOOLS, check_target
-    from ._mcp import _register_mcp, _update_marked_section
+    from ..config.tools import check_target
+    from ._mcp import _update_marked_section
 
-    tool = TOOLS[tool_id]
-    print(f"\n── {tool.name} ({tool_id}) ──")
-    warnings: list[str] = []
     ok = False
-
-    if tool.inherits_from:
-        parent = TOOLS.get(tool.inherits_from)
-        parent_name = parent.name if parent else tool.inherits_from
-        parent_ok = parent and parent.is_detected()
-        if parent_ok and tool_id in selected and tool.inherits_from in selected:
-            print(f"  [info] Inherits from {parent_name} — already handled above, skipping")
-            return True, warnings
-        elif parent_ok:
-            print(f"  [info] Inherits from {parent_name} which has fw-context instructions")
-            ok = True
-            if not args.force:
-                print("  [skip] Nothing to do. Use --force to inject anyway.")
-                return ok, warnings
-            print("  [force] Injecting despite inheritance...")
-        else:
-            print(f"  [warn] Inherits from {parent_name} but parent NOT DETECTED")
-            print("  [info] Injecting instructions anyway...")
-
-    if not args.instructions_only and mcp_bin and (tool.mcp_registration or tool.mcp_config_file):
-        if args.dry_run:
-            _register_mcp(tool, mcp_bin, dry_run=True)
-        else:
-            _register_mcp(tool, mcp_bin)
+    warnings: list[str] = []
 
     if not tool.targets:
         if not tool.mcp_registration and not tool.mcp_config_file:
@@ -389,6 +456,48 @@ def _init_one_tool(
             resolved.write_text(instructions, encoding="utf-8")
             print(f"  [ok] {resolved}: written")
         ok = True
+
+    return ok, warnings
+
+
+def _init_one_tool(
+    tool_id: str,
+    args: argparse.Namespace,
+    project_root: Path,
+    mcp_bin: str | None,
+    selected: list[str],
+) -> tuple[bool, list[str]]:
+    """Initialize a single AI tool: MCP registration + instruction injection.
+
+    Returns (ok, warnings).  ok=True if at least one action succeeded;
+    an inherited tool that requires no action is also considered ok.
+    """
+    from ..config.tools import TOOLS
+    from ._mcp import _register_mcp
+
+    tool = TOOLS[tool_id]
+    print(f"\n── {tool.name} ({tool_id}) ──")
+    warnings: list[str] = []
+
+    # ── Inheritance ──
+    should_return, ok, inh_warnings = _handle_inheritance(
+        tool, tool_id, force=args.force, selected=selected,
+    )
+    warnings.extend(inh_warnings)
+    if should_return:
+        return ok, warnings
+
+    # ── MCP registration ──
+    if not args.instructions_only and mcp_bin and (tool.mcp_registration or tool.mcp_config_file):
+        if args.dry_run:
+            _register_mcp(tool, mcp_bin, dry_run=True)
+        else:
+            _register_mcp(tool, mcp_bin)
+
+    # ── Instruction injection ──
+    inj_ok, inj_warnings = _inject_instructions(tool, args, project_root)
+    ok = ok or inj_ok
+    warnings.extend(inj_warnings)
 
     return ok, warnings
 
