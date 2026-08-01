@@ -318,6 +318,7 @@ def _start_ping_thread(root: Path) -> None:
             try:
                 alive = ping_daemon(root)
                 if not alive:
+                    # Revival handled by _ensure_daemon_running in background.py
                     log.debug("Daemon ping failed — daemon may have exited")
             except OSError:
                 log.debug("Daemon ping error", exc_info=True)
