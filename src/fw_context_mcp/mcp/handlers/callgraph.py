@@ -672,15 +672,16 @@ def find_wrapper_callers(
         if _lookup_definition(conn, config_hash, class_name, preferred_kinds=None) is None:
             return [{"error": f"Symbol not found: {class_name}"}]
 
-        # Find all methods of the class
+        # Find all methods of the class (index-able prefix LIKE, no leading %)
         driver_methods = conn.execute(
             """SELECT s.usr, s.name, s.qualified_name
                FROM symbols s
                WHERE s.config_hash = ?
                  AND s.kind = 'method'
-                 AND (s.qualified_name LIKE ? OR s.qualified_name LIKE ?)  -- full table scan: LIKE with leading % cannot use index
-               ORDER BY s.name""",
-            (config_hash, f"{class_name}::%", f"%{class_name}::%"),
+                 AND s.qualified_name LIKE ?
+               ORDER BY s.name
+               LIMIT ?""",
+            (config_hash, f"{class_name}::%", max(limit * 10, 500)),
         ).fetchall()
 
         if not driver_methods:
