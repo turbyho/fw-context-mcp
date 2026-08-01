@@ -139,7 +139,7 @@ async def daemon_main(project_root: Path) -> None:
             data = await asyncio.wait_for(reader.read(1024), timeout=2.0)
             if b"ping" in data:
                 last_ping_time = time.monotonic()
-        except (asyncio.TimeoutError, OSError):
+        except (TimeoutError, OSError):
             pass
         finally:
             try:
@@ -267,7 +267,7 @@ async def daemon_main(project_root: Path) -> None:
             index_proc.terminate()
             try:
                 await asyncio.wait_for(index_proc.wait(), timeout=10)
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 dlog.warning("Index subprocess did not exit, killing")
                 index_proc.kill()
                 await index_proc.wait()
@@ -460,7 +460,7 @@ async def _wait_index(
                 proc.terminate()
                 try:
                     await asyncio.wait_for(proc.wait(), timeout=10)
-                except asyncio.TimeoutError:
+                except TimeoutError:
                     log.warning("Index subprocess did not exit after SIGTERM, killing")
                     proc.kill()
                     await proc.wait()

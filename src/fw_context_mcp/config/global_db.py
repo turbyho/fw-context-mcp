@@ -15,6 +15,7 @@ import logging
 import sqlite3
 import threading
 from pathlib import Path
+
 from fw_context_mcp.utils import SAFE_EXCEPT, is_fatal
 
 log = logging.getLogger(__name__)

@@ -7,7 +7,6 @@ of duplicated code.
 from __future__ import annotations
 
 import math
-
 import re
 
 _SAFE_TABLE_NAME = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*$")

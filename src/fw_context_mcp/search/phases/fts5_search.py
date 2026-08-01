@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 import logging
-import sqlite3
 import re
+import sqlite3
 from typing import TYPE_CHECKING
 
 from fw_context_mcp.search.phases.base import Phase
@@ -95,7 +95,7 @@ def _search_queries(  # NOTE(turbyho, 2026-07-31): combine OR + name_tokens into
                     rows.append(dict(r))
                 elif r["is_definition"] and not rows[prev_idx].get("is_definition"):
                     rows[prev_idx] = dict(r)
-        except sqlite3.Error as e:
+        except sqlite3.Error:
             log.warning("FTS5 query failed (q=%r)", q[:60], exc_info=True)
 
     return rows

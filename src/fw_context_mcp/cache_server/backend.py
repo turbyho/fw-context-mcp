@@ -10,9 +10,9 @@ Write behaviour is controlled by *can_overwrite*:
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import re
-import hashlib
 import secrets
 from typing import Any
 

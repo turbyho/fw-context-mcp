@@ -13,8 +13,8 @@ Startup/shutdown hooks manage the asyncpg connection pool lifecycle.
 from __future__ import annotations
 
 import logging
-import re
 import os
+import re
 from contextlib import asynccontextmanager
 from typing import Any
 
@@ -98,7 +98,7 @@ class BatchPutRequest(BaseModel):
 
 # -- Application factory --
 
-def create_app(*, backend: "CacheStorageBackend | None" = None) -> FastAPI:
+def create_app(*, backend: CacheStorageBackend | None = None) -> FastAPI:
     """Create and configure the FastAPI app.
 
     *backend* is for testing — when provided, it is used as

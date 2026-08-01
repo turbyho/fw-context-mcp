@@ -27,12 +27,12 @@ def _install_skills(
     ones — if a project has its own copy the user intentionally
     customized it.
     """
-    from . import __file__ as _pkg_init
     from ..config.tools import (
         CROSS_TOOL_SKILL_DIRS_GLOBAL,
         CROSS_TOOL_SKILL_DIRS_PROJECT,
         TOOLS,
     )
+    from . import __file__ as _pkg_init
 
     pkg_dir = Path(_pkg_init).parent
     skill_dir = pkg_dir / "data" / "skills" / "fw-review"
@@ -164,8 +164,8 @@ def _install_agents(dry_run: bool = False, project_root: Path | None = None, sco
     Agent directories and file patterns are driven by the ``TOOLS``
     registry — no tool paths are hardcoded here.
     """
-    from . import __file__ as _pkg_init
     from ..config.tools import AGENT_CRITICAL_BLOCK
+    from . import __file__ as _pkg_init
     from ._mcp import _convert_agent_md_to_toml, _inject_agent_section, _inject_agent_toml_section
 
     pkg_dir = Path(_pkg_init).parent
@@ -408,8 +408,8 @@ def cmd_init(args: argparse.Namespace) -> int:
     project root when using project-scoped injection.
     """
     from ..config import load as load_project_config
-    from ..config.settings import _ensure_project_config, _ensure_project_local_config
-    from ..config.settings import _write_project_id, generate_project_id as _gen_pid
+    from ..config.settings import _ensure_project_config, _ensure_project_local_config, _write_project_id
+    from ..config.settings import generate_project_id as _gen_pid
     from ..config.tools import TOOLS
     from ..indexer.build import detect_build_system
     from ..utils import resolve_project_root
@@ -525,33 +525,14 @@ def _check_config_file(project_root: Path, rel_path: str, template: str, fix: bo
             print(f"  [warn] {path} missing — run with --fix to create")
         return
 
-    # Parse template for option keys (lines like "# key = value" or "key = value")
-    template_keys: set[str] = set()
-    for line in template.splitlines():
-        # Match both "# key = ..." and "key = ..." lines
-        m = re.match(r"^#?\s*(\w+)\s*=", line)
-        if m:
-            template_keys.add(m.group(1))
+    from fw_context_mcp.config._toml_editor import merge_template
 
-    existing_text = path.read_text(encoding="utf-8")
-    missing: list[str] = []
-    for key in sorted(template_keys):
-        if not re.search(rf"^\s*#?\s*{key}\s*=", existing_text, re.MULTILINE):
-            # Also check if key appears under a [section] (TOML scoped)
-            if not re.search(rf"^\s*{key}\s*=", existing_text, re.MULTILINE):
-                missing.append(key)
-
-    if missing:
+    added = merge_template(path, template)
+    if added:
         if fix:
-            with path.open("a", encoding="utf-8") as f:
-                f.write("\n")
-                for line in template.splitlines():
-                    m = re.match(r"^#?\s*(\w+)\s*=", line)
-                    if m and m.group(1) in missing:
-                        f.write(line + "\n")
-            print(f"  [fix] {path}: added {', '.join(missing)}")
+            print(f"  [fix] {path}: added {', '.join(added)}")
         else:
-            print(f"  [info] {path}: missing options: {', '.join(missing)}")
+            print(f"  [info] {path}: missing options: {', '.join(added)}")
     else:
         print(f"  [ok] {path}")
 

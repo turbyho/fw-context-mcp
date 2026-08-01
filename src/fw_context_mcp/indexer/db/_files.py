@@ -5,6 +5,17 @@ from __future__ import annotations
 import sqlite3
 from typing import NamedTuple
 
+__all__ = [
+    "FileHashRecord",
+    "delete_orphan_files",
+    "delete_symbols_for_file",
+    "get_file_hashes",
+    "get_file_map",
+    "get_file_mtime_indexed",
+    "get_file_mtimes",
+    "upsert_file",
+]
+
 
 
 def _escape_like(value: str) -> str:

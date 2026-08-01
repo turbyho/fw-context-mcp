@@ -39,8 +39,9 @@ async def _lookup_permissions(request: Request, token: str) -> dict[str, Any] | 
 # Simple in-memory IP-based rate limiter for auth failures.
 # Tracks failed attempts per IP with a sliding 60s window.
 _auth_failures: dict[str, list[float]] = {}
-import time as _time
 import threading as _threading
+import time as _time
+
 _auth_lock = _threading.Lock()
 _auth_check_count: int = 0
 _AUTH_PRUNE_INTERVAL = 100  # prune stale entries every N checks

@@ -99,8 +99,8 @@ def _validate_and_fix_artifacts(
     if not detected_system:
         return compile_commands, None, True
 
-    from ..indexer.builders import registry as builder_registry
     from ..indexer.build import generate_compile_commands
+    from ..indexer.builders import registry as builder_registry
     from ..indexer.validator import is_compile_commands_stale, validate_and_fix
 
     builder_cls = builder_registry.get(detected_system)

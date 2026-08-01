@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import argparse
 import sqlite3
-import sys
 
 
 def cmd_watch(args: argparse.Namespace) -> int:

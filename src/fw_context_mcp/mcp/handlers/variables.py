@@ -9,8 +9,8 @@ from typing import Annotated
 from pydantic import Field
 
 from ...utils import abs_path
-from ._base import BaseHandler
 from ..shared.stale import _stale_files
+from ._base import BaseHandler
 
 log = logging.getLogger(__name__)
 
@@ -186,19 +186,16 @@ def find_variables(
 
         return results
 
-    try:
-        with db.conn:
-            results = _do_find(db.conn, db.config_hash)
-            file_paths = [abs_path(db.root, r["file"]) for r in results if "file" in r]
-            if file_paths:
-                stale = _stale_files(db.conn, db.config_hash, file_paths, db.root)
-                if stale:
-                    from fw_context_mcp.mcp.background import _ensure_daemon_running
-                    _ensure_daemon_running(db.root)
-                    return [{"warning": (
-                        f"Results may be stale — {len(stale)} file(s) changed. "
-                        "Background reindex in progress. Run 'fw-context index' to force full update."
-                    )}] + results
-            return results
-    finally:
-        pass  # connection managed by connection.py cache
+    with db.conn:
+        results = _do_find(db.conn, db.config_hash)
+        file_paths = [abs_path(db.root, r["file"]) for r in results if "file" in r]
+        if file_paths:
+            stale = _stale_files(db.conn, db.config_hash, file_paths, db.root)
+            if stale:
+                from fw_context_mcp.mcp.background import _ensure_daemon_running
+                _ensure_daemon_running(db.root)
+                return [{"warning": (
+                    f"Results may be stale — {len(stale)} file(s) changed. "
+                    "Background reindex in progress. Run 'fw-context index' to force full update."
+                )}] + results
+        return results

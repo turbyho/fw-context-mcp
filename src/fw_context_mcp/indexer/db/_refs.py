@@ -4,6 +4,21 @@ from __future__ import annotations
 
 import sqlite3
 
+__all__ = [
+    "count_fp_assignments",
+    "count_indirect_call_sites",
+    "count_refs",
+    "delete_fp_assignments_for_file",
+    "delete_indirect_call_sites_for_file",
+    "delete_refs_for_file",
+    "find_indirect_call_sites",
+    "find_indirect_targets",
+    "find_refs",
+    "insert_fp_assignments_batch",
+    "insert_indirect_call_sites_batch",
+    "insert_refs_batch",
+]
+
 
 def insert_refs_batch(conn: sqlite3.Connection, rows: list[tuple]) -> int:
     """Insert reference rows for the cross-reference / call graph.

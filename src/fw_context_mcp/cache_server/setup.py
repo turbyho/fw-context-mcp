@@ -17,7 +17,6 @@ import secrets
 import shutil
 import subprocess
 import sys
-import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -63,6 +62,7 @@ def setup_wizard() -> int:
         project_tokens = None
     else:
         import asyncio
+
         from .backend import CacheBackend
 
         # Collect ALL user input BEFORE the async block
@@ -524,6 +524,7 @@ def _ensure_cache_server_init() -> str | None:
         return os.environ.get("FW_CACHE_ADMIN_TOKEN", "unknown")
 
     import asyncio
+
     from .backend import CacheBackend
 
     async def _standalone():
@@ -575,6 +576,7 @@ def _setup_project_and_tokens(
     ``_all_db_ops()`` path instead (single ``asyncio.run()`` call).
     """
     import asyncio
+
     from .backend import CacheBackend
     db_url = _find_db_url()
 

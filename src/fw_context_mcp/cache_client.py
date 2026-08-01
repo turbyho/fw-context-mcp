@@ -13,8 +13,9 @@ import logging
 import sqlite3
 import time
 from pathlib import Path
-from fw_context_mcp.utils import SAFE_EXCEPT, is_fatal
 from typing import Any
+
+from fw_context_mcp.utils import SAFE_EXCEPT, is_fatal
 
 logger = logging.getLogger(__name__)
 

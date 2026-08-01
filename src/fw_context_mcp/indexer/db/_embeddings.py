@@ -24,7 +24,6 @@ import sqlite3
 import struct
 
 from fw_context_mcp.indexer.db._schema import _table_exists
-
 from fw_context_mcp.indexer.db._symbols import search_symbols
 
 log = logging.getLogger(__name__)

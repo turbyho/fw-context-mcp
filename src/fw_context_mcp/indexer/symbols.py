@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import re
+import threading
 from functools import lru_cache
 from pathlib import Path
 
@@ -11,7 +12,6 @@ import clang.cindex as cx
 
 from .compile_commands import CompilationUnit
 
-import threading
 _log = logging.getLogger(__name__)
 
 _INDEX: cx.Index | None = None
@@ -91,7 +91,6 @@ from .models import (
     Reference,
     Symbol,
 )
-
 
 
 def _cursor_kind_label(kind: cx.CursorKind) -> str:
@@ -1209,7 +1208,7 @@ from dataclasses import dataclass, field
 @dataclass
 class ExtractionResult:
     """Result of a single extract_all() call on one translation unit."""
-    tu: "cx.TranslationUnit | None" = None
+    tu: cx.TranslationUnit | None = None
     symbols: list = field(default_factory=list)
     references: list = field(default_factory=list)
     inheritance: list = field(default_factory=list)

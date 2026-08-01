@@ -14,6 +14,7 @@ import os
 import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
+
 from fw_context_mcp.utils import SAFE_EXCEPT, is_fatal
 
 # ── Instruction templates ───────────────────────────────────────────────────

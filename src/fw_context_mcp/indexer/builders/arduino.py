@@ -5,9 +5,9 @@ from __future__ import annotations
 import logging
 import shutil
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from fw_context_mcp.utils import run_build_command
-from typing import TYPE_CHECKING
 
 from . import registry
 from .protocol import BuildIssue

@@ -4,6 +4,16 @@ from __future__ import annotations
 
 import sqlite3
 
+__all__ = [
+    "delete_build_data",
+    "get_active_config",
+    "get_all_builds_for_project",
+    "get_all_projects",
+    "get_build_stats",
+    "upsert_build_config",
+    "upsert_project",
+]
+
 
 
 def delete_build_data(conn: sqlite3.Connection, config_hash: str) -> None:

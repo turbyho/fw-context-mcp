@@ -6,17 +6,16 @@ other small helpers that were copied into multiple modules.
 
 from __future__ import annotations
 
-
 import logging
 
 log = logging.getLogger(__name__)
-from collections import OrderedDict
 import hashlib
 import os
 import sqlite3
+import subprocess
+from collections import OrderedDict
 from datetime import UTC, datetime
 from pathlib import Path
-import subprocess
 
 from fw_context_mcp import _stdlib_sqlite3
 

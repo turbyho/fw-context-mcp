@@ -227,7 +227,7 @@ class HandlerContext:
     conn: sqlite3.Connection
     config_hash: str
     root: Path
-    cfg: "Config"
+    cfg: Config
     project_id: str
     db_path: Path
 

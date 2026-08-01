@@ -2,6 +2,19 @@
 
 import sqlite3
 
+__all__ = [
+    "delete_inheritance_for_file",
+    "get_class_members",
+    "get_direct_bases",
+    "get_direct_bases_batch",
+    "get_direct_derived",
+    "get_direct_derived_batch",
+    "get_overrides_for_method",
+    "get_template_instances",
+    "insert_inheritance_batch",
+    "insert_overrides_batch",
+]
+
 
 def insert_inheritance_batch(conn: sqlite3.Connection, rows: list[tuple]) -> int:
     """Insert inheritance edges.

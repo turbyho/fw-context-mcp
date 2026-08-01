@@ -12,10 +12,10 @@ from __future__ import annotations
 import logging
 import re
 import sqlite3
-from functools import lru_cache
-import time
-from collections import defaultdict, OrderedDict
 import threading
+import time
+from collections import OrderedDict, defaultdict
+from functools import lru_cache
 
 log = logging.getLogger(__name__)
 

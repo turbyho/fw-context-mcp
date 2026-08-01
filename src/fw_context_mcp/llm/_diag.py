@@ -2,11 +2,10 @@
 
 from __future__ import annotations
 
-import logging
-
 import httpx
 
 from fw_context_mcp.config.settings import LLMConfig
+from fw_context_mcp.llm.auto_model import _model_name_matches
 
 
 def check_setup(cfg: LLMConfig) -> dict:
@@ -38,22 +37,10 @@ def check_setup(cfg: LLMConfig) -> dict:
 
     models = resp.json().get("models", [])
     installed = [m["name"] for m in models]
-    model_found = cfg.model in installed
-
-    if not model_found:
-        # Match exact model name, tag variants (model:tag), or quantized variants (model-suffix)
-        model_found = any(
-            m == cfg.model or m.startswith(cfg.model + ":") or m.startswith(cfg.model + "-")
-            for m in installed
-        )
+    model_found = any(_model_name_matches(m, cfg.model) for m in installed)
 
     # Check embedding model too — semantic_search will fail at query time if it's missing
-    embed_found = cfg.embed_model in installed
-    if not embed_found:
-        embed_found = any(
-            m == cfg.embed_model or m.startswith(cfg.embed_model + ":") or m.startswith(cfg.embed_model + "-")
-            for m in installed
-        )
+    embed_found = any(_model_name_matches(m, cfg.embed_model) for m in installed)
 
     result: dict = {
         "status": "ok" if model_found else "model_missing",

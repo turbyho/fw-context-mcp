@@ -4,8 +4,6 @@ from __future__ import annotations
 
 import argparse
 import os
-import sys
-from pathlib import Path
 
 
 def _resolve_config_hash(conn, prefix: str) -> str | None:
