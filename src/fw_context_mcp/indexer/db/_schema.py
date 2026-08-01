@@ -14,6 +14,12 @@ import sqlite3
 
 log = logging.getLogger(__name__)
 
+__all__ = [
+    "CURRENT_SCHEMA_VERSION",
+    "_ensure_column",
+    "drop_fts_triggers",
+]
+
 
 def _ensure_column(conn: sqlite3.Connection, table: str, column: str, type_def: str) -> None:
     """Idempotently add a column to a table if it doesn't exist.
