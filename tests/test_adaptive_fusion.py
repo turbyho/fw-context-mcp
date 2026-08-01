@@ -13,26 +13,6 @@ from fw_context_mcp.search.phases.adaptive_fusion import (
     AdaptiveFusionPhase,
 )
 
-# ── RRF boost constants (moved from adaptive_fusion.py — test-only) ──
-
-PROJ_BOOST: float = 1.5
-FUNC_BOOST: float = 1.2
-PAGERANK_BOOST: float = 0.2
-
-
-def _boost(row: dict) -> float:
-    """Compute per-symbol RRF boost factor from project/kind/pagerank fields."""
-    b = 1.0
-    if row.get("is_project") == 1:
-        b *= PROJ_BOOST
-    kind = row.get("kind", "")
-    if kind in ("function", "method", "constructor", "destructor", "varglobal"):
-        b *= FUNC_BOOST
-    pr = row.get("pagerank", 0.0) or 0.0
-    if pr > 0:
-        b *= 1.0 + pr * PAGERANK_BOOST
-    return b
-
 
 def _make_ctx(*, limit: int = 20, embedding_results=None, fts5_results=None, config: Config | None = None) -> PipelineContext:
     return PipelineContext(
@@ -47,45 +27,6 @@ def _make_ctx(*, limit: int = 20, embedding_results=None, fts5_results=None, con
         fts5_results=fts5_results or [],
     )
 
-
-class TestBoostFunction:
-    def test_identity_for_empty_row(self) -> None:
-        assert _boost({}) == 1.0
-
-    def test_project_boost(self) -> None:
-        assert _boost({"is_project": 1}) == PROJ_BOOST
-
-    def test_non_project_no_boost(self) -> None:
-        assert _boost({"is_project": 0}) == 1.0
-
-    def test_function_kind_boost(self) -> None:
-        assert _boost({"kind": "function"}) == FUNC_BOOST
-
-    @pytest.mark.parametrize("kind", ["function", "method", "constructor", "destructor", "varglobal"])
-    def test_all_func_kinds_boosted(self, kind: str) -> None:
-        assert _boost({"kind": kind}) == FUNC_BOOST
-
-    @pytest.mark.parametrize("kind", ["class", "struct", "enum", "typedef", "variable", "field"])
-    def test_non_func_kinds_not_boosted(self, kind: str) -> None:
-        assert _boost({"kind": kind}) == 1.0
-
-    def test_pagerank_boost(self) -> None:
-        assert _boost({"pagerank": 1.0}) == 1.0 + PAGERANK_BOOST
-
-    def test_pagerank_zero_no_boost(self) -> None:
-        assert _boost({"pagerank": 0.0}) == 1.0
-
-    def test_pagerank_none_no_boost(self) -> None:
-        assert _boost({"pagerank": None}) == 1.0
-
-    def test_combined_boosts_multiply(self) -> None:
-        score = _boost({"is_project": 1, "kind": "function", "pagerank": 0.5})
-        expected = PROJ_BOOST * FUNC_BOOST * (1.0 + 0.5 * PAGERANK_BOOST)
-        assert score == expected
-
-    def test_varglobal_combined(self) -> None:
-        score = _boost({"is_project": 1, "kind": "varglobal"})
-        assert score == PROJ_BOOST * FUNC_BOOST
 
 
 class TestAdaptiveFusionPhase:
