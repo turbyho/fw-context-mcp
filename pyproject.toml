@@ -88,7 +88,7 @@ warn_redundant_casts = true
 
 [tool.pytest.ini_options]
 addopts = [
-    "--ignore=tests/test_system_indexing.py",
+    "-m", "not system",
     "--ignore=tests/builds/mbed_os/mbed-os/tools",
 ]
 testpaths = ["tests"]
@@ -96,4 +96,5 @@ markers = [
     "slow: tests that take longer than 2 seconds (full index/reindex via libclang)",
     "ollama: tests that require a running Ollama instance",
     "libclang: tests that require libclang and a C compiler (gcc/clang)",
+    "system: tests that require real build tools (gcc/CMake/Make/PlatformIO) and run index on test fixtures",
 ]
