@@ -21,6 +21,14 @@ _RE_SEPARATOR = re.compile(r"[^a-zA-Z0-9]+")
 # _RE_COL_FILTER detects column-filter syntax in FTS5 queries (single colon not part of ::)
 _RE_COL_FILTER = re.compile(r"(?<!:):(?!:)")
 
+# BM25 weight configuration — module-level to avoid recreation on every search.
+# Base 9 columns: name, qualified_name, signature, docstring, file_path,
+#                name_tokens, summary, inputs, outputs
+_BASE_WEIGHTS = [1.2, 0.75, 10.0, 1.0, 3.0, 2.0, 1.0, 5.0, 1.0]
+# Cache: PRAGMA table_info column count per connection id → avoids
+# querying the schema on every search_symbols call.
+_bm25_col_count_cache: dict[int, int] = {}
+
 # Noise words that pollute FTS5 — strip before tokenizing (module-level, cached)
 _NOISE_WORDS = frozenset(("at", "unnamed"))
 # Guard against pathological inputs that cause ReDoS in regex processing (module-level, cached)
@@ -299,13 +307,15 @@ def search_symbols(
     if kind:
         params.append(kind)
     params.append(limit)
-    # Build bm25 weights dynamically — the number of indexed columns varies
-    # based on whether ``source`` column exists in the symbols table.
-    # Base 9 columns: name, qualified_name, signature, docstring, file_path,
-    #                name_tokens, summary, inputs, outputs
-    _BASE_WEIGHTS = [1.2, 0.75, 10.0, 1.0, 3.0, 2.0, 1.0, 5.0, 1.0]
-    fts_cols = [r[1] for r in conn.execute("PRAGMA table_info(symbols_fts)").fetchall()]
-    n_extra = len(fts_cols) - len(_BASE_WEIGHTS)
+    # Build bm25 weights — cache column count per connection to avoid
+    # querying PRAGMA table_info on every search_symbols call.
+    conn_id = id(conn)
+    col_count = _bm25_col_count_cache.get(conn_id)
+    if col_count is None:
+        fts_cols = [r[1] for r in conn.execute("PRAGMA table_info(symbols_fts)").fetchall()]
+        col_count = len(fts_cols)
+        _bm25_col_count_cache[conn_id] = col_count
+    n_extra = col_count - len(_BASE_WEIGHTS)
     weights = _BASE_WEIGHTS + [1.0] * max(0, n_extra)
     bm25_expr = f"bm25(symbols_fts, {', '.join(str(w) for w in weights)})"
     return conn.execute(
