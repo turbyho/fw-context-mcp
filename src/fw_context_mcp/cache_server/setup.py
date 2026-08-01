@@ -17,6 +17,7 @@ import secrets
 import shutil
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -194,8 +195,7 @@ def _ask(msg: str, default: str = "y") -> bool:
 
 def _run(cmd: list[str], **kwargs: Any) -> bool:
     """Run a shell command.  Returns True on success."""
-    # Suppress "could not change directory" noise from sudo commands
-    scwd = kwargs.pop("cwd", "/tmp") if cmd[0] == "sudo" and "cwd" not in kwargs else kwargs.pop("cwd", None)
+    scwd = kwargs.pop("cwd", tempfile.gettempdir()) if cmd[0] == "sudo" and "cwd" not in kwargs else kwargs.pop("cwd", None)
     try:
         subprocess.run(cmd, check=True, cwd=scwd, **kwargs)
         return True
@@ -244,7 +244,7 @@ def _ensure_server_venv() -> bool:
     from fw_context_mcp import __version__ as _current_version
     wheel_candidates = [
         Path.home() / f"fw_context_mcp-{_current_version}-py3-none-any.whl",
-        Path("/tmp") / f"fw_context_mcp-{_current_version}-py3-none-any.whl",
+        Path(tempfile.gettempdir()) / f"fw_context_mcp-{_current_version}-py3-none-any.whl",
     ]
     wheel_path = None
     for w in wheel_candidates:
