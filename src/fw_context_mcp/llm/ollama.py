@@ -162,7 +162,7 @@ def call_ollama(
         raise OllamaError(f"Ollama HTTP {e.response.status_code}: {e.response.text[:200]}") from e
     except OllamaError:
         raise  # Pass through — prevents wrapping by the broad except Exception below
-    except (httpx.HTTPError, OSError) as e:
+    except (httpx.HTTPError, OSError, KeyError, json.JSONDecodeError, ValueError) as e:
         raise OllamaError(str(e)) from e
 
 
@@ -239,7 +239,7 @@ def _call_ollama_embed_impl(
         raise OllamaError("Ollama embed request timed out") from None
     except OllamaError:
         raise
-    except (httpx.HTTPError, OSError) as e:
+    except (httpx.HTTPError, OSError, KeyError, json.JSONDecodeError, ValueError) as e:
         raise OllamaError(str(e)) from e
 
 
@@ -305,7 +305,7 @@ class OllamaEmbedder(Embedder):
                 if isinstance(ctx_len, int) and ctx_len > 0:
                     _max_tokens_cache[model] = ctx_len
                     return ctx_len
-        except (ValueError, TypeError, RuntimeError, AttributeError, OSError):
+        except (ValueError, TypeError, RuntimeError, AttributeError, OSError, json.JSONDecodeError):
             pass
         model_lower = model.lower()
         if "qwen3-embedding:0.6b" in model_lower or "qwen3-embedding:4b" in model_lower:
