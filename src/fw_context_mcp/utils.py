@@ -6,18 +6,19 @@ other small helpers that were copied into multiple modules.
 
 from __future__ import annotations
 
-import logging
-
-log = logging.getLogger(__name__)
 import hashlib
+import logging
 import os
 import sqlite3
 import subprocess
+import threading
 from collections import OrderedDict
 from datetime import UTC, datetime
 from pathlib import Path
 
 from fw_context_mcp import _stdlib_sqlite3
+
+log = logging.getLogger(__name__)
 
 __all__ = [
     "MTIME_TOLERANCE_S",
@@ -41,10 +42,16 @@ MTIME_TOLERANCE_S: float = 1.0
 # Standard exception tuple for non-fatal recoverable errors.
 # Use in all broad-except blocks where the operation can safely
 # continue or log+skip.  Always pair with is_fatal() check first.
+#
+# Includes stdlib sqlite3.Error (not just pysqlite3) because
+# external libraries that import sqlite3 before the pysqlite3
+# redirect may raise the stdlib type.
+_STDLIB_DB_ERROR = (_stdlib_sqlite3.Error,) if _stdlib_sqlite3 is not None else ()
+
 SAFE_EXCEPT = (
     ValueError, TypeError, RuntimeError, AttributeError,
     sqlite3.Error, OSError,
-)
+) + _STDLIB_DB_ERROR
 
 
 def is_fatal(exc: BaseException) -> bool:
@@ -124,7 +131,7 @@ def run_build_command(
         )
     return result
 
-def resolve_project_root(explicit: str | None = None) -> Path:
+def resolve_project_root(explicit: str | Path | None = None) -> Path:
     """Return the project root directory.
 
     Resolution order:
@@ -162,6 +169,7 @@ def abs_path(root: Path, path: str) -> str:
 # Keyed by (path, mtime) so file changes are automatically detected.
 _read_cache: OrderedDict[tuple[str, float], list[str]] = OrderedDict()
 _read_cache_max = 500
+_read_cache_lock = threading.Lock()
 
 
 def read_file_lines(abs_path: str) -> list[str] | None:
@@ -178,9 +186,10 @@ def read_file_lines(abs_path: str) -> list[str] | None:
     except OSError:
         return None
     cache_key = (abs_path, mtime)
-    if cache_key in _read_cache:
-        _read_cache.move_to_end(cache_key)
-        return _read_cache[cache_key]
+    with _read_cache_lock:
+        if cache_key in _read_cache:
+            _read_cache.move_to_end(cache_key)
+            return _read_cache[cache_key]
 
     # NOTE: UTF-16 files will produce garbled content; extremely low risk
     # in embedded C/C++ projects.
@@ -203,9 +212,10 @@ def read_file_lines(abs_path: str) -> list[str] | None:
             return None
 
     # Evict oldest entry if at capacity (LRU via OrderedDict — move_to_end on hit)
-    if len(_read_cache) >= _read_cache_max:
-        _read_cache.popitem(last=False)
-    _read_cache[cache_key] = result
+    with _read_cache_lock:
+        if len(_read_cache) >= _read_cache_max:
+            _read_cache.popitem(last=False)
+        _read_cache[cache_key] = result
     return result
 
 
@@ -274,4 +284,6 @@ def truncate_path_middle(path: str, max_len: int) -> str:
 
 def fmt_count(n: int) -> str:
     """Format a count with thousand separators (non-breaking thin spaces)."""
+    if n < 0:
+        return "-" + f"{abs(n):_d}".replace("_", " ")
     return f"{n:_d}".replace("_", " ")

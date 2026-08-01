@@ -361,6 +361,7 @@ class TestBuilderRegistry:
 pytestmark_libclang = pytest.mark.libclang
 
 
+@pytest.mark.slow
 class TestBareInitAndIndex:
     """End-to-end: init + index for a bare (manual mode) C project."""
 
@@ -449,6 +450,7 @@ class TestBareInitAndIndex:
             conn.close()
 
 
+@pytest.mark.slow
 class TestCMakeInitAndIndex:
     """End-to-end: init + index for a CMake C project (detection works out of the box)."""
 
@@ -502,6 +504,7 @@ class TestCMakeInitAndIndex:
             conn.close()
 
 
+@pytest.mark.slow
 class TestMakefileInitAndIndex:
     """End-to-end: init + index for a Makefile C project (detection works out of the box)."""
 
@@ -566,9 +569,9 @@ class TestMakefileInitAndIndex:
             conn.close()
 
 
+@pytest.mark.slow
 class TestPlatformIOInitAndIndex:
     """End-to-end: init + index for a PlatformIO project."""
-
     @pytest.fixture(scope="class")
     @classmethod
     def indexed(cls):
@@ -634,6 +637,7 @@ class TestPlatformIOInitAndIndex:
             conn.close()
 
 
+@pytest.mark.slow
 class TestArduinoInitAndIndex:
     """End-to-end: init + index for an Arduino project (needs fqbn)."""
 
@@ -681,6 +685,7 @@ class TestArduinoInitAndIndex:
             conn.close()
 
 
+@pytest.mark.slow
 class TestMbedOSInitAndIndex:
     """End-to-end: init + index for an Mbed OS 6 project.
 
@@ -746,6 +751,7 @@ class TestMbedOSInitAndIndex:
             conn.close()
 
 
+@pytest.mark.slow
 class TestZephyrInitAndIndex:
     """End-to-end: init + index for a Zephyr RTOS project.
 
@@ -841,6 +847,7 @@ class TestZephyrInitAndIndex:
             conn.close()
 
 
+@pytest.mark.slow
 class TestESPIDFInitAndIndex:
     """End-to-end: init + index for an ESP-IDF project.
 

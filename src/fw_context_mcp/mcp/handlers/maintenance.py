@@ -117,8 +117,9 @@ def get_active_build(
     bg_running = _is_bg_reindex_running(root)
 
     conn, err_result = _open_db_or_return(db_path)
-    if err_result:
+    if err_result is not None:
         return err_result[0]
+    assert conn is not None
     with conn:
         project_id = derive_project_id(root)
         cfg = get_active_config(conn, project_id)
@@ -177,45 +178,10 @@ def get_active_build(
         proj_cfg = load_config(project_root=root)
 
         # Count definition symbols that still need LLM analysis
-        if stored_analyze_vendor:
-            # No exclusion — count all symbols including vendor/SDK
-            unanalyzed_count = conn.execute(
-                """SELECT COUNT(*)
-                   FROM symbols s
-                   WHERE s.config_hash = ?
-                     AND s.is_definition = 1
-                     AND s.kind IN ('function', 'method', 'constructor',
-                                    'destructor', 'class', 'struct')
-                     AND s.name NOT LIKE '%(anonymous%'
-                     AND s.name NOT LIKE '%(unnamed%'
-                     AND s.id NOT IN (SELECT symbol_id FROM llm_analysis)""",
-                (config_hash,),
-            ).fetchone()[0]
-        else:
-            from ..shared.filtering import compute_exclude_like
-
-            exclude_like = compute_exclude_like(
-                root,
-                analyze_vendor=False,
-                vendor_paths=proj_cfg.index.vendor_paths,
-            )
-            exclude_clauses = " AND ".join(
-                ["s.file_path NOT LIKE ?"] * len(exclude_like)
-            )
-            exclude_clause = (" AND " + exclude_clauses) if exclude_clauses else ""
-            query = f"""SELECT COUNT(*)
-               FROM symbols s
-               WHERE s.config_hash = ?
-                 AND s.is_definition = 1
-                 AND s.kind IN ('function', 'method', 'constructor',
-                                'destructor', 'class', 'struct')
-                 {exclude_clause}
-                 AND s.name NOT LIKE '%(anonymous%'
-                 AND s.name NOT LIKE '%(unnamed%'
-                 AND s.id NOT IN (SELECT symbol_id FROM llm_analysis)"""
-            unanalyzed_count = conn.execute(
-                query, (config_hash, *exclude_like)
-            ).fetchone()[0]
+        unanalyzed_count = _count_unanalyzed_symbols(
+            conn, config_hash, stored_analyze_vendor, root,
+            proj_cfg.index.vendor_paths,
+        )
 
         cc_changed, stale_reason = _is_stale(cfg, cfg["compile_commands_path"])
         schema_old = db_schema_ver < CURRENT_SCHEMA_VERSION
@@ -337,21 +303,23 @@ def get_active_build(
     # not spawn subprocesses.
     result["bg_reindex_running"] = bg_running
     if bg_running:
-        log_file = db_path.parent / "reindex.log"
-        try:
-            with open(log_file, encoding="utf-8") as fh:
-                fh.seek(0, 2)
-                file_size = fh.tell()
-                if file_size == 0:
-                    result["reindex_progress"] = None
-                else:
-                    fh.seek(max(0, file_size - 4096))
-                    last_chunk = fh.read()
-                    lines = last_chunk.splitlines()
-                    result["reindex_progress"] = lines[-1].strip() if lines else None
-        except (OSError, IndexError):
-            result["reindex_progress"] = None
+        result["reindex_progress"] = _read_reindex_progress(db_path)
     return result
+def _read_reindex_progress(db_path: Path) -> str | None:
+    """Read the last line of reindex.log, or None if unavailable."""
+    log_file = db_path.parent / "reindex.log"
+    try:
+        with open(log_file, encoding="utf-8") as fh:
+            fh.seek(0, 2)
+            file_size = fh.tell()
+            if file_size == 0:
+                return None
+            fh.seek(max(0, file_size - 4096))
+            last_chunk = fh.read()
+            lines = last_chunk.splitlines()
+            return lines[-1].strip() if lines else None
+    except (OSError, IndexError):
+        return None
 
 
 # ── moved from server.py ──
@@ -359,6 +327,51 @@ def _list_status(db_schema_ver: int, cc_stale: bool) -> str:
     """Return a status string for list_projects."""
     needs = (db_schema_ver < CURRENT_SCHEMA_VERSION) or cc_stale
     return "reindex_needed" if needs else "ready"
+
+def _count_unanalyzed_symbols(
+    conn: sqlite3.Connection,
+    config_hash: str,
+    stored_analyze_vendor: bool,
+    root: Path,
+    vendor_paths: list[str],
+) -> int:
+    """Count definition symbols that still need LLM analysis."""
+    if stored_analyze_vendor:
+        return conn.execute(
+            """SELECT COUNT(*)
+               FROM symbols s
+               WHERE s.config_hash = ?
+                 AND s.is_definition = 1
+                 AND s.kind IN ('function', 'method', 'constructor',
+                                'destructor', 'class', 'struct')
+                 AND s.name NOT LIKE '%(anonymous%'
+                 AND s.name NOT LIKE '%(unnamed%'
+                 AND s.id NOT IN (SELECT symbol_id FROM llm_analysis)""",
+            (config_hash,),
+        ).fetchone()[0]
+
+    from ..shared.filtering import compute_exclude_like
+
+    exclude_like = compute_exclude_like(
+        root,
+        analyze_vendor=False,
+        vendor_paths=vendor_paths,
+    )
+    exclude_clauses = " AND ".join(
+        ["s.file_path NOT LIKE ?"] * len(exclude_like)
+    )
+    exclude_clause = (" AND " + exclude_clauses) if exclude_clauses else ""
+    query = f"""SELECT COUNT(*)
+           FROM symbols s
+           WHERE s.config_hash = ?
+             AND s.is_definition = 1
+             AND s.kind IN ('function', 'method', 'constructor',
+                            'destructor', 'class', 'struct')
+             {exclude_clause}
+             AND s.name NOT LIKE '%(anonymous%'
+             AND s.name NOT LIKE '%(unnamed%'
+             AND s.id NOT IN (SELECT symbol_id FROM llm_analysis)"""
+    return conn.execute(query, (config_hash, *exclude_like)).fetchone()[0]
 
 
 def list_projects(
@@ -390,9 +403,10 @@ def list_projects(
     for db_path in sorted(db_files):
         try:
             conn, err_result = _open_db_or_return(db_path)
-            if err_result:
+            if err_result is not None:
                 results.append(err_result[0])
                 continue
+            assert conn is not None
             with conn:
                 rows = get_all_projects(conn)
                 db_schema_ver = get_db_schema_version(conn)
@@ -608,6 +622,7 @@ def _reindex_parse_and_store(
     from ...indexer.db import write_lock as db_write_lock
     from ...indexer.ops import store_symbols_for_unit
     from ...indexer.symbols import (
+        ExtractionResult,
         extract_all,
     )
     from ..background import _request_bg_reindex_pause, _resume_bg_reindex
@@ -626,7 +641,7 @@ def _reindex_parse_and_store(
             # early return here is safe (pause was never requested).
             # Do NOT move _request_bg_reindex_pause before this loop
             # without wrapping it in try/finally.
-        except (RuntimeError, sqlite3.Error) as exc:
+        except RuntimeError as exc:
             log.warning("skip TU %s during reindex: %s", unit.file.name, exc)
             skipped_tus.append(str(unit.file.name))
 
@@ -660,43 +675,7 @@ def _reindex_parse_and_store(
             if deleted_orphans:
                 log.debug("Orphan files cleaned up: %d", deleted_orphans)
 
-            try:
-                from fw_context_mcp.utils import compute_source_hash
-
-                from ...indexer.manifest import (
-                    _collect_headers_from_tokens,
-                    update_entry,
-                )
-                from ...indexer.manifest import (
-                    load as load_manifest,
-                )
-                from ...indexer.manifest import (
-                    save as save_manifest,
-                )
-                manifest_data = load_manifest(db_path.parent)
-                if manifest_data is not None:
-                    for unit, _parsed in parsed_units:
-                        headers = _collect_headers_from_tokens(unit, root, build_dir_patterns=None)
-                        source_hash = compute_source_hash(unit.file.resolve())
-                        try:
-                            tu_rel = str(unit.file.resolve().relative_to(root))
-                        except ValueError:
-                            tu_rel = str(unit.file.resolve())
-                        for idx, entry in enumerate(manifest_data.get("entries", [])):
-                            if entry.get("file") == tu_rel:
-                                update_entry(manifest_data, idx, source_hash, headers)
-                                break
-                        else:
-                            manifest_data.setdefault("entries", []).append({
-                                "file": tu_rel,
-                                "directory": str(unit.directory) if unit.directory else str(root),
-                                "arguments": unit.clang_args,
-                                "source_hash": source_hash,
-                                "headers": headers,
-                            })
-                    save_manifest(manifest_data, db_path.parent, config_hash)
-            except OSError:
-                log.debug("manifest.json update skipped during reindex_file", exc_info=True)
+            _update_manifest_after_reindex(parsed_units, root, db_path.parent, config_hash)
 
             elapsed = round(time.monotonic() - t0, 2)
             result = {
@@ -717,6 +696,51 @@ def _reindex_parse_and_store(
         _resume_bg_reindex(root)
         from ...mcp.shared.stale import _invalidate_modified_cache
         _invalidate_modified_cache(config_hash)
+
+def _update_manifest_after_reindex(
+    parsed_units: list,
+    root: Path,
+    db_dir: Path,
+    config_hash: str,
+) -> None:
+    """Update manifest.json entries for reindexed translation units."""
+    try:
+        from fw_context_mcp.utils import compute_source_hash
+
+        from ...indexer.manifest import (
+            _collect_headers_from_tokens,
+            update_entry,
+        )
+        from ...indexer.manifest import (
+            load as load_manifest,
+        )
+        from ...indexer.manifest import (
+            save as save_manifest,
+        )
+        manifest_data = load_manifest(db_dir)
+        if manifest_data is not None:
+            for unit, _parsed in parsed_units:
+                headers = _collect_headers_from_tokens(unit, root, build_dir_patterns=None)
+                source_hash = compute_source_hash(unit.file.resolve())
+                try:
+                    tu_rel = str(unit.file.resolve().relative_to(root))
+                except ValueError:
+                    tu_rel = str(unit.file.resolve())
+                for idx, entry in enumerate(manifest_data.get("entries", [])):
+                    if entry.get("file") == tu_rel:
+                        update_entry(manifest_data, idx, source_hash, headers)
+                        break
+                else:
+                    manifest_data.setdefault("entries", []).append({
+                        "file": tu_rel,
+                        "directory": str(unit.directory) if unit.directory else str(root),
+                        "arguments": unit.clang_args,
+                        "source_hash": source_hash,
+                        "headers": headers,
+                    })
+            save_manifest(manifest_data, db_dir, config_hash)
+    except OSError:
+        log.debug("manifest.json update skipped during reindex_file", exc_info=True)
 
 
 def _reindex_post_write_phases(
@@ -840,8 +864,9 @@ def reindex_file_impl(
     if not db_path.exists():
         return {"error": f"No index found for {root}. Run 'fw-context index' first."}
     conn, err_result = _open_db_or_return(db_path)
-    if err_result:
+    if err_result is not None:
         return err_result[0]
+    assert conn is not None
     try:
         cfg_data = get_active_config(conn, project_id)
         if not cfg_data:

@@ -30,6 +30,21 @@ from ._search_fallbacks import (
 
 log = logging.getLogger(__name__)
 
+__all__ = [
+    "_SEARCH_CODE_FALLBACKS",
+    "_fmt_symbol_rows",
+    "_search_code_docstring",
+    "_search_code_fts5_kind",
+    "_search_code_macros_fts",
+    "_search_code_name_tokens",
+    "lookup_symbol",
+    "search_code",
+    "semantic_search",
+    "smart_search",
+    "search_bodies",
+    "search_content",
+]
+
 def _with_search_context(root: Path, tool_name: str, do_search) -> list[dict]:
     """Shared setup/error wrapper for search tools — DRY the resolve→db→stale→error pattern."""
     try:
@@ -132,9 +147,11 @@ def search_code(
     def _do_search(c: sqlite3.Connection, config_hash: str) -> list[dict]:
         result = _search_code_fts5_kind(c, query, config_hash, limit, kind, project_only, root)
         if result is not None:
-            return result[0]
+            return result[0]  # Each fallback returns (data, method_name); data is the result list
 
         for strategy in _SEARCH_CODE_FALLBACKS:
+            # Each fallback returns (data, method_name) tuple — method_name is
+            # already in each dict via _fmt_symbol_rows → _fallback key.
             result = strategy(c, query, config_hash, limit, kind, project_only, root)
             if result is not None:
                 return result[0]
@@ -222,8 +239,9 @@ async def smart_search(
     if ctx.ollama_warning is None:
         # Connection stays in cache — managed by TTL eviction (same as _with_stale_recovery)
         conn, err_result = _open_db_or_return(ctx.db_path)
-        if err_result:
+        if err_result is not None:
             return err_result
+        assert conn is not None
         with conn:
             cfg_data = get_active_config(conn, derive_project_id(ctx.project_root))
             if cfg_data and _is_stale(cfg_data, cfg_data["compile_commands_path"])[0]:
@@ -345,14 +363,11 @@ async def semantic_search(
             )
 
         if not results:
-            # Filter out metadata entries and check for real results
-            real_results = [r for r in results if not r.get("_meta")]
-            if not real_results:
-                return _fallback_to_search_code(
-                    root, db_path, query, limit,
-                    warning=f"No symbols matched with similarity > {threshold}. "
-                            "Try lowering the threshold or rephrasing the query.",
-                )
+            return _fallback_to_search_code(
+                root, db_path, query, limit,
+                warning=f"No symbols matched with similarity > {threshold}. "
+                        "Try lowering the threshold or rephrasing the query.",
+            )
 
         # Apply reranker when configured
         if cfg.llm.reranker_model and results:
@@ -369,8 +384,9 @@ async def semantic_search(
 
         # Add staleness warning if applicable
         conn, err_result = _open_db_or_return(ctx.db_path)
-        if err_result:
+        if err_result is not None:
             return err_result
+        assert conn is not None
         with conn:
             cfg_data = get_active_config(conn, derive_project_id(ctx.project_root))
             if cfg_data and _is_stale(cfg_data, cfg_data["compile_commands_path"])[0]:

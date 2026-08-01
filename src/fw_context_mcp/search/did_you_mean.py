@@ -82,7 +82,7 @@ def suggest(
                 if time.monotonic() - ts < _CACHE_TTL_S:
                     return cached[:limit]
             del _cache[cache_key]
-        _cache[cache_key] = None  # stampede prevention
+        _cache[cache_key] = None  # type: ignore[assignment]  # stampede sentinel
 
     t0 = time.monotonic()
     candidates = _load_names(conn, config_hash)
@@ -125,7 +125,7 @@ def suggest(
     results: list[tuple[str, float]] = []
     for c, _ in scored.items():
         c_tokens = _tokenize(c)
-        score = _token_score(query_tokens, c_tokens)
+        score = _token_score(list(query_tokens), list(c_tokens))
         if score > 0:
             results.append((c, score))
 

@@ -119,6 +119,9 @@ async def _try_embedding_samples(ctx) -> list[dict] | None:
             get_embeddings,
             search_similar_vec,
         )
+        from fw_context_mcp.indexer.db import (
+            open_db as _open_db,
+        )
         from fw_context_mcp.llm.embedder_factory import get_embedder
         from fw_context_mcp.llm.ollama import OllamaError
     except (ValueError, TypeError, RuntimeError, AttributeError):

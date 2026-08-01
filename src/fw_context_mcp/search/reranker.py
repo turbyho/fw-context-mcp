@@ -71,7 +71,7 @@ class CrossEncoderReranker:
             desc = self._describe(c)
             pairs.append((query, desc))
 
-        scores = self._model.predict(pairs)  # type: ignore[union-attr]
+        scores = self._model.predict(pairs)  # type: ignore[attr-defined]
 
         # Attach scores and sort descending
         if len(scores) != len(candidates):

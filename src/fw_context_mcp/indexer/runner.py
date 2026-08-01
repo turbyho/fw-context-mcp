@@ -14,11 +14,19 @@ import time
 from pathlib import Path
 
 from ..config.settings import derive_project_id
+from ..mcp.shared.pid_file import PidFile
 from ._embedding import (
+    _build_embeddings,
+    _chunk_body,
     _cleanup_orphaned_cc_artifacts,
     _fmt_dur,
+    _truncate_body,
 )
+from ._llm_analysis import _fetch_callees, _fetch_referencers
 from ._postprocess import (
+    _build_hotspot_cache,
+    _build_overrides,
+    _build_pagerank,
     _run_postprocess,
 )
 from ._unit_processor import (
@@ -40,6 +48,21 @@ from .db import (
 )
 
 log = logging.getLogger(__name__)
+
+__all__ = [
+    "_build_embeddings",
+    "_build_hotspot_cache",
+    "_build_overrides",
+    "_build_pagerank",
+    "_chunk_body",
+    "_cleanup_orphaned_cc_artifacts",
+    "_fmt_dur",
+    "_fetch_callees",
+    "_fetch_referencers",
+    "_run_postprocess",
+    "_truncate_body",
+    "run",
+]
 
 
 
@@ -216,7 +239,7 @@ def run(
                     with open(_hb_log, "a") as f:
                         f.write(f"{time.strftime('%H:%M:%S')} heartbeat\n")
                 except (ValueError, TypeError, RuntimeError, AttributeError, sqlite3.Error):
-                    pass  # libclang/SQLite fallback
+                    pass  # non-fatal — continue
 
         _hb_thread = threading.Thread(target=_heartbeat, daemon=True)
         _hb_thread.start()
@@ -328,29 +351,14 @@ def run(
             if time.monotonic() > deadline:
                 log.warning("_wait_if_paused: timeout after 300s — resuming")
                 return
-            if not pause_file.exists():
+            if not PidFile.is_active(pause_file):
                 return
-            try:
-                content = pause_file.read_text(encoding="utf-8").strip()
-                requester_pid = int(content)
-            except (OSError, ValueError):
-                try:
-                    pause_file.unlink(missing_ok=True)
-                except OSError:
-                    pass
+            requester_pid = PidFile.read_pid(pause_file)
+            if requester_pid is None:
                 return
             # Never pause on our own marker — this process created it
             # to signal the background reindex, not to block itself.
             if requester_pid == our_pid:
-                return
-            try:
-                os.kill(requester_pid, 0)
-            except OSError:
-                # Process dead — clean up stale marker
-                try:
-                    pause_file.unlink(missing_ok=True)
-                except OSError:
-                    pass
                 return
             time.sleep(1.0)  # Wait, then check again
 

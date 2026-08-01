@@ -320,7 +320,7 @@ def train_step(
     """
     try:
         from datasets import Dataset as HFDataset
-        from sentence_transformers import losses
+        from sentence_transformers import losses  # type: ignore[attr-defined]
         from sentence_transformers.trainer import SentenceTransformerTrainer
         from sentence_transformers.training_args import SentenceTransformerTrainingArguments
     except ImportError as e:

@@ -6,14 +6,10 @@ from __future__ import annotations
 
 import argparse
 import logging
-import os
-import re
-import signal
 import sys
-import time
-from pathlib import Path
 
 from .. import __version__
+
 
 log = logging.getLogger(__name__)
 

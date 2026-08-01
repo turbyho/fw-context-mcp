@@ -8,13 +8,28 @@ hotspot cache, and the main post-processing orchestrator
 from __future__ import annotations
 
 import logging
-import os
 import sqlite3
 import time
+from collections.abc import Callable
+from contextlib import nullcontext
 from pathlib import Path
 
+from ..mcp.shared.pid_file import PidFile
 from ..utils import is_fatal
-from .db import WriteLockTimeout, write_lock
+from ._embedding import _build_embeddings
+from ._llm_analysis import _build_llm_analysis
+from ._manifest_updater import _refresh_header_mtimes_from_manifest, _update_manifest_after_index
+from .db import (
+    CURRENT_SCHEMA_VERSION,
+    WriteLockTimeout,
+    delete_build_data,
+    rebuild_files_fts,
+    rebuild_fts,
+    rebuild_macros_fts,
+    transaction,
+    upsert_build_config,
+    write_lock,
+)
 
 # Local SAFE_EXCEPT that includes WriteLockTimeout — cannot extend
 # utils.SAFE_EXCEPT directly because utils.py would need a circular import
@@ -23,20 +38,9 @@ SAFE_EXCEPT = (
     ValueError, TypeError, RuntimeError, AttributeError,
     sqlite3.Error, OSError, WriteLockTimeout,
 )
-from ._embedding import _build_embeddings
-from ._llm_analysis import _build_llm_analysis
-from ._manifest_updater import _refresh_header_mtimes_from_manifest, _update_manifest_after_index
-from .db import (
-    CURRENT_SCHEMA_VERSION,
-    delete_build_data,
-    rebuild_files_fts,
-    rebuild_fts,
-    rebuild_macros_fts,
-    transaction,
-    upsert_build_config,
-)
 
 log = logging.getLogger(__name__)
+
 
 
 def _extract_param_types(signature: str) -> str:
@@ -50,6 +54,18 @@ def _extract_param_types(signature: str) -> str:
         "void write(const uint8_t *data, size_t len)" → "const uint8_t *,size_t"
         "void reset()" → ""
         "void set(int)" → "int"
+
+    **Limitations:**
+
+    - Does **not** parse string literals or comments — a comma inside
+      ``printf("hello, world")`` is treated as a parameter separator.
+    - Does **not** resolve template aliases — ``std::vector<int>`` and
+      ``VectorInt`` (where ``VectorInt = std::vector<int>``) are seen as
+      different types.
+    - **False negatives** (missing override edges) are possible; **false
+      positives** (incorrect override edges) are extremely unlikely
+      because both the derived AND base method signatures would need to
+      contain the same ambiguous pattern.
     """
     # Find the outermost parentheses
     paren_start = signature.find("(")
@@ -594,19 +610,7 @@ def _step_cleanup_old_builds(conn: sqlite3.Connection, ctx: dict) -> None:
     if not old_hashes:
         return
 
-    pause_file = db_dir / "reindex.pause"
-    skip_cleanup = False
-    if pause_file.exists():
-        try:
-            pause_pid = int(pause_file.read_text(encoding="utf-8").strip())
-            try:
-                os.kill(pause_pid, 0)
-                skip_cleanup = True
-            except OSError:
-                pause_file.unlink(missing_ok=True)
-        except (OSError, ValueError):
-            pause_file.unlink(missing_ok=True)
-    if skip_cleanup:
+    if PidFile.is_active(db_dir / "reindex.pause"):
         return
 
     for row in old_hashes:
@@ -638,7 +642,7 @@ def _step_wal_checkpoint(conn: sqlite3.Connection, ctx: dict) -> None:
 
 # Each entry: (step_name, step_fn, condition | None)
 # condition(ctx) → bool — when None, the step always runs.
-_STEPS: list[tuple[str, callable, callable | None]] = [
+_STEPS: list[tuple[str, Callable[..., None], Callable[..., bool] | None]] = [
     ("fts5",             _step_rebuild_fts,       None),
     ("orphans",          _step_orphan_cleanup,     None),
     ("is_project",       _step_align_is_project,   None),

@@ -27,7 +27,7 @@ try:
     # sqlite3.Row has in Python 3.13+.  Replace with a Python subclass
     # that adds .get() compatibility.
     _OrigRow = pysqlite3.dbapi2.Row
-    class _CompatRow(_OrigRow):
+    class _CompatRow(_OrigRow):  # type: ignore[misc,valid-type]
         if not hasattr(_OrigRow, "get"):
             def get(self, key, default=None):
                 try:

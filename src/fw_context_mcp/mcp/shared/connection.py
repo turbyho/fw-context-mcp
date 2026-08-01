@@ -16,9 +16,13 @@ import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from fw_context_mcp import config
 from fw_context_mcp.indexer.db import DatabaseCorruptionError, open_db
+
+if TYPE_CHECKING:
+    from fw_context_mcp.config.settings import Config
 
 log = logging.getLogger(__name__)
 
@@ -191,7 +195,8 @@ def _open_db_safe(db_path: Path) -> tuple[sqlite3.Connection | None, dict | None
     try:
         return _open_and_cache(db_key, db_path), None
     except DatabaseCorruptionError as e:
-        _integrity_checked.discard(db_key)
+        with _integrity_lock:
+            _integrity_checked.discard(db_key)
         return None, {
             "error": f"Database corruption detected: {e}",
             "action": "reset_index",
@@ -204,7 +209,8 @@ def _open_db_or_return(db_path: Path) -> tuple[sqlite3.Connection | None, list[d
 
     Unlike ``_open_db_safe``, this never returns ``(None, None)`` — the
     error result is always a ready-to-return list of error dicts.
-    Handlers can use this instead of the ``assert conn is not None`` pattern.
+    Handlers should narrow with ``if err_result is not None: return err_result``
+    followed by ``assert conn is not None`` for mypy.
     """
     conn, err = _open_db_safe(db_path)
     if err:
@@ -254,8 +260,9 @@ def _resolve_handler_context(
         return None, [{"error": f"No index found for {root}. Run 'fw-context index' first."}]
 
     conn, err_result = _open_db_or_return(db_path)
-    if err_result:
+    if err_result is not None:
         return None, err_result
+    assert conn is not None
 
     cfg = config.load(root)
     from fw_context_mcp.config import derive_project_id

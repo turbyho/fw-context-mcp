@@ -607,7 +607,7 @@ def cmd_init(args: argparse.Namespace) -> int:
 
     if all_warnings:
         print("\nWarnings:")
-        for w in all_warnings:
+        for w in all_warnings:  # type: ignore[assignment]  # mypy false positive — w is str from list[str]
             print(f"  ⚠ {w}")
 
     if ok:

@@ -5,12 +5,21 @@ from __future__ import annotations
 import logging
 import re
 import threading
+from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
 
 import clang.cindex as cx
 
 from .compile_commands import CompilationUnit
+from .models import (
+    FnPointerAssignment,
+    IndirectCallSite,
+    InheritanceRecord,
+    Macro,
+    Reference,
+    Symbol,
+)
 
 _log = logging.getLogger(__name__)
 
@@ -81,16 +90,6 @@ _INDIRECT_TARGET_KINDS = frozenset({
     cx.CursorKind.FUNCTION_TEMPLATE,
     cx.CursorKind.CXX_METHOD,
 })
-
-
-from .models import (
-    FnPointerAssignment,
-    IndirectCallSite,
-    InheritanceRecord,
-    Macro,
-    Reference,
-    Symbol,
-)
 
 
 def _cursor_kind_label(kind: cx.CursorKind) -> str:
@@ -1202,7 +1201,6 @@ def _run_source_line_fallback(
 
 
 
-from dataclasses import dataclass, field
 
 
 @dataclass
@@ -1221,7 +1219,7 @@ def extract_all(
     with_refs: bool = False,
     *,
     return_tu: bool = False,
-) -> tuple:
+) -> ExtractionResult:
     """Parse one translation unit and return extracted symbols, references, and inheritance.
 
     This is the single-pass entry point for all data extraction from a

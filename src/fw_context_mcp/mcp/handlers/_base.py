@@ -19,10 +19,14 @@ import dataclasses
 import logging
 import sqlite3
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from fw_context_mcp.mcp.shared.context import _resolve_handler_context
 from fw_context_mcp.mcp.shared.stale import _stale_files, _with_stale_recovery
 from fw_context_mcp.utils import abs_path, resolve_project_root
+
+if TYPE_CHECKING:
+    from ...config.settings import Config
 
 log = logging.getLogger(__name__)
 
@@ -43,7 +47,7 @@ class DbContext:
     db_path: Path
     conn: sqlite3.Connection
     config_hash: str
-    cfg: object  # FullConfig — avoided import to prevent circular dependency
+    cfg: Config
     project_id: str
     root: Path
 
@@ -73,6 +77,7 @@ class BaseHandler:
         ctx, err = _resolve_handler_context(project_root)
         if err:
             raise RuntimeError(err[0].get("error", "Failed to resolve handler context"))
+        assert ctx is not None, "HandlerContext must be non-None when err is None"
         return DbContext(
             db_path=ctx.db_path,
             conn=ctx.conn,

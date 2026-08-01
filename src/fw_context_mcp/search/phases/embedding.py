@@ -131,7 +131,7 @@ class EmbeddingPhase(Phase):
                         limit=self.overfetch,
                     )
                     if vec_rows:
-                        distance_map = {r["symbol_id"]: r.get("distance", 0.0) for r in vec_rows}
+                        distance_map = {r["symbol_id"]: dict(r).get("distance", 0.0) for r in vec_rows}
                         sym_ids = list(distance_map.keys())
                         placeholders = ",".join("?" * len(sym_ids))
                         emb_rows = conn.execute(
@@ -166,8 +166,8 @@ class EmbeddingPhase(Phase):
                     stored = get_embeddings(conn, ctx.config_hash, ctx.config.llm.embed_model)
                     if not stored:
                         return ctx
-                    scored = _brute_force_search(query_vec, stored, threshold=self.threshold)
-                    top_ids = [s[0] for s in scored[: self.overfetch]]
+                    scored_bf = _brute_force_search(query_vec, stored, threshold=self.threshold)
+                    top_ids = [s[0] for s in scored_bf[: self.overfetch]]
                     if not top_ids:
                         return ctx
                     placeholders = ",".join("?" * len(top_ids))  # SAFE: values in params, not f-string

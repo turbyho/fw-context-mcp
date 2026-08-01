@@ -10,6 +10,7 @@ import sys
 from pathlib import Path
 
 from .shared.context import _db_path
+from .shared.pid_file import PidFile
 
 log = logging.getLogger(__name__)
 
@@ -17,13 +18,9 @@ log = logging.getLogger(__name__)
 def _pid_exists(pid: int) -> bool:
     """Check whether a process with the given PID is running.
 
-    Uses ``os.kill(pid, 0)`` on POSIX (signal 0 = existence check only).
+    Delegates to :meth:`PidFile._pid_exists`.
     """
-    try:
-        os.kill(pid, 0)
-        return True
-    except OSError:
-        return False
+    return PidFile._pid_exists(pid)
 
 
 def _spawn_daemon(root: Path) -> None:
@@ -36,7 +33,7 @@ def _spawn_daemon(root: Path) -> None:
     log_file = db_path.parent / "daemon.log"
     try:
         log_fh = open(log_file, "a", encoding="utf-8")
-        proc = subprocess.Popen(
+        subprocess.Popen(
             [sys.executable, "-u", "-m", "fw_context_mcp.mcp.daemon", str(root)],
             start_new_session=True,
             stdout=log_fh,
@@ -88,15 +85,8 @@ def _is_bg_reindex_running(root: Path) -> bool:
 
     # 1. Index PID file — daemon subprocess or standalone fw-context index
     reindex_pid_file = db_path.parent / "reindex.pid"
-    if reindex_pid_file.exists():
-        try:
-            pid = int(reindex_pid_file.read_text(encoding="utf-8").strip())
-            if _pid_exists(pid):
-                return True
-        except (OSError, ValueError):
-            pass
-        # PID not alive or garbage — clean up stale file
-        reindex_pid_file.unlink(missing_ok=True)
+    if PidFile.is_active(reindex_pid_file):
+        return True
 
     # 2. General write lock — held during reindex_file, reset_index, etc.
     if _lock_held(db_path.parent / "write.lock"):
@@ -163,11 +153,7 @@ def _request_bg_reindex_pause(root: Path) -> None:
     requesting PID is dead, it ignores the stale marker and continues.
     """
     db_path = _db_path(root)
-    pause_file = db_path.parent / "reindex.pause"
-    try:
-        pause_file.write_text(str(os.getpid()), encoding="utf-8")
-    except OSError:
-        pass
+    PidFile(db_path.parent / "reindex.pause").write()
 
 # ── _resume_bg_reindex (was at server.py:430) ──
 def _resume_bg_reindex(root: Path) -> None:
@@ -179,14 +165,7 @@ def _resume_bg_reindex(root: Path) -> None:
     must stay so the bg reindex remains paused for that caller.
     """
     db_path = _db_path(root)
-    pause_file = db_path.parent / "reindex.pause"
-    try:
-        if pause_file.exists():
-            content = pause_file.read_text(encoding="utf-8").strip()
-            if content == str(os.getpid()):
-                pause_file.unlink(missing_ok=True)
-    except OSError:
-        pass
+    PidFile(db_path.parent / "reindex.pause").unlink_if_ours()
 
 # ── _check_bg_pause (was at server.py:440) ──
 def _check_bg_pause(root: Path) -> bool:
@@ -198,27 +177,7 @@ def _check_bg_pause(root: Path) -> bool:
     cleaned up automatically).
     """
     db_path = _db_path(root)
-    pause_file = db_path.parent / "reindex.pause"
-    if not pause_file.exists():
-        return False
-    try:
-        content = pause_file.read_text(encoding="utf-8").strip()
-        requester_pid = int(content)
-    except (OSError, ValueError):
-        try:
-            pause_file.unlink(missing_ok=True)
-        except OSError:
-            pass
-        return False
-    # Check if the requesting process is still alive
-    if not _pid_exists(requester_pid):
-        # Process dead — clean up stale marker
-        try:
-            pause_file.unlink(missing_ok=True)
-        except OSError:
-            pass
-        return False
-    return True
+    return PidFile.is_active(db_path.parent / "reindex.pause")
 
 # ── _fast_staleness_check ────────────────────────────────────────────────────
 def _fast_staleness_check(root: Path) -> tuple[bool, list[str]]:
@@ -243,8 +202,9 @@ def _fast_staleness_check(root: Path) -> tuple[bool, list[str]]:
         return False, []
 
     conn, err_result = _open_db_or_return(db_path)
-    if err_result:
+    if err_result is not None:
         return False, []
+    assert conn is not None
     reasons: list[str] = []
     project_id = derive_project_id(root)
     cfg = get_active_config(conn, project_id)
@@ -253,7 +213,7 @@ def _fast_staleness_check(root: Path) -> tuple[bool, list[str]]:
     config_hash = cfg["config_hash"]
 
     # 1-3. Structural checks (shared with daemon._staleness_check)
-    reasons.extend(check_structural_staleness(conn, config_hash, cfg, root))
+    reasons.extend(check_structural_staleness(conn, config_hash, dict(cfg), root))
 
     # 4. Unanalyzed symbols?
     # Uses CONFIG analyze_vendor (not stored) because this check
