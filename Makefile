@@ -89,6 +89,7 @@ lint-security:
 	$(VENV)/bin/bandit -r src/ -c pyproject.toml
 
 # ---- test targets ----
+# fast subset: excludes tests needing ollama, libclang, C compiler, and slow indexing
 test:
 	$(VENV)/bin/pytest tests/ -q -m "not ollama and not libclang and not slow"
 
@@ -96,7 +97,12 @@ lint:
 	$(VENV)/bin/ruff check src/
 	$(VENV)/bin/mypy src/
 
+# all tests except system and slow (both require manual invocation)
 test-all:
 	$(VENV)/bin/pytest tests/ -q
 
-.PHONY: install update uninstall venv pip-install link-add clean-path dev test lint lint-security test-all
+# slow tests only — full indexing runs, takes 30+ minutes
+test-slow:
+	$(VENV)/bin/pytest tests/ -q -m "slow"
+
+.PHONY: install update uninstall venv pip-install link-add clean-path dev test lint lint-security test-all test-slow

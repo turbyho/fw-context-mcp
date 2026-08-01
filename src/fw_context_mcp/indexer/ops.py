@@ -221,7 +221,7 @@ def _build_filtered_file_content(
     # ── Collect active lines from all header files in a single AST traversal ──
     def _collect_all_active_lines(root_cursor) -> None:
         """Walk the AST iteratively and add extent line ranges keyed by source file."""
-        stack: list[object] = [root_cursor]
+        stack: list = [root_cursor]
         while stack:
             cursor = stack.pop()
             if cursor.location.file:
@@ -398,7 +398,7 @@ def _restore_llm_analysis(
 
             cached: dict | None = None
             saved = saved_analyses.get(s.usr)
-            if saved is not None and (saved.get("content_hash") == new_ch or not saved.get("content_hash")):
+            if saved is not None and saved.get("content_hash") == new_ch:
                 cached = saved
             else:
                 cached = local_cache_lookup(local_db, [new_ch]).get(new_ch)
@@ -525,7 +525,8 @@ def _save_old_state(
         return old_usrs, saved_analyses
     file_id_old = known[normalized_tu_path][0]
     old_rows = conn.execute(
-        """SELECT s.usr, a.summary, a.inputs, a.outputs, a.model, a.content_hash
+        """SELECT s.usr, a.summary, a.inputs, a.outputs, a.model, a.content_hash,
+                  s.source, s.qualified_name, s.signature, s.docstring
            FROM symbols s
            LEFT JOIN llm_analysis a ON a.symbol_id = s.id
            WHERE s.file_id = ?""",
@@ -534,12 +535,20 @@ def _save_old_state(
     for r in old_rows:
         old_usrs.add(r["usr"])
         if r["summary"]:
+            ch = r["content_hash"] or ""
+            if not ch and r["source"]:
+                # content_hash was NULL — compute from the OLD body stored
+                # in the symbols table so we can detect whether the source
+                # file changed between the previous index and now.
+                ch = compute_content_hash(
+                    r["source"], r["qualified_name"], r["signature"], r["docstring"]
+                )
             saved_analyses[r["usr"]] = {
                 "summary": r["summary"],
                 "inputs": r["inputs"],
                 "outputs": r["outputs"],
                 "model": r["model"],
-                "content_hash": r["content_hash"],
+                "content_hash": ch,
             }
     return old_usrs, saved_analyses
 

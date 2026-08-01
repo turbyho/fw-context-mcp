@@ -1251,10 +1251,6 @@ class TestStoreSymbolsForUnitAnalysisRestore:
 
         conn.close()
 
-    @pytest.mark.xfail(
-        reason="Phase 1 reads body from current file on disk — "
-        "can't detect changes made before reindex"
-    )
     def test_phase3_does_not_restore_when_content_changed(self, store_db, tmp_path: Path):
         """Phase 3: changed symbol content means analysis is NOT restored."""
         from fw_context_mcp.indexer.ops import store_symbols_for_unit
@@ -1265,7 +1261,7 @@ class TestStoreSymbolsForUnitAnalysisRestore:
         # Write ORIGINAL content
         src_file.write_text("int bar(int x) {\n    return x * 2;\n}\n", encoding="utf-8")
 
-        file_id = upsert_file(conn, config_hash, str(src_file), "c")
+        file_id = upsert_file(conn, config_hash, "test2.c", "c")
         insert_symbols_batch(
             conn,
             [
@@ -1292,7 +1288,7 @@ class TestStoreSymbolsForUnitAnalysisRestore:
                     "",
                     0,
                     0.0,
-                    "",
+                    "int bar(int x) {\n    return x * 2;\n}\n",
                 ),
             ],
         )
@@ -1360,13 +1356,10 @@ class TestStoreSymbolsForUnitAnalysisRestore:
 
         assert syms_added == 1
 
-        # Analysis should be GONE because body changed (return x * 2 → x * 3)
-        # Phase 1 reads from CURRENT file (already modified), so hash matches new content.
-        # FIXME: This is a known limitation — Phase 1 doesn't preserve old body text.
-        # When the source file is already modified before reindex, the "old" hash
-        # is computed from the new content, so unchanged detection is ineffective.
-        # In practice, auto-reindex detects file changes via mtime and re-indexes
-        # before analysis runs — analysis is generated on the new content.
+        # Analysis should be GONE because body changed (return x * 2 → x * 3).
+        # _save_old_state now computes content_hash from the OLD body stored
+        # in the symbols.source column, so it can detect that the file changed
+        # even though Phase 3 reads the NEW body from disk.
         ana_after = conn.execute("SELECT COUNT(*) FROM llm_analysis").fetchone()[0]
         assert ana_after == 0, (
             f"Expected analysis to be DROPPED (body changed: x*2 → x*3), "
