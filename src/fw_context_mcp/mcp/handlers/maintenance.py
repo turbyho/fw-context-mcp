@@ -53,6 +53,10 @@ def get_active_build(
     project_root: Annotated[
         str | None, Field(description="Project root directory. Auto-detected from CWD if omitted.")
     ] = None,
+    fast: Annotated[
+        bool, Field(description="When True (default), skip per-file stat scan — faster but "
+        "modified_files_count and header_affected_tus may be 0.")
+    ] = True,
 ) -> dict:
     """MANDATORY FIRST CALL for C/C++ projects. Return metadata about the
     most recently indexed build configuration — check index health before
@@ -79,11 +83,14 @@ def get_active_build(
 
     ``index_message`` is a human-readable summary of the index state.
 
-    When ``modified_files_count > 0``, a background ``fw-context index``
-    subprocess is spawned automatically (non-blocking, at most one at a time).
-    Queries continue to be served from the existing index while the new one
-    is being built.  ``reindex_progress`` contains the last log line from
-    the reindex subprocess when ``bg_reindex_running`` is True.
+    Background reindex is managed by the startup daemon thread and the
+    file watcher — ``get_active_build()`` is a read-only tool that does
+    not spawn subprocesses.  ``reindex_progress`` contains the last log
+    line from the reindex subprocess when ``bg_reindex_running`` is True.
+
+    Set ``fast=False`` to include per-file stat scanning for accurate
+    ``modified_files_count`` and ``header_affected_tus``.  The default
+    ``fast=True`` is faster and sufficient for most session-start checks.
 
     Args:
         project_root: Project root directory. Auto-detected from CWD if
@@ -131,17 +138,21 @@ def get_active_build(
             file_count = conn.execute("SELECT COUNT(*) FROM files WHERE config_hash=?", (config_hash,)).fetchone()[0]
             ref_count = count_refs(conn, config_hash)
             manifest_verification = cfg["manifest_verification"] if "manifest_verification" in cfg else "none"
-            modified_count = _count_modified_files(conn, config_hash, root, use_cache=False)
-            # Check header dependencies separately (different metric: TUs, not files)
-            if manifest_verification == "full":
-                header_affected_tus, _ = _check_header_staleness(
-                    conn,
-                    config_hash,
-                    root,
-                    use_cache=False,
-                )
-            else:
+            if fast:
+                modified_count = 0
                 header_affected_tus = 0
+            else:
+                modified_count = _count_modified_files(conn, config_hash, root, use_cache=False)
+                # Check header dependencies separately (different metric: TUs, not files)
+                if manifest_verification == "full":
+                    header_affected_tus, _ = _check_header_staleness(
+                        conn,
+                        config_hash,
+                        root,
+                        use_cache=False,
+                    )
+                else:
+                    header_affected_tus = 0
             db_schema_ver = get_db_schema_version(conn)
 
             # LLM analysis statistics
