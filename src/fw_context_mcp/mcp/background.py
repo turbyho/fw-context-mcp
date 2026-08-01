@@ -7,6 +7,7 @@ import logging
 import os
 import subprocess
 import sys
+from contextlib import contextmanager
 from pathlib import Path
 
 from .shared.context import _db_path
@@ -166,6 +167,24 @@ def _resume_bg_reindex(root: Path) -> None:
     """
     db_path = _db_path(root)
     PidFile(db_path.parent / "reindex.pause").unlink_if_ours()
+
+
+# ── bg_reindex_pause — context manager for safe pause/resume ──
+@contextmanager
+def bg_reindex_pause(root: Path):
+    """Context manager: pause background reindex, auto-resume on exit.
+
+    Safe for early returns, exceptions — resume always runs in finally.
+    Usage::
+
+        with bg_reindex_pause(root):
+            ...  # critical section — bg reindex is paused
+    """
+    _request_bg_reindex_pause(root)
+    try:
+        yield
+    finally:
+        _resume_bg_reindex(root)
 
 # ── _check_bg_pause (was at server.py:440) ──
 def _check_bg_pause(root: Path) -> bool:
