@@ -8,6 +8,15 @@ from collections.abc import Generator
 from contextlib import contextmanager
 from pathlib import Path
 
+__all__ = [
+    "DatabaseCorruptionError",
+    "WriteLockTimeout",
+    "get_db_schema_version",
+    "open_db",
+    "transaction",
+    "write_lock",
+]
+
 from fw_context_mcp.indexer.db._schema import (
     _SCHEMA,
     CURRENT_SCHEMA_VERSION,
