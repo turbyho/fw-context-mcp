@@ -28,6 +28,7 @@ from ...indexer.db import (
 )
 from ...utils import abs_path, resolve_project_root
 from ..shared.context import _db_path, _open_db_or_return, _open_db_safe, _resolve_context
+from ._base import BaseHandler
 from .source import _lookup_definition
 
 
@@ -392,12 +393,22 @@ def _refs_guard(project_root: str | None) -> tuple[sqlite3.Connection, Path, str
         ``(conn, root, config_hash, None)`` on success — caller reuses *conn* (do not close).
         ``(None, None, None, error_list)`` on failure — caller propagates the error.
     """
-    from fw_context_mcp.mcp.shared.context import _resolve_handler_context, HandlerContext
+    from fw_context_mcp.indexer.db import count_refs
 
-    ctx, err = _resolve_handler_context(project_root, require_refs=True)
-    if err:
-        return None, None, None, err
-    return ctx.conn, ctx.root, ctx.config_hash, None
+    try:
+        db = BaseHandler.resolve_db_context(project_root)
+    except RuntimeError as e:
+        return None, None, None, [{"error": str(e)}]
+
+    with db.conn:
+        if count_refs(db.conn, db.config_hash) == 0:
+            return None, None, None, [{"info": (
+                "No references indexed. Refs are on by default — "
+                "they may have been disabled with [index] index_refs = false. "
+                "Re-run 'fw-context index' to rebuild."
+            )}]
+
+    return db.conn, db.root, db.config_hash, None
 
 # ── moved from server.py ──
 def find_call_path(

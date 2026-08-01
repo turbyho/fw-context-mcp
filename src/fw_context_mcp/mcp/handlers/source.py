@@ -20,7 +20,7 @@ from ...indexer.db import (
 )
 from ...llm.ollama import OllamaError, OllamaModelNotFoundError, call_ollama_async
 from ...utils import abs_path, read_file_lines
-from ..shared.context import _resolve_handler_context
+from ._base import BaseHandler
 
 log = logging.getLogger(__name__)
 def _validate_path_in_root(resolved_path: str, root: Path) -> str | None:
@@ -216,13 +216,14 @@ async def explain_symbol(
         fallback returns ``kind="macro"``, ``signature`` (as ``#define NAME``),
         ``value`` (raw definition), and ``expanded_value``.
     """
-    ctx, err = _resolve_handler_context(project_root)
-    if err:
-        return err[0]
-    cfg = ctx.cfg
-    conn = ctx.conn
-    config_hash = ctx.config_hash
-    root = ctx.root
+    try:
+        db = BaseHandler.resolve_db_context(project_root)
+    except RuntimeError as e:
+        return {"error": str(e)}
+    cfg = db.cfg
+    conn = db.conn
+    config_hash = db.config_hash
+    root = db.root
     try:
         with conn:
             row = _lookup_definition(conn, config_hash, name, prefer_project=True)
@@ -363,12 +364,13 @@ def get_source(
         ``constants`` (list for enums), ``value`` (raw macro definition),
         ``expanded_value`` (preprocessor-resolved macro value) when applicable.
     """
-    ctx, err = _resolve_handler_context(project_root)
-    if err:
-        return err[0]
-    conn = ctx.conn
-    config_hash = ctx.config_hash
-    root = ctx.root
+    try:
+        db = BaseHandler.resolve_db_context(project_root)
+    except RuntimeError as e:
+        return {"error": str(e)}
+    conn = db.conn
+    config_hash = db.config_hash
+    root = db.root
     try:
         with conn:
             row = _lookup_definition(conn, config_hash, name, prefer_project=True)
@@ -485,12 +487,13 @@ def get_file_map(
         dict: {file, total_symbols, symbols: {kind: {count, items[],
         subgroups?[]}}}
     """
-    ctx, err = _resolve_handler_context(project_root)
-    if err:
-        return err[0]
-    conn = ctx.conn
-    config_hash = ctx.config_hash
-    root = ctx.root
+    try:
+        db = BaseHandler.resolve_db_context(project_root)
+    except RuntimeError as e:
+        return {"error": str(e)}
+    conn = db.conn
+    config_hash = db.config_hash
+    root = db.root
     try:
         with conn:
             # Resolve file_path: try exact match first, then suffix
@@ -738,12 +741,13 @@ def get_symbol_context(
         with a structured description of the symbol's purpose, parameters, and
         return values/side effects.
     """
-    ctx, err = _resolve_handler_context(project_root)
-    if err:
-        return err[0]
-    conn = ctx.conn
-    config_hash = ctx.config_hash
-    root = ctx.root
+    try:
+        db = BaseHandler.resolve_db_context(project_root)
+    except RuntimeError as e:
+        return {"error": str(e)}
+    conn = db.conn
+    config_hash = db.config_hash
+    root = db.root
     try:
         with conn:
             row = _lookup_definition(conn, config_hash, name, prefer_project=True)
@@ -874,12 +878,13 @@ def read_file(
         warning (str, optional — when reading from raw disk instead of
         indexed content)}.
     """
-    ctx, err = _resolve_handler_context(project_root)
-    if err:
-        return err[0]
-    conn = ctx.conn
-    config_hash = ctx.config_hash
-    root = ctx.root
+    try:
+        db = BaseHandler.resolve_db_context(project_root)
+    except RuntimeError as e:
+        return {"error": str(e)}
+    conn = db.conn
+    config_hash = db.config_hash
+    root = db.root
     try:
         with conn:
 
