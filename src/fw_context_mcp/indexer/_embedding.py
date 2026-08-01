@@ -232,80 +232,40 @@ def _build_embeddings(
             log.warning("Ollama not reachable — skipping embedding generation")
             return
     model = _embed_model_key(embedder.name, True)
-    # NOTE: DELETE-then-INSERT has a data-loss window — if interrupted,
-    # embeddings are lost.  Run `fw-context index --embeddings` to recover.
-    with transaction(conn):
-        # Clean embeddings for symbols whose body text may have changed
-        # (chunk count can differ after source edits — a symbol with
-        # chunk_index=0 may now split into 3 chunks, or vice versa).
-        # Also removes stale rows from interrupted prior runs.
-        # When symbol_ids is provided, only those symbols are cleaned.
-        if symbol_ids:
-            id_placeholders = ",".join("?" * len(symbol_ids))
-            conn.execute(
-                f"""DELETE FROM embeddings
-                   WHERE model = ?
-                     AND symbol_id IN ({id_placeholders})""",
-                (model, *symbol_ids),
-            )
-            try:
-                conn.execute(
-                    f"DELETE FROM vec_symbols WHERE config_hash = ? AND symbol_id IN ({id_placeholders})",
-                    (config_hash, *symbol_ids),
-                )
-            except sqlite3.OperationalError:
-                pass
-        else:
-            conn.execute(
-                """DELETE FROM embeddings
-                   WHERE model = ?
-                     AND symbol_id IN (
-                         SELECT s.id FROM symbols s
-                         WHERE s.config_hash = ?
-                           AND s.is_definition = 1
-                           AND s.kind IN ('function', 'method', 'constructor', 'destructor',
-                                          'class', 'struct', 'union', 'typedef', 'enum', 'varglobal')
-                     )""",
-                (model, config_hash),
-            )
-            try:
-                conn.execute("DELETE FROM vec_symbols WHERE config_hash = ?", (config_hash,))
-            except sqlite3.OperationalError:
-                pass
-
-        if symbol_ids:
-            id_placeholders = ",".join("?" * len(symbol_ids))
-            rows = conn.execute(
-                f"""SELECT s.id, s.name, s.qualified_name, s.kind, s.file_path,
-                           s.signature, s.is_definition, s.docstring, s.summary,
-                           s.source, s.is_project
-                    FROM symbols s
-                    WHERE s.config_hash = ?
-                      AND s.is_definition = 1
-                      AND s.id IN ({id_placeholders})
-                      AND s.kind IN ('function', 'method', 'constructor', 'destructor',
-                                    'class', 'struct', 'union', 'typedef', 'enum', 'varglobal')
-                    ORDER BY CASE WHEN s.docstring IS NOT NULL AND LENGTH(s.docstring) > 30
-                              THEN 0 ELSE 1 END""",
-                (config_hash, *symbol_ids),
-            ).fetchall()
-        else:
-            rows = conn.execute(
-                """SELECT s.id, s.name, s.qualified_name, s.kind, s.file_path,
-                          s.signature, s.is_definition, s.docstring, s.summary,
-                          s.source, s.is_project
-                   FROM symbols s
-                   WHERE s.config_hash = ?
-                     AND s.is_definition = 1
-                     AND s.kind IN ('function', 'method', 'constructor', 'destructor',
-                                   'class', 'struct', 'union', 'typedef', 'enum', 'varglobal')
-                   ORDER BY CASE WHEN s.docstring IS NOT NULL AND LENGTH(s.docstring) > 30
-                             THEN 0 ELSE 1 END""",
-                (config_hash,),
-            ).fetchall()
-        if not rows:
-            log.info("No definition symbols to embed (model=%s)", model)
-            return
+    # ── Phase 1: SELECT symbols to embed (read-only) ──
+    if symbol_ids:
+        id_placeholders = ",".join("?" * len(symbol_ids))
+        rows = conn.execute(
+            f"""SELECT s.id, s.name, s.qualified_name, s.kind, s.file_path,
+                       s.signature, s.is_definition, s.docstring, s.summary,
+                       s.source, s.is_project
+                FROM symbols s
+                WHERE s.config_hash = ?
+                  AND s.is_definition = 1
+                  AND s.id IN ({id_placeholders})
+                  AND s.kind IN ('function', 'method', 'constructor', 'destructor',
+                                'class', 'struct', 'union', 'typedef', 'enum', 'varglobal')
+                ORDER BY CASE WHEN s.docstring IS NOT NULL AND LENGTH(s.docstring) > 30
+                          THEN 0 ELSE 1 END""",
+            (config_hash, *symbol_ids),
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            """SELECT s.id, s.name, s.qualified_name, s.kind, s.file_path,
+                      s.signature, s.is_definition, s.docstring, s.summary,
+                      s.source, s.is_project
+               FROM symbols s
+               WHERE s.config_hash = ?
+                 AND s.is_definition = 1
+                 AND s.kind IN ('function', 'method', 'constructor', 'destructor',
+                               'class', 'struct', 'union', 'typedef', 'enum', 'varglobal')
+               ORDER BY CASE WHEN s.docstring IS NOT NULL AND LENGTH(s.docstring) > 30
+                         THEN 0 ELSE 1 END""",
+            (config_hash,),
+        ).fetchall()
+    if not rows:
+        log.info("No definition symbols to embed (model=%s)", model)
+        return
 
     # Build contextual descriptions — flowing sentences instead of token lists.
     # Anthropic Contextual Retrieval: chunk-specific context as sentences improves
@@ -386,6 +346,11 @@ def _build_embeddings(
                 f"{context_prefix}{sig_line} {extra_text}{body_text}".rstrip() + "\n",
             ))
 
+    # ── Phase 2: Generate embeddings (no DB writes) ──
+    # Buffer successful batches for atomic write-back at the end.
+    # Each entry: (blob_rows, vec_rows) — ready-to-insert tuples.
+    blob_batches: list[list[tuple]] = []
+    vec_batches: list[list[tuple]] = []
     total = 0
     chunk_size = 100
     total_batches = (len(desc_rows) + chunk_size - 1) // chunk_size
@@ -414,45 +379,84 @@ def _build_embeddings(
                 if is_fatal(e): raise
                 log.warning("vec0 table recreation failed (non-fatal): %s", e)
 
-        # Store in legacy BLOB table (backward compatibility)
-        with write_lock(db_dir, timeout=5.0):
-            blob_batch = [
-                (r["id"], ci, _vec_to_blob(emb), model)
-                for (r, ci, _), emb in zip(batch, embs, strict=True)
-            ]
-            upsert_embeddings(conn, blob_batch)
-
-            # Store in vec0 table (sqlite-vec KNN search)
-            try:
-                vec_batch = [
-                    (r["id"], ci, config_hash, emb)
-                    for (r, ci, _), emb in zip(batch, embs, strict=True)
-                ]
-                upsert_embeddings_vec(conn, vec_batch)
-            except SAFE_EXCEPT as e:
-                if is_fatal(e): raise
-                log.warning("vec0 batch insert failed (sqlite-vec may not be loaded): %s", e)
-
-        total += len(blob_batch)
+        blob_rows = [
+            (r["id"], ci, _vec_to_blob(emb), model)
+            for (r, ci, _), emb in zip(batch, embs, strict=True)
+        ]
+        vec_rows = [
+            (r["id"], ci, config_hash, emb)
+            for (r, ci, _), emb in zip(batch, embs, strict=True)
+        ]
+        blob_batches.append(blob_rows)
+        vec_batches.append(vec_rows)
+        total += len(blob_rows)
         elapsed = time.monotonic() - t0
         log.info("[%d/%d] %d symbols embedded %s", batch_num + 1, total_batches, len(batch), _fmt_dur(elapsed))
+
+    # ── Phase 3: Atomic DELETE + INSERT (no data-loss window) ──
+    # Old code deleted embeddings BEFORE generating new ones — if the
+    # process crashed mid-generation, embeddings were lost.  Now we
+    # buffer all new embeddings in memory and atomically swap them in.
+    with write_lock(db_dir, timeout=30.0):
+        with transaction(conn):
+            # Clean old embeddings for symbols being re-embedded
+            if symbol_ids:
+                id_placeholders = ",".join("?" * len(symbol_ids))
+                conn.execute(
+                    f"""DELETE FROM embeddings WHERE model = ?
+                        AND symbol_id IN ({id_placeholders})""",
+                    (model, *symbol_ids),
+                )
+                try:
+                    conn.execute(
+                        f"DELETE FROM vec_symbols WHERE config_hash = ? AND symbol_id IN ({id_placeholders})",
+                        (config_hash, *symbol_ids),
+                    )
+                except sqlite3.OperationalError:
+                    pass
+            else:
+                conn.execute(
+                    """DELETE FROM embeddings WHERE model = ?
+                       AND symbol_id IN (
+                           SELECT s.id FROM symbols s
+                           WHERE s.config_hash = ?
+                             AND s.is_definition = 1
+                             AND s.kind IN ('function', 'method', 'constructor', 'destructor',
+                                            'class', 'struct', 'union', 'typedef', 'enum', 'varglobal')
+                       )""",
+                    (model, config_hash),
+                )
+                try:
+                    conn.execute("DELETE FROM vec_symbols WHERE config_hash = ?", (config_hash,))
+                except sqlite3.OperationalError:
+                    pass
+
+            # Insert all buffered batches
+            for blob_rows in blob_batches:
+                upsert_embeddings(conn, blob_rows)
+            for vec_rows in vec_batches:
+                try:
+                    upsert_embeddings_vec(conn, vec_rows)
+                except SAFE_EXCEPT as e:
+                    if is_fatal(e): raise
+                    log.warning("vec0 batch insert failed (sqlite-vec may not be loaded): %s", e)
+
+            if embedding_dim is not None:
+                conn.execute(
+                    "UPDATE build_configs SET embedding_dim = ? WHERE config_hash = ?",
+                    (embedding_dim, config_hash),
+                )
+            # Prune embeddings with non-versioned model keys
+            try:
+                conn.execute(
+                    "DELETE FROM embeddings WHERE model NOT LIKE '%:desc-v%'"
+                    " AND symbol_id IN (SELECT id FROM symbols WHERE config_hash = ?)",
+                    (config_hash,),
+                )
+            except sqlite3.OperationalError:
+                pass
+
     log.info("Embeddings stored: %d embedding rows (model=%s)", total, model)
-    if embedding_dim is not None:
-        conn.execute(
-            "UPDATE build_configs SET embedding_dim = ? WHERE config_hash = ?",
-            (embedding_dim, config_hash),
-        )
-    # Prune embeddings with non-versioned model keys (pre-desc-v1 or unknown)
-    # to prevent old vectors from bloating storage and polluting query results.
-    try:
-        conn.execute(
-            "DELETE FROM embeddings WHERE model NOT LIKE '%:desc-v%'"
-            " AND symbol_id IN (SELECT id FROM symbols WHERE config_hash = ?)",
-            (config_hash,),
-        )
-    except sqlite3.OperationalError:
-        pass
-    conn.commit()
 
 
 
