@@ -11,6 +11,7 @@ Import from here as before::
 
 from .connection import (
     HandlerContext,
+    _integrity_checked,  # noqa: F401 — re-exported for server.py
     _invalidate_conn_cache,
     _open_db_or_return,
     _open_db_safe,

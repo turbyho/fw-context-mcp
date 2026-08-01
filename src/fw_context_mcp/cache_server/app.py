@@ -25,6 +25,7 @@ from starlette.middleware.base import BaseHTTPMiddleware
 
 from .. import __version__
 from .auth import CacheAuthMiddleware, require_can_read, require_can_write, require_can_write_with_overwrite
+from .backend import CacheStorageBackend
 
 logger = logging.getLogger(__name__)
 
@@ -153,6 +154,9 @@ def create_app(*, backend: CacheStorageBackend | None = None) -> FastAPI:
         if error is not None:
             raise HTTPException(status_code=403, detail="Token does not have write/overwrite permission")
     # -- Endpoints --
+    _dep_read = Depends(_auth_read)
+    _dep_write = Depends(_auth_write)
+    _dep_write_overwrite = Depends(_auth_write_with_overwrite)
 
     @app.get("/health")
     async def health(request: Request) -> dict[str, str]:
@@ -160,7 +164,7 @@ def create_app(*, backend: CacheStorageBackend | None = None) -> FastAPI:
         return {"status": "ok", "version": __version__}
 
     @app.post("/cache/batch", response_model=None)
-    async def batch_get(request: Request, body: BatchGetRequest, _auth=Depends(_auth_read)) -> dict[str, Any]:
+    async def batch_get(request: Request, body: BatchGetRequest, _auth=_dep_read) -> dict[str, Any]:
         """Batch lookup content hashes.
 
         Returns ``{"results": {hash: entry | null, ...}}``.
@@ -173,7 +177,7 @@ def create_app(*, backend: CacheStorageBackend | None = None) -> FastAPI:
         return {"results": results, "truncated": truncated}
 
     @app.put("/cache/batch", response_model=None)
-    async def batch_put(request: Request, body: BatchPutRequest, _auth=Depends(_auth_write_with_overwrite)) -> dict[str, Any]:
+    async def batch_put(request: Request, body: BatchPutRequest, _auth=_dep_write_overwrite) -> dict[str, Any]:
         """Batch write cache entries.
 
         Normal behaviour: ``INSERT ON CONFLICT DO NOTHING`` (first write wins).
@@ -193,7 +197,7 @@ def create_app(*, backend: CacheStorageBackend | None = None) -> FastAPI:
         return {"inserted": inserted, "total": len(entries), "truncated": truncated}
 
     @app.get("/cache/stats", response_model=None)
-    async def cache_stats(request: Request, _auth=Depends(_auth_read)) -> dict[str, Any]:
+    async def cache_stats(request: Request, _auth=_dep_read) -> dict[str, Any]:
         """Return cache statistics (total entries, models breakdown).
 
         Requires ``can_read``.
@@ -207,7 +211,7 @@ def create_app(*, backend: CacheStorageBackend | None = None) -> FastAPI:
         return stats
 
     @app.post("/cache/clear", response_model=None)
-    async def cache_clear(request: Request, body: CacheClearRequest, _auth=Depends(_auth_write)) -> dict[str, Any]:
+    async def cache_clear(request: Request, body: CacheClearRequest, _auth=_dep_write) -> dict[str, Any]:
         """Delete cache entries by content hash.
 
         Requires ``can_write``. Returns the number of deleted entries.

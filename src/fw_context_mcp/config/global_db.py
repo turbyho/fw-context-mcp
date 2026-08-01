@@ -62,7 +62,8 @@ def open_global_db() -> sqlite3.Connection:
                 try:
                     _global_conn.close()
                 except SAFE_EXCEPT as e:
-                    if is_fatal(e): raise
+                    if is_fatal(e):
+                        raise
                     pass
                 _global_conn = None  # stale connection, reopen
 

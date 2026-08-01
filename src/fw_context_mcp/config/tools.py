@@ -465,7 +465,8 @@ def check_target(target: InstructionTarget, project_root: Path | None = None) ->
                 if managed:  # Non-empty managed dict = skillshare active here
                     collision.is_skillshare_managed = True
             except SAFE_EXCEPT as e:
-                if is_fatal(e): raise
+                if is_fatal(e):
+                    raise
                 pass
             break
         parent = parent.parent

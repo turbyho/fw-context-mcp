@@ -187,14 +187,14 @@ def get_inheritance_chain(
             for depth in range(1, max_depth + 1):
                 if not current_level:
                     break
-                seen_level: set[str] = set()
-                unique_level: list[tuple[str, str, bool]] = []
+                seen_level_down: set[str] = set()
+                unique_level_down: list[tuple[str, str, bool]] = []
                 for cur_usr, access, is_virtual in current_level:
-                    if cur_usr not in seen_level and cur_usr not in visited_down:
-                        seen_level.add(cur_usr)
+                    if cur_usr not in seen_level_down and cur_usr not in visited_down:
+                        seen_level_down.add(cur_usr)
                         visited_down.add(cur_usr)
-                        unique_level.append((cur_usr, access, is_virtual))
-                current_level = unique_level
+                        unique_level_down.append((cur_usr, access, is_virtual))
+                current_level = unique_level_down
                 if not current_level:
                     break
 

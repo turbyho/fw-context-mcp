@@ -25,8 +25,9 @@ def _fallback_to_search_code(
     integrity checks run.  Adds a stale warning when the index is out of date.
     """
     conn, err_result = _open_db_or_return(db_path)
-    if err_result:
+    if err_result is not None:
         return err_result
+    assert conn is not None
     try:
         with conn:
             project_id = derive_project_id(root)

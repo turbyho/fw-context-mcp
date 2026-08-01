@@ -59,8 +59,9 @@ def _references_result(name: str, project_root: str | None, ref_kind: str | list
     if not db_path.exists():
         return [{"error": f"No index found for {root}. Run 'fw-context index' first."}]
     conn, err_result = _open_db_or_return(db_path)
-    if err_result:
+    if err_result is not None:
         return err_result
+    assert conn is not None
     with conn:
         cfg_data = get_active_config(conn, project_id)
         if not cfg_data:
@@ -257,8 +258,9 @@ def find_indirect_call_sites(
     if not db_path.exists():
         return [{"error": f"No index found for {root}. Run 'fw-context index' first."}]
     conn, err_result = _open_db_or_return(db_path)
-    if err_result:
+    if err_result is not None:
         return err_result
+    assert conn is not None
     with conn:
         cfg_data = get_active_config(conn, project_id)
         if not cfg_data:
@@ -334,8 +336,9 @@ def find_indirect_targets(
     if not db_path.exists():
         return [{"error": f"No index found for {root}. Run 'fw-context index' first."}]
     conn, err_result = _open_db_or_return(db_path)
-    if err_result:
+    if err_result is not None:
         return err_result
+    assert conn is not None
     with conn:
         cfg_data = get_active_config(conn, project_id)
         if not cfg_data:

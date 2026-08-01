@@ -10,6 +10,7 @@ import sys
 import time
 from pathlib import Path
 
+from ..mcp.shared.pid_file import PidFile
 from . import VerboseFormatter
 
 log = logging.getLogger(__name__)
@@ -159,41 +160,30 @@ def _validate_and_fix_artifacts(
     return compile_commands, build_dir_patterns, True
 
 
-# NOTE: PID file access could benefit from fcntl.flock() for multi-process
-# safety. Currently uses os.kill(pid, 0) for liveness checks which has
-# a TOCTOU race with PID reuse (low risk — PIDs on Linux wrap at 4M, collision extremely unlikely).  flock would eliminate this entirely.
 def _manage_bg_reindex(db_path: Path) -> None:
     """Kill any running background reindex and write pause/pid files."""
     pause_file = db_path.parent / "reindex.pause"
     reindex_pid_file = db_path.parent / "reindex.pid"
     db_path.parent.mkdir(parents=True, exist_ok=True)
 
-    if reindex_pid_file.exists():
-        try:
-            bg_pid = int(reindex_pid_file.read_text(encoding="utf-8").strip())
-            if bg_pid != os.getpid():
-                os.kill(bg_pid, signal.SIGTERM)
-                deadline = time.monotonic() + 5.0
-                while time.monotonic() < deadline:
-                    try:
-                        os.kill(bg_pid, 0)
-                    except OSError:
-                        break
-                    time.sleep(0.1)
-                else:
-                    try:
-                        os.kill(bg_pid, signal.SIGKILL)
-                    except OSError:
-                        log.debug("SIGKILL on bg reindex process %d failed", bg_pid)
-                reindex_pid_file.unlink(missing_ok=True)
-        except (OSError, ValueError):
-            reindex_pid_file.unlink(missing_ok=True)
+    # Kill any running background reindex
+    old_pid = PidFile.read_pid(reindex_pid_file)
+    if old_pid is not None and old_pid != os.getpid():
+        os.kill(old_pid, signal.SIGTERM)
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline:
+            if not PidFile._pid_exists(old_pid):
+                break
+            time.sleep(0.1)
+        else:
+            try:
+                os.kill(old_pid, signal.SIGKILL)
+            except OSError:
+                log.debug("SIGKILL on bg reindex process %d failed", old_pid)
+    reindex_pid_file.unlink(missing_ok=True)
 
-    try:
-        pause_file.write_text(str(os.getpid()), encoding="utf-8")
-    except OSError:
-        log.debug("Failed to write pause marker %s", pause_file)
-    reindex_pid_file.write_text(str(os.getpid()), encoding="utf-8")
+    PidFile(pause_file).write()
+    PidFile(reindex_pid_file).write()
 
 
 def _post_index_optimize(
@@ -274,6 +264,7 @@ def cmd_index(args: argparse.Namespace) -> int:
     if cc_result[0] is None:
         return 1
     compile_commands, explicit_cc = cc_result
+    assert compile_commands is not None  # checked above via cc_result[0]
 
     # ── Validate build artifacts ──
     compile_commands, build_dir_patterns, ok = _validate_and_fix_artifacts(
@@ -281,6 +272,7 @@ def cmd_index(args: argparse.Namespace) -> int:
     )
     if not ok:
         return 1
+    assert compile_commands is not None  # _validate_and_fix_artifacts returns Path|None, but ok=True → non-None
 
     project_id = derive_project_id(project_root)
     db_path = cfg.index.db_dir / project_id / "index.db"
@@ -295,8 +287,6 @@ def cmd_index(args: argparse.Namespace) -> int:
 
     # ── Manage background reindex ──
     _manage_bg_reindex(db_path)
-    reindex_pid_file = db_path.parent / "reindex.pid"
-    pause_file = db_path.parent / "reindex.pause"
 
     try:
         config_hash = run(
@@ -335,11 +325,5 @@ def cmd_index(args: argparse.Namespace) -> int:
         _post_index_optimize(db_path, project_root, project_id, detected_system, args)
         return 0
     finally:
-        reindex_pid_file.unlink(missing_ok=True)
-        try:
-            if pause_file.exists():
-                content = pause_file.read_text(encoding="utf-8").strip()
-                if content == str(os.getpid()):
-                    pause_file.unlink(missing_ok=True)
-        except OSError:
-            log.debug("Failed to unlink pause file %s", pause_file)
+        PidFile(db_path.parent / "reindex.pid").unlink_if_ours()
+        PidFile(db_path.parent / "reindex.pause").unlink_if_ours()

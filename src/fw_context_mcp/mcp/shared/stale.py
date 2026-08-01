@@ -356,8 +356,9 @@ def _with_stale_recovery(
     from ..background import _ensure_daemon_running  # lazy — avoids circular import
 
     conn, err_result = _open_db_or_return(db_path)
-    if err_result:
+    if err_result is not None:
         return err_result
+    assert conn is not None
     try:
         with conn:
             project_id = derive_project_id(root)

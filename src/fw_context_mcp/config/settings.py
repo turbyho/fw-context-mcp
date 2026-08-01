@@ -514,11 +514,9 @@ def _convert(value, conv: str):
     if conv == "path":
         return Path(value).expanduser()
     if conv.startswith("int("):
-        default = int(conv[4:-1])
-        return _safe_int(value, default)
+        return _safe_int(value, int(conv[4:-1]))
     if conv.startswith("float("):
-        default = float(conv[6:-1])
-        return _safe_float(value, default)
+        return _safe_float(value, float(conv[6:-1]))
     return value  # fallback
 
 

@@ -111,9 +111,9 @@ def cmd_analyze(args: argparse.Namespace) -> int:
     """
     from ..config import derive_project_id
     from ..config import load as load_config
-    from ..indexer.db import get_active_config, open_db, upsert_build_config
     from ..indexer._llm_analysis import _build_llm_analysis
     from ..indexer._postprocess import _build_overrides
+    from ..indexer.db import get_active_config, open_db, upsert_build_config
     from ..utils import resolve_project_root
 
     if args.verbose:

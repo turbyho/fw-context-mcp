@@ -32,6 +32,7 @@ from pathlib import Path
 
 from ..config import derive_project_id
 from ..config import load as load_config
+from .shared.pid_file import PidFile
 
 log = logging.getLogger(__name__)
 
@@ -127,58 +128,20 @@ async def daemon_main(project_root: Path) -> None:
     index_proc: asyncio.subprocess.Process | None = None
 
     # ── Unix socket server ───────────────────────────────────────────────
-    sock_path = _socket_path(db_dir)
-
-    # Clean up stale socket file left by a previous crashed daemon.
-    sock_path.unlink(missing_ok=True)
-
-    async def _handle_ping(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
-        """Handle one incoming ping connection."""
+    def _on_ping() -> None:
         nonlocal last_ping_time
-        try:
-            data = await asyncio.wait_for(reader.read(1024), timeout=2.0)
-            if b"ping" in data:
-                last_ping_time = time.monotonic()
-        except (TimeoutError, OSError):
-            pass
-        finally:
-            try:
-                writer.close()
-                await writer.wait_closed()
-            except OSError:
-                pass
+        last_ping_time = time.monotonic()
 
     try:
-        server = await asyncio.start_unix_server(
-            _handle_ping,
-            path=str(sock_path),
-        )
+        server, sock_path = await _setup_unix_socket(db_dir, _on_ping)
     except OSError:
-        log.error("Cannot bind socket %s — daemon already running?", sock_path)
         fcntl.flock(lock_fd, fcntl.LOCK_UN)
         os.close(lock_fd)
         pid_file.unlink(missing_ok=True)
         sys.exit(1)
 
-    os.chmod(sock_path, 0o600)
-
     # ── Signal handlers ──────────────────────────────────────────────────
-    loop = asyncio.get_running_loop()
-
-    def _handle_signal() -> None:
-        """Set the shutdown event — runs inside the event loop context.
-
-        All cleanup happens cooperatively in the main loop when
-        ``shutdown.is_set()`` is detected.
-        """
-        shutdown.set()
-
-    for sig in (signal.SIGTERM, signal.SIGINT):
-        try:
-            loop.add_signal_handler(sig, _handle_signal)
-        except NotImplementedError:
-            # Fallback for platforms without add_signal_handler (Windows).
-            pass
+    _setup_signal_handlers(shutdown)
 
     # ── Main loop ────────────────────────────────────────────────────────
     from watchfiles import awatch
@@ -261,25 +224,84 @@ async def daemon_main(project_root: Path) -> None:
                     index_proc = None
 
     finally:
-        dlog.info("Daemon shutting down")
-        if index_proc is not None and index_proc.returncode is None:
-            dlog.info("Terminating index subprocess (pid %d)", index_proc.pid)
-            index_proc.terminate()
-            try:
-                await asyncio.wait_for(index_proc.wait(), timeout=10)
-            except TimeoutError:
-                dlog.warning("Index subprocess did not exit, killing")
-                index_proc.kill()
-                await index_proc.wait()
-        shutdown.set()
-        server.close()
-        await server.wait_closed()
-        _cleanup_files(sock_path, pid_file)
-        fcntl.flock(lock_fd, fcntl.LOCK_UN)
-        os.close(lock_fd)
+        await _cleanup_daemon(index_proc, server, sock_path, pid_file, lock_fd, shutdown)
 
 
 # ── Internal helpers ─────────────────────────────────────────────────────────
+
+
+async def _setup_unix_socket(db_dir: Path, on_ping) -> tuple[asyncio.Server, Path]:
+    """Create and bind the Unix domain socket for daemon pings.
+
+    *on_ping* is called (no arguments) each time a valid ping arrives.
+    Returns the server and socket path.
+    """
+    sock_path = _socket_path(db_dir)
+    sock_path.unlink(missing_ok=True)
+
+    async def _handle_ping(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        try:
+            data = await asyncio.wait_for(reader.read(1024), timeout=2.0)
+            if b"ping" in data:
+                on_ping()
+        except (TimeoutError, OSError):
+            pass
+        finally:
+            try:
+                writer.close()
+                await writer.wait_closed()
+            except OSError:
+                pass
+
+    try:
+        server = await asyncio.start_unix_server(_handle_ping, path=str(sock_path))
+    except OSError:
+        log.error("Cannot bind socket %s — daemon already running?", sock_path)
+        raise
+
+    os.chmod(sock_path, 0o600)
+    return server, sock_path
+
+
+def _setup_signal_handlers(shutdown: asyncio.Event) -> None:
+    """Register SIGTERM / SIGINT handlers that set *shutdown*."""
+    loop = asyncio.get_running_loop()
+
+    def _handle_signal() -> None:
+        shutdown.set()
+
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            loop.add_signal_handler(sig, _handle_signal)
+        except NotImplementedError:
+            pass
+
+
+async def _cleanup_daemon(
+    index_proc: asyncio.subprocess.Process | None,
+    server: asyncio.Server,
+    sock_path: Path,
+    pid_file: Path,
+    lock_fd: int,
+    shutdown: asyncio.Event,
+) -> None:
+    """Gracefully shut down the daemon: terminate subprocess, close server, clean up files."""
+    log.info("Daemon shutting down")
+    if index_proc is not None and index_proc.returncode is None:
+        log.info("Terminating index subprocess (pid %d)", index_proc.pid)
+        index_proc.terminate()
+        try:
+            await asyncio.wait_for(index_proc.wait(), timeout=10)
+        except TimeoutError:
+            log.warning("Index subprocess did not exit, killing")
+            index_proc.kill()
+            await index_proc.wait()
+    shutdown.set()
+    server.close()
+    await server.wait_closed()
+    _cleanup_files(sock_path, pid_file)
+    fcntl.flock(lock_fd, fcntl.LOCK_UN)
+    os.close(lock_fd)
 
 
 def _is_source_file(path_str: str, build_patterns: list[str] | None = None) -> bool:
@@ -350,7 +372,7 @@ def _staleness_check(project_root: Path) -> tuple[bool, list[str]]:
         config_hash = cfg["config_hash"]
 
         # 1-3. Structural checks (shared with background._fast_staleness_check)
-        reasons.extend(check_structural_staleness(conn, config_hash, cfg, project_root))
+        reasons.extend(check_structural_staleness(conn, config_hash, dict(cfg), project_root))
 
         # 4. Modified source files — files changed before daemon started.
         #    watchfiles only detects NEW events, so without this check
@@ -395,25 +417,15 @@ async def _run_index_async(
 
     # Write reindex.pid BEFORE spawning so a concurrent daemon
     # restart sees the marker and doesn't spawn a duplicate.
-    from .background import _pid_exists
     rp = db_dir / "reindex.pid"
-    try:
-        rfd = os.open(str(rp), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
-    except FileExistsError:
-        # Stale PID file from a previous crashed index subprocess.
-        # Check if the old process is still alive before removing.
-        try:
-            old_pid = int(rp.read_text(encoding="utf-8").strip())
-            if _pid_exists(old_pid):
-                raise RuntimeError(
-                    f"Another index process (pid {old_pid}) is already running for {project_root}"
-                ) from None
-        except (OSError, ValueError):
-            pass
-        rp.unlink(missing_ok=True)
-        rfd = os.open(str(rp), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
-    # Write a sentinel — real PID is filled in after spawn.
-    pf = os.fdopen(rfd, "w", encoding="utf-8")
+    old_pid = PidFile.read_pid(rp)
+    if old_pid is not None and PidFile._pid_exists(old_pid):
+        raise RuntimeError(
+            f"Another index process (pid {old_pid}) is already running for {project_root}"
+        )
+    # Clean up any stale file before writing ours.
+    rp.unlink(missing_ok=True)
+    pf = open(rp, "w", encoding="utf-8")
     pf.write(str(os.getpid()))
     pf.flush()
 
@@ -467,7 +479,7 @@ async def _wait_index(
                 return
             await asyncio.sleep(0.5)
     finally:
-        (db_dir / "reindex.pid").unlink(missing_ok=True)
+        PidFile(db_dir / "reindex.pid", pid=proc.pid).unlink_if_ours()
 
     if proc.returncode == 0:
         log.info("Background index completed")

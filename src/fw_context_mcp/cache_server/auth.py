@@ -11,6 +11,10 @@ requires ``can_overwrite``.
 
 from __future__ import annotations
 
+import ipaddress as _ipaddress
+import os as _os
+import threading as _threading
+import time as _time
 from typing import Any
 
 from starlette.middleware.base import BaseHTTPMiddleware
@@ -35,12 +39,14 @@ async def _lookup_permissions(request: Request, token: str) -> dict[str, Any] | 
 
 
 
-
 # Simple in-memory IP-based rate limiter for auth failures.
 # Tracks failed attempts per IP with a sliding 60s window.
+#
+# NOTE: This is intentionally IN-MEMORY ONLY — state resets on server
+# restart.  For production deployments behind a reverse proxy (nginx),
+# rate limiting should be configured at the proxy level via
+# limit_req_zone / limit_req (see nginx documentation).
 _auth_failures: dict[str, list[float]] = {}
-import threading as _threading
-import time as _time
 
 _auth_lock = _threading.Lock()
 _auth_check_count: int = 0
@@ -50,9 +56,6 @@ _AUTH_PRUNE_INTERVAL = 100  # prune stale entries every N checks
 # Default trusted reverse-proxy CIDRs (loopback + private ranges).
 # Override via FW_CACHE_TRUSTED_PROXIES env var (comma-separated CIDRs).
 _DEFAULT_TRUSTED_PROXIES = frozenset({"127.0.0.0/8", "::1/128", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"})
-
-import ipaddress as _ipaddress
-import os as _os
 
 
 def _parse_trusted_proxies() -> frozenset[str]:

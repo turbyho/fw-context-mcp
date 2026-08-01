@@ -151,7 +151,7 @@ def resource_stats() -> str:
     configured index directory.
     """
 
-    projects = list_projects()
+    projects = maintenance.list_projects()
     if not projects:
         return "No indexed projects found."
     lines = [f"# fw-context — {len(projects)} project(s)", ""]
@@ -180,7 +180,7 @@ def resource_projects() -> str:
     """
     import json
 
-    return json.dumps(list_projects(), indent=2, ensure_ascii=False, default=str)
+    return json.dumps(maintenance.list_projects(), indent=2, ensure_ascii=False, default=str)
 
 
 @mcp.resource("fw-context://symbols/{name}")
@@ -193,12 +193,12 @@ def resource_symbol(name: str) -> str:
     import json
 
     try:
-        result = get_source(name)
+        result = source.get_source(name)
     except (sqlite3.Error, OSError, ValueError) as exc:
         return json.dumps({"error": f"Failed to read symbol '{name}': {exc}"})
     if "error" in result:
         return json.dumps(result)
-    source = result.pop("source", "")
+    source_code = result.pop("source", "")
     # Render as a small markdown document
     lines = [
         f"# {result['name']}",
@@ -209,7 +209,7 @@ def resource_symbol(name: str) -> str:
         f"- **signature:** `{result.get('signature', '')}`",
         "",
         "```cpp",
-        source,
+        source_code,
         "```",
     ]
     return "\n".join(lines)

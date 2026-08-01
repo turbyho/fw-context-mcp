@@ -108,6 +108,87 @@ def _enrich_batch(conn, batch_rows, config_hash: str) -> list[dict]:
         enriched.append(d)
     return enriched
 
+def _resolve_model_context_size(llm_config) -> int:
+    """Resolve the model context window size from the Ollama API.
+
+    Falls back to ``llm_config.num_ctx`` when the API is unreachable.
+    """
+    import httpx
+
+    try:
+        resp = httpx.get(llm_config.ollama_url.rstrip("/") + "/api/tags", timeout=5.0)
+        resp.raise_for_status()
+        for m in resp.json().get("models", []):
+            if m.get("name") == llm_config.model:
+                ctx = m.get("details", {}).get("context_length", 0)
+                if ctx > 0:
+                    log.debug("Resolved model context from Ollama: %d tokens", ctx)
+                    return ctx
+                break
+    except SAFE_EXCEPT as e:
+        if is_fatal(e):
+            raise
+        log.warning("Ollama not reachable — skipping LLM analysis generation")
+        return 0
+    return llm_config.num_ctx
+
+
+def _clear_skip_sentinels(
+    conn,
+    model: str,
+    model_ctx_size: int,
+    retry_unparseable: bool,
+) -> None:
+    """Remove skip sentinels that are no longer applicable.
+
+    - ``skip:toolarge:`` sentinels whose recorded context size is smaller
+      than the current model's context window are cleared (the symbol may
+      now fit).
+    - ``skip:unparseable:`` sentinels are cleared when *retry_unparseable*
+      is True, or when the stored model name doesn't match *model*.
+    """
+    conn.execute(
+        """DELETE FROM llm_analysis
+           WHERE model LIKE 'skip:toolarge:%'
+             AND CAST(SUBSTR(model, 15) AS INTEGER) < ?""",
+        (model_ctx_size,),
+    )
+    if retry_unparseable:
+        conn.execute("DELETE FROM llm_analysis WHERE model LIKE 'skip:unparseable:%'")
+    else:
+        conn.execute(
+            """DELETE FROM llm_analysis
+               WHERE model LIKE 'skip:unparseable:%'
+                 AND SUBSTR(model, 18) != ?""",
+            (model,),
+        )
+
+
+def _select_unanalyzed_symbols(
+    conn,
+    config_hash: str,
+    project_only: bool,
+) -> list:
+    """Return definition symbols that still need LLM analysis."""
+    is_project_clause = "AND s.is_project = 1" if project_only else ""
+    query = f"""SELECT s.id, s.name, s.qualified_name, s.kind, s.file_path,
+                      s.signature, s.is_definition, s.docstring,
+                      s.end_line, s.line, s.usr,
+                      f.path as abs_path
+               FROM symbols s
+               JOIN files f ON s.file_id = f.id
+               WHERE s.config_hash = ?
+                 AND s.is_definition = 1
+                 AND s.kind IN ('function', 'method', 'constructor', 'destructor',
+                                'class', 'struct', 'union', 'typedef', 'enum', 'varglobal')
+                 AND s.name NOT LIKE '%(anonymous%'
+                 AND s.name NOT LIKE '%(unnamed%'
+                 {is_project_clause}
+                 AND s.id NOT IN (SELECT symbol_id FROM llm_analysis)
+               ORDER BY s.kind, s.file_path, s.line"""
+    with transaction(conn, checkpoint=False):
+        return conn.execute(query, (config_hash,)).fetchall()
+
 
 def _build_llm_analysis(
     conn,
@@ -142,8 +223,6 @@ def _build_llm_analysis(
     so previously-failed symbols are re-attempted. Set True for manual
     indexing, False for background reindex (safe: retries only on model change).
     """
-    import httpx
-
     from ..indexer.prompts import build_analysis_prompt, parse_analysis_response
     from ..utils import compute_content_hash
 
@@ -151,79 +230,20 @@ def _build_llm_analysis(
     logging.getLogger("httpx").setLevel(logging.WARNING)
 
     # Check Ollama reachability and resolve model context size.
-    # /api/tags response includes details.context_length per model —
-    # authoritative for both local and cloud-proxied models.
-    _model_ctx_size = llm_config.num_ctx
-    try:
-        resp = httpx.get(llm_config.ollama_url.rstrip("/") + "/api/tags", timeout=5.0)
-        resp.raise_for_status()
-        for m in resp.json().get("models", []):
-            if m.get("name") == llm_config.model:
-                ctx = m.get("details", {}).get("context_length", 0)
-                if ctx > 0:
-                    _model_ctx_size = ctx
-                    log.debug("Resolved model context from Ollama: %d tokens", ctx)
-                break
-    except SAFE_EXCEPT as e:
-        if is_fatal(e): raise
-        log.warning("Ollama not reachable — skipping LLM analysis generation")
+    _model_ctx_size = _resolve_model_context_size(llm_config)
+    if _model_ctx_size == 0:
         return
 
     model = llm_config.model
 
-    # Un-skip symbols that were previously skipped because of a smaller
-    # context window.  When the user switches to a model with a larger
-    # context, those symbols may now fit and should be re-attempted.
-    conn.execute(
-        """DELETE FROM llm_analysis
-           WHERE model LIKE 'skip:toolarge:%'
-             AND CAST(SUBSTR(model, 15) AS INTEGER) < ?""",
-        (_model_ctx_size,),
-    )
+    # Clear skip sentinels that are no longer applicable
+    _clear_skip_sentinels(conn, model, _model_ctx_size, retry_unparseable)
 
-    # Un-skip symbols that were skipped due to unparseable output.
-    # The sentinel is "skip:unparseable:<model>".
-    # Background reindex keeps sentinels (retry only on model change);
-    # manual fw-context index / reindex_file clears all sentinels so
-    # the fixed parser/LLM gets another chance.
-    if retry_unparseable:
-        conn.execute("DELETE FROM llm_analysis WHERE model LIKE 'skip:unparseable:%'")
-    else:
-        conn.execute(
-            """DELETE FROM llm_analysis
-               WHERE model LIKE 'skip:unparseable:%'
-                 AND SUBSTR(model, 18) != ?""",
-            (model,),
-        )
-
-    if not project_only:
-        is_project_clause = ""
-    else:
-        is_project_clause = "AND s.is_project = 1"
-
-    query = """SELECT s.id, s.name, s.qualified_name, s.kind, s.file_path,
-                      s.signature, s.is_definition, s.docstring,
-                      s.end_line, s.line, s.usr,
-                      f.path as abs_path
-               FROM symbols s
-               JOIN files f ON s.file_id = f.id
-               WHERE s.config_hash = ?
-                 AND s.is_definition = 1
-                  AND s.kind IN ('function', 'method', 'constructor', 'destructor',
-                                  'class', 'struct', 'union', 'typedef', 'enum', 'varglobal')
-                 AND s.name NOT LIKE '%(anonymous%'
-                 AND s.name NOT LIKE '%(unnamed%'
-                 """
-    if is_project_clause:
-        query += f" {is_project_clause}"
-    query += """ AND s.id NOT IN (SELECT symbol_id FROM llm_analysis)
-               ORDER BY s.kind, s.file_path, s.line"""
-
-    with transaction(conn, checkpoint=False):
-        rows = conn.execute(query, (config_hash,)).fetchall()
-        if not rows:
-            log.info("All project symbols already analyzed — nothing to do")
-            return
+    # Select symbols needing analysis
+    rows = _select_unanalyzed_symbols(conn, config_hash, project_only)
+    if not rows:
+        log.info("All project symbols already analyzed — nothing to do")
+        return
 
     model = llm_config.model
     total_symbols = len(rows)
@@ -250,7 +270,8 @@ def _build_llm_analysis(
                 local_hits = local_cache_lookup(local_db, [h])
                 cached = local_hits.get(h)
             except SAFE_EXCEPT as e:
-                if is_fatal(e): raise
+                if is_fatal(e):
+                    raise
                 log.debug("Local global cache lookup failed: %s", e)
 
             # Tier 2: remote cache server
@@ -263,12 +284,14 @@ def _build_llm_analysis(
                         try:
                             local_cache_upsert(local_db, [{"hash": h, **cached}])
                         except SAFE_EXCEPT as e:
-                            if is_fatal(e): raise
+                            if is_fatal(e):
+                                raise
                             log.debug("Local global cache write failed: %s", e)
                     else:
                         log.debug("Remote cache miss for %s (hash=%s…)", qname, h[:12])
                 except SAFE_EXCEPT as e:
-                    if is_fatal(e): raise
+                    if is_fatal(e):
+                        raise
                     log.debug("Remote cache lookup failed for %s: %s", qname, e)
 
             if cached:
@@ -396,7 +419,8 @@ def _build_llm_analysis(
                             ],
                         )
                     except SAFE_EXCEPT as e:
-                        if is_fatal(e): raise
+                        if is_fatal(e):
+                            raise
                         log.debug("Local global cache write failed: %s", e)
                     # Store on remote cache server (fire-and-forget)
                     if cache_client is not None:
@@ -413,7 +437,8 @@ def _build_llm_analysis(
                                 ]
                             )
                         except SAFE_EXCEPT as e:
-                            if is_fatal(e): raise
+                            if is_fatal(e):
+                                raise
                             log.debug("Remote cache write failed: %s", e)
                     total += inserted
 
@@ -430,8 +455,9 @@ def _build_llm_analysis(
     try:
         conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
     except SAFE_EXCEPT as e:
-        if is_fatal(e): raise
-        pass  # libclang/SQLite fallback
+        if is_fatal(e):
+            raise
+        pass  # non-fatal — continue
 
     log.info("LLM analysis stored: %d/%d symbols (model=%s)", total, total_symbols, model)
     local_db.close()

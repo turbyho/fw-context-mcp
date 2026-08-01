@@ -527,7 +527,7 @@ def _ensure_cache_server_init() -> str | None:
 
     from .backend import CacheBackend
 
-    async def _standalone():
+    async def _init_server():
         backend = CacheBackend(db_url)
         try:
             await backend.connect()
@@ -536,7 +536,7 @@ def _ensure_cache_server_init() -> str | None:
             await backend.close()
 
     try:
-        token = asyncio.run(_standalone())
+        token = asyncio.run(_init_server())
     except (RuntimeError, OSError) as e:
         print(f"  [!] Failed to init cache server: {e}")
         return None
@@ -580,9 +580,8 @@ def _setup_project_and_tokens(
     from .backend import CacheBackend
     db_url = _find_db_url()
 
-    existing: list[dict] = []
 
-    async def _standalone():
+    async def _create_project():
         backend = CacheBackend(db_url)
         try:
             await backend.connect()
@@ -631,7 +630,7 @@ def _setup_project_and_tokens(
             await backend.close()
 
     try:
-        return asyncio.run(_standalone())
+        return asyncio.run(_create_project())
     except (RuntimeError, OSError) as e:
         print(f"    [!] Failed to create project: {e}")
     return None

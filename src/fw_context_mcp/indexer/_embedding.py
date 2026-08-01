@@ -156,8 +156,9 @@ def _cleanup_orphaned_cc_artifacts(db_path: Path, project_id: str) -> int:
             conn.close()
             active_hashes = {r["config_hash"] for r in rows}
         except SAFE_EXCEPT as e:
-            if is_fatal(e): raise
-            pass  # libclang/SQLite fallback  # DB may be corrupt or schema not yet initialized
+            if is_fatal(e):
+                raise
+            pass  # non-fatal — continue  # DB may be corrupt or schema not yet initialized
 
     deleted = 0
     for f in cc_dir.iterdir():
@@ -221,7 +222,8 @@ def _build_embeddings(
             resp = httpx.get(llm_config.ollama_url.rstrip("/") + "/api/tags", timeout=5.0)
             resp.raise_for_status()
         except SAFE_EXCEPT as e:
-            if is_fatal(e): raise
+            if is_fatal(e):
+                raise
             log.warning("Ollama not reachable — skipping embedding generation")
             return
     model = _embed_model_key(embedder.name, True)
@@ -356,7 +358,8 @@ def _build_embeddings(
         try:
             embs = embedder.embed_documents(chunk_descs)
         except SAFE_EXCEPT as e:
-            if is_fatal(e): raise
+            if is_fatal(e):
+                raise
             elapsed = time.monotonic() - t0
             log.warning("[%d/%d] embedding batch failed %s: %s", batch_num + 1, total_batches, _fmt_dur(elapsed), e)
             continue
@@ -369,7 +372,8 @@ def _build_embeddings(
             try:
                 init_vec_table(conn, embedding_dim)
             except SAFE_EXCEPT as e:
-                if is_fatal(e): raise
+                if is_fatal(e):
+                    raise
                 log.warning("vec0 table recreation failed (non-fatal): %s", e)
 
         blob_rows = [
@@ -387,9 +391,30 @@ def _build_embeddings(
         log.info("[%d/%d] %d symbols embedded %s", batch_num + 1, total_batches, len(batch), _fmt_dur(elapsed))
 
     # ── Phase 3: Atomic DELETE + INSERT (no data-loss window) ──
-    # Old code deleted embeddings BEFORE generating new ones — if the
-    # process crashed mid-generation, embeddings were lost.  Now we
-    # buffer all new embeddings in memory and atomically swap them in.
+    total = _atomic_store_embeddings(
+        conn, db_dir, config_hash, symbol_ids, blob_batches, vec_batches,
+        embedding_dim, model,
+    )
+
+    log.info("Embeddings stored: %d embedding rows (model=%s)", total, model)
+
+
+
+def _atomic_store_embeddings(
+    conn: sqlite3.Connection,
+    db_dir: Path,
+    config_hash: str,
+    symbol_ids: list[int] | None,
+    blob_batches: list[list[tuple]],
+    vec_batches: list[list[tuple]],
+    embedding_dim: int | None,
+    model: str,
+) -> int:
+    """Atomically delete old embeddings and insert new ones within a write lock.
+
+    Returns the total number of embedding rows stored.
+    """
+    total = sum(len(b) for b in blob_batches)
     with write_lock(db_dir, timeout=30.0):
         with transaction(conn):
             # Clean old embeddings for symbols being re-embedded
@@ -431,7 +456,8 @@ def _build_embeddings(
                 try:
                     upsert_embeddings_vec(conn, vec_rows)
                 except SAFE_EXCEPT as e:
-                    if is_fatal(e): raise
+                    if is_fatal(e):
+                        raise
                     log.warning("vec0 batch insert failed (sqlite-vec may not be loaded): %s", e)
 
             if embedding_dim is not None:
@@ -448,10 +474,7 @@ def _build_embeddings(
                 )
             except sqlite3.OperationalError:
                 pass
-
-    log.info("Embeddings stored: %d embedding rows (model=%s)", total, model)
-
-
+    return total
 
 
 # ═══════════════════════════════════════════════════════════════
