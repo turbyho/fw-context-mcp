@@ -77,6 +77,17 @@ def _cli(args: list[str], cwd: Path, timeout: int = 120) -> subprocess.Completed
     )
 
 
+
+def _isolate_index_db(project_root: Path, tmp_dir: Path) -> None:
+    """Write local.toml to redirect db_dir into tmp_dir for test isolation."""
+    local_config_dir = project_root / ".fw-context"
+    local_config_dir.mkdir(parents=True, exist_ok=True)
+    local_toml = local_config_dir / "local.toml"
+    index_dir = tmp_dir / "index"
+    local_toml.write_text(
+        f'[index]\ndb_dir = "{index_dir}"\n',
+        encoding="utf-8",
+    )
 def _write_file(path: Path, content: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(content, encoding="utf-8")
@@ -242,6 +253,9 @@ void log_message(const char* msg) {
         },
     ]
     cc_json.write_text(json.dumps(cc, indent=2), encoding="utf-8")
+
+    # Isolate index DB to tmp_path before init
+    _isolate_index_db(proj, tmp_path)
 
     # Initialize project to generate UUID4 project ID
     init_result = _cli(
@@ -1718,6 +1732,9 @@ void log_message(const char* msg) {
     ]
     cc_json = proj / "compile_commands.json"
     cc_json.write_text(json.dumps(cc, indent=2), encoding="utf-8")
+
+    # Isolate index DB to tmp_path before init
+    _isolate_index_db(proj, proj.parent)
 
     # Initialize project first — generates UUID4 project ID
     init_result = _cli(
