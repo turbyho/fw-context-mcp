@@ -7,8 +7,8 @@ within a session.
 from __future__ import annotations
 
 import threading
-from collections import OrderedDict
 import time
+from collections import OrderedDict
 
 
 class KeywordCache:
@@ -28,7 +28,7 @@ class KeywordCache:
         self._ttl_s = ttl_s
         self._max_entries = max_entries
         # value = (ts, (queries, understanding))
-        self._store: "OrderedDict[tuple[str, str], tuple[float, tuple[list[str], str]]]" = OrderedDict()
+        self._store: OrderedDict[tuple[str, str], tuple[float, tuple[list[str], str]]] = OrderedDict()
         self._lock = threading.Lock()
 
     def get(self, key: tuple) -> tuple[list[str], str] | None:

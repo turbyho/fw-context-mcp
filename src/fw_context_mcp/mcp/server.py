@@ -33,7 +33,7 @@ from mcp.server.fastmcp import FastMCP
 
 from ..utils import resolve_project_root
 from .background import _ensure_daemon_running
-from .handlers import callgraph, inheritance, maintenance, search, _search_fallbacks, _lookup, source, variables
+from .handlers import callgraph, inheritance, maintenance, search, source, variables
 from .shared.context import _check_server_ready, _integrity_checked
 
 log = logging.getLogger(__name__)

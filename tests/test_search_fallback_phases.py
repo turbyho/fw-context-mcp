@@ -25,21 +25,22 @@ from fw_context_mcp.search.phases.search_fallbacks import (
     _do_individual_terms_fallback,
     _do_macros_fts_fallback,
     _do_name_tokens_fallback,
-    _symbol_row_to_dict,
 )
+from fw_context_mcp.search.shared_fallbacks import _symbol_row_to_dict
 
 
 # ── Patch helpers ─────────────────────────────────────────────────────────────
-# Phase implementations + _do_* helpers pass root=None to _symbol_row_to_dict
-# or call abs_path(root=None), which crashes (known bug, see F5.1 in
-# comprehensive-review-fixes.md).  Mock abs_path in tests as workaround.
+# _do_* adapter functions delegate to _search_code_* in shared_fallbacks,
+# which call abs_path.  When root is None (adapter default), _symbol_row_to_dict
+# skips abs_path entirely, so the mock is only needed for phase tests that
+# pass ctx.project_root.  Kept for safety — no harm mocking it either way.
 
-_ABS_PATH_MODULE = "fw_context_mcp.search.phases.search_fallbacks.abs_path"
+_ABS_PATH_MODULE = "fw_context_mcp.search.shared_fallbacks.abs_path"
 _OPEN_DB_MODULE = "fw_context_mcp.search.phases.search_fallbacks.open_db"
 
 
 def _mock_abs_path():
-    """Return a side_effect mock for abs_path that handles None root."""
+    """Return a side_effect mock for abs_path."""
     return patch(
         _ABS_PATH_MODULE,
         side_effect=lambda root, path: f"/fake/{path}" if path else "",

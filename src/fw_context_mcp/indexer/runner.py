@@ -6,42 +6,38 @@ that runner, reindex_file, and auto-reindex all use the same code path.
 
 from __future__ import annotations
 
-import hashlib
 import logging
 import os
 import sqlite3
 import threading
 import time
-from contextlib import nullcontext
 from pathlib import Path
 
-from ..config.settings import DESCRIPTION_VERSION, derive_project_id
-from ..llm.ollama import call_ollama
-from ..utils import MTIME_TOLERANCE_S, compute_source_hash, read_file_lines
+from ..config.settings import derive_project_id
+from ._embedding import (
+    _cleanup_orphaned_cc_artifacts,
+    _fmt_dur,
+)
+from ._postprocess import (
+    _run_postprocess,
+)
+from ._unit_processor import (
+    _check_and_parse_unit,
+    _handle_unchanged_or_reuse,
+    _process_unit,
+)
 from .compile_commands import _SOURCE_EXTS, validate_include_files
 from .compile_commands import parse as parse_compile_commands
-from .config_hash import compute_flags_hash, compute_tu_content_hash
 from .db import (
-    CURRENT_SCHEMA_VERSION,
-    delete_build_data,
     drop_fts_triggers,
     get_file_hashes,
     open_db,
-    rebuild_files_fts,
     rebuild_fts,
-    rebuild_macros_fts,
     transaction,
     upsert_build_config,
-    upsert_file,
     upsert_project,
     write_lock,
 )
-from .ops import _build_filtered_file_content, _normalize_file_path, store_symbols_for_unit
-from ._manifest_updater import _refresh_header_mtimes_from_manifest, _update_manifest_after_index
-from ._embedding import _build_embeddings, _chunk_body, _cleanup_orphaned_cc_artifacts, _embed_model_key, _fmt_dur, _truncate_body
-from ._llm_analysis import _build_llm_analysis, _enrich_batch, _fetch_callees, _fetch_referencers, _read_body
-from ._unit_processor import _check_and_parse_unit, _get_manifest_entry_hash_for_unit, _handle_unchanged_or_reuse, _process_unit, _reassign_symbols_for_file
-from ._postprocess import _build_hotspot_cache, _build_overrides, _build_pagerank, _extract_param_types, _run_postprocess
 
 log = logging.getLogger(__name__)
 

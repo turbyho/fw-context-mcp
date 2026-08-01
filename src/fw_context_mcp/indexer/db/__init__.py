@@ -96,12 +96,11 @@ from ._connection import (
     open_db,
     transaction,
 )
-from ._locking import WriteLockTimeout, write_lock
 from ._embeddings import (
     _cosine_sim,
-    get_embeddings,
     clean_orphan_embeddings,
     clean_orphan_embeddings_vec,
+    get_embeddings,
     init_vec_table,
     search_similar_hybrid,
     search_similar_vec,
@@ -140,6 +139,7 @@ from ._llm import (
     get_llm_analysis_for_symbol,
     upsert_llm_analysis_batch,
 )
+from ._locking import WriteLockTimeout, write_lock
 from ._projects import (
     delete_build_data,
     get_active_config,

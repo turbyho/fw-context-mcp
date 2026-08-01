@@ -13,10 +13,10 @@ import httpx
 
 def cmd_cache_stats(args: argparse.Namespace) -> int:
     """Show cache statistics for one or both tiers."""
+    from ..cache_client import CacheClient, local_cache_stats
     from ..config import derive_project_id
     from ..config import load as load_config
     from ..utils import resolve_project_root
-    from ..cache_client import local_cache_stats, CacheClient
 
     show_local = not args.remote
     project_root = resolve_project_root(args.project) if hasattr(args, "project") and args.project else Path.cwd()
@@ -89,9 +89,9 @@ def cmd_cache_push(args: argparse.Namespace) -> int:
     Uses ``--force`` by default (X-Cache-Overwrite) so newer local entries
     replace older remote ones.  Progress is reported in batches.
     """
+    from ..cache_client import CacheClient, get_local_cache_db
     from ..config import load as load_config
     from ..utils import resolve_project_root
-    from ..cache_client import get_local_cache_db, CacheClient
 
     project_root = resolve_project_root(args.project) if hasattr(args, "project") else None
     if not project_root:
@@ -245,24 +245,9 @@ def cmd_cache_remote_init(args: argparse.Namespace) -> int:
         os.close(fd)
     os.replace(tmp_file, token_file)
 
-    cache_section = f"""
-[cache_server]
-url = "{url}"
-"""
+    from fw_context_mcp.config._toml_editor import set_key
+    set_key(config_path, "cache_server", "url", url)
 
-    if "[cache_server]" in existing:
-        # Replace existing section
-        new_content = re.sub(
-            r"\[cache_server\].*?(?=\[|$)",
-            cache_section.strip(),
-            existing,
-            flags=re.DOTALL,
-        )
-    else:
-        # Append
-        new_content = existing.rstrip("\n") + "\n" + cache_section.strip() + "\n"
-
-    config_path.write_text(new_content, encoding="utf-8")
     print(f"\nRemote cache configured: {url}")
     print(f"Config written to: {config_path}")
     print("Run 'fw-context cache stats --remote' to verify.")
@@ -272,10 +257,10 @@ url = "{url}"
 
 def cmd_cache_clear(args: argparse.Namespace) -> int:
     """Delete cache entries for one or both tiers."""
+    from ..cache_client import CacheClient, local_cache_clear
     from ..config import derive_project_id
     from ..config import load as load_config
     from ..utils import resolve_project_root
-    from ..cache_client import local_cache_clear, CacheClient
 
     project_root = resolve_project_root(args.project) if hasattr(args, "project") else None
 

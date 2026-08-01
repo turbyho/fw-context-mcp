@@ -6,8 +6,8 @@ import json
 import re
 from typing import TYPE_CHECKING
 
-from fw_context_mcp.search.phases.base import Phase
 from fw_context_mcp.search._llm_parse import parse_llm_search_terms as _parse_search_terms
+from fw_context_mcp.search.phases.base import Phase
 
 if TYPE_CHECKING:
     from fw_context_mcp.search.context import PipelineContext

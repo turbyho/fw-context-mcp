@@ -2,6 +2,12 @@
 
 import sqlite3
 
+__all__ = [
+    "rebuild_files_fts",
+    "rebuild_fts",
+    "rebuild_macros_fts",
+]
+
 
 
 def rebuild_fts(conn: sqlite3.Connection) -> None:

@@ -15,10 +15,10 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING
 
-from fw_context_mcp.search.phases.base import Phase
 from fw_context_mcp.indexer.db import get_embeddings, open_db, search_similar_hybrid, search_similar_vec
 from fw_context_mcp.llm.embedder_factory import get_embedder
 from fw_context_mcp.llm.ollama import OllamaError
+from fw_context_mcp.search.phases.base import Phase
 
 if TYPE_CHECKING:
     from fw_context_mcp.search.context import PipelineContext

@@ -14,6 +14,11 @@ from collections.abc import Generator
 from contextlib import contextmanager
 from pathlib import Path
 
+__all__ = [
+    "WriteLockTimeout",
+    "write_lock",
+]
+
 
 class WriteLockTimeout(Exception):
     """Raised when the write lock cannot be acquired within the timeout."""

@@ -363,5 +363,4 @@ class OllamaModelNotFoundError(OllamaError):
             f"Run: ollama pull {model}"
         )
 
-from ._diag import check_setup
 

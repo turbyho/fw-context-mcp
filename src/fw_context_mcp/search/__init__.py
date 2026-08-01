@@ -14,6 +14,7 @@ from fw_context_mcp.search.pipeline import (
     _build_smart_search,
 )
 
+
 # Lazily materialize SMART_SEARCH so embedding imports are deferred.
 def __getattr__(name):
     if name == "SMART_SEARCH":

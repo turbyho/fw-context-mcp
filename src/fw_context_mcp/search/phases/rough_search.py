@@ -20,9 +20,9 @@ if TYPE_CHECKING:
 
 from fw_context_mcp.search.phases.embedding_helpers import (
     brute_force_search,
+    round_robin_by_kind,
     table_exists,
     table_has_rows,
-    round_robin_by_kind,
 )
 
 log = logging.getLogger(__name__)
@@ -65,7 +65,7 @@ class RoughSearchPhase(Phase):
         back to FTS5 word-pair + single-word search. Extracts keyword
         terms from sample names for downstream FTS5 fallback use.
         """
-        from fw_context_mcp.indexer.db import get_embeddings, open_db as _open_db, search_similar_vec
+        from fw_context_mcp.indexer.db import open_db as _open_db
 
         query = ctx.query
         config_hash = ctx.config_hash

@@ -6,25 +6,23 @@ reassignment, and persistence — the core per-file indexing logic.
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
-import hashlib
 import sqlite3
 import time
 from contextlib import nullcontext
 from pathlib import Path
 
 from ..utils import MTIME_TOLERANCE_S, SAFE_EXCEPT, compute_source_hash, is_fatal
-from .ops import _build_filtered_file_content, _normalize_file_path, store_symbols_for_unit
+from .config_hash import compute_flags_hash, compute_tu_content_hash
 from .db import (
-    get_file_hashes,
     open_db,
     transaction,
     upsert_file,
     write_lock,
 )
-from .compile_commands import _SOURCE_EXTS, validate_include_files
-from .config_hash import compute_flags_hash, compute_tu_content_hash
+from .ops import _build_filtered_file_content, _normalize_file_path, store_symbols_for_unit
 
 log = logging.getLogger(__name__)
 

@@ -9,17 +9,17 @@ Hierarchy (later overrides earlier):
 
 from __future__ import annotations
 
+import ipaddress
 import logging
-import os
 import sys
 import tomllib
-import ipaddress
-from urllib.parse import urlparse
 from collections import OrderedDict
 from dataclasses import dataclass, field
 from pathlib import Path
+from urllib.parse import urlparse
 
 from ..indexer.build import BuildConfig
+
 log = logging.getLogger(__name__)
 
 __all__ = [
@@ -616,15 +616,12 @@ def _ensure_global_config() -> Path:
 def update_global_config(fix: bool = False) -> None:
     """Check ``~/.fw-context/config.toml`` for missing template keys.
 
-    When *fix* is True, append missing keys (commented out) to the file.
-    New keys are added to the appropriate TOML section — the template's
-    section headers are used to determine where each key belongs.
-    Does NOT modify existing keys or their values.
+    When *fix* is True, merge missing keys from the template into the file.
+    Keys are placed in their correct TOML sections.  Does NOT modify
+    existing keys or their values.
 
     Returns nothing; prints status to stdout.
     """
-    import re
-
     path = _GLOBAL_CONFIG_PATH
     if not path.exists():
         if fix:
@@ -635,65 +632,14 @@ def update_global_config(fix: bool = False) -> None:
             print(f"  [info] {path} missing — run with --force to create")
         return
 
-    existing_text = path.read_text(encoding="utf-8")
+    from fw_context_mcp.config._toml_editor import merge_template
 
-    # Parse template: collect (section, key) pairs with their original line text.
-    template_entries: list[tuple[str, str]] = []  # (key, full_line)
-    section_map: dict[str, str] = {}  # key → section
-    current_section = ""
-    for line in _GLOBAL_DEFAULTS.splitlines():
-        header_m = re.match(r"^\[([^\]]+)\]", line)
-        if header_m:
-            current_section = header_m.group(1)
-            continue
-        key_m = re.match(r"^(#?\s*)(\w+)\s*=", line)
-        if key_m:
-            key = key_m.group(2)
-            template_entries.append((key, line))
-            section_map[key] = current_section or ""
-
-    missing: list[str] = []
-    for key, _line_text in template_entries:
-        if not re.search(rf"^\s*#?\s*{key}\s*=", existing_text, re.MULTILINE):
-            missing.append(key)
-
-    if missing:
+    added = merge_template(path, _GLOBAL_DEFAULTS)
+    if added:
         if fix:
-            missing_set = set(missing)
-            current_section = ""
-            appended_sections: set[str] = set()
-
-            existing_sections: set[str] = set(
-                re.findall(r"^\[([^\]]+)\]", existing_text, re.MULTILINE)
-            )
-
-            lines_to_append: list[str] = []
-            existing_ends_with_newline = existing_text.endswith("\n")
-
-            for key, line_text in template_entries:
-                if key not in missing_set:
-                    continue
-                section = section_map.get(key, "")
-                if section and section != current_section:
-                    if section not in existing_sections and section not in appended_sections:
-                        lines_to_append.append(f"\n[{section}]")
-                        appended_sections.add(section)
-                    elif section in existing_sections and section not in appended_sections:
-                        lines_to_append.append("")
-                        appended_sections.add(section)
-                    current_section = section
-                if not existing_ends_with_newline:
-                    lines_to_append.append("")
-                    existing_ends_with_newline = True
-                lines_to_append.append(line_text)
-
-            if lines_to_append:
-                text = "\n".join(lines_to_append)
-                with path.open("a", encoding="utf-8") as f:
-                    f.write("\n" + text + "\n")
-                print(f"  [fix] {path}: added {', '.join(missing)}")
+            print(f"  [fix] {path}: added {', '.join(added)}")
         else:
-            print(f"  [info] {path}: missing options: {', '.join(missing)}")
+            print(f"  [info] {path}: missing options: {', '.join(added)}")
     else:
         print(f"  [ok] {path}")
 
@@ -874,53 +820,14 @@ def derive_project_id(root: Path) -> str:
 def _write_project_id(project_root: Path, project_id: str) -> None:
     """Write ``id = "<project_id>"`` into ``[project]`` section of config.toml.
 
-    Uses line-level editing to preserve comments and formatting.
-    Creates the config file from the template if it doesn't exist yet.
+    Uses :func:`fw_context_mcp.config._toml_editor.set_key` for atomic,
+    section-aware writes.  Creates the config file from the template if it
+    doesn't exist yet.
     """
     config_path = project_root / _PROJECT_CONFIG_DIR / _PROJECT_CONFIG_NAME
     if not config_path.exists():
         _ensure_project_config(project_root)
 
-    lines = config_path.read_text(encoding="utf-8").splitlines(keepends=True)
-    in_project = False
+    from fw_context_mcp.config._toml_editor import set_key
 
-    for i, line in enumerate(lines):
-        if line.strip() == "[project]":
-            in_project = True
-            continue
-        if in_project and line.strip().startswith("[") and line.strip() != "[project]":
-            # Start of next section — insert before it
-            lines.insert(i, f'id = "{project_id}"\n\n')
-            break
-        if in_project and (line.strip().startswith("id ") or line.strip().startswith("# id ")):
-            # Replace existing id line (commented or not)
-            lines[i] = f'id = "{project_id}"\n'
-            break
-    else:
-        if in_project:
-            # id not found, append at end of [project] section (end of file)
-            lines.append(f'id = "{project_id}"\n')
-        else:
-            # [project] section doesn't exist — prepend one
-            lines.insert(0, f'[project]\nid = "{project_id}"\n\n')
-
-    # Atomic write: temp file + rename — prevents corruption on partial write
-    import tempfile
-    tmp = tempfile.NamedTemporaryFile(
-        mode="w", encoding="utf-8", dir=config_path.parent, delete=False,
-    )
-    try:
-        tmp.write("".join(lines))
-        tmp.flush()
-        os.fsync(tmp.fileno())
-    finally:
-        tmp.close()
-    Path(tmp.name).replace(config_path)
-    # Ensure directory entry is persisted — belt-and-suspenders for older
-    # filesystems where rename() may not be atomic.
-    try:
-        dir_fd = os.open(str(config_path.parent), os.O_RDONLY)
-        os.fsync(dir_fd)
-        os.close(dir_fd)
-    except OSError:
-        pass
+    set_key(config_path, "project", "id", project_id)

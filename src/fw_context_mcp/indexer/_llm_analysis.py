@@ -6,22 +6,16 @@ enriching batches, and the main LLM analysis build phase.
 
 from __future__ import annotations
 
-import hashlib
-import json
 import logging
-import os
-import sqlite3
 import time
 from contextlib import nullcontext
 from pathlib import Path
 
-
 from ..cache_client import get_local_cache_db, local_cache_lookup, local_cache_upsert
 from ..llm.ollama import call_ollama
 from ..utils import SAFE_EXCEPT, is_fatal, read_file_lines
-from ..config.settings import DESCRIPTION_VERSION
-from ._embedding import _chunk_body, _fmt_dur
-from .db import open_db, transaction, upsert_llm_analysis_batch, write_lock
+from ._embedding import _fmt_dur
+from .db import transaction, upsert_llm_analysis_batch, write_lock
 
 log = logging.getLogger(__name__)
 
@@ -152,7 +146,6 @@ def _build_llm_analysis(
 
     from ..indexer.prompts import build_analysis_prompt, parse_analysis_response
     from ..utils import compute_content_hash
-    from .db import open_db, transaction, upsert_llm_analysis_batch
 
     # Suppress httpx INFO logs (one per symbol — noisy during analysis)
     logging.getLogger("httpx").setLevel(logging.WARNING)
@@ -238,7 +231,6 @@ def _build_llm_analysis(
 
     log.info("LLM analysis: %d symbols (model=%s)", total_symbols, model)
 
-    from ..cache_client import get_local_cache_db, local_cache_lookup, local_cache_upsert
 
     local_db = get_local_cache_db()  # single connection for all symbols
 

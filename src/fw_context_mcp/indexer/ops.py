@@ -10,12 +10,12 @@ from __future__ import annotations
 import logging
 import sqlite3
 import time
+
 try:
     from clang.cindex import TranslationUnitLoadError
 except ImportError:
     TranslationUnitLoadError = RuntimeError  # clang not available — use fallback
 from collections import OrderedDict
-
 from pathlib import Path
 
 from fw_context_mcp.indexer.config_hash import compute_tu_content_hash
@@ -23,13 +23,13 @@ from fw_context_mcp.indexer.db import (
     delete_fp_assignments_for_file,
     delete_indirect_call_sites_for_file,
     delete_inheritance_for_file,
+    delete_macros_for_file,
     delete_refs_for_file,
     delete_symbols_for_file,
     get_file_mtimes,
     insert_fp_assignments_batch,
     insert_indirect_call_sites_batch,
     insert_inheritance_batch,
-    delete_macros_for_file,
     insert_macros_batch,
     insert_refs_batch,
     insert_symbols_batch,

@@ -9,7 +9,6 @@ from typing import Annotated
 
 from pydantic import Field
 
-from ...config import derive_project_id
 from ...indexer import db as index_db
 from ...indexer.db import (
     count_fp_assignments,
@@ -26,8 +25,8 @@ from ...indexer.db import (
 from ...indexer.db import (
     find_indirect_targets as query_indirect_targets,
 )
-from ...utils import abs_path, resolve_project_root
-from ..shared.context import _db_path, _open_db_or_return, _open_db_safe, _resolve_context
+from ...utils import abs_path
+from ..shared.context import _open_db_or_return, _resolve_context
 from ._base import BaseHandler
 from .source import _lookup_definition
 
@@ -62,66 +61,63 @@ def _references_result(name: str, project_root: str | None, ref_kind: str | list
     conn, err_result = _open_db_or_return(db_path)
     if err_result:
         return err_result
-    try:
-        with conn:
-            cfg_data = get_active_config(conn, project_id)
-            if not cfg_data:
-                return [{"error": "No build config indexed."}]
-            config_hash = cfg_data["config_hash"]
-            symbol = _lookup_definition(conn, config_hash, name, preferred_kinds=None)
-            if symbol is None:
-                # Macro fallback: check if name is a macro definition
-                macros = lookup_macro(conn, config_hash, name, exact=True, limit=1)
-                if macros:
-                    macro = macros[0]
-                    # Use find_macro_refs for file-level usage tracking
-                    ref_rows = find_macro_refs(conn, config_hash, name, limit=limit)
-                    macro_def = {
-                        "kind": "macro",
-                        "name": macro["name"],
-                        "file": abs_path(root, macro["file_path"]),
-                        "line": macro["line"],
-                        "value": macro["value"],
-                        **({"expanded_value": macro["expanded_value"]} if macro["expanded_value"] else {}),
-                    }
-                    if not ref_rows:
-                        label = "callers" if caller_mode else "references"
-                        return [{"info": f"No {label} (macro) found for '{name}'.", **macro_def}]
-                    macro_refs: list[dict] = [
-                        {
-                            "file": abs_path(root, r["file_path"]),
-                            "ref_kind": "macro_use",
-                            "_match_snippet": r["_match_snippet"],
-                        }
-                        for r in ref_rows
-                    ]
-                    macro_refs.insert(0, macro_def)
-                    return macro_refs
-                return [{"error": f"Symbol not found: {name}"}]
-            if count_refs(conn, config_hash) == 0:
-                return [{"info": (
-                    "No references indexed. Refs are on by default — "
-                    "they may have been disabled with [index] index_refs = false. "
-                    "Re-run 'fw-context index' to rebuild with refs enabled."
-                )}]
-            limit = max(0, min(limit, 200))
-            rows = find_refs(conn, config_hash, name, ref_kind=ref_kind, limit=limit)
-            if not rows:
-                label = "callers" if caller_mode else "references"
-                return [{"info": f"No {label} found for '{name}'."}]
-            result: list[dict] = [
-                {
-                    "file": abs_path(root, r["from_file"]),
-                    "line": r["from_line"],
-                    "ref_kind": r["ref_kind"],
-                    "caller": r["caller_qname"] or r["caller_name"] or "<file scope>",
-                    "caller_kind": r["caller_kind"],
+    with conn:
+        cfg_data = get_active_config(conn, project_id)
+        if not cfg_data:
+            return [{"error": "No build config indexed."}]
+        config_hash = cfg_data["config_hash"]
+        symbol = _lookup_definition(conn, config_hash, name, preferred_kinds=None)
+        if symbol is None:
+            # Macro fallback: check if name is a macro definition
+            macros = lookup_macro(conn, config_hash, name, exact=True, limit=1)
+            if macros:
+                macro = macros[0]
+                # Use find_macro_refs for file-level usage tracking
+                ref_rows = find_macro_refs(conn, config_hash, name, limit=limit)
+                macro_def = {
+                    "kind": "macro",
+                    "name": macro["name"],
+                    "file": abs_path(root, macro["file_path"]),
+                    "line": macro["line"],
+                    "value": macro["value"],
+                    **({"expanded_value": macro["expanded_value"]} if macro["expanded_value"] else {}),
                 }
-                for r in rows
-            ]
-        return result
-    finally:
-        pass  # connection managed by connection.py cache
+                if not ref_rows:
+                    label = "callers" if caller_mode else "references"
+                    return [{"info": f"No {label} (macro) found for '{name}'.", **macro_def}]
+                macro_refs: list[dict] = [
+                    {
+                        "file": abs_path(root, r["file_path"]),
+                        "ref_kind": "macro_use",
+                        "_match_snippet": r["_match_snippet"],
+                    }
+                    for r in ref_rows
+                ]
+                macro_refs.insert(0, macro_def)
+                return macro_refs
+            return [{"error": f"Symbol not found: {name}"}]
+        if count_refs(conn, config_hash) == 0:
+            return [{"info": (
+                "No references indexed. Refs are on by default — "
+                "they may have been disabled with [index] index_refs = false. "
+                "Re-run 'fw-context index' to rebuild with refs enabled."
+            )}]
+        limit = max(0, min(limit, 200))
+        rows = find_refs(conn, config_hash, name, ref_kind=ref_kind, limit=limit)
+        if not rows:
+            label = "callers" if caller_mode else "references"
+            return [{"info": f"No {label} found for '{name}'."}]
+        result: list[dict] = [
+            {
+                "file": abs_path(root, r["from_file"]),
+                "line": r["from_line"],
+                "ref_kind": r["ref_kind"],
+                "caller": r["caller_qname"] or r["caller_name"] or "<file scope>",
+                "caller_kind": r["caller_kind"],
+            }
+            for r in rows
+        ]
+    return result
 
 # ── moved from server.py ──
 def find_callers(
@@ -263,39 +259,36 @@ def find_indirect_call_sites(
     conn, err_result = _open_db_or_return(db_path)
     if err_result:
         return err_result
-    try:
-        with conn:
-            cfg_data = get_active_config(conn, project_id)
-            if not cfg_data:
-                return [{"error": "No build config indexed."}]
-            config_hash = cfg_data["config_hash"]
+    with conn:
+        cfg_data = get_active_config(conn, project_id)
+        if not cfg_data:
+            return [{"error": "No build config indexed."}]
+        config_hash = cfg_data["config_hash"]
 
-            if count_indirect_call_sites(conn, config_hash) == 0:
-                return [{"info": (
-                    "No indirect call sites indexed. Re-run 'fw-context index' "
-                    "to populate the table (added in Phase 2)."
-                )}]
+        if count_indirect_call_sites(conn, config_hash) == 0:
+            return [{"info": (
+                "No indirect call sites indexed. Re-run 'fw-context index' "
+                "to populate the table (added in Phase 2)."
+            )}]
 
-            limit = max(0, min(limit, 200))
-            rows = query_indirect_call_sites(conn, config_hash, name, limit=limit)
-            if not rows:
-                return [{"info": f"No indirect call sites found for '{name}'."}]
+        limit = max(0, min(limit, 200))
+        rows = query_indirect_call_sites(conn, config_hash, name, limit=limit)
+        if not rows:
+            return [{"info": f"No indirect call sites found for '{name}'."}]
 
-            return [
-                {
-                    "file": abs_path(root, r["from_file"]),
-                    "line": r["from_line"],
-                    "expr_text": r["expr_text"],
-                    "target_usr": r["target_usr"],
-                    "target_name": r["target_name"],
-                    "fn_ptr_type": r["fn_ptr_type"],
-                    "caller": r["caller_qname"] or r["caller_name"] or "<file scope>",
-                    "caller_kind": r["caller_kind"],
-                }
-                for r in rows
-            ]
-    finally:
-        pass  # connection managed by connection.py cache
+        return [
+            {
+                "file": abs_path(root, r["from_file"]),
+                "line": r["from_line"],
+                "expr_text": r["expr_text"],
+                "target_usr": r["target_usr"],
+                "target_name": r["target_name"],
+                "fn_ptr_type": r["fn_ptr_type"],
+                "caller": r["caller_qname"] or r["caller_name"] or "<file scope>",
+                "caller_kind": r["caller_kind"],
+            }
+            for r in rows
+        ]
 
 # ── moved from server.py ──
 def find_indirect_targets(
@@ -343,41 +336,38 @@ def find_indirect_targets(
     conn, err_result = _open_db_or_return(db_path)
     if err_result:
         return err_result
-    try:
-        with conn:
-            cfg_data = get_active_config(conn, project_id)
-            if not cfg_data:
-                return [{"error": "No build config indexed."}]
-            config_hash = cfg_data["config_hash"]
+    with conn:
+        cfg_data = get_active_config(conn, project_id)
+        if not cfg_data:
+            return [{"error": "No build config indexed."}]
+        config_hash = cfg_data["config_hash"]
 
-            if count_fp_assignments(conn, config_hash) == 0:
-                return [{"info": (
-                    "No function pointer assignments indexed. Re-run "
-                    "'fw-context index' to populate the table (added in Phase 3)."
-                )}]
+        if count_fp_assignments(conn, config_hash) == 0:
+            return [{"info": (
+                "No function pointer assignments indexed. Re-run "
+                "'fw-context index' to populate the table (added in Phase 3)."
+            )}]
 
-            limit = max(0, min(limit, 200))
-            rows = query_indirect_targets(conn, config_hash, name, limit=limit)
-            if not rows:
-                return [{"info": f"No functions assigned to '{name}'."}]
+        limit = max(0, min(limit, 200))
+        rows = query_indirect_targets(conn, config_hash, name, limit=limit)
+        if not rows:
+            return [{"info": f"No functions assigned to '{name}'."}]
 
-            return [
-                {
-                    "rhs_name": r["rhs_name"],
-                    "rhs_qname": r["rhs_qname"] or r["rhs_name"],
-                    "fn_ptr_type": r["fn_ptr_type"],
-                    "method": r["method"],
-                    "assign_file": abs_path(root, r["assign_file"]),
-                    "assign_line": r["assign_line"],
-                    "assign_caller": r["assign_caller"] or "<file scope>",
-                    "call_file": abs_path(root, r["call_file"]) if r["call_file"] else None,
-                    "call_line": r["call_line"],
-                    "call_expr_text": r["call_expr_text"],
-                }
-                for r in rows
-            ]
-    finally:
-        pass  # connection managed by connection.py cache
+        return [
+            {
+                "rhs_name": r["rhs_name"],
+                "rhs_qname": r["rhs_qname"] or r["rhs_name"],
+                "fn_ptr_type": r["fn_ptr_type"],
+                "method": r["method"],
+                "assign_file": abs_path(root, r["assign_file"]),
+                "assign_line": r["assign_line"],
+                "assign_caller": r["assign_caller"] or "<file scope>",
+                "call_file": abs_path(root, r["call_file"]) if r["call_file"] else None,
+                "call_line": r["call_line"],
+                "call_expr_text": r["call_expr_text"],
+            }
+            for r in rows
+        ]
 
 # ── moved from server.py ──
 def _refs_guard(project_root: str | None) -> tuple[sqlite3.Connection, Path, str, None] | tuple[None, None, None, list[dict]]:
@@ -452,17 +442,14 @@ def find_call_path(
     assert conn is not None
     assert root is not None
     assert config_hash is not None
-    try:
-        if _lookup_definition(conn, config_hash, from_name, preferred_kinds=None) is None:
-            return [{"error": f"Symbol not found: {from_name}"}]
-        if _lookup_definition(conn, config_hash, to_name, preferred_kinds=None) is None:
-            return [{"error": f"Symbol not found: {to_name}"}]
-        rows = index_db.find_call_path(conn, config_hash, from_name, to_name, max_depth=max_depth)
-        if not rows:
-            return [{"info": f"No path found from '{from_name}' to '{to_name}' within depth {max_depth}."}]
-        return rows
-    finally:
-        pass  # connection managed by connection.py cache
+    if _lookup_definition(conn, config_hash, from_name, preferred_kinds=None) is None:
+        return [{"error": f"Symbol not found: {from_name}"}]
+    if _lookup_definition(conn, config_hash, to_name, preferred_kinds=None) is None:
+        return [{"error": f"Symbol not found: {to_name}"}]
+    rows = index_db.find_call_path(conn, config_hash, from_name, to_name, max_depth=max_depth)
+    if not rows:
+        return [{"info": f"No path found from '{from_name}' to '{to_name}' within depth {max_depth}."}]
+    return rows
 
 # ── moved from server.py ──
 def find_all_callers_recursive(
@@ -505,15 +492,12 @@ def find_all_callers_recursive(
     assert conn is not None
     assert root is not None
     assert config_hash is not None
-    try:
-        if _lookup_definition(conn, config_hash, name, preferred_kinds=None) is None:
-            return [{"error": f"Symbol not found: {name}"}]
-        rows = index_db.find_all_callers_recursive(conn, config_hash, name, max_depth=max_depth, limit=limit)
-        if not rows:
-            return [{"info": f"No callers found for '{name}'."}]
-        return rows
-    finally:
-        pass  # connection managed by connection.py cache
+    if _lookup_definition(conn, config_hash, name, preferred_kinds=None) is None:
+        return [{"error": f"Symbol not found: {name}"}]
+    rows = index_db.find_all_callers_recursive(conn, config_hash, name, max_depth=max_depth, limit=limit)
+    if not rows:
+        return [{"info": f"No callers found for '{name}'."}]
+    return rows
 
 # ── moved from server.py ──
 def find_callees_recursive(
@@ -556,15 +540,12 @@ def find_callees_recursive(
     assert conn is not None
     assert root is not None
     assert config_hash is not None
-    try:
-        if _lookup_definition(conn, config_hash, name, preferred_kinds=None) is None:
-            return [{"error": f"Symbol not found: {name}"}]
-        rows = index_db.find_callees_recursive(conn, config_hash, name, max_depth=max_depth, limit=limit)
-        if not rows:
-            return [{"info": f"No callees found for '{name}'."}]
-        return rows
-    finally:
-        pass  # connection managed by connection.py cache
+    if _lookup_definition(conn, config_hash, name, preferred_kinds=None) is None:
+        return [{"error": f"Symbol not found: {name}"}]
+    rows = index_db.find_callees_recursive(conn, config_hash, name, max_depth=max_depth, limit=limit)
+    if not rows:
+        return [{"info": f"No callees found for '{name}'."}]
+    return rows
 
 # ── moved from server.py ──
 def find_dead_code(
@@ -625,17 +606,14 @@ def find_dead_code(
     assert conn is not None
     assert root is not None
     assert config_hash is not None
-    try:
-        rows = index_db.find_dead_code(
-            conn, config_hash, limit=limit,
-            exclude_paths=exclude_paths,
-            project_only=project_only,
-        )
-        if not rows:
-            return [{"info": "No dead or possibly-dead functions found — every defined function has at least one caller."}]
-        return rows
-    finally:
-        pass  # connection managed by connection.py cache
+    rows = index_db.find_dead_code(
+        conn, config_hash, limit=limit,
+        exclude_paths=exclude_paths,
+        project_only=project_only,
+    )
+    if not rows:
+        return [{"info": "No dead or possibly-dead functions found — every defined function has at least one caller."}]
+    return rows
 
 # ── moved from server.py ──
 def find_wrapper_callers(
@@ -678,87 +656,84 @@ def find_wrapper_callers(
     assert conn is not None
     assert root is not None
     assert config_hash is not None
-    try:
-        # Resolve driver class — check it exists in the index
-        if _lookup_definition(conn, config_hash, class_name, preferred_kinds=None) is None:
-            return [{"error": f"Symbol not found: {class_name}"}]
+    # Resolve driver class — check it exists in the index
+    if _lookup_definition(conn, config_hash, class_name, preferred_kinds=None) is None:
+        return [{"error": f"Symbol not found: {class_name}"}]
 
-        # Find all methods of the class (index-able prefix LIKE, no leading %)
-        driver_methods = conn.execute(
-            """SELECT s.usr, s.name, s.qualified_name
-               FROM symbols s
-               WHERE s.config_hash = ?
-                 AND s.kind = 'method'
-                 AND s.qualified_name LIKE ?
-               ORDER BY s.name
-               LIMIT ?""",
-            (config_hash, f"{class_name}::%", max(limit * 10, 500)),
-        ).fetchall()
+    # Find all methods of the class (index-able prefix LIKE, no leading %)
+    driver_methods = conn.execute(
+        """SELECT s.usr, s.name, s.qualified_name
+           FROM symbols s
+           WHERE s.config_hash = ?
+             AND s.kind = 'method'
+             AND s.qualified_name LIKE ?
+           ORDER BY s.name
+           LIMIT ?""",
+        (config_hash, f"{class_name}::%", max(limit * 10, 500)),
+    ).fetchall()
 
-        if not driver_methods:
-            return [{"info": f"No methods found for class '{class_name}'."}]
+    if not driver_methods:
+        return [{"info": f"No methods found for class '{class_name}'."}]
 
-        driver_usr_map = {r["usr"]: r for r in driver_methods}
+    driver_usr_map = {r["usr"]: r for r in driver_methods}
 
-        # Find all callers of those methods
-        placeholders = ",".join("?" * len(driver_usr_map))
-        rows = conn.execute(
-            f"""SELECT r.from_usr, r.to_usr, r.from_file, r.from_line, r.ref_kind,
-                       caller.name AS caller_name,
-                       caller.qualified_name AS caller_qname,
-                       caller.kind AS caller_kind
-                FROM refs r
-                LEFT JOIN symbols caller
-                  ON caller.config_hash = r.config_hash AND caller.usr = r.from_usr
-                WHERE r.config_hash = ?
-                  AND r.to_usr IN ({placeholders})
-                  AND r.ref_kind IN ('call', 'indirect')
-                ORDER BY caller.qualified_name, r.from_line
-                LIMIT ?""",
-            (config_hash, *driver_usr_map.keys(), limit),
-        ).fetchall()
+    # Find all callers of those methods
+    placeholders = ",".join("?" * len(driver_usr_map))
+    rows = conn.execute(
+        f"""SELECT r.from_usr, r.to_usr, r.from_file, r.from_line, r.ref_kind,
+                   caller.name AS caller_name,
+                   caller.qualified_name AS caller_qname,
+                   caller.kind AS caller_kind
+            FROM refs r
+            LEFT JOIN symbols caller
+              ON caller.config_hash = r.config_hash AND caller.usr = r.from_usr
+            WHERE r.config_hash = ?
+              AND r.to_usr IN ({placeholders})
+              AND r.ref_kind IN ('call', 'indirect')
+            ORDER BY caller.qualified_name, r.from_line
+            LIMIT ?""",
+        (config_hash, *driver_usr_map.keys(), limit),
+    ).fetchall()
 
-        if not rows:
-            return [{"info": f"No callers found for methods of '{class_name}'."}]
+    if not rows:
+        return [{"info": f"No callers found for methods of '{class_name}'."}]
 
-        # Group by wrapper class
-        wrapped: dict[str, dict] = {}
-        for r in rows:
-            caller_qn = r["caller_qname"] or r["caller_name"] or "?"
-            # Extract class from qualified name: "zbox::ZMODEM::start" → "zbox::ZMODEM"
-            if "::" in caller_qn:
-                wrapper_class = caller_qn.rsplit("::", 1)[0]
-            else:
-                wrapper_class = "(global)"
-            if wrapper_class not in wrapped:
-                wrapped[wrapper_class] = {"class": wrapper_class, "methods": {}, "_file": r["from_file"]}
-            cm = wrapped[wrapper_class]["methods"]
-            if caller_qn not in cm:
-                cm[caller_qn] = {
-                    "method": r["caller_name"],
-                    "qualified_name": caller_qn,
-                    "kind": r["caller_kind"],
-                    "calls": [],
-                }
-            target = driver_usr_map.get(r["to_usr"])
-            if target:
-                cm[caller_qn]["calls"].append({
-                    "driver_method": target["name"],
-                    "line": r["from_line"],
-                })
-
-        # Flatten for output
-        result = []
-        for wc in sorted(wrapped.keys()):
-            entry = wrapped[wc]
-            result.append({
-                "wrapper_class": wc,
-                "method_count": len(entry["methods"]),
-                "methods": sorted(entry["methods"].values(), key=lambda m: m["qualified_name"]),
+    # Group by wrapper class
+    wrapped: dict[str, dict] = {}
+    for r in rows:
+        caller_qn = r["caller_qname"] or r["caller_name"] or "?"
+        # Extract class from qualified name: "zbox::ZMODEM::start" → "zbox::ZMODEM"
+        if "::" in caller_qn:
+            wrapper_class = caller_qn.rsplit("::", 1)[0]
+        else:
+            wrapper_class = "(global)"
+        if wrapper_class not in wrapped:
+            wrapped[wrapper_class] = {"class": wrapper_class, "methods": {}, "_file": r["from_file"]}
+        cm = wrapped[wrapper_class]["methods"]
+        if caller_qn not in cm:
+            cm[caller_qn] = {
+                "method": r["caller_name"],
+                "qualified_name": caller_qn,
+                "kind": r["caller_kind"],
+                "calls": [],
+            }
+        target = driver_usr_map.get(r["to_usr"])
+        if target:
+            cm[caller_qn]["calls"].append({
+                "driver_method": target["name"],
+                "line": r["from_line"],
             })
-        return result
-    finally:
-        pass  # connection managed by connection.py cache
+
+    # Flatten for output
+    result = []
+    for wc in sorted(wrapped.keys()):
+        entry = wrapped[wc]
+        result.append({
+            "wrapper_class": wc,
+            "method_count": len(entry["methods"]),
+            "methods": sorted(entry["methods"].values(), key=lambda m: m["qualified_name"]),
+        })
+    return result
 
 # ── moved from server.py ──
 def trace_data_flow(
@@ -810,69 +785,66 @@ def trace_data_flow(
     assert conn is not None
     assert root is not None
     assert config_hash is not None
-    try:
-        # Resolve target USR
-        target = conn.execute(
-            """SELECT usr, name FROM symbols
-               WHERE config_hash = ? AND (name = ? OR qualified_name = ?)
-               ORDER BY is_definition DESC LIMIT 1""",
-            (config_hash, to_symbol, to_symbol),
-        ).fetchone()
-        if not target:
-            return [{"info": f"Target symbol '{to_symbol}' not found."}]
+    # Resolve target USR
+    target = conn.execute(
+        """SELECT usr, name FROM symbols
+           WHERE config_hash = ? AND (name = ? OR qualified_name = ?)
+           ORDER BY is_definition DESC LIMIT 1""",
+        (config_hash, to_symbol, to_symbol),
+    ).fetchone()
+    if not target:
+        return [{"info": f"Target symbol '{to_symbol}' not found."}]
 
-        # Find functions mentioning type_name in their signature (ranked by
-        # caller count so the most "active" data handlers are shown first)
-        sources = conn.execute(
-            """SELECT s.name, s.qualified_name, s.kind, s.file_path, s.line,
-                      s.signature, s.usr,
-                      (SELECT COUNT(*) FROM refs r
-                       WHERE r.to_usr = s.usr AND r.config_hash = s.config_hash
-                         AND r.ref_kind IN ('call', 'indirect')) AS caller_count
-               FROM symbols s
-               WHERE s.config_hash = ?
-                 AND s.is_definition = 1
-                 AND s.signature LIKE ?
-               ORDER BY caller_count DESC
-               LIMIT ?""",
-            (config_hash, f"%{_escape_like(type_name)}%", limit),
-        ).fetchall()
+    # Find functions mentioning type_name in their signature (ranked by
+    # caller count so the most "active" data handlers are shown first)
+    sources = conn.execute(
+        """SELECT s.name, s.qualified_name, s.kind, s.file_path, s.line,
+                  s.signature, s.usr,
+                  (SELECT COUNT(*) FROM refs r
+                   WHERE r.to_usr = s.usr AND r.config_hash = s.config_hash
+                     AND r.ref_kind IN ('call', 'indirect')) AS caller_count
+           FROM symbols s
+           WHERE s.config_hash = ?
+             AND s.is_definition = 1
+             AND s.signature LIKE ?
+           ORDER BY caller_count DESC
+           LIMIT ?""",
+        (config_hash, f"%{_escape_like(type_name)}%", limit),
+    ).fetchall()
 
-        if not sources:
-            return [{"info": f"No functions found with '{type_name}' in their signature."}]
+    if not sources:
+        return [{"info": f"No functions found with '{type_name}' in their signature."}]
 
-        # Try call paths from each source to target
-        results = []
-        for src in sources:
-            paths = index_db.find_call_path(
-                conn, config_hash, src["qualified_name"], to_symbol, max_depth=max_depth,
-            )
-            entry = {
-                "source_name": src["name"],
-                "source_qualified_name": src["qualified_name"],
-                "source_kind": src["kind"],
-                "source_file": abs_path(root, src["file_path"]),
-                "source_line": src["line"],
-                "caller_count": src["caller_count"],
-            }
-            if paths:
-                entry["reachable"] = True
-                entry["paths"] = paths[:3]
-            else:
-                entry["reachable"] = False
-            results.append(entry)
+    # Try call paths from each source to target
+    results = []
+    for src in sources:
+        paths = index_db.find_call_path(
+            conn, config_hash, src["qualified_name"], to_symbol, max_depth=max_depth,
+        )
+        entry = {
+            "source_name": src["name"],
+            "source_qualified_name": src["qualified_name"],
+            "source_kind": src["kind"],
+            "source_file": abs_path(root, src["file_path"]),
+            "source_line": src["line"],
+            "caller_count": src["caller_count"],
+        }
+        if paths:
+            entry["reachable"] = True
+            entry["paths"] = paths[:3]
+        else:
+            entry["reachable"] = False
+        results.append(entry)
 
-        num_reachable = sum(1 for r in results if r["reachable"])
-        return [
-            {
-                "_summary": f"{num_reachable}/{len(results)} source functions reach '{to_symbol}' within depth {max_depth}",
-                "_type": type_name,
-                "_target": to_symbol,
-            },
-            *results,
-        ]
-    finally:
-        pass  # connection managed by connection.py cache
+    num_reachable = sum(1 for r in results if r["reachable"])
+    return [
+        {
+            "_summary": f"{num_reachable}/{len(results)} source functions reach '{to_symbol}' within depth {max_depth}",
+            "_type": type_name,
+            "_target": to_symbol,
+        },
+        *results,
+    ]
 
 # ── moved from server.py ──
 def find_hotspots(
@@ -920,17 +892,14 @@ def find_hotspots(
     assert conn is not None
     assert root is not None
     assert config_hash is not None
-    try:
-        rows = index_db.find_hotspots(
-            conn, config_hash, limit=limit,
-            exclude_paths=exclude_paths,
-            project_only=project_only,
-        )
-        if not rows and project_only:
-            return [{"info": "No project hotspots found. Try project_only=False to include vendor code."}]
-        if not rows:
-            return [{"info": "No references indexed — enable index_refs and re-index."}]
-        return rows
-    finally:
-        pass  # connection managed by connection.py cache
+    rows = index_db.find_hotspots(
+        conn, config_hash, limit=limit,
+        exclude_paths=exclude_paths,
+        project_only=project_only,
+    )
+    if not rows and project_only:
+        return [{"info": "No project hotspots found. Try project_only=False to include vendor code."}]
+    if not rows:
+        return [{"info": "No references indexed — enable index_refs and re-index."}]
+    return rows
 
