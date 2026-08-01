@@ -38,6 +38,24 @@ dev = [
 
 [tool.bandit]
 exclude_dirs = ["tests", "experiments"]
+# ── Suppressed checks with justifications ──
+# B101 (assert_used): assertions guard invariants / type narrowing; not
+#   used for security boundary enforcement.
+# B404 (import subprocess): build tool must invoke compilers, cmake, bear,
+#   git, and other CLI tools — subprocess is essential.
+# B603 (subprocess shell): all subprocess.run() calls use the default
+#   shell=False; untrusted input never reaches the command arguments.
+# B607 (partial path): tools like git, cmake, bear, ninja are expected on
+#   PATH in developer environments; absolute paths would break portability.
+# B608 (SQL): f-strings only inject parameterized ``?`` placeholders —
+#   all user data goes through query parameters, never string interpolation.
+# B311 (random): used only in finetune.py for ML training data generation
+#   (template sampling, query shuffling, disagreement mining) — no security
+#   impact, and SystemRandom would add unnecessary overhead here.
+# B105 (password string): false positives — 'unknown' is a sentinel value,
+#   '-specs' is a GCC compiler flag, not credentials.
+# B108 (tmp dir): uses tempfile.gettempdir(), not raw /tmp string.
+skips = ["B101", "B404", "B603", "B607", "B608", "B311", "B105", "B108"]
 
 [project.scripts]
 fw-context = "fw_context_mcp.cli:main"
