@@ -104,7 +104,7 @@ def _register_mcp_file(tool, mcp_bin: str, dry_run: bool = False) -> None:
             raw = config_path.read_text(encoding="utf-8")
             # Strip JSONC comments (// and /* */) before parsing
             raw = re.sub(r"/\*.*?\*/", "", raw, flags=re.DOTALL)
-            raw = re.sub(r"//.*$", "", raw, flags=re.MULTILINE)
+            raw = re.sub(r'(?<!:)//.*$', '', raw, flags=re.MULTILINE)
             data = json.loads(raw)
         else:
             data = {}
