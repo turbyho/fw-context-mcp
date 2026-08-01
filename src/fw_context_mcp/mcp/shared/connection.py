@@ -107,25 +107,37 @@ def _check_cached_conn(db_key: str) -> sqlite3.Connection | None:
 def _open_and_cache(db_key: str, db_path: Path) -> sqlite3.Connection:
     """Open a database connection and cache it.
 
-    Double-checked locking: re-checks the cache after acquiring the lock.
-    Runs ``PRAGMA integrity_check`` once per database path per process
-    (outside the cache lock so other tools are not blocked).
-    Note: calls open_db() while holding _conn_cache_lock -- IO under
-    lock is acceptable for read-heavy workloads (open <1ms on modern FS).
+    Double-checked locking with IO outside the lock: ``open_db()``
+    (which includes schema migrations and integrity checks) runs
+    before acquiring ``_conn_cache_lock`` so IO-intensive work does
+    not block other threads from accessing the cache.
     """
+    # Fast path: connection already cached — return immediately
+    with _conn_cache_lock:
+        if db_key in _conn_cache:
+            return _conn_cache[db_key].conn
+
+    # Open the database OUTSIDE the cache lock — IO-intensive work
+    # (schema migrations, integrity checks) should not block other threads
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    conn = None
+    try:
+        conn = open_db(db_path.resolve())
+    except DatabaseCorruptionError:
+        if conn:
+            conn.close()
+        raise
+
+    # Insert into cache under lock — double-check another thread didn't win
     should_check = False
     with _conn_cache_lock:
         if db_key in _conn_cache:
-            return _conn_cache[db_key].conn  # race: another thread cached first
-
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        conn = None
-        try:
-            conn = open_db(db_path.resolve())
-        except DatabaseCorruptionError:
-            if conn:
+            # Another thread already cached a connection — close our duplicate
+            try:
                 conn.close()
-            raise
+            except sqlite3.Error:
+                pass
+            return _conn_cache[db_key].conn
 
         with _integrity_lock:
             if db_key not in _integrity_checked:
