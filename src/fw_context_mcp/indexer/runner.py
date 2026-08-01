@@ -40,7 +40,7 @@ from .ops import _build_filtered_file_content, _normalize_file_path, store_symbo
 from ._manifest_updater import _refresh_header_mtimes_from_manifest, _update_manifest_after_index
 from ._embedding import _build_embeddings, _chunk_body, _cleanup_orphaned_cc_artifacts, _embed_model_key, _fmt_dur, _truncate_body
 from ._llm_analysis import _build_llm_analysis, _enrich_batch, _fetch_callees, _fetch_referencers, _read_body
-from ._unit_processor import _check_and_parse_unit, _get_manifest_entry_hash_for_unit, _process_unit, _reassign_symbols_for_file
+from ._unit_processor import _check_and_parse_unit, _get_manifest_entry_hash_for_unit, _handle_unchanged_or_reuse, _process_unit, _reassign_symbols_for_file
 from ._postprocess import _build_hotspot_cache, _build_overrides, _build_pagerank, _extract_param_types, _run_postprocess
 
 log = logging.getLogger(__name__)
@@ -385,95 +385,23 @@ def run(
         )
 
         if check_status in ("unchanged", "reuse"):
-            is_reuse = check_status == "reuse"
-            file_path_str = _normalize_file_path(str(unit.file.resolve()), project_root)
-            rec = existing_files.get(file_path_str)
-            file_id = rec.file_id if rec else None
-            try:
-                current_mtime = unit.file.stat().st_mtime if unit.file.exists() else 0.0
-            except OSError:
-                current_mtime = 0.0
-
-            # When "reuse" migration produces 0 symbols (no old data for this
-            # TU), we must fall through to Phase 2 for a real libclang parse
-            # instead of skipping the TU permanently.
-            fallthrough = False
-
-            with write_lock(db_path.parent, timeout=120.0):
-                with transaction(conn, checkpoint=False):
-                    if hashes is not None:
-                        # Tier 2 / Tier 2b: content-hash match — update or create file record
-                        source_hash, flags_hash, manifest_entry_hash = hashes
-                        content_hash_val = compute_tu_content_hash(source_hash, flags_hash, manifest_entry_hash)
-                        if file_id is not None:
-                            conn.execute(
-                                """UPDATE files SET mtime=?, content_hash=?, source_hash=?,
-                                   flags_hash=?
-                                   WHERE id=?""",
-                                (current_mtime, content_hash_val, source_hash, flags_hash, file_id),
-                            )
-                        else:
-                            # New config_hash — create file record for this TU
-                            file_id = upsert_file(
-                                conn,
-                                config_hash,
-                                file_path_str,
-                                unit.language,
-                                mtime=current_mtime,
-                                content_hash=content_hash_val,
-                                source_hash=source_hash,
-                                flags_hash=flags_hash,
-                            )
-                    elif file_id is not None:
-                        # Tier 1: mtime match — just refresh stored mtime
-                        conn.execute(
-                            "UPDATE files SET mtime=? WHERE id=?",
-                            (current_mtime, file_id),
-                        )
-                    # For "reuse": copy symbols + refs from old config_hash
-                    if is_reuse and file_id is not None:
-                        syms_copied = _reassign_symbols_for_file(
-                            conn, config_hash, file_id, file_path_str,
-                        )
-                        if syms_copied > 0:
-                            total_syms += syms_copied
-                            reused += 1
-                        else:
-                            # No old data to migrate — clear the file record
-                            # so orphan cleanup handles it, then fall through
-                            # to Phase 2 for a real libclang parse.
-                            log.info(
-                                "[%d/%d] %s: reuse produced 0 symbols — re-parsing",
-                                processed, len(units), fname,
-                            )
-                            conn.execute("UPDATE files SET content = '' WHERE id = ?", (file_id,))
-                            fallthrough = True
-                    elif not is_reuse:
-                        unchanged += 1
-
-                    if not fallthrough:
-                        # Fill ifdef-filtered file content via tokenization
-                        fc, headers = _build_filtered_file_content(
-                            conn, unit, config_hash, project_root, build_dir_patterns=build_dir_patterns
-                        )
-                        content_filled += fc
-                if not fallthrough and headers:
-                    try:
-                        tu_key = str(unit.file.resolve().relative_to(project_root))
-                    except ValueError:
-                        tu_key = str(unit.file.resolve())
-                    tu_headers[tu_key] = headers
-            if fallthrough:
+            result = _handle_unchanged_or_reuse(
+                unit, check_status, hashes, conn, config_hash, project_root,
+                build_dir_patterns, db_path, existing_files, processed, len(units),
+            )
+            total_syms += result["total_syms"]
+            if result["is_reuse"] and result["total_syms"] > 0:
+                reused += 1
+            elif not result["is_reuse"]:
+                unchanged += 1
+            content_filled += result["content_filled"]
+            if result["headers"]:
+                tu_headers.update(result["headers"])
+            if result["fallthrough"]:
                 # Fall through to Phase 2 — _process_unit will re-parse with libclang
                 pass
             else:
-                if is_reuse:
-                    terse = "reused (manifest)"
-                elif hashes is not None:
-                    terse = "unchanged (content)"
-                else:
-                    terse = "unchanged"
-                log.info("[%d/%d] %s: %s", processed, len(units), fname, terse)
+                log.info("[%d/%d] %s: %s", processed, len(units), fname, result["status"])
                 continue
 
         if check_status == "skipped":

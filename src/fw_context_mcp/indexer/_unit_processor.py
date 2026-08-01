@@ -21,6 +21,7 @@ from .db import (
     open_db,
     transaction,
     upsert_file,
+    write_lock,
 )
 from .compile_commands import _SOURCE_EXTS, validate_include_files
 from .config_hash import compute_flags_hash, compute_tu_content_hash
@@ -552,3 +553,140 @@ def _process_unit(
             conn.close()
 
 
+
+
+def _handle_unchanged_or_reuse(
+    unit,
+    check_status: str,
+    hashes: tuple | None,
+    conn: sqlite3.Connection,
+    config_hash: str,
+    project_root: Path,
+    build_dir_patterns: list[str] | None,
+    db_path: Path,
+    existing_files: dict,
+    processed: int,
+    total_units: int,
+) -> dict:
+    """Handle Phase 1 staleness outcomes — bookkeeping for unchanged/reuse TUs.
+
+    Manages file-record updates, symbol reassignment from old config_hash
+    (reuse migration), and ifdef-filtered content filling.  The caller is
+    responsible for applying the returned counters to its own state.
+
+    Args:
+        unit: The compilation unit being processed.
+        check_status: One of ``"unchanged"`` or ``"reuse"`` (from
+            :func:`_check_and_parse_unit`).
+        hashes: ``(source_hash, flags_hash, manifest_entry_hash)`` tuple
+            from Tier 2 / Tier 2b staleness check, or ``None`` for Tier 1.
+        conn: Open SQLite connection to the index database.
+        config_hash: Active build config hash.
+        project_root: Project root directory.
+        build_dir_patterns: Build directory exclusion patterns.
+        db_path: Path to the index database file.
+        existing_files: Dict mapping file paths to ``FileHashRecord``.
+        processed: 1-based index of this TU in the batch (for logging).
+        total_units: Total TU count (for logging).
+
+    Returns:
+        dict with keys:
+        - ``fallthrough`` (bool): True when the TU must be re-parsed in
+          Phase 2 (reuse migration produced 0 symbols).
+        - ``file_id`` (int | None): File record ID for use in Phase 2.
+        - ``headers`` (dict | None): Collected headers for manifest update.
+        - ``status`` (str): ``"reused (manifest)"``, ``"unchanged (content)"``,
+          or ``"unchanged"``.
+        - ``is_reuse`` (bool): True when the TU was migrated from old config.
+        - ``total_syms`` (int): Symbols copied during reuse migration.
+        - ``content_filled`` (int): 1 if ifdef content was filled, 0 otherwise.
+    """
+    is_reuse = check_status == "reuse"
+    fname = unit.file.name
+    file_path_str = _normalize_file_path(str(unit.file.resolve()), project_root)
+    rec = existing_files.get(file_path_str)
+    file_id = rec.file_id if rec else None
+    try:
+        current_mtime = unit.file.stat().st_mtime if unit.file.exists() else 0.0
+    except OSError:
+        current_mtime = 0.0
+
+    # When "reuse" migration produces 0 symbols (no old data for this
+    # TU), we must fall through to Phase 2 for a real libclang parse
+    # instead of skipping the TU permanently.
+    fallthrough = False
+    total_syms = 0
+    content_filled = 0
+    headers = None
+
+    with write_lock(db_path.parent, timeout=120.0):
+        with transaction(conn, checkpoint=False):
+            if hashes is not None:
+                # Tier 2 / Tier 2b: content-hash match — update or create file record
+                source_hash, flags_hash, manifest_entry_hash = hashes
+                content_hash_val = compute_tu_content_hash(source_hash, flags_hash, manifest_entry_hash)
+                if file_id is not None:
+                    conn.execute(
+                        """UPDATE files SET mtime=?, content_hash=?, source_hash=?,
+                           flags_hash=?
+                           WHERE id=?""",
+                        (current_mtime, content_hash_val, source_hash, flags_hash, file_id),
+                    )
+                else:
+                    # New config_hash — create file record for this TU
+                    file_id = upsert_file(
+                        conn,
+                        config_hash,
+                        file_path_str,
+                        unit.language,
+                        mtime=current_mtime,
+                        content_hash=content_hash_val,
+                        source_hash=source_hash,
+                        flags_hash=flags_hash,
+                    )
+            elif file_id is not None:
+                # Tier 1: mtime match — just refresh stored mtime
+                conn.execute(
+                    "UPDATE files SET mtime=? WHERE id=?",
+                    (current_mtime, file_id),
+                )
+            # For "reuse": copy symbols + refs from old config_hash
+            if is_reuse and file_id is not None:
+                syms_copied = _reassign_symbols_for_file(
+                    conn, config_hash, file_id, file_path_str,
+                )
+                if syms_copied > 0:
+                    total_syms = syms_copied
+                else:
+                    # No old data to migrate — clear the file record
+                    # so orphan cleanup handles it, then fall through
+                    # to Phase 2 for a real libclang parse.
+                    log.info(
+                        "[%d/%d] %s: reuse produced 0 symbols — re-parsing",
+                        processed, total_units, fname,
+                    )
+                    conn.execute("UPDATE files SET content = '' WHERE id = ?", (file_id,))
+                    fallthrough = True
+
+            if not fallthrough:
+                # Fill ifdef-filtered file content via tokenization
+                fc, hdrs = _build_filtered_file_content(
+                    conn, unit, config_hash, project_root, build_dir_patterns=build_dir_patterns
+                )
+                content_filled = fc
+                if hdrs:
+                    try:
+                        tu_key = str(unit.file.resolve().relative_to(project_root))
+                    except ValueError:
+                        tu_key = str(unit.file.resolve())
+                    headers = {tu_key: hdrs}
+
+    return {
+        "fallthrough": fallthrough,
+        "file_id": file_id,
+        "headers": headers,
+        "status": "reused (manifest)" if is_reuse else ("unchanged (content)" if hashes is not None else "unchanged"),
+        "is_reuse": is_reuse,
+        "total_syms": total_syms,
+        "content_filled": content_filled,
+    }
