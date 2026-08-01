@@ -163,6 +163,7 @@ class CacheBackend(CacheStorageBackend):
                     can_read      BOOLEAN NOT NULL DEFAULT true,
                     can_write     BOOLEAN NOT NULL DEFAULT false,
                     can_overwrite BOOLEAN NOT NULL DEFAULT false,
+                    is_admin     BOOLEAN NOT NULL DEFAULT false,
                     description   TEXT,
                     created_at    TIMESTAMPTZ DEFAULT now(),
                     revoked_at    TIMESTAMPTZ
@@ -179,6 +180,10 @@ class CacheBackend(CacheStorageBackend):
             )
             if is_nullable and is_nullable.upper() != "YES":
                 await meta.execute("ALTER TABLE tokens ALTER COLUMN project_id DROP NOT NULL")
+            # Ensure is_admin column exists (added in v0.24.1)
+            await meta.execute("ALTER TABLE tokens ADD COLUMN IF NOT EXISTS is_admin BOOLEAN NOT NULL DEFAULT false")
+            # Existing tokens with NULL project_id are admin tokens
+            await meta.execute("UPDATE tokens SET is_admin = true WHERE project_id IS NULL AND NOT is_admin")
         finally:
             await self._meta_pool.release(meta)
 
@@ -223,7 +228,7 @@ class CacheBackend(CacheStorageBackend):
         token_hash = hashlib.sha256(token.encode()).digest()
         async with self._meta_pool.acquire() as conn:
             row = await conn.fetchrow(
-                "SELECT project_id, can_read, can_write, can_overwrite "
+                "SELECT project_id, can_read, can_write, can_overwrite, is_admin "
                 "FROM tokens WHERE token_hash = $1 AND revoked_at IS NULL",
                 token_hash,
             )
@@ -234,6 +239,7 @@ class CacheBackend(CacheStorageBackend):
                 "can_read": row["can_read"],
                 "can_write": row["can_write"],
                 "can_overwrite": row["can_overwrite"],
+                "is_admin": row["is_admin"],
             }
 
     async def batch_get(self, hashes: list[str]) -> dict[str, dict[str, Any] | None]:
@@ -268,7 +274,7 @@ class CacheBackend(CacheStorageBackend):
         *,
         can_overwrite: bool = False,
     ) -> int:
-        """Insert multiple cache entries.
+        """Insert multiple cache entries in a single round trip.
 
         When *can_overwrite* is ``False`` (default), uses ``INSERT ON
         CONFLICT DO NOTHING`` — the first analysis wins.
@@ -281,11 +287,17 @@ class CacheBackend(CacheStorageBackend):
         if not entries:
             return 0
 
-        stmt: str
+        hashes = [e["hash"] for e in entries]
+        summaries = [e["summary"] for e in entries]
+        inputs_list = [e["inputs"] for e in entries]
+        outputs_list = [e["outputs"] for e in entries]
+        models = [e["model"] for e in entries]
+
         if can_overwrite:
             stmt = (
                 "INSERT INTO llm_analysis_cache (content_hash, summary, inputs, outputs, model) "
-                "VALUES ($1, $2, $3, $4, $5) "
+                "SELECT h, s, i, o, m FROM unnest($1::text[], $2::text[], $3::text[], $4::text[], $5::text[]) "
+                "AS t(h, s, i, o, m) "
                 "ON CONFLICT (content_hash) DO UPDATE SET "
                 "summary = EXCLUDED.summary, inputs = EXCLUDED.inputs, "
                 "outputs = EXCLUDED.outputs, model = EXCLUDED.model, "
@@ -295,23 +307,16 @@ class CacheBackend(CacheStorageBackend):
         else:
             stmt = (
                 "INSERT INTO llm_analysis_cache (content_hash, summary, inputs, outputs, model) "
-                "VALUES ($1, $2, $3, $4, $5) "
+                "SELECT h, s, i, o, m FROM unnest($1::text[], $2::text[], $3::text[], $4::text[], $5::text[]) "
+                "AS t(h, s, i, o, m) "
                 "ON CONFLICT (content_hash) DO NOTHING "
                 "RETURNING content_hash"
             )
 
-        inserted = 0
         async with self._cache_pool.acquire() as conn:
-            for entry in entries:
-                result = await conn.fetchrow(
-                    stmt,
-                    entry["hash"], entry["summary"], entry["inputs"],
-                    entry["outputs"], entry["model"],
-                )
-                if result is not None:
-                    inserted += 1
+            rows = await conn.fetch(stmt, hashes, summaries, inputs_list, outputs_list, models)
 
-        return inserted
+        return len(rows)
 
     # -- Admin methods (direct PostgreSQL access, not via HTTP) --
 
@@ -460,8 +465,8 @@ class CacheBackend(CacheStorageBackend):
 
         async with self._meta_pool.acquire() as conn:
             await conn.execute(
-                "INSERT INTO tokens (token_hash, project_id, can_read, can_write, can_overwrite, description) "
-                "VALUES ($1, NULL, true, true, true, 'admin (setup)')",
+                "INSERT INTO tokens (token_hash, project_id, can_read, can_write, can_overwrite, is_admin, description) "
+                "VALUES ($1, NULL, true, true, true, true, 'admin (setup)')",
                 token_hash,
             )
         return token

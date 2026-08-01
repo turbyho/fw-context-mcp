@@ -52,8 +52,8 @@ def admin_command(fn: Callable[[Any, argparse.Namespace], Any]) -> Callable[[arg
             try:
                 await backend.connect()
                 perms = await backend.validate_token(admin_token)
-                if perms is None or not perms.get("can_overwrite", False):
-                    print("Error: admin token is invalid or lacks can_overwrite permission", file=sys.stderr)
+                if perms is None or not perms.get("is_admin", False):
+                    print("Error: admin token is invalid or lacks admin permission", file=sys.stderr)
                     return 1
                 args._admin_project_id = perms.get("project_id")
                 return await fn(backend, args)
