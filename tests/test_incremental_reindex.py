@@ -50,6 +50,14 @@ def _db_path_for_project(project_root: Path) -> Path:
     return cfg.index.db_dir / project_id / "index.db"
 
 
+def _fail_or_skip_analysis(result: dict, symbol_name: str) -> None:
+    """Fail if analysis was expected but not generated; skip if Ollama unavailable."""
+    if "analysis_warning" in result:
+        pytest.skip(f"Ollama not available — cannot generate analysis for {symbol_name}: "
+                     f"{result['analysis_warning']}")
+    pytest.fail(f"No analysis generated for {symbol_name} after reindex with with_analysis=True")
+
+
 def _project_root() -> Path:
     """Return the fw-context-mcp repo root."""
     return Path(__file__).resolve().parents[1]
@@ -606,7 +614,7 @@ class TestIncrementalReindex:
                 assert ana_after["inputs"] == "data: input, len: buffer length"
                 print(f"  Analysis preserved: {ana_after['summary']}")
             else:
-                print("  WARNING: Analysis was NOT preserved (may indicate hash mismatch)")
+                pytest.fail("Analysis was NOT preserved (may indicate hash mismatch)")
 
         finally:
             conn.close()
@@ -720,11 +728,12 @@ int modem_flush(void) {
 
         result = reindex_file_impl("src/modem.h", str(indexed_project), with_analysis=False)
         # Header-only files not in compile_commands.json should return error
-        if "error" in result:
-            assert "header" in result["error"].lower() or "not found" in result["error"].lower()
-            print(f"  Expected error: {result['error']}")
-        else:
-            print(f"  Header reindexed (via include): {result}")
+        assert "error" in result, (
+            f"Expected error for header file not in compile_commands.json, got: {result}"
+        )
+        assert "header" in result["error"].lower() or "not found" in result["error"].lower(), (
+            f"Expected 'header' or 'not found' in error message, got: {result['error']!r}"
+        )
 
 
 @pytest.mark.libclang
@@ -1223,6 +1232,10 @@ class TestStoreSymbolsForUnitAnalysisRestore:
 
         conn.close()
 
+    @pytest.mark.xfail(
+        reason="Phase 1 reads body from current file on disk — "
+        "can't detect changes made before reindex"
+    )
     def test_phase3_does_not_restore_when_content_changed(self, store_db, tmp_path: Path):
         """Phase 3: changed symbol content means analysis is NOT restored."""
         from fw_context_mcp.indexer.ops import store_symbols_for_unit
@@ -1336,8 +1349,11 @@ class TestStoreSymbolsForUnitAnalysisRestore:
         # In practice, auto-reindex detects file changes via mtime and re-indexes
         # before analysis runs — analysis is generated on the new content.
         ana_after = conn.execute("SELECT COUNT(*) FROM llm_analysis").fetchone()[0]
-        # Currently: analysis is restored because both hashes come from the same file
-        print(f"  Analysis after reindex: {ana_after} (1=restored from same content)")
+        assert ana_after == 0, (
+            f"Expected analysis to be DROPPED (body changed: x*2 → x*3), "
+            f"but {ana_after} analysis row(s) remain. "
+            f"Known limitation: Phase 1 reads body from current file on disk."
+        )
 
         conn.close()
 
@@ -1882,7 +1898,7 @@ class TestLlvmAnalysisConsistency:
                 assert len(new["summary"]) > 10, f"Summary too short: {new['summary']!r}"
                 print(f"  New summary: {new['summary'][:120]}...")
             else:
-                print("  WARNING: No analysis after reindex (known Phase 1 limitation)")
+                _fail_or_skip_analysis(result, "modem_send")
 
         finally:
             conn.close()
@@ -2003,7 +2019,7 @@ int compute_average(const int* values, int count) {
                 assert len(ana["summary"]) > 10, f"Summary too short: {ana['summary']!r}"
                 print(f"  Analysis: {ana['summary'][:120]}...")
             else:
-                print("  WARNING: No analysis generated for new symbol")
+                _fail_or_skip_analysis(result, "compute_average")
 
         finally:
             conn.close()
