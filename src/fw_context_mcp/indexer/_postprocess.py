@@ -14,11 +14,11 @@ import time
 from pathlib import Path
 
 from ..utils import is_fatal
-from .db import WriteLockTimeout
+from .db import WriteLockTimeout, write_lock
 
 # Local SAFE_EXCEPT that includes WriteLockTimeout — cannot extend
 # utils.SAFE_EXCEPT directly because utils.py would need a circular import
-# from .db._connection.
+# from .db._locking.
 SAFE_EXCEPT = (
     ValueError, TypeError, RuntimeError, AttributeError,
     sqlite3.Error, OSError, WriteLockTimeout,

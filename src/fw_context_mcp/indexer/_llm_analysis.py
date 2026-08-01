@@ -21,7 +21,7 @@ from ..llm.ollama import call_ollama
 from ..utils import SAFE_EXCEPT, is_fatal, read_file_lines
 from ..config.settings import DESCRIPTION_VERSION
 from ._embedding import _chunk_body, _fmt_dur
-from .db import open_db, transaction, upsert_llm_analysis_batch
+from .db import open_db, transaction, upsert_llm_analysis_batch, write_lock
 
 log = logging.getLogger(__name__)
 

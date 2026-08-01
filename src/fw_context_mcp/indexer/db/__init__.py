@@ -23,6 +23,7 @@ __all__ = [
     "delete_refs_for_file",
     "delete_symbols_for_file",
     "drop_fts_triggers",
+    "ensure_schema",
     "find_all_callers_recursive",
     "find_callees_recursive",
     "find_call_path",
@@ -90,12 +91,12 @@ from ._callgraph import (
 )
 from ._connection import (
     DatabaseCorruptionError,
-    WriteLockTimeout,
+    ensure_schema,
     get_db_schema_version,
     open_db,
     transaction,
-    write_lock,
 )
+from ._locking import WriteLockTimeout, write_lock
 from ._embeddings import (
     _cosine_sim,
     get_embeddings,
