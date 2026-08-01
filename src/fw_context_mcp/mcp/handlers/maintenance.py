@@ -508,10 +508,9 @@ def reset_index(
         else:
             info["message"] = f"Would delete {db_path}. Call reset_index(confirm=True) to proceed."
         return info
-    from ..background import _request_bg_reindex_pause, _resume_bg_reindex
+    from ..background import bg_reindex_pause
 
-    _request_bg_reindex_pause(root)
-    try:
+    with bg_reindex_pause(root):
         db_path.unlink()
         for suffix in ("-wal", "-shm", "-journal"):
             p = db_path.with_name(db_path.name + suffix)
@@ -519,8 +518,6 @@ def reset_index(
         _invalidate_conn_cache(str(db_path.resolve()))
         info["action"] = "deleted"
         info["message"] = f"Index deleted. Run 'fw-context index' in {root} to rebuild."
-    finally:
-        _resume_bg_reindex(root)
     return info
 
 
@@ -556,7 +553,7 @@ def _reindex_cleanup_deleted_file(
         write_lock as _db_write_lock,
     )
     from ...indexer.ops import _normalize_file_path
-    from ..background import _request_bg_reindex_pause, _resume_bg_reindex
+    from ..background import bg_reindex_pause
 
     known = get_file_mtimes(conn, config_hash)
     file_path_str = _normalize_file_path(str(target), root)
@@ -573,8 +570,7 @@ def _reindex_cleanup_deleted_file(
     except ValueError:
         tu_rel = file_path_str
 
-    _request_bg_reindex_pause(root)
-    try:
+    with bg_reindex_pause(root):
         with _db_write_lock(db_path.parent, timeout=60.0):
             with transaction(conn):
                 try:
@@ -596,11 +592,9 @@ def _reindex_cleanup_deleted_file(
             "symbols_removed": symbol_count,
             "action": "deleted",
         }
-    finally:
-        _resume_bg_reindex(root)
-        from ...mcp.shared.stale import _invalidate_modified_cache
+    from ...mcp.shared.stale import _invalidate_modified_cache
 
-        _invalidate_modified_cache(config_hash)
+    _invalidate_modified_cache(config_hash)
 
 
 def _reindex_parse_and_store(
@@ -625,7 +619,7 @@ def _reindex_parse_and_store(
         ExtractionResult,
         extract_all,
     )
-    from ..background import _request_bg_reindex_pause, _resume_bg_reindex
+    from ..background import bg_reindex_pause
 
     config_hash = cfg_data["config_hash"]
 
@@ -637,65 +631,59 @@ def _reindex_parse_and_store(
             parsed_units.append((unit, parsed))
         except sqlite3.Error as exc:
             return 0, {"error": f"DB error during parse of {unit.file.name}: {exc}"}
-            # NOTE: _request_bg_reindex_pause is called AFTER this loop —
-            # early return here is safe (pause was never requested).
-            # Do NOT move _request_bg_reindex_pause before this loop
-            # without wrapping it in try/finally.
         except RuntimeError as exc:
             log.warning("skip TU %s during reindex: %s", unit.file.name, exc)
             skipped_tus.append(str(unit.file.name))
 
-    _request_bg_reindex_pause(root)
-    t0 = time.monotonic()
-    total_symbols = 0
+    with bg_reindex_pause(root):
+        t0 = time.monotonic()
+        total_symbols = 0
 
-    try:
-        with db_write_lock(db_path.parent, timeout=60.0):
-            for unit, parsed in parsed_units:
-                with transaction(conn):
-                    syms_added, _, _headers = store_symbols_for_unit(
-                        conn, unit, config_hash, root,
-                        vendor_patterns=vendor_patterns,
-                        project_patterns=project_patterns_list,
-                        index_refs=cfg_refs,
-                        pre_parsed=parsed,
-                    )
-                    total_symbols += syms_added
+        try:
+            with db_write_lock(db_path.parent, timeout=60.0):
+                for unit, parsed in parsed_units:
+                    with transaction(conn):
+                        syms_added, _, _headers = store_symbols_for_unit(
+                            conn, unit, config_hash, root,
+                            vendor_patterns=vendor_patterns,
+                            project_patterns=project_patterns_list,
+                            index_refs=cfg_refs,
+                            pre_parsed=parsed,
+                        )
+                        total_symbols += syms_added
 
-            if parsed_units:
-                try:
-                    from ...indexer.macros import resolve_and_update
-                    first_unit = parsed_units[0][0]
-                    resolve_and_update(conn, config_hash, first_unit.clang_args, first_unit.file.resolve())
-                except (RuntimeError, sqlite3.Error):
-                    pass
+                if parsed_units:
+                    try:
+                        from ...indexer.macros import resolve_and_update
+                        first_unit = parsed_units[0][0]
+                        resolve_and_update(conn, config_hash, first_unit.clang_args, first_unit.file.resolve())
+                    except (RuntimeError, sqlite3.Error):
+                        pass
 
-            from ...indexer.db import delete_orphan_files
-            deleted_orphans = delete_orphan_files(conn, config_hash)
-            if deleted_orphans:
-                log.debug("Orphan files cleaned up: %d", deleted_orphans)
+                from ...indexer.db import delete_orphan_files
+                deleted_orphans = delete_orphan_files(conn, config_hash)
+                if deleted_orphans:
+                    log.debug("Orphan files cleaned up: %d", deleted_orphans)
 
-            _update_manifest_after_reindex(parsed_units, root, db_path.parent, config_hash)
+                _update_manifest_after_reindex(parsed_units, root, db_path.parent, config_hash)
 
-            elapsed = round(time.monotonic() - t0, 2)
-            result = {
-                "file": str(target),
-                "translation_units": len(matching),
-                "symbols_updated": total_symbols,
-                "elapsed_s": elapsed,
-            }
-            if skipped_tus:
-                result["skipped_tus"] = skipped_tus
-                result["skipped_count"] = len(skipped_tus)
-            if not parsed_units and skipped_tus:
-                return 0, {"error": f"All {len(matching)} translation unit(s) failed to parse", "skipped_tus": skipped_tus}
-        return total_symbols, result
-    except sqlite3.Error as exc:
-        return 0, {"error": f"DB error during reindex: {exc}"}
-    finally:
-        _resume_bg_reindex(root)
-        from ...mcp.shared.stale import _invalidate_modified_cache
-        _invalidate_modified_cache(config_hash)
+                elapsed = round(time.monotonic() - t0, 2)
+                result = {
+                    "file": str(target),
+                    "translation_units": len(matching),
+                    "symbols_updated": total_symbols,
+                    "elapsed_s": elapsed,
+                }
+                if skipped_tus:
+                    result["skipped_tus"] = skipped_tus
+                    result["skipped_count"] = len(skipped_tus)
+                if not parsed_units and skipped_tus:
+                    return 0, {"error": f"All {len(matching)} translation unit(s) failed to parse", "skipped_tus": skipped_tus}
+            return total_symbols, result
+        except sqlite3.Error as exc:
+            return 0, {"error": f"DB error during reindex: {exc}"}
+    from ...mcp.shared.stale import _invalidate_modified_cache
+    _invalidate_modified_cache(config_hash)
 
 def _update_manifest_after_reindex(
     parsed_units: list,
