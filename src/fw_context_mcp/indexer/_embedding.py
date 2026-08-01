@@ -8,7 +8,7 @@ build phase.
 from __future__ import annotations
 
 import logging
-import os
+import sqlite3
 import time
 from pathlib import Path
 
@@ -16,10 +16,9 @@ import httpx
 
 from ..config.settings import DESCRIPTION_VERSION
 from ..llm.embedder_factory import get_embedder
-from ..utils import SAFE_EXCEPT, compute_source_hash, is_fatal
-from .db import open_db, transaction, write_lock
+from ..utils import SAFE_EXCEPT, is_fatal
+from .db import open_db, transaction, upsert_embeddings, upsert_embeddings_vec, write_lock
 from .db._embeddings import _vec_to_blob
-from .db import upsert_embeddings, upsert_embeddings_vec
 
 log = logging.getLogger(__name__)
 
@@ -208,14 +207,8 @@ def _build_embeddings(
     When Ollama is unreachable or returns an error for a batch, a warning is
     logged and the batch is skipped (non-fatal — remaining batches continue).
     """
-    import time
 
-    import httpx
 
-    from ..llm.embedder_factory import get_embedder
-    from .db import open_db
-    from .db._embeddings import _vec_to_blob
-    from .db import upsert_embeddings, upsert_embeddings_vec
 
     # Suppress httpx INFO logs (one per batch — noisy during embedding)
     logging.getLogger("httpx").setLevel(logging.WARNING)

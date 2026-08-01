@@ -24,14 +24,7 @@ from ...indexer.db import (
     open_db,
     transaction,
 )
-from ...indexer.symbols import (
-    FnPointerAssignment,
-    IndirectCallSite,
-    InheritanceRecord,
-    Macro,
-    Symbol,
-)
-from ...llm.ollama import check_setup
+from ...llm._diag import check_setup
 from ...utils import resolve_project_root
 from ..background import _is_bg_reindex_running
 from ..shared.context import (
@@ -40,7 +33,6 @@ from ..shared.context import (
     _invalidate_conn_cache,
     _is_stale,
     _open_db_or_return,
-    _open_db_safe,
     _resolve_context,
 )
 from ..shared.stale import _check_header_staleness, _count_modified_files
@@ -127,242 +119,239 @@ def get_active_build(
     conn, err_result = _open_db_or_return(db_path)
     if err_result:
         return err_result[0]
-    try:
-        with conn:
-            project_id = derive_project_id(root)
-            cfg = get_active_config(conn, project_id)
-            if not cfg:
-                return {"error": f"No build config indexed for project at {root}."}
-            config_hash = cfg["config_hash"]
-            sym_count = conn.execute("SELECT COUNT(*) FROM symbols WHERE config_hash=?", (config_hash,)).fetchone()[0]
-            file_count = conn.execute("SELECT COUNT(*) FROM files WHERE config_hash=?", (config_hash,)).fetchone()[0]
-            ref_count = count_refs(conn, config_hash)
-            manifest_verification = cfg["manifest_verification"] if "manifest_verification" in cfg else "none"
-            if fast:
-                modified_count = 0
-                header_affected_tus = 0
-            else:
-                modified_count = _count_modified_files(conn, config_hash, root, use_cache=False)
-                # Check header dependencies separately (different metric: TUs, not files)
-                if manifest_verification == "full":
-                    header_affected_tus, _ = _check_header_staleness(
-                        conn,
-                        config_hash,
-                        root,
-                        use_cache=False,
-                    )
-                else:
-                    header_affected_tus = 0
-            db_schema_ver = get_db_schema_version(conn)
-
-            # LLM analysis statistics
-            analyzed_count = conn.execute(
-                """SELECT COUNT(*) FROM llm_analysis a
-                   JOIN symbols s ON s.id = a.symbol_id
-                   WHERE s.config_hash = ?""",
-                (config_hash,),
-            ).fetchone()[0]
-            analysis_model_row = conn.execute(
-                """SELECT a.model FROM llm_analysis a
-                   JOIN symbols s ON s.id = a.symbol_id
-                   WHERE s.config_hash = ? LIMIT 1""",
-                (config_hash,),
-            ).fetchone()
-
-            # Read stored analyze_vendor — what was actually indexed.
-            # Fall back to False for DBs that predate the column.
-            try:
-                stored_analyze_vendor = bool(
-                    conn.execute(
-                        "SELECT analyze_vendor FROM build_configs WHERE config_hash = ?",
-                        (config_hash,),
-                    ).fetchone()["analyze_vendor"]
-                )
-            except sqlite3.OperationalError:
-                stored_analyze_vendor = False
-
-            # Load project config for vendor_paths/project_paths in the response
-            # and for unanalyzed_symbol count filtering.
-            proj_cfg = load_config(project_root=root)
-
-            # Count definition symbols that still need LLM analysis
-            if stored_analyze_vendor:
-                # No exclusion — count all symbols including vendor/SDK
-                unanalyzed_count = conn.execute(
-                    """SELECT COUNT(*)
-                       FROM symbols s
-                       WHERE s.config_hash = ?
-                         AND s.is_definition = 1
-                         AND s.kind IN ('function', 'method', 'constructor',
-                                        'destructor', 'class', 'struct')
-                         AND s.name NOT LIKE '%(anonymous%'
-                         AND s.name NOT LIKE '%(unnamed%'
-                         AND s.id NOT IN (SELECT symbol_id FROM llm_analysis)""",
-                    (config_hash,),
-                ).fetchone()[0]
-            else:
-                from ..shared.filtering import compute_exclude_like
-
-                exclude_like = compute_exclude_like(
+    with conn:
+        project_id = derive_project_id(root)
+        cfg = get_active_config(conn, project_id)
+        if not cfg:
+            return {"error": f"No build config indexed for project at {root}."}
+        config_hash = cfg["config_hash"]
+        sym_count = conn.execute("SELECT COUNT(*) FROM symbols WHERE config_hash=?", (config_hash,)).fetchone()[0]
+        file_count = conn.execute("SELECT COUNT(*) FROM files WHERE config_hash=?", (config_hash,)).fetchone()[0]
+        ref_count = count_refs(conn, config_hash)
+        manifest_verification = cfg["manifest_verification"] if "manifest_verification" in cfg else "none"
+        if fast:
+            modified_count = 0
+            header_affected_tus = 0
+        else:
+            modified_count = _count_modified_files(conn, config_hash, root, use_cache=False)
+            # Check header dependencies separately (different metric: TUs, not files)
+            if manifest_verification == "full":
+                header_affected_tus, _ = _check_header_staleness(
+                    conn,
+                    config_hash,
                     root,
-                    analyze_vendor=False,
-                    vendor_paths=proj_cfg.index.vendor_paths,
+                    use_cache=False,
                 )
-                exclude_clauses = " AND ".join(
-                    ["s.file_path NOT LIKE ?"] * len(exclude_like)
-                )
-                exclude_clause = (" AND " + exclude_clauses) if exclude_clauses else ""
-                query = f"""SELECT COUNT(*)
+            else:
+                header_affected_tus = 0
+        db_schema_ver = get_db_schema_version(conn)
+
+        # LLM analysis statistics
+        analyzed_count = conn.execute(
+            """SELECT COUNT(*) FROM llm_analysis a
+               JOIN symbols s ON s.id = a.symbol_id
+               WHERE s.config_hash = ?""",
+            (config_hash,),
+        ).fetchone()[0]
+        analysis_model_row = conn.execute(
+            """SELECT a.model FROM llm_analysis a
+               JOIN symbols s ON s.id = a.symbol_id
+               WHERE s.config_hash = ? LIMIT 1""",
+            (config_hash,),
+        ).fetchone()
+
+        # Read stored analyze_vendor — what was actually indexed.
+        # Fall back to False for DBs that predate the column.
+        try:
+            stored_analyze_vendor = bool(
+                conn.execute(
+                    "SELECT analyze_vendor FROM build_configs WHERE config_hash = ?",
+                    (config_hash,),
+                ).fetchone()["analyze_vendor"]
+            )
+        except sqlite3.OperationalError:
+            stored_analyze_vendor = False
+
+        # Load project config for vendor_paths/project_paths in the response
+        # and for unanalyzed_symbol count filtering.
+        proj_cfg = load_config(project_root=root)
+
+        # Count definition symbols that still need LLM analysis
+        if stored_analyze_vendor:
+            # No exclusion — count all symbols including vendor/SDK
+            unanalyzed_count = conn.execute(
+                """SELECT COUNT(*)
                    FROM symbols s
                    WHERE s.config_hash = ?
                      AND s.is_definition = 1
                      AND s.kind IN ('function', 'method', 'constructor',
                                     'destructor', 'class', 'struct')
-                     {exclude_clause}
                      AND s.name NOT LIKE '%(anonymous%'
                      AND s.name NOT LIKE '%(unnamed%'
-                     AND s.id NOT IN (SELECT symbol_id FROM llm_analysis)"""
-                unanalyzed_count = conn.execute(
-                    query, (config_hash, *exclude_like)
-                ).fetchone()[0]
+                     AND s.id NOT IN (SELECT symbol_id FROM llm_analysis)""",
+                (config_hash,),
+            ).fetchone()[0]
+        else:
+            from ..shared.filtering import compute_exclude_like
 
-            cc_changed, stale_reason = _is_stale(cfg, cfg["compile_commands_path"])
-            schema_old = db_schema_ver < CURRENT_SCHEMA_VERSION
-            needs_reindex = cc_changed or schema_old
+            exclude_like = compute_exclude_like(
+                root,
+                analyze_vendor=False,
+                vendor_paths=proj_cfg.index.vendor_paths,
+            )
+            exclude_clauses = " AND ".join(
+                ["s.file_path NOT LIKE ?"] * len(exclude_like)
+            )
+            exclude_clause = (" AND " + exclude_clauses) if exclude_clauses else ""
+            query = f"""SELECT COUNT(*)
+               FROM symbols s
+               WHERE s.config_hash = ?
+                 AND s.is_definition = 1
+                 AND s.kind IN ('function', 'method', 'constructor',
+                                'destructor', 'class', 'struct')
+                 {exclude_clause}
+                 AND s.name NOT LIKE '%(anonymous%'
+                 AND s.name NOT LIKE '%(unnamed%'
+                 AND s.id NOT IN (SELECT symbol_id FROM llm_analysis)"""
+            unanalyzed_count = conn.execute(
+                query, (config_hash, *exclude_like)
+            ).fetchone()[0]
 
-            # Build reindex_reasons — only when reindex is actually needed
-            reindex_reasons: list[str] = []
-            if schema_old:
-                reindex_reasons.append(f"schema_mismatch: {db_schema_ver} < {CURRENT_SCHEMA_VERSION}")
-            if cc_changed:
-                reindex_reasons.append(stale_reason or "compile_commands_changed")
+        cc_changed, stale_reason = _is_stale(cfg, cfg["compile_commands_path"])
+        schema_old = db_schema_ver < CURRENT_SCHEMA_VERSION
+        needs_reindex = cc_changed or schema_old
 
-            # Determine status
-            if needs_reindex:
-                status = "reindex_needed"
-            elif bg_running:
-                status = "reindexing"
-            else:
-                status = "ready"
+        # Build reindex_reasons — only when reindex is actually needed
+        reindex_reasons: list[str] = []
+        if schema_old:
+            reindex_reasons.append(f"schema_mismatch: {db_schema_ver} < {CURRENT_SCHEMA_VERSION}")
+        if cc_changed:
+            reindex_reasons.append(stale_reason or "compile_commands_changed")
 
-            # Build human-readable index message
-            if status == "ready":
-                index_message = f"Index is fully up to date ({sym_count} symbols)"
-            elif status == "reindexing":
-                if modified_count:
-                    index_message = (
-                        f"Index is usable — {modified_count} file(s) being reindexed "
-                        f"in background. All queries return accurate results."
-                    )
-                else:
-                    index_message = (
-                        "Index is usable — background reindex in progress. All queries return accurate results."
-                    )
-            elif schema_old and cc_changed:
+        # Determine status
+        if needs_reindex:
+            status = "reindex_needed"
+        elif bg_running:
+            status = "reindexing"
+        else:
+            status = "ready"
+
+        # Build human-readable index message
+        if status == "ready":
+            index_message = f"Index is fully up to date ({sym_count} symbols)"
+        elif status == "reindexing":
+            if modified_count:
                 index_message = (
-                    f"Schema version mismatch ({db_schema_ver} < {CURRENT_SCHEMA_VERSION}) "
-                    f"and compile_commands.json changed. Run fw-context index. "
-                    f"Queries still work on existing data."
-                )
-            elif schema_old:
-                index_message = (
-                    f"Schema version mismatch ({db_schema_ver} < {CURRENT_SCHEMA_VERSION}). "
-                    f"Run fw-context index. Queries still work on existing data."
+                    f"Index is usable — {modified_count} file(s) being reindexed "
+                    f"in background. All queries return accurate results."
                 )
             else:
-                index_message = "Compile commands changed — run fw-context index. Queries still work on existing data."
+                index_message = (
+                    "Index is usable — background reindex in progress. All queries return accurate results."
+                )
+        elif schema_old and cc_changed:
+            index_message = (
+                f"Schema version mismatch ({db_schema_ver} < {CURRENT_SCHEMA_VERSION}) "
+                f"and compile_commands.json changed. Run fw-context index. "
+                f"Queries still work on existing data."
+            )
+        elif schema_old:
+            index_message = (
+                f"Schema version mismatch ({db_schema_ver} < {CURRENT_SCHEMA_VERSION}). "
+                f"Run fw-context index. Queries still work on existing data."
+            )
+        else:
+            index_message = "Compile commands changed — run fw-context index. Queries still work on existing data."
 
-            # When manifest verification is not full, warn the LLM.
-            _warning = None
-            if manifest_verification != "full":
-                if bg_running:
-                    _warning = (
-                        "Index was built without full header dependency "
-                        "tracking (manifest verification: "
-                        f"{manifest_verification}). A reindex is currently "
-                        "running — the index will be updated once it "
-                        "completes. You may continue analysis, but note "
-                        "that header changes since the last completed "
-                        "index may not be reflected."
-                    )
-                    index_message += (
-                        f" — manifest verification: {manifest_verification} (reindex in progress — wait for completion)"
-                    )
-                else:
-                    _warning = (
-                        "⚠️ INDEX DEGRADED — STOP ALL C/C++ ANALYSIS "
-                        "IMMEDIATELY.\n\n"
-                        "manifest.json is NOT available "
-                        "for this index (manifest verification: "
-                        f"{manifest_verification}). The index may contain "
-                        "STALE data — header changes cannot be detected "
-                        "without manifest.json. Continuing analysis with a "
-                        "stale index WILL produce incorrect results.\n\n"
-                        "REQUIRED: Tell the user to run 'fw-context index' "
-                        "to rebuild with full dependency tracking. Do NOT "
-                        "continue any C/C++ analysis until the user "
-                        "confirms the index has been rebuilt."
-                    )
-                    index_message += (
-                        f" — manifest verification: {manifest_verification} (run 'fw-context index' for full tracking)"
-                    )
-
-            if header_affected_tus:
+        # When manifest verification is not full, warn the LLM.
+        _warning = None
+        if manifest_verification != "full":
+            if bg_running:
+                _warning = (
+                    "Index was built without full header dependency "
+                    "tracking (manifest verification: "
+                    f"{manifest_verification}). A reindex is currently "
+                    "running — the index will be updated once it "
+                    "completes. You may continue analysis, but note "
+                    "that header changes since the last completed "
+                    "index may not be reflected."
+                )
                 index_message += (
-                    f" | {header_affected_tus} TU(s) have stale header dependencies — header changes since last index"
+                    f" — manifest verification: {manifest_verification} (reindex in progress — wait for completion)"
+                )
+            else:
+                _warning = (
+                    "⚠️ INDEX DEGRADED — STOP ALL C/C++ ANALYSIS "
+                    "IMMEDIATELY.\n\n"
+                    "manifest.json is NOT available "
+                    "for this index (manifest verification: "
+                    f"{manifest_verification}). The index may contain "
+                    "STALE data — header changes cannot be detected "
+                    "without manifest.json. Continuing analysis with a "
+                    "stale index WILL produce incorrect results.\n\n"
+                    "REQUIRED: Tell the user to run 'fw-context index' "
+                    "to rebuild with full dependency tracking. Do NOT "
+                    "continue any C/C++ analysis until the user "
+                    "confirms the index has been rebuilt."
+                )
+                index_message += (
+                    f" — manifest verification: {manifest_verification} (run 'fw-context index' for full tracking)"
                 )
 
-            result: dict = {
-                "config_hash": config_hash,
-                "project_id": project_id,
-                "project_root": str(root),
-                "build_system": _detect_build_system(root),
-                "compile_commands": cfg["compile_commands_path"],
-                "indexed_at": cfg["created_at"],
-                "symbol_count": sym_count,
-                "file_count": file_count,
-                "reference_count": ref_count,
-                "modified_files_count": modified_count,
-                "header_affected_tus": header_affected_tus,
-                "schema_version": db_schema_ver,
-                "current_schema": CURRENT_SCHEMA_VERSION,
-                "analyzed_symbols": analyzed_count,
-                "unanalyzed_symbols": unanalyzed_count,
-                "analysis_model": analysis_model_row["model"] if analysis_model_row else None,
-                "manifest_verification": manifest_verification,
-                "description": cfg["description"] if "description" in cfg.keys() else "",
-                "first_indexed_at": cfg["first_indexed_at"] if "first_indexed_at" in cfg.keys() else "",
-                "vendor_paths": proj_cfg.index.vendor_paths,
-                "project_paths": proj_cfg.index.project_paths,
-                "status": status,
-                "reindex_needed": needs_reindex,
-                "reindex_reasons": reindex_reasons,
-                "index_message": index_message,
-            }
-            if _warning is not None:
-                result["_warning"] = _warning
-        # Background reindex is managed by the startup daemon thread and the
-        # file watcher — get_active_build() is a read-only tool and should
-        # not spawn subprocesses.
-        result["bg_reindex_running"] = bg_running
-        if bg_running:
-            log_file = db_path.parent / "reindex.log"
-            try:
-                with open(log_file, encoding="utf-8") as fh:
-                    fh.seek(0, 2)
-                    file_size = fh.tell()
-                    if file_size == 0:
-                        result["reindex_progress"] = None
-                    else:
-                        fh.seek(max(0, file_size - 4096))
-                        last_chunk = fh.read()
-                        lines = last_chunk.splitlines()
-                        result["reindex_progress"] = lines[-1].strip() if lines else None
-            except (OSError, IndexError):
-                result["reindex_progress"] = None
-        return result
-    finally:
-        pass  # connection managed by connection.py cache
+        if header_affected_tus:
+            index_message += (
+                f" | {header_affected_tus} TU(s) have stale header dependencies — header changes since last index"
+            )
+
+        result: dict = {
+            "config_hash": config_hash,
+            "project_id": project_id,
+            "project_root": str(root),
+            "build_system": _detect_build_system(root),
+            "compile_commands": cfg["compile_commands_path"],
+            "indexed_at": cfg["created_at"],
+            "symbol_count": sym_count,
+            "file_count": file_count,
+            "reference_count": ref_count,
+            "modified_files_count": modified_count,
+            "header_affected_tus": header_affected_tus,
+            "schema_version": db_schema_ver,
+            "current_schema": CURRENT_SCHEMA_VERSION,
+            "analyzed_symbols": analyzed_count,
+            "unanalyzed_symbols": unanalyzed_count,
+            "analysis_model": analysis_model_row["model"] if analysis_model_row else None,
+            "manifest_verification": manifest_verification,
+            "description": cfg["description"] if "description" in cfg.keys() else "",
+            "first_indexed_at": cfg["first_indexed_at"] if "first_indexed_at" in cfg.keys() else "",
+            "vendor_paths": proj_cfg.index.vendor_paths,
+            "project_paths": proj_cfg.index.project_paths,
+            "status": status,
+            "reindex_needed": needs_reindex,
+            "reindex_reasons": reindex_reasons,
+            "index_message": index_message,
+        }
+        if _warning is not None:
+            result["_warning"] = _warning
+    # Background reindex is managed by the startup daemon thread and the
+    # file watcher — get_active_build() is a read-only tool and should
+    # not spawn subprocesses.
+    result["bg_reindex_running"] = bg_running
+    if bg_running:
+        log_file = db_path.parent / "reindex.log"
+        try:
+            with open(log_file, encoding="utf-8") as fh:
+                fh.seek(0, 2)
+                file_size = fh.tell()
+                if file_size == 0:
+                    result["reindex_progress"] = None
+                else:
+                    fh.seek(max(0, file_size - 4096))
+                    last_chunk = fh.read()
+                    lines = last_chunk.splitlines()
+                    result["reindex_progress"] = lines[-1].strip() if lines else None
+        except (OSError, IndexError):
+            result["reindex_progress"] = None
+    return result
 
 
 # ── moved from server.py ──
@@ -404,12 +393,9 @@ def list_projects(
             if err_result:
                 results.append(err_result[0])
                 continue
-            try:
-                with conn:
-                    rows = get_all_projects(conn)
-                    db_schema_ver = get_db_schema_version(conn)
-            finally:
-                pass  # connection managed by connection.py cache
+            with conn:
+                rows = get_all_projects(conn)
+                db_schema_ver = get_db_schema_version(conn)
             for r in rows:
                 cc_stale = (
                     _is_stale(
@@ -480,16 +466,13 @@ def reset_index(
     except DatabaseCorruptionError:
         corrupt = True
     else:
-        try:
-            with conn:
-                cfg_data = get_active_config(conn, project_id)
-                if cfg_data:
-                    sym_count = conn.execute(
-                        "SELECT COUNT(*) FROM symbols WHERE config_hash=?",
-                        (cfg_data["config_hash"],),
-                    ).fetchone()[0]
-        finally:
-            pass  # connection managed by connection.py cache
+        with conn:
+            cfg_data = get_active_config(conn, project_id)
+            if cfg_data:
+                sym_count = conn.execute(
+                    "SELECT COUNT(*) FROM symbols WHERE config_hash=?",
+                    (cfg_data["config_hash"],),
+                ).fetchone()[0]
     info: dict[str, object] = {
         "project_root": str(root),
         "db": str(db_path),
@@ -625,14 +608,13 @@ def _reindex_parse_and_store(
     from ...indexer.db import write_lock as db_write_lock
     from ...indexer.ops import store_symbols_for_unit
     from ...indexer.symbols import (
-        Reference,
         extract_all,
     )
     from ..background import _request_bg_reindex_pause, _resume_bg_reindex
 
     config_hash = cfg_data["config_hash"]
 
-    parsed_units: list[tuple[TU, "ExtractionResult"]] = []
+    parsed_units: list[tuple[TU, ExtractionResult]] = []
     skipped_tus: list[str] = []
     for unit in matching:
         try:
@@ -752,7 +734,7 @@ def _reindex_post_write_phases(
     if cfg.llm.enabled and cfg.llm.analyze_symbols and total_symbols > 0:
         try:
             from ...cache_client import CacheClient
-            from ...indexer.runner import _build_llm_analysis
+            from ...indexer._llm_analysis import _build_llm_analysis
             try:
                 stored_av = bool(
                     conn.execute(
@@ -895,7 +877,6 @@ def reindex_file_impl(
             conn.execute("PRAGMA optimize")
         except sqlite3.Error:
             pass
-        pass  # connection managed by connection.py cache
         _invalidate_conn_cache(str(db_path.resolve()))
 
 

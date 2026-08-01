@@ -28,8 +28,10 @@ from fw_context_mcp.mcp.handlers.maintenance import (  # noqa: E402
     reindex_file,
     reset_index,
 )
-from fw_context_mcp.mcp.handlers.search import (  # noqa: E402
+from fw_context_mcp.mcp.handlers._lookup import (  # noqa: E402
     lookup_symbol,
+)
+from fw_context_mcp.mcp.handlers.search import (  # noqa: E402
     search_code,
     semantic_search,
     smart_search,

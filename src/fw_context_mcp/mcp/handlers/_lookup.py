@@ -3,18 +3,16 @@
 from __future__ import annotations
 
 import logging
-from pathlib import Path
+import sqlite3
 from typing import Annotated
 
 from pydantic import Field
 
-from fw_context_mcp.config import derive_project_id
-from fw_context_mcp.indexer.db import get_active_config, lookup_macro
-from fw_context_mcp.utils import abs_path, resolve_project_root
-from fw_context_mcp.mcp.shared.context import _db_path, _open_db_safe
-from fw_context_mcp.mcp.shared.stale import _with_stale_recovery
+from fw_context_mcp.indexer.db import lookup_macro
 from fw_context_mcp.mcp.handlers._search_fallbacks import _symbol_row_to_dict
-
+from fw_context_mcp.mcp.shared.context import _db_path
+from fw_context_mcp.mcp.shared.stale import _with_stale_recovery
+from fw_context_mcp.utils import abs_path, resolve_project_root
 
 LOOKUP_EXACT_SQL = """SELECT s.* FROM symbols s
    WHERE s.config_hash=? AND (s.name=? OR s.qualified_name=?)
