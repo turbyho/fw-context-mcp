@@ -284,6 +284,15 @@ def run(
     # INSERT/DELETE/UPDATE would otherwise pay per-row FTS index overhead
     # (~2× write I/O).  The FTS table is rebuilt from scratch in one pass
     # after all TUs are stored.
+    # If a previous run crashed after drop_fts_triggers() but before
+    # rebuild_fts(), the triggers are missing — repair now so FTS stays
+    # consistent during this run.
+    cur = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='trigger' AND name='symbols_ai'"
+    )
+    if cur.fetchone() is None:
+        log.info("FTS5 triggers missing (possibly from a crashed run) — rebuilding FTS first")
+        rebuild_fts(conn)
     drop_fts_triggers(conn)
 
     total_syms = 0
