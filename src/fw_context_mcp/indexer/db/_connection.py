@@ -1,20 +1,18 @@
 """SQLite connection management for fw-context-mcp index."""
 
-import fcntl
 import logging
-import os
 import sqlite3
+import time as _time
 from collections.abc import Generator
 from contextlib import contextmanager
 from pathlib import Path
 
 __all__ = [
     "DatabaseCorruptionError",
-    "WriteLockTimeout",
+    "ensure_schema",
     "get_db_schema_version",
     "open_db",
     "transaction",
-    "write_lock",
 ]
 
 from fw_context_mcp.indexer.db._schema import (
@@ -41,52 +39,6 @@ class DatabaseCorruptionError(sqlite3.DatabaseError):
         super().__init__(f"Database corruption detected at {db_path}: {details}")
 
 
-class WriteLockTimeout(Exception):
-    """Raised when the write lock cannot be acquired within the timeout."""
-
-
-@contextmanager
-def write_lock(db_dir: Path, timeout: float = 60.0) -> Generator[None, None, None]:
-    """Acquire an exclusive write lock for the index directory.
-
-    Serializes all write operations (symbol storage, LLM analysis, embeddings)
-    across processes.  Uses ``fcntl.flock`` — the kernel releases the lock
-    automatically on process exit, so a crash never leaves a stale lock.
-
-    Blocks for up to *timeout* seconds; raises ``WriteLockTimeout`` when the
-    lock cannot be acquired in time.  Callers should catch and propagate
-    the error gracefully — never retry indefinitely.
-
-    Args:
-        db_dir: Directory containing the index database (lock file is
-            ``<db_dir>/write.lock``).
-        timeout: Maximum time to wait for the lock, in seconds (default 60).
-
-    Raises:
-        WriteLockTimeout: Lock could not be acquired within *timeout*.
-    """
-    import time as _time
-
-    lock_file = db_dir / "write.lock"
-    fd = os.open(lock_file, os.O_CREAT | os.O_RDWR)
-    deadline = _time.monotonic() + timeout
-    acquired = False
-    try:
-        while True:
-            try:
-                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                acquired = True
-                break
-            except BlockingIOError:
-                if _time.monotonic() > deadline:
-                    raise WriteLockTimeout(f"Could not acquire write lock for {db_dir} within {timeout:.0f}s") from None
-                _time.sleep(0.5)
-        yield
-    finally:
-        if acquired:
-            fcntl.flock(fd, fcntl.LOCK_UN)
-        os.close(fd)
-
 def _configure_connection(conn: sqlite3.Connection) -> None:
     """Apply standard PRAGMAs and extensions to a freshly opened connection."""
     conn.execute("PRAGMA busy_timeout = 10000")
@@ -104,118 +56,26 @@ def _configure_connection(conn: sqlite3.Connection) -> None:
         pass
 
 
-def open_db(path: Path, *, skip_integrity_check: bool = False, check_same_thread: bool = True) -> sqlite3.Connection:
-    """Open SQLite database at *path*, enabling WAL mode and loading extensions.
+def ensure_schema(conn: sqlite3.Connection) -> None:
+    """Run schema creation, migrations, and self-healing on an open connection.
 
-    Creates the parent directory if missing.  Configures WAL journal mode,
-    foreign keys, and a 30 s busy timeout.  Loads the ``sqlite-vec`` extension
-    (best-effort — silently skipped when unavailable).
+    Idempotent — safe to call on every connection open.  The version-gate
+    skips the expensive migration block when the on-disk schema is current.
 
-    Runs the full schema and migrations in sequence:
-
-    1. Executes ``_SCHEMA`` (CREATE TABLE IF NOT EXISTS, indexes, triggers).
-    2. Applies add-column migrations from ``_MIGRATION_ADD_COLUMNS``
-       (idempotent — skips duplicate column errors).
-    3. Backfills ``symbols.file_path`` from ``files.path`` for rows with
-       empty ``file_path`` (migration for old indexes).
-    4. Backfills ``symbols.name_tokens`` via Python ``split_tokens()``
-       (SQLite cannot call Python functions).
-     5. Rebuilds ``symbols_fts`` FTS5 virtual table when it lacks the
-        ``name_tokens`` column (older schema).
-      6. Backfills ``symbols.summary/inputs/outputs`` from ``llm_analysis``
-         table, then rebuilds FTS5 again when it lacks those columns.
-      7. Initialises the ``vec_symbols`` vec0 table (best-effort).
-      8. Unconditionally ensures ``files_fts`` FTS5 table exists (self-healing
-         when a migration was interrupted — see ``_CRITICAL_TABLES`` for the
-         same pattern applied to regular tables).
-      9. Runs ``PRAGMA integrity_check`` (unless *skip_integrity_check*
-         is ``True``) — raises ``DatabaseCorruptionError`` on failure
-         (detected before any tool reads the data).
-
-    On ``OperationalError('locked')`` the connection is retried once after a
-    short sleep.  Other ``OperationalError`` and ``DatabaseError`` are
-    converted to ``DatabaseCorruptionError``.
-
-    Args:
-        path: Filesystem path to the SQLite database file.
-        skip_integrity_check: When ``True``, skip the ``PRAGMA integrity_check``
-            scan.  Use for auxiliary connections (worker threads, pooled
-            connections) where the check was already performed on the primary
-            connection.  On large databases (5+ GB) the scan takes 15–30 s
-            and saturates disk I/O.
-        check_same_thread: Passed through to ``sqlite3.connect``.  Set to
-            ``False`` when the connection will be shared across threads
-            (e.g. in a thread-safe connection cache).  Default ``True``.
-
-    Returns:
-        Open ``sqlite3.Connection`` with ``row_factory = sqlite3.Row``.
-
-    Raises:
-        DatabaseCorruptionError: When ``PRAGMA integrity_check`` fails or the
-            database is otherwise unreadable.
+    Raises the original exception on failure — the caller (``open_db``) is
+    responsible for retry logic and error conversion.
     """
-    path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(str(path), check_same_thread=check_same_thread)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA busy_timeout = 10000")  # 10s — wait on lock, don't fail
-    conn.execute("PRAGMA foreign_keys = ON")
-
-    # WAL mode — persistent on the DB file once set, but needs to be applied
-    # on first-open.  Run outside executescript() to avoid an unnecessary
-    # write transaction when the DB is already in WAL mode.
-    try:
-        conn.execute("PRAGMA journal_mode = WAL")
-    except sqlite3.DatabaseError as e:
-        conn.close()
-        raise DatabaseCorruptionError(str(path), str(e)) from e
-
-    _configure_connection(conn)
-
     # Only run the (expensive) schema/migration block when the on-disk schema
     # is outdated.  executescript() implies a write transaction — skipping it
     # when the schema is current means read-only queries never acquire a
     # write lock, even while a background reindex is writing.
-    try:
-        current_schema_ver = conn.execute("PRAGMA user_version").fetchone()[0]
-    except sqlite3.DatabaseError as e:
-        conn.close()
-        raise DatabaseCorruptionError(str(path), str(e)) from e
+    current_schema_ver = conn.execute("PRAGMA user_version").fetchone()[0]
 
     if current_schema_ver < CURRENT_SCHEMA_VERSION:
-        try:
-            conn.executescript(_SCHEMA)
-            _ensure_migrated_columns(conn)
-            _run_data_migrations(conn)
-            conn.execute(f"PRAGMA user_version = {CURRENT_SCHEMA_VERSION}")
-        except sqlite3.OperationalError as e:
-            # SQLITE_BUSY (5) = database is locked (another process has a
-            # write lock).  SQLITE_LOCKED (6) = a table within the database
-            # is locked (another process is modifying it right now).
-            if getattr(e, "sqlite_errorcode", 0) in (5, 6):
-                conn.close()
-                import time as _time
-                _time.sleep(1)
-                return open_db(path, skip_integrity_check=skip_integrity_check,
-                               check_same_thread=check_same_thread)
-            elif "no such column" in str(e):
-                _ensure_migrated_columns(conn)
-                try:
-                    conn.executescript(_SCHEMA)
-                    _run_data_migrations(conn)
-                    conn.execute(f"PRAGMA user_version = {CURRENT_SCHEMA_VERSION}")
-                except sqlite3.OperationalError as e3:
-                    conn.close()
-                    raise DatabaseCorruptionError(
-                        str(path),
-                        f"Schema migration failed after column recovery — "
-                        f"the database may be in an inconsistent state: {e3}",
-                    ) from e3
-            else:
-                conn.close()
-                raise DatabaseCorruptionError(str(path), str(e)) from e
-        except sqlite3.DatabaseError as e:
-            conn.close()
-            raise DatabaseCorruptionError(str(path), str(e)) from e
+        conn.executescript(_SCHEMA)
+        _ensure_migrated_columns(conn)
+        _run_data_migrations(conn)
+        conn.execute(f"PRAGMA user_version = {CURRENT_SCHEMA_VERSION}")
 
     # ── Unconditional column sanity check ──────────────────────────────────
     # Belt-and-suspenders: ensure all columns from _MIGRATION_ADD_COLUMNS
@@ -259,6 +119,108 @@ def open_db(path: Path, *, skip_integrity_check: bool = False, check_same_thread
     if not _table_exists(conn, "macros_fts"):
         log.info("macros_fts missing — rebuilding (self-healing)")
         rebuild_macros_fts(conn)
+
+
+def open_db(path: Path, *, skip_integrity_check: bool = False, check_same_thread: bool = True) -> sqlite3.Connection:
+    """Open SQLite database at *path*, enabling WAL mode and loading extensions.
+
+    Creates the parent directory if missing.  Configures WAL journal mode,
+    foreign keys, and a 30 s busy timeout.  Loads the ``sqlite-vec`` extension
+    (best-effort — silently skipped when unavailable).
+
+    Calls :func:`ensure_schema` to run the full schema and migrations in sequence:
+
+    1. Executes ``_SCHEMA`` (CREATE TABLE IF NOT EXISTS, indexes, triggers).
+    2. Applies add-column migrations from ``_MIGRATION_ADD_COLUMNS``
+       (idempotent — skips duplicate column errors).
+    3. Backfills ``symbols.file_path`` from ``files.path`` for rows with
+       empty ``file_path`` (migration for old indexes).
+    4. Backfills ``symbols.name_tokens`` via Python ``split_tokens()``
+       (SQLite cannot call Python functions).
+    5. Rebuilds ``symbols_fts`` FTS5 virtual table when it lacks the
+       ``name_tokens`` column (older schema).
+    6. Backfills ``symbols.summary/inputs/outputs`` from ``llm_analysis``
+       table, then rebuilds FTS5 again when it lacks those columns.
+    7. Initialises the ``vec_symbols`` vec0 table (best-effort).
+    8. Unconditionally ensures ``files_fts`` FTS5 table exists (self-healing
+       when a migration was interrupted — see ``_CRITICAL_TABLES`` for the
+       same pattern applied to regular tables).
+    9. Runs ``PRAGMA integrity_check`` (unless *skip_integrity_check*
+       is ``True``) — raises ``DatabaseCorruptionError`` on failure
+       (detected before any tool reads the data).
+
+    On ``OperationalError('locked')`` the connection is retried once after a
+    short sleep.  Other ``OperationalError`` and ``DatabaseError`` are
+    converted to ``DatabaseCorruptionError``.
+
+    Args:
+        path: Filesystem path to the SQLite database file.
+        skip_integrity_check: When ``True``, skip the ``PRAGMA integrity_check``
+            scan.  Use for auxiliary connections (worker threads, pooled
+            connections) where the check was already performed on the primary
+            connection.  On large databases (5+ GB) the scan takes 15–30 s
+            and saturates disk I/O.
+        check_same_thread: Passed through to ``sqlite3.connect``.  Set to
+            ``False`` when the connection will be shared across threads
+            (e.g. in a thread-safe connection cache).  Default ``True``.
+
+    Returns:
+        Open ``sqlite3.Connection`` with ``row_factory = sqlite3.Row``.
+
+    Raises:
+        DatabaseCorruptionError: When ``PRAGMA integrity_check`` fails or the
+            database is otherwise unreadable.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(path), check_same_thread=check_same_thread)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA busy_timeout = 10000")  # 10s — wait on lock, don't fail
+    conn.execute("PRAGMA foreign_keys = ON")
+
+    # WAL mode — persistent on the DB file once set, but needs to be applied
+    # on first-open.  Run outside executescript() to avoid an unnecessary
+    # write transaction when the DB is already in WAL mode.
+    try:
+        conn.execute("PRAGMA journal_mode = WAL")
+    except sqlite3.DatabaseError as e:
+        conn.close()
+        raise DatabaseCorruptionError(str(path), str(e)) from e
+
+    _configure_connection(conn)
+
+    # Schema + migrations — with retry on lock contention.
+    try:
+        ensure_schema(conn)
+    except sqlite3.OperationalError as e:
+        # SQLITE_BUSY (5) = database is locked (another process has a
+        # write lock).  SQLITE_LOCKED (6) = a table within the database
+        # is locked (another process is modifying it right now).
+        if getattr(e, "sqlite_errorcode", 0) in (5, 6):
+            conn.close()
+            _time.sleep(1)
+            return open_db(path, skip_integrity_check=skip_integrity_check,
+                           check_same_thread=check_same_thread)
+        elif "no such column" in str(e):
+            _ensure_migrated_columns(conn)
+            try:
+                conn.executescript(_SCHEMA)
+                _run_data_migrations(conn)
+                conn.execute(f"PRAGMA user_version = {CURRENT_SCHEMA_VERSION}")
+                # Re-run the self-healing parts of ensure_schema
+                ensure_schema(conn)
+            except sqlite3.OperationalError as e3:
+                conn.close()
+                raise DatabaseCorruptionError(
+                    str(path),
+                    f"Schema migration failed after column recovery — "
+                    f"the database may be in an inconsistent state: {e3}",
+                ) from e3
+        else:
+            conn.close()
+            raise DatabaseCorruptionError(str(path), str(e)) from e
+    except sqlite3.DatabaseError as e:
+        conn.close()
+        raise DatabaseCorruptionError(str(path), str(e)) from e
 
     # Integrity check — detect corruption early, before any tool uses the DB.
     # Skip for auxiliary connections (worker threads, pooled connections)
