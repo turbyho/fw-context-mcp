@@ -570,6 +570,9 @@ def _reindex_cleanup_deleted_file(
     except ValueError:
         tu_rel = file_path_str
 
+    from ...mcp.shared.stale import _invalidate_modified_cache
+    _invalidate_modified_cache(config_hash)
+
     with bg_reindex_pause(root):
         with _db_write_lock(db_path.parent, timeout=60.0):
             with transaction(conn):
@@ -592,9 +595,6 @@ def _reindex_cleanup_deleted_file(
             "symbols_removed": symbol_count,
             "action": "deleted",
         }
-    from ...mcp.shared.stale import _invalidate_modified_cache
-
-    _invalidate_modified_cache(config_hash)
 
 
 def _reindex_parse_and_store(

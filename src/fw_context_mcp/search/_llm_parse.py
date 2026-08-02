@@ -13,6 +13,7 @@ import re
 log = logging.getLogger(__name__)
 
 _SAFE_FTS5_TOKEN = re.compile(r"^[\w*]+$")
+_BOGUS = frozenset({"json", "[]"})
 
 
 def parse_llm_search_terms(raw: str) -> list[str]:
@@ -37,6 +38,5 @@ def parse_llm_search_terms(raw: str) -> list[str]:
             cleaned = re.sub(r"^[\s\d\.\-\*]+", "", line).strip().strip("`'\"*")
             if cleaned and not cleaned.startswith("#") and _SAFE_FTS5_TOKEN.match(cleaned):
                 terms.append(cleaned)
-    _BOGUS = frozenset({"json", "[]"})
     return [t.strip() for t in terms
             if t and t.lower() not in _BOGUS]

@@ -62,7 +62,7 @@ mcp = FastMCP(
 # _db_path, _resolve_context, _open_db_safe, _is_stale — see mcp/shared/context.py
 
 
-# _stale_files, _count_modified_files, _auto_reindex_stale — re-exported from .shared.stale
+# _stale_files, _count_modified_files — re-exported from .shared.stale
 
 # ── Background reindex ──────────────────────────────────────────────────────
 

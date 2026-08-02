@@ -79,6 +79,10 @@ def get_local_cache_db(readonly: bool = False) -> sqlite3.Connection:
         readonly = False
     uri = f"file://{_LOCAL_CACHE_PATH}?mode={'ro' if readonly else 'rwc'}"
     conn = sqlite3.connect(uri, uri=True)
+    try:
+        _LOCAL_CACHE_PATH.chmod(0o600)
+    except OSError:
+        pass
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA busy_timeout=5000")
     conn.execute(

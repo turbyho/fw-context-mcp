@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import ipaddress
 import logging
-import sys
 import tomllib
 from collections import OrderedDict
 from collections.abc import Callable
@@ -715,6 +714,31 @@ def _ensure_project_local_config(project_root: Path) -> Path:
     )
 
 
+def _validate_config_safety(proj_data: dict, proj_path: Path) -> None:
+    """Raise RuntimeError if committed config contains security-sensitive settings.
+
+    Committed config (.fw-context/config.toml) is shared via git.  Dangerous
+    settings should only be in local.toml (gitignored).
+    """
+    build = proj_data.get("build") or {}
+    for key in ("pre_build", "command"):
+        if build.get(key):
+            raise RuntimeError(
+                f"SECURITY: {key} is set in .fw-context/config.toml "
+                f"(committed).  This allows anyone with commit access to run "
+                f"arbitrary shell commands on other developers' machines.  "
+                f"Move {key} to .fw-context/local.toml (gitignored) instead."
+            )
+
+    ollama_url = (proj_data.get("llm") or {}).get("ollama_url")
+    if ollama_url and not _is_loopback_url(ollama_url):
+        raise RuntimeError(
+            f"SECURITY: ollama_url ({ollama_url}) in .fw-context/config.toml "
+            f"(committed) points to a non-local host.  Source code snippets in "
+            f"LLM prompts would be sent to that host.  Use localhost or move "
+            f"ollama_url to .fw-context/local.toml (gitignored) instead."
+        )
+
 def _is_loopback_url(url: str) -> bool:
     """True if *url*'s host is a loopback address.
 
@@ -782,18 +806,10 @@ def load(project_root: Path | None = None) -> Config:
         except (OSError, ValueError):
             log.exception("Failed to parse %s — ignoring project config", proj_path)
 
-        # Security: pre_build in committed config.toml is a risk — anyone
-        # who can commit can run arbitrary shell commands on other devs'
-        # machines.  pre_build should only be in local.toml (gitignored).
-        if (proj_data.get("build") or {}).get("pre_build"):
-            msg = (
-                "⚠ SECURITY: pre_build is set in .fw-context/config.toml "
-                "(committed).  This allows anyone with commit access to run "
-                "arbitrary shell commands.  Move pre_build to "
-                ".fw-context/local.toml (gitignored) instead."
-            )
-            log.warning(msg)
-            print(msg, file=sys.stderr)
+        # Security: validate committed config doesn't contain dangerous settings.
+        # pre_build, command, and non-loopback ollama_url in committed config.toml
+        # are potential RCE / data exfiltration vectors.
+        _validate_config_safety(proj_data, proj_path)
 
         assert local_path is not None
         try:
@@ -801,21 +817,6 @@ def load(project_root: Path | None = None) -> Config:
             data = _deep_merge(data, local_data)
         except (OSError, ValueError):
             log.exception("Failed to parse %s — ignoring local config", local_path)
-
-        # Security: a committed or local config can redirect LLM calls (which
-        # include source-code snippets) to an arbitrary host. Warn loudly.
-        final_url = (data.get("llm") or {}).get("ollama_url")
-        if final_url and not _is_loopback_url(final_url):
-            log.warning(
-                "Config sets a non-local ollama_url (%s). "
-                "Source-code snippets in LLM prompts will be sent to that host.",
-                final_url,
-            )
-            print(
-                f"⚠ WARNING: non-local ollama_url ({final_url}) — "
-                "source code will be sent to an external host.",
-                file=sys.stderr,
-            )
 
     cfg = _from_dict(data)
     from ..llm.auto_model import resolve_embed_model

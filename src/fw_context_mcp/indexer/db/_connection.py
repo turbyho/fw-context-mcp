@@ -52,7 +52,7 @@ def _configure_connection(conn: sqlite3.Connection) -> None:
         conn.enable_load_extension(True)
         import sqlite_vec
         sqlite_vec.load(conn)
-    except (ImportError, Exception):
+    except (ImportError, sqlite3.Error, RuntimeError, OSError):
         pass
 
 
@@ -100,8 +100,6 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
     try:
         init_vec_table(conn)
     except (sqlite3.Error, RuntimeError) as e:
-        if isinstance(e, (KeyboardInterrupt, SystemExit)):
-            raise
         log.warning(
             "sqlite-vec vector table initialization failed — semantic search will use legacy BLOB fallback: %s",
             e,
@@ -173,6 +171,11 @@ def open_db(path: Path, *, skip_integrity_check: bool = False, check_same_thread
     """
     path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(path), check_same_thread=check_same_thread)
+    # Ensure DB file is only readable by the owner (defense in depth).
+    try:
+        path.chmod(0o600)
+    except OSError:
+        pass
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA busy_timeout = 10000")  # 10s — wait on lock, don't fail
     conn.execute("PRAGMA foreign_keys = ON")
@@ -277,4 +280,4 @@ def transaction(conn: sqlite3.Connection, checkpoint: bool = True) -> Generator[
         try:
             conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
         except sqlite3.Error:
-            pass  # best-effort — data was already committed; KeyboardInterrupt won't reach here (guarded above)
+            pass  # best-effort — data was already committed

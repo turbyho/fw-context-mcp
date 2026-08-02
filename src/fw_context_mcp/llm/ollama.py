@@ -210,8 +210,6 @@ def call_ollama(
         if e.response.status_code == 404:
             raise OllamaModelNotFoundError(cfg.model, cfg.ollama_url) from e
         raise OllamaError(f"Ollama HTTP {e.response.status_code}: {e.response.text[:200]}") from e
-    except OllamaError:
-        raise  # Pass through — prevents wrapping by the broad except Exception below
     except (httpx.HTTPError, OSError, KeyError, json.JSONDecodeError, ValueError) as e:
         raise OllamaError(str(e)) from e
 
@@ -287,8 +285,6 @@ def _call_ollama_embed_impl(
         ) from e
     except httpx.TimeoutException:
         raise OllamaError("Ollama embed request timed out") from None
-    except OllamaError:
-        raise
     except (httpx.HTTPError, OSError, KeyError, json.JSONDecodeError, ValueError) as e:
         raise OllamaError(str(e)) from e
 
@@ -307,10 +303,8 @@ def call_ollama_embed(inputs: list[str], cfg: LLMConfig, *, query: bool = True) 
 class OllamaEmbedder(Embedder):
     """Embedding backend that delegates to Ollama's HTTP API.
 
-    Thin wrapper around ``call_ollama_embed`` that satisfies the ``Embedder``
-    interface.  The standalone ``call_ollama_embed`` function is kept for
-    backward compatibility with ``experiments/`` scripts — it simply
-    forwards to :meth:`embed_documents` / :meth:`embed_queries`.
+    Thin wrapper around :func:`_call_ollama_embed_impl` that satisfies the
+    ``Embedder`` interface.
     """
 
     def __init__(self, cfg: LLMConfig) -> None:

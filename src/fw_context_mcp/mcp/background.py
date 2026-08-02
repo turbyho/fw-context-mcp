@@ -33,7 +33,8 @@ def _spawn_daemon(root: Path) -> None:
     db_path = _db_path(root)
     log_file = db_path.parent / "daemon.log"
     try:
-        log_fh = open(log_file, "a", encoding="utf-8")
+        fd = os.open(log_file, os.O_NOFOLLOW | os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
+        log_fh = os.fdopen(fd, "a", encoding="utf-8", closefd=True)
         subprocess.Popen(
             [sys.executable, "-u", "-m", "fw_context_mcp.mcp.daemon", str(root)],
             start_new_session=True,
@@ -42,7 +43,7 @@ def _spawn_daemon(root: Path) -> None:
         )
         log_fh.close()
         # Daemon process runs independently via start_new_session=True — no detach needed
-    except (ValueError, TypeError, RuntimeError, AttributeError):
+    except (OSError, ValueError, TypeError, RuntimeError, AttributeError):
         log.exception("Failed to spawn watcher daemon for %s", root)
 
 # ── _is_bg_reindex_running (was at server.py:367) ──

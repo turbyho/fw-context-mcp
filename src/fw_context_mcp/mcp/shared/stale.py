@@ -9,7 +9,7 @@ import time
 from pathlib import Path
 
 from ...config import derive_project_id
-from ...indexer.db import get_active_config, get_file_mtime_indexed
+from ...indexer.db import get_active_config
 from ...utils import MTIME_TOLERANCE_S, abs_path
 from .context import _open_db_or_return
 
@@ -110,8 +110,8 @@ def _stale_files(conn, config_hash: str, file_paths: list[str], root: Path) -> l
     manifest = load_manifest(db_path.parent)
     build_patterns = manifest.get("build_dir_patterns", []) if manifest else []
 
-    # Build work items: deduplicate paths, resolve DB keys
-    work_items: list[tuple[str, str, float]] = []  # (abs_path, db_key, stored_mtime)
+    # Build work items: batch-fetch stored mtimes in one query (was N+1).
+    normalized: list[tuple[str, str]] = []  # (abs_path, db_key)
     seen: set[str] = set()
     for path in dict.fromkeys(file_paths):
         if path in seen:
@@ -120,10 +120,26 @@ def _stale_files(conn, config_hash: str, file_paths: list[str], root: Path) -> l
         if _path_matches_patterns(path, build_patterns):
             continue
         db_key = _normalize_file_path(path, root)
-        stored = get_file_mtime_indexed(conn, config_hash, db_key)
-        if not stored:
-            continue
-        work_items.append((path, db_key, stored))
+        normalized.append((path, db_key))
+
+    if not normalized:
+        return []
+
+    # Batch lookup: one SELECT for all keys
+    keys = [db_key for _, db_key in normalized]
+    placeholders = ",".join("?" * len(keys))
+    rows = conn.execute(
+        f"SELECT path, mtime FROM files WHERE config_hash = ? AND path IN ({placeholders})",
+        (config_hash, *keys),
+    ).fetchall()
+    stored_map: dict[str, float] = {r["path"]: r["mtime"] for r in rows}
+
+    # Build work items with resolved mtimes
+    work_items: list[tuple[str, str, float]] = []  # (abs_path, db_key, stored_mtime)
+    for file_path, db_key in normalized:
+        stored = stored_map.get(db_key)
+        if stored is not None:
+            work_items.append((file_path, db_key, stored))
 
     if not work_items:
         return []
@@ -242,36 +258,6 @@ def _count_modified_files(
     return modified
 
 
-def _auto_reindex_stale(
-    stale_files: list[str],
-    project_root: Path,
-    max_files: int = 5,
-    timeout_s: float = 120.0,
-) -> tuple[list[str], list[str]]:
-    """Re-index up to *max_files* stale files, bounded by *timeout_s*.
-
-    Calls ``reindex_file_impl`` **without** LLM analysis or override
-    regeneration — those are left for the background ``fw-context index``
-    subprocess.  This keeps query-time recovery fast while the full
-    reindex (including LLM analysis) catches up in the background.
-    """
-    from ..handlers.maintenance import reindex_file_impl  # lazy — avoids circular import
-
-    succeeded: list[str] = []
-    failed: list[str] = []
-    t0 = time.monotonic()
-    for fp in stale_files[:max_files]:
-        if time.monotonic() - t0 > timeout_s:
-            break
-        try:
-            result = reindex_file_impl(fp, str(project_root), with_analysis=False)
-            if result.get("error"):
-                failed.append(fp)
-            else:
-                succeeded.append(fp)
-        except (sqlite3.Error, RuntimeError, OSError):
-            failed.append(fp)
-    return succeeded, failed
 
 
 # ── Header dependency staleness ──

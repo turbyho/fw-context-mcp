@@ -26,6 +26,7 @@ import os
 import re
 import signal
 import socket
+import sqlite3
 import sys
 import time
 from pathlib import Path
@@ -402,7 +403,8 @@ async def _run_index_async(
     """
     log_file = db_dir / "reindex.log"
     try:
-        log_fh = open(log_file, "w")
+        fd = os.open(log_file, os.O_NOFOLLOW | os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
+        log_fh = os.fdopen(fd, "w", closefd=True)
     except OSError:
         log_fh = _DEVNULL  # type: ignore[assignment]
 
@@ -512,7 +514,7 @@ def _optimize_db(db_dir: Path) -> None:
         return
     try:
         conn.execute("PRAGMA optimize")
-    except (ValueError, TypeError, RuntimeError, AttributeError):
+    except (sqlite3.Error, ValueError, TypeError, RuntimeError, AttributeError):
         log.debug("PRAGMA optimize failed", exc_info=True)
     finally:
         conn.close()

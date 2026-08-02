@@ -89,72 +89,75 @@ def suggest(
             return []
         _in_flight.add(cache_key)
 
-    t0 = time.monotonic()
-    candidates = _load_names(conn, config_hash)
-    if not candidates:
-        return []
+    try:
+        t0 = time.monotonic()
+        candidates = _load_names(conn, config_hash)
+        if not candidates:
+            return []
 
-    query_tokens = _tokenize(name)
-    log.debug("did-you-mean: loaded %d candidates in %.2fs for '%s'",
-              len(candidates), time.monotonic() - t0, name)
-    if not query_tokens:
-        return []
+        query_tokens = _tokenize(name)
+        log.debug("did-you-mean: loaded %d candidates in %.2fs for '%s'",
+                  len(candidates), time.monotonic() - t0, name)
+        if not query_tokens:
+            return []
 
-    # Build token → candidate index for efficient filtering
-    token_index: dict[str, list[str]] = defaultdict(list)
-    # Prefix index: first 3 chars → set of tokens — narrows O(n) scan to O(1)
-    prefix_index: dict[str, set[str]] = defaultdict(set)
-    # Short prefix index for 2-char tokens — avoids O(n) scan over all tokens
-    prefix_index_short: dict[str, set[str]] = defaultdict(set)
-    for c in candidates:
-        for t in _tokenize(c):
-            token_index[t].append(c)
-            if len(t) >= 3:
-                prefix_index[t[:3]].add(t)
-            elif len(t) == 2:
-                prefix_index_short[t].add(t)
+        # Build token → candidate index for efficient filtering
+        token_index: dict[str, list[str]] = defaultdict(list)
+        # Prefix index: first 3 chars → set of tokens — narrows O(n) scan to O(1)
+        prefix_index: dict[str, set[str]] = defaultdict(set)
+        # Short prefix index for 2-char tokens — avoids O(n) scan over all tokens
+        prefix_index_short: dict[str, set[str]] = defaultdict(set)
+        for c in candidates:
+            for t in _tokenize(c):
+                token_index[t].append(c)
+                if len(t) >= 3:
+                    prefix_index[t[:3]].add(t)
+                elif len(t) == 2:
+                    prefix_index_short[t].add(t)
 
-    # Score candidates that share at least one token with the query
-    scored: dict[str, float] = {}
-    for qt in query_tokens:
-        # Exact matches
-        for c in token_index.get(qt, []):
-            if c not in scored:
-                scored[c] = 0.0
-        # Narrow scan for prefix matches by token length tier
-        if len(qt) >= 3:
-            candidate_tokens = prefix_index.get(qt[:3], set())
-        elif len(qt) == 2:
-            candidate_tokens = prefix_index_short.get(qt, set())
-        else:
-            candidate_tokens = set()  # 1-char: exact matches only
-        for token in candidate_tokens:
-            if token.startswith(qt) and token != qt:
-                for c in token_index.get(token, []):
-                    if c not in scored:
-                        scored[c] = 0.0
+        # Score candidates that share at least one token with the query
+        scored: dict[str, float] = {}
+        for qt in query_tokens:
+            # Exact matches
+            for c in token_index.get(qt, []):
+                if c not in scored:
+                    scored[c] = 0.0
+            # Narrow scan for prefix matches by token length tier
+            if len(qt) >= 3:
+                candidate_tokens = prefix_index.get(qt[:3], set())
+            elif len(qt) == 2:
+                candidate_tokens = prefix_index_short.get(qt, set())
+            else:
+                candidate_tokens = set()  # 1-char: exact matches only
+            for token in candidate_tokens:
+                if token.startswith(qt) and token != qt:
+                    for c in token_index.get(token, []):
+                        if c not in scored:
+                            scored[c] = 0.0
 
-    # Score each shortlisted candidate
-    results: list[tuple[str, float]] = []
-    for c, _ in scored.items():
-        c_tokens = _tokenize(c)
-        score = _token_score(list(query_tokens), list(c_tokens))
-        if score > 0:
-            results.append((c, score))
+        # Score each shortlisted candidate
+        results: list[tuple[str, float]] = []
+        for c, _ in scored.items():
+            c_tokens = _tokenize(c)
+            score = _token_score(list(query_tokens), list(c_tokens))
+            if score > 0:
+                results.append((c, score))
 
-    # Sort by score descending, then by name length (shorter = less noise)
-    results.sort(key=lambda x: (-x[1], len(x[0])))
+        # Sort by score descending, then by name length (shorter = less noise)
+        results.sort(key=lambda x: (-x[1], len(x[0])))
 
-    matches = [r[0] for r in results[:limit]]
+        matches = [r[0] for r in results[:limit]]
 
-    with _cache_lock:
-        _in_flight.discard(cache_key)
-        if _cache:
-            if len(_cache) >= _MAX_CACHE:
-                _cache.pop(next(iter(_cache)))
-        _cache[cache_key] = (time.monotonic(), matches)
+        with _cache_lock:
+            if _cache:
+                if len(_cache) >= _MAX_CACHE:
+                    _cache.pop(next(iter(_cache)))
+            _cache[cache_key] = (time.monotonic(), matches)
 
-    return matches
+        return matches
+    finally:
+        with _cache_lock:
+            _in_flight.discard(cache_key)
 
 
 def _token_score(query_tokens: list[str], candidate_tokens: list[str]) -> float:

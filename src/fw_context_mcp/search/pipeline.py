@@ -194,8 +194,9 @@ class PipelineRunner:
                 ctx = await phase.run(ctx)
                 elapsed = time.monotonic() - t0
                 log.debug("Phase %r completed in %.2fs", phase_name, elapsed)
-            except Exception as exc:
-                if isinstance(exc, (KeyboardInterrupt, SystemExit)):
+            except BaseException as exc:
+                from fw_context_mcp.utils import is_fatal
+                if is_fatal(exc):
                     raise
                 if isinstance(exc, (ValueError, TypeError, AttributeError, RuntimeError)):
                     log.exception("Phase %r crashed — this is likely a bug", phase_name)

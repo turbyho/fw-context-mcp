@@ -56,8 +56,14 @@ def resolve_macros_via_preprocessor(
             cmd = _sanitize_flags(cmd)
             result = subprocess.run(
                 cmd, capture_output=True, text=True, timeout=timeout,
-            cwd=file_path.parent if file_path.parent.exists() else Path.cwd(),
+                cwd=file_path.parent if file_path.parent.exists() else Path.cwd(),
             )
+        except FileNotFoundError:
+            log.debug("clang binary not found: %s — macro expansion skipped", clang_binary)
+            return {}
+        except subprocess.TimeoutExpired:
+            log.debug("clang -dM -E timed out after %.1fs for %s", timeout, file_path.name)
+            return {}
         finally:
             Path(tmp_path).unlink(missing_ok=True)
     else:
@@ -190,13 +196,14 @@ def resolve_and_update(
     if not expanded:
         return 0
 
-    updated = 0
-    for name, value in expanded.items():
-        cur = conn.execute(
-            "UPDATE macros SET expanded_value = ? WHERE config_hash = ? AND name = ? AND expanded_value = ''",
-            (value, config_hash, name),
-        )
-        updated += cur.rowcount
+    # executemany: single batch UPDATE instead of N individual queries
+    rows = [(value, config_hash, name) for name, value in expanded.items()]
+    before = conn.total_changes
+    conn.executemany(
+        "UPDATE macros SET expanded_value = ? WHERE config_hash = ? AND name = ? AND expanded_value = ''",
+        rows,
+    )
+    updated = conn.total_changes - before
     if updated:
         conn.commit()  # defensive: _run_postprocess doesn't commit after this point
     return updated
