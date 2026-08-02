@@ -803,13 +803,12 @@ def load(project_root: Path | None = None) -> Config:
         try:
             proj_data = tomllib.loads(proj_path.read_text())
             data = _deep_merge(data, proj_data)
+            # Security: validate committed config doesn't contain dangerous settings.
+            # pre_build, command, and non-loopback ollama_url in committed config.toml
+            # are potential RCE / data exfiltration vectors.
+            _validate_config_safety(proj_data, proj_path)
         except (OSError, ValueError):
             log.exception("Failed to parse %s — ignoring project config", proj_path)
-
-        # Security: validate committed config doesn't contain dangerous settings.
-        # pre_build, command, and non-loopback ollama_url in committed config.toml
-        # are potential RCE / data exfiltration vectors.
-        _validate_config_safety(proj_data, proj_path)
 
         assert local_path is not None
         try:
@@ -817,6 +816,21 @@ def load(project_root: Path | None = None) -> Config:
             data = _deep_merge(data, local_data)
         except (OSError, ValueError):
             log.exception("Failed to parse %s — ignoring local config", local_path)
+
+    # Security: warn when merged config (committed + local) sets a non-loopback
+    # ollama_url.  Committed config is already rejected by _validate_config_safety
+    # above; this catches the local.toml case — still a privacy risk, but not a
+    # supply-chain vector, so a warning (not RuntimeError) is appropriate.
+    final_url = (data.get("llm") or {}).get("ollama_url")
+    if final_url and not _is_loopback_url(final_url):
+        msg = (
+            f"WARNING: non-local ollama_url ({final_url}) — "
+            "source-code snippets in LLM prompts will be sent to an external host. "
+            "Consider using a local model instead."
+        )
+        log.warning(msg)
+        import sys
+        print(f"⚠ {msg}", file=sys.stderr)
 
     cfg = _from_dict(data)
     from ..llm.auto_model import resolve_embed_model

@@ -94,7 +94,12 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
 
     # Lazy imports — these symbols are defined in __init__.py (sibling module).
     # Deferred to avoid circular import: __init__.py imports from _connection.py.
-    from fw_context_mcp.indexer.db import init_vec_table, rebuild_files_fts, rebuild_macros_fts  # noqa: F811
+    from fw_context_mcp.indexer.db import (  # noqa: F811
+        init_vec_table,
+        rebuild_files_fts,
+        rebuild_fts,
+        rebuild_macros_fts,
+    )
 
     # Migrate vec0 table when sqlite-vec is available (idempotent CREATE IF NOT EXISTS)
     try:
@@ -117,6 +122,15 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
     if not _table_exists(conn, "macros_fts"):
         log.info("macros_fts missing — rebuilding (self-healing)")
         rebuild_macros_fts(conn)
+
+    # Unconditional symbols_fts self-healing — same pattern as files_fts
+    # and macros_fts above.  On a current-schema DB with a missing or
+    # corrupt symbols_fts (e.g. interrupted migration that stamped
+    # user_version), this recreates it so search_code/search_bodies
+    # don't raise "no such table: symbols_fts".
+    if not _table_exists(conn, "symbols_fts"):
+        log.info("symbols_fts missing — rebuilding (self-healing)")
+        rebuild_fts(conn)
 
 
 def open_db(path: Path, *, skip_integrity_check: bool = False, check_same_thread: bool = True) -> sqlite3.Connection:

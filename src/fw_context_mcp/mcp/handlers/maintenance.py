@@ -17,6 +17,7 @@ from ...indexer.compile_commands import parse as parse_cc
 from ...indexer.db import (
     CURRENT_SCHEMA_VERSION,
     DatabaseCorruptionError,
+    WriteLockTimeout,
     count_refs,
     get_active_config,
     get_all_projects,
@@ -516,6 +517,8 @@ def reset_index(
             p = db_path.with_name(db_path.name + suffix)
             p.unlink(missing_ok=True)
         _invalidate_conn_cache(str(db_path.resolve()))
+        from ...mcp.shared.stale import _invalidate_modified_cache
+        _invalidate_modified_cache()  # clear all entries — DB is gone
         info["action"] = "deleted"
         info["message"] = f"Index deleted. Run 'fw-context index' in {root} to rebuild."
     return info
@@ -574,27 +577,30 @@ def _reindex_cleanup_deleted_file(
     _invalidate_modified_cache(config_hash)
 
     with bg_reindex_pause(root):
-        with _db_write_lock(db_path.parent, timeout=60.0):
-            with transaction(conn):
-                try:
-                    conn.execute(
-                        "DELETE FROM vec_symbols WHERE symbol_id IN "
-                        "(SELECT id FROM symbols WHERE file_id = ?)",
-                        (file_id_old,),
-                    )
-                except sqlite3.OperationalError:
-                    pass
-                _del_inh(conn, config_hash, file_id_old)
-                _del_syms(conn, file_id_old)
-                _del_refs(conn, config_hash, tu_rel)
-                _del_ics(conn, config_hash, tu_rel)
-                _del_fpa(conn, config_hash, tu_rel)
-                conn.execute("DELETE FROM files WHERE id = ?", (file_id_old,))
-        return {
-            "file": str(target),
-            "symbols_removed": symbol_count,
-            "action": "deleted",
-        }
+        try:
+            with _db_write_lock(db_path.parent, timeout=60.0):
+                with transaction(conn):
+                    try:
+                        conn.execute(
+                            "DELETE FROM vec_symbols WHERE symbol_id IN "
+                            "(SELECT id FROM symbols WHERE file_id = ?)",
+                            (file_id_old,),
+                        )
+                    except sqlite3.OperationalError:
+                        pass
+                    _del_inh(conn, config_hash, file_id_old)
+                    _del_syms(conn, file_id_old)
+                    _del_refs(conn, config_hash, tu_rel)
+                    _del_ics(conn, config_hash, tu_rel)
+                    _del_fpa(conn, config_hash, tu_rel)
+                    conn.execute("DELETE FROM files WHERE id = ?", (file_id_old,))
+                return {
+                    "file": str(target),
+                    "symbols_removed": symbol_count,
+                    "action": "deleted",
+                }
+        except WriteLockTimeout as e:
+            return {"error": f"Could not acquire write lock for cleanup of {target}: {e}", "action": "timeout"}
 
 
 def _reindex_parse_and_store(
@@ -634,6 +640,9 @@ def _reindex_parse_and_store(
         except RuntimeError as exc:
             log.warning("skip TU %s during reindex: %s", unit.file.name, exc)
             skipped_tus.append(str(unit.file.name))
+
+    from ...mcp.shared.stale import _invalidate_modified_cache
+    _invalidate_modified_cache(config_hash)
 
     with bg_reindex_pause(root):
         t0 = time.monotonic()
@@ -680,10 +689,8 @@ def _reindex_parse_and_store(
                 if not parsed_units and skipped_tus:
                     return 0, {"error": f"All {len(matching)} translation unit(s) failed to parse", "skipped_tus": skipped_tus}
             return total_symbols, result
-        except sqlite3.Error as exc:
+        except (sqlite3.Error, WriteLockTimeout) as exc:
             return 0, {"error": f"DB error during reindex: {exc}"}
-    from ...mcp.shared.stale import _invalidate_modified_cache
-    _invalidate_modified_cache(config_hash)
 
 def _update_manifest_after_reindex(
     parsed_units: list,

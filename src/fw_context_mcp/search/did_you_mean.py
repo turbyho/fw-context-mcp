@@ -206,9 +206,10 @@ def _load_names(conn: sqlite3.Connection, config_hash: str) -> list[str]:
     Results are cached at module level per *config_hash* to avoid reloading
     on every uncached query.  Cache is LRU-bounded at _MAX_NAMES_CACHE entries.
     """
-    if config_hash in _names_cache:
-        _names_cache.move_to_end(config_hash)
-        return _names_cache[config_hash]
+    with _cache_lock:
+        if config_hash in _names_cache:
+            _names_cache.move_to_end(config_hash)
+            return _names_cache[config_hash]
     rows = conn.execute(
         """SELECT DISTINCT name FROM symbols
            WHERE config_hash = ?
@@ -219,7 +220,8 @@ def _load_names(conn: sqlite3.Connection, config_hash: str) -> list[str]:
         (config_hash,),
     ).fetchall()
     names = [r["name"] for r in rows]
-    if len(_names_cache) >= _MAX_NAMES_CACHE:
-        _names_cache.popitem(last=False)  # evict oldest (LRU)
-    _names_cache[config_hash] = names
+    with _cache_lock:
+        if len(_names_cache) >= _MAX_NAMES_CACHE:
+            _names_cache.popitem(last=False)  # evict oldest (LRU)
+        _names_cache[config_hash] = names
     return names
