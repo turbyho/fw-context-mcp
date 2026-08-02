@@ -394,6 +394,7 @@ def _process_unit(
     parse_timing=(0.0, 0.0),
     hashes=None,
     build_dir_patterns=None,
+    cache_client=None,
 ):
     """Process one translation unit: check staleness, parse, store.
 
@@ -518,6 +519,7 @@ def _process_unit(
                     existing_files=existing_files,
                     hashes=hashes,
                     build_dir_patterns=build_dir_patterns,
+                    cache_client=cache_client,
                 )
             t_write_end = time.monotonic()
             t_parse = t_parse_end - t_parse_start

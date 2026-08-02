@@ -216,7 +216,8 @@ def _build_embeddings(
 
     embedder = get_embedder(llm_config)
 
-    from ..llm.ollama import OllamaEmbedder
+    from ..llm.auto_model import _model_installed
+    from ..llm.ollama import OllamaEmbedder, OllamaError
     if isinstance(embedder, OllamaEmbedder):
         try:
             resp = httpx.get(llm_config.ollama_url.rstrip("/") + "/api/tags", timeout=5.0)
@@ -226,6 +227,17 @@ def _build_embeddings(
                 raise
             log.warning("Ollama not reachable — skipping embedding generation")
             return
+        if not _model_installed(llm_config.ollama_url, llm_config.embed_model):
+            if symbol_ids is not None:
+                log.warning("Embedding model not installed. Run manual reindex to pull it.")
+                return
+            log.info("Embedding model '%s' not installed, pulling...", llm_config.embed_model)
+            try:
+                from ..llm.ollama import _pull_model
+                _pull_model(llm_config.embed_model, llm_config.ollama_url)
+            except (OllamaError, httpx.HTTPError) as e:
+                log.error("Failed to pull embedding model: %s", e)
+                return
     model = _embed_model_key(embedder.name, True)
     # ── Phase 1: SELECT symbols to embed (read-only) ──
     if symbol_ids:
@@ -414,6 +426,9 @@ def _atomic_store_embeddings(
 
     Returns the total number of embedding rows stored.
     """
+    if not blob_batches and not vec_batches:
+        log.warning("No embedding batches — old embeddings preserved.")
+        return 0
     total = sum(len(b) for b in blob_batches)
     with write_lock(db_dir, timeout=30.0):
         with transaction(conn):

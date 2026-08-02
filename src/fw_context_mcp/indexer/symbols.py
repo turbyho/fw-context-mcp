@@ -344,6 +344,15 @@ def _is_fn_ptr_type(t: cx.Type) -> bool:
         if canon.kind == cx.TypeKind.POINTER:
             pointee = canon.get_pointee()
             return pointee.kind in (cx.TypeKind.FUNCTIONPROTO, cx.TypeKind.FUNCTIONNOPROTO)
+        # Fallback: template-based callback types (mbed::Callback<...>, std::function<...>)
+        spelling = canon.spelling
+        if '<' in spelling and '>' in spelling:
+            if spelling.startswith(('Callback<', 'function<', 'std::function<', 'EventHandler<')):
+                return True
+            if '::' in spelling:
+                for prefix in ('Callback<', 'function<', 'std::function<', 'EventHandler<'):
+                    if prefix in spelling:
+                        return True
     except (ValueError, TypeError, RuntimeError, AttributeError):
         _log.debug("_is_fn_ptr_type: get_canonical failed")
         pass
@@ -869,7 +878,8 @@ def _process_ref_cursor(
 
     _handle_direct_refs(cursor, cur_fn, refs, seen_ref, tu_path_str, resolve_fn)
     _handle_indirect_invocations(cursor, cur_fn, refs, indirect_call_sites,
-                                 fp_assignments, seen_ref, tu_path_str, resolve_fn, _log)
+                                 fp_assignments, seen_ref, tu_path_str, resolve_fn,
+                                 qn_to_usr, _log)
     _handle_fn_ptr_cases(cursor, cur_fn, refs, fp_assignments, seen_ref, tu_path_str, _log)
     _handle_implicit_constructors(cursor, cur_fn, refs, seen_ref, _log)
     _handle_token_fallbacks(cursor, cur_fn, refs, seen_ref, qn_to_usr, tu_path_str, _log)
@@ -979,7 +989,8 @@ def _handle_constructor_fallback(cursor, cur_fn, refs, seen_ref, tu_path_str, re
 
 
 def _handle_indirect_invocations(cursor, cur_fn, refs, indirect_call_sites,
-                                 fp_assignments, seen_ref, tu_path_str, resolve_fn, _log):
+                                 fp_assignments, seen_ref, tu_path_str, resolve_fn,
+                                 qn_to_usr, _log):
     """Indirect calls: function pointers invoked directly or passed as call arguments."""
     if cursor.kind != cx.CursorKind.CALL_EXPR:
         return
@@ -1012,10 +1023,41 @@ def _handle_indirect_invocations(cursor, cur_fn, refs, indirect_call_sites,
                     target_name=target_name, fn_ptr_type=_fn_ptr_spelling,
                 ))
 
-    _handle_fn_ptr_as_argument(cursor, cur_fn, refs, fp_assignments, seen_ref, tu_path_str, _log)
+    _handle_fn_ptr_as_argument(cursor, cur_fn, refs, fp_assignments, seen_ref, tu_path_str, qn_to_usr, _log)
 
 
-def _handle_fn_ptr_as_argument(cursor, cur_fn, refs, fp_assignments, seen_ref, tu_path_str, _log):
+
+def _extract_fn_refs_from_unexposed(
+    cursor: cx.Cursor,
+    qn_to_usr: dict[str, str],
+) -> list[tuple[str, str]]:
+    """Extract ``(USR, rhs_name)`` pairs from UNEXPOSED_EXPR tokens.
+
+    Parses token stream for ``&Class::method`` patterns and resolves
+    them against *qn_to_usr*.  Returns ``[(usr, name), ...]`` tuples
+    suitable for direct ``FnPointerAssignment`` creation.
+    """
+    results: list[tuple[str, str]] = []
+    tokens = list(cursor.get_tokens())
+    for i, tok in enumerate(tokens):
+        if tok.spelling == "&" and i + 3 < len(tokens):
+            t1, t2, t3 = tokens[i + 1], tokens[i + 2], tokens[i + 3]
+            if (t1.kind.name == "IDENTIFIER" and t2.spelling == "::"
+                    and t3.kind.name == "IDENTIFIER"):
+                partial = f"{t1.spelling}::{t3.spelling}"
+                target_usr = qn_to_usr.get(partial)
+                if not target_usr:
+                    suffix = f"::{partial}"
+                    for qn, usr in qn_to_usr.items():
+                        if qn.endswith(suffix):
+                            target_usr = usr
+                            break
+                if target_usr:
+                    results.append((target_usr, t3.spelling))
+    return results
+
+
+def _handle_fn_ptr_as_argument(cursor, cur_fn, refs, fp_assignments, seen_ref, tu_path_str, qn_to_usr, _log):
     """Function pointers passed as call arguments."""
     loc = cursor.location
     direct_callee = cursor.referenced
@@ -1029,6 +1071,28 @@ def _handle_fn_ptr_as_argument(cursor, cur_fn, refs, fp_assignments, seen_ref, t
         callee_args = list(cursor.get_arguments())
         for i, arg in enumerate(callee_args):
             targets = _find_fn_refs_in_expr(arg, direct_callee_usr)
+            # Fallback: UNEXPOSED_EXPR wrapping &Class::method
+            if not targets and arg.kind == cx.CursorKind.UNEXPOSED_EXPR:
+                unexposed_pairs = _extract_fn_refs_from_unexposed(arg, qn_to_usr)
+                if unexposed_pairs and i < len(callee_params):
+                    param = callee_params[i]
+                    if _is_fn_ptr_type(param.type):
+                        param_usr = param.get_usr()
+                        if param_usr:
+                            try:
+                                _fp_type = param.type.spelling
+                            except (ValueError, TypeError, RuntimeError, AttributeError):
+                                _log.debug("param type.spelling failed for %s", param.spelling)
+                                _fp_type = ""
+                            for target_usr, rhs_name in unexposed_pairs:
+                                if target_usr != direct_callee_usr:
+                                    fp_assignments.append(FnPointerAssignment(
+                                        from_file=loc.file.name, from_line=loc.line,
+                                        lhs_usr=param_usr, lhs_name=param.spelling,
+                                        rhs_usr=target_usr, rhs_name=rhs_name,
+                                        fn_ptr_type=_fp_type, method="call_arg",
+                                        from_usr=cur_fn,
+                                    ))
             if targets and i < len(callee_params):
                 param = callee_params[i]
                 if _is_fn_ptr_type(param.type):
@@ -1104,21 +1168,9 @@ def _handle_token_fallbacks(cursor, cur_fn, refs, seen_ref, qn_to_usr, tu_path_s
     loc = cursor.location
 
     if cursor.kind == cx.CursorKind.UNEXPOSED_EXPR:
-        tokens = list(cursor.get_tokens())
-        for i, tok in enumerate(tokens):
-            if tok.spelling == "&" and i + 3 < len(tokens):
-                t1, t2, t3 = tokens[i + 1], tokens[i + 2], tokens[i + 3]
-                if t1.kind.name == "IDENTIFIER" and t2.spelling == "::" and t3.kind.name == "IDENTIFIER":
-                    partial = f"{t1.spelling}::{t3.spelling}"
-                    target_usr = qn_to_usr.get(partial)
-                    if not target_usr:
-                        suffix = f"::{partial}"
-                        for qn, usr in qn_to_usr.items():
-                            if qn.endswith(suffix):
-                                target_usr = usr
-                                break
-                    if target_usr:
-                        _add_ref(refs, seen_ref, target_usr, loc.file.name, loc.line, cur_fn, "indirect")
+        pairs = _extract_fn_refs_from_unexposed(cursor, qn_to_usr)
+        for target_usr, _rhs_name in pairs:
+            _add_ref(refs, seen_ref, target_usr, loc.file.name, loc.line, cur_fn, "indirect")
 
     if cursor.kind == cx.CursorKind.CALL_EXPR:
         tokens = list(cursor.get_tokens())
@@ -1142,6 +1194,11 @@ def _handle_token_fallbacks(cursor, cur_fn, refs, seen_ref, qn_to_usr, tu_path_s
                 if target_usr:
                     _add_ref(refs, seen_ref, target_usr, loc.file.name, loc.line, cur_fn, "call")
 
+_BARE_CALL_KEYWORD_DENYLIST: frozenset[str] = frozenset({
+    'if', 'while', 'for', 'return', 'switch', 'catch',
+    'sizeof', 'decltype', 'typeof', 'alignof', 'noexcept',
+    'static_cast', 'dynamic_cast', 'const_cast', 'reinterpret_cast',
+})
 
 def _run_source_line_fallback(
     tu: cx.TranslationUnit,
@@ -1198,6 +1255,20 @@ def _run_source_line_fallback(
                     "Source-line fallback: no USR for %s.%s() at %s:%d",
                     _field_name, _method_name, _tu_file, _lineno,
                 )
+        # Bare call fallback: function(args) or function<T>(args)
+        for _m in _re.finditer(r'(?<![.\w])(\w+)(<[^>]+>)?\s*\(', _line):
+            _method_name = _m.group(1)
+            if _method_name in _BARE_CALL_KEYWORD_DENYLIST:
+                continue
+            _target_usr = _resolve_method_usr(_method_name, qn_to_usr)
+            if _target_usr:
+                _key = (_target_usr, _tu_file, _lineno, _line_fn, "call")
+                if _key not in seen_ref:
+                    seen_ref.add(_key)
+                    refs.append(Reference(
+                        to_usr=_target_usr, from_file=_tu_file,
+                        from_line=_lineno, from_usr=_line_fn, ref_kind="call",
+                    ))
 
 
 

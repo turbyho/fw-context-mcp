@@ -181,6 +181,7 @@ def cmd_analyze(args: argparse.Namespace) -> int:
             config_hash,
             cfg.llm,
             db_path.parent,
+            project_root=project_root,
             project_only=not analyze_vendor,
             cache_client=cc,
             retry_unparseable=True,

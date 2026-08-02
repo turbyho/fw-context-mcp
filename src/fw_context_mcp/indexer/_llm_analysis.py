@@ -66,13 +66,16 @@ def _fetch_referencers(conn, symbol_usr: str, config_hash: str) -> list[str]:
     return [r[0] for r in rows]
 
 
-def _enrich_batch(conn, batch_rows, config_hash: str) -> list[dict]:
+def _enrich_batch(conn, batch_rows, config_hash: str, *, project_root: Path | None = None) -> list[dict]:
     """Augment symbol rows with ``body`` and ``callees`` keys.
 
     Reads function/method bodies from disk and fetches callee names
     from the reference index.  Failures are non-fatal — missing body
     or callees are left as empty strings/lists.
     """
+    from ..utils import abs_path as resolve_abs_path
+
+    log = logging.getLogger(__name__)
     enriched: list[dict] = []
     for r in batch_rows:
         d = dict(r)
@@ -80,19 +83,27 @@ def _enrich_batch(conn, batch_rows, config_hash: str) -> list[dict]:
         callees: list[str] = []
 
         kind = d.get("kind", "")
-        abs_path = d.get("abs_path", "")
+        file_path = d.get("file_path", "")
         start_line = d.get("line", 0)
         end_line = d.get("end_line", 0)
         usr = d.get("usr", "")
+
+        abs_file_path = resolve_abs_path(project_root, file_path) if project_root else file_path
 
         # Read body for symbols with meaningful extents.  Enums and typedefs
         # benefit from body text during LLM analysis (enum constants, type alias).
         if (
             kind in ("function", "method", "constructor", "destructor", "class", "struct", "union", "enum", "typedef")
-            and abs_path
+            and abs_file_path
             and end_line > start_line
         ):
-            body = _read_body(abs_path, start_line, end_line)
+            body = _read_body(abs_file_path, start_line, end_line)
+            if not body and start_line > 0:
+                log.error(
+                    "[%s] empty body for %s at %s:%d-%d — "
+                    "file may be missing or path resolution broken",
+                    kind, d.get("qualified_name", "?"), abs_file_path, start_line, end_line,
+                )
 
         # Fetch callees / referencers from the reference index
         if usr:
@@ -174,7 +185,7 @@ def _select_unanalyzed_symbols(
     query = f"""SELECT s.id, s.name, s.qualified_name, s.kind, s.file_path,
                       s.signature, s.is_definition, s.docstring,
                       s.end_line, s.line, s.usr,
-                      f.path as abs_path
+                      f.path as file_path
                FROM symbols s
                JOIN files f ON s.file_id = f.id
                WHERE s.config_hash = ?
@@ -197,6 +208,7 @@ def _build_llm_analysis(
     db_dir: Path,
     *,
     project_only: bool = True,
+    project_root: Path | None = None,
     write_lock_held: bool = False,
     cache_client=None,
     retry_unparseable: bool = False,
@@ -258,7 +270,7 @@ def _build_llm_analysis(
         t0 = time.monotonic()
         qname = row["qualified_name"] or row["name"]
         try:
-            batch_dicts = _enrich_batch(conn, [row], config_hash)
+            batch_dicts = _enrich_batch(conn, [row], config_hash, project_root=project_root)
             d = batch_dicts[0]
 
             # ── Cache check — 2 tiers: local global → remote ──
