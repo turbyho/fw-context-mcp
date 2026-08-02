@@ -1,6 +1,7 @@
 """Configuration: global (~/.fw-context/config.toml), shared project (.fw-context/config.toml), and local project (.fw-context/local.toml)."""
 
 from .settings import (
+    CacheServerConfig,
     Config,
     IndexConfig,
     LLMConfig,
@@ -12,6 +13,7 @@ from .settings import (
 )
 
 __all__ = [
+    "CacheServerConfig",
     "Config",
     "IndexConfig",
     "LLMConfig",

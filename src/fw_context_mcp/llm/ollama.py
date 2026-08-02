@@ -35,6 +35,7 @@ _max_tokens_cache: dict[str, int] = {}
 # capacity, not about httpx correctness.
 _ollama_sem: threading.BoundedSemaphore = threading.BoundedSemaphore(1)
 _sem_value: int = 1
+_reconfigure_lock = threading.Lock()
 
 
 def _reconfigure_ollama_sem(max_concurrent: int) -> None:
@@ -47,9 +48,10 @@ def _reconfigure_ollama_sem(max_concurrent: int) -> None:
     global _ollama_sem, _sem_value
     if max_concurrent < 1:
         max_concurrent = 1
-    if max_concurrent != _sem_value:
-        _ollama_sem = threading.BoundedSemaphore(max_concurrent)
-        _sem_value = max_concurrent
+    with _reconfigure_lock:
+        if max_concurrent != _sem_value:
+            _ollama_sem = threading.BoundedSemaphore(max_concurrent)
+            _sem_value = max_concurrent
 
 
 @contextmanager
@@ -87,12 +89,12 @@ def _pull_model(model: str, base_url: str, *, timeout: float = 600.0) -> None:
 
 def _write_debug_log(path: Path, entry: dict) -> None:
     """Append a JSON line to the LLM debug log file."""
-    import os as _os
+    import os
 
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
-        fd = _os.open(str(path), _os.O_WRONLY | _os.O_CREAT | _os.O_APPEND, 0o600)
-        with _os.fdopen(fd, "a", encoding="utf-8") as f:
+        fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        with os.fdopen(fd, "a", encoding="utf-8") as f:
             f.write(json.dumps(entry, ensure_ascii=False) + "\n")
     except (OSError, ValueError) as e:
         log.warning("LLM debug log write failed: %s", e)
@@ -305,7 +307,7 @@ class OllamaEmbedder(Embedder):
                 if isinstance(ctx_len, int) and ctx_len > 0:
                     _max_tokens_cache[model] = ctx_len
                     return ctx_len
-        except (ValueError, TypeError, RuntimeError, AttributeError, OSError, json.JSONDecodeError):
+        except (ValueError, TypeError, OSError, json.JSONDecodeError, httpx.HTTPError):
             pass
         model_lower = model.lower()
         if "qwen3-embedding:0.6b" in model_lower or "qwen3-embedding:4b" in model_lower:

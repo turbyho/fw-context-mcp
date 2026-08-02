@@ -10,7 +10,6 @@ which re-exports everything from this module.
 from __future__ import annotations
 
 import logging
-import sqlite3
 import threading
 from pathlib import Path
 
@@ -72,7 +71,7 @@ def _check_server_ready(project_root: Path | None = None) -> Path:
             _project_ready_cache[cache_key] = (now, msg)
         raise RuntimeError(msg)
 
-    db_path = cfg.index.db_dir / cfg.project.id / "index.db"
+    db_path = _index_db_path(cfg)
     if not db_path.exists():
         msg = (
             f"No index found at {db_path}.  Run:\n"
@@ -87,12 +86,17 @@ def _check_server_ready(project_root: Path | None = None) -> Path:
     return root
 
 
+def _index_db_path(cfg) -> Path:
+    """Return the path to the index database for a loaded config."""
+    assert cfg.project.id is not None
+    return cfg.index.db_dir / cfg.project.id / "index.db"
+
 def _db_path(project_root: Path | None) -> Path:
     """Resolve the database path for a project root."""
     root = _check_server_ready(project_root)
     cfg = config.load(root)
     assert cfg.project.id is not None
-    return cfg.index.db_dir / cfg.project.id / "index.db"
+    return _index_db_path(cfg)
 
 
 def _resolve_context(project_root: str | Path | None, *, skip_ready_check: bool = False):
@@ -109,7 +113,7 @@ def _resolve_context(project_root: str | Path | None, *, skip_ready_check: bool 
         root = _check_server_ready(Path(project_root) if project_root else None)
     cfg = config.load(root)
     assert cfg.project.id is not None
-    db_path = cfg.index.db_dir / cfg.project.id / "index.db"
+    db_path = _index_db_path(cfg)
     return db_path, cfg, cfg.project.id, root
 
 
@@ -125,9 +129,9 @@ def _is_stale(cfg, compile_commands_path: Path) -> tuple[bool, str | None]:
     """
     try:
         from fw_context_mcp.utils import is_compile_commands_stale
-        created_at = cfg.get("created_at") if hasattr(cfg, "get") else cfg["created_at"]
+        created_at = cfg["created_at"]
         return is_compile_commands_stale(created_at, compile_commands_path)
-    except (KeyError, Exception):
+    except KeyError:
         return False, None
 
 
@@ -137,5 +141,6 @@ def _detect_build_system(root: Path) -> str:
         from fw_context_mcp.indexer.build import detect_build_system
         result = detect_build_system(root)
         return result if result is not None else "unknown"
-    except (ValueError, TypeError, RuntimeError, sqlite3.Error):
+    except (ValueError, TypeError, RuntimeError) as e:
+        log.debug("Build system detection failed for %s: %s", root, e)
         return "unknown"

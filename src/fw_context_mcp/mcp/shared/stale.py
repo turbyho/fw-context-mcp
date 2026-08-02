@@ -228,10 +228,10 @@ def _count_modified_files(
         if build_patterns and _path_matches_patterns(key, build_patterns):
             continue  # build-generated file — skip
         try:
-        # NOTE: individual stat() calls — O(n) for n files. On modern NVMe
-        # filesystems this is <10ms for 10K files. If slow, consider os.scandir()
-        # batch processing or caching more aggressively.
-            if Path(key).stat().st_mtime > stored_mtime + MTIME_TOLERANCE_S:
+            # NOTE: individual stat() calls — O(n) for n files. On modern NVMe
+            # filesystems this is <10ms for 10K files. If slow, consider
+            # os.scandir() batch processing or caching more aggressively.
+            if os.path.getmtime(key) > stored_mtime + MTIME_TOLERANCE_S:
                 modified += 1
         except OSError:
             pass
@@ -359,24 +359,22 @@ def _with_stale_recovery(
     if err_result is not None:
         return err_result
     assert conn is not None
-    try:
-        with conn:
-            project_id = derive_project_id(root)
-            cfg = get_active_config(conn, project_id)
-            if not cfg:
-                return [{"error": "No build config indexed."}]
-            config_hash = cfg["config_hash"]
-            result_rows = query_fn(conn, config_hash)
-            # Ensure plain dicts — sqlite3.Row objects become invalid after conn.close()
-            safe_rows: list[dict] = [dict(r) for r in result_rows]
-            stale_f = _stale_files(
-                conn,
-                config_hash,
-                [abs_path(root, r["file"]) for r in result_rows if "file" in r],
-                root,
-            )
-    finally:
-        pass  # Connection stays in cache (managed by TTL eviction in connection.py)
+    # Connection stays in cache (managed by TTL eviction in connection.py)
+    with conn:
+        project_id = derive_project_id(root)
+        cfg = get_active_config(conn, project_id)
+        if not cfg:
+            return [{"error": "No build config indexed."}]
+        config_hash = cfg["config_hash"]
+        result_rows = query_fn(conn, config_hash)
+        # Ensure plain dicts — sqlite3.Row objects become invalid after conn.close()
+        safe_rows: list[dict] = [dict(r) for r in result_rows]
+        stale_f = _stale_files(
+            conn,
+            config_hash,
+            [abs_path(root, r["file"]) for r in result_rows if "file" in r],
+            root,
+        )
 
     results: list[dict] = []
     if stale_f:

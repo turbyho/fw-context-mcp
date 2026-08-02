@@ -61,7 +61,12 @@ def _build_registry() -> dict[str, Phase]:
             IndividualTermsFallbackPhase,
             MacrosFtsFallbackPhase,
         ]:
-            instance = cls()  # type: ignore[abstract]
+            instance = cls()  # type: ignore[abstract]  # runtime check below
+            if not hasattr(instance, 'run') or not callable(instance.run):
+                raise TypeError(
+                    f"{cls.__name__} is listed as a Phase subclass but does "
+                    f"not implement abstract 'run' method"
+                )
             _REGISTRY[instance.name] = instance
 
     return _REGISTRY
@@ -192,7 +197,10 @@ class PipelineRunner:
             except Exception as exc:
                 if isinstance(exc, (KeyboardInterrupt, SystemExit)):
                     raise
-                log.warning("Phase %r failed: %s", phase_name, exc)
+                if isinstance(exc, (ValueError, TypeError, AttributeError, RuntimeError)):
+                    log.exception("Phase %r crashed — this is likely a bug", phase_name)
+                else:
+                    log.warning("Phase %r failed: %s", phase_name, exc)
                 ctx = ctx.evolve(warnings=ctx.warnings + [f"Phase {phase_name!r} failed: {exc}"])
                 # Continue with remaining phases — one phase failure
                 # shouldn't break the entire search.
