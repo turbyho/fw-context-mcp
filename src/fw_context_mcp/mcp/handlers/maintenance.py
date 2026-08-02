@@ -737,6 +737,8 @@ def _reindex_llm_analysis(
     cfg: Config,
     db_dir: Path,
     result: dict,
+    *,
+    project_root: Path,
 ) -> None:
     """Regenerate LLM symbol analysis for reindexed symbols."""
     if not (cfg.llm.enabled and cfg.llm.analyze_symbols):
@@ -759,6 +761,7 @@ def _reindex_llm_analysis(
                 conn, config_hash, cfg.llm, db_dir,
                 write_lock_held=False, retry_unparseable=True,
                 cache_client=cc, project_only=not stored_av,
+                project_root=project_root,
             )
             conn.commit()
         finally:
@@ -867,7 +870,7 @@ def _reindex_post_write_phases(
     if total_symbols <= 0:
         return result
 
-    _reindex_llm_analysis(conn, config_hash, cfg, db_dir, result)
+    _reindex_llm_analysis(conn, config_hash, cfg, db_dir, result, project_root=root)
     _reindex_overrides(conn, config_hash, cfg, db_dir, result)
     _reindex_pagerank(conn, config_hash, cfg, result)
 

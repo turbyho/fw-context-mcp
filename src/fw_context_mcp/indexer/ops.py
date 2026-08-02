@@ -37,7 +37,7 @@ from fw_context_mcp.indexer.db import (
     upsert_file,
     upsert_llm_analysis_batch,
 )
-from fw_context_mcp.utils import compute_content_hash, compute_source_hash, read_file_lines
+from fw_context_mcp.utils import SAFE_EXCEPT, abs_path, compute_content_hash, compute_source_hash, read_file_lines
 
 log = logging.getLogger(__name__)
 
@@ -378,13 +378,19 @@ def _restore_llm_analysis(
     config_hash: str,
     syms: list,
     saved_analyses: dict[str, dict],
+    *,
+    cache_client=None,
 ) -> None:
     """Restore LLM analysis for symbols whose body didn't change.
 
     Uses per-build saved analysis (exact USR match) as the primary source,
-    then falls back to the global local cache.
+    then falls back to the global local cache, then the remote cache server.
     """
-    from fw_context_mcp.cache_client import get_local_cache_db, local_cache_lookup
+    from fw_context_mcp.cache_client import (
+        get_local_cache_db,
+        local_cache_lookup,
+        local_cache_upsert,
+    )
 
     local_db = get_local_cache_db(readonly=True)
     restored = 0
@@ -402,6 +408,21 @@ def _restore_llm_analysis(
                 cached = saved
             else:
                 cached = local_cache_lookup(local_db, [new_ch]).get(new_ch)
+
+            # Tier C: remote cache server
+            if not cached and cache_client is not None:
+                try:
+                    remote_hits = cache_client.batch_get([new_ch])
+                    cached = remote_hits.get(new_ch)
+                    if cached:
+                        # Store in local global cache for next time
+                        writable_db = get_local_cache_db(readonly=False)
+                        try:
+                            local_cache_upsert(writable_db, [{"hash": new_ch, **cached}])
+                        finally:
+                            writable_db.close()
+                except SAFE_EXCEPT:
+                    pass  # remote down → graceful fallback
 
             if not cached:
                 continue
@@ -452,7 +473,7 @@ def _detect_moved_symbols(
         normalized_sym_file = _normalize_file_path(s.file, project_root)
         old_row = conn.execute(
             """SELECT s.id, s.file_id, s.qualified_name, s.signature, s.line, s.end_line,
-                      s.docstring, f.path as abs_path,
+                      s.docstring, f.path as file_path,
                       a.summary, a.inputs, a.outputs, a.model, a.analyzed_at
                FROM symbols s
                LEFT JOIN llm_analysis a ON a.symbol_id = s.id
@@ -470,7 +491,7 @@ def _detect_moved_symbols(
         lines = _cached_read_lines(s.file)
         if lines is None:
             continue
-        old_lines = _cached_read_lines(old_row["abs_path"])
+        old_lines = _cached_read_lines(abs_path(project_root, old_row["file_path"]))
         if old_lines is None:
             continue
         old_ch = _compute_content_hash(
@@ -637,6 +658,7 @@ def store_symbols_for_unit(
     existing_files: dict[str, tuple[int, float]] | None = None,
     hashes=None,
     build_dir_patterns: list[str] | None = None,
+    cache_client=None,
 ) -> tuple[int, int, list[dict]]:
     """Parse one translation unit and store its symbols + refs in the DB.
 
@@ -775,7 +797,7 @@ def store_symbols_for_unit(
                 "UPDATE files SET is_project = ? WHERE id = ? AND is_project < ?",
                 (ip, fid, ip),
             )
-        _restore_llm_analysis(conn, config_hash, syms, saved_analyses)
+        _restore_llm_analysis(conn, config_hash, syms, saved_analyses, cache_client=cache_client)
         _detect_moved_symbols(conn, config_hash, syms, old_usrs, file_id_cache, project_root)
 
     # Path-relative helper used by refs and indirect_call_sites blocks

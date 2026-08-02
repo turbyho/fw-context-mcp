@@ -67,18 +67,66 @@ def ollama_guard() -> Generator[None, None, None]:
         yield
 
 
-def _pull_model(model: str, base_url: str, *, timeout: float = 600.0) -> None:
-    """Pull a model via Ollama /api/pull (blocking, streaming).
+def _pull_model(
+    model: str,
+    base_url: str,
+    *,
+    stall_timeout: float = 120.0,
+) -> None:
+    """Pull a model via Ollama /api/pull with stall detection.
 
-    Downloads the model if not already installed.  The streaming response
-    is consumed to avoid leaving a dangling connection.
+    Downloads the model, tracking progress from the streaming JSON
+    response.  Only times out when NO progress is made for
+    *stall_timeout* seconds — slow connections and large models
+    are handled gracefully.
     """
+
     url = base_url.rstrip("/") + "/api/pull"
+    last_progress = time.monotonic()
+    digest_states: dict[str, int] = {}  # digest → last completed bytes
+
     try:
-        with httpx.stream("POST", url, json={"name": model}, timeout=timeout) as resp:
+        with httpx.stream(
+            "POST", url, json={"name": model},
+            timeout=httpx.Timeout(
+                connect=30.0,
+                read=stall_timeout,   # per-read timeout = stall detection
+                write=30.0,
+                pool=30.0,
+            ),
+        ) as resp:
             resp.raise_for_status()
-            for _ in resp.iter_lines():
-                pass  # consume stream
+            for line in resp.iter_lines():
+                if not line:
+                    continue
+                try:
+                    entry = json.loads(line)
+                except (ValueError, TypeError):
+                    continue
+
+                status = entry.get("status", "")
+                digest = entry.get("digest", "")
+                completed = entry.get("completed", 0)
+
+                if status == "downloading" and digest:
+                    prev = digest_states.get(digest, -1)
+                    if completed > prev:
+                        digest_states[digest] = completed
+                        last_progress = time.monotonic()
+
+                elif status in ("pulling manifest", "verifying sha256 digest",
+                                "writing manifest", "removing unused layers"):
+                    last_progress = time.monotonic()
+
+                elif status == "success":
+                    break
+
+                # Stall check
+                if time.monotonic() - last_progress > stall_timeout:
+                    raise OllamaError(
+                        f"Pull stalled for {model}: no progress for "
+                        f"{stall_timeout:.0f}s"
+                    )
     except httpx.HTTPStatusError as e:
         raise OllamaError(
             f"Failed to pull model '{model}': HTTP {e.response.status_code}"
@@ -136,7 +184,7 @@ def call_ollama(
             resp = httpx.post(url, json=payload, timeout=cfg.timeout)
         if resp.status_code == 404:
             log.info("LLM model '%s' not found, pulling...", cfg.model)
-            _pull_model(cfg.model, cfg.ollama_url, timeout=cfg.timeout)
+            _pull_model(cfg.model, cfg.ollama_url)
             with ollama_guard():
                 resp = httpx.post(url, json=payload, timeout=cfg.timeout)
         resp.raise_for_status()
@@ -211,7 +259,7 @@ def _call_ollama_embed_impl(
         if e.response.status_code == 404:
             # Model not installed — pull it, then retry once
             log.info("Embedding model '%s' not found, pulling...", cfg.embed_model)
-            _pull_model(cfg.embed_model, cfg.ollama_url, timeout=cfg.timeout)
+            _pull_model(cfg.embed_model, cfg.ollama_url)
             try:
                 with ollama_guard():
                     resp = httpx.post(url, json=payload, timeout=cfg.timeout * 2)

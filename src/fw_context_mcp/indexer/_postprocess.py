@@ -549,6 +549,7 @@ def _step_llm_analysis(conn: sqlite3.Connection, ctx: dict) -> None:
         conn.commit()
     _build_llm_analysis(
         conn, config_hash, llm_config, ctx["db_dir"],
+        project_root=ctx["project_root"],
         project_only=not ctx["analyze_vendor"],
         cache_client=cc,
         retry_unparseable=True,

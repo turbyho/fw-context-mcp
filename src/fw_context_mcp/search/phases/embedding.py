@@ -86,7 +86,7 @@ class EmbeddingPhase(Phase):
                 has_blob = _table_has_rows(conn, "embeddings")
 
                 if not has_vec0 and not has_blob:
-                    return ctx  # No embeddings at all
+                    return ctx.evolve(ollama_warning="No embedding tables exist")  # No embeddings at all
 
                 # Generate query embedding
                 try:
@@ -94,7 +94,7 @@ class EmbeddingPhase(Phase):
                     query_embs = embedder.embed_queries([ctx.query])
                     query_vec = query_embs[0]
                 except OllamaError:
-                    return ctx  # Embedding model unavailable
+                    return ctx.evolve(ollama_warning="Embedding model unavailable")
 
                 # ---- Hybrid re-rank path (default) ----
                 # When FTS5 already produced candidates, re-rank them by
@@ -165,7 +165,7 @@ class EmbeddingPhase(Phase):
                 if has_blob:
                     stored = get_embeddings(conn, ctx.config_hash, ctx.config.llm.embed_model)
                     if not stored:
-                        return ctx
+                        return ctx.evolve(ollama_warning="No stored embeddings found")
                     scored_bf = _brute_force_search(query_vec, stored, threshold=self.threshold)
                     top_ids = [s[0] for s in scored_bf[: self.overfetch]]
                     if not top_ids:
