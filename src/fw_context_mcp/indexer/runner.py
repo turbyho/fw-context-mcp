@@ -91,7 +91,6 @@ def run(
     project_id: str | None = None,
     llm_config=None,
     cache_server_config=None,
-    parallel: bool = True,
     force: bool = False,
     index_macros_expanded: bool = True,
     config_header: str = "",
@@ -138,9 +137,6 @@ def run(
         llm_config: Configuration dataclass for Ollama connection (URL,
             model names, enabled flag).  Required when any ``index_*`` or
             ``analyze_*`` option is enabled.
-        parallel: Deprecated — kept for backward compatibility.  All
-            indexing is now sequential with per-TU write locks so manual
-            operations (reindex_file) can interleave via the pause marker.
 
     Returns:
         The ``config_hash`` string — a content-addressable fingerprint of the
@@ -239,7 +235,7 @@ def run(
                 try:
                     with open(_hb_log, "a") as f:
                         f.write(f"{time.strftime('%H:%M:%S')} heartbeat\n")
-                except (ValueError, TypeError, RuntimeError, AttributeError, sqlite3.Error):
+                except (OSError, ValueError, TypeError, RuntimeError, AttributeError, sqlite3.Error):
                     pass  # non-fatal — continue
 
         _hb_thread = threading.Thread(target=_heartbeat, daemon=True)
@@ -307,10 +303,15 @@ def run(
     # If a previous run crashed after drop_fts_triggers() but before
     # rebuild_fts(), the triggers are missing — repair now so FTS stays
     # consistent during this run.
-    cur = conn.execute(
-        "SELECT name FROM sqlite_master WHERE type='trigger' AND name='symbols_ai'"
-    )
-    if cur.fetchone() is None:
+    missing_triggers = False
+    for trigger_name in ("symbols_ai", "files_ai", "macros_ai"):
+        cur = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='trigger' AND name=?",
+            (trigger_name,)
+        )
+        if cur.fetchone() is None:
+            missing_triggers = True
+    if missing_triggers:
         log.info("FTS5 triggers missing (possibly from a crashed run) — rebuilding FTS first")
         rebuild_fts(conn)
     drop_fts_triggers(conn)

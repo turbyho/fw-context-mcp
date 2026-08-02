@@ -277,8 +277,9 @@ def main() -> None:
         sys.exit(0)
     try:
         sys.exit(args.func(args))
-    except Exception as exc:
-        if isinstance(exc, (KeyboardInterrupt, SystemExit)):
+    except BaseException as exc:
+        from ..utils import is_fatal
+        if is_fatal(exc):
             raise
         # ProjectNotInitializedError — lazy import to avoid circular deps
         from ..config.settings import ProjectNotInitializedError

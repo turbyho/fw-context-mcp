@@ -122,27 +122,6 @@ def _build_alias_temp_table(
     )
 
 
-def _bridge_weak_aliases(
-    conn: sqlite3.Connection,
-    config_hash: str,
-    all_edges: dict[str, list[tuple[str, str]]],
-) -> None:
-    """Add synthetic edges from weak-alias declarations to their definitions.
-
-    Embedded firmware uses ``__attribute__((weak, alias(\"__func\")))`` for
-    user-overridable hooks (e.g. ``digitalWrite`` → ``__digitalWrite``).
-    Libclang sees these as two different USRs with no connection.  We inject
-    synthetic edges so the BFS can traverse past the declaration.
-    """
-    pairs = _get_alias_pairs(conn, config_hash)
-    for decl_usr, def_usr in pairs:
-        # Get the definition name for display in chains
-        def_name = conn.execute(
-            "SELECT name FROM symbols WHERE config_hash=? AND usr=? LIMIT 1",
-            (config_hash, def_usr),
-        ).fetchone()
-        label = def_name["name"] if def_name else "?"
-        all_edges.setdefault(decl_usr, []).append((def_usr, label))
 
 
 def find_call_path(

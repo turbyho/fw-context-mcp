@@ -348,15 +348,72 @@ def _build_embeddings(
                 f"{context_prefix}{sig_line} {extra_text}{body_text}".rstrip() + "\n",
             ))
 
-    # ── Phase 2: Generate embeddings (no DB writes) ──
-    # Buffer successful batches for atomic write-back at the end.
-    # Each entry: (blob_rows, vec_rows) — ready-to-insert tuples.
-    blob_batches: list[list[tuple]] = []
-    vec_batches: list[list[tuple]] = []
+    # ── Phase 2: Generate and store embeddings incrementally ──
+    # Write in transactions of up to CHUNK_SYMBOLS (5000) symbols to avoid
+    # buffering all embeddings in RAM (OOM risk on large projects).
+    # Each chunk is atomic (DELETE old + INSERT new for those symbols).
+    from .db import upsert_embeddings, upsert_embeddings_vec, write_lock
+    from .db._connection import transaction
+
+    CHUNK_SYMBOLS = 5000
     total = 0
+    embedding_dim: int | None = None
+    chunk_blob: list[tuple] = []
+    chunk_vec: list[tuple] = []
+    chunk_sym_ids: list[int] = []
+    first_chunk = True
+
+    def _flush_chunk() -> None:
+        """Write accumulated batch to DB in a single transaction."""
+        nonlocal first_chunk, total
+        if not chunk_blob:
+            return
+        with write_lock(db_dir, timeout=30.0):
+            with transaction(conn):
+                if first_chunk:
+                    # DELETE old embeddings for all symbols being processed
+                    if symbol_ids:
+                        id_phs = ",".join("?" * len(symbol_ids))
+                        conn.execute(
+                            f"DELETE FROM embeddings WHERE model = ? AND symbol_id IN ({id_phs})",
+                            (model, *symbol_ids),
+                        )
+                        try:
+                            conn.execute(
+                                f"DELETE FROM vec_symbols WHERE config_hash = ? AND symbol_id IN ({id_phs})",
+                                (config_hash, *symbol_ids),
+                            )
+                        except sqlite3.OperationalError:
+                            pass
+                    else:
+                        conn.execute(
+                            """DELETE FROM embeddings WHERE model = ?
+                               AND symbol_id IN (
+                                   SELECT s.id FROM symbols s
+                                   WHERE s.config_hash = ?
+                                     AND s.is_definition = 1
+                                     AND s.kind IN ('function','method','constructor','destructor',
+                                                    'class','struct','union','typedef','enum','varglobal')
+                               )""",
+                            (model, config_hash),
+                        )
+                        try:
+                            conn.execute("DELETE FROM vec_symbols WHERE config_hash = ?",
+                                         (config_hash,))
+                        except sqlite3.OperationalError:
+                            pass
+                    first_chunk = False
+                upsert_embeddings(conn, chunk_blob)
+                try:
+                    upsert_embeddings_vec(conn, chunk_vec)
+                except SAFE_EXCEPT as e:
+                    if is_fatal(e):
+                        raise
+                    log.warning("vec0 batch insert failed (sqlite-vec may not be loaded): %s", e)
+                total += len(chunk_blob)
+
     chunk_size = 100
     total_batches = (len(desc_rows) + chunk_size - 1) // chunk_size
-    embedding_dim: int | None = None
     for i in range(0, len(desc_rows), chunk_size):
         batch_num = i // chunk_size
         batch = desc_rows[i : i + chunk_size]
@@ -391,17 +448,29 @@ def _build_embeddings(
             (r["id"], ci, config_hash, emb)
             for (r, ci, _), emb in zip(batch, embs, strict=True)
         ]
-        blob_batches.append(blob_rows)
-        vec_batches.append(vec_rows)
-        total += len(blob_rows)
+        chunk_blob.extend(blob_rows)
+        chunk_vec.extend(vec_rows)
+        chunk_sym_ids.extend(r["id"] for r, _, _ in batch)
+
         elapsed = time.monotonic() - t0
         log.info("[%d/%d] %d symbols embedded %s", batch_num + 1, total_batches, len(batch), _fmt_dur(elapsed))
 
-    # ── Phase 3: Atomic DELETE + INSERT (no data-loss window) ──
-    total = _atomic_store_embeddings(
-        conn, db_dir, config_hash, symbol_ids, blob_batches, vec_batches,
-        embedding_dim, model,
-    )
+        if len(chunk_blob) >= CHUNK_SYMBOLS:
+            _flush_chunk()
+            chunk_blob.clear()
+            chunk_vec.clear()
+            chunk_sym_ids.clear()
+
+    # Flush remaining
+    _flush_chunk()
+
+    if embedding_dim is not None:
+        with write_lock(db_dir, timeout=30.0):
+            with transaction(conn):
+                conn.execute(
+                    "UPDATE build_configs SET embedding_dim = ? WHERE config_hash = ?",
+                    (embedding_dim, config_hash),
+                )
 
     log.info("Embeddings stored: %d embedding rows (model=%s)", total, model)
 

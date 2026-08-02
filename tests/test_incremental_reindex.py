@@ -912,61 +912,6 @@ class TestMoveDetection:
         modem_c.write_text(modem_original, encoding="utf-8")
 
 
-@pytest.mark.libclang
-class TestAutoReindexStale:
-    """Tests for _auto_reindex_stale — background reindex of modified files."""
-
-    def test_stale_files_detected(self, indexed_project: Path):
-        """_count_modified_files detects touched files."""
-
-        db_path = _db_path_for_project(indexed_project)
-        conn = open_db(db_path)
-        try:
-            ch = conn.execute("SELECT config_hash FROM build_configs ORDER BY created_at DESC LIMIT 1").fetchone()[
-                "config_hash"
-            ]
-
-            from fw_context_mcp.mcp.shared.stale import _count_modified_files
-
-            # Nothing should be modified initially
-            mod_before = _count_modified_files(conn, ch, indexed_project)
-            assert mod_before == 0, f"Expected 0 modified files, got {mod_before}"
-
-            # Touch source file and advance mtime past MTIME_TOLERANCE_S
-            src_file = indexed_project / "src" / "utils.c"
-            src_file.touch()
-            _advance_mtime(src_file)
-
-            mod_after = _count_modified_files(conn, ch, indexed_project)
-            assert mod_after > 0, f"Modified file should be detected (got {mod_after})"
-            print(f"  Modified files after touch: {mod_after}")
-
-        finally:
-            conn.close()
-
-    def test_auto_reindex_stale_integration(self, indexed_project: Path):
-        """_auto_reindex_stale reindexes changed files successfully."""
-
-        from fw_context_mcp.mcp.shared.stale import _auto_reindex_stale
-
-        # Touch utils.c and advance mtime past MTIME_TOLERANCE_S
-        utils_c = indexed_project / "src" / "utils.c"
-        utils_c.touch()
-        _advance_mtime(utils_c)
-
-        # Run auto-reindex
-        ok, failed = _auto_reindex_stale(["src/utils.c"], str(indexed_project), max_files=5, timeout_s=30.0)
-        print(f"  OK: {ok}, Failed: {failed}")
-        # utils.c should reindex successfully
-        assert len(ok) >= 1, f"No files reindexed: ok={ok}, failed={failed}"
-
-    def test_auto_reindex_empty_list(self, indexed_project: Path):
-        """Empty stale list returns empty results."""
-        from fw_context_mcp.mcp.shared.stale import _auto_reindex_stale
-
-        ok, failed = _auto_reindex_stale([], str(indexed_project))
-        assert ok == []
-        assert failed == []
 
 
 @pytest.mark.libclang

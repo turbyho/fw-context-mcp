@@ -1,17 +1,8 @@
-"""Shared base handler with context resolution and staleness helpers.
+"""Shared base handler with context resolution.
 
 Provides ``BaseHandler`` — a mixin-style class that all MCP tool handlers
-can inherit from to eliminate the repetitive resolve→open→query→stale
-boilerplate.
-
-Usage::
-
-    class MyHandler(BaseHandler):
-        def my_tool(self, project_root: str | None = None) -> dict:
-            db_ctx = self.resolve_db_context(project_root)
-            results = self._query(db_ctx.conn, db_ctx.config_hash)
-            return self.handle_staleness(results, db_ctx)
-"""
+can inherit from to eliminate the repetitive resolve→open→query
+boilerplate."""
 
 from __future__ import annotations
 
@@ -22,8 +13,6 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from fw_context_mcp.mcp.shared.context import _resolve_handler_context
-from fw_context_mcp.mcp.shared.stale import _stale_files, _with_stale_recovery
-from fw_context_mcp.utils import abs_path, resolve_project_root
 
 if TYPE_CHECKING:
     from ...config.settings import Config
@@ -53,7 +42,7 @@ class DbContext:
 
 
 class BaseHandler:
-    """Mixin for MCP tool handlers — context resolution + staleness wrapping.
+    """Mixin for MCP tool handlers — context resolution.
 
     All methods are static so they can be used without instantiation.
     The class exists as a namespace for discoverability; handlers can
@@ -87,83 +76,7 @@ class BaseHandler:
             root=ctx.root,
         )
 
-    @staticmethod
-    def resolve_db_context_optional(project_root: str | None = None) -> DbContext | None:
-        """Like :meth:`resolve_db_context` but returns None on error.
 
-        Use in tools that handle the missing-index case themselves
-        (e.g. ``reindex_file_impl``).
-        """
-        try:
-            return BaseHandler.resolve_db_context(project_root)
-        except (RuntimeError, sqlite3.Error, OSError):
-            return None
-
-    # ── Staleness handling ─────────────────────────────────────────
-
-    @staticmethod
-    def handle_staleness(
-        results: list[dict],
-        db_ctx: DbContext,
-        *,
-        stale_msg: str = "",
-    ) -> list[dict]:
-        """Check result files for staleness and prepend a warning if stale.
-
-        When stale files are found, triggers the background daemon so
-        the index catches up asynchronously.  The original results are
-        always returned — the daemon handles the fix in the background.
-
-        Args:
-            results: Query result rows (each must have a ``file`` key).
-            db_ctx: Resolved context from :meth:`resolve_db_context`.
-            stale_msg: Optional custom warning message prefix.
-
-        Returns:
-            List of dicts — ``[{"warning": ...}, *results]`` if stale,
-            otherwise just ``results``.
-        """
-        file_paths = [abs_path(db_ctx.root, r["file"]) for r in results if "file" in r]
-        if not file_paths:
-            return results
-
-        stale = _stale_files(db_ctx.conn, db_ctx.config_hash, file_paths, db_ctx.root)
-        if not stale:
-            return results
-
-        from fw_context_mcp.mcp.background import _ensure_daemon_running
-
-        _ensure_daemon_running(db_ctx.root)
-        prefix = stale_msg or (
-            f"Results may be stale — {len(stale)} file(s) changed. "
-            "Background reindex in progress. Run 'fw-context index' to force full update."
-        )
-        return [{"warning": prefix}] + results
-
-    # ── Convenience: full query wrapper ────────────────────────────
-
-    @staticmethod
-    def with_stale_recovery(
-        project_root: str | None,
-        query_fn,
-        *,
-        stale_msg: str = "",
-    ) -> list[dict]:
-        """Execute *query_fn(conn, config_hash)* with automatic stale recovery.
-
-        Delegates to :func:`fw_context_mcp.mcp.shared.stale._with_stale_recovery`.
-
-        Args:
-            project_root: Project root directory (or None for CWD).
-            query_fn: Callable ``(conn, config_hash) -> list[dict]``.
-            stale_msg: Optional custom warning message.
-
-        Returns:
-            List of result dicts, possibly with a leading warning entry.
-        """
-        root = resolve_project_root(project_root)
-        db_path = BaseHandler._get_db_path(root)
-        return _with_stale_recovery(root, db_path, query_fn, stale_msg=stale_msg)
 
     @staticmethod
     def _get_db_path(project_root: Path) -> Path:
@@ -171,3 +84,4 @@ class BaseHandler:
         from fw_context_mcp.mcp.shared.context import _db_path
 
         return _db_path(project_root)
+

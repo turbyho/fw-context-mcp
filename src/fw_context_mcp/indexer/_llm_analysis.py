@@ -466,11 +466,11 @@ def _build_llm_analysis(
 
     try:
         conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        log.info("LLM analysis stored: %d/%d symbols (model=%s)", total, total_symbols, model)
     except SAFE_EXCEPT as e:
         if is_fatal(e):
             raise
         pass  # non-fatal — continue
-
-    log.info("LLM analysis stored: %d/%d symbols (model=%s)", total, total_symbols, model)
-    local_db.close()
+    finally:
+        local_db.close()
 

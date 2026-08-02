@@ -160,27 +160,50 @@ def _validate_and_fix_artifacts(
     return compile_commands, build_dir_patterns, True
 
 
+def _pid_is_fw_context_reindexer(pid: int) -> bool:
+    """Verify that *pid* belongs to an fw-context background reindex process.
+
+    Checks /proc/<pid>/comm and /proc/<pid>/cmdline to avoid signalling
+    an unrelated process that reused the PID (PID reuse safety).
+    """
+    try:
+        comm_path = Path(f"/proc/{pid}/comm")
+        comm = comm_path.read_text().strip()
+        # Match python or fw-context process names
+        if comm not in ("fw-context", "python", "python3"):
+            return False
+        # Exclude daemon (file watcher) processes
+        cmdline_path = Path(f"/proc/{pid}/cmdline")
+        cmdline = cmdline_path.read_text()
+        if "daemon" in cmdline:
+            return False
+        return True
+    except (OSError, FileNotFoundError):
+        return False
+
 def _manage_bg_reindex(db_path: Path) -> None:
     """Kill any running background reindex and write pause/pid files."""
     pause_file = db_path.parent / "reindex.pause"
     reindex_pid_file = db_path.parent / "reindex.pid"
     db_path.parent.mkdir(parents=True, exist_ok=True)
 
-    # Kill any running background reindex
+    # Kill any running background reindex, with PID reuse safety.
     old_pid = PidFile.read_pid(reindex_pid_file)
     if old_pid is not None and old_pid != os.getpid():
-        os.kill(old_pid, signal.SIGTERM)
-        deadline = time.monotonic() + 5.0
-        while time.monotonic() < deadline:
-            if not PidFile._pid_exists(old_pid):
-                break
-            time.sleep(0.1)
+        if _pid_is_fw_context_reindexer(old_pid):
+            os.kill(old_pid, signal.SIGTERM)
+            deadline = time.monotonic() + 5.0
+            while time.monotonic() < deadline:
+                if not PidFile._pid_exists(old_pid):
+                    break
+                time.sleep(0.1)
+            else:
+                try:
+                    os.kill(old_pid, signal.SIGKILL)
+                except OSError:
+                    log.debug("SIGKILL on bg reindex process %d failed", old_pid)
         else:
-            try:
-                os.kill(old_pid, signal.SIGKILL)
-            except OSError:
-                log.debug("SIGKILL on bg reindex process %d failed", old_pid)
-    reindex_pid_file.unlink(missing_ok=True)
+            log.debug("PID %d from reindex.pid is not an fw-context reindexer — ignoring", old_pid)
 
     PidFile(pause_file).write()
     PidFile(reindex_pid_file).write()

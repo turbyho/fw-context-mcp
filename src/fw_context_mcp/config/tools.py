@@ -437,10 +437,6 @@ class Collision:
         """True when the file has no fw-context content at all — safe for fresh injection."""
         return not self.has_marked_section and not self.has_unmarked_content
 
-    @property
-    def can_update_safely(self) -> bool:
-        """True when we can safely update (marked section exists or file is clean)."""
-        return self.has_marked_section or self.is_clean
 
 
 def check_target(target: InstructionTarget, project_root: Path | None = None) -> Collision:

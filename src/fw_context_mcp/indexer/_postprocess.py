@@ -10,6 +10,7 @@ from __future__ import annotations
 import logging
 import sqlite3
 import time
+from collections import deque
 from collections.abc import Callable
 from contextlib import nullcontext
 from pathlib import Path
@@ -201,21 +202,23 @@ def _build_overrides(
         if parent_usr in parent_to_bases:
             return parent_to_bases[parent_usr]
         bases: list[str] = []
-        queue = [parent_usr]
+        queue: deque[str] = deque([parent_usr])
         while queue:
-            cur = queue.pop(0)
-            if cur in visited:
-                continue
-            visited.add(cur)
+            # Process in levels: batch-fetch edges for all nodes at this depth
+            level = list(queue)
+            queue.clear()
+            visited.update(level)
+            placeholders = ",".join("?" * len(level))
             rows = conn.execute(
-                """SELECT base_usr FROM inheritance
-                   WHERE config_hash = ? AND derived_usr = ?""",
-                (config_hash, cur),
+                f"""SELECT derived_usr, base_usr FROM inheritance
+                   WHERE config_hash = ? AND derived_usr IN ({placeholders})""",
+                (config_hash, *level),
             ).fetchall()
             for r in rows:
-                if r["base_usr"] not in visited:
-                    bases.append(r["base_usr"])
-                    queue.append(r["base_usr"])
+                base = r["base_usr"]
+                if base not in visited:
+                    bases.append(base)
+                    queue.append(base)
         parent_to_bases[parent_usr] = bases
         return bases
 

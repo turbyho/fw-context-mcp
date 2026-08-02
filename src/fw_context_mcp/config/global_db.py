@@ -72,6 +72,10 @@ def open_global_db() -> sqlite3.Connection:
             db_path.parent.mkdir(parents=True, exist_ok=True)
 
             _global_conn = sqlite3.connect(str(db_path), check_same_thread=False)
+            try:
+                db_path.chmod(0o600)
+            except OSError:
+                pass
             _global_conn.row_factory = sqlite3.Row
             _global_conn.execute("PRAGMA journal_mode=WAL")
             _global_conn.execute("PRAGMA foreign_keys=ON")
@@ -129,10 +133,3 @@ def get_project_by_id(project_id: str) -> dict | None:
     return dict(row)
 
 
-def list_all_registered_projects() -> list[dict]:
-    """Return all projects from the global registry, newest first."""
-    conn = open_global_db()
-    rows = conn.execute(
-        "SELECT * FROM projects ORDER BY updated_at DESC"
-    ).fetchall()
-    return [dict(r) for r in rows]
