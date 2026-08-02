@@ -20,7 +20,7 @@ __all__ = [
 ]
 
 
-class WriteLockTimeout(Exception):
+class WriteLockTimeout(RuntimeError):
     """Raised when the write lock cannot be acquired within the timeout."""
 
 

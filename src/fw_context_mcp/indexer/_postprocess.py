@@ -15,13 +15,12 @@ from contextlib import nullcontext
 from pathlib import Path
 
 from ..mcp.shared.pid_file import PidFile
-from ..utils import is_fatal
+from ..utils import SAFE_EXCEPT, is_fatal
 from ._embedding import _build_embeddings
 from ._llm_analysis import _build_llm_analysis
 from ._manifest_updater import _refresh_header_mtimes_from_manifest, _update_manifest_after_index
 from .db import (
     CURRENT_SCHEMA_VERSION,
-    WriteLockTimeout,
     delete_build_data,
     rebuild_files_fts,
     rebuild_fts,
@@ -31,16 +30,10 @@ from .db import (
     write_lock,
 )
 
-# Local SAFE_EXCEPT that includes WriteLockTimeout — cannot extend
-# utils.SAFE_EXCEPT directly because utils.py would need a circular import
-# from .db._locking.
-SAFE_EXCEPT = (
-    ValueError, TypeError, RuntimeError, AttributeError,
-    sqlite3.Error, OSError, WriteLockTimeout,
-)
-
 log = logging.getLogger(__name__)
 
+# C++ type qualifiers that are NOT parameter names during signature parsing.
+_CPP_TYPE_QUALIFIERS: frozenset[str] = frozenset({"const", "volatile", "constexpr", "noexcept"})
 
 
 def _extract_param_types(signature: str) -> str:
@@ -128,7 +121,6 @@ def _extract_param_types(signature: str) -> str:
             # it's the parameter name — remove it, keeping any pointer/ref prefix
             # on the type.  But C++ type qualifiers (const, volatile, etc.) are
             # NOT parameter names — keep them.
-            _CPP_TYPE_QUALIFIERS = frozenset({"const", "volatile", "constexpr", "noexcept"})
             if stripped and stripped.replace("_", "").isalnum() and stripped not in _CPP_TYPE_QUALIFIERS:
                 ptr_prefix = last[: len(last) - len(stripped)]
                 if ptr_prefix:
