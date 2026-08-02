@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 import json
-import re
 from typing import TYPE_CHECKING
 
+from fw_context_mcp.search._llm_parse import _SAFE_FTS5_TOKEN
 from fw_context_mcp.search._llm_parse import parse_llm_search_terms as _parse_search_terms
 from fw_context_mcp.search.phases.base import Phase
 
@@ -77,9 +77,8 @@ class RefinePhase(Phase):
         try:
             raw = await call_ollama_async(refine_prompt, ctx.config.llm)
             refined = _parse_search_terms(raw)[:5]
-            # Sanitize LLM-generated tokens — same pattern as H9 in fts5_search.py
-            _SAFE_TOKEN = re.compile(r"^[\w*]+$")
-            refined = [t for t in refined if _SAFE_TOKEN.match(t)]
+            # Sanitize LLM-generated tokens — shared pattern with fts5_search.py
+            refined = [t for t in refined if _SAFE_FTS5_TOKEN.match(t)]
             if refined:
                 all_queries = ctx.generated_queries + refined
                 cache_key = (ctx.query, ctx.config_hash)

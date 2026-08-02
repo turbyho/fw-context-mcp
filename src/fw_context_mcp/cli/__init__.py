@@ -47,7 +47,7 @@ def main() -> None:
     """Entry point for the ``fw-context`` CLI — dispatches subcommands.
 
     Subcommands: index, search, list, status, init, export, cache, db,
-    watch, analyze, version. Parses arguments via argparse and calls the
+    watch, finetune, analyze, version. Parses arguments via argparse and calls the
     corresponding ``cmd_*`` handler.
     """
     parser = argparse.ArgumentParser(prog="fw-context", description="Firmware code intelligence")
