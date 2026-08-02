@@ -476,6 +476,13 @@ def run(
                 log.info("[%d/%d] %s: skipped", processed, len(units), fname)
 
 
+    # Close CacheClient created during TU loop — its work is done.
+    if _cc is not None:
+        try:
+            _cc.close()
+        except SAFE_EXCEPT:
+            pass
+
     # ── Post-processing ──
     _run_postprocess(
         conn=conn,

@@ -484,20 +484,12 @@ def _process_unit(
             return ("skipped", 0, 0, (0.0, 0.0, 0.0), [])
         t_parse_end = time.monotonic()
 
-    # Resolve connection: persistent (callable → lazy open, don't close),
-    # explicit, or own (open now, close after).
-    # Must detect already-opened connections first — sqlite3/pysqlite3
-    # Connection objects became callable in Python 3.14 (conn("SQL") shortcut).
-    if hasattr(conn, "execute"):
+    # Resolve connection: caller-supplied or own.
+    if conn is not None:
         own_conn = False  # caller-supplied, don't close
-    elif callable(conn):
-        conn = conn()  # lazy thread-local — caller manages lifecycle
-        own_conn = False
-    elif conn is None:
+    else:
         conn = open_db(db_path)
         own_conn = True
-    else:
-        own_conn = False  # caller-supplied, don't close
 
     t_lock_start = time.monotonic()
     try:
