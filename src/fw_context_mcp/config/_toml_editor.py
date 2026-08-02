@@ -75,8 +75,8 @@ def merge_template(
     """Merge missing keys from a TOML *template* string into *config_path*.
 
     Keys that already exist (in the correct section) are NOT overwritten.
-    Commented keys in the template are included as active keys (the ``#``
-    prefix is stripped).
+    Keys commented out with ``#`` in the template are ignored (standard TOML
+    comment handling).
 
     Returns the list of key names that were added.
     """

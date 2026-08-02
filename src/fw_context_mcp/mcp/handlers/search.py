@@ -64,6 +64,25 @@ def _with_search_context(root: Path, tool_name: str, do_search) -> list[dict]:
 
 # ── moved from server.py ──
 
+def _append_staleness_warning(
+    results: list[dict], db_path: Path, project_root: Path,
+) -> list[dict]:
+    """Check compile_commands staleness and append warning if stale."""
+    # Connection stays in cache — managed by TTL eviction (same as _with_stale_recovery)
+    conn, err_result = _open_db_or_return(db_path)
+    if err_result is not None:
+        return err_result
+    assert conn is not None
+    with conn:
+        cfg_data = get_active_config(conn, derive_project_id(project_root))
+        if cfg_data and _is_stale(cfg_data, cfg_data["compile_commands_path"])[0]:
+            results.append({
+                "warning": "Index may be stale — compile_commands.json changed since last index.",
+                "hint": "Call reindex_file() on modified files or run 'fw-context index' to update.",
+            })
+    return results
+
+
 def search_code(
     query: Annotated[str, Field(description="FTS5 search terms. 1-3 words, omit underscores. E.g. 'modem init' not 'modem_init'. Supports trailing wildcard 'modem*'.")],
     project_root: Annotated[str | None, Field(description="Project root. Auto-detected if omitted.")] = None,
@@ -237,18 +256,7 @@ async def smart_search(
     # Add staleness warning if applicable
     results = list(ctx.formatted_results)
     if ctx.ollama_warning is None:
-        # Connection stays in cache — managed by TTL eviction (same as _with_stale_recovery)
-        conn, err_result = _open_db_or_return(ctx.db_path)
-        if err_result is not None:
-            return err_result
-        assert conn is not None
-        with conn:
-            cfg_data = get_active_config(conn, derive_project_id(ctx.project_root))
-            if cfg_data and _is_stale(cfg_data, cfg_data["compile_commands_path"])[0]:
-                results.append({
-                    "warning": "Index may be stale — compile_commands.json changed since last index.",
-                    "hint": "Call reindex_file() on modified files or run 'fw-context index' to update.",
-                })
+        results = _append_staleness_warning(results, ctx.db_path, ctx.project_root)
     return results
 
 # ── moved from server.py ──
@@ -383,17 +391,7 @@ async def semantic_search(
                 log.warning("Reranker failed, returning unranked results: %s", e)
 
         # Add staleness warning if applicable
-        conn, err_result = _open_db_or_return(ctx.db_path)
-        if err_result is not None:
-            return err_result
-        assert conn is not None
-        with conn:
-            cfg_data = get_active_config(conn, derive_project_id(ctx.project_root))
-            if cfg_data and _is_stale(cfg_data, cfg_data["compile_commands_path"])[0]:
-                results.append({
-                    "warning": "Index may be stale — compile_commands.json changed since last index.",
-                    "hint": "Call reindex_file() on modified files or run 'fw-context index' to update.",
-                })
+        results = _append_staleness_warning(results, ctx.db_path, ctx.project_root)
         return results
 
     except (sqlite3.Error, OSError, RuntimeError) as e:

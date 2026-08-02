@@ -386,7 +386,6 @@ def _refs_guard(project_root: str | None) -> tuple[sqlite3.Connection, Path, str
         ``(conn, root, config_hash, None)`` on success — caller reuses *conn* (do not close).
         ``(None, None, None, error_list)`` on failure — caller propagates the error.
     """
-    from fw_context_mcp.indexer.db import count_refs
 
     try:
         db = BaseHandler.resolve_db_context(project_root)

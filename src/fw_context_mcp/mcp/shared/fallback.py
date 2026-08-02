@@ -28,22 +28,20 @@ def _fallback_to_search_code(
     if err_result is not None:
         return err_result
     assert conn is not None
-    try:
-        with conn:
-            project_id = derive_project_id(root)
-            cfg = get_active_config(conn, project_id)
-            if not cfg:
-                return [{"error": "No build config indexed."}]
-            config_hash = cfg["config_hash"]
-            results = _fallback_to_search_code_inner(
-                conn, root, query, config_hash, limit, warning
-            )
-            # Collect file paths for staleness check before closing
-            result_files = [abs_path(root, r["file"]) for r in results if "file" in r]
-            stale_f = _stale_files(conn, config_hash, result_files, root)
-            is_stale, _ = _is_stale(cfg, cfg["compile_commands_path"])
-    finally:
-        pass  # connection managed by connection.py cache
+    # connection managed by connection.py cache
+    with conn:
+        project_id = derive_project_id(root)
+        cfg = get_active_config(conn, project_id)
+        if not cfg:
+            return [{"error": "No build config indexed."}]
+        config_hash = cfg["config_hash"]
+        results = _fallback_to_search_code_inner(
+            conn, root, query, config_hash, limit, warning
+        )
+        # Collect file paths for staleness check before closing
+        result_files = [abs_path(root, r["file"]) for r in results if "file" in r]
+        stale_f = _stale_files(conn, config_hash, result_files, root)
+        is_stale, _ = _is_stale(cfg, cfg["compile_commands_path"])
 
     if is_stale:
         results.insert(0, {

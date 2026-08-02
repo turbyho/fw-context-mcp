@@ -14,8 +14,10 @@ import logging
 import sys
 import tomllib
 from collections import OrderedDict
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 from urllib.parse import urlparse
 
 from ..indexer.build import BuildConfig
@@ -239,6 +241,10 @@ class LLMConfig:
         analyze_symbols: Generate per-symbol summaries, inputs, and outputs during indexing.
          analyze_vendor: When False (default), skip LLM analysis for vendor/SDK code
              (mbed-os, Zephyr, PlatformIO, etc.) — only project code is analyzed.
+         reranker_model: Optional cross-encoder model name for result reranking.
+             When set (e.g. ``"cross-encoder/ms-marco-MiniLM-L6-v2"``), search
+             results are rescored by the cross-encoder for higher precision.
+             Default ``None`` — no reranking.
              Set True to analyze every indexed symbol regardless of origin.
          ollama_max_concurrent: Maximum concurrent in-flight Ollama HTTP calls per
              process.  Default 1 (serial, identical to a Lock).  Increase to 2–4
@@ -330,6 +336,9 @@ class IndexConfig:
             trust dense-only routing in ``AdaptiveFusionPhase``.  Below this
             threshold FTS5 is used as fallback.  Set higher for projects
             with immature embedding quality (default 3, tuned on zbox-ecb-fw).
+        max_symbol_body_lines: Maximum number of source lines stored per
+            function/method body in the index.  Bodies longer than this are
+            truncated.  Default 1000.
     """
     db_dir: Path = field(default_factory=lambda: Path.home() / ".fw-context" / "index")
     compile_commands: Path = field(default_factory=lambda: Path("compile_commands.json"))
@@ -438,6 +447,40 @@ def _apply_section(
             if key in section:
                 setattr(target, attr, _convert(section[key], conv))
 
+
+def _build_cache_server_config(data: dict) -> CacheServerConfig | None:
+    """Build a ``CacheServerConfig`` from the ``[cache_server]`` TOML section.
+
+    Reads the bearer token from the config file, falling back to
+    ``~/.fw-context/.cache_token`` when not set.
+
+    Args:
+        data: Merged TOML dictionary.
+
+    Returns:
+        ``CacheServerConfig`` when ``[cache_server]`` section is present and
+        has a non-empty URL, ``None`` otherwise.
+    """
+    cs = data.get("cache_server", {})
+    if not cs:
+        return None
+
+    token = cs.get("token", "")
+    if not token:
+        token_file = Path.home() / ".fw-context" / ".cache_token"
+        if token_file.exists():
+            try:
+                token = token_file.read_text(encoding="utf-8").strip()
+            except OSError:
+                pass
+
+    return CacheServerConfig(
+        url=cs.get("url", ""),
+        token=token,
+        batch_size=cs.get("batch_size", 100),
+        force=cs.get("force", False),
+    )
+
 def _from_dict(data: dict) -> Config:
     """Convert merged TOML dict to Config with field mapping tables.
 
@@ -458,25 +501,9 @@ def _from_dict(data: dict) -> Config:
     _apply_embed_prompt_defaults(cfg.llm)
 
 
-    # ── [cache_server] ──
-    if cs := data.get("cache_server", {}):
-        token = cs.get("token", "")
-        if not token:
-            token_file = Path.home() / ".fw-context" / ".cache_token"
-            if token_file.exists():
-                try:
-                    token = token_file.read_text(encoding="utf-8").strip()
-                except OSError:
-                    pass
-        cfg.cache_server = CacheServerConfig(
-            url=cs.get("url", ""),
-            token=token,
-            batch_size=cs.get("batch_size", 100),
-            force=cs.get("force", False),
-        )
+    cfg.cache_server = _build_cache_server_config(data)
 
     # Warn about unknown top-level keys
-    _KNOWN_SECTIONS = {"project", "build", "index", "llm", "cache_server"}
     for key in data:
         if key not in _KNOWN_SECTIONS:
             log.warning(
@@ -488,34 +515,59 @@ def _from_dict(data: dict) -> Config:
 
 
 def _convert(value, conv: str):
-    """Convert a TOML value using the converter specification."""
-    if conv == "str":
-        return value
-    if conv == "bool":
-        if isinstance(value, bool):
-            return value
-        if isinstance(value, str):
-            v = value.strip().lower()
-            if v in ("true", "yes", "1", "on"):
-                return True
-            if v in ("false", "no", "0", "off", ""):
-                return False
-        return bool(value)
-    if conv == "list":
-        if isinstance(value, list):
-            return value
-        if isinstance(value, str):
-            return [value]
-        return list(value)
-    if conv == "dict":
-        return dict(value)
-    if conv == "path":
-        return Path(value).expanduser()
+    """Convert a TOML value using the converter specification.
+
+    Converter specs:
+        ``"str"`` — return as-is
+        ``"bool"`` — coerce to bool (handles strings "true"/"false"/"yes"/"no"/"1"/"0")
+        ``"list"`` — coerce to list (wraps scalar in list)
+        ``"dict"`` — coerce to dict
+        ``"path"`` — wrap in ``Path`` and expand ``~``
+        ``"int(N)"`` — coerce to int, default N on failure
+        ``"float(N)"`` — coerce to float, default N on failure
+    """
+    # Exact-match converters (fast path)
+    if conv in _CONVERTERS:
+        return _CONVERTERS[conv](value)
+
+    # Prefix-match converters: "int(N)" / "float(N)"
     if conv.startswith("int("):
         return _safe_int(value, int(conv[4:-1]))
     if conv.startswith("float("):
         return _safe_float(value, float(conv[6:-1]))
-    return value  # fallback
+
+    return value  # fallback — unknown converter, pass through
+
+
+def _convert_bool(value) -> bool:
+    """Coerce *value* to bool, handling string representations."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        v = value.strip().lower()
+        if v in ("true", "yes", "1", "on"):
+            return True
+        if v in ("false", "no", "0", "off", ""):
+            return False
+    return bool(value)
+
+
+def _convert_list(value) -> list:
+    """Coerce *value* to list — wraps scalar values."""
+    if isinstance(value, list):
+        return value
+    if isinstance(value, str):
+        return [value]
+    return list(value)
+
+
+_CONVERTERS: dict[str, Callable[..., Any]] = {
+    "str": lambda v: v,
+    "bool": _convert_bool,
+    "list": _convert_list,
+    "dict": dict,
+    "path": lambda v: Path(v).expanduser(),
+}
 
 
 # ── Field mapping tables ──
@@ -589,16 +641,31 @@ _LLM_FIELDS: list[tuple[str, str, str]] = [
     ("ollama_max_concurrent", "ollama_max_concurrent", "int(1)"),
 ]
 
-def _ensure_global_config() -> Path:
-    path = _GLOBAL_CONFIG_PATH
+_KNOWN_SECTIONS: set[str] = {"project", "build", "index", "llm", "cache_server"}
+
+
+def _ensure_config_file(path: Path, template: str, label: str) -> Path:
+    """Create *path* from *template* if it does not exist.
+
+    Args:
+        path: Absolute path to the config file.
+        template: TOML template string to write when the file is missing.
+        label: Human-readable label for log messages (e.g. ``"global config"``).
+
+    Returns:
+        *path* unchanged.
+    """
     if not path.exists():
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(_GLOBAL_DEFAULTS)
+            path.write_text(template)
         except (OSError, PermissionError) as e:
-            import logging
-            logging.getLogger(__name__).warning("Could not create global config %s: %s", path, e)
+            log.warning("Could not create %s %s: %s", label, path, e)
     return path
+
+
+def _ensure_global_config() -> Path:
+    return _ensure_config_file(_GLOBAL_CONFIG_PATH, _GLOBAL_DEFAULTS, "global config")
 
 
 def update_global_config(fix: bool = False) -> None:
@@ -633,29 +700,19 @@ def update_global_config(fix: bool = False) -> None:
 
 
 def _ensure_project_config(project_root: Path) -> Path:
-    config_dir = project_root / _PROJECT_CONFIG_DIR
-    path = config_dir / _PROJECT_CONFIG_NAME
-    if not path.exists():
-        try:
-            config_dir.mkdir(parents=True, exist_ok=True)
-            path.write_text(_PROJECT_DEFAULTS_TEMPLATE)
-        except (OSError, PermissionError) as e:
-            import logging
-            logging.getLogger(__name__).warning("Could not create project config %s: %s", path, e)
-    return path
+    return _ensure_config_file(
+        project_root / _PROJECT_CONFIG_DIR / _PROJECT_CONFIG_NAME,
+        _PROJECT_DEFAULTS_TEMPLATE,
+        "project config",
+    )
 
 
 def _ensure_project_local_config(project_root: Path) -> Path:
-    config_dir = project_root / _PROJECT_CONFIG_DIR
-    path = config_dir / _PROJECT_LOCAL_CONFIG_NAME
-    if not path.exists():
-        try:
-            config_dir.mkdir(parents=True, exist_ok=True)
-            path.write_text(_PROJECT_LOCAL_DEFAULTS_TEMPLATE)
-        except (OSError, PermissionError) as e:
-            import logging
-            logging.getLogger(__name__).warning("Could not create local config %s: %s", path, e)
-    return path
+    return _ensure_config_file(
+        project_root / _PROJECT_CONFIG_DIR / _PROJECT_LOCAL_CONFIG_NAME,
+        _PROJECT_LOCAL_DEFAULTS_TEMPLATE,
+        "local config",
+    )
 
 
 def _is_loopback_url(url: str) -> bool:
