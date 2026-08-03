@@ -1071,8 +1071,9 @@ def _handle_fn_ptr_as_argument(cursor, cur_fn, refs, fp_assignments, seen_ref, t
         callee_args = list(cursor.get_arguments())
         for i, arg in enumerate(callee_args):
             targets = _find_fn_refs_in_expr(arg, direct_callee_usr)
-            # Fallback: UNEXPOSED_EXPR wrapping &Class::method
-            if not targets and arg.kind == cx.CursorKind.UNEXPOSED_EXPR:
+            # Fallback: token-based extraction for opaque args
+            # (UNEXPOSED_EXPR, unresolved CALL_EXPR like callback(...), etc.)
+            if not targets:
                 unexposed_pairs = _extract_fn_refs_from_unexposed(arg, qn_to_usr)
                 if unexposed_pairs and i < len(callee_params):
                     param = callee_params[i]

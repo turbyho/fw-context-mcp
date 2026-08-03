@@ -264,6 +264,10 @@ def cmd_index(args: argparse.Namespace) -> int:
             datefmt="%H:%M:%S",
         )
 
+    # Suppress httpx INFO logs (one per HTTP request — extremely noisy during
+    # embedding generation, LLM analysis, and cache server communication).
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+
     project_root = resolve_project_root(args.project)
     cfg = load_config(project_root=project_root)
     bg = getattr(args, "background", False)
