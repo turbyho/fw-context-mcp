@@ -365,9 +365,13 @@ async def semantic_search(
 
         # Fallback to search_code when embedding fails or returns nothing
         if ctx.ollama_warning is not None:
+            if isinstance(ctx.ollama_warning, dict):
+                warning_msg = ctx.ollama_warning.get("detail", "LLM embedding failed.")
+            else:
+                warning_msg = str(ctx.ollama_warning)
             return _fallback_to_search_code(
                 root, db_path, query, limit,
-                warning=ctx.ollama_warning.get("detail", "LLM embedding failed."),
+                warning=warning_msg,
             )
 
         if not results:
