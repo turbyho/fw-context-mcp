@@ -52,8 +52,14 @@ def _configure_connection(conn: sqlite3.Connection) -> None:
         conn.enable_load_extension(True)
         import sqlite_vec
         sqlite_vec.load(conn)
-    except (ImportError, sqlite3.Error, RuntimeError, OSError):
-        pass
+        log.debug("sqlite-vec loaded successfully")
+    except ImportError:
+        log.debug("sqlite-vec not installed — semantic search will use legacy BLOB fallback")
+    except sqlite3.OperationalError as e:
+        log.debug("sqlite-vec extension failed to load (%s) — "
+                  "semantic search KNN unavailable, will use BLOB fallback", e)
+    except (sqlite3.Error, RuntimeError, OSError) as e:
+        log.warning("sqlite-vec load error: %s", e)
 
 
 def ensure_schema(conn: sqlite3.Connection) -> None:

@@ -1057,7 +1057,15 @@ def check_ollama(
         message (str, on error/disabled), available_code_models (list[str], when model missing),
         debug_log (str, optional — only when debug logging is enabled)}
     """
-    _, cfg, _, _ = _resolve_context(project_root)
+    try:
+        _, cfg, _, _ = _resolve_context(project_root)
+    except RuntimeError:
+        # Project has no index — irrelevant for check_ollama (only needs LLM config)
+        from pathlib import Path
+
+        from fw_context_mcp.config.settings import load
+
+        cfg = load(Path(project_root) if project_root else None)
     if not cfg.llm.enabled:
         return {
             "status": "disabled",
@@ -1074,6 +1082,22 @@ def check_ollama(
         }
     result = check_setup(cfg.llm)
     result["ollama_enabled"] = True
+
+    # Check sqlite-vec availability for semantic_search
+    try:
+        import sqlite3 as _sqlite3
+
+        import sqlite_vec
+        _conn = _sqlite3.connect(":memory:")
+        _conn.enable_load_extension(True)
+        sqlite_vec.load(_conn)
+        _conn.close()
+        result["vec_available"] = True
+        result["vec_error"] = None
+    except Exception as e:
+        result["vec_available"] = False
+        result["vec_error"] = str(e)
+
     return result
 
 

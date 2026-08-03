@@ -15,7 +15,6 @@ from pathlib import Path
 
 from ..config.settings import derive_project_id
 from ..mcp.shared.pid_file import PidFile
-from ..utils import SAFE_EXCEPT, is_fatal
 from ._embedding import (
     _build_embeddings,
     _chunk_body,
@@ -374,21 +373,6 @@ def run(
     # lock during parsing starves other indexers (bg reindex, concurrent
     # ``fw-context index --force``) and causes WriteLockTimeout errors.
 
-    # ── Create CacheClient for remote cache lookup during indexing ──
-    from fw_context_mcp.cache_client import CacheClient
-    _cc = None
-    if cache_server_config is not None and cache_server_config.url:
-        try:
-            _cc = CacheClient(
-                url=cache_server_config.url,
-                token=cache_server_config.token,
-                force=cache_server_config.force,
-                batch_size=cache_server_config.batch_size,
-            )
-        except SAFE_EXCEPT as e:
-            if is_fatal(e):
-                raise
-            log.debug("Failed to create CacheClient: %s", e)
     for i, unit in enumerate(units):
         _wait_if_paused()  # Check pause marker before each TU
         fname = unit.file.name
@@ -448,7 +432,6 @@ def run(
                 parse_timing=parse_timing,
                 hashes=hashes,
                 build_dir_patterns=build_dir_patterns,
-                cache_client=_cc,
             )
             if status == "updated":
                 updated += 1
@@ -477,12 +460,6 @@ def run(
                 log.info("[%d/%d] %s: skipped", processed, len(units), fname)
 
 
-    # Close CacheClient created during TU loop — its work is done.
-    if _cc is not None:
-        try:
-            _cc.close()
-        except SAFE_EXCEPT:
-            pass
 
     # ── Post-processing ──
     _run_postprocess(

@@ -180,23 +180,31 @@ def _select_unanalyzed_symbols(
     config_hash: str,
     project_only: bool,
 ) -> list:
-    """Return definition symbols that still need LLM analysis."""
+    """Return definition symbols that may need LLM analysis.
+
+    LEFT JOINs ``llm_analysis`` so the caller can compare the
+    content-addressable hash: if ``existing_hash`` matches the
+    freshly-computed hash, the analysis is still current and the
+    symbol can be skipped.  Symbols without any analysis have
+    ``existing_hash = NULL`` and always proceed to cache lookup.
+    """
     is_project_clause = "AND s.is_project = 1" if project_only else ""
     query = f"""SELECT s.id, s.name, s.qualified_name, s.kind, s.file_path,
-                      s.signature, s.is_definition, s.docstring,
-                      s.end_line, s.line, s.usr,
-                      f.path as file_path
-               FROM symbols s
-               JOIN files f ON s.file_id = f.id
-               WHERE s.config_hash = ?
-                 AND s.is_definition = 1
-                 AND s.kind IN ('function', 'method', 'constructor', 'destructor',
-                                'class', 'struct', 'union', 'typedef', 'enum', 'varglobal')
-                 AND s.name NOT LIKE '%(anonymous%'
-                 AND s.name NOT LIKE '%(unnamed%'
-                 {is_project_clause}
-                 AND s.id NOT IN (SELECT symbol_id FROM llm_analysis)
-               ORDER BY s.kind, s.file_path, s.line"""
+                       s.signature, s.is_definition, s.docstring,
+                       s.end_line, s.line, s.usr,
+                       f.path as file_path,
+                       a.content_hash as existing_hash
+                FROM symbols s
+                JOIN files f ON s.file_id = f.id
+                LEFT JOIN llm_analysis a ON a.symbol_id = s.id
+                WHERE s.config_hash = ?
+                  AND s.is_definition = 1
+                  AND s.kind IN ('function', 'method', 'constructor', 'destructor',
+                                 'class', 'struct', 'union', 'typedef', 'enum', 'varglobal')
+                  AND s.name NOT LIKE '%(anonymous%'
+                  AND s.name NOT LIKE '%(unnamed%'
+                  {is_project_clause}
+                ORDER BY s.kind, s.file_path, s.line"""
     with transaction(conn, checkpoint=False):
         return conn.execute(query, (config_hash,)).fetchall()
 
@@ -275,6 +283,15 @@ def _build_llm_analysis(
 
             # ── Cache check — 2 tiers: local global → remote ──
             h = compute_content_hash(d["body"], d["qualified_name"], d["signature"], d["docstring"])
+
+            # Step 0: project DB check — if existing hash matches, skip.
+            existing_hash = row.get("existing_hash")
+            if existing_hash and existing_hash == h:
+                total += 1
+                elapsed = time.monotonic() - t0
+                log.debug("[%d/%d] %s: hash-matched %s", idx + 1, total_symbols, qname, _fmt_dur(elapsed))
+                continue
+
 
             # Tier 1: local global cache (~/.fw-context/llm_cache.db)
             cached = None

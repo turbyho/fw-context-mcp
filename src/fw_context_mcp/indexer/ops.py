@@ -35,9 +35,8 @@ from fw_context_mcp.indexer.db import (
     insert_symbols_batch,
     split_tokens,
     upsert_file,
-    upsert_llm_analysis_batch,
 )
-from fw_context_mcp.utils import SAFE_EXCEPT, abs_path, compute_content_hash, compute_source_hash, read_file_lines
+from fw_context_mcp.utils import abs_path, compute_content_hash, compute_source_hash, read_file_lines
 
 log = logging.getLogger(__name__)
 
@@ -373,83 +372,6 @@ def _store_symbol_rows(
     return len(rows), file_proj
 
 
-def _restore_llm_analysis(
-    conn: sqlite3.Connection,
-    config_hash: str,
-    syms: list,
-    saved_analyses: dict[str, dict],
-    *,
-    cache_client=None,
-) -> None:
-    """Restore LLM analysis for symbols whose body didn't change.
-
-    Uses per-build saved analysis (exact USR match) as the primary source,
-    then falls back to the global local cache, then the remote cache server.
-    """
-    from fw_context_mcp.cache_client import (
-        get_local_cache_db,
-        local_cache_lookup,
-        local_cache_upsert,
-    )
-
-    local_db = get_local_cache_db(readonly=True)
-    restored = 0
-    try:
-        for s in syms:
-            lines = _cached_read_lines(s.file)
-            if lines is None:
-                continue
-            body = _read_body(lines, s.line, s.end_line)
-            new_ch = compute_content_hash(body, s.qualified_name, s.signature, s.docstring)
-
-            cached: dict | None = None
-            saved = saved_analyses.get(s.usr)
-            if saved is not None and saved.get("content_hash") == new_ch:
-                cached = saved
-            else:
-                cached = local_cache_lookup(local_db, [new_ch]).get(new_ch)
-
-            # Tier C: remote cache server
-            if not cached and cache_client is not None:
-                try:
-                    remote_hits = cache_client.batch_get([new_ch])
-                    cached = remote_hits.get(new_ch)
-                    if cached:
-                        # Store in local global cache for next time
-                        writable_db = get_local_cache_db(readonly=False)
-                        try:
-                            local_cache_upsert(writable_db, [{"hash": new_ch, **cached}])
-                        finally:
-                            writable_db.close()
-                except SAFE_EXCEPT:
-                    pass  # remote down → graceful fallback
-
-            if not cached:
-                continue
-            new_id = conn.execute(
-                "SELECT id FROM symbols WHERE config_hash = ? AND usr = ?",
-                (config_hash, s.usr),
-            ).fetchone()
-            if not new_id:
-                continue
-            upsert_llm_analysis_batch(
-                conn,
-                [
-                    (
-                        new_id[0],
-                        cached["summary"],
-                        cached["inputs"],
-                        cached["outputs"],
-                        cached["model"],
-                        new_ch,
-                    )
-                ],
-            )
-            restored += 1
-        if restored:
-            log.debug("Restored LLM analysis for %d symbols from cache", restored)
-    finally:
-        local_db.close()
 
 
 def _detect_moved_symbols(
@@ -658,7 +580,6 @@ def store_symbols_for_unit(
     existing_files: dict[str, tuple[int, float]] | None = None,
     hashes=None,
     build_dir_patterns: list[str] | None = None,
-    cache_client=None,
 ) -> tuple[int, int, list[dict]]:
     """Parse one translation unit and store its symbols + refs in the DB.
 
@@ -797,7 +718,6 @@ def store_symbols_for_unit(
                 "UPDATE files SET is_project = ? WHERE id = ? AND is_project < ?",
                 (ip, fid, ip),
             )
-        _restore_llm_analysis(conn, config_hash, syms, saved_analyses, cache_client=cache_client)
         _detect_moved_symbols(conn, config_hash, syms, old_usrs, file_id_cache, project_root)
 
     # Path-relative helper used by refs and indirect_call_sites blocks
