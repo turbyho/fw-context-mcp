@@ -95,6 +95,7 @@ def _try_pull(model: str, ollama_url: str) -> bool:
     Real pull (in ollama.py) uses 600s timeout — this just tries to
     start the download early so it's ready when embedder initializes."""
     import json
+
     import httpx
 
     url = ollama_url.rstrip("/") + "/api/pull"
