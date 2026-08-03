@@ -52,7 +52,7 @@ class DeduplicatePhase(Phase):
             # Filter noise
             if name.startswith("("):
                 continue
-            if len(name) <= 2 and r.get("kind") in ("variable", "field"):
+            if len(name) <= 2 and r.get("kind") in ("varlocal", "variable", "field"):
                 continue
 
             key = (name, r.get("file_path"))

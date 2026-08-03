@@ -19,6 +19,8 @@ KIND_WEIGHT: dict[str, int] = {
     "typedef": 2,
     "enum_constant": 1,
     "namespace": 1,
+    "varglobal": 2,
+    "varlocal": 0,
     "variable": 0,
     "field": 0,
 }

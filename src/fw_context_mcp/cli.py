@@ -1083,6 +1083,19 @@ def cmd_init(args: argparse.Namespace) -> int:
 
     # ── Project-level config and assets (skills, agents) ──
     _build_system = detect_build_system(project_root)
+
+    # Config file checks — always run, independent of AI tool injection success
+    if not args.dry_run and not args.instructions_only:
+        from .config.settings import (
+            _PROJECT_DEFAULTS_TEMPLATE,
+            _PROJECT_LOCAL_DEFAULTS_TEMPLATE,
+            update_global_config,
+        )
+
+        update_global_config(fix=True)
+        _check_config_file(project_root, ".fw-context/config.toml", _PROJECT_DEFAULTS_TEMPLATE, fix=True)
+        _check_config_file(project_root, ".fw-context/local.toml", _PROJECT_LOCAL_DEFAULTS_TEMPLATE, fix=True)
+
     if ok and not args.dry_run:
         if not args.instructions_only:
             proj_config = _ensure_project_config(project_root)
@@ -1091,14 +1104,6 @@ def cmd_init(args: argparse.Namespace) -> int:
                 f"\n[ok] {proj_config}: shared project config ready — edit vendor_paths, project_paths, etc. (commit to git)"
             )
             print(f"[ok] {local_config}: local developer config ready — edit ollama_url, model, etc. (gitignore)")
-            # Check config files for missing template keys
-            from .config.settings import (
-                _PROJECT_DEFAULTS_TEMPLATE,
-                _PROJECT_LOCAL_DEFAULTS_TEMPLATE,
-            )
-
-            _check_config_file(project_root, ".fw-context/config.toml", _PROJECT_DEFAULTS_TEMPLATE, fix=True)
-            _check_config_file(project_root, ".fw-context/local.toml", _PROJECT_LOCAL_DEFAULTS_TEMPLATE, fix=True)
             # .gitignore management
             _ensure_gitignore(project_root, fix=True, build_system=_build_system)
         _install_skills(dry_run=False, project_root=project_root, scope=args.scope)

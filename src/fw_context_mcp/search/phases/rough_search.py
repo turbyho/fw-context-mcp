@@ -157,7 +157,8 @@ async def _try_embedding_samples(ctx) -> list[dict] | None:
                                           WHEN kind = 'method' THEN 1
                                           WHEN kind = 'class' THEN 2
                                           WHEN kind = 'struct' THEN 3
-                                          ELSE 4 END
+                                          WHEN kind = 'varglobal' THEN 4
+                                          ELSE 5 END
                             LIMIT 20""",
                         (ctx.config_hash, *sym_ids),
                     ).fetchall()

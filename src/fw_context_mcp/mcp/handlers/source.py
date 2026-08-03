@@ -645,7 +645,7 @@ def get_symbol_context(
 
             # Indirect call sites — for function pointer fields and variables
             indirect_calls_list: list[dict] = []
-            if row["kind"] in ("field", "variable"):
+            if row["kind"] in ("field", "variable", "varglobal", "varlocal"):
                 ics_rows = find_indirect_call_sites(
                     conn, config_hash, row["qualified_name"] or row["name"], limit=200
                 )
@@ -688,7 +688,7 @@ def get_symbol_context(
 
             # Resolution info — for function pointer fields/variables
             resolution: dict | None = None
-            if row["kind"] in ("field", "variable"):
+            if row["kind"] in ("field", "variable", "varglobal", "varlocal"):
                 # Count assignments to this field
                 assign_count = conn.execute(
                     "SELECT COUNT(*) FROM fp_assignments WHERE config_hash = ? AND lhs_usr = ?",
