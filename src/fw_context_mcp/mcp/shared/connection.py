@@ -126,7 +126,8 @@ def _open_and_cache(db_key: str, db_path: Path) -> sqlite3.Connection:
     db_path.parent.mkdir(parents=True, exist_ok=True)
     conn = None
     try:
-        conn = open_db(db_path.resolve())
+        skip_integrity = db_key in _integrity_checked
+        conn = open_db(db_path.resolve(), check_same_thread=False, skip_integrity_check=skip_integrity)
     except DatabaseCorruptionError:
         if conn:
             conn.close()

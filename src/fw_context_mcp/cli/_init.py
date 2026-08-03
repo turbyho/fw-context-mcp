@@ -36,9 +36,7 @@ def _install_skills(
         CROSS_TOOL_SKILL_DIRS_PROJECT,
         TOOLS,
     )
-    from . import __file__ as _pkg_init
-
-    pkg_dir = Path(_pkg_init).parent
+    pkg_dir = Path(__file__).resolve().parent.parent  # src/fw_context_mcp/
     skill_dir = pkg_dir / "data" / "skills" / "fw-review"
 
     if not (skill_dir / "SKILL.md").exists():
@@ -290,9 +288,7 @@ def _install_agents(dry_run: bool = False, project_root: Path | None = None, sco
     registry — no tool paths are hardcoded here.
     """
     from ..config.tools import AGENT_CRITICAL_BLOCK
-    from . import __file__ as _pkg_init
-
-    pkg_dir = Path(_pkg_init).parent
+    pkg_dir = Path(__file__).resolve().parent.parent  # src/fw_context_mcp/
     agents_src = pkg_dir / "data" / "agents"
     templates = sorted(agents_src.glob("*.md")) if agents_src.is_dir() else []
 

@@ -348,17 +348,6 @@ def _discover_projects() -> dict[str, dict]:
             if file_row:
                 test_symbols["top_file"] = file_row["file_path"]
 
-            # A file with LLM analysis
-            if _has_column(conn, "file_analysis", "config_hash"):
-                analysis_row = conn.execute(
-                    """SELECT f.path FROM file_analysis fa
-                       JOIN files f ON f.id = fa.file_id
-                       WHERE fa.config_hash = ? AND f.path LIKE 'src/%'
-                       LIMIT 1""",
-                    (ch,),
-                ).fetchone()
-                if analysis_row:
-                    test_symbols["analyzed_file"] = analysis_row["path"]
 
             # A type name for data flow
             type_row = conn.execute(

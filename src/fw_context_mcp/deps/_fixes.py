@@ -16,7 +16,7 @@ def _pip_install(package: str) -> tuple[bool, str]:
     # uv pip install fails with "No virtual environment found".
     # Always fall back to sys.executable which knows where its own venv is.
     if which("uv") and os.environ.get("VIRTUAL_ENV"):
-        cmd = ["uv", "pip", "install", package]
+        cmd = ["uv", "pip", "install", "--python", sys.executable, package]
     else:
         cmd = [sys.executable, "-m", "pip", "install", package]
 
@@ -132,6 +132,7 @@ FIXABLE: dict[str, Any] = {
     "watchfiles": fix_watchfiles,
     "chat-model": fix_chat_model,
     "embed-model": fix_embed_model,
+    "sqlite-ext": _fix_pip_install,
 }
 
 

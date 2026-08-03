@@ -18,6 +18,14 @@ if TYPE_CHECKING:
     pass
 
 
+class EmbedderError(Exception):
+    """Unified exception for all embedder backend failures.
+
+    Used by search pipeline phases to catch embedder errors
+    regardless of which backend (Ollama or SentenceTransformer) is active.
+    """
+
+
 class Embedder(ABC):
     """Pluggable embedding backend."""
 

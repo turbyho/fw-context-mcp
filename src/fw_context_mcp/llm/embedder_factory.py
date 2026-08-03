@@ -30,13 +30,17 @@ def get_embedder(cfg: LLMConfig) -> Embedder:
 
     resolve_embed_model(cfg)  # empty → auto-detect, explicit → no-op
     model = cfg.embed_model.lower()
-    if model.startswith("ft://"):
-        return _get_ft_embedder(cfg)
-    _st_prefixes = ("ibm-granite/", "lightonai/", "baai/", "cross-encoder/", "sentence-transformers/")
-    if model.startswith(_st_prefixes):
-        return _get_st_embedder(cfg)
-    from .ollama import OllamaEmbedder
-    return OllamaEmbedder(cfg)
+    try:
+        if model.startswith("ft://"):
+            return _get_ft_embedder(cfg)
+        _st_prefixes = ("ibm-granite/", "lightonai/", "baai/", "cross-encoder/", "sentence-transformers/")
+        if model.startswith(_st_prefixes):
+            return _get_st_embedder(cfg)
+        from .ollama import OllamaEmbedder
+        return OllamaEmbedder(cfg)
+    except (OSError, ImportError, RuntimeError, ValueError) as e:
+        from .embedder import EmbedderError
+        raise EmbedderError(str(e)) from e
 
 
 def _get_st_embedder(cfg: LLMConfig) -> Embedder:
@@ -97,7 +101,7 @@ def _get_ft_embedder(cfg: LLMConfig) -> Embedder:
         _validate_model_dir(best, "ft://latest resolved to " + str(best))
         log.info("Resolved ft://latest → %s", best)
         resolved_cfg = copy.copy(cfg)
-        resolved_cfg.embed_model = str(best)
+        resolved_cfg._ft_model_path = str(best)  # type: ignore[attr-defined]
         embedder = SentenceTransformerEmbedder(resolved_cfg)
         _FT_EMBEDDER_CACHE[model] = embedder
         return embedder
@@ -112,7 +116,7 @@ def _get_ft_embedder(cfg: LLMConfig) -> Embedder:
         )
     _validate_model_dir(model_path, str(model_path))
     resolved_cfg = copy.copy(cfg)
-    resolved_cfg.embed_model = resolved
+    resolved_cfg._ft_model_path = resolved  # type: ignore[attr-defined]
     embedder = SentenceTransformerEmbedder(resolved_cfg)
     _FT_EMBEDDER_CACHE[model] = embedder
     return embedder

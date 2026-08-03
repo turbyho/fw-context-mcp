@@ -86,8 +86,6 @@ def run_full_check(project_root: str | Path | None = None) -> list[DepCheckResul
             else:
                 r = fn()
 
-            if name == "sqlite-ext":
-                ctx["sqlite_ext_ok"] = r.status == "ok"
 
             results.append(r)
         except Exception as exc:
@@ -96,7 +94,7 @@ def run_full_check(project_root: str | Path | None = None) -> list[DepCheckResul
                     name=name,
                     status="error",
                     message=f"check crashed: {exc}",
-                    critical=False,
+                    critical=True,  # crashed checks are treated as critical
                 )
             )
 
@@ -116,13 +114,15 @@ def run_fixes(results: list[DepCheckResult], project_root: str | Path | None = N
 
     updated: list[DepCheckResult] = []
     for r in results:
-        if r.status in ("ok", "skipped") or r.name not in FIXABLE:
+        if r.status in ("ok", "skipped", "error") or r.name not in FIXABLE:
             updated.append(r)
             continue
         ok, msg = run_fix(r.name, r, project_root)
         if ok:
             try:
                 updated.append(_recheck(r.name, project_root))
+                if r.name == "sqlite-vec":
+                    _reset_vec_cache()
             except Exception as exc:
                 updated.append(
                     DepCheckResult(
@@ -270,3 +270,10 @@ def _vec_available() -> tuple[bool, str | None]:
         except Exception as e:
             _vec_cache = (False, f"sqlite-vec load failed: {e}")
     return _vec_cache
+
+
+def _reset_vec_cache() -> None:
+    """Invalidate the ``_vec_available()`` cache — called after sqlite-vec install."""
+    global _vec_cache
+    with _vec_cache_lock:
+        _vec_cache = None

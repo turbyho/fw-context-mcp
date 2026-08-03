@@ -409,17 +409,6 @@ CREATE TABLE IF NOT EXISTS llm_analysis (
     content_hash TEXT    NOT NULL DEFAULT ''
 );
 
--- Per-file LLM analysis (opt-in via [llm] analyze_files = true).
--- Pre-computed by Ollama during indexing: a 2-3 sentence summary of what
--- the file is responsible for, based on the symbols it contains.
--- ON DELETE CASCADE: when a file row is deleted, its analysis is removed.
-CREATE TABLE IF NOT EXISTS file_analysis (
-    file_id      INTEGER PRIMARY KEY REFERENCES files(id) ON DELETE CASCADE,
-    config_hash  TEXT    NOT NULL DEFAULT '',
-    summary      TEXT    NOT NULL DEFAULT '',
-    model        TEXT    NOT NULL,
-    analyzed_at  TEXT    NOT NULL DEFAULT (datetime('now'))
-);
 
 -- C++ inheritance hierarchy edges. -- CRITICAL_TABLE
 -- derived_usr → base_usr: class Derived : public Base { ... }
@@ -618,7 +607,27 @@ def _run_data_migrations(conn: sqlite3.Connection) -> None:
             conn.execute("RELEASE data_migration")
             conn.execute("SAVEPOINT data_migration")
 
-        # ── Deduplicate refs before creating unique index ──
+
+        conn.execute("RELEASE data_migration")
+    except sqlite3.Error:
+        try:
+            conn.execute("ROLLBACK TO data_migration")
+        except sqlite3.OperationalError:
+            pass  # SAVEPOINT may have already been released or never created
+        raise
+
+    # ── FTS5 rebuild (after SAVEPOINT — executescript() issues COMMIT) ──
+    # ── Drop deprecated file_analysis table ──
+    conn.execute("DROP TABLE IF EXISTS file_analysis")
+    from fw_context_mcp.indexer.db import rebuild_fts
+
+    rebuild_fts(conn)
+
+    # ── Deduplicate refs + create unique index (runs unconditionally) ──
+    idx_exists = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_refs_unique'"
+    ).fetchone()
+    if not idx_exists:
         dup_count = conn.execute(
             """SELECT COUNT(*) FROM refs WHERE rowid NOT IN (
                 SELECT MIN(rowid) FROM refs
@@ -633,27 +642,10 @@ def _run_data_migrations(conn: sqlite3.Connection) -> None:
                     GROUP BY config_hash, to_usr, from_file, from_line, from_usr, ref_kind
                 )"""
             )
-            conn.execute("RELEASE data_migration")
-            conn.execute("SAVEPOINT data_migration")
-
-        # ── Create unique index on refs (idempotent; dedup ran first) ──
         conn.execute(
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_refs_unique "
             "ON refs(config_hash, to_usr, from_file, from_line, from_usr, ref_kind)"
         )
-
-        conn.execute("RELEASE data_migration")
-    except sqlite3.Error:
-        try:
-            conn.execute("ROLLBACK TO data_migration")
-        except sqlite3.OperationalError:
-            pass  # SAVEPOINT may have already been released or never created
-        raise
-
-    # ── FTS5 rebuild (after SAVEPOINT — executescript() issues COMMIT) ──
-    from fw_context_mcp.indexer.db import rebuild_fts
-
-    rebuild_fts(conn)
 
     # ── embeddings composite PK migration ──
     if _table_exists(conn, "embeddings"):

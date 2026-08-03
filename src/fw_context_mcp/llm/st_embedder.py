@@ -71,10 +71,16 @@ class SentenceTransformerEmbedder(Embedder):
                     "sentence-transformers is required for this model. "
                     "Install it with: pip install fw-context-mcp[st]"
                 ) from err
-            model_path = self._cfg.embed_model
+            model_path = getattr(self._cfg, "_ft_model_path", None) or self._cfg.embed_model
             log.info("Loading embedding model: %s ...", model_path)
-            self._model = SentenceTransformer(model_path)
-            self._native_dim = self._model.get_sentence_embedding_dimension()
+            try:
+                self._model = SentenceTransformer(model_path)
+                self._native_dim = self._model.get_sentence_embedding_dimension()
+            except (OSError, RuntimeError, ValueError) as err:
+                from .embedder import EmbedderError
+                raise EmbedderError(
+                    f"Failed to load SentenceTransformer model '{model_path}': {err}"
+                ) from err
             if self._cfg.embed_dim and self._cfg.embed_dim < self._native_dim:
                 log.info("MRL: truncating %d → %d (model=%s)", self._native_dim, self._cfg.embed_dim, model_path)
                 self._dim = self._cfg.embed_dim

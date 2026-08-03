@@ -580,7 +580,12 @@ def _step_pagerank_hotspot(conn: sqlite3.Connection, ctx: dict) -> None:
 def _step_finalize_manifest(conn: sqlite3.Connection, ctx: dict) -> None:
     """Stamp the build config with manifest verification status."""
     manifest_path = ctx["db_dir"] / "manifest.json"
-    manifest_verification: str = "full" if manifest_path.exists() else "none"
+    manifest_verification: str
+    if manifest_path.exists():
+        failed = ctx.get("failed_critical", set())
+        manifest_verification = "partial" if failed else "full"
+    else:
+        manifest_verification = "none"
     with transaction(conn):
         upsert_build_config(
             conn, ctx["config_hash"], ctx["project_id"],
@@ -712,6 +717,9 @@ def _run_postprocess(
         "force": force,
     }
 
+    failed_critical: set[str] = set()
+    critical_steps = {"fts5", "embeddings"}
+
     for step_name, step_fn, guard in _STEPS:
         if guard is not None and not guard(ctx):
             continue
@@ -724,5 +732,11 @@ def _run_postprocess(
         except SAFE_EXCEPT as e:
             if is_fatal(e):
                 raise
-            log.warning("Postprocess step %s failed: %s", step_name, e)
+            if step_name in critical_steps:
+                failed_critical.add(step_name)
+                log.error("Postprocess CRITICAL step %s failed: %s", step_name, e)
+            else:
+                log.warning("Postprocess step %s failed: %s", step_name, e)
+
+    ctx["failed_critical"] = failed_critical
 
