@@ -344,6 +344,9 @@ def _is_fn_ptr_type(t: cx.Type) -> bool:
         if canon.kind == cx.TypeKind.POINTER:
             pointee = canon.get_pointee()
             return pointee.kind in (cx.TypeKind.FUNCTIONPROTO, cx.TypeKind.FUNCTIONNOPROTO)
+        if canon.kind == cx.TypeKind.MEMBERPOINTER:
+            pointee = canon.get_pointee()
+            return pointee.kind in (cx.TypeKind.FUNCTIONPROTO, cx.TypeKind.FUNCTIONNOPROTO)
         # Fallback: template-based callback types (mbed::Callback<...>, std::function<...>)
         spelling = canon.spelling
         if '<' in spelling and '>' in spelling:
@@ -610,6 +613,7 @@ def _emit_fn_ptr_targets(
     lhs_usr: str | None = None,
     lhs_name: str = "",
     method: str = "assignment",
+    qn_to_usr: dict[str, str] | None = None,
 ) -> None:
     """Emit indirect refs and FnPointerAssignment records for function pointer assignments.
 
@@ -664,7 +668,42 @@ def _emit_fn_ptr_targets(
                         from_usr=caller_usr,
                     ))
 
-
+    # Token fallback: when _find_fn_refs_in_expr found no targets in any child
+    # (e.g. UNEXPOSED_EXPR wrapping a member function pointer inside a CALL_EXPR
+    # like callback(&Class::method)), try token-based extraction on the whole expr.
+    if qn_to_usr is not None:
+        any_found = False
+        for child in expr_cursor.get_children():
+            if _find_fn_refs_in_expr(child, skip_usr):
+                any_found = True
+                break
+        if not any_found:
+            pairs = _extract_fn_refs_from_unexposed(expr_cursor, qn_to_usr)
+            for target_usr, rhs_name in pairs:
+                if target_usr == skip_usr:
+                    continue
+                key = (target_usr, loc.file.name, loc.line, caller_usr, "indirect")
+                if key not in seen_ref:
+                    seen_ref.add(key)
+                    refs.append(Reference(
+                        to_usr=target_usr,
+                        from_file=loc.file.name,
+                        from_line=loc.line,
+                        from_usr=caller_usr,
+                        ref_kind="indirect",
+                    ))
+                if lhs_usr and lhs_usr != target_usr:
+                    fp_assignments.append(FnPointerAssignment(
+                        from_file=loc.file.name,
+                        from_line=loc.line,
+                        lhs_usr=lhs_usr,
+                        lhs_name=lhs_name,
+                        rhs_usr=target_usr,
+                        rhs_name=rhs_name,
+                        fn_ptr_type="",
+                        method=method,
+                        from_usr=caller_usr,
+                    ))
 def _build_refs_and_fp_assignments(
     tu: cx.TranslationUnit,
     tu_path_str: str,
@@ -1087,6 +1126,7 @@ def _handle_fn_ptr_as_argument(cursor, cur_fn, refs, fp_assignments, seen_ref, t
                                 _fp_type = ""
                             for target_usr, rhs_name in unexposed_pairs:
                                 if target_usr != direct_callee_usr:
+                                    _add_ref(refs, seen_ref, target_usr, loc.file.name, loc.line, cur_fn, "indirect")
                                     fp_assignments.append(FnPointerAssignment(
                                         from_file=loc.file.name, from_line=loc.line,
                                         lhs_usr=param_usr, lhs_name=param.spelling,
@@ -1113,7 +1153,7 @@ def _handle_fn_ptr_as_argument(cursor, cur_fn, refs, fp_assignments, seen_ref, t
                                     rhs_usr=target_usr, rhs_name=target.spelling,
                                     fn_ptr_type=_fp_type, method="call_arg", from_usr=cur_fn,
                                 ))
-    _emit_fn_ptr_targets(cursor, cur_fn, seen_ref, refs, fp_assignments, direct_callee_usr)
+    _emit_fn_ptr_targets(cursor, cur_fn, seen_ref, refs, fp_assignments, direct_callee_usr, qn_to_usr=qn_to_usr)
 
 
 def _handle_fn_ptr_cases(cursor, cur_fn, refs, fp_assignments, seen_ref, tu_path_str, _log):

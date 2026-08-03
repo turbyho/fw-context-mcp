@@ -114,6 +114,17 @@ def fix_embed_model(result, _project_root=None) -> tuple[bool, str]:
     return _ollama_pull(model)
 
 
+
+
+def fix_sqlite_ext(_result, _project_root=None) -> tuple[bool, str]:
+    """Cannot auto-fix — Python must be reinstalled with --enable-loadable-sqlite-extensions."""
+    return False, (
+        "sqlite3 loadable extensions are not enabled. "
+        "Reinstall Python with --enable-loadable-sqlite-extensions "
+        "(e.g. PYTHON_CONFIGURE_OPTS=\"--enable-loadable-sqlite-extensions\" pyenv install <version>), "
+        "or install pysqlite3 as a workaround."
+    )
+
 def _extract_model_name(result, default_url: str) -> str:
     """Extract model name from fix_cmd like 'ollama pull <model>'."""
     if result.fix_cmd and result.fix_cmd.startswith("ollama pull "):
@@ -132,7 +143,7 @@ FIXABLE: dict[str, Any] = {
     "watchfiles": fix_watchfiles,
     "chat-model": fix_chat_model,
     "embed-model": fix_embed_model,
-    "sqlite-ext": _fix_pip_install,
+    "sqlite-ext": fix_sqlite_ext,
 }
 
 

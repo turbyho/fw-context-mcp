@@ -49,7 +49,7 @@ def check_pysqlite3() -> DepCheckResult:
     """Verify pysqlite3 is installed and importable."""
     platform_ctx = get_platform_info()
     try:
-        mod = _import("pysqlite3")
+        _import("pysqlite3")
         ver = _version("pysqlite3")
         # Verify it actually replaced stdlib sqlite3
         import sqlite3
