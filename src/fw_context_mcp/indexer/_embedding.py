@@ -17,7 +17,7 @@ import httpx
 from ..config.settings import DESCRIPTION_VERSION
 from ..llm.embedder_factory import get_embedder
 from ..utils import SAFE_EXCEPT, is_fatal
-from .db import open_db, transaction, upsert_embeddings, upsert_embeddings_vec, write_lock
+from .db import open_db
 from .db._embeddings import _vec_to_blob
 
 log = logging.getLogger(__name__)
@@ -472,88 +472,22 @@ def _build_embeddings(
                     (embedding_dim, config_hash),
                 )
 
-    log.info("Embeddings stored: %d embedding rows (model=%s)", total, model)
-
-
-
-def _atomic_store_embeddings(
-    conn: sqlite3.Connection,
-    db_dir: Path,
-    config_hash: str,
-    symbol_ids: list[int] | None,
-    blob_batches: list[list[tuple]],
-    vec_batches: list[list[tuple]],
-    embedding_dim: int | None,
-    model: str,
-) -> int:
-    """Atomically delete old embeddings and insert new ones within a write lock.
-
-    Returns the total number of embedding rows stored.
-    """
-    if not blob_batches and not vec_batches:
-        log.warning("No embedding batches — old embeddings preserved.")
-        return 0
-    total = sum(len(b) for b in blob_batches)
-    with write_lock(db_dir, timeout=30.0):
-        with transaction(conn):
-            # Clean old embeddings for symbols being re-embedded
-            if symbol_ids:
-                id_placeholders = ",".join("?" * len(symbol_ids))
-                conn.execute(
-                    f"""DELETE FROM embeddings WHERE model = ?
-                        AND symbol_id IN ({id_placeholders})""",
-                    (model, *symbol_ids),
-                )
-                try:
-                    conn.execute(
-                        f"DELETE FROM vec_symbols WHERE config_hash = ? AND symbol_id IN ({id_placeholders})",
-                        (config_hash, *symbol_ids),
-                    )
-                except sqlite3.OperationalError:
-                    pass
-            else:
-                conn.execute(
-                    """DELETE FROM embeddings WHERE model = ?
-                       AND symbol_id IN (
-                           SELECT s.id FROM symbols s
-                           WHERE s.config_hash = ?
-                             AND s.is_definition = 1
-                             AND s.kind IN ('function', 'method', 'constructor', 'destructor',
-                                            'class', 'struct', 'union', 'typedef', 'enum', 'varglobal')
-                       )""",
-                    (model, config_hash),
-                )
-                try:
-                    conn.execute("DELETE FROM vec_symbols WHERE config_hash = ?", (config_hash,))
-                except sqlite3.OperationalError:
-                    pass
-
-            # Insert all buffered batches
-            for blob_rows in blob_batches:
-                upsert_embeddings(conn, blob_rows)
-            for vec_rows in vec_batches:
-                try:
-                    upsert_embeddings_vec(conn, vec_rows)
-                except SAFE_EXCEPT as e:
-                    if is_fatal(e):
-                        raise
-                    log.warning("vec0 batch insert failed (sqlite-vec may not be loaded): %s", e)
-
-            if embedding_dim is not None:
-                conn.execute(
-                    "UPDATE build_configs SET embedding_dim = ? WHERE config_hash = ?",
-                    (embedding_dim, config_hash),
-                )
-            # Prune embeddings with non-versioned model keys
-            try:
+    # Prune embeddings with non-versioned model keys (leftover from
+    # older fw-context versions that used bare model names without
+    # the :desc-v<N> version suffix).  Must run after new embeddings
+    # are stored so the DELETE only targets stale rows.
+    try:
+        with write_lock(db_dir, timeout=30.0):
+            with transaction(conn):
                 conn.execute(
                     "DELETE FROM embeddings WHERE model NOT LIKE '%:desc-v%'"
                     " AND symbol_id IN (SELECT id FROM symbols WHERE config_hash = ?)",
                     (config_hash,),
                 )
-            except sqlite3.OperationalError:
-                pass
-    return total
+    except sqlite3.OperationalError:
+        pass
+
+    log.info("Embeddings stored: %d embedding rows (model=%s)", total, model)
 
 
 # ═══════════════════════════════════════════════════════════════
