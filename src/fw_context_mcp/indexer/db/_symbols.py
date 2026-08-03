@@ -34,9 +34,35 @@ _RE_SEPARATOR = re.compile(r"[^a-zA-Z0-9]+")
 # _RE_COL_FILTER detects column-filter syntax in FTS5 queries (single colon not part of ::)
 _RE_COL_FILTER = re.compile(r"(?<!:):(?!:)")
 
-# BM25 weight configuration — module-level to avoid recreation on every search.
-# Base 9 columns: name, qualified_name, signature, docstring, file_path,
-#                name_tokens, summary, inputs, outputs
+# BM25 weight configuration — module-level constant to avoid recreating the
+# weight list on every search_symbols() call (was previously inline).
+#
+# Each weight corresponds to a column in the symbols_fts FTS5 table.
+# Higher weight → stronger influence on BM25 relevance ranking:
+#
+#   Column            Weight  Rationale
+#   ────────────────  ──────  ─────────────────────────────────────────────
+#   name               1.2    Slight boost — name matches are important but
+#                              common words should not dominate.
+#   qualified_name     0.75   De-emphasized — qualified name often repeats
+#                              tokens already in 'name', avoid double-counting.
+#   signature         10.0    Strongest signal — function signatures contain
+#                              precise type/parameter info, exact match is a
+#                              strong relevance indicator.
+#   docstring          1.0    Neutral — docstrings are free-form text with
+#                              variable quality; don't boost or penalize.
+#   file_path          3.0    Moderate boost — matching the file name is a
+#                              good signal for organizational relevance.
+#   name_tokens        2.0    Slight boost — CamelCase/snake_case token
+#                              decomposition provides extra match surface.
+#   summary            1.0    Neutral — LLM-generated summaries (like docstrings).
+#   inputs             5.0    Strong boost — LLM-analyzed input parameters
+#                              are high-signal structured data.
+#   outputs            1.0    Neutral — LLM-analyzed outputs, complementary
+#                              to inputs but less discriminative.
+#
+# Extra columns beyond these 9 (e.g. 'source' body text when present) get
+# weight 1.0 — they contribute but don't dominate the ranking.
 _BASE_WEIGHTS = [1.2, 0.75, 10.0, 1.0, 3.0, 2.0, 1.0, 5.0, 1.0]
 # Cache: PRAGMA table_info column count per connection id → avoids
 # querying the schema on every search_symbols call.
