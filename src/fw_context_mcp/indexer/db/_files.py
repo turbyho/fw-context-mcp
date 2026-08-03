@@ -204,7 +204,7 @@ def get_file_map(
             """SELECT name, qualified_name, kind, line, col, end_line,
                       is_definition, signature, enum_value
                FROM symbols
-               WHERE config_hash = ? AND (file_path = ? OR file_path LIKE ? ESCAPE '\')
+               WHERE config_hash = ? AND (file_path = ? OR file_path LIKE ? ESCAPE '\\')
                ORDER BY kind, line""",
             (config_hash, file_path, f"%{_escape_like(file_path)}"),
         ).fetchall()

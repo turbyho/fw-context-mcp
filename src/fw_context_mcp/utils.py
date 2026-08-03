@@ -225,6 +225,9 @@ def compute_content_hash(body: str, qualified_name: str, signature: str, docstri
     Used for content-addressable LLM analysis caching — survives
     re-indexes, config changes, and branch switches.
     """
+    # \x1f (Unit Separator) — safe delimiter not occurring in C/C++ identifiers,
+    # signatures, or docstrings.  Changed from a plain printable delimiter to
+    # avoid collisions with symbols whose names contain the old separator.
     raw = f"{body.strip()}\x1f{qualified_name}\x1f{signature or ''}\x1f{(docstring or '').strip()}"
     return hashlib.sha256(raw.encode()).hexdigest()
 

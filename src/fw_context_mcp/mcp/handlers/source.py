@@ -823,6 +823,7 @@ def get_symbol_context(
 
 
 # ── moved from server.py ──
+
 def read_file(
     file_path: Annotated[str, Field(description="Path to source file — relative to project root or just filename.")],
     project_root: Annotated[str | None, Field(description="Project root. Auto-detected if omitted.")] = None,

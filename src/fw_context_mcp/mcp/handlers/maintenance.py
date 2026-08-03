@@ -133,7 +133,13 @@ def get_active_build(
         manifest_verification = cfg["manifest_verification"] if "manifest_verification" in cfg else "none"
         if fast:
             modified_count = 0
-            header_affected_tus = 0
+            # header_affected_tus computed from manifest even at fast=True
+            if manifest_verification == "full":
+                header_affected_tus, _ = _check_header_staleness(
+                    conn, config_hash, root, use_cache=True,
+                )
+            else:
+                header_affected_tus = 0
         else:
             modified_count = _count_modified_files(conn, config_hash, root, use_cache=False)
             # Check header dependencies separately (different metric: TUs, not files)
@@ -295,6 +301,7 @@ def get_active_build(
             "status": status,
             "reindex_needed": needs_reindex,
             "reindex_reasons": reindex_reasons,
+            "stale": needs_reindex or header_affected_tus > 0,
             "index_message": index_message,
         }
         if _warning is not None:
@@ -484,6 +491,7 @@ def reset_index(
     cfg_data = None
     sym_count = 0
     corrupt = False
+    conn = None
     try:
         conn = open_db(db_path)
     except DatabaseCorruptionError:
@@ -496,6 +504,12 @@ def reset_index(
                     "SELECT COUNT(*) FROM symbols WHERE config_hash=?",
                     (cfg_data["config_hash"],),
                 ).fetchone()[0]
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except sqlite3.Error:
+                pass
     info: dict[str, object] = {
         "project_root": str(root),
         "db": str(db_path),

@@ -619,7 +619,7 @@ def search_content(
             if not terms:
                 return []
             escaped_terms = [t.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") for t in terms]
-            like_clauses = " AND ".join(["f.content LIKE ?" for _ in escaped_terms])
+            like_clauses = " AND ".join(["f.content LIKE ? ESCAPE '\\'" for _ in escaped_terms])
             like_params = [f"%{t}%" for t in escaped_terms]
             rows = c.execute(
                 f"""SELECT f.*,

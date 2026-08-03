@@ -57,8 +57,10 @@ def main() -> None:
     _argv = sys.argv[1:] if len(sys.argv) > 1 else []
     if (
         os.environ.get("FW_CONTEXT_SKIP_PREFLIGHT") is None
-        and _argv
-        and _argv[0] not in ("doctor", "version", "--version", "--help", "-h")
+        and not any(
+            a in ("doctor", "version", "--version", "--help", "-h")
+            for a in _argv
+        )
     ):
         from ..deps import run_preflight
 

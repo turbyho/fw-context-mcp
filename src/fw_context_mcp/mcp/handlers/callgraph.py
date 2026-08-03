@@ -808,7 +808,7 @@ def trace_data_flow(
            FROM symbols s
            WHERE s.config_hash = ?
              AND s.is_definition = 1
-             AND s.signature LIKE ?
+             AND s.signature LIKE ? ESCAPE '\\'
            ORDER BY caller_count DESC
            LIMIT ?""",
         (config_hash, f"%{_escape_like(type_name)}%", limit),

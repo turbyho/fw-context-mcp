@@ -31,15 +31,13 @@ _DEFAULT_GPU_MODEL = "qwen3-embedding:8b"
 # return instantly.  Cached independently per process — subprocesses
 # (e.g. MCP tool workers) resolve once each.
 _cached_model: str | None = None
-_cached_gpu: bool | None = None
 _auto_model_lock = threading.Lock()
 
 
 def _reset_auto_model_cache() -> None:
     """Reset the cached auto-detection result. Used by tests only."""
-    global _cached_model, _cached_gpu
+    global _cached_model
     _cached_model = None
-    _cached_gpu = None
 
 
 def _gpu_available() -> bool:
@@ -96,17 +94,35 @@ def _try_pull(model: str, ollama_url: str) -> bool:
     """Best-effort pre-warm pull with 5s read timeout.
     Real pull (in ollama.py) uses 600s timeout — this just tries to
     start the download early so it's ready when embedder initializes."""
+    import json
     import httpx
 
     url = ollama_url.rstrip("/") + "/api/pull"
     try:
         with httpx.stream(
             "POST", url, json={"name": model},
-            timeout=httpx.Timeout(connect=5.0, read=5.0, write=5.0, pool=5.0),
+            timeout=httpx.Timeout(connect=5.0, read=300.0, write=5.0, pool=5.0),
         ) as resp:
             resp.raise_for_status()
-            for _ in resp.iter_lines():
-                pass
+            for line in resp.iter_lines():
+                if not line:
+                    continue
+                try:
+                    data = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                status = data.get("status", "")
+                if status in ("downloading", "pulling"):
+                    total = data.get("total", 0)
+                    completed = data.get("completed", 0)
+                    if total:
+                        pct = int(completed / total * 100)
+                        print(f"\r  Downloading {model}... {pct}%", end="", flush=True)
+                    else:
+                        print(f"\r  Downloading {model}...", end="", flush=True)
+                elif status:
+                    print(f"\r  {status} {model}...", end="", flush=True)
+            print()  # final newline
         return True
     except (httpx.HTTPError, OSError) as e:
         log.debug("Pull %s failed: %s", model, e)
@@ -129,8 +145,10 @@ def resolve_embed_model(cfg: LLMConfig) -> None:
     Result is cached at module level — subsequent calls return instantly
     (no subprocess or HTTP I/O).
     """
-    global _cached_model, _cached_gpu
+    global _cached_model
 
+    if not cfg.enabled:
+        return
     if cfg.embed_model:
         return
 
@@ -151,7 +169,6 @@ def resolve_embed_model(cfg: LLMConfig) -> None:
         target = _DEFAULT_GPU_MODEL if gpu else _DEFAULT_CPU_MODEL
         cfg.embed_model = target
         _cached_model = target
-        _cached_gpu = gpu
 
     # NOTE: _apply_prompt_defaults, _model_installed, and _try_pull are outside
     # _auto_model_lock.  This is intentional — they perform HTTP requests which

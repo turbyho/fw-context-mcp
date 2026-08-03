@@ -52,7 +52,8 @@ def check_pysqlite3() -> DepCheckResult:
         mod = _import("pysqlite3")
         ver = _version("pysqlite3")
         # Verify it actually replaced stdlib sqlite3
-        if "pysqlite3" in str(mod.__file__):
+        import sqlite3
+        if "pysqlite3" in str(sqlite3.__file__):
             return DepCheckResult(
                 name="pysqlite3",
                 status="ok",
@@ -154,6 +155,19 @@ def check_libclang_python() -> DepCheckResult:
     try:
         _import("clang.cindex")
         ver = _version("libclang")
+        try:
+            from packaging.version import Version
+            if Version(ver) < Version("18.1.1"):
+                return DepCheckResult(
+                    name="libclang-python",
+                    status="degraded",
+                    message=f"libclang {ver} is too old — 18.1.1+ required",
+                    fix_cmd=f"{platform_ctx['pip_cmd']} 'libclang>=18.1.1'",
+                    instructions=f"{platform_ctx['pip_cmd']} 'libclang>=18.1.1'",
+                    critical=True,
+                )
+        except ImportError:
+            pass  # packaging not installed, skip version check
         return DepCheckResult(
             name="libclang-python",
             status="ok",
@@ -199,7 +213,7 @@ def check_libclang_so() -> DepCheckResult:
             critical=True,
         )
 
-    if lib_path and Path(lib_path).exists():
+    if lib_path and "/" in lib_path and Path(lib_path).exists():
         # Smoke test: try to actually load the library
         try:
             clang.cindex.Index.create()

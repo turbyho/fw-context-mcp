@@ -49,7 +49,7 @@ def _reconfigure_ollama_sem(max_concurrent: int) -> None:
     if max_concurrent < 1:
         max_concurrent = 1
     with _reconfigure_lock:
-        if max_concurrent != _sem_value:
+        if max_concurrent > _sem_value:
             _ollama_sem = threading.BoundedSemaphore(max_concurrent)
             _sem_value = max_concurrent
 
@@ -276,7 +276,11 @@ def _call_ollama_embed_impl(
                     })
                 return embeddings
             except httpx.HTTPStatusError as e2:
-                raise OllamaModelNotFoundError(cfg.embed_model, cfg.ollama_url) from e2
+                if e2.response.status_code == 404:
+                    raise OllamaModelNotFoundError(cfg.embed_model, cfg.ollama_url) from e2
+                raise OllamaError(f"Ollama HTTP {e2.response.status_code}: {e2.response.text[:200]}") from e2
+            except (httpx.HTTPError, OSError, KeyError, json.JSONDecodeError, ValueError) as e2:
+                raise OllamaError(str(e2)) from e2
         raise OllamaError(f"Ollama HTTP {e.response.status_code}: {e.response.text[:200]}") from e
     except httpx.ConnectError as e:
         raise OllamaError(

@@ -166,7 +166,7 @@ async def _try_embedding_samples(ctx) -> list[dict] | None:
 
             # Legacy BLOB fallback
             if has_blob:
-                stored = get_embeddings(conn, ctx.config_hash, ctx.config.llm.embed_model)
+                stored = get_embeddings(conn, ctx.config_hash, ctx.config.llm.embed_key())
                 if not stored:
                     return None
                 scored = brute_force_search(query_vec, stored, threshold=threshold)

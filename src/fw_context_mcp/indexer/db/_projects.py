@@ -19,7 +19,7 @@ __all__ = [
 def delete_build_data(conn: sqlite3.Connection, config_hash: str) -> None:
     """Delete all data for a given *config_hash*.
 
-    ``file_analysis`` and ``embeddings`` are handled by ON DELETE CASCADE —
+    ``embeddings`` are handled by ON DELETE CASCADE —
     they do not need explicit DELETE statements.
 
     Safe to call after a successful reindex — old config_hash data is
