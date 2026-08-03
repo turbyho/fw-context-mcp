@@ -517,6 +517,41 @@ project code (1.2×) over vendored SDK paths (0.85×).
 Requires Ollama with an embedding model. Falls back to `search_code` if
 Ollama is unavailable or disabled.
 
+#### `find_variables`
+
+Find C/C++ variables by name or prefix and trace who reads or writes them
+through the call graph. Splits variables into global (``varglobal`` — file/
+namespace/class-scope) and local (``varlocal`` — inside a function body).
+
+```
+Input:  {"name": "g_", "project_root?": "/path/to/project", "kind?": "varglobal", "limit?": 20}
+Output: [{"name": "g_debug_level", "qualified_name": "g_debug_level",
+          "kind": "varglobal", "file": "/path/src/logging.c", "line": 15,
+          "signature": "int g_debug_level",
+          "enclosing_function": "<file scope>", "enclosing_class": "",
+          "references": [
+            {"function": "log_init", "file": "/path/src/logging.c", "line": 42, "ref_kind": "ref"},
+            {"function": "log_write", "file": "/path/src/logging.c", "line": 68, "ref_kind": "ref"}
+          ]}, …]
+```
+
+Each result includes a type signature (``"bool timeSet"``,
+``"const IPAddress modbus_ip"``), the enclosing function for local
+variables (``"<file scope>"`` for globals), enclosing class for static
+members, and a ``references`` list showing every function that reads or
+writes the variable — the same ``ref_kind`` values as ``find_references``
+(``"call"``, ``"ref"``, ``"member"``).
+
+Use when you need to understand shared state, find who modifies a global
+variable, trace side effects, or distinguish important globals from loop
+counters. For general symbol search use ``search_code`` or ``lookup_symbol``.
+For all references to a specific variable (including reads in expressions),
+use ``find_references``.
+
+The ``kind`` parameter accepts ``"varglobal"``, ``"varlocal"``, or ``None``
+(both).  Legacy indexes with ``kind="variable"`` (pre-split) are included
+in results — reindex to fully benefit from the split.
+
 ### Understanding
 
 #### `get_file_map`

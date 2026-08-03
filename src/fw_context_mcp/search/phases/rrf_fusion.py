@@ -76,7 +76,7 @@ class RRFFusionPhase(Phase):
         if row.get("is_project") == 1:
             b *= self.PROJ_BOOST
         kind = row.get("kind", "")
-        if kind in ("function", "method", "constructor", "destructor"):
+        if kind in ("function", "method", "constructor", "destructor", "varglobal"):
             b *= self.FUNC_BOOST
         pr = row.get("pagerank", 0.0) or 0.0
         if pr > 0:

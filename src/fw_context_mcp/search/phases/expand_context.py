@@ -136,7 +136,8 @@ def _resolve_project_defs(
         f"FROM symbols WHERE config_hash = ? AND usr IN ({ph}) "
         f"AND is_definition = 1 AND is_project = 1 "
         f"ORDER BY CASE kind WHEN 'function' THEN 0 WHEN 'method' THEN 1 "
-        f"  WHEN 'constructor' THEN 2 WHEN 'destructor' THEN 3 ELSE 4 END",
+        f"  WHEN 'constructor' THEN 2 WHEN 'destructor' THEN 3 "
+        f"  WHEN 'varglobal' THEN 4 ELSE 5 END",
         (config_hash, *usrs),
     ).fetchall()
 
