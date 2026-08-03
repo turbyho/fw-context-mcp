@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 import sys
 
 from .. import __version__
@@ -47,9 +48,32 @@ def main() -> None:
     """Entry point for the ``fw-context`` CLI — dispatches subcommands.
 
     Subcommands: index, search, list, status, init, export, cache, db,
-    watch, finetune, analyze, version. Parses arguments via argparse and calls the
+    watch, finetune, analyze, doctor, version. Parses arguments via argparse and calls the
     corresponding ``cmd_*`` handler.
     """
+    # ── Fast pre-flight: critical dependency checks (<50ms) ──
+    # Skipped for doctor (which reports these itself), --version, --help,
+    # and bare invocation (help only).
+    _argv = sys.argv[1:] if len(sys.argv) > 1 else []
+    if (
+        os.environ.get("FW_CONTEXT_SKIP_PREFLIGHT") is None
+        and _argv
+        and _argv[0] not in ("doctor", "version", "--version", "--help", "-h")
+    ):
+        from ..deps import run_preflight
+
+        failures = [r for r in run_preflight() if r.status != "ok"]
+        if failures:
+            for r in failures:
+                print(
+                    f"fw-context: error: [{r.status.upper()}] {r.name}: {r.message}",
+                    file=sys.stderr,
+                )
+                if r.fix_cmd:
+                    print(f"  auto-fix: {r.fix_cmd}", file=sys.stderr)
+                if r.instructions:
+                    print(f"  {r.instructions}", file=sys.stderr)
+            sys.exit(1)
     parser = argparse.ArgumentParser(prog="fw-context", description="Firmware code intelligence")
     parser.add_argument("-v", "--verbose", action="store_true")
     parser.add_argument(
@@ -270,6 +294,13 @@ def main() -> None:
     p_finetune.add_argument("--batch-size", type=int, default=16, metavar="N",
                             help="Training batch size (default: 16)")
     p_finetune.set_defaults(func=cmd_finetune)
+
+    from ._doctor import cmd_doctor  # noqa: I001
+    p_doctor = sub.add_parser("doctor", help="Audit dependencies and repair broken installs")
+    p_doctor.add_argument("--fix", action="store_true", help="Attempt auto-repair of fixable issues")
+    p_doctor.add_argument("--json", action="store_true", help="Machine-readable JSON output")
+    p_doctor.add_argument("--project", metavar="DIR", help="Project root (default: cwd)")
+    p_doctor.set_defaults(func=cmd_doctor)
 
     args = parser.parse_args()
     if not hasattr(args, "func"):

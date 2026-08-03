@@ -271,11 +271,21 @@ def main() -> None:
     # Pre-populate the project-ready cache with a one-shot check.
     # _check_server_ready() raises RuntimeError when the project isn't
     # ready — we catch it here so the server can still start (tools will
-    # surface the error to the LLM on first call).
     try:
         _check_server_ready()
     except RuntimeError as exc:
         log.info("Project not ready at startup: %s", exc)
+
+    # Fast dependency pre-flight — warn on degraded deps, never exit
+    try:
+        from ..deps import run_preflight
+        for r in run_preflight():
+            if r.status != "ok":
+                log.warning("[%s] %s: %s", r.status.upper(), r.name, r.message)
+                if r.fix_cmd:
+                    log.warning("  fix: %s", r.fix_cmd)
+    except Exception:
+        log.debug("Dependency pre-flight skipped", exc_info=True)
 
     # If the project IS ready, pre-mark integrity check and ensure daemon.
     try:

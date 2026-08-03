@@ -545,8 +545,8 @@ class TestIncrementalReindex:
         # Restore original file for other tests
         modem_c.write_text(original, encoding="utf-8")
 
-    def test_reindex_preserves_analysis_for_unchanged_symbols(self, indexed_project: Path):
-        """Phase 3: unchanged symbols keep their LLM analysis after reindex."""
+    def test_reindex_without_analysis_deletes_llm_analysis(self, indexed_project: Path):
+        """_delete_old_for_tu cleans up llm_analysis; without_analysis=True skips regeneration."""
         import json
 
         db_path = _db_path_for_project(indexed_project)
@@ -613,7 +613,10 @@ class TestIncrementalReindex:
         assert "error" not in result, f"Reindex failed: {result.get('error')}"
         print(f"  Reindex result: {json.dumps(result)}")
 
-        # ── Verify: compute_checksum unchanged → analysis preserved ──
+        # ── Verify: analysis deleted by _delete_old_for_tu cleanup ──
+        # _delete_old_for_tu now cleans up llm_analysis for all symbols
+        # of the reindexed TU. Since with_analysis=False, the
+        # _reindex_llm_analysis post-phase is skipped — analysis stays gone.
         conn = open_db(db_path)
         try:
             ch = conn.execute("SELECT config_hash FROM build_configs ORDER BY created_at DESC LIMIT 1").fetchone()[
@@ -626,16 +629,15 @@ class TestIncrementalReindex:
             assert sym_row is not None
 
             ana_after = conn.execute(
-                "SELECT summary, inputs, outputs, model FROM llm_analysis WHERE symbol_id=?",
+                "SELECT summary FROM llm_analysis WHERE symbol_id=?",
                 (sym_row["id"],),
             ).fetchone()
-            # Analysis should be preserved because the function body didn't change
-            if ana_after:
-                assert ana_after["summary"] == "Computes XOR checksum of data buffer."
-                assert ana_after["inputs"] == "data: input, len: buffer length"
-                print(f"  Analysis preserved: {ana_after['summary']}")
-            else:
-                pytest.fail("Analysis was NOT preserved (may indicate hash mismatch)")
+            # Analysis was deleted — with_analysis=False means no regeneration
+            assert ana_after is None, (
+                f"Analysis should be deleted by _delete_old_for_tu cleanup, "
+                f"but got: {ana_after}"
+            )
+            print("  Analysis correctly deleted by cleanup")
 
         finally:
             conn.close()
@@ -1049,8 +1051,8 @@ class TestStoreSymbolsForUnitAnalysisRestore:
 
         return conn, "hash-0001", tmp_path
 
-    def test_phase1_saves_analysis_before_delete(self, store_db, tmp_path: Path):
-        """Phase 1: existing LLM analysis is captured before Phase 2 deletes symbols."""
+    def test_analysis_deleted_during_cleanup(self, store_db, tmp_path: Path):
+        """_delete_old_for_tu cleans up llm_analysis for all symbols of the TU."""
         from fw_context_mcp.indexer.ops import store_symbols_for_unit
 
         conn, config_hash, root = store_db
@@ -1059,8 +1061,10 @@ class TestStoreSymbolsForUnitAnalysisRestore:
         src_file = tmp_path / "test.c"
         src_file.write_text("void foo(void) {\n    return;\n}\n", encoding="utf-8")
 
-        # Manually upsert file and symbol with analysis
-        file_id = upsert_file(conn, config_hash, str(src_file), "c")
+        # Use a RELATIVE path so _normalize_file_path produces the same key
+        # that store_symbols_for_unit uses — otherwise the cleanup block
+        # in _delete_old_for_tu is skipped (normalized_tu_path not in known).
+        file_id = upsert_file(conn, config_hash, "test.c", "c")
         insert_symbols_batch(
             conn,
             [
@@ -1107,38 +1111,6 @@ class TestStoreSymbolsForUnitAnalysisRestore:
             (sym_id,),
         )
 
-        # Populate global cache — Phase 3 reads from ~/.fw-context/llm_cache.db.
-        # Redirect HOME so get_local_cache_db uses tmp_path.
-        from fw_context_mcp.utils import compute_content_hash
-
-        content_hash = compute_content_hash(
-            "void foo(void) {\n    return;\n}\n",
-            "foo",
-            "void foo(void)",
-            "",
-        )
-        import os as _os
-
-        _saved_home = _os.environ.get("HOME")
-        _os.environ["HOME"] = str(tmp_path)
-        try:
-            from fw_context_mcp.cache_client import get_local_cache_db
-
-            global_db = get_local_cache_db()
-            global_db.execute(
-                """INSERT OR REPLACE INTO llm_analysis_cache
-                   (content_hash, summary, inputs, outputs, model, analyzed_at)
-                   VALUES (?, ?, ?, ?, ?, datetime('now'))""",
-                (content_hash, "Test function.", "none", "void", "test"),
-            )
-            global_db.commit()
-            global_db.close()
-        finally:
-            if _saved_home is None:
-                _os.environ.pop("HOME", None)
-            else:
-                _os.environ["HOME"] = _saved_home
-
         # Verify analysis exists before
         ana_before = conn.execute("SELECT COUNT(*) FROM llm_analysis").fetchone()[0]
         assert ana_before == 1
@@ -1175,7 +1147,10 @@ class TestStoreSymbolsForUnitAnalysisRestore:
             template_usr="",
         )
 
-        # Call store_symbols_for_unit — this triggers Phase 1 save → Phase 2 delete → Phase 3 restore
+        # store_symbols_for_unit calls _delete_old_for_tu which now cleans
+        # up llm_analysis (along with embeddings and vec_symbols) before
+        # re-inserting symbols.  The old analysis is deleted and no longer
+        # associated with the new symbol IDs.
         with transaction(conn):
             syms_added, _, _ = store_symbols_for_unit(
                 conn,
@@ -1190,14 +1165,14 @@ class TestStoreSymbolsForUnitAnalysisRestore:
 
         assert syms_added == 1
 
-        # Check analysis is still there (Phase 3 restored it because content didn't change)
+        # Analysis should be GONE — _delete_old_for_tu cleaned it up
         ana_after = conn.execute("SELECT COUNT(*) FROM llm_analysis").fetchone()[0]
-        assert ana_after == 1, f"Expected 1 analysis after reindex, got {ana_after}"
+        assert ana_after == 0, f"Expected 0 analyses after cleanup, got {ana_after}"
 
         conn.close()
 
-    def test_phase3_does_not_restore_when_content_changed(self, store_db, tmp_path: Path):
-        """Phase 3: changed symbol content means analysis is NOT restored."""
+    def test_analysis_dropped_when_content_changed(self, store_db, tmp_path: Path):
+        """Changed symbol content means analysis is dropped during reindex."""
         from fw_context_mcp.indexer.ops import store_symbols_for_unit
 
         conn, config_hash, root = store_db
@@ -1302,9 +1277,9 @@ class TestStoreSymbolsForUnitAnalysisRestore:
         assert syms_added == 1
 
         # Analysis should be GONE because body changed (return x * 2 → x * 3).
-        # _save_old_state now computes content_hash from the OLD body stored
-        # in the symbols.source column, so it can detect that the file changed
-        # even though Phase 3 reads the NEW body from disk.
+        # _delete_old_for_tu cleans up old llm_analysis rows before re-inserting
+        # symbols, and the new symbols get fresh IDs.  The old analysis is no
+        # longer associated with any existing symbol.
         ana_after = conn.execute("SELECT COUNT(*) FROM llm_analysis").fetchone()[0]
         assert ana_after == 0, (
             f"Expected analysis to be DROPPED (body changed: x*2 → x*3), "
@@ -1314,8 +1289,8 @@ class TestStoreSymbolsForUnitAnalysisRestore:
 
         conn.close()
 
-    def test_symbols_without_analysis_not_in_saved_analyses(self, store_db, tmp_path: Path):
-        """Phase 1 only saves symbols that have llm_analysis rows."""
+    def test_symbols_without_analysis_not_restored(self, store_db, tmp_path: Path):
+        """Symbols without existing analysis do not get analysis during reindex."""
         from fw_context_mcp.indexer.ops import store_symbols_for_unit
 
         conn, config_hash, root = store_db

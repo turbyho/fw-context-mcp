@@ -453,47 +453,22 @@ def _detect_moved_symbols(
 
 def _save_old_state(
     conn: sqlite3.Connection,
-    config_hash: str,
     normalized_tu_path: str,
     known: dict[str, tuple[int, float]],
-) -> tuple[set[str], dict[str, dict]]:
-    """Save USRs and LLM analysis of symbols that existed in a previous build.
+) -> set[str]:
+    """Return USRs of symbols that existed for this TU in a previous build.
 
-    Returns (old_usrs, saved_analyses) for use by _restore_llm_analysis
-    and _detect_moved_symbols later in the pipeline.
+    Used by :func:`_detect_moved_symbols` to detect symbols that moved
+    between files.
     """
-    old_usrs: set[str] = set()
-    saved_analyses: dict[str, dict] = {}
     if normalized_tu_path not in known:
-        return old_usrs, saved_analyses
+        return set()
     file_id_old = known[normalized_tu_path][0]
-    old_rows = conn.execute(
-        """SELECT s.usr, a.summary, a.inputs, a.outputs, a.model, a.content_hash,
-                  s.source, s.qualified_name, s.signature, s.docstring
-           FROM symbols s
-           LEFT JOIN llm_analysis a ON a.symbol_id = s.id
-           WHERE s.file_id = ?""",
+    rows = conn.execute(
+        "SELECT usr FROM symbols WHERE file_id = ?",
         (file_id_old,),
     ).fetchall()
-    for r in old_rows:
-        old_usrs.add(r["usr"])
-        if r["summary"]:
-            ch = r["content_hash"] or ""
-            if not ch and r["source"]:
-                # content_hash was NULL — compute from the OLD body stored
-                # in the symbols table so we can detect whether the source
-                # file changed between the previous index and now.
-                ch = compute_content_hash(
-                    r["source"], r["qualified_name"], r["signature"], r["docstring"]
-                )
-            saved_analyses[r["usr"]] = {
-                "summary": r["summary"],
-                "inputs": r["inputs"],
-                "outputs": r["outputs"],
-                "model": r["model"],
-                "content_hash": ch,
-            }
-    return old_usrs, saved_analyses
+    return {r["usr"] for r in rows}
 
 
 def _delete_old_for_tu(
@@ -518,6 +493,27 @@ def _delete_old_for_tu(
             )
     if normalized_tu_path in known:
         file_id_old = known[normalized_tu_path][0]
+        # Clean embeddings and analyses for symbols about to be deleted —
+        # avoids orphaned rows in embeddings, vec_symbols, and llm_analysis
+        # tables after re-insertion.
+        conn.execute(
+            "DELETE FROM embeddings WHERE symbol_id IN "
+            "(SELECT id FROM symbols WHERE file_id = ?)",
+            (file_id_old,),
+        )
+        conn.execute(
+            "DELETE FROM llm_analysis WHERE symbol_id IN "
+            "(SELECT id FROM symbols WHERE file_id = ?)",
+            (file_id_old,),
+        )
+        try:
+            conn.execute(
+                "DELETE FROM vec_symbols WHERE symbol_id IN "
+                "(SELECT id FROM symbols WHERE file_id = ?)",
+                (file_id_old,),
+            )
+        except sqlite3.OperationalError:
+            pass  # sqlite-vec may not be loaded
         delete_inheritance_for_file(conn, config_hash, file_id_old)
         delete_symbols_for_file(conn, file_id_old)
 
@@ -686,8 +682,8 @@ def store_symbols_for_unit(
     # ── Clear body cache per TU — fresh reads for each translation unit ──
     _clear_body_cache()
 
-    # ── Phase 1: Save USRs + analysis of old symbols ──
-    old_usrs, saved_analyses = _save_old_state(conn, config_hash, normalized_tu_path, known)
+    # ── Phase 1: Save USRs of old symbols ──
+    old_usrs = _save_old_state(conn, normalized_tu_path, known)
 
     # ── Phase 2: Delete old symbols ──
     _delete_old_for_tu(conn, config_hash, normalized_tu_path, known, syms)

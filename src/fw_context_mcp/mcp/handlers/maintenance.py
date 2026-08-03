@@ -305,6 +305,14 @@ def get_active_build(
     result["bg_reindex_running"] = bg_running
     if bg_running:
         result["reindex_progress"] = _read_reindex_progress(db_path)
+
+    # sqlite-vec availability for semantic_search
+    from ...deps import _vec_available
+    vec_ok, vec_err = _vec_available()
+    result["vec_available"] = vec_ok
+    if vec_err is not None:
+        result["vec_error"] = vec_err
+
     return result
 def _read_reindex_progress(db_path: Path) -> str | None:
     """Read the last line of reindex.log, or None if unavailable."""
@@ -580,6 +588,22 @@ def _reindex_cleanup_deleted_file(
         try:
             with _db_write_lock(db_path.parent, timeout=60.0):
                 with transaction(conn):
+                    try:
+                        conn.execute(
+                            "DELETE FROM embeddings WHERE symbol_id IN "
+                            "(SELECT id FROM symbols WHERE file_id = ?)",
+                            (file_id_old,),
+                        )
+                    except sqlite3.OperationalError:
+                        pass
+                    try:
+                        conn.execute(
+                            "DELETE FROM llm_analysis WHERE symbol_id IN "
+                            "(SELECT id FROM symbols WHERE file_id = ?)",
+                            (file_id_old,),
+                        )
+                    except sqlite3.OperationalError:
+                        pass
                     try:
                         conn.execute(
                             "DELETE FROM vec_symbols WHERE symbol_id IN "
@@ -1084,19 +1108,11 @@ def check_ollama(
     result["ollama_enabled"] = True
 
     # Check sqlite-vec availability for semantic_search
-    try:
-        import sqlite3 as _sqlite3
-
-        import sqlite_vec
-        _conn = _sqlite3.connect(":memory:")
-        _conn.enable_load_extension(True)
-        sqlite_vec.load(_conn)
-        _conn.close()
-        result["vec_available"] = True
-        result["vec_error"] = None
-    except Exception as e:
-        result["vec_available"] = False
-        result["vec_error"] = str(e)
+    from ...deps import _vec_available
+    vec_ok, vec_err = _vec_available()
+    result["vec_available"] = vec_ok
+    if vec_err is not None:
+        result["vec_error"] = vec_err
 
     return result
 
