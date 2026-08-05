@@ -77,6 +77,7 @@ def _build_sdk_excludes(root: Path) -> list[str]:
     excludes: list[str] = []
     if build_system == "mbed-os":
         excludes.append("mbed-os/%")
+        excludes.append("BUILD/%")
     elif build_system == "platformio":
         excludes.extend([".pio/%", "%.platformio/%"])
     elif build_system == "zephyr":
