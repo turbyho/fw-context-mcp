@@ -7,6 +7,7 @@ build phase.
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import sqlite3
 import time
@@ -27,6 +28,28 @@ def _embed_model_key(embed_model: str, embed_bodies: bool) -> str:
     """Return the cache-disambiguating model key including the description version."""
     version = DESCRIPTION_VERSION if embed_bodies else "desc-v1"
     return f"{embed_model}:{version}"
+
+
+def _embed_content_hash(r) -> str:
+    """Content-addressable hash of the fields that feed an embedding description.
+
+    Mirrors the description assembly in :func:`_build_embeddings`: any change
+    to name, qualified name, kind, file path, signature, docstring, LLM
+    summary, or body must invalidate the embedding so the symbol is
+    re-embedded on the next index run.
+    """
+
+    raw = "|".join([
+        r["name"] or "",
+        r["qualified_name"] or "",
+        r["kind"] or "",
+        r["file_path"] or "",
+        r["signature"] or "",
+        r["docstring"] or "",
+        r["summary"] or "",
+        r["source"] or "",
+    ])
+    return hashlib.sha256(raw.encode("utf-8", errors="replace")).hexdigest()
 
 
 def _chunk_body(source: str, max_chars: int) -> list[str]:
@@ -146,8 +169,8 @@ def _cleanup_orphaned_cc_artifacts(db_path: Path, project_id: str) -> int:
     if not cc_dir.is_dir():
         return 0
 
-    # Collect active config_hashes from the database (best-effort — DB may
-    # not exist yet on first index or after reset_index).
+    # Collect active config_hashes from the database — DB may not exist yet
+    # on first index or after reset_index.
     active_hashes: set[str] = set()
     if db_path.exists():
         try:
@@ -234,6 +257,44 @@ def _build_embeddings(
             log.warning("Embedding model not installed. Run manual reindex to pull it.")
             return
     model = _embed_model_key(embedder.name, True)
+
+    # ── Incremental re-embedding (Phase 0) ──
+    # Skip symbols whose embedding description content did not change since
+    # the last successful embedding pass.  Without this, every `fw-context
+    # index` run re-embeds ALL definition symbols even when nothing changed
+    # (the embeddings step has no idempotency check otherwise).
+    #
+    # Safety gate: only skip when a previous embedding pass stored a known
+    # embedding_dim for this build config.  On the very first run (no stored
+    # dim) every symbol is embedded so the vec0 table is (re)built fully and
+    # the dimension is recorded.  When the dimension later changes (model
+    # switched) the skip is disabled, vec0 is recreated, and everything is
+    # re-embedded.
+    existing_hashes: dict[int, str] = {}
+    stored_dim: int | None = None
+    try:
+        _dim_row = conn.execute(
+            "SELECT embedding_dim FROM build_configs WHERE config_hash = ?",
+            (config_hash,),
+        ).fetchone()
+        if _dim_row is not None:
+            stored_dim = _dim_row["embedding_dim"]
+    except sqlite3.OperationalError:
+        pass
+    incremental_ok = stored_dim is not None
+    if incremental_ok:
+        try:
+            _hash_rows = conn.execute(
+                """SELECT e.symbol_id, e.content_hash
+                   FROM embeddings e
+                   JOIN symbols s ON s.id = e.symbol_id
+                   WHERE e.model = ? AND s.config_hash = ? AND e.chunk_index = 0""",
+                (model, config_hash),
+            ).fetchall()
+            existing_hashes = {r["symbol_id"]: r["content_hash"] for r in _hash_rows}
+        except sqlite3.OperationalError:
+            pass  # content_hash column missing (pre-migration) — fall back to full embed
+
     # ── Phase 1: SELECT symbols to embed (read-only) ──
     if symbol_ids:
         id_placeholders = ",".join("?" * len(symbol_ids))
@@ -269,84 +330,114 @@ def _build_embeddings(
         log.info("No definition symbols to embed (model=%s)", model)
         return
 
+    # Save full row set before incremental filter — needed for dim-change restart.
+    _all_rows = rows
+    # Keep only symbols whose content changed or which lack an embedding for
+    # this model key.  When incremental_ok is False (no stored dim yet) the
+    # filter is a no-op — everything is embedded.
+    if incremental_ok:
+        to_embed = [
+            r for r in rows if existing_hashes.get(r["id"]) != _embed_content_hash(r)
+        ]
+        skipped = len(rows) - len(to_embed)
+        if skipped:
+            log.info(
+                "Embeddings: %d/%d symbols unchanged — skipped (model=%s)",
+                skipped, len(rows), model,
+            )
+        rows = to_embed
+        if not rows:
+            log.info("All symbols already embedded (model=%s) — nothing to do", model)
+            return
+
+    target_ids = sorted({r["id"] for r in rows})
+    log.info(
+        "Embeddings: %d symbols to embed (model=%s, %s)",
+        len(target_ids), model,
+        "full rebuild" if not incremental_ok else "incremental",
+    )
+
     # Build contextual descriptions — flowing sentences instead of token lists.
     # Anthropic Contextual Retrieval: chunk-specific context as sentences improves
     # embedding recall by -35% failures vs token-boundary lists.
     body_kinds = frozenset({"function", "method", "constructor", "destructor"})
     max_body_chars = embedder.max_tokens * 4
 
-    # Build description rows — one per (symbol, chunk).
-    # Most symbols produce a single chunk; long functions get split into
-    # multiple chunks, each with its own embedding.
-    desc_rows: list[tuple[dict, int, str]] = []  # (symbol_row, chunk_idx, description)
-    for r in rows:
-        fp = (r["file_path"] or "").replace("\\", "/")
-        path = ""
-        module = ""
-        if "/" in fp:
-            *dirs, fname = fp.split("/")
-            path = "/".join(dirs[-2:])
-            module = dirs[-1] if dirs else ""
-        qname = r["qualified_name"] or ""
-        name = r["name"] or ""
-        kind = r["kind"] or ""
-        class_ = "::".join(qname.split("::")[:-1]) if "::" in qname else ""
-        sig = r["signature"] or ""
-        is_vendor = r["is_project"] == 0
-        doc = ""
-        if not is_vendor:
-            doc = (r["docstring"] or "").strip()
-            if doc and len(doc) > 20:
-                doc = doc[:150]
-        llm = (r["summary"] or "").strip()
-        if llm:
-            llm = llm[:200]
+    desc_rows: list[tuple[dict, int, str]] = []
 
-        # ---- context_prefix: kind + name + location as natural sentence ----
-        clauses = [f"{kind} {name}"]
-        if class_:
-            clauses.append(f"in class {class_}")
-        if module:
-            clauses.append(f"in module {module}")
-        if path:
-            clauses.append(f"at {path}")
-        if fp:
-            clauses.append(f"file: {fp}")
-        context_prefix = ", ".join(clauses) + "."
+    def _rebuild_desc_rows() -> None:
+        """(Re)build description rows from the current ``rows`` list.
 
-        # ---- sig line ----
-        sig_line = f" Signature: {sig}." if sig else ""
+        Clears and refills ``desc_rows`` — called once before Phase 2 and
+        again when a dim change forces a full rebuild.
+        """
+        desc_rows.clear()
+        for r in rows:
+            fp = (r["file_path"] or "").replace("\\", "/")
+            path = ""
+            module = ""
+            if "/" in fp:
+                *dirs, fname = fp.split("/")
+                path = "/".join(dirs[-2:])
+                module = dirs[-1] if dirs else ""
+            qname = r["qualified_name"] or ""
+            name = r["name"] or ""
+            kind = r["kind"] or ""
+            class_ = "::".join(qname.split("::")[:-1]) if "::" in qname else ""
+            sig = r["signature"] or ""
+            is_vendor = r["is_project"] == 0
+            doc = ""
+            if not is_vendor:
+                doc = (r["docstring"] or "").strip()
+                if doc and len(doc) > 20:
+                    doc = doc[:150]
+            llm = (r["summary"] or "").strip()
+            if llm:
+                llm = llm[:200]
 
-        # ---- doc/summary as flowing text ----
-        extra = []
-        if doc:
-            extra.append(doc)
-        if llm:
-            extra.append(llm)
-        extra_text = " ".join(extra) if extra else ""
+            clauses = [f"{kind} {name}"]
+            if class_:
+                clauses.append(f"in class {class_}")
+            if module:
+                clauses.append(f"in module {module}")
+            if path:
+                clauses.append(f"at {path}")
+            if fp:
+                clauses.append(f"file: {fp}")
+            context_prefix = ", ".join(clauses) + "."
 
-        # ---- body (for function-like kinds) ----
-        body_chunks: list[str] = []
-        if kind in body_kinds:
-            source = (r["source"] or "").strip()
-            if source:
-                body_chunks = _chunk_body(source, max_body_chars)
+            sig_line = f" Signature: {sig}." if sig else ""
 
-        if not body_chunks:
-            body_chunks = [""]  # single description, no body
+            extra = []
+            if doc:
+                extra.append(doc)
+            if llm:
+                extra.append(llm)
+            extra_text = " ".join(extra) if extra else ""
 
-        n_chunks = len(body_chunks)
-        for ci, body in enumerate(body_chunks):
-            body_text = ""
-            if body:
-                if n_chunks > 1:
-                    body_text = f"\n\nBody [part {ci + 1}/{n_chunks}]:\n{body}"
-                else:
-                    body_text = f"\n\nBody:\n{body}"
-            desc_rows.append((
-                r, ci,
-                f"{context_prefix}{sig_line} {extra_text}{body_text}".rstrip() + "\n",
-            ))
+            body_chunks: list[str] = []
+            if kind in body_kinds:
+                source = (r["source"] or "").strip()
+                if source:
+                    body_chunks = _chunk_body(source, max_body_chars)
+
+            if not body_chunks:
+                body_chunks = [""]
+
+            n_chunks = len(body_chunks)
+            for ci, body in enumerate(body_chunks):
+                body_text = ""
+                if body:
+                    if n_chunks > 1:
+                        body_text = f"\n\nBody [part {ci + 1}/{n_chunks}]:\n{body}"
+                    else:
+                        body_text = f"\n\nBody:\n{body}"
+                desc_rows.append((
+                    r, ci,
+                    f"{context_prefix}{sig_line} {extra_text}{body_text}".rstrip() + "\n",
+                ))
+
+    _rebuild_desc_rows()
 
     # ── Phase 2: Generate and store embeddings incrementally ──
     # Write in transactions of up to CHUNK_SYMBOLS (5000) symbols to avoid
@@ -360,7 +451,6 @@ def _build_embeddings(
     embedding_dim: int | None = None
     chunk_blob: list[tuple] = []
     chunk_vec: list[tuple] = []
-    chunk_sym_ids: list[int] = []
     first_chunk = True
 
     def _flush_chunk() -> None:
@@ -371,37 +461,22 @@ def _build_embeddings(
         with write_lock(db_dir, timeout=30.0):
             with transaction(conn):
                 if first_chunk:
-                    # DELETE old embeddings for all symbols being processed
-                    if symbol_ids:
-                        id_phs = ",".join("?" * len(symbol_ids))
+                    # DELETE old embeddings only for the symbols being (re)embedded.
+                    # Unchanged symbols keep their existing rows — this is what
+                    # makes repeated `fw-context index` runs incremental instead of
+                    # re-embedding every definition symbol.
+                    id_phs = ",".join("?" * len(target_ids))
+                    conn.execute(
+                        f"DELETE FROM embeddings WHERE model = ? AND symbol_id IN ({id_phs})",
+                        (model, *target_ids),
+                    )
+                    try:
                         conn.execute(
-                            f"DELETE FROM embeddings WHERE model = ? AND symbol_id IN ({id_phs})",
-                            (model, *symbol_ids),
+                            f"DELETE FROM vec_symbols WHERE config_hash = ? AND symbol_id IN ({id_phs})",
+                            (config_hash, *target_ids),
                         )
-                        try:
-                            conn.execute(
-                                f"DELETE FROM vec_symbols WHERE config_hash = ? AND symbol_id IN ({id_phs})",
-                                (config_hash, *symbol_ids),
-                            )
-                        except sqlite3.OperationalError:
-                            pass
-                    else:
-                        conn.execute(
-                            """DELETE FROM embeddings WHERE model = ?
-                               AND symbol_id IN (
-                                   SELECT s.id FROM symbols s
-                                   WHERE s.config_hash = ?
-                                     AND s.is_definition = 1
-                                     AND s.kind IN ('function','method','constructor','destructor',
-                                                    'class','struct','union','typedef','enum','varglobal')
-                               )""",
-                            (model, config_hash),
-                        )
-                        try:
-                            conn.execute("DELETE FROM vec_symbols WHERE config_hash = ?",
-                                         (config_hash,))
-                        except sqlite3.OperationalError:
-                            pass
+                    except sqlite3.OperationalError:
+                        pass
                     first_chunk = False
                 upsert_embeddings(conn, chunk_blob)
                 try:
@@ -414,7 +489,10 @@ def _build_embeddings(
 
     chunk_size = 100
     total_batches = (len(desc_rows) + chunk_size - 1) // chunk_size
-    for i in range(0, len(desc_rows), chunk_size):
+    _phase2_idx = 0
+    while _phase2_idx < len(desc_rows):
+        i = _phase2_idx
+        _phase2_idx += chunk_size
         batch_num = i // chunk_size
         batch = desc_rows[i : i + chunk_size]
         chunk_descs = [d for _, _, d in batch]
@@ -433,15 +511,36 @@ def _build_embeddings(
             log.info("Embedding dimension detected: %d (model=%s)", embedding_dim, model)
             from .db import init_vec_table
 
-            try:
-                init_vec_table(conn, embedding_dim)
-            except SAFE_EXCEPT as e:
-                if is_fatal(e):
-                    raise
-                log.warning("vec0 table recreation failed (non-fatal): %s", e)
+            dim_changed = stored_dim != embedding_dim
+            if dim_changed:
+                log.info("Embedding dimension changed %d → %d — forcing full rebuild", stored_dim, embedding_dim)
+                try:
+                    init_vec_table(conn, embedding_dim, recreate=True)
+                except SAFE_EXCEPT as e:
+                    if is_fatal(e):
+                        raise
+                    log.warning("vec0 table recreation failed (non-fatal): %s", e)
+                rows = _all_rows
+                target_ids.clear()
+                target_ids.extend(sorted({r["id"] for r in rows}))
+                chunk_blob.clear()
+                chunk_vec.clear()
+                first_chunk = True
+                total = 0
+                _rebuild_desc_rows()
+                total_batches = (len(desc_rows) + chunk_size - 1) // chunk_size
+                _phase2_idx = 0
+                continue
+            else:
+                try:
+                    init_vec_table(conn)
+                except SAFE_EXCEPT as e:
+                    if is_fatal(e):
+                        raise
+                    log.warning("vec0 table ensure failed (non-fatal): %s", e)
 
         blob_rows = [
-            (r["id"], ci, _vec_to_blob(emb), model)
+            (r["id"], ci, _vec_to_blob(emb), model, _embed_content_hash(r))
             for (r, ci, _), emb in zip(batch, embs, strict=True)
         ]
         vec_rows = [
@@ -450,7 +549,6 @@ def _build_embeddings(
         ]
         chunk_blob.extend(blob_rows)
         chunk_vec.extend(vec_rows)
-        chunk_sym_ids.extend(r["id"] for r, _, _ in batch)
 
         elapsed = time.monotonic() - t0
         log.info("[%d/%d] %d symbols embedded %s", batch_num + 1, total_batches, len(batch), _fmt_dur(elapsed))
@@ -459,7 +557,6 @@ def _build_embeddings(
             _flush_chunk()
             chunk_blob.clear()
             chunk_vec.clear()
-            chunk_sym_ids.clear()
 
     # Flush remaining
     _flush_chunk()
