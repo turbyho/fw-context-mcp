@@ -26,7 +26,15 @@ if TYPE_CHECKING:
 
 log = logging.getLogger(__name__)
 
-# ── Connection cache ────────────────────────────────────────────────────
+# ── Connection pool ─────────────────────────────────────────────────────
+#
+# Each db_key gets a pool of N read-only connections (N=4) for concurrent
+# request handling.  Pool connections beyond the first skip integrity
+# checks — the primary connection already verified the DB.  WAL mode
+# allows multiple concurrent readers without blocking.
+#
+# Round-robin allocation ensures requests are distributed evenly across
+# pool connections, preventing a single slow query from starving others.
 
 
 @dataclass
@@ -35,9 +43,11 @@ class _ConnCacheEntry:
     opened_at: float
 
 
-_conn_cache: dict[str, _ConnCacheEntry] = {}
-_conn_cache_lock = threading.Lock()
-_CONN_TTL = 60  # seconds
+_conn_pool: dict[str, list[_ConnCacheEntry]] = {}
+_conn_pool_lock = threading.Lock()
+_pool_index: dict[str, int] = {}  # round-robin cursor per db_key
+_POOL_SIZE = 4
+_CONN_TTL = 300  # seconds — pool lives for the server lifetime (was 60)
 
 # ── Integrity check cache ───────────────────────────────────────────────
 
@@ -47,22 +57,26 @@ _integrity_lock = threading.Lock()
 
 def _invalidate_conn_cache(db_key: str | None = None) -> None:
     """Evict cached connections.  Pass ``None`` to clear all."""
-    with _conn_cache_lock:
+    with _conn_pool_lock:
         if db_key is None:
-            for entry in _conn_cache.values():
+            for pool in _conn_pool.values():
+                for entry in pool:
+                    try:
+                        entry.conn.close()
+                    except sqlite3.Error:
+                        pass
+            _conn_pool.clear()
+            _pool_index.clear()
+            with _integrity_lock:
+                _integrity_checked.clear()
+        elif db_key in _conn_pool:
+            for entry in _conn_pool[db_key]:
                 try:
                     entry.conn.close()
                 except sqlite3.Error:
                     pass
-            _conn_cache.clear()
-            with _integrity_lock:
-                _integrity_checked.clear()
-        elif db_key in _conn_cache:
-            try:
-                _conn_cache[db_key].conn.close()
-            except sqlite3.Error:
-                pass
-            del _conn_cache[db_key]
+            del _conn_pool[db_key]
+            _pool_index.pop(db_key, None)
             with _integrity_lock:
                 _integrity_checked.discard(db_key)
 
@@ -70,134 +84,187 @@ def _invalidate_conn_cache(db_key: str | None = None) -> None:
 def _invalidate_conn_cache_if_reindex_done(
     db_key: str, reindex_pid_file: Path
 ) -> None:
-    """Evict cached connection when a background reindex has completed."""
-    if db_key not in _conn_cache:
+    """Evict cached connections when a background reindex has completed."""
+    if db_key not in _conn_pool:
         return
     if not reindex_pid_file.exists():
         _invalidate_conn_cache(db_key)
 
 
-def _evict_stale_entry(db_key: str) -> None:
-    """Close and evict a cached connection if its TTL has expired."""
-    with _conn_cache_lock:
-        entry = _conn_cache.get(db_key)
-        if entry is None:
+def _evict_stale_entries(db_key: str) -> None:
+    """Close and evict stale connections from the pool for *db_key*."""
+    now = time.monotonic()
+    with _conn_pool_lock:
+        pool = _conn_pool.get(db_key)
+        if pool is None:
             return
-        if time.monotonic() - entry.opened_at > _CONN_TTL:
-            try:
-                entry.conn.close()
-            except sqlite3.Error:
-                pass
-            del _conn_cache[db_key]
+        live: list[_ConnCacheEntry] = []
+        for entry in pool:
+            if now - entry.opened_at > _CONN_TTL:
+                try:
+                    entry.conn.close()
+                except sqlite3.Error:
+                    pass
+            else:
+                live.append(entry)
+        if live:
+            _conn_pool[db_key] = live
+        else:
+            del _conn_pool[db_key]
+            _pool_index.pop(db_key, None)
             with _integrity_lock:
                 _integrity_checked.discard(db_key)
 
 
-def _check_cached_conn(db_key: str) -> sqlite3.Connection | None:
-    """Return a live cached connection, or None if dead/expired."""
-    with _conn_cache_lock:
-        entry = _conn_cache.get(db_key)
-        if entry is None:
+def _check_pool_health(db_key: str) -> sqlite3.Connection | None:
+    """Verify all pool connections are live; return an arbitrary live one or None."""
+    with _conn_pool_lock:
+        pool = _conn_pool.get(db_key)
+        if pool is None or not pool:
             return None
-    try:
-        entry.conn.execute("SELECT 1")
-        entry.opened_at = time.monotonic()  # bump TTL on each successful use
-        return entry.conn
-    except sqlite3.Error:
-        _invalidate_conn_cache(db_key)
-        return None
+        entries = list(pool)  # snapshot under lock — avoids iterating stale list
+    now = time.monotonic()
+    for entry in entries:
+        try:
+            entry.conn.execute("SELECT 1")
+            entry.opened_at = now
+            return entry.conn
+        except sqlite3.Error:
+            pass
+    _invalidate_conn_cache(db_key)
+    return None
 
 
 def _open_and_cache(db_key: str, db_path: Path) -> sqlite3.Connection:
-    """Open a database connection and cache it.
+    """Ensure the connection pool exists and return a connection from it.
 
-    Double-checked locking with IO outside the lock: ``open_db()``
-    (which includes schema migrations and integrity checks) runs
-    before acquiring ``_conn_cache_lock`` so IO-intensive work does
-    not block other threads from accessing the cache.
+    The first call creates 1 connection.  On subsequent calls, if the pool
+    has fewer than *POOL_SIZE* entries AND the round-robin cursor wraps to
+    the first connection, a new connection is added lazily — this amortises
+    ``open_db`` cost across requests instead of paying it all upfront.
     """
-    # Fast path: connection already cached — return immediately
-    with _conn_cache_lock:
-        if db_key in _conn_cache:
-            return _conn_cache[db_key].conn
+    with _conn_pool_lock:
+        pool = _conn_pool.get(db_key)
+        if pool:
+            idx = _pool_index.get(db_key, 0)
+            _pool_index[db_key] = idx + 1
+            if idx >= len(pool):
+                idx = 0
+                _pool_index[db_key] = 1
+            return pool[idx].conn
 
-    # Open the database OUTSIDE the cache lock — IO-intensive work
-    # (schema migrations, integrity checks) should not block other threads
     db_path.parent.mkdir(parents=True, exist_ok=True)
-    conn = None
+    skip_integrity = db_key in _integrity_checked
+
     try:
-        skip_integrity = db_key in _integrity_checked
-        conn = open_db(db_path.resolve(), check_same_thread=False, skip_integrity_check=skip_integrity)
+        primary_conn = open_db(
+            db_path.resolve(),
+            check_same_thread=False,
+            skip_integrity_check=skip_integrity,
+        )
     except DatabaseCorruptionError:
-        if conn:
-            conn.close()
         raise
 
-    # Insert into cache under lock — double-check another thread didn't win
-    should_check = False
-    with _conn_cache_lock:
-        if db_key in _conn_cache:
-            # Another thread already cached a connection — close our duplicate
+    with _integrity_lock:
+        if db_key not in _integrity_checked:
+            _integrity_checked.add(db_key)
+
+    now = time.monotonic()
+    entries = [_ConnCacheEntry(conn=primary_conn, opened_at=now)]
+
+    with _conn_pool_lock:
+        if db_key in _conn_pool:
             try:
-                conn.close()
+                primary_conn.close()
             except sqlite3.Error:
                 pass
-            return _conn_cache[db_key].conn
+            pool = _conn_pool[db_key]
+            idx = _pool_index.get(db_key, 0) % len(pool)
+            _pool_index[db_key] = idx + 1
+            return pool[idx].conn
 
-        with _integrity_lock:
-            if db_key not in _integrity_checked:
-                _integrity_checked.add(db_key)
-                should_check = True
+        _conn_pool[db_key] = entries
+        _pool_index[db_key] = 1
 
-        _conn_cache[db_key] = _ConnCacheEntry(conn=conn, opened_at=time.monotonic())
+    if not skip_integrity:
+        _check_integrity(primary_conn)
 
-    # Integrity check outside the cache lock so concurrent tool calls are not blocked
-    if should_check:
-        # Fast check first — PRAGMA quick_check is O(1), catches most corruption
-        try:
-            quick_result = conn.execute("PRAGMA quick_check").fetchone()
-            if quick_result and quick_result[0] != "ok":
-                log.warning("quick_check failed: %s — database may be corrupt", quick_result[0])
-                # Fall through to full integrity_check for details
-        except sqlite3.Error:
-            pass
+    return primary_conn
 
-        # Full PRAGMA integrity_check runs once per process per DB.
-        # For large databases (>100 MB) this can take seconds, but it's the
-        # only way to catch subtle index corruption that quick_check misses.
-        # The result is cached so subsequent tool calls skip this entirely.
-        try:
-            result = conn.execute("PRAGMA integrity_check").fetchone()
-            if result and result[0] != "ok":
-                log.warning("integrity_check: %s", result[0])
-        except sqlite3.Error:
-            pass
 
-    return conn
+def _maybe_expand_pool(db_key: str, db_path: Path) -> None:
+    """Add a new connection to the pool if under *POOL_SIZE* and the cursor
+    has wrapped to trigger it.  Called after each request to grow lazily."""
+    with _conn_pool_lock:
+        pool = _conn_pool.get(db_key)
+        if pool is None or len(pool) >= _POOL_SIZE:
+            return
+
+    try:
+        c = open_db(
+            db_path.resolve(),
+            check_same_thread=False,
+            skip_integrity_check=True,
+        )
+    except (sqlite3.Error, DatabaseCorruptionError) as exc:
+        log.debug("Lazy pool expansion failed for %s: %s", db_key, exc)
+        return
+
+    with _conn_pool_lock:
+        pool = _conn_pool.get(db_key)
+        if pool is not None and len(pool) < _POOL_SIZE:
+            pool.append(_ConnCacheEntry(conn=c, opened_at=time.monotonic()))
+
+
+def _check_integrity(conn: sqlite3.Connection) -> None:
+    """Run PRAGMA quick_check + integrity_check on *conn* (one-time)."""
+    try:
+        quick_result = conn.execute("PRAGMA quick_check").fetchone()
+        if quick_result and quick_result[0] != "ok":
+            log.warning("quick_check failed: %s — database may be corrupt", quick_result[0])
+    except sqlite3.Error:
+        pass
+
+    try:
+        result = conn.execute("PRAGMA integrity_check").fetchone()
+        if result and result[0] != "ok":
+            log.warning("integrity_check: %s", result[0])
+    except sqlite3.Error:
+        pass
 
 
 def _open_db_safe(db_path: Path) -> tuple[sqlite3.Connection | None, dict | None]:
-    """Public entry point: evict stale, check cached, check reindex, open.
+    """Public entry point: check pool health, check reindex, open if needed.
 
     Returns ``(conn, None)`` on success or ``(None, error_dict)`` when the
-    database is corrupt or unreachable.
+    database is corrupt or unreachable.  Lazily expands the connection pool
+    on each call, up to *POOL_SIZE*.
 
     Re-exported via ``context.py`` — the canonical import for all MCP handlers.
     """
     db_key = str(db_path.resolve())
-    _evict_stale_entry(db_key)
-    cached = _check_cached_conn(db_key)
+    _evict_stale_entries(db_key)
+    cached = _check_pool_health(db_key)
     if cached is not None:
+        _maybe_expand_pool(db_key, db_path)
         return cached, None
 
     reindex_pid = db_path.parent / "reindex.pid"
     _invalidate_conn_cache_if_reindex_done(db_key, reindex_pid)
 
     try:
-        return _open_and_cache(db_key, db_path), None
+        conn = _open_and_cache(db_key, db_path)
+        _maybe_expand_pool(db_key, db_path)
+        return conn, None
     except DatabaseCorruptionError as e:
         with _integrity_lock:
             _integrity_checked.discard(db_key)
+        if getattr(e, "locked", False):
+            return None, {
+                "error": f"Database locked: {e.details}",
+                "action": "retry",
+                "hint": "Stop any running fw-context index process and retry.",
+            }
         return None, {
             "error": f"Database corruption detected: {e}",
             "action": "reset_index",

@@ -93,12 +93,11 @@ def _lookup_definition(
         _order_parts.append("s.is_project DESC")
     _order_prefix = ", ".join(_order_parts) + ", " if _order_parts else ""
 
-    QUERY = f"""SELECT s.* FROM symbols s
-       WHERE s.config_hash=? AND %s
-       ORDER BY {_order_prefix}%s s.line"""
+    QUERY_WHERE = "SELECT s.* FROM symbols s WHERE s.config_hash=? AND %s"
+    QUERY_ORDER = f"ORDER BY {_order_prefix}%s s.line"
 
     result = _lookup_try_columns(
-        conn, QUERY + " LIMIT 1", config_hash, name,
+        conn, f"{QUERY_WHERE} {QUERY_ORDER} LIMIT 1", config_hash, name,
         ("s.name", "s.qualified_name"),
     )
     if result:
@@ -106,11 +105,22 @@ def _lookup_definition(
 
     if "::" in name:
         short_name = name.rsplit("::", 1)[-1]
-        return _lookup_try_columns(
-            conn, QUERY, config_hash, short_name,
+        result = _lookup_try_columns(
+            conn, f"{QUERY_WHERE} {QUERY_ORDER}", config_hash, short_name,
             ("s.name", "s.qualified_name"),
             suffix_filter=name,
         )
+        if result:
+            return result
+        # Plain-name fallback: e.g. "zbox::NoinitStruct" where the symbol
+        # is global (qualified_name == name, no namespace prefix).
+        result = _lookup_try_columns(
+            conn, f"{QUERY_WHERE} AND s.qualified_name = s.name {QUERY_ORDER} LIMIT 1",
+            config_hash, short_name,
+            ("s.name",),
+        )
+        if result:
+            return result
     return None
 
 
@@ -295,7 +305,7 @@ async def explain_symbol(
         result["llm_analysis"] = llm_analysis
         return result
 
-    context_lines = min(context_lines, _CONTEXT_LINES_MAX)
+    context_lines = max(1, min(context_lines, _CONTEXT_LINES_MAX))
     source_snippet = ""
     try:
         lines = Path(file_path).read_text(errors="replace").splitlines()
@@ -457,10 +467,11 @@ def get_file_map(
 ) -> dict:
     """Fast structural map of all C/C++ symbols in a file grouped by kind —
     libclang-powered table of contents. Like a table of contents before
-    NOTE: No path-traversal validation — the DB stores only relative paths
-    from indexing, so absolute-path escaping is not a realistic attack vector.
     reading a chapter: see what functions, classes, and enums a file
     defines at a glance.
+
+    Paths are validated against the project root before read —
+    :func:`_validate_path_in_root` ensures resolved paths stay within bounds.
 
     Pass a path relative to the project root (``src/main.cpp``) or just the
     filename (``main.cpp``). Returns symbols keyed by kind (function, method,

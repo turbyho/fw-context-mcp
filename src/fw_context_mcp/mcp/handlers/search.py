@@ -394,6 +394,24 @@ async def semantic_search(
             except (RuntimeError, ValueError) as e:
                 log.warning("Reranker failed, returning unranked results: %s", e)
 
+        # Relevance floor: when the best result has very low similarity,
+        # the symbols are likely unrelated — warn and suggest search_code.
+        _RELEVANCE_FLOOR = 0.68
+        if results and results[0].get("_similarity", 1.0) < _RELEVANCE_FLOOR:
+            best_score = results[0].get("_similarity", 0)
+            return [
+                {
+                    "warning": (
+                        f"Best result similarity ({best_score:.3f}) is below relevance "
+                        f"floor ({_RELEVANCE_FLOOR}). These results are likely unrelated. "
+                        "Try search_code for keyword-based search."
+                    ),
+                    "_fallback_suggestion": "search_code",
+                    "_best_similarity": best_score,
+                    "_results": results,
+                },
+            ]
+
         # Add staleness warning if applicable
         results = _append_staleness_warning(results, ctx.db_path, ctx.project_root)
         return results
@@ -484,6 +502,12 @@ def search_bodies(
     root = resolve_project_root(project_root)
     limit = max(0, min(limit, 100))
     expanded = _expand_query(query, for_body_search=True)
+    # Body search passes the query through unmodified — repair backslashes
+    # (never valid FTS5) so `"extern \"C\""`-style queries don't raise.
+    if "\\" in expanded:
+        from ...indexer.db._symbols import _sanitize_fts5_syntax
+
+        expanded = _sanitize_fts5_syntax(expanded)
 
     def _do_search(c: sqlite3.Connection, config_hash: str) -> list[dict]:
         kind_filter = ""
@@ -496,16 +520,23 @@ def search_bodies(
             project_filter = "AND s.is_project = 1"
         params.append(limit * 3 if not project_only else limit)
 
-        rows = c.execute(
-            f"""SELECT s.*, snippet(symbols_fts, 9, '<b>', '</b>', '…', 60) AS _match_snippet
-               FROM symbols_fts
-               JOIN symbols s ON s.id = symbols_fts.rowid
-               WHERE symbols_fts MATCH ? AND s.config_hash = ? AND s.is_definition = 1
-                 AND s.source != '' {kind_filter} {project_filter}
-                ORDER BY rank
-               LIMIT ?""",
-            params,
-        ).fetchall()
+        try:
+            rows = c.execute(
+                f"""SELECT s.*, snippet(symbols_fts, 9, '<b>', '</b>', '…', 60) AS _match_snippet
+                   FROM symbols_fts
+                   JOIN symbols s ON s.id = symbols_fts.rowid
+                   WHERE symbols_fts MATCH ? AND s.config_hash = ? AND s.is_definition = 1
+                     AND s.source != '' {kind_filter} {project_filter}
+                    ORDER BY rank
+                   LIMIT ?""",
+                params,
+            ).fetchall()
+        except sqlite3.OperationalError as e:
+            if getattr(e, "sqlite_errorcode", 0) == 1 and "fts5" in str(e).lower():
+                log.warning("search_bodies: FTS5 syntax error (%s) — returning empty", e)
+                rows = []
+            else:
+                raise
 
         results = []
         for r in rows:
@@ -604,17 +635,27 @@ def search_content(
         ).fetchone()
 
         if table_row is not None:
-            rows = c.execute(
-                f"""SELECT f.*, snippet(files_fts, 1, '<b>', '</b>', '…', 80) AS _match_snippet
-                   FROM files_fts
-                   JOIN files f ON f.id = files_fts.rowid
-                   WHERE files_fts MATCH ? AND f.config_hash = ?
-                     AND f.content != '' {project_filter}
-                    ORDER BY rank
-                   LIMIT ?""",
-                (expanded, config_hash, limit * 3),
-            ).fetchall()
-        else:
+            try:
+                rows = c.execute(
+                    f"""SELECT f.*, snippet(files_fts, 1, '<b>', '</b>', '…', 80) AS _match_snippet
+                       FROM files_fts
+                       JOIN files f ON f.id = files_fts.rowid
+                       WHERE files_fts MATCH ? AND f.config_hash = ?
+                         AND f.content != '' {project_filter}
+                        ORDER BY rank
+                       LIMIT ?""",
+                    (expanded, config_hash, limit * 3),
+                ).fetchall()
+            except sqlite3.OperationalError as e:
+                if getattr(e, "sqlite_errorcode", 0) == 1 and "fts5" in str(e).lower():
+                    table_row = None
+                    log.warning(
+                        "search_content: FTS5 syntax error (%s) — falling back to LIKE",
+                        e,
+                    )
+                else:
+                    raise
+        if table_row is None:
             terms = [t.strip() for t in query.replace("_", " ").split() if t.strip()]
             if not terms:
                 return []
