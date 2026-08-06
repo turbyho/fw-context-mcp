@@ -53,7 +53,9 @@ class KeilBuildSystem:
         """
         root = project_root.resolve()
 
-        if not shutil.which("keil2clangd"):
+        if cfg.python:
+            keil_prefix: list[str] = [cfg.python, "-m", "keil2clangd"]
+        elif not shutil.which("keil2clangd"):
             raise RuntimeError(
                 "keil2clangd is required for Keil MDK projects.\n"
                 "Install it:\n"
@@ -61,6 +63,8 @@ class KeilBuildSystem:
                 "Or generate compile_commands.json manually and run:\n"
                 "  fw-context index compile_commands.json"
             )
+        else:
+            keil_prefix = ["keil2clangd"]
 
         # Find the .uvprojx file
         if cfg.keil_project:
@@ -78,7 +82,7 @@ class KeilBuildSystem:
         if not proj_path.exists():
             raise RuntimeError(f"Keil project file not found: {proj_path}")
 
-        cmd: list[str] = ["keil2clangd", str(proj_path)]
+        cmd: list[str] = keil_prefix + [str(proj_path)]
 
         if cfg.keil_target:
             cmd += ["-t", cfg.keil_target]
@@ -96,7 +100,7 @@ class KeilBuildSystem:
         cmd += ["-o", str(cc_path)]
 
         log.info("keil convert: %s", " ".join(cmd))
-        run_build_command(cmd, cwd=root, description="keil convert")
+        run_build_command(cmd, cwd=root, description="keil convert", build_cfg=cfg)
 
         if not cc_path.exists():
             raise RuntimeError("compile_commands.json was not generated — keil2clangd may have failed silently")
@@ -112,6 +116,19 @@ class KeilBuildSystem:
 
     def required_tools(self) -> list[str]:
         return ["keil2clangd"]
+
+    # ── Environment auto-detection ──
+
+    @classmethod
+    def detect_environment(cls, project_root: Path) -> dict[str, str | None]:
+        return {"python": None, "activate": None}
+
+    @classmethod
+    def environment_help(cls) -> str:
+        return (
+            "Install keil2clangd:\n"
+            "  pip install keil2clangd"
+        )
 
     # ── Build dir patterns ──
 

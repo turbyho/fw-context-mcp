@@ -70,7 +70,7 @@ class ESPIDFBuildSystem:
             clean_cmd = [idf_py, "fullclean"]
             log.info("esp-idf clean: %s", " ".join(clean_cmd))
             try:
-                run_build_command(clean_cmd, cwd=project_root, description="idf.py fullclean")
+                run_build_command(clean_cmd, cwd=project_root, description="idf.py fullclean", build_cfg=cfg)
             except RuntimeError:
                 pass  # clean is best-effort — build dir may not exist yet
 
@@ -142,12 +142,12 @@ class ESPIDFBuildSystem:
             set_target_cmd = [idf_py, "set-target", target]
             log.info("esp-idf set-target: %s", " ".join(set_target_cmd))
             try:
-                run_build_command(set_target_cmd, cwd=project_root, description="idf.py set-target")
+                run_build_command(set_target_cmd, cwd=project_root, description="idf.py set-target", build_cfg=cfg)
             except RuntimeError:
                 log.warning("idf.py set-target failed — build may use wrong target")
 
         log.info("esp-idf build: %s", " ".join(cmd))
-        run_build_command(cmd, cwd=project_root, description="idf.py build", env=env)
+        run_build_command(cmd, cwd=project_root, description="idf.py build", env=env, build_cfg=cfg)
 
         # ESP-IDF puts compile_commands.json in the build directory
         cc_in_build = project_root / "build" / "compile_commands.json"
@@ -196,6 +196,38 @@ class ESPIDFBuildSystem:
 
     def required_tools(self) -> list[str]:
         return ["idf.py"]
+
+    # ── Environment auto-detection ──
+
+    @classmethod
+    def detect_environment(cls, project_root: Path) -> dict[str, str | None]:
+        idf_path = os.environ.get("IDF_PATH")
+        if idf_path:
+            export_sh = Path(idf_path) / "export.sh"
+            if export_sh.exists():
+                return {"python": None, "activate": str(export_sh)}
+
+        for candidate in [
+            Path.home() / "esp" / "esp-idf" / "export.sh",
+            Path.home() / "esp-idf" / "export.sh",
+        ]:
+            if candidate.exists():
+                return {"python": None, "activate": str(candidate)}
+
+        if shutil.which("idf.py"):
+            return {"python": None, "activate": None}
+
+        return {"python": None, "activate": None}
+
+    @classmethod
+    def environment_help(cls) -> str:
+        return (
+            "ESP-IDF builds require an activated environment.\n"
+            "Source the export script:\n"
+            "  source ~/esp/esp-idf/export.sh\n"
+            "Or set in .fw-context/local.toml:\n"
+            '  [build]\n  activate = "~/esp/esp-idf/export.sh"'
+        )
 
 
 # Register

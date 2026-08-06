@@ -9,12 +9,17 @@ from __future__ import annotations
 import hashlib
 import logging
 import os
+import shlex
 import sqlite3
 import subprocess
 import threading
 from collections import OrderedDict
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from fw_context_mcp.indexer.build import BuildConfig
 
 from fw_context_mcp import _stdlib_sqlite3
 
@@ -94,6 +99,7 @@ def run_build_command(
     timeout: float = 600,
     description: str = "",
     env: dict[str, str] | None = None,
+    build_cfg: BuildConfig | None = None,
 ) -> subprocess.CompletedProcess:
     """Run a build command with consistent timeout and output capture.
 
@@ -107,6 +113,9 @@ def run_build_command(
         timeout: Maximum time in seconds.
         description: Human-readable description for error messages.
         env: Optional environment variables dict (merged with os.environ).
+        build_cfg: Optional BuildConfig — when set, ``activate`` wraps the
+            command in ``bash -c "source <activate> && <cmd>"``, and
+            ``extra_path`` / ``extra_env`` are merged into the environment.
 
     Returns:
         CompletedProcess with captured stdout/stderr.
@@ -114,9 +123,23 @@ def run_build_command(
     Raises:
         RuntimeError: On non-zero exit or timeout.
     """
+    merged_env = dict(os.environ)
+    if env:
+        merged_env.update(env)
+
+    if build_cfg:
+        if build_cfg.extra_path:
+            merged_env["PATH"] = os.pathsep.join(build_cfg.extra_path) + os.pathsep + merged_env.get("PATH", "")
+        if build_cfg.extra_env:
+            merged_env.update(build_cfg.extra_env)
+        if build_cfg.activate:
+            expanded = str(Path(build_cfg.activate).expanduser())
+            cmd_str = " ".join(shlex.quote(c) for c in cmd)
+            cmd = ["bash", "-c", f"source {shlex.quote(expanded)} && {cmd_str}"]
+
     try:
         result = subprocess.run(
-            cmd, cwd=cwd, capture_output=True, text=True, timeout=timeout, env=env
+            cmd, cwd=cwd, capture_output=True, text=True, timeout=timeout, env=merged_env
         )
     except subprocess.TimeoutExpired:
         raise RuntimeError(
@@ -238,6 +261,11 @@ def compute_source_hash(file_path: Path) -> str:
         return hashlib.sha256(file_path.read_bytes()).hexdigest()
     except OSError:
         return ""
+
+
+def escape_like(value: str) -> str:
+    """Escape LIKE wildcards ``%``, ``_``, and the escape char ``\\``."""
+    return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
 
 def is_compile_commands_stale(

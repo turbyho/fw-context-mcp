@@ -156,6 +156,17 @@ compile_commands = "compile_commands.json"
 #   On by default. Set false to disable for faster indexing.
 # index_embeddings = false
 
+[call_graph]
+# dispatch_bridges: map dispatch-registration APIs to their event-loop
+#   entry points for call-path tracing through async dispatch
+#   (EventQueue, work queues, thread starts, timers).
+#   Built-in defaults cover mbed-os, Zephyr, FreeRTOS.
+#   Add custom bridges for other RTOS/dispatch frameworks here.
+#
+# [call_graph.dispatch_bridges]
+# "my_rtos::Task::start" = "my_rtos::Task::_thread_entry"
+# "my_rtos::Timer::attach" = "my_rtos::Timer::_on_timeout"
+
 # LLM and local-path settings belong in local.toml (gitignored).
 # See local.toml for ollama_url, model, db_dir, etc.
 """
@@ -164,6 +175,16 @@ _PROJECT_LOCAL_DEFAULTS_TEMPLATE = """\
 # Local developer settings — NOT committed to git.
 # Overrides values from config.toml where both define the same key.
 
+# ── Build environment (machine-specific paths to build tools) ──
+# Detected automatically by 'fw-context init'.
+# Set manually only if auto-detection fails or you need a different toolchain.
+#
+# python = "/path/to/python"        # Python interpreter for pip-based CLI tools
+#                                    #   (mbed-cli, platformio, keil2clangd, compiledb)
+# activate = "/path/to/setup.sh"    # shell script sourced before build
+#                                    #   (Zephyr/NCS nordic_minimal_setup.sh, ESP-IDF export.sh)
+
+[build]
 [llm]
 # enabled = false   # disable Ollama, return raw prompts for the agent to answer
 # ollama_url = "http://localhost:11434"
@@ -264,7 +285,10 @@ class LLMConfig:
     debug_log: Path | None = None
     analyze_symbols: bool = True
     analyze_vendor: bool = False
-    reranker_model: str | None = None  # "cross-encoder/ms-marco-MiniLM-L6-v2" to enable
+    reranker_model: str | None = None
+    """SentenceTransformers cross-encoder model for re-ranking search results.
+    Set to e.g. ``"cross-encoder/ms-marco-MiniLM-L6-v2"`` to enable re-ranking.
+    ``None`` (default) skips re-ranking — results are returned in FTS5 order."""
     ollama_max_concurrent: int = 1  # max concurrent Ollama HTTP calls (1=serial, 2–4 for SSE transport)
 
     def embed_key(self) -> str:
@@ -607,6 +631,8 @@ _BUILD_FIELDS: list[tuple[str, str, str]] = [
     ("source_dirs", "source_dirs", "list"),
     ("compiler", "compiler", "str"),
     ("pre_build", "pre_build", "str"),
+    ("activate", "activate", "str"),
+    ("python", "python", "str"),
 ]
 
 _INDEX_FIELDS: list[tuple[str, str, str]] = [
@@ -629,7 +655,7 @@ _LLM_FIELDS: list[tuple[str, str, str]] = [
     ("embed_model", "embed_model", "str"),
     ("embed_query_prompt", "embed_query_prompt", "str"),
     ("embed_doc_prompt", "embed_doc_prompt", "str"),
-    ("embed_dim", "embed_dim", "int(-1)"),
+    ("embed_dim", "embed_dim", "int(-1)"),  # -1 = auto-detect (maps to None)
     ("num_ctx", "num_ctx", "int(16384)"),
     ("timeout", "timeout", "float(600.0)"),
     ("keep_alive", "keep_alive", "str"),
@@ -719,6 +745,11 @@ def _validate_config_safety(proj_data: dict, proj_path: Path) -> None:
 
     Committed config (.fw-context/config.toml) is shared via git.  Dangerous
     settings should only be in local.toml (gitignored).
+
+    .. versionadded:: v0.18
+       New security check — existing projects with ``pre_build`` or
+       ``command`` in committed config.toml will see a RuntimeError on
+       load.  Move these settings to ``local.toml`` to resolve.
     """
     build = proj_data.get("build") or {}
     for key in ("pre_build", "command"):

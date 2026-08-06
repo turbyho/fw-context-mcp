@@ -102,12 +102,17 @@ class MbedOSBuildSystem:
                 'in custom_targets.json, or in .fw-context/config.toml [build] target = "..."'
             )
 
+        if cfg.python:
+            mbed_prefix = [cfg.python, "-m", "mbed"]
+        else:
+            mbed_prefix = ["mbed"]
+
         cmd: list[str] = [
             "bear",
             "--output",
             "compile_commands.json",
             "--",
-            "mbed",
+        ] + mbed_prefix + [
             "compile",
             "-t",
             toolchain,
@@ -129,7 +134,7 @@ class MbedOSBuildSystem:
             cmd.append("--clean")
 
         log.info("mbed-os build: %s", " ".join(cmd))
-        run_build_command(cmd, cwd=project_root, description="mbed compile")
+        run_build_command(cmd, cwd=project_root, description="mbed compile", build_cfg=cfg)
 
         cc_path = project_root / "compile_commands.json"
         if not cc_path.exists():
@@ -161,6 +166,43 @@ class MbedOSBuildSystem:
 
     def required_tools(self) -> list[str]:
         return ["bear", "mbed"]
+
+    # ── Environment auto-detection ──
+
+    @classmethod
+    def detect_environment(cls, project_root: Path) -> dict[str, str | None]:
+        pyenv_versions = Path.home() / ".pyenv" / "versions"
+        if pyenv_versions.is_dir():
+            for vdir in sorted(pyenv_versions.iterdir(), reverse=True):
+                if (vdir / "bin" / "mbed").exists():
+                    return {"python": str(vdir / "bin" / "python"), "activate": None}
+
+        for venv_dir in [
+            Path.home() / "mbed_venv",
+            Path.home() / ".virtualenvs" / "mbed",
+        ]:
+            python_bin = venv_dir / "bin" / "python"
+            if python_bin.exists():
+                return {"python": str(python_bin), "activate": None}
+
+        if (Path.home() / ".local" / "bin" / "mbed").exists():
+            return {"python": None, "activate": None}
+
+        if shutil.which("mbed"):
+            return {"python": None, "activate": None}
+
+        return {"python": None, "activate": None}
+
+    @classmethod
+    def environment_help(cls) -> str:
+        return (
+            "mbed-cli requires Python 3.11 or older.\n"
+            "Install into a venv or pyenv:\n"
+            "  python3.11 -m venv ~/mbed_venv\n"
+            "  ~/mbed_venv/bin/pip install mbed-cli\n"
+            "Or set in .fw-context/local.toml:\n"
+            '  [build]\n  python = "/path/to/python3.11/bin/python"'
+        )
 
 
 # Register

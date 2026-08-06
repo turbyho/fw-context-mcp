@@ -84,6 +84,7 @@ class ArduinoBuildSystem:
             base_cmd + ["--only-compilation-database"],
             cwd=project_root,
             description="arduino-cli compile --only-compilation-database",
+            build_cfg=cfg,
         )
 
         cc_in_build = build_dir / "compile_commands.json"
@@ -106,7 +107,7 @@ class ArduinoBuildSystem:
         # ── Pass 2: real compile to produce .d dependency files ──
         log.info("arduino build (compile): %s", " ".join(base_cmd))
         try:
-            run_build_command(base_cmd, cwd=project_root, description="arduino-cli compile (real build for .d files)")
+            run_build_command(base_cmd, cwd=project_root, description="arduino-cli compile (real build for .d files)", build_cfg=cfg)
         except RuntimeError:
             # Real compile failed — but we already have the compilation
             # database.  Warn and continue (the indexer can still work,
@@ -135,6 +136,16 @@ class ArduinoBuildSystem:
 
     def required_tools(self) -> list[str]:
         return ["arduino-cli"]
+
+    # ── Environment auto-detection ──
+
+    @classmethod
+    def detect_environment(cls, project_root: Path) -> dict[str, str | None]:
+        return {"python": None, "activate": None}
+
+    @classmethod
+    def environment_help(cls) -> str:
+        return ""
 
 
 # Register

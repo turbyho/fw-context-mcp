@@ -15,6 +15,14 @@ if TYPE_CHECKING:
     from ..config.tools import AiTool
 
 
+def _write_build_key(project_root: Path, key: str, value: str) -> None:
+    """Write a key-value pair into the [build] section of local.toml."""
+    from fw_context_mcp.config._toml_editor import set_key
+
+    local_path = project_root / ".fw-context" / "local.toml"
+    set_key(local_path, "build", key, value)
+
+
 def _install_skills(
     dry_run: bool = False,
     project_root: Path | None = None,
@@ -563,6 +571,38 @@ def cmd_init(args: argparse.Namespace) -> int:
     # ── Project-level config and assets (skills, agents) ──
     _build_system = detect_build_system(project_root)
 
+    # ── Auto-detect build environment ──
+    _detected_env: dict[str, str | None] = {"python": None, "activate": None}
+    if _build_system and not args.dry_run:
+        from ..indexer.builders import registry as _bregistry
+        builder_cls = _bregistry.get(_build_system)
+        if builder_cls and hasattr(builder_cls, "detect_environment"):
+            try:
+                _detected_env = builder_cls.detect_environment(project_root)
+            except Exception:
+                _detected_env = {"python": None, "activate": None}
+            if python_path := _detected_env.get("python"):
+                _write_build_key(project_root, "python", python_path)
+                print(f"  [ok] Build Python: {python_path}")
+            if activate_path := _detected_env.get("activate"):
+                _write_build_key(project_root, "activate", activate_path)
+                print(f"  [ok] Build activate: {activate_path}")
+
+            if not _detected_env.get("python") and not _detected_env.get("activate"):
+                try:
+                    builder = builder_cls()
+                    required = builder.required_tools()
+                except Exception:
+                    required = []
+                missing = [t for t in required if not shutil.which(t)]
+                if missing:
+                    print(f"  [warn] Missing tools for {_build_system}: {', '.join(missing)}")
+                    if hasattr(builder_cls, "environment_help"):
+                        help_text = builder_cls.environment_help()
+                        if help_text:
+                            for line in help_text.splitlines():
+                                print(f"  [info] {line}")
+
     if not args.dry_run and not args.instructions_only:
         from ..config.settings import (
             _PROJECT_DEFAULTS_TEMPLATE,
@@ -593,6 +633,10 @@ def cmd_init(args: argparse.Namespace) -> int:
         print()
         if _build_system:
             print(f"  Build system: {_build_system}")
+            if _detected_env.get("python"):
+                print(f"    python = \"{_detected_env['python']}\"")
+            if _detected_env.get("activate"):
+                print(f"    activate = \"{_detected_env['activate']}\"")
         else:
             print("  Build system: none detected — set [build] system in config.toml")
 

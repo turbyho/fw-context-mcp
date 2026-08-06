@@ -53,7 +53,9 @@ class IARBuildSystem:
         """
         root = project_root.resolve()
 
-        if not shutil.which("keil2clangd"):
+        if cfg.python:
+            keil_prefix: list[str] = [cfg.python, "-m", "keil2clangd"]
+        elif not shutil.which("keil2clangd"):
             raise RuntimeError(
                 "keil2clangd is required for IAR EWARM projects.\n"
                 "Install it:\n"
@@ -61,6 +63,8 @@ class IARBuildSystem:
                 "Or generate compile_commands.json manually and run:\n"
                 "  fw-context index compile_commands.json"
             )
+        else:
+            keil_prefix = ["keil2clangd"]
 
         # Find the .ewp file
         if cfg.iar_project:
@@ -78,7 +82,7 @@ class IARBuildSystem:
         if not proj_path.exists():
             raise RuntimeError(f"IAR project file not found: {proj_path}")
 
-        cmd: list[str] = ["keil2clangd", str(proj_path)]
+        cmd: list[str] = keil_prefix + [str(proj_path)]
 
         if cfg.iar_target:
             cmd += ["-t", cfg.iar_target]
@@ -93,7 +97,7 @@ class IARBuildSystem:
         cmd += ["-o", str(cc_path)]
 
         log.info("iar convert: %s", " ".join(cmd))
-        run_build_command(cmd, cwd=root, description="iar convert")
+        run_build_command(cmd, cwd=root, description="iar convert", build_cfg=cfg)
 
         if not cc_path.exists():
             raise RuntimeError("compile_commands.json was not generated — keil2clangd may have failed silently")
@@ -109,6 +113,19 @@ class IARBuildSystem:
 
     def required_tools(self) -> list[str]:
         return ["keil2clangd"]
+
+    # ── Environment auto-detection ──
+
+    @classmethod
+    def detect_environment(cls, project_root: Path) -> dict[str, str | None]:
+        return {"python": None, "activate": None}
+
+    @classmethod
+    def environment_help(cls) -> str:
+        return (
+            "Install keil2clangd:\n"
+            "  pip install keil2clangd"
+        )
 
     # ── Build dir patterns ──
 
