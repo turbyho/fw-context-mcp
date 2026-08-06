@@ -34,6 +34,9 @@ try:
                     return self[key]
                 except (KeyError, IndexError):
                     return default
+        if not hasattr(_OrigRow, "__contains__"):
+            def __contains__(self, key):
+                return key in self.keys()
     pysqlite3.dbapi2.Row = _CompatRow
     pysqlite3.Row = _CompatRow
 except ImportError:
