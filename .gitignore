@@ -13,6 +13,9 @@ MEMORY.md
 memory/
 plans/
 
+# Local debug scripts
+_debug_*.py
+
 # fw-context runtime data
 .fw-context/
 
