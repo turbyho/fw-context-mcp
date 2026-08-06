@@ -7,6 +7,7 @@ enriching batches, and the main LLM analysis build phase.
 from __future__ import annotations
 
 import logging
+import os
 import time
 from contextlib import nullcontext
 from pathlib import Path
@@ -97,13 +98,19 @@ def _enrich_batch(conn, batch_rows, config_hash: str, *, project_root: Path | No
             and abs_file_path
             and end_line > start_line
         ):
-            body = _read_body(abs_file_path, start_line, end_line)
-            if not body and start_line > 0:
-                log.error(
-                    "[%s] empty body for %s at %s:%d-%d — "
-                    "file may be missing or path resolution broken",
-                    kind, d.get("qualified_name", "?"), abs_file_path, start_line, end_line,
+            if not os.path.exists(abs_file_path):
+                log.warning(
+                    "[%s] body not available for %s — file missing: %s",
+                    kind, d.get("qualified_name", "?"), abs_file_path,
                 )
+            else:
+                body = _read_body(abs_file_path, start_line, end_line)
+                if not body and start_line > 0:
+                    log.error(
+                        "[%s] empty body for %s at %s:%d-%d — "
+                        "path resolution or extent mismatch",
+                        kind, d.get("qualified_name", "?"), abs_file_path, start_line, end_line,
+                    )
 
         # Fetch callees / referencers from the reference index
         if usr:

@@ -32,6 +32,8 @@ def _reassign_symbols_for_file(
     new_config_hash: str,
     new_file_id: int,
     file_path: str,
+    *,
+    project_root: Path | None = None,
 ) -> int:
     """Reassign data for *file_path* from an old config_hash to *new_config_hash* using UPDATE.
 
@@ -44,6 +46,10 @@ def _reassign_symbols_for_file(
     Rows that would collide with already-indexed symbols (shared headers
     across TUs) are left under the old config_hash and cleaned up later
     by :func:`delete_build_data`.
+
+    When *project_root* is provided, symbols whose ``file_path`` no longer
+    exists on disk are deleted after reassignment — prevents stale symbols
+    from generated/removed headers persisting in the index.
 
     When no previous build exists (Scenario C — first index), returns 0
     and the caller falls through to normal libclang parsing.
@@ -72,6 +78,9 @@ def _reassign_symbols_for_file(
         (new_config_hash, new_file_id, old_ch, old_fid, new_config_hash),
     )
     symbol_count = cur.rowcount
+
+    if project_root is not None:
+        _prune_stale_symbols(conn, new_config_hash, new_file_id, project_root)
     # Reset pagerank — _build_pagerank() skips when pagerank > 0.
     # Values from the previous build are stale because the call graph
     # may have changed in other (updated) files.
@@ -179,6 +188,51 @@ def _reassign_symbols_for_file(
     # config_hash in post-processing.  No reassignment needed.
 
     return symbol_count
+
+
+def _prune_stale_symbols(
+    conn: sqlite3.Connection,
+    config_hash: str,
+    file_id: int,
+    project_root: Path,
+) -> int:
+    """Delete reassigned symbols whose source file no longer exists on disk.
+
+    During incremental reuse, symbols from headers that were removed or
+    renamed between index runs can persist with stale ``file_path`` values.
+    This function checks each unique ``file_path`` among the just-reassigned
+    symbols and deletes those whose file is missing.
+
+    Returns the number of stale file paths removed.
+    """
+    rows = conn.execute(
+        "SELECT DISTINCT file_path FROM symbols WHERE config_hash=? AND file_id=?",
+        (config_hash, file_id),
+    ).fetchall()
+
+    stale_paths: list[str] = []
+    for (fp,) in rows:
+        if not fp:
+            continue
+        resolved = project_root / fp if not os.path.isabs(fp) else Path(fp)
+        if not resolved.exists():
+            stale_paths.append(fp)
+
+    if not stale_paths:
+        return 0
+
+    placeholders = ",".join("?" * len(stale_paths))
+    result = conn.execute(
+        f"DELETE FROM symbols WHERE config_hash=? AND file_id=? AND file_path IN ({placeholders})",
+        (config_hash, file_id, *stale_paths),
+    )
+    removed = result.rowcount
+    if removed:
+        log.warning(
+            "Pruned %d stale symbol(s) from %d missing file(s) for %s",
+            removed, len(stale_paths), ", ".join(stale_paths[-5:]),
+        )
+    return len(stale_paths)
 
 
 def _check_and_parse_unit(
@@ -641,6 +695,7 @@ def _handle_unchanged_or_reuse(
             if is_reuse and file_id is not None:
                 syms_copied = _reassign_symbols_for_file(
                     conn, config_hash, file_id, file_path_str,
+                    project_root=project_root,
                 )
                 if syms_copied > 0:
                     total_syms = syms_copied
