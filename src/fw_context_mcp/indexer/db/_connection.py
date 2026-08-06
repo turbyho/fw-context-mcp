@@ -29,14 +29,47 @@ log = logging.getLogger(__name__)
 class DatabaseCorruptionError(sqlite3.DatabaseError):
     """Raised when the SQLite database fails integrity check.
 
+    Set ``locked=True`` when the failure is a lock-contention exhaustion,
+    not actual data corruption.  Callers use this to decide whether to
+    suggest ``reset_index`` (corruption) or a retry (locking).
+
     The caller should present the error to the user with a clear action:
     run ``reset_index()`` then ``fw-context index`` to rebuild.
     """
 
-    def __init__(self, db_path: str, details: str = ""):
+    def __init__(self, db_path: str, details: str = "", locked: bool = False):
         self.db_path = db_path
         self.details = details
+        self.locked = locked
         super().__init__(f"Database corruption detected at {db_path}: {details}")
+
+
+_QUERY_TIMEOUT_S = 10.0               # max single-query execution time (under MCP 15s timeout)
+_PROGRESS_CHECK_INTERVAL = 100_000     # VM instructions between progress checks
+# Per-connection progress handler start time — keyed by id(conn).
+# Resets when the gap between consecutive progress calls exceeds 5 s
+# (indicating a new query has started).
+_progress_last: dict[int, float] = {}
+_progress_start: dict[int, float] = {}
+
+
+def _progress_handler_factory(conn_id: int):
+    """Return a progress callback that interrupts queries running >10 s."""
+    def _handler() -> int:
+        now = _time.monotonic()
+        last = _progress_last.get(conn_id, 0.0)
+        if now - last > 5.0:
+            # Gap between queries → new query started, reset start time
+            _progress_start[conn_id] = now
+            _progress_last[conn_id] = now
+            return 0
+        _progress_last[conn_id] = now
+        start = _progress_start.get(conn_id, now)
+        if now - start > _QUERY_TIMEOUT_S:
+            log.warning("Query timeout after %.1fs on conn %d", now - start, conn_id)
+            return 1  # interrupt
+        return 0
+    return _handler
 
 
 def _configure_connection(conn: sqlite3.Connection) -> None:
@@ -81,6 +114,9 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
         conn.executescript(_SCHEMA)
         _ensure_migrated_columns(conn)
         _run_data_migrations(conn)
+        conn.execute(f"PRAGMA user_version = {CURRENT_SCHEMA_VERSION}")
+    elif current_schema_ver > CURRENT_SCHEMA_VERSION:
+        log.warning("Schema version %d > current %d — re-stamping.", current_schema_ver, CURRENT_SCHEMA_VERSION)
         conn.execute(f"PRAGMA user_version = {CURRENT_SCHEMA_VERSION}")
 
     # ── Unconditional column sanity check ──────────────────────────────────
@@ -139,7 +175,7 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
         rebuild_fts(conn)
 
 
-def open_db(path: Path, *, skip_integrity_check: bool = False, check_same_thread: bool = True) -> sqlite3.Connection:
+def open_db(path: Path, *, skip_integrity_check: bool = False, check_same_thread: bool = True, _retries: int = 0) -> sqlite3.Connection:
     """Open SQLite database at *path*, enabling WAL mode and loading extensions.
 
     Creates the parent directory if missing.  Configures WAL journal mode,
@@ -219,10 +255,19 @@ def open_db(path: Path, *, skip_integrity_check: bool = False, check_same_thread
         # write lock).  SQLITE_LOCKED (6) = a table within the database
         # is locked (another process is modifying it right now).
         if getattr(e, "sqlite_errorcode", 0) in (5, 6):
+            if _retries >= 3:
+                conn.close()
+                raise DatabaseCorruptionError(
+                    str(path),
+                    f"Database locked after {_retries + 1} attempts — "
+                    "another process may hold an exclusive lock. "
+                    "Stop any running fw-context index process and retry.",
+                    locked=True,
+                ) from e
             conn.close()
             _time.sleep(1)
             return open_db(path, skip_integrity_check=skip_integrity_check,
-                           check_same_thread=check_same_thread)
+                           check_same_thread=check_same_thread, _retries=_retries + 1)
         elif "no such column" in str(e):
             _ensure_migrated_columns(conn)
             try:
@@ -264,6 +309,11 @@ def open_db(path: Path, *, skip_integrity_check: bool = False, check_same_thread
         except sqlite3.DatabaseError as e:
             conn.close()
             raise DatabaseCorruptionError(str(path), str(e)) from e
+
+    conn.set_progress_handler(
+        _progress_handler_factory(id(conn)),
+        _PROGRESS_CHECK_INTERVAL,
+    )
 
     return conn
 

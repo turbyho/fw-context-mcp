@@ -5,6 +5,8 @@ from __future__ import annotations
 import sqlite3
 from typing import NamedTuple
 
+from ...utils import escape_like as _escape_like
+
 __all__ = [
     "FileHashRecord",
     "delete_orphan_files",
@@ -15,12 +17,6 @@ __all__ = [
     "get_file_mtimes",
     "upsert_file",
 ]
-
-
-
-def _escape_like(value: str) -> str:
-    """Escape LIKE wildcards ``%``, ``_``, and the escape char ``\\``."""
-    return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
 
 def upsert_file(
