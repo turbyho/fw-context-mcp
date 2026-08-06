@@ -142,6 +142,35 @@ class FnPointerAssignment:
 
 
 @dataclass
+class PendingDispatch:
+    """Dispatch API call detected during indexing, resolved in post-processing.
+
+    Records a likely dispatch-registration pattern (e.g. ``EventQueue::call_every``
+    with ``&Class::method`` as an argument) before the dispatch entry point's
+    USR is known.  Resolver runs after all translation units are indexed.
+
+    Attributes:
+        callee_qn: Qualified name of the dispatch API method called
+            (e.g. ``"events::EventQueue::call_every"``).
+        target_qn_partial: Partial qualified name of the callback target
+            (e.g. ``"ZBLE::watch_ble"``).
+        target_name: Unqualified name of the callback target
+            (e.g. ``"watch_ble"``).
+        file: Source file path, relative to project root.
+        line: Source line number (1-based).
+        caller_usr: USR of the enclosing function that calls the dispatch API,
+            or None when at file scope.
+    """
+    callee_qn: str
+    target_qn_partial: str
+    target_name: str
+    file: str
+    line: int
+    caller_usr: str | None
+    target_usr: str | None = None
+
+
+@dataclass
 class Symbol:
     """A parsed C/C++ symbol extracted from a translation unit.
 

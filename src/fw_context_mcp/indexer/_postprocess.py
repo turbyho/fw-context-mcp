@@ -10,6 +10,7 @@ from __future__ import annotations
 import logging
 import sqlite3
 import time
+import tomllib
 from collections import deque
 from collections.abc import Callable
 from contextlib import nullcontext
@@ -17,6 +18,7 @@ from pathlib import Path
 
 from ..mcp.shared.pid_file import PidFile
 from ..utils import SAFE_EXCEPT, is_fatal
+from ._dispatch_bridges import _DISPATCH_ENTRY_POINTS
 from ._embedding import _build_embeddings
 from ._llm_analysis import _build_llm_analysis
 from ._manifest_updater import _refresh_header_mtimes_from_manifest, _update_manifest_after_index
@@ -359,7 +361,8 @@ def _build_pagerank(conn, config_hash: str, *, write_lock_held: bool = False, fo
     log.info("PageRank stored: %d nodes", n)
 
 
-def _build_hotspot_cache(conn, config_hash: str, *, force: bool = False) -> None:
+def _build_hotspot_cache(conn, config_hash: str, *, force: bool = False,
+                         write_lock_held: bool = False, db_dir: Path | None = None) -> None:
     """Pre-compute hotspot caller counts for instant ``find_hotspots`` queries.
 
     Idempotent — skips when cache already exists for this config.
@@ -373,21 +376,22 @@ def _build_hotspot_cache(conn, config_hash: str, *, force: bool = False) -> None
             log.info("Hotspot cache already built — nothing to do")
             return
 
-    with transaction(conn):
-        if force:
-            conn.execute("DELETE FROM hotspot_cache WHERE config_hash = ?", (config_hash,))
-        conn.execute(
-            """INSERT INTO hotspot_cache (config_hash, symbol_id, caller_count)
-               SELECT r.config_hash, s.id, COUNT(r.rowid)
-               FROM refs r
-               JOIN symbols s ON s.usr = r.to_usr AND s.config_hash = r.config_hash
-               WHERE r.config_hash = ?
-                 AND s.is_definition = 1
-                 AND r.ref_kind IN ('call', 'indirect')
-               GROUP BY s.usr
-            """,
-            (config_hash,),
-        )
+    with write_lock(db_dir, timeout=5.0) if not write_lock_held and db_dir is not None else nullcontext():
+        with transaction(conn):
+            if force:
+                conn.execute("DELETE FROM hotspot_cache WHERE config_hash = ?", (config_hash,))
+            conn.execute(
+                """INSERT INTO hotspot_cache (config_hash, symbol_id, caller_count)
+                   SELECT r.config_hash, s.id, COUNT(r.rowid)
+                   FROM refs r
+                   JOIN symbols s ON s.usr = r.to_usr AND s.config_hash = r.config_hash
+                   WHERE r.config_hash = ?
+                     AND s.is_definition = 1
+                     AND r.ref_kind IN ('call', 'indirect')
+                   GROUP BY s.usr
+                """,
+                (config_hash,),
+            )
 
     cnt = conn.execute("SELECT COUNT(*) FROM hotspot_cache WHERE config_hash = ?", (config_hash,)).fetchone()[0]
     log.info("Hotspot cache stored: %d entries", cnt)
@@ -472,6 +476,102 @@ def _step_update_manifest(conn: sqlite3.Connection, ctx: dict) -> None:
     )
     if updated_manifest is not None:
         _refresh_header_mtimes_from_manifest(conn, config_hash, ctx["project_root"], updated_manifest)
+
+
+def _resolve_matching_usr(
+    conn: sqlite3.Connection, config_hash: str, name: str
+) -> str | None:
+    """Look up a symbol's USR by name, preferring definitions.
+
+    When multiple USRs exist for the same name, prefers the one with the
+    most incoming references.  Tiebreaker: prefers symbols that have
+    outgoing refs (they have a body).
+    """
+    esc_name = name.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    suffix_pattern = f"%::{esc_name}"
+    row = conn.execute(
+        """SELECT s.usr,
+                  COUNT(r_in.rowid) AS ref_count,
+                  COUNT(r_out.rowid) AS out_count
+           FROM symbols s
+           LEFT JOIN refs r_in ON r_in.to_usr = s.usr AND r_in.config_hash = s.config_hash
+           LEFT JOIN refs r_out ON r_out.from_usr = s.usr AND r_out.config_hash = s.config_hash
+           WHERE s.config_hash = ?
+             AND (s.name = ? OR s.qualified_name = ? OR s.qualified_name LIKE ? ESCAPE '\\')
+           GROUP BY s.usr
+           ORDER BY s.is_definition DESC, ref_count DESC, out_count DESC
+           LIMIT 1""",
+        (config_hash, name, name, suffix_pattern),
+    ).fetchone()
+    return row["usr"] if row else None
+
+
+def _step_resolve_dispatches(conn: sqlite3.Connection, ctx: dict) -> None:
+    """Resolve pending dispatch edges into ref_kind='dispatch' references.
+
+    Reads the `_pending_dispatch` temp table populated during indexing,
+    resolves the dispatch entry point and callback target USRs, and
+    inserts synthetic dispatch edges into the refs table.
+    """
+    config_hash = ctx["config_hash"]
+    rows = conn.execute(
+        "SELECT * FROM _pending_dispatch WHERE config_hash = ?",
+        (config_hash,),
+    ).fetchall()
+    if not rows:
+        return
+
+    # ── Merge user-defined dispatch bridges from project TOML config ──
+    _dispatch_map = dict(_DISPATCH_ENTRY_POINTS)
+    project_root = ctx.get("project_root")
+    if project_root is not None:
+        try:
+            _config_path = Path(project_root) / ".fw-context" / "config.toml"
+            if _config_path.exists():
+                _cfg = tomllib.loads(_config_path.read_text())
+                _user_bridges = _cfg.get("call_graph", {}).get("dispatch_bridges", {})
+                if isinstance(_user_bridges, dict):
+                    _dispatch_map.update(_user_bridges)
+        except (OSError, KeyError, ValueError) as e:
+            log.warning("Failed to load dispatch_bridges from %s: %s", _config_path, e)
+        except Exception:
+            log.exception("Unexpected error loading dispatch_bridges from %s", _config_path)
+
+    resolved = 0
+    for r in rows:
+        callee_qn = r["callee_qn"]
+        entry_qn = _dispatch_map.get(callee_qn)
+        if not entry_qn:
+            continue
+        entry_usr = _resolve_matching_usr(conn, config_hash, entry_qn)
+        if not entry_usr:
+            continue
+
+        target_usr = r["target_usr"] or ""
+        if not target_usr:
+            target_qn = r["target_qn_partial"] or ""
+            if target_qn:
+                target_usr = _resolve_matching_usr(conn, config_hash, target_qn) or ""
+
+        if not target_usr:
+            continue
+
+        conn.execute(
+            """INSERT OR IGNORE INTO refs
+               (config_hash, to_usr, from_file, from_line, from_usr, ref_kind)
+               VALUES (?, ?, ?, ?, ?, 'dispatch')""",
+            (
+                config_hash,
+                target_usr,
+                r["file"],
+                r["line"],
+                entry_usr,
+            ),
+        )
+        resolved += 1
+
+    if resolved:
+        log.info("Dispatch edges resolved: %d synthetic edges created", resolved)
 
 
 def _step_expand_macros(conn: sqlite3.Connection, ctx: dict) -> None:
@@ -573,7 +673,7 @@ def _step_pagerank_hotspot(conn: sqlite3.Connection, ctx: dict) -> None:
         conn.commit()
     _build_pagerank(conn, config_hash)
     conn.commit()
-    _build_hotspot_cache(conn, config_hash)
+    _build_hotspot_cache(conn, config_hash, db_dir=ctx.get("db_dir"))
     conn.commit()
 
 
@@ -649,6 +749,7 @@ _STEPS: list[tuple[str, Callable[..., None], Callable[..., bool] | None]] = [
     ("is_project",       _step_align_is_project,   None),
     ("manifest",         _step_update_manifest,    None),
     ("macros",           _step_expand_macros,      lambda c: c["index_macros_expanded"] and c["units"]),
+    ("dispatch_edges",   _step_resolve_dispatches,  lambda c: c["index_refs"]),
     ("embeddings",       _step_build_embeddings,   lambda c: c["index_embeddings"] and c["llm_config"] is not None and c["llm_config"].enabled),
     ("llm_analysis",     _step_llm_analysis,       lambda c: c["analyze_symbols"] and c["llm_config"] is not None and c["llm_config"].enabled),
     ("overrides",        _step_build_overrides,    lambda c: c["analyze_overrides"]),
