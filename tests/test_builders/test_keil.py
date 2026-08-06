@@ -55,3 +55,15 @@ class TestKeilBuildSystem:
         builder = KeilBuildSystem()
         with pytest.raises(RuntimeError, match="not found"):
             builder.convert(tmp_path, cfg)
+
+    def test_detect_environment_returns_defaults(self, tmp_path):
+        """detect_environment returns safe defaults when no Python env found."""
+        result = KeilBuildSystem.detect_environment(tmp_path)
+        assert result == {"python": None, "activate": None}
+
+    def test_detect_environment_callable(self, tmp_path):
+        """detect_environment does not raise on valid project root."""
+        result = KeilBuildSystem.detect_environment(tmp_path)
+        assert isinstance(result, dict)
+        assert "python" in result
+        assert "activate" in result

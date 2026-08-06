@@ -1790,6 +1790,89 @@ void process_data(struct Driver* driver, const char* data, int len) {
         )
 
 
+class TestFnPtrTypeConsistency:
+    """Verify fp_assignments.fn_ptr_type uses the LHS field type (the function
+    pointer typedef), not the RHS function type.  This ensures the Phase 3
+    USR join (fp_assignments.lhs_usr = indirect_call_sites.target_usr) and
+    fn_ptr_type matching work when the same typedef is used for both the
+    struct field and the storage variable through which the callback is
+    invoked."""
+
+    @pytest.mark.libclang
+    def test_init_list_fn_ptr_type_matches_indirect_call_site(self, tmp_path):
+        """Assigning via designated initializer must store the field's type,
+        not the RHS function's type."""
+        from fw_context_mcp.indexer.compile_commands import CompilationUnit
+        from fw_context_mcp.indexer.symbols import extract_all
+
+        src = tmp_path / "src"
+        src.mkdir()
+        init_c = src / "init.c"
+        init_c.write_text("""\
+typedef void (*event_handler_t)(int event);
+
+struct config {
+    event_handler_t handler;
+};
+
+static event_handler_t stored_handler;
+
+void register_handler(const struct config* cfg) {
+    stored_handler = cfg->handler;
+}
+
+void irq_handler(int irq) {
+    if (stored_handler) {
+        stored_handler(irq);
+    }
+}
+
+static void my_handler_cb(int event) {
+    (void)event;
+}
+
+void init(void) {
+    struct config cfg = {
+        .handler = my_handler_cb
+    };
+    register_handler(&cfg);
+}
+""", encoding="utf-8")
+
+        unit = CompilationUnit(
+            file=init_c,
+            directory=src,
+            language="c",
+            clang_args=["-std=c11"],
+        )
+        r = extract_all(unit, with_refs=True)
+        fpa = r.fp_assignments
+        ics = r.indirect_call_sites
+
+        init_list_fpa = [f for f in fpa if f.method == "init_list"]
+        assert len(init_list_fpa) == 1, (
+            f"Expected 1 init_list fp_assignment, got {len(init_list_fpa)}: "
+            f"{[(f.method, f.lhs_name, f.rhs_name) for f in fpa]}"
+        )
+        assert init_list_fpa[0].rhs_name == "my_handler_cb", (
+            f"Expected rhs_name='my_handler_cb', got '{init_list_fpa[0].rhs_name}'"
+        )
+        assert init_list_fpa[0].fn_ptr_type == "event_handler_t", (
+            f"fn_ptr_type must be the field's typedef 'event_handler_t', "
+            f"got '{init_list_fpa[0].fn_ptr_type}'"
+        )
+
+        stored_calls = [c for c in ics if c.target_name == "stored_handler"]
+        assert len(stored_calls) >= 1, (
+            f"Expected at least 1 indirect call site for stored_handler, "
+            f"got {len(stored_calls)}"
+        )
+        assert stored_calls[0].fn_ptr_type == "event_handler_t", (
+            f"indirect_call_sites.fn_ptr_type must be 'event_handler_t', "
+            f"got '{stored_calls[0].fn_ptr_type}'"
+        )
+
+
 class TestMacros:
     """Preprocessor macro storage, lookup, FTS search, and rebuild."""
 

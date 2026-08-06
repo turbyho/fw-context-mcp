@@ -57,3 +57,8 @@ class TestIARBuildSystem:
         builder = IARBuildSystem()
         with pytest.raises(RuntimeError, match="not found"):
             builder.convert(tmp_path, cfg)
+
+    def test_detect_environment_returns_defaults(self, tmp_path):
+        """detect_environment returns safe defaults."""
+        result = IARBuildSystem.detect_environment(tmp_path)
+        assert result == {"python": None, "activate": None}
