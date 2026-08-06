@@ -32,14 +32,15 @@ class FTS5SearchPhase(Phase):
         Opens a fresh DB connection, runs both OR queries and name_tokens
         queries, and merges with deduplication preferring definitions.
         """
-        from fw_context_mcp.indexer.db import open_db
-
         queries = ctx.generated_queries if ctx.generated_queries else ctx.rough_queries
         fetch_limit = max(ctx.limit * 6, 120)
 
-        conn = open_db(ctx.db_path)
-        with conn:
-            rows = _search_queries(conn, queries, ctx.config_hash, fetch_limit)
+        def _query(conn, config_hash):
+            # Runs under the executor lock on the single shared
+            # connection; the phase must not open its own connection.
+            return _search_queries(conn, queries, config_hash, fetch_limit)
+
+        rows = ctx.executor.execute_sync(_query, ctx.config_hash)
 
         return ctx.evolve(fts5_results=rows)
 

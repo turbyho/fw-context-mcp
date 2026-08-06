@@ -186,16 +186,21 @@ def find_variables(
 
         return results
 
-    with db.conn:
-        results = _do_find(db.conn, db.config_hash)
-        file_paths = [abs_path(db.root, r["file"]) for r in results if "file" in r]
-        if file_paths:
-            stale = _stale_files(db.conn, db.config_hash, file_paths, db.root)
-            if stale:
-                from fw_context_mcp.mcp.background import _ensure_daemon_running
-                _ensure_daemon_running(db.root)
-                return [{"warning": (
-                    f"Results may be stale — {len(stale)} file(s) changed. "
-                    "Background reindex in progress. Run 'fw-context index' to force full update."
-                )}] + results
-        return results
+    def _query(conn, config_hash):
+        # Runs under the executor lock on the single shared connection;
+        # must not open its own connection.  Timeout is enforced by
+        # _wrap_tool (300 s + interrupt), not here.
+        results = _do_find(conn, config_hash)
+        file_paths = [abs_path(root, r["file"]) for r in results if "file" in r]
+        stale = _stale_files(conn, config_hash, file_paths, root) if file_paths else []
+        return results, stale
+
+    results, stale = db.executor.execute_sync(_query, db.config_hash)
+    if stale:
+        from fw_context_mcp.mcp.background import _ensure_daemon_running
+        _ensure_daemon_running(root)
+        return [{"warning": (
+            f"Results may be stale — {len(stale)} file(s) changed. "
+            "Background reindex in progress. Run 'fw-context index' to force full update."
+        )}] + results
+    return results

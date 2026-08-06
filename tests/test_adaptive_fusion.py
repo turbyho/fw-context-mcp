@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from pathlib import Path
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -22,6 +23,7 @@ def _make_ctx(*, limit: int = 20, embedding_results=None, fts5_results=None, con
         query="test",
         original_query="test",
         config=config if config is not None else Config(),
+        executor=MagicMock(),  # fusion phase never touches the DB
         limit=limit,
         embedding_results=embedding_results or [],
         fts5_results=fts5_results or [],

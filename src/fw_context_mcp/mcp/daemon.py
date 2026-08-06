@@ -351,15 +351,21 @@ def _staleness_check(project_root: Path) -> tuple[bool, list[str]]:
     the file-level check the daemon would never detect files that were
     modified BEFORE it started — watchfiles only detects NEW changes.
     """
-    from .shared.context import _db_path
+    from .shared.context import _db_path, _quick_open_readonly
     from .shared.stale import _count_modified_files, check_structural_staleness
 
     db_path = _db_path(project_root)
     if not db_path.exists():
         return False, []
 
-    conn = _open_db(db_path)
-    if conn is None:
+    # Read-only quick open: a full open_db would run ensure_schema's
+    # unconditional executescript — a write transaction on every check
+    # interval — causing lock contention with the executor.  The daemon
+    # only reads here.
+    try:
+        conn = _quick_open_readonly(db_path)
+    except sqlite3.Error:
+        log.warning("Database unreadable — skipping staleness check")
         return False, []
     reasons: list[str] = []
     try:
@@ -505,7 +511,14 @@ def _open_db(db_path: Path):
 
 
 def _optimize_db(db_dir: Path) -> None:
-    """Run PRAGMA optimize to shrink the WAL file and defragment indexes."""
+    """Run PRAGMA optimize to shrink the WAL file and defragment indexes.
+
+    Deliberately uses a full ``open_db`` (whitelisted write path): this
+    is a rare maintenance operation outside the request path, and WAL
+    allows concurrent readers while it runs.  Not a bug — do not
+    "convert" this to the read-only quick open; writes need a writable
+    connection.
+    """
     db_path = db_dir / "index.db"
     if not db_path.exists():
         return

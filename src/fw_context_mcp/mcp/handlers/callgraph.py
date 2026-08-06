@@ -3,8 +3,6 @@
 from __future__ import annotations
 
 import logging
-import sqlite3
-from pathlib import Path
 from typing import Annotated
 
 from pydantic import Field
@@ -27,8 +25,7 @@ from ...indexer.db import (
 )
 from ...utils import abs_path
 from ...utils import escape_like as _escape_like
-from ..shared.context import _open_db_or_return, _resolve_context
-from ._base import BaseHandler
+from ._base import BaseHandler, DbContext
 from .source import _lookup_definition
 
 log = logging.getLogger(__name__)
@@ -51,18 +48,19 @@ def _references_result(name: str, project_root: str | None, ref_kind: str | list
     Returns:
         list of dicts, each with: file, line, ref_kind, caller, caller_kind.
     """
-    db_path, cfg, project_id, root = _resolve_context(project_root)
-    if not db_path.exists():
-        return [{"error": f"No index found for {root}. Run 'fw-context index' first."}]
-    conn, err_result = _open_db_or_return(db_path)
-    if err_result is not None:
-        return err_result
-    assert conn is not None
-    with conn:
-        cfg_data = get_active_config(conn, project_id)
+    try:
+        db = BaseHandler.resolve_db_context(project_root)
+    except RuntimeError as e:
+        return [{"error": str(e)}]
+    root = db.root
+
+    def _query(conn, config_hash):
+        # Runs under the executor lock on the single shared connection;
+        # must not open its own connection.  Timeout is enforced by
+        # _wrap_tool (300 s + interrupt), not here.
+        cfg_data = get_active_config(conn, db.project_id)
         if not cfg_data:
             return [{"error": "No build config indexed."}]
-        config_hash = cfg_data["config_hash"]
         symbol = _lookup_definition(conn, config_hash, name, preferred_kinds=None)
         if symbol is None:
             # Macro fallback: check if name is a macro definition
@@ -120,8 +118,8 @@ def _references_result(name: str, project_root: str | None, ref_kind: str | list
                 "they may have been disabled with [index] index_refs = false. "
                 "Re-run 'fw-context index' to rebuild with refs enabled."
             )}]
-        limit = max(0, min(limit, 200))
-        rows = find_refs(conn, config_hash, name, ref_kind=ref_kind, limit=limit)
+        clamped_limit = max(0, min(limit, 200))
+        rows = find_refs(conn, config_hash, name, ref_kind=ref_kind, limit=clamped_limit)
         if not rows:
             label = "callers" if caller_mode else "references"
             return [{"info": f"No {label} found for '{name}'."}]
@@ -135,7 +133,9 @@ def _references_result(name: str, project_root: str | None, ref_kind: str | list
             }
             for r in rows
         ]
-    return result
+        return result
+
+    return db.executor.execute_sync(_query, db.config_hash)
 
 # ── moved from server.py ──
 def find_callers(
@@ -271,27 +271,24 @@ def find_indirect_call_sites(
         fn_ptr_type (the function pointer type signature), caller
         (enclosing function name), caller_kind.
     """
-    db_path, cfg, project_id, root = _resolve_context(project_root)
-    if not db_path.exists():
-        return [{"error": f"No index found for {root}. Run 'fw-context index' first."}]
-    conn, err_result = _open_db_or_return(db_path)
-    if err_result is not None:
-        return err_result
-    assert conn is not None
-    with conn:
-        cfg_data = get_active_config(conn, project_id)
-        if not cfg_data:
-            return [{"error": "No build config indexed."}]
-        config_hash = cfg_data["config_hash"]
+    try:
+        db = BaseHandler.resolve_db_context(project_root)
+    except RuntimeError as e:
+        return [{"error": str(e)}]
+    root = db.root
 
+    def _query(conn, config_hash):
+        # Runs under the executor lock on the single shared connection;
+        # must not open its own connection.  Timeout is enforced by
+        # _wrap_tool (300 s + interrupt), not here.
         if count_indirect_call_sites(conn, config_hash) == 0:
             return [{"info": (
                 "No indirect call sites indexed. Re-run 'fw-context index' "
                 "to populate the table (added in Phase 2)."
             )}]
 
-        limit = max(0, min(limit, 200))
-        rows = query_indirect_call_sites(conn, config_hash, name, limit=limit)
+        clamped_limit = max(0, min(limit, 200))
+        rows = query_indirect_call_sites(conn, config_hash, name, limit=clamped_limit)
         if not rows:
             return [{"info": f"No indirect call sites found for '{name}'."}]
 
@@ -308,6 +305,8 @@ def find_indirect_call_sites(
             }
             for r in rows
         ]
+
+    return db.executor.execute_sync(_query, db.config_hash)
 
 # ── moved from server.py ──
 def find_indirect_targets(
@@ -349,27 +348,24 @@ def find_indirect_targets(
         init_list), assign_file, assign_line, assign_caller,
         call_file, call_line, call_expr_text.
     """
-    db_path, cfg, project_id, root = _resolve_context(project_root)
-    if not db_path.exists():
-        return [{"error": f"No index found for {root}. Run 'fw-context index' first."}]
-    conn, err_result = _open_db_or_return(db_path)
-    if err_result is not None:
-        return err_result
-    assert conn is not None
-    with conn:
-        cfg_data = get_active_config(conn, project_id)
-        if not cfg_data:
-            return [{"error": "No build config indexed."}]
-        config_hash = cfg_data["config_hash"]
+    try:
+        db = BaseHandler.resolve_db_context(project_root)
+    except RuntimeError as e:
+        return [{"error": str(e)}]
+    root = db.root
 
+    def _query(conn, config_hash):
+        # Runs under the executor lock on the single shared connection;
+        # must not open its own connection.  Timeout is enforced by
+        # _wrap_tool (300 s + interrupt), not here.
         if count_fp_assignments(conn, config_hash) == 0:
             return [{"info": (
                 "No function pointer assignments indexed. Re-run "
                 "'fw-context index' to populate the table (added in Phase 3)."
             )}]
 
-        limit = max(0, min(limit, 200))
-        rows = query_indirect_targets(conn, config_hash, name, limit=limit)
+        clamped_limit = max(0, min(limit, 200))
+        rows = query_indirect_targets(conn, config_hash, name, limit=clamped_limit)
         if not rows:
             return [{"info": f"No functions assigned to '{name}'."}]
 
@@ -408,37 +404,31 @@ def find_indirect_targets(
             results.append(entry)
         return results
 
+    return db.executor.execute_sync(_query, db.config_hash)
+
 # ── moved from server.py ──
-def _refs_guard(project_root: str | None) -> tuple[sqlite3.Connection, Path, str, None] | tuple[None, None, None, list[dict]]:
-    """Shared guard for graph tools: resolve project, open DB, check refs exist.
-
-    Returns a cache-managed connection on success — callers must NOT
-    close it and must only perform read queries. Any write operation
-    requires a new explicit ``with conn:`` block. The connection is owned
-    by :mod:`fw_context_mcp.mcp.shared.connection` and will be reused
-    across handlers within the same MCP session.
-
-    Delegates to ``_resolve_handler_context`` — prefer that directly in new code.
+def _refs_guard(project_root: str | None) -> tuple[DbContext, None] | tuple[None, list[dict]]:
+    """Shared guard for graph tools: resolve project, get executor, check refs exist.
 
     Returns:
-        ``(conn, root, config_hash, None)`` on success — caller reuses *conn* (do not close).
-        ``(None, None, None, error_list)`` on failure — caller propagates the error.
+        ``(db_context, None)`` on success — callers run their queries via
+        ``db.executor.execute_sync(query_fn, db.config_hash)``.
+        ``(None, error_list)`` on failure — caller propagates the error.
     """
 
     try:
         db = BaseHandler.resolve_db_context(project_root)
     except RuntimeError as e:
-        return None, None, None, [{"error": str(e)}]
+        return None, [{"error": str(e)}]
 
-    with db.conn:
-        if count_refs(db.conn, db.config_hash) == 0:
-            return None, None, None, [{"info": (
-                "No references indexed. Refs are on by default — "
-                "they may have been disabled with [index] index_refs = false. "
-                "Re-run 'fw-context index' to rebuild."
-            )}]
+    if db.executor.execute_sync(count_refs, db.config_hash) == 0:
+        return None, [{"info": (
+            "No references indexed. Refs are on by default — "
+            "they may have been disabled with [index] index_refs = false. "
+            "Re-run 'fw-context index' to rebuild."
+        )}]
 
-    return db.conn, db.root, db.config_hash, None
+    return db, None
 
 # ── moved from server.py ──
 def find_call_path(
@@ -521,20 +511,25 @@ def find_call_path(
         e.g. ``"main → app_run → modem_init"``). Empty list when no
         path exists within the depth limit.
     """
-    conn, root, config_hash, err = _refs_guard(project_root)
+    db, err = _refs_guard(project_root)
     if err:
         return err
-    assert conn is not None
-    assert root is not None
-    assert config_hash is not None
-    if _lookup_definition(conn, config_hash, from_name, preferred_kinds=None) is None:
-        return [{"error": f"Symbol not found: {from_name}"}]
-    if _lookup_definition(conn, config_hash, to_name, preferred_kinds=None) is None:
-        return [{"error": f"Symbol not found: {to_name}"}]
-    rows = index_db.find_call_path(conn, config_hash, from_name, to_name, max_depth=max_depth)
-    if not rows:
-        return [{"info": f"No path found from '{from_name}' to '{to_name}' within depth {max_depth}."}]
-    return rows
+    assert db is not None  # narrowed: err is None only on success
+
+    def _query(conn, config_hash):
+        # Runs under the executor lock on the single shared connection;
+        # must not open its own connection.  Timeout is enforced by
+        # _wrap_tool (300 s + interrupt), not here.
+        if _lookup_definition(conn, config_hash, from_name, preferred_kinds=None) is None:
+            return [{"error": f"Symbol not found: {from_name}"}]
+        if _lookup_definition(conn, config_hash, to_name, preferred_kinds=None) is None:
+            return [{"error": f"Symbol not found: {to_name}"}]
+        rows = index_db.find_call_path(conn, config_hash, from_name, to_name, max_depth=max_depth)
+        if not rows:
+            return [{"info": f"No path found from '{from_name}' to '{to_name}' within depth {max_depth}."}]
+        return rows
+
+    return db.executor.execute_sync(_query, db.config_hash)
 
 # ── moved from server.py ──
 def find_all_callers_recursive(
@@ -584,18 +579,23 @@ def find_all_callers_recursive(
         caller_qualified_name (str), depth (int — distance from target),
         file (str), line (int), ref_kind (``"call"`` or ``"indirect"``).
     """
-    conn, root, config_hash, err = _refs_guard(project_root)
+    db, err = _refs_guard(project_root)
     if err:
         return err
-    assert conn is not None
-    assert root is not None
-    assert config_hash is not None
-    if _lookup_definition(conn, config_hash, name, preferred_kinds=None) is None:
-        return [{"error": f"Symbol not found: {name}"}]
-    rows = index_db.find_all_callers_recursive(conn, config_hash, name, max_depth=max_depth, limit=limit)
-    if not rows:
-        return [{"info": f"No callers found for '{name}'."}]
-    return rows
+    assert db is not None  # narrowed: err is None only on success
+
+    def _query(conn, config_hash):
+        # Runs under the executor lock on the single shared connection;
+        # must not open its own connection.  Timeout is enforced by
+        # _wrap_tool (300 s + interrupt), not here.
+        if _lookup_definition(conn, config_hash, name, preferred_kinds=None) is None:
+            return [{"error": f"Symbol not found: {name}"}]
+        rows = index_db.find_all_callers_recursive(conn, config_hash, name, max_depth=max_depth, limit=limit)
+        if not rows:
+            return [{"info": f"No callers found for '{name}'."}]
+        return rows
+
+    return db.executor.execute_sync(_query, db.config_hash)
 
 # ── moved from server.py ──
 def find_callees_recursive(
@@ -643,18 +643,23 @@ def find_callees_recursive(
         callee_qualified_name (str), depth (int — distance from source),
         file (str), line (int), ref_kind (``"call"`` or ``"indirect"``).
     """
-    conn, root, config_hash, err = _refs_guard(project_root)
+    db, err = _refs_guard(project_root)
     if err:
         return err
-    assert conn is not None
-    assert root is not None
-    assert config_hash is not None
-    if _lookup_definition(conn, config_hash, name, preferred_kinds=None) is None:
-        return [{"error": f"Symbol not found: {name}"}]
-    rows = index_db.find_callees_recursive(conn, config_hash, name, max_depth=max_depth, limit=limit)
-    if not rows:
-        return [{"info": f"No callees found for '{name}'."}]
-    return rows
+    assert db is not None  # narrowed: err is None only on success
+
+    def _query(conn, config_hash):
+        # Runs under the executor lock on the single shared connection;
+        # must not open its own connection.  Timeout is enforced by
+        # _wrap_tool (300 s + interrupt), not here.
+        if _lookup_definition(conn, config_hash, name, preferred_kinds=None) is None:
+            return [{"error": f"Symbol not found: {name}"}]
+        rows = index_db.find_callees_recursive(conn, config_hash, name, max_depth=max_depth, limit=limit)
+        if not rows:
+            return [{"info": f"No callees found for '{name}'."}]
+        return rows
+
+    return db.executor.execute_sync(_query, db.config_hash)
 
 # ── moved from server.py ──
 def find_dead_code(
@@ -709,20 +714,25 @@ def find_dead_code(
         explains why the function is classified as dead or possibly dead).
     """
     limit = max(0, min(limit, 200))  # clamp
-    conn, root, config_hash, err = _refs_guard(project_root)
+    db, err = _refs_guard(project_root)
     if err:
         return err
-    assert conn is not None
-    assert root is not None
-    assert config_hash is not None
-    rows = index_db.find_dead_code(
-        conn, config_hash, limit=limit,
-        exclude_paths=exclude_paths,
-        project_only=project_only,
-    )
-    if not rows:
-        return [{"info": "No dead or possibly-dead functions found — every defined function has at least one caller."}]
-    return rows
+    assert db is not None  # narrowed: err is None only on success
+
+    def _query(conn, config_hash):
+        # Runs under the executor lock on the single shared connection;
+        # must not open its own connection.  Timeout is enforced by
+        # _wrap_tool (300 s + interrupt), not here.
+        rows = index_db.find_dead_code(
+            conn, config_hash, limit=limit,
+            exclude_paths=exclude_paths,
+            project_only=project_only,
+        )
+        if not rows:
+            return [{"info": "No dead or possibly-dead functions found — every defined function has at least one caller."}]
+        return rows
+
+    return db.executor.execute_sync(_query, db.config_hash)
 
 # ── moved from server.py ──
 def find_wrapper_callers(
@@ -759,116 +769,121 @@ def find_wrapper_callers(
         and calls (list of driver methods called)).
     """
     limit = max(0, min(limit, 50))  # clamp
-    conn, root, config_hash, err = _refs_guard(project_root)
+    db, err = _refs_guard(project_root)
     if err:
         return err
-    assert conn is not None
-    assert root is not None
-    assert config_hash is not None
-    # Resolve driver class — check it exists in the index
-    if _lookup_definition(conn, config_hash, class_name, preferred_kinds=None) is None:
-        return [{"error": f"Symbol not found: {class_name}"}]
+    assert db is not None  # narrowed: err is None only on success
 
-    # Find all methods of the class (index-able prefix LIKE, no leading %)
-    driver_methods = conn.execute(
-        """SELECT s.usr, s.name, s.qualified_name
-           FROM symbols s
-           WHERE s.config_hash = ?
-             AND s.kind = 'method'
-             AND s.qualified_name LIKE ?
-           ORDER BY s.name
-           LIMIT ?""",
-        (config_hash, f"{class_name}::%", max(limit * 10, 500)),
-    ).fetchall()
+    def _query(conn, config_hash):
+        # Runs under the executor lock on the single shared connection;
+        # must not open its own connection.  Timeout is enforced by
+        # _wrap_tool (300 s + interrupt), not here.
+        # Resolve driver class — check it exists in the index
+        if _lookup_definition(conn, config_hash, class_name, preferred_kinds=None) is None:
+            return [{"error": f"Symbol not found: {class_name}"}]
 
-    if not driver_methods:
-        esc_name = _escape_like(class_name)
+        # Find all methods of the class (index-able prefix LIKE, no leading %)
         driver_methods = conn.execute(
             """SELECT s.usr, s.name, s.qualified_name
                FROM symbols s
                WHERE s.config_hash = ?
                  AND s.kind = 'method'
-                 AND s.qualified_name LIKE ? ESCAPE '\\'
+                 AND s.qualified_name LIKE ?
                ORDER BY s.name
                LIMIT ?""",
-            (config_hash, f"%{esc_name}::%", max(limit * 10, 500)),
+            (config_hash, f"{class_name}::%", max(limit * 10, 500)),
         ).fetchall()
 
-    if not driver_methods and "::" in class_name:
-        short_name = class_name.rsplit("::", 1)[-1]
-        driver_methods = conn.execute(
-            """SELECT s.usr, s.name, s.qualified_name
-               FROM symbols s
-               WHERE s.config_hash = ?
-                 AND s.kind = 'method'
-                 AND s.qualified_name LIKE ? ESCAPE '\\'
-               ORDER BY s.name
-               LIMIT ?""",
-            (config_hash, f"{short_name}::%", max(limit * 10, 500)),
+        if not driver_methods:
+            esc_name = _escape_like(class_name)
+            driver_methods = conn.execute(
+                """SELECT s.usr, s.name, s.qualified_name
+                   FROM symbols s
+                   WHERE s.config_hash = ?
+                     AND s.kind = 'method'
+                     AND s.qualified_name LIKE ? ESCAPE '\\'
+                   ORDER BY s.name
+                   LIMIT ?""",
+                (config_hash, f"%{esc_name}::%", max(limit * 10, 500)),
+            ).fetchall()
+
+        if not driver_methods and "::" in class_name:
+            short_name = class_name.rsplit("::", 1)[-1]
+            driver_methods = conn.execute(
+                """SELECT s.usr, s.name, s.qualified_name
+                   FROM symbols s
+                   WHERE s.config_hash = ?
+                     AND s.kind = 'method'
+                     AND s.qualified_name LIKE ? ESCAPE '\\'
+                   ORDER BY s.name
+                   LIMIT ?""",
+                (config_hash, f"{short_name}::%", max(limit * 10, 500)),
+            ).fetchall()
+
+        if not driver_methods:
+            return [{"info": f"No methods found for class '{class_name}'."}]
+
+        driver_usr_map = {r["usr"]: r for r in driver_methods}
+
+        # Find all callers of those methods
+        placeholders = ",".join("?" * len(driver_usr_map))
+        rows = conn.execute(
+            f"""SELECT r.from_usr, r.to_usr, r.from_file, r.from_line, r.ref_kind,
+                       caller.name AS caller_name,
+                       caller.qualified_name AS caller_qname,
+                       caller.kind AS caller_kind
+                FROM refs r
+                LEFT JOIN symbols caller
+                  ON caller.config_hash = r.config_hash AND caller.usr = r.from_usr
+                WHERE r.config_hash = ?
+                  AND r.to_usr IN ({placeholders})
+                  AND r.ref_kind IN ('call', 'indirect')
+                ORDER BY caller.qualified_name, r.from_line
+                LIMIT ?""",
+            (config_hash, *driver_usr_map.keys(), limit),
         ).fetchall()
 
-    if not driver_methods:
-        return [{"info": f"No methods found for class '{class_name}'."}]
+        if not rows:
+            return [{"info": f"No callers found for methods of '{class_name}'."}]
 
-    driver_usr_map = {r["usr"]: r for r in driver_methods}
+        # Group by wrapper class
+        wrapped: dict[str, dict] = {}
+        for r in rows:
+            caller_qn = r["caller_qname"] or r["caller_name"] or "?"
+            # Extract class from qualified name: "zbox::ZMODEM::start" → "zbox::ZMODEM"
+            if "::" in caller_qn:
+                wrapper_class = caller_qn.rsplit("::", 1)[0]
+            else:
+                wrapper_class = "(global)"
+            if wrapper_class not in wrapped:
+                wrapped[wrapper_class] = {"class": wrapper_class, "methods": {}, "_file": r["from_file"]}
+            cm = wrapped[wrapper_class]["methods"]
+            if caller_qn not in cm:
+                cm[caller_qn] = {
+                    "method": r["caller_name"],
+                    "qualified_name": caller_qn,
+                    "kind": r["caller_kind"],
+                    "calls": [],
+                }
+            target = driver_usr_map.get(r["to_usr"])
+            if target:
+                cm[caller_qn]["calls"].append({
+                    "driver_method": target["name"],
+                    "line": r["from_line"],
+                })
 
-    # Find all callers of those methods
-    placeholders = ",".join("?" * len(driver_usr_map))
-    rows = conn.execute(
-        f"""SELECT r.from_usr, r.to_usr, r.from_file, r.from_line, r.ref_kind,
-                   caller.name AS caller_name,
-                   caller.qualified_name AS caller_qname,
-                   caller.kind AS caller_kind
-            FROM refs r
-            LEFT JOIN symbols caller
-              ON caller.config_hash = r.config_hash AND caller.usr = r.from_usr
-            WHERE r.config_hash = ?
-              AND r.to_usr IN ({placeholders})
-              AND r.ref_kind IN ('call', 'indirect')
-            ORDER BY caller.qualified_name, r.from_line
-            LIMIT ?""",
-        (config_hash, *driver_usr_map.keys(), limit),
-    ).fetchall()
-
-    if not rows:
-        return [{"info": f"No callers found for methods of '{class_name}'."}]
-
-    # Group by wrapper class
-    wrapped: dict[str, dict] = {}
-    for r in rows:
-        caller_qn = r["caller_qname"] or r["caller_name"] or "?"
-        # Extract class from qualified name: "zbox::ZMODEM::start" → "zbox::ZMODEM"
-        if "::" in caller_qn:
-            wrapper_class = caller_qn.rsplit("::", 1)[0]
-        else:
-            wrapper_class = "(global)"
-        if wrapper_class not in wrapped:
-            wrapped[wrapper_class] = {"class": wrapper_class, "methods": {}, "_file": r["from_file"]}
-        cm = wrapped[wrapper_class]["methods"]
-        if caller_qn not in cm:
-            cm[caller_qn] = {
-                "method": r["caller_name"],
-                "qualified_name": caller_qn,
-                "kind": r["caller_kind"],
-                "calls": [],
-            }
-        target = driver_usr_map.get(r["to_usr"])
-        if target:
-            cm[caller_qn]["calls"].append({
-                "driver_method": target["name"],
-                "line": r["from_line"],
+        # Flatten for output
+        result = []
+        for wc in sorted(wrapped.keys()):
+            entry = wrapped[wc]
+            result.append({
+                "wrapper_class": wc,
+                "method_count": len(entry["methods"]),
+                "methods": sorted(entry["methods"].values(), key=lambda m: m["qualified_name"]),
             })
+        return result
 
-    # Flatten for output
-    result = []
-    for wc in sorted(wrapped.keys()):
-        entry = wrapped[wc]
-        result.append({
-            "wrapper_class": wc,
-            "method_count": len(entry["methods"]),
-            "methods": sorted(entry["methods"].values(), key=lambda m: m["qualified_name"]),
-        })
-    return result
+    return db.executor.execute_sync(_query, db.config_hash)
 
 # ── moved from server.py ──
 def trace_data_flow(
@@ -914,72 +929,78 @@ def trace_data_flow(
     """
     max_depth = max(1, min(max_depth, 20))  # clamp
     limit = max(0, min(limit, 15))  # clamp
-    conn, root, config_hash, err = _refs_guard(project_root)
+    db, err = _refs_guard(project_root)
     if err:
         return err
-    assert conn is not None
-    assert root is not None
-    assert config_hash is not None
-    # Resolve target USR
-    target = conn.execute(
-        """SELECT usr, name FROM symbols
-           WHERE config_hash = ? AND (name = ? OR qualified_name = ?)
-           ORDER BY is_definition DESC LIMIT 1""",
-        (config_hash, to_symbol, to_symbol),
-    ).fetchone()
-    if not target:
-        return [{"info": f"Target symbol '{to_symbol}' not found."}]
+    assert db is not None  # narrowed: err is None only on success
+    root = db.root
 
-    # Find functions mentioning type_name in their signature (ranked by
-    # caller count so the most "active" data handlers are shown first)
-    sources = conn.execute(
-        """SELECT s.name, s.qualified_name, s.kind, s.file_path, s.line,
-                  s.signature, s.usr,
-                  (SELECT COUNT(*) FROM refs r
-                   WHERE r.to_usr = s.usr AND r.config_hash = s.config_hash
-                     AND r.ref_kind IN ('call', 'indirect')) AS caller_count
-           FROM symbols s
-           WHERE s.config_hash = ?
-             AND s.is_definition = 1
-             AND s.signature LIKE ? ESCAPE '\\'
-           ORDER BY caller_count DESC
-           LIMIT ?""",
-        (config_hash, f"%{_escape_like(type_name)}%", limit),
-    ).fetchall()
+    def _query(conn, config_hash):
+        # Runs under the executor lock on the single shared connection;
+        # must not open its own connection.  Timeout is enforced by
+        # _wrap_tool (300 s + interrupt), not here.
+        # Resolve target USR
+        target = conn.execute(
+            """SELECT usr, name FROM symbols
+               WHERE config_hash = ? AND (name = ? OR qualified_name = ?)
+               ORDER BY is_definition DESC LIMIT 1""",
+            (config_hash, to_symbol, to_symbol),
+        ).fetchone()
+        if not target:
+            return [{"info": f"Target symbol '{to_symbol}' not found."}]
 
-    if not sources:
-        return [{"info": f"No functions found with '{type_name}' in their signature."}]
+        # Find functions mentioning type_name in their signature (ranked by
+        # caller count so the most "active" data handlers are shown first)
+        sources = conn.execute(
+            """SELECT s.name, s.qualified_name, s.kind, s.file_path, s.line,
+                      s.signature, s.usr,
+                      (SELECT COUNT(*) FROM refs r
+                       WHERE r.to_usr = s.usr AND r.config_hash = s.config_hash
+                         AND r.ref_kind IN ('call', 'indirect')) AS caller_count
+               FROM symbols s
+               WHERE s.config_hash = ?
+                 AND s.is_definition = 1
+                 AND s.signature LIKE ? ESCAPE '\\'
+               ORDER BY caller_count DESC
+               LIMIT ?""",
+            (config_hash, f"%{_escape_like(type_name)}%", limit),
+        ).fetchall()
 
-    # Try call paths from each source to target
-    results = []
-    for src in sources:
-        paths = index_db.find_call_path(
-            conn, config_hash, src["qualified_name"], to_symbol, max_depth=max_depth,
-        )
-        entry = {
-            "source_name": src["name"],
-            "source_qualified_name": src["qualified_name"],
-            "source_kind": src["kind"],
-            "source_file": abs_path(root, src["file_path"]),
-            "source_line": src["line"],
-            "caller_count": src["caller_count"],
-        }
-        if paths:
-            entry["reachable"] = True
-            entry["paths"] = paths[:3]
-        else:
-            entry["reachable"] = False
-        results.append(entry)
+        if not sources:
+            return [{"info": f"No functions found with '{type_name}' in their signature."}]
 
-    num_reachable = sum(1 for r in results if r["reachable"])
-    return [
-        {
-            "_summary": f"{num_reachable}/{len(results)} source functions reach '{to_symbol}' within depth {max_depth}",
-            "_type": type_name,
-            "_target": to_symbol,
-        },
-        *results,
-    ]
+        # Try call paths from each source to target
+        results = []
+        for src in sources:
+            paths = index_db.find_call_path(
+                conn, config_hash, src["qualified_name"], to_symbol, max_depth=max_depth,
+            )
+            entry = {
+                "source_name": src["name"],
+                "source_qualified_name": src["qualified_name"],
+                "source_kind": src["kind"],
+                "source_file": abs_path(root, src["file_path"]),
+                "source_line": src["line"],
+                "caller_count": src["caller_count"],
+            }
+            if paths:
+                entry["reachable"] = True
+                entry["paths"] = paths[:3]
+            else:
+                entry["reachable"] = False
+            results.append(entry)
+
+        num_reachable = sum(1 for r in results if r["reachable"])
+        return [
+            {
+                "_summary": f"{num_reachable}/{len(results)} source functions reach '{to_symbol}' within depth {max_depth}",
+                "_type": type_name,
+                "_target": to_symbol,
+            },
+            *results,
+        ]
+
+    return db.executor.execute_sync(_query, db.config_hash)
 
 # ── moved from server.py ──
 def find_hotspots(
@@ -1021,20 +1042,25 @@ def find_hotspots(
         caller_count (int — total number of call sites), signature.
     """
     limit = max(0, min(limit, 50))  # clamp
-    conn, root, config_hash, err = _refs_guard(project_root)
+    db, err = _refs_guard(project_root)
     if err:
         return err
-    assert conn is not None
-    assert root is not None
-    assert config_hash is not None
-    rows = index_db.find_hotspots(
-        conn, config_hash, limit=limit,
-        exclude_paths=exclude_paths,
-        project_only=project_only,
-    )
-    if not rows and project_only:
-        return [{"info": "No project hotspots found. Try project_only=False to include vendor code."}]
-    if not rows:
-        return [{"info": "No references indexed — enable index_refs and re-index."}]
-    return rows
+    assert db is not None  # narrowed: err is None only on success
+
+    def _query(conn, config_hash):
+        # Runs under the executor lock on the single shared connection;
+        # must not open its own connection.  Timeout is enforced by
+        # _wrap_tool (300 s + interrupt), not here.
+        rows = index_db.find_hotspots(
+            conn, config_hash, limit=limit,
+            exclude_paths=exclude_paths,
+            project_only=project_only,
+        )
+        if not rows and project_only:
+            return [{"info": "No project hotspots found. Try project_only=False to include vendor code."}]
+        if not rows:
+            return [{"info": "No references indexed — enable index_refs and re-index."}]
+        return rows
+
+    return db.executor.execute_sync(_query, db.config_hash)
 

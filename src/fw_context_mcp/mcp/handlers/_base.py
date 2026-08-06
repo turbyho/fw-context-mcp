@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import dataclasses
 import logging
-import sqlite3
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -16,6 +15,7 @@ from fw_context_mcp.mcp.shared.context import _resolve_handler_context
 
 if TYPE_CHECKING:
     from ...config.settings import Config
+    from ..shared.executor import SyncQueryExecutor
 
 log = logging.getLogger(__name__)
 
@@ -24,17 +24,24 @@ log = logging.getLogger(__name__)
 class DbContext:
     """Resolved database context for a single request.
 
+    There is deliberately NO ``conn`` field (not even ``None``): a
+    missing attribute fails loudly at the call site (and statically via
+    mypy), while ``conn=None`` would only fail at runtime.  All database
+    access goes through ``executor.execute_sync(query_fn, config_hash)``;
+    after the executor migration, grepping for ``db.conn`` attribute
+    access over the handlers must return zero hits.
+
     Attributes:
         db_path: Path to the SQLite index database.
-        conn: Open, integrity-checked connection.
-        config_hash: Active build config hash.
+        executor: The single-connection query executor for this database.
+        config_hash: Active build config hash (read fresh per request).
         cfg: Full project config object.
         project_id: UUID project identifier.
         root: Resolved project root directory.
     """
 
     db_path: Path
-    conn: sqlite3.Connection
+    executor: SyncQueryExecutor
     config_hash: str
     cfg: Config
     project_id: str
@@ -53,7 +60,7 @@ class BaseHandler:
 
     @staticmethod
     def resolve_db_context(project_root: str | None = None) -> DbContext:
-        """Resolve project → config → db → connection → config_hash.
+        """Resolve project → config → db → executor → config_hash.
 
         Delegates to :func:`_resolve_handler_context` — one call replaces
         the common handler preamble.
@@ -69,7 +76,7 @@ class BaseHandler:
         assert ctx is not None, "HandlerContext must be non-None when err is None"
         return DbContext(
             db_path=ctx.db_path,
-            conn=ctx.conn,
+            executor=ctx.executor,
             config_hash=ctx.config_hash,
             cfg=ctx.cfg,
             project_id=ctx.project_id,

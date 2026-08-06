@@ -1,16 +1,14 @@
 # Quick Start
 
-This guide gets **fw-context** running on your project in just a few
-minutes.
+This guide shows how to run **fw-context** on your project. The setup takes only a few minutes.
 
-The main `README.md` explains **why** the project exists and the problem
-it solves.
+The main `README.md` file explains **why** the project exists, and which problem the project solves.
 
-This document explains **how** to start using it.
+This document explains **how** to start using fw-context.
 
 ## Prerequisites
 
-Before indexing a project you need:
+Before you index a project, you need:
 
 -   Python 3.11+
 -   libclang
@@ -21,7 +19,7 @@ See the installation guide for platform-specific instructions.
 
 ## Installation
 
-Clone the repository and install:
+Clone the repository. Then install fw-context:
 
 ``` bash
 git clone git@github.com:turbyho/fw-context-mcp.git ~/.fw-context/src
@@ -37,25 +35,25 @@ fw-context init
 
 ## Index your first project
 
-Go to your firmware project and either build and index it automatically:
+Go to your firmware project. Then choose one of two options.
+
+To build and index the project automatically, run:
 
 ``` bash
 fw-context index --build
 ```
 
-or reuse an existing `compile_commands.json`:
+To reuse an existing `compile_commands.json` file, run:
 
 ``` bash
 fw-context index
 ```
 
-The index is persistent and incremental. After the initial indexing only
-changed translation units are reprocessed.
+The index is persistent and incremental. After the first indexing run, fw-context reprocesses only the translation units that changed.
 
 ## Start asking questions
 
-Once indexing is complete your LLM can ask semantic questions instead of
-reading entire source files, for example:
+After indexing finishes, your LLM can ask semantic questions. Your LLM does not need to read entire source files. For example, your LLM can ask:
 
 -   Who calls this function?
 -   Which callback registers this handler?
@@ -66,15 +64,13 @@ reading entire source files, for example:
 
 ## Optional: Remote cache
 
-If your team runs a [shared cache server](cache-server.md), configure
-it to share LLM analysis results across developers:
+If your team runs a [shared cache server](cache-server.md), configure fw-context to share LLM analysis results across developers:
 
 ``` bash
 fw-context cache remote-init
 ```
 
-The interactive wizard asks for your server URL and token, verifies
-the connection, and writes the configuration to your project.
+The interactive wizard asks for your server URL and your token. The wizard verifies the connection. The wizard writes the configuration to your project.
 
 ## Next steps
 
@@ -85,5 +81,4 @@ Continue with the detailed documentation:
 -   [Tools Reference](tools.md)
 -   [MCP Server](../README-MCP.md)
 
-The documentation in this directory is intended as a reference. The
-recommended starting point for new users is the repository `README.md`.
+This directory contains reference documentation. New users should start with the repository `README.md` file instead.

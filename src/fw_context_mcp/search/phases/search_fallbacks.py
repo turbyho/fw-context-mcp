@@ -15,7 +15,6 @@ from __future__ import annotations
 
 import logging
 
-from fw_context_mcp.indexer.db import open_db
 from fw_context_mcp.search.phases.base import Phase
 from fw_context_mcp.search.shared_fallbacks import (
     _search_code_docstring,
@@ -47,17 +46,17 @@ class NameTokensFallbackPhase(Phase):
         return not ctx.fts5_results
 
     async def run(self, ctx: PipelineContext) -> PipelineContext:
-        conn = open_db(ctx.db_path)
-        try:
-            with conn:
-                result = _search_code_name_tokens(
-                    conn, ctx.query, ctx.config_hash,
-                    ctx.limit, None, False, ctx.project_root,
-                )
-                if result is not None:
-                    return ctx.evolve(fts5_results=result[0])
-        finally:
-            conn.close()
+        def _query(conn, config_hash):
+            # Runs under the executor lock on the single shared
+            # connection; the phase must not open its own connection.
+            return _search_code_name_tokens(
+                conn, ctx.query, config_hash,
+                ctx.limit, None, False, ctx.project_root,
+            )
+
+        result = ctx.executor.execute_sync(_query, ctx.config_hash)
+        if result is not None:
+            return ctx.evolve(fts5_results=result[0])
         return ctx
 
 
@@ -74,17 +73,17 @@ class DocstringFallbackPhase(Phase):
         return not ctx.fts5_results
 
     async def run(self, ctx: PipelineContext) -> PipelineContext:
-        conn = open_db(ctx.db_path)
-        try:
-            with conn:
-                result = _search_code_docstring(
-                    conn, ctx.query, ctx.config_hash,
-                    ctx.limit, None, False, ctx.project_root,
-                )
-                if result is not None:
-                    return ctx.evolve(fts5_results=result[0])
-        finally:
-            conn.close()
+        def _query(conn, config_hash):
+            # Runs under the executor lock on the single shared
+            # connection; the phase must not open its own connection.
+            return _search_code_docstring(
+                conn, ctx.query, config_hash,
+                ctx.limit, None, False, ctx.project_root,
+            )
+
+        result = ctx.executor.execute_sync(_query, ctx.config_hash)
+        if result is not None:
+            return ctx.evolve(fts5_results=result[0])
         return ctx
 
 
@@ -101,17 +100,17 @@ class IndividualTermsFallbackPhase(Phase):
         return not ctx.fts5_results
 
     async def run(self, ctx: PipelineContext) -> PipelineContext:
-        conn = open_db(ctx.db_path)
-        try:
-            with conn:
-                result = _search_code_individual_terms(
-                    conn, ctx.query, ctx.config_hash,
-                    ctx.limit, None, False, ctx.project_root,
-                )
-                if result is not None:
-                    return ctx.evolve(fts5_results=result[0])
-        finally:
-            conn.close()
+        def _query(conn, config_hash):
+            # Runs under the executor lock on the single shared
+            # connection; the phase must not open its own connection.
+            return _search_code_individual_terms(
+                conn, ctx.query, config_hash,
+                ctx.limit, None, False, ctx.project_root,
+            )
+
+        result = ctx.executor.execute_sync(_query, ctx.config_hash)
+        if result is not None:
+            return ctx.evolve(fts5_results=result[0])
         return ctx
 
 
@@ -128,17 +127,17 @@ class MacrosFtsFallbackPhase(Phase):
         return not ctx.fts5_results
 
     async def run(self, ctx: PipelineContext) -> PipelineContext:
-        conn = open_db(ctx.db_path)
-        try:
-            with conn:
-                result = _search_code_macros_fts(
-                    conn, ctx.query, ctx.config_hash,
-                    ctx.limit, None, False, ctx.project_root,
-                )
-                if result is not None:
-                    return ctx.evolve(fts5_results=result[0])
-        finally:
-            conn.close()
+        def _query(conn, config_hash):
+            # Runs under the executor lock on the single shared
+            # connection; the phase must not open its own connection.
+            return _search_code_macros_fts(
+                conn, ctx.query, config_hash,
+                ctx.limit, None, False, ctx.project_root,
+            )
+
+        result = ctx.executor.execute_sync(_query, ctx.config_hash)
+        if result is not None:
+            return ctx.evolve(fts5_results=result[0])
         return ctx
 
 

@@ -5,6 +5,7 @@ from __future__ import annotations
 import fcntl
 import logging
 import os
+import sqlite3
 import subprocess
 import sys
 from contextlib import contextmanager
@@ -214,66 +215,73 @@ def _fast_staleness_check(root: Path) -> tuple[bool, list[str]]:
     from ..config import derive_project_id
     from ..config import load as load_config
     from ..indexer.db import get_active_config
-    from .shared.context import _db_path, _open_db_or_return
+    from .shared.context import _db_path, _quick_open_readonly
     from .shared.stale import check_structural_staleness
 
     db_path = _db_path(root)
     if not db_path.exists():
         return False, []
 
-    conn, err_result = _open_db_or_return(db_path)
-    if err_result is not None:
+    # Read-only quick open: a full open_db would run ensure_schema's
+    # unconditional executescript — a write transaction on every check
+    # interval — causing lock contention with the executor.  This path
+    # only reads.
+    try:
+        conn = _quick_open_readonly(db_path)
+    except sqlite3.Error:
         return False, []
-    assert conn is not None
-    reasons: list[str] = []
-    project_id = derive_project_id(root)
-    cfg = get_active_config(conn, project_id)
-    if not cfg:
-        return False, []
-    config_hash = cfg["config_hash"]
+    try:
+        reasons: list[str] = []
+        project_id = derive_project_id(root)
+        cfg = get_active_config(conn, project_id)
+        if not cfg:
+            return False, []
+        config_hash = cfg["config_hash"]
 
-    # 1-3. Structural checks (shared with daemon._staleness_check)
-    reasons.extend(check_structural_staleness(conn, config_hash, dict(cfg), root))
+        # 1-3. Structural checks (shared with daemon._staleness_check)
+        reasons.extend(check_structural_staleness(conn, config_hash, dict(cfg), root))
 
-    # 4. Unanalyzed symbols?
-    # Uses CONFIG analyze_vendor (not stored) because this check
-    # predicts what the background reindex will do — and the
-    # background reindex uses config, not stored flags.  Using
-    # stored would cause an infinite reindex loop when a manual
-    # --analyze-vendor run stored True but config is False.
-    proj_cfg = load_config(root)
-    if proj_cfg.llm.enabled and proj_cfg.llm.analyze_symbols:
-        if proj_cfg.llm.analyze_vendor:
-            unanalyzed = conn.execute(
-                """SELECT COUNT(*)
-                   FROM symbols s
-                   WHERE s.config_hash = ?
-                     AND s.is_definition = 1
-                     AND s.kind IN ('function', 'method',
-                                    'constructor', 'destructor',
-                                    'class', 'struct')
-                     AND s.name NOT LIKE '%(anonymous%'
-                     AND s.name NOT LIKE '%(unnamed%'
-                     AND NOT EXISTS (SELECT 1 FROM llm_analysis a WHERE a.symbol_id = s.id)""",
-                (config_hash,),
-            ).fetchone()[0]
-        else:
-            # Use is_project column directly for unanalyzed symbol count
-            unanalyzed = conn.execute(
-                """SELECT COUNT(*)
-                   FROM symbols s
-                   WHERE s.config_hash = ?
-                     AND s.is_definition = 1
-                     AND s.is_project = 1
-                     AND s.kind IN ('function', 'method',
-                                    'constructor', 'destructor',
-                                    'class', 'struct')
-                     AND s.name NOT LIKE '%(anonymous%'
-                     AND s.name NOT LIKE '%(unnamed%'
-                     AND NOT EXISTS (SELECT 1 FROM llm_analysis a WHERE a.symbol_id = s.id)""",
-                (config_hash,),
-            ).fetchone()[0]
-        if unanalyzed > 0:
-            reasons.append(f"{unanalyzed} unanalyzed symbols")
-    return len(reasons) > 0, reasons
+        # 4. Unanalyzed symbols?
+        # Uses CONFIG analyze_vendor (not stored) because this check
+        # predicts what the background reindex will do — and the
+        # background reindex uses config, not stored flags.  Using
+        # stored would cause an infinite reindex loop when a manual
+        # --analyze-vendor run stored True but config is False.
+        proj_cfg = load_config(root)
+        if proj_cfg.llm.enabled and proj_cfg.llm.analyze_symbols:
+            if proj_cfg.llm.analyze_vendor:
+                unanalyzed = conn.execute(
+                    """SELECT COUNT(*)
+                       FROM symbols s
+                       WHERE s.config_hash = ?
+                         AND s.is_definition = 1
+                         AND s.kind IN ('function', 'method',
+                                        'constructor', 'destructor',
+                                        'class', 'struct')
+                         AND s.name NOT LIKE '%(anonymous%'
+                         AND s.name NOT LIKE '%(unnamed%'
+                         AND NOT EXISTS (SELECT 1 FROM llm_analysis a WHERE a.symbol_id = s.id)""",
+                    (config_hash,),
+                ).fetchone()[0]
+            else:
+                # Use is_project column directly for unanalyzed symbol count
+                unanalyzed = conn.execute(
+                    """SELECT COUNT(*)
+                       FROM symbols s
+                       WHERE s.config_hash = ?
+                         AND s.is_definition = 1
+                         AND s.is_project = 1
+                         AND s.kind IN ('function', 'method',
+                                        'constructor', 'destructor',
+                                        'class', 'struct')
+                         AND s.name NOT LIKE '%(anonymous%'
+                         AND s.name NOT LIKE '%(unnamed%'
+                         AND NOT EXISTS (SELECT 1 FROM llm_analysis a WHERE a.symbol_id = s.id)""",
+                    (config_hash,),
+                ).fetchone()[0]
+            if unanalyzed > 0:
+                reasons.append(f"{unanalyzed} unanalyzed symbols")
+        return len(reasons) > 0, reasons
+    finally:
+        conn.close()
 

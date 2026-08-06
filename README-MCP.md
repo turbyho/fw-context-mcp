@@ -1,12 +1,10 @@
 # fw-context-mcp — MCP Server
 
-MCP (Model Context Protocol) server that exposes the fw-context symbol index
-as tools for AI assistants. Communicates over **JSON-RPC 2.0 via stdio**.
+fw-context-mcp is an MCP (Model Context Protocol) server. fw-context-mcp exposes the fw-context symbol index as tools for AI assistants. fw-context-mcp communicates over **JSON-RPC 2.0**, through stdio.
 
 ## What it is
 
-A persistent subprocess started by your AI assistant (Claude Code, OpenCode, …)
-that provides **34 tools** for navigating embedded firmware codebases:
+Your AI assistant (for example, Claude Code or OpenCode) starts fw-context-mcp as a persistent subprocess. fw-context-mcp provides **34 tools** to navigate embedded firmware codebases:
 
 | Category | Tools |
 |----------|-------|
@@ -16,11 +14,11 @@ that provides **34 tools** for navigating embedded firmware codebases:
 | **Class analysis** | `get_inheritance_chain`, `get_class_members`, `get_template_instances`, `get_method_overrides` |
 | **Index maintenance** | `get_active_build`, `reindex_file`, `reindex_file_impl`, `reset_index`, `list_projects`, `check_ollama` |
 
-Full tool reference with schemas and examples: **[Tools Reference](docs/tools.md)**
+For the full tool reference, with schemas and examples, see **[Tools Reference](docs/tools.md)**.
 
 ## Protocol
 
-JSON-RPC 2.0 over stdin/stdout. One JSON object per line, terminated by `\n`.
+fw-context-mcp uses JSON-RPC 2.0 over stdin and stdout. Each line contains one JSON object. A newline character (`\n`) ends each line.
 
 ### Initialization
 
@@ -45,7 +43,7 @@ Server → Client:
   {"jsonrpc":"2.0","id":2,"result":{"content":[{"type":"text","text":"<json>"}],"isError":false}}
 ```
 
-The `text` field is a JSON-encoded string — parse it to get the return value.
+The `text` field is a JSON-encoded string. Parse the string to get the return value.
 
 ### Listing tools
 
@@ -62,8 +60,7 @@ Server → Client:  {"jsonrpc":"2.0","id":99,"result":{"tools":[{…},…]}}
 claude mcp add --scope user fw-context ~/.fw-context/.venv/bin/fw-context-mcp
 ```
 
-Run `fw-context init` to do this automatically and inject usage instructions
-into `~/.claude/CLAUDE.md`.
+Run `fw-context init` to do this automatically. This command also adds usage instructions to `~/.claude/CLAUDE.md`.
 
 ### OpenCode
 
@@ -89,8 +86,7 @@ Start the server as a subprocess:
 /path/to/.fw-context/.venv/bin/fw-context-mcp
 ```
 
-Send JSON-RPC on stdin, read responses from stdout. The server has no CLI
-interface — it only speaks MCP.
+Send JSON-RPC requests on stdin. Read the responses from stdout. The server has no CLI interface. The server speaks only MCP.
 
 ## Error handling
 
@@ -99,20 +95,16 @@ interface — it only speaks MCP.
 {"jsonrpc":"2.0","id":1,"error":{"code":-32602,"message":"Invalid request parameters"}}
 ```
 
-**Tool-level errors** (tool ran but couldn't complete):
+**Tool-level errors** (the tool ran, but did not complete):
 ```json
 {"result":{"content":[{"type":"text","text":"{\"error\": \"No index found for …\"}"}],"isError":false}}
 ```
 
-Tool errors use `isError: false` — the tool call succeeded, but returned an
-error field. Only JSON-RPC protocol errors use the top-level `error` key.
+Tool errors use `isError: false`. The tool call succeeded, but the result contains an error field. Only JSON-RPC protocol errors use the top-level `error` key.
 
 ### Staleness and auto-reindex
 
-`search_code` and `lookup_symbol` automatically detect stale files in results,
-re-index them (up to 5 files, 30 s timeout), and re-run the query. When
-auto-reindex fails or `compile_commands.json` itself is stale, a warning
-entry is included:
+`search_code` and `lookup_symbol` detect stale files in the results automatically. These tools re-index up to 5 stale files, with a 30-second timeout. Then these tools run the query again. When auto-reindex fails, or when `compile_commands.json` itself is stale, the result includes a warning entry:
 
 ```json
 [
@@ -123,8 +115,7 @@ entry is included:
 
 ### Database corruption
 
-The server runs `PRAGMA integrity_check` on every database open. If corruption
-is detected, tools return a structured error:
+The server runs `PRAGMA integrity_check` on every database open. If the check finds corruption, the tools return a structured error:
 
 ```json
 {
@@ -134,16 +125,13 @@ is detected, tools return a structured error:
 }
 ```
 
-Call `reset_index(confirm=true)` to delete the database, then `fw-context index`
-to rebuild.
+Call `reset_index(confirm=true)` to delete the database. Then run `fw-context index` to rebuild the database.
 
 ## Environment
 
-- **CWD:** The server resolves project root from `$PWD` when `project_root`
-  is not provided. Launch it from the firmware project root.
-- **No network required** for core tools (search, lookup, source, graph).
-  `smart_search` and `explain_symbol` optionally use local Ollama.
-- **Stateless** between calls — each tool opens the DB, queries, closes.
+- **CWD:** The server resolves the project root from `$PWD` when the request does not provide `project_root`. Launch the server from the firmware project root.
+- **The core tools need no network connection** (search, lookup, source, graph). `smart_search` and `explain_symbol` can optionally use a local Ollama server.
+- **The server keeps no state between calls.** For each call, a tool opens the database, runs the query, and closes the database.
 
 ## Debugging
 

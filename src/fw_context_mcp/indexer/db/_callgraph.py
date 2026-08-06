@@ -57,8 +57,10 @@ def _resolve_target_usr(conn: sqlite3.Connection, config_hash: str, name: str) -
     return rows["usr"] if rows else None
 
 
-# Cache for _get_alias_pairs — stored on the connection object.
-# Automatically garbage-collected when the connection is closed.
+# Cache for _get_alias_pairs — module-level dict keyed by id(conn).
+# pysqlite3.dbapi2.Connection objects lack __dict__ for attribute
+# storage, so we cannot attach _alias_cache to the connection directly.
+_alias_cache_global: dict[int, dict[str, list[tuple[str, str]]]] = {}
 
 
 def _get_alias_pairs(conn: sqlite3.Connection, config_hash: str) -> list[tuple[str, str]]:
@@ -71,7 +73,7 @@ def _get_alias_pairs(conn: sqlite3.Connection, config_hash: str) -> list[tuple[s
     Result is cached per-connection — alias pairs don't change during a
     connection's lifetime.
     """
-    per_conn_cache: dict[str, list[tuple[str, str]]] | None = getattr(conn, "_alias_cache", None)
+    per_conn_cache = _alias_cache_global.get(id(conn))
     if per_conn_cache is not None:
         cached = per_conn_cache.get(config_hash)
         if cached is not None:
@@ -120,9 +122,12 @@ def _get_alias_pairs(conn: sqlite3.Connection, config_hash: str) -> list[tuple[s
             if def_usr:
                 pairs.append((r["usr"], def_usr))
                 break
-    if not hasattr(conn, "_alias_cache"):
-        conn._alias_cache = {}  # type: ignore[attr-defined]
-    conn._alias_cache[config_hash] = pairs  # type: ignore[attr-defined]
+    conn_id = id(conn)
+    if conn_id not in _alias_cache_global:
+        if len(_alias_cache_global) > 16:  # evict stale entries from closed connections
+            _alias_cache_global.clear()
+        _alias_cache_global[conn_id] = {}
+    _alias_cache_global[conn_id][config_hash] = pairs
     return pairs
 
 
@@ -193,6 +198,7 @@ def find_call_path(
 
     # ── Lazy edge / name caches (avoid loading all refs into memory) ──
     _edge_cache: dict[str, list[tuple[str, str]]] = {}
+    _in_edge_cache: dict[str, list[tuple[str, str]]] = {}
     _name_cache: dict[str, str] = {}
     # USR variants for from_name — edges from ANY variant are valid
     _from_variants: set[str] = from_usr_set
@@ -243,6 +249,33 @@ def find_call_path(
                 _edge_cache[usr] = []
         return _edge_cache[usr]
 
+    def _get_in_edges(usr: str) -> list[tuple[str, str]]:
+        """Return [(from_usr, caller_name), ...] for *usr* — who calls it.  Cached per call."""
+        if usr not in _in_edge_cache:
+            try:
+                rows = conn.execute(
+                    """SELECT r.from_usr,
+                              COALESCE(
+                                  (SELECT name FROM symbols s
+                                   WHERE s.usr = r.from_usr AND s.config_hash = r.config_hash
+                                     AND s.is_definition = 1 LIMIT 1),
+                                  (SELECT name FROM symbols s
+                                   WHERE s.usr = r.from_usr AND s.config_hash = r.config_hash LIMIT 1),
+                                  '?'
+                              ) AS caller_name
+                       FROM refs r
+                       WHERE r.config_hash = ? AND r.to_usr = ?
+                         AND r.from_usr IS NOT NULL
+                         AND r.ref_kind IN ('call', 'indirect', 'implicit_construct', 'dispatch')
+                       GROUP BY r.from_usr""",
+                    (config_hash, usr),
+                ).fetchall()
+                _in_edge_cache[usr] = [(r["from_usr"], r["caller_name"]) for r in rows]
+            except sqlite3.Error:
+                log.exception("_get_in_edges failed for USR '%s'", usr)
+                _in_edge_cache[usr] = []
+        return _in_edge_cache[usr]
+
     def _get_edges_multi(usrs: set[str]) -> list[tuple[str, str]]:
         """Return all outgoing edges from ANY of the given USRs."""
         edges: list[tuple[str, str]] = []
@@ -285,42 +318,75 @@ def find_call_path(
             log.exception("Global ctors bridging failed")
 
     from_name_resolved = _get_name(from_usr)
-    found: list[dict] = []
 
-    # ── BFS queue: (current_usr, depth, chain) ──
-    queue: deque = deque()
-    visited: set[str] = {from_usr}
-
-    # Seed: direct edges from source (all USR variants)
+    # ── Direct edge check (depth 1) — same as old code for fast path ──
     for to_usr_edge, callee_name in _get_edges_multi(_from_variants):
-        if to_usr_edge not in visited:
-            chain = f"{from_name_resolved} → {callee_name}"
-            if to_usr_edge == to_usr:
-                found.append({"depth": 1, "chain": chain, "target_usr": to_usr})
-                if len(found) >= 5:
-                    return found
-            else:
-                queue.append((to_usr_edge, 1, chain))
-            visited.add(to_usr_edge)
+        if to_usr_edge == to_usr:
+            return [{"depth": 1, "chain": f"{from_name_resolved} → {callee_name}", "target_usr": to_usr}]
 
-    # BFS main loop — expand until we have 5 paths or the queue is empty
-    while queue and len(found) < 5:
-        current, depth, chain = queue.popleft()
-        if current == to_usr:
-            found.append({"depth": depth, "chain": chain, "target_usr": current})
-            continue
-        if depth >= max_depth:
-            continue
-        for next_usr, next_name in _get_edges(current):
-            if next_usr not in visited:
-                visited.add(next_usr)
-                new_chain = f"{chain} → {next_name}"
-                if next_usr == to_usr:
-                    found.append({"depth": depth + 1, "chain": new_chain, "target_usr": next_usr})
+    # ── Bidirectional BFS — expands forward from source AND reverse from target
+    # simultaneously.  Halves the effective search depth (O(b^(d/2)) vs O(b^d))
+    # so large fan-out nodes (e.g. dispatch_forever with thousands of event
+    # handlers) no longer dominate the search. ──
+    f_dist: dict[str, int] = {}     # usr → distance from source
+    f_chain: dict[str, str] = {}    # usr → chain string from source
+    r_dist: dict[str, int] = {}     # usr → distance to target (reverse)
+    r_chain: dict[str, str] = {}    # usr → chain string to target (reverse)
+
+    # Seed forward: all USR variants of from_name
+    for u in _from_variants:
+        if u not in f_dist:
+            f_dist[u] = 0
+            f_chain[u] = _get_name(u) if u != from_usr else from_name_resolved
+    # Seed reverse: target
+    to_name_resolved = _get_name(to_usr)
+    r_dist[to_usr] = 0
+    r_chain[to_usr] = to_name_resolved
+
+    f_queue: deque[str] = deque(f_dist.keys())
+    r_queue: deque[str] = deque([to_usr])
+    found: list[dict] = []
+    depth = 0
+
+    while f_queue and r_queue and depth < max_depth:
+        depth += 1
+        # ── Expand forward (outgoing edges) ──
+        for _ in range(len(f_queue)):
+            u = f_queue.popleft()
+            for v, v_name in _get_edges(u):
+                if v in f_dist:
+                    continue
+                f_dist[v] = depth
+                f_chain[v] = f"{f_chain[u]} → {v_name}"
+                f_queue.append(v)
+                if v in r_dist:
+                    # Meeting point — reconstruct full path
+                    total_depth = f_dist[v] + r_dist[v]
+                    r_parts = r_chain[v].split(" → ")
+                    tail = " → ".join(r_parts[1:])  # skip meeting node (already in f_chain)
+                    chain = f_chain[v] if not tail else f"{f_chain[v]} → {tail}"
+                    found.append({"depth": total_depth, "chain": chain, "target_usr": to_usr})
                     if len(found) >= 5:
-                        break
-                else:
-                    queue.append((next_usr, depth + 1, new_chain))
+                        return found
+
+        # ── Expand reverse (incoming edges) ──
+        for _ in range(len(r_queue)):
+            u = r_queue.popleft()
+            for v, v_name in _get_in_edges(u):
+                if v in r_dist:
+                    continue
+                r_dist[v] = depth
+                r_chain[v] = f"{v_name} → {r_chain[u]}"
+                r_queue.append(v)
+                if v in f_dist:
+                    # Meeting point
+                    total_depth = f_dist[v] + r_dist[v]
+                    r_parts = r_chain[v].split(" → ")
+                    tail = " → ".join(r_parts[1:])
+                    chain = f_chain[v] if not tail else f"{f_chain[v]} → {tail}"
+                    found.append({"depth": total_depth, "chain": chain, "target_usr": to_usr})
+                    if len(found) >= 5:
+                        return found
 
     return found
 

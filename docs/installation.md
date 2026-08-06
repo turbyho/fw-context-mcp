@@ -1,6 +1,6 @@
 # Installation
 
-Complete installation guide — prerequisites, setup, Ollama, AI assistant integration.
+This is the complete installation guide. This guide covers prerequisites, setup, Ollama, and AI assistant integration.
 
 ## Prerequisites
 
@@ -34,7 +34,7 @@ echo 'export PATH="/opt/homebrew/opt/python@3.12/libexec/bin:$PATH"' >> ~/.zshrc
 |------|-----|
 | Python 3.11+ | Runtime |
 | [`uv`](https://docs.astral.sh/uv/) | Fast package installer |
-| Compiler toolchain (ARM GCC / Zephyr SDK / …) | libclang needs system headers to parse cross-compiled code |
+| Compiler toolchain (for example ARM GCC or the Zephyr SDK) | libclang needs system headers to parse cross-compiled code |
 | [`bear`](https://github.com/rizsotto/Bear) | Intercepts build commands → `compile_commands.json` |
 | [Ollama](https://ollama.com) *(optional)* | Powers `smart_search` and `explain_symbol`. Disable with `[llm] enabled = false` to let the AI assistant handle results. |
 
@@ -51,14 +51,11 @@ cd ~/.fw-context/src && make install
 
 **File watcher (auto-reindex on save):**
 
-The MCP server starts a background watcher daemon automatically — edited
-source files are reindexed within 500 ms of saving, and LLM analysis
-regenerates after 60 s of inactivity. No separate configuration needed.
+The MCP server starts a background watcher daemon automatically. This daemon reindexes an edited source file within 500 ms after you save the file. This daemon regenerates the LLM analysis after 60 s of inactivity. You do not need separate configuration.
 
 ## Configure your project
 
-After install, create `<project>/.fw-context/config.toml` in your firmware
-project — or let `fw-context index` auto-create it with defaults.
+After you install fw-context, create `<project>/.fw-context/config.toml` in your firmware project. Or let `fw-context index` create this file automatically, with default values.
 
 Two project-level files exist:
 
@@ -67,7 +64,7 @@ Two project-level files exist:
 | `.fw-context/config.toml` | Shared settings (build, index, project name) | Commit |
 | `.fw-context/local.toml` | Private overrides (LLM model, db path, analysis toggles) | Gitignore |
 
-Full reference: **[Configuration →](configuration.md)**.
+For the full reference, see **[Configuration →](configuration.md)**.
 
 ### Zephyr
 
@@ -77,9 +74,6 @@ board = "nrf52840dk_nrf52840"    # required
 # clean = true                   # pristine build (recommended)
 ```
 
-### PlatformIO / Arduino
-
-```toml
 ### PlatformIO / Arduino
 
 ```toml
@@ -116,22 +110,22 @@ defines = [
 # project_paths = ["src/old_hal"]        # manual project dirs (overrides auto-detection)
 ```
 
-> **`defines`** are passed as `-D` flags to the compiler. Use them for version
-> numbers and feature toggles — ensures `#ifdef DEV` / `#if VERSION_FW_MAJOR`
-> branches are indexed correctly.
+> fw-context passes **`defines`** to the compiler as `-D` flags. Use `defines` for version
+> numbers and feature toggles. This makes fw-context index `#ifdef DEV` and
+> `#if VERSION_FW_MAJOR` branches correctly.
 
 ## Dependencies by Build System
 
-Install only what your build system needs. Core Python packages (`libclang`,
-`pysqlite3`, `sqlite-vec`, `watchfiles`, `httpx`, `mcp`) are installed
-automatically with `pip install fw-context-mcp`.
+Install only the tools that your build system needs. `pip install fw-context-mcp`
+installs the core Python packages automatically: `libclang`, `pysqlite3`,
+`sqlite-vec`, `watchfiles`, `httpx`, and `mcp`.
 
 ### Core (All Projects)
 
 | Tool | Why |
 |------|-----|
 | Python 3.11+ | Runtime |
-| `clang` (system binary) | Resolves expanded macro values (`clang -dM -E`) |
+| `clang` (system binary) | fw-context uses this tool to resolve expanded macro values, with `clang -dM -E` |
 
 ```bash
 # Arch / Manjaro
@@ -148,17 +142,16 @@ xcode-select --install   # ships clang as part of Command Line Tools
 
 | Tool | Why | Install |
 |------|-----|---------|
-| **west** | Build orchestration | Bundled with Zephyr SDK — [Getting Started](https://docs.zephyrproject.org/latest/develop/getting_started/index.html) |
-| Zephyr SDK | Toolchain + cmake + host tools | Follow Zephyr install guide |
+| **west** | Build orchestration | Included with the Zephyr SDK. See [Getting Started](https://docs.zephyrproject.org/latest/develop/getting_started/index.html) |
+| Zephyr SDK | Toolchain + cmake + host tools | Follow the Zephyr install guide |
 
-`fw-context` runs `west build -b <board>`. `CMAKE_EXPORT_COMPILE_COMMANDS=ON`
-is enabled automatically.
+`fw-context` runs `west build -b <board>`. `fw-context` enables `CMAKE_EXPORT_COMPILE_COMMANDS=ON` automatically.
 
-> **Nordic NCS users:** `fw-context init` auto-detects the NCS toolchain
-> setup script (`~/ncs_tools/nordic_minimal_setup.sh`) and writes it to
-> `.fw-context/local.toml` as `activate`.  For plain Zephyr, it checks
-> `west config zephyr.base` and `~/zephyr-sdk-*/` for the environment
-> setup script.
+> **Nordic NCS users:** `fw-context init` detects the NCS toolchain setup script
+> automatically, at `~/ncs_tools/nordic_minimal_setup.sh`. `fw-context init`
+> writes this script path to `.fw-context/local.toml`, as `activate`. For plain
+> Zephyr, `fw-context init` checks `west config zephyr.base` and
+> `~/zephyr-sdk-*/` for the environment setup script.
 
 ### PlatformIO
 
@@ -168,9 +161,10 @@ is enabled automatically.
 
 `fw-context` runs `pio run --target compiledb` plus a real build for `.d` files.
 
-> **`fw-context init`** auto-detects PlatformIO from `~/.platformio/penv/bin/python`
-> (bundled venv) or `pio` on PATH.  When detection fails, set
-> `python = "/path/to/python"` in `.fw-context/local.toml`.
+> **`fw-context init`** detects PlatformIO automatically, from
+> `~/.platformio/penv/bin/python` (the bundled venv) or from `pio` on PATH.
+> When automatic detection fails, set `python = "/path/to/python"` in
+> `.fw-context/local.toml`.
 
 ### Mbed OS
 
@@ -182,10 +176,11 @@ is enabled automatically.
 
 `fw-context` runs `bear --output compile_commands.json -- mbed compile -t GCC_ARM -m <target>`.
 
-> **`fw-context init`** auto-detects the Python interpreter for `mbed-cli`
+> **`fw-context init`** detects the Python interpreter for `mbed-cli` automatically,
 > from pyenv versions (`~/.pyenv/versions/*/bin/mbed`), common venv paths
-> (`~/mbed_venv`), and `~/.local/bin/mbed`.  When detected, it writes the
-> path to `.fw-context/local.toml`.  See **[Build Configuration →](build.md#12-build-environment--custom-python-for-mbed-cli)** for details.
+> (`~/mbed_venv`), and `~/.local/bin/mbed`. When `fw-context init` detects the
+> interpreter, it writes the path to `.fw-context/local.toml`. For details, see
+> **[Build Configuration →](build.md#12-build-environment--custom-python-for-mbed-cli)**.
 
 ### Arduino CLI
 
@@ -193,12 +188,13 @@ is enabled automatically.
 |------|-----|---------|
 | **arduino-cli** | Compile + compile_commands.json | `curl -fsSL https://raw.githubusercontent.com/arduino/arduino-cli/master/install.sh \| sh` |
 
-Requires `fqbn` (fully qualified board name) in `.fw-context/config.toml`:
-`fqbn = "arduino:avr:uno"`.
+This build system requires `fqbn` (fully qualified board name) in
+`.fw-context/config.toml`. Example: `fqbn = "arduino:avr:uno"`.
 
-`fw-context` runs `arduino-cli compile --export-compile-commands` (two passes:
-database only, then real compile for object files).  Header dependency tracking
-uses ``manifest.json`` (built from libclang token stream) — no ``.d`` files needed.
+`fw-context` runs `arduino-cli compile --export-compile-commands` in two passes:
+first for the database only, then for a real compile that creates object files.
+Header dependency tracking uses `manifest.json`, which fw-context builds from
+the libclang token stream. This build system does not need `.d` files.
 
 ### ESP-IDF
 
@@ -207,13 +203,14 @@ uses ``manifest.json`` (built from libclang token stream) — no ``.d`` files ne
 | **idf.py** | Build wrapper | Bundled with [ESP-IDF](https://docs.espressif.com/projects/esp-idf/en/stable/esp32/get-started/) |
 | cmake | Build system | Bundled with ESP-IDF |
 
-`fw-context` runs `idf.py build`. Requires the ESP-IDF environment
-(`. ./export.sh` or `idf.py` on PATH).
+`fw-context` runs `idf.py build`. This command requires the ESP-IDF environment:
+`. ./export.sh`, or `idf.py` on PATH.
 
-> **`fw-context init`** auto-detects the ESP-IDF export script from
-> `$IDF_PATH/export.sh`, `~/esp/esp-idf/export.sh`, or `idf.py` on PATH.
-> When detected, it writes `activate` to `.fw-context/local.toml` so
-> builds work without manually sourcing the environment.
+> **`fw-context init`** detects the ESP-IDF export script automatically, from
+> `$IDF_PATH/export.sh`, `~/esp/esp-idf/export.sh`, or `idf.py` on PATH. When
+> `fw-context init` detects the script, it writes `activate` to
+> `.fw-context/local.toml`. Then builds work without you sourcing the
+> environment manually.
 
 ### Generic CMake
 
@@ -221,8 +218,8 @@ uses ``manifest.json`` (built from libclang token stream) — no ``.d`` files ne
 |------|-----|---------|
 | **cmake** | Build + compile_commands.json | `sudo pacman -S cmake` / `sudo apt install cmake` / `sudo dnf install cmake` / `brew install cmake` |
 
-For any CMake project that is not Zephyr or ESP-IDF. `fw-context` runs
-`cmake -B build -DCMAKE_EXPORT_COMPILE_COMMANDS=ON && cmake --build build`.
+Use this build system for any CMake project that is not Zephyr or ESP-IDF.
+`fw-context` runs `cmake -B build -DCMAKE_EXPORT_COMPILE_COMMANDS=ON && cmake --build build`.
 
 ### Makefile
 
@@ -239,7 +236,7 @@ For any CMake project that is not Zephyr or ESP-IDF. `fw-context` runs
 |------|-----|---------|
 | **keil2clangd** | Converts `.uvprojx` → compile_commands.json | `pip install keil2clangd` |
 
-**No Keil installation needed** — `keil2clangd` parses the XML project file statically.
+**You do not need a Keil installation.** `keil2clangd` parses the XML project file statically.
 
 ### IAR EWARM
 
@@ -247,7 +244,7 @@ For any CMake project that is not Zephyr or ESP-IDF. `fw-context` runs
 |------|-----|---------|
 | **keil2clangd** | Converts `.ewp` → compile_commands.json | `pip install keil2clangd` |
 
-**No IAR installation needed** — `keil2clangd` parses the XML project file statically.
+**You do not need an IAR installation.** `keil2clangd` parses the XML project file statically.
 
 ### Manual (Bare) Mode
 
@@ -255,13 +252,13 @@ For any CMake project that is not Zephyr or ESP-IDF. `fw-context` runs
 |------|-----|---------|
 | **gcc** (or any C/C++ compiler) | Syntax-only compilation for `.d` files | `sudo pacman -S gcc` / `sudo apt install gcc` / `sudo dnf install gcc` / `brew install gcc` (or Xcode CLT clang) |
 
-No build system required. Configure `source_dirs`, `include_dirs`, and `defines`
-in `.fw-context/config.toml`. `fw-context` scans sources and generates
-`compile_commands.json`.
+This mode needs no build system. Configure `source_dirs`, `include_dirs`, and
+`defines` in `.fw-context/config.toml`. `fw-context` scans the sources and
+generates `compile_commands.json`.
 
 ### STM32CubeIDE (Manual Setup)
 
-No CLI tools. Enable the built-in JSON Compilation Database generator:
+This setup needs no CLI tools. Enable the built-in JSON Compilation Database generator:
 
 **Project Properties → C/C++ Build → Builder Settings → ✓ Generate JSON Compilation Database**
 
@@ -269,7 +266,7 @@ Then run `fw-context index compile_commands.json` with the generated file.
 
 ### TI Code Composer Studio (Manual Setup)
 
-No CLI tools. Enable JSON Compilation Database in Project Settings, or use `bear`:
+This setup needs no CLI tools. Enable JSON Compilation Database in Project Settings. Or use `bear`:
 
 ```bash
 bear -- eclipse -nosplash -application com.ti.ccstudio.apps.projectBuild ...
@@ -308,8 +305,8 @@ fw-context status
 ## Ollama (optional)
 
 Ollama powers natural-language search and symbol explanations.
-**It is optional** — set `enabled = false` in `[llm]` and the AI assistant
-processes results with its own model.
+**Ollama is optional.** Set `enabled = false` in `[llm]`. Then the AI
+assistant processes the results with its own model.
 
 ### Install Ollama
 
@@ -328,7 +325,7 @@ sudo dnf install ollama
 ollama --version
 ```
 
-Ollama runs a daemon on `http://localhost:11434`. It must be running when
+Ollama runs a daemon on `http://localhost:11434`. This daemon must run when
 you call `smart_search` or `explain_symbol`.
 
 ```bash
@@ -358,12 +355,13 @@ ollama run qwen2.5-coder:14b "Explain: void uart_init(int baudrate)"
 
 | VRAM | Model | Tag | Notes |
 |------|-------|-----|-------|
-| 12 GB | **Qwen2.5-Coder 14B** | `qwen2.5-coder:14b` | Minimum recommended — robust JSON, good code comprehension |
+| 12 GB | **Qwen2.5-Coder 14B** | `qwen2.5-coder:14b` | Minimum recommended. Produces robust JSON, with good code comprehension |
 | 16 GB | Qwen2.5-Coder 14B Q8 | `qwen2.5-coder:14b-q8_0` | Higher precision, slightly better quality |
 | 24 GB+ | Qwen2.5-Coder 32B | `qwen2.5-coder:32b` | Best local quality for embedded C++ |
 
-> **Less than 12 GB VRAM?** Use cloud models (below) — smaller local models
-> produce inconsistent JSON and poor-quality descriptions for C++ embedded code.
+> **Do you have less than 12 GB of VRAM?** Use the cloud models below. A smaller
+> local model produces inconsistent JSON, and writes poor descriptions for
+> embedded C++ code.
 
 **Without GPU (cloud models, requires `ollama signin`):**
 
@@ -390,7 +388,7 @@ num_ctx      = 16384
 > **Remote Ollama:** Set `ollama_url = "http://192.168.1.50:11434"` if
 > Ollama runs on another machine.
 > **Per-project model:** Use `<project>/.fw-context/local.toml` to override
-> the model for a specific project (e.g. a 32B model for a large codebase).
+> the model for a specific project, for example a 32B model for a large codebase.
 
 ## AI assistant setup
 
@@ -405,28 +403,27 @@ fw-context init --scope all        # both global and project
 
 **What `fw-context init` does:**
 
-By default (`--scope project`), it configures ONLY the current project:
+By default, with `--scope project`, `fw-context init` configures only the current project:
 
 | Tool | Detection | Action |
 |------|-----------|--------|
-| **Claude Code** | `.claude/` dir in project | Injects `<!-- fw-context -->` into `CLAUDE.md`, installs agents (`code-explorer`, `general-purpose`), installs `fw-review` skill |
-| **OpenCode** | `.opencode/` dir in project | Writes rules file, installs skill |
+| **Claude Code** | `.claude/` dir in project | Adds `<!-- fw-context -->` to `CLAUDE.md`. Installs the `code-explorer` and `general-purpose` agents. Installs the `fw-review` skill. |
+| **OpenCode** | `.opencode/` dir in project | Writes the rules file. Installs the skill. |
 
-**Project agents:** Two agent definitions are created in `.claude/agents/`:
-- `code-explorer` — includes a `CRITICAL — C/C++ source access` block that
-  enforces fw-context for all C/C++ code reading
-- `general-purpose` — same enforcement for any general task that touches
-  C/C++ source
+**Project agents:** `fw-context init` creates two agent definitions in `.claude/agents/`:
+- `code-explorer`: this agent includes a `CRITICAL — C/C++ source access` block. This block enforces fw-context for all C/C++ code reading
+- `general-purpose`: this agent has the same enforcement, for any general task that touches C/C++ source
 
-For existing agents, the CRITICAL block is injected without touching the
-rest of the file — custom domain knowledge is preserved.
+For an existing agent file, `fw-context init` adds only the CRITICAL block.
+`fw-context init` does not change the rest of the file, so the file keeps its
+custom domain knowledge.
 
-**Project skill:** The `fw-review` skill is installed in
-the project's `.claude/skills/` directory alongside the global copy.
+**Project skill:** `fw-context init` installs the `fw-review` skill in
+the project's `.claude/skills/` directory, alongside the global copy.
 
-**If no AI tool is detected in the project** (no `.claude/`, `.opencode/`,
-etc. directory), `fw-context init` prints instructions instead of falling
-back to a global install:
+**If `fw-context init` detects no AI tool in the project** (no `.claude/` or
+`.opencode/` directory, for example), `fw-context init` prints instructions.
+`fw-context init` does not fall back to a global install:
 
 ```
 No AI assistant detected in this project.
@@ -439,11 +436,13 @@ Alternatively, use --scope global to install fw-context for all
 projects, or --tool to target a specific assistant.
 ```
 
-**Global install** (`--scope global` or `--scope all`) is still available
-and works as before — injects instructions into `~/.claude/CLAUDE.md` etc.
+**Global install**, with `--scope global` or `--scope all`, is also available.
+Global install injects instructions into `~/.claude/CLAUDE.md` and similar
+files, the same way as before.
 
-The command is **idempotent** — safe to re-run after updates.
-Collision detection warns before overwriting existing content.
+The command is **idempotent**. You can safely re-run the command after
+updates. Collision detection warns you before the command overwrites
+existing content.
 
 ## libclang
 

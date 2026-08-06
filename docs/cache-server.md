@@ -1,11 +1,12 @@
 # Cache Server — Shared LLM Analysis Cache
 
-Central HTTP cache for `llm_analysis` results. Multiple developers index the
-same project independently; the cache server stores each unique symbol analysis
-once and serves it to everyone. Built on FastAPI + PostgreSQL with token-based
-auth, rate-limited nginx proxy, and optional Let's Encrypt TLS.
+This is a central HTTP cache for `llm_analysis` results. Multiple developers
+can index the same project independently. The cache server stores each
+unique symbol analysis once, and serves this analysis to everyone. The cache
+server is built on FastAPI and PostgreSQL, with token-based authentication, a
+rate-limited nginx proxy, and optional Let's Encrypt TLS.
 
-> **Non-server users** — `llm_analysis` lives in the local per-project index
+> **Non-server users:** `llm_analysis` stays in the local per-project index
 > database. The cache server is strictly optional.
 
 ## How it works
@@ -28,18 +29,19 @@ fw-context index --analyze
         └── return stored result
 ```
 
-Two-tier lookup, each tier caches the answer for next time:
+fw-context uses a two-tier lookup. Each tier caches the answer, for next time:
 
 | Tier | Storage | Scope | Lookup cost |
 |------|---------|-------|-------------|
 | 1 | `~/.fw-context/llm_cache.db` | All projects, same machine | SQLite (fast) |
 | 2 | Remote cache server (PostgreSQL) | All developers, all machines | HTTPS (network) |
 
-Each content hash is computed from the function body + signature — identical
-code produces identical hashes regardless of project. An analysis generated
-for *birdie1* is automatically available to *zbox-ecb* and *HA_Boiler*.
-Re-indexing any project with `[cache_server]` configured skips Ollama entirely
-for symbols already cached.
+fw-context computes each content hash from the function body and the
+signature. Identical code produces identical hashes, regardless of the
+project. So an analysis that fw-context generates for *birdie1* is also
+available automatically to *zbox-ecb* and *HA_Boiler*. When you configure
+`[cache_server]` and re-index any project, fw-context skips Ollama entirely
+for symbols that are already in the cache.
 
 ## API Endpoints
 
@@ -53,8 +55,9 @@ for symbols already cached.
 
 ### GET /cache/stats
 
-Returns cache-wide statistics: total entries, newest/oldest timestamps,
-and per-model entry counts. Used by ``fw-context cache stats --remote``.
+This endpoint returns cache-wide statistics: the total entries, the newest
+and oldest timestamps, and the entry counts for each model.
+`fw-context cache stats --remote` uses this endpoint.
 
 ```json
 → {"total_entries": 13391, "newest_entry": "...", "oldest_entry": "...",
@@ -68,9 +71,10 @@ and per-model entry counts. Used by ``fw-context cache stats --remote``.
 → {"deleted": 2, "total": 2}
 ```
 
-Deletes cache entries matching the given content hashes. Used by
-`fw-context cache clear --remote` to purge a project's entries from
-the shared server. Hashes are uploaded in chunks of `batch_size`.
+This endpoint deletes the cache entries that match the given content hashes.
+`fw-context cache clear --remote` uses this endpoint, to purge a project's
+entries from the shared server. The client uploads the hashes in chunks of
+`batch_size`.
 
 ## Quickstart
 
@@ -97,8 +101,9 @@ fw-cache-admin token create my-project --write --description "dev-1"
 | nginx (optional) | `apt install nginx` | `pacman -S nginx` |
 | certbot (optional) | `apt install certbot python3-certbot-nginx` | `pacman -S certbot certbot-nginx` |
 
-The setup wizard detects and installs missing prerequisites automatically.
-For manual installation, install PostgreSQL and ensure it is running:
+The setup wizard detects missing prerequisites, and installs them
+automatically. For a manual installation, install PostgreSQL, and make sure
+PostgreSQL is running:
 
 ```bash
 # Ubuntu / Debian
@@ -120,20 +125,20 @@ pip install fw-context-mcp[cache-server]
 fw-cache-server setup
 ```
 
-The wizard is **idempotent** — re-run it to add new projects, upgrade nginx
-config, or recover from errors. Each step detects existing state and skips
-already-configured parts.
+The wizard is **idempotent**. Re-run the wizard to add new projects, to
+upgrade the nginx configuration, or to recover from errors. Each step
+detects the existing state, and skips the parts that are already configured.
 
-What it does:
+What the wizard does:
 
 1. Creates `/opt/fw-cache-server/venv/` with FastAPI + asyncpg
-2. Detects OS, installs PostgreSQL if missing
-3. Creates `fw_cache` database user with random password
-4. Creates `fw_cache_meta` + `fw_cache` databases
-5. Initializes schema, prints admin token
-6. Creates project(s) and tokens interactively
-7. Installs systemd service (`fw-cache-server`)
-8. Optionally configures nginx reverse proxy + Let's Encrypt TLS
+2. Detects the OS, and installs PostgreSQL if missing
+3. Creates the `fw_cache` database user, with a random password
+4. Creates the `fw_cache_meta` and `fw_cache` databases
+5. Initializes the schema, and prints the admin token
+6. Creates the project or projects, and the tokens, interactively
+7. Installs the systemd service (`fw-cache-server`)
+8. Optionally configures the nginx reverse proxy and Let's Encrypt TLS
 
 ### Option 2: Manual
 
@@ -191,8 +196,8 @@ sudo journalctl -u fw-cache-server -f       # live logs
 ```
 
 The systemd unit:
-- Runs as `fw-cache` system user (created automatically)
-- `ProtectSystem=strict`, `NoNewPrivileges=yes`, `PrivateTmp=yes`
+- Runs as the `fw-cache` system user, created automatically
+- Sets `ProtectSystem=strict`, `NoNewPrivileges=yes`, `PrivateTmp=yes`
 - Restarts on failure
 
 ### launchd (macOS)
@@ -240,8 +245,9 @@ Features of the generated config:
 sudo certbot --nginx -d fw-cache.example.com --non-interactive --agree-tos
 ```
 
-The setup wizard runs this automatically after confirming DNS resolves.
-Certificates auto-renew via `certbot.timer` (installed by the certbot package).
+The setup wizard runs this command automatically, after the wizard confirms
+that DNS resolves correctly. Certificates renew automatically, through
+`certbot.timer`, which the certbot package installs.
 
 ## Credentials
 
@@ -255,13 +261,15 @@ Format:
 FW_CACHE_DB_URL="postgresql://fw_cache:PASSWORD@localhost:5432"
 ```
 
-The server connects to `FW_CACHE_DB_URL/fw_cache_meta` and `FW_CACHE_DB_URL/fw_cache`
-(prefix is auto-appended — the configured URL must be the **base**, not a specific database).
+The server connects to `FW_CACHE_DB_URL/fw_cache_meta` and to
+`FW_CACHE_DB_URL/fw_cache`. The server appends this prefix automatically. So
+the configured URL must be the **base** URL, not a specific database.
 
 ## Managing with fw-cache-admin
 
-`fw-cache-admin` connects directly to PostgreSQL — no HTTP overhead.
-Requires `FW_CACHE_DB_URL` and `FW_CACHE_ADMIN_TOKEN` in environment.
+`fw-cache-admin` connects directly to PostgreSQL, with no HTTP overhead.
+`fw-cache-admin` requires `FW_CACHE_DB_URL` and `FW_CACHE_ADMIN_TOKEN` in the
+environment.
 
 ```bash
 source /var/lib/fw-cache-server/db.env
@@ -276,8 +284,9 @@ fw-cache-admin project create my-project --description "My firmware project"
 fw-cache-admin project remove my-project --confirm
 ```
 
-Removing a project deletes its tokens (cascade). Cache entries are **not**
-deleted — cache is global across all projects.
+When you remove a project, `fw-cache-admin` also deletes the project's
+tokens, in a cascade. `fw-cache-admin` does **not** delete the cache entries.
+The cache is global, across all projects.
 
 ### Tokens
 
@@ -293,8 +302,9 @@ fw-cache-admin token revoke <token>
 #   --overwrite  can_read + can_write + can_overwrite (admin-level)
 ```
 
-Token plaintext is printed once at creation. Store it securely — it is
-SHA-256 hashed in the database and cannot be recovered.
+`fw-cache-admin` prints the plaintext token once, at creation time. Store
+the token securely. The database stores only a SHA-256 hash of the token,
+so you cannot recover the plaintext token later.
 
 ### Cache maintenance
 
@@ -315,20 +325,20 @@ token = "<your-read-write-token>"
 # force = false           # set true to overwrite existing entries
 ```
 
-The client uses `url` for `POST /cache/batch` (read), `PUT /cache/batch`
-(write), and `POST /cache/clear` (delete). It chunks requests by `batch_size`.
-Retries network errors 3× with exponential backoff; falls back gracefully
-to local-only on failure.
+The client uses `url` for three endpoints: `POST /cache/batch` to read,
+`PUT /cache/batch` to write, and `POST /cache/clear` to delete. The client
+chunks the requests by `batch_size`. On a network error, the client retries
+3 times, with exponential backoff. If all retries fail, the client falls
+back to the local cache only.
 
 ### How the client uses the cache
 
 On `fw-context index --analyze`:
 
-1. **Local global cache** (Tier 1, `~/.fw-context/llm_cache.db`)
-   — shared across all projects on the same machine. SQLite.
-2. **Remote cache server** (Tier 2)
-   — only if `[cache_server]` is configured.
-   Cache misses from the server are stored back into the local cache.
+1. **Local global cache** (Tier 1, `~/.fw-context/llm_cache.db`): shared
+   across all projects on the same machine, with SQLite.
+2. **Remote cache server** (Tier 2): only when you configure `[cache_server]`.
+   The client stores a cache miss from the server back into the local cache.
 
 ### Cache management commands
 
@@ -354,30 +364,34 @@ fw-context cache remote-init --project /path/to/project
 
 ### `fw-context cache remote-init`
 
-Interactive wizard that configures the remote cache server connection.
-Prompts for the server URL (defaults to existing value) and authentication
-token, verifies the connection, and writes the `[cache_server]` section
-to `.fw-context/local.toml`.
+This is an interactive wizard that configures the remote cache server
+connection. The wizard prompts you for the server URL, which defaults to
+the existing value, and for the authentication token. The wizard verifies
+the connection, and writes the `[cache_server]` section to
+`.fw-context/local.toml`.
 
-1. **URL** — server base URL (e.g. `https://fw-cache.example.com`)
-2. **Token** — read or read+write token created with `fw-cache-admin token create`
-3. **Verify** — calls `/health` and `/cache/stats` to confirm connectivity
-4. **Write** — idempotently updates `local.toml` (replaces existing section
-   or appends a new one)
+1. **URL**: the server's base URL, for example `https://fw-cache.example.com`
+2. **Token**: a read token, or a read-and-write token, created with
+   `fw-cache-admin token create`
+3. **Verify**: the wizard calls `/health` and `/cache/stats`, to confirm
+   connectivity
+4. **Write**: the wizard updates `local.toml` idempotently. The wizard
+   replaces the existing `[cache_server]` section, or appends a new one
 
-Re-run to update the URL or rotate the token — the wizard detects existing
-configuration and shows the current value as the default.
+Re-run the wizard to update the URL or to rotate the token. The wizard
+detects the existing configuration, and shows the current value as the
+default.
 
-The `--remote` flag reads all content hashes from the project's per-project
-`llm_analysis_cache` table and sends them to the server's `POST /cache/clear`
-endpoint. Only the current project's entries are deleted — entries shared
-with other projects remain on the server.
+The `--remote` flag reads all the content hashes from the project's
+`llm_analysis_cache` table. The `--remote` flag sends these hashes to the
+server's `POST /cache/clear` endpoint. This deletes only the current
+project's entries. Entries that other projects share remain on the server.
 
-`fw-context cache push` uploads ALL entries from the local global cache
-(``~/.fw-context/llm_cache.db``) to the remote server with overwrite enabled
-(``X-Cache-Overwrite: true``). This is useful for seeding a newly-deployed
-server or migrating cache between machines. Requires ``can_write`` and
-``can_overwrite`` on the token.
+`fw-context cache push` uploads all entries from the local global cache
+(`~/.fw-context/llm_cache.db`) to the remote server, with overwrite enabled
+(`X-Cache-Overwrite: true`). This command is useful for seeding a
+newly-deployed server, or for migrating the cache between machines. This
+command requires `can_write` and `can_overwrite` on the token.
 
 ## Hardening (production)
 
@@ -444,13 +458,14 @@ Re-run `fw-cache-server setup` to repair the venv and symlink.
 
 ### Permission denied errors during setup
 
-The wizard uses `sudo` for privileged operations. Ensure the current user
-has passwordless sudo or enters the password when prompted.
+The wizard uses `sudo` for privileged operations. Make sure the current
+user has passwordless sudo, or can enter the password when the system
+prompts for it.
 
 ### could not change directory to "/home/user"
 
-Expected — the `fw-cache` system user has no home directory. The service
-runs from `/tmp`. This message is harmless.
+This message is expected. The `fw-cache` system user has no home directory,
+so the service runs from `/tmp`. This message is harmless.
 
 ### Connection refused on port 8000
 
@@ -476,15 +491,16 @@ sudo certbot --nginx -d fw-cache.example.com --staging
 
 ### certbot 503 from Let's Encrypt
 
-Temporary LE API overload — retry in 30–60 minutes. The rate limit
-is separate from this transient error.
+This error is a temporary overload of the Let's Encrypt API. Retry in 30 to
+60 minutes. The rate limit is a separate issue from this transient error.
 
 ### 401 Unauthorized
 
-Token is missing, invalid, or revoked. Check:
-- `Authorization: Bearer <token>` header is present
-- Token matches the one from `fw-cache-admin token create`
-- `fw-cache-admin token list <project>` shows the token as active (no revoked_at)
+The token is missing, invalid, or revoked. Check:
+- The `Authorization: Bearer <token>` header is present
+- The token matches the token from `fw-cache-admin token create`
+- `fw-cache-admin token list <project>` shows the token as active, with no
+  `revoked_at` value
 
 ### 403 Forbidden on PUT
 
@@ -495,7 +511,8 @@ fw-cache-admin token create my-project --write
 
 ### 403 Forbidden with X-Cache-Overwrite
 
-Requires `can_overwrite`. Use an admin token or create an overwrite token:
+This action requires `can_overwrite`. Use an admin token, or create an
+overwrite token:
 ```bash
 fw-cache-admin token create my-project --overwrite
 ```

@@ -44,36 +44,33 @@ class DatabaseCorruptionError(sqlite3.DatabaseError):
         super().__init__(f"Database corruption detected at {db_path}: {details}")
 
 
-_QUERY_TIMEOUT_S = 10.0               # max single-query execution time (under MCP 15s timeout)
-_PROGRESS_CHECK_INTERVAL = 100_000     # VM instructions between progress checks
-# Per-connection progress handler start time — keyed by id(conn).
-# Resets when the gap between consecutive progress calls exceeds 5 s
-# (indicating a new query has started).
-_progress_last: dict[int, float] = {}
-_progress_start: dict[int, float] = {}
-
-
-def _progress_handler_factory(conn_id: int):
-    """Return a progress callback that interrupts queries running >10 s."""
-    def _handler() -> int:
-        now = _time.monotonic()
-        last = _progress_last.get(conn_id, 0.0)
-        if now - last > 5.0:
-            # Gap between queries → new query started, reset start time
-            _progress_start[conn_id] = now
-            _progress_last[conn_id] = now
-            return 0
-        _progress_last[conn_id] = now
-        start = _progress_start.get(conn_id, now)
-        if now - start > _QUERY_TIMEOUT_S:
-            log.warning("Query timeout after %.1fs on conn %d", now - start, conn_id)
-            return 1  # interrupt
-        return 0
-    return _handler
+# ── Removed: progress-handler query timeout — DO NOT RESTORE ─────────────
+#
+# This module used to install a SQLite progress handler on every
+# connection (10 s per-query wall-clock limit, interrupting via
+# set_progress_handler).  It was a workaround for the old connection-pool
+# architecture in the MCP server, where several connections competed for
+# one database file and a runaway query had to be killed defensively.
+#
+# Why it was removed: the handler killed ANY query after 10 s, including
+# legitimate BFS call-graph traversals that need 15-25 s on large
+# databases (350K+ references) — under parallel load every such query
+# timed out.  Timeout enforcement moved to the MCP layer: the server's
+# _wrap_tool applies a 300 s limit and cancels the running query via
+# SyncQueryExecutor.interrupt() (sqlite3_interrupt).  The CLI indexer
+# runs queries sequentially and needs no per-query timeout at all.
+#
+# DO NOT RESTORE a blanket per-query timeout here — it is the wrong
+# layer (it cannot distinguish a locked query from a legitimately long
+# one) and it breaks heavy read queries on large indexes.
 
 
 def _configure_connection(conn: sqlite3.Connection) -> None:
     """Apply standard PRAGMAs and extensions to a freshly opened connection."""
+    # 10 s busy_timeout is deliberate: the CLI indexer must fail fast when
+    # it collides with a running MCP server.  The server's executor sets
+    # its own 120 s busy_timeout on its dedicated connection — do NOT
+    # raise this global value.
     conn.execute("PRAGMA busy_timeout = 10000")
     conn.execute("PRAGMA foreign_keys = ON")
     conn.execute("PRAGMA journal_mode = WAL")
@@ -233,6 +230,9 @@ def open_db(path: Path, *, skip_integrity_check: bool = False, check_same_thread
     except OSError:
         pass
     conn.row_factory = sqlite3.Row
+    # 10 s busy_timeout is deliberate (fail-fast for the CLI indexer —
+    # see _configure_connection).  The MCP server's executor overrides
+    # this on its own connection with 120 s.
     conn.execute("PRAGMA busy_timeout = 10000")  # 10s — wait on lock, don't fail
     conn.execute("PRAGMA foreign_keys = ON")
 
@@ -310,11 +310,10 @@ def open_db(path: Path, *, skip_integrity_check: bool = False, check_same_thread
             conn.close()
             raise DatabaseCorruptionError(str(path), str(e)) from e
 
-    conn.set_progress_handler(
-        _progress_handler_factory(id(conn)),
-        _PROGRESS_CHECK_INTERVAL,
-    )
-
+    # No per-query progress-handler timeout is installed here — see the
+    # "Removed: progress-handler query timeout" note at the top of this
+    # module.  Query timeout enforcement lives in the MCP layer
+    # (_wrap_tool 300 s + SyncQueryExecutor.interrupt()).
     return conn
 
 

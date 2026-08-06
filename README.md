@@ -2,55 +2,85 @@
 
 # fw-context
 
-> [!NOTE]
-> The project is functional but still evolving — not everything is fully stable.
-> Bug reports, shortcomings, and unexpected behavior reports are welcome. Issues and PRs appreciated.
+Modern large language models (LLMs) understand C and C++ well. But an LLM cannot reason about your code directly. First, the LLM must reconstruct the program from the source files.
 
-_All documentation is generated automatically using an LLM._
+This method works well for many software projects. It often does not work for embedded firmware.
 
-Modern large language models are remarkably good at understanding C and C++. Yet before they can reason about your code, they first have to reconstruct the program from source files.
+The program that your compiler builds is not only a set of source files. The program also depends on:
 
-For many software projects this works surprisingly well. For embedded firmware, it often does not.
+- preprocessor configuration
+- compiler flags
+- include paths
+- generated code
+- template instantiation
+- the active implementation for each build
+- callback registration
+- function pointer assignments
+- other relationships that the compiler creates during compilation
 
-The program your compiler actually builds is much more than a collection of source files. It depends on preprocessor configuration, compiler flags, include paths, generated code, template instantiation, active implementations, callback registration, function pointer assignments and many other semantic relationships established during compilation. When an LLM reads source files, it has to infer all of this itself.
+When an LLM reads only the source files, the LLM must infer all these relationships itself.
 
-When that reconstruction is incomplete, the mistakes are surprisingly consistent. The model reviews inactive code, misses callback registrations, cannot determine the real call graph, fails to connect indirect function calls, analyzes implementations that are never compiled, or simply reads far more code than is actually relevant to answer the question. These mistakes are usually not caused by poor reasoning. They are caused by incomplete knowledge of the program being analyzed.
+When the LLM does not reconstruct the program completely, the LLM makes the same mistakes each time. For example, the LLM can:
 
-fw-context solves this problem by building a compiler-accurate model of your project from `compile_commands.json` and the libclang AST. Instead of reconstructing the program from text, the LLM can query a persistent semantic index to discover symbol definitions and references, callers and callees, callback registrations, function pointer assignments, inheritance, translation units, active source code, documentation and other project metadata.
+- review code that is not active
+- miss callback registrations
+- fail to find the real call graph
+- fail to connect indirect function calls
+- analyze implementations that the compiler does not build
+- read much more code than the question needs
 
-The goal is not to provide more context. The goal is to provide the right context. Instead of sending thousands of lines of mostly irrelevant source code to the model, fw-context returns only the semantic information required to answer the current question. This improves review quality, makes navigation and code understanding more reliable, reduces unnecessary token usage and lets the model spend its context window reasoning about the firmware instead of reconstructing it.
+Poor reasoning does not cause these mistakes. Incomplete knowledge of the program causes these mistakes.
+
+fw-context solves this problem. fw-context builds a compiler-accurate model of your project from `compile_commands.json` and the libclang AST. Instead of reconstructing the program from text, the LLM queries a persistent semantic index. The index gives the LLM:
+
+- symbol definitions and references
+- callers and callees
+- callback registrations
+- function pointer assignments
+- inheritance data
+- translation units
+- active source code
+- documentation
+- other project metadata
+
+fw-context does not try to add more context. fw-context tries to add the right context. fw-context does not send thousands of lines of mostly irrelevant source code to the model. Instead, fw-context returns only the semantic information that answers the current question. This method:
+
+- improves the quality of the review
+- makes navigation and code understanding more reliable
+- reduces the number of tokens that the model uses
+- lets the model use its context window to reason about the firmware, not to reconstruct it
 
 ## What changes?
 
-Without fw-context, an LLM working on an embedded C/C++ project usually starts by opening files, searching text, following includes, guessing which definitions are active and trying to infer relationships that are implicit in the build. That process is slow, token-heavy and often incomplete.
+Without fw-context, an LLM that works on an embedded C/C++ project usually works this way. The LLM opens files, searches text, follows includes, and guesses which definitions are active. The LLM also tries to infer relationships that the build defines but the text does not show. This process is slow. The process uses many tokens, and the process is often incomplete.
 
-With fw-context, the LLM can ask questions about the program your compiler actually sees:
+With fw-context, the LLM can ask questions about the program that your compiler actually sees:
 
 - Who calls this function?
 - Which callbacks can invoke it?
 - Where is this callback registered?
 - Which implementation is active for this build?
-- Which code is excluded by preprocessing?
-- Which macros are defined with what values?
+- Which code does preprocessing exclude?
+- Which macros exist in the build, and what are their values?
 - Which symbols reference this API?
 - What will break if this function signature changes?
 - How does data flow from the ISR to the application?
 - Which functions are never used?
-- What does this subsystem do, using only the relevant symbols?
+- What does this subsystem do? (Answer using only the relevant symbols.)
 
-These answers come from a compiler-derived index, not from a best-effort text search over source files.
+A compiler-derived index gives these answers. A best-effort text search over source files does not give these answers.
 
 ## Why firmware is different
 
-In Python, JavaScript or many application-level projects, the source files an LLM reads are often close to the program being executed. Imports matter, but the gap between text and runtime structure is usually manageable.
+In Python, JavaScript, and many application-level projects, the source files that an LLM reads are often close to the program that runs. Imports matter, but the gap between the text and the runtime structure is usually small.
 
-Embedded C and C++ are different. The build system, compiler flags and target configuration can substantially change the program. A single source tree may contain many mutually exclusive implementations. Vendor SDKs and RTOS layers add thousands of declarations and inline functions. Callbacks, interrupt handlers, work queues, driver tables and function pointers create relationships that are not visible through simple textual search.
+Embedded C and C++ are different. The build system, the compiler flags, and the target configuration can change the program a great deal. A single source tree can contain many implementations that exclude each other. Vendor SDKs and RTOS layers add thousands of declarations and inline functions. Callbacks, interrupt handlers, work queues, driver tables, and function pointers create relationships. A simple text search cannot show these relationships.
 
-That is why an LLM can produce a convincing firmware review and still miss the important part. It may be reasoning well, but over the wrong or incomplete program.
+This is why an LLM can write a review that looks correct. But the review can still miss the important part. The LLM may reason well, but about the wrong program, or about an incomplete program.
 
 ## How fw-context works
 
-fw-context indexes the project through the same compilation database used by your build tooling.
+fw-context indexes the project through the same compilation database that your build tooling uses.
 
 ```mermaid
 flowchart LR
@@ -60,39 +90,52 @@ flowchart LR
     MCP --> LLM[LLM coding agent]
 ```
 
-The index stores symbols, source extents, references, call relationships, active source content, function pointer assignments, inheritance information, macro definitions with expanded values, documentation and optional LLM-generated summaries. The MCP server exposes this information as 34 tools that coding agents and other LLM clients can call during analysis, review and navigation.
+The index stores:
 
-fw-context does not replace the model. It gives the model better input.
+- symbols
+- source extents
+- references
+- call relationships
+- active source content
+- function pointer assignments
+- inheritance information
+- macro definitions with expanded values
+- documentation
+- optional LLM-generated summaries
+
+The MCP server exposes this information as 34 tools. Coding agents and other LLM clients can call these tools during analysis, review, and navigation.
+
+fw-context does not replace the model. fw-context gives the model better input.
 
 ## What it is useful for
 
-fw-context is useful whenever an LLM needs to answer questions about an embedded C/C++ project beyond the local contents of a single file.
+fw-context is useful when an LLM must answer questions about an embedded C/C++ project. This includes questions that go beyond the contents of one file.
 
 Typical use cases include:
 
 - reviewing firmware commits with build-aware context
 - finding all callers and references of an API
 - tracing callback registration and indirect invocation paths
-- understanding ISR, work queue and task relationships
-- navigating large source files through symbol maps instead of reading them whole
-- identifying dead-code candidates
-- finding active implementations selected by the current build
-- reducing the amount of irrelevant source code sent to the model
+- understanding ISR, work queue, and task relationships
+- navigating large source files through symbol maps, instead of reading the whole file
+- identifying candidates for dead code
+- finding the active implementation that the current build selects
+- reducing the amount of irrelevant source code that the LLM reads
 - helping an LLM understand an unfamiliar firmware subsystem
 
-It is especially useful for Zephyr, PlatformIO, Mbed OS, Arduino, FreeRTOS-based projects and custom embedded builds that can produce `compile_commands.json`.
+fw-context is especially useful for Zephyr, PlatformIO, Mbed OS, Arduino, and FreeRTOS-based projects, and for custom embedded builds that can produce `compile_commands.json`.
 
 ## Why not just use an LSP?
 
-Language servers such as clangd are excellent for interactive editing. They provide completion, diagnostics, go-to-definition and other editor-centric features.
+Language servers such as clangd are excellent for interactive editing. They provide completion, diagnostics, go-to-definition, and other editor-centric features.
 
-fw-context is designed for a different workflow: LLM-assisted reasoning over firmware projects. It exposes high-level semantic queries through MCP, stores a persistent index and optimizes for repeated questions from an LLM rather than for interactive editor latency.
+fw-context is designed for a different workflow: LLM-assisted reasoning over firmware projects. fw-context exposes high-level semantic queries through MCP. fw-context stores a persistent index, and fw-context optimizes for repeated questions from an LLM, not for interactive editor latency.
 
-Use your LSP for editing. Use fw-context when an LLM needs to understand, review or navigate the program your compiler actually builds.
+Use your LSP for editing. Use fw-context when an LLM must understand, review, or navigate the program that your compiler actually builds.
 
 ## Getting started
 
-The detailed quick start, installation instructions and configuration guide are in the documentation:
+The documentation contains the detailed quick start guide, the installation instructions, and the configuration guide:
 
 - [Quick Start](docs/README.md)
 - [Installation](docs/installation.md)
@@ -107,17 +150,17 @@ fw-context init
 fw-context index --build
 ```
 
-Then restart your LLM client and ask questions about your firmware.
+Then restart your LLM client, and ask questions about your firmware.
 
 ## Background
 
-This project was motivated by a recurring failure mode in AI-assisted embedded firmware review: coding agents often spend much of their effort reconstructing the program before they can reason about it.
+A recurring failure mode motivated this project. In AI-assisted embedded firmware review, coding agents often spend most of their effort on reconstructing the program, before the agents can reason about it.
 
 Read the background essay:
 [Why AI Coding Agents Keep Making the Same Mistakes When Analyzing Embedded Firmware](https://medium.com/@turbyho/why-ai-coding-agents-keep-making-the-same-mistakes-when-analyzing-embedded-firmware-6c0d8ff1a636)
 
 ## Project status
 
-fw-context is primarily built for real embedded C/C++ work where source-level text search is not enough. It is designed to be local-first, build-aware and useful with existing LLM coding workflows.
+fw-context is built primarily for real embedded C/C++ work, where source-level text search is not enough. fw-context is designed to be local-first and build-aware, and to work with existing LLM coding workflows.
 
 The compiler has already reconstructed your program. Let your LLM use it.
