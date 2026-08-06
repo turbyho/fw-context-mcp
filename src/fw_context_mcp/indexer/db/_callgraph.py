@@ -2,8 +2,13 @@
 
 from __future__ import annotations
 
+import logging
 import sqlite3
 from collections import deque
+
+from fw_context_mcp.utils import escape_like as _escape_like
+
+log = logging.getLogger(__name__)
 
 __all__ = [
     "find_all_callers_recursive",
@@ -25,27 +30,35 @@ def _resolve_target_usr(conn: sqlite3.Connection, config_hash: str, name: str) -
     with ``#*1C.#`` ABI tags), pick the one with the most incoming
     references — that is the variant actually called throughout the codebase.
 
-    Tiebreaker: prefer symbols that have outgoing refs (they call other
-    functions — i.e. they have a body) over symbols with no outgoing refs
-    (framework struct fields, declaration-only symbols, etc.).
+    Uses correlated subqueries (with LIMIT 1) instead of LEFT JOIN + GROUP BY
+    so that index lookups short-circuit without scanning the full refs table.
     """
-    esc_name = name.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    esc_name = _escape_like(name)
     suffix_pattern = f"%::{esc_name}"
-    rows = conn.execute(
-        """SELECT s.usr,
-                  COUNT(r_in.rowid) AS ref_count,
-                  COUNT(r_out.rowid) AS out_count
-           FROM symbols s
-           LEFT JOIN refs r_in ON r_in.to_usr = s.usr AND r_in.config_hash = s.config_hash
-           LEFT JOIN refs r_out ON r_out.from_usr = s.usr AND r_out.config_hash = s.config_hash
-           WHERE s.config_hash = ?
-             AND (s.name = ? OR s.qualified_name = ? OR s.qualified_name LIKE ? ESCAPE '\\')
-           GROUP BY s.usr
-           ORDER BY s.is_definition DESC, ref_count DESC, out_count DESC
-           LIMIT 1""",
-        (config_hash, name, name, suffix_pattern),
-    ).fetchone()
+    plain_name = name.rsplit("::", 1)[-1] if "::" in name else name
+    try:
+        rows = conn.execute(
+            """SELECT s.usr,
+                      (SELECT COUNT(*) FROM refs r
+                       WHERE r.to_usr = s.usr AND r.config_hash = s.config_hash) AS ref_count,
+                      (SELECT COUNT(*) FROM refs r
+                       WHERE r.from_usr = s.usr AND r.config_hash = s.config_hash) AS out_count
+               FROM symbols s
+               WHERE s.config_hash = ?
+                 AND (s.name = ? OR s.qualified_name = ? OR s.qualified_name LIKE ? ESCAPE '\\'
+                      OR s.name = ?)
+               ORDER BY s.is_definition DESC, ref_count DESC, out_count DESC
+               LIMIT 1""",
+            (config_hash, name, name, suffix_pattern, plain_name),
+        ).fetchone()
+    except sqlite3.Error:
+        log.exception("_resolve_target_usr failed for '%s'", name)
+        return None
     return rows["usr"] if rows else None
+
+
+# Cache for _get_alias_pairs — stored on the connection object.
+# Automatically garbage-collected when the connection is closed.
 
 
 def _get_alias_pairs(conn: sqlite3.Connection, config_hash: str) -> list[tuple[str, str]]:
@@ -54,33 +67,45 @@ def _get_alias_pairs(conn: sqlite3.Connection, config_hash: str) -> list[tuple[s
     Detects the ``__attribute__((weak, alias(\"__func\")))`` pattern by finding
     declaration-only symbols that have a ``__``-prefixed sibling definition
     with the same parameter signature.
+
+    Result is cached per-connection — alias pairs don't change during a
+    connection's lifetime.
     """
-    # Declarations that appear as callees but have no outgoing refs themselves.
-    # Use NOT EXISTS instead of NOT IN — the refs table has NULL from_usr
-    # (2760 file-scope references with no enclosing function), and NOT IN
-    # returns NULL (falsy) when the subquery contains NULLs.
-    rows = conn.execute(
-        """SELECT s.usr, s.name, s.signature
-           FROM symbols s
-           WHERE s.config_hash = ?
-             AND s.is_definition = 0
-             AND s.kind IN ('function', 'method', 'constructor', 'destructor')
-             AND EXISTS (SELECT 1 FROM refs r WHERE r.to_usr = s.usr AND r.config_hash = ?)
-             AND NOT EXISTS (SELECT 1 FROM refs r WHERE r.from_usr = s.usr AND r.config_hash = ?)
-        """,
-        (config_hash, config_hash, config_hash),
-    ).fetchall()
+    per_conn_cache: dict[str, list[tuple[str, str]]] | None = getattr(conn, "_alias_cache", None)
+    if per_conn_cache is not None:
+        cached = per_conn_cache.get(config_hash)
+        if cached is not None:
+            return cached
+    try:
+        rows = conn.execute(
+            """SELECT s.usr, s.name, s.signature
+               FROM symbols s
+               WHERE s.config_hash = ?
+                 AND s.is_definition = 0
+                 AND s.kind IN ('function', 'method', 'constructor', 'destructor')
+                 AND EXISTS (SELECT 1 FROM refs r WHERE r.to_usr = s.usr AND r.config_hash = ? LIMIT 1)
+                 AND NOT EXISTS (SELECT 1 FROM refs r WHERE r.from_usr = s.usr AND r.config_hash = ? LIMIT 1)
+            """,
+            (config_hash, config_hash, config_hash),
+        ).fetchall()
+    except sqlite3.Error:
+        log.exception("_get_alias_pairs failed")
+        return []
 
     if not rows:
         return []
 
     # Build index of __-prefixed definitions by (name, param_count)
-    def_rows = conn.execute(
-        """SELECT usr, name, signature FROM symbols
-           WHERE config_hash = ? AND is_definition = 1 AND name LIKE '__%'
-        """,
-        (config_hash,),
-    ).fetchall()
+    try:
+        def_rows = conn.execute(
+            """SELECT usr, name, signature FROM symbols
+               WHERE config_hash = ? AND is_definition = 1 AND name LIKE '__%'
+            """,
+            (config_hash,),
+        ).fetchall()
+    except sqlite3.Error:
+        log.exception("_get_alias_pairs def_rows failed")
+        return []
 
     def_index: dict[tuple[str, int], str] = {}
     for r in def_rows:
@@ -95,6 +120,9 @@ def _get_alias_pairs(conn: sqlite3.Connection, config_hash: str) -> list[tuple[s
             if def_usr:
                 pairs.append((r["usr"], def_usr))
                 break
+    if not hasattr(conn, "_alias_cache"):
+        conn._alias_cache = {}  # type: ignore[attr-defined]
+    conn._alias_cache[config_hash] = pairs  # type: ignore[attr-defined]
     return pairs
 
 
@@ -134,8 +162,8 @@ def find_call_path(
     """Find call paths from *from_name* to *to_name* via BFS in the refs table.
 
     Uses Python BFS with cycle detection — avoids the exponential explosion
-    of a recursive CTE over 1M+ reference edges.  Returns up to 5 shortest
-    paths, each with ``depth`` (number of edges) and ``chain``
+    of a recursive CTE over 1M+ reference edges.  Returns the shortest path
+    (first found), with ``depth`` (number of edges) and ``chain``
     (human-readable ``A → B → C`` string).
     """
     from_usr = _resolve_target_usr(conn, config_hash, from_name)
@@ -143,51 +171,118 @@ def find_call_path(
     if not from_usr or not to_usr:
         return []
 
+    # ── Resolve ALL USRs for from_name (there can be multiple due to TU variants) ──
+    esc_name = _escape_like(from_name)
+    suffix_pattern = f"%::{esc_name}"
+    plain_name = from_name.rsplit("::", 1)[-1] if "::" in from_name else from_name
+    try:
+        from_usr_rows = conn.execute(
+            """SELECT s.usr FROM symbols s
+               WHERE s.config_hash = ?
+                 AND (s.name = ? OR s.qualified_name = ? OR s.qualified_name LIKE ? ESCAPE '\\'
+                      OR s.name = ?)
+               ORDER BY s.is_definition DESC""",
+            (config_hash, from_name, from_name, suffix_pattern, plain_name),
+        ).fetchall()
+    except sqlite3.Error:
+        log.exception("Multi-USR resolution failed for '%s'", from_name)
+        return []
+    from_usr_set: set[str] = {r["usr"] for r in from_usr_rows}
+    if not from_usr_set:
+        return []
+
     # ── Lazy edge / name caches (avoid loading all refs into memory) ──
     _edge_cache: dict[str, list[tuple[str, str]]] = {}
     _name_cache: dict[str, str] = {}
+    # USR variants for from_name — edges from ANY variant are valid
+    _from_variants: set[str] = from_usr_set
+
+    _GLOBAL_CTORS_USR = "$$__global_ctors__"
 
     def _get_name(usr: str) -> str:
         """Resolve USR → name, preferring definitions.  Cached per call."""
+        if usr == _GLOBAL_CTORS_USR:
+            return "<global ctors>"
         if usr not in _name_cache:
-            row = conn.execute(
-                """SELECT name FROM symbols
-                   WHERE config_hash = ? AND usr = ?
-                   ORDER BY is_definition DESC LIMIT 1""",
-                (config_hash, usr),
-            ).fetchone()
-            _name_cache[usr] = row["name"] if row else "?"
+            try:
+                row = conn.execute(
+                    """SELECT name FROM symbols
+                       WHERE config_hash = ? AND usr = ?
+                       ORDER BY is_definition DESC LIMIT 1""",
+                    (config_hash, usr),
+                ).fetchone()
+                _name_cache[usr] = row["name"] if row else "?"
+            except sqlite3.Error:
+                log.exception("_get_name failed for USR '%s'", usr)
+                _name_cache[usr] = "?"
         return _name_cache[usr]
 
     def _get_edges(usr: str) -> list[tuple[str, str]]:
         """Return [(to_usr, callee_name), ...] for *usr*.  Cached per call."""
         if usr not in _edge_cache:
-            rows = conn.execute(
-                """SELECT r.to_usr,
-                          COALESCE(
-                              (SELECT name FROM symbols s
-                               WHERE s.usr = r.to_usr AND s.config_hash = r.config_hash
-                                 AND s.is_definition = 1 LIMIT 1),
-                              (SELECT name FROM symbols s
-                               WHERE s.usr = r.to_usr AND s.config_hash = r.config_hash LIMIT 1),
-                              '?'
-                          ) AS callee_name
-                   FROM refs r
-                   WHERE r.config_hash = ? AND r.from_usr = ?
-                     AND r.ref_kind IN ('call', 'indirect')
-                   GROUP BY r.to_usr""",
-                (config_hash, usr),
-            ).fetchall()
-            _edge_cache[usr] = [(r["to_usr"], r["callee_name"]) for r in rows]
+            try:
+                rows = conn.execute(
+                    """SELECT r.to_usr,
+                              COALESCE(
+                                  (SELECT name FROM symbols s
+                                   WHERE s.usr = r.to_usr AND s.config_hash = r.config_hash
+                                     AND s.is_definition = 1 LIMIT 1),
+                                  (SELECT name FROM symbols s
+                                   WHERE s.usr = r.to_usr AND s.config_hash = r.config_hash LIMIT 1),
+                                  '?'
+                              ) AS callee_name
+                       FROM refs r
+                       WHERE r.config_hash = ? AND r.from_usr = ?
+                         AND r.ref_kind IN ('call', 'indirect', 'implicit_construct', 'dispatch')
+                       GROUP BY r.to_usr""",
+                    (config_hash, usr),
+                ).fetchall()
+                _edge_cache[usr] = [(r["to_usr"], r["callee_name"]) for r in rows]
+            except sqlite3.Error:
+                log.exception("_get_edges failed for USR '%s'", usr)
+                _edge_cache[usr] = []
         return _edge_cache[usr]
+
+    def _get_edges_multi(usrs: set[str]) -> list[tuple[str, str]]:
+        """Return all outgoing edges from ANY of the given USRs."""
+        edges: list[tuple[str, str]] = []
+        seen: set[str] = set()
+        for u in usrs:
+            for to_usr, name in _get_edges(u):
+                if to_usr not in seen:
+                    seen.add(to_usr)
+                    edges.append((to_usr, name))
+        return edges
 
     # ── Weak-alias bridging ──
     # Inject synthetic edges from alias declarations → their definitions
     # into _edge_cache so the BFS can traverse past weak aliases.
-    alias_pairs = _get_alias_pairs(conn, config_hash)
-    for decl_usr, def_usr in alias_pairs:
-        label = _get_name(def_usr)
-        _edge_cache.setdefault(decl_usr, []).append((def_usr, label))
+    try:
+        alias_pairs = _get_alias_pairs(conn, config_hash)
+        for decl_usr, def_usr in alias_pairs:
+            label = _get_name(def_usr)
+            _edge_cache.setdefault(decl_usr, []).append((def_usr, label))
+    except sqlite3.Error:
+        log.exception("Alias pair resolution failed")
+
+    # ── Global constructor bridging ──
+    _main_usr = _resolve_target_usr(conn, config_hash, "main")
+    if _main_usr:
+        try:
+            _ctors_rows = conn.execute(
+                """SELECT r.to_usr FROM refs r
+                   WHERE r.config_hash = ? AND r.ref_kind = 'implicit_construct' AND r.from_usr IS NULL""",
+                (config_hash,),
+            ).fetchall()
+            if _ctors_rows:
+                _edge_cache[_GLOBAL_CTORS_USR] = [
+                    (r["to_usr"], _get_name(r["to_usr"])) for r in _ctors_rows
+                ]
+                _edge_cache.setdefault(_main_usr, []).append(
+                    (_GLOBAL_CTORS_USR, "<global ctors>")
+                )
+        except sqlite3.Error:
+            log.exception("Global ctors bridging failed")
 
     from_name_resolved = _get_name(from_usr)
     found: list[dict] = []
@@ -196,12 +291,14 @@ def find_call_path(
     queue: deque = deque()
     visited: set[str] = {from_usr}
 
-    # Seed: direct edges from source
-    for to_usr_edge, callee_name in _get_edges(from_usr):
+    # Seed: direct edges from source (all USR variants)
+    for to_usr_edge, callee_name in _get_edges_multi(_from_variants):
         if to_usr_edge not in visited:
             chain = f"{from_name_resolved} → {callee_name}"
             if to_usr_edge == to_usr:
                 found.append({"depth": 1, "chain": chain, "target_usr": to_usr})
+                if len(found) >= 5:
+                    return found
             else:
                 queue.append((to_usr_edge, 1, chain))
             visited.add(to_usr_edge)
@@ -262,7 +359,7 @@ def find_all_callers_recursive(
     query = f"""WITH {alias_cte}
         extended_refs(from_usr, to_usr) AS (
             SELECT from_usr, to_usr FROM refs
-            WHERE config_hash = ? AND ref_kind IN ('call', 'indirect')
+            WHERE config_hash = ? AND ref_kind IN ('call', 'indirect', 'implicit_construct', 'dispatch')
             {alias_join}
         ),
         callers(usr, depth) AS (
@@ -337,7 +434,7 @@ def find_callees_recursive(
     query = f"""WITH {alias_cte}
         extended_refs(from_usr, to_usr) AS (
             SELECT from_usr, to_usr FROM refs
-            WHERE config_hash = ? AND ref_kind IN ('call', 'indirect')
+            WHERE config_hash = ? AND ref_kind IN ('call', 'indirect', 'implicit_construct', 'dispatch')
             {alias_join}
         ),
         callees(usr, depth) AS (

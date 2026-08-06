@@ -266,6 +266,40 @@ def find_macro_refs(
         return []
 
 
+# Characters that break FTS5 when they appear unquoted in a bare term.
+# The `unicode61` tokenizer treats these as separators/syntax, and FTS5's
+# query parser raises "fts5: syntax error" for e.g. `#define` or a backslash.
+_FTS5_UNSAFE_TERM_CHARS: frozenset[str] = frozenset('#\\[]{}^:+-')
+
+
+def _quote_fts5_term(term: str) -> str:
+    """Wrap *term* in double quotes as an FTS5 phrase (doubling internal quotes)."""
+    return '"' + term.replace('"', '""') + '"'
+
+
+def _sanitize_fts5_syntax(query: str) -> str:
+    """Repair a query containing characters that are illegal in FTS5 syntax.
+
+    A backslash is never valid FTS5 syntax (e.g. ``"extern \\"C\\""`` from a
+    user copying a quoted string).  Strip backslashes and stray quote marks,
+    then re-quote any remaining token that still contains unsafe characters
+    (e.g. ``#define``).  Safe tokens get the usual trailing-wildcard expansion.
+    """
+    if "\\" in query:
+        log.debug("FTS5 sanitization: stripping backslashes from query=%r", query)
+    cleaned = query.replace("\\", "").replace('"', "")
+    parts = cleaned.split()
+    expanded: list[str] = []
+    for tok in parts:
+        if tok.endswith("*"):
+            expanded.append(tok)
+        elif any(ch in _FTS5_UNSAFE_TERM_CHARS for ch in tok):
+            expanded.append(_quote_fts5_term(tok.rstrip("*")))
+        else:
+            expanded.append(f"{tok}*")
+    return " OR ".join(expanded)
+
+
 def _expand_query(query: str, *, for_body_search: bool = False) -> str:
     """Add trailing wildcard to each bare word for broader prefix matching.
 
@@ -274,15 +308,23 @@ def _expand_query(query: str, *, for_body_search: bool = False) -> str:
     column-filter syntax are detected via regex; C++ ``::`` passes through
     so its tokens get wildcard expansion.
 
+    Queries containing a backslash (never valid FTS5) are repaired via
+    :func:`_sanitize_fts5_syntax`.  Bare terms containing FTS5-unsafe
+    characters (``#define``, ``#ifdef``, ``user-defined``) are quoted as
+    phrases so they match instead of raising ``fts5: syntax error``.
+
     When *for_body_search* is True, the query is returned as-is — body
     search patterns like ``.attach(`` should not be wildcard-expanded.
     """
     if for_body_search:
         return query
 
+    # Backslash is never valid FTS5 syntax — repair the whole query.
+    if "\\" in query:
+        return _sanitize_fts5_syntax(query)
+
     # Tokens that already are FTS5 syntax — don't touch them.
     # Single colon (not part of ::) covers column-filter expressions like
-    # "name_tokens : term*" which would be corrupted by wildcard appending.
     _bare_syntax = ('"', "NEAR", "AND", "OR", "(", ")")
     _has_col_filter = _RE_COL_FILTER.search(query)
     if any(c in query for c in _bare_syntax) or _has_col_filter:
@@ -293,6 +335,8 @@ def _expand_query(query: str, *, for_body_search: bool = False) -> str:
     for p in parts:
         if p.endswith("*"):
             expanded.append(p)
+        elif any(ch in _FTS5_UNSAFE_TERM_CHARS for ch in p):
+            expanded.append(_quote_fts5_term(p))
         else:
             expanded.append(f"{p}*")
     return " OR ".join(expanded)
@@ -350,12 +394,18 @@ def search_symbols(
     n_extra = col_count - len(_BASE_WEIGHTS)
     weights = _BASE_WEIGHTS + [1.0] * max(0, n_extra)
     bm25_expr = f"bm25(symbols_fts, {', '.join(str(w) for w in weights)})"
-    return conn.execute(
-        f"""SELECT s.*
-           FROM symbols_fts
-           JOIN symbols s ON s.id = symbols_fts.rowid
-           WHERE symbols_fts MATCH ? AND s.config_hash = ? {kind_filter} {project_filter}
-            ORDER BY {bm25_expr}
-           LIMIT ?""",
-        params,
-    ).fetchall()
+    try:
+        return conn.execute(
+            f"""SELECT s.*
+               FROM symbols_fts
+               JOIN symbols s ON s.id = symbols_fts.rowid
+               WHERE symbols_fts MATCH ? AND s.config_hash = ? {kind_filter} {project_filter}
+                ORDER BY {bm25_expr}
+               LIMIT ?""",
+            params,
+        ).fetchall()
+    except sqlite3.OperationalError as e:
+        if getattr(e, "sqlite_errorcode", 0) == 1 and "fts5" in str(e).lower():
+            log.debug("search_symbols: FTS5 syntax error (%s) — returning empty", e)
+            return []
+        raise
