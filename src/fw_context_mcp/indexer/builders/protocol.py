@@ -88,3 +88,31 @@ class BuildSystem(Protocol):
         An empty list means no build-directory filtering is needed.
         """
         ...
+
+    # ── Environment auto-detection ──
+
+    @classmethod
+    def detect_environment(cls, project_root: Path) -> dict[str, str | None]:
+        """Auto-detect build environment paths for this build system.
+
+        Returns a dict with keys ``python`` and ``activate``.
+        Values are resolved absolute paths (as strings), or ``None``
+        when not detected.
+
+        Called by ``fw-context init`` — results are written to
+        ``.fw-context/local.toml``.
+
+        Default implementation returns no detections — builders that
+        need a specific Python interpreter or shell activation script
+        should override this.
+        """
+        return {"python": None, "activate": None}
+
+    @classmethod
+    def environment_help(cls) -> str:
+        """Human-readable instructions for manual environment setup.
+
+        Shown by ``fw-context init`` when ``detect_environment()``
+        returns no results and ``required_tools()`` are not on PATH.
+        """
+        return ""

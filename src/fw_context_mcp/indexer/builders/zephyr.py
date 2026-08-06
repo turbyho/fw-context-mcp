@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import os
 import shutil
+import subprocess
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -103,7 +104,7 @@ class ZephyrBuildSystem:
         }
         # NOTE: no timeout= — build commands can run for minutes; adding a fixed
         # timeout would break long builds.  Network-filesystem stalls remain a risk.
-        run_build_command(cmd, cwd=project_root, description="west build", env=env)
+        run_build_command(cmd, cwd=project_root, description="west build", env=env, build_cfg=cfg)
 
         cc_in_build = build_dir / "compile_commands.json"
         if not cc_in_build.exists():
@@ -148,6 +149,44 @@ class ZephyrBuildSystem:
 
     def required_tools(self) -> list[str]:
         return ["west"]
+
+    # ── Environment auto-detection ──
+
+    @classmethod
+    def detect_environment(cls, project_root: Path) -> dict[str, str | None]:
+        ncs_setup = Path.home() / "ncs_tools" / "nordic_minimal_setup.sh"
+        if ncs_setup.exists():
+            return {"python": None, "activate": str(ncs_setup)}
+
+        west = shutil.which("west")
+        if west:
+            try:
+                r = subprocess.run(
+                    ["west", "config", "zephyr.base"],
+                    capture_output=True, text=True, timeout=5,
+                )
+                if r.returncode == 0 and r.stdout.strip():
+                    zephyr_env = Path(r.stdout.strip()) / "zephyr-env.sh"
+                    if zephyr_env.exists():
+                        return {"python": None, "activate": str(zephyr_env)}
+            except Exception:
+                pass
+
+        for sdk_dir in sorted(Path.home().glob("zephyr-sdk-*"), reverse=True):
+            for env_file in sdk_dir.glob("environment-setup-*"):
+                return {"python": None, "activate": str(env_file)}
+
+        return {"python": None, "activate": None}
+
+    @classmethod
+    def environment_help(cls) -> str:
+        return (
+            "Zephyr builds require an activated toolchain environment.\n"
+            "For Nordic NCS, source the setup script:\n"
+            "  source ~/ncs_tools/nordic_minimal_setup.sh\n"
+            "Or set in .fw-context/local.toml:\n"
+            '  [build]\n  activate = "~/ncs_tools/nordic_minimal_setup.sh"'
+        )
 
 
 # Register

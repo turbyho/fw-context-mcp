@@ -55,17 +55,21 @@ class MakefileBuildSystem:
         """
         root = project_root.resolve()
 
-        if not shutil.which("compiledb"):
+        if cfg.python:
+            compiledb_prefix: list[str] = [cfg.python, "-m", "compiledb"]
+        elif not shutil.which("compiledb"):
             raise RuntimeError(
                 "compiledb is required for Makefile projects.\n"
                 "Install it:  pip install compiledb\n"
                 "Or use bear instead with a custom command:\n"
                 '  [build]\n  command = "bear -- make"'
             )
+        else:
+            compiledb_prefix = ["compiledb"]
 
         target = cfg.make_target or "all"
 
-        cmd: list[str] = ["compiledb"]
+        cmd: list[str] = compiledb_prefix
 
         if cfg.make_dry_run:
             cmd.append("-n")
@@ -89,7 +93,7 @@ class MakefileBuildSystem:
         cmd.append(target)
 
         log.info("makefile build: %s", " ".join(cmd))
-        run_build_command(cmd, cwd=root, description="compiledb make")
+        run_build_command(cmd, cwd=root, description="compiledb make", build_cfg=cfg)
 
         cc_path = root / "compile_commands.json"
         if not cc_path.exists():
@@ -105,6 +109,19 @@ class MakefileBuildSystem:
 
     def required_tools(self) -> list[str]:
         return ["compiledb", "make"]
+
+    # ── Environment auto-detection ──
+
+    @classmethod
+    def detect_environment(cls, project_root: Path) -> dict[str, str | None]:
+        return {"python": None, "activate": None}
+
+    @classmethod
+    def environment_help(cls) -> str:
+        return (
+            "Install compiledb:\n"
+            "  pip install compiledb"
+        )
 
     # ── Build dir patterns ──
 

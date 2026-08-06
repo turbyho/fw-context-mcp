@@ -74,12 +74,12 @@ class GenericCMakeBuildSystem:
             shutil.rmtree(build_dir)
 
         log.info("cmake configure: %s", " ".join(configure_cmd))
-        run_build_command(configure_cmd, cwd=project_root, description="cmake configure")
+        run_build_command(configure_cmd, cwd=project_root, description="cmake configure", build_cfg=cfg)
 
         # Build
         build_cmd: list[str] = ["cmake", "--build", str(build_dir)]
         log.info("cmake build: %s", " ".join(build_cmd))
-        run_build_command(build_cmd, cwd=project_root, description="cmake build")
+        run_build_command(build_cmd, cwd=project_root, description="cmake build", build_cfg=cfg)
 
         cc_in_build = build_dir / "compile_commands.json"
         if not cc_in_build.exists():
@@ -114,6 +114,16 @@ class GenericCMakeBuildSystem:
 
     def required_tools(self) -> list[str]:
         return ["cmake"]
+
+    # ── Environment auto-detection ──
+
+    @classmethod
+    def detect_environment(cls, project_root: Path) -> dict[str, str | None]:
+        return {"python": None, "activate": None}
+
+    @classmethod
+    def environment_help(cls) -> str:
+        return ""
 
 
 # Register

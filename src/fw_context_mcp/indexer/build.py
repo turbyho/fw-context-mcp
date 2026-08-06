@@ -112,6 +112,12 @@ class BuildConfig:
     source_dirs: list[str] = field(default_factory=list)  # directories to scan for sources
     compiler: str = "gcc"  # compiler executable name
 
+    # ── Build environment (machine-specific, stored in local.toml) ──
+    activate: str | None = None  # shell script sourced before build (Zephyr, ESP-IDF, etc.)
+    python: str | None = None  # Python interpreter for pip-based CLI tools (mbed-cli, pio, etc.)
+    extra_env: dict[str, str] = field(default_factory=dict)  # extra environment variables
+    extra_path: list[str] = field(default_factory=list)  # directories prepended to PATH
+
     # ── Pre-build hooks ──
     pre_build: str | None = None  # shell command run before build/convert/generate
 

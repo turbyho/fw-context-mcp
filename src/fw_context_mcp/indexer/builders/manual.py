@@ -141,7 +141,7 @@ class ManualBuildSystem:
             cmd = [compiler] + dep_args + flags + ["-fsyntax-only", str(src)]
             log.debug("Compile: %s", " ".join(cmd))
             try:
-                run_build_command(cmd, cwd=root, description=f"Syntax check: {src.name}")
+                run_build_command(cmd, cwd=root, description=f"Syntax check: {src.name}", build_cfg=cfg)
             except RuntimeError as exc:
                 raise RuntimeError(f"Syntax check failed for {src.name}: {exc}") from exc
 
@@ -179,6 +179,16 @@ class ManualBuildSystem:
     def get_build_dir_patterns(self, project_root: Path) -> list[str]:
         """Return build-output directory patterns for staleness filtering."""
         return []
+
+    # ── Environment auto-detection ──
+
+    @classmethod
+    def detect_environment(cls, project_root: Path) -> dict[str, str | None]:
+        return {"python": None, "activate": None}
+
+    @classmethod
+    def environment_help(cls) -> str:
+        return ""
 
 
 # Register

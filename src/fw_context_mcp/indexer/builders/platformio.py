@@ -45,23 +45,27 @@ class PlatformIOBuildSystem:
         during actual compilation.  A subsequent ``pio run`` ensures they
         exist for header-change detection.
         """
-        if not shutil.which("pio") and not shutil.which("platformio"):
+        if cfg.python:
+            pio_prefix = [cfg.python, "-m", "platformio"]
+        elif shutil.which("pio"):
+            pio_prefix = ["pio"]
+        elif shutil.which("platformio"):
+            pio_prefix = ["platformio"]
+        else:
             raise RuntimeError("PlatformIO CLI is required.  Install it:  pip install platformio")
 
-        pio_bin = "pio" if shutil.which("pio") else "platformio"
-
-        cmd: list[str] = [pio_bin, "run", "--project-dir", str(project_root), "--target", "compiledb"]
+        cmd: list[str] = pio_prefix + ["run", "--project-dir", str(project_root), "--target", "compiledb"]
 
         if cfg.clean:
-            clean_cmd = [pio_bin, "run", "--project-dir", str(project_root), "--target", "clean"]
+            clean_cmd = pio_prefix + ["run", "--project-dir", str(project_root), "--target", "clean"]
             log.info("platformio clean: %s", " ".join(clean_cmd))
             try:
-                run_build_command(clean_cmd, cwd=project_root, description="pio run --target clean")
+                run_build_command(clean_cmd, cwd=project_root, description="pio run --target clean", build_cfg=cfg)
             except RuntimeError:
                 pass  # clean is best-effort — build dir may not exist yet
 
         log.info("platformio build: %s", " ".join(cmd))
-        run_build_command(cmd, cwd=project_root, description="pio run --target compiledb")
+        run_build_command(cmd, cwd=project_root, description="pio run --target compiledb", build_cfg=cfg)
 
         cc_path = project_root / "compile_commands.json"
         if not cc_path.exists():
@@ -72,10 +76,10 @@ class PlatformIOBuildSystem:
         # run.  A full pio run compiles and emits .d files that the indexer
         # uses for header-change staleness detection.  When the build is
         # already up-to-date, pio run exits quickly (no-op).
-        build_cmd = [pio_bin, "run", "--project-dir", str(project_root)]
+        build_cmd = pio_prefix + ["run", "--project-dir", str(project_root)]
         log.info("platformio compile: %s", " ".join(build_cmd))
         try:
-            run_build_command(build_cmd, cwd=project_root, description="pio run (full build for .d files)")
+            run_build_command(build_cmd, cwd=project_root, description="pio run (full build for .d files)", build_cfg=cfg)
         except RuntimeError:
             log.warning(
                 "Full build failed — .d files may be missing. "
@@ -107,6 +111,28 @@ class PlatformIOBuildSystem:
 
     def required_tools(self) -> list[str]:
         return ["pio"]
+
+    # ── Environment auto-detection ──
+
+    @classmethod
+    def detect_environment(cls, project_root: Path) -> dict[str, str | None]:
+        pio_python = Path.home() / ".platformio" / "penv" / "bin" / "python"
+        if pio_python.exists():
+            return {"python": str(pio_python), "activate": None}
+
+        if shutil.which("pio") or shutil.which("platformio"):
+            return {"python": None, "activate": None}
+
+        return {"python": None, "activate": None}
+
+    @classmethod
+    def environment_help(cls) -> str:
+        return (
+            "Install PlatformIO CLI:\n"
+            "  pip install platformio\n"
+            "Or set in .fw-context/local.toml:\n"
+            '  [build]\n  python = "/path/to/pio/venv/bin/python"'
+        )
 
 
 # Register
