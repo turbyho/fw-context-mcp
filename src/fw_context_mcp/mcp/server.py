@@ -2,6 +2,15 @@
 
 Serves 34 MCP tools and 4 MCP resources via FastMCP (stdio transport).
 
+**Concurrency:** The server processes at most ONE tool request at a time.
+If a request arrives while another is already running, the server waits up
+to 5 s for the running request to finish.  If it does not finish within
+that window, the new request is rejected with a ``"server busy"`` error
+that tells the client which tool is currently executing.  This prevents
+query pile-up under parallel MCP load (40+ concurrent requests serialized
+on the SQLite executor would otherwise cause client-side timeouts and
+"Connection closed" errors).
+
 **Search & lookup tools** (delegate to ``fw_context_mcp.search`` pipeline):
 ``search_code`` (FTS5), ``lookup_symbol`` (exact/prefix), ``smart_search``
 (Ollama-driven), ``semantic_search`` (embeddings + cosine similarity).
@@ -45,6 +54,16 @@ from .shared.context import _check_server_ready, _integrity_checked
 
 log = logging.getLogger(__name__)
 
+#: Ensures at most one tool handler runs at a time.  Without this, parallel
+#: requests pile up on the serialized SQLite executor: 40 concurrent requests
+#: × 3 s each = 120 s for request #40 → client timeout → "Connection closed".
+#: With the lock, excess requests receive an immediate "server busy" error and
+#: the client can retry.  Timeout 5 s — long enough for a just-finished
+#: handler to release the lock, short enough to avoid client-side timeouts.
+_SERVER_LOCK = asyncio.Lock()
+_SERVER_LOCK_TIMEOUT = 5.0  # seconds
+
+
 
 def _wrap_debug(msg: str) -> None:
     """Write to /tmp/fw-context-debug.log when FW_CONTEXT_DEBUG_WRAP=1."""
@@ -80,20 +99,73 @@ def _wrap_tool(fn):
         async def _wrapper(*a, ctx: MCPContext | None = None, **kw):
             start = time.monotonic()
             _wrap_debug(f"[async] {fn.__name__} ctx={'P' if ctx is not None else 'N'} ann={list(_wrapper.__annotations__.keys())}")
-            task = asyncio.ensure_future(fn(*a, **kw))
+            try:
+                await asyncio.wait_for(_SERVER_LOCK.acquire(), timeout=_SERVER_LOCK_TIMEOUT)
+            except TimeoutError:
+                _wrap_debug(f"[async] {fn.__name__} BUSY — lock timeout")
+                return [{"error": f"The MCP server is currently processing another query ({fn.__name__} cannot run right now because a different tool is already executing). Wait for the active query to complete, then retry. If this error persists, the active query may be stuck — restart the server with `fw-context watch`."}]
+            try:
+                task = asyncio.ensure_future(fn(*a, **kw))
+
+                while not task.done():
+                    done, pending = await asyncio.wait([task], timeout=5.0)
+                    if task in done:
+                        break
+                    elapsed = int(time.monotonic() - start)
+                    _wrap_debug(f"[async-loop] {fn.__name__} t={elapsed}s task_done={task.done()}")
+                    if ctx is not None:
+                        try:
+                            await ctx.info(f"{fn.__name__}: {elapsed}s")
+                            _wrap_debug(f"[async-loop] {fn.__name__} ctx.info() OK at {elapsed}s")
+                        except Exception as e:
+                            _wrap_debug(f"[async-loop] {fn.__name__} ctx.info() FAIL: {e}")
+                    if elapsed > 300:
+                        task.cancel()
+                        try:
+                            from .shared.context import interrupt_all
+
+                            interrupt_all()
+                        except Exception:
+                            pass
+                        return [{"error": f"Tool {fn.__name__} timed out after {elapsed}s"}]
+
+                exception = task.exception()
+                if exception is not None:
+                    if isinstance(exception, BrokenPipeError):
+                        sys.exit(0)
+                    log.exception("Tool %s crashed", fn.__name__)
+                    return [{"error": f"Internal server error in {fn.__name__}: {exception}"}]
+                return task.result()
+            finally:
+                _SERVER_LOCK.release()
+        return _wrapper
+
+    @functools.wraps(fn, assigned=("__module__", "__name__", "__qualname__", "__doc__"))
+    async def _wrapper(*a, ctx: MCPContext | None = None, **kw):
+        start = time.monotonic()
+        _wrap_debug(f"[sync] {fn.__name__} ctx={'P' if ctx is not None else 'N'} ann={list(_wrapper.__annotations__.keys())}")
+        try:
+            await asyncio.wait_for(_SERVER_LOCK.acquire(), timeout=_SERVER_LOCK_TIMEOUT)
+        except TimeoutError:
+            _wrap_debug(f"[sync] {fn.__name__} BUSY — lock timeout")
+            return [{"error": f"Server busy — {fn.__name__} cannot run, another query is in progress. Retry in a few seconds."}]
+        try:
+            task = asyncio.ensure_future(
+                asyncio.to_thread(functools.partial(fn, *a, **kw))
+            )
 
             while not task.done():
                 done, pending = await asyncio.wait([task], timeout=5.0)
                 if task in done:
                     break
                 elapsed = int(time.monotonic() - start)
-                _wrap_debug(f"[async-loop] {fn.__name__} t={elapsed}s task_done={task.done()}")
+                _wrap_debug(f"[sync-loop] {fn.__name__} t={elapsed}s task_done={task.done()}")
                 if ctx is not None:
                     try:
                         await ctx.info(f"{fn.__name__}: {elapsed}s")
-                        _wrap_debug(f"[async-loop] {fn.__name__} ctx.info() OK at {elapsed}s")
+                        _wrap_debug(f"[sync-loop] {fn.__name__} ctx.info() OK at {elapsed}s")
                     except Exception as e:
-                        _wrap_debug(f"[async-loop] {fn.__name__} ctx.info() FAIL: {e}")
+                        _wrap_debug(f"[sync-loop] {fn.__name__} ctx.info() FAIL: {e}")
                 if elapsed > 300:
                     task.cancel()
                     try:
@@ -111,55 +183,8 @@ def _wrap_tool(fn):
                 log.exception("Tool %s crashed", fn.__name__)
                 return [{"error": f"Internal server error in {fn.__name__}: {exception}"}]
             return task.result()
-        return _wrapper
-
-    @functools.wraps(fn, assigned=("__module__", "__name__", "__qualname__", "__doc__"))
-    async def _wrapper(*a, ctx: MCPContext | None = None, **kw):
-        start = time.monotonic()
-        _wrap_debug(f"[sync] {fn.__name__} ctx={'P' if ctx is not None else 'N'} ann={list(_wrapper.__annotations__.keys())}")
-        task = asyncio.ensure_future(
-            asyncio.to_thread(functools.partial(fn, *a, **kw))
-        )
-
-        while not task.done():
-            done, pending = await asyncio.wait([task], timeout=5.0)
-            if task in done:
-                break
-            elapsed = int(time.monotonic() - start)
-            _wrap_debug(f"[sync-loop] {fn.__name__} t={elapsed}s task_done={task.done()}")
-            if ctx is not None:
-                try:
-                    await ctx.info(f"{fn.__name__}: {elapsed}s")
-                    _wrap_debug(f"[sync-loop] {fn.__name__} ctx.info() OK at {elapsed}s")
-                except Exception as e:
-                    _wrap_debug(f"[sync-loop] {fn.__name__} ctx.info() FAIL: {e}")
-            if elapsed > 300:
-                task.cancel()
-                # task.cancel() does NOT kill the asyncio.to_thread
-                # worker thread — without this, a cancelled query keeps
-                # running as a zombie thread holding the executor lock.
-                # interrupt_all() makes the query raise
-                # OperationalError('interrupted') instead.  Imported via
-                # shared.context (layer rule — server code must not touch
-                # the private _executors registry).  May also interrupt
-                # another call's query on the shared connection
-                # (per-connection interrupt cannot be targeted) —
-                # accepted in this pathological 300 s path only.
-                try:
-                    from .shared.context import interrupt_all
-
-                    interrupt_all()
-                except Exception:
-                    pass
-                return [{"error": f"Tool {fn.__name__} timed out after {elapsed}s"}]
-
-        exception = task.exception()
-        if exception is not None:
-            if isinstance(exception, BrokenPipeError):
-                sys.exit(0)
-            log.exception("Tool %s crashed", fn.__name__)
-            return [{"error": f"Internal server error in {fn.__name__}: {exception}"}]
-        return task.result()
+        finally:
+            _SERVER_LOCK.release()
     return _wrapper
 
 _DATA_DIR = Path(__file__).resolve().parent.parent / "data"
