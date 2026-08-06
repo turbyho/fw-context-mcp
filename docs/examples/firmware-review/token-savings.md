@@ -25,7 +25,7 @@
 
 For each fw-context tool type, we estimated:
 1. **fw-context response volume** — what the tool actually returned (compact structured data)
-2. **Traditional alternative volume** — what you'd need to read via `grep` + `read`/`cat` to achieve the same result
+2. **Traditional alternative volume** — what you would need to read with `grep` and `read`/`cat`, to achieve the same result
 
 Traditional alternative for each operation:
 - **`lookup_symbol`** → `grep -rn "name" src/ lib/` (finding declarations across 281 files) + `read` for context verification
@@ -70,11 +70,11 @@ Traditional alternative for each operation:
 | Total tokens | **5 250** | **1 050 000** |
 | **Savings** | | **1 044 750 (200×)** |
 
-**Largest savings** — `grep` for `find_callers` returns enormous amounts of data because:
-- It doesn't distinguish declarations from calls
-- It returns every name occurrence in any context
-- For frequently called functions (e.g. `get_key` with 161 callers), grep would return hundreds of lines
-- False matches in comments, string literals, include directives
+**Largest savings** — `grep` for `find_callers` returns enormous amounts of data, because:
+- `grep` does not distinguish declarations from calls
+- `grep` returns every name occurrence, in any context
+- For a frequently called function, for example `get_key` with 161 callers, `grep` would return hundreds of lines
+- False matches appear in comments, string literals, and include directives
 
 ### 3.4 find_all_callers_recursive (5 calls)
 
@@ -166,8 +166,8 @@ Traditional alternative for each operation:
 
 ### 5.1 Without fw-context, this review would not be possible in a single session
 
-- The traditional approach would produce **~5.8 million tokens** — that's **29× more** than context capacity
-- The review would have to be split into **at least 30 separate conversations**, each with partial context
+- The traditional approach would produce **~5.8 million tokens**. That is **29× more** than the context capacity
+- The review would need **at least 30 separate conversations**, each with partial context
 - Each conversation would lack the overall picture → risk of missing cross-module impacts
 
 ### 5.2 With fw-context, everything fit into 8 parallel subagents
@@ -184,13 +184,13 @@ Traditional alternative for each operation:
 | `find_dead_code` | **400×** | Requires cross-referencing the entire codebase |
 | `find_references` | **320×** | `grep` returns orders of magnitude more false positives (declarations, comments, includes) |
 | `find_callees_recursive` | **285×** | Same reason as callers — transitive analysis |
-| `find_callers` | **200×** | `grep` doesn't distinguish calls from declarations |
+| `find_callers` | **200×** | `grep` does not distinguish calls from declarations |
 
 ### 5.4 Which Tools Save the Least (But Still Significantly)?
 
 | Tool | Savings | Reason |
 |--------|--------|-------|
-| `get_source` | **10×** | Function body is similar size in both approaches; fw-context wins on exact extents |
+| `get_source` | **10×** | Function body is similar size in both approaches. fw-context wins on exact extents |
 | `get_class_members` | **10×** | Header file is relatively small |
 | `get_file_map` | **12×** | File overview is similar volume to manual `read` |
 
@@ -209,7 +209,7 @@ Traditional `grep` for `grep -rn "get_key(" src/ lib/` would return:
 - Comments `// calls get_key`
 - String literals `"get_key"`
 
-The LLM would have to read and **manually filter** all these results — costing additional tokens on prompt/chain-of-thought. fw-context `find_callers("nexbox::NCfgDataManager::get_key")` returns **only call sites**.
+The LLM would have to read all these results, and filter them manually. This filtering costs additional tokens, on the prompt and the chain-of-thought. fw-context `find_callers("nexbox::NCfgDataManager::get_key")` returns **only call sites**.
 
 ### 6.2 Exact Function Boundaries (libclang Extents)
 
@@ -221,7 +221,7 @@ The project has `#ifdef TARGET_P_ECB_BOARD` / `#ifdef TARGET_CH_ECB_BOARD` (hist
 
 ### 6.4 Automatic Deduplication
 
-With 8 parallel subagents, without fw-context each would have to read the same header files (e.g. `nconfig.h`, `ncfgdata_manager.h`) over and over — each subagent has its own context window. With fw-context, each subagent gets only relevant excerpts — headers aren't read in full, just the queried symbols.
+With 8 parallel subagents, and without fw-context, each subagent would have to read the same header files over and over, for example `nconfig.h` or `ncfgdata_manager.h`. Each subagent has its own context window. With fw-context, each subagent gets only relevant excerpts. fw-context does not read a header in full, only the queried symbols.
 
 ---
 
@@ -242,4 +242,4 @@ With 8 parallel subagents, without fw-context each would have to read the same h
 - Fail to detect **dead code** (find_dead_code) — manually impossible
 - Have **orders of magnitude more false positives** from grep output
 
-**The greatest benefit of fw-context isn't "tokens saved", but enabling analyses that would otherwise be impossible** — transitive call trees, dead code detection, and precise references across 281 files.
+**The greatest benefit of fw-context is not "tokens saved," but enabling analyses that would otherwise be impossible** — transitive call trees, dead code detection, and precise references across 281 files.
