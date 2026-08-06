@@ -137,7 +137,7 @@ def get_active_build(
         sym_count = conn.execute("SELECT COUNT(*) FROM symbols WHERE config_hash=?", (config_hash,)).fetchone()[0]
         file_count = conn.execute("SELECT COUNT(*) FROM files WHERE config_hash=?", (config_hash,)).fetchone()[0]
         ref_count = count_refs(conn, config_hash)
-        manifest_verification = cfg["manifest_verification"] if "manifest_verification" in cfg else "none"
+        manifest_verification = cfg.get("manifest_verification", "none")
         if fast:
             modified_count = 0
             # header_affected_tus computed from manifest even at fast=True
