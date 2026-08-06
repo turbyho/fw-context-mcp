@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 from typing import TYPE_CHECKING
 
@@ -11,6 +12,8 @@ from fw_context_mcp.search.phases.base import Phase
 
 if TYPE_CHECKING:
     from fw_context_mcp.search.context import PipelineContext
+
+log = logging.getLogger(__name__)
 
 
 class LLMQueryPhase(Phase):
@@ -83,9 +86,14 @@ class LLMQueryPhase(Phase):
                 "Samples (use file paths to identify the right subsystem; samples\n"
                 "from unrelated subsystems are noise):\n"
                 f"{context_str}\n\n"
-                "Output format:\n"
-                "UNDERSTANDING: <one sentence — what subsystem, what they really want>\n"
-                'QUERIES: ["term1*", "term2*", ...]\n'
+                "CRITICAL OUTPUT RULES — plaintext only, NO markdown formatting:\n"
+                "• Never use **bold**, __underline__, or ```code fences``` in your response.\n"
+                "• QUERIES must be a valid JSON array of strings on ONE line.\n"
+                "• Output EXACTLY two lines — nothing else before or after.\n\n"
+                "Example correct output:\n"
+                "UNDERSTANDING: The developer wants to find all DMA transfer functions.\n"
+                'QUERIES: ["dma*", "transfer*", "channel*"]\n\n'
+                "Now respond with the same format for the query above.\n"
             )
         else:
             prompt = (
@@ -101,15 +109,24 @@ class LLMQueryPhase(Phase):
                 "question is about interrupts or exception handlers, include\n"
                 "`handler*` and `fault*` in your queries — they don't contain\n"
                 "'irq' or 'isr' in their names.\n\n"
-                "Output format:\n"
-                "UNDERSTANDING: <one sentence>\n"
-                'QUERIES: ["term1*", "term2*", ...]\n'
+                "CRITICAL OUTPUT RULES — plaintext only, NO markdown formatting:\n"
+                "• Never use **bold**, __underline__, or ```code fences``` in your response.\n"
+                "• QUERIES must be a valid JSON array of strings on ONE line.\n"
+                "• Output EXACTLY two lines — nothing else before or after.\n\n"
+                "Example correct output:\n"
+                "UNDERSTANDING: The developer wants to find all DMA transfer functions.\n"
+                'QUERIES: ["dma*", "transfer*", "channel*"]\n\n'
+                "Now respond with the same format for the query above.\n"
             )
 
         try:
             raw = await call_ollama_async(prompt, ctx.config.llm)
             understanding, queries = _parse_understanding_response(raw)
-            all_queries = queries[:5] if queries else ctx.rough_queries
+            if queries:
+                all_queries = queries[:5]
+            else:
+                all_queries = ctx.rough_queries
+                log.warning("LLM response parse failed — falling back to rough queries")
             is_fallback = not queries  # don't cache LLM failures — retry next time
         except (OllamaModelNotFoundError, OllamaError) as e:
             return ctx.evolve(
@@ -129,17 +146,31 @@ def _parse_understanding_response(raw: str) -> tuple[str, list[str]]:
     """Parse Phase 2 LLM response into (understanding, queries)."""
     understanding = ""
     queries: list[str] = []
-    und_match = re.search(r"UNDERSTANDING:\s*(.+?)(?:\n|$)", raw, re.IGNORECASE)
+    # Strip ANSI escape sequences (ollama injects cursor-move codes) and markdown bold
+    stripped = re.sub(r"\x1b\[[0-9;]*[a-zA-Z]", "", raw)
+    stripped = re.sub(r"\*\*", "", stripped)
+    stripped = re.sub(r"__", "", stripped)
+    # Match UNDERSTANDING up to the QUERIES: line (handles multi-line understanding)
+    und_match = re.search(
+        r"UNDERSTANDING:\s*(.+?)\n(?=QUERIES:)", stripped, re.IGNORECASE | re.DOTALL
+    )
     if und_match:
-        understanding = und_match.group(1).strip()
+        understanding = " ".join(und_match.group(1).split())
+    else:
+        und_match = re.search(r"UNDERSTANDING:\s*(.+?)(?:\n|$)", stripped, re.IGNORECASE)
+        if und_match:
+            understanding = und_match.group(1).strip()
     try:
-        start = raw.index("[")
-        end = raw.rindex("]") + 1
-        parsed = json.loads(raw[start:end])
+        start = stripped.index("[")
+        end = stripped.rindex("]") + 1
+        parsed = json.loads(stripped[start:end])
         if isinstance(parsed, list):
             for item in parsed:
                 if isinstance(item, str) and item.strip():
                     queries.append(item.strip())
     except (ValueError, json.JSONDecodeError):
-        pass
+        for match in re.finditer(r"[-*]\s*`?(\w+[*\w]*)`?", stripped):
+            term = match.group(1).strip()
+            if term and term not in queries:
+                queries.append(term)
     return understanding, queries
