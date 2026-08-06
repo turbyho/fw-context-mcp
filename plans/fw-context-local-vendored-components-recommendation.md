@@ -307,25 +307,24 @@ CPE
 
 Výstup je kandidátní sada CVE.
 
-#### OSV-Scanner
+#### OSV (HTTP API)
 
 Doplňkový scanner pro komponenty, u kterých je známý upstream repository a commit.
 
 To může být přesnější než obecný CPE match, zejména pokud projekt používá vendored snapshot nebo Git fork.
 
-Příklad interního exportu:
+Commit matching jde přímo přes OSV HTTP API — `osv-scanner scan source` manifest párů (repo, commit) nepodporuje (očekává adresář/lockfile/SBOM/git repo). Příklad dotazu pro každou komponentu s `upstream_revision`:
 
 ```json
+POST https://api.osv.dev/v1/querybatch
 {
-  "packages": [
-    {
-      "name": "github.com/Mbed-TLS/mbedtls",
-      "commit": "abcdef0123456789",
-      "component_id": "mbedtls"
-    }
+  "queries": [
+    { "commit": "abcdef0123456789" }
   ]
 }
 ```
+
+`commit` je top-level query parametr; `package` je optional, `version` se při commit query nezadává. Výsledek se mapuje zpět na interní `component_id` přes registry.
 
 #### CVE Binary Tool
 
