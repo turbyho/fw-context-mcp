@@ -637,13 +637,17 @@ def store_symbols_for_unit(
             indirect_call_sites = result.indirect_call_sites
             fp_assignments = result.fp_assignments
             macros = result.macros
+            pending_dispatches = getattr(result, 'pending_dispatches', [])
         elif len(pre_parsed) == 7:
             tu, syms, refs, inheritance, indirect_call_sites, fp_assignments, macros = pre_parsed
+            pending_dispatches = []
         elif len(pre_parsed) == 6:
             syms, refs, inheritance, indirect_call_sites, fp_assignments, macros = pre_parsed
+            pending_dispatches = []
         else:
             syms, refs, inheritance, indirect_call_sites, fp_assignments = pre_parsed
             macros = []
+            pending_dispatches = []
     else:
         try:
             result = extract_all(
@@ -658,6 +662,7 @@ def store_symbols_for_unit(
             indirect_call_sites = result.indirect_call_sites
             fp_assignments = result.fp_assignments
             macros = result.macros
+            pending_dispatches = getattr(result, 'pending_dispatches', [])
         except sqlite3.Error:
             log.error("Fatal DB error parsing %s — stopping indexer", unit.file.name)
             raise
@@ -769,6 +774,38 @@ def store_symbols_for_unit(
             for fpa in fp_assignments
         ]
         insert_fp_assignments_batch(conn, fpa_rows)
+
+    # Pending dispatch edges (for deferred resolution in post-processing)
+    if index_refs and pending_dispatches:
+        conn.execute(
+            """CREATE TEMP TABLE IF NOT EXISTS _pending_dispatch (
+                config_hash TEXT,
+                callee_qn TEXT,
+                target_qn_partial TEXT,
+                target_name TEXT,
+                target_usr TEXT,
+                file TEXT,
+                line INTEGER,
+                caller_usr TEXT
+            )"""
+        )
+        pd_rows = [
+            (
+                config_hash,
+                pd.callee_qn,
+                pd.target_qn_partial,
+                pd.target_name,
+                pd.target_usr or "",
+                _rel(pd.file),
+                pd.line,
+                pd.caller_usr or "",
+            )
+            for pd in pending_dispatches
+        ]
+        conn.executemany(
+            "INSERT INTO _pending_dispatch VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            pd_rows,
+        )
 
     # Inheritance
     if inheritance:

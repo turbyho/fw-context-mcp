@@ -25,10 +25,16 @@ Serves 34 MCP tools and 4 MCP resources via FastMCP (stdio transport).
 ``fw-context://symbols/{name}``.
 """
 
+import asyncio
+import functools
+import inspect
 import logging
 import sqlite3
+import sys
+import time
 from pathlib import Path
 
+from mcp.server.fastmcp import Context as MCPContext
 from mcp.server.fastmcp import FastMCP
 
 from ..utils import resolve_project_root
@@ -37,6 +43,63 @@ from .handlers import callgraph, inheritance, maintenance, search, source, varia
 from .shared.context import _check_server_ready, _integrity_checked
 
 log = logging.getLogger(__name__)
+
+
+def _wrap_tool(fn):
+    """Wrap a tool handler: error boundary + async dispatch + MCP progress.
+
+    Sync handlers are dispatched to a background thread via
+    ``asyncio.to_thread``.  The event loop sends MCP progress
+    notifications every 5 s to keep the client alive during long-running
+    queries (BFS call-graph traversal, etc.).
+
+    All handlers get an error boundary — no unhandled exception can crash
+    the server process.
+    """
+    if inspect.iscoroutinefunction(fn):
+        @functools.wraps(fn)
+        async def _wrapper(*a, **kw):
+            try:
+                return await fn(*a, **kw)
+            except BrokenPipeError:
+                sys.exit(0)
+            except Exception as exc:
+                log.exception("Tool %s crashed", fn.__name__)
+                return [{"error": f"Internal server error in {fn.__name__}: {exc}"}]
+        return _wrapper
+
+    @functools.wraps(fn)
+    async def _wrapper(*a, ctx: MCPContext | None = None, **kw):
+        start = time.monotonic()
+        task = asyncio.ensure_future(
+            asyncio.to_thread(functools.partial(fn, *a, **kw))
+        )
+
+        while not task.done():
+            done, pending = await asyncio.wait([task], timeout=5.0)
+            if task in done:
+                break
+            elapsed = int(time.monotonic() - start)
+            if ctx is not None:
+                try:
+                    await ctx.report_progress(
+                        elapsed, None,
+                        f"Working on {fn.__name__}... ({elapsed}s)",
+                    )
+                except Exception:
+                    pass
+            if elapsed > 300:
+                task.cancel()
+                return [{"error": f"Tool {fn.__name__} timed out after {elapsed}s"}]
+
+        exception = task.exception()
+        if exception is not None:
+            if isinstance(exception, BrokenPipeError):
+                sys.exit(0)
+            log.exception("Tool %s crashed", fn.__name__)
+            return [{"error": f"Internal server error in {fn.__name__}: {exception}"}]
+        return task.result()
+    return _wrapper
 
 _DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 
@@ -95,50 +158,50 @@ _SOURCE_EXTS_WATCH = {".c", ".cpp", ".h", ".hpp"}
 # ── MCP tool registration (implementations in handlers/) ──────────────
 
 # maintenance.py
-mcp.tool()(maintenance.check_ollama)
-mcp.tool()(maintenance.get_active_build)
-mcp.tool()(maintenance.get_project_info)
-mcp.tool()(maintenance.list_projects)
-mcp.tool()(maintenance.reindex_file)
-mcp.tool()(maintenance.reindex_file_impl)
-mcp.tool()(maintenance.reset_index)
+mcp.tool()(_wrap_tool(maintenance.check_ollama))
+mcp.tool()(_wrap_tool(maintenance.get_active_build))
+mcp.tool()(_wrap_tool(maintenance.get_project_info))
+mcp.tool()(_wrap_tool(maintenance.list_projects))
+mcp.tool()(_wrap_tool(maintenance.reindex_file))
+mcp.tool()(_wrap_tool(maintenance.reindex_file_impl))
+mcp.tool()(_wrap_tool(maintenance.reset_index))
 
 # search.py
-mcp.tool()(search.lookup_symbol)
-mcp.tool()(search.search_code)
-mcp.tool()(search.search_bodies)
-mcp.tool()(search.search_content)
-mcp.tool()(search.semantic_search)
-mcp.tool()(search.smart_search)
+mcp.tool()(_wrap_tool(search.lookup_symbol))
+mcp.tool()(_wrap_tool(search.search_code))
+mcp.tool()(_wrap_tool(search.search_bodies))
+mcp.tool()(_wrap_tool(search.search_content))
+mcp.tool()(_wrap_tool(search.semantic_search))
+mcp.tool()(_wrap_tool(search.smart_search))
 
 # callgraph.py
-mcp.tool()(callgraph.find_all_callers_recursive)
-mcp.tool()(callgraph.find_call_path)
-mcp.tool()(callgraph.find_callees_recursive)
-mcp.tool()(callgraph.find_callers)
-mcp.tool()(callgraph.find_dead_code)
-mcp.tool()(callgraph.find_hotspots)
-mcp.tool()(callgraph.find_indirect_call_sites)
-mcp.tool()(callgraph.find_indirect_targets)
-mcp.tool()(callgraph.find_references)
-mcp.tool()(callgraph.find_wrapper_callers)
-mcp.tool()(callgraph.trace_data_flow)
+mcp.tool()(_wrap_tool(callgraph.find_all_callers_recursive))
+mcp.tool()(_wrap_tool(callgraph.find_call_path))
+mcp.tool()(_wrap_tool(callgraph.find_callees_recursive))
+mcp.tool()(_wrap_tool(callgraph.find_callers))
+mcp.tool()(_wrap_tool(callgraph.find_dead_code))
+mcp.tool()(_wrap_tool(callgraph.find_hotspots))
+mcp.tool()(_wrap_tool(callgraph.find_indirect_call_sites))
+mcp.tool()(_wrap_tool(callgraph.find_indirect_targets))
+mcp.tool()(_wrap_tool(callgraph.find_references))
+mcp.tool()(_wrap_tool(callgraph.find_wrapper_callers))
+mcp.tool()(_wrap_tool(callgraph.trace_data_flow))
 
 # source.py
-mcp.tool()(source.explain_symbol)
-mcp.tool()(source.get_file_map)
-mcp.tool()(source.get_source)
-mcp.tool()(source.get_symbol_context)
-mcp.tool()(source.read_file)
+mcp.tool()(_wrap_tool(source.explain_symbol))
+mcp.tool()(_wrap_tool(source.get_file_map))
+mcp.tool()(_wrap_tool(source.get_source))
+mcp.tool()(_wrap_tool(source.get_symbol_context))
+mcp.tool()(_wrap_tool(source.read_file))
 
 # inheritance.py
-mcp.tool()(inheritance.get_class_members)
-mcp.tool()(inheritance.get_inheritance_chain)
-mcp.tool()(inheritance.get_method_overrides)
-mcp.tool()(inheritance.get_template_instances)
+mcp.tool()(_wrap_tool(inheritance.get_class_members))
+mcp.tool()(_wrap_tool(inheritance.get_inheritance_chain))
+mcp.tool()(_wrap_tool(inheritance.get_method_overrides))
+mcp.tool()(_wrap_tool(inheritance.get_template_instances))
 
 # variables.py
-mcp.tool()(variables.find_variables)
+mcp.tool()(_wrap_tool(variables.find_variables))
 
 # ── MCP Resources ──────────────────────────────────────────────────────────
 

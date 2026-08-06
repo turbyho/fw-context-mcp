@@ -26,14 +26,10 @@ from ...indexer.db import (
     find_indirect_targets as query_indirect_targets,
 )
 from ...utils import abs_path
+from ...utils import escape_like as _escape_like
 from ..shared.context import _open_db_or_return, _resolve_context
 from ._base import BaseHandler
 from .source import _lookup_definition
-
-
-def _escape_like(value: str) -> str:
-    """Escape LIKE wildcards ``%``, ``_``, and the escape char ``\\``."""
-    return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
 log = logging.getLogger(__name__)
 
@@ -75,6 +71,20 @@ def _references_result(name: str, project_root: str | None, ref_kind: str | list
                 macro = macros[0]
                 # Use find_macro_refs for file-level usage tracking
                 ref_rows = find_macro_refs(conn, config_hash, name, limit=limit)
+                # Filter out matches inside C/C++ comments (FTS5 sees raw text)
+                import re as _re
+                _comment_refs: list = []
+                _non_comment_refs: list = []
+                for r in ref_rows:
+                    _snip = r["_match_snippet"] or ""
+                    # Single-line comment: // before <b> on the same logical line
+                    if _re.search(r'//[^\n]*<b>', _snip):
+                        _comment_refs.append(r)
+                    # Multi-line comment: /* before <b> and */ after it or line end
+                    elif _re.search(r'/\*.*<b>', _snip, _re.DOTALL):
+                        _comment_refs.append(r)
+                    else:
+                        _non_comment_refs.append(r)
                 macro_def = {
                     "kind": "macro",
                     "name": macro["name"],
@@ -83,16 +93,23 @@ def _references_result(name: str, project_root: str | None, ref_kind: str | list
                     "value": macro["value"],
                     **({"expanded_value": macro["expanded_value"]} if macro["expanded_value"] else {}),
                 }
-                if not ref_rows:
+                if not _non_comment_refs:
                     label = "callers" if caller_mode else "references"
-                    return [{"info": f"No {label} (macro) found for '{name}'.", **macro_def}]
+                    extra: dict = {}
+                    if _comment_refs:
+                        extra["warning"] = (
+                            "All macro uses are in comments — "
+                            "no active code references found."
+                        )
+                    return [{"info": f"No {label} (macro) found for '{name}'.",
+                             **macro_def, **extra}]
                 macro_refs: list[dict] = [
                     {
                         "file": abs_path(root, r["file_path"]),
                         "ref_kind": "macro_use",
                         "_match_snippet": r["_match_snippet"],
                     }
-                    for r in ref_rows
+                    for r in _non_comment_refs
                 ]
                 macro_refs.insert(0, macro_def)
                 return macro_refs
@@ -356,29 +373,50 @@ def find_indirect_targets(
         if not rows:
             return [{"info": f"No functions assigned to '{name}'."}]
 
-        return [
-            {
-                "rhs_name": r["rhs_name"],
-                "rhs_qname": r["rhs_qname"] or r["rhs_name"],
-                "fn_ptr_type": r["fn_ptr_type"],
-                "method": r["method"],
-                "assign_file": abs_path(root, r["assign_file"]),
+        results: list[dict] = []
+        for r in rows:
+            call_expr_text: str | None = str(r["call_expr_text"]) if r["call_expr_text"] else None
+            entry: dict = {
+                "rhs_name": str(r["rhs_name"] or ""),
+                "rhs_qname": str(r["rhs_qname"] or r["rhs_name"] or ""),
+                "fn_ptr_type": str(r["fn_ptr_type"] or ""),
+                "method": str(r["method"] or ""),
+                "assign_file": abs_path(root, str(r["assign_file"] or "")),
                 "assign_line": r["assign_line"],
-                "assign_caller": r["assign_caller"] or "<file scope>",
-                "call_file": abs_path(root, r["call_file"]) if r["call_file"] else None,
+                "assign_caller": str(r["assign_caller"] or "<file scope>"),
+                "call_file": abs_path(root, str(r["call_file"])) if r["call_file"] else None,
                 "call_line": r["call_line"],
-                "call_expr_text": r["call_expr_text"],
+                "call_expr_text": call_expr_text,
             }
-            for r in rows
-        ]
+            lhs_name = str(r["lhs_name"] or "")
+            if lhs_name and not r["lhs_usr"]:
+                if not r["call_file"]:
+                    lhs_display = lhs_name.strip()
+                    entry["_note"] = (
+                        f"Direct call site not resolved — the callee "
+                        f"({lhs_display}) is template-obscured. "
+                        "The function pointer is likely stored and invoked "
+                        "asynchronously (e.g. Timeout/Ticker callback). "
+                        "Use find_indirect_call_sites on the receiver class "
+                        "to find the actual invocation site."
+                    )
+                else:
+                    entry["_note"] = (
+                        "Call site resolved via type-based fallback "
+                        "(template-obscured callback → receiver class handler)."
+                    )
+            results.append(entry)
+        return results
 
 # ── moved from server.py ──
 def _refs_guard(project_root: str | None) -> tuple[sqlite3.Connection, Path, str, None] | tuple[None, None, None, list[dict]]:
     """Shared guard for graph tools: resolve project, open DB, check refs exist.
 
-    Returns a cache-managed connection on success — callers must NOT close it.
-    The connection is owned by :mod:`fw_context_mcp.mcp.shared.connection` and
-    will be reused across handlers within the same MCP session.
+    Returns a cache-managed connection on success — callers must NOT
+    close it and must only perform read queries. Any write operation
+    requires a new explicit ``with conn:`` block. The connection is owned
+    by :mod:`fw_context_mcp.mcp.shared.connection` and will be reused
+    across handlers within the same MCP session.
 
     Delegates to ``_resolve_handler_context`` — prefer that directly in new code.
 
@@ -410,14 +448,59 @@ def find_call_path(
     max_depth: Annotated[int, Field(description="Maximum BFS depth for path search (default 10).")] = 10,
 ) -> list[dict]:
     """Find call paths between two C/C++ functions via BFS in the libclang
-    call graph, including function-pointer edges and ISR vector
-    registrations. libclang-powered: follows function-pointer edges and
-    ISR vector registrations that text-based search cannot resolve.
+    call graph, including function-pointer edges, ISR vector
+    registrations, implicit constructors, and synthetic dispatch edges
+    (event loops, thread starts).  libclang-powered: follows
+    function-pointer edges and ISR vector registrations that text-based
+    search cannot resolve.
 
     Use to answer "how does A reach B?" — e.g. tracing how a high-level
     event handler eventually calls a low-level driver.  Returns up to 5
     shortest paths, each with ``depth`` (edge count) and ``chain``
     (e.g. ``"main → app_run → modem_init"``).
+
+    **Edge types traversed:** The BFS includes ``call``, ``indirect``
+    (function pointers / ISRs), ``implicit_construct`` (global/static
+    object constructors), and ``dispatch`` (synthetic edges through event
+    loops like ``EventQueue::dispatch_forever`` and thread starts like
+    ``Thread::start``).
+
+    **Limitations:**
+
+    - **Caveat 1 — Callback/event-loop dispatch:** Callbacks registered
+      via dispatch-registration APIs (``EventQueue::call_every``,
+      ``k_work_submit``, ``xTimerStart``) are bridged to their dispatch
+      entry point (e.g. ``dispatch_forever``, ``z_work_q_main``) via a
+      built-in mapping for mbed-os, Zephyr, and FreeRTOS.  Custom or
+      uncommon RTOS dispatch patterns can be added via
+      ``[call_graph.dispatch_bridges]`` in ``.fw-context/config.toml``.
+      Bridges whose entry point symbol does not exist in the index are
+      silently skipped — the map can list all supported platforms
+      without causing errors.
+    - **Caveat 2 — Ambiguous name resolution in fallback paths:** When
+      libclang cannot resolve a call (e.g. template-obscured
+      ``_timeout.attach(...)``), a source-line regex fallback attempts
+      to match the method name.  If multiple methods share the same
+      unqualified name AND neither the receiver field type nor the
+      caller's class provide disambiguation, the edge is **not** created
+      (conservative — avoids false paths).
+    - **Caveat 3 — Global constructor bridging:** File-scope
+      ``implicit_construct`` edges are reachable through a synthetic
+      ``<global ctors>`` node injected between ``main`` and all global
+      constructors.  Works for any call-path query that can reach
+      ``main`` — not limited to queries starting from ``main``.
+
+    **When ``find_call_path`` returns empty** and you believe a path
+    should exist:
+
+    1. Check for async dispatch — use ``search_bodies("call_every")``
+       or ``search_bodies("attach")`` to find callback registrations.
+    2. Manually trace through callbacks with ``find_callers`` on
+       intermediate symbols.
+    3. Raise ``max_depth`` (default 10, max 50) if the call chain is
+       long.
+    4. Use ``find_indirect_call_sites`` / ``find_indirect_targets`` to
+       verify function-pointer wiring.
 
     For one-sided exploration use ``find_all_callers_recursive`` (who reaches
     this?) or ``find_callees_recursive`` (what does this reach?).
@@ -431,7 +514,7 @@ def find_call_path(
         from_name: Starting symbol for path search.
         to_name: Target symbol to find path to.
         project_root: Project root. Auto-detected if omitted.
-        max_depth: Maximum BFS depth for path search (default 10).
+        max_depth: Maximum BFS depth for path search (default 10, max 50).
 
     Returns:
         list of dicts, each with: depth (edge count, int), chain (str —
@@ -462,13 +545,26 @@ def find_all_callers_recursive(
 ) -> list[dict]:
     """Find all transitive C/C++ callers — who calls *name*, directly or
     indirectly, through the libclang call graph including
-    function-pointer edges. libclang-powered: follows function-pointer
+    function-pointer edges, implicit constructors, and synthetic
+    dispatch edges. libclang-powered: follows function-pointer
     assignments and ISR vector registrations across the full call tree.
 
     Use for impact analysis: "if I change this function, how far does the
     ripple go?"  Returns callers at depth 1 (direct), depth 2 (callers of
     callers), up to ``max_depth`` (default 5).  Results are deduplicated —
     each caller appears once at its shortest distance to the target.
+
+    **Edge types traversed:** Includes ``call``, ``indirect`` (function
+    pointers / ISRs), ``implicit_construct`` (constructors reachable through
+    file-scope global objects), and ``dispatch`` (synthetic edges through
+    event loops and thread starts).
+
+    **Limitation — ambiguous name resolution:** When a source-line fallback
+    cannot disambiguate which method is called (e.g. ``attach()`` matching
+    both ``Timeout::attach`` and ``SerialBase::attach``), the edge is
+    conservatively omitted to avoid false callers.  If you suspect a
+    missing caller, verify with ``search_bodies("target_name")`` and
+    ``find_indirect_targets``.
 
     For a flat, single-level caller list use ``find_callers`` (faster).
     For the reverse direction use ``find_callees_recursive``.
@@ -510,13 +606,24 @@ def find_callees_recursive(
 ) -> list[dict]:
     """Find all transitive C/C++ callees — what *name* calls, directly or
     indirectly, through the libclang call graph including
-    function-pointer edges. libclang-powered: follows function-pointer
+    function-pointer edges, implicit constructors, and synthetic
+    dispatch edges. libclang-powered: follows function-pointer
     calls and indirect invocations across the full dependency tree.
 
     Use for dependency analysis: "what does this function depend on to do
     its job?"  Returns callees at depth 1 (direct), depth 2 (callees of
     callees), up to ``max_depth`` (default 5).  Results are deduplicated
     by shortest distance.
+
+    **Edge types traversed:** Includes ``call``, ``indirect`` (function
+    pointers / ISRs), ``implicit_construct`` (constructors reachable through
+    file-scope global objects), and ``dispatch`` (synthetic edges through
+    event loops and thread starts).
+
+    **Limitation — ambiguous name resolution:** When a source-line fallback
+    cannot disambiguate which method is called, the edge is conservatively
+    omitted to avoid false callees.  If you suspect a missing callee,
+    verify with ``search_bodies("target_name")``.
 
     For direct callees only, ``get_symbol_context`` gives a faster flat
     list along with the function body and callers. For the reverse
@@ -673,6 +780,32 @@ def find_wrapper_callers(
            LIMIT ?""",
         (config_hash, f"{class_name}::%", max(limit * 10, 500)),
     ).fetchall()
+
+    if not driver_methods:
+        esc_name = _escape_like(class_name)
+        driver_methods = conn.execute(
+            """SELECT s.usr, s.name, s.qualified_name
+               FROM symbols s
+               WHERE s.config_hash = ?
+                 AND s.kind = 'method'
+                 AND s.qualified_name LIKE ? ESCAPE '\\'
+               ORDER BY s.name
+               LIMIT ?""",
+            (config_hash, f"%{esc_name}::%", max(limit * 10, 500)),
+        ).fetchall()
+
+    if not driver_methods and "::" in class_name:
+        short_name = class_name.rsplit("::", 1)[-1]
+        driver_methods = conn.execute(
+            """SELECT s.usr, s.name, s.qualified_name
+               FROM symbols s
+               WHERE s.config_hash = ?
+                 AND s.kind = 'method'
+                 AND s.qualified_name LIKE ? ESCAPE '\\'
+               ORDER BY s.name
+               LIMIT ?""",
+            (config_hash, f"{short_name}::%", max(limit * 10, 500)),
+        ).fetchall()
 
     if not driver_methods:
         return [{"info": f"No methods found for class '{class_name}'."}]
