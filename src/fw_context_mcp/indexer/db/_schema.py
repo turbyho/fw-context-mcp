@@ -186,6 +186,10 @@ _MIGRATION_ADD_COLUMNS = [
     "ALTER TABLE build_configs ADD COLUMN first_indexed_at TEXT NOT NULL DEFAULT ''",
     "ALTER TABLE build_configs ADD COLUMN analyze_vendor INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE files ADD COLUMN is_project INTEGER NOT NULL DEFAULT 0",
+    # Incremental re-embedding: content-addressable hash of the fields that
+    # feed an embedding description.  Lets _build_embeddings skip unchanged
+    # symbols instead of re-embedding the whole index on every `fw-context index`.
+    "ALTER TABLE embeddings ADD COLUMN content_hash TEXT NOT NULL DEFAULT ''",
     # Schema version bump — DO NOT REMOVE. When adding new migration steps after this
     # column, also add a NEW ALTER TABLE … ADD COLUMN _schema_bump_… line. The hash
     # of _MIGRATION_ADD_COLUMNS drives CURRENT_SCHEMA_VERSION.
@@ -386,11 +390,16 @@ CREATE INDEX IF NOT EXISTS idx_fpa_config_file ON fp_assignments(config_hash, fr
 -- Stored as BLOB: variable-dimension float32 values packed with struct.pack('f', ...).
 -- Common: mxbai-embed-large → 1024 floats (4096 bytes), qwen3-embedding → 4096 floats (16384 bytes).
 -- ON DELETE CASCADE: when a symbol row is deleted, all of its embedding chunks are removed.
+-- content_hash: content-addressable hash of the fields that feed the embedding
+-- description (name, qname, kind, file, signature, docstring, summary, source).
+-- Used for incremental re-embedding — a symbol is re-embedded only when its
+-- content changed or it has no embedding for the current model key yet.
 CREATE TABLE IF NOT EXISTS embeddings (
     symbol_id    INTEGER NOT NULL REFERENCES symbols(id) ON DELETE CASCADE,
     chunk_index  INTEGER NOT NULL DEFAULT 0,
     embedding    BLOB    NOT NULL,
     model        TEXT    NOT NULL,
+    content_hash TEXT    NOT NULL DEFAULT '',
     updated_at   TEXT    NOT NULL DEFAULT (datetime('now')),
     PRIMARY KEY (symbol_id, chunk_index)
 );

@@ -86,18 +86,21 @@ def _cosine_sim(query_vec: list[float], blob: bytes) -> float | None:
 
 def upsert_embeddings(
     conn: sqlite3.Connection,
-    rows: list[tuple[int, int, bytes, str]],
+    rows: list[tuple[int, int, bytes, str, str]],
 ) -> int:
     """Insert or replace embedding rows.
 
-    Each row is (symbol_id, chunk_index, embedding_blob, model).
+    Each row is ``(symbol_id, chunk_index, embedding_blob, model, content_hash)``.
+    ``content_hash`` is a content-addressable hash of the fields that feed the
+    embedding description — used by the incremental re-embedding pass to skip
+    symbols whose content did not change.
     Returns number of rows inserted.
     """
     # NOTE: Orphan cleanup moved to clean_orphan_embeddings() — call it once
     # after indexing completes, not on every batch insert.
     cur = conn.executemany(
-        """INSERT OR REPLACE INTO embeddings(symbol_id, chunk_index, embedding, model, updated_at)
-           VALUES (?, ?, ?, ?, datetime('now'))""",
+        """INSERT OR REPLACE INTO embeddings(symbol_id, chunk_index, embedding, model, content_hash, updated_at)
+           VALUES (?, ?, ?, ?, ?, datetime('now'))""",
         rows,
     )
     return cur.rowcount
@@ -177,20 +180,35 @@ CREATE VIRTUAL TABLE IF NOT EXISTS vec_symbols USING vec0(
 """
 
 
-def init_vec_table(conn: sqlite3.Connection, dim: int | None = None) -> None:
+def init_vec_table(conn: sqlite3.Connection, dim: int | None = None, *, recreate: bool = False) -> None:
     """Create the vec0 virtual table if it does not exist.
 
     Must be called after ``sqlite_vec.load(conn)``.
     The table stores embeddings keyed by ``symbol_id`` with a per-build
     ``config_hash`` metadata column for filtered KNN queries.
 
-    When *dim* is passed explicitly (during indexing after the embedding
-    dimension is known), the table is dropped and recreated to match.
-    When *dim* is ``None`` (called from ``open_db``), the table is only
-    created if it does not already exist — the real dimension is applied
-    later by ``_build_embeddings``.
+    When *recreate* is ``True`` (and *dim* is a positive int), the table
+    is dropped and recreated to match the requested dimension.  Use this
+    when the embedding model changed and the dimension no longer matches.
+
+    When *recreate* is ``False`` (default), the table is only created if
+    it does not already exist — safe for repeated calls during ``open_db``.
+    The *dim* parameter is ignored in this mode.
     """
-    if dim is not None:
+    if dim is None:
+        try:
+            row = conn.execute(
+                "SELECT embedding_dim FROM build_configs ORDER BY rowid DESC LIMIT 1"
+            ).fetchone()
+            if row and row["embedding_dim"]:
+                dim = row["embedding_dim"]
+        except sqlite3.OperationalError:
+            pass
+
+    if dim is None:
+        dim = 1024
+
+    if recreate:
         if not isinstance(dim, int) or dim < 1:
             raise ValueError(f"Invalid embedding dimension: {dim!r} — must be a positive integer")
         conn.execute("DROP TABLE IF EXISTS vec_symbols")
@@ -198,7 +216,7 @@ def init_vec_table(conn: sqlite3.Connection, dim: int | None = None) -> None:
     # NOTE: .format() is used because SQLite CREATE VIRTUAL TABLE does not
     # support parameterized dimension.  *dim* is validated as positive int
     # above — no SQL injection risk.
-    conn.execute(_VEC_SCHEMA.format(dim=dim or 1024))
+    conn.execute(_VEC_SCHEMA.format(dim=dim))
     conn.commit()
 
 
