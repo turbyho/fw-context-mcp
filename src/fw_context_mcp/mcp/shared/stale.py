@@ -11,7 +11,7 @@ from pathlib import Path
 from ...config import derive_project_id
 from ...indexer.db import get_active_config
 from ...utils import MTIME_TOLERANCE_S, abs_path
-from .context import _open_db_or_return
+from .context import _quick_open_readonly, get_executor
 
 log = logging.getLogger(__name__)
 
@@ -330,37 +330,56 @@ def _with_stale_recovery(
     *,
     stale_msg: str = "",
 ) -> list[dict]:
-    """Execute *query_fn(conn, config_hash)* with automatic stale-recovery.
+    """Execute *query_fn(conn, config_hash)* on the executor with stale-recovery.
 
     When the index or result files are stale, kicks off a background
     ``fw-context index`` and returns a warning.  The original (possibly
     stale) results are always returned — the background reindex handles
     the actual fix asynchronously.
 
-    Connections are always closed before returning.
+    The ENTIRE body (config read + ``query_fn`` + ``_stale_files``) runs
+    inside ``executor.execute_sync``: the connection is needed for the
+    whole search query, not just the staleness check.  A shorter variant
+    that closed or released the connection after the config read would
+    break every search tool — do NOT "optimise" this by splitting the
+    connection usage.
+
+    ``config_hash`` is read fresh per request via a short-lived
+    read-only connection (no write transaction), then passed per call
+    to the executor — a reindex with a changed build config can never
+    leave queries filtering by a stale hash.
     """
     from ..background import _ensure_daemon_running  # lazy — avoids circular import
 
-    conn, err_result = _open_db_or_return(db_path)
-    if err_result is not None:
-        return err_result
-    assert conn is not None
-    # Connection stays in cache (managed by TTL eviction in connection.py)
-    with conn:
+    # Fresh config_hash via a short-lived read-only connection.
+    conn = _quick_open_readonly(db_path)
+    try:
         project_id = derive_project_id(root)
         cfg = get_active_config(conn, project_id)
         if not cfg:
             return [{"error": "No build config indexed."}]
         config_hash = cfg["config_hash"]
-        result_rows = query_fn(conn, config_hash)
-        # Ensure plain dicts — sqlite3.Row objects become invalid after conn.close()
+    finally:
+        conn.close()
+
+    executor = get_executor(db_path)
+
+    def _query(db_conn, cfg_hash):
+        # Runs under the executor lock on the single shared connection;
+        # must not open its own connection.  Timeout is enforced by
+        # _wrap_tool (300 s + interrupt), not here.
+        result_rows = query_fn(db_conn, cfg_hash)
+        # Ensure plain dicts — rows must be materialised before returning.
         safe_rows: list[dict] = [dict(r) for r in result_rows]
         stale_f = _stale_files(
-            conn,
-            config_hash,
+            db_conn,
+            cfg_hash,
             [abs_path(root, r["file"]) for r in result_rows if "file" in r],
             root,
         )
+        return safe_rows, stale_f
+
+    safe_rows, stale_f = executor.execute_sync(_query, config_hash)
 
     results: list[dict] = []
     if stale_f:

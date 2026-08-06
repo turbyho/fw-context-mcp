@@ -45,8 +45,6 @@ class ExpandContextPhase(Phase):
         return bool(ctx.final_results)
 
     async def run(self, ctx: PipelineContext) -> PipelineContext:
-        from fw_context_mcp.indexer.db import open_db
-
         results = ctx.final_results
         seeds = results[: self.SEEDS]
 
@@ -63,20 +61,18 @@ class ExpandContextPhase(Phase):
             log.debug("ExpandContext: no seeds have USR — skipping")
             return ctx
 
-        conn = open_db(ctx.db_path)
-        try:
-            with conn:
-                neighbor_usrs = _get_neighbors(conn, ctx.config_hash, seed_usrs, self.DIRECTION)
+        def _query(conn, config_hash):
+            # Runs under the executor lock on the single shared
+            # connection; the phase must not open its own connection.
+            neighbor_usrs = _get_neighbors(conn, config_hash, seed_usrs, self.DIRECTION)
+            if not neighbor_usrs:
+                return None
+            # Resolve neighbor USRs to symbol rows — project definitions only
+            return _resolve_project_defs(
+                conn, config_hash, neighbor_usrs, seed_set, self.MAX_NEIGHBORS
+            )
 
-                if not neighbor_usrs:
-                    return ctx
-
-                # Resolve neighbor USRs to symbol rows — project definitions only
-                neighbors = _resolve_project_defs(
-                    conn, ctx.config_hash, neighbor_usrs, seed_set, self.MAX_NEIGHBORS
-                )
-        finally:
-            conn.close()
+        neighbors = ctx.executor.execute_sync(_query, ctx.config_hash)
 
         if not neighbors:
             return ctx

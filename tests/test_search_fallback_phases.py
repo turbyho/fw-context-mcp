@@ -36,7 +36,21 @@ from fw_context_mcp.search.shared_fallbacks import _symbol_row_to_dict
 # pass ctx.project_root.  Kept for safety — no harm mocking it either way.
 
 _ABS_PATH_MODULE = "fw_context_mcp.search.shared_fallbacks.abs_path"
-_OPEN_DB_MODULE = "fw_context_mcp.search.phases.search_fallbacks.open_db"
+
+
+class _FakeExecutor:
+    """Minimal executor stand-in for phase tests.
+
+    Phases no longer call ``open_db`` directly — they run queries through
+    ``ctx.executor.execute_sync(query_fn, config_hash)``.  This fake runs
+    the closure against the test's in-memory connection.
+    """
+
+    def execute_sync(self, query_fn, config_hash, *args):
+        return query_fn(_CURRENT_DB, config_hash, *args)
+
+
+_CURRENT_DB = None  # set by _phase_patches for the duration of a phase test
 
 
 def _mock_abs_path():
@@ -49,9 +63,14 @@ def _mock_abs_path():
 
 @contextmanager
 def _phase_patches(db: sqlite3.Connection):
-    """Context manager bundling open_db + abs_path patches for phase tests."""
-    with patch(_OPEN_DB_MODULE, return_value=db), _mock_abs_path():
-        yield
+    """Context manager providing the test DB connection + abs_path patch."""
+    global _CURRENT_DB
+    _CURRENT_DB = db
+    try:
+        with _mock_abs_path():
+            yield
+    finally:
+        _CURRENT_DB = None
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
@@ -68,6 +87,7 @@ def _make_ctx(**overrides) -> PipelineContext:
         "query": "modem init",
         "original_query": "modem init",
         "config": Config(),
+        "executor": _FakeExecutor(),
         "limit": 20,
     }
     defaults.update(overrides)

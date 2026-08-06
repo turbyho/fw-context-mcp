@@ -43,6 +43,9 @@ def _make_ctx(**overrides) -> PipelineContext:
         from fw_context_mcp.config.settings import Config
 
         defaults["config"] = Config()
+    if "executor" not in defaults:
+        # Most runner/registration tests never touch the DB
+        defaults["executor"] = MagicMock()
     return PipelineContext(**defaults)
 
 

@@ -31,10 +31,11 @@ from ..background import _is_bg_reindex_running
 from ..shared.context import (
     _db_path,
     _detect_build_system,
-    _invalidate_conn_cache,
     _is_stale,
-    _open_db_or_return,
+    _quick_open_readonly,
     _resolve_context,
+    get_executor,
+    invalidate_executor,
 )
 from ..shared.stale import _check_header_staleness, _count_modified_files
 
@@ -117,16 +118,22 @@ def get_active_build(
     # the reindex started.  Skipping the cache ensures accurate counts.
     bg_running = _is_bg_reindex_running(root)
 
-    conn, err_result = _open_db_or_return(db_path)
-    if err_result is not None:
-        return err_result[0]
-    assert conn is not None
-    with conn:
+    conn = _quick_open_readonly(db_path)
+    try:
         project_id = derive_project_id(root)
         cfg = get_active_config(conn, project_id)
         if not cfg:
             return {"error": f"No build config indexed for project at {root}."}
         config_hash = cfg["config_hash"]
+    finally:
+        conn.close()
+
+    executor = get_executor(db_path)
+
+    def _query(conn, config_hash):
+        # Runs under the executor lock on the single shared connection;
+        # must not open its own connection.  Timeout is enforced by
+        # _wrap_tool (300 s + interrupt), not here.
         sym_count = conn.execute("SELECT COUNT(*) FROM symbols WHERE config_hash=?", (config_hash,)).fetchone()[0]
         file_count = conn.execute("SELECT COUNT(*) FROM files WHERE config_hash=?", (config_hash,)).fetchone()[0]
         ref_count = count_refs(conn, config_hash)
@@ -306,6 +313,11 @@ def get_active_build(
         }
         if _warning is not None:
             result["_warning"] = _warning
+        return result
+
+    result = executor.execute_sync(_query, config_hash)
+    if "error" in result:
+        return result
     # Background reindex is managed by the startup daemon thread and the
     # file watcher — get_active_build() is a read-only tool and should
     # not spawn subprocesses.
@@ -418,14 +430,14 @@ def list_projects(
     results: list[dict] = []
     for db_path in sorted(db_files):
         try:
-            conn, err_result = _open_db_or_return(db_path)
-            if err_result is not None:
-                results.append(err_result[0])
-                continue
-            assert conn is not None
-            with conn:
-                rows = get_all_projects(conn)
-                db_schema_ver = get_db_schema_version(conn)
+            executor = get_executor(db_path)
+
+            def _query(conn, _config_hash):
+                # Runs under the executor lock on the single shared
+                # connection; must not open its own connection.
+                return get_all_projects(conn), get_db_schema_version(conn)
+
+            rows, db_schema_ver = executor.execute_sync(_query, "")
             for r in rows:
                 cc_stale = (
                     _is_stale(
@@ -534,11 +546,17 @@ def reset_index(
     from ..background import bg_reindex_pause
 
     with bg_reindex_pause(root):
+        # Mandatory ordering:
+        # 1. The dry-run connection above is already closed (finally block).
+        # 2. Invalidate the executor BEFORE deleting the DB file —
+        #    otherwise it keeps a connection to an unlinked file and
+        #    every subsequent query silently reads stale data forever.
+        # 3. Only then delete the files.
+        invalidate_executor(str(db_path.resolve()))
         db_path.unlink()
         for suffix in ("-wal", "-shm", "-journal"):
             p = db_path.with_name(db_path.name + suffix)
             p.unlink(missing_ok=True)
-        _invalidate_conn_cache(str(db_path.resolve()))
         from ...mcp.shared.stale import _invalidate_modified_cache
         _invalidate_modified_cache()  # clear all entries — DB is gone
         info["action"] = "deleted"
@@ -952,15 +970,25 @@ def reindex_file_impl(
     db_path, cfg, project_id, root = _resolve_context(project_root, skip_ready_check=True)
     if not db_path.exists():
         return {"error": f"No index found for {root}. Run 'fw-context index' first."}
-    conn, err_result = _open_db_or_return(db_path)
-    if err_result is not None:
-        return err_result[0]
-    assert conn is not None
+
+    # Config read via a short-lived read-only connection.
+    ro_conn = _quick_open_readonly(db_path)
     try:
-        cfg_data = get_active_config(conn, project_id)
+        cfg_data = get_active_config(ro_conn, project_id)
         if not cfg_data:
             return {"error": "No build config indexed."}
+        config_hash = cfg_data["config_hash"]
+    finally:
+        ro_conn.close()
 
+    executor = get_executor(db_path)
+
+    def _query(conn, config_hash):
+        # WRITE path: the executor is not read-only — writes are
+        # serialized with reads by the same lock.  A collision with a
+        # concurrently running CLI indexer is absorbed by the executor's
+        # 120 s busy_timeout (the CLI indexer keeps its own 10 s
+        # fail-fast).  Timeout is enforced by _wrap_tool, not here.
         target, error = _reindex_resolve_target(file_path, root)
         if error:
             return error
@@ -981,17 +1009,23 @@ def reindex_file_impl(
         if not with_analysis:
             return result
 
-        config_hash = cfg_data["config_hash"]
         return _reindex_post_write_phases(
             conn, config_hash, cfg, total_symbols, db_path.parent,
             target, matching, result, root,
         )
+
+    try:
+        return executor.execute_sync(_query, config_hash)
     finally:
-        try:
+        # Best-effort statistics refresh after the write.  Runs through
+        # the executor so it serializes with other queries.
+        def _optimize(conn, _ch):
             conn.execute("PRAGMA optimize")
+
+        try:
+            executor.execute_sync(_optimize, config_hash)
         except sqlite3.Error:
             pass
-        _invalidate_conn_cache(str(db_path.resolve()))
 
 
 def _reindex_resolve_target(

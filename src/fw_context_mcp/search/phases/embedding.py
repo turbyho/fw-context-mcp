@@ -16,7 +16,7 @@ import logging
 import sqlite3
 from typing import TYPE_CHECKING
 
-from fw_context_mcp.indexer.db import get_embeddings, open_db, search_similar_hybrid, search_similar_vec
+from fw_context_mcp.indexer.db import get_embeddings, search_similar_hybrid, search_similar_vec
 from fw_context_mcp.llm.embedder_factory import get_embedder
 from fw_context_mcp.llm.ollama import OllamaError
 from fw_context_mcp.search.phases.base import Phase
@@ -77,11 +77,10 @@ class EmbeddingPhase(Phase):
         brute-force BLOB search for legacy indexes.
         """
 
-        # imports at module level
-
-        conn = open_db(ctx.db_path)
-        try:
-            with conn:
+        def _query(conn, _config_hash):
+            # Runs under the executor lock on the single shared
+            # connection; the phase must not open its own connection.
+            # (Body indentation kept from the pre-executor version.)
                 # Check which embedding storage is available
                 has_vec0 = _table_exists(conn, "vec_symbols")
                 has_blob = _table_has_rows(conn, "embeddings")
@@ -200,7 +199,7 @@ class EmbeddingPhase(Phase):
                     ).fetchall()
                     emb_row_dicts = [dict(r) for r in emb_rows]
                     return ctx.evolve(embedding_results=emb_row_dicts, final_results=emb_row_dicts)
-        finally:
-            conn.close()
 
-        return ctx
+                return ctx
+
+        return ctx.executor.execute_sync(_query, ctx.config_hash)

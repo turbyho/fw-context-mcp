@@ -65,8 +65,6 @@ class RoughSearchPhase(Phase):
         back to FTS5 word-pair + single-word search. Extracts keyword
         terms from sample names for downstream FTS5 fallback use.
         """
-        from fw_context_mcp.indexer.db import open_db as _open_db
-
         query = ctx.query
         config_hash = ctx.config_hash
 
@@ -96,14 +94,16 @@ class RoughSearchPhase(Phase):
                 )
 
         # ── FTS5 fallback (original behaviour) ────────────────────────────
-        conn = _open_db(ctx.db_path)
-        try:
-            return ctx.evolve(
-                rough_queries=rough_terms,
-                rough_samples=_fts5_rough_samples(conn, query, content_words, config_hash),
-            )
-        finally:
-            conn.close()
+        def _query(conn, _config_hash):
+            # Runs under the executor lock on the single shared
+            # connection; the phase must not open its own connection.
+            return _fts5_rough_samples(conn, query, content_words, config_hash)
+
+        samples = ctx.executor.execute_sync(_query, config_hash)
+        return ctx.evolve(
+            rough_queries=rough_terms,
+            rough_samples=samples,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -114,13 +114,9 @@ class RoughSearchPhase(Phase):
 async def _try_embedding_samples(ctx) -> list[dict] | None:
     """Try embedding search for rough samples. Returns None on failure."""
     try:
-        # open_db imported at module level as _open_db
         from fw_context_mcp.indexer.db import (
             get_embeddings,
             search_similar_vec,
-        )
-        from fw_context_mcp.indexer.db import (
-            open_db as _open_db,
         )
         from fw_context_mcp.llm.embedder_factory import get_embedder
         from fw_context_mcp.llm.ollama import OllamaError
@@ -128,69 +124,71 @@ async def _try_embedding_samples(ctx) -> list[dict] | None:
         log.warning("Embedding rough search unavailable — import failed", exc_info=True)
         return None
 
-    conn = _open_db(ctx.db_path)
-    try:
-            has_vec0 = _table_exists(conn, "vec_symbols")
-            has_blob = _table_has_rows(conn, "embeddings")
+    def _query(conn, _config_hash):
+        # Runs under the executor lock on the single shared connection;
+        # the phase must not open its own connection.
+        has_vec0 = _table_exists(conn, "vec_symbols")
+        has_blob = _table_has_rows(conn, "embeddings")
 
-            if not has_vec0 and not has_blob:
-                return None
+        if not has_vec0 and not has_blob:
+            return None
 
-            try:
-                embedder = get_embedder(ctx.config.llm)
-                query_embs = embedder.embed_queries([ctx.query])
-                query_vec = query_embs[0]
-            except OllamaError:
-                return None
+        try:
+            embedder = get_embedder(ctx.config.llm)
+            query_embs = embedder.embed_queries([ctx.query])
+            query_vec = query_embs[0]
+        except OllamaError:
+            return None
 
-            threshold = 0.5  # Broad for rough sampling — later phases refine
+        threshold = 0.5  # Broad for rough sampling — later phases refine
 
-            if has_vec0:
-                rows = search_similar_vec(
-                    conn, query_vec, ctx.config_hash,
-                    threshold=threshold, limit=20,
-                )
-                if rows:
-                    sym_ids = [r["symbol_id"] for r in rows]
-                    placeholders = ",".join("?" * len(sym_ids))  # SAFE: values in params, not f-string
-                    sym_rows = conn.execute(
-                        f"""SELECT * FROM symbols
-                            WHERE config_hash = ? AND id IN ({placeholders})
-                            AND is_definition = 1""",
-                        (ctx.config_hash, *sym_ids),
-                    ).fetchall()
-                    if sym_rows:
-                        result = round_robin_by_kind(sym_rows, limit=20)
-                        return [dict(r) for r in result]
-                # vec0 had no matches for this config_hash — fall through to BLOB
-
-            # Legacy BLOB fallback
-            if has_blob:
-                stored = get_embeddings(conn, ctx.config_hash, ctx.config.llm.embed_key())
-                if not stored:
-                    return None
-                scored = brute_force_search(query_vec, stored, threshold=threshold)
-                top_ids = [s[0] for s in scored[:20]]
-                if not top_ids:
-                    return None
-                placeholders = ",".join("?" * len(top_ids))  # SAFE: values in params, not f-string
+        if has_vec0:
+            rows = search_similar_vec(
+                conn, query_vec, ctx.config_hash,
+                threshold=threshold, limit=20,
+            )
+            if rows:
+                sym_ids = [r["symbol_id"] for r in rows]
+                placeholders = ",".join("?" * len(sym_ids))  # SAFE: values in params, not f-string
                 sym_rows = conn.execute(
                     f"""SELECT * FROM symbols
                         WHERE config_hash = ? AND id IN ({placeholders})
-                        AND is_definition = 1
-                        LIMIT 20""",
-                    (ctx.config_hash, *top_ids),
+                        AND is_definition = 1""",
+                    (ctx.config_hash, *sym_ids),
                 ).fetchall()
                 if sym_rows:
-                    return [dict(r) for r in sym_rows]
-                return None
+                    result = round_robin_by_kind(sym_rows, limit=20)
+                    return [dict(r) for r in result]
+            # vec0 had no matches for this config_hash — fall through to BLOB
 
+        # Legacy BLOB fallback
+        if has_blob:
+            stored = get_embeddings(conn, ctx.config_hash, ctx.config.llm.embed_key())
+            if not stored:
+                return None
+            scored = brute_force_search(query_vec, stored, threshold=threshold)
+            top_ids = [s[0] for s in scored[:20]]
+            if not top_ids:
+                return None
+            placeholders = ",".join("?" * len(top_ids))  # SAFE: values in params, not f-string
+            sym_rows = conn.execute(
+                f"""SELECT * FROM symbols
+                    WHERE config_hash = ? AND id IN ({placeholders})
+                    AND is_definition = 1
+                    LIMIT 20""",
+                (ctx.config_hash, *top_ids),
+            ).fetchall()
+            if sym_rows:
+                return [dict(r) for r in sym_rows]
             return None
+
+        return None
+
+    try:
+        return ctx.executor.execute_sync(_query, ctx.config_hash)
     except (ValueError, TypeError, RuntimeError, AttributeError):
         log.warning("Embedding rough search failed", exc_info=True)
         return None
-    finally:
-        conn.close()
 
 
 

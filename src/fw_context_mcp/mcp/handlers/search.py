@@ -15,7 +15,7 @@ from ...config import load as load_config
 from ...indexer.db import _expand_query, get_active_config
 from ...llm._diag import check_setup
 from ...utils import abs_path, resolve_project_root
-from ..shared.context import _db_path, _is_stale, _open_db_or_return
+from ..shared.context import _db_path, _is_stale, _quick_open_readonly
 from ..shared.fallback import _fallback_to_search_code
 from ..shared.stale import _with_stale_recovery
 from ._lookup import lookup_symbol
@@ -67,19 +67,22 @@ def _with_search_context(root: Path, tool_name: str, do_search) -> list[dict]:
 def _append_staleness_warning(
     results: list[dict], db_path: Path, project_root: Path,
 ) -> list[dict]:
-    """Check compile_commands staleness and append warning if stale."""
-    # Connection stays in cache — managed by TTL eviction (same as _with_stale_recovery)
-    conn, err_result = _open_db_or_return(db_path)
-    if err_result is not None:
-        return err_result
-    assert conn is not None
-    with conn:
+    """Check compile_commands staleness and append warning if stale.
+
+    Reads the active config via a short-lived read-only connection — a
+    full ``open_db`` would pay an ``ensure_schema`` write transaction
+    for what is a two-field read.
+    """
+    conn = _quick_open_readonly(db_path)
+    try:
         cfg_data = get_active_config(conn, derive_project_id(project_root))
         if cfg_data and _is_stale(cfg_data, cfg_data["compile_commands_path"])[0]:
             results.append({
                 "warning": "Index may be stale — compile_commands.json changed since last index.",
                 "hint": "Call reindex_file() on modified files or run 'fw-context index' to update.",
             })
+    finally:
+        conn.close()
     return results
 
 

@@ -172,6 +172,7 @@ class TestGetFileMapFuzzyFallback:
         conn.close()
 
         from fw_context_mcp.mcp.handlers._base import BaseHandler, DbContext
+        from fw_context_mcp.mcp.shared.executor import SyncQueryExecutor
         from fw_context_mcp.mcp.handlers.source import get_file_map
 
         # Mock resolve_db_context to point to our tmp_path DB — bypasses
@@ -179,7 +180,7 @@ class TestGetFileMapFuzzyFallback:
         # resolve to a different path for this project_id.
         db_ctx = DbContext(
             db_path=db_path,
-            conn=open_db(db_path, skip_integrity_check=True),
+            executor=SyncQueryExecutor(str(db_path.resolve()), db_path),
             config_hash="hash-H3",
             project_id=project_id,
             root=tmp_path,

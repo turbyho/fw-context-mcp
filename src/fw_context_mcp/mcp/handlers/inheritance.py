@@ -165,10 +165,13 @@ def get_inheritance_chain(
         db = BaseHandler.resolve_db_context(project_root)
     except RuntimeError as e:
         return {"error": str(e)}
-    with db.conn:
-        config_hash = db.config_hash
-        root = db.root
-        row = _lookup_definition(db.conn, config_hash, class_name,
+    root = db.root
+
+    def _query(conn, config_hash):
+        # Runs under the executor lock on the single shared connection;
+        # must not open its own connection.  Timeout is enforced by
+        # _wrap_tool (300 s + interrupt), not here.
+        row = _lookup_definition(conn, config_hash, class_name,
                                  preferred_kinds=("class", "struct"))
         if not row:
             return {"error": f"Symbol not found: {class_name}"}
@@ -185,7 +188,7 @@ def get_inheritance_chain(
         }
 
         # ── Direct base classes (parents) ──
-        bases = get_direct_bases(db.conn, config_hash, usr)
+        bases = get_direct_bases(conn, config_hash, usr)
         result["bases"] = [
             {
                 "name": b.get("base_name") or "<unknown>",
@@ -198,7 +201,7 @@ def get_inheritance_chain(
         ]
 
         # ── Direct derived classes (children) ──
-        derived = get_direct_derived(db.conn, config_hash, usr)
+        derived = get_direct_derived(conn, config_hash, usr)
         result["derived"] = [
             {
                 "name": d.get("derived_name") or "<unknown>",
@@ -220,7 +223,7 @@ def get_inheritance_chain(
                 if b["base_usr"] not in visited_up
             ]
             result["all_bases"] = _bfs_inheritance_walk(
-                db.conn, config_hash, root,
+                conn, config_hash, root,
                 start_edges=start_up,
                 batch_fn=get_direct_bases_batch,
                 edge_usr_key="base_usr",
@@ -236,7 +239,7 @@ def get_inheritance_chain(
                 if d["derived_usr"] not in visited_down
             ]
             result["all_derived"] = _bfs_inheritance_walk(
-                db.conn, config_hash, root,
+                conn, config_hash, root,
                 start_edges=start_down,
                 batch_fn=get_direct_derived_batch,
                 edge_usr_key="derived_usr",
@@ -244,7 +247,9 @@ def get_inheritance_chain(
                 max_depth=max_depth,
             )
 
-    return result
+        return result
+
+    return db.executor.execute_sync(_query, db.config_hash)
 
 # ── moved from server.py ──
 def get_class_members(
@@ -279,10 +284,13 @@ def get_class_members(
         db = BaseHandler.resolve_db_context(project_root)
     except RuntimeError as e:
         return {"error": str(e)}
-    with db.conn:
-        config_hash = db.config_hash
-        root = db.root
-        row = _lookup_definition(db.conn, config_hash, class_name,
+    root = db.root
+
+    def _query(conn, config_hash):
+        # Runs under the executor lock on the single shared connection;
+        # must not open its own connection.  Timeout is enforced by
+        # _wrap_tool (300 s + interrupt), not here.
+        row = _lookup_definition(conn, config_hash, class_name,
                                  preferred_kinds=("class", "struct"))
         if not row:
             return {"error": f"Symbol not found: {class_name}"}
@@ -299,7 +307,7 @@ def get_class_members(
         }
 
         # ── Members grouped by kind ──
-        members = query_class_members(db.conn, config_hash, usr)
+        members = query_class_members(conn, config_hash, usr)
         grouped: dict[str, list[dict]] = {}
         for m in members:
             k = m["kind"]
@@ -317,6 +325,8 @@ def get_class_members(
         result["member_count"] = len(members)
 
         return result
+
+    return db.executor.execute_sync(_query, db.config_hash)
 
 # ── moved from server.py ──
 def get_template_instances(
@@ -359,10 +369,13 @@ def get_template_instances(
         db = BaseHandler.resolve_db_context(project_root)
     except RuntimeError as e:
         return [{"error": str(e)}]
-    with db.conn:
-        config_hash = db.config_hash
-        root = db.root
-        row = _lookup_definition(db.conn, config_hash, template_name,
+    root = db.root
+
+    def _query(conn, config_hash):
+        # Runs under the executor lock on the single shared connection;
+        # must not open its own connection.  Timeout is enforced by
+        # _wrap_tool (300 s + interrupt), not here.
+        row = _lookup_definition(conn, config_hash, template_name,
                                  preferred_kinds=None)
         if not row:
             return [{"error": f"Symbol not found: {template_name}"}]
@@ -370,7 +383,7 @@ def get_template_instances(
             return [{"error": f"'{template_name}' is not a template (kind: {row['kind']}, is_template: false)."}]
 
         template_usr = row["usr"]
-        instances = query_template_instances(db.conn, config_hash, template_usr, limit=limit)
+        instances = query_template_instances(conn, config_hash, template_usr, limit=limit)
 
         result: list[dict] = [
             {
@@ -397,6 +410,8 @@ def get_template_instances(
             }
         ]
         return result
+
+    return db.executor.execute_sync(_query, db.config_hash)
 
 # ── moved from server.py ──
 def get_method_overrides(
@@ -436,10 +451,13 @@ def get_method_overrides(
         db = BaseHandler.resolve_db_context(project_root)
     except RuntimeError as e:
         return {"error": str(e)}
-    with db.conn:
-        config_hash = db.config_hash
-        root = db.root
-        row = _lookup_definition(db.conn, config_hash, method_name,
+    root = db.root
+
+    def _query(conn, config_hash):
+        # Runs under the executor lock on the single shared connection;
+        # must not open its own connection.  Timeout is enforced by
+        # _wrap_tool (300 s + interrupt), not here.
+        row = _lookup_definition(conn, config_hash, method_name,
                                  preferred_kinds=("method", "destructor"))
         if not row:
             return {"error": f"Symbol not found: {method_name}"}
@@ -455,7 +473,7 @@ def get_method_overrides(
             "signature": row["signature"],
         }
 
-        ov = get_overrides_for_method(db.conn, config_hash, row["usr"])
+        ov = get_overrides_for_method(conn, config_hash, row["usr"])
         result["overrides"] = [
             {
                 "usr": o["base_usr"],
@@ -478,5 +496,7 @@ def get_method_overrides(
             }
             for o in ov["overridden_by"]
         ]
-    return result
+        return result
+
+    return db.executor.execute_sync(_query, db.config_hash)
 

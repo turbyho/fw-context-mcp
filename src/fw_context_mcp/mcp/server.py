@@ -29,6 +29,7 @@ import asyncio
 import functools
 import inspect
 import logging
+import os
 import sqlite3
 import sys
 import time
@@ -45,32 +46,77 @@ from .shared.context import _check_server_ready, _integrity_checked
 log = logging.getLogger(__name__)
 
 
+def _wrap_debug(msg: str) -> None:
+    """Write to /tmp/fw-context-debug.log when FW_CONTEXT_DEBUG_WRAP=1."""
+    if os.environ.get("FW_CONTEXT_DEBUG_WRAP") != "1":
+        return
+    try:
+        with open("/tmp/fw-context-debug.log", "a") as f:
+            f.write(f"{msg}\n")
+    except OSError:
+        pass
+
+
 def _wrap_tool(fn):
     """Wrap a tool handler: error boundary + async dispatch + MCP progress.
 
     Sync handlers are dispatched to a background thread via
     ``asyncio.to_thread``.  The event loop sends MCP progress
     notifications every 5 s to keep the client alive during long-running
-    queries (BFS call-graph traversal, etc.).
+    queries (BFS call-graph traversal, etc.).  The 5 s interval is
+    deliberate: some clients (e.g. OpenCode) kill the connection after
+    ~15 s without progress, so notifications at t=0/5/10 s provide
+    coverage — do NOT lengthen the interval.
 
     All handlers get an error boundary — no unhandled exception can crash
     the server process.
     """
     if inspect.iscoroutinefunction(fn):
-        @functools.wraps(fn)
-        async def _wrapper(*a, **kw):
-            try:
-                return await fn(*a, **kw)
-            except BrokenPipeError:
-                sys.exit(0)
-            except Exception as exc:
+        # Manual wrap: copy __name__/__doc__/__module__/__qualname__ but NOT
+        # __annotations__ — functools.wraps would overwrite the wrapper's
+        # annotations (which include ctx) with fn's annotations (which
+        # don't), causing find_context_parameter to miss ctx.
+        @functools.wraps(fn, assigned=("__module__", "__name__", "__qualname__", "__doc__"))
+        async def _wrapper(*a, ctx: MCPContext | None = None, **kw):
+            start = time.monotonic()
+            _wrap_debug(f"[async] {fn.__name__} ctx={'P' if ctx is not None else 'N'} ann={list(_wrapper.__annotations__.keys())}")
+            task = asyncio.ensure_future(fn(*a, **kw))
+
+            while not task.done():
+                done, pending = await asyncio.wait([task], timeout=5.0)
+                if task in done:
+                    break
+                elapsed = int(time.monotonic() - start)
+                _wrap_debug(f"[async-loop] {fn.__name__} t={elapsed}s task_done={task.done()}")
+                if ctx is not None:
+                    try:
+                        await ctx.info(f"{fn.__name__}: {elapsed}s")
+                        _wrap_debug(f"[async-loop] {fn.__name__} ctx.info() OK at {elapsed}s")
+                    except Exception as e:
+                        _wrap_debug(f"[async-loop] {fn.__name__} ctx.info() FAIL: {e}")
+                if elapsed > 300:
+                    task.cancel()
+                    try:
+                        from .shared.context import interrupt_all
+
+                        interrupt_all()
+                    except Exception:
+                        pass
+                    return [{"error": f"Tool {fn.__name__} timed out after {elapsed}s"}]
+
+            exception = task.exception()
+            if exception is not None:
+                if isinstance(exception, BrokenPipeError):
+                    sys.exit(0)
                 log.exception("Tool %s crashed", fn.__name__)
-                return [{"error": f"Internal server error in {fn.__name__}: {exc}"}]
+                return [{"error": f"Internal server error in {fn.__name__}: {exception}"}]
+            return task.result()
         return _wrapper
 
-    @functools.wraps(fn)
+    @functools.wraps(fn, assigned=("__module__", "__name__", "__qualname__", "__doc__"))
     async def _wrapper(*a, ctx: MCPContext | None = None, **kw):
         start = time.monotonic()
+        _wrap_debug(f"[sync] {fn.__name__} ctx={'P' if ctx is not None else 'N'} ann={list(_wrapper.__annotations__.keys())}")
         task = asyncio.ensure_future(
             asyncio.to_thread(functools.partial(fn, *a, **kw))
         )
@@ -80,16 +126,31 @@ def _wrap_tool(fn):
             if task in done:
                 break
             elapsed = int(time.monotonic() - start)
+            _wrap_debug(f"[sync-loop] {fn.__name__} t={elapsed}s task_done={task.done()}")
             if ctx is not None:
                 try:
-                    await ctx.report_progress(
-                        elapsed, None,
-                        f"Working on {fn.__name__}... ({elapsed}s)",
-                    )
-                except Exception:
-                    pass
+                    await ctx.info(f"{fn.__name__}: {elapsed}s")
+                    _wrap_debug(f"[sync-loop] {fn.__name__} ctx.info() OK at {elapsed}s")
+                except Exception as e:
+                    _wrap_debug(f"[sync-loop] {fn.__name__} ctx.info() FAIL: {e}")
             if elapsed > 300:
                 task.cancel()
+                # task.cancel() does NOT kill the asyncio.to_thread
+                # worker thread — without this, a cancelled query keeps
+                # running as a zombie thread holding the executor lock.
+                # interrupt_all() makes the query raise
+                # OperationalError('interrupted') instead.  Imported via
+                # shared.context (layer rule — server code must not touch
+                # the private _executors registry).  May also interrupt
+                # another call's query on the shared connection
+                # (per-connection interrupt cannot be targeted) —
+                # accepted in this pathological 300 s path only.
+                try:
+                    from .shared.context import interrupt_all
+
+                    interrupt_all()
+                except Exception:
+                    pass
                 return [{"error": f"Tool {fn.__name__} timed out after {elapsed}s"}]
 
         exception = task.exception()
@@ -122,7 +183,8 @@ mcp = FastMCP(
 
 
 # ── Re-exported from .shared.context ──────────────────────────────────────────
-# _db_path, _resolve_context, _open_db_safe, _is_stale — see mcp/shared/context.py
+# _db_path, _resolve_context, _quick_open_readonly, _is_stale, get_executor,
+# invalidate_executor, interrupt_all — see mcp/shared/context.py
 
 
 # _stale_files, _count_modified_files — re-exported from .shared.stale

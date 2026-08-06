@@ -8,7 +8,7 @@ from pathlib import Path
 from ...config import derive_project_id
 from ...indexer.db import get_active_config
 from ...utils import abs_path
-from .context import _is_stale, _open_db_or_return
+from .context import _is_stale, _quick_open_readonly, get_executor
 from .stale import _stale_files
 
 
@@ -21,28 +21,42 @@ def _fallback_to_search_code(
 ) -> list[dict]:
     """Fall back to lexical search when Ollama/embeddings are unavailable.
 
-    Uses the same DB-safe open path as regular tools so migrations and
-    integrity checks run.  Adds a stale warning when the index is out of date.
+    Runs on the shared executor connection (same as regular tools) and
+    adds a stale warning when the index is out of date.  ``config_hash``
+    is read fresh per request via a short-lived read-only connection.
     """
-    conn, err_result = _open_db_or_return(db_path)
-    if err_result is not None:
-        return err_result
-    assert conn is not None
-    # connection managed by connection.py cache
-    with conn:
+    try:
+        conn = _quick_open_readonly(db_path)
+    except sqlite3.Error as e:
+        # Read-only open does not create a missing file — report instead
+        # of crashing (callers may pass a path whose index was deleted).
+        return [{"error": f"Cannot open index database {db_path}: {e}. Run 'fw-context index' first."}]
+    try:
         project_id = derive_project_id(root)
         cfg = get_active_config(conn, project_id)
         if not cfg:
             return [{"error": "No build config indexed."}]
         config_hash = cfg["config_hash"]
-        results = _fallback_to_search_code_inner(
-            conn, root, query, config_hash, limit, warning
-        )
-        # Collect file paths for staleness check before closing
-        result_files = [abs_path(root, r["file"]) for r in results if "file" in r]
-        stale_f = _stale_files(conn, config_hash, result_files, root)
-        is_stale, _ = _is_stale(cfg, cfg["compile_commands_path"])
+        compile_commands_path = cfg["compile_commands_path"]
+    finally:
+        conn.close()
 
+    executor = get_executor(db_path)
+
+    def _query(db_conn, cfg_hash):
+        # Runs under the executor lock on the single shared connection;
+        # must not open its own connection.  Timeout is enforced by
+        # _wrap_tool (300 s + interrupt), not here.
+        results = _fallback_to_search_code_inner(
+            db_conn, root, query, cfg_hash, limit, warning
+        )
+        result_files = [abs_path(root, r["file"]) for r in results if "file" in r]
+        stale_f = _stale_files(db_conn, cfg_hash, result_files, root)
+        return results, stale_f
+
+    results, stale_f = executor.execute_sync(_query, config_hash)
+
+    is_stale, _ = _is_stale(cfg, compile_commands_path)
     if is_stale:
         results.insert(0, {
             "warning": "Index may be stale — compile_commands.json changed. Run 'fw-context index' to update.",

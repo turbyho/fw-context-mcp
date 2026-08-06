@@ -1,12 +1,10 @@
 # Configuration
 
-Complete reference for `.fw-context/config.toml` and `.fw-context/local.toml` —
-global defaults, shared project settings, local developer overrides, and every
-available setting.
+This document is the complete reference for `.fw-context/config.toml` and `.fw-context/local.toml`. This document lists the global defaults, the shared project settings, the local developer overrides, and every available setting.
 
 ## How config works
 
-Three levels of TOML files, merged in order (later overrides earlier):
+fw-context merges three levels of TOML files, in this order. A later file overrides an earlier file.
 
 ```
 ~/.fw-context/config.toml                global defaults (apply to all projects)
@@ -19,91 +17,80 @@ Three levels of TOML files, merged in order (later overrides earlier):
     final Config used by fw-context
 ```
 
-**Why two project files?** `config.toml` holds settings that are the same for
-everyone on the project — build parameters, source roots, excludes. Commit it
-to git. `local.toml` holds developer-specific settings — which Ollama model you
-have installed, where your index database lives, whether you want LLM analysis
-enabled. Keep it out of git.
+**Why two project files?** `config.toml` holds settings that are the same for every developer on the project. Examples are build parameters, source roots, and excludes. Commit `config.toml` to git.
 
-Run ``fw-context init`` to auto-create the config files and add the
-necessary entries to ``.gitignore``. All files are created with commented-out
-defaults on first use.
+`local.toml` holds settings that are specific to each developer. Examples are which Ollama model you have installed, where your index database is, and whether you want LLM analysis enabled. Keep `local.toml` out of git.
+
+Run `fw-context init` to create the config files automatically. This command also adds the necessary entries to `.gitignore`. On first use, fw-context creates all files with commented-out default values.
 
 ## Settings reference
 
 ### `[build]` — Build system
 
-Controls how `fw-context index` generates `compile_commands.json`.
-Used only when running with ``--build`` or when ``compile_commands.json``
-doesn't exist yet.
+This section controls how `fw-context index` generates `compile_commands.json`. fw-context uses this section only when you run `fw-context index --build`, or when `compile_commands.json` does not yet exist.
 
-> **Incremental is the default.**  ``fw-context index`` reuses an existing
-> ``compile_commands.json`` whenever possible.  Use ``fw-context index --build``
-> to force a clean build and full re-index when needed.
+> **Incremental is the default.** `fw-context index` reuses an existing `compile_commands.json` file whenever possible. Use `fw-context index --build` to force a clean build. A clean build also forces a full re-index.
 
 | Key | Default | Scope | Description |
 |-----|---------|-------|-------------|
-| `system` | *(auto-detect)* | project | Build system: `"mbed-os"`, `"zephyr"`, `"platformio"`. Auto-detected from project markers (`west.yml`, `.mbed`, `platformio.ini`, etc.) |
-| `clean` | `true` | project | Always do a clean build before generating. **Recommended** — ensures complete `compile_commands.json`. Set `false` or use `--no-clean` for incremental builds. Note: a clean build forces a full re-index. |
-| `command` | *(none)* | project | Full build command override. Bypasses all auto-detection. Example: `"bear -- make -j4"`. |
-| `python` | *(auto-detect)* | local | Python interpreter for pip-based build tools (`mbed-cli`, `platformio`, `keil2clangd`, `compiledb`). Auto-detected by `fw-context init`. Set manually when auto-detection fails. |
-| `activate` | *(auto-detect)* | local | Shell script sourced before build (Zephyr/NCS toolchain, ESP-IDF export.sh). Auto-detected by `fw-context init`. Set manually when auto-detection fails. |
-| `target` | *(auto-detect)* | project | Mbed OS target board. Auto-detected from `.mbed` or `custom_targets.json`. |
-| `toolchain` | *(auto-detect)* | project | Mbed OS toolchain. Auto-detected from `.mbed`. |
-| `profile` | `"develop"` | project | Mbed OS build profile. `develop` is best for indexing (includes `-g` debug symbols). |
-| `app_config` | `"mbed_app.json"` | project | Mbed OS app configuration file. |
-| `extra_profiles` | `["lto.json"]` | project | Additional Mbed OS profiles (resolved relative to `mbed-os/tools/profiles/extensions/`). |
-| `defines` | `[]` | project | Extra preprocessor macros passed to the compiler (`-D` flags). Example: `["VERSION_FW_MAJOR=4", "DEV"]`. Useful for conditional code paths — ensures `#ifdef DEV` branches are indexed. |
-| `board` | *(required)* | project | Zephyr board name. Must be set explicitly for Zephyr projects. |
+| `system` | *(auto-detect)* | project | The build system: `"mbed-os"`, `"zephyr"`, or `"platformio"`. fw-context detects this automatically from project markers, such as `west.yml`, `.mbed`, or `platformio.ini`. |
+| `clean` | `true` | project | Always run a clean build before fw-context generates `compile_commands.json`. **Recommended.** A clean build ensures a complete `compile_commands.json` file. Set this key to `false`, or use `--no-clean`, for incremental builds. Note: a clean build always forces a full re-index. |
+| `command` | *(none)* | project | A full override for the build command. This key bypasses all automatic detection. Example: `"bear -- make -j4"`. |
+| `python` | *(auto-detect)* | local | The Python interpreter for pip-based build tools, such as `mbed-cli`, `platformio`, `keil2clangd`, or `compiledb`. `fw-context init` detects this automatically. Set this key manually when automatic detection fails. |
+| `activate` | *(auto-detect)* | local | A shell script that fw-context sources before the build, for example the Zephyr/NCS toolchain script or the ESP-IDF `export.sh` script. `fw-context init` detects this automatically. Set this key manually when automatic detection fails. |
+| `target` | *(auto-detect)* | project | The Mbed OS target board. fw-context detects this automatically from `.mbed` or `custom_targets.json`. |
+| `toolchain` | *(auto-detect)* | project | The Mbed OS toolchain. fw-context detects this automatically from `.mbed`. |
+| `profile` | `"develop"` | project | The Mbed OS build profile. The `develop` profile works best for indexing, because it includes `-g` debug symbols. |
+| `app_config` | `"mbed_app.json"` | project | The Mbed OS application configuration file. |
+| `extra_profiles` | `["lto.json"]` | project | Additional Mbed OS profiles. fw-context resolves these paths relative to `mbed-os/tools/profiles/extensions/`. |
+| `defines` | `[]` | project | Extra preprocessor macros that fw-context passes to the compiler as `-D` flags. Example: `["VERSION_FW_MAJOR=4", "DEV"]`. This key is useful for conditional code paths, because it makes fw-context index `#ifdef DEV` branches too. |
+| `board` | *(required)* | project | The Zephyr board name. You must set this key explicitly for Zephyr projects. |
 
 ### `[index]` — Indexer
 
 | Key | Default | Scope | Description |
 |-----|---------|-------|-------------|
-| `db_dir` | `"~/.fw-context/index"` | global, local | Directory for SQLite index databases. One subdirectory per project. |
-| `compile_commands` | `"compile_commands.json"` | project | Path to compilation database. Relative paths resolved from project root. |
-| `vendor_paths` | `[]` | project | Additional vendor/SDK directory patterns (additive to auto-detection). Paths matching these get `is_project=0`. E.g. `["third_party", "generated"]`. |
-| `project_paths` | `[]` | project | Manual project directory patterns — overrides auto-detection. Paths matching these get `is_project=1`. Useful for vendored code your team maintains (e.g. `["src/old_hal"]`). For paths outside the project root, use absolute paths (e.g. `["/home/user/esp/components/muj_fork"]`). |
-| `index_refs` | `true` | project | Build cross-reference / call graph. On by default — enables `find_callers`, `find_call_path`, `find_dead_code`, etc. Set `false` or pass `--no-refs` for faster indexing on very large projects. |
-| `index_embeddings` | `true` | project | Generate vector embeddings during indexing. Requires Ollama. Embeddings power semantic search and hybrid FTS5+vector re-ranking. Disable with `false` or `--no-embeddings`. |
+| `db_dir` | `"~/.fw-context/index"` | global, local | The directory for SQLite index databases. fw-context creates one subdirectory for each project. |
+| `compile_commands` | `"compile_commands.json"` | project | The path to the compilation database. fw-context resolves relative paths from the project root. |
+| `vendor_paths` | `[]` | project | Additional vendor or SDK directory patterns. fw-context adds these patterns to its automatic detection. A path that matches one of these patterns gets `is_project=0`. Example: `["third_party", "generated"]`. |
+| `project_paths` | `[]` | project | Manual project directory patterns. These patterns override automatic detection. A path that matches one of these patterns gets `is_project=1`. Use this key for vendored code that your team maintains, for example `["src/old_hal"]`. For a path outside the project root, use an absolute path, for example `["/home/user/esp/components/muj_fork"]`. |
+| `index_refs` | `true` | project | Build the cross-reference and call graph data. This key is on by default, and it enables tools such as `find_callers`, `find_call_path`, and `find_dead_code`. Set this key to `false`, or pass `--no-refs`, for faster indexing on very large projects. |
+| `index_embeddings` | `true` | project | Generate vector embeddings during indexing. This key requires Ollama. The embeddings power semantic search and hybrid FTS5+vector re-ranking. Disable this key with `false`, or with `--no-embeddings`. |
 
 ### `[llm]` — Ollama
 
-These settings belong in `~/.fw-context/config.toml` (global defaults) or
-`<project>/.fw-context/local.toml` (per-project overrides). They should NOT
-go in the shared `config.toml` — LLM configuration is developer-specific.
+Put these settings in `~/.fw-context/config.toml` for global defaults, or in `<project>/.fw-context/local.toml` for per-project overrides. Do not put these settings in the shared `config.toml` file. LLM configuration is specific to each developer.
 
 | Key | Default | Scope | Description |
 |-----|---------|-------|-------------|
-| `enabled` | `true` | global, local | Enable Ollama. When `false`, `smart_search` falls back to word-split FTS5, `explain_symbol` returns source + prompt for the AI assistant. |
-| `ollama_url` | `"http://localhost:11434"` | global, local | Ollama API base URL. Change for remote GPU servers. |
-| `model` | `"qwen2.5-coder:14b"` | global, local | LLM model tag. Override per-project for different codebases. |
-| `embed_model` | `"mxbai-embed-large:latest"` | global, local | Embedding model for vector search. Auto-pulled on first use. ``mxbai-embed-large`` runs on CPU; for GPU, use ``qwen3-embedding:8b`` (~4.7 GB VRAM, 4096-dim vectors). |
-| `embed_query_prompt` | *(auto-detect)* | global, local | Instruction prepended to query text before embedding. Auto-detected from model prefix: ``mxbai-*`` → ``"Represent this sentence for searching relevant passages: "``, ``qwen3-embedding*`` → code retrieval instruction. Set explicitly to override, or ``""`` to disable. |
-| `embed_doc_prompt` | *(empty)* | global, local | Instruction prepended to symbol descriptions during indexing. Most models work best with an empty prompt — only set when the model's training expects a per-document instruction. |
-| `num_ctx` | `16384` | global, local | Context window in tokens. Accommodates full function bodies during analysis generation. |
-| `keep_alive` | `"10m"` | global, local | How long to keep the model loaded in VRAM after a request (minutes, seconds, or ``-1`` for indefinite). During indexing, prevents per-request model loading (~2–5 s each). |
-| `timeout` | `600.0` | global, local | HTTP request timeout in seconds for Ollama API calls. Embed requests use ``timeout × 2``. |
-| `analyze_symbols` | `true` | global, local | Generate per-symbol LLM analysis (summary, inputs, outputs) during indexing. Stored in `llm_analysis` table — symbols become searchable by purpose. |
-| `debug_log` | *(none)* | global, local | Path to JSONL debug log for Ollama prompts + responses. Example: `"~/.fw-context/llm-debug.jsonl"`. |
+| `enabled` | `true` | global, local | Enable Ollama. When this key is `false`, `smart_search` falls back to word-split FTS5. Also, `explain_symbol` returns the source code and a prompt for the AI assistant. |
+| `ollama_url` | `"http://localhost:11434"` | global, local | The base URL for the Ollama API. Change this key for a remote GPU server. |
+| `model` | `"qwen2.5-coder:14b"` | global, local | The LLM model tag. Override this key for each project, to use a different model for different codebases. |
+| `embed_model` | `"mxbai-embed-large:latest"` | global, local | The embedding model for vector search. fw-context pulls this model automatically on first use. `mxbai-embed-large` runs on a CPU. For a GPU, use `qwen3-embedding:8b`, which needs about 4.7 GB of VRAM and creates 4096-dimension vectors. |
+| `embed_query_prompt` | *(auto-detect)* | global, local | An instruction that fw-context adds before the query text, before it creates the embedding. fw-context detects this instruction automatically from the model name prefix: for `mxbai-*`, fw-context uses `"Represent this sentence for searching relevant passages: "`; for `qwen3-embedding*`, fw-context uses a code-retrieval instruction. Set this key explicitly to override the default, or set it to `""` to disable it. |
+| `embed_doc_prompt` | *(empty)* | global, local | An instruction that fw-context adds before symbol descriptions during indexing. Most models work best with an empty prompt. Set this key only when the model's training expects a per-document instruction. |
+| `num_ctx` | `16384` | global, local | The context window, in tokens. This size allows full function bodies during analysis generation. |
+| `keep_alive` | `"10m"` | global, local | How long fw-context keeps the model loaded in VRAM after a request. Use minutes, seconds, or `-1` for an indefinite time. During indexing, this setting prevents model loading before each request, which takes about 2 to 5 seconds each time. |
+| `timeout` | `600.0` | global, local | The HTTP request timeout, in seconds, for Ollama API calls. Embed requests use `timeout × 2`. |
+| `analyze_symbols` | `true` | global, local | Generate an LLM analysis for each symbol during indexing. This analysis includes a summary, the inputs, and the outputs. fw-context stores this analysis in the `llm_analysis` table, so you can search for symbols by purpose. |
+| `debug_log` | *(none)* | global, local | The path to a JSONL debug log for Ollama prompts and responses. Example: `"~/.fw-context/llm-debug.jsonl"`. |
 
 ### `[project]` — Metadata
 
 | Key | Default | Scope | Description |
 |-----|---------|-------|-------------|
-| `name` | *(directory name)* | project | Human-readable project name shown in `fw-context list` and status output. |
+| `name` | *(directory name)* | project | A readable project name. fw-context shows this name in `fw-context list` and in status output. |
 
 ### `[cache_server]` — Shared LLM Analysis Cache
 
-Configure a remote cache server for sharing `llm_analysis` across developers.
-**Optional** — without this section, analysis stays local.
+Configure a remote cache server, to share `llm_analysis` data across developers. **Optional.** Without this section, the analysis stays local.
 
 | Key | Default | Scope | Description |
 |-----|---------|-------|-------------|
-| `url` | *(none)* | global, local | Cache server URL. Example: `"https://fw-cache.example.com"`. |
-| `token` | *(none)* | global, local | Bearer token with `can_read` + `can_write` permissions. Created via `fw-cache-admin token create`. |
-| `batch_size` | `100` | global, local | Max hashes/entries per HTTP request. |
-| `force` | `false` | global, local | When `true`, sends `X-Cache-Overwrite` header — overwrites existing entries. Requires `can_overwrite` token. |
+| `url` | *(none)* | global, local | The cache server URL. Example: `"https://fw-cache.example.com"`. |
+| `token` | *(none)* | global, local | A bearer token with `can_read` and `can_write` permissions. Create this token with the `fw-cache-admin token create` command. |
+| `batch_size` | `100` | global, local | The maximum number of hashes or entries in each HTTP request. |
+| `force` | `false` | global, local | When this key is `true`, fw-context sends the `X-Cache-Overwrite` header, and overwrites existing entries. This key requires a `can_overwrite` token. |
 
 ```toml
 [cache_server]
@@ -113,7 +100,7 @@ token = "<your-token>"
 # force = false
 ```
 
-See **[Cache Server →](cache-server.md)** for setup, deployment, and management.
+For setup, deployment, and management instructions, see **[Cache Server →](cache-server.md)**.
 
 ## Examples
 
@@ -133,7 +120,7 @@ num_ctx = 16384
 
 ### Shared project config (`<project>/.fw-context/config.toml`)
 
-Commit this file to git. It contains settings that are the same for all developers.
+Commit this file to git. This file contains settings that are the same for every developer.
 
 #### Zephyr
 
@@ -191,8 +178,7 @@ compile_commands = "compile_commands.json"
 
 ### Local developer config (`<project>/.fw-context/local.toml`)
 
-Keep this file out of git (add to `.gitignore`). It overrides settings from
-`config.toml` and the global config — use it for developer-specific preferences.
+Keep this file out of git. Add it to `.gitignore`. This file overrides settings from `config.toml` and from the global config. Use this file for preferences that are specific to each developer.
 
 ```toml
 # ── Build environment (auto-detected by fw-context init) ──
@@ -218,15 +204,13 @@ Keep this file out of git (add to `.gitignore`). It overrides settings from
 
 ## Project vs vendor code detection
 
-Every indexed file gets an ``is_project`` flag during indexing, computed from
-path patterns in this priority order (first match wins):
+During indexing, fw-context gives every indexed file an `is_project` flag. fw-context computes this flag from path patterns, in this priority order. The first match wins:
 
-1. **``project_paths`` config** → ``is_project=1`` (user says "this is project code")
-2. **Outside project root** → ``is_project=0`` (external SDK, toolchain, system headers)
-3. **``vendor_paths`` config + auto-detection** → ``is_project=0`` (SDK/vendor code)
-4. **Everything else** → ``is_project=1`` (project code)
+1. **`project_paths` config** → `is_project=1` (user says "this is project code")
+2. **Outside project root** → `is_project=0` (external SDK, toolchain, system headers)
+3. **`vendor_paths` config + auto-detection** → `is_project=0` (SDK/vendor code)
+4. **Everything else** → `is_project=1` (project code)
 
-Query-time ``project_only`` filtering uses this column directly
-(``WHERE is_project = 1``), so it always respects your config.
+At query time, `project_only` filtering uses this column directly, with `WHERE is_project = 1`. This filtering always follows your configuration.
 
-See ``vendor_paths`` and ``project_paths`` in the ``[index]`` section above.
+For more information, see `vendor_paths` and `project_paths` in the `[index]` section above.

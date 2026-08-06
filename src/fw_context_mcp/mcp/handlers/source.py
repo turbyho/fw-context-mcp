@@ -261,10 +261,12 @@ async def explain_symbol(
     except RuntimeError as e:
         return {"error": str(e)}
     cfg = db.cfg
-    conn = db.conn
-    config_hash = db.config_hash
     root = db.root
-    with conn:
+
+    def _query(conn, config_hash):
+        # Runs under the executor lock on the single shared connection;
+        # must not open its own connection.  Timeout is enforced by
+        # _wrap_tool (300 s + interrupt), not here.
         row = _lookup_definition(conn, config_hash, name, prefer_project=True)
         if not row:
             # Macro fallback
@@ -278,13 +280,17 @@ async def explain_symbol(
             _Path(file_path).resolve().relative_to(root.resolve())
         except ValueError:
             return {"error": f"Path {file_path} outside project root"}
-        line_no = row["line"]
-        signature = row["signature"] or ""
-        kind = row["kind"]
-        symbol_id = row["id"]
-
         # Check for pre-computed LLM analysis (instant, no Ollama call)
-        llm_analysis = get_llm_analysis_for_symbol(conn, symbol_id)
+        llm_analysis = get_llm_analysis_for_symbol(conn, row["id"])
+        return row, file_path, llm_analysis
+
+    query_result = db.executor.execute_sync(_query, db.config_hash)
+    if isinstance(query_result, dict):
+        return query_result
+    row, file_path, llm_analysis = query_result
+    line_no = row["line"]
+    signature = row["signature"] or ""
+    kind = row["kind"]
 
     result: dict = {
         "name": name,
@@ -394,10 +400,12 @@ def get_source(
         db = BaseHandler.resolve_db_context(project_root)
     except RuntimeError as e:
         return {"error": str(e)}
-    conn = db.conn
-    config_hash = db.config_hash
     root = db.root
-    with conn:
+
+    def _query(conn, config_hash):
+        # Runs under the executor lock on the single shared connection;
+        # must not open its own connection.  Timeout is enforced by
+        # _wrap_tool (300 s + interrupt), not here.
         row = _lookup_definition(conn, config_hash, name, prefer_project=True)
         if not row:
             # Macro fallback
@@ -449,8 +457,13 @@ def get_source(
                     }
                     for c in const_rows
                 ]
-        end_line = row["end_line"] or 0
-        line_no = row["line"]
+        return result, file_path, row["line"], row["end_line"] or 0
+
+    query_result = db.executor.execute_sync(_query, db.config_hash)
+    if isinstance(query_result, dict):
+        # Early-return path from the closure: macro fallback or error dict.
+        return query_result
+    result, file_path, line_no, end_line = query_result
     source = _read_symbol_body(file_path, line_no, end_line=end_line)
     if not source:
         result["warning"] = f"Could not read source from {file_path}"
@@ -504,10 +517,12 @@ def get_file_map(
         db = BaseHandler.resolve_db_context(project_root)
     except RuntimeError as e:
         return {"error": str(e)}
-    conn = db.conn
-    config_hash = db.config_hash
     root = db.root
-    with conn:
+
+    def _query(conn, config_hash):
+        # Runs under the executor lock on the single shared connection;
+        # must not open its own connection.  Timeout is enforced by
+        # _wrap_tool (300 s + interrupt), not here.
         # Resolve file_path: try exact match first, then suffix
         exact = conn.execute(
             "SELECT COUNT(*) FROM symbols WHERE config_hash=? AND file_path=?",
@@ -529,11 +544,12 @@ def get_file_map(
         err = _validate_path_in_root(resolved, root)
         if err:
             return {"error": err}
-        result = index_db.get_file_map(
+        return index_db.get_file_map(
             conn, config_hash, resolved,
             signatures=signatures, max_per_kind=max_per_kind,
         )
-    return result
+
+    return db.executor.execute_sync(_query, db.config_hash)
 
 # ── moved from server.py ──
 # ── get_symbol_context collectors ───────────────────────────────────
@@ -755,10 +771,12 @@ def get_symbol_context(
         db = BaseHandler.resolve_db_context(project_root)
     except RuntimeError as e:
         return {"error": str(e)}
-    conn = db.conn
-    config_hash = db.config_hash
     root = db.root
-    with conn:
+
+    def _query(conn, config_hash):
+        # Runs under the executor lock on the single shared connection;
+        # must not open its own connection.  Timeout is enforced by
+        # _wrap_tool (300 s + interrupt), not here.
         row = _lookup_definition(conn, config_hash, name, prefer_project=True)
         if not row:
             # Macro fallback — macros have no callers/callees, return basic info
@@ -795,6 +813,20 @@ def get_symbol_context(
 
         # Override info for virtual methods
         overrides_info = _collect_override_info(conn, config_hash, row)
+
+        return (
+            row, file_path, callers_list, callees_list, indirect_calls_list,
+            resolution, enum_constants, llm_analysis, overrides_info,
+        )
+
+    query_result = db.executor.execute_sync(_query, db.config_hash)
+    if isinstance(query_result, dict):
+        # Early-return path from the closure: macro fallback or error dict.
+        return query_result
+    (
+        row, file_path, callers_list, callees_list, indirect_calls_list,
+        resolution, enum_constants, llm_analysis, overrides_info,
+    ) = query_result
 
     source = _read_symbol_body(file_path, row["line"], end_line=row["end_line"] or 0)
     result: dict = {
@@ -877,10 +909,12 @@ def read_file(
         db = BaseHandler.resolve_db_context(project_root)
     except RuntimeError as e:
         return {"error": str(e)}
-    conn = db.conn
-    config_hash = db.config_hash
     root = db.root
-    with conn:
+
+    def _query(conn, config_hash):
+        # Runs under the executor lock on the single shared connection;
+        # must not open its own connection.  Timeout is enforced by
+        # _wrap_tool (300 s + interrupt), not here.
 
         # Resolve file_path: try exact match first, then suffix match
         exact = conn.execute(
@@ -910,6 +944,13 @@ def read_file(
             "SELECT content, language, path, mtime FROM files WHERE config_hash=? AND path=?",
             (config_hash, resolved),
         ).fetchone()
+        return resolved, row
+
+    query_result = db.executor.execute_sync(_query, db.config_hash)
+    if isinstance(query_result, dict):
+        # Early-return path from the closure: error dict.
+        return query_result
+    resolved, row = query_result
 
     if not row:
         return {"error": f"File not found in index: {file_path}"}
