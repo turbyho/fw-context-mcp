@@ -5,12 +5,12 @@
 **Method:** Deep recursive — fw-context call graph, find_references, search_bodies, search_content
 
 > **💡 fw-context insight — review scoping:**
-> The review started with `get_active_build()` to verify the index was healthy
-> (52 646 symbols, 1 335 934 references, status "ready"), then `find_hotspots`
-> to identify the most-called functions. This revealed that `zdebug` (2 086
-> callers) and `get_ctime` (2 038 callers) were unchanged, so the review could
-> safely focus on the 115 actually-modified files rather than auditing the
-> entire codebase.
+> The review started with `get_active_build()`, to verify that the index was
+> healthy (52 646 symbols, 1 335 934 references, status "ready"). Then the
+> review used `find_hotspots`, to identify the most-called functions. This
+> step showed that `zdebug` (2 086 callers) and `get_ctime` (2 038 callers)
+> were unchanged. So the review could safely focus on the 115 actually
+> modified files, rather than on auditing the entire codebase.
 
 ---
 
@@ -35,7 +35,7 @@
 
 ### 1. CH_ECB_SIM800 removal — **CLEAN** ✅
 
-All references to `CH_ECB_BOARD`, `SIM800`, `SIMCOM`, `TARGET_CH_ECB` completely removed:
+fw-context found that all references to `CH_ECB_BOARD`, `SIM800`, `SIMCOM`, and `TARGET_CH_ECB` are completely removed:
 - `search_content("CH_ECB", project_only=True)` → **0 results** (except a comment in `lb_manager.cpp`)
 - `search_content("SIM800")` → **0 results**
 - `search_content("SIMCOM")` → **0 results**
@@ -45,11 +45,11 @@ All references to `CH_ECB_BOARD`, `SIM800`, `SIMCOM`, `TARGET_CH_ECB` completely
 
 > **💡 fw-context insight — verifying complete removal:**
 > `search_content("CH_ECB", project_only=True)` searched all application files
-> through the FTS5 index in a single call. A traditional `grep -r "CH_ECB"` would
-> have scanned 2 562 files and returned false positives from `#ifdef`-disabled
-> code. `find_dead_code(project_only=true)` then confirmed that no orphaned
-> functions were left behind — a check that would be manually impossible across
-> 67 000 lines of code.
+> through the FTS5 index, in a single call. A traditional `grep -r "CH_ECB"`
+> would have scanned 2 562 files, and would have returned false positives
+> from `#ifdef`-disabled code. `find_dead_code(project_only=true)` then
+> confirmed that no orphaned functions remained. A manual check like this
+> would be impossible across 67 000 lines of code.
 
 ### 2. BLE messaging subsystem — new layered architecture
 
@@ -71,7 +71,7 @@ Inheritance: `MsgManager → BleMsgManager`, `CborMsg → BleMsg → {Token, Sta
 > lines. `get_inheritance_chain("nexbox::MsgManager", transitive=true)` and
 > `get_method_overrides("nexbox::BleMsg::process_prod_specialized")` revealed the
 > full virtual dispatch design in two calls — without reading a single header file.
-> With `grep`, you'd need to manually chase `: public` declarations across 8 files.
+> With `grep`, you would need to chase `: public` declarations manually, across 8 files.
 
 ### 3. Key management — rotation 4→2 slots
 
@@ -116,12 +116,12 @@ Inheritance: `MsgManager → BleMsgManager`, `CborMsg → BleMsg → {Token, Sta
 - **Fix:** Add `_rx_mail_box.free(p_msg_rx);` before `break;` on line 567.
 
 > **💡 fw-context insight — finding memory leaks with precise extents:**
-> `get_source("nexbox::NBLE::onDataWritten")` returned ONLY the function body —
-> from the opening `{` to the closing `}` — via libclang exact extents. A manual
-> `read nble.cpp offset=540 limit=40` would require guessing where the function
-> ends. Reading too little misses the `break`; reading too much wastes context
-> tokens on neighboring functions. The exact extents made the missing `free()`
-> immediately visible.
+> `get_source("nexbox::NBLE::onDataWritten")` returned **only** the function
+> body, from the opening `{` to the closing `}`, through libclang exact
+> extents. A manual `read nble.cpp offset=540 limit=40` would require
+> guessing where the function ends. Reading too little misses the `break`.
+> Reading too much wastes context tokens on neighboring functions. The
+> exact extents made the missing `free()` immediately visible.
 
 #### 2. Unnamed variable `error` in `requestConnParamsUpdate()`
 
@@ -135,15 +135,16 @@ Inheritance: `MsgManager → BleMsgManager`, `CborMsg → BleMsg → {Token, Sta
   ```
 
 - **Runtime impact:** Compilation error, or — if `error` is pulled from an outer scope — the log prints an incorrect value.
-- **Evidence:** `get_source("nexbox::NBLE::requestConnParamsUpdate")` — `err` declared line 721, `error` used line 730. `lookup_symbol(exact=true, "error")` confirmed that `error` is NOT a global variable in application code (only local variables in other functions and the mbed `error()` function were found).
+- **Evidence:** `get_source("nexbox::NBLE::requestConnParamsUpdate")` — `err` declared line 721, `error` used line 730. `lookup_symbol(exact=true, "error")` confirmed that `error` is **not** a global variable in application code. `lookup_symbol` found only local variables in other functions, and the mbed `error()` function.
 - **Fix:** Change `(int) error` → `(int) err`.
 
 > **💡 fw-context insight — cross-referencing symbol existence:**
-> `get_source` pinpointed the mismatch, but the key verification came from
-> `lookup_symbol(exact=true, "error")` — it searched all 52 646 indexed
-> symbols in milliseconds and proved that no application-global `error` variable
-> exists. A `grep -rn "error"` across 2 562 files would have returned hundreds
-> of false positives (local variables, mbed's `error()` function, comments).
+> `get_source` pinpointed the mismatch. But the key verification came from
+> `lookup_symbol(exact=true, "error")`. This tool searched all 52 646
+> indexed symbols in milliseconds, and proved that no application-global
+> `error` variable exists. A `grep -rn "error"` across 2 562 files would
+> have returned hundreds of false positives: local variables, mbed's
+> `error()` function, and comments.
 
 ### 🟡 Warning (10)
 
@@ -157,29 +158,30 @@ Inheritance: `MsgManager → BleMsgManager`, `CborMsg → BleMsg → {Token, Sta
 #### 4. `ModemMsgDspCom::process_cons_specialized()` — ignores response data
 
 - **File:line** — `src/modem_msg.cpp:4387-4414`
-- **Root cause:** CBOR decode succeeds, but `dsp_com_cons_s.map_shp` and `dsp_com_cons_s.map_st` are never read. The response is received, but the status (`st`) and shipment ID (`shp`) from the response are not used.
-- **Runtime impact:** Server error states are not recognized. DSP_COM response is effectively "fire and forget".
+- **Root cause:** CBOR decode succeeds, but the code never reads `dsp_com_cons_s.map_shp` and `dsp_com_cons_s.map_st`. The code receives the response, but never uses the status (`st`) and shipment ID (`shp`) from the response.
+- **Runtime impact:** The code does not recognize a server error state. The DSP_COM response is effectively "fire and forget".
 
 #### 5. `restrict_size=0xF0000` in debug build — potential flash overflow
 
 - **File:line** — `mbed_app_dbg.json:23`
 - **Root cause:** `0xF0000` (983 040 B) + app start `0x10000` = end `0x100000`. nRF52840 has 1 MB flash (`0x00000–0xFFFFF`). App ends at `0x100000` = just past the flash boundary. Additionally, TDB storage starts at `0xFD000` — the app can overflow into TDB.
-- **Runtime impact:** Build could fail at the linker stage, or worse, TDB data gets overwritten.
+- **Runtime impact:** The build could fail at the linker stage. Or, worse, the overflow overwrites TDB data.
 - **Fix:** Reduce to max `0xEDE00` (= `0xFD000 - 0x10000 - 0x200`).
 
 #### 6. Missing `frame_length` validation in `BleMsgManager::process_cons()`
 
 - **File:line** — `ble_msg_manager.cpp:168`
-- **Root cause:** `_cons_header.get_frame_length()` is not validated against a maximum size. A corrupted frame with `frame_length = 0xFFFF` causes an infinite loop waiting for data.
+- **Root cause:** The code does not validate `_cons_header.get_frame_length()` against a maximum size. A corrupted frame with `frame_length = 0xFFFF` causes an infinite loop waiting for data.
 - **Runtime impact:** Watchdog timeout on the main periodic loop.
 - **Fix:** Add `if (frame_length > MAX_FRAME_LENGTH) { _clean_cons_process(); return; }`.
 
 > **💡 fw-context insight — finding missing validations:**
 > `get_source("nexbox::BleMsgManager::process_cons")` returned the complete
-> function body with exact extents. The absence of a bounds check between the
-> `get_frame_length()` call and the data accumulation loop was immediately
-> visible. A `grep` for `get_frame_length` would only show WHERE it's called,
-> not WHAT happens (or doesn't happen) around it.
+> function body with exact extents. The absence of a bounds check between
+> the `get_frame_length()` call and the data accumulation loop was
+> immediately visible. A `grep` search for `get_frame_length` would show
+> only **where** the code calls the function, not **what** happens, or
+> does not happen, around it.
 
 #### 7. `_p_msg` not reset after CRC error
 
@@ -196,19 +198,20 @@ Inheritance: `MsgManager → BleMsgManager`, `CborMsg → BleMsg → {Token, Sta
 - **Fix:** Protect `_p_msg` with `CriticalSectionLock`.
 
 > **💡 fw-context insight — detecting cross-module races:**
-> The race condition was found by running `find_callers` on BOTH functions:
-> `find_callers("nexbox::BleMsgManager::process_timeout")` returned
-> `_thread_app_func`; `find_callers("nexbox::BleMsgManager::process_cons")`
-> returned `_periodic_app_task`. The two call chains originate from different
-> thread contexts, revealing the unsynchronized access. Without fw-context,
-> you'd need to manually trace each caller and recognize the threading model —
-> something easily missed when reading files in isolation.
+> The review found the race condition by running `find_callers` on **both**
+> functions. `find_callers("nexbox::BleMsgManager::process_timeout")`
+> returned `_thread_app_func`. `find_callers("nexbox::BleMsgManager::process_cons")`
+> returned `_periodic_app_task`. The two call chains originate from
+> different thread contexts, which reveals the unsynchronized access.
+> Without fw-context, you would need to trace each caller manually, and
+> recognize the threading model — something easily missed when reading
+> files in isolation.
 
 #### 9. Conditional `set_slot` may lose snapshot on `lock_open` failure
 
 - **File:line** — `src/inventory_writer.cpp:172-212` (`dispatch_open_slot`)
-- **Root cause:** When `lock_open` fails, break exits the do-while, state remains `DISPATCH_LOADED`, and the condition `if (state != DISPATCH_LOADED && state != STOCK_DISPATCHED)` prevents calling `set_slot()`. A snapshot with `SLOT_OPEN_FAILED` is set in memory but not persisted.
-- **Runtime impact:** Diagnostic data is missing, but does not affect open functionality.
+- **Root cause:** When `lock_open` fails, break exits the do-while, state remains `DISPATCH_LOADED`, and the condition `if (state != DISPATCH_LOADED && state != STOCK_DISPATCHED)` prevents calling `set_slot()`. The code sets a snapshot with `SLOT_OPEN_FAILED` in memory, but does not persist the snapshot.
+- **Runtime impact:** Diagnostic data is missing, but this does not affect open functionality.
 - **Fix:** Add explicit `set_slot` in the error path for the snapshot.
 
 #### 10. SKEY critical level change — `NONE` → `BOTH`
@@ -242,7 +245,7 @@ Inheritance: `MsgManager → BleMsgManager`, `CborMsg → BleMsg → {Token, Sta
 #### 14. Unused methods in header — `_process_prod()`, `_release_prod_buffer()`
 
 - **File:line** — `ble_msg_manager.h:107,112`
-- **Description:** Declared but never defined anywhere. Found by `search_bodies` → empty result.
+- **Description:** The header declares these methods, but never defines them. `search_bodies` returned an empty result for them.
 
 #### 15. `get_last_key()` — dead code after migration to `get_keys()`
 
@@ -250,12 +253,12 @@ Inheritance: `MsgManager → BleMsgManager`, `CborMsg → BleMsg → {Token, Sta
 - **Description:** `find_callers("nexbox::NCfgDataManager::get_last_key")` → zero callers. Method should be removed.
 
 > **💡 fw-context insight — dead code detection:**
-> `find_callers` returned zero results for `get_last_key` — but a `grep -rn
-> "get_last_key"` would have found the definition, the template instantiation,
-> and potentially comments. Only fw-context can distinguish "defined" from
-> "actually called" without manually reading every result. For whole-project
-> dead code, `find_dead_code(project_only=true)` scans all 67 000 lines in
-> seconds — something that would take hours manually.
+> `find_callers` returned zero results for `get_last_key`. But a `grep -rn
+> "get_last_key"` would have found the definition, the template
+> instantiation, and potentially comments. Only fw-context can distinguish
+> "defined" from "actually called", without reading every result manually.
+> For whole-project dead code, `find_dead_code(project_only=true)` scans
+> all 67 000 lines in seconds. A manual search like this would take hours.
 
 #### 16. `cordio.preferred-tx-power=45` in debug build
 
@@ -265,7 +268,7 @@ Inheritance: `MsgManager → BleMsgManager`, `CborMsg → BleMsg → {Token, Sta
 #### 17. `localtime()` instead of `gmtime()` for RTC
 
 - **File:line** — `lib/modem/nmodem_driver_QUECTEL_EG9X.cpp:1942`
-- **Description:** Pre-existing bug. After NTP synchronization, `localtime()` (conversion to local time) is used to set the external RTC. Should be `gmtime()` (UTC). Comment states "We work only with UTC".
+- **Description:** Pre-existing bug. After NTP synchronization, the code uses `localtime()` (conversion to local time) to set the external RTC. Should be `gmtime()` (UTC). Comment states "We work only with UTC".
 
 #### 18. Unused variable `elapsed_time` in `lb_keyboard.cpp`
 
@@ -275,7 +278,7 @@ Inheritance: `MsgManager → BleMsgManager`, `CborMsg → BleMsg → {Token, Sta
 #### 19. Inconsistent types in `ble_mail_rx_data_t`
 
 - **File:line** — `src/nble.h:28-33`
-- **Description:** `_rx_data` is `char[]`, but `ble_mail_tx_data_t._tx_data` is `uint8_t[]`. Recommended to unify on `uint8_t`.
+- **Description:** `_rx_data` is `char[]`, but `ble_mail_tx_data_t._tx_data` is `uint8_t[]`. The reviewer recommends unifying on `uint8_t`.
 
 ---
 

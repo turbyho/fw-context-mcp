@@ -28,7 +28,7 @@
 | `find_dead_code` | ~2 | Orphaned code detection |
 | **Total fw-context** | **~231** | |
 
-### Where fw-context was NOT used (and correctly so)
+### Where fw-context was **not** used (and correctly so)
 
 | Tool | Reason not used | File type |
 |---------|-----------------|-------------|
@@ -86,7 +86,7 @@
 - `search_content("CH_ECB")` — finding preprocessor directives and comments across files
 - `search_content("#define SKEY_INIT")` — finding macros (only `search_content` sees them)
 
-### 2.5 Where fw-context CANNOT be used → other tools
+### 2.5 Where fw-context **cannot** be used → other tools
 
 | File/operation | Tool used | Reason |
 |---------------|----------------|-------|
@@ -122,7 +122,7 @@
 | Find `CriticalSection` | `search_content` | ✅ | Verified critical_section removal |
 | Callers `onDataSent` | `find_callers` | ✅ | BLE stack callback |
 
-**fw-context coverage:** 100% — all C/C++ operations performed through fw-context
+**fw-context coverage:** 100% — every C/C++ operation went through fw-context
 
 ### 3.2 Subagent #2: modem_msg.cpp/h analysis
 
@@ -257,19 +257,19 @@
 | Read `.gitlab-ci.yml` | `read` / diff | — | YAML file |
 | Read `build_app.py` | `read` / diff | — | Python script |
 
-**fw-context coverage:** ~40% — nconfig.h analyzed via fw-context, but JSON/YAML/Python via standard tools. **Correct** — fw-context is designed only for C/C++.
+**fw-context coverage:** ~40%. The review analyzed nconfig.h with fw-context, but used standard tools for JSON, YAML, and Python files. **This is correct** — fw-context is designed only for C/C++.
 
 ---
 
-## 4. Findings That Would NOT Be Possible Without fw-context
+## 4. Findings That Would **Not** Be Possible Without fw-context
 
 | Finding | fw-context tool | Why `grep`/`cat` would fail |
 |-------|-------------------|---------------------------|
-| Memory leak in `onDataWritten` | `get_source` | Exact callback body — `grep` wouldn't find the `try_alloc`/`put`/`free` pairing |
+| Memory leak in `onDataWritten` | `get_source` | Exact callback body — `grep` would not find the `try_alloc`/`put`/`free` pairing |
 | `error` vs `err` in `requestConnParamsUpdate` | `get_source` | Libclang extents — exact function boundaries |
 | Ignored DSP_COM response | `get_source` | Body of `process_cons_specialized` — CBOR decode called but data not read |
 | Missing `_num_shipments` in migration | `get_source` + `search_bodies` | `operator=` from `InventorySlotOld` — manual field comparison |
-| `_p_msg` not reset after CRC error | `get_source` | `_clean_cons_process()` — `grep` wouldn't find the absence of `_p_msg = nullptr` |
+| `_p_msg` not reset after CRC error | `get_source` | `_clean_cons_process()` — `grep` would not find the absence of `_p_msg = nullptr` |
 | Dead code `get_last_key` | `find_callers` | `grep` would find both definition and calls — but `find_callers` showed 0 callers |
 | 161 callers of `get_key` | `find_callers` | `grep` would have to search 2 562 files — manually impossible |
 | Race condition `_thread_app_func` vs `_periodic_app_task` | `find_callers` on both | Revealed shared access to `_p_msg` from two thread contexts |
