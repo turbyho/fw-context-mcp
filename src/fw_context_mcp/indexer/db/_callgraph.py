@@ -163,6 +163,7 @@ def find_call_path(
     from_name: str,
     to_name: str,
     max_depth: int = 10,
+    max_nodes: int = 5000,
 ) -> list[dict]:
     """Find call paths from *from_name* to *to_name* via BFS in the refs table.
 
@@ -170,6 +171,16 @@ def find_call_path(
     of a recursive CTE over 1M+ reference edges.  Returns the shortest path
     (first found), with ``depth`` (number of edges) and ``chain``
     (human-readable ``A → B → C`` string).
+
+    Args:
+        conn: SQLite connection.
+        config_hash: Build configuration hash.
+        from_name: Source symbol name or qualified name.
+        to_name: Target symbol name or qualified name.
+        max_depth: Maximum call path depth (default 10).
+        max_nodes: Maximum total BFS node expansions (default 5000).
+            Prevents runaway queries on pathological call graphs
+            (e.g. global dispatch loops with thousands of handlers).
     """
     from_usr = _resolve_target_usr(conn, config_hash, from_name)
     to_usr = _resolve_target_usr(conn, config_hash, to_name)
@@ -347,8 +358,9 @@ def find_call_path(
     r_queue: deque[str] = deque([to_usr])
     found: list[dict] = []
     depth = 0
+    nodes_expanded = 0
 
-    while f_queue and r_queue and depth < max_depth:
+    while f_queue and r_queue and depth < max_depth and nodes_expanded < max_nodes:
         depth += 1
         # ── Expand forward (outgoing edges) ──
         for _ in range(len(f_queue)):
@@ -359,6 +371,7 @@ def find_call_path(
                 f_dist[v] = depth
                 f_chain[v] = f"{f_chain[u]} → {v_name}"
                 f_queue.append(v)
+                nodes_expanded += 1
                 if v in r_dist:
                     # Meeting point — reconstruct full path
                     total_depth = f_dist[v] + r_dist[v]
@@ -378,6 +391,7 @@ def find_call_path(
                 r_dist[v] = depth
                 r_chain[v] = f"{v_name} → {r_chain[u]}"
                 r_queue.append(v)
+                nodes_expanded += 1
                 if v in f_dist:
                     # Meeting point
                     total_depth = f_dist[v] + r_dist[v]

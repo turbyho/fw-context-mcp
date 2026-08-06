@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from typing import Annotated
 
 from pydantic import Field
@@ -892,6 +893,8 @@ def trace_data_flow(
     project_root: Annotated[str | None, Field(description="Project root. Auto-detected if omitted.")] = None,
     max_depth: Annotated[int, Field(description="Maximum call path depth (default 8).")] = 8,
     limit: Annotated[int, Field(description="Maximum source functions to trace (default 15).")] = 15,
+    timeout_ms: Annotated[int, Field(description="Maximum total execution time in "
+        "milliseconds (default 30000).")] = 30000,
 ) -> list[dict]:
     """Trace how C/C++ data of a given type flows to a target function via
     libclang call paths. libclang-powered: finds functions by type
@@ -919,6 +922,8 @@ def trace_data_flow(
         project_root: Project root. Auto-detected if omitted.
         max_depth: Maximum call path depth (default 8).
         limit: Maximum source functions to trace (default 15).
+        timeout_ms: Maximum total execution time in milliseconds
+            (default 30000). Clamped to 1000–300000.
 
     Returns:
         list of dicts with a leading ``_summary`` entry:
@@ -929,6 +934,7 @@ def trace_data_flow(
     """
     max_depth = max(1, min(max_depth, 20))  # clamp
     limit = max(0, min(limit, 15))  # clamp
+    timeout_ms = max(1000, min(timeout_ms, 300000))  # clamp 1s–5min
     db, err = _refs_guard(project_root)
     if err:
         return err
@@ -939,6 +945,7 @@ def trace_data_flow(
         # Runs under the executor lock on the single shared connection;
         # must not open its own connection.  Timeout is enforced by
         # _wrap_tool (300 s + interrupt), not here.
+        t0 = time.perf_counter()
         # Resolve target USR
         target = conn.execute(
             """SELECT usr, name FROM symbols
@@ -972,6 +979,19 @@ def trace_data_flow(
         # Try call paths from each source to target
         results = []
         for src in sources:
+            elapsed_ms = (time.perf_counter() - t0) * 1000
+            if elapsed_ms >= timeout_ms:
+                results.append({
+                    "source_name": src["name"],
+                    "source_qualified_name": src["qualified_name"],
+                    "source_kind": src["kind"],
+                    "source_file": abs_path(root, src["file_path"]),
+                    "source_line": src["line"],
+                    "caller_count": src["caller_count"],
+                    "reachable": False,
+                    "timed_out": True,
+                })
+                continue
             paths = index_db.find_call_path(
                 conn, config_hash, src["qualified_name"], to_symbol, max_depth=max_depth,
             )
@@ -990,10 +1010,15 @@ def trace_data_flow(
                 entry["reachable"] = False
             results.append(entry)
 
-        num_reachable = sum(1 for r in results if r["reachable"])
+        num_reachable = sum(1 for r in results if r.get("reachable"))
+        num_timed_out = sum(1 for r in results if r.get("timed_out"))
+        summary = f"{num_reachable}/{len(results)} source functions reach '{to_symbol}' within depth {max_depth}"
+        if num_timed_out:
+            summary += f" ({num_timed_out} timed out)"
+
         return [
             {
-                "_summary": f"{num_reachable}/{len(results)} source functions reach '{to_symbol}' within depth {max_depth}",
+                "_summary": summary,
                 "_type": type_name,
                 "_target": to_symbol,
             },

@@ -14,8 +14,8 @@ from ._base import BaseHandler
 
 log = logging.getLogger(__name__)
 
-_VALID_KINDS = frozenset({"varglobal", "varlocal", "variable"})
-_VAR_KINDS = ("varglobal", "varlocal", "variable")
+_VALID_KINDS = frozenset({"varglobal", "varlocal", "variable", "field"})
+_VAR_KINDS = ("varglobal", "varlocal", "variable", "field")
 
 
 def find_variables(
@@ -24,7 +24,7 @@ def find_variables(
     project_root: Annotated[str | None, Field(description="Project root. "
         "Auto-detected if omitted.")] = None,
     kind: Annotated[str | None, Field(description="Filter by kind: "
-        "'varglobal', 'varlocal', or None for both.")] = None,
+        "'varglobal', 'varlocal', 'field', or None for all.")] = None,
     limit: Annotated[int, Field(description="Maximum results "
         "(default 20, max 100).")] = 20,
 ) -> list[dict]:
@@ -56,7 +56,7 @@ def find_variables(
             (e.g. ``g_`` finds ``g_debug_level``, ``g_state``).
         project_root: Project root directory. Auto-detected if omitted.
         kind: Optional kind filter — ``"varglobal"``, ``"varlocal"``,
-            or ``None`` (both). Default ``None``.
+            ``"field"``, or ``None`` (all). Default ``None``.
         limit: Maximum results (default 20, max 100).
 
     Returns:
@@ -72,7 +72,7 @@ def find_variables(
     if not name.strip():
         return [{"error": "Variable name must be non-empty."}]
     if kind is not None and kind not in _VALID_KINDS:
-        return [{"error": f"Invalid kind: {kind!r}. Expected 'varglobal', 'varlocal', or None."}]
+        return [{"error": f"Invalid kind: {kind!r}. Expected 'varglobal', 'varlocal', 'field', or None."}]
     limit = max(0, min(limit, 100))
 
     try:

@@ -482,16 +482,10 @@ def find_refs(
         ).fetchall()
 
     # ── Exact USR match for functions, methods, variables, etc. ──────────
-    # Same four-tier name resolution: exact name, exact qualified_name, suffix LIKE, plain name
-    params = [config_hash, config_hash, name, name, suffix_pattern, plain_name] + kind_params + [limit]
+    params = [config_hash, symbol["usr"]] + kind_params + [limit]
     return conn.execute(
         f"""{_SELECT}
-              AND r.to_usr IN (
-                  SELECT usr FROM symbols
-                  WHERE config_hash = ?
-                    AND (name = ? OR qualified_name = ? OR qualified_name LIKE ? ESCAPE '\\'
-                         OR name = ?)
-              ) {kind_filter}
+              AND r.to_usr = ? {kind_filter}
             ORDER BY r.from_file, r.from_line
             LIMIT ?""",
         params,
