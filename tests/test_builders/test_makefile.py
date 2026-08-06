@@ -94,3 +94,8 @@ class TestMakefileBuildSystem:
         tools = MakefileBuildSystem().required_tools()
         assert "compiledb" in tools
         assert "make" in tools
+
+    def test_detect_environment_returns_defaults(self, tmp_path):
+        """detect_environment returns safe defaults."""
+        result = MakefileBuildSystem.detect_environment(tmp_path)
+        assert result == {"python": None, "activate": None}

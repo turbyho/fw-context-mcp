@@ -48,6 +48,8 @@ detection or force a specific builder.
 | `system` | `str` | (auto-detect) | all | Build system: `mbed-os`, `zephyr`, `platformio`, `esp-idf`, `arduino`, `cmake`, `keil-mdk`, `iar-ewarm`, `makefile`, `bare` |
 | `clean` | `bool` | `true` | all | Clean build before generating. Recommended — ensures complete `compile_commands.json`. |
 | `command` | `str` | — | all | Full shell command override. Highest priority — all other settings are ignored. |
+| `python` | `str` | (auto-detect) | all | Python interpreter for pip-based CLI tools (`mbed-cli`, `platformio`, `keil2clangd`, `compiledb`). Auto-detected by `fw-context init` from pyenv, venv, and common install paths. Set manually when detection fails. |
+| `activate` | `str` | (auto-detect) | all | Shell script sourced before build (e.g. `nordic_minimal_setup.sh` for NCS, `export.sh` for ESP-IDF). Auto-detected by `fw-context init` from common install paths. Set manually when detection fails. |
 | `pre_build` | `str` | — | all | Shell command run BEFORE build/convert/generate. **Security: use only in `local.toml` (gitignored), never in committed `config.toml`.** |
 
 ### Mbed OS
@@ -302,6 +304,56 @@ When nothing else fits, `command` runs as-is.  `bear` intercepts the build
 and records compile commands.  All other `[build]` settings are ignored.
 Requires `bear` (system package: `sudo pacman -S bear`).
 
+### 12. Build environment — custom Python for mbed-cli
+
+Mbed OS CLI requires Python 3.11 or older.  If your system Python is newer,
+install mbed-cli into a pyenv or venv and point fw-context at it.
+
+```toml
+# In .fw-context/local.toml (gitignored, machine-specific)
+[build]
+python = "/home/user/.pyenv/versions/3.11.8/bin/python"
+```
+
+`fw-context init` auto-detects this from pyenv, `~/mbed_venv`, and
+`~/.local/bin/mbed`.  Set manually only when detection fails.
+
+With `python` set, the builder runs:
+```
+bear -- /path/to/python -m mbed compile -t GCC_ARM -m TARGET ...
+```
+
+### 13. Build environment — activation script for Zephyr/NCS
+
+Nordic nRF Connect SDK (and similarly ESP-IDF) needs a toolchain setup script
+sourced before `west build`.
+
+```toml
+# In .fw-context/local.toml (gitignored, machine-specific)
+[build]
+activate = "/home/user/ncs_tools/nordic_minimal_setup.sh"
+```
+
+`fw-context init` auto-detects this from paths like
+`~/ncs_tools/nordic_minimal_setup.sh`, `west config zephyr.base`, and
+`~/zephyr-sdk-*/environment-setup-*`.
+
+With `activate` set, the builder wraps the command:
+```
+bash -c "source /path/to/setup.sh && west build -b nrf52840dk ..."
+```
+
+### 14. Build environment — ESP-IDF
+
+```toml
+# In .fw-context/local.toml
+[build]
+activate = "/home/user/esp/esp-idf/export.sh"
+```
+
+`fw-context init` checks `$IDF_PATH`, `~/esp/esp-idf/export.sh`, and
+`idf.py` on PATH.
+
 ## Troubleshooting
 
 ### `compile_commands.json` is empty
@@ -352,6 +404,46 @@ pip install compiledb
 
 ```bash
 pip install keil2clangd
+```
+
+### `mbed: command not found` (Mbed OS)
+
+Mbed CLI requires Python 3.11 or older.  If you see this error:
+```
+RuntimeError: bear is required ... (or: Build command failed: mbed compile)
+```
+
+**Auto-detection:** Run `fw-context init` — it scans pyenv versions
+(`~/.pyenv/versions/*/bin/mbed`) and common venv paths for a working
+mbed-cli installation and writes the path to `local.toml`.
+
+**Manual setup:**
+```bash
+# Using pyenv:
+pyenv install 3.11.8
+pyenv shell 3.11.8
+pip install mbed-cli
+
+# Or using a venv:
+python3.11 -m venv ~/mbed_venv
+~/mbed_venv/bin/pip install mbed-cli
+```
+Then set in `.fw-context/local.toml`:
+```toml
+[build]
+python = "/home/user/.pyenv/versions/3.11.8/bin/python"
+```
+
+### `west: command not found` (Zephyr/NCS)
+
+Zephyr builds need an activated toolchain environment.  `fw-context init`
+auto-detects common setup scripts (`~/ncs_tools/nordic_minimal_setup.sh`,
+`west config zephyr.base`, `~/zephyr-sdk-*/environment-setup-*`).
+
+If detection fails, set the activation script manually in `.fw-context/local.toml`:
+```toml
+[build]
+activate = "/home/user/ncs_tools/nordic_minimal_setup.sh"
 ```
 
 ### Pre-build hook security warning

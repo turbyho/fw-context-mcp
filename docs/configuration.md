@@ -46,6 +46,8 @@ doesn't exist yet.
 | `system` | *(auto-detect)* | project | Build system: `"mbed-os"`, `"zephyr"`, `"platformio"`. Auto-detected from project markers (`west.yml`, `.mbed`, `platformio.ini`, etc.) |
 | `clean` | `true` | project | Always do a clean build before generating. **Recommended** — ensures complete `compile_commands.json`. Set `false` or use `--no-clean` for incremental builds. Note: a clean build forces a full re-index. |
 | `command` | *(none)* | project | Full build command override. Bypasses all auto-detection. Example: `"bear -- make -j4"`. |
+| `python` | *(auto-detect)* | local | Python interpreter for pip-based build tools (`mbed-cli`, `platformio`, `keil2clangd`, `compiledb`). Auto-detected by `fw-context init`. Set manually when auto-detection fails. |
+| `activate` | *(auto-detect)* | local | Shell script sourced before build (Zephyr/NCS toolchain, ESP-IDF export.sh). Auto-detected by `fw-context init`. Set manually when auto-detection fails. |
 | `target` | *(auto-detect)* | project | Mbed OS target board. Auto-detected from `.mbed` or `custom_targets.json`. |
 | `toolchain` | *(auto-detect)* | project | Mbed OS toolchain. Auto-detected from `.mbed`. |
 | `profile` | `"develop"` | project | Mbed OS build profile. `develop` is best for indexing (includes `-g` debug symbols). |
@@ -193,6 +195,12 @@ Keep this file out of git (add to `.gitignore`). It overrides settings from
 `config.toml` and the global config — use it for developer-specific preferences.
 
 ```toml
+# ── Build environment (auto-detected by fw-context init) ──
+# Set manually only if auto-detection fails.
+[build]
+# python = "/home/user/.pyenv/versions/3.11.8/bin/python"  # for mbed-cli, platformio, keil2clangd
+# activate = "/home/user/ncs_tools/nordic_minimal_setup.sh"  # for Zephyr/NCS, ESP-IDF
+
 [llm]
 # enabled = false                        # set false if you don't use Ollama
 # ollama_url = "http://localhost:11434"

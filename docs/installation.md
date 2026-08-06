@@ -154,6 +154,12 @@ xcode-select --install   # ships clang as part of Command Line Tools
 `fw-context` runs `west build -b <board>`. `CMAKE_EXPORT_COMPILE_COMMANDS=ON`
 is enabled automatically.
 
+> **Nordic NCS users:** `fw-context init` auto-detects the NCS toolchain
+> setup script (`~/ncs_tools/nordic_minimal_setup.sh`) and writes it to
+> `.fw-context/local.toml` as `activate`.  For plain Zephyr, it checks
+> `west config zephyr.base` and `~/zephyr-sdk-*/` for the environment
+> setup script.
+
 ### PlatformIO
 
 | Tool | Why | Install |
@@ -162,15 +168,24 @@ is enabled automatically.
 
 `fw-context` runs `pio run --target compiledb` plus a real build for `.d` files.
 
+> **`fw-context init`** auto-detects PlatformIO from `~/.platformio/penv/bin/python`
+> (bundled venv) or `pio` on PATH.  When detection fails, set
+> `python = "/path/to/python"` in `.fw-context/local.toml`.
+
 ### Mbed OS
 
 | Tool | Why | Install |
 |------|-----|---------|
 | **bear** | Intercepts build → compile_commands.json | `sudo pacman -S bear` / `sudo apt install bear` / `sudo dnf install bear` / `brew install bear` |
-| **mbed** CLI | `mbed compile` | `pip install mbed-cli` |
+| **mbed** CLI | `mbed compile` | `pip install mbed-cli` (requires Python 3.11 or older — use pyenv or venv) |
 | ARM GCC | Cross-compiler toolchain | [ARM GNU Toolchain](https://developer.arm.com/downloads/-/arm-gnu-toolchain-downloads) |
 
 `fw-context` runs `bear --output compile_commands.json -- mbed compile -t GCC_ARM -m <target>`.
+
+> **`fw-context init`** auto-detects the Python interpreter for `mbed-cli`
+> from pyenv versions (`~/.pyenv/versions/*/bin/mbed`), common venv paths
+> (`~/mbed_venv`), and `~/.local/bin/mbed`.  When detected, it writes the
+> path to `.fw-context/local.toml`.  See **[Build Configuration →](build.md#12-build-environment--custom-python-for-mbed-cli)** for details.
 
 ### Arduino CLI
 
@@ -194,6 +209,11 @@ uses ``manifest.json`` (built from libclang token stream) — no ``.d`` files ne
 
 `fw-context` runs `idf.py build`. Requires the ESP-IDF environment
 (`. ./export.sh` or `idf.py` on PATH).
+
+> **`fw-context init`** auto-detects the ESP-IDF export script from
+> `$IDF_PATH/export.sh`, `~/esp/esp-idf/export.sh`, or `idf.py` on PATH.
+> When detected, it writes `activate` to `.fw-context/local.toml` so
+> builds work without manually sourcing the environment.
 
 ### Generic CMake
 
