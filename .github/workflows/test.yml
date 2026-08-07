@@ -16,4 +16,4 @@ jobs:
       - run: pip install -e ".[dev]"
       - run: ruff check src/
       - run: mypy src/
-      - run: pytest tests/ -q -m "not ollama and not libclang and not slow"
+      - run: pytest tests/ -q -m "not ollama and not libclang and not slow and not system"

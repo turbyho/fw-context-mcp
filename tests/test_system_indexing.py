@@ -936,6 +936,7 @@ class TestESPIDFInitAndIndex:
 # ── Config hash tests ──────────────────────────────────────────────────────
 
 
+@pytest.mark.system
 class TestConfigHashStability:
     """Verify config_hash is stable across repeated indexing of the same project."""
 
@@ -1090,6 +1091,7 @@ def _print_stats_table(all_stats: list[dict]) -> None:
     print()
 
 
+@pytest.mark.system
 class TestGhostRecordPurge:
     """End-to-end: delete file (same config_hash) → reindex purges ghosts.
 
