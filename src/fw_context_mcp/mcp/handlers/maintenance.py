@@ -574,11 +574,7 @@ def _reindex_cleanup_deleted_file(
 ) -> dict:
     """Clean up index records for a file that no longer exists on disk."""
     config_hash = cfg_data["config_hash"]
-    from ...indexer.db import (
-        get_file_mtimes,
-        purge_file_records,
-        write_lock as _db_write_lock,
-    )
+    from ...indexer.db import get_file_mtimes, purge_file_records
     from ...indexer.db._locking import WriteLockTimeout
     from ...indexer.ops import _normalize_file_path
     from ..background import bg_reindex_pause
@@ -600,7 +596,7 @@ def _reindex_cleanup_deleted_file(
         try:
             # write_lock_held=False, transaction_held=False — this caller
             # does NOT hold either; purge_file_records acquires its own.
-            removed = purge_file_records(
+            purge_file_records(
                 conn, config_hash, file_id_old, file_path_str,
                 db_dir=db_path.parent,
             )

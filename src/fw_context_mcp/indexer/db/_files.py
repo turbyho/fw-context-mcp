@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import sqlite3
 from contextlib import nullcontext
+from pathlib import Path
 from typing import NamedTuple
 
 from ...utils import escape_like as _escape_like
@@ -299,7 +300,7 @@ def purge_file_records(
     file_id: int,
     file_path: str,
     *,
-    db_dir: object = None,
+    db_dir: Path | None = None,
     write_lock_held: bool = False,
     transaction_held: bool = False,
 ) -> int:
@@ -358,7 +359,7 @@ def purge_missing_files_batch(
     config_hash: str,
     files: list[tuple[int, str]],
     *,
-    db_dir: object = None,
+    db_dir: Path | None = None,
     write_lock_held: bool = False,
     transaction_held: bool = False,
 ) -> int:
