@@ -346,6 +346,7 @@ def cmd_index(args: argparse.Namespace) -> int:
                 if getattr(args, "no_analyze_vendor", False)
                 else getattr(args, "analyze_vendor", False) or cfg.llm.analyze_vendor
             ),
+            purge_max_missing_percent=cfg.index.purge_max_missing_percent,
         )
         print(f"Indexed. config_hash={config_hash[:16]}…  db={db_path}")
 

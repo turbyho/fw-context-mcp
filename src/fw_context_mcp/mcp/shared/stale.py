@@ -161,10 +161,15 @@ def _stale_files(conn, config_hash: str, file_paths: list[str], root: Path) -> l
 
 
 def _check_file_stale(path: str, stored_mtime: float) -> bool:
-    """Return True if *path* on-disk mtime is newer than *stored_mtime*."""
+    """Return True if *path* on-disk mtime is newer than *stored_mtime*.
+
+    A missing file is treated as stale — it was deleted since indexing.
+    """
     try:
         return os.path.getmtime(path) > stored_mtime + MTIME_TOLERANCE_S
-    except (FileNotFoundError, OSError):
+    except FileNotFoundError:
+        return True
+    except OSError:
         return False
 
 
@@ -249,6 +254,8 @@ def _count_modified_files(
             # os.scandir() batch processing or caching more aggressively.
             if os.path.getmtime(key) > stored_mtime + MTIME_TOLERANCE_S:
                 modified += 1
+        except FileNotFoundError:
+            modified += 1
         except OSError:
             pass
 

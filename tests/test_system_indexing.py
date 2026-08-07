@@ -1090,7 +1090,113 @@ def _print_stats_table(all_stats: list[dict]) -> None:
     print()
 
 
-class TestIndexStatistics:
+class TestGhostRecordPurge:
+    """End-to-end: delete file (same config_hash) → reindex purges ghosts.
+
+    Simulates a git branch switch where a source file exists only on one
+    branch but compile_commands.json stays the same (the common case —
+    most teams do not regenerate cc.json on every checkout).
+    """
+
+    def test_ghost_purged_after_file_deletion(self, tmp_path: Path):
+        """Scenario: bare/ project indexed → one .c deleted from disk (cc.json
+        unchanged) → reindex → ghost symbols purged, survivors intact."""
+        import shutil as _shutil
+        from fw_context_mcp.indexer.runner import run
+
+        # ── Phase 1: copy bare/, add extra.c, init + index via proven path ──
+        proj = tmp_path / "bare_ghost"
+        _shutil.copytree(_BUILDS / "bare", proj)
+
+        extra_c = proj / "src" / "extra.c"
+        extra_c.write_text("""\
+int extra_global = 0;
+int extra_init(void) {
+    extra_global = 1;
+    return 42;
+}
+""", encoding="utf-8")
+
+        proj = _init_and_index(
+            proj,
+            replacements={
+                "[build] system": '"bare"',
+                "[build] source_dirs": '["src"]',
+                "[build] include_dirs": '["src"]',
+            },
+            clean_db=True,
+        )
+
+        db_path = _db_path_for_project(proj)
+        assert db_path.exists()
+
+        # ── Phase 2: verify initial state ──
+        conn = open_db(db_path)
+        try:
+            ch = _config_hash(conn, proj)
+            defs_before = {
+                r["name"]
+                for r in conn.execute(
+                    "SELECT name FROM symbols WHERE config_hash=? AND kind='function' AND is_definition=1",
+                    (ch,),
+                )
+            }
+            assert "extra_init" in defs_before, f"Missing extra_init in {sorted(defs_before)}"
+            assert "uart_init" in defs_before
+            assert "main" in defs_before
+            print(f"  Before: {sorted(defs_before)}")
+            config_hash_before = ch
+        finally:
+            conn.close()
+
+        # ── Phase 3: delete extra.c from disk, cc.json untouched ──
+        extra_c.unlink()
+
+        # ── Phase 4: reindex — same config_hash, missing TU skipped ──
+        cc_json = proj / "compile_commands.json"
+        config_hash_after = run(
+            compile_commands=cc_json,
+            db_path=db_path,
+            project_root=proj,
+            vendor_paths=[],
+            project_paths=[],
+            index_refs=False,
+            index_embeddings=False,
+            analyze_symbols=False,
+            analyze_overrides=False,
+            purge_max_missing_percent=100,
+        )
+        print(f"  Config hash: before={config_hash_before[:16]}… after={config_hash_after[:16]}…")
+        assert config_hash_after == config_hash_before, (
+            "config_hash changed — test must exercise the 'unchanged config_hash' path"
+        )
+
+        # ── Phase 5: verify ghosts purged, survivors intact ──
+        conn = open_db(db_path)
+        try:
+            defs_after = {
+                r["name"]
+                for r in conn.execute(
+                    "SELECT name FROM symbols WHERE is_definition=1 AND kind='function'"
+                ).fetchall()
+            }
+            print(f"  After: {sorted(defs_after)}")
+
+            assert "extra_init" not in defs_after, (
+                f"Ghost function extra_init survived purge: {sorted(defs_after)}"
+            )
+            assert "main" in defs_after, "main lost"
+            assert "uart_init" in defs_after, "uart_init lost"
+            assert "compute_checksum" in defs_after, "compute_checksum lost"
+
+            extra_files = conn.execute(
+                "SELECT path FROM files WHERE path LIKE '%extra%'"
+            ).fetchall()
+            assert len(extra_files) == 0, f"extra file rows survived: {extra_files}"
+        finally:
+            conn.close()
+
+        _cleanup_index_db(proj)
     """Print indexing statistics for all test projects that have been indexed."""
 
     def test_print_statistics(self):

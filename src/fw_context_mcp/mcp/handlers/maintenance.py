@@ -575,26 +575,11 @@ def _reindex_cleanup_deleted_file(
     """Clean up index records for a file that no longer exists on disk."""
     config_hash = cfg_data["config_hash"]
     from ...indexer.db import (
-        delete_fp_assignments_for_file as _del_fpa,
-    )
-    from ...indexer.db import (
-        delete_indirect_call_sites_for_file as _del_ics,
-    )
-    from ...indexer.db import (
-        delete_inheritance_for_file as _del_inh,
-    )
-    from ...indexer.db import (
-        delete_refs_for_file as _del_refs,
-    )
-    from ...indexer.db import (
-        delete_symbols_for_file as _del_syms,
-    )
-    from ...indexer.db import (
         get_file_mtimes,
-    )
-    from ...indexer.db import (
+        purge_file_records,
         write_lock as _db_write_lock,
     )
+    from ...indexer.db._locking import WriteLockTimeout
     from ...indexer.ops import _normalize_file_path
     from ..background import bg_reindex_pause
 
@@ -608,53 +593,22 @@ def _reindex_cleanup_deleted_file(
         "SELECT COUNT(*) FROM symbols WHERE file_id = ?", (file_id_old,)
     ).fetchone()[0]
 
-    try:
-        tu_rel = str(target.relative_to(root))
-    except ValueError:
-        tu_rel = file_path_str
-
     from ...mcp.shared.stale import _invalidate_modified_cache
     _invalidate_modified_cache(config_hash)
 
     with bg_reindex_pause(root):
         try:
-            with _db_write_lock(db_path.parent, timeout=60.0):
-                with transaction(conn):
-                    try:
-                        conn.execute(
-                            "DELETE FROM embeddings WHERE symbol_id IN "
-                            "(SELECT id FROM symbols WHERE file_id = ?)",
-                            (file_id_old,),
-                        )
-                    except sqlite3.OperationalError:
-                        pass
-                    try:
-                        conn.execute(
-                            "DELETE FROM llm_analysis WHERE symbol_id IN "
-                            "(SELECT id FROM symbols WHERE file_id = ?)",
-                            (file_id_old,),
-                        )
-                    except sqlite3.OperationalError:
-                        pass
-                    try:
-                        conn.execute(
-                            "DELETE FROM vec_symbols WHERE symbol_id IN "
-                            "(SELECT id FROM symbols WHERE file_id = ?)",
-                            (file_id_old,),
-                        )
-                    except sqlite3.OperationalError:
-                        pass
-                    _del_inh(conn, config_hash, file_id_old)
-                    _del_syms(conn, file_id_old)
-                    _del_refs(conn, config_hash, tu_rel)
-                    _del_ics(conn, config_hash, tu_rel)
-                    _del_fpa(conn, config_hash, tu_rel)
-                    conn.execute("DELETE FROM files WHERE id = ?", (file_id_old,))
-                return {
-                    "file": str(target),
-                    "symbols_removed": symbol_count,
-                    "action": "deleted",
-                }
+            # write_lock_held=False, transaction_held=False — this caller
+            # does NOT hold either; purge_file_records acquires its own.
+            removed = purge_file_records(
+                conn, config_hash, file_id_old, file_path_str,
+                db_dir=db_path.parent,
+            )
+            return {
+                "file": str(target),
+                "symbols_removed": symbol_count,
+                "action": "deleted",
+            }
         except WriteLockTimeout as e:
             return {"error": f"Could not acquire write lock for cleanup of {target}: {e}", "action": "timeout"}
 

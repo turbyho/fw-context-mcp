@@ -8,11 +8,13 @@ hotspot cache, and the main post-processing orchestrator
 from __future__ import annotations
 
 import logging
+import os
 import sqlite3
 import time
 import tomllib
 from collections import deque
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import nullcontext
 from pathlib import Path
 
@@ -406,6 +408,81 @@ def _build_hotspot_cache(conn, config_hash: str, *, force: bool = False,
 # ═══════════════════════════════════════════════════════════════
 
 
+def _step_purge_missing_files(conn: sqlite3.Connection, ctx: dict) -> None:
+    """Purge ghost records of files that no longer exist on disk.
+
+    Runs first in the pipeline so FTS, embeddings, overrides, and PageRank
+    are not built on ghost nodes that are deleted moments later.
+    """
+    from ..utils import abs_path
+
+    config_hash = ctx["config_hash"]
+    project_root = ctx["project_root"]
+    build_patterns = ctx.get("build_dir_patterns") or []
+
+    rows = conn.execute(
+        "SELECT id, path FROM files WHERE config_hash = ?",
+        (config_hash,),
+    ).fetchall()
+
+    # Collect candidates: skip empty paths (header-less TU markers) and
+    # build-output files (regenerated independently of source control).
+    candidates: list[tuple[int, str, str]] = []  # (id, db_path, abs_path)
+    for r in rows:
+        db_path = r["path"]
+        if not db_path:
+            continue
+        if any(pat in db_path for pat in build_patterns):
+            continue
+        abs_p = abs_path(project_root, db_path)
+        # Absolute paths outside project_root: skip (system headers etc.)
+        if os.path.isabs(db_path) and not abs_p.startswith(str(project_root)):
+            continue
+        candidates.append((r["id"], db_path, abs_p))
+
+    if not candidates:
+        return
+
+    # Guard: abort when too many files are missing (offline mount etc.)
+    threshold_pct = ctx.get("purge_max_missing_percent", 20)
+    total = len(candidates)
+    if total == 0:
+        return
+
+    missing: list[tuple[int, str]] = []
+    with ThreadPoolExecutor(max_workers=min(8, len(candidates))) as ex:
+        futures = {
+            ex.submit(os.path.exists, abs_p): (file_id, db_path)
+            for file_id, db_path, abs_p in candidates
+        }
+        for f in as_completed(futures):
+            if not f.result():
+                missing.append(futures[f])
+
+    if not missing:
+        return
+
+    missing_pct = (len(missing) / total) * 100
+    if missing_pct > threshold_pct:
+        log.warning(
+            "Ghost-file purge aborted: %d/%d files (%.1f%%) missing from disk "
+            "(threshold %d%%). Possible offline mount or wrong project root.",
+            len(missing), total, missing_pct, threshold_pct,
+        )
+        return
+
+    from .db import purge_missing_files_batch
+
+    removed = purge_missing_files_batch(
+        conn, config_hash, missing,
+        db_dir=ctx["db_dir"],
+    )
+    preview = ", ".join(p for _, p in missing[:5])
+    if len(missing) > 5:
+        preview += f", … (+{len(missing) - 5} more)"
+    log.info("Purged %d ghost file(s), %d symbol(s): %s", len(missing), removed, preview)
+
+
 def _step_rebuild_fts(conn: sqlite3.Connection, ctx: dict) -> None:
     """Rebuild FTS5 indexes for symbols, files, and macros."""
     rebuild_fts(conn)
@@ -514,10 +591,13 @@ def _step_resolve_dispatches(conn: sqlite3.Connection, ctx: dict) -> None:
     inserts synthetic dispatch edges into the refs table.
     """
     config_hash = ctx["config_hash"]
-    rows = conn.execute(
-        "SELECT * FROM _pending_dispatch WHERE config_hash = ?",
-        (config_hash,),
-    ).fetchall()
+    try:
+        rows = conn.execute(
+            "SELECT * FROM _pending_dispatch WHERE config_hash = ?",
+            (config_hash,),
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return
     if not rows:
         return
 
@@ -744,6 +824,7 @@ def _step_wal_checkpoint(conn: sqlite3.Connection, ctx: dict) -> None:
 # Each entry: (step_name, step_fn, condition | None)
 # condition(ctx) → bool — when None, the step always runs.
 _STEPS: list[tuple[str, Callable[..., None], Callable[..., bool] | None]] = [
+    ("purge_missing",    _step_purge_missing_files, None),
     ("fts5",             _step_rebuild_fts,       None),
     ("orphans",          _step_orphan_cleanup,     None),
     ("is_project",       _step_align_is_project,   None),
@@ -785,6 +866,7 @@ def _run_postprocess(
     llm_config=None,
     cache_server_config=None,
     force: bool = False,
+    purge_max_missing_percent: int = 20,
 ) -> None:
     """Run all post-processing phases via a data-driven pipeline.
 
@@ -816,6 +898,7 @@ def _run_postprocess(
         "llm_config": llm_config,
         "cache_server_config": cache_server_config,
         "force": force,
+        "purge_max_missing_percent": purge_max_missing_percent,
     }
 
     failed_critical: set[str] = set()

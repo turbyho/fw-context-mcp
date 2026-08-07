@@ -373,6 +373,10 @@ class IndexConfig:
     rerank_top_k: int = 50
     min_dense_count: int = 3
     max_symbol_body_lines: int = 1000
+    purge_max_missing_percent: int = 20
+    """Abort the automatic ghost-file purge when more than this percent of
+    indexed files are missing from disk — guards against an offline network
+    mount or a misconfigured project root deleting the whole vendor index."""
 
 
 @dataclass
@@ -646,6 +650,7 @@ _INDEX_FIELDS: list[tuple[str, str, str]] = [
     ("rerank_top_k", "rerank_top_k", "int(50)"),
     ("min_dense_count", "min_dense_count", "int(3)"),
     ("max_symbol_body_lines", "max_symbol_body_lines", "int(1000)"),
+    ("purge_max_missing_percent", "purge_max_missing_percent", "int(20)"),
 ]
 
 _LLM_FIELDS: list[tuple[str, str, str]] = [

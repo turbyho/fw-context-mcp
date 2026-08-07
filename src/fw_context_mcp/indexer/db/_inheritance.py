@@ -4,6 +4,7 @@ import sqlite3
 
 __all__ = [
     "delete_inheritance_for_file",
+    "delete_overrides_for_file",
     "get_class_members",
     "get_direct_bases",
     "get_direct_bases_batch",
@@ -44,6 +45,19 @@ def delete_inheritance_for_file(conn: sqlite3.Connection, config_hash: str, file
     """
     conn.execute(
         """DELETE FROM inheritance WHERE config_hash = ? AND derived_usr IN (
+            SELECT usr FROM symbols WHERE config_hash = ? AND file_id = ?
+        )""",
+        (config_hash, config_hash, file_id),
+    )
+
+
+def delete_overrides_for_file(conn: sqlite3.Connection, config_hash: str, file_id: int) -> None:
+    """Delete override records for methods defined in the given file.
+
+    Mirror of :func:`delete_inheritance_for_file` for the ``overrides`` table.
+    """
+    conn.execute(
+        """DELETE FROM overrides WHERE config_hash = ? AND derived_usr IN (
             SELECT usr FROM symbols WHERE config_hash = ? AND file_id = ?
         )""",
         (config_hash, config_hash, file_id),

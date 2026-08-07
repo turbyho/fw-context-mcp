@@ -20,6 +20,7 @@ __all__ = [
     "delete_indirect_call_sites_for_file",
     "delete_macros_for_file",
     "delete_orphan_files",
+    "delete_overrides_for_file",
     "delete_refs_for_file",
     "delete_symbols_for_file",
     "drop_fts_triggers",
@@ -63,6 +64,8 @@ __all__ = [
     "insert_symbols_batch",
     "lookup_macro",
     "open_db",
+    "purge_file_records",
+    "purge_missing_files_batch",
     "rebuild_files_fts",
     "rebuild_fts",
     "rebuild_macros_fts",
@@ -115,6 +118,8 @@ from ._files import (
     get_file_map,
     get_file_mtime_indexed,
     get_file_mtimes,
+    purge_file_records,
+    purge_missing_files_batch,
     upsert_file,
 )
 from ._fts import (
@@ -124,6 +129,7 @@ from ._fts import (
 )
 from ._inheritance import (
     delete_inheritance_for_file,
+    delete_overrides_for_file,
     get_class_members,
     get_direct_bases,
     get_direct_bases_batch,
