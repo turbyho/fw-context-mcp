@@ -307,6 +307,14 @@ class LLMConfig:
             for multi-client MCP transports (SSE/streamable) where embedding
             requests (small model, ~100 ms) can overlap without saturating the
             GPU.  Chat requests are GPU-heavy — keep this low.
+        chat_api_base: Chat API URL for OpenAI-compatible cloud/proxy endpoints
+            (DeepSeek, LiteLLM, vLLM, llama.cpp).  ``None`` (default) uses local
+            Ollama for chat.  External URLs send source code to that host.
+        chat_api_key: Bearer token for cloud/proxy APIs.  ``None`` for local/no-auth.
+        chat_api_format: Format override: ``"auto"`` (default), ``"ollama"``, or
+            ``"openai"``.  ``"auto"`` detects format from the URL.
+        auto_pull: Auto-pull models on 404 (Ollama only).  Default ``False`` —
+            all model pulls must be explicit (safer for intranet/offline envs).
         stream: When True, send ``stream: true`` and consume SSE chunks for chat
             requests (both OpenAI-compatible and Ollama-native paths).  Keeps the
             HTTP connection alive with continuous data flow, avoiding reverse-proxy
@@ -992,7 +1000,16 @@ def _write_project_id(project_root: Path, project_id: str) -> None:
 
 
 def _format_toml_value(key: str, value: object) -> str:
-    """Format a key-value pair as a TOML line."""
+    """Format a key-value pair as a TOML line.
+
+    Args:
+        key: TOML key name.
+        value: Value to format (str → quoted, bool → true/false,
+            int/float → unquoted number).
+
+    Returns:
+        ``"key = value\\n"`` string suitable for insertion into a TOML file.
+    """
     if isinstance(value, bool):
         val = "true" if value else "false"
     elif isinstance(value, int):

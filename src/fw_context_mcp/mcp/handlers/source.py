@@ -20,6 +20,7 @@ from ...indexer.db import (
 )
 from ...llm.ollama import OllamaError, OllamaModelNotFoundError, call_ollama_async
 from ...utils import abs_path, read_file_lines
+from ..shared.context import _normalize_file_path_query
 from ._base import BaseHandler
 
 log = logging.getLogger(__name__)
@@ -518,6 +519,7 @@ def get_file_map(
     except RuntimeError as e:
         return {"error": str(e)}
     root = db.root
+    file_path = _normalize_file_path_query(file_path)
 
     def _query(conn, config_hash):
         # Runs under the executor lock on the single shared connection;
@@ -910,6 +912,7 @@ def read_file(
     except RuntimeError as e:
         return {"error": str(e)}
     root = db.root
+    file_path = _normalize_file_path_query(file_path)
 
     def _query(conn, config_hash):
         # Runs under the executor lock on the single shared connection;
