@@ -6,6 +6,8 @@ Uses FastAPI TestClient with a mock backend — no PostgreSQL required.
 from __future__ import annotations
 
 import pytest
+
+pytest.importorskip("fastapi", reason="fastapi not installed (cache-server extra)")
 from fastapi.testclient import TestClient
 
 from fw_context_mcp import __version__ as fw_context_version
