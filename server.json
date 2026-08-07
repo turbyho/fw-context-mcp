@@ -1,8 +1,8 @@
 {
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
   "name": "io.github.turbyho/fw-context-mcp",
-  "description": "Build-aware code intelligence for embedded C/C++ firmware — libclang, FTS5, call graphs, 34 tools",
-  "version": "0.25.3",
+  "description": "Build-aware code intelligence for embedded C/C++ firmware — libclang, FTS5, call graphs, 35 tools",
+  "version": "0.25.4",
   "repository": {
     "url": "https://github.com/turbyho/fw-context-mcp",
     "source": "github"
@@ -11,7 +11,7 @@
     {
       "registryType": "pypi",
       "identifier": "fw-context-mcp",
-      "version": "0.25.3",
+      "version": "0.25.4",
       "transport": {
         "type": "stdio"
       }
