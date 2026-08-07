@@ -1446,7 +1446,7 @@ def _handle_token_fallbacks(cursor: cx.Cursor, cur_fn: str | None,
         for i, tok in enumerate(tokens):
             if (tok.kind.name == "IDENTIFIER"
                     and i + 3 < len(tokens)
-                    and tokens[i + 1].spelling == "."
+                    and tokens[i + 1].spelling in (".", "->")
                     and tokens[i + 2].kind.name == "IDENTIFIER"
                     and tokens[i + 3].spelling == "("):
                 target_usr = _resolve_method_usr(
@@ -1460,7 +1460,7 @@ def _handle_token_fallbacks(cursor: cx.Cursor, cur_fn: str | None,
             if (tok.kind.name == "IDENTIFIER"
                     and i + 1 < len(tokens)
                     and tokens[i + 1].spelling == "("
-                    and (i == 0 or tokens[i - 1].spelling != ".")):
+                    and (i == 0 or tokens[i - 1].spelling not in (".", "->"))):
                 target_usr = _resolve_method_usr(tok.spelling, qn_to_usr, caller_qn=caller_qn)
                 if target_usr:
                     _add_ref(refs, seen_ref, target_usr, loc.file.name, loc.line, cur_fn, "call")
@@ -1536,7 +1536,7 @@ def _run_source_line_fallback(
         if _line_fn is None:
             continue
         _line_qn = usr_to_qn.get(_line_fn or "") or ""
-        for _m in _re.finditer(r'(\w+)\.(\w+)\s*\(', _line):
+        for _m in _re.finditer(r'(\w+)(?:\.|->)(\w+)\s*\(', _line):
             _field_name = _m.group(1)
             _method_name = _m.group(2)
             _target_usr = _resolve_method_usr(_method_name, qn_to_usr, _field_name, _line_qn)
