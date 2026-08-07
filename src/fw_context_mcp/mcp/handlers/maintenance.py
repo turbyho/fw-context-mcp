@@ -100,15 +100,19 @@ def get_active_build(
         number of TUs with stale header dependencies), manifest_verification (str —
         "full" when manifest.json exists, "none" otherwise), analyzed_symbols (int),
         unanalyzed_symbols (int — definition symbols still needing LLM analysis),
-        analysis_model (str or None), vendor_paths (list[str] —
-        config index.vendor_paths), project_paths (list[str] —
-        config index.project_paths), bg_reindex_running (bool),
+        analysis_model (str or None), description (str), first_indexed_at (str),
+        vendor_paths (list[str] — config index.vendor_paths),
+        project_paths (list[str] — config index.project_paths),
+        bg_reindex_running (bool),
         reindex_progress (str or None — last log line when reindex is running),
         schema_version (int — DB schema version),
         current_schema (int — code expects), status (str — "ready"|"reindexing"|
         "reindex_needed"|"no_index"|"not_initialized"|"error"), reindex_needed (bool —
         structural mismatch requiring a full reindex),
         reindex_reasons (list[str] — why reindex is needed, empty when False),
+        stale (bool — True when reindex_needed or header_affected_tus > 0),
+        _warning (str, optional — when manifest verification is not "full"),
+        vec_available (bool), vec_error (str, optional),
         index_message (str — human-readable summary of index state)}
     """
     root = resolve_project_root(project_root)
@@ -449,7 +453,8 @@ def list_projects(
 
     Returns:
         list of dicts, each with: project_id, name, root_path, build_system,
-        symbol_count, file_count, indexed_at, schema_version, current_schema,
+        symbol_count, file_count, indexed_at, description (str),
+        first_indexed_at (str), schema_version, current_schema,
         reindex_needed (bool), status (str), db (path to SQLite database file).
     """
     cfg = load_config(project_root=Path(project_root).resolve() if project_root else None)
@@ -702,7 +707,7 @@ def _reindex_parse_and_store(
                         from ...indexer.macros import resolve_and_update
                         first_unit = parsed_units[0][0]
                         resolve_and_update(conn, config_hash, first_unit.clang_args, first_unit.file.resolve(), cwd=root)
-                    except Exception:
+                    except Exception:  # nosec B110 — macro expansion is best-effort
                         pass
 
                 from ...indexer.db import delete_orphan_files
@@ -946,7 +951,27 @@ def reindex_file_impl(
         ),
     ] = True,
 ) -> dict:
-    """Re-parse a single source file with libclang and update its symbols in the index."""
+    """Re-parse a single source file with libclang and update its symbols in the index.
+
+    Not read-only — uses the exact compiler flags from ``compile_commands.json``.
+    The file must be listed in ``compile_commands.json`` (headers are re-indexed
+    via the translation unit that includes them). Use after editing a file to
+    keep the index current without a full rebuild.
+
+    Also regenerates LLM analysis and method override relationships for
+    affected symbols when ``with_analysis=True``.
+
+    Args:
+        file_path: Path to source file to re-parse. Must be in compile_commands.json.
+        project_root: Project root directory. Auto-detected if omitted.
+        with_analysis: When True (default), also regenerates LLM symbol analysis,
+            method override relationships, PageRank, and embeddings. Set False
+            for a fast symbol-only update (used by background auto-reindex).
+
+    Returns:
+        dict: {file, translation_units, symbols_updated, elapsed_s,
+        analysis_updated (if LLM enabled with analysis), or error}.
+    """
     db_path, cfg, project_id, root = _resolve_context(project_root, skip_ready_check=True)
     if not db_path.exists():
         return {"error": f"No index found for {root}. Run 'fw-context index' first."}
@@ -1087,7 +1112,8 @@ def reindex_file(
 # ── moved from server.py ──
 def check_ollama(
     project_root: Annotated[
-        str | None, Field(description="Project root. Auto-detected if omitted. Ignored by this tool.")
+        str | None, Field(description="Project root. Auto-detected if omitted. "
+        "Used to locate LLM config. Falls back to auto-detection when omitted.")
     ] = None,
 ) -> dict:
     """Check whether the LLM backend is running and the configured embedding/chat model is installed.
@@ -1098,16 +1124,19 @@ def check_ollama(
     backend).
 
     Args:
-        project_root: Project root. Auto-detected if omitted. Ignored
-            by this tool.
+        project_root: Project root. Auto-detected if omitted. Used to
+            locate the project's LLM configuration.
 
     Returns:
-        dict: {ollama_enabled (bool), status (str — "ok"|"disabled"|"error"|"model_missing"),
+        dict: {ollama_enabled (bool), status (str — "ok"|"disabled"|
+        "not_configured"|"model_missing"|"embedding_unavailable"|"error"),
         ollama_running (bool), ollama_url (str), configured_model (str),
         num_ctx (int), installed_models (list[str]),
         configured_embed_model (str), embedding_installed (bool),
-        message (str, on error/disabled), model_details (list[dict], when Ollama running),
-        suggest_cloud (bool), debug_log (str, optional — only when debug logging is enabled)}
+        message (str, on error/disabled), model_details (list[dict], when
+        Ollama running), suggest_cloud (bool), vec_available (bool),
+        vec_error (str, optional), debug_log (str, optional — only when
+        debug logging is enabled)}
     """
     try:
         _, cfg, _, _ = _resolve_context(project_root)
@@ -1225,7 +1254,7 @@ def configure_llm(
     Writes to ``<project>/.fw-context/local.toml`` ONLY (gitignored,
     per-developer). Does NOT modify the global config or the shared
     project ``config.toml``. After writing, tests the configuration
-    by making a simple API call.
+    by making a simple API call (skipped when LLM is disabled).
 
     IMPORTANT: When ``chat_api_base`` points to an external host, source
     code snippets in chat prompts will be sent to that endpoint. Ensure
@@ -1243,7 +1272,11 @@ def configure_llm(
         stream: Stream chat responses via SSE. True avoids reverse-proxy idle timeouts.
 
     Returns:
-        dict: {status ("ok"|"error"), chat_api (dict), model, test_latency_s (float, on success), message (str, on error)}
+        dict: {status ("ok"|"error"), chat_api (dict — configured, endpoint,
+        format, model), model (str), auto_pull (bool), stream (bool),
+        test_latency_s (float, on success), test_response (str, on success),
+        compliance_warning (str, when chat_api_base is external),
+        message (str, on error)}
     """
     from ...config.settings import ProjectNotInitializedError, _is_loopback_url, _update_local_toml
 

@@ -169,7 +169,7 @@ class ZephyrBuildSystem:
                     zephyr_env = Path(r.stdout.strip()) / "zephyr-env.sh"
                     if zephyr_env.exists():
                         return {"python": None, "activate": str(zephyr_env)}
-            except Exception:
+            except Exception:  # nosec B110 — best-effort env detection
                 pass
 
         for sdk_dir in sorted(Path.home().glob("zephyr-sdk-*"), reverse=True):
