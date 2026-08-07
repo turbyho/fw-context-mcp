@@ -69,11 +69,86 @@ Put these settings in `~/.fw-context/config.toml` for global defaults, or in `<p
 | `embed_model` | `"mxbai-embed-large:latest"` | global, local | The embedding model for vector search. fw-context pulls this model automatically on first use. `mxbai-embed-large` runs on a CPU. For a GPU, use `qwen3-embedding:8b`, which needs about 4.7 GB of VRAM and creates 4096-dimension vectors. |
 | `embed_query_prompt` | *(auto-detect)* | global, local | An instruction that fw-context adds before the query text, before it creates the embedding. fw-context detects this instruction automatically from the model name prefix: for `mxbai-*`, fw-context uses `"Represent this sentence for searching relevant passages: "`; for `qwen3-embedding*`, fw-context uses a code-retrieval instruction. Set this key explicitly to override the default, or set it to `""` to disable it. |
 | `embed_doc_prompt` | *(empty)* | global, local | An instruction that fw-context adds before symbol descriptions during indexing. Most models work best with an empty prompt. Set this key only when the model's training expects a per-document instruction. |
+| `auto_pull` | `false` | global, local | When `true`, fw-context pulls a model automatically from the Ollama registry when it is not installed. When `false` (default), you must pull each model explicitly. Set this key to `false` for offline or intranet environments. |
 | `num_ctx` | `16384` | global, local | The context window, in tokens. This size allows full function bodies during analysis generation. |
 | `keep_alive` | `"10m"` | global, local | How long fw-context keeps the model loaded in VRAM after a request. Use minutes, seconds, or `-1` for an indefinite time. During indexing, this setting prevents model loading before each request, which takes about 2 to 5 seconds each time. |
 | `timeout` | `600.0` | global, local | The HTTP request timeout, in seconds, for Ollama API calls. Embed requests use `timeout × 2`. |
+| `reranker_model` | *(none)* | global, local | A cross-encoder model for search result reranking. Example: `"cross-encoder/ms-marco-MiniLM-L6-v2"`. When you set this key, fw-context rescors each result with the cross-encoder for higher precision. This key requires `sentence-transformers`. Default `None` — no reranking. |
 | `analyze_symbols` | `true` | global, local | Generate an LLM analysis for each symbol during indexing. This analysis includes a summary, the inputs, and the outputs. fw-context stores this analysis in the `llm_analysis` table, so you can search for symbols by purpose. |
+| `ollama_max_concurrent` | `1` | global, local | The maximum number of parallel Ollama HTTP calls per process. Increase this key to 2–4 for multi-client MCP transports, such as SSE or streamable, where embedding requests (~100 ms) can overlap. Keep this key low for chat requests, which use the GPU more. |
+| `chat_api_base` | *(none)* | global, local | A chat API URL for an OpenAI-compatible cloud or proxy endpoint. Examples: DeepSeek, LiteLLM, vLLM, llama.cpp. When you set this key, fw-context sends chat requests to this URL instead of the local Ollama instance. Default `None` — fw-context uses the local Ollama server. |
+| `chat_api_key` | *(none)* | global, local | A bearer token for the cloud or proxy chat API. Leave this key empty for endpoints that need no authentication. |
+| `chat_api_format` | `"auto"` | global, local | The request format for the chat API. `"auto"` (default) detects the format from the URL. `"ollama"` uses the Ollama-native `/api/chat` format. `"openai"` uses the `/v1/chat/completions` format. |
+| `stream` | `false` | global, local | When `true`, fw-context sends `stream: true` and reads SSE chunks for chat requests. This setting keeps the HTTP connection open with a continuous data flow, and prevents reverse-proxy idle timeouts (nginx default: 60 s, Cloudflare: 100 s). When `false`, fw-context uses a non-streaming path. |
 | `debug_log` | *(none)* | global, local | The path to a JSONL debug log for Ollama prompts and responses. Example: `"~/.fw-context/llm-debug.jsonl"`. |
+
+#### External chat API examples
+
+When you set `chat_api_base`, fw-context sends chat requests (analysis
+generation, `smart_search`, `explain_symbol`) to that URL, with
+OpenAI-compatible JSON. The embedding model still uses Ollama.
+
+**OpenAI:**
+
+```toml
+[llm]
+chat_api_base = "https://api.openai.com/v1"
+chat_api_key = "sk-..."
+chat_api_format = "openai"
+model = "gpt-4.1"
+```
+
+**Anthropic (through a proxy):**
+
+Anthropic has no OpenAI-compatible endpoint. Use LiteLLM as a proxy —
+it translates OpenAI-format requests to Anthropic-format requests.
+
+```toml
+[llm]
+# Point at your LiteLLM proxy. Set ANTHROPIC_API_KEY in the proxy env.
+chat_api_base = "http://localhost:4000/v1"
+chat_api_key = "sk-lite"
+chat_api_format = "openai"
+model = "claude-sonnet-4-20250514"
+```
+
+**DeepSeek:**
+
+```toml
+[llm]
+chat_api_base = "https://api.deepseek.com/v1"
+chat_api_key = "sk-..."
+chat_api_format = "openai"
+model = "deepseek-v4-flash"
+```
+
+**LiteLLM proxy (local):**
+
+LiteLLM translates between provider-specific formats. You run it locally,
+and fw-context talks to it as if it were OpenAI.
+
+```toml
+[llm]
+chat_api_base = "http://localhost:4000/v1"
+chat_api_key = "sk-lite"
+chat_api_format = "openai"
+model = "openai/gpt-4o"       # LiteLLM model routing syntax
+# or: model = "deepseek/deepseek-v4-flash"
+# or: model = "anthropic/claude-3-5-sonnet-20241022"
+```
+
+**llama.cpp server:**
+
+```toml
+[llm]
+chat_api_base = "http://localhost:8080/v1"
+chat_api_key = "not-needed"
+chat_api_format = "openai"
+model = "qwen2.5-coder:14b"
+```
+
+For all external endpoints, set `stream = true` when you use a reverse
+proxy, to prevent idle timeouts.
 
 ### `[project]` — Metadata
 

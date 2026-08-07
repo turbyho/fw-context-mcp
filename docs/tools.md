@@ -102,14 +102,97 @@ my-zephyr-app   /home/user/zephyr-app     symbols=12430  files=1502  indexed=202
 my-platformio-app /home/user/pio-app      symbols=8586   files=952   indexed=2026-06-04 16:20:45
 ```
 
-### `fw-context reset`
+### `fw-context db`
 
-Delete the index for a project.
+Manage the index database.
 
 ```bash
-fw-context reset                  # interactive confirmation
-fw-context reset -y               # skip confirmation
-fw-context reset --project /path  # specific project
+fw-context db list                   # list all builds
+fw-context db stats <hash>           # show statistics for a build
+fw-context db delete <hash>          # delete a specific build
+fw-context db delete --all           # delete the entire index
+fw-context db cleanup                # remove orphaned compile_commands artifacts
+```
+
+#### `fw-context db list`
+
+List all builds for a project, with per-build statistics. The active build
+shows with a `*` marker.
+
+```bash
+$ fw-context db list
+Project: my-zephyr-app  path=/home/user/zephyr-app
+
+*a1b2c3d4e5f6  main: add UART driver
+  First indexed:  2026-06-01 12:00:00      Last indexed:    2026-06-05 09:35:18
+  Symbols:        12,430                   Files:           1,502  Refs:    8,900
+
+7f8e9d0c1b2a  feature/spi: WIP SPI rewrite
+  First indexed:  2026-06-03 14:22:10      Last indexed:    2026-06-04 18:10:05
+  Symbols:        12,318                   Files:           1,498  Refs:    8,756
+
+* = active build (a1b2c3d4e5f6...)
+```
+
+#### `fw-context db stats`
+
+Show detailed statistics for a specific build: symbols by kind, LLM
+analysis coverage, embedding count, reference count, PageRank coverage,
+and more.
+
+```bash
+$ fw-context db stats a1b2c3d4e5f6
+Build:          a1b2c3d4e5f6...
+  Description:  main: add UART driver
+  First indexed: 2026-06-01 12:00:00
+  Last indexed: 2026-06-05 09:35:18
+  ...
+
+Symbols by kind:
+  function                  5 212
+  method                    3 108
+  class                       482
+  ...
+  TOTAL                    12 430
+  Definitions (is_definition=1): 8 450
+
+LLM analysis:   8 450 / 8 450 definitions analyzed
+  Coverage:     100%
+  Unanalyzed:   0
+Embeddings:     12 430 symbols with embeddings
+Files:          1 502
+References:     8 900
+Macros:         1 234
+Indirect calls: 156
+FP assignments: 89
+Overrides:      42
+Hotspot cache:  20
+PageRank cov:   12 430 / 12 430 symbols
+```
+
+#### `fw-context db delete`
+
+Delete a specific build, by its config hash. You can resolve a hash with
+the first 12 or more characters.
+
+```bash
+fw-context db delete a1b2c3d4e5f6       # delete a build (interactive confirmation)
+fw-context db delete a1b2c3d4e5f6 -y    # skip confirmation
+fw-context db delete --all              # delete the entire index
+fw-context db delete --all -y           # delete all without confirmation
+```
+
+You cannot delete the active build without `--force`. You cannot delete
+the only build: use `--all` instead.
+
+#### `fw-context db cleanup`
+
+Remove orphaned `compile_commands.<hash>.json` artifacts that have no
+matching build in the index.
+
+```bash
+fw-context db cleanup                  # clean up for current project
+fw-context db cleanup --project /path  # clean up for specific project
 ```
 
 ### `fw-context init`
@@ -263,6 +346,52 @@ Remote cache configured: https://fw-cache.montyho.com
 Config written to: /path/to/project/.fw-context/local.toml
 Run 'fw-context cache stats --remote' to verify.
 ```
+
+### `fw-context finetune`
+
+Fine-tune the embedding model on project code. This command generates
+synthetic training pairs from the symbol index, and trains the embedding
+model to produce better vector representations of your codebase.
+
+```bash
+fw-context finetune                          # fine-tune on current project
+fw-context finetune --project /path          # fine-tune on specific project
+fw-context finetune --sample-limit 500       # limit training pairs
+fw-context finetune --epochs 5               # number of training epochs
+fw-context finetune --batch-size 32          # training batch size
+```
+
+This command requires the `st` extra: `pip install fw-context-mcp[st]`.
+You can control the number of synthetic pairs with `--sample-limit`
+(default 2000). More epochs and pairs give better quality, but take
+more time.
+
+### `fw-context doctor`
+
+Audit the installation: check dependencies, file permissions, database
+integrity, and configuration. This command reports issues, and can
+attempt automatic repairs.
+
+```bash
+fw-context doctor                    # audit, report issues
+fw-context doctor --fix              # audit and attempt repair
+fw-context doctor --json             # machine-readable JSON output
+fw-context doctor --project /path    # audit specific project
+```
+
+`fw-context doctor` checks:
+
+- The Python version and required packages
+- The Ollama installation and model availability
+- The libclang shared library and its version
+- The SQLite version and FTS5 support
+- Index database integrity and schema compatibility
+- Configuration file syntax and key validity
+- File permissions for the index directory and config files
+
+When you run this command with `--fix`, it attempts to repair fixable
+issues automatically. The command reports issues that it cannot fix, and
+tells you how to fix them manually.
 
 ### `fw-context watch`
 
