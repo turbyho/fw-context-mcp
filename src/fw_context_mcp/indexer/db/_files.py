@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sqlite3
+from contextlib import nullcontext
 from typing import NamedTuple
 
 from ...utils import escape_like as _escape_like
@@ -15,6 +16,8 @@ __all__ = [
     "get_file_map",
     "get_file_mtime_indexed",
     "get_file_mtimes",
+    "purge_file_records",
+    "purge_missing_files_batch",
     "upsert_file",
 ]
 
@@ -254,3 +257,164 @@ def get_file_map(
         "total_symbols": len(rows),
         "symbols": groups,
     }
+
+
+def _delete_dangling_incoming_refs(conn: sqlite3.Connection, config_hash: str, purged_usrs: list[str]) -> None:
+    """Delete edges from surviving files that point at now-purged symbols.
+
+    Only called from the file-gone-forever purge path. Do NOT fold this
+    into delete_inheritance_for_file/delete_overrides_for_file — those
+    two are also called from the reindex/reuse path where the file is being
+    RE-PARSED, not deleted.
+    """
+    chunk = 400
+    for i in range(0, len(purged_usrs), chunk):
+        batch = purged_usrs[i : i + chunk]
+        ph = ",".join("?" * len(batch))
+        conn.execute(
+            f"DELETE FROM inheritance WHERE config_hash = ? AND base_usr IN ({ph})",
+            (config_hash, *batch),
+        )
+        conn.execute(
+            f"DELETE FROM overrides WHERE config_hash = ? AND base_usr IN ({ph})",
+            (config_hash, *batch),
+        )
+        conn.execute(
+            f"DELETE FROM refs WHERE config_hash = ? AND to_usr IN ({ph})",
+            (config_hash, *batch),
+        )
+        conn.execute(
+            f"DELETE FROM indirect_call_sites WHERE config_hash = ? AND target_usr IN ({ph})",
+            (config_hash, *batch),
+        )
+        conn.execute(
+            f"DELETE FROM fp_assignments WHERE config_hash = ? AND (lhs_usr IN ({ph}) OR rhs_usr IN ({ph}))",
+            (config_hash, *batch, *batch),
+        )
+
+
+def purge_file_records(
+    conn: sqlite3.Connection,
+    config_hash: str,
+    file_id: int,
+    file_path: str,
+    *,
+    db_dir: object = None,
+    write_lock_held: bool = False,
+    transaction_held: bool = False,
+) -> int:
+    """Delete all index records for a single file across all tables.
+
+    Returns the number of symbols removed.
+    """
+    from ._connection import transaction
+    from ._inheritance import delete_inheritance_for_file, delete_overrides_for_file
+    from ._locking import write_lock
+    from ._refs import (
+        delete_fp_assignments_for_file,
+        delete_indirect_call_sites_for_file,
+        delete_refs_for_file,
+    )
+    from ._symbols import delete_macros_for_file
+
+    lock = (
+        write_lock(db_dir, timeout=60.0)
+        if not write_lock_held and db_dir is not None
+        else nullcontext()
+    )
+    tx = transaction(conn) if not transaction_held else nullcontext()
+    with lock, tx:
+        purged_usrs = [
+            r[0]
+            for r in conn.execute(
+                "SELECT usr FROM symbols WHERE config_hash = ? AND file_id = ?",
+                (config_hash, file_id),
+            ).fetchall()
+        ]
+        delete_inheritance_for_file(conn, config_hash, file_id)
+        delete_overrides_for_file(conn, config_hash, file_id)
+        if purged_usrs:
+            _delete_dangling_incoming_refs(conn, config_hash, purged_usrs)
+        try:
+            conn.execute(
+                "DELETE FROM vec_symbols WHERE symbol_id IN "
+                "(SELECT id FROM symbols WHERE file_id = ?)",
+                (file_id,),
+            )
+        except sqlite3.OperationalError:
+            pass
+        delete_macros_for_file(conn, file_id)
+        symbol_count = len(purged_usrs)
+        delete_symbols_for_file(conn, file_id)
+        delete_refs_for_file(conn, config_hash, file_path)
+        delete_indirect_call_sites_for_file(conn, config_hash, file_path)
+        delete_fp_assignments_for_file(conn, config_hash, file_path)
+        conn.execute("DELETE FROM files WHERE id = ?", (file_id,))
+    return symbol_count
+
+
+def purge_missing_files_batch(
+    conn: sqlite3.Connection,
+    config_hash: str,
+    files: list[tuple[int, str]],
+    *,
+    db_dir: object = None,
+    write_lock_held: bool = False,
+    transaction_held: bool = False,
+) -> int:
+    """Delete all index records for multiple files in one lock/transaction.
+
+    Same table order as :func:`purge_file_records`, one lock acquisition
+    and one transaction for the whole batch.  Dangling incoming references
+    are cleaned in a single pass over the union of all purged USRs.
+
+    Returns the total number of symbols removed.
+    """
+    from ._connection import transaction
+    from ._inheritance import delete_inheritance_for_file, delete_overrides_for_file
+    from ._locking import write_lock
+    from ._refs import (
+        delete_fp_assignments_for_file,
+        delete_indirect_call_sites_for_file,
+        delete_refs_for_file,
+    )
+    from ._symbols import delete_macros_for_file
+
+    lock = (
+        write_lock(db_dir, timeout=60.0)
+        if not write_lock_held and db_dir is not None
+        else nullcontext()
+    )
+    tx = transaction(conn) if not transaction_held else nullcontext()
+    with lock, tx:
+        all_purged_usrs: list[str] = []
+        for file_id, _file_path in files:
+            usrs = [
+                r[0]
+                for r in conn.execute(
+                    "SELECT usr FROM symbols WHERE config_hash = ? AND file_id = ?",
+                    (config_hash, file_id),
+                ).fetchall()
+            ]
+            delete_inheritance_for_file(conn, config_hash, file_id)
+            delete_overrides_for_file(conn, config_hash, file_id)
+            try:
+                conn.execute(
+                    "DELETE FROM vec_symbols WHERE symbol_id IN "
+                    "(SELECT id FROM symbols WHERE file_id = ?)",
+                    (file_id,),
+                )
+            except sqlite3.OperationalError:
+                pass
+            delete_macros_for_file(conn, file_id)
+            all_purged_usrs.extend(usrs)
+            delete_symbols_for_file(conn, file_id)
+        if all_purged_usrs:
+            _delete_dangling_incoming_refs(conn, config_hash, all_purged_usrs)
+        symbol_count = len(all_purged_usrs)
+        for file_id, file_path in files:
+            delete_refs_for_file(conn, config_hash, file_path)
+            delete_indirect_call_sites_for_file(conn, config_hash, file_path)
+            delete_fp_assignments_for_file(conn, config_hash, file_path)
+            conn.execute("DELETE FROM files WHERE id = ?", (file_id,))
+    return symbol_count

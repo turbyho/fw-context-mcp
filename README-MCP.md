@@ -113,6 +113,31 @@ Tool errors use `isError: false`. The tool call succeeded, but the result contai
 ]
 ```
 
+#### Ghost-record purge after file deletion
+
+When a source file is deleted from disk (e.g. after a git branch switch),
+the next `fw-context index` run automatically removes its symbols, references,
+and edges from the index. The query-time staleness check now detects deleted
+files and triggers a background reindex, which in turn runs the purge.
+
+A safety guard prevents accidental mass deletion: the automatic purge aborts
+when more than 20 percent of indexed files are missing from disk. This guards
+against offline network mounts or a wrong project root.
+
+Configure the threshold in `.fw-context/config.toml`:
+
+```toml
+[index]
+purge_max_missing_percent = 20   # default; set to 100 to disable the guard
+```
+
+The log contains a warning when the guard blocks a purge:
+
+```
+Ghost-file purge aborted: 150/200 files (75.0%) missing from disk (threshold 20%).
+Possible offline mount or wrong project root.
+```
+
 ### Database corruption
 
 The server runs `PRAGMA integrity_check` on every database open. If the check finds corruption, the tools return a structured error:

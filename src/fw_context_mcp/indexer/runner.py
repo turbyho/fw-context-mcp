@@ -95,6 +95,7 @@ def run(
     config_header: str = "",
     build_dir_patterns: list[str] | None = None,
     analyze_vendor: bool = False,
+    purge_max_missing_percent: int = 20,
 ) -> str:
     """Index a project: parse translation units, extract symbols, and store to SQLite.
 
@@ -486,6 +487,7 @@ def run(
         llm_config=llm_config,
         cache_server_config=cache_server_config,
         force=force,
+        purge_max_missing_percent=purge_max_missing_percent,
     )
 
     elapsed = time.monotonic() - t0

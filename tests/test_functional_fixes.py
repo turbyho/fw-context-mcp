@@ -84,6 +84,9 @@ class TestSearchContentFts5GracefulFallback:
             ("hash-F5", project_id, str(tmpdir / "compile_commands.json")),
         )
         upsert_file(conn, "hash-F5", "a.cpp", "cpp", False, 0.0)
+        # Create the actual file on disk — WP4 staleness fix detects missing
+        # files as stale, which would trigger daemon startup in _with_stale_recovery.
+        (tmpdir / "a.cpp").write_text("#define FOO 1\nint main() { return 0; }\n")
         conn.execute(
             "UPDATE files SET content = ? WHERE config_hash = ?",
             ("#define FOO 1\nint main() { return 0; }\n", "hash-F5"),
@@ -94,6 +97,7 @@ class TestSearchContentFts5GracefulFallback:
         from fw_context_mcp.mcp.handlers import search as search_mod
         from fw_context_mcp.mcp.handlers._base import BaseHandler, DbContext
         from fw_context_mcp.mcp.shared.executor import SyncQueryExecutor
+        from fw_context_mcp.mcp.shared.stale import _stale_files
 
         db_ctx = DbContext(
             db_path=db_path,
@@ -105,9 +109,13 @@ class TestSearchContentFts5GracefulFallback:
         )
         with mock.patch.object(BaseHandler, "resolve_db_context", return_value=db_ctx):
             with mock.patch.object(search_mod, "_db_path", return_value=db_path):
-                result = search_mod.search_content(
-                    query="#define", project_root=str(tmpdir)
-                )
+                with mock.patch(
+                    "fw_context_mcp.mcp.shared.stale._stale_files",
+                    return_value=[],
+                ):
+                    result = search_mod.search_content(
+                        query="#define", project_root=str(tmpdir)
+                    )
         assert isinstance(result, list)
         assert result, "search_content should return at least one matching file"
         assert result[0]["file"].endswith("a.cpp")
