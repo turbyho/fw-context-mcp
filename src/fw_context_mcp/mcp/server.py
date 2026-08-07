@@ -1,6 +1,6 @@
 """fw-context MCP server — build-aware code intelligence for embedded C/C++ projects.
 
-Serves 34 MCP tools and 4 MCP resources via FastMCP (stdio transport).
+Serves 35 MCP tools and 4 MCP resources via FastMCP (stdio transport).
 
 **Concurrency:** The server processes at most ONE tool request at a time.
 If a request arrives while another is already running, the server waits up
@@ -13,7 +13,8 @@ on the SQLite executor would otherwise cause client-side timeouts and
 
 **Search & lookup tools** (delegate to ``fw_context_mcp.search`` pipeline):
 ``search_code`` (FTS5), ``lookup_symbol`` (exact/prefix), ``smart_search``
-(Ollama-driven), ``semantic_search`` (embeddings + cosine similarity).
+(Ollama-driven), ``semantic_search`` (embeddings + cosine similarity),
+``search_bodies`` (function body text), ``search_content`` (full file content).
 
 **Symbol reading tools:** ``get_source``, ``get_file_map``, ``get_symbol_context``,
 ``explain_symbol``, ``read_file``.
@@ -27,7 +28,10 @@ on the SQLite executor would otherwise cause client-side timeouts and
 **Inheritance tools:** ``get_inheritance_chain``, ``get_class_members``,
 ``get_template_instances``, ``get_method_overrides``.
 
-**Maintenance tools:** ``get_active_build``, ``list_projects``, ``check_ollama``,
+**Variables:** ``find_variables``.
+
+**Maintenance tools:** ``get_active_build``, ``list_projects``,
+``get_project_info``, ``check_ollama``, ``configure_llm``,
 ``reindex_file``, ``reindex_file_impl``, ``reset_index``.
 
 **MCP Resources:** ``fw-context://stats``, ``fw-context://projects``,
@@ -127,7 +131,7 @@ def _wrap_tool(fn):
                             from .shared.context import interrupt_all
 
                             interrupt_all()
-                        except Exception:
+                        except Exception:  # nosec B110 — best-effort interrupt on timeout
                             pass
                         return [{"error": f"Tool {fn.__name__} timed out after {elapsed}s"}]
 
@@ -174,7 +178,7 @@ def _wrap_tool(fn):
                         from .shared.context import interrupt_all
 
                         interrupt_all()
-                    except Exception:
+                    except Exception:  # nosec B110 — best-effort interrupt on timeout
                         pass
                     return [{"error": f"Tool {fn.__name__} timed out after {elapsed}s"}]
 

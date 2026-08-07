@@ -11,11 +11,11 @@ import time
 from collections.abc import Generator
 from contextlib import contextmanager
 from datetime import UTC, datetime
-from pathlib import Path
 
 import httpx
 
 from ..config.settings import LLMConfig
+from ._debug import _write_debug_log
 from .embedder import Embedder
 
 log = logging.getLogger(__name__)
@@ -259,9 +259,6 @@ def _extract_ollama_chunk(line: str | None, chunks: list[str]) -> None:
             chunks.append(chunk)
     except json.JSONDecodeError:
         pass
-
-
-from ._debug import _write_debug_log
 
 
 def call_ollama(
