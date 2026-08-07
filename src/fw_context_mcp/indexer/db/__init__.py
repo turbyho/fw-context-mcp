@@ -10,6 +10,7 @@ __all__ = [
     "_cosine_sim",
     "_ensure_column",
     "_expand_query",
+    "_resolve_target_usr",
     "count_fp_assignments",
     "count_indirect_call_sites",
     "count_llm_analysis",
@@ -86,7 +87,7 @@ __all__ = [
 import logging
 
 from ._callgraph import (
-    _resolve_target_usr,
+    _resolve_target_usr,  # noqa: F401 — re-exported for ops.py
     find_all_callers_recursive,
     find_call_path,
     find_callees_recursive,

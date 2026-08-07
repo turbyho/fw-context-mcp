@@ -658,15 +658,15 @@ def _step_expand_macros(conn: sqlite3.Connection, ctx: dict) -> None:
     """Resolve and store expanded macro values (libclang-powered)."""
     from .macros import resolve_and_update
 
-    seen_flags: set[tuple] = set()
+    # Process all TUs — different TUs include different headers,
+    # so each contributes a different set of expanded macro values.
+    # Deduplicating by flags would miss macros only visible from
+    # TUs that include project config headers.
     for unit in ctx["units"]:
-        flag_key = tuple(sorted(unit.clang_args))
-        if flag_key in seen_flags:
-            continue
-        seen_flags.add(flag_key)
         try:
             resolve_and_update(
-                conn, ctx["config_hash"], unit.clang_args, unit.file.resolve(),
+                conn, ctx["config_hash"], unit.clang_args,
+                unit.file.resolve(), cwd=ctx.get("project_root"),
             )
         except SAFE_EXCEPT as e:
             if is_fatal(e):
@@ -742,6 +742,24 @@ def _step_build_overrides(conn: sqlite3.Connection, ctx: dict) -> None:
         conn.commit()
     _build_overrides(conn, config_hash, ctx["db_dir"])
     conn.commit()
+
+
+def _step_backfill_cross_tu_refs(conn: sqlite3.Connection, ctx: dict) -> None:
+    """Backfill call references that per-TU symbol lookup could not resolve.
+
+    Per-TU ``_qn_to_usr`` only contains symbols from the current
+    translation unit.  Cross-TU method calls (e.g. a private method
+    defined in another ``.cpp`` file) are resolved here using the
+    complete symbols table, which is available after the TU loop.
+    Must run BEFORE PageRank so the call graph is complete.
+    """
+    from .ops import backfill_cross_tu_refs
+
+    config_hash = ctx["config_hash"]
+    project_root = ctx["project_root"]
+    added = backfill_cross_tu_refs(conn, config_hash, project_root)
+    if added:
+        log.info("Cross-TU ref backfill: %d references added", added)
 
 
 def _step_pagerank_hotspot(conn: sqlite3.Connection, ctx: dict) -> None:
@@ -834,6 +852,7 @@ _STEPS: list[tuple[str, Callable[..., None], Callable[..., bool] | None]] = [
     ("embeddings",       _step_build_embeddings,   lambda c: c["index_embeddings"] and c["llm_config"] is not None and c["llm_config"].enabled),
     ("llm_analysis",     _step_llm_analysis,       lambda c: c["analyze_symbols"] and c["llm_config"] is not None and c["llm_config"].enabled),
     ("overrides",        _step_build_overrides,    lambda c: c["analyze_overrides"]),
+    ("cross_tu_refs",    _step_backfill_cross_tu_refs, lambda c: c["index_refs"]),
     ("pagerank_hotspot", _step_pagerank_hotspot,   lambda c: c["index_refs"]),
     ("finalize_manifest", _step_finalize_manifest,  None),
     ("cleanup_old",      _step_cleanup_old_builds,  None),
