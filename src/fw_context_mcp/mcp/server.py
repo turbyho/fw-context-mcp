@@ -453,7 +453,7 @@ def main() -> None:
         db_path = cfg.index.db_dir / project_id / "index.db"
         if db_path.exists():
             _integrity_checked.add(str(db_path.resolve()))
-    except (OSError, ValueError):
+    except (OSError, ValueError, RuntimeError):
         log.warning("Failed to pre-mark integrity check — will run on first query", exc_info=True)
 
     try:
