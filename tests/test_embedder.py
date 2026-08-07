@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import pytest
 
+pytest.importorskip("numpy", reason="numpy not installed")
+
 from fw_context_mcp.config.settings import DESCRIPTION_VERSION, LLMConfig
 from fw_context_mcp.llm.embedder import Embedder
 from fw_context_mcp.llm.embedder_factory import get_embedder

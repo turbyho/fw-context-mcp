@@ -1,7 +1,11 @@
 """Tests for MakefileBuildSystem — compile_commands.json via compiledb."""
 
+import pytest
+
 from fw_context_mcp.indexer.build import BuildConfig
 from fw_context_mcp.indexer.builders.makefile import MakefileBuildSystem
+
+pytest.importorskip("compiledb", reason="compiledb not installed")
 
 
 class TestMakefileBuildSystem:
