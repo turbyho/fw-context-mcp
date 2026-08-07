@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import logging
 import sqlite3
 import time
@@ -25,7 +26,7 @@ from ...indexer.db import (
     open_db,
     transaction,
 )
-from ...llm._diag import check_setup
+from ...llm.ollama import OllamaError, check_setup
 from ...utils import resolve_project_root
 from ..background import _is_bg_reindex_running
 from ..shared.context import (
@@ -67,7 +68,9 @@ def get_active_build(
     * ``"reindex_needed"`` — compile_commands.json changed or schema
       mismatch. Run ``fw-context index``, but queries still work on
       existing data.
-    * ``"no_index"`` — no build config indexed. Use other tools.
+    * ``"no_index"`` — project initialized but no index built yet.
+    * ``"not_initialized"`` — project has not been initialized
+      (``fw-context init`` not run).
     * ``"error"`` — DB corruption or access error. Use other tools.
 
     ``reindex_needed`` is True when a structural mismatch exists: schema
@@ -103,15 +106,42 @@ def get_active_build(
         reindex_progress (str or None — last log line when reindex is running),
         schema_version (int — DB schema version),
         current_schema (int — code expects), status (str — "ready"|"reindexing"|
-        "reindex_needed"|"no_index"|"error"), reindex_needed (bool —
+        "reindex_needed"|"no_index"|"not_initialized"|"error"), reindex_needed (bool —
         structural mismatch requiring a full reindex),
         reindex_reasons (list[str] — why reindex is needed, empty when False),
         index_message (str — human-readable summary of index state)}
     """
     root = resolve_project_root(project_root)
-    db_path = _db_path(root)
+    # Resolve project ID directly — bypass _db_path/derive_project_id so
+    # get_active_build can report not_initialized/no_index gracefully
+    # instead of raising.  Other tools still use derive_project_id
+    # (via _resolve_context) and raise ProjectNotInitializedError when
+    # the project is not initialized — fail-fast for operational tools,
+    # graceful degradation for this diagnostic tool.
+    fw_cfg = load_config(root)
+    project_id = fw_cfg.project.id
+    if not project_id:
+        return {
+            "status": "not_initialized",
+            "project_root": str(root),
+            "index_message": (
+                f"Project at {root} is not initialized. "
+                "Run `fw-context init` via bash to create a project ID and config, "
+                "then call get_active_build() again."
+            ),
+        }
+    db_path = fw_cfg.index.db_dir / project_id / "index.db"
     if not db_path.exists():
-        return {"error": f"No index found for {root}. Run 'fw-context index' first."}
+        return {
+            "status": "no_index",
+            "project_root": str(root),
+            "project_id": project_id,
+            "index_message": (
+                f"No symbol index found for {root}. "
+                "Run `fw-context index <path/to/compile_commands.json>` via bash "
+                "to build the index, then call get_active_build() again."
+            ),
+        }
 
     # Check bg reindex status BEFORE querying the DB — when a bg reindex
     # is running, the _modified_cache may contain stale counts from before
@@ -671,8 +701,8 @@ def _reindex_parse_and_store(
                     try:
                         from ...indexer.macros import resolve_and_update
                         first_unit = parsed_units[0][0]
-                        resolve_and_update(conn, config_hash, first_unit.clang_args, first_unit.file.resolve())
-                    except (RuntimeError, sqlite3.Error):
+                        resolve_and_update(conn, config_hash, first_unit.clang_args, first_unit.file.resolve(), cwd=root)
+                    except Exception:
                         pass
 
                 from ...indexer.db import delete_orphan_files
@@ -1076,8 +1106,8 @@ def check_ollama(
         ollama_running (bool), ollama_url (str), configured_model (str),
         num_ctx (int), installed_models (list[str]),
         configured_embed_model (str), embedding_installed (bool),
-        message (str, on error/disabled), available_code_models (list[str], when model missing),
-        debug_log (str, optional — only when debug logging is enabled)}
+        message (str, on error/disabled), model_details (list[dict], when Ollama running),
+        suggest_cloud (bool), debug_log (str, optional — only when debug logging is enabled)}
     """
     try:
         _, cfg, _, _ = _resolve_context(project_root)
@@ -1140,4 +1170,172 @@ def get_project_info(
     result = get_project_by_id(project_id)
     if result is None:
         return {"error": f"Project '{project_id}' not found in the global registry."}
+    return result
+
+
+def configure_llm(
+    project_root: Annotated[str | None, Field(description="Project root. Auto-detected if omitted.")] = None,
+    chat_api_base: Annotated[
+        str | None,
+        Field(
+            description=(
+                "Chat API URL. None = use local Ollama for chat. "
+                "Auto-detects format: :11434 or /api/generate -> Ollama, "
+                "/v1 or bare host -> OpenAI-compatible. "
+                "Examples: 'https://api.deepseek.com/v1' (DeepSeek), "
+                "'http://localhost:4000' (LiteLLM), "
+                "'http://localhost:8080/v1' (llama.cpp). "
+                "WARNING: external URLs send source code to that host."
+            )
+        ),
+    ] = None,
+    chat_api_key: Annotated[
+        str | None,
+        Field(description="API key for cloud/proxy APIs. None for local/no-auth."),
+    ] = None,
+    chat_api_format: Annotated[
+        str,
+        Field(description="Format override: 'auto' (default), 'ollama', or 'openai'."),
+    ] = "auto",
+    model: Annotated[
+        str | None,
+        Field(description="Chat model name. None = keep current."),
+    ] = None,
+    embed_model: Annotated[
+        str | None,
+        Field(description="Embedding model name (Ollama only). None = keep current."),
+    ] = None,
+    auto_pull: Annotated[
+        bool,
+        Field(description="Auto-pull models on 404 (Ollama only). False for intranet."),
+    ] = False,
+    stream: Annotated[
+        bool | None,
+        Field(
+            description=(
+                "Stream chat responses via SSE (both OpenAI-compatible and Ollama-native). "
+                "True = send stream:true, consume SSE chunks — avoids reverse-proxy idle "
+                "timeouts (nginx 60s, Cloudflare 100s). None = keep current setting."
+            )
+        ),
+    ] = None,
+) -> dict:
+    """Configure LLM settings for the current project.
+
+    Writes to ``<project>/.fw-context/local.toml`` ONLY (gitignored,
+    per-developer). Does NOT modify the global config or the shared
+    project ``config.toml``. After writing, tests the configuration
+    by making a simple API call.
+
+    IMPORTANT: When ``chat_api_base`` points to an external host, source
+    code snippets in chat prompts will be sent to that endpoint. Ensure
+    this complies with your organization's data security policies.
+    Consider using local Ollama or an internal API proxy first.
+
+    Args:
+        project_root: Project root directory. Auto-detected if omitted.
+        chat_api_base: Chat API URL (see description for format details).
+        chat_api_key: Bearer token for cloud/proxy APIs.
+        chat_api_format: Override auto-detection: "auto", "ollama", "openai".
+        model: Chat model name.
+        embed_model: Embedding model name (Ollama only).
+        auto_pull: Whether to auto-pull models on 404.
+        stream: Stream chat responses via SSE. True avoids reverse-proxy idle timeouts.
+
+    Returns:
+        dict: {status ("ok"|"error"), chat_api (dict), model, test_latency_s (float, on success), message (str, on error)}
+    """
+    from ...config.settings import ProjectNotInitializedError, _is_loopback_url, _update_local_toml
+
+    try:
+        _, cfg, _, root = _resolve_context(project_root, skip_ready_check=True)
+    except ProjectNotInitializedError as e:
+        return {
+            "status": "error",
+            "message": (
+                f"Project is not initialized. Run 'fw-context init' in the "
+                f"project root first. ({e.root})"
+            ),
+        }
+
+    # Build updates dict — only non-None values are written
+    updates: dict[str, object] = {}
+    if chat_api_base is not None:
+        updates["chat_api_base"] = chat_api_base
+    if chat_api_key is not None:
+        updates["chat_api_key"] = chat_api_key
+    if chat_api_format != "auto":
+        updates["chat_api_format"] = chat_api_format
+    if model is not None:
+        updates["model"] = model
+    if embed_model is not None:
+        updates["embed_model"] = embed_model
+    if auto_pull != cfg.llm.auto_pull:
+        updates["auto_pull"] = auto_pull
+    if stream is not None:
+        updates["stream"] = stream
+
+    if not updates:
+        return {
+            "status": "error",
+            "message": "No configuration changes to write — all parameters are None or default.",
+        }
+
+    # Compliance warning for external URLs
+    result: dict = {}
+    if chat_api_base and not _is_loopback_url(chat_api_base):
+        result["compliance_warning"] = (
+            f"Chat API set to external host ({chat_api_base}). "
+            "Source code snippets in chat prompts WILL be sent to this "
+            "endpoint. Ensure compliance with your organization's data "
+            "security policies. Consider using local Ollama or an internal "
+            "API proxy."
+        )
+
+    # Write to local.toml (only local.toml — never global or shared config)
+    try:
+        _update_local_toml(Path(root), updates)
+    except Exception as e:
+        return {
+            "status": "error",
+            "message": f"Failed to write local.toml: {e}",
+        }
+
+    # Reload config (cache is mtime-based — file change triggers reload)
+    new_cfg = load_config(project_root=Path(root))
+    result["chat_api"] = {
+        "configured": bool(new_cfg.llm.chat_api_base),
+        "endpoint": new_cfg.llm.chat_api_base,
+        "model": new_cfg.llm.model,
+    }
+    result["model"] = new_cfg.llm.model
+    result["auto_pull"] = new_cfg.llm.auto_pull
+    result["stream"] = new_cfg.llm.stream
+
+    # Test the configuration with a simple API call
+    if not new_cfg.llm.enabled:
+        result["status"] = "ok"
+        result["message"] = "Configuration written. LLM is disabled — no test call made."
+        return result
+
+    try:
+        from ...llm.ollama import call_ollama
+
+        t0 = time.monotonic()
+        test_cfg = dataclasses.replace(new_cfg.llm, timeout=30.0)
+        response = call_ollama(
+            "Reply with exactly: OK",
+            test_cfg,
+            temperature=0.0,
+            num_predict=10,
+        )
+        latency = round(time.monotonic() - t0, 2)
+        result["status"] = "ok"
+        result["test_latency_s"] = latency
+        result["test_response"] = response[:100]
+        result["message"] = f"Configuration written and tested successfully ({latency}s)."
+    except OllamaError as e:
+        result["status"] = "error"
+        result["message"] = f"Configuration written but test call failed: {e}. Check the API URL, key, and model name."
+
     return result

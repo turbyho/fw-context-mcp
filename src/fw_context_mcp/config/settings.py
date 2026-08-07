@@ -11,6 +11,8 @@ from __future__ import annotations
 
 import ipaddress
 import logging
+import re
+import sys
 import tomllib
 from collections import OrderedDict
 from collections.abc import Callable
@@ -24,8 +26,15 @@ from ..indexer.build import BuildConfig
 log = logging.getLogger(__name__)
 
 __all__ = [
-    "CacheServerConfig", "Config", "LLMConfig", "IndexConfig", "ProjectMeta",
-    "ProjectNotInitializedError", "derive_project_id", "generate_project_id", "load",
+    "CacheServerConfig",
+    "Config",
+    "LLMConfig",
+    "IndexConfig",
+    "ProjectMeta",
+    "ProjectNotInitializedError",
+    "derive_project_id",
+    "generate_project_id",
+    "load",
     "update_global_config",
 ]
 
@@ -213,6 +222,33 @@ _PROJECT_LOCAL_DEFAULTS_TEMPLATE = """\
 # analyze_symbols = true    # generate structured symbol descriptions (summary, inputs, outputs) — enabled by default
 # analyze_vendor = false    # when true, also analyze vendor/SDK code (mbed-os, Zephyr, etc.) — can add hours
 
+# ── Chat API — use OpenAI-compatible API for chat instead of local Ollama ──
+# When set, chat calls are routed to this endpoint. Embedding still uses
+# local Ollama (embed_model above). Format is auto-detected from the URL:
+#   :11434 or /api/generate → Ollama native (keeps keep_alive, num_ctx, auto_pull)
+#   /v1 or bare host       → OpenAI-compatible (DeepSeek, OpenAI, LiteLLM, vLLM, etc.)
+# Examples:
+#   chat_api_base = "https://api.deepseek.com/v1"   # DeepSeek
+#   chat_api_base = "https://api.openai.com/v1"     # OpenAI
+#   chat_api_base = "http://localhost:4000"          # LiteLLM proxy
+#   chat_api_base = "http://localhost:8080/v1"       # llama.cpp
+# chat_api_base = ""
+# chat_api_key = ""   # Bearer token — required by most cloud APIs
+# chat_api_format = "auto"   # "auto" | "ollama" | "openai" (override detection)
+
+# Auto-pull models on 404 (Ollama only). Set true for auto-recovery in
+# online environments. Set false (default) for intranet/offline — model
+# pulls must be done explicitly via `ollama pull` or the agent flow.
+# auto_pull = false
+
+# Stream chat responses (both OpenAI-compatible and Ollama-native).
+# When true, sends stream:true and consumes SSE chunks — keeps the HTTP
+# connection alive with continuous data flow, avoiding reverse-proxy idle
+# timeouts (nginx 60s, Cloudflare 100s). Default false — non-streaming is
+# sufficient for local Ollama. When false, SSE responses are still
+# auto-detected and parsed as a fallback.
+# stream = false
+
 [index]
 # db_dir = "~/.fw-context/index"   # where to store the SQLite index database
 """
@@ -259,19 +295,26 @@ class LLMConfig:
             Set ``"0"`` to unload immediately (saves VRAM, adds latency).
             Set ``"-1"`` to keep loaded indefinitely.
         analyze_symbols: Generate per-symbol summaries, inputs, and outputs during indexing.
-         analyze_vendor: When False (default), skip LLM analysis for vendor/SDK code
-             (mbed-os, Zephyr, PlatformIO, etc.) — only project code is analyzed.
-         reranker_model: Optional cross-encoder model name for result reranking.
-             When set (e.g. ``"cross-encoder/ms-marco-MiniLM-L6-v2"``), search
-             results are rescored by the cross-encoder for higher precision.
-             Default ``None`` — no reranking.
-             Set True to analyze every indexed symbol regardless of origin.
-         ollama_max_concurrent: Maximum concurrent in-flight Ollama HTTP calls per
-             process.  Default 1 (serial, identical to a Lock).  Increase to 2–4
-             for multi-client MCP transports (SSE/streamable) where embedding
-             requests (small model, ~100 ms) can overlap without saturating the
-             GPU.  Chat requests are GPU-heavy — keep this low.
+        analyze_vendor: When False (default), skip LLM analysis for vendor/SDK code
+            (mbed-os, Zephyr, PlatformIO, etc.) — only project code is analyzed.
+            Set True to analyze every indexed symbol regardless of origin.
+        reranker_model: Optional cross-encoder model name for result reranking.
+            When set (e.g. ``"cross-encoder/ms-marco-MiniLM-L6-v2"``), search
+            results are rescored by the cross-encoder for higher precision.
+            Default ``None`` — no reranking.
+        ollama_max_concurrent: Maximum concurrent in-flight Ollama HTTP calls per
+            process.  Default 1 (serial, identical to a Lock).  Increase to 2–4
+            for multi-client MCP transports (SSE/streamable) where embedding
+            requests (small model, ~100 ms) can overlap without saturating the
+            GPU.  Chat requests are GPU-heavy — keep this low.
+        stream: When True, send ``stream: true`` and consume SSE chunks for chat
+            requests (both OpenAI-compatible and Ollama-native paths).  Keeps the
+            HTTP connection alive with continuous data flow, avoiding reverse-proxy
+            idle timeouts (nginx default 60s, Cloudflare 100s).  Default False —
+            non-streaming is simpler and sufficient for local Ollama.  When False,
+            SSE responses are still auto-detected and parsed (Plan A fallback).
     """
+
     enabled: bool = True
     ollama_url: str = "http://localhost:11434"
     model: str = "qwen2.5-coder:14b"
@@ -290,6 +333,11 @@ class LLMConfig:
     Set to e.g. ``"cross-encoder/ms-marco-MiniLM-L6-v2"`` to enable re-ranking.
     ``None`` (default) skips re-ranking — results are returned in FTS5 order."""
     ollama_max_concurrent: int = 1  # max concurrent Ollama HTTP calls (1=serial, 2–4 for SSE transport)
+    chat_api_base: str | None = None
+    chat_api_key: str | None = None
+    chat_api_format: str = "auto"
+    auto_pull: bool = False
+    stream: bool = False
 
     def embed_key(self) -> str:
         """Return ``embed_model`` with description version for cache disambiguation.
@@ -311,17 +359,12 @@ def _apply_embed_prompt_defaults(llm_cfg: LLMConfig) -> None:
     if llm_cfg.embed_query_prompt == "":
         if model_lower.startswith("qwen3-embedding"):
             llm_cfg.embed_query_prompt = (
-                "Retrieve C/C++ functions, types, symbols, and implementation "
-                "code relevant to the query."
+                "Retrieve C/C++ functions, types, symbols, and implementation code relevant to the query."
             )
         elif model_lower.startswith("mxbai"):
-            llm_cfg.embed_query_prompt = (
-                "Represent this sentence for searching relevant passages: "
-            )
+            llm_cfg.embed_query_prompt = "Represent this sentence for searching relevant passages: "
         elif model_lower.startswith("ibm-granite"):
-            llm_cfg.embed_query_prompt = (
-                "Represent this sentence for searching relevant passages: "
-            )
+            llm_cfg.embed_query_prompt = "Represent this sentence for searching relevant passages: "
     if llm_cfg.embed_doc_prompt == "":
         if model_lower.startswith("qwen3-embedding"):
             llm_cfg.embed_doc_prompt = ""
@@ -363,6 +406,7 @@ class IndexConfig:
             function/method body in the index.  Bodies longer than this are
             truncated.  Default 1000.
     """
+
     db_dir: Path = field(default_factory=lambda: Path.home() / ".fw-context" / "index")
     compile_commands: Path = field(default_factory=lambda: Path("compile_commands.json"))
     config_header: str = ""  # path to build-generated config.h for custom build systems
@@ -390,6 +434,7 @@ class ProjectMeta:
             Generated by ``fw-context init``, stored in
             ``.fw-context/config.toml``.  Shared across the team via git.
     """
+
     name: str | None = None
     id: str | None = None
 
@@ -409,6 +454,7 @@ class CacheServerConfig:
         force: When ``True``, sends ``X-Cache-Overwrite`` header on write
             requests (requires ``can_overwrite`` on the server).
     """
+
     url: str = ""
     token: str = ""
     batch_size: int = 100
@@ -430,11 +476,13 @@ class Config:
         index: Index storage, scoping, and feature flags.
         llm: Ollama configuration for analysis and search.
     """
+
     project: ProjectMeta = field(default_factory=ProjectMeta)
     build: BuildConfig = field(default_factory=BuildConfig)
     index: IndexConfig = field(default_factory=IndexConfig)
     llm: LLMConfig = field(default_factory=LLMConfig)
     cache_server: CacheServerConfig | None = None
+
 
 def _deep_merge(base: dict, override: dict) -> dict:
     result = dict(base)
@@ -669,6 +717,11 @@ _LLM_FIELDS: list[tuple[str, str, str]] = [
     ("analyze_vendor", "analyze_vendor", "bool"),
     ("reranker_model", "reranker_model", "str"),
     ("ollama_max_concurrent", "ollama_max_concurrent", "int(1)"),
+    ("chat_api_base", "chat_api_base", "str"),
+    ("chat_api_key", "chat_api_key", "str"),
+    ("chat_api_format", "chat_api_format", "str"),
+    ("auto_pull", "auto_pull", "bool"),
+    ("stream", "stream", "bool"),
 ]
 
 _KNOWN_SECTIONS: set[str] = {"project", "build", "index", "llm", "cache_server"}
@@ -688,7 +741,7 @@ def _ensure_config_file(path: Path, template: str, label: str) -> Path:
     if not path.exists():
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(template)
+            path.write_text(template, encoding="utf-8")
         except (OSError, PermissionError) as e:
             log.warning("Could not create %s %s: %s", label, path, e)
     return path
@@ -746,34 +799,35 @@ def _ensure_project_local_config(project_root: Path) -> Path:
 
 
 def _validate_config_safety(proj_data: dict, proj_path: Path) -> None:
-    """Raise RuntimeError if committed config contains security-sensitive settings.
+    """Warn if committed config contains security-sensitive settings.
 
     Committed config (.fw-context/config.toml) is shared via git.  Dangerous
     settings should only be in local.toml (gitignored).
 
     .. versionadded:: v0.18
-       New security check — existing projects with ``pre_build`` or
-       ``command`` in committed config.toml will see a RuntimeError on
-       load.  Move these settings to ``local.toml`` to resolve.
     """
     build = proj_data.get("build") or {}
     for key in ("pre_build", "command"):
         if build.get(key):
-            raise RuntimeError(
+            msg = (
                 f"SECURITY: {key} is set in .fw-context/config.toml "
                 f"(committed).  This allows anyone with commit access to run "
                 f"arbitrary shell commands on other developers' machines.  "
                 f"Move {key} to .fw-context/local.toml (gitignored) instead."
             )
+            log.warning(msg)
+            print(f"⚠ {msg}", file=sys.stderr)
 
     ollama_url = (proj_data.get("llm") or {}).get("ollama_url")
     if ollama_url and not _is_loopback_url(ollama_url):
-        raise RuntimeError(
+        msg = (
             f"SECURITY: ollama_url ({ollama_url}) in .fw-context/config.toml "
             f"(committed) points to a non-local host.  Source code snippets in "
             f"LLM prompts would be sent to that host.  Use localhost or move "
             f"ollama_url to .fw-context/local.toml (gitignored) instead."
         )
+        log.warning(msg)
+        print(f"⚠ {msg}", file=sys.stderr)
 
 def _is_loopback_url(url: str) -> bool:
     """True if *url*'s host is a loopback address.
@@ -821,23 +875,21 @@ def load(project_root: Path | None = None) -> Config:
         cached_ts, cached_cfg = _config_cache[cache_key]
         # Check if any source file changed
         try:
-            newest = max(
-                p.stat().st_mtime for p in cache_key if p is not None
-            )
+            newest = max(p.stat().st_mtime for p in cache_key if p is not None)
             if newest <= cached_ts:
                 return cached_cfg
         except OSError:
             pass  # File missing → reload
 
     try:
-        data = tomllib.loads(global_path.read_text())
+        data = tomllib.loads(global_path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         log.exception("Failed to parse %s — using defaults", global_path)
 
     if project_root is not None:
         assert proj_path is not None
         try:
-            proj_data = tomllib.loads(proj_path.read_text())
+            proj_data = tomllib.loads(proj_path.read_text(encoding="utf-8"))
             data = _deep_merge(data, proj_data)
             # Security: validate committed config doesn't contain dangerous settings.
             # pre_build, command, and non-loopback ollama_url in committed config.toml
@@ -848,25 +900,36 @@ def load(project_root: Path | None = None) -> Config:
 
         assert local_path is not None
         try:
-            local_data = tomllib.loads(local_path.read_text())
+            local_data = tomllib.loads(local_path.read_text(encoding="utf-8"))
             data = _deep_merge(data, local_data)
         except (OSError, ValueError):
             log.exception("Failed to parse %s — ignoring local config", local_path)
 
-    # Security: warn when merged config (committed + local) sets a non-loopback
-    # ollama_url.  Committed config is already rejected by _validate_config_safety
-    # above; this catches the local.toml case — still a privacy risk, but not a
-    # supply-chain vector, so a warning (not RuntimeError) is appropriate.
-    final_url = (data.get("llm") or {}).get("ollama_url")
-    if final_url and not _is_loopback_url(final_url):
-        msg = (
-            f"WARNING: non-local ollama_url ({final_url}) — "
-            "source-code snippets in LLM prompts will be sent to an external host. "
-            "Consider using a local model instead."
-        )
-        log.warning(msg)
-        import sys
-        print(f"⚠ {msg}", file=sys.stderr)
+        # Security: a committed or local config can redirect LLM calls (which
+        # include source-code snippets) to an arbitrary host. Warn loudly.
+        final_url = (data.get("llm") or {}).get("ollama_url")
+        if final_url and not _is_loopback_url(final_url):
+            log.warning(
+                "Config sets a non-local ollama_url (%s). "
+                "Source-code snippets in LLM prompts will be sent to that host.",
+                final_url,
+            )
+            print(
+                f"⚠ WARNING: non-local ollama_url ({final_url}) — source code will be sent to an external host.",
+                file=sys.stderr,
+            )
+
+        # Security: chat_api_base may point to an external cloud API.
+        # Unlike ollama_url (which is typically local), chat_api_base is
+        # explicitly chosen by the user for cloud access — so this is an
+        # informational notice, not a loud warning.
+        chat_base = (data.get("llm") or {}).get("chat_api_base")
+        if chat_base and not _is_loopback_url(chat_base):
+            print(
+                f"ℹ Chat API set to external host ({chat_base}). "
+                "Source code snippets in chat prompts will be sent to this endpoint.",
+                file=sys.stderr,
+            )
 
     cfg = _from_dict(data)
     from ..llm.auto_model import resolve_embed_model
@@ -926,3 +989,81 @@ def _write_project_id(project_root: Path, project_id: str) -> None:
     from fw_context_mcp.config._toml_editor import set_key
 
     set_key(config_path, "project", "id", project_id)
+
+
+def _format_toml_value(key: str, value: object) -> str:
+    """Format a key-value pair as a TOML line."""
+    if isinstance(value, bool):
+        val = "true" if value else "false"
+    elif isinstance(value, int):
+        val = str(value)
+    elif isinstance(value, float):
+        val = str(value)
+    else:
+        val = f'"{value}"'
+    return f"{key} = {val}\n"
+
+
+def _update_local_toml(project_root: Path, updates: dict[str, object]) -> None:
+    """Update the ``[llm]`` section of ``<project>/.fw-context/local.toml``.
+
+    Uses line-level editing to preserve comments and other sections.
+    Creates the file from the template if it doesn't exist yet.
+
+    Only writes to ``local.toml`` (gitignored, per-developer) — never
+    touches the global config or the shared project ``config.toml``.
+
+    Args:
+        project_root: Project root directory.
+        updates: Dict of ``{key: value}`` pairs to write.  ``None`` values
+            are skipped (key is not written).  Supported value types:
+            ``str``, ``bool``, ``int``, ``float``.
+    """
+    local_path = project_root / _PROJECT_CONFIG_DIR / _PROJECT_LOCAL_CONFIG_NAME
+    if not local_path.exists():
+        _ensure_project_local_config(project_root)
+
+    lines = local_path.read_text(encoding="utf-8").splitlines(keepends=True)
+
+    # Find [llm] section boundaries
+    in_llm = False
+    llm_start = -1
+    llm_end = len(lines)
+
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        if stripped == "[llm]":
+            in_llm = True
+            llm_start = i + 1
+            continue
+        if in_llm and stripped.startswith("[") and stripped != "[llm]":
+            llm_end = i
+            break
+
+    # Filter out None values
+    to_write = {k: v for k, v in updates.items() if v is not None}
+    if not to_write:
+        return
+
+    if llm_start == -1:
+        # No [llm] section — append one at the end of the file
+        if lines and not lines[-1].endswith("\n"):
+            lines[-1] += "\n"
+        lines.append("\n[llm]\n")
+        llm_start = len(lines)
+        llm_end = len(lines)
+
+    # For each key: find and replace existing line, or insert before llm_end
+    for key, value in to_write.items():
+        found = False
+        for i in range(llm_start, llm_end):
+            stripped = lines[i].strip()
+            if re.match(rf"^#?\s*{re.escape(key)}\s*=", stripped):
+                lines[i] = _format_toml_value(key, value)
+                found = True
+                break
+        if not found:
+            lines.insert(llm_end, _format_toml_value(key, value))
+            llm_end += 1
+
+    local_path.write_text("".join(lines), encoding="utf-8")

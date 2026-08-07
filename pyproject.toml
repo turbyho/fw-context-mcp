@@ -116,4 +116,5 @@ markers = [
     "ollama: tests that require a running Ollama instance",
     "libclang: tests that require libclang and a C compiler (gcc/clang)",
     "system: tests that require real build tools (gcc/CMake/Make/PlatformIO) and run index on test fixtures",
+    "litellm: tests that require a running LiteLLM proxy at localhost:4000",
 ]

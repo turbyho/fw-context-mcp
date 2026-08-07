@@ -86,6 +86,7 @@ __all__ = [
 import logging
 
 from ._callgraph import (
+    _resolve_target_usr,
     find_all_callers_recursive,
     find_call_path,
     find_callees_recursive,

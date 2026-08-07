@@ -397,6 +397,10 @@ async def semantic_search(
             except (RuntimeError, ValueError) as e:
                 log.warning("Reranker failed, returning unranked results: %s", e)
 
+        # Source-aware boost: project code > vendored SDK
+        def _source_boost(row) -> float:
+            return 1.2 if row["is_project"] == 1 else 0.85
+
         # Relevance floor: when the best result has very low similarity,
         # the symbols are likely unrelated — warn and suggest search_code.
         _RELEVANCE_FLOOR = 0.68
