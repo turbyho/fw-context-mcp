@@ -198,7 +198,7 @@ def _select_unanalyzed_symbols(
     is_project_clause = "AND s.is_project = 1" if project_only else ""
     query = f"""SELECT s.id, s.name, s.qualified_name, s.kind, s.file_path,
                        s.signature, s.is_definition, s.docstring,
-                       s.end_line, s.line, s.usr,
+                       s.end_line, s.line, s.usr, s.source,
                        f.path as file_path,
                        a.content_hash as existing_hash
                 FROM symbols s
@@ -285,20 +285,49 @@ def _build_llm_analysis(
         t0 = time.monotonic()
         qname = row["qualified_name"] or row["name"]
         try:
+            # ── Step 0: project DB hash check — skip unchanged symbols
+            #    without disk I/O or callee fetch.  Uses the ``source``
+            #    column stored during indexing (same body text as
+            #    _enrich_batch would read from disk).
+            existing_hash = row.get("existing_hash")
+            if existing_hash:
+                source_body = row["source"] or ""
+                if not source_body:
+                    # source column is empty (legacy symbol from before
+                    # the 'source' column was added).  Fall back to
+                    # reading the body from disk for the hash comparison.
+                    from ..utils import abs_path as _resolve_abs_path
+
+                    file_path = row.get("file_path", "")
+                    abs_file_path = _resolve_abs_path(project_root, file_path) if project_root else file_path
+                    if abs_file_path:
+                        source_body = _read_body(abs_file_path, row["line"], row["end_line"])
+                h = compute_content_hash(
+                    source_body,
+                    row["qualified_name"] or "",
+                    row["signature"] or "",
+                    row["docstring"] or "",
+                )
+                if existing_hash == h:
+                    total += 1
+                    elapsed = time.monotonic() - t0
+                    log.debug("[%d/%d] %s: hash-matched %s", idx + 1, total_symbols, qname, _fmt_dur(elapsed))
+                    continue
+
             batch_dicts = _enrich_batch(conn, [row], config_hash, project_root=project_root)
             d = batch_dicts[0]
 
             # ── Cache check — 2 tiers: local global → remote ──
             h = compute_content_hash(d["body"], d["qualified_name"], d["signature"], d["docstring"])
 
-            # Step 0: project DB check — if existing hash matches, skip.
-            existing_hash = row.get("existing_hash")
+            # Catch edge cases where source-H ≠ body-H (e.g. varglobal
+            # with multi-line initializer — source column captured the
+            # body but _enrich_batch left it empty).
             if existing_hash and existing_hash == h:
                 total += 1
                 elapsed = time.monotonic() - t0
                 log.debug("[%d/%d] %s: hash-matched %s", idx + 1, total_symbols, qname, _fmt_dur(elapsed))
                 continue
-
 
             # Tier 1: local global cache (~/.fw-context/llm_cache.db)
             cached = None
