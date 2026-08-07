@@ -675,6 +675,15 @@ def find_dead_code(
     just within a single file — text-based search cannot determine
     whether a function is actually reachable.
 
+    **What "dead" means:** A function with **zero references** in the
+    index — no calls, no function-pointer assignments, no indirect call
+    sites.  This is a **single-layer reference check**, not a
+    reachability analysis from entry points (main, ISR, exported
+    symbols).  A function that is only called by *another* dead function
+    will NOT be marked as dead (it has a reference).  If you need
+    transitive reachability, manually trace from your entry points using
+    ``find_callees_recursive``.
+
     Returns two categories of results, each with a ``status`` field:
 
     * ``"dead"`` — no references at all (neither calls nor function

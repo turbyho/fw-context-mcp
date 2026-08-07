@@ -14,6 +14,7 @@ import threading
 from pathlib import Path
 
 from fw_context_mcp import config
+from fw_context_mcp.config.settings import ProjectNotInitializedError
 from fw_context_mcp.utils import resolve_project_root
 
 log = logging.getLogger(__name__)
@@ -39,6 +40,11 @@ def _check_server_ready(project_root: Path | None = None) -> Path:
     global _project_ready_cache
     now = time.monotonic()
 
+    from fw_context_mcp.mcp.shared import context as _ctx
+
+    if _ctx._server_init_error is not None:
+        raise RuntimeError(_ctx._server_init_error)
+
     root = resolve_project_root(project_root)
     if root is None:
         msg = (
@@ -63,13 +69,7 @@ def _check_server_ready(project_root: Path | None = None) -> Path:
 
     cfg = config.load(root)
     if not cfg.project.id:
-        msg = (
-            f"Project at {root} has no project ID.  Run:\n"
-            "  fw-context init"
-        )
-        with _project_ready_lock:
-            _project_ready_cache[cache_key] = (now, msg)
-        raise RuntimeError(msg)
+        raise ProjectNotInitializedError(root)
 
     db_path = _index_db_path(cfg)
     if not db_path.exists():
@@ -112,7 +112,8 @@ def _resolve_context(project_root: str | Path | None, *, skip_ready_check: bool 
     else:
         root = _check_server_ready(Path(project_root) if project_root else None)
     cfg = config.load(root)
-    assert cfg.project.id is not None
+    if cfg.project.id is None:
+        raise ProjectNotInitializedError(root)
     db_path = _index_db_path(cfg)
     return db_path, cfg, cfg.project.id, root
 
