@@ -13,6 +13,23 @@ Import from here as before::
 
 import os
 
+# Sentinel for detecting an unready project at MCP server startup.
+# Set in main() before mcp.run().  When the project is not initialized
+# or has no index, all tool handlers return the same error message.
+_server_init_error: str | None = None
+
+
+def _set_server_init_error(message: str) -> None:
+    """Set the error message that all tool handlers see.
+
+    Call only in main() before the server starts.  After the sentinel
+    is set, every tool handler fails with this message — the LLM
+    forwards it to the user.
+    """
+    global _server_init_error
+    _server_init_error = message
+
+
 from .connection import (
     HandlerContext,
     _integrity_checked,  # noqa: F401 — re-exported for server.py
@@ -53,6 +70,8 @@ __all__ = [
     "_quick_open_readonly",
     "_resolve_context",
     "_resolve_handler_context",
+    "_server_init_error",
+    "_set_server_init_error",
     "HandlerContext",
     "get_executor",
     "invalidate_executor",
