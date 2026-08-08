@@ -2086,7 +2086,7 @@ def extract_all(
     with_refs: bool = False,
     *,
     return_tu: bool = False,
-    skip_files: set[str] | None = None,
+    skip_files: set[str] | frozenset[str] | None = None,
 ) -> ExtractionResult:
     """Parse one translation unit and return extracted symbols, references, and inheritance.
 
