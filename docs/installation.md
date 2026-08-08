@@ -51,6 +51,11 @@ uv pip install fw-context-mcp
 This command installs the latest release from PyPI with all dependencies
 (libclang, pysqlite3, sqlite-vec, watchfiles, httpx, mcp).
 
+The `fw-context` binary lands in your active Python environment's `bin/`
+directory — typically `~/.local/bin` for user installs, or the virtual
+environment's `bin/` if you use one. Ensure that directory is on your
+`PATH`.
+
 ### From source
 
 ```bash
