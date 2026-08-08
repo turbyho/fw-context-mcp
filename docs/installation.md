@@ -40,6 +40,19 @@ echo 'export PATH="/opt/homebrew/opt/python@3.12/libexec/bin:$PATH"' >> ~/.zshrc
 
 ## Install
 
+### pip (recommended)
+
+```bash
+pip install fw-context-mcp
+# or via uv:
+uv pip install fw-context-mcp
+```
+
+This command installs the latest release from PyPI with all dependencies
+(libclang, pysqlite3, sqlite-vec, watchfiles, httpx, mcp).
+
+### From source
+
 ```bash
 # Clone
 git clone git@github.com:turbyho/fw-context-mcp.git ~/.fw-context/src
