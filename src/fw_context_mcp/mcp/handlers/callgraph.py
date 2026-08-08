@@ -31,6 +31,107 @@ from .source import _lookup_definition
 
 log = logging.getLogger(__name__)
 
+def _resolve_virtual_callers(conn, config_hash: str, usr: str, root, ref_kind: list[str] | None,
+                            limit: int = 50) -> list[dict] | None:
+    """Return callers of sibling override methods when *usr* has no direct callers.
+
+    When libclang resolves ``this->end_download()`` to the nearest override
+    (e.g. ``DownloadManagerSD::end_download``), the most-derived override
+    (e.g. ``DownloadManagerFlash::end_download``) shows 0 callers in ``refs``.
+    This propagates callers from peer overrides to reveal the real call sites.
+
+    Returns None when the symbol is not a virtual method with overrides,
+    or an empty list when overrides exist but also have no callers.
+    """
+    # Check if the symbol is a virtual/pure-virtual method
+    sym_row = conn.execute(
+        """SELECT s.kind, s.parent_usr
+           FROM symbols s
+           WHERE s.config_hash = ? AND s.usr = ?
+           LIMIT 1""",
+        (config_hash, usr),
+    ).fetchone()
+    if not sym_row:
+        return None
+    if sym_row["kind"] not in ("method", "destructor"):
+        return None
+
+    # Find base method via overrides table
+    base = conn.execute(
+        """SELECT base_usr FROM overrides
+           WHERE derived_usr = ? AND config_hash = ?""",
+        (usr, config_hash),
+    ).fetchone()
+
+    # Find all override methods sharing the same base (peers)
+    if base:
+        base_usr = base["base_usr"]
+        overrides = conn.execute(
+            """SELECT derived_usr FROM overrides
+               WHERE base_usr = ? AND config_hash = ?
+                 AND derived_usr != ?""",
+            (base_usr, config_hash, usr),
+        ).fetchall()
+        all_derived: list[str] = [r["derived_usr"] for r in overrides]
+        all_derived.append(base_usr)
+    else:
+        # No base found — try reverse: find overrides sharing the same parent class
+        parent_usr = sym_row["parent_usr"]
+        if not parent_usr:
+            return None
+        siblings = conn.execute(
+            """SELECT usr FROM symbols
+               WHERE config_hash = ? AND parent_usr = ? AND name = (
+                 SELECT name FROM symbols WHERE config_hash = ? AND usr = ?
+               )
+                 AND usr != ?
+                 AND kind IN ('method', 'destructor')
+                 AND (is_virtual OR is_pure_virtual)""",
+            (config_hash, parent_usr, config_hash, usr, usr),
+        ).fetchall()
+        all_derived = [r["usr"] for r in siblings]
+        if not all_derived:
+            return None
+
+    if not all_derived:
+        return None
+
+    # UNION callers of all peer overrides
+    placeholders = ",".join("?" * len(all_derived))
+    kind_clause = ""
+    kind_params: list = []
+    if ref_kind:
+        rk_placeholders = ",".join("?" * len(ref_kind))
+        kind_clause = f"AND r.ref_kind IN ({rk_placeholders})"
+        kind_params = list(ref_kind)
+
+    caller_rows = conn.execute(
+        f"""SELECT DISTINCT r.from_file, r.from_line, r.ref_kind,
+                    caller.name AS caller_name,
+                    caller.qualified_name AS caller_qname,
+                    caller.kind AS caller_kind
+             FROM refs r
+             LEFT JOIN symbols caller
+               ON caller.config_hash = r.config_hash AND caller.usr = r.from_usr
+             WHERE r.config_hash = ?
+               AND r.to_usr IN ({placeholders})
+               {kind_clause}
+             LIMIT ?""",
+        (config_hash, *all_derived, *kind_params, limit),
+    ).fetchall()
+
+    return [
+        {
+            "file": abs_path(root, r["from_file"]),
+            "line": r["from_line"],
+            "ref_kind": r["ref_kind"],
+            "caller": r["caller_qname"] or r["caller_name"] or "<file scope>",
+            "caller_kind": r["caller_kind"],
+        }
+        for r in caller_rows
+    ]
+
+
 # ── moved from server.py ──
 def _references_result(name: str, project_root: str | None, ref_kind: str | list[str] | None, limit: int, *, caller_mode: bool = False) -> list[dict]:
     """Shared logic for ``find_callers`` and ``find_references``.
@@ -122,6 +223,14 @@ def _references_result(name: str, project_root: str | None, ref_kind: str | list
         clamped_limit = max(0, min(limit, 200))
         rows = find_refs(conn, config_hash, name, ref_kind=ref_kind, limit=clamped_limit)
         if not rows:
+            virtual_result = _resolve_virtual_callers(
+                conn, config_hash, symbol["usr"], root, ref_kind=ref_kind, limit=clamped_limit,
+            )
+            if virtual_result is not None:
+                if not virtual_result:
+                    label = "callers" if caller_mode else "references"
+                    return [{"info": f"No {label} found for '{name}'."}]
+                return virtual_result
             label = "callers" if caller_mode else "references"
             return [{"info": f"No {label} found for '{name}'."}]
         result: list[dict] = [
