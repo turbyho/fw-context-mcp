@@ -41,6 +41,12 @@ The case study includes the review output, methodology and per-tool token analys
 
 Ollama is optional. It is used only for local semantic enrichment and symbol explanations; the core compiler-derived index does not require it.
 
+### Install via pip (recommended)
+
+```bash
+pip install fw-context-mcp
+```
+
 ### Install the current source version
 
 ```bash
