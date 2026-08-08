@@ -57,6 +57,10 @@ Server → Client:  {"jsonrpc":"2.0","id":99,"result":{"tools":[{…},…]}}
 ### Claude Code
 
 ```bash
+# pip install (binary in ~/.local/bin or venv bin/)
+claude mcp add --scope user fw-context fw-context-mcp
+
+# source install
 claude mcp add --scope user fw-context ~/.fw-context/.venv/bin/fw-context-mcp
 ```
 
@@ -70,23 +74,29 @@ Add to `~/.config/opencode/opencode.json`:
 {
   "mcp": {
     "fw-context": {
-      "command": ["/home/<user>/.fw-context/.venv/bin/fw-context-mcp"],
+      "command": ["fw-context-mcp"],
       "enabled": true,
       "type": "local"
     }
   }
 }
 ```
+If `fw-context-mcp` is not on your PATH, use the full path:
+`"command": ["/home/<user>/.local/bin/fw-context-mcp"]` (pip) or
+`"command": ["/home/<user>/.fw-context/.venv/bin/fw-context-mcp"]` (source).
 
 ### Other MCP clients
 
 Start the server as a subprocess:
 
 ```bash
-/path/to/.fw-context/.venv/bin/fw-context-mcp
+fw-context-mcp
 ```
 
-Send JSON-RPC requests on stdin. Read the responses from stdout. The server has no CLI interface. The server speaks only MCP.
+If the binary is not on your PATH, use the full path. For pip installs
+the binary is typically at `~/.local/bin/fw-context-mcp`. For source
+installs it is at `~/.fw-context/.venv/bin/fw-context-mcp`. Run
+`which fw-context-mcp` to find the exact path on your system.
 
 ## Error handling
 
@@ -163,10 +173,10 @@ Call `reset_index(confirm=true)` to delete the database. Then run `fw-context in
 ```bash
 # Manual tool listing
 echo '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}' \
-  | /path/to/.fw-context/.venv/bin/fw-context-mcp
+  | fw-context-mcp
 
 # Verbose logging
-FW_CONTEXT_LOG_LEVEL=DEBUG /path/to/.fw-context/.venv/bin/fw-context-mcp
+FW_CONTEXT_LOG_LEVEL=DEBUG fw-context-mcp
 
 # Ollama debug log (when debug_log is set in config)
 tail -f ~/.fw-context/llm-debug.jsonl
