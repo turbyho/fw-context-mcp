@@ -1,8 +1,55 @@
-"""Post-processing phases extracted from runner.py.
+"""Post-processing pipelines that run AFTER libclang parsing is complete.
 
-Handles parameter type extraction, method override graph, PageRank,
-hotspot cache, and the main post-processing orchestrator
-(``_run_postprocess``).
+The indexer loop first extracts symbols from each translation unit via
+libclang.  That phase is TU-parallel and focused on raw symbol + reference
+extraction.  This module handles everything that must run *sequentially*
+after the full symbol table is available:
+
+**Why post-processing is separate from parsing**
+
+1. **Global knowledge required.**  The inheritance graph, call graph,
+   and cross-TU reference resolution need the complete symbol table —
+   they cannot work on a single TU at a time.
+
+2. **Dependency ordering.**  Steps have strict dependencies:
+   FTS5 rebuilding must see the final symbol set, PageRank needs the
+   complete call graph, and override detection needs the inheritance
+   graph.  A data-driven pipeline (``_STEPS``) ensures correct ordering
+   and skips optional phases based on user configuration.
+
+3. **Idempotency for resilience.**  If a step fails mid-way, the next
+   reindex run can pick up where it left off — each step checks whether
+   its output already exists before recomputing.
+
+**Pipeline phases (in order)**
+
+1. **Purge missing files** — remove symbols from deleted source files
+2. **FTS5 rebuild** — rebuild full-text search indexes for symbols,
+   files, and macros
+3. **Orphan cleanup** — remove dangling rows in related tables
+4. **Project alignment** — mark which files belong to the project
+   vs. the vendor SDK
+5. **Manifest update** — write ``manifest.json`` for incremental
+   reindex tracking
+6. **Macro expansion** — resolve ``#define`` values via libclang
+   preprocessing
+7. **Dispatch edges** — create synthetic call-graph edges from
+   event-loop registrations (``call_every``, ``k_work_submit``, etc.)
+8. **Embeddings** — compute vector embeddings for semantic search
+9. **LLM analysis** — generate natural-language symbol explanations
+10. **Override graph** — build the virtual-method override map
+11. **Cross-TU ref backfill** — resolve method calls whose target
+    was defined in a different translation unit
+12. **PageRank + hotspot cache** — compute call-graph centrality
+    and pre-aggregate caller counts
+13. **Finalize manifest** — stamp build config with verification status
+14. **Cleanup old builds** — delete data from previous indexing runs
+    (unless a reindex is paused)
+15. **WAL checkpoint** — flush SQLite write-ahead log to disk
+
+Two functions are also used before the pipeline during TU-parallel
+parsing: ``_extract_param_types`` for override matching and
+``_normalize_type_namespaces`` for cross-namespace override detection.
 """
 
 from __future__ import annotations
@@ -47,6 +94,12 @@ def _extract_param_types(signature: str) -> str:
     Strips parameter names, default values, and whitespace to produce a
     normalized string suitable for override comparison.
 
+    This is used during virtual-method override detection: a derived-class
+    method ``Derived::write(const uint8_t *data, size_t len)`` overrides
+    ``Base::write(const uint8_t *buf, size_t sz)`` when both normalize to
+    the same type list ``"const uint8_t *,size_t"``.  Parameter names are
+    irrelevant for override semantics — only types matter.
+
     Examples:
         "int read(char *buf, size_t len)" → "char *,size_t"
         "void write(const uint8_t *data, size_t len)" → "const uint8_t *,size_t"
@@ -65,7 +118,9 @@ def _extract_param_types(signature: str) -> str:
       because both the derived AND base method signatures would need to
       contain the same ambiguous pattern.
     """
-    # Find the outermost parentheses
+    # Find the outermost parentheses — use a depth counter rather than a
+    # regex because C++ parameter lists can contain nested parentheses
+    # (function pointers, lambdas, template args with > and <).
     paren_start = signature.find("(")
     if paren_start == -1:
         return ""
@@ -82,11 +137,17 @@ def _extract_param_types(signature: str) -> str:
     params_str = signature[paren_start + 1 : paren_end].strip()
     if not params_str:
         return ""
-    # In C++, foo(void) and foo() are semantically identical — normalize both to empty
+    # In C++, foo(void) and foo() are semantically identical for
+    # override purposes — both mean "no parameters".  Normalize
+    # both to empty so they match during comparison.
     if params_str == "void":
         return ""
 
     # Split by top-level commas, strip parameter names (keep only types)
+    # Depth tracking handles nested angle brackets, parentheses, braces,
+    # and square brackets so that commas inside template arguments
+    # (e.g. map<int,string>) or function-pointer types are NOT treated
+    # as parameter separators.
     parts: list[str] = []
     depth = 0
     current: list[str] = []
@@ -104,13 +165,23 @@ def _extract_param_types(signature: str) -> str:
         parts.append("".join(current).strip())
 
     # For each parameter, extract the type by removing the parameter name
-    # and any trailing default value
+    # and any trailing default value.
+
+    # The algorithm strips the last identifier token from each parameter
+    # *unless* that token is a C++ type qualifier (const, volatile, etc.).
+    # Pointer/reference markers (*, &) that precede the parameter name
+    # are kept because they belong to the type.  This handles both
+    # "int x" → "int" and "int *x" → "int *".
     normalized: list[str] = []
     for param in parts:
         param = param.strip()
         if not param:
             continue
-        # Remove default value (everything after '=')
+        # Remove default value (everything after '=').
+        # Must be done before name stripping because default values
+        # can themselves contain identifier-like strings,
+        # e.g. "int x = DEFAULT_X" — we first strip "= DEFAULT_X",
+        # then remove "x" from the remaining "int x".
         eq_idx = param.find("=")
         if eq_idx != -1:
             param = param[:eq_idx].strip()
@@ -146,6 +217,14 @@ def _normalize_type_namespaces(param_types: str) -> str:
 
     ``const ble::ConnectionCompleteEvent &`` → ``const ConnectionCompleteEvent &``
     ``std::vector<int>`` → ``vector<int>``
+
+    Used as a fallback in override detection when exact type-matching
+    fails.  Cross-namespace overrides are common in firmware codebases
+    where a derived class in namespace ``app`` overrides a base-class
+    method whose signature uses types from a vendor namespace (``ble::``,
+    ``mbed::``).  By stripping the namespace prefix from every type
+    token, ``ble::ConnectionCompleteEvent`` and ``ConnectionCompleteEvent``
+    (when the derived class imports the symbol) are treated as equivalent.
     """
     if not param_types:
         return ""
@@ -195,7 +274,8 @@ def _build_overrides(
 
     total = 0
 
-    # Phase 1: collect all virtual/pure-virtual project methods with parent class info
+    # Phase 1: collect all virtual/pure-virtual project methods with parent class info.
+    # Single table scan groups by parent_usr for efficient batch processing in Phase 2.
     with transaction(conn):
         virtual_rows = conn.execute(
             """SELECT s.usr, s.name, s.qualified_name, s.signature,
@@ -312,6 +392,20 @@ def _build_pagerank(conn, config_hash: str, *, write_lock_held: bool = False, fo
     Iterates until convergence (max 50 iterations, damping factor 0.85).
     Scores are normalized to 0.0–1.0 and stored in ``symbols.pagerank``.
 
+    PageRank gives each function a centrality score — how many callers
+    (direct and indirect, weighted) depend on it.  This powers the
+    ``find_hotspots`` tool: functions with high PageRank have the most
+    architectural weight and are the best candidates for refactoring,
+    testing, or optimization.
+
+    Damping factor 0.85 is the standard value from the original PageRank
+    paper, balancing the random-surfer probability with the link-following
+    probability.  Max 50 iterations covers even large codebases (10k+
+    functions) because the call graph is sparse — almost all call graphs
+    converge within 20-30 iterations.  The convergence threshold of
+    1e-6 is sufficient for a stable ordering; higher precision adds
+    iterations without changing relative rankings.
+
     Idempotent — skips when pagerank already exists for this config.
     Set *force* to True to recompute even when pagerank data already exists
     (e.g. after incremental reindex).
@@ -327,6 +421,9 @@ def _build_pagerank(conn, config_hash: str, *, write_lock_held: bool = False, fo
             log.info("PageRank already computed — nothing to do")
             return
 
+    # Load edges: only `call` ref_kind to avoid inflating scores with
+    # indirect/constructor edges.  JOIN on symbols ensures both endpoints
+    # are indexed functions — filters out refs to variables and macros.
     edges = conn.execute(
         """SELECT DISTINCT r.from_usr, r.to_usr
            FROM refs r
@@ -342,6 +439,8 @@ def _build_pagerank(conn, config_hash: str, *, write_lock_held: bool = False, fo
         (config_hash,),
     ).fetchall()
 
+    # Build adjacency lists: outgoing (who-this-calls) for rank distribution,
+    # incoming (who-calls-this) for rank accumulation.
     outgoing: dict[str, list[str]] = {}
     incoming: dict[str, list[str]] = {}
     all_nodes: set[str] = set()
@@ -361,6 +460,10 @@ def _build_pagerank(conn, config_hash: str, *, write_lock_held: bool = False, fo
     damping = 0.85
     scores: dict[str, float] = {node: 1.0 / n for node in all_nodes}
 
+    # Standard PageRank iteration: each function distributes its score
+    # equally among outgoing call edges.  The |outgoing| for
+    # undirected-graph nodes defaults to [1] so they don't divide by zero —
+    # their score dissipates into the (1-damping)/n base term.
     for iteration in range(50):
         new_scores: dict[str, float] = {}
         for node in all_nodes:
@@ -375,7 +478,9 @@ def _build_pagerank(conn, config_hash: str, *, write_lock_held: bool = False, fo
             log.info("PageRank converged after %d iterations", iteration + 1)
             break
 
-    # Normalize to 0.0–1.0
+    # Normalize to 0.0–1.0 so scores are human-readable and comparable
+    # across reindex runs.  Division by max_score preserves relative
+    # ordering while bounding values in [0, 1].
     max_score = max(scores.values()) if scores else 1.0
     if max_score > 0:
         for node in scores:
@@ -393,6 +498,17 @@ def _build_pagerank(conn, config_hash: str, *, write_lock_held: bool = False, fo
 def _build_hotspot_cache(conn, config_hash: str, *, force: bool = False,
                          write_lock_held: bool = False, db_dir: Path | None = None) -> None:
     """Pre-compute hotspot caller counts for instant ``find_hotspots`` queries.
+
+    The ``find_hotspots`` tool must return a ranked list of functions by
+    caller count in under a second.  Computing ``COUNT(*) ... GROUP BY``
+    on the ``refs`` table at query time would require a full scan of
+    millions of refs rows — tens of seconds on large codebases.  This
+    cache stores pre-aggregated counts keyed by ``symbol_id`` so the
+    tool does a simple ``ORDER BY caller_count DESC LIMIT N``.
+
+    Counts both ``call`` and ``indirect`` reference kinds so that
+    function-pointer callbacks and ISR vector registrations are included
+    in the caller count.
 
     Idempotent — skips when cache already exists for this config.
     Set *force* to True to recompute even when cache data already exists
@@ -440,6 +556,15 @@ def _step_purge_missing_files(conn: sqlite3.Connection, ctx: dict) -> None:
 
     Runs first in the pipeline so FTS, embeddings, overrides, and PageRank
     are not built on ghost nodes that are deleted moments later.
+
+    Uses a ThreadPoolExecutor for parallel ``os.path.exists()`` checks
+    because file-existence is I/O-bound — the GIL does not block it and
+    checking thousands of files sequentially would add seconds of latency
+    while the I/O scheduler is idle.
+
+    The threshold guard prevents accidental mass-deletion: if >20% of
+    indexed files are missing, the index is likely pointing at a
+    disconnected mount or stale project root, not genuinely deleted files.
     """
     from ..utils import abs_path
 
@@ -530,7 +655,26 @@ def _step_orphan_cleanup(conn: sqlite3.Connection, ctx: dict) -> None:
 
 
 def _step_align_is_project(conn: sqlite3.Connection, ctx: dict) -> None:
-    """Mark project files in the ``files`` table based on project/vendor patterns."""
+    """Mark project files in the ``files`` table based on project/vendor patterns.
+
+    Two-phase marking:
+
+    1. **Explicit project patterns** (``project_patterns_list`` from config):
+       files matching globs like ``src/%`` are unconditionally marked
+       ``is_project = 1``.  This handles the typical directory structure
+       where all source under ``src/`` and ``lib/`` is project code.
+
+    2. **Exclusion-based remainder**: all files that do NOT match any
+       vendor pattern are marked as project code.  Vendor patterns come
+       from the detected build system (e.g. ``mbed-os/%`` for Mbed OS,
+       ``zephyr/%`` for Zephyr).  Files with absolute paths (system
+       headers) are excluded from this phase — they are neither project
+       nor vendor.
+
+    The two-phase approach ensures custom project directory layouts are
+    supported while still auto-detecting project-vs-vendor boundaries
+    from the build system.
+    """
     config_hash = ctx["config_hash"]
     project_patterns_list: list[str] = ctx["project_patterns_list"]
     vendor_patterns: list[str] = ctx["vendor_patterns"]
@@ -587,9 +731,24 @@ def _resolve_matching_usr(
 ) -> str | None:
     """Look up a symbol's USR by name, preferring definitions.
 
-    When multiple USRs exist for the same name, prefers the one with the
-    most incoming references.  Tiebreaker: prefers symbols that have
-    outgoing refs (they have a body).
+    Used by dispatch-edge resolution when the pending-dispatch table
+    stores a symbol by qualified name rather than USR (the USR may not
+    have been known at registration time because it was from a different
+    TU).  Three-tier matching handles the common name-ambiguity cases:
+
+    1. Exact ``name`` match (e.g. ``"main"``)
+    2. Exact ``qualified_name`` match (e.g. ``"app::main"``)
+    3. Suffix LIKE match on qualified name (e.g. ``"%::EventHandler::process"``)
+
+    When multiple USRs exist for the same name, tie-breaking uses three
+    criteria in descending priority:
+
+    1. **is_definition** — the definition is the "real" symbol; a
+       declaration-only entry may exist from a forward-declaration header.
+    2. **ref_count** — incoming references indicate the symbol is actively
+       used, so it is more likely to be the intended target.
+    3. **out_count** — outgoing references indicate the symbol has a body
+       (there are calls inside it), so it is not a stub or declaration.
     """
     esc_name = name.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
     suffix_pattern = f"%::{esc_name}"
@@ -616,6 +775,20 @@ def _step_resolve_dispatches(conn: sqlite3.Connection, ctx: dict) -> None:
     Reads the `_pending_dispatch` temp table populated during indexing,
     resolves the dispatch entry point and callback target USRs, and
     inserts synthetic dispatch edges into the refs table.
+
+    **How dispatch bridging works:**  When the indexer encounters a
+    registration call like ``event_queue.call_every(1000, &MyClass::tick)``,
+    it records the callee qualified name (``EventQueue::call_every``) and
+    the callback target in ``_pending_dispatch``.  This step matches
+    ``call_every`` to a known *dispatch entry point*
+    (``EventQueue::dispatch_forever``) and creates an edge from the
+    entry point to ``MyClass::tick``.  The entry point acts as a bridge
+    node — subsequent call-graph tools can walk from ``main`` through
+    ``dispatch_forever`` to all registered callbacks.
+
+    User-defined dispatch bridges (in ``config.toml``) override or extend
+    the built-in map.  This allows support for custom RTOS dispatch
+    primitives without modifying the source code.
     """
     config_hash = ctx["config_hash"]
     try:
@@ -702,7 +875,18 @@ def _step_expand_macros(conn: sqlite3.Connection, ctx: dict) -> None:
 
 
 def _step_build_embeddings(conn: sqlite3.Connection, ctx: dict) -> None:
-    """Compute symbol embeddings via the configured LLM backend."""
+    """Compute symbol embeddings via the configured LLM backend.
+
+    Embeddings are high-dimensional vectors (1024D for mxbai-embed-large)
+    computed from each symbol's signature and docstring.  They power the
+    ``semantic_search`` tool — finding symbols by meaning rather than
+    by exact keyword match.
+
+    When ``force`` is True, existing embeddings for this config are deleted
+    first.  This is necessary after incremental reindex because removed
+    symbols would leave orphaned embedding rows that reference stale
+    ``symbol_id`` values.
+    """
     config_hash = ctx["config_hash"]
     llm_config = ctx["llm_config"]
     if ctx["force"]:
@@ -723,7 +907,19 @@ def _step_build_embeddings(conn: sqlite3.Connection, ctx: dict) -> None:
 
 
 def _step_llm_analysis(conn: sqlite3.Connection, ctx: dict) -> None:
-    """Generate natural-language symbol explanations via the configured LLM."""
+    """Generate natural-language symbol explanations via the configured LLM.
+
+    Each function/method/class definition gets an ``llm_analysis`` row
+    with a summary, inputs, and outputs description.  This powers the
+    ``explain_symbol`` tool and the pre-computed analysis fields in
+    ``search_code`` results.
+
+    The optional ``CacheClient`` avoids re-analyzing symbols that have
+    not changed since the last index run — it checks a remote cache
+    server (if configured) for existing analyses keyed by symbol USR
+    and content hash.  This saves minutes of LLM calls on incremental
+    reindexes where only a handful of files changed.
+    """
     from ..cache_client import CacheClient
 
     config_hash = ctx["config_hash"]
@@ -762,7 +958,12 @@ def _step_llm_analysis(conn: sqlite3.Connection, ctx: dict) -> None:
 
 
 def _step_build_overrides(conn: sqlite3.Connection, ctx: dict) -> None:
-    """Build the virtual-method override graph from the inheritance table."""
+    """Build the virtual-method override graph from the inheritance table.
+
+    Resolves which derived-class methods override which base-class
+    virtual methods.  Used by ``get_method_overrides`` and the
+    ``find_callers`` tool (to find callers through base-class pointers).
+    """
     config_hash = ctx["config_hash"]
     if ctx["force"]:
         conn.execute("DELETE FROM overrides WHERE config_hash = ?", (config_hash,))
@@ -790,7 +991,13 @@ def _step_backfill_cross_tu_refs(conn: sqlite3.Connection, ctx: dict) -> None:
 
 
 def _step_pagerank_hotspot(conn: sqlite3.Connection, ctx: dict) -> None:
-    """Compute PageRank scores and build the hotspot cache from the call graph."""
+    """Compute PageRank scores and build the hotspot cache from the call graph.
+
+    Runs after cross-TU backfill to ensure the call graph is complete.
+    Two outputs are computed sequentially from the same call-graph data:
+    PageRank scores (centrality) and the pre-aggregated hotspot cache
+    (caller counts for instant ``find_hotspots`` queries).
+    """
     config_hash = ctx["config_hash"]
     if ctx["force"]:
         conn.execute("UPDATE symbols SET pagerank = 0.0 WHERE config_hash = ?", (config_hash,))
@@ -803,7 +1010,18 @@ def _step_pagerank_hotspot(conn: sqlite3.Connection, ctx: dict) -> None:
 
 
 def _step_finalize_manifest(conn: sqlite3.Connection, ctx: dict) -> None:
-    """Stamp the build config with manifest verification status."""
+    """Stamp the build config with manifest verification status.
+
+    The ``manifest_verification`` field records how complete the index is:
+
+    - ``"full"`` — manifest.json exists and no critical steps failed;
+      all data (symbols, embeddings, FTS) is consistent.
+    - ``"partial"`` — manifest exists but critical steps (FTS,
+      embeddings) failed; the index is usable but some features are
+      degraded.
+    - ``"none"`` — no manifest.json was written (e.g. build system
+      detection failed); the index cannot support incremental updates.
+    """
     manifest_path = ctx["db_dir"] / "manifest.json"
     manifest_verification: str
     if manifest_path.exists():
@@ -822,7 +1040,17 @@ def _step_finalize_manifest(conn: sqlite3.Connection, ctx: dict) -> None:
 
 
 def _step_cleanup_old_builds(conn: sqlite3.Connection, ctx: dict) -> None:
-    """Delete data from previous builds, unless a reindex is paused."""
+    """Delete data from previous builds, unless a reindex is paused.
+
+    Each reindex produces a new ``config_hash`` — the old hash's data
+    (symbols, refs, embeddings, etc.) is deleted to reclaim disk space.
+
+    The reindex-pause guard prevents deletion when a background reindex
+    was paused mid-stream: if the old process has not finished, its data
+    is still the active index and must not be removed.  The ``reindex.pause``
+    PID file acts as a distributed lock — if its process is still alive,
+    cleanup is skipped.
+    """
     config_hash = ctx["config_hash"]
     project_id = ctx["project_id"]
     db_dir = ctx["db_dir"]
@@ -854,7 +1082,19 @@ def _step_cleanup_old_builds(conn: sqlite3.Connection, ctx: dict) -> None:
 
 
 def _step_wal_checkpoint(conn: sqlite3.Connection, ctx: dict) -> None:
-    """Run a passive WAL checkpoint and stamp the schema version."""
+    """Run a passive WAL checkpoint and stamp the schema version.
+
+    SQLite WAL (Write-Ahead Log) accumulates changes during indexing.
+    Without a checkpoint, the WAL file grows without bound — every
+    ``INSERT/UPDATE/DELETE`` appends to it.  PASSIVE mode merges WAL
+    pages into the main database file without blocking concurrent
+    readers, so the server can serve queries during checkpoint.
+
+    The ``user_version`` pragma stamps the schema version into the
+    database header so the startup code can detect schema mismatches
+    (stale indexes from older fw-context versions) and trigger a
+    reindex automatically.
+    """
     try:
         conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
     except SAFE_EXCEPT as e:
@@ -868,6 +1108,19 @@ def _step_wal_checkpoint(conn: sqlite3.Connection, ctx: dict) -> None:
 
 # Each entry: (step_name, step_fn, condition | None)
 # condition(ctx) → bool — when None, the step always runs.
+#
+# Ordering constraints (why steps are in this exact order):
+#  • purge_missing MUST run before fts5 — FTS must not index ghost symbols.
+#  • fts5 MUST run before embeddings and llm_analysis — both query FTS.
+#  • is_project MUST run before embeddings — embedding source selection
+#    depends on project/vendor classification.
+#  • dispatch_edges MUST run before cross_tu_refs — dispatch edges add
+#    new from_usr values that the backfill needs.
+#  • cross_tu_refs MUST run before pagerank_hotspot — PageRank needs the
+#    complete call graph.
+#  • cleanup_old runs LAST with data mutation — it deletes old-build tables
+#    that earlier steps might reference.
+#  • wal_checkpoint runs LAST — flushes all accumulated changes to disk.
 _STEPS: list[tuple[str, Callable[..., None], Callable[..., bool] | None]] = [
     ("purge_missing",    _step_purge_missing_files, None),
     ("fts5",             _step_rebuild_fts,       None),
@@ -920,6 +1173,14 @@ def _run_postprocess(
     are skipped when their guard returns ``False``.  Runtime errors in
     individual steps are logged (not fatal) so the remaining steps
     always execute.
+
+    **Error classification:**  Steps are divided into *critical* and
+    *non-critical*.  Critical steps (FTS5, embeddings) are core features
+    — if they fail, the index is marked ``"partial"`` in the manifest
+    so the server can report degraded functionality (e.g. "semantic
+    search is unavailable") instead of serving a silently-broken index.
+    Non-critical step failures are logged at WARNING level and do not
+    affect the manifest status.
     """
     ctx = {
         "config_hash": config_hash,

@@ -1,4 +1,22 @@
-"""Phase 7: Format results for MCP tool output."""
+"""Phase: Format results for MCP tool output.
+
+Why metadata entries before symbol results?
+    MCP tool consumers (LLMs, IDE plugins) parse the result list linearly.
+    Metadata like ``_generated_queries``, ``_translated_from``, and warnings
+    provide context for interpreting the symbol results that follow.  Placing
+    them first lets consumers see the search intent before the matches.
+
+Why absolute paths?
+    Symbol results must be usable by downstream tools (file readers, editors)
+    without resolving relative paths.  The ``abs_path()`` conversion ensures
+    every result has a fully qualified path regardless of the project root.
+
+Why omit empty optional fields?
+    Fields like ``summary``, ``inputs``, ``outputs`` are LLM-generated and
+    absent for most symbols.  Including them as empty strings would bloat
+    the MCP response (20 results × 3 fields = 60 empty strings).  Omitting
+    them keeps responses compact.
+"""
 
 from __future__ import annotations
 
@@ -14,6 +32,11 @@ from fw_context_mcp.utils import abs_path
 class FormatPhase(Phase):
     """Convert final results to the MCP tool output format.
 
+    Why the last phase?
+        All upstream phases work with raw database dicts — adding metadata
+        or formatting paths earlier would require every phase to handle
+        these fields.  Formatting once at the end keeps phase code clean.
+
     Adds metadata entries: ``_generated_queries``, ``_rough_queries``,
     ``_translated_from`` / ``_translated_to``, warnings, etc.
     """
@@ -25,7 +48,8 @@ class FormatPhase(Phase):
 
         Prepends metadata entries (``_generated_queries``, ``_rough_queries``,
         ``_translated_from``, warnings), converts relative paths to absolute,
-        and includes optional fields (``summary``, ``inputs``, ``outputs``).
+        and includes optional LLM analysis fields (``summary``, ``inputs``,
+        ``outputs``) only when present.
         """
         project_root = ctx.project_root
 
@@ -48,7 +72,7 @@ class FormatPhase(Phase):
 
         results: list[dict] = []
 
-        # Metadata entries (always first)
+        # Metadata entries (always first — consumers parse these before symbols)
         if ctx.generated_queries:
             results.append({"_generated_queries": ctx.generated_queries})
         if ctx.rough_queries:

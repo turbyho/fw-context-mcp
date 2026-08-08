@@ -1,5 +1,10 @@
 """Index runner: parse compile_commands.json, extract symbols, store to SQLite.
 
+WHY a separate runner: the indexing pipeline has four distinct phases
+(preparation, parsing, post-processing, optional analysis) that are
+orchestrated in sequence.  Keeping them in one module allows the
+write-lock and heartbeat mechanisms to span the entire run.
+
 Uses ``indexer/ops.py`` for the shared "parse TU → store symbols" loop so
 that runner, reindex_file, and auto-reindex all use the same code path.
 """
@@ -222,10 +227,11 @@ def run(
         # preliminary (empty source_hash) entries and fall through to regeneration.
         manifest = load_manifest(db_path.parent)
 
-    # Heartbeat for background reindex watchdog.  When the subprocess is
-    # stuck (deadlock / hung syscall), this daemon thread stops writing
-    # and the watchdog kills the process.  Only active when the heartbeat
-    # log path is passed via env var (background reindex).
+    # WHY heartbeat: the index subprocess can deadlock (libclang hang, disk
+    # full, NFS stall).  Without a heartbeat, the watchdog has no way to
+    # distinguish "slow but alive" from "deadlocked."  This daemon thread
+    # writes a timestamp to a known file every 30s — if the file stops
+    # updating, the watchdog kills and restarts the process.
     _hb_log = os.environ.get("FW_CONTEXT_HEARTBEAT_LOG")
     if _hb_log:
         _hb_stop = threading.Event()
@@ -331,6 +337,13 @@ def run(
     tu_headers: dict[str, list[dict]] = {}
     t0 = time.monotonic()
 
+    # skip_files accumulates resolved paths of headers already processed
+    # by earlier TUs in this run.  Starts empty each run — never loaded
+    # from manifest, never persisted.  This avoids stale-header bugs
+    # where a changed header would be skipped because it was in a
+    # persist-stored skip set from a previous index run.
+    skip_files: set[str] = set()
+
     log.info("", extra={"phase": f"Parsing ({len(units)} TUs)"})
 
     def _wait_if_paused() -> None:
@@ -380,6 +393,10 @@ def run(
         processed = i + 1
 
         # ── Phase 1: staleness check + libclang parse (no lock) ──
+        # WHY outside lock: libclang parsing can take seconds to minutes per
+        # TU on large codebases (mbed-os, Zephyr).  Holding the write lock
+        # during parsing starves other indexers (bg reindex, concurrent
+        # ``fw-context index --force``) and causes WriteLockTimeout errors.
         check_status, parsed_data, parse_timing, hashes = _check_and_parse_unit(
             unit,
             config_hash,
@@ -389,12 +406,17 @@ def run(
             existing_files,
             force=force,
             manifest=manifest_lookup,
+            skip_files=skip_files,
         )
+
+        if parsed_data is not None and hasattr(parsed_data, 'newly_seen_files'):
+            skip_files.update(parsed_data.newly_seen_files)
 
         if check_status in ("unchanged", "reuse"):
             result = _handle_unchanged_or_reuse(
                 unit, check_status, hashes, conn, config_hash, project_root,
                 build_dir_patterns, db_path, existing_files, processed, len(units),
+                skip_files=frozenset(skip_files) if skip_files else None,
             )
             total_syms += result["total_syms"]
             if result["is_reuse"] and result["total_syms"] > 0:
@@ -433,6 +455,7 @@ def run(
                 parse_timing=parse_timing,
                 hashes=hashes,
                 build_dir_patterns=build_dir_patterns,
+                skip_files=frozenset(skip_files) if skip_files else None,
             )
             if status == "updated":
                 updated += 1

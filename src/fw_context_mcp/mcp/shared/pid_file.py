@@ -5,6 +5,18 @@ reused between the check and the action.  Risk is low on Linux (PID wrap
 at 4M), and :func:`fcntl.flock` is used where correctness matters
 (``watcher.lock``).  The helpers in this module are for **coordination
 markers** (pause, reindex-in-progress), not mutual exclusion.
+
+WHY PID files instead of a database flag: the background reindex runs in
+a separate OS process (``subprocess.Popen``).  It cannot share an in-memory
+mutex or a Python ``threading.Lock`` with the MCP server process.  PID files
+are the simplest cross-process coordination primitive — the filesystem is
+the only IPC channel guaranteed to exist without additional infrastructure.
+
+WHY ``unlink_if_ours`` checks the PID before unlinking: during a long
+``fw-context index --force`` run, a second MCP server may write its own
+pause marker, then finish and try to clean up.  Without PID ownership
+checking, it would delete the first server's marker, prematurely resuming
+the background reindex.  PID-based ownership prevents this.
 """
 
 from __future__ import annotations

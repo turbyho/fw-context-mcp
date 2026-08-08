@@ -1,4 +1,11 @@
-"""Git context helpers — extract branch and tag info for build description."""
+"""Git context helpers — extract branch and tag info for build description.
+
+WHY git context: each indexed build stores a ``description`` column in
+``build_configs``.  When a developer looks at ``get_active_build`` output
+and sees multiple config_hashes, the git context tells them WHICH branch
+each index was built from — essential for debugging "why is symbol X
+missing?" across feature branches.
+"""
 
 from __future__ import annotations
 

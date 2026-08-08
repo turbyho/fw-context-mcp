@@ -1,5 +1,26 @@
 """Did-you-mean? suggestions for lookup_symbol when no exact match is found.
 
+Why token-based matching instead of difflib?
+    difflib sequence matching (``get_close_matches``) works well for
+    English words but poorly for code symbols.  Two symbols may share
+    no character n-grams yet be semantically identical in CamelCase
+    (``nrfxUarteInit`` vs ``NRF_UARTE_Init``).  Token-based matching
+    splits both into conceptual tokens (``nrfx``, ``uarte``, ``init``)
+    and scores by shared tokens — matching the developer's mental model.
+
+Why a cache with TTL?
+    ``_load_names()`` queries the database for up to 50000 symbol names.
+    Without caching, every uncached ``lookup_symbol`` miss would reload
+    all names.  The 5-minute TTL covers repeated lookups within a session
+    without serving stale data from a reindexed project.
+
+Why a stampede guard (``_in_flight``)?
+    When a user types an unknown symbol name, multiple concurrent tool
+    calls can arrive simultaneously.  Without the guard, every thread
+    would independently load 50000 names — wasteful.  The ``_in_flight``
+    set lets one thread compute while others return empty (cached next
+    time).
+
 Uses token-based matching (snake_case + camelCase split) instead of difflib
 sequence matching.  Token matching prefers candidates that share multiple
 tokens with the query, with exact-token and prefix-token weights.
@@ -19,13 +40,16 @@ from functools import lru_cache
 
 log = logging.getLogger(__name__)
 
-# Simple cache with TTL: {query: (timestamp, [suggestions])}
+# {query: (timestamp, [suggestions])}
 _cache: dict[str, tuple[float, list[str]]] = {}
 _MAX_CACHE = 128
-_CACHE_TTL_S = 300  # Invalidate after 5 minutes (matches keyword_cache)
+# 5-minute TTL — matches keyword_cache; long enough for a session,
+# short enough that a full reindex will be reflected
+_CACHE_TTL_S = 300
 _cache_lock = threading.Lock()
-# Set of cache keys currently being computed — prevents stampede when
-# multiple threads query the same unmatched name simultaneously.
+
+# Stampede prevention: when one thread is already computing suggestions
+# for a key, other threads skip rather than duplicating work.
 _in_flight: set[str] = set()
 
 # Characters that delimit tokens in symbol names
@@ -35,6 +59,18 @@ _TOKEN_SPLIT = re.compile(r"[_]+")
 @lru_cache(maxsize=20000)
 def _tokenize(name: str) -> tuple[str, ...]:
     """Split a symbol name into lowercase tokens.
+
+    Why lru_cache?
+        Tokenizing is pure computation (no I/O).  The same symbol names
+        appear repeatedly during scoring — caching avoids re-splitting
+        ``nrfxUarteInit`` hundreds of times across different candidates.
+
+    Why these regex patterns?
+        ``[A-Z]?[a-z0-9]+`` matches standard camelCase words like
+        ``Uarte`` or ``nrfx``.  ``[A-Z]+(?=[A-Z][a-z]|$|\\d)`` handles
+        consecutive acronyms like ``TIM16`` → ``TIM``, ``16`` — the
+        lookahead prevents greedy matching that would merge ``TIM16``
+        into one token.
 
     Splits on ``_`` first, then splits each part on camelCase boundaries.
     Returns deduplicated, lowercased tokens.
@@ -61,6 +97,29 @@ def suggest(
     limit: int = 5,
 ) -> list[str]:
     """Return symbol names similar to *name*, or empty list.
+
+    What it does:
+        Finds definition-level symbols (functions, methods, constructors,
+        destructors) from the database, tokenises both the query name and
+        all candidates, and scores by shared tokens.
+
+    Why token matching?
+        A typo like ``modem_init`` vs ``modem_init`` would fail difflib
+        because the edit distance is tiny.  But ``uart_configure`` vs
+        ``uart_setup`` has high edit distance yet shares the ``uart``
+        token — token matching captures this conceptual similarity.
+
+    Why definition-only candidates?
+        Users type names of functions and methods they want to find.
+        Variables, fields, and namespace names are noise for this purpose.
+        Limiting to ``is_definition=1`` of callable kinds keeps the
+        candidate set focused (~5000–50000 names, manageable in memory).
+
+    Why prefix-index for O(1) lookups?
+        Naively scanning all candidate tokens for prefix matches is O(n).
+        The prefix index maps the first 3 chars of each token to candidate
+        tokens, reducing the scan to only tokens that start with the query
+        prefix — typically 1–10 candidates instead of thousands.
 
     Uses token-based matching: splits both query and candidates into tokens
     (on ``_`` and camelCase boundaries), then scores candidates by how many
@@ -101,11 +160,20 @@ def suggest(
         if not query_tokens:
             return []
 
-        # Build token → candidate index for efficient filtering
+        # Build token → candidate index for exact-match O(1) lookup.
+        # Without this, finding candidates that share a token would
+        # require scanning all candidates — O(n) per query token.
         token_index: dict[str, list[str]] = defaultdict(list)
-        # Prefix index: first 3 chars → set of tokens — narrows O(n) scan to O(1)
+
+        # Prefix index: first 3 chars → set of tokens.  Narrows the
+        # O(n) candidate scan to O(1) for prefix matching.  3-char
+        # threshold chosen empirically — shorter prefixes (1-2 chars)
+        # match too broadly; longer (4+) miss typos in short tokens.
         prefix_index: dict[str, set[str]] = defaultdict(set)
-        # Short prefix index for 2-char tokens — avoids O(n) scan over all tokens
+
+        # Separate short-prefix index for 2-char tokens — these are
+        # too few to benefit from a 3-char prefix, but still need
+        # O(1) lookup to avoid scanning all tokens.
         prefix_index_short: dict[str, set[str]] = defaultdict(set)
         for c in candidates:
             for t in _tokenize(c):
@@ -163,6 +231,20 @@ def suggest(
 def _token_score(query_tokens: list[str], candidate_tokens: list[str]) -> float:
     """Score a candidate against query tokens.
 
+    Why these weights?
+        Exact token match (+2.0) dominates — the query token literally
+        appears in the candidate.  Prefix match (+1.0) is weaker — it's
+        a partial signal that may be coincidental (``mod`` prefix matches
+        ``modem`` but the symbols may be unrelated).  Same-position bonus
+        (+0.5) rewards candidates whose token order matches the query
+        order, reducing false positives from reordered tokens.
+
+    Why no normalisation?
+        The score is NOT divided by candidate length — a candidate with
+        many unrelated tokens would otherwise be penalised.  Instead, the
+        score reflects how many query tokens were matched, regardless of
+        how many extra tokens the candidate has.
+
     Exact token match: +2.0
     Prefix token match: +1.0
     Same-position match: +0.5 bonus
@@ -194,12 +276,25 @@ def _token_score(query_tokens: list[str], candidate_tokens: list[str]) -> float:
     return score if matched_any else 0.0
 
 
+# config_hash → list of definition names, LRU-bounded
 _names_cache: OrderedDict[str, list[str]] = OrderedDict()
 _MAX_NAMES_CACHE = 8  # config_hash entries — rarely more than 1 per process
 
 
 def _load_names(conn: sqlite3.Connection, config_hash: str) -> list[str]:
     """Load all definition names from the index for fuzzy matching.
+
+    Why cache by config_hash?
+        A typical MCP server process serves queries for a single project,
+        so the candidate list is loaded once.  The ``_names_cache`` is
+        LRU-bounded at 8 entries to handle the rare case where a process
+        serves multiple projects (e.g. during testing).
+
+    Why LIMIT 50000?
+        SQLite's ORDER BY for 50000 rows takes ~5 ms on an indexed column.
+        Beyond 50000, in-memory tokenisation becomes the bottleneck,
+        not database load.  The limit ensures predictable performance
+        even on very large codebases.
 
     Only loads definition symbols (is_definition=1) of callable kinds to keep
     the set small and relevant — these are what users typically search for.

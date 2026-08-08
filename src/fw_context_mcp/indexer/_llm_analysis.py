@@ -1,5 +1,10 @@
 """LLM analysis batch processing extracted from runner.py.
 
+WHY separate module: the LLM analysis loop is complex (hash-based caching,
+two-tier cache lookup, body truncation, context-window budgeting, sentinel
+management).  Extracting it from runner.py keeps the runner focused on the
+parse→store pipeline and makes the analysis logic testable in isolation.
+
 Handles reading symbol bodies, fetching callees/referencers,
 enriching batches, and the main LLM analysis build phase.
 """

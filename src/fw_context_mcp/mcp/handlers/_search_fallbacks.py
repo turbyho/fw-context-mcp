@@ -5,6 +5,14 @@ All fallback strategies and formatting helpers are defined in
 for backward compatibility.  Only ``_search_code_fts5_kind`` is
 handler-specific (it runs a primary FTS5 search with optional kind
 filter before the fallback chain).
+
+WHY this re-export layer exists: the search fallback chain was
+originally in this module.  When it moved to ``search.shared_fallbacks``
+to be shareable with CLI tools, existing callers in the handlers
+package would have needed import-path changes across many files.
+The re-export avoids a noisy refactor — existing handlers import
+from ``_search_fallbacks`` and get the same symbols, now sourced
+from the canonical location.
 """
 
 from __future__ import annotations

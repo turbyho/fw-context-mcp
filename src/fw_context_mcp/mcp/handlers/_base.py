@@ -1,8 +1,25 @@
 """Shared base handler with context resolution.
 
 Provides ``BaseHandler`` — a mixin-style class that all MCP tool handlers
-can inherit from to eliminate the repetitive resolve→open→query
-boilerplate."""
+can inherit from to eliminate the repetitive resolve→open→query boilerplate.
+
+Why a mixin class with static methods instead of module-level functions:
+
+- Handlers are standalone modules (each tool gets its own file) that
+  need the same two operations: resolve the database context and get
+  the DB path.  A base class makes these operations discoverable via
+  IDE autocompletion (``BaseHandler.resolve_db_context``) and
+  grep-able (``class.*BaseHandler`` finds all handlers).
+- Static methods mean handlers can inherit without instantiation —
+  ``BaseHandler`` is a namespace, not a stateful object.  No ``self``
+  or ``cls`` reference, no constructor, no state to manage.
+- The ``DbContext`` dataclass enforces that handlers never receive a
+  raw ``conn`` attribute — all database access goes through
+  ``executor.execute_sync(query_fn, config_hash)``.  A dataclass with
+  NO ``conn`` field was a deliberate design choice: a missing
+  attribute fails at import/type-check time, while ``conn=None``
+  would only fail at runtime when some handler tries to use it.
+"""
 
 from __future__ import annotations
 
@@ -87,7 +104,20 @@ class BaseHandler:
 
     @staticmethod
     def _get_db_path(project_root: Path) -> Path:
-        """Resolve index.db path for *project_root*."""
+        """Resolve index.db path for *project_root*.
+
+        Why a thin wrapper around ``_db_path``:
+
+        - Handlers inherit from ``BaseHandler`` and call
+          ``self._get_db_path()`` — without this method every handler
+          would import ``_db_path`` directly from ``.context``, creating
+          a cross-layer import from handler code into shared
+          infrastructure code.
+        - When the database location moves (e.g., from
+          ``.fw-context/index.db`` to ``.fw-context/db/index.db``),
+          only ``_db_path`` in ``readiness.py`` and this thin wrapper
+          change — zero handler files are touched.
+        """
         from fw_context_mcp.mcp.shared.context import _db_path
 
         return _db_path(project_root)

@@ -23,7 +23,24 @@ _ZEPHYR_MARKERS = ["west.yml", "zephyr"]
 
 
 class ZephyrBuildSystem:
-    """Zephyr RTOS build system (``west build``)."""
+    """Zephyr RTOS build system (``west build``).
+
+    WHY ninja wrapper for .d files: Ninja deletes .d dependency files after
+    reading them by default (``-d keepdepfile`` is needed to persist them).
+    Zephyr's sysbuild uses Ninja as both outer and inner build tool.  The
+    wrapper shadows the real ninja binary in PATH with ``-d keepdepfile``
+    appended, ensuring .d files survive the build for header-change tracking.
+
+    WHY PATH injection (not CMAKE_MAKE_PROGRAM): sysbuild's
+    ExternalProject_Add does not forward CMAKE_MAKE_PROGRAM to the inner
+    Zephyr CMake project.  Injecting the wrapper via PATH works for both
+    the outer and inner Ninja invocations.
+
+    WHY CCACHE_DEPEND=1: ccache with ``depend_mode=false`` (default) skips
+    .d file regeneration on cache hits, meaning reindex can't detect which
+    headers a TU depends on.  Setting ``CCACHE_DEPEND=1`` forces ccache to
+    write .d files on every build, cache hit or not.
+    """
 
     name: str = "Zephyr"
     config_key: str = "zephyr"

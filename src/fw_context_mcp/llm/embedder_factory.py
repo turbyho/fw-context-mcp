@@ -1,4 +1,20 @@
-"""Embedder factory — resolves backend from LLMConfig."""
+"""Embedder factory — resolves backend from LLMConfig.
+
+WHY a factory: The project supports three embedding backends
+(Ollama HTTP, SentenceTransformer local, fine-tuned local).  The
+operator configures a model name string; the factory inspects the
+model name prefix and returns the correct ``Embedder`` subclass.
+Callers never import backend-specific classes.
+
+Backend selection rules
+    See :func:`get_embedder` docstring.
+
+Caching
+    Fine-tuned embedders (``ft://``) are cached by model path in
+    ``_FT_EMBEDDER_CACHE``.  ST and Ollama embedders are cheap to
+    construct (no heavy model loading at ``__init__`` time — ST
+    lazily loads in ``_ensure_model``, Ollama has no local state).
+"""
 
 from __future__ import annotations
 
@@ -25,6 +41,17 @@ def get_embedder(cfg: LLMConfig) -> Embedder:
     - ``ibm-granite/*``, ``lightonai/*``, ``BAAI/*``, ``cross-encoder/*`` →
       sentence-transformers (requires optional ``[st]`` extra)
     - Everything else → OllamaEmbedder
+
+    WHY prefix-based dispatch: Model names are the canonical user-facing
+    identifiers.  The operator writes ``embed_model = "BAAI/bge-small-en-v1.5"``
+    in config; the factory knows that ``BAAI/*`` is a HuggingFace model
+    requiring sentence-transformers.  No separate ``backend`` config key
+    needed.
+
+    WHY Ollama is the default for unrecognized names: Any model name not
+    matching a known ST prefix is assumed to be an Ollama model tag
+    (e.g. ``mxbai-embed-large``, ``nomic-embed-text``).  This covers the
+    common case without extra config.
     """
     from .auto_model import resolve_embed_model
 
@@ -59,6 +86,18 @@ def _get_ft_embedder(cfg: LLMConfig) -> Embedder:
 
     Results are cached by model path to avoid directory traversal on
     every call.
+
+    WHY ``ft://latest`` exists: After ``fw-context finetune``, a model
+    is saved to ``~/.fw-context/models/<project>/<timestamp>/final/``.
+    ``ft://latest`` auto-selects the most recent one by mtime — operator
+    never needs to copy-paste a path.  After retraining, the latest
+    model is picked up automatically (no config change).
+
+    WHY directory scan limited to 100 entries: ``~/.fw-context/models/``
+    can accumulate many stale training runs.  Scanning all of them on a
+    slow network-mounted home directory would cause multi-second hangs.
+    The 100-entry limit ensures the first call is fast; operators with
+    100+ projects should use an explicit ``ft://<path>``.
     """
     from .st_embedder import SentenceTransformerEmbedder
 
@@ -100,6 +139,8 @@ def _get_ft_embedder(cfg: LLMConfig) -> Embedder:
             )
         _validate_model_dir(best, "ft://latest resolved to " + str(best))
         log.info("Resolved ft://latest → %s", best)
+        # Shallow-copy cfg so we can mutate _ft_model_path without affecting
+        # the original config or other embedder instances that share it.
         resolved_cfg = copy.copy(cfg)
         resolved_cfg._ft_model_path = str(best)  # type: ignore[attr-defined]
         embedder = SentenceTransformerEmbedder(resolved_cfg)

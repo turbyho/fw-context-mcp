@@ -1,13 +1,68 @@
-"""Extract symbols, references, and inheritance edges from a CompilationUnit using libclang."""
+"""Extract symbols, references, inheritance edges, and macros from a CompilationUnit using libclang.
+
+This module is the single-pass extraction engine of the fw-context indexer.
+For each translation unit it produces:
+
+* **Symbols** — functions, methods, classes, enums, variables, fields,
+  namespaces.  Variable declarations are split into ``varglobal`` (file/class
+  scope) and ``varlocal`` (inside function bodies) based on semantic parent.
+* **References** — direct calls, reads, member accesses, indirect
+  (function-pointer) edges, and implicit constructor invocations.
+* **Inheritance** — C++ base-class edges with access specifier and virtual
+  flag for each class/struct definition.
+* **Macros** — ``#define`` name, value, and function-like flag.
+* **Indirect call sites** — locations where a function-pointer field or
+  variable is invoked (``driver.onData(buf, len)``).
+* **FnPointerAssignment** — links an assignment site (``obj.onData = &handler``)
+  to the assigned function, storing the helper-pointer typedef for Phase 3
+  linking of assignments to call sites.
+* **PendingDispatch** — deferred dispatch-registration patterns (e.g.
+  ``EventQueue::call_every``) for synthetic ``ref_kind='dispatch'`` edges.
+
+**Key design decisions:**
+
+* **Single TU walk** — ``extract_all`` parses once and walks the AST once.
+  Symbols and references are extracted in separate sub-walks over the same
+  cursor stream, trading memory for speed (no re-parse).
+
+* **Skip-files optimisation** — when a header was already visited by an
+  earlier TU, its subtree is skipped during subsequent walks.
+  ``_iter_cursor_skip`` uses a manual stack (instead of native
+  ``walk_preorder``) to support subtree omission.  The native method is ~3×
+  faster and is used when *skip_files* is empty.
+
+* **Three-phase function-pointer resolution** — Phase 1 detects assignments
+  (``_emit_fn_ptr_targets``).  Phase 2 records indirect call sites
+  (``_handle_indirect_invocations``).  Phase 3 links assignments to call
+  sites via the ``fn_ptr_type`` column (performed downstream in the
+  database layer).  Arguments to dispatch-registration APIs are additionally
+  captured via ``PendingDispatch``.
+
+* **Source-line fallback** — embedded C++ (mbed-os, Zephyr) relies heavily on
+  templates.  ``callback(&Class::method, this)`` and ``_timeout.attach(...)``
+  often produce ``UNEXPOSED_EXPR`` or empty CALL_EXPR cursors that libclang
+  cannot resolve.  ``_run_source_line_fallback`` scans raw source text inside
+  known function bodies and emits the missing call edges via regex matching.
+
+* **Conservative disambiguation** — ``_resolve_method_usr`` returns ``None``
+  when candidate methods are ambiguous rather than guessing.  A wrong edge
+  is worse than a missing edge (previously ``_timeout.attach(...)`` was
+  mis-resolved to ``SerialBase::attach``).
+
+* **Declaration-to-definition promotion** — ``_process_one_symbol`` tracks
+  ``seen_usrs`` as ``USR → bool(definition)``.  A forward declaration is
+  recorded as ``False``; when the definition is later encountered in the
+  same TU, the flag is promoted to ``True`` — the definition wins.
+"""
 
 from __future__ import annotations
 
 import logging
 import re
 import threading
-from collections.abc import Callable
+from collections.abc import Callable, Generator
 from dataclasses import dataclass, field
-from functools import lru_cache
+from functools import cache
 from pathlib import Path
 
 import clang.cindex as cx
@@ -44,6 +99,59 @@ def _get_index() -> cx.Index:
                 _INDEX = cx.Index.create()
     return _INDEX
 
+
+def _iter_cursor_skip(
+    root_cursor: cx.Cursor,
+    skip_files: frozenset[str],
+    resolve_fn: Callable[[str], Path],
+) -> Generator[cx.Cursor, None, None]:
+    """Pre-order AST walk that skips subtrees of already processed source files.
+
+    When a cursor's source file is in *skip_files*, the cursor and its
+    entire subtree are omitted from the traversal — children are never
+    pushed onto the stack.
+
+    Uses a manual stack instead of the native ``walk_preorder``, which
+    does not support subtree skipping.  The native method is about 3×
+    faster (implemented in C) and is used when *skip_files* is empty.
+
+    Each yielded cursor is guaranteed NOT to originate from a file in
+    *skip_files*, so the caller does not need to re-check.
+
+    Args:
+        root_cursor: The top-level ``TRANSLATION_UNIT`` cursor.
+        skip_files: Frozen set of resolved file paths to skip.
+            A frozen set avoids accidental mutation across call sites.
+        resolve_fn: Path resolver (typically an ``@lru_cache``-decorated
+            local function in ``extract_all``).  Each call resolves a
+            libclang file name string to a canonical ``Path``.
+
+    Yields:
+        Libclang cursors in pre-order, skipping any whose source file
+        is in *skip_files*.
+    """
+    stack: list[cx.Cursor] = [root_cursor]
+    while stack:
+        c = stack.pop()
+        loc = c.location
+        if loc.file:
+            fname = str(resolve_fn(str(loc.file.name)))
+            if fname in skip_files:
+                continue  # omit cursor + subtree
+
+        yield c
+
+        # Push children in reverse order for pre-order semantics.
+        # Materializing into a list is necessary — get_children()
+        # returns a lazy iterable, and reversed() needs a sequence.
+        children = list(c.get_children())
+        for child in reversed(children):
+            stack.append(child)
+
+
+# Frozen set for O(1) containment check on cursor kind during the symbol
+# walk.  A frozenset is hashable (can be used as a dict key) and immutable
+# (no accidental mutation in a long-running indexing process).
 _SYMBOL_KINDS = frozenset({
     cx.CursorKind.FUNCTION_DECL,
     cx.CursorKind.FUNCTION_TEMPLATE,
@@ -64,14 +172,20 @@ _SYMBOL_KINDS = frozenset({
     cx.CursorKind.NAMESPACE,
 })
 
-# Kinds where we index declarations even without a definition
+# Kinds where we index declarations even without a definition.
+# Forward declarations of functions/methods are recorded so that
+# find_all_callers_recursive can resolve calls even when the definition
+# is in a different TU.  Definitions win in seen_usrs promotion.
 _DECL_KINDS = frozenset({
     cx.CursorKind.FUNCTION_DECL,
     cx.CursorKind.FUNCTION_TEMPLATE,
     cx.CursorKind.CXX_METHOD,
 })
 
-# Callable definitions that establish an "enclosing function" for references
+# Callable definitions that establish an "enclosing function" for references.
+# When a cursor with one of these kinds is encountered during the ref walk
+# and it is a definition, it is pushed onto fn_stack — subsequent references
+# within its extent are attributed to this function as the caller (from_usr).
 _CALLABLE_KINDS = frozenset({
     cx.CursorKind.FUNCTION_DECL,
     cx.CursorKind.FUNCTION_TEMPLATE,
@@ -142,7 +256,11 @@ def _is_anonymous_struct_or_union(cursor: cx.Cursor) -> bool:
     return False
 
 
-def _build_anon_usr_to_field(tu_cursor: cx.Cursor) -> dict[str, str]:
+def _build_anon_usr_to_field(
+    tu_cursor: cx.Cursor,
+    skip_files: frozenset[str] | None = None,
+    resolve_fn: Callable[[str], Path] | None = None,
+) -> dict[str, str]:
     """Build a mapping from anonymous struct/union USR → enclosing field name.
 
     Walks struct/union/class/namespace bodies (skipping function bodies)
@@ -152,10 +270,23 @@ def _build_anon_usr_to_field(tu_cursor: cx.Cursor) -> dict[str, str]:
     This is used as a pre-scan before symbol extraction so that anonymous
     structs defined as ``struct { ... } _payload;`` get indexed with the
     field name (``_payload``) instead of ``"(unnamed struct at ...)"``.
+
+    When *skip_files* and *resolve_fn* are provided, subtrees rooted in
+    already-processed header files are skipped via an early-return in
+    the internal ``_walk`` function.  The skip check covers all cursor
+    kinds — not just the ones ``_walk`` recurses into — keeping the
+    guard consistent with ``_iter_cursor_skip`` semantics.
     """
     mapping: dict[str, str] = {}
 
     def _walk(cursor: cx.Cursor) -> None:
+        if skip_files and resolve_fn:
+            loc = cursor.location
+            if loc.file:
+                fpath = str(resolve_fn(str(loc.file.name)))
+                if fpath in skip_files:
+                    return  # omit subtree from already-processed header
+
         if cursor.kind == cx.CursorKind.FIELD_DECL:
             for child in cursor.get_children():
                 if _is_anonymous_struct_or_union(child):
@@ -268,6 +399,16 @@ def _end_line(cursor: cx.Cursor, loc) -> int:
 
 
 def _docstring(cursor: cx.Cursor) -> str:
+    """Extract and clean the Doxygen/Javadoc comment attached to *cursor*.
+
+    Strips leading comment markers (``/**``, ``//``, ``*``) and trailing
+    whitespace from each line, then joins with newlines.  Returns an
+    empty string when no raw comment is attached.
+
+    libclang parses comments attached to the declaration — even when the
+    comment appears before the declaration in source — via
+    ``cursor.raw_comment``.
+    """
     raw = cursor.raw_comment
     if not raw:
         return ""
@@ -318,9 +459,14 @@ def _find_fn_refs_in_expr(
 
     # Nested call expression — e.g. callback(&Class::method, this).
     # Always recurse into arguments to find function pointer targets.
-    # When the nested callee is itself a known function (not a callback
-    # wrapper like mbed::callback), propagate its USR as _skip_usr so its
-    # own callee-reference children are not emitted as indirect edges.
+    # When the nested callee is directly resolvable AND has a valid file
+    # location (not a built-in), upgrade _skip_usr to that callee's USR.
+    # This prevents emitting indirect edges for the callee's OWN children:
+    # e.g. inside ``callback(&handler, this)``, ``callback`` itself is the
+    # callee, so its parameters (handler's address) should NOT also be
+    # recorded as if they were called by ``callback``.
+    # If the nested callee cannot be resolved (template wrapper), keep the
+    # outer _skip_usr — we still descend into arguments to find targets.
     if cursor.kind == cx.CursorKind.CALL_EXPR:
         nested_callee = cursor.referenced
         nested_skip = _skip_usr
@@ -341,6 +487,9 @@ def _find_fn_refs_in_expr(
     return results
 
 
+# Known callback-wrapper template names used by _spelling_is_callback_wrapper
+# and _is_fn_ptr_type to detect function-pointer types stored behind a
+# template facade.  Tuple for O(N) linear scan over a small fixed set.
 _CALLBACK_TYPE_PREFIXES = (
     "Callback<", "function<", "std::function<", "EventHandler<",
 )
@@ -481,6 +630,16 @@ def _process_one_base_specifier(
     cls_spelling: str,
     access_map: dict[cx.AccessSpecifier, str],
 ) -> InheritanceRecord | None:
+    """Build an InheritanceRecord from one CXX_BASE_SPECIFIER child cursor.
+
+    Returns ``None`` for non-base-specifier cursors or when the base class
+    cannot be resolved (e.g. forward-declared template base with no
+    instantiation visible in this TU).
+
+    Calls ``clang_isVirtualBase`` directly through the C-API to detect
+    virtual inheritance — libclang does not expose a Python wrapper for
+    this query.
+    """
     if child.kind != cx.CursorKind.CXX_BASE_SPECIFIER:
         return None
     base_ref = child.referenced
@@ -530,8 +689,12 @@ def _extract_inheritance(class_cursors: list[cx.Cursor]) -> list[InheritanceReco
     return inheritance
 
 
-def _extract_macros(tu_cursor: cx.Cursor, resolve_fn) -> list[Macro]:
-    """Extract ``#define`` macro definitions from a translation unit cursor."""
+def _extract_macros(tu_cursor: cx.Cursor, resolve_fn, skip_files=None) -> list[Macro]:
+    """Extract ``#define`` macro definitions, skipping headers in *skip_files*.
+
+    Uses the module-level ``_log`` logger — no logging changes needed
+    when the *skip_files* parameter is supplied.
+    """
     macros: list[Macro] = []
     for child in tu_cursor.get_children():
         if child.kind != cx.CursorKind.MACRO_DEFINITION:
@@ -539,6 +702,10 @@ def _extract_macros(tu_cursor: cx.Cursor, resolve_fn) -> list[Macro]:
         loc = child.location
         if not loc.file:
             continue
+
+        fpath = str(resolve_fn(loc.file.name))
+        if skip_files and fpath in skip_files:
+            continue  # macro from already processed header
 
         try:
             is_fn_like = child.is_macro_function_like()
@@ -560,7 +727,7 @@ def _extract_macros(tu_cursor: cx.Cursor, resolve_fn) -> list[Macro]:
             value=value,
             line=loc.line,
             is_function_like=is_fn_like,
-            file=str(resolve_fn(loc.file.name)),
+            file=fpath,
         ))
     return macros
 
@@ -752,6 +919,10 @@ def _emit_fn_ptr_targets(
     # Token fallback: when _find_fn_refs_in_expr found no targets in any child
     # (e.g. UNEXPOSED_EXPR wrapping a member function pointer inside a CALL_EXPR
     # like callback(&Class::method)), try token-based extraction on the whole expr.
+    # This is the last-resort fallback — the libclang AST is opaque but the raw
+    # token stream still contains the ``&Class::method`` pattern.  We scan for
+    # it via _extract_fn_refs_from_unexposed which does not depend on AST
+    # structure, only on a linear token sequence.
     if qn_to_usr is not None:
         any_found = False
         for child in expr_cursor.get_children():
@@ -792,8 +963,31 @@ def _build_refs_and_fp_assignments(
     resolve_fn,
     anon_usr_to_field: dict[str, str],
     _log,
+    skip_files: frozenset[str] | None = None,
 ) -> tuple[list[Reference], list[IndirectCallSite], list[FnPointerAssignment], list[PendingDispatch]]:
     """Walk the TU AST extracting references, indirect call sites, and function pointer assignments.
+
+    When *skip_files* is a non-empty frozenset, subtrees of already
+    processed headers are skipped via :func:`_iter_cursor_skip` —
+    references from those headers were already captured during the
+    first TU that included them.
+
+    **Phase 1 — AST walk**: traverses the translation unit in pre-order.
+    A ``fn_stack`` tracks the enclosing function for each cursor — needed
+    because references store the caller's USR (``from_usr``).  The stack
+    is maintained by two pop conditions:
+    * File-mismatch pop — when the cursor moves into a different source
+      file and the top-of-stack function's span belongs to the TU's own
+      file, it is popped (we left that function's body).
+    * Line-overflow pop — when the cursor's line exceeds the top-of-stack
+      function's ``end_line`` (which is non-zero only for TU-resident
+      definitions), it is popped (we passed the closing brace).
+
+    **Phase 2 — source-line fallback**: after the AST walk,
+    :func:`_run_source_line_fallback` scans raw source text inside known
+    function spans and emits call/indirect edges via regex matching.
+    This catches ``obj.method()`` and ``&Class::method`` patterns that
+    template-obscured AST cursors cannot resolve.
 
     Returns (refs, indirect_call_sites, fp_assignments, pending_dispatches).
     """
@@ -816,12 +1010,23 @@ def _build_refs_and_fp_assignments(
 
     fn_stack: list[tuple[str, int, str]] = []
 
-    for cursor in tu.cursor.walk_preorder():
+    for cursor in (
+        _iter_cursor_skip(tu.cursor, skip_files, resolve_fn)
+        if skip_files
+        else tu.cursor.walk_preorder()
+    ):
         _cl = cursor.location
         _cl_file = str(Path(_cl.file.name).resolve()) if _cl and _cl.file else None
         _cl_line = _cl.line if _cl else -1
+        # Pop condition 1 — file mismatch: the top-of-stack function was
+        # defined in the TU's own file (tu_path_str) but the cursor is now
+        # in a different file (e.g. an included header).  The function
+        # body ended before the include; pop it.
         while fn_stack and fn_stack[-1][2] and _cl_file and fn_stack[-1][2] != _cl_file:
             fn_stack.pop()
+        # Pop condition 2 — line overflow: the top-of-stack function has a
+        # known end_line (>0, set only for TU-resident definitions) and the
+        # cursor line has advanced past it.  We left the function body.
         while fn_stack and fn_stack[-1][1] > 0 and _cl is not None and _cl_line > fn_stack[-1][1]:
             fn_stack.pop()
         cur_fn = fn_stack[-1][0] if fn_stack else None
@@ -834,6 +1039,11 @@ def _build_refs_and_fp_assignments(
                 _ext = cursor.extent
                 if _ext.start.file:
                     _ext_file = _ext.start.file.name
+                    # Only TU-resident definitions get a non-zero end_line
+                    # stored in fn_stack.  This end_line is used by the
+                    # line-overflow pop condition above to determine when
+                    # we left the function body.  Definitions from other
+                    # files (headers) get end_line=0 — no pop-on-line.
                     if str(resolve_fn(_ext_file)) == tu_path_str:
                         _fn_spans.append((cur_fn or '', _ext.start.line, _ext.end.line))
                         fn_stack.append((cur_fn or '', _ext.end.line, tu_path_str))
@@ -872,6 +1082,29 @@ def _process_one_symbol(
     """Process a single cursor during AST walk for symbol extraction.
 
     Returns True if the cursor was added as a new symbol.
+
+    **Kind classification** — ``VAR_DECL`` cursors are split into two
+    sub-kinds based on their semantic parent:
+    * ``varglobal`` — global, namespace, linkage-spec, or class-scope
+      variables (including ``static`` class members).
+    * ``varlocal`` — variables inside function/method/constructor bodies.
+
+    **Template USR resolution** — for non-template declarations that are
+    instantiations of a template (e.g. ``Callback<void(int)>``), the
+    ``specialized_template`` cursor is resolved through a three-level
+    fallback chain:
+    1. Direct ``cursor.specialized_template``.
+    2. Parent's ``semantic_parent.specialized_template`` — handles members
+       of template classes.
+    3. ``cursor.type.get_declaration().specialized_template`` — handles
+       typedef/variable declarations where the type itself is a template
+       instantiation.
+
+    **Deduplication** — ``seen_usrs`` maps USR → ``bool(definition)``.
+    When a forward declaration is encountered first, it is recorded with
+    ``False``.  When the definition is later met in the same TU, the flag
+    is promoted to ``True``.  A duplicate declaration (with the same
+    definition status) is silently skipped — returns ``False``.
     """
     loc = cursor.location
     if not loc.file:
@@ -897,6 +1130,11 @@ def _process_one_symbol(
 
     sem_parent = cursor.semantic_parent
     kind = _cursor_kind_label(cursor.kind)
+    # Split VAR_DECL into varglobal / varlocal based on semantic parent.
+    # A variable declared at file, namespace, or class scope is a
+    # varglobal (shared state); a variable inside a function body is a
+    # varlocal (stack/register).  This split powers find_variables for
+    # global-state discovery without flooding results with loop counters.
     if kind == "variable":
         if sem_parent and sem_parent.kind in (
             cx.CursorKind.TRANSLATION_UNIT,
@@ -933,6 +1171,13 @@ def _process_one_symbol(
     )
     template_usr = ""
     if not is_template:
+        # Three-level fallback for template USR resolution.
+        # Level 1: direct specialized_template (most common).
+        # Level 2: parent's specialized_template — members of template
+        #   classes (e.g. Callback<void()>::operator()) inherit their
+        #   template USR from the enclosing class.
+        # Level 3: type declaration lookup — typedef/variable whose type
+        #   is a template instantiation (e.g. ``Callback<void()> cb;``).
         _template_check_kinds = (
             cx.CursorKind.CLASS_DECL, cx.CursorKind.STRUCT_DECL,
             cx.CursorKind.FUNCTION_DECL, cx.CursorKind.CXX_METHOD,
@@ -959,6 +1204,9 @@ def _process_one_symbol(
             except (ValueError, TypeError, RuntimeError, AttributeError):
                 _log.debug("specialized_template failed for %s", cursor.spelling)
 
+    # Deduplication: seen_usrs[usr] = bool(is_definition).
+    # Forward declaration (False) → definition (True) is promoted.
+    # Duplicate declaration or definition with the same status is skipped.
     prev = seen_usrs.get(usr)
     if prev is not None:
         if is_def and not prev:
@@ -1092,6 +1340,16 @@ def _collect_ctor_refs_from_type(
     child_type: cx.Type, loc_file: str, loc_line: int, cur_fn: str | None,
     refs: list[Reference], seen_ref: set[tuple],
 ) -> None:
+    """Emit a ``call`` reference for every constructor of a RECORD type.
+
+    Called from ``_handle_constructor_fallback`` when a variable or field
+    declaration has a class type whose constructor call was not resolved
+    by libclang (common with implicit/default constructors).
+
+    Iterates all child constructors of the class — the specific overload
+    is not distinguished; each constructor gets a call reference at the
+    declaration site.
+    """
     if child_type.kind != cx.TypeKind.RECORD:
         return
     try:
@@ -1148,7 +1406,26 @@ def _handle_indirect_invocations(cursor: cx.Cursor, cur_fn: str | None,
                                  resolve_fn: Callable[..., object],
                                  qn_to_usr: dict[str, str],
                                  _log: logging.Logger) -> None:
-    """Indirect calls: function pointers invoked directly or passed as call arguments."""
+    """Indirect calls: function pointers invoked directly or passed as call arguments.
+
+    Two resolution strategies for indirect invocations:
+
+    1. **Direct callee** — ``cursor.referenced`` resolves to a FIELD_DECL,
+       VAR_DECL, or PARM_DECL whose type is a function pointer.  This
+       covers the common case ``driver.onData(buf, len)`` where libclang
+       resolves ``onData`` directly.  An IndirectCallSite is recorded.
+
+    2. **Callee-expression fallback** — when ``cursor.referenced`` is
+       ``None`` or does not match, the first child of the CALL_EXPR is
+       unwrapped (through ``UNEXPOSED_EXPR`` layers) and its type is
+       checked.  This covers ``stored_callback(42)`` where the callee is
+       a variable rather than a field, and template-wrapped cases.
+       ``_extract_lhs_field`` walks the callee expression to extract the
+       target USR and name.
+
+    After recording the call site, ``_handle_fn_ptr_as_argument`` scans
+    the call arguments for function-pointer targets passed as parameters.
+    """
     if cursor.kind != cx.CursorKind.CALL_EXPR:
         return
     loc = cursor.location
@@ -1373,7 +1650,26 @@ def _handle_fn_ptr_cases(cursor: cx.Cursor, cur_fn: str | None,
                         fp_assignments: list[FnPointerAssignment],
                         seen_ref: set[tuple], tu_path_str: str,
                         _log: logging.Logger) -> None:
-    """Function pointers in assignments, variable initializers, and init lists."""
+    """Function pointers in assignments, variable initializers, and init lists.
+
+    Three recognised patterns for function-pointer assignments:
+
+    * **Binary assignment** — ``obj.onData = &handler`` or ``global_cb = &fn``.
+      The LHS field/variable is extracted via ``_extract_lhs_field`` and
+      passed to ``_emit_fn_ptr_targets`` for ``FnPointerAssignment`` creation.
+
+    * **Variable initializer** — ``static void (*fp)(int) = &handler``.
+      The variable declaration itself is the LHS; its USR and spelling
+      become the assignment target for Phase 3 linking.
+
+    * **Init-list member** — ``{.on_data = &handler, .cb = &fallback}``.
+      Each init-list child that assigns a function pointer is processed
+      individually, with the designated field name used as the LHS.
+
+    Does NOT check return value of ``_emit_fn_ptr_targets`` — indirect
+    references are always emitted even when no ``FnPointerAssignment`` is
+    created (i.e. the assigned function has no call site yet).
+    """
 
     if cursor.kind == cx.CursorKind.BINARY_OPERATOR:
         lhs_usr, lhs_name = _extract_lhs_field(cursor)
@@ -1392,7 +1688,20 @@ def _handle_fn_ptr_cases(cursor: cx.Cursor, cur_fn: str | None,
 def _handle_implicit_constructors(cursor: cx.Cursor, cur_fn: str | None,
                                   refs: list[Reference], seen_ref: set[tuple],
                                   _log: logging.Logger) -> None:
-    """Implicit constructor calls from global/static objects and member fields."""
+    """Implicit constructor calls from global/static objects and member fields.
+
+    Detects ``ref_kind='implicit_construct'`` edges: when a VAR_DECL or
+    FIELD_DECL has a RECORD type (class/struct), iterates all constructors
+    of that class and emits a call reference at the declaration site.
+    This is necessary because libclang does not emit CALL_EXPR for implicit
+    or default constructor invocations (e.g. ``Foo obj;`` or
+    ``static Bar _bar;`` at file scope).
+
+    The specific constructor overload is NOT distinguished — every
+    constructor of the class gets a reference.  This is sufficient for
+    call-graph dead-code detection and hotspot analysis, where the
+    caller count should reflect all construction sites.
+    """
     if cursor.kind not in (cx.CursorKind.VAR_DECL, cx.CursorKind.FIELD_DECL):
         return
     loc = cursor.location
@@ -1428,7 +1737,30 @@ def _handle_token_fallbacks(cursor: cx.Cursor, cur_fn: str | None,
                             seen_ref: set[tuple], qn_to_usr: dict[str, str],
                             usr_to_qn: dict[str, str], tu_path_str: str,
                             _log: logging.Logger) -> None:
-    """Token-based fallback detection: UNEXPOSED_EXPR and template-obscured calls."""
+    """Token-based fallback detection: UNEXPOSED_EXPR and template-obscured calls.
+
+    Operates on the raw token stream, not the libclang AST — necessary when
+    template expansion produces ``UNEXPOSED_EXPR`` wrappers that hide the
+    actual call/ref structure.
+
+    Three detection patterns:
+
+    1. **UNEXPOSED_EXPR** → extracts ``&Class::method`` via
+       ``_extract_fn_refs_from_unexposed`` from any opaque expression node.
+
+    2. **Token-level obj.method()** — scans CALL_EXPR tokens for
+       ``IDENTIFIER DOT/ARROW IDENTIFIER LPAREN`` sequences and resolves
+       via ``_resolve_method_usr`` with the field name as hint.
+
+    3. **Token-level bare call** — matches ``IDENTIFIER LPAREN`` where the
+       identifier is not preceded by ``.`` or ``->`` (avoids double-counting
+       with pattern 2).  Resolves via ``_resolve_method_usr`` with the
+       enclosing class as hint.
+
+    4. **Callback-style indirect targets** — ``&Class::method`` inside a
+       CALL_EXPR argument list.  Emits ``ref_kind='indirect'`` and an
+       ``FnPointerAssignment`` with ``method='call_arg'``.
+    """
     loc = cursor.location
     caller_qn = usr_to_qn.get(cur_fn or "") or ""
 
@@ -1486,6 +1818,10 @@ def _handle_token_fallbacks(cursor: cx.Cursor, cur_fn: str | None,
                         from_usr=cur_fn,
                     ))
 
+# Keywords and built-in operators that the bare-call regex in
+# _run_source_line_fallback must not emit as call edges.
+# A frozenset gives O(1) containment check and prevents accidental
+# mutation across the module's lifetime.
 _BARE_CALL_KEYWORD_DENYLIST: frozenset[str] = frozenset({
     'if', 'while', 'for', 'return', 'switch', 'catch',
     'sizeof', 'decltype', 'typeof', 'alignof', 'noexcept',
@@ -1504,7 +1840,38 @@ def _run_source_line_fallback(
     _log,
 ) -> None:
     """Post-processing: scan source lines inside known function bodies for
-    template-obscured ``obj.method(`` patterns and emit missing references."""
+    template-obscured patterns and emit missing references.
+
+    Operates in four sequential phases per source line:
+
+    **Phase 1 — obj.method() fallback**: regex-matches ``obj.method(`` patterns
+    on lines NOT already covered by AST-extracted call/indirect edges.  Uses
+    ``_resolve_method_usr`` with the field name as a disambiguation hint.
+    When the matched method name is in ``_DISPATCH_METHOD_NAMES``, also
+    scans for ``&Class::callback`` arguments and records ``PendingDispatch``.
+
+    **Phase 2 — bare call fallback**: matches ``function(args)`` and
+    ``function<T>(args)`` patterns (excluding language keywords in
+    ``_BARE_CALL_KEYWORD_DENYLIST``).  Suppresses self-references on the
+    function's own definition line — the regex would otherwise match the
+    declaration signature as a self-call.
+
+    **Phase 3 — type-erased ISR registration**: detects patterns like
+    ``NVIC_SetVector(IRQn, (uint32_t)handler)`` where the integer cast
+    obliterates the function-pointer type.  Uses ``_TYPE_ERASED_ISR_FUNCTIONS``
+    (a registry of known ISR-registration function names mapped to their
+    handler-argument position) and attempts to resolve the handler name
+    through both ``&Class::method`` regex and bare-name lookup.
+
+    **Phase 4 — &Class::method on source text**: a final blanket scan for
+    ``&Class::method`` patterns.  This runs on raw source text, not AST
+    cursors, so it fires even when the TU is too degraded for libclang to
+    produce ``CALL_EXPR`` cursors (common in embedded mbed-os builds where
+    the AST-based ``_handle_token_fallbacks`` cannot see empty bodies).
+
+    Each phase uses ``seen_ref`` for deduplication — a reference already
+    found by an earlier phase or the AST walk is never re-emitted.
+    """
     import re as _re
 
     _tu_file = tu.spelling
@@ -1536,6 +1903,13 @@ def _run_source_line_fallback(
         if _line_fn is None:
             continue
         _line_qn = usr_to_qn.get(_line_fn or "") or ""
+        # ── Phase 1: obj.method() fallback ─────────────────────────────
+        # Matches ``field.method(...)`` or ``field->method(...)`` patterns.
+        # Runs only on lines NOT already covered by AST-extracted call/indirect
+        # edges (checked via _lines_with_calls fast-path above).
+        # _resolve_method_usr uses the field name hint for receiver-class
+        # disambiguation — e.g. ``_timeout.attach(...)`` resolves to
+        # ``Timeout::attach`` because the field is named ``_timeout``.
         for _m in _re.finditer(r'(\w+)(?:\.|->)(\w+)\s*\(', _line):
             _field_name = _m.group(1)
             _method_name = _m.group(2)
@@ -1580,6 +1954,14 @@ def _run_source_line_fallback(
                     "Source-line fallback: no USR for %s.%s() at %s:%d",
                     _field_name, _method_name, _tu_file, _lineno,
                 )
+        # ── Phase 2: bare call fallback ────────────────────────────────
+        # Matches ``func(args)`` or ``func<T>(args)`` — direct function
+        # calls without a receiver object.  Filters out C/C++ keywords via
+        # _BARE_CALL_KEYWORD_DENYLIST (e.g. ``if(x)`` is not a call to
+        # function ``if``).  Suppresses the self-reference false-positive:
+        # a bare match of the enclosing function's own name on its
+        # definition line is the declaration signature, not a recursive
+        # call (e.g. ``void zbox_reset(void)`` matches ``zbox_reset(``).
         # Bare call fallback: function(args) or function<T>(args)
         for _m in _re.finditer(r'(?<![.\w])(\w+)(<[^>]+>)?\s*\(', _line):
             _method_name = _m.group(1)
@@ -1600,9 +1982,16 @@ def _run_source_line_fallback(
                     to_usr=_target_usr, from_file=_tu_file,
                     from_line=_lineno, from_usr=_line_fn, ref_kind="call",
                 ))
-        # ── Type-erased ISR registration detection ──────────────
+        # ── Phase 3: Type-erased ISR registration detection ────────────
         # APIs like NVIC_SetVector(IRQn, (uint32_t)handler) where
         # libclang cannot see the fn-ptr because of the integer cast.
+        # _TYPE_ERASED_ISR_FUNCTIONS maps known ISR-registration function
+        # names to their handler-argument position (currently unused in
+        # the detection itself — the handler is found by regex, not by
+        # argument indexing).  Two sub-strategies for handler resolution:
+        #   a) ``&Class::method`` pattern in the argument text.
+        #   b) Bare-name lookup of the last identifier in the arg list
+        #      (after stripping parenthesized sub-expressions).
         for _isr_fn, _arg_pos in _TYPE_ERASED_ISR_FUNCTIONS.items():
             for _m in _re.finditer(rf'\b{_isr_fn}\s*\(', _line):
                 _call_start = _m.end()
@@ -1648,10 +2037,13 @@ def _run_source_line_fallback(
                         fn_ptr_type="", method="isr_vec",
                         from_usr=_line_fn,
                     ))
-        # This runs on the source TEXT (not AST cursors), so it also fires when
-        # a translation unit is too badly degraded for libclang to produce
-        # CALL_EXPR cursors (common in embedded mbed-os builds) — the AST-based
-        # scan in _handle_token_fallbacks cannot see those empty bodies.
+        # ── Phase 4: &Class::method on source text ─────────────────────
+        # Blanket scan for ``&Class::method`` patterns on every source
+        # line inside a known function body.  This runs on raw text, not
+        # AST cursors — when a TU is too degraded for libclang to produce
+        # CALL_EXPR cursors (embedded mbed-os builds with unrecoverable
+        # template errors), the AST-based _handle_token_fallbacks cannot
+        # see the empty body, but the source text still has the patterns.
         for _m in _re.finditer(r'&(\w+)::(\w+)', _line):
             _partial = f"{_m.group(1)}::{_m.group(2)}"
             _target_usr = _resolve_partial_qn(_partial, qn_to_usr)
@@ -1687,18 +2079,26 @@ class ExtractionResult:
     fp_assignments: list = field(default_factory=list)
     macros: list = field(default_factory=list)
     pending_dispatches: list = field(default_factory=list)
+    newly_seen_files: set[str] = field(default_factory=set)
 
 def extract_all(
     unit: CompilationUnit,
     with_refs: bool = False,
     *,
     return_tu: bool = False,
+    skip_files: set[str] | None = None,
 ) -> ExtractionResult:
     """Parse one translation unit and return extracted symbols, references, and inheritance.
 
     This is the single-pass entry point for all data extraction from a
     ``CompilationUnit``.  It parses the file with libclang, walks the AST
-    once, and produces five outputs simultaneously.
+    once, and produces multiple outputs simultaneously.
+
+    When *skip_files* is a non-empty ``set[str]``, subtrees rooted in
+    already-processed header files are skipped during all AST walks
+    (symbols, references, macros, anon-field mapping, and content fill).
+    This eliminates 91–97 % of duplicate work for headers already
+    visited by earlier translation units in the same indexing run.
 
     No filtering is done at the extraction level — all symbols and references
     from all included files are extracted.  Filtering (project vs vendor)
@@ -1710,26 +2110,17 @@ def extract_all(
             edges and embed a source-line token fallback pass for
             template-obscured expressions.  Inheritance is always extracted
             regardless of this flag.
+        skip_files: Optional set of resolved file paths whose subtrees
+            should be skipped.  Passed through to all internal walkers.
+            When ``None`` or empty, the native ``walk_preorder`` is used
+            (faster for the first TU with an empty skip set).
 
     Returns:
-        A tuple ``(symbols, references, inheritance, indirect_call_sites, fp_assignments, macros)``:
-            symbols — all declarations and definitions from all included files.
-            references — when ``with_refs`` is True, all call/ref/member/indirect
-                edges; empty list otherwise.
-            inheritance — C++ base class edges for class/struct definitions.
-            indirect_call_sites — when ``with_refs`` is True, call sites
-                where a function pointer field or variable is invoked
-                (``obj->onData(args)``, ``stored_callback(args)``);
-                empty list otherwise.
-            fp_assignments — when ``with_refs`` is True, function pointer
-                assignments (``field = &fn``, ``cb(&fn)`` param flow,
-                ``void (*fp)(...) = &fn``) recording both the left-hand
-                field/variable/parameter and the right-hand function;
-                enables Phase 3 linking of assignment sites to call sites.
-            macros — ``#define`` macro definitions found in the
-                translation unit, always extracted.
-                ``expanded_value`` is empty at this stage; populated later
-                by the ``clang -dM -E`` driver.
+        An ``ExtractionResult`` with symbols, references, inheritance,
+        indirect_call_sites, fp_assignments, macros, pending_dispatches,
+        and newly_seen_files (the set of all source file paths encountered
+        during the symbol walk — used to accumulate the skip set for
+        subsequent translation units).
     """
 
     import logging
@@ -1745,10 +2136,20 @@ def extract_all(
 
     cwd = unit.directory
 
-    @lru_cache(maxsize=4096)
+    # maxsize=None — the cache lives only for this extract_all() call
+    # (one TU).  Even 10 000 unique header paths (~2 MB) is negligible,
+    # and unbounded cache avoids eviction churn during the AST walk.
+    @cache
     def _resolve(path: str) -> Path:
         p = Path(path)
         return (cwd / p).resolve() if not p.is_absolute() else p.resolve()
+
+    # Convert mutable set to frozen for hash-consistency across call sites.
+    # The mutable set lives in runner.py; each extract_all call gets a
+    # stable frozen view that cannot be accidentally mutated.
+    _skip_frozen: frozenset[str] | None = (
+        frozenset(skip_files) if skip_files else None
+    )
 
     # --- Symbols ---
     symbols: list[Symbol] = []
@@ -1757,11 +2158,28 @@ def extract_all(
 
     # Pre-scan: map anonymous struct/union USRs to their field names
     # (e.g. struct { ... } _ble_cmd;  →  anon_usr → "_ble_cmd")
-    anon_usr_to_field = _build_anon_usr_to_field(tu.cursor)
+    anon_usr_to_field = _build_anon_usr_to_field(
+        tu.cursor, skip_files=_skip_frozen, resolve_fn=_resolve,
+    )
 
     tu_path_str = str(_resolve(tu.spelling))
 
-    for cursor in tu.cursor.walk_preorder():
+    # Collect every source file path seen during the symbol walk.
+    # Includes ALL files, not just those with _SYMBOL_KINDS cursors —
+    # a header with only forward declarations still contributes to the
+    # skip set so subsequent TUs can skip its subtree entirely.
+    _newly_seen: set[str] = set()
+
+    if _skip_frozen:
+        _skipper = _iter_cursor_skip(tu.cursor, _skip_frozen, _resolve)
+    else:
+        _skipper = tu.cursor.walk_preorder()
+
+    for cursor in _skipper:
+        if cursor.location.file:
+            fpath = str(_resolve(str(cursor.location.file.name)))
+            _newly_seen.add(fpath)
+
         if cursor.kind not in _SYMBOL_KINDS:
             continue
         _process_one_symbol(cursor, symbols, seen_usrs, class_cursors, anon_usr_to_field, _log)
@@ -1772,15 +2190,20 @@ def extract_all(
     inheritance = _extract_inheritance(class_cursors)
 
     # --- Macro definitions (#define) ---
-    macros = _extract_macros(tu.cursor, _resolve)
+    macros = _extract_macros(tu.cursor, _resolve, skip_files=_skip_frozen)
 
     if not with_refs:
         _log.info("  parse=%.1fs symwalk=%.1fs syms=%d macros=%d", _t_parse, _t_symwalk, len(symbols), len(macros))
-        result = ExtractionResult(tu=tu if return_tu else None, symbols=symbols, references=[], inheritance=inheritance, indirect_call_sites=[], fp_assignments=[], macros=macros)
+        result = ExtractionResult(
+            tu=tu if return_tu else None, symbols=symbols, references=[],
+            inheritance=inheritance, indirect_call_sites=[], fp_assignments=[],
+            macros=macros, newly_seen_files=_newly_seen,
+        )
         return result
 
     refs, indirect_call_sites, fp_assignments, pending_dispatches = _build_refs_and_fp_assignments(
         tu, tu_path_str, symbols, _resolve, anon_usr_to_field, _log,
+        skip_files=_skip_frozen,
     )
 
     _t_total = _time.monotonic() - _t_start
@@ -1789,5 +2212,10 @@ def extract_all(
         "  parse=%.1fs symwalk=%.1fs refwalk=%.1fs syms=%d refs=%d macros=%d",
         _t_parse, _t_symwalk, _t_refwalk, len(symbols), len(refs), len(macros),
     )
-    result = ExtractionResult(tu=tu if return_tu else None, symbols=symbols, references=refs, inheritance=inheritance, indirect_call_sites=indirect_call_sites, fp_assignments=fp_assignments, macros=macros, pending_dispatches=pending_dispatches)
+    result = ExtractionResult(
+        tu=tu if return_tu else None, symbols=symbols, references=refs,
+        inheritance=inheritance, indirect_call_sites=indirect_call_sites,
+        fp_assignments=fp_assignments, macros=macros,
+        pending_dispatches=pending_dispatches, newly_seen_files=_newly_seen,
+    )
     return result

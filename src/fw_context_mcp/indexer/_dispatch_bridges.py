@@ -2,6 +2,13 @@ from __future__ import annotations
 
 """Built-in dispatch bridges: callee QN → dispatch entry point QN.
 
+WHY dispatch bridges: libclang's call graph is static — it sees
+``EventQueue::call_every(callback)`` but has no way to know that
+``callback`` will be invoked by ``EventQueue::dispatch_forever`` during
+the event loop.  These bridges inject synthetic edges that connect
+dispatch-registration APIs to their event-loop entry points, making
+the static call graph correctly reflect the runtime control flow.
+
 When a function calls a dispatch-registration method
 (e.g. ``EventQueue::call_every``), a synthetic ``ref_kind='dispatch'`` edge
 is created from the dispatch entry point (e.g. ``EventQueue::dispatch_forever``)
@@ -26,6 +33,12 @@ pointer invisible to libclang.  ``_TYPE_ERASED_ISR_FUNCTIONS`` maps such
 function names to the (0-based) argument index that carries the handler.
 The source-line fallback in ``symbols.py`` uses this to extract the handler
 name from the raw source line.
+
+WHY source-line fallback: type-erased arguments (``(uint32_t)handler``) are
+invisible to libclang's AST — the function pointer assignment is completely
+hidden.  Without the source-line fallback, ISR registrations in CMSIS, Nordic
+SDK, and STM32 HAL would produce no ``fn_pointer_assignment`` records,
+breaking the indirect-call resolution chain entirely.
 """
 
 # Map: dispatch-registration API qualified name → dispatch entry point QN.

@@ -2,6 +2,21 @@
 
 Updates ``manifest.json`` after indexing: header mtime refresh and
 incremental/full manifest rebuild.
+
+WHAT is manifest.json: a JSON file that stores per-TU (Translation Unit)
+metadata — the source file, compiler arguments, a content hash of the
+source, and a list of included headers with their content hashes.  This
+enables fast staleness detection without re-parsing all headers.
+
+WHY incremental manifest update: after a full index of 500+ TUs,
+regenerating the manifest from scratch (re-tokenizing every header) takes
+minutes.  The incremental path reuses pre-collected header hashes from the
+main indexing loop, only re-tokenizing new or changed TUs.
+
+WHY header mtime refresh: ``git checkout`` / ``git merge`` changes header
+file mtimes without changing content.  Without the refresh pass, the
+stored mtimes would fall behind disk state, causing phantom modifications
+that trigger unnecessary background reindexes.
 """
 
 from __future__ import annotations
@@ -31,6 +46,14 @@ def _refresh_header_mtimes_from_manifest(
     This function scans the manifest's header entries and updates the
     stored mtime whenever the on-disk mtime is newer but the stored mtime
     is stale — fixing the drift without a full Tier-3 reparse.
+
+    WHY only update when on-disk mtime is newer: we use ``UPDATE ... SET
+    mtime=? WHERE mtime < ?`` — this is a one-way forward correction.
+    If the on-disk mtime is OLDER than the stored mtime (e.g., after a
+    ``git checkout`` of an older commit), we don't roll back the stored
+    mtime because that would mark the file as modified and trigger a
+    reindex.  The content hash check in the staleness detection will
+    still catch actual content changes regardless of mtime.
 
     Called once after the main TU loop, before the manifest update phase.
     Returns the number of refreshed header records.
@@ -80,13 +103,19 @@ def _update_manifest_after_index(
 ) -> dict | None:
     """Update ``manifest.json`` after an indexing run.
 
-    Strategy:
+    Strategy (ordered by cost):
     - No existing manifest → build from scratch (tokenize all TUs).
     - Manifest exists, nothing changed → skip (manifest is still valid).
     - Manifest exists, TUs changed, *tu_headers* provided → incremental:
       reuse stored entries for unchanged TUs, update only changed ones.
+      This is the fast path — no extra libclang parsing needed.
     - Manifest exists, TUs changed, no *tu_headers* → fallback to full
-      rebuild (re-tokenize all TUs).
+      rebuild (re-tokenize all TUs).  This is the slow path.
+
+    WHY incremental update: after indexing 500+ TUs, re-tokenizing every
+    header takes minutes.  The incremental path reuses pre-collected header
+    hashes from the main indexing loop (``tu_headers``), avoiding a second
+    libclang parse for unchanged TUs.
 
     Returns the updated manifest dict, or ``None`` when no update needed.
     """
@@ -104,6 +133,10 @@ def _update_manifest_after_index(
     if manifest is not None and updated_count == 0 and not tu_headers:
         # Check for degraded (preliminary) manifest — entries with empty
         # source_hash mean build_preliminary overwrote the real manifest.
+        # A preliminary manifest is written during the build phase before
+        # any TU is parsed — it has the correct TU list but empty hashes.
+        # We MUST regenerate with real hashes from the just-completed parse
+        # to ensure accurate staleness detection on the next index run.
         entries = manifest.get("entries", [])
         if entries and not entries[0].get("source_hash"):
             log.info("Manifest has preliminary entries — regenerating with full hashes")

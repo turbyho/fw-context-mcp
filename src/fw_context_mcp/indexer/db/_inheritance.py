@@ -1,4 +1,19 @@
-"""C++ class hierarchy storage helpers for fw-context-mcp index."""
+"""C++ class hierarchy storage helpers for fw-context-mcp index.
+
+Stores C++ inheritance edges (``inheritance`` table) and virtual method
+override relationships (``overrides`` table).  These tables power:
+- ``get_inheritance_chain`` — shows what a class inherits from and what
+  inherits from it
+- ``get_class_members`` — lists all methods/fields/nested types of a class
+- ``get_method_overrides`` — shows virtual dispatch relationships
+- ``get_template_instances`` — lists all instantiations of a template
+
+WHY store inheritance separately from symbols: C++ inheritance can span
+translation units (base class in header, derived class in .cpp).  A
+separate ``inheritance`` table with batch insertion/deletion by file
+enables incremental reindexing — when one file changes, only its
+inheritance edges are updated, not the entire class hierarchy.
+"""
 
 import sqlite3
 

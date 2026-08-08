@@ -54,6 +54,17 @@ def detect_chat_endpoint(cfg: LLMConfig) -> tuple[str, str]:
     5. URL ends with ``/api`` -> Ollama, append ``/generate``.
     6. URL contains ``:11434`` -> Ollama, append ``/api/generate``.
     7. Bare host (none of above) -> OpenAI, append ``/v1/chat/completions``.
+
+    WHY heuristic-based: There is no standard discovery endpoint for
+    Ollama vs OpenAI.  The URL patterns above cover 95%+ of real-world
+    configurations (Ollama default port 11434, OpenAI-compatible servers
+    at ``/v1``, LiteLLM/vLLM at bare hosts).  The operator can always
+    override with ``chat_api_format`` if the heuristic guesses wrong.
+
+    WHY ``chat_api_format`` takes priority over URL patterns: An operator
+    who explicitly sets ``chat_api_format = "ollama"`` on a URL that looks
+    like OpenAI (e.g. a reverse proxy) knows what they are doing.  The
+    explicit override is never second-guessed.
     """
     if not cfg.chat_api_base:
         raise ValueError("chat_api_base is empty — set it or leave as None")
@@ -104,6 +115,12 @@ def _is_sse_response(resp: httpx.Response) -> bool:
     Some APIs ignore ``stream: false`` and return ``text/event-stream``
     anyway.  This detects that situation so we can parse the SSE body
     instead of failing with a JSON decode error.
+
+    WHY check Content-Type (not first-byte heuristic): The Content-Type
+    header is the canonical signal.  Checking for ``text/event-stream``
+    with or without charset suffix covers all known SSE implementations.
+    A first-byte heuristic (e.g. checking if body starts with ``data:``)
+    would be fragile — some APIs prepend BOM or whitespace.
     """
     ct = resp.headers.get("content-type", "").lower()
     return ct == "text/event-stream" or ct.startswith("text/event-stream;")
@@ -119,6 +136,13 @@ def _extract_openai_text(msg_or_delta: dict) -> str:
     small ``max_tokens``) or interleaved with ``content``.  Using it as
     a fallback ensures we still return useful text in those cases
     rather than an empty string.
+
+    WHY fallback to reasoning_content: The OpenAI API spec reserves
+    ``reasoning_content`` for chain-of-thought output.  Some model
+    providers repurpose it for the final answer when ``max_tokens``
+    is set too low for the thinking phase + answer.  Without this
+    fallback, the response would be silently empty — confusing for
+    the operator who sees no error but no output either.
     """
     content = msg_or_delta.get("content")
     if content:
@@ -267,6 +291,15 @@ def call_openai_chat(
     Does NOT send ``keep_alive`` / ``num_ctx`` (Ollama-specific parameters).
     Does NOT auto-pull on 404 (cloud APIs don't support model pulling).
 
+    WHY no ollama_guard: The semaphore protects a local Ollama process
+    from GPU saturation.  Cloud APIs are multi-tenant and designed for
+    concurrent requests — serializing them would add unnecessary latency.
+
+    WHY no auto-pull: Cloud APIs report 404 for invalid model names or
+    missing deployments.  Auto-pulling would be meaningless (there is no
+    ``ollama pull`` equivalent for OpenAI/DeepSeek/vLLM).  The operator
+    should fix the model name in config.
+
     Streaming behavior:
 
     * When ``cfg.stream`` is True (Plan B): sends ``stream: true`` and
@@ -315,7 +348,11 @@ def call_openai_chat(
         resp = httpx.post(endpoint, json=payload, headers=headers, timeout=cfg.timeout)
         resp.raise_for_status()
 
-        # Plan A: detect SSE response even when stream:false was requested
+        # Plan A: detect SSE response even when stream:false was requested.
+        # Some API backends (especially Ollama's /v1 endpoint) ignore the
+        # stream flag and return text/event-stream regardless.  Detecting it
+        # here avoids a JSON decode error — the SSE body is parsed as a
+        # completed stream instead.
         if _is_sse_response(resp):
             log.debug("API returned SSE despite stream:false — parsing as SSE (Plan A fallback)")
             response_text = _accumulate_openai_sse(resp)

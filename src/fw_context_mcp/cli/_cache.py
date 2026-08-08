@@ -1,4 +1,15 @@
-"""``fw-context cache`` — LLM analysis cache management (local + remote)."""
+"""``fw-context cache`` — LLM analysis cache management (local + remote).
+
+Two-tier caching architecture: local global cache (Tier 1) on disk for fast
+lookup, remote cache server (Tier 2) for team-wide sharing.  Each tier
+stores pre-computed LLM symbol analysis keyed by content hash, so identical
+symbol bodies produce identical analysis across all projects and machines.
+
+WHY two tiers: local cache avoids network latency for repeated analysis
+runs; remote cache enables team members to benefit from each other's
+analyzed symbols without re-running expensive LLM calls.  The content hash
+makes cache entries deterministic — same source = same analysis.
+"""
 
 from __future__ import annotations
 
@@ -12,7 +23,12 @@ import httpx
 
 
 def cmd_cache_stats(args: argparse.Namespace) -> int:
-    """Show cache statistics for one or both tiers."""
+    """Print cache statistics: entry counts, models, per-project coverage.
+
+    Reports Tier 1 (local) always, Tier 2 (remote) only when ``--remote``
+    is given.  For the remote tier, also shows how many of THIS project's
+    analysis entries are already cached on the server.
+    """
     from ..cache_client import CacheClient, local_cache_stats
     from ..config import derive_project_id
     from ..config import load as load_config
@@ -84,10 +100,18 @@ def cmd_cache_stats(args: argparse.Namespace) -> int:
 
 
 def cmd_cache_push(args: argparse.Namespace) -> int:
-    """Push all local cache entries to the remote cache server.
+    """Push all local Tier 1 entries to the remote Tier 2 cache server.
 
-    Uses ``--force`` by default (X-Cache-Overwrite) so newer local entries
-    replace older remote ones.  Progress is reported in batches.
+    Uses ``--force`` by default (X-Cache-Overwrite header) so newer local
+    entries replace older remote ones — this is safe because content hashes
+    guarantee identical analysis for identical source.
+
+    WHY batch push: pushing entries one-by-one would incur HTTP overhead
+    per entry; batching by ``batch_size`` (from config or ``--batch``)
+    amortizes the connection cost across multiple entries.
+
+    WHY progress reporting per batch: users need feedback during large
+    pushes (thousands of entries) to know the operation is still alive.
     """
     from ..cache_client import CacheClient, get_local_cache_db
     from ..config import load as load_config
@@ -138,8 +162,19 @@ def cmd_cache_push(args: argparse.Namespace) -> int:
 def cmd_cache_remote_init(args: argparse.Namespace) -> int:
     """Interactive wizard: configure remote cache server connection.
 
-    Prompts for URL and token, verifies the connection, and writes
-    [cache_server] to the global config (~/.fw-context/config.toml).
+    Prompts for URL and token, verifies the connection, and writes the
+    [cache_server] section to the global config (~/.fw-context/config.toml).
+
+    WHY interactive wizard: the remote cache server URL and token are
+    deployment-specific — they differ per organization and per user role.
+    An interactive prompt is the least error-prone way to collect them,
+    especially the token which should never appear in shell history.
+
+    WHY token in separate file (not config.toml): config.toml is shared
+    via version control; the token is a secret.  The token is stored in
+    ``~/.fw-context/.cache_token`` with ``0o600`` permissions, created via
+    atomic write (temp file + rename) to prevent window-of-vulnerability
+    where the file exists with world-readable permissions.
     """
     from ..config.settings import _ensure_global_config
 
@@ -256,7 +291,16 @@ def cmd_cache_remote_init(args: argparse.Namespace) -> int:
 
 
 def cmd_cache_clear(args: argparse.Namespace) -> int:
-    """Delete cache entries for one or both tiers."""
+    """Delete cache entries for one or both tiers (``--all``, ``--remote``).
+
+    Requires interactive confirmation unless ``--yes`` is passed, because
+    clearing the cache means re-running LLM analysis on the next index,
+    which is expensive (CPU/GPU time, possibly cloud API cost).
+
+    WHY per-project remote clear: clearing ALL remote entries would affect
+    other team members; the remote clear only removes THIS project's entries
+    (resolved via content hashes from the local index DB).
+    """
     from ..cache_client import CacheClient, local_cache_clear
     from ..config import derive_project_id
     from ..config import load as load_config

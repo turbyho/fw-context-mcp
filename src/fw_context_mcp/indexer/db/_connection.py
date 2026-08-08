@@ -1,4 +1,73 @@
-"""SQLite connection management for fw-context-mcp index."""
+"""SQLite connection management for fw-context-mcp index.
+
+Connection lifecycle
+────────────────────
+Every connection goes through ``open_db`` → ``_configure_connection`` →
+``ensure_schema`` → integrity check.  The pipeline is linear by design:
+
+  1. **open_db** — creates parent directory, opens the file, sets
+     ``row_factory`` and initial ``busy_timeout``, puts the DB in WAL
+     mode, then delegates to ``_configure_connection``.
+  2. **``_configure_connection``** — applies the full PRAGMA set
+     (cache_size, mmap_size, synchronous, foreign_keys) and loads the
+     ``sqlite-vec`` extension.  Called separately from ``open_db`` so
+     auxiliary connections (worker threads) can re-use the same
+     configuration without repeating the directory-creation and chmod
+     steps.
+  3. **ensure_schema** — idempotent schema migration and self-healing.
+     The version-gate skips the expensive migration block when the
+     on-disk schema is current.
+  4. **Integrity check** — ``PRAGMA integrity_check``, skipped on
+     auxiliary connections or when pre-marked as already verified.
+
+WAL mode
+────────
+Write-Ahead Logging is enabled with ``PRAGMA journal_mode=WAL``.
+Key properties for fw-context-mcp:
+
+  • **Concurrent reads + writes** — the MCP server holds a read
+    connection open for client queries while the background indexer
+    writes through a separate connection.  WAL mode allows this
+    without SQLITE_BUSY on reads.
+  • **Persistent** — WAL mode is a persistent DB-file property.  Once
+    set, all subsequent connections (including from other processes)
+    use WAL automatically.  The initial PRAGMA is still required on
+    first-open; it is wrapped in a try/except to convert to
+    DatabaseCorruptionError when the DB is unreadable.
+  • **WAL size management** — ``cache_size = -64000`` (64 MB) and
+    ``mmap_size = 268435456`` (256 MB) reduce the frequency of WAL
+    page evictions.  The ``transaction`` context manager runs
+    ``PRAGMA wal_checkpoint(TRUNCATE)`` after each successful commit
+    to keep the WAL file small.
+
+Locking strategy
+────────────────
+The database layer uses three separate mechanisms:
+
+  • **busy_timeout** — 10 s by default (CLI indexer: fail fast on
+    collision).  The MCP server's executor overrides this on its
+    dedicated connection with 120 s.  This is NOT a lock — it is a
+    wait-before-failing timeout when another connection holds a
+    write lock.
+  • **``write_lock`` (``_locking.py``)** — a file-system lock
+    (``DB_LOCK`` file in the database directory).  Acquired before
+    any write batch (indexer per-TU commit, purge operations).  This
+    coordinates multiple processes (indexer + MCP server) writing to
+    the same database.
+  • **``transaction`` context manager** — standard SQLite BEGIN/COMMIT/
+    ROLLBACK.  Always used together with ``write_lock`` for writes;
+    NOT used for read-only queries (readers hold no transaction that
+    could block writers in WAL mode).
+
+Schema versioning
+─────────────────
+The schema version is stored in ``PRAGMA user_version`` and compared
+against ``CURRENT_SCHEMA_VERSION``.  When the on-disk version is older,
+``ensure_schema`` runs the full migration pipeline.  When the on-disk
+version is NEWER (tool downgrade scenario), it is re-stamped to current
+with a warning — the expectation is that the developer downgraded and
+the database should match the current code's expectations.
+"""
 
 import logging
 import sqlite3
@@ -66,7 +135,32 @@ class DatabaseCorruptionError(sqlite3.DatabaseError):
 
 
 def _configure_connection(conn: sqlite3.Connection) -> None:
-    """Apply standard PRAGMAs and extensions to a freshly opened connection."""
+    """Apply standard PRAGMAs and extensions to a freshly opened connection.
+
+    PRAGMA rationale
+    ────────────────
+    • ``busy_timeout = 10000`` (10 s) — CLI indexer must fail fast when
+      colliding with a running MCP server.  The server's executor sets
+      its own 120 s busy_timeout on its dedicated connection.
+    • ``foreign_keys = ON`` — enforced at connection level because SQLite
+      defaults to OFF.  All DELETE CASCADE and FK constraints in the
+      schema are silent no-ops without this.
+    • ``journal_mode = WAL`` — enables concurrent readers while a
+      writer holds the write lock.  Without WAL, any read query during
+      an index run would get SQLITE_BUSY.
+    • ``cache_size = -64000`` — 64 MB page cache (negative = kibibytes).
+      Large enough to hold the index's hot working set (symbols FTS5,
+      symbols, references tables) in memory.  Reduces disk I/O during
+      search queries and BFS traversals.
+    • ``mmap_size = 268435456`` — 256 MB memory-mapped I/O.  On Linux
+      this lets the kernel page-cache the database file directly,
+      eliminating read() syscalls for cached pages.  The index can
+      grow to 5+ GB; mmap handles large databases efficiently.
+    • ``synchronous = 1`` (NORMAL) — balances durability with write
+      throughput.  FULL (2) would add fsync after every write, halving
+      indexing speed.  OFF (0) risks corruption on power loss.  NORMAL
+      is safe because the WAL journal protects committed data.
+    """
     # 10 s busy_timeout is deliberate: the CLI indexer must fail fast when
     # it collides with a running MCP server.  The server's executor sets
     # its own 120 s busy_timeout on its dedicated connection — do NOT
@@ -254,6 +348,15 @@ def open_db(path: Path, *, skip_integrity_check: bool = False, check_same_thread
         # SQLITE_BUSY (5) = database is locked (another process has a
         # write lock).  SQLITE_LOCKED (6) = a table within the database
         # is locked (another process is modifying it right now).
+        #
+        # Retry up to 3 times with a 1 s sleep between attempts.  This
+        # handles transient lock contention when the MCP server's executor
+        # is holding a write lock for a reindex_file call or when the
+        # background indexer is mid-commit.
+        #
+        # After 3 failures, raise DatabaseCorruptionError with
+        # locked=True — the caller can distinguish "the DB is corrupt"
+        # from "the DB is busy" and suggest a different recovery action.
         if getattr(e, "sqlite_errorcode", 0) in (5, 6):
             if _retries >= 3:
                 conn.close()
@@ -338,6 +441,18 @@ def transaction(conn: sqlite3.Connection, checkpoint: bool = True) -> Generator[
 
     The checkpoint is best-effort: if it fails (e.g. another connection holds
     a read transaction), the commit is NOT rolled back — data is already safe.
+
+    Checkpoint frequency trade-off
+    ──────────────────────────────
+    Running wal_checkpoint(TRUNCATE) after every commit keeps the WAL file
+    near zero bytes — good for disk usage but expensive under high write
+    throughput (the indexer commits ~200-500 transactions during a full
+    build re-index).  Each checkpoint is an fsync of the entire page cache.
+
+    Running a single checkpoint at the end of the loop (``checkpoint=False``
+    on each commit, then one manual checkpoint after the loop) reduces I/O
+    by 200-500× during indexing.  The WAL file grows temporarily (up to
+    ~100 MB on large projects) but is truncated at the end.
     """
     try:
         yield conn

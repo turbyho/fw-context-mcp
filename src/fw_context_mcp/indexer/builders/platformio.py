@@ -21,7 +21,19 @@ _PIO_MARKERS = ["platformio.ini"]
 
 
 class PlatformIOBuildSystem:
-    """PlatformIO build system (``pio run --target compiledb``)."""
+    """PlatformIO build system (``pio run --target compiledb``).
+
+    WHY two build steps (compiledb + full build): SCons (PlatformIO's
+    build engine) tracks targets independently.  The ``compiledb`` target
+    generates compile_commands.json by inspecting SCons internals but may
+    not invoke GCC.  A subsequent ``pio run`` ensures actual compilation
+    happens, producing .d dependency files needed for header-change
+    detection.
+
+    WHY clean is best-effort: the build directory may not exist on a fresh
+    checkout, so ``pio run --target clean`` may fail.  We catch the error
+    and continue — if the build dir exists, it's cleaned; if not, we skip.
+    """
 
     name: str = "PlatformIO"
     config_key: str = "platformio"

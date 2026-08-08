@@ -2,6 +2,23 @@
 
 String-literal and comment-aware brace counting.  Does NOT handle
 C++11 raw string literals ``R"(...)"`` — rare in embedded C/C++ code.
+
+WHY this exists instead of using libclang: when extracting a function
+body for search snippet display, the full AST is not available — only
+source text.  libclang exact extents require a TU parse, which is too
+slow for per-result snippet generation.  A lightweight state-machine
+brace counter runs in microseconds on source lines that are already
+in memory.
+
+WHY it is String and comment-aware: C/C++ source contains braces in
+string literals (``"}"``), character constants (``'}'``), and comments
+(``/* { */``).  Without skipping these, the depth counter would
+prematurely close the function body.
+
+WHY no raw-string support: C++11 ``R"(...)"`` raw string literals are
+virtually non-existent in embedded MCU firmware codebases (C99/C11
+without C++17 features).  Adding support would complicate the state
+machine for zero practical benefit.
 """
 
 from __future__ import annotations
@@ -10,6 +27,15 @@ import enum
 
 
 class _BraceState(enum.IntEnum):
+    """States of the brace-counting state machine.
+
+    Each state skips a different class of "fake" braces:
+    - STRING: ``"{"`` and ``"}"`` inside double-quoted literals
+    - CHAR: ``'{'`` and ``'}'`` inside single-quoted character constants
+    - LINE_COMMENT: everything after ``//`` to end of line
+    - BLOCK_COMMENT: everything between ``/*`` and ``*/``
+    - NORMAL: actual code — braces count toward depth
+    """
     NORMAL = 0
     STRING = 1
     CHAR = 2
@@ -67,16 +93,20 @@ def find_closing_brace(
                 elif ch == '}':
                     depth -= 1
             elif state == _BraceState.STRING:
+                # In a string literal: backslash escapes the next char
+                # (\" is not string end), otherwise " closes the string.
                 if ch == '\\' and j + 1 < len(line):
                     j += 1  # skip escaped character
                 elif ch == '"':
                     state = _BraceState.NORMAL
             elif state == _BraceState.CHAR:
+                # Same escape logic for character constants.
                 if ch == '\\' and j + 1 < len(line):
                     j += 1  # skip escaped character
                 elif ch == "'":
                     state = _BraceState.NORMAL
             elif state == _BraceState.BLOCK_COMMENT:
+                # Block comments span lines — state persists across line endings.
                 if ch == '*' and j + 1 < len(line) and line[j + 1] == '/':
                     state = _BraceState.NORMAL
                     j += 1

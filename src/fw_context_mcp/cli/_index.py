@@ -1,4 +1,25 @@
-"""``fw-context index`` — build or rebuild the symbol index."""
+"""``fw-context index`` — build or rebuild the libclang symbol index.
+
+This command parses ``compile_commands.json`` with libclang and stores
+function/class/enum metadata, cross-references, embeddings, and optional
+LLM analysis in an SQLite database.
+
+Indexing phases run in order:
+1. **Build** (if ``--build`` or missing cc.json) — generate
+   compile_commands.json from the detected build system.
+2. **Validate** — check cc.json completeness, detect stale entries,
+   fix path separators and other common issues.
+3. **Parse** — libclang extraction of symbols from every translation unit.
+4. **Refs** — cross-reference indexing: callers, callees, indirect edges.
+5. **Embeddings** — generate vector embeddings for semantic search.
+6. **Analyze** (optional) — LLM-generated summaries for each symbol.
+
+WHY: The index is the core data structure of fw-context.  Without a
+complete and accurate index, every search, call-graph query, and
+semantic search returns wrong or empty results.  This command must
+handle incremental updates, stale detection, background conflict
+resolution, and graceful degradation when optional phases fail.
+"""
 
 from __future__ import annotations
 
@@ -27,6 +48,17 @@ def _resolve_compile_commands(
 
     Returns (path, is_explicit) or (None, False) on fatal error.
     Caller checks for None → return 1.
+
+    Three resolution strategies, tried in order:
+    1. ``--build`` — force a fresh build, ignoring any existing file.
+    2. Explicit path (positional arg) — use the provided file.
+    3. Default — reuse existing cc.json from config; build if missing.
+
+    WHY: Users should not need to know where their build system stores
+    compile_commands.json.  The default path is discovered from the
+    detected build system and stored in config.  The explicit path
+    option exists for edge cases (CI pipelines, unsupported build
+    systems) where the user manages cc.json themselves.
     """
     explicit_cc = bool(args.compile_commands)
 
@@ -96,6 +128,16 @@ def _validate_and_fix_artifacts(
     Returns (compile_commands, build_dir_patterns, ok).
     compile_commands may be updated if a rebuild was triggered.
     Caller returns 1 when ok is False.
+
+    Checks performed:
+    * Staleness — cc.json older than project sources.
+    * Completeness — all source files present in cc.json entries.
+    * Path correctness — Windows backslashes, mixed separators.
+
+    WHY: A stale compile_commands.json produces an index that silently
+    misses new or renamed files.  Auto-detection and auto-rebuild
+    prevent the user from debugging "symbol not found" errors caused
+    by an outdated cc.json rather than actual code issues.
     """
     if not detected_system:
         return compile_commands, None, True
@@ -165,6 +207,12 @@ def _pid_is_fw_context_reindexer(pid: int) -> bool:
 
     Checks /proc/<pid>/comm and /proc/<pid>/cmdline to avoid signalling
     an unrelated process that reused the PID (PID reuse safety).
+
+    WHY: Linux recycles PIDs.  When a background reindex finishes and
+    its PID file is stale, the PID may have been reassigned to a
+    completely unrelated process (web server, database).  Killing that
+    process would cause a service outage.  This check verifies the
+    process identity before sending any signal.
     """
     try:
         comm_path = Path(f"/proc/{pid}/comm")
@@ -182,7 +230,21 @@ def _pid_is_fw_context_reindexer(pid: int) -> bool:
         return False
 
 def _manage_bg_reindex(db_path: Path) -> None:
-    """Kill any running background reindex and write pause/pid files."""
+    """Kill any running background reindex and write pause/pid files.
+
+    A foreground ``fw-context index`` must not race with a background
+    reindex writing to the same database.  This function:
+    1. Reads the PID file to find the background process.
+    2. Sends SIGTERM, waits up to 5 seconds, falls back to SIGKILL.
+    3. Writes a pause file to prevent the file-watcher daemon from
+       starting a new background reindex while the foreground one runs.
+    4. Writes a PID file so other processes know this index is active.
+
+    WHY: Two concurrent writers on an SQLite database cause corruption
+    (SQLITE_BUSY retries are not a substitute for mutual exclusion on
+    long-running writes).  The pause file is the coordination mechanism
+    between the CLI and the daemon.
+    """
     pause_file = db_path.parent / "reindex.pause"
     reindex_pid_file = db_path.parent / "reindex.pid"
     db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -246,6 +308,11 @@ def cmd_index(args: argparse.Namespace) -> int:
     triggered automatically (auto-detecting Mbed OS / Zephyr / PlatformIO).
 
     Pass ``--build`` to force a fresh build and full re-index.
+
+    WHY: Most invocations are incremental (user edits a file and runs
+    ``fw-context index``).  Forcing a build on every run would be
+    wasteful — Mbed/zephyr builds can take minutes.  The auto-detect
+    logic only triggers a build when necessary.
     """
     from ..config import derive_project_id
     from ..config import load as load_config

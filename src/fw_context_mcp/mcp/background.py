@@ -1,4 +1,35 @@
-"""Background services — daemon lifecycle, auto-reindex, pause coordination."""
+"""Background services — daemon lifecycle, auto-reindex, pause coordination.
+
+The background module solves a coordination problem: multiple MCP server
+processes (one per AI assistant instance) share a single per-project index.
+They must agree on who spawns the watcher daemon, who detects staleness,
+and how to pause the background reindex during write operations.
+
+Key design decisions:
+
+- **Daemon spawning uses ``fcntl.flock`` (not PID files) for mutual exclusion**:
+  PID files have an inherent TOCTOU race — the PID may be reused between
+  ``read_pid()`` and ``os.kill()``.  ``flock`` is an atomic kernel lock that
+  survives process death (the kernel releases it automatically).  The spawning
+  protocol in ``_ensure_daemon_running`` holds the lock, spawns the daemon,
+  then releases — the daemon blocks on its own ``flock`` acquisition and
+  picks up the lock as soon as the spawner releases.  No race window.
+
+- **Staleness check is split into two tiers**: ``_fast_staleness_check``
+  (called via ``get_active_build``) does only structural checks — schema
+  version, compile_commands.json mtime, missing refs.  The daemon's
+  ``_staleness_check`` adds file-level mtime comparison because the daemon
+  needs to detect files that changed BEFORE it started (watchfiles only
+  detects NEW changes).
+
+- **Pause/resume protocol**: before an MCP tool writes to the index
+  (reindex_file_impl), it calls ``_request_bg_reindex_pause`` to prevent
+  the daemon's background reindex from holding the write lock.  The pause
+  marker is a PID file — if the requesting process dies, the daemon detects
+  the stale marker and resumes automatically.  This is safe because the
+  background reindex checks the marker BETWEEN translation units, not
+  mid-operation.
+"""
 
 from __future__ import annotations
 
@@ -136,10 +167,17 @@ def _ensure_daemon_running(root: Path) -> None:
         os.close(lock_fd)
         return
 
-    # Spawn the daemon BEFORE releasing the lock.  The daemon blocks on
-    # its own watcher.lock acquisition (LOCK_EX without LOCK_NB) until we
-    # release the lock, then acquires it immediately — no race window
-    # where another MCP server could also try to spawn a daemon.
+    # ── Spawn-before-release protocol ──
+    # The daemon's main() blocks on LOCK_EX acquisition of watcher.lock.
+    # We spawn the daemon WHILE holding our lock.  The daemon starts,
+    # reaches its fcntl.flock(LOCK_EX) call, and blocks (because WE
+    # hold the lock).  Then we release — the daemon immediately acquires
+    # the lock and enters its main loop.
+    #
+    # Without this protocol, a second MCP server arriving between our
+    # release and the daemon's acquisition would see the lock free,
+    # conclude "daemon dead," and spawn a SECOND daemon — leading to
+    # two daemons racing to run background reindexes.
     log.info("Spawning watcher daemon for %s", root)
     _spawn_daemon(root)
 

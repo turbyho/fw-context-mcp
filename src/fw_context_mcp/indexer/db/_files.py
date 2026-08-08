@@ -1,4 +1,61 @@
-"""File-record storage layer for fw-context-mcp index."""
+"""File-record storage layer for fw-context-mcp index.
+
+File tracking
+─────────────
+Every translation unit and header seen by libclang has a row in the
+``files`` table, keyed on ``(config_hash, path)``.  The table stores:
+
+  • ``language`` — ``"c"`` or ``"cpp"``, set during compilation-database
+    parsing.  Determines which parser flags libclang uses on re-parse.
+  • ``mtime`` — last-modified time; used for fast staleness checks.
+  • ``content_hash`` — SHA-256 hash of source + compiler flags +
+    manifest entry.  Enables content-addressable staleness: even when
+    mtime differs, a matching hash means the TU can be skipped.
+  • ``source_hash`` — SHA-256 of the raw source file (without flags).
+    Used to detect purely cosmetic changes (whitespace, comment edits)
+    that do not affect symbols.
+  • ``flags_hash`` — SHA-256 of normalized compiler flags.  Detects
+    when a TU's include-path or define set changes without touching
+    the source file itself.
+
+Content storage
+───────────────
+The ``content`` column holds ifdef-filtered file text — only code that
+actually compiles for the active build config.  Inactive ``#ifdef``
+branches are replaced with blank lines to preserve line numbers.  This
+is the source of truth for ``search_content`` and the ``files_fts``
+FTS5 index.  Content is loaded lazily during indexing and is not
+updated on every re-parse of a symbol-only change.
+
+is_project marking
+──────────────────
+Each file row carries an ``is_project`` flag (0 or 1).  Project files
+are those under user-defined project paths (``src/``, ``lib/``,
+``app/``, ``include/`` by default) or custom paths from
+``config.toml``.  Vendor/SDK paths (e.g. ``mbed-os/``, ``zephyr/``,
+``.pio/``) are marked ``is_project=0``.  This flag propagates to the
+``symbols.is_project`` column during symbol insertion and enables the
+``project_only`` filter in all search, callgraph, and maintenance tools.
+
+Deletion order on file purge
+─────────────────────────────
+When a source file is removed from the project, all index records
+must be cleaned across 8+ tables.  The order is not arbitrary:
+
+  1. **Inheritance/overrides** — deleted first because they reference
+     USRs that will be removed.
+  2. **Dangling incoming refs** — edges from surviving files that
+     pointed at USRs in the purged file.  Cleaned before those USRs
+     disappear, using the collected USR list.
+  3. **Vector embeddings** — vec_symbols rows referencing symbol IDs.
+  4. **Macros** — macros for the file (FTS triggers clean the index).
+  5. **Symbols** — the core symbol rows (FTS triggers clean the index).
+  6. **References, indirect call sites, fp_assignments** — use
+     file_path, not USR, so they are cleaned last (the USRs they
+     referenced are already gone).
+  7. **File record** — the ``files`` row itself, deleted last so all
+     ``file_id`` foreign-key references are already cleared.
+"""
 
 from __future__ import annotations
 
@@ -85,6 +142,10 @@ def upsert_file(
     # Use SELECT instead of last_insert_rowid() — the latter returns
     # the rowid of the last INSERT, which is wrong when ON CONFLICT
     # triggered an UPDATE (rowid stays unchanged or is zero).
+    #
+    # The SELECT fallback is always correct: it asks for the id of the
+    # row that now exists at (config_hash, path), regardless of whether
+    # it was created by INSERT or matched by ON CONFLICT.
     return conn.execute(
         "SELECT id FROM files WHERE config_hash=? AND path=?",
         (config_hash, path),
@@ -199,6 +260,18 @@ def get_file_map(
         (config_hash, file_path),
     ).fetchall()
 
+    # Two-phase path matching — the symbols table stores the relative
+    # path as libclang sees it (e.g. "src/modem_msg.cpp"), but callers
+    # may pass just the filename ("modem_msg.cpp") or a partial path.
+    #
+    # Phase 1: exact file_path match.  Uses the index on (config_hash,
+    # file_path), fast for the common case.
+    #
+    # Phase 2: LIKE-based fallback with escaped wildcards.  The
+    # _escape_like call prevents "_" and "%" in the filename itself
+    # from matching as wildcards (important for filenames like
+    # "hw_config_v2.cpp" where "v2" must be literal).  The prefix "%"
+    # allows "modem_msg.cpp" to match "src/net/modem_msg.cpp".
     if not rows:
         rows = conn.execute(
             """SELECT name, qualified_name, kind, line, col, end_line,
@@ -214,9 +287,21 @@ def get_file_map(
         kind = r["kind"]
         if kind not in groups:
             groups[kind] = {"count": 0, "items": []}
+        # Count is ALWAYS incremented — it reflects the real total.
+        # Items are conditionally appended — bounded by max_per_kind.
+        # This separation lets the caller see "methods: 45 (showing 30)"
+        # instead of silently truncating to 30 with no indication.
         groups[kind]["count"] += 1
 
         if kind == "enum_constant":
+            # Enum constants are grouped by parent enum to avoid a flat
+            # list of hundreds of unrelated constants.  Each parent enum
+            # forms a subgroup with its own name, count, and constants.
+            #
+            # Parent extraction uses the qualified name: everything before
+            # the last "::" is the parent enum.  An unqualified constant
+            # (C-style enum — no "::") gets "(anonymous)" as the parent
+            # label, keeping the grouping uniform.
             # Group by parent enum: extract everything before last "::"
             qn = r["qualified_name"] or ""
             if "::" in qn:
@@ -325,6 +410,10 @@ def purge_file_records(
     )
     tx = transaction(conn) if not transaction_held else nullcontext()
     with lock, tx:
+        # Collect USRs before deleting symbols — the USR is the
+        # cross-table key for refs, inheritance, overrides, and
+        # indirect-call edges.  We need the USR list for
+        # _delete_dangling_incoming_refs below.
         purged_usrs = [
             r[0]
             for r in conn.execute(
@@ -334,6 +423,11 @@ def purge_file_records(
         ]
         delete_inheritance_for_file(conn, config_hash, file_id)
         delete_overrides_for_file(conn, config_hash, file_id)
+        # Clean dangling edges BEFORE deleting the USRs.  After symbols
+        # are deleted, we cannot resolve USR → file, so incoming refs
+        # from surviving files would point at non-existent USRs.  Doing
+        # this FIRST (while USRs still exist in the symbols table) lets
+        # _delete_dangling_incoming_refs use the USR list cleanly.
         if purged_usrs:
             _delete_dangling_incoming_refs(conn, config_hash, purged_usrs)
         try:

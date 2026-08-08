@@ -1,4 +1,15 @@
-"""``fw-context db`` — index database management (list, stats, delete, cleanup)."""
+"""``fw-context db`` — index database management (list, stats, delete, cleanup).
+
+Provides commands to inspect and manage the SQLite index database without
+needing to run raw SQL queries.  Operations: listing all builds with stats,
+detailed per-build statistics, safe deletion of builds, and cleanup of
+orphaned artifacts.
+
+WHY a separate ``db`` command group: the index database accumulates
+multiple builds over time (different branches, different configs).  Users
+need visibility into what exists and a safe way to free disk space by
+deleting obsolete builds without corrupting the database.
+"""
 
 from __future__ import annotations
 
@@ -7,11 +18,13 @@ import os
 
 
 def _resolve_config_hash(conn, prefix: str) -> str | None:
-    """Resolve a hash prefix to a full ``config_hash``.
+    """Resolve a short hash prefix to a full 64-char ``config_hash``.
 
-    Returns the full hash on exact match or when *prefix* uniquely
-    matches one row via LIKE.  Returns ``None`` on ambiguous prefix
-    (multiple matches) or when no match exists.
+    Returns the full hash on exact match, or when *prefix* uniquely matches
+    one row via LIKE.  Returns ``None`` on ambiguous prefix or no match.
+
+    WHY prefix resolution: full 64-char hashes are unreadable for humans;
+    prefix matching lets users type just the first 8-12 characters.
     """
     # Exact match first (full 64-char hash)
     row = conn.execute(
@@ -41,7 +54,15 @@ def cmd_db(args: argparse.Namespace) -> int:
 
 
 def cmd_db_list(args: argparse.Namespace) -> int:
-    """List all builds for a project with per-build statistics."""
+    """List all builds for a project with per-build statistics.
+
+    Each build is shown with hash, description (git branch+tag), timestamps,
+    and symbol/file/reference counts.  The active build is marked with ``*``.
+
+    WHY multi-line block format: build descriptions can be long (branch +
+    commit message), so a simple table would truncate them.  Block format
+    gives each build its own visual section with full description.
+    """
     from ..config import derive_project_id
     from ..config import load as load_config
     from ..indexer.db import get_active_config, get_all_builds_for_project, open_db
@@ -174,7 +195,17 @@ def cmd_db_stats(args: argparse.Namespace) -> int:
 
 
 def cmd_db_delete(args: argparse.Namespace) -> int:
-    """Delete a specific build or all builds (``--all``)."""
+    """Delete a specific build (by config_hash) or all builds (``--all``).
+
+    Single-build delete refuses to delete the active build without ``--force``
+    and refuses to delete the only build entirely — both guards prevent
+    accidental data loss.
+
+    WHY pause file during --all delete: the background reindex daemon may
+    try to write to the database while we delete it.  Writing a
+    ``reindex.pause`` file signals the daemon to pause, preventing race
+    conditions between delete and auto-reindex.
+    """
     from ..config import derive_project_id
     from ..config import load as load_config
     from ..indexer.db import (

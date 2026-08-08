@@ -1,4 +1,15 @@
-"""MCP server registration helpers for ``fw-context init``."""
+"""MCP server registration helpers for ``fw-context init``.
+
+Registers fw-context-mcp as an MCP server in AI coding tools (Claude Code,
+OpenCode, Codex, Cursor, etc.) during ``fw-context init``.  Each tool
+stores MCP configuration differently — CLI commands, JSON files, TOML files,
+or markdown with YAML frontmatter.  This module provides a unified interface
+that dispatches to the right registration method per tool.
+
+WHY registration during init: users should not need to manually edit MCP
+config files — the tool should integrate itself into the user's existing
+AI coding setup automatically.
+"""
 
 from __future__ import annotations
 
@@ -12,7 +23,18 @@ from pathlib import Path
 
 
 def _resolve_mcp_bin() -> str | None:
-    """Find the fw-context-mcp binary, preferring canonical install over dev venv."""
+    """Find the fw-context-mcp binary, preferring canonical install over dev venv.
+
+    Search order (priority):
+    1. ``~/.local/bin/fw-context-mcp`` — canonical user install (pipx / pip --user)
+    2. ``~/.fw-context/.venv/bin/fw-context-mcp`` — managed venv
+    3. ``shutil.which("fw-context-mcp")`` — system PATH
+    4. ``sys.executable / fw-context-mcp`` — dev venv (editable install)
+
+    WHY canonical install first: the managed venv and system PATH may point
+    to different versions or stale installations.  The canonical path is
+    the most likely to match the currently installed package.
+    """
     for candidate in [
         Path.home() / ".local" / "bin" / "fw-context-mcp",
         Path.home() / ".fw-context" / ".venv" / "bin" / "fw-context-mcp",
@@ -102,7 +124,14 @@ def _register_mcp_file(tool, mcp_bin: str, dry_run: bool = False) -> None:
     try:
         if config_path.exists():
             raw = config_path.read_text(encoding="utf-8")
-            # Strip JSONC comments (// and /* */) before parsing
+            # Strip JSONC comments (// and /* */) before parsing.
+            # OpenCode config files support comments for human readability
+            # but they are not valid JSON.  We strip them before json.loads()
+            # to avoid parse errors, then write back as plain JSON.
+            # Regex patterns:
+            #   /\*.*?\*/ — block comments (non-greedy, dotall for multiline)
+            #   (?<!:)//.*$ — line comments (// not preceded by colon, to
+            #     preserve URLs like "http://")
             raw = re.sub(r"/\*.*?\*/", "", raw, flags=re.DOTALL)
             raw = re.sub(r'(?<!:)//.*$', '', raw, flags=re.MULTILINE)
             data = json.loads(raw)

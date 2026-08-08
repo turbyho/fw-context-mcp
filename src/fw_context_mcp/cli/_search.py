@@ -1,4 +1,13 @@
-"""``fw-context search``, ``list``, ``status`` — index query commands."""
+"""``fw-context search``, ``list``, ``status`` — index query commands.
+
+Exposes the same search capabilities as the MCP server (symbol lookup,
+full-text search, semantic search) but from the command line.  Useful for
+debugging, scripting, and when the MCP server is not running.
+
+WHY a CLI search: the MCP server requires an AI tool client; the CLI
+search works standalone.  Users can verify index quality, debug search
+results, and integrate with shell scripts without the overhead of MCP.
+"""
 
 from __future__ import annotations
 

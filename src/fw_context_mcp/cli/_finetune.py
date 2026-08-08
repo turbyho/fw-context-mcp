@@ -1,4 +1,18 @@
-"""``fw-context finetune`` — self-supervised fine-tuning of the embedding model."""
+"""``fw-context finetune`` — self-supervised fine-tuning of the embedding model.
+
+Mines disagreement triples between dense (vec0 KNN) and lexical (FTS5)
+retrieval, then fine-tunes the base embedding model with
+MultipleNegativesRankingLoss.  The resulting model captures project-specific
+naming conventions and domain vocabulary better than the generic base model.
+
+WHY self-supervised: manual labeling of "relevant" vs "irrelevant" search
+results is prohibitively expensive.  Disagreement mining automatically
+identifies cases where text search finds something the embedding model
+missed (or vice versa), generating training data from the index itself.
+
+The fine-tuned model is saved to ``~/.fw-context/models/<project_id>/``
+and can be activated by setting ``embed_model = "ft://<path>"`` in config.
+"""
 
 from __future__ import annotations
 
@@ -11,8 +25,14 @@ def cmd_finetune(args: argparse.Namespace) -> int:
 
     Mines disagreement triples between dense (vec0 KNN) and lexical (FTS5)
     retrieval, then fine-tunes the base model with
-    MultipleNegativesRankingLoss.  The fine-tuned model is saved to
-    ~/.fw-context/models/<project_id>/.
+    MultipleNegativesRankingLoss.
+
+    WHY disagreement mining: dense retrieval uses semantic similarity and
+    may rank generic names above project-specific ones; lexical FTS5 matches
+    exact tokens but misses synonyms.  When they disagree on ranking, the
+    disagreement signals where the embedding model needs project-specific
+    tuning.  Each triple is (anchor, positive from one method, negative from
+    the other) — the model learns to prefer positives over negatives.
     """
     from ..config import derive_project_id
     from ..config import load as load_config

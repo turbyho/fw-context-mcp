@@ -1,5 +1,10 @@
 """Compute a deterministic config_hash from compile_commands.json.
 
+WHY a deterministic hash: the same build configuration should always produce
+the same hash, regardless of timestamps, output paths, or dependency file
+names.  This allows comparing two compile_commands.json files to answer
+"has the build configuration changed?" without manual inspection.
+
 Same build configuration always produces the same hash, regardless of
 timestamps, output paths, or dependency file names.
 """
@@ -18,6 +23,15 @@ _TRANSIENT_DROP = frozenset({"-MD", "-MP", "-MMD", "-MG"})
 
 def _normalize_entry(entry: dict) -> dict:
     """Normalize a single compile_commands.json entry for stable hashing.
+
+    WHY strip transient flags: ``-MD``, ``-MP``, ``-o``, ``-MF`` vary per
+    build but do not affect compilation semantics.  Including them in the
+    hash would cause false config_hash changes (and unnecessary full reindexes)
+    every build.
+
+    WHY sort arguments: build tools may reorder flags between consecutive
+    builds (e.g. ``-I/path -DFOO`` vs ``-DFOO -I/path``).  Sorting ensures
+    the same set of flags always produces the same hash.
 
     Strips the compiler binary, expands response files (@rsp), removes
     transient flags (-MD, -o, -MF, -MT, -MQ and their arguments), drops
@@ -82,8 +96,16 @@ def compute_flags_hash(entry: dict) -> str:
 def compute_tu_content_hash(source_hash: str, flags_hash: str, manifest_entry_hash: str) -> str:
     """Return combined SHA-256 of the three per-TU component hashes.
 
-    This is the value stored in ``files.content_hash`` — when it matches
-    the stored hash, the TU can be skipped even if mtime has changed.
+    WHY three components: a translation unit's index validity depends on
+    three independent factors:
+    1. Source file content (source_hash)
+    2. Compiler flags (flags_hash)
+    3. Included headers (manifest_entry_hash, replacing old deps_hash)
+
+    Any one of these changing invalidates the TU's indexed symbols.
+    This hash is stored in ``files.content_hash`` — when it matches the
+    stored hash, the TU can be skipped even if mtime has changed (mtime
+    false-positives from git checkout, touch, etc.).
 
     *manifest_entry_hash* is the hash of the TU's manifest entry
     (source + headers), replacing the old ``deps_hash`` from ``.d`` files.

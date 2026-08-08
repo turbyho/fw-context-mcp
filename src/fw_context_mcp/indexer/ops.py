@@ -1,8 +1,40 @@
-"""Shared index operations used by runner.py and MCP server tools.
+"""Shared indexing operations — parse TU, store symbols, refs, macros, content.
 
-Extracts the duplicated "parse TU → store symbols" loop into a single
-function so the indexer, reindex_file, and auto-reindex all use the
-same code path.
+Three code paths share this module:
+  1. Bulk index (``runner.py``) — full Cold reindex of all TUs
+  2. Single-file reindex (``reindex_file`` / ``reindex_file_impl``) —
+     incremental update after a source edit
+  3. Auto-reindex (file watcher daemon) — background update on save
+
+Pipeline, per TU (``store_symbols_for_unit``):
+  1. Parse with libclang (or use caller-supplied *pre_parsed* to avoid
+     double parsing when the caller already parsed outside the write lock)
+  2. Delete old symbols, refs, inheritance, indirect call sites,
+     function-pointer assignments, and macro rows for this TU
+  3. Insert new symbol rows — compute ``is_project`` from vendor/project
+     LIKE patterns, extract function bodies from disk via cached reads
+  4. Detect symbols that moved between files without content changes —
+     preserve LLM analysis by updating file_id instead of re-inserting
+  5. Insert refs, indirect call sites, function-pointer assignments,
+     pending dispatch edges, and inheritance rows
+  6. Store macro definitions (per-TU replacement)
+  7. Fill ``files.content`` with ``#ifdef``-filtered text — tokenize the
+     TU to find which lines are active for the build configuration
+
+Post-processing (after all TUs):
+  * ``backfill_cross_tu_refs`` — resolve method calls whose callee lives
+    in a different TU (invisible to per-TU ``_qn_to_usr``)
+
+Design decisions:
+  - All database writes happen inside a caller-managed transaction —
+    this module never commits.  The caller can group multiple TUs into
+    a single transaction for speed, or commit per-TU for incremental work.
+  - Pre-parsed data (``pre_parsed`` kwarg) lets the caller run expensive
+    libclang parsing outside the write lock, then hand the results to
+    ``store_symbols_for_unit`` for fast DB insertion.
+  - The ``_body_cache`` avoids re-reading the same header file hundreds
+    of times during a single TU — OrderedDict with manual eviction caps
+    memory at ~200 files.
 """
 
 from __future__ import annotations
@@ -11,6 +43,7 @@ import logging
 import re
 import sqlite3
 import time
+from functools import cache
 
 try:
     from clang.cindex import TranslationUnitLoadError
@@ -44,11 +77,29 @@ log = logging.getLogger(__name__)
 
 # NOTE(turbyho, 2026-07-31): Each header is opened/read/closed individually — 500+ headers = 500+
 # open/read/close cycles per TU.  Consider batch I/O for read_file_lines.
+#
+# OrderedDict with manual eviction is used instead of functools.lru_cache
+# because the cached values are large list[str] objects and we need an
+# explicit, small cap — lru_cache defaults to 128 but drops old entries
+# even when they are still useful within one TU.  A per-TU OrderedDict
+# with `popitem(last=False)` acts like FIFO: oldest entries (from already-
+# processed headers) are evicted first, while recently-used entries
+# (headers shared across many symbols in the same file) stay resident.
 _body_cache: OrderedDict[str, list[str] | None] = OrderedDict()
 _BODY_CACHE_MAX_ENTRIES = 200
 
 
 def _cached_read_lines(abs_path: str) -> list[str] | None:
+    """Read all lines of *abs_path*, caching the result in an LRU-like cache.
+
+    Returns ``None`` when the file cannot be read (OSError, missing file).
+    The cache is per-TU — ``_clear_body_cache()`` is called at the start
+    of each TU so a later TU re-reads files that changed on disk.
+
+    Performance: a header included by 200 symbols in one TU would trigger
+    200 file reads without this cache.  With the cache, the first read
+    costs one I/O call; the next 199 are dictionary lookups.
+    """
     if abs_path not in _body_cache:
         if len(_body_cache) >= _BODY_CACHE_MAX_ENTRIES:
             _body_cache.popitem(last=False)
@@ -59,6 +110,12 @@ def _cached_read_lines(abs_path: str) -> list[str] | None:
 
 
 def _clear_body_cache() -> None:
+    """Drop all cached file contents at the start of a new TU.
+
+    Header files may have been modified between TU parses (unlikely during
+    a single bulk index, but possible during auto-reindex).  Clearing the
+    cache ensures the next TU reads fresh data from disk.
+    """
     _body_cache.clear()
 
 
@@ -106,7 +163,8 @@ def _normalize_file_path(file_path: str, project_root: Path) -> str:
 
 
 def _build_filtered_file_content(
-    conn, unit, config_hash: str, project_root: Path, *, build_dir_patterns: list[str] | None = None, existing_tu=None
+    conn, unit, config_hash: str, project_root: Path, *, build_dir_patterns: list[str] | None = None, existing_tu=None,
+    skip_files: frozenset[str] | None = None,
 ) -> tuple[int, list[dict]]:
     """Tokenize TU, extract active lines per file, store ifdef-filtered content.
 
@@ -220,19 +278,37 @@ def _build_filtered_file_content(
             active.setdefault(fname, set()).add(loc.line)
 
     # ── Collect active lines from all header files in a single AST traversal ──
+    # When *skip_files* is provided, subtrees of already-processed headers
+    # are skipped — content for those files was already stored during the
+    # first TU that included them.  Without this integration,
+    # _collect_all_active_lines would walk headers that extract_all skipped,
+    # producing content rows with no matching symbol rows (data inconsistency).
     def _collect_all_active_lines(root_cursor) -> None:
-        """Walk the AST iteratively and add extent line ranges keyed by source file."""
-        stack: list = [root_cursor]
-        while stack:
-            cursor = stack.pop()
+        """Walk the AST and add extent line ranges keyed by source file."""
+        if skip_files:
+            from fw_context_mcp.indexer.symbols import _iter_cursor_skip
+
+            # Per-TU resolve function with its own lru_cache.
+            # Each _build_filtered_file_content call uses a fresh cache
+            # because *unit.directory* differs per TU.  Within a single
+            # content-fill walk (~100K cursors, ~1K unique files), the
+            # cache hits ~99 % of resolve calls.
+            @cache
+            def _res(path: str) -> Path:
+                p = Path(path)
+                return (unit.directory / p).resolve() if not p.is_absolute() else p.resolve()
+
+            walker = _iter_cursor_skip(root_cursor, skip_files, _res)
+        else:
+            walker = root_cursor.walk_preorder()
+
+        for cursor in walker:
             if cursor.location.file:
                 fname = str(cursor.location.file.name)
                 extent = cursor.extent
                 if extent.start.file and extent.end.file:
                     for line in range(extent.start.line, extent.end.line + 1):
                         active.setdefault(fname, set()).add(line)
-            for child in cursor.get_children():
-                stack.append(child)
 
     _collect_all_active_lines(tu.cursor)
 
@@ -297,11 +373,29 @@ def _store_symbol_rows(
     vendor_patterns: list[str],
     project_patterns: list[str],
 ) -> tuple[int, dict[int, int]]:
-    """Build symbol rows for every symbol in *syms*, insert them in a batch,
-    and return ``(syms_added, file_proj)``.
+    """Build and batch-insert symbol rows for one TU.
 
-    *file_proj* maps ``file_id → max(is_project)`` so the caller can update
-    ``files.is_project`` across all files touched by this TU.
+    Returns ``(syms_added, file_proj)`` where *file_proj* maps
+    ``file_id → max(is_project)`` across all files touched by this TU.
+
+    The caller uses *file_proj* to update ``files.is_project`` —
+    a file that hosts both project and vendor symbols is treated as
+    project code (``is_project=1`` wins because ``project_patterns``
+    take priority).
+
+    Design decisions:
+      - File IDs are resolved per unique path (not per symbol) to avoid
+        duplicate ``files`` rows.  The *file_id_cache* dict is shared
+        across the whole TU so headers included by many symbols only
+        get one file row each.
+      - ``is_project`` is computed from LIKE patterns rather than from
+        a directory prefix check because build systems (PlatformIO,
+        ESP-IDF) spread project code across multiple non-trivial
+        directory trees — a simple ``startswith(project_root)`` would
+        misclassify framework headers copied into the build directory.
+      - Bodies are only extracted for definitions (``is_definition``
+        with ``end_line > start_line``).  Declarations and forward
+        declarations store ``body=''`` to save disk space.
     """
     from .sdk_detect import _path_matches
 
@@ -320,6 +414,14 @@ def _store_symbol_rows(
                 conn, config_hash, normalized_sym_file, lang, mtime=sym_mtime,
             )
         rel_path = normalized_sym_file
+        # ── Compute is_project ──
+        # project_patterns are checked FIRST because a path that matches
+        # both project_patterns AND vendor_patterns should be treated as
+        # project code (e.g. a project file inside a directory that also
+        # happens to match a generic vendor pattern).
+        # Files outside the project root (framework headers from absolute
+        # system paths) cannot match project_patterns — they default to
+        # is_project=0 unless a broad project_pattern catches them.
         try:
             resolved_sym = Path(sym_file).resolve()
             rel = str(resolved_sym.relative_to(project_root))
@@ -335,12 +437,21 @@ def _store_symbol_rows(
                 is_proj = 1
             else:
                 is_proj = 0
+        # ── Extract function body for definitions ──
+        # Bodies are stored in the DB to power search_bodies (FTS5 over
+        # function implementations).  Declarations (is_definition=False)
+        # store an empty body — only definitions have executable code.
+        # _cached_read_lines reuses file content across symbols in the
+        # same file, avoiding repeated disk I/O.
         body = ""
         if s.is_definition and s.end_line > s.line:
             file_lines = _cached_read_lines(s.file)
             if file_lines is not None:
                 body = _read_body(file_lines, s.line, s.end_line)
         fid = file_id_cache[normalized_sym_file]
+        # Track the highest is_project value per file — files hosting any
+        # project symbol get is_project=1 even if they also contain
+        # vendor symbols (e.g. a glue header that includes both).
         file_proj[fid] = max(file_proj.get(fid, 0), is_proj)
         rows.append(
             (
@@ -369,6 +480,8 @@ def _store_symbol_rows(
                 body,
             )
         )
+    # Batch insert — a single SQL statement for all symbols in the TU
+    # is orders of magnitude faster than individual INSERT per symbol.
     if rows:
         insert_symbols_batch(conn, rows)
     return len(rows), file_proj
@@ -386,15 +499,35 @@ def _detect_moved_symbols(
 ) -> None:
     """Detect symbols that moved between files without content changes.
 
-    When a symbol has the same USR, same content hash, but a different file_id
-    compared to the previous index, update its file_id in place and delete
-    the duplicate row created by the current batch insert.
+    When a developer moves a function definition from ``a.cpp`` to ``b.cpp``
+    without editing the body, the symbol gets a new USR (because USR encodes
+    file path in some libclang configurations) or gets caught here when the
+    old USR still exists in the DB but the symbol's file changed.
+
+    Strategy: for each new symbol whose USR also exists in the previous
+    index (different file_id), compare content hashes.  If the hash is
+    identical, update the OLD row's file_id/line/column in place and
+    delete the DUPLICATE row that the current batch insert just created.
+
+    This preserves LLM analysis (``llm_analysis`` table is tied to
+    ``symbol_id``) across file moves — without this step, a moved function
+    would lose its pre-computed analysis and require re-analysis.
+
+    Content hash comparison uses the actual body text (via libclang extents)
+    so that pure-formatting changes that don't affect the hash are still
+    treated as "same body" even if whitespace differs.
     """
     moved = 0
     for s in syms:
+        # Skip symbols that are pure-new (no old USR match) — they
+        # cannot be moved because there is no previous location.
         if s.usr in old_usrs:
             continue
         normalized_sym_file = _normalize_file_path(s.file, project_root)
+        # Fetch the old row with its LLM analysis — we only preserve
+        # moves for symbols that actually have analysis (summary IS NOT NULL).
+        # Symbols without analysis are cheap to re-insert; the duplicate
+        # cleanup would add overhead without benefit.
         old_row = conn.execute(
             """SELECT s.id, s.file_id, s.qualified_name, s.signature, s.line, s.end_line,
                       s.docstring, f.path as file_path,
@@ -407,8 +540,12 @@ def _detect_moved_symbols(
         ).fetchone()
         if old_row is None:
             continue
+        # Only preserve moves for analyzed symbols — unanalyzed symbols
+        # are cheaper to re-insert from scratch than to verify content
+        # equality across file reads.
         if old_row["summary"] is None:
             continue
+        # Same file — not a move, nothing to do.
         if old_row["file_id"] == file_id_cache[normalized_sym_file]:
             continue
 
@@ -418,6 +555,10 @@ def _detect_moved_symbols(
         old_lines = _cached_read_lines(abs_path(project_root, old_row["file_path"]))
         if old_lines is None:
             continue
+        # Compare content hashes — same body + signature = same symbol.
+        # If hashes differ, the symbol was genuinely modified (not just
+        # moved), so we keep the new insert (old row will be cleaned up
+        # by _delete_old_for_tu on its original TU).
         old_ch = _compute_content_hash(
             old_lines,
             old_row["line"],
@@ -432,6 +573,11 @@ def _detect_moved_symbols(
         if old_ch != new_ch:
             continue
 
+        # ── Update old row in place, delete the duplicate ──
+        # The current batch insert already created a NEW row for this
+        # symbol.  We update the OLD row's location fields to point at
+        # the new file, then delete the duplicate.  LLM analysis and
+        # embedding rows remain linked to the old row's id.
         try:
             new_rel = str(Path(s.file).resolve().relative_to(project_root))
         except ValueError:
@@ -442,6 +588,9 @@ def _detect_moved_symbols(
                WHERE id = ?""",
             (file_id_cache[normalized_sym_file], new_rel, s.line, s.column, s.end_line, old_row["id"]),
         )
+        # Delete the duplicate row created by this batch insert.
+        # We match by (config_hash, usr, id != old_row_id) — the duplicate
+        # is guaranteed to exist because we just inserted it.
         dup_id = conn.execute(
             "SELECT id FROM symbols WHERE config_hash = ? AND usr = ? AND id != ?",
             (config_hash, s.usr, old_row["id"]),
@@ -462,6 +611,10 @@ def _save_old_state(
 
     Used by :func:`_detect_moved_symbols` to detect symbols that moved
     between files.
+
+    Only symbols whose file_id matches this TU's old file_id are included —
+    symbols from other TUs that happen to share the same USR (e.g. because
+    a header was included by both) are correctly excluded.
     """
     if normalized_tu_path not in known:
         return set()
@@ -480,11 +633,30 @@ def _delete_old_for_tu(
     known: dict[str, tuple[int, float]],
     syms: list,
 ) -> None:
-    """Delete stale inheritance and symbol rows for a TU before re-insertion.
+    """Delete stale data for a TU before inserting fresh symbols.
 
-    Removes inheritance edges for classes being re-parsed, then drops all
-    symbols and inheritance records tied to the TU's file_id.
+    Performs four cleanup actions:
+      1. Deletes inheritance edges for classes being re-parsed (class
+         hierarchy may have changed: removed bases, added bases).
+      2. Deletes ``embeddings``, ``llm_analysis``, and ``vec_symbols``
+         rows for symbols about to be deleted — prevents orphan rows.
+      3. Deletes all inheritance records tied to this TU's file_id.
+      4. Deletes all symbols tied to this TU's file_id (the main cleanup).
+
+    Inheritance is cleaned first because the ``inheritance`` table has
+    no FK to ``symbols`` (the FK constraint was dropped to allow deferred
+    batch insertion).  Cleaning it before the symbols ensures no dangling
+    inheritance edges survive.
+
+    The ``vec_symbols`` DELETE is wrapped in a try/except because
+    ``sqlite-vec`` is an optional extension — the table may not exist
+    in environments where ``sqlite-vec`` is not loaded.
     """
+    # Step 1: Remove inheritance edges for classes being re-parsed.
+    #         If a class was removed entirely, its inheritance edges
+    #         would also be caught by step 3 (DELETE by file_id).
+    #         But if a class MOVED to another file, this prevents
+    #         stale inheritance edges pointing at the old file.
     _class_kinds = frozenset({"class", "struct"})
     _class_usrs = {s.usr for s in syms if s.kind in _class_kinds}
     if _class_usrs:
@@ -493,11 +665,14 @@ def _delete_old_for_tu(
                 "DELETE FROM inheritance WHERE config_hash = ? AND derived_usr = ?",
                 (config_hash, usr),
             )
+    # Step 2-4: Delete all data for this TU's old file_id.
     if normalized_tu_path in known:
         file_id_old = known[normalized_tu_path][0]
-        # Clean embeddings and analyses for symbols about to be deleted —
-        # avoids orphaned rows in embeddings, vec_symbols, and llm_analysis
-        # tables after re-insertion.
+        # Delete embeddings and analysis BEFORE symbols, even though
+        # SQLite FK cascades would handle it in order — doing it
+        # explicitly avoids FK constraint violations when the FK
+        # was deferred or when the schema was created without ON DELETE
+        # CASCADE.
         conn.execute(
             "DELETE FROM embeddings WHERE symbol_id IN "
             "(SELECT id FROM symbols WHERE file_id = ?)",
@@ -535,6 +710,16 @@ def _store_macros_for_unit(
 
     Upserts file records for header files that contain macros, then
     replaces all macros previously stored for this TU with the fresh set.
+
+    Macro storage is per-TU replacement, not per-macro upsert.  This is
+    necessary because the same macro name may be defined with different
+    values in different TUs (``#ifdef``-conditional definitions) — per-TU
+    replacement ensures each TU's view of the macro is consistent with
+    its own preprocessing output.
+
+    The mtime for the TU's own file uses the current stat result; header
+    files get mtime=0.0 if stat fails (the upsert_file call will look up
+    the existing mtime from the DB via its ON CONFLICT handler).
     """
     if not macros:
         return
@@ -562,6 +747,8 @@ def _store_macros_for_unit(
                 int(m.is_function_like),
             )
         )
+    # Delete old macros for this TU before inserting — prevents stale
+    # macro definitions from surviving across reindexes.
     delete_macros_for_file(conn, tu_file_id)
     if macro_rows:
         insert_macros_batch(conn, macro_rows)
@@ -578,6 +765,7 @@ def store_symbols_for_unit(
     existing_files: dict[str, tuple[int, float]] | None = None,
     hashes=None,
     build_dir_patterns: list[str] | None = None,
+    skip_files: frozenset[str] | None = None,
 ) -> tuple[int, int, list[dict]]:
     """Parse one translation unit and store its symbols + refs in the DB.
 
@@ -627,6 +815,12 @@ def store_symbols_for_unit(
         current_mtime = 0.0
 
     # Parse (or use caller-supplied pre-parsed data)
+    # pre_parsed supports three shapes for backward compatibility:
+    #   1. ExtractionResult dataclass (current) — has `.tu` attribute
+    #   2. Old-style 7-tuple: (tu, syms, refs, inheritance, ics, fpa, macros)
+    #   3. Old-style 6-tuple: (syms, refs, inheritance, ics, fpa, macros)
+    #   4. Old-style 5-tuple: (syms, refs, inheritance, ics, fpa) — before macros
+    # The dataclass check (hasattr) is the fast path for all current callers.
     tu = None
     if pre_parsed is not None:
         # ExtractionResult dataclass — use named fields instead of positional unpacking
@@ -651,11 +845,23 @@ def store_symbols_for_unit(
             macros = []
             pending_dispatches = []
     else:
+        # ── Run libclang parse inside the write lock ──
+        # Two types of exceptions are handled differently:
+        #   - sqlite3.Error: always fatal — the DB is likely corrupt,
+        #     and continuing would produce an incomplete index.
+        #   - RuntimeError / TranslationUnitLoadError with "unable to open
+        #     database file": a known error from clang's module cache
+        #     when the DB exceeds OS limits — fatal for the same reason.
+        #   - Other RuntimeError / TranslationUnitLoadError: transient
+        #     parse failures (corrupt PCH, missing include path, OOM
+        #     during parse) — log and skip this TU; the indexer continues
+        #     with the remaining TUs.
         try:
             result = extract_all(
                 unit,
                 with_refs=index_refs,
                 return_tu=True,
+                skip_files=set(skip_files) if skip_files else None,
             )
             tu = result.tu
             syms = result.symbols
@@ -695,7 +901,13 @@ def store_symbols_for_unit(
     # ── Phase 2: Delete old symbols ──
     _delete_old_for_tu(conn, config_hash, normalized_tu_path, known, syms)
 
-    # Upsert the TU file record and capture its id
+    # Upsert the TU file record and capture its id.
+    # When the caller provides hashes (bulk-indexing path with pre-computed
+    # content/stability hashes), we store them in the files row.  These
+    # hashes power the manifest verification step, which detects whether
+    # a TU needs re-parsing by comparing current hashes to stored hashes.
+    # Without hashes (reindex_file path), we still upsert the file row
+    # but leave hash columns at their defaults.
     if hashes is not None:
         source_hash, flags_hash, manifest_entry_hash = hashes
         content_hash_val = compute_tu_content_hash(source_hash, flags_hash, manifest_entry_hash)
@@ -716,6 +928,11 @@ def store_symbols_for_unit(
             conn, config_hash, syms, file_id_cache, project_root,
             vendor_patterns, project_patterns,
         )
+        # Update files.is_project for all files touched by this TU.
+        # Using ``is_project < ip`` ensures a file that was previously
+        # vendor-only (is_project=0) gets upgraded to project (is_project=1)
+        # when any symbol in it matches a project_pattern — but a project
+        # file is never downgraded to vendor.
         for fid, ip in file_proj.items():
             conn.execute(
                 "UPDATE files SET is_project = ? WHERE id = ? AND is_project < ?",
@@ -778,6 +995,11 @@ def store_symbols_for_unit(
         insert_fp_assignments_batch(conn, fpa_rows)
 
     # Pending dispatch edges (for deferred resolution in post-processing)
+    # Dispatch edges (event-loop callbacks, thread starts, timer callbacks)
+    # cannot be resolved during per-TU processing because the target symbol
+    # may live in a different TU that hasn't been parsed yet.  Instead, we
+    # store them in a temp table and resolve them after ALL TUs are indexed
+    # (see the dispatch bridging phase in runner.py).
     if index_refs and pending_dispatches:
         conn.execute(
             """CREATE TEMP TABLE IF NOT EXISTS _pending_dispatch (
@@ -825,7 +1047,8 @@ def store_symbols_for_unit(
     # Fill files.content with ifdef-filtered content (tokenization pass)
     _t_content = time.monotonic()
     _, headers = _build_filtered_file_content(
-        conn, unit, config_hash, project_root, build_dir_patterns=build_dir_patterns, existing_tu=tu
+        conn, unit, config_hash, project_root, build_dir_patterns=build_dir_patterns, existing_tu=tu,
+        skip_files=skip_files,
     )
     _t_content = time.monotonic() - _t_content
 
@@ -845,6 +1068,10 @@ def store_symbols_for_unit(
 # Used by backfill_cross_tu_refs to find call sites that per-TU fallback
 # could not resolve (because the callee was defined in another TU and not
 # declared in any included header).
+#
+# Captures two groups:
+#   group(1) — the object/receiver name (unused, but validated by regex)
+#   group(2) — the method name (used to resolve against the symbols table)
 _CALL_PATTERN_RE = re.compile(r"(\w+)(?:\.|->)(\w+)\s*\(")
 
 
@@ -872,6 +1099,10 @@ def backfill_cross_tu_refs(
     total_added = 0
 
     # 1. Get all project source files (.c/.cpp) with indexed content.
+    #    Only project files are scanned — vendor SDK code is not expected
+    #    to have cross-TU method calls that libclang misses.  Files without
+    #    content (content='') are skipped because we need the ifdef-filtered
+    #    source text to scan for method call patterns.
     source_files = conn.execute(
         """SELECT f.path, f.content, f.language
            FROM files f
@@ -925,7 +1156,9 @@ def backfill_cross_tu_refs(
         # 4. For each function span, scan lines without existing refs.
         new_refs: list[tuple] = []
         for fn_usr, fn_start, fn_end in fn_spans:
-            # Clamp to actual line count
+            # Clamp to actual line count — fn_end may extend past
+            # the file length if the source was truncated or if
+            # libclang reported an extent beyond EOF.
             span_end = min(fn_end, n_lines)
             for lineno in range(fn_start, span_end + 1):
                 if lineno in existing_ref_lines:
@@ -933,18 +1166,26 @@ def backfill_cross_tu_refs(
                 line_text = lines[lineno - 1] if 0 < lineno <= n_lines else ""
                 if not line_text:
                     continue
-                # Scan for obj.method( and obj->method( patterns
+                # Scan for obj.method( and obj->method( patterns.
+                # Each match yields a potential cross-TU call that
+                # libclang's per-TU cursor visitor could not resolve.
                 for m in _CALL_PATTERN_RE.finditer(line_text):
                     method_name = m.group(2)
-                    # Skip common false positives
+                    # Skip common false positives — C++ keywords and
+                    # builtins that match the regex but are not method
+                    # calls (e.g. `if (` in minified code).
                     if method_name in ("if", "for", "while", "switch", "sizeof", "return"):
                         continue
                     target_usr = _resolve_target_usr(conn, config_hash, method_name)
+                    # Avoid self-references — a function calling itself
+                    # (recursion) would already have a per-TU ref.
                     if target_usr and target_usr != fn_usr:
                         new_refs.append(
                             (config_hash, target_usr, file_path_rel, lineno, fn_usr, "call")
                         )
-                        # Mark this line as having a ref to avoid duplicates
+                        # Mark this line as having a ref to avoid
+                        # inserting duplicate references when multiple
+                        # method calls appear on the same line.
                         existing_ref_lines.add(lineno)
 
         if new_refs:

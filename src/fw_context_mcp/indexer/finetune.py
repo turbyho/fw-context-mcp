@@ -1,5 +1,11 @@
 """Self-supervised embedding fine-tuning per project.
 
+WHY fine-tuning: general-purpose embedding models (e.g. BGE, mxbai-embed-large)
+are trained on generic text — they don't understand embedded firmware
+domain vocabulary (ISR, NVIC, BLE, GPIO, I2C, CMSIS).  Fine-tuning on
+project-specific symbol descriptions improves semantic search recall by
+adapting the embedding space to the codebase's actual vocabulary.
+
 Based on the vstash approach (arXiv:2604.15484):
   1. Generate synthetic queries from symbol descriptions (no LLM needed).
   2. For each query, run dense (vec0 KNN) and FTS5 searches → top-10.

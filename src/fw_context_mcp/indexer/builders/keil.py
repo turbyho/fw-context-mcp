@@ -28,7 +28,12 @@ class KeilBuildSystem:
     """Keil MDK — compile_commands.json via ``keil2clangd`` conversion.
 
     Does NOT build the project — only parses the ``.uvprojx`` file.
-    Requires ``keil2clangd`` (``pip install keil2clangd``).
+
+    WHY keil2clangd (not bear + uVision CLI): Keil MDK's uVision IDE is
+    Windows-only GUI-first; its command-line interface is limited and
+    platform-specific.  keil2clangd parses the .uvprojx XML project file
+    to extract compiler flags, include paths, and defines without running
+    the compiler.  Works cross-platform and doesn't need the Keil toolchain.
     """
 
     name: str = "Keil MDK"

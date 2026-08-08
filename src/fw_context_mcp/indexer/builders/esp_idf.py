@@ -25,6 +25,13 @@ class ESPIDFBuildSystem:
     Detected by the presence of ``sdkconfig`` alongside a CMakeLists.txt
     that references ``idf_build``.  Registered AFTER the Mbed/Zephyr/PlatformIO
     builders so those take precedence in ambiguous setups.
+
+    WHY ``idf.py build`` (not raw CMake): ESP-IDF uses CMake internally
+    but the project structure is non-standard — CMakeLists.txt in an
+    IDF-managed directory hierarchy.  ``idf.py build`` invokes CMake with
+    ESP-IDF-specific toolchain paths and component discovery that a raw
+    ``cmake`` call would miss.  It also handles the two-phase build
+    (bootloader + app) and the ``sdkconfig`` configuration system.
     """
 
     name: str = "ESP-IDF"

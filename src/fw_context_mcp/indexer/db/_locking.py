@@ -3,6 +3,17 @@
 Serializes all write operations (symbol storage, LLM analysis, embeddings)
 across processes.  Uses ``fcntl.flock`` — the kernel releases the lock
 automatically on process exit, so a crash never leaves a stale lock.
+
+WHY fcntl.flock (not a file-based lock or SQLite WAL): SQLite WAL mode
+allows concurrent reads but serializes writes per connection.  Multiple
+processes (indexing daemon, reindex_file, CLI watch) may all try to write
+simultaneously.  An external lock serializes them at the application level,
+preventing SQLITE_BUSY errors and ensuring atomic multi-table operations.
+
+WHY advisory lock (not mandatory): fcntl.flock is cooperative — only
+processes that check the lock are serialized.  This is sufficient because
+all fw-context processes use ``write_lock``.  A mandatory lock (chmod +l)
+would block even read-only operations and requires root.
 """
 
 from __future__ import annotations

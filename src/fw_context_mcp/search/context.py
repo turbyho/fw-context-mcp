@@ -1,8 +1,24 @@
 """PipelineContext — immutable-ish state flowing through search phases.
 
-Each phase receives a context, reads what it needs, and returns a NEW context
-with its output fields populated.  The dataclass is frozen so phases cannot
-accidentally mutate state they don't own.
+Why a frozen dataclass?
+    The pipeline has 10+ phases, several of which run database queries
+    and mutate state.  Without immutability, a phase could accidentally
+    modify a field that another phase already processed, introducing
+    subtle ordering bugs.  The frozen dataclass forces phases to return
+    a new context via ``ctx.evolve(**updates)``, making data flow explicit.
+
+Why a shared executor instead of per-phase connections?
+    Each ``open_db`` call pays an ``ensure_schema`` write transaction
+    (~10 ms) and installs a progress handler.  With 10+ phases, that's
+    100+ ms of overhead.  Worse, multiple connections contend on the
+    same SQLite WAL.  A single shared ``SyncQueryExecutor`` gives every
+    phase serialised access on one connection — zero overhead per phase.
+
+Why ``_quick_open_readonly`` for config loading?
+    The ``create()`` factory reads exactly two fields from the database
+    (config_hash, project_id).  A full ``open_db`` would pay the schema
+    migration write transaction for a two-field read — wasteful.  The
+    read-only shortcut avoids that cost.
 """
 
 from __future__ import annotations
@@ -21,13 +37,24 @@ from fw_context_mcp.utils import resolve_project_root
 class PipelineContext:
     """State object flowing through every search phase.
 
-    Phases read from this context and return a new one via ``ctx.evolve(**updates)``.
+    Why immutable?
+        Each phase reads from this context and returns a new one via
+        ``ctx.evolve(**updates)``.  This prevents phases from accidentally
+        mutating state another phase depends on, and makes the data flow
+        through the pipeline explicit and traceable.
+
+    Why slots=True?
+        Reduces memory overhead.  Every search creates exactly one context
+        that flows through 10+ phases — slots avoid per-instance dict
+        overhead.  Combined with frozen=True, this is a zero-copy-shared
+        immutable record.
 
     ``executor`` is the shared single-connection query executor for this
     project's database.  Every phase with database access runs its queries
     through ``ctx.executor.execute_sync(...)`` — phases must NOT open
-    their own connections with a bare ``open_db`` call (that paid an ensure_schema
-    write transaction and a 10 s progress-handler timeout per phase).
+    their own connections with a bare ``open_db`` call (that paid an
+    ensure_schema write transaction and a 10 s progress-handler timeout
+    per phase).
     """
 
     # ── inputs (set at creation) ──────────────────────────────────────────
@@ -70,7 +97,14 @@ class PipelineContext:
     # ── helpers ───────────────────────────────────────────────────────────
 
     def evolve(self, **kwargs) -> PipelineContext:
-        """Return a new context with the given fields replaced."""
+        """Return a new context with the given fields replaced.
+
+        Why ``dataclasses.replace``?
+            It creates a shallow copy with specific fields replaced —
+            O(1) per field, no manual copy-constructor.  Combined with
+            frozen=True, this is the standard pattern for immutable
+            state updates in a pipeline.
+        """
         return replace(self, **kwargs)
 
     @classmethod
@@ -82,8 +116,12 @@ class PipelineContext:
     ) -> PipelineContext:
         """Factory: resolve project root, load config, read config_hash, get executor.
 
-        Returns a context ready for pipeline execution, or raises ValueError
-        when no index exists.
+        Why a factory method?
+            Creating a PipelineContext requires multiple steps (resolve root,
+            load config, open DB, read config_hash, create executor) that
+            would be error-prone if done manually.  The factory encapsulates
+            all initialisation and validates preconditions (index exists,
+            build config exists) before returning.
 
         The config read uses a short-lived read-only connection
         (``_quick_open_readonly``) — a full ``open_db`` would pay an

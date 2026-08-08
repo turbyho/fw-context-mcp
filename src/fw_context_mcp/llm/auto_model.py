@@ -9,6 +9,24 @@ Called when ``embed_model`` is empty (default).  Resolution order:
 All Ollama calls are best-effort with short timeouts — if Ollama is
 offline, the model name is still set and the pull/install is retried
 at first embed time by ``OllamaEmbedder``.
+
+WHY auto-detect: The default config ships with ``embed_model = ""``.
+First-time setup should "just work" without asking the operator to
+choose an embedding model.  Auto-detect picks a reasonable default
+based on GPU availability — larger model (8B, better quality) for
+GPU, smaller model (0.6B, lower RAM) for CPU.
+
+WHY best-effort pull: The nvidia-smi check and Ollama API probes are
+fast (<3s combined).  If either fails (no network, Ollama not running),
+the model name is still set — ``OllamaEmbedder`` retries with longer
+timeouts at first embed time (via ``auto_pull`` if enabled).  The
+operator sees a working system as soon as Ollama starts.
+
+WHY module-level cache: ``resolve_embed_model`` is called on every
+config load.  GPU detection (subprocess) and Ollama API probes
+(HTTP) add latency — caching avoids re-running these on every MCP
+tool invocation.  The environment (GPU presence, installed models)
+doesn't change within a process lifetime.
 """
 
 from __future__ import annotations
@@ -59,6 +77,13 @@ def _model_name_matches(installed_name: str, configured_name: str) -> bool:
     variants (``model-q4_K_M``).  Does NOT match different versions of
     the same base model (``qwen3-embedding:0.6b`` does NOT match
     ``qwen3-embedding:8b``).
+
+    WHY not match different versions: ``qwen3-embedding:0.6b`` and
+    ``qwen3-embedding:8b`` are different models with different
+    dimensions and quality characteristics.  Matching them would
+    silently use the wrong model — the operator intended 0.6b but got
+    8b (or vice versa).  Exact or prefix-with-separator matching
+    prevents this ambiguity.
     """
     return (
         installed_name == configured_name
@@ -171,10 +196,11 @@ def resolve_embed_model(cfg: LLMConfig) -> None:
         cfg.embed_model = target
         _cached_model = target
 
-    # NOTE: _apply_prompt_defaults, _model_installed, and _try_pull are outside
-    # _auto_model_lock.  This is intentional — they perform HTTP requests which
-    # would serialize all config loads.  The cache is already populated above
-    # (inside the lock) so subsequent calls take the fast path at line 127.
+    # NOTE: HTTP calls are OUTSIDE the lock — _apply_prompt_defaults,
+    # _model_installed, and _try_pull perform network requests which
+    # would serialize all config loads if they held the lock.  The
+    # cache is already populated above (inside the lock) so subsequent
+    # calls take the fast path at the double-check above.
     # Worst case on first call: two threads both check/pull — harmless
     # best-effort operations with short timeouts.
     _apply_prompt_defaults(cfg)
@@ -196,6 +222,11 @@ def _apply_prompt_defaults(cfg: LLMConfig) -> None:
     Delegates to ``settings._apply_embed_prompt_defaults`` (canonical owner
     of prompt defaults).  Lazy import to avoid circular import — settings.py
     imports ``resolve_embed_model`` from this module.
+
+    WHY prompts are applied here: Each embedding model uses different
+    prompt prefixes (e.g. E5 uses "query:", BGE uses "Represent this
+    sentence...").  Picking the model also means picking the prompts;
+    doing both in one place ensures they stay in sync.
     """
     from ..config.settings import _apply_embed_prompt_defaults
 

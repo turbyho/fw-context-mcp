@@ -1,4 +1,47 @@
-"""Source MCP tools — see mcp/server.py for registration."""
+"""MCP tool handlers that serve source-code and symbol-metadata queries.
+
+Each handler translates a user-facing MCP tool call into one or more
+index lookups against the libclang-powered SQLite symbol database and
+returns structured, tool-ready results.
+
+Handlers in this module:
+  - explain_symbol    — human-readable explanation of a symbol's purpose
+  - get_source        — exact function/enum body via libclang extents
+  - get_symbol_context — body + callers + callees + indirect calls in one
+  - get_file_map      — structural table of contents for a source file
+  - read_file         — ifdef-filtered file content, line numbers preserved
+
+Execution pattern (shared by all handlers):
+
+1. Resolve the project database context (config hash + root path) via
+   ``BaseHandler.resolve_db_context``.
+2. Define a ``_query`` closure that runs **under** the executor lock on
+   the single shared SQLite connection — no handler opens its own
+   connection.  Timeout enforcement is delegated to ``_wrap_tool``
+   (300 s + interrupt).
+3. Execute ``_query`` via ``db.executor.execute_sync``, which serialises
+   all DB access to prevent SQLite "database is locked" errors.
+4. Post-process the raw query result: read source bodies from disk,
+   format output keys, attach optional metadata (LLM analysis, override
+   info, enum constants).
+
+Private helper functions provide reusable building blocks:
+
+  - _lookup_definition    — multi-tier best-match symbol lookup with
+                            kind-priority and project-priority ordering
+  - _lookup_try_columns   — column-level search strategy: try each column,
+                            definition-first then any-match with
+                            definition-descent sort
+  - _read_symbol_body     — windowed file reading with brace-matching
+                            fallback; avoids loading huge generated files
+  - _try_macro_fallback   — #define macro lookup that returns a
+                            standardised result dict callers can chain
+  - _validate_path_in_root — path-security guard used by read_file and
+                            get_file_map
+  - _collect_*            — callers, callees, indirect calls, enum
+                            constants, override metadata, and Phase 3
+                            resolution info
+"""
 
 from __future__ import annotations
 
@@ -25,10 +68,15 @@ from ._base import BaseHandler
 
 log = logging.getLogger(__name__)
 def _validate_path_in_root(resolved_path: str, root: Path) -> str | None:
-    """Validate that *resolved_path* relative to *root* stays within the project.
+    """Check that *resolved_path* relative to *root* stays within the project.
 
     Returns an error message string on failure, or ``None`` on success.
-    Used by ``read_file`` and ``get_file_map`` for consistent path-security checks.
+    Uses ``Path.resolve().relative_to()`` which resolves symlinks and ``..``
+    components — a path like ``../../etc/passwd`` is caught even if it
+    appears to be under the project root.
+
+    Used by ``read_file`` and ``get_file_map`` for consistent path-security
+    checks before any disk read.
     """
     try:
         Path(root, resolved_path).resolve().relative_to(root.resolve())
@@ -38,6 +86,11 @@ def _validate_path_in_root(resolved_path: str, root: Path) -> str | None:
 
 
 # ── Truncation limits ──
+# These prevent blowing up MCP tool responses with multi-megabyte source
+# bodies.  LLMs have token-budget constraints; returning the full body of a
+# 2000-line function wastes tokens and slows tool-calling iteration.
+# Context windows are shared across all tools in a conversation, so every
+# byte saved here is a byte the user's LLM can use for actual reasoning.
 _SOURCE_TRUNCATE_CHARS = 8000   # max chars for get_source / get_symbol_context body
 _EXPLAIN_SNIPPET_CHARS = 4000   # max chars for explain_symbol source snippet
 _CONTEXT_LINES_MAX = 200        # max context_lines parameter for explain_symbol
@@ -134,14 +187,22 @@ def _lookup_try_columns(
     *,
     suffix_filter: str | None = None,
 ):
-    """Try *search_name* against each column in *columns*.
+    """Try *search_name* against each column in *columns*, returning the first match.
 
-    For each column, tries ``is_definition=1`` first, then without the filter
-    (with ``is_definition DESC`` sort).  Returns the first matching row or
-    ``None``.
+    Strategy (per-column, two-pass):
+    1. Exact-column match with ``is_definition=1`` — prefer the definition site
+       over forward declarations.
+    2. Exact-column match without the definition filter, sorted with
+       ``is_definition DESC`` — gets any match when no definition exists.
 
     When *suffix_filter* is set, only rows whose ``qualified_name`` ends with
-    that string are returned.
+    that string survive.  This is used by ``_lookup_definition`` to
+    disambiguate ``Foo::bar`` from an unrelated ``bar`` in another namespace.
+
+    Returns ``None`` when no row matches across all columns.  This function is
+    intentionally single-purpose — callers compose it with their own
+    ``query_template`` for kind-priority ordering, project-priority sorting,
+    and result limits.
     """
     for column in columns:
         for is_def, replace in ((True, ""), (False, "s.is_definition DESC,")):
@@ -205,6 +266,11 @@ def _try_macro_fallback(
 
     Returns ``None`` when no matching macro is found so callers can chain
     with ``if (m := _try_macro_fallback(...)): return m``.
+
+    When *include_empty_refs* is True, empty ``callers`` and ``callees``
+    lists are added so the result shape matches ``get_symbol_context``
+    output (which always has these keys).  ``explain_symbol`` and
+    ``get_source`` set this to False — they do not emit caller/callee keys.
     """
     macros = lookup_macro(conn, config_hash, name, exact=True, limit=1)
     if not macros:
@@ -301,7 +367,9 @@ async def explain_symbol(
         "signature": signature,
     }
 
-    # Use pre-computed analysis if available (instant response)
+    # Pre-computed LLM analysis (from `fw-context index --analyze`) is
+    # instant — no Ollama network call.  Return immediately when available
+    # so the caller gets a response in <1 ms instead of 10–30 s.
     if llm_analysis:
         explanation = llm_analysis["summary"]
         if llm_analysis["inputs"]:
@@ -312,6 +380,9 @@ async def explain_symbol(
         result["llm_analysis"] = llm_analysis
         return result
 
+    # No pre-computed analysis — fall through to the on-demand path.
+    # Build a source-context window around the symbol so the LLM can
+    # see what the code actually does, not just the signature.
     context_lines = max(1, min(context_lines, _CONTEXT_LINES_MAX))
     source_snippet = ""
     try:
@@ -335,6 +406,12 @@ async def explain_symbol(
     if source_snippet:
         prompt += f"\nSource context:\n```cpp\n{source_snippet}\n```\n"
     if cfg.llm.enabled:
+        # Three distinct error types form a progressive-degradation strategy:
+        # - TimeoutError  → user knows the request completed (just too slow)
+        # - ModelNotFound → actionable: install the model or switch to cloud
+        # - OllamaError   → generic failure (server down, OOM, etc.)
+        # Each produces a warning + raw data so the user's LLM can still
+        # interpret the symbol from source + prompt without our server.
         try:
             result["explanation"] = await asyncio.wait_for(
                 call_ollama_async(prompt, cfg.llm),
@@ -439,7 +516,11 @@ def get_source(
             result["parent_usr"] = row["parent_usr"]
         if row["enum_value"] is not None:
             result["enum_value"] = row["enum_value"]
-        # For enums, collect all constants with their values
+        # For enums, collect all member constants.
+        # Two LIKE patterns cover both unqualified (EnumName::CONST) and
+        # namespaced (prefix::EnumName::CONST, e.g. inner enum in a class).
+        # SQLite GLOB/REGEXP would be cleaner but LIKE is indexed for FTS5
+        # prefix scans and avoids a second table lookup per enum.
         if row["kind"] == "enum":
             qn = row["qualified_name"]
             const_rows = conn.execute(
@@ -525,7 +606,11 @@ def get_file_map(
         # Runs under the executor lock on the single shared connection;
         # must not open its own connection.  Timeout is enforced by
         # _wrap_tool (300 s + interrupt), not here.
-        # Resolve file_path: try exact match first, then suffix
+        # Path resolution: exact match first, then suffix LIKE fallback.
+        # Users often pass just "main.cpp" or "src/main.cpp" — the suffix
+        # match finds the canonical path without requiring the full relative
+        # prefix.  When multiple candidates exist, choose the shortest path
+        # because it is the least-nested (most canonical) match.
         exact = conn.execute(
             "SELECT COUNT(*) FROM symbols WHERE config_hash=? AND file_path=?",
             (config_hash, file_path),
@@ -598,8 +683,18 @@ def _collect_indirect_calls(
     symbol_usr: str,
     root: Path,
 ) -> list[dict]:
-    """Return indirect call sites: either who calls this field/variable,
-    or what this function calls indirectly."""
+    """Return indirect call sites for a symbol — dual-purpose by symbol kind.
+
+    For **field/variable** kinds (function-pointer fields): returns call sites
+    where this field is actually invoked (e.g. ``driver.onData(buf, len)``).
+    Uses ``find_indirect_call_sites`` which queries the Phase 3 link table.
+
+    For **function/method** kinds: returns indirect call sites made BY this
+    function — calls through function pointers that originate inside this
+    function's body (e.g. ``stored_callback(42)`` inside ``dispatch_event``).
+
+    Returns an empty list for all other kinds (enum, class, struct, etc.).
+    """
     kind = row["kind"]
     if kind in ("field", "variable", "varglobal", "varlocal"):
         ics_rows = find_indirect_call_sites(
@@ -649,7 +744,20 @@ def _collect_resolution_info(
     symbol_usr: str,
     indirect_calls_list: list[dict],
 ) -> dict | None:
-    """Build Phase 3 resolution metadata for function-pointer symbols."""
+    """Build Phase 3 resolution metadata for function-pointer symbols.
+
+    Phase 3 links function-pointer *assignments* (who is attached to this
+    field?) with *call sites* (where is this field actually invoked?).  When
+    both sides are populated the resolution is "fully resolved" — the LLM
+    (and the user) can trace the data flow from registration through
+    invocation.  When one side is missing, the `note` explains why
+    (assignments in unindexed code, type-erased API, etc.).
+
+    Returns ``None`` when the symbol is not a function-pointer-bearing
+    field/variable (kinds other than field/variable/varglobal/varlocal)
+    OR when neither assignments nor call sites exist — no need to emit
+    empty resolution metadata.
+    """
     kind = row["kind"]
     if kind not in ("field", "variable", "varglobal", "varlocal"):
         return None
@@ -690,7 +798,13 @@ def _collect_resolution_info(
 def _collect_enum_constants(
     conn: sqlite3.Connection, config_hash: str, row: sqlite3.Row
 ) -> list[dict]:
-    """Return enum member constants (name + value) for an enum symbol."""
+    """Return enum member constants (name + value) for an enum symbol.
+
+    Uses two LIKE patterns to match both unqualified constants
+    (``EnumName::CONST``) and namespaced ones (``prefix::EnumName::CONST``).
+    LIKE is preferred over GLOB/REGEXP because SQLite can optimise it with
+    the FTS5-backed index prefix scan, a pattern repeated in ``get_source``.
+    """
     if row["kind"] != "enum":
         return []
     qn = row["qualified_name"]
@@ -714,7 +828,14 @@ def _collect_enum_constants(
 def _collect_override_info(
     conn: sqlite3.Connection, config_hash: str, row: sqlite3.Row
 ) -> dict | None:
-    """Return virtual-method override metadata when applicable."""
+    """Return virtual-method override metadata when applicable.
+
+    Only methods and destructors marked ``is_virtual`` or ``is_pure_virtual``
+    trigger this lookup — non-virtual methods return ``None`` immediately.
+    The override data (``overrides`` → base-class method, ``overridden_by``
+    → derived-class methods) is stored in the ``overrides`` table populated
+    during ``fw-context index`` post-processing of the inheritance graph.
+    """
     kind = row["kind"]
     if kind not in ("method", "destructor"):
         return None
@@ -793,6 +914,12 @@ def get_symbol_context(
         except ValueError:
             return {"error": f"Path {file_path} outside project root"}
         symbol_usr = row["usr"]
+
+        # Assemble six independent data sources inside a single DB transaction
+        # (via execute_sync) so the caller gets a complete picture in one
+        # response — avoids N+1 MCP round-trips for callers, callees, etc.
+        # Each collector is a separate function for readability; the DB lock
+        # is held for the entire _query closure so the snapshot is consistent.
 
         # Immediate callers (who calls this symbol, direct + indirect).
         callers_list = _collect_callers(conn, config_hash, name, root)
@@ -919,7 +1046,8 @@ def read_file(
         # must not open its own connection.  Timeout is enforced by
         # _wrap_tool (300 s + interrupt), not here.
 
-        # Resolve file_path: try exact match first, then suffix match
+        # Path resolution: exact match first, then suffix LIKE fallback
+        # (same strategy as get_file_map — users often pass bare filenames).
         exact = conn.execute(
             "SELECT COUNT(*) FROM files WHERE config_hash=? AND path=?",
             (config_hash, file_path),
@@ -966,11 +1094,16 @@ def read_file(
     }
 
     if content:
+        # Normal path: ifdef-filtered content is available from the index.
+        # This is the preferred code path — inactive #ifdef branches are
+        # already stripped, line numbers are preserved as blank lines.
         lines_list = content.splitlines()
         result["lines"] = len(lines_list)
         result["content"] = content
     else:
-        # Fallback: raw disk read for legacy indexes without ifdef-filtered content
+        # Legacy index fallback: older indexes (pre-ifdef-filtering) have an
+        # empty content column.  Read from raw disk instead and emit a
+        # warning so the user knows this is NOT build-accurate content.
         disk_lines = read_file_lines(abs_path(root, resolved))
         if disk_lines is None:
             return {"error": f"Could not read file: {abs_path(root, resolved)}"}

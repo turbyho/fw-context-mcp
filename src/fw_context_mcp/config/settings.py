@@ -5,6 +5,31 @@ Hierarchy (later overrides earlier):
   2. ~/.fw-context/config.toml           (global, per-user)
   3. <project>/.fw-context/config.toml   (project, shared — commit to git)
   4. <project>/.fw-context/local.toml    (project, local — gitignore)
+
+**Why four levels?**  Configuration has three owners:
+- Tool authors define safe defaults (built-in).
+- Each developer sets their own machine preferences (global — Ollama URL,
+  model choice, VRAM limits).  This file must NEVER be committed.
+- The team agrees on project-level settings (build system, index paths,
+  vendor directories) and shares them via git.  Third-party contributors
+  get a working config out of the box.
+- Machine-specific overrides (local Python path, virtualenv activation,
+  API keys) are stored in ``local.toml`` (gitignored).  A broken
+  ``local.toml`` must not block other developers.
+
+**Config class design — dataclasses vs dicts:**  Dataclasses provide
+type-safe field access, IDE autocompletion, and default values directly
+in the attribute definitions.  The TOML-to-dataclass bridge uses
+field-mapping tables (_PROJECT_FIELDS, _BUILD_FIELDS, etc.) instead of
+reflection — this avoids fragile naming conventions, gives explicit
+control over type coercion per field, and makes the TOML schema
+self-documenting through the mapping tables themselves.
+
+**Safety — committed config validation:**  ``config.toml`` is shared
+via git, so anyone with commit access could set ``pre_build`` or
+``command`` to arbitrary shell commands.  The config loader warns
+loudly when dangerous settings appear in committed config.  These
+settings must live in ``local.toml`` (gitignored, per-developer).
 """
 
 from __future__ import annotations
@@ -39,6 +64,12 @@ __all__ = [
 ]
 
 # ── Embedding description format version — bump when the text changes ──
+# Each version change invalidates all cached embeddings because the vector
+# for "the same symbol" differs if the description text format changed.
+# The version tag is embedded in the embed_key() cache key so stale vectors
+# from a previous index are never reused — semantic_search sees only vectors
+# produced by the current description format.
+#
 # desc-v1: original — "kind name : in class : in path : sig : doc : llm"
 # desc-v2: body text appended for function/method/constructor/destructor
 # desc-v3: file name prefix added
@@ -63,6 +94,16 @@ _GLOBAL_CONFIG_PATH = Path.home() / ".fw-context" / "config.toml"
 _PROJECT_CONFIG_DIR = ".fw-context"
 _PROJECT_CONFIG_NAME = "config.toml"
 _PROJECT_LOCAL_CONFIG_NAME = "local.toml"
+
+# Why separate global vs project vs local?
+# - Global: per-machine, per-developer — never committed.  Holds Ollama
+#   URL, model preference, VRAM budgets.
+# - Project (config.toml): team-shared via git — build system, index
+#   paths, vendor directories.  Third-party contributors get a working
+#   config immediately.
+# - Local (local.toml): machine-specific overrides — Python path,
+#   virtualenv activation scripts, API keys.  Gitignored.  Must not
+#   break other developers if missing or broken.
 
 _GLOBAL_DEFAULTS = """\
 [index]
@@ -362,6 +403,13 @@ def _apply_embed_prompt_defaults(llm_cfg: LLMConfig) -> None:
 
     Called by ``_from_dict`` after loading TOML — only fills defaults when
     the user hasn't explicitly configured a prompt value.
+
+    **Why per-model prompts?**  Embedding models are trained with specific
+    instruction formats.  ``qwen3-embedding`` models expect a task
+    description prepended to the query (e.g. "Retrieve C/C++ functions…").
+    ``mxbai`` and ``ibm-granite`` models use the standard "Represent this
+    sentence…" format.  Using the wrong format reduces retrieval quality
+    by 10-15% MTEB score — auto-detection prevents silent degradation.
     """
     model_lower = llm_cfg.embed_model.lower()
     if llm_cfg.embed_query_prompt == "":
@@ -493,6 +541,15 @@ class Config:
 
 
 def _deep_merge(base: dict, override: dict) -> dict:
+    """Recursively merge *override* into *base* — nested dicts are merged,
+    not replaced.
+
+    **Why recursive?**  TOML sections are nested dicts.  A shallow merge
+    (``{**base, **override}``) would replace the entire ``[llm]`` dict
+    when ``local.toml`` sets ``ollama_url`` — erasing all other LLM keys
+    set by ``config.toml``.  Deep merge walks into sub-dicts, so each
+    key is overridden individually.
+    """
     result = dict(base)
     for k, v in override.items():
         if isinstance(v, dict) and isinstance(result.get(k), dict):
@@ -503,6 +560,13 @@ def _deep_merge(base: dict, override: dict) -> dict:
 
 
 def _safe_int(val, default: int = 0) -> int:
+    """Coerce *val* to int, returning *default* on failure.
+
+    **Why safe?**  TOML values come from user-edited files — typos like
+    ``num_ctx = "auto"`` or ``timeout = "inf"`` crash the server if not
+    caught.  ``_safe_int`` logs a warning and returns the default so the
+    server starts with a working (but potentially wrong) value.
+    """
     try:
         return int(val)
     except (ValueError, TypeError):
@@ -511,6 +575,7 @@ def _safe_int(val, default: int = 0) -> int:
 
 
 def _safe_float(val, default: float = 0.0) -> float:
+    """Coerce *val* to float, returning *default* on failure."""
     try:
         return float(val)
     except (ValueError, TypeError):
@@ -524,7 +589,18 @@ def _apply_section(
     fields: list[tuple[str, str, str]],
     target: object,
 ) -> None:
-    """Apply a TOML section's key-value pairs to a config dataclass."""
+    """Apply a TOML section's key-value pairs to a config dataclass.
+
+    Iterates over *fields* — each is a ``(toml_key, attr_name, converter)``
+    tuple — and calls ``_convert`` + ``setattr`` for each key present in
+    the TOML section.
+
+    **Why separate ``_convert`` dispatch?**  TOML types are limited (str,
+    int, float, bool, array, table).  Our config types are richer (Path,
+    list[str], Optional[int] with sentinel values).  The converter strings
+    provide a compact, self-documenting mapping from TOML types to Python
+    dataclass attribute types — no per-field handler functions needed.
+    """
     if section := data.get(section_name, {}):
         for key, attr, conv in fields:
             if key in section:
@@ -536,6 +612,12 @@ def _build_cache_server_config(data: dict) -> CacheServerConfig | None:
 
     Reads the bearer token from the config file, falling back to
     ``~/.fw-context/.cache_token`` when not set.
+
+    **Why token file fallback?**  API tokens must never appear in
+    committed config files.  The ``.cache_token`` file lives outside any
+    git repository and follows the same pattern as ``.netrc`` — machine
+    credentials in a protected dotfile.  Multiple projects on the same
+    machine share one cache server, so a single token file suffices.
 
     Args:
         data: Merged TOML dictionary.
@@ -569,6 +651,16 @@ def _from_dict(data: dict) -> Config:
 
     Each mapping entry: (toml_key, attr_name, converter).
     Converters: "str" | "bool" | "list" | "dict" | "path" | "int(N)" | "float(N)"
+
+    Why table-driven instead of reflection-based?
+    - Reflection (``setattr(cfg.__dict__[k], ...)``) couples TOML key names
+      to Python attribute names, forcing identical naming.  Tables let them
+      diverge — e.g. TOML ``compile_commands`` → Python ``compile_commands``,
+      but could map TOML ``db-path`` → Python ``db_dir`` if desired.
+    - Tables self-document the full TOML schema in one place.  A new developer
+      can see every supported key without reading dataclass field definitions.
+    - Type coercion is explicit per field — no guessing whether a TOML string
+      "true" should be bool or str.
     """
     cfg = Config()
 
@@ -578,7 +670,9 @@ def _from_dict(data: dict) -> Config:
     _apply_section(data, "index", _INDEX_FIELDS, cfg.index)
     _apply_section(data, "llm", _LLM_FIELDS, cfg.llm)
 
-    # Normalize sentinel values: -1 means "not set" for embed_dim
+    # Normalize sentinel values: -1 means "not set" for embed_dim.
+    # The TOML file cannot express None, so we use -1 as a sentinel that
+    # resolve_embed_model later replaces with the auto-detected dimension.
     if cfg.llm.embed_dim is not None and cfg.llm.embed_dim < 0:
         cfg.llm.embed_dim = None
     _apply_embed_prompt_defaults(cfg.llm)
@@ -586,7 +680,8 @@ def _from_dict(data: dict) -> Config:
 
     cfg.cache_server = _build_cache_server_config(data)
 
-    # Warn about unknown top-level keys
+    # Warn about unknown top-level keys — a typo like [indexx] goes unnoticed
+    # without this check.  The user would otherwise get silent defaults.
     for key in data:
         if key not in _KNOWN_SECTIONS:
             log.warning(
@@ -609,11 +704,13 @@ def _convert(value, conv: str):
         ``"int(N)"`` — coerce to int, default N on failure
         ``"float(N)"`` — coerce to float, default N on failure
     """
-    # Exact-match converters (fast path)
+    # Exact-match converters (fast path) — dict lookup instead of if/elif chain.
+    # Each converter is a lambda or builtin, stored once at module load.
     if conv in _CONVERTERS:
         return _CONVERTERS[conv](value)
 
-    # Prefix-match converters: "int(N)" / "float(N)"
+    # Prefix-match converters: "int(N)" / "float(N)".
+    # Format: "int(16384)" → int conversion, default 16384 on failure.
     if conv.startswith("int("):
         return _safe_int(value, int(conv[4:-1]))
     if conv.startswith("float("):
@@ -644,6 +741,8 @@ def _convert_list(value) -> list:
     return list(value)
 
 
+# Dispatch table for exact-match converters — dict lookup is O(1) and
+# extensible (add a new converter string + lambda without touching _convert logic).
 _CONVERTERS: dict[str, Callable[..., Any]] = {
     "str": lambda v: v,
     "bool": _convert_bool,
@@ -812,6 +911,12 @@ def _validate_config_safety(proj_data: dict, proj_path: Path) -> None:
     Committed config (.fw-context/config.toml) is shared via git.  Dangerous
     settings should only be in local.toml (gitignored).
 
+    **Why separate validation?**  The deep merge in ``load()`` would silently
+    execute a malicious ``pre_build`` from a committed config.  Separate
+    validation (checking the committed layer BEFORE merge with local)
+    catches this.  A local.toml override for ``pre_build`` is fine — it's
+    per-developer and not shared.
+
     .. versionadded:: v0.18
     """
     build = proj_data.get("build") or {}
@@ -857,6 +962,10 @@ def _is_loopback_url(url: str) -> bool:
 # Module-level config cache with mtime-based invalidation.
 # load_config() is called 20+ times per MCP session; caching avoids redundant
 # TOML parsing when config files haven't changed.
+#
+# Why mtime instead of inotify?  Simplicity — the MCP server is short-lived
+# (one session), config files change rarely, and mtime comparison costs ~0.
+# An inotify watcher would need threads and cleanup logic for no real benefit.
 _config_cache: OrderedDict[tuple, tuple[float, Config]] = OrderedDict()
 _CONFIG_CACHE_MAX = 50
 
@@ -870,6 +979,17 @@ def load(project_root: Path | None = None) -> Config:
 
     Results are cached per (global_path, proj_path, local_path) tuple and
     invalidated when any source file's mtime changes.
+
+    **Why deep merge?**  Shallow merge loses nested keys —
+    ``config.toml`` sets ``[llm] embed_model = "foo"``, ``local.toml`` sets
+    ``[llm] num_ctx = 8192`` — shallow merge would overwrite the entire
+    ``[llm]`` dict, discarding ``embed_model``.  Deep merge preserves both.
+
+    **Why graceful degradation?**  The MCP server is a plumbing tool — if
+    it fails to start because of a typo in ``local.toml``, the developer
+    loses all fw-context tools in their AI assistant.  A more frustrating
+    failure mode: the bug is in the tool they'd use to debug the config.
+    Log loudly, continue with defaults.
     """
     data: dict = {}
 
@@ -877,7 +997,10 @@ def load(project_root: Path | None = None) -> Config:
     proj_path = _ensure_project_config(project_root) if project_root is not None else None
     local_path = _ensure_project_local_config(project_root) if project_root is not None else None
 
-    # Check mtime-based cache
+    # Check mtime-based cache — if no config file has changed since last
+    # load, return the cached Config object directly.  TOML parsing and
+    # dataclass construction are cheap (sub-ms), but resolve_embed_model
+    # runs subprocess checks (ollama list, nvidia-smi) that cost ~200 ms.
     cache_key = (global_path, proj_path, local_path)
     if cache_key in _config_cache:
         cached_ts, cached_cfg = _config_cache[cache_key]
@@ -889,6 +1012,8 @@ def load(project_root: Path | None = None) -> Config:
         except OSError:
             pass  # File missing → reload
 
+    # Phase 1: load global config (always present — _ensure_global_config
+    # creates it from template if missing).
     try:
         data = tomllib.loads(global_path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
@@ -896,6 +1021,10 @@ def load(project_root: Path | None = None) -> Config:
 
     if project_root is not None:
         assert proj_path is not None
+
+        # Phase 2: deep-merge project config (shared via git).
+        # Uses _deep_merge so nested sections accumulate — [index] keys
+        # from global and project config coexist.
         try:
             proj_data = tomllib.loads(proj_path.read_text(encoding="utf-8"))
             data = _deep_merge(data, proj_data)
@@ -907,6 +1036,9 @@ def load(project_root: Path | None = None) -> Config:
             log.exception("Failed to parse %s — ignoring project config", proj_path)
 
         assert local_path is not None
+
+        # Phase 3: deep-merge local config (gitignored, per-developer).
+        # This is the last merge — local.toml values have highest precedence.
         try:
             local_data = tomllib.loads(local_path.read_text(encoding="utf-8"))
             data = _deep_merge(data, local_data)
@@ -1030,6 +1162,12 @@ def _update_local_toml(project_root: Path, updates: dict[str, object]) -> None:
     Only writes to ``local.toml`` (gitignored, per-developer) — never
     touches the global config or the shared project ``config.toml``.
 
+    **Why line-level editing instead of TOML round-trip?**  ``tomllib``
+    can parse but Python has no standard TOML writer in the stdlib.
+    Third-party writers (``toml``, ``tomli-w``, ``tomlkit``) lose comments
+    and formatting.  Line-level editing with regex preserves everything
+    — existing comments, blank lines, key ordering, trailing commas.
+
     Args:
         project_root: Project root directory.
         updates: Dict of ``{key: value}`` pairs to write.  ``None`` values
@@ -1042,7 +1180,8 @@ def _update_local_toml(project_root: Path, updates: dict[str, object]) -> None:
 
     lines = local_path.read_text(encoding="utf-8").splitlines(keepends=True)
 
-    # Find [llm] section boundaries
+    # Find [llm] section boundaries — we need to insert/replace keys
+    # within this section while leaving other sections untouched.
     in_llm = False
     llm_start = -1
     llm_end = len(lines)
@@ -1051,10 +1190,10 @@ def _update_local_toml(project_root: Path, updates: dict[str, object]) -> None:
         stripped = line.strip()
         if stripped == "[llm]":
             in_llm = True
-            llm_start = i + 1
+            llm_start = i + 1  # First line after [llm] header
             continue
         if in_llm and stripped.startswith("[") and stripped != "[llm]":
-            llm_end = i
+            llm_end = i  # Next section starts — stop here
             break
 
     # Filter out None values
@@ -1070,7 +1209,9 @@ def _update_local_toml(project_root: Path, updates: dict[str, object]) -> None:
         llm_start = len(lines)
         llm_end = len(lines)
 
-    # For each key: find and replace existing line, or insert before llm_end
+    # For each key: find and replace existing line, or insert before llm_end.
+    # Regex matches both active and commented-out keys (``# key = value``)
+    # so the user can uncomment a template default by running configure_llm.
     for key, value in to_write.items():
         found = False
         for i in range(llm_start, llm_end):

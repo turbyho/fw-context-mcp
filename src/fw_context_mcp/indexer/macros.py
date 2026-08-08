@@ -60,6 +60,13 @@ def resolve_macros_via_preprocessor(
 ) -> dict[str, str]:
     """Run ``clang -dM -E`` and return {name: expanded_value}.
 
+    WHY ``clang -dM -E`` instead of parsing macros from the AST: libclang's
+    AST only exposes macro names and raw values from ``#define`` directives.
+    Fully expanded values require preprocessing — ``clang -dM -E`` uses the
+    compiler's built-in preprocessor, correctly expanding chains like
+    ``#define A B`` + ``#define B 42`` to ``A=42``.  No need to build and
+    maintain a macro dependency graph ourselves.
+
     Uses the same compiler flags as the translation unit so that
     ``-D`` defines and ``-I`` include paths are honoured.
 
@@ -141,13 +148,18 @@ def resolve_macros_via_preprocessor(
 def _sanitize_flags(cmd: list[str]) -> list[str]:
     """Remove flags that interfere with ``-dM -E`` preprocessor-only mode.
 
-    ``-dM -E`` only needs ``-I``, ``-D``, ``-U``, ``-include``, ``-std=``,
-    ``-fmacro-prefix-map=``, and similar preprocessor-level flags.
-    Strips object-file flags (``-o``, ``-c``), warning flags (``-W...``),
-    and optimization/debug flags that have no effect on preprocessing.
+    WHY sanitize: compile_commands.json contains the full compiler command
+    line including object-file flags (``-o``, ``-c``), warning flags (``-W...``),
+    optimization (``-O2``), and debug (``-g``).  These are irrelevant for
+    preprocessing and some (like ``-c``) conflict with ``-E``.  Keeping them
+    would cause clang errors or unnecessary output.
 
     Also strips dangerous flags that should never reach the compiler
-    from compile_commands.json (supply-chain defense-in-depth).
+    from compile_commands.json (supply-chain defense-in-depth):
+    ``-Xclang``, ``-plugin``, ``-cc1``, ``-emit-llvm``, ``-emit-ast``.
+
+    ``-dM -E`` only needs ``-I``, ``-D``, ``-U``, ``-include``, ``-std=``,
+    ``-fmacro-prefix-map=``, and similar preprocessor-level flags.
     """
     _DANGEROUS = frozenset({
         "-Xclang", "-plugin", "-cc1", "-emit-llvm", "-emit-ast",

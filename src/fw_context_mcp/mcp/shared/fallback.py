@@ -1,4 +1,14 @@
-"""Fallback search — lexical FTS5 when Ollama/embeddings are unavailable."""
+"""Fallback search — lexical FTS5 when Ollama/embeddings are unavailable.
+
+WHY this module exists: semantic and smart search depend on an LLM
+backend (Ollama or cloud API) for embedding generation and query
+translation.  When that backend is offline — common on air-gapped
+build machines or before first-time setup — the search tools must
+degrade gracefully to pure lexical FTS5 instead of returning an error.
+An error would make the MCP server appear broken, so the assistant
+would stop using fw-context entirely.  A fallback with a clear warning
+lets the assistant continue working with lexical precision only.
+"""
 
 from __future__ import annotations
 

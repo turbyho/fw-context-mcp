@@ -1,4 +1,58 @@
-"""Symbol and macro storage / search routines for fw-context-mcp index."""
+"""Symbol and macro storage / search routines for fw-context-mcp index.
+
+Lookup strategy — three-tier resolution
+───────────────────────────────────────
+Every symbol/macro lookup follows a three-tier path designed to maximise
+precision while tolerating the caller not knowing the exact qualified name:
+
+  1. **Exact name match** — searches for the literal name the caller
+     provides.  Fastest path; used when a tool already resolved the
+     symbol name (e.g. from a hover event or a previous search result).
+  2. **Exact qualified-name match** — when an unqualified name matches
+     multiple symbols (e.g. ``send`` in both ``UART::send`` and
+     ``SPI::send``), callers append ``ClassName::``.  This tier returns
+     the single definitive match.
+  3. **Prefix LIKE match** — when callers provide a partial name
+     (``uart_`` finds ``uart_init``, ``uart_send``, ``uart_config``).
+     Uses LIKE with ESCAPE so ``_`` and ``%`` in symbol names do not
+     cause false matches.
+
+Query building patterns
+────────────────────────
+**FTS5 for symbols** — ``search_symbols`` delegates to the
+``symbols_fts`` virtual table.  Bare search terms are expanded to
+trailing-wildcard prefix queries (``modem`` → ``modem*``) so a
+single token matches ``modem_init``, ``modem_parser_oob_init``, etc.
+Tokens are OR-joined to broaden recall.
+
+**FTS5 for file content** — ``find_macro_refs`` delegates to
+``files_fts``, searching ifdef-filtered file text.  The same
+``_expand_query`` helper applies wildcard expansion so the caller
+gets prefix matches by default.
+
+**BM25 ranking** — per-column weights are tuned empirically for
+embedded C/C++ codebases.  The signature column carries the highest
+weight (10.0) because parameter types are a strong relevance signal.
+Input parameter analysis from LLMs (weight 5.0) provides structured
+data.  Qualified names are de-weighted (0.75) to prevent double-
+counting tokens already present in the unqualified name.
+
+**Sanitization** — ``_sanitize_fts5_syntax`` repairs queries that
+contain characters illegal in FTS5 (``#define``, backslashes from
+copy-pasted string literals).  Rather than rejecting them, the layer
+strips backslashes and quote-marks, then double-quotes tokens that
+still contain unsafe characters so they match as phrase terms.
+
+Token decomposition
+───────────────────
+``split_tokens`` decomposes camelCase/snake_case/C++ qualified names
+into lowercase tokens stored in the ``symbols.name_tokens`` column
+and the ``symbols_fts`` FTS5 index.  This is the mechanism that lets
+``connect*`` match ``onConnectionComplete`` and ``modem*`` match
+``ModemMsgManager``.  Anonymous struct/enum/union markers and single-
+character noise tokens are stripped because they match thousands of
+irrelevant symbols.
+"""
 
 from __future__ import annotations
 
@@ -132,6 +186,27 @@ def insert_symbols_batch(
                parent_usr, is_template, template_usr, is_project, pagerank, source)
 
     Returns count of rows inserted or upgraded to definition.
+
+    Conflict resolution strategy
+    ─────────────────────────────
+    Libclang emits a USR per symbol per translation unit.  When a header
+    declares ``int foo(int)`` and a .cpp file defines it, the indexer sees
+    both as separate rows with the same USR.  The declaration row has
+    ``is_definition=0``; the definition row has ``is_definition=1``.
+
+    ``ON CONFLICT(config_hash, usr) DO UPDATE`` merges duplicates on the
+    same USR.  The ``WHERE excluded.is_definition = 1 AND
+    symbols.is_definition = 0`` guard ensures:
+
+      • A **declaration** arriving before a definition is silently
+        overwritten when the definition row arrives later.
+      • A **definition** arriving first stays untouched — the declaration
+        row cannot downgrade it.
+      • Two declarations for the same USR (e.g. from two headers) keep
+        whichever arrived first.
+
+    Without this guard, a declaration row arriving AFTER a definition
+    would overwrite ``is_definition`` back to 0 — breaking the call graph.
     """
 
     cur = conn.executemany(
@@ -174,6 +249,14 @@ def insert_macros_batch(
     Each row: (config_hash, file_id, name, value, expanded_value, line, is_function_like)
 
     Returns count of rows inserted or updated.
+
+    The ``expanded_value`` merge uses ``CASE WHEN`` to preserve existing
+    data: when a re-index overwrites the same file/line with a non-empty
+    expanded_value, the new value replaces the old one.  When the incoming
+    row has an empty expanded_value (e.g. the preprocessor could not
+    resolve the macro), the existing value is kept.  Without this guard,
+    a re-index of an unchanged file would lose resolved values obtained
+    during the first pass.
     """
     cur = conn.executemany(
         """INSERT INTO macros
@@ -207,6 +290,13 @@ def lookup_macro(
     the file path.  Same three-tier name resolution as ``lookup_symbol``
     for symbols (exact name, exact name with definition preference,
     prefix LIKE).
+
+    The ``ESCAPE '\\'`` clause is required because macro names can legally
+    contain underscores (common in embedded code — ``SYSTICK_HANDLER``,
+    ``STM32F4XX_HAL_CONF_H``).  Without ESCAPE, ``_`` in LIKE is the
+    single-character wildcard and would match any character at that
+    position.  The three-step escaping (``\\\\``, ``\\%``, ``\\\\_``) makes
+    ``_`` and ``%`` match literally.
     """
     limit = min(limit, 100)
     if exact:
@@ -242,6 +332,12 @@ def find_macro_refs(
 
     Searches ifdef-filtered file content for occurrences of *name*.
     Returns file-level matches with highlighted snippets.
+
+    The ``files_fts`` existence check is not purely defensive — legacy
+    indexes built before the files_fts table was introduced lack it
+    entirely.  Rather than raising, the function returns an empty list so
+    the caller can fall back to raw LIKE search or report an empty result
+    set gracefully.
     """
     limit = min(limit, 100)
     table_row = conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='files_fts'").fetchone()
@@ -330,6 +426,11 @@ def _expand_query(query: str, *, for_body_search: bool = False) -> str:
     if any(c in query for c in _bare_syntax) or _has_col_filter:
         return query
 
+    # C++ :: must be replaced with a space BEFORE splitting — otherwise
+    # "a::b_c::d" would become ["a::b_c::d"] (one token) instead of
+    # ["a","b","c","d"].  FTS5's unicode61 tokenizer already splits on
+    # spaces and non-alphanumeric chars; replacing :: with space lets
+    # each namespace/class-component become an independent search term.
     parts = query.replace("::", " ").split()
     expanded = []
     for p in parts:
@@ -372,6 +473,10 @@ def search_symbols(
     if kind:
         kind_filter = "AND s.kind = ?"
     elif exclude_variables:
+        # Covers both 'variable' (legacy unsplit kind) and 'varlocal'
+        # (post-split kind for locals).  'varglobal' is deliberately NOT
+        # excluded — global variables carry higher architectural weight
+        # and their names are often meaningful search targets.
         kind_filter = "AND s.kind NOT IN ('variable', 'varlocal')"
     else:
         kind_filter = ""
@@ -385,6 +490,12 @@ def search_symbols(
     params.append(limit)
     # Build bm25 weights — cache column count per connection to avoid
     # querying PRAGMA table_info on every search_symbols call.
+    #
+    # The cache is keyed on connection id (not the connection object)
+    # because two calls sharing the same connection always see the same
+    # schema.  When the schema changes (reindex), the old connection is
+    # closed and a new one opens — the cache entry for the old id is
+    # never reused for the new connection.
     conn_id = id(conn)
     col_count = _bm25_col_count_cache.get(conn_id)
     if col_count is None:

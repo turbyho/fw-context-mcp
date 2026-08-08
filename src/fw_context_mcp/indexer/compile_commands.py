@@ -1,4 +1,12 @@
-"""Parse and normalize compile_commands.json for libclang consumption."""
+"""Parse and normalize compile_commands.json for libclang consumption.
+
+WHY: compile_commands.json emitted by build tools contains GCC-specific flags
+that libclang (clang's C API) does not understand.  Passing them directly
+causes ``TranslationUnitLoadError`` or silent incorrect parsing.  This module
+strips unsupported flags, resolves relative include paths, detects target
+triples from compiler names, and injects GCC cross-compiler system include
+paths so libclang can find ``stdint.h`` and friends.
+"""
 
 from __future__ import annotations
 
@@ -111,6 +119,11 @@ def _detect_target_triple(
     compiler: Path | None, args: list[str]
 ) -> str | None:
     """Detect the GNU target triple for the cross-compiler.
+
+    WHY: libclang needs ``--target=<triple>`` to correctly interpret
+    architecture-specific flags like ``-mcpu=cortex-m4`` and ``-mfpu=fpv4-sp-d16``.
+    Without it, libclang uses the host triple (e.g. ``x86_64-linux-gnu``)
+    and rejects ARM/RISC-V flags as unknown, emitting hard errors.
 
     1. Extract from compiler name: ``<triple>-gcc`` → ``<triple>``
        (e.g. ``arm-none-eabi-g++`` → ``arm-none-eabi``,
@@ -228,6 +241,15 @@ def normalize_args(
 ) -> list[str]:
     """Expand response files and strip GCC-specific flags incompatible with libclang.
 
+    WHY: libclang rejects flags that clang does not support (``-flto``,
+    ``-fno-common``, ``-specs=``, ``-Wno-stringop-truncation``, etc.).
+    Passing them causes ``TranslationUnitLoadError``.  This function removes
+    them before the argument list reaches libclang.
+
+    Also resolves relative ``-I`` paths to absolute because libclang uses
+    the process CWD, not the compile_commands.json directory — ``-I.``
+    would resolve to the wrong location otherwise.
+
     If source_file is given, any token matching that filename (by basename)
     is dropped — handles build systems where the source file is not the last arg.
     """
@@ -313,6 +335,12 @@ def normalize_args(
 def validate_include_files(clang_args: list[str]) -> None:
     """Check that all -include and -imacros referenced files exist.
 
+    WHY: build-systems generate configuration headers during the build
+    (e.g. ``mbed_config.h`` in ``BUILD/``).  If the build was cleaned
+    but compile_commands.json was preserved, these files are missing.
+    libclang would fail for every TU that includes the SDK, producing a
+    partial index and wasting seconds per TU on doomed parse attempts.
+
     *clang_args* should already be normalized by ``normalize_args()`` (paths
     resolved to absolute).  Raises ``RuntimeError`` listing every missing file
     so the user can fix them all at once rather than one at a time.
@@ -354,6 +382,13 @@ def _safe_iterdir(path: Path) -> list[Path]:
 
 def _gcc_system_includes(compiler: Path, triple: str) -> list[str]:
     """Return -isystem flags for a GCC cross-compiler's built-in headers.
+
+    WHY: when ``--target=arm-none-eabi`` is injected, libclang switches to
+    that target's header search path.  But the GCC toolchain's built-in
+    headers (``stdint.h``, ``stddef.h``, newlib, libstdc++) are not in
+    clang's internal resource directory.  Without these ``-isystem`` flags,
+    libclang fails to find fundamental headers — every ``#include <stdint.h>``
+    becomes a fatal error and the entire TU parse fails.
 
     *triple* is the GNU target triple (e.g. ``arm-none-eabi``) detected
     by :func:`_detect_target_triple`.  Only include directories matching
@@ -397,7 +432,13 @@ def _gcc_system_includes(compiler: Path, triple: str) -> list[str]:
 
 
 def parse(path: Path) -> Iterator[CompilationUnit]:
-    """Yield one CompilationUnit per entry in compile_commands.json."""
+    """Yield one CompilationUnit per entry in compile_commands.json.
+
+    WHY iterator: compile_commands.json for large firmware projects (mbed-os,
+    Zephyr) contains thousands of entries.  Yielding one at a time avoids
+    loading the entire structure into memory at once — only the current
+    TU is materialized.
+    """
     entries = json.loads(path.read_text(encoding="utf-8-sig"))
     for entry in entries:
         file = Path(entry["file"])

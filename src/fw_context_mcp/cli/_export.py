@@ -1,4 +1,14 @@
-"""``fw-context export``, ``analyze``, ``version`` — data export and analysis."""
+"""``fw-context export``, ``analyze``, ``version`` — data export and analysis.
+
+Export: serializes the symbol index as portable JSON (format version
+``fw-context-export/1``) — enables data exchange, backup, and offline
+analysis.  Analyzes: re-runs LLM symbol analysis on an existing index
+without recompiling.  Version: prints the installed package version.
+
+WHY export format versioning: downstream consumers (scripts, visualizers,
+other tools) need a stable contract.  The ``_format`` field enables
+forward-compatible parsing.
+"""
 
 from __future__ import annotations
 
@@ -13,9 +23,14 @@ from . import VerboseFormatter
 def cmd_export(args: argparse.Namespace) -> int:
     """Export the symbol index as portable JSON (``_format: "fw-context-export/1"``).
 
-    Writes all symbols and optionally cross-references to a JSON file
-    or stdout. The format includes project metadata, all symbol records,
+    Writes all symbols and optionally cross-references to a JSON file or
+    stdout.  The format includes project metadata, all symbol records,
     and reference counts.
+
+    WHY JSON (not SQLite dump): the index database uses SQLite-specific
+    features (FTS5, vec0).  A JSON export is portable across machines,
+    database versions, and consumers.  The format is documented and
+    versioned so downstream tools can rely on it.
     """
     import json
 
@@ -105,9 +120,17 @@ def cmd_analyze(args: argparse.Namespace) -> int:
     """Re-run LLM symbol analysis on an existing index (idempotent).
 
     Requires Ollama (or LM Studio) running and ``[llm] enabled = true``
-    in config. Re-generates per-symbol summaries, inputs/outputs analysis
-    and method override relationships. Existing analysis rows are skipped
-    (idempotent) — only unanalyzed symbols are processed.
+    in config.  Re-generates per-symbol summaries, inputs/outputs analysis,
+    and method override relationships.
+
+    WHY idempotent: analysis is keyed by content hash — re-running on an
+    already-analyzed index skips all cached symbols.  This means users can
+    safely call ``fw-context analyze`` after editing a few files without
+    re-analyzing unchanged symbols.
+
+    WHY suppress httpx INFO logs: each HTTP request to Ollama produces an
+    INFO-level log line; during analysis of thousands of symbols this
+    floods the output.  WARNING level still shows errors.
     """
     from ..config import derive_project_id
     from ..config import load as load_config

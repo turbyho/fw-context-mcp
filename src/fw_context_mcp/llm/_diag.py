@@ -1,4 +1,20 @@
-"""Ollama setup diagnostics."""
+"""Ollama setup diagnostics.
+
+Called by the ``get_active_build`` → ``check_ollama`` tool path and
+as a standalone entry point (``fw-context diag llm``).  Returns a
+structured status report for both chat and embedding models.
+
+WHY separate from ``ollama.check_setup``: This module performs a
+simpler, faster check — it only queries ``/api/tags`` and checks
+model names.  ``ollama.check_setup`` also probes the chat API
+endpoint (external) and produces a richer result with compliance
+warnings.  This module is used for quick CLI diagnostics; the main
+check in ollama.py is used by the MCP tool handler.
+
+The two ``check_setup`` functions have different signatures and
+return different result shapes by design — they serve different
+consumers (CLI diag vs MCP tool).
+"""
 
 from __future__ import annotations
 
@@ -38,7 +54,10 @@ def check_setup(cfg: LLMConfig) -> dict:
     installed = [m["name"] for m in models]
     model_found = any(_model_name_matches(m, cfg.model) for m in installed)
 
-    # Check embedding model too — semantic_search will fail at query time if it's missing
+    # Embedding model availability is checked here (not deferred to ollama.py)
+    # so the CLI diag gives a complete picture in one call.  semantic_search
+    # will fail at query time if the embedding model is missing — the operator
+    # should know this before they try to use it.
     embed_found = any(_model_name_matches(m, cfg.embed_model) for m in installed)
 
     result: dict = {

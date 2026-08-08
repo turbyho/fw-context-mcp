@@ -29,6 +29,13 @@ class IARBuildSystem:
 
     Does NOT build the project — only parses the ``.ewp`` file.
     Requires ``keil2clangd`` (``pip install keil2clangd``).
+
+    WHY keil2clangd (not bear + iarbuild): IAR's command-line build tools
+    (iarbuild.exe) are Windows-only and don't integrate with bear's
+    LD_PRELOAD interception.  keil2clangd parses the .ewp XML project file
+    to extract compiler flags, include paths, and defines without running
+    the compiler — it works cross-platform and doesn't require the IAR
+    toolchain to be installed.
     """
 
     name: str = "IAR EWARM"

@@ -1,4 +1,11 @@
-"""SDK/vendor path detection — low-level helpers used by both indexer and MCP layers."""
+"""SDK/vendor path detection — low-level helpers used by both indexer and MCP layers.
+
+WHY shared between indexer and MCP: the ``is_project`` column is computed
+during indexing but MUST produce the same result when the MCP layer later
+queries it for filtering.  Using the same detection logic in both layers
+ensures consistency — a symbol classified as vendor during indexing will
+also be treated as vendor by the MCP query filters.
+"""
 
 from __future__ import annotations
 
@@ -8,9 +15,13 @@ from pathlib import Path
 def _path_matches(file_path: str, pattern: str) -> bool:
     """Check if *file_path* matches a SQL LIKE pattern (supports % wildcard).
 
+    WHY LIKE patterns not glob: vendor paths can appear at any depth.
+    ``mbed-os/%`` must match ``mbed-os/targets/TARGET_NORDIC/foo.cpp``,
+    which glob ``*`` cannot do (it doesn't cross directory boundaries).
+    SQL LIKE ``%`` matches any sequence including ``/``.
+
     ``%`` matches any sequence of characters **including ``/``** (unlike
-    fnmatch ``*``).  Uses regex for correct matching of nested directories:
-    ``mbed-os/%`` matches ``mbed-os/targets/TARGET_NORDIC/foo.cpp``.
+    fnmatch ``*``).  Uses regex for correct matching of nested directories.
 
     For absolute paths (``project_paths`` outside project root) the first
     branch is used — the second branch (prefix match ``*/pattern`` against
@@ -65,6 +76,11 @@ def _normalize_patterns(patterns: list[str]) -> list[str]:
 
 def _build_sdk_excludes(root: Path) -> list[str]:
     """Build default SDK exclude patterns from build system type.
+
+    WHY auto-detect from build system: each build system has known vendor
+    directories — ``mbed-os/`` for Mbed OS, ``.pio/`` for PlatformIO,
+    ``zephyr/`` for Zephyr.  Auto-detection removes the need for users to
+    manually configure vendor paths in 95% of projects.
 
     Returns LIKE patterns (with ``%`` wildcard) for vendor/SDK directories.
     Only true vendor/SDK source code — NOT build output (build/ is not SDK).

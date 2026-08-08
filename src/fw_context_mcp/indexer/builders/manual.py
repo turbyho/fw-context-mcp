@@ -73,6 +73,16 @@ class ManualBuildSystem:
 
     Never auto-detected — the user must explicitly set
     ``[build] system = "bare"`` in their config.
+
+    WHY manual mode: some projects have no standard build system (e.g., a
+    handful of .c files with a handwritten Makefile that doesn't support
+    ``compiledb``).  Manual mode lets these projects still benefit from
+    fw-context indexing by specifying source directories, include paths,
+    and defines directly in config.toml.
+
+    Generates compile_commands.json by syntax-checking each source file
+    with ``-MD -MF -fsyntax-only`` — produces .d dependency files for
+    header-change tracking without compiling to object files.
     """
 
     name: str = "Manual (bare)"

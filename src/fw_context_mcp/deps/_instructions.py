@@ -1,4 +1,21 @@
-"""Platform-specific dependency fix instructions."""
+"""Platform-specific dependency fix instructions.
+
+Each check in ``_checks.py`` produces a ``DepCheckResult`` with an
+``instructions`` string.  These strings come from the functions in this
+module.  Keeping instructions separate from checks enables:
+
+* **Testing** — instructions can be verified without running the checks.
+* **Rendering** — the MCP ``check_ollama`` tool renders instructions
+  directly from this module.
+* **Localization** — platform-specific text is in one place.
+
+WHY: A missing dependency on Ubuntu needs ``apt install`` instructions;
+on macOS it needs ``brew install``; on Windows it needs a download URL.
+Hardcoding all three in every check function would be unmaintainable.
+This module centralizes platform branching so each check can call
+``get_platform_info()`` once and pass the context dict to the relevant
+instruction function.
+"""
 
 from __future__ import annotations
 
@@ -7,7 +24,17 @@ import sys
 
 
 def get_platform_info() -> dict:
-    """Return platform metadata for branching fix instructions."""
+    """Return platform metadata for branching fix instructions.
+
+    Detects: OS (sys.platform), architecture (platform.machine()),
+    Python version, whether pyenv manages the Python installation,
+    the system package manager (apt/dnf/pacman/brew), and the preferred
+    pip installer command.
+
+    WHY: Every instruction function needs this context.  Computing it
+    once at the start of an audit avoids repeating platform detection
+    logic across 10+ instruction functions.
+    """
     system = sys.platform
     machine = platform.machine()
     python_ver = f"{sys.version_info.major}.{sys.version_info.minor}"
@@ -164,7 +191,18 @@ def _vec_check_cmd(ctx: dict) -> str:
 
 
 def vec0_load_error_instructions(error_msg: str, ctx: dict) -> str:
-    """Diagnose sqlite-vec load failures (missing .so dependencies)."""
+    """Diagnose sqlite-vec load failures (missing .so dependencies).
+
+    Two error categories:
+    1. "cannot open shared object file" — a system library is missing
+       (e.g. libgcc_s.so.1 on Alpine).  The fix depends on the distro.
+    2. "undefined symbol" — SQLite version is incompatible.  Usually
+       fixed by upgrading sqlite-vec and pysqlite3 together.
+
+    WHY: The raw error message (e.g. ``"libgcc_s.so.1: cannot open
+    shared object file"``) means nothing to most users.  This function
+    translates it into actionable platform-specific commands.
+    """
     if "cannot open shared object file" in error_msg:
         return (
             f"sqlite-vec native extension failed to load: {error_msg}\n"

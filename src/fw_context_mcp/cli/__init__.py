@@ -1,4 +1,21 @@
-"""fw-context CLI — index and query firmware code intelligence."""
+"""CLI entry point for the ``fw-context`` tool.
+
+This module owns the top-level ``fw-context`` command dispatched to users.
+It is responsible for:
+
+* Parsing CLI arguments via ``argparse`` subcommands.
+* Running fast pre-flight dependency checks on every invocation
+  (except ``doctor`` / ``--version`` / ``--help``) so broken installs
+  fail immediately with actionable error messages.
+* Formatting verbose output with phase headers when the user passes
+  ``--verbose``.
+* Mapping subcommand names to their implementation modules (each in a
+  private ``_*.py`` file under this package).
+
+Subcommands are implemented in separate modules to keep argument
+registration concise and to avoid importing heavy dependencies
+(libclang, httpx) until the user actually runs the command.
+"""
 
 # ruff: noqa: I001 — lazy imports in functions must stay near use sites
 
@@ -22,25 +39,45 @@ class VerboseFormatter(logging.Formatter):
     and rendered as framed separators.  Body messages are indented.  Phase
     results (single-line summaries) use ``extra={"result": True}`` to align
     timing info right after the phase header on the same line.
+
+    WHY: Indexing can take minutes and goes through many phases (compile,
+    parse, extract refs, embeddings, LLM analysis).  A flat stream of log
+    lines makes it impossible to tell which phase is currently running or
+    how long each took.  This formatter groups output by phase so the user
+    can see progress at a glance and identify slow phases.
     """
 
     WIDTH: int = 60
 
     def format(self, record: logging.LogRecord) -> str:
+        """Render a log record with phase-aware formatting.
+
+        Three render modes:
+        * ``extra={"phase": "name"}`` — framed phase header, delimits a new phase.
+        * ``extra={"result": True}`` — same-line summary after the phase header,
+          typically contains timing information.
+        * default — indented body line within the current phase.
+
+        WHY: A single formatter class replaces having to sprinkle print()
+        calls throughout the indexing pipeline.  All code logs normally;
+        the formatter decides the visual structure.
+        """
         msg = record.getMessage()
 
-        # Phase header
+        # Phase header — printed once when a new phase begins.
+        # The caller emits this via log.info("", extra={"phase": "extracting refs"})
         phase = getattr(record, "phase", None)
         if phase:
             header = f"── {phase} "
             padding = max(2, self.WIDTH - len(header))
             return "\n" + header + ("─" * padding)
 
-        # Phase result (same-line summary)
+        # Phase result — printed on the same visual line as the header.
+        # Used to show elapsed time without breaking the grouping.
         if getattr(record, "result", False):
             return f"  {msg}"
 
-        # Regular message within a phase
+        # Regular message within a phase — indented to show subordination.
         return f"  {msg}"
 
 
@@ -48,12 +85,22 @@ def main() -> None:
     """Entry point for the ``fw-context`` CLI — dispatches subcommands.
 
     Subcommands: index, search, list, status, init, export, cache, db,
-    watch, finetune, analyze, doctor, version. Parses arguments via argparse and calls the
-    corresponding ``cmd_*`` handler.
+    watch, finetune, analyze, doctor, version.  Parses arguments via
+    argparse and calls the corresponding ``cmd_*`` handler.
+
+    WHY: All CLI subcommands share common setup (pre-flight checks,
+    logging, error formatting).  Centralizing that here avoids
+    duplicating it in every ``cmd_*`` function and ensures consistent
+    behaviour regardless of which subcommand is invoked.
     """
     # ── Fast pre-flight: critical dependency checks (<50ms) ──
     # Skipped for doctor (which reports these itself), --version, --help,
     # and bare invocation (help only).
+    # WHY: Fail-fast for broken installs.  Most CLI errors come from
+    # missing pysqlite3 or sqlite-vec.  Running a 50 ms check on every
+    # invocation catches those before the user wastes time waiting for a
+    # command that will inevitably crash.  The FW_CONTEXT_SKIP_PREFLIGHT
+    # env var provides an escape hatch for CI/test environments.
     _argv = sys.argv[1:] if len(sys.argv) > 1 else []
     if (
         os.environ.get("FW_CONTEXT_SKIP_PREFLIGHT") is None
@@ -76,6 +123,11 @@ def main() -> None:
                 if r.instructions:
                     print(f"  {r.instructions}", file=sys.stderr)
             sys.exit(1)
+
+    # ── Argument parser — top-level flags + subcommand dispatch ──
+    # Each subcommand is registered inline (not via entry_points)
+    # because argparse subparsers need lazy imports to avoid pulling in
+    # heavy modules (libclang, httpx) before the subcommand is selected.
     parser = argparse.ArgumentParser(prog="fw-context", description="Firmware code intelligence")
     parser.add_argument("-v", "--verbose", action="store_true")
     parser.add_argument(
@@ -308,6 +360,14 @@ def main() -> None:
     if not hasattr(args, "func"):
         parser.print_help()
         sys.exit(0)
+
+    # ── Execute subcommand — catch-and-classify exceptions ──
+    # All subcommands return an exit code (0 = ok, 1 = error).
+    # Unhandled exceptions are caught here so the CLI always produces
+    # a clean error message instead of a raw traceback.
+    # WHY: Users should never see a Python traceback for expected
+    # failures (missing project, bad config).  Only fatal exceptions
+    # (KeyboardInterrupt, MemoryError) propagate unhandled.
     try:
         sys.exit(args.func(args))
     except BaseException as exc:

@@ -69,7 +69,19 @@ def _resolve_mbed_extra_profiles(project_root: Path, extra: list[str]) -> list[s
 
 
 class MbedOSBuildSystem:
-    """Mbed OS 5/6 build system (``mbed compile`` via ``bear``)."""
+    """Mbed OS 5/6 build system (``mbed compile`` via ``bear``).
+
+    WHY bear: Mbed OS uses its own build tool (``mbed compile``) which
+    internally calls the ARM GCC toolchain but does not produce
+    compile_commands.json.  ``bear`` intercepts the compiler invocations
+    via LD_PRELOAD and captures them into compile_commands.json.
+
+    WHY target resolution from multiple sources: the target board can be
+    specified in .mbed (mbed config), custom_targets.json, or
+    .fw-context/config.toml.  Each source has a different precedence
+    because users configure their board in different ways depending on
+    their workflow.
+    """
 
     name: str = "Mbed OS"
     config_key: str = "mbed-os"

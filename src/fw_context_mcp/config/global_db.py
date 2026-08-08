@@ -7,6 +7,22 @@ all firmware projects.  It answers the question "what project is this UUID4?"
 The registry is populated:
 - At ``fw-context init`` (``project_type = "unknown"``)
 - At ``fw-context index`` (``project_type`` updated from build detection)
+
+WHY a separate global registry instead of embedding metadata in each
+project's index database: the MCP server needs to resolve project IDs
+to names before opening the project's own database.  For example,
+``list_projects`` must return the project name without opening every
+``index.db`` on the filesystem and running ``get_active_config`` on each.
+The registry is a fast lookup table — one SQLite file, one query per
+lookup.
+
+WHY the connection is cached at module level: the registry is read on
+EVERY MCP tool invocation (via ``derive_project_id``).  Opening and
+closing a SQLite connection per call would add 2-5 ms of filesystem
+overhead.  A long-lived connection with WAL mode supports concurrent
+readers (multiple MCP servers) and infrequent writers (init/index).
+The health check (``SELECT 1``) before reuse catches stale connections
+from process forks.
 """
 
 from __future__ import annotations

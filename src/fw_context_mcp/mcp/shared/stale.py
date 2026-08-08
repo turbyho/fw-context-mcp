@@ -1,4 +1,25 @@
-"""Stale detection and recovery — file mtime checks, auto-reindex, query staleness wrapping."""
+"""Stale detection and recovery — file mtime checks, auto-reindex, query staleness wrapping.
+
+WHY stale detection cannot be a simple "compare index timestamp to latest file
+mtime": compile_commands.json changes may require a full reindex even if no source
+file changed (new defines, changed include paths, different compiler).  Conversely,
+source files may change without modifying compile_commands.json.  Both triggers are
+independent and must be checked separately.
+
+WHY there are two staleness helpers (``_stale_files`` vs ``_count_modified_files``):
+- ``_stale_files`` operates on a small set of result files — it checks "are THESE
+  specific files stale?"  Used after every search/lookup to warn the assistant.
+- ``_count_modified_files`` scans ALL files in the database — it answers "how many
+  files are stale overall?"  Used by ``get_active_build`` for the dashboard count
+  and by the daemon's startup check.
+
+WHY mtime checks are cached: on NFS/CIFS mounts, each ``os.path.getmtime()`` may
+take 50-200 ms.  With 10K indexed files, a full scan would take seconds.  The
+``_modified_cache`` with 30-second TTL bounds this to one scan per evaluation
+interval.  The ``MAX(mtime)`` verification before serving cached values catches
+external modifications by the daemon's background reindex (which is a separate
+OS process and cannot call ``_invalidate_modified_cache``).
+"""
 
 from __future__ import annotations
 
@@ -358,7 +379,14 @@ def _with_stale_recovery(
     """
     from ..background import _ensure_daemon_running  # lazy — avoids circular import
 
-    # Fresh config_hash via a short-lived read-only connection.
+    # ── Read config_hash via a separate short-lived read-only connection ──
+    # WHY: config_hash must be read BEFORE entering the executor lock.
+    # The executor's single shared connection is a scarce resource —
+    # using it for a 2-line config lookup would block all concurrent
+    # search queries.  _quick_open_readonly opens a separate WAL reader
+    # that coexists with the executor's connection.
+    # Fresh config_hash per request: a reindex with a changed build
+    # config can never leave queries filtering by a stale hash.
     conn = _quick_open_readonly(db_path)
     try:
         project_id = derive_project_id(root)

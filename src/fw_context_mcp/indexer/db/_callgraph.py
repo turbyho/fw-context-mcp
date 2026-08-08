@@ -1,4 +1,65 @@
-"""Call-graph analysis — call path, recursive callers/callees, dead code, hotspots."""
+"""Call-graph analysis — call paths, recursive callers/callees, dead code, hotspots.
+
+This module performs graph-traversal queries on the ``refs`` table to answer:
+
+1. **Call paths** — "How does A reach B?" (bidirectional BFS).
+2. **Transitive callers** — "Who calls X, directly or indirectly?" (recursive CTE).
+3. **Transitive callees** — "What does X call, directly or indirectly?" (recursive CTE).
+4. **Dead code** — "Which functions are defined but never called?" (anti-join).
+5. **Hotspots** — "Which functions have the most callers?" (aggregation + cache).
+
+── Query strategy overview ──
+
+**BFS vs Recursive CTE for path finding**
+
+``find_call_path()`` uses Python BFS with in-memory caches instead of
+a SQL recursive CTE.  The refs table can contain 1M+ edges for a typical
+firmware project.  A recursive CTE over that many edges risks exponential
+expansion because SQLite cannot apply cycle detection to recursive joins.
+Python BFS with a visited set (``seen`` dict) guarantees O(V+E) traversal
+with explicit depth and node-expansion limits.
+
+The bidirectional variant was added when unidirectional BFS hit the
+depth limit on wide dispatch patterns.  Expanding forward from source
+AND reverse from target simultaneously halves the effective search depth
+(O(b^(d/2)) instead of O(b^d)), so large fan-out nodes like
+``dispatch_forever`` (with thousands of event handlers) no longer
+dominate the search.
+
+**Recursive CTE for transitive queries**
+
+``find_all_callers_recursive()`` and ``find_callees_recursive()`` use
+SQL recursive CTEs.  These are correct here because:
+- The search is one-sided (only outgoing edges OR only incoming edges).
+- The depth limit is small (default 5).
+- MIN(depth) GROUP BY deduplicates at each level, preventing exponential
+  re-expansion of nodes reached through multiple paths.
+
+**Weak-alias bridging**
+
+C/C++ weak aliases (``__attribute__((weak, alias("__func")))``) create
+symbols that appear as declarations in the index but whose bodies exist
+under a different USR (the ``__``-prefixed definition).  Without alias
+bridging, callers and callees of the alias declaration would appear empty.
+The ``_get_alias_pairs()`` function detects these pairs and ``_build_alias_temp_table()``
+injects synthetic edges into the query, so graph traversal passes through
+aliases transparently.
+
+**Global constructor bridging**
+
+File-scope C++ global objects call constructors before ``main()``.
+These constructor calls are recorded as ``ref_kind='implicit_construct'``
+with ``from_usr=NULL``.  A synthetic ``<global ctors>`` node is injected
+between ``main`` and all implicit constructors, making them reachable in
+any call-path query that can reach ``main``.
+
+── Edge types ──
+
+- ``call`` — direct function call (``foo()``).
+- ``indirect`` — function pointer assignment (``driver.onData = &handler``).
+- ``implicit_construct`` — global/static object constructor.
+- ``dispatch`` — synthetic edge through event loop / thread start.
+"""
 
 from __future__ import annotations
 
@@ -24,14 +85,23 @@ __all__ = [
 
 
 def _resolve_target_usr(conn: sqlite3.Connection, config_hash: str, name: str) -> str | None:
-    """Look up the USR of a symbol by name.
+    """Look up the USR of a symbol by name, preferring the most-referenced variant.
 
-    When multiple USRs exist for the same name (e.g. C++ inline functions
-    with ``#*1C.#`` ABI tags), pick the one with the most incoming
-    references — that is the variant actually called throughout the codebase.
+    When multiple USRs exist for the same name — e.g. C++ inline functions
+    with ``#*1C.#`` ABI tags in different TUs — the system must pick one.
+    Picking arbitrarily would produce inconsistent call-graph results:
+    some queries would traverse edges to one variant, others to another,
+    and paths would break.
 
-    Uses correlated subqueries (with LIMIT 1) instead of LEFT JOIN + GROUP BY
-    so that index lookups short-circuit without scanning the full refs table.
+    Strategy: pick the variant with the most incoming references (``to_usr``
+    count) and outgoing references (``from_usr`` count), preferring
+    ``is_definition = 1``.  This chooses the variant that is actually called
+    throughout the codebase, not an incidental declaration in a header.
+
+    Why correlated subqueries with LIMIT 1 over LEFT JOIN + GROUP BY:
+    SQLite's query planner short-circuits after the first matching row
+    in a correlated subquery, avoiding a full scan of the refs table.
+    A JOIN + GROUP BY would materialize all rows before aggregating.
     """
     esc_name = _escape_like(name)
     suffix_pattern = f"%::{esc_name}"
@@ -60,18 +130,37 @@ def _resolve_target_usr(conn: sqlite3.Connection, config_hash: str, name: str) -
 # Cache for _get_alias_pairs — module-level dict keyed by id(conn).
 # pysqlite3.dbapi2.Connection objects lack __dict__ for attribute
 # storage, so we cannot attach _alias_cache to the connection directly.
+# A module-level dict with connection ID keys works because:
+#  - Connection objects are created per request and live for seconds.
+#  - id(conn) is stable for the connection's lifetime.
+#  - The 16-entry eviction limit prevents unbounded growth from
+#    orphaned connections (Python GC does not notify us when a
+#    connection is garbage-collected).
 _alias_cache_global: dict[int, dict[str, list[tuple[str, str]]]] = {}
 
 
 def _get_alias_pairs(conn: sqlite3.Connection, config_hash: str) -> list[tuple[str, str]]:
-    """Return [(decl_usr, def_usr)] for weak-alias declarations → definitions.
+    """Find weak-alias declaration → definition pairs in the index.
 
-    Detects the ``__attribute__((weak, alias(\"__func\")))`` pattern by finding
-    declaration-only symbols that have a ``__``-prefixed sibling definition
-    with the same parameter signature.
+    Detects the ``__attribute__((weak, alias("__func")))`` pattern by
+    finding declaration-only symbols that have a ``__``-prefixed sibling
+    definition with the same parameter count.
 
-    Result is cached per-connection — alias pairs don't change during a
-    connection's lifetime.
+    Why parameter-count matching over exact signature comparison:
+    alias declarations often omit parameter names or use abbreviated
+    types in headers, while definitions have full signatures.  Parameter
+    count is a robust heuristic that avoids false negatives from
+    whitespace or qualifier differences.
+
+    Why cached per-connection: alias pairs are invariant during a
+    connection's lifetime — they are derived from the static symbol
+    table.  Recomputing them for every call-graph query would waste
+    2-4ms per query scanning the symbols table.
+
+    Why separate per-connection cache instead of a global cache keyed
+    by config_hash: different connections may access databases from
+    different points in time (e.g., after a reindex).  A global cache
+    would serve stale data.
     """
     per_conn_cache = _alias_cache_global.get(id(conn))
     if per_conn_cache is not None:
@@ -134,13 +223,18 @@ def _get_alias_pairs(conn: sqlite3.Connection, config_hash: str) -> list[tuple[s
 def _build_alias_temp_table(
     conn: sqlite3.Connection, alias_pairs: list[tuple[str, str]]
 ) -> tuple[str, list[str]]:
-    """Populate temp table with alias pairs, return CTE fragment.
+    """Populate a temporary table with alias pairs and return a CTE fragment.
 
-    Uses a temporary table instead of a VALUES clause to avoid hitting
-    ``SQLITE_LIMIT_COMPOUND_SELECT`` (default 500) when there are many
-    alias pairs.  Returns ``(cte_fragment, [])`` where *cte_fragment*
-    is ``"alias_pairs(decl_usr, def_usr) AS (SELECT * FROM _alias_pairs),"``
-    or ``""`` when *alias_pairs* is empty.
+    Why a temp table over a VALUES clause: SQLite's
+    ``SQLITE_LIMIT_COMPOUND_SELECT`` (default 500) caps the number of
+    rows in a VALUES clause.  Large firmware projects can have 1000+
+    weak-alias pairs (e.g., STM32 HAL with per-peripheral weak aliases).
+    A temp table has no such limit.
+
+    Returns ``(cte_fragment, [])`` where *cte_fragment* is a CTE
+    definition string, or ``""`` when *alias_pairs* is empty.
+    The empty-string case avoids injecting a CTE with zero rows,
+    which would still add parsing overhead to the SQL statement.
     """
     if not alias_pairs:
         return "", []
@@ -165,12 +259,29 @@ def find_call_path(
     max_depth: int = 10,
     max_nodes: int = 5000,
 ) -> list[dict]:
-    """Find call paths from *from_name* to *to_name* via BFS in the refs table.
+    """Find call paths from *from_name* to *to_name* via bidirectional BFS.
 
-    Uses Python BFS with cycle detection — avoids the exponential explosion
-    of a recursive CTE over 1M+ reference edges.  Returns the shortest path
-    (first found), with ``depth`` (number of edges) and ``chain``
-    (human-readable ``A → B → C`` string).
+    Uses Python BFS with cycle detection instead of a SQL recursive CTE.
+    The refs table can contain 1M+ edges — a recursive CTE over that many
+    rows risks exponential expansion and cannot be bounded by a node limit.
+
+    **Bidirectional BFS** expands forward from *from_name* AND reverse from
+    *to_name* simultaneously.  When the two search fronts meet, the path
+    is reconstructed.  This halves the effective search depth from O(b^d)
+    to O(b^(d/2)), making wide dispatch patterns tractable.
+
+    **Multi-USR source expansion**: *from_name* may resolve to multiple
+    USRs (e.g., a function declared in multiple TUs).  All variants are
+    used as forward BFS seeds — edges from ANY variant are valid.  This
+    avoids missing paths that pass through TU-specific USRs.
+
+    **Lazy edge caching** avoids loading the entire refs table into memory.
+    Edges for a USR are fetched on first access and cached per-call.
+    For a typical 5-depth BFS, this loads ~500-2000 edges instead of the
+    full 1M+ row refs table.
+
+    **max_nodes** prevents runaway queries on pathological call graphs
+    (e.g., a global dispatch loop with thousands of registered handlers).
 
     Args:
         conn: SQLite connection.
@@ -179,8 +290,10 @@ def find_call_path(
         to_name: Target symbol name or qualified name.
         max_depth: Maximum call path depth (default 10).
         max_nodes: Maximum total BFS node expansions (default 5000).
-            Prevents runaway queries on pathological call graphs
-            (e.g. global dispatch loops with thousands of handlers).
+
+    Returns:
+        Up to 5 paths, each with ``depth`` (edge count), ``chain``
+        (``A → B → C`` string), and ``target_usr``.
     """
     from_usr = _resolve_target_usr(conn, config_hash, from_name)
     to_usr = _resolve_target_usr(conn, config_hash, to_name)
@@ -207,7 +320,12 @@ def find_call_path(
     if not from_usr_set:
         return []
 
-    # ── Lazy edge / name caches (avoid loading all refs into memory) ──
+    # ── Lazy edge / name caches ──────────────────────────────────────
+    # Avoid loading all 1M+ refs into memory.  Each USR's edges are
+    # fetched on first access and cached per-call.  The _get_edges and
+    # _get_in_edges helper functions encapsulate this caching pattern.
+    # GROUP BY r.to_usr (or r.from_usr) deduplicates multiple refs to
+    # the same target (e.g., a function called on multiple lines).
     _edge_cache: dict[str, list[tuple[str, str]]] = {}
     _in_edge_cache: dict[str, list[tuple[str, str]]] = {}
     _name_cache: dict[str, str] = {}
@@ -298,9 +416,11 @@ def find_call_path(
                     edges.append((to_usr, name))
         return edges
 
-    # ── Weak-alias bridging ──
+    # ── Weak-alias bridging ─────────────────────────────────────────
     # Inject synthetic edges from alias declarations → their definitions
-    # into _edge_cache so the BFS can traverse past weak aliases.
+    # into _edge_cache.  Without this, a call path that passes through
+    # a weak alias (e.g., HAL_UART_Init → __HAL_UART_Init) would be
+    # invisible — the declaration USR has no outgoing edges.
     try:
         alias_pairs = _get_alias_pairs(conn, config_hash)
         for decl_usr, def_usr in alias_pairs:
@@ -309,7 +429,13 @@ def find_call_path(
     except sqlite3.Error:
         log.exception("Alias pair resolution failed")
 
-    # ── Global constructor bridging ──
+    # ── Global constructor bridging ─────────────────────────────────
+    # File-scope C++ global objects call constructors before main().
+    # These are recorded as ref_kind='implicit_construct' with
+    # from_usr=NULL.  Without bridging, call paths that span global
+    # constructors (main → MyClass::MyClass → some_init) would break.
+    # A synthetic <global ctors> node is inserted between main and
+    # all implicit_construct targets, making them reachable via BFS.
     _main_usr = _resolve_target_usr(conn, config_hash, "main")
     if _main_usr:
         try:
@@ -413,10 +539,27 @@ def find_all_callers_recursive(
     max_depth: int = 5,
     limit: int = 50,
 ) -> list[dict]:
-    """Find all transitive callers of *name* (who calls it, directly or indirectly).
+    """Find all transitive callers of *name* via recursive CTE.
 
-    Returns deduplicated results with ``depth`` (shortest distance to target)
-    and the callee's ``name``, ``qualified_name``, ``kind``, ``file_path``.
+    Returns deduplicated callers at depth 1 (direct), depth 2
+    (callers of callers), up to *max_depth*.  Each caller appears once
+    at its shortest distance — ``MIN(depth) GROUP BY usr``.
+
+    Why recursive CTE over Python BFS: the search radius is small
+    (max 5), and SQLite's recursive CTE with a depth bound is efficient
+    when the fan-in per node is moderate (<50 callers per function).
+    For wide calls (>500 callers), the CTE with GROUP BY naturally
+    deduplicates without materializing all intermediate results.
+
+    Why extended_refs with alias UNION ALL: when A calls decl_usr
+    (a weak alias) and decl_usr aliases def_usr, A also effectively
+    calls def_usr.  The UNION ALL injects these synthetic edges so the
+    recursive CTE can traverse past aliases.
+
+    Why COALESCE(s_def.name, s_any.name): some callers may exist only
+    as declarations (not definitions) in the index — e.g., an ISR
+    declared in a header but defined in assembly.  Falling back to
+    s_any ensures the caller still appears in results.
     """
     target_usr = _resolve_target_usr(conn, config_hash, name)
     if not target_usr:
@@ -488,9 +631,17 @@ def find_callees_recursive(
     max_depth: int = 5,
     limit: int = 50,
 ) -> list[dict]:
-    """Find all transitive callees of *name* (what it calls, directly or indirectly).
+    """Find all transitive callees of *name* via recursive CTE.
 
-    Inverse of ``find_all_callers_recursive`` — walks edges from caller to callee.
+    Inverse of ``find_all_callers_recursive`` — follows outgoing edges
+    from caller to callee.  Same recursive CTE pattern with alias bridging,
+    but the alias UNION ALL direction is reversed: when def_usr is the
+    real definition that decl_usr aliases, anything def_usr calls should
+    also appear as callees of decl_usr.
+
+    Query structure: WITH alias_pairs → extended_refs (real + synthetic
+    edges) → recursive callees CTE → dedup with MIN(depth) → join symbols
+    for metadata.
     """
     source_usr = _resolve_target_usr(conn, config_hash, name)
     if not source_usr:
@@ -563,25 +714,31 @@ def find_dead_code(
     exclude_paths: list[str] | None = None,
     project_only: bool = False,
 ) -> list[dict]:
-    """Find functions/methods that are defined but never called.
+    """Find functions that are defined but never called, with two confidence levels.
 
-    Returns two categories of results, each with a ``status`` field:
+    **Category 1 — "dead"**: the symbol's USR has no entry at all in
+    ``refs.to_usr``.  This is a single-layer check, not a reachability
+    analysis.  A function called only by another dead function will NOT
+    appear here (it has a reference).  Use ``find_callees_recursive()``
+    from known entry points for transitive dead-code analysis.
 
-    * ``"dead"`` — the symbol's USR has no entry at all in ``refs.to_usr``
-      (neither direct calls nor indirect function pointer assignments).
-    * ``"possibly_dead"`` — the symbol has at least one indirect reference
-      (``ref_kind = 'indirect'``, a function pointer assignment) but the
-      assignment is not linked to any call site via ``fp_assignments``.
-      This means the function IS assigned to a function pointer somewhere,
-      but the invocation site is unknown — it may be called through
-      unindexed code or a type-erased API.  LLM should treat this as
-      uncertain, not as confirmed dead code.
+    **Category 2 — "possibly_dead"**: the symbol has ``ref_kind='indirect'``
+    entries (function pointer assignments) but no resolved call site via
+    the ``fp_assignments → indirect_call_sites`` join.  This means the
+    function IS assigned to a function pointer somewhere, but the
+    invocation path is unknown — it may be called through unindexed code,
+    a type-erased API, or an interrupt vector table entry the indexer
+    could not resolve.  Treat these as uncertain.
 
-    Each result dict includes: name, qualified_name, kind, file_path,
-    signature, line, status, reason.
+    Why two categories: flagging all indirect-only targets as "dead" would
+    produce false positives for ISR handlers, callback registrations, and
+    RTOS task entries — all of which are invoked through function pointers
+    and would appear unreachable to a naive direct-call-only check.
 
-    *exclude_paths* is a list of LIKE patterns for file paths to exclude
-    (e.g. ``["mbed-os/%", "cmsis/%"]``).  When omitted, no paths are excluded.
+    Why ``NOT IN (SELECT DISTINCT to_usr FROM refs)`` over LEFT JOIN +
+    IS NULL: the NOT IN anti-join lets SQLite short-circuit on the first
+    matching ref row per USR, while LEFT JOIN must scan all rows before
+    filtering NULLs.
     """
     project_only_clause = "AND s.is_project = 1" if project_only else ""
     if exclude_paths:
@@ -706,20 +863,26 @@ def find_hotspots(
     exclude_paths: list[str] | None = None,
     project_only: bool = False,
 ) -> list[dict]:
-    """Find the most-called functions (hotspots) ranked by caller count.
+    """Find the most-called functions ranked by caller count.
 
-    Only counts actual call edges (``ref_kind IN ('call', 'indirect')``) —
-    plain references and member-access expressions are excluded so enum
-    constants and fields don't appear as "hot" call targets.
+    Only counts call edges (``ref_kind IN ('call', 'indirect')``) —
+    plain references (``ref_kind='ref'``) and member accesses are excluded
+    so enum constants and field declarations do not appear as hotspots.
 
-    When ``hotspot_cache`` is populated for this config, returns instantly
-    from the pre-computed cache.  Falls back to a live COUNT+GROUP BY
-    query when the cache is missing or stale.
+    **Cache strategy**: when ``hotspot_cache`` is populated for this
+    config, the function returns instantly from the pre-computed table.
+    The cache is built during indexing via a COUNT(*) GROUP BY over refs,
+    which takes 2-5 seconds for 1M+ edges.  Serving from cache eliminates
+    this latency on every query.
 
-    When *exclude_paths* is given, symbols whose ``file_path`` matches any
-    of the LIKE patterns are excluded.
-    When *project_only* is True, only project symbols (``is_project = 1``)
-    are returned.
+    Falls back to a live COUNT+GROUP BY query when:
+    - The cache table has zero rows for this config (first index).
+    - The cache was not populated (refs indexed but hotspot_cache skipped).
+
+    Why not always use the live query: 2-5 second latency on every
+    ``find_hotspots()`` call is unacceptable for interactive use.
+    The cache trades a small write cost at index time for zero-latency
+    reads at query time.
     """
     proj_clause = "AND s.is_project = 1" if project_only else ""
     # Try cache first
