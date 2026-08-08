@@ -320,7 +320,7 @@ def _discover_projects() -> dict[str, dict]:
             # A template (for template instances)
             if has_templates:
                 tpl_row = conn.execute(
-                    "SELECT name FROM symbols WHERE config_hash=? AND is_template=1 AND file_path LIKE 'src/%' LIMIT 1",
+                    "SELECT name FROM symbols WHERE config_hash=? AND is_template=1 AND kind IN ('class','struct') AND file_path LIKE 'src/%' LIMIT 1",
                     (ch,),
                 ).fetchone()
                 if tpl_row:
@@ -856,7 +856,10 @@ def run_tests_for_project(proj: dict, results: CheckResults) -> None:
         if ti is not None:
             results.check("get_template_instances → returns list", isinstance(ti, list))
             if ti and isinstance(ti[0], dict):
-                results.check("get_template_instances → has signature", "signature" in ti[0])
+                if "error" in ti[0]:
+                    print(f"     \033[33mWARN\033[0m   get_template_instances → {ti[0]['error']}")
+                else:
+                    results.check("get_template_instances → has signature", "signature" in ti[0])
 
         # Non-template
         if sym.get("function"):

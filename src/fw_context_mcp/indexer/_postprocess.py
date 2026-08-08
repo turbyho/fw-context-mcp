@@ -141,6 +141,26 @@ def _extract_param_types(signature: str) -> str:
     return ",".join(normalized)
 
 
+def _normalize_type_namespaces(param_types: str) -> str:
+    """Strip namespace prefixes from all type tokens in a parameter list.
+
+    ``const ble::ConnectionCompleteEvent &`` → ``const ConnectionCompleteEvent &``
+    ``std::vector<int>`` → ``vector<int>``
+    """
+    if not param_types:
+        return ""
+    parts = param_types.split(",")
+    normalized: list[str] = []
+    for part in parts:
+        tokens = part.strip().split()
+        stripped: list[str] = []
+        for t in tokens:
+            if "::" in t:
+                t = t.rsplit("::", 1)[-1]
+            stripped.append(t)
+        normalized.append(" ".join(stripped))
+    return ",".join(normalized)
+
 
 # ═══════════════════════════════════════════════════════════════
 # SECTION: Post-processing pipeline (→ postprocessor.py)
@@ -261,7 +281,14 @@ def _build_overrides(
         derived_params = _extract_param_types(vrow["signature"] or "")
         for bm in base_methods:
             base_params = _extract_param_types(bm["signature"] or "")
+            # Phase 1: exact type match (fast path, handles 95 %+ of cases)
             if derived_params == base_params:
+                override_rows.append((config_hash, vrow["usr"], bm["usr"]))
+                continue
+            # Phase 2: namespace-normalized match (handles cross-namespace overrides)
+            derived_norm = _normalize_type_namespaces(derived_params)
+            base_norm = _normalize_type_namespaces(base_params)
+            if derived_norm == base_norm:
                 override_rows.append((config_hash, vrow["usr"], bm["usr"]))
 
     if override_rows:
