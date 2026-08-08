@@ -7,6 +7,24 @@ Supports Matryoshka representation (MRL) — when ``embed_dim`` is set
 in config, output vectors are truncated to that dimension before
 normalization.  Truncation happens on the encoder side so the stored
 vector is the smaller dimension; this avoids the 6× storage cost.
+
+WHY Matryoshka: Full-dimension embeddings (1024 or 4096 floats) consume
+significant disk space in SQLite.  MRL-trained models produce vectors
+where the first N dimensions alone are a valid, normalized embedding —
+truncating from 4096 to 768 produces a usable vector at ~1/5 the size.
+The cosine similarity of truncated vectors is slightly degraded but
+still meaningful for semantic search.  This is a space/accuracy
+trade-off configurable per deployment via ``embed_dim``.
+
+WHY double-checked locking for model load: ``SentenceTransformer``
+constructor downloads and loads a multi-GB model.  Multiple threads
+calling ``embed_*`` concurrently would all try to load the model;
+the lock ensures only one thread pays the load cost, all others
+wait on the already-loaded instance.
+
+WHY Lock() not RLock(): ``_ensure_model()`` does NOT call back into
+the embedder's own properties — no recursion risk.  Lock is cheaper
+and sufficient.
 """
 
 from __future__ import annotations
@@ -52,10 +70,12 @@ class SentenceTransformerEmbedder(Embedder):
         self._cfg = cfg
         self._model = None
         self._dim: int | None = None
-        self._native_dim: int | None = None  # model's full dim before MRL truncation
-        # NOTE: Lock() (non-reentrant) is correct here — _ensure_model() uses
-        # double-checked locking and SentenceTransformer.__init__ doesn't call
-        # back into the embedder's own properties (no deadlock risk).
+        # Model's full dimension BEFORE MRL truncation.
+        # Used to compute the actual stored dimension from embed_dim config.
+        self._native_dim: int | None = None
+        # Double-checked locking: _ensure_model() reads _model outside the lock
+        # for the fast path (already loaded), acquires lock for the slow path
+        # (first load).
         self._lock = threading.Lock()
 
     def _ensure_model(self):
@@ -93,7 +113,13 @@ class SentenceTransformerEmbedder(Embedder):
             raise RuntimeError("_encode called before _ensure_model()")
         if not texts:
             return []
+        # SentenceTransformer.encode(normalize_embeddings=True) returns
+        # L2-normalized vectors as a numpy array of shape (N, native_dim).
         result = self._model.encode(texts, normalize_embeddings=True)
+        # MRL truncation: slice to the first embed_dim dimensions, then
+        # re-normalize.  Matryoshka-trained models guarantee that the first
+        # N dimensions form a nearly-orthonormal subspace — re-normalization
+        # restores unit norm after truncation.
         if self._cfg.embed_dim and self._cfg.embed_dim < len(result[0]):
             result = result[:, : self._cfg.embed_dim]
             norms = np.linalg.norm(result, axis=1, keepdims=True)
@@ -141,4 +167,8 @@ class SentenceTransformerEmbedder(Embedder):
         for prefix, limit in _MODEL_MAX_TOKENS.items():
             if model_lower.startswith(prefix):
                 return limit
+        # Unknown model — return 32768 (largest known limit) to err on the
+        # side of NOT truncating.  A too-small limit loses content; a too-large
+        # limit causes the model to truncate internally (message logged at
+        # WARNING in sentence-transformers).
         return 32768

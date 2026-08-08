@@ -1,4 +1,24 @@
-"""SQLite storage layer for fw-context-mcp index."""
+"""SQLite storage layer for fw-context-mcp index.
+
+Central ``__init__`` that re-exports all database operations from separate
+specialized modules.  The package is split by concern:
+- ``_symbols`` — symbol CRUD, macro CRUD, search
+- ``_files`` — file metadata (mtime, content, hashes)
+- ``_refs`` — reference edges (calls, reads, indirect calls)
+- ``_inheritance`` — C++ class hierarchy edges
+- ``_callgraph`` — graph traversal (callers, callees, paths)
+- ``_embeddings`` — vector storage (BLOB and vec0)
+- ``_fts`` — FTS5 rebuild utilities
+- ``_llm`` — LLM analysis storage
+- ``_locking`` — file-system write lock
+- ``_projects`` — project/build config CRUD
+- ``_schema`` — schema versioning and migration
+- ``_connection`` — connection management (open, schema, transactions)
+
+WHY split by concern: a single monolithic ``db.py`` would exceed 2000 lines
+and be unmaintainable.  Each module has a single responsibility, making it
+testable in isolation and reducing merge conflicts in team workflows.
+"""
 
 from __future__ import annotations
 

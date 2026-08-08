@@ -2,6 +2,16 @@
 table.  Vector dimension is detected at runtime from the Ollama response;
 no hardcoded value.  The ``build_configs.embedding_dim`` column stores
 the detected dimension per build for vec0 table compatibility.
+
+Supports two storage backends:
+1. BLOB table (``embeddings``) — legacy, kept for backward compatibility
+   with databases created before sqlite-vec support was added.
+2. vec0 virtual table (``vec_symbols``) — current, uses sqlite-vec for
+   efficient KNN queries with cosine distance.
+
+WHY two backends: sqlite-vec is an optional extension that requires a
+separate C library.  The BLOB fallback ensures fw-context works without
+sqlite-vec installed, at the cost of slower vector search (full scan).
 """
 
 from __future__ import annotations
@@ -64,6 +74,10 @@ def _cosine_sim(query_vec: list[float], blob: bytes) -> float | None:
 
     Returns None when the BLOB cannot be unpacked (dimension mismatch,
     corruption, etc.).  Returns 0.0 when either vector has zero norm.
+
+    WHY None on dimension mismatch: silently returning a wrong similarity
+    score (e.g., from a different embedding model) is worse than returning
+    nothing — the caller can detect the gap and warn the user to reindex.
     """
     import math as _math
 
@@ -95,9 +109,15 @@ def upsert_embeddings(
     embedding description — used by the incremental re-embedding pass to skip
     symbols whose content did not change.
     Returns number of rows inserted.
+
+    WHY content_hash: regenerating embeddings for all symbols on every
+    reindex would be extremely expensive (LLM calls per symbol).  The hash
+    enables incremental updates — only changed symbols get new embeddings.
+
+    NOTE: Orphan cleanup moved to clean_orphan_embeddings() — call it once
+    after indexing completes, not on every batch insert.  Deleting orphans
+    on every batch would be O(n²) with massive constant-factor overhead.
     """
-    # NOTE: Orphan cleanup moved to clean_orphan_embeddings() — call it once
-    # after indexing completes, not on every batch insert.
     cur = conn.executemany(
         """INSERT OR REPLACE INTO embeddings(symbol_id, chunk_index, embedding, model, content_hash, updated_at)
            VALUES (?, ?, ?, ?, ?, datetime('now'))""",
@@ -273,8 +293,13 @@ def search_similar_vec(
 
     Returns rows with ``symbol_id`` and ``distance`` (cosine distance,
     range [0, 2], where 0 = identical).  Results are post-filtered by
-    *threshold* and deduplicated by ``symbol_id`` (best distance kept
-    for multi-chunk symbols).
+    *threshold* and deduplicated by ``symbol_id``.
+
+    WHY overfetching (5×) with iterative widening: multi-chunk symbols
+    produce multiple vec0 rows for the same ``symbol_id``.  After dedup,
+    the result count may be much smaller than the KNN fetch.  Overfetching
+    compensates; iterative widening (max 3 passes, doubling each time)
+    handles the worst case without a huge initial fetch.
     """
     import json
 
@@ -325,6 +350,11 @@ def search_similar_hybrid(
     1. Fetch candidate symbols via FTS5 (broad recall – up to 200 candidates).
     2. Re-rank candidates by cosine distance against *query_vec*.
     3. Return top *limit* results sorted by distance.
+
+    WHY hybrid: pure vector search may miss exact keyword matches (symbol
+    names, identifiers); pure FTS5 may miss semantically related concepts.
+    Combining both gives the best of both worlds: text recall ensures
+    exact matches are found, vector re-ranking surfaces the most relevant.
 
     This avoids a full-scan of vec_symbols while still leveraging semantic
     similarity for ranking.

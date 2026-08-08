@@ -2,14 +2,42 @@
 
 Serves 35 MCP tools and 4 MCP resources via FastMCP (stdio transport).
 
-**Concurrency:** The server processes at most ONE tool request at a time.
-If a request arrives while another is already running, the server waits up
-to 5 s for the running request to finish.  If it does not finish within
-that window, the new request is rejected with a ``"server busy"`` error
-that tells the client which tool is currently executing.  This prevents
-query pile-up under parallel MCP load (40+ concurrent requests serialized
-on the SQLite executor would otherwise cause client-side timeouts and
-"Connection closed" errors).
+**Concurrency model — single-tool execution with busy rejection:**
+The server processes at most ONE tool request at a time.  If a request
+arrives while another is already running, the server waits up to 5 s for
+the running request to finish.  If it does not finish within that window,
+the new request is rejected with a ``"server busy"`` error that tells the
+client which tool is currently executing.
+
+**Why single-tool?**  The underlying SQLite database is WAL-mode but not
+designed for concurrent writers.  Parallel requests serialize on the
+SQLite executor anyway: 40 concurrent requests × 3 s each = 120 s for
+request #40 → client timeout → "Connection closed".  Explicit busy
+rejection lets the client retry immediately instead of waiting for a
+timeout.
+
+**Tool registration pattern:**  Each handler module (search.py,
+callgraph.py, etc.) exports plain functions with type-annotated
+signatures.  ``server.py`` wraps them with ``_wrap_tool()`` for error
+boundaries, async dispatch, and MCP progress notifications, then
+registers with ``mcp.tool()``.  This separation keeps handlers testable
+as plain functions without MCP dependencies.
+
+**Handler wrap modes:**
+- Sync handlers (BFS graph traversals, SQLite queries): dispatched to
+  ``asyncio.to_thread()`` to avoid blocking the event loop.
+- Async handlers (Ollama HTTP calls, concurrent I/O): run directly
+  on the event loop.
+Both modes send MCP progress notifications every 5 s to prevent
+client-side connection timeouts.
+
+**Lifecycle:**
+1. ``main()`` resolves the project root → validates initialization
+   state → sets appropriate sentinels for tools to report status.
+2. Pre-marks the database as integrity-checked (avoids startup timeout
+   on large DBs — integrity was verified during indexing).
+3. Spawns a file-watcher daemon for auto-reindex (once per project).
+4. Enters the FastMCP stdio event loop and processes tool requests.
 
 **Search & lookup tools** (delegate to ``fw_context_mcp.search`` pipeline):
 ``search_code`` (FTS5), ``lookup_symbol`` (exact/prefix), ``smart_search``
@@ -35,7 +63,7 @@ on the SQLite executor would otherwise cause client-side timeouts and
 ``reindex_file``, ``reindex_file_impl``, ``reset_index``.
 
 **MCP Resources:** ``fw-context://stats``, ``fw-context://projects``,
-``fw-context://symbols/{name}``.
+``fw-context://symbols/{name}``, ``fw-context://skills/fw-review``.
 """
 
 import asyncio
@@ -66,6 +94,12 @@ _DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 #: With the lock, excess requests receive an immediate "server busy" error and
 #: the client can retry.  Timeout 5 s — long enough for a just-finished
 #: handler to release the lock, short enough to avoid client-side timeouts.
+#:
+#: **Why asyncio.Lock instead of threading.Lock?**  Both async and sync
+#: paths are wrapped in ``async def`` wrappers that run on the event loop
+#: (sync handlers use ``asyncio.to_thread`` but the wrapper itself is
+#: async).  ``threading.Lock`` would block the event loop thread — an
+#: ``asyncio.Lock`` integrates with the cooperative scheduler.
 _SERVER_LOCK = asyncio.Lock()
 _SERVER_LOCK_TIMEOUT = 5.0  # seconds
 
@@ -94,13 +128,22 @@ def _wrap_tool(fn):
     coverage — do NOT lengthen the interval.
 
     All handlers get an error boundary — no unhandled exception can crash
-    the server process.
+    the server process.  ``BrokenPipeError`` on the async path is treated
+    as a clean exit (client disconnected mid-query) — the server exits 0.
+
+    **Why two code paths (sync vs async)?**  Sync handlers execute
+    blocking SQLite queries and libclang traversal.  Running them on
+    the event loop would freeze all other coroutines (ping thread,
+    daemon health checks, progress notifications).  ``asyncio.to_thread``
+    moves them to the default thread pool executor, keeping the event
+    loop responsive.
     """
     if inspect.iscoroutinefunction(fn):
-        # Manual wrap: copy __name__/__doc__/__module__/__qualname__ but NOT
-        # __annotations__ — functools.wraps would overwrite the wrapper's
-        # annotations (which include ctx) with fn's annotations (which
-        # don't), causing find_context_parameter to miss ctx.
+        # Async path — handler yields to event loop (e.g., Ollama HTTP calls).
+        # Manual functools.wraps: copy __name__/__doc__/__module__/__qualname__
+        # but NOT __annotations__ — functools.wraps would overwrite the
+        # wrapper's annotations (which include ctx) with fn's annotations
+        # (which don't), causing find_context_parameter to miss ctx.
         @functools.wraps(fn, assigned=("__module__", "__name__", "__qualname__", "__doc__"))
         async def _wrapper(*a, ctx: MCPContext | None = None, **kw):
             start = time.monotonic()
@@ -113,6 +156,12 @@ def _wrap_tool(fn):
             try:
                 task = asyncio.ensure_future(fn(*a, **kw))
 
+                # Progress loop: poll every 5 s until the handler completes.
+                # Each iteration sends an MCP progress notification to the
+                # client via ctx.info() — this keeps the connection alive
+                # through client-side idle-timeout gates.  If the handler
+                # takes >300 s, it is cancelled and all active SQLite
+                # connections are interrupted.
                 while not task.done():
                     done, pending = await asyncio.wait([task], timeout=5.0)
                     if task in done:
@@ -146,6 +195,9 @@ def _wrap_tool(fn):
                 _SERVER_LOCK.release()
         return _wrapper
 
+    # Sync path — handler blocks (SQLite queries, libclang traversal).
+    # Dispatched to ``asyncio.to_thread`` so the event loop stays free
+    # for progress notifications and the ping thread.
     @functools.wraps(fn, assigned=("__module__", "__name__", "__qualname__", "__doc__"))
     async def _wrapper(*a, ctx: MCPContext | None = None, **kw):
         start = time.monotonic()
@@ -156,10 +208,15 @@ def _wrap_tool(fn):
             _wrap_debug(f"[sync] {fn.__name__} BUSY — lock timeout")
             return [{"error": f"Server busy — {fn.__name__} cannot run, another query is in progress. Retry in a few seconds."}]
         try:
+            # functools.partial captures *a and **kw into a zero-argument
+            # callable that asyncio.to_thread can execute on the thread pool.
             task = asyncio.ensure_future(
                 asyncio.to_thread(functools.partial(fn, *a, **kw))
             )
 
+            # Same progress loop as async path — the thread pool executor
+            # runs the handler while the event loop polls and sends progress
+            # notifications every 5 s.
             while not task.done():
                 done, pending = await asyncio.wait([task], timeout=5.0)
                 if task in done:
@@ -193,6 +250,13 @@ def _wrap_tool(fn):
             _SERVER_LOCK.release()
     return _wrapper
 
+# The FastMCP instructions string is embedded here (not loaded from a file)
+# because it must be available at import time — FastMCP reads it during
+# construction.  Loading from a data file would add an I/O dependency to
+# the import path and complicate packaging (MANIFEST.in, wheel data_files).
+# The instructions are the "user manual" for LLM agents using fw-context
+# tools — they teach tool selection, FTS5 query rules, the agent loop,
+# and the LLM setup workflow.
 mcp = FastMCP(
     "fw-context",
     instructions=(
@@ -452,6 +516,17 @@ _SOURCE_EXTS_WATCH = {".c", ".cpp", ".h", ".hpp"}
 
 # ── MCP tool registration (implementations in handlers/) ──────────────
 
+# Maintenance tools are NOT wrapped with _wrap_tool — they are lightweight
+# (config reads, file stats, SQLite pragma checks) and complete in <1 s.
+# Wrapping them would add asyncio overhead for no benefit, and the lock
+# would serialize fast queries behind slow ones (e.g., a 30 s search_bodies
+# query blocking a 10 ms get_active_build check).
+#
+# All search, call graph, symbol source, inheritance, and variable tools
+# ARE wrapped — they may run for seconds to minutes (BFS traversal,
+# Ollama HTTP calls, libclang re-parsing) and need progress notifications
+# and the 5 s busy-rejection guard.
+
 # maintenance.py
 mcp.tool()(maintenance.check_ollama)
 mcp.tool()(maintenance.configure_llm)
@@ -630,10 +705,17 @@ def main() -> None:
     3. Ensures the persistent watcher daemon is running for the project
        (spawns it if this is the first MCP server).
     4. Starts a ping thread that keeps the daemon alive.
+
+    **Why progressive startup?**  The server must NOT exit when the
+    project is not initialized or has no index.  The whole point of
+    ``get_active_build()`` returning ``not_initialized`` / ``no_index``
+    is so the agent can ask the operator and run the corresponding
+    command via bash.  An early exit would make the tools disappear from
+    the agent's context, breaking the guided setup flow.
     """
     log.info("fw-context MCP server starting")
 
-    # Pre-populate the project-ready cache with a one-shot check.
+    # Phase 1: pre-populate the project-ready cache with a one-shot check.
     # _check_server_ready() raises RuntimeError when the project isn't
     # ready — we catch it here so the server can still start (tools will
     try:
@@ -641,7 +723,9 @@ def main() -> None:
     except RuntimeError as exc:
         log.info("Project not ready at startup: %s", exc)
 
-    # Fast dependency pre-flight — warn on degraded deps, never exit
+    # Phase 2: fast dependency pre-flight — warn on degraded deps, never exit.
+    # Missing optional dependencies (e.g., nvidia-smi for GPU detection) are
+    # non-fatal.  The server starts with reduced functionality.
     try:
         from ..deps import run_preflight
         for r in run_preflight():
@@ -652,7 +736,9 @@ def main() -> None:
     except Exception:
         log.debug("Dependency pre-flight skipped", exc_info=True)
 
-    # If the project IS ready, pre-mark integrity check and ensure daemon.
+    # Phase 3: if the project IS ready, pre-mark integrity check and ensure
+    # daemon.  If not ready, skip to mcp.run() — tools will report status
+    # via get_active_build().
     try:
         root = resolve_project_root(None)
     except OSError:
@@ -700,7 +786,19 @@ def main() -> None:
 
 
 def _start_ping_thread(root: Path) -> None:
-    """Start a daemon thread that pings the watcher daemon every 15 s."""
+    """Start a daemon thread that pings the watcher daemon every 15 s.
+
+    **Why a separate thread?**  The ping loop is a blocking infinite loop
+    with ``time.sleep``.  Running it on the event loop (``asyncio.sleep``)
+    would add one more coroutine competing for the same executor.  A
+    daemon thread is simpler — it runs independently and dies with the
+    process.
+
+    **Why ping?**  The watcher daemon is a separate process spawned by
+    the first MCP server.  If it dies (OOM, segfault, manual kill),
+    file watching stops silently — the ping thread detects this and
+    signals ``_ensure_daemon_running`` to respawn it.
+    """
     import threading
     import time
 

@@ -1,3 +1,17 @@
+"""LLM analysis storage for fw-context-mcp.
+
+Provides CRUD for the ``llm_analysis`` table: batch upsert, single lookup,
+and count queries.  Analysis rows store per-symbol summaries, inputs,
+outputs, the model that generated them, and a content hash for
+incremental re-analysis.
+
+WHY denormalize to symbols table: the FTS5 index on ``symbols`` includes
+``summary``, ``inputs``, ``outputs`` columns so that LLM-generated
+descriptions are searchable via ``search_code``.  After inserting analysis
+rows, the corresponding ``symbols`` columns are updated to keep FTS5
+in sync without a full rebuild.
+"""
+
 import sqlite3
 
 __all__ = [

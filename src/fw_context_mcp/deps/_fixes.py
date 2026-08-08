@@ -1,4 +1,21 @@
-"""Auto-install functions for fixable dependencies."""
+"""Auto-install functions for fixable dependencies.
+
+Each fix function accepts a ``DepCheckResult`` and an optional project
+root, then attempts to install or repair the dependency.  Returns
+``(ok, message)``.
+
+WHY: ``fw-context doctor --fix`` must be able to repair common issues
+without the user typing multiple shell commands.  Each fix is a
+separate function so the registry can map check names to fix actions
+and so individual fixes can be tested in isolation.
+
+Design:
+* ``_pip_install`` wraps pip/uv with timeout and error handling.
+* ``_ollama_pull`` uses the CLI binary when available (better UX
+  with progress bar), falls back to HTTP API.
+* Fix functions are thin wrappers — the real logic lives in the
+  shared helpers to avoid duplication.
+"""
 
 from __future__ import annotations
 
@@ -11,7 +28,15 @@ from typing import Any
 
 
 def _pip_install(package: str) -> tuple[bool, str]:
-    """Install a Python package. Returns (ok, output)."""
+    """Install a Python package. Returns (ok, output).
+
+    WHY (uv preference): ``uv pip install`` is 10-100× faster than
+    ``pip install`` for cached packages.  However, uv only works inside
+    a virtual environment (it requires VIRTUAL_ENV or a venv).  We
+    check for both uv binary AND VIRTUAL_ENV before using it, then
+    fall back to ``sys.executable -m pip`` which knows its own venv
+    implicitly.
+    """
     # Prefer uv only when inside a venv (VIRTUAL_ENV set) — otherwise
     # uv pip install fails with "No virtual environment found".
     # Always fall back to sys.executable which knows where its own venv is.
@@ -37,7 +62,13 @@ def _pip_install(package: str) -> tuple[bool, str]:
 
 
 def _ollama_pull(model: str, url: str | None = None) -> tuple[bool, str]:
-    """Pull an Ollama model. Returns (ok, output)."""
+    """Pull an Ollama model. Returns (ok, output).
+
+    WHY (CLI-first): The ``ollama pull`` CLI shows a progress bar and
+    is already authenticated for self-hosted registries.  The HTTP API
+    fallback exists for headless servers where the CLI is not installed
+    but Ollama is running as a daemon.
+    """
     # Prefer the CLI binary — streams progress and is already authenticated
     if which("ollama"):
         try:
@@ -148,7 +179,12 @@ FIXABLE: dict[str, Any] = {
 
 
 def run_fix(name: str, result, project_root: str | Path | None = None) -> tuple[bool, str]:
-    """Run the fix for *name*. Returns (ok, message)."""
+    """Run the fix for *name*. Returns (ok, message).
+
+    WHY (registry dispatch): A dictionary lookup is safer and more
+    testable than if/elif chains.  New fixes can be added by
+    registering a function in FIXABLE without modifying dispatch logic.
+    """
     fn = FIXABLE.get(name)
     if fn is None:
         return False, f"no fix available for '{name}'"

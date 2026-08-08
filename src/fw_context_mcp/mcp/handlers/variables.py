@@ -1,4 +1,25 @@
-"""Variable MCP tools — see mcp/server.py for registration."""
+"""Variable MCP tools — see mcp/server.py for registration.
+
+WHY a dedicated variable search tool instead of extending search_code:
+variables need different metadata — enclosing function (for locals),
+enclosing class (for static members), type signature, and references
+(who reads/writes this variable?).  search_code returns symbol-level
+metadata (name, file, line, docstring) but not the enclosing scope
+or reference graph.  find_variables bridges this gap with batched
+JOINs across the symbols, refs, and parent-usr relationships.
+
+WHY parent_usr batch lookups: every local variable has a parent function
+(class method, free function, or file scope).  Without batching, each
+variable would incur a separate ``SELECT … FROM symbols WHERE usr=?``
+query — O(n) SQL round-trips for n results.  The batch collects all
+parent USRs into a single ``WHERE usr IN (?, ?, …)`` query.
+
+WHY refs are capped at 30 per variable: global variables like errno
+or HAL handles may have hundreds of references.  Returning all of
+them would blow up the MCP response and provide diminishing value —
+the assistant needs to see the pattern (who reads vs writes), not
+every single site.
+"""
 
 from __future__ import annotations
 

@@ -1,4 +1,25 @@
-"""Maintenance MCP tools — see mcp/server.py for registration."""
+"""Maintenance MCP tools — index health checks, LLM configuration,
+project listing, index reset, and single-file reindexing.
+
+These are diagnostic and administrative tools distinct from the
+search and code-navigation tools in other handler modules.  They
+do not query the symbol index for code-analysis purposes; instead
+they inspect index metadata, configure runtime behavior, and
+manage the index lifecycle.
+
+Public MCP handlers in this module:
+    get_active_build  — mandatory first-call index health report
+    check_ollama      — LLM backend availability and model status
+    configure_llm     — write per-developer LLM settings to local.toml
+    reindex_file      — re-parse a single source file into the index
+    reindex_file_impl — same as above with an ``--analysis`` equivalent
+    reset_index       — delete the symbol database
+    list_projects     — enumerate all indexed projects
+    get_project_info  — look up a project by UUID4 in the global registry
+
+Each handler is read-only except where noted in its docstring.
+The ``Field(description=…)`` strings on public signatures are tool
+registration metadata — they must not be modified casually."""
 
 from __future__ import annotations
 
@@ -125,6 +146,8 @@ def get_active_build(
     fw_cfg = load_config(root)
     project_id = fw_cfg.project.id
     if not project_id:
+        # The project directory exists but was never initialized.
+        # Return a human-readable status so the LLM can guide the user.
         return {
             "status": "not_initialized",
             "project_root": str(root),
@@ -136,6 +159,8 @@ def get_active_build(
         }
     db_path = fw_cfg.index.db_dir / project_id / "index.db"
     if not db_path.exists():
+        # Project is initialized but no index was ever built.
+        # The LLM uses this to prompt the user for indexing.
         return {
             "status": "no_index",
             "project_root": str(root),
@@ -152,6 +177,9 @@ def get_active_build(
     # the reindex started.  Skipping the cache ensures accurate counts.
     bg_running = _is_bg_reindex_running(root)
 
+    # Open a short-lived read-only connection to fetch the active config
+    # hash.  We close it immediately — the actual heavy queries run
+    # through the executor on its own connection.
     conn = _quick_open_readonly(db_path)
     try:
         project_id = derive_project_id(root)
@@ -162,6 +190,9 @@ def get_active_build(
     finally:
         conn.close()
 
+    # The executor serializes all DB access through a single shared
+    # connection.  This prevents SQLITE_BUSY errors when the MCP server
+    # handles concurrent requests and a background reindex is running.
     executor = get_executor(db_path)
 
     def _query(conn, config_hash):
@@ -174,7 +205,9 @@ def get_active_build(
         manifest_verification = cfg.get("manifest_verification", "none")
         if fast:
             modified_count = 0
-            # header_affected_tus computed from manifest even at fast=True
+            # header_affected_tus is cheap when the manifest is available —
+            # it compares stored hashes, not file stats.  Always compute it
+            # even in fast mode so the LLM knows about header staleness.
             if manifest_verification == "full":
                 header_affected_tus, _ = _check_header_staleness(
                     conn, config_hash, root, use_cache=True,
@@ -182,6 +215,8 @@ def get_active_build(
             else:
                 header_affected_tus = 0
         else:
+            # Full stat scan — walks every indexed file on disk to detect
+            # mtime changes.  Slow (~100 ms for large projects) but accurate.
             modified_count = _count_modified_files(conn, config_hash, root, use_cache=False)
             # Check header dependencies separately (different metric: TUs, not files)
             if manifest_verification == "full":
@@ -233,6 +268,13 @@ def get_active_build(
 
         cc_changed, stale_reason = _is_stale(cfg, cfg["compile_commands_path"])
         schema_old = db_schema_ver < CURRENT_SCHEMA_VERSION
+
+        # Two conditions force a reindex:
+        #   1. Schema version in DB is older than current code expects.
+        #   2. compile_commands.json was modified since indexing
+        #      (detected via mtime comparison in _is_stale).
+        # Modified source files are handled per-query via auto-reindex
+        # and do NOT cause reindex_needed=True.
         needs_reindex = cc_changed or schema_old
 
         # Build reindex_reasons — only when reindex is actually needed
@@ -242,7 +284,8 @@ def get_active_build(
         if cc_changed:
             reindex_reasons.append(stale_reason or "compile_commands_changed")
 
-        # Determine status
+        # Determine status — single value that drives LLM decision-making.
+        # Priority: reindex_needed > reindexing > ready.
         if needs_reindex:
             status = "reindex_needed"
         elif bg_running:
@@ -359,7 +402,8 @@ def get_active_build(
     if bg_running:
         result["reindex_progress"] = _read_reindex_progress(db_path)
 
-    # sqlite-vec availability for semantic_search
+    # sqlite-vec is an optional C extension for vector embeddings.
+    # Report its availability so semantic_search can degrade gracefully.
     from ...deps import _vec_available
     vec_ok, vec_err = _vec_available()
     result["vec_available"] = vec_ok
@@ -368,7 +412,13 @@ def get_active_build(
 
     return result
 def _read_reindex_progress(db_path: Path) -> str | None:
-    """Read the last line of reindex.log, or None if unavailable."""
+    """Read the last log line from the background reindex process.
+
+    Opens ``reindex.log`` in the same directory as the index database.
+    Reads only the last 4 KiB of the file — sufficient for a single
+    log line without reading a multi-megabyte log file into memory.
+    Returns ``None`` when the log file is missing or empty.
+    """
     log_file = db_path.parent / "reindex.log"
     try:
         with open(log_file, encoding="utf-8") as fh:
@@ -386,7 +436,12 @@ def _read_reindex_progress(db_path: Path) -> str | None:
 
 # ── moved from server.py ──
 def _list_status(db_schema_ver: int, cc_stale: bool) -> str:
-    """Return a status string for list_projects."""
+    """Map schema version and compile-commands staleness to a status label.
+
+    Returns ``"reindex_needed"`` when either the DB schema is outdated
+    or compile_commands.json has changed.  Returns ``"ready"`` otherwise.
+    Used by ``list_projects`` to summarize each indexed project.
+    """
     needs = (db_schema_ver < CURRENT_SCHEMA_VERSION) or cc_stale
     return "reindex_needed" if needs else "ready"
 
@@ -397,7 +452,20 @@ def _count_unanalyzed_symbols(
     root: Path,
     vendor_paths: list[str],
 ) -> int:
-    """Count definition symbols that still need LLM analysis."""
+    """Count definition symbols that still need LLM analysis.
+
+    Only considers definition-site symbols (is_definition=1) of kinds
+    that the LLM analysis pipeline processes: function, method,
+    constructor, destructor, class, struct.
+
+    When ``stored_analyze_vendor`` is True, all symbols are counted
+    (no path filtering).  When False, vendor paths are excluded using
+    LIKE patterns derived from the project config so the count reflects
+    only project-owned symbols still awaiting analysis.
+
+    Anonymous/unnamed symbols are excluded — they have no meaningful
+    name for the LLM to analyse.
+    """
     if stored_analyze_vendor:
         return conn.execute(
             """SELECT COUNT(*)
@@ -459,6 +527,8 @@ def list_projects(
     """
     cfg = load_config(project_root=Path(project_root).resolve() if project_root else None)
     index_dir = cfg.index.db_dir
+    # Glob for subdirectories containing index.db — each subdirectory
+    # is named after a project_id UUID4.
     db_files = list(index_dir.glob("*/index.db")) if index_dir.exists() else []
     if not db_files:
         return [{"info": f"No indexed projects found under {index_dir}."}]
@@ -474,6 +544,9 @@ def list_projects(
 
             rows, db_schema_ver = executor.execute_sync(_query, "")
             for r in rows:
+                # Staleness check: compare stored creation time with
+                # compile_commands.json mtime.  Does not require
+                # _wrap_tool — list_projects is informational only.
                 cc_stale = (
                     _is_stale(
                         {"created_at": r["created_at"]},
@@ -541,6 +614,9 @@ def reset_index(
     conn = None
     try:
         conn = open_db(db_path)
+        # DatabaseCorruptionError is raised during open when the integrity
+        # check (PRAGMA integrity_check) fails.  A corrupt DB can still
+        # be deleted — we track the flag and skip symbol counting.
     except DatabaseCorruptionError:
         corrupt = True
     else:
@@ -589,6 +665,9 @@ def reset_index(
         # 3. Only then delete the files.
         invalidate_executor(str(db_path.resolve()))
         db_path.unlink()
+        # WAL and SHM files are sidecar files managed by SQLite in WAL
+        # journal mode.  They must be deleted alongside the main DB file
+        # to prevent a zombie WAL from being replayed into a fresh index.
         for suffix in ("-wal", "-shm", "-journal"):
             p = db_path.with_name(db_path.name + suffix)
             p.unlink(missing_ok=True)
@@ -607,7 +686,16 @@ def _reindex_cleanup_deleted_file(
     root: Path,
     db_path: Path,
 ) -> dict:
-    """Clean up index records for a file that no longer exists on disk."""
+    """Remove index records for a file that no longer exists on disk.
+
+    Called when ``reindex_file`` is invoked for a path that the user
+    deleted after indexing.  Fetches the file's old ID from the index,
+    counts deleted symbols for reporting, and purges all records
+    (symbols, references, analysis) via ``purge_file_records``.
+
+    Pauses background reindex to avoid a race: the bg thread might
+    also detect the deletion and attempt its own cleanup.
+    """
     config_hash = cfg_data["config_hash"]
     from ...indexer.db import get_file_mtimes, purge_file_records
     from ...indexer.db._locking import WriteLockTimeout
@@ -655,9 +743,19 @@ def _reindex_parse_and_store(
     vendor_patterns: list[str],
     project_patterns_list: list[str],
 ) -> tuple[int, dict]:
-    """Parse matching TUs with libclang, store symbols, update manifest.
+    """Parse one or more translation units with libclang and store their symbols.
 
-    Returns (total_symbols, partial_result_dict with elapsed time info).
+    Steps:
+    1. Call ``extract_all`` for each TU — this invokes libclang to parse
+       the file with the compiler flags from compile_commands.json.
+    2. Within a single write-lock transaction, call ``store_symbols_for_unit``
+       for each successfully parsed TU to upsert symbols into the database.
+    3. Run macro resolution (best-effort — silently skipped on failure).
+    4. Delete orphan file records (files that disappeared from the index).
+    5. Update the manifest.json header-dependency tracking file.
+
+    Returns ``(total_symbols, result_dict)``.  The result dict includes
+    ``symbols_updated``, ``elapsed_s``, and optionally ``skipped_tus``.
     """
     from ...indexer.compile_commands import CompilationUnit as TU
     from ...indexer.db import write_lock as db_write_lock
@@ -670,6 +768,9 @@ def _reindex_parse_and_store(
 
     config_hash = cfg_data["config_hash"]
 
+    # Phase 1: parse all matching TUs before acquiring the write lock.
+    # Parsing is CPU-bound and does not touch the database — doing it
+    # outside the lock minimises contention.
     parsed_units: list[tuple[TU, ExtractionResult]] = []
     skipped_tus: list[str] = []
     for unit in matching:
@@ -679,6 +780,8 @@ def _reindex_parse_and_store(
         except sqlite3.Error as exc:
             return 0, {"error": f"DB error during parse of {unit.file.name}: {exc}"}
         except RuntimeError as exc:
+            # Clang parse failures (missing headers, syntax errors) are
+            # non-fatal — skip the TU and continue with others.
             log.warning("skip TU %s during reindex: %s", unit.file.name, exc)
             skipped_tus.append(str(unit.file.name))
 
@@ -690,6 +793,9 @@ def _reindex_parse_and_store(
         total_symbols = 0
 
         try:
+            # Phase 2: acquire the write lock and store all parsed symbols
+            # in a single transaction per TU.  Each TU gets its own
+            # transaction so partial failures don't roll back all work.
             with db_write_lock(db_path.parent, timeout=60.0):
                 for unit, parsed in parsed_units:
                     with transaction(conn):
@@ -702,6 +808,10 @@ def _reindex_parse_and_store(
                         )
                         total_symbols += syms_added
 
+                # Phase 3: resolve macro definitions after all TUs are stored.
+                # Macro resolution needs the clang flags from one TU (they
+                # are identical for TUs of the same file) and runs a
+                # best-effort pass — failure is silently ignored.
                 if parsed_units:
                     try:
                         from ...indexer.macros import resolve_and_update
@@ -710,6 +820,8 @@ def _reindex_parse_and_store(
                     except Exception:  # nosec B110 — macro expansion is best-effort
                         pass
 
+                # Phase 4: clean up orphan files — files that existed in
+                # the previous index but are now absent from the TU list.
                 from ...indexer.db import delete_orphan_files
                 deleted_orphans = delete_orphan_files(conn, config_hash)
                 if deleted_orphans:
@@ -739,7 +851,17 @@ def _update_manifest_after_reindex(
     db_dir: Path,
     config_hash: str,
 ) -> None:
-    """Update manifest.json entries for reindexed translation units."""
+    """Update manifest.json entries for reindexed translation units.
+
+    The manifest tracks each TU's source hash and its set of included
+    headers.  After re-parsing a file, the manifest entry must be
+    refreshed so header-staleness detection (used by ``get_active_build``)
+    reflects the file's current dependencies.
+
+    When the manifest does not exist (first index, or manifest not
+    enabled), this is a no-op — the ``load_manifest`` guard returns
+    early.
+    """
     try:
         from fw_context_mcp.utils import compute_source_hash
 
@@ -788,7 +910,16 @@ def _reindex_llm_analysis(
     *,
     project_root: Path,
 ) -> None:
-    """Regenerate LLM symbol analysis for reindexed symbols."""
+    """Regenerate LLM symbol analysis for symbols affected by a reindex.
+
+    Only runs when both ``cfg.llm.enabled`` and ``cfg.llm.analyze_symbols``
+    are True.  Reads the stored ``analyze_vendor`` flag from the build
+    config to determine whether vendor symbols should be re-analysed.
+
+    Uses ``CacheClient`` to avoid redundant LLM calls for symbols whose
+    source has not changed.  Failures are non-fatal — the result dict
+    gets an ``analysis_warning`` key instead of a hard error.
+    """
     if not (cfg.llm.enabled and cfg.llm.analyze_symbols):
         return
     try:
@@ -831,7 +962,15 @@ def _reindex_overrides(
     db_dir: Path,
     result: dict,
 ) -> None:
-    """Rebuild method override relationships."""
+    """Rebuild virtual method override relationships after reindex.
+
+    Only runs when ``cfg.index.index_refs`` is True (reference indexing
+    must be enabled).  The override table maps virtual methods to their
+    overrides in derived classes and is used by ``get_method_overrides``.
+
+    Failures are non-fatal — an ``overrides_warning`` key is added to
+    the result dict.
+    """
     if not cfg.index.index_refs:
         return
     try:
@@ -848,7 +987,15 @@ def _reindex_pagerank(
     cfg: Config,
     result: dict,
 ) -> None:
-    """Rebuild PageRank and hotspot cache."""
+    """Rebuild PageRank scores and the hotspot cache after reindex.
+
+    PageRank runs on the call graph to rank functions by architectural
+    importance.  The hotspot cache pre-computes the top-N most-called
+    functions for ``find_hotspots``.  Both depend on the reference index
+    (``cfg.index.index_refs`` must be True).
+
+    Failures are non-fatal.
+    """
     if not cfg.index.index_refs:
         return
     try:
@@ -869,7 +1016,17 @@ def _reindex_embeddings(
     root: Path,
     result: dict,
 ) -> None:
-    """Regenerate vector embeddings for reindexed symbols."""
+    """Regenerate vector embeddings for symbols in the reindexed file.
+
+    Only runs when ``cfg.llm.enabled`` is True (the embedding model is
+    configured through the LLM subsystem).  Queries for all symbol IDs
+    belonging to the file path, then calls ``_build_embeddings`` with
+    the filtered ID set to avoid recomputing embeddings for the entire
+    index.
+
+    When no symbols are found for the file path (possible for symlink
+    or out-of-root files), the warning is logged but no error is raised.
+    """
     if not cfg.llm.enabled:
         return
     from ...indexer.ops import _normalize_file_path
@@ -913,7 +1070,20 @@ def _reindex_post_write_phases(
 ) -> dict:
     """Run post-write enrichment phases after reindex_file.
 
-    Each phase is independent — failure in one does not prevent others.
+    Each phase is independent — failure in one does not prevent others
+    from running.  The phases are:
+
+    1. LLM symbol analysis (function descriptions)
+    2. Virtual method override relationships
+    3. PageRank scores and hotspot cache
+    4. Vector embeddings for semantic search
+
+    When ``total_symbols <= 0``, all phases are skipped (nothing was
+    added or updated).
+
+    A warning is emitted when a single header file is reindexed via only
+    one TU — other TUs including the same header may still have stale
+    symbols and the user should run a full ``fw-context index``.
     """
     if total_symbols <= 0:
         return result
@@ -1038,8 +1208,13 @@ def _reindex_resolve_target(
 ) -> tuple[Path, dict | None]:
     """Resolve *file_path* to an absolute path relative to *root*.
 
+    When the path is relative, it is joined with *root* and resolved.
+    When absolute, it is resolved directly.  Resolution follows symlinks
+    so the path matches the canonical form in compile_commands.json.
+
     Returns ``(target, None)`` on success or ``(target, error_dict)``
-    when the path cannot be resolved.
+    when the path cannot be resolved.  The error_dict arm is reserved
+    for future path-safety checks; currently this function never fails.
     """
     target = Path(file_path)
     if not target.is_absolute():
@@ -1054,7 +1229,14 @@ def _reindex_match_tus(
 ) -> tuple[list, dict | None]:
     """Find compilation units in compile_commands.json that build *target*.
 
-    Returns ``(matching_tus, None)`` or ``(None, error_dict)``.
+    Parses the compile_commands.json file and matches by absolute,
+    resolved file path.  A single source file may appear in multiple TUs
+    (e.g. when a header is included by several .cpp files) — all
+    matching TUs are returned so symbols from every context are updated.
+
+    Returns ``(matching_tus, None)`` on success or an empty list with
+    an ``error_dict`` when the compile_commands.json is missing or the
+    target file is not listed.
     """
     cc_path = Path(cfg_data["compile_commands_path"])
     if not cc_path.exists():
@@ -1069,7 +1251,18 @@ def _reindex_match_tus(
 def _reindex_build_patterns(
     cfg, root: Path
 ) -> tuple[list[str], list[str]]:
-    """Collect vendor-exclude and project-include file path patterns."""
+    """Collect vendor-exclude and project-include file path patterns.
+
+    Returns two lists of SQL LIKE patterns:
+
+    *vendor_patterns* — paths that the SDK detector and the user config
+    mark as vendor/SDK code.  These patterns exclude symbols from the
+    ``is_project`` flag and from ``project_only`` queries.
+
+    *project_patterns_list* — paths explicitly listed as project code
+    in the user config.  These override the auto-detected vendor
+    boundary when the detector misclassifies a path.
+    """
     from ...indexer.sdk_detect import _build_sdk_excludes, _normalize_patterns
 
     vendor_patterns = list(_build_sdk_excludes(root))
@@ -1141,13 +1334,18 @@ def check_ollama(
     try:
         _, cfg, _, _ = _resolve_context(project_root)
     except RuntimeError:
-        # Project has no index — irrelevant for check_ollama (only needs LLM config)
+        # Project has no index — irrelevant for check_ollama (only needs
+        # LLM config).  Fall back to loading config directly without
+        # requiring an active index.
         from pathlib import Path
 
         from fw_context_mcp.config.settings import load
 
         cfg = load(Path(project_root) if project_root else None)
     if not cfg.llm.enabled:
+        # LLM is explicitly disabled in config.  Return immediately
+        # with a message that explains the implications for tools that
+        # depend on the LLM backend.
         return {
             "status": "disabled",
             "ollama_enabled": False,
@@ -1161,10 +1359,13 @@ def check_ollama(
                 "smart_search will use raw text queries."
             ),
         }
+    # Delegates to check_setup which probes the Ollama server / chat API,
+    # lists installed models, and determines the status string.
     result = check_setup(cfg.llm)
     result["ollama_enabled"] = True
 
-    # Check sqlite-vec availability for semantic_search
+    # sqlite-vec is needed for semantic_search embeddings.
+    # Report availability so tools can degrade gracefully.
     from ...deps import _vec_available
     vec_ok, vec_err = _vec_available()
     result["vec_available"] = vec_ok
@@ -1195,9 +1396,13 @@ def get_project_info(
     from ...config.global_db import get_project_by_id
 
     if not project_id:
+        # Empty string is the default — the LLM must be told that a
+        # project_id is required before this tool can return anything.
         return {"error": "project_id is required — provide a UUID4 hex string from fw-context init."}
     result = get_project_by_id(project_id)
     if result is None:
+        # The UUID was not found in the global registry (~/.fw-context/projects.db).
+        # This can happen when the project was deleted or the registry was reset.
         return {"error": f"Project '{project_id}' not found in the global registry."}
     return result
 
@@ -1283,6 +1488,8 @@ def configure_llm(
     try:
         _, cfg, _, root = _resolve_context(project_root, skip_ready_check=True)
     except ProjectNotInitializedError as e:
+        # configure_llm writes local.toml — the project must be initialized
+        # so the config directory (.fw-context/) exists.
         return {
             "status": "error",
             "message": (
@@ -1291,7 +1498,10 @@ def configure_llm(
             ),
         }
 
-    # Build updates dict — only non-None values are written
+    # Collect only non-default/non-None values to avoid overwriting
+    # existing settings with defaults.  The auto_pull comparison uses
+    # the current config value (not a constant) to distinguish "user
+    # explicitly set False" from "user passed the default arg False".
     updates: dict[str, object] = {}
     if chat_api_base is not None:
         updates["chat_api_base"] = chat_api_base
@@ -1314,7 +1524,10 @@ def configure_llm(
             "message": "No configuration changes to write — all parameters are None or default.",
         }
 
-    # Compliance warning for external URLs
+    # Compliance warning for external URLs.
+    # The _is_loopback_url check catches localhost, 127.0.0.1, and ::1
+    # but NOT internal-network IPs (e.g. 192.168.x.x).  Only loopback
+    # is considered "safe" — everything else gets the warning.
     result: dict = {}
     if chat_api_base and not _is_loopback_url(chat_api_base):
         result["compliance_warning"] = (
@@ -1325,7 +1538,10 @@ def configure_llm(
             "API proxy."
         )
 
-    # Write to local.toml (only local.toml — never global or shared config)
+    # Write to local.toml — only local.toml, never global or shared config.
+    # This is the critical security boundary: configure_llm does not touch
+    # .fw-context/config.toml (shared, committed) or ~/.fw-context/config.toml
+    # (global, machine-wide).  local.toml is gitignored and per-developer.
     try:
         _update_local_toml(Path(root), updates)
     except Exception as e:
@@ -1334,7 +1550,9 @@ def configure_llm(
             "message": f"Failed to write local.toml: {e}",
         }
 
-    # Reload config (cache is mtime-based — file change triggers reload)
+    # Reload config — the cache is mtime-based so the file change
+    # triggers a fresh parse.  This ensures the response reflects the
+    # newly written settings.
     new_cfg = load_config(project_root=Path(root))
     result["chat_api"] = {
         "configured": bool(new_cfg.llm.chat_api_base),
@@ -1345,7 +1563,8 @@ def configure_llm(
     result["auto_pull"] = new_cfg.llm.auto_pull
     result["stream"] = new_cfg.llm.stream
 
-    # Test the configuration with a simple API call
+    # Test the configuration with a simple API call.
+    # When LLM is disabled, skip the test — there is no endpoint to call.
     if not new_cfg.llm.enabled:
         result["status"] = "ok"
         result["message"] = "Configuration written. LLM is disabled — no test call made."
@@ -1355,6 +1574,9 @@ def configure_llm(
         from ...llm.ollama import call_ollama
 
         t0 = time.monotonic()
+        # Use a short timeout and minimal token budget for the test call.
+        # The prompt is deliberately trivial ("Reply with exactly: OK")
+        # so even a slow model responds quickly.
         test_cfg = dataclasses.replace(new_cfg.llm, timeout=30.0)
         response = call_ollama(
             "Reply with exactly: OK",
@@ -1368,6 +1590,9 @@ def configure_llm(
         result["test_response"] = response[:100]
         result["message"] = f"Configuration written and tested successfully ({latency}s)."
     except OllamaError as e:
+        # Configuration was written but the test call failed.
+        # The LLM should inspect the error and guide the user to fix
+        # the URL, key, or model name.
         result["status"] = "error"
         result["message"] = f"Configuration written but test call failed: {e}. Check the API URL, key, and model name."
 

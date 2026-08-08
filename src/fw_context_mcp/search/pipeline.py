@@ -1,4 +1,29 @@
-"""PipelineRunner — executes a configured sequence of search phases."""
+"""PipelineRunner — executes a configured sequence of search phases.
+
+Why a pipeline with configurable phases?
+    Different search modes need different phase combinations:
+
+    - ``SEARCH_CODE``: fast FTS5 symbol search (no LLM, no embeddings)
+    - ``SMART_SEARCH``: full pipeline (translate → rough → LLM → FTS5 →
+      refine → embedding → fusion → deduplicate → expand → format)
+    - ``SEMANTIC_SEARCH``: embedding-only similarity search
+
+    A composable pipeline lets each mode pick its phases without code
+    duplication.  New search modes add a new ``PipelineConfig`` without
+    touching the runner.
+
+Why lazy registry?
+    Phase classes import heavy dependencies (sentence-transformers,
+    sqlite-vec, Ollama client).  Loading all phases at import time would
+    make every search slow, even the simple ``SEARCH_CODE`` path.  The
+    lazy registry defers imports until ``PipelineRunner.run()`` is called.
+
+Why continue on phase failure?
+    A single phase fail (e.g. Ollama timeout during refinement) should
+    not break the entire search.  The pipeline collects warnings and
+    continues to the next phase, so the user still gets partial results
+    instead of an error.
+"""
 
 from __future__ import annotations
 
@@ -20,7 +45,22 @@ _REGISTRY_LOCK = threading.Lock()
 
 
 def _build_registry() -> dict[str, Phase]:
-    """Lazy-load all phase classes into the registry."""
+    """Lazy-load all phase classes into the registry.
+
+    Why lazy?
+        Phase imports pull in sentence-transformers (~200 MB), sqlite-vec
+        (~5 MB native library), and Ollama client.  A simple FTS5 search
+        should not pay these import costs.  The registry is built on first
+        ``PipelineRunner.run()`` call, deferring heavy imports to when
+        they're actually needed.
+
+    Why double-checked locking?
+        Multiple concurrent tool calls may trigger ``_build_registry``
+        simultaneously.  The first check (without lock) is a fast path
+        for the common case; the second check (with lock) handles the
+        race where another thread populated the registry between the
+        first check and acquiring the lock.
+    """
     if _REGISTRY:
         return _REGISTRY
 
@@ -79,6 +119,12 @@ def _build_registry() -> dict[str, Phase]:
 class PipelineConfig:
     """Which phases to run, in what order.
 
+    Why support both string names and Phase instances?
+        String names (``"translate"``) are simpler for most phases that
+        need no configuration.  Phase instances (``EmbeddingPhase(threshold=0.6)``)
+        allow per-pipeline parameter customisation without subclassing.
+        Both forms coexist in the same ``phases`` list.
+
     Each element can be either a phase name string (looked up in the registry)
     or a pre-configured ``Phase`` instance (for custom parameters).
 
@@ -90,6 +136,10 @@ class PipelineConfig:
 
 
 # Predefined pipelines
+
+# SEARCH_CODE: fast FTS5 symbol search with progressive fallbacks.
+# No LLM, no embeddings — runs entirely on the SQLite index.
+# Each fallback only executes when the previous phase found nothing.
 SEARCH_CODE = PipelineConfig(
     phases=[
         "rough_search",
@@ -105,7 +155,14 @@ SEARCH_CODE = PipelineConfig(
 
 
 def _build_smart_search() -> PipelineConfig:
-    """Lazy-built SMART_SEARCH config — imports Phase classes on first use."""
+    """Lazy-built SMART_SEARCH config — imports Phase classes on first use.
+
+    Why lazy?
+        SMART_SEARCH pulls in ``EmbeddingPhase`` which imports sqlite-vec.
+        Building the config at module load time would make every import of
+        ``search`` pay the native-library cost, even for callers that only
+        use ``SEARCH_CODE``.
+    """
     from fw_context_mcp.search.phases.embedding import EmbeddingPhase
 
     return PipelineConfig(
@@ -131,6 +188,16 @@ def _build_smart_search() -> PipelineConfig:
 def _build_semantic_search(threshold: float, overfetch: int) -> PipelineConfig:
     """Lazy-built SEMANTIC_SEARCH config.
 
+    Why a builder function instead of a constant?
+        Semantic search is always called with caller-provided ``threshold``
+        and ``overfetch`` parameters.  These vary per invocation — a
+        constant couldn't capture them.
+
+    Why source_boost=True?
+        Project code is weighted 1.2× and vendor SDK 0.85×.  This ensures
+        project-owned symbols rank higher than framework code in semantic
+        search results, matching user expectations.
+
     Standalone embedding with source boosting for project-code ranking.
     """
     from fw_context_mcp.search.phases.embedding import EmbeddingPhase
@@ -154,6 +221,17 @@ def _build_semantic_search(threshold: float, overfetch: int) -> PipelineConfig:
 class PipelineRunner:
     """Execute a configured sequence of phases against a PipelineContext.
 
+    Why async?
+        Both LLM calls (Ollama) and embedding operations are I/O-bound.
+        The async runner lets these phases overlap with database queries
+        from other concurrent searches in the MCP server.
+
+    Why continue on phase failure?
+        A non-fatal phase error (e.g. Ollama timeout) should not prevent
+        results from earlier phases from being formatted and returned.
+        The pipeline collects warnings and continues, so users get partial
+        results rather than an opaque error.
+
     Usage::
 
         ctx = PipelineContext.create(query="modem init", project_root="/path")
@@ -170,8 +248,17 @@ class PipelineRunner:
     async def run(self, ctx):
         """Run all configured phases sequentially, returning the final context.
 
-        Each phase that ``should_run()`` returns True for receives the context,
-        runs, and returns an updated context.  Skipped phases pass through.
+        Why sequential, not parallel?
+            Phases have data dependencies — ``LLMQueryPhase`` needs
+            ``rough_samples`` from ``RoughSearchPhase``, ``RefinePhase``
+            needs ``fts5_results`` from ``FTS5SearchPhase``.  Sequential
+            execution ensures correct ordering.  The cost is acceptable
+            because the total pipeline time is dominated by 2-3 LLM calls
+            (5-15 s), not by phase dispatch overhead (<1 ms per phase).
+
+        Each phase that ``should_run()`` returns True for receives the
+        context, runs, and returns an updated context.  Skipped phases
+        pass through verbatim.
         """
         for item in self.config.phases:
             if isinstance(item, Phase):
@@ -204,6 +291,7 @@ class PipelineRunner:
                     log.warning("Phase %r failed: %s", phase_name, exc)
                 ctx = ctx.evolve(warnings=ctx.warnings + [f"Phase {phase_name!r} failed: {exc}"])
                 # Continue with remaining phases — one phase failure
-                # shouldn't break the entire search.
+                # shouldn't break the entire search.  Users get partial
+                # results from earlier phases instead of an opaque error.
 
         return ctx

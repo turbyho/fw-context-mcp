@@ -1,7 +1,21 @@
 """TTL cache for LLM-generated search keywords.
 
-Avoids calling Ollama repeatedly for the same (query, config_hash) pair
-within a session.
+Why cache LLM responses?
+    Calling Ollama to generate FTS5 search terms takes 2-10 seconds per
+    query.  Users often repeat similar searches during a session ("modem
+    init", then "modem connect", then "modem attach").  Without caching,
+    each query variant would call Ollama again even for identical queries.
+
+    The cache stores ``(query, config_hash)`` → ``(queries, understanding)``
+    mappings with a 5-minute TTL.  This covers repeated searches within
+    a session without serving stale results from a different build config.
+
+Why an OrderedDict with TTL rather than functools.lru_cache?
+    lru_cache is unbounded and process-global.  This cache is explicitly
+    bounded (256 entries) with time-based eviction.  Different projects
+    have different config_hashes — a process-global LRU cache would mix
+    entries across projects.  The bounded TTL approach gives predictable
+    memory usage and implicit project isolation via the config_hash key.
 """
 
 from __future__ import annotations
@@ -13,6 +27,18 @@ from collections import OrderedDict
 
 class KeywordCache:
     """Simple TTL cache for (query, config_hash) → list[str] mappings.
+
+    Why bounded with TTL?
+        Unbounded caches grow indefinitely in long-running MCP server
+        processes.  The combination of max_entries (256) and TTL (300 s)
+        bounds both memory and staleness.  LRU eviction via OrderedDict
+        ensures frequently-accessed entries survive while one-shot queries
+        are evicted quickly.
+
+    Why thread-safe?
+        The MCP server handles concurrent tool calls.  Multiple search
+        requests can hit the cache simultaneously — the lock prevents
+        data races on the OrderedDict.
 
     Evicts entries older than *ttl_s* seconds on access.  When the cache
     exceeds *max_entries*, the oldest entries are evicted first.
@@ -32,7 +58,13 @@ class KeywordCache:
         self._lock = threading.Lock()
 
     def get(self, key: tuple) -> tuple[list[str], str] | None:
-        """Return cached (queries, understanding) or None if missing / expired."""
+        """Return cached (queries, understanding) or None if missing / expired.
+
+        Why refresh LRU position on access?
+            This implements a "read-through" LRU policy — every ``get()``
+            moves the entry to the front of the OrderedDict, so entries
+            that are actively used survive eviction.
+        """
         with self._lock:
             entry = self._store.get(key)
             if entry is None:
@@ -45,10 +77,18 @@ class KeywordCache:
             return value
 
     def set(self, key: tuple, queries: list[str], understanding: str = "") -> None:
-        """Store (queries, understanding), evicting oldest if at capacity."""
+        """Store (queries, understanding), evicting oldest if at capacity.
+
+        Why popitem(last=False)?
+            OrderedDict.popitem(last=False) evicts the Least-Recently-Used
+            entry (oldest by insertion + access order).  This is standard
+            LRU eviction — new entries push out the ones nobody has looked
+            at recently.
+        """
         with self._lock:
             if len(self._store) >= self._max_entries:
-                # LRU eviction via OrderedDict — get() refreshes position, popitem(last=False) evicts LRU
+                # LRU eviction via OrderedDict — get() refreshes position,
+                # popitem(last=False) evicts the oldest entry
                 self._store.popitem(last=False)
             self._store[key] = (time.monotonic(), (queries, understanding))
 
@@ -61,5 +101,7 @@ class KeywordCache:
             return len(self._store)
 
 
-# Session-level caches
+# Module-level singleton — shared across all search invocations within the
+# same process (MCP server or CLI).  One cache per process avoids redundant
+# LLM calls across different tool invocations.
 keyword_cache = KeywordCache()

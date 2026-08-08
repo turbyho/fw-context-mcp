@@ -28,8 +28,12 @@ class MakefileBuildSystem:
     """Makefile project — compile_commands.json via ``compiledb make``.
 
     Auto-detected when a ``Makefile`` exists in the project root.
-    Uses the ``compiledb`` Python package, which is a pure-Python
-    tool that parses make output — no need for ``bear``.
+
+    WHY compiledb (not bear): bear intercepts compiler calls via
+    LD_PRELOAD, which requires the compiler to actually run.  compiledb
+    parses the Makefile to understand the build graph and can produce
+    compile_commands.json without compiling — faster and works even for
+    projects that don't build in the current environment.
     """
 
     name: str = "Makefile"

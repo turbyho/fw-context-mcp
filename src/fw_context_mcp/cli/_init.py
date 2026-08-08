@@ -1,4 +1,20 @@
-"""``fw-context init`` — AI assistant setup and instruction injection."""
+"""``fw-context init`` — register fw-context with AI coding assistants.
+
+This command discovers installed AI tools (Claude Code, Codex, Cursor,
+OpenCode, etc.) and injects fw-context usage instructions plus MCP server
+registration into their configuration files.
+
+Injection has two parts:
+1. **MCP registration** — registers the ``fw-context-mcp`` MCP server so
+   the assistant can invoke fw-context tools at runtime.
+2. **Instruction injection** — writes a CRITICAL block into each agent
+   file (CLAUDE.md, AGENTS.md, .cursorrules, etc.) telling the assistant
+   to use fw-context tools instead of raw file reads for C/C++ code.
+
+WHY: Manual configuration is error-prone and tool-specific.  This command
+automates it across 7+ AI assistants and 3 scopes (global, project, all),
+respecting each tool's config format and inheritance model.
+"""
 
 from __future__ import annotations
 
@@ -16,7 +32,17 @@ if TYPE_CHECKING:
 
 
 def _write_build_key(project_root: Path, key: str, value: str) -> None:
-    """Write a key-value pair into the [build] section of local.toml."""
+    """Write a key-value pair into the [build] section of local.toml.
+
+    Uses ``set_key`` from the TOML editor to update or insert the key.
+    The file is created automatically if it does not exist.
+
+    WHY: Build environment detection (Python path, activate script) is
+    done once during ``fw-context init`` and stored in local config.
+    Subsequent ``fw-context index`` calls read these values rather than
+    re-detecting them, which would require running Mbed CLI / west
+    commands again.
+    """
     from fw_context_mcp.config._toml_editor import set_key
 
     local_path = project_root / ".fw-context" / "local.toml"
@@ -28,7 +54,7 @@ def _install_skills(
     project_root: Path | None = None,
     scope: str = "project",
 ) -> bool:
-    """Copy fw-context skills to AI tool skills directories.
+    """Copy fw-context review skills to AI tool skills directories.
 
     Installs the fw-review skill globally (when scope is
     ``"global"`` or ``"all"``) and at the project level (when scope is
@@ -38,6 +64,11 @@ def _install_skills(
     paths are hardcoded here.  Project-local skills override global
     ones — if a project has its own copy the user intentionally
     customized it.
+
+    WHY: The fw-review skill teaches AI assistants how to review C/C++
+    firmware code using fw-context tools.  Installing it automatically
+    saves the user from copying skill files manually across multiple
+    tools and projects.
     """
     from ..config.tools import (
         CROSS_TOOL_SKILL_DIRS_GLOBAL,
@@ -114,6 +145,10 @@ def _detect_project_ai_tools(project_root: Path) -> list[str]:  # noqa: ARG001 �
 
     Uses ``AiTool.is_detected()`` — checks for CLI binaries in PATH
     and global config directories (``~/.claude``, ``~/.codex``, etc.).
+
+    WHY: Detection is the first step of ``fw-context init``.  The
+    tool must know which assistants are present before it can inject
+    instructions into their configuration files.
     """
     from ..config.tools import TOOLS
 
@@ -123,7 +158,16 @@ def _detect_project_ai_tools(project_root: Path) -> list[str]:  # noqa: ARG001 �
 def _build_agent_targets(
     scope: str, project_root: Path | None
 ) -> list[tuple[Path, str, list[str], bool]]:
-    """Build the list of (directory, tool_id, file_patterns, strip_name) tuples."""
+    """Build the list of (directory, tool_id, file_patterns, strip_name) tuples.
+
+    Iterates ``TOOLS`` for each tool's agent directories and
+    ``CROSS_TOOL_AGENT_DIRS_*`` for directories shared across tools.
+
+    WHY: Agent directories differ per tool and per scope.  This
+    function normalizes all of them into a flat list so downstream
+    injection code does not need to know about individual tool
+    layouts.
+    """
     from ..config.tools import CROSS_TOOL_AGENT_DIRS_GLOBAL, CROSS_TOOL_AGENT_DIRS_PROJECT, TOOLS
 
     targets: list[tuple[Path, str, list[str], bool]] = []
@@ -174,6 +218,11 @@ def _inject_critical_block(
     Scans *agents_dir* for files matching *patterns*, injecting
     *critical_block* into each one (TOML vs markdown handled automatically).
     Returns ``True`` if any files were updated (or would be in dry-run mode).
+
+    WHY: Existing agent files already contain user content.  We must
+    inject the fw-context critical block without overwriting the rest
+    of the file.  This requires format-aware injection: TOML uses
+    section headers, markdown uses HTML-style markers.
     """
     from ._mcp import _inject_agent_section, _inject_agent_toml_section
 
@@ -215,6 +264,11 @@ def _install_template_agents(
     - ``.md`` → ``.mdc`` (Cursor rules, same content)
 
     Returns ``True`` if any templates were installed (or would be in dry-run).
+
+    WHY: Each AI tool uses a different config format.  We ship a single
+    canonical markdown template and convert it per-tool at install time.
+    This avoids maintaining duplicate templates that would inevitably
+    drift out of sync.
     """
     from ._mcp import _convert_agent_md_to_toml
 
@@ -294,6 +348,12 @@ def _install_agents(dry_run: bool = False, project_root: Path | None = None, sco
 
     Agent directories and file patterns are driven by the ``TOOLS``
     registry — no tool paths are hardcoded here.
+
+    WHY: Agent files are the primary way AI assistants learn project-
+    specific conventions.  Injecting the CRITICAL block ensures every
+    assistant in the project knows to use fw-context for C/C++ code.
+    New agent files receive the full template; existing ones get only
+    the injected section to preserve user content.
     """
     from ..config.tools import AGENT_CRITICAL_BLOCK
     pkg_dir = Path(__file__).resolve().parent.parent  # src/fw_context_mcp/
@@ -321,6 +381,12 @@ def _select_init_tools(args: argparse.Namespace, project_root: Path) -> list[str
     """Select which AI tools to act on.
 
     Returns a list of tool IDs, or None if a fatal error occurred (caller returns 1).
+
+    WHY: The user can pass ``--tool claude-code`` to target one tool,
+    a comma-separated list for multiple, or omit it to auto-detect all
+    installed tools.  Detection uses project-level and system-wide
+    heuristics because some tools only install config globally while
+    others create project-local files.
     """
     from ..config.tools import TOOLS
 
@@ -371,6 +437,12 @@ def _handle_inheritance(
     Returns ``(should_return, ok, warnings)``.  When *should_return* is
     ``True`` the caller must return ``(ok, warnings)`` immediately.
     Otherwise *ok* is the initial ok flag to carry forward.
+
+    WHY: Some AI tools inherit configuration from a parent tool
+    (e.g. kilocode inherits from claude-code).  When the parent already
+    has fw-context instructions and is detected, injecting into the child
+    is redundant and risks duplication.  The ``--force`` flag overrides
+    this safety check.
     """
     from ..config.tools import TOOLS
 
@@ -410,6 +482,12 @@ def _inject_instructions(
     write methods.
 
     Returns ``(ok, warnings)``.
+
+    WHY: Collision detection is critical — some directories are managed
+    by external tools (skillshare) and overwriting them would break other
+    integrations.  Unmarked content detection prevents accidental
+    overwrite of user-written instructions that happen to contain
+    fw-context references.
     """
     from ..config.tools import check_target
     from ._mcp import _update_marked_section

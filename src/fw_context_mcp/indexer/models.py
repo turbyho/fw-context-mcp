@@ -1,5 +1,11 @@
 """Data models for the fw-context-mcp index.
 
+WHY separate from symbols.py: symbols.py imports libclang (``clang.cindex``)
+and sqlite3.  These dataclass definitions are pure Python — no C extension
+bindings, no DB driver.  Keeping them isolated allows other modules to
+import the data types without pulling in heavy dependencies or risking
+import errors on systems without libclang installed.
+
 Extracted from ``symbols.py`` — pure dataclass definitions with no
 AST traversal or DB dependencies.  Imported throughout the codebase
 without pulling in libclang or sqlite3.

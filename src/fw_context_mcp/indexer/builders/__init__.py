@@ -3,6 +3,20 @@
 Each supported build system has a class implementing the ``BuildSystem``
 protocol.  ``BuildSystemRegistry`` discovers the active system from project
 markers and holds the corresponding builder instance.
+
+WHY registry pattern: each build system is self-contained — it knows its
+detection markers, how to run the build, what tools it needs, and how to
+auto-detect the environment.  Adding a new build system only requires a
+new module and ``registry.register()`` — no changes to the core indexer.
+
+Detection strategy (tiered):
+Tier 1 — build: runs the native build tool (bear + cmake, pio run, west build,
+  mbed compile, bare compilation) to produce compile_commands.json + .d files.
+Tier 2 — detect only: recognizes IDE projects (STM32CubeIDE, TI CCS) and
+  instructs the user how to generate compile_commands.json manually.
+Tier 3 — generic fallback: tries cmake/make/makefile/compile_commands.json.
+Tier 4 — manual: user provides source_dirs and flags in config; fw-context
+  runs syntax-only compilation of each source file.
 """
 
 from __future__ import annotations

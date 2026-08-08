@@ -3,6 +3,13 @@
 Each check returns a :class:`DepCheckResult` — never raises.
 Heavy imports (httpx, clang, watchfiles) are local to the function body
 so that importing this module stays fast for pre-flight.
+
+WHY: Checks must never crash the CLI.  If a check raises an unhandled
+exception, the entire audit fails and the user sees a raw traceback.
+Every check catches all exceptions internally and returns an error
+result instead.  Imports are deferred so ``check_pysqlite3`` and
+``check_sqlite3_extensions`` (the pre-flight checks) can run without
+paying the cost of importing httpx, clang, or the config subsystem.
 """
 
 from __future__ import annotations
@@ -30,12 +37,21 @@ from ._instructions import (
 
 
 def _import(name: str):
-    """Import a module by name — indirection point for test monkeypatching."""
+    """Import a module by name — indirection point for test monkeypatching.
+
+    WHY: Direct ``import`` statements cannot be intercepted by tests.
+    Wrapping in a helper function lets test suites inject mock modules
+    without modifying production code.
+    """
     return importlib.import_module(name)
 
 
 def _version(pkg: str) -> str:
-    """Return the installed version of *pkg*, or ``"unknown"``."""
+    """Return the installed version of *pkg*, or ``"unknown"``.
+
+    Uses ``importlib.metadata`` which is the standard library replacement
+    for the deprecated ``pkg_resources``.
+    """
     try:
         return importlib.metadata.version(pkg)
     except importlib.metadata.PackageNotFoundError:
@@ -46,7 +62,16 @@ def _version(pkg: str) -> str:
 
 
 def check_pysqlite3() -> DepCheckResult:
-    """Verify pysqlite3 is installed and importable."""
+    """Verify pysqlite3 is installed and importable.
+
+    WHY: pysqlite3 is the most common failure point on macOS and Windows.
+    The Python.org installer and Homebrew Python do not ship with
+    ``--enable-loadable-sqlite-extensions``, which means sqlite-vec
+    cannot load at all.  pysqlite3 bundles a compatible SQLite.  The
+    ``"degraded"`` status catches the case where pysqlite3 is installed
+    but did not replace the stdlib sqlite3 module (e.g. wrong import
+    order due to PYTHONPATH).
+    """
     platform_ctx = get_platform_info()
     try:
         _import("pysqlite3")
@@ -78,7 +103,13 @@ def check_pysqlite3() -> DepCheckResult:
 
 
 def check_sqlite3_extensions() -> DepCheckResult:
-    """Verify sqlite3 supports loadable extensions."""
+    """Verify sqlite3 supports loadable extensions.
+
+    WHY: ``sqlite3.enable_load_extension(True)`` raises AttributeError
+    on macOS system Python and some pyenv builds.  This is distinct from
+    the pysqlite3 check — a Python with extension support but without
+    pysqlite3 will pass this check but fail the sqlite-vec load test.
+    """
     platform_ctx = get_platform_info()
     try:
         conn = sqlite3.connect(":memory:")
@@ -112,7 +143,15 @@ def check_sqlite3_extensions() -> DepCheckResult:
 
 
 def check_sqlite_vec() -> DepCheckResult:
-    """Verify sqlite-vec can load into SQLite."""
+    """Verify sqlite-vec can load into SQLite.
+
+    WHY: sqlite-vec can be installed (pip succeeds) but fail to load at
+    runtime.  Common causes: missing vec0.so shared library dependency
+    (libgcc_s.so.1 on Alpine, libc++.dylib on old macOS), SQLite version
+    too old, or architecture mismatch (arm64 pip on x86_64 Python).
+    The ``"degraded"`` status captures load-time failures; the
+    instructions include platform-specific diagnostic commands.
+    """
     platform_ctx = get_platform_info()
     try:
         mod = _import("sqlite_vec")

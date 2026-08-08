@@ -1,4 +1,33 @@
-"""Phase 2: LLM generates FTS5 search terms from query + sample symbols."""
+"""Phase: LLM generates FTS5 search terms from query + sample symbols.
+
+Why involve an LLM?
+    Users describe what they want in natural language ("how does the modem
+    connect to the network?") not in FTS5 query syntax ("modem* network*
+    attach*").  The LLM translates the intent into keyword queries, learning
+    the project's naming conventions from sample symbols so it generates
+    terms that actually match (snake_case for snake_case codebases,
+    camelCase for camelCase).
+
+Why show sample symbols?
+    Without samples, an LLM would guess naming conventions — it might
+    generate ``NetworkRegistration*`` for a codebase that uses
+    ``network_registration``.  The 12-20 samples from ``RoughSearchPhase``
+    teach the LLM the project's actual naming style, prefixes, and
+    abbreviations before it generates terms.
+
+Why the two-line output format (UNDERSTANDING / QUERIES)?
+    The "UNDERSTANDING" line forces the LLM to disambiguate before
+    generating queries.  "register to the network" → "network registration
+    (modem), NOT hardware register".  This step catches ambiguity that
+    would otherwise produce wrong queries.  The "QUERIES" line is a clean
+    JSON array for deterministic parsing.
+
+Why cache LLM responses?
+    LLM calls take 2-10 seconds.  Repeated searches with the same query
+    (common during exploration) would waste time and compute.  The cache
+    stores (query, config_hash) → (queries, understanding) with a 5-minute
+    TTL, avoiding redundant calls.
+"""
 
 from __future__ import annotations
 
@@ -19,9 +48,17 @@ log = logging.getLogger(__name__)
 class LLMQueryPhase(Phase):
     """Ask Ollama to generate FTS5 prefix search terms.
 
-    Shows the LLM the original query + 12-20 sample symbols from the project
-    so it can learn naming conventions (snake_case vs camelCase, prefixes)
-    before generating search terms.
+    What it does:
+        Builds a prompt with the user's query, 12-20 sample symbols from
+        the project, and detailed instructions about naming convention
+        learning, disambiguation, and output format.
+
+    Why fall back to rough terms?
+        If the LLM fails to parse into queries, the pipeline still has
+        ``rough_queries`` from ``RoughSearchPhase``.  These are FTS5
+        word-split terms from the raw query — lower quality than LLM-
+        generated terms, but sufficient to produce results rather than
+        returning empty.
 
     Output format expected from LLM:
         UNDERSTANDING: <one sentence — what subsystem, what they really want>
@@ -39,10 +76,7 @@ class LLMQueryPhase(Phase):
     async def run(self, ctx: PipelineContext) -> PipelineContext:
         """Build an LLM prompt from query + sample symbols, call Ollama, parse FTS5 terms.
 
-        Checks the keyword cache first.  Shows the LLM sample symbols so
-        it learns naming conventions before generating search terms.
-        Parses the ``UNDERSTANDING: ... QUERIES: [...]`` output format.
-        Falls back to rough terms on Ollama errors.
+        Checks the keyword cache first — cache hit avoids a 2-10s LLM call.
         """
         from fw_context_mcp.llm.ollama import OllamaError, OllamaModelNotFoundError, call_ollama_async
 
@@ -55,6 +89,8 @@ class LLMQueryPhase(Phase):
         query = ctx.query
         rough_samples = ctx.rough_samples
 
+        # Build prompt with or without sample symbols depending on what
+        # RoughSearchPhase produced (FTS5-only runs may have empty samples)
         if rough_samples:
             context_lines = [
                 f"  {r['name']} ({r['kind']}) — {r['file_path']}"
@@ -83,7 +119,7 @@ class LLMQueryPhase(Phase):
                 "question is about interrupts, exceptions, or fault handlers, include\n"
                 "`handler*` and `fault*` in your queries — these symbols don't contain\n"
                 "'irq' or 'isr' in their names.\n\n"
-                "Samples (use file paths to identify the right subsystem; samples\n"
+                f"Samples (use file paths to identify the right subsystem; samples\n"
                 "from unrelated subsystems are noise):\n"
                 f"{context_str}\n\n"
                 "CRITICAL OUTPUT RULES — plaintext only, NO markdown formatting:\n"
@@ -96,6 +132,8 @@ class LLMQueryPhase(Phase):
                 "Now respond with the same format for the query above.\n"
             )
         else:
+            # No samples available — LLM must guess naming conventions.
+            # Less reliable, but still better than raw word-split.
             prompt = (
                 "You are a C/C++ code search assistant for an embedded firmware project.\n\n"
                 "A developer asked:\n"
@@ -127,7 +165,9 @@ class LLMQueryPhase(Phase):
             else:
                 all_queries = ctx.rough_queries
                 log.warning("LLM response parse failed — falling back to rough queries")
-            is_fallback = not queries  # don't cache LLM failures — retry next time
+            # Don't cache failures — the same query might succeed next time
+            # if the model was temporarily overloaded
+            is_fallback = not queries
         except (OllamaModelNotFoundError, OllamaError) as e:
             return ctx.evolve(
                 generated_queries=list(ctx.rough_queries),
@@ -143,10 +183,22 @@ class LLMQueryPhase(Phase):
 
 
 def _parse_understanding_response(raw: str) -> tuple[str, list[str]]:
-    """Parse Phase 2 LLM response into (understanding, queries)."""
+    """Parse Phase 2 LLM response into (understanding, queries).
+
+    Why strip ANSI and markdown?
+        Some Ollama backends inject terminal control sequences (cursor
+        movement) or markdown formatting (bold, underline) into the raw
+        response.  Stripping before parsing prevents these artefacts
+        from breaking the JSON or regex extraction.
+
+    Why dual JSON + regex extraction?
+        Same rationale as ``_llm_parse.parse_llm_search_terms`` — the
+        prompt requests JSON, but small LLMs sometimes drift.  The regex
+        fallback handles markdown lists and inline terms.
+    """
     understanding = ""
     queries: list[str] = []
-    # Strip ANSI escape sequences (ollama injects cursor-move codes) and markdown bold
+    # Strip ANSI escape sequences (ollama injects cursor-move codes) and markdown bold/underline
     stripped = re.sub(r"\x1b\[[0-9;]*[a-zA-Z]", "", raw)
     stripped = re.sub(r"\*\*", "", stripped)
     stripped = re.sub(r"__", "", stripped)
@@ -169,6 +221,7 @@ def _parse_understanding_response(raw: str) -> tuple[str, list[str]]:
                 if isinstance(item, str) and item.strip():
                     queries.append(item.strip())
     except (ValueError, json.JSONDecodeError):
+        # Fallback: extract terms from markdown-style lists or inline text
         for match in re.finditer(r"[-*]\s*`?(\w+[*\w]*)`?", stripped):
             term = match.group(1).strip()
             if term and term not in queries:

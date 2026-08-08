@@ -1,4 +1,50 @@
-"""Callgraph MCP tools — see mcp/server.py for registration."""
+"""Call-graph tool suite for MCP server.
+
+Provides the complete call-graph analysis API exposed through MCP tools:
+
+* **Direct reference lookup** — ``find_callers``, ``find_references``
+* **Indirect (function pointer) resolution** — ``find_indirect_call_sites``,
+  ``find_indirect_targets``
+* **Transitive graph traversal** — ``find_all_callers_recursive``,
+  ``find_callees_recursive``, ``find_call_path``
+* **Structural analysis** — ``find_dead_code``, ``find_hotspots``,
+  ``find_wrapper_callers``, ``trace_data_flow``
+
+Design decisions
+----------------
+
+**Single-connection executor pattern:** All SQL queries run inside a closure
+passed to ``db.executor.execute_sync(query_fn, config_hash)``. The executor
+pins a single database connection and serializes access through a lock,
+ensuring thread safety without connection pooling overhead. The public handler
+functions do not access the database directly — they close over the executor
+and delegate.
+
+**Three-tier symbol resolution:** Every reference lookup (callers, references,
+indirect targets) resolves the target symbol in three ordered steps:
+
+1. Exact name match in the ``symbols`` table.
+2. Exact qualified name match.
+3. Suffix LIKE match (``%::name``).
+
+This mirrors libclang's name resolution heuristics and prevents false
+matches on similarly-named but unrelated symbols.
+
+**Virtual callers propagation:** libclang resolves ``this->method()`` to the
+nearest override in the C++ class hierarchy. When the most-derived override
+is indexed but callers are recorded against the nearest (base) override,
+``_resolve_virtual_callers`` propagates caller information from peer overrides.
+
+**Macro fallback:** When ``_lookup_definition`` returns None, the reference
+functions fall back to the macro table. Raw FTS5 results are filtered to
+exclude matches inside C/C++ comments (FTS5 indexes comment content but
+only active-code references are meaningful).
+
+**Function pointer phases:** The ``refs`` table stores Phase 1 assignments
+(``driver.onData = &handler``). Phase 3 call sites (``driver.onData(buf, len)``)
+are stored in the ``indirect_calls`` table. ``find_indirect_targets`` links
+them via the field's USR, producing a complete assignment-to-invocation trace.
+"""
 
 from __future__ import annotations
 
@@ -40,10 +86,21 @@ def _resolve_virtual_callers(conn, config_hash: str, usr: str, root, ref_kind: l
     (e.g. ``DownloadManagerFlash::end_download``) shows 0 callers in ``refs``.
     This propagates callers from peer overrides to reveal the real call sites.
 
+    Uses two resolution strategies:
+
+    1. **Base-method lookup** — queries the ``overrides`` table to find all
+       derived classes that override the same base method. Includes the base
+       method itself because libclang may record callers against it.
+    2. **Parent-class sibling lookup** — when no entry exists in ``overrides``,
+       falls back to finding same-name virtual methods within the same parent
+       class. This handles cases where the overrides table was not populated
+       (e.g., partial indexing).
+
     Returns None when the symbol is not a virtual method with overrides,
     or an empty list when overrides exist but also have no callers.
     """
-    # Check if the symbol is a virtual/pure-virtual method
+    # Verify the symbol exists and is a method or destructor — virtual
+    # dispatch only applies to methods, not free functions or fields.
     sym_row = conn.execute(
         """SELECT s.kind, s.parent_usr
            FROM symbols s
@@ -56,14 +113,18 @@ def _resolve_virtual_callers(conn, config_hash: str, usr: str, root, ref_kind: l
     if sym_row["kind"] not in ("method", "destructor"):
         return None
 
-    # Find base method via overrides table
+    # Strategy 1: resolve through the overrides table (Phase 1 indexing).
+    # The overrides table maps derived_usr → base_usr for every virtual
+    # method pair. When the base method has callers, propagate them.
     base = conn.execute(
         """SELECT base_usr FROM overrides
            WHERE derived_usr = ? AND config_hash = ?""",
         (usr, config_hash),
     ).fetchone()
 
-    # Find all override methods sharing the same base (peers)
+    # Collect all peer overrides that share the same base method.
+    # Include the base method itself — callers may be recorded directly
+    # against it when libclang resolves the call to the base-level override.
     if base:
         base_usr = base["base_usr"]
         overrides = conn.execute(
@@ -75,7 +136,10 @@ def _resolve_virtual_callers(conn, config_hash: str, usr: str, root, ref_kind: l
         all_derived: list[str] = [r["derived_usr"] for r in overrides]
         all_derived.append(base_usr)
     else:
-        # No base found — try reverse: find overrides sharing the same parent class
+        # Strategy 2: the overrides table has no entry for this symbol.
+        # Walk the parent class to find same-name virtual methods.
+        # This handles partial indexes where overrides were not computed
+        # or the symbol is flagged virtual but not tracked in overrides.
         parent_usr = sym_row["parent_usr"]
         if not parent_usr:
             return None
@@ -96,7 +160,11 @@ def _resolve_virtual_callers(conn, config_hash: str, usr: str, root, ref_kind: l
     if not all_derived:
         return None
 
-    # UNION callers of all peer overrides
+    # Build a UNION query across all peer overrides. A single IN clause
+    # is used rather than per-usr UNION ALL because the target set is
+    # built programmatically — SQLite handles the IN list efficiently
+    # when the placeholder count is small (typically 2–10 values).
+    # DISTINCT deduplicates callers that reference multiple peers.
     placeholders = ",".join("?" * len(all_derived))
     kind_clause = ""
     kind_params: list = []
@@ -139,6 +207,10 @@ def _references_result(name: str, project_root: str | None, ref_kind: str | list
     Resolves the project, opens the DB, looks up the symbol, checks that refs
     are indexed, and returns formatted reference results.
 
+    The two callers differ only in the ``ref_kind`` filter:
+    ``find_callers`` passes ``["call", "indirect", "implicit_construct"]``
+    while ``find_references`` passes ``None`` (all kinds including reads).
+
     Args:
         name: Symbol name to find references for.
         project_root: Project root directory.
@@ -165,22 +237,28 @@ def _references_result(name: str, project_root: str | None, ref_kind: str | list
             return [{"error": "No build config indexed."}]
         symbol = _lookup_definition(conn, config_hash, name, preferred_kinds=None)
         if symbol is None:
-            # Macro fallback: check if name is a macro definition
+            # ── Macro fallback ──────────────────────────────────────────
+            # The symbol is not a libclang-indexed function/method/type.
+            # Fall back to the macros table. FTS5 indexes the entire file
+            # content including comments, so matched snippets must be
+            # post-filtered to exclude references in C/C++ comments.
+            # Only active-code references are meaningful to the caller.
             macros = lookup_macro(conn, config_hash, name, exact=True, limit=1)
             if macros:
                 macro = macros[0]
-                # Use find_macro_refs for file-level usage tracking
                 ref_rows = find_macro_refs(conn, config_hash, name, limit=limit)
-                # Filter out matches inside C/C++ comments (FTS5 sees raw text)
+                # Post-filter: the FTS5 match snippet is checked for
+                # surrounding comment markers. Inline (//) and block (/* */)
+                # comments are detected via regex. This is heuristic —
+                # false negatives are possible when the comment spans
+                # multiple lines and the snippet cuts mid-comment.
                 import re as _re
                 _comment_refs: list = []
                 _non_comment_refs: list = []
                 for r in ref_rows:
                     _snip = r["_match_snippet"] or ""
-                    # Single-line comment: // before <b> on the same logical line
                     if _re.search(r'//[^\n]*<b>', _snip):
                         _comment_refs.append(r)
-                    # Multi-line comment: /* before <b> and */ after it or line end
                     elif _re.search(r'/\*.*<b>', _snip, _re.DOTALL):
                         _comment_refs.append(r)
                     else:
@@ -223,6 +301,10 @@ def _references_result(name: str, project_root: str | None, ref_kind: str | list
         clamped_limit = max(0, min(limit, 200))
         rows = find_refs(conn, config_hash, name, ref_kind=ref_kind, limit=clamped_limit)
         if not rows:
+            # When zero refs are recorded for this specific symbol, try
+            # virtual dispatch resolution. C++ virtual method calls
+            # through base-class pointers are often recorded against
+            # the nearest (base) override, not the most-derived one.
             virtual_result = _resolve_virtual_callers(
                 conn, config_hash, symbol["usr"], root, ref_kind=ref_kind, limit=clamped_limit,
             )
@@ -391,6 +473,9 @@ def find_indirect_call_sites(
         # Runs under the executor lock on the single shared connection;
         # must not open its own connection.  Timeout is enforced by
         # _wrap_tool (300 s + interrupt), not here.
+        # Check that Phase 2 indirect call sites exist at all in this index.
+        # Older indexes predating Phase 2 will have zero call sites,
+        # and reporting "not found" for every query would be misleading.
         if count_indirect_call_sites(conn, config_hash) == 0:
             return [{"info": (
                 "No indirect call sites indexed. Re-run 'fw-context index' "
@@ -468,6 +553,8 @@ def find_indirect_targets(
         # Runs under the executor lock on the single shared connection;
         # must not open its own connection.  Timeout is enforced by
         # _wrap_tool (300 s + interrupt), not here.
+        # Check that Phase 3 function-pointer assignments exist.
+        # Older indexes predating Phase 3 will have zero entries.
         if count_fp_assignments(conn, config_hash) == 0:
             return [{"info": (
                 "No function pointer assignments indexed. Re-run "
@@ -496,6 +583,11 @@ def find_indirect_targets(
             }
             lhs_name = str(r["lhs_name"] or "")
             if lhs_name and not r["lhs_usr"]:
+                # Template-obscured callback: libclang could not resolve the
+                # concrete callee type (e.g., _timeout.attach(&handler)).
+                # The call-site resolver uses a type-based fallback — when
+                # the receiver class's method signature matches a known
+                # handler type, the call site is attributed to that method.
                 if not r["call_file"]:
                     lhs_display = lhs_name.strip()
                     entry["_note"] = (
@@ -519,6 +611,13 @@ def find_indirect_targets(
 # ── moved from server.py ──
 def _refs_guard(project_root: str | None) -> tuple[DbContext, None] | tuple[None, list[dict]]:
     """Shared guard for graph tools: resolve project, get executor, check refs exist.
+
+    Every graph-traversal tool (find_call_path, find_all_callers_recursive,
+    find_callees_recursive, find_dead_code, find_wrapper_callers,
+    trace_data_flow, find_hotspots) must verify two preconditions:
+    1. The project DB context can be resolved.
+    2. At least one reference is indexed — an empty refs table means
+       the graph tools cannot return meaningful results.
 
     Returns:
         ``(db_context, None)`` on success — callers run their queries via
@@ -630,6 +729,9 @@ def find_call_path(
         # Runs under the executor lock on the single shared connection;
         # must not open its own connection.  Timeout is enforced by
         # _wrap_tool (300 s + interrupt), not here.
+        # Validate both symbols exist before running the BFS —
+        # a failed BFS on nonexistent symbols wastes time and
+        # produces unhelpful "no path" errors.
         if _lookup_definition(conn, config_hash, from_name, preferred_kinds=None) is None:
             return [{"error": f"Symbol not found: {from_name}"}]
         if _lookup_definition(conn, config_hash, to_name, preferred_kinds=None) is None:
@@ -901,7 +1003,15 @@ def find_wrapper_callers(
         if _lookup_definition(conn, config_hash, class_name, preferred_kinds=None) is None:
             return [{"error": f"Symbol not found: {class_name}"}]
 
-        # Find all methods of the class (index-able prefix LIKE, no leading %)
+        # Find all methods of the class. Three-tier resolution:
+        # 1. Exact prefix LIKE (class_name::%) — matches when the
+        #    class was indexed with its full qualified name.
+        # 2. Escaped LIKE with leading wildcard (%class_name::%) —
+        #    catches cases where the class is nested in a namespace.
+        #    ESCAPE clause prevents SQLite from treating '::' specially.
+        # 3. Short-name fallback — when the class has a fully-qualified
+        #    name (Namespace::Class), strip the namespace and retry
+        #    with just the short name as prefix.
         driver_methods = conn.execute(
             """SELECT s.usr, s.name, s.qualified_name
                FROM symbols s
@@ -965,7 +1075,12 @@ def find_wrapper_callers(
         if not rows:
             return [{"info": f"No callers found for methods of '{class_name}'."}]
 
-        # Group by wrapper class
+        # Aggregate callers by wrapper class. The qualified name of each
+        # caller method is split at the last "::" to extract the enclosing
+        # class name. Free functions (no "::" in qualified name) are
+        # grouped under "(global)".
+        # Methods are deduplicated by qualified name within each class.
+        # Each method tracks the list of driver methods it calls.
         wrapped: dict[str, dict] = {}
         for r in rows:
             caller_qn = r["caller_qname"] or r["caller_name"] or "?"
@@ -1064,7 +1179,7 @@ def trace_data_flow(
         # must not open its own connection.  Timeout is enforced by
         # _wrap_tool (300 s + interrupt), not here.
         t0 = time.perf_counter()
-        # Resolve target USR
+        # Resolve the target symbol's USR — needed for call-path lookups.
         target = conn.execute(
             """SELECT usr, name FROM symbols
                WHERE config_hash = ? AND (name = ? OR qualified_name = ?)
@@ -1094,7 +1209,12 @@ def trace_data_flow(
         if not sources:
             return [{"info": f"No functions found with '{type_name}' in their signature."}]
 
-        # Try call paths from each source to target
+        # For each source function, attempt call-path BFS to the target.
+        # A per-iteration timeout guard checks elapsed time against
+        # timeout_ms. When the budget is exhausted, remaining sources
+        # are marked as timed_out rather than silently dropped.
+        # This allows the caller to distinguish between truly unreachable
+        # sources and sources that were not checked due to time limits.
         results = []
         for src in sources:
             elapsed_ms = (time.perf_counter() - t0) * 1000

@@ -1,4 +1,19 @@
-"""lookup_symbol MCP tool."""
+"""lookup_symbol MCP tool.
+
+WHY lookup_symbol exists separately from search_code: search_code uses
+FTS5 full-text search — it tokenizes names into words and matches by
+concept.  This is lossy for exact names: ``"kb_open_disp"`` tokenizes
+as ``"kb" + "open" + "disp"``, which matches unrelated symbols containing
+those tokens.  lookup_symbol uses SQL LIKE with escaped wildcards for
+EXACT or PREFIX matching — no tokenization, no false positives.
+
+WHY there is a ``::`` short-name fallback: users often know partial
+qualified names (``"Foo::bar"``) but not the full namespace prefix.
+The fallback extracts the short name after the last ``::``, does a LIKE
+search, then filters by qualified_name suffix — resolving ``"bar"``
+to ``"some::ns::Foo::bar"`` without requiring the user to know the
+namespace chain.
+"""
 
 from __future__ import annotations
 
@@ -81,6 +96,10 @@ def lookup_symbol(
         limit = max(0, min(limit, 100))
 
         def _do_lookup(c: sqlite3.Connection, config_hash: str) -> list[dict]:
+            # ── Tier 1: Exact or prefix LIKE, no tokenization ──
+            # The ESCAPE '\' prevents SQL wildcards in user input from
+            # being interpreted — e.g. "UART_DRIVER" must match the
+            # literal underscore, not "UART+any_char+DRIVER".
             if exact:
                 rows = c.execute(
 LOOKUP_EXACT_SQL,
@@ -94,6 +113,9 @@ LOOKUP_PREFIX_SQL,
                 ).fetchall()
 
             # Fallback: "Foo::bar" without namespace — extract short name, suffix-filter
+            # WHY: users often type qualified names partially — e.g. "bar" when
+            # they mean "ns::Foo::bar".  The short-name LIKE search finds broad
+            # candidates; the suffix filter then narrows to exact matches.
             if not rows and "::" in name:
                 short_name = name.rsplit("::", 1)[-1]
                 if exact:

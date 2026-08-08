@@ -1,4 +1,25 @@
-"""Phase 6: Merge FTS5 + embedding results, score, deduplicate."""
+"""Phase: Merge FTS5 + embedding results, score, deduplicate.
+
+Why deduplicate by (name, file_path)?
+    The same symbol can appear in both FTS5 and embedding result sets.
+    Simply concatenating would produce duplicates.  The ``(name, file_path)``
+    key identifies the same symbol across result sets — different from
+    USR-based deduplication because results may come as raw database rows
+    without a USR field.
+
+Why prefer definitions over declarations?
+    A declaration (``void init();`` in a header) and its definition
+    (``void init() { ... }`` in a source file) have the same ``(name,
+    file_path)`` key but different ``is_definition`` values.  Definitions
+    are more useful — they show the implementation, not just the signature.
+
+Why filter short variable/field names?
+    Two-character variable names (``i``, ``j``, ``rc``) are overwhelmingly
+    loop counters and local temporaries.  Including them in search results
+    adds noise without signal.  Filtering by kind (varlocal, variable, field)
+    with length ≤ 2 removes these while keeping short function names
+    (``init``, ``run``, ``go``) which are legitimate search targets.
+"""
 
 from __future__ import annotations
 
@@ -15,6 +36,13 @@ class DeduplicatePhase(Phase):
     """Merge FTS5 and embedding results, deduplicate by (name, file_path),
     prefer definitions, and sort by score.
 
+    Why only run when ``final_results`` is still empty?
+        In SMART_SEARCH, ``AdaptiveFusionPhase`` runs first and populates
+        ``final_results`` — deduplication is then redundant (the fusion
+        phase already picked one source).  This phase only activates
+        when no earlier phase produced final results (e.g. embedding-only
+        pipelines or SEARCH_CODE fallback paths).
+
     Only runs when ``final_results`` is still empty — i.e.
     ``AdaptiveFusionPhase`` did not produce output (e.g. no embeddings
     available).
@@ -23,7 +51,7 @@ class DeduplicatePhase(Phase):
     name = "deduplicate"  #: Phase identifier used in pipeline configuration.
 
     def should_run(self, ctx: PipelineContext) -> bool:
-        """Run only when ``final_results`` is still empty.
+        """Run only when no prior phase produced final results.
 
         In ``SMART_SEARCH``, ``AdaptiveFusionPhase`` runs first and populates
         ``final_results`` — deduplication is then redundant.  Only run
@@ -35,10 +63,15 @@ class DeduplicatePhase(Phase):
     async def run(self, ctx: PipelineContext) -> PipelineContext:
         """Merge FTS5 and embedding results, deduplicate, score, and sort.
 
-        Merges both result sets, filters noise (very short variable/field
-        names, names starting with ``(``), deduplicates by ``(name,
-        file_path)`` preferring definitions, scores each result, and sorts
-        by score descending.  Limits to ``ctx.limit`` results.
+        Why scored_index for O(1) replacement?
+            When a declaration is found before its definition, replacing
+            it requires finding the old entry.  ``scored_index[key]`` maps
+            the ``(name, file_path)`` key to the list index, enabling O(1)
+            replacement instead of O(n) scanning.
+
+        Merges both result sets, prevents duplicates, prefers definitions,
+        and filters noise.  Scores via ``score_result()`` and sorts
+        by score descending.
         """
         queries = ctx.generated_queries if ctx.generated_queries else ctx.rough_queries
         stems = stems_from_queries(queries)
@@ -51,9 +84,12 @@ class DeduplicatePhase(Phase):
         scored_index: dict[tuple, int] = {}
         for r in all_rows:
             name = r.get("name") or ""
-            # Filter noise
+            # Filter noise: names starting with '(' are malformed
+            # (usually lambda or anonymous types that slipped through)
             if name.startswith("("):
                 continue
+            # Short variable/field names (≤2 chars) are noise —
+            # loop counters, temps, single-letter locals
             if len(name) <= 2 and r.get("kind") in ("varlocal", "variable", "field"):
                 continue
 

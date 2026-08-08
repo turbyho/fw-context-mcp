@@ -5,6 +5,25 @@ Each supported AI assistant is registered with:
 - Whether it inherits from another tool (e.g. KiloCode shares Claude Code config)
 - Where to inject fw-context instructions (target files, methods)
 - Collision detection (marked sections, skillshare, unmarked duplicates)
+
+WHY the registry is a declarative dataclass tree instead of imperative
+"detect and inject" code: new AI tools appear frequently (weekly).
+Adding support is a five-line ``AiTool`` entry with no new logic.
+The registry pattern also supports ``fw-context init --list-tools``
+output without installing anything.
+
+WHY inheritance (``inherits_from``) exists: some tools read another
+tool's config files.  Kilo Code reads OpenCode's AGENTS.md and MCP
+config.  Without inheritance tracking, ``fw-context init`` would
+inject instructions into both, causing duplicate sections.  Inheritance
+prevents double injection while still listing both tools as "detected."
+
+WHY collision detection exists: when a project already has fw-context
+instructions (from a previous ``fw-context init`` or manual copy),
+blindly appending would create duplicate blocks.  Collision detection
+finds existing marked sections (safe to update), unmarked content
+(warn about potential duplicates), and skillshare-managed directories
+(warn that injection may be overwritten by the skill manager).
 """
 
 from __future__ import annotations

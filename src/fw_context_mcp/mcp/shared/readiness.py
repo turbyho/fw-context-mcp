@@ -5,6 +5,14 @@ index existence, build system detection, and compile_commands staleness.
 
 External users should continue importing from ``.context``
 which re-exports everything from this module.
+
+WHY readiness checks are cached with a 30-second TTL: every MCP tool
+invocation calls ``_check_server_ready`` to verify the project is
+initialized and indexed.  Without caching, a conversation where the
+AI assistant calls 5 tools sequentially would perform 5 identical
+filesystem stat() calls on the same index database.  For embedded
+projects on NFS or CIFS shares, each stat() may take 100+ ms — the
+TTL saves hundreds of milliseconds with zero correctness impact.
 """
 
 from __future__ import annotations

@@ -4,6 +4,12 @@ These builders recognise proprietary/legacy build systems and provide
 helpful instructions for generating ``compile_commands.json`` manually.
 They cannot build automatically — the user must provide a
 ``compile_commands.json`` or a custom ``[build] command`` in config.
+
+WHY stub builders exist: users of STM32CubeIDE and TI CCS may not know
+how to extract compile_commands.json from their IDE.  The stub builder
+detects the project type and prints platform-specific instructions instead
+of an unhelpful "no build system found" error.  This guides the user to
+enable the IDE's built-in JSON Compilation Database generator.
 """
 
 from __future__ import annotations
@@ -27,6 +33,12 @@ class STM32CubeIDEStub:
     Eclipse-based IDE with a built-in JSON Compilation Database generator.
     Go to Project Properties → C/C++ Build → Builder Settings →
     Generate JSON Compilation Database.
+
+    WHY cannot build automatically: STM32CubeIDE is an Eclipse-based GUI
+    application with no stable headless command-line interface for building.
+    The JSON Compilation Database generator is a GUI-only setting.  The stub
+    instructs the user to enable it in the IDE and then point fw-context at
+    the generated file.
     """
 
     name: str = "STM32CubeIDE"
@@ -78,6 +90,12 @@ class TICCSStub:
 
     Eclipse-based IDE. Similar to STM32CubeIDE — enable the built-in
     JSON Compilation Database generator in Project Settings.
+
+    WHY cannot build automatically: TI CCS, like STM32CubeIDE, is an
+    Eclipse-based GUI application.  Its headless build interface
+    (``eclipse -application com.ti.ccstudio.apps.projectBuild``) is
+    poorly documented and platform-specific, making automated build
+    unreliable across different CCS versions and OS configurations.
     """
 
     name: str = "TI Code Composer Studio"

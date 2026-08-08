@@ -1,8 +1,15 @@
 """Build system detection and compile_commands.json generation.
 
-Supports Mbed OS, Zephyr, and PlatformIO.  Auto-detects the build system
-from project markers and runs the appropriate command to generate a fresh,
-complete compile_commands.json.
+WHY: Firmware projects use disparate build systems (Mbed OS, Zephyr,
+PlatformIO, CMake, Keil, IAR, bare Makefiles).  libclang-based indexing
+requires a compile_commands.json — a JSON compilation database listing every
+translation unit with its exact compiler flags.  This module provides a
+build-system-agnostic interface: detect the system from project markers,
+then delegate to the appropriate backend to produce a fresh, complete
+compile_commands.json.
+
+Supports Mbed OS, Zephyr, PlatformIO, CMake, Arduino, Keil MDK, IAR EWARM,
+bare Makefile (via compiledb), and bare/manual mode.
 """
 
 from __future__ import annotations
@@ -130,6 +137,10 @@ class BuildConfig:
 def detect_build_system(project_root: Path) -> str | None:
     """Detect the build system from project markers.
 
+    WHY scoring rather than exact match: a project may contain markers from
+    multiple build systems (e.g. ``CMakeLists.txt`` + ``.mbed`` in a hybrid
+    project).  Scoring by marker count picks the dominant system.
+
     Delegates to the ``BuildSystemRegistry`` — each registered builder's
     ``markers`` list is scored by how many markers exist in *project_root*.
     The builder with the highest score wins.
@@ -187,6 +198,10 @@ def _mbed_target_from_custom_targets(project_root: Path) -> str | None:
 def check_completeness(cc_path: Path, project_root: Path) -> list[str]:
     """Return a list of warnings if compile_commands.json seems incomplete.
 
+    WHY: a build system may produce a partially-empty compile_commands.json
+    (e.g. after ``mbed deploy`` pulls new libraries without a rebuild).
+    Catching this early avoids indexing an incomplete project silently.
+
     Heuristic: count source files (.c, .cpp) in common directories and
     compare with the number of entries in compile_commands.json.
     """
@@ -225,7 +240,12 @@ def check_completeness(cc_path: Path, project_root: Path) -> list[str]:
 
 
 def _run_pre_build(cfg: BuildConfig, cwd: Path) -> None:
-    """Execute the pre-build hook if configured."""
+    """Execute the pre-build hook if configured.
+
+    WHY: some build systems require environment setup scripts (``west zephyr-export``,
+    ``idf.py set-target``) before the actual build can proceed.  The pre-build
+    hook runs these once, before any build/convert/generate step.
+    """
     if not cfg.pre_build:
         return
     log.warning(
@@ -246,6 +266,11 @@ def generate_compile_commands(
     cfg: BuildConfig,
 ) -> Path:
     """Generate a fresh compile_commands.json and return its path.
+
+    WHY four paths: different build systems produce compile_commands.json
+    differently.  Some require a full build (PlatformIO), others can convert
+    their project files statically (Keil, IAR), and bare Makefiles can use
+    ``compiledb`` dry-run.  This function picks the cheapest available path.
 
     Auto-detects the build system when ``cfg.system`` is ``None``.
     The generation path is chosen by builder capability:

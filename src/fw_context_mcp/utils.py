@@ -2,6 +2,19 @@
 
 Avoids duplication of project-root resolution, path normalisation, and
 other small helpers that were copied into multiple modules.
+
+Why a single utils module instead of topic-split utility files:
+
+- These helpers have zero interdependencies and are each called from 3+
+  unrelated modules.  Splitting them across files would scatter imports
+  without improving cohesion.
+- The ``SAFE_EXCEPT`` tuple and its ``is_fatal`` / ``is_db_exception``
+  guard pair must be in one import-able place — every try/except in the
+  codebase needs the same fatal-vs-recoverable classification.
+- ``read_file_lines`` with its LRU cache and encoding fallback chain
+  replaces four copy-pasted file-reading loops that had diverged subtly
+  (different encoding orders, no mtime invalidation, different error
+  handling for missing files).
 """
 
 from __future__ import annotations
@@ -107,6 +120,20 @@ def run_build_command(
     ``subprocess.run()`` to ensure consistent timeout and output capture
     behaviour across the nine builders.
 
+    Why wrapper vs raw subprocess:
+
+    - The nine build-system backends each have different argument
+      conventions.  Without a single wrapper, every caller duplicates
+      the ``cwd``, ``capture_output=True``, ``text=True``,
+      ``timeout``, and ``env`` merge logic — a maintenance liability.
+    - The ``activate`` block maps a declarative ``build_cfg.activate``
+      field (a shell script path) into a ``bash -c "source <script>
+      && <cmd>"`` invocation.  Centralising this logic means only one
+      call site tests quoting (``shlex.quote``) and shell injection
+      resistance.
+    - The ``extra_path`` / ``extra_env`` blocks apply per-build-system
+      configuration that callers must not need to know about.
+
     Args:
         cmd: Command and arguments as a list (shell=False is enforced).
         cwd: Working directory.
@@ -188,8 +215,20 @@ def abs_path(root: Path, path: str) -> str:
     return str(root / p)
 
 
-# Cache with mtime-based invalidation — avoids stale data in daemon/server processes.
-# Keyed by (path, mtime) so file changes are automatically detected.
+# Content LRU cache — mtime-keyed to auto-invalidate on file changes.
+#
+# Why an LRU cache instead of functools.lru_cache:
+# - functools.lru_cache keys by argument equality; we want equality on
+#   (path, mtime) and eviction by access order (LRU), not by recency
+#   of adding new items.
+# - A daemon process reads the same hot files (project config, linker
+#   scripts, common headers) hundreds of times per session; disk I/O
+#   for those reads is pure waste.
+# - The mtime key means a file edited between reads is never stale —
+#   the old cache entry has a different key than the new mtime.
+#
+# 500 entries ≈ 500 source files in memory, each ~20 KB average →
+# ~10 MB memory footprint — acceptable for a long-running server.
 _read_cache: OrderedDict[tuple[str, float], list[str]] = OrderedDict()
 _read_cache_max = 500
 _read_cache_lock = threading.Lock()
@@ -214,6 +253,17 @@ def read_file_lines(abs_path: str) -> list[str] | None:
             _read_cache.move_to_end(cache_key)
             return _read_cache[cache_key]
 
+    # Encoding fallback chain — ordered by coverage in embedded C/C++ projects:
+    #
+    # 1. UTF-8 — universal, handles 99%+ of source files.
+    # 2. cp1252 (Windows-1252) — common in legacy Windows-authored firmware;
+    #    characters like 0x80-0x9F decode cleanly (unlike latin1 where they
+    #    map to control characters that produce valid-but-garbled output).
+    # 3. latin1 — ISO-8859-1 never raises UnicodeDecodeError (every byte
+    #    maps to a valid character), so any file that survives this far
+    #    is readable; the content may be garbled but the caller gets
+    #    line-oriented access without crashing.
+    #
     # NOTE: UTF-16 files will produce garbled content; extremely low risk
     # in embedded C/C++ projects.
     encodings = ["utf-8", "cp1252", "latin1"]
@@ -247,10 +297,22 @@ def compute_content_hash(body: str, qualified_name: str, signature: str, docstri
 
     Used for content-addressable LLM analysis caching — survives
     re-indexes, config changes, and branch switches.
+
+    Why include all four fields and why the Unit Separator delimiter:
+
+    - A hash over just ``body`` would fingerprint ``void foo() { }``
+      and ``void bar() { }`` to the same value when both have empty
+      bodies — cache collisions across symbols.
+    - Including ``qualified_name`` and ``signature`` disambiguates
+      identically-bodied functions (stubs, thin wrappers).
+    - Including ``docstring`` makes the cache invalidate when
+      documentation changes — LLM analysis output changes when its
+      input docstring changes, even when the code is identical.
+    - ``\\x1f`` (ASCII Unit Separator, 0x1F) is a non-printable
+      control character that cannot appear in C/C++ identifiers,
+      signatures, or docstrings — no escaping needed, no collision
+      risk from literal delimiter characters in content.
     """
-    # \x1f (Unit Separator) — safe delimiter not occurring in C/C++ identifiers,
-    # signatures, or docstrings.  Changed from a plain printable delimiter to
-    # avoid collisions with symbols whose names contain the old separator.
     raw = f"{body.strip()}\x1f{qualified_name}\x1f{signature or ''}\x1f{(docstring or '').strip()}"
     return hashlib.sha256(raw.encode()).hexdigest()
 
@@ -264,7 +326,22 @@ def compute_source_hash(file_path: Path) -> str:
 
 
 def escape_like(value: str) -> str:
-    """Escape LIKE wildcards ``%``, ``_``, and the escape char ``\\``."""
+    """Escape SQL ``LIKE`` wildcards ``%``, ``_``, and the escape char ``\\``.
+
+    Callers must append ``ESCAPE '\\'`` to the LIKE clause when using the
+    escaped string.  The double-backslash in the replacement string
+    produces a single backslash followed by the wildcard character in the
+    SQL value.
+
+    Why manual escaping instead of query parameters: ``LIKE`` patterns
+    with ``?`` placeholders require the caller to decide at call time
+    whether a value should be escaped — AND gate automation that
+    text-searches user-supplied file paths are always LIKE patterns
+    where unescaped ``%`` would match arbitrary substrings and
+    unescaped ``_`` would match any single character.
+    """
+    # Order matters: escape backslash FIRST so the escaping character
+    # itself is escaped before it appears in later replacements.
     return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
 

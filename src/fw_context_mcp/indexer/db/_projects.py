@@ -1,4 +1,20 @@
-"""Project and build config management for the fw-context-mcp index."""
+"""Project and build config management for the fw-context-mcp index.
+
+Manages ``projects`` and ``build_configs`` tables.  Each project gets a
+deterministic UUID4 (hashed from root path), and each build gets a
+content-addressable hash of the compile_commands.json.
+
+WHY deterministic project ID: the project ID must be stable across
+machines and reindexes so that MCP tool calls from different directories
+resolve to the same project.  Hash-based derivation from the resolved
+root path ensures consistency without storing state globally.
+
+WHY content-addressable build hash: the compile_commands.json is hashed
+to produce the ``config_hash``.  When the same file is indexed twice
+(with no changes), the hash matches and the existing build is updated
+in-place (idempotent).  When compiler flags change, a new build is
+created — old builds remain queryable until explicitly deleted.
+"""
 
 from __future__ import annotations
 

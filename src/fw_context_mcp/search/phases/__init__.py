@@ -1,4 +1,18 @@
-"""Phase abstractions for the search pipeline."""
+"""Phase abstractions for the search pipeline.
+
+Why a separate ``phases/`` package?
+    Each phase is a self-contained unit with its own database queries,
+    LLM calls, or embedding computations.  Keeping phases in separate
+    modules prevents single-file bloat (a 2000-line ``pipeline.py``)
+    and allows independent testing.  Each phase module can be tested
+    with a mock context without loading any other phase's dependencies.
+
+Why explicit ``__all__``?
+    The ``phases`` package exposes 14 classes.  Without ``__all__``,
+    ``from fw_context_mcp.search.phases import *`` would only import
+    what's explicitly listed in ``__init__.py``.  The explicit list
+    makes the public API unambiguous.
+"""
 
 from fw_context_mcp.search.phases.adaptive_fusion import AdaptiveFusionPhase
 from fw_context_mcp.search.phases.base import Phase

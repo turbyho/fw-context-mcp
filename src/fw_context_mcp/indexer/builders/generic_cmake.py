@@ -25,6 +25,11 @@ class GenericCMakeBuildSystem:
     """Generic CMake build system (``cmake -B build -DCMAKE_EXPORT_COMPILE_COMMANDS=ON``).
 
     Registered AFTER Zephyr and ESP-IDF so those specific builders match first.
+
+    WHY registered last among CMake-based builders: Zephyr and ESP-IDF both
+    use CMake but have specific project detection markers and build commands.
+    The generic CMake builder acts as a fallback for any project with a
+    CMakeLists.txt that doesn't match a more specific builder.
     """
 
     name: str = "CMake (generic)"

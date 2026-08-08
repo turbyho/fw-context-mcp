@@ -108,6 +108,15 @@ class SyncQueryExecutor:
         - WAL pragma in try/except: setting journal_mode is a write op
           and can block behind an active reindex; the DB is already WAL
           from indexing, so failure here is harmless.
+
+        Why ``check_same_thread=False``:
+
+        - Handler calls land in ``asyncio.to_thread`` workers — each
+          call is a different OS thread.  Without this flag SQLite
+          would reject the connection as "used in a different thread
+          than the one it was created in."  The executor lock
+          guarantees at most one thread touches the connection at any
+          time, so ``check_same_thread=False`` is safe.
         """
         conn = sqlite3.connect(
             str(self._db_path),
@@ -195,6 +204,23 @@ class SyncQueryExecutor:
         2. IDENTITY CHANGE: ``(st_ino, st_mtime)`` of the DB file differs
            from the values recorded at open.  Covers DB replacement by a
            manual ``fw-context index`` run, which writes no pid file.
+
+        Why two triggers and not a single mechanism:
+
+        - The pid-file transition catches background reindexes triggered
+          by the daemon (file watcher → reindex).  The daemon writes
+          ``reindex.pid`` before starting and removes it on completion.
+        - The identity change catches manual ``fw-context index`` runs.
+          These produce a new DB file (different inode) or overwrite
+          the existing one (same inode, different mtime).  The manual
+          reindex path does not write a pid file.
+        - Relying only on the pid file would miss manual reindexes.
+          Relying only on identity would miss the case where the
+          reindex replaces the DB atomically (rename) but the executor
+          was already connected to the old file — the inode changes
+          but ``st_ino`` was recorded from the old open; the rename
+          creates a new inode and the executor's connection still
+          references the old (unlinked) inode.
         """
         pid_exists = self._reindex_pid.exists()
         if self._reindex_was_running and not pid_exists:

@@ -1,4 +1,26 @@
-"""Inheritance MCP tools — see mcp/server.py for registration."""
+"""Inheritance MCP tools — see mcp/server.py for registration.
+
+WHY these tools exist as MCP handlers instead of raw SQL queries:
+C++ inheritance in embedded firmware (mbed-os, Zephyr, Arduino) follows
+deep class hierarchies — ``SerialBase → BufferedSerial → UARTSerial →
+UnbufferedSerial`` with virtual method dispatch.  A text-based grep
+cannot answer "show me the full override chain for ``SerialBase::write``"
+because overrides span multiple files and translation units.  These
+handlers query the libclang-populated ``bases``, ``derived``, and
+``overrides`` tables for AST-accurate inheritance graphs.
+
+WHY BFS instead of recursive SQL: SQLite does not support recursive CTEs
+with graph deduplication well (cycles in diamond inheritance cause
+infinite recursion).  BFS in Python gives full control over visit tracking
+and depth limits.  The batch-fetch pattern (``get_direct_bases_batch``)
+reduces N+1 queries — one SQL call per depth level, not one per class.
+
+WHY transitive traversal is opt-in (``transitive=False`` default):
+for large hierarchies (mbed-os has 500+ classes), a full transitive walk
+from a root class like ``FileHandle`` can return thousands of results.
+Most users only need direct parents/children; transitive is for deep
+impact analysis.
+"""
 
 from __future__ import annotations
 

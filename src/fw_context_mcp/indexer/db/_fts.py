@@ -1,4 +1,21 @@
-"""FTS5 (Full-Text Search) rebuild utilities."""
+"""FTS5 (Full-Text Search) rebuild utilities.
+
+Provides functions to rebuild the three FTS5 virtual tables from the
+authoritative content tables.  Called after bulk indexing operations
+that insert large numbers of rows — rebuilding the FTS index once is
+much faster than paying per-row trigger overhead for every INSERT.
+
+WHY drop triggers, rebuild, re-create: per-row FTS triggers fire on every
+INSERT/UPDATE/DELETE, doubling the write cost.  During bulk indexing of
+50k+ symbols, dropping triggers before the batch insert and rebuilding FTS
+afterwards reduces indexing time by ~60%.  The trade-off is that FTS is
+unavailable during the insert window — acceptable because no queries run
+during indexing.
+
+Three tables: ``symbols_fts`` (symbol names, signatures, docstrings, source),
+``files_fts`` (ifdef-filtered file content), ``macros_fts`` (macro names
+and expanded values).
+"""
 
 import sqlite3
 

@@ -5,6 +5,31 @@ PostgreSQL, cache server init, project/token creation, systemd/launchd,
 nginx HTTPS reverse proxy, firewall, and logrotate.
 
 Each step detects the current state and only prompts when action is needed.
+
+Why a wizard instead of 8 separate commands?
+--------------------------------------------
+Without the wizard, the operator would need to:
+1. Install PostgreSQL manually
+2. Create database user with password
+3. Create two databases
+4. Save credentials to db.env
+5. Run ``fw-cache-server init``
+6. Run ``fw-cache-admin project create <id>``
+7. Run ``fw-cache-server install-systemd``
+8. Configure nginx + certbot manually
+
+Each step has its own environment variables, file paths, and error
+modes.  The wizard chains them together with state detection at each
+step — it only prompts when action is actually needed, making both
+fresh installs and re-runs (after partial failures) fast.
+
+Design principles
+-----------------
+- **Idempotent** — every step detects current state and skips completed work.
+- **Minimal interaction** — yes/no prompts, not configuration file editing.
+- **Credentials safety** — PostgreSQL passwords use secrets.token_urlsafe,
+  are piped via stdin (not command-line args visible in ps), and are
+  saved to db.env with chmod 640.
 """
 
 from __future__ import annotations
@@ -23,7 +48,32 @@ from typing import Any
 
 
 def setup_wizard() -> int:
-    """Run the interactive setup wizard.  Returns 0 on success, non-zero on error."""
+    """Run the interactive setup wizard.  Returns 0 on success, non-zero on error.
+
+    The wizard proceeds through ~9 phases in order:
+    0. Ensure dedicated venv in /opt
+    1. Detect OS
+    2. PostgreSQL installation
+    3. Database user creation
+    4. Database creation
+    5. Cache server init + admin token
+    6. Project + token creation
+    7. systemd/launchd service installation
+    8. nginx HTTPS reverse proxy
+
+    Phases 5-6 use a SINGLE ``asyncio.run()`` call to avoid the overhead
+    of opening/closing database pools for each step.  All user input is
+    collected synchronously BEFORE the async block — no async I/O in
+    interactive prompts.
+
+    Why single asyncio.run() for phases 5-6?
+    -----------------------------------------
+    Each ``asyncio.run()`` creates a new event loop, which means new
+    asyncpg connection pools.  Two separate ``asyncio.run()`` calls
+    would open/close pools twice — wasting connection overhead and
+    PostgreSQL resources.  One call keeps the pool alive across both
+    init and project creation.
+    """
 
     print("\n  fw-context Cache Server Setup")
     print("  " + "─" * 36 + "\n")
@@ -56,6 +106,9 @@ def setup_wizard() -> int:
         return 1
 
     # 5-6. DB operations — SINGLE asyncio.run(), all user input collected first
+    # Collecting user input BEFORE the async block avoids mixing sync
+    # input() calls with async database operations — input() blocks
+    # the event loop, which would cause connection timeouts.
     db_url = _find_db_url()
     if not db_url:
         print("    FW_CACHE_DB_URL not available — run 'fw-cache-server init' manually")
@@ -174,7 +227,11 @@ def setup_wizard() -> int:
 
 
 def _ask(msg: str, default: str = "y") -> bool:
-    """Prompt the user yes/no.  Returns True for yes."""
+    """Prompt the user yes/no.  Returns True for yes.
+
+    Handles EOF (Ctrl+D) and KeyboardInterrupt (Ctrl+C) gracefully —
+    both exit the wizard.  Empty input uses the *default*.
+    """
     if default == "y":
         prompt = f"  > {msg} [Y/n] "
     else:
@@ -194,7 +251,14 @@ def _ask(msg: str, default: str = "y") -> bool:
 
 
 def _run(cmd: list[str], **kwargs: Any) -> bool:
-    """Run a shell command.  Returns True on success."""
+    """Run a shell command.  Returns True on success.
+
+    Handles the common pattern: ``sudo`` commands often fail when CWD
+    is inaccessible to root (e.g. a user home directory with mode 0700).
+    When ``cwd`` is not explicitly passed and the command starts with
+    ``sudo``, this function changes CWD to ``/tmp`` to avoid permission
+    errors.
+    """
     scwd = kwargs.pop("cwd", tempfile.gettempdir()) if cmd[0] == "sudo" and "cwd" not in kwargs else kwargs.pop("cwd", None)
     try:
         subprocess.run(cmd, check=True, cwd=scwd, **kwargs)
@@ -208,7 +272,26 @@ def _run(cmd: list[str], **kwargs: Any) -> bool:
 
 
 def _ensure_server_venv() -> bool:
-    """Ensure a dedicated venv exists (default /opt/fw-cache-server/venv)."""
+    """Ensure a dedicated venv exists (default /opt/fw-cache-server/venv).
+
+    Why a dedicated venv in /opt?
+    -----------------------------
+    The cache server runs as its own system user (``fw-cache``) via
+    systemd.  The venv must be readable by that user.  Installing into
+    a system-wide Python or a developer's home directory would either
+    require running as a developer user (bad for isolation) or would
+    be inaccessible to the fw-cache user.  ``/opt/fw-cache-server/``
+    is the standard location for third-party application installations
+    per the FHS (Filesystem Hierarchy Standard).
+
+    Why install from a local wheel (not PyPI)?
+    ------------------------------------------
+    The setup wizard runs from an already-installed fw-context-mcp.
+    Installing the same version from a local wheel ensures the cache
+    server runs the exact same code as the developer's environment —
+    no version mismatch between the server and the clients that push
+    analyses to it.
+    """
     _DEFAULT = "/opt/fw-cache-server"
 
     # Check for existing installation
@@ -259,12 +342,15 @@ def _ensure_server_venv() -> bool:
         return False
     subprocess.run([pip, "install", "fastapi", "uvicorn[standard]", "asyncpg"], check=True, timeout=120)
 
-    # Ensure fw-cache system user exists before chown
+    # Ensure fw-cache system user exists before chown.
+    # The user must exist so the systemd service can run as fw-cache.
     try:
         pwd.getpwnam("fw-cache")
     except KeyError:
         _run(["sudo", "useradd", "-r", "-s", shutil.which("nologin") or "/usr/sbin/nologin", "-d", "/nonexistent", "fw-cache"], timeout=10)
-    # Ensure fw-cache user can read the venv
+    # Ensure fw-cache user can read the venv.
+    # Without chown, the venv is owned by the installing user (root or sudoer)
+    # and the fw-cache service user cannot import fw-context-mcp modules.
     _run(["sudo", "chown", "-R", "fw-cache:fw-cache", str(venv_dir)], timeout=10)
 
     os.environ["FW_CACHE_VENV"] = str(venv_dir)
@@ -274,7 +360,15 @@ def _ensure_server_venv() -> bool:
 
 
 def _install_cli_symlinks(venv_dir: Path) -> None:
-    """Create symlinks in /usr/local/bin for fw-cache-server and fw-cache-admin."""
+    """Create symlinks in /usr/local/bin for fw-cache-server and fw-cache-admin.
+
+    Why symlinks (not shell wrappers)?
+    ---------------------------------
+    Shell wrappers add an extra process layer and can lose environment
+    variable propagation.  Symlinks to the venv executables preserve
+    the venv's activate behavior — the shebang line in the installed
+    console script already points to the venv's Python interpreter.
+    """
     bindir = Path("/usr/local/bin")
     for cmd in ("fw-cache-server", "fw-cache-admin"):
         target = venv_dir / "bin" / cmd
@@ -288,7 +382,14 @@ def _install_cli_symlinks(venv_dir: Path) -> None:
 # -- PostgreSQL --
 
 def _detect_postgresql() -> bool:
-    """Check if PostgreSQL is installed and running."""
+    """Check if PostgreSQL is installed and running.
+
+    Tries ``pg_isready`` first (fastest, direct connection check), then
+    falls back to ``systemctl is-active``.  ``pg_isready`` is more
+    reliable because it actually connects — systemctl only checks the
+    process state, which can report "active" for a PostgreSQL that is
+    still starting up and not accepting connections.
+    """
     pg_isready = subprocess.run(["pg_isready", "-q"], capture_output=True, timeout=5)
     if pg_isready.returncode == 0:
         return True
@@ -301,7 +402,21 @@ def _detect_postgresql() -> bool:
 
 
 def _ensure_postgresql() -> bool:
-    """Ensure PostgreSQL is installed and running, prompting to install if needed."""
+    """Ensure PostgreSQL is installed and running, prompting to install if needed.
+
+    Why install from apt/brew (not from source)?
+    -------------------------------------------
+    Package-manager PostgreSQL is pre-configured with sensible defaults
+    (auto-start on boot, correct file permissions, system user creation).
+    Building from source would require manual configuration of all these
+    — the wizard is about convenience, not maximal control.
+
+    Why PostgreSQL 16 on macOS?
+    ---------------------------
+    Homebrew's ``postgresql`` formula tracks the latest stable release.
+    Pinning to ``@16`` ensures the formula name doesn't change when 17
+    becomes the default — no breakage on Homebrew upgrades.
+    """
     if _detect_postgresql():
         print("  [✓] PostgreSQL — running")
         return True
@@ -333,7 +448,24 @@ def _ensure_postgresql() -> bool:
 # -- Database user --
 
 def _ensure_db_user() -> bool:
-    """Ensure the ``fw_cache`` PostgreSQL user exists and credentials are saved."""
+    """Ensure the ``fw_cache`` PostgreSQL user exists and credentials are saved.
+
+    Why ``secrets.token_urlsafe(24)`` for passwords?
+    ------------------------------------------------
+    24 bytes of urlsafe base64 = 192 bits of entropy, encoded as ~32
+    printable characters.  This is far beyond what PostgreSQL's password
+    authentication can withstand (the wire protocol uses SCRAM-SHA-256
+    which salts and hashes, but a strong password prevents offline
+    dictionary attacks if pg_hba.conf or the password hash file is
+    compromised).
+
+    Why pipe SQL via stdin (not command-line args)?
+    -----------------------------------------------
+    PostgreSQL's ``-c`` flag puts the SQL in the process command line,
+    visible via ``ps aux`` and in shell history.  Piping via stdin
+    keeps the password out of process listings — only root can see
+    the subprocess stdin buffer.
+    """
     user_exists = False
     try:
         result = subprocess.run(
@@ -369,7 +501,9 @@ def _ensure_db_user() -> bool:
         print("  [✓] Database user 'fw_cache' — exists")
         return True
 
-    # User exists but no saved password — regenerate
+    # User exists but no saved password — regenerate.
+    # This case occurs when the database was created manually or the
+    # credentials file was deleted/lost.  ALTER USER resets the password.
     print("  [!] Database user 'fw_cache' exists but no saved credentials")
     password = secrets.token_urlsafe(24)
     sql = f"ALTER USER fw_cache WITH PASSWORD E'{password}'"
@@ -388,7 +522,27 @@ def _ensure_db_user() -> bool:
 
 
 def _save_credentials(password: str) -> None:
-    """Save the database URL to a credentials file."""
+    """Save the database URL to a credentials file.
+
+    Writes to two locations in order of preference:
+    1. ``/var/lib/fw-cache-server/db.env`` (production, systemd
+       EnvironmentFile=, chmod 640 root:fw-cache)
+    2. ``~/.fw-context/db.env`` (fallback, chmod 600)
+
+    Why chmod 640 (not 600)?
+    ------------------------
+    640 allows the ``fw-cache`` group to read the file — necessary
+    because systemd reads EnvironmentFile as root but the service runs
+    as the ``fw-cache`` user.  600 (owner-only) would prevent the
+    service user from reading the credentials at runtime.
+
+    Why two locations?
+    ------------------
+    ``/var/lib/fw-cache-server/`` is the production path (system-wide,
+    readable by the fw-cache group).  ``~/.fw-context/`` is the fallback
+    for single-user setups where the operator doesn't have sudo access
+    or is running in a development environment.
+    """
     db_url = f"postgresql://fw_cache:{password}@localhost:5432"
     db_url_line = f'FW_CACHE_DB_URL="{db_url}"\n'
 
@@ -421,7 +575,17 @@ def _save_credentials(password: str) -> None:
 
 
 def _find_db_url() -> str:
-    """Find the PostgreSQL connection URL from env or credentials files."""
+    """Find the PostgreSQL connection URL from env or credentials files.
+
+    Checks in order: environment variable, /var/lib/fw-cache-server/db.env,
+    ~/.fw-context/db.env.  Returns the first found URL or empty string.
+
+    Why set os.environ?
+    -------------------
+    Once a db_url is found from a file, setting ``FW_CACHE_DB_URL`` in
+    the environment ensures subsequent functions in the wizard don't
+    re-read the file — they get the cached value from os.environ.
+    """
     db_url = os.environ.get("FW_CACHE_DB_URL", "")
     if db_url:
         return db_url
@@ -438,7 +602,23 @@ def _find_db_url() -> str:
 # -- Databases --
 
 def _ensure_databases() -> bool:
-    """Ensure the meta and cache databases exist."""
+    """Ensure the meta and cache databases exist.
+
+    Checks both ``fw_cache_meta`` and ``fw_cache`` via PostgreSQL's
+    ``pg_database`` catalog.  Creates any missing database with
+    ``OWNER fw_cache`` — this is critical: without the correct owner,
+    the fw_cache user cannot create tables in the database during
+    ``fw-cache-server init``.
+
+    Why separate databases (meta + cache)?
+    --------------------------------------
+    The meta database (projects, tokens) has different security
+    requirements than the cache database (shared analyses).  Separate
+    databases allow different PostgreSQL user permissions, backup
+    schedules, and connection pool sizes.  This also isolates the
+    impact of a cache database corruption — meta operations
+    (token validation) continue working.
+    """
     db_url = _find_db_url()
 
     if not db_url:
@@ -480,7 +660,19 @@ def _ensure_databases() -> bool:
 # -- Cache server init + project/token creation (single async context) --
 
 async def _async_init_cache_server(backend) -> str | None:
-    """Initialize schema + admin token using an already-connected *backend*."""
+    """Initialize schema + admin token using an already-connected *backend*.
+
+    When projects already exist (re-run scenario), returns the existing
+    admin token from the environment without creating a duplicate.
+
+    Why check for existing projects before creating admin token?
+    ------------------------------------------------------------
+    ``create_admin_token()`` creates a new token each time it's called.
+    Running the wizard twice would create duplicate admin tokens —
+    confusing and wasteful.  If projects exist, the server has already
+    been initialized — return the existing token (or "unknown" if not
+    in environment).
+    """
     await backend.init_schema()
 
     existing = await backend.list_projects()
@@ -501,7 +693,20 @@ async def _async_list_projects(backend) -> list[dict]:
 async def _async_create_project(
     backend, project_id: str
 ) -> tuple[str, str, str] | None:
-    """Create a project + tokens using an already-connected *backend*."""
+    """Create a project + tokens using an already-connected *backend*.
+
+    Returns ``(project_id, write_token, read_token)`` on success, ``None``
+    on failure.  Also generates two additional tokens (write+overwrite and
+    read-only) even when the project already exists — the existing
+    project's admin token may have been lost.
+
+    Why create both write and read tokens?
+    --------------------------------------
+    - Write+overwrite token — for the project maintainer/CI to push analyses
+    - Read-only token — for developers to consume cached analyses
+    This gives the operator both tokens immediately; they distribute the
+    read-only token to developers and keep the write token for CI.
+    """
     result = await backend.create_project(project_id)
     if result is None:
         print(f"    Project '{project_id}' already exists — creating additional tokens")
@@ -551,7 +756,16 @@ def _ensure_cache_server_init() -> str | None:
 # -- Project and tokens (interactive UI, no asyncio.run inside) --
 
 def _detect_project_id_from_cwd() -> str | None:
-    """Read project ID from .fw-context/config.toml in the current directory."""
+    """Read project ID from .fw-context/config.toml in the current directory.
+
+    Why read from config.toml?
+    --------------------------
+    The operator typically runs the setup wizard from their project
+    directory (where they ran ``fw-context init``).  Reading the
+    project ID from config.toml saves them from having to copy-paste
+    a 32-character hex string — the wizard detects it automatically
+    and offers to use it.
+    """
     config_path = Path.cwd() / ".fw-context" / "config.toml"
     if not config_path.exists():
         return None
@@ -574,6 +788,14 @@ def _setup_project_and_tokens(
 
     Opens its own database connection.  The wizard uses the inline
     ``_all_db_ops()`` path instead (single ``asyncio.run()`` call).
+
+    Why a separate entry point for CLI?
+    -----------------------------------
+    The CLI command ``fw-cache-server setup`` may need to create
+    projects interactively after the server is already running.
+    This function handles the interactive project creation flow
+    independently of the full wizard — useful for adding projects
+    to an existing cache server.
     """
     import asyncio
 
@@ -639,7 +861,13 @@ def _setup_project_and_tokens(
 # -- systemd --
 
 def _ensure_systemd_service() -> None:
-    """Prompt to install the systemd service."""
+    """Prompt to install the systemd service.
+
+    Why check for existing service first?
+    ------------------------------------
+    The setup wizard should be idempotent — running it twice should
+    not overwrite a manually-tuned systemd unit or create a duplicate.
+    """
     if Path("/etc/systemd/system/fw-cache-server.service").exists():
         print("  [✓] systemd service — already installed")
         return
@@ -648,7 +876,12 @@ def _ensure_systemd_service() -> None:
     if not _ask("Install systemd service?"):
         return
 
-    # Ensure fw-cache system user exists
+    # Ensure fw-cache system user exists.
+    # The systemd unit runs as User=fw-cache — the user must exist
+    # before the service can start.  ``-r`` creates a system user
+    # (no home directory, no login shell), ``-s nologin`` prevents
+    # interactive login, ``-d /nonexistent`` provides a non-existent
+    # home directory (the service never needs disk access).
     import pwd
     try:
         pwd.getpwnam("fw-cache")
@@ -692,7 +925,25 @@ def _ensure_launchd_service() -> None:
 # -- nginx --
 
 def _ensure_nginx() -> None:
-    """Prompt to install and configure nginx with HTTPS."""
+    """Prompt to install and configure nginx with HTTPS.
+
+    This is the most complex step in the wizard.  It handles:
+    1. nginx installation (if missing)
+    2. DNS validation
+    3. Config generation with HTTP-only temporary config
+    4. certbot certificate acquisition
+    5. Full HTTPS config generation
+    6. Config test + reload
+
+    Why a temporary HTTP-only config before certbot?
+    -----------------------------------------------
+    certbot's nginx plugin needs to serve the ACME HTTP-01 challenge
+    on port 80.  The full HTTPS config only listens on 443 — if we
+    generate the full config first, nginx won't serve the challenge
+    and certbot fails.  The temporary config serves port 80 only
+    (static root), certbot passes the challenge, then we overwrite
+    with the full HTTPS config.
+    """
     from .nginx_config import (
         detect_certbot,
         detect_nginx,
@@ -708,6 +959,7 @@ def _ensure_nginx() -> None:
     if nginx_state["installed"] and nginx_state["running"] and nginx_state["has_https"]:
         domains = nginx_state["domains"]
         print(f"  [✓] nginx — running, HTTPS active ({', '.join(domains[:2])}{'...' if len(domains) > 2 else ''})")
+        return  # Nothing to do — already fully configured
 
     elif nginx_state["installed"] and nginx_state["running"]:
         print("  [✓] nginx — running (no HTTPS detected)")
@@ -735,7 +987,9 @@ def _ensure_nginx() -> None:
         print("    No domain — skipping nginx/HTTPS configuration")
         return
 
-    # Check DNS
+    # Check DNS — certbot needs the domain to resolve to this server
+    # for the HTTP-01 challenge.  Warn but don't abort — DNS might
+    # be propagating or configured after the wizard runs.
     import socket
     try:
         socket.getaddrinfo(domain, None)
@@ -766,7 +1020,10 @@ def _ensure_nginx() -> None:
     from .nginx_config import cert_exists
     if not cert_exists(domain):
         print(f"  [!] No certificate for {domain} — obtaining via certbot...")
-        # First, create temporary HTTP-only config so certbot can verify
+        # First, create temporary HTTP-only config so certbot can verify.
+        # certbot --nginx modifies nginx configs but ONLY those that have
+        # a server_name matching the requested domain.  The temporary
+        # config ensures port 80 is served.
         http_config = f"""server {{
     listen 80;
     server_name {domain};
@@ -794,7 +1051,10 @@ def _ensure_nginx() -> None:
 
         print(f"  [✓] Certificate obtained for {domain}")
 
-    # Write full HTTPS nginx config (cert now exists)
+    # Write full HTTPS nginx config (cert now exists).
+    # This overwrites the temporary HTTP-only config with the full
+    # HTTPS config that includes SSL certificates and the reverse
+    # proxy to the cache server backend.
     config_path = write_nginx_config(domain)
     enable_nginx_site()
     print(f"  [✓] nginx config — {config_path}")

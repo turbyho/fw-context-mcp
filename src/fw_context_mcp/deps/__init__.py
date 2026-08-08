@@ -7,6 +7,21 @@ Public API:
 - :func:`format_results` — human-readable table output
 - :func:`exit_code` — map results to 0/1/2 exit code
 - :func:`_vec_available` — cached sqlite-vec probe (shared with MCP handlers)
+
+WHY: fw-context has non-trivial runtime dependencies (pysqlite3,
+sqlite-vec, libclang shared library, Ollama models) that must be
+installed outside the Python packaging system.  pip cannot install
+shared libraries or pull LLM models.  The dep system fills this gap:
+it detects problems early, prints platform-specific fix instructions,
+and can auto-install pip-installable packages.
+
+Design:
+* **Pre-flight** (``run_preflight``) only checks imports that are fast
+  and that block basic operation — pysqlite3 and sqlite3 extension
+  support.  Everything else is deferred to ``run_full_check``.
+* **Idempotent** — checks can be re-run safely; they never modify state.
+* **Platform-aware** — fix instructions branch on OS, package manager,
+  and whether Python is managed by pyenv.
 """
 
 from __future__ import annotations
@@ -29,6 +44,11 @@ class DepCheckResult:
         fix_cmd: Shell command to auto-repair (``None`` when not fixable).
         instructions: Multi-line platform-specific manual fix guide.
         critical: When True, blocks basic operation — pre-flight exits 1.
+
+    WHY (frozen): Check results must be immutable so they can be passed
+    between threads (the MCP server runs checks in background threads)
+    and so callers cannot accidentally modify a result after it is
+    returned.
     """
 
     name: str
@@ -48,6 +68,11 @@ def run_preflight() -> list[DepCheckResult]:
     Only checks that can fail on a correctly-installed package:
     pysqlite3 import + sqlite3 extension support.  Heavy imports
     (httpx, clang, config) are deferred to :func:`run_full_check`.
+
+    WHY: Running on every CLI invocation catches the #1 support issue
+    (missing pysqlite3 on macOS/Windows) before the user wastes time
+    waiting for a command that will eventually crash.  The 50 ms budget
+    ensures the check is invisible to users.
     """
     from ._checks import check_pysqlite3, check_sqlite3_extensions
 
@@ -62,6 +87,10 @@ def run_full_check(project_root: str | Path | None = None) -> list[DepCheckResul
 
     Checks in dependency order; dependent checks return ``"skipped"``
     when a prerequisite failed.  Loads config once for Ollama/model checks.
+
+    WHY: Loading config is slow (it triggers TOML parsing and build
+    system detection).  Doing it once and sharing across multiple
+    checks avoids redundant I/O.
     """
     from ._checks import CHECK_ORDER
 
@@ -109,6 +138,11 @@ def run_fixes(results: list[DepCheckResult], project_root: str | Path | None = N
 
     Returns the updated list — successfully fixed items are replaced
     with a fresh ``"ok"`` result from re-running the corresponding check.
+
+    WHY: A fix may succeed (pip install works) but the installation may
+    still be broken (wrong architecture, missing .so dependency).
+    Re-checking after every fix gives the user accurate status rather
+    than falsely reporting success.
     """
     from ._fixes import FIXABLE, run_fix
 
@@ -244,6 +278,11 @@ def _vec_available() -> tuple[bool, str | None]:
 
     First call imports ``sqlite_vec`` and probes an in-memory connection
     (~10-20 ms).  Subsequent calls return the cached result instantly.
+
+    WHY: The MCP server calls this on every incoming query.  Without
+    caching, every request would pay the 10-20 ms import + probe cost.
+    The double-checked locking pattern (check outside lock, then check
+    inside) avoids lock contention on the hot path after the first call.
     """
     global _vec_cache
     if _vec_cache is not None:

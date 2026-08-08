@@ -1,5 +1,21 @@
 """Phase: Scoring — prefer embedding results, fall back to FTS5.
 
+Why no RRF (Reciprocal Rank Fusion)?
+    RRF merges FTS5 and embedding results by giving each result a score
+    based on its rank in both lists.  Evaluation on zbox-ecb-fw (30 queries)
+    showed Dense-only MRR 0.609 vs any hybrid combination < 0.58.  FTS5
+    adds noise for natural-language queries because it matches sub-word
+    tokens without semantic understanding — a "dma transfer" query via
+    FTS5 finds ``timer_dma`` (partial token match), while embeddings find
+    ``DMAStream::transfer`` (semantic match).  Merging degrades precision.
+
+Why the dense-count threshold?
+    On some projects, embedding quality is poor (pre-desc-v4 model:
+    HA_Boiler dense MRR=0.066 vs FTS5 MRR=0.335).  The threshold prevents
+    returning 2-3 barely-relevant dense results when FTS5 would return
+    20 solid hits.  When dense results are too sparse to be trustworthy,
+    fall back to FTS5.
+
 Replaces old ``rrf_fusion`` + ``rerank`` dual-phase.
 Evaluation on zbox-ecb-fw (30 queries): Dense-only MRR 0.609 > any hybrid.
 FTS5 adds noise for NL queries — best strategy is to trust the embedding model.
@@ -32,6 +48,19 @@ MIN_DENSE_COUNT: int = 3
 class AdaptiveFusionPhase(Phase):
     """Route results: embedding if available and sufficient, otherwise FTS5.
 
+    Why not merge?
+        Merging FTS5 and embedding results (via RRF, weighted sum, or
+        interleaving) consistently produces lower MRR than the best
+        individual source.  The adaptive routing strategy picks the
+        better source per-query: embedding when it has enough signal,
+        FTS5 when embedding is too sparse.
+
+    Why configurable threshold?
+        Different projects have different embedding quality depending
+        on the model used, codebase size, and coding conventions.  The
+        ``[index] min_dense_count`` config lets project maintainers tune
+        the threshold per-project without code changes.
+
     No RRF merging — evaluation shows any blend degrades MRR.
     The dense-result threshold is read from ``[index] min_dense_count``
     config (default 3).  When dense results are too sparse, falls back
@@ -42,7 +71,13 @@ class AdaptiveFusionPhase(Phase):
     name = "adaptive_fusion"
 
     def _get_threshold(self, ctx: PipelineContext) -> int:
-        """Return the minimum dense count from config or module default."""
+        """Return the minimum dense count from config or module default.
+
+        Why max(1, ...)?
+            A threshold of 0 would always choose embedding, defeating
+            the purpose.  Clamping to 1 ensures at least one decent
+            embedding result is required.
+        """
         min_count = getattr(ctx.config.index, "min_dense_count", MIN_DENSE_COUNT)
         return max(1, min_count)
 

@@ -1,4 +1,25 @@
-"""SDK path filtering — LIKE-based exclude patterns for vendor/OS code."""
+"""SDK path filtering — LIKE-based exclude patterns for vendor/OS code.
+
+Why LIKE patterns instead of file-path comparison:
+
+- The files table stores paths that may be relative (``mbed-os/rtos/Thread.cpp``)
+  or absolute (``/home/user/project/mbed-os/rtos/Thread.cpp``).  LIKE with a
+  ``%`` prefix matches both forms in one query — ``%mbed-os/%`` finds
+  every file under a directory named ``mbed-os`` regardless of the path
+  representation.
+- A Python-side ``Path.match()`` filter would require pulling the entire
+  file list into memory (project databases with 30K+ files) and applying
+  path joins per row — the database is faster at pattern matching than
+  Python, and the WHERE clause pushes the filter into SQLite's index scan.
+- Patterns compose additively: auto-detected SDK directories from the build
+  system + user-configured ``vendor_paths`` from config.  LIKE patterns
+  merge without conflict because SQL's OR semantics naturally compose.
+
+Pattern format: ``%dir_name/%`` — the trailing ``/%`` ensures only files
+inside the directory are excluded, not files whose path merely contains
+the directory name as a substring (``%lib/%`` excludes ``lib/mylib.c``
+but not ``calibration/sensor.c``).
+"""
 
 from __future__ import annotations
 
@@ -13,19 +34,32 @@ from ...indexer.sdk_detect import (  # noqa: F401 — re-exported
 
 
 def detect_sdk_exclude_like(project_root: Path, extra_vendor_paths: list[str] | None = None) -> list[str]:
-    """Return LIKE patterns for SDK/vendor directories.
+    """Return SQL LIKE patterns that match SDK and vendor directory paths.
 
-    SDK directories are auto-detected from the build system type via
-    :func:`_build_sdk_excludes`. User-configured paths come from
-    *extra_vendor_paths* (config ``vendor_paths``).
+    Two sources of patterns, merged:
 
-    Returns patterns with a ``%`` prefix so they match both relative
-    (``mbed-os/...``) and absolute (``/home/.../mbed-os/...``) paths
-    in the files table.
+    1. **Auto-detection** — :func:`_build_sdk_excludes` inspects the
+       build system type (PlatformIO, Mbed CLI, CMake) and returns
+       patterns like ``mbed-os/``, ``.pio/libdeps/``, ``build/``.
+       These patterns come from the SDK's own build-system detectives,
+       not from hardcoded guesses.
+    2. **User configuration** — ``vendor_paths`` from
+       ``[index]`` in ``config.toml``.  Users add directories like
+       ``external/libfoo/`` that the auto-detector cannot know about.
+
+    All returned patterns are prefixed with ``%`` so they match both
+    relative and absolute paths in SQL ``LIKE`` queries.
+
+    Why the leading ``%`` strip-then-add approach:
+
+    - ``_build_sdk_excludes`` may already include a ``%`` prefix for
+      patterns that match nested paths (``%.platformio/%``).  Stripping
+      any existing leading ``%`` before adding our own avoids double
+      prefixes (``%%.platformio/%``) that would break the pattern.
+    - User paths never include ``%``, so the strip is a no-op for them.
     """
-    # Auto-detect from build system (zero hardcoded marker names outside _build_sdk_excludes).
-    # Some patterns already include a % prefix for nested-path matching (e.g. %.platformio/%),
-    # so we strip any leading % before adding our own.
+    # Strip existing leading % to prevent double-prefix (some auto-detected
+    # patterns already include % for nested-path matching).
     patterns: list[str] = [f"%{p.lstrip('%')}" for p in _build_sdk_excludes(project_root)]
 
     if extra_vendor_paths:

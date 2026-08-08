@@ -7,6 +7,21 @@ Uses stdlib ``tomllib`` for reading/validation and ``tomli_w`` for writing.
 Comment preservation is NOT guaranteed — sites that need comment preservation
 should use line-level editing instead (see ``_write_project_id`` for an
 example of the pattern).
+
+WHY ``_atomic_write`` uses ``tempfile.mkstemp`` + ``os.replace`` instead
+of a simple ``Path.write_text``: if the process is killed (OOM killer,
+SIGKILL) mid-write, ``Path.write_text`` leaves a partially written file.
+``os.replace`` is an atomic rename syscall — the destination either
+contains the old content or the new content, never a truncated mix.
+
+WHY ``tomli_w`` (not the stdlib ``tomllib``): Python 3.11+ stdlib has
+``tomllib`` for READING only — there is no ``toml`` write support in
+the standard library.  ``tomli_w`` is the de facto write library.
+
+WHY ``merge_template`` preserves existing keys: ``fw-context init`` may
+be re-run on an already-initialised project (e.g. after a colleague
+checked out the repo).  The template adds new keys that appeared in
+a newer version, but must not overwrite the team's existing settings.
 """
 
 from __future__ import annotations

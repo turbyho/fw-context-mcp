@@ -1,7 +1,16 @@
 """Build manifest — deterministic snapshot of compile_commands + header hashes + macros.
 
 Replaces ``.d`` dependency files with a single ``manifest.json`` in the index
-directory.  The manifest records every translation unit's source hash, included
+directory.
+
+WHY a manifest: ``.d`` dependency files are fragile — they depend on build
+output paths that change between builds and are scattered across the build
+tree.  A centralised manifest with SHA-256 hashes provides uniform,
+content-addressable staleness detection: compare stored hashes against
+current on-disk content.  This is faster (one JSON read vs. thousands of
+``.d`` file reads) and more reliable (no missing or stale ``.d`` files).
+
+The manifest records every translation unit's source hash, included
 header hashes (collected from the libclang token stream), and preprocessor
 macro definitions (from ``clang -dM -E``).  Staleness detection is uniform:
 compare the stored hashes against current on-disk content.
@@ -47,13 +56,16 @@ HEADER_EXTS = _HEADER_EXTS
 def _collect_headers_from_tokens(tu, project_root: Path, build_dir_patterns: list[str] | None = None) -> list[dict]:
     """Collect included header paths and their SHA-256 hashes from libclang includes.
 
-    Parses *tu* (a ``CompilationUnit``) with libclang, uses
-    ``TranslationUnit.get_includes()`` to enumerate every included file
-    (recursively, at all nesting depths), and returns a list of
-    ``{path, hash, generated}`` dicts for files with header-like extensions.
+    WHY libclang token stream: libclang's ``get_includes()`` returns the
+    ACTUAL resolved header set after preprocessing — including files pulled
+    in via nested ``#include`` chains, ``-include`` forced headers, and
+    platform-conditional ``#ifdef`` branches.  This is more accurate than
+    parsing ``.d`` files, which can miss headers from different build configs
+    or become stale after incremental builds.
 
-    Paths inside *project_root* are stored relative; paths outside (SDK,
-    framework) are stored absolute.
+    Paths inside *project_root* are stored relative so the manifest is
+    portable across machines.  Paths outside (SDK, framework, system headers)
+    are stored absolute.
 
     *build_dir_patterns* are passed through to ``_is_generated_header``
     so that the builder's actual build-output directories (not just the
@@ -236,6 +248,13 @@ def build_preliminary(
 ) -> str:
     """Build a preliminary ``manifest.json`` from structural data only — no libclang.
 
+    WHY preliminary: full manifest generation (with ``_collect_headers_from_tokens``)
+    requires parsing every TU with libclang, which can take minutes on large projects.
+    This function captures the structural identity (files, directories, compiler flags)
+    immediately so staleness checks (the config_hash comparison) work BEFORE the full
+    parse phase.  If the config_hash matches the stored manifest, we know the build
+    structure hasn't changed and can proceed to incremental header updates.
+
     Creates a manifest with ``file``, ``directory``, and ``arguments`` for each
     translation unit, leaving ``source_hash`` and ``headers`` empty.  The
     config_hash is computed from the normalized compile_commands.json via
@@ -244,8 +263,6 @@ def build_preliminary(
 
     This is cheap — no file I/O beyond reading ``compile_commands.json``,
     no libclang parsing.
-
-    Returns the *config_hash* string.
     """
     from fw_context_mcp.config.settings import derive_project_id
 
@@ -317,6 +334,13 @@ def compute_config_hash(
     build_dir_patterns: list[str] | None = None,
 ) -> str:
     """Return SHA-256 of the **normalized** compile_commands.json.
+
+    WHY normalization: raw compile_commands.json is unstable — flag order,
+    absolute vs. relative paths, build-output directory names, and transient
+    ``-D`` macros (timestamps, build counters) change between builds even
+    when compilation semantics are identical.  Hashing the raw file would
+    trigger unnecessary full reindexes.  This function normalizes away
+    all non-semantic differences.
 
     Instead of hashing the manifest dict (which created a circular dependency
     and caused unnecessary config_hash churn when flag order changed), this
@@ -498,15 +522,17 @@ def check_tu_staleness(
 ) -> tuple[bool, str | None]:
     """Check whether a translation unit's source or project headers have changed.
 
+    WHY per-TU staleness: re-parsing every TU on every index run is wasteful
+    when only a few source files changed.  This function enables incremental
+    indexing — only TUs whose source or project headers changed are re-parsed.
+
+    Vendor/SDK headers and headers outside *project_root* are trusted from
+    the manifest — re-hashing thousands of SDK headers on every run would
+    dominate index time.  Only project headers inside *project_root* are
+    re-hashed.
+
     Compares the stored ``source_hash`` and ``headers[].hash`` from *entry*
     against the current on-disk content.
-
-    Args:
-        entry: A single entry from the manifest's ``"entries"`` list.
-        project_root: Project root for resolving relative paths.
-        vendor_patterns: LIKE patterns (with ``%``) for vendor/SDK directories.
-            Headers matching these patterns are trusted from the manifest.
-            Headers outside *project_root* are also trusted.
 
     Returns:
         ``(stale, new_source_hash)`` — *stale* is True when the TU needs

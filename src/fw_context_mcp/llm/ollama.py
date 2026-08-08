@@ -1,4 +1,66 @@
-"""Thin Ollama client for fw-context LLM tools."""
+"""Ollama client for fw-context LLM tools — chat and embedding over HTTP.
+
+Design decisions
+================
+
+Single-process serialization via BoundedSemaphore
+    Ollama runs a single inference engine (llama.cpp under the hood).
+    Two simultaneous /api/generate requests to the same model can
+    trigger OOM on GPU-poor machines or produce garbled output when
+    the KV cache is shared.  The per-process semaphore caps in-flight
+    Ollama HTTP calls so each request completes before the next one
+    starts.  The default value (1) makes this identical to a Lock.
+
+    Multi-client transports (SSE streaming) may tolerate 2-4 concurrent
+    requests — embed requests (small model, ~100ms) rarely interfere
+    with generation requests.  The semaphore is reconfigurable via
+    ``ollama_max_concurrent`` in config.
+
+Cross-process write serialization
+    Multiple MCP workers can call Ollama in parallel (different
+    processes).  The semaphore only serializes within one process.
+    Cross-process ordering is enforced at a higher level by the
+    database write lock (``db.write_lock``) — only the process that
+    holds the write lock may perform LLM analysis writes, so two
+    workers never race on generation→write for the same symbol.
+
+Plan A / Plan B streaming
+    Ollama sometimes ignores ``stream: false`` and returns SSE anyway
+    (observed with certain model+Ollama version combos).  Two plans:
+
+    * **Plan A** (auto-detect): request ``stream: false``.  If the
+      response Content-Type is SSE, parse the already-complete body
+      as SSE lines — no extra HTTP round-trip, no config needed.
+    * **Plan B** (active streaming): request ``stream: true`` and
+      consume SSE chunks via ``httpx.stream()``.  Keeps the connection
+      alive during long generations — avoids reverse-proxy idle
+      timeouts (nginx 60s, Cloudflare 100s).  Used when the operator
+      sets ``cfg.stream = True``.
+
+Auto-pull on 404
+    When ``cfg.auto_pull`` is True and Ollama returns HTTP 404, the
+    model is pulled before the request is retried.  Auto-pull is
+    disabled by default (``auto_pull=False``) for intranet deployments
+    where outbound bandwidth is limited or models require approval.
+
+    Pull detection uses stall-based timeouts (not absolute) — a slow
+    download is not a failure; only zero progress triggers a timeout.
+
+Embedding prompt prepending
+    ``embed_query_prompt`` and ``embed_doc_prompt`` are prepended to
+    input texts before embedding.  Some models (e.g. E5-style) use
+    these for asymmetric encoding — a query prefix triggers different
+    internal behaviour than a document prefix.  The Ollama API sends
+    input as-is; the prompt prefix is client-side prepending.
+
+Module-level state
+    ``_max_tokens_cache`` — model → context-length map, built lazily.
+    Avoids an HTTP GET per ``max_tokens`` access (called frequently
+    during truncation decisions).
+
+    ``_ollama_sem`` — per-process BoundedSemaphore.  See Design
+    decisions above.
+"""
 
 from __future__ import annotations
 
@@ -20,7 +82,10 @@ from .embedder import Embedder
 
 log = logging.getLogger(__name__)
 
-# Cache for Ollama model context lengths — populated lazily by OllamaEmbedder.max_tokens
+# Cache for Ollama model context lengths — populated lazily by OllamaEmbedder.max_tokens.
+# Module-level (not instance-level) because context length depends only on the
+# model name, not on the config or embedder instance.  Avoids an HTTP GET
+# to /api/show every time max_tokens is accessed during batch embedding.
 _max_tokens_cache: dict[str, int] = {}
 
 # Per-process semaphore controlling concurrent Ollama HTTP calls.
@@ -34,8 +99,13 @@ _max_tokens_cache: dict[str, int] = {}
 #
 # httpx.Client IS thread-safe — this semaphore is about Ollama server
 # capacity, not about httpx correctness.
+#
+# BoundedSemaphore (not Semaphore) — raises ValueError on release()
+# without acquire(), catching double-release bugs early.
 _ollama_sem: threading.BoundedSemaphore = threading.BoundedSemaphore(1)
 _sem_value: int = 1
+# Protects _ollama_sem reassignment — reconfiguring while threads
+# are acquiring the old semaphore would lose the cap.
 _reconfigure_lock = threading.Lock()
 
 
@@ -45,6 +115,10 @@ def _reconfigure_ollama_sem(max_concurrent: int) -> None:
     Called from ``OllamaEmbedder.__init__`` when config provides a
     non-default ``ollama_max_concurrent``.  Idempotent — a semaphore
     with the same value is not recreated.
+
+    WHY idempotent: Embedder instances are created once per config load.
+    On config reload the existing semaphore keeps working; recreating
+    needlessly would risk losing in-flight acquires.
     """
     global _ollama_sem, _sem_value
     if max_concurrent < 1:
@@ -80,10 +154,18 @@ def _pull_model(
     response.  Only times out when NO progress is made for
     *stall_timeout* seconds — slow connections and large models
     are handled gracefully.
+
+    WHY stall-based timeout (not absolute): Model downloads range from
+    0.5 GB (qwen3-embedding:0.6b) to >20 GB (deepseek-coder-v2).
+    A fixed timeout would be too short for large models or too long for
+    small ones.  Stall detection handles both: it waits as long as bytes
+    keep arriving, only failing when the connection truly hangs.
     """
 
     url = base_url.rstrip("/") + "/api/pull"
     last_progress = time.monotonic()
+    # Track per-digest progress — Ollama streams progress per BLOB digest,
+    # not as a single cumulative counter.  A new digest resets completed=0.
     digest_states: dict[str, int] = {}  # digest → last completed bytes
 
     try:
@@ -286,6 +368,13 @@ def call_ollama(
     API returns a streaming response anyway, it is auto-detected and parsed
     transparently (Plan A fallback).
 
+    WHY two separate paths: The OpenAI-compatible endpoint uses
+    ``/chat/completions`` with a messages array; the Ollama-native endpoint
+    uses ``/api/generate`` with a raw prompt string.  These are different
+    HTTP payload formats — auto-detected from the URL so the operator
+    doesn't need to know which one to use.  Embedding always goes to
+    local Ollama (``/api/embed``) regardless of chat routing.
+
     Args:
         prompt: The full prompt text to send.
         cfg: LLM configuration.
@@ -412,6 +501,10 @@ def _call_ollama_embed_impl(
     if not cfg.ollama_url.startswith(("http://", "https://")):
         raise OllamaError(f"Invalid ollama_url scheme: {cfg.ollama_url} — must be http:// or https://")
     url = cfg.ollama_url.rstrip("/") + "/api/embed"
+    # Prepend instruction prompt for asymmetric embedding models (e.g. E5-style).
+    # Query: "Represent this sentence for searching relevant passages: "
+    # Document: "" (empty — document encoding expects no prefix for some models)
+    # The prompts are configured per-model in settings.py defaults.
     prompt = cfg.embed_query_prompt if query else cfg.embed_doc_prompt
     if prompt:
         inputs = [prompt + inp for inp in inputs]
@@ -721,6 +814,9 @@ def check_setup(cfg: LLMConfig) -> dict:
             messages: list[str] = []
             if not model_found:
                 messages.append(f"Chat model '{cfg.model}' is not installed. Run: ollama pull {cfg.model}")
+                # If the largest installed model is <7B parameters, suggest cloud API.
+                # Models <7B generally produce poor-quality code analysis;
+                # the operator may want to use an external API instead.
                 max_size = max(
                     (_parse_parameter_size(md["parameter_size"]) for md in model_details),
                     default=0.0,

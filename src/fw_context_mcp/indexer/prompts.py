@@ -1,5 +1,12 @@
 """Prompt templates and response parsers for LLM-based symbol analysis.
 
+WHY custom prompts: general-purpose LLMs don't know embedded firmware
+conventions.  Without explicit format instructions and domain examples,
+models produce inconsistent output (nested JSON, missing fields,
+prose instead of structured data).  The prompt template was iterated
+6+ times against qwen2.5-coder:14b on real Mbed OS firmware symbols
+to find the format that produces reliable, parseable JSON.
+
 Uses Ollama chat models to generate structured descriptions (summary,
 inputs, outputs) for C/C++ symbols. The prompt template is based on
 experimental validation against qwen2.5-coder:14b on real Mbed OS
@@ -201,10 +208,14 @@ _INVALID_JSON_ESCAPE = re.compile(r"(?<!\\)\\(?![\"\\/bfnrt]|u[0-9a-fA-F]{4})")
 def _extract_first_json_array(text: str) -> str | None:
     """Extract the first complete JSON array from *text* using bracket counting.
 
+    WHY bracket counting: LLMs sometimes wrap their JSON output in markdown
+    prose ("Here is the analysis: [..] let me know if...").  A greedy regex
+    ``re.search(r"\\[.*\\]", text, re.DOTALL)`` would match from the first
+    ``[`` to the last ``]`` across multiple arrays.  Bracket counting with
+    string-aware state correctly handles nested arrays/objects and strings
+    containing literal ``[`` or ``]``.
+
     Returns the array substring (from ``[`` to matching ``]``) or None.
-    Handles nested arrays/objects and strings correctly — unlike the
-    greedy ``re.search(r\"\\[.*\\]\", text, re.DOTALL)`` which matches
-    from the first ``[`` to the last ``]`` across multiple arrays.
     """
     start = text.find("[")
     if start == -1:

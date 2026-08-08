@@ -1,5 +1,11 @@
 """Embedding generation extracted from runner.py.
 
+WHY separate module: embedding generation is the most memory-intensive phase
+of indexing — it loads sentence-transformer models that consume gigabytes of
+VRAM/RAM.  Isolating it from the main runner allows the model to be garbage-
+collected after the embedding phase completes, freeing memory for subsequent
+analysis phases.
+
 Handles embedding model key generation, body chunking/truncation,
 orphaned compile_commands artifact cleanup, and the main embedding
 build phase.
@@ -54,6 +60,14 @@ def _embed_content_hash(r) -> str:
 
 def _chunk_body(source: str, max_chars: int) -> list[str]:
     """Split a C/C++ function body into semantic chunks at statement boundaries.
+
+    WHY chunking: embedding models have a fixed maximum context window
+    (typically 512-1024 tokens).  Large function bodies (e.g. a 2000-line
+    state machine) must be split into overlapping or contiguous chunks.
+    Semantic splitting at brace/semicolon boundaries preserves statement
+    integrity — each chunk is a self-contained semantic unit rather than
+    an arbitrary character-range window.
+
 
     Split points (highest to lowest priority):
     1. Closing brace ``}`` at end of line (end of block)

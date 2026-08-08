@@ -1,5 +1,10 @@
 """Pre-index validation and auto-fix for build artifacts.
 
+WHY pre-index validation: libclang parsing fails silently or with cryptic
+errors when build artifacts are missing or corrupt.  Catching common
+failure modes BEFORE parsing saves minutes of doomed parse attempts and
+gives the user a clear, actionable error message.
+
 ``validate_and_fix()`` is called between build and ``runner.run()`` in
 ``cmd_index()``.  It parses ``compile_commands.json``, runs per-builder
 validation, auto-fixes detected problems, and returns any remaining

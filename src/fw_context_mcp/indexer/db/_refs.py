@@ -1,4 +1,59 @@
-"""Reference tracking (refs, indirect_call_sites, fp_assignments)."""
+"""Reference tracking — refs, indirect call sites, function pointer assignments.
+
+This module handles three layers of cross-reference resolution:
+
+── Layer 1: Direct references (refs table) ──
+
+Every read, write, call, or member access by source code is recorded as a
+row in ``refs``.  Queries resolve a symbol name → USR → all reference rows,
+joining back through ``symbols`` for caller metadata.
+
+── Layer 2: Indirect call sites (indirect_call_sites table) ──
+
+When code invokes a function through a pointer (``driver.onData(buf, len)``),
+the callee is a FIELD_DECL or VAR_DECL, not a FUNCTION_DECL.  The
+``indirect_call_sites`` table records WHERE the call happens and WHICH
+field/variable was invoked — but not WHICH function is actually called.
+That resolution happens in Layer 3.
+
+── Layer 3: Function pointer assignments (fp_assignments table) ──
+
+The ``fp_assignments`` table records every ``field = &function`` assignment.
+The linking query in ``find_indirect_targets()`` joins:
+  ``fp_assignments.lhs_usr = indirect_call_sites.target_usr``
+to answer: "which functions can be called through this function pointer?"
+
+── Reference resolution strategy ──
+
+Name → USR resolution uses a four-tier match:
+
+1. Exact ``name`` match — ``send`` matches bare name.
+2. Exact ``qualified_name`` match — ``zbox::ZMODEM_DRIVER::send``.
+3. Suffix LIKE on ``qualified_name`` — ``ZMODEM_DRIVER::send`` matches
+   ``zbox::ZMODEM_DRIVER::send``.
+4. Plain name fallback — the segment after the last ``::``.
+
+For aggregate types (class, struct, enum), references are stored at
+member granularity (``MyClass::method``, not just ``MyClass``).  The
+query uses USR prefix matching (``to_usr LIKE usr || '@%'``) to include
+all member references when the resolved symbol is an aggregate type.
+
+── Phase 3b / 3c fallbacks ──
+
+When the exact USR join in ``find_indirect_targets()`` produces no call
+site, two fallback strategies are tried:
+
+**Phase 3b — class hierarchy fallback**: traces the receiver field's
+type through the inheritance chain and searches for an ``indirect_call_sites``
+row in any method of that class.  This handles C++ template callback
+wrappers like ``mbed::Callback<void()>`` where the callback is stored in
+an internal field of the receiver class.
+
+**Phase 3c — fn_ptr_type fallback**: matches by function pointer type
+string when the exact USR join fails.  This handles cases where the same
+function pointer type is assigned through one variable but invoked through
+a differently-named variable (e.g., ``.handler = cb`` → ``m_usbevt_handler(...)``).
+"""
 
 from __future__ import annotations
 
@@ -26,8 +81,13 @@ __all__ = [
 def insert_refs_batch(conn: sqlite3.Connection, rows: list[tuple]) -> int:
     """Insert reference rows for the cross-reference / call graph.
 
-    Each row: (config_hash, to_usr, from_file, from_line, from_usr, ref_kind)
-    Returns number of rows inserted.
+    Each row: (config_hash, to_usr, from_file, from_line, from_usr, ref_kind).
+
+    Why INSERT OR IGNORE: the same TU can be indexed multiple times
+    (reindex after header change).  OR IGNORE skips duplicates silently
+    instead of raising IntegrityError.  Duplicate detection relies on
+    the ``idx_refs_unique`` UNIQUE index, which is created during data
+    migration AFTER deduplication for performance.
     """
     cur = conn.executemany(
         """INSERT OR IGNORE INTO refs (config_hash, to_usr, from_file, from_line, from_usr, ref_kind)
@@ -38,9 +98,17 @@ def insert_refs_batch(conn: sqlite3.Connection, rows: list[tuple]) -> int:
 
 
 def delete_refs_for_file(conn: sqlite3.Connection, config_hash: str, from_file: str) -> None:
-    """Delete refs for *from_file*.
-    Path normalization depends on _rel() and _normalize_file_path() staying
-    consistent — any future change to normalization would leave orphaned rows."""
+    """Delete all refs originating in *from_file* under *config_hash*.
+
+    Called before re-indexing a TU to remove stale reference entries.
+    After deletion, the TU's fresh references are re-inserted via
+    ``insert_refs_batch()``.
+
+    Why by file not by USR: a single TU can contain hundreds of symbols,
+    each with dozens of references.  Deleting by file in one DELETE is
+    O(log N) via the index; deleting per-USR would be O(N*log M) with
+    N round-trips.
+    """
     conn.execute(
         "DELETE FROM refs WHERE config_hash=? AND from_file=?",
         (config_hash, from_file),
@@ -53,11 +121,17 @@ def delete_refs_for_file(conn: sqlite3.Connection, config_hash: str, from_file: 
 
 
 def insert_indirect_call_sites_batch(conn: sqlite3.Connection, rows: list[tuple]) -> int:
-    """Insert indirect call site rows.
+    """Insert indirect call site rows for batch indexing.
 
-    Each row: (config_hash, from_file, from_line, from_usr, expr_text,
-    target_usr, target_name, fn_ptr_type).
-    Returns number of rows inserted.
+    Each row records one function pointer invocation.  Unlike refs, the
+    target is a FIELD_DECL/VAR_DECL (the function pointer variable), not
+    a FUNCTION_DECL (the actual function called).
+
+    Why no UNIQUE constraint: a single field can be called many times
+    from the same line (e.g., inside a loop).  Each invocation is a
+    separate call-site row.  Duplicate prevention is not needed here
+    because re-indexing cleans the file's entries first via
+    ``delete_indirect_call_sites_for_file()``.
     """
     cur = conn.executemany(
         """INSERT INTO indirect_call_sites
@@ -82,10 +156,21 @@ def find_indirect_call_sites(
     name: str,
     limit: int = 50,
 ) -> list[sqlite3.Row]:
-    """Find indirect call sites for a function pointer field or variable by name.
+    """Find indirect call sites for a function pointer field or variable.
 
-    Three-tier name resolution (same pattern as ``find_refs``): exact name,
-    exact qualified_name, suffix LIKE.
+    Three-tier name resolution:
+
+    1. Match via ``symbols`` table — covers FIELD_DECL and VAR_DECL symbols
+       that have a USR in the index.
+    2. Fallback to ``target_name`` direct match — covers PARM_DECL symbols
+       (function pointer parameters) that are NOT in the symbols table.
+       Parameters are excluded from symbols because they have no definition
+       USR, but they still appear in indirect_call_sites via the expr_text
+       captured during indexing.
+
+    Why this split: a single ``indirect_call_sites.target_usr IN (SELECT...)``
+    query would miss PARM_DECL targets.  The ``target_name`` fallback
+    ensures parameter-based function pointer calls are found.
     """
     esc_name = name.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
     suffix_pattern = f"%::{esc_name}"
@@ -119,7 +204,11 @@ def find_indirect_call_sites(
 
 
 def count_indirect_call_sites(conn: sqlite3.Connection, config_hash: str) -> int:
-    """Return total indirect call site count (0 when not indexed)."""
+    """Return total indirect call site count for a build config.
+
+    Returns 0 when the Phase 2 analysis has not been indexed.  Used by
+    ``get_active_build()`` to report index coverage.
+    """
     return conn.execute(
         "SELECT COUNT(*) FROM indirect_call_sites WHERE config_hash=?",
         (config_hash,),
@@ -170,23 +259,38 @@ def find_indirect_targets(
 ) -> list[dict[str, object]]:
     """Find functions assigned to a function pointer field/variable/parameter.
 
-    Joins ``fp_assignments`` with ``indirect_call_sites`` on
-    ``lhs_usr = target_usr`` to link assignment sites to call sites.
-    When ``lhs_usr`` is empty (template-obscured callee), ``call_file``
-    will be ``NULL`` — the callback is stored for async invocation through
-    a different USR (e.g. mbed::Timeout internal fields).
-    Three-tier name resolution: exact name, exact qualified, suffix LIKE.
+    The core join: ``fp_assignments`` LEFT JOIN ``indirect_call_sites``
+    ON ``target_usr = lhs_usr``.  When both sides resolve, the result
+    shows which function (rhs_usr) is called where (call_file:call_line).
 
-    **Type-based fallback (Phase 3b):** When the exact USR join fails
-    (call_file IS NULL, typical for C++ template callback wrappers like
-    ``mbed::Callback<void()>``), traces the receiver field's *type* to
-    its class hierarchy and searches for ``indirect_call_sites`` in any
-    method of that class.  This correctly links ``_timeout.attach(cb)``
-    → ``TimeoutBase::handler()`` for mbed-os Timer/Ticker callbacks,
-    and analogous patterns in other C++ frameworks.  C patterns
-    (Zephyr ``k_work_init``, FreeRTOS ``xTimerStart``) are unaffected
-    — their function pointers are stored directly (no templates) so the
-    exact USR join already works.
+    **When the exact USR join fails** (call_file IS NULL), three fallback
+    strategies are applied:
+
+    ── Strategy 1: lhs_usr IS NOT NULL → type-based class hierarchy ──
+    Extract the receiver field's type from its signature, look up the
+    type's class hierarchy, and search for a ``handler`` method in the
+    class or its bases.  This handles C++ template callback wrappers
+    like ``mbed::Callback<void()>`` where the callback is stored in an
+    internal field (``TimeoutBase::_function``) of the class, not the
+    field that was attached to (``TimeoutBase::_timeout``).
+
+    ── Strategy 1b: lhs_usr IS NULL → resolve field by name in parent class ──
+    When the callee is template-obscured and has no USR, find the
+    enclosing function's parent class, enumerate its fields, and try
+    each field's type as a candidate for the class hierarchy fallback.
+
+    ── Strategy 2 (Phase 3c): fn_ptr_type matching ──
+    When both type-hierarchy strategies fail, match by function pointer
+    type string.  This handles cases where the same fn_ptr_type is
+    assigned through one struct field but invoked through a differently
+    named variable (e.g., ``config.handler = cb`` stored via one field
+    but ``m_usbevt_handler(...)`` called through another).  The match
+    is logged as ``_note`` because it is less certain than USR resolution.
+
+    Why multi-tier fallback: each strategy covers a different C/C++
+    callback pattern.  No single strategy works for all patterns because
+    the indexer captures different levels of detail depending on whether
+    libclang can resolve the template parameters at parse time.
     """
     esc_name = name.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
     suffix_pattern = f"%::{esc_name}"
@@ -394,9 +498,18 @@ def count_fp_assignments(conn: sqlite3.Connection, config_hash: str) -> int:
 def _build_kind_filter(ref_kind: str | list[str] | None) -> tuple[str, list[str]]:
     """Build a SQL kind-filter clause and parameter list for ref_kind.
 
-    Returns ``(sql_fragment, params)`` — the fragment is empty when
-    *ref_kind* is None, a single ``= ?`` for a string, or an ``IN (...)``
-    clause for a list.
+    Returns ``(sql_fragment, params)``:
+
+    - ``None`` → ``""`` (no filter) — returns all reference kinds.
+    - ``"call"`` → ``"AND r.ref_kind = ?"`` — single-value filter.
+    - ``["call", "indirect"]`` → ``"AND r.ref_kind IN (?, ?)"`` — multi-value.
+    - ``[]`` (empty list) → ``"AND 1=0"`` — intentionally returns no rows
+      (caller asked for zero allowed kinds).
+
+    Why ``1=0`` instead of returning ``""`` for an empty list: returning
+    all rows when the caller explicitly wants zero types would be a silent
+    correctness bug.  ``1=0`` is a constant false condition that SQLite's
+    query planner recognizes and short-circuits.
     """
     if ref_kind is None:
         return "", []
@@ -415,25 +528,33 @@ def find_refs(
     ref_kind: str | list[str] | None = None,
     limit: int = 50,
 ) -> list[sqlite3.Row]:
-    """Find references to a symbol by name.
+    """Find all references to a symbol by name or partial qualified name.
 
-    Resolves the target name → its USR(s) via symbols, then joins refs.to_usr.
-    Each result carries the referencing location and, when known, the enclosing
-    caller symbol (joined from refs.from_usr → symbols.usr).
+    **Name resolution** uses a four-tier match so partially-qualified names
+    work without requiring the full ``Namespace::Class::method`` prefix:
 
-    Name resolution uses a three-tier match so partially-qualified names work:
-    1. Exact ``name`` match (e.g. ``send`` matches bare name ``send``)
-    2. Exact ``qualified_name`` match (``zbox::ZMODEM_DRIVER::send``)
-    3. Suffix LIKE on ``qualified_name`` (``ZMODEM_DRIVER::send``
-       matches ``zbox::ZMODEM_DRIVER::send``)
+    1. Exact ``name`` — ``send`` matches bare name ``send``.
+    2. Exact ``qualified_name`` — ``zbox::ZMODEM_DRIVER::send``.
+    3. Suffix LIKE on ``qualified_name`` — ``ZMODEM_DRIVER::send`` matches
+       ``zbox::ZMODEM_DRIVER::send``.
+    4. Plain name — the segment after the last ``::`` (same as tier 1 but
+       with precedence for exact qualified_name match).
 
-    For classes, structs, and enums the index stores references at member-level
-    granularity (e.g. ``ZUART::get``, not ``ZUART`` itself).  When the resolved
-    symbol is an aggregate type, the query uses USR prefix matching
-    (``to_usr LIKE usr || '@%'``) so all member references are included.
+    Why tier 3 (suffix LIKE): users typically start typing at the class
+    level, not the namespace level.  Requiring the full qualified name
+    would make partial queries return empty.
 
-    *ref_kind* can be a single value, a list (→ ``IN`` clause), or None
-    (no filter).
+    **Aggregate type handling**: for classes, structs, and enums, references
+    are stored at member granularity (``MyClass::method``).  When the
+    resolved symbol IS an aggregate type, the query uses USR prefix matching
+    (``to_usr LIKE usr || '@%'``) to include all member references.
+    GROUP BY on (qualified_name, file, line) deduplicates when multiple
+    members of the same class are referenced at the same location.
+
+    Why GROUP BY: USR prefix matching can return the same reference
+    site multiple times if multiple member references happen on the
+    same line (e.g., ``obj.a = obj.b``).  Grouping by caller+file+line
+    gives one result per unique reference location.
     """
     # ── Resolve name → USR and kind ──────────────────────────────────────
     # Four-tier match: exact name, exact qualified_name, suffix LIKE, plain name
@@ -493,5 +614,11 @@ def find_refs(
 
 
 def count_refs(conn: sqlite3.Connection, config_hash: str) -> int:
-    """Return total reference count for a build config (0 when refs not indexed)."""
+    """Return total reference count for a build config.
+
+    Returns 0 when refs have not been indexed.  Used by
+    ``get_active_build()`` to display index statistics and by the
+    indexer to decide whether reference-based tools (find_callers,
+    find_hotspots) are available.
+    """
     return conn.execute("SELECT COUNT(*) FROM refs WHERE config_hash=?", (config_hash,)).fetchone()[0]

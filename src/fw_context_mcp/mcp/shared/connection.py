@@ -137,6 +137,16 @@ def _resolve_handler_context(
        reindex with a changed build config cannot leave queries
        filtering by a stale hash.
 
+    Why the two-step split exists:
+
+    - Step 1 opens a short-lived R/O connection, reads metadata, and
+      closes it — sub-millisecond, no write lock ever held.
+    - Step 2 gets or creates the executor whose single connection is
+      shared for the process lifetime.  If step 2 opened the executor
+      first and then read config_hash from it, the executor open
+      would pay the WAL setup cost before we even knew the project
+      is valid.
+
     Returns ``(ctx, None)`` on success or ``(None, [error_dict])`` on failure.
 
     When *require_refs* is ``True``, the call also verifies that the reference

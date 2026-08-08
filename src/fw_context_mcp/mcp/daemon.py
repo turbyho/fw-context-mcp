@@ -15,6 +15,41 @@ Isolation
 ---------
 Each project has its own socket file at ``<db_dir>/<project_id>/daemon.sock``.
 Pings from an MCP server on project A never affect project B's daemon.
+
+Design rationale
+----------------
+WHY a per-project daemon instead of a single system-wide watcher:
+- Each project has a different root directory, index database, and
+  build configuration.  A single watcher would need to multiplex
+  watchfiles across unrelated directory trees, complicating error
+  handling (one project's NFS mount hangs → all projects stall).
+- Socket-based ping-per-project gives clean client counting:
+  when no MCP server pings project A's daemon for 60 s, that daemon
+  exits — independent of project B's activity.
+
+WHY Unix domain sockets instead of a message queue or shared memory:
+- Sockets work on all Unix-like systems without additional dependencies.
+- No message broker process needed (ZeroMQ, Redis, etc.).
+- Socket existence doubles as a daemon-alive indicator for ``ping_daemon``.
+- 0o600 permissions prevent other users on the same machine from sending
+  spurious pings.
+
+WHY ``watchfiles`` instead of ``inotify`` directly:
+- ``watchfiles`` provides a cross-platform polling + inotify backend with
+  debouncing built in.  Raw inotify requires manual event coalescing
+  (a ``git checkout`` generates hundreds of events).
+
+WHY ``debounce=2000 ms``: ``git checkout``, ``git pull``, and IDE
+auto-save generate bursts of file-change events.  Without debouncing,
+the daemon would spawn a ``fw-context index`` for each event — then
+kill and restart it for the next event arriving 20 ms later.  The 2 s
+window collects all rapid changes into a single reindex run.
+
+WHY 60 s ping timeout (not shorter): the MCP server pings every 15 s.
+Four missed pings = 60 s.  This gives headroom for:
+- MCP server process being paged out under memory pressure.
+- Temporary socket buffer saturation.
+- Brief NFS hangs on the project directory.
 """
 
 from __future__ import annotations
@@ -491,6 +526,11 @@ async def _wait_index(
 
     if proc.returncode == 0:
         log.info("Background index completed")
+        # WAL files grow unboundedly during long reindex runs because
+        # the index subprocess writes continuously without checkpointing.
+        # PRAGMA optimize triggers a checkpoint + ANALYZE to shrink the
+        # WAL and refresh query-planner statistics.  This runs AFTER the
+        # index completes — no lock contention with the subprocess.
         _optimize_db(db_dir)
     else:
         log.warning("Background index exited with %d", proc.returncode)
