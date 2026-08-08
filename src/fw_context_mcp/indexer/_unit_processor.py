@@ -57,7 +57,7 @@ import logging
 import os
 import sqlite3
 import time
-from contextlib import nullcontext
+from contextlib import AbstractContextManager, nullcontext
 from pathlib import Path
 
 from ..utils import MTIME_TOLERANCE_S, SAFE_EXCEPT, compute_source_hash, is_fatal
@@ -610,7 +610,7 @@ def _process_unit(
     try:
         # threading.Lock (intra-process) or nullcontext (sequential path
         # where the caller holds fcntl write_lock across all TUs)
-        lock_ctx: object = lock if lock is not None else nullcontext()
+        lock_ctx: AbstractContextManager = lock if lock is not None else nullcontext()
         with lock_ctx:
             t_write_start = time.monotonic()
             with transaction(conn, checkpoint=False):

@@ -326,9 +326,13 @@ def train_step(
     """
     try:
         from datasets import Dataset as HFDataset
-        from sentence_transformers import losses
-        from sentence_transformers.trainer import SentenceTransformerTrainer
-        from sentence_transformers.training_args import SentenceTransformerTrainingArguments
+        from sentence_transformers.sentence_transformer import losses  # noqa: F811
+        from sentence_transformers.sentence_transformer.trainer import (  # noqa: F811
+            SentenceTransformerTrainer,
+        )
+        from sentence_transformers.sentence_transformer.training_args import (  # noqa: F811
+            SentenceTransformerTrainingArguments,
+        )
     except ImportError as e:
         log.error("Missing dependency for fine-tuning: %s", e)
         return None
