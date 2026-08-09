@@ -375,7 +375,7 @@ def _build_embeddings(
     # Anthropic Contextual Retrieval: chunk-specific context as sentences improves
     # embedding recall by -35% failures vs token-boundary lists.
     body_kinds = frozenset({"function", "method", "constructor", "destructor"})
-    max_body_chars = embedder.max_tokens * 4
+    max_body_chars = embedder.max_tokens * 3
 
     desc_rows: list[tuple[dict, int, str]] = []
 
@@ -508,14 +508,20 @@ def _build_embeddings(
                     log.warning("vec0 batch insert failed (sqlite-vec may not be loaded): %s", e)
                 total += len(chunk_blob)
 
-    chunk_size = 100
-    total_batches = (len(desc_rows) + chunk_size - 1) // chunk_size
+    _desc_char_limit = embedder.max_tokens * 3  # conservative: 3 chars ≈ 1 token for code
     _phase2_idx = 0
+    batch_num = 0
     while _phase2_idx < len(desc_rows):
-        i = _phase2_idx
-        _phase2_idx += chunk_size
-        batch_num = i // chunk_size
-        batch = desc_rows[i : i + chunk_size]
+        batch: list[tuple] = []
+        _batch_chars = 0
+        while _phase2_idx < len(desc_rows):
+            _desc_len = len(desc_rows[_phase2_idx][2])
+            if _batch_chars + _desc_len > _desc_char_limit and batch:
+                break
+            batch.append(desc_rows[_phase2_idx])
+            _batch_chars += _desc_len
+            _phase2_idx += 1
+        batch_num += 1
         chunk_descs = [d for _, _, d in batch]
         t0 = time.monotonic()
         embs = None
@@ -532,7 +538,7 @@ def _build_embeddings(
                     time.sleep(2)
         if embs is None:
             elapsed = time.monotonic() - t0
-            log.warning("[%d/%d] embedding batch failed %s: %s", batch_num + 1, total_batches, _fmt_dur(elapsed), _last_exc)
+            log.warning("[%d] embedding batch failed %s: %s", batch_num, _fmt_dur(elapsed), _last_exc)
             continue
 
         if embedding_dim is None and embs:
@@ -557,7 +563,7 @@ def _build_embeddings(
                 first_chunk = True
                 total = 0
                 _rebuild_desc_rows()
-                total_batches = (len(desc_rows) + chunk_size - 1) // chunk_size
+                batch_num = 0
                 _phase2_idx = 0
                 log.info("Restarting embeddings with new dimension %d...", embedding_dim)
                 continue
@@ -581,7 +587,7 @@ def _build_embeddings(
         chunk_vec.extend(vec_rows)
 
         elapsed = time.monotonic() - t0
-        log.info("[%d/%d] %d symbols embedded %s", batch_num + 1, total_batches, len(batch), _fmt_dur(elapsed))
+        log.info("[%d] %d symbols (%d chars) embedded %s", batch_num, len(batch), _batch_chars, _fmt_dur(elapsed))
 
         if len(chunk_blob) >= CHUNK_SYMBOLS:
             _flush_chunk()
