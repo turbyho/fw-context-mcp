@@ -508,7 +508,7 @@ def _build_embeddings(
                     log.warning("vec0 batch insert failed (sqlite-vec may not be loaded): %s", e)
                 total += len(chunk_blob)
 
-    chunk_size = 1
+    chunk_size = 100
     total_batches = (len(desc_rows) + chunk_size - 1) // chunk_size
     _phase2_idx = 0
     while _phase2_idx < len(desc_rows):
