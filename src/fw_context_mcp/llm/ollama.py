@@ -639,10 +639,8 @@ class OllamaEmbedder(Embedder):
         except (ValueError, TypeError, OSError, json.JSONDecodeError, httpx.HTTPError):
             pass
         model_lower = model.lower()
-        if "qwen3-embedding:0.6b" in model_lower or "qwen3-embedding:4b" in model_lower:
+        if "qwen3-embedding" in model_lower:
             tokens = 32768
-        elif "qwen3-embedding:8b" in model_lower:
-            tokens = 8192
         elif "mxbai" in model_lower:
             tokens = 512
         else:

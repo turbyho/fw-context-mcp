@@ -80,7 +80,7 @@ class TestGetEmbedder:
     def test_qwen3_token_limit(self) -> None:
         cfg = LLMConfig(embed_model="qwen3-embedding:8b")
         e = get_embedder(cfg)
-        assert e.max_tokens == 8192  # qwen3:8b has 8K context window
+        assert e.max_tokens == 32768  # qwen3:8b has 32K context window
 
     def test_ollama_default_for_unknown_model(self) -> None:
         cfg = LLMConfig(embed_model="some-unknown-model")
