@@ -376,6 +376,7 @@ def _build_embeddings(
     # embedding recall by -35% failures vs token-boundary lists.
     body_kinds = frozenset({"function", "method", "constructor", "destructor"})
     max_body_chars = embedder.max_tokens * 3
+    MAX_EMBED_BATCH_SYMBOLS = 10
 
     desc_rows: list[tuple[dict, int, str]] = []
 
@@ -508,21 +509,22 @@ def _build_embeddings(
                     log.warning("vec0 batch insert failed (sqlite-vec may not be loaded): %s", e)
                 total += len(chunk_blob)
 
-    _desc_char_limit = embedder.max_tokens * 3  # conservative: 3 chars ≈ 1 token for code
     _phase2_idx = 0
     batch_num = 0
     while _phase2_idx < len(desc_rows):
         batch: list[tuple] = []
-        _batch_chars = 0
+        seen: set[int] = set()
         while _phase2_idx < len(desc_rows):
-            _desc_len = len(desc_rows[_phase2_idx][2])
-            if _batch_chars + _desc_len > _desc_char_limit and batch:
-                break
+            r = desc_rows[_phase2_idx][0]
+            if r["id"] not in seen:
+                if len(seen) >= MAX_EMBED_BATCH_SYMBOLS:
+                    break
+                seen.add(r["id"])
             batch.append(desc_rows[_phase2_idx])
-            _batch_chars += _desc_len
             _phase2_idx += 1
         batch_num += 1
         chunk_descs = [d for _, _, d in batch]
+        _batch_chars = sum(len(d) for d in chunk_descs)
         t0 = time.monotonic()
         embs = None
         _last_exc = None
