@@ -441,9 +441,17 @@ def _build_llm_analysis(
                 )
                 continue
 
-            try:
-                response = call_ollama(prompt, llm_config, temperature=0.1, num_predict=num_predict)
-            except SAFE_EXCEPT as e:
+            response = None
+            for _a_attempt in range(3):
+                try:
+                    response = call_ollama(prompt, llm_config, temperature=0.1, num_predict=num_predict)
+                    break
+                except SAFE_EXCEPT as e:
+                    if is_fatal(e):
+                        raise
+                    if _a_attempt < 2:
+                        time.sleep(2)
+            if response is None:
                 elapsed = time.monotonic() - t0
                 log.warning("[%d/%d] %s: err %s: %s", idx + 1, total_symbols, qname, _fmt_dur(elapsed), e)
                 continue

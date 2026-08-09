@@ -216,6 +216,14 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
     # Idempotent — on a fully migrated DB this is a single empty commit.
     _ensure_migrated_columns(conn)
 
+    # ── Unconditional embeddings schema check ────────────────────────────
+    # The embeddings composite-PK migration lives in _run_data_migrations
+    # (version-gated), but databases that had their schema version bumped
+    # before the migration code was added will skip it.  This unconditional
+    # call patches those databases without requiring another version bump.
+    from ._schema import _ensure_embeddings_schema
+    _ensure_embeddings_schema(conn)
+
     # ── Defensive table creation ──────────────────────────────────────────
     # Self-healing: ensure critical tables exist even when a migration was
     # interrupted.  CREATE TABLE IF NOT EXISTS is idempotent and takes

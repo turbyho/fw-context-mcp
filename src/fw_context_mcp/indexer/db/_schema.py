@@ -929,57 +929,68 @@ def _run_data_migrations(conn: sqlite3.Connection) -> None:
         )
 
     # ── Embeddings composite PK migration ───────────────────────────
-    # Original schema had a single-column PK (symbol_id).  The composite
-    # PK (symbol_id, chunk_index) was added to support multi-chunk
-    # embeddings for large models.  This migration recreates the table
-    # with the new schema, preserving all existing data.
-    # Why NOT ALTER TABLE: SQLite cannot alter PRIMARY KEY constraints.
-    # The only way is CREATE new → INSERT data → DROP old → RENAME.
-    # Why BEGIN IMMEDIATE: prevents other connections from starting a
-    # transaction while the table is being rebuilt.
-    if _table_exists(conn, "embeddings"):
-        emb_cols = [
-            r[1]
-            for r in conn.execute(
-                "PRAGMA table_info(embeddings)"
-            ).fetchall()
-        ]
-        if "chunk_index" not in emb_cols:
-            log.info(
-                "Migrating embeddings table to composite PK "
-                "(symbol_id, chunk_index)..."
-            )
-            conn.execute("BEGIN IMMEDIATE")
-            try:
-                conn.execute(
-                    """CREATE TABLE IF NOT EXISTS embeddings_v2 (
-                        symbol_id    INTEGER NOT NULL
-                            REFERENCES symbols(id) ON DELETE CASCADE,
-                        chunk_index  INTEGER NOT NULL DEFAULT 0,
-                        embedding    BLOB    NOT NULL,
-                        model        TEXT    NOT NULL,
-                        updated_at   TEXT    NOT NULL
-                            DEFAULT (datetime('now')),
-                        PRIMARY KEY (symbol_id, chunk_index)
-                    )"""
-                )
-                conn.execute(
-                    """INSERT OR IGNORE INTO embeddings_v2
-                        (symbol_id, chunk_index, embedding, model, updated_at)
-                    SELECT symbol_id, 0, embedding, model, updated_at
-                    FROM embeddings"""
-                )
-                conn.execute("DROP TABLE IF EXISTS embeddings")
-                conn.execute(
-                    "ALTER TABLE embeddings_v2 RENAME TO embeddings"
-                )
-                conn.execute(
-                    "CREATE INDEX IF NOT EXISTS idx_embeddings_symbol ON embeddings(symbol_id)"
-                )
-                conn.commit()
-            except sqlite3.Error:
-                conn.execute("ROLLBACK")
-                raise
+    # Delegates to _ensure_embeddings_schema — idempotent, safe to call
+    # here (version-gated path) and from ensure_schema (unconditional).
+    _ensure_embeddings_schema(conn)
+
+
+def _ensure_embeddings_schema(conn: sqlite3.Connection) -> None:
+    """Ensure the embeddings table has composite PK (symbol_id, chunk_index).
+
+    Idempotent — checks PRAGMA table_info before rebuilding.  Safe to call
+    unconditionally on every ``open_db()``, unlike the version-gated
+    ``_run_data_migrations`` which only runs on schema version mismatch.
+
+    Why separate from _run_data_migrations: when the schema bump marker
+    was added before this migration code, databases that went through
+    the version bump without running this rebuild were left with a
+    single-column PK — missing ``chunk_index``.
+    """
+    if not _table_exists(conn, "embeddings"):
+        return
+    emb_cols = [
+        r[1]
+        for r in conn.execute(
+            "PRAGMA table_info(embeddings)"
+        ).fetchall()
+    ]
+    if "chunk_index" in emb_cols:
+        return
+    log.info(
+        "Migrating embeddings table to composite PK "
+        "(symbol_id, chunk_index)..."
+    )
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS embeddings_v2 (
+                symbol_id    INTEGER NOT NULL
+                    REFERENCES symbols(id) ON DELETE CASCADE,
+                chunk_index  INTEGER NOT NULL DEFAULT 0,
+                embedding    BLOB    NOT NULL,
+                model        TEXT    NOT NULL,
+                updated_at   TEXT    NOT NULL
+                    DEFAULT (datetime('now')),
+                PRIMARY KEY (symbol_id, chunk_index)
+            )"""
+        )
+        conn.execute(
+            """INSERT OR IGNORE INTO embeddings_v2
+                (symbol_id, chunk_index, embedding, model, updated_at)
+            SELECT symbol_id, 0, embedding, model, updated_at
+            FROM embeddings"""
+        )
+        conn.execute("DROP TABLE IF EXISTS embeddings")
+        conn.execute(
+            "ALTER TABLE embeddings_v2 RENAME TO embeddings"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_embeddings_symbol ON embeddings(symbol_id)"
+        )
+        conn.commit()
+    except sqlite3.Error:
+        conn.execute("ROLLBACK")
+        raise
 
 
 def drop_fts_triggers(conn: sqlite3.Connection) -> None:
