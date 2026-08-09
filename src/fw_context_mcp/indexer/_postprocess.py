@@ -1218,8 +1218,7 @@ def _run_postprocess(
         try:
             step_fn(conn, ctx)
             elapsed = time.monotonic() - t0
-            if elapsed > 0.5:
-                log.debug("Postprocess step %s: %.1fs", step_name, elapsed)
+            log.info("Post-process: %s (%.1fs)", step_name, elapsed)
         except SAFE_EXCEPT as e:
             if is_fatal(e):
                 raise
