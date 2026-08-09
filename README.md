@@ -112,7 +112,7 @@ fw-context indexes the project through the same compilation database used by bui
 flowchart LR
     CCJ[compile_commands.json] & SRC[(source files)] --> LIBCLANG[libclang<br/>AST parser]
     LIBCLANG --> SYMBOLS[symbols<br/>name, kind, USR<br/>signature, source body<br/>docstring, tokens] & FILES[files<br/>path, language<br/>ifdef-filtered content<br/>project/SDK sources] & REFS[refs &amp; call graph<br/>fp_assignments<br/>indirect_call_sites] & INHERIT[inheritance<br/>&amp; overrides<br/>virtual dispatch] & MACROS[macros<br/>raw &amp; expanded values<br/>FTS5 searchable] & ENRICH[optional enrichment<br/>embeddings &amp; summaries<br/>hotspot cache]
-    SYMBOLS & FILES & REFS & INHERIT & MACROS & ENRICH --> MCP[MCP server<br/>34 tools]
+    SYMBOLS & FILES & REFS & INHERIT & MACROS & ENRICH --> MCP[MCP server<br/>35 tools]
     MCP --> LLM[AI coding agent]
 ```
 
