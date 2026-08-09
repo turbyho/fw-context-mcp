@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import logging
 import subprocess
+import sys
 import threading
 from typing import TYPE_CHECKING
 
@@ -59,13 +60,39 @@ def _reset_auto_model_cache() -> None:
 
 
 def _gpu_available() -> bool:
-    """Check for NVIDIA GPU via nvidia-smi (fast, non-blocking)."""
+    """Check for GPU availability: NVIDIA via nvidia-smi, Apple Silicon via sysctl."""
+    if _apple_silicon_gpu():
+        return True
+
     try:
         result = subprocess.run(
             ["nvidia-smi", "-L"],
             capture_output=True, text=True, timeout=3,
         )
         return result.returncode == 0 and "GPU" in result.stdout
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        return False
+
+
+def _apple_silicon_gpu() -> bool:
+    """Check for Apple Silicon GPU (M1/M2/M3/M4/M5) via sysctl.
+
+    On Apple Silicon, Ollama uses Metal/MLX for GPU acceleration — the
+    8b embedding model runs efficiently.  We detect via the CPU brand
+    string and macOS kernel (no Metal API call needed).
+    """
+    if sys.platform != "darwin":
+        return False
+
+    try:
+        result = subprocess.run(
+            ["sysctl", "-n", "machdep.cpu.brand_string"],
+            capture_output=True, text=True, timeout=2,
+        )
+        if result.returncode != 0:
+            return False
+        # Apple Silicon CPUs have "Apple" in the brand string
+        return "Apple" in result.stdout
     except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
         return False
 
