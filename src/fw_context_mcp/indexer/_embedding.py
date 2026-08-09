@@ -519,18 +519,20 @@ def _build_embeddings(
         chunk_descs = [d for _, _, d in batch]
         t0 = time.monotonic()
         embs = None
+        _last_exc = None
         for _attempt in range(3):
             try:
                 embs = embedder.embed_documents(chunk_descs)
                 break
-            except SAFE_EXCEPT as e:
-                if is_fatal(e):
+            except SAFE_EXCEPT as _e:
+                _last_exc = _e
+                if is_fatal(_e):
                     raise
                 if _attempt < 2:
                     time.sleep(2)
         if embs is None:
             elapsed = time.monotonic() - t0
-            log.warning("[%d/%d] embedding batch failed %s: %s", batch_num + 1, total_batches, _fmt_dur(elapsed), e)
+            log.warning("[%d/%d] embedding batch failed %s: %s", batch_num + 1, total_batches, _fmt_dur(elapsed), _last_exc)
             continue
 
         if embedding_dim is None and embs:

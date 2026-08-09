@@ -442,18 +442,20 @@ def _build_llm_analysis(
                 continue
 
             response = None
+            _last_exc = None
             for _a_attempt in range(3):
                 try:
                     response = call_ollama(prompt, llm_config, temperature=0.1, num_predict=num_predict)
                     break
-                except SAFE_EXCEPT as e:
-                    if is_fatal(e):
+                except SAFE_EXCEPT as _e:
+                    _last_exc = _e
+                    if is_fatal(_e):
                         raise
                     if _a_attempt < 2:
                         time.sleep(2)
             if response is None:
                 elapsed = time.monotonic() - t0
-                log.warning("[%d/%d] %s: err %s: %s", idx + 1, total_symbols, qname, _fmt_dur(elapsed), e)
+                log.warning("[%d/%d] %s: err %s: %s", idx + 1, total_symbols, qname, _fmt_dur(elapsed), _last_exc)
                 continue
 
             parsed = parse_analysis_response(response, batch_dicts)
