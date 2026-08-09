@@ -479,18 +479,25 @@ def _build_embeddings(
                     # Unchanged symbols keep their existing rows — this is what
                     # makes repeated `fw-context index` runs incremental instead of
                     # re-embedding every definition symbol.
-                    id_phs = ",".join("?" * len(target_ids))
-                    conn.execute(
-                        f"DELETE FROM embeddings WHERE model = ? AND symbol_id IN ({id_phs})",
-                        (model, *target_ids),
-                    )
-                    try:
+                    #
+                    # Batch deletes in chunks of 500 to stay under SQLite's
+                    # SQLITE_MAX_VARIABLE_NUMBER limit (default 999).  A single
+                    # DELETE with 5000+ parameters would fail silently.
+                    _BATCH = 500
+                    for _batch_start in range(0, len(target_ids), _BATCH):
+                        _batch_ids = target_ids[_batch_start : _batch_start + _BATCH]
+                        _phs = ",".join("?" * len(_batch_ids))
                         conn.execute(
-                            f"DELETE FROM vec_symbols WHERE config_hash = ? AND symbol_id IN ({id_phs})",
-                            (config_hash, *target_ids),
+                            f"DELETE FROM embeddings WHERE model = ? AND symbol_id IN ({_phs})",
+                            (model, *_batch_ids),
                         )
-                    except sqlite3.OperationalError:
-                        pass
+                        try:
+                            conn.execute(
+                                f"DELETE FROM vec_symbols WHERE config_hash = ? AND symbol_id IN ({_phs})",
+                                (config_hash, *_batch_ids),
+                            )
+                        except sqlite3.OperationalError:
+                            pass
                     first_chunk = False
                 upsert_embeddings(conn, chunk_blob)
                 try:
@@ -501,7 +508,7 @@ def _build_embeddings(
                     log.warning("vec0 batch insert failed (sqlite-vec may not be loaded): %s", e)
                 total += len(chunk_blob)
 
-    chunk_size = 100
+    chunk_size = 1
     total_batches = (len(desc_rows) + chunk_size - 1) // chunk_size
     _phase2_idx = 0
     while _phase2_idx < len(desc_rows):
@@ -511,11 +518,17 @@ def _build_embeddings(
         batch = desc_rows[i : i + chunk_size]
         chunk_descs = [d for _, _, d in batch]
         t0 = time.monotonic()
-        try:
-            embs = embedder.embed_documents(chunk_descs)
-        except SAFE_EXCEPT as e:
-            if is_fatal(e):
-                raise
+        embs = None
+        for _attempt in range(3):
+            try:
+                embs = embedder.embed_documents(chunk_descs)
+                break
+            except SAFE_EXCEPT as e:
+                if is_fatal(e):
+                    raise
+                if _attempt < 2:
+                    time.sleep(2)
+        if embs is None:
             elapsed = time.monotonic() - t0
             log.warning("[%d/%d] embedding batch failed %s: %s", batch_num + 1, total_batches, _fmt_dur(elapsed), e)
             continue
@@ -544,6 +557,7 @@ def _build_embeddings(
                 _rebuild_desc_rows()
                 total_batches = (len(desc_rows) + chunk_size - 1) // chunk_size
                 _phase2_idx = 0
+                log.info("Restarting embeddings with new dimension %d...", embedding_dim)
                 continue
             else:
                 try:
