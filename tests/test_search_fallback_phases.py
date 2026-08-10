@@ -13,8 +13,6 @@ from contextlib import contextmanager
 from pathlib import Path
 from unittest.mock import patch
 
-import pytest
-
 from fw_context_mcp.search.context import PipelineContext
 from fw_context_mcp.search.phases.search_fallbacks import (
     DocstringFallbackPhase,
@@ -27,7 +25,6 @@ from fw_context_mcp.search.phases.search_fallbacks import (
     _do_name_tokens_fallback,
 )
 from fw_context_mcp.search.shared_fallbacks import _symbol_row_to_dict
-
 
 # ── Patch helpers ─────────────────────────────────────────────────────────────
 # _do_* adapter functions delegate to _search_code_* in shared_fallbacks,

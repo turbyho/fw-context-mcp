@@ -23,7 +23,6 @@ from fw_context_mcp.search.pipeline import (
     _build_smart_search,
 )
 
-
 # ── Test helpers ────────────────────────────────────────────────────────────
 
 

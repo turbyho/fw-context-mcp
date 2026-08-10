@@ -8,40 +8,25 @@ the safety guard, and end-to-end integration.
 from __future__ import annotations
 
 import json
-import os
 import shutil
 import sqlite3
 from pathlib import Path
 
-import pytest
-
 from fw_context_mcp.indexer.db import (
-    delete_fp_assignments_for_file,
-    delete_inheritance_for_file,
-    delete_indirect_call_sites_for_file,
-    delete_macros_for_file,
-    delete_orphan_files,
     delete_overrides_for_file,
-    delete_refs_for_file,
-    delete_symbols_for_file,
-    get_file_mtimes,
     insert_fp_assignments_batch,
-    insert_inheritance_batch,
     insert_indirect_call_sites_batch,
-    insert_macros_batch,
+    insert_inheritance_batch,
     insert_overrides_batch,
     insert_refs_batch,
     insert_symbols_batch,
     open_db,
     purge_file_records,
     purge_missing_files_batch,
-    split_tokens,
-    transaction,
     upsert_build_config,
     upsert_file,
     upsert_project,
 )
-
 
 # ── schemaless helpers ───────────────────────────────────────────────
 
@@ -442,7 +427,6 @@ class TestStepPurgeMissingFiles:
     def test_delete_file_ghost_records_purged(self, tmp_path: Path):
         """Index a project, delete a source file from disk (cc.json unchanged),
         reindex — ghost symbols must be gone."""
-        import json
 
         proj = tmp_path / "demo"
         proj.mkdir()

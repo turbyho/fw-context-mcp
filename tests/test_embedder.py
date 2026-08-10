@@ -381,6 +381,7 @@ class TestValidateModelDir:
 
     def test_nonexistent_dir_raises(self) -> None:
         from pathlib import Path
+
         from fw_context_mcp.llm.embedder_factory import _validate_model_dir
 
         with pytest.raises(FileNotFoundError):

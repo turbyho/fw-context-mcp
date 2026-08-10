@@ -6,8 +6,6 @@ import asyncio
 from pathlib import Path
 from unittest.mock import MagicMock
 
-import pytest
-
 from fw_context_mcp.config.settings import Config
 from fw_context_mcp.search.context import PipelineContext
 from fw_context_mcp.search.phases.adaptive_fusion import (

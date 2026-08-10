@@ -6,11 +6,9 @@ Covers remaining test gaps: B3, H1, H3, M1, M2, M7, M8, M9.
 from __future__ import annotations
 
 import sqlite3
-from pathlib import Path
 from unittest import mock
 
 import pytest
-
 
 # ═══════════════════════════════════════════════════════════════════════════
 # B3 — get_active_build "stale" key
@@ -172,8 +170,8 @@ class TestGetFileMapFuzzyFallback:
         conn.close()
 
         from fw_context_mcp.mcp.handlers._base import BaseHandler, DbContext
-        from fw_context_mcp.mcp.shared.executor import SyncQueryExecutor
         from fw_context_mcp.mcp.handlers.source import get_file_map
+        from fw_context_mcp.mcp.shared.executor import SyncQueryExecutor
 
         # Mock resolve_db_context to point to our tmp_path DB — bypasses
         # the global registry (~/.fw-context/projects.db) which would

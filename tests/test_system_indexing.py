@@ -25,6 +25,7 @@ import sys
 from pathlib import Path
 
 import pytest
+
 pytestmark = pytest.mark.system
 
 from fw_context_mcp.indexer.build import detect_build_system
@@ -1104,6 +1105,7 @@ class TestGhostRecordPurge:
         """Scenario: bare/ project indexed → one .c deleted from disk (cc.json
         unchanged) → reindex → ghost symbols purged, survivors intact."""
         import shutil as _shutil
+
         from fw_context_mcp.indexer.runner import run
 
         # ── Phase 1: copy bare/, add extra.c, init + index via proven path ──
