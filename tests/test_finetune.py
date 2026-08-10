@@ -143,7 +143,6 @@ class TestTrainStepTypeCheck:
     def test_rejects_ollama_embedder(self, tmp_path: Path) -> None:
         """train_step with OllamaEmbedder must return None."""
         from fw_context_mcp.config.settings import LLMConfig
-        from fw_context_mcp.llm.embedder import Embedder
         from fw_context_mcp.indexer.finetune import train_step
 
         cfg = LLMConfig(embed_model="mxbai-embed-large:latest")
@@ -159,8 +158,8 @@ class TestTrainStepTypeCheck:
         assert result is None  # rejected
 
     def test_rejects_unknown_embedder(self, tmp_path: Path) -> None:
-        from fw_context_mcp.llm.embedder import Embedder
         from fw_context_mcp.indexer.finetune import train_step
+        from fw_context_mcp.llm.embedder import Embedder
 
         class PlainEmbedder(Embedder):
             def embed_documents(self, texts): return [[0.0]]

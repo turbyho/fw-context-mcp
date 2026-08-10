@@ -8,6 +8,7 @@ from pathlib import Path
 
 from fw_context_mcp.utils import MTIME_TOLERANCE_S, abs_path, resolve_project_root
 
+
 class TestResolveProjectRoot:
     def test_explicit_path_returns_resolved(self, tmp_path: Path):
         result = resolve_project_root(str(tmp_path))

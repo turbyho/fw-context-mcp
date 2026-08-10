@@ -18,8 +18,6 @@ Covers:
 
 from __future__ import annotations
 
-import fw_context_mcp  # noqa: F401 — must import FIRST: it redirects sqlite3 → pysqlite3
-
 import sqlite3  # noqa: E402 — resolves to pysqlite3 after the redirect above
 import threading  # noqa: E402
 import time  # noqa: E402
@@ -27,6 +25,7 @@ from pathlib import Path  # noqa: E402
 
 import pytest  # noqa: E402
 
+import fw_context_mcp  # noqa: F401 — must import FIRST: it redirects sqlite3 → pysqlite3
 from fw_context_mcp.mcp.shared.executor import (  # noqa: E402
     SyncQueryExecutor,
     get_executor,

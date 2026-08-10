@@ -7,9 +7,9 @@ from fw_context_mcp.indexer.compile_commands import (
     _SOURCE_EXTS,
     _detect_language,
     _detect_target_triple,
-    expand_response_file,
     _gcc_system_includes,
     _is_source_file,
+    expand_response_file,
     normalize_args,
     parse,
 )

@@ -97,7 +97,6 @@ class TestSearchContentFts5GracefulFallback:
         from fw_context_mcp.mcp.handlers import search as search_mod
         from fw_context_mcp.mcp.handlers._base import BaseHandler, DbContext
         from fw_context_mcp.mcp.shared.executor import SyncQueryExecutor
-        from fw_context_mcp.mcp.shared.stale import _stale_files
 
         db_ctx = DbContext(
             db_path=db_path,
@@ -637,9 +636,11 @@ class TestCallGraphDispatchAndGlobalCtors:
 
     @pytest.fixture(autouse=True)
     def _import(self):
-        from fw_context_mcp.indexer.db._callgraph import find_call_path
-        from fw_context_mcp.indexer.db._callgraph import find_all_callers_recursive
-        from fw_context_mcp.indexer.db._callgraph import find_callees_recursive
+        from fw_context_mcp.indexer.db._callgraph import (
+            find_all_callers_recursive,
+            find_call_path,
+            find_callees_recursive,
+        )
         self._find_call_path = find_call_path
         self._find_all_callers_recursive = find_all_callers_recursive
         self._find_callees_recursive = find_callees_recursive
@@ -651,12 +652,17 @@ class TestCallGraphDispatchAndGlobalCtors:
 
     def _build_db(self):
         """Build an in-memory DB with symbols and refs for call-graph testing."""
-        import shutil
         import tempfile
         from pathlib import Path
+
         from fw_context_mcp.indexer.db import (
-            insert_refs_batch, insert_symbols_batch, open_db,
-            transaction, upsert_build_config, upsert_file, upsert_project,
+            insert_refs_batch,
+            insert_symbols_batch,
+            open_db,
+            transaction,
+            upsert_build_config,
+            upsert_file,
+            upsert_project,
         )
 
         tmpdir = Path(tempfile.mkdtemp())
@@ -787,7 +793,7 @@ class TestCallGraphDispatchAndGlobalCtors:
                 f"main must be in transitive callers of zbox_reset, got: {caller_names}"
             )
             assert "swdt_check" in caller_names, (
-                f"swdt_check must be in callers of zbox_reset"
+                "swdt_check must be in callers of zbox_reset"
             )
         finally:
             conn.close()
@@ -802,7 +808,7 @@ class TestCallGraphDispatchAndGlobalCtors:
                 f"zbox_reset must be in transitive callees of main, got: {callee_names}"
             )
             assert "watch_ble" in callee_names, (
-                f"watch_ble must be in callees of main"
+                "watch_ble must be in callees of main"
             )
         finally:
             conn.close()
