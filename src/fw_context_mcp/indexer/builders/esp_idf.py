@@ -8,7 +8,7 @@ import shutil
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from fw_context_mcp.utils import run_build_command
+from fw_context_mcp.utils import resolve_real_binary, run_build_command
 
 from . import registry
 from .protocol import BuildIssue
@@ -84,7 +84,12 @@ class ESPIDFBuildSystem:
         # Ninja deletes .d depfiles after reading them by default.
         # Create a wrapper that adds -d keepdepfile so .d files persist
         # for incremental re-indexing.
-        ninja = shutil.which("ninja")
+        #
+        # Resolve the REAL ninja binary, not a pyenv/asdf shim: the shim
+        # re-execs `ninja` by name, and since the wrapper dir is prepended
+        # to PATH below, that re-resolution would find the wrapper again
+        # and recurse (appending -d keepdepfile each cycle).
+        ninja = resolve_real_binary("ninja")
         if ninja is None:
             raise RuntimeError("ninja is required for ESP-IDF builds")
         wrapper_dir = project_root / ".fw-context"
@@ -208,6 +213,17 @@ class ESPIDFBuildSystem:
 
     @classmethod
     def detect_environment(cls, project_root: Path) -> dict[str, str | None]:
+        # EIM (Espressif Installation Manager) activation scripts take
+        # priority.  They set IDF_PATH / IDF_TOOLS_PATH / the toolchain
+        # PATH directly without running idf_tools.py's full install check,
+        # which fails on target-only installs (e.g. ``eim install -t esp32``
+        # without the RISC-V toolchain).  ``export.sh`` by contrast runs
+        # that check and aborts the build when any declared tool is absent.
+        tools_dir = Path.home() / ".espressif" / "tools"
+        eim_scripts = sorted(tools_dir.glob("activate_idf_*.sh"), reverse=True)
+        if eim_scripts:
+            return {"python": None, "activate": str(eim_scripts[0])}
+
         idf_path = os.environ.get("IDF_PATH")
         if idf_path:
             export_sh = Path(idf_path) / "export.sh"
