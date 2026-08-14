@@ -153,6 +153,7 @@ def _pull_via_cli(model: str) -> tuple[bool, str]:
 
     def _read_stream() -> None:
         try:
+            assert proc.stdout is not None
             while True:
                 chunk = proc.stdout.read(65536)
                 if not chunk:

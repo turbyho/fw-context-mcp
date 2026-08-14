@@ -419,14 +419,16 @@ def resolve_build_env(
         except Exception:
             detected = {"python": None, "activate": None}
 
-    if detected.get("python"):
+    detected_python = detected.get("python")
+    if detected_python:
         if not dry_run:
-            _write_build_key(project_root, "python", detected["python"])
-        print(f"  [ok] Build python: {detected['python']} (auto-detected)")
-    if detected.get("activate"):
+            _write_build_key(project_root, "python", detected_python)
+        print(f"  [ok] Build python: {detected_python} (auto-detected)")
+    detected_activate = detected.get("activate")
+    if detected_activate:
         if not dry_run:
-            _write_build_key(project_root, "activate", detected["activate"])
-        print(f"  [ok] Build activate: {detected['activate']} (auto-detected)")
+            _write_build_key(project_root, "activate", detected_activate)
+        print(f"  [ok] Build activate: {detected_activate} (auto-detected)")
 
     if system == "esp-idf" and not detected.get("activate"):
         val = prompt_text(

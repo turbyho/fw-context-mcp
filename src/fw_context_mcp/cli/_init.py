@@ -29,6 +29,7 @@ from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from ..config.tools import AiTool
+    from ..deps import DepCheckResult
 
 
 def _write_build_key(project_root: Path, key: str, value: str) -> None:
@@ -624,7 +625,8 @@ def cmd_init(args: argparse.Namespace) -> int:
     # ── 1. Dependency audit + auto-fix (MUST precede any config write) ──
     # Project-ID generation writes config via tomli-w (set_key) — on a clean
     # venv without tomli-w this must run AFTER the deps phase installs it.
-    before_results, after_results = [], []
+    before_results: list[DepCheckResult] = []
+    after_results: list[DepCheckResult] = []
     if skip_doctor and not args.dry_run:
         # --skip-doctor bypasses the deps auto-fix, but config writes still
         # need tomli-w — verify it before the first set_key (project ID).

@@ -118,7 +118,7 @@ def _print_checklist(
             print(f"    ✓ {item}")
 
     # ── Remaining ──
-    remaining: list[str] = []
+    remaining: list[tuple[str, str]] = []
     libclang = next((r for r in after_results if r.name == "libclang-so"), None)
     if libclang is not None and libclang.status == "missing":
         cmd = libclang.fix_cmd or "apt install libclang-18-dev"
