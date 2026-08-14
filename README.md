@@ -58,6 +58,7 @@ make install
 Register fw-context with the supported coding agents detected in your project:
 
 ```bash
+cd /path/to/your/firmware
 fw-context init
 ```
 
