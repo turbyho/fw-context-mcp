@@ -694,6 +694,12 @@ def cmd_init(args: argparse.Namespace) -> int:
         project_root, _proj_cfg, build_system, non_interactive=non_interactive, dry_run=args.dry_run,
     )
 
+    # Reload so the python/activate/idf_path written by resolve_build_env are
+    # visible to the auto-build below.  Without this the ESP-IDF/Zephyr build
+    # runs without sourcing export.sh / nordic_minimal_setup.sh — the toolchain
+    # is then missing from PATH and the build fails at configure time.
+    _proj_cfg = load_project_config(project_root=project_root)
+
     # ── 5. Config templates (NOT gated by ok / instructions_only) ──
     if not args.dry_run:
         from ..config.settings import (

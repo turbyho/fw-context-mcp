@@ -206,7 +206,7 @@ def _init_and_index(
     # gets its own ID, independent of git remote or filesystem path.
     # Falls back to manual config creation when no AI tools are present
     # (e.g. CI environments).
-    result = _cli(["init", "--project", str(proj)], cwd=proj, timeout=timeout)
+    result = _cli(["init", "--project", str(proj)], cwd=proj, timeout=timeout, extra_env=extra_env)
     if result.returncode != 0:
         # init may fail when no AI tools are detected — create config manually
         fwctx = proj / ".fw-context"

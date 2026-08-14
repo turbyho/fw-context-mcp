@@ -9,7 +9,7 @@ import subprocess
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from fw_context_mcp.utils import run_build_command
+from fw_context_mcp.utils import resolve_real_binary, run_build_command
 
 from . import registry
 from .protocol import BuildIssue
@@ -73,7 +73,12 @@ class ZephyrBuildSystem:
         # We place the wrapper at $PATH priority (not CMAKE_MAKE_PROGRAM)
         # because sysbuild's ExternalProject_Add does not forward
         # CMAKE_MAKE_PROGRAM to the inner Zephyr CMake project.
-        ninja = shutil.which("ninja")
+        #
+        # Resolve the REAL ninja binary, not a pyenv/asdf shim: the shim
+        # re-execs `ninja` by name, and since the wrapper dir is prepended
+        # to PATH below, that re-resolution would find the wrapper again
+        # and recurse (appending -d keepdepfile each cycle).
+        ninja = resolve_real_binary("ninja")
         if ninja is None:
             raise RuntimeError("ninja is required for Zephyr builds")
         wrapper_dir = project_root / ".fw-context"
