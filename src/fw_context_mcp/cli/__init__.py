@@ -94,20 +94,22 @@ def main() -> None:
     behaviour regardless of which subcommand is invoked.
     """
     # ── Fast pre-flight: critical dependency checks (<50ms) ──
-    # Skipped for doctor (which reports these itself), --version, --help,
-    # and bare invocation (help only).
+    # Skipped for doctor/init/quickstart (they run their own dependency
+    # audit), and for version/--version/--help/-h.
     # WHY: Fail-fast for broken installs.  Most CLI errors come from
     # missing pysqlite3 or sqlite-vec.  Running a 50 ms check on every
     # invocation catches those before the user wastes time waiting for a
     # command that will inevitably crash.  The FW_CONTEXT_SKIP_PREFLIGHT
     # env var provides an escape hatch for CI/test environments.
     _argv = sys.argv[1:] if len(sys.argv) > 1 else []
+    # The subcommand is the first non-flag token (e.g. "-v index" → "index").
+    # Matching only that token — not every argv element — avoids skipping
+    # preflight when a subcommand ARGUMENT happens to equal "init"/"doctor".
+    _subcmd = next((a for a in _argv if not a.startswith("-")), None)
     if (
         os.environ.get("FW_CONTEXT_SKIP_PREFLIGHT") is None
-        and not any(
-            a in ("doctor", "version", "--version", "--help", "-h")
-            for a in _argv
-        )
+        and _subcmd not in ("doctor", "init", "quickstart", "version")
+        and not any(a in ("--version", "--help", "-h") for a in _argv)
     ):
         from ..deps import run_preflight
 
@@ -232,7 +234,36 @@ def main() -> None:
     p_init.add_argument(
         "--list-tools", action="store_true", help="List supported AI assistants and their detection status"
     )
-    p_init.set_defaults(func=cmd_init, tool=None, dry_run=False, force=False, instructions_only=False, list_tools=False)
+    p_init.add_argument(
+        "--quick", action="store_true",
+        help="Skip AI tool registration (still provisions project ID, config, deps, build, checklist)",
+    )
+    p_init.add_argument("--skip-doctor", action="store_true", help="Skip dependency audit")
+    p_init.add_argument("--skip-build", action="store_true", help="Skip compile_commands.json generation")
+    p_init.add_argument("--non-interactive", action="store_true", help="Disable interactive prompts (CI/pipe)")
+    p_init.add_argument("--name", metavar="NAME", help="Project name in the global registry")
+    p_init.set_defaults(
+        func=cmd_init, tool=None, dry_run=False, force=False, instructions_only=False, list_tools=False,
+        quick=False, skip_doctor=False, skip_build=False, non_interactive=False,
+    )
+
+    # quickstart — alias for `init --quick` (skip only AI tool registration).
+    p_qs = sub.add_parser(
+        "quickstart",
+        help="Provision project without AI tool registration (alias for 'init --quick')",
+    )
+    p_qs.add_argument("--project", metavar="DIR", help="Project root (default: cwd)")
+    p_qs.add_argument("--dry-run", action="store_true", help="Show what would be done without making changes")
+    p_qs.add_argument("--skip-doctor", action="store_true", help="Skip dependency audit")
+    p_qs.add_argument("--skip-build", action="store_true", help="Skip compile_commands.json generation")
+    p_qs.add_argument("--non-interactive", action="store_true", help="Disable interactive prompts (CI/pipe)")
+    p_qs.add_argument("--name", metavar="NAME", help="Project name in the global registry")
+    p_qs.set_defaults(
+        func=cmd_init, quick=True,
+        tool=None, scope="project", force=False,
+        instructions_only=False, list_tools=False,
+        dry_run=False, skip_doctor=False, skip_build=False, non_interactive=False,
+    )
 
     p_list = sub.add_parser("list", help="List all indexed projects")
     p_list.add_argument("-v", "--verbose", action="store_true")

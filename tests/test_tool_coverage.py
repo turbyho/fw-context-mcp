@@ -1,4 +1,4 @@
-"""Tool coverage tests — exercises all 27 MCP tools against real indexed projects.
+"""Tool coverage tests — exercises all 37 MCP tools against real indexed projects.
 
 Usage::
 

@@ -26,6 +26,12 @@ from pathlib import Path
 from shutil import which
 from typing import Any
 
+# Seconds without progress before a model pull is killed.  Pulling a
+# multi-GB model can legitimately run far longer than any fixed timeout,
+# so the timeout is stall-based: only an absence of progress (no new
+# bytes) for this long aborts the pull.
+STALL_TIMEOUT = 300
+
 
 def _pip_install(package: str) -> tuple[bool, str]:
     """Install a Python package. Returns (ok, output).
@@ -68,44 +74,175 @@ def _ollama_pull(model: str, url: str | None = None) -> tuple[bool, str]:
     is already authenticated for self-hosted registries.  The HTTP API
     fallback exists for headless servers where the CLI is not installed
     but Ollama is running as a daemon.
+
+    WHY stall-based timeout: a multi-GB pull may legitimately run for
+    tens of minutes on a slow link.  A fixed timeout would kill a
+    healthy download.  Instead the pull is aborted only when progress
+    STOPS — no new bytes for ``STALL_TIMEOUT`` seconds means it is hung.
     """
-    # Prefer the CLI binary — streams progress and is already authenticated
     if which("ollama"):
         try:
-            result = subprocess.run(
-                ["ollama", "pull", model],
-                capture_output=True,
-                text=True,
-                timeout=600,
-            )
-            if result.returncode == 0:
-                return True, result.stdout.strip().splitlines()[-1] if result.stdout.strip() else "pulled"
-            return False, result.stderr.strip() or f"exit {result.returncode}"
+            return _pull_via_cli(model)
         except FileNotFoundError:
             pass
-        except subprocess.TimeoutExpired:
-            return False, f"timed out after 600 s — try running `ollama pull {model}` manually"
 
-    # Fallback: HTTP pull via the Ollama API
     if url is None:
         url = "http://localhost:11434"
+
+    return _pull_via_api(model, url)
+
+
+def _kill(proc: subprocess.Popen) -> None:
+    """Terminate a subprocess, escalating to SIGKILL when it ignores SIGTERM."""
+    try:
+        proc.terminate()
+    except OSError:
+        return
+    try:
+        proc.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        try:
+            proc.kill()
+        except OSError:
+            pass
+
+
+def _extract_cli_error(tail: bytes) -> str:
+    """Return the last meaningful error line from a merged ``ollama pull`` stream.
+
+    Ollama prints carriage-return progress updates; on failure it emits an
+    ``Error: ...`` line.  Splitting on both ``\\r`` and ``\\n`` and preferring
+    a line that mentions "error" avoids returning garbled progress-bar bytes
+    as the failure message.
+    """
+    text = tail.decode(errors="replace")
+    parts = [p.strip() for p in text.replace("\r", "\n").split("\n") if p.strip()]
+    for p in reversed(parts):
+        if "error" in p.lower():
+            return p
+    return parts[-1] if parts else ""
+
+
+def _pull_via_cli(model: str) -> tuple[bool, str]:
+    """Pull *model* via the ``ollama`` CLI with a stall-based timeout.
+
+    Reads the merged stdout+stderr stream from a background thread and
+    echoes it to stderr, so the CLI progress bar stays visible during the
+    pull.  Any new byte resets the stall clock; ``STALL_TIMEOUT`` seconds
+    without bytes kills the process.
+
+    WHY a reader thread instead of ``select``: ``select.select`` waits only
+    on sockets on Windows, not on subprocess pipes, so the previous raw-fd
+    approach would crash there.  A thread performing a blocking ``read`` is
+    portable and keeps the same incremental-progress semantics.
+    """
+    import threading
+    import time
+
+    proc = subprocess.Popen(
+        ["ollama", "pull", model],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+    )
+    # Progress state is shared between the reader thread and this loop, so it
+    # is guarded by a lock — a plain closure variable would be a data race.
+    # ollama (a Go binary) writes progress to stderr unbuffered, so bytes
+    # arrive promptly even when stdout is not a TTY (no block-buffer stalls).
+    lock = threading.Lock()
+    state: dict = {"last_byte": time.monotonic(), "tail": b""}
+
+    def _read_stream() -> None:
+        try:
+            while True:
+                chunk = proc.stdout.read(65536)
+                if not chunk:
+                    break
+                sys.stderr.write(chunk.decode(errors="replace"))
+                sys.stderr.flush()
+                with lock:
+                    state["last_byte"] = time.monotonic()
+                    state["tail"] = (state["tail"] + chunk)[-4096:]
+        except OSError:
+            pass
+
+    reader = threading.Thread(target=_read_stream, daemon=True)
+    reader.start()
+    try:
+        while proc.poll() is None:
+            with lock:
+                last = state["last_byte"]
+            if time.monotonic() - last > STALL_TIMEOUT:
+                _kill(proc)
+                reader.join(timeout=1.0)
+                return False, (
+                    f"pull stalled — no progress for {STALL_TIMEOUT}s; "
+                    f"run `ollama pull {model}` manually"
+                )
+            time.sleep(1.0)
+        reader.join(timeout=5.0)
+        # End the progress bar on a clean line — a trailing ``\r`` update
+        # would otherwise leave the caller's result message mid-line.
+        sys.stderr.write("\n")
+        sys.stderr.flush()
+        with lock:
+            tail = state["tail"]
+        if proc.returncode == 0:
+            return True, "pulled"
+        return False, _extract_cli_error(tail) or f"exit {proc.returncode}"
+    finally:
+        if proc.poll() is None:
+            _kill(proc)
+
+
+def _pull_via_api(model: str, url: str) -> tuple[bool, str]:
+    """Pull *model* via the Ollama HTTP API with a stall-based timeout.
+
+    Streams ``/api/pull`` and folds ``status``/``error`` from the
+    NDJSON stream.  A stall is enforced by the httpx per-chunk ``read``
+    timeout (``STALL_TIMEOUT``) — if the server stops sending bytes for
+    that long, ``httpx.ReadTimeout`` fires and is reported as a stall.
+    A long "verifying sha256 digest" phase (which keeps emitting lines)
+    does not trigger a false abort, because each received line resets the
+    read deadline.
+    """
+    import json
 
     import httpx
 
     try:
-        resp = httpx.post(
+        with httpx.stream(
+            "POST",
             f"{url.rstrip('/')}/api/pull",
-            json={"name": model, "stream": False},
-            timeout=600,
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        if data.get("status") == "success":
-            return True, "pulled via API"
-        return False, data.get("error", "unknown API error")
+            json={"name": model, "stream": True},
+            timeout=httpx.Timeout(connect=10.0, read=STALL_TIMEOUT, write=10.0, pool=10.0),
+        ) as resp:
+            resp.raise_for_status()
+            status = "unknown"
+            for line in resp.iter_lines():
+                if not line:
+                    continue
+                try:
+                    data = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                status = data.get("status", status)
+                if data.get("error"):
+                    return False, data["error"]
+                if status == "success":
+                    return True, "pulled via API"
+            if status == "success":
+                return True, "pulled via API"
+            return False, status or "unknown API error"
     except httpx.ConnectError:
         return False, f"Ollama not reachable at {url}"
+    except httpx.ReadTimeout:
+        return False, (
+            f"pull stalled — no progress for {STALL_TIMEOUT}s; "
+            f"run `ollama pull {model}` manually"
+        )
     except httpx.HTTPError as e:
+        return False, str(e)
+    except OSError as e:
         return False, str(e)
 
 
@@ -130,6 +267,11 @@ def fix_libclang_python(_result, _project_root=None) -> tuple[bool, str]:
 def fix_watchfiles(_result, _project_root=None) -> tuple[bool, str]:
     """Install watchfiles."""
     return _pip_install("watchfiles")
+
+
+def fix_tomli_w(_result, _project_root=None) -> tuple[bool, str]:
+    """Install tomli-w (required for config writes during init)."""
+    return _pip_install("tomli-w")
 
 
 def fix_chat_model(result, _project_root=None) -> tuple[bool, str]:
@@ -172,6 +314,7 @@ FIXABLE: dict[str, Any] = {
     "sqlite-vec": fix_sqlite_vec,
     "libclang-python": fix_libclang_python,
     "watchfiles": fix_watchfiles,
+    "tomli-w": fix_tomli_w,
     "chat-model": fix_chat_model,
     "embed-model": fix_embed_model,
     "sqlite-ext": fix_sqlite_ext,

@@ -143,7 +143,7 @@ def _model_installed(ollama_url: str, model: str) -> bool:
 
 
 def _try_pull(model: str, ollama_url: str) -> bool:
-    """Best-effort pre-warm pull with 5s read timeout.
+    """Best-effort pre-warm pull with a 300 s read timeout.
     Real pull (in ollama.py) uses 600s timeout — this just tries to
     start the download early so it's ready when embedder initializes."""
     import json
@@ -182,7 +182,7 @@ def _try_pull(model: str, ollama_url: str) -> bool:
         return False
 
 
-def resolve_embed_model(cfg: LLMConfig) -> None:
+def resolve_embed_model(cfg: LLMConfig, *, skip_pull: bool = False) -> None:
     """Resolve ``cfg.embed_model`` to the best available model.
 
     Only runs when ``embed_model`` is empty (default).  Sets the
@@ -194,6 +194,12 @@ def resolve_embed_model(cfg: LLMConfig) -> None:
     Best-effort: checks if the model is installed and pulls if missing.
     All Ollama calls have short timeouts — if Ollama is offline the
     model name is still set and ``OllamaEmbedder`` retries at embed time.
+
+    The auto-pull is gated behind ``cfg.auto_pull`` (default ``False``)
+    AND *skip_pull*.  ``fw-context init`` passes ``skip_pull=True`` so it
+    never downloads a multi-GB model without consent — it only persists
+    the resolved model name.  When both gates allow it, ``_try_pull``
+    performs the best-effort pre-warm.
 
     Result is cached at module level — subsequent calls return instantly
     (no subprocess or HTTP I/O).
@@ -234,6 +240,15 @@ def resolve_embed_model(cfg: LLMConfig) -> None:
 
     if _model_installed(cfg.ollama_url, target):
         log.info("Auto-detected embed model: %s (GPU=%s, already installed)", target, gpu)
+        return
+
+    # No consent → no pull.  The model name + prompt defaults are already
+    # set above; the operator (or an explicit `ollama pull`) fetches it.
+    if skip_pull or not cfg.auto_pull:
+        log.info(
+            "Auto-detected embed model: %s (GPU=%s, pull skipped — auto_pull=%s, skip_pull=%s)",
+            target, gpu, cfg.auto_pull, skip_pull,
+        )
         return
 
     log.info("Auto-detected embed model: %s (GPU=%s, pulling...)", target, gpu)

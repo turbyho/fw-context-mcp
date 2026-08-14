@@ -36,6 +36,7 @@ This section controls how `fw-context index` generates `compile_commands.json`. 
 | `system` | *(auto-detect)* | project | The build system: `"mbed-os"`, `"zephyr"`, or `"platformio"`. fw-context detects this automatically from project markers, such as `west.yml`, `.mbed`, or `platformio.ini`. |
 | `clean` | `true` | project | Always run a clean build before fw-context generates `compile_commands.json`. **Recommended.** A clean build ensures a complete `compile_commands.json` file. Set this key to `false`, or use `--no-clean`, for incremental builds. Note: a clean build always forces a full re-index. |
 | `command` | *(none)* | project | A full override for the build command. This key bypasses all automatic detection. Example: `"bear -- make -j4"`. |
+| `timeout` | `7200` | project | The build timeout, in seconds. Long first builds (Zephyr, ESP-IDF) must not fail at the previous 600 s limit. |
 | `python` | *(auto-detect)* | local | The Python interpreter for pip-based build tools, such as `mbed-cli`, `platformio`, `keil2clangd`, or `compiledb`. `fw-context init` detects this automatically. Set this key manually when automatic detection fails. |
 | `activate` | *(auto-detect)* | local | A shell script that fw-context sources before the build, for example the Zephyr/NCS toolchain script or the ESP-IDF `export.sh` script. `fw-context init` detects this automatically. Set this key manually when automatic detection fails. |
 | `target` | *(auto-detect)* | project | The Mbed OS target board. fw-context detects this automatically from `.mbed` or `custom_targets.json`. |
@@ -45,6 +46,11 @@ This section controls how `fw-context index` generates `compile_commands.json`. 
 | `extra_profiles` | `["lto.json"]` | project | Additional Mbed OS profiles. fw-context resolves these paths relative to `mbed-os/tools/profiles/extensions/`. |
 | `defines` | `[]` | project | Extra preprocessor macros that fw-context passes to the compiler as `-D` flags. Example: `["VERSION_FW_MAJOR=4", "DEV"]`. This key is useful for conditional code paths, because it makes fw-context index `#ifdef DEV` branches too. |
 | `board` | *(required)* | project | The Zephyr board name. You must set this key explicitly for Zephyr projects. |
+| `fqbn` | *(none)* | project | The Arduino fully qualified board name, for example `"arduino:avr:uno"`. `fw-context init` asks for this value when you select the Arduino build system interactively. |
+| `keil_project` | *(none)* | project | The path to the Keil MDK `.uvprojx` project file. `keil2clangd` converts this file to `compile_commands.json`. |
+| `iar_project` | *(none)* | project | The path to the IAR EWARM `.ewp` project file. `keil2clangd` converts this file to `compile_commands.json`. |
+| `source_dirs` | *(none)* | project | The source directories for the manual (bare) mode. `fw-context init` asks for this value when you select the bare mode interactively. |
+| `include_dirs` | *(none)* | project | The include directories for the manual (bare) mode. |
 
 ### `[index]` — Indexer
 
@@ -66,7 +72,7 @@ Put these settings in `~/.fw-context/config.toml` for global defaults, or in `<p
 | `enabled` | `true` | global, local | Enable Ollama. When this key is `false`, `smart_search` falls back to word-split FTS5. Also, `explain_symbol` returns the source code and a prompt for the AI assistant. |
 | `ollama_url` | `"http://localhost:11434"` | global, local | The base URL for the Ollama API. Change this key for a remote GPU server. |
 | `model` | `"qwen2.5-coder:14b"` | global, local | The LLM model tag. Override this key for each project, to use a different model for different codebases. |
-| `embed_model` | `"mxbai-embed-large:latest"` | global, local | The embedding model for vector search. fw-context pulls this model automatically on first use. `mxbai-embed-large` runs on a CPU. For a GPU, use `qwen3-embedding:8b`, which needs about 4.7 GB of VRAM and creates 4096-dimension vectors. |
+| `embed_model` | `"mxbai-embed-large:latest"` | global, local | The embedding model for vector search. When `auto_pull` is `true`, fw-context pulls this model automatically on first use; otherwise pull it manually. `mxbai-embed-large` runs on a CPU. For a GPU, use `qwen3-embedding:8b`, which needs about 4.7 GB of VRAM and creates 4096-dimension vectors. |
 | `embed_query_prompt` | *(auto-detect)* | global, local | An instruction that fw-context adds before the query text, before it creates the embedding. fw-context detects this instruction automatically from the model name prefix: for `mxbai-*`, fw-context uses `"Represent this sentence for searching relevant passages: "`; for `qwen3-embedding*`, fw-context uses a code-retrieval instruction. Set this key explicitly to override the default, or set it to `""` to disable it. |
 | `embed_doc_prompt` | *(empty)* | global, local | An instruction that fw-context adds before symbol descriptions during indexing. Most models work best with an empty prompt. Set this key only when the model's training expects a per-document instruction. |
 | `auto_pull` | `false` | global, local | When `true`, fw-context pulls a model automatically from the Ollama registry when it is not installed. When `false` (default), you must pull each model explicitly. Set this key to `false` for offline or intranet environments. |

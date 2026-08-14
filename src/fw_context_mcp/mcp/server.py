@@ -1,6 +1,6 @@
 """fw-context MCP server — build-aware code intelligence for embedded C/C++ projects.
 
-Serves 35 MCP tools and 4 MCP resources via FastMCP (stdio transport).
+Serves 37 MCP tools and 4 MCP resources via FastMCP (stdio transport).
 
 **Concurrency model — single-tool execution with busy rejection:**
 The server processes at most ONE tool request at a time.  If a request
@@ -58,9 +58,10 @@ client-side connection timeouts.
 
 **Variables:** ``find_variables``.
 
-**Maintenance tools:** ``get_active_build``, ``list_projects``,
-``get_project_info``, ``check_ollama``, ``configure_llm``,
-``reindex_file``, ``reindex_file_impl``, ``reset_index``.
+**Maintenance tools:** ``get_active_build``, ``get_environment_status``,
+``check_dependencies``, ``list_projects``, ``get_project_info``,
+``check_ollama``, ``configure_llm``, ``reindex_file``,
+``reindex_file_impl``, ``reset_index``.
 
 **MCP Resources:** ``fw-context://stats``, ``fw-context://projects``,
 ``fw-context://symbols/{name}``, ``fw-context://skills/fw-review``.
@@ -395,7 +396,8 @@ mcp = FastMCP(
         "Inheritance: get_inheritance_chain, get_class_members,\n"
         "get_template_instances, get_method_overrides.\n"
         "Source: get_source, get_symbol_context, get_file_map, explain_symbol, read_file.\n"
-        "Maintenance: get_active_build, list_projects, get_project_info,\n"
+        "Maintenance: get_active_build, get_environment_status,\n"
+        "check_dependencies, list_projects, get_project_info,\n"
         "check_ollama, configure_llm, reindex_file, reindex_file_impl,\n"
         "reset_index.\n\n"
         "REVIEW SKILL — MANDATORY (not optional): When reviewing C/C++ firmware\n"
@@ -528,9 +530,11 @@ _SOURCE_EXTS_WATCH = {".c", ".cpp", ".h", ".hpp"}
 # and the 5 s busy-rejection guard.
 
 # maintenance.py
+mcp.tool()(maintenance.check_dependencies)
 mcp.tool()(maintenance.check_ollama)
 mcp.tool()(maintenance.configure_llm)
 mcp.tool()(maintenance.get_active_build)
+mcp.tool()(maintenance.get_environment_status)
 mcp.tool()(maintenance.get_project_info)
 mcp.tool()(maintenance.list_projects)
 mcp.tool()(maintenance.reindex_file)

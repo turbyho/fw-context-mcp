@@ -127,6 +127,7 @@ class BuildConfig:
 
     # ── Pre-build hooks ──
     pre_build: str | None = None  # shell command run before build/convert/generate
+    timeout: float = 7200  # build timeout in seconds — long first builds (Zephyr, ESP-IDF) must not be killed at 10 min
 
 
 # ---------------------------------------------------------------------------
@@ -256,7 +257,7 @@ def _run_pre_build(cfg: BuildConfig, cwd: Path) -> None:
         cfg.pre_build,
     )
     import shlex
-    result = subprocess.run(shlex.split(cfg.pre_build), shell=False, cwd=cwd, timeout=600)
+    result = subprocess.run(shlex.split(cfg.pre_build), shell=False, cwd=cwd, timeout=cfg.timeout)
     if result.returncode != 0:
         raise RuntimeError(f"Pre-build command failed with exit code {result.returncode}")
 
