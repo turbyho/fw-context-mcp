@@ -25,6 +25,7 @@ from ._instructions import (
     db_integrity_instructions,
     disk_space_instructions,
     get_platform_info,
+    libclang_python_instructions,
     libclang_so_instructions,
     ollama_instructions,
     pysqlite3_instructions,
@@ -56,6 +57,22 @@ def _version(pkg: str) -> str:
         return importlib.metadata.version(pkg)
     except importlib.metadata.PackageNotFoundError:
         return "unknown"
+
+
+def _require_tomli_w() -> bool:
+    """Return True when ``tomli-w`` is importable.
+
+    Shared by ``check_tomli_w`` (doctor) and ``--skip-doctor`` (init) so
+    the knowledge of the tomli-w dependency lives in one place.  ``tomli-w``
+    is a runtime dependency of the config writer — a missing package only
+    crashes at ``set_key``/``merge_template`` time, so an import probe is
+    the cheapest reliable check.
+    """
+    try:
+        importlib.import_module("tomli_w")
+        return True
+    except ImportError:
+        return False
 
 
 # ── Checks ──────────────────────────────────────────────────────────────
@@ -201,8 +218,8 @@ def check_libclang_python() -> DepCheckResult:
                     name="libclang-python",
                     status="degraded",
                     message=f"libclang {ver} is too old — 18.1.1+ required",
-                    fix_cmd=f"{platform_ctx['pip_cmd']} 'libclang>=18.1.1'",
-                    instructions=f"{platform_ctx['pip_cmd']} 'libclang>=18.1.1'",
+                    fix_cmd=libclang_python_instructions(platform_ctx),
+                    instructions=libclang_python_instructions(platform_ctx),
                     critical=True,
                 )
         except ImportError:
@@ -218,8 +235,8 @@ def check_libclang_python() -> DepCheckResult:
             name="libclang-python",
             status="missing",
             message="clang Python bindings not installed",
-            fix_cmd=f"{platform_ctx['pip_cmd']} libclang",
-            instructions=f"{platform_ctx['pip_cmd']} libclang",
+            fix_cmd=libclang_python_instructions(platform_ctx),
+            instructions=libclang_python_instructions(platform_ctx),
             critical=True,
         )
 
@@ -246,8 +263,9 @@ def check_libclang_so() -> DepCheckResult:
     except Exception as exc:
         return DepCheckResult(
             name="libclang-so",
-            status="degraded",
+            status="missing",
             message=f"clang.cindex.Config().lib failed: {exc}",
+            fix_cmd=libclang_so_instructions(platform_ctx),
             instructions=libclang_so_instructions(platform_ctx),
             critical=True,
         )
@@ -267,14 +285,16 @@ def check_libclang_so() -> DepCheckResult:
                 name="libclang-so",
                 status="degraded",
                 message=f"library found at {lib_path} but failed to load: {exc}",
+                fix_cmd=libclang_so_instructions(platform_ctx),
                 instructions=libclang_so_instructions(platform_ctx),
                 critical=True,
             )
 
     return DepCheckResult(
         name="libclang-so",
-        status="degraded",
+        status="missing",
         message=f"libclang not found at {lib_path}",
+        fix_cmd=libclang_so_instructions(platform_ctx),
         instructions=libclang_so_instructions(platform_ctx),
         critical=True,
     )
@@ -301,6 +321,35 @@ def check_watchfiles() -> DepCheckResult:
             instructions=watchfiles_instructions(platform_ctx),
             critical=False,
         )
+
+
+def check_tomli_w() -> DepCheckResult:
+    """Verify tomli-w is installed — required for config writes during init.
+
+    WHY: ``tomli-w`` is a runtime dependency of the config writer
+    (``config/_toml_editor.py`` lazy-imports it in ``set_key`` and
+    ``merge_template``).  ``pip install fw-context`` declares it, but a
+    partially-broken environment can miss it.  ``fw-context init`` and
+    ``doctor --fix`` write config, so a missing ``tomli-w`` crashes with
+    ``No module named 'tomli_w'`` only at write time — this import probe
+    surfaces the problem early.
+    """
+    platform_ctx = get_platform_info()
+    if _require_tomli_w():
+        return DepCheckResult(
+            name="tomli-w",
+            status="ok",
+            message=f"tomli-w {_version('tomli-w')}",
+            critical=False,
+        )
+    return DepCheckResult(
+        name="tomli-w",
+        status="missing",
+        message="tomli-w not installed — blocks fw-context init (config writes)",
+        fix_cmd=f"{platform_ctx['pip_cmd']} tomli-w",
+        instructions=f"{platform_ctx['pip_cmd']} tomli-w",
+        critical=False,
+    )
 
 
 def check_ollama_running(cfg) -> DepCheckResult:
@@ -531,6 +580,7 @@ CHECK_ORDER: list[tuple[str, Any]] = [
     ("libclang-python", check_libclang_python),
     ("libclang-so", check_libclang_so),
     ("watchfiles", check_watchfiles),
+    ("tomli-w", check_tomli_w),
     ("ollama", check_ollama_running),
     ("chat-model", check_ollama_chat_model),
     ("embed-model", check_ollama_embed_model),

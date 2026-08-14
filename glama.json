@@ -5,7 +5,7 @@
   ],
   "title": "fw-context-mcp",
   "version": "0.25.8",
-  "description": "Build-aware code intelligence for embedded C/C++ firmware. libclang + SQLite+FTS5, 35 MCP tools for symbol search, call graphs, hotspot analysis, dead code detection, and vector search.",
+  "description": "Build-aware code intelligence for embedded C/C++ firmware. libclang + SQLite+FTS5, 37 MCP tools for symbol search, call graphs, hotspot analysis, dead code detection, and vector search.",
   "tags": [
     "c++",
     "c",

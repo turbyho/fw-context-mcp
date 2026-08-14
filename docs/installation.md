@@ -49,7 +49,7 @@ uv pip install fw-context-mcp
 ```
 
 This command installs the latest release from PyPI with all dependencies
-(libclang, pysqlite3, sqlite-vec, watchfiles, httpx, mcp).
+(libclang, pysqlite3, sqlite-vec, watchfiles, httpx, mcp, tomli-w).
 
 The `fw-context` binary lands in your active Python environment's `bin/`
 directory — typically `~/.local/bin` for user installs, or the virtual
@@ -136,7 +136,7 @@ defines = [
 
 Install only the tools that your build system needs. `pip install fw-context-mcp`
 installs the core Python packages automatically: `libclang`, `pysqlite3`,
-`sqlite-vec`, `watchfiles`, `httpx`, and `mcp`.
+`sqlite-vec`, `watchfiles`, `httpx`, `mcp`, and `tomli-w`.
 
 ### Core (All Projects)
 
@@ -417,7 +417,27 @@ fw-context init --dry-run          # preview without writing
 fw-context init --tool claude-code # specific tool only
 fw-context init --scope global     # global install (all projects)
 fw-context init --scope all        # both global and project
+fw-context init --quick            # skip AI tool registration only
+fw-context init --skip-doctor      # skip the dependency audit
+fw-context init --skip-build       # skip compile_commands.json generation
+fw-context init --non-interactive  # disable prompts (CI/pipe)
+fw-context quickstart              # alias for `init --quick`
 ```
+
+**Provisioning:** `fw-context init` now does more than AI-tool setup. It
+runs these steps, in order:
+
+1. Generate the project ID and register the project globally.
+2. Audit the dependencies, and auto-fix what it can (missing pip packages).
+   Model pulls (`ollama pull`) never run here.
+3. Detect the build system and generate `compile_commands.json` when the
+   project is buildable.
+4. Register the AI tools (steps skipped by `--quick`).
+5. Print a checklist of the remaining manual steps.
+
+When build-system detection fails, `fw-context init` asks for the missing
+value interactively (build system, board, FQBN, and so on). In a pipe, or
+with `--non-interactive`, the missing value goes to the checklist instead.
 
 **What `fw-context init` does:**
 

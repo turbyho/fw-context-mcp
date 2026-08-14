@@ -4,7 +4,7 @@ fw-context-mcp is an MCP (Model Context Protocol) server. fw-context-mcp exposes
 
 ## What it is
 
-Your AI assistant (for example, Claude Code or OpenCode) starts fw-context-mcp as a persistent subprocess. fw-context-mcp provides **34 tools** to navigate embedded firmware codebases:
+Your AI assistant (for example, Claude Code or OpenCode) starts fw-context-mcp as a persistent subprocess. fw-context-mcp provides **37 tools** to navigate embedded firmware codebases:
 
 | Category | Tools |
 |----------|-------|
@@ -12,7 +12,7 @@ Your AI assistant (for example, Claude Code or OpenCode) starts fw-context-mcp a
 | **Understanding** | `get_file_map`, `get_source`, `explain_symbol`, `get_symbol_context`, `read_file` |
 | **Call graph** | `find_callers`, `find_references`, `find_call_path`, `find_all_callers_recursive`, `find_callees_recursive`, `find_dead_code`, `find_hotspots`, `find_wrapper_callers`, `find_indirect_call_sites`, `find_indirect_targets`, `trace_data_flow` |
 | **Class analysis** | `get_inheritance_chain`, `get_class_members`, `get_template_instances`, `get_method_overrides` |
-| **Index maintenance** | `get_active_build`, `reindex_file`, `reindex_file_impl`, `reset_index`, `list_projects`, `check_ollama` |
+| **Index maintenance** | `get_active_build`, `get_environment_status`, `check_dependencies`, `configure_llm`, `reindex_file`, `reindex_file_impl`, `reset_index`, `list_projects`, `get_project_info`, `check_ollama` |
 
 For the full tool reference, with schemas and examples, see **[Tools Reference](docs/tools.md)**.
 

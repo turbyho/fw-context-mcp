@@ -82,11 +82,20 @@ def run_preflight() -> list[DepCheckResult]:
 # ── Full check ──────────────────────────────────────────────────────────
 
 
-def run_full_check(project_root: str | Path | None = None) -> list[DepCheckResult]:
+def run_full_check(
+    project_root: str | Path | None = None,
+    subset: set[str] | None = None,
+) -> list[DepCheckResult]:
     """Complete dependency audit.
 
     Checks in dependency order; dependent checks return ``"skipped"``
     when a prerequisite failed.  Loads config once for Ollama/model checks.
+
+    When *subset* is given, only checks whose ``name`` is in *subset* run
+    (in ``CHECK_ORDER`` order).  Used by ``get_environment_status`` for the
+    ``not_initialized`` path — pip-only checks that do not depend on a
+    project config.  Default ``None`` runs the full audit (unchanged for
+    ``doctor``).
 
     WHY: Loading config is slow (it triggers TOML parsing and build
     system detection).  Doing it once and sharing across multiple
@@ -98,6 +107,8 @@ def run_full_check(project_root: str | Path | None = None) -> list[DepCheckResul
     ctx: dict = {}  # mutable state shared across checks (e.g. cfg)
 
     for name, fn in CHECK_ORDER:
+        if subset is not None and name not in subset:
+            continue
         try:
             if name in ("ollama", "chat-model", "embed-model"):
                 if "cfg" not in ctx:
@@ -133,11 +144,22 @@ def run_full_check(project_root: str | Path | None = None) -> list[DepCheckResul
 # ── Fixes ───────────────────────────────────────────────────────────────
 
 
-def run_fixes(results: list[DepCheckResult], project_root: str | Path | None = None) -> list[DepCheckResult]:
+def run_fixes(
+    results: list[DepCheckResult],
+    project_root: str | Path | None = None,
+    skip_model_pulls: bool = False,
+) -> list[DepCheckResult]:
     """Attempt auto-repair for every non-ok result that has a fix.
 
     Returns the updated list — successfully fixed items are replaced
     with a fresh ``"ok"`` result from re-running the corresponding check.
+
+    When *skip_model_pulls* is True, ``chat-model``/``embed-model`` fixes
+    are NOT invoked — the original result is left as-is so the pull command
+    stays in ``fix_cmd`` for the caller's checklist.  ``fw-context init``
+    passes True because model pulls (multi-GB) are owned exclusively by the
+    interactive ``prompt_llm_config`` flow and must never happen without
+    consent.  ``doctor --fix`` keeps the default False (unchanged behaviour).
 
     WHY: A fix may succeed (pip install works) but the installation may
     still be broken (wrong architecture, missing .so dependency).
@@ -148,6 +170,9 @@ def run_fixes(results: list[DepCheckResult], project_root: str | Path | None = N
 
     updated: list[DepCheckResult] = []
     for r in results:
+        if skip_model_pulls and r.name in ("chat-model", "embed-model"):
+            updated.append(r)  # leave as-is — prompt_llm_config owns model pulls
+            continue
         if r.status in ("ok", "skipped", "error") or r.name not in FIXABLE:
             updated.append(r)
             continue
@@ -193,6 +218,7 @@ def _recheck(name: str, project_root: str | Path | None = None) -> DepCheckResul
         check_pysqlite3,
         check_sqlite3_extensions,
         check_sqlite_vec,
+        check_tomli_w,
         check_watchfiles,
     )
 
@@ -214,6 +240,7 @@ def _recheck(name: str, project_root: str | Path | None = None) -> DepCheckResul
         "libclang-python": check_libclang_python,
         "libclang-so": check_libclang_so,
         "watchfiles": check_watchfiles,
+        "tomli-w": check_tomli_w,
         "ollama": lambda: check_ollama_running(cfg.llm) if cfg else DepCheckResult("ollama", "skipped", "no config"),
         "chat-model": lambda: check_ollama_chat_model(cfg.llm) if cfg else DepCheckResult("chat-model", "skipped", "no config"),
         "embed-model": lambda: check_ollama_embed_model(cfg.llm) if cfg else DepCheckResult("embed-model", "skipped", "no config"),

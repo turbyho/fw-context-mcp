@@ -197,20 +197,65 @@ fw-context db cleanup --project /path  # clean up for specific project
 
 ### `fw-context init`
 
-Register fw-context with AI assistants, and inject usage instructions.
+Provision a project in one command: audit and fix dependencies, generate
+`compile_commands.json` when possible, register AI assistants, and print
+a checklist of the remaining manual steps.
 
 ```bash
-fw-context init                         # all detected assistants
+fw-context init                         # full provisioning (all detected assistants)
+fw-context init --quick                 # skip AI tool registration only
 fw-context init --tool claude-code      # specific tool only
 fw-context init --dry-run               # preview without writing
 fw-context init --force                 # overwrite collisions
 fw-context init --list-tools            # show supported tools
+fw-context init --skip-doctor           # skip the dependency audit
+fw-context init --skip-build            # skip compile_commands.json generation
+fw-context init --non-interactive       # disable prompts (CI/pipe)
+fw-context init --name NAME             # project name in the global registry
 ```
+
+`fw-context init` runs these steps, in order:
+
+1. **Project ID** — generate the ID and register the project globally.
+2. **Dependencies** — audit and auto-fix fixable issues, such as missing
+   pip packages. Model pulls (`ollama pull`) never run in this step.
+3. **Build** — detect the build system and generate
+   `compile_commands.json` when the project is buildable.
+4. **AI tools** — register the MCP server and inject instructions, skills,
+   and agents.
+5. **Checklist** — print the remaining manual steps, grouped by category.
+
+**Interactive fallback.** When build-system detection fails (no project
+markers, no board, no FQBN), `fw-context init` asks for the missing value.
+Each prompt has a default; press Enter to accept it. The answers are
+written to `.fw-context/config.toml`. In a pipe, or with
+`--non-interactive`, the missing value goes to the checklist instead.
+
+The command is idempotent. Re-running it asks `Change? [y/N]` for each
+configured value, so you can press Enter to keep the current setup.
+
+`--quick` skips only step 4 (AI tool registration). It still creates the
+project ID, the config files, the `.gitignore` entries, and runs the
+dependency audit, the build, and the checklist.
 
 | Tool | ID | Scope |
 |------|----|-------|
 | Claude Code | `claude-code` | global (`~/.claude/`) |
 | OpenCode | `opencode` | global (`~/.config/opencode/`) |
+
+### `fw-context quickstart`
+
+Alias for `fw-context init --quick`. Provision the project, but skip AI
+tool registration only. Use this command for CI, or when the AI tools
+already work.
+
+```bash
+fw-context quickstart                  # deps + build + config + checklist
+```
+
+This command shares the `--project`, `--dry-run`, `--skip-doctor`,
+`--skip-build`, `--non-interactive`, and `--name` flags with
+`fw-context init`.
 
 ### `fw-context export`
 
@@ -382,6 +427,7 @@ fw-context doctor --project /path    # audit specific project
 `fw-context doctor` checks:
 
 - The Python version and required packages
+- The `tomli-w` package, which writes the config files
 - The Ollama installation and model availability
 - The libclang shared library and its version
 - The SQLite version and FTS5 support
@@ -1208,6 +1254,54 @@ empty lists.
 
 ### Index maintenance
 
+#### `get_environment_status`
+
+Return the complete project environment status in one call. This tool
+aggregates the dependency audit, the detected build system, the
+compilation database, the index state, and the LLM backend.
+
+```
+Input:  {"project_root?": "/path/to/project"}
+Output: {"init_status": "initialized",
+         "deps": [{"name": "libclang-so", "status": "missing",
+                    "action": {"message": "libclang shared library not found.",
+                               "command": "apt install libclang-18-dev"}}],
+         "build_system": "zephyr",
+         "compile_db": {"exists": true, "path": "/path/build/compile_commands.json",
+                        "entry_count": 312},
+         "index": {"status": "reindex_needed", "index_message": "…", …},
+         "llm": {"enabled": true, "ollama_running": true,
+                 "chat_model": "qwen2.5-coder:14b", "embed_model": "qwen3-embedding:8b"}}
+```
+
+Each problem field (`deps[*]`, `compile_db`, `llm`) may carry an `action`
+with a human-readable `message` and an exact shell `command`. Pass both to
+the user without interpretation. The `index` field is the full
+`get_active_build()` result, unchanged; its `index_message` carries the
+action.
+
+This tool is read-only. Use it at session start, to see everything that
+needs fixing before answering the user. Pass `project_root` explicitly
+when the project is not the server's working directory.
+
+#### `check_dependencies`
+
+Run the full dependency audit. Read-only. Returns structured results, one
+entry per check.
+
+```
+Input:  {"project_root?": "/path/to/project"}
+Output: [{"name": "libclang-so", "status": "missing",
+          "message": "…", "fix_cmd": "apt install libclang-18-dev",
+          "instructions": "…", "critical": true}, …]
+```
+
+Read `status`, `fix_cmd`, and `instructions` per issue. A `status` of
+`"skipped"` means a prerequisite check is missing. This tool is the MCP
+wrapper for `fw-context doctor` without `--fix`; it repairs nothing. For a
+single-call overview of the whole environment, use
+`get_environment_status`.
+
 #### `get_active_build`
 
 Check index health — call at session start.
@@ -1351,6 +1445,24 @@ this tool needs no Ollama.
 Note: `explain_symbol`, with pre-computed analysis (the default), returns
 instantly, and does not require Ollama at query time. `num_ctx` is 16384
 by default, to allow full function bodies during analysis generation.
+
+#### `configure_llm`
+
+Write per-developer LLM settings to `.fw-context/local.toml` (gitignored).
+This tool writes nothing else. After writing, it tests the configuration
+with a simple API call.
+
+```
+Input:  {"chat_api_base?": "https://api.deepseek.com/v1", "chat_api_key?": "sk-…",
+         "model?": "deepseek-chat", "auto_pull?": false, "stream?": false}
+Output: {"status": "ok", "model": "deepseek-chat", "test_latency_s": 1.2, …}
+```
+
+Pass `chat_api_base` for a cloud or proxy API. When it is empty, this
+tool uses the local Ollama instance. When `chat_api_base` points to an
+external host, source code in chat prompts is sent to that host. Verify
+this complies with your data security policy. Prefer the local Ollama
+instance.
 
 ### MCP Resources
 

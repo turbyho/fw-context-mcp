@@ -109,7 +109,7 @@ def is_db_exception(exc: BaseException) -> bool:
 def run_build_command(
     cmd: list[str],
     cwd: Path,
-    timeout: float = 600,
+    timeout: float | None = None,
     description: str = "",
     env: dict[str, str] | None = None,
     build_cfg: BuildConfig | None = None,
@@ -118,11 +118,11 @@ def run_build_command(
 
     All build-system invocations should use this helper instead of raw
     ``subprocess.run()`` to ensure consistent timeout and output capture
-    behaviour across the nine builders.
+    behaviour across the ten builders.
 
     Why wrapper vs raw subprocess:
 
-    - The nine build-system backends each have different argument
+    - The ten build-system backends each have different argument
       conventions.  Without a single wrapper, every caller duplicates
       the ``cwd``, ``capture_output=True``, ``text=True``,
       ``timeout``, and ``env`` merge logic — a maintenance liability.
@@ -137,7 +137,10 @@ def run_build_command(
     Args:
         cmd: Command and arguments as a list (shell=False is enforced).
         cwd: Working directory.
-        timeout: Maximum time in seconds.
+        timeout: Maximum time in seconds.  ``None`` (default) resolves to
+            ``build_cfg.timeout`` when *build_cfg* is given, else 7200 s —
+            long first builds (Zephyr, ESP-IDF) must not be killed at
+            10 min.
         description: Human-readable description for error messages.
         env: Optional environment variables dict (merged with os.environ).
         build_cfg: Optional BuildConfig — when set, ``activate`` wraps the
@@ -150,6 +153,9 @@ def run_build_command(
     Raises:
         RuntimeError: On non-zero exit or timeout.
     """
+    if timeout is None:
+        timeout = build_cfg.timeout if build_cfg is not None else 7200
+
     merged_env = dict(os.environ)
     if env:
         merged_env.update(env)

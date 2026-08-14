@@ -8,14 +8,16 @@ they inspect index metadata, configure runtime behavior, and
 manage the index lifecycle.
 
 Public MCP handlers in this module:
-    get_active_build  — mandatory first-call index health report
-    check_ollama      — LLM backend availability and model status
-    configure_llm     — write per-developer LLM settings to local.toml
-    reindex_file      — re-parse a single source file into the index
-    reindex_file_impl — same as above with an ``--analysis`` equivalent
-    reset_index       — delete the symbol database
-    list_projects     — enumerate all indexed projects
-    get_project_info  — look up a project by UUID4 in the global registry
+    get_active_build         — mandatory first-call index health report
+    get_environment_status   — aggregate deps/build/index/llm in one call
+    check_ollama             — LLM backend availability and model status
+    check_dependencies       — read-only dependency audit (structured results)
+    configure_llm            — write per-developer LLM settings to local.toml
+    reindex_file             — re-parse a single source file into the index
+    reindex_file_impl        — same as above with an ``--analysis`` equivalent
+    reset_index              — delete the symbol database
+    list_projects            — enumerate all indexed projects
+    get_project_info         — look up a project by UUID4 in the global registry
 
 Each handler is read-only except where noted in its docstring.
 The ``Field(description=…)`` strings on public signatures are tool
@@ -23,7 +25,6 @@ registration metadata — they must not be modified casually."""
 
 from __future__ import annotations
 
-import dataclasses
 import logging
 import sqlite3
 import time
@@ -47,7 +48,7 @@ from ...indexer.db import (
     open_db,
     transaction,
 )
-from ...llm.ollama import OllamaError, check_setup
+from ...llm.ollama import check_setup
 from ...utils import resolve_project_root
 from ..background import _is_bg_reindex_running
 from ..shared.context import (
@@ -1375,6 +1376,190 @@ def check_ollama(
     return result
 
 
+def _dep_to_schema(r) -> dict:
+    """Map one ``DepCheckResult`` to the ``{name, status, message, action}`` schema.
+
+    The optional ``action`` carries a human-readable ``message`` (what is
+    wrong or what to do) and an exact shell ``command`` (``fix_cmd``).
+    When ``instructions`` merely repeats ``fix_cmd`` (the common pip/apt
+    one-liner case), the status ``message`` is used as the human part so
+    ``action.message`` is not a bare duplicate of ``action.command``.
+    ``status="skipped"`` passes through unchanged — it signals a missing
+    prerequisite, not a failure.
+    """
+    d: dict = {"name": r.name, "status": r.status, "message": r.message}
+    if r.fix_cmd or r.instructions:
+        human = r.instructions or r.message
+        if r.fix_cmd and human.strip() == r.fix_cmd.strip():
+            human = r.message
+        d["action"] = {"message": human, "command": r.fix_cmd}
+    return d
+
+
+def _llm_to_schema(result: dict) -> dict:
+    """Map ``check_ollama()`` output to the documented ``llm`` sub-schema.
+
+    ``check_ollama`` returns ``ollama_enabled``/``configured_model``/
+    ``configured_embed_model``/``embedding_installed`` — not the ``llm``
+    sub-schema.  This adapter maps those keys.  The disabled path returns
+    only a subset of keys, so every read uses ``.get(key, default)``.
+    """
+    llm: dict = {
+        "enabled": bool(result.get("ollama_enabled")),
+        "ollama_running": bool(result.get("ollama_running")),
+        "chat_model": result.get("configured_model"),
+        "embed_model": result.get("configured_embed_model"),
+    }
+    status = result.get("status")
+    action: dict | None = None
+    if status == "model_missing":
+        model = (
+            result.get("configured_embed_model")
+            if not result.get("embedding_installed")
+            else result.get("configured_model")
+        )
+        action = {"message": result.get("message", ""), "command": f"ollama pull {model}" if model else None}
+    elif status in ("not_configured", "disabled"):
+        action = {"message": result.get("message", ""), "command": "fw-context init"}
+    elif status in ("embedding_unavailable", "error"):
+        action = {"message": result.get("message", "")}
+    if action is not None:
+        llm["action"] = action
+    return llm
+
+
+def _cc_entry_count(cc: Path) -> int | None:
+    """Count entries in a compile_commands.json (None on parse error).
+
+    ``None`` signals "count unknown" to the LLM — a corrupt file must not
+    crash this read-only status tool.  ``0`` is reserved for an
+    empty-but-valid compile DB, so a parse failure is kept distinct.
+    """
+    import json
+
+    try:
+        return len(json.loads(cc.read_text(encoding="utf-8")))
+    except (json.JSONDecodeError, OSError):
+        return None
+
+
+def get_environment_status(
+    project_root: Annotated[
+        str | None,
+        Field(description="Project root. Auto-detected if omitted. Pass explicitly when the project is not the server cwd."),
+    ] = None,
+) -> dict:
+    """Return the complete project environment status in one call.
+
+    Read-only. Aggregates five domains into a single call so the LLM can
+    see everything at session start without extra round-trips:
+
+    - ``deps`` — dependency audit (``run_full_check``), each entry with an
+      optional ``action`` (``message`` + shell ``command``).  ``status="skipped"``
+      means a prerequisite is missing (e.g. ``libclang-so`` skipped because
+      ``libclang-python`` is absent) — not a failure.
+    - ``build_system`` — detected build system, ``None`` when unknown.
+    - ``compile_db`` — whether compile_commands.json exists and its entry count.
+      Reported as ``{"exists": false, ...}`` before init (no config to resolve
+      the path from, and loading one would create empty config files).
+    - ``index`` — the FULL ``get_active_build()`` result, unchanged (its action
+      lives in ``index_message``).
+    - ``llm`` — LLM backend status with an optional ``action``.
+
+    When the project is not initialized (``index.status == "not_initialized"``),
+    only the config-independent dependency subset runs (checks that do not need
+    a project config) — Ollama/model/db/build checks are skipped.
+
+    Args:
+        project_root: Project root directory. Auto-detected from CWD if omitted.
+
+    Returns:
+        dict: {init_status, deps, build_system, compile_db, index, llm}.
+    """
+    from ...deps import run_full_check
+
+    root = resolve_project_root(project_root)
+
+    index = get_active_build(project_root=str(root))
+    init_status = "initialized" if index.get("status") != "not_initialized" else "not_initialized"
+
+    if index.get("status") == "not_initialized":
+        # libclang-so is project-config-independent (only needs libclang-python),
+        # so it belongs in the pre-init subset — the "missing libclang .so →
+        # apt install libclang-18-dev" signal must work before the first init.
+        pip_subset = {"pysqlite3", "sqlite-vec", "libclang-python", "libclang-so", "watchfiles", "tomli-w"}
+        dep_results = run_full_check(project_root=str(root), subset=pip_subset)
+        # No [index] compile_commands path exists pre-init, and load_config()
+        # would create empty .fw-context/config.toml + local.toml.  Skip it so
+        # this read-only tool has no file-creation side effect before init.
+        compile_db: dict = {"exists": False, "path": None, "entry_count": None}
+    else:
+        dep_results = run_full_check(project_root=str(root))
+        cfg = load_config(root)
+        cc = cfg.index.compile_commands
+        if not cc.is_absolute():
+            cc = (root / cc).resolve()
+        compile_db = {"exists": cc.exists(), "path": str(cc) if cc.exists() else None, "entry_count": None}
+        if cc.exists():
+            compile_db["entry_count"] = _cc_entry_count(cc)
+    deps = [_dep_to_schema(r) for r in dep_results]
+
+    build_system_raw = _detect_build_system(root)
+    build_system = None if build_system_raw == "unknown" else build_system_raw
+
+    if index.get("status") == "not_initialized":
+        # No config exists yet — probe the LLM backend from defaults so this
+        # read-only tool does NOT create .fw-context config files.  check_ollama
+        # routes through load() (via _resolve_context), which has that
+        # file-creation side effect.  Resolve the embed model first so the
+        # report mirrors the initialized path (concrete embed_model, no pull).
+        from ...config.settings import LLMConfig
+        from ...llm.auto_model import resolve_embed_model
+
+        default_cfg = LLMConfig()
+        resolve_embed_model(default_cfg, skip_pull=True)
+        llm_result = check_setup(default_cfg)
+        llm_result["ollama_enabled"] = True
+        llm = _llm_to_schema(llm_result)
+    else:
+        llm = _llm_to_schema(check_ollama(project_root=str(root)))
+
+    return {
+        "init_status": init_status,
+        "deps": deps,
+        "build_system": build_system,
+        "compile_db": compile_db,
+        "index": index,
+        "llm": llm,
+    }
+
+
+def check_dependencies(
+    project_root: Annotated[
+        str | None,
+        Field(description="Project root. Auto-detected if omitted. Pass explicitly when the project is not the server cwd."),
+    ] = None,
+) -> list[dict]:
+    """Run the full dependency audit. Read-only. Returns structured results.
+
+    Returns the raw per-check dicts (``name``, ``status``, ``message``,
+    ``fix_cmd``, ``instructions``, ``critical``) — NOT the formatted
+    ``doctor`` table.  Read ``status``/``fix_cmd``/``instructions`` per
+    issue; ``status="skipped"`` means a prerequisite is missing.
+
+    Args:
+        project_root: Project root directory. Auto-detected from CWD if omitted.
+
+    Returns:
+        list[dict]: one dict per check, ``DepCheckResult`` fields via ``asdict``.
+    """
+    from dataclasses import asdict
+
+    from ...deps import run_full_check
+
+    return [asdict(r) for r in run_full_check(project_root=project_root)]
+
+
 def get_project_info(
     project_id: Annotated[str, Field(description="Project ID (UUID4 hex) to look up.")] = "",
 ) -> dict:
@@ -1481,9 +1666,9 @@ def configure_llm(
         format, model), model (str), auto_pull (bool), stream (bool),
         test_latency_s (float, on success), test_response (str, on success),
         compliance_warning (str, when chat_api_base is external),
-        message (str, on error)}
+        message (str)}
     """
-    from ...config.settings import ProjectNotInitializedError, _is_loopback_url, _update_local_toml
+    from ...config.settings import ProjectNotInitializedError
 
     try:
         _, cfg, _, root = _resolve_context(project_root, skip_ready_check=True)
@@ -1524,76 +1709,9 @@ def configure_llm(
             "message": "No configuration changes to write — all parameters are None or default.",
         }
 
-    # Compliance warning for external URLs.
-    # The _is_loopback_url check catches localhost, 127.0.0.1, and ::1
-    # but NOT internal-network IPs (e.g. 192.168.x.x).  Only loopback
-    # is considered "safe" — everything else gets the warning.
-    result: dict = {}
-    if chat_api_base and not _is_loopback_url(chat_api_base):
-        result["compliance_warning"] = (
-            f"Chat API set to external host ({chat_api_base}). "
-            "Source code snippets in chat prompts WILL be sent to this "
-            "endpoint. Ensure compliance with your organization's data "
-            "security policies. Consider using local Ollama or an internal "
-            "API proxy."
-        )
+    # Delegate to the shared write+test implementation (llm/configure.py).
+    # It writes only local.toml — never global or committed config —
+    # reloads the config, and tests the endpoint.
+    from ...llm.configure import configure_llm_core
 
-    # Write to local.toml — only local.toml, never global or shared config.
-    # This is the critical security boundary: configure_llm does not touch
-    # .fw-context/config.toml (shared, committed) or ~/.fw-context/config.toml
-    # (global, machine-wide).  local.toml is gitignored and per-developer.
-    try:
-        _update_local_toml(Path(root), updates)
-    except Exception as e:
-        return {
-            "status": "error",
-            "message": f"Failed to write local.toml: {e}",
-        }
-
-    # Reload config — the cache is mtime-based so the file change
-    # triggers a fresh parse.  This ensures the response reflects the
-    # newly written settings.
-    new_cfg = load_config(project_root=Path(root))
-    result["chat_api"] = {
-        "configured": bool(new_cfg.llm.chat_api_base),
-        "endpoint": new_cfg.llm.chat_api_base,
-        "model": new_cfg.llm.model,
-    }
-    result["model"] = new_cfg.llm.model
-    result["auto_pull"] = new_cfg.llm.auto_pull
-    result["stream"] = new_cfg.llm.stream
-
-    # Test the configuration with a simple API call.
-    # When LLM is disabled, skip the test — there is no endpoint to call.
-    if not new_cfg.llm.enabled:
-        result["status"] = "ok"
-        result["message"] = "Configuration written. LLM is disabled — no test call made."
-        return result
-
-    try:
-        from ...llm.ollama import call_ollama
-
-        t0 = time.monotonic()
-        # Use a short timeout and minimal token budget for the test call.
-        # The prompt is deliberately trivial ("Reply with exactly: OK")
-        # so even a slow model responds quickly.
-        test_cfg = dataclasses.replace(new_cfg.llm, timeout=30.0)
-        response = call_ollama(
-            "Reply with exactly: OK",
-            test_cfg,
-            temperature=0.0,
-            num_predict=10,
-        )
-        latency = round(time.monotonic() - t0, 2)
-        result["status"] = "ok"
-        result["test_latency_s"] = latency
-        result["test_response"] = response[:100]
-        result["message"] = f"Configuration written and tested successfully ({latency}s)."
-    except OllamaError as e:
-        # Configuration was written but the test call failed.
-        # The LLM should inspect the error and guide the user to fix
-        # the URL, key, or model name.
-        result["status"] = "error"
-        result["message"] = f"Configuration written but test call failed: {e}. Check the API URL, key, and model name."
-
-    return result
+    return configure_llm_core(Path(root), updates, chat_api_base=chat_api_base)

@@ -585,28 +585,33 @@ def _init_one_tool(
 
 
 def cmd_init(args: argparse.Namespace) -> int:
-    """Register fw-context with AI assistants and inject usage instructions.
+    """Register fw-context with AI assistants and provision the project.
+
+    One command that checks and auto-fixes dependencies, detects (or asks
+    for) the build system, generates ``compile_commands.json`` when
+    feasible, registers AI tools, and prints the remaining-steps checklist.
 
     Per-tool injection with inheritance awareness, collision detection,
-    dry-run preview, and ``--list-tools`` discovery.
+    dry-run preview, and ``--list-tools`` discovery.  Idempotent — safe to
+    re-run; configured sections are shown with a ``Change? [y/N]`` prompt
+    (default N) and already-built artifacts are reused.
 
-    Registers the ``fw-context-mcp`` MCP server with each detected tool's CLI
-    and writes fw-context usage instructions into the tool's configuration files
-    (CLAUDE.md, AGENTS.md, etc.). Respects tool inheritance — e.g. tools based
-    on Claude Code read the parent's instructions automatically.
-
-    Writes ``.fw-context/config.toml`` and ``.fw-context/local.toml`` in the
-    project root when using project-scoped injection.
+    ``--quick`` (and the ``quickstart`` alias) skips only AI-tool
+    registration — project ID, config, deps, build, and checklist still run.
     """
     from ..config import load as load_project_config
-    from ..config.settings import _ensure_project_config, _ensure_project_local_config, _write_project_id
+    from ..config.settings import _update_local_toml, _write_project_id
     from ..config.settings import generate_project_id as _gen_pid
     from ..config.tools import TOOLS
-    from ..indexer.build import detect_build_system
     from ..utils import resolve_project_root
     from ._mcp import _resolve_mcp_bin
 
-    if args.list_tools:
+    quick = getattr(args, "quick", False)
+    non_interactive = getattr(args, "non_interactive", False) or not sys.stdin.isatty()
+    skip_doctor = getattr(args, "skip_doctor", False)
+    skip_build = getattr(args, "skip_build", False)
+
+    if getattr(args, "list_tools", False) and not quick:
         print("Supported AI assistants:\n")
         for tool in TOOLS.values():
             print(f"  {tool.status()}")
@@ -616,72 +621,81 @@ def cmd_init(args: argparse.Namespace) -> int:
     mcp_bin = _resolve_mcp_bin()
     project_root = resolve_project_root(args.project)
 
-    # ── Project ID + global registry ──
+    # ── 1. Dependency audit + auto-fix (MUST precede any config write) ──
+    # Project-ID generation writes config via tomli-w (set_key) — on a clean
+    # venv without tomli-w this must run AFTER the deps phase installs it.
+    before_results, after_results = [], []
+    if skip_doctor and not args.dry_run:
+        # --skip-doctor bypasses the deps auto-fix, but config writes still
+        # need tomli-w — verify it before the first set_key (project ID).
+        # --dry-run writes nothing, so the check is skipped there.
+        from ..deps._checks import _require_tomli_w
+
+        if not _require_tomli_w():
+            print("[error] tomli-w is missing and --skip-doctor was given.", file=sys.stderr)
+            print("  Install it with:  pip install tomli-w", file=sys.stderr)
+            print("  (tomli-w is required to write config during init.)", file=sys.stderr)
+            return 1
+    elif not skip_doctor:
+        from ._init_deps import _run_deps_auto_fix
+
+        try:
+            before_results, after_results = _run_deps_auto_fix(project_root, dry_run=args.dry_run)
+        except Exception as exc:  # a fatal deps error aborts provisioning
+            print(f"[error] dependency audit/auto-fix failed: {exc}", file=sys.stderr)
+            return 1
+
+    # ── 2. Build system (config-first) + interactive fallback ──
     _proj_cfg = load_project_config(project_root=project_root)
+    from ._init_interactive import resolve_build_env, resolve_build_params, resolve_build_system
+
+    build_system = resolve_build_system(
+        project_root, _proj_cfg, non_interactive=non_interactive, dry_run=args.dry_run,
+    )
+    resolve_build_params(
+        project_root, _proj_cfg, build_system, non_interactive=non_interactive, dry_run=args.dry_run,
+    )
+
+    # ── 3. Project ID + global registry (after deps) ──
+    provisioned = False
     if not _proj_cfg.project.id:
-        new_id = _gen_pid()
-        _write_project_id(project_root, new_id)
-        print(f"Project ID: {new_id}")
-        proj_id = new_id
+        if args.dry_run:
+            print("  [dry-run] would generate a project ID")
+        else:
+            new_id = _gen_pid()
+            _write_project_id(project_root, new_id)
+            print(f"Project ID: {new_id}")
+            _proj_cfg = load_project_config(project_root=project_root)
     else:
         print(f"Project ID: {_proj_cfg.project.id} (existing)")
-        proj_id = _proj_cfg.project.id
 
-    from ..config.global_db import open_global_db, upsert_project_registry
+    proj_id = _proj_cfg.project.id
+    if proj_id:
+        provisioned = True
+        if not args.dry_run:
+            from ..config.global_db import open_global_db, upsert_project_registry
 
-    proj_name = getattr(args, "name", None) or _proj_cfg.project.name or project_root.name
-    glob_conn = open_global_db()
-    upsert_project_registry(glob_conn, proj_id, proj_name, "unknown", str(project_root))
-
-    # ── Tool selection ──
-    selected = _select_init_tools(args, project_root)
-    if selected is None:
-        return 1
-
-    # ── Per-tool initialization ──
-    ok = False
-    all_warnings: list[str] = []
-    for tool_id in selected:
-        tool_ok, w = _init_one_tool(tool_id, args, project_root, mcp_bin, selected)
-        ok = ok or tool_ok
-        all_warnings.extend(w)
-
-    # ── Project-level config and assets (skills, agents) ──
-    _build_system = detect_build_system(project_root)
-
-    # ── Auto-detect build environment ──
-    _detected_env: dict[str, str | None] = {"python": None, "activate": None}
-    if _build_system and not args.dry_run:
-        from ..indexer.builders import registry as _bregistry
-        builder_cls = _bregistry.get(_build_system)
-        if builder_cls and hasattr(builder_cls, "detect_environment"):
+            proj_name = getattr(args, "name", None) or _proj_cfg.project.name or project_root.name
             try:
-                _detected_env = builder_cls.detect_environment(project_root)
-            except Exception:
-                _detected_env = {"python": None, "activate": None}
-            if python_path := _detected_env.get("python"):
-                _write_build_key(project_root, "python", python_path)
-                print(f"  [ok] Build Python: {python_path}")
-            if activate_path := _detected_env.get("activate"):
-                _write_build_key(project_root, "activate", activate_path)
-                print(f"  [ok] Build activate: {activate_path}")
+                glob_conn = open_global_db()
+                upsert_project_registry(
+                    glob_conn, proj_id, proj_name, build_system or "unknown", str(project_root)
+                )
+                glob_conn.close()
+            except Exception as exc:  # registry is best-effort — never fatal
+                print(f"  [warn] could not update global registry: {exc}")
 
-            if not _detected_env.get("python") and not _detected_env.get("activate"):
-                try:
-                    builder = builder_cls()
-                    required = builder.required_tools()
-                except Exception:
-                    required = []
-                missing = [t for t in required if not shutil.which(t)]
-                if missing:
-                    print(f"  [warn] Missing tools for {_build_system}: {', '.join(missing)}")
-                    if hasattr(builder_cls, "environment_help"):
-                        help_text = builder_cls.environment_help()
-                        if help_text:
-                            for line in help_text.splitlines():
-                                print(f"  [info] {line}")
+    # Reload config so board/fqbn/... written above are visible to the build.
+    if build_system or _proj_cfg.build.system:
+        _proj_cfg = load_project_config(project_root=project_root)
 
-    if not args.dry_run and not args.instructions_only:
+    # ── 4. Build environment auto-detect (config-first, machine-specific) ──
+    resolve_build_env(
+        project_root, _proj_cfg, build_system, non_interactive=non_interactive, dry_run=args.dry_run,
+    )
+
+    # ── 5. Config templates (NOT gated by ok / instructions_only) ──
+    if not args.dry_run:
         from ..config.settings import (
             _PROJECT_DEFAULTS_TEMPLATE,
             _PROJECT_LOCAL_DEFAULTS_TEMPLATE,
@@ -691,53 +705,102 @@ def cmd_init(args: argparse.Namespace) -> int:
         _check_config_file(project_root, ".fw-context/config.toml", _PROJECT_DEFAULTS_TEMPLATE, fix=True)
         _check_config_file(project_root, ".fw-context/local.toml", _PROJECT_LOCAL_DEFAULTS_TEMPLATE, fix=True)
 
-    if ok and not args.dry_run:
-        if not args.instructions_only:
-            proj_config = _ensure_project_config(project_root)
-            local_config = _ensure_project_local_config(project_root)
-            print(
-                f"\n[ok] {proj_config}: shared project config ready — edit vendor_paths, project_paths, etc. (commit to git)"
-            )
-            print(f"[ok] {local_config}: local developer config ready — edit ollama_url, model, etc. (gitignore)")
-            if _proj_cfg.llm.enabled:
-                from ..llm.auto_model import resolve_embed_model
-                resolve_embed_model(_proj_cfg.llm)
-            _ensure_gitignore(project_root, fix=True, build_system=_build_system)
-        _install_skills(dry_run=False, project_root=project_root, scope=args.scope)
-        _install_agents(dry_run=False, project_root=project_root, scope=args.scope)
+    # ── 6. Auto-build compile_commands.json ──
+    build_ok, cc_path, cc_err = False, None, None
+    if args.dry_run:
+        print("  [dry-run] would generate compile_commands.json when feasible")
+    elif skip_build:
+        print("  [build] skipped (--skip-build)")
+    else:
+        from ._init_build import _auto_build_if_possible
 
-    # ── Diagnostic output ──
+        build_ok, cc_path, cc_err = _auto_build_if_possible(project_root, build_system, _proj_cfg)
+        if not build_ok:
+            print(f"  [build] compile_commands.json not generated: {cc_err}")
+
+    # ── 7. AI tool registration (unless quick) ──
+    ok = False
+    all_warnings: list[str] = []
+    tools_registered: list[str] = []
+    if not quick:
+        selected = _select_init_tools(args, project_root)
+        if selected is None:
+            return 1
+        for tool_id in selected:
+            tool_ok, w = _init_one_tool(tool_id, args, project_root, mcp_bin, selected)
+            if tool_ok:
+                tools_registered.append(tool_id)
+            ok = ok or tool_ok
+            all_warnings.extend(w)
+
+    # ── 8. gitignore + skills + agents (gitignore NOT ok-gated) ──
+    if not args.dry_run:
+        _ensure_gitignore(project_root, fix=True, build_system=build_system)
+        if not quick:
+            scope = getattr(args, "scope", "project")
+            _install_skills(dry_run=False, project_root=project_root, scope=scope)
+            _install_agents(dry_run=False, project_root=project_root, scope=scope)
+
+    # ── 9. LLM config (interactive; no-op in non-interactive mode) ──
+    if not args.dry_run:
+        from ._init_interactive import prompt_llm_config
+
+        prompt_llm_config(project_root, _proj_cfg, non_interactive=non_interactive)
+
+    # ── 10. Resolve embed model (skip_pull) + persist name ──
+    if not args.dry_run:
+        _proj_cfg = load_project_config(project_root=project_root)
+        from ..llm.auto_model import resolve_embed_model
+
+        resolve_embed_model(_proj_cfg.llm, skip_pull=True)
+        # Persist the resolved name so the next load() short-circuits and
+        # never auto-pulls without consent (init is the single writer).
+        if _proj_cfg.llm.enabled and _proj_cfg.llm.embed_model:
+            _update_local_toml(project_root, {"embed_model": _proj_cfg.llm.embed_model})
+
+    # ── 11. Diagnostic output ──
     if not args.dry_run:
         print()
-        if _build_system:
-            print(f"  Build system: {_build_system}")
-            if _detected_env.get("python"):
-                print(f"    python = \"{_detected_env['python']}\"")
-            if _detected_env.get("activate"):
-                print(f"    activate = \"{_detected_env['activate']}\"")
+        if build_system:
+            print(f"  Build system: {build_system}")
         else:
             print("  Build system: none detected — set [build] system in config.toml")
-
-        if _proj_cfg.llm.enabled:
-            print(f"  Embed model: {_proj_cfg.llm.embed_model}")
-        else:
-            print("  LLM: disabled — Ollama calls will return raw prompts")
 
     if all_warnings:
         print("\nWarnings:")
         for w in all_warnings:  # type: ignore[assignment]  # mypy false positive — w is str from list[str]
             print(f"  ⚠ {w}")
 
-    if ok:
-        if args.dry_run:
-            _install_skills(dry_run=True, project_root=project_root, scope=args.scope)
-            _install_agents(dry_run=True, project_root=project_root, scope=args.scope)
-            print("\nDry-run complete. Run without --dry-run to apply changes.")
-        else:
-            print("\nSetup complete. Restart your AI assistant to pick up changes.")
-    else:
-        print("\nNo changes made.", file=sys.stderr)
-    return 0 if ok else 1
+    # ── 12. Checklist ──
+    if not args.dry_run:
+        from ._init_deps import _index_exists, _model_status, _print_checklist
+
+        _print_checklist(
+            after_results,
+            _model_status(project_root),
+            build_ok=build_ok,
+            cc_path=cc_path,
+            build_system=build_system,
+            tools_registered=tools_registered,
+            index_exists=_index_exists(_proj_cfg),
+            build_skipped=skip_build,
+        )
+
+    # ── Return logic ──
+    if args.dry_run:
+        print("\nDry-run complete. Run without --dry-run to apply changes.")
+        return 0
+    if quick:
+        if not provisioned:
+            print("\nProvisioning incomplete — see errors above.", file=sys.stderr)
+            return 1
+        print("\nQuickstart complete. Project provisioned (AI tool registration skipped).")
+        return 0
+    if ok or provisioned:
+        print("\nSetup complete. Restart your AI assistant to pick up changes.")
+        return 0
+    print("\nNo changes made.", file=sys.stderr)
+    return 1
 
 
 def _check_config_file(project_root: Path, rel_path: str, template: str, fix: bool) -> None:

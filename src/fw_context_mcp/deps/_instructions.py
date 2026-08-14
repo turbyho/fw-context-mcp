@@ -127,36 +127,30 @@ def sqlite_ext_instructions(ctx: dict) -> str:
     return "Reinstall Python with --enable-loadable-sqlite-extensions, or install pysqlite3."
 
 
-def libclang_instructions(ctx: dict) -> str:
-    """How to install libclang."""
-    pkg = ctx.get("pkg_manager", "unknown")
-    if pkg == "apt":
-        return "apt install libclang-18-dev"
-    elif pkg == "dnf":
-        return "dnf install clang-devel"
-    elif pkg == "pacman":
-        return "pacman -S clang"
-    elif pkg == "brew":
-        return "brew install llvm@18"
-    return "Install libclang (system package) and clang Python bindings (pip install libclang)"
+def libclang_python_instructions(ctx: dict) -> str:
+    """How to install the clang Python bindings (libclang>=18.1.1)."""
+    pip = ctx.get("pip_cmd", "pip install")
+    return f"{pip} 'libclang>=18.1.1'"
 
 
 def libclang_so_instructions(ctx: dict) -> str:
-    """How to make libclang.so discoverable."""
-    system = ctx.get("system", sys.platform)
-    if system == "darwin":
-        return "brew install llvm && ln -sf $(brew --prefix llvm)/lib/libclang.dylib /usr/local/lib/"
-    if system == "win32":
-        return (
-            "Install LLVM from https://github.com/llvm/llvm-project/releases\n"
-            "or via scoop:  scoop install llvm\n"
-            "Ensure the LLVM bin directory is on PATH."
-        )
-    return (
-        "Create a symlink so clang.cindex can find the library:\n"
-        "  ln -sf /usr/lib/llvm-18/lib/libclang.so.1 /usr/lib/libclang.so\n"
-        "Or set LD_LIBRARY_PATH to the directory containing libclang.so"
-    )
+    """How to install the native libclang shared library.
+
+    The clang Python bindings (``pip install libclang``) ship without the
+    ``libclang.so``/``libclang.dylib`` shared object.  Parsing C/C++ needs
+    that native library, so it must be installed separately through the
+    system package manager — ``pip`` cannot install a shared library.
+    """
+    pkg = ctx.get("pkg_manager", "unknown")
+    if pkg == "apt":
+        return "apt install libclang-18-dev"
+    if pkg == "dnf":
+        return "dnf install clang-devel"
+    if pkg == "pacman":
+        return "pacman -S clang"
+    if pkg == "brew":
+        return "brew install llvm@18"
+    return "Install libclang (system package) and clang Python bindings (pip install libclang)"
 
 
 def ollama_instructions(ctx: dict) -> str:

@@ -792,6 +792,7 @@ _BUILD_FIELDS: list[tuple[str, str, str]] = [
     ("pre_build", "pre_build", "str"),
     ("activate", "activate", "str"),
     ("python", "python", "str"),
+    ("timeout", "timeout", "float(7200)"),
 ]
 
 _INDEX_FIELDS: list[tuple[str, str, str]] = [
@@ -831,7 +832,7 @@ _LLM_FIELDS: list[tuple[str, str, str]] = [
     ("stream", "stream", "bool"),
 ]
 
-_KNOWN_SECTIONS: set[str] = {"project", "build", "index", "llm", "cache_server"}
+_KNOWN_SECTIONS: set[str] = {"project", "build", "index", "llm", "cache_server", "call_graph"}
 
 
 def _ensure_config_file(path: Path, template: str, label: str) -> Path:
@@ -1153,7 +1154,12 @@ def _format_toml_value(key: str, value: object) -> str:
     return f"{key} = {val}\n"
 
 
-def _update_local_toml(project_root: Path, updates: dict[str, object]) -> None:
+def _update_local_toml(
+    project_root: Path,
+    updates: dict[str, object],
+    *,
+    clear_keys: list[str] | None = None,
+) -> None:
     """Update the ``[llm]`` section of ``<project>/.fw-context/local.toml``.
 
     Uses line-level editing to preserve comments and other sections.
@@ -1173,12 +1179,43 @@ def _update_local_toml(project_root: Path, updates: dict[str, object]) -> None:
         updates: Dict of ``{key: value}`` pairs to write.  ``None`` values
             are skipped (key is not written).  Supported value types:
             ``str``, ``bool``, ``int``, ``float``.
+        clear_keys: Keys to REMOVE from the ``[llm]`` section (both active
+            and commented-out forms).  Used when re-configuring away from a
+            value that must not merely be overwritten — e.g. switching from
+            a cloud API back to local Ollama must clear ``chat_api_base``/
+            ``chat_api_key`` so chat stops routing externally.
     """
     local_path = project_root / _PROJECT_CONFIG_DIR / _PROJECT_LOCAL_CONFIG_NAME
     if not local_path.exists():
         _ensure_project_local_config(project_root)
 
     lines = local_path.read_text(encoding="utf-8").splitlines(keepends=True)
+
+    to_write = {k: v for k, v in updates.items() if v is not None}
+    to_clear = set(clear_keys or ())
+    if not to_write and not to_clear:
+        return
+
+    # Remove requested keys from the [llm] section before writing, so a
+    # cleared key cannot reappear from an earlier config.  Only lines inside
+    # [llm] are considered — other sections are never touched.
+    if to_clear:
+        in_llm = False
+        kept: list[str] = []
+        for line in lines:
+            s = line.strip()
+            if s == "[llm]":
+                in_llm = True
+                kept.append(line)
+                continue
+            if in_llm and s.startswith("["):
+                in_llm = False
+                kept.append(line)
+                continue
+            if in_llm and any(re.match(rf"^#?\s*{re.escape(k)}\s*=", s) for k in to_clear):
+                continue
+            kept.append(line)
+        lines = kept
 
     # Find [llm] section boundaries — we need to insert/replace keys
     # within this section while leaving other sections untouched.
@@ -1196,12 +1233,7 @@ def _update_local_toml(project_root: Path, updates: dict[str, object]) -> None:
             llm_end = i  # Next section starts — stop here
             break
 
-    # Filter out None values
-    to_write = {k: v for k, v in updates.items() if v is not None}
-    if not to_write:
-        return
-
-    if llm_start == -1:
+    if llm_start == -1 and to_write:
         # No [llm] section — append one at the end of the file
         if lines and not lines[-1].endswith("\n"):
             lines[-1] += "\n"
