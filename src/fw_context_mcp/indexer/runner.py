@@ -423,6 +423,14 @@ def run(
             skip_files=skip_files,
         )
 
+        # Snapshot the skip set BEFORE folding in this TU's own files.
+        # Content fill must skip only headers already processed by EARLIER
+        # TUs.  This TU's headers are filled now — their active lines come
+        # from the AST walk, because get_tokens() returns tokens only for
+        # the main file.  A post-update skip set would skip this TU's
+        # headers entirely and leave files.content empty.
+        skip_before = frozenset(skip_files) if skip_files else None
+
         if parsed_data is not None and hasattr(parsed_data, 'newly_seen_files'):
             skip_files.update(parsed_data.newly_seen_files)
 
@@ -430,7 +438,7 @@ def run(
             result = _handle_unchanged_or_reuse(
                 unit, check_status, hashes, conn, config_hash, project_root,
                 build_dir_patterns, db_path, existing_files, processed, len(units),
-                skip_files=frozenset(skip_files) if skip_files else None,
+                skip_files=skip_before,
             )
             total_syms += result["total_syms"]
             if result["is_reuse"] and result["total_syms"] > 0:
@@ -469,7 +477,7 @@ def run(
                 parse_timing=parse_timing,
                 hashes=hashes,
                 build_dir_patterns=build_dir_patterns,
-                skip_files=frozenset(skip_files) if skip_files else None,
+                skip_files=skip_before,
             )
             if status == "updated":
                 updated += 1
