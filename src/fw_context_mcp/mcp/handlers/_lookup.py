@@ -26,7 +26,6 @@ from pydantic import Field
 from fw_context_mcp.indexer.db import lookup_macro
 from fw_context_mcp.mcp.handlers._search_fallbacks import _symbol_row_to_dict
 from fw_context_mcp.mcp.shared.context import _db_path
-from fw_context_mcp.mcp.shared.stale import _with_stale_recovery
 from fw_context_mcp.utils import abs_path, resolve_project_root
 
 LOOKUP_EXACT_SQL = """SELECT s.* FROM symbols s
@@ -47,6 +46,8 @@ def lookup_symbol(
     project_root: Annotated[str | None, Field(description="Project root directory. Auto-detected from CWD if omitted.")] = None,
     exact: Annotated[bool, Field(description="True = exact name match, False = prefix LIKE match (default).")] = False,
     limit: Annotated[int, Field(description="Maximum results returned (capped at 100, default 50).")] = 50,
+    variant: Annotated[str | None, Field(description="Build variant name (multi-project). Omit to use default_variant or fail-closed. Use '*' for all variants.")] = None,
+    image: Annotated[str | None, Field(description="Sysbuild image name within the variant (multi-project). Omit for all images of the variant.")] = None,
 ) -> list[dict]:
     """Look up a C/C++ symbol by name via libclang index — exact or prefix
     matching. Finds symbols text-based search can miss: build-conditional
@@ -191,7 +192,9 @@ LOOKUP_PREFIX_SQL,
                 result.append({"_did_you_mean": _suggestions})
             return result
 
-        return _with_stale_recovery(root, db_path, _do_lookup)
+        from ..shared.variants import run_scoped_query
+
+        return run_scoped_query(root, db_path, _do_lookup, variant or "", image or "")
     except (sqlite3.Error, OSError, RuntimeError) as e:
         log.exception("lookup_symbol failed: %s", e)
         return [{"error": f"lookup_symbol failed: {e}"}]

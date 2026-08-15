@@ -146,6 +146,8 @@ def get_inheritance_chain(
     project_root: Annotated[str | None, Field(description="Project root. Auto-detected if omitted.")] = None,
     transitive: Annotated[bool, Field(description="When True, walk the full inheritance tree both up (ancestors) and down (descendants). Default: False (direct bases and derived only).")] = False,
     max_depth: Annotated[int, Field(description="Maximum BFS depth for transitive walk (default 10).", ge=1, le=50)] = 10,
+    variant: Annotated[str | None, Field(description="Build variant name (multi-project). Omit to use default_variant or fail-closed. Use '*' for all variants.")] = None,
+    image: Annotated[str | None, Field(description="Sysbuild image name within the variant (multi-project). Omit for all images of the variant.")] = None,
 ) -> dict:
     """Return the C++ inheritance chain for a class or struct —
     libclang-aware hierarchy. Resolves base/derived class relationships
@@ -184,7 +186,7 @@ def get_inheritance_chain(
         }
     """
     try:
-        db = BaseHandler.resolve_db_context(project_root)
+        db = BaseHandler.resolve_db_context(project_root, variant=variant, image=image)
     except RuntimeError as e:
         return {"error": str(e)}
     root = db.root
@@ -271,12 +273,14 @@ def get_inheritance_chain(
 
         return result
 
-    return db.executor.execute_sync(_query, db.config_hash)
+    return db.execute_scoped(_query)
 
 # ── moved from server.py ──
 def get_class_members(
     class_name: Annotated[str, Field(description="Class or struct name. E.g. 'ModemManager' or 'zbox::ZMODEM'.")],
     project_root: Annotated[str | None, Field(description="Project root. Auto-detected if omitted.")] = None,
+    variant: Annotated[str | None, Field(description="Build variant name (multi-project). Omit to use default_variant or fail-closed. Use '*' for all variants.")] = None,
+    image: Annotated[str | None, Field(description="Sysbuild image name within the variant (multi-project). Omit for all images of the variant.")] = None,
 ) -> dict:
     """Return all methods, fields, and nested types of a C/C++ class/struct —
     libclang-powered member table. Groups members by kind (method,
@@ -303,7 +307,7 @@ def get_class_members(
         line}]}, member_count}
     """
     try:
-        db = BaseHandler.resolve_db_context(project_root)
+        db = BaseHandler.resolve_db_context(project_root, variant=variant, image=image)
     except RuntimeError as e:
         return {"error": str(e)}
     root = db.root
@@ -348,13 +352,15 @@ def get_class_members(
 
         return result
 
-    return db.executor.execute_sync(_query, db.config_hash)
+    return db.execute_scoped(_query)
 
 # ── moved from server.py ──
 def get_template_instances(
     template_name: Annotated[str, Field(description="Template name to find instantiations for. E.g. 'Callback' or 'mbed::Callback'.")],
     project_root: Annotated[str | None, Field(description="Project root. Auto-detected if omitted.")] = None,
     limit: Annotated[int, Field(description="Maximum results (default 50).")] = 50,
+    variant: Annotated[str | None, Field(description="Build variant name (multi-project). Omit to use default_variant or fail-closed. Use '*' for all variants.")] = None,
+    image: Annotated[str | None, Field(description="Sysbuild image name within the variant (multi-project). Omit for all images of the variant.")] = None,
 ) -> list[dict]:
     """Find all template instantiations for a C/C++ class or function
     template — libclang template-aware lookup. Finds concrete
@@ -395,7 +401,7 @@ def get_template_instances(
     """
     limit = max(0, min(limit, 200))  # clamp
     try:
-        db = BaseHandler.resolve_db_context(project_root)
+        db = BaseHandler.resolve_db_context(project_root, variant=variant, image=image)
     except RuntimeError as e:
         return [{"error": str(e)}]
     root = db.root
@@ -440,12 +446,14 @@ def get_template_instances(
         ]
         return result
 
-    return db.executor.execute_sync(_query, db.config_hash)
+    return db.execute_scoped(_query)
 
 # ── moved from server.py ──
 def get_method_overrides(
     method_name: Annotated[str, Field(description="Method name to get override information for. Use qualified name for disambiguation, e.g. 'UART_DRIVER::write'.")],
     project_root: Annotated[str | None, Field(description="Project root. Auto-detected if omitted.")] = None,
+    variant: Annotated[str | None, Field(description="Build variant name (multi-project). Omit to use default_variant or fail-closed. Use '*' for all variants.")] = None,
+    image: Annotated[str | None, Field(description="Sysbuild image name within the variant (multi-project). Omit for all images of the variant.")] = None,
 ) -> dict:
     """Return C++ virtual method override information — libclang-powered
     vtable analysis. Resolves virtual dispatch across class hierarchies:
@@ -477,7 +485,7 @@ def get_method_overrides(
         }
     """
     try:
-        db = BaseHandler.resolve_db_context(project_root)
+        db = BaseHandler.resolve_db_context(project_root, variant=variant, image=image)
     except RuntimeError as e:
         return {"error": str(e)}
     root = db.root
@@ -527,5 +535,5 @@ def get_method_overrides(
         ]
         return result
 
-    return db.executor.execute_sync(_query, db.config_hash)
+    return db.execute_scoped(_query)
 

@@ -204,6 +204,34 @@ def main() -> None:
         default=False,
         help="Background reindex mode — skip build, validation, and dep-tracking fixes (safe for automated runs)",
     )
+    p_index.add_argument(
+        "--variant",
+        metavar="NAME",
+        help="Restrict to one build variant (name from [[build.variants]])",
+    )
+    p_index.add_argument(
+        "--variants",
+        metavar="A,B",
+        help="Comma-separated list of build variants to index",
+    )
+    p_index.add_argument(
+        "--image",
+        metavar="NAME",
+        help="Restrict indexing to one sysbuild image (build-scope stays full)",
+    )
+    p_index.add_argument(
+        "--exclude-image",
+        metavar="NAME",
+        action="append",
+        default=[],
+        help="Exclude a sysbuild image from indexing (repeatable)",
+    )
+    p_index.add_argument(
+        "--no-index",
+        action="store_true",
+        dest="no_index",
+        help="With --build: build only, skip indexing",
+    )
     p_index.set_defaults(func=cmd_index)
 
     from ._search import cmd_list, cmd_search, cmd_status  # noqa: I001
@@ -246,6 +274,32 @@ def main() -> None:
         func=cmd_init, tool=None, dry_run=False, force=False, instructions_only=False, list_tools=False,
         quick=False, skip_doctor=False, skip_build=False, non_interactive=False,
     )
+
+    # ── init-variants — manage [[build.variants]] for an initialized project ──
+    from ._init_variants import cmd_init_variants  # noqa: I001
+    p_iv = sub.add_parser("init-variants", help="Manage [[build.variants]] (add/remove/list build variants)")
+    p_iv_sub = p_iv.add_subparsers(dest="variants_command")
+
+    p_iv_list = p_iv_sub.add_parser("list", help="List declared [[build.variants]]")
+    p_iv_list.add_argument("--project", metavar="DIR", help="Project root (default: cwd)")
+    p_iv_list.set_defaults(func=cmd_init_variants)
+
+    p_iv_add = p_iv_sub.add_parser("add", help="Add a build variant to config.toml")
+    p_iv_add.add_argument("--name", metavar="NAME", help="Variant name (unique key)")
+    p_iv_add.add_argument("--board", metavar="BOARD", help="Board/target/chip qualifier")
+    p_iv_add.add_argument("--description", metavar="TEXT", help="Human-readable description")
+    p_iv_add.add_argument("--build-dir", metavar="DIR", help="Per-variant build output dir")
+    p_iv_add.add_argument("--env", metavar="K=V", action="append", default=None,
+                          help="Build env var (repeatable)")
+    p_iv_add.add_argument("--project", metavar="DIR", help="Project root (default: cwd)")
+    p_iv_add.set_defaults(func=cmd_init_variants)
+
+    p_iv_remove = p_iv_sub.add_parser("remove", help="Remove a build variant from config.toml")
+    p_iv_remove.add_argument("name", help="Variant name to remove")
+    p_iv_remove.add_argument("--project", metavar="DIR", help="Project root (default: cwd)")
+    p_iv_remove.set_defaults(func=cmd_init_variants)
+
+    p_iv.set_defaults(func=cmd_init_variants)
 
     # quickstart — alias for `init --quick` (skip only AI tool registration).
     p_qs = sub.add_parser(

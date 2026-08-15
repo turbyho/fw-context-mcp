@@ -94,6 +94,7 @@ def _print_checklist(
     tools_registered: list[str],
     index_exists: bool,
     build_skipped: bool = False,
+    multi_variant: bool = False,
 ) -> None:
     """Print the remaining-steps checklist, grouped by category.
 
@@ -130,7 +131,11 @@ def _print_checklist(
             remaining.append(("[model]", r.fix_cmd or f"ollama pull <{label}>"))
 
     if not build_ok:
-        if build_skipped:
+        if multi_variant:
+            remaining.append(
+                ("[build]", "compile_commands.json — multi-variant project: run 'fw-context index --build'")
+            )
+        elif build_skipped:
             remaining.append(
                 ("[build]", "compile_commands.json — re-run init without --skip-build (or fw-context index --build)")
             )

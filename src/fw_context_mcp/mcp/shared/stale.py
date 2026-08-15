@@ -128,7 +128,7 @@ def _stale_files(conn, config_hash: str, file_paths: list[str], root: Path) -> l
     from ...indexer.ops import _normalize_file_path
 
     db_path = Path(conn.execute("PRAGMA database_list").fetchone()["file"])
-    manifest = load_manifest(db_path.parent)
+    manifest = load_manifest(db_path.parent, config_hash)
     build_patterns = manifest.get("build_dir_patterns", []) if manifest else []
 
     # Build work items: batch-fetch stored mtimes in one query (was N+1).
@@ -260,7 +260,7 @@ def _count_modified_files(
     from ...indexer.manifest import load as load_manifest
 
     db_path = Path(conn.execute("PRAGMA database_list").fetchone()["file"])
-    manifest = load_manifest(db_path.parent)
+    manifest = load_manifest(db_path.parent, config_hash)
     build_patterns = manifest.get("build_dir_patterns", []) if manifest else []
 
     # NOTE: TOCTOU — file may change between DB read and stat() below.
@@ -357,6 +357,7 @@ def _with_stale_recovery(
     query_fn,
     *,
     stale_msg: str = "",
+    config_hash: str | None = None,
 ) -> list[dict]:
     """Execute *query_fn(conn, config_hash)* on the executor with stale-recovery.
 
@@ -387,15 +388,16 @@ def _with_stale_recovery(
     # that coexists with the executor's connection.
     # Fresh config_hash per request: a reindex with a changed build
     # config can never leave queries filtering by a stale hash.
-    conn = _quick_open_readonly(db_path)
-    try:
-        project_id = derive_project_id(root)
-        cfg = get_active_config(conn, project_id)
-        if not cfg:
-            return [{"error": "No build config indexed."}]
-        config_hash = cfg["config_hash"]
-    finally:
-        conn.close()
+    if config_hash is None:
+        conn = _quick_open_readonly(db_path)
+        try:
+            project_id = derive_project_id(root)
+            cfg = get_active_config(conn, project_id)
+            if not cfg:
+                return [{"error": "No build config indexed."}]
+            config_hash = cfg["config_hash"]
+        finally:
+            conn.close()
 
     executor = get_executor(db_path)
 

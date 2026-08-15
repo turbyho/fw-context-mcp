@@ -163,6 +163,8 @@ def run_build_command(
         merged_env.update(env)
 
     if build_cfg:
+        if build_cfg.env:
+            merged_env.update(build_cfg.env)
         if build_cfg.extra_path:
             merged_env["PATH"] = os.pathsep.join(build_cfg.extra_path) + os.pathsep + merged_env.get("PATH", "")
         if build_cfg.extra_env:
