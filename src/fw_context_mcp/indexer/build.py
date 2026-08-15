@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import logging
 import subprocess
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from pathlib import Path
 
 # Import builders package so the registry is populated with all registered
@@ -84,6 +84,17 @@ class BuildConfig:
     # Zephyr override (required, no safe auto-detection)
     board: str | None = None
 
+    # ── Zephyr sysbuild (multi-image) + multi-variant ──
+    source_dir: str | None = None  # sysbuild source app dir (e.g. "proj/app")
+    sysbuild: bool = False  # use `west build --sysbuild`
+    build_dir: str | None = None  # build output dir override (default "build")
+
+    # Multi-variant build configuration (opt-in).  When empty, every builder
+    # produces a single compile_commands.json (variant='' image='' board='').
+    default_variant: str | None = None  # name of default variant (fail-closed queries)
+    default_image: str | None = None  # name of default image within default_variant
+    variants: list[BuildVariant] = field(default_factory=list)
+
     # ESP-IDF (optional — auto-detected from environment)
     idf_path: str | None = None  # Path to ESP-IDF install (usually $IDF_PATH)
 
@@ -119,6 +130,12 @@ class BuildConfig:
     source_dirs: list[str] = field(default_factory=list)  # directories to scan for sources
     compiler: str = "gcc"  # compiler executable name
 
+    # ── Build environment (compile-affecting, stored in config.toml) ──
+    # env vars passed to the build command and folded into config_hash.  Must
+    # mirror exactly the build-affecting variables of the project — machine-
+    # specific values go in extra_env (local.toml) instead.
+    env: dict[str, str] = field(default_factory=dict)
+
     # ── Build environment (machine-specific, stored in local.toml) ──
     activate: str | None = None  # shell script sourced before build (Zephyr, ESP-IDF, etc.)
     python: str | None = None  # Python interpreter for pip-based CLI tools (mbed-cli, pio, etc.)
@@ -128,6 +145,122 @@ class BuildConfig:
     # ── Pre-build hooks ──
     pre_build: str | None = None  # shell command run before build/convert/generate
     timeout: float = 7200  # build timeout in seconds — long first builds (Zephyr, ESP-IDF) must not be killed at 10 min
+
+
+@dataclass(slots=True)
+class BuildImage:
+    """One sysbuild image — a sub-project of a multi-image build.
+
+    ``image`` and sub-project are 1:1 — an image IS a part of the project.
+    ``name`` is the mapping key (= basename of the per-image build dir);
+    ``dir`` is the SOURCE dir (may point outside project_root, e.g. an SDK
+    image ``mcuboot``), kept only for LLM orientation.  ``type`` is a display
+    hint for the LLM (``project`` vs ``sdk``) — it does NOT change is_project
+    classification nor exclude the image from indexing.
+    """
+
+    name: str
+    description: str = ""
+    dir: str = ""
+    type: str = "project"  # "project" | "sdk" — display hint only
+    board: str | None = None  # per-image board override (e.g. FLPR -> cpuflpr)
+
+
+@dataclass(slots=True)
+class BuildVariant:
+    """A named build configuration within a project.
+
+    One project may build N variants (different boards/envs/flags) × M images.
+    Each (variant, image) pair produces one compile_commands.json → one
+    config_hash.  ``board`` is the variant default board; individual images
+    may override it (FLPR asymmetry).  ``overrides`` holds arbitrary
+    ``[build]`` keys that override the shared top-level defaults per the
+    scalar-override / list-replace / dict-merge rules.
+    """
+
+    name: str
+    description: str = ""
+    board: str | None = None
+    build_dir: str | None = None
+    env: dict[str, str] = field(default_factory=dict)
+    images: list[BuildImage] = field(default_factory=list)
+    overrides: dict = field(default_factory=dict)
+
+
+# BuildConfig fields classified by per-variant merge semantics.
+#
+# WHY explicit lists: TOML variant tables may override any [build] key, but
+# the merge rule depends on the field type — scalars override, lists replace,
+# dicts merge per-key.  Classification lives here (not in settings.py) so the
+# merge is next to the dataclass that owns the fields.
+_SCALAR_FIELDS: frozenset[str] = frozenset({
+    "system", "clean", "command", "target", "toolchain", "profile",
+    "app_config", "board", "idf_path", "fqbn", "cmake_generator",
+    "keil_project", "keil_target", "keil_cmsis_path",
+    "iar_project", "iar_target", "makefile", "make_target",
+    "make_dry_run", "toolchain_path", "toolchain_prefix", "compiler",
+    "activate", "python", "pre_build", "timeout",
+    "source_dir", "sysbuild", "build_dir",
+})
+_LIST_FIELDS: frozenset[str] = frozenset({
+    "extra_profiles", "defines", "include_dirs", "system_include_dirs",
+    "extra_flags", "source_dirs", "extra_path",
+})
+_DICT_FIELDS: frozenset[str] = frozenset({
+    "env", "make_vars", "extra_env",
+})
+
+
+def build_variant_config(base: BuildConfig, variant: BuildVariant) -> BuildConfig:
+    """Construct the effective per-variant ``BuildConfig``.
+
+    WHY this function: a variant is a partial ``[build]`` override, not a full
+    config.  The effective config is the top-level ``[build]`` with the
+    variant's values applied according to the merge table — scalars override,
+    lists replace (authoritative), dicts merge per-key.  This gives the user
+    full control, including REMOVING a shared list item (a list replace, not
+    an append, allows dropping an entry from ``[build]``).
+
+    ``env`` from the variant is merged per-key over the shared ``[build] env``
+    — build env vars are the dict case, never replaced wholesale.
+
+    The result is a fresh ``BuildConfig`` (shallow copy of *base*) so the
+    shared top-level config is never mutated across variants.
+    """
+    cfg = BuildConfig()
+    for f in fields(BuildConfig):
+        if not f.init:
+            continue
+        val = getattr(base, f.name)
+        if f.name in _LIST_FIELDS:
+            val = list(val)
+        elif f.name in _DICT_FIELDS:
+            val = dict(val)
+        setattr(cfg, f.name, val)
+
+    # Explicit variant fields (board/build_dir) are scalar overrides; env is
+    # a dict merge.  images/default_* are not part of the effective build.
+    if variant.board is not None:
+        cfg.board = variant.board
+    if variant.build_dir is not None:
+        cfg.build_dir = variant.build_dir
+    if variant.env:
+        merged_env = dict(base.env)
+        merged_env.update(variant.env)
+        cfg.env = merged_env
+
+    # Arbitrary [build] overrides, classified by field type.
+    for attr, value in variant.overrides.items():
+        if attr in _SCALAR_FIELDS:
+            setattr(cfg, attr, value)
+        elif attr in _LIST_FIELDS:
+            setattr(cfg, attr, list(value))
+        elif attr in _DICT_FIELDS:
+            merged = dict(getattr(base, attr))
+            merged.update(value)
+            setattr(cfg, attr, merged)
+
+    return cfg
 
 
 # ---------------------------------------------------------------------------

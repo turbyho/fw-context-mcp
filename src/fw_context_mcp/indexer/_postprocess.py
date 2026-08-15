@@ -718,10 +718,11 @@ def _step_update_manifest(conn: sqlite3.Connection, ctx: dict) -> None:
         db_dir=ctx["db_dir"],
         compile_commands=ctx["compile_commands"],
         updated_count=ctx["updated"],
-        tu_headers=ctx["tu_headers"] if ctx["tu_headers"] else None,
-        build_dir_patterns=ctx["build_dir_patterns"],
-        config_hash=config_hash,
-    )
+         tu_headers=ctx["tu_headers"] if ctx["tu_headers"] else None,
+         build_dir_patterns=ctx["build_dir_patterns"],
+         config_hash=config_hash,
+         scope=ctx.get("scope"),
+     )
     if updated_manifest is not None:
         _refresh_header_mtimes_from_manifest(conn, config_hash, ctx["project_root"], updated_manifest)
 
@@ -1022,7 +1023,9 @@ def _step_finalize_manifest(conn: sqlite3.Connection, ctx: dict) -> None:
     - ``"none"`` — no manifest.json was written (e.g. build system
       detection failed); the index cannot support incremental updates.
     """
-    manifest_path = ctx["db_dir"] / "manifest.json"
+    from .manifest import _manifest_path
+
+    manifest_path = _manifest_path(ctx["db_dir"], ctx["config_hash"])
     manifest_verification: str
     if manifest_path.exists():
         failed = ctx.get("failed_critical", set())
@@ -1036,49 +1039,101 @@ def _step_finalize_manifest(conn: sqlite3.Connection, ctx: dict) -> None:
             description=ctx["git_description"],
             manifest_verification=manifest_verification,
             analyze_vendor=int(ctx["analyze_vendor"]),
+            variant=ctx.get("variant", ""),
+            image=ctx.get("image", ""),
+            board=ctx.get("board", ""),
         )
 
 
-def _step_cleanup_old_builds(conn: sqlite3.Connection, ctx: dict) -> None:
-    """Delete data from previous builds, unless a reindex is paused.
+def _cleanup_old_for_pair(
+    conn: sqlite3.Connection,
+    project_id: str,
+    db_dir: Path,
+    variant: str,
+    image: str,
+    keep_hash: str,
+) -> list[str]:
+    """Delete older builds of one ``(variant, image)`` pair, keeping *keep_hash*.
 
-    Each reindex produces a new ``config_hash`` — the old hash's data
-    (symbols, refs, embeddings, etc.) is deleted to reclaim disk space.
-
-    The reindex-pause guard prevents deletion when a background reindex
-    was paused mid-stream: if the old process has not finished, its data
-    is still the active index and must not be removed.  The ``reindex.pause``
-    PID file acts as a distributed lock — if its process is still alive,
-    cleanup is skipped.
+    Returns the list of deleted ``config_hash`` values.  Also removes the
+    debug artifacts ``~/.fw-context/index/<project_id>/compile_commands.<hash>.json``
+    so no orphaned files survive retention.
     """
-    config_hash = ctx["config_hash"]
-    project_id = ctx["project_id"]
-    db_dir = ctx["db_dir"]
-
-    old_hashes = conn.execute(
+    old_rows = conn.execute(
         """SELECT config_hash FROM build_configs
-           WHERE project_id = ? AND config_hash != ?
-           ORDER BY created_at DESC""",
-        (project_id, config_hash),
+           WHERE project_id = ? AND variant = ? AND image = ? AND config_hash != ?
+           ORDER BY created_at DESC, rowid DESC""",
+        (project_id, variant, image, keep_hash),
     ).fetchall()
-    if not old_hashes:
-        return
-
-    if PidFile.is_active(db_dir / "reindex.pause"):
-        return
-
-    for row in old_hashes:
+    deleted: list[str] = []
+    for row in old_rows:
         old_ch = row["config_hash"]
         with transaction(conn):
             delete_build_data(conn, old_ch)
+        deleted.append(old_ch)
+
     cc_dir = Path.home() / ".fw-context" / "index" / project_id
     if cc_dir.exists():
-        for row in old_hashes:
-            old_ch = row["config_hash"]
+        for old_ch in deleted:
             try:
                 (cc_dir / f"compile_commands.{old_ch}.json").unlink(missing_ok=True)
             except OSError:
                 pass
+    return deleted
+
+
+def cleanup_old_builds_multi(
+    conn: sqlite3.Connection,
+    project_id: str,
+    db_dir: Path,
+    touched_pairs: list[tuple[str, str]],
+) -> int:
+    """Run per-``(variant, image)`` retention after a multi-build run.
+
+    Keeps the newest ``config_hash`` per touched ``(variant, image)`` pair and
+    deletes older builds of those pairs ONLY.  Builds of untouched pairs are
+    left alone — a narrowed ``--variant`` run must not delete other variants.
+
+    Returns the number of deleted builds.
+    """
+    if PidFile.is_active(db_dir / "reindex.pause"):
+        return 0
+    deleted = 0
+    for variant, image in dict.fromkeys(touched_pairs):
+        row = conn.execute(
+            """SELECT config_hash FROM build_configs
+               WHERE project_id = ? AND variant = ? AND image = ?
+               ORDER BY created_at DESC, rowid DESC LIMIT 1""",
+            (project_id, variant, image),
+        ).fetchone()
+        if row is None:
+            continue
+        deleted += len(
+            _cleanup_old_for_pair(conn, project_id, db_dir, variant, image, row["config_hash"])
+        )
+    return deleted
+
+
+def _step_cleanup_old_builds(conn: sqlite3.Connection, ctx: dict) -> None:
+    """Delete older builds of the current ``(variant, image)`` pair.
+
+    Each reindex of the same (variant, image) produces a new ``config_hash`` —
+    the old hash's data is deleted to reclaim disk space.  Retention is scoped
+    to the pair: builds of OTHER variants/images are preserved (multi-build).
+
+    The reindex-pause guard prevents deletion when a background reindex was
+    paused mid-stream: the old process's data is still the active index.
+    """
+    config_hash = ctx["config_hash"]
+    project_id = ctx["project_id"]
+    db_dir = ctx["db_dir"]
+    variant = ctx.get("variant", "")
+    image = ctx.get("image", "")
+
+    if PidFile.is_active(db_dir / "reindex.pause"):
+        return
+
+    _cleanup_old_for_pair(conn, project_id, db_dir, variant, image, config_hash)
 
 
 def _step_wal_checkpoint(conn: sqlite3.Connection, ctx: dict) -> None:
@@ -1166,6 +1221,12 @@ def _run_postprocess(
     cache_server_config=None,
     force: bool = False,
     purge_max_missing_percent: int = 20,
+    variant: str = "",
+    image: str = "",
+    board: str = "",
+    scope: list[str] | None = None,
+    defer_fts: bool = False,
+    defer_cleanup: bool = False,
 ) -> None:
     """Run all post-processing phases via a data-driven pipeline.
 
@@ -1206,12 +1267,26 @@ def _run_postprocess(
         "cache_server_config": cache_server_config,
         "force": force,
         "purge_max_missing_percent": purge_max_missing_percent,
+        "variant": variant,
+        "image": image,
+        "board": board,
+        "scope": scope,
+        "defer_fts": defer_fts,
+        "defer_cleanup": defer_cleanup,
     }
+
+    defer_skip: set[str] = set()
+    if defer_fts:
+        defer_skip.add("fts5")
+    if defer_cleanup:
+        defer_skip.add("cleanup_old")
 
     failed_critical: set[str] = set()
     critical_steps = {"fts5", "embeddings"}
 
     for step_name, step_fn, guard in _STEPS:
+        if step_name in defer_skip:
+            continue
         if guard is not None and not guard(ctx):
             continue
         t0 = time.monotonic()

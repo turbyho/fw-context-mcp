@@ -65,39 +65,15 @@ class ZephyrBuildSystem:
                 'Zephyr requires a board name.  Set it in .fw-context/config.toml:\n  [build]\n  board = "your_board"'
             )
 
-        build_dir = project_root / "build"
+        build_dir = project_root / (cfg.build_dir or "build")
 
-        # Ninja deletes .d depfiles after reading them by default.
-        # Create a wrapper that adds -d keepdepfile so .d files persist
-        # on disk for incremental re-indexing.
-        # We place the wrapper at $PATH priority (not CMAKE_MAKE_PROGRAM)
-        # because sysbuild's ExternalProject_Add does not forward
-        # CMAKE_MAKE_PROGRAM to the inner Zephyr CMake project.
-        #
-        # Resolve the REAL ninja binary, not a pyenv/asdf shim: the shim
-        # re-execs `ninja` by name, and since the wrapper dir is prepended
-        # to PATH below, that re-resolution would find the wrapper again
-        # and recurse (appending -d keepdepfile each cycle).
-        ninja = resolve_real_binary("ninja")
-        if ninja is None:
-            raise RuntimeError("ninja is required for Zephyr builds")
-        wrapper_dir = project_root / ".fw-context"
-        wrapper_dir.mkdir(parents=True, exist_ok=True)
-        ninja_wrapper = wrapper_dir / "ninja"
-        expected = f'#!/bin/sh\nexec "{ninja}" -d keepdepfile "$@"\n'
-        # Atomic write via temp file + rename — prevents TOCTOU between
-        # check and write where another process could replace the wrapper.
-        if not ninja_wrapper.exists() or ninja_wrapper.read_text(encoding="utf-8") != expected:
-            tmp_wrapper = wrapper_dir / ".ninja.tmp"
-            tmp_wrapper.write_text(expected, encoding="utf-8")
-            tmp_wrapper.chmod(0o755)
-            tmp_wrapper.rename(ninja_wrapper)
+        _, env = self._prepare_ninja_wrapper(project_root)
 
         cmd: list[str] = [
             "west",
             "build",
             "-b",
-            cfg.board,
+            self._normalize_board(cfg.board),
             "-d",
             str(build_dir),
         ]
@@ -113,17 +89,6 @@ class ZephyrBuildSystem:
         cmd.append("-DEXTRA_CPPFLAGS=-MMD")
 
         log.info("zephyr build: %s", " ".join(cmd))
-        # ccache with depend_mode=false (default) skips .d file regeneration
-        # on cache hits.  CCACHE_DEPEND=1 forces ccache to cache dependency
-        # info so .d files are present after every build.
-        # Prepend the .fw-context wrapper directory to PATH so our ninja
-        # wrapper (which adds -d keepdepfile) shadows the real ninja binary
-        # in both sysbuild (outer) and Zephyr (inner) CMake projects.
-        env = {
-            **os.environ,
-            "CCACHE_DEPEND": "1",
-            "PATH": f"{wrapper_dir}{os.pathsep}{os.environ.get('PATH', '')}",
-        }
         # NOTE: no timeout= — build commands can run for minutes; adding a fixed
         # timeout would break long builds.  Network-filesystem stalls remain a risk.
         run_build_command(cmd, cwd=project_root, description="west build", env=env, build_cfg=cfg)
@@ -147,6 +112,151 @@ class ZephyrBuildSystem:
         log.info("Copied %s → %s", cc_in_build, target_cc)
 
         return target_cc
+
+    # ── Multi-variant (sysbuild) ──
+
+    @staticmethod
+    def _normalize_board(board: str) -> str:
+        """Normalize a board qualifier to the canonical ``board/soc[/cpu]`` form.
+
+        Zephyr/NCS uses ``board/soc[/cpu]`` (``/``-separated); a legacy
+        ``board_soc`` underscore form may appear when a user hand-writes it in
+        config.  Board identifiers never contain underscores, so ``_``→``/`` is
+        a safe defensive normalization (canonical 2-segment ``nrf52840dk/nrf52840``,
+        3-segment ``nrf54lm20dk/nrf54lm20a/cpuapp``).
+        """
+        return board.replace("_", "/")
+
+    def _prepare_ninja_wrapper(self, project_root: Path) -> tuple[str, dict[str, str]]:
+        """Create the ninja ``-d keepdepfile`` wrapper and return ``(dir, env)``.
+
+        WHY a wrapper: Ninja deletes ``.d`` depfiles after reading them by
+        default (``-d keepdepfile`` is needed to persist them).  The wrapper is
+        placed at PATH priority (not CMAKE_MAKE_PROGRAM) because sysbuild's
+        ExternalProject_Add does not forward CMAKE_MAKE_PROGRAM to the inner
+        Zephyr CMake project.
+
+        WHY resolve the REAL ninja: a pyenv/asdf shim re-execs ``ninja`` by
+        name; with the wrapper dir prepended to PATH that re-resolution finds
+        the wrapper again and recurses.
+
+        The returned env sets ``CCACHE_DEPEND=1`` (ccache with depend_mode=false
+        skips ``.d`` regeneration on cache hits) and prepends the wrapper dir to
+        PATH for both sysbuild (outer) and Zephyr (inner) CMake projects.
+        """
+        ninja = resolve_real_binary("ninja")
+        if ninja is None:
+            raise RuntimeError("ninja is required for Zephyr builds")
+        wrapper_dir = project_root / ".fw-context"
+        wrapper_dir.mkdir(parents=True, exist_ok=True)
+        ninja_wrapper = wrapper_dir / "ninja"
+        expected = f'#!/bin/sh\nexec "{ninja}" -d keepdepfile "$@"\n'
+        # Atomic write via temp file + rename — prevents TOCTOU between
+        # check and write where another process could replace the wrapper.
+        if not ninja_wrapper.exists() or ninja_wrapper.read_text(encoding="utf-8") != expected:
+            tmp_wrapper = wrapper_dir / ".ninja.tmp"
+            tmp_wrapper.write_text(expected, encoding="utf-8")
+            tmp_wrapper.chmod(0o755)
+            tmp_wrapper.rename(ninja_wrapper)
+
+        env = {
+            **os.environ,
+            "CCACHE_DEPEND": "1",
+            "PATH": f"{wrapper_dir}{os.pathsep}{os.environ.get('PATH', '')}",
+        }
+        return str(wrapper_dir), env
+
+    @staticmethod
+    def _discover_images(build_dir: Path) -> list[str]:
+        """Return sysbuild image names from the build directory structure.
+
+        An image is a subdir of *build_dir* that contains a
+        ``compile_commands.json`` directly (verified on NCS 3.2.3 — the
+        per-image compile_commands lives at ``<build_dir>/<image>/compile_commands.json``,
+        not one level deeper).  This predicate excludes non-image directories
+        that sysbuild also creates (``_sysbuild/``, ``CMakeFiles/``,
+        ``CMakeCache.txt``, the top-level ``zephyr/``).  Image names are a
+        discovery trigger + fallback label, not a stable identity — the durable
+        label is ``images[].name`` from config and the durable identity is the
+        per-image ``config_hash``.
+        """
+        if not build_dir.is_dir():
+            return []
+        return [
+            sub.name
+            for sub in sorted(build_dir.iterdir())
+            if sub.is_dir() and (sub / "compile_commands.json").exists()
+        ]
+
+    def build_multi(
+        self, project_root: Path, cfg: BuildConfig
+    ) -> list[tuple[str, str, Path]]:
+        """Build all variants × images via sysbuild, return per-image cc paths.
+
+        Returns a list of ``(variant, image, compile_commands_path)`` — one
+        entry per (variant, image) pair, with the per-image compile_commands
+        copied to ``compile_commands.<variant>.<image>.json`` in project_root.
+
+        WHY per-image copies: each image is a separate Zephyr CMake project
+        with its own ``compile_commands.json``; the per-(variant, image) file
+        lets ``config_hash`` and the manifest stay per-image (§5.3.3).
+
+        Clean is deliberately suppressed — indexing only needs
+        ``compile_commands.json``, so ``--pristine=auto`` (incremental) is used
+        instead of ``--pristine`` (always), keeping re-builds fast (§5.8).
+        """
+        from ..build import build_variant_config
+
+        if not shutil.which("west"):
+            raise RuntimeError("west is required for Zephyr builds.  Install the Zephyr SDK and west tool.")
+        if not cfg.variants:
+            raise RuntimeError("build_multi() requires [[build.variants]] in config.")
+
+        _, env = self._prepare_ninja_wrapper(project_root)
+        results: list[tuple[str, str, Path]] = []
+
+        for variant in cfg.variants:
+            vcfg = build_variant_config(cfg, variant)
+            if not vcfg.board:
+                raise RuntimeError(
+                    f"variant '{variant.name}' has no board.  Set it in "
+                    f"[[build.variants]] or inherit from [build] board."
+                )
+            board = self._normalize_board(vcfg.board)
+            source_dir = vcfg.source_dir or "."
+            build_dir = project_root / (vcfg.build_dir or f"build/{variant.name}")
+
+            cmd: list[str] = [
+                "west", "build", "--sysbuild",
+                "-b", board,
+                "-d", str(build_dir),
+                source_dir,
+                "--pristine=auto",
+                "--",
+                "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON",
+                "-DEXTRA_CPPFLAGS=-MMD",
+            ]
+
+            variant_env = {**env, **(vcfg.env or {})}
+            log.info("zephyr build_multi[%s]: %s", variant.name, " ".join(cmd))
+            run_build_command(
+                cmd,
+                cwd=project_root,
+                description=f"west build --sysbuild ({variant.name})",
+                env=variant_env,
+                build_cfg=vcfg,
+            )
+
+            for image_name in self._discover_images(build_dir):
+                cc_src = build_dir / image_name / "compile_commands.json"
+                if not cc_src.exists():
+                    continue
+                target = project_root / f"compile_commands.{variant.name}.{image_name}.json"
+                shutil.copy2(cc_src, target)
+                results.append((variant.name, image_name, target))
+                log.info("Copied %s → %s", cc_src, target)
+
+        return results
 
     # ── Build dir patterns ──
 
@@ -195,26 +305,14 @@ class ZephyrBuildSystem:
         return None
 
     @staticmethod
-    def _ncs_version(project_root: Path, ncs_root: Path) -> str | None:
+    def _ncs_version(ncs_root: Path) -> str | None:
         """Return the NCS version (``vX.Y.Z``) for *ncs_root*, or None.
 
-        Prefers the project-pinned ``ci/sdk.env`` (``NCS_VERSION``), then
-        falls back to ``<ncs_root>/v*/zephyr`` directory names.
+        Only standard signals are consulted: ``<ncs_root>/v*/zephyr`` directory
+        names.  Project-custom pins (``ci/sdk.env``) are deliberately NOT read
+        — they are a per-project convention, not a generic NCS signal (design
+        rule: fw-context must not depend on project-specific files).
         """
-        for anc in [project_root.resolve(), *project_root.resolve().parents]:
-            sdk_env = anc / "ci" / "sdk.env"
-            if not sdk_env.is_file():
-                continue
-            try:
-                for line in sdk_env.read_text(encoding="utf-8").splitlines():
-                    line = line.strip()
-                    if line.startswith("NCS_VERSION="):
-                        ver = line.split("=", 1)[1].strip()
-                        if ver:
-                            return ver if ver.startswith("v") else f"v{ver}"
-            except OSError:
-                pass
-            break
         if ncs_root.is_dir():
             for d in sorted(ncs_root.iterdir(), reverse=True):
                 if d.name.startswith("v") and (d / "zephyr").is_dir():
@@ -226,8 +324,9 @@ class ZephyrBuildSystem:
         """Detect an NCS install and return ``(nrfutil, version, ncs_root)``.
 
         NCS root candidates, most specific first: ``ZEPHYR_BASE`` env,
-        ``west config zephyr.base``, an ``ncs`` symlink/dir in the project
-        tree, and ``~/ncs``.  Returns None when no usable NCS install is found.
+        ``west config zephyr.base``, and ``~/ncs``.  A project-local ``ncs``
+        symlink is deliberately NOT used — it is a project-custom convention,
+        not a generic signal.  Returns None when no usable NCS install is found.
         """
         candidates: list[Path] = []
 
@@ -251,12 +350,6 @@ class ZephyrBuildSystem:
             except Exception:  # nosec B110 — best-effort env detection
                 pass
 
-        for anc in [project_root.resolve(), *project_root.resolve().parents]:
-            ncs_link = anc / "ncs"
-            if ncs_link.exists():
-                candidates.append(ncs_link.resolve())
-                break
-
         home_ncs = Path.home() / "ncs"
         if home_ncs.is_dir():
             candidates.append(home_ncs)
@@ -264,7 +357,7 @@ class ZephyrBuildSystem:
         for ncs_root in candidates:
             if not ncs_root.is_dir():
                 continue
-            version = cls._ncs_version(project_root, ncs_root)
+            version = cls._ncs_version(ncs_root)
             if version is None or not (ncs_root / version / "zephyr").is_dir():
                 continue
             nrfutil = cls._find_nrfutil()

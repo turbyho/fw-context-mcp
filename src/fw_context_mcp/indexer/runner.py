@@ -101,6 +101,12 @@ def run(
     build_dir_patterns: list[str] | None = None,
     analyze_vendor: bool = False,
     purge_max_missing_percent: int = 20,
+    variant: str = "",
+    image: str = "",
+    board: str = "",
+    build_env: dict[str, str] | None = None,
+    defer_fts: bool = False,
+    defer_cleanup: bool = False,
 ) -> str:
     """Index a project: parse translation units, extract symbols, and store to SQLite.
 
@@ -199,19 +205,22 @@ def run(
         for unit in units:
             unit.clang_args.extend(("-include", str(ch_abs)))
 
-    from .manifest import build_preliminary, compute_structural_hash
+    from .manifest import build_preliminary, build_scope, compute_structural_hash
     from .manifest import load as load_manifest
 
-    manifest = load_manifest(db_path.parent)
+    scope = build_scope(variant, image, build_env)
+
     expected_hash = compute_structural_hash(
         compile_commands,
         project_root,
         units,
         build_dir_patterns,
         project_id=project_id,
+        scope=scope,
     )
-    if manifest is not None and manifest.get("config_hash") == expected_hash:
-        config_hash = manifest["config_hash"]
+    manifest = load_manifest(db_path.parent, expected_hash)
+    if manifest is not None:
+        config_hash = manifest.get("config_hash", expected_hash)
     else:
         config_hash = build_preliminary(
             compile_commands,
@@ -220,12 +229,14 @@ def run(
             units,
             build_dir_patterns,
             project_id=project_id,
+            scope=scope,
         )
-        # Reload manifest from disk — build_preliminary may have overwritten
-        # manifest.json.  The in-memory manifest must reflect what _update_manifest_after_index
-        # will find on disk (degraded or fresh), so the early-return guard can detect
-        # preliminary (empty source_hash) entries and fall through to regeneration.
-        manifest = load_manifest(db_path.parent)
+        # Reload manifest from disk — build_preliminary may have written a
+        # preliminary (empty source_hash) manifest.  The in-memory manifest
+        # must reflect what _update_manifest_after_index will find on disk
+        # (degraded or fresh), so the early-return guard can detect
+        # preliminary entries and fall through to regeneration.
+        manifest = load_manifest(db_path.parent, config_hash)
 
     # WHY heartbeat: the index subprocess can deadlock (libclang hang, disk
     # full, NFS stall).  Without a heartbeat, the watchdog has no way to
@@ -283,6 +294,9 @@ def run(
                 description=git_description,
                 manifest_verification=initial_manifest_verification,
                 analyze_vendor=int(_analyze_vendor),
+                variant=variant,
+                image=image,
+                board=board,
             )
 
     # Validate that all -include/-imacros referenced files exist BEFORE
@@ -317,7 +331,7 @@ def run(
         )
         if cur.fetchone() is None:
             missing_triggers = True
-    if missing_triggers:
+    if missing_triggers and not defer_fts:
         log.info("FTS5 triggers missing (possibly from a crashed run) — rebuilding FTS first")
         rebuild_fts(conn)
     drop_fts_triggers(conn)
@@ -511,6 +525,12 @@ def run(
         cache_server_config=cache_server_config,
         force=force,
         purge_max_missing_percent=purge_max_missing_percent,
+        variant=variant,
+        image=image,
+        board=board,
+        scope=scope,
+        defer_fts=defer_fts,
+        defer_cleanup=defer_cleanup,
     )
 
     elapsed = time.monotonic() - t0

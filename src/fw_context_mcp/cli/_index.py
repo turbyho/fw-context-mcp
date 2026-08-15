@@ -300,6 +300,223 @@ def _post_index_optimize(
         _gconn.close()
 
 
+def _select_variants(variants: list, args: argparse.Namespace) -> list:
+    """Return the variants selected by --variant/--variants CLI filters."""
+    if not variants:
+        return []
+    requested: set[str] | None = None
+    if getattr(args, "variant", None):
+        requested = {args.variant}
+    elif getattr(args, "variants", None):
+        requested = {v.strip() for v in args.variants.split(",") if v.strip()}
+    if requested is None:
+        return list(variants)
+    selected = [v for v in variants if v.name in requested]
+    missing = requested - {v.name for v in selected}
+    for m in sorted(missing):
+        print(f"error: variant '{m}' not found in [[build.variants]]", file=sys.stderr)
+    return selected
+
+
+def _find_variant(variants: list, name: str):
+    for v in variants:
+        if v.name == name:
+            return v
+    return None
+
+
+def _effective_board(build_cfg, variant, image: str) -> str:
+    """Resolve the concrete board per-(variant, image).
+
+    Per-image override wins (FLPR → cpuflpr), else the variant default board,
+    else the shared ``[build] board``.
+    """
+    for img in variant.images:
+        if img.name == image and img.board:
+            return img.board
+    return variant.board or build_cfg.board or ""
+
+
+def _variant_build_dir(variant, build_cfg) -> str:
+    """Return the per-variant build output directory (relative)."""
+    return variant.build_dir or build_cfg.build_dir or f"build/{variant.name}"
+
+
+def _filter_images(cc_list: list, args: argparse.Namespace) -> list:
+    """Apply --image (inclusive) and --exclude-image (exclusive) index filters."""
+    include = getattr(args, "image", None)
+    exclude = set(getattr(args, "exclude_image", None) or [])
+    out = []
+    for item in cc_list:
+        _, image, _, _ = item
+        if image and image in exclude:
+            continue
+        if include and image != include:
+            continue
+        out.append(item)
+    return out
+
+
+def _discover_existing_cc(project_root, variants: list, build_cfg) -> list:
+    """Discover existing ``compile_commands.<variant>[.<image>].json`` copies."""
+    found: list = []
+    for variant in variants:
+        build_dir = _variant_build_dir(variant, build_cfg)
+        bd = project_root / build_dir
+        # per-image layout: <build_dir>/<image>/compile_commands.json (NCS 3.2.3)
+        if bd.is_dir():
+            for sub in sorted(bd.iterdir()):
+                cc = sub / "compile_commands.json"
+                if cc.exists():
+                    found.append((variant.name, sub.name, cc, _effective_board(build_cfg, variant, sub.name)))
+        # non-sysbuild single-image layout: compile_commands.<variant>.json
+        single = project_root / f"compile_commands.{variant.name}.json"
+        if single.exists():
+            found.append((variant.name, "", single, _effective_board(build_cfg, variant, "")))
+        if not bd.is_dir() and not single.exists():
+            print(f"error: no build artifacts for variant '{variant.name}' — run 'fw-context index --build'", file=sys.stderr)
+    return found
+
+
+def _run_multi(
+    args,
+    cfg,
+    project_root,
+    project_id,
+    db_path,
+    detected_system,
+    run_kwargs,
+) -> int:
+    """Orchestrate indexing of all (variant, image) builds.
+
+    Builds each variant (sysbuild via ``build_multi``, else per-variant
+    ``build()``), indexes each (variant, image) with deferred FTS/cleanup,
+    then runs the FTS rebuild and per-(variant, image) retention once at the
+    end (§5.8).  A failure in one build does not abort the others.
+    """
+    from ..indexer._postprocess import cleanup_old_builds_multi
+    from ..indexer.build import build_variant_config, generate_compile_commands
+    from ..indexer.builders import registry as builder_registry
+    from ..indexer.db import open_db, rebuild_files_fts, rebuild_fts, rebuild_macros_fts
+    from ..indexer.runner import run
+
+    build_cfg = cfg.build
+    variants = _select_variants(build_cfg.variants, args)
+    if not variants:
+        print("error: no variants selected", file=sys.stderr)
+        return 1
+
+    system = build_cfg.system or detected_system
+    builder_cls = builder_registry.get(system) if system else None
+    builder = builder_cls() if builder_cls else None
+
+    cc_list: list[tuple[str, str, Path, str]] = []
+
+    if args.build:
+        if builder is not None and hasattr(builder, "build_multi") and build_cfg.sysbuild:
+            for variant, image, path in builder.build_multi(project_root, build_cfg):
+                v = _find_variant(variants, variant)
+                board = _effective_board(build_cfg, v, image) if v else ""
+                cc_list.append((variant, image, path, board))
+        else:
+            for variant in variants:
+                vcfg = build_variant_config(build_cfg, variant)
+                try:
+                    path = generate_compile_commands(project_root, vcfg)
+                except RuntimeError as exc:
+                    print(f"error: variant '{variant.name}': {exc}", file=sys.stderr)
+                    continue
+                cc_list.append((variant.name, "", path, _effective_board(build_cfg, variant, "")))
+    else:
+        cc_list = _discover_existing_cc(project_root, variants, build_cfg)
+
+    cc_list = _filter_images(cc_list, args)
+
+    if args.no_index:
+        print(f"Built {len(cc_list)} build(s) — skipping indexing (--no-index)")
+        return 0
+
+    if not cc_list:
+        print("error: no builds to index", file=sys.stderr)
+        return 1
+
+    touched_pairs: list[tuple[str, str]] = []
+    for variant_name, image, cc_path, board in cc_list:
+        v = _find_variant(variants, variant_name)
+        env = dict(build_cfg.env)
+        if v is not None:
+            env.update(v.env)
+        build_dir_patterns = [f"{_variant_build_dir(v, build_cfg)}/"] if v is not None else None
+        try:
+            ch = run(
+                compile_commands=cc_path,
+                db_path=db_path,
+                variant=variant_name,
+                image=image,
+                board=board,
+                build_env=env,
+                build_dir_patterns=build_dir_patterns,
+                defer_fts=True,
+                defer_cleanup=True,
+                **run_kwargs,
+            )
+        except Exception as exc:  # noqa: BLE001 — best-effort per-build
+            print(f"error: indexing variant={variant_name} image={image}: {exc}", file=sys.stderr)
+            continue
+        touched_pairs.append((variant_name, image))
+        print(f"Indexed variant={variant_name} image={image} config_hash={ch[:16]}…")
+
+    # Final: rebuild FTS once and run per-(variant, image) retention once.
+    conn = open_db(db_path)
+    try:
+        rebuild_fts(conn)
+        rebuild_files_fts(conn)
+        rebuild_macros_fts(conn)
+        deleted = cleanup_old_builds_multi(conn, project_id, db_path.parent, touched_pairs)
+        if deleted:
+            print(f"Cleaned up {deleted} stale build(s)")
+    finally:
+        conn.close()
+
+    _post_index_optimize(db_path, project_root, project_id, system, args)
+    return 0
+
+
+def _build_run_kwargs(
+    args, cfg, project_root, project_id, vendor_paths, project_paths, cs_config,
+) -> dict:
+    """Build the shared ``runner.run()`` kwargs from config + CLI flags."""
+    return dict(
+        vendor_paths=vendor_paths,
+        project_paths=project_paths,
+        project_name=args.name or cfg.project.name,
+        index_refs=False if args.no_refs else cfg.index.index_refs,
+        index_embeddings=(
+            False
+            if getattr(args, "no_embeddings", False)
+            else getattr(args, "embeddings", None) or cfg.index.index_embeddings
+        ),
+        analyze_symbols=(
+            False
+            if getattr(args, "no_analyze", False)
+            else getattr(args, "analyze", False) or cfg.llm.analyze_symbols
+        ),
+        analyze_overrides=True,
+        project_root=project_root,
+        project_id=project_id,
+        llm_config=cfg.llm,
+        cache_server_config=cs_config,
+        config_header=cfg.index.config_header,
+        force=args.force,
+        analyze_vendor=(
+            False
+            if getattr(args, "no_analyze_vendor", False)
+            else getattr(args, "analyze_vendor", False) or cfg.llm.analyze_vendor
+        ),
+        purge_max_missing_percent=cfg.index.purge_max_missing_percent,
+    )
+
+
 def cmd_index(args: argparse.Namespace) -> int:
     """Build or rebuild the symbol index from compile_commands.json.
 
@@ -353,6 +570,36 @@ def cmd_index(args: argparse.Namespace) -> int:
     else:
         print(f"Project: {project_root.name}  path={project_root}  build=unknown")
 
+    project_id = derive_project_id(project_root)
+    db_path = cfg.index.db_dir / project_id / "index.db"
+
+    vendor_paths = list(getattr(args, "vendor_paths", None) or cfg.index.vendor_paths)
+    project_paths = list(getattr(args, "project_paths", None) or cfg.index.project_paths)
+
+    cs_config = cfg.cache_server
+    if cs_config is not None and getattr(args, "force", False):
+        from dataclasses import replace
+        cs_config = replace(cs_config, force=True)
+
+    # ── Multi-variant: dispatch BEFORE single-build resolution ──
+    # WHY: [[build.variants]] replaces the single [build] board/source flow.
+    # build_multi() builds each variant; the single-build path below
+    # (generate_compile_commands → builder.build()) would fail on a project
+    # whose board lives per-variant (Zephyr "requires a board name").
+    if cfg.build.variants:
+        _manage_bg_reindex(db_path)
+        run_kwargs = _build_run_kwargs(
+            args, cfg, project_root, project_id, vendor_paths, project_paths, cs_config,
+        )
+        try:
+            return _run_multi(
+                args, cfg, project_root, project_id, db_path,
+                detected_system, run_kwargs,
+            )
+        finally:
+            PidFile(db_path.parent / "reindex.pid").unlink_if_ours()
+            PidFile(db_path.parent / "reindex.pause").unlink_if_ours()
+
     # ── Resolve compile_commands.json ──
     cc_result = _resolve_compile_commands(args, project_root, cfg, detected_system, bg)
     if cc_result[0] is None:
@@ -368,52 +615,19 @@ def cmd_index(args: argparse.Namespace) -> int:
         return 1
     assert compile_commands is not None  # _validate_and_fix_artifacts returns Path|None, but ok=True → non-None
 
-    project_id = derive_project_id(project_root)
-    db_path = cfg.index.db_dir / project_id / "index.db"
-
-    vendor_paths = list(getattr(args, "vendor_paths", None) or cfg.index.vendor_paths)
-    project_paths = list(getattr(args, "project_paths", None) or cfg.index.project_paths)
-
-    cs_config = cfg.cache_server
-    if cs_config is not None and getattr(args, "force", False):
-        from dataclasses import replace
-        cs_config = replace(cs_config, force=True)
-
     # ── Manage background reindex ──
     _manage_bg_reindex(db_path)
+
+    run_kwargs = _build_run_kwargs(
+        args, cfg, project_root, project_id, vendor_paths, project_paths, cs_config,
+    )
 
     try:
         config_hash = run(
             compile_commands=compile_commands,
             db_path=db_path,
-            vendor_paths=vendor_paths,
-            project_paths=project_paths,
-            project_name=args.name or cfg.project.name,
-            index_refs=False if args.no_refs else cfg.index.index_refs,
-            index_embeddings=(
-                False
-                if getattr(args, "no_embeddings", False)
-                else getattr(args, "embeddings", None) or cfg.index.index_embeddings
-            ),
-            analyze_symbols=(
-                False
-                if getattr(args, "no_analyze", False)
-                else getattr(args, "analyze", False) or cfg.llm.analyze_symbols
-            ),
-            analyze_overrides=True,
-            project_root=project_root,
-            project_id=project_id,
-            llm_config=cfg.llm,
-            cache_server_config=cs_config,
-            config_header=cfg.index.config_header,
-            force=args.force,
             build_dir_patterns=build_dir_patterns,
-            analyze_vendor=(
-                False
-                if getattr(args, "no_analyze_vendor", False)
-                else getattr(args, "analyze_vendor", False) or cfg.llm.analyze_vendor
-            ),
-            purge_max_missing_percent=cfg.index.purge_max_missing_percent,
+            **run_kwargs,
         )
         print(f"Indexed. config_hash={config_hash[:16]}…  db={db_path}")
 

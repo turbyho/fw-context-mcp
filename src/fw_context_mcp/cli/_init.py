@@ -717,6 +717,8 @@ def cmd_init(args: argparse.Namespace) -> int:
     build_ok, cc_path, cc_err = False, None, None
     if args.dry_run:
         print("  [dry-run] would generate compile_commands.json when feasible")
+    elif _proj_cfg.build.variants:
+        print("  [build] multi-variant project — build via 'fw-context index --build'")
     elif skip_build:
         print("  [build] skipped (--skip-build)")
     else:
@@ -792,6 +794,7 @@ def cmd_init(args: argparse.Namespace) -> int:
             tools_registered=tools_registered,
             index_exists=_index_exists(_proj_cfg),
             build_skipped=skip_build,
+            multi_variant=bool(_proj_cfg.build.variants),
         )
 
     # ── Return logic ──

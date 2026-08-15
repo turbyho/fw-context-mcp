@@ -1,8 +1,9 @@
 """Tests for fw_context_mcp.indexer.config_hash."""
 
-
+from pathlib import Path
 
 from fw_context_mcp.indexer.config_hash import _normalize_entry
+from fw_context_mcp.indexer.manifest import build_scope, compute_config_hash
 
 
 class TestNormalizeEntry:
@@ -70,5 +71,42 @@ class TestNormalizeEntry:
         }
         result = _normalize_entry(entry)
         assert "-DEXTRA=1" in result["args"]
+
+
+class _FakeUnit:
+    def __init__(self, f: str):
+        self.file = Path(f)
+        self.clang_args = ["-I/inc", "-DFOO=1"]
+        self.raw_entry = None
+        self.directory = "/tmp"
+
+
+class TestBuildScope:
+    def test_empty_scope(self):
+        assert build_scope() == []
+        assert build_scope("", "", {}) == []
+
+    def test_variant_image(self):
+        assert build_scope("nrf52840", "app") == ["nrf52840", "app"]
+
+    def test_env_is_sorted_and_prefixed(self):
+        tokens = build_scope("nrf52840", "", {"B": "2", "A": "1"})
+        assert tokens == ["nrf52840", 'env:{"A": "1", "B": "2"}']
+
+
+class TestConfigHashScope:
+    def _hash(self, scope=None):
+        unit = _FakeUnit("/tmp/proj/src/main.c")
+        return compute_config_hash([unit], Path("/tmp/proj"), "projid", None, scope=scope)
+
+    def test_scope_changes_hash(self):
+        base = self._hash()
+        v1 = self._hash(scope=["nrf52840", "app"])
+        v2 = self._hash(scope=["nrf52840", "stage0"])
+        assert base != v1
+        assert v1 != v2
+
+    def test_same_scope_is_idempotent(self):
+        assert self._hash(scope=["nrf52840", "app"]) == self._hash(scope=["nrf52840", "app"])
 
 

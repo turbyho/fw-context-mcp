@@ -238,6 +238,11 @@ _MIGRATION_ADD_COLUMNS = [
     "ALTER TABLE build_configs ADD COLUMN first_indexed_at TEXT NOT NULL DEFAULT ''",
     "ALTER TABLE build_configs ADD COLUMN analyze_vendor INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE files ADD COLUMN is_project INTEGER NOT NULL DEFAULT 0",
+    # Multi-variant / multi-image build identity.  variant='' image='' board=''
+    # for single-project builds (backward-compatible defaults).
+    "ALTER TABLE build_configs ADD COLUMN variant TEXT NOT NULL DEFAULT ''",
+    "ALTER TABLE build_configs ADD COLUMN image TEXT NOT NULL DEFAULT ''",
+    "ALTER TABLE build_configs ADD COLUMN board TEXT NOT NULL DEFAULT ''",
     # Incremental re-embedding: content-addressable hash of the fields that
     # feed an embedding description.  Lets _build_embeddings skip unchanged
     # symbols instead of re-embedding the whole index on every `fw-context index`.
