@@ -501,7 +501,7 @@ def get_active_build(
             "config_hash": config_hash,
             "project_id": project_id,
             "project_root": str(root),
-            "build_system": _detect_build_system(root),
+            "build_system": proj_cfg.build.system or _detect_build_system(root),
             "compile_commands": cfg["compile_commands_path"],
             "indexed_at": cfg["created_at"],
             "symbol_count": sym_count,
@@ -735,12 +735,21 @@ def list_projects(
                     else False
                 )
                 root = Path(r["root_path"]) if r["root_path"] else None
+                # Report the CONFIGURED build system first — projects without
+                # markers (e.g. an NCS workspace) resolve system from config,
+                # not from marker detection, so _detect_build_system would
+                # wrongly report "unknown".
+                try:
+                    _pc = load_config(project_root=root) if root else None
+                    _bs = (_pc.build.system if _pc else None) or (_detect_build_system(root) if root else "unknown")
+                except Exception:
+                    _bs = _detect_build_system(root) if root else "unknown"
                 results.append(
                     {
                         "project_id": r["project_id"],
                         "name": r["name"],
                         "root_path": r["root_path"],
-                        "build_system": _detect_build_system(root) if root else "unknown",
+                        "build_system": _bs,
                         "symbol_count": r["symbol_count"],
                         "file_count": r["file_count"],
                         "indexed_at": r["created_at"],
@@ -1684,7 +1693,7 @@ def get_environment_status(
             compile_db["entry_count"] = _cc_entry_count(cc)
     deps = [_dep_to_schema(r) for r in dep_results]
 
-    build_system_raw = _detect_build_system(root)
+    build_system_raw = index.get("build_system") or _detect_build_system(root)
     build_system = None if build_system_raw == "unknown" else build_system_raw
 
     if index.get("status") == "not_initialized":
