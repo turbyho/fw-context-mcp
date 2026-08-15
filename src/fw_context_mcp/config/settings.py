@@ -232,7 +232,7 @@ _PROJECT_LOCAL_DEFAULTS_TEMPLATE = """\
 # python = "/path/to/python"        # Python interpreter for pip-based CLI tools
 #                                    #   (mbed-cli, platformio, keil2clangd, compiledb)
 # activate = "/path/to/setup.sh"    # shell script sourced before build
-#                                    #   (Zephyr/NCS nordic_minimal_setup.sh, ESP-IDF export.sh)
+#                                    #   (auto-detected for Zephyr/NCS/ESP-IDF; override for custom)
 
 [build]
 [llm]
