@@ -7,7 +7,7 @@ import shutil
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from fw_context_mcp.utils import run_build_command
+from fw_context_mcp.utils import cc_output_path, run_build_command
 
 from . import registry
 from .protocol import BuildIssue
@@ -79,9 +79,16 @@ class PlatformIOBuildSystem:
         log.info("platformio build: %s", " ".join(cmd))
         run_build_command(cmd, cwd=project_root, description="pio run --target compiledb", build_cfg=cfg)
 
-        cc_path = project_root / "compile_commands.json"
-        if not cc_path.exists():
+        # PlatformIO writes compile_commands.json natively to the project
+        # root; copy it to the gitignored fw-context build dir for a stable
+        # location that survives a clean of the project root.
+        native_cc = project_root / "compile_commands.json"
+        if not native_cc.exists():
             raise RuntimeError("compile_commands.json was not generated — pio run may have failed silently")
+
+        cc_path = cc_output_path(project_root)
+        shutil.copy2(native_cc, cc_path)
+        log.info("Copied %s → %s", native_cc, cc_path)
 
         # ── Full build for .d file generation ──
         # compiledb only writes compile_commands.json — GCC may not have

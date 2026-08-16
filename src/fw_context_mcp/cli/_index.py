@@ -32,6 +32,7 @@ import time
 from pathlib import Path
 
 from ..mcp.shared.pid_file import PidFile
+from ..utils import CC_OUTPUT_REL
 from . import VerboseFormatter
 
 log = logging.getLogger(__name__)
@@ -370,7 +371,7 @@ def _discover_existing_cc(project_root, variants: list, build_cfg) -> list:
                 if cc.exists():
                     found.append((variant.name, sub.name, cc, _effective_board(build_cfg, variant, sub.name)))
         # non-sysbuild single-image layout: compile_commands.<variant>.json
-        single = project_root / f"compile_commands.{variant.name}.json"
+        single = (project_root / CC_OUTPUT_REL).with_name(f"compile_commands.{variant.name}.json")
         if single.exists():
             found.append((variant.name, "", single, _effective_board(build_cfg, variant, "")))
         if not bd.is_dir() and not single.exists():
@@ -560,7 +561,7 @@ def cmd_index(args: argparse.Namespace) -> int:
     if detected_system:
         print(f"Project: {project_root.name}  path={project_root}  build={detected_system}")
     elif bg:
-        cc_fallback = project_root / "compile_commands.json"
+        cc_fallback = project_root / CC_OUTPUT_REL
         if cc_fallback.exists():
             print(f"Project: {project_root.name}  path={project_root}  build=unknown (bg, reusing cc)")
         else:

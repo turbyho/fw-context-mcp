@@ -13,7 +13,7 @@ import shutil
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from fw_context_mcp.utils import run_build_command
+from fw_context_mcp.utils import cc_output_path, run_build_command
 
 from . import registry
 from .protocol import BuildIssue
@@ -73,6 +73,8 @@ class MakefileBuildSystem:
 
         target = cfg.make_target or "all"
 
+        cc_path = cc_output_path(root)
+
         cmd: list[str] = compiledb_prefix
 
         if cfg.make_dry_run:
@@ -80,7 +82,7 @@ class MakefileBuildSystem:
 
         cmd += [
             "-o",
-            str(root / "compile_commands.json"),
+            str(cc_path),
             "-f",  # overwrite
             "make",
             "-C",
@@ -99,7 +101,6 @@ class MakefileBuildSystem:
         log.info("makefile build: %s", " ".join(cmd))
         run_build_command(cmd, cwd=root, description="compiledb make", build_cfg=cfg)
 
-        cc_path = root / "compile_commands.json"
         if not cc_path.exists():
             raise RuntimeError("compile_commands.json was not generated — compiledb may have failed silently")
 

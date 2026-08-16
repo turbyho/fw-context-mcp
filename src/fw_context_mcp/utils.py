@@ -40,8 +40,10 @@ from fw_context_mcp import _stdlib_sqlite3
 log = logging.getLogger(__name__)
 
 __all__ = [
+    "CC_OUTPUT_REL",
     "MTIME_TOLERANCE_S",
     "abs_path",
+    "cc_output_path",
     "compute_content_hash",
     "compute_source_hash",
     "fmt_count",
@@ -58,6 +60,12 @@ __all__ = [
 # Seconds of tolerance when comparing file mtimes to account for
 # clock skew between the indexer and the filesystem.
 MTIME_TOLERANCE_S: float = 1.0
+
+# Relative location (from the project root) of the generated
+# compile_commands.json.  Kept out of the project root so the build artifact
+# does not pollute the repository; ``fw-context init`` adds the containing
+# directory to .gitignore.
+CC_OUTPUT_REL: Path = Path(".fw-context") / "build" / "compile_commands.json"
 
 # Standard exception tuple for non-fatal recoverable errors.
 # Use in all broad-except blocks where the operation can safely
@@ -266,6 +274,18 @@ def abs_path(root: Path, path: str) -> str:
     if p.is_absolute():
         return str(p)
     return str(root / p)
+
+
+def cc_output_path(project_root: Path) -> Path:
+    """Return the default compile_commands.json output path for a project.
+
+    Ensures the parent directory exists.  Every builder writes the generated
+    compilation database here so fw-context owns one stable, gitignored
+    location regardless of where the native build system produces its file.
+    """
+    target = project_root / CC_OUTPUT_REL
+    target.parent.mkdir(parents=True, exist_ok=True)
+    return target
 
 
 # Content LRU cache — mtime-keyed to auto-invalidate on file changes.

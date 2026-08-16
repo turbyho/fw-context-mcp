@@ -15,9 +15,12 @@ bare Makefile (via compiledb), and bare/manual mode.
 from __future__ import annotations
 
 import logging
+import shutil
 import subprocess
 from dataclasses import dataclass, field, fields
 from pathlib import Path
+
+from fw_context_mcp.utils import cc_output_path
 
 # Import builders package so the registry is populated with all registered
 # build system backends before ``detect_build_system()`` is called.
@@ -426,9 +429,14 @@ def generate_compile_commands(
         result = subprocess.run(shlex.split(cfg.command), shell=False, cwd=root)
         if result.returncode != 0:
             raise RuntimeError(f"Build command failed with exit code {result.returncode}")
-        cc_path = root / "compile_commands.json"
-        if not cc_path.exists():
+        # A custom command runs an arbitrary build tool in the project root;
+        # its native output lands at ``compile_commands.json``.  Copy it to
+        # the gitignored fw-context build dir for a stable, reusable location.
+        native_cc = root / "compile_commands.json"
+        if not native_cc.exists():
             raise RuntimeError("compile_commands.json was not generated")
+        cc_path = cc_output_path(root)
+        shutil.copy2(native_cc, cc_path)
         return cc_path
 
     # Detect or validate
