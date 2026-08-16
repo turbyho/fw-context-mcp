@@ -94,6 +94,7 @@ def _print_checklist(
     tools_registered: list[str],
     index_exists: bool,
     build_skipped: bool = False,
+    multi_variant: bool = False,
 ) -> None:
     """Print the remaining-steps checklist, grouped by category.
 
@@ -118,24 +119,36 @@ def _print_checklist(
             print(f"    ✓ {item}")
 
     # ── Remaining ──
+    # ``needs_init_rerun`` marks items fixed by re-running ``init`` (deps,
+    # models, build params).  The ``[build]`` multi-variant and ``[index]``
+    # items are fixed by ``fw-context index --build``, not by init.
     remaining: list[tuple[str, str]] = []
+    needs_init_rerun = False
     libclang = next((r for r in after_results if r.name == "libclang-so"), None)
     if libclang is not None and libclang.status == "missing":
         cmd = libclang.fix_cmd or "apt install libclang-18-dev"
         remaining.append(("[system]", cmd))
+        needs_init_rerun = True
 
     for name, label in (("chat-model", "chat model"), ("embed-model", "embedding model")):
         r = model_results.get(name)
         if r is not None and r.status == "missing":
             remaining.append(("[model]", r.fix_cmd or f"ollama pull <{label}>"))
+            needs_init_rerun = True
 
     if not build_ok:
-        if build_skipped:
+        if multi_variant:
+            remaining.append(
+                ("[build]", "compile_commands.json — multi-variant project: run 'fw-context index --build'")
+            )
+        elif build_skipped:
             remaining.append(
                 ("[build]", "compile_commands.json — re-run init without --skip-build (or fw-context index --build)")
             )
+            needs_init_rerun = True
         else:
             remaining.append(("[build]", "compile_commands.json — set build system / build params and re-run init"))
+            needs_init_rerun = True
 
     if not index_exists:
         remaining.append(("[index]", "fw-context index --build"))
@@ -144,4 +157,5 @@ def _print_checklist(
         print("  Remaining:")
         for i, (cat, cmd) in enumerate(remaining, start=1):
             print(f"    {cat:<10} {i}. {cmd}")
-        print("\n  (re-run `fw-context init` after fixing remaining items — it is safe to re-run)")
+        if needs_init_rerun:
+            print("\n  (re-run `fw-context init` after fixing remaining items — it is safe to re-run)")

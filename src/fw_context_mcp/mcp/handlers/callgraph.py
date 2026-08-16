@@ -201,7 +201,7 @@ def _resolve_virtual_callers(conn, config_hash: str, usr: str, root, ref_kind: l
 
 
 # ── moved from server.py ──
-def _references_result(name: str, project_root: str | None, ref_kind: str | list[str] | None, limit: int, *, caller_mode: bool = False) -> list[dict]:
+def _references_result(name: str, project_root: str | None, ref_kind: str | list[str] | None, limit: int, *, caller_mode: bool = False, variant: str | None = None, image: str | None = None) -> list[dict]:
     """Shared logic for ``find_callers`` and ``find_references``.
 
     Resolves the project, opens the DB, looks up the symbol, checks that refs
@@ -223,7 +223,7 @@ def _references_result(name: str, project_root: str | None, ref_kind: str | list
         list of dicts, each with: file, line, ref_kind, caller, caller_kind.
     """
     try:
-        db = BaseHandler.resolve_db_context(project_root)
+        db = BaseHandler.resolve_db_context(project_root, variant=variant, image=image)
     except RuntimeError as e:
         return [{"error": str(e)}]
     root = db.root
@@ -327,13 +327,15 @@ def _references_result(name: str, project_root: str | None, ref_kind: str | list
         ]
         return result
 
-    return db.executor.execute_sync(_query, db.config_hash)
+    return db.execute_scoped(_query)
 
 # ── moved from server.py ──
 def find_callers(
     name: Annotated[str, Field(description="Symbol name to find callers of. Returns direct call sites and indirect calls via function pointers.")],
     project_root: Annotated[str | None, Field(description="Project root. Auto-detected if omitted.")] = None,
     limit: Annotated[int, Field(description="Maximum results.")] = 50,
+    variant: Annotated[str | None, Field(description="Build variant name (multi-project). Omit to use default_variant or fail-closed. Use '*' for all variants.")] = None,
+    image: Annotated[str | None, Field(description="Sysbuild image name within the variant (multi-project). Omit for all images of the variant.")] = None,
 ) -> list[dict]:
     """Find who calls a C/C++ function — direct calls AND indirect via
     function pointers, callbacks, interrupt vector registrations, and
@@ -380,13 +382,15 @@ def find_callers(
         ``"method"``, …). Macro fallback includes a leading dict with
         ``kind="macro"``, ``value``, and ``expanded_value``.
     """
-    return _references_result(name, project_root, ref_kind=["call", "indirect", "implicit_construct"], limit=limit, caller_mode=True)
+    return _references_result(name, project_root, ref_kind=["call", "indirect", "implicit_construct"], limit=limit, caller_mode=True, variant=variant, image=image)
 
 # ── moved from server.py ──
 def find_references(
     name: Annotated[str, Field(description="Symbol name to find all references of — calls, reads, member accesses.")],
     project_root: Annotated[str | None, Field(description="Project root. Auto-detected if omitted.")] = None,
     limit: Annotated[int, Field(description="Maximum results.")] = 50,
+    variant: Annotated[str | None, Field(description="Build variant name (multi-project). Omit to use default_variant or fail-closed. Use '*' for all variants.")] = None,
+    image: Annotated[str | None, Field(description="Sysbuild image name within the variant (multi-project). Omit for all images of the variant.")] = None,
 ) -> list[dict]:
     """Find ALL references to a C/C++ symbol — calls, reads, member accesses,
     function pointer registrations, template references, and macro
@@ -422,13 +426,15 @@ def find_references(
         in file). Macro fallback includes a leading dict with
         ``kind="macro"``, ``value``, and ``expanded_value``.
     """
-    return _references_result(name, project_root, ref_kind=None, limit=limit)
+    return _references_result(name, project_root, ref_kind=None, limit=limit, variant=variant, image=image)
 
 # ── moved from server.py ──
 def find_indirect_call_sites(
     name: Annotated[str, Field(description="Name of the function pointer field or variable to find call sites of. E.g. 'onData' finds all calls through Driver::onData.")],
     project_root: Annotated[str | None, Field(description="Project root directory. Auto-detected if omitted.")] = None,
     limit: Annotated[int, Field(description="Maximum results (default 50).")] = 50,
+    variant: Annotated[str | None, Field(description="Build variant name (multi-project). Omit to use default_variant or fail-closed. Use '*' for all variants.")] = None,
+    image: Annotated[str | None, Field(description="Sysbuild image name within the variant (multi-project). Omit for all images of the variant.")] = None,
 ) -> list[dict]:
     """Find indirect call sites where a C/C++ function pointer field or
     variable is invoked. libclang-powered: resolves calls through
@@ -464,7 +470,7 @@ def find_indirect_call_sites(
         (enclosing function name), caller_kind.
     """
     try:
-        db = BaseHandler.resolve_db_context(project_root)
+        db = BaseHandler.resolve_db_context(project_root, variant=variant, image=image)
     except RuntimeError as e:
         return [{"error": str(e)}]
     root = db.root
@@ -501,7 +507,7 @@ def find_indirect_call_sites(
             for r in rows
         ]
 
-    return db.executor.execute_sync(_query, db.config_hash)
+    return db.execute_scoped(_query)
 
 # ── moved from server.py ──
 def find_indirect_targets(
@@ -509,6 +515,8 @@ def find_indirect_targets(
         "E.g. 'onData' — returns functions assigned to Driver::onData.")],
     project_root: Annotated[str | None, Field(description="Project root. Auto-detected if omitted.")] = None,
     limit: Annotated[int, Field(description="Maximum results (default 50, max 200).")] = 50,
+    variant: Annotated[str | None, Field(description="Build variant name (multi-project). Omit to use default_variant or fail-closed. Use '*' for all variants.")] = None,
+    image: Annotated[str | None, Field(description="Sysbuild image name within the variant (multi-project). Omit for all images of the variant.")] = None,
 ) -> list[dict]:
     """Find functions assigned to a C/C++ function pointer field or
     variable. libclang-powered: links assignment sites to call sites
@@ -544,7 +552,7 @@ def find_indirect_targets(
         call_file, call_line, call_expr_text.
     """
     try:
-        db = BaseHandler.resolve_db_context(project_root)
+        db = BaseHandler.resolve_db_context(project_root, variant=variant, image=image)
     except RuntimeError as e:
         return [{"error": str(e)}]
     root = db.root
@@ -606,10 +614,10 @@ def find_indirect_targets(
             results.append(entry)
         return results
 
-    return db.executor.execute_sync(_query, db.config_hash)
+    return db.execute_scoped(_query)
 
 # ── moved from server.py ──
-def _refs_guard(project_root: str | None) -> tuple[DbContext, None] | tuple[None, list[dict]]:
+def _refs_guard(project_root: str | None, variant: str | None = None, image: str | None = None) -> tuple[DbContext, None] | tuple[None, list[dict]]:
     """Shared guard for graph tools: resolve project, get executor, check refs exist.
 
     Every graph-traversal tool (find_call_path, find_all_callers_recursive,
@@ -626,7 +634,7 @@ def _refs_guard(project_root: str | None) -> tuple[DbContext, None] | tuple[None
     """
 
     try:
-        db = BaseHandler.resolve_db_context(project_root)
+        db = BaseHandler.resolve_db_context(project_root, variant=variant, image=image)
     except RuntimeError as e:
         return None, [{"error": str(e)}]
 
@@ -645,6 +653,8 @@ def find_call_path(
     to_name: Annotated[str, Field(description="Target symbol to find path to.")],
     project_root: Annotated[str | None, Field(description="Project root. Auto-detected if omitted.")] = None,
     max_depth: Annotated[int, Field(description="Maximum BFS depth for path search (default 10).")] = 10,
+    variant: Annotated[str | None, Field(description="Build variant name (multi-project). Omit to use default_variant or fail-closed. Use '*' for all variants.")] = None,
+    image: Annotated[str | None, Field(description="Sysbuild image name within the variant (multi-project). Omit for all images of the variant.")] = None,
 ) -> list[dict]:
     """Find call paths between two C/C++ functions via BFS in the libclang
     call graph, including function-pointer edges, ISR vector
@@ -720,7 +730,7 @@ def find_call_path(
         e.g. ``"main → app_run → modem_init"``). Empty list when no
         path exists within the depth limit.
     """
-    db, err = _refs_guard(project_root)
+    db, err = _refs_guard(project_root, variant=variant, image=image)
     if err:
         return err
     assert db is not None  # narrowed: err is None only on success
@@ -741,7 +751,7 @@ def find_call_path(
             return [{"info": f"No path found from '{from_name}' to '{to_name}' within depth {max_depth}."}]
         return rows
 
-    return db.executor.execute_sync(_query, db.config_hash)
+    return db.execute_scoped(_query)
 
 # ── moved from server.py ──
 def find_all_callers_recursive(
@@ -749,6 +759,8 @@ def find_all_callers_recursive(
     project_root: Annotated[str | None, Field(description="Project root. Auto-detected if omitted.")] = None,
     max_depth: Annotated[int, Field(description="Maximum BFS depth for transitive search (default 5).")] = 5,
     limit: Annotated[int, Field(description="Maximum results (default 50).")] = 50,
+    variant: Annotated[str | None, Field(description="Build variant name (multi-project). Omit to use default_variant or fail-closed. Use '*' for all variants.")] = None,
+    image: Annotated[str | None, Field(description="Sysbuild image name within the variant (multi-project). Omit for all images of the variant.")] = None,
 ) -> list[dict]:
     """Find all transitive C/C++ callers — who calls *name*, directly or
     indirectly, through the libclang call graph including
@@ -791,7 +803,7 @@ def find_all_callers_recursive(
         caller_qualified_name (str), depth (int — distance from target),
         file (str), line (int), ref_kind (``"call"`` or ``"indirect"``).
     """
-    db, err = _refs_guard(project_root)
+    db, err = _refs_guard(project_root, variant=variant, image=image)
     if err:
         return err
     assert db is not None  # narrowed: err is None only on success
@@ -807,7 +819,7 @@ def find_all_callers_recursive(
             return [{"info": f"No callers found for '{name}'."}]
         return rows
 
-    return db.executor.execute_sync(_query, db.config_hash)
+    return db.execute_scoped(_query)
 
 # ── moved from server.py ──
 def find_callees_recursive(
@@ -815,6 +827,8 @@ def find_callees_recursive(
     project_root: Annotated[str | None, Field(description="Project root. Auto-detected if omitted.")] = None,
     max_depth: Annotated[int, Field(description="Maximum BFS depth for transitive search (default 5).")] = 5,
     limit: Annotated[int, Field(description="Maximum results (default 50).")] = 50,
+    variant: Annotated[str | None, Field(description="Build variant name (multi-project). Omit to use default_variant or fail-closed. Use '*' for all variants.")] = None,
+    image: Annotated[str | None, Field(description="Sysbuild image name within the variant (multi-project). Omit for all images of the variant.")] = None,
 ) -> list[dict]:
     """Find all transitive C/C++ callees — what *name* calls, directly or
     indirectly, through the libclang call graph including
@@ -855,7 +869,7 @@ def find_callees_recursive(
         callee_qualified_name (str), depth (int — distance from source),
         file (str), line (int), ref_kind (``"call"`` or ``"indirect"``).
     """
-    db, err = _refs_guard(project_root)
+    db, err = _refs_guard(project_root, variant=variant, image=image)
     if err:
         return err
     assert db is not None  # narrowed: err is None only on success
@@ -871,7 +885,7 @@ def find_callees_recursive(
             return [{"info": f"No callees found for '{name}'."}]
         return rows
 
-    return db.executor.execute_sync(_query, db.config_hash)
+    return db.execute_scoped(_query)
 
 # ── moved from server.py ──
 def find_dead_code(
@@ -879,6 +893,8 @@ def find_dead_code(
     limit: Annotated[int, Field(description="Maximum results (default 100).")] = 100,
     exclude_paths: Annotated[list[str] | None, Field(description="Additional LIKE patterns to exclude. Merged with defaults from config. E.g. ['lib/%'].")] = None,
     project_only: Annotated[bool, Field(description="When True (default), auto-excludes SDK/vendor paths based on the detected build system and applies project config exclude_paths. Set False to see all results.")] = True,
+    variant: Annotated[str | None, Field(description="Build variant name (multi-project). Omit to use default_variant or fail-closed. Use '*' for all variants.")] = None,
+    image: Annotated[str | None, Field(description="Sysbuild image name within the variant (multi-project). Omit for all images of the variant.")] = None,
 ) -> list[dict]:
     """Find C/C++ functions that are defined but never called —
     libclang-powered dead code detection across the entire indexed
@@ -935,7 +951,7 @@ def find_dead_code(
         explains why the function is classified as dead or possibly dead).
     """
     limit = max(0, min(limit, 200))  # clamp
-    db, err = _refs_guard(project_root)
+    db, err = _refs_guard(project_root, variant=variant, image=image)
     if err:
         return err
     assert db is not None  # narrowed: err is None only on success
@@ -953,13 +969,15 @@ def find_dead_code(
             return [{"info": "No dead or possibly-dead functions found — every defined function has at least one caller."}]
         return rows
 
-    return db.executor.execute_sync(_query, db.config_hash)
+    return db.execute_scoped(_query)
 
 # ── moved from server.py ──
 def find_wrapper_callers(
     class_name: Annotated[str, Field(description="Driver class name to find wrappers for. E.g. 'UART_DRIVER' or 'hal::UART_DRIVER'.")],
     project_root: Annotated[str | None, Field(description="Project root. Auto-detected if omitted.")] = None,
     limit: Annotated[int, Field(description="Maximum wrapper method results (default 50).")] = 50,
+    variant: Annotated[str | None, Field(description="Build variant name (multi-project). Omit to use default_variant or fail-closed. Use '*' for all variants.")] = None,
+    image: Annotated[str | None, Field(description="Sysbuild image name within the variant (multi-project). Omit for all images of the variant.")] = None,
 ) -> list[dict]:
     """Find C/C++ wrapper classes that call methods of a driver class —
     libclang-powered adapter pattern detection. Traces method ownership
@@ -990,7 +1008,7 @@ def find_wrapper_callers(
         and calls (list of driver methods called)).
     """
     limit = max(0, min(limit, 50))  # clamp
-    db, err = _refs_guard(project_root)
+    db, err = _refs_guard(project_root, variant=variant, image=image)
     if err:
         return err
     assert db is not None  # narrowed: err is None only on success
@@ -1117,7 +1135,7 @@ def find_wrapper_callers(
             })
         return result
 
-    return db.executor.execute_sync(_query, db.config_hash)
+    return db.execute_scoped(_query)
 
 # ── moved from server.py ──
 def trace_data_flow(
@@ -1128,6 +1146,8 @@ def trace_data_flow(
     limit: Annotated[int, Field(description="Maximum source functions to trace (default 15).")] = 15,
     timeout_ms: Annotated[int, Field(description="Maximum total execution time in "
         "milliseconds (default 30000).")] = 30000,
+    variant: Annotated[str | None, Field(description="Build variant name (multi-project). Omit to use default_variant or fail-closed. Use '*' for all variants.")] = None,
+    image: Annotated[str | None, Field(description="Sysbuild image name within the variant (multi-project). Omit for all images of the variant.")] = None,
 ) -> list[dict]:
     """Trace how C/C++ data of a given type flows to a target function via
     libclang call paths. libclang-powered: finds functions by type
@@ -1168,7 +1188,7 @@ def trace_data_flow(
     max_depth = max(1, min(max_depth, 20))  # clamp
     limit = max(0, min(limit, 15))  # clamp
     timeout_ms = max(1000, min(timeout_ms, 300000))  # clamp 1s–5min
-    db, err = _refs_guard(project_root)
+    db, err = _refs_guard(project_root, variant=variant, image=image)
     if err:
         return err
     assert db is not None  # narrowed: err is None only on success
@@ -1263,7 +1283,7 @@ def trace_data_flow(
             *results,
         ]
 
-    return db.executor.execute_sync(_query, db.config_hash)
+    return db.execute_scoped(_query)
 
 # ── moved from server.py ──
 def find_hotspots(
@@ -1271,6 +1291,8 @@ def find_hotspots(
     limit: Annotated[int, Field(description="Number of top-called functions to return (default 20).")] = 20,
     project_only: Annotated[bool, Field(description="When True (default), auto-excludes SDK/vendor paths so hotspots reflect project code.")] = True,
     exclude_paths: Annotated[list[str] | None, Field(description="Additional LIKE patterns to exclude. Merged with defaults. E.g. ['lib/%'].")] = None,
+    variant: Annotated[str | None, Field(description="Build variant name (multi-project). Omit to use default_variant or fail-closed. Use '*' for all variants.")] = None,
+    image: Annotated[str | None, Field(description="Sysbuild image name within the variant (multi-project). Omit for all images of the variant.")] = None,
 ) -> list[dict]:
     """Find the most-called C/C++ functions ranked by caller count —
     libclang call-graph hotspot detection. Identifies functions with
@@ -1305,7 +1327,7 @@ def find_hotspots(
         caller_count (int — total number of call sites), signature.
     """
     limit = max(0, min(limit, 50))  # clamp
-    db, err = _refs_guard(project_root)
+    db, err = _refs_guard(project_root, variant=variant, image=image)
     if err:
         return err
     assert db is not None  # narrowed: err is None only on success
@@ -1325,5 +1347,5 @@ def find_hotspots(
             return [{"info": "No references indexed — enable index_refs and re-index."}]
         return rows
 
-    return db.executor.execute_sync(_query, db.config_hash)
+    return db.execute_scoped(_query)
 

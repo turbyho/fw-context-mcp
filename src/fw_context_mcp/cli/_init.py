@@ -717,6 +717,8 @@ def cmd_init(args: argparse.Namespace) -> int:
     build_ok, cc_path, cc_err = False, None, None
     if args.dry_run:
         print("  [dry-run] would generate compile_commands.json when feasible")
+    elif _proj_cfg.build.variants:
+        print("  [build] multi-variant project — build via 'fw-context index --build'")
     elif skip_build:
         print("  [build] skipped (--skip-build)")
     else:
@@ -792,6 +794,7 @@ def cmd_init(args: argparse.Namespace) -> int:
             tools_registered=tools_registered,
             index_exists=_index_exists(_proj_cfg),
             build_skipped=skip_build,
+            multi_variant=bool(_proj_cfg.build.variants),
         )
 
     # ── Return logic ──
@@ -836,8 +839,12 @@ def _check_config_file(project_root: Path, rel_path: str, template: str, fix: bo
 
 
 def _ensure_gitignore(project_root: Path, *, fix: bool = False, build_system: str | None = None) -> None:
-    """Add ``compile_commands.json`` and ``.fw-context/local.toml`` to the
+    """Add fw-context build artifacts and ``.fw-context/local.toml`` to the
     project's ``.gitignore`` if they aren't already listed.
+
+    ``.fw-context/build/`` holds the generated ``compile_commands.*`` files;
+    the root-level ``compile_commands.json`` entry covers build systems that
+    write natively to the project root (PlatformIO) and legacy layouts.
 
     For Mbed OS projects, also adds ``mbed_config.h`` — the build-generated
     config header that ends up in the project root.
@@ -851,6 +858,7 @@ def _ensure_gitignore(project_root: Path, *, fix: bool = False, build_system: st
     """
     entries = [
         "compile_commands.json",
+        ".fw-context/build/",
         ".fw-context/local.toml",
     ]
     if build_system == "mbed-os":

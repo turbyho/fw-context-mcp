@@ -57,7 +57,7 @@ This section controls how `fw-context index` generates `compile_commands.json`. 
 | Key | Default | Scope | Description |
 |-----|---------|-------|-------------|
 | `db_dir` | `"~/.fw-context/index"` | global, local | The directory for SQLite index databases. fw-context creates one subdirectory for each project. |
-| `compile_commands` | `"compile_commands.json"` | project | The path to the compilation database. fw-context resolves relative paths from the project root. |
+| `compile_commands` | `".fw-context/build/compile_commands.json"` | project | The path to the compilation database. fw-context resolves relative paths from the project root. The default keeps the build artifact out of the repository root; `fw-context init` gitignores the containing directory. |
 | `vendor_paths` | `[]` | project | Additional vendor or SDK directory patterns. fw-context adds these patterns to its automatic detection. A path that matches one of these patterns gets `is_project=0`. Example: `["third_party", "generated"]`. |
 | `project_paths` | `[]` | project | Manual project directory patterns. These patterns override automatic detection. A path that matches one of these patterns gets `is_project=1`. Use this key for vendored code that your team maintains, for example `["src/old_hal"]`. For a path outside the project root, use an absolute path, for example `["/home/user/esp/components/muj_fork"]`. |
 | `index_refs` | `true` | project | Build the cross-reference and call graph data. This key is on by default, and it enables tools such as `find_callers`, `find_call_path`, and `find_dead_code`. Set this key to `false`, or pass `--no-refs`, for faster indexing on very large projects. |
@@ -215,7 +215,7 @@ board = "nrf52840dk_nrf52840"            # required — your board name
 # clean = true                           # pristine build (recommended)
 
 [index]
-compile_commands = "build/compile_commands.json"
+# compile_commands = ".fw-context/build/compile_commands.json"   # default — set only to override
 # vendor_paths = ["third_party"]          # additional vendor dirs (additive to auto-detection)
 # project_paths = ["src/old_hal"]        # manual project dirs (overrides auto-detection)
 ```
@@ -230,7 +230,7 @@ name = "my-pio-project"
 # system = "platformio"                  # auto-detected from platformio.ini
 
 [index]
-compile_commands = "compile_commands.json"
+# compile_commands = ".fw-context/build/compile_commands.json"   # default — set only to override
 # PlatformIO framework packages are auto-detected as vendor (is_project=0).
 # For vendored code your team maintains, use project_paths to mark it as project:
 # project_paths = ["src/my_customized_framework"]

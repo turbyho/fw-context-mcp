@@ -511,6 +511,7 @@ def _build_embeddings(
 
     _phase2_idx = 0
     batch_num = 0
+    _done_ids: set[int] = set()
     while _phase2_idx < len(desc_rows):
         batch: list[tuple] = []
         seen: set[int] = set()
@@ -548,7 +549,7 @@ def _build_embeddings(
             log.info("Embedding dimension detected: %d (model=%s)", embedding_dim, model)
             from .db import init_vec_table
 
-            dim_changed = stored_dim != embedding_dim
+            dim_changed = stored_dim is not None and stored_dim != embedding_dim
             if dim_changed:
                 log.info("Embedding dimension changed %d → %d — forcing full rebuild", stored_dim, embedding_dim)
                 try:
@@ -567,6 +568,7 @@ def _build_embeddings(
                 _rebuild_desc_rows()
                 batch_num = 0
                 _phase2_idx = 0
+                _done_ids.clear()
                 log.info("Restarting embeddings with new dimension %d...", embedding_dim)
                 continue
             else:
@@ -589,7 +591,12 @@ def _build_embeddings(
         chunk_vec.extend(vec_rows)
 
         elapsed = time.monotonic() - t0
-        log.info("[%d] %d symbols (%d chars) embedded %s", batch_num, len(batch), _batch_chars, _fmt_dur(elapsed))
+        _done_ids.update(seen)
+        log.info(
+            "Embeddings: [%d/%d] %d symbols (%d chars) embedded %s",
+            len(_done_ids), len(target_ids), len(batch), _batch_chars,
+            _fmt_dur(elapsed),
+        )
 
         if len(chunk_blob) >= CHUNK_SYMBOLS:
             _flush_chunk()

@@ -43,6 +43,7 @@ from ...indexer.db import (
     WriteLockTimeout,
     count_refs,
     get_active_config,
+    get_all_builds_for_project,
     get_all_projects,
     get_db_schema_version,
     open_db,
@@ -63,6 +64,141 @@ from ..shared.context import (
 from ..shared.stale import _check_header_staleness, _count_modified_files
 
 log = logging.getLogger(__name__)
+
+
+def _expand_dir_placeholder(dir_str: str, root: Path) -> str:
+    """Expand the ``${NCS}`` placeholder in an image source dir (best-effort).
+
+    ``dir`` for an SDK image may point outside project_root (``${NCS}/…``) —
+    a machine-specific path that must not be committed literally.  The
+    placeholder is expanded to the NCS root detected from standard signals;
+    on failure the raw string is returned (the LLM still sees the placeholder).
+    """
+    if "${NCS}" not in dir_str:
+        return dir_str
+    try:
+        from ...indexer.builders.zephyr import ZephyrBuildSystem
+
+        ncs = ZephyrBuildSystem._detect_ncs(root)
+        if ncs is not None:
+            _, version, ncs_root = ncs
+            return dir_str.replace("${NCS}", f"{ncs_root}/{version}")
+    except Exception:  # nosec B110 — best-effort display expansion
+        pass
+    return dir_str
+
+
+def _build_variant_discovery(cfg: Config, builds: list, root: Path) -> dict:
+    """Build discovery data (variants/images/variant_images) for the LLM.
+
+    WHY discovery: the LLM must know what the project contains (parts = images)
+    and for which MCU variants indexes exist — without guessing names.  Source
+    of truth is config ``[[build.variants]]`` first; when config ``images`` is
+    empty (auto-detect), the actually-indexed ``build_configs`` rows fill in.
+    """
+    build_cfg = cfg.build
+    variants_cfg = build_cfg.variants
+    multi = bool(variants_cfg)
+
+    variants = [
+        {
+            "name": v.name,
+            "description": v.description,
+            "board": v.board or build_cfg.board or "",
+        }
+        for v in variants_cfg
+    ]
+
+    images: list[dict] = []
+    variant_images: dict[str, list[str]] = {}
+    if any(v.images for v in variants_cfg):
+        seen: set[str] = set()
+        for v in variants_cfg:
+            variant_images[v.name] = [img.name for img in v.images]
+            for img in v.images:
+                if img.name in seen:
+                    continue
+                seen.add(img.name)
+                entry = {
+                    "name": img.name,
+                    "description": img.description,
+                    "dir": _expand_dir_placeholder(img.dir, root) if img.dir else "",
+                    "type": img.type,
+                }
+                if img.board:
+                    entry["board"] = img.board
+                images.append(entry)
+    else:
+        # Auto-detect from build_configs (no explicit images in config).
+        seen_images: set[str] = set()
+        for b in builds:
+            variant_name = b["variant"] or ""
+            image_name = b["image"] or ""
+            if variant_name and image_name:
+                variant_images.setdefault(variant_name, [])
+                if image_name not in variant_images[variant_name]:
+                    variant_images[variant_name].append(image_name)
+            if image_name and image_name not in seen_images:
+                seen_images.add(image_name)
+                images.append({"name": image_name, "description": "", "dir": "", "type": "project"})
+
+    return {
+        "multi": multi,
+        "variants": variants,
+        "images": images,
+        "variant_images": variant_images,
+        "active_variant": build_cfg.default_variant,
+        "active_image": build_cfg.default_image,
+    }
+
+
+def list_variants(
+    project_root: Annotated[
+        str | None, Field(description="Project root directory. Auto-detected from CWD if omitted.")
+    ] = None,
+) -> dict:
+    """List every indexed build with its (variant, image, board) identity.
+
+    Read-only diagnostic — shows what is actually indexed, not what the config
+    declares.  Each row is one ``(variant, image)`` build with its own
+    ``config_hash`` and symbol count.  For single-project indexes this returns
+    one row with ``variant``/``image`` empty.
+
+    Use ``get_active_build`` for the mandatory first-call health check and the
+    human-readable ``variants``/``images`` discovery; use this tool to see the
+    per-build ``config_hash`` and symbol counts (authoritative per-build state).
+    """
+    root = resolve_project_root(project_root)
+    cfg = load_config(root)
+    project_id = cfg.project.id
+    if not project_id:
+        return {"builds": [], "multi": False, "error": f"Project at {root} is not initialized."}
+    db_path = cfg.index.db_dir / project_id / "index.db"
+    if not db_path.exists():
+        return {"builds": [], "multi": False, "error": f"No index found for {root}."}
+
+    conn = _quick_open_readonly(db_path)
+    try:
+        builds = get_all_builds_for_project(conn, project_id)
+    finally:
+        conn.close()
+
+    result_builds: list[dict] = []
+    for b in builds:
+        result_builds.append(
+            {
+                "variant": b["variant"] or "",
+                "image": b["image"] or "",
+                "board": b["board"] or "",
+                "config_hash": b["config_hash"],
+                "symbol_count": b["symbol_count"],
+                "file_count": b["file_count"],
+                "manifest_verification": b["manifest_verification"],
+            }
+        )
+
+    multi = bool(cfg.build.variants) or any(r["variant"] for r in result_builds)
+    return {"builds": result_builds, "multi": multi}
 
 
 # ── moved from server.py ──
@@ -365,7 +501,7 @@ def get_active_build(
             "config_hash": config_hash,
             "project_id": project_id,
             "project_root": str(root),
-            "build_system": _detect_build_system(root),
+            "build_system": proj_cfg.build.system or _detect_build_system(root),
             "compile_commands": cfg["compile_commands_path"],
             "indexed_at": cfg["created_at"],
             "symbol_count": sym_count,
@@ -391,6 +527,38 @@ def get_active_build(
         }
         if _warning is not None:
             result["_warning"] = _warning
+
+        # ── Multi-variant discovery (§5.6.A) ──
+        # Tell the LLM what the project contains (parts = images) and for which
+        # variants indexes exist — before it guesses names.  Sources: config
+        # [[build.variants]] first, build_configs fallback.
+        builds = get_all_builds_for_project(conn, project_id)
+        discovery = _build_variant_discovery(proj_cfg, builds, root)
+        result["multi"] = discovery["multi"]
+        result["variants"] = discovery["variants"]
+        result["images"] = discovery["images"]
+        result["variant_images"] = discovery["variant_images"]
+        result["active_variant"] = discovery["active_variant"]
+        result["active_image"] = discovery["active_image"]
+
+        if discovery["multi"]:
+            # Aggregate health fields across builds (shared common/ code is
+            # counted N times — sums are "total symbol records", not unique).
+            result["symbol_count"] = sum(b["symbol_count"] for b in builds)
+            result["file_count"] = sum(b["file_count"] for b in builds)
+            result["reference_count"] = sum(b["reference_count"] for b in builds)
+            # config_hash/compile_commands reflect the default build only; empty
+            # without [build] default_variant (the LLM must pick a variant).
+            default_build = None
+            if discovery["active_variant"]:
+                default_build = get_active_config(
+                    conn, project_id, discovery["active_variant"], discovery["active_image"] or ""
+                )
+            result["config_hash"] = default_build["config_hash"] if default_build else ""
+            result["compile_commands"] = (
+                default_build["compile_commands_path"] if default_build else ""
+            )
+
         return result
 
     result = executor.execute_sync(_query, config_hash)
@@ -541,9 +709,19 @@ def list_projects(
             def _query(conn, _config_hash):
                 # Runs under the executor lock on the single shared
                 # connection; must not open its own connection.
-                return get_all_projects(conn), get_db_schema_version(conn)
+                rows = get_all_projects(conn)
+                schema_ver = get_db_schema_version(conn)
+                counts = {}
+                for row in conn.execute(
+                    "SELECT project_id, "
+                    "COUNT(DISTINCT CASE WHEN variant != '' THEN variant END) AS vc, "
+                    "COUNT(DISTINCT CASE WHEN image != '' THEN image END) AS ic "
+                    "FROM build_configs GROUP BY project_id"
+                ).fetchall():
+                    counts[row["project_id"]] = (row["vc"] or 0, row["ic"] or 0)
+                return rows, schema_ver, counts
 
-            rows, db_schema_ver = executor.execute_sync(_query, "")
+            rows, db_schema_ver, variant_counts = executor.execute_sync(_query, "")
             for r in rows:
                 # Staleness check: compare stored creation time with
                 # compile_commands.json mtime.  Does not require
@@ -557,24 +735,35 @@ def list_projects(
                     else False
                 )
                 root = Path(r["root_path"]) if r["root_path"] else None
+                # Report the CONFIGURED build system first — projects without
+                # markers (e.g. an NCS workspace) resolve system from config,
+                # not from marker detection, so _detect_build_system would
+                # wrongly report "unknown".
+                try:
+                    _pc = load_config(project_root=root) if root else None
+                    _bs = (_pc.build.system if _pc else None) or (_detect_build_system(root) if root else "unknown")
+                except Exception:
+                    _bs = _detect_build_system(root) if root else "unknown"
                 results.append(
                     {
                         "project_id": r["project_id"],
                         "name": r["name"],
                         "root_path": r["root_path"],
-                        "build_system": _detect_build_system(root) if root else "unknown",
+                        "build_system": _bs,
                         "symbol_count": r["symbol_count"],
                         "file_count": r["file_count"],
                         "indexed_at": r["created_at"],
                         "description": r["description"] if "description" in r.keys() else "",
                         "first_indexed_at": r["first_indexed_at"] if "first_indexed_at" in r.keys() else "",
-                        "schema_version": db_schema_ver,
-                        "current_schema": CURRENT_SCHEMA_VERSION,
-                        "reindex_needed": cc_stale or db_schema_ver < CURRENT_SCHEMA_VERSION,
-                        "status": _list_status(db_schema_ver, cc_stale),
-                        "db": str(db_path),
-                    }
-                )
+                         "schema_version": db_schema_ver,
+                         "current_schema": CURRENT_SCHEMA_VERSION,
+                         "reindex_needed": cc_stale or db_schema_ver < CURRENT_SCHEMA_VERSION,
+                         "status": _list_status(db_schema_ver, cc_stale),
+                         "db": str(db_path),
+                         "variant_count": variant_counts.get(r["project_id"], (0, 0))[0],
+                         "image_count": variant_counts.get(r["project_id"], (0, 0))[1],
+                     }
+                 )
         except (sqlite3.Error, OSError) as e:
             results.append({"db": str(db_path), "error": str(e)})
     return results
@@ -876,7 +1065,7 @@ def _update_manifest_after_reindex(
         from ...indexer.manifest import (
             save as save_manifest,
         )
-        manifest_data = load_manifest(db_dir)
+        manifest_data = load_manifest(db_dir, config_hash)
         if manifest_data is not None:
             for unit, _parsed in parsed_units:
                 headers = _collect_headers_from_tokens(unit, root, build_dir_patterns=None)
@@ -1504,7 +1693,7 @@ def get_environment_status(
             compile_db["entry_count"] = _cc_entry_count(cc)
     deps = [_dep_to_schema(r) for r in dep_results]
 
-    build_system_raw = _detect_build_system(root)
+    build_system_raw = index.get("build_system") or _detect_build_system(root)
     build_system = None if build_system_raw == "unknown" else build_system_raw
 
     if index.get("status") == "not_initialized":

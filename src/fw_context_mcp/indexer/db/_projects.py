@@ -26,6 +26,7 @@ __all__ = [
     "get_all_builds_for_project",
     "get_all_projects",
     "get_build_stats",
+    "get_builds_for_scope",
     "upsert_build_config",
     "upsert_project",
 ]
@@ -86,6 +87,9 @@ def upsert_build_config(
     manifest_verification: str = "none",
     description: str = "",
     analyze_vendor: int = 0,
+    variant: str = "",
+    image: str = "",
+    board: str = "",
 ) -> None:
     """Insert or update a build configuration record.
 
@@ -105,6 +109,10 @@ def upsert_build_config(
             indicates whether manifest.json was available during indexing.
         description: Human-readable build description (git branch + tag).
             Updated on every index to reflect current git context.
+        variant: Build variant name (``''`` for single-project builds).
+        image: Sysbuild image name (``''`` for non-sysbuild builds).
+        board: Concrete board string per-(variant, image) — captures per-image
+            board overrides (e.g. FLPR ``cpuflpr`` vs ``cpuapp``).
 
     Returns:
         None.
@@ -115,8 +123,8 @@ def upsert_build_config(
         """INSERT INTO build_configs(config_hash, project_id, compile_commands_path,
                                      embedding_dim, manifest_verification,
                                      description, first_indexed_at,
-                                     analyze_vendor)
-           VALUES (?,?,?,?,?,?, datetime('now'), ?)
+                                     analyze_vendor, variant, image, board)
+           VALUES (?,?,?,?,?,?, datetime('now'), ?, ?, ?, ?)
            ON CONFLICT(config_hash) DO UPDATE SET
                created_at = datetime('now'),
                description = excluded.description,
@@ -127,24 +135,84 @@ def upsert_build_config(
                                        THEN datetime('now')
                                        ELSE build_configs.first_indexed_at
                                   END,
-               analyze_vendor = excluded.analyze_vendor""",
-        (config_hash, project_id, compile_commands_path, embedding_dim, manifest_verification, description, analyze_vendor),
+               analyze_vendor = excluded.analyze_vendor,
+               variant = excluded.variant,
+               image = excluded.image,
+               board = excluded.board""",
+        (config_hash, project_id, compile_commands_path, embedding_dim, manifest_verification, description, analyze_vendor, variant, image, board),
     )
 
 
-def get_active_config(conn: sqlite3.Connection, project_id: str) -> sqlite3.Row | None:
+def get_active_config(
+    conn: sqlite3.Connection,
+    project_id: str,
+    variant: str = "",
+    image: str = "",
+) -> sqlite3.Row | None:
     """Return the most recently indexed build_config for a project.
 
     Builds with ``manifest_verification = 'indexing'`` are excluded —
     they are still being indexed and their data is incomplete.
     MCP queries fall back to the previous completed build.
+
+    *variant*/*image* optionally narrow the lookup to one build — when
+    both are empty, the newest build overall is returned (single-project
+    default, unchanged).
     """
+    if variant and image:
+        return conn.execute(
+            """SELECT * FROM build_configs WHERE project_id=?
+               AND variant=? AND image=?
+               AND (manifest_verification IS NULL OR manifest_verification != 'indexing')
+               ORDER BY created_at DESC, rowid DESC LIMIT 1""",
+            (project_id, variant, image),
+        ).fetchone()
+    if variant:
+        return conn.execute(
+            """SELECT * FROM build_configs WHERE project_id=?
+               AND variant=?
+               AND (manifest_verification IS NULL OR manifest_verification != 'indexing')
+               ORDER BY created_at DESC, rowid DESC LIMIT 1""",
+            (project_id, variant),
+        ).fetchone()
     return conn.execute(
         """SELECT * FROM build_configs WHERE project_id=?
            AND (manifest_verification IS NULL OR manifest_verification != 'indexing')
            ORDER BY created_at DESC, rowid DESC LIMIT 1""",
         (project_id,),
     ).fetchone()
+
+
+def get_builds_for_scope(
+    conn: sqlite3.Connection,
+    project_id: str,
+    variant: str = "",
+    image: str = "",
+) -> list[sqlite3.Row]:
+    """Return completed build_configs rows matching a ``(variant, image)`` scope.
+
+    Selection semantics (mirrors the MCP ``variant``/``image`` protocol):
+
+    - ``variant="*"`` → all variants (all builds), newest first.
+    - ``variant`` set, ``image=""`` → every image of that variant.
+    - ``variant`` set, ``image`` set → that one (variant, image) build.
+    - both empty → the newest single build (single-project default).
+
+    Completed builds only (``manifest_verification != 'indexing'``).
+    """
+    where = "project_id = ? AND (manifest_verification IS NULL OR manifest_verification != 'indexing')"
+    params: list[object] = [project_id]
+    if variant and variant != "*":
+        where += " AND variant = ?"
+        params.append(variant)
+        if image:
+            where += " AND image = ?"
+            params.append(image)
+    return conn.execute(
+        f"SELECT * FROM build_configs WHERE {where} "
+        "ORDER BY created_at DESC, rowid DESC",
+        params,
+    ).fetchall()
 
 
 def get_all_projects(conn: sqlite3.Connection) -> list[sqlite3.Row]:
@@ -184,6 +252,7 @@ def get_all_builds_for_project(conn: sqlite3.Connection, project_id: str) -> lis
         """SELECT b.config_hash, b.created_at, b.first_indexed_at,
                   b.compile_commands_path, b.embedding_dim,
                   b.manifest_verification, b.description,
+                  b.variant, b.image, b.board,
                   COALESCE(s.sym_count, 0) AS symbol_count,
                   COALESCE(f.file_count, 0) AS file_count,
                   COALESCE(r.ref_count, 0) AS reference_count

@@ -396,10 +396,20 @@ mcp = FastMCP(
         "Inheritance: get_inheritance_chain, get_class_members,\n"
         "get_template_instances, get_method_overrides.\n"
         "Source: get_source, get_symbol_context, get_file_map, explain_symbol, read_file.\n"
-        "Maintenance: get_active_build, get_environment_status,\n"
-        "check_dependencies, list_projects, get_project_info,\n"
-        "check_ollama, configure_llm, reindex_file, reindex_file_impl,\n"
-        "reset_index.\n\n"
+         "Maintenance: get_active_build, get_environment_status,\n"
+         "check_dependencies, list_projects, get_project_info,\n"
+         "check_ollama, configure_llm, reindex_file, reindex_file_impl,\n"
+         "reset_index, list_variants.\n\n"
+         "MULTIPROJECT / MULTIDEVICE — when get_active_build() returns multi=true:\n"
+         "  • The project indexes N variants × M images (boards/cores).\n"
+         "  • get_active_build() lists variants/images/variant_images/active_variant.\n"
+         "  • Every query tool takes variant=<name> and (sysbuild) image=<name>.\n"
+         "  • FAIL-CLOSED: a query without variant errors (listing variants) unless\n"
+         "    [build] default_variant is set — never guess a variant silently.\n"
+         "  • variant=\"*\" = all variants (explicit only); image omitted = all images\n"
+         "    of the variant (results annotated with variant/image).\n"
+         "  • list_variants() shows the authoritative per-build config_hash + counts.\n"
+         "  • \"hledej v nRF52840\" → variant=\"nrf52840\"; \"ukaž stage0\" → image=\"stage0\".\n\n"
         "REVIEW SKILL — MANDATORY (not optional): When reviewing C/C++ firmware\n"
         "code (diffs, commits, PRs, changed files), your FIRST action MUST be:\n"
         "  skill(name=\"fw-review\")\n"
@@ -537,6 +547,7 @@ mcp.tool()(maintenance.get_active_build)
 mcp.tool()(maintenance.get_environment_status)
 mcp.tool()(maintenance.get_project_info)
 mcp.tool()(maintenance.list_projects)
+mcp.tool()(maintenance.list_variants)
 mcp.tool()(maintenance.reindex_file)
 mcp.tool()(maintenance.reindex_file_impl)
 mcp.tool()(maintenance.reset_index)

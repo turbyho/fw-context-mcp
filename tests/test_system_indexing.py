@@ -52,6 +52,11 @@ def _project_root() -> Path:
     return Path(__file__).resolve().parents[1]
 
 
+def _cc_path(proj: Path) -> Path:
+    """Return the generated compile_commands.json location for a project."""
+    return proj / ".fw-context" / "build" / "compile_commands.json"
+
+
 def _cli(
     args: list[str], cwd: Path | None = None, timeout: int = 180, extra_env: dict[str, str] | None = None
 ) -> subprocess.CompletedProcess:
@@ -253,7 +258,8 @@ def _init_and_index(
     if result.returncode != 0:
         pytest.fail(f"index failed:\nSTDOUT:\n{result.stdout}\nSTDERR:\n{result.stderr}")
 
-    assert cc.exists(), f"compile_commands.json not created at {cc}"
+    generated_cc = _cc_path(proj)
+    assert generated_cc.exists(), f"compile_commands.json not created at {generated_cc}"
     return proj
 
 
@@ -382,7 +388,7 @@ class TestBareInitAndIndex:
         _cleanup_index_db(proj)
 
     def test_compile_commands_generated(self, indexed):
-        entries = json.loads((indexed / "compile_commands.json").read_text())
+        entries = json.loads(_cc_path(indexed).read_text())
         assert len(entries) >= 1
 
     def test_symbols_indexed(self, indexed):
@@ -463,7 +469,7 @@ class TestCMakeInitAndIndex:
         _cleanup_index_db(proj)
 
     def test_compile_commands_generated(self, indexed):
-        entries = json.loads((indexed / "compile_commands.json").read_text())
+        entries = json.loads(_cc_path(indexed).read_text())
         assert len(entries) >= 1
 
     def test_symbols_indexed(self, indexed):
@@ -521,7 +527,7 @@ class TestMakefileInitAndIndex:
         _cleanup_index_db(proj)
 
     def test_compile_commands_generated(self, indexed):
-        entries = json.loads((indexed / "compile_commands.json").read_text())
+        entries = json.loads(_cc_path(indexed).read_text())
         assert len(entries) >= 1
 
     def test_device_functions_indexed(self, indexed):
@@ -581,7 +587,7 @@ class TestPlatformIOInitAndIndex:
         _cleanup_index_db(proj)
 
     def test_compile_commands_has_entries(self, indexed):
-        entries = json.loads((indexed / "compile_commands.json").read_text())
+        entries = json.loads(_cc_path(indexed).read_text())
         assert len(entries) > 10
 
     def test_project_symbols_indexed(self, indexed):
@@ -656,7 +662,7 @@ class TestArduinoInitAndIndex:
         _cleanup_index_db(proj)
 
     def test_compile_commands_generated(self, indexed):
-        entries = json.loads((indexed / "compile_commands.json").read_text())
+        entries = json.loads(_cc_path(indexed).read_text())
         assert len(entries) >= 1
 
     def test_symbols_indexed(self, indexed):
@@ -721,7 +727,7 @@ class TestMbedOSInitAndIndex:
         _cleanup_index_db(proj)
 
     def test_compile_commands_generated(self, indexed):
-        entries = json.loads((indexed / "compile_commands.json").read_text())
+        entries = json.loads(_cc_path(indexed).read_text())
         assert len(entries) > 100, f"Expected >100 entries, got {len(entries)}"
 
     def test_project_symbols_indexed(self, indexed):
@@ -799,7 +805,7 @@ class TestZephyrInitAndIndex:
         _cleanup_index_db(proj)
 
     def test_compile_commands_generated(self, indexed):
-        entries = json.loads((indexed / "compile_commands.json").read_text())
+        entries = json.loads(_cc_path(indexed).read_text())
         assert len(entries) > 50, f"Expected >50 entries, got {len(entries)}"
 
     def test_project_symbols_indexed(self, indexed):
@@ -903,7 +909,7 @@ class TestESPIDFInitAndIndex:
         _cleanup_index_db(proj)
 
     def test_compile_commands_generated(self, indexed):
-        entries = json.loads((indexed / "compile_commands.json").read_text())
+        entries = json.loads(_cc_path(indexed).read_text())
         assert len(entries) > 100, f"Expected >100 entries, got {len(entries)}"
 
     def test_project_symbols_indexed(self, indexed):
@@ -945,7 +951,7 @@ class TestConfigHashStability:
         from fw_context_mcp.indexer.compile_commands import parse as parse_cc
         from fw_context_mcp.indexer.manifest import compute_structural_hash
 
-        cc = _BUILDS / "generic_cmake" / "compile_commands.json"
+        cc = _cc_path(_BUILDS / "generic_cmake")
         assert cc.exists(), "Run CMake init+index test first to generate cc.json"
         units1 = list(parse_cc(cc))
         units2 = list(parse_cc(cc))
@@ -1157,7 +1163,7 @@ int extra_init(void) {
         extra_c.unlink()
 
         # ── Phase 4: reindex — same config_hash, missing TU skipped ──
-        cc_json = proj / "compile_commands.json"
+        cc_json = _cc_path(proj)
         config_hash_after = run(
             compile_commands=cc_json,
             db_path=db_path,

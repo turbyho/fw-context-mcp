@@ -285,6 +285,8 @@ class AiTool:
         if self.inherits_from:
             parent = TOOLS.get(self.inherits_from)
             parent_name = parent.name if parent else self.inherits_from
+            if not self.is_detected():
+                return f"[MISSING]   {self.name:12s} → inherits from {parent_name}"
             if parent and parent.is_detected():
                 return f"[DETECTED]  {self.name:12s} → inherits from {parent_name} ✓"
             return f"[DETECTED]  {self.name:12s} → inherits from {parent_name} [parent NOT DETECTED]"
@@ -357,7 +359,7 @@ TOOLS: dict[str, AiTool] = {
     "kilocode": AiTool(
         id="kilocode",
         name="Kilo Code",
-        detection_dirs=["~/.kilo"],
+        detection_dirs=["~/.kilocode"],
         inherits_from="opencode",
         mcp_config_file="~/.config/kilo/kilo.json",
         mcp_config_key="fw-context",

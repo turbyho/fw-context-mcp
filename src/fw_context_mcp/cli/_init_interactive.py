@@ -317,6 +317,11 @@ def resolve_build_params(
     from ._init_build import _write_build_config_key
 
     b = cfg.build
+    if b.variants:
+        # Multi-variant: board/target/fqbn/etc. live per-variant in
+        # [[build.variants]] — the top-level singleton is not prompted.
+        print("  Build variants configured — per-variant board/target lives in [[build.variants]]")
+        return
 
     def _ensure(key: str, label: str, current: str | None) -> None:
         if current:

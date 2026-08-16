@@ -115,12 +115,16 @@ class HandlerContext:
     cfg: Config
     project_id: str
     db_path: Path
+    scopes: list[dict]
+    multi: bool
 
 
 def _resolve_handler_context(
     project_root: str | None,
     *,
     require_refs: bool = False,
+    variant: str | None = None,
+    image: str | None = None,
 ) -> tuple[HandlerContext | None, list[dict] | None]:
     """One-call setup for MCP handlers: resolve project, read config, get executor.
 
@@ -166,12 +170,14 @@ def _resolve_handler_context(
 
     conn = _quick_open_readonly(db_path)
     try:
-        from fw_context_mcp.indexer.db import get_active_config
+        from .variants import resolve_scopes
 
-        cfg_data = get_active_config(conn, project_id)
-        if not cfg_data:
+        scopes, multi, err = resolve_scopes(conn, project_id, cfg, variant or "", image or "")
+        if err:
+            return None, [{"error": err}]
+        if not scopes:
             return None, [{"error": "No build config indexed."}]
-        config_hash = cfg_data["config_hash"]
+        config_hash = scopes[0]["config_hash"]
 
         if require_refs:
             from fw_context_mcp.indexer.db import count_refs
@@ -194,4 +200,6 @@ def _resolve_handler_context(
         cfg=cfg,
         project_id=project_id,
         db_path=db_path,
+        scopes=scopes,
+        multi=multi,
     ), None

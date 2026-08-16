@@ -100,6 +100,7 @@ def _update_manifest_after_index(
     tu_headers: dict[str, list[dict]] | None = None,
     build_dir_patterns: list[str] | None = None,
     config_hash: str = "",
+    scope: list[str] | None = None,
 ) -> dict | None:
     """Update ``manifest.json`` after an indexing run.
 
@@ -206,8 +207,8 @@ def _update_manifest_after_index(
     elif manifest is None:
         # No manifest and no tu_headers — full rebuild via libclang (slow)
         log.info("Generating manifest.json from %d TUs...", len(units))
-        generate_manifest(compile_commands, db_dir, project_root, units, build_dir_patterns=build_dir_patterns)
-        return reload_manifest(db_dir)
+        gen_hash = generate_manifest(compile_commands, db_dir, project_root, units, build_dir_patterns=build_dir_patterns, scope=scope)
+        return reload_manifest(db_dir, gen_hash)
     else:
         # ── Incremental update (tu_headers=None, manifest exists) ──
         old_entries = {e.get("file", ""): e for e in manifest.get("entries", [])}
@@ -260,7 +261,7 @@ def _update_manifest_after_index(
 
         from .manifest import compute_config_hash as _compute_cc_hash
 
-        config_hash = _compute_cc_hash(units, project_root, _derive_id(project_root), build_dir_patterns)
+        config_hash = _compute_cc_hash(units, project_root, _derive_id(project_root), build_dir_patterns, scope=scope)
     config_hash = save(manifest_data, db_dir, config_hash)
     header_count = sum(len(e.get("headers", [])) for e in entries)
     log.info("manifest.json saved: %d TUs, %d headers, config_hash=%s", len(entries), header_count, config_hash[:12])

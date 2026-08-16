@@ -296,6 +296,8 @@ async def explain_symbol(
     name: Annotated[str, Field(description="Symbol name to explain. E.g. 'uart_init', 'ModemMsg::send'.")],
     project_root: Annotated[str | None, Field(description="Project root. Auto-detected if omitted.")] = None,
     context_lines: Annotated[int, Field(description="Lines of source context around the symbol definition.")] = 40,
+    variant: Annotated[str | None, Field(description="Build variant name (multi-project). Omit to use default_variant or fail-closed. Use '*' for all variants.")] = None,
+    image: Annotated[str | None, Field(description="Sysbuild image name within the variant (multi-project). Omit for all images of the variant.")] = None,
 ) -> dict:
     """Explain what a C/C++ symbol does in plain English — libclang-aware
     analysis. Uses pre-computed LLM analysis when available (instant),
@@ -324,7 +326,7 @@ async def explain_symbol(
         ``value`` (raw definition), and ``expanded_value``.
     """
     try:
-        db = BaseHandler.resolve_db_context(project_root)
+        db = BaseHandler.resolve_db_context(project_root, variant=variant, image=image)
     except RuntimeError as e:
         return {"error": str(e)}
     cfg = db.cfg
@@ -443,6 +445,8 @@ async def explain_symbol(
 def get_source(
     name: Annotated[str, Field(description="Fully qualified symbol name. Returns exact function body via libclang extent.")],
     project_root: Annotated[str | None, Field(description="Project root. Auto-detected if omitted.")] = None,
+    variant: Annotated[str | None, Field(description="Build variant name (multi-project). Omit to use default_variant or fail-closed. Use '*' for all variants.")] = None,
+    image: Annotated[str | None, Field(description="Sysbuild image name within the variant (multi-project). Omit for all images of the variant.")] = None,
 ) -> dict:
     """Read a C/C++ function/method/enum/macro body using libclang exact
     extents — no guessing line numbers. Uses AST-precise {start, end}
@@ -475,7 +479,7 @@ def get_source(
         ``expanded_value`` (preprocessor-resolved macro value) when applicable.
     """
     try:
-        db = BaseHandler.resolve_db_context(project_root)
+        db = BaseHandler.resolve_db_context(project_root, variant=variant, image=image)
     except RuntimeError as e:
         return {"error": str(e)}
     root = db.root
@@ -559,6 +563,8 @@ def get_file_map(
     project_root: Annotated[str | None, Field(description="Project root. Auto-detected if omitted.")] = None,
     signatures: Annotated[bool, Field(description="Include full function signatures in output.")] = False,
     max_per_kind: Annotated[int, Field(description="Max items per symbol kind group (default 30, 0 = unlimited).")] = 30,
+    variant: Annotated[str | None, Field(description="Build variant name (multi-project). Omit to use default_variant or fail-closed. Use '*' for all variants.")] = None,
+    image: Annotated[str | None, Field(description="Sysbuild image name within the variant (multi-project). Omit for all images of the variant.")] = None,
 ) -> dict:
     """Fast structural map of all C/C++ symbols in a file grouped by kind —
     libclang-powered table of contents. Like a table of contents before
@@ -596,7 +602,7 @@ def get_file_map(
         subgroups?[]}}}
     """
     try:
-        db = BaseHandler.resolve_db_context(project_root)
+        db = BaseHandler.resolve_db_context(project_root, variant=variant, image=image)
     except RuntimeError as e:
         return {"error": str(e)}
     root = db.root
@@ -848,6 +854,8 @@ def _collect_override_info(
 def get_symbol_context(
     name: Annotated[str, Field(description="Symbol name. Returns body, signature, all direct callers and callees.")],
     project_root: Annotated[str | None, Field(description="Project root. Auto-detected if omitted.")] = None,
+    variant: Annotated[str | None, Field(description="Build variant name (multi-project). Omit to use default_variant or fail-closed. Use '*' for all variants.")] = None,
+    image: Annotated[str | None, Field(description="Sysbuild image name within the variant (multi-project). Omit for all images of the variant.")] = None,
 ) -> dict:
     """Rich one-shot context for a C/C++ symbol: body, signature, all direct
     callers and callees. Answers "what does this do and how does it fit in
@@ -891,7 +899,7 @@ def get_symbol_context(
         return values/side effects.
     """
     try:
-        db = BaseHandler.resolve_db_context(project_root)
+        db = BaseHandler.resolve_db_context(project_root, variant=variant, image=image)
     except RuntimeError as e:
         return {"error": str(e)}
     root = db.root
@@ -999,6 +1007,8 @@ def get_symbol_context(
 def read_file(
     file_path: Annotated[str, Field(description="Path to source file — relative to project root or just filename.")],
     project_root: Annotated[str | None, Field(description="Project root. Auto-detected if omitted.")] = None,
+    variant: Annotated[str | None, Field(description="Build variant name (multi-project). Omit to use default_variant or fail-closed. Use '*' for all variants.")] = None,
+    image: Annotated[str | None, Field(description="Sysbuild image name within the variant (multi-project). Omit for all images of the variant.")] = None,
 ) -> dict:
     """Read a complete C/C++ source file with **ifdef-filtered** content —
     only code that actually compiles for the current build configuration.
@@ -1035,7 +1045,7 @@ def read_file(
         indexed content)}.
     """
     try:
-        db = BaseHandler.resolve_db_context(project_root)
+        db = BaseHandler.resolve_db_context(project_root, variant=variant, image=image)
     except RuntimeError as e:
         return {"error": str(e)}
     root = db.root
