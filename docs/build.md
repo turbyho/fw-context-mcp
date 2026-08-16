@@ -140,6 +140,76 @@ This build system needs no extra parameters. Everything is in `platformio.ini`.
 | `toolchain_path` | `str` | — | The path to the toolchain `bin` directory |
 | `toolchain_prefix` | `str` | — | The prefix, for example `"arm-none-eabi-"` |
 
+## Multi-project and multi-image builds
+
+One workspace can build several boards or images. Each board or image is
+a **build variant**. You declare each variant with `[[build.variants]]` in
+`.fw-context/config.toml`. Each `(variant, image)` pair becomes one
+indexed build, with its own `config_hash`.
+
+**Why use variants.** You index every board in one run. A query can
+target one variant, or all variants. You do not need one checkout per
+board.
+
+### Concepts
+
+- **Variant** — one build configuration, for one board, target, or environment.
+- **Image** — one sysbuild image inside a variant (Zephyr only). An
+  example is the `app` image and the `mcuboot` bootloader image.
+
+### `[[build.variants]]` reference
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `name` | `str` | — | **Required.** A unique key. The query tools and the CLI reference this key. |
+| `board` | `str` | — | The board, target, or chip label for this variant. This value overrides `[build] board`. |
+| `description` | `str` | — | A human-readable description. |
+| `build_dir` | `str` | `build/<name>` | The build output directory for this variant. |
+| `env` | `dict` | — | Build environment variables. fw-context folds these variables into the `config_hash`. |
+| `images` | `list` | — | The sysbuild images (Zephyr only). |
+| *(any other `[build]` key)* | — | — | Overrides the shared `[build]` value for this variant only. |
+
+The `images` sub-table:
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `name` | `str` | — | The image name. |
+| `dir` | `str` | — | The path to the image source. |
+| `type` | `str` | `"project"` | `"project"` or `"sdk"`. |
+| `board` | `str` | — | A per-image board override. |
+
+Shared `[build]` keys for multi-variant projects:
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `default_variant` | — | The variant that a query uses when it omits `variant`. |
+| `default_image` | — | The image that a query uses when it omits `image`. |
+| `sysbuild` | `false` | Use `west build --sysbuild` (Zephyr). |
+| `source_dir` | — | The sysbuild input application directory (Zephyr). |
+
+Variant overrides merge with the shared `[build]` section by type. A
+scalar value (such as `board`) replaces the shared value. A list value
+(such as `defines`) replaces the shared list. A dict value (such as
+`env`) merges into the shared dict.
+
+### Index the variants
+
+```bash
+fw-context index --build                          # build and index every variant
+fw-context index --build --variant nrf52840-dev   # one variant
+fw-context index --build --variants a,b           # a list of variants
+fw-context index --image app                      # one image only
+fw-context index --exclude-image mcuboot          # skip one image
+```
+
+### Manage the variants
+
+```bash
+fw-context init-variants list
+fw-context init-variants add --name <name> --board <board>
+fw-context init-variants remove <name>
+```
+
 ## Examples
 
 ### 1. PlatformIO (ESP32)
@@ -366,6 +436,75 @@ activate = "/home/user/esp/esp-idf/export.sh"
 
 `fw-context init` checks `$IDF_PATH`, `~/esp/esp-idf/export.sh`, and
 `idf.py` on PATH.
+
+### 15. Multi-variant — one codebase, several boards (bare mode)
+
+One `bare` build compiles the same sources for two boards. Each variant
+overrides the board and the preprocessor defines:
+
+```toml
+[build]
+system = "bare"
+compiler = "arm-none-eabi-gcc"
+source_dirs = ["src", "lib"]
+include_dirs = ["include"]
+default_variant = "board-a"
+
+[[build.variants]]
+name = "board-a"
+board = "STM32F407xx"
+defines = ["USE_HAL_DRIVER", "STM32F407xx"]
+
+[[build.variants]]
+name = "board-b"
+board = "STM32F103xx"
+defines = ["USE_HAL_DRIVER", "STM32F103xx"]
+```
+
+### 16. Multi-variant — Mbed OS targets
+
+One Mbed OS project builds two targets. Each variant overrides the target
+and the hardware revision define:
+
+```toml
+[build]
+system = "mbed-os"
+toolchain = "GCC_ARM"
+
+[[build.variants]]
+name = "target-a"
+target = "P_ECB_BOARD"
+defines = ["HW_REV=1"]
+
+[[build.variants]]
+name = "target-b"
+target = "OTHER_BOARD"
+defines = ["HW_REV=2"]
+```
+
+### 17. Multi-variant and multi-image — Zephyr sysbuild
+
+A Zephyr sysbuild project builds one variant with two images: the `app`
+image and the `mcuboot` bootloader image. Each image becomes a separate
+indexed build:
+
+```toml
+[build]
+system = "zephyr"
+sysbuild = true
+source_dir = "proj/app"
+default_variant = "nrf52840-dev"
+
+[[build.variants]]
+name = "nrf52840-dev"
+board = "nrf52840dk/nrf52840"
+build_dir = "build/nrf52840_sysbuild"
+env = { ZBOX_ENV = "DEV" }
+images = [
+  { name = "app",      dir = "proj/app",                  type = "project" },
+  { name = "mcuboot",  dir = "${NCS}/bootloader/mcuboot", type = "sdk" },
+]
+```
 
 ## Troubleshooting
 
