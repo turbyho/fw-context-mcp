@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import logging
 import sqlite3
+from pathlib import Path
 from unittest import mock
 
 import pytest
@@ -476,6 +477,38 @@ class TestBuildEmbeddingsIncremental:
 
         assert fake.calls > first_calls, (
             "A changed symbol must be re-embedded on the next run"
+        )
+
+    def test_vec0_failure_does_not_discard_blob_write(self, populated_db, tmpdir):
+        """vec0 insert failure must not roll back the legacy BLOB embeddings.
+
+        The fake embedder returns dim=8 while the vec0 table is created with
+        the 1024-dim default, so ``upsert_embeddings_vec`` fails.  That failure
+        is non-fatal and must leave the BLOB row intact — otherwise the next
+        incremental run re-embeds everything.
+        """
+        from fw_context_mcp.indexer._embedding import _build_embeddings
+
+        conn = populated_db
+        self._seed(conn, "hash-deadbeef")
+        fake = _FakeEmbedder()
+
+        with mock.patch(
+            "fw_context_mcp.indexer._embedding.get_embedder", return_value=fake,
+        ):
+            _build_embeddings(conn, "hash-deadbeef", None, tmpdir)
+
+        row = conn.execute(
+            """SELECT e.content_hash
+               FROM embeddings e
+               JOIN symbols s ON s.id = e.symbol_id
+               WHERE s.usr = 'u_foo'"""
+        ).fetchone()
+        assert row is not None, (
+            "BLOB embedding must persist even when the vec0 insert fails"
+        )
+        assert len(row["content_hash"]) == 64, (
+            "content_hash must be a stored sha256 hex digest"
         )
 
 
