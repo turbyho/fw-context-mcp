@@ -292,6 +292,7 @@ def _check_and_parse_unit(
     existing_files,
     force=False,
     manifest=None,
+    reuse_possible: bool = True,
     skip_files: set[str] | None = None,
 ):
     """Check whether *unit* needs re-parsing and parse it if so.
@@ -317,6 +318,12 @@ def _check_and_parse_unit(
             is checked via hash comparison against the manifest (fast —
             file reads + SHA-256 only).  When ``None``, falls back to
             source-hash-only comparison.
+        reuse_possible: When False, Tier 2b (reuse from an old build) is
+            skipped entirely.  The caller sets this False when the DB has
+            no prior build data to migrate from (e.g. after ``reset_index``
+            while ``manifest.json`` survives on disk) — reuse would hash
+            source+headers and run a reassignment query for every TU, then
+            fall through to a full parse anyway.
 
     Returns:
         * ``("unchanged", None, None, None)`` — no re-parse needed (Tier 1 mtime match).
@@ -392,7 +399,7 @@ def _check_and_parse_unit(
     # the PREVIOUS index provides source_hash, header hashes, and flags_hash.
     # If all three match current disk content, the TU is unchanged despite
     # the new config_hash — skip the expensive libclang parse.
-    if not force_refs and file_path not in existing_files and manifest is not None:
+    if reuse_possible and not force_refs and file_path not in existing_files and manifest is not None:
         from .manifest import check_tu_staleness
         from .manifest import get_manifest_entry_hash as _entry_hash
 

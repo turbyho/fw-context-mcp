@@ -309,6 +309,19 @@ def run(
 
     existing_files = get_file_hashes(conn, config_hash)
 
+    # After reset_index (DB wipe) manifest.json survives on disk, but there
+    # is no old build data to migrate from.  Tier 2b (reuse) can never
+    # produce symbols then — for each TU it would re-hash source+headers and
+    # run a pointless reassignment query before falling through to a full
+    # parse.  Detect "no old build" once up front and disable the reuse path.
+    has_old_build = (
+        conn.execute(
+            "SELECT 1 FROM files WHERE config_hash != ? LIMIT 1",
+            (config_hash,),
+        ).fetchone()
+        is not None
+    )
+
     # Pre-build lookup dict for O(1) manifest entry access during Tier 2 checks.
     # *manifest* was loaded above (before config_hash computation) — reuse it.
     manifest_lookup: dict[str, dict] = {}
@@ -420,6 +433,7 @@ def run(
             existing_files,
             force=force,
             manifest=manifest_lookup,
+            reuse_possible=has_old_build,
             skip_files=skip_files,
         )
 
