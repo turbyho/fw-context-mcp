@@ -51,13 +51,9 @@ def lookup_symbol(
 ) -> list[dict]:
     """Look up a C/C++ symbol by name via libclang index — exact or prefix
     matching. Finds symbols text-based search can miss: build-conditional
-    code, template instantiations, macro-expanded names. Prefer this when
-    you know the exact symbol name or prefix. Falls back to macro lookup.
-
-    Finds symbols text-based search can miss: build-conditional code, template
-    instantiations, macro-expanded names. Macros are extracted via
-    ``clang -dM -E`` during indexing so ``#ifdef``-conditional macros
-    resolve correctly for the active build config. Prefer this over
+    code, template instantiations, macro-expanded names. Macros are
+    extracted via ``clang -dM -E`` during indexing so ``#ifdef``-conditional
+    macros resolve correctly for the active build config. Prefer this over
     search_code when you know the exact symbol name or a prefix
     (``uart_`` finds all UART symbols). Use search_code for
     keyword/concept search.
