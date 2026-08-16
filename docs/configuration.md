@@ -52,6 +52,63 @@ This section controls how `fw-context index` generates `compile_commands.json`. 
 | `source_dirs` | *(none)* | project | The source directories for the manual (bare) mode. `fw-context init` asks for this value when you select the bare mode interactively. |
 | `include_dirs` | *(none)* | project | The include directories for the manual (bare) mode. |
 
+#### `[[build.variants]]` — Multi-project and multi-image builds
+
+One workspace can build several boards or images. You declare each build
+as a **variant**, with an array-of-tables entry. Each `(variant, image)`
+pair becomes one indexed build, with its own `config_hash`. This feature
+works for every build system, not only Zephyr.
+
+Shared `[build]` keys for multi-variant projects:
+
+| Key | Default | Scope | Description |
+|-----|---------|-------|-------------|
+| `default_variant` | *(none)* | project | The variant that a query uses when it omits `variant`. Without this key, a query without `variant` fails closed. |
+| `default_image` | *(none)* | project | The image that a query uses when it omits `image`. |
+| `sysbuild` | `false` | project | Use `west build --sysbuild` (Zephyr). |
+| `source_dir` | *(none)* | project | The sysbuild input application directory (Zephyr). |
+| `build_dir` | *(none)* | project | The default build output directory. Each variant can override this value. |
+| `env` | *(none)* | project | Build environment variables, shared by every variant. |
+
+Each `[[build.variants]]` table:
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `name` | *(required)* | A unique key. The query tools and the CLI reference this key. |
+| `board` | *(none)* | The board, target, or chip label for this variant. This value overrides `[build] board`. |
+| `description` | *(none)* | A human-readable description. |
+| `build_dir` | `build/<name>` | The build output directory for this variant. |
+| `env` | *(none)* | Build environment variables. fw-context folds these variables into the `config_hash`. |
+| `images` | *(none)* | The sysbuild images (Zephyr only). Each image has `name`, `dir`, `type` (`"project"` or `"sdk"`), and an optional `board`. |
+| *(any other `[build]` key)* | — | Overrides the shared `[build]` value for this variant only. |
+
+Variant overrides merge with the shared `[build]` section by type. A
+scalar value (such as `board`) replaces the shared value. A list value
+(such as `defines`) replaces the shared list. A dict value (such as
+`env`) merges into the shared dict.
+
+```toml
+[build]
+system = "bare"
+compiler = "arm-none-eabi-gcc"
+source_dirs = ["src", "lib"]
+include_dirs = ["include"]
+default_variant = "board-a"
+
+[[build.variants]]
+name = "board-a"
+board = "STM32F407xx"
+defines = ["USE_HAL_DRIVER", "STM32F407xx"]
+
+[[build.variants]]
+name = "board-b"
+board = "STM32F103xx"
+defines = ["USE_HAL_DRIVER", "STM32F103xx"]
+```
+
+For a Zephyr sysbuild example, see [Build Configuration → Multi-project
+and multi-image builds](build.md).
+
 ### `[index]` — Indexer
 
 | Key | Default | Scope | Description |

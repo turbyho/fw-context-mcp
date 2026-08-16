@@ -56,7 +56,16 @@ fw-context index --source-roots src lib drivers
 | `--no-analyze` | off | Skip LLM symbol analysis |
 | `--analyze` | on | Force LLM symbol analysis (negates --no-analyze) |
 | `--force` | off | Force re-index of all files, embeddings, LLM analysis, overrides, PageRank, and hotspot cache (bypasses mtime checks) |
+| `--variant NAME` | all variants | Restrict indexing to one build variant (name from `[[build.variants]]`) |
+| `--variants A,B` | all variants | Comma-separated list of build variants to index |
+| `--image NAME` | all images | Restrict indexing to one sysbuild image |
+| `--exclude-image NAME` | none | Exclude a sysbuild image from indexing (repeatable) |
 | `-v` | off | Verbose progress output |
+
+For a multi-variant project, `fw-context index --build` builds and indexes
+every variant. Use `--variant`, `--variants`, `--image`, or
+`--exclude-image` to narrow the run. See
+[Build Configuration → Multi-project and multi-image builds](build.md).
 
 **Generating `compile_commands.json`:**
 
@@ -256,6 +265,32 @@ fw-context quickstart                  # deps + build + config + checklist
 This command shares the `--project`, `--dry-run`, `--skip-doctor`,
 `--skip-build`, `--non-interactive`, and `--name` flags with
 `fw-context init`.
+
+### `fw-context init-variants`
+
+Manage `[[build.variants]]` in `.fw-context/config.toml`, for a project
+that is already initialized. This command adds, removes, or lists build
+variants, without re-running the agent and dependency provisioning.
+
+```bash
+fw-context init-variants list                          # list declared variants
+fw-context init-variants add --name <name> --board <board>
+fw-context init-variants add --name <name> --board <board> --description "text"
+fw-context init-variants add --name <name> --build-dir build/<name>
+fw-context init-variants add --name <name> --env ZBOX_ENV=DEV
+fw-context init-variants remove <name>
+```
+
+| Subcommand | Description |
+|-----------|-------------|
+| `list` | Read `[[build.variants]]` from `config.toml` (what the config declares) |
+| `add` | Append one variant to `config.toml` |
+| `remove` | Remove one variant from `config.toml` |
+
+`list` shows what the config declares. It does not show what fw-context
+has indexed. After you add or remove a variant, run `fw-context index
+--build` to index the new set. The MCP `list_variants` tool shows what is
+actually indexed.
 
 ### `fw-context export`
 
@@ -504,6 +539,14 @@ All tools accept an optional `project_root` parameter, which defaults to a
 value that fw-context detects automatically from the current working
 directory. Every input block below shows this parameter, but you typically
 omit it, because the automatic detection handles the common case.
+
+**Multi-variant projects.** For a project with `[[build.variants]]`, every
+query tool also accepts `variant` and `image` parameters. When you omit
+`variant`, fw-context uses `[build] default_variant`, or returns an error
+that lists the valid names. Set `variant` to `"*"` to query every variant.
+A multi-variant result annotates each record with its `variant` and
+`image`. Call `get_active_build` to see the variants and images that
+fw-context has indexed.
 
 ### Search & lookup
 
@@ -1353,6 +1396,38 @@ dependency tracking.
 `unanalyzed_symbols` counts the definition symbols that still need LLM
 analysis. This count is zero when analysis is disabled, and empty when
 fw-context has analyzed all symbols.
+
+**Multi-variant output.** For a project with `[[build.variants]]`, the
+result adds these fields:
+
+- `multi` — `true` for a multi-variant project
+- `variants` — a list of `{name, description, board}`
+- `images` — a list of `{name, description, dir, type, board?}`
+- `variant_images` — a map of variant name to its image names
+- `active_variant` — the `[build] default_variant` value
+- `active_image` — the `[build] default_image` value
+
+#### `list_variants`
+
+List every indexed build, with its `(variant, image, board)` identity.
+This tool shows what fw-context actually indexed, not what the config
+declares. Each `builds` entry is one `(variant, image)` build, with its
+own `config_hash` and symbol count.
+
+```
+Input:  {"project_root?": "/path/to/project"}
+Output: {"multi": true, "builds": [
+           {"variant": "nrf52840-dev", "image": "app", "board": "nrf52840dk/nrf52840",
+            "config_hash": "a1b2…", "symbol_count": 12430, "file_count": 1502,
+            "manifest_verification": "full"},
+           {"variant": "nrf52840-dev", "image": "mcuboot", "board": "nrf52840dk/nrf52840",
+            "config_hash": "c3d4…", "symbol_count": 3120, "file_count": 480,
+            "manifest_verification": "full"}]}
+```
+
+For a single-project index, this tool returns one `builds` entry, with an
+empty `variant` and an empty `image`. Use `get_active_build` for the
+human-readable variant and image discovery.
 
 #### `reindex_file`
 
