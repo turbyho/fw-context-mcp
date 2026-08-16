@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import ipaddress
 import logging
+import os
 import re
 import sys
 import tomllib
@@ -1209,6 +1210,17 @@ def load(project_root: Path | None = None) -> Config:
     from ..llm.auto_model import resolve_embed_model
     resolve_embed_model(cfg.llm)
     cfg.index.db_dir = cfg.index.db_dir.expanduser().resolve()
+
+    # Test isolation: FW_CONTEXT_INDEX_DIR redirects the DEFAULT index DB
+    # directory (~/.fw-context/index) for the whole process.  Tests set this
+    # to a temp dir so no test writes to the user's real index.  Inherited by
+    # subprocesses, so CLI invocations spawned from tests are isolated too.
+    # An explicit db_dir in config.toml/local.toml still wins — this only
+    # catches tests that forget to set db_dir and would fall back to the home.
+    _default_db_dir = (Path.home() / ".fw-context" / "index").resolve()
+    _env_index_dir = os.environ.get("FW_CONTEXT_INDEX_DIR")
+    if _env_index_dir and cfg.index.db_dir == _default_db_dir:
+        cfg.index.db_dir = Path(_env_index_dir).expanduser().resolve()
 
     # Cache with current mtime
     try:
