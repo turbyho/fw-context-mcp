@@ -26,11 +26,11 @@ from pathlib import Path
 
 import pytest
 
-pytestmark = pytest.mark.system
-
 from fw_context_mcp.indexer.build import detect_build_system
 from fw_context_mcp.indexer.builders import registry as builder_registry
 from fw_context_mcp.indexer.db import open_db
+
+pytestmark = pytest.mark.system
 
 # ── Helpers ────────────────────────────────────────────────────────────────
 

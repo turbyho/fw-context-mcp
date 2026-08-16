@@ -7,6 +7,7 @@ unknown phase handling, predefined configs, context creation/validation.
 from __future__ import annotations
 
 import asyncio
+from dataclasses import FrozenInstanceError
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -310,7 +311,7 @@ class TestPipelineContext:
     def test_context_is_frozen(self) -> None:
         """PipelineContext is frozen — direct mutation raises."""
         ctx = _make_ctx()
-        with pytest.raises(Exception):  # FrozenInstanceError or AttributeError
+        with pytest.raises(FrozenInstanceError):
             ctx.limit = 999  # type: ignore[misc]
 
     def test_create_raises_valueerror_when_no_index(self, tmp_path: Path) -> None:

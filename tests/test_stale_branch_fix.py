@@ -91,11 +91,11 @@ class TestPurgeFileRecords:
         )
 
         # Insert macro for f1
-        mac_id = conn.execute(
+        conn.execute(
             "INSERT INTO macros(config_hash, file_id, name, value, expanded_value, line, is_function_like) "
-            "VALUES (?,?,?,?,?,?,0) RETURNING id",
+            "VALUES (?,?,?,?,?,?,0)",
             (ch, f1, "MY_MACRO", "1", "1", 1),
-        ).fetchone()["id"]
+        )
 
         # Insert inheritance edge (f1 → f2)
         class_usr1 = "c:@S@A"
