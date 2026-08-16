@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import shutil
 import tempfile
 import time
@@ -130,6 +131,28 @@ def pytest_sessionfinish(session, exitstatus):
 
 
 # ── Standard fixtures ──────────────────────────────────────────────────────
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _isolate_index_dir():
+    """Redirect fw-context index writes to a session temp dir.
+
+    Sets ``FW_CONTEXT_INDEX_DIR`` for the whole test run, so every test
+    (including new tests) writes index databases to a temp dir instead of
+    the real ``~/.fw-context/index``.  The env var is inherited by any
+    subprocess a test spawns, so CLI invocations stay isolated too.  The
+    temp dir is removed at session end.
+    """
+    prev = os.environ.get("FW_CONTEXT_INDEX_DIR")
+    with tempfile.TemporaryDirectory(prefix="fw-context-index-") as d:
+        os.environ["FW_CONTEXT_INDEX_DIR"] = d
+        try:
+            yield d
+        finally:
+            if prev is None:
+                os.environ.pop("FW_CONTEXT_INDEX_DIR", None)
+            else:
+                os.environ["FW_CONTEXT_INDEX_DIR"] = prev
 
 
 @pytest.fixture
