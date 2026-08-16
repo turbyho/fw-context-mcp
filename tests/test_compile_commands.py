@@ -155,6 +155,16 @@ class TestNormalizeArgs:
         result = normalize_args([f"@{rsp}", "-std=c++14", "main.cpp"], tmpdir)
         assert "-DEXTRA=1" in result
 
+    def test_appends_suppress_unknown_warning(self):
+        result = normalize_args(["-Wno-maybe-uninitialized", "-Wall", "main.cpp"], Path.cwd())
+        assert result[-1] == "-Wno-unknown-warning-option"
+        assert "-Wno-maybe-uninitialized" in result
+
+    def test_suppress_flag_wins_after_werror(self):
+        result = normalize_args(["-Werror", "-std=c99", "main.c"], Path.cwd())
+        assert result[-1] == "-Wno-unknown-warning-option"
+        assert result.index("-Werror") < result.index("-Wno-unknown-warning-option")
+
 
 class TestGccSystemIncludes:
     def test_no_lib_gcc_returns_empty(self, tmpdir):

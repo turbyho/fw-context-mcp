@@ -349,6 +349,11 @@ def normalize_args(
         else:
             resolved.append(token)
 
+    # Silences clang's "unknown warning option" diagnostic for every GCC-only
+    # -W flag at once.  Appended last so it also wins over an earlier -Werror,
+    # which would otherwise turn the diagnostic into a hard parse error.
+    resolved.append("-Wno-unknown-warning-option")
+
     return resolved
 
 
