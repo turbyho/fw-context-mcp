@@ -951,12 +951,13 @@ class TestConfigHashStability:
         from fw_context_mcp.indexer.compile_commands import parse as parse_cc
         from fw_context_mcp.indexer.manifest import compute_structural_hash
 
-        cc = _cc_path(_BUILDS / "generic_cmake")
+        project_root = _BUILDS / "generic_cmake"
+        cc = _cc_path(project_root)
         assert cc.exists(), "Run CMake init+index test first to generate cc.json"
         units1 = list(parse_cc(cc))
         units2 = list(parse_cc(cc))
-        h1 = compute_structural_hash(cc, cc.parent, units1)
-        h2 = compute_structural_hash(cc, cc.parent, units2)
+        h1 = compute_structural_hash(cc, project_root, units1)
+        h2 = compute_structural_hash(cc, project_root, units2)
         assert h1 == h2
 
     def test_config_hash_changes_with_different_cc(self, tmp_path):
