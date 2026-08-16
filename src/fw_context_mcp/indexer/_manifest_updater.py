@@ -261,7 +261,7 @@ def _update_manifest_after_index(
 
         from .manifest import compute_config_hash as _compute_cc_hash
 
-        config_hash = _compute_cc_hash(units, project_root, _derive_id(project_root), build_dir_patterns, scope=scope)
+        config_hash = _compute_cc_hash(units, project_root, _derive_id(project_root), build_dir_patterns, scope=scope, db_dir=db_dir)
     config_hash = save(manifest_data, db_dir, config_hash)
     header_count = sum(len(e.get("headers", [])) for e in entries)
     log.info("manifest.json saved: %d TUs, %d headers, config_hash=%s", len(entries), header_count, config_hash[:12])

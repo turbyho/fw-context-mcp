@@ -1056,7 +1056,7 @@ def _cleanup_old_for_pair(
     """Delete older builds of one ``(variant, image)`` pair, keeping *keep_hash*.
 
     Returns the list of deleted ``config_hash`` values.  Also removes the
-    debug artifacts ``~/.fw-context/index/<project_id>/compile_commands.<hash>.json``
+    debug artifacts ``<db_dir>/<project_id>/compile_commands.<hash>.json``
     so no orphaned files survive retention.
     """
     old_rows = conn.execute(
@@ -1072,7 +1072,7 @@ def _cleanup_old_for_pair(
             delete_build_data(conn, old_ch)
         deleted.append(old_ch)
 
-    cc_dir = Path.home() / ".fw-context" / "index" / project_id
+    cc_dir = db_dir / project_id
     if cc_dir.exists():
         for old_ch in deleted:
             try:

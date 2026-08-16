@@ -184,7 +184,7 @@ def generate(
         # New callers should pass config_hash computed from the normalized
         # compile_commands.json instead.
         project_id = derive_project_id(project_root)
-        config_hash = compute_config_hash(units, project_root, project_id, build_dir_patterns, scope=scope)
+        config_hash = compute_config_hash(units, project_root, project_id, build_dir_patterns, scope=scope, db_dir=db_dir)
 
     manifest["config_hash"] = config_hash
     manifest_json = json.dumps(manifest, sort_keys=True, indent=2, ensure_ascii=False)
@@ -305,7 +305,7 @@ def build_preliminary(
     if not project_id:
         project_id = derive_project_id(project_root)
 
-    config_hash = compute_config_hash(units, project_root, project_id, build_dir_patterns, scope=scope)
+    config_hash = compute_config_hash(units, project_root, project_id, build_dir_patterns, scope=scope, db_dir=db_dir)
 
     # Build entries for the manifest file
     entries: list[dict] = []
@@ -394,6 +394,7 @@ def compute_config_hash(
     project_id: str,
     build_dir_patterns: list[str] | None = None,
     scope: list[str] | None = None,
+    db_dir: Path | None = None,
 ) -> str:
     """Return SHA-256 of the **normalized** compile_commands.json.
 
@@ -420,7 +421,7 @@ def compute_config_hash(
        IDs injected by the build system).
 
     The canonical JSON is written to
-    ``~/.fw-context/index/<project_id>/compile_commands.<hash>.json``
+    ``<db_dir>/<project_id>/compile_commands.<hash>.json``
     as a debug artifact — ``diff`` between two versions shows only
     semantic differences, without flag-ordering or path-format noise.
 
@@ -567,14 +568,18 @@ def compute_config_hash(
     canonical_json = json.dumps(canonical, sort_keys=True, indent=2, ensure_ascii=False)
     config_hash = hashlib.sha256(canonical_json.encode()).hexdigest()
 
-    # Write canonical JSON as a debug artifact
-    cc_dir = Path.home() / ".fw-context" / "index" / project_id
-    cc_dir.mkdir(parents=True, exist_ok=True)
-    out_path = cc_dir / f"compile_commands.{config_hash}.json"
-    try:
-        out_path.write_text(canonical_json, encoding="utf-8")
-    except OSError:
-        pass  # best-effort — hash is already computed
+    # Write canonical JSON as a debug artifact under the configured index dir
+    # (db_dir), never ~/.fw-context/index.  db_dir is None only on the no-I/O
+    # path (compute_structural_hash) — skip the artifact there so no stray
+    # file escapes test isolation (FW_CONTEXT_INDEX_DIR).
+    if db_dir is not None:
+        cc_dir = db_dir / project_id
+        cc_dir.mkdir(parents=True, exist_ok=True)
+        out_path = cc_dir / f"compile_commands.{config_hash}.json"
+        try:
+            out_path.write_text(canonical_json, encoding="utf-8")
+        except OSError:
+            pass  # best-effort — hash is already computed
 
     return config_hash
 
