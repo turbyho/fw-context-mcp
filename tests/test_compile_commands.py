@@ -123,6 +123,20 @@ class TestNormalizeArgs:
         assert "-Wno-stringop-truncation" not in result
         assert "-Wall" in result
 
+    def test_drops_format_signedness(self):
+        result = normalize_args(["-Wformat-signedness", "-Wall", "main.c"], Path.cwd())
+        assert "-Wformat-signedness" not in result
+        assert "-Wall" in result
+
+    def test_drops_format_overflow_level(self):
+        result = normalize_args(
+            ["-Wformat-overflow=2", "-Wformat-truncation=1", "-Wall", "main.c"],
+            Path.cwd(),
+        )
+        assert not any(a.startswith("-Wformat-overflow") for a in result)
+        assert not any(a.startswith("-Wformat-truncation") for a in result)
+        assert "-Wall" in result
+
     def test_injects_target_for_cortex(self):
         result = normalize_args(["-mcpu=cortex-m4", "-std=c++14", "main.cpp"], Path.cwd())
         assert result[0] == "--target=arm-none-eabi"

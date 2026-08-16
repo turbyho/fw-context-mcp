@@ -36,6 +36,23 @@ _DROP_FLAGS = frozenset({
     "-Wno-missing-parameter-type",
     "-Wold-style-declaration",
     "-Wno-old-style-declaration",
+    # GCC-only format warnings (libclang does not implement these)
+    "-Wformat-signedness",
+    "-Wno-format-signedness",
+    "-Wformat-overflow",
+    "-Wno-format-overflow",
+    "-Wformat-truncation",
+    "-Wno-format-truncation",
+})
+
+# GCC-only warning flags that take a level suffix (=1, =2) — drop any token
+# matching one of these prefixes. Clang rejects them as unknown options,
+# which becomes a hard error under -Werror and aborts the TU parse.
+_DROP_PREFIXES = frozenset({
+    "-Wformat-overflow=",
+    "-Wno-format-overflow=",
+    "-Wformat-truncation=",
+    "-Wno-format-truncation=",
 })
 
 # Two-token flags: drop both the flag and its next argument
@@ -275,6 +292,9 @@ def normalize_args(
             continue
 
         if token in _DROP_FLAGS:
+            continue
+
+        if token.startswith(tuple(_DROP_PREFIXES)):
             continue
 
         # -specs=<arg> and -specs <arg>
