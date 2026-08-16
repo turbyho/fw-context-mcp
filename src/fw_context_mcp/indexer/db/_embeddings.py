@@ -22,6 +22,7 @@ __all__ = [
     "_vec_to_blob",
     "clean_orphan_embeddings",
     "get_embeddings",
+    "get_vec_dim",
     "init_vec_table",
     "search_similar_hybrid",
     "search_similar_vec",
@@ -30,6 +31,7 @@ __all__ = [
 ]
 
 import logging
+import re
 import sqlite3
 import struct
 
@@ -238,6 +240,31 @@ def init_vec_table(conn: sqlite3.Connection, dim: int | None = None, *, recreate
     # above — no SQL injection risk.
     conn.execute(_VEC_SCHEMA.format(dim=dim))
     conn.commit()
+
+
+def get_vec_dim(conn: sqlite3.Connection) -> int | None:
+    """Return the dimension of the existing ``vec_symbols`` vec0 table.
+
+    Reads the dimension from the ``sqlite_master`` CREATE statement
+    (``embedding float[N]``) — the table itself is the source of truth.
+    ``build_configs.embedding_dim`` is NOT used here because it may be
+    NULL on a fresh build (first index) while ``ensure_schema`` has
+    already created the table with the fallback dimension (1024).  Comparing
+    against that stale value would mask a model switch.
+
+    Returns ``None`` when the table does not exist or the dimension cannot
+    be parsed.
+    """
+    try:
+        row = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'vec_symbols'"
+        ).fetchone()
+    except sqlite3.OperationalError:
+        return None
+    if row is None or not row["sql"]:
+        return None
+    m = re.search(r"float\[(\d+)\]", row["sql"])
+    return int(m.group(1)) if m else None
 
 
 def upsert_embeddings_vec(

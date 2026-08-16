@@ -556,11 +556,19 @@ def _build_embeddings(
         if embedding_dim is None and embs:
             embedding_dim = len(embs[0])
             log.info("Embedding dimension detected: %d (model=%s)", embedding_dim, model)
-            from .db import init_vec_table
+            from .db import get_vec_dim, init_vec_table
 
-            dim_changed = stored_dim is not None and stored_dim != embedding_dim
+            actual_dim = None
+            try:
+                actual_dim = get_vec_dim(conn)
+            except SAFE_EXCEPT as e:
+                if is_fatal(e):
+                    raise
+                log.warning("vec0 dimension read failed (non-fatal): %s", e)
+
+            dim_changed = actual_dim is not None and actual_dim != embedding_dim
             if dim_changed:
-                log.info("Embedding dimension changed %d → %d — forcing full rebuild", stored_dim, embedding_dim)
+                log.info("Embedding dimension changed %d → %d — forcing full rebuild", actual_dim, embedding_dim)
                 try:
                     init_vec_table(conn, embedding_dim, recreate=True)
                 except SAFE_EXCEPT as e:
@@ -582,7 +590,7 @@ def _build_embeddings(
                 continue
             else:
                 try:
-                    init_vec_table(conn)
+                    init_vec_table(conn, embedding_dim)
                 except SAFE_EXCEPT as e:
                     if is_fatal(e):
                         raise
