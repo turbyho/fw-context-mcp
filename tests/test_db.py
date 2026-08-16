@@ -1650,7 +1650,7 @@ void interrupt_dispatch(int irq) {
         r = extract_all(
             unit, with_refs=True,
         )
-        indirect, fp_assignments = r.indirect_call_sites, r.fp_assignments
+        indirect = r.indirect_call_sites
 
         # There should be at least one indirect call site for the array call
         assert len(indirect) >= 1, (
@@ -1702,7 +1702,7 @@ void dispatch_event(struct Dispatcher* d, int event_id) {
         r = extract_all(
             unit, with_refs=True,
         )
-        indirect, fp_assignments = r.indirect_call_sites, r.fp_assignments
+        indirect = r.indirect_call_sites
 
         callbacks_calls = [c for c in indirect if c.target_name == "callbacks"]
         assert len(callbacks_calls) == 1, (

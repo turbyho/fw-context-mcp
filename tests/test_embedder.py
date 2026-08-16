@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 pytest.importorskip("numpy", reason="numpy not installed")
@@ -168,7 +170,7 @@ class TestAutoDetect:
 
     def test_embed_model_resolved_by_from_dict(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """_from_dict does NOT resolve embed_model — that's a load() responsibility.
-        
+
         _from_dict is a pure data transformation. resolve_embed_model is an I/O
         side effect (GPU detection, Ollama API) and belongs in load().
         """
