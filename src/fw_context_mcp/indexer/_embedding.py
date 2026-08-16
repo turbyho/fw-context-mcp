@@ -469,11 +469,18 @@ def _build_embeddings(
     first_chunk = True
 
     def _flush_chunk() -> None:
-        """Write accumulated batch to DB in a single transaction."""
+        """Write accumulated batch to DB, BLOB and vec0 in separate transactions."""
         nonlocal first_chunk, total
         if not chunk_blob:
             return
         with write_lock(db_dir, timeout=30.0):
+            # Commit the legacy BLOB embeddings in their own transaction first.
+            # WHY separate from the vec0 write: upsert_embeddings_vec() opens
+            # its own transaction and rolls back the whole connection when its
+            # INSERT fails (dimension mismatch, sqlite-vec not loaded).  Keeping
+            # both in one transaction would roll back the BLOB write too,
+            # silently discarding embeddings and forcing a full re-embed on the
+            # next run — which defeats incremental embedding tracking.
             with transaction(conn):
                 if first_chunk:
                     # DELETE old embeddings only for the symbols being (re)embedded.
@@ -501,13 +508,15 @@ def _build_embeddings(
                             pass
                     first_chunk = False
                 upsert_embeddings(conn, chunk_blob)
-                try:
-                    upsert_embeddings_vec(conn, chunk_vec)
-                except SAFE_EXCEPT as e:
-                    if is_fatal(e):
-                        raise
-                    log.warning("vec0 batch insert failed (sqlite-vec may not be loaded): %s", e)
                 total += len(chunk_blob)
+            # vec0 write is non-fatal — a failure here must not roll back the
+            # BLOB write committed above.
+            try:
+                upsert_embeddings_vec(conn, chunk_vec)
+            except SAFE_EXCEPT as e:
+                if is_fatal(e):
+                    raise
+                log.warning("vec0 batch insert failed (sqlite-vec may not be loaded): %s", e)
 
     _phase2_idx = 0
     batch_num = 0
