@@ -548,7 +548,7 @@ def _build_embeddings(
             log.info("Embedding dimension detected: %d (model=%s)", embedding_dim, model)
             from .db import init_vec_table
 
-            dim_changed = stored_dim != embedding_dim
+            dim_changed = stored_dim is not None and stored_dim != embedding_dim
             if dim_changed:
                 log.info("Embedding dimension changed %d → %d — forcing full rebuild", stored_dim, embedding_dim)
                 try:
