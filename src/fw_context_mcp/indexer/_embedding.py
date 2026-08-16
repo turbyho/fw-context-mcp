@@ -179,7 +179,7 @@ def _cleanup_orphaned_cc_artifacts(db_path: Path, project_id: str) -> int:
 
     Returns the number of deleted files.
     """
-    cc_dir = Path.home() / ".fw-context" / "index" / project_id
+    cc_dir = db_path.parent
     if not cc_dir.is_dir():
         return 0
 
