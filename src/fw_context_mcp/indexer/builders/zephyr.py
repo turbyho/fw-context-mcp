@@ -9,7 +9,7 @@ import subprocess
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from fw_context_mcp.utils import resolve_real_binary, run_build_command
+from fw_context_mcp.utils import cc_output_path, resolve_real_binary, run_build_command
 
 from . import registry
 from .protocol import BuildIssue
@@ -106,8 +106,8 @@ class ZephyrBuildSystem:
                     "Ensure CMAKE_EXPORT_COMPILE_COMMANDS is enabled."
                 )
 
-        # Copy to project root for consistency
-        target_cc = project_root / "compile_commands.json"
+        # Copy to the gitignored fw-context build dir for a stable location
+        target_cc = cc_output_path(project_root)
         shutil.copy2(cc_in_build, target_cc)
         log.info("Copied %s → %s", cc_in_build, target_cc)
 
@@ -195,7 +195,7 @@ class ZephyrBuildSystem:
 
         Returns a list of ``(variant, image, compile_commands_path)`` — one
         entry per (variant, image) pair, with the per-image compile_commands
-        copied to ``compile_commands.<variant>.<image>.json`` in project_root.
+        copied to ``.fw-context/build/compile_commands.<variant>.<image>.json``.
 
         WHY per-image copies: each image is a separate Zephyr CMake project
         with its own ``compile_commands.json``; the per-(variant, image) file
@@ -251,7 +251,9 @@ class ZephyrBuildSystem:
                 cc_src = build_dir / image_name / "compile_commands.json"
                 if not cc_src.exists():
                     continue
-                target = project_root / f"compile_commands.{variant.name}.{image_name}.json"
+                target = cc_output_path(project_root).with_name(
+                    f"compile_commands.{variant.name}.{image_name}.json"
+                )
                 shutil.copy2(cc_src, target)
                 results.append((variant.name, image_name, target))
                 log.info("Copied %s → %s", cc_src, target)

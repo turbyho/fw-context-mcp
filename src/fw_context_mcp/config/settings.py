@@ -210,7 +210,7 @@ _PROJECT_DEFAULTS_TEMPLATE = """\
 # system = "platformio"
 
 [index]
-compile_commands = "compile_commands.json"
+compile_commands = ".fw-context/build/compile_commands.json"
 # Generate it with:  fw-context index --build  (auto-detects build system)
 # config_header = "config/my_build_config.h"   # path to config.h for custom build systems
 #vendor_paths = ["third_party", "vendor_libs"]
@@ -458,6 +458,8 @@ class IndexConfig:
     Attributes:
         db_dir: Directory where per-project SQLite databases are stored.
         compile_commands: Path to compile_commands.json (relative to project root).
+            Defaults to ``.fw-context/build/compile_commands.json`` — a gitignored
+            subdirectory of the project config dir.
         config_header: Path to a build-generated configuration header (e.g.
             ``config.h``) for projects whose build system does not emit
             ``-include`` flags in compile_commands.json.  When set, the file
@@ -485,7 +487,9 @@ class IndexConfig:
     """
 
     db_dir: Path = field(default_factory=lambda: Path.home() / ".fw-context" / "index")
-    compile_commands: Path = field(default_factory=lambda: Path("compile_commands.json"))
+    compile_commands: Path = field(
+        default_factory=lambda: Path(".fw-context") / "build" / "compile_commands.json"
+    )
     config_header: str = ""  # path to build-generated config.h for custom build systems
     vendor_paths: list[str] = field(default_factory=list)
     project_paths: list[str] = field(default_factory=list)

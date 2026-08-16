@@ -7,7 +7,7 @@ import shutil
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from fw_context_mcp.utils import run_build_command
+from fw_context_mcp.utils import cc_output_path, run_build_command
 
 from . import registry
 from .protocol import BuildIssue
@@ -97,10 +97,10 @@ class ArduinoBuildSystem:
                     "compile_commands.json not generated. Ensure arduino-cli supports --only-compilation-database."
                 )
 
-        # Copy to project root for consistency BEFORE the real compile,
-        # which may overwrite build/compile_commands.json (or not — but
-        # without --only-compilation-database it typically won't).
-        target_cc = project_root / "compile_commands.json"
+        # Copy to the gitignored fw-context build dir for consistency BEFORE
+        # the real compile, which may overwrite build/compile_commands.json
+        # (or not — but without --only-compilation-database it typically won't).
+        target_cc = cc_output_path(project_root)
         shutil.copy2(cc_in_build, target_cc)
         log.info("Copied %s → %s", cc_in_build, target_cc)
 

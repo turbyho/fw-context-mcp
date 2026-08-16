@@ -18,7 +18,7 @@ import shutil
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from fw_context_mcp.utils import run_build_command
+from fw_context_mcp.utils import cc_output_path, run_build_command
 
 from . import registry
 from .protocol import BuildIssue
@@ -163,7 +163,7 @@ class ManualBuildSystem:
                 }
             )
 
-        cc_path = root / "compile_commands.json"
+        cc_path = cc_output_path(root)
         cc_path.write_text(json.dumps(entries, indent=2, ensure_ascii=False), encoding="utf-8")
         log.info(
             "Generated compile_commands.json + .d files (%d entries, compiler=%s)",
