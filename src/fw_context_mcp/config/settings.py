@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import ipaddress
 import logging
+import os
 import re
 import sys
 import tomllib
@@ -46,7 +47,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
-from ..indexer.build import BuildConfig
+from ..indexer.build import BuildConfig, BuildImage, BuildVariant
 
 log = logging.getLogger(__name__)
 
@@ -184,12 +185,33 @@ _PROJECT_DEFAULTS_TEMPLATE = """\
 # system = "zephyr"
 # board = "nrf52840dk_nrf52840"
 
+# ── Multi-project / multi-device ([[build.variants]]) ─────────────────────
+# One workspace may build several boards/images (Zephyr sysbuild, multiple
+# mbed targets, PlatformIO environments, …).  Declare each build as a variant;
+# each (variant, image) pair becomes one indexed build with its own config_hash.
+#
+# [[build.variants]]
+# name   = "nrf52840-dev"                     # unique key, referenced by tools
+# board  = "nrf52840dk/nrf52840"              # build-system-specific label
+# build_dir = "build/nrf52840_sysbuild"       # per-variant output (default build/<name>)
+# env    = { ZBOX_ENV = "DEV" }               # build env vars (folded into config_hash)
+# images = [                                  # sysbuild images (Zephyr only)
+#   { name = "app",      dir = "proj/app",      type = "project" },
+#   { name = "mcuboot",  dir = "${NCS}/bootloader/mcuboot", type = "sdk" },
+# ]
+#
+# Optional shared defaults:
+# source_dir = "proj/app"        # sysbuild input app (Zephyr)
+# sysbuild   = true              # use `west build --sysbuild`
+# default_variant = "nrf52840-dev"  # default when a query omits variant
+# default_image   = "app"           # default image within default_variant
+
 # ── PlatformIO ───────────────────────────────────────────────────────────
 # Usually needs no extra config — pio run --target compiledb is enough.
 # system = "platformio"
 
 [index]
-compile_commands = "compile_commands.json"
+compile_commands = ".fw-context/build/compile_commands.json"
 # Generate it with:  fw-context index --build  (auto-detects build system)
 # config_header = "config/my_build_config.h"   # path to config.h for custom build systems
 #vendor_paths = ["third_party", "vendor_libs"]
@@ -232,7 +254,7 @@ _PROJECT_LOCAL_DEFAULTS_TEMPLATE = """\
 # python = "/path/to/python"        # Python interpreter for pip-based CLI tools
 #                                    #   (mbed-cli, platformio, keil2clangd, compiledb)
 # activate = "/path/to/setup.sh"    # shell script sourced before build
-#                                    #   (Zephyr/NCS nordic_minimal_setup.sh, ESP-IDF export.sh)
+#                                    #   (auto-detected for Zephyr/NCS/ESP-IDF; override for custom)
 
 [build]
 [llm]
@@ -437,6 +459,8 @@ class IndexConfig:
     Attributes:
         db_dir: Directory where per-project SQLite databases are stored.
         compile_commands: Path to compile_commands.json (relative to project root).
+            Defaults to ``.fw-context/build/compile_commands.json`` — a gitignored
+            subdirectory of the project config dir.
         config_header: Path to a build-generated configuration header (e.g.
             ``config.h``) for projects whose build system does not emit
             ``-include`` flags in compile_commands.json.  When set, the file
@@ -464,7 +488,9 @@ class IndexConfig:
     """
 
     db_dir: Path = field(default_factory=lambda: Path.home() / ".fw-context" / "index")
-    compile_commands: Path = field(default_factory=lambda: Path("compile_commands.json"))
+    compile_commands: Path = field(
+        default_factory=lambda: Path(".fw-context") / "build" / "compile_commands.json"
+    )
     config_header: str = ""  # path to build-generated config.h for custom build systems
     vendor_paths: list[str] = field(default_factory=list)
     project_paths: list[str] = field(default_factory=list)
@@ -670,6 +696,11 @@ def _from_dict(data: dict) -> Config:
     _apply_section(data, "index", _INDEX_FIELDS, cfg.index)
     _apply_section(data, "llm", _LLM_FIELDS, cfg.llm)
 
+    # [[build.variants]] is an array-of-tables, not a scalar — parsed
+    # separately from the flat _BUILD_FIELDS mapping.
+    cfg.build.variants = _build_variants(data)
+    _validate_variant_names(cfg.build)
+
     # Normalize sentinel values: -1 means "not set" for embed_dim.
     # The TOML file cannot express None, so we use -1 as a sentinel that
     # resolve_embed_model later replaces with the auto-detected dimension.
@@ -793,6 +824,12 @@ _BUILD_FIELDS: list[tuple[str, str, str]] = [
     ("activate", "activate", "str"),
     ("python", "python", "str"),
     ("timeout", "timeout", "float(7200)"),
+    ("source_dir", "source_dir", "str"),
+    ("sysbuild", "sysbuild", "bool"),
+    ("build_dir", "build_dir", "str"),
+    ("default_variant", "default_variant", "str"),
+    ("default_image", "default_image", "str"),
+    ("env", "env", "dict"),
 ]
 
 _INDEX_FIELDS: list[tuple[str, str, str]] = [
@@ -833,6 +870,103 @@ _LLM_FIELDS: list[tuple[str, str, str]] = [
 ]
 
 _KNOWN_SECTIONS: set[str] = {"project", "build", "index", "llm", "cache_server", "call_graph"}
+
+# BuildConfig attribute name → merge semantics classification lives in
+# indexer/build.py; this module maps TOML keys → attribute names for the
+# variant-override table.
+_BUILD_KEY_TO_ATTR: dict[str, str] = {key: attr for key, attr, _ in _BUILD_FIELDS}
+_VARIANT_SPECIFIC_KEYS: frozenset[str] = frozenset({
+    "name", "description", "board", "build_dir", "env", "images",
+})
+
+
+def _build_variants(data: dict) -> list[BuildVariant]:
+    """Parse ``[[build.variants]]`` from the merged TOML dict.
+
+    Each variant is a partial ``[build]`` override keyed by ``name``.  Variant-
+    specific keys (name/description/board/build_dir/env/images) map to
+    BuildVariant fields; every other key is treated as a ``[build]`` override
+    keyed by the BuildConfig attribute name.
+
+    WHY attribute-keyed overrides: ``build_variant_config`` (build.py) applies
+    the merge by field type (scalar/list/dict).  Keying overrides by attribute
+    name keeps the TOML→attribute mapping in this module and the merge logic in
+    build.py — no duplicated key tables.
+    """
+    raw = data.get("build", {}).get("variants")
+    if not raw:
+        return []
+
+    variants: list[BuildVariant] = []
+    for table in raw:
+        if not isinstance(table, dict):
+            log.warning("[[build.variants]] entry is not a table — skipping %r", table)
+            continue
+        name = table.get("name")
+        if not name:
+            log.warning("[[build.variants]] entry missing required 'name' — skipping")
+            continue
+
+        images: list[BuildImage] = []
+        for img in table.get("images") or []:
+            if not isinstance(img, dict):
+                continue
+            images.append(
+                BuildImage(
+                    name=img.get("name", ""),
+                    description=img.get("description", ""),
+                    dir=img.get("dir", ""),
+                    type=img.get("type", "project"),
+                    board=img.get("board"),
+                )
+            )
+
+        overrides: dict = {}
+        for key, value in table.items():
+            if key in _VARIANT_SPECIFIC_KEYS:
+                continue
+            overrides[_BUILD_KEY_TO_ATTR.get(key, key)] = value
+
+        env = table.get("env") or {}
+        variants.append(
+            BuildVariant(
+                name=name,
+                description=table.get("description", ""),
+                board=table.get("board"),
+                build_dir=table.get("build_dir"),
+                env=dict(env) if isinstance(env, dict) else {},
+                images=images,
+                overrides=overrides,
+            )
+        )
+
+    return variants
+
+
+def _validate_variant_names(build: BuildConfig) -> None:
+    """Warn when default_variant/default_image reference unknown names.
+
+    WHY a warning, not an error: the config may declare a default_variant that
+    has not been indexed yet — the choice is owned by the project author, so a
+    typo must be surfaced but must not block startup.
+    """
+    if not build.variants:
+        return
+    names = {v.name for v in build.variants}
+    if build.default_variant and build.default_variant not in names:
+        log.warning(
+            "[build] default_variant '%s' not found in [[build.variants]] "
+            "(valid: %s)",
+            build.default_variant, ", ".join(sorted(names)),
+        )
+    if build.default_image and build.default_variant in names:
+        dv = next(v for v in build.variants if v.name == build.default_variant)
+        img_names = {i.name for i in dv.images}
+        if build.default_image not in img_names:
+            log.warning(
+                "[build] default_image '%s' not found in images of variant '%s'",
+                build.default_image, build.default_variant,
+            )
 
 
 def _ensure_config_file(path: Path, template: str, label: str) -> Path:
@@ -1076,6 +1210,17 @@ def load(project_root: Path | None = None) -> Config:
     from ..llm.auto_model import resolve_embed_model
     resolve_embed_model(cfg.llm)
     cfg.index.db_dir = cfg.index.db_dir.expanduser().resolve()
+
+    # Test isolation: FW_CONTEXT_INDEX_DIR redirects the DEFAULT index DB
+    # directory (~/.fw-context/index) for the whole process.  Tests set this
+    # to a temp dir so no test writes to the user's real index.  Inherited by
+    # subprocesses, so CLI invocations spawned from tests are isolated too.
+    # An explicit db_dir in config.toml/local.toml still wins — this only
+    # catches tests that forget to set db_dir and would fall back to the home.
+    _default_db_dir = (Path.home() / ".fw-context" / "index").resolve()
+    _env_index_dir = os.environ.get("FW_CONTEXT_INDEX_DIR")
+    if _env_index_dir and cfg.index.db_dir == _default_db_dir:
+        cfg.index.db_dir = Path(_env_index_dir).expanduser().resolve()
 
     # Cache with current mtime
     try:

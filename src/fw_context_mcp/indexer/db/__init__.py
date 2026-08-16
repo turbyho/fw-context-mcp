@@ -59,6 +59,7 @@ __all__ = [
     "get_all_builds_for_project",
     "get_all_projects",
     "get_build_stats",
+    "get_builds_for_scope",
     "get_class_members",
     "get_db_schema_version",
     "get_direct_bases",
@@ -174,6 +175,7 @@ from ._projects import (
     get_all_builds_for_project,
     get_all_projects,
     get_build_stats,
+    get_builds_for_scope,
     upsert_build_config,
     upsert_project,
 )

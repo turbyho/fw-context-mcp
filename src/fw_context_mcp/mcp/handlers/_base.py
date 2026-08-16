@@ -63,6 +63,40 @@ class DbContext:
     cfg: Config
     project_id: str
     root: Path
+    scopes: list[dict] = dataclasses.field(default_factory=list)
+    multi: bool = False
+
+    def execute_scoped(self, query_fn):
+        """Run ``query_fn(conn, config_hash)`` per build scope, merge + annotate.
+
+        Single-scope calls behave exactly like ``executor.execute_sync`` (result
+        shape unchanged).  Multi-scope calls merge per-build outputs: list items
+        and dict records gain a ``variant``/``image`` key so the LLM always
+        knows which build produced a result.
+        """
+        if len(self.scopes) <= 1:
+            return self.executor.execute_sync(query_fn, self.config_hash)
+        merged: list = []
+        for scope in self.scopes:
+            part = self.executor.execute_sync(query_fn, scope["config_hash"])
+            if isinstance(part, list):
+                for r in part:
+                    if isinstance(r, dict) and "error" not in r and "warning" not in r:
+                        r = dict(r)
+                        r["variant"] = scope["variant"]
+                        r["image"] = scope["image"]
+                    merged.append(r)
+            elif isinstance(part, dict):
+                if "error" in part:
+                    merged.append(part)
+                else:
+                    d = dict(part)
+                    d["variant"] = scope["variant"]
+                    d["image"] = scope["image"]
+                    merged.append(d)
+            else:
+                merged.append(part)
+        return merged
 
 
 class BaseHandler:
@@ -76,18 +110,24 @@ class BaseHandler:
     # ── Context resolution ─────────────────────────────────────────
 
     @staticmethod
-    def resolve_db_context(project_root: str | None = None) -> DbContext:
-        """Resolve project → config → db → executor → config_hash.
+    def resolve_db_context(
+        project_root: str | None = None,
+        *,
+        variant: str | None = None,
+        image: str | None = None,
+    ) -> DbContext:
+        """Resolve project → config → db → executor → config_hash (+ scopes).
 
         Delegates to :func:`_resolve_handler_context` — one call replaces
-        the common handler preamble.
+        the common handler preamble.  ``variant``/``image`` narrow the
+        multi-project selection (fail-closed, see ``resolve_scopes``).
 
         Returns:
             A ``DbContext`` with all resolved fields.
         Raises:
             RuntimeError: Project not initialized or index missing.
         """
-        ctx, err = _resolve_handler_context(project_root)
+        ctx, err = _resolve_handler_context(project_root, variant=variant, image=image)
         if err:
             raise RuntimeError(err[0].get("error", "Failed to resolve handler context"))
         assert ctx is not None, "HandlerContext must be non-None when err is None"
@@ -98,6 +138,8 @@ class BaseHandler:
             cfg=ctx.cfg,
             project_id=ctx.project_id,
             root=ctx.root,
+            scopes=ctx.scopes,
+            multi=ctx.multi,
         )
 
 

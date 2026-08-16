@@ -20,6 +20,11 @@ capabilities and your configuration. You do not need to know which path
 `fw-context` uses. Just configure the relevant parameters, and `fw-context`
 does the rest.
 
+The generated `compile_commands.json` is written to
+`.fw-context/build/compile_commands.json` — a gitignored subdirectory of the
+project config dir, so the build artifact stays out of the repository root.
+`fw-context init` adds `.fw-context/build/` to `.gitignore` automatically.
+
 ### Detection order
 
 When you do not set `system` explicitly, `fw-context` detects the build

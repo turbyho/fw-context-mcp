@@ -8,7 +8,7 @@ import shutil
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from fw_context_mcp.utils import resolve_real_binary, run_build_command
+from fw_context_mcp.utils import cc_output_path, resolve_real_binary, run_build_command
 
 from . import registry
 from .protocol import BuildIssue
@@ -169,8 +169,8 @@ class ESPIDFBuildSystem:
                 "Ensure the ESP-IDF project was configured correctly."
             )
 
-        # Copy to project root for consistency
-        target_cc = project_root / "compile_commands.json"
+        # Copy to the gitignored fw-context build dir for a stable location
+        target_cc = cc_output_path(project_root)
         shutil.copy2(cc_in_build, target_cc)
         log.info("Copied %s → %s", cc_in_build, target_cc)
 

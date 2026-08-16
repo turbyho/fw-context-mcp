@@ -261,6 +261,28 @@ class TestIndexedSymbolCounts:
         finally:
             conn.close()
 
+    def test_header_files_have_content(self, indexed_extended: Path):
+        """Header files must carry ifdef-filtered content, not empty strings.
+
+        Regression guard: header active lines come only from the AST walk
+        (``get_tokens()`` covers the main file).  When the skip set was
+        folded with the current TU's own headers, that walk skipped them and
+        ``files.content`` stayed empty for every header.
+        """
+        db_path = _db_path_for_project(indexed_extended)
+        conn = open_db(db_path)
+        try:
+            ch = _config_hash(conn)
+            for header in ("src/types.h", "src/driver.h"):
+                row = conn.execute(
+                    "SELECT content FROM files WHERE config_hash=? AND path=?",
+                    (ch, header),
+                ).fetchone()
+                assert row is not None, f"header {header} not indexed"
+                assert row["content"], f"header {header} has empty content"
+        finally:
+            conn.close()
+
     def test_function_definitions_indexed(self, indexed_extended: Path):
         db_path = _db_path_for_project(indexed_extended)
         conn = open_db(db_path)

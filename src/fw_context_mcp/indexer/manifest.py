@@ -125,6 +125,7 @@ def generate(
     macros: dict[str, str] | None = None,
     build_dir_patterns: list[str] | None = None,
     config_hash: str = "",
+    scope: list[str] | None = None,
 ) -> str:
     """Generate ``manifest.json`` from compile_commands + libclang token stream.
 
@@ -183,11 +184,11 @@ def generate(
         # New callers should pass config_hash computed from the normalized
         # compile_commands.json instead.
         project_id = derive_project_id(project_root)
-        config_hash = compute_config_hash(units, project_root, project_id, build_dir_patterns)
+        config_hash = compute_config_hash(units, project_root, project_id, build_dir_patterns, scope=scope)
 
     manifest["config_hash"] = config_hash
     manifest_json = json.dumps(manifest, sort_keys=True, indent=2, ensure_ascii=False)
-    manifest_path = db_dir / "manifest.json"
+    manifest_path = _manifest_path(db_dir, config_hash)
     manifest_path.write_text(manifest_json, encoding="utf-8")
 
     elapsed = time.monotonic() - t0
@@ -203,16 +204,49 @@ def generate(
     return config_hash
 
 
-def load(db_dir: Path) -> dict | None:
-    """Load ``manifest.json`` from *db_dir*, returning the parsed dict or None."""
-    manifest_path = db_dir / "manifest.json"
-    if not manifest_path.exists():
-        return None
+def _manifest_path(db_dir: Path, config_hash: str) -> Path:
+    """Return the per-``config_hash`` manifest path.
+
+    WHY per-hash: multi-variant builds produce one manifest per (variant,
+    image) — a single ``manifest.json`` would be overwritten by each build.
+    The file is keyed by ``config_hash`` (content-addressable, stable).
+    """
+    return db_dir / f"manifest.{config_hash}.json"
+
+
+def load(db_dir: Path, config_hash: str | None = None) -> dict | None:
+    """Load the manifest for *config_hash* from *db_dir*, or None.
+
+    With *config_hash*, reads ``manifest.<config_hash>.json``.  Without it,
+    returns the most recently modified ``manifest.*.json`` — a best-effort
+    fallback for callers that only need ``build_dir_patterns`` and do not
+    know the active build yet (e.g. the file-watch daemon).
+    """
+    if config_hash:
+        manifest_path = _manifest_path(db_dir, config_hash)
+        if not manifest_path.exists():
+            return None
+        try:
+            return json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError) as exc:
+            log.warning("Failed to load %s: %s", manifest_path.name, exc)
+            return None
+
+    candidates: list[Path] = []
     try:
-        return json.loads(manifest_path.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError) as exc:
-        log.warning("Failed to load manifest.json: %s", exc)
+        candidates = sorted(
+            db_dir.glob("manifest.*.json"),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+    except OSError:
         return None
+    for manifest_path in candidates:
+        try:
+            return json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError) as exc:
+            log.warning("Failed to load %s: %s", manifest_path.name, exc)
+    return None
 
 
 def compute_structural_hash(
@@ -221,6 +255,7 @@ def compute_structural_hash(
     units: list,
     build_dir_patterns: list[str] | None = None,
     project_id: str = "",
+    scope: list[str] | None = None,
 ) -> str:
     """Compute the config_hash from structural build identity — no I/O, no libclang.
 
@@ -235,7 +270,7 @@ def compute_structural_hash(
 
     if not project_id:
         project_id = derive_project_id(project_root)
-    return compute_config_hash(units, project_root, project_id, build_dir_patterns)
+    return compute_config_hash(units, project_root, project_id, build_dir_patterns, scope=scope)
 
 
 def build_preliminary(
@@ -245,6 +280,7 @@ def build_preliminary(
     units: list,
     build_dir_patterns: list[str] | None = None,
     project_id: str = "",
+    scope: list[str] | None = None,
 ) -> str:
     """Build a preliminary ``manifest.json`` from structural data only — no libclang.
 
@@ -269,7 +305,7 @@ def build_preliminary(
     if not project_id:
         project_id = derive_project_id(project_root)
 
-    config_hash = compute_config_hash(units, project_root, project_id, build_dir_patterns)
+    config_hash = compute_config_hash(units, project_root, project_id, build_dir_patterns, scope=scope)
 
     # Build entries for the manifest file
     entries: list[dict] = []
@@ -307,8 +343,8 @@ def build_preliminary(
     # manifest has empty source_hash/headers — writing it would degrade the
     # on-disk manifest.  _update_manifest_after_index will handle the
     # regeneration when it detects the degraded entries.
-    manifest_path = db_dir / "manifest.json"
-    existing = load(db_dir)
+    manifest_path = _manifest_path(db_dir, config_hash)
+    existing = load(db_dir, config_hash)
     if existing is not None:
         existing_entries = existing.get("entries", [])
         if existing_entries and existing_entries[0].get("source_hash"):
@@ -327,11 +363,37 @@ def build_preliminary(
     return config_hash
 
 
+def build_scope(
+    variant: str = "",
+    image: str = "",
+    env: dict[str, str] | None = None,
+) -> list[str]:
+    """Build the canonical scope token list that enters ``config_hash``.
+
+    WHY scope: two (variant, image) builds may compile the same shared source
+    (``proj/common/*.c``) with identical normalized flags after build-dir paths
+    are stripped — the raw compile_commands hash could collide.  Folding
+    variant/image/env into the hash disambiguates them explicitly.  Empty parts
+    are omitted so single-project builds (variant='' image='' env={}) produce
+    the exact same hash as before this feature.  ``env`` is serialized with
+    sorted keys so the hash is deterministic across dict ordering.
+    """
+    tokens: list[str] = []
+    if variant:
+        tokens.append(variant)
+    if image:
+        tokens.append(image)
+    if env:
+        tokens.append("env:" + json.dumps(dict(sorted(env.items()))))
+    return tokens
+
+
 def compute_config_hash(
     units: list,
     project_root: Path,
     project_id: str,
     build_dir_patterns: list[str] | None = None,
+    scope: list[str] | None = None,
 ) -> str:
     """Return SHA-256 of the **normalized** compile_commands.json.
 
@@ -499,6 +561,8 @@ def compute_config_hash(
         "project_root": str(project_root),
         "entries": entries,
     }
+    if scope:
+        canonical["scope"] = scope
 
     canonical_json = json.dumps(canonical, sort_keys=True, indent=2, ensure_ascii=False)
     config_hash = hashlib.sha256(canonical_json.encode()).hexdigest()
@@ -597,7 +661,7 @@ def update_entry(
 
 
 def save(manifest: dict, db_dir: Path, config_hash: str) -> str:
-    """Save manifest.json with the given *config_hash*, return it.
+    """Save the per-hash manifest (``manifest.<config_hash>.json``), return it.
 
     The caller is responsible for computing *config_hash* — save() no
     longer calls ``compute_config_hash()`` internally.  This removes the
@@ -605,7 +669,7 @@ def save(manifest: dict, db_dir: Path, config_hash: str) -> str:
     """
     manifest["config_hash"] = config_hash
     manifest_json = json.dumps(manifest, sort_keys=True, indent=2, ensure_ascii=False)
-    (db_dir / "manifest.json").write_text(manifest_json, encoding="utf-8")
+    _manifest_path(db_dir, config_hash).write_text(manifest_json, encoding="utf-8")
     return config_hash
 
 

@@ -7,7 +7,7 @@ import shutil
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from fw_context_mcp.utils import run_build_command
+from fw_context_mcp.utils import cc_output_path, run_build_command
 
 from . import registry
 from .protocol import BuildIssue
@@ -119,10 +119,12 @@ class MbedOSBuildSystem:
         else:
             mbed_prefix = ["mbed"]
 
+        cc_path = cc_output_path(project_root)
+
         cmd: list[str] = [
             "bear",
             "--output",
-            "compile_commands.json",
+            str(cc_path),
             "--",
         ] + mbed_prefix + [
             "compile",
@@ -148,7 +150,6 @@ class MbedOSBuildSystem:
         log.info("mbed-os build: %s", " ".join(cmd))
         run_build_command(cmd, cwd=project_root, description="mbed compile", build_cfg=cfg)
 
-        cc_path = project_root / "compile_commands.json"
         if not cc_path.exists():
             raise RuntimeError("compile_commands.json was not generated — bear may have failed silently")
 

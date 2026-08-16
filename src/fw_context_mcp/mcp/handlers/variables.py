@@ -48,6 +48,8 @@ def find_variables(
         "'varglobal', 'varlocal', 'field', or None for all.")] = None,
     limit: Annotated[int, Field(description="Maximum results "
         "(default 20, max 100).")] = 20,
+    variant: Annotated[str | None, Field(description="Build variant name (multi-project). Omit to use default_variant or fail-closed. Use '*' for all variants.")] = None,
+    image: Annotated[str | None, Field(description="Sysbuild image name within the variant (multi-project). Omit for all images of the variant.")] = None,
 ) -> list[dict]:
     """Find C/C++ variables by name or prefix and trace who reads or
     writes them through the call graph.  libclang-powered: splits
@@ -97,7 +99,7 @@ def find_variables(
     limit = max(0, min(limit, 100))
 
     try:
-        db = BaseHandler.resolve_db_context(project_root)
+        db = BaseHandler.resolve_db_context(project_root, variant=variant, image=image)
     except RuntimeError as e:
         return [{"error": str(e)}]
 

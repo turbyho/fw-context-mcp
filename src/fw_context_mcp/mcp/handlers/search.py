@@ -59,6 +59,24 @@ from ._search_fallbacks import (
 
 log = logging.getLogger(__name__)
 
+
+def _resolve_scopes_for_search(root: Path, db_path: Path, variant: str, image: str):
+    """Resolve ``(variant, image)`` → ``(scopes, multi, error)`` for search tools.
+
+    Loads the project config, reads the project ID, and delegates to the shared
+    ``resolve_scopes`` helper on a short-lived read-only connection.
+    """
+    from ..shared.variants import resolve_scopes
+
+    project_id = derive_project_id(root)
+    cfg = load_config(root)
+    conn = _quick_open_readonly(db_path)
+    try:
+        return resolve_scopes(conn, project_id, cfg, variant or "", image or "")
+    finally:
+        conn.close()
+
+
 __all__ = [
     "_SEARCH_CODE_FALLBACKS",
     "_fmt_symbol_rows",
@@ -74,7 +92,7 @@ __all__ = [
     "search_content",
 ]
 
-def _with_search_context(root: Path, tool_name: str, do_search) -> list[dict]:
+def _with_search_context(root: Path, tool_name: str, do_search, variant: str = "", image: str = "") -> list[dict]:
     """Resolve project root, verify index existence, and execute search with stale recovery.
 
     Every search handler follows the same setup sequence:
@@ -110,7 +128,25 @@ def _with_search_context(root: Path, tool_name: str, do_search) -> list[dict]:
         db_path = _db_path(root)
         if not db_path.exists():
             return [{"error": f"No index found for {root}. Run 'fw-context index' first."}]
-        return _with_stale_recovery(root, db_path, do_search)
+
+        # Resolve (variant, image) selection → build scopes (fail-closed).
+        scopes, multi, err = _resolve_scopes_for_search(root, db_path, variant, image)
+        if err:
+            return [{"error": err}]
+        if len(scopes) == 1:
+            return _with_stale_recovery(root, db_path, do_search, config_hash=scopes[0]["config_hash"])
+
+        # Multi-scope: run per build and annotate each result with its identity.
+        merged: list[dict] = []
+        for scope in scopes:
+            part = _with_stale_recovery(root, db_path, do_search, config_hash=scope["config_hash"])
+            for r in part:
+                if isinstance(r, dict) and "error" not in r and "warning" not in r:
+                    r = dict(r)
+                    r["variant"] = scope["variant"]
+                    r["image"] = scope["image"]
+                merged.append(r)
+        return merged
     except (sqlite3.Error, OSError, RuntimeError) as e:
         log.exception("%s failed: %s", tool_name, e)
         return [{"error": f"{tool_name} failed: {e}"}]
@@ -164,9 +200,11 @@ def search_code(
     query: Annotated[str, Field(description="FTS5 search terms. 1-3 words, omit underscores. E.g. 'modem init' not 'modem_init'. Supports trailing wildcard 'modem*'.")],
     project_root: Annotated[str | None, Field(description="Project root. Auto-detected if omitted.")] = None,
      kind: Annotated[str | None, Field(description="Optional kind filter: function, method, constructor, destructor, class, struct, union, enum, enum_constant, typedef, varglobal, varlocal, variable, field, namespace.")] = None,
-    limit: Annotated[int, Field(description="Maximum results (default 20, max 100).")] = 20,
-    project_only: Annotated[bool, Field(description="Exclude vendor SDK code. When True, only application code. Default False.")] = False,
-) -> list[dict]:
+     limit: Annotated[int, Field(description="Maximum results (default 20, max 100).")] = 20,
+     project_only: Annotated[bool, Field(description="Exclude vendor SDK code. When True, only application code. Default False.")] = False,
+     variant: Annotated[str | None, Field(description="Build variant name (multi-project). Omit to use default_variant or fail-closed. Use '*' for all variants.")] = None,
+     image: Annotated[str | None, Field(description="Sysbuild image name within the variant (multi-project). Omit for all images of the variant.")] = None,
+ ) -> list[dict]:
     """Find C/C++ symbols by name — searches function/class/enum NAMES.
 
     Searches symbol names, qualified names, signatures, docstrings, and
@@ -296,7 +334,7 @@ def search_code(
 
         return []
 
-    return _with_search_context(root, "search_code", _do_search)
+    return _with_search_context(root, "search_code", _do_search, variant or "", image or "")
 
 
 
@@ -576,6 +614,8 @@ def search_bodies(
     kind: Annotated[str | None, Field(description="Optional kind filter: function, method, class, etc.")] = None,
     limit: Annotated[int, Field(description="Maximum results (default 20, max 100).")] = 20,
     project_only: Annotated[bool, Field(description="Exclude vendor SDK code. When True, only application code. Default False.")] = False,
+    variant: Annotated[str | None, Field(description="Build variant name (multi-project). Omit to use default_variant or fail-closed. Use '*' for all variants.")] = None,
+    image: Annotated[str | None, Field(description="Sysbuild image name within the variant (multi-project). Omit for all images of the variant.")] = None,
 ) -> list[dict]:
     """Find patterns in C/C++ function BODIES — the implementation code inside ``{ }``.
 
@@ -769,7 +809,7 @@ def search_bodies(
             del r["_is_project"]
         return final[:limit]
 
-    return _with_search_context(root, "search_bodies", _do_search)
+    return _with_search_context(root, "search_bodies", _do_search, variant or "", image or "")
 
 
 
@@ -778,6 +818,8 @@ def search_content(
     project_root: Annotated[str | None, Field(description="Project root. Auto-detected if omitted.")] = None,
     limit: Annotated[int, Field(description="Maximum results (default 20, max 100).")] = 20,
     project_only: Annotated[bool, Field(description="Exclude vendor SDK code. When True, only application code. Default False.")] = False,
+    variant: Annotated[str | None, Field(description="Build variant name (multi-project). Omit to use default_variant or fail-closed. Use '*' for all variants.")] = None,
+    image: Annotated[str | None, Field(description="Sysbuild image name within the variant (multi-project). Omit for all images of the variant.")] = None,
 ) -> list[dict]:
     """Find patterns in FULL file content — not limited to function bodies.
 
@@ -946,4 +988,4 @@ def search_content(
             results.append(d)
         return results[:limit]
 
-    return _with_search_context(root, "search_content", _do_search)
+    return _with_search_context(root, "search_content", _do_search, variant or "", image or "")
