@@ -147,11 +147,13 @@ def _auto_build_if_possible(
     deleted.  ``cc_path`` resolves against ``cfg.index.compile_commands``
     (identical to ``_resolve_compile_commands`` — not hardcoded).
     """
-    from ..indexer.build import check_completeness, generate_compile_commands
+    from ..indexer.build import (
+        check_completeness,
+        generate_compile_commands,
+        resolve_reuse_compile_commands,
+    )
 
-    cc = cfg.index.compile_commands
-    if not cc.is_absolute():
-        cc = (project_root / cc).resolve()
+    cc = resolve_reuse_compile_commands(project_root, cfg.index.compile_commands)
 
     if cc.exists():
         print(f"  [ok] compile_commands.json already exists ({_count_cc_entries(cc)} entries)")

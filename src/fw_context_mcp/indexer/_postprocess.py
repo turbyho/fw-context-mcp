@@ -1169,6 +1169,11 @@ def _step_wal_checkpoint(conn: sqlite3.Connection, ctx: dict) -> None:
 #  • fts5 MUST run before embeddings and llm_analysis — both query FTS.
 #  • is_project MUST run before embeddings — embedding source selection
 #    depends on project/vendor classification.
+#  • llm_analysis MUST run before embeddings — the embedding content hash
+#    includes the LLM summary, so summaries must exist before embeddings are
+#    hashed.  Otherwise the first run stores a hash without summaries, the
+#    analysis step fills them, and the NEXT run re-embeds every analyzed
+#    symbol (a spurious full re-embed on every run that follows analysis).
 #  • dispatch_edges MUST run before cross_tu_refs — dispatch edges add
 #    new from_usr values that the backfill needs.
 #  • cross_tu_refs MUST run before pagerank_hotspot — PageRank needs the
@@ -1184,8 +1189,8 @@ _STEPS: list[tuple[str, Callable[..., None], Callable[..., bool] | None]] = [
     ("manifest",         _step_update_manifest,    None),
     ("macros",           _step_expand_macros,      lambda c: c["index_macros_expanded"] and c["units"]),
     ("dispatch_edges",   _step_resolve_dispatches,  lambda c: c["index_refs"]),
-    ("embeddings",       _step_build_embeddings,   lambda c: c["index_embeddings"] and c["llm_config"] is not None and c["llm_config"].enabled),
     ("llm_analysis",     _step_llm_analysis,       lambda c: c["analyze_symbols"] and c["llm_config"] is not None and c["llm_config"].enabled),
+    ("embeddings",       _step_build_embeddings,   lambda c: c["index_embeddings"] and c["llm_config"] is not None and c["llm_config"].enabled),
     ("overrides",        _step_build_overrides,    lambda c: c["analyze_overrides"]),
     ("cross_tu_refs",    _step_backfill_cross_tu_refs, lambda c: c["index_refs"]),
     ("pagerank_hotspot", _step_pagerank_hotspot,   lambda c: c["index_refs"]),
