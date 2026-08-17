@@ -475,6 +475,33 @@ def generate_compile_commands(
     return builder.build(root, cfg)
 
 
+def resolve_reuse_compile_commands(project_root: Path, configured: Path) -> Path:
+    """Return the compile_commands.json to reuse when not rebuilding.
+
+    WHY this self-heal: every builder writes the generated database to the
+    canonical fw-context-owned location ``cc_output_path()``
+    (``.fw-context/build/compile_commands.json``).  Projects initialised
+    before that location was introduced still carry a legacy
+    ``[index] compile_commands = "compile_commands.json"`` value that points
+    at the project root — a file ``--build`` no longer produces.  Reusing that
+    stale root file instead of the freshly generated one changes the
+    config_hash and silently drops the injected ``-D`` defines (e.g.
+    ``SKEY_INIT_BASE64``) and any newly listed translation units.
+
+    When the configured path is exactly the legacy root file and the canonical
+    file exists, prefer the canonical file.  All other configured paths
+    (explicit user overrides) are returned unchanged.
+    """
+    root = project_root.resolve()
+    if not configured.is_absolute():
+        configured = (root / configured).resolve()
+    legacy = root / "compile_commands.json"
+    canonical = cc_output_path(root)
+    if configured == legacy and canonical.exists():
+        return canonical
+    return configured
+
+
 def _can_convert(cfg: BuildConfig, system: str) -> bool:
     """Check whether the configuration supports the convert path."""
     if system == "keil-mdk":

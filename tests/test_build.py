@@ -2,12 +2,15 @@
 
 import json
 
+from pathlib import Path
+
 from fw_context_mcp.indexer.build import (
     BuildConfig,
     _mbed_target_from_custom_targets,
     _parse_mbed_dotfile,
     check_completeness,
     detect_build_system,
+    resolve_reuse_compile_commands,
 )
 
 
@@ -128,6 +131,36 @@ class TestCheckCompleteness:
         cc.write_text("not json at all")
         warnings = check_completeness(cc, tmpdir)
         assert len(warnings) >= 1
+
+
+class TestResolveReuseCompileCommands:
+    def test_legacy_root_value_self_heals_to_canonical(self, tmpdir):
+        # Legacy config: compile_commands = "compile_commands.json" (root).
+        # A previous --build produced the canonical file.
+        canonical = tmpdir / ".fw-context" / "build" / "compile_commands.json"
+        canonical.parent.mkdir(parents=True)
+        canonical.write_text("[]")
+
+        result = resolve_reuse_compile_commands(tmpdir, Path("compile_commands.json"))
+        assert result == canonical
+
+    def test_legacy_root_value_without_canonical_keeps_root(self, tmpdir):
+        result = resolve_reuse_compile_commands(tmpdir, Path("compile_commands.json"))
+        assert result == (tmpdir / "compile_commands.json").resolve()
+
+    def test_custom_relative_path_unchanged(self, tmpdir):
+        result = resolve_reuse_compile_commands(tmpdir, Path("cmake_build/compile_commands.json"))
+        assert result == (tmpdir / "cmake_build" / "compile_commands.json").resolve()
+
+    def test_absolute_path_unchanged(self, tmpdir):
+        custom = tmpdir / "ci" / "cc.json"
+        result = resolve_reuse_compile_commands(tmpdir, custom)
+        assert result == custom.resolve()
+
+    def test_default_canonical_path_unchanged(self, tmpdir):
+        default = Path(".fw-context") / "build" / "compile_commands.json"
+        result = resolve_reuse_compile_commands(tmpdir, default)
+        assert result == (tmpdir / default).resolve()
 
 
 class TestBuildConfig:

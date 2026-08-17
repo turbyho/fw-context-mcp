@@ -1685,9 +1685,9 @@ def get_environment_status(
     else:
         dep_results = run_full_check(project_root=str(root))
         cfg = load_config(root)
-        cc = cfg.index.compile_commands
-        if not cc.is_absolute():
-            cc = (root / cc).resolve()
+        from ...indexer.build import resolve_reuse_compile_commands
+
+        cc = resolve_reuse_compile_commands(root, cfg.index.compile_commands)
         compile_db = {"exists": cc.exists(), "path": str(cc) if cc.exists() else None, "entry_count": None}
         if cc.exists():
             compile_db["entry_count"] = _cc_entry_count(cc)
