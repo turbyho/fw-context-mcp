@@ -1790,6 +1790,79 @@ void process_data(struct Driver* driver, const char* data, int len) {
         )
 
 
+class TestHeaderInlineCallableFnStack:
+    """Header-resident inline definitions must not leak ``from_usr``.
+
+    Regression test: an inline destructor ``virtual ~Store() {}`` in an
+    included header was pushed onto the fn_stack with ``end_line=0`` and an
+    empty file marker.  Both pop conditions were disabled, so the destructor
+    never popped and its USR leaked into ``from_usr`` for unrelated cursors
+    (file-scope declarations and the bodies of following functions).
+    """
+
+    @pytest.mark.libclang
+    def test_inline_header_destructor_does_not_leak_from_usr(self, tmp_path):
+        from fw_context_mcp.indexer.compile_commands import CompilationUnit
+        from fw_context_mcp.indexer.symbols import extract_all
+
+        src = tmp_path / "src"
+        src.mkdir()
+        (src / "store.h").write_text("""\
+#pragma once
+class Store {
+public:
+    virtual ~Store() {}
+    virtual int get();
+};
+""", encoding="utf-8")
+        (src / "store.cpp").write_text("""\
+#include "store.h"
+
+enum Flag { FLAG_A = 1, FLAG_B = 2 };
+
+static const int supported = FLAG_A | FLAG_B;
+
+int helper() { return 42; }
+
+int Store::get() {
+    return helper();
+}
+""", encoding="utf-8")
+
+        unit = CompilationUnit(
+            file=src / "store.cpp",
+            directory=src,
+            language="cpp",
+            clang_args=["-std=c++11"],
+        )
+        r = extract_all(unit, with_refs=True)
+        refs = r.references
+
+        # File-scope references (FLAG_A / FLAG_B in the ``supported`` init)
+        # must be attributed to <file scope>, not to the inline destructor.
+        flag_refs = [ref for ref in refs if "FLAG_" in ref.to_usr]
+        assert flag_refs, "expected references to FLAG_A / FLAG_B"
+        for ref in flag_refs:
+            assert ref.from_usr in (None, ""), (
+                f"file-scope ref to {ref.to_usr} leaked from_usr={ref.from_usr!r}"
+            )
+
+        # The helper() call inside Store::get() must be attributed to get(),
+        # not to the inline destructor.
+        helper_calls = [
+            ref for ref in refs
+            if "helper" in ref.to_usr and ref.ref_kind == "call"
+        ]
+        assert helper_calls, "expected a call reference to helper()"
+        for ref in helper_calls:
+            assert "~Store" not in (ref.from_usr or ""), (
+                f"helper() call leaked from_usr to destructor: {ref.from_usr!r}"
+            )
+            assert "get" in (ref.from_usr or ""), (
+                f"helper() call attributed to wrong function: {ref.from_usr!r}"
+            )
+
+
 class TestFnPtrTypeConsistency:
     """Verify fp_assignments.fn_ptr_type uses the LHS field type (the function
     pointer typedef), not the RHS function type.  This ensures the Phase 3

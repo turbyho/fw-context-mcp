@@ -1039,16 +1039,29 @@ def _build_refs_and_fp_assignments(
                 _ext = cursor.extent
                 if _ext.start.file:
                     _ext_file = _ext.start.file.name
-                    # Only TU-resident definitions get a non-zero end_line
-                    # stored in fn_stack.  This end_line is used by the
-                    # line-overflow pop condition above to determine when
-                    # we left the function body.  Definitions from other
-                    # files (headers) get end_line=0 — no pop-on-line.
-                    if str(resolve_fn(_ext_file)) == tu_path_str:
+                    _resolved_file = str(resolve_fn(_ext_file))
+                    if _resolved_file == tu_path_str:
                         _fn_spans.append((cur_fn or '', _ext.start.line, _ext.end.line))
                         fn_stack.append((cur_fn or '', _ext.end.line, tu_path_str))
                     else:
-                        fn_stack.append((cur_fn or '', 0, ""))
+                        # Header-resident definition (inline body in an
+                        # included header).  Store the resolved file path so
+                        # the file-mismatch pop (condition 1) fires when the
+                        # walk leaves the header, and a guarded end_line so
+                        # the line-overflow pop (condition 2) fires when the
+                        # walk passes the definition within the header.
+                        # Previously both were zeroed, so the definition
+                        # never popped and its USR leaked into ``from_usr``
+                        # for unrelated cursors (file-scope declarations and
+                        # the bodies of following functions).
+                        _end = 0
+                        if (
+                            _ext.end.file
+                            and _ext.end.file.name == _ext_file
+                            and _ext.end.line >= _ext.start.line
+                        ):
+                            _end = _ext.end.line
+                        fn_stack.append((cur_fn or '', _end, _resolved_file))
                 else:
                     fn_stack.append((cur_fn or '', 0, ""))
             except (ValueError, TypeError, RuntimeError, AttributeError):
