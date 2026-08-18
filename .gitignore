@@ -56,3 +56,6 @@ test-firmware/
 # Backup and temporary files
 *.bak
 LEAN-CTX.md
+
+# Python version manager (local only)
+.python-version
