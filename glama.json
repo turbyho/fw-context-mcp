@@ -4,7 +4,7 @@
     "turbyho"
   ],
   "title": "fw-context-mcp",
-  "version": "0.27.5",
+  "version": "0.27.6",
   "description": "Build-aware code intelligence for embedded C/C++ firmware. libclang + SQLite+FTS5, 38 MCP tools for symbol search, call graphs, hotspot analysis, dead code detection, and vector search.",
   "tags": [
     "c++",
