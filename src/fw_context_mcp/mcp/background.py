@@ -248,11 +248,15 @@ def _fast_staleness_check(root: Path) -> tuple[bool, list[str]]:
     Does **not** call ``_count_modified_files`` — the background subprocess
     does its own per-file mtime comparison during ``run()``.  This function
     only detects structural issues (missing data, schema changes,
-    compile_commands.json modification).
+    compile_commands.json modification) and pending LLM analysis.
+
+    The analysis check calls ``count_pending_analysis``, which shares its
+    query with the ``analysis`` coverage report of ``get_active_build``.
+    Thus the two can never disagree about what still needs analysis.
     """
     from ..config import derive_project_id
     from ..config import load as load_config
-    from ..indexer.db import get_active_config
+    from ..indexer.db import count_pending_analysis, get_active_config
     from .shared.context import _db_path, _quick_open_readonly
     from .shared.stale import check_structural_staleness
 
@@ -285,38 +289,18 @@ def _fast_staleness_check(root: Path) -> tuple[bool, list[str]]:
         # background reindex uses config, not stored flags.  Using
         # stored would cause an infinite reindex loop when a manual
         # --analyze-vendor run stored True but config is False.
+        #
+        # count_pending_analysis shares its query with the coverage report
+        # in get_active_build, thus "N unanalyzed symbols" here and
+        # analysis.complete there can never disagree.  Both use
+        # ANALYZABLE_KINDS, and both count a skip:* sentinel as done.
         proj_cfg = load_config(root)
         if proj_cfg.llm.enabled and proj_cfg.llm.analyze_symbols:
-            if proj_cfg.llm.analyze_vendor:
-                unanalyzed = conn.execute(
-                    """SELECT COUNT(*)
-                       FROM symbols s
-                       WHERE s.config_hash = ?
-                         AND s.is_definition = 1
-                         AND s.kind IN ('function', 'method',
-                                        'constructor', 'destructor',
-                                        'class', 'struct')
-                         AND s.name NOT LIKE '%(anonymous%'
-                         AND s.name NOT LIKE '%(unnamed%'
-                         AND NOT EXISTS (SELECT 1 FROM llm_analysis a WHERE a.symbol_id = s.id)""",
-                    (config_hash,),
-                ).fetchone()[0]
-            else:
-                # Use is_project column directly for unanalyzed symbol count
-                unanalyzed = conn.execute(
-                    """SELECT COUNT(*)
-                       FROM symbols s
-                       WHERE s.config_hash = ?
-                         AND s.is_definition = 1
-                         AND s.is_project = 1
-                         AND s.kind IN ('function', 'method',
-                                        'constructor', 'destructor',
-                                        'class', 'struct')
-                         AND s.name NOT LIKE '%(anonymous%'
-                         AND s.name NOT LIKE '%(unnamed%'
-                         AND NOT EXISTS (SELECT 1 FROM llm_analysis a WHERE a.symbol_id = s.id)""",
-                    (config_hash,),
-                ).fetchone()[0]
+            unanalyzed = count_pending_analysis(
+                conn,
+                config_hash,
+                analyze_vendor=proj_cfg.llm.analyze_vendor,
+            )
             if unanalyzed > 0:
                 reasons.append(f"{unanalyzed} unanalyzed symbols")
         return len(reasons) > 0, reasons

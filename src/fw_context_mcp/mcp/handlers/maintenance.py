@@ -41,11 +41,13 @@ from ...indexer.db import (
     CURRENT_SCHEMA_VERSION,
     DatabaseCorruptionError,
     WriteLockTimeout,
+    compute_analysis_coverage,
     count_refs,
     get_active_config,
     get_all_builds_for_project,
     get_all_projects,
     get_db_schema_version,
+    make_analysis_summary,
     open_db,
     transaction,
 )
@@ -167,6 +169,22 @@ def list_variants(
     Use ``get_active_build`` for the mandatory first-call health check and the
     human-readable ``variants``/``images`` discovery; use this tool to see the
     per-build ``config_hash`` and symbol counts (authoritative per-build state).
+
+    Args:
+        project_root: Project root directory. Auto-detected from CWD if
+            omitted.
+
+    Returns:
+        dict: {builds (list[dict]), multi (bool — True when the config
+        declares variants or a build has a non-empty variant name)}.
+
+        Each build dict holds: variant (str — empty for a single-project
+        index), image (str — empty for a single-project index), board (str),
+        config_hash (str), symbol_count (int), file_count (int),
+        manifest_verification (str — "full" or "none").
+
+        When the project is not initialized, or has no index, the result is
+        {builds: [], multi: False, error (str)}.
     """
     root = resolve_project_root(project_root)
     cfg = load_config(root)
@@ -207,58 +225,74 @@ def get_active_build(
         str | None, Field(description="Project root directory. Auto-detected from CWD if omitted.")
     ] = None,
     fast: Annotated[
-        bool, Field(description="When True (default), skip per-file stat scan — faster but "
-        "modified_files_count and header_affected_tus may be 0.")
+        bool, Field(description="When True (default), skip the per-file stat scan. "
+        "modified_files_count is then always 0. header_affected_tus still comes from the "
+        "cached manifest hashes when manifest_verification is 'full'.")
     ] = True,
 ) -> dict:
     """MANDATORY FIRST CALL for C/C++ projects. Return metadata about the
     most recently indexed build configuration — check index health before
     using any other fw-context tools.
 
-    Read-only: yes. Call at session start to check if the index exists,
-    how many symbols it contains, and whether a reindex is needed.
+    Read-only, and it spawns no subprocess — the startup daemon thread and
+    the file watcher own the background reindex.
 
-    Use the ``status`` field for decision-making:
+    Act on ``status``:
 
-    * ``"ready"`` — fully up to date, no issues. Continue normally.
-    * ``"reindexing"`` — background reindex in progress. Index is still
-      usable — all queries return accurate results. Continue normally.
-    * ``"reindex_needed"`` — compile_commands.json changed or schema
-      mismatch. Run ``fw-context index``, but queries still work on
-      existing data.
-    * ``"no_index"`` — project initialized but no index built yet.
-    * ``"not_initialized"`` — project has not been initialized
-      (``fw-context init`` not run).
+    * ``"ready"`` — up to date. Continue.
+    * ``"reindexing"`` — background reindex running; queries stay accurate.
+      Continue. ``reindex_progress`` holds its last log line.
+    * ``"reindex_needed"`` — schema mismatch or compile_commands.json
+      changed. Queries still work on existing data; run ``fw-context index``.
+    * ``"no_index"`` — initialized, never indexed. Run ``fw-context index``.
+    * ``"not_initialized"`` — run ``fw-context init``.
     * ``"error"`` — DB corruption or access error. Use other tools.
 
-    ``reindex_needed`` is True when a structural mismatch exists: schema
-    version outdated or compile_commands.json changed since indexing.
-    Modified source files are auto-handled per-query and do NOT cause
-    ``reindex_needed=True``.
+    Only a structural mismatch sets ``reindex_needed`` — an outdated schema,
+    or a changed compile_commands.json.  Modified source files are handled
+    per-query, and never set it.
 
-    ``index_message`` is a human-readable summary of the index state.
+    ``indexed_at`` and ``first_indexed_at`` are UTC; file mtimes are local
+    time.  Never compare the two directly — in UTC+2 a correctly indexed
+    file looks 2 hours newer than ``indexed_at``.  Call with ``fast=False``
+    to find modified files.
 
-    Background reindex is managed by the startup daemon thread and the
-    file watcher — ``get_active_build()`` is a read-only tool that does
-    not spawn subprocesses.  ``reindex_progress`` contains the last log
-    line from the reindex subprocess when ``bg_reindex_running`` is True.
+    ``analysis`` splits the LLM-analysis coverage into project and vendor
+    symbols:
 
-    Set ``fast=False`` to include per-file stat scanning for accurate
-    ``modified_files_count`` and ``header_affected_tus``.  The default
-    ``fast=True`` is faster and sufficient for most session-start checks.
+    * ``model`` — the model of the analysis, or None. One model only, even
+      when several were used.
+    * ``analyze_vendor`` — the value at index time, not the current config.
+    * ``project`` / ``vendor`` — ``{analyzed, skipped, total}``.
+      ``skipped`` = tried, but not analyzable (body larger than the model
+      context, or an unparseable answer).
+    * ``complete`` — no work left: every project symbol is analyzed or
+      skipped.  True exactly when ``reindex_reasons`` holds no "unanalyzed
+      symbols" entry.  Vendor symbols excluded by ``analyze_vendor=False``
+      never block it, thus ``vendor.total`` large with ``vendor.analyzed=0``
+      is expected, not a defect.
 
     Args:
         project_root: Project root directory. Auto-detected from CWD if
             omitted.
+        fast: When True (default), skip the per-file stat scan.
+            ``modified_files_count`` is then always 0.  ``header_affected_tus``
+            still comes from the cached manifest hashes when
+            ``manifest_verification`` is "full".
 
     Returns:
         dict: {config_hash, project_id, project_root, build_system,
-        compile_commands, indexed_at (ISO timestamp), symbol_count, file_count,
-        reference_count, modified_files_count (int), header_affected_tus (int —
-        number of TUs with stale header dependencies), manifest_verification (str —
-        "full" when manifest.json exists, "none" otherwise), analyzed_symbols (int),
-        unanalyzed_symbols (int — definition symbols still needing LLM analysis),
-        analysis_model (str or None), description (str), first_indexed_at (str),
+        compile_commands, indexed_at (str — "YYYY-MM-DD HH:MM:SS" in UTC,
+        the completion time of the last full index), symbol_count, file_count,
+        reference_count, modified_files_count (int — 0 when fast=True),
+        header_affected_tus (int — number of TUs with stale header
+        dependencies), manifest_verification (str —
+        "full" when manifest.json exists, "none" otherwise),
+        analysis (dict — LLM-analysis coverage split by project/vendor:
+        {model, analyze_vendor, project: {analyzed, skipped, total},
+        vendor: {analyzed, skipped, total}, complete}),
+        description (str), first_indexed_at (str — UTC, same format as
+        indexed_at),
         vendor_paths (list[str] — config index.vendor_paths),
         project_paths (list[str] — config index.project_paths),
         bg_reindex_running (bool),
@@ -271,7 +305,17 @@ def get_active_build(
         stale (bool — True when reindex_needed or header_affected_tus > 0),
         _warning (str, optional — when manifest verification is not "full"),
         vec_available (bool), vec_error (str, optional),
-        index_message (str — human-readable summary of index state)}
+        index_message (str — human-readable summary of index state),
+        multi (bool — True for a multi-variant project),
+        variants (list[dict] — {name, description, board}),
+        images (list[dict] — {name, description, dir, type}),
+        variant_images (dict — variant name to its image names),
+        active_variant (str or None — [build] default_variant),
+        active_image (str or None — [build] default_image)}
+
+        For a project that is not initialized, the result holds only
+        ``status``, ``project_root``, and ``index_message``.  When no index
+        exists, the result adds ``project_id``.
     """
     root = resolve_project_root(project_root)
     # Resolve project ID directly — bypass _db_path/derive_project_id so
@@ -367,19 +411,20 @@ def get_active_build(
                 header_affected_tus = 0
         db_schema_ver = get_db_schema_version(conn)
 
-        # LLM analysis statistics
-        analyzed_count = conn.execute(
-            """SELECT COUNT(*) FROM llm_analysis a
-               JOIN symbols s ON s.id = a.symbol_id
-               WHERE s.config_hash = ?""",
-            (config_hash,),
-        ).fetchone()[0]
+        # LLM analysis coverage — split by project vs vendor so the LLM can
+        # tell intentionally-skipped vendor symbols apart from project
+        # symbols that genuinely still need analysis.
+        coverage = compute_analysis_coverage(conn, config_hash)
+        # Exclude the skip:* sentinels (skip:toolarge, skip:unparseable) —
+        # they are not model names and must never surface as analysis.model.
         analysis_model_row = conn.execute(
             """SELECT a.model FROM llm_analysis a
                JOIN symbols s ON s.id = a.symbol_id
-               WHERE s.config_hash = ? LIMIT 1""",
+               WHERE s.config_hash = ?
+                 AND a.model NOT LIKE 'skip:%' LIMIT 1""",
             (config_hash,),
         ).fetchone()
+        model = analysis_model_row["model"] if analysis_model_row else None
 
         # Read stored analyze_vendor — what was actually indexed.
         # Fall back to False for DBs that predate the column.
@@ -393,15 +438,10 @@ def get_active_build(
         except sqlite3.OperationalError:
             stored_analyze_vendor = False
 
-        # Load project config for vendor_paths/project_paths in the response
-        # and for unanalyzed_symbol count filtering.
+        # Load project config for vendor_paths/project_paths in the response.
         proj_cfg = load_config(project_root=root)
 
-        # Count definition symbols that still need LLM analysis
-        unanalyzed_count = _count_unanalyzed_symbols(
-            conn, config_hash, stored_analyze_vendor, root,
-            proj_cfg.index.vendor_paths,
-        )
+        analysis = make_analysis_summary(coverage, stored_analyze_vendor, model)
 
         cc_changed, stale_reason = _is_stale(cfg, cfg["compile_commands_path"])
         schema_old = db_schema_ver < CURRENT_SCHEMA_VERSION
@@ -497,6 +537,11 @@ def get_active_build(
                 f" | {header_affected_tus} TU(s) have stale header dependencies — header changes since last index"
             )
 
+        # Append LLM-analysis coverage, split by project/vendor, so the LLM
+        # reads unanalyzed vendor symbols as expected (analyze_vendor=false),
+        # not as a defect.
+        index_message += _analysis_message(analysis, stored_analyze_vendor)
+
         result: dict = {
             "config_hash": config_hash,
             "project_id": project_id,
@@ -511,9 +556,7 @@ def get_active_build(
             "header_affected_tus": header_affected_tus,
             "schema_version": db_schema_ver,
             "current_schema": CURRENT_SCHEMA_VERSION,
-            "analyzed_symbols": analyzed_count,
-            "unanalyzed_symbols": unanalyzed_count,
-            "analysis_model": analysis_model_row["model"] if analysis_model_row else None,
+            "analysis": analysis,
             "manifest_verification": manifest_verification,
             "description": cfg["description"] if "description" in cfg.keys() else "",
             "first_indexed_at": cfg["first_indexed_at"] if "first_indexed_at" in cfg.keys() else "",
@@ -604,6 +647,46 @@ def _read_reindex_progress(db_path: Path) -> str | None:
 
 
 # ── moved from server.py ──
+def _analysis_message(analysis: dict, analyze_vendor: bool) -> str:
+    """Return the LLM-analysis part of ``index_message``.
+
+    Takes the ``analysis`` dict from ``make_analysis_summary`` and gives one
+    line for a human reader.  The line always names the skipped symbols,
+    because the pipeline cannot analyze them — the gap between ``analyzed``
+    and ``total`` is not a defect.
+
+    With ``analyze_vendor=False`` the line reports the project counts, and
+    says that fw-context skipped the vendor symbols by design.  With
+    ``analyze_vendor=True`` it reports both sides.
+
+    Args:
+        analysis: The ``analysis`` dict — {project, vendor} each with
+            ``analyzed``, ``skipped``, and ``total``.
+        analyze_vendor: The stored value, thus the message describes the
+            build that fw-context indexed, not the current config.
+
+    Returns:
+        str: the message part, with a leading ``" | "`` separator.
+    """
+    p = analysis["project"]
+    v = analysis["vendor"]
+    if analyze_vendor:
+        skipped_note = ""
+        if p["skipped"] or v["skipped"]:
+            skipped_note = (
+                f" ({p['skipped']} project, {v['skipped']} vendor symbols skipped)"
+            )
+        return (
+            f" | LLM analysis: project {p['analyzed']}/{p['total']}, "
+            f"vendor {v['analyzed']}/{v['total']}{skipped_note}"
+        )
+    skipped_note = f", {p['skipped']} project symbols skipped" if p["skipped"] else ""
+    return (
+        f" | LLM analysis: project {p['analyzed']}/{p['total']}{skipped_note} "
+        "(vendor skipped — analyze_vendor=false)"
+    )
+
+
 def _list_status(db_schema_ver: int, cc_stale: bool) -> str:
     """Map schema version and compile-commands staleness to a status label.
 
@@ -613,64 +696,6 @@ def _list_status(db_schema_ver: int, cc_stale: bool) -> str:
     """
     needs = (db_schema_ver < CURRENT_SCHEMA_VERSION) or cc_stale
     return "reindex_needed" if needs else "ready"
-
-def _count_unanalyzed_symbols(
-    conn: sqlite3.Connection,
-    config_hash: str,
-    stored_analyze_vendor: bool,
-    root: Path,
-    vendor_paths: list[str],
-) -> int:
-    """Count definition symbols that still need LLM analysis.
-
-    Only considers definition-site symbols (is_definition=1) of kinds
-    that the LLM analysis pipeline processes: function, method,
-    constructor, destructor, class, struct.
-
-    When ``stored_analyze_vendor`` is True, all symbols are counted
-    (no path filtering).  When False, vendor paths are excluded using
-    LIKE patterns derived from the project config so the count reflects
-    only project-owned symbols still awaiting analysis.
-
-    Anonymous/unnamed symbols are excluded — they have no meaningful
-    name for the LLM to analyse.
-    """
-    if stored_analyze_vendor:
-        return conn.execute(
-            """SELECT COUNT(*)
-               FROM symbols s
-               WHERE s.config_hash = ?
-                 AND s.is_definition = 1
-                 AND s.kind IN ('function', 'method', 'constructor',
-                                'destructor', 'class', 'struct')
-                 AND s.name NOT LIKE '%(anonymous%'
-                 AND s.name NOT LIKE '%(unnamed%'
-                 AND s.id NOT IN (SELECT symbol_id FROM llm_analysis)""",
-            (config_hash,),
-        ).fetchone()[0]
-
-    from ..shared.filtering import compute_exclude_like
-
-    exclude_like = compute_exclude_like(
-        root,
-        analyze_vendor=False,
-        vendor_paths=vendor_paths,
-    )
-    exclude_clauses = " AND ".join(
-        ["s.file_path NOT LIKE ?"] * len(exclude_like)
-    )
-    exclude_clause = (" AND " + exclude_clauses) if exclude_clauses else ""
-    query = f"""SELECT COUNT(*)
-           FROM symbols s
-           WHERE s.config_hash = ?
-             AND s.is_definition = 1
-             AND s.kind IN ('function', 'method', 'constructor',
-                            'destructor', 'class', 'struct')
-             {exclude_clause}
-             AND s.name NOT LIKE '%(anonymous%'
-             AND s.name NOT LIKE '%(unnamed%'
-             AND s.id NOT IN (SELECT symbol_id FROM llm_analysis)"""
-    return conn.execute(query, (config_hash, *exclude_like)).fetchone()[0]
 
 
 def list_projects(
@@ -684,15 +709,33 @@ def list_projects(
     Read-only. No side effects. Use at session start to discover available
     projects; use ``get_active_build`` for details on the currently active project.
 
+    ``indexed_at`` and ``first_indexed_at`` are UTC, in ``"YYYY-MM-DD
+    HH:MM:SS"`` format — the same format that ``get_active_build`` returns.
+
+    ``analysis`` holds the ``project`` and ``vendor`` counts only.  For the
+    ``model``, ``analyze_vendor``, and ``complete`` fields, call
+    ``get_active_build`` for that project.
+
     Args:
         project_root: Project root. Auto-detected if omitted. Pass to
             distinguish multiple indexed projects.
 
     Returns:
         list of dicts, each with: project_id, name, root_path, build_system,
-        symbol_count, file_count, indexed_at, description (str),
-        first_indexed_at (str), schema_version, current_schema,
-        reindex_needed (bool), status (str), db (path to SQLite database file).
+        symbol_count, file_count, indexed_at (str — UTC), description (str),
+        first_indexed_at (str — UTC), schema_version, current_schema,
+        reindex_needed (bool), status (str — "ready" or "reindex_needed"),
+        db (path to SQLite database file),
+        variant_count (int — number of build variants),
+        image_count (int — number of sysbuild images),
+        analysis (dict — LLM-analysis coverage
+        {project: {analyzed, skipped, total},
+        vendor: {analyzed, skipped, total}}, or None when no build is
+        indexed).
+
+        When no project has an index, the result is a single dict with an
+        ``info`` key.  When fw-context cannot read a database, the result
+        holds a dict with ``db`` and ``error`` keys for that file.
     """
     cfg = load_config(project_root=Path(project_root).resolve() if project_root else None)
     index_dir = cfg.index.db_dir
@@ -719,9 +762,14 @@ def list_projects(
                     "FROM build_configs GROUP BY project_id"
                 ).fetchall():
                     counts[row["project_id"]] = (row["vc"] or 0, row["ic"] or 0)
-                return rows, schema_ver, counts
+                coverage_map = {
+                    row["config_hash"]: compute_analysis_coverage(conn, row["config_hash"])
+                    for row in rows
+                    if row["config_hash"]
+                }
+                return rows, schema_ver, counts, coverage_map
 
-            rows, db_schema_ver, variant_counts = executor.execute_sync(_query, "")
+            rows, db_schema_ver, variant_counts, coverage_map = executor.execute_sync(_query, "")
             for r in rows:
                 # Staleness check: compare stored creation time with
                 # compile_commands.json mtime.  Does not require
@@ -744,6 +792,7 @@ def list_projects(
                     _bs = (_pc.build.system if _pc else None) or (_detect_build_system(root) if root else "unknown")
                 except Exception:
                     _bs = _detect_build_system(root) if root else "unknown"
+                cov = coverage_map.get(r["config_hash"]) if r["config_hash"] else None
                 results.append(
                     {
                         "project_id": r["project_id"],
@@ -762,8 +811,12 @@ def list_projects(
                          "db": str(db_path),
                          "variant_count": variant_counts.get(r["project_id"], (0, 0))[0],
                          "image_count": variant_counts.get(r["project_id"], (0, 0))[1],
-                     }
-                 )
+                         "analysis": (
+                             {"project": cov["project"], "vendor": cov["vendor"]}
+                             if cov else None
+                         ),
+                    }
+                )
         except (sqlite3.Error, OSError) as e:
             results.append({"db": str(db_path), "error": str(e)})
     return results
@@ -792,6 +845,11 @@ def reset_index(
     Returns:
         dict: {project_root, db, project_id, action: "dry_run"|"deleted",
         message, symbol_count, indexed_at (dry-run)}.
+
+        A ``warning`` key means that the database is corrupt — the
+        integrity check failed, thus the counts can be incomplete.
+
+        On failure the dict holds only ``error`` with the reason.
     """
     root = resolve_project_root(project_root)
     db_path = _db_path(root)
@@ -1331,6 +1389,8 @@ def reindex_file_impl(
     Returns:
         dict: {file, translation_units, symbols_updated, elapsed_s,
         analysis_updated (if LLM enabled with analysis), or error}.
+
+        On failure the dict holds only ``error`` with the reason.
     """
     db_path, cfg, project_id, root = _resolve_context(project_root, skip_ready_check=True)
     if not db_path.exists():
@@ -1663,7 +1723,16 @@ def get_environment_status(
         project_root: Project root directory. Auto-detected from CWD if omitted.
 
     Returns:
-        dict: {init_status, deps, build_system, compile_db, index, llm}.
+        dict: {init_status (str — "initialized" or "not_initialized"),
+        deps (list[dict] — name, status, message, and an optional action),
+        build_system (str or None),
+        compile_db (dict — {exists (bool), path (str or None),
+        entry_count (int or None — None before init, and when fw-context
+        cannot read the file)}),
+        index (dict — the full ``get_active_build`` result),
+        llm (dict — {enabled, ollama_running, chat_model, embed_model}, plus
+        ``ollama_enabled`` when the LLM check ran, plus an optional
+        ``action``)}.
     """
     from ...deps import run_full_check
 
@@ -1766,6 +1835,8 @@ def get_project_info(
     Returns:
         dict: {project_id, name, project_type, root_path, created_at, updated_at}
         or {"error": "..."} when the project_id is not registered.
+
+        On failure the dict holds only ``error`` with the reason.
     """
     from ...config.global_db import get_project_by_id
 
