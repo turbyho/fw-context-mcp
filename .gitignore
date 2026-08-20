@@ -42,7 +42,12 @@ AGENTS.md
 .coverage
 htmlcov/
 .lean-ctx/
-work/
+# Keep this pattern anchored to the project root.  An unanchored "work/"
+# also matches the absolute path of a checkout below a directory with the
+# name "work".  Hatchling tests the project root against this file and drops
+# every pattern on a match, thus the sdist gets all ignored files.
+# See hatchling/builders/config.py, load_vcs_exclusion_patterns().
+/work/
 tests/results/
 docs/examples/raw/
 
