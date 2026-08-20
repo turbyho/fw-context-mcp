@@ -1,7 +1,7 @@
 ---
 name: general-purpose
 description: General-purpose agent for complex tasks, research, and multi-step operations. Uses fw-context MCP tools exclusively for all C/C++ source access.
-mode: all
+mode: subagent
 ---
 
 <!-- fw-context -->

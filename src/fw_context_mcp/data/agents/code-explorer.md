@@ -1,7 +1,7 @@
 ---
 name: code-explorer
 description: Code search and analysis across the entire firmware project. Uses fw-context index for symbol lookup, cross-references, and code explanations. Use for any code exploration — finding functions/classes, tracing call chains, understanding modules across domains (BLE, modem, CBOR, RTOS, OTA). Does not replace code-reviewer (diff review) or firmware-builder (build pipeline).
-mode: all
+mode: subagent
 ---
 
 <!-- fw-context -->

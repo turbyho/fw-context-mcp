@@ -448,9 +448,13 @@ By default, with `--scope project`, `fw-context init` configures only the curren
 | **Claude Code** | `.claude/` dir in project | Adds `<!-- fw-context -->` to `CLAUDE.md`. Installs the `code-explorer` and `general-purpose` agents. Installs the `fw-review` skill. |
 | **OpenCode** | `.opencode/` dir in project | Writes the rules file. Installs the skill. |
 
-**Project agents:** `fw-context init` creates two agent definitions in `.claude/agents/`:
-- `code-explorer`: this agent includes a `CRITICAL — C/C++ source access` block. This block enforces fw-context for all C/C++ code reading
-- `general-purpose`: this agent has the same enforcement, for any general task that touches C/C++ source
+**Project agents:** `fw-context init` creates two subagent definitions in `.claude/agents/`:
+- `code-explorer`: this subagent includes a `CRITICAL — C/C++ source access` block. This block enforces fw-context for all C/C++ code reading
+- `general-purpose`: this subagent has the same enforcement, for any general task that touches C/C++ source
+
+Both agents are registered as `mode: subagent`, so in OpenCode they are only
+invoked by `@`-mention or delegated by a primary agent — they do not appear
+in the primary-agent (Tab) selector.
 
 For an existing agent file, `fw-context init` adds only the CRITICAL block.
 `fw-context init` does not change the rest of the file, so the file keeps its
