@@ -318,12 +318,22 @@ async def explain_symbol(
         project_root: Project root directory. Auto-detected if omitted.
         context_lines: Lines of source context around the symbol definition
             (default 40, max 200). Only used when no pre-computed analysis exists.
+        variant: Build variant (multi-project). Omit for the default
+            variant, ``"*"`` for all.
+        image: Sysbuild image in the variant. Omit for all images.
 
     Returns:
         dict: {name, kind, file, line, signature, explanation, llm_analysis
         (if pre-computed)}, plus source/explain_prompt on fallback. Macro
         fallback returns ``kind="macro"``, ``signature`` (as ``#define NAME``),
         ``value`` (raw definition), and ``expanded_value``.
+
+        A ``warning`` key means that the local LLM gave no explanation —
+        the request timed out, or the model is not available.  The dict then
+        holds ``source`` and ``explain_prompt``: read the source, and answer
+        the prompt yourself.
+
+        On failure the dict holds only ``error`` with the reason.
     """
     try:
         db = BaseHandler.resolve_db_context(project_root, variant=variant, image=image)
@@ -468,6 +478,9 @@ def get_source(
         name: Fully qualified symbol name. Returns exact function body
             via libclang extent.
         project_root: Project root. Auto-detected if omitted.
+        variant: Build variant (multi-project). Omit for the default
+            variant, ``"*"`` for all.
+        image: Sysbuild image in the variant. Omit for all images.
 
     Returns:
         dict: {name, qualified_name, kind, file, line, signature,
@@ -477,6 +490,8 @@ def get_source(
         May also include ``template_usr``, ``parent_usr``, ``enum_value``,
         ``constants`` (list for enums), ``value`` (raw macro definition),
         ``expanded_value`` (preprocessor-resolved macro value) when applicable.
+
+        On failure the dict holds only ``error`` with the reason.
     """
     try:
         db = BaseHandler.resolve_db_context(project_root, variant=variant, image=image)
@@ -596,10 +611,15 @@ def get_file_map(
         project_root: Project directory. Auto-detected if omitted.
         signatures: Include full function signatures. Default: False.
         max_per_kind: Max items per kind group (default 30, 0 = unlimited).
+        variant: Build variant (multi-project). Omit for the default
+            variant, ``"*"`` for all.
+        image: Sysbuild image in the variant. Omit for all images.
 
     Returns:
         dict: {file, total_symbols, symbols: {kind: {count, items[],
         subgroups?[]}}}
+
+        On failure the dict holds only ``error`` with the reason.
     """
     try:
         db = BaseHandler.resolve_db_context(project_root, variant=variant, image=image)
@@ -878,6 +898,9 @@ def get_symbol_context(
         name: Symbol name. Returns body, signature, all direct callers
             and callees.
         project_root: Project root. Auto-detected if omitted.
+        variant: Build variant (multi-project). Omit for the default
+            variant, ``"*"`` for all.
+        image: Sysbuild image in the variant. Omit for all images.
 
     Returns:
         dict with: name, qualified_name, kind, file, line, signature,
@@ -897,6 +920,15 @@ def get_symbol_context(
         includes ``llm_analysis``: {summary, inputs, outputs, model, analyzed_at}
         with a structured description of the symbol's purpose, parameters, and
         return values/side effects.
+
+        The dict also carries the libclang flags of the symbol:
+        is_virtual, is_pure_virtual, is_template, parent_usr, and
+        template_usr.  For a virtual method it adds ``overrides`` (the base
+        methods that this method overrides) and ``overridden_by`` (the
+        derived methods that override it) — use these two before you change
+        a virtual method.
+
+        On failure the dict holds only ``error`` with the reason.
     """
     try:
         db = BaseHandler.resolve_db_context(project_root, variant=variant, image=image)
@@ -1036,6 +1068,9 @@ def read_file(
         file_path: Path relative to project root, or just the filename.
             E.g. ``src/main.cpp`` or ``main.cpp``.
         project_root: Project root. Auto-detected if omitted.
+        variant: Build variant (multi-project). Omit for the default
+            variant, ``"*"`` for all.
+        image: Sysbuild image in the variant. Omit for all images.
 
     Returns:
         dict: {file (str), language (str — ``"c"`` or ``"cpp"``),
@@ -1043,6 +1078,8 @@ def read_file(
         content (str — the complete ifdef-filtered file text),
         warning (str, optional — when reading from raw disk instead of
         indexed content)}.
+
+        On failure the dict holds only ``error`` with the reason.
     """
     try:
         db = BaseHandler.resolve_db_context(project_root, variant=variant, image=image)

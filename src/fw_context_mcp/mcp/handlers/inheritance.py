@@ -175,6 +175,9 @@ def get_inheritance_chain(
             bases and derived only).
         max_depth: Maximum BFS depth for transitive walk (default 10,
             clamped to 1–50).
+        variant: Build variant (multi-project). Omit for the default
+            variant, ``"*"`` for all.
+        image: Sysbuild image in the variant. Omit for all images.
 
     Returns:
         dict: {
@@ -184,6 +187,8 @@ def get_inheritance_chain(
             all_bases: [...] (when transitive=True, ancestors sorted by depth),
             all_derived: [...] (when transitive=True, descendants sorted by depth)
         }
+
+        On failure the dict holds only ``error`` with the reason.
     """
     try:
         db = BaseHandler.resolve_db_context(project_root, variant=variant, image=image)
@@ -300,11 +305,16 @@ def get_class_members(
         class_name: Class or struct name. E.g. ``'ModemManager'`` or
             ``'comm::MODEM'``.
         project_root: Project root. Auto-detected if omitted.
+        variant: Build variant (multi-project). Omit for the default
+            variant, ``"*"`` for all.
+        image: Sysbuild image in the variant. Omit for all images.
 
     Returns:
         dict: {name, qualified_name, kind, file, line, members: {kind:
         [{name, qualified_name, signature, is_virtual, is_pure_virtual,
         line}]}, member_count}
+
+        On failure the dict holds only ``error`` with the reason.
     """
     try:
         db = BaseHandler.resolve_db_context(project_root, variant=variant, image=image)
@@ -391,6 +401,9 @@ def get_template_instances(
             E.g. ``'Callback'`` or ``'mbed::Callback'``.
         project_root: Project root. Auto-detected if omitted.
         limit: Maximum results (default 50).
+        variant: Build variant (multi-project). Omit for the default
+            variant, ``"*"`` for all.
+        image: Sysbuild image in the variant. Omit for all images.
 
     Returns:
         list[dict] with one element wrapping the template declaration:
@@ -398,6 +411,9 @@ def get_template_instances(
         signature, instances (list of dicts, each with name,
         qualified_name, kind, file, line, signature, is_definition),
         instance_count (int)}
+
+        No match gives ``[]``.  One dict with ``error`` means the query
+        failed — check that key first.
     """
     limit = max(0, min(limit, 200))  # clamp
     try:
@@ -476,6 +492,9 @@ def get_method_overrides(
             qualified name for disambiguation, e.g.
             ``'UART_DRIVER::write'``.
         project_root: Project root. Auto-detected if omitted.
+        variant: Build variant (multi-project). Omit for the default
+            variant, ``"*"`` for all.
+        image: Sysbuild image in the variant. Omit for all images.
 
     Returns:
         dict: {
@@ -483,6 +502,8 @@ def get_method_overrides(
             overrides: [{usr, name, qualified_name, kind, file, line}],
             overridden_by: [{usr, name, qualified_name, kind, file, line}]
         }
+
+        On failure the dict holds only ``error`` with the reason.
     """
     try:
         db = BaseHandler.resolve_db_context(project_root, variant=variant, image=image)

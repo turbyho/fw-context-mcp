@@ -216,8 +216,8 @@ def search_code(
     (``"interrupt handler"``, ``"modem init"``).  Prefer ``lookup_symbol``
     when you already know the exact or prefix name.
 
-    Results include names, file locations, signatures, and docstrings —
-    the metadata about each symbol, not the symbol's implementation code.
+    Results hold the metadata of each symbol — name, location, signature,
+    docstring — not its implementation code.
 
     **FTS5 syntax:**
     - ``init*`` matches init, init_uart, initialize (trailing wildcard)
@@ -225,37 +225,29 @@ def search_code(
     - Do NOT use underscore in queries — ``modem_init`` is split into
       ``modem AND init``. Write ``modem init`` instead.
 
-    **Progressive relaxation:** when the initial FTS5 search returns nothing,
-    the tool automatically broadens the search in up to six steps:
+    **Progressive relaxation:** when FTS5 finds nothing, the search widens
+    in up to six steps, and every result carries the ``_fallback`` method
+    that found it:
 
-    1. *FTS5 with kind filter* — the original query with the user-provided
-       ``kind`` constraint.
-    2. *FTS5 without kind filter* — drops the ``kind`` constraint (users often
-       guess the wrong kind for a symbol).
-    3. *name_tokens substring match* — searches the pre-computed CamelCase/
-       snake_case token column (e.g. ``BuildType`` is indexed as
-       ``"build type"``).  Requires at least N‑1 of N query terms to match.
-    4. *Single-term docstring LIKE* — when only one query term was given and
-       the token-based steps found nothing, does a raw LIKE over the docstring
-       column to catch terms the FTS5 tokeniser may have missed.
-    5. *Individual term FTS5* — searches each query word separately and merges
-       the results.
-    6. *Macro FTS5 fallback* — searches the ``macros_fts`` table for matching
-       ``#define`` names and values (kind="macro", ``_fallback="macros_fts"``).
-
-    Results from fallback steps carry ``_fallback`` indicating which method
-    succeeded (``"fts5"``, ``"name_tokens_like"``, ``"docstring_like"``,
-    ``"individual_terms"``, ``"macros_fts"``).
+    1. FTS5 with the ``kind`` filter — ``_fallback="fts5"``.
+    2. FTS5 without it; operators often guess the wrong kind.
+    3. ``name_tokens`` substring match over the pre-computed CamelCase /
+       snake_case tokens (``BuildType`` is indexed as ``"build type"``).
+       Needs N−1 of N query terms — ``"name_tokens_like"``.
+    4. LIKE over the docstring column, for a single-term query that the
+       token steps missed — ``"docstring_like"``.
+    5. FTS5 per query word, results merged — ``"individual_terms"``.
+    6. ``macros_fts`` for ``#define`` names and values, kind="macro" —
+       ``"macros_fts"``.
 
     **Kind filter values:** ``function``, ``method``, ``constructor``,
     ``destructor``, ``class``, ``struct``, ``union``, ``enum``, ``enum_constant``,
     ``typedef``, ``varglobal``, ``varlocal``, ``variable``, ``field``,
     ``namespace``.
 
-    Each result may include ``summary``, ``inputs``, ``outputs``
-    when LLM analysis has been generated (``fw-context index --analyze``).
-    These provide structured descriptions: what the symbol does, what
-    parameters/data it receives, and what it returns/produces.
+    After ``fw-context index --analyze``, a result also holds ``summary``,
+    ``inputs``, and ``outputs`` — what the symbol does, what it receives,
+    and what it returns.
 
     Read-only. No side effects.
 
@@ -266,6 +258,9 @@ def search_code(
         limit: Maximum results (default 20, max 100).
         project_only: When True, exclude vendor SDK directories and return only
             application code. Default False.
+        variant: Build variant (multi-project). Omit for the default
+            variant, ``"*"`` for all.
+        image: Sysbuild image in the variant. Omit for all images.
 
     Returns:
         list of dicts, each with: name, qualified_name, kind, file, line,
@@ -274,6 +269,9 @@ def search_code(
         integer value. May also include ``template_usr``, ``parent_usr``,
         ``summary``, ``inputs``, ``outputs`` when available. Fallback
         results include ``_fallback`` with the method name.
+
+        No match gives ``[]``.  A dict with ``error`` means the query
+        failed.  A stale index prepends a dict with ``warning`` + ``hint``.
     """
     root = resolve_project_root(project_root)
     limit = max(0, min(limit, 100))
@@ -380,6 +378,17 @@ async def smart_search(
         list of dicts with metadata entries (_generated_queries, _rough_queries,
         _translated_from) followed by symbol results with name, qualified_name,
         kind, file, line, is_definition, signature, docstring.
+
+        When the LLM stalls, the tool gives the FTS5 results that it has.
+        The leading dict then holds ``_partial: True``, a ``warning`` with
+        the timeout, and a ``hint``.  The result is incomplete: make the
+        query more specific, or increase the LLM timeout.
+
+        When the index is stale, a leading dict holds a ``warning`` and a
+        ``hint`` to reindex.
+
+        No match gives ``[]``.  One dict with ``error`` means the query
+        failed — check that key first.
     """
     from fw_context_mcp.search.context import PipelineContext
     from fw_context_mcp.search.pipeline import PipelineRunner, _build_smart_search
@@ -479,6 +488,20 @@ async def semantic_search(
         is_definition, signature, docstring, plus ``_similarity`` (cosine
         similarity score) and ``_method`` (``"embedding"`` or
         ``"search_code_fallback"``).
+
+        When the best similarity is below the relevance floor (0.68), the
+        result is one dict with ``warning``, ``_best_similarity`` (float),
+        ``_fallback_suggestion`` (``"search_code"``), and ``_results`` (the
+        low-similarity results).  Treat those results as noise, and use
+        ``search_code`` instead.
+
+        When the LLM is not running, or the embedding fails, this tool falls
+        back to ``search_code``.  The results then carry
+        ``_method: "search_code_fallback"``, and a leading dict holds a
+        ``warning`` with the reason.
+
+        No match gives ``[]``.  One dict with ``error`` means the query
+        failed — check that key first.
     """
 
     try:
@@ -631,11 +654,9 @@ def search_bodies(
     - ``search_code`` — find symbols by NAME (what the code IS):
       ``modem init``, ``interrupt handler``, ``uart send``.
 
-    **Limitations — what ``search_bodies`` CANNOT find:**
-
-    Only function/method definition bodies are indexed (``is_definition=1``
-    symbols with source text).  The following are at FILE SCOPE and are
-    NEVER in the ``source`` column:
+    **Limitation — this tool searches ONLY function bodies.**  The index
+    holds the source text of definition bodies (``is_definition=1``), thus
+    the ``source`` column NEVER holds a file-scope construct:
 
     - ``extern "C"`` — linkage specifier at file scope
     - Type declarations in headers — ``InterruptIn _pin;`` in class bodies
@@ -644,25 +665,13 @@ def search_bodies(
     - Namespace declarations
     - Any code outside ``{ }`` of a function definition
 
-    **LIMITATION — search_bodies ONLY searches function bodies ({ }):**
-    If your pattern might be at file scope (class member declarations like
-    ``InterruptIn _pin``, function declarations, ``#define``, ``extern "C"``,
-    global variables), use ``search_content`` instead.  search_bodies returns
-    empty for any pattern outside function bodies.
+    For a pattern that can be at file scope, use ``search_content``, which
+    indexes the full file.  ``search_bodies`` returns nothing for it.
 
-    For these patterns, use ``search_content`` which indexes full file
-    content (not limited to function bodies).
-
-    **When to set ``project_only=True``:**
-    Your project contains two kinds of code:
-    - Application code — code your team wrote.
-    - Vendor SDK — framework/OS code shipped by a vendor, NOT written by
-      your team.
-
-    Set ``project_only=True`` when the question is about YOUR code
-    (``"where do we register interrupt handlers?"``,
-    ``"which functions call .attach()?"``).  Leave it ``False`` (default)
-    when the vendor code is also relevant.
+    Set ``project_only=True`` for a question about YOUR code (``"where do we
+    register interrupt handlers?"``).  Leave it ``False`` (default) when the
+    vendor SDK code — the framework or OS code that your team did not write
+    — is also relevant.
 
     Results include ``_match_snippet`` — a highlighted excerpt showing
     each match in context (e.g. ``_timeout.<b>attach</b>(callback(...))``).
@@ -681,11 +690,17 @@ def search_bodies(
         limit: Maximum results (default 20, max 100).
         project_only: When True, exclude vendor SDK directories and return only
             application code. Default False.
+        variant: Build variant (multi-project). Omit for the default
+            variant, ``"*"`` for all.
+        image: Sysbuild image in the variant. Omit for all images.
 
     Returns:
         list of dicts, each with: name, qualified_name, kind, file, line,
         is_definition, signature, _match_snippet (excerpt around match),
         source (function body, truncated at 2000 chars).
+
+        No match gives ``[]``.  A dict with ``error`` means the query
+        failed.  A stale index prepends a dict with ``warning`` + ``hint``.
     """
     root = resolve_project_root(project_root)
     # Enforce limit bounds at the function entry point (not inside _do_search)
@@ -827,26 +842,16 @@ def search_content(
     for the current build configuration.  Inactive ``#ifdef`` branches are
     replaced with blank lines (preserving original line numbers).
 
-    Covers file-scope constructs that ``search_bodies`` cannot see:
-    ``extern "C"``, type declarations in headers, ``#include``, ``#define``,
-    global variables, namespace blocks.  Also covers function bodies, but
-    ``search_bodies`` is preferred for body-level patterns (per-function
-    context, snippet highlights per match).
+    Covers the file-scope constructs that ``search_bodies`` cannot see:
+    ``extern "C"``, ``InterruptIn`` and other type declarations in headers,
+    ``#include``, ``#define``, global variables, namespace blocks.  It
+    covers function bodies too, but prefer ``search_bodies`` there — it
+    gives per-function context and a snippet per match.  To find a symbol by
+    NAME (``modem init``, ``interrupt handler``), use ``search_code``.
 
-    **When to use ``search_content`` vs ``search_bodies`` vs ``search_code``:**
-
-    - ``search_content`` — patterns anywhere in FILES (file scope + bodies):
-      ``extern "C"``, ``InterruptIn``, ``#define``, type declarations.
-    - ``search_bodies`` — patterns in function BODIES only:
-      ``.attach(``, ``callback(&``, ISR registration patterns.
-    - ``search_code`` — find symbols by NAME:
-      ``interrupt handler``, ``modem init``.
-
-    **project_only=True** filters to files with ``is_project = 1`` (project code, excluding vendor/SDK).
-    Default False includes vendor SDK files.
-
-    Results are file-level (one entry per matching file) — use
-    ``search_bodies`` for per-function granularity.
+    Results are file-level — one entry per matching file.
+    ``project_only=True`` filters to ``is_project = 1`` files; the default
+    False includes the vendor SDK files.
 
     When ``files_fts`` is missing (legacy index), falls back to LIKE
     search on ``files.content`` — results include ``_fallback: "like"``
@@ -861,10 +866,16 @@ def search_content(
         project_root: Project root. Auto-detected if omitted.
         limit: Maximum results (default 20, max 100).
         project_only: When True, filter to project code only (files with is_project = 1).
+        variant: Build variant (multi-project). Omit for the default
+            variant, ``"*"`` for all.
+        image: Sysbuild image in the variant. Omit for all images.
 
     Returns:
         list of dicts, each with: file, language, mtime,
         _match_snippet (highlighted excerpt around the match).
+
+        No match gives ``[]``.  A dict with ``error`` means the query
+        failed.  A stale index prepends a dict with ``warning`` + ``hint``.
     """
     root = resolve_project_root(project_root)
     # Enforce limit bounds at the function entry point (not inside _do_search)
