@@ -67,6 +67,9 @@ def lookup_symbol(
         project_root: Project directory. Auto-detected if omitted.
         exact: True = exact name match, False = prefix LIKE match (default).
         limit: Maximum results (default 50).
+        variant: Build variant (multi-project). Omit for the default
+            variant, ``"*"`` for all.
+        image: Sysbuild image in the variant. Omit for all images.
 
     Returns:
         list[dict]: Symbols with name, qualified_name, kind, file, line,
@@ -77,12 +80,20 @@ def lookup_symbol(
         resolved value). May also include ``template_usr``,
         ``parent_usr``, ``summary``, ``inputs``, ``outputs`` when available.
         When no results found, may include ``_did_you_mean`` with suggested
-        symbol names. Empty list if not found.
+        symbol names. When no symbol matches, the list is empty —
+        this tool gives no ``info`` entry for an empty result.
 
         **Note:** C++ constructors share their name with the enclosing
         class, so ``lookup_symbol("Foo")`` may return both ``class Foo``
         and ``constructor Foo::Foo()``.  Use the ``kind`` field to
         filter when you need a specific symbol type.
+
+        A symbol that comes from the relaxed prefix fallback carries
+        ``_fallback: True`` — the name is not an exact match of *name*.
+
+        A list with one dict that holds an ``error`` key means that the
+        project has no index, or that the lookup failed.  Read that key
+        before you read the result fields.
     """
     try:
         root = resolve_project_root(project_root)

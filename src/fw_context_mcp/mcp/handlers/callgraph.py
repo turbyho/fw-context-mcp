@@ -374,6 +374,9 @@ def find_callers(
             suffix LIKE).
         project_root: Project root directory. Auto-detected if omitted.
         limit: Maximum results (default 50).
+        variant: Build variant (multi-project). Omit for the default
+            variant, ``"*"`` for all.
+        image: Sysbuild image in the variant. Omit for all images.
 
     Returns:
         list of dicts, each with: file, line, ref_kind (``"call"``,
@@ -381,6 +384,9 @@ def find_callers(
         caller (enclosing function name), caller_kind (``"function"``,
         ``"method"``, …). Macro fallback includes a leading dict with
         ``kind="macro"``, ``value``, and ``expanded_value``.
+
+        Never empty: one dict with ``error`` (symbol not resolved) or
+        ``info`` (no references of this kind).  Check both keys first.
     """
     return _references_result(name, project_root, ref_kind=["call", "indirect", "implicit_construct"], limit=limit, caller_mode=True, variant=variant, image=image)
 
@@ -415,6 +421,9 @@ def find_references(
         name: Symbol name to find all references of.
         project_root: Project root directory. Auto-detected if omitted.
         limit: Maximum results (default 50, max 200).
+        variant: Build variant (multi-project). Omit for the default
+            variant, ``"*"`` for all.
+        image: Sysbuild image in the variant. Omit for all images.
 
     Returns:
         list of dicts, each with: file, line, ref_kind, caller, caller_kind.
@@ -425,6 +434,9 @@ def find_references(
         initialization), ``"macro_use"`` (macro usage
         in file). Macro fallback includes a leading dict with
         ``kind="macro"``, ``value``, and ``expanded_value``.
+
+        Never empty: one dict with ``error`` (symbol not resolved) or
+        ``info`` (no references).  Check both keys first.
     """
     return _references_result(name, project_root, ref_kind=None, limit=limit, variant=variant, image=image)
 
@@ -462,12 +474,18 @@ def find_indirect_call_sites(
             qualified, suffix LIKE.
         project_root: Project root directory. Auto-detected if omitted.
         limit: Maximum results (default 50, max 200).
+        variant: Build variant (multi-project). Omit for the default
+            variant, ``"*"`` for all.
+        image: Sysbuild image in the variant. Omit for all images.
 
     Returns:
         list of dicts, each with: file, line, expr_text (the callee
         expression, e.g. ``"driver.onData"``), target_usr, target_name,
         fn_ptr_type (the function pointer type signature), caller
         (enclosing function name), caller_kind.
+
+        Never empty: one dict with ``error`` (cannot resolve) or ``info``
+        (no results) replaces the results.  Check both keys first.
     """
     try:
         db = BaseHandler.resolve_db_context(project_root, variant=variant, image=image)
@@ -544,12 +562,23 @@ def find_indirect_targets(
             named ``onData``.  Uses three-tier resolution.
         project_root: Project root directory. Auto-detected if omitted.
         limit: Maximum results (default 50, max 200).
+        variant: Build variant (multi-project). Omit for the default
+            variant, ``"*"`` for all.
+        image: Sysbuild image in the variant. Omit for all images.
 
     Returns:
         list of dicts, each with: rhs_name (assigned function),
         rhs_qname, fn_ptr_type, method (assignment/call_arg/var_init/
         init_list), assign_file, assign_line, assign_caller,
         call_file, call_line, call_expr_text.
+
+        An entry can carry ``_note`` (str) when fw-context cannot resolve
+        the direct call site — the callee is template-obscured, or the call
+        site comes from the type-based fallback.  Read that note before you
+        act on ``call_file`` and ``call_line``.
+
+        Never empty: one dict with ``error`` (cannot resolve) or ``info``
+        (no results) replaces the results.  Check both keys first.
     """
     try:
         db = BaseHandler.resolve_db_context(project_root, variant=variant, image=image)
@@ -676,40 +705,29 @@ def find_call_path(
 
     **Limitations:**
 
-    - **Caveat 1 — Callback/event-loop dispatch:** Callbacks registered
-      via dispatch-registration APIs (``EventQueue::call_every``,
-      ``k_work_submit``, ``xTimerStart``) are bridged to their dispatch
-      entry point (e.g. ``dispatch_forever``, ``z_work_q_main``) via a
-      built-in mapping for mbed-os, Zephyr, and FreeRTOS.  Custom or
-      uncommon RTOS dispatch patterns can be added via
-      ``[call_graph.dispatch_bridges]`` in ``.fw-context/config.toml``.
-      Bridges whose entry point symbol does not exist in the index are
-      silently skipped — the map can list all supported platforms
-      without causing errors.
-    - **Caveat 2 — Ambiguous name resolution in fallback paths:** When
-      libclang cannot resolve a call (e.g. template-obscured
-      ``_timeout.attach(...)``), a source-line regex fallback attempts
-      to match the method name.  If multiple methods share the same
-      unqualified name AND neither the receiver field type nor the
-      caller's class provide disambiguation, the edge is **not** created
-      (conservative — avoids false paths).
-    - **Caveat 3 — Global constructor bridging:** File-scope
-      ``implicit_construct`` edges are reachable through a synthetic
-      ``<global ctors>`` node injected between ``main`` and all global
-      constructors.  Works for any call-path query that can reach
-      ``main`` — not limited to queries starting from ``main``.
+    - **Dispatch bridges:** callbacks registered through
+      ``EventQueue::call_every``, ``k_work_submit``, or ``xTimerStart``
+      reach their dispatch entry point (``dispatch_forever``,
+      ``z_work_q_main``) through a built-in map for mbed-os, Zephyr, and
+      FreeRTOS.  Add other RTOS patterns in
+      ``[call_graph.dispatch_bridges]`` (``.fw-context/config.toml``); a
+      bridge whose entry symbol is not in the index is skipped silently.
+    - **Ambiguous fallback names:** for a call that libclang cannot
+      resolve (template-obscured ``_timeout.attach(...)``), a source-line
+      regex matches the method name.  When several methods share that
+      unqualified name and neither the receiver field type nor the caller
+      class disambiguates, fw-context creates NO edge — conservative, to
+      avoid false paths.
+    - **Global constructors:** file-scope ``implicit_construct`` edges
+      hang off a synthetic ``<global ctors>`` node between ``main`` and
+      every global constructor.  Any query that can reach ``main`` uses
+      it, not only a query that starts at ``main``.
 
-    **When ``find_call_path`` returns empty** and you believe a path
-    should exist:
-
-    1. Check for async dispatch — use ``search_bodies("call_every")``
-       or ``search_bodies("attach")`` to find callback registrations.
-    2. Manually trace through callbacks with ``find_callers`` on
-       intermediate symbols.
-    3. Raise ``max_depth`` (default 10, max 50) if the call chain is
-       long.
-    4. Use ``find_indirect_call_sites`` / ``find_indirect_targets`` to
-       verify function-pointer wiring.
+    **On an empty result** that you expected to hold a path: look for async
+    dispatch (``search_bodies("call_every")``, ``search_bodies("attach")``),
+    trace the intermediate symbols with ``find_callers``, raise
+    ``max_depth``, and check the function-pointer wiring with
+    ``find_indirect_call_sites`` / ``find_indirect_targets``.
 
     For one-sided exploration use ``find_all_callers_recursive`` (who reaches
     this?) or ``find_callees_recursive`` (what does this reach?).
@@ -724,11 +742,17 @@ def find_call_path(
         to_name: Target symbol to find path to.
         project_root: Project root. Auto-detected if omitted.
         max_depth: Maximum BFS depth for path search (default 10, max 50).
+        variant: Build variant (multi-project). Omit for the default
+            variant, ``"*"`` for all.
+        image: Sysbuild image in the variant. Omit for all images.
 
     Returns:
         list of dicts, each with: depth (edge count, int), chain (str —
-        e.g. ``"main → app_run → modem_init"``). Empty list when no
-        path exists within the depth limit.
+        e.g. ``"main → app_run → modem_init"``). When no path exists
+        within the depth limit, the list holds one ``info`` dict.
+
+        Never empty: one dict with ``error`` (cannot resolve) or ``info``
+        (no results) replaces the results.  Check both keys first.
     """
     db, err = _refs_guard(project_root, variant=variant, image=image)
     if err:
@@ -797,11 +821,17 @@ def find_all_callers_recursive(
         project_root: Project root. Auto-detected if omitted.
         max_depth: Maximum BFS depth for transitive search (default 5).
         limit: Maximum results (default 50).
+        variant: Build variant (multi-project). Omit for the default
+            variant, ``"*"`` for all.
+        image: Sysbuild image in the variant. Omit for all images.
 
     Returns:
         list of dicts, each with: caller (str — caller name),
         caller_qualified_name (str), depth (int — distance from target),
         file (str), line (int), ref_kind (``"call"`` or ``"indirect"``).
+
+        Never empty: one dict with ``error`` (cannot resolve) or ``info``
+        (no results) replaces the results.  Check both keys first.
     """
     db, err = _refs_guard(project_root, variant=variant, image=image)
     if err:
@@ -863,11 +893,17 @@ def find_callees_recursive(
         project_root: Project root. Auto-detected if omitted.
         max_depth: Maximum BFS depth for transitive search (default 5).
         limit: Maximum results (default 50).
+        variant: Build variant (multi-project). Omit for the default
+            variant, ``"*"`` for all.
+        image: Sysbuild image in the variant. Omit for all images.
 
     Returns:
         list of dicts, each with: callee (str — callee name),
         callee_qualified_name (str), depth (int — distance from source),
         file (str), line (int), ref_kind (``"call"`` or ``"indirect"``).
+
+        Never empty: one dict with ``error`` (cannot resolve) or ``info``
+        (no results) replaces the results.  Check both keys first.
     """
     db, err = _refs_guard(project_root, variant=variant, image=image)
     if err:
@@ -902,37 +938,33 @@ def find_dead_code(
     just within a single file — text-based search cannot determine
     whether a function is actually reachable.
 
-    **What "dead" means:** A function with **zero references** in the
-    index — no calls, no function-pointer assignments, no indirect call
-    sites.  This is a **single-layer reference check**, not a
-    reachability analysis from entry points (main, ISR, exported
-    symbols).  A function that is only called by *another* dead function
-    will NOT be marked as dead (it has a reference).  If you need
-    transitive reachability, manually trace from your entry points using
-    ``find_callees_recursive``.
+    **What "dead" means:** zero references in the index — no call, no
+    function-pointer assignment, no indirect call site.  This is a
+    single-layer reference check, NOT a reachability analysis from the
+    entry points (main, ISR, exported symbols): a function that only a
+    second dead function calls still has a reference, thus this tool does
+    not mark it.  For transitive reachability, trace from your entry points
+    with ``find_callees_recursive``.
 
-    Returns two categories of results, each with a ``status`` field:
+    The ``status`` field splits the results:
 
-    * ``"dead"`` — no references at all (neither calls nor function
-      pointer assignments).  Likely unused.
-    * ``"possibly_dead"`` — the function is assigned to a function
-      pointer (Phase 1 ``ref_kind="indirect"``) but no call site
-      through that pointer was resolved (Phase 3).  This means the
-      function MIGHT be called through unindexed code or a type-erased
-      API.  LLM should treat this as uncertain, not as confirmed dead
-      code.  Verify each hit with ``find_indirect_targets`` before
-      deleting.
+    * ``"dead"`` — no reference at all.  Likely unused.
+    * ``"possibly_dead"`` — assigned to a function pointer (Phase 1
+      ``ref_kind="indirect"``), but no call site through that pointer
+      resolved (Phase 3).  Unindexed code or a type-erased API can still
+      call it.  Treat it as uncertain, and check each hit with
+      ``find_indirect_targets`` before you delete anything.
 
-    Implicit constructor calls through global/static object and member-field
-    initialization are detected as ``implicit_construct`` references. Known
-    remaining false positives: constructors called via factories, ISRs,
-    virtual method overrides, and weak-aliased symbols. Always verify before
-    deleting.
+    fw-context detects a constructor call through global/static object and
+    member-field initialization as an ``implicit_construct`` reference.
+    Known false positives remain: constructors from factories, ISRs,
+    virtual method overrides, and weak-aliased symbols.  Always verify
+    before you delete.
 
-    By default, SDK/vendor paths are auto-excluded via the ``is_project``
-    column (which respects project config ``vendor_paths`` and
-    ``project_paths``).  Use ``project_only=False`` to see all results
-    including vendor code.
+    ``project_only=True`` (default) excludes the SDK and vendor paths
+    through the ``is_project`` column, which follows the ``vendor_paths``
+    and ``project_paths`` config.  Set ``project_only=False`` to see the
+    vendor results too.
 
     Read-only. No side effects. Requires the reference index
     (``fw-context index`` — refs on by default).
@@ -944,11 +976,17 @@ def find_dead_code(
             tool parameter, not config). E.g. ``['lib/%']``.
         project_only: When True (default), filters to ``is_project = 1``
             symbols. Set False to see all results.
+        variant: Build variant (multi-project). Omit for the default
+            variant, ``"*"`` for all.
+        image: Sysbuild image in the variant. Omit for all images.
 
     Returns:
         list of dicts, each with: name, qualified_name, kind, file, line,
         status (``"dead"`` or ``"possibly_dead"``), and reason (str —
         explains why the function is classified as dead or possibly dead).
+
+        Never empty: one dict with ``info`` replaces an empty result.
+        Check that key first.
     """
     limit = max(0, min(limit, 200))  # clamp
     db, err = _refs_guard(project_root, variant=variant, image=image)
@@ -1001,11 +1039,19 @@ def find_wrapper_callers(
             E.g. ``'UART_DRIVER'`` or ``'hal::UART_DRIVER'``.
         project_root: Project root. Auto-detected if omitted.
         limit: Maximum wrapper method results (default 50).
+        variant: Build variant (multi-project). Omit for the default
+            variant, ``"*"`` for all.
+        image: Sysbuild image in the variant. Omit for all images.
 
     Returns:
-        list of dicts, each with: wrapper_class (str), method_count (int),
+        list of dicts, each with: wrapper_class (str — ``"(global)"`` for a
+        free function), method_count (int),
         methods (list of dicts — each with method, qualified_name, kind,
-        and calls (list of driver methods called)).
+        and calls (list of dicts — ``driver_method`` (str) and ``line``
+        (int) of each call into the driver))).
+
+        Never empty: one dict with ``error`` (cannot resolve) or ``info``
+        (no results) replaces the results.  Check both keys first.
     """
     limit = max(0, min(limit, 50))  # clamp
     db, err = _refs_guard(project_root, variant=variant, image=image)
@@ -1177,6 +1223,9 @@ def trace_data_flow(
         limit: Maximum source functions to trace (default 15).
         timeout_ms: Maximum total execution time in milliseconds
             (default 30000). Clamped to 1000–300000.
+        variant: Build variant (multi-project). Omit for the default
+            variant, ``"*"`` for all.
+        image: Sysbuild image in the variant. Omit for all images.
 
     Returns:
         list of dicts with a leading ``_summary`` entry:
@@ -1184,6 +1233,13 @@ def trace_data_flow(
         entries each with: source_name, source_qualified_name, source_kind,
         source_file, source_line, caller_count, reachable (bool), and
         paths (list of call path dicts — empty when unreachable).
+
+        A source entry with ``timed_out: True`` means that the path search
+        stopped at the time limit for that source.  Its ``reachable: False``
+        thus means "not proved reachable", not "proved unreachable".
+
+        Never empty: one dict with ``info`` replaces an empty result.
+        Check that key first.
     """
     max_depth = max(1, min(max_depth, 20))  # clamp
     limit = max(0, min(limit, 15))  # clamp
@@ -1321,10 +1377,16 @@ def find_hotspots(
             symbols so hotspots reflect project code.
         exclude_paths: Additional LIKE patterns to exclude (user-supplied
             tool parameter). E.g. ``['lib/%']``.
+        variant: Build variant (multi-project). Omit for the default
+            variant, ``"*"`` for all.
+        image: Sysbuild image in the variant. Omit for all images.
 
     Returns:
         list of dicts, each with: name, qualified_name, kind, file, line,
         caller_count (int — total number of call sites), signature.
+
+        Never empty: one dict with ``info`` replaces an empty result.
+        Check that key first.
     """
     limit = max(0, min(limit, 50))  # clamp
     db, err = _refs_guard(project_root, variant=variant, image=image)

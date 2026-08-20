@@ -323,8 +323,8 @@ names, as supplementary context. fw-context stores the results in the
 `llm_analysis` table, and denormalizes the results into the FTS5 index. So
 symbols become searchable by their purpose, not only by their name.
 
-Configure with `[llm] analyze_symbols`, `[llm] analysis_model`, and
-`[llm] num_ctx` in `~/.fw-context/config.toml`.
+Configure with `[llm] analyze_symbols`, `[llm] model`, `[llm] analyze_vendor`,
+and `[llm] num_ctx` in `~/.fw-context/config.toml`.
 
 ### `fw-context cache stats`
 
@@ -1353,16 +1353,18 @@ Check index health — call at session start.
 Input:  {"project_root?": "/path/to/project"}
 Output: {"config_hash": "a1b2…", "project_id": "c3d4…", "project_root": "/path/to/project",
          "build_system": "zephyr", "compile_commands": "/path/build/compile_commands.json",
-         "indexed_at": "2026-06-05T09:35:18", "symbol_count": 12430, "file_count": 1502,
+         "indexed_at": "2026-06-05 09:35:18", "symbol_count": 12430, "file_count": 1502,
          "reference_count": 8900, "modified_files_count": 3,
          "header_affected_tus": 0, "manifest_verification": "full",
          "schema_version": 84935291, "current_schema": 84935291,
-         "analyzed_symbols": 8450, "unanalyzed_symbols": 120,
-         "analysis_model": "qwen2.5-coder:14b",
+         "analysis": {"model": "qwen2.5-coder:14b", "analyze_vendor": false,
+                      "project": {"analyzed": 8450, "skipped": 6, "total": 8570},
+                      "vendor": {"analyzed": 0, "skipped": 0, "total": 42330},
+                      "complete": false},
          "vendor_paths": [], "project_paths": [],
          "bg_reindex_running": false, "reindex_progress": null,
          "status": "ready", "reindex_needed": false, "reindex_reasons": [],
-         "index_message": "Index is fully up to date (12430 symbols)"}
+         "index_message": "Index is fully up to date (12430 symbols) | LLM analysis: project 8450/8570 (vendor skipped — analyze_vendor=false)"}
 ```
 
 **Read-only.** This tool has no side effects, and does not spawn background
@@ -1377,14 +1379,18 @@ whether a background reindex is active, and its last log line.
 | ``"ready"`` | Fully up to date, no issues | Continue normally |
 | ``"reindexing"`` | Background reindex in progress | Index is still usable — continue normally |
 | ``"reindex_needed"`` | compile_commands.json changed or schema mismatch | Queries still work, but schedule ``fw-context index`` |
-| ``"no_index"`` | No build config indexed | Use other tools |
+| ``"no_index"`` | No build config indexed | Run ``fw-context index`` |
+| ``"not_initialized"`` | ``fw-context init`` was not run | Run ``fw-context init`` |
 | ``"error"`` | DB corruption or access error | Use other tools |
 
-`modified_files_count` is cached for 30 seconds, so calls within that
-window return the same value. `header_affected_tus` reports how many
-translation units have stale header dependencies. This count is non-zero
-when headers changed since the last index with
-`manifest_verification: "full"`.
+`modified_files_count` is 0 with the default `fast=true`. With
+`fast=false`, fw-context does a fresh stat scan of every indexed file. This
+tool does not use the 30-second count cache — only the watcher daemon uses
+it. `header_affected_tus` reports how many translation units have stale
+header dependencies. This count is non-zero when headers changed since the
+last index with `manifest_verification: "full"`. fw-context reports
+`header_affected_tus` in both modes, but `fast=true` reads it from the
+cache.
 
 `manifest_verification` is `"full"` when `manifest.json` is available. In
 that case, fw-context tracks header staleness with SHA-256 hashes that
@@ -1393,9 +1399,32 @@ when no manifest exists. In that case, fw-context cannot detect header
 changes. Run `fw-context index --build` to regenerate the index with full
 dependency tracking.
 
-`unanalyzed_symbols` counts the definition symbols that still need LLM
-analysis. This count is zero when analysis is disabled, and empty when
-fw-context has analyzed all symbols.
+`analysis` splits LLM-analysis coverage by project vs vendor symbols so
+the reader can tell intentionally-skipped vendor symbols apart from
+project symbols that still need analysis:
+
+- `project.analyzed` / `project.total` — project definition symbols.
+- `vendor.analyzed` / `vendor.total` — vendor/SDK definition symbols.
+- `project.skipped` / `vendor.skipped` — symbols that the pipeline tried
+  and cannot analyze. The body is larger than the model context, or the
+  model gave an unparseable answer. fw-context stores a `skip:` sentinel
+  for these symbols and does not try them again.
+- `analyze_vendor` — whether vendor analysis was enabled at index time.
+- `complete` — `true` when the pipeline has no more work: every project
+  symbol is analyzed or skipped (and, when `analyze_vendor` is true, every
+  vendor symbol too).
+
+`complete` and the `"N unanalyzed symbols"` entry in `reindex_reasons` come
+from one query. `complete` is `true` exactly when that entry is absent.
+
+When `analyze_vendor` is `false`, vendor symbols are skipped by design —
+a large unanalyzed vendor count is normal, not a defect.
+
+`indexed_at` and `first_indexed_at` are UTC, in `"YYYY-MM-DD HH:MM:SS"`
+format. File modification times are local time. Do not compare the two
+directly. In UTC+2, a file that fw-context indexed correctly looks 2 hours
+newer than `indexed_at`. To find modified files, use `modified_files_count`
+with `fast=false`.
 
 **Multi-variant output.** For a project with `[[build.variants]]`, the
 result adds these fields:
@@ -1481,8 +1510,24 @@ List all indexed firmware projects.
 Input:  {"project_root?": "/path/to/project"}
 Output: [{"project_id": "a1b2…", "name": "my-zephyr-app", "root_path": "/path",
           "build_system": "zephyr", "symbol_count": 12430, "file_count": 1502,
-          "indexed_at": "2026-06-05T09:35:18", "stale": false, "db": "…"}, …]
+          "indexed_at": "2026-06-05 09:35:18", "description": "branch: main",
+          "first_indexed_at": "2026-06-01 11:02:44",
+          "schema_version": 84935291, "current_schema": 84935291,
+          "reindex_needed": false, "status": "ready", "db": "…",
+          "variant_count": 2, "image_count": 5,
+          "analysis": {"project": {"analyzed": 8450, "skipped": 6, "total": 8570},
+                       "vendor": {"analyzed": 0, "skipped": 0, "total": 42330}}}, …]
 ```
+
+`indexed_at` and `first_indexed_at` are UTC, in `"YYYY-MM-DD HH:MM:SS"`
+format. `analysis` holds the `project` and `vendor` counts only, and is
+`null` when the project has no indexed build. For the `model`,
+`analyze_vendor`, and `complete` fields, call `get_active_build` for that
+project.
+
+When no project has an index, the result is one entry with an `info` key.
+When fw-context cannot read a database, the result holds one entry with `db`
+and `error` keys for that file.
 
 #### `get_project_info`
 

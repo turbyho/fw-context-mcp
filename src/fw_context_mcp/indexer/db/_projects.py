@@ -21,16 +21,164 @@ from __future__ import annotations
 import sqlite3
 
 __all__ = [
+    "ANALYZABLE_KINDS",
+    "compute_analysis_coverage",
+    "count_pending_analysis",
     "delete_build_data",
     "get_active_config",
     "get_all_builds_for_project",
     "get_all_projects",
     "get_build_stats",
     "get_builds_for_scope",
+    "make_analysis_summary",
     "upsert_build_config",
     "upsert_project",
 ]
 
+# Kinds the LLM analysis pipeline processes.  All three consumers import
+# this tuple, thus the selection query, the coverage report, and the
+# staleness check can never drift apart again:
+#   1. ``_llm_analysis._select_unanalyzed_symbols`` — selects the work.
+#   2. ``compute_analysis_coverage`` — reports the coverage.
+#   3. ``count_pending_analysis`` — the staleness signal that
+#      ``background._fast_staleness_check`` uses.
+# A kind that is in the selection query but not here made the daemon miss
+# the analysis work for that kind.
+ANALYZABLE_KINDS: tuple[str, ...] = (
+    "function",
+    "method",
+    "constructor",
+    "destructor",
+    "class",
+    "struct",
+    "union",
+    "typedef",
+    "enum",
+    "varglobal",
+)
+
+
+def compute_analysis_coverage(conn: sqlite3.Connection, config_hash: str) -> dict:
+    """Return LLM-analysis coverage split by project vs vendor symbols.
+
+    Counts definition symbols (``is_definition=1``) of the kinds the
+    analysis pipeline processes (``ANALYZABLE_KINDS``), excluding
+    anonymous/unnamed symbols.  The split uses the ``is_project`` column so
+    callers can tell intentionally-skipped vendor symbols apart from project
+    symbols that genuinely still need analysis.
+
+    Each side reports three counts, and ``llm_analysis`` holds at most one
+    row per symbol (``symbol_id`` is the primary key), thus the counts never
+    overlap:
+
+    * ``analyzed`` — symbols with a real analysis row.
+    * ``skipped`` — symbols with a ``skip:*`` sentinel row.  The pipeline
+      tried these symbols and cannot analyze them (the body is larger than
+      the model context, or the model gave an unparseable answer).
+    * ``total`` — all symbols of the analyzable kinds.
+
+    ``total - analyzed - skipped`` gives the symbols that the pipeline can
+    still process.  Use ``count_pending_analysis`` for that value — do not
+    compute it again in the caller.
+    """
+    placeholders = ", ".join("?" * len(ANALYZABLE_KINDS))
+    rows = conn.execute(
+        f"""SELECT s.is_project,
+                   SUM(CASE WHEN a.symbol_id IS NOT NULL
+                                AND a.model NOT LIKE 'skip:%'
+                            THEN 1 ELSE 0 END) AS analyzed,
+                   SUM(CASE WHEN a.model LIKE 'skip:%'
+                            THEN 1 ELSE 0 END) AS skipped,
+                   COUNT(*) AS total
+            FROM symbols s
+            LEFT JOIN llm_analysis a ON a.symbol_id = s.id
+            WHERE s.config_hash = ?
+              AND s.is_definition = 1
+              AND s.kind IN ({placeholders})
+              AND s.name NOT LIKE '%(anonymous%'
+              AND s.name NOT LIKE '%(unnamed%'
+            GROUP BY s.is_project""",
+        (config_hash, *ANALYZABLE_KINDS),
+    ).fetchall()
+
+    coverage = {
+        "project": {"analyzed": 0, "skipped": 0, "total": 0},
+        "vendor": {"analyzed": 0, "skipped": 0, "total": 0},
+    }
+    for row in rows:
+        key = "project" if row["is_project"] else "vendor"
+        coverage[key]["analyzed"] = row["analyzed"] or 0
+        coverage[key]["skipped"] = row["skipped"] or 0
+        coverage[key]["total"] = row["total"] or 0
+    return coverage
+
+
+def count_pending_analysis(
+    conn: sqlite3.Connection,
+    config_hash: str,
+    *,
+    analyze_vendor: bool,
+) -> int:
+    """Count the symbols that the LLM-analysis pipeline can still process.
+
+    This is the staleness signal: a value larger than 0 means that a
+    background reindex has analysis work to do.  It is the counterpart of
+    ``compute_analysis_coverage``, and it uses the same query, thus the
+    coverage report and the staleness check can never disagree.
+
+    A symbol with a ``skip:*`` sentinel counts as done.  The pipeline
+    already tried it and cannot analyze it, thus a pending count that
+    included these symbols would start a background reindex again after
+    every run.
+
+    When *analyze_vendor* is False, only project symbols count.  Pass the
+    value from the CONFIG, not the value stored in ``build_configs`` — this
+    count must predict what the next background reindex does.
+    """
+    coverage = compute_analysis_coverage(conn, config_hash)
+    sides = ("project", "vendor") if analyze_vendor else ("project",)
+    return sum(
+        max(0, coverage[side]["total"] - coverage[side]["analyzed"] - coverage[side]["skipped"])
+        for side in sides
+    )
+
+
+def make_analysis_summary(
+    coverage: dict,
+    analyze_vendor: bool,
+    model: str | None,
+) -> dict:
+    """Shape ``compute_analysis_coverage`` output into the ``analysis`` status.
+
+    ``complete`` is True when the pipeline has no more work: every project
+    symbol is analyzed or skipped and, when vendor analysis is enabled,
+    every vendor symbol too.  Two states never block completeness, because
+    the two are expected, not deficient:
+
+    * Vendor symbols that ``analyze_vendor=False`` excludes.
+    * Symbols with a ``skip:*`` sentinel, which the pipeline cannot
+      analyze.  ``skipped`` keeps these symbols visible in the counts.
+
+    Thus ``complete`` agrees with ``count_pending_analysis``:
+    ``complete`` is True exactly when the pending count is 0.
+    """
+    project_pending = (
+        coverage["project"]["total"]
+        - coverage["project"]["analyzed"]
+        - coverage["project"]["skipped"]
+    )
+    vendor_pending = (
+        coverage["vendor"]["total"]
+        - coverage["vendor"]["analyzed"]
+        - coverage["vendor"]["skipped"]
+    )
+    return {
+        "model": model,
+        "analyze_vendor": analyze_vendor,
+        "project": coverage["project"],
+        "vendor": coverage["vendor"],
+        "complete": project_pending <= 0 and (vendor_pending <= 0 or not analyze_vendor),
+    }
 
 
 def delete_build_data(conn: sqlite3.Connection, config_hash: str) -> None:
@@ -307,13 +455,17 @@ def get_build_stats(conn: sqlite3.Connection, config_hash: str) -> dict:
         (config_hash,),
     ).fetchone()[0]
 
-    analyzed = conn.execute(
-        """SELECT COUNT(*) FROM llm_analysis a
+    coverage = compute_analysis_coverage(conn, config_hash)
+    # Exclude the skip:* sentinels (skip:toolarge, skip:unparseable) —
+    # they are not model names and must never surface as analysis.model.
+    model_row = conn.execute(
+        """SELECT a.model FROM llm_analysis a
            JOIN symbols s ON s.id = a.symbol_id
            WHERE s.config_hash = ?
-             AND a.model NOT LIKE 'skip:%'""",
+             AND a.model NOT LIKE 'skip:%' LIMIT 1""",
         (config_hash,),
-    ).fetchone()[0]
+    ).fetchone()
+    model = model_row["model"] if model_row else None
 
     embeddings = conn.execute(
         """SELECT COUNT(DISTINCT e.symbol_id) FROM embeddings e
@@ -333,8 +485,11 @@ def get_build_stats(conn: sqlite3.Connection, config_hash: str) -> dict:
     result["by_kind"] = {r["kind"]: r["cnt"] for r in by_kind_rows}
     result["symbol_total"] = sym_total
     result["symbol_definitions"] = sym_defs
-    result["analyzed_symbols"] = analyzed
-    result["unanalyzed_definitions"] = max(0, sym_defs - analyzed)
+    result["analysis"] = make_analysis_summary(
+        coverage,
+        bool(result.get("analyze_vendor")),
+        model,
+    )
     result["file_count"] = files
     result["reference_count"] = refs
     result["macro_count"] = macros

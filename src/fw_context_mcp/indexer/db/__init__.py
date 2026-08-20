@@ -35,6 +35,8 @@ __all__ = [
     "count_indirect_call_sites",
     "count_llm_analysis",
     "count_refs",
+    "compute_analysis_coverage",
+    "count_pending_analysis",
     "delete_build_data",
     "delete_fp_assignments_for_file",
     "delete_inheritance_for_file",
@@ -86,6 +88,7 @@ __all__ = [
     "insert_refs_batch",
     "insert_symbols_batch",
     "lookup_macro",
+    "make_analysis_summary",
     "open_db",
     "purge_file_records",
     "purge_missing_files_batch",
@@ -172,12 +175,15 @@ from ._llm import (
 )
 from ._locking import WriteLockTimeout, write_lock
 from ._projects import (
+    compute_analysis_coverage,
+    count_pending_analysis,
     delete_build_data,
     get_active_config,
     get_all_builds_for_project,
     get_all_projects,
     get_build_stats,
     get_builds_for_scope,
+    make_analysis_summary,
     upsert_build_config,
     upsert_project,
 )

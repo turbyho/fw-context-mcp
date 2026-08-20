@@ -177,11 +177,16 @@ def cmd_db_stats(args: argparse.Namespace) -> int:
     print(f"  Definitions (is_definition=1): {stats['symbol_definitions']}")
     print()
 
-    print(f"LLM analysis:   {stats['analyzed_symbols']} / {stats['symbol_definitions']} definitions analyzed")
-    if stats["symbol_definitions"] > 0:
-        pct = stats["analyzed_symbols"] * 100 // stats["symbol_definitions"]
-        print(f"  Coverage:     {pct}%")
-    print(f"  Unanalyzed:   {stats['unanalyzed_definitions']}")
+    analysis = stats.get("analysis") or {}
+    proj = analysis.get("project", {"analyzed": 0, "total": 0})
+    vend = analysis.get("vendor", {"analyzed": 0, "total": 0})
+    print(f"LLM analysis (project): {proj['analyzed']}/{proj['total']} analyzed")
+    print(f"LLM analysis (vendor):  {vend['analyzed']}/{vend['total']} analyzed")
+    print(f"  Skipped:        {proj.get('skipped', 0)} project, {vend.get('skipped', 0)} vendor")
+    print(f"  analyze_vendor: {analysis.get('analyze_vendor', False)}")
+    print(f"  Complete:       {analysis.get('complete', False)}")
+    if analysis.get("model"):
+        print(f"  Model:          {analysis['model']}")
     print(f"Embeddings:     {stats['embedding_count']} symbols with embeddings")
     print(f"Files:          {stats['file_count']}")
     print(f"References:     {stats['reference_count']}")

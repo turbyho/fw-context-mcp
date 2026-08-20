@@ -22,6 +22,7 @@ from ..llm.ollama import call_ollama
 from ..utils import SAFE_EXCEPT, is_fatal, read_file_lines
 from ._embedding import _fmt_dur
 from .db import transaction, upsert_llm_analysis_batch, write_lock
+from .db._projects import ANALYZABLE_KINDS
 
 log = logging.getLogger(__name__)
 
@@ -201,24 +202,24 @@ def _select_unanalyzed_symbols(
     ``existing_hash = NULL`` and always proceed to cache lookup.
     """
     is_project_clause = "AND s.is_project = 1" if project_only else ""
+    kind_placeholders = ", ".join("?" * len(ANALYZABLE_KINDS))
     query = f"""SELECT s.id, s.name, s.qualified_name, s.kind, s.file_path,
-                       s.signature, s.is_definition, s.docstring,
-                       s.end_line, s.line, s.usr, s.source,
-                       f.path as file_path,
-                       a.content_hash as existing_hash
-                FROM symbols s
-                JOIN files f ON s.file_id = f.id
-                LEFT JOIN llm_analysis a ON a.symbol_id = s.id
-                WHERE s.config_hash = ?
-                  AND s.is_definition = 1
-                  AND s.kind IN ('function', 'method', 'constructor', 'destructor',
-                                 'class', 'struct', 'union', 'typedef', 'enum', 'varglobal')
-                  AND s.name NOT LIKE '%(anonymous%'
-                  AND s.name NOT LIKE '%(unnamed%'
-                  {is_project_clause}
-                ORDER BY s.kind, s.file_path, s.line"""
+                        s.signature, s.is_definition, s.docstring,
+                        s.end_line, s.line, s.usr, s.source,
+                        f.path as file_path,
+                        a.content_hash as existing_hash
+                 FROM symbols s
+                 JOIN files f ON s.file_id = f.id
+                 LEFT JOIN llm_analysis a ON a.symbol_id = s.id
+                 WHERE s.config_hash = ?
+                   AND s.is_definition = 1
+                   AND s.kind IN ({kind_placeholders})
+                   AND s.name NOT LIKE '%(anonymous%'
+                   AND s.name NOT LIKE '%(unnamed%'
+                   {is_project_clause}
+                 ORDER BY s.kind, s.file_path, s.line"""
     with transaction(conn, checkpoint=False):
-        return conn.execute(query, (config_hash,)).fetchall()
+        return conn.execute(query, (config_hash, *ANALYZABLE_KINDS)).fetchall()
 
 
 def _build_llm_analysis(

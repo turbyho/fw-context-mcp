@@ -81,6 +81,9 @@ def find_variables(
         kind: Optional kind filter — ``"varglobal"``, ``"varlocal"``,
             ``"field"``, or ``None`` (all). Default ``None``.
         limit: Maximum results (default 20, max 100).
+        variant: Build variant (multi-project). Omit for the default
+            variant, ``"*"`` for all.
+        image: Sysbuild image in the variant. Omit for all images.
 
     Returns:
         list of dicts, each with: name (str), qualified_name (str),
@@ -91,6 +94,10 @@ def find_variables(
         name for static members, empty otherwise),
         references (list[dict] — ``function``, ``file``, ``line``,
         ``ref_kind``).
+
+        No match gives ``[]``.  One dict with ``error`` means the query
+        failed — check that key first.
+        A ``warning`` key marks a partial result.
     """
     if not name.strip():
         return [{"error": "Variable name must be non-empty."}]
