@@ -2752,3 +2752,616 @@ class TestBgReindexEndToEnd:
         finally:
             conn.close()
             _invalidate_modified_cache(ch)
+
+
+# ── Header-change propagation ─────────────────────────────────────────
+
+
+def _index_cli(project_root: Path, *extra: str) -> subprocess.CompletedProcess:
+    """Run the incremental indexer the way the background daemon does.
+
+    The daemon spawns ``fw-context index --background`` — no ``--force``.
+    These tests pass ``compile_commands.json`` explicitly because the test
+    project has no detectable build system.
+    """
+    return _cli(
+        [
+            "index",
+            "--no-refs",
+            "--no-analyze",
+            "--no-embeddings",
+            *extra,
+            str(project_root / "compile_commands.json"),
+        ],
+        cwd=project_root,
+    )
+
+
+def _symbol_row(conn, config_hash: str, name: str):
+    """Return the single symbol row for *name*, or None."""
+    return conn.execute(
+        "SELECT name, file_path, line, end_line FROM symbols WHERE config_hash=? AND name=?",
+        (config_hash, name),
+    ).fetchone()
+
+
+def _indexed_content(conn, config_hash: str, path_suffix: str) -> str:
+    """Return the ifdef-filtered content stored for a file (empty when absent)."""
+    row = conn.execute(
+        "SELECT content FROM files WHERE config_hash=? AND path LIKE ? LIMIT 1",
+        (config_hash, f"%{path_suffix}"),
+    ).fetchone()
+    return (row["content"] or "") if row else ""
+
+
+def _manifest_file(db_path: Path) -> Path:
+    """Return the single manifest.<config_hash>.json for the project index."""
+    manifests = sorted(db_path.parent.glob("manifest.*.json"))
+    assert len(manifests) == 1, f"expected exactly one manifest, found {manifests}"
+    return manifests[0]
+
+
+@pytest.mark.libclang
+class TestHeaderChangePropagation:
+    """A header is not a translation unit — its changes must still reach the index.
+
+    Covers four defects that together froze header symbols at their
+    first-index state:
+
+    - **D1** the mtime fast-path only looked at the TU's own file, so a
+      header change re-parsed nothing.
+    - **D2** the manifest and the stored header mtimes were refreshed even
+      for TUs that were never re-parsed, erasing the staleness signal.
+    - **D3** ``files.content`` (backing ``read_file`` / ``search_content``)
+      was written once and never refreshed.
+    - **D4** symbols owned by a header were never deleted before re-insert,
+      so ``ON CONFLICT(config_hash, usr)`` silently dropped the fresh rows.
+    """
+
+    def test_header_only_change_reaches_the_index(self, indexed_project: Path):
+        """A declaration added to a header appears after an incremental run. (D1)"""
+        db_path = _db_path_for_project(indexed_project)
+        modem_h = indexed_project / "src" / "modem.h"
+        modem_h.write_text(
+            modem_h.read_text(encoding="utf-8").replace(
+                "#endif", "int modem_brand_new_symbol(int x);\n\n#endif"
+            ),
+            encoding="utf-8",
+        )
+        _advance_mtime(modem_h, 5.0)
+
+        result = _index_cli(indexed_project)
+        assert result.returncode == 0, result.stderr
+
+        conn = open_db(db_path)
+        try:
+            ch = _config_hash(conn)
+            row = _symbol_row(conn, ch, "modem_brand_new_symbol")
+            assert row is not None, (
+                "header-only change never reached the index\n" + result.stderr[-2000:]
+            )
+        finally:
+            conn.close()
+
+    def test_header_change_reparses_every_dependent_tu(self, indexed_project: Path):
+        """modem.h is included by main.c and modem.c — both must be re-parsed. (D1)
+
+        Only re-parsing one of them would leave the other TU's copy of the
+        header symbols behind, and ``ON CONFLICT`` would then keep the stale
+        rows alive.
+        """
+        modem_h = indexed_project / "src" / "modem.h"
+        modem_h.write_text(
+            modem_h.read_text(encoding="utf-8").replace(
+                "#endif", "int modem_fanout_probe(void);\n\n#endif"
+            ),
+            encoding="utf-8",
+        )
+        _advance_mtime(modem_h, 5.0)
+
+        result = _index_cli(indexed_project)
+        assert result.returncode == 0, result.stderr
+        assert "2 updated, 1 unchanged" in result.stderr, (
+            "expected main.c + modem.c re-parsed and utils.c skipped\n"
+            + result.stderr[-2000:]
+        )
+
+    def test_removed_header_declaration_is_purged(self, indexed_project: Path):
+        """A declaration deleted from a header must not survive in the index. (D4)"""
+        db_path = _db_path_for_project(indexed_project)
+        modem_h = indexed_project / "src" / "modem.h"
+        original = modem_h.read_text(encoding="utf-8")
+
+        # Seed: add the declaration and index it in.
+        modem_h.write_text(
+            original.replace("#endif", "int modem_doomed_symbol(void);\n\n#endif"),
+            encoding="utf-8",
+        )
+        _advance_mtime(modem_h, 5.0)
+        assert _index_cli(indexed_project, "--force").returncode == 0
+
+        conn = open_db(db_path)
+        try:
+            ch = _config_hash(conn)
+            assert _symbol_row(conn, ch, "modem_doomed_symbol") is not None, "seed failed"
+        finally:
+            conn.close()
+
+        # Remove it again — an incremental run must drop the row.
+        modem_h.write_text(original, encoding="utf-8")
+        _advance_mtime(modem_h, 10.0)
+        result = _index_cli(indexed_project)
+        assert result.returncode == 0, result.stderr
+
+        conn = open_db(db_path)
+        try:
+            ch = _config_hash(conn)
+            assert _symbol_row(conn, ch, "modem_doomed_symbol") is None, (
+                "symbol deleted from the header survived the reindex\n"
+                + result.stderr[-2000:]
+            )
+        finally:
+            conn.close()
+
+    def test_header_definition_line_is_refreshed(self, indexed_project: Path):
+        """An inline definition inside a header must follow its new position. (D1 + D4)
+
+        The old row lives under the header's own ``file_id`` and carries
+        ``is_definition=1``, so nothing deleted it and the ON CONFLICT guard
+        rejected the fresh row — the line number froze at the first index.
+        """
+        db_path = _db_path_for_project(indexed_project)
+        util_h = indexed_project / "src" / "inline_util.h"
+        _write_file(
+            util_h,
+            "#ifndef INLINE_UTIL_H\n"
+            "#define INLINE_UTIL_H\n"
+            "\n"
+            "static inline int iu_double(int x) {\n"
+            "    return x * 2;\n"
+            "}\n"
+            "\n"
+            "#endif\n",
+        )
+        main_c = indexed_project / "src" / "main.c"
+        main_c.write_text(
+            main_c.read_text(encoding="utf-8").replace(
+                '#include "utils.h"', '#include "utils.h"\n#include "inline_util.h"'
+            ),
+            encoding="utf-8",
+        )
+        _advance_mtime(main_c, 5.0)
+        assert _index_cli(indexed_project, "--force").returncode == 0
+
+        conn = open_db(db_path)
+        try:
+            ch = _config_hash(conn)
+            before = _symbol_row(conn, ch, "iu_double")
+            assert before is not None, "seed failed — iu_double not indexed"
+            line_before = before["line"]
+        finally:
+            conn.close()
+
+        # Push the definition down by five lines.  Only the header changes.
+        util_h.write_text(
+            util_h.read_text(encoding="utf-8").replace(
+                "static inline", "\n\n\n\n\nstatic inline"
+            ),
+            encoding="utf-8",
+        )
+        _advance_mtime(util_h, 10.0)
+        result = _index_cli(indexed_project)
+        assert result.returncode == 0, result.stderr
+
+        conn = open_db(db_path)
+        try:
+            ch = _config_hash(conn)
+            after = _symbol_row(conn, ch, "iu_double")
+            assert after is not None, "iu_double disappeared after reindex"
+            assert after["line"] == line_before + 5, (
+                f"header definition kept a stale line: {after['line']} "
+                f"(expected {line_before + 5})\n" + result.stderr[-2000:]
+            )
+        finally:
+            conn.close()
+
+    def test_source_change_refreshes_indexed_content(self, indexed_project: Path):
+        """``files.content`` must follow the disk — read_file/search_content use it. (D3)"""
+        db_path = _db_path_for_project(indexed_project)
+        utils_c = indexed_project / "src" / "utils.c"
+        utils_c.write_text(
+            utils_c.read_text(encoding="utf-8").replace(
+                "int sum = 0;", "int sum = 0;\n    sum += 0; /* MARKER_D3 */"
+            ),
+            encoding="utf-8",
+        )
+        _advance_mtime(utils_c, 5.0)
+
+        result = _index_cli(indexed_project)
+        assert result.returncode == 0, result.stderr
+
+        conn = open_db(db_path)
+        try:
+            ch = _config_hash(conn)
+            assert "MARKER_D3" in _indexed_content(conn, ch, "utils.c"), (
+                "indexed content still holds the pre-change text\n"
+                + result.stderr[-2000:]
+            )
+        finally:
+            conn.close()
+
+    def test_noop_run_does_not_rewrite_manifest(self, indexed_project: Path):
+        """With nothing changed, the manifest must stay untouched. (D2)
+
+        Rewriting it would stamp current header hashes onto TUs that were
+        never re-parsed — the index would then believe it is up to date.
+        Skipping the rewrite also skips a libclang parse per unchanged TU,
+        which is what makes a no-op background run cheap.
+        """
+        db_path = _db_path_for_project(indexed_project)
+        manifest = _manifest_file(db_path)
+        before_bytes = manifest.read_bytes()
+        before_mtime = manifest.stat().st_mtime_ns
+
+        result = _index_cli(indexed_project)
+        assert result.returncode == 0, result.stderr
+        assert "0 updated" in result.stderr, result.stderr[-2000:]
+        assert manifest.read_bytes() == before_bytes, "manifest content changed on a no-op run"
+        assert manifest.stat().st_mtime_ns == before_mtime, (
+            "manifest was rewritten on a no-op run\n" + result.stderr[-2000:]
+        )
+        assert "from tu_headers" not in result.stderr, (
+            "unchanged TUs still contributed header hashes\n" + result.stderr[-2000:]
+        )
+
+
+# ── Header-scoped row cleanup (refs / macros) ─────────────────────────
+
+
+def _index_cli_refs(project_root: Path, *extra: str) -> subprocess.CompletedProcess:
+    """Run the incremental indexer with cross-reference indexing enabled.
+
+    ``_index_cli`` passes ``--no-refs`` to keep the other tests fast.  The
+    refs and indirect-call-site tests need the reference walk, so this
+    variant leaves it on.
+    """
+    return _cli(
+        [
+            "index",
+            "--no-analyze",
+            "--no-embeddings",
+            *extra,
+            str(project_root / "compile_commands.json"),
+        ],
+        cwd=project_root,
+    )
+
+
+def _include_from_main(project_root: Path, header_name: str) -> None:
+    """Add ``#include "<header_name>"`` to main.c after the utils.h include."""
+    main_c = project_root / "src" / "main.c"
+    main_c.write_text(
+        main_c.read_text(encoding="utf-8").replace(
+            '#include "utils.h"', f'#include "utils.h"\n#include "{header_name}"'
+        ),
+        encoding="utf-8",
+    )
+
+
+def _refs_from(conn, config_hash: str, path_suffix: str) -> list:
+    """Return every refs row that originates in a file with this path suffix."""
+    return conn.execute(
+        "SELECT from_file, from_line, to_usr, ref_kind FROM refs "
+        "WHERE config_hash=? AND from_file LIKE ? ORDER BY from_line",
+        (config_hash, f"%{path_suffix}"),
+    ).fetchall()
+
+
+def _ics_from(conn, config_hash: str, path_suffix: str) -> list:
+    """Return every indirect_call_sites row originating in this file."""
+    return conn.execute(
+        "SELECT from_file, from_line, target_name FROM indirect_call_sites "
+        "WHERE config_hash=? AND from_file LIKE ? ORDER BY from_line",
+        (config_hash, f"%{path_suffix}"),
+    ).fetchall()
+
+
+def _macro_lines(conn, config_hash: str, name: str) -> list[int]:
+    """Return the line of every macro row stored under *name*."""
+    rows = conn.execute(
+        "SELECT line FROM macros WHERE config_hash=? AND name=? ORDER BY line",
+        (config_hash, name),
+    ).fetchall()
+    return [r["line"] for r in rows]
+
+
+@pytest.mark.libclang
+class TestHeaderScopedRowCleanup:
+    """Rows owned by a header must be cleaned when the header is re-parsed.
+
+    ``store_symbols_for_unit`` deletes refs, indirect call sites, function
+    pointer assignments and macros by the *translation unit's* path only.
+    Code inside an inline function in a header stores those rows under the
+    HEADER's path / file_id, so nothing deletes them:
+
+    - **D5** ``delete_refs_for_file(conn, ch, tu_rel)`` — a call removed from
+      a header keeps its refs row, so ``find_callers`` reports a caller that
+      no longer exists.  A call that only moved gets a second row, because
+      ``idx_refs_unique`` includes ``from_line``.
+    - **D6** ``delete_macros_for_file(conn, tu_file_id)`` — a ``#define``
+      removed from a header keeps its macros row.  A ``#define`` that moved
+      gets a second row, because the UNIQUE key is
+      ``(config_hash, file_id, line)``.
+    """
+
+    def test_removed_header_call_drops_its_ref(self, c_project: Path):
+        """A call deleted from an inline header function must lose its ref. (D5)"""
+        db_path = _db_path_for_project(c_project)
+        hdr = c_project / "src" / "inline_ref.h"
+        _write_file(
+            hdr,
+            "#ifndef INLINE_REF_H\n"
+            "#define INLINE_REF_H\n"
+            '#include "modem.h"\n'
+            "\n"
+            "static inline int ir_probe(void) {\n"
+            '    return modem_send("x", 1);\n'
+            "}\n"
+            "\n"
+            "#endif\n",
+        )
+        _include_from_main(c_project, "inline_ref.h")
+        assert _index_cli_refs(c_project).returncode == 0
+
+        conn = open_db(db_path)
+        try:
+            ch = _config_hash(conn)
+            assert _refs_from(conn, ch, "inline_ref.h"), "seed failed — no ref from the header"
+        finally:
+            conn.close()
+
+        # Drop the call.  Only the header changes.
+        hdr.write_text(
+            hdr.read_text(encoding="utf-8").replace('return modem_send("x", 1);', "return 0;"),
+            encoding="utf-8",
+        )
+        _advance_mtime(hdr, 10.0)
+        result = _index_cli_refs(c_project)
+        assert result.returncode == 0, result.stderr
+
+        conn = open_db(db_path)
+        try:
+            ch = _config_hash(conn)
+            stale = _refs_from(conn, ch, "inline_ref.h")
+            assert stale == [], (
+                f"refs from the header survived its rewrite: {[dict(r) for r in stale]}\n"
+                + result.stderr[-2000:]
+            )
+        finally:
+            conn.close()
+
+    def test_moved_header_call_leaves_no_duplicate_ref(self, c_project: Path):
+        """A call that only moved must not gain extra refs rows. (D5)
+
+        One call site legitimately produces two rows — ``ref_kind='call'``
+        and ``ref_kind='ref'``.  The count must stay at two after the move;
+        four rows would mean the pre-move pair survived, because
+        ``idx_refs_unique`` includes ``from_line``.
+        """
+        db_path = _db_path_for_project(c_project)
+        hdr = c_project / "src" / "inline_ref.h"
+        _write_file(
+            hdr,
+            "#ifndef INLINE_REF_H\n"
+            "#define INLINE_REF_H\n"
+            '#include "modem.h"\n'
+            "\n"
+            "static inline int ir_probe(void) {\n"
+            '    return modem_send("x", 1);\n'
+            "}\n"
+            "\n"
+            "#endif\n",
+        )
+        _include_from_main(c_project, "inline_ref.h")
+        assert _index_cli_refs(c_project).returncode == 0
+
+        conn = open_db(db_path)
+        try:
+            ch = _config_hash(conn)
+            before = _refs_from(conn, ch, "inline_ref.h")
+            lines_before = {r["from_line"] for r in before}
+            assert len(lines_before) == 1, (
+                f"seed expected one call site, got {[dict(r) for r in before]}"
+            )
+            count_before = len(before)
+            line_before = lines_before.pop()
+        finally:
+            conn.close()
+
+        # Push the inline function down by five lines.
+        hdr.write_text(
+            hdr.read_text(encoding="utf-8").replace(
+                "static inline", "\n\n\n\n\nstatic inline"
+            ),
+            encoding="utf-8",
+        )
+        _advance_mtime(hdr, 10.0)
+        result = _index_cli_refs(c_project)
+        assert result.returncode == 0, result.stderr
+
+        conn = open_db(db_path)
+        try:
+            ch = _config_hash(conn)
+            after = _refs_from(conn, ch, "inline_ref.h")
+            assert len(after) == count_before, (
+                f"the moved call left duplicate refs rows: {[dict(r) for r in after]}\n"
+                + result.stderr[-2000:]
+            )
+            assert {r["from_line"] for r in after} == {line_before + 5}, (
+                f"refs kept a stale line: {sorted(r['from_line'] for r in after)} "
+                f"(expected {line_before + 5})"
+            )
+        finally:
+            conn.close()
+
+    def test_repeated_reindex_does_not_pile_up_header_call_sites(self, c_project: Path):
+        """A fn-pointer call in a header must not gain a row per reindex. (D5)
+
+        ``indirect_call_sites`` carries no unique constraint — a field can
+        legitimately be invoked many times from one line — so nothing stops
+        duplicates.  Three reindexes of an unchanged call site must leave the
+        row count where it started.
+        """
+        db_path = _db_path_for_project(c_project)
+        hdr = c_project / "src" / "fnptr_hdr.h"
+
+        def header_text(round_no: int) -> str:
+            """Header whose content changes per round, call site line fixed.
+
+            An identical rewrite is NOT enough: the indexer compares content
+            hashes, so a header with unchanged text never triggers a reparse
+            of its TUs.  The marker comment changes the hash while keeping the
+            line count — and therefore the call site's ``from_line`` — stable,
+            so a pile-up is the only way the row count can grow.
+            """
+            return (
+                "#ifndef FNPTR_HDR_H\n"
+                "#define FNPTR_HDR_H\n"
+                f"/* revision {round_no:04d} */\n"
+                "\n"
+                "typedef struct {\n"
+                "    int (*on_data)(const char* buf, int len);\n"
+                "} fh_driver_t;\n"
+                "\n"
+                "static inline int fh_dispatch(fh_driver_t* d, const char* buf, int len) {\n"
+                "    return d->on_data(buf, len);\n"
+                "}\n"
+                "\n"
+                "#endif\n"
+            )
+
+        _write_file(hdr, header_text(0))
+        _include_from_main(c_project, "fnptr_hdr.h")
+        assert _index_cli_refs(c_project).returncode == 0
+
+        conn = open_db(db_path)
+        try:
+            ch = _config_hash(conn)
+            baseline = _ics_from(conn, ch, "fnptr_hdr.h")
+            assert baseline, "seed failed — no indirect call site from the header"
+            count_baseline = len(baseline)
+            line_baseline = {r["from_line"] for r in baseline}
+        finally:
+            conn.close()
+
+        for round_no in range(1, 4):
+            hdr.write_text(header_text(round_no), encoding="utf-8")
+            _advance_mtime(hdr, 10.0 * round_no)
+            result = _index_cli_refs(c_project)
+            assert result.returncode == 0, result.stderr
+            assert "unchanged" not in result.stderr or "updated" in result.stderr, (
+                f"round {round_no}: nothing was re-parsed, the test proves nothing\n"
+                + result.stderr[-2000:]
+            )
+
+            conn = open_db(db_path)
+            try:
+                ch = _config_hash(conn)
+                rows = _ics_from(conn, ch, "fnptr_hdr.h")
+                assert {r["from_line"] for r in rows} == line_baseline, (
+                    f"round {round_no}: the call site moved — the marker comment "
+                    f"changed the line count\n{[dict(r) for r in rows]}"
+                )
+                assert len(rows) == count_baseline, (
+                    f"round {round_no}: call sites piled up — "
+                    f"{len(rows)} rows, expected {count_baseline}: "
+                    f"{[dict(r) for r in rows]}\n" + result.stderr[-2000:]
+                )
+            finally:
+                conn.close()
+
+    def test_removed_header_macro_is_purged(self, c_project: Path):
+        """A ``#define`` deleted from a header must not survive. (D6)"""
+        db_path = _db_path_for_project(c_project)
+        hdr = c_project / "src" / "macro_hdr.h"
+        _write_file(
+            hdr,
+            "#ifndef MACRO_HDR_H\n"
+            "#define MACRO_HDR_H\n"
+            "\n"
+            "#define MH_DOOMED 1\n"
+            "\n"
+            "#endif\n",
+        )
+        _include_from_main(c_project, "macro_hdr.h")
+        assert _index_cli(c_project).returncode == 0
+
+        conn = open_db(db_path)
+        try:
+            ch = _config_hash(conn)
+            assert _macro_lines(conn, ch, "MH_DOOMED"), "seed failed — macro not indexed"
+        finally:
+            conn.close()
+
+        hdr.write_text(
+            hdr.read_text(encoding="utf-8").replace("#define MH_DOOMED 1\n", ""),
+            encoding="utf-8",
+        )
+        _advance_mtime(hdr, 10.0)
+        result = _index_cli(c_project)
+        assert result.returncode == 0, result.stderr
+
+        conn = open_db(db_path)
+        try:
+            ch = _config_hash(conn)
+            assert _macro_lines(conn, ch, "MH_DOOMED") == [], (
+                "a macro deleted from the header survived the reindex\n"
+                + result.stderr[-2000:]
+            )
+        finally:
+            conn.close()
+
+    def test_moved_header_macro_leaves_no_duplicate(self, c_project: Path):
+        """A ``#define`` that only moved must end up with exactly one row. (D6)"""
+        db_path = _db_path_for_project(c_project)
+        hdr = c_project / "src" / "macro_hdr.h"
+        _write_file(
+            hdr,
+            "#ifndef MACRO_HDR_H\n"
+            "#define MACRO_HDR_H\n"
+            "\n"
+            "#define MH_MOVED 1\n"
+            "\n"
+            "#endif\n",
+        )
+        _include_from_main(c_project, "macro_hdr.h")
+        assert _index_cli(c_project).returncode == 0
+
+        conn = open_db(db_path)
+        try:
+            ch = _config_hash(conn)
+            lines_before = _macro_lines(conn, ch, "MH_MOVED")
+            assert len(lines_before) == 1, f"seed expected one macro row, got {lines_before}"
+        finally:
+            conn.close()
+
+        hdr.write_text(
+            hdr.read_text(encoding="utf-8").replace(
+                "#define MH_MOVED 1", "\n\n\n\n\n#define MH_MOVED 1"
+            ),
+            encoding="utf-8",
+        )
+        _advance_mtime(hdr, 10.0)
+        result = _index_cli(c_project)
+        assert result.returncode == 0, result.stderr
+
+        conn = open_db(db_path)
+        try:
+            ch = _config_hash(conn)
+            lines_after = _macro_lines(conn, ch, "MH_MOVED")
+            assert lines_after == [lines_before[0] + 5], (
+                f"the moved macro left a duplicate row: {lines_after}\n"
+                + result.stderr[-2000:]
+            )
+        finally:
+            conn.close()

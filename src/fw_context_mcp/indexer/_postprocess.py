@@ -722,9 +722,17 @@ def _step_update_manifest(conn: sqlite3.Connection, ctx: dict) -> None:
          build_dir_patterns=ctx["build_dir_patterns"],
          config_hash=config_hash,
          scope=ctx.get("scope"),
+         reparsed_tus=ctx.get("reparsed_tus"),
      )
     if updated_manifest is not None:
-        _refresh_header_mtimes_from_manifest(conn, config_hash, ctx["project_root"], updated_manifest)
+        _refresh_header_mtimes_from_manifest(
+            conn,
+            config_hash,
+            ctx["project_root"],
+            updated_manifest,
+            vendor_patterns=ctx.get("vendor_patterns") or [],
+            hash_cache=ctx.get("header_hash_cache"),
+        )
 
 
 def _resolve_matching_usr(
@@ -1232,6 +1240,8 @@ def _run_postprocess(
     scope: list[str] | None = None,
     defer_fts: bool = False,
     defer_cleanup: bool = False,
+    header_hash_cache: dict[str, str] | None = None,
+    reparsed_tus: set[str] | None = None,
 ) -> None:
     """Run all post-processing phases via a data-driven pipeline.
 
@@ -1278,6 +1288,11 @@ def _run_postprocess(
         "scope": scope,
         "defer_fts": defer_fts,
         "defer_cleanup": defer_cleanup,
+        # Header hashes already computed by the runner's staleness pre-pass —
+        # reused by the mtime refresh so no project header is read twice.
+        "header_hash_cache": header_hash_cache,
+        # TUs re-parsed in this run — only they may refresh their manifest entry.
+        "reparsed_tus": reparsed_tus,
     }
 
     defer_skip: set[str] = set()

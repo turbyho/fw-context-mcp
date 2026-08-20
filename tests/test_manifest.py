@@ -388,3 +388,190 @@ class TestUpdateEntry:
         update_entry(manifest, 5, "hash", [])
         # Should not raise — silently no-op
         assert len(manifest["entries"]) == 0
+
+
+class TestCollectStaleHeaders:
+    """Unit tests for the header → TU staleness pre-pass."""
+
+    @staticmethod
+    def _manifest(tmp_path: Path, headers: list[dict], *, tu: str = "src/main.cpp") -> dict:
+        import hashlib
+
+        src = tmp_path / tu
+        src.parent.mkdir(parents=True, exist_ok=True)
+        src.write_text("int main() { return 0; }")
+        return {
+            "project_root": str(tmp_path),
+            "entries": [
+                {
+                    "file": tu,
+                    "source_hash": hashlib.sha256(src.read_bytes()).hexdigest(),
+                    "headers": headers,
+                }
+            ],
+        }
+
+    def test_changed_project_header_reported(self, tmp_path: Path):
+        import hashlib
+
+        from fw_context_mcp.indexer.manifest import collect_stale_headers
+
+        header = tmp_path / "src" / "config.h"
+        header.parent.mkdir(parents=True, exist_ok=True)
+        header.write_text("// current content")
+        stored = hashlib.sha256(b"// old content").hexdigest()
+
+        manifest = self._manifest(
+            tmp_path, [{"path": "src/config.h", "hash": stored, "generated": False}]
+        )
+        assert collect_stale_headers(manifest, tmp_path, []) == {"src/config.h"}
+
+    def test_unchanged_header_not_reported(self, tmp_path: Path):
+        import hashlib
+
+        from fw_context_mcp.indexer.manifest import collect_stale_headers
+
+        header = tmp_path / "src" / "config.h"
+        header.parent.mkdir(parents=True, exist_ok=True)
+        header.write_text("// current content")
+        stored = hashlib.sha256(header.read_bytes()).hexdigest()
+
+        manifest = self._manifest(
+            tmp_path, [{"path": "src/config.h", "hash": stored, "generated": False}]
+        )
+        assert collect_stale_headers(manifest, tmp_path, []) == set()
+
+    def test_generated_and_vendor_headers_skipped(self, tmp_path: Path):
+        from fw_context_mcp.indexer.manifest import collect_stale_headers
+
+        (tmp_path / "BUILD").mkdir()
+        (tmp_path / "BUILD" / "mbed_config.h").write_text("// generated")
+        (tmp_path / "mbed-os").mkdir()
+        (tmp_path / "mbed-os" / "mbed.h").write_text("// SDK")
+
+        manifest = self._manifest(
+            tmp_path,
+            [
+                {"path": "BUILD/mbed_config.h", "hash": "stale", "generated": True},
+                {"path": "mbed-os/mbed.h", "hash": "stale", "generated": False},
+            ],
+        )
+        assert collect_stale_headers(manifest, tmp_path, ["mbed-os/%"]) == set()
+
+    def test_header_outside_project_root_skipped(self, tmp_path: Path):
+        from fw_context_mcp.indexer.manifest import collect_stale_headers
+
+        outside = tmp_path.parent / f"{tmp_path.name}-external.h"
+        outside.write_text("// toolchain header")
+        try:
+            manifest = self._manifest(
+                tmp_path, [{"path": str(outside), "hash": "stale", "generated": False}]
+            )
+            assert collect_stale_headers(manifest, tmp_path, []) == set()
+        finally:
+            outside.unlink(missing_ok=True)
+
+    def test_hash_cache_is_consulted(self, tmp_path: Path):
+        """A pre-filled cache entry is trusted — no re-read of the header."""
+        import hashlib
+
+        from fw_context_mcp.indexer.manifest import collect_stale_headers
+
+        header = tmp_path / "src" / "config.h"
+        header.parent.mkdir(parents=True, exist_ok=True)
+        header.write_text("// current content")
+        stored = hashlib.sha256(b"// old content").hexdigest()
+
+        manifest = self._manifest(
+            tmp_path, [{"path": "src/config.h", "hash": stored, "generated": False}]
+        )
+        cache = {str(header.resolve()): stored}
+        assert collect_stale_headers(manifest, tmp_path, [], hash_cache=cache) == set()
+
+    def test_tus_affected_by_headers(self, tmp_path: Path):
+        from fw_context_mcp.indexer.manifest import tus_affected_by_headers
+
+        manifest = {
+            "entries": [
+                {"file": "src/main.cpp", "headers": [{"path": "src/config.h"}]},
+                {"file": "src/other.cpp", "headers": [{"path": "src/util.h"}]},
+            ]
+        }
+        assert tus_affected_by_headers(manifest, {"src/config.h"}) == {"src/main.cpp"}
+        assert tus_affected_by_headers(manifest, set()) == set()
+
+
+class TestManifestEntryRefreshGuard:
+    """``_update_manifest_after_index`` may only refresh re-parsed TUs.
+
+    Refreshing the entry of a TU that kept its previous symbols would declare
+    the index current while it still holds data parsed from the old header
+    text — the staleness signal disappears and only ``--force`` recovers.
+    """
+
+    @staticmethod
+    def _unit(tmp_path: Path, rel: str):
+        from unittest.mock import MagicMock
+
+        src = tmp_path / rel
+        src.parent.mkdir(parents=True, exist_ok=True)
+        src.write_text("int main() { return 0; }")
+        unit = MagicMock()
+        unit.file = src
+        unit.directory = tmp_path
+        unit.clang_args = ["gcc", "-c", rel]
+        unit.raw_entry = {"file": rel, "directory": str(tmp_path), "arguments": ["gcc", "-c", rel]}
+        return unit
+
+    def _run(self, tmp_path: Path, *, updated_count: int, reparsed: set[str] | None):
+        from fw_context_mcp.indexer._manifest_updater import _update_manifest_after_index
+
+        unit = self._unit(tmp_path, "src/main.cpp")
+        manifest = {
+            "project_root": str(tmp_path),
+            "entries": [
+                {
+                    "file": "src/main.cpp",
+                    "directory": str(tmp_path),
+                    "arguments": unit.clang_args,
+                    "source_hash": "stored-source",
+                    "flags_hash": "stored-flags",
+                    "headers": [{"path": "src/config.h", "hash": "STORED", "generated": False}],
+                }
+            ],
+        }
+        return _update_manifest_after_index(
+            manifest=manifest,
+            units=[unit],
+            project_root=tmp_path,
+            db_dir=tmp_path / "index",
+            compile_commands=tmp_path / "compile_commands.json",
+            updated_count=updated_count,
+            tu_headers={"src/main.cpp": [{"path": "src/config.h", "hash": "FRESH", "generated": False}]},
+            config_hash="deadbeef",
+            reparsed_tus=reparsed,
+        )
+
+    def test_not_reparsed_keeps_stored_hash(self, tmp_path: Path):
+        (tmp_path / "index").mkdir()
+        # updated_count=1 → another TU was re-parsed, so the rebuild path runs,
+        # but src/main.cpp itself was not re-parsed.
+        result = self._run(tmp_path, updated_count=1, reparsed=set())
+        assert result is not None
+        assert result["entries"][0]["headers"][0]["hash"] == "STORED"
+
+    def test_reparsed_takes_fresh_hash(self, tmp_path: Path):
+        (tmp_path / "index").mkdir()
+        result = self._run(tmp_path, updated_count=1, reparsed={"src/main.cpp"})
+        assert result is not None
+        assert result["entries"][0]["headers"][0]["hash"] == "FRESH"
+
+    def test_nothing_reparsed_returns_manifest_untouched(self, tmp_path: Path):
+        """updated_count=0 → no rewrite at all, even with collected headers."""
+        (tmp_path / "index").mkdir()
+        result = self._run(tmp_path, updated_count=0, reparsed=set())
+        assert result is not None
+        assert result["entries"][0]["headers"][0]["hash"] == "STORED"
+        assert not list((tmp_path / "index").glob("manifest.*.json")), (
+            "manifest file was written for a run that re-parsed nothing"
+        )

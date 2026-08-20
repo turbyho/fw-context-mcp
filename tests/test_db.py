@@ -8,7 +8,9 @@ from fw_context_mcp.indexer.db import (
     count_refs,
     delete_inheritance_for_file,
     delete_macros_for_file,
+    delete_macros_for_files,
     delete_refs_for_file,
+    delete_refs_for_files,
     delete_symbols_for_file,
     find_refs,
     get_active_config,
@@ -572,6 +574,60 @@ class TestRefs:
         assert count_refs(populated_db, "hash-deadbeef") == 1
         remaining = find_refs(populated_db, "hash-deadbeef", "modem_init")
         assert remaining[0]["from_file"] == "src/other.cpp"
+
+    def test_delete_refs_for_files(self, populated_db):
+        """The plural form clears several origin files in one call."""
+        self._setup_symbols(populated_db)
+        insert_refs_batch(populated_db, [
+            ("hash-deadbeef", "U_callee", "src/app.cpp", 55, "U_caller", "call"),
+            ("hash-deadbeef", "U_callee", "src/inline.h", 7, "U_caller", "call"),
+            ("hash-deadbeef", "U_callee", "src/other.cpp", 5, None, "call"),
+        ])
+        assert count_refs(populated_db, "hash-deadbeef") == 3
+        delete_refs_for_files(
+            populated_db, "hash-deadbeef", ["src/app.cpp", "src/inline.h"]
+        )
+        remaining = find_refs(populated_db, "hash-deadbeef", "modem_init")
+        assert [r["from_file"] for r in remaining] == ["src/other.cpp"]
+
+    def test_delete_refs_for_files_empty_list_is_a_noop(self, populated_db):
+        """An empty path list must not turn into an unfiltered DELETE."""
+        self._setup_symbols(populated_db)
+        insert_refs_batch(populated_db, [
+            ("hash-deadbeef", "U_callee", "src/app.cpp", 55, "U_caller", "call"),
+        ])
+        delete_refs_for_files(populated_db, "hash-deadbeef", [])
+        assert count_refs(populated_db, "hash-deadbeef") == 1
+
+    def test_delete_refs_for_files_respects_config_hash(self, populated_db):
+        """Rows of another config must survive a delete for the same path."""
+        self._setup_symbols(populated_db)
+        insert_refs_batch(populated_db, [
+            ("hash-deadbeef", "U_callee", "src/app.cpp", 55, "U_caller", "call"),
+            ("hash-other", "U_callee", "src/app.cpp", 55, "U_caller", "call"),
+        ])
+        delete_refs_for_files(populated_db, "hash-deadbeef", ["src/app.cpp"])
+        assert count_refs(populated_db, "hash-deadbeef") == 0
+        assert count_refs(populated_db, "hash-other") == 1
+
+    def test_delete_refs_for_files_beyond_the_parameter_limit(self, populated_db):
+        """More paths than one statement can bind must still all be deleted.
+
+        A single TU on an SDK-heavy project owns well over a thousand headers,
+        so the delete has to chunk.  1200 paths forces at least three chunks.
+        """
+        self._setup_symbols(populated_db)
+        paths = [f"src/gen/hdr_{i:04d}.h" for i in range(1200)]
+        insert_refs_batch(populated_db, [
+            ("hash-deadbeef", "U_callee", p, 1, "U_caller", "call") for p in paths
+        ])
+        insert_refs_batch(populated_db, [
+            ("hash-deadbeef", "U_callee", "src/keep.cpp", 1, "U_caller", "call"),
+        ])
+        assert count_refs(populated_db, "hash-deadbeef") == 1201
+        delete_refs_for_files(populated_db, "hash-deadbeef", paths)
+        remaining = find_refs(populated_db, "hash-deadbeef", "modem_init")
+        assert [r["from_file"] for r in remaining] == ["src/keep.cpp"]
 
     def test_find_refs_no_match(self, populated_db):
         self._setup_symbols(populated_db)
@@ -2026,6 +2082,62 @@ class TestMacros:
             "SELECT COUNT(*) FROM macros WHERE file_id=?", (fid,)
         ).fetchone()[0]
         assert count_after == 0
+
+    def test_delete_macros_for_files(self, populated_db):
+        """The plural form clears several files' macros in one call."""
+        conn = populated_db
+        tu_id = upsert_file(conn, "hash-deadbeef", "/tmp/main.c", "c")
+        hdr_id = upsert_file(conn, "hash-deadbeef", "/tmp/inline.h", "c")
+        keep_id = upsert_file(conn, "hash-deadbeef", "/tmp/keep.h", "c")
+        insert_macros_batch(conn, [
+            ("hash-deadbeef", tu_id, "TU_MACRO", "1", "1", 1, 0),
+            ("hash-deadbeef", hdr_id, "HDR_MACRO", "2", "2", 4, 0),
+            ("hash-deadbeef", keep_id, "KEEP_MACRO", "3", "3", 9, 0),
+        ])
+        delete_macros_for_files(conn, [tu_id, hdr_id])
+        names = [
+            r[0] for r in conn.execute(
+                "SELECT name FROM macros WHERE config_hash=? ORDER BY name",
+                ("hash-deadbeef",),
+            ).fetchall()
+        ]
+        assert names == ["KEEP_MACRO"]
+
+    def test_delete_macros_for_files_empty_list_is_a_noop(self, populated_db):
+        """An empty id list must not turn into an unfiltered DELETE."""
+        conn = populated_db
+        fid = upsert_file(conn, "hash-deadbeef", "/tmp/test.h", "cpp")
+        insert_macros_batch(conn, [
+            ("hash-deadbeef", fid, "SURVIVOR", "1", "1", 1, 0),
+        ])
+        delete_macros_for_files(conn, [])
+        count = conn.execute(
+            "SELECT COUNT(*) FROM macros WHERE file_id=?", (fid,)
+        ).fetchone()[0]
+        assert count == 1
+
+    def test_delete_macros_for_files_beyond_the_parameter_limit(self, populated_db):
+        """More file_ids than one statement can bind must still all be deleted."""
+        conn = populated_db
+        ids = [
+            upsert_file(conn, "hash-deadbeef", f"/tmp/gen/hdr_{i:04d}.h", "c")
+            for i in range(1200)
+        ]
+        keep_id = upsert_file(conn, "hash-deadbeef", "/tmp/keep.h", "c")
+        insert_macros_batch(conn, [
+            ("hash-deadbeef", fid, f"GEN_{i:04d}", "1", "1", 1, 0)
+            for i, fid in enumerate(ids)
+        ])
+        insert_macros_batch(conn, [
+            ("hash-deadbeef", keep_id, "KEEP_MACRO", "1", "1", 1, 0),
+        ])
+        delete_macros_for_files(conn, ids)
+        names = [
+            r[0] for r in conn.execute(
+                "SELECT name FROM macros WHERE config_hash=?", ("hash-deadbeef",)
+            ).fetchall()
+        ]
+        assert names == ["KEEP_MACRO"]
 
     def test_lookup_macro_by_exact_name(self, populated_db):
         """lookup_macro returns matching macro with value and expanded_value."""

@@ -329,6 +329,40 @@ def run(
         for e in manifest.get("entries", []):
             manifest_lookup[e.get("file", "")] = e
 
+    # ── Header staleness pre-pass ──
+    # A header is not a translation unit, so editing one leaves the mtime and
+    # source hash of every dependent TU untouched — the per-TU mtime fast-path
+    # would report them all as unchanged and the header's symbols would stay
+    # frozen at their first-index state.  Hash the project headers once here
+    # and mark every TU that includes a changed one for re-parsing.
+    #
+    # ALL dependent TUs are marked, not a subset: symbols from a shared header
+    # are claimed by whichever TU stores them first, and a TU that keeps its
+    # old rows would block the fresh ones via the ON CONFLICT(config_hash,
+    # usr) guard in insert_symbols_batch.
+    #
+    # header_hash_cache is shared with the per-TU staleness checks below, so
+    # each project header is read and hashed exactly once per run.
+    header_hash_cache: dict[str, str] = {}
+    header_stale_tus: frozenset[str] = frozenset()
+    if manifest is not None:
+        from .manifest import collect_stale_headers, tus_affected_by_headers
+        from .ops import _normalize_file_path
+
+        stale_headers = collect_stale_headers(
+            manifest, project_root, vendor_patterns, hash_cache=header_hash_cache
+        )
+        if stale_headers:
+            header_stale_tus = frozenset(
+                _normalize_file_path(str((project_root / tu_rel).resolve()), project_root)
+                for tu_rel in tus_affected_by_headers(manifest, stale_headers)
+            )
+            log.info(
+                "%d changed header(s) → %d TU(s) queued for reparse",
+                len(stale_headers),
+                len(header_stale_tus),
+            )
+
     # Drop FTS5 content-sync triggers before bulk indexing — each symbol
     # INSERT/DELETE/UPDATE would otherwise pay per-row FTS index overhead
     # (~2× write I/O).  The FTS table is rebuilt from scratch in one pass
@@ -362,7 +396,30 @@ def run(
     # Collect headers during tokenization for incremental manifest update.
     # Maps file_path → list of {path, hash, generated} header dicts.
     tu_headers: dict[str, list[dict]] = {}
+    # TUs actually re-parsed in this run.  The manifest may only take fresh
+    # header hashes from these — an entry refreshed for a TU that kept its
+    # previous symbols would erase the evidence that the index is behind.
+    reparsed_tus: set[str] = set()
     t0 = time.monotonic()
+
+    # Is any PROJECT file still missing its ifdef-filtered content?  One query
+    # per run instead of one per TU.  While a backfill is pending, unchanged
+    # TUs keep running the content pass so it can complete; once every project
+    # file has content they skip it, along with the libclang parse behind it.
+    #
+    # WHY project files only (relative path = inside project_root, see
+    # _normalize_file_path): out-of-tree system headers routinely end up with
+    # an empty content column — e.g. libstdc++ headers whose cursors were all
+    # claimed by an earlier TU.  Counting those would pin the flag to True
+    # forever on any C++ project and the pass would never be skipped.
+    content_backfill_needed = (
+        conn.execute(
+            "SELECT 1 FROM files WHERE config_hash = ? AND content = '' "
+            "AND path NOT LIKE '/%' LIMIT 1",
+            (config_hash,),
+        ).fetchone()
+        is not None
+    )
 
     # skip_files accumulates resolved paths of headers already processed
     # by earlier TUs in this run.  Starts empty each run — never loaded
@@ -435,6 +492,8 @@ def run(
             manifest=manifest_lookup,
             reuse_possible=has_old_build,
             skip_files=skip_files,
+            header_stale_tus=header_stale_tus,
+            hash_cache=header_hash_cache,
         )
 
         # Snapshot the skip set BEFORE folding in this TU's own files.
@@ -453,6 +512,8 @@ def run(
                 unit, check_status, hashes, conn, config_hash, project_root,
                 build_dir_patterns, db_path, existing_files, processed, len(units),
                 skip_files=skip_before,
+                manifest_lookup=manifest_lookup,
+                content_backfill_needed=content_backfill_needed,
             )
             total_syms += result["total_syms"]
             if result["is_reuse"] and result["total_syms"] > 0:
@@ -500,11 +561,14 @@ def run(
                 acc_parse += timing[0]
                 acc_lock += timing[1]
                 acc_write += timing[2]
+                try:
+                    tu_key = str(unit.file.resolve().relative_to(project_root))
+                except ValueError:
+                    tu_key = str(unit.file.resolve())
+                # Only a re-parsed TU may refresh its manifest entry — its
+                # symbols now match the headers it just read.
+                reparsed_tus.add(tu_key)
                 if tu_headers_list:
-                    try:
-                        tu_key = str(unit.file.resolve().relative_to(project_root))
-                    except ValueError:
-                        tu_key = str(unit.file.resolve())
                     tu_headers[tu_key] = tu_headers_list
                 log.info(
                     "[%d/%d] %s: %d syms, %d refs, %.1fs",
@@ -553,6 +617,8 @@ def run(
         scope=scope,
         defer_fts=defer_fts,
         defer_cleanup=defer_cleanup,
+        header_hash_cache=header_hash_cache,
+        reparsed_tus=reparsed_tus,
     )
 
     elapsed = time.monotonic() - t0

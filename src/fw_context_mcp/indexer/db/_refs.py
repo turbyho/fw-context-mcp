@@ -59,6 +59,7 @@ from __future__ import annotations
 
 import logging
 import sqlite3
+from collections.abc import Sequence
 
 log = logging.getLogger(__name__)
 
@@ -67,8 +68,11 @@ __all__ = [
     "count_indirect_call_sites",
     "count_refs",
     "delete_fp_assignments_for_file",
+    "delete_fp_assignments_for_files",
     "delete_indirect_call_sites_for_file",
+    "delete_indirect_call_sites_for_files",
     "delete_refs_for_file",
+    "delete_refs_for_files",
     "find_indirect_call_sites",
     "find_indirect_targets",
     "find_refs",
@@ -95,6 +99,73 @@ def insert_refs_batch(conn: sqlite3.Connection, rows: list[tuple]) -> int:
         rows,
     )
     return cur.rowcount
+
+
+# SQLite rejects a statement that binds more parameters than
+# ``SQLITE_MAX_VARIABLE_NUMBER`` — 999 on builds before SQLite 3.32.  500 per
+# chunk leaves room for the ``config_hash`` parameter and stays valid on the
+# oldest build the project supports.
+_MAX_BOUND_PARAMS = 500
+
+
+def _chunked(items: list[str], size: int = _MAX_BOUND_PARAMS) -> list[list[str]]:
+    """Split *items* into chunks that fit SQLite's bound-parameter limit.
+
+    A single translation unit on an SDK-heavy project walks well over a
+    thousand header files, so ``WHERE from_file IN (?, ?, ...)`` over the
+    whole set would exceed the parameter limit.  The deletes run in batches
+    instead of one statement.
+    """
+    return [items[i : i + size] for i in range(0, len(items), size)]
+
+
+def _delete_by_from_file(
+    conn: sqlite3.Connection,
+    table: str,
+    config_hash: str,
+    from_files: Sequence[str],
+) -> None:
+    """Delete rows of *table* whose ``from_file`` is one of *from_files*.
+
+    Shared by the three reference tables: they all key their rows on
+    ``(config_hash, from_file)`` and all carry an index on that pair, so the
+    ``IN`` list resolves to index seeks instead of a table scan.
+
+    *table* is never caller-supplied data — the three public wrappers below
+    each pass a literal name.  Only ``?`` placeholders are interpolated.
+    """
+    paths = list(dict.fromkeys(from_files))  # dedupe, keep a stable order
+    if not paths:
+        return
+    for chunk in _chunked(paths):
+        placeholders = ",".join("?" * len(chunk))
+        conn.execute(
+            f"DELETE FROM {table} WHERE config_hash=? AND from_file IN ({placeholders})",
+            (config_hash, *chunk),
+        )
+
+
+def delete_refs_for_files(
+    conn: sqlite3.Connection,
+    config_hash: str,
+    from_files: Sequence[str],
+) -> None:
+    """Delete all refs originating in any of *from_files* under *config_hash*.
+
+    WHY a plural form is needed: a translation unit owns more than its own
+    file.  A call inside an inline function in a header is stored with the
+    HEADER's path in ``from_file``, so a delete keyed on the TU path alone
+    leaves those rows behind.  A call removed from a header then keeps its
+    refs row — ``find_callers`` reports a caller that no longer exists — and
+    a call that only moved gains a SECOND row, because ``idx_refs_unique``
+    includes ``from_line`` and ``insert_refs_batch`` uses ``INSERT OR
+    IGNORE``.
+
+    *from_files* must be normalised exactly the way ``insert_refs_batch``
+    normalises the paths it writes.  A path built by a different normaliser
+    would not match, and the stale row would survive the delete.
+    """
+    _delete_by_from_file(conn, "refs", config_hash, from_files)
 
 
 def delete_refs_for_file(conn: sqlite3.Connection, config_hash: str, from_file: str) -> None:
@@ -140,6 +211,22 @@ def insert_indirect_call_sites_batch(conn: sqlite3.Connection, rows: list[tuple]
         rows,
     )
     return cur.rowcount
+
+
+def delete_indirect_call_sites_for_files(
+    conn: sqlite3.Connection,
+    config_hash: str,
+    from_files: Sequence[str],
+) -> None:
+    """Delete indirect call sites originating in any of *from_files*.
+
+    Same header-ownership problem as :func:`delete_refs_for_files`, with a
+    worse failure mode: ``indirect_call_sites`` has NO unique constraint (one
+    field can legitimately be invoked many times from a single line), so a
+    function pointer call inside an inline header function gains a duplicate
+    row on EVERY reindex, without bound.
+    """
+    _delete_by_from_file(conn, "indirect_call_sites", config_hash, from_files)
 
 
 def delete_indirect_call_sites_for_file(conn: sqlite3.Connection, config_hash: str, from_file: str) -> None:
@@ -235,6 +322,20 @@ def insert_fp_assignments_batch(conn: sqlite3.Connection, rows: list[tuple]) -> 
         rows,
     )
     return cur.rowcount
+
+
+def delete_fp_assignments_for_files(
+    conn: sqlite3.Connection,
+    config_hash: str,
+    from_files: Sequence[str],
+) -> None:
+    """Delete fp_assignments rows originating in any of *from_files*.
+
+    Same header-ownership problem as :func:`delete_refs_for_files`: a
+    ``handler = &fn`` assignment inside an inline function in a header is
+    stored under the HEADER's path, not the translation unit's.
+    """
+    _delete_by_from_file(conn, "fp_assignments", config_hash, from_files)
 
 
 def delete_fp_assignments_for_file(

@@ -30,11 +30,49 @@ from .config_hash import compute_flags_hash
 log = logging.getLogger(__name__)
 
 
+def _mtime_bump_is_safe(
+    resolved: Path,
+    header: dict,
+    project_root: Path,
+    vendor_patterns: list[str],
+    hash_cache: dict[str, str] | None,
+) -> bool:
+    """Return True when the stored mtime may be moved forward for this header.
+
+    Only content-identical headers qualify.  Bumping the mtime of a header
+    whose content actually changed would hide that change from
+    ``_count_modified_files`` and from the next index run — the index would
+    keep serving symbols parsed from the old text while reporting itself as
+    up to date.
+
+    Vendor, generated, and out-of-tree headers keep the unconditional
+    behaviour: their stored hashes are trusted everywhere else in the
+    pipeline (re-hashing thousands of SDK headers on every run would
+    dominate index time), so verifying them here would be both meaningless
+    and expensive.
+    """
+    from .manifest import _hash_with_cache
+    from .sdk_detect import _path_matches
+
+    if header.get("generated"):
+        return True
+    try:
+        rel_path = str(resolved.relative_to(project_root))
+    except ValueError:
+        return True  # outside project_root — hash is trusted from the manifest
+    if any(_path_matches(rel_path, pat) for pat in vendor_patterns):
+        return True
+    return _hash_with_cache(resolved, hash_cache) == header.get("hash", "")
+
+
 def _refresh_header_mtimes_from_manifest(
     conn,
     config_hash: str,
     project_root: Path,
     manifest: dict | None,
+    *,
+    vendor_patterns: list[str] | None = None,
+    hash_cache: dict[str, str] | None = None,
 ) -> int:
     """Refresh stored mtimes for headers touched by VCS operations.
 
@@ -55,14 +93,25 @@ def _refresh_header_mtimes_from_manifest(
     reindex.  The content hash check in the staleness detection will
     still catch actual content changes regardless of mtime.
 
+    WHY the hash check (see :func:`_mtime_bump_is_safe`): a project header
+    whose content really changed must keep its stale mtime.  Bumping it
+    would erase the last signal that the index is behind — the header is
+    not a TU of its own, so nothing else would ever notice.
+
     Called once after the main TU loop, before the manifest update phase.
     Returns the number of refreshed header records.
     """
     if manifest is None:
         return 0
+    vendor_patterns = vendor_patterns or []
     refreshed = 0
+    seen: set[str] = set()
     for entry in manifest.get("entries", []):
         for h in entry.get("headers", []):
+            # A header shared by many TUs only needs one stat + hash check.
+            if h["path"] in seen:
+                continue
+            seen.add(h["path"])
             # Resolve absolute path for stat() — h["path"] may be relative
             p = Path(h["path"])
             if not p.is_absolute():
@@ -73,6 +122,8 @@ def _refresh_header_mtimes_from_manifest(
                 cur_mtime = p_resolved.stat().st_mtime
             except OSError:
                 continue
+            if not _mtime_bump_is_safe(p_resolved, h, project_root, vendor_patterns, hash_cache):
+                continue  # content really changed — the stale signal must survive
             # Use the manifest path directly — it already matches files.path format
             cur_obj = conn.execute(
                 "UPDATE files SET mtime=? WHERE config_hash=? AND path=? AND mtime < ?",
@@ -101,6 +152,7 @@ def _update_manifest_after_index(
     build_dir_patterns: list[str] | None = None,
     config_hash: str = "",
     scope: list[str] | None = None,
+    reparsed_tus: set[str] | None = None,
 ) -> dict | None:
     """Update ``manifest.json`` after an indexing run.
 
@@ -118,20 +170,31 @@ def _update_manifest_after_index(
     hashes from the main indexing loop (``tu_headers``), avoiding a second
     libclang parse for unchanged TUs.
 
+    *reparsed_tus* names the TUs that were actually re-parsed in this run.
+    Only those may contribute fresh header hashes: an entry rewritten for a
+    TU that kept its previous symbols would claim the index is current while
+    it still holds data parsed from the old header text.  Every other TU
+    keeps its stored entry verbatim.  ``None`` disables the filter (used by
+    callers with no run bookkeeping, e.g. a first index).
+
     Returns the updated manifest dict, or ``None`` when no update needed.
     """
     from .manifest import MANIFEST_FORMAT, _collect_headers_from_tokens, save
 
-    # Nothing changed — keep existing manifest as-is, but only when all
-    # of these hold:
-    #   - TU list hasn't changed (same number of entries)
-    #   - No stale header hashes were collected (tu_headers empty)
-    #   - Manifest entries have real source_hash data (not a preliminary
-    #     manifest written by build_preliminary with empty hashes)
+    # No TU was re-parsed — keep the existing manifest as-is, provided:
+    #   - the TU list hasn't changed (same number of entries), and
+    #   - manifest entries have real source_hash data (not a preliminary
+    #     manifest written by build_preliminary with empty hashes).
     # A different TU count means files were added/removed from
     # compile_commands.json.  A preliminary manifest means the on-disk
     # file was overwritten by build_preliminary and needs regeneration.
-    if manifest is not None and updated_count == 0 and not tu_headers:
+    #
+    # WHY collected header hashes must NOT force a rewrite: *tu_headers* also
+    # carries hashes gathered for TUs that were only bookkept, not re-parsed.
+    # Writing those in would declare the manifest current while the index
+    # still holds symbols parsed from the previous header text — the staleness
+    # signal would be gone and only ``--force`` could recover.
+    if manifest is not None and updated_count == 0:
         # Check for degraded (preliminary) manifest — entries with empty
         # source_hash mean build_preliminary overwrote the real manifest.
         # A preliminary manifest is written during the build phase before
@@ -172,7 +235,9 @@ def _update_manifest_after_index(
             except ValueError:
                 tu_rel = str(unit.file.resolve())
 
-            if tu_rel in tu_headers:
+            # Fresh hashes only from TUs that were really re-parsed —
+            # see *reparsed_tus* in the docstring.
+            if tu_rel in tu_headers and (reparsed_tus is None or tu_rel in reparsed_tus):
                 source_hash = compute_source_hash(unit.file.resolve())
                 entries.append(
                     {

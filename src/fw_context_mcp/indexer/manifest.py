@@ -584,10 +584,32 @@ def compute_config_hash(
     return config_hash
 
 
+def _hash_with_cache(path: Path, hash_cache: dict[str, str] | None) -> str:
+    """Return the SHA-256 of *path*, memoized in *hash_cache* by resolved path.
+
+    WHY a cache: a project header included by 300 TUs is asked for by the
+    staleness pre-pass and again by every per-TU check.  Without memoization
+    each of those reads and hashes the same file, which dominates the cost of
+    an otherwise no-op index run on large codebases.
+
+    Callers that pass ``None`` get the uncached behaviour.
+    """
+    if hash_cache is None:
+        return compute_source_hash(path)
+    key = str(path)
+    cached = hash_cache.get(key)
+    if cached is None:
+        cached = compute_source_hash(path)
+        hash_cache[key] = cached
+    return cached
+
+
 def check_tu_staleness(
     entry: dict,
     project_root: Path,
     vendor_patterns: list[str],
+    *,
+    hash_cache: dict[str, str] | None = None,
 ) -> tuple[bool, str | None]:
     """Check whether a translation unit's source or project headers have changed.
 
@@ -642,11 +664,92 @@ def check_tu_staleness(
         if any(_path_matches(rel_path, pat) for pat in vendor_patterns):
             continue
 
-        current_hash = compute_source_hash(p)
-        if current_hash != h.get("hash", ""):
+        if _hash_with_cache(p, hash_cache) != h.get("hash", ""):
             return True, current_source_hash
 
     return False, None
+
+
+def collect_stale_headers(
+    manifest: dict,
+    project_root: Path,
+    vendor_patterns: list[str],
+    *,
+    hash_cache: dict[str, str] | None = None,
+) -> set[str]:
+    """Return the manifest header paths whose on-disk content has changed.
+
+    WHY this pre-pass exists: a header is not a translation unit, so editing
+    one never moves the mtime of any TU.  The per-TU mtime fast-path would
+    therefore report every dependent TU as unchanged and the header's symbols
+    would stay frozen at their first-index state.  Collecting the changed
+    headers up front lets the runner mark the dependent TUs for re-parsing.
+
+    Trust rules match :func:`check_tu_staleness` exactly — generated headers,
+    headers outside *project_root*, and headers matching *vendor_patterns*
+    keep their stored hash and are never re-read.  Re-hashing thousands of
+    SDK headers on every run would dominate index time.
+
+    Header paths are deduplicated, so a header shared by many TUs is hashed
+    once.  Pass *hash_cache* to share those hashes with the per-TU staleness
+    checks that follow.
+
+    Returns the paths exactly as stored in the manifest, so the result can be
+    fed straight into :func:`tus_affected_by_headers`.
+    """
+    from .sdk_detect import _path_matches
+
+    stale: set[str] = set()
+    checked: set[str] = set()
+
+    for entry in manifest.get("entries", []):
+        for h in entry.get("headers", []):
+            header_path = h["path"]
+            if header_path in checked or header_path in stale:
+                continue
+            checked.add(header_path)
+
+            if h.get("generated"):
+                continue
+
+            p = Path(header_path)
+            if not p.is_absolute():
+                p = (project_root / header_path).resolve()
+
+            # Outside project_root → trust manifest (system/toolchain/external SDK)
+            try:
+                rel_path = str(p.relative_to(project_root))
+            except ValueError:
+                continue
+
+            # Matches vendor pattern → trust manifest
+            if any(_path_matches(rel_path, pat) for pat in vendor_patterns):
+                continue
+
+            if _hash_with_cache(p, hash_cache) != h.get("hash", ""):
+                stale.add(header_path)
+
+    return stale
+
+
+def tus_affected_by_headers(manifest: dict, stale_headers: set[str]) -> set[str]:
+    """Return ``entry["file"]`` for every TU that includes one of *stale_headers*.
+
+    WHY every dependent TU and not just one: symbols from a shared header are
+    stored by whichever TU claims them first in a run.  A TU that keeps its
+    old rows would hold the fresh ones out through the
+    ``ON CONFLICT(config_hash, usr)`` guard in ``insert_symbols_batch``, so a
+    partial re-parse leaves stale line numbers and signatures behind.
+    """
+    if not stale_headers:
+        return set()
+    affected: set[str] = set()
+    for entry in manifest.get("entries", []):
+        for h in entry.get("headers", []):
+            if h["path"] in stale_headers:
+                affected.add(entry["file"])
+                break
+    return affected
 
 
 def update_entry(
@@ -701,6 +804,7 @@ def compute_current_entry_hash(
     vendor_patterns: list[str],
     *,
     new_source_hash: str | None = None,
+    hash_cache: dict[str, str] | None = None,
 ) -> str:
     """Return the manifest entry hash computed from CURRENT disk content.
 
@@ -738,7 +842,7 @@ def compute_current_entry_hash(
         if any(_path_matches(rel_path, pat) for pat in vendor_patterns):
             current_headers.append(dict(h))
         else:
-            current_hash = compute_source_hash(p)
+            current_hash = _hash_with_cache(p, hash_cache)
             current_headers.append({"path": h["path"], "hash": current_hash, "generated": h.get("generated", False)})
 
     header_hashes = "".join(

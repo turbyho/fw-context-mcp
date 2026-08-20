@@ -294,6 +294,8 @@ def _check_and_parse_unit(
     manifest=None,
     reuse_possible: bool = True,
     skip_files: set[str] | None = None,
+    header_stale_tus: frozenset[str] = frozenset(),
+    hash_cache: dict[str, str] | None = None,
 ):
     """Check whether *unit* needs re-parsing and parse it if so.
 
@@ -324,6 +326,14 @@ def _check_and_parse_unit(
             while ``manifest.json`` survives on disk) — reuse would hash
             source+headers and run a reassignment query for every TU, then
             fall through to a full parse anyway.
+        header_stale_tus: Normalized paths of TUs that include a header
+            whose content changed (from ``manifest.collect_stale_headers``).
+            For those TUs both cheap tiers are skipped: a header change
+            never moves the TU's own mtime, so Tier 1 would report
+            "unchanged" and the header's symbols would never be refreshed.
+        hash_cache: Shared ``{resolved path: sha256}`` memo for project
+            header hashes, so a header included by many TUs is read once
+            per index run.
 
     Returns:
         * ``("unchanged", None, None, None)`` — no re-parse needed (Tier 1 mtime match).
@@ -350,8 +360,14 @@ def _check_and_parse_unit(
     file_path = _normalize_file_path(str(resolved_tu), project_root)
     force_refs = force or os.environ.get("FW_CONTEXT_FORCE_REFINDEX") == "1"
 
+    # A changed header leaves the TU's own mtime and source hash untouched,
+    # so both cheap tiers would wave this TU through.  Skip them and let
+    # Tier 3 re-parse — that is the only way the header's symbols and its
+    # ifdef-filtered content get refreshed.
+    tu_header_stale = file_path in header_stale_tus
+
     # ── Tier 1: mtime fast-path ──
-    if not force_refs and file_path in existing_files:
+    if not force_refs and not tu_header_stale and file_path in existing_files:
         rec = existing_files[file_path]
         stored_mtime = rec.mtime
         try:
@@ -381,12 +397,13 @@ def _check_and_parse_unit(
         project_root,
         vendor_patterns,
         manifest,
+        hash_cache=hash_cache,
     )
 
     content_hash = compute_tu_content_hash(source_hash, flags_hash, manifest_entry_hash)
     hashes = (source_hash, flags_hash, manifest_entry_hash)
 
-    if not force_refs and file_path in existing_files:
+    if not force_refs and not tu_header_stale and file_path in existing_files:
         rec = existing_files[file_path]
         # rec is a FileHashRecord from get_file_hashes() — attribute access
         if rec.content_hash and rec.content_hash == content_hash:
@@ -412,7 +429,7 @@ def _check_and_parse_unit(
         # Preliminary (degraded) manifests have empty source_hash; old
         # manifests from before this feature lack flags_hash.
         if entry is not None and entry.get("source_hash") and entry.get("flags_hash"):
-            stale, _ = check_tu_staleness(entry, project_root, vendor_patterns)
+            stale, _ = check_tu_staleness(entry, project_root, vendor_patterns, hash_cache=hash_cache)
             if not stale:
                 current_flags = compute_flags_hash(unit.raw_entry) if unit.raw_entry else ""
                 if entry["flags_hash"] == current_flags:
@@ -454,6 +471,8 @@ def _get_manifest_entry_hash_for_unit(
     project_root: Path,
     vendor_patterns: list[str],
     manifest_lookup: dict[str, dict] | None,
+    *,
+    hash_cache: dict[str, str] | None = None,
 ) -> str:
     """Return the manifest entry hash for a TU for Tier 2 staleness comparison.
 
@@ -476,7 +495,9 @@ def _get_manifest_entry_hash_for_unit(
 
         entry = manifest_lookup.get(tu_rel)
         if entry is not None:
-            stale, current_source_hash = check_tu_staleness(entry, project_root, vendor_patterns)
+            stale, current_source_hash = check_tu_staleness(
+                entry, project_root, vendor_patterns, hash_cache=hash_cache
+            )
             if not stale:
                 return _entry_hash(entry)
             # Stale — compute hash from CURRENT disk content (both source and headers)
@@ -485,6 +506,7 @@ def _get_manifest_entry_hash_for_unit(
                 project_root,
                 vendor_patterns,
                 new_source_hash=current_source_hash,
+                hash_cache=hash_cache,
             )
 
     # ── Fallback: source-only hash (no manifest, no header tracking) ──
@@ -682,6 +704,8 @@ def _handle_unchanged_or_reuse(
     processed: int,
     total_units: int,
     skip_files: frozenset[str] | None = None,
+    manifest_lookup: dict[str, dict] | None = None,
+    content_backfill_needed: bool = True,
 ) -> dict:
     """Handle Phase 1 staleness outcomes — bookkeeping for unchanged/reuse TUs.
 
@@ -703,6 +727,15 @@ def _handle_unchanged_or_reuse(
         existing_files: Dict mapping file paths to ``FileHashRecord``.
         processed: 1-based index of this TU in the batch (for logging).
         total_units: Total TU count (for logging).
+        skip_files: Headers already processed by earlier TUs in this run.
+        manifest_lookup: ``{tu path: manifest entry}`` from ``manifest.json``.
+            A usable entry (real ``source_hash`` and ``flags_hash``) lets an
+            unchanged TU skip the header/content pass entirely — see the
+            comment below.
+        content_backfill_needed: True when some file in the index still has
+            an empty ``content`` column.  Computed once per run by the
+            caller; when True the header/content pass runs even for
+            unchanged TUs so the backfill can complete.
 
     Returns:
         dict with keys:
@@ -719,6 +752,29 @@ def _handle_unchanged_or_reuse(
     is_reuse = check_status == "reuse"
     fname = unit.file.name
     file_path_str = _normalize_file_path(str(unit.file.resolve()), project_root)
+    try:
+        tu_key = str(unit.file.resolve().relative_to(project_root))
+    except ValueError:
+        tu_key = str(unit.file.resolve())
+
+    # An unchanged TU has nothing to contribute to the manifest: its stored
+    # entry is still accurate.  Running the header/content pass anyway would
+    # cost a full libclang parse per TU AND stamp current header hashes onto
+    # a TU that was never re-parsed — erasing the only signal that its
+    # headers are stale.  A preliminary or pre-flags_hash entry does not
+    # qualify: those must be regenerated with real hashes.
+    #
+    # "reuse" is excluded — that path migrates a TU to a new config_hash and
+    # the new manifest still needs its entry.
+    manifest_entry = manifest_lookup.get(tu_key) if manifest_lookup else None
+    manifest_entry_usable = bool(
+        manifest_entry
+        and manifest_entry.get("source_hash")
+        and manifest_entry.get("flags_hash")
+    )
+    skip_header_pass = (
+        check_status == "unchanged" and manifest_entry_usable and not content_backfill_needed
+    )
     rec = existing_files.get(file_path_str)
     file_id = rec.file_id if rec else None
     try:
@@ -788,7 +844,7 @@ def _handle_unchanged_or_reuse(
                     conn.execute("UPDATE files SET content = '' WHERE id = ?", (file_id,))
                     fallthrough = True
 
-            if not fallthrough:
+            if not fallthrough and not skip_header_pass:
                 # Fill ifdef-filtered file content via tokenization
                 fc, hdrs = _build_filtered_file_content(
                     conn, unit, config_hash, project_root, build_dir_patterns=build_dir_patterns,
@@ -796,10 +852,6 @@ def _handle_unchanged_or_reuse(
                 )
                 content_filled = fc
                 if hdrs:
-                    try:
-                        tu_key = str(unit.file.resolve().relative_to(project_root))
-                    except ValueError:
-                        tu_key = str(unit.file.resolve())
                     headers = {tu_key: hdrs}
 
     return {
