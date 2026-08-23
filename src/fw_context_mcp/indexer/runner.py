@@ -36,7 +36,7 @@ from ._postprocess import (
 )
 from ._unit_processor import (
     _check_and_parse_unit,
-    _handle_unchanged_or_reuse,
+    _handle_unchanged,
     _process_unit,
 )
 from .compile_commands import _SOURCE_EXTS, validate_include_files
@@ -309,19 +309,6 @@ def run(
 
     existing_files = get_file_hashes(conn, config_hash)
 
-    # After reset_index (DB wipe) manifest.json survives on disk, but there
-    # is no old build data to migrate from.  Tier 2b (reuse) can never
-    # produce symbols then — for each TU it would re-hash source+headers and
-    # run a pointless reassignment query before falling through to a full
-    # parse.  Detect "no old build" once up front and disable the reuse path.
-    has_old_build = (
-        conn.execute(
-            "SELECT 1 FROM files WHERE config_hash != ? LIMIT 1",
-            (config_hash,),
-        ).fetchone()
-        is not None
-    )
-
     # Pre-build lookup dict for O(1) manifest entry access during Tier 2 checks.
     # *manifest* was loaded above (before config_hash computation) — reuse it.
     manifest_lookup: dict[str, dict] = {}
@@ -387,7 +374,6 @@ def run(
     total_refs = 0
     skipped = 0
     unchanged = 0
-    reused = 0
     updated = 0
     acc_parse = 0.0
     acc_lock = 0.0
@@ -490,7 +476,6 @@ def run(
             existing_files,
             force=force,
             manifest=manifest_lookup,
-            reuse_possible=has_old_build,
             skip_files=skip_files,
             header_stale_tus=header_stale_tus,
             hash_cache=header_hash_cache,
@@ -507,28 +492,20 @@ def run(
         if parsed_data is not None and hasattr(parsed_data, 'newly_seen_files'):
             skip_files.update(parsed_data.newly_seen_files)
 
-        if check_status in ("unchanged", "reuse"):
-            result = _handle_unchanged_or_reuse(
+        if check_status == "unchanged":
+            result = _handle_unchanged(
                 unit, check_status, hashes, conn, config_hash, project_root,
-                build_dir_patterns, db_path, existing_files, processed, len(units),
+                build_dir_patterns, db_path, existing_files,
                 skip_files=skip_before,
                 manifest_lookup=manifest_lookup,
                 content_backfill_needed=content_backfill_needed,
             )
-            total_syms += result["total_syms"]
-            if result["is_reuse"] and result["total_syms"] > 0:
-                reused += 1
-            elif not result["is_reuse"]:
-                unchanged += 1
+            unchanged += 1
             content_filled += result["content_filled"]
             if result["headers"]:
                 tu_headers.update(result["headers"])
-            if result["fallthrough"]:
-                # Fall through to Phase 2 — _process_unit will re-parse with libclang
-                pass
-            else:
-                log.info("[%d/%d] %s: %s", processed, len(units), fname, result["status"])
-                continue
+            log.info("[%d/%d] %s: %s", processed, len(units), fname, result["status"])
+            continue
 
         if check_status == "skipped":
             skipped += 1
@@ -623,5 +600,5 @@ def run(
 
     elapsed = time.monotonic() - t0
     log.info("", extra={"phase": f"Done — {total_syms} symbols, {total_refs} refs, {_fmt_dur(elapsed)}"})
-    log.info("%d updated, %d unchanged, %d reused, %d skipped  config_hash=%s", updated, unchanged, reused, skipped, config_hash[:12])
+    log.info("%d updated, %d unchanged, %d skipped  config_hash=%s", updated, unchanged, skipped, config_hash[:12])
     return config_hash

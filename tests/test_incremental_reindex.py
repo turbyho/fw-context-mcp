@@ -3629,3 +3629,135 @@ class TestCoveragePurge:
             )
         finally:
             conn.close()
+
+
+# ── Dialect round trip ────────────────────────────────────────────────
+
+
+_GATED_HEADER = (
+    "#ifndef FEATURE_H\n"
+    "#define FEATURE_H\n"
+    "#ifdef FEATURE_ON\n"
+    "int feature_only_fn(void);\n"
+    "#else\n"
+    "int baseline_only_fn(void);\n"
+    "#endif\n"
+    "#endif\n"
+)
+
+
+def _gated_symbols(conn, config_hash: str) -> set[str]:
+    """Return whichever of the two #ifdef-gated declarations are indexed."""
+    return {
+        r["name"]
+        for r in conn.execute(
+            "SELECT name FROM symbols WHERE config_hash=? AND name LIKE '%_only_fn'",
+            (config_hash,),
+        ).fetchall()
+    }
+
+
+@pytest.mark.libclang
+class TestDialectRoundTrip:
+    """Returning to a previous dialect must be answered by parsing.
+
+    A ``-D`` change flips ``#ifdef``, so the stored rows of one dialect say
+    nothing about another.  Going back to a dialect whose rows retention
+    already deleted used to hit the "reuse" tier, which imported rows from
+    whatever other build was newest — ``_reassign_symbols_for_file`` selects
+    its source with ``ORDER BY rowid DESC`` and never checks that the dialect
+    matches.
+
+    The header below declares exactly one symbol per dialect, so the name
+    present tells you which dialect the stored rows came from.
+    """
+
+    def _setup(self, project_root: Path) -> None:
+        _write_file(project_root / "src" / "feature.h", _GATED_HEADER)
+        _include_from_main(project_root, "feature.h")
+
+    def test_gated_symbol_follows_the_current_dialect(self, c_project: Path):
+        db_path = _db_path_for_project(c_project)
+        self._setup(c_project)
+
+        assert _index_cli(c_project).returncode == 0
+        conn = open_db(db_path)
+        try:
+            assert _gated_symbols(conn, _config_hash(conn)) == {"baseline_only_fn"}, (
+                "seed failed — the #ifdef-gated declaration was not indexed"
+            )
+        finally:
+            conn.close()
+
+        # → dialect B
+        _change_build_dialect(c_project, "FEATURE_ON")
+        assert _index_cli(c_project).returncode == 0
+        conn = open_db(db_path)
+        try:
+            assert _gated_symbols(conn, _config_hash(conn)) == {"feature_only_fn"}, (
+                "the macro did not take effect — the test would prove nothing"
+            )
+        finally:
+            conn.close()
+
+        # → back to dialect A.  Its rows were retired by retention when B was
+        # built, so this is the case the reuse tier used to serve.
+        import json
+
+        cc_json = c_project / "compile_commands.json"
+        cc = json.loads(cc_json.read_text(encoding="utf-8"))
+        for entry in cc:
+            entry["arguments"] = [a for a in entry["arguments"]
+                                  if a != "-DFEATURE_ON"]
+        cc_json.write_text(json.dumps(cc, indent=2), encoding="utf-8")
+
+        result = _index_cli(c_project)
+        assert result.returncode == 0, result.stderr
+
+        conn = open_db(db_path)
+        try:
+            gated = _gated_symbols(conn, _config_hash(conn))
+            assert gated == {"baseline_only_fn"}, (
+                f"the index does not match the current dialect: {sorted(gated)}\n"
+                + result.stderr[-2500:]
+            )
+        finally:
+            conn.close()
+
+    def test_dialect_change_reparses_instead_of_importing(self, c_project: Path):
+        """No translation unit may be satisfied by importing another build."""
+        self._setup(c_project)
+        assert _index_cli(c_project).returncode == 0
+        _change_build_dialect(c_project, "FEATURE_ON")
+        assert _index_cli(c_project).returncode == 0
+
+        import json
+
+        cc_json = c_project / "compile_commands.json"
+        cc = json.loads(cc_json.read_text(encoding="utf-8"))
+        for entry in cc:
+            entry["arguments"] = [a for a in entry["arguments"]
+                                  if a != "-DFEATURE_ON"]
+        cc_json.write_text(json.dumps(cc, indent=2), encoding="utf-8")
+
+        result = _index_cli(c_project)
+        assert result.returncode == 0, result.stderr
+        # Check the per-TU summary line specifically.  "reused" also appears
+        # in the manifest updater's own line ("N updated, M reused"), which
+        # counts reused manifest ENTRIES and is unrelated to serving a TU
+        # from another build.
+        summary = next(
+            (ln for ln in result.stderr.splitlines()
+             if "unchanged," in ln and "skipped" in ln),
+            "",
+        )
+        assert summary, f"no indexer summary line found\n{result.stderr[-2500:]}"
+        assert "reused" not in summary, (
+            f"a TU was served from another build instead of being re-parsed\n{summary}"
+        )
+        # Returning to a retired dialect leaves nothing under its
+        # config_hash, so every TU is parsed afresh — the count is whatever
+        # the project has, but it must not be zero.
+        assert "0 updated" not in summary, (
+            f"no TU was re-parsed under the restored dialect\n{summary}"
+        )
