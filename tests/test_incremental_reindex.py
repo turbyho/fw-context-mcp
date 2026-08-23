@@ -3089,19 +3089,21 @@ def _macro_lines(conn, config_hash: str, name: str) -> list[int]:
 class TestHeaderScopedRowCleanup:
     """Rows owned by a header must be cleaned when the header is re-parsed.
 
-    ``store_symbols_for_unit`` deletes refs, indirect call sites, function
-    pointer assignments and macros by the *translation unit's* path only.
-    Code inside an inline function in a header stores those rows under the
-    HEADER's path / file_id, so nothing deletes them:
+    Code inside an inline function in a header stores its rows under the
+    HEADER's path / file_id.  The cleanup used to delete refs, indirect call
+    sites, function pointer assignments and macros by the *translation
+    unit's* key only, so nothing removed them:
 
-    - **D5** ``delete_refs_for_file(conn, ch, tu_rel)`` — a call removed from
-      a header keeps its refs row, so ``find_callers`` reports a caller that
-      no longer exists.  A call that only moved gets a second row, because
-      ``idx_refs_unique`` includes ``from_line``.
-    - **D6** ``delete_macros_for_file(conn, tu_file_id)`` — a ``#define``
-      removed from a header keeps its macros row.  A ``#define`` that moved
-      gets a second row, because the UNIQUE key is
+    - a call removed from a header kept its refs row, so ``find_callers``
+      reported a caller that no longer exists.  A call that only moved got a
+      second row, because ``idx_refs_unique`` includes ``from_line``.
+    - a ``#define`` removed from a header kept its macros row.  One that
+      moved got a second row, because the UNIQUE key is
       ``(config_hash, file_id, line)``.
+
+    ``replace_file_data()`` now clears everything a file owns from its file
+    id alone, so these cases have one implementation to get right instead of
+    three.
     """
 
     def test_removed_header_call_drops_its_ref(self, c_project: Path):

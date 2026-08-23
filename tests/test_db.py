@@ -7,9 +7,7 @@ from fw_context_mcp.indexer.db import (
     _expand_query,
     count_refs,
     delete_inheritance_for_file,
-    delete_macros_for_file,
     delete_macros_for_files,
-    delete_refs_for_file,
     delete_refs_for_files,
     delete_symbols_for_file,
     find_refs,
@@ -562,18 +560,6 @@ class TestRefs:
         rows = find_refs(populated_db, "hash-deadbeef", "modem_init")
         assert len(rows) == 1
         assert rows[0]["caller_name"] is None
-
-    def test_delete_refs_for_file(self, populated_db):
-        self._setup_symbols(populated_db)
-        insert_refs_batch(populated_db, [
-            ("hash-deadbeef", "U_callee", "src/app.cpp", 55, "U_caller", "call"),
-            ("hash-deadbeef", "U_callee", "src/other.cpp", 5, None, "call"),
-        ])
-        assert count_refs(populated_db, "hash-deadbeef") == 2
-        delete_refs_for_file(populated_db, "hash-deadbeef", "src/app.cpp")
-        assert count_refs(populated_db, "hash-deadbeef") == 1
-        remaining = find_refs(populated_db, "hash-deadbeef", "modem_init")
-        assert remaining[0]["from_file"] == "src/other.cpp"
 
     def test_delete_refs_for_files(self, populated_db):
         """The plural form clears several origin files in one call."""
@@ -2066,22 +2052,23 @@ class TestMacros:
         assert len(results) == 1
         assert results[0][0] == "REBUILD_TEST"
 
-    def test_delete_macros_for_file(self, populated_db):
-        """Deleting by file_id removes macros and FTS entries."""
+    def test_delete_macros_for_files_clears_the_fts_index(self, populated_db):
+        """The delete must reach macros_fts through the ad trigger."""
         conn = populated_db
         fid = upsert_file(conn, "hash-deadbeef", "/tmp/test.h", "cpp")
         insert_macros_batch(conn, [
             ("hash-deadbeef", fid, "TO_DELETE", "42", "42", 1, 0),
         ])
-        count_before = conn.execute(
+        assert conn.execute(
             "SELECT COUNT(*) FROM macros_fts WHERE macros_fts MATCH 'name:to_delete'"
-        ).fetchone()[0]
-        assert count_before == 1
-        delete_macros_for_file(conn, fid)
-        count_after = conn.execute(
+        ).fetchone()[0] == 1
+        delete_macros_for_files(conn, [fid])
+        assert conn.execute(
             "SELECT COUNT(*) FROM macros WHERE file_id=?", (fid,)
-        ).fetchone()[0]
-        assert count_after == 0
+        ).fetchone()[0] == 0
+        assert conn.execute(
+            "SELECT COUNT(*) FROM macros_fts WHERE macros_fts MATCH 'name:to_delete'"
+        ).fetchone()[0] == 0, "the FTS index kept a deleted macro"
 
     def test_delete_macros_for_files(self, populated_db):
         """The plural form clears several files' macros in one call."""

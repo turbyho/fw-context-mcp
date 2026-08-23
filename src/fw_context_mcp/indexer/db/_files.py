@@ -379,6 +379,107 @@ def _delete_dangling_incoming_refs(conn: sqlite3.Connection, config_hash: str, p
         )
 
 
+def _delete_rows_owned_by(
+    conn: sqlite3.Connection,
+    config_hash: str,
+    files: list[tuple[int, str]],
+) -> list[str]:
+    """Delete every row OWNED by *files*; return the USRs that were removed.
+
+    "Owned" means the row's own file is one of *files*: its symbols, macros,
+    inheritance edges, embeddings, LLM analysis, vectors, and the references /
+    call sites / function pointer assignments that ORIGINATE in it.
+
+    Deliberately NOT touched, because the two callers need different things:
+
+    - **Incoming references.** Rows in OTHER files that point at these USRs.
+      A re-parse must keep them — the symbols are about to be re-inserted. A
+      file that left the build must lose them, so ``purge_files`` and friends
+      call :func:`_delete_dangling_incoming_refs` afterwards with the returned
+      USRs.
+    - **The ``files`` rows themselves.** A re-parse reuses them.
+    - **``overrides``.** They key on ``derived_usr``, not on a symbol id, so
+      they stay valid across a re-parse.  Deleting them here would lose them
+      for good when ``analyze_overrides`` is off and nothing rebuilds them.
+
+    Order is forced: inheritance resolves USR through ``symbols``, and the
+    embedding / analysis deletes select by ``symbol_id``, so both must run
+    before the symbols go.  ``vec_symbols`` is a sqlite-vec virtual table and
+    may not exist at all.
+    """
+    from ._inheritance import delete_inheritance_for_file
+    from ._refs import (
+        delete_fp_assignments_for_files,
+        delete_indirect_call_sites_for_files,
+        delete_refs_for_files,
+    )
+    from ._symbols import delete_macros_for_files
+
+    purged_usrs: list[str] = []
+    for file_id, _ in files:
+        purged_usrs.extend(
+            r[0] for r in conn.execute(
+                "SELECT usr FROM symbols WHERE config_hash = ? AND file_id = ?",
+                (config_hash, file_id),
+            ).fetchall()
+        )
+        delete_inheritance_for_file(conn, config_hash, file_id)
+        selector = "(SELECT id FROM symbols WHERE file_id = ?)"
+        # Explicit rather than relying on ON DELETE CASCADE, so the order
+        # holds even if a future schema defers the constraint.
+        conn.execute(f"DELETE FROM embeddings WHERE symbol_id IN {selector}", (file_id,))
+        conn.execute(f"DELETE FROM llm_analysis WHERE symbol_id IN {selector}", (file_id,))
+        try:
+            conn.execute(f"DELETE FROM vec_symbols WHERE symbol_id IN {selector}", (file_id,))
+        except sqlite3.OperationalError:
+            pass  # sqlite-vec not loaded — the virtual table does not exist
+        delete_symbols_for_file(conn, file_id)
+
+    delete_macros_for_files(conn, [fid for fid, _ in files])
+    paths = [path for _, path in files if path]
+    delete_refs_for_files(conn, config_hash, paths)
+    delete_indirect_call_sites_for_files(conn, config_hash, paths)
+    delete_fp_assignments_for_files(conn, config_hash, paths)
+    return purged_usrs
+
+
+def replace_file_data(
+    conn: sqlite3.Connection,
+    config_hash: str,
+    file_ids: list[int],
+) -> None:
+    """Clear the rows of *file_ids* so a fresh parse can re-insert them.
+
+    This is the ONE entry point for the re-parse case.  It used to be three
+    separate cleanups keyed three different ways — symbols and inheritance by
+    file_id, refs and call sites by path, macros by file_id again — and every
+    one of them had to be told which files the parse owned.  Each derived that
+    answer itself, and each got it wrong for rows owned by a header.
+
+    Paths for the reference tables are read from ``files.path`` rather than
+    supplied, so the string used to delete is by construction the string that
+    was stored.  Callers need only the file ids.
+
+    The ``files`` rows survive: the parse is about to refresh them.
+    """
+    ids = list(dict.fromkeys(file_ids))
+    if not ids:
+        return
+    rows: list[tuple[int, str]] = []
+    for i in range(0, len(ids), 500):
+        chunk = ids[i : i + 500]
+        placeholders = ",".join("?" * len(chunk))
+        rows.extend(
+            (r["id"], r["path"])
+            for r in conn.execute(
+                f"SELECT id, path FROM files WHERE id IN ({placeholders})",  # noqa: S608
+                chunk,
+            ).fetchall()
+        )
+    if rows:
+        _delete_rows_owned_by(conn, config_hash, rows)
+
+
 def purge_file_records(
     conn: sqlite3.Connection,
     config_hash: str,
@@ -394,14 +495,8 @@ def purge_file_records(
     Returns the number of symbols removed.
     """
     from ._connection import transaction
-    from ._inheritance import delete_inheritance_for_file, delete_overrides_for_file
+    from ._inheritance import delete_overrides_for_file
     from ._locking import write_lock
-    from ._refs import (
-        delete_fp_assignments_for_file,
-        delete_indirect_call_sites_for_file,
-        delete_refs_for_file,
-    )
-    from ._symbols import delete_macros_for_file
 
     lock = (
         write_lock(db_dir, timeout=60.0)
@@ -410,42 +505,15 @@ def purge_file_records(
     )
     tx = transaction(conn) if not transaction_held else nullcontext()
     with lock, tx:
-        # Collect USRs before deleting symbols — the USR is the
-        # cross-table key for refs, inheritance, overrides, and
-        # indirect-call edges.  We need the USR list for
-        # _delete_dangling_incoming_refs below.
-        purged_usrs = [
-            r[0]
-            for r in conn.execute(
-                "SELECT usr FROM symbols WHERE config_hash = ? AND file_id = ?",
-                (config_hash, file_id),
-            ).fetchall()
-        ]
-        delete_inheritance_for_file(conn, config_hash, file_id)
+        purged_usrs = _delete_rows_owned_by(conn, config_hash, [(file_id, file_path)])
+        # The file is gone for good, so three things the re-parse path keeps
+        # must also go: overrides recorded for its methods, edges from
+        # SURVIVING files that point at its USRs, and the files row.
         delete_overrides_for_file(conn, config_hash, file_id)
-        # Clean dangling edges BEFORE deleting the USRs.  After symbols
-        # are deleted, we cannot resolve USR → file, so incoming refs
-        # from surviving files would point at non-existent USRs.  Doing
-        # this FIRST (while USRs still exist in the symbols table) lets
-        # _delete_dangling_incoming_refs use the USR list cleanly.
         if purged_usrs:
             _delete_dangling_incoming_refs(conn, config_hash, purged_usrs)
-        try:
-            conn.execute(
-                "DELETE FROM vec_symbols WHERE symbol_id IN "
-                "(SELECT id FROM symbols WHERE file_id = ?)",
-                (file_id,),
-            )
-        except sqlite3.OperationalError:
-            pass
-        delete_macros_for_file(conn, file_id)
-        symbol_count = len(purged_usrs)
-        delete_symbols_for_file(conn, file_id)
-        delete_refs_for_file(conn, config_hash, file_path)
-        delete_indirect_call_sites_for_file(conn, config_hash, file_path)
-        delete_fp_assignments_for_file(conn, config_hash, file_path)
         conn.execute("DELETE FROM files WHERE id = ?", (file_id,))
-    return symbol_count
+    return len(purged_usrs)
 
 
 def purge_missing_files_batch(
@@ -466,14 +534,8 @@ def purge_missing_files_batch(
     Returns the total number of symbols removed.
     """
     from ._connection import transaction
-    from ._inheritance import delete_inheritance_for_file, delete_overrides_for_file
+    from ._inheritance import delete_overrides_for_file
     from ._locking import write_lock
-    from ._refs import (
-        delete_fp_assignments_for_file,
-        delete_indirect_call_sites_for_file,
-        delete_refs_for_file,
-    )
-    from ._symbols import delete_macros_for_file
 
     lock = (
         write_lock(db_dir, timeout=60.0)
@@ -482,34 +544,13 @@ def purge_missing_files_batch(
     )
     tx = transaction(conn) if not transaction_held else nullcontext()
     with lock, tx:
-        all_purged_usrs: list[str] = []
-        for file_id, _file_path in files:
-            usrs = [
-                r[0]
-                for r in conn.execute(
-                    "SELECT usr FROM symbols WHERE config_hash = ? AND file_id = ?",
-                    (config_hash, file_id),
-                ).fetchall()
-            ]
-            delete_inheritance_for_file(conn, config_hash, file_id)
+        purged_usrs = _delete_rows_owned_by(conn, config_hash, list(files))
+        for file_id, _ in files:
             delete_overrides_for_file(conn, config_hash, file_id)
-            try:
-                conn.execute(
-                    "DELETE FROM vec_symbols WHERE symbol_id IN "
-                    "(SELECT id FROM symbols WHERE file_id = ?)",
-                    (file_id,),
-                )
-            except sqlite3.OperationalError:
-                pass
-            delete_macros_for_file(conn, file_id)
-            all_purged_usrs.extend(usrs)
-            delete_symbols_for_file(conn, file_id)
-        if all_purged_usrs:
-            _delete_dangling_incoming_refs(conn, config_hash, all_purged_usrs)
-        symbol_count = len(all_purged_usrs)
-        for file_id, file_path in files:
-            delete_refs_for_file(conn, config_hash, file_path)
-            delete_indirect_call_sites_for_file(conn, config_hash, file_path)
-            delete_fp_assignments_for_file(conn, config_hash, file_path)
+        # One pass over the union of every purged USR, so an edge between two
+        # files that both left the build is not looked up twice.
+        if purged_usrs:
+            _delete_dangling_incoming_refs(conn, config_hash, purged_usrs)
+        for file_id, _ in files:
             conn.execute("DELETE FROM files WHERE id = ?", (file_id,))
-    return symbol_count
+    return len(purged_usrs)

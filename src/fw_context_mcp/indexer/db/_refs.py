@@ -67,11 +67,8 @@ __all__ = [
     "count_fp_assignments",
     "count_indirect_call_sites",
     "count_refs",
-    "delete_fp_assignments_for_file",
     "delete_fp_assignments_for_files",
-    "delete_indirect_call_sites_for_file",
     "delete_indirect_call_sites_for_files",
-    "delete_refs_for_file",
     "delete_refs_for_files",
     "find_indirect_call_sites",
     "find_indirect_targets",
@@ -168,24 +165,6 @@ def delete_refs_for_files(
     _delete_by_from_file(conn, "refs", config_hash, from_files)
 
 
-def delete_refs_for_file(conn: sqlite3.Connection, config_hash: str, from_file: str) -> None:
-    """Delete all refs originating in *from_file* under *config_hash*.
-
-    Called before re-indexing a TU to remove stale reference entries.
-    After deletion, the TU's fresh references are re-inserted via
-    ``insert_refs_batch()``.
-
-    Why by file not by USR: a single TU can contain hundreds of symbols,
-    each with dozens of references.  Deleting by file in one DELETE is
-    O(log N) via the index; deleting per-USR would be O(N*log M) with
-    N round-trips.
-    """
-    conn.execute(
-        "DELETE FROM refs WHERE config_hash=? AND from_file=?",
-        (config_hash, from_file),
-    )
-
-
 # ---------------------------------------------------------------------------
 # Indirect call sites (Phase 2) — function pointer invocation tracking
 # ---------------------------------------------------------------------------
@@ -202,7 +181,7 @@ def insert_indirect_call_sites_batch(conn: sqlite3.Connection, rows: list[tuple]
     from the same line (e.g., inside a loop).  Each invocation is a
     separate call-site row.  Duplicate prevention is not needed here
     because re-indexing cleans the file's entries first via
-    ``delete_indirect_call_sites_for_file()``.
+    ``delete_indirect_call_sites_for_files()``.
     """
     cur = conn.executemany(
         """INSERT INTO indirect_call_sites
@@ -227,14 +206,6 @@ def delete_indirect_call_sites_for_files(
     row on EVERY reindex, without bound.
     """
     _delete_by_from_file(conn, "indirect_call_sites", config_hash, from_files)
-
-
-def delete_indirect_call_sites_for_file(conn: sqlite3.Connection, config_hash: str, from_file: str) -> None:
-    """Delete all indirect call sites originating in a given file (for incremental reindex)."""
-    conn.execute(
-        "DELETE FROM indirect_call_sites WHERE config_hash=? AND from_file=?",
-        (config_hash, from_file),
-    )
 
 
 def find_indirect_call_sites(
@@ -337,19 +308,6 @@ def delete_fp_assignments_for_files(
     """
     _delete_by_from_file(conn, "fp_assignments", config_hash, from_files)
 
-
-def delete_fp_assignments_for_file(
-    conn: sqlite3.Connection,
-    config_hash: str,
-    from_file: str,
-) -> None:
-    """Delete fp_assignments rows for *from_file* under *config_hash*.
-
-    Called before re-indexing a TU to remove stale entries."""
-    conn.execute(
-        "DELETE FROM fp_assignments WHERE config_hash = ? AND from_file = ?",
-        (config_hash, from_file),
-    )
 
 
 def find_indirect_targets(

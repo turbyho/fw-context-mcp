@@ -69,7 +69,6 @@ from ._refs import _MAX_BOUND_PARAMS
 
 __all__ = [
     "_expand_query",
-    "delete_macros_for_file",
     "delete_macros_for_files",
     "find_macro_refs",
     "insert_macros_batch",
@@ -277,10 +276,6 @@ def insert_macros_batch(
     )
     return cur.rowcount  # approximate with ON CONFLICT DO UPDATE WHERE (used for logging only)
 
-
-def delete_macros_for_file(conn: sqlite3.Connection, file_id: int) -> None:
-    """Delete all macros for a file (FTS ad trigger cleans up FTS index)."""
-    conn.execute("DELETE FROM macros WHERE file_id=?", (file_id,))
 
 
 def delete_macros_for_files(conn: sqlite3.Connection, file_ids: Sequence[int]) -> None:

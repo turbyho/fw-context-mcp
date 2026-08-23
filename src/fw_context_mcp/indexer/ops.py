@@ -55,11 +55,6 @@ from pathlib import Path
 from fw_context_mcp.indexer.config_hash import compute_tu_content_hash
 from fw_context_mcp.indexer.db import (
     _resolve_target_usr,
-    delete_fp_assignments_for_files,
-    delete_indirect_call_sites_for_files,
-    delete_inheritance_for_file,
-    delete_macros_for_files,
-    delete_refs_for_files,
     get_file_mtimes,
     insert_fp_assignments_batch,
     insert_indirect_call_sites_batch,
@@ -67,6 +62,7 @@ from fw_context_mcp.indexer.db import (
     insert_macros_batch,
     insert_refs_batch,
     insert_symbols_batch,
+    replace_file_data,
     split_tokens,
     upsert_file,
 )
@@ -724,24 +720,16 @@ def _delete_old_for_tu(
                 "DELETE FROM inheritance WHERE config_hash = ? AND derived_usr = ?",
                 (config_hash, usr),
             )
-    # Step 2-4: Delete all data for the owned files' old file_ids.
-    for chunk in _chunked(_owned_file_ids(known, normalized_tu_path, owned_paths)):
-        placeholders = ",".join("?" * len(chunk))
-        selector = f"(SELECT id FROM symbols WHERE file_id IN ({placeholders}))"
-        # Delete embeddings and analysis BEFORE symbols, even though
-        # SQLite FK cascades would handle it in order — doing it
-        # explicitly avoids FK constraint violations when the FK
-        # was deferred or when the schema was created without ON DELETE
-        # CASCADE.
-        conn.execute(f"DELETE FROM embeddings WHERE symbol_id IN {selector}", chunk)
-        conn.execute(f"DELETE FROM llm_analysis WHERE symbol_id IN {selector}", chunk)
-        try:
-            conn.execute(f"DELETE FROM vec_symbols WHERE symbol_id IN {selector}", chunk)
-        except sqlite3.OperationalError:
-            pass  # sqlite-vec may not be loaded
-        for file_id_old in chunk:
-            delete_inheritance_for_file(conn, config_hash, file_id_old)
-        conn.execute(f"DELETE FROM symbols WHERE file_id IN ({placeholders})", chunk)
+    # Step 2: hand the owned files to the one primitive that knows what a
+    #         file owns — symbols, macros, inheritance, embeddings, analysis,
+    #         vectors, and the refs / call sites / assignments originating in
+    #         it.  This used to be three cleanups keyed three different ways
+    #         (file_id here, paths in the refs block, file_id again for
+    #         macros), each deriving "which files does this parse own" for
+    #         itself, and each getting it wrong for rows owned by a header.
+    replace_file_data(
+        conn, config_hash, _owned_file_ids(known, normalized_tu_path, owned_paths)
+    )
 
 
 def _store_macros_for_unit(
@@ -754,23 +742,15 @@ def _store_macros_for_unit(
     tu_file_id: int,
     file_id_cache: dict[str, int],
     project_root: Path,
-    *,
-    owned_file_ids: list[int] | None = None,
 ) -> None:
-    """Insert or update macro definitions for one translation unit.
+    """Insert macro definitions for one translation unit.
 
-    Upserts file records for header files that contain macros, then
-    replaces all macros previously stored for the files this parse owns
-    with the fresh set.
-
-    *owned_file_ids* holds the previous file_ids of every file this parse
-    walked — the TU plus the headers it claimed.  A ``#define`` in a header
-    is stored under the HEADER's file_id, so replacing only ``tu_file_id``
-    would leave the header's rows behind: a deleted macro would survive, and
-    a moved one would gain a second row (the UNIQUE key is
-    ``(config_hash, file_id, line)``, so the upsert only refreshes a macro
-    that stayed on its line).  ``None`` falls back to the TU's own file,
-    which reproduces the behaviour from before header ownership was tracked.
+    Upserts file records for header files that contain macros, then inserts
+    the fresh set.  Nothing is deleted here: ``replace_file_data()`` already
+    cleared the macros of every file this parse owns, including the headers,
+    and it did so whether or not this parse found any macros to replace them
+    with.  A ``#define`` in a header is stored under the HEADER's file_id, so
+    a delete keyed on ``tu_file_id`` alone used to leave those rows behind.
 
     Macro storage is per-owned-file replacement, not per-macro upsert.  This
     is necessary because the same macro name may be defined with different
@@ -782,12 +762,8 @@ def _store_macros_for_unit(
     files get mtime=0.0 if stat fails (the upsert_file call will look up
     the existing mtime from the DB via its ON CONFLICT handler).
     """
-    # The delete runs BEFORE the empty check: a header whose last ``#define``
-    # was deleted produces no fresh rows, and returning early would leave the
-    # old ones in place.  ``tu_file_id`` is always included because
-    # *owned_file_ids* is built from the pre-run snapshot, which does not know
-    # a TU indexed for the first time.
-    delete_macros_for_files(conn, [tu_file_id, *(owned_file_ids or ())])
+    # No delete here: replace_file_data() already cleared the macros of every
+    # owned file, whether or not this parse found any to replace them with.
     if not macros:
         return
     macro_rows: list[tuple] = []
@@ -889,10 +865,6 @@ def store_symbols_for_unit(
     # Legacy tuple shapes carry no file set — the ownership set then holds
     # only the TU's own file, which is exactly the pre-existing behaviour.
     newly_seen: set[str] = set()
-    # The 5-tuple shape predates macro extraction, so its empty macro list
-    # means "the caller knows nothing about macros", not "this parse found
-    # none".  Replacing the stored macros from it would silently drop them.
-    macros_tracked = True
     if pre_parsed is not None:
         # ExtractionResult dataclass — use named fields instead of positional unpacking
         if hasattr(pre_parsed, 'tu'):
@@ -919,7 +891,6 @@ def store_symbols_for_unit(
         else:
             syms, refs, inheritance, indirect_call_sites, fp_assignments = pre_parsed
             macros = []
-            macros_tracked = False
             pending_dispatches = []
     else:
         # ── Run libclang parse inside the write lock ──
@@ -1031,31 +1002,17 @@ def store_symbols_for_unit(
             )
         _detect_moved_symbols(conn, config_hash, syms, old_usrs, file_id_cache, project_root)
 
-    # Path-relative helper used by refs and indirect_call_sites blocks
+    # Every path written to or matched against the database goes through the
+    # one normaliser.  There used to be a second, local one here that omitted
+    # project_root.resolve(); the two agreed for an ordinary checkout and
+    # diverged for a symlinked project root, which would have made
+    # refs.from_file unmatchable against files.path.
     def _rel(p: str) -> str:
-        try:
-            return str(Path(p).resolve().relative_to(project_root))
-        except ValueError:
-            return p
+        return _normalize_file_path(p, project_root)
 
-    tu_rel = _rel(file_path)
-
-    # ── Files whose refs / call-site / assignment rows this parse owns ──
-    # A call inside an inline function in a header carries the HEADER's path
-    # in ``from_file``, so a delete keyed on the TU alone leaves those rows
-    # behind.  Built with _rel() — the same normaliser the inserts below use.
-    # A path produced by _normalize_file_path() instead would diverge for a
-    # symlinked project_root and the stale row would survive the delete.
-    owned_rel = sorted({_rel(p) for p in newly_seen} | {tu_rel})
-
-    # ── Clear the reference data of every owned file, then re-insert ──
-    # The deletes are NOT guarded on the fresh row sets.  A TU (or one of its
-    # headers) whose last call was removed yields an empty set, and guarding
-    # on it would keep the stale rows alive forever.
-    if index_refs:
-        delete_refs_for_files(conn, config_hash, owned_rel)
-        delete_indirect_call_sites_for_files(conn, config_hash, owned_rel)
-        delete_fp_assignments_for_files(conn, config_hash, owned_rel)
+    # No per-table delete set is derived here any more.  The stale rows of
+    # every file this parse owns — the reference tables included — were
+    # cleared by replace_file_data() in phase 2, from the file ids alone.
 
     # References
     if index_refs and refs:
@@ -1143,12 +1100,10 @@ def store_symbols_for_unit(
 
     # Macros
     _t_macros = time.monotonic()
-    if macros_tracked:
-        _store_macros_for_unit(
-            conn, config_hash, macros, file_path, normalized_tu_path,
-            current_mtime, tu_file_id, file_id_cache, project_root,
-            owned_file_ids=_owned_file_ids(known, normalized_tu_path, owned_paths),
-        )
+    _store_macros_for_unit(
+        conn, config_hash, macros, file_path, normalized_tu_path,
+        current_mtime, tu_file_id, file_id_cache, project_root,
+    )
     _t_macros = time.monotonic() - _t_macros
 
     # Fill files.content with ifdef-filtered content (tokenization pass)
