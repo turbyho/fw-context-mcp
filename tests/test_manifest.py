@@ -52,14 +52,21 @@ class TestComputeConfigHash:
         assert h1 == h2
         assert len(h1) == 64
 
-    def test_different_files_produce_different_hash(self, tmp_path: Path):
+    def test_different_files_produce_the_same_hash(self, tmp_path: Path):
+        """The file set is not build identity — the dialect is.
+
+        Keeping the TU list in the hash meant adding or renaming one source
+        file minted a new build for every unchanged TU, whose rows then had to
+        be migrated to it.  Which files exist is recorded in the manifest, and
+        whether one changed is answered by ``files.source_hash``.
+        """
         from fw_context_mcp.indexer.manifest import compute_config_hash
 
         u1 = [self._make_unit(str(tmp_path / "a.cpp"))]
         u2 = [self._make_unit(str(tmp_path / "b.cpp"))]
         h1 = compute_config_hash(u1, tmp_path, "test")
         h2 = compute_config_hash(u2, tmp_path, "test")
-        assert h1 != h2
+        assert h1 == h2
 
     def test_different_flags_produce_different_hash(self, tmp_path: Path):
         from fw_context_mcp.indexer.manifest import compute_config_hash

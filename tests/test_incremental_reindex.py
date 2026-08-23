@@ -2280,10 +2280,20 @@ int sensor_read(void) {
             )
             print(f"  New config_hash: {config_hash_new[:16]}…")
 
-            # ── Verify: utils.c definitions gone from the NEW build config ──
+            # ── Verify: utils.c definitions gone ──
             # Note: declarations from utils.h (included by main.c) may still
-            # appear under the new config_hash — only definitions should be gone.
-            assert config_hash_new != ch_before, "config_hash should change when cc.json changes"
+            # appear — only definitions from the removed TU should be gone.
+            #
+            # The build identity does NOT change: config_hash names the
+            # compilation dialect, and dropping a source file does not alter
+            # it.  The removed file's rows are collected by the coverage purge
+            # instead, which compares the files table against the build's
+            # actual file set.  Before that purge existed, this test passed by
+            # accident: the file list was part of config_hash, so a removal
+            # minted a whole new build and the old one was retired.
+            assert config_hash_new == ch_before, (
+                "dropping a source file must not change the build identity"
+            )
             conn = open_db(db_path)
             try:
                 def_names = {
@@ -3373,9 +3383,9 @@ class TestHeaderScopedRowCleanup:
 def _add_tu_to_compile_commands(project_root: Path, name: str) -> None:
     """Add one more translation unit to the project and its compile_commands.
 
-    ``config_hash`` is the SHA-256 of the normalised compile_commands.json, so
-    adding a TU changes it while leaving every existing TU's ``source_hash``
-    and ``flags_hash`` untouched.
+    Note this does NOT change ``config_hash`` — that hash identifies the
+    compilation dialect, not the file set.  Use :func:`_change_build_dialect`
+    when a test needs a new build identity.
     """
     import json
 
@@ -3391,6 +3401,22 @@ def _add_tu_to_compile_commands(project_root: Path, name: str) -> None:
             "-o", f"build/{Path(name).stem}.o",
         ],
     })
+    cc_json.write_text(json.dumps(cc, indent=2), encoding="utf-8")
+
+
+def _change_build_dialect(project_root: Path, define: str) -> None:
+    """Add a ``-D`` macro to every entry, minting a new ``config_hash``.
+
+    A macro flips ``#ifdef``, so it can change what the same source text
+    compiles to — that is what makes a different build.  Adding or removing a
+    source file does not.
+    """
+    import json
+
+    cc_json = project_root / "compile_commands.json"
+    cc = json.loads(cc_json.read_text(encoding="utf-8"))
+    for entry in cc:
+        entry["arguments"] = [*entry["arguments"], f"-D{define}"]
     cc_json.write_text(json.dumps(cc, indent=2), encoding="utf-8")
 
 
@@ -3429,7 +3455,7 @@ class TestBuildRetention:
         finally:
             conn.close()
 
-        _add_tu_to_compile_commands(c_project, "extra.c")
+        _change_build_dialect(c_project, "RETENTION_PROBE=1")
         result = _index_cli(c_project)
         assert result.returncode == 0, result.stderr
 
@@ -3456,7 +3482,7 @@ class TestBuildRetention:
         finally:
             conn.close()
 
-        _add_tu_to_compile_commands(c_project, "extra.c")
+        _change_build_dialect(c_project, "RETENTION_PROBE=1")
         result = _index_cli(c_project)
         assert result.returncode == 0, result.stderr
 
@@ -3471,6 +3497,134 @@ class TestBuildRetention:
             }
             assert all(n == 0 for n in leftovers.values()), (
                 f"rows of the deleted build survived: {leftovers}\n"
+                + result.stderr[-2000:]
+            )
+        finally:
+            conn.close()
+
+
+# ── Coverage purge ────────────────────────────────────────────────────
+
+
+def _file_row(conn, config_hash: str, path_suffix: str):
+    """Return the files row whose path ends with *path_suffix*, or None."""
+    return conn.execute(
+        "SELECT id, path, content FROM files WHERE config_hash=? AND path LIKE ? LIMIT 1",
+        (config_hash, f"%{path_suffix}"),
+    ).fetchone()
+
+
+@pytest.mark.libclang
+class TestCoveragePurge:
+    """A file that leaves the build must leave the index with it.
+
+    ``config_hash`` names the compilation dialect, so dropping a source file
+    no longer mints a new build — nothing else notices it left.
+    ``purge_missing`` only looks for files gone from DISK, and
+    ``delete_orphan_files`` only removes rows that already have no symbols, no
+    macros and empty content.  Without a coverage purge the file keeps its
+    symbols, macros, refs and indexed content for the life of the index.
+    """
+
+    def test_removed_tu_leaves_no_rows(self, c_project: Path):
+        """A TU dropped from compile_commands.json keeps nothing behind."""
+        db_path = _db_path_for_project(c_project)
+        _add_tu_to_compile_commands(c_project, "doomed.c")
+        assert _index_cli(c_project).returncode == 0
+
+        conn = open_db(db_path)
+        try:
+            ch = _config_hash(conn)
+            row = _file_row(conn, ch, "doomed.c")
+            assert row is not None, "seed failed — doomed.c was not indexed"
+            assert _symbol_row(conn, ch, "doomed_fn") is not None, "seed failed"
+        finally:
+            conn.close()
+
+        # Drop it from the build; the file stays on disk, so purge_missing
+        # cannot be what cleans it up.
+        import json
+
+        cc_json = c_project / "compile_commands.json"
+        cc = [e for e in json.loads(cc_json.read_text(encoding="utf-8"))
+              if e["file"] != "doomed.c"]
+        cc_json.write_text(json.dumps(cc, indent=2), encoding="utf-8")
+        assert (c_project / "src" / "doomed.c").exists(), "the file must stay on disk"
+
+        result = _index_cli(c_project)
+        assert result.returncode == 0, result.stderr
+
+        conn = open_db(db_path)
+        try:
+            ch = _config_hash(conn)
+            assert _file_row(conn, ch, "doomed.c") is None, (
+                "files row of a TU no longer in the build survived\n"
+                + result.stderr[-2000:]
+            )
+            assert _symbol_row(conn, ch, "doomed_fn") is None, (
+                "symbols of a TU no longer in the build survived\n"
+                + result.stderr[-2000:]
+            )
+        finally:
+            conn.close()
+
+    def test_headers_still_included_elsewhere_survive(self, c_project: Path):
+        """Purging one TU must not take a header another TU still includes.
+
+        modem.h is included by both main.c and modem.c.  Dropping modem.c must
+        leave modem.h — and its symbols — in place.
+        """
+        db_path = _db_path_for_project(c_project)
+        assert _index_cli(c_project).returncode == 0
+
+        import json
+
+        cc_json = c_project / "compile_commands.json"
+        cc = [e for e in json.loads(cc_json.read_text(encoding="utf-8"))
+              if e["file"] != "modem.c"]
+        cc_json.write_text(json.dumps(cc, indent=2), encoding="utf-8")
+
+        result = _index_cli(c_project)
+        assert result.returncode == 0, result.stderr
+
+        conn = open_db(db_path)
+        try:
+            ch = _config_hash(conn)
+            assert _file_row(conn, ch, "modem.h") is not None, (
+                "a header still included by main.c was purged\n"
+                + result.stderr[-2000:]
+            )
+            assert _file_row(conn, ch, "modem.c") is None, (
+                "the dropped TU's own row survived\n" + result.stderr[-2000:]
+            )
+        finally:
+            conn.close()
+
+    def test_untouched_build_purges_nothing(self, c_project: Path):
+        """A no-op reindex must not delete anything."""
+        db_path = _db_path_for_project(c_project)
+        assert _index_cli(c_project).returncode == 0
+
+        conn = open_db(db_path)
+        try:
+            ch = _config_hash(conn)
+            before = conn.execute(
+                "SELECT COUNT(*) FROM files WHERE config_hash=?", (ch,)
+            ).fetchone()[0]
+        finally:
+            conn.close()
+
+        result = _index_cli(c_project)
+        assert result.returncode == 0, result.stderr
+
+        conn = open_db(db_path)
+        try:
+            ch = _config_hash(conn)
+            after = conn.execute(
+                "SELECT COUNT(*) FROM files WHERE config_hash=?", (ch,)
+            ).fetchone()[0]
+            assert after == before, (
+                f"a no-op reindex changed the file count: {before} -> {after}\n"
                 + result.stderr[-2000:]
             )
         finally:

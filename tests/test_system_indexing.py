@@ -960,22 +960,56 @@ class TestConfigHashStability:
         h2 = compute_structural_hash(cc, project_root, units2)
         assert h1 == h2
 
-    def test_config_hash_changes_with_different_cc(self, tmp_path):
+    def _hash_for(self, tmp_path, name: str, entries: list[dict]) -> str:
         from pathlib import Path
 
         from fw_context_mcp.indexer.compile_commands import parse as parse_cc
         from fw_context_mcp.indexer.manifest import compute_structural_hash
 
         project_root = Path(__file__).parent / "builds" / "bare"
-        cc1 = tmp_path / "cc1.json"
-        cc2 = tmp_path / "cc2.json"
-        cc1.write_text(json.dumps([{"file": "a.c", "directory": str(tmp_path), "arguments": ["gcc", "-c", "a.c"]}]))
-        cc2.write_text(json.dumps([{"file": "b.c", "directory": str(tmp_path), "arguments": ["gcc", "-c", "b.c"]}]))
-        units1 = list(parse_cc(cc1))
-        units2 = list(parse_cc(cc2))
-        h1 = compute_structural_hash(cc1, project_root, units1)
-        h2 = compute_structural_hash(cc2, project_root, units2)
-        assert h1 != h2
+        cc = tmp_path / name
+        cc.write_text(json.dumps(entries))
+        return compute_structural_hash(cc, project_root, list(parse_cc(cc)))
+
+    def test_config_hash_changes_with_different_dialect(self, tmp_path):
+        """A different macro or standard is a different build."""
+        base = self._hash_for(tmp_path, "base.json", [
+            {"file": "a.c", "directory": str(tmp_path),
+             "arguments": ["gcc", "-std=c11", "-c", "a.c"]},
+        ])
+        define = self._hash_for(tmp_path, "define.json", [
+            {"file": "a.c", "directory": str(tmp_path),
+             "arguments": ["gcc", "-std=c11", "-DFEATURE=1", "-c", "a.c"]},
+        ])
+        std = self._hash_for(tmp_path, "std.json", [
+            {"file": "a.c", "directory": str(tmp_path),
+             "arguments": ["gcc", "-std=c99", "-c", "a.c"]},
+        ])
+        assert define != base
+        assert std != base
+
+    def test_config_hash_survives_a_different_file_set(self, tmp_path):
+        """A different set of translation units is the SAME build.
+
+        config_hash identifies the compilation dialect.  Making it depend on
+        the file list meant adding one .c file minted a new build identity for
+        every unchanged TU, whose rows then had to be migrated to it — the
+        "reuse" path, which lost rows owned by headers.  Which files exist is
+        the manifest's job; whether one changed is files.source_hash's.
+        """
+        flags = ["gcc", "-std=c11", "-c"]
+        one = self._hash_for(tmp_path, "one.json", [
+            {"file": "a.c", "directory": str(tmp_path), "arguments": [*flags, "a.c"]},
+        ])
+        renamed = self._hash_for(tmp_path, "renamed.json", [
+            {"file": "b.c", "directory": str(tmp_path), "arguments": [*flags, "b.c"]},
+        ])
+        both = self._hash_for(tmp_path, "both.json", [
+            {"file": "a.c", "directory": str(tmp_path), "arguments": [*flags, "a.c"]},
+            {"file": "b.c", "directory": str(tmp_path), "arguments": [*flags, "b.c"]},
+        ])
+        assert renamed == one
+        assert both == one
 
 
 # ── Index statistics ─────────────────────────────────────────────────────────

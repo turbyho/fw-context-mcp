@@ -724,6 +724,10 @@ def _step_update_manifest(conn: sqlite3.Connection, ctx: dict) -> None:
          scope=ctx.get("scope"),
          reparsed_tus=ctx.get("reparsed_tus"),
      )
+    # Keep whichever manifest is now authoritative so the coverage purge does
+    # not have to re-read it.  A no-op run returns None and leaves the
+    # on-disk manifest (already loaded into ctx) current.
+    ctx["effective_manifest"] = updated_manifest or ctx.get("manifest")
     if updated_manifest is not None:
         _refresh_header_mtimes_from_manifest(
             conn,
@@ -733,6 +737,101 @@ def _step_update_manifest(conn: sqlite3.Connection, ctx: dict) -> None:
             vendor_patterns=ctx.get("vendor_patterns") or [],
             hash_cache=ctx.get("header_hash_cache"),
         )
+
+
+def _build_coverage_set(units: list, manifest: dict | None, project_root: Path) -> set[str] | None:
+    """Return the file paths that belong to this build, or None if unknown.
+
+    A file belongs to the build when it is a translation unit of the current
+    ``compile_commands.json``, or a header that one of those TUs includes.
+
+    The TU half comes from *units*, never from the manifest: when no TU was
+    re-parsed the manifest is not rewritten, so a TU dropped from the build
+    would still be listed there.  The header half can only come from the
+    manifest — it is the sole record of what each TU includes — and entries
+    are filtered to the current TUs so a dropped TU takes its headers with it
+    (unless another TU includes them too).
+
+    Returns ``None`` when the manifest cannot answer the header question: no
+    manifest, no entries, or entries carrying no header lists (a preliminary
+    manifest).  Purging on that basis would delete every header in the index.
+    """
+    if not manifest:
+        return None
+    entries = manifest.get("entries") or []
+    if not entries:
+        return None
+
+    tu_paths: set[str] = set()
+    for unit in units:
+        try:
+            tu_paths.add(str(unit.file.resolve().relative_to(project_root)))
+        except ValueError:
+            tu_paths.add(str(unit.file.resolve()))
+
+    covered = set(tu_paths)
+    saw_headers = False
+    for entry in entries:
+        if entry.get("file") not in tu_paths:
+            continue
+        headers = entry.get("headers") or []
+        if headers:
+            saw_headers = True
+        for h in headers:
+            covered.add(h["path"] if isinstance(h, dict) else h)
+
+    return covered if saw_headers else None
+
+
+def _step_purge_files_outside_build(conn: sqlite3.Connection, ctx: dict) -> None:
+    """Delete index rows for files that no longer belong to the build.
+
+    WHY this step exists: ``config_hash`` identifies the compilation dialect,
+    so dropping a source file from ``compile_commands.json`` no longer mints a
+    new build.  Nothing else notices the file left — ``purge_missing`` only
+    looks for files gone from DISK, and ``delete_orphan_files`` only removes
+    rows with no symbols, no macros and empty content.  Without this step a
+    removed TU keeps its symbols, macros, refs and file content forever.
+
+    The same guard as ``purge_missing`` applies: refuse to act when the set
+    looks implausibly large, which would mean the coverage data is wrong
+    rather than the index being stale.
+    """
+    config_hash = ctx["config_hash"]
+    covered = _build_coverage_set(
+        ctx["units"], ctx.get("effective_manifest"), ctx["project_root"]
+    )
+    if covered is None:
+        log.debug("coverage purge skipped: manifest carries no header lists")
+        return
+
+    rows = conn.execute(
+        "SELECT id, path FROM files WHERE config_hash = ?", (config_hash,)
+    ).fetchall()
+    stale = [(r["id"], r["path"]) for r in rows if r["path"] and r["path"] not in covered]
+    if not stale:
+        return
+
+    threshold_pct = ctx.get("purge_max_missing_percent", 20)
+    stale_pct = (len(stale) / len(rows)) * 100 if rows else 0
+    if stale_pct > threshold_pct:
+        log.warning(
+            "Coverage purge aborted: %d/%d files (%.1f%%) are outside the build "
+            "(threshold %d%%). The manifest's header lists are probably incomplete.",
+            len(stale), len(rows), stale_pct, threshold_pct,
+        )
+        return
+
+    from .db import purge_missing_files_batch
+
+    removed = purge_missing_files_batch(conn, config_hash, stale, db_dir=ctx["db_dir"])
+    preview = ", ".join(p for _, p in stale[:5])
+    if len(stale) > 5:
+        preview += f", … (+{len(stale) - 5} more)"
+    log.info(
+        "Purged %d file(s) no longer in the build, %d symbol(s): %s",
+        len(stale), removed, preview,
+    )
 
 
 def _resolve_matching_usr(
@@ -1178,6 +1277,10 @@ def _step_wal_checkpoint(conn: sqlite3.Connection, ctx: dict) -> None:
 #
 # Ordering constraints (why steps are in this exact order):
 #  • purge_missing MUST run before fts5 — FTS must not index ghost symbols.
+#  • coverage_purge MUST run after manifest — it needs the current header
+#    lists to know which files the build still includes.  It runs after fts5
+#    rather than before, which is safe: its deletes fire the symbols_ad /
+#    files_ad / macros_ad triggers, so the FTS indexes follow.
 #  • fts5 MUST run before embeddings and llm_analysis — both query FTS.
 #  • is_project MUST run before embeddings — embedding source selection
 #    depends on project/vendor classification.
@@ -1199,6 +1302,7 @@ _STEPS: list[tuple[str, Callable[..., None], Callable[..., bool] | None]] = [
     ("orphans",          _step_orphan_cleanup,     None),
     ("is_project",       _step_align_is_project,   None),
     ("manifest",         _step_update_manifest,    None),
+    ("coverage_purge",   _step_purge_files_outside_build, None),
     ("macros",           _step_expand_macros,      lambda c: c["index_macros_expanded"] and c["units"]),
     ("dispatch_edges",   _step_resolve_dispatches,  lambda c: c["index_refs"]),
     ("llm_analysis",     _step_llm_analysis,       lambda c: c["analyze_symbols"] and c["llm_config"] is not None and c["llm_config"].enabled),

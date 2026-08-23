@@ -29,8 +29,13 @@ import logging
 import time
 from pathlib import Path
 
-from fw_context_mcp.indexer.config_hash import compute_flags_hash
+from fw_context_mcp.indexer.compile_commands import _DROP_WITH_ARG, _SOURCE_EXTS
+from fw_context_mcp.indexer.config_hash import _TRANSIENT_DROP, compute_flags_hash
 from fw_context_mcp.utils import compute_source_hash
+
+# Object / dependency outputs.  A token with one of these suffixes is a build
+# product, never a flag that shapes the dialect.
+_OUTPUT_EXTS = frozenset({".o", ".obj", ".d", ".map", ".elf", ".bin", ".hex"})
 
 log = logging.getLogger(__name__)
 
@@ -396,38 +401,48 @@ def compute_config_hash(
     scope: list[str] | None = None,
     db_dir: Path | None = None,
 ) -> str:
-    """Return SHA-256 of the **normalized** compile_commands.json.
+    """Return SHA-256 of the build's **compilation dialect**.
 
-    WHY normalization: raw compile_commands.json is unstable — flag order,
-    absolute vs. relative paths, build-output directory names, and transient
-    ``-D`` macros (timestamps, build counters) change between builds even
-    when compilation semantics are identical.  Hashing the raw file would
-    trigger unnecessary full reindexes.  This function normalizes away
-    all non-semantic differences.
+    The hash answers exactly one question: *could the same source text compile
+    to something different now?*  Only two kinds of flag can change that
+    answer, so only those are hashed:
 
-    Instead of hashing the manifest dict (which created a circular dependency
-    and caused unnecessary config_hash churn when flag order changed), this
-    function normalizes the raw TU list directly:
+    1. ``-D`` macros — they flip ``#ifdef``, so they change which code exists.
+    2. Dialect / target flags (``-std``, ``-mcpu``, ``-f*``, ``-O*``, …) —
+       they change what the parser accepts and how it behaves.
 
-    1. Sort entries by *file* — removes TU order dependence.
-    2. Sort *arguments* alphabetically per entry — removes flag order dependence.
-    3. Normalize paths in path-bearing arguments (``-I``, ``-isystem``, etc.)
-       to be relative to *project_root*; paths outside the project are
-       resolved through ``Path.resolve()`` for symlink/collapse stability.
-    4. Drop arguments pointing into build-output directories
-       (detected via *build_dir_patterns* from the build system) so that
-       per-build temporary directories don't destabilize the hash.
-    5. Drop transient ``-D`` macros that vary per build (timestamps, build
-       IDs injected by the build system).
+    Everything else is deliberately excluded:
+
+    - **The translation-unit list.**  Which files exist is not build identity.
+      Including it meant adding one ``.c`` file minted a new identity for
+      every unchanged TU, and their rows then had to be migrated to it.  That
+      migration was the "reuse" tier, and it was incomplete: rows owned by a
+      header stayed under the old hash and retention deleted them.
+    - **Include search paths** (``-I``, ``-isystem``, ``-include``, …).  This
+      is where per-directory variance lives — HA_Boiler has 14 distinct
+      flag-sets but 208 distinct include paths.  A changed path is caught by
+      that TU's ``files.flags_hash`` (which expands response files, so it sees
+      real paths) and reparses the one TU.
+    - **Build-output paths**, whether they arrive as a path flag or embedded
+      in another flag, detected via *build_dir_patterns*.
+    - **Transient ``-D`` macros** (timestamps, build counters) — they change
+      every build without changing semantics.
+
+    Flag order and TU order do not matter: both accumulate into sets.
+
+    What detects real change is therefore split by scope: this hash for the
+    dialect, ``files.source_hash`` for content, ``files.flags_hash`` for a
+    TU's own flags, and the manifest entry list for which files belong to the
+    build at all.
 
     The canonical JSON is written to
     ``<db_dir>/<project_id>/compile_commands.<hash>.json``
     as a debug artifact — ``diff`` between two versions shows only
-    semantic differences, without flag-ordering or path-format noise.
+    semantic differences.
 
     Returns the *config_hash* hex string.
     """
-    # Path arguments whose value should be normalized
+    # Path-bearing flags — consumed and dropped, see the docstring.
     _PATH_PREFIXES = ("-I", "-isystem", "-idirafter", "-iquote", "-include", "-imacros")
     _PATH_EQ_PREFIXES = ("--sysroot=",)
 
@@ -450,23 +465,34 @@ def compute_config_hash(
     def _is_build_output(arg_value: str) -> bool:
         return any(marker in arg_value for marker in _markers)
 
-    def _normalize_path(arg_value: str) -> str:
-        """Resolve a path argument value relative to *project_root*.
+    def _is_dialect_token(token: str) -> bool:
+        """Does *token* belong to the build's compilation dialect?
 
-        Paths inside *project_root* become relative; paths outside are
-        resolved via ``Path.resolve()`` for symlink/``..`` collapse.
+        Callers hand over ``unit.clang_args``, which ``normalize_args``
+        already stripped of the source file and the output path.  This check
+        does not trust that: a filename slipping through would be neither a
+        ``-D`` nor a path-bearing flag, so it would land in *dialect* and put
+        the translation-unit list back into the hash — the exact coupling
+        this function exists to remove.  Keeping the guard local means the
+        property holds no matter what the caller passes.
         """
-        p = Path(arg_value)
-        if not p.is_absolute():
-            p = (project_root / p).resolve()
-        else:
-            p = p.resolve()
-        try:
-            return str(p.relative_to(project_root))
-        except ValueError:
-            return str(p)
+        if token in _TRANSIENT_DROP or token in _DROP_WITH_ARG:
+            return False
+        if _is_build_output(token):
+            # A build-output path can ride inside a non-path flag
+            # (-Wl,-Map=BUILD/x.map, -fprofile-dir=BUILD/...).  Those names
+            # change per build without changing semantics.
+            return False
+        suffix = Path(token).suffix.lower()
+        return suffix not in _SOURCE_EXTS and suffix not in _OUTPUT_EXTS
 
-    entries: list[dict] = []
+    # Accumulated across ALL translation units, deduplicated: a macro or
+    # dialect flag anywhere in the build is part of that build's identity,
+    # and it counts once no matter how many TUs carry it.  (Measured: FM has
+    # an identical -D set on all 216 TUs; HA_Boiler has exactly one macro
+    # that varies, ARDUINO_CORE_BUILD on 46 of 114.)
+    defines: set[str] = set()
+    dialect: set[str] = set()
     for unit in units:
         # ── Pre-pass: collapse space-separated -D NAME=VALUE → -DNAME=VALUE ──
         # Sorting alphabetically (next step) would separate "-D" from its value
@@ -510,20 +536,25 @@ def compute_config_hash(
             arg = args[i]
             handled = False
 
+            # ── Path-bearing flags are consumed and DROPPED ──
+            # The include search path is per-TU state, not build identity.
+            # Measured: HA_Boiler has 14 distinct flag-sets but 208 distinct
+            # include paths — the per-directory variance lives here.  A path
+            # change is caught by that TU's ``files.flags_hash``, which
+            # reparses the one TU instead of minting a new build.
+            #
+            # ``-include`` / ``-imacros`` are dropped too, even though the
+            # injected header defines macros: its CONTENT reaches every TU as
+            # an include, so the per-TU manifest header hash already covers a
+            # change to it.  Only its path is dropped, and a path alone is not
+            # a semantic difference.
             for prefix in _PATH_PREFIXES:
                 if arg == prefix and i + 1 < len(args):
-                    val = args[i + 1]
-                    if not _is_build_output(val):
-                        normalized_args.append(prefix)
-                        normalized_args.append(_normalize_path(val))
                     i += 2
                     handled = True
                     break
                 elif arg.startswith(prefix) and len(arg) > len(prefix):
                     # Concatenated form: -I/path/to/include
-                    val = arg[len(prefix):]
-                    if not _is_build_output(val):
-                        normalized_args.append(prefix + _normalize_path(val))
                     i += 1
                     handled = True
                     break
@@ -533,9 +564,6 @@ def compute_config_hash(
 
             for prefix in _PATH_EQ_PREFIXES:
                 if arg.startswith(prefix):
-                    val = arg[len(prefix):]
-                    if not _is_build_output(val):
-                        normalized_args.append(prefix + _normalize_path(val))
                     i += 1
                     handled = True
                     break
@@ -547,20 +575,36 @@ def compute_config_hash(
             normalized_args.append(arg)
             i += 1
 
-        try:
-            file_rel = str(unit.file.resolve().relative_to(project_root))
-        except ValueError:
-            file_rel = str(unit.file.resolve())
-
-        entries.append({"file": file_rel, "arguments": normalized_args})
-
-    # Sort entries by file path for deterministic ordering
-    entries.sort(key=lambda e: e["file"])
+        # Split this TU's surviving flags into the two things that define
+        # the compilation dialect.  The TU's own identity is deliberately
+        # NOT recorded — see the canonical dict below.
+        for token in normalized_args:
+            if token.startswith("-D"):
+                defines.add(token)
+            elif _is_dialect_token(token):
+                dialect.add(token)
 
     canonical: dict = {
-        "_format": "fw-context-cc/1",
+        # Bumped from /1, which keyed the hash on the per-TU {file, arguments}
+        # list.  Every existing index therefore gets one final reindex, which
+        # is intended: the old hashes describe a different question.
+        "_format": "fw-context-cc/2",
         "project_root": str(project_root),
-        "entries": entries,
+        # WHY only these two: config_hash answers "could the same source text
+        # compile to something different now?"  Macros flip #ifdef, and the
+        # standard / target / dialect flags change what the parser accepts.
+        # Nothing else can change the meaning of unchanged source.
+        #
+        # WHY the translation-unit list is absent: it made adding one .c file
+        # mint a new build identity for every unchanged TU, whose rows then
+        # had to be migrated to it.  That migration was the reuse tier, and it
+        # was incomplete — rows owned by a header stayed behind under the old
+        # hash and retention deleted them.  Which files exist is recorded in
+        # the manifest entries; whether one changed is answered by
+        # ``files.source_hash`` and ``files.flags_hash``; whether one left the
+        # build is answered by comparing the manifest to the files table.
+        "defines": sorted(defines),
+        "dialect": sorted(dialect),
     }
     if scope:
         canonical["scope"] = scope
