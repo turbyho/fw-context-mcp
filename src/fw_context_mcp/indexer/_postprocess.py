@@ -1104,7 +1104,7 @@ def cleanup_old_builds_multi(
 
     Returns the number of deleted builds.
     """
-    if PidFile.is_active(db_dir / "reindex.pause"):
+    if PidFile.is_active_other(db_dir / "reindex.pause"):
         return 0
     deleted = 0
     for variant, image in dict.fromkeys(touched_pairs):
@@ -1129,8 +1129,12 @@ def _step_cleanup_old_builds(conn: sqlite3.Connection, ctx: dict) -> None:
     the old hash's data is deleted to reclaim disk space.  Retention is scoped
     to the pair: builds of OTHER variants/images are preserved (multi-build).
 
-    The reindex-pause guard prevents deletion when a background reindex was
-    paused mid-stream: the old process's data is still the active index.
+    The reindex-pause guard prevents deletion when ANOTHER process paused a
+    background reindex mid-stream: that process's data is still the active
+    index.  It must test ``is_active_other``, not ``is_active`` — ``fw-context
+    index`` writes ``reindex.pause`` with its own PID for the whole run, so
+    the plain liveness check is always true here and retention never ran at
+    all: every reindex left its predecessor's build in the database forever.
     """
     config_hash = ctx["config_hash"]
     project_id = ctx["project_id"]
@@ -1138,7 +1142,7 @@ def _step_cleanup_old_builds(conn: sqlite3.Connection, ctx: dict) -> None:
     variant = ctx.get("variant", "")
     image = ctx.get("image", "")
 
-    if PidFile.is_active(db_dir / "reindex.pause"):
+    if PidFile.is_active_other(db_dir / "reindex.pause"):
         return
 
     _cleanup_old_for_pair(conn, project_id, db_dir, variant, image, config_hash)

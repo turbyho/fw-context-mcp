@@ -3365,3 +3365,113 @@ class TestHeaderScopedRowCleanup:
             )
         finally:
             conn.close()
+
+
+# ── Build retention ───────────────────────────────────────────────────
+
+
+def _add_tu_to_compile_commands(project_root: Path, name: str) -> None:
+    """Add one more translation unit to the project and its compile_commands.
+
+    ``config_hash`` is the SHA-256 of the normalised compile_commands.json, so
+    adding a TU changes it while leaving every existing TU's ``source_hash``
+    and ``flags_hash`` untouched.
+    """
+    import json
+
+    src = project_root / "src"
+    _write_file(src / name, f"int {Path(name).stem}_fn(void) {{ return 1; }}\n")
+    cc_json = project_root / "compile_commands.json"
+    cc = json.loads(cc_json.read_text(encoding="utf-8"))
+    cc.append({
+        "directory": str(src),
+        "file": name,
+        "arguments": [
+            "gcc", "-std=c11", "-O2", "-Isrc", "-c", name,
+            "-o", f"build/{Path(name).stem}.o",
+        ],
+    })
+    cc_json.write_text(json.dumps(cc, indent=2), encoding="utf-8")
+
+
+def _build_hashes(conn) -> list[str]:
+    """Return every config_hash in build_configs, oldest first."""
+    return [
+        r["config_hash"]
+        for r in conn.execute(
+            "SELECT config_hash FROM build_configs ORDER BY created_at, rowid"
+        ).fetchall()
+    ]
+
+
+@pytest.mark.libclang
+class TestBuildRetention:
+    """A reindex must not leave its predecessor's build in the database.
+
+    ``_step_cleanup_old_builds`` guards on the ``reindex.pause`` marker so it
+    never deletes a build another process is still serving.  It used to test
+    ``PidFile.is_active``, but ``fw-context index`` writes that marker with
+    its OWN pid for the whole run — so the guard was always true and
+    retention never ran once.  Every reindex silently kept the previous
+    build: symbols, macros, refs and file content, for every config_hash the
+    project ever had.
+    """
+
+    def test_old_build_is_deleted_after_a_config_change(self, c_project: Path):
+        """One build per (variant, image) slot survives a config_hash change."""
+        db_path = _db_path_for_project(c_project)
+        assert _index_cli(c_project).returncode == 0
+
+        conn = open_db(db_path)
+        try:
+            before = _build_hashes(conn)
+            assert len(before) == 1, f"expected one build after the first index, got {before}"
+        finally:
+            conn.close()
+
+        _add_tu_to_compile_commands(c_project, "extra.c")
+        result = _index_cli(c_project)
+        assert result.returncode == 0, result.stderr
+
+        conn = open_db(db_path)
+        try:
+            after = _build_hashes(conn)
+            assert len(after) == 1, (
+                f"retention did not run — old build(s) left behind: {after}\n"
+                + result.stderr[-2000:]
+            )
+            assert after[0] != before[0], "the surviving build should be the new one"
+        finally:
+            conn.close()
+
+    def test_old_build_leaves_no_rows_behind(self, c_project: Path):
+        """Deleting a build must take its rows with it, not just its row in
+        ``build_configs`` — otherwise the tables grow without bound."""
+        db_path = _db_path_for_project(c_project)
+        assert _index_cli(c_project).returncode == 0
+
+        conn = open_db(db_path)
+        try:
+            old_hash = _build_hashes(conn)[0]
+        finally:
+            conn.close()
+
+        _add_tu_to_compile_commands(c_project, "extra.c")
+        result = _index_cli(c_project)
+        assert result.returncode == 0, result.stderr
+
+        conn = open_db(db_path)
+        try:
+            leftovers = {
+                table: conn.execute(
+                    f"SELECT COUNT(*) FROM {table} WHERE config_hash=?",  # noqa: S608
+                    (old_hash,),
+                ).fetchone()[0]
+                for table in ("files", "symbols", "macros", "refs")
+            }
+            assert all(n == 0 for n in leftovers.values()), (
+                f"rows of the deleted build survived: {leftovers}\n"
+                + result.stderr[-2000:]
+            )
+        finally:
+            conn.close()

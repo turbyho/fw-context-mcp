@@ -130,6 +130,25 @@ class PidFile:
         return False
 
     @staticmethod
+    def is_active_other(path: Path) -> bool:
+        """Return ``True`` when *path* is held by a live OTHER process.
+
+        WHY this exists next to :meth:`is_active`: a pause marker written by
+        THIS process must not block this process's own work.  ``fw-context
+        index`` writes ``reindex.pause`` with its own PID for the whole run,
+        so a guard built on :meth:`is_active` is always true inside that run
+        and silently disables whatever it protects.
+
+        Use :meth:`is_active` to answer "is anyone paused?" and this to
+        answer "is someone ELSE paused?".  A guard that must not fire on our
+        own marker needs the latter.
+        """
+        if not PidFile.is_active(path):
+            return False
+        pid = PidFile.read_pid(path)
+        return pid is not None and pid != os.getpid()
+
+    @staticmethod
     def read_pid(path: Path) -> int | None:
         """Read a PID from *path*.
 
