@@ -774,11 +774,14 @@ def _build_coverage_set(units: list, manifest: dict | None, project_root: Path) 
     for entry in entries:
         if entry.get("file") not in tu_paths:
             continue
+        # Built from the per-TU lists, never from the manifest's shared
+        # headers map: an orphan left in the map by a re-parse that stopped
+        # including a header would keep that file inside coverage and the
+        # purge would never remove its rows.
         headers = entry.get("headers") or []
         if headers:
             saw_headers = True
-        for h in headers:
-            covered.add(h["path"] if isinstance(h, dict) else h)
+        covered.update(headers)
 
     return covered if saw_headers else None
 

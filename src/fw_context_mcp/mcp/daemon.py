@@ -358,15 +358,18 @@ def _is_source_file(path_str: str, build_patterns: list[str] | None = None) -> b
 
 
 def _load_build_patterns(db_dir: Path) -> list[str]:
-    """Load ``build_dir_patterns`` from manifest.json, returning [] on any error."""
+    """Load ``build_dir_patterns`` from manifest.json, returning [] on any error.
+
+    Reads the patterns without parsing the whole manifest — the file runs to
+    tens of megabytes and this needs one short list from it.  The daemon calls
+    this once at startup, so the cost was one-off rather than per query, but
+    there is no reason to pay it.
+    """
     try:
-        from ..indexer.manifest import load as load_manifest
-        manifest = load_manifest(db_dir)
-        if manifest:
-            return manifest.get("build_dir_patterns", [])
+        from ..indexer.manifest import load_build_dir_patterns_any
+        return load_build_dir_patterns_any(db_dir)
     except (OSError, ImportError, ValueError, KeyError):
-        pass
-    return []
+        return []
 
 
 def _cleanup_files(sock_path: Path, pid_file: Path) -> None:

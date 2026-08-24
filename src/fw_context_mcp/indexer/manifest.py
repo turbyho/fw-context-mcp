@@ -39,7 +39,103 @@ _OUTPUT_EXTS = frozenset({".o", ".obj", ".d", ".map", ".elf", ".bin", ".hex"})
 
 log = logging.getLogger(__name__)
 
-MANIFEST_FORMAT = "fw-context-manifest/1"
+# Bumped from /1, which repeated every header's hash and every TU's argument
+# list inside each entry.  On zbox that was 86 686 header records for 1 037
+# distinct files and 876 argument lists for 2 distinct ones — 52.45 MB, of
+# which 74% was duplication.  /2 keeps one ``headers`` map and one
+# ``arg_sets`` table and has each entry reference them.
+MANIFEST_FORMAT = "fw-context-manifest/2"
+
+def resolve_headers(entry: dict, header_table: dict[str, dict] | None) -> list[dict]:
+    """Resolve one entry's header paths into ``{path, hash, generated}`` dicts.
+
+    This is the only place that knows how the ``headers`` map and the per-TU
+    path list fit together.  Everything downstream keeps working with the
+    record shape it always had.
+
+    A path the map does not cover gets an empty hash, which every staleness
+    check reads as "changed".  The alternative — dropping it — would take the
+    file out of the coverage set and let the purge delete rows for a header
+    that is still included.  Erring towards one extra re-parse is cheap;
+    erring towards deletion is not.
+
+    Takes the table rather than the manifest so callers that carry the table
+    alone — the indexing loop passes it beside its ``{path: entry}`` lookup —
+    do not have to fake a manifest dict around it.
+    """
+    table = header_table or {}
+    resolved: list[dict] = []
+    for path in entry.get("headers") or ():
+        record = table.get(path)
+        if record is None:
+            resolved.append({"path": path, "hash": "", "generated": False})
+        else:
+            resolved.append({"path": path, **record})
+    return resolved
+
+
+def tu_headers(manifest: dict, entry: dict) -> list[dict]:
+    """Resolve one entry's headers against *manifest*'s shared table."""
+    return resolve_headers(entry, manifest.get("headers"))
+
+
+def fold_headers(
+    headers: list[dict] | list[str],
+    header_table: dict[str, dict],
+) -> list[str]:
+    """Fold header records into *header_table*, return the entry's path list.
+
+    The indexing loop collects ``{path, hash, generated}`` records per TU,
+    because that is what a single parse naturally produces.  The manifest
+    stores one record per distinct path.  This is the one place that converts
+    between the two.
+
+    Accepts a list of plain path strings unchanged, so an entry reused from a
+    previous manifest passes through without a special case at the call site.
+    A record whose path is already in the table wins over the stored one: it
+    was read during this run and is the newer of the two.
+    """
+    paths: list[str] = []
+    for item in headers:
+        if isinstance(item, str):
+            paths.append(item)
+            continue
+        path = item["path"]
+        paths.append(path)
+        header_table[path] = {
+            "hash": item.get("hash", ""),
+            "generated": item.get("generated", False),
+        }
+    return paths
+
+
+def tu_arguments(manifest: dict, entry: dict) -> list[str]:
+    """Resolve one entry's compiler arguments from the shared ``arg_sets``.
+
+    Returns an empty list when the index is out of range, which can only
+    happen for a hand-edited manifest — the writer and the reader are the same
+    module.
+    """
+    arg_sets = manifest.get("arg_sets") or []
+    index = entry.get("arg_set")
+    if isinstance(index, int) and 0 <= index < len(arg_sets):
+        return list(arg_sets[index])
+    return []
+
+
+def _intern_arguments(arguments: list[str], arg_sets: list[list[str]]) -> int:
+    """Return the index of *arguments* in *arg_sets*, appending it if new.
+
+    Linear search is deliberate: a project has a handful of distinct argument
+    lists (2 on zbox, 14 on HA_Boiler), so the scan is shorter than the cost
+    of hashing a 410-token list to key a dict.
+    """
+    for index, existing in enumerate(arg_sets):
+        if existing == arguments:
+            return index
+    arg_sets.append(arguments)
+    return len(arg_sets) - 1
+
 
 def _is_generated_header(header_path: str, build_dir_patterns: list[str] | None = None) -> bool:
     """Return True when *header_path* looks like a build-generated file.
@@ -55,8 +151,23 @@ def _is_generated_header(header_path: str, build_dir_patterns: list[str] | None 
 
 
 
-def _collect_headers_from_tokens(tu, project_root: Path, build_dir_patterns: list[str] | None = None) -> list[dict]:
-    """Collect included header paths and their SHA-256 hashes from libclang includes.
+def _collect_headers_from_tokens(
+    tu,
+    project_root: Path,
+    build_dir_patterns: list[str] | None = None,
+    header_table: dict[str, dict] | None = None,
+) -> list[str]:
+    """Collect the paths of the headers this TU includes, hashing each once.
+
+    Returns the paths as stored in the manifest.  The hash and the
+    ``generated`` flag go into *header_table*, keyed by path — a file included
+    by 300 TUs is hashed on the first TU that reaches it and looked up by the
+    other 299.  On zbox that is 1 037 hashes instead of 86 686.
+
+    Pass a fresh dict per manifest, not per TU; the table is the manifest's
+    ``headers`` section and must span every entry.  When *header_table* is
+    ``None`` a throwaway table is used, which only makes sense for a caller
+    that wants the path list alone.
 
     WHY libclang token stream: libclang's ``get_includes()`` returns the
     ACTUAL resolved header set after preprocessing — including files pulled
@@ -88,8 +199,10 @@ def _collect_headers_from_tokens(tu, project_root: Path, build_dir_patterns: lis
         log.debug("_collect_headers_from_tokens: parse failed for %s", tu.file.name)
         return []
 
+    if header_table is None:
+        header_table = {}
     seen: set[str] = set()
-    headers: list[dict] = []
+    headers: list[str] = []
 
     for inc in includes:
         abs_path = str(inc.include.name)
@@ -113,14 +226,12 @@ def _collect_headers_from_tokens(tu, project_root: Path, build_dir_patterns: lis
         except ValueError:
             rel = str(resolved)  # absolute path for files outside project tree
 
-        h = compute_source_hash(resolved)
-        headers.append(
-            {
-                "path": rel,
-                "hash": h,
+        headers.append(rel)
+        if rel not in header_table:
+            header_table[rel] = {
+                "hash": compute_source_hash(resolved),
                 "generated": _is_generated_header(rel, build_dir_patterns),
             }
-        )
 
     return headers
 
@@ -154,6 +265,9 @@ def generate(
     from fw_context_mcp.config.settings import derive_project_id
 
     entries: list[dict] = []
+    # Shared across every entry — see MANIFEST_FORMAT for why.
+    header_table: dict[str, dict] = {}
+    arg_sets: list[list[str]] = []
     t0 = time.monotonic()
 
     for unit in units:
@@ -164,12 +278,14 @@ def generate(
             source_rel = source_file
 
         source_hash = compute_source_hash(unit.file.resolve())
-        headers = _collect_headers_from_tokens(unit, project_root, build_dir_patterns)
+        headers = _collect_headers_from_tokens(
+            unit, project_root, build_dir_patterns, header_table
+        )
 
         entry: dict = {
             "file": source_rel,
             "directory": str(unit.directory) if unit.directory else str(project_root),
-            "arguments": unit.clang_args,
+            "arg_set": _intern_arguments(unit.clang_args, arg_sets),
             "source_hash": source_hash,
             "headers": headers,
             "flags_hash": compute_flags_hash(unit.raw_entry) if unit.raw_entry else "",
@@ -180,6 +296,8 @@ def generate(
         "_format": MANIFEST_FORMAT,
         "compile_commands_path": str(compile_commands_path),
         "project_root": str(project_root),
+        "arg_sets": arg_sets,
+        "headers": header_table,
         "entries": entries,
     }
     if macros:
@@ -200,11 +318,16 @@ def generate(
     manifest_path.write_text(manifest_json, encoding="utf-8")
 
     elapsed = time.monotonic() - t0
-    header_count = sum(len(e.get("headers", [])) for e in entries)
+    # Both numbers, because their ratio is the whole point of the /2 format:
+    # references are what /1 stored, distinct files are what /2 stores.
+    reference_count = sum(len(e.get("headers", [])) for e in entries)
     log.info(
-        "manifest.json written: %d TUs, %d headers, config_hash=%s  %s",
+        "manifest.json written: %d TUs, %d distinct headers (%d references), "
+        "%d arg sets, config_hash=%s  %s",
         len(entries),
-        header_count,
+        len(header_table),
+        reference_count,
+        len(arg_sets),
         config_hash[:12],
         f"{elapsed:.1f}s",
     )
@@ -262,6 +385,53 @@ def load_build_dir_patterns(db_dir: Path, config_hash: str) -> list[str]:
     return patterns
 
 
+def _read_manifest_file(manifest_path: Path) -> dict | None:
+    """Parse one manifest file, or return None when it is unusable.
+
+    A manifest written by an older format is rejected rather than migrated.
+    Its entries carry per-TU header records and argument lists that the /2
+    readers do not understand, and a silent misread would look like "this TU
+    has no headers" — which marks nothing stale and freezes the index.
+    Returning None makes the caller treat the build as un-indexed, and the
+    reindex that follows writes the current format.
+    """
+    try:
+        data = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError) as exc:
+        log.warning("Failed to load %s: %s", manifest_path.name, exc)
+        return None
+    if not isinstance(data, dict):
+        log.warning("Ignoring %s: not a JSON object", manifest_path.name)
+        return None
+    stored_format = data.get("_format")
+    if stored_format != MANIFEST_FORMAT:
+        log.info(
+            "Ignoring %s: format %r, this build reads %r",
+            manifest_path.name, stored_format, MANIFEST_FORMAT,
+        )
+        return None
+    return data
+
+
+def load_build_dir_patterns_any(db_dir: Path) -> list[str]:
+    """Return ``build_dir_patterns`` for the newest manifest in *db_dir*.
+
+    Same purpose as :func:`load_build_dir_patterns`, for the caller that does
+    not know the active config_hash yet — the file-watch daemon reads the
+    patterns before it has resolved a build.
+    """
+    try:
+        newest = max(
+            db_dir.glob("manifest.*.json"), key=lambda p: p.stat().st_mtime, default=None
+        )
+    except OSError:
+        return []
+    if newest is None:
+        return []
+    config_hash = newest.name.removeprefix("manifest.").removesuffix(".json")
+    return load_build_dir_patterns(db_dir, config_hash)
+
+
 def load(db_dir: Path, config_hash: str | None = None) -> dict | None:
     """Load the manifest for *config_hash* from *db_dir*, or None.
 
@@ -274,11 +444,7 @@ def load(db_dir: Path, config_hash: str | None = None) -> dict | None:
         manifest_path = _manifest_path(db_dir, config_hash)
         if not manifest_path.exists():
             return None
-        try:
-            return json.loads(manifest_path.read_text(encoding="utf-8"))
-        except (json.JSONDecodeError, OSError) as exc:
-            log.warning("Failed to load %s: %s", manifest_path.name, exc)
-            return None
+        return _read_manifest_file(manifest_path)
 
     candidates: list[Path] = []
     try:
@@ -290,10 +456,9 @@ def load(db_dir: Path, config_hash: str | None = None) -> dict | None:
     except OSError:
         return None
     for manifest_path in candidates:
-        try:
-            return json.loads(manifest_path.read_text(encoding="utf-8"))
-        except (json.JSONDecodeError, OSError) as exc:
-            log.warning("Failed to load %s: %s", manifest_path.name, exc)
+        data = _read_manifest_file(manifest_path)
+        if data is not None:
+            return data
     return None
 
 
@@ -357,6 +522,7 @@ def build_preliminary(
 
     # Build entries for the manifest file
     entries: list[dict] = []
+    arg_sets: list[list[str]] = []
     for unit in units:
         source_file = str(unit.file.resolve())
         try:
@@ -367,7 +533,7 @@ def build_preliminary(
         entries.append({
             "file": source_rel,
             "directory": str(unit.directory) if unit.directory else str(project_root),
-            "arguments": unit.clang_args,
+            "arg_set": _intern_arguments(unit.clang_args, arg_sets),
             "source_hash": "",
             "headers": [],
         })
@@ -376,6 +542,9 @@ def build_preliminary(
         "_format": MANIFEST_FORMAT,
         "compile_commands_path": str(compile_commands_path),
         "project_root": str(project_root),
+        "arg_sets": arg_sets,
+        # Empty until generate() runs — a preliminary manifest has no hashes.
+        "headers": {},
         "entries": entries,
     }
     if build_dir_patterns:
@@ -697,8 +866,15 @@ def check_tu_staleness(
     vendor_patterns: list[str],
     *,
     hash_cache: dict[str, str] | None = None,
+    headers: list[dict] | None = None,
 ) -> tuple[bool, str | None]:
     """Check whether a translation unit's source or project headers have changed.
+
+    *headers* are the entry's resolved header records from
+    :func:`tu_headers`.  It is a required argument in practice: the entry
+    itself only stores paths, so omitting it checks the source hash alone and
+    silently stops tracking headers.  It stays optional so a caller that
+    genuinely wants the source-only check can ask for it.
 
     WHY per-TU staleness: re-parsing every TU on every index run is wasteful
     when only a few source files changed.  This function enables incremental
@@ -732,7 +908,7 @@ def check_tu_staleness(
     # ── Check project header hashes ──
     # Vendor/SDK headers and headers outside project_root are trusted from
     # the manifest.  Only project headers inside project_root are re-hashed.
-    for h in entry.get("headers", []):
+    for h in headers or ():
         if h.get("generated"):
             continue  # build-generated headers are skipped
 
@@ -777,9 +953,9 @@ def collect_stale_headers(
     keep their stored hash and are never re-read.  Re-hashing thousands of
     SDK headers on every run would dominate index time.
 
-    Header paths are deduplicated, so a header shared by many TUs is hashed
-    once.  Pass *hash_cache* to share those hashes with the per-TU staleness
-    checks that follow.
+    Reads the manifest's ``headers`` map, which already holds each path once,
+    so a header shared by 300 TUs is checked once.  Pass *hash_cache* to share
+    those hashes with the per-TU staleness checks that follow.
 
     Returns the paths exactly as stored in the manifest, so the result can be
     fed straight into :func:`tus_affected_by_headers`.
@@ -787,34 +963,27 @@ def collect_stale_headers(
     from .sdk_detect import _path_matches
 
     stale: set[str] = set()
-    checked: set[str] = set()
 
-    for entry in manifest.get("entries", []):
-        for h in entry.get("headers", []):
-            header_path = h["path"]
-            if header_path in checked or header_path in stale:
-                continue
-            checked.add(header_path)
+    for header_path, record in (manifest.get("headers") or {}).items():
+        if record.get("generated"):
+            continue
 
-            if h.get("generated"):
-                continue
+        p = Path(header_path)
+        if not p.is_absolute():
+            p = (project_root / header_path).resolve()
 
-            p = Path(header_path)
-            if not p.is_absolute():
-                p = (project_root / header_path).resolve()
+        # Outside project_root → trust manifest (system/toolchain/external SDK)
+        try:
+            rel_path = str(p.relative_to(project_root))
+        except ValueError:
+            continue
 
-            # Outside project_root → trust manifest (system/toolchain/external SDK)
-            try:
-                rel_path = str(p.relative_to(project_root))
-            except ValueError:
-                continue
+        # Matches vendor pattern → trust manifest
+        if any(_path_matches(rel_path, pat) for pat in vendor_patterns):
+            continue
 
-            # Matches vendor pattern → trust manifest
-            if any(_path_matches(rel_path, pat) for pat in vendor_patterns):
-                continue
-
-            if _hash_with_cache(p, hash_cache) != h.get("hash", ""):
-                stale.add(header_path)
+        if _hash_with_cache(p, hash_cache) != record.get("hash", ""):
+            stale.add(header_path)
 
     return stale
 
@@ -832,10 +1001,9 @@ def tus_affected_by_headers(manifest: dict, stale_headers: set[str]) -> set[str]
         return set()
     affected: set[str] = set()
     for entry in manifest.get("entries", []):
-        for h in entry.get("headers", []):
-            if h["path"] in stale_headers:
-                affected.add(entry["file"])
-                break
+        # The per-TU list holds paths, so this is a plain membership test.
+        if any(path in stale_headers for path in entry.get("headers") or ()):
+            affected.add(entry["file"])
     return affected
 
 
@@ -843,16 +1011,49 @@ def update_entry(
     manifest: dict,
     entry_index: int,
     source_hash: str,
-    headers: list[dict],
+    headers: list[str],
+    header_records: dict[str, dict] | None = None,
 ) -> None:
     """Update a single translation unit's entry in the manifest in-place.
 
-    Called after a TU has been re-parsed — updates ``source_hash`` and
-    ``headers`` for the given entry index.
+    Called after a TU has been re-parsed — updates ``source_hash`` and the
+    entry's header path list.  *header_records* carries the ``{hash,
+    generated}`` records for those paths and is merged into the manifest's
+    shared ``headers`` map; a re-parse that discovered a header no other TU
+    has seen must contribute its record, or the path would resolve with an
+    empty hash and stay permanently stale.
+
+    Records already in the map are overwritten, because the re-parse just read
+    the file and its hash is the newer one.
     """
-    if entry_index < len(manifest.get("entries", [])):
-        manifest["entries"][entry_index]["source_hash"] = source_hash
-        manifest["entries"][entry_index]["headers"] = headers
+    entries = manifest.get("entries", [])
+    if entry_index >= len(entries):
+        return
+    entries[entry_index]["source_hash"] = source_hash
+    entries[entry_index]["headers"] = headers
+    if header_records:
+        manifest.setdefault("headers", {}).update(header_records)
+
+
+def prune_header_table(manifest: dict) -> int:
+    """Drop ``headers`` records no entry references, return how many.
+
+    A re-parse that stops including a header leaves its record behind.  The
+    coverage set is built from the per-TU lists, never from this map, so an
+    orphan cannot keep a removed file inside the build — but it would still
+    make the artifact claim a dependency that no longer exists, and it would
+    grow the map without bound across incremental runs.
+    """
+    table = manifest.get("headers")
+    if not table:
+        return 0
+    referenced: set[str] = set()
+    for entry in manifest.get("entries", []):
+        referenced.update(entry.get("headers") or ())
+    orphans = [path for path in table if path not in referenced]
+    for path in orphans:
+        del table[path]
+    return len(orphans)
 
 
 def save(manifest: dict, db_dir: Path, config_hash: str) -> str:
@@ -862,24 +1063,26 @@ def save(manifest: dict, db_dir: Path, config_hash: str) -> str:
     longer calls ``compute_config_hash()`` internally.  This removes the
     circular dependency between manifest content and config_hash.
     """
+    prune_header_table(manifest)
     manifest["config_hash"] = config_hash
     manifest_json = json.dumps(manifest, sort_keys=True, indent=2, ensure_ascii=False)
     _manifest_path(db_dir, config_hash).write_text(manifest_json, encoding="utf-8")
     return config_hash
 
 
-def get_manifest_entry_hash(entry: dict) -> str:
+def get_manifest_entry_hash(entry: dict, headers: list[dict] | None = None) -> str:
     """Return SHA-256 hash of a single manifest entry (source + headers).
 
     Used as the per-TU staleness hash (replaces the old deps_hash-based
     ``content_hash`` for Tier 2 checks).
+
+    *headers* are the entry's resolved records from :func:`tu_headers`.
+    Passing None hashes the source alone, which no longer detects a header
+    change — the entry stores paths, not hashes.
     """
     header_hashes = "".join(
         h.get("hash", "")
-        for h in sorted(
-            entry.get("headers", []),
-            key=lambda x: x.get("path", ""),
-        )
+        for h in sorted(headers or (), key=lambda x: x.get("path", ""))
     )
     source = entry.get("source_hash", "")
     return hashlib.sha256(f"{source}|{header_hashes}".encode()).hexdigest()
@@ -892,6 +1095,7 @@ def compute_current_entry_hash(
     *,
     new_source_hash: str | None = None,
     hash_cache: dict[str, str] | None = None,
+    headers: list[dict] | None = None,
 ) -> str:
     """Return the manifest entry hash computed from CURRENT disk content.
 
@@ -902,13 +1106,15 @@ def compute_current_entry_hash(
 
     *new_source_hash* overrides ``entry["source_hash"]`` when the source
     file content has also changed.
+
+    *headers* are the entry's resolved records from :func:`tu_headers`.
     """
     from .sdk_detect import _path_matches
 
     source = new_source_hash if new_source_hash else entry.get("source_hash", "")
 
     current_headers: list[dict] = []
-    for h in entry.get("headers", []):
+    for h in headers or ():
         if h.get("generated"):
             current_headers.append(dict(h))
             continue

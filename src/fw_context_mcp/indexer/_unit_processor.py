@@ -79,6 +79,7 @@ def _check_and_parse_unit(
     skip_files: set[str] | None = None,
     header_stale_tus: frozenset[str] = frozenset(),
     hash_cache: dict[str, str] | None = None,
+    header_table: dict[str, dict] | None = None,
 ):
     """Check whether *unit* needs re-parsing and parse it if so.
 
@@ -172,6 +173,7 @@ def _check_and_parse_unit(
         vendor_patterns,
         manifest,
         hash_cache=hash_cache,
+        header_table=header_table,
     )
 
     content_hash = compute_tu_content_hash(source_hash, flags_hash, manifest_entry_hash)
@@ -218,6 +220,7 @@ def _get_manifest_entry_hash_for_unit(
     manifest_lookup: dict[str, dict] | None,
     *,
     hash_cache: dict[str, str] | None = None,
+    header_table: dict[str, dict] | None = None,
 ) -> str:
     """Return the manifest entry hash for a TU for Tier 2 staleness comparison.
 
@@ -227,8 +230,12 @@ def _get_manifest_entry_hash_for_unit(
 
     When *manifest_lookup* is ``None``, falls back to a source-only hash
     (no header tracking possible).
+
+    *header_table* is the manifest's shared ``headers`` map.  The entries hold
+    header paths only; without the table they resolve to empty hashes and
+    every TU reads as stale.
     """
-    from .manifest import check_tu_staleness, compute_current_entry_hash
+    from .manifest import check_tu_staleness, compute_current_entry_hash, resolve_headers
     from .manifest import get_manifest_entry_hash as _entry_hash
 
     # ── Manifest path (fast — no libclang, O(1) lookup) ──
@@ -240,11 +247,13 @@ def _get_manifest_entry_hash_for_unit(
 
         entry = manifest_lookup.get(tu_rel)
         if entry is not None:
+            headers = resolve_headers(entry, header_table)
             stale, current_source_hash = check_tu_staleness(
-                entry, project_root, vendor_patterns, hash_cache=hash_cache
+                entry, project_root, vendor_patterns,
+                hash_cache=hash_cache, headers=headers,
             )
             if not stale:
-                return _entry_hash(entry)
+                return _entry_hash(entry, headers)
             # Stale — compute hash from CURRENT disk content (both source and headers)
             return compute_current_entry_hash(
                 entry,
@@ -252,6 +261,7 @@ def _get_manifest_entry_hash_for_unit(
                 vendor_patterns,
                 new_source_hash=current_source_hash,
                 hash_cache=hash_cache,
+                headers=headers,
             )
 
     # ── Fallback: source-only hash (no manifest, no header tracking) ──

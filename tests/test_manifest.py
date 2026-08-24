@@ -6,6 +6,8 @@ import json
 import os
 from pathlib import Path
 
+from fw_context_mcp.indexer.manifest import MANIFEST_FORMAT
+
 
 class TestManifestEntryHash:
     def test_empty_entry(self):
@@ -26,9 +28,31 @@ class TestManifestEntryHash:
     def test_different_headers_produce_different_hash(self):
         from fw_context_mcp.indexer.manifest import get_manifest_entry_hash
 
-        e1 = {"source_hash": "abc", "headers": [{"path": "a.h", "hash": "111"}]}
-        e2 = {"source_hash": "abc", "headers": [{"path": "a.h", "hash": "222"}]}
-        assert get_manifest_entry_hash(e1) != get_manifest_entry_hash(e2)
+        entry = {"source_hash": "abc", "headers": ["a.h"]}
+        h1 = get_manifest_entry_hash(entry, [{"path": "a.h", "hash": "111"}])
+        h2 = get_manifest_entry_hash(entry, [{"path": "a.h", "hash": "222"}])
+        assert h1 != h2
+
+    def test_resolved_headers_are_what_the_hash_sees(self):
+        """The entry alone cannot distinguish two header states.
+
+        Entries store paths; the hashes live in the manifest's shared table.
+        Hashing the entry without its resolved records would make every header
+        change invisible, so this asserts the resolved form is what counts.
+        """
+        from fw_context_mcp.indexer.manifest import (
+            get_manifest_entry_hash,
+            tu_headers,
+        )
+
+        entry = {"source_hash": "abc", "headers": ["a.h"]}
+        before = {"headers": {"a.h": {"hash": "111", "generated": False}}}
+        after = {"headers": {"a.h": {"hash": "222", "generated": False}}}
+        assert get_manifest_entry_hash(entry, tu_headers(before, entry)) != (
+            get_manifest_entry_hash(entry, tu_headers(after, entry))
+        )
+        # Without the records the two states collapse into one hash.
+        assert get_manifest_entry_hash(entry) == get_manifest_entry_hash(entry)
 
 
 class TestComputeConfigHash:
@@ -176,19 +200,21 @@ class TestSaveAndLoad:
         from fw_context_mcp.indexer.manifest import compute_config_hash, load, save
 
         manifest = {
-            "_format": "fw-context-manifest/1",
+            "_format": MANIFEST_FORMAT,
             "project_root": str(tmp_path),
             "compile_commands_path": str(tmp_path / "compile_commands.json"),
+            "arg_sets": [["gcc", "-c", "src/main.cpp"]],
+            "headers": {
+                "src/config.h": {"hash": "def456", "generated": False},
+                "build/mbed_config.h": {"hash": "ghi789", "generated": True},
+            },
             "entries": [
                 {
                     "file": "src/main.cpp",
                     "directory": str(tmp_path),
-                    "arguments": ["gcc", "-c", "src/main.cpp"],
+                    "arg_set": 0,
                     "source_hash": "abc123",
-                    "headers": [
-                        {"path": "src/config.h", "hash": "def456", "generated": False},
-                        {"path": "build/mbed_config.h", "hash": "ghi789", "generated": True},
-                    ],
+                    "headers": ["src/config.h", "build/mbed_config.h"],
                 }
             ],
         }
@@ -204,15 +230,53 @@ class TestSaveAndLoad:
 
         loaded = load(tmp_path)
         assert loaded is not None
-        assert loaded["_format"] == "fw-context-manifest/1"
+        assert loaded["_format"] == MANIFEST_FORMAT
         assert len(loaded["entries"]) == 1
         assert loaded["entries"][0]["file"] == "src/main.cpp"
+        # The shared tables survive the round trip and still resolve.
+        from fw_context_mcp.indexer.manifest import tu_arguments, tu_headers
+
+        entry = loaded["entries"][0]
+        assert tu_arguments(loaded, entry) == ["gcc", "-c", "src/main.cpp"]
+        assert tu_headers(loaded, entry) == [
+            {"path": "src/config.h", "hash": "def456", "generated": False},
+            {"path": "build/mbed_config.h", "hash": "ghi789", "generated": True},
+        ]
 
     def test_load_nonexistent(self, tmp_path: Path):
         from fw_context_mcp.indexer.manifest import load
 
         loaded = load(tmp_path)
         assert loaded is None
+
+    def test_a_manifest_from_an_older_format_is_ignored(self, tmp_path: Path):
+        """An unreadable manifest must read as absent, not as empty.
+
+        A /1 manifest keeps its header records inside each entry.  Handing it
+        to a /2 reader would resolve every path against a missing table, and
+        the entry would look like a TU with no headers — nothing marks stale
+        and the index freezes.  Returning None sends the caller down the
+        reindex path instead.
+        """
+        import json
+
+        from fw_context_mcp.indexer.manifest import load
+
+        legacy = {
+            "_format": "fw-context-manifest/1",
+            "project_root": str(tmp_path),
+            "entries": [{
+                "file": "src/main.cpp",
+                "arguments": ["gcc"],
+                "source_hash": "abc",
+                "headers": [{"path": "src/a.h", "hash": "111", "generated": False}],
+            }],
+        }
+        (tmp_path / "manifest.deadbeef.json").write_text(
+            json.dumps(legacy), encoding="utf-8"
+        )
+        assert load(tmp_path, "deadbeef") is None
+        assert load(tmp_path) is None
 
 
 class TestCheckTuStaleness:
@@ -256,7 +320,7 @@ class TestCheckTuStaleness:
     def test_project_header_changed(self, tmp_path: Path):
         import hashlib
 
-        from fw_context_mcp.indexer.manifest import check_tu_staleness
+        from fw_context_mcp.indexer.manifest import check_tu_staleness, tu_headers
 
         # Create source file
         src = tmp_path / "src" / "main.cpp"
@@ -269,14 +333,20 @@ class TestCheckTuStaleness:
         header.write_text("// original config")
         old_header_hash = hashlib.sha256(b"// different content").hexdigest()
 
-        entry = {
-            "file": "src/main.cpp",
-            "source_hash": source_hash,
-            "headers": [
-                {"path": "src/config.h", "hash": old_header_hash, "generated": False},
-            ],
+        manifest = {
+            "headers": {
+                "src/config.h": {"hash": old_header_hash, "generated": False},
+            },
+            "entries": [{
+                "file": "src/main.cpp",
+                "source_hash": source_hash,
+                "headers": ["src/config.h"],
+            }],
         }
-        stale, _ = check_tu_staleness(entry, tmp_path, [])
+        entry = manifest["entries"][0]
+        stale, _ = check_tu_staleness(
+            entry, tmp_path, [], headers=tu_headers(manifest, entry)
+        )
         assert stale is True  # header hash differs
 
     def test_generated_header_skipped(self, tmp_path: Path):
@@ -344,15 +414,49 @@ class TestCollectHeadersFromTokens:
             clang_args = ["-std=c++14", "-I" + str(tmp_path / "src")]
 
         unit = FakeUnit()
-        headers = _collect_headers_from_tokens(unit, tmp_path)
+        header_table: dict[str, dict] = {}
+        headers = _collect_headers_from_tokens(unit, tmp_path, None, header_table)
+
+        # Paths come back; the hash and the generated flag land in the table.
         assert isinstance(headers, list)
-        # Should find at least the included config.h header
-        for h in headers:
-            assert "path" in h
-            assert "hash" in h
-            assert "generated" in h
+        assert all(isinstance(path, str) for path in headers)
         assert len(headers) > 0
-        assert any("config.h" in h["path"] for h in headers)
+        assert any("config.h" in path for path in headers)
+        assert set(headers) == set(header_table)
+        for record in header_table.values():
+            assert "hash" in record
+            assert "generated" in record
+
+    def test_a_shared_header_is_hashed_once(self, tmp_path: Path):
+        """Two TUs including the same header produce one table record.
+
+        This is what makes the manifest 74% smaller on zbox: the old shape
+        stored one record per (TU, header) pair — 86 686 of them for 1 037
+        files.
+        """
+        from fw_context_mcp.indexer.manifest import _collect_headers_from_tokens
+
+        src_dir = tmp_path / "src"
+        src_dir.mkdir(parents=True, exist_ok=True)
+        (src_dir / "config.h").write_text("// config header")
+        first = src_dir / "a.cpp"
+        first.write_text('#include "config.h"\nint a() { return 0; }')
+        second = src_dir / "b.cpp"
+        second.write_text('#include "config.h"\nint b() { return 0; }')
+
+        header_table: dict[str, dict] = {}
+        args = ["-std=c++14", "-I" + str(src_dir)]
+        for source in (first, second):
+            class FakeUnit:
+                file = source
+                clang_args = args
+
+            paths = _collect_headers_from_tokens(
+                FakeUnit(), tmp_path, None, header_table
+            )
+            assert "src/config.h" in paths
+
+        assert len([p for p in header_table if p.endswith("config.h")]) == 1
 
 
 class TestIsGeneratedHeader:
@@ -404,18 +508,28 @@ class TestCollectStaleHeaders:
 
     @staticmethod
     def _manifest(tmp_path: Path, headers: list[dict], *, tu: str = "src/main.cpp") -> dict:
+        """Build a manifest from header records, in the stored /2 shape.
+
+        The tests express their input as records because that is what a parse
+        produces; fold_headers puts them where the manifest keeps them.
+        """
         import hashlib
+
+        from fw_context_mcp.indexer.manifest import fold_headers
 
         src = tmp_path / tu
         src.parent.mkdir(parents=True, exist_ok=True)
         src.write_text("int main() { return 0; }")
+        header_table: dict[str, dict] = {}
+        paths = fold_headers(headers, header_table)
         return {
             "project_root": str(tmp_path),
+            "headers": header_table,
             "entries": [
                 {
                     "file": tu,
                     "source_hash": hashlib.sha256(src.read_bytes()).hexdigest(),
-                    "headers": headers,
+                    "headers": paths,
                 }
             ],
         }
@@ -502,8 +616,8 @@ class TestCollectStaleHeaders:
 
         manifest = {
             "entries": [
-                {"file": "src/main.cpp", "headers": [{"path": "src/config.h"}]},
-                {"file": "src/other.cpp", "headers": [{"path": "src/util.h"}]},
+                {"file": "src/main.cpp", "headers": ["src/config.h"]},
+                {"file": "src/other.cpp", "headers": ["src/util.h"]},
             ]
         }
         assert tus_affected_by_headers(manifest, {"src/config.h"}) == {"src/main.cpp"}
@@ -537,15 +651,18 @@ class TestManifestEntryRefreshGuard:
 
         unit = self._unit(tmp_path, "src/main.cpp")
         manifest = {
+            "_format": MANIFEST_FORMAT,
             "project_root": str(tmp_path),
+            "arg_sets": [list(unit.clang_args)],
+            "headers": {"src/config.h": {"hash": "STORED", "generated": False}},
             "entries": [
                 {
                     "file": "src/main.cpp",
                     "directory": str(tmp_path),
-                    "arguments": unit.clang_args,
+                    "arg_set": 0,
                     "source_hash": "stored-source",
                     "flags_hash": "stored-flags",
-                    "headers": [{"path": "src/config.h", "hash": "STORED", "generated": False}],
+                    "headers": ["src/config.h"],
                 }
             ],
         }
@@ -561,29 +678,53 @@ class TestManifestEntryRefreshGuard:
             reparsed_tus=reparsed,
         )
 
+    @staticmethod
+    def _stored_hash(result: dict) -> str:
+        """The hash the first entry's only header resolves to."""
+        from fw_context_mcp.indexer.manifest import tu_headers
+
+        headers = tu_headers(result, result["entries"][0])
+        assert len(headers) == 1, f"expected one header, got {headers}"
+        return headers[0]["hash"]
+
     def test_not_reparsed_keeps_stored_hash(self, tmp_path: Path):
         (tmp_path / "index").mkdir()
         # updated_count=1 → another TU was re-parsed, so the rebuild path runs,
         # but src/main.cpp itself was not re-parsed.
         result = self._run(tmp_path, updated_count=1, reparsed=set())
         assert result is not None
-        assert result["entries"][0]["headers"][0]["hash"] == "STORED"
+        assert self._stored_hash(result) == "STORED"
 
     def test_reparsed_takes_fresh_hash(self, tmp_path: Path):
         (tmp_path / "index").mkdir()
         result = self._run(tmp_path, updated_count=1, reparsed={"src/main.cpp"})
         assert result is not None
-        assert result["entries"][0]["headers"][0]["hash"] == "FRESH"
+        assert self._stored_hash(result) == "FRESH"
 
     def test_nothing_reparsed_returns_manifest_untouched(self, tmp_path: Path):
         """updated_count=0 → no rewrite at all, even with collected headers."""
         (tmp_path / "index").mkdir()
         result = self._run(tmp_path, updated_count=0, reparsed=set())
         assert result is not None
-        assert result["entries"][0]["headers"][0]["hash"] == "STORED"
+        assert self._stored_hash(result) == "STORED"
         assert not list((tmp_path / "index").glob("manifest.*.json")), (
             "manifest file was written for a run that re-parsed nothing"
         )
+
+    def test_a_reused_entry_keeps_pointing_at_its_own_arguments(self, tmp_path: Path):
+        """``arg_set`` is an index, so a carried-over entry must be re-interned.
+
+        The rebuild starts a fresh ``arg_sets`` table.  Copying an entry with
+        its old index would silently attach it to whatever argument list
+        happens to sit at that position, or to none at all.
+        """
+        from fw_context_mcp.indexer.manifest import tu_arguments
+
+        (tmp_path / "index").mkdir()
+        result = self._run(tmp_path, updated_count=1, reparsed=set())
+        assert result is not None
+        entry = result["entries"][0]
+        assert tu_arguments(result, entry) == ["gcc", "-c", "src/main.cpp"]
 
 
 class TestLoadBuildDirPatterns:
@@ -606,7 +747,7 @@ class TestLoadBuildDirPatterns:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(
             json.dumps({
-                "_format": "fw-context-manifest/1",
+                "_format": MANIFEST_FORMAT,
                 "config_hash": config_hash,
                 "project_root": str(db_dir),
                 "build_dir_patterns": patterns,

@@ -3868,8 +3868,7 @@ def _manifest_header_paths(db_path: Path) -> set[str]:
     data = json.loads(manifests[0].read_text(encoding="utf-8"))
     paths: set[str] = set()
     for entry in data.get("entries") or []:
-        for h in entry.get("headers") or []:
-            paths.add(h["path"] if isinstance(h, dict) else h)
+        paths.update(entry.get("headers") or [])
     return paths
 
 

@@ -1115,6 +1115,7 @@ def _update_manifest_after_reindex(
 
         from ...indexer.manifest import (
             _collect_headers_from_tokens,
+            _intern_arguments,
             update_entry,
         )
         from ...indexer.manifest import (
@@ -1126,7 +1127,13 @@ def _update_manifest_after_reindex(
         manifest_data = load_manifest(db_dir, config_hash)
         if manifest_data is not None:
             for unit, _parsed in parsed_units:
-                headers = _collect_headers_from_tokens(unit, root, build_dir_patterns=None)
+                # Records go into a per-unit table and are merged by
+                # update_entry, so a header this re-parse is the first to see
+                # still contributes its hash to the manifest's shared map.
+                header_records: dict[str, dict] = {}
+                headers = _collect_headers_from_tokens(
+                    unit, root, None, header_records
+                )
                 source_hash = compute_source_hash(unit.file.resolve())
                 try:
                     tu_rel = str(unit.file.resolve().relative_to(root))
@@ -1134,13 +1141,19 @@ def _update_manifest_after_reindex(
                     tu_rel = str(unit.file.resolve())
                 for idx, entry in enumerate(manifest_data.get("entries", [])):
                     if entry.get("file") == tu_rel:
-                        update_entry(manifest_data, idx, source_hash, headers)
+                        update_entry(
+                            manifest_data, idx, source_hash, headers, header_records
+                        )
                         break
                 else:
+                    manifest_data.setdefault("headers", {}).update(header_records)
                     manifest_data.setdefault("entries", []).append({
                         "file": tu_rel,
                         "directory": str(unit.directory) if unit.directory else str(root),
-                        "arguments": unit.clang_args,
+                        "arg_set": _intern_arguments(
+                            unit.clang_args,
+                            manifest_data.setdefault("arg_sets", []),
+                        ),
                         "source_hash": source_hash,
                         "headers": headers,
                     })

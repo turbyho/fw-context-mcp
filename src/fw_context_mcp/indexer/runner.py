@@ -315,6 +315,11 @@ def run(
     if manifest is not None:
         for e in manifest.get("entries", []):
             manifest_lookup[e.get("file", "")] = e
+    # The entries hold header paths; their hashes live in this shared map.
+    # Both travel together into the staleness checks.
+    manifest_header_table: dict[str, dict] = (
+        dict(manifest.get("headers") or {}) if manifest is not None else {}
+    )
 
     # ── Header staleness pre-pass ──
     # A header is not a translation unit, so editing one leaves the mtime and
@@ -479,6 +484,7 @@ def run(
             skip_files=skip_files,
             header_stale_tus=header_stale_tus,
             hash_cache=header_hash_cache,
+            header_table=manifest_header_table,
         )
 
         # Snapshot the skip set BEFORE folding in this TU's own files.

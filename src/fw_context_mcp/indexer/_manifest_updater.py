@@ -37,6 +37,8 @@ def _mtime_bump_is_safe(
     vendor_patterns: list[str],
     hash_cache: dict[str, str] | None,
 ) -> bool:
+    # *header* is a manifest ``headers`` record: {hash, generated}.  The path
+    # is passed separately as *resolved* because the record is keyed by it.
     """Return True when the stored mtime may be moved forward for this header.
 
     Only content-identical headers qualify.  Bumping the mtime of a header
@@ -105,32 +107,28 @@ def _refresh_header_mtimes_from_manifest(
         return 0
     vendor_patterns = vendor_patterns or []
     refreshed = 0
-    seen: set[str] = set()
-    for entry in manifest.get("entries", []):
-        for h in entry.get("headers", []):
-            # A header shared by many TUs only needs one stat + hash check.
-            if h["path"] in seen:
-                continue
-            seen.add(h["path"])
-            # Resolve absolute path for stat() — h["path"] may be relative
-            p = Path(h["path"])
-            if not p.is_absolute():
-                p_resolved = (project_root / p).resolve()
-            else:
-                p_resolved = p.resolve()
-            try:
-                cur_mtime = p_resolved.stat().st_mtime
-            except OSError:
-                continue
-            if not _mtime_bump_is_safe(p_resolved, h, project_root, vendor_patterns, hash_cache):
-                continue  # content really changed — the stale signal must survive
-            # Use the manifest path directly — it already matches files.path format
-            cur_obj = conn.execute(
-                "UPDATE files SET mtime=? WHERE config_hash=? AND path=? AND mtime < ?",
-                (cur_mtime, config_hash, h["path"], cur_mtime),
-            )
-            if cur_obj.rowcount:
-                refreshed += 1
+    # The manifest's headers map already holds each path once, so there is no
+    # per-TU loop and no dedup set to maintain.
+    for header_path, record in (manifest.get("headers") or {}).items():
+        # Resolve absolute path for stat() — the stored path may be relative
+        p = Path(header_path)
+        if not p.is_absolute():
+            p_resolved = (project_root / p).resolve()
+        else:
+            p_resolved = p.resolve()
+        try:
+            cur_mtime = p_resolved.stat().st_mtime
+        except OSError:
+            continue
+        if not _mtime_bump_is_safe(p_resolved, record, project_root, vendor_patterns, hash_cache):
+            continue  # content really changed — the stale signal must survive
+        # Use the manifest path directly — it already matches files.path format
+        cur_obj = conn.execute(
+            "UPDATE files SET mtime=? WHERE config_hash=? AND path=? AND mtime < ?",
+            (cur_mtime, config_hash, header_path, cur_mtime),
+        )
+        if cur_obj.rowcount:
+            refreshed += 1
     if refreshed:
         log.info("header mtimes refreshed from manifest: %d", refreshed)
     return refreshed
@@ -179,7 +177,7 @@ def _update_manifest_after_index(
 
     Returns the updated manifest dict, or ``None`` when no update needed.
     """
-    from .manifest import MANIFEST_FORMAT, _collect_headers_from_tokens, save
+    from .manifest import MANIFEST_FORMAT, _collect_headers_from_tokens, _intern_arguments, save
 
     # No TU was re-parsed — keep the existing manifest as-is, provided:
     #   - the TU list hasn't changed (same number of entries), and
@@ -214,8 +212,29 @@ def _update_manifest_after_index(
     # ── Build/update manifest entries ──
     # Priority: 1) tu_headers (pre-collected during main loop — no extra I/O),
     # 2) old manifest entries (unchanged), 3) libclang tokenization (slow fallback).
+    from .manifest import fold_headers, tu_arguments
     from .manifest import generate as generate_manifest
     from .manifest import load as reload_manifest
+
+    # The manifest's two shared tables.  The header table is seeded from the
+    # previous manifest so an entry carried over unchanged keeps the records
+    # its path list points at; save() prunes whatever ends up unreferenced.
+    header_table: dict[str, dict] = dict(manifest.get("headers") or {}) if manifest else {}
+    arg_sets: list[list[str]] = []
+
+    def carry_over(old_entry: dict) -> dict:
+        """Re-point a reused entry at THIS manifest's arg_sets table.
+
+        ``arg_set`` is an index into the table of the manifest it was written
+        for.  Copying the entry without re-interning would leave the index
+        pointing at a different argument list, or past the end of the new
+        table — the reason this is a function and not an append.
+        """
+        carried = dict(old_entry)
+        carried["arg_set"] = _intern_arguments(
+            tu_arguments(manifest or {}, old_entry), arg_sets
+        )
+        return carried
 
     if tu_headers is not None:
         # Use pre-collected header hashes from _build_filtered_file_content.
@@ -243,24 +262,26 @@ def _update_manifest_after_index(
                     {
                         "file": tu_rel,
                         "directory": str(unit.directory) if unit.directory else str(project_root),
-                        "arguments": unit.clang_args,
+                        "arg_set": _intern_arguments(unit.clang_args, arg_sets),
                         "source_hash": source_hash,
-                        "headers": tu_headers[tu_rel],
+                        "headers": fold_headers(tu_headers[tu_rel], header_table),
                         "flags_hash": compute_flags_hash(unit.raw_entry) if unit.raw_entry else "",
                     }
                 )
                 updated += 1
             elif tu_rel in old_entries:
-                entries.append(old_entries[tu_rel])
+                entries.append(carry_over(old_entries[tu_rel]))
                 reused += 1
             else:
-                headers = _collect_headers_from_tokens(unit, project_root, build_dir_patterns)
+                headers = _collect_headers_from_tokens(
+                    unit, project_root, build_dir_patterns, header_table
+                )
                 source_hash = compute_source_hash(unit.file.resolve())
                 entries.append(
                     {
                         "file": tu_rel,
                         "directory": str(unit.directory) if unit.directory else str(project_root),
-                        "arguments": unit.clang_args,
+                        "arg_set": _intern_arguments(unit.clang_args, arg_sets),
                         "source_hash": source_hash,
                         "headers": headers,
                         "flags_hash": compute_flags_hash(unit.raw_entry) if unit.raw_entry else "",
@@ -288,16 +309,18 @@ def _update_manifest_after_index(
                 tu_rel = str(unit.file.resolve())
 
             if tu_rel in old_entries:
-                entries.append(old_entries[tu_rel])
+                entries.append(carry_over(old_entries[tu_rel]))
                 reused += 1
             else:
-                headers = _collect_headers_from_tokens(unit, project_root, build_dir_patterns)
+                headers = _collect_headers_from_tokens(
+                    unit, project_root, build_dir_patterns, header_table
+                )
                 source_hash = compute_source_hash(unit.file.resolve())
                 entries.append(
                     {
                         "file": tu_rel,
                         "directory": str(unit.directory) if unit.directory else str(project_root),
-                        "arguments": unit.clang_args,
+                        "arg_set": _intern_arguments(unit.clang_args, arg_sets),
                         "source_hash": source_hash,
                         "headers": headers,
                         "flags_hash": compute_flags_hash(unit.raw_entry) if unit.raw_entry else "",
@@ -311,6 +334,8 @@ def _update_manifest_after_index(
         "_format": MANIFEST_FORMAT,
         "compile_commands_path": str(compile_commands),
         "project_root": str(project_root),
+        "arg_sets": arg_sets,
+        "headers": header_table,
         "entries": entries,
     }
     # Preserve build_dir_patterns across incremental updates
@@ -328,8 +353,13 @@ def _update_manifest_after_index(
 
         config_hash = _compute_cc_hash(units, project_root, _derive_id(project_root), build_dir_patterns, scope=scope, db_dir=db_dir)
     config_hash = save(manifest_data, db_dir, config_hash)
-    header_count = sum(len(e.get("headers", [])) for e in entries)
-    log.info("manifest.json saved: %d TUs, %d headers, config_hash=%s", len(entries), header_count, config_hash[:12])
+    log.info(
+        "manifest.json saved: %d TUs, %d distinct headers (%d references), config_hash=%s",
+        len(entries),
+        len(manifest_data.get("headers") or {}),
+        sum(len(e.get("headers", [])) for e in entries),
+        config_hash[:12],
+    )
     return manifest_data
 
 

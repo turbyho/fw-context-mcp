@@ -325,7 +325,7 @@ def _check_header_staleness(
             if time.monotonic() - ts < _CACHE_TTL_S:
                 return count, []
 
-    from ...indexer.manifest import check_tu_staleness
+    from ...indexer.manifest import check_tu_staleness, resolve_headers
     from ...indexer.manifest import load as load_manifest
     from ...indexer.sdk_detect import _build_sdk_excludes
 
@@ -341,8 +341,15 @@ def _check_header_staleness(
     stale_count = 0
     affected: list[str] = []
 
+    # Resolved per entry rather than for the whole manifest: only the first
+    # *max_files* entries are examined, and on a large project that is a small
+    # fraction of them.
+    header_table = manifest.get("headers")
     for entry in manifest.get("entries", [])[:max_files]:
-        stale, _ = check_tu_staleness(entry, project_root, vendor_patterns)
+        stale, _ = check_tu_staleness(
+            entry, project_root, vendor_patterns,
+            headers=resolve_headers(entry, header_table),
+        )
         if stale:
             stale_count += 1
             affected.append(entry["file"])
