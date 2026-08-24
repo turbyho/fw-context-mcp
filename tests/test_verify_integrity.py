@@ -27,8 +27,8 @@ _HASH = "hash-deadbeef"
 _PROBE_HASH = "probe-hash"
 
 
-def _ctx(config_hash: str = _HASH) -> dict:
-    return {"config_hash": config_hash}
+def _ctx(config_hash: str = _HASH, *, defer_fts: bool = False) -> dict:
+    return {"config_hash": config_hash, "defer_fts": defer_fts}
 
 
 def _data_tables(conn) -> list[str]:
@@ -140,6 +140,47 @@ class TestVerifyIntegrity:
         with pytest.raises(IndexIntegrityError) as exc:
             _step_verify_integrity(conn, _ctx())
         assert "symbols_fts" in str(exc.value)
+
+    def test_a_deferred_fts_rebuild_is_not_read_as_a_broken_index(
+        self, populated_db
+    ):
+        """A multi-build run rebuilds FTS once, after every build.
+
+        The CLI passes defer_fts=True per (variant, image) and rebuilds at the
+        end, so during each build the FTS index is legitimately behind its
+        content table.  Checking it there condemned every build of
+        zbox-ecb-fw-v5: verification failed, finalize_manifest never ran, and
+        both variants stayed stamped "indexing" — hidden from readers.  The
+        caller that owns the deferral runs the check after its rebuild.
+        """
+        conn = populated_db
+        fid = upsert_file(conn, _HASH, "src/a.c", "c")
+        _insert_probe_row(conn, "symbols", {
+            "config_hash": _HASH, "file_id": fid,
+            "usr": "U_ghost", "name": "ghost_symbol",
+        })
+        conn.execute("DROP TRIGGER symbols_ad")
+        conn.execute("DELETE FROM symbols WHERE usr = 'U_ghost'")
+
+        # Same state as the test above, which fails without the deferral.
+        with pytest.raises(IndexIntegrityError):
+            _step_verify_integrity(conn, _ctx())
+
+        _step_verify_integrity(conn, _ctx(defer_fts=True))
+
+    def test_a_deferred_run_still_checks_foreign_keys(self, populated_db):
+        """Only the FTS half is deferred — the rest of the check still runs."""
+        conn = populated_db
+        conn.execute("PRAGMA foreign_keys = OFF")
+        _insert_probe_row(conn, "symbols", {
+            "config_hash": _HASH, "file_id": 999999, "usr": "U_orphan",
+            "name": "orphan_symbol",
+        })
+        conn.execute("PRAGMA foreign_keys = ON")
+
+        with pytest.raises(IndexIntegrityError) as exc:
+            _step_verify_integrity(conn, _ctx(defer_fts=True))
+        assert "foreign key" in str(exc.value)
 
     def test_the_error_is_not_swallowed_as_a_failed_step(self):
         """IndexIntegrityError must stay outside SAFE_EXCEPT.

@@ -1140,6 +1140,15 @@ class IndexIntegrityError(Exception):
 _FTS_TABLES = ("symbols_fts", "files_fts", "macros_fts")
 
 
+def fts_inconsistencies(conn: sqlite3.Connection) -> list[str]:
+    """Public alias — the multi-build CLI owns its own FTS rebuild.
+
+    That path defers the per-build rebuild and does one at the end, so it also
+    has to run the check that was skipped inside each build.
+    """
+    return _fts_inconsistencies(conn)
+
+
 def _fts_inconsistencies(conn: sqlite3.Connection) -> list[str]:
     """Return a message per FTS index that disagrees with its content table.
 
@@ -1205,7 +1214,19 @@ def _step_verify_integrity(conn: sqlite3.Connection, ctx: dict) -> None:
             preview += f"; … (+{len(violations) - 5} more)"
         problems.append(f"{len(violations)} foreign key violation(s): {preview}")
 
-    problems.extend(_fts_inconsistencies(conn))
+    # The FTS half only means something once the index has been rebuilt.
+    # A multi-build project defers that rebuild: the CLI passes
+    # defer_fts=True for every (variant, image) run and rebuilds once at the
+    # end, so checking here would compare the content tables against an index
+    # that nothing has updated yet.  Measured on zbox-ecb-fw-v5 (two
+    # variants): every build failed verification and therefore never reached
+    # finalize_manifest, leaving both stamped "indexing" — hidden from
+    # readers.  The caller that owns the deferral runs this check after its
+    # rebuild instead.
+    if ctx.get("defer_fts"):
+        log.debug("FTS integrity check deferred with the FTS rebuild")
+    else:
+        problems.extend(_fts_inconsistencies(conn))
 
     if problems:
         for p in problems:

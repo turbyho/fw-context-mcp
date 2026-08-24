@@ -471,15 +471,34 @@ def _run_multi(
 
     # Final: rebuild FTS once and run per-(variant, image) retention once.
     conn = open_db(db_path)
+    fts_problems: list[str] = []
     try:
         rebuild_fts(conn)
         rebuild_files_fts(conn)
         rebuild_macros_fts(conn)
+        # Each build skipped its own FTS check because the rebuild was
+        # deferred to here — see _step_verify_integrity.  This is the one
+        # place that can run it, and it has to: the FTS index backs
+        # search_code, search_content and the macro search, and an index that
+        # disagrees with its content table serves rows that are not there.
+        from ..indexer._postprocess import fts_inconsistencies
+
+        fts_problems = fts_inconsistencies(conn)
         deleted = cleanup_old_builds_multi(conn, project_id, db_path.parent, touched_pairs)
         if deleted:
             print(f"Cleaned up {deleted} stale build(s)")
     finally:
         conn.close()
+
+    if fts_problems:
+        for problem in fts_problems:
+            print(f"error: {problem}", file=sys.stderr)
+        print(
+            "error: the full-text index disagrees with its content after a "
+            "rebuild — reindex with --force",
+            file=sys.stderr,
+        )
+        return 1
 
     _post_index_optimize(db_path, project_root, project_id, system, args)
     return 0
