@@ -98,7 +98,20 @@ class PidFile:
         """Check whether a process with *pid* is running.
 
         Uses ``os.kill(pid, 0)`` — signal 0 is an existence check only
-        (no signal is actually delivered).
+        (no signal is actually delivered).  The three outcomes mean different
+        things and must not be collapsed:
+
+        - success — the process exists and we may signal it.
+        - ``ProcessLookupError`` (ESRCH) — no such process.
+        - ``PermissionError`` (EPERM) — the process EXISTS, we simply may not
+          signal it.  It belongs to another user.
+
+        Catching bare ``OSError`` reported that last case as dead, and
+        :meth:`is_active` deletes the PID file when the process reads as dead.
+        A pause marker written by another user's process would therefore be
+        removed by a mere liveness check, resuming a background reindex that
+        was deliberately held, or letting retention delete the build that
+        process is still writing.
 
         **TOCTOU:** the PID may be reused between the check and the
         action.  Risk is low on Linux (PID wrap at 4M).  Use
@@ -106,9 +119,15 @@ class PidFile:
         """
         try:
             os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
             return True
         except OSError:
+            # Anything else (EINVAL on a bad signal number, for instance) is
+            # not evidence of life; treat it as gone rather than guess.
             return False
+        return True
 
     @staticmethod
     def is_active(path: Path) -> bool:

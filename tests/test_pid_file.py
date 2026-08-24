@@ -75,3 +75,53 @@ class TestIsActiveOther:
         path.write_text(str(live_other_pid), encoding="utf-8")
         PidFile(path, pid=os.getpid()).unlink_if_ours()
         assert path.exists(), "another process's marker must survive our cleanup"
+
+
+class TestPidLiveness:
+    """``os.kill(pid, 0)`` has three outcomes and they mean different things.
+
+    EPERM says the process EXISTS but belongs to someone else.  Reporting that
+    as dead is destructive rather than merely wrong, because
+    :meth:`PidFile.is_active` deletes the marker of a process it believes is
+    gone — resuming a background reindex that was deliberately held, or
+    letting retention delete a build another process is still writing.
+    """
+
+    def test_eperm_means_the_process_exists(self, monkeypatch):
+        def _raise_eperm(pid, sig):
+            raise PermissionError(1, "Operation not permitted")
+
+        monkeypatch.setattr(os, "kill", _raise_eperm)
+        assert PidFile._pid_exists(4242) is True
+
+    def test_esrch_means_the_process_is_gone(self, monkeypatch):
+        def _raise_esrch(pid, sig):
+            raise ProcessLookupError(3, "No such process")
+
+        monkeypatch.setattr(os, "kill", _raise_esrch)
+        assert PidFile._pid_exists(4242) is False
+
+    def test_another_users_marker_survives_a_liveness_check(self, tmp_path, monkeypatch):
+        """The consequence, stated as the defect it was.
+
+        A liveness check is a read.  It must not delete a live process's
+        marker just because that process is not ours.
+        """
+        def _raise_eperm(pid, sig):
+            raise PermissionError(1, "Operation not permitted")
+
+        monkeypatch.setattr(os, "kill", _raise_eperm)
+        path = tmp_path / "reindex.pause"
+        path.write_text("4242", encoding="utf-8")
+
+        assert PidFile.is_active(path) is True
+        assert path.exists(), "a live process's marker was deleted"
+        assert PidFile.is_active_other(path) is True
+
+    def test_pid_one_is_reported_alive(self, tmp_path):
+        """Integration touch, without mocking.
+
+        pid 1 always exists.  As an ordinary user os.kill raises EPERM; as
+        root it succeeds — either way the answer must be "alive".
+        """
+        assert PidFile._pid_exists(1) is True
