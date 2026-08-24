@@ -68,6 +68,7 @@ from pathlib import Path
 
 from ..config import derive_project_id
 from ..config import load as load_config
+from ..indexer.runner import EXIT_SUPERSEDED
 from .shared.pid_file import PidFile
 
 log = logging.getLogger(__name__)
@@ -78,6 +79,12 @@ PING_INTERVAL = 15   # How often each MCP server pings (seconds)
 PING_TIMEOUT = 60    # Exit after this long without any ping (seconds)
 _DEBOUNCE_S = 2.0    # Collect changes before spawning index
 _WATCH_TIMEOUT = 5   # watchfiles yield_on_timeout interval (seconds)
+# A reindex abandoned because a manual operation took the index over is
+# retried, not dropped — its changes are still unindexed.  Bounded because a
+# manual operation that keeps re-taking the index would otherwise spin here;
+# after this the next file change picks the work up.
+_SUPERSEDED_RETRIES = 3
+_PAUSE_WAIT_S = 120.0  # How long to wait for a manual operation to release
 
 # ── Watched file extensions ──────────────────────────────────────────────────
 _SOURCE_EXTS_WATCH = frozenset({".c", ".cpp", ".cc", ".cxx", ".h", ".hpp", ".hh", ".hxx"})
@@ -255,9 +262,33 @@ async def daemon_main(project_root: Path) -> None:
                 if _bg_paused(project_root):
                     dlog.info("Manual index in progress — skipping background reindex")
                 else:
-                    index_proc = await _run_index_async(project_root, db_dir)
-                    await _wait_index(index_proc, shutdown, db_dir=db_dir)
-                    index_proc = None
+                    # A manual operation can take the index over mid-run, and
+                    # the run then abandons itself rather than finishing from
+                    # a snapshot that operation invalidated.  Its work is
+                    # still outstanding, so retry once the marker clears
+                    # instead of falling back to waiting for another change —
+                    # the edits that triggered this would otherwise stay
+                    # unindexed indefinitely.
+                    for _attempt in range(_SUPERSEDED_RETRIES):
+                        index_proc = await _run_index_async(project_root, db_dir)
+                        superseded = await _wait_index(
+                            index_proc, shutdown, db_dir=db_dir
+                        )
+                        index_proc = None
+                        if not superseded or shutdown.is_set():
+                            break
+                        if not await _wait_for_pause_to_clear(project_root, shutdown):
+                            dlog.info(
+                                "Pause marker still held — leaving the reindex "
+                                "to the next change"
+                            )
+                            break
+                    else:
+                        dlog.warning(
+                            "Background reindex superseded %d times — giving up "
+                            "until the next change",
+                            _SUPERSEDED_RETRIES,
+                        )
 
     finally:
         await _cleanup_daemon(index_proc, server, sock_path, pid_file, lock_fd, shutdown)
@@ -500,17 +531,42 @@ async def _run_index_async(
     return proc
 
 
+async def _wait_for_pause_to_clear(
+    project_root: Path, shutdown: asyncio.Event
+) -> bool:
+    """Wait for the manual operation to release the index.
+
+    Returns True when the marker cleared and a retry makes sense, False on
+    shutdown or when the operation outlasts the wait — a manual reindex of a
+    large project can run for an hour, and holding the daemon in a poll loop
+    that whole time buys nothing over letting the next file change trigger it.
+    """
+    from .background import _check_bg_pause as _bg_paused
+
+    deadline = time.monotonic() + _PAUSE_WAIT_S
+    while time.monotonic() < deadline:
+        if shutdown.is_set():
+            return False
+        if not _bg_paused(project_root):
+            return True
+        await asyncio.sleep(2.0)
+    return False
+
+
 async def _wait_index(
     proc: asyncio.subprocess.Process,
     shutdown: asyncio.Event,
     *,
     db_dir: Path,
-) -> None:
+) -> bool:
     """Wait for *proc* to finish, polling *shutdown* every 500 ms.
 
     When *shutdown* is set, terminates the subprocess gracefully
     (SIGTERM → 10 s → SIGKILL).  Removes ``reindex.pid`` on exit
     so ``_is_bg_reindex_running`` doesn't report a stale PID.
+
+    Returns True when the run was superseded by a manual operation and its
+    work still has to be done.
     """
     try:
         while proc.returncode is None:
@@ -522,11 +578,18 @@ async def _wait_index(
                     log.warning("Index subprocess did not exit after SIGTERM, killing")
                     proc.kill()
                     await proc.wait()
-                return
+                return False
             await asyncio.sleep(0.5)
     finally:
         PidFile(db_dir / "reindex.pid", pid=proc.pid).unlink_if_ours()
 
+    if proc.returncode == EXIT_SUPERSEDED:
+        # The run stopped because a manual operation took the index over.
+        # The changes that triggered it are still unindexed, so this must not
+        # be treated as done — going back to waiting for the NEXT change
+        # would leave them out until something else happens to be edited.
+        log.info("Background index superseded by a manual operation — will retry")
+        return True
     if proc.returncode == 0:
         log.info("Background index completed")
         # WAL files grow unboundedly during long reindex runs because
@@ -537,6 +600,7 @@ async def _wait_index(
         _optimize_db(db_dir)
     else:
         log.warning("Background index exited with %d", proc.returncode)
+    return False
 
 
 # ── DB helper ────────────────────────────────────────────────────────────────

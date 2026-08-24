@@ -401,7 +401,7 @@ def _run_multi(
     from ..indexer.build import build_variant_config, generate_compile_commands
     from ..indexer.builders import registry as builder_registry
     from ..indexer.db import open_db, rebuild_files_fts, rebuild_fts, rebuild_macros_fts
-    from ..indexer.runner import run
+    from ..indexer.runner import EXIT_SUPERSEDED, IndexSuperseded, run
 
     build_cfg = cfg.build
     variants = _select_variants(build_cfg.variants, args)
@@ -463,6 +463,13 @@ def _run_multi(
                 defer_cleanup=True,
                 **run_kwargs,
             )
+        except IndexSuperseded as exc:
+            # Another process owns the index now.  The remaining builds would
+            # abort on the same marker, so stop and let the whole command be
+            # retried — a partial sweep would leave some builds indexed
+            # against a database the other process is changing.
+            print(f"Superseded: {exc}", file=sys.stderr)
+            return EXIT_SUPERSEDED
         except Exception as exc:  # noqa: BLE001 — best-effort per-build
             print(f"error: indexing variant={variant_name} image={image}: {exc}", file=sys.stderr)
             continue
@@ -556,7 +563,7 @@ def cmd_index(args: argparse.Namespace) -> int:
     from ..config import derive_project_id
     from ..config import load as load_config
     from ..indexer.build import detect_build_system
-    from ..indexer.runner import run
+    from ..indexer.runner import EXIT_SUPERSEDED, IndexSuperseded, run
     from ..utils import resolve_project_root
 
     if args.verbose:
@@ -655,6 +662,11 @@ def cmd_index(args: argparse.Namespace) -> int:
 
         _post_index_optimize(db_path, project_root, project_id, detected_system, args)
         return 0
+    except IndexSuperseded as exc:
+        # Not a failure — see IndexSuperseded.  The distinct exit code lets
+        # the daemon retry the work instead of treating it as a broken run.
+        print(f"Superseded: {exc}", file=sys.stderr)
+        return EXIT_SUPERSEDED
     finally:
         PidFile(db_path.parent / "reindex.pid").unlink_if_ours()
         PidFile(db_path.parent / "reindex.pause").unlink_if_ours()

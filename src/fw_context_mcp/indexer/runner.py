@@ -76,6 +76,69 @@ __all__ = [
 # ═══════════════════════════════════════════════════════════════
 
 
+# Process exit status for a run that stopped because another process took the
+# index over.  Distinct from 0 (done) and 1 (failed) so the daemon can tell
+# the three apart: this one means the work still has to happen, from the
+# start.  75 is EX_TEMPFAIL from sysexits.h — a temporary failure, try again.
+#
+# Lives beside the exception rather than in the CLI: the producer (the CLI)
+# and the consumer (the daemon) are in different layers, and both already
+# depend on the indexer.
+EXIT_SUPERSEDED = 75
+
+
+class IndexSuperseded(Exception):
+    """Another process took over the index, so this run gave up.
+
+    Not a failure: nothing is wrong with the index, and nothing was written
+    that has to be undone.  The run simply stopped because continuing would
+    have applied decisions made from a snapshot the other process has since
+    invalidated.
+
+    Deliberately outside :data:`SAFE_EXCEPT` — a handler that swallowed this
+    as "a step failed, carry on" would resume exactly the run this exists to
+    stop.  Callers report it as superseded and retry the work from the start.
+    """
+
+
+def raise_if_superseded(db_dir: Path) -> None:
+    """Raise :class:`IndexSuperseded` when another process owns the index.
+
+    The MCP server writes ``<pid>`` to ``reindex.pause`` before a manual
+    ``reindex_file`` or ``reset_index``.  An indexing run used to block here
+    until the marker cleared and then carry on from the same translation unit
+    — which is not safe.  Everything the loop decides with was captured
+    before the pause: ``existing_files`` (the mtime and hash snapshot), the
+    manifest lookup, the stale-header set, and the header ownership built up
+    TU by TU.  After a manual operation those all describe an index that no
+    longer exists.
+
+    The damage is concrete.  ``reset_index`` empties the database; a resumed
+    run then reads its pre-pause ``existing_files``, takes the mtime
+    fast-path for translation units whose rows are gone, and finishes by
+    stamping a manifest over a half-built index.  A ``reindex_file`` is
+    subtler but the same shape: the manual parse re-assigned header
+    ownership, and the resumed run's ``replace_file_data`` deletes rows it
+    just wrote.
+
+    So the run gives up instead.  The caller reports it as superseded rather
+    than as a failure, and the work is retried from the start — with a fresh
+    snapshot — once the marker clears.
+
+    A marker holding our own PID is ignored: a foreground index writes it to
+    stop the background reindex, not to stop itself.  A marker whose process
+    is gone is ignored too — nothing owns the index any more.
+    """
+    pause_file = db_dir / "reindex.pause"
+    if not PidFile.is_active(pause_file):
+        return
+    requester_pid = PidFile.read_pid(pause_file)
+    if requester_pid is None or requester_pid == os.getpid():
+        return
+    raise IndexSuperseded(
+        f"another process (pid {requester_pid}) took over the index; "
+        f"abandoning this run so it can be redone from a fresh snapshot"
+    )
 
 
 
@@ -421,37 +484,6 @@ def run(
 
     log.info("", extra={"phase": f"Parsing ({len(units)} TUs)"})
 
-    def _wait_if_paused() -> None:
-        """If a manual operation requested pause, wait until it finishes.
-
-        The MCP server writes ``<pid>`` to ``reindex.pause`` before a manual
-        ``reindex_file`` or ``reset_index``.  This function blocks until the
-        pause is lifted or the requesting process dies (stale marker cleanup).
-
-        When the current process wrote the marker itself (e.g. ``fw-context
-        index --force`` was invoked from the CLI while a background reindex
-        is running), the marker is skipped so the foreground process does not
-        pause itself.
-        """
-        pause_file = db_path.parent / "reindex.pause"
-        our_pid = os.getpid()
-        # 1s polling — exits immediately when no pause file exists
-        deadline = time.monotonic() + 300  # 5-min timeout
-        while True:
-            if time.monotonic() > deadline:
-                log.warning("_wait_if_paused: timeout after 300s — resuming")
-                return
-            if not PidFile.is_active(pause_file):
-                return
-            requester_pid = PidFile.read_pid(pause_file)
-            if requester_pid is None:
-                return
-            # Never pause on our own marker — this process created it
-            # to signal the background reindex, not to block itself.
-            if requester_pid == our_pid:
-                return
-            time.sleep(1.0)  # Wait, then check again
-
     # Single sequential loop with per-TU write lock for responsiveness.
     # The lock is acquired and released for each translation unit so that
     # manual operations (reindex_file, reset_index) can interleave via
@@ -463,7 +495,7 @@ def run(
     # ``fw-context index --force``) and causes WriteLockTimeout errors.
 
     for i, unit in enumerate(units):
-        _wait_if_paused()  # Check pause marker before each TU
+        raise_if_superseded(db_path.parent)  # Give up if another process took over
         fname = unit.file.name
         processed = i + 1
 
