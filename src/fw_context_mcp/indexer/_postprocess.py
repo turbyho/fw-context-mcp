@@ -1124,6 +1124,95 @@ def _step_pagerank_hotspot(conn: sqlite3.Connection, ctx: dict) -> None:
     conn.commit()
 
 
+class IndexIntegrityError(Exception):
+    """The finished index contradicts itself.
+
+    Deliberately outside :data:`SAFE_EXCEPT`, so the post-process loop cannot
+    swallow it as "a step failed, carry on".  An index that disagrees with
+    itself answers queries wrongly, and a wrong answer is worse than a
+    missing one — the run must fail and say why.
+    """
+
+
+_FTS_TABLES = ("symbols_fts", "files_fts", "macros_fts")
+
+
+def _fts_inconsistencies(conn: sqlite3.Connection) -> list[str]:
+    """Return a message per FTS index that disagrees with its content table.
+
+    WHY ``rank`` is passed as 1: these are external-content FTS5 tables, and
+    the plain ``integrity-check`` command only validates the index's internal
+    structure.  Measured against a deliberately broken index — a row deleted
+    from ``symbols`` with the ``symbols_ad`` trigger dropped, leaving a
+    dangling FTS entry that ``MATCH`` still finds — the bare form and
+    ``rank = 0`` both reported "ok".  Only ``rank = 1``, which compares the
+    index against the content table, detected it.  A check that cannot see
+    the failure it exists for is worse than no check: it grants confidence.
+    """
+    problems: list[str] = []
+    for table in _FTS_TABLES:
+        try:
+            conn.execute(
+                f"INSERT INTO {table}({table}, rank) VALUES('integrity-check', 1)"  # noqa: S608
+            )
+        except sqlite3.OperationalError as exc:
+            # No such table — the FTS index was never created in this DB.
+            log.debug("FTS integrity check skipped for %s: %s", table, exc)
+        except sqlite3.DatabaseError as exc:
+            problems.append(f"{table} disagrees with its content table: {exc}")
+    return problems
+
+
+def _step_verify_integrity(conn: sqlite3.Connection, ctx: dict) -> None:
+    """Fail the run when the finished index contradicts itself.
+
+    Two checks, both cheap enough to always run:
+
+    - ``PRAGMA foreign_key_check`` — a row pointing at a parent that no
+      longer exists.  This is what a cleanup path that missed a table looks
+      like from the outside, which is the defect class this whole series of
+      changes was about.
+    - FTS index versus content table.  A dangling FTS entry makes a deleted
+      symbol searchable, so ``search_code`` reports code that is not there.
+
+    Placed BEFORE ``finalize_manifest`` on purpose: raising here means the
+    build is never stamped ``"full"``.  For a new ``config_hash`` it keeps the
+    ``"indexing"`` marker, so ``get_active_config`` hides it and readers stay
+    on the last complete build instead of being served a broken one.  It also
+    runs before ``cleanup_old``, so the previous build survives for
+    comparison.
+
+    WHAT THIS DOES NOT CATCH: both checks test whether the index agrees with
+    ITSELF, not whether it agrees with the source.  An index can be perfectly
+    self-consistent and still be missing data.  Measured: on HA_Boiler, a
+    coverage purge that deleted 145 files and 6698 symbols — the entire C++
+    standard library — passed both checks, because the deletes were clean and
+    fired the FTS triggers.  Completeness against the sources is a different
+    question, answered by the manifest and by the per-file hashes, not here.
+    """
+    problems: list[str] = []
+
+    violations = conn.execute("PRAGMA foreign_key_check").fetchall()
+    if violations:
+        # Row shape: (child table, child rowid, parent table, fkid).
+        preview = "; ".join(
+            f"{r[0]} rowid={r[1]} -> missing {r[2]}" for r in violations[:5]
+        )
+        if len(violations) > 5:
+            preview += f"; … (+{len(violations) - 5} more)"
+        problems.append(f"{len(violations)} foreign key violation(s): {preview}")
+
+    problems.extend(_fts_inconsistencies(conn))
+
+    if problems:
+        for p in problems:
+            log.error("Index integrity: %s", p)
+        raise IndexIntegrityError(
+            f"index verification failed for config_hash="
+            f"{ctx['config_hash'][:12]}: " + "; ".join(problems)
+        )
+
+
 def _step_finalize_manifest(conn: sqlite3.Connection, ctx: dict) -> None:
     """Stamp the build config with manifest verification status.
 
@@ -1300,6 +1389,9 @@ def _step_wal_checkpoint(conn: sqlite3.Connection, ctx: dict) -> None:
 #    new from_usr values that the backfill needs.
 #  • cross_tu_refs MUST run before pagerank_hotspot — PageRank needs the
 #    complete call graph.
+#  • verify_integrity MUST run before finalize_manifest and cleanup_old.
+#    Before finalize so a failing index is never stamped "full"; before
+#    cleanup so the previous build is still there to fall back on.
 #  • cleanup_old runs LAST with data mutation — it deletes old-build tables
 #    that earlier steps might reference.
 #  • wal_checkpoint runs LAST — flushes all accumulated changes to disk.
@@ -1317,6 +1409,7 @@ _STEPS: list[tuple[str, Callable[..., None], Callable[..., bool] | None]] = [
     ("overrides",        _step_build_overrides,    lambda c: c["analyze_overrides"]),
     ("cross_tu_refs",    _step_backfill_cross_tu_refs, lambda c: c["index_refs"]),
     ("pagerank_hotspot", _step_pagerank_hotspot,   lambda c: c["index_refs"]),
+    ("verify_integrity", _step_verify_integrity,   None),
     ("finalize_manifest", _step_finalize_manifest,  None),
     ("cleanup_old",      _step_cleanup_old_builds,  None),
     ("wal_checkpoint",   _step_wal_checkpoint,      None),
