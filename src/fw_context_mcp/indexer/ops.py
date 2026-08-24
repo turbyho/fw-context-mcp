@@ -51,6 +51,12 @@ except ImportError:
     TranslationUnitLoadError = RuntimeError  # clang not available — use fallback
 from collections import OrderedDict
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    # Type-only import: fw_context_mcp.indexer.symbols pulls in libclang at
+    # import time, and ops is imported on paths that never parse.
+    from fw_context_mcp.indexer.symbols import ExtractionResult
 
 from fw_context_mcp.indexer.config_hash import compute_tu_content_hash
 from fw_context_mcp.indexer.db import (
@@ -811,7 +817,7 @@ def store_symbols_for_unit(
     vendor_patterns: list[str] | None = None,
     project_patterns: list[str] | None = None,
     index_refs: bool = False,
-    pre_parsed=None,
+    pre_parsed: ExtractionResult | None = None,
     existing_files: dict[str, tuple[int, float]] | None = None,
     hashes=None,
     build_dir_patterns: list[str] | None = None,
@@ -839,10 +845,12 @@ def store_symbols_for_unit(
     Patterns must already be normalized (``third_party`` → ``third_party/%``).
     ``project_patterns`` take priority over ``vendor_patterns``.
 
-    *pre_parsed* is an optional tuple ``(syms, refs, inheritance,
-    indirect_call_sites, fp_assignments)`` from a prior ``extract_all``
-    call.  When provided, the libclang parse step is skipped entirely.
-    This allows callers to run expensive parsing outside the write lock.
+    *pre_parsed* is an optional ``ExtractionResult`` from a prior
+    ``extract_all`` call.  When provided, the libclang parse step is skipped
+    entirely, which lets callers parse outside the write lock.  It must be the
+    dataclass: its ``newly_seen_files`` is what tells the cleanup which files
+    this parse owns, and a caller that cannot supply that has no business
+    skipping the parse.
 
     *existing_files* is an optional ``{path: (file_id, mtime)}`` dict
     from ``get_file_mtimes()``.  When provided (bulk indexing path), it
@@ -864,44 +872,30 @@ def store_symbols_for_unit(
     except OSError:
         current_mtime = 0.0
 
-    # Parse (or use caller-supplied pre-parsed data)
-    # pre_parsed supports three shapes for backward compatibility:
-    #   1. ExtractionResult dataclass (current) — has `.tu` attribute
-    #   2. Old-style 7-tuple: (tu, syms, refs, inheritance, ics, fpa, macros)
-    #   3. Old-style 6-tuple: (syms, refs, inheritance, ics, fpa, macros)
-    #   4. Old-style 5-tuple: (syms, refs, inheritance, ics, fpa) — before macros
-    # The dataclass check (hasattr) is the fast path for all current callers.
+    # Parse, or use the caller's ExtractionResult.
+    #
+    # This used to accept three positional tuple shapes as well, for callers
+    # that predated the dataclass.  Nothing in the package passed one; the only
+    # users were tests, and the 5-tuple shape had become actively wrong — it
+    # carried no macros, so it read as "this parse found none" and the cleanup
+    # cleared the stored ones with nothing to put back.
     tu = None
-    # Legacy tuple shapes carry no file set — the ownership set then holds
-    # only the TU's own file, which is exactly the pre-existing behaviour.
     newly_seen: set[str] = set()
     if pre_parsed is not None:
-        # ExtractionResult dataclass — use named fields instead of positional unpacking
-        if hasattr(pre_parsed, 'tu'):
-            result = pre_parsed
-            tu = result.tu
-            syms = result.symbols
-            refs = result.references
-            inheritance = result.inheritance
-            indirect_call_sites = result.indirect_call_sites
-            fp_assignments = result.fp_assignments
-            macros = result.macros
-            pending_dispatches = getattr(result, 'pending_dispatches', [])
-            # Every file whose cursors this parse walked — the set this TU
-            # owns in this run.  Headers already claimed by an earlier TU are
-            # absent (skip_files excluded their subtrees).  Drives stale-row
-            # deletion and the content refresh below.
-            newly_seen = set(getattr(result, "newly_seen_files", ()) or ())
-        elif len(pre_parsed) == 7:
-            tu, syms, refs, inheritance, indirect_call_sites, fp_assignments, macros = pre_parsed
-            pending_dispatches = []
-        elif len(pre_parsed) == 6:
-            syms, refs, inheritance, indirect_call_sites, fp_assignments, macros = pre_parsed
-            pending_dispatches = []
-        else:
-            syms, refs, inheritance, indirect_call_sites, fp_assignments = pre_parsed
-            macros = []
-            pending_dispatches = []
+        result = pre_parsed
+        tu = result.tu
+        syms = result.symbols
+        refs = result.references
+        inheritance = result.inheritance
+        indirect_call_sites = result.indirect_call_sites
+        fp_assignments = result.fp_assignments
+        macros = result.macros
+        pending_dispatches = result.pending_dispatches
+        # Every file whose cursors this parse walked — the set this TU owns in
+        # this run.  Headers already claimed by an earlier TU are absent
+        # (skip_files excluded their subtrees).  Drives stale-row deletion and
+        # the content refresh below.
+        newly_seen = set(result.newly_seen_files or ())
     else:
         # ── Run libclang parse inside the write lock ──
         # Two types of exceptions are handled differently:

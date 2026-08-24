@@ -1117,7 +1117,7 @@ class TestStoreSymbolsForUnitAnalysisRestore:
 
         # Create a mock unit and pre-parsed data for the SAME file
         from fw_context_mcp.indexer.compile_commands import CompilationUnit
-        from fw_context_mcp.indexer.symbols import Symbol
+        from fw_context_mcp.indexer.symbols import ExtractionResult, Symbol
 
         unit = CompilationUnit(
             file=Path(src_file),
@@ -1160,7 +1160,7 @@ class TestStoreSymbolsForUnitAnalysisRestore:
                 vendor_patterns=[],
                 project_patterns=[],
                 index_refs=False,
-                pre_parsed=([sym], [], [], [], []),
+                pre_parsed=ExtractionResult(symbols=[sym]),
             )
 
         assert syms_added == 1
@@ -1233,7 +1233,7 @@ class TestStoreSymbolsForUnitAnalysisRestore:
         src_file.write_text("int bar(int x) {\n    return x * 3;\n}\n", encoding="utf-8")
 
         from fw_context_mcp.indexer.compile_commands import CompilationUnit
-        from fw_context_mcp.indexer.symbols import Symbol
+        from fw_context_mcp.indexer.symbols import ExtractionResult, Symbol
 
         unit = CompilationUnit(
             file=Path(src_file),
@@ -1271,7 +1271,7 @@ class TestStoreSymbolsForUnitAnalysisRestore:
                 vendor_patterns=[],
                 project_patterns=[],
                 index_refs=False,
-                pre_parsed=([sym], [], [], [], []),
+                pre_parsed=ExtractionResult(symbols=[sym]),
             )
 
         assert syms_added == 1
@@ -1337,7 +1337,7 @@ class TestStoreSymbolsForUnitAnalysisRestore:
         assert ana_before == 0
 
         from fw_context_mcp.indexer.compile_commands import CompilationUnit
-        from fw_context_mcp.indexer.symbols import Symbol
+        from fw_context_mcp.indexer.symbols import ExtractionResult, Symbol
 
         unit = CompilationUnit(
             file=Path(src_file),
@@ -1374,7 +1374,7 @@ class TestStoreSymbolsForUnitAnalysisRestore:
                 vendor_patterns=[],
                 project_patterns=[],
                 index_refs=False,
-                pre_parsed=([sym], [], [], [], []),
+                pre_parsed=ExtractionResult(symbols=[sym]),
             )
 
         assert syms_added == 1
@@ -1468,7 +1468,7 @@ class TestStoreSymbolsForUnitAnalysisRestore:
                 _os2.environ["HOME"] = _saved_home2
 
         from fw_context_mcp.indexer.compile_commands import CompilationUnit
-        from fw_context_mcp.indexer.symbols import Symbol
+        from fw_context_mcp.indexer.symbols import ExtractionResult, Symbol
 
         unit = CompilationUnit(
             file=Path(src_file),
@@ -1505,7 +1505,7 @@ class TestStoreSymbolsForUnitAnalysisRestore:
                 vendor_patterns=[],
                 project_patterns=[],
                 index_refs=False,
-                pre_parsed=([sym], [], [], [], []),
+                pre_parsed=ExtractionResult(symbols=[sym]),
             )
 
         # Check denormalized columns on symbols

@@ -1527,7 +1527,7 @@ class TestFilesIsProject:
         from fw_context_mcp.indexer.compile_commands import CompilationUnit
         from fw_context_mcp.indexer.db import open_db, upsert_build_config, upsert_project
         from fw_context_mcp.indexer.ops import store_symbols_for_unit
-        from fw_context_mcp.indexer.symbols import extract_all
+        from fw_context_mcp.indexer.symbols import ExtractionResult, extract_all
 
         src = tmp_path / "src"
         src.mkdir()
@@ -1564,7 +1564,11 @@ class TestFilesIsProject:
             conn, unit_proj, config_hash, tmp_path,
             vendor_patterns=vendor_patterns,
             project_patterns=project_patterns,
-            pre_parsed=(syms, refs, inheritance, indirect, fp_assigns, macros),
+            pre_parsed=ExtractionResult(
+                symbols=syms, references=refs, inheritance=inheritance,
+                indirect_call_sites=indirect, fp_assignments=fp_assigns,
+                macros=macros,
+            ),
         )
         conn.commit()
 
@@ -1588,7 +1592,11 @@ class TestFilesIsProject:
             conn, unit_vendor, config_hash, tmp_path,
             vendor_patterns=vendor_patterns,
             project_patterns=project_patterns,
-            pre_parsed=(syms_v, refs_v, inh_v, ind_v, fpa_v, mac_v),
+            pre_parsed=ExtractionResult(
+                symbols=syms_v, references=refs_v, inheritance=inh_v,
+                indirect_call_sites=ind_v, fp_assignments=fpa_v,
+                macros=mac_v,
+            ),
         )
         conn.commit()
 
@@ -1609,7 +1617,7 @@ class TestFilesIsProject:
         from fw_context_mcp.indexer.compile_commands import CompilationUnit
         from fw_context_mcp.indexer.db import open_db, upsert_build_config, upsert_project
         from fw_context_mcp.indexer.ops import store_symbols_for_unit
-        from fw_context_mcp.indexer.symbols import extract_all
+        from fw_context_mcp.indexer.symbols import ExtractionResult, extract_all
 
         src = tmp_path / "lib" / "muj_modul"
         src.mkdir(parents=True)
@@ -1638,7 +1646,11 @@ class TestFilesIsProject:
             conn, unit, config_hash, tmp_path,
             vendor_patterns=vendor_patterns,
             project_patterns=project_patterns,
-            pre_parsed=(syms, refs, inheritance, indirect, fp_assigns, macros),
+            pre_parsed=ExtractionResult(
+                symbols=syms, references=refs, inheritance=inheritance,
+                indirect_call_sites=indirect, fp_assignments=fp_assigns,
+                macros=macros,
+            ),
         )
         conn.commit()
 
