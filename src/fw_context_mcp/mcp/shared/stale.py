@@ -124,12 +124,14 @@ def _stale_files(conn, config_hash: str, file_paths: list[str], root: Path) -> l
     """Return the subset of *file_paths* whose on-disk mtime is newer than the index."""
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
-    from ...indexer.manifest import load as load_manifest
+    from ...indexer.manifest import load_build_dir_patterns
     from ...indexer.ops import _normalize_file_path
 
     db_path = Path(conn.execute("PRAGMA database_list").fetchone()["file"])
-    manifest = load_manifest(db_path.parent, config_hash)
-    build_patterns = manifest.get("build_dir_patterns", []) if manifest else []
+    # This runs on every query routed through _with_stale_recovery, and the
+    # patterns are all it needs — see load_build_dir_patterns for why parsing
+    # the whole manifest here was the most expensive thing on that path.
+    build_patterns = load_build_dir_patterns(db_path.parent, config_hash)
 
     # Build work items: batch-fetch stored mtimes in one query (was N+1).
     normalized: list[tuple[str, str]] = []  # (abs_path, db_key)
@@ -257,11 +259,10 @@ def _count_modified_files(
             best_mtime[key] = stored
 
     # Load build_dir_patterns from manifest to skip build-generated files
-    from ...indexer.manifest import load as load_manifest
+    from ...indexer.manifest import load_build_dir_patterns
 
     db_path = Path(conn.execute("PRAGMA database_list").fetchone()["file"])
-    manifest = load_manifest(db_path.parent, config_hash)
-    build_patterns = manifest.get("build_dir_patterns", []) if manifest else []
+    build_patterns = load_build_dir_patterns(db_path.parent, config_hash)
 
     # NOTE: TOCTOU — file may change between DB read and stat() below.
     # Not a security issue: worst case is missed detection until next query.

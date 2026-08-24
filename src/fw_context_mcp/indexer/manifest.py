@@ -222,6 +222,46 @@ def _manifest_path(db_dir: Path, config_hash: str) -> Path:
     return db_dir / f"manifest.{config_hash}.json"
 
 
+# Keyed by (manifest path, mtime_ns) so a rewritten manifest misses.  Only the
+# small list is retained — never the parsed manifest, which is 150 MB+ of
+# Python objects for a large project and would sit in the MCP server for its
+# whole life.
+_BUILD_PATTERNS_CACHE: dict[tuple[str, int], list[str]] = {}
+
+
+def load_build_dir_patterns(db_dir: Path, config_hash: str) -> list[str]:
+    """Return just ``build_dir_patterns``, cached across calls.
+
+    WHY this exists rather than ``load(...)["build_dir_patterns"]``: the
+    staleness helpers on the MCP query path need nothing else from the
+    manifest, and parsing the whole file to reach one short list is the most
+    expensive thing they do.  Measured on zbox-ecb-fw (876 TUs), the manifest
+    is 52 MB and takes 109 ms to read and parse — paid on EVERY query routed
+    through ``_with_stale_recovery``, to obtain a list of two or three
+    strings.
+
+    The first call after an index still parses once; every later one is a
+    dict lookup.  Only the list is kept, so the cost is bytes rather than the
+    hundreds of megabytes a parsed manifest occupies.
+    """
+    path = _manifest_path(db_dir, config_hash)
+    try:
+        key = (str(path), path.stat().st_mtime_ns)
+    except OSError:
+        return []
+    cached = _BUILD_PATTERNS_CACHE.get(key)
+    if cached is not None:
+        return cached
+    manifest = load(db_dir, config_hash)
+    patterns = list(manifest.get("build_dir_patterns", [])) if manifest else []
+    # One project has one active manifest; bound the dict so a long-running
+    # server that reindexes repeatedly cannot accumulate entries.
+    if len(_BUILD_PATTERNS_CACHE) > 32:
+        _BUILD_PATTERNS_CACHE.clear()
+    _BUILD_PATTERNS_CACHE[key] = patterns
+    return patterns
+
+
 def load(db_dir: Path, config_hash: str | None = None) -> dict | None:
     """Load the manifest for *config_hash* from *db_dir*, or None.
 

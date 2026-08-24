@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+import os
 from pathlib import Path
 
 
@@ -582,3 +584,85 @@ class TestManifestEntryRefreshGuard:
         assert not list((tmp_path / "index").glob("manifest.*.json")), (
             "manifest file was written for a run that re-parsed nothing"
         )
+
+
+class TestLoadBuildDirPatterns:
+    """``build_dir_patterns`` is read on the MCP query path, so it is cached.
+
+    ``_stale_files`` runs on every query routed through
+    ``_with_stale_recovery`` and needs nothing from the manifest but this one
+    short list.  Parsing the whole file for it was the most expensive thing on
+    that path: measured on zbox-ecb-fw, 94.7 ms to fetch ``['BUILD/']`` from a
+    52 MB manifest.  Cached, the same call is 0.007 ms.
+
+    The cache is keyed by the manifest's mtime, so the interesting case is not
+    the speed — it is that a reindex must never be served the old value.
+    """
+
+    def _write(self, db_dir: Path, config_hash: str, patterns: list[str]) -> Path:
+        from fw_context_mcp.indexer.manifest import _manifest_path
+
+        path = _manifest_path(db_dir, config_hash)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps({
+                "_format": "fw-context-manifest/1",
+                "config_hash": config_hash,
+                "project_root": str(db_dir),
+                "build_dir_patterns": patterns,
+                "entries": [],
+            }),
+            encoding="utf-8",
+        )
+        return path
+
+    def test_returns_the_stored_patterns(self, tmp_path: Path):
+        from fw_context_mcp.indexer.manifest import load_build_dir_patterns
+
+        self._write(tmp_path, "abc123", ["BUILD/", ".pio/"])
+        assert load_build_dir_patterns(tmp_path, "abc123") == ["BUILD/", ".pio/"]
+
+    def test_agrees_with_a_full_load(self, tmp_path: Path):
+        """The fast path must not drift from the thing it replaces."""
+        from fw_context_mcp.indexer.manifest import load as load_manifest
+        from fw_context_mcp.indexer.manifest import load_build_dir_patterns
+
+        self._write(tmp_path, "abc123", ["BUILD/"])
+        full = load_manifest(tmp_path, "abc123")
+        assert load_build_dir_patterns(tmp_path, "abc123") == full["build_dir_patterns"]
+
+    def test_a_missing_manifest_gives_no_patterns(self, tmp_path: Path):
+        from fw_context_mcp.indexer.manifest import load_build_dir_patterns
+
+        assert load_build_dir_patterns(tmp_path, "nosuchhash") == []
+
+    def test_a_rewritten_manifest_is_not_served_from_cache(self, tmp_path: Path):
+        """The case that makes the cache safe rather than merely fast.
+
+        A reindex rewrites the manifest under the same config_hash when the
+        dialect did not change.  Serving the previous patterns would silently
+        exclude, or stop excluding, whole directories.
+        """
+        from fw_context_mcp.indexer.manifest import load_build_dir_patterns
+
+        path = self._write(tmp_path, "abc123", ["BUILD/"])
+        assert load_build_dir_patterns(tmp_path, "abc123") == ["BUILD/"]
+
+        self._write(tmp_path, "abc123", ["out/"])
+        # Force a distinct mtime even on a coarse-grained filesystem.
+        st = path.stat()
+        os.utime(path, ns=(st.st_atime_ns, st.st_mtime_ns + 1_000_000))
+
+        assert load_build_dir_patterns(tmp_path, "abc123") == ["out/"], (
+            "the cache served patterns from before the reindex"
+        )
+
+    def test_an_empty_pattern_list_is_cached_too(self, tmp_path: Path):
+        """None-vs-empty must not make every call a miss."""
+        from fw_context_mcp.indexer import manifest as m
+
+        self._write(tmp_path, "abc123", [])
+        assert m.load_build_dir_patterns(tmp_path, "abc123") == []
+        before = len(m._BUILD_PATTERNS_CACHE)
+        assert m.load_build_dir_patterns(tmp_path, "abc123") == []
+        assert len(m._BUILD_PATTERNS_CACHE) == before, "an empty list was not cached"
