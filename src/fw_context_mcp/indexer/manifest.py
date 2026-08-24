@@ -53,9 +53,6 @@ def _is_generated_header(header_path: str, build_dir_patterns: list[str] | None 
 
 
 
-_HEADER_EXTS = frozenset({".h", ".hpp", ".hxx", ".hh", ".inl"})
-# Public alias — used by ops.py for header extension filtering
-HEADER_EXTS = _HEADER_EXTS
 
 
 def _collect_headers_from_tokens(tu, project_root: Path, build_dir_patterns: list[str] | None = None) -> list[dict]:
@@ -101,10 +98,16 @@ def _collect_headers_from_tokens(tu, project_root: Path, build_dir_patterns: lis
         seen.add(abs_path)
 
         resolved = Path(abs_path).resolve()
-        # Only collect files with header-like extensions
-        if resolved.suffix.lower() not in _HEADER_EXTS:
-            continue
-
+        # Everything get_includes() returns was reached by an #include, so it
+        # IS a header — whatever it is called.  There used to be an extension
+        # whitelist here ({.h .hpp .hxx .hh .inl}), and it silently dropped
+        # every extensionless C++ standard header (<algorithm>, <bit>) and
+        # every .tcc template body.  Two consequences, both measured on
+        # HA_Boiler: the coverage purge deleted 29 such files and 1810 symbols
+        # because the manifest did not list them, and a toolchain upgrade
+        # could change any of them without marking a single TU stale, because
+        # no hash was recorded to compare.  A whitelist of "what counts as a
+        # header" cannot be kept complete; not filtering can.
         try:
             rel = str(resolved.relative_to(project_root))
         except ValueError:

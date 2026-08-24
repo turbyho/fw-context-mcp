@@ -805,10 +805,17 @@ def _step_purge_files_outside_build(conn: sqlite3.Connection, ctx: dict) -> None
         log.debug("coverage purge skipped: manifest carries no header lists")
         return
 
+    # Vendor and SDK files are candidates too, not just project sources: a
+    # framework upgrade replaces headers, and the ones it dropped must go with
+    # it.  That only works because the manifest now records every file an
+    # #include reached, extensionless C++ standard headers and .tcc template
+    # bodies included.  While it carried an extension whitelist this step
+    # deleted 29 real files and 1810 symbols on HA_Boiler.
     rows = conn.execute(
-        "SELECT id, path FROM files WHERE config_hash = ?", (config_hash,)
+        "SELECT id, path FROM files WHERE config_hash = ? AND path != ''",
+        (config_hash,),
     ).fetchall()
-    stale = [(r["id"], r["path"]) for r in rows if r["path"] and r["path"] not in covered]
+    stale = [(r["id"], r["path"]) for r in rows if r["path"] not in covered]
     if not stale:
         return
 

@@ -146,15 +146,26 @@ def _compute_content_hash(
 def _normalize_file_path(file_path: str, project_root: Path) -> str:
     """Convert a file path to project-relative when inside *project_root*.
 
-    Files outside *project_root* (SDK, framework) keep their absolute path.
-    This is the canonical path normalization for the ``files.path`` column —
-    consistent with :func:`_build_filtered_file_content`.
+    Files outside *project_root* (SDK, framework) keep an absolute path, but
+    a RESOLVED one.  The fallback used to return *file_path* untouched, and
+    that produced two ``files`` rows for one file: libclang reports a system
+    header reached through an include path as
+    ``/usr/lib64/gcc/…/16/../../../../include/c++/16/algorithm``, which this
+    function stored verbatim, while ``_build_filtered_file_content`` stored
+    ``str(Path(p).resolve())`` — ``/usr/include/c++/16/algorithm``.  The
+    symbols hung off one row and the content off the other, and nothing
+    matched them up.  Measured on HA_Boiler: 145 duplicate rows, and the
+    whole C++ standard library became invisible once the coverage purge
+    removed the spelling the manifest did not use.
+
+    One spelling per file is the invariant every path-keyed lookup relies on,
+    so this is the only place that decides it.
     """
-    resolved_root = project_root.resolve()
+    resolved = Path(file_path).resolve()
     try:
-        return str(Path(file_path).resolve().relative_to(resolved_root))
+        return str(resolved.relative_to(project_root.resolve()))
     except ValueError:
-        return file_path
+        return str(resolved)
 
 
 def _build_filtered_file_content(
@@ -236,7 +247,6 @@ def _build_filtered_file_content(
             log.debug("_build_filtered_file_content: parse failed for %s", unit.file.name)
             return 0, []
 
-    from fw_context_mcp.indexer.manifest import HEADER_EXTS as _HEADER_EXTS
     from fw_context_mcp.indexer.manifest import _is_generated_header
 
     # ── Collect included header paths + SHA-256 hashes (always needed for manifest) ──
@@ -250,9 +260,9 @@ def _build_filtered_file_content(
         seen_headers.add(abs_path)
 
         resolved = Path(abs_path).resolve()
-        if resolved.suffix.lower() not in _HEADER_EXTS:
-            continue
-
+        # No extension filter — see _collect_headers_from_tokens() for why.
+        # Anything reached by an #include belongs in the manifest, or it can
+        # neither be kept nor invalidated.
         try:
             rel = str(resolved.relative_to(project_root))
         except ValueError:

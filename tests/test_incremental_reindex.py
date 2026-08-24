@@ -3602,6 +3602,62 @@ class TestCoveragePurge:
         finally:
             conn.close()
 
+    def test_out_of_project_headers_are_not_collateral_damage(self, c_project: Path):
+        """SDK and system headers must survive a purge that targets a TU.
+
+        The purge deliberately covers vendor and SDK files too — a framework
+        upgrade replaces headers and the dropped ones must go with them — so
+        it can only be as correct as the manifest is complete.  Note this case
+        does NOT exercise the extension whitelist that made the manifest
+        incomplete: this fixture's system headers are all ``.h``, so they were
+        recorded either way.  ``TestManifestRecordsEveryInclude`` covers that.
+        """
+        db_path = _db_path_for_project(c_project)
+        assert _index_cli(c_project).returncode == 0
+
+        conn = open_db(db_path)
+        try:
+            ch = _config_hash(conn)
+            before = conn.execute(
+                "SELECT COUNT(*) FROM files WHERE config_hash=? AND path LIKE '/%'",
+                (ch,),
+            ).fetchone()[0]
+            assert before > 0, (
+                "seed failed — the fixture indexed no out-of-project headers, "
+                "so this test would prove nothing"
+            )
+        finally:
+            conn.close()
+
+        # A reindex that also drops a TU, so the purge definitely runs.
+        _add_tu_to_compile_commands(c_project, "transient.c")
+        assert _index_cli(c_project).returncode == 0
+        import json
+
+        cc_json = c_project / "compile_commands.json"
+        cc = [e for e in json.loads(cc_json.read_text(encoding="utf-8"))
+              if e["file"] != "transient.c"]
+        cc_json.write_text(json.dumps(cc, indent=2), encoding="utf-8")
+        result = _index_cli(c_project)
+        assert result.returncode == 0, result.stderr
+
+        conn = open_db(db_path)
+        try:
+            ch = _config_hash(conn)
+            after = conn.execute(
+                "SELECT COUNT(*) FROM files WHERE config_hash=? AND path LIKE '/%'",
+                (ch,),
+            ).fetchone()[0]
+            assert after == before, (
+                f"out-of-project headers were purged: {before} -> {after}\n"
+                + result.stderr[-2000:]
+            )
+            assert _file_row(conn, ch, "transient.c") is None, (
+                "the dropped in-project TU should still have been purged"
+            )
+        finally:
+            conn.close()
+
     def test_untouched_build_purges_nothing(self, c_project: Path):
         """A no-op reindex must not delete anything."""
         db_path = _db_path_for_project(c_project)
@@ -3763,3 +3819,112 @@ class TestDialectRoundTrip:
         assert "0 updated" not in summary, (
             f"no TU was re-parsed under the restored dialect\n{summary}"
         )
+
+
+# ── Manifest completeness ─────────────────────────────────────────────
+
+
+def _manifest_header_paths(db_path: Path) -> set[str]:
+    """Every header path the manifest records, across all TUs."""
+    import json
+
+    manifests = sorted(db_path.parent.glob("manifest.*.json"))
+    assert len(manifests) == 1, f"expected one manifest, found {manifests}"
+    data = json.loads(manifests[0].read_text(encoding="utf-8"))
+    paths: set[str] = set()
+    for entry in data.get("entries") or []:
+        for h in entry.get("headers") or []:
+            paths.add(h["path"] if isinstance(h, dict) else h)
+    return paths
+
+
+@pytest.mark.libclang
+class TestManifestRecordsEveryInclude:
+    """The manifest must list every file an ``#include`` reached.
+
+    It used to filter by extension — ``{.h .hpp .hxx .hh .inl}`` — which
+    silently dropped every extensionless C++ standard header (``<algorithm>``,
+    ``<bit>``) and every ``.tcc`` template body.  Two things broke.  The
+    coverage purge deleted those files because the manifest did not list them:
+    measured on HA_Boiler, 29 files and 1810 symbols.  And nothing recorded a
+    hash for them, so a toolchain or SDK upgrade could change any of them
+    without marking a single TU stale.
+
+    A whitelist of "what counts as a header" cannot be kept complete;
+    ``get_includes()`` already answers the question exactly.
+    """
+
+    def test_an_extensionless_header_is_recorded(self, c_project: Path):
+        """This is the shape of every C++ standard library header."""
+        db_path = _db_path_for_project(c_project)
+        _write_file(
+            c_project / "src" / "plain_header",
+            "#ifndef PLAIN_H\n#define PLAIN_H\nint plain_fn(void);\n#endif\n",
+        )
+        _include_from_main(c_project, "plain_header")
+
+        result = _index_cli(c_project)
+        assert result.returncode == 0, result.stderr
+
+        recorded = _manifest_header_paths(db_path)
+        assert "src/plain_header" in recorded, (
+            "an extensionless header is missing from the manifest, so nothing "
+            "can detect a change to it and the coverage purge would delete it\n"
+            f"recorded: {sorted(p for p in recorded if 'src/' in p)}"
+        )
+
+    def test_an_unusual_extension_is_recorded(self, c_project: Path):
+        """``.tcc`` is what libstdc++ names its template bodies."""
+        db_path = _db_path_for_project(c_project)
+        _write_file(
+            c_project / "src" / "bodies.tcc",
+            "static inline int tcc_fn(void) { return 1; }\n",
+        )
+        _write_file(
+            c_project / "src" / "wrap.h",
+            '#ifndef WRAP_H\n#define WRAP_H\n#include "bodies.tcc"\n#endif\n',
+        )
+        _include_from_main(c_project, "wrap.h")
+
+        result = _index_cli(c_project)
+        assert result.returncode == 0, result.stderr
+
+        recorded = _manifest_header_paths(db_path)
+        assert "src/bodies.tcc" in recorded, (
+            "a .tcc include is missing from the manifest\n"
+            f"recorded: {sorted(p for p in recorded if 'src/' in p)}"
+        )
+
+    def test_such_a_header_is_not_purged(self, c_project: Path):
+        """The consequence: coverage must keep what the manifest now lists."""
+        db_path = _db_path_for_project(c_project)
+        _write_file(
+            c_project / "src" / "plain_header",
+            "#ifndef PLAIN_H\n#define PLAIN_H\nint plain_fn(void);\n#endif\n",
+        )
+        _include_from_main(c_project, "plain_header")
+        assert _index_cli(c_project).returncode == 0
+
+        # Reindex after dropping a TU, so the purge definitely runs.
+        _add_tu_to_compile_commands(c_project, "transient.c")
+        assert _index_cli(c_project).returncode == 0
+        import json
+
+        cc_json = c_project / "compile_commands.json"
+        cc = [e for e in json.loads(cc_json.read_text(encoding="utf-8"))
+              if e["file"] != "transient.c"]
+        cc_json.write_text(json.dumps(cc, indent=2), encoding="utf-8")
+        result = _index_cli(c_project)
+        assert result.returncode == 0, result.stderr
+
+        conn = open_db(db_path)
+        try:
+            ch = _config_hash(conn)
+            assert _file_row(conn, ch, "plain_header") is not None, (
+                "the extensionless header was purged\n" + result.stderr[-2000:]
+            )
+            assert _file_row(conn, ch, "transient.c") is None, (
+                "the dropped TU should still have been purged"
+            )
+        finally:
+            conn.close()
