@@ -86,6 +86,12 @@ __all__ = [
 # depend on the indexer.
 EXIT_SUPERSEDED = 75
 
+# Process exit status for a run that refused to start because another
+# indexing run already owns the index.  Unlike EXIT_SUPERSEDED there is
+# nothing to retry: the run that holds the lock is doing this work.
+# 69 is EX_UNAVAILABLE from sysexits.h — the service is busy.
+EXIT_ALREADY_RUNNING = 69
+
 
 class IndexSuperseded(Exception):
     """Another process took over the index, so this run gave up.

@@ -68,7 +68,7 @@ from pathlib import Path
 
 from ..config import derive_project_id
 from ..config import load as load_config
-from ..indexer.runner import EXIT_SUPERSEDED
+from ..indexer.runner import EXIT_ALREADY_RUNNING, EXIT_SUPERSEDED
 from .shared.pid_file import PidFile
 
 log = logging.getLogger(__name__)
@@ -590,6 +590,11 @@ async def _wait_index(
         # would leave them out until something else happens to be edited.
         log.info("Background index superseded by a manual operation — will retry")
         return True
+    if proc.returncode == EXIT_ALREADY_RUNNING:
+        # Another indexing run owns the index.  Nothing to retry — that run
+        # covers this project, and racing it is what the lock prevents.
+        log.info("Background index skipped — another index run holds the index")
+        return False
     if proc.returncode == 0:
         log.info("Background index completed")
         # WAL files grow unboundedly during long reindex runs because

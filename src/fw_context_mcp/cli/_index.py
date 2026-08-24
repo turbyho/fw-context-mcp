@@ -206,31 +206,36 @@ def _validate_and_fix_artifacts(
 
 
 def _pid_is_fw_context_reindexer(pid: int) -> bool:
-    """Verify that *pid* belongs to an fw-context background reindex process.
+    """Verify that *pid* is a BACKGROUND fw-context index run.
 
-    Checks /proc/<pid>/comm and /proc/<pid>/cmdline to avoid signalling
-    an unrelated process that reused the PID (PID reuse safety).
+    WHY the identity check at all: Linux recycles PIDs.  A stale
+    ``reindex.pid`` may name a process that has nothing to do with
+    fw-context, and signalling it would take out an unrelated service.
 
-    WHY: Linux recycles PIDs.  When a background reindex finishes and
-    its PID file is stale, the PID may have been reassigned to a
-    completely unrelated process (web server, database).  Killing that
-    process would cause a service outage.  This check verifies the
-    process identity before sending any signal.
+    WHY the cmdline and not the process name: this used to compare
+    ``/proc/<pid>/comm`` against ``("fw-context", "python", "python3")``.  A
+    virtualenv interpreter is named for its version — ``python3.14`` here —
+    so the comparison never matched and the function always returned False.
+    The takeover it guards therefore never happened, and two index runs could
+    write the same database side by side.  Observed exactly that: a run
+    started at 16:42 was still going when a second one started at 17:04.
+
+    Only ``--background`` runs are killable.  The daemon spawns those and
+    will start another when it needs one; a foreground run belongs to a
+    person and is excluded through :func:`index_run_lock` instead of being
+    terminated under them.
     """
     try:
-        comm_path = Path(f"/proc/{pid}/comm")
-        comm = comm_path.read_text().strip()
-        # Match python or fw-context process names
-        if comm not in ("fw-context", "python", "python3"):
-            return False
-        # Exclude daemon (file watcher) processes
-        cmdline_path = Path(f"/proc/{pid}/cmdline")
-        cmdline = cmdline_path.read_text()
-        if "daemon" in cmdline:
-            return False
-        return True
-    except (OSError, FileNotFoundError):
+        cmdline = Path(f"/proc/{pid}/cmdline").read_bytes().decode(errors="replace")
+    except OSError:
         return False
+    # /proc joins argv with NULs.
+    argv = [arg for arg in cmdline.split("\0") if arg]
+    if not any(arg.endswith(("fw-context", "fw_context_mcp.cli", "fw_context_mcp")) for arg in argv):
+        return False
+    if "index" not in argv:
+        return False
+    return "--background" in argv
 
 def _manage_bg_reindex(db_path: Path) -> None:
     """Kill any running background reindex and write pause/pid files.
@@ -563,7 +568,13 @@ def cmd_index(args: argparse.Namespace) -> int:
     from ..config import derive_project_id
     from ..config import load as load_config
     from ..indexer.build import detect_build_system
-    from ..indexer.runner import EXIT_SUPERSEDED, IndexSuperseded, run
+    from ..indexer.db._locking import IndexRunLocked, index_run_lock
+    from ..indexer.runner import (
+        EXIT_ALREADY_RUNNING,
+        EXIT_SUPERSEDED,
+        IndexSuperseded,
+        run,
+    )
     from ..utils import resolve_project_root
 
     if args.verbose:
@@ -616,18 +627,29 @@ def cmd_index(args: argparse.Namespace) -> int:
     # (generate_compile_commands → builder.build()) would fail on a project
     # whose board lives per-variant (Zephyr "requires a board name").
     if cfg.build.variants:
+        # Takes over from a background run by killing it, which also drops
+        # its index lock; the lock below then only refuses another
+        # FOREGROUND run.
         _manage_bg_reindex(db_path)
         run_kwargs = _build_run_kwargs(
             args, cfg, project_root, project_id, vendor_paths, project_paths, cs_config,
         )
         try:
-            return _run_multi(
-                args, cfg, project_root, project_id, db_path,
-                detected_system, run_kwargs,
-            )
-        finally:
-            PidFile(db_path.parent / "reindex.pid").unlink_if_ours()
-            PidFile(db_path.parent / "reindex.pause").unlink_if_ours()
+            # Held across every (variant, image) build, not per build: a
+            # second run slipping in between two builds would index against a
+            # database this one is still changing.
+            with index_run_lock(db_path.parent):
+                try:
+                    return _run_multi(
+                        args, cfg, project_root, project_id, db_path,
+                        detected_system, run_kwargs,
+                    )
+                finally:
+                    PidFile(db_path.parent / "reindex.pid").unlink_if_ours()
+                    PidFile(db_path.parent / "reindex.pause").unlink_if_ours()
+        except IndexRunLocked as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return EXIT_ALREADY_RUNNING
 
     # ── Resolve compile_commands.json ──
     cc_result = _resolve_compile_commands(args, project_root, cfg, detected_system, bg)
@@ -645,6 +667,8 @@ def cmd_index(args: argparse.Namespace) -> int:
     assert compile_commands is not None  # _validate_and_fix_artifacts returns Path|None, but ok=True → non-None
 
     # ── Manage background reindex ──
+    # Takes over from a background run by killing it, which also drops its
+    # index lock; the lock below then only refuses another FOREGROUND run.
     _manage_bg_reindex(db_path)
 
     run_kwargs = _build_run_kwargs(
@@ -652,21 +676,28 @@ def cmd_index(args: argparse.Namespace) -> int:
     )
 
     try:
-        config_hash = run(
-            compile_commands=compile_commands,
-            db_path=db_path,
-            build_dir_patterns=build_dir_patterns,
-            **run_kwargs,
-        )
-        print(f"Indexed. config_hash={config_hash[:16]}…  db={db_path}")
+        with index_run_lock(db_path.parent):
+            try:
+                config_hash = run(
+                    compile_commands=compile_commands,
+                    db_path=db_path,
+                    build_dir_patterns=build_dir_patterns,
+                    **run_kwargs,
+                )
+                print(f"Indexed. config_hash={config_hash[:16]}…  db={db_path}")
 
-        _post_index_optimize(db_path, project_root, project_id, detected_system, args)
-        return 0
-    except IndexSuperseded as exc:
-        # Not a failure — see IndexSuperseded.  The distinct exit code lets
-        # the daemon retry the work instead of treating it as a broken run.
-        print(f"Superseded: {exc}", file=sys.stderr)
-        return EXIT_SUPERSEDED
-    finally:
-        PidFile(db_path.parent / "reindex.pid").unlink_if_ours()
-        PidFile(db_path.parent / "reindex.pause").unlink_if_ours()
+                _post_index_optimize(
+                    db_path, project_root, project_id, detected_system, args
+                )
+                return 0
+            except IndexSuperseded as exc:
+                # Not a failure — see IndexSuperseded.  The distinct exit code
+                # lets the daemon retry instead of treating it as a broken run.
+                print(f"Superseded: {exc}", file=sys.stderr)
+                return EXIT_SUPERSEDED
+            finally:
+                PidFile(db_path.parent / "reindex.pid").unlink_if_ours()
+                PidFile(db_path.parent / "reindex.pause").unlink_if_ours()
+    except IndexRunLocked as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return EXIT_ALREADY_RUNNING
