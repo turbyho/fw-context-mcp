@@ -287,23 +287,76 @@ class ZephyrBuildSystem:
     # ── Environment auto-detection ──
 
     @staticmethod
-    def _find_nrfutil() -> str | None:
-        """Locate the nrfutil SDK-manager binary.
+    def _provides_sdk_manager(candidate: str) -> bool:
+        """Return True when *candidate* really provides ``sdk-manager``.
 
-        Prefers ``nrfutil-sdk-manager`` / ``nrfutil`` from PATH, then the
-        standard install locations (``~/.nrfutil/bin/``, ``~/ncs_tools/``).
+        WHY probe instead of trusting the name: ``nrfutil`` is a name several
+        unrelated tools answer to.  A pip-installed ``nrfutil`` (the
+        click-based nRF5 utility) has no ``sdk-manager`` command at all, and a
+        machine can easily carry both — measured here, four different
+        ``nrfutil`` binaries were on PATH and only one was the SDK manager.
+
+        Accepting the wrong one is silent and expensive: detection writes an
+        activation script around it, and every later Zephyr build dies with a
+        bare ``Usage: nrfutil [OPTIONS] COMMAND [ARGS]...`` that names neither
+        the script nor the binary that produced it.
         """
-        for name in ("nrfutil-sdk-manager", "nrfutil"):
-            found = shutil.which(name)
-            if found:
-                return found
+        try:
+            result = subprocess.run(
+                [candidate, "sdk-manager", "--version"],
+                capture_output=True, text=True, timeout=15,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return False
+        return result.returncode == 0
+
+    @classmethod
+    def _find_nrfutil(cls) -> str | None:
+        """Locate an nrfutil binary that provides the SDK manager.
+
+        Searches every PATH entry — not just the first hit, since a machine
+        can carry several unrelated ``nrfutil`` binaries — then the standard
+        install locations (``~/.nrfutil/bin/``, ``~/ncs_tools/``).  Each
+        candidate is probed; the first that answers to ``sdk-manager`` wins.
+
+        Version-manager shims are tried last.  The path found here is baked
+        into the generated activation script, and a shim re-resolves the name
+        at run time: the same shim answers the probe now and can dispatch to a
+        different binary during the build, when the environment sets another
+        interpreter version.  A real binary cannot change under us.
+        """
+        direct: list[str] = []
+        shims: list[str] = []
+        seen: set[str] = set()
+
+        def add(path: Path) -> None:
+            resolved = str(path)
+            if resolved in seen or not path.is_file():
+                return
+            seen.add(resolved)
+            # Same marker resolve_real_binary() uses — pyenv and asdf share it.
+            (shims if "/shims/" in resolved else direct).append(resolved)
+
+        for entry in os.environ.get("PATH", "").split(os.pathsep):
+            if not entry:
+                continue
+            for name in ("nrfutil-sdk-manager", "nrfutil"):
+                add(Path(entry) / name)
         for cand in (
             Path.home() / ".nrfutil" / "bin" / "nrfutil-sdk-manager",
             Path.home() / ".nrfutil" / "bin" / "nrfutil",
             Path.home() / "ncs_tools" / "nrfutil",
         ):
-            if cand.is_file():
-                return str(cand)
+            add(cand)
+
+        for candidate in (*direct, *shims):
+            if cls._provides_sdk_manager(candidate):
+                return candidate
+        if seen:
+            log.warning(
+                "Found %d nrfutil binaries, none providing 'sdk-manager': %s",
+                len(seen), ", ".join(sorted(seen)[:4]),
+            )
         return None
 
     @staticmethod
