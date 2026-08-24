@@ -169,7 +169,6 @@ def _init_and_index(
     proj: Path,
     *,
     replacements: dict[str, str] | None = None,
-    local_replacements: dict[str, str] | None = None,
     timeout: int | None = None,
     extra_env: dict[str, str] | None = None,
     keep_build: bool = False,
@@ -249,16 +248,10 @@ def _init_and_index(
     if replacements:
         _patch_config(config_path, dict(replacements))
 
-    # Step 2b: patch local.toml, which OVERRIDES config.toml.
-    # `fw-context init` writes its auto-detected build environment there
-    # (Python path, activate script), so a key set in config.toml alone is
-    # silently ignored.  A test that needs to choose the environment has to
-    # write it here.
-    if local_replacements:
-        local_path = proj / ".fw-context" / "local.toml"
-        if not local_path.exists():
-            local_path.write_text("[build]\n", encoding="utf-8")
-        _patch_config(local_path, dict(local_replacements))
+    # NOTE for anyone adding a build-environment override here: local.toml
+    # OVERRIDES config.toml, and `fw-context init` writes its auto-detected
+    # environment (python path, activate script) into local.toml.  A key set
+    # in config.toml alone is silently ignored.
 
     # Step 3: fw-context index (auto-build + index)
     result = _cli(
@@ -785,7 +778,6 @@ class TestZephyrInitAndIndex:
     # fixture's own ci/sdk.env, so the version stays with the fixture, and it
     # exports the whole toolchain — cmake, ninja, dtc, gperf and the SDK's own
     # Python — not just the compiler that _ZEPHYR_ENV below names.
-    _ACTIVATE = Path(os.path.expanduser("~/ncs_tools/nordic_minimal_setup.sh"))
 
     _ZEPHYR_ENV = {
         "PYENV_VERSION": "3.11.8",
@@ -810,20 +802,15 @@ class TestZephyrInitAndIndex:
             pytest.skip("Zephyr SDK not found")
         if not cls._WEST_BIN.exists():
             pytest.skip(f"west not installed (expected at {cls._WEST_BIN})")
-        if not cls._ACTIVATE.is_file():
-            pytest.skip(f"NCS environment script not found at {cls._ACTIVATE}")
-        if not (_BUILDS / "zephyr" / "ci" / "sdk.env").is_file():
-            pytest.skip("fixture has no ci/sdk.env — the activate script needs it")
+        # No activate script is configured on purpose.  `fw-context init`
+        # writes .fw-context/ncs-env.sh for the chosen SDK, and that generic
+        # path is what a project without its own setup script gets — so it is
+        # the one worth covering.  Pointing the fixture at a hand-written
+        # script would test one machine's custom arrangement instead.
         proj = _init_and_index(
             _BUILDS / "zephyr",
             replacements={
                 "[build] board": '"nrf52840dk/nrf52840"',
-            },
-            # Goes in local.toml, not config.toml: `fw-context init` writes
-            # its own auto-detected activate script there, and local.toml
-            # wins.  Setting it in config.toml has no effect at all.
-            local_replacements={
-                "[build] activate": f'"{cls._ACTIVATE}"',
             },
             extra_env=cls._ZEPHYR_ENV,
             clean_db=True,

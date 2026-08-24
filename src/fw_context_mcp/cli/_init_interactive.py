@@ -65,6 +65,31 @@ def prompt_build_system(non_interactive: bool, *, current: str | None = None) ->
     return current
 
 
+# Sentinel for the picker's "I have my own script" entry.  A version string
+# can never collide with it.
+_OWN_SCRIPT = "\0own-script"
+
+
+def _prompt_own_env_script(project_root: Path, *, dry_run: bool) -> str | None:
+    """Ask for a hand-written environment script and use it as-is.
+
+    The generated script is the default because it works for anyone with an
+    SDK installed.  A project with its own arrangement — a shared team script
+    that pins the version, sets extra variables, or activates a venv — says
+    so here instead of having the generated one imposed on it.
+    """
+    val = prompt_text("Path to your SDK environment script", non_interactive=False)
+    if not val:
+        return None
+    path = Path(val).expanduser()
+    if not path.is_file():
+        print(f"  [warn] {path} does not exist — writing it anyway, fix it later.")
+    if dry_run:
+        print(f"  [dry-run] Would use {path}")
+        return None
+    return str(path)
+
+
 def _configure_ncs_version(
     project_root: Path, *, dry_run: bool, non_interactive: bool
 ) -> str | None:
@@ -75,6 +100,19 @@ def _configure_ncs_version(
     falls back to the generic detection and prompt.
     """
     from ..indexer.builders.zephyr import ZephyrBuildSystem
+
+    # Upstream Zephyr sets its own paths — sourcing zephyr-env.sh or
+    # activating the workspace exports ZEPHYR_BASE and
+    # ZEPHYR_SDK_INSTALL_DIR.  When they are already there, use them; there
+    # is nothing to choose between.  Only NCS needs asking, because its
+    # environment does not exist until nrfutil is told which version to make.
+    try:
+        zephyr_sdk = ZephyrBuildSystem.zephyr_sdk_from_environment()
+    except Exception:  # noqa: BLE001 — detection is best-effort at init
+        zephyr_sdk = None
+    if zephyr_sdk is not None and zephyr_sdk.usable and zephyr_sdk.env_script:
+        print(f"  [ok] Zephyr SDK from the environment: {zephyr_sdk.path}")
+        return str(zephyr_sdk.env_script)
 
     try:
         installs = ZephyrBuildSystem.list_installed_ncs()
@@ -87,6 +125,8 @@ def _configure_ncs_version(
     version = prompt_ncs_version(
         installs, default=preferred, non_interactive=non_interactive
     )
+    if version == _OWN_SCRIPT:
+        return _prompt_own_env_script(project_root, dry_run=dry_run)
     if version is None:
         print(
             "  No SDK version chosen — set [build] activate yourself, or "
@@ -104,13 +144,13 @@ def _configure_ncs_version(
         return None
 
     if dry_run:
-        print(f"  [dry-run] Would use nRF Connect SDK {version} ({chosen.sdk_dir})")
+        print(f"  [dry-run] Would use nRF Connect SDK {version} ({chosen.path})")
         return None
 
     script = ZephyrBuildSystem._write_ncs_env_script(
-        project_root, nrfutil, version, str(chosen.sdk_dir.parent)
+        project_root, nrfutil, version, str(chosen.path.parent)
     )
-    print(f"  [ok] nRF Connect SDK: {version} ({chosen.sdk_dir})")
+    print(f"  [ok] nRF Connect SDK: {version} ({chosen.path})")
     return script
 
 
@@ -144,6 +184,8 @@ def prompt_ncs_version(
     for index, install in enumerate(usable, start=1):
         marker = "  (matches this project's environment)" if install.version == default else ""
         print(f"  {index:>2}. {install.describe()}{marker}")
+    own = len(usable) + 1
+    print(f"  {own:>2}. I have my own environment script")
     suffix = f" [{default}]" if default else ""
     answer = _input(f"  >{suffix} ")
     if not answer:
@@ -154,6 +196,8 @@ def prompt_ncs_version(
         # Accept the version string too — "v3.2.3" is what the user sees.
         match = [i for i in usable if i.version == answer.strip()]
         return match[0].version if match else default
+    if choice == own:
+        return _OWN_SCRIPT
     if 1 <= choice <= len(usable):
         return usable[choice - 1].version
     return default

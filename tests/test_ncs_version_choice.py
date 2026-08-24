@@ -20,14 +20,20 @@ from pathlib import Path
 
 import pytest
 
-from fw_context_mcp.cli._init_interactive import prompt_ncs_version
-from fw_context_mcp.indexer.builders.zephyr import NcsInstall, ZephyrBuildSystem
+from fw_context_mcp.cli._init_interactive import _OWN_SCRIPT, prompt_ncs_version
+from fw_context_mcp.indexer.builders.zephyr import (
+    SDK_KIND_NCS,
+    SDK_KIND_ZEPHYR,
+    SdkChoice,
+    ZephyrBuildSystem,
+)
 
 
-def _install(version: str, *, usable: bool = True) -> NcsInstall:
-    return NcsInstall(
+def _install(version: str, *, usable: bool = True) -> SdkChoice:
+    return SdkChoice(
+        kind=SDK_KIND_NCS,
         version=version,
-        sdk_dir=Path(f"/home/u/ncs/{version}"),
+        path=Path(f"/home/u/ncs/{version}"),
         toolchain_path=Path("/home/u/ncs/toolchains/abc") if usable else None,
         usable=usable,
     )
@@ -90,7 +96,7 @@ class TestListInstalled:
         )
         assert [i.version for i in installs] == ["v3.4.0", "v3.2.3"]
         assert all(i.usable for i in installs)
-        assert installs[0].sdk_dir == Path("/home/u/ncs/v3.4.0")
+        assert installs[0].path == Path("/home/u/ncs/v3.4.0")
 
     def test_a_version_without_its_toolchain_is_not_usable(self, tmp_path: Path):
         """Offering it would only defer the failure to the build."""
@@ -189,3 +195,80 @@ class TestPrompt:
             default="v3.4.0", non_interactive=False,
         )
         assert chosen == "v3.4.0"
+
+    def test_a_own_script_entry_is_offered_after_the_versions(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        """The generated script is the default; a custom one stays possible.
+
+        A project with its own team script has to be able to say so instead
+        of having the generated one imposed on it.
+        """
+        monkeypatch.setattr(
+            "fw_context_mcp.cli._init_interactive._input", lambda _: "3"
+        )
+        chosen = prompt_ncs_version(
+            [_install("v3.4.0"), _install("v3.2.3")],
+            default=None, non_interactive=False,
+        )
+        assert chosen == _OWN_SCRIPT
+
+
+class TestZephyrSdkIsNotNcs:
+    """Upstream Zephyr and the nRF Connect SDK are different things.
+
+    Zephyr's own workflow exports ZEPHYR_BASE and ZEPHYR_SDK_INSTALL_DIR when
+    you source zephyr-env.sh or activate the workspace, so anyone using it
+    already has the paths set — there is nothing to pick between.  NCS is the
+    opposite: its environment is created by `nrfutil sdk-manager toolchain
+    env`, which takes the version as an argument, so before it runs there is
+    nothing in the environment to read.
+    """
+
+    def test_it_is_read_from_the_environment(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ):
+        sdk = tmp_path / "zephyr-sdk-0.17.0"
+        sdk.mkdir()
+        (sdk / "environment-setup-x86_64-pokysdk-linux").write_text("", encoding="utf-8")
+        monkeypatch.setenv("ZEPHYR_SDK_INSTALL_DIR", str(sdk))
+
+        choice = ZephyrBuildSystem.zephyr_sdk_from_environment()
+        assert choice is not None
+        assert choice.kind == SDK_KIND_ZEPHYR
+        assert choice.version == "0.17.0"
+        assert choice.usable is True
+        assert choice.env_script is not None
+
+    def test_without_the_variable_there_is_nothing_to_report(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        monkeypatch.delenv("ZEPHYR_SDK_INSTALL_DIR", raising=False)
+        assert ZephyrBuildSystem.zephyr_sdk_from_environment() is None
+
+    def test_a_directory_without_an_env_script_is_not_usable(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ):
+        sdk = tmp_path / "zephyr-sdk-0.17.0"
+        sdk.mkdir()
+        monkeypatch.setenv("ZEPHYR_SDK_INSTALL_DIR", str(sdk))
+
+        choice = ZephyrBuildSystem.zephyr_sdk_from_environment()
+        assert choice is not None
+        assert choice.usable is False
+
+    def test_a_missing_directory_is_not_reported(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ):
+        monkeypatch.setenv("ZEPHYR_SDK_INSTALL_DIR", str(tmp_path / "gone"))
+        assert ZephyrBuildSystem.zephyr_sdk_from_environment() is None
+
+    def test_the_two_kinds_are_labelled_apart(self):
+        ncs = _install("v3.2.3")
+        zephyr = SdkChoice(
+            kind=SDK_KIND_ZEPHYR, version="0.17.0",
+            path=Path("/opt/zephyr-sdk-0.17.0"), usable=True,
+        )
+        assert ncs.label != zephyr.label
+        assert "nRF Connect" in ncs.describe()
+        assert "Zephyr SDK" in zephyr.describe()

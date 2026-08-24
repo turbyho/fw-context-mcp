@@ -24,23 +24,47 @@ log = logging.getLogger(__name__)
 _ZEPHYR_MARKERS = ["west.yml", "zephyr"]
 
 
-@dataclass(frozen=True)
-class NcsInstall:
-    """One nRF Connect SDK version installed on this machine.
+# The two toolchain families a Zephyr project can build with.  They are not
+# interchangeable and are discovered differently, so the kind travels with
+# every option instead of being inferred later.
+#
+#   NCS         — Nordic's nRF Connect SDK.  Versions live under the
+#                 installation directory nrfutil manages, and the environment
+#                 comes from `nrfutil sdk-manager toolchain env`, which
+#                 bundles its own Zephyr SDK inside the toolchain.
+#   ZEPHYR_SDK  — the upstream Zephyr SDK.  A zephyr-sdk-<version> directory
+#                 that ships its own environment-setup-* script.
+SDK_KIND_NCS = "ncs"
+SDK_KIND_ZEPHYR = "zephyr-sdk"
 
-    ``usable`` is False when the SDK tree is present but its toolchain is
-    not — offering such a version would only defer the failure to the build.
+
+@dataclass(frozen=True)
+class SdkChoice:
+    """One toolchain a Zephyr project could build with.
+
+    ``usable`` is False when the pieces needed to compile are not all there —
+    an NCS version whose toolchain is missing, or a Zephyr SDK with no
+    environment script.  Offering those would only defer the failure to the
+    build.
     """
 
+    kind: str
     version: str
-    sdk_dir: Path
-    toolchain_path: Path | None
+    path: Path
     usable: bool
+    # NCS only: the toolchain bundle nrfutil installed for this version.
+    toolchain_path: Path | None = None
+    # Zephyr SDK only: the environment-setup-* script to source.
+    env_script: Path | None = None
+
+    @property
+    def label(self) -> str:
+        return "nRF Connect SDK" if self.kind == SDK_KIND_NCS else "Zephyr SDK"
 
     def describe(self) -> str:
         """One line for the init picker."""
-        state = "" if self.usable else "  (toolchain missing)"
-        return f"{self.version}  {self.sdk_dir}{state}"
+        state = "" if self.usable else "  (incomplete)"
+        return f"{self.label} {self.version}  {self.path}{state}"
 
 
 class ZephyrBuildSystem:
@@ -381,7 +405,38 @@ class ZephyrBuildSystem:
         return None
 
     @classmethod
-    def list_installed_ncs(cls, nrfutil: str | None = None) -> list[NcsInstall]:
+    def zephyr_sdk_from_environment(cls) -> SdkChoice | None:
+        """Return the upstream Zephyr SDK the environment already names.
+
+        WHY only the environment, and no search of the standard install
+        locations: an upstream Zephyr workflow sets its own paths — you
+        source ``zephyr-env.sh`` or activate the workspace venv, and
+        ``ZEPHYR_BASE`` and ``ZEPHYR_SDK_INSTALL_DIR`` are exported.  Someone
+        working that way has them set already, so there is nothing to pick
+        between and nothing to ask.
+
+        NCS is the opposite case, which is why it gets a picker: its
+        environment is *created* by ``nrfutil sdk-manager toolchain env``,
+        and that command takes the version as an argument.  Before it runs
+        there is nothing in the environment to read.
+        """
+        env_dir = os.environ.get("ZEPHYR_SDK_INSTALL_DIR")
+        if not env_dir:
+            return None
+        sdk_dir = Path(env_dir).expanduser()
+        if not sdk_dir.is_dir():
+            return None
+        script = next(iter(sorted(sdk_dir.glob("environment-setup-*"))), None)
+        return SdkChoice(
+            kind=SDK_KIND_ZEPHYR,
+            version=sdk_dir.name.removeprefix("zephyr-sdk-"),
+            path=sdk_dir,
+            usable=script is not None,
+            env_script=script,
+        )
+
+    @classmethod
+    def list_installed_ncs(cls, nrfutil: str | None = None) -> list[SdkChoice]:
         """Return the NCS versions installed on this machine, newest first.
 
         WHY ask nrfutil rather than scan ``~/ncs``: the directory names give
@@ -407,7 +462,7 @@ class ZephyrBuildSystem:
             return []
 
         # --json emits JSON Lines; the versions arrive in one "info" record.
-        installs: list[NcsInstall] = []
+        installs: list[SdkChoice] = []
         for line in result.stdout.splitlines():
             line = line.strip()
             if not line:
@@ -426,8 +481,8 @@ class ZephyrBuildSystem:
         return installs
 
     @staticmethod
-    def _parse_ncs_entry(entry: object) -> NcsInstall | None:
-        """Turn one ``sdk-manager list`` record into an :class:`NcsInstall`."""
+    def _parse_ncs_entry(entry: object) -> SdkChoice | None:
+        """Turn one ``sdk-manager list`` record into an :class:`SdkChoice`."""
         if not isinstance(entry, dict):
             return None
         version = entry.get("version")
@@ -435,9 +490,10 @@ class ZephyrBuildSystem:
         if not isinstance(version, str) or not dir_names:
             return None
         toolchain = entry.get("toolchainPath")
-        return NcsInstall(
+        return SdkChoice(
+            kind=SDK_KIND_NCS,
             version=version,
-            sdk_dir=Path(str(dir_names[0])),
+            path=Path(str(dir_names[0])),
             toolchain_path=Path(str(toolchain)) if toolchain else None,
             # Both halves have to be present: an SDK tree without its
             # toolchain compiles nothing, and offering it would only produce
