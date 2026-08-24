@@ -1275,13 +1275,24 @@ def _cleanup_old_for_pair(
             delete_build_data(conn, old_ch)
         deleted.append(old_ch)
 
+    # Both on-disk artifacts of a retired build go with its rows.  The
+    # manifest used to be left behind: nothing reads an abandoned build's
+    # manifest since the reuse tier was removed, so it was pure accumulation —
+    # one file per dialect change, 52 MB of it on zbox-ecb-fw, for the life of
+    # the project.  It also made load(db_dir) ambiguous, since that form picks
+    # the most recently modified manifest in the directory.
+    from .manifest import _manifest_path
+
     cc_dir = db_dir / project_id
-    if cc_dir.exists():
-        for old_ch in deleted:
+    for old_ch in deleted:
+        for artifact in (
+            _manifest_path(db_dir, old_ch),
+            cc_dir / f"compile_commands.{old_ch}.json",
+        ):
             try:
-                (cc_dir / f"compile_commands.{old_ch}.json").unlink(missing_ok=True)
-            except OSError:
-                pass
+                artifact.unlink(missing_ok=True)
+            except OSError as exc:
+                log.debug("could not remove %s: %s", artifact.name, exc)
     return deleted
 
 

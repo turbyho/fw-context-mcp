@@ -3472,6 +3472,41 @@ class TestBuildRetention:
         finally:
             conn.close()
 
+    def test_old_build_leaves_no_files_on_disk(self, c_project: Path):
+        """A retired build takes both of its on-disk artifacts with it.
+
+        The manifest used to be left behind.  Nothing reads an abandoned
+        build's manifest since the reuse tier was removed, so it was pure
+        accumulation — one file per dialect change, and 52 MB of it on
+        zbox-ecb-fw.  It also made ``manifest.load(db_dir)`` ambiguous: that
+        form picks the most recently modified manifest in the directory.
+        """
+        db_path = _db_path_for_project(c_project)
+        assert _index_cli(c_project).returncode == 0
+
+        conn = open_db(db_path)
+        try:
+            old_hash = _build_hashes(conn)[0]
+        finally:
+            conn.close()
+        assert (db_path.parent / f"manifest.{old_hash}.json").exists(), "seed failed"
+
+        _change_build_dialect(c_project, "ARTIFACT_PROBE=1")
+        result = _index_cli(c_project)
+        assert result.returncode == 0, result.stderr
+
+        leftovers = sorted(
+            p.name for p in db_path.parent.glob(f"*.{old_hash}.json")
+        )
+        assert leftovers == [], (
+            f"artifacts of the retired build survived: {leftovers}\n"
+            + result.stderr[-2000:]
+        )
+        remaining = sorted(p.name for p in db_path.parent.glob("manifest.*.json"))
+        assert len(remaining) == 1, (
+            f"expected exactly one manifest after retention, found {remaining}"
+        )
+
     def test_old_build_leaves_no_rows_behind(self, c_project: Path):
         """Deleting a build must take its rows with it, not just its row in
         ``build_configs`` — otherwise the tables grow without bound."""
