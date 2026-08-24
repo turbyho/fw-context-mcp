@@ -626,6 +626,21 @@ class ZephyrBuildSystem:
         toolchain env`` for the toolchain plus ``ZEPHYR_BASE`` — so fw-context
         does not depend on a project-specific setup script.  The script path is
         returned so it can be persisted as ``[build] activate``.
+
+        ``ZEPHYR_BASE`` is set here because ``toolchain env`` does not set it;
+        that is a known gap in the Nordic tooling, not an oversight.
+
+        WHY ``zephyr-env.sh`` is deliberately NOT sourced: beyond exporting
+        the same ``ZEPHYR_BASE``, it does two things.  It prepends
+        ``$ZEPHYR_BASE/scripts`` to PATH — tools people run by hand
+        (``twister``, ``checkpatch``), which ``west build`` does not need;
+        measured, the toolchain env omits that directory and the build
+        succeeds anyway.  And it sources ``~/.config/zephyr/zephyrrc`` or
+        ``~/.zephyrrc``, a user file of arbitrary content.  Pulling that in
+        would make a private rc file an invisible input to every index build,
+        so two machines could produce different indexes with nothing in the
+        project to explain it.  A project that genuinely needs its own
+        environment sets ``[build] activate`` to its own script instead.
         """
         wrapper_dir = project_root / ".fw-context"
         wrapper_dir.mkdir(parents=True, exist_ok=True)

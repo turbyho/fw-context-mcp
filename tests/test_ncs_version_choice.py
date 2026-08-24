@@ -20,7 +20,7 @@ from pathlib import Path
 
 import pytest
 
-from fw_context_mcp.cli._init_interactive import _OWN_SCRIPT, prompt_ncs_version
+from fw_context_mcp.cli._init_interactive import prompt_ncs_version
 from fw_context_mcp.indexer.builders.zephyr import (
     SDK_KIND_NCS,
     SDK_KIND_ZEPHYR,
@@ -196,22 +196,107 @@ class TestPrompt:
         )
         assert chosen == "v3.4.0"
 
-    def test_a_own_script_entry_is_offered_after_the_versions(
+    def test_only_installed_sdks_are_offered(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+    ):
+        """A hand-written script is manual configuration, not an init choice.
+
+        A project that wants one sets [build] activate itself; init offers
+        the SDKs it found and nothing else.
+        """
+        monkeypatch.setattr(
+            "fw_context_mcp.cli._init_interactive._input", lambda _: "1"
+        )
+        prompt_ncs_version(
+            [_install("v3.4.0"), _install("v3.2.3")],
+            default=None, non_interactive=False,
+        )
+        menu = capsys.readouterr().out
+        assert "v3.4.0" in menu and "v3.2.3" in menu
+        assert "own" not in menu.lower()
+        assert "script" not in menu.lower()
+
+    def test_an_answer_past_the_last_sdk_keeps_the_default(
         self, monkeypatch: pytest.MonkeyPatch
     ):
-        """The generated script is the default; a custom one stays possible.
-
-        A project with its own team script has to be able to say so instead
-        of having the generated one imposed on it.
-        """
+        """There is no entry after the versions to select."""
         monkeypatch.setattr(
             "fw_context_mcp.cli._init_interactive._input", lambda _: "3"
         )
         chosen = prompt_ncs_version(
             [_install("v3.4.0"), _install("v3.2.3")],
-            default=None, non_interactive=False,
+            default="v3.4.0", non_interactive=False,
         )
-        assert chosen == _OWN_SCRIPT
+        assert chosen == "v3.4.0"
+
+
+class TestAlreadyConfigured:
+    """A configured environment is the standing answer until someone changes it.
+
+    init does not ask for a script path — a custom one is set by hand in the
+    config.  What it does on a re-run is show what is configured, so the
+    choice can be moved to a standard SDK without editing the file.
+    """
+
+    _SCRIPT = "/home/u/ncs_tools/nordic_minimal_setup.sh"
+
+    def test_the_configured_script_is_shown_first_and_kept_by_default(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+    ):
+        monkeypatch.setattr("fw_context_mcp.cli._init_interactive._input", lambda _: "")
+        chosen = prompt_ncs_version(
+            [_install("v3.4.0"), _install("v3.2.3")],
+            default=None, non_interactive=False, current=self._SCRIPT,
+        )
+        assert chosen == self._SCRIPT
+
+        menu = capsys.readouterr().out
+        first_line = next(line for line in menu.splitlines() if line.strip().startswith("1."))
+        assert self._SCRIPT in first_line
+        assert "(current)" in first_line
+
+    def test_an_sdk_can_be_chosen_instead(self, monkeypatch: pytest.MonkeyPatch):
+        """Entry 1 is the current script, so the SDKs start at 2."""
+        monkeypatch.setattr("fw_context_mcp.cli._init_interactive._input", lambda _: "2")
+        chosen = prompt_ncs_version(
+            [_install("v3.4.0"), _install("v3.2.3")],
+            default=None, non_interactive=False, current=self._SCRIPT,
+        )
+        assert chosen == "v3.4.0"
+
+    def test_an_unattended_run_never_switches_away(self):
+        """Silently replacing a configured environment is not init's call."""
+        chosen = prompt_ncs_version(
+            [_install("v3.4.0"), _install("v3.2.3")],
+            default="v3.2.3", non_interactive=True, current=self._SCRIPT,
+        )
+        assert chosen == self._SCRIPT
+
+    def test_it_is_offered_even_with_a_single_sdk_installed(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        """With one SDK and no current value there is nothing to ask.
+
+        With a current value there is: keep it, or move to that one SDK.
+        """
+        monkeypatch.setattr("fw_context_mcp.cli._init_interactive._input", lambda _: "2")
+        chosen = prompt_ncs_version(
+            [_install("v3.2.3")],
+            default=None, non_interactive=False, current=self._SCRIPT,
+        )
+        assert chosen == "v3.2.3"
+
+    def test_a_junk_answer_keeps_the_configured_script(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        monkeypatch.setattr(
+            "fw_context_mcp.cli._init_interactive._input", lambda _: "nonsense"
+        )
+        chosen = prompt_ncs_version(
+            [_install("v3.4.0")],
+            default=None, non_interactive=False, current=self._SCRIPT,
+        )
+        assert chosen == self._SCRIPT
 
 
 class TestZephyrSdkIsNotNcs:

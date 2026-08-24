@@ -65,41 +65,34 @@ def prompt_build_system(non_interactive: bool, *, current: str | None = None) ->
     return current
 
 
-# Sentinel for the picker's "I have my own script" entry.  A version string
-# can never collide with it.
-_OWN_SCRIPT = "\0own-script"
-
-
-def _prompt_own_env_script(project_root: Path, *, dry_run: bool) -> str | None:
-    """Ask for a hand-written environment script and use it as-is.
-
-    The generated script is the default because it works for anyone with an
-    SDK installed.  A project with its own arrangement — a shared team script
-    that pins the version, sets extra variables, or activates a venv — says
-    so here instead of having the generated one imposed on it.
-    """
-    val = prompt_text("Path to your SDK environment script", non_interactive=False)
-    if not val:
-        return None
-    path = Path(val).expanduser()
-    if not path.is_file():
-        print(f"  [warn] {path} does not exist — writing it anyway, fix it later.")
-    if dry_run:
-        print(f"  [dry-run] Would use {path}")
-        return None
-    return str(path)
-
-
 def _configure_ncs_version(
-    project_root: Path, *, dry_run: bool, non_interactive: bool
+    project_root: Path, *, dry_run: bool, non_interactive: bool,
+    current: str | None = None,
 ) -> str | None:
     """Pick an NCS version and write the activation script for it.
+
+    *current* is the ``[build] activate`` already in the config, when there is
+    one.  It is offered first and kept by default, so a re-run of init shows
+    what the project uses — a hand-written script included — and only moves
+    off it when asked.
 
     Returns the script path, or None when there is nothing to configure —
     no NCS installs, or no answer in a non-interactive run.  The caller then
     falls back to the generic detection and prompt.
     """
     from ..indexer.builders.zephyr import ZephyrBuildSystem
+
+    if current:
+        # A configured environment is the answer until someone changes it;
+        # do not let the environment scan below silently override it.
+        installs = ZephyrBuildSystem.list_installed_ncs()
+        version = prompt_ncs_version(
+            installs, default=None, non_interactive=non_interactive, current=current
+        )
+        if version is None or version == current:
+            print(f"  Build activate: {current} (already configured)")
+            return current
+        return _write_ncs_script(project_root, installs, version, dry_run=dry_run)
 
     # Upstream Zephyr sets its own paths — sourcing zephyr-env.sh or
     # activating the workspace exports ZEPHYR_BASE and
@@ -125,14 +118,21 @@ def _configure_ncs_version(
     version = prompt_ncs_version(
         installs, default=preferred, non_interactive=non_interactive
     )
-    if version == _OWN_SCRIPT:
-        return _prompt_own_env_script(project_root, dry_run=dry_run)
     if version is None:
         print(
             "  No SDK version chosen — set [build] activate yourself, or "
             "re-run init interactively."
         )
         return None
+
+    return _write_ncs_script(project_root, installs, version, dry_run=dry_run)
+
+
+def _write_ncs_script(
+    project_root: Path, installs: list, version: str, *, dry_run: bool
+) -> str | None:
+    """Generate the activation script for *version* and return its path."""
+    from ..indexer.builders.zephyr import ZephyrBuildSystem
 
     chosen = next((i for i in installs if i.version == version), None)
     if chosen is None:
@@ -155,7 +155,8 @@ def _configure_ncs_version(
 
 
 def prompt_ncs_version(
-    installs: list, *, default: str | None, non_interactive: bool
+    installs: list, *, default: str | None, non_interactive: bool,
+    current: str | None = None,
 ) -> str | None:
     """Ask which nRF Connect SDK version to build against.
 
@@ -172,35 +173,40 @@ def prompt_ncs_version(
     may be None — the caller then declines to configure rather than pick.
     """
     usable = [i for i in installs if i.usable]
-    if not usable:
-        return None
-    if len(usable) == 1:
-        # Nothing to choose.
-        return usable[0].version
+    if current is None:
+        if not usable:
+            return None
+        if len(usable) == 1:
+            # Nothing to choose.
+            return usable[0].version
     if non_interactive:
-        return default
+        # Never switch an unattended run off what is configured.
+        return current or default
 
     print("\n  Which nRF Connect SDK should this project build with?")
-    for index, install in enumerate(usable, start=1):
+    entries: list[tuple[str, str]] = []
+    if current is not None:
+        entries.append((current, f"{current}  (current)"))
+    for install in usable:
         marker = "  (matches this project's environment)" if install.version == default else ""
-        print(f"  {index:>2}. {install.describe()}{marker}")
-    own = len(usable) + 1
-    print(f"  {own:>2}. I have my own environment script")
-    suffix = f" [{default}]" if default else ""
+        entries.append((install.version, f"{install.describe()}{marker}"))
+    for index, (_value, line) in enumerate(entries, start=1):
+        print(f"  {index:>2}. {line}")
+
+    keep = current or default
+    suffix = f" [{keep}]" if keep else ""
     answer = _input(f"  >{suffix} ")
     if not answer:
-        return default
+        return keep
     try:
         choice = int(answer)
     except ValueError:
         # Accept the version string too — "v3.2.3" is what the user sees.
-        match = [i for i in usable if i.version == answer.strip()]
-        return match[0].version if match else default
-    if choice == own:
-        return _OWN_SCRIPT
-    if 1 <= choice <= len(usable):
-        return usable[choice - 1].version
-    return default
+        match = [v for v, _ in entries if v == answer.strip()]
+        return match[0] if match else keep
+    if 1 <= choice <= len(entries):
+        return entries[choice - 1][0]
+    return keep
 
 
 def prompt_text(
@@ -542,10 +548,26 @@ def resolve_build_env(
     if b.python or b.activate or b.idf_path:
         if b.python:
             print(f"  Build python: {b.python} (already configured)")
-        if b.activate:
-            print(f"  Build activate: {b.activate} (already configured)")
         if b.idf_path:
             print(f"  Build idf_path: {b.idf_path} (already configured)")
+        if b.activate and system == "zephyr":
+            # Show what is configured — a hand-written script included — as
+            # the standing choice, with the installed SDKs behind it so a
+            # re-run can switch.  init never asks for a script path: a custom
+            # one is set by hand in the config, and this only offers to move
+            # off it.
+            chosen = _configure_ncs_version(
+                project_root, dry_run=dry_run, non_interactive=non_interactive,
+                current=b.activate,
+            )
+            if chosen is not None and chosen != b.activate and not dry_run:
+                from ._init import _write_build_key
+
+                _write_build_key(project_root, "activate", chosen)
+                print(f"  [ok] Build activate: {chosen}")
+            return
+        if b.activate:
+            print(f"  Build activate: {b.activate} (already configured)")
         return
 
     if not system:
