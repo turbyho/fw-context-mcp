@@ -331,7 +331,14 @@ def _check_header_staleness(
 
     # Find the DB dir from the conn's path
     db_path = Path(conn.execute("PRAGMA database_list").fetchone()["file"])
-    manifest = load_manifest(db_path.parent)
+    # Load the manifest OF THIS BUILD.  Without the config_hash, load() falls
+    # back to the most recently written manifest.*.json — on a project with
+    # build variants that is whichever variant was indexed last, so the count
+    # returned for variant A could describe variant B's translation units and
+    # header hashes, and get cached under A's key.  A missing manifest for
+    # this build means there is no header-hash data for it, which is exactly
+    # "no header staleness known" rather than someone else's answer.
+    manifest = load_manifest(db_path.parent, config_hash)
     if not manifest:
         return 0, []
 
