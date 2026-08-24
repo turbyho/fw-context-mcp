@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import shutil
 import subprocess
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -20,6 +22,25 @@ if TYPE_CHECKING:
 log = logging.getLogger(__name__)
 
 _ZEPHYR_MARKERS = ["west.yml", "zephyr"]
+
+
+@dataclass(frozen=True)
+class NcsInstall:
+    """One nRF Connect SDK version installed on this machine.
+
+    ``usable`` is False when the SDK tree is present but its toolchain is
+    not — offering such a version would only defer the failure to the build.
+    """
+
+    version: str
+    sdk_dir: Path
+    toolchain_path: Path | None
+    usable: bool
+
+    def describe(self) -> str:
+        """One line for the init picker."""
+        state = "" if self.usable else "  (toolchain missing)"
+        return f"{self.version}  {self.sdk_dir}{state}"
 
 
 class ZephyrBuildSystem:
@@ -358,6 +379,124 @@ class ZephyrBuildSystem:
                 len(seen), ", ".join(sorted(seen)[:4]),
             )
         return None
+
+    @classmethod
+    def list_installed_ncs(cls, nrfutil: str | None = None) -> list[NcsInstall]:
+        """Return the NCS versions installed on this machine, newest first.
+
+        WHY ask nrfutil rather than scan ``~/ncs``: the directory names give
+        the version but not whether its toolchain is present, and a version
+        whose toolchain is missing cannot build anything.  ``sdk-manager
+        list`` reports both, and it knows the configured installation
+        directory, which need not be ``~/ncs``.
+
+        Returns an empty list when nrfutil is absent or answers with
+        something unparseable — the caller falls back to asking the user.
+        """
+        nrfutil = nrfutil or cls._find_nrfutil()
+        if nrfutil is None:
+            return []
+        try:
+            result = subprocess.run(
+                [nrfutil, "--json", "sdk-manager", "list"],
+                capture_output=True, text=True, timeout=30,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return []
+        if result.returncode != 0:
+            return []
+
+        # --json emits JSON Lines; the versions arrive in one "info" record.
+        installs: list[NcsInstall] = []
+        for line in result.stdout.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                payload = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            versions = (payload.get("data") or {}).get("versions")
+            if not isinstance(versions, list):
+                continue
+            for entry in versions:
+                install = cls._parse_ncs_entry(entry)
+                if install is not None:
+                    installs.append(install)
+        return installs
+
+    @staticmethod
+    def _parse_ncs_entry(entry: object) -> NcsInstall | None:
+        """Turn one ``sdk-manager list`` record into an :class:`NcsInstall`."""
+        if not isinstance(entry, dict):
+            return None
+        version = entry.get("version")
+        dir_names = entry.get("dirNames") or []
+        if not isinstance(version, str) or not dir_names:
+            return None
+        toolchain = entry.get("toolchainPath")
+        return NcsInstall(
+            version=version,
+            sdk_dir=Path(str(dir_names[0])),
+            toolchain_path=Path(str(toolchain)) if toolchain else None,
+            # Both halves have to be present: an SDK tree without its
+            # toolchain compiles nothing, and offering it would only produce
+            # a build failure later.
+            usable=(
+                entry.get("sdkStatus") == "installed"
+                and entry.get("toolchainStatus") == "installed"
+            ),
+        )
+
+    @classmethod
+    def preferred_ncs_version(cls, project_root: Path) -> str | None:
+        """Return the NCS version this project's environment points at.
+
+        ``ZEPHYR_BASE`` and ``west config zephyr.base`` both resolve to
+        ``<ncs_root>/<version>/zephyr``, so the version is right there in the
+        path.  It used to be discarded — both signals were reduced to the NCS
+        root and the version re-derived as "the newest directory under it",
+        which on a machine with several installs answers with a version the
+        project does not use.  The index would then be built against
+        different headers and different macros than the developer compiles
+        with, which is the one thing this tool must not get wrong.
+
+        Returns None when neither signal is present; the caller asks instead
+        of guessing.
+        """
+        for source in (cls._zephyr_base_version(), cls._west_config_version(project_root)):
+            if source is not None:
+                return source
+        return None
+
+    @staticmethod
+    def _version_from_zephyr_path(zephyr_dir: str | None) -> str | None:
+        """Extract ``vX.Y.Z`` from a ``.../vX.Y.Z/zephyr`` path."""
+        if not zephyr_dir:
+            return None
+        p = Path(zephyr_dir).resolve()
+        if p.name != "zephyr" or not p.parent.name.startswith("v"):
+            return None
+        return p.parent.name
+
+    @classmethod
+    def _zephyr_base_version(cls) -> str | None:
+        return cls._version_from_zephyr_path(os.environ.get("ZEPHYR_BASE"))
+
+    @classmethod
+    def _west_config_version(cls, project_root: Path) -> str | None:
+        if not shutil.which("west"):
+            return None
+        try:
+            r = subprocess.run(
+                ["west", "config", "zephyr.base"],
+                capture_output=True, text=True, timeout=5, cwd=str(project_root),
+            )
+        except (OSError, subprocess.SubprocessError):
+            return None
+        if r.returncode != 0:
+            return None
+        return cls._version_from_zephyr_path(r.stdout.strip())
 
     @staticmethod
     def _ncs_version(ncs_root: Path) -> str | None:

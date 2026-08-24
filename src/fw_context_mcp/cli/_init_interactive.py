@@ -65,6 +65,100 @@ def prompt_build_system(non_interactive: bool, *, current: str | None = None) ->
     return current
 
 
+def _configure_ncs_version(
+    project_root: Path, *, dry_run: bool, non_interactive: bool
+) -> str | None:
+    """Pick an NCS version and write the activation script for it.
+
+    Returns the script path, or None when there is nothing to configure —
+    no NCS installs, or no answer in a non-interactive run.  The caller then
+    falls back to the generic detection and prompt.
+    """
+    from ..indexer.builders.zephyr import ZephyrBuildSystem
+
+    try:
+        installs = ZephyrBuildSystem.list_installed_ncs()
+    except Exception:  # noqa: BLE001 — detection is best-effort at init
+        return None
+    if not installs:
+        return None
+
+    preferred = ZephyrBuildSystem.preferred_ncs_version(project_root)
+    version = prompt_ncs_version(
+        installs, default=preferred, non_interactive=non_interactive
+    )
+    if version is None:
+        print(
+            "  No SDK version chosen — set [build] activate yourself, or "
+            "re-run init interactively."
+        )
+        return None
+
+    chosen = next((i for i in installs if i.version == version), None)
+    if chosen is None:
+        return None
+
+    nrfutil = ZephyrBuildSystem._find_nrfutil()
+    if nrfutil is None:
+        print("  nrfutil with 'sdk-manager' not found — cannot write the env script.")
+        return None
+
+    if dry_run:
+        print(f"  [dry-run] Would use nRF Connect SDK {version} ({chosen.sdk_dir})")
+        return None
+
+    script = ZephyrBuildSystem._write_ncs_env_script(
+        project_root, nrfutil, version, str(chosen.sdk_dir.parent)
+    )
+    print(f"  [ok] nRF Connect SDK: {version} ({chosen.sdk_dir})")
+    return script
+
+
+def prompt_ncs_version(
+    installs: list, *, default: str | None, non_interactive: bool
+) -> str | None:
+    """Ask which nRF Connect SDK version to build against.
+
+    WHY this is asked rather than detected: the SDK version is an argument to
+    ``nrfutil sdk-manager toolchain env``, not something discoverable from the
+    project.  Before that environment is set up there is no ZEPHYR_BASE and
+    no toolchain on PATH, so a machine with several SDKs installed offers no
+    signal about which one this project wants.  Guessing "the newest" builds
+    the index against different headers and macros than the developer
+    compiles with.
+
+    *default* is the version the project's own environment points at, when
+    there is one; Enter keeps it.  Non-interactive returns the default, which
+    may be None — the caller then declines to configure rather than pick.
+    """
+    usable = [i for i in installs if i.usable]
+    if not usable:
+        return None
+    if len(usable) == 1:
+        # Nothing to choose.
+        return usable[0].version
+    if non_interactive:
+        return default
+
+    print("\n  Which nRF Connect SDK should this project build with?")
+    for index, install in enumerate(usable, start=1):
+        marker = "  (matches this project's environment)" if install.version == default else ""
+        print(f"  {index:>2}. {install.describe()}{marker}")
+    suffix = f" [{default}]" if default else ""
+    answer = _input(f"  >{suffix} ")
+    if not answer:
+        return default
+    try:
+        choice = int(answer)
+    except ValueError:
+        # Accept the version string too — "v3.2.3" is what the user sees.
+        match = [i for i in usable if i.version == answer.strip()]
+        return match[0].version if match else default
+    if 1 <= choice <= len(usable):
+        return usable[choice - 1].version
+    return default
+
+
 def prompt_text(
     label: str,
     *,
@@ -418,7 +512,18 @@ def resolve_build_env(
 
     builder_cls = _bregistry.get(system)
     detected: dict[str, str | None] = {"python": None, "activate": None}
-    if builder_cls and hasattr(builder_cls, "detect_environment"):
+
+    # Zephyr/NCS: the SDK version is a choice, not a detectable fact — see
+    # prompt_ncs_version.  Ask before falling back to detect_environment,
+    # which can only guess when several SDKs are installed.
+    if system == "zephyr":
+        chosen = _configure_ncs_version(
+            project_root, dry_run=dry_run, non_interactive=non_interactive
+        )
+        if chosen is not None:
+            detected["activate"] = chosen
+
+    if detected["activate"] is None and builder_cls and hasattr(builder_cls, "detect_environment"):
         try:
             detected = builder_cls.detect_environment(project_root)
         except Exception:
