@@ -59,6 +59,17 @@ def _mtime_bump_is_safe(
     return _hash_with_cache(resolved, hash_cache) == header.get("hash", "")
 
 
+def _patterns_changed(manifest: dict, build_dir_patterns: list[str] | None) -> bool:
+    """Do this run's build-output patterns differ from the stored ones?
+
+    A run that passes none inherits the stored value (see below), so that is
+    not a change.  Order is not significant, hence the set comparison.
+    """
+    if not build_dir_patterns:
+        return False
+    return set(manifest.get("build_dir_patterns") or ()) != set(build_dir_patterns)
+
+
 def _headers_moved_on(entry: dict, before: dict, after: dict) -> bool:
     """True when another translation unit refreshed a header of this entry.
 
@@ -199,7 +210,13 @@ def _update_manifest_after_index(
 
     Returns the updated manifest dict, or ``None`` when no update needed.
     """
-    from .manifest import MANIFEST_FORMAT, _collect_headers_from_tokens, _intern_arguments, save
+    from .manifest import (
+        MANIFEST_FORMAT,
+        _collect_headers_from_tokens,
+        _intern_arguments,
+        _is_generated_header,
+        save,
+    )
 
     # No TU was re-parsed — keep the existing manifest as-is, provided:
     #   - the TU list hasn't changed (same number of entries), and
@@ -225,6 +242,18 @@ def _update_manifest_after_index(
         if entries and not entries[0].get("source_hash"):
             log.info("Manifest has preliminary entries — regenerating with full hashes")
             # Fall through to full regeneration below (don't return early)
+        elif _patterns_changed(manifest, build_dir_patterns):
+            # `generated` is a function of the path and the build-output
+            # patterns.  When those change the stored flags describe a
+            # boundary this build no longer has, and header_is_trusted()
+            # reads them — so a narrowed pattern would have no effect until
+            # --force.  Measured: narrowing PlatformIO from '.pio/' to
+            # '.pio/build/' leaves the config_hash identical, so nothing else
+            # would ever rewrite this file.
+            log.info(
+                "Rebuilding manifest.json (build_dir_patterns changed: %s -> %s)",
+                manifest.get("build_dir_patterns"), build_dir_patterns,
+            )
         else:
             old_count = len(entries)
             if old_count == len(units):
@@ -242,6 +271,16 @@ def _update_manifest_after_index(
     # previous manifest so an entry carried over unchanged keeps the records
     # its path list points at; save() prunes whatever ends up unreferenced.
     header_table: dict[str, dict] = dict(manifest.get("headers") or {}) if manifest else {}
+    # `generated` is recomputed for every seeded record, always — not only
+    # when the patterns changed.  It is a pure function of the path and this
+    # build's patterns, and recomputing it here removes the whole class of
+    # drift where a record keeps a flag from a boundary the build no longer
+    # has.  The hash is NOT touched: that one carries history on purpose.
+    if header_table:
+        header_table = {
+            path: {**record, "generated": _is_generated_header(path, build_dir_patterns)}
+            for path, record in header_table.items()
+        }
     arg_sets: list[list[str]] = []
 
     def carry_over(old_entry: dict) -> dict:

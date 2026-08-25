@@ -115,10 +115,16 @@ def upsert_file(
     It must not be CLEARED either, which is what a plain
     ``generated=excluded.generated`` would do the moment one of those four
     callers touched the row again.  ``generated`` is a property of the PATH,
-    not of one caller's knowledge.  Within one config_hash the build-output
-    patterns are fixed; a change to them mints a new config_hash and
-    therefore new rows.  Same rule, and the same reason, as
+    not of one caller's knowledge.  Same rule, and the same reason, as
     merge_header_records() in manifest.py.
+
+    MAX therefore holds WITHIN a run and cannot heal ACROSS two.  An earlier
+    version of this text claimed the case could not arise, because a change
+    to build_dir_patterns mints a new config_hash.  Measured, that is false:
+    narrowing PlatformIO from ``.pio/`` to ``.pio/build/`` left the
+    config_hash of HA_Boiler and of FM identical, because the path pass drops
+    in-project paths anyway.  _step_reconcile_generated() is what makes the
+    column right again, and it is the authoritative write.
 
     Args:
         conn: Open database connection.

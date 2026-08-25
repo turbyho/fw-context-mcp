@@ -149,8 +149,24 @@ class PlatformIOBuildSystem:
     # ── Build dir patterns ──
 
     def get_build_dir_patterns(self, project_root: Path) -> list[str]:
-        """Return build-output directory patterns for staleness filtering."""
-        return [".pio/"]
+        """Return the directory PlatformIO writes its build output into.
+
+        ``.pio/build/``, not ``.pio/``.  These patterns are matched as a
+        SUBSTRING by _is_generated_header(), so the wider form also caught
+        ``.pio/libdeps/``, which holds the SOURCE of the libraries the tool
+        downloads — not build output.
+
+        That mattered once a build-generated header became the only thing the
+        staleness check still trusts: every vendored library header under
+        ``.pio/libdeps/`` was trusted, so an edit to one went unnoticed.
+        Measured: 56 of the 56 headers HA_Boiler called generated were under
+        libdeps and none were under build, and 1 of 1 on FM.  Every other
+        build system was clean — Mbed 0 of 1, Zephyr 0 of 27.
+
+        ``.pio/libdeps/`` keeps its own answer in get_vendor_patterns(): it is
+        vendor code, which is a different question from build output.
+        """
+        return [".pio/build/"]
 
     def get_vendor_patterns(
         self,

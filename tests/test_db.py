@@ -1,5 +1,7 @@
 """Tests for fw_context_mcp.indexer.db."""
 
+from pathlib import Path
+
 import pytest
 
 from fw_context_mcp.indexer.db import (
@@ -2166,6 +2168,10 @@ class TestGeneratedFlagIsMonotone:
     It must not be CLEARED either, which is what a plain
     ``generated=excluded.generated`` would do.  That direction is the
     negative control below; it held before this change as well.
+
+    MAX holds within a run and cannot heal across two, so a change of
+    build_dir_patterns that leaves the config_hash alone needs
+    _step_reconcile_generated().  See TestReconcileGenerated.
     """
 
     @staticmethod
@@ -2251,3 +2257,182 @@ class TestGeneratedFlagIsMonotone:
             assert row[1] == "NEW"
         finally:
             conn.close()
+
+
+class TestReconcileGenerated:
+    """The run makes ``files.generated`` agree with its own build_dir_patterns.
+
+    upsert_file() takes MAX, so a row can gain the flag but never lose it.
+    That is right inside a run and wrong across two.  Measured: narrowing
+    PlatformIO from ``.pio/`` to ``.pio/build/`` leaves the config_hash
+    identical, so 57 rows on HA_Boiler and FM would have kept a flag their
+    manifest no longer gives them.
+    """
+
+    @staticmethod
+    def _ctx(conn, patterns):
+        return {"config_hash": "cafe", "build_dir_patterns": patterns}
+
+    @staticmethod
+    def _conn(tmp_path: Path):
+        from fw_context_mcp.indexer.db import open_db, upsert_build_config, upsert_project
+
+        conn = open_db(tmp_path / "index.db")
+        upsert_project(conn, "proj", "Proj", str(tmp_path))
+        upsert_build_config(conn, "cafe", "proj", str(tmp_path / "compile_commands.json"))
+        return conn
+
+    @staticmethod
+    def _generated(conn, path):
+        return conn.execute(
+            "SELECT generated FROM files WHERE config_hash=? AND path=?",
+            ("cafe", path),
+        ).fetchone()[0]
+
+    def test_a_narrowed_pattern_clears_a_stale_flag(self, tmp_path: Path):
+        """The case MAX cannot reach: same config_hash, narrower patterns."""
+        from fw_context_mcp.indexer._postprocess import _step_reconcile_generated
+        from fw_context_mcp.indexer.db import upsert_file
+
+        conn = self._conn(tmp_path)
+        try:
+            # Written by a run that still used the wide '.pio/'.
+            upsert_file(conn, "cafe", ".pio/libdeps/Foo/foo.h", "c", generated=True)
+
+            _step_reconcile_generated(conn, self._ctx(conn, [".pio/build/"]))
+
+            assert self._generated(conn, ".pio/libdeps/Foo/foo.h") == 0
+        finally:
+            conn.close()
+
+    def test_real_build_output_keeps_the_flag(self, tmp_path: Path):
+        from fw_context_mcp.indexer._postprocess import _step_reconcile_generated
+        from fw_context_mcp.indexer.db import upsert_file
+
+        conn = self._conn(tmp_path)
+        try:
+            upsert_file(conn, "cafe", ".pio/build/esp32dev/gen.h", "c", generated=True)
+
+            _step_reconcile_generated(conn, self._ctx(conn, [".pio/build/"]))
+
+            assert self._generated(conn, ".pio/build/esp32dev/gen.h") == 1
+        finally:
+            conn.close()
+
+    def test_a_missed_row_gains_the_flag(self, tmp_path: Path):
+        """Reconciliation writes both directions, not only the clear."""
+        from fw_context_mcp.indexer._postprocess import _step_reconcile_generated
+        from fw_context_mcp.indexer.db import upsert_file
+
+        conn = self._conn(tmp_path)
+        try:
+            upsert_file(conn, "cafe", ".pio/build/esp32dev/gen.h", "c")
+
+            _step_reconcile_generated(conn, self._ctx(conn, [".pio/build/"]))
+
+            assert self._generated(conn, ".pio/build/esp32dev/gen.h") == 1
+        finally:
+            conn.close()
+
+    def test_it_is_idempotent(self, tmp_path: Path):
+        from fw_context_mcp.indexer._postprocess import _step_reconcile_generated
+        from fw_context_mcp.indexer.db import upsert_file
+
+        conn = self._conn(tmp_path)
+        try:
+            upsert_file(conn, "cafe", ".pio/build/gen.h", "c")
+            upsert_file(conn, "cafe", "src/main.c", "c")
+
+            for _ in range(3):
+                _step_reconcile_generated(conn, self._ctx(conn, [".pio/build/"]))
+
+            assert self._generated(conn, ".pio/build/gen.h") == 1
+            assert self._generated(conn, "src/main.c") == 0
+        finally:
+            conn.close()
+
+    def test_no_patterns_clears_everything(self, tmp_path: Path):
+        """With no patterns nothing is build output, and the column says so."""
+        from fw_context_mcp.indexer._postprocess import _step_reconcile_generated
+        from fw_context_mcp.indexer.db import upsert_file
+
+        conn = self._conn(tmp_path)
+        try:
+            upsert_file(conn, "cafe", "build/gen.h", "c", generated=True)
+
+            _step_reconcile_generated(conn, self._ctx(conn, None))
+
+            assert self._generated(conn, "build/gen.h") == 0
+        finally:
+            conn.close()
+
+    def test_another_build_is_not_touched(self, tmp_path: Path):
+        """The UPDATE is scoped to this config_hash."""
+        from fw_context_mcp.indexer._postprocess import _step_reconcile_generated
+        from fw_context_mcp.indexer.db import (
+            upsert_build_config,
+            upsert_file,
+            upsert_project,
+        )
+        from fw_context_mcp.indexer.db import open_db
+
+        conn = open_db(tmp_path / "index.db")
+        try:
+            upsert_project(conn, "proj", "Proj", str(tmp_path))
+            upsert_build_config(conn, "cafe", "proj", str(tmp_path / "cc.json"))
+            upsert_build_config(conn, "beef", "proj", str(tmp_path / "cc.json"))
+            upsert_file(conn, "cafe", ".pio/libdeps/Foo/foo.h", "c", generated=True)
+            upsert_file(conn, "beef", ".pio/libdeps/Foo/foo.h", "c", generated=True)
+
+            _step_reconcile_generated(conn, self._ctx(conn, [".pio/build/"]))
+
+            assert self._generated(conn, ".pio/libdeps/Foo/foo.h") == 0
+            other = conn.execute(
+                "SELECT generated FROM files WHERE config_hash=? AND path=?",
+                ("beef", ".pio/libdeps/Foo/foo.h"),
+            ).fetchone()[0]
+            assert other == 1
+        finally:
+            conn.close()
+
+
+class TestPlatformIOBuildDirPattern:
+    """``.pio/build/``, not ``.pio/`` — the patterns are matched as substrings."""
+
+    def test_libdeps_is_not_build_output(self):
+        from fw_context_mcp.indexer.builders.platformio import PlatformIOBuildSystem
+        from fw_context_mcp.indexer.manifest import _is_generated_header
+
+        patterns = PlatformIOBuildSystem().get_build_dir_patterns(Path("/proj"))
+
+        assert patterns == [".pio/build/"]
+        assert _is_generated_header(".pio/build/esp32dev/gen.h", patterns) is True
+        assert _is_generated_header(".pio/libdeps/Foo/foo.h", patterns) is False
+
+    def test_libdeps_stays_vendor(self):
+        """Build output and vendor are different questions, answered separately."""
+        from fw_context_mcp.indexer.builders.platformio import PlatformIOBuildSystem
+        from fw_context_mcp.indexer.sdk_detect import _path_matches
+
+        vendor = PlatformIOBuildSystem().get_vendor_patterns(Path("/proj"))
+
+        assert any(_path_matches(".pio/libdeps/Foo/foo.cpp", p) for p in vendor)
+        assert not any(_path_matches(".pio/build/env/gen.h", p) for p in vendor)
+
+    def test_a_libdeps_header_is_no_longer_trusted(self):
+        """The K4 hole this closes: a vendor header must not read as generated.
+
+        A build-generated header is the only thing the staleness check still
+        trusts.  While libdeps counted as build output, every vendored
+        library header was trusted and an edit to one went unnoticed.
+        """
+        from fw_context_mcp.indexer.builders.platformio import PlatformIOBuildSystem
+        from fw_context_mcp.indexer.manifest import _is_generated_header, header_is_trusted
+
+        patterns = PlatformIOBuildSystem().get_build_dir_patterns(Path("/proj"))
+        record = {
+            "hash": "x",
+            "generated": _is_generated_header(".pio/libdeps/Foo/foo.h", patterns),
+        }
+
+        assert header_is_trusted(record) is False

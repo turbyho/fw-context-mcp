@@ -81,6 +81,8 @@ from .db import (
     upsert_build_config,
     write_lock,
 )
+from .db._chunking import chunked
+from .manifest import _is_generated_header
 
 log = logging.getLogger(__name__)
 
@@ -1453,12 +1455,65 @@ def _step_wal_checkpoint(conn: sqlite3.Connection, ctx: dict) -> None:
 #  • cleanup_old runs LAST with data mutation — it deletes old-build tables
 #    that earlier steps might reference.
 #  • wal_checkpoint runs LAST — flushes all accumulated changes to disk.
+def _step_reconcile_generated(conn: sqlite3.Connection, ctx: dict) -> None:
+    """Make ``files.generated`` agree with THIS run's build_dir_patterns.
+
+    upsert_file() takes MAX so that the one caller who knows the patterns
+    cannot be overwritten by the four who do not.  That is right inside a
+    run and wrong across two: a row can only gain the flag, never lose it.
+
+    Its docstring used to say the case could not arise, because a change to
+    build_dir_patterns mints a new config_hash.  Measured, that is false:
+    narrowing PlatformIO from ``.pio/`` to ``.pio/build/`` left the
+    config_hash of HA_Boiler and of FM byte for byte identical, because the
+    path pass drops in-project paths anyway.  57 rows would have kept a flag
+    the manifest no longer gives them, and the structural check that compares
+    the two would fail on every existing index until a --force.
+
+    So the run reconciles instead of hoping.  This is the authoritative
+    write: the patterns of the run decide, in both directions, and the step
+    is idempotent.  It runs after the manifest is written, so the two
+    describe the same boundary.
+    """
+    build_dir_patterns = ctx.get("build_dir_patterns")
+    config_hash = ctx["config_hash"]
+
+    rows = conn.execute(
+        "SELECT path, generated FROM files WHERE config_hash = ?", (config_hash,)
+    ).fetchall()
+
+    to_set: list[str] = []
+    to_clear: list[str] = []
+    for row in rows:
+        want = _is_generated_header(row["path"], build_dir_patterns)
+        if want and not row["generated"]:
+            to_set.append(row["path"])
+        elif not want and row["generated"]:
+            to_clear.append(row["path"])
+
+    for value, paths in ((1, to_set), (0, to_clear)):
+        for batch in chunked(paths):
+            placeholders = ",".join("?" * len(batch))
+            conn.execute(
+                f"UPDATE files SET generated = ? "  # noqa: S608 — placeholders only
+                f"WHERE config_hash = ? AND path IN ({placeholders})",
+                (value, config_hash, *batch),
+            )
+    if to_set or to_clear:
+        conn.commit()
+        log.info(
+            "files.generated reconciled: %d set, %d cleared",
+            len(to_set), len(to_clear),
+        )
+
+
 _STEPS: list[tuple[str, Callable[..., None], Callable[..., bool] | None]] = [
     ("purge_missing",    _step_purge_missing_files, None),
     ("fts5",             _step_rebuild_fts,       None),
     ("orphans",          _step_orphan_cleanup,     None),
     ("is_project",       _step_align_is_project,   None),
     ("manifest",         _step_update_manifest,    None),
+    ("generated_flag",   _step_reconcile_generated, None),
     ("coverage_purge",   _step_purge_files_outside_build, None),
     ("macros",           _step_expand_macros,      lambda c: c["index_macros_expanded"] and c["units"]),
     ("dispatch_edges",   _step_resolve_dispatches,  lambda c: c["index_refs"]),
