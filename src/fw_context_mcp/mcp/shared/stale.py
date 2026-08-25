@@ -327,7 +327,7 @@ def _check_header_staleness(
 
     from ...indexer.manifest import check_tu_staleness, resolve_headers
     from ...indexer.manifest import load as load_manifest
-    from ...indexer.sdk_detect import _build_sdk_excludes
+    from ...indexer.sdk_detect import vendor_patterns_for_build
 
     # Find the DB dir from the conn's path
     db_path = Path(conn.execute("PRAGMA database_list").fetchone()["file"])
@@ -343,7 +343,11 @@ def _check_header_staleness(
         return 0, []
 
     project_root = Path(manifest.get("project_root", str(root)))
-    vendor_patterns = list(_build_sdk_excludes(project_root))
+    # The set the INDEXER applied, not one derived here.  A derived set
+    # differs — this layer has no compiler flags — and a narrower one makes
+    # this check re-hash headers the indexer trusted.  maintenance.py turns
+    # that into "stale": true and asks for a reindex that cannot clear it.
+    vendor_patterns = vendor_patterns_for_build(manifest, project_root)
 
     stale_count = 0
     affected: list[str] = []

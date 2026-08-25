@@ -24,6 +24,10 @@ log = logging.getLogger(__name__)
 
 _ZEPHYR_MARKERS = ["west.yml", "zephyr"]
 
+# The flag Zephyr CMake uses to name the two SDK roots.  See
+# _prefix_map_roots() for what each name means.
+_PREFIX_MAP_FLAG = "-fmacro-prefix-map="
+
 
 def _zephyr_vendor_patterns(
     project_root: Path,
@@ -61,6 +65,46 @@ def _zephyr_vendor_patterns(
         if pattern not in patterns:
             patterns.append(pattern)
     return patterns
+
+
+def _prefix_map_roots(units: list | None) -> tuple[Path | None, Path | None]:
+    """Return ``(ZEPHYR_BASE, WEST_TOPDIR)`` read from ``-fmacro-prefix-map``.
+
+    Zephyr's CMake emits one prefix map per name for every translation unit,
+    and it names the two roots directly::
+
+        -fmacro-prefix-map=/home/u/ncs/v3.4.0/zephyr=ZEPHYR_BASE
+        -fmacro-prefix-map=/home/u/ncs/v3.4.0=WEST_TOPDIR
+        -fmacro-prefix-map=<app dir>=CMAKE_SOURCE_DIR
+
+    Verified in all 9 production artifacts of zbox-ecb-fw-v5 with no
+    exception.  This is the strongest source there is: it describes the
+    build that is indexed, not the shell that runs fw-context and not the
+    state of the filesystem.
+
+    ``=CMAKE_SOURCE_DIR`` is read and DROPPED.  The application directory is
+    arbitrary, and for a sysbuild image such as mcuboot it sits INSIDE the
+    SDK — measured as four different values across those 9 builds.
+
+    Returns ``(None, None)`` when *units* is None or carries no prefix map.
+    """
+    zephyr_base: Path | None = None
+    west_topdir: Path | None = None
+    for unit in units or ():
+        for arg in getattr(unit, "clang_args", ()) or ():
+            if not arg.startswith(_PREFIX_MAP_FLAG):
+                continue
+            mapping = arg[len(_PREFIX_MAP_FLAG):]
+            path, sep, name = mapping.rpartition("=")
+            if not sep or not path:
+                continue
+            if name == "ZEPHYR_BASE" and zephyr_base is None:
+                zephyr_base = Path(path)
+            elif name == "WEST_TOPDIR" and west_topdir is None:
+                west_topdir = Path(path)
+        if zephyr_base is not None and west_topdir is not None:
+            break
+    return zephyr_base, west_topdir
 
 
 @lru_cache(maxsize=32)
@@ -411,12 +455,14 @@ class ZephyrBuildSystem:
     ) -> tuple[Path | None, Path | None]:
         """Return ``(ZEPHYR_BASE, WEST_TOPDIR)`` for this build, or None for each.
 
-        Three sources, in falling order of how well each one describes the
+        Four sources, in falling order of how well each one describes the
         build that is indexed:
 
-        1. ``ZEPHYR_BASE`` in the environment.
-        2. ``west config zephyr.base`` and ``west topdir``.
-        3. A ``zephyr/`` directory in project_root, which is the T3
+        1. ``-fmacro-prefix-map`` in *units*.  It comes from the build that
+           is indexed, so it beats every other source.
+        2. ``ZEPHYR_BASE`` in the environment.
+        3. ``west config zephyr.base`` and ``west topdir``.
+        4. A ``zephyr/`` directory in project_root, which is the T3
            workspace layout.  This is the last resort: it is the only
            source that reads the filesystem instead of the build.
 
@@ -424,10 +470,11 @@ class ZephyrBuildSystem:
         a value from the environment and a value from ``west`` can name two
         different workspaces, and a mix of the two describes neither.
 
-        The strongest source, ``-fmacro-prefix-map`` in *units*, arrives
-        with the manifest carrier.  *units* is accepted here already so the
-        signature does not change again.
         """
+        from_flags = _prefix_map_roots(units)
+        if from_flags != (None, None):
+            return from_flags
+
         env_base = os.environ.get("ZEPHYR_BASE")
         if env_base:
             return Path(env_base).resolve(), None

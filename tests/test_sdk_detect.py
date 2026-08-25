@@ -12,6 +12,7 @@ from fw_context_mcp.indexer.sdk_detect import (
     _normalize_path_pattern,
     _normalize_patterns,
     _path_matches,
+    vendor_patterns_for_build,
 )
 
 
@@ -316,6 +317,46 @@ class TestZephyrVendorPatterns:
 
         assert _build_sdk_excludes(tmp_path, "zephyr") == ["workspace/zephyr/%"]
 
+    def test_zephyr_base_comes_from_the_prefix_map(self, tmp_path: Path, monkeypatch):
+        """The compiler flags beat the environment, because they describe THIS build.
+
+        The environment is set to a DIFFERENT workspace on purpose.  Without
+        that, the test passes on a machine where the variable happens to name
+        the same path, and it would then prove nothing about the flags.
+        """
+        (tmp_path / "west.yml").write_text("")
+        from_flags = tmp_path / "from_flags"
+        (from_flags / "zephyr").mkdir(parents=True)
+        from_env = tmp_path / "from_env"
+        (from_env / "zephyr").mkdir(parents=True)
+        monkeypatch.setenv("ZEPHYR_BASE", str(from_env / "zephyr"))
+
+        patterns = _build_sdk_excludes(
+            tmp_path, "zephyr",
+            units=[_FakeUnit([
+                f"-fmacro-prefix-map={from_flags / 'zephyr'}=ZEPHYR_BASE",
+                f"-fmacro-prefix-map={from_flags}=WEST_TOPDIR",
+                f"-fmacro-prefix-map={tmp_path / 'proj' / 'app'}=CMAKE_SOURCE_DIR",
+            ])],
+        )
+
+        assert patterns == ["from_flags/zephyr/%", "from_flags/%"]
+        assert "from_env/zephyr/%" not in patterns
+
+    def test_the_prefix_map_ignores_the_source_dir(self, tmp_path: Path, monkeypatch):
+        """``=CMAKE_SOURCE_DIR`` is read and dropped, never used as a root."""
+        (tmp_path / "west.yml").write_text("")
+        monkeypatch.delenv("ZEPHYR_BASE", raising=False)
+
+        patterns = _build_sdk_excludes(
+            tmp_path, "zephyr",
+            units=[_FakeUnit([
+                f"-fmacro-prefix-map={tmp_path / 'proj' / 'app'}=CMAKE_SOURCE_DIR",
+            ])],
+        )
+
+        assert patterns == []
+
     def test_the_app_directory_is_not_a_signal(self, tmp_path: Path, monkeypatch):
         """Two images of one build give the same patterns, whatever their source dir.
 
@@ -342,3 +383,56 @@ class TestZephyrVendorPatterns:
         )
 
         assert app == mcuboot == ["workspace/zephyr/%"]
+
+
+class TestVendorPatternsForBuild:
+    """The query layer reads the set the indexer applied."""
+
+    def test_the_manifest_carries_the_vendor_patterns(self, tmp_path: Path, monkeypatch):
+        """What the manifest holds wins over anything this layer could detect."""
+        (tmp_path / "mbed-os").mkdir()
+        manifest = {"vendor_patterns": ["deps/ncs/%"]}
+
+        assert vendor_patterns_for_build(manifest, tmp_path) == ["deps/ncs/%"]
+
+    def test_an_empty_list_in_the_manifest_is_an_answer(self, tmp_path: Path):
+        """An empty set is the correct answer for an SDK outside the project.
+
+        It must NOT read as a missing value and start a second detection —
+        that is how the query layer and the indexer come to disagree.
+        """
+        (tmp_path / "mbed-os").mkdir()
+
+        assert vendor_patterns_for_build({"vendor_patterns": []}, tmp_path) == []
+
+    def test_a_manifest_without_the_key_falls_back_to_detection(self, tmp_path: Path):
+        """Every index written before the key existed must keep working."""
+        (tmp_path / "mbed-os").mkdir()
+
+        assert vendor_patterns_for_build({}, tmp_path) == ["mbed-os/%"]
+        assert vendor_patterns_for_build(None, tmp_path) == ["mbed-os/%"]
+
+    def test_the_stale_check_and_the_indexer_agree_on_trust(self, tmp_path: Path, monkeypatch):
+        """One header, two callers, one answer.
+
+        The indexer derives its set from the compiler flags, which this layer
+        does not have.  When the two disagree, _check_header_staleness
+        re-hashes a header the indexer trusted, maintenance.py reports
+        "stale": true, and the reindex it asks for cannot clear that.
+        """
+        (tmp_path / "west.yml").write_text("")
+        workspace = tmp_path / "deps" / "ncs"
+        (workspace / "zephyr").mkdir(parents=True)
+        monkeypatch.delenv("ZEPHYR_BASE", raising=False)
+
+        indexer_set = _build_sdk_excludes(
+            tmp_path, "zephyr",
+            units=[_FakeUnit([
+                f"-fmacro-prefix-map={workspace / 'zephyr'}=ZEPHYR_BASE",
+                f"-fmacro-prefix-map={workspace}=WEST_TOPDIR",
+            ])],
+        )
+        manifest = {"vendor_patterns": indexer_set}
+
+        assert vendor_patterns_for_build(manifest, tmp_path) == indexer_set
+        assert indexer_set == ["deps/ncs/zephyr/%", "deps/ncs/%"]

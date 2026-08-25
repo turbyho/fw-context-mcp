@@ -233,13 +233,10 @@ def run(
     else:
         project_root = project_root.resolve()
 
-    # Prepare vendor/project patterns for is_project computation.
-    # Normalize patterns without % wildcard to match subdirectories.
+    # Normalize patterns without % wildcard to match subdirectories.  The
+    # vendor set waits for the translation units — see below.
     from .sdk_detect import _build_sdk_excludes, _normalize_patterns
 
-    vendor_patterns = list(_build_sdk_excludes(project_root, build_system))
-    if vendor_paths:
-        vendor_patterns.extend(_normalize_patterns(vendor_paths))
     project_patterns_list = _normalize_patterns(list(project_paths)) if project_paths else []
 
     if project_id is None:
@@ -258,6 +255,23 @@ def run(
     units = list(parse_compile_commands(compile_commands))
     units = [u for u in units if u.file.suffix.lower() in _SOURCE_EXTS]
     log.info("TUs to index: %d", len(units))
+
+    # ── The effective vendor set, computed HERE and not earlier ──
+    # A builder may read the compiler flags: Zephyr takes ZEPHYR_BASE and
+    # WEST_TOPDIR from -fmacro-prefix-map, which names the roots of the build
+    # that is indexed rather than the shell that runs fw-context.  The units
+    # carry those flags, so the set cannot be built before they are parsed.
+    # Its first use is the header staleness pre-pass further down.
+    vendor_patterns = list(
+        _build_sdk_excludes(project_root, build_system, units=units)
+    )
+    if vendor_paths:
+        vendor_patterns.extend(_normalize_patterns(vendor_paths))
+    log.info(
+        "vendor patterns for %s: %s",
+        variant or project_root.name,
+        ", ".join(vendor_patterns) or "none",
+    )
 
     # Determine config_hash from manifest.json.  The manifest captures the
     # full structural build identity (files, directories, compiler flags) —

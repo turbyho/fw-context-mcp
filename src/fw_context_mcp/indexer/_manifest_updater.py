@@ -151,6 +151,7 @@ def _update_manifest_after_index(
     updated_count: int,
     tu_headers: dict[str, list[dict]] | None = None,
     build_dir_patterns: list[str] | None = None,
+    vendor_patterns: list[str] | None = None,
     config_hash: str = "",
     scope: list[str] | None = None,
     reparsed_tus: set[str] | None = None,
@@ -177,6 +178,13 @@ def _update_manifest_after_index(
     it still holds data parsed from the old header text.  Every other TU
     keeps its stored entry verbatim.  ``None`` disables the filter (used by
     callers with no run bookkeeping, e.g. a first index).
+
+    *vendor_patterns* is the EFFECTIVE set this run used — what the builder
+    derived plus what the config added.  It is stored so the query layer can
+    read it instead of deriving its own: the strongest source for Zephyr is
+    ``-fmacro-prefix-map`` in the compiler flags, and only the indexer has
+    those.  A consumer that derives its own set answers with a different one,
+    and the staleness check then re-hashes headers the indexer trusted.
 
     Returns the updated manifest dict, or ``None`` when no update needed.
     """
@@ -296,7 +304,11 @@ def _update_manifest_after_index(
     elif manifest is None:
         # No manifest and no tu_headers — full rebuild via libclang (slow)
         log.info("Generating manifest.json from %d TUs...", len(units))
-        gen_hash = generate_manifest(compile_commands, db_dir, project_root, units, build_dir_patterns=build_dir_patterns, scope=scope)
+        gen_hash = generate_manifest(
+            compile_commands, db_dir, project_root, units,
+            build_dir_patterns=build_dir_patterns, scope=scope,
+            vendor_patterns=vendor_patterns,
+        )
         return reload_manifest(db_dir, gen_hash)
     else:
         # ── Incremental update (tu_headers=None, manifest exists) ──
@@ -346,6 +358,13 @@ def _update_manifest_after_index(
         manifest_data["build_dir_patterns"] = build_dir_patterns
     elif manifest and manifest.get("build_dir_patterns"):
         manifest_data["build_dir_patterns"] = manifest["build_dir_patterns"]
+    # Same inheritance for the vendor set: an incremental run that gets no
+    # patterns must keep the ones the build was indexed with, or the next
+    # staleness check reads a manifest that describes a different boundary.
+    if vendor_patterns:
+        manifest_data["vendor_patterns"] = vendor_patterns
+    elif manifest and manifest.get("vendor_patterns"):
+        manifest_data["vendor_patterns"] = manifest["vendor_patterns"]
     # Preserve macros from old manifest
     if manifest and manifest.get("macros"):
         manifest_data["macros"] = manifest["macros"]

@@ -624,6 +624,102 @@ class TestCollectStaleHeaders:
         assert tus_affected_by_headers(manifest, set()) == set()
 
 
+class TestVendorPatternCarrier:
+    """The manifest carries the vendor set the index run applied.
+
+    The query layer cannot derive the same set: the strongest source for
+    Zephyr is ``-fmacro-prefix-map`` in the compiler flags, and only the
+    indexer has those.  Without the carrier the two layers disagree, and a
+    narrower set on the query side reports the index as permanently stale.
+    """
+
+    @staticmethod
+    def _unit(tmp_path: Path, rel: str):
+        from unittest.mock import MagicMock
+
+        src = tmp_path / rel
+        src.parent.mkdir(parents=True, exist_ok=True)
+        src.write_text("int main() { return 0; }")
+        unit = MagicMock()
+        unit.file = src
+        unit.directory = tmp_path
+        unit.clang_args = ["gcc", "-c", rel]
+        unit.raw_entry = {"file": rel, "directory": str(tmp_path), "arguments": ["gcc", "-c", rel]}
+        return unit
+
+    def _run(self, tmp_path: Path, *, manifest, vendor_patterns):
+        from fw_context_mcp.indexer._manifest_updater import _update_manifest_after_index
+
+        unit = self._unit(tmp_path, "src/main.cpp")
+        (tmp_path / "index").mkdir(exist_ok=True)
+        return _update_manifest_after_index(
+            manifest=manifest,
+            units=[unit],
+            project_root=tmp_path,
+            db_dir=tmp_path / "index",
+            compile_commands=tmp_path / "compile_commands.json",
+            updated_count=1,
+            tu_headers={"src/main.cpp": [
+                {"path": "src/config.h", "hash": "FRESH", "generated": False}
+            ]},
+            vendor_patterns=vendor_patterns,
+            config_hash="deadbeef",
+            reparsed_tus={"src/main.cpp"},
+        )
+
+    @staticmethod
+    def _base(tmp_path: Path, **extra) -> dict:
+        manifest = {
+            "_format": MANIFEST_FORMAT,
+            "project_root": str(tmp_path),
+            "arg_sets": [["gcc", "-c", "src/main.cpp"]],
+            "headers": {"src/config.h": {"hash": "STORED", "generated": False}},
+            "entries": [
+                {
+                    "file": "src/main.cpp",
+                    "directory": str(tmp_path),
+                    "arg_set": 0,
+                    "source_hash": "stored-source",
+                    "flags_hash": "stored-flags",
+                    "headers": ["src/config.h"],
+                }
+            ],
+        }
+        manifest.update(extra)
+        return manifest
+
+    def test_the_manifest_carries_the_vendor_patterns(self, tmp_path: Path):
+        result = self._run(
+            tmp_path,
+            manifest=self._base(tmp_path),
+            vendor_patterns=["deps/ncs/zephyr/%", "deps/ncs/%"],
+        )
+
+        assert result is not None
+        assert result["vendor_patterns"] == ["deps/ncs/zephyr/%", "deps/ncs/%"]
+
+    def test_an_incremental_run_inherits_the_patterns(self, tmp_path: Path):
+        """A run that computes no patterns must keep what the build was indexed with.
+
+        Same rule build_dir_patterns already follows.  Without it the next
+        staleness check reads a manifest that describes a different boundary
+        from the one the rows were written under.
+        """
+        old = self._base(tmp_path, vendor_patterns=["deps/ncs/%"])
+
+        result = self._run(tmp_path, manifest=old, vendor_patterns=[])
+
+        assert result is not None
+        assert result["vendor_patterns"] == ["deps/ncs/%"]
+
+    def test_a_manifest_without_the_key_stays_without_it(self, tmp_path: Path):
+        """An older index has no key, and nothing invents one for it."""
+        result = self._run(tmp_path, manifest=self._base(tmp_path), vendor_patterns=[])
+
+        assert result is not None
+        assert "vendor_patterns" not in result
+
+
 class TestManifestEntryRefreshGuard:
     """``_update_manifest_after_index`` may only refresh re-parsed TUs.
 

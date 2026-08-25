@@ -1437,7 +1437,15 @@ def reindex_file_impl(
         if error:
             return error
 
-        vendor_patterns, project_patterns_list = _reindex_build_patterns(cfg, root)
+        # The manifest of THIS build carries the vendor set the index run
+        # applied.  reindex_file must write is_project with that same
+        # boundary, or one file ends up on the other side of it.
+        from ...indexer.manifest import load as load_manifest
+
+        build_manifest = load_manifest(db_path.parent, config_hash)
+        vendor_patterns, project_patterns_list = _reindex_build_patterns(
+            cfg, root, build_manifest
+        )
         total_symbols, result = _reindex_parse_and_store(
             conn, matching, cfg_data, cfg.index.index_refs,
             root, db_path, target, vendor_patterns, project_patterns_list,
@@ -1512,7 +1520,7 @@ def _reindex_match_tus(
 
 
 def _reindex_build_patterns(
-    cfg, root: Path
+    cfg, root: Path, manifest: dict | None = None
 ) -> tuple[list[str], list[str]]:
     """Collect vendor-exclude and project-include file path patterns.
 
@@ -1525,10 +1533,16 @@ def _reindex_build_patterns(
     *project_patterns_list* — paths explicitly listed as project code
     in the user config.  These override the auto-detected vendor
     boundary when the detector misclassifies a path.
-    """
-    from ...indexer.sdk_detect import _build_sdk_excludes, _normalize_patterns
 
-    vendor_patterns = list(_build_sdk_excludes(root, cfg.build.system))
+    Pass *manifest* whenever the caller has it.  The set stored there is the
+    one the index run applied, and to derive a second one here would give
+    this build two different boundaries.
+    """
+    from ...indexer.sdk_detect import _normalize_patterns, vendor_patterns_for_build
+
+    vendor_patterns = vendor_patterns_for_build(
+        manifest, root, build_system=cfg.build.system
+    )
     if cfg.index.vendor_paths:
         vendor_patterns.extend(_normalize_patterns(cfg.index.vendor_paths))
     project_patterns_list = (

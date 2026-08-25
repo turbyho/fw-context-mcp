@@ -127,3 +127,29 @@ def _build_sdk_excludes(
         # the team's own code.
         log.warning("Builder %s failed to give vendor patterns", key, exc_info=True)
         return []
+
+
+def vendor_patterns_for_build(
+    manifest: dict | None,
+    project_root: Path,
+    *,
+    build_system: str | None = None,
+) -> list[str]:
+    """Return the vendor set THIS build was indexed with.
+
+    Reads ``manifest["vendor_patterns"]``, which the index run wrote after it
+    applied that set.  Deriving one instead gives a different answer: the
+    strongest source for Zephyr is ``-fmacro-prefix-map`` in the compiler
+    flags, and only the indexer has those.  A query layer with a wider set
+    then trusts headers the indexer re-hashed, and a query layer with a
+    narrower set re-hashes headers the indexer trusted — the second case
+    reports the index as permanently stale, and a reindex does not clear it.
+
+    Falls back to detection when the key is absent, which is every index
+    written before the key existed.  An empty list in the manifest is an
+    ANSWER, not a missing value: most projects keep their SDK outside the
+    project, and the correct set for them is empty.
+    """
+    if manifest is not None and "vendor_patterns" in manifest:
+        return list(manifest["vendor_patterns"])
+    return list(_build_sdk_excludes(project_root, build_system))

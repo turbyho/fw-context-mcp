@@ -245,6 +245,7 @@ def generate(
     build_dir_patterns: list[str] | None = None,
     config_hash: str = "",
     scope: list[str] | None = None,
+    vendor_patterns: list[str] | None = None,
 ) -> str:
     """Generate ``manifest.json`` from compile_commands + libclang token stream.
 
@@ -258,6 +259,9 @@ def generate(
             (e.g. ``["BUILD/", ".pio/"]``).  Used to mark generated headers.
         config_hash: Optional pre-computed config_hash.  When empty, the hash
             is computed from the manifest dict (backward-compatible fallback).
+        vendor_patterns: The effective vendor/SDK set this build used.  Stored
+            so the query layer reads the same boundary the indexer applied
+            instead of deriving its own.
 
     Returns:
         The ``config_hash`` — SHA-256 of the structural part of the manifest.
@@ -304,6 +308,8 @@ def generate(
         manifest["macros"] = macros
     if build_dir_patterns:
         manifest["build_dir_patterns"] = build_dir_patterns
+    if vendor_patterns:
+        manifest["vendor_patterns"] = vendor_patterns
 
     if not config_hash:
         # Backward-compatible fallback — compute hash from manifest dict.
