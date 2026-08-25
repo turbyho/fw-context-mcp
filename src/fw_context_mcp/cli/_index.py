@@ -237,25 +237,26 @@ def _pid_is_fw_context_reindexer(pid: int) -> bool:
         return False
     return "--background" in argv
 
-def _manage_bg_reindex(db_path: Path) -> None:
-    """Kill any running background reindex and write pause/pid files.
+def _kill_bg_reindex(db_path: Path) -> None:
+    """Terminate a running BACKGROUND index run so that its lock drops.
 
-    A foreground ``fw-context index`` must not race with a background
-    reindex writing to the same database.  This function:
-    1. Reads the PID file to find the background process.
-    2. Sends SIGTERM, waits up to 5 seconds, falls back to SIGKILL.
-    3. Writes a pause file to prevent the file-watcher daemon from
-       starting a new background reindex while the foreground one runs.
-    4. Writes a PID file so other processes know this index is active.
+    Reads reindex.pid, sends SIGTERM, waits up to 5 seconds and falls back
+    to SIGKILL.  Two concurrent writers on one SQLite database corrupt it,
+    and SQLITE_BUSY retries are not mutual exclusion on a long write.
 
-    WHY: Two concurrent writers on an SQLite database cause corruption
-    (SQLITE_BUSY retries are not a substitute for mutual exclusion on
-    long-running writes).  The pause file is the coordination mechanism
-    between the CLI and the daemon.
+    Writes nothing.  To claim the index is a separate step, and only the
+    process that won index_run_lock may do it — see _claim_index().  A run
+    that writes the pause marker and then LOSES the lock leaves a marker
+    that names a live process, and the run that WON reads that marker as
+    "somebody took the index over" and abandons itself.
+
+    Deliberately does NOT clean up the pause marker of the run it just
+    killed.  PidFile.is_active answers False for a dead PID and
+    raise_if_superseded ignores such a marker — its own docstring says so.
+    To unlink a marker that belongs to another process is the same defect
+    this function exists to remove, seen from the other side.
     """
-    pause_file = db_path.parent / "reindex.pause"
     reindex_pid_file = db_path.parent / "reindex.pid"
-    db_path.parent.mkdir(parents=True, exist_ok=True)
 
     # Kill any running background reindex, with PID reuse safety.
     old_pid = PidFile.read_pid(reindex_pid_file)
@@ -275,8 +276,29 @@ def _manage_bg_reindex(db_path: Path) -> None:
         else:
             log.debug("PID %d from reindex.pid is not an fw-context reindexer — ignoring", old_pid)
 
-    PidFile(pause_file).write()
-    PidFile(reindex_pid_file).write()
+
+def _claim_index(db_dir: Path) -> None:
+    """Write the pause marker and the pid marker.
+
+    Call this function ONLY while the caller holds index_run_lock.  The pause
+    marker stops the file-watcher daemon from starting a background run, and
+    the pid marker tells every other process which run owns the index.  Both
+    are claims, and a process that lost the lock owns nothing.
+
+    Creates no directory: index_run_lock already does that before it takes
+    the lock.
+    """
+    PidFile(db_dir / "reindex.pause").write()
+    PidFile(db_dir / "reindex.pid").write()
+
+
+def _release_index(db_dir: Path) -> None:
+    """Drop the markers this process wrote, and only those.
+
+    unlink_if_ours checks the PID, so a marker another run owns survives.
+    """
+    PidFile(db_dir / "reindex.pid").unlink_if_ours()
+    PidFile(db_dir / "reindex.pause").unlink_if_ours()
 
 
 def _post_index_optimize(
@@ -637,8 +659,9 @@ def cmd_index(args: argparse.Namespace) -> int:
     if cfg.build.variants:
         # Takes over from a background run by killing it, which also drops
         # its index lock; the lock below then only refuses another
-        # FOREGROUND run.
-        _manage_bg_reindex(db_path)
+        # FOREGROUND run.  The markers are claimed AFTER the lock — see
+        # _kill_bg_reindex().
+        _kill_bg_reindex(db_path)
         run_kwargs = _build_run_kwargs(
             args, cfg, project_root, project_id, vendor_paths, project_paths, cs_config,
         )
@@ -647,14 +670,14 @@ def cmd_index(args: argparse.Namespace) -> int:
             # second run slipping in between two builds would index against a
             # database this one is still changing.
             with index_run_lock(db_path.parent):
+                _claim_index(db_path.parent)
                 try:
                     return _run_multi(
                         args, cfg, project_root, project_id, db_path,
                         detected_system, run_kwargs,
                     )
                 finally:
-                    PidFile(db_path.parent / "reindex.pid").unlink_if_ours()
-                    PidFile(db_path.parent / "reindex.pause").unlink_if_ours()
+                    _release_index(db_path.parent)
         except IndexRunLocked as exc:
             print(f"error: {exc}", file=sys.stderr)
             return EXIT_ALREADY_RUNNING
@@ -677,7 +700,8 @@ def cmd_index(args: argparse.Namespace) -> int:
     # ── Manage background reindex ──
     # Takes over from a background run by killing it, which also drops its
     # index lock; the lock below then only refuses another FOREGROUND run.
-    _manage_bg_reindex(db_path)
+    # The markers are claimed AFTER the lock — see _kill_bg_reindex().
+    _kill_bg_reindex(db_path)
 
     run_kwargs = _build_run_kwargs(
         args, cfg, project_root, project_id, vendor_paths, project_paths, cs_config,
@@ -685,6 +709,7 @@ def cmd_index(args: argparse.Namespace) -> int:
 
     try:
         with index_run_lock(db_path.parent):
+            _claim_index(db_path.parent)
             try:
                 config_hash = run(
                     compile_commands=compile_commands,
@@ -704,8 +729,7 @@ def cmd_index(args: argparse.Namespace) -> int:
                 print(f"Superseded: {exc}", file=sys.stderr)
                 return EXIT_SUPERSEDED
             finally:
-                PidFile(db_path.parent / "reindex.pid").unlink_if_ours()
-                PidFile(db_path.parent / "reindex.pause").unlink_if_ours()
+                _release_index(db_path.parent)
     except IndexRunLocked as exc:
         print(f"error: {exc}", file=sys.stderr)
         return EXIT_ALREADY_RUNNING

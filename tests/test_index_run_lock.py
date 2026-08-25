@@ -195,3 +195,207 @@ def test_the_two_locks_are_separate_files(tmp_path: Path, name: str):
 
     with index_run_lock(tmp_path), write_lock(tmp_path, timeout=5):
         assert (tmp_path / name).exists()
+
+
+class TestARefusedRunLeavesNothingBehind:
+    """A run that LOSES the lock must not claim the index.
+
+    Observed:
+
+        A: holds the lock, indexing
+        B: refused, an index run is already in progress ... (pid 2631030)
+        A: ABORTED after 2 TUs -- another process (pid 2631031) took over
+        A exit=75
+
+    cmd_index called _manage_bg_reindex() BEFORE index_run_lock, and that
+    function wrote reindex.pause with its own PID unconditionally.  When the
+    lock then refused B, the cleanup sat inside the `with` block that never
+    ran, so B's marker stayed for as long as B lived.  A calls
+    raise_if_superseded before every TU, and a live foreign PID in the marker
+    reads as "somebody took the index over".  A run that won the lock threw
+    away an hour of work because of a run that was correctly refused.
+
+    test_index_run_lock.py and test_superseded_run.py each covered one
+    mechanism.  Nothing covered the two together, which is why it shipped.
+    """
+
+    def test_the_pause_marker_is_not_left_behind_by_a_refused_run(self, tmp_path: Path):
+        """B is refused, so it must leave no marker at all."""
+        from fw_context_mcp.cli._index import _claim_index, _kill_bg_reindex
+        from fw_context_mcp.indexer.db._locking import IndexRunLocked, index_run_lock
+
+        db_dir = tmp_path / "index"
+        db_dir.mkdir()
+        pause = db_dir / "reindex.pause"
+
+        script = textwrap.dedent(
+            f"""
+            import sys
+            from pathlib import Path
+            sys.path.insert(0, {str(Path(__file__).resolve().parents[1] / "src")!r})
+            from fw_context_mcp.cli._index import _claim_index, _kill_bg_reindex
+            from fw_context_mcp.indexer.db._locking import IndexRunLocked, index_run_lock
+
+            db_dir = Path({str(db_dir)!r})
+            _kill_bg_reindex(db_dir / "index.db")
+            try:
+                with index_run_lock(db_dir):
+                    _claim_index(db_dir)
+                    print("ACQUIRED")
+            except IndexRunLocked:
+                print("REFUSED")
+            """
+        )
+        with index_run_lock(db_dir):
+            _claim_index(db_dir)
+            result = subprocess.run(  # noqa: S603 — fixed argv, no shell
+                [sys.executable, "-c", script],
+                capture_output=True, text=True, timeout=60,
+            )
+            assert "REFUSED" in result.stdout, result.stdout + result.stderr
+            # The marker must still name THIS process, not the refused one.
+            assert pause.read_text().strip() == str(os.getpid()), (
+                "the refused run overwrote the holder's pause marker"
+            )
+
+    def test_a_refused_run_does_not_abort_the_holder(self, tmp_path: Path):
+        """End to end: A holds the lock and must survive B being refused.
+
+        Both sides are real processes.  A takes the lock, claims the index
+        and then calls raise_if_superseded in a short loop, the same call the
+        indexer makes before every translation unit.  B does what cmd_index
+        does: kill the background run, take the lock, claim on success.
+        """
+        from fw_context_mcp.indexer.db._locking import index_run_lock
+        from fw_context_mcp.indexer.runner import EXIT_SUPERSEDED
+
+        db_dir = tmp_path / "index"
+        db_dir.mkdir()
+
+        holder = textwrap.dedent(
+            f"""
+            import sys, time
+            from pathlib import Path
+            sys.path.insert(0, {str(Path(__file__).resolve().parents[1] / "src")!r})
+            from fw_context_mcp.cli._index import _claim_index, _release_index
+            from fw_context_mcp.indexer.db._locking import index_run_lock
+            from fw_context_mcp.indexer.runner import (
+                EXIT_SUPERSEDED, IndexSuperseded, raise_if_superseded,
+            )
+
+            db_dir = Path({str(db_dir)!r})
+            with index_run_lock(db_dir):
+                _claim_index(db_dir)
+                print("HOLDING", flush=True)
+                try:
+                    deadline = time.monotonic() + 8.0
+                    while time.monotonic() < deadline:
+                        raise_if_superseded(db_dir)
+                        time.sleep(0.05)
+                except IndexSuperseded as exc:
+                    print(f"ABORTED {{exc}}", flush=True)
+                    sys.exit(EXIT_SUPERSEDED)
+                finally:
+                    _release_index(db_dir)
+            sys.exit(0)
+            """
+        )
+        # B STAYS ALIVE after it is refused.  That is the condition of the
+        # incident: PidFile.is_active answers False for a dead PID, so a
+        # marker left by a process that exited at once is ignored and the
+        # test would pass with or without the fix.
+        challenger = textwrap.dedent(
+            f"""
+            import sys, time
+            from pathlib import Path
+            sys.path.insert(0, {str(Path(__file__).resolve().parents[1] / "src")!r})
+            from fw_context_mcp.cli._index import _claim_index, _kill_bg_reindex
+            from fw_context_mcp.indexer.db._locking import IndexRunLocked, index_run_lock
+            from fw_context_mcp.indexer.runner import EXIT_ALREADY_RUNNING
+
+            db_dir = Path({str(db_dir)!r})
+            _kill_bg_reindex(db_dir / "index.db")
+            try:
+                with index_run_lock(db_dir):
+                    _claim_index(db_dir)
+                code = 0
+            except IndexRunLocked:
+                code = EXIT_ALREADY_RUNNING
+            print("REFUSED", flush=True)
+            time.sleep(5.0)
+            sys.exit(code)
+            """
+        )
+
+        a = subprocess.Popen(  # noqa: S603 — fixed argv, no shell
+            [sys.executable, "-c", holder],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
+        b = None
+        try:
+            line = a.stdout.readline()
+            assert line.strip() == "HOLDING", line
+
+            b = subprocess.Popen(  # noqa: S603 — fixed argv, no shell
+                [sys.executable, "-c", challenger],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            )
+            assert b.stdout.readline().strip() == "REFUSED"
+
+            out, err = a.communicate(timeout=30)
+            assert b.wait(timeout=30) == EXIT_ALREADY_RUNNING, (
+                "B should be refused"
+            )
+        finally:
+            for proc in (a, b):
+                if proc is not None and proc.poll() is None:
+                    proc.kill()
+                    proc.wait(timeout=10)
+
+        assert a.returncode != EXIT_SUPERSEDED, (
+            "the run that WON the lock abandoned itself because of the run "
+            f"that was refused: {out}{err}"
+        )
+        assert a.returncode == 0, f"{a.returncode}: {out}{err}"
+
+    def test_a_manual_takeover_still_supersedes(self, tmp_path: Path):
+        """The regression guard in the other direction.
+
+        reset_index and reindex_file write the marker from a LIVE process
+        that does not hold index_run_lock, and a run must still stop for
+        them.  A fix that made raise_if_superseded ignore foreign markers
+        would pass the test above and break this one.
+        """
+        from fw_context_mcp.indexer.runner import IndexSuperseded, raise_if_superseded
+        from fw_context_mcp.mcp.shared.pid_file import PidFile
+
+        db_dir = tmp_path / "index"
+        db_dir.mkdir()
+
+        # A live process that is not this one: a sleeping child.
+        other = subprocess.Popen(  # noqa: S603 — fixed argv, no shell
+            [sys.executable, "-c", "import time; time.sleep(30)"],
+        )
+        try:
+            (db_dir / "reindex.pause").write_text(str(other.pid))
+            assert PidFile.is_active(db_dir / "reindex.pause")
+            with pytest.raises(IndexSuperseded):
+                raise_if_superseded(db_dir)
+        finally:
+            other.kill()
+            other.wait(timeout=10)
+
+    def test_the_kill_step_writes_nothing(self, tmp_path: Path):
+        """_kill_bg_reindex must leave the directory as it found it.
+
+        Its whole purpose is to be safe to call BEFORE the lock.
+        """
+        from fw_context_mcp.cli._index import _kill_bg_reindex
+
+        db_dir = tmp_path / "index"
+        db_dir.mkdir()
+
+        _kill_bg_reindex(db_dir / "index.db")
+
+        assert not (db_dir / "reindex.pause").exists()
+        assert not (db_dir / "reindex.pid").exists()
