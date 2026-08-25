@@ -3962,3 +3962,160 @@ class TestManifestRecordsEveryInclude:
             )
         finally:
             conn.close()
+
+
+class TestReindexKeepsTheGeneratedFlag:
+    """``reindex_file`` must not turn a generated header into a plain one.
+
+    _update_manifest_after_reindex passed None for build_dir_patterns, so
+    _is_generated_header() answered False for every header and every record
+    it wrote claimed "generated": False.  After the end of vendor trust
+    ``generated`` is the only trust rule left, so a single reindex_file
+    turned the next full index run into a complete reparse.  Measured on
+    zbox-ecb-fw-v5 variant nrf52840-dev: 27 generated headers went to 0.
+    """
+
+    @staticmethod
+    def _unit(tmp_path: Path, rel: str):
+        from unittest.mock import MagicMock
+
+        src = tmp_path / rel
+        src.parent.mkdir(parents=True, exist_ok=True)
+        src.write_text("int main() { return 0; }")
+        unit = MagicMock()
+        unit.file = src
+        unit.directory = tmp_path
+        unit.clang_args = ["-std=c11"]
+        unit.raw_entry = {"file": rel, "directory": str(tmp_path)}
+        return unit
+
+    @staticmethod
+    def _manifest(tmp_path: Path, *, entries, build_dir_patterns) -> dict:
+        from fw_context_mcp.indexer.manifest import MANIFEST_FORMAT
+
+        manifest: dict = {
+            "_format": MANIFEST_FORMAT,
+            "compile_commands_path": str(tmp_path / "compile_commands.json"),
+            "project_root": str(tmp_path),
+            "arg_sets": [["-std=c11"]],
+            "headers": {
+                "build/zephyr/include/generated/autoconf.h": {
+                    "hash": "OLD", "generated": True,
+                },
+            },
+            "entries": entries,
+        }
+        if build_dir_patterns is not None:
+            manifest["build_dir_patterns"] = build_dir_patterns
+        return manifest
+
+    def _run(self, tmp_path: Path, *, entries, build_dir_patterns, monkeypatch):
+        """Drive _update_manifest_after_reindex with a stubbed header collector.
+
+        The real collector needs libclang and a compiled TU.  What this test
+        checks is the patterns that reach it and the merge that follows, so
+        the stub records the patterns and returns the header the build
+        generates.
+        """
+        from fw_context_mcp.mcp.handlers import maintenance
+        from fw_context_mcp.indexer import manifest as manifest_mod
+
+        saved: dict = {}
+        seen: list = []
+
+        def fake_collect(unit, root, build_dir_patterns, header_table):
+            seen.append(build_dir_patterns)
+            path = "build/zephyr/include/generated/autoconf.h"
+            header_table[path] = {
+                "hash": "NEW",
+                "generated": manifest_mod._is_generated_header(path, build_dir_patterns),
+            }
+            return [path]
+
+        def fake_load(db_dir, config_hash):
+            return self._manifest(
+                tmp_path, entries=entries, build_dir_patterns=build_dir_patterns
+            )
+
+        def fake_save(data, db_dir, config_hash):
+            saved.update(data)
+            return config_hash
+
+        monkeypatch.setattr(manifest_mod, "_collect_headers_from_tokens", fake_collect)
+        monkeypatch.setattr(manifest_mod, "load", fake_load)
+        monkeypatch.setattr(manifest_mod, "save", fake_save)
+
+        maintenance._update_manifest_after_reindex(
+            [(self._unit(tmp_path, "src/main.c"), object())],
+            tmp_path,
+            tmp_path / "index",
+            "deadbeef",
+        )
+        return saved, seen
+
+    def test_reindex_file_reads_the_patterns_from_the_manifest(self, tmp_path, monkeypatch):
+        """The manifest is the source, because it holds what the index run used."""
+        _, seen = self._run(
+            tmp_path,
+            entries=[{
+                "file": "src/main.c", "directory": str(tmp_path), "arg_set": 0,
+                "source_hash": "x", "headers": [],
+            }],
+            build_dir_patterns=["build/"],
+            monkeypatch=monkeypatch,
+        )
+
+        assert seen == [["build/"]]
+
+    def test_reindex_file_keeps_the_generated_flag(self, tmp_path, monkeypatch):
+        """An entry the manifest already has goes through update_entry."""
+        saved, _ = self._run(
+            tmp_path,
+            entries=[{
+                "file": "src/main.c", "directory": str(tmp_path), "arg_set": 0,
+                "source_hash": "x", "headers": [],
+            }],
+            build_dir_patterns=["build/"],
+            monkeypatch=monkeypatch,
+        )
+
+        record = saved["headers"]["build/zephyr/include/generated/autoconf.h"]
+        assert record["generated"] is True
+        assert record["hash"] == "NEW"
+
+    def test_a_new_entry_keeps_the_generated_flag(self, tmp_path, monkeypatch):
+        """A TU the manifest has never seen goes down the else branch.
+
+        That branch bypasses update_entry, so the fix in update_entry alone
+        does not reach it.
+        """
+        saved, _ = self._run(
+            tmp_path,
+            entries=[],
+            build_dir_patterns=["build/"],
+            monkeypatch=monkeypatch,
+        )
+
+        record = saved["headers"]["build/zephyr/include/generated/autoconf.h"]
+        assert record["generated"] is True
+        assert len(saved["entries"]) == 1
+
+    def test_a_manifest_without_patterns_falls_back_to_detection(self, tmp_path, monkeypatch):
+        """An index written before the key existed must still get patterns.
+
+        The probe for this whole class must run on a build whose manifest HAS
+        patterns: five of the nine zbox-v5 manifests carry none, and on those
+        "generated is 0 after reindex_file" holds before the fix as well.
+        """
+        (tmp_path / "west.yml").write_text("")
+        _, seen = self._run(
+            tmp_path,
+            entries=[{
+                "file": "src/main.c", "directory": str(tmp_path), "arg_set": 0,
+                "source_hash": "x", "headers": [],
+            }],
+            build_dir_patterns=None,
+            monkeypatch=monkeypatch,
+        )
+
+        assert seen == [["build/"]]

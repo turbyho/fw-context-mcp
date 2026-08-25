@@ -735,7 +735,6 @@ def _step_update_manifest(conn: sqlite3.Connection, ctx: dict) -> None:
             config_hash,
             ctx["project_root"],
             updated_manifest,
-            vendor_patterns=ctx.get("vendor_patterns") or [],
             hash_cache=ctx.get("header_hash_cache"),
         )
 

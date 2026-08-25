@@ -1116,6 +1116,7 @@ def _update_manifest_after_reindex(
         from ...indexer.manifest import (
             _collect_headers_from_tokens,
             _intern_arguments,
+            merge_header_records,
             update_entry,
         )
         from ...indexer.manifest import (
@@ -1126,13 +1127,24 @@ def _update_manifest_after_reindex(
         )
         manifest_data = load_manifest(db_dir, config_hash)
         if manifest_data is not None:
+            # The patterns the INDEX RUN used, read from the manifest it
+            # wrote.  With None here _is_generated_header() answers False for
+            # every header, so every record this function writes claimed
+            # "generated": False.  After the end of vendor trust `generated`
+            # is the only trust rule left, so that turned every build of a
+            # re-indexed file into a full reparse.  Measured on zbox-ecb-fw-v5
+            # variant nrf52840-dev: 27 generated headers dropped to 0.
+            bdp = manifest_data.get("build_dir_patterns")
+            if not bdp:
+                bdp, _ = _reindex_build_patterns_for_generated(root)
             for unit, _parsed in parsed_units:
                 # Records go into a per-unit table and are merged by
-                # update_entry, so a header this re-parse is the first to see
-                # still contributes its hash to the manifest's shared map.
+                # merge_header_records, so a header this re-parse is the first
+                # to see still contributes its hash to the manifest's shared
+                # map — without a downgrade of `generated` on the way.
                 header_records: dict[str, dict] = {}
                 headers = _collect_headers_from_tokens(
-                    unit, root, None, header_records
+                    unit, root, bdp, header_records
                 )
                 source_hash = compute_source_hash(unit.file.resolve())
                 try:
@@ -1146,7 +1158,10 @@ def _update_manifest_after_reindex(
                         )
                         break
                 else:
-                    manifest_data.setdefault("headers", {}).update(header_records)
+                    # Same merge as update_entry uses.  This branch bypasses
+                    # update_entry completely, so a plain .update() here is a
+                    # second place where a False overwrites a True.
+                    merge_header_records(manifest_data, header_records)
                     manifest_data.setdefault("entries", []).append({
                         "file": tu_rel,
                         "directory": str(unit.directory) if unit.directory else str(root),
@@ -1517,6 +1532,24 @@ def _reindex_match_tus(
     if not matching:
         return [], {"error": f"{target.name} not found in compile_commands.json — it may be a header-only file."}
     return matching, None
+
+
+def _reindex_build_patterns_for_generated(root: Path) -> tuple[list[str], None]:
+    """Return build-output patterns for a manifest that stores none.
+
+    Only for an index written before the manifest carried the key.  The
+    manifest is the better source: it holds the value the index run applied,
+    while this one re-detects and can answer differently after the build
+    system changes.
+    """
+    from ...indexer.build import detect_build_system
+    from ...indexer.builders import registry
+
+    system = detect_build_system(root)
+    builder_cls = registry.get(system) if system else None
+    if builder_cls is None:
+        return [], None
+    return list(builder_cls().get_build_dir_patterns(root)), None
 
 
 def _reindex_build_patterns(

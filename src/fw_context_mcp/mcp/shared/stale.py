@@ -327,7 +327,6 @@ def _check_header_staleness(
 
     from ...indexer.manifest import check_tu_staleness, resolve_headers
     from ...indexer.manifest import load as load_manifest
-    from ...indexer.sdk_detect import vendor_patterns_for_build
 
     # Find the DB dir from the conn's path
     db_path = Path(conn.execute("PRAGMA database_list").fetchone()["file"])
@@ -343,11 +342,12 @@ def _check_header_staleness(
         return 0, []
 
     project_root = Path(manifest.get("project_root", str(root)))
-    # The set the INDEXER applied, not one derived here.  A derived set
-    # differs — this layer has no compiler flags — and a narrower one makes
-    # this check re-hash headers the indexer trusted.  maintenance.py turns
-    # that into "stale": true and asks for a reindex that cannot clear it.
-    vendor_patterns = vendor_patterns_for_build(manifest, project_root)
+    # No vendor set is needed here any more: header_is_trusted() is the one
+    # rule, and it reads `generated` alone.  This layer used to derive its
+    # own set, which differed from the indexer's — it has no compiler flags —
+    # and the narrower answer made this check re-hash headers the indexer had
+    # trusted.  maintenance.py turned that into "stale": true and asked for a
+    # reindex that could not clear it.
 
     stale_count = 0
     affected: list[str] = []
@@ -358,7 +358,7 @@ def _check_header_staleness(
     header_table = manifest.get("headers")
     for entry in manifest.get("entries", [])[:max_files]:
         stale, _ = check_tu_staleness(
-            entry, project_root, vendor_patterns,
+            entry, project_root,
             headers=resolve_headers(entry, header_table),
         )
         if stale:

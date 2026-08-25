@@ -431,7 +431,7 @@ def run(
         from .ops import _normalize_file_path
 
         stale_headers = collect_stale_headers(
-            manifest, project_root, vendor_patterns, hash_cache=header_hash_cache
+            manifest, project_root, hash_cache=header_hash_cache
         )
         if stale_headers:
             header_stale_tus = frozenset(
@@ -534,7 +534,6 @@ def run(
             unit,
             config_hash,
             project_root,
-            vendor_patterns,
             index_refs,
             existing_files,
             force=force,

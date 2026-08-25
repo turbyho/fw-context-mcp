@@ -71,7 +71,6 @@ def _check_and_parse_unit(
     unit,
     config_hash,
     project_root,
-    vendor_patterns,
     index_refs,
     existing_files,
     force=False,
@@ -97,8 +96,6 @@ def _check_and_parse_unit(
     All translation units are indexed — no exclusion filtering.
 
     Args:
-        vendor_patterns: LIKE patterns for vendor/SDK directories (used for
-            manifest staleness checking — vendor headers are trusted).
         manifest: Optional ``{file_path: entry}`` lookup dict built from
             ``manifest.load()`` entries.  When provided, header staleness
             is checked via hash comparison against the manifest (fast —
@@ -170,7 +167,6 @@ def _check_and_parse_unit(
     manifest_entry_hash = _get_manifest_entry_hash_for_unit(
         unit,
         project_root,
-        vendor_patterns,
         manifest,
         hash_cache=hash_cache,
         header_table=header_table,
@@ -216,7 +212,6 @@ def _check_and_parse_unit(
 def _get_manifest_entry_hash_for_unit(
     unit,
     project_root: Path,
-    vendor_patterns: list[str],
     manifest_lookup: dict[str, dict] | None,
     *,
     hash_cache: dict[str, str] | None = None,
@@ -249,7 +244,7 @@ def _get_manifest_entry_hash_for_unit(
         if entry is not None:
             headers = resolve_headers(entry, header_table)
             stale, current_source_hash = check_tu_staleness(
-                entry, project_root, vendor_patterns,
+                entry, project_root,
                 hash_cache=hash_cache, headers=headers,
             )
             if not stale:
@@ -258,7 +253,6 @@ def _get_manifest_entry_hash_for_unit(
             return compute_current_entry_hash(
                 entry,
                 project_root,
-                vendor_patterns,
                 new_source_hash=current_source_hash,
                 hash_cache=hash_cache,
                 headers=headers,

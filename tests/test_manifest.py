@@ -292,7 +292,7 @@ class TestCheckTuStaleness:
             "source_hash": "old_hash_that_differs",
             "headers": [],
         }
-        stale, new_hash = check_tu_staleness(entry, tmp_path, [])
+        stale, new_hash = check_tu_staleness(entry, tmp_path)
         assert stale is True
         assert new_hash is not None
         assert len(new_hash) == 64
@@ -313,7 +313,7 @@ class TestCheckTuStaleness:
             "source_hash": source_hash,
             "headers": [],
         }
-        stale, new_hash = check_tu_staleness(entry, tmp_path, [])
+        stale, new_hash = check_tu_staleness(entry, tmp_path)
         assert stale is False
         assert new_hash is None
 
@@ -345,7 +345,7 @@ class TestCheckTuStaleness:
         }
         entry = manifest["entries"][0]
         stale, _ = check_tu_staleness(
-            entry, tmp_path, [], headers=tu_headers(manifest, entry)
+            entry, tmp_path, headers=tu_headers(manifest, entry)
         )
         assert stale is True  # header hash differs
 
@@ -362,14 +362,30 @@ class TestCheckTuStaleness:
         entry = {
             "file": "src/main.cpp",
             "source_hash": source_hash,
-            "headers": [
-                {"path": "BUILD/mbed_config.h", "hash": "nonexistent_hash", "generated": True},
-            ],
+            "headers": ["BUILD/mbed_config.h"],
         }
-        stale, _ = check_tu_staleness(entry, tmp_path, [])
-        assert stale is False  # generated header is skipped
+        # The records go in as `headers=`.  check_tu_staleness never reads
+        # entry["headers"]: that field holds paths, and the records live in
+        # the manifest's shared map.
+        stale, _ = check_tu_staleness(
+            entry, tmp_path,
+            headers=[{"path": "BUILD/mbed_config.h", "hash": "nonexistent_hash", "generated": True}],
+        )
+        assert stale is False  # generated header is trusted
 
-    def test_sdk_header_trusted(self, tmp_path: Path):
+    def test_an_in_tree_vendor_header_is_not_trusted(self, tmp_path: Path):
+        """A changed vendor header makes its dependent TU stale.
+
+        This test asserted ``stale is False`` before, on the reasoning that
+        re-hashing the SDK would dominate the index run.  Measured: 45 ms
+        against 42 minutes, so cost was never the reason.
+
+        External code reaches the index THROUGH the project's own units: an
+        inline function, a macro, a constexpr, a template or a struct layout
+        expands from the header INTO every unit that includes it.  A changed
+        vendor header therefore changes the indexed symbols of PROJECT files,
+        so a full reparse is the correct answer and not a conservative one.
+        """
         import hashlib
 
         from fw_context_mcp.indexer.manifest import check_tu_staleness
@@ -386,13 +402,70 @@ class TestCheckTuStaleness:
         entry = {
             "file": "src/main.cpp",
             "source_hash": source_hash,
-            "headers": [
-                {"path": "mbed-os/mbed.h", "hash": "nonexistent_hash", "generated": False},
-            ],
+            "headers": ["mbed-os/mbed.h"],
         }
-        # mbed-os/% is a vendor pattern — SDK header is trusted from manifest
-        stale, _ = check_tu_staleness(entry, tmp_path, ["mbed-os/%"])
-        assert stale is False  # SDK header is trusted from manifest
+        stale, _ = check_tu_staleness(
+            entry, tmp_path,
+            headers=[{"path": "mbed-os/mbed.h", "hash": "nonexistent_hash", "generated": False}],
+        )
+        assert stale is True
+
+    def test_an_out_of_tree_header_is_not_trusted(self, tmp_path: Path):
+        """A changed toolchain header makes its dependent TU stale.
+
+        This is the defect A4 measured from the other side: a toolchain
+        update moved no source mtime, every toolchain header sat outside
+        project_root, and nothing queued a single TU for reparse.
+        """
+        import hashlib
+
+        from fw_context_mcp.indexer.manifest import check_tu_staleness
+
+        src = tmp_path / "src" / "main.cpp"
+        src.parent.mkdir(parents=True, exist_ok=True)
+        src.write_text("int main() { return 0; }")
+        source_hash = hashlib.sha256(src.read_bytes()).hexdigest()
+
+        outside = tmp_path / "toolchain" / "stdint.h"
+        outside.parent.mkdir(parents=True)
+        outside.write_text("// toolchain header")
+
+        entry = {
+            "file": "src/main.cpp",
+            "source_hash": source_hash,
+            "headers": [str(outside)],
+        }
+        stale, _ = check_tu_staleness(
+            entry, tmp_path,
+            headers=[{"path": str(outside), "hash": "nonexistent_hash", "generated": False}],
+        )
+        assert stale is True
+
+    def test_a_missing_header_reads_as_changed(self, tmp_path: Path):
+        """A path that no longer exists is stale, not trusted.
+
+        compute_source_hash returns "" on OSError, so a toolchain path that
+        disappeared cannot match a stored hash.
+        """
+        import hashlib
+
+        from fw_context_mcp.indexer.manifest import check_tu_staleness
+
+        src = tmp_path / "src" / "main.cpp"
+        src.parent.mkdir(parents=True, exist_ok=True)
+        src.write_text("int main() { return 0; }")
+        source_hash = hashlib.sha256(src.read_bytes()).hexdigest()
+
+        entry = {
+            "file": "src/main.cpp",
+            "source_hash": source_hash,
+            "headers": ["/gone/stdint.h"],
+        }
+        stale, _ = check_tu_staleness(
+            entry, tmp_path,
+            headers=[{"path": "/gone/stdint.h", "hash": "some_hash", "generated": False}],
+        )
+        assert stale is True
 
 
 class TestCollectHeadersFromTokens:
@@ -547,7 +620,7 @@ class TestCollectStaleHeaders:
         manifest = self._manifest(
             tmp_path, [{"path": "src/config.h", "hash": stored, "generated": False}]
         )
-        assert collect_stale_headers(manifest, tmp_path, []) == {"src/config.h"}
+        assert collect_stale_headers(manifest, tmp_path) == {"src/config.h"}
 
     def test_unchanged_header_not_reported(self, tmp_path: Path):
         import hashlib
@@ -562,26 +635,76 @@ class TestCollectStaleHeaders:
         manifest = self._manifest(
             tmp_path, [{"path": "src/config.h", "hash": stored, "generated": False}]
         )
-        assert collect_stale_headers(manifest, tmp_path, []) == set()
+        assert collect_stale_headers(manifest, tmp_path) == set()
 
-    def test_generated_and_vendor_headers_skipped(self, tmp_path: Path):
+    def test_a_generated_header_is_still_trusted(self, tmp_path: Path):
+        """The one rule that survives: build output changes every build.
+
+        This is the half of the old test that keeps its sign.  Without it the
+        end of vendor trust would overshoot into trusting nothing, and every
+        build would then force a full reparse.
+        """
         from fw_context_mcp.indexer.manifest import collect_stale_headers
 
         (tmp_path / "BUILD").mkdir()
         (tmp_path / "BUILD" / "mbed_config.h").write_text("// generated")
+
+        manifest = self._manifest(
+            tmp_path,
+            [{"path": "BUILD/mbed_config.h", "hash": "stale", "generated": True}],
+        )
+        assert collect_stale_headers(manifest, tmp_path) == set()
+
+    def test_an_in_tree_vendor_header_change_is_detected(self, tmp_path: Path):
+        """The other half of the old test, with its sign inverted.
+
+        A vendor header used to keep its stored hash and its dependents were
+        never queued.  See test_an_in_tree_vendor_header_is_not_trusted for
+        why external code changes the indexed symbols of project files.
+        """
+        from fw_context_mcp.indexer.manifest import collect_stale_headers
+
         (tmp_path / "mbed-os").mkdir()
         (tmp_path / "mbed-os" / "mbed.h").write_text("// SDK")
 
         manifest = self._manifest(
             tmp_path,
-            [
-                {"path": "BUILD/mbed_config.h", "hash": "stale", "generated": True},
-                {"path": "mbed-os/mbed.h", "hash": "stale", "generated": False},
-            ],
+            [{"path": "mbed-os/mbed.h", "hash": "stale", "generated": False}],
         )
-        assert collect_stale_headers(manifest, tmp_path, ["mbed-os/%"]) == set()
+        assert collect_stale_headers(manifest, tmp_path) == {"mbed-os/mbed.h"}
 
-    def test_header_outside_project_root_skipped(self, tmp_path: Path):
+    def test_a_vendor_change_queues_its_dependents(self, tmp_path: Path):
+        """Every TU that includes the changed vendor header is queued."""
+        from fw_context_mcp.indexer.manifest import (
+            collect_stale_headers,
+            tus_affected_by_headers,
+        )
+
+        (tmp_path / "mbed-os").mkdir()
+        (tmp_path / "mbed-os" / "mbed.h").write_text("// SDK")
+
+        manifest = self._manifest(
+            tmp_path,
+            [{"path": "mbed-os/mbed.h", "hash": "stale", "generated": False}],
+        )
+        manifest["entries"].append({
+            "file": "src/other.cpp",
+            "source_hash": "x",
+            "headers": ["mbed-os/mbed.h"],
+        })
+
+        stale = collect_stale_headers(manifest, tmp_path)
+        assert tus_affected_by_headers(manifest, stale) == {
+            "src/main.cpp", "src/other.cpp",
+        }
+
+    def test_an_out_of_tree_header_change_is_detected(self, tmp_path: Path):
+        """A changed toolchain or system header is stale, not trusted.
+
+        This test asserted ``== set()`` before.  It is the defect A4 measured
+        from the other side: a toolchain update moves no source mtime, so if
+        nothing here reports the header, no TU is ever queued.
+        """
         from fw_context_mcp.indexer.manifest import collect_stale_headers
 
         outside = tmp_path.parent / f"{tmp_path.name}-external.h"
@@ -590,7 +713,7 @@ class TestCollectStaleHeaders:
             manifest = self._manifest(
                 tmp_path, [{"path": str(outside), "hash": "stale", "generated": False}]
             )
-            assert collect_stale_headers(manifest, tmp_path, []) == set()
+            assert collect_stale_headers(manifest, tmp_path) == {str(outside)}
         finally:
             outside.unlink(missing_ok=True)
 
@@ -609,7 +732,7 @@ class TestCollectStaleHeaders:
             tmp_path, [{"path": "src/config.h", "hash": stored, "generated": False}]
         )
         cache = {str(header.resolve()): stored}
-        assert collect_stale_headers(manifest, tmp_path, [], hash_cache=cache) == set()
+        assert collect_stale_headers(manifest, tmp_path, hash_cache=cache) == set()
 
     def test_tus_affected_by_headers(self, tmp_path: Path):
         from fw_context_mcp.indexer.manifest import tus_affected_by_headers
@@ -903,3 +1026,201 @@ class TestLoadBuildDirPatterns:
         before = len(m._BUILD_PATTERNS_CACHE)
         assert m.load_build_dir_patterns(tmp_path, "abc123") == []
         assert len(m._BUILD_PATTERNS_CACHE) == before, "an empty list was not cached"
+
+
+class TestMtimeBumpIsSafe:
+    """The mtime may move forward only for a header the pipeline trusts.
+
+    This is the site that is easy to forget.  It used to return True for a
+    vendor, a generated and an out-of-tree header with no check of the
+    content.  Left alone, a header with changed content would get a new
+    mtime, _count_modified_files would stop seeing the change, and the end
+    of trust in the other four callers would have no effect.
+    """
+
+    def test_the_mtime_bump_verifies_a_vendor_header(self, tmp_path: Path):
+        import hashlib
+
+        from fw_context_mcp.indexer._manifest_updater import _mtime_bump_is_safe
+
+        header = tmp_path / "mbed-os" / "mbed.h"
+        header.parent.mkdir(parents=True)
+        header.write_text("// changed content")
+        stored = hashlib.sha256(b"// old content").hexdigest()
+
+        assert _mtime_bump_is_safe(
+            header, {"hash": stored, "generated": False}, None
+        ) is False
+
+    def test_the_mtime_bump_verifies_an_out_of_tree_header(self, tmp_path: Path):
+        import hashlib
+
+        from fw_context_mcp.indexer._manifest_updater import _mtime_bump_is_safe
+
+        header = tmp_path / "toolchain" / "stdint.h"
+        header.parent.mkdir(parents=True)
+        header.write_text("// changed content")
+        stored = hashlib.sha256(b"// old content").hexdigest()
+
+        assert _mtime_bump_is_safe(
+            header, {"hash": stored, "generated": False}, None
+        ) is False
+
+    def test_an_unchanged_vendor_header_may_bump(self, tmp_path: Path):
+        """Content-identical still qualifies — this is what fixes VCS mtime drift."""
+        import hashlib
+
+        from fw_context_mcp.indexer._manifest_updater import _mtime_bump_is_safe
+
+        header = tmp_path / "mbed-os" / "mbed.h"
+        header.parent.mkdir(parents=True)
+        header.write_text("// same content")
+        stored = hashlib.sha256(header.read_bytes()).hexdigest()
+
+        assert _mtime_bump_is_safe(
+            header, {"hash": stored, "generated": False}, None
+        ) is True
+
+    def test_a_generated_header_still_bumps_unconditionally(self, tmp_path: Path):
+        from fw_context_mcp.indexer._manifest_updater import _mtime_bump_is_safe
+
+        header = tmp_path / "BUILD" / "mbed_config.h"
+        header.parent.mkdir(parents=True)
+        header.write_text("// generated")
+
+        assert _mtime_bump_is_safe(
+            header, {"hash": "whatever", "generated": True}, None
+        ) is True
+
+
+class TestMergeHeaderRecords:
+    """``generated`` goes from False to True, never the other way.
+
+    ``generated`` is a property of the PATH, not of one parse.  A caller with
+    no build_dir_patterns computes False for every header, and after the end
+    of vendor trust ``generated`` is the only trust rule the pipeline has
+    left — to let False overwrite True disables it in silence.
+    """
+
+    def test_update_entry_does_not_downgrade_generated(self):
+        from fw_context_mcp.indexer.manifest import update_entry
+
+        manifest = {
+            "headers": {"build/autoconf.h": {"hash": "OLD", "generated": True}},
+            "entries": [{"file": "src/main.c", "source_hash": "x", "headers": []}],
+        }
+        update_entry(
+            manifest, 0, "new-source", ["build/autoconf.h"],
+            {"build/autoconf.h": {"hash": "NEW", "generated": False}},
+        )
+
+        assert manifest["headers"]["build/autoconf.h"]["generated"] is True
+        assert manifest["headers"]["build/autoconf.h"]["hash"] == "NEW"
+
+    def test_a_new_entry_does_not_downgrade_generated(self):
+        """The second merge site, which bypasses update_entry completely.
+
+        _update_manifest_after_reindex has an else branch for a TU the
+        manifest has never seen.  It called .update() directly, so the fix in
+        update_entry alone would not reach it.
+        """
+        from fw_context_mcp.indexer.manifest import merge_header_records
+
+        manifest = {"headers": {"build/autoconf.h": {"hash": "OLD", "generated": True}}}
+        merge_header_records(
+            manifest, {"build/autoconf.h": {"hash": "NEW", "generated": False}}
+        )
+
+        assert manifest["headers"]["build/autoconf.h"]["generated"] is True
+        assert manifest["headers"]["build/autoconf.h"]["hash"] == "NEW"
+
+    def test_a_promotion_to_generated_goes_through(self):
+        """False to True is the direction that must still work."""
+        from fw_context_mcp.indexer.manifest import merge_header_records
+
+        manifest = {"headers": {"build/autoconf.h": {"hash": "OLD", "generated": False}}}
+        merge_header_records(
+            manifest, {"build/autoconf.h": {"hash": "NEW", "generated": True}}
+        )
+
+        assert manifest["headers"]["build/autoconf.h"]["generated"] is True
+
+    def test_a_new_header_is_added(self):
+        from fw_context_mcp.indexer.manifest import merge_header_records
+
+        manifest: dict = {}
+        merge_header_records(
+            manifest, {"src/config.h": {"hash": "H", "generated": False}}
+        )
+
+        assert manifest["headers"] == {"src/config.h": {"hash": "H", "generated": False}}
+
+    def test_the_caller_record_is_not_mutated(self):
+        """The merge must not write True back into the caller's own dict."""
+        from fw_context_mcp.indexer.manifest import merge_header_records
+
+        manifest = {"headers": {"build/autoconf.h": {"hash": "OLD", "generated": True}}}
+        records = {"build/autoconf.h": {"hash": "NEW", "generated": False}}
+        merge_header_records(manifest, records)
+
+        assert records["build/autoconf.h"]["generated"] is False
+
+
+class TestTheTrustRuleHasOneDefinition:
+    """A copy of the rule anywhere else is the defect this commit removes."""
+
+    def test_every_caller_uses_the_shared_trust_predicate(self):
+        """Grep src/, do not assert over a list of known functions.
+
+        A test written as "these four functions delegate" cannot find a fifth
+        copy — and a fifth copy in compute_current_entry_hash is exactly what
+        four rounds of review missed.  The grep finds any new one.
+        """
+        import re
+
+        src = Path(__file__).resolve().parent.parent / "src" / "fw_context_mcp"
+        offenders = []
+        for path in src.rglob("*.py"):
+            text = path.read_text(encoding="utf-8")
+            for lineno, line in enumerate(text.splitlines(), 1):
+                if line.lstrip().startswith("#"):
+                    continue
+                # The rule read as: skip when the record says generated.
+                if re.search(r'\.get\("generated"\)', line) and "header_is_trusted" not in line:
+                    offenders.append(f"{path.relative_to(src)}:{lineno}: {line.strip()}")
+
+        allowed = {
+            # The one definition.
+            "indexer/manifest.py",
+        }
+        unexpected = [
+            o for o in offenders
+            if not any(o.startswith(a + ":") for a in allowed)
+        ]
+        assert unexpected == [], (
+            "the trust rule is copied outside header_is_trusted():\n"
+            + "\n".join(unexpected)
+        )
+
+    def test_the_vendor_patterns_parameter_is_gone(self):
+        """The four staleness signatures must not take a vendor set again.
+
+        A signature that still accepts it states a rule the body no longer
+        applies, and the next caller passes one and believes it matters.
+        """
+        import inspect
+
+        from fw_context_mcp.indexer._manifest_updater import _mtime_bump_is_safe
+        from fw_context_mcp.indexer.manifest import (
+            check_tu_staleness,
+            collect_stale_headers,
+            compute_current_entry_hash,
+        )
+
+        for fn in (
+            check_tu_staleness,
+            collect_stale_headers,
+            compute_current_entry_hash,
+            _mtime_bump_is_safe,
+        ):
+            assert "vendor_patterns" not in inspect.signature(fn).parameters, fn.__name__

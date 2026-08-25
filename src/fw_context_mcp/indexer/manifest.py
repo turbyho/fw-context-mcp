@@ -866,10 +866,66 @@ def _hash_with_cache(path: Path, hash_cache: dict[str, str] | None) -> str:
     return cached
 
 
+def header_is_trusted(record: dict) -> bool:
+    """May the pipeline keep the stored hash of this header without a re-read?
+
+    ONE definition, FIVE callers: collect_stale_headers(),
+    check_tu_staleness(), compute_current_entry_hash(),
+    _mtime_bump_is_safe() and _headers_moved_on().  What the pipeline trusts
+    is one decision, and five copies of it move apart.  A caller that
+    repeats the rule instead of a call to this function is a defect.
+
+    compute_current_entry_hash() was the copy that four rounds of review did
+    not see: it answers a different question ("what IS the hash now") and so
+    it reads as a hash function, not as a trust rule.  It carries the same
+    three conditions, and a copy that keeps the STORED hash for a header the
+    run just re-read writes a files.content_hash that describes no text at
+    all.  grep for the rule, not for the word "trust".
+
+    Only a build-generated header is trusted.  Its content changes with every
+    build without a change of meaning, and config_hash plus flags_hash carry
+    what does change.
+
+    A vendor header and a header outside the project are NOT trusted any
+    more.  External code reaches the index THROUGH the project's own units:
+    an inline function, a macro, a constexpr, a C++ template, or a struct
+    layout expands from the header INTO every unit that includes it.  A
+    changed external header therefore changes the indexed symbols of PROJECT
+    files — their signatures, their lines, and which code survives the
+    #ifdefs.  A full reparse is the correct answer, not a conservative one.
+
+    Cost measured: to hash every header in the manifest takes 45 ms, against
+    an index run of 42 minutes.
+    """
+    return bool(record.get("generated"))
+
+
+def merge_header_records(
+    manifest: dict,
+    header_records: dict[str, dict],
+) -> None:
+    """Merge fresh header records into the manifest's shared ``headers`` map.
+
+    Merge, do not replace: the hash is newer and wins, but ``generated`` is a
+    property of the PATH, not of this parse.  A caller with no
+    build_dir_patterns computes False for every header, and ``generated`` is
+    the only trust rule the pipeline has left — to let False overwrite True
+    disables it in silence.
+
+    ONE definition, and every writer of that map calls it.  A second copy of
+    this merge is how the defect it fixes came back the first time.
+    """
+    table = manifest.setdefault("headers", {})
+    for path, record in header_records.items():
+        existing = table.get(path)
+        if existing is not None and existing.get("generated"):
+            record = {**record, "generated": True}
+        table[path] = record
+
+
 def check_tu_staleness(
     entry: dict,
     project_root: Path,
-    vendor_patterns: list[str],
     *,
     hash_cache: dict[str, str] | None = None,
     headers: list[dict] | None = None,
@@ -886,13 +942,9 @@ def check_tu_staleness(
     when only a few source files changed.  This function enables incremental
     indexing — only TUs whose source or project headers changed are re-parsed.
 
-    Vendor/SDK headers and headers outside *project_root* are trusted from
-    the manifest.  Only project headers inside *project_root* are re-hashed.
-
-    Cost is not the reason for these rules.  To hash every header in the
-    manifest takes 45 ms on the measured projects (1 037 headers on
-    zbox-ecb-fw, 541 on a Zephyr build, 640 on an ESP32 build), against
-    an index run of 42 minutes.  That is 0.002 %.
+    Every header is re-hashed except a build-generated one — see
+    :func:`header_is_trusted` for the one rule and for why the vendor and
+    out-of-tree exceptions are gone.
 
     Compares the stored ``source_hash`` and ``headers[].hash`` from *entry*
     against the current on-disk content.
@@ -903,8 +955,6 @@ def check_tu_staleness(
         file (for updating the manifest after reparse), or None when stale
         is False.
     """
-    from .sdk_detect import _path_matches
-
     # ── Check source file hash ──
     source_file = Path(entry["file"])
     if not source_file.is_absolute():
@@ -914,27 +964,15 @@ def check_tu_staleness(
     if current_source_hash != entry.get("source_hash", ""):
         return True, current_source_hash
 
-    # ── Check project header hashes ──
-    # Vendor/SDK headers and headers outside project_root are trusted from
-    # the manifest.  Only project headers inside project_root are re-hashed.
+    # ── Check header hashes ──
     for h in headers or ():
-        if h.get("generated"):
-            continue  # build-generated headers are skipped
+        if header_is_trusted(h):
+            continue
 
         header_path = h["path"]
         p = Path(header_path)
         if not p.is_absolute():
             p = (project_root / header_path).resolve()
-
-        # Outside project_root → trust manifest (system/toolchain/external SDK)
-        try:
-            rel_path = str(p.relative_to(project_root))
-        except ValueError:
-            continue
-
-        # Matches vendor pattern → trust manifest
-        if any(_path_matches(rel_path, pat) for pat in vendor_patterns):
-            continue
 
         if _hash_with_cache(p, hash_cache) != h.get("hash", ""):
             return True, current_source_hash
@@ -945,7 +983,6 @@ def check_tu_staleness(
 def collect_stale_headers(
     manifest: dict,
     project_root: Path,
-    vendor_patterns: list[str],
     *,
     hash_cache: dict[str, str] | None = None,
 ) -> set[str]:
@@ -957,14 +994,9 @@ def collect_stale_headers(
     would stay frozen at their first-index state.  Collecting the changed
     headers up front lets the runner mark the dependent TUs for re-parsing.
 
-    Trust rules match :func:`check_tu_staleness` exactly — generated headers,
-    headers outside *project_root*, and headers matching *vendor_patterns*
-    keep their stored hash and are never re-read.
-
-    Cost is not the reason for these rules.  To hash every header in the
-    manifest takes 45 ms on the measured projects (1 037 headers on
-    zbox-ecb-fw, 541 on a Zephyr build, 640 on an ESP32 build), against
-    an index run of 42 minutes.  That is 0.002 %.
+    Trust rules match :func:`check_tu_staleness` exactly, because both call
+    :func:`header_is_trusted`.  A build-generated header keeps its stored
+    hash; every other header is re-read.
 
     Reads the manifest's ``headers`` map, which already holds each path once,
     so a header shared by 300 TUs is checked once.  Pass *hash_cache* to share
@@ -973,27 +1005,15 @@ def collect_stale_headers(
     Returns the paths exactly as stored in the manifest, so the result can be
     fed straight into :func:`tus_affected_by_headers`.
     """
-    from .sdk_detect import _path_matches
-
     stale: set[str] = set()
 
     for header_path, record in (manifest.get("headers") or {}).items():
-        if record.get("generated"):
+        if header_is_trusted(record):
             continue
 
         p = Path(header_path)
         if not p.is_absolute():
             p = (project_root / header_path).resolve()
-
-        # Outside project_root → trust manifest (system/toolchain/external SDK)
-        try:
-            rel_path = str(p.relative_to(project_root))
-        except ValueError:
-            continue
-
-        # Matches vendor pattern → trust manifest
-        if any(_path_matches(rel_path, pat) for pat in vendor_patterns):
-            continue
 
         if _hash_with_cache(p, hash_cache) != record.get("hash", ""):
             stale.add(header_path)
@@ -1036,8 +1056,9 @@ def update_entry(
     has seen must contribute its record, or the path would resolve with an
     empty hash and stay permanently stale.
 
-    Records already in the map are overwritten, because the re-parse just read
-    the file and its hash is the newer one.
+    The hash of a record already in the map is overwritten, because the
+    re-parse just read the file.  ``generated`` is NOT — see
+    :func:`merge_header_records`.
     """
     entries = manifest.get("entries", [])
     if entry_index >= len(entries):
@@ -1045,7 +1066,7 @@ def update_entry(
     entries[entry_index]["source_hash"] = source_hash
     entries[entry_index]["headers"] = headers
     if header_records:
-        manifest.setdefault("headers", {}).update(header_records)
+        merge_header_records(manifest, header_records)
 
 
 def prune_header_table(manifest: dict) -> int:
@@ -1104,7 +1125,6 @@ def get_manifest_entry_hash(entry: dict, headers: list[dict] | None = None) -> s
 def compute_current_entry_hash(
     entry: dict,
     project_root: Path,
-    vendor_patterns: list[str],
     *,
     new_source_hash: str | None = None,
     hash_cache: dict[str, str] | None = None,
@@ -1114,26 +1134,22 @@ def compute_current_entry_hash(
 
     When *entry* is stale (headers or source changed), this function reads
     the actual on-disk hashes rather than trusting the stored values.
-    Headers matching *vendor_patterns* or outside *project_root* keep their
-    stored hashes — only project headers are re-hashed.
-
-    Cost is not the reason for these rules.  To hash every header in the
-    manifest takes 45 ms on the measured projects (1 037 headers on
-    zbox-ecb-fw, 541 on a Zephyr build, 640 on an ESP32 build), against
-    an index run of 42 minutes.  That is 0.002 %.
+    Trusts what :func:`header_is_trusted` trusts and nothing else.  This
+    function reads as a hash function rather than as a trust rule, which is
+    why its copy of the rules survived four rounds of review: a copy that
+    keeps the STORED hash for a header the run just re-read writes a
+    files.content_hash that describes no text at all.
 
     *new_source_hash* overrides ``entry["source_hash"]`` when the source
     file content has also changed.
 
     *headers* are the entry's resolved records from :func:`tu_headers`.
     """
-    from .sdk_detect import _path_matches
-
     source = new_source_hash if new_source_hash else entry.get("source_hash", "")
 
     current_headers: list[dict] = []
     for h in headers or ():
-        if h.get("generated"):
+        if header_is_trusted(h):
             current_headers.append(dict(h))
             continue
 
@@ -1142,19 +1158,10 @@ def compute_current_entry_hash(
         if not p.is_absolute():
             p = (project_root / header_path).resolve()
 
-        # Outside project_root → keep stored hash
-        try:
-            rel_path = str(p.relative_to(project_root))
-        except ValueError:
-            current_headers.append(dict(h))
-            continue
-
-        # Matches vendor pattern → keep stored hash
-        if any(_path_matches(rel_path, pat) for pat in vendor_patterns):
-            current_headers.append(dict(h))
-        else:
-            current_hash = _hash_with_cache(p, hash_cache)
-            current_headers.append({"path": h["path"], "hash": current_hash, "generated": h.get("generated", False)})
+        current_hash = _hash_with_cache(p, hash_cache)
+        current_headers.append(
+            {"path": h["path"], "hash": current_hash, "generated": h.get("generated", False)}
+        )
 
     header_hashes = "".join(
         h.get("hash", "")

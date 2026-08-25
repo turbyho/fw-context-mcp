@@ -33,8 +33,6 @@ log = logging.getLogger(__name__)
 def _mtime_bump_is_safe(
     resolved: Path,
     header: dict,
-    project_root: Path,
-    vendor_patterns: list[str],
     hash_cache: dict[str, str] | None,
 ) -> bool:
     # *header* is a manifest ``headers`` record: {hash, generated}.  The path
@@ -47,25 +45,16 @@ def _mtime_bump_is_safe(
     keep serving symbols parsed from the old text while reporting itself as
     up to date.
 
-    Vendor, generated, and out-of-tree headers keep the unconditional
-    behaviour: their stored hashes are trusted everywhere else in the
-    pipeline, so to verify them here would be meaningless.
-
-    Cost is not the reason for these rules.  To hash every header in the
-    manifest takes 45 ms on the measured projects (1 037 headers on
-    zbox-ecb-fw, 541 on a Zephyr build, 640 on an ESP32 build), against
-    an index run of 42 minutes.  That is 0.002 %.
+    Only a build-generated header keeps the unconditional behaviour, because
+    :func:`header_is_trusted` is the one rule and this is one of its five
+    callers.  A vendor header and a header outside the project are verified
+    here now: without that, a header with changed content would still get a
+    new mtime, ``_count_modified_files`` would stop seeing the change, and
+    the end of trust in the other four callers would have no effect.
     """
-    from .manifest import _hash_with_cache
-    from .sdk_detect import _path_matches
+    from .manifest import _hash_with_cache, header_is_trusted
 
-    if header.get("generated"):
-        return True
-    try:
-        rel_path = str(resolved.relative_to(project_root))
-    except ValueError:
-        return True  # outside project_root — hash is trusted from the manifest
-    if any(_path_matches(rel_path, pat) for pat in vendor_patterns):
+    if header_is_trusted(header):
         return True
     return _hash_with_cache(resolved, hash_cache) == header.get("hash", "")
 
@@ -76,7 +65,6 @@ def _refresh_header_mtimes_from_manifest(
     project_root: Path,
     manifest: dict | None,
     *,
-    vendor_patterns: list[str] | None = None,
     hash_cache: dict[str, str] | None = None,
 ) -> int:
     """Refresh stored mtimes for headers touched by VCS operations.
@@ -108,7 +96,6 @@ def _refresh_header_mtimes_from_manifest(
     """
     if manifest is None:
         return 0
-    vendor_patterns = vendor_patterns or []
     refreshed = 0
     # The manifest's headers map already holds each path once, so there is no
     # per-TU loop and no dedup set to maintain.
@@ -123,7 +110,7 @@ def _refresh_header_mtimes_from_manifest(
             cur_mtime = p_resolved.stat().st_mtime
         except OSError:
             continue
-        if not _mtime_bump_is_safe(p_resolved, record, project_root, vendor_patterns, hash_cache):
+        if not _mtime_bump_is_safe(p_resolved, record, hash_cache):
             continue  # content really changed — the stale signal must survive
         # Use the manifest path directly — it already matches files.path format
         cur_obj = conn.execute(
