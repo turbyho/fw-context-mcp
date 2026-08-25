@@ -2149,3 +2149,105 @@ class TestMacros:
         assert len(results) == 1
         assert results[0]["name"] == "API_KEY"
         assert results[0]["value"] == "0xABCD"
+
+
+class TestGeneratedFlagIsMonotone:
+    """``files.generated`` goes from 0 to 1 and never back.
+
+    Five callers reach upsert_file() and only one of them has the
+    build-output patterns; the other four pass the default False.
+
+    The flag could not be RAISED: the column was written on INSERT and the
+    ON CONFLICT clause never mentioned it, so a row another caller inserted
+    first kept 0 whatever a later caller knew.  Measured on HA_Boiler once
+    the column was first filled: manifest 56, database 49, and the seven
+    that differed were the rows some other caller had inserted first.
+
+    It must not be CLEARED either, which is what a plain
+    ``generated=excluded.generated`` would do.  That direction is the
+    negative control below; it held before this change as well.
+    """
+
+    @staticmethod
+    def _conn(tmp_path: Path):
+        from fw_context_mcp.indexer.db import open_db, upsert_build_config, upsert_project
+
+        conn = open_db(tmp_path / "index.db")
+        upsert_project(conn, "proj", "Proj", str(tmp_path))
+        upsert_build_config(conn, "cafe", "proj", str(tmp_path / "compile_commands.json"))
+        return conn
+
+    def test_a_later_caller_does_not_clear_the_flag(self, tmp_path: Path):
+        """Negative control.  It held before the change too — a plain
+        ``generated=excluded.generated`` is what would break it.
+        """
+        from fw_context_mcp.indexer.db import upsert_file
+
+        conn = self._conn(tmp_path)
+        try:
+            upsert_file(conn, "cafe", "build/gen/autoconf.h", "c", generated=True)
+            # A caller with no build_dir_patterns — the default False.
+            upsert_file(conn, "cafe", "build/gen/autoconf.h", "c")
+
+            row = conn.execute(
+                "SELECT generated FROM files WHERE config_hash=? AND path=?",
+                ("cafe", "build/gen/autoconf.h"),
+            ).fetchone()
+            assert row[0] == 1
+        finally:
+            conn.close()
+
+    def test_a_later_caller_can_raise_the_flag(self, tmp_path: Path):
+        """The defect: _store_symbol_rows knows, and it usually is not first.
+
+        This is the assertion that fails without the MAX clause.
+        """
+        from fw_context_mcp.indexer.db import upsert_file
+
+        conn = self._conn(tmp_path)
+        try:
+            upsert_file(conn, "cafe", "build/gen/autoconf.h", "c")
+            upsert_file(conn, "cafe", "build/gen/autoconf.h", "c", generated=True)
+
+            row = conn.execute(
+                "SELECT generated FROM files WHERE config_hash=? AND path=?",
+                ("cafe", "build/gen/autoconf.h"),
+            ).fetchone()
+            assert row[0] == 1
+        finally:
+            conn.close()
+
+    def test_a_plain_file_stays_not_generated(self, tmp_path: Path):
+        """The negative control: MAX must not turn everything on."""
+        from fw_context_mcp.indexer.db import upsert_file
+
+        conn = self._conn(tmp_path)
+        try:
+            upsert_file(conn, "cafe", "src/main.c", "c")
+            upsert_file(conn, "cafe", "src/main.c", "c", mtime=1.0)
+
+            row = conn.execute(
+                "SELECT generated FROM files WHERE config_hash=? AND path=?",
+                ("cafe", "src/main.c"),
+            ).fetchone()
+            assert row[0] == 0
+        finally:
+            conn.close()
+
+    def test_the_other_columns_still_take_the_new_value(self, tmp_path: Path):
+        """MAX applies to `generated` alone; the rest still overwrite."""
+        from fw_context_mcp.indexer.db import upsert_file
+
+        conn = self._conn(tmp_path)
+        try:
+            upsert_file(conn, "cafe", "src/main.c", "c", mtime=1.0, source_hash="OLD")
+            upsert_file(conn, "cafe", "src/main.c", "c", mtime=2.0, source_hash="NEW")
+
+            row = conn.execute(
+                "SELECT mtime, source_hash FROM files WHERE config_hash=? AND path=?",
+                ("cafe", "src/main.c"),
+            ).fetchone()
+            assert row[0] == 2.0
+            assert row[1] == "NEW"
+        finally:
+            conn.close()

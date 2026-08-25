@@ -76,6 +76,7 @@ from fw_context_mcp.utils import abs_path, compute_content_hash, compute_source_
 
 from .db._chunking import chunked
 from .db._files import FileIdLookup
+from .manifest import _is_generated_header
 
 log = logging.getLogger(__name__)
 
@@ -377,12 +378,25 @@ def _build_filtered_file_content(
         # The stored mtime moves forward together with the content: both come
         # from the text this parse just read, so the pair stays consistent.
         # Updating mtime without the content would hide a real change.
+        # `generated` is written here too, and not only in
+        # _store_symbol_rows.  That function iterates over SYMBOLS, so a
+        # header that declares nothing never reaches it — this INSERT is the
+        # only creator of its row.  Measured on HA_Boiler: 7 of 56 generated
+        # headers, among them umbrella and version headers, came in this way
+        # and kept generated=0 while the manifest said True.
+        #
+        # MAX for the same reason upsert_file() uses it: `generated` is a
+        # property of the PATH, so it goes from 0 to 1 and never back.
         conn.execute(
-            "INSERT INTO files (config_hash, path, language, content, mtime) "
-            "VALUES (?, ?, ?, ?, ?) "
+            "INSERT INTO files (config_hash, path, language, content, mtime, generated) "
+            "VALUES (?, ?, ?, ?, ?, ?) "
             "ON CONFLICT (config_hash, path) DO UPDATE SET "
-            "content = excluded.content, mtime = MAX(files.mtime, excluded.mtime)",
-            (config_hash, db_path, lang, content, file_mtime),
+            "content = excluded.content, mtime = MAX(files.mtime, excluded.mtime), "
+            "generated = MAX(files.generated, excluded.generated)",
+            (
+                config_hash, db_path, lang, content, file_mtime,
+                int(_is_generated_header(db_path, build_dir_patterns)),
+            ),
         )
         filled += 1
 
@@ -434,7 +448,6 @@ def _store_symbol_rows(
     ``is_project`` asks who owns the file, ``generated`` asks whether a tool
     wrote it.
     """
-    from .manifest import _is_generated_header
     from .sdk_detect import _path_matches
 
     rows = []

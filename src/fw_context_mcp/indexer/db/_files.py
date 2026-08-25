@@ -101,6 +101,25 @@ def upsert_file(
     Uses ``ON CONFLICT`` so re-indexing the same ``(config_hash, path)``
     updates language and mtime without duplication.
 
+    ``generated`` takes MAX for two reasons, one in each direction.
+
+    It could not be RAISED at all: the column was written on INSERT and the
+    ON CONFLICT clause never mentioned it, so a row that another caller
+    created first kept 0 whatever a later caller knew.  Five callers reach
+    this function and only one of them has the build-output patterns; the
+    other four pass the default False.  Measured on HA_Boiler once the
+    column was first filled: the manifest said 56 generated headers and the
+    database said 49, and the seven that differed were exactly the rows some
+    other caller had inserted first.
+
+    It must not be CLEARED either, which is what a plain
+    ``generated=excluded.generated`` would do the moment one of those four
+    callers touched the row again.  ``generated`` is a property of the PATH,
+    not of one caller's knowledge.  Within one config_hash the build-output
+    patterns are fixed; a change to them mints a new config_hash and
+    therefore new rows.  Same rule, and the same reason, as
+    merge_header_records() in manifest.py.
+
     Args:
         conn: Open database connection.
         config_hash: Build config hash the file belongs to.
@@ -124,7 +143,8 @@ def upsert_file(
                mtime=excluded.mtime,
                content_hash=excluded.content_hash,
                source_hash=excluded.source_hash,
-               flags_hash=excluded.flags_hash
+               flags_hash=excluded.flags_hash,
+               generated=MAX(files.generated, excluded.generated)
            RETURNING id""",
         (
             config_hash,
