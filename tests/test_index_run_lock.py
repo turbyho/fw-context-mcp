@@ -151,17 +151,49 @@ class TestReindexerIdentity:
 
         return _pid_is_fw_context_reindexer
 
-    def test_a_background_run_is_recognised(self, tmp_path: Path):
-        """A sleeping stand-in with the same argv shape as the daemon spawns."""
-        proc = subprocess.Popen(  # noqa: S603 — fixed argv, no shell
-            [sys.executable, "-m", "fw_context_mcp.cli", "index", "--background",
-             "--this-argument-does-not-exist"],
+    @staticmethod
+    def _stand_in(*argv: str) -> subprocess.Popen:
+        """Spawn a SLEEPING process carrying *argv*, and nothing else.
+
+        The stand-in really sleeps now.  It used to be a real CLI invocation
+        with a bad argument, which argparse rejected after 114 ms — measured.
+        The check then read /proc/<pid>/cmdline for a process that had
+        already exited, and the test failed whenever the full suite kept this
+        one off the CPU for longer than that.  It reads argv and nothing
+        else, so a stand-in carrying the same argv tests exactly the same
+        thing without the race.
+        """
+        return subprocess.Popen(  # noqa: S603 — fixed argv, no shell
+            [sys.executable, "-c", "import time; time.sleep(30)", *argv],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         )
+
+    def test_a_background_run_is_recognised(self, tmp_path: Path):
+        """The argv shape the daemon spawns."""
+        proc = self._stand_in("-m", "fw_context_mcp.cli", "index", "--background")
         try:
-            # argv is set before the process does anything, so /proc is
-            # readable immediately even though the command will fail.
             assert self._pid_check()(proc.pid) is True
+        finally:
+            proc.kill()
+            proc.wait(timeout=10)
+
+    def test_a_foreground_argv_is_not_killable(self, tmp_path: Path):
+        """Without --background the run belongs to a person.
+
+        index_run_lock excludes it instead; nothing may signal it.
+        """
+        proc = self._stand_in("-m", "fw_context_mcp.cli", "index")
+        try:
+            assert self._pid_check()(proc.pid) is False
+        finally:
+            proc.kill()
+            proc.wait(timeout=10)
+
+    def test_another_fw_context_subcommand_is_not_killable(self, tmp_path: Path):
+        """Only an INDEX run is killable, not `status` or `init`."""
+        proc = self._stand_in("-m", "fw_context_mcp.cli", "status", "--background")
+        try:
+            assert self._pid_check()(proc.pid) is False
         finally:
             proc.kill()
             proc.wait(timeout=10)
