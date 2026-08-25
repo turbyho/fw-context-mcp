@@ -1225,3 +1225,356 @@ class TestTheTrustRuleHasOneDefinition:
             _mtime_bump_is_safe,
         ):
             assert "vendor_patterns" not in inspect.signature(fn).parameters, fn.__name__
+
+
+class TestNeedsReparse:
+    """The shared header table erases the staleness of a unit nobody re-parsed.
+
+    Repro: shared.h changes, the runner queues a.c and b.c.  a.c re-parses,
+    b.c ends as "skipped" and is therefore NOT in reparsed_tus.  a.c writes
+    the fresh hash of shared.h into the shared map.  Next run:
+    collect_stale_headers finds nothing and Tier 1 waves b.c through, so
+    b.c holds rows built from the OLD header text until --force.
+
+    In format /1 every entry carried its own copy of the hashes.  The
+    manifest dedup lost that property in silence.
+    """
+
+    @staticmethod
+    def _unit(tmp_path: Path, rel: str):
+        from unittest.mock import MagicMock
+
+        src = tmp_path / rel
+        src.parent.mkdir(parents=True, exist_ok=True)
+        src.write_text("int main() { return 0; }")
+        unit = MagicMock()
+        unit.file = Path(src)
+        unit.directory = tmp_path
+        unit.clang_args = ["-std=c11"]
+        unit.raw_entry = {"file": rel, "directory": str(tmp_path)}
+        return unit
+
+    def _run(self, tmp_path: Path, *, reparsed, generated=False):
+        from fw_context_mcp.indexer._manifest_updater import _update_manifest_after_index
+
+        (tmp_path / "index").mkdir(exist_ok=True)
+        units = [self._unit(tmp_path, "src/a.c"), self._unit(tmp_path, "src/b.c")]
+        manifest = {
+            "_format": MANIFEST_FORMAT,
+            "project_root": str(tmp_path),
+            "arg_sets": [["-std=c11"]],
+            "headers": {"src/shared.h": {"hash": "OLD", "generated": generated}},
+            "entries": [
+                {"file": "src/a.c", "directory": str(tmp_path), "arg_set": 0,
+                 "source_hash": "sa", "flags_hash": "f", "headers": ["src/shared.h"]},
+                {"file": "src/b.c", "directory": str(tmp_path), "arg_set": 0,
+                 "source_hash": "sb", "flags_hash": "f", "headers": ["src/shared.h"]},
+            ],
+        }
+        return _update_manifest_after_index(
+            manifest=manifest,
+            units=units,
+            project_root=tmp_path,
+            db_dir=tmp_path / "index",
+            compile_commands=tmp_path / "compile_commands.json",
+            updated_count=1,
+            tu_headers={
+                "src/a.c": [{"path": "src/shared.h", "hash": "FRESH", "generated": generated}],
+                "src/b.c": [{"path": "src/shared.h", "hash": "FRESH", "generated": generated}],
+            },
+            config_hash="deadbeef",
+            reparsed_tus=reparsed,
+        )
+
+    @staticmethod
+    def _entry(result: dict, name: str) -> dict:
+        return next(e for e in result["entries"] if e["file"] == name)
+
+    def test_a_skipped_tu_stays_queued(self, tmp_path: Path):
+        result = self._run(tmp_path, reparsed={"src/a.c"})
+
+        assert result is not None
+        assert self._entry(result, "src/b.c").get("needs_reparse") is True
+
+    def test_a_reparsed_tu_clears_the_flag(self, tmp_path: Path):
+        """A re-parsed TU gets a fresh dict with no key, so the flag is gone."""
+        result = self._run(tmp_path, reparsed={"src/a.c"})
+
+        assert result is not None
+        assert "needs_reparse" not in self._entry(result, "src/a.c")
+
+    def test_a_generated_header_does_not_flag_anything(self, tmp_path: Path):
+        """The one header the pipeline still trusts must not queue anybody."""
+        result = self._run(tmp_path, reparsed={"src/a.c"}, generated=True)
+
+        assert result is not None
+        assert "needs_reparse" not in self._entry(result, "src/b.c")
+
+    def test_an_unchanged_header_does_not_flag_anything(self, tmp_path: Path):
+        """No difference in the shared table means nothing to mark."""
+        from fw_context_mcp.indexer._manifest_updater import _headers_moved_on
+
+        entry = {"headers": ["src/shared.h"]}
+        table = {"src/shared.h": {"hash": "SAME", "generated": False}}
+
+        assert _headers_moved_on(entry, table, table) is False
+
+    def test_a_second_failure_keeps_the_flag(self, tmp_path: Path):
+        """The mark is sticky: it must hold until a real reparse clears it.
+
+        carry_over() copies the whole entry, so the key survives every
+        further carry-over.  That is the intent — a TU that keeps failing
+        must keep being queued.
+        """
+        from fw_context_mcp.indexer._manifest_updater import _update_manifest_after_index
+
+        (tmp_path / "index").mkdir(exist_ok=True)
+        units = [self._unit(tmp_path, "src/b.c")]
+        manifest = {
+            "_format": MANIFEST_FORMAT,
+            "project_root": str(tmp_path),
+            "arg_sets": [["-std=c11"]],
+            "headers": {"src/shared.h": {"hash": "FRESH", "generated": False}},
+            "entries": [
+                {"file": "src/b.c", "directory": str(tmp_path), "arg_set": 0,
+                 "source_hash": "sb", "flags_hash": "f",
+                 "headers": ["src/shared.h"], "needs_reparse": True},
+            ],
+        }
+        result = _update_manifest_after_index(
+            manifest=manifest,
+            units=units,
+            project_root=tmp_path,
+            db_dir=tmp_path / "index",
+            compile_commands=tmp_path / "compile_commands.json",
+            updated_count=1,
+            tu_headers={},
+            config_hash="deadbeef",
+            reparsed_tus=set(),
+        )
+
+        assert result is not None
+        assert self._entry(result, "src/b.c").get("needs_reparse") is True
+
+    def test_the_staleness_check_reads_the_flag(self, tmp_path: Path):
+        """A flagged entry is stale whatever its hashes say."""
+        import hashlib
+
+        from fw_context_mcp.indexer.manifest import check_tu_staleness
+
+        src = tmp_path / "src" / "b.c"
+        src.parent.mkdir(parents=True, exist_ok=True)
+        src.write_text("int main() { return 0; }")
+        entry = {
+            "file": "src/b.c",
+            "source_hash": hashlib.sha256(src.read_bytes()).hexdigest(),
+            "headers": [],
+            "needs_reparse": True,
+        }
+
+        stale, _ = check_tu_staleness(entry, tmp_path)
+        assert stale is True
+
+    def test_an_unflagged_entry_with_the_same_hashes_is_not_stale(self, tmp_path: Path):
+        """The negative control for the test above."""
+        import hashlib
+
+        from fw_context_mcp.indexer.manifest import check_tu_staleness
+
+        src = tmp_path / "src" / "b.c"
+        src.parent.mkdir(parents=True, exist_ok=True)
+        src.write_text("int main() { return 0; }")
+        entry = {
+            "file": "src/b.c",
+            "source_hash": hashlib.sha256(src.read_bytes()).hexdigest(),
+            "headers": [],
+        }
+
+        stale, _ = check_tu_staleness(entry, tmp_path)
+        assert stale is False
+
+
+class TestMarkEntriesBehind:
+    """``reindex_file`` refreshes the shared hashes and must flag the rest."""
+
+    @staticmethod
+    def _manifest() -> dict:
+        return {
+            "headers": {
+                "src/shared.h": {"hash": "FRESH", "generated": False},
+                "build/autoconf.h": {"hash": "FRESH", "generated": True},
+            },
+            "entries": [
+                {"file": "src/a.c", "headers": ["src/shared.h"]},
+                {"file": "src/b.c", "headers": ["src/shared.h"]},
+                {"file": "src/c.c", "headers": ["build/autoconf.h"]},
+            ],
+        }
+
+    def test_reindex_file_flags_other_dependents(self):
+        from fw_context_mcp.indexer.manifest import mark_entries_behind
+
+        manifest = self._manifest()
+        flagged = mark_entries_behind(manifest, {"src/shared.h"}, {"src/a.c"})
+
+        assert flagged == 1
+        by_file = {e["file"]: e for e in manifest["entries"]}
+        assert "needs_reparse" not in by_file["src/a.c"]
+        assert by_file["src/b.c"]["needs_reparse"] is True
+        assert "needs_reparse" not in by_file["src/c.c"]
+
+    def test_nothing_changed_flags_nobody(self):
+        from fw_context_mcp.indexer.manifest import mark_entries_behind
+
+        manifest = self._manifest()
+        assert mark_entries_behind(manifest, set(), {"src/a.c"}) == 0
+        assert all("needs_reparse" not in e for e in manifest["entries"])
+
+    def test_an_already_flagged_entry_is_not_counted_twice(self):
+        from fw_context_mcp.indexer.manifest import mark_entries_behind
+
+        manifest = self._manifest()
+        manifest["entries"][1]["needs_reparse"] = True
+
+        assert mark_entries_behind(manifest, {"src/shared.h"}, {"src/a.c"}) == 0
+
+
+class TestTheFlagReachesTheReport:
+    """``_check_header_staleness`` must count a flagged entry.
+
+    The window is the trap here.  _check_header_staleness scans
+    manifest["entries"][:max_files] with max_files=200, so an entry past
+    index 200 is invisible to the report — the test would then measure the
+    window and not the flag.  The entry below sits inside it, and
+    test_an_entry_past_the_window_is_not_seen records the boundary.
+    """
+
+    @staticmethod
+    def _write(tmp_path: Path, *, flagged_at: int, total: int) -> tuple[Path, str]:
+        import hashlib
+        import json
+
+        db_dir = tmp_path / "index"
+        db_dir.mkdir(exist_ok=True)
+        src_dir = tmp_path / "src"
+        src_dir.mkdir(exist_ok=True)
+
+        entries = []
+        for i in range(total):
+            src = src_dir / f"u{i}.c"
+            src.write_text("int main() { return 0; }")
+            entry = {
+                "file": f"src/u{i}.c",
+                "directory": str(tmp_path),
+                "arg_set": 0,
+                "source_hash": hashlib.sha256(src.read_bytes()).hexdigest(),
+                "flags_hash": "f",
+                "headers": [],
+            }
+            if i == flagged_at:
+                entry["needs_reparse"] = True
+            entries.append(entry)
+
+        config_hash = "cafe1234"
+        manifest = {
+            "_format": MANIFEST_FORMAT,
+            "compile_commands_path": str(tmp_path / "compile_commands.json"),
+            "project_root": str(tmp_path),
+            "arg_sets": [["-std=c11"]],
+            "headers": {},
+            "entries": entries,
+        }
+        (db_dir / f"manifest.{config_hash}.json").write_text(json.dumps(manifest))
+        return db_dir, config_hash
+
+    @staticmethod
+    def _count(tmp_path: Path, db_dir: Path, config_hash: str) -> int:
+        import sqlite3
+
+        from fw_context_mcp.mcp.shared.stale import _check_header_staleness
+
+        conn = sqlite3.connect(db_dir / "index.db")
+        conn.row_factory = sqlite3.Row
+        try:
+            count, _ = _check_header_staleness(
+                conn, config_hash, tmp_path, use_cache=False
+            )
+        finally:
+            conn.close()
+        return count
+
+    def test_the_stale_report_counts_a_flagged_tu(self, tmp_path: Path):
+        db_dir, config_hash = self._write(tmp_path, flagged_at=3, total=10)
+
+        assert self._count(tmp_path, db_dir, config_hash) == 1
+
+    def test_an_unflagged_manifest_reports_nothing(self, tmp_path: Path):
+        db_dir, config_hash = self._write(tmp_path, flagged_at=-1, total=10)
+
+        assert self._count(tmp_path, db_dir, config_hash) == 0
+
+    def test_an_entry_past_the_window_is_not_seen(self, tmp_path: Path):
+        """A recorded limit, not a defect to fix here.
+
+        max_files exists for the latency of get_active_build.  On zbox (876
+        TUs) a flagged entry past index 200 is invisible to this report,
+        while the index run itself still queues it.
+        """
+        db_dir, config_hash = self._write(tmp_path, flagged_at=250, total=260)
+
+        assert self._count(tmp_path, db_dir, config_hash) == 0
+
+
+class TestTusToRequeue:
+    """Tier 1 must not wave a flagged TU through.
+
+    Tier 1 compares the source mtime.  A header change moves no source mtime,
+    and neither does another unit's re-parse, so the only way a flagged TU
+    reaches the parser is through this set.
+    """
+
+    @staticmethod
+    def _manifest(tmp_path: Path, *, flagged: bool) -> dict:
+        for rel in ("src/a.c", "src/b.c"):
+            src = tmp_path / rel
+            src.parent.mkdir(parents=True, exist_ok=True)
+            src.write_text("int main() { return 0; }")
+        entries = [
+            {"file": "src/a.c", "headers": ["src/shared.h"]},
+            {"file": "src/b.c", "headers": ["src/shared.h"]},
+        ]
+        if flagged:
+            entries[1]["needs_reparse"] = True
+        return {"project_root": str(tmp_path), "entries": entries}
+
+    def test_tier1_does_not_wave_a_flagged_tu_through(self, tmp_path: Path):
+        """The mark must reach the set even when NO header reads as changed.
+
+        This is the probe trap: built inside an ``if stale_headers:`` the set
+        stays empty here and the mark reaches nothing.
+        """
+        from fw_context_mcp.indexer.runner import _tus_to_requeue
+
+        result = _tus_to_requeue(
+            self._manifest(tmp_path, flagged=True), set(), tmp_path
+        )
+
+        assert any(r.endswith("src/b.c") for r in result), result
+        assert not any(r.endswith("src/a.c") for r in result), result
+
+    def test_nothing_stale_and_nothing_flagged_queues_nobody(self, tmp_path: Path):
+        from fw_context_mcp.indexer.runner import _tus_to_requeue
+
+        assert _tus_to_requeue(
+            self._manifest(tmp_path, flagged=False), set(), tmp_path
+        ) == frozenset()
+
+    def test_a_changed_header_still_queues_every_dependent(self, tmp_path: Path):
+        """The original source must keep working next to the new one."""
+        from fw_context_mcp.indexer.runner import _tus_to_requeue
+
+        result = _tus_to_requeue(
+            self._manifest(tmp_path, flagged=False), {"src/shared.h"}, tmp_path
+        )
+
+        assert len(result) == 2

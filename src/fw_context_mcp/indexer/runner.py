@@ -150,6 +150,46 @@ def raise_if_superseded(db_dir: Path) -> None:
 
 
 
+def _tus_to_requeue(
+    manifest: dict,
+    stale_headers: set[str],
+    project_root: Path,
+) -> frozenset[str]:
+    """Return the normalized TU paths that must skip the cheap staleness tiers.
+
+    Two sources, and the union of them:
+
+    - a TU that includes a header whose content changed, and
+    - a TU whose entry carries ``needs_reparse``.
+
+    The second source must be read even when *stale_headers* is empty.  That
+    is the whole point of the mark: another unit's re-parse already wrote the
+    current hash into the shared header table, so the difference the header
+    pass looks for is gone.  Built inside an ``if stale_headers:`` the set
+    stays empty and the mark reaches nothing.
+    """
+    from .manifest import tus_affected_by_headers
+    from .ops import _normalize_file_path
+
+    flagged = {
+        e["file"] for e in manifest.get("entries", []) if e.get("needs_reparse")
+    }
+    from_headers = tus_affected_by_headers(manifest, stale_headers)
+    affected = from_headers | flagged
+    if not affected:
+        return frozenset()
+
+    log.info(
+        "%d changed header(s) -> %d TU(s) queued for reparse, "
+        "%d more queued by needs_reparse",
+        len(stale_headers), len(from_headers), len(flagged - from_headers),
+    )
+    return frozenset(
+        _normalize_file_path(str((project_root / tu_rel).resolve()), project_root)
+        for tu_rel in affected
+    )
+
+
 def run(
     compile_commands: Path,
     db_path: Path,
@@ -427,22 +467,12 @@ def run(
     header_hash_cache: dict[str, str] = {}
     header_stale_tus: frozenset[str] = frozenset()
     if manifest is not None:
-        from .manifest import collect_stale_headers, tus_affected_by_headers
-        from .ops import _normalize_file_path
+        from .manifest import collect_stale_headers
 
         stale_headers = collect_stale_headers(
             manifest, project_root, hash_cache=header_hash_cache
         )
-        if stale_headers:
-            header_stale_tus = frozenset(
-                _normalize_file_path(str((project_root / tu_rel).resolve()), project_root)
-                for tu_rel in tus_affected_by_headers(manifest, stale_headers)
-            )
-            log.info(
-                "%d changed header(s) → %d TU(s) queued for reparse",
-                len(stale_headers),
-                len(header_stale_tus),
-            )
+        header_stale_tus = _tus_to_requeue(manifest, stale_headers, project_root)
 
     # Drop FTS5 content-sync triggers before bulk indexing — each symbol
     # INSERT/DELETE/UPDATE would otherwise pay per-row FTS index overhead

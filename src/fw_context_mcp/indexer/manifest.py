@@ -1074,6 +1074,11 @@ def check_tu_staleness(
     :func:`header_is_trusted` for the one rule and for why the vendor and
     out-of-tree exceptions are gone.
 
+    An entry marked ``needs_reparse`` is stale whatever its hashes say.  The
+    manifest keeps ONE hash per header path and every entry shares it, so a
+    unit that another unit's re-parse left behind cannot be told apart by
+    the hashes alone.  See ``_headers_moved_on``.
+
     Compares the stored ``source_hash`` and ``headers[].hash`` from *entry*
     against the current on-disk content.
 
@@ -1090,6 +1095,11 @@ def check_tu_staleness(
 
     current_source_hash = compute_source_hash(source_file)
     if current_source_hash != entry.get("source_hash", ""):
+        return True, current_source_hash
+
+    if entry.get("needs_reparse"):
+        # Another unit refreshed a header that this entry shares.  The shared
+        # hash proves nothing about THIS entry's rows any more.
         return True, current_source_hash
 
     # ── Check header hashes ──
@@ -1195,6 +1205,38 @@ def update_entry(
     entries[entry_index]["headers"] = headers
     if header_records:
         merge_header_records(manifest, header_records)
+
+
+def mark_entries_behind(
+    manifest: dict,
+    changed_paths: set[str],
+    keep: set[str],
+) -> int:
+    """Flag each entry that depends on a header another unit refreshed.
+
+    Trusts what :func:`header_is_trusted` trusts, and nothing else — the same
+    one decision that collect_stale_headers() and _headers_moved_on() read.
+
+    *changed_paths* is the difference of the shared header table, taken
+    BEFORE the loop over the re-parsed units, not one time per unit.  A
+    per-unit difference makes the second unit read what the first one just
+    wrote as somebody else's change.
+
+    *keep* is the set of ``tu_rel`` paths this run really re-parsed.  Those
+    entries hold current rows and must not be flagged.
+
+    Returns the number of entries flagged.
+    """
+    if not changed_paths:
+        return 0
+    flagged = 0
+    for entry in manifest.get("entries", []):
+        if entry.get("file") in keep or entry.get("needs_reparse"):
+            continue
+        if any(path in changed_paths for path in entry.get("headers") or ()):
+            entry["needs_reparse"] = True
+            flagged += 1
+    return flagged
 
 
 def prune_header_table(manifest: dict) -> int:

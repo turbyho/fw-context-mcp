@@ -533,8 +533,14 @@ def get_active_build(
                 )
 
         if header_affected_tus:
+            # A TU that failed to parse keeps its needs_reparse mark, so it
+            # counts here run after run.  Without the second half of this
+            # sentence the user is told to run 'fw-context index', and the
+            # index does not clear it.
             index_message += (
-                f" | {header_affected_tus} TU(s) have stale header dependencies — header changes since last index"
+                f" | {header_affected_tus} TU(s) have stale header dependencies "
+                "— header changes since last index, or a TU that failed to "
+                "parse (see the index log)"
             )
 
         # Append LLM-analysis coverage, split by project/vendor, so the LLM
@@ -1116,6 +1122,8 @@ def _update_manifest_after_reindex(
         from ...indexer.manifest import (
             _collect_headers_from_tokens,
             _intern_arguments,
+            header_is_trusted,
+            mark_entries_behind,
             merge_header_records,
             update_entry,
         )
@@ -1137,6 +1145,14 @@ def _update_manifest_after_reindex(
             bdp = manifest_data.get("build_dir_patterns")
             if not bdp:
                 bdp, _ = _reindex_build_patterns_for_generated(root)
+            # Snapshot the shared header table BEFORE the loop.  A per-unit
+            # difference would make the second unit read what the first one
+            # just wrote as somebody else's change.
+            table_before = {
+                path: record.get("hash", "")
+                for path, record in (manifest_data.get("headers") or {}).items()
+            }
+            reparsed_rel: set[str] = set()
             for unit, _parsed in parsed_units:
                 # Records go into a per-unit table and are merged by
                 # merge_header_records, so a header this re-parse is the first
@@ -1151,6 +1167,7 @@ def _update_manifest_after_reindex(
                     tu_rel = str(unit.file.resolve().relative_to(root))
                 except ValueError:
                     tu_rel = str(unit.file.resolve())
+                reparsed_rel.add(tu_rel)
                 for idx, entry in enumerate(manifest_data.get("entries", [])):
                     if entry.get("file") == tu_rel:
                         update_entry(
@@ -1172,6 +1189,23 @@ def _update_manifest_after_reindex(
                         "source_hash": source_hash,
                         "headers": headers,
                     })
+            # This function refreshed the SHARED header hashes, so the next
+            # full index run sees no difference for the OTHER units that
+            # include those headers — their rows still come from the old
+            # text.  Flag them, or reindex_file hides the change from every
+            # later run.
+            changed = {
+                path
+                for path, record in (manifest_data.get("headers") or {}).items()
+                if not header_is_trusted(record)
+                and record.get("hash", "") != table_before.get(path, "")
+            }
+            behind = mark_entries_behind(manifest_data, changed, reparsed_rel)
+            if behind:
+                log.info(
+                    "reindex_file: %d entr(ies) flagged needs_reparse after "
+                    "%d refreshed header(s)", behind, len(changed),
+                )
             save_manifest(manifest_data, db_dir, config_hash)
     except OSError:
         log.debug("manifest.json update skipped during reindex_file", exc_info=True)

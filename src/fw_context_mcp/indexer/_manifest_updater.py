@@ -59,6 +59,30 @@ def _mtime_bump_is_safe(
     return _hash_with_cache(resolved, hash_cache) == header.get("hash", "")
 
 
+def _headers_moved_on(entry: dict, before: dict, after: dict) -> bool:
+    """True when another translation unit refreshed a header of this entry.
+
+    The manifest keeps ONE hash per header path, and every entry shares it.
+    A unit that the run re-parsed writes the current hash there.  A unit that
+    the run did NOT re-parse still holds rows that come from the PREVIOUS
+    text.  Without a mark the shared hash answers "current" for the two of
+    them, and nothing queues the second unit again — its rows stay at the old
+    header text until --force.
+
+    Calls header_is_trusted() instead of a copy of the rules: what the
+    pipeline trusts is one decision, and this is one of its FIVE callers.
+    """
+    from .manifest import header_is_trusted
+
+    for path in entry.get("headers") or ():
+        record = after.get(path, {})
+        if header_is_trusted(record):
+            continue
+        if record.get("hash", "") != before.get(path, {}).get("hash", ""):
+            return True
+    return False
+
+
 def _refresh_header_mtimes_from_manifest(
     conn,
     config_hash: str,
@@ -242,11 +266,18 @@ def _update_manifest_after_index(
         old_entries: dict[str, dict] = {}
         if manifest is not None:
             old_entries = {e.get("file", ""): e for e in manifest.get("entries", [])}
-        entries = []
+        # A shallow copy is enough: fold_headers and update_entry REPLACE a
+        # record, they never change one in place.
+        old_header_table = dict(header_table)
+        entry_slots: list[dict | None] = [None] * len(units)
+        carried: list[tuple[int, dict]] = []
         reused = 0
         updated = 0
 
-        for unit in units:
+        # ── pass 1: entries rewritten from THIS run's parse ──
+        # These are what fills header_table, so the decision for a carried
+        # entry must wait until the table is final.
+        for idx, unit in enumerate(units):
             try:
                 tu_rel = str(unit.file.resolve().relative_to(project_root))
             except ValueError:
@@ -256,38 +287,47 @@ def _update_manifest_after_index(
             # see *reparsed_tus* in the docstring.
             if tu_rel in tu_headers and (reparsed_tus is None or tu_rel in reparsed_tus):
                 source_hash = compute_source_hash(unit.file.resolve())
-                entries.append(
-                    {
-                        "file": tu_rel,
-                        "directory": str(unit.directory) if unit.directory else str(project_root),
-                        "arg_set": _intern_arguments(unit.clang_args, arg_sets),
-                        "source_hash": source_hash,
-                        "headers": fold_headers(tu_headers[tu_rel], header_table),
-                        "flags_hash": compute_flags_hash(unit.raw_entry) if unit.raw_entry else "",
-                    }
-                )
+                entry_slots[idx] = {
+                    "file": tu_rel,
+                    "directory": str(unit.directory) if unit.directory else str(project_root),
+                    "arg_set": _intern_arguments(unit.clang_args, arg_sets),
+                    "source_hash": source_hash,
+                    "headers": fold_headers(tu_headers[tu_rel], header_table),
+                    "flags_hash": compute_flags_hash(unit.raw_entry) if unit.raw_entry else "",
+                }
                 updated += 1
             elif tu_rel in old_entries:
-                entries.append(carry_over(old_entries[tu_rel]))
+                carried.append((idx, old_entries[tu_rel]))
                 reused += 1
             else:
                 headers = _collect_headers_from_tokens(
                     unit, project_root, build_dir_patterns, header_table
                 )
                 source_hash = compute_source_hash(unit.file.resolve())
-                entries.append(
-                    {
-                        "file": tu_rel,
-                        "directory": str(unit.directory) if unit.directory else str(project_root),
-                        "arg_set": _intern_arguments(unit.clang_args, arg_sets),
-                        "source_hash": source_hash,
-                        "headers": headers,
-                        "flags_hash": compute_flags_hash(unit.raw_entry) if unit.raw_entry else "",
-                    }
-                )
+                entry_slots[idx] = {
+                    "file": tu_rel,
+                    "directory": str(unit.directory) if unit.directory else str(project_root),
+                    "arg_set": _intern_arguments(unit.clang_args, arg_sets),
+                    "source_hash": source_hash,
+                    "headers": headers,
+                    "flags_hash": compute_flags_hash(unit.raw_entry) if unit.raw_entry else "",
+                }
                 updated += 1
 
-        log.info("manifest.json: %d updated (from tu_headers), %d reused", updated, reused)
+        # ── pass 2: carried entries, now that the table is final ──
+        flagged = 0
+        for idx, old_entry in carried:
+            entry = carry_over(old_entry)
+            if _headers_moved_on(old_entry, old_header_table, header_table):
+                entry["needs_reparse"] = True
+                flagged += 1
+            entry_slots[idx] = entry
+
+        entries = [e for e in entry_slots if e is not None]
+        log.info(
+            "manifest.json: %d updated (from tu_headers), %d reused, %d needs_reparse",
+            updated, reused, flagged,
+        )
     elif manifest is None:
         # No manifest and no tu_headers — full rebuild via libclang (slow)
         log.info("Generating manifest.json from %d TUs...", len(units))
@@ -300,37 +340,49 @@ def _update_manifest_after_index(
     else:
         # ── Incremental update (tu_headers=None, manifest exists) ──
         old_entries = {e.get("file", ""): e for e in manifest.get("entries", [])}
-        entries = []
+        old_header_table = dict(header_table)
+        entry_slots = [None] * len(units)
+        carried = []
         reused = 0
         updated = 0
 
-        for unit in units:
+        for idx, unit in enumerate(units):
             try:
                 tu_rel = str(unit.file.resolve().relative_to(project_root))
             except ValueError:
                 tu_rel = str(unit.file.resolve())
 
             if tu_rel in old_entries:
-                entries.append(carry_over(old_entries[tu_rel]))
+                carried.append((idx, old_entries[tu_rel]))
                 reused += 1
             else:
                 headers = _collect_headers_from_tokens(
                     unit, project_root, build_dir_patterns, header_table
                 )
                 source_hash = compute_source_hash(unit.file.resolve())
-                entries.append(
-                    {
-                        "file": tu_rel,
-                        "directory": str(unit.directory) if unit.directory else str(project_root),
-                        "arg_set": _intern_arguments(unit.clang_args, arg_sets),
-                        "source_hash": source_hash,
-                        "headers": headers,
-                        "flags_hash": compute_flags_hash(unit.raw_entry) if unit.raw_entry else "",
-                    }
-                )
+                entry_slots[idx] = {
+                    "file": tu_rel,
+                    "directory": str(unit.directory) if unit.directory else str(project_root),
+                    "arg_set": _intern_arguments(unit.clang_args, arg_sets),
+                    "source_hash": source_hash,
+                    "headers": headers,
+                    "flags_hash": compute_flags_hash(unit.raw_entry) if unit.raw_entry else "",
+                }
                 updated += 1
 
-        log.info("manifest.json incremental: %d updated, %d reused", updated, reused)
+        flagged = 0
+        for idx, old_entry in carried:
+            entry = carry_over(old_entry)
+            if _headers_moved_on(old_entry, old_header_table, header_table):
+                entry["needs_reparse"] = True
+                flagged += 1
+            entry_slots[idx] = entry
+
+        entries = [e for e in entry_slots if e is not None]
+        log.info(
+            "manifest.json incremental: %d updated, %d reused, %d needs_reparse",
+            updated, reused, flagged,
+        )
 
     manifest_data = {
         "_format": MANIFEST_FORMAT,
