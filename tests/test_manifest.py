@@ -1578,3 +1578,62 @@ class TestTusToRequeue:
         )
 
         assert len(result) == 2
+
+
+class TestFilesGeneratedColumn:
+    """``files.generated`` must agree with ``headers[path].generated``.
+
+    No caller of upsert_file() passed the flag, so every row held 0 from the
+    default while the manifest of the same build said True for the same
+    paths.  Measured on zbox-v5 52840/app: 28 files under
+    build/.../generated/ with files.generated = 0.
+
+    A disagreement between the two means somebody wrote the manifest with
+    different build_dir_patterns from the ones the index used — which is the
+    defect D8 fixes, seen from the other side.
+    """
+
+    def test_generated_matches_the_manifest(self):
+        """Both columns read the same predicate with the same patterns."""
+        from fw_context_mcp.indexer.manifest import _is_generated_header
+
+        patterns = ["build/"]
+        generated = "build/zephyr/include/generated/autoconf.h"
+        owned = "src/main.c"
+
+        assert _is_generated_header(generated, patterns) is True
+        assert _is_generated_header(owned, patterns) is False
+
+    def test_no_patterns_means_nothing_is_generated(self):
+        """The negative control, and the reason D8 mattered.
+
+        With None every header reads as not generated.  That is correct for
+        a build with no output directory, and it is exactly what
+        reindex_file used to pass for every build.
+        """
+        from fw_context_mcp.indexer.manifest import _is_generated_header
+
+        assert _is_generated_header("build/gen/autoconf.h", None) is False
+
+    def test_the_generated_flag_does_not_change_is_project(self, tmp_path: Path):
+        """Generated code is PROJECT code (decision 1).
+
+        is_project comes from project_patterns and vendor_patterns alone.
+        build_dir_patterns must stay out of it, or filling this column would
+        move 28 files of zbox-v5 out of every project_only query.
+        """
+        import inspect
+
+        from fw_context_mcp.indexer import ops
+
+        source = inspect.getsource(ops._store_symbol_rows)
+        # The is_project block runs between these two markers.
+        start = source.index("# ── Compute is_project ──")
+        end = source.index("# ── Extract function body for definitions ──")
+        is_project_block = source[start:end]
+
+        assert "build_dir_patterns" not in is_project_block, (
+            "build_dir_patterns must not take part in is_project"
+        )
+        assert "project_patterns" in is_project_block
+        assert "vendor_patterns" in is_project_block

@@ -396,6 +396,7 @@ def _store_symbol_rows(
     project_root: Path,
     vendor_patterns: list[str],
     project_patterns: list[str],
+    build_dir_patterns: list[str] | None = None,
 ) -> tuple[int, dict[int, int]]:
     """Build and batch-insert symbol rows for one TU.
 
@@ -420,7 +421,17 @@ def _store_symbol_rows(
       - Bodies are only extracted for definitions (``is_definition``
         with ``end_line > start_line``).  Declarations and forward
         declarations store ``body=''`` to save disk space.
+      - ``files.generated`` is written from *build_dir_patterns*, the same
+        source the manifest uses for ``headers[path].generated``.  The two
+        must agree; a disagreement means somebody wrote the manifest with
+        different patterns from the ones the index used.
+
+    *build_dir_patterns* does NOT take part in ``is_project``.  Generated
+    code is project code, and the two columns answer different questions:
+    ``is_project`` asks who owns the file, ``generated`` asks whether a tool
+    wrote it.
     """
+    from .manifest import _is_generated_header
     from .sdk_detect import _path_matches
 
     rows = []
@@ -435,7 +446,9 @@ def _store_symbol_rows(
             except OSError:
                 sym_mtime = 0.0
             file_id_cache[normalized_sym_file] = upsert_file(
-                conn, config_hash, normalized_sym_file, lang, mtime=sym_mtime,
+                conn, config_hash, normalized_sym_file, lang,
+                generated=_is_generated_header(normalized_sym_file, build_dir_patterns),
+                mtime=sym_mtime,
             )
         rel_path = normalized_sym_file
         # ── Compute is_project ──
@@ -992,7 +1005,7 @@ def store_symbols_for_unit(
     if syms:
         syms_added, file_proj = _store_symbol_rows(
             conn, config_hash, syms, file_id_cache, project_root,
-            vendor_patterns, project_patterns,
+            vendor_patterns, project_patterns, build_dir_patterns,
         )
         # Update files.is_project for all files touched by this TU.
         # Using ``is_project < ip`` ensures a file that was previously
