@@ -722,7 +722,7 @@ def _step_update_manifest(conn: sqlite3.Connection, ctx: dict) -> None:
         updated_count=ctx["updated"],
          tu_headers=ctx["tu_headers"] if ctx["tu_headers"] else None,
          build_dir_patterns=ctx["build_dir_patterns"],
-         vendor_patterns=ctx.get("vendor_patterns") or [],
+         vendor_patterns=ctx.get("vendor_patterns"),
          config_hash=config_hash,
          scope=ctx.get("scope"),
          reparsed_tus=ctx.get("reparsed_tus"),

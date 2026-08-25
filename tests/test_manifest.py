@@ -823,25 +823,60 @@ class TestVendorPatternCarrier:
         assert result["vendor_patterns"] == ["deps/ncs/zephyr/%", "deps/ncs/%"]
 
     def test_an_incremental_run_inherits_the_patterns(self, tmp_path: Path):
-        """A run that computes no patterns must keep what the build was indexed with.
+        """A run that computes no patterns keeps what the build was indexed with.
 
-        Same rule build_dir_patterns already follows.  Without it the next
-        staleness check reads a manifest that describes a different boundary
-        from the one the rows were written under.
+        Without it the next staleness check reads a manifest that describes a
+        different boundary from the one the rows were written under.
+
+        The SIGNAL for "I did not compute one" is None, not [].  This test
+        used [] before, and so did the writer — which is why an empty set,
+        the correct answer for every project whose SDK lives outside it, was
+        never stored at all.  See test_an_empty_set_is_STORED_as_an_answer.
         """
         old = self._base(tmp_path, vendor_patterns=["deps/ncs/%"])
 
-        result = self._run(tmp_path, manifest=old, vendor_patterns=[])
+        result = self._run(tmp_path, manifest=old, vendor_patterns=None)
 
         assert result is not None
         assert result["vendor_patterns"] == ["deps/ncs/%"]
 
-    def test_a_manifest_without_the_key_stays_without_it(self, tmp_path: Path):
-        """An older index has no key, and nothing invents one for it."""
+    def test_an_empty_set_is_STORED_as_an_answer(self, tmp_path: Path):
+        """[] must reach the file.  A missing key means something else.
+
+        This test had the opposite sign, and the writer agreed with it: the
+        key was written under a truthiness test, so an empty set was dropped.
+        Measured on all 9 builds of zbox-ecb-fw-v5 — every one keeps its SDK
+        outside the project, so every one computes the empty set — and not
+        one of their manifests carried the key.  vendor_patterns_for_build()
+        then fell back to detection, which is the disagreement between the
+        two layers that this carrier exists to remove.
+        """
         result = self._run(tmp_path, manifest=self._base(tmp_path), vendor_patterns=[])
 
         assert result is not None
+        assert result["vendor_patterns"] == []
+
+    def test_none_means_inherit_and_writes_nothing_new(self, tmp_path: Path):
+        """None is the caller saying "I did not compute one"."""
+        result = self._run(
+            tmp_path, manifest=self._base(tmp_path), vendor_patterns=None
+        )
+
+        assert result is not None
         assert "vendor_patterns" not in result
+
+    def test_an_absent_key_forces_a_rewrite(self, tmp_path: Path):
+        """The no-op early return must not keep a manifest without the key.
+
+        Nothing else would ever rewrite it: the config_hash does not change,
+        and the TU count does not change either.
+        """
+        from fw_context_mcp.indexer._manifest_updater import _patterns_changed
+
+        assert _patterns_changed({}, None, []) is True
+        assert _patterns_changed({"vendor_patterns": []}, None, []) is False
+        assert _patterns_changed({"vendor_patterns": []}, None, ["a/%"]) is True
+        assert _patterns_changed({"vendor_patterns": ["a/%"]}, None, None) is False
 
 
 class TestManifestEntryRefreshGuard:

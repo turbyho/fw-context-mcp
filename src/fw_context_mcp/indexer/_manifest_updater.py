@@ -59,15 +59,33 @@ def _mtime_bump_is_safe(
     return _hash_with_cache(resolved, hash_cache) == header.get("hash", "")
 
 
-def _patterns_changed(manifest: dict, build_dir_patterns: list[str] | None) -> bool:
-    """Do this run's build-output patterns differ from the stored ones?
+def _patterns_changed(
+    manifest: dict,
+    build_dir_patterns: list[str] | None,
+    vendor_patterns: list[str] | None = None,
+) -> bool:
+    """Does this run disagree with the stored manifest about its patterns?
 
-    A run that passes none inherits the stored value (see below), so that is
-    not a change.  Order is not significant, hence the set comparison.
+    Two keys, and a different rule for each.
+
+    ``build_dir_patterns``: a run that passes none inherits the stored value,
+    so that is not a change.  Order is not significant, hence the set
+    comparison.
+
+    ``vendor_patterns``: an ABSENT key is a change even when the run computed
+    an empty set, because absent sends the query layer back to detection
+    while empty is an answer.  Measured on zbox-ecb-fw-v5: all 9 builds have
+    their SDK outside the project, so all 9 want the empty answer stored.
     """
-    if not build_dir_patterns:
+    if build_dir_patterns and set(manifest.get("build_dir_patterns") or ()) != set(
+        build_dir_patterns
+    ):
+        return True
+    if vendor_patterns is None:
         return False
-    return set(manifest.get("build_dir_patterns") or ()) != set(build_dir_patterns)
+    if "vendor_patterns" not in manifest:
+        return True
+    return set(manifest["vendor_patterns"]) != set(vendor_patterns)
 
 
 def _headers_moved_on(entry: dict, before: dict, after: dict) -> bool:
@@ -242,7 +260,7 @@ def _update_manifest_after_index(
         if entries and not entries[0].get("source_hash"):
             log.info("Manifest has preliminary entries — regenerating with full hashes")
             # Fall through to full regeneration below (don't return early)
-        elif _patterns_changed(manifest, build_dir_patterns):
+        elif _patterns_changed(manifest, build_dir_patterns, vendor_patterns):
             # `generated` is a function of the path and the build-output
             # patterns.  When those change the stored flags describe a
             # boundary this build no longer has, and header_is_trusted()
@@ -251,8 +269,10 @@ def _update_manifest_after_index(
             # '.pio/build/' leaves the config_hash identical, so nothing else
             # would ever rewrite this file.
             log.info(
-                "Rebuilding manifest.json (build_dir_patterns changed: %s -> %s)",
+                "Rebuilding manifest.json (patterns changed: build_dir %s -> %s, "
+                "vendor %s -> %s)",
                 manifest.get("build_dir_patterns"), build_dir_patterns,
+                manifest.get("vendor_patterns", "<absent>"), vendor_patterns,
             )
         else:
             old_count = len(entries)
@@ -439,9 +459,14 @@ def _update_manifest_after_index(
     # Same inheritance for the vendor set: an incremental run that gets no
     # patterns must keep the ones the build was indexed with, or the next
     # staleness check reads a manifest that describes a different boundary.
-    if vendor_patterns:
+    # `is not None`, NOT truthiness: an empty list is an ANSWER.  Most
+    # projects keep their SDK outside the project, and the correct set for
+    # them is empty — measured on all 9 builds of zbox-ecb-fw-v5.  Written as
+    # a missing key it would send the query layer back to detection, which is
+    # exactly the disagreement the carrier exists to remove.
+    if vendor_patterns is not None:
         manifest_data["vendor_patterns"] = vendor_patterns
-    elif manifest and manifest.get("vendor_patterns"):
+    elif manifest is not None and "vendor_patterns" in manifest:
         manifest_data["vendor_patterns"] = manifest["vendor_patterns"]
     # Preserve macros from old manifest
     if manifest and manifest.get("macros"):

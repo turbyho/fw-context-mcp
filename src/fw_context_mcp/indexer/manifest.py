@@ -304,7 +304,9 @@ def generate(
         manifest["macros"] = macros
     if build_dir_patterns:
         manifest["build_dir_patterns"] = build_dir_patterns
-    if vendor_patterns:
+    # `is not None`: an empty set is the correct answer for a project whose
+    # SDK lives outside it, and a missing key means something else entirely.
+    if vendor_patterns is not None:
         manifest["vendor_patterns"] = vendor_patterns
 
     if not config_hash:
