@@ -1208,6 +1208,20 @@ def _step_verify_integrity(conn: sqlite3.Connection, ctx: dict) -> None:
     standard library — passed both checks, because the deletes were clean and
     fired the FTS triggers.  Completeness against the sources is a different
     question, answered by the manifest and by the per-file hashes, not here.
+
+    TWO CONSEQUENCES OF THE DB-WIDE SCOPE, both deliberate and both a cost:
+
+    - ``PRAGMA foreign_key_check`` reads the WHOLE database, not the current
+      config_hash.  The pragma takes a table name at most, so it cannot be
+      scoped to one build.  On a multi-build project a violation left by
+      ANOTHER build therefore fails a build that is itself correct.  The
+      error message says so; real scoping is an open question, not something
+      this function can do.
+    - When this raises, the pipeline stops here, so ``finalize_manifest`` is
+      skipped — which is the intent — but ``cleanup_old`` and
+      ``wal_checkpoint`` are skipped too.  The WAL stays without a
+      checkpoint and ``PRAGMA user_version`` is never set, and the next
+      reader sees that as ``reindex_needed`` because of the schema version.
     """
     problems: list[str] = []
 
@@ -1241,6 +1255,8 @@ def _step_verify_integrity(conn: sqlite3.Connection, ctx: dict) -> None:
         raise IndexIntegrityError(
             f"index verification failed for config_hash="
             f"{ctx['config_hash'][:12]}: " + "; ".join(problems)
+            + " (the foreign-key check reads the whole database, so the "
+            "violation can belong to a different build of this project)"
         )
 
 

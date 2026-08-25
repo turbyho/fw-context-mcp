@@ -60,6 +60,7 @@ must be cleaned across 8+ tables.  The order is not arbitrary:
 from __future__ import annotations
 
 import sqlite3
+from collections.abc import Mapping
 from contextlib import nullcontext
 from pathlib import Path
 from typing import NamedTuple
@@ -171,6 +172,16 @@ class FileHashRecord(NamedTuple):
     content_hash: str
     source_hash: str
     flags_hash: str
+
+
+# What a caller may pass where only ``[0]`` (the file_id) is read.
+#
+# The runner hands get_file_hashes() output — dict[str, FileHashRecord] — to
+# helpers annotated dict[str, tuple[int, float]].  It works because
+# FileHashRecord is a NamedTuple with file_id at index 0, and mypy did not
+# object because those helpers take the dict positionally through several
+# layers.  The annotation was a statement about the data that was false.
+FileIdLookup = Mapping[str, "tuple[int, float] | FileHashRecord"]
 
 
 def get_file_hashes(conn: sqlite3.Connection, config_hash: str) -> dict[str, FileHashRecord]:

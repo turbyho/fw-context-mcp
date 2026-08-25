@@ -75,6 +75,7 @@ from fw_context_mcp.indexer.db import (
 from fw_context_mcp.utils import abs_path, compute_content_hash, compute_source_hash, read_file_lines
 
 from .db._chunking import chunked
+from .db._files import FileIdLookup
 
 log = logging.getLogger(__name__)
 
@@ -642,7 +643,7 @@ def _detect_moved_symbols(
 
 
 def _owned_file_ids(
-    known: dict[str, tuple[int, float]],
+    known: FileIdLookup,
     normalized_tu_path: str,
     owned_paths: set[str] | None,
 ) -> list[int]:
@@ -660,7 +661,7 @@ def _owned_file_ids(
 def _save_old_state(
     conn: sqlite3.Connection,
     normalized_tu_path: str,
-    known: dict[str, tuple[int, float]],
+    known: FileIdLookup,
     *,
     owned_paths: set[str] | None = None,
 ) -> set[str]:
@@ -694,7 +695,7 @@ def _delete_old_for_tu(
     conn: sqlite3.Connection,
     config_hash: str,
     normalized_tu_path: str,
-    known: dict[str, tuple[int, float]],
+    known: FileIdLookup,
     syms: list,
     *,
     owned_paths: set[str] | None = None,

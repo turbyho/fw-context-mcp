@@ -556,12 +556,32 @@ class ZephyrBuildSystem:
         seen: set[str] = set()
 
         def add(path: Path) -> None:
-            resolved = str(path)
-            if resolved in seen or not path.is_file():
+            literal = str(path)
+            if not path.is_file():
                 return
-            seen.add(resolved)
             # Same marker resolve_real_binary() uses — pyenv and asdf share it.
-            (shims if "/shims/" in resolved else direct).append(resolved)
+            is_shim = "/shims/" in literal
+            # A non-shim candidate is deduplicated by its REAL path.
+            # /usr/bin/nrfutil and /bin/nrfutil are one binary behind a
+            # symlink, and keyed by the literal string they passed as two —
+            # each then paying its own subprocess.run(..., timeout=15) probe.
+            #
+            # A shim keeps its literal key on purpose.  Two shims can resolve
+            # to one dispatcher today and to different binaries during the
+            # build, when the environment selects another interpreter
+            # version.  That is the same reason the docstring gives for not
+            # resolving a shim at all.
+            if is_shim:
+                key = literal
+            else:
+                try:
+                    key = os.path.realpath(literal)
+                except OSError:
+                    key = literal
+            if key in seen:
+                return
+            seen.add(key)
+            (shims if is_shim else direct).append(literal)
 
         for entry in os.environ.get("PATH", "").split(os.pathsep):
             if not entry:
@@ -618,7 +638,13 @@ class ZephyrBuildSystem:
 
     @classmethod
     def list_installed_ncs(cls, nrfutil: str | None = None) -> list[SdkChoice]:
-        """Return the NCS versions installed on this machine, newest first.
+        """Return the NCS versions installed on this machine.
+
+        In the order ``sdk-manager list`` reports them, which is newest
+        first.  Nothing here sorts: an order of our own would need a version
+        comparison, and ``vX.Y.Z`` has cases it cannot rank (``v3.2.3-rc1``,
+        ``main``).  ``preferred`` is chosen by NAME, not by position, so the
+        order is presentation only.
 
         WHY ask nrfutil rather than scan ``~/ncs``: the directory names give
         the version but not whether its toolchain is present, and a version
