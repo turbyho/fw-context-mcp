@@ -68,7 +68,7 @@ from pathlib import Path
 
 from ..config import derive_project_id
 from ..config import load as load_config
-from ..indexer.runner import EXIT_ALREADY_RUNNING, EXIT_SUPERSEDED
+from ..exit_codes import EXIT_ALREADY_RUNNING, EXIT_SUPERSEDED
 from .shared.pid_file import PidFile
 
 log = logging.getLogger(__name__)

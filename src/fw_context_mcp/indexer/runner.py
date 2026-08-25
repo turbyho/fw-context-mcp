@@ -19,6 +19,14 @@ import time
 from pathlib import Path
 
 from ..config.settings import derive_project_id
+
+# Re-exported so an existing `from .runner import EXIT_SUPERSEDED` keeps
+# working.  The constants live in fw_context_mcp.exit_codes because
+# mcp/daemon.py needs them and must not pull the indexer — see that module.
+from ..exit_codes import (  # noqa: F401 — re-exported
+    EXIT_ALREADY_RUNNING,
+    EXIT_SUPERSEDED,
+)
 from ..mcp.shared.pid_file import PidFile
 from ._embedding import (
     _build_embeddings,
@@ -74,23 +82,6 @@ __all__ = [
 # ═══════════════════════════════════════════════════════════════
 # SECTION: Embedding building (→ llm_analysis.py)
 # ═══════════════════════════════════════════════════════════════
-
-
-# Process exit status for a run that stopped because another process took the
-# index over.  Distinct from 0 (done) and 1 (failed) so the daemon can tell
-# the three apart: this one means the work still has to happen, from the
-# start.  75 is EX_TEMPFAIL from sysexits.h — a temporary failure, try again.
-#
-# Lives beside the exception rather than in the CLI: the producer (the CLI)
-# and the consumer (the daemon) are in different layers, and both already
-# depend on the indexer.
-EXIT_SUPERSEDED = 75
-
-# Process exit status for a run that refused to start because another
-# indexing run already owns the index.  Unlike EXIT_SUPERSEDED there is
-# nothing to retry: the run that holds the lock is doing this work.
-# 69 is EX_UNAVAILABLE from sysexits.h — the service is busy.
-EXIT_ALREADY_RUNNING = 69
 
 
 class IndexSuperseded(Exception):

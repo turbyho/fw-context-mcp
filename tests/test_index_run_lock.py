@@ -26,7 +26,7 @@ import pytest
 from fw_context_mcp.indexer.db._locking import (
     index_run_lock,
 )
-from fw_context_mcp.indexer.runner import EXIT_ALREADY_RUNNING, EXIT_SUPERSEDED
+from fw_context_mcp.exit_codes import EXIT_ALREADY_RUNNING, EXIT_SUPERSEDED
 
 
 class TestIndexRunLock:
@@ -267,7 +267,7 @@ class TestARefusedRunLeavesNothingBehind:
         does: kill the background run, take the lock, claim on success.
         """
         from fw_context_mcp.indexer.db._locking import index_run_lock
-        from fw_context_mcp.indexer.runner import EXIT_SUPERSEDED
+        from fw_context_mcp.exit_codes import EXIT_SUPERSEDED
 
         db_dir = tmp_path / "index"
         db_dir.mkdir()
@@ -311,7 +311,7 @@ class TestARefusedRunLeavesNothingBehind:
             sys.path.insert(0, {str(Path(__file__).resolve().parents[1] / "src")!r})
             from fw_context_mcp.cli._index import _claim_index, _kill_bg_reindex
             from fw_context_mcp.indexer.db._locking import IndexRunLocked, index_run_lock
-            from fw_context_mcp.indexer.runner import EXIT_ALREADY_RUNNING
+            from fw_context_mcp.exit_codes import EXIT_ALREADY_RUNNING
 
             db_dir = Path({str(db_dir)!r})
             _kill_bg_reindex(db_dir / "index.db")

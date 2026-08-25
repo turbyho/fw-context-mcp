@@ -424,11 +424,12 @@ def _run_multi(
     then runs the FTS rebuild and per-(variant, image) retention once at the
     end (§5.8).  A failure in one build does not abort the others.
     """
+    from ..exit_codes import EXIT_SUPERSEDED
     from ..indexer._postprocess import cleanup_old_builds_multi
     from ..indexer.build import build_variant_config, generate_compile_commands
     from ..indexer.builders import registry as builder_registry
     from ..indexer.db import open_db, rebuild_files_fts, rebuild_fts, rebuild_macros_fts
-    from ..indexer.runner import EXIT_SUPERSEDED, IndexSuperseded, run
+    from ..indexer.runner import IndexSuperseded, run
 
     build_cfg = cfg.build
     variants = _select_variants(build_cfg.variants, args)
@@ -592,14 +593,10 @@ def cmd_index(args: argparse.Namespace) -> int:
     """
     from ..config import derive_project_id
     from ..config import load as load_config
+    from ..exit_codes import EXIT_ALREADY_RUNNING, EXIT_SUPERSEDED
     from ..indexer.build import detect_build_system
     from ..indexer.db._locking import IndexRunLocked, index_run_lock
-    from ..indexer.runner import (
-        EXIT_ALREADY_RUNNING,
-        EXIT_SUPERSEDED,
-        IndexSuperseded,
-        run,
-    )
+    from ..indexer.runner import IndexSuperseded, run
     from ..utils import resolve_project_root
 
     if args.verbose:

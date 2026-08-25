@@ -18,8 +18,8 @@ from pathlib import Path
 
 import pytest
 
+from fw_context_mcp.exit_codes import EXIT_SUPERSEDED
 from fw_context_mcp.indexer.runner import (
-    EXIT_SUPERSEDED,
     IndexSuperseded,
     raise_if_superseded,
 )

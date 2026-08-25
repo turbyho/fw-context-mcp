@@ -61,6 +61,8 @@ import logging
 import sqlite3
 from collections.abc import Sequence
 
+from ._chunking import chunked
+
 log = logging.getLogger(__name__)
 
 __all__ = [
@@ -98,22 +100,6 @@ def insert_refs_batch(conn: sqlite3.Connection, rows: list[tuple]) -> int:
     return cur.rowcount
 
 
-# SQLite rejects a statement that binds more parameters than
-# ``SQLITE_MAX_VARIABLE_NUMBER`` — 999 on builds before SQLite 3.32.  500 per
-# chunk leaves room for the ``config_hash`` parameter and stays valid on the
-# oldest build the project supports.
-_MAX_BOUND_PARAMS = 500
-
-
-def _chunked(items: list[str], size: int = _MAX_BOUND_PARAMS) -> list[list[str]]:
-    """Split *items* into chunks that fit SQLite's bound-parameter limit.
-
-    A single translation unit on an SDK-heavy project walks well over a
-    thousand header files, so ``WHERE from_file IN (?, ?, ...)`` over the
-    whole set would exceed the parameter limit.  The deletes run in batches
-    instead of one statement.
-    """
-    return [items[i : i + size] for i in range(0, len(items), size)]
 
 
 def _delete_by_from_file(
@@ -134,7 +120,7 @@ def _delete_by_from_file(
     paths = list(dict.fromkeys(from_files))  # dedupe, keep a stable order
     if not paths:
         return
-    for chunk in _chunked(paths):
+    for chunk in chunked(paths):
         placeholders = ",".join("?" * len(chunk))
         conn.execute(
             f"DELETE FROM {table} WHERE config_hash=? AND from_file IN ({placeholders})",

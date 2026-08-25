@@ -65,6 +65,7 @@ from pathlib import Path
 from typing import NamedTuple
 
 from ...utils import escape_like as _escape_like
+from ._chunking import chunked
 
 __all__ = [
     "FileHashRecord",
@@ -353,9 +354,10 @@ def _delete_dangling_incoming_refs(conn: sqlite3.Connection, config_hash: str, p
     two are also called from the reindex/reuse path where the file is being
     RE-PARSED, not deleted.
     """
-    chunk = 400
-    for i in range(0, len(purged_usrs), chunk):
-        batch = purged_usrs[i : i + chunk]
+    # 400, not the default 500: the fp_assignments statement below binds
+    # each item TWICE (lhs_usr and rhs_usr), so 1 + 2 * 500 would be 1001 and
+    # exceed the limit on SQLite before 3.32.  See chunked().
+    for batch in chunked(purged_usrs, 400):
         ph = ",".join("?" * len(batch))
         conn.execute(
             f"DELETE FROM inheritance WHERE config_hash = ? AND base_usr IN ({ph})",
@@ -466,8 +468,7 @@ def replace_file_data(
     if not ids:
         return
     rows: list[tuple[int, str]] = []
-    for i in range(0, len(ids), 500):
-        chunk = ids[i : i + 500]
+    for chunk in chunked(ids):
         placeholders = ",".join("?" * len(chunk))
         rows.extend(
             (r["id"], r["path"])

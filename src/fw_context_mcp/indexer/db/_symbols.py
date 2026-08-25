@@ -63,9 +63,7 @@ from collections.abc import Sequence
 
 from fw_context_mcp.utils import is_db_exception
 
-# ``_MAX_BOUND_PARAMS`` and the chunking rationale live in ``_refs`` — sharing
-# the constant keeps the two modules' parameter limits from drifting apart.
-from ._refs import _MAX_BOUND_PARAMS
+from ._chunking import chunked
 
 __all__ = [
     "_expand_query",
@@ -295,8 +293,7 @@ def delete_macros_for_files(conn: sqlite3.Connection, file_ids: Sequence[int]) -
     ids = list(dict.fromkeys(file_ids))  # dedupe, keep a stable order
     if not ids:
         return
-    for i in range(0, len(ids), _MAX_BOUND_PARAMS):
-        chunk = ids[i : i + _MAX_BOUND_PARAMS]
+    for chunk in chunked(ids):
         placeholders = ",".join("?" * len(chunk))
         conn.execute(
             f"DELETE FROM macros WHERE file_id IN ({placeholders})",

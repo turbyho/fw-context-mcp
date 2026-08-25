@@ -74,6 +74,8 @@ from fw_context_mcp.indexer.db import (
 )
 from fw_context_mcp.utils import abs_path, compute_content_hash, compute_source_hash, read_file_lines
 
+from .db._chunking import chunked
+
 log = logging.getLogger(__name__)
 
 # NOTE(turbyho, 2026-07-31): Each header is opened/read/closed individually — 500+ headers = 500+
@@ -639,17 +641,6 @@ def _detect_moved_symbols(
         log.debug("Detected %d moved symbols", moved)
 
 
-def _chunked(items: list[int], size: int = 500) -> list[list[int]]:
-    """Split *items* into chunks that fit SQLite's bound-parameter limit.
-
-    A single TU on an SDK-heavy project can own well over a thousand header
-    files.  ``WHERE file_id IN (?, ?, …)`` with that many parameters exceeds
-    ``SQLITE_MAX_VARIABLE_NUMBER`` on older builds (999), so the deletes run
-    in batches instead of one statement.
-    """
-    return [items[i : i + size] for i in range(0, len(items), size)]
-
-
 def _owned_file_ids(
     known: dict[str, tuple[int, float]],
     normalized_tu_path: str,
@@ -689,7 +680,7 @@ def _save_old_state(
     if not file_ids:
         return set()
     usrs: set[str] = set()
-    for chunk in _chunked(file_ids):
+    for chunk in chunked(file_ids):
         placeholders = ",".join("?" * len(chunk))
         rows = conn.execute(
             f"SELECT usr FROM symbols WHERE file_id IN ({placeholders})",
