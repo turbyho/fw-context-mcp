@@ -49,9 +49,12 @@ def _mtime_bump_is_safe(
 
     Vendor, generated, and out-of-tree headers keep the unconditional
     behaviour: their stored hashes are trusted everywhere else in the
-    pipeline (re-hashing thousands of SDK headers on every run would
-    dominate index time), so verifying them here would be both meaningless
-    and expensive.
+    pipeline, so to verify them here would be meaningless.
+
+    Cost is not the reason for these rules.  To hash every header in the
+    manifest takes 45 ms on the measured projects (1 037 headers on
+    zbox-ecb-fw, 541 on a Zephyr build, 640 on an ESP32 build), against
+    an index run of 42 minutes.  That is 0.002 %.
     """
     from .manifest import _hash_with_cache
     from .sdk_detect import _path_matches

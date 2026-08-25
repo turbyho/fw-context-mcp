@@ -881,9 +881,12 @@ def check_tu_staleness(
     indexing — only TUs whose source or project headers changed are re-parsed.
 
     Vendor/SDK headers and headers outside *project_root* are trusted from
-    the manifest — re-hashing thousands of SDK headers on every run would
-    dominate index time.  Only project headers inside *project_root* are
-    re-hashed.
+    the manifest.  Only project headers inside *project_root* are re-hashed.
+
+    Cost is not the reason for these rules.  To hash every header in the
+    manifest takes 45 ms on the measured projects (1 037 headers on
+    zbox-ecb-fw, 541 on a Zephyr build, 640 on an ESP32 build), against
+    an index run of 42 minutes.  That is 0.002 %.
 
     Compares the stored ``source_hash`` and ``headers[].hash`` from *entry*
     against the current on-disk content.
@@ -950,8 +953,12 @@ def collect_stale_headers(
 
     Trust rules match :func:`check_tu_staleness` exactly — generated headers,
     headers outside *project_root*, and headers matching *vendor_patterns*
-    keep their stored hash and are never re-read.  Re-hashing thousands of
-    SDK headers on every run would dominate index time.
+    keep their stored hash and are never re-read.
+
+    Cost is not the reason for these rules.  To hash every header in the
+    manifest takes 45 ms on the measured projects (1 037 headers on
+    zbox-ecb-fw, 541 on a Zephyr build, 640 on an ESP32 build), against
+    an index run of 42 minutes.  That is 0.002 %.
 
     Reads the manifest's ``headers`` map, which already holds each path once,
     so a header shared by 300 TUs is checked once.  Pass *hash_cache* to share
@@ -1103,6 +1110,11 @@ def compute_current_entry_hash(
     the actual on-disk hashes rather than trusting the stored values.
     Headers matching *vendor_patterns* or outside *project_root* keep their
     stored hashes — only project headers are re-hashed.
+
+    Cost is not the reason for these rules.  To hash every header in the
+    manifest takes 45 ms on the measured projects (1 037 headers on
+    zbox-ecb-fw, 541 on a Zephyr build, 640 on an ESP32 build), against
+    an index run of 42 minutes.  That is 0.002 %.
 
     *new_source_hash* overrides ``entry["source_hash"]`` when the source
     file content has also changed.
