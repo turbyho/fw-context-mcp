@@ -153,20 +153,32 @@ class TestReindexerIdentity:
 
     @staticmethod
     def _stand_in(*argv: str) -> subprocess.Popen:
-        """Spawn a SLEEPING process carrying *argv*, and nothing else.
+        """Spawn a sleeping process that carries *argv*, and wait until it does.
 
-        The stand-in really sleeps now.  It used to be a real CLI invocation
-        with a bad argument, which argparse rejected after 114 ms — measured.
-        The check then read /proc/<pid>/cmdline for a process that had
-        already exited, and the test failed whenever the full suite kept this
-        one off the CPU for longer than that.  It reads argv and nothing
-        else, so a stand-in carrying the same argv tests exactly the same
-        thing without the race.
+        _pid_is_fw_context_reindexer reads /proc/<pid>/cmdline and nothing
+        else, so a process carrying the same argv tests the same thing as a
+        real CLI run.  TWO races had to go:
+
+        - The stand-in used to be a real CLI invocation with a bad argument.
+          argparse rejects it after 114 ms — measured — so the check read
+          /proc for a process that had already exited.
+        - Popen returns once fork succeeds, and execve finishes after that.
+          Until it does, /proc/<pid>/cmdline still holds the PARENT's argv,
+          which is pytest's and matches nothing.  The process is alive and
+          the answer is wrong, so waiting on poll() would not catch it.
+
+        The child therefore prints a marker before it sleeps, and this
+        function returns only once that marker arrives.  At that point the
+        exec is done and the argv on /proc is the child's own.
         """
-        return subprocess.Popen(  # noqa: S603 — fixed argv, no shell
-            [sys.executable, "-c", "import time; time.sleep(30)", *argv],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        proc = subprocess.Popen(  # noqa: S603 — fixed argv, no shell
+            [sys.executable, "-c",
+             "import time; print('READY', flush=True); time.sleep(30)", *argv],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
         )
+        assert proc.stdout is not None
+        assert proc.stdout.readline().strip() == "READY"
+        return proc
 
     def test_a_background_run_is_recognised(self, tmp_path: Path):
         """The argv shape the daemon spawns."""
