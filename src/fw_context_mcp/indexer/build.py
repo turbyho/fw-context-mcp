@@ -179,6 +179,14 @@ class BuildVariant:
     may override it (FLPR asymmetry).  ``overrides`` holds arbitrary
     ``[build]`` keys that override the shared top-level defaults per the
     scalar-override / list-replace / dict-merge rules.
+
+    ``index_overrides`` holds ``[index]`` keys.  Those ADD to the ``[index]``
+    section, they do not replace it: a user with a value in both would
+    otherwise lose the shared entries without a word, and that is the same
+    class of silent wrongness as a lost staleness signal.  A variant can
+    therefore not NARROW the vendor set; the channels for that are
+    ``project_paths``, which wins over every vendor pattern, or a fix to the
+    detection.
     """
 
     name: str
@@ -188,6 +196,11 @@ class BuildVariant:
     env: dict[str, str] = field(default_factory=dict)
     images: list[BuildImage] = field(default_factory=list)
     overrides: dict = field(default_factory=dict)
+    # ``[index]`` keys written in this variant's table.  Kept apart from
+    # ``overrides`` because build_variant_config applies BuildConfig fields
+    # only: an [index] key landing there was dropped in silence, and since
+    # the unknown-key warning it would be reported as a typo.
+    index_overrides: dict = field(default_factory=dict)
 
 
 # BuildConfig fields classified by per-variant merge semantics.

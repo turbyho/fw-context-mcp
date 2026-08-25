@@ -163,9 +163,13 @@ def main() -> None:
         help="With --build: skip clean, do incremental build (may produce incomplete compile_commands.json)",
     )
     p_index.add_argument("--vendor-paths", nargs="*", default=None,
-                         help="Additional vendor/SDK directories (additive to auto-detection)")
+                         help="Vendor/SDK directories.  Added to what the build "
+                              "system detects, and REPLACES [index] vendor_paths. "
+                              "A [[build.variants]] entry adds to this.")
     p_index.add_argument("--project-paths", nargs="*", default=None,
-                         help="Manual project directories (overrides auto-detection)")
+                         help="Project directories.  They win over every vendor "
+                              "pattern, and REPLACE [index] project_paths. "
+                              "A [[build.variants]] entry adds to this.")
     p_index.add_argument("--name", metavar="NAME", help="Project name override")
     p_index.add_argument("--no-refs", action="store_true", help="Skip cross-reference indexing (on by default)")
     p_index.add_argument("--no-embeddings", action="store_true", dest="no_embeddings", help="Skip embedding generation")

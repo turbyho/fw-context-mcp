@@ -478,6 +478,19 @@ def _run_multi(
         if v is not None:
             env.update(v.env)
         build_dir_patterns = [f"{_variant_build_dir(v, build_cfg)}/"] if v is not None else None
+        # The path layers are summed per build, not once for the command:
+        # two variants may vendor different in-tree trees.  run_kwargs holds
+        # the [index] layer (or the CLI flag, which replaces it).
+        per_build = dict(run_kwargs)
+        idx = v.index_overrides if v is not None else {}
+        for key in ("vendor_paths", "project_paths"):
+            extra = list(idx.get(key) or [])
+            per_build[key] = _layered_paths(list(run_kwargs[key]), extra)
+            if extra:
+                print(
+                    f"  {variant_name}: {key} = "
+                    f"{len(run_kwargs[key])} from [index] + {len(extra)} from variant"
+                )
         try:
             ch = run(
                 compile_commands=cc_path,
@@ -489,7 +502,7 @@ def _run_multi(
                 build_dir_patterns=build_dir_patterns,
                 defer_fts=True,
                 defer_cleanup=True,
-                **run_kwargs,
+                **per_build,
             )
         except IndexSuperseded as exc:
             # Another process owns the index now.  The remaining builds would
@@ -537,6 +550,25 @@ def _run_multi(
 
     _post_index_optimize(db_path, project_root, project_id, system, args)
     return 0
+
+
+def _layered_paths(base: list[str], variant_extra: list[str]) -> list[str]:
+    """Return the ``[index]`` layer PLUS this variant's, in a stable order.
+
+    Adds, never replaces.  A user with a value in ``[index]`` and in the
+    variant would otherwise lose the shared entries without a word, which is
+    the same class of silent wrongness this series of changes is about.  The
+    precedent is already in the repo: ``_DICT_FIELDS`` in build.py merges
+    ``env`` per key, and says so.
+
+    The cost, and it is real: a variant cannot NARROW the set.  The channels
+    for that are ``project_paths``, which wins over every vendor pattern, or
+    a fix to the detection.  No escape hatch is added.
+
+    ``dict.fromkeys`` and not ``set``: the order shows up in the LIKE filters,
+    in the log and in the manifest, and a stable order diffs cleanly.
+    """
+    return list(dict.fromkeys([*base, *variant_extra]))
 
 
 def _build_run_kwargs(
@@ -640,6 +672,8 @@ def cmd_index(args: argparse.Namespace) -> int:
     project_id = derive_project_id(project_root)
     db_path = cfg.index.db_dir / project_id / "index.db"
 
+    # The CLI flag REPLACES the [index] layer.  A variant's own [index] keys
+    # are added on top of whichever of the two won — see _layered_paths().
     vendor_paths = list(getattr(args, "vendor_paths", None) or cfg.index.vendor_paths)
     project_paths = list(getattr(args, "project_paths", None) or cfg.index.project_paths)
 

@@ -568,6 +568,13 @@ def get_active_build(
             "first_indexed_at": cfg["first_indexed_at"] if "first_indexed_at" in cfg.keys() else "",
             "vendor_paths": proj_cfg.index.vendor_paths,
             "project_paths": proj_cfg.index.project_paths,
+            # What the INDEX RUN applied, which is not always what the config
+            # says today: the builder derives part of it, a variant adds to
+            # it, and the config can have changed since.  Three layers with no
+            # way to read the result are worse than two.
+            "effective_vendor_patterns": _effective_vendor_patterns(
+                db_path.parent, config_hash, root
+            ),
             "status": status,
             "reindex_needed": needs_reindex,
             "reindex_reasons": reindex_reasons,
@@ -1566,6 +1573,26 @@ def _reindex_match_tus(
     if not matching:
         return [], {"error": f"{target.name} not found in compile_commands.json — it may be a header-only file."}
     return matching, None
+
+
+def _effective_vendor_patterns(
+    db_dir: Path, config_hash: str, root: Path
+) -> list[str]:
+    """Return the vendor set stored with THIS build, or [] when unknown.
+
+    Read-only and best-effort: this feeds a status report, so a manifest that
+    cannot be read must not make the report fail.
+    """
+    from ...indexer.manifest import load as load_manifest
+
+    try:
+        manifest = load_manifest(db_dir, config_hash)
+    except OSError:
+        log.debug("manifest unreadable for the status report", exc_info=True)
+        return []
+    if manifest is None:
+        return []
+    return list(manifest.get("vendor_patterns") or [])
 
 
 def _reindex_build_patterns_for_generated(root: Path) -> tuple[list[str], None]:
