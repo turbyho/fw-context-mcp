@@ -8,6 +8,7 @@ import os
 import shutil
 import subprocess
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -22,6 +23,75 @@ if TYPE_CHECKING:
 log = logging.getLogger(__name__)
 
 _ZEPHYR_MARKERS = ["west.yml", "zephyr"]
+
+
+def _zephyr_vendor_patterns(
+    project_root: Path,
+    zephyr_base: Path | None,
+    west_topdir: Path | None,
+) -> list[str]:
+    """Return the in-tree SDK patterns for this Zephyr build.
+
+    Derived from ZEPHYR_BASE and WEST_TOPDIR, never guessed from a marker
+    file.  The application directory gives no signal: it is arbitrary, and
+    for a sysbuild image such as mcuboot it sits INSIDE the SDK.  Measured on
+    zbox-ecb-fw-v5: four different CMAKE_SOURCE_DIR values across 9 builds,
+    one of them under the SDK root.
+
+    A root outside project_root needs no pattern.  A path outside
+    project_root already gets is_project=0, so a pattern would add nothing
+    and would make the staleness check trust a tree two times.
+
+    ``modules/`` goes in ONLY as the real WEST_TOPDIR sibling.  A T2 manifest
+    repository has west.yml and its own ``modules/`` for the TEAM's Zephyr
+    modules, and a fixed ``modules/%`` pattern hides those from a
+    project_only query.
+    """
+    patterns: list[str] = []
+    for root in (zephyr_base, west_topdir):
+        if root is None:
+            continue
+        try:
+            rel = root.relative_to(project_root)
+        except ValueError:
+            continue                      # outside the project — no pattern
+        if rel == Path("."):
+            continue                      # project root IS the workspace
+        pattern = f"{rel}/%"
+        if pattern not in patterns:
+            patterns.append(pattern)
+    return patterns
+
+
+@lru_cache(maxsize=32)
+def _west_paths(project_root: str) -> tuple[str | None, str | None]:
+    """Return ``(zephyr.base, topdir)`` that ``west`` reports for this project.
+
+    Cached for the life of the process.  ``west`` starts a Python
+    interpreter, and get_vendor_patterns() also runs on the MCP query path,
+    where that cost is paid for every request.  The two values name the
+    workspace the project sits in, and that does not change while
+    fw-context runs.
+
+    Returns ``(None, None)`` when ``west`` is not on PATH or when it fails.
+    The caller then uses a different source.
+    """
+    if not shutil.which("west"):
+        return None, None
+
+    def ask(*args: str) -> str | None:
+        try:
+            r = subprocess.run(
+                ["west", *args],
+                capture_output=True, text=True, timeout=5, cwd=project_root,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return None
+        if r.returncode != 0:
+            return None
+        return r.stdout.strip() or None
+
+    return ask("config", "zephyr.base"), ask("topdir")
 
 
 # The two toolchain families a Zephyr project can build with.  They are not
@@ -310,6 +380,70 @@ class ZephyrBuildSystem:
     def get_build_dir_patterns(self, project_root: Path) -> list[str]:
         """Return build-output directory patterns for staleness filtering."""
         return ["build/"]
+
+    def get_vendor_patterns(
+        self,
+        project_root: Path,
+        *,
+        units: list | None = None,
+    ) -> list[str]:
+        """Return the in-tree SDK patterns derived from this build's SDK root.
+
+        For a standard Zephyr or NCS project the answer is an empty list:
+        the SDK is outside the project, and a path outside project_root
+        already gets is_project=0.  A pattern appears only when the
+        workspace really is inside the project, which is the T3 layout.
+
+        The SDK root comes from the sources in _sdk_roots(), in falling
+        order of how well each one describes THIS build.  The markers in
+        the project root are not one of them: ``west.yml`` is in a T2
+        manifest repository as well, where ``modules/`` holds the team's own
+        Zephyr modules.
+        """
+        zephyr_base, west_topdir = self._sdk_roots(project_root, units)
+        return _zephyr_vendor_patterns(project_root, zephyr_base, west_topdir)
+
+    @classmethod
+    def _sdk_roots(
+        cls,
+        project_root: Path,
+        units: list | None,
+    ) -> tuple[Path | None, Path | None]:
+        """Return ``(ZEPHYR_BASE, WEST_TOPDIR)`` for this build, or None for each.
+
+        Three sources, in falling order of how well each one describes the
+        build that is indexed:
+
+        1. ``ZEPHYR_BASE`` in the environment.
+        2. ``west config zephyr.base`` and ``west topdir``.
+        3. A ``zephyr/`` directory in project_root, which is the T3
+           workspace layout.  This is the last resort: it is the only
+           source that reads the filesystem instead of the build.
+
+        The first source that answers wins, and the sources are not mixed:
+        a value from the environment and a value from ``west`` can name two
+        different workspaces, and a mix of the two describes neither.
+
+        The strongest source, ``-fmacro-prefix-map`` in *units*, arrives
+        with the manifest carrier.  *units* is accepted here already so the
+        signature does not change again.
+        """
+        env_base = os.environ.get("ZEPHYR_BASE")
+        if env_base:
+            return Path(env_base).resolve(), None
+
+        west_base, west_top = _west_paths(str(project_root))
+        if west_base or west_top:
+            return (
+                Path(west_base).resolve() if west_base else None,
+                Path(west_top).resolve() if west_top else None,
+            )
+
+        in_tree = project_root / "zephyr"
+        if in_tree.is_dir():
+            return in_tree.resolve(), None
+
+        return None, None
 
     # ── Validation ──
 

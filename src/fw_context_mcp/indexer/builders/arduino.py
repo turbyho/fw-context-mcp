@@ -122,6 +122,21 @@ class ArduinoBuildSystem:
         """Return build-output directory patterns for staleness filtering."""
         return ["build/"]
 
+    def get_vendor_patterns(
+        self,
+        project_root: Path,
+        *,
+        units: list | None = None,
+    ) -> list[str]:
+        """Return no pattern — Arduino has no in-tree vendor directory.
+
+        The Arduino CLI keeps the cores and the libraries in the sketchbook
+        directory, which is outside the project.  An in-tree ``libraries/``
+        folder is a team convention, not a rule of the build system, so a
+        pattern for it would hide code the team owns.
+        """
+        return []
+
     # ── Validation ──
 
     def validate_artifacts(self, compile_commands: Path, project_root: Path) -> list[BuildIssue]:

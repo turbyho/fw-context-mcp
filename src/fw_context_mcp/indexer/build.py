@@ -262,6 +262,14 @@ def build_variant_config(base: BuildConfig, variant: BuildVariant) -> BuildConfi
             merged = dict(getattr(base, attr))
             merged.update(value)
             setattr(cfg, attr, merged)
+        else:
+            # A key that no field table knows was dropped in silence, so a
+            # typo in [[build.variants]] had no effect and no message.  The
+            # user then reads the config as applied when it is not.
+            log.warning(
+                "Variant %r: unknown [build] key %r — it has no effect",
+                variant.name, attr,
+            )
 
     return cfg
 

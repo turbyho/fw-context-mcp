@@ -89,6 +89,31 @@ class BuildSystem(Protocol):
         """
         ...
 
+    def get_vendor_patterns(
+        self,
+        project_root: Path,
+        *,
+        units: list | None = None,
+    ) -> list[str]:
+        """Return LIKE patterns for the vendor and SDK trees INSIDE the project.
+
+        Answers one question: which in-tree paths hold code that the team does
+        not own?  A path outside project_root needs no pattern — it is vendor by
+        position.  Build output needs no pattern either: it has
+        get_build_dir_patterns(), and generated code counts as project code.
+
+        Return an empty list when the build system mandates no in-tree vendor
+        directory.  A guess is worse than nothing here: a wrong pattern hides
+        the team's own code from a project_only query, and it makes the
+        staleness check trust a tree that the team edits.
+
+        *units* are this build's translation units, or None on the query side.
+        A builder that needs the compiler flags reads them from *units*.  With
+        None it must use the environment and the project files, so it stays
+        usable before the units are parsed.
+        """
+        return []
+
     # ── Environment auto-detection ──
 
     @classmethod

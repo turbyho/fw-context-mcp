@@ -6,6 +6,8 @@ from pathlib import Path
 
 from fw_context_mcp.indexer.build import (
     BuildConfig,
+    BuildVariant,
+    build_variant_config,
     _mbed_target_from_custom_targets,
     _parse_mbed_dotfile,
     check_completeness,
@@ -184,3 +186,85 @@ class TestBuildConfig:
         assert cfg.clean is False
         assert cfg.profile == "Release"
         assert cfg.target == "MY_BOARD"
+
+
+class TestTheConfiguredSystemWins:
+    """``[build] system`` decides which builder runs, not the project markers."""
+
+    def test_a_freestanding_zephyr_app_is_not_taken_for_cmake(self, tmp_path: Path):
+        """The config also decides who generates and validates compile_commands.json.
+
+        A freestanding NCS application has CMakeLists.txt and no west.yml.  A
+        marker scan calls it a CMake project, so GenericCMakeBuildSystem
+        validated its artifacts and answered for its build directories.
+        Measured on zbox-ecb-fw-v5, which declares system = "zephyr".
+        """
+        from fw_context_mcp.config import load as load_config
+        from fw_context_mcp.indexer.builders import registry
+
+        (tmp_path / "CMakeLists.txt").write_text("cmake_minimum_required(VERSION 3.20)\n")
+        cfg_dir = tmp_path / ".fw-context"
+        cfg_dir.mkdir()
+        (cfg_dir / "config.toml").write_text('[build]\nsystem = "zephyr"\n')
+
+        cfg = load_config(project_root=tmp_path)
+        system = cfg.build.system or detect_build_system(tmp_path)
+
+        assert detect_build_system(tmp_path) == "cmake"
+        assert system == "zephyr"
+
+        builder_cls = registry.get(system)
+        assert builder_cls is not None
+        assert builder_cls().get_build_dir_patterns(tmp_path) == ["build/"]
+        assert registry.get("cmake")().get_build_dir_patterns(tmp_path) == [
+            "build/", "cmake-build-",
+        ]
+
+
+class TestBuildVariantConfig:
+    def test_an_unknown_variant_override_warns(self, caplog):
+        """A typo in [[build.variants]] must not disappear without a message.
+
+        An unknown key was dropped in silence, so ``vendor_pathz = [...]``
+        had no effect and no warning.  The user then reads the config as
+        applied when it is not.
+        """
+        import logging
+
+        base = BuildConfig(system="zephyr")
+        variant = BuildVariant(name="dev", overrides={"vendor_pathz": ["x"]})
+
+        with caplog.at_level(logging.WARNING, logger="fw_context_mcp.indexer.build"):
+            cfg = build_variant_config(base, variant)
+
+        assert cfg.system == "zephyr"
+        assert "vendor_pathz" in caplog.text
+        assert "dev" in caplog.text
+
+    def test_a_known_variant_override_does_not_warn(self, caplog):
+        """The warning must fire on a typo only, never on a valid key."""
+        import logging
+
+        base = BuildConfig(system="zephyr", profile="develop")
+        variant = BuildVariant(name="rel", overrides={"profile": "release"})
+
+        with caplog.at_level(logging.WARNING, logger="fw_context_mcp.indexer.build"):
+            cfg = build_variant_config(base, variant)
+
+        assert cfg.profile == "release"
+        assert caplog.text == ""
+
+    def test_the_build_dir_pattern_is_per_variant(self):
+        """``build_dir`` IS per-variant, and this is the boundary that measurement supports.
+
+        Measured on zbox-ecb-fw-v5: 9 builds and 2 different build_dir values.
+        The vendor patterns have no such measured trigger, so do not read this
+        test as evidence for a per-variant vendor set.
+        """
+        base = BuildConfig(system="zephyr", build_dir="build")
+        dev = build_variant_config(base, BuildVariant(name="dev", build_dir="build/dev"))
+        rel = build_variant_config(base, BuildVariant(name="rel", build_dir="build/rel"))
+
+        assert dev.build_dir == "build/dev"
+        assert rel.build_dir == "build/rel"
+        assert base.build_dir == "build"

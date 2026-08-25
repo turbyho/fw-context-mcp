@@ -134,6 +134,20 @@ class MakefileBuildSystem:
         """Return build-output directory patterns for staleness filtering."""
         return ["build/"]
 
+    def get_vendor_patterns(
+        self,
+        project_root: Path,
+        *,
+        units: list | None = None,
+    ) -> list[str]:
+        """Return no pattern — a Makefile project has no canonical vendor tree.
+
+        Where the third-party code sits is written in the Makefile itself,
+        with a different variable in every project.  A fixed pattern would
+        be a guess, and a wrong guess hides code the team owns.
+        """
+        return []
+
 
 # Register
 registry.register(MakefileBuildSystem)

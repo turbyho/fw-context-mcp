@@ -1528,7 +1528,7 @@ def _reindex_build_patterns(
     """
     from ...indexer.sdk_detect import _build_sdk_excludes, _normalize_patterns
 
-    vendor_patterns = list(_build_sdk_excludes(root))
+    vendor_patterns = list(_build_sdk_excludes(root, cfg.build.system))
     if cfg.index.vendor_paths:
         vendor_patterns.extend(_normalize_patterns(cfg.index.vendor_paths))
     project_patterns_list = (

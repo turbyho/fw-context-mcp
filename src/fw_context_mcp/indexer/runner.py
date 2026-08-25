@@ -168,6 +168,7 @@ def run(
     index_macros_expanded: bool = True,
     config_header: str = "",
     build_dir_patterns: list[str] | None = None,
+    build_system: str | None = None,
     analyze_vendor: bool = False,
     purge_max_missing_percent: int = 20,
     variant: str = "",
@@ -212,6 +213,11 @@ def run(
         project_root: Root directory of the project.  Used to resolve relative
             paths and derive defaults.  Defaults to the parent of
             ``compile_commands``.
+        build_system: The ``[build] system`` config key of this project.  It
+            decides WHICH builder answers for the vendor patterns.  Pass it
+            whenever the config has it: the config and the markers can
+            disagree, and a freestanding NCS application reads as a CMake
+            project by its markers alone.  With None the markers decide.
         project_id: Unique project identifier (auto-derived from
             ``project_root`` when not provided).
         llm_config: Configuration dataclass for Ollama connection (URL,
@@ -231,7 +237,7 @@ def run(
     # Normalize patterns without % wildcard to match subdirectories.
     from .sdk_detect import _build_sdk_excludes, _normalize_patterns
 
-    vendor_patterns = list(_build_sdk_excludes(project_root))
+    vendor_patterns = list(_build_sdk_excludes(project_root, build_system))
     if vendor_paths:
         vendor_patterns.extend(_normalize_patterns(vendor_paths))
     project_patterns_list = _normalize_patterns(list(project_paths)) if project_paths else []

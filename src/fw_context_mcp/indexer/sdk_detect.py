@@ -9,7 +9,10 @@ also be treated as vendor by the MCP query filters.
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
+
+log = logging.getLogger(__name__)
 
 
 def _path_matches(file_path: str, pattern: str) -> bool:
@@ -74,28 +77,53 @@ def _normalize_patterns(patterns: list[str]) -> list[str]:
     return [_normalize_path_pattern(p) for p in patterns]
 
 
-def _build_sdk_excludes(root: Path) -> list[str]:
-    """Build default SDK exclude patterns from build system type.
+def _build_sdk_excludes(
+    root: Path,
+    build_system: str | None = None,
+    *,
+    units: list | None = None,
+) -> list[str]:
+    """Return the in-tree vendor and SDK patterns for this project.
 
-    WHY auto-detect from build system: each build system has known vendor
-    directories — ``mbed-os/`` for Mbed OS, ``.pio/`` for PlatformIO,
-    ``zephyr/`` for Zephyr.  Auto-detection removes the need for users to
-    manually configure vendor paths in 95% of projects.
+    A thin wrapper over the builder registry.  Each builder answers for its
+    own build system through ``get_vendor_patterns()``, so the knowledge of
+    where a build system puts third-party code lives with that build system
+    and not in a chain of ``if`` branches here.  A build system that has no
+    canonical in-tree vendor directory answers with an empty list, and each
+    one says why in its own docstring.
 
-    Returns LIKE patterns (with ``%`` wildcard) for vendor/SDK directories.
-    Only true vendor/SDK source code — NOT build output (build/ is not SDK).
+    *build_system* is the ``[build] system`` key from the config.  It wins
+    over marker detection, because the markers and the config can disagree:
+    a freestanding NCS application has CMakeLists.txt and no west.yml, so a
+    marker scan calls it a CMake project.  Pass None on a path that has no
+    config, and the markers decide.
+
+    *units* are this build's translation units, or None when the caller has
+    not parsed them.  A builder that reads the compiler flags needs them.
+
+    Returns LIKE patterns (with the ``%`` wildcard) for the vendor and SDK
+    trees INSIDE the project.  Build output is NOT in the result: it has
+    ``get_build_dir_patterns()``, and generated code counts as project code.
     """
     from .build import detect_build_system
+    from .builders import registry
 
-    build_system = detect_build_system(root)
-    if build_system is None:
+    key = build_system or detect_build_system(root)
+    if key is None:
         return []
-    excludes: list[str] = []
-    if build_system == "mbed-os":
-        excludes.append("mbed-os/%")
-        excludes.append("BUILD/%")
-    elif build_system == "platformio":
-        excludes.extend([".pio/%", "%.platformio/%"])
-    elif build_system == "zephyr":
-        excludes.extend(["zephyr/%", "modules/%"])
-    return excludes
+    builder_cls = registry.get(key)
+    if builder_cls is None:
+        log.warning(
+            "Unknown build system %r — no vendor patterns.  Known: %s",
+            key, ", ".join(sorted(registry.keys())),
+        )
+        return []
+    try:
+        return builder_cls().get_vendor_patterns(root, units=units)
+    except (OSError, ValueError, TypeError, RuntimeError):
+        # A builder that cannot answer must not stop the index run or the
+        # query.  An empty list means "no in-tree vendor tree", which is the
+        # answer for most projects anyway, and a wrong pattern would hide
+        # the team's own code.
+        log.warning("Builder %s failed to give vendor patterns", key, exc_info=True)
+        return []

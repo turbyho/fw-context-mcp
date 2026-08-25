@@ -140,6 +140,20 @@ class IARBuildSystem:
         """Return build-output directory patterns for staleness filtering."""
         return []
 
+    def get_vendor_patterns(
+        self,
+        project_root: Path,
+        *,
+        units: list | None = None,
+    ) -> list[str]:
+        """Return no pattern — IAR EWARM keeps its device support outside the project.
+
+        The header files and the libraries come from the EWARM installation
+        directory.  A path outside project_root is vendor by position and
+        needs no pattern.
+        """
+        return []
+
 
 # Register
 registry.register(IARBuildSystem)

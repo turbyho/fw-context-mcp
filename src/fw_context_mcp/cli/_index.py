@@ -520,6 +520,8 @@ def _build_run_kwargs(
     args, cfg, project_root, project_id, vendor_paths, project_paths, cs_config,
 ) -> dict:
     """Build the shared ``runner.run()`` kwargs from config + CLI flags."""
+    from ..indexer.build import detect_build_system
+
     return dict(
         vendor_paths=vendor_paths,
         project_paths=project_paths,
@@ -548,6 +550,7 @@ def _build_run_kwargs(
             else getattr(args, "analyze_vendor", False) or cfg.llm.analyze_vendor
         ),
         purge_max_missing_percent=cfg.index.purge_max_missing_percent,
+        build_system=cfg.build.system or detect_build_system(project_root),
     )
 
 
@@ -595,7 +598,12 @@ def cmd_index(args: argparse.Namespace) -> int:
     project_root = resolve_project_root(args.project)
     cfg = load_config(project_root=project_root)
     bg = getattr(args, "background", False)
-    detected_system = detect_build_system(project_root)
+    # The config wins over the markers, the same form _run_multi already
+    # uses.  The two can disagree: a freestanding NCS application has
+    # CMakeLists.txt and no west.yml, so a marker scan calls it a CMake
+    # project.  This value also decides which builder generates and
+    # validates compile_commands.json, not only the vendor patterns.
+    detected_system = cfg.build.system or detect_build_system(project_root)
 
     if detected_system:
         print(f"Project: {project_root.name}  path={project_root}  build={detected_system}")

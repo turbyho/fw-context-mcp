@@ -66,16 +66,31 @@ class TestBuildSdkExcludes:
         excludes = _build_sdk_excludes(tmp_path)
         assert "mbed-os/%" in excludes
 
-    def test_zephyr_detected(self, tmp_path: Path):
-        (tmp_path / "west.yml").write_text("")
-        excludes = _build_sdk_excludes(tmp_path)
-        assert "zephyr/%" in excludes
-        assert "modules/%" in excludes
+    def test_a_manifest_repo_keeps_its_own_modules(self, tmp_path: Path, monkeypatch):
+        """The MCP layer must give the same answer as the indexer.
 
-    def test_platformio_detected(self, tmp_path: Path):
+        The sign of this test is inverted from what it was.  ``modules/`` in a
+        T2 manifest repository holds the TEAM's Zephyr modules, and the old
+        fixed pattern hid them from every project_only query.  The reasoning
+        is in tests/test_sdk_detect.py, and the duplicate lives here because
+        the two layers must not drift apart.
+        """
+        repo = tmp_path / "repo"
+        (repo / "modules").mkdir(parents=True)
+        (repo / "west.yml").write_text("")
+        sdk = tmp_path / "ncs" / "v3.4.0" / "zephyr"
+        sdk.mkdir(parents=True)
+        monkeypatch.setenv("ZEPHYR_BASE", str(sdk))
+
+        assert _build_sdk_excludes(repo) == []
+
+    def test_pio_libdeps_stays_vendor(self, tmp_path: Path):
+        """``.pio/libdeps`` is vendor, ``.pio/build`` is build output."""
         (tmp_path / "platformio.ini").write_text("")
         excludes = _build_sdk_excludes(tmp_path)
-        assert ".pio/%" in excludes
+
+        assert ".pio/libdeps/%" in excludes
+        assert ".pio/%" not in excludes
 
     def test_unknown_build_system(self, tmp_path: Path):
         excludes = _build_sdk_excludes(tmp_path)
@@ -85,6 +100,33 @@ class TestBuildSdkExcludes:
         excludes = _build_sdk_excludes(tmp_path)
         assert isinstance(excludes, list)
         assert len(excludes) == 0
+
+
+class TestGeneratedOutputIsProjectCode:
+    """Build output never appears in the vendor patterns.
+
+    Generated code counts as project code (decision 1), and build output
+    has its own answer in get_build_dir_patterns().  Mbed used to put
+    ``BUILD/%`` in the vendor list and PlatformIO used to put ``.pio/%``
+    there, so their generated files read as somebody else's code.
+    """
+
+    def test_generated_build_output_is_project_code(self, tmp_path: Path, monkeypatch):
+        cases = [
+            ("mbed-os", "BUILD/NRF52840/GCC_ARM/mbed_config.h"),
+            ("platformio", ".pio/build/nucleo/FrameworkArduino/gen.h"),
+            ("zephyr", "build/nrf52840_sysbuild/zephyr/include/generated/autoconf.h"),
+            ("esp-idf", "build/config/sdkconfig.h"),
+        ]
+        workspace = tmp_path / "workspace"
+        (workspace / "zephyr").mkdir(parents=True)
+        monkeypatch.setenv("ZEPHYR_BASE", str(workspace / "zephyr"))
+
+        for system, generated in cases:
+            patterns = _build_sdk_excludes(tmp_path, system)
+            assert not any(_path_matches(generated, p) for p in patterns), (
+                f"{system}: {generated} matched {patterns}"
+            )
 
 
 class TestComputeExcludeLike:

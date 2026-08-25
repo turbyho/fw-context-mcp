@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import configparser
 import logging
 import shutil
 from pathlib import Path
@@ -18,6 +19,43 @@ if TYPE_CHECKING:
 log = logging.getLogger(__name__)
 
 _PIO_MARKERS = ["platformio.ini"]
+
+
+def _libdeps_dir(project_root: Path) -> str:
+    """Return the ``libdeps`` directory of *project_root*, relative to it.
+
+    Defaults to ``.pio/libdeps``.  A project can move it with
+    ``libdeps_dir`` in the ``[platformio]`` section of ``platformio.ini``,
+    and a fixed pattern would then match nothing.
+
+    Reads the file with configparser, which is what PlatformIO's own
+    format is.  On any read or parse error the default is returned: a
+    pattern that is merely wrong for one project is better than an index
+    run that stops.  An absolute or out-of-tree value is dropped for the
+    same reason it is dropped everywhere else — a path outside
+    project_root is vendor by position and needs no pattern.
+    """
+    default = ".pio/libdeps"
+    ini = project_root / "platformio.ini"
+    if not ini.is_file():
+        return default
+    parser = configparser.ConfigParser()
+    try:
+        parser.read(ini, encoding="utf-8")
+        raw = parser.get("platformio", "libdeps_dir", fallback="").strip()
+    except (configparser.Error, OSError, UnicodeDecodeError):
+        log.debug("Cannot read libdeps_dir from %s", ini, exc_info=True)
+        return default
+    if not raw:
+        return default
+    candidate = Path(raw)
+    if not candidate.is_absolute():
+        candidate = project_root / candidate
+    try:
+        rel = candidate.resolve().relative_to(project_root.resolve())
+    except (ValueError, OSError):
+        return default
+    return str(rel) if str(rel) != "." else default
 
 
 class PlatformIOBuildSystem:
@@ -113,6 +151,29 @@ class PlatformIOBuildSystem:
     def get_build_dir_patterns(self, project_root: Path) -> list[str]:
         """Return build-output directory patterns for staleness filtering."""
         return [".pio/"]
+
+    def get_vendor_patterns(
+        self,
+        project_root: Path,
+        *,
+        units: list | None = None,
+    ) -> list[str]:
+        """Return the directories that hold the libraries PlatformIO downloads.
+
+        ``.pio/libdeps/`` holds the ``lib_deps`` packages, and
+        ``.platformio/`` is the global package and framework store.  The
+        team writes neither, and PlatformIO overwrites both.
+
+        ``.pio/build/`` is NOT in this list, so the pattern is
+        ``.pio/libdeps/%`` and not ``.pio/%``.  ``.pio/build/`` is build
+        output: it has get_build_dir_patterns(), and generated code counts
+        as project code.
+
+        The path of ``libdeps`` is configurable, so it is read from
+        ``platformio.ini`` when the project sets ``libdeps_dir``.
+        """
+        libdeps = _libdeps_dir(project_root)
+        return [f"{libdeps}/%", "%.platformio/%"]
 
     # ── Validation ──
 
