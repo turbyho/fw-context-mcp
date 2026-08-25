@@ -89,6 +89,9 @@ def _check_and_parse_unit(
        Uses ``manifest.json`` for header hashes when available — no libclang needed.
     3. **libclang parse** — content hashes differ → parse.
 
+    Tier 1 does not look at the flags.  A build whose flags changed but
+    whose sources did not moves no mtime, so the check stops here.
+
     Does NOT write to the database — the caller is responsible for
     acquiring ``write_lock`` and calling ``_process_unit(pre_parsed=...)``
     to persist the result.

@@ -49,11 +49,18 @@ def _normalize_entry(entry: dict) -> dict:
     if raw_args and not raw_args[0].startswith("-"):
         raw_args = raw_args[1:]
 
-    # Expand response files inline so hash is stable across build dirs
+    # Expand response files inline so hash is stable across build dirs.
+    # A relative @rsp resolves against the entry's OWN directory, not the
+    # directory fw-context happens to run from.  Measured on zbox-ecb-fw: all
+    # 873 entries carry a relative @./BUILD/... response file with 269 -I
+    # tokens inside, and expand_response_file returns [] for a file it cannot
+    # find, with no error and no log.  flags_hash therefore depended on the
+    # process CWD, and the whole build read as changed after a `cd`.
+    cwd = Path(entry["directory"]) if entry.get("directory") else None
     expanded: list[str] = []
     for token in raw_args:
         if token.startswith("@"):
-            rsp_args = expand_response_file(token, None)
+            rsp_args = expand_response_file(token, cwd)
             expanded.extend(rsp_args)
         else:
             expanded.append(token)
@@ -106,6 +113,11 @@ def compute_tu_content_hash(source_hash: str, flags_hash: str, manifest_entry_ha
     This hash is stored in ``files.content_hash`` — when it matches the
     stored hash, the TU can be skipped even if mtime has changed (mtime
     false-positives from git checkout, touch, etc.).
+
+    Tier 1 compares the source file mtime only, so nothing reads this hash
+    when the mtime is unchanged.  A change of flags_hash alone therefore
+    invalidates nothing through this path — config_hash must hold what a
+    toolchain change moves.  See compute_config_hash.
 
     *manifest_entry_hash* is the hash of the TU's manifest entry
     (source + headers), replacing the old ``deps_hash`` from ``.d`` files.

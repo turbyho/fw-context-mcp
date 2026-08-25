@@ -29,13 +29,9 @@ import logging
 import time
 from pathlib import Path
 
-from fw_context_mcp.indexer.compile_commands import _DROP_WITH_ARG, _SOURCE_EXTS
+from fw_context_mcp.indexer.compile_commands import _DROP_WITH_ARG
 from fw_context_mcp.indexer.config_hash import _TRANSIENT_DROP, compute_flags_hash
 from fw_context_mcp.utils import compute_source_hash
-
-# Object / dependency outputs.  A token with one of these suffixes is a build
-# product, never a flag that shapes the dialect.
-_OUTPUT_EXTS = frozenset({".o", ".obj", ".d", ".map", ".elf", ".bin", ".hex"})
 
 log = logging.getLogger(__name__)
 
@@ -636,11 +632,18 @@ def compute_config_hash(
       every unchanged TU, and their rows then had to be migrated to it.  That
       migration was the "reuse" tier, and it was incomplete: rows owned by a
       header stayed under the old hash and retention deleted them.
-    - **Include search paths** (``-I``, ``-isystem``, ``-include``, …).  This
-      is where per-directory variance lives — HA_Boiler has 14 distinct
-      flag-sets but 208 distinct include paths.  A changed path is caught by
-      that TU's ``files.flags_hash`` (which expands response files, so it sees
-      real paths) and reparses the one TU.
+    - **Include search paths INSIDE the project** (``-I``, ``-isystem``,
+      ``-include``, …).  This is where per-directory variance lives —
+      HA_Boiler has 14 distinct flag-sets but 208 distinct include paths, and
+      zbox-ecb-fw has 268 in-project ones.  A directory that moves inside the
+      project does not change what the compiler reads.
+
+    An include path OUTSIDE the project is KEPT, because it names the
+    toolchain and the SDK.  Two toolchains must map to two config_hash
+    values: rows parsed against different system headers cannot share one
+    build.  Those paths go in as the INTERSECTION over the units, so a path
+    that only some units carry stays out — otherwise the translation-unit
+    list comes back into the hash through the side door.
     - **Build-output paths**, whether they arrive as a path flag or embedded
       in another flag, detected via *build_dir_patterns*.
     - **Transient ``-D`` macros** (timestamps, build counters) — they change
@@ -652,6 +655,12 @@ def compute_config_hash(
     dialect, ``files.source_hash`` for content, ``files.flags_hash`` for a
     TU's own flags, and the manifest entry list for which files belong to the
     build at all.
+
+    ``files.flags_hash`` only counts for a TU that already got past Tier 1.
+    Tier 1 compares the source file mtime and stops there, and a change of
+    flags alone moves no mtime.  A statement that flags_hash catches a
+    changed include path is therefore wrong on its own, which is why the
+    out-of-project paths belong in THIS hash.
 
     The canonical JSON is written to
     ``<db_dir>/<project_id>/compile_commands.<hash>.json``
@@ -683,26 +692,54 @@ def compute_config_hash(
     def _is_build_output(arg_value: str) -> bool:
         return any(marker in arg_value for marker in _markers)
 
+    def _is_outside_project(path_value: str) -> bool:
+        """Is *path_value* outside the project tree and outside the build tree?
+
+        Does no I/O: compute_structural_hash() documents this code path as
+        "no I/O, no libclang", so this function does not call Path.resolve().
+        normalize_args() already resolved the relative paths, and an absolute
+        path arrives as the build system wrote it, which is stable between
+        runs.
+        """
+        if _is_build_output(path_value):
+            return False
+        p = Path(path_value)
+        if not p.is_absolute():
+            # normalize_args resolves an include path against the translation
+            # unit's directory, so a relative path here is not a search path.
+            return False
+        try:
+            p.relative_to(project_root)
+        except ValueError:
+            return True
+        return False
+
     def _is_dialect_token(token: str) -> bool:
         """Does *token* belong to the build's compilation dialect?
 
-        Callers hand over ``unit.clang_args``, which ``normalize_args``
-        already stripped of the source file and the output path.  This check
-        does not trust that: a filename slipping through would be neither a
-        ``-D`` nor a path-bearing flag, so it would land in *dialect* and put
-        the translation-unit list back into the hash — the exact coupling
-        this function exists to remove.  Keeping the guard local means the
-        property holds no matter what the caller passes.
+        A dialect flag always starts with '-'.  Anything else is a filename or
+        a stray value.  The pre-pass joins every separated flag with its
+        value, so a bare token that arrives here belongs to no flag.
+
+        This test compared the token SUFFIX against _SOURCE_EXTS and
+        _OUTPUT_EXTS before.  A whitelist of "what counts as a source file"
+        cannot stay complete, and a suffix outside the list put a filename
+        into the hash — the translation-unit coupling that this function
+        exists to remove.  The rule above needs no list.
+
+        The rule does NOT mean the hash holds no project path.  A path can
+        ride inside a non-path flag, and -fmacro-prefix-map=<project>=NAME
+        stays.  That flag has one value per build, not one per translation
+        unit, so it makes no churn.
         """
+        if not token.startswith("-"):
+            return False
         if token in _TRANSIENT_DROP or token in _DROP_WITH_ARG:
             return False
-        if _is_build_output(token):
-            # A build-output path can ride inside a non-path flag
-            # (-Wl,-Map=BUILD/x.map, -fprofile-dir=BUILD/...).  Those names
-            # change per build without changing semantics.
-            return False
-        suffix = Path(token).suffix.lower()
-        return suffix not in _SOURCE_EXTS and suffix not in _OUTPUT_EXTS
+        # A build-output path can ride inside a non-path flag
+        # (-Wl,-Map=BUILD/x.map, -fprofile-dir=BUILD/...).  Those names
+        # change per build without changing semantics.
+        return not _is_build_output(token)
 
     # Accumulated across ALL translation units, deduplicated: a macro or
     # dialect flag anywhere in the build is part of that build's identity,
@@ -711,16 +748,43 @@ def compute_config_hash(
     # that varies, ARDUINO_CORE_BUILD on 46 of 114.)
     defines: set[str] = set()
     dialect: set[str] = set()
+    # Out-of-project include paths go in as the INTERSECTION over translation
+    # units, not as the union.  A path that only some units carry is per-unit
+    # state, and to put it in would put the translation-unit list back into
+    # the hash: on zbox-ecb-fw-v5 one generated unit,
+    # validate_binding_headers.c, carries 11 devicetree binding headers, so
+    # the union moves each time the board overlay changes.  The intersection
+    # does not move.  Measured over 2 052 translation units in 7 real builds:
+    # no single unit changes it, and it still holds all 16 toolchain
+    # directories.
+    #
+    # A running intersection needs no list of per-unit sets, and `None` for
+    # "no unit seen yet" removes the empty-build special case.
+    external: set[str] | None = None
     for unit in units:
         # ── Pre-pass: collapse space-separated -D NAME=VALUE → -DNAME=VALUE ──
         # Sorting alphabetically (next step) would separate "-D" from its value
         # token — join them first so the sort is semantically safe.  Also
         # drops transient -D macros in the same pass.
         raw_args = unit.clang_args
+        # The unit's own source file, by basename.  The join below must not
+        # take it for the value of the flag in front of it: "-c main.c" would
+        # become "-cmain.c" and put the translation-unit list back into the
+        # hash.  normalize_args() strips the positional tokens on the
+        # production path, but this function does not trust its caller — see
+        # _is_dialect_token().  Read without resolve(): this code path is
+        # documented as "no I/O".
+        source_name = Path(str(unit.file)).name
         collapsed_args: list[str] = []
         j = 0
         while j < len(raw_args):
             a = raw_args[j]
+            if a in _DROP_WITH_ARG:
+                # -o, -MF, -MT, -MQ: the flag AND its value go.  Without this
+                # the join below would attach the value and hide it from
+                # _is_dialect_token(), which only recognises the bare flag.
+                j += 2 if (j + 1 < len(raw_args) and not raw_args[j + 1].startswith("-")) else 1
+                continue
             if a == "-D" and j + 1 < len(raw_args):
                 val = raw_args[j + 1]
                 eq_idx = val.find("=")
@@ -741,6 +805,35 @@ def compute_config_hash(
                     continue
                 collapsed_args.append(a)
                 j += 1
+            # Join ANY flag with a following non-flag token, before the sort.
+            # The path pass below pairs a flag with its neighbour BY POSITION,
+            # and the sort has already moved each value away from its flag.
+            # Measured on zbox-ecb-fw-v5, one build of 257 translation units:
+            # a sorted -isystem consumed -mabi=aapcs 230 times, and it left
+            # its own directory in the set as a token with no flag.
+            #
+            # WHY no list of "flags that take a value": such a list cannot
+            # stay complete, and _is_dialect_token() drops what it forgets.
+            # Measured on FM, the forgotten ones were
+            # "--param max-inline-insns-single=500" and the separated
+            # --sysroot form, which carries the toolchain root.
+            #
+            # Two structural guards keep a stray token out, so the join
+            # needs no list of flag names either.  A flag that already holds
+            # an '=' carries its own value and takes no second one
+            # (-std=c11, -mcpu=cortex-m4, -Wl,-Map=x.map), and the unit's own
+            # source file is never a value.  normalize_args() removes the
+            # positional tokens on the production path, but this function
+            # does not trust its caller — see _is_dialect_token().
+            elif (
+                a.startswith("-")
+                and "=" not in a
+                and j + 1 < len(raw_args)
+                and not raw_args[j + 1].startswith("-")
+                and Path(raw_args[j + 1]).name != source_name
+            ):
+                collapsed_args.append(f"{a}{raw_args[j + 1]}")
+                j += 2
             else:
                 collapsed_args.append(a)
                 j += 1
@@ -748,31 +841,54 @@ def compute_config_hash(
         # Normalize arguments: sort, then process path-bearing flags
         args = sorted(collapsed_args)
         normalized_args: list[str] = []
+        # The out-of-project paths of THIS unit.  _is_build_output is tested
+        # while they are collected, because the running intersection below
+        # bypasses _is_dialect_token().
+        tu_external: set[str] = set()
 
         i = 0
         while i < len(args):
             arg = args[i]
             handled = False
 
-            # ── Path-bearing flags are consumed and DROPPED ──
-            # The include search path is per-TU state, not build identity.
-            # Measured: HA_Boiler has 14 distinct flag-sets but 208 distinct
-            # include paths — the per-directory variance lives here.  A path
-            # change is caught by that TU's ``files.flags_hash``, which
-            # reparses the one TU instead of minting a new build.
+            # ── Path-bearing flags ──
+            # Include search paths INSIDE the project are dropped.  Paths
+            # outside it are kept.  The two answer different questions.
             #
-            # ``-include`` / ``-imacros`` are dropped too, even though the
-            # injected header defines macros: its CONTENT reaches every TU as
-            # an include, so the per-TU manifest header hash already covers a
-            # change to it.  Only its path is dropped, and a path alone is not
-            # a semantic difference.
+            # An in-project path is per-unit state.  zbox-ecb-fw has 268 of
+            # them, and they move when a directory moves.  A moved directory
+            # does not change what the compiler reads.
+            #
+            # An out-of-project path names the toolchain and the SDK.  Those
+            # are the system headers that the parse reads.  Measured: 16
+            # toolchain directories on every translation unit of a Zephyr
+            # build and of a PlatformIO build.
+            #
+            # A toolchain update creates a new build IDENTITY.  Two
+            # toolchains must map to two config_hash values: rows parsed
+            # against different system headers cannot share one build, and a
+            # variant project would mix them under a single hash.  That is
+            # what this path pass buys, and the full reindex it causes is
+            # intended.
+            #
+            # Detection is a separate question, answered elsewhere: the
+            # staleness pass hashes every header the units include, so it
+            # sees a content change at an unchanged path.  Tier 1 sees
+            # neither — it compares the source file mtime, and a toolchain
+            # update moves no source file.
             for prefix in _PATH_PREFIXES:
-                if arg == prefix and i + 1 < len(args):
-                    i += 2
+                if arg == prefix:
+                    # Dangling: the pre-pass joined every real pair, so a
+                    # bare prefix here has no value.  Consume the flag alone.
+                    # When this branch consumed args[i + 1], it removed a
+                    # sorted neighbour that belongs to no flag.
+                    i += 1
                     handled = True
                     break
                 elif arg.startswith(prefix) and len(arg) > len(prefix):
                     # Concatenated form: -I/path/to/include
+                    if _is_outside_project(arg[len(prefix):]):
+                        tu_external.add(arg)
                     i += 1
                     handled = True
                     break
@@ -782,6 +898,10 @@ def compute_config_hash(
 
             for prefix in _PATH_EQ_PREFIXES:
                 if arg.startswith(prefix):
+                    # --sysroot= is a toolchain root by definition, so it is
+                    # kept whenever it points outside the project.
+                    if _is_outside_project(arg[len(prefix):]):
+                        tu_external.add(arg)
                     i += 1
                     handled = True
                     break
@@ -801,6 +921,14 @@ def compute_config_hash(
                 defines.add(token)
             elif _is_dialect_token(token):
                 dialect.add(token)
+
+        # The attached token goes into the intersection, not the bare path:
+        # it keeps the invariant that a dialect token starts with '-', and it
+        # records WHICH flag carried the path.
+        external = tu_external if external is None else external & tu_external
+
+    if external:
+        dialect |= external
 
     canonical: dict = {
         # Bumped from /1, which keyed the hash on the per-TU {file, arguments}

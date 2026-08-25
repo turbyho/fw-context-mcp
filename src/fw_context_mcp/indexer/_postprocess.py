@@ -1169,6 +1169,13 @@ def _fts_inconsistencies(conn: sqlite3.Connection) -> list[str]:
             )
         except sqlite3.OperationalError as exc:
             # No such table — the FTS index was never created in this DB.
+            #
+            # This catch is DELIBERATELY wider than that one case.
+            # OperationalError is a subtype of DatabaseError and this except
+            # comes first, so a locked database or a disk error also lands
+            # here and reaches log.debug alone.  A narrower catch would need
+            # to read the message text, which is not a stable interface.  The
+            # cost is one silent skip; the check runs again on the next run.
             log.debug("FTS integrity check skipped for %s: %s", table, exc)
         except sqlite3.DatabaseError as exc:
             problems.append(f"{table} disagrees with its content table: {exc}")

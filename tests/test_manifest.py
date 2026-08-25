@@ -64,8 +64,9 @@ class TestComputeConfigHash:
         if clang_args is None:
             clang_args = ["gcc", "-c", file_path]
         unit = MagicMock()
-        unit.file = MagicMock()
-        unit.file.resolve.return_value = Path(file_path)
+        # A real CompilationUnit.file IS a Path, and a MagicMock here hides
+        # its basename from anything that does not call .resolve().
+        unit.file = Path(file_path)
         unit.clang_args = clang_args
         return unit
 
