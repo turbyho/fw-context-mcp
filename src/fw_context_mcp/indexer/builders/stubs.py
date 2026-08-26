@@ -74,6 +74,21 @@ class STM32CubeIDEStub:
         """Return build-output directory patterns for staleness filtering."""
         return []
 
+    def get_vendor_patterns(
+        self,
+        project_root: Path,
+        *,
+        units: list | None = None,
+    ) -> list[str]:
+        """Return no pattern — STM32CubeIDE writes project code, not vendor code.
+
+        CubeMX generates ``Drivers/`` and ``Middlewares/`` INTO the project
+        from the project's own ``.ioc`` file, and the team edits what it
+        generates.  Generated code counts as project code, so a pattern for
+        those directories would hide code the team owns.
+        """
+        return []
+
     # ── Environment auto-detection ──
 
     @classmethod
@@ -128,6 +143,20 @@ class TICCSStub:
 
     def get_build_dir_patterns(self, project_root: Path) -> list[str]:
         """Return build-output directory patterns for staleness filtering."""
+        return []
+
+    def get_vendor_patterns(
+        self,
+        project_root: Path,
+        *,
+        units: list | None = None,
+    ) -> list[str]:
+        """Return no pattern — Code Composer Studio keeps its support files outside.
+
+        SysConfig and the device support come from the CCS installation
+        directory.  A path outside project_root is vendor by position and
+        needs no pattern.
+        """
         return []
 
     # ── Environment auto-detection ──

@@ -105,6 +105,21 @@ class GenericCMakeBuildSystem:
         """Return build-output directory patterns for staleness filtering."""
         return ["build/", "cmake-build-"]
 
+    def get_vendor_patterns(
+        self,
+        project_root: Path,
+        *,
+        units: list | None = None,
+    ) -> list[str]:
+        """Return no pattern — CMake mandates no vendor directory.
+
+        A CMake project can put third-party code in a submodule at any depth,
+        in the build tree through FetchContent, or in an installed package
+        outside the project.  There is no canonical name to match, and a
+        guess would hide the team's own code.
+        """
+        return []
+
     # ── Validation ──
 
     def validate_artifacts(self, compile_commands: Path, project_root: Path) -> list[BuildIssue]:

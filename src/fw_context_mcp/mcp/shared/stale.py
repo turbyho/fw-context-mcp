@@ -124,12 +124,14 @@ def _stale_files(conn, config_hash: str, file_paths: list[str], root: Path) -> l
     """Return the subset of *file_paths* whose on-disk mtime is newer than the index."""
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
-    from ...indexer.manifest import load as load_manifest
+    from ...indexer.manifest import load_build_dir_patterns
     from ...indexer.ops import _normalize_file_path
 
     db_path = Path(conn.execute("PRAGMA database_list").fetchone()["file"])
-    manifest = load_manifest(db_path.parent, config_hash)
-    build_patterns = manifest.get("build_dir_patterns", []) if manifest else []
+    # This runs on every query routed through _with_stale_recovery, and the
+    # patterns are all it needs — see load_build_dir_patterns for why parsing
+    # the whole manifest here was the most expensive thing on that path.
+    build_patterns = load_build_dir_patterns(db_path.parent, config_hash)
 
     # Build work items: batch-fetch stored mtimes in one query (was N+1).
     normalized: list[tuple[str, str]] = []  # (abs_path, db_key)
@@ -257,11 +259,10 @@ def _count_modified_files(
             best_mtime[key] = stored
 
     # Load build_dir_patterns from manifest to skip build-generated files
-    from ...indexer.manifest import load as load_manifest
+    from ...indexer.manifest import load_build_dir_patterns
 
     db_path = Path(conn.execute("PRAGMA database_list").fetchone()["file"])
-    manifest = load_manifest(db_path.parent, config_hash)
-    build_patterns = manifest.get("build_dir_patterns", []) if manifest else []
+    build_patterns = load_build_dir_patterns(db_path.parent, config_hash)
 
     # NOTE: TOCTOU — file may change between DB read and stat() below.
     # Not a security issue: worst case is missed detection until next query.
@@ -324,24 +325,42 @@ def _check_header_staleness(
             if time.monotonic() - ts < _CACHE_TTL_S:
                 return count, []
 
-    from ...indexer.manifest import check_tu_staleness
+    from ...indexer.manifest import check_tu_staleness, resolve_headers
     from ...indexer.manifest import load as load_manifest
-    from ...indexer.sdk_detect import _build_sdk_excludes
 
     # Find the DB dir from the conn's path
     db_path = Path(conn.execute("PRAGMA database_list").fetchone()["file"])
-    manifest = load_manifest(db_path.parent)
+    # Load the manifest OF THIS BUILD.  Without the config_hash, load() falls
+    # back to the most recently written manifest.*.json — on a project with
+    # build variants that is whichever variant was indexed last, so the count
+    # returned for variant A could describe variant B's translation units and
+    # header hashes, and get cached under A's key.  A missing manifest for
+    # this build means there is no header-hash data for it, which is exactly
+    # "no header staleness known" rather than someone else's answer.
+    manifest = load_manifest(db_path.parent, config_hash)
     if not manifest:
         return 0, []
 
     project_root = Path(manifest.get("project_root", str(root)))
-    vendor_patterns = list(_build_sdk_excludes(project_root))
+    # No vendor set is needed here any more: header_is_trusted() is the one
+    # rule, and it reads `generated` alone.  This layer used to derive its
+    # own set, which differed from the indexer's — it has no compiler flags —
+    # and the narrower answer made this check re-hash headers the indexer had
+    # trusted.  maintenance.py turned that into "stale": true and asked for a
+    # reindex that could not clear it.
 
     stale_count = 0
     affected: list[str] = []
 
+    # Resolved per entry rather than for the whole manifest: only the first
+    # *max_files* entries are examined, and on a large project that is a small
+    # fraction of them.
+    header_table = manifest.get("headers")
     for entry in manifest.get("entries", [])[:max_files]:
-        stale, _ = check_tu_staleness(entry, project_root, vendor_patterns)
+        stale, _ = check_tu_staleness(
+            entry, project_root,
+            headers=resolve_headers(entry, header_table),
+        )
         if stale:
             stale_count += 1
             affected.append(entry["file"])

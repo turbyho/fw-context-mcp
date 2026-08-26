@@ -1117,7 +1117,7 @@ class TestStoreSymbolsForUnitAnalysisRestore:
 
         # Create a mock unit and pre-parsed data for the SAME file
         from fw_context_mcp.indexer.compile_commands import CompilationUnit
-        from fw_context_mcp.indexer.symbols import Symbol
+        from fw_context_mcp.indexer.symbols import ExtractionResult, Symbol
 
         unit = CompilationUnit(
             file=Path(src_file),
@@ -1160,7 +1160,7 @@ class TestStoreSymbolsForUnitAnalysisRestore:
                 vendor_patterns=[],
                 project_patterns=[],
                 index_refs=False,
-                pre_parsed=([sym], [], [], [], []),
+                pre_parsed=ExtractionResult(symbols=[sym]),
             )
 
         assert syms_added == 1
@@ -1233,7 +1233,7 @@ class TestStoreSymbolsForUnitAnalysisRestore:
         src_file.write_text("int bar(int x) {\n    return x * 3;\n}\n", encoding="utf-8")
 
         from fw_context_mcp.indexer.compile_commands import CompilationUnit
-        from fw_context_mcp.indexer.symbols import Symbol
+        from fw_context_mcp.indexer.symbols import ExtractionResult, Symbol
 
         unit = CompilationUnit(
             file=Path(src_file),
@@ -1271,7 +1271,7 @@ class TestStoreSymbolsForUnitAnalysisRestore:
                 vendor_patterns=[],
                 project_patterns=[],
                 index_refs=False,
-                pre_parsed=([sym], [], [], [], []),
+                pre_parsed=ExtractionResult(symbols=[sym]),
             )
 
         assert syms_added == 1
@@ -1337,7 +1337,7 @@ class TestStoreSymbolsForUnitAnalysisRestore:
         assert ana_before == 0
 
         from fw_context_mcp.indexer.compile_commands import CompilationUnit
-        from fw_context_mcp.indexer.symbols import Symbol
+        from fw_context_mcp.indexer.symbols import ExtractionResult, Symbol
 
         unit = CompilationUnit(
             file=Path(src_file),
@@ -1374,7 +1374,7 @@ class TestStoreSymbolsForUnitAnalysisRestore:
                 vendor_patterns=[],
                 project_patterns=[],
                 index_refs=False,
-                pre_parsed=([sym], [], [], [], []),
+                pre_parsed=ExtractionResult(symbols=[sym]),
             )
 
         assert syms_added == 1
@@ -1468,7 +1468,7 @@ class TestStoreSymbolsForUnitAnalysisRestore:
                 _os2.environ["HOME"] = _saved_home2
 
         from fw_context_mcp.indexer.compile_commands import CompilationUnit
-        from fw_context_mcp.indexer.symbols import Symbol
+        from fw_context_mcp.indexer.symbols import ExtractionResult, Symbol
 
         unit = CompilationUnit(
             file=Path(src_file),
@@ -1505,7 +1505,7 @@ class TestStoreSymbolsForUnitAnalysisRestore:
                 vendor_patterns=[],
                 project_patterns=[],
                 index_refs=False,
-                pre_parsed=([sym], [], [], [], []),
+                pre_parsed=ExtractionResult(symbols=[sym]),
             )
 
         # Check denormalized columns on symbols
@@ -2280,10 +2280,20 @@ int sensor_read(void) {
             )
             print(f"  New config_hash: {config_hash_new[:16]}…")
 
-            # ── Verify: utils.c definitions gone from the NEW build config ──
+            # ── Verify: utils.c definitions gone ──
             # Note: declarations from utils.h (included by main.c) may still
-            # appear under the new config_hash — only definitions should be gone.
-            assert config_hash_new != ch_before, "config_hash should change when cc.json changes"
+            # appear — only definitions from the removed TU should be gone.
+            #
+            # The build identity does NOT change: config_hash names the
+            # compilation dialect, and dropping a source file does not alter
+            # it.  The removed file's rows are collected by the coverage purge
+            # instead, which compares the files table against the build's
+            # actual file set.  Before that purge existed, this test passed by
+            # accident: the file list was part of config_hash, so a removal
+            # minted a whole new build and the old one was retired.
+            assert config_hash_new == ch_before, (
+                "dropping a source file must not change the build identity"
+            )
             conn = open_db(db_path)
             try:
                 def_names = {
@@ -2752,3 +2762,1360 @@ class TestBgReindexEndToEnd:
         finally:
             conn.close()
             _invalidate_modified_cache(ch)
+
+
+# ── Header-change propagation ─────────────────────────────────────────
+
+
+def _index_cli(project_root: Path, *extra: str) -> subprocess.CompletedProcess:
+    """Run the incremental indexer the way the background daemon does.
+
+    The daemon spawns ``fw-context index --background`` — no ``--force``.
+    These tests pass ``compile_commands.json`` explicitly because the test
+    project has no detectable build system.
+    """
+    return _cli(
+        [
+            "index",
+            "--no-refs",
+            "--no-analyze",
+            "--no-embeddings",
+            *extra,
+            str(project_root / "compile_commands.json"),
+        ],
+        cwd=project_root,
+    )
+
+
+def _symbol_row(conn, config_hash: str, name: str):
+    """Return the single symbol row for *name*, or None."""
+    return conn.execute(
+        "SELECT name, file_path, line, end_line FROM symbols WHERE config_hash=? AND name=?",
+        (config_hash, name),
+    ).fetchone()
+
+
+def _indexed_content(conn, config_hash: str, path_suffix: str) -> str:
+    """Return the ifdef-filtered content stored for a file (empty when absent)."""
+    row = conn.execute(
+        "SELECT content FROM files WHERE config_hash=? AND path LIKE ? LIMIT 1",
+        (config_hash, f"%{path_suffix}"),
+    ).fetchone()
+    return (row["content"] or "") if row else ""
+
+
+def _manifest_file(db_path: Path) -> Path:
+    """Return the single manifest.<config_hash>.json for the project index."""
+    manifests = sorted(db_path.parent.glob("manifest.*.json"))
+    assert len(manifests) == 1, f"expected exactly one manifest, found {manifests}"
+    return manifests[0]
+
+
+@pytest.mark.libclang
+class TestHeaderChangePropagation:
+    """A header is not a translation unit — its changes must still reach the index.
+
+    Covers four defects that together froze header symbols at their
+    first-index state:
+
+    - **D1** the mtime fast-path only looked at the TU's own file, so a
+      header change re-parsed nothing.
+    - **D2** the manifest and the stored header mtimes were refreshed even
+      for TUs that were never re-parsed, erasing the staleness signal.
+    - **D3** ``files.content`` (backing ``read_file`` / ``search_content``)
+      was written once and never refreshed.
+    - **D4** symbols owned by a header were never deleted before re-insert,
+      so ``ON CONFLICT(config_hash, usr)`` silently dropped the fresh rows.
+    """
+
+    def test_header_only_change_reaches_the_index(self, indexed_project: Path):
+        """A declaration added to a header appears after an incremental run. (D1)"""
+        db_path = _db_path_for_project(indexed_project)
+        modem_h = indexed_project / "src" / "modem.h"
+        modem_h.write_text(
+            modem_h.read_text(encoding="utf-8").replace(
+                "#endif", "int modem_brand_new_symbol(int x);\n\n#endif"
+            ),
+            encoding="utf-8",
+        )
+        _advance_mtime(modem_h, 5.0)
+
+        result = _index_cli(indexed_project)
+        assert result.returncode == 0, result.stderr
+
+        conn = open_db(db_path)
+        try:
+            ch = _config_hash(conn)
+            row = _symbol_row(conn, ch, "modem_brand_new_symbol")
+            assert row is not None, (
+                "header-only change never reached the index\n" + result.stderr[-2000:]
+            )
+        finally:
+            conn.close()
+
+    def test_header_change_reparses_every_dependent_tu(self, indexed_project: Path):
+        """modem.h is included by main.c and modem.c — both must be re-parsed. (D1)
+
+        Only re-parsing one of them would leave the other TU's copy of the
+        header symbols behind, and ``ON CONFLICT`` would then keep the stale
+        rows alive.
+        """
+        modem_h = indexed_project / "src" / "modem.h"
+        modem_h.write_text(
+            modem_h.read_text(encoding="utf-8").replace(
+                "#endif", "int modem_fanout_probe(void);\n\n#endif"
+            ),
+            encoding="utf-8",
+        )
+        _advance_mtime(modem_h, 5.0)
+
+        result = _index_cli(indexed_project)
+        assert result.returncode == 0, result.stderr
+        assert "2 updated, 1 unchanged" in result.stderr, (
+            "expected main.c + modem.c re-parsed and utils.c skipped\n"
+            + result.stderr[-2000:]
+        )
+
+    def test_removed_header_declaration_is_purged(self, indexed_project: Path):
+        """A declaration deleted from a header must not survive in the index. (D4)"""
+        db_path = _db_path_for_project(indexed_project)
+        modem_h = indexed_project / "src" / "modem.h"
+        original = modem_h.read_text(encoding="utf-8")
+
+        # Seed: add the declaration and index it in.
+        modem_h.write_text(
+            original.replace("#endif", "int modem_doomed_symbol(void);\n\n#endif"),
+            encoding="utf-8",
+        )
+        _advance_mtime(modem_h, 5.0)
+        assert _index_cli(indexed_project, "--force").returncode == 0
+
+        conn = open_db(db_path)
+        try:
+            ch = _config_hash(conn)
+            assert _symbol_row(conn, ch, "modem_doomed_symbol") is not None, "seed failed"
+        finally:
+            conn.close()
+
+        # Remove it again — an incremental run must drop the row.
+        modem_h.write_text(original, encoding="utf-8")
+        _advance_mtime(modem_h, 10.0)
+        result = _index_cli(indexed_project)
+        assert result.returncode == 0, result.stderr
+
+        conn = open_db(db_path)
+        try:
+            ch = _config_hash(conn)
+            assert _symbol_row(conn, ch, "modem_doomed_symbol") is None, (
+                "symbol deleted from the header survived the reindex\n"
+                + result.stderr[-2000:]
+            )
+        finally:
+            conn.close()
+
+    def test_header_definition_line_is_refreshed(self, indexed_project: Path):
+        """An inline definition inside a header must follow its new position. (D1 + D4)
+
+        The old row lives under the header's own ``file_id`` and carries
+        ``is_definition=1``, so nothing deleted it and the ON CONFLICT guard
+        rejected the fresh row — the line number froze at the first index.
+        """
+        db_path = _db_path_for_project(indexed_project)
+        util_h = indexed_project / "src" / "inline_util.h"
+        _write_file(
+            util_h,
+            "#ifndef INLINE_UTIL_H\n"
+            "#define INLINE_UTIL_H\n"
+            "\n"
+            "static inline int iu_double(int x) {\n"
+            "    return x * 2;\n"
+            "}\n"
+            "\n"
+            "#endif\n",
+        )
+        main_c = indexed_project / "src" / "main.c"
+        main_c.write_text(
+            main_c.read_text(encoding="utf-8").replace(
+                '#include "utils.h"', '#include "utils.h"\n#include "inline_util.h"'
+            ),
+            encoding="utf-8",
+        )
+        _advance_mtime(main_c, 5.0)
+        assert _index_cli(indexed_project, "--force").returncode == 0
+
+        conn = open_db(db_path)
+        try:
+            ch = _config_hash(conn)
+            before = _symbol_row(conn, ch, "iu_double")
+            assert before is not None, "seed failed — iu_double not indexed"
+            line_before = before["line"]
+        finally:
+            conn.close()
+
+        # Push the definition down by five lines.  Only the header changes.
+        util_h.write_text(
+            util_h.read_text(encoding="utf-8").replace(
+                "static inline", "\n\n\n\n\nstatic inline"
+            ),
+            encoding="utf-8",
+        )
+        _advance_mtime(util_h, 10.0)
+        result = _index_cli(indexed_project)
+        assert result.returncode == 0, result.stderr
+
+        conn = open_db(db_path)
+        try:
+            ch = _config_hash(conn)
+            after = _symbol_row(conn, ch, "iu_double")
+            assert after is not None, "iu_double disappeared after reindex"
+            assert after["line"] == line_before + 5, (
+                f"header definition kept a stale line: {after['line']} "
+                f"(expected {line_before + 5})\n" + result.stderr[-2000:]
+            )
+        finally:
+            conn.close()
+
+    def test_source_change_refreshes_indexed_content(self, indexed_project: Path):
+        """``files.content`` must follow the disk — read_file/search_content use it. (D3)"""
+        db_path = _db_path_for_project(indexed_project)
+        utils_c = indexed_project / "src" / "utils.c"
+        utils_c.write_text(
+            utils_c.read_text(encoding="utf-8").replace(
+                "int sum = 0;", "int sum = 0;\n    sum += 0; /* MARKER_D3 */"
+            ),
+            encoding="utf-8",
+        )
+        _advance_mtime(utils_c, 5.0)
+
+        result = _index_cli(indexed_project)
+        assert result.returncode == 0, result.stderr
+
+        conn = open_db(db_path)
+        try:
+            ch = _config_hash(conn)
+            assert "MARKER_D3" in _indexed_content(conn, ch, "utils.c"), (
+                "indexed content still holds the pre-change text\n"
+                + result.stderr[-2000:]
+            )
+        finally:
+            conn.close()
+
+    def test_noop_run_does_not_rewrite_manifest(self, indexed_project: Path):
+        """With nothing changed, the manifest must stay untouched. (D2)
+
+        Rewriting it would stamp current header hashes onto TUs that were
+        never re-parsed — the index would then believe it is up to date.
+        Skipping the rewrite also skips a libclang parse per unchanged TU,
+        which is what makes a no-op background run cheap.
+        """
+        db_path = _db_path_for_project(indexed_project)
+        manifest = _manifest_file(db_path)
+        before_bytes = manifest.read_bytes()
+        before_mtime = manifest.stat().st_mtime_ns
+
+        result = _index_cli(indexed_project)
+        assert result.returncode == 0, result.stderr
+        assert "0 updated" in result.stderr, result.stderr[-2000:]
+        assert manifest.read_bytes() == before_bytes, "manifest content changed on a no-op run"
+        assert manifest.stat().st_mtime_ns == before_mtime, (
+            "manifest was rewritten on a no-op run\n" + result.stderr[-2000:]
+        )
+        assert "from tu_headers" not in result.stderr, (
+            "unchanged TUs still contributed header hashes\n" + result.stderr[-2000:]
+        )
+
+
+# ── Header-scoped row cleanup (refs / macros) ─────────────────────────
+
+
+def _index_cli_refs(project_root: Path, *extra: str) -> subprocess.CompletedProcess:
+    """Run the incremental indexer with cross-reference indexing enabled.
+
+    ``_index_cli`` passes ``--no-refs`` to keep the other tests fast.  The
+    refs and indirect-call-site tests need the reference walk, so this
+    variant leaves it on.
+    """
+    return _cli(
+        [
+            "index",
+            "--no-analyze",
+            "--no-embeddings",
+            *extra,
+            str(project_root / "compile_commands.json"),
+        ],
+        cwd=project_root,
+    )
+
+
+def _include_from_main(project_root: Path, header_name: str) -> None:
+    """Add ``#include "<header_name>"`` to main.c after the utils.h include."""
+    main_c = project_root / "src" / "main.c"
+    main_c.write_text(
+        main_c.read_text(encoding="utf-8").replace(
+            '#include "utils.h"', f'#include "utils.h"\n#include "{header_name}"'
+        ),
+        encoding="utf-8",
+    )
+
+
+def _refs_from(conn, config_hash: str, path_suffix: str) -> list:
+    """Return every refs row that originates in a file with this path suffix."""
+    return conn.execute(
+        "SELECT from_file, from_line, to_usr, ref_kind FROM refs "
+        "WHERE config_hash=? AND from_file LIKE ? ORDER BY from_line",
+        (config_hash, f"%{path_suffix}"),
+    ).fetchall()
+
+
+def _ics_from(conn, config_hash: str, path_suffix: str) -> list:
+    """Return every indirect_call_sites row originating in this file."""
+    return conn.execute(
+        "SELECT from_file, from_line, target_name FROM indirect_call_sites "
+        "WHERE config_hash=? AND from_file LIKE ? ORDER BY from_line",
+        (config_hash, f"%{path_suffix}"),
+    ).fetchall()
+
+
+def _macro_lines(conn, config_hash: str, name: str) -> list[int]:
+    """Return the line of every macro row stored under *name*."""
+    rows = conn.execute(
+        "SELECT line FROM macros WHERE config_hash=? AND name=? ORDER BY line",
+        (config_hash, name),
+    ).fetchall()
+    return [r["line"] for r in rows]
+
+
+@pytest.mark.libclang
+class TestHeaderScopedRowCleanup:
+    """Rows owned by a header must be cleaned when the header is re-parsed.
+
+    Code inside an inline function in a header stores its rows under the
+    HEADER's path / file_id.  The cleanup used to delete refs, indirect call
+    sites, function pointer assignments and macros by the *translation
+    unit's* key only, so nothing removed them:
+
+    - a call removed from a header kept its refs row, so ``find_callers``
+      reported a caller that no longer exists.  A call that only moved got a
+      second row, because ``idx_refs_unique`` includes ``from_line``.
+    - a ``#define`` removed from a header kept its macros row.  One that
+      moved got a second row, because the UNIQUE key is
+      ``(config_hash, file_id, line)``.
+
+    ``replace_file_data()`` now clears everything a file owns from its file
+    id alone, so these cases have one implementation to get right instead of
+    three.
+    """
+
+    def test_removed_header_call_drops_its_ref(self, c_project: Path):
+        """A call deleted from an inline header function must lose its ref. (D5)"""
+        db_path = _db_path_for_project(c_project)
+        hdr = c_project / "src" / "inline_ref.h"
+        _write_file(
+            hdr,
+            "#ifndef INLINE_REF_H\n"
+            "#define INLINE_REF_H\n"
+            '#include "modem.h"\n'
+            "\n"
+            "static inline int ir_probe(void) {\n"
+            '    return modem_send("x", 1);\n'
+            "}\n"
+            "\n"
+            "#endif\n",
+        )
+        _include_from_main(c_project, "inline_ref.h")
+        assert _index_cli_refs(c_project).returncode == 0
+
+        conn = open_db(db_path)
+        try:
+            ch = _config_hash(conn)
+            assert _refs_from(conn, ch, "inline_ref.h"), "seed failed — no ref from the header"
+        finally:
+            conn.close()
+
+        # Drop the call.  Only the header changes.
+        hdr.write_text(
+            hdr.read_text(encoding="utf-8").replace('return modem_send("x", 1);', "return 0;"),
+            encoding="utf-8",
+        )
+        _advance_mtime(hdr, 10.0)
+        result = _index_cli_refs(c_project)
+        assert result.returncode == 0, result.stderr
+
+        conn = open_db(db_path)
+        try:
+            ch = _config_hash(conn)
+            stale = _refs_from(conn, ch, "inline_ref.h")
+            assert stale == [], (
+                f"refs from the header survived its rewrite: {[dict(r) for r in stale]}\n"
+                + result.stderr[-2000:]
+            )
+        finally:
+            conn.close()
+
+    def test_moved_header_call_leaves_no_duplicate_ref(self, c_project: Path):
+        """A call that only moved must not gain extra refs rows. (D5)
+
+        One call site legitimately produces two rows — ``ref_kind='call'``
+        and ``ref_kind='ref'``.  The count must stay at two after the move;
+        four rows would mean the pre-move pair survived, because
+        ``idx_refs_unique`` includes ``from_line``.
+        """
+        db_path = _db_path_for_project(c_project)
+        hdr = c_project / "src" / "inline_ref.h"
+        _write_file(
+            hdr,
+            "#ifndef INLINE_REF_H\n"
+            "#define INLINE_REF_H\n"
+            '#include "modem.h"\n'
+            "\n"
+            "static inline int ir_probe(void) {\n"
+            '    return modem_send("x", 1);\n'
+            "}\n"
+            "\n"
+            "#endif\n",
+        )
+        _include_from_main(c_project, "inline_ref.h")
+        assert _index_cli_refs(c_project).returncode == 0
+
+        conn = open_db(db_path)
+        try:
+            ch = _config_hash(conn)
+            before = _refs_from(conn, ch, "inline_ref.h")
+            lines_before = {r["from_line"] for r in before}
+            assert len(lines_before) == 1, (
+                f"seed expected one call site, got {[dict(r) for r in before]}"
+            )
+            count_before = len(before)
+            line_before = lines_before.pop()
+        finally:
+            conn.close()
+
+        # Push the inline function down by five lines.
+        hdr.write_text(
+            hdr.read_text(encoding="utf-8").replace(
+                "static inline", "\n\n\n\n\nstatic inline"
+            ),
+            encoding="utf-8",
+        )
+        _advance_mtime(hdr, 10.0)
+        result = _index_cli_refs(c_project)
+        assert result.returncode == 0, result.stderr
+
+        conn = open_db(db_path)
+        try:
+            ch = _config_hash(conn)
+            after = _refs_from(conn, ch, "inline_ref.h")
+            assert len(after) == count_before, (
+                f"the moved call left duplicate refs rows: {[dict(r) for r in after]}\n"
+                + result.stderr[-2000:]
+            )
+            assert {r["from_line"] for r in after} == {line_before + 5}, (
+                f"refs kept a stale line: {sorted(r['from_line'] for r in after)} "
+                f"(expected {line_before + 5})"
+            )
+        finally:
+            conn.close()
+
+    def test_repeated_reindex_does_not_pile_up_header_call_sites(self, c_project: Path):
+        """A fn-pointer call in a header must not gain a row per reindex. (D5)
+
+        ``indirect_call_sites`` carries no unique constraint — a field can
+        legitimately be invoked many times from one line — so nothing stops
+        duplicates.  Three reindexes of an unchanged call site must leave the
+        row count where it started.
+        """
+        db_path = _db_path_for_project(c_project)
+        hdr = c_project / "src" / "fnptr_hdr.h"
+
+        def header_text(round_no: int) -> str:
+            """Header whose content changes per round, call site line fixed.
+
+            An identical rewrite is NOT enough: the indexer compares content
+            hashes, so a header with unchanged text never triggers a reparse
+            of its TUs.  The marker comment changes the hash while keeping the
+            line count — and therefore the call site's ``from_line`` — stable,
+            so a pile-up is the only way the row count can grow.
+            """
+            return (
+                "#ifndef FNPTR_HDR_H\n"
+                "#define FNPTR_HDR_H\n"
+                f"/* revision {round_no:04d} */\n"
+                "\n"
+                "typedef struct {\n"
+                "    int (*on_data)(const char* buf, int len);\n"
+                "} fh_driver_t;\n"
+                "\n"
+                "static inline int fh_dispatch(fh_driver_t* d, const char* buf, int len) {\n"
+                "    return d->on_data(buf, len);\n"
+                "}\n"
+                "\n"
+                "#endif\n"
+            )
+
+        _write_file(hdr, header_text(0))
+        _include_from_main(c_project, "fnptr_hdr.h")
+        assert _index_cli_refs(c_project).returncode == 0
+
+        conn = open_db(db_path)
+        try:
+            ch = _config_hash(conn)
+            baseline = _ics_from(conn, ch, "fnptr_hdr.h")
+            assert baseline, "seed failed — no indirect call site from the header"
+            count_baseline = len(baseline)
+            line_baseline = {r["from_line"] for r in baseline}
+        finally:
+            conn.close()
+
+        for round_no in range(1, 4):
+            hdr.write_text(header_text(round_no), encoding="utf-8")
+            _advance_mtime(hdr, 10.0 * round_no)
+            result = _index_cli_refs(c_project)
+            assert result.returncode == 0, result.stderr
+            assert "unchanged" not in result.stderr or "updated" in result.stderr, (
+                f"round {round_no}: nothing was re-parsed, the test proves nothing\n"
+                + result.stderr[-2000:]
+            )
+
+            conn = open_db(db_path)
+            try:
+                ch = _config_hash(conn)
+                rows = _ics_from(conn, ch, "fnptr_hdr.h")
+                assert {r["from_line"] for r in rows} == line_baseline, (
+                    f"round {round_no}: the call site moved — the marker comment "
+                    f"changed the line count\n{[dict(r) for r in rows]}"
+                )
+                assert len(rows) == count_baseline, (
+                    f"round {round_no}: call sites piled up — "
+                    f"{len(rows)} rows, expected {count_baseline}: "
+                    f"{[dict(r) for r in rows]}\n" + result.stderr[-2000:]
+                )
+            finally:
+                conn.close()
+
+    def test_removed_header_macro_is_purged(self, c_project: Path):
+        """A ``#define`` deleted from a header must not survive. (D6)"""
+        db_path = _db_path_for_project(c_project)
+        hdr = c_project / "src" / "macro_hdr.h"
+        _write_file(
+            hdr,
+            "#ifndef MACRO_HDR_H\n"
+            "#define MACRO_HDR_H\n"
+            "\n"
+            "#define MH_DOOMED 1\n"
+            "\n"
+            "#endif\n",
+        )
+        _include_from_main(c_project, "macro_hdr.h")
+        assert _index_cli(c_project).returncode == 0
+
+        conn = open_db(db_path)
+        try:
+            ch = _config_hash(conn)
+            assert _macro_lines(conn, ch, "MH_DOOMED"), "seed failed — macro not indexed"
+        finally:
+            conn.close()
+
+        hdr.write_text(
+            hdr.read_text(encoding="utf-8").replace("#define MH_DOOMED 1\n", ""),
+            encoding="utf-8",
+        )
+        _advance_mtime(hdr, 10.0)
+        result = _index_cli(c_project)
+        assert result.returncode == 0, result.stderr
+
+        conn = open_db(db_path)
+        try:
+            ch = _config_hash(conn)
+            assert _macro_lines(conn, ch, "MH_DOOMED") == [], (
+                "a macro deleted from the header survived the reindex\n"
+                + result.stderr[-2000:]
+            )
+        finally:
+            conn.close()
+
+    def test_moved_header_macro_leaves_no_duplicate(self, c_project: Path):
+        """A ``#define`` that only moved must end up with exactly one row. (D6)"""
+        db_path = _db_path_for_project(c_project)
+        hdr = c_project / "src" / "macro_hdr.h"
+        _write_file(
+            hdr,
+            "#ifndef MACRO_HDR_H\n"
+            "#define MACRO_HDR_H\n"
+            "\n"
+            "#define MH_MOVED 1\n"
+            "\n"
+            "#endif\n",
+        )
+        _include_from_main(c_project, "macro_hdr.h")
+        assert _index_cli(c_project).returncode == 0
+
+        conn = open_db(db_path)
+        try:
+            ch = _config_hash(conn)
+            lines_before = _macro_lines(conn, ch, "MH_MOVED")
+            assert len(lines_before) == 1, f"seed expected one macro row, got {lines_before}"
+        finally:
+            conn.close()
+
+        hdr.write_text(
+            hdr.read_text(encoding="utf-8").replace(
+                "#define MH_MOVED 1", "\n\n\n\n\n#define MH_MOVED 1"
+            ),
+            encoding="utf-8",
+        )
+        _advance_mtime(hdr, 10.0)
+        result = _index_cli(c_project)
+        assert result.returncode == 0, result.stderr
+
+        conn = open_db(db_path)
+        try:
+            ch = _config_hash(conn)
+            lines_after = _macro_lines(conn, ch, "MH_MOVED")
+            assert lines_after == [lines_before[0] + 5], (
+                f"the moved macro left a duplicate row: {lines_after}\n"
+                + result.stderr[-2000:]
+            )
+        finally:
+            conn.close()
+
+
+# ── Build retention ───────────────────────────────────────────────────
+
+
+def _add_tu_to_compile_commands(project_root: Path, name: str) -> None:
+    """Add one more translation unit to the project and its compile_commands.
+
+    Note this does NOT change ``config_hash`` — that hash identifies the
+    compilation dialect, not the file set.  Use :func:`_change_build_dialect`
+    when a test needs a new build identity.
+    """
+    import json
+
+    src = project_root / "src"
+    _write_file(src / name, f"int {Path(name).stem}_fn(void) {{ return 1; }}\n")
+    cc_json = project_root / "compile_commands.json"
+    cc = json.loads(cc_json.read_text(encoding="utf-8"))
+    cc.append({
+        "directory": str(src),
+        "file": name,
+        "arguments": [
+            "gcc", "-std=c11", "-O2", "-Isrc", "-c", name,
+            "-o", f"build/{Path(name).stem}.o",
+        ],
+    })
+    cc_json.write_text(json.dumps(cc, indent=2), encoding="utf-8")
+
+
+def _change_build_dialect(project_root: Path, define: str) -> None:
+    """Add a ``-D`` macro to every entry, minting a new ``config_hash``.
+
+    A macro flips ``#ifdef``, so it can change what the same source text
+    compiles to — that is what makes a different build.  Adding or removing a
+    source file does not.
+    """
+    import json
+
+    cc_json = project_root / "compile_commands.json"
+    cc = json.loads(cc_json.read_text(encoding="utf-8"))
+    for entry in cc:
+        entry["arguments"] = [*entry["arguments"], f"-D{define}"]
+    cc_json.write_text(json.dumps(cc, indent=2), encoding="utf-8")
+
+
+def _build_hashes(conn) -> list[str]:
+    """Return every config_hash in build_configs, oldest first."""
+    return [
+        r["config_hash"]
+        for r in conn.execute(
+            "SELECT config_hash FROM build_configs ORDER BY created_at, rowid"
+        ).fetchall()
+    ]
+
+
+@pytest.mark.libclang
+class TestBuildRetention:
+    """A reindex must not leave its predecessor's build in the database.
+
+    ``_step_cleanup_old_builds`` guards on the ``reindex.pause`` marker so it
+    never deletes a build another process is still serving.  It used to test
+    ``PidFile.is_active``, but ``fw-context index`` writes that marker with
+    its OWN pid for the whole run — so the guard was always true and
+    retention never ran once.  Every reindex silently kept the previous
+    build: symbols, macros, refs and file content, for every config_hash the
+    project ever had.
+    """
+
+    def test_old_build_is_deleted_after_a_config_change(self, c_project: Path):
+        """One build per (variant, image) slot survives a config_hash change."""
+        db_path = _db_path_for_project(c_project)
+        assert _index_cli(c_project).returncode == 0
+
+        conn = open_db(db_path)
+        try:
+            before = _build_hashes(conn)
+            assert len(before) == 1, f"expected one build after the first index, got {before}"
+        finally:
+            conn.close()
+
+        _change_build_dialect(c_project, "RETENTION_PROBE=1")
+        result = _index_cli(c_project)
+        assert result.returncode == 0, result.stderr
+
+        conn = open_db(db_path)
+        try:
+            after = _build_hashes(conn)
+            assert len(after) == 1, (
+                f"retention did not run — old build(s) left behind: {after}\n"
+                + result.stderr[-2000:]
+            )
+            assert after[0] != before[0], "the surviving build should be the new one"
+        finally:
+            conn.close()
+
+    def test_old_build_leaves_no_files_on_disk(self, c_project: Path):
+        """A retired build takes both of its on-disk artifacts with it.
+
+        The manifest used to be left behind.  Nothing reads an abandoned
+        build's manifest since the reuse tier was removed, so it was pure
+        accumulation — one file per dialect change, and 52 MB of it on
+        zbox-ecb-fw.  It also made ``manifest.load(db_dir)`` ambiguous: that
+        form picks the most recently modified manifest in the directory.
+        """
+        db_path = _db_path_for_project(c_project)
+        assert _index_cli(c_project).returncode == 0
+
+        conn = open_db(db_path)
+        try:
+            old_hash = _build_hashes(conn)[0]
+        finally:
+            conn.close()
+        assert (db_path.parent / f"manifest.{old_hash}.json").exists(), "seed failed"
+
+        _change_build_dialect(c_project, "ARTIFACT_PROBE=1")
+        result = _index_cli(c_project)
+        assert result.returncode == 0, result.stderr
+
+        leftovers = sorted(
+            p.name for p in db_path.parent.glob(f"*.{old_hash}.json")
+        )
+        assert leftovers == [], (
+            f"artifacts of the retired build survived: {leftovers}\n"
+            + result.stderr[-2000:]
+        )
+        remaining = sorted(p.name for p in db_path.parent.glob("manifest.*.json"))
+        assert len(remaining) == 1, (
+            f"expected exactly one manifest after retention, found {remaining}"
+        )
+
+    def test_old_build_leaves_no_rows_behind(self, c_project: Path):
+        """Deleting a build must take its rows with it, not just its row in
+        ``build_configs`` — otherwise the tables grow without bound."""
+        db_path = _db_path_for_project(c_project)
+        assert _index_cli(c_project).returncode == 0
+
+        conn = open_db(db_path)
+        try:
+            old_hash = _build_hashes(conn)[0]
+        finally:
+            conn.close()
+
+        _change_build_dialect(c_project, "RETENTION_PROBE=1")
+        result = _index_cli(c_project)
+        assert result.returncode == 0, result.stderr
+
+        conn = open_db(db_path)
+        try:
+            leftovers = {
+                table: conn.execute(
+                    f"SELECT COUNT(*) FROM {table} WHERE config_hash=?",  # noqa: S608
+                    (old_hash,),
+                ).fetchone()[0]
+                for table in ("files", "symbols", "macros", "refs")
+            }
+            assert all(n == 0 for n in leftovers.values()), (
+                f"rows of the deleted build survived: {leftovers}\n"
+                + result.stderr[-2000:]
+            )
+        finally:
+            conn.close()
+
+
+# ── Coverage purge ────────────────────────────────────────────────────
+
+
+def _file_row(conn, config_hash: str, path_suffix: str):
+    """Return the files row whose path ends with *path_suffix*, or None."""
+    return conn.execute(
+        "SELECT id, path, content FROM files WHERE config_hash=? AND path LIKE ? LIMIT 1",
+        (config_hash, f"%{path_suffix}"),
+    ).fetchone()
+
+
+@pytest.mark.libclang
+class TestCoveragePurge:
+    """A file that leaves the build must leave the index with it.
+
+    ``config_hash`` names the compilation dialect, so dropping a source file
+    no longer mints a new build — nothing else notices it left.
+    ``purge_missing`` only looks for files gone from DISK, and
+    ``delete_orphan_files`` only removes rows that already have no symbols, no
+    macros and empty content.  Without a coverage purge the file keeps its
+    symbols, macros, refs and indexed content for the life of the index.
+    """
+
+    def test_removed_tu_leaves_no_rows(self, c_project: Path):
+        """A TU dropped from compile_commands.json keeps nothing behind."""
+        db_path = _db_path_for_project(c_project)
+        _add_tu_to_compile_commands(c_project, "doomed.c")
+        assert _index_cli(c_project).returncode == 0
+
+        conn = open_db(db_path)
+        try:
+            ch = _config_hash(conn)
+            row = _file_row(conn, ch, "doomed.c")
+            assert row is not None, "seed failed — doomed.c was not indexed"
+            assert _symbol_row(conn, ch, "doomed_fn") is not None, "seed failed"
+        finally:
+            conn.close()
+
+        # Drop it from the build; the file stays on disk, so purge_missing
+        # cannot be what cleans it up.
+        import json
+
+        cc_json = c_project / "compile_commands.json"
+        cc = [e for e in json.loads(cc_json.read_text(encoding="utf-8"))
+              if e["file"] != "doomed.c"]
+        cc_json.write_text(json.dumps(cc, indent=2), encoding="utf-8")
+        assert (c_project / "src" / "doomed.c").exists(), "the file must stay on disk"
+
+        result = _index_cli(c_project)
+        assert result.returncode == 0, result.stderr
+
+        conn = open_db(db_path)
+        try:
+            ch = _config_hash(conn)
+            assert _file_row(conn, ch, "doomed.c") is None, (
+                "files row of a TU no longer in the build survived\n"
+                + result.stderr[-2000:]
+            )
+            assert _symbol_row(conn, ch, "doomed_fn") is None, (
+                "symbols of a TU no longer in the build survived\n"
+                + result.stderr[-2000:]
+            )
+        finally:
+            conn.close()
+
+    def test_headers_still_included_elsewhere_survive(self, c_project: Path):
+        """Purging one TU must not take a header another TU still includes.
+
+        modem.h is included by both main.c and modem.c.  Dropping modem.c must
+        leave modem.h — and its symbols — in place.
+        """
+        db_path = _db_path_for_project(c_project)
+        assert _index_cli(c_project).returncode == 0
+
+        import json
+
+        cc_json = c_project / "compile_commands.json"
+        cc = [e for e in json.loads(cc_json.read_text(encoding="utf-8"))
+              if e["file"] != "modem.c"]
+        cc_json.write_text(json.dumps(cc, indent=2), encoding="utf-8")
+
+        result = _index_cli(c_project)
+        assert result.returncode == 0, result.stderr
+
+        conn = open_db(db_path)
+        try:
+            ch = _config_hash(conn)
+            assert _file_row(conn, ch, "modem.h") is not None, (
+                "a header still included by main.c was purged\n"
+                + result.stderr[-2000:]
+            )
+            assert _file_row(conn, ch, "modem.c") is None, (
+                "the dropped TU's own row survived\n" + result.stderr[-2000:]
+            )
+        finally:
+            conn.close()
+
+    def test_out_of_project_headers_are_not_collateral_damage(self, c_project: Path):
+        """SDK and system headers must survive a purge that targets a TU.
+
+        The purge deliberately covers vendor and SDK files too — a framework
+        upgrade replaces headers and the dropped ones must go with them — so
+        it can only be as correct as the manifest is complete.  Note this case
+        does NOT exercise the extension whitelist that made the manifest
+        incomplete: this fixture's system headers are all ``.h``, so they were
+        recorded either way.  ``TestManifestRecordsEveryInclude`` covers that.
+        """
+        db_path = _db_path_for_project(c_project)
+        assert _index_cli(c_project).returncode == 0
+
+        conn = open_db(db_path)
+        try:
+            ch = _config_hash(conn)
+            before = conn.execute(
+                "SELECT COUNT(*) FROM files WHERE config_hash=? AND path LIKE '/%'",
+                (ch,),
+            ).fetchone()[0]
+            assert before > 0, (
+                "seed failed — the fixture indexed no out-of-project headers, "
+                "so this test would prove nothing"
+            )
+        finally:
+            conn.close()
+
+        # A reindex that also drops a TU, so the purge definitely runs.
+        _add_tu_to_compile_commands(c_project, "transient.c")
+        assert _index_cli(c_project).returncode == 0
+        import json
+
+        cc_json = c_project / "compile_commands.json"
+        cc = [e for e in json.loads(cc_json.read_text(encoding="utf-8"))
+              if e["file"] != "transient.c"]
+        cc_json.write_text(json.dumps(cc, indent=2), encoding="utf-8")
+        result = _index_cli(c_project)
+        assert result.returncode == 0, result.stderr
+
+        conn = open_db(db_path)
+        try:
+            ch = _config_hash(conn)
+            after = conn.execute(
+                "SELECT COUNT(*) FROM files WHERE config_hash=? AND path LIKE '/%'",
+                (ch,),
+            ).fetchone()[0]
+            assert after == before, (
+                f"out-of-project headers were purged: {before} -> {after}\n"
+                + result.stderr[-2000:]
+            )
+            assert _file_row(conn, ch, "transient.c") is None, (
+                "the dropped in-project TU should still have been purged"
+            )
+        finally:
+            conn.close()
+
+    def test_untouched_build_purges_nothing(self, c_project: Path):
+        """A no-op reindex must not delete anything."""
+        db_path = _db_path_for_project(c_project)
+        assert _index_cli(c_project).returncode == 0
+
+        conn = open_db(db_path)
+        try:
+            ch = _config_hash(conn)
+            before = conn.execute(
+                "SELECT COUNT(*) FROM files WHERE config_hash=?", (ch,)
+            ).fetchone()[0]
+        finally:
+            conn.close()
+
+        result = _index_cli(c_project)
+        assert result.returncode == 0, result.stderr
+
+        conn = open_db(db_path)
+        try:
+            ch = _config_hash(conn)
+            after = conn.execute(
+                "SELECT COUNT(*) FROM files WHERE config_hash=?", (ch,)
+            ).fetchone()[0]
+            assert after == before, (
+                f"a no-op reindex changed the file count: {before} -> {after}\n"
+                + result.stderr[-2000:]
+            )
+        finally:
+            conn.close()
+
+
+# ── Dialect round trip ────────────────────────────────────────────────
+
+
+_GATED_HEADER = (
+    "#ifndef FEATURE_H\n"
+    "#define FEATURE_H\n"
+    "#ifdef FEATURE_ON\n"
+    "int feature_only_fn(void);\n"
+    "#else\n"
+    "int baseline_only_fn(void);\n"
+    "#endif\n"
+    "#endif\n"
+)
+
+
+def _gated_symbols(conn, config_hash: str) -> set[str]:
+    """Return whichever of the two #ifdef-gated declarations are indexed."""
+    return {
+        r["name"]
+        for r in conn.execute(
+            "SELECT name FROM symbols WHERE config_hash=? AND name LIKE '%_only_fn'",
+            (config_hash,),
+        ).fetchall()
+    }
+
+
+@pytest.mark.libclang
+class TestDialectRoundTrip:
+    """Returning to a previous dialect must be answered by parsing.
+
+    A ``-D`` change flips ``#ifdef``, so the stored rows of one dialect say
+    nothing about another.  Going back to a dialect whose rows retention
+    already deleted used to hit the "reuse" tier, which imported rows from
+    whatever other build was newest — ``_reassign_symbols_for_file`` selects
+    its source with ``ORDER BY rowid DESC`` and never checks that the dialect
+    matches.
+
+    The header below declares exactly one symbol per dialect, so the name
+    present tells you which dialect the stored rows came from.
+    """
+
+    def _setup(self, project_root: Path) -> None:
+        _write_file(project_root / "src" / "feature.h", _GATED_HEADER)
+        _include_from_main(project_root, "feature.h")
+
+    def test_gated_symbol_follows_the_current_dialect(self, c_project: Path):
+        db_path = _db_path_for_project(c_project)
+        self._setup(c_project)
+
+        assert _index_cli(c_project).returncode == 0
+        conn = open_db(db_path)
+        try:
+            assert _gated_symbols(conn, _config_hash(conn)) == {"baseline_only_fn"}, (
+                "seed failed — the #ifdef-gated declaration was not indexed"
+            )
+        finally:
+            conn.close()
+
+        # → dialect B
+        _change_build_dialect(c_project, "FEATURE_ON")
+        assert _index_cli(c_project).returncode == 0
+        conn = open_db(db_path)
+        try:
+            assert _gated_symbols(conn, _config_hash(conn)) == {"feature_only_fn"}, (
+                "the macro did not take effect — the test would prove nothing"
+            )
+        finally:
+            conn.close()
+
+        # → back to dialect A.  Its rows were retired by retention when B was
+        # built, so this is the case the reuse tier used to serve.
+        import json
+
+        cc_json = c_project / "compile_commands.json"
+        cc = json.loads(cc_json.read_text(encoding="utf-8"))
+        for entry in cc:
+            entry["arguments"] = [a for a in entry["arguments"]
+                                  if a != "-DFEATURE_ON"]
+        cc_json.write_text(json.dumps(cc, indent=2), encoding="utf-8")
+
+        result = _index_cli(c_project)
+        assert result.returncode == 0, result.stderr
+
+        conn = open_db(db_path)
+        try:
+            gated = _gated_symbols(conn, _config_hash(conn))
+            assert gated == {"baseline_only_fn"}, (
+                f"the index does not match the current dialect: {sorted(gated)}\n"
+                + result.stderr[-2500:]
+            )
+        finally:
+            conn.close()
+
+    def test_dialect_change_reparses_instead_of_importing(self, c_project: Path):
+        """No translation unit may be satisfied by importing another build."""
+        self._setup(c_project)
+        assert _index_cli(c_project).returncode == 0
+        _change_build_dialect(c_project, "FEATURE_ON")
+        assert _index_cli(c_project).returncode == 0
+
+        import json
+
+        cc_json = c_project / "compile_commands.json"
+        cc = json.loads(cc_json.read_text(encoding="utf-8"))
+        for entry in cc:
+            entry["arguments"] = [a for a in entry["arguments"]
+                                  if a != "-DFEATURE_ON"]
+        cc_json.write_text(json.dumps(cc, indent=2), encoding="utf-8")
+
+        result = _index_cli(c_project)
+        assert result.returncode == 0, result.stderr
+        # Check the per-TU summary line specifically.  "reused" also appears
+        # in the manifest updater's own line ("N updated, M reused"), which
+        # counts reused manifest ENTRIES and is unrelated to serving a TU
+        # from another build.
+        summary = next(
+            (ln for ln in result.stderr.splitlines()
+             if "unchanged," in ln and "skipped" in ln),
+            "",
+        )
+        assert summary, f"no indexer summary line found\n{result.stderr[-2500:]}"
+        assert "reused" not in summary, (
+            f"a TU was served from another build instead of being re-parsed\n{summary}"
+        )
+        # Returning to a retired dialect leaves nothing under its
+        # config_hash, so every TU is parsed afresh — the count is whatever
+        # the project has, but it must not be zero.
+        assert "0 updated" not in summary, (
+            f"no TU was re-parsed under the restored dialect\n{summary}"
+        )
+
+
+# ── Manifest completeness ─────────────────────────────────────────────
+
+
+def _manifest_header_paths(db_path: Path) -> set[str]:
+    """Every header path the manifest records, across all TUs."""
+    import json
+
+    manifests = sorted(db_path.parent.glob("manifest.*.json"))
+    assert len(manifests) == 1, f"expected one manifest, found {manifests}"
+    data = json.loads(manifests[0].read_text(encoding="utf-8"))
+    paths: set[str] = set()
+    for entry in data.get("entries") or []:
+        paths.update(entry.get("headers") or [])
+    return paths
+
+
+@pytest.mark.libclang
+class TestManifestRecordsEveryInclude:
+    """The manifest must list every file an ``#include`` reached.
+
+    It used to filter by extension — ``{.h .hpp .hxx .hh .inl}`` — which
+    silently dropped every extensionless C++ standard header (``<algorithm>``,
+    ``<bit>``) and every ``.tcc`` template body.  Two things broke.  The
+    coverage purge deleted those files because the manifest did not list them:
+    measured on HA_Boiler, 29 files and 1810 symbols.  And nothing recorded a
+    hash for them, so a toolchain or SDK upgrade could change any of them
+    without marking a single TU stale.
+
+    A whitelist of "what counts as a header" cannot be kept complete;
+    ``get_includes()`` already answers the question exactly.
+    """
+
+    def test_an_extensionless_header_is_recorded(self, c_project: Path):
+        """This is the shape of every C++ standard library header."""
+        db_path = _db_path_for_project(c_project)
+        _write_file(
+            c_project / "src" / "plain_header",
+            "#ifndef PLAIN_H\n#define PLAIN_H\nint plain_fn(void);\n#endif\n",
+        )
+        _include_from_main(c_project, "plain_header")
+
+        result = _index_cli(c_project)
+        assert result.returncode == 0, result.stderr
+
+        recorded = _manifest_header_paths(db_path)
+        assert "src/plain_header" in recorded, (
+            "an extensionless header is missing from the manifest, so nothing "
+            "can detect a change to it and the coverage purge would delete it\n"
+            f"recorded: {sorted(p for p in recorded if 'src/' in p)}"
+        )
+
+    def test_an_unusual_extension_is_recorded(self, c_project: Path):
+        """``.tcc`` is what libstdc++ names its template bodies."""
+        db_path = _db_path_for_project(c_project)
+        _write_file(
+            c_project / "src" / "bodies.tcc",
+            "static inline int tcc_fn(void) { return 1; }\n",
+        )
+        _write_file(
+            c_project / "src" / "wrap.h",
+            '#ifndef WRAP_H\n#define WRAP_H\n#include "bodies.tcc"\n#endif\n',
+        )
+        _include_from_main(c_project, "wrap.h")
+
+        result = _index_cli(c_project)
+        assert result.returncode == 0, result.stderr
+
+        recorded = _manifest_header_paths(db_path)
+        assert "src/bodies.tcc" in recorded, (
+            "a .tcc include is missing from the manifest\n"
+            f"recorded: {sorted(p for p in recorded if 'src/' in p)}"
+        )
+
+    def test_such_a_header_is_not_purged(self, c_project: Path):
+        """The consequence: coverage must keep what the manifest now lists."""
+        db_path = _db_path_for_project(c_project)
+        _write_file(
+            c_project / "src" / "plain_header",
+            "#ifndef PLAIN_H\n#define PLAIN_H\nint plain_fn(void);\n#endif\n",
+        )
+        _include_from_main(c_project, "plain_header")
+        assert _index_cli(c_project).returncode == 0
+
+        # Reindex after dropping a TU, so the purge definitely runs.
+        _add_tu_to_compile_commands(c_project, "transient.c")
+        assert _index_cli(c_project).returncode == 0
+        import json
+
+        cc_json = c_project / "compile_commands.json"
+        cc = [e for e in json.loads(cc_json.read_text(encoding="utf-8"))
+              if e["file"] != "transient.c"]
+        cc_json.write_text(json.dumps(cc, indent=2), encoding="utf-8")
+        result = _index_cli(c_project)
+        assert result.returncode == 0, result.stderr
+
+        conn = open_db(db_path)
+        try:
+            ch = _config_hash(conn)
+            assert _file_row(conn, ch, "plain_header") is not None, (
+                "the extensionless header was purged\n" + result.stderr[-2000:]
+            )
+            assert _file_row(conn, ch, "transient.c") is None, (
+                "the dropped TU should still have been purged"
+            )
+        finally:
+            conn.close()
+
+
+class TestReindexKeepsTheGeneratedFlag:
+    """``reindex_file`` must not turn a generated header into a plain one.
+
+    _update_manifest_after_reindex passed None for build_dir_patterns, so
+    _is_generated_header() answered False for every header and every record
+    it wrote claimed "generated": False.  After the end of vendor trust
+    ``generated`` is the only trust rule left, so a single reindex_file
+    turned the next full index run into a complete reparse.  Measured on
+    zbox-ecb-fw-v5 variant nrf52840-dev: 27 generated headers went to 0.
+    """
+
+    @staticmethod
+    def _unit(tmp_path: Path, rel: str):
+        from unittest.mock import MagicMock
+
+        src = tmp_path / rel
+        src.parent.mkdir(parents=True, exist_ok=True)
+        src.write_text("int main() { return 0; }")
+        unit = MagicMock()
+        unit.file = src
+        unit.directory = tmp_path
+        unit.clang_args = ["-std=c11"]
+        unit.raw_entry = {"file": rel, "directory": str(tmp_path)}
+        return unit
+
+    @staticmethod
+    def _manifest(tmp_path: Path, *, entries, build_dir_patterns) -> dict:
+        from fw_context_mcp.indexer.manifest import MANIFEST_FORMAT
+
+        manifest: dict = {
+            "_format": MANIFEST_FORMAT,
+            "compile_commands_path": str(tmp_path / "compile_commands.json"),
+            "project_root": str(tmp_path),
+            "arg_sets": [["-std=c11"]],
+            "headers": {
+                "build/zephyr/include/generated/autoconf.h": {
+                    "hash": "OLD", "generated": True,
+                },
+            },
+            "entries": entries,
+        }
+        if build_dir_patterns is not None:
+            manifest["build_dir_patterns"] = build_dir_patterns
+        return manifest
+
+    def _run(self, tmp_path: Path, *, entries, build_dir_patterns, monkeypatch):
+        """Drive _update_manifest_after_reindex with a stubbed header collector.
+
+        The real collector needs libclang and a compiled TU.  What this test
+        checks is the patterns that reach it and the merge that follows, so
+        the stub records the patterns and returns the header the build
+        generates.
+        """
+        from fw_context_mcp.mcp.handlers import maintenance
+        from fw_context_mcp.indexer import manifest as manifest_mod
+
+        saved: dict = {}
+        seen: list = []
+
+        def fake_collect(unit, root, build_dir_patterns, header_table):
+            seen.append(build_dir_patterns)
+            path = "build/zephyr/include/generated/autoconf.h"
+            header_table[path] = {
+                "hash": "NEW",
+                "generated": manifest_mod._is_generated_header(path, build_dir_patterns),
+            }
+            return [path]
+
+        def fake_load(db_dir, config_hash):
+            return self._manifest(
+                tmp_path, entries=entries, build_dir_patterns=build_dir_patterns
+            )
+
+        def fake_save(data, db_dir, config_hash):
+            saved.update(data)
+            return config_hash
+
+        monkeypatch.setattr(manifest_mod, "_collect_headers_from_tokens", fake_collect)
+        monkeypatch.setattr(manifest_mod, "load", fake_load)
+        monkeypatch.setattr(manifest_mod, "save", fake_save)
+
+        maintenance._update_manifest_after_reindex(
+            [(self._unit(tmp_path, "src/main.c"), object())],
+            tmp_path,
+            tmp_path / "index",
+            "deadbeef",
+        )
+        return saved, seen
+
+    def test_reindex_file_reads_the_patterns_from_the_manifest(self, tmp_path, monkeypatch):
+        """The manifest is the source, because it holds what the index run used."""
+        _, seen = self._run(
+            tmp_path,
+            entries=[{
+                "file": "src/main.c", "directory": str(tmp_path), "arg_set": 0,
+                "source_hash": "x", "headers": [],
+            }],
+            build_dir_patterns=["build/"],
+            monkeypatch=monkeypatch,
+        )
+
+        assert seen == [["build/"]]
+
+    def test_reindex_file_keeps_the_generated_flag(self, tmp_path, monkeypatch):
+        """An entry the manifest already has goes through update_entry."""
+        saved, _ = self._run(
+            tmp_path,
+            entries=[{
+                "file": "src/main.c", "directory": str(tmp_path), "arg_set": 0,
+                "source_hash": "x", "headers": [],
+            }],
+            build_dir_patterns=["build/"],
+            monkeypatch=monkeypatch,
+        )
+
+        record = saved["headers"]["build/zephyr/include/generated/autoconf.h"]
+        assert record["generated"] is True
+        assert record["hash"] == "NEW"
+
+    def test_a_new_entry_keeps_the_generated_flag(self, tmp_path, monkeypatch):
+        """A TU the manifest has never seen goes down the else branch.
+
+        That branch bypasses update_entry, so the fix in update_entry alone
+        does not reach it.
+        """
+        saved, _ = self._run(
+            tmp_path,
+            entries=[],
+            build_dir_patterns=["build/"],
+            monkeypatch=monkeypatch,
+        )
+
+        record = saved["headers"]["build/zephyr/include/generated/autoconf.h"]
+        assert record["generated"] is True
+        assert len(saved["entries"]) == 1
+
+    def test_a_manifest_without_patterns_falls_back_to_detection(self, tmp_path, monkeypatch):
+        """An index written before the key existed must still get patterns.
+
+        The probe for this whole class must run on a build whose manifest HAS
+        patterns: five of the nine zbox-v5 manifests carry none, and on those
+        "generated is 0 after reindex_file" holds before the fix as well.
+        """
+        (tmp_path / "west.yml").write_text("")
+        _, seen = self._run(
+            tmp_path,
+            entries=[{
+                "file": "src/main.c", "directory": str(tmp_path), "arg_set": 0,
+                "source_hash": "x", "headers": [],
+            }],
+            build_dir_patterns=None,
+            monkeypatch=monkeypatch,
+        )
+
+        assert seen == [["build/"]]

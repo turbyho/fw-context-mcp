@@ -190,6 +190,20 @@ class ManualBuildSystem:
         """Return build-output directory patterns for staleness filtering."""
         return []
 
+    def get_vendor_patterns(
+        self,
+        project_root: Path,
+        *,
+        units: list | None = None,
+    ) -> list[str]:
+        """Return no pattern — manual mode already gets the paths from the config.
+
+        The team lists its source directories and its flags in ``[build]``,
+        and it adds ``[index] vendor_paths`` for the trees it does not own.
+        A second, detected answer would only compete with that one.
+        """
+        return []
+
     # ── Environment auto-detection ──
 
     @classmethod

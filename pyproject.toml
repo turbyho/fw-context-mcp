@@ -13,7 +13,12 @@ urls = {Homepage = "https://github.com/turbyho/fw-context-mcp", Documentation = 
 dependencies = [
     "httpx>=0.27.0",
     "libclang>=18.1.1",
-    "mcp[cli]>=1.0.0",
+    # <2 is a hard bound, not caution.  mcp 2.x renamed FastMCP to
+    # MCPServer and mcp.server.fastmcp now raises ModuleNotFoundError on
+    # import, so mcp/server.py does not merely fail to type-check under it
+    # — it cannot start.  Upstream says to pin mcp<2 to keep v1 code
+    # running.  Lift this together with the migration, not before it.
+    "mcp[cli]>=1.0.0,<2",
     "pysqlite3>=0.5.0",
     "sqlite-vec>=0.1.0",
     "tomli-w>=1.2.0",

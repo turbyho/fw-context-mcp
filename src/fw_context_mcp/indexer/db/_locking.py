@@ -26,13 +26,87 @@ from contextlib import contextmanager
 from pathlib import Path
 
 __all__ = [
+    "IndexRunLocked",
     "WriteLockTimeout",
+    "index_run_lock",
     "write_lock",
 ]
 
 
 class WriteLockTimeout(RuntimeError):
     """Raised when the write lock cannot be acquired within the timeout."""
+
+
+class IndexRunLocked(RuntimeError):
+    """Another indexing run already owns this index directory.
+
+    Carries the PID recorded by the holder, for the message only — the
+    exclusion itself comes from the kernel, not from the PID.
+    """
+
+    def __init__(self, db_dir: Path, holder_pid: int | None) -> None:
+        self.holder_pid = holder_pid
+        who = f"pid {holder_pid}" if holder_pid else "another process"
+        super().__init__(f"an index run is already in progress for {db_dir} ({who})")
+
+
+@contextmanager
+def index_run_lock(db_dir: Path) -> Generator[None, None, None]:
+    """Hold an exclusive lock for a whole indexing run.
+
+    WHY this exists next to :func:`write_lock`: that lock is taken and
+    released per translation unit, deliberately, so a manual operation can
+    interleave.  It therefore does nothing to stop a SECOND indexing run from
+    starting and writing the same tables between two of the first run's
+    units.  Two indexers sharing a database corrupt each other's bookkeeping:
+    each captured its own file snapshot and header ownership at start, and
+    each deletes rows the other just wrote.
+
+    WHY ``flock`` rather than a PID file: the kernel drops the lock when the
+    process exits, however it exits.  A PID file survives a crash and has to
+    be validated against ``/proc``, which is how the previous guard here came
+    to be dead code — it compared the interpreter name against a list that
+    did not include ``python3.14``, so it never matched and never excluded
+    anything.
+
+    Raises :class:`IndexRunLocked` immediately when another run holds it.
+    Waiting would be wrong: an index run takes minutes to hours, and a caller
+    that wants the work done can act on the refusal instead.
+    """
+    db_dir.mkdir(parents=True, exist_ok=True)
+    lock_file = db_dir / "index.lock"
+    fd = os.open(lock_file, os.O_CREAT | os.O_RDWR, 0o644)
+    acquired = False
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            acquired = True
+        except BlockingIOError:
+            raise IndexRunLocked(db_dir, _read_holder_pid(lock_file)) from None
+        # Record who holds it, for the refusal message the next caller prints.
+        os.ftruncate(fd, 0)
+        os.write(fd, str(os.getpid()).encode())
+        os.fsync(fd)
+        yield
+    finally:
+        if acquired:
+            os.ftruncate(fd, 0)
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+
+
+def _read_holder_pid(lock_file: Path) -> int | None:
+    """Return the PID the lock holder recorded, or None when unreadable.
+
+    Advisory only — the lock is already known to be held.  A holder that has
+    not written its PID yet, or a truncated read, simply means the message
+    says "another process".
+    """
+    try:
+        content = lock_file.read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    return int(content) if content.isdigit() else None
 
 
 @contextmanager

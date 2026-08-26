@@ -19,6 +19,14 @@ import time
 from pathlib import Path
 
 from ..config.settings import derive_project_id
+
+# Re-exported so an existing `from .runner import EXIT_SUPERSEDED` keeps
+# working.  The constants live in fw_context_mcp.exit_codes because
+# mcp/daemon.py needs them and must not pull the indexer — see that module.
+from ..exit_codes import (  # noqa: F401 — re-exported
+    EXIT_ALREADY_RUNNING,
+    EXIT_SUPERSEDED,
+)
 from ..mcp.shared.pid_file import PidFile
 from ._embedding import (
     _build_embeddings,
@@ -36,7 +44,7 @@ from ._postprocess import (
 )
 from ._unit_processor import (
     _check_and_parse_unit,
-    _handle_unchanged_or_reuse,
+    _handle_unchanged,
     _process_unit,
 )
 from .compile_commands import _SOURCE_EXTS, validate_include_files
@@ -76,9 +84,101 @@ __all__ = [
 # ═══════════════════════════════════════════════════════════════
 
 
+class IndexSuperseded(Exception):
+    """Another process took over the index, so this run gave up.
+
+    Not a failure: nothing is wrong with the index, and nothing was written
+    that has to be undone.  The run simply stopped because continuing would
+    have applied decisions made from a snapshot the other process has since
+    invalidated.
+
+    Deliberately outside :data:`SAFE_EXCEPT` — a handler that swallowed this
+    as "a step failed, carry on" would resume exactly the run this exists to
+    stop.  Callers report it as superseded and retry the work from the start.
+    """
+
+
+def raise_if_superseded(db_dir: Path) -> None:
+    """Raise :class:`IndexSuperseded` when another process owns the index.
+
+    The MCP server writes ``<pid>`` to ``reindex.pause`` before a manual
+    ``reindex_file`` or ``reset_index``.  An indexing run used to block here
+    until the marker cleared and then carry on from the same translation unit
+    — which is not safe.  Everything the loop decides with was captured
+    before the pause: ``existing_files`` (the mtime and hash snapshot), the
+    manifest lookup, the stale-header set, and the header ownership built up
+    TU by TU.  After a manual operation those all describe an index that no
+    longer exists.
+
+    The damage is concrete.  ``reset_index`` empties the database; a resumed
+    run then reads its pre-pause ``existing_files``, takes the mtime
+    fast-path for translation units whose rows are gone, and finishes by
+    stamping a manifest over a half-built index.  A ``reindex_file`` is
+    subtler but the same shape: the manual parse re-assigned header
+    ownership, and the resumed run's ``replace_file_data`` deletes rows it
+    just wrote.
+
+    So the run gives up instead.  The caller reports it as superseded rather
+    than as a failure, and the work is retried from the start — with a fresh
+    snapshot — once the marker clears.
+
+    A marker holding our own PID is ignored: a foreground index writes it to
+    stop the background reindex, not to stop itself.  A marker whose process
+    is gone is ignored too — nothing owns the index any more.
+    """
+    pause_file = db_dir / "reindex.pause"
+    if not PidFile.is_active(pause_file):
+        return
+    requester_pid = PidFile.read_pid(pause_file)
+    if requester_pid is None or requester_pid == os.getpid():
+        return
+    raise IndexSuperseded(
+        f"another process (pid {requester_pid}) took over the index; "
+        f"abandoning this run so it can be redone from a fresh snapshot"
+    )
 
 
 
+
+
+def _tus_to_requeue(
+    manifest: dict,
+    stale_headers: set[str],
+    project_root: Path,
+) -> frozenset[str]:
+    """Return the normalized TU paths that must skip the cheap staleness tiers.
+
+    Two sources, and the union of them:
+
+    - a TU that includes a header whose content changed, and
+    - a TU whose entry carries ``needs_reparse``.
+
+    The second source must be read even when *stale_headers* is empty.  That
+    is the whole point of the mark: another unit's re-parse already wrote the
+    current hash into the shared header table, so the difference the header
+    pass looks for is gone.  Built inside an ``if stale_headers:`` the set
+    stays empty and the mark reaches nothing.
+    """
+    from .manifest import tus_affected_by_headers
+    from .ops import _normalize_file_path
+
+    flagged = {
+        e["file"] for e in manifest.get("entries", []) if e.get("needs_reparse")
+    }
+    from_headers = tus_affected_by_headers(manifest, stale_headers)
+    affected = from_headers | flagged
+    if not affected:
+        return frozenset()
+
+    log.info(
+        "%d changed header(s) -> %d TU(s) queued for reparse, "
+        "%d more queued by needs_reparse",
+        len(stale_headers), len(from_headers), len(flagged - from_headers),
+    )
+    return frozenset(
+        _normalize_file_path(str((project_root / tu_rel).resolve()), project_root)
+        for tu_rel in affected
+    )
 
 
 def run(
@@ -99,6 +199,7 @@ def run(
     index_macros_expanded: bool = True,
     config_header: str = "",
     build_dir_patterns: list[str] | None = None,
+    build_system: str | None = None,
     analyze_vendor: bool = False,
     purge_max_missing_percent: int = 20,
     variant: str = "",
@@ -143,6 +244,11 @@ def run(
         project_root: Root directory of the project.  Used to resolve relative
             paths and derive defaults.  Defaults to the parent of
             ``compile_commands``.
+        build_system: The ``[build] system`` config key of this project.  It
+            decides WHICH builder answers for the vendor patterns.  Pass it
+            whenever the config has it: the config and the markers can
+            disagree, and a freestanding NCS application reads as a CMake
+            project by its markers alone.  With None the markers decide.
         project_id: Unique project identifier (auto-derived from
             ``project_root`` when not provided).
         llm_config: Configuration dataclass for Ollama connection (URL,
@@ -158,13 +264,10 @@ def run(
     else:
         project_root = project_root.resolve()
 
-    # Prepare vendor/project patterns for is_project computation.
-    # Normalize patterns without % wildcard to match subdirectories.
+    # Normalize patterns without % wildcard to match subdirectories.  The
+    # vendor set waits for the translation units — see below.
     from .sdk_detect import _build_sdk_excludes, _normalize_patterns
 
-    vendor_patterns = list(_build_sdk_excludes(project_root))
-    if vendor_paths:
-        vendor_patterns.extend(_normalize_patterns(vendor_paths))
     project_patterns_list = _normalize_patterns(list(project_paths)) if project_paths else []
 
     if project_id is None:
@@ -183,6 +286,23 @@ def run(
     units = list(parse_compile_commands(compile_commands))
     units = [u for u in units if u.file.suffix.lower() in _SOURCE_EXTS]
     log.info("TUs to index: %d", len(units))
+
+    # ── The effective vendor set, computed HERE and not earlier ──
+    # A builder may read the compiler flags: Zephyr takes ZEPHYR_BASE and
+    # WEST_TOPDIR from -fmacro-prefix-map, which names the roots of the build
+    # that is indexed rather than the shell that runs fw-context.  The units
+    # carry those flags, so the set cannot be built before they are parsed.
+    # Its first use is the header staleness pre-pass further down.
+    vendor_patterns = list(
+        _build_sdk_excludes(project_root, build_system, units=units)
+    )
+    if vendor_paths:
+        vendor_patterns.extend(_normalize_patterns(vendor_paths))
+    log.info(
+        "vendor patterns for %s: %s",
+        variant or project_root.name,
+        ", ".join(vendor_patterns) or "none",
+    )
 
     # Determine config_hash from manifest.json.  The manifest captures the
     # full structural build identity (files, directories, compiler flags) —
@@ -309,25 +429,41 @@ def run(
 
     existing_files = get_file_hashes(conn, config_hash)
 
-    # After reset_index (DB wipe) manifest.json survives on disk, but there
-    # is no old build data to migrate from.  Tier 2b (reuse) can never
-    # produce symbols then — for each TU it would re-hash source+headers and
-    # run a pointless reassignment query before falling through to a full
-    # parse.  Detect "no old build" once up front and disable the reuse path.
-    has_old_build = (
-        conn.execute(
-            "SELECT 1 FROM files WHERE config_hash != ? LIMIT 1",
-            (config_hash,),
-        ).fetchone()
-        is not None
-    )
-
     # Pre-build lookup dict for O(1) manifest entry access during Tier 2 checks.
     # *manifest* was loaded above (before config_hash computation) — reuse it.
     manifest_lookup: dict[str, dict] = {}
     if manifest is not None:
         for e in manifest.get("entries", []):
             manifest_lookup[e.get("file", "")] = e
+    # The entries hold header paths; their hashes live in this shared map.
+    # Both travel together into the staleness checks.
+    manifest_header_table: dict[str, dict] = (
+        dict(manifest.get("headers") or {}) if manifest is not None else {}
+    )
+
+    # ── Header staleness pre-pass ──
+    # A header is not a translation unit, so editing one leaves the mtime and
+    # source hash of every dependent TU untouched — the per-TU mtime fast-path
+    # would report them all as unchanged and the header's symbols would stay
+    # frozen at their first-index state.  Hash the project headers once here
+    # and mark every TU that includes a changed one for re-parsing.
+    #
+    # ALL dependent TUs are marked, not a subset: symbols from a shared header
+    # are claimed by whichever TU stores them first, and a TU that keeps its
+    # old rows would block the fresh ones via the ON CONFLICT(config_hash,
+    # usr) guard in insert_symbols_batch.
+    #
+    # header_hash_cache is shared with the per-TU staleness checks below, so
+    # each project header is read and hashed exactly once per run.
+    header_hash_cache: dict[str, str] = {}
+    header_stale_tus: frozenset[str] = frozenset()
+    if manifest is not None:
+        from .manifest import collect_stale_headers
+
+        stale_headers = collect_stale_headers(
+            manifest, project_root, hash_cache=header_hash_cache
+        )
+        header_stale_tus = _tus_to_requeue(manifest, stale_headers, project_root)
 
     # Drop FTS5 content-sync triggers before bulk indexing — each symbol
     # INSERT/DELETE/UPDATE would otherwise pay per-row FTS index overhead
@@ -353,7 +489,6 @@ def run(
     total_refs = 0
     skipped = 0
     unchanged = 0
-    reused = 0
     updated = 0
     acc_parse = 0.0
     acc_lock = 0.0
@@ -362,7 +497,30 @@ def run(
     # Collect headers during tokenization for incremental manifest update.
     # Maps file_path → list of {path, hash, generated} header dicts.
     tu_headers: dict[str, list[dict]] = {}
+    # TUs actually re-parsed in this run.  The manifest may only take fresh
+    # header hashes from these — an entry refreshed for a TU that kept its
+    # previous symbols would erase the evidence that the index is behind.
+    reparsed_tus: set[str] = set()
     t0 = time.monotonic()
+
+    # Is any PROJECT file still missing its ifdef-filtered content?  One query
+    # per run instead of one per TU.  While a backfill is pending, unchanged
+    # TUs keep running the content pass so it can complete; once every project
+    # file has content they skip it, along with the libclang parse behind it.
+    #
+    # WHY project files only (relative path = inside project_root, see
+    # _normalize_file_path): out-of-tree system headers routinely end up with
+    # an empty content column — e.g. libstdc++ headers whose cursors were all
+    # claimed by an earlier TU.  Counting those would pin the flag to True
+    # forever on any C++ project and the pass would never be skipped.
+    content_backfill_needed = (
+        conn.execute(
+            "SELECT 1 FROM files WHERE config_hash = ? AND content = '' "
+            "AND path NOT LIKE '/%' LIMIT 1",
+            (config_hash,),
+        ).fetchone()
+        is not None
+    )
 
     # skip_files accumulates resolved paths of headers already processed
     # by earlier TUs in this run.  Starts empty each run — never loaded
@@ -372,37 +530,6 @@ def run(
     skip_files: set[str] = set()
 
     log.info("", extra={"phase": f"Parsing ({len(units)} TUs)"})
-
-    def _wait_if_paused() -> None:
-        """If a manual operation requested pause, wait until it finishes.
-
-        The MCP server writes ``<pid>`` to ``reindex.pause`` before a manual
-        ``reindex_file`` or ``reset_index``.  This function blocks until the
-        pause is lifted or the requesting process dies (stale marker cleanup).
-
-        When the current process wrote the marker itself (e.g. ``fw-context
-        index --force`` was invoked from the CLI while a background reindex
-        is running), the marker is skipped so the foreground process does not
-        pause itself.
-        """
-        pause_file = db_path.parent / "reindex.pause"
-        our_pid = os.getpid()
-        # 1s polling — exits immediately when no pause file exists
-        deadline = time.monotonic() + 300  # 5-min timeout
-        while True:
-            if time.monotonic() > deadline:
-                log.warning("_wait_if_paused: timeout after 300s — resuming")
-                return
-            if not PidFile.is_active(pause_file):
-                return
-            requester_pid = PidFile.read_pid(pause_file)
-            if requester_pid is None:
-                return
-            # Never pause on our own marker — this process created it
-            # to signal the background reindex, not to block itself.
-            if requester_pid == our_pid:
-                return
-            time.sleep(1.0)  # Wait, then check again
 
     # Single sequential loop with per-TU write lock for responsiveness.
     # The lock is acquired and released for each translation unit so that
@@ -415,7 +542,7 @@ def run(
     # ``fw-context index --force``) and causes WriteLockTimeout errors.
 
     for i, unit in enumerate(units):
-        _wait_if_paused()  # Check pause marker before each TU
+        raise_if_superseded(db_path.parent)  # Give up if another process took over
         fname = unit.file.name
         processed = i + 1
 
@@ -428,13 +555,14 @@ def run(
             unit,
             config_hash,
             project_root,
-            vendor_patterns,
             index_refs,
             existing_files,
             force=force,
             manifest=manifest_lookup,
-            reuse_possible=has_old_build,
             skip_files=skip_files,
+            header_stale_tus=header_stale_tus,
+            hash_cache=header_hash_cache,
+            header_table=manifest_header_table,
         )
 
         # Snapshot the skip set BEFORE folding in this TU's own files.
@@ -448,26 +576,20 @@ def run(
         if parsed_data is not None and hasattr(parsed_data, 'newly_seen_files'):
             skip_files.update(parsed_data.newly_seen_files)
 
-        if check_status in ("unchanged", "reuse"):
-            result = _handle_unchanged_or_reuse(
+        if check_status == "unchanged":
+            result = _handle_unchanged(
                 unit, check_status, hashes, conn, config_hash, project_root,
-                build_dir_patterns, db_path, existing_files, processed, len(units),
+                build_dir_patterns, db_path, existing_files,
                 skip_files=skip_before,
+                manifest_lookup=manifest_lookup,
+                content_backfill_needed=content_backfill_needed,
             )
-            total_syms += result["total_syms"]
-            if result["is_reuse"] and result["total_syms"] > 0:
-                reused += 1
-            elif not result["is_reuse"]:
-                unchanged += 1
+            unchanged += 1
             content_filled += result["content_filled"]
             if result["headers"]:
                 tu_headers.update(result["headers"])
-            if result["fallthrough"]:
-                # Fall through to Phase 2 — _process_unit will re-parse with libclang
-                pass
-            else:
-                log.info("[%d/%d] %s: %s", processed, len(units), fname, result["status"])
-                continue
+            log.info("[%d/%d] %s: %s", processed, len(units), fname, result["status"])
+            continue
 
         if check_status == "skipped":
             skipped += 1
@@ -500,11 +622,14 @@ def run(
                 acc_parse += timing[0]
                 acc_lock += timing[1]
                 acc_write += timing[2]
+                try:
+                    tu_key = str(unit.file.resolve().relative_to(project_root))
+                except ValueError:
+                    tu_key = str(unit.file.resolve())
+                # Only a re-parsed TU may refresh its manifest entry — its
+                # symbols now match the headers it just read.
+                reparsed_tus.add(tu_key)
                 if tu_headers_list:
-                    try:
-                        tu_key = str(unit.file.resolve().relative_to(project_root))
-                    except ValueError:
-                        tu_key = str(unit.file.resolve())
                     tu_headers[tu_key] = tu_headers_list
                 log.info(
                     "[%d/%d] %s: %d syms, %d refs, %.1fs",
@@ -553,9 +678,11 @@ def run(
         scope=scope,
         defer_fts=defer_fts,
         defer_cleanup=defer_cleanup,
+        header_hash_cache=header_hash_cache,
+        reparsed_tus=reparsed_tus,
     )
 
     elapsed = time.monotonic() - t0
     log.info("", extra={"phase": f"Done — {total_syms} symbols, {total_refs} refs, {_fmt_dur(elapsed)}"})
-    log.info("%d updated, %d unchanged, %d reused, %d skipped  config_hash=%s", updated, unchanged, reused, skipped, config_hash[:12])
+    log.info("%d updated, %d unchanged, %d skipped  config_hash=%s", updated, unchanged, skipped, config_hash[:12])
     return config_hash

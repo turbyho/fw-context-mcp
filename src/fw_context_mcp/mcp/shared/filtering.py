@@ -30,10 +30,16 @@ from ...indexer.sdk_detect import (  # noqa: F401 — re-exported
     _build_sdk_excludes,
     _normalize_path_pattern,
     _path_matches,
+    vendor_patterns_for_build,
 )
 
 
-def detect_sdk_exclude_like(project_root: Path, extra_vendor_paths: list[str] | None = None) -> list[str]:
+def detect_sdk_exclude_like(
+    project_root: Path,
+    extra_vendor_paths: list[str] | None = None,
+    *,
+    manifest: dict | None = None,
+) -> list[str]:
     """Return SQL LIKE patterns that match SDK and vendor directory paths.
 
     Two sources of patterns, merged:
@@ -57,10 +63,16 @@ def detect_sdk_exclude_like(project_root: Path, extra_vendor_paths: list[str] | 
       any existing leading ``%`` before adding our own avoids double
       prefixes (``%%.platformio/%``) that would break the pattern.
     - User paths never include ``%``, so the strip is a no-op for them.
+
+    Pass *manifest* whenever the caller has it.  The set stored there is the
+    one the index run applied, and this layer cannot derive the same one: the
+    strongest source for Zephyr is ``-fmacro-prefix-map`` in the compiler
+    flags, and only the indexer has those.
     """
     # Strip existing leading % to prevent double-prefix (some auto-detected
     # patterns already include % for nested-path matching).
-    patterns: list[str] = [f"%{p.lstrip('%')}" for p in _build_sdk_excludes(project_root)]
+    detected = vendor_patterns_for_build(manifest, project_root)
+    patterns: list[str] = [f"%{p.lstrip('%')}" for p in detected]
 
     if extra_vendor_paths:
         for p in extra_vendor_paths:
@@ -76,6 +88,7 @@ def compute_exclude_like(
     *,
     analyze_vendor: bool = False,
     vendor_paths: list[str] | None = None,
+    manifest: dict | None = None,
 ) -> list[str]:
     """Compute SQL LIKE patterns for SDK/vendor path exclusion.
 
@@ -102,4 +115,4 @@ def compute_exclude_like(
     if vendor_paths is not None:
         extra = list(vendor_paths)
 
-    return detect_sdk_exclude_like(project_root, extra)
+    return detect_sdk_exclude_like(project_root, extra, manifest=manifest)

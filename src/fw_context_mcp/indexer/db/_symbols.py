@@ -59,12 +59,15 @@ from __future__ import annotations
 import logging
 import re
 import sqlite3
+from collections.abc import Sequence
 
 from fw_context_mcp.utils import is_db_exception
 
+from ._chunking import chunked
+
 __all__ = [
     "_expand_query",
-    "delete_macros_for_file",
+    "delete_macros_for_files",
     "find_macro_refs",
     "insert_macros_batch",
     "insert_symbols_batch",
@@ -272,9 +275,30 @@ def insert_macros_batch(
     return cur.rowcount  # approximate with ON CONFLICT DO UPDATE WHERE (used for logging only)
 
 
-def delete_macros_for_file(conn: sqlite3.Connection, file_id: int) -> None:
-    """Delete all macros for a file (FTS ad trigger cleans up FTS index)."""
-    conn.execute("DELETE FROM macros WHERE file_id=?", (file_id,))
+
+def delete_macros_for_files(conn: sqlite3.Connection, file_ids: Sequence[int]) -> None:
+    """Delete all macros for *file_ids* (FTS ad trigger cleans up FTS index).
+
+    WHY a plural form is needed: a translation unit owns more than its own
+    file.  A ``#define`` in a header is stored under the HEADER's ``file_id``,
+    so a delete keyed on the TU's file_id alone leaves those rows behind.  A
+    macro removed from a header then survives, and a macro that only moved
+    gains a SECOND row, because the UNIQUE key is
+    ``(config_hash, file_id, line)`` — the ON CONFLICT upsert in
+    ``insert_macros_batch`` only refreshes a macro that stayed on its line.
+
+    No ``config_hash`` filter is needed: ``files`` is unique per
+    ``(config_hash, path)``, so a file_id already identifies one config.
+    """
+    ids = list(dict.fromkeys(file_ids))  # dedupe, keep a stable order
+    if not ids:
+        return
+    for chunk in chunked(ids):
+        placeholders = ",".join("?" * len(chunk))
+        conn.execute(
+            f"DELETE FROM macros WHERE file_id IN ({placeholders})",
+            chunk,
+        )
 
 
 def lookup_macro(

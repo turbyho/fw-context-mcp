@@ -892,6 +892,11 @@ def _build_variants(data: dict) -> list[BuildVariant]:
     the merge by field type (scalar/list/dict).  Keying overrides by attribute
     name keeps the TOML→attribute mapping in this module and the merge logic in
     build.py — no duplicated key tables.
+
+    An ``[index]`` key goes to ``index_overrides`` instead.
+    ``build_variant_config`` applies BuildConfig fields only, so such a key
+    used to be dropped without a word — and since the unknown-key warning it
+    would be reported as a typo.
     """
     raw = data.get("build", {}).get("variants")
     if not raw:
@@ -921,9 +926,18 @@ def _build_variants(data: dict) -> list[BuildVariant]:
                 )
             )
 
+        # Split by section.  The three key sets are disjoint — verified:
+        # _BUILD_FIELDS n _INDEX_FIELDS, _VARIANT_SPECIFIC_KEYS n
+        # _INDEX_FIELDS and _INDEX_FIELDS n _LLM_FIELDS are all empty — so a
+        # key cannot belong to two of them.
+        index_keys = {toml_key for toml_key, _, _ in _INDEX_FIELDS}
         overrides: dict = {}
+        index_overrides: dict = {}
         for key, value in table.items():
             if key in _VARIANT_SPECIFIC_KEYS:
+                continue
+            if key in index_keys:
+                index_overrides[key] = value
                 continue
             overrides[_BUILD_KEY_TO_ATTR.get(key, key)] = value
 
@@ -937,6 +951,7 @@ def _build_variants(data: dict) -> list[BuildVariant]:
                 env=dict(env) if isinstance(env, dict) else {},
                 images=images,
                 overrides=overrides,
+                index_overrides=index_overrides,
             )
         )
 

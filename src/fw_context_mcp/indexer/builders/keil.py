@@ -141,6 +141,20 @@ class KeilBuildSystem:
         """Return build-output directory patterns for staleness filtering."""
         return []
 
+    def get_vendor_patterns(
+        self,
+        project_root: Path,
+        *,
+        units: list | None = None,
+    ) -> list[str]:
+        """Return no pattern — Keil MDK keeps its packs outside the project.
+
+        The CMSIS packs and the device support live in the pack root under
+        the user profile.  A path outside project_root is vendor by
+        position and needs no pattern.
+        """
+        return []
+
 
 # Register
 registry.register(KeilBuildSystem)

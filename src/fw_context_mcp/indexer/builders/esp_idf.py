@@ -182,6 +182,24 @@ class ESPIDFBuildSystem:
         """Return build-output directory patterns for staleness filtering."""
         return ["build/"]
 
+    def get_vendor_patterns(
+        self,
+        project_root: Path,
+        *,
+        units: list | None = None,
+    ) -> list[str]:
+        """Return the directory the IDF Component Manager writes into.
+
+        ``managed_components/`` holds the components that ``idf.py`` pulls
+        from the ESP Component Registry.  The team does not write them and
+        the manager overwrites them.
+
+        ``components/`` is NOT in this list.  It is the standard place for
+        the application's OWN components, so a pattern for it would hide the
+        team's code from a project_only query.
+        """
+        return ["managed_components/%"]
+
     # ── Validation ──
 
     def validate_artifacts(self, compile_commands: Path, project_root: Path) -> list[BuildIssue]:

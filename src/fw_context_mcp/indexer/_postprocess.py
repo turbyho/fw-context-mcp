@@ -81,6 +81,8 @@ from .db import (
     upsert_build_config,
     write_lock,
 )
+from .db._chunking import chunked
+from .manifest import _is_generated_header
 
 log = logging.getLogger(__name__)
 
@@ -646,7 +648,7 @@ def _step_orphan_cleanup(conn: sqlite3.Connection, ctx: dict) -> None:
     """Remove orphaned files, embeddings, and LLM analysis rows."""
     from .db import clean_orphan_embeddings, clean_orphan_embeddings_vec, delete_orphan_files
 
-    delete_orphan_files(conn, ctx["config_hash"])
+    delete_orphan_files(conn, ctx["config_hash"], ctx["project_root"])
     clean_orphan_embeddings(conn)
     clean_orphan_embeddings_vec(conn)
     conn.execute(
@@ -720,11 +722,128 @@ def _step_update_manifest(conn: sqlite3.Connection, ctx: dict) -> None:
         updated_count=ctx["updated"],
          tu_headers=ctx["tu_headers"] if ctx["tu_headers"] else None,
          build_dir_patterns=ctx["build_dir_patterns"],
+         vendor_patterns=ctx.get("vendor_patterns"),
          config_hash=config_hash,
          scope=ctx.get("scope"),
+         reparsed_tus=ctx.get("reparsed_tus"),
      )
+    # Keep whichever manifest is now authoritative so the coverage purge does
+    # not have to re-read it.  A no-op run returns None and leaves the
+    # on-disk manifest (already loaded into ctx) current.
+    ctx["effective_manifest"] = updated_manifest or ctx.get("manifest")
     if updated_manifest is not None:
-        _refresh_header_mtimes_from_manifest(conn, config_hash, ctx["project_root"], updated_manifest)
+        _refresh_header_mtimes_from_manifest(
+            conn,
+            config_hash,
+            ctx["project_root"],
+            updated_manifest,
+            hash_cache=ctx.get("header_hash_cache"),
+        )
+
+
+def _build_coverage_set(units: list, manifest: dict | None, project_root: Path) -> set[str] | None:
+    """Return the file paths that belong to this build, or None if unknown.
+
+    A file belongs to the build when it is a translation unit of the current
+    ``compile_commands.json``, or a header that one of those TUs includes.
+
+    The TU half comes from *units*, never from the manifest: when no TU was
+    re-parsed the manifest is not rewritten, so a TU dropped from the build
+    would still be listed there.  The header half can only come from the
+    manifest — it is the sole record of what each TU includes — and entries
+    are filtered to the current TUs so a dropped TU takes its headers with it
+    (unless another TU includes them too).
+
+    Returns ``None`` when the manifest cannot answer the header question: no
+    manifest, no entries, or entries carrying no header lists (a preliminary
+    manifest).  Purging on that basis would delete every header in the index.
+    """
+    if not manifest:
+        return None
+    entries = manifest.get("entries") or []
+    if not entries:
+        return None
+
+    tu_paths: set[str] = set()
+    for unit in units:
+        try:
+            tu_paths.add(str(unit.file.resolve().relative_to(project_root)))
+        except ValueError:
+            tu_paths.add(str(unit.file.resolve()))
+
+    covered = set(tu_paths)
+    saw_headers = False
+    for entry in entries:
+        if entry.get("file") not in tu_paths:
+            continue
+        # Built from the per-TU lists, never from the manifest's shared
+        # headers map: an orphan left in the map by a re-parse that stopped
+        # including a header would keep that file inside coverage and the
+        # purge would never remove its rows.
+        headers = entry.get("headers") or []
+        if headers:
+            saw_headers = True
+        covered.update(headers)
+
+    return covered if saw_headers else None
+
+
+def _step_purge_files_outside_build(conn: sqlite3.Connection, ctx: dict) -> None:
+    """Delete index rows for files that no longer belong to the build.
+
+    WHY this step exists: ``config_hash`` identifies the compilation dialect,
+    so dropping a source file from ``compile_commands.json`` no longer mints a
+    new build.  Nothing else notices the file left — ``purge_missing`` only
+    looks for files gone from DISK, and ``delete_orphan_files`` only removes
+    rows with no symbols, no macros and empty content.  Without this step a
+    removed TU keeps its symbols, macros, refs and file content forever.
+
+    The same guard as ``purge_missing`` applies: refuse to act when the set
+    looks implausibly large, which would mean the coverage data is wrong
+    rather than the index being stale.
+    """
+    config_hash = ctx["config_hash"]
+    covered = _build_coverage_set(
+        ctx["units"], ctx.get("effective_manifest"), ctx["project_root"]
+    )
+    if covered is None:
+        log.debug("coverage purge skipped: manifest carries no header lists")
+        return
+
+    # Vendor and SDK files are candidates too, not just project sources: a
+    # framework upgrade replaces headers, and the ones it dropped must go with
+    # it.  That only works because the manifest now records every file an
+    # #include reached, extensionless C++ standard headers and .tcc template
+    # bodies included.  While it carried an extension whitelist this step
+    # deleted 29 real files and 1810 symbols on HA_Boiler.
+    rows = conn.execute(
+        "SELECT id, path FROM files WHERE config_hash = ? AND path != ''",
+        (config_hash,),
+    ).fetchall()
+    stale = [(r["id"], r["path"]) for r in rows if r["path"] not in covered]
+    if not stale:
+        return
+
+    threshold_pct = ctx.get("purge_max_missing_percent", 20)
+    stale_pct = (len(stale) / len(rows)) * 100 if rows else 0
+    if stale_pct > threshold_pct:
+        log.warning(
+            "Coverage purge aborted: %d/%d files (%.1f%%) are outside the build "
+            "(threshold %d%%). The manifest's header lists are probably incomplete.",
+            len(stale), len(rows), stale_pct, threshold_pct,
+        )
+        return
+
+    from .db import purge_missing_files_batch
+
+    removed = purge_missing_files_batch(conn, config_hash, stale, db_dir=ctx["db_dir"])
+    preview = ", ".join(p for _, p in stale[:5])
+    if len(stale) > 5:
+        preview += f", … (+{len(stale) - 5} more)"
+    log.info(
+        "Purged %d file(s) no longer in the build, %d symbol(s): %s",
+        len(stale), removed, preview,
+    )
 
 
 def _resolve_matching_usr(
@@ -1010,6 +1129,139 @@ def _step_pagerank_hotspot(conn: sqlite3.Connection, ctx: dict) -> None:
     conn.commit()
 
 
+class IndexIntegrityError(Exception):
+    """The finished index contradicts itself.
+
+    Deliberately outside :data:`SAFE_EXCEPT`, so the post-process loop cannot
+    swallow it as "a step failed, carry on".  An index that disagrees with
+    itself answers queries wrongly, and a wrong answer is worse than a
+    missing one — the run must fail and say why.
+    """
+
+
+_FTS_TABLES = ("symbols_fts", "files_fts", "macros_fts")
+
+
+def fts_inconsistencies(conn: sqlite3.Connection) -> list[str]:
+    """Public alias — the multi-build CLI owns its own FTS rebuild.
+
+    That path defers the per-build rebuild and does one at the end, so it also
+    has to run the check that was skipped inside each build.
+    """
+    return _fts_inconsistencies(conn)
+
+
+def _fts_inconsistencies(conn: sqlite3.Connection) -> list[str]:
+    """Return a message per FTS index that disagrees with its content table.
+
+    WHY ``rank`` is passed as 1: these are external-content FTS5 tables, and
+    the plain ``integrity-check`` command only validates the index's internal
+    structure.  Measured against a deliberately broken index — a row deleted
+    from ``symbols`` with the ``symbols_ad`` trigger dropped, leaving a
+    dangling FTS entry that ``MATCH`` still finds — the bare form and
+    ``rank = 0`` both reported "ok".  Only ``rank = 1``, which compares the
+    index against the content table, detected it.  A check that cannot see
+    the failure it exists for is worse than no check: it grants confidence.
+    """
+    problems: list[str] = []
+    for table in _FTS_TABLES:
+        try:
+            conn.execute(
+                f"INSERT INTO {table}({table}, rank) VALUES('integrity-check', 1)"  # noqa: S608
+            )
+        except sqlite3.OperationalError as exc:
+            # No such table — the FTS index was never created in this DB.
+            #
+            # This catch is DELIBERATELY wider than that one case.
+            # OperationalError is a subtype of DatabaseError and this except
+            # comes first, so a locked database or a disk error also lands
+            # here and reaches log.debug alone.  A narrower catch would need
+            # to read the message text, which is not a stable interface.  The
+            # cost is one silent skip; the check runs again on the next run.
+            log.debug("FTS integrity check skipped for %s: %s", table, exc)
+        except sqlite3.DatabaseError as exc:
+            problems.append(f"{table} disagrees with its content table: {exc}")
+    return problems
+
+
+def _step_verify_integrity(conn: sqlite3.Connection, ctx: dict) -> None:
+    """Fail the run when the finished index contradicts itself.
+
+    Two checks, both cheap enough to always run:
+
+    - ``PRAGMA foreign_key_check`` — a row pointing at a parent that no
+      longer exists.  This is what a cleanup path that missed a table looks
+      like from the outside, which is the defect class this whole series of
+      changes was about.
+    - FTS index versus content table.  A dangling FTS entry makes a deleted
+      symbol searchable, so ``search_code`` reports code that is not there.
+
+    Placed BEFORE ``finalize_manifest`` on purpose: raising here means the
+    build is never stamped ``"full"``.  For a new ``config_hash`` it keeps the
+    ``"indexing"`` marker, so ``get_active_config`` hides it and readers stay
+    on the last complete build instead of being served a broken one.  It also
+    runs before ``cleanup_old``, so the previous build survives for
+    comparison.
+
+    WHAT THIS DOES NOT CATCH: both checks test whether the index agrees with
+    ITSELF, not whether it agrees with the source.  An index can be perfectly
+    self-consistent and still be missing data.  Measured: on HA_Boiler, a
+    coverage purge that deleted 145 files and 6698 symbols — the entire C++
+    standard library — passed both checks, because the deletes were clean and
+    fired the FTS triggers.  Completeness against the sources is a different
+    question, answered by the manifest and by the per-file hashes, not here.
+
+    TWO CONSEQUENCES OF THE DB-WIDE SCOPE, both deliberate and both a cost:
+
+    - ``PRAGMA foreign_key_check`` reads the WHOLE database, not the current
+      config_hash.  The pragma takes a table name at most, so it cannot be
+      scoped to one build.  On a multi-build project a violation left by
+      ANOTHER build therefore fails a build that is itself correct.  The
+      error message says so; real scoping is an open question, not something
+      this function can do.
+    - When this raises, the pipeline stops here, so ``finalize_manifest`` is
+      skipped — which is the intent — but ``cleanup_old`` and
+      ``wal_checkpoint`` are skipped too.  The WAL stays without a
+      checkpoint and ``PRAGMA user_version`` is never set, and the next
+      reader sees that as ``reindex_needed`` because of the schema version.
+    """
+    problems: list[str] = []
+
+    violations = conn.execute("PRAGMA foreign_key_check").fetchall()
+    if violations:
+        # Row shape: (child table, child rowid, parent table, fkid).
+        preview = "; ".join(
+            f"{r[0]} rowid={r[1]} -> missing {r[2]}" for r in violations[:5]
+        )
+        if len(violations) > 5:
+            preview += f"; … (+{len(violations) - 5} more)"
+        problems.append(f"{len(violations)} foreign key violation(s): {preview}")
+
+    # The FTS half only means something once the index has been rebuilt.
+    # A multi-build project defers that rebuild: the CLI passes
+    # defer_fts=True for every (variant, image) run and rebuilds once at the
+    # end, so checking here would compare the content tables against an index
+    # that nothing has updated yet.  Measured on zbox-ecb-fw-v5 (two
+    # variants): every build failed verification and therefore never reached
+    # finalize_manifest, leaving both stamped "indexing" — hidden from
+    # readers.  The caller that owns the deferral runs this check after its
+    # rebuild instead.
+    if ctx.get("defer_fts"):
+        log.debug("FTS integrity check deferred with the FTS rebuild")
+    else:
+        problems.extend(_fts_inconsistencies(conn))
+
+    if problems:
+        for p in problems:
+            log.error("Index integrity: %s", p)
+        raise IndexIntegrityError(
+            f"index verification failed for config_hash="
+            f"{ctx['config_hash'][:12]}: " + "; ".join(problems)
+            + " (the foreign-key check reads the whole database, so the "
+            "violation can belong to a different build of this project)"
+        )
+
+
 def _step_finalize_manifest(conn: sqlite3.Connection, ctx: dict) -> None:
     """Stamp the build config with manifest verification status.
 
@@ -1072,13 +1324,24 @@ def _cleanup_old_for_pair(
             delete_build_data(conn, old_ch)
         deleted.append(old_ch)
 
+    # Both on-disk artifacts of a retired build go with its rows.  The
+    # manifest used to be left behind: nothing reads an abandoned build's
+    # manifest since the reuse tier was removed, so it was pure accumulation —
+    # one file per dialect change, 52 MB of it on zbox-ecb-fw, for the life of
+    # the project.  It also made load(db_dir) ambiguous, since that form picks
+    # the most recently modified manifest in the directory.
+    from .manifest import _manifest_path
+
     cc_dir = db_dir / project_id
-    if cc_dir.exists():
-        for old_ch in deleted:
+    for old_ch in deleted:
+        for artifact in (
+            _manifest_path(db_dir, old_ch),
+            cc_dir / f"compile_commands.{old_ch}.json",
+        ):
             try:
-                (cc_dir / f"compile_commands.{old_ch}.json").unlink(missing_ok=True)
-            except OSError:
-                pass
+                artifact.unlink(missing_ok=True)
+            except OSError as exc:
+                log.debug("could not remove %s: %s", artifact.name, exc)
     return deleted
 
 
@@ -1096,7 +1359,7 @@ def cleanup_old_builds_multi(
 
     Returns the number of deleted builds.
     """
-    if PidFile.is_active(db_dir / "reindex.pause"):
+    if PidFile.is_active_other(db_dir / "reindex.pause"):
         return 0
     deleted = 0
     for variant, image in dict.fromkeys(touched_pairs):
@@ -1121,8 +1384,12 @@ def _step_cleanup_old_builds(conn: sqlite3.Connection, ctx: dict) -> None:
     the old hash's data is deleted to reclaim disk space.  Retention is scoped
     to the pair: builds of OTHER variants/images are preserved (multi-build).
 
-    The reindex-pause guard prevents deletion when a background reindex was
-    paused mid-stream: the old process's data is still the active index.
+    The reindex-pause guard prevents deletion when ANOTHER process paused a
+    background reindex mid-stream: that process's data is still the active
+    index.  It must test ``is_active_other``, not ``is_active`` — ``fw-context
+    index`` writes ``reindex.pause`` with its own PID for the whole run, so
+    the plain liveness check is always true here and retention never ran at
+    all: every reindex left its predecessor's build in the database forever.
     """
     config_hash = ctx["config_hash"]
     project_id = ctx["project_id"]
@@ -1130,7 +1397,7 @@ def _step_cleanup_old_builds(conn: sqlite3.Connection, ctx: dict) -> None:
     variant = ctx.get("variant", "")
     image = ctx.get("image", "")
 
-    if PidFile.is_active(db_dir / "reindex.pause"):
+    if PidFile.is_active_other(db_dir / "reindex.pause"):
         return
 
     _cleanup_old_for_pair(conn, project_id, db_dir, variant, image, config_hash)
@@ -1166,6 +1433,10 @@ def _step_wal_checkpoint(conn: sqlite3.Connection, ctx: dict) -> None:
 #
 # Ordering constraints (why steps are in this exact order):
 #  • purge_missing MUST run before fts5 — FTS must not index ghost symbols.
+#  • coverage_purge MUST run after manifest — it needs the current header
+#    lists to know which files the build still includes.  It runs after fts5
+#    rather than before, which is safe: its deletes fire the symbols_ad /
+#    files_ad / macros_ad triggers, so the FTS indexes follow.
 #  • fts5 MUST run before embeddings and llm_analysis — both query FTS.
 #  • is_project MUST run before embeddings — embedding source selection
 #    depends on project/vendor classification.
@@ -1178,15 +1449,72 @@ def _step_wal_checkpoint(conn: sqlite3.Connection, ctx: dict) -> None:
 #    new from_usr values that the backfill needs.
 #  • cross_tu_refs MUST run before pagerank_hotspot — PageRank needs the
 #    complete call graph.
+#  • verify_integrity MUST run before finalize_manifest and cleanup_old.
+#    Before finalize so a failing index is never stamped "full"; before
+#    cleanup so the previous build is still there to fall back on.
 #  • cleanup_old runs LAST with data mutation — it deletes old-build tables
 #    that earlier steps might reference.
 #  • wal_checkpoint runs LAST — flushes all accumulated changes to disk.
+def _step_reconcile_generated(conn: sqlite3.Connection, ctx: dict) -> None:
+    """Make ``files.generated`` agree with THIS run's build_dir_patterns.
+
+    upsert_file() takes MAX so that the one caller who knows the patterns
+    cannot be overwritten by the four who do not.  That is right inside a
+    run and wrong across two: a row can only gain the flag, never lose it.
+
+    Its docstring used to say the case could not arise, because a change to
+    build_dir_patterns mints a new config_hash.  Measured, that is false:
+    narrowing PlatformIO from ``.pio/`` to ``.pio/build/`` left the
+    config_hash of HA_Boiler and of FM byte for byte identical, because the
+    path pass drops in-project paths anyway.  57 rows would have kept a flag
+    the manifest no longer gives them, and the structural check that compares
+    the two would fail on every existing index until a --force.
+
+    So the run reconciles instead of hoping.  This is the authoritative
+    write: the patterns of the run decide, in both directions, and the step
+    is idempotent.  It runs after the manifest is written, so the two
+    describe the same boundary.
+    """
+    build_dir_patterns = ctx.get("build_dir_patterns")
+    config_hash = ctx["config_hash"]
+
+    rows = conn.execute(
+        "SELECT path, generated FROM files WHERE config_hash = ?", (config_hash,)
+    ).fetchall()
+
+    to_set: list[str] = []
+    to_clear: list[str] = []
+    for row in rows:
+        want = _is_generated_header(row["path"], build_dir_patterns)
+        if want and not row["generated"]:
+            to_set.append(row["path"])
+        elif not want and row["generated"]:
+            to_clear.append(row["path"])
+
+    for value, paths in ((1, to_set), (0, to_clear)):
+        for batch in chunked(paths):
+            placeholders = ",".join("?" * len(batch))
+            conn.execute(
+                f"UPDATE files SET generated = ? "  # noqa: S608 — placeholders only
+                f"WHERE config_hash = ? AND path IN ({placeholders})",
+                (value, config_hash, *batch),
+            )
+    if to_set or to_clear:
+        conn.commit()
+        log.info(
+            "files.generated reconciled: %d set, %d cleared",
+            len(to_set), len(to_clear),
+        )
+
+
 _STEPS: list[tuple[str, Callable[..., None], Callable[..., bool] | None]] = [
     ("purge_missing",    _step_purge_missing_files, None),
     ("fts5",             _step_rebuild_fts,       None),
     ("orphans",          _step_orphan_cleanup,     None),
     ("is_project",       _step_align_is_project,   None),
     ("manifest",         _step_update_manifest,    None),
+    ("generated_flag",   _step_reconcile_generated, None),
+    ("coverage_purge",   _step_purge_files_outside_build, None),
     ("macros",           _step_expand_macros,      lambda c: c["index_macros_expanded"] and c["units"]),
     ("dispatch_edges",   _step_resolve_dispatches,  lambda c: c["index_refs"]),
     ("llm_analysis",     _step_llm_analysis,       lambda c: c["analyze_symbols"] and c["llm_config"] is not None and c["llm_config"].enabled),
@@ -1194,6 +1522,7 @@ _STEPS: list[tuple[str, Callable[..., None], Callable[..., bool] | None]] = [
     ("overrides",        _step_build_overrides,    lambda c: c["analyze_overrides"]),
     ("cross_tu_refs",    _step_backfill_cross_tu_refs, lambda c: c["index_refs"]),
     ("pagerank_hotspot", _step_pagerank_hotspot,   lambda c: c["index_refs"]),
+    ("verify_integrity", _step_verify_integrity,   None),
     ("finalize_manifest", _step_finalize_manifest,  None),
     ("cleanup_old",      _step_cleanup_old_builds,  None),
     ("wal_checkpoint",   _step_wal_checkpoint,      None),
@@ -1232,6 +1561,8 @@ def _run_postprocess(
     scope: list[str] | None = None,
     defer_fts: bool = False,
     defer_cleanup: bool = False,
+    header_hash_cache: dict[str, str] | None = None,
+    reparsed_tus: set[str] | None = None,
 ) -> None:
     """Run all post-processing phases via a data-driven pipeline.
 
@@ -1278,6 +1609,11 @@ def _run_postprocess(
         "scope": scope,
         "defer_fts": defer_fts,
         "defer_cleanup": defer_cleanup,
+        # Header hashes already computed by the runner's staleness pre-pass —
+        # reused by the mtime refresh so no project header is read twice.
+        "header_hash_cache": header_hash_cache,
+        # TUs re-parsed in this run — only they may refresh their manifest entry.
+        "reparsed_tus": reparsed_tus,
     }
 
     defer_skip: set[str] = set()

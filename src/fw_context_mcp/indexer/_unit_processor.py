@@ -8,9 +8,8 @@ Position in the pipeline
    through it.
 2. **Phase 1** (parallel): :func:`_check_and_parse_unit` runs in a
    thread pool — no database writes.  It determines whether each TU
-   is unchanged (skip), reusable from a prior config (migrate), or
-   changed (re-parse with libclang).
-3. **Phase 2** (serialised): :func:`_handle_unchanged_or_reuse` and
+   is unchanged (skip) or changed (re-parse with libclang).
+3. **Phase 2** (serialised): :func:`_handle_unchanged` and
    :func:`_process_unit` serialise via ``write_lock`` and persist
    the results.
 
@@ -20,10 +19,13 @@ Design principles
   (mtime → content-hash → libclang parse).  mtime is ~100× cheaper
   than content-hashing; content-hashing is ~50× cheaper than
   libclang parsing.
-* **Incremental reuse** — when ``compile_commands.json`` changes but
-  source files do not, symbols from the old config are reassigned
-  in-place via UPDATE rather than re-parsed.  This saves 80-95 % of
-  indexing time on typical rebuilds.
+* **No cross-build import** — a TU is either up to date under the
+  current ``config_hash`` or it is re-parsed.  Rows are never copied
+  from another build: ``config_hash`` identifies the compilation
+  dialect, so another build's rows were produced by different macros
+  and say nothing about this one.  Adding or removing a source file no
+  longer changes ``config_hash``, so the case this used to optimise
+  does not arise.
 * **Parallel parse, serialise writes** — libclang parsing is
   CPU-bound and runs in a thread pool without any lock.  Only
   database writes are serialised, maximising throughput on
@@ -34,20 +36,12 @@ Design principles
 
 Key decisions
 -------------
-* :func:`_reassign_symbols_for_file` uses UPDATE in-place rather than
-  INSERT OR REPLACE — no new row allocation, no index page splits,
-  minimal WAL pressure.
-* Shared headers (included by multiple TUs) stay under the old
-  config_hash when a collision is detected — the first TU to index a
-  shared file "wins", and the later TUs' copies are cleaned up by
-  ``delete_build_data``.
-* Overrides are not migrated during incremental reuse —
-  ``_build_overrides`` rebuilds them from scratch in post-processing
-  because the override graph depends on the full set of indexed
-  classes.
-* sqlite-vec virtual tables may not support UPDATE with WHERE
-  subselect, so we DELETE first and UPDATE second — defensive,
-  costs nothing on a sqlite-vec-free build.
+* Shared headers (included by multiple TUs) are claimed by exactly one
+  TU per run via ``skip_files`` — the first TU to walk a header owns
+  its rows, and later TUs skip its subtree entirely.
+* Overrides are rebuilt from scratch in post-processing by
+  ``_build_overrides`` because the override graph depends on the full
+  set of indexed classes.
 """
 
 from __future__ import annotations
@@ -73,227 +67,18 @@ from .ops import _build_filtered_file_content, _normalize_file_path, store_symbo
 log = logging.getLogger(__name__)
 
 
-def _reassign_symbols_for_file(
-    conn,
-    new_config_hash: str,
-    new_file_id: int,
-    file_path: str,
-    *,
-    project_root: Path | None = None,
-) -> int:
-    """Reassign data for *file_path* from an old config_hash to *new_config_hash* using UPDATE.
-
-    Unlike the old ``_migrate_symbols_for_file`` which copied data via
-    INSERT OR REPLACE (allocating new rows, rebuilding indexes), this
-    function updates ``config_hash`` and ``file_id`` in-place on existing
-    rows.  No new rows are allocated, indexes are updated only for the
-    changed columns.
-
-    Rows that would collide with already-indexed symbols (shared headers
-    across TUs) are left under the old config_hash and cleaned up later
-    by :func:`delete_build_data`.
-
-    When *project_root* is provided, symbols whose ``file_path`` no longer
-    exists on disk are deleted after reassignment — prevents stale symbols
-    from generated/removed headers persisting in the index.
-
-    When no previous build exists (Scenario C — first index), returns 0
-    and the caller falls through to normal libclang parsing.
-
-    Runs inside the caller's transaction — atomic UPDATE across all tables.
-    """
-    # Find the most recent old config_hash that has symbols for this file
-    old = conn.execute(
-        "SELECT config_hash, id FROM files WHERE path=? AND config_hash!=? ORDER BY rowid DESC LIMIT 1",
-        (file_path, new_config_hash),
-    ).fetchone()
-    if old is None:
-        return 0  # Scenario C — first index, nothing to reassign
-
-    old_ch, old_fid = old
-
-    # ── symbols ──
-    # UPDATE only those that don't collide with already-existing symbols
-    # under the new config_hash.  NOT IN subselect: symbols shared across
-    # TUs (headers) may already have been indexed under new_config_hash by
-    # another TU.
-    cur = conn.execute(
-        """UPDATE symbols SET config_hash=?, file_id=?
-           WHERE config_hash=? AND file_id=?
-           AND usr NOT IN (SELECT usr FROM symbols WHERE config_hash=?)""",
-        (new_config_hash, new_file_id, old_ch, old_fid, new_config_hash),
-    )
-    symbol_count = cur.rowcount
-
-    if project_root is not None:
-        # Prune symbols from removed/renamed headers — stale file_path
-        # values from a prior index run would persist otherwise.
-        _prune_stale_symbols(conn, new_config_hash, new_file_id, project_root)
-    # Reset pagerank — _build_pagerank() skips when pagerank > 0.
-    # Values from the previous build are stale because the call graph
-    # may have changed in other (updated) files.
-    conn.execute(
-        "UPDATE symbols SET pagerank = 0.0 WHERE config_hash = ? AND file_id = ?",
-        (new_config_hash, new_file_id),
-    )
-
-    # ── macros ──
-    # UNIQUE(config_hash, file_id, line) — on collision, keep the old version.
-    conn.execute(
-        """UPDATE macros SET config_hash=?, file_id=?
-           WHERE config_hash=? AND file_id=?
-           AND NOT EXISTS (
-               SELECT 1 FROM macros m2
-               WHERE m2.config_hash = ?
-                 AND m2.file_id = ?
-                 AND m2.line = macros.line
-           )""",
-        (new_config_hash, new_file_id, old_ch, old_fid, new_config_hash, new_file_id),
-    )
-
-    # ── refs ──
-    # Delete anything already under new_config_hash for this file so
-    # UPDATE won't create duplicates (refs has no UNIQUE constraint).
-    conn.execute(
-        "DELETE FROM refs WHERE config_hash=? AND from_file=?",
-        (new_config_hash, file_path),
-    )
-    conn.execute(
-        """UPDATE refs SET config_hash=?
-           WHERE config_hash=? AND from_file=?""",
-        (new_config_hash, old_ch, file_path),
-    )
-
-    # ── fp_assignments ──
-    conn.execute(
-        "DELETE FROM fp_assignments WHERE config_hash=? AND from_file=?",
-        (new_config_hash, file_path),
-    )
-    conn.execute(
-        """UPDATE fp_assignments SET config_hash=?
-           WHERE config_hash=? AND from_file=?""",
-        (new_config_hash, old_ch, file_path),
-    )
-
-    # ── indirect_call_sites ──
-    conn.execute(
-        "DELETE FROM indirect_call_sites WHERE config_hash=? AND from_file=?",
-        (new_config_hash, file_path),
-    )
-    conn.execute(
-        """UPDATE indirect_call_sites SET config_hash=?
-           WHERE config_hash=? AND from_file=?""",
-        (new_config_hash, old_ch, file_path),
-    )
-
-    # ── vec_symbols (sqlite-vec KNN) ──
-    # vec0 virtual table has a config_hash column for filtered KNN queries.
-    # After updating symbols we must also update config_hash in vec0.
-    # DELETE before UPDATE — safer; vec0 virtual tables may not support
-    # UPDATE with WHERE subselect.
-    try:
-        conn.execute(
-            """DELETE FROM vec_symbols WHERE symbol_id IN (
-                   SELECT id FROM symbols WHERE config_hash=? AND file_id=?
-               )""",
-            (new_config_hash, new_file_id),
-        )
-        conn.execute(
-            """UPDATE vec_symbols SET config_hash=?
-               WHERE symbol_id IN (
-                   SELECT id FROM symbols WHERE config_hash=? AND file_id=?
-               )""",
-            (new_config_hash, new_config_hash, new_file_id),
-        )
-    except SAFE_EXCEPT as e:
-        if is_fatal(e):
-            raise
-        pass  # libclang/SQLite fallback  # sqlite-vec may not be available
-
-    # ── inheritance ──
-    # UPDATE inheritance edges for classes defined in this file.
-    # derived_usr must belong to symbols we just reassigned (they already
-    # have the new config_hash).
-    # NOT EXISTS: prevents UNIQUE constraint violation when another TU
-    # (changed, Tier 3) already created the same (derived_usr, base_usr)
-    # edge under the new config_hash.
-    conn.execute(
-        """UPDATE inheritance SET config_hash=?
-           WHERE config_hash=? AND derived_usr IN (
-               SELECT usr FROM symbols WHERE config_hash=? AND file_id=?
-           )
-           AND NOT EXISTS (
-               SELECT 1 FROM inheritance i2
-               WHERE i2.config_hash = ?
-                 AND i2.derived_usr = inheritance.derived_usr
-                 AND i2.base_usr = inheritance.base_usr
-           )""",
-        (new_config_hash, old_ch, new_config_hash, new_file_id, new_config_hash),
-    )
-
-    # ── overrides ──
-    # NOT migrated — _build_overrides() rebuilds from scratch for the new
-    # config_hash in post-processing.  No reassignment needed.
-
-    return symbol_count
-
-
-def _prune_stale_symbols(
-    conn: sqlite3.Connection,
-    config_hash: str,
-    file_id: int,
-    project_root: Path,
-) -> int:
-    """Delete reassigned symbols whose source file no longer exists on disk.
-
-    During incremental reuse, symbols from headers that were removed or
-    renamed between index runs can persist with stale ``file_path`` values.
-    This function checks each unique ``file_path`` among the just-reassigned
-    symbols and deletes those whose file is missing.
-
-    Returns the number of stale file paths removed.
-    """
-    rows = conn.execute(
-        "SELECT DISTINCT file_path FROM symbols WHERE config_hash=? AND file_id=?",
-        (config_hash, file_id),
-    ).fetchall()
-
-    stale_paths: list[str] = []
-    for (fp,) in rows:
-        if not fp:
-            continue
-        resolved = project_root / fp if not os.path.isabs(fp) else Path(fp)
-        if not resolved.exists():
-            stale_paths.append(fp)
-
-    if not stale_paths:
-        return 0
-
-    placeholders = ",".join("?" * len(stale_paths))
-    result = conn.execute(
-        f"DELETE FROM symbols WHERE config_hash=? AND file_id=? AND file_path IN ({placeholders})",
-        (config_hash, file_id, *stale_paths),
-    )
-    removed = result.rowcount
-    if removed:
-        log.warning(
-            "Pruned %d stale symbol(s) from %d missing file(s) for %s",
-            removed, len(stale_paths), ", ".join(stale_paths[-5:]),
-        )
-    return len(stale_paths)
-
-
 def _check_and_parse_unit(
     unit,
     config_hash,
     project_root,
-    vendor_patterns,
     index_refs,
     existing_files,
     force=False,
     manifest=None,
-    reuse_possible: bool = True,
     skip_files: set[str] | None = None,
+    header_stale_tus: frozenset[str] = frozenset(),
+    hash_cache: dict[str, str] | None = None,
+    header_table: dict[str, dict] | None = None,
 ):
     """Check whether *unit* needs re-parsing and parse it if so.
 
@@ -304,6 +89,9 @@ def _check_and_parse_unit(
        Uses ``manifest.json`` for header hashes when available — no libclang needed.
     3. **libclang parse** — content hashes differ → parse.
 
+    Tier 1 does not look at the flags.  A build whose flags changed but
+    whose sources did not moves no mtime, so the check stops here.
+
     Does NOT write to the database — the caller is responsible for
     acquiring ``write_lock`` and calling ``_process_unit(pre_parsed=...)``
     to persist the result.
@@ -311,26 +99,23 @@ def _check_and_parse_unit(
     All translation units are indexed — no exclusion filtering.
 
     Args:
-        vendor_patterns: LIKE patterns for vendor/SDK directories (used for
-            manifest staleness checking — vendor headers are trusted).
         manifest: Optional ``{file_path: entry}`` lookup dict built from
             ``manifest.load()`` entries.  When provided, header staleness
             is checked via hash comparison against the manifest (fast —
             file reads + SHA-256 only).  When ``None``, falls back to
             source-hash-only comparison.
-        reuse_possible: When False, Tier 2b (reuse from an old build) is
-            skipped entirely.  The caller sets this False when the DB has
-            no prior build data to migrate from (e.g. after ``reset_index``
-            while ``manifest.json`` survives on disk) — reuse would hash
-            source+headers and run a reassignment query for every TU, then
-            fall through to a full parse anyway.
+        header_stale_tus: Normalized paths of TUs that include a header
+            whose content changed (from ``manifest.collect_stale_headers``).
+            For those TUs both cheap tiers are skipped: a header change
+            never moves the TU's own mtime, so Tier 1 would report
+            "unchanged" and the header's symbols would never be refreshed.
+        hash_cache: Shared ``{resolved path: sha256}`` memo for project
+            header hashes, so a header included by many TUs is read once
+            per index run.
 
     Returns:
         * ``("unchanged", None, None, None)`` — no re-parse needed (Tier 1 mtime match).
         * ``("unchanged", None, None, hashes)`` — no re-parse needed (Tier 2 content-hash match).
-        * ``("reuse", None, None, hashes)`` — TU is unchanged across config_hash
-          change; caller must copy symbols from the old config_hash and create
-          a file record for the new config_hash (Tier 2b manifest-based match).
         * ``("skipped", None, None, None)`` — parse failed.
         * ``("updated", parsed, (t_start, t_end), hashes)`` — parsed
           successfully, ready for ``_process_unit(pre_parsed=parsed)``.
@@ -350,8 +135,14 @@ def _check_and_parse_unit(
     file_path = _normalize_file_path(str(resolved_tu), project_root)
     force_refs = force or os.environ.get("FW_CONTEXT_FORCE_REFINDEX") == "1"
 
+    # A changed header leaves the TU's own mtime and source hash untouched,
+    # so both cheap tiers would wave this TU through.  Skip them and let
+    # Tier 3 re-parse — that is the only way the header's symbols and its
+    # ifdef-filtered content get refreshed.
+    tu_header_stale = file_path in header_stale_tus
+
     # ── Tier 1: mtime fast-path ──
-    if not force_refs and file_path in existing_files:
+    if not force_refs and not tu_header_stale and file_path in existing_files:
         rec = existing_files[file_path]
         stored_mtime = rec.mtime
         try:
@@ -379,48 +170,20 @@ def _check_and_parse_unit(
     manifest_entry_hash = _get_manifest_entry_hash_for_unit(
         unit,
         project_root,
-        vendor_patterns,
         manifest,
+        hash_cache=hash_cache,
+        header_table=header_table,
     )
 
     content_hash = compute_tu_content_hash(source_hash, flags_hash, manifest_entry_hash)
     hashes = (source_hash, flags_hash, manifest_entry_hash)
 
-    if not force_refs and file_path in existing_files:
+    if not force_refs and not tu_header_stale and file_path in existing_files:
         rec = existing_files[file_path]
         # rec is a FileHashRecord from get_file_hashes() — attribute access
         if rec.content_hash and rec.content_hash == content_hash:
             # Content unchanged — just the mtime was bumped by a rebuild.
             return ("unchanged", None, None, hashes)
-
-    # ── Tier 2b: manifest-based fallback for new config_hash ──
-    # When file_path has no record in the current config_hash (e.g. after
-    # --build with a new compile_commands.json), the manifest entry from
-    # the PREVIOUS index provides source_hash, header hashes, and flags_hash.
-    # If all three match current disk content, the TU is unchanged despite
-    # the new config_hash — skip the expensive libclang parse.
-    if reuse_possible and not force_refs and file_path not in existing_files and manifest is not None:
-        from .manifest import check_tu_staleness
-        from .manifest import get_manifest_entry_hash as _entry_hash
-
-        try:
-            tu_rel = str(unit.file.resolve().relative_to(project_root))
-        except ValueError:
-            tu_rel = str(unit.file.resolve())
-        entry = manifest.get(tu_rel)
-        # Guard: only trust entries with real source_hash AND flags_hash.
-        # Preliminary (degraded) manifests have empty source_hash; old
-        # manifests from before this feature lack flags_hash.
-        if entry is not None and entry.get("source_hash") and entry.get("flags_hash"):
-            stale, _ = check_tu_staleness(entry, project_root, vendor_patterns)
-            if not stale:
-                current_flags = compute_flags_hash(unit.raw_entry) if unit.raw_entry else ""
-                if entry["flags_hash"] == current_flags:
-                    mh = _entry_hash(entry)
-                    hashes = (source_hash, current_flags, mh)
-                    # Return "reuse" — caller must copy symbols from old
-                    # config_hash and create a file record for the new one.
-                    return ("reuse", None, None, hashes)
 
     # ── Tier 3: libclang parse ──
     from .symbols import extract_all
@@ -452,8 +215,10 @@ def _check_and_parse_unit(
 def _get_manifest_entry_hash_for_unit(
     unit,
     project_root: Path,
-    vendor_patterns: list[str],
     manifest_lookup: dict[str, dict] | None,
+    *,
+    hash_cache: dict[str, str] | None = None,
+    header_table: dict[str, dict] | None = None,
 ) -> str:
     """Return the manifest entry hash for a TU for Tier 2 staleness comparison.
 
@@ -463,8 +228,12 @@ def _get_manifest_entry_hash_for_unit(
 
     When *manifest_lookup* is ``None``, falls back to a source-only hash
     (no header tracking possible).
+
+    *header_table* is the manifest's shared ``headers`` map.  The entries hold
+    header paths only; without the table they resolve to empty hashes and
+    every TU reads as stale.
     """
-    from .manifest import check_tu_staleness, compute_current_entry_hash
+    from .manifest import check_tu_staleness, compute_current_entry_hash, resolve_headers
     from .manifest import get_manifest_entry_hash as _entry_hash
 
     # ── Manifest path (fast — no libclang, O(1) lookup) ──
@@ -476,15 +245,20 @@ def _get_manifest_entry_hash_for_unit(
 
         entry = manifest_lookup.get(tu_rel)
         if entry is not None:
-            stale, current_source_hash = check_tu_staleness(entry, project_root, vendor_patterns)
+            headers = resolve_headers(entry, header_table)
+            stale, current_source_hash = check_tu_staleness(
+                entry, project_root,
+                hash_cache=hash_cache, headers=headers,
+            )
             if not stale:
-                return _entry_hash(entry)
+                return _entry_hash(entry, headers)
             # Stale — compute hash from CURRENT disk content (both source and headers)
             return compute_current_entry_hash(
                 entry,
                 project_root,
-                vendor_patterns,
                 new_source_hash=current_source_hash,
+                hash_cache=hash_cache,
+                headers=headers,
             )
 
     # ── Fallback: source-only hash (no manifest, no header tracking) ──
@@ -669,7 +443,7 @@ def _process_unit(
 
 
 
-def _handle_unchanged_or_reuse(
+def _handle_unchanged(
     unit,
     check_status: str,
     hashes: tuple | None,
@@ -679,46 +453,69 @@ def _handle_unchanged_or_reuse(
     build_dir_patterns: list[str] | None,
     db_path: Path,
     existing_files: dict,
-    processed: int,
-    total_units: int,
     skip_files: frozenset[str] | None = None,
+    manifest_lookup: dict[str, dict] | None = None,
+    content_backfill_needed: bool = True,
 ) -> dict:
-    """Handle Phase 1 staleness outcomes — bookkeeping for unchanged/reuse TUs.
+    """Handle a TU that needs no re-parse — file-record and content bookkeeping.
 
-    Manages file-record updates, symbol reassignment from old config_hash
-    (reuse migration), and ifdef-filtered content filling.  The caller is
-    responsible for applying the returned counters to its own state.
+    Updates the TU's file record and fills ifdef-filtered content.  The caller
+    is responsible for applying the returned counters to its own state.
 
     Args:
         unit: The compilation unit being processed.
-        check_status: One of ``"unchanged"`` or ``"reuse"`` (from
-            :func:`_check_and_parse_unit`).
+        check_status: Always ``"unchanged"`` (from
+            :func:`_check_and_parse_unit`).  Kept as a parameter so the
+            caller's tier dispatch stays explicit.
         hashes: ``(source_hash, flags_hash, manifest_entry_hash)`` tuple
-            from Tier 2 / Tier 2b staleness check, or ``None`` for Tier 1.
+            from the Tier 2 content-hash check, or ``None`` for Tier 1.
         conn: Open SQLite connection to the index database.
         config_hash: Active build config hash.
         project_root: Project root directory.
         build_dir_patterns: Build directory exclusion patterns.
         db_path: Path to the index database file.
         existing_files: Dict mapping file paths to ``FileHashRecord``.
-        processed: 1-based index of this TU in the batch (for logging).
-        total_units: Total TU count (for logging).
+        skip_files: Headers already processed by earlier TUs in this run.
+        manifest_lookup: ``{tu path: manifest entry}`` from ``manifest.json``.
+            A usable entry (real ``source_hash`` and ``flags_hash``) lets an
+            unchanged TU skip the header/content pass entirely — see the
+            comment below.
+        content_backfill_needed: True when some file in the index still has
+            an empty ``content`` column.  Computed once per run by the
+            caller; when True the header/content pass runs even for
+            unchanged TUs so the backfill can complete.
 
     Returns:
         dict with keys:
-        - ``fallthrough`` (bool): True when the TU must be re-parsed in
-          Phase 2 (reuse migration produced 0 symbols).
         - ``file_id`` (int | None): File record ID for use in Phase 2.
         - ``headers`` (dict | None): Collected headers for manifest update.
-        - ``status`` (str): ``"reused (manifest)"``, ``"unchanged (content)"``,
-          or ``"unchanged"``.
-        - ``is_reuse`` (bool): True when the TU was migrated from old config.
-        - ``total_syms`` (int): Symbols copied during reuse migration.
+        - ``status`` (str): ``"unchanged (content)"`` or ``"unchanged"``.
         - ``content_filled`` (int): 1 if ifdef content was filled, 0 otherwise.
     """
-    is_reuse = check_status == "reuse"
-    fname = unit.file.name
     file_path_str = _normalize_file_path(str(unit.file.resolve()), project_root)
+    try:
+        tu_key = str(unit.file.resolve().relative_to(project_root))
+    except ValueError:
+        tu_key = str(unit.file.resolve())
+
+    # An unchanged TU has nothing to contribute to the manifest: its stored
+    # entry is still accurate.  Running the header/content pass anyway would
+    # cost a full libclang parse per TU AND stamp current header hashes onto
+    # a TU that was never re-parsed — erasing the only signal that its
+    # headers are stale.  A preliminary or pre-flags_hash entry does not
+    # qualify: those must be regenerated with real hashes.
+    #
+    # "reuse" is excluded — that path migrates a TU to a new config_hash and
+    # the new manifest still needs its entry.
+    manifest_entry = manifest_lookup.get(tu_key) if manifest_lookup else None
+    manifest_entry_usable = bool(
+        manifest_entry
+        and manifest_entry.get("source_hash")
+        and manifest_entry.get("flags_hash")
+    )
+    skip_header_pass = (
+        check_status == "unchanged" and manifest_entry_usable and not content_backfill_needed
+    )
     rec = existing_files.get(file_path_str)
     file_id = rec.file_id if rec else None
     try:
@@ -726,11 +523,6 @@ def _handle_unchanged_or_reuse(
     except OSError:
         current_mtime = 0.0
 
-    # When "reuse" migration produces 0 symbols (no old data for this
-    # TU), we must fall through to Phase 2 for a real libclang parse
-    # instead of skipping the TU permanently.
-    fallthrough = False
-    total_syms = 0
     content_filled = 0
     headers = None
 
@@ -769,26 +561,7 @@ def _handle_unchanged_or_reuse(
                     "UPDATE files SET mtime=? WHERE id=?",
                     (current_mtime, file_id),
                 )
-            # For "reuse": copy symbols + refs from old config_hash
-            if is_reuse and file_id is not None:
-                syms_copied = _reassign_symbols_for_file(
-                    conn, config_hash, file_id, file_path_str,
-                    project_root=project_root,
-                )
-                if syms_copied > 0:
-                    total_syms = syms_copied
-                else:
-                    # No old data to migrate — clear the file record
-                    # so orphan cleanup handles it, then fall through
-                    # to Phase 2 for a real libclang parse.
-                    log.info(
-                        "[%d/%d] %s: reuse produced 0 symbols — re-parsing",
-                        processed, total_units, fname,
-                    )
-                    conn.execute("UPDATE files SET content = '' WHERE id = ?", (file_id,))
-                    fallthrough = True
-
-            if not fallthrough:
+            if not skip_header_pass:
                 # Fill ifdef-filtered file content via tokenization
                 fc, hdrs = _build_filtered_file_content(
                     conn, unit, config_hash, project_root, build_dir_patterns=build_dir_patterns,
@@ -796,18 +569,11 @@ def _handle_unchanged_or_reuse(
                 )
                 content_filled = fc
                 if hdrs:
-                    try:
-                        tu_key = str(unit.file.resolve().relative_to(project_root))
-                    except ValueError:
-                        tu_key = str(unit.file.resolve())
                     headers = {tu_key: hdrs}
 
     return {
-        "fallthrough": fallthrough,
         "file_id": file_id,
         "headers": headers,
-        "status": "reused (manifest)" if is_reuse else ("unchanged (content)" if hashes is not None else "unchanged"),
-        "is_reuse": is_reuse,
-        "total_syms": total_syms,
+        "status": "unchanged (content)" if hashes is not None else "unchanged",
         "content_filled": content_filled,
     }

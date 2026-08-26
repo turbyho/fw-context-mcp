@@ -51,16 +51,16 @@ except ImportError:
     TranslationUnitLoadError = RuntimeError  # clang not available — use fallback
 from collections import OrderedDict
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    # Type-only import: fw_context_mcp.indexer.symbols pulls in libclang at
+    # import time, and ops is imported on paths that never parse.
+    from fw_context_mcp.indexer.symbols import ExtractionResult
 
 from fw_context_mcp.indexer.config_hash import compute_tu_content_hash
 from fw_context_mcp.indexer.db import (
     _resolve_target_usr,
-    delete_fp_assignments_for_file,
-    delete_indirect_call_sites_for_file,
-    delete_inheritance_for_file,
-    delete_macros_for_file,
-    delete_refs_for_file,
-    delete_symbols_for_file,
     get_file_mtimes,
     insert_fp_assignments_batch,
     insert_indirect_call_sites_batch,
@@ -68,10 +68,15 @@ from fw_context_mcp.indexer.db import (
     insert_macros_batch,
     insert_refs_batch,
     insert_symbols_batch,
+    replace_file_data,
     split_tokens,
     upsert_file,
 )
 from fw_context_mcp.utils import abs_path, compute_content_hash, compute_source_hash, read_file_lines
+
+from .db._chunking import chunked
+from .db._files import FileIdLookup
+from .manifest import _is_generated_header
 
 log = logging.getLogger(__name__)
 
@@ -151,27 +156,46 @@ def _compute_content_hash(
 def _normalize_file_path(file_path: str, project_root: Path) -> str:
     """Convert a file path to project-relative when inside *project_root*.
 
-    Files outside *project_root* (SDK, framework) keep their absolute path.
-    This is the canonical path normalization for the ``files.path`` column —
-    consistent with :func:`_build_filtered_file_content`.
+    Files outside *project_root* (SDK, framework) keep an absolute path, but
+    a RESOLVED one.  The fallback used to return *file_path* untouched, and
+    that produced two ``files`` rows for one file: libclang reports a system
+    header reached through an include path as
+    ``/usr/lib64/gcc/…/16/../../../../include/c++/16/algorithm``, which this
+    function stored verbatim, while ``_build_filtered_file_content`` stored
+    ``str(Path(p).resolve())`` — ``/usr/include/c++/16/algorithm``.  The
+    symbols hung off one row and the content off the other, and nothing
+    matched them up.  Measured on HA_Boiler: 145 duplicate rows, and the
+    whole C++ standard library became invisible once the coverage purge
+    removed the spelling the manifest did not use.
+
+    One spelling per file is the invariant every path-keyed lookup relies on,
+    so this is the only place that decides it.
     """
-    resolved_root = project_root.resolve()
+    resolved = Path(file_path).resolve()
     try:
-        return str(Path(file_path).resolve().relative_to(resolved_root))
+        return str(resolved.relative_to(project_root.resolve()))
     except ValueError:
-        return file_path
+        return str(resolved)
 
 
 def _build_filtered_file_content(
     conn, unit, config_hash: str, project_root: Path, *, build_dir_patterns: list[str] | None = None, existing_tu=None,
     skip_files: frozenset[str] | None = None,
+    refresh_paths: set[str] | None = None,
 ) -> tuple[int, list[dict]]:
     """Tokenize TU, extract active lines per file, store ifdef-filtered content.
 
     Parses *unit* (a ``CompilationUnit`` data class) with libclang, then
     tokenizes to find which source lines are active (not ``#ifdef``-dead).
-    Only processes files whose ``content`` column is still empty — once set,
-    content is trusted until the next full reindex.
+    Processes files whose ``content`` column is still empty, plus the files
+    named in *refresh_paths* — the set this parse owns, whose text just
+    changed.  Everything else keeps its stored content: re-filtering a file
+    that did not change would cost an AST walk for an identical result.
+
+    WHY *refresh_paths* is needed: ``files.content`` backs ``read_file`` and
+    ``search_content``.  Without it a file's indexed text is frozen at the
+    first index — a re-parsed TU would report fresh symbols while the same
+    tools served the pre-change source.
 
     Also collects included header paths and their SHA-256 hashes — used by
     the manifest update phase to avoid a second tokenization pass.
@@ -233,7 +257,6 @@ def _build_filtered_file_content(
             log.debug("_build_filtered_file_content: parse failed for %s", unit.file.name)
             return 0, []
 
-    from fw_context_mcp.indexer.manifest import HEADER_EXTS as _HEADER_EXTS
     from fw_context_mcp.indexer.manifest import _is_generated_header
 
     # ── Collect included header paths + SHA-256 hashes (always needed for manifest) ──
@@ -247,9 +270,9 @@ def _build_filtered_file_content(
         seen_headers.add(abs_path)
 
         resolved = Path(abs_path).resolve()
-        if resolved.suffix.lower() not in _HEADER_EXTS:
-            continue
-
+        # No extension filter — see _collect_headers_from_tokens() for why.
+        # Anything reached by an #include belongs in the manifest, or it can
+        # neither be kept nor invalidated.
         try:
             rel = str(resolved.relative_to(project_root))
         except ValueError:
@@ -263,7 +286,7 @@ def _build_filtered_file_content(
     # Skip tokenization and AST walk — they're only needed for content-fill,
     # not for header collection (which only needs get_includes, already done).
     filled = 0
-    if remaining == 0:
+    if remaining == 0 and not refresh_paths:
         return 0, headers
 
     # ── Build ifdef-filtered content for files that still need it ──
@@ -319,12 +342,13 @@ def _build_filtered_file_content(
         db_path = _normalize_file_path(abs_path, project_root)
         resolved = Path(abs_path).resolve()
 
-        # Already processed?
+        # Already processed — and not owned by this parse, so its stored
+        # content still matches the disk.
         row = conn.execute(
             "SELECT content FROM files WHERE config_hash=? AND path=?",
             (config_hash, db_path),
         ).fetchone()
-        if row and row[0]:
+        if row and row[0] and not (refresh_paths and db_path in refresh_paths):
             continue  # already have filtered content
 
         # Read original file
@@ -351,11 +375,28 @@ def _build_filtered_file_content(
             file_mtime = resolved.stat().st_mtime
         except OSError:
             file_mtime = 0.0
+        # The stored mtime moves forward together with the content: both come
+        # from the text this parse just read, so the pair stays consistent.
+        # Updating mtime without the content would hide a real change.
+        # `generated` is written here too, and not only in
+        # _store_symbol_rows.  That function iterates over SYMBOLS, so a
+        # header that declares nothing never reaches it — this INSERT is the
+        # only creator of its row.  Measured on HA_Boiler: 7 of 56 generated
+        # headers, among them umbrella and version headers, came in this way
+        # and kept generated=0 while the manifest said True.
+        #
+        # MAX for the same reason upsert_file() uses it: `generated` is a
+        # property of the PATH, so it goes from 0 to 1 and never back.
         conn.execute(
-            "INSERT INTO files (config_hash, path, language, content, mtime) "
-            "VALUES (?, ?, ?, ?, ?) "
-            "ON CONFLICT (config_hash, path) DO UPDATE SET content = excluded.content",
-            (config_hash, db_path, lang, content, file_mtime),
+            "INSERT INTO files (config_hash, path, language, content, mtime, generated) "
+            "VALUES (?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT (config_hash, path) DO UPDATE SET "
+            "content = excluded.content, mtime = MAX(files.mtime, excluded.mtime), "
+            "generated = MAX(files.generated, excluded.generated)",
+            (
+                config_hash, db_path, lang, content, file_mtime,
+                int(_is_generated_header(db_path, build_dir_patterns)),
+            ),
         )
         filled += 1
 
@@ -372,6 +413,7 @@ def _store_symbol_rows(
     project_root: Path,
     vendor_patterns: list[str],
     project_patterns: list[str],
+    build_dir_patterns: list[str] | None = None,
 ) -> tuple[int, dict[int, int]]:
     """Build and batch-insert symbol rows for one TU.
 
@@ -396,6 +438,15 @@ def _store_symbol_rows(
       - Bodies are only extracted for definitions (``is_definition``
         with ``end_line > start_line``).  Declarations and forward
         declarations store ``body=''`` to save disk space.
+      - ``files.generated`` is written from *build_dir_patterns*, the same
+        source the manifest uses for ``headers[path].generated``.  The two
+        must agree; a disagreement means somebody wrote the manifest with
+        different patterns from the ones the index used.
+
+    *build_dir_patterns* does NOT take part in ``is_project``.  Generated
+    code is project code, and the two columns answer different questions:
+    ``is_project`` asks who owns the file, ``generated`` asks whether a tool
+    wrote it.
     """
     from .sdk_detect import _path_matches
 
@@ -411,7 +462,9 @@ def _store_symbol_rows(
             except OSError:
                 sym_mtime = 0.0
             file_id_cache[normalized_sym_file] = upsert_file(
-                conn, config_hash, normalized_sym_file, lang, mtime=sym_mtime,
+                conn, config_hash, normalized_sym_file, lang,
+                generated=_is_generated_header(normalized_sym_file, build_dir_patterns),
+                mtime=sym_mtime,
             )
         rel_path = normalized_sym_file
         # ── Compute is_project ──
@@ -602,46 +655,82 @@ def _detect_moved_symbols(
         log.debug("Detected %d moved symbols", moved)
 
 
+def _owned_file_ids(
+    known: FileIdLookup,
+    normalized_tu_path: str,
+    owned_paths: set[str] | None,
+) -> list[int]:
+    """Return the previous file_ids of the files this parse owns.
+
+    Paths with no previous row (first index of that file) are skipped —
+    there is nothing to delete or compare for them.  Falls back to the TU's
+    own file when *owned_paths* is None, which reproduces the behaviour from
+    before header ownership was tracked.
+    """
+    paths = owned_paths if owned_paths is not None else {normalized_tu_path}
+    return sorted({known[p][0] for p in paths if p in known})
+
+
 def _save_old_state(
     conn: sqlite3.Connection,
     normalized_tu_path: str,
-    known: dict[str, tuple[int, float]],
+    known: FileIdLookup,
+    *,
+    owned_paths: set[str] | None = None,
 ) -> set[str]:
-    """Return USRs of symbols that existed for this TU in a previous build.
+    """Return USRs of symbols that existed for the files this parse owns.
 
     Used by :func:`_detect_moved_symbols` to detect symbols that moved
     between files.
 
-    Only symbols whose file_id matches this TU's old file_id are included —
-    symbols from other TUs that happen to share the same USR (e.g. because
-    a header was included by both) are correctly excluded.
+    The set spans the TU plus the headers it claimed this run (*owned_paths*)
+    — exactly the rows :func:`_delete_old_for_tu` is about to delete.  A
+    symbol that stays in the same owned header must not look "new" to move
+    detection, or it would be treated as an incoming move from its own file.
+    Symbols owned by OTHER TUs are still excluded, even when they share a USR
+    because both include the same header.
     """
-    if normalized_tu_path not in known:
+    file_ids = _owned_file_ids(known, normalized_tu_path, owned_paths)
+    if not file_ids:
         return set()
-    file_id_old = known[normalized_tu_path][0]
-    rows = conn.execute(
-        "SELECT usr FROM symbols WHERE file_id = ?",
-        (file_id_old,),
-    ).fetchall()
-    return {r["usr"] for r in rows}
+    usrs: set[str] = set()
+    for chunk in chunked(file_ids):
+        placeholders = ",".join("?" * len(chunk))
+        rows = conn.execute(
+            f"SELECT usr FROM symbols WHERE file_id IN ({placeholders})",
+            chunk,
+        ).fetchall()
+        usrs.update(r["usr"] for r in rows)
+    return usrs
 
 
 def _delete_old_for_tu(
     conn: sqlite3.Connection,
     config_hash: str,
     normalized_tu_path: str,
-    known: dict[str, tuple[int, float]],
+    known: FileIdLookup,
     syms: list,
+    *,
+    owned_paths: set[str] | None = None,
 ) -> None:
-    """Delete stale data for a TU before inserting fresh symbols.
+    """Delete stale data for the files this parse owns, before inserting.
 
     Performs four cleanup actions:
       1. Deletes inheritance edges for classes being re-parsed (class
          hierarchy may have changed: removed bases, added bases).
       2. Deletes ``embeddings``, ``llm_analysis``, and ``vec_symbols``
          rows for symbols about to be deleted — prevents orphan rows.
-      3. Deletes all inheritance records tied to this TU's file_id.
-      4. Deletes all symbols tied to this TU's file_id (the main cleanup).
+      3. Deletes all inheritance records tied to the owned file_ids.
+      4. Deletes all symbols tied to the owned file_ids (the main cleanup).
+
+    *owned_paths* covers the TU plus the headers it claimed this run.  It
+    must include the headers: their symbol rows carry the HEADER's file_id,
+    so deleting only the TU's file_id would leave them in place.  The fresh
+    rows would then hit ``ON CONFLICT(config_hash, usr)`` in
+    ``insert_symbols_batch``, whose guard only promotes a declaration to a
+    definition — every other update is dropped.  The visible effect is a
+    header whose symbols keep the line numbers, signatures, and even the
+    membership of the very first index.
 
     Inheritance is cleaned first because the ``inheritance`` table has
     no FK to ``symbols`` (the FK constraint was dropped to allow deferred
@@ -665,34 +754,16 @@ def _delete_old_for_tu(
                 "DELETE FROM inheritance WHERE config_hash = ? AND derived_usr = ?",
                 (config_hash, usr),
             )
-    # Step 2-4: Delete all data for this TU's old file_id.
-    if normalized_tu_path in known:
-        file_id_old = known[normalized_tu_path][0]
-        # Delete embeddings and analysis BEFORE symbols, even though
-        # SQLite FK cascades would handle it in order — doing it
-        # explicitly avoids FK constraint violations when the FK
-        # was deferred or when the schema was created without ON DELETE
-        # CASCADE.
-        conn.execute(
-            "DELETE FROM embeddings WHERE symbol_id IN "
-            "(SELECT id FROM symbols WHERE file_id = ?)",
-            (file_id_old,),
-        )
-        conn.execute(
-            "DELETE FROM llm_analysis WHERE symbol_id IN "
-            "(SELECT id FROM symbols WHERE file_id = ?)",
-            (file_id_old,),
-        )
-        try:
-            conn.execute(
-                "DELETE FROM vec_symbols WHERE symbol_id IN "
-                "(SELECT id FROM symbols WHERE file_id = ?)",
-                (file_id_old,),
-            )
-        except sqlite3.OperationalError:
-            pass  # sqlite-vec may not be loaded
-        delete_inheritance_for_file(conn, config_hash, file_id_old)
-        delete_symbols_for_file(conn, file_id_old)
+    # Step 2: hand the owned files to the one primitive that knows what a
+    #         file owns — symbols, macros, inheritance, embeddings, analysis,
+    #         vectors, and the refs / call sites / assignments originating in
+    #         it.  This used to be three cleanups keyed three different ways
+    #         (file_id here, paths in the refs block, file_id again for
+    #         macros), each deriving "which files does this parse own" for
+    #         itself, and each getting it wrong for rows owned by a header.
+    replace_file_data(
+        conn, config_hash, _owned_file_ids(known, normalized_tu_path, owned_paths)
+    )
 
 
 def _store_macros_for_unit(
@@ -706,21 +777,27 @@ def _store_macros_for_unit(
     file_id_cache: dict[str, int],
     project_root: Path,
 ) -> None:
-    """Insert or update macro definitions for one translation unit.
+    """Insert macro definitions for one translation unit.
 
-    Upserts file records for header files that contain macros, then
-    replaces all macros previously stored for this TU with the fresh set.
+    Upserts file records for header files that contain macros, then inserts
+    the fresh set.  Nothing is deleted here: ``replace_file_data()`` already
+    cleared the macros of every file this parse owns, including the headers,
+    and it did so whether or not this parse found any macros to replace them
+    with.  A ``#define`` in a header is stored under the HEADER's file_id, so
+    a delete keyed on ``tu_file_id`` alone used to leave those rows behind.
 
-    Macro storage is per-TU replacement, not per-macro upsert.  This is
-    necessary because the same macro name may be defined with different
-    values in different TUs (``#ifdef``-conditional definitions) — per-TU
-    replacement ensures each TU's view of the macro is consistent with
-    its own preprocessing output.
+    Macro storage is per-owned-file replacement, not per-macro upsert.  This
+    is necessary because the same macro name may be defined with different
+    values in different TUs (``#ifdef``-conditional definitions) — replacing
+    a whole file's rows ensures each TU's view of the macro is consistent
+    with its own preprocessing output.
 
     The mtime for the TU's own file uses the current stat result; header
     files get mtime=0.0 if stat fails (the upsert_file call will look up
     the existing mtime from the DB via its ON CONFLICT handler).
     """
+    # No delete here: replace_file_data() already cleared the macros of every
+    # owned file, whether or not this parse found any to replace them with.
     if not macros:
         return
     macro_rows: list[tuple] = []
@@ -747,9 +824,6 @@ def _store_macros_for_unit(
                 int(m.is_function_like),
             )
         )
-    # Delete old macros for this TU before inserting — prevents stale
-    # macro definitions from surviving across reindexes.
-    delete_macros_for_file(conn, tu_file_id)
     if macro_rows:
         insert_macros_batch(conn, macro_rows)
 
@@ -761,7 +835,7 @@ def store_symbols_for_unit(
     vendor_patterns: list[str] | None = None,
     project_patterns: list[str] | None = None,
     index_refs: bool = False,
-    pre_parsed=None,
+    pre_parsed: ExtractionResult | None = None,
     existing_files: dict[str, tuple[int, float]] | None = None,
     hashes=None,
     build_dir_patterns: list[str] | None = None,
@@ -789,10 +863,12 @@ def store_symbols_for_unit(
     Patterns must already be normalized (``third_party`` → ``third_party/%``).
     ``project_patterns`` take priority over ``vendor_patterns``.
 
-    *pre_parsed* is an optional tuple ``(syms, refs, inheritance,
-    indirect_call_sites, fp_assignments)`` from a prior ``extract_all``
-    call.  When provided, the libclang parse step is skipped entirely.
-    This allows callers to run expensive parsing outside the write lock.
+    *pre_parsed* is an optional ``ExtractionResult`` from a prior
+    ``extract_all`` call.  When provided, the libclang parse step is skipped
+    entirely, which lets callers parse outside the write lock.  It must be the
+    dataclass: its ``newly_seen_files`` is what tells the cleanup which files
+    this parse owns, and a caller that cannot supply that has no business
+    skipping the parse.
 
     *existing_files* is an optional ``{path: (file_id, mtime)}`` dict
     from ``get_file_mtimes()``.  When provided (bulk indexing path), it
@@ -814,36 +890,30 @@ def store_symbols_for_unit(
     except OSError:
         current_mtime = 0.0
 
-    # Parse (or use caller-supplied pre-parsed data)
-    # pre_parsed supports three shapes for backward compatibility:
-    #   1. ExtractionResult dataclass (current) — has `.tu` attribute
-    #   2. Old-style 7-tuple: (tu, syms, refs, inheritance, ics, fpa, macros)
-    #   3. Old-style 6-tuple: (syms, refs, inheritance, ics, fpa, macros)
-    #   4. Old-style 5-tuple: (syms, refs, inheritance, ics, fpa) — before macros
-    # The dataclass check (hasattr) is the fast path for all current callers.
+    # Parse, or use the caller's ExtractionResult.
+    #
+    # This used to accept three positional tuple shapes as well, for callers
+    # that predated the dataclass.  Nothing in the package passed one; the only
+    # users were tests, and the 5-tuple shape had become actively wrong — it
+    # carried no macros, so it read as "this parse found none" and the cleanup
+    # cleared the stored ones with nothing to put back.
     tu = None
+    newly_seen: set[str] = set()
     if pre_parsed is not None:
-        # ExtractionResult dataclass — use named fields instead of positional unpacking
-        if hasattr(pre_parsed, 'tu'):
-            result = pre_parsed
-            tu = result.tu
-            syms = result.symbols
-            refs = result.references
-            inheritance = result.inheritance
-            indirect_call_sites = result.indirect_call_sites
-            fp_assignments = result.fp_assignments
-            macros = result.macros
-            pending_dispatches = getattr(result, 'pending_dispatches', [])
-        elif len(pre_parsed) == 7:
-            tu, syms, refs, inheritance, indirect_call_sites, fp_assignments, macros = pre_parsed
-            pending_dispatches = []
-        elif len(pre_parsed) == 6:
-            syms, refs, inheritance, indirect_call_sites, fp_assignments, macros = pre_parsed
-            pending_dispatches = []
-        else:
-            syms, refs, inheritance, indirect_call_sites, fp_assignments = pre_parsed
-            macros = []
-            pending_dispatches = []
+        result = pre_parsed
+        tu = result.tu
+        syms = result.symbols
+        refs = result.references
+        inheritance = result.inheritance
+        indirect_call_sites = result.indirect_call_sites
+        fp_assignments = result.fp_assignments
+        macros = result.macros
+        pending_dispatches = result.pending_dispatches
+        # Every file whose cursors this parse walked — the set this TU owns in
+        # this run.  Headers already claimed by an earlier TU are absent
+        # (skip_files excluded their subtrees).  Drives stale-row deletion and
+        # the content refresh below.
+        newly_seen = set(result.newly_seen_files or ())
     else:
         # ── Run libclang parse inside the write lock ──
         # Two types of exceptions are handled differently:
@@ -871,6 +941,11 @@ def store_symbols_for_unit(
             fp_assignments = result.fp_assignments
             macros = result.macros
             pending_dispatches = getattr(result, 'pending_dispatches', [])
+            # Every file whose cursors this parse walked — the set this TU
+            # owns in this run.  Headers already claimed by an earlier TU are
+            # absent (skip_files excluded their subtrees).  Drives stale-row
+            # deletion and the content refresh below.
+            newly_seen = set(getattr(result, "newly_seen_files", ()) or ())
         except sqlite3.Error:
             log.error("Fatal DB error parsing %s — stopping indexer", unit.file.name)
             raise
@@ -895,11 +970,20 @@ def store_symbols_for_unit(
     # ── Clear body cache per TU — fresh reads for each translation unit ──
     _clear_body_cache()
 
+    # ── Files this parse owns: the TU plus the headers it claimed ──
+    # Symbol rows for a header live under the HEADER's file_id, not the TU's.
+    # Deleting by the TU's file_id alone leaves them behind, and the fresh
+    # rows then lose the ON CONFLICT(config_hash, usr) race in
+    # insert_symbols_batch — a header definition would keep its first-index
+    # line numbers forever and a deleted declaration would never disappear.
+    owned_paths = {_normalize_file_path(p, project_root) for p in newly_seen}
+    owned_paths.add(normalized_tu_path)
+
     # ── Phase 1: Save USRs of old symbols ──
-    old_usrs = _save_old_state(conn, normalized_tu_path, known)
+    old_usrs = _save_old_state(conn, normalized_tu_path, known, owned_paths=owned_paths)
 
     # ── Phase 2: Delete old symbols ──
-    _delete_old_for_tu(conn, config_hash, normalized_tu_path, known, syms)
+    _delete_old_for_tu(conn, config_hash, normalized_tu_path, known, syms, owned_paths=owned_paths)
 
     # Upsert the TU file record and capture its id.
     # When the caller provides hashes (bulk-indexing path with pre-computed
@@ -926,7 +1010,7 @@ def store_symbols_for_unit(
     if syms:
         syms_added, file_proj = _store_symbol_rows(
             conn, config_hash, syms, file_id_cache, project_root,
-            vendor_patterns, project_patterns,
+            vendor_patterns, project_patterns, build_dir_patterns,
         )
         # Update files.is_project for all files touched by this TU.
         # Using ``is_project < ip`` ensures a file that was previously
@@ -940,25 +1024,26 @@ def store_symbols_for_unit(
             )
         _detect_moved_symbols(conn, config_hash, syms, old_usrs, file_id_cache, project_root)
 
-    # Path-relative helper used by refs and indirect_call_sites blocks
+    # Every path written to or matched against the database goes through the
+    # one normaliser.  There used to be a second, local one here that omitted
+    # project_root.resolve(); the two agreed for an ordinary checkout and
+    # diverged for a symlinked project root, which would have made
+    # refs.from_file unmatchable against files.path.
     def _rel(p: str) -> str:
-        try:
-            return str(Path(p).resolve().relative_to(project_root))
-        except ValueError:
-            return p
+        return _normalize_file_path(p, project_root)
 
-    tu_rel = _rel(file_path)
+    # No per-table delete set is derived here any more.  The stale rows of
+    # every file this parse owns — the reference tables included — were
+    # cleared by replace_file_data() in phase 2, from the file ids alone.
 
     # References
     if index_refs and refs:
-        delete_refs_for_file(conn, config_hash, tu_rel)
         ref_rows = [(config_hash, r.to_usr, _rel(r.from_file), r.from_line, r.from_usr, r.ref_kind) for r in refs]
         insert_refs_batch(conn, ref_rows)
         refs_added = len(ref_rows)
 
     # Indirect call sites (function pointer invocations)
     if index_refs and indirect_call_sites:
-        delete_indirect_call_sites_for_file(conn, config_hash, tu_rel)
         ics_rows = [
             (
                 config_hash,
@@ -976,7 +1061,6 @@ def store_symbols_for_unit(
 
     # Function pointer assignments (Phase 3 — links assignments to call sites)
     if index_refs and fp_assignments:
-        delete_fp_assignments_for_file(conn, config_hash, tu_rel)
         fpa_rows = [
             (
                 config_hash,
@@ -1048,7 +1132,7 @@ def store_symbols_for_unit(
     _t_content = time.monotonic()
     _, headers = _build_filtered_file_content(
         conn, unit, config_hash, project_root, build_dir_patterns=build_dir_patterns, existing_tu=tu,
-        skip_files=skip_files,
+        skip_files=skip_files, refresh_paths=owned_paths,
     )
     _t_content = time.monotonic() - _t_content
 

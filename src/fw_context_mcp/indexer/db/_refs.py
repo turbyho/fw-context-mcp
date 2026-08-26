@@ -59,6 +59,9 @@ from __future__ import annotations
 
 import logging
 import sqlite3
+from collections.abc import Sequence
+
+from ._chunking import chunked
 
 log = logging.getLogger(__name__)
 
@@ -66,9 +69,9 @@ __all__ = [
     "count_fp_assignments",
     "count_indirect_call_sites",
     "count_refs",
-    "delete_fp_assignments_for_file",
-    "delete_indirect_call_sites_for_file",
-    "delete_refs_for_file",
+    "delete_fp_assignments_for_files",
+    "delete_indirect_call_sites_for_files",
+    "delete_refs_for_files",
     "find_indirect_call_sites",
     "find_indirect_targets",
     "find_refs",
@@ -97,22 +100,55 @@ def insert_refs_batch(conn: sqlite3.Connection, rows: list[tuple]) -> int:
     return cur.rowcount
 
 
-def delete_refs_for_file(conn: sqlite3.Connection, config_hash: str, from_file: str) -> None:
-    """Delete all refs originating in *from_file* under *config_hash*.
 
-    Called before re-indexing a TU to remove stale reference entries.
-    After deletion, the TU's fresh references are re-inserted via
-    ``insert_refs_batch()``.
 
-    Why by file not by USR: a single TU can contain hundreds of symbols,
-    each with dozens of references.  Deleting by file in one DELETE is
-    O(log N) via the index; deleting per-USR would be O(N*log M) with
-    N round-trips.
+def _delete_by_from_file(
+    conn: sqlite3.Connection,
+    table: str,
+    config_hash: str,
+    from_files: Sequence[str],
+) -> None:
+    """Delete rows of *table* whose ``from_file`` is one of *from_files*.
+
+    Shared by the three reference tables: they all key their rows on
+    ``(config_hash, from_file)`` and all carry an index on that pair, so the
+    ``IN`` list resolves to index seeks instead of a table scan.
+
+    *table* is never caller-supplied data — the three public wrappers below
+    each pass a literal name.  Only ``?`` placeholders are interpolated.
     """
-    conn.execute(
-        "DELETE FROM refs WHERE config_hash=? AND from_file=?",
-        (config_hash, from_file),
-    )
+    paths = list(dict.fromkeys(from_files))  # dedupe, keep a stable order
+    if not paths:
+        return
+    for chunk in chunked(paths):
+        placeholders = ",".join("?" * len(chunk))
+        conn.execute(
+            f"DELETE FROM {table} WHERE config_hash=? AND from_file IN ({placeholders})",
+            (config_hash, *chunk),
+        )
+
+
+def delete_refs_for_files(
+    conn: sqlite3.Connection,
+    config_hash: str,
+    from_files: Sequence[str],
+) -> None:
+    """Delete all refs originating in any of *from_files* under *config_hash*.
+
+    WHY a plural form is needed: a translation unit owns more than its own
+    file.  A call inside an inline function in a header is stored with the
+    HEADER's path in ``from_file``, so a delete keyed on the TU path alone
+    leaves those rows behind.  A call removed from a header then keeps its
+    refs row — ``find_callers`` reports a caller that no longer exists — and
+    a call that only moved gains a SECOND row, because ``idx_refs_unique``
+    includes ``from_line`` and ``insert_refs_batch`` uses ``INSERT OR
+    IGNORE``.
+
+    *from_files* must be normalised exactly the way ``insert_refs_batch``
+    normalises the paths it writes.  A path built by a different normaliser
+    would not match, and the stale row would survive the delete.
+    """
+    _delete_by_from_file(conn, "refs", config_hash, from_files)
 
 
 # ---------------------------------------------------------------------------
@@ -131,7 +167,7 @@ def insert_indirect_call_sites_batch(conn: sqlite3.Connection, rows: list[tuple]
     from the same line (e.g., inside a loop).  Each invocation is a
     separate call-site row.  Duplicate prevention is not needed here
     because re-indexing cleans the file's entries first via
-    ``delete_indirect_call_sites_for_file()``.
+    ``delete_indirect_call_sites_for_files()``.
     """
     cur = conn.executemany(
         """INSERT INTO indirect_call_sites
@@ -142,12 +178,20 @@ def insert_indirect_call_sites_batch(conn: sqlite3.Connection, rows: list[tuple]
     return cur.rowcount
 
 
-def delete_indirect_call_sites_for_file(conn: sqlite3.Connection, config_hash: str, from_file: str) -> None:
-    """Delete all indirect call sites originating in a given file (for incremental reindex)."""
-    conn.execute(
-        "DELETE FROM indirect_call_sites WHERE config_hash=? AND from_file=?",
-        (config_hash, from_file),
-    )
+def delete_indirect_call_sites_for_files(
+    conn: sqlite3.Connection,
+    config_hash: str,
+    from_files: Sequence[str],
+) -> None:
+    """Delete indirect call sites originating in any of *from_files*.
+
+    Same header-ownership problem as :func:`delete_refs_for_files`, with a
+    worse failure mode: ``indirect_call_sites`` has NO unique constraint (one
+    field can legitimately be invoked many times from a single line), so a
+    function pointer call inside an inline header function gains a duplicate
+    row on EVERY reindex, without bound.
+    """
+    _delete_by_from_file(conn, "indirect_call_sites", config_hash, from_files)
 
 
 def find_indirect_call_sites(
@@ -237,18 +281,19 @@ def insert_fp_assignments_batch(conn: sqlite3.Connection, rows: list[tuple]) -> 
     return cur.rowcount
 
 
-def delete_fp_assignments_for_file(
+def delete_fp_assignments_for_files(
     conn: sqlite3.Connection,
     config_hash: str,
-    from_file: str,
+    from_files: Sequence[str],
 ) -> None:
-    """Delete fp_assignments rows for *from_file* under *config_hash*.
+    """Delete fp_assignments rows originating in any of *from_files*.
 
-    Called before re-indexing a TU to remove stale entries."""
-    conn.execute(
-        "DELETE FROM fp_assignments WHERE config_hash = ? AND from_file = ?",
-        (config_hash, from_file),
-    )
+    Same header-ownership problem as :func:`delete_refs_for_files`: a
+    ``handler = &fn`` assignment inside an inline function in a header is
+    stored under the HEADER's path, not the translation unit's.
+    """
+    _delete_by_from_file(conn, "fp_assignments", config_hash, from_files)
+
 
 
 def find_indirect_targets(

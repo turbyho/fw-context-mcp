@@ -1,5 +1,7 @@
 """Tests for fw_context_mcp.indexer.db."""
 
+from pathlib import Path
+
 import pytest
 
 from fw_context_mcp.indexer.db import (
@@ -7,8 +9,8 @@ from fw_context_mcp.indexer.db import (
     _expand_query,
     count_refs,
     delete_inheritance_for_file,
-    delete_macros_for_file,
-    delete_refs_for_file,
+    delete_macros_for_files,
+    delete_refs_for_files,
     delete_symbols_for_file,
     find_refs,
     get_active_config,
@@ -561,17 +563,59 @@ class TestRefs:
         assert len(rows) == 1
         assert rows[0]["caller_name"] is None
 
-    def test_delete_refs_for_file(self, populated_db):
+    def test_delete_refs_for_files(self, populated_db):
+        """The plural form clears several origin files in one call."""
         self._setup_symbols(populated_db)
         insert_refs_batch(populated_db, [
             ("hash-deadbeef", "U_callee", "src/app.cpp", 55, "U_caller", "call"),
+            ("hash-deadbeef", "U_callee", "src/inline.h", 7, "U_caller", "call"),
             ("hash-deadbeef", "U_callee", "src/other.cpp", 5, None, "call"),
         ])
-        assert count_refs(populated_db, "hash-deadbeef") == 2
-        delete_refs_for_file(populated_db, "hash-deadbeef", "src/app.cpp")
-        assert count_refs(populated_db, "hash-deadbeef") == 1
+        assert count_refs(populated_db, "hash-deadbeef") == 3
+        delete_refs_for_files(
+            populated_db, "hash-deadbeef", ["src/app.cpp", "src/inline.h"]
+        )
         remaining = find_refs(populated_db, "hash-deadbeef", "modem_init")
-        assert remaining[0]["from_file"] == "src/other.cpp"
+        assert [r["from_file"] for r in remaining] == ["src/other.cpp"]
+
+    def test_delete_refs_for_files_empty_list_is_a_noop(self, populated_db):
+        """An empty path list must not turn into an unfiltered DELETE."""
+        self._setup_symbols(populated_db)
+        insert_refs_batch(populated_db, [
+            ("hash-deadbeef", "U_callee", "src/app.cpp", 55, "U_caller", "call"),
+        ])
+        delete_refs_for_files(populated_db, "hash-deadbeef", [])
+        assert count_refs(populated_db, "hash-deadbeef") == 1
+
+    def test_delete_refs_for_files_respects_config_hash(self, populated_db):
+        """Rows of another config must survive a delete for the same path."""
+        self._setup_symbols(populated_db)
+        insert_refs_batch(populated_db, [
+            ("hash-deadbeef", "U_callee", "src/app.cpp", 55, "U_caller", "call"),
+            ("hash-other", "U_callee", "src/app.cpp", 55, "U_caller", "call"),
+        ])
+        delete_refs_for_files(populated_db, "hash-deadbeef", ["src/app.cpp"])
+        assert count_refs(populated_db, "hash-deadbeef") == 0
+        assert count_refs(populated_db, "hash-other") == 1
+
+    def test_delete_refs_for_files_beyond_the_parameter_limit(self, populated_db):
+        """More paths than one statement can bind must still all be deleted.
+
+        A single TU on an SDK-heavy project owns well over a thousand headers,
+        so the delete has to chunk.  1200 paths forces at least three chunks.
+        """
+        self._setup_symbols(populated_db)
+        paths = [f"src/gen/hdr_{i:04d}.h" for i in range(1200)]
+        insert_refs_batch(populated_db, [
+            ("hash-deadbeef", "U_callee", p, 1, "U_caller", "call") for p in paths
+        ])
+        insert_refs_batch(populated_db, [
+            ("hash-deadbeef", "U_callee", "src/keep.cpp", 1, "U_caller", "call"),
+        ])
+        assert count_refs(populated_db, "hash-deadbeef") == 1201
+        delete_refs_for_files(populated_db, "hash-deadbeef", paths)
+        remaining = find_refs(populated_db, "hash-deadbeef", "modem_init")
+        assert [r["from_file"] for r in remaining] == ["src/keep.cpp"]
 
     def test_find_refs_no_match(self, populated_db):
         self._setup_symbols(populated_db)
@@ -1485,7 +1529,7 @@ class TestFilesIsProject:
         from fw_context_mcp.indexer.compile_commands import CompilationUnit
         from fw_context_mcp.indexer.db import open_db, upsert_build_config, upsert_project
         from fw_context_mcp.indexer.ops import store_symbols_for_unit
-        from fw_context_mcp.indexer.symbols import extract_all
+        from fw_context_mcp.indexer.symbols import ExtractionResult, extract_all
 
         src = tmp_path / "src"
         src.mkdir()
@@ -1522,7 +1566,11 @@ class TestFilesIsProject:
             conn, unit_proj, config_hash, tmp_path,
             vendor_patterns=vendor_patterns,
             project_patterns=project_patterns,
-            pre_parsed=(syms, refs, inheritance, indirect, fp_assigns, macros),
+            pre_parsed=ExtractionResult(
+                symbols=syms, references=refs, inheritance=inheritance,
+                indirect_call_sites=indirect, fp_assignments=fp_assigns,
+                macros=macros,
+            ),
         )
         conn.commit()
 
@@ -1546,7 +1594,11 @@ class TestFilesIsProject:
             conn, unit_vendor, config_hash, tmp_path,
             vendor_patterns=vendor_patterns,
             project_patterns=project_patterns,
-            pre_parsed=(syms_v, refs_v, inh_v, ind_v, fpa_v, mac_v),
+            pre_parsed=ExtractionResult(
+                symbols=syms_v, references=refs_v, inheritance=inh_v,
+                indirect_call_sites=ind_v, fp_assignments=fpa_v,
+                macros=mac_v,
+            ),
         )
         conn.commit()
 
@@ -1567,7 +1619,7 @@ class TestFilesIsProject:
         from fw_context_mcp.indexer.compile_commands import CompilationUnit
         from fw_context_mcp.indexer.db import open_db, upsert_build_config, upsert_project
         from fw_context_mcp.indexer.ops import store_symbols_for_unit
-        from fw_context_mcp.indexer.symbols import extract_all
+        from fw_context_mcp.indexer.symbols import ExtractionResult, extract_all
 
         src = tmp_path / "lib" / "muj_modul"
         src.mkdir(parents=True)
@@ -1596,7 +1648,11 @@ class TestFilesIsProject:
             conn, unit, config_hash, tmp_path,
             vendor_patterns=vendor_patterns,
             project_patterns=project_patterns,
-            pre_parsed=(syms, refs, inheritance, indirect, fp_assigns, macros),
+            pre_parsed=ExtractionResult(
+                symbols=syms, references=refs, inheritance=inheritance,
+                indirect_call_sites=indirect, fp_assignments=fp_assigns,
+                macros=macros,
+            ),
         )
         conn.commit()
 
@@ -2010,22 +2066,79 @@ class TestMacros:
         assert len(results) == 1
         assert results[0][0] == "REBUILD_TEST"
 
-    def test_delete_macros_for_file(self, populated_db):
-        """Deleting by file_id removes macros and FTS entries."""
+    def test_delete_macros_for_files_clears_the_fts_index(self, populated_db):
+        """The delete must reach macros_fts through the ad trigger."""
         conn = populated_db
         fid = upsert_file(conn, "hash-deadbeef", "/tmp/test.h", "cpp")
         insert_macros_batch(conn, [
             ("hash-deadbeef", fid, "TO_DELETE", "42", "42", 1, 0),
         ])
-        count_before = conn.execute(
+        assert conn.execute(
             "SELECT COUNT(*) FROM macros_fts WHERE macros_fts MATCH 'name:to_delete'"
-        ).fetchone()[0]
-        assert count_before == 1
-        delete_macros_for_file(conn, fid)
-        count_after = conn.execute(
+        ).fetchone()[0] == 1
+        delete_macros_for_files(conn, [fid])
+        assert conn.execute(
+            "SELECT COUNT(*) FROM macros WHERE file_id=?", (fid,)
+        ).fetchone()[0] == 0
+        assert conn.execute(
+            "SELECT COUNT(*) FROM macros_fts WHERE macros_fts MATCH 'name:to_delete'"
+        ).fetchone()[0] == 0, "the FTS index kept a deleted macro"
+
+    def test_delete_macros_for_files(self, populated_db):
+        """The plural form clears several files' macros in one call."""
+        conn = populated_db
+        tu_id = upsert_file(conn, "hash-deadbeef", "/tmp/main.c", "c")
+        hdr_id = upsert_file(conn, "hash-deadbeef", "/tmp/inline.h", "c")
+        keep_id = upsert_file(conn, "hash-deadbeef", "/tmp/keep.h", "c")
+        insert_macros_batch(conn, [
+            ("hash-deadbeef", tu_id, "TU_MACRO", "1", "1", 1, 0),
+            ("hash-deadbeef", hdr_id, "HDR_MACRO", "2", "2", 4, 0),
+            ("hash-deadbeef", keep_id, "KEEP_MACRO", "3", "3", 9, 0),
+        ])
+        delete_macros_for_files(conn, [tu_id, hdr_id])
+        names = [
+            r[0] for r in conn.execute(
+                "SELECT name FROM macros WHERE config_hash=? ORDER BY name",
+                ("hash-deadbeef",),
+            ).fetchall()
+        ]
+        assert names == ["KEEP_MACRO"]
+
+    def test_delete_macros_for_files_empty_list_is_a_noop(self, populated_db):
+        """An empty id list must not turn into an unfiltered DELETE."""
+        conn = populated_db
+        fid = upsert_file(conn, "hash-deadbeef", "/tmp/test.h", "cpp")
+        insert_macros_batch(conn, [
+            ("hash-deadbeef", fid, "SURVIVOR", "1", "1", 1, 0),
+        ])
+        delete_macros_for_files(conn, [])
+        count = conn.execute(
             "SELECT COUNT(*) FROM macros WHERE file_id=?", (fid,)
         ).fetchone()[0]
-        assert count_after == 0
+        assert count == 1
+
+    def test_delete_macros_for_files_beyond_the_parameter_limit(self, populated_db):
+        """More file_ids than one statement can bind must still all be deleted."""
+        conn = populated_db
+        ids = [
+            upsert_file(conn, "hash-deadbeef", f"/tmp/gen/hdr_{i:04d}.h", "c")
+            for i in range(1200)
+        ]
+        keep_id = upsert_file(conn, "hash-deadbeef", "/tmp/keep.h", "c")
+        insert_macros_batch(conn, [
+            ("hash-deadbeef", fid, f"GEN_{i:04d}", "1", "1", 1, 0)
+            for i, fid in enumerate(ids)
+        ])
+        insert_macros_batch(conn, [
+            ("hash-deadbeef", keep_id, "KEEP_MACRO", "1", "1", 1, 0),
+        ])
+        delete_macros_for_files(conn, ids)
+        names = [
+            r[0] for r in conn.execute(
+                "SELECT name FROM macros WHERE config_hash=?", ("hash-deadbeef",)
+            ).fetchall()
+        ]
+        assert names == ["KEEP_MACRO"]
 
     def test_lookup_macro_by_exact_name(self, populated_db):
         """lookup_macro returns matching macro with value and expanded_value."""
@@ -2038,3 +2151,552 @@ class TestMacros:
         assert len(results) == 1
         assert results[0]["name"] == "API_KEY"
         assert results[0]["value"] == "0xABCD"
+
+
+class TestGeneratedFlagIsMonotone:
+    """``files.generated`` goes from 0 to 1 and never back.
+
+    Five callers reach upsert_file() and only one of them has the
+    build-output patterns; the other four pass the default False.
+
+    The flag could not be RAISED: the column was written on INSERT and the
+    ON CONFLICT clause never mentioned it, so a row another caller inserted
+    first kept 0 whatever a later caller knew.  Measured on HA_Boiler once
+    the column was first filled: manifest 56, database 49, and the seven
+    that differed were the rows some other caller had inserted first.
+
+    It must not be CLEARED either, which is what a plain
+    ``generated=excluded.generated`` would do.  That direction is the
+    negative control below; it held before this change as well.
+
+    MAX holds within a run and cannot heal across two, so a change of
+    build_dir_patterns that leaves the config_hash alone needs
+    _step_reconcile_generated().  See TestReconcileGenerated.
+    """
+
+    @staticmethod
+    def _conn(tmp_path: Path):
+        from fw_context_mcp.indexer.db import open_db, upsert_build_config, upsert_project
+
+        conn = open_db(tmp_path / "index.db")
+        upsert_project(conn, "proj", "Proj", str(tmp_path))
+        upsert_build_config(conn, "cafe", "proj", str(tmp_path / "compile_commands.json"))
+        return conn
+
+    def test_a_later_caller_does_not_clear_the_flag(self, tmp_path: Path):
+        """Negative control.  It held before the change too — a plain
+        ``generated=excluded.generated`` is what would break it.
+        """
+        from fw_context_mcp.indexer.db import upsert_file
+
+        conn = self._conn(tmp_path)
+        try:
+            upsert_file(conn, "cafe", "build/gen/autoconf.h", "c", generated=True)
+            # A caller with no build_dir_patterns — the default False.
+            upsert_file(conn, "cafe", "build/gen/autoconf.h", "c")
+
+            row = conn.execute(
+                "SELECT generated FROM files WHERE config_hash=? AND path=?",
+                ("cafe", "build/gen/autoconf.h"),
+            ).fetchone()
+            assert row[0] == 1
+        finally:
+            conn.close()
+
+    def test_a_later_caller_can_raise_the_flag(self, tmp_path: Path):
+        """The defect: _store_symbol_rows knows, and it usually is not first.
+
+        This is the assertion that fails without the MAX clause.
+        """
+        from fw_context_mcp.indexer.db import upsert_file
+
+        conn = self._conn(tmp_path)
+        try:
+            upsert_file(conn, "cafe", "build/gen/autoconf.h", "c")
+            upsert_file(conn, "cafe", "build/gen/autoconf.h", "c", generated=True)
+
+            row = conn.execute(
+                "SELECT generated FROM files WHERE config_hash=? AND path=?",
+                ("cafe", "build/gen/autoconf.h"),
+            ).fetchone()
+            assert row[0] == 1
+        finally:
+            conn.close()
+
+    def test_a_plain_file_stays_not_generated(self, tmp_path: Path):
+        """The negative control: MAX must not turn everything on."""
+        from fw_context_mcp.indexer.db import upsert_file
+
+        conn = self._conn(tmp_path)
+        try:
+            upsert_file(conn, "cafe", "src/main.c", "c")
+            upsert_file(conn, "cafe", "src/main.c", "c", mtime=1.0)
+
+            row = conn.execute(
+                "SELECT generated FROM files WHERE config_hash=? AND path=?",
+                ("cafe", "src/main.c"),
+            ).fetchone()
+            assert row[0] == 0
+        finally:
+            conn.close()
+
+    def test_the_other_columns_still_take_the_new_value(self, tmp_path: Path):
+        """MAX applies to `generated` alone; the rest still overwrite."""
+        from fw_context_mcp.indexer.db import upsert_file
+
+        conn = self._conn(tmp_path)
+        try:
+            upsert_file(conn, "cafe", "src/main.c", "c", mtime=1.0, source_hash="OLD")
+            upsert_file(conn, "cafe", "src/main.c", "c", mtime=2.0, source_hash="NEW")
+
+            row = conn.execute(
+                "SELECT mtime, source_hash FROM files WHERE config_hash=? AND path=?",
+                ("cafe", "src/main.c"),
+            ).fetchone()
+            assert row[0] == 2.0
+            assert row[1] == "NEW"
+        finally:
+            conn.close()
+
+
+class TestReconcileGenerated:
+    """The run makes ``files.generated`` agree with its own build_dir_patterns.
+
+    upsert_file() takes MAX, so a row can gain the flag but never lose it.
+    That is right inside a run and wrong across two.  Measured: narrowing
+    PlatformIO from ``.pio/`` to ``.pio/build/`` leaves the config_hash
+    identical, so 57 rows on HA_Boiler and FM would have kept a flag their
+    manifest no longer gives them.
+    """
+
+    @staticmethod
+    def _ctx(conn, patterns):
+        return {"config_hash": "cafe", "build_dir_patterns": patterns}
+
+    @staticmethod
+    def _conn(tmp_path: Path):
+        from fw_context_mcp.indexer.db import open_db, upsert_build_config, upsert_project
+
+        conn = open_db(tmp_path / "index.db")
+        upsert_project(conn, "proj", "Proj", str(tmp_path))
+        upsert_build_config(conn, "cafe", "proj", str(tmp_path / "compile_commands.json"))
+        return conn
+
+    @staticmethod
+    def _generated(conn, path):
+        return conn.execute(
+            "SELECT generated FROM files WHERE config_hash=? AND path=?",
+            ("cafe", path),
+        ).fetchone()[0]
+
+    def test_a_narrowed_pattern_clears_a_stale_flag(self, tmp_path: Path):
+        """The case MAX cannot reach: same config_hash, narrower patterns."""
+        from fw_context_mcp.indexer._postprocess import _step_reconcile_generated
+        from fw_context_mcp.indexer.db import upsert_file
+
+        conn = self._conn(tmp_path)
+        try:
+            # Written by a run that still used the wide '.pio/'.
+            upsert_file(conn, "cafe", ".pio/libdeps/Foo/foo.h", "c", generated=True)
+
+            _step_reconcile_generated(conn, self._ctx(conn, [".pio/build/"]))
+
+            assert self._generated(conn, ".pio/libdeps/Foo/foo.h") == 0
+        finally:
+            conn.close()
+
+    def test_real_build_output_keeps_the_flag(self, tmp_path: Path):
+        from fw_context_mcp.indexer._postprocess import _step_reconcile_generated
+        from fw_context_mcp.indexer.db import upsert_file
+
+        conn = self._conn(tmp_path)
+        try:
+            upsert_file(conn, "cafe", ".pio/build/esp32dev/gen.h", "c", generated=True)
+
+            _step_reconcile_generated(conn, self._ctx(conn, [".pio/build/"]))
+
+            assert self._generated(conn, ".pio/build/esp32dev/gen.h") == 1
+        finally:
+            conn.close()
+
+    def test_a_missed_row_gains_the_flag(self, tmp_path: Path):
+        """Reconciliation writes both directions, not only the clear."""
+        from fw_context_mcp.indexer._postprocess import _step_reconcile_generated
+        from fw_context_mcp.indexer.db import upsert_file
+
+        conn = self._conn(tmp_path)
+        try:
+            upsert_file(conn, "cafe", ".pio/build/esp32dev/gen.h", "c")
+
+            _step_reconcile_generated(conn, self._ctx(conn, [".pio/build/"]))
+
+            assert self._generated(conn, ".pio/build/esp32dev/gen.h") == 1
+        finally:
+            conn.close()
+
+    def test_it_is_idempotent(self, tmp_path: Path):
+        from fw_context_mcp.indexer._postprocess import _step_reconcile_generated
+        from fw_context_mcp.indexer.db import upsert_file
+
+        conn = self._conn(tmp_path)
+        try:
+            upsert_file(conn, "cafe", ".pio/build/gen.h", "c")
+            upsert_file(conn, "cafe", "src/main.c", "c")
+
+            for _ in range(3):
+                _step_reconcile_generated(conn, self._ctx(conn, [".pio/build/"]))
+
+            assert self._generated(conn, ".pio/build/gen.h") == 1
+            assert self._generated(conn, "src/main.c") == 0
+        finally:
+            conn.close()
+
+    def test_no_patterns_clears_everything(self, tmp_path: Path):
+        """With no patterns nothing is build output, and the column says so."""
+        from fw_context_mcp.indexer._postprocess import _step_reconcile_generated
+        from fw_context_mcp.indexer.db import upsert_file
+
+        conn = self._conn(tmp_path)
+        try:
+            upsert_file(conn, "cafe", "build/gen.h", "c", generated=True)
+
+            _step_reconcile_generated(conn, self._ctx(conn, None))
+
+            assert self._generated(conn, "build/gen.h") == 0
+        finally:
+            conn.close()
+
+    def test_another_build_is_not_touched(self, tmp_path: Path):
+        """The UPDATE is scoped to this config_hash."""
+        from fw_context_mcp.indexer._postprocess import _step_reconcile_generated
+        from fw_context_mcp.indexer.db import (
+            upsert_build_config,
+            upsert_file,
+            upsert_project,
+        )
+        from fw_context_mcp.indexer.db import open_db
+
+        conn = open_db(tmp_path / "index.db")
+        try:
+            upsert_project(conn, "proj", "Proj", str(tmp_path))
+            upsert_build_config(conn, "cafe", "proj", str(tmp_path / "cc.json"))
+            upsert_build_config(conn, "beef", "proj", str(tmp_path / "cc.json"))
+            upsert_file(conn, "cafe", ".pio/libdeps/Foo/foo.h", "c", generated=True)
+            upsert_file(conn, "beef", ".pio/libdeps/Foo/foo.h", "c", generated=True)
+
+            _step_reconcile_generated(conn, self._ctx(conn, [".pio/build/"]))
+
+            assert self._generated(conn, ".pio/libdeps/Foo/foo.h") == 0
+            other = conn.execute(
+                "SELECT generated FROM files WHERE config_hash=? AND path=?",
+                ("beef", ".pio/libdeps/Foo/foo.h"),
+            ).fetchone()[0]
+            assert other == 1
+        finally:
+            conn.close()
+
+
+class TestPlatformIOBuildDirPattern:
+    """``.pio/build/``, not ``.pio/`` — the patterns are matched as substrings."""
+
+    def test_libdeps_is_not_build_output(self):
+        from fw_context_mcp.indexer.builders.platformio import PlatformIOBuildSystem
+        from fw_context_mcp.indexer.manifest import _is_generated_header
+
+        patterns = PlatformIOBuildSystem().get_build_dir_patterns(Path("/proj"))
+
+        assert patterns == [".pio/build/"]
+        assert _is_generated_header(".pio/build/esp32dev/gen.h", patterns) is True
+        assert _is_generated_header(".pio/libdeps/Foo/foo.h", patterns) is False
+
+    def test_libdeps_stays_vendor(self):
+        """Build output and vendor are different questions, answered separately."""
+        from fw_context_mcp.indexer.builders.platformio import PlatformIOBuildSystem
+        from fw_context_mcp.indexer.sdk_detect import _path_matches
+
+        vendor = PlatformIOBuildSystem().get_vendor_patterns(Path("/proj"))
+
+        assert any(_path_matches(".pio/libdeps/Foo/foo.cpp", p) for p in vendor)
+        assert not any(_path_matches(".pio/build/env/gen.h", p) for p in vendor)
+
+    def test_a_libdeps_header_is_no_longer_trusted(self):
+        """The K4 hole this closes: a vendor header must not read as generated.
+
+        A build-generated header is the only thing the staleness check still
+        trusts.  While libdeps counted as build output, every vendored
+        library header was trusted and an edit to one went unnoticed.
+        """
+        from fw_context_mcp.indexer.builders.platformio import PlatformIOBuildSystem
+        from fw_context_mcp.indexer.manifest import _is_generated_header, header_is_trusted
+
+        patterns = PlatformIOBuildSystem().get_build_dir_patterns(Path("/proj"))
+        record = {
+            "hash": "x",
+            "generated": _is_generated_header(".pio/libdeps/Foo/foo.h", patterns),
+        }
+
+        assert header_is_trusted(record) is False
+
+
+class TestOrphanFileCleanup:
+    """An empty ENTRY is garbage.  An entry for an empty FILE is not.
+
+    Zephyr compiles misc/empty_file.c — a 0-byte placeholder — three times
+    per build.  A 0-byte source yields no symbols, no macros and no content,
+    so it matched every condition of the orphan sweep and its row went away
+    on every run.  Tier 1 needs a row to skip a translation unit, so the next
+    run parsed it again: measured on zbox-ecb-fw-v5, all 9 builds reported
+    "3 updated" for ever and never reached "0 updated".
+
+    The clause that spares a row with symbols or macros is NOT retested here.
+    It is unchanged: the same WHERE picks the candidates, and only what
+    happens to a candidate is different.
+    """
+
+    @staticmethod
+    def _conn(tmp_path: Path):
+        from fw_context_mcp.indexer.db import open_db, upsert_build_config, upsert_project
+
+        conn = open_db(tmp_path / "index.db")
+        upsert_project(conn, "proj", "Proj", str(tmp_path))
+        upsert_build_config(conn, "cafe", "proj", str(tmp_path / "cc.json"))
+        return conn
+
+    @staticmethod
+    def _paths(conn):
+        return {r[0] for r in conn.execute(
+            "SELECT path FROM files WHERE config_hash='cafe'")}
+
+    def test_a_zero_byte_translation_unit_keeps_its_row(self, tmp_path: Path):
+        from fw_context_mcp.indexer.db import delete_orphan_files, upsert_file
+
+        empty = tmp_path / "empty_file.c"
+        empty.write_text("")
+        conn = self._conn(tmp_path)
+        try:
+            upsert_file(conn, "cafe", str(empty), "c", mtime=1.0,
+                        content_hash="CH", source_hash="SH", flags_hash="FH")
+
+            delete_orphan_files(conn, "cafe", tmp_path)
+
+            assert str(empty) in self._paths(conn)
+        finally:
+            conn.close()
+
+    def test_a_relative_zero_byte_path_keeps_its_row(self, tmp_path: Path):
+        """The stored path of an in-project file is relative to the root."""
+        from fw_context_mcp.indexer.db import delete_orphan_files, upsert_file
+
+        (tmp_path / "src").mkdir()
+        (tmp_path / "src" / "empty.c").write_text("")
+        conn = self._conn(tmp_path)
+        try:
+            upsert_file(conn, "cafe", "src/empty.c", "c", mtime=1.0)
+
+            delete_orphan_files(conn, "cafe", tmp_path)
+
+            assert "src/empty.c" in self._paths(conn)
+        finally:
+            conn.close()
+
+    def test_a_row_for_a_file_with_text_is_still_deleted(self, tmp_path: Path):
+        """The negative control.  This is what the sweep exists for.
+
+        A file that HAS text but no symbols, no macros and no captured
+        content is a stale row from an earlier index.
+        """
+        from fw_context_mcp.indexer.db import delete_orphan_files, upsert_file
+
+        header = tmp_path / "stale.h"
+        header.write_text("// something\n")
+        conn = self._conn(tmp_path)
+        try:
+            upsert_file(conn, "cafe", str(header), "c")
+
+            assert delete_orphan_files(conn, "cafe", tmp_path) == 1
+            assert str(header) not in self._paths(conn)
+        finally:
+            conn.close()
+
+    def test_a_row_for_a_missing_file_is_still_deleted(self, tmp_path: Path):
+        from fw_context_mcp.indexer.db import delete_orphan_files, upsert_file
+
+        conn = self._conn(tmp_path)
+        try:
+            upsert_file(conn, "cafe", str(tmp_path / "gone.c"), "c")
+
+            assert delete_orphan_files(conn, "cafe", tmp_path) == 1
+        finally:
+            conn.close()
+
+    def test_a_row_with_content_is_untouched(self, tmp_path: Path):
+        """Unchanged behaviour: a header with captured content stays.
+
+        search_content serves those, which is why the sweep never took them.
+        """
+        from fw_context_mcp.indexer.db import delete_orphan_files, upsert_file
+
+        header = tmp_path / "decls.h"
+        header.write_text("void f(void);\n")
+        conn = self._conn(tmp_path)
+        try:
+            upsert_file(conn, "cafe", str(header), "c")
+            conn.execute(
+                "UPDATE files SET content = ? WHERE config_hash='cafe' AND path = ?",
+                ("void f(void);\n", str(header)),
+            )
+
+            assert delete_orphan_files(conn, "cafe", tmp_path) == 0
+            assert str(header) in self._paths(conn)
+        finally:
+            conn.close()
+
+    def test_without_a_root_a_relative_path_is_deleted_as_before(self, tmp_path: Path):
+        """A caller with no root cannot check, so nothing changes for it."""
+        from fw_context_mcp.indexer.db import delete_orphan_files, upsert_file
+
+        (tmp_path / "src").mkdir()
+        (tmp_path / "src" / "empty.c").write_text("")
+        conn = self._conn(tmp_path)
+        try:
+            upsert_file(conn, "cafe", "src/empty.c", "c")
+
+            assert delete_orphan_files(conn, "cafe") == 1
+        finally:
+            conn.close()
+
+    def test_another_build_is_not_touched(self, tmp_path: Path):
+        from fw_context_mcp.indexer.db import (
+            delete_orphan_files, open_db, upsert_build_config, upsert_file, upsert_project,
+        )
+
+        header = tmp_path / "stale.h"
+        header.write_text("// text\n")
+        conn = open_db(tmp_path / "index.db")
+        try:
+            upsert_project(conn, "proj", "Proj", str(tmp_path))
+            upsert_build_config(conn, "cafe", "proj", str(tmp_path / "cc.json"))
+            upsert_build_config(conn, "beef", "proj", str(tmp_path / "cc.json"))
+            upsert_file(conn, "cafe", str(header), "c")
+            upsert_file(conn, "beef", str(header), "c")
+
+            assert delete_orphan_files(conn, "cafe", tmp_path) == 1
+            other = conn.execute(
+                "SELECT COUNT(*) FROM files WHERE config_hash='beef'").fetchone()[0]
+            assert other == 1
+        finally:
+            conn.close()
+
+
+class TestHashColumnsAreNotErased:
+    """An EMPTY hash never overwrites a stored one.
+
+    Four of the five callers of upsert_file() pass no hashes.  reindex_file
+    is one of them: it re-parses one translation unit through
+    store_symbols_for_unit() without them, and that erased content_hash,
+    source_hash and flags_hash for that row.
+
+    Erasing them was never a WRONG answer.  Tier 1 compares the mtime, which
+    a re-parse does not move, so the next run never read the cleared value —
+    measured on zbox-ecb-fw-v5, where a reindex_file of proj/app/src/main.c
+    left 254 of 257 units unchanged on the following run.  The cost came
+    later: once something moved the mtime without changing the text, Tier 2
+    found an empty content_hash, could not take its shortcut, and paid one
+    libclang parse to rebuild what was already known.
+    """
+
+    @staticmethod
+    def _conn(tmp_path: Path):
+        from fw_context_mcp.indexer.db import open_db, upsert_build_config, upsert_project
+
+        conn = open_db(tmp_path / "index.db")
+        upsert_project(conn, "proj", "Proj", str(tmp_path))
+        upsert_build_config(conn, "cafe", "proj", str(tmp_path / "cc.json"))
+        return conn
+
+    @staticmethod
+    def _row(conn):
+        return dict(conn.execute(
+            "SELECT mtime, content_hash, source_hash, flags_hash FROM files "
+            "WHERE config_hash='cafe' AND path='src/main.c'").fetchone())
+
+    def test_a_caller_without_hashes_keeps_the_stored_ones(self, tmp_path: Path):
+        from fw_context_mcp.indexer.db import upsert_file
+
+        conn = self._conn(tmp_path)
+        try:
+            upsert_file(conn, "cafe", "src/main.c", "c", mtime=10.0,
+                        content_hash="CH", source_hash="SH", flags_hash="FH")
+            # exactly what _reindex_parse_and_store does
+            upsert_file(conn, "cafe", "src/main.c", "c", mtime=20.0)
+
+            row = self._row(conn)
+            assert row["content_hash"] == "CH"
+            assert row["source_hash"] == "SH"
+            assert row["flags_hash"] == "FH"
+        finally:
+            conn.close()
+
+    def test_the_mtime_still_moves(self, tmp_path: Path):
+        """Only the hashes are protected.  The mtime must keep updating."""
+        from fw_context_mcp.indexer.db import upsert_file
+
+        conn = self._conn(tmp_path)
+        try:
+            upsert_file(conn, "cafe", "src/main.c", "c", mtime=10.0, content_hash="CH")
+            upsert_file(conn, "cafe", "src/main.c", "c", mtime=20.0)
+
+            assert self._row(conn)["mtime"] == 20.0
+        finally:
+            conn.close()
+
+    def test_a_new_hash_still_overwrites(self, tmp_path: Path):
+        """The negative control.  A caller that KNOWS must still win."""
+        from fw_context_mcp.indexer.db import upsert_file
+
+        conn = self._conn(tmp_path)
+        try:
+            upsert_file(conn, "cafe", "src/main.c", "c", mtime=10.0,
+                        content_hash="OLD", source_hash="OLDS", flags_hash="OLDF")
+            upsert_file(conn, "cafe", "src/main.c", "c", mtime=20.0,
+                        content_hash="NEW", source_hash="NEWS", flags_hash="NEWF")
+
+            row = self._row(conn)
+            assert row["content_hash"] == "NEW"
+            assert row["source_hash"] == "NEWS"
+            assert row["flags_hash"] == "NEWF"
+        finally:
+            conn.close()
+
+    def test_each_column_is_protected_on_its_own(self, tmp_path: Path):
+        """A caller that knows one hash must not erase the other two."""
+        from fw_context_mcp.indexer.db import upsert_file
+
+        conn = self._conn(tmp_path)
+        try:
+            upsert_file(conn, "cafe", "src/main.c", "c",
+                        content_hash="CH", source_hash="SH", flags_hash="FH")
+            upsert_file(conn, "cafe", "src/main.c", "c", source_hash="NEWS")
+
+            row = self._row(conn)
+            assert row["content_hash"] == "CH"
+            assert row["source_hash"] == "NEWS"
+            assert row["flags_hash"] == "FH"
+        finally:
+            conn.close()
+
+    def test_a_row_that_never_had_hashes_stays_empty(self, tmp_path: Path):
+        """A header row keeps its empty hashes — nothing is invented."""
+        from fw_context_mcp.indexer.db import upsert_file
+
+        conn = self._conn(tmp_path)
+        try:
+            upsert_file(conn, "cafe", "src/main.c", "c")
+            upsert_file(conn, "cafe", "src/main.c", "c", mtime=5.0)
+
+            row = self._row(conn)
+            assert row["content_hash"] == ""
+            assert row["source_hash"] == ""
+            assert row["flags_hash"] == ""
+        finally:
+            conn.close()

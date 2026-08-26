@@ -161,6 +161,23 @@ class MbedOSBuildSystem:
         """Return build-output directory patterns for staleness filtering."""
         return ["BUILD/"]
 
+    def get_vendor_patterns(
+        self,
+        project_root: Path,
+        *,
+        units: list | None = None,
+    ) -> list[str]:
+        """Return the Mbed OS tree, which the project vendors in-tree.
+
+        ``mbed-os/`` is the name the tool itself mandates: ``mbed deploy``
+        writes the OS there, and this builder already reads that name as a
+        detection marker (see ``_MBED_MARKERS``).
+
+        ``BUILD/`` is NOT in this list.  It is build output, it has
+        get_build_dir_patterns(), and generated code counts as project code.
+        """
+        return ["mbed-os/%"]
+
     # ── Validation ──
 
     def validate_artifacts(self, compile_commands: Path, project_root: Path) -> list[BuildIssue]:

@@ -778,8 +778,8 @@ class TestCallGraphDispatchAndGlobalCtors:
         conn, ch = self._build_db()
         try:
             # Remove the implicit_construct edge so only dispatch path works
-            from fw_context_mcp.indexer.db import delete_refs_for_file
-            delete_refs_for_file(conn, ch, "src/zble.cpp")
+            from fw_context_mcp.indexer.db import delete_refs_for_files
+            delete_refs_for_files(conn, ch, ["src/zble.cpp"])
             # Re-add only the dispatch and direct call edges (no implicit_construct)
             from fw_context_mcp.indexer.db import insert_refs_batch
             insert_refs_batch(conn, [

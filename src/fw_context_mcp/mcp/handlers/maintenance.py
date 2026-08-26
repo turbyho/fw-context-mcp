@@ -533,8 +533,14 @@ def get_active_build(
                 )
 
         if header_affected_tus:
+            # A TU that failed to parse keeps its needs_reparse mark, so it
+            # counts here run after run.  Without the second half of this
+            # sentence the user is told to run 'fw-context index', and the
+            # index does not clear it.
             index_message += (
-                f" | {header_affected_tus} TU(s) have stale header dependencies — header changes since last index"
+                f" | {header_affected_tus} TU(s) have stale header dependencies "
+                "— header changes since last index, or a TU that failed to "
+                "parse (see the index log)"
             )
 
         # Append LLM-analysis coverage, split by project/vendor, so the LLM
@@ -562,6 +568,13 @@ def get_active_build(
             "first_indexed_at": cfg["first_indexed_at"] if "first_indexed_at" in cfg.keys() else "",
             "vendor_paths": proj_cfg.index.vendor_paths,
             "project_paths": proj_cfg.index.project_paths,
+            # What the INDEX RUN applied, which is not always what the config
+            # says today: the builder derives part of it, a variant adds to
+            # it, and the config can have changed since.  Three layers with no
+            # way to read the result are worse than two.
+            "effective_vendor_patterns": _effective_vendor_patterns(
+                db_path.parent, config_hash, root
+            ),
             "status": status,
             "reindex_needed": needs_reindex,
             "reindex_reasons": reindex_reasons,
@@ -1071,7 +1084,7 @@ def _reindex_parse_and_store(
                 # Phase 4: clean up orphan files — files that existed in
                 # the previous index but are now absent from the TU list.
                 from ...indexer.db import delete_orphan_files
-                deleted_orphans = delete_orphan_files(conn, config_hash)
+                deleted_orphans = delete_orphan_files(conn, config_hash, root)
                 if deleted_orphans:
                     log.debug("Orphan files cleaned up: %d", deleted_orphans)
 
@@ -1115,6 +1128,10 @@ def _update_manifest_after_reindex(
 
         from ...indexer.manifest import (
             _collect_headers_from_tokens,
+            _intern_arguments,
+            header_is_trusted,
+            mark_entries_behind,
+            merge_header_records,
             update_entry,
         )
         from ...indexer.manifest import (
@@ -1125,25 +1142,77 @@ def _update_manifest_after_reindex(
         )
         manifest_data = load_manifest(db_dir, config_hash)
         if manifest_data is not None:
+            # The patterns the INDEX RUN used, read from the manifest it
+            # wrote.  With None here _is_generated_header() answers False for
+            # every header, so every record this function writes claimed
+            # "generated": False.  After the end of vendor trust `generated`
+            # is the only trust rule left, so that turned every build of a
+            # re-indexed file into a full reparse.  Measured on zbox-ecb-fw-v5
+            # variant nrf52840-dev: 27 generated headers dropped to 0.
+            bdp = manifest_data.get("build_dir_patterns")
+            if not bdp:
+                bdp, _ = _reindex_build_patterns_for_generated(root)
+            # Snapshot the shared header table BEFORE the loop.  A per-unit
+            # difference would make the second unit read what the first one
+            # just wrote as somebody else's change.
+            table_before = {
+                path: record.get("hash", "")
+                for path, record in (manifest_data.get("headers") or {}).items()
+            }
+            reparsed_rel: set[str] = set()
             for unit, _parsed in parsed_units:
-                headers = _collect_headers_from_tokens(unit, root, build_dir_patterns=None)
+                # Records go into a per-unit table and are merged by
+                # merge_header_records, so a header this re-parse is the first
+                # to see still contributes its hash to the manifest's shared
+                # map — without a downgrade of `generated` on the way.
+                header_records: dict[str, dict] = {}
+                headers = _collect_headers_from_tokens(
+                    unit, root, bdp, header_records
+                )
                 source_hash = compute_source_hash(unit.file.resolve())
                 try:
                     tu_rel = str(unit.file.resolve().relative_to(root))
                 except ValueError:
                     tu_rel = str(unit.file.resolve())
+                reparsed_rel.add(tu_rel)
                 for idx, entry in enumerate(manifest_data.get("entries", [])):
                     if entry.get("file") == tu_rel:
-                        update_entry(manifest_data, idx, source_hash, headers)
+                        update_entry(
+                            manifest_data, idx, source_hash, headers, header_records
+                        )
                         break
                 else:
+                    # Same merge as update_entry uses.  This branch bypasses
+                    # update_entry completely, so a plain .update() here is a
+                    # second place where a False overwrites a True.
+                    merge_header_records(manifest_data, header_records)
                     manifest_data.setdefault("entries", []).append({
                         "file": tu_rel,
                         "directory": str(unit.directory) if unit.directory else str(root),
-                        "arguments": unit.clang_args,
+                        "arg_set": _intern_arguments(
+                            unit.clang_args,
+                            manifest_data.setdefault("arg_sets", []),
+                        ),
                         "source_hash": source_hash,
                         "headers": headers,
                     })
+            # This function refreshed the SHARED header hashes, so the next
+            # full index run sees no difference for the OTHER units that
+            # include those headers — their rows still come from the old
+            # text.  Flag them, or reindex_file hides the change from every
+            # later run.
+            changed = {
+                path
+                for path, record in (manifest_data.get("headers") or {}).items()
+                if not header_is_trusted(record)
+                and record.get("hash", "") != table_before.get(path, "")
+            }
+            behind = mark_entries_behind(manifest_data, changed, reparsed_rel)
+            if behind:
+                log.info(
+                    "reindex_file: %d entr(ies) flagged needs_reparse after "
+                    "%d refreshed header(s)", behind, len(changed),
+                )
             save_manifest(manifest_data, db_dir, config_hash)
     except OSError:
         log.debug("manifest.json update skipped during reindex_file", exc_info=True)
@@ -1424,7 +1493,15 @@ def reindex_file_impl(
         if error:
             return error
 
-        vendor_patterns, project_patterns_list = _reindex_build_patterns(cfg, root)
+        # The manifest of THIS build carries the vendor set the index run
+        # applied.  reindex_file must write is_project with that same
+        # boundary, or one file ends up on the other side of it.
+        from ...indexer.manifest import load as load_manifest
+
+        build_manifest = load_manifest(db_path.parent, config_hash)
+        vendor_patterns, project_patterns_list = _reindex_build_patterns(
+            cfg, root, build_manifest
+        )
         total_symbols, result = _reindex_parse_and_store(
             conn, matching, cfg_data, cfg.index.index_refs,
             root, db_path, target, vendor_patterns, project_patterns_list,
@@ -1498,8 +1575,46 @@ def _reindex_match_tus(
     return matching, None
 
 
+def _effective_vendor_patterns(
+    db_dir: Path, config_hash: str, root: Path
+) -> list[str]:
+    """Return the vendor set stored with THIS build, or [] when unknown.
+
+    Read-only and best-effort: this feeds a status report, so a manifest that
+    cannot be read must not make the report fail.
+    """
+    from ...indexer.manifest import load as load_manifest
+
+    try:
+        manifest = load_manifest(db_dir, config_hash)
+    except OSError:
+        log.debug("manifest unreadable for the status report", exc_info=True)
+        return []
+    if manifest is None:
+        return []
+    return list(manifest.get("vendor_patterns") or [])
+
+
+def _reindex_build_patterns_for_generated(root: Path) -> tuple[list[str], None]:
+    """Return build-output patterns for a manifest that stores none.
+
+    Only for an index written before the manifest carried the key.  The
+    manifest is the better source: it holds the value the index run applied,
+    while this one re-detects and can answer differently after the build
+    system changes.
+    """
+    from ...indexer.build import detect_build_system
+    from ...indexer.builders import registry
+
+    system = detect_build_system(root)
+    builder_cls = registry.get(system) if system else None
+    if builder_cls is None:
+        return [], None
+    return list(builder_cls().get_build_dir_patterns(root)), None
+
+
 def _reindex_build_patterns(
-    cfg, root: Path
+    cfg, root: Path, manifest: dict | None = None
 ) -> tuple[list[str], list[str]]:
     """Collect vendor-exclude and project-include file path patterns.
 
@@ -1512,10 +1627,16 @@ def _reindex_build_patterns(
     *project_patterns_list* — paths explicitly listed as project code
     in the user config.  These override the auto-detected vendor
     boundary when the detector misclassifies a path.
-    """
-    from ...indexer.sdk_detect import _build_sdk_excludes, _normalize_patterns
 
-    vendor_patterns = list(_build_sdk_excludes(root))
+    Pass *manifest* whenever the caller has it.  The set stored there is the
+    one the index run applied, and to derive a second one here would give
+    this build two different boundaries.
+    """
+    from ...indexer.sdk_detect import _normalize_patterns, vendor_patterns_for_build
+
+    vendor_patterns = vendor_patterns_for_build(
+        manifest, root, build_system=cfg.build.system
+    )
     if cfg.index.vendor_paths:
         vendor_patterns.extend(_normalize_patterns(cfg.index.vendor_paths))
     project_patterns_list = (
