@@ -64,3 +64,9 @@ LEAN-CTX.md
 
 # Python version manager (local only)
 .python-version
+
+# uv lockfile — nothing in this project reads it. make install and the
+# Dockerfile resolve from pyproject.toml, CI uses pip install -e. Keeping
+# it tracked only shipped a stale 500 KB file inside every sdist. Track it
+# again if the build ever moves to `uv sync --locked`.
+uv.lock
