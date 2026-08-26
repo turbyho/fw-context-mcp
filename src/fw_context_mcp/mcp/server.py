@@ -715,11 +715,14 @@ def main() -> None:
          tools raise ``ProjectNotInitializedError`` (fail-fast).
        - If project is initialized but no index exists: server starts
          normally — ``get_active_build()`` returns ``no_index`` so the
-         agent can ask the operator and run index via bash.
+         agent can ask the operator and run index via bash.  The ping
+         thread starts, thus the watcher daemon starts as soon as the
+         operator creates the index.
     2. When ready, pre-marks the database as integrity-checked.
     3. Ensures the persistent watcher daemon is running for the project
        (spawns it if this is the first MCP server).
-    4. Starts a ping thread that keeps the daemon alive.
+    4. Starts a ping thread that keeps the daemon alive, and that
+       spawns the daemon again when a ping gets no answer.
 
     **Why progressive startup?**  The server must NOT exit when the
     project is not initialized or has no index.  The whole point of
@@ -779,6 +782,17 @@ def main() -> None:
     db_path = cfg.index.db_dir / project_id / "index.db"
     if not db_path.exists():
         log.info("No index found at %s — get_active_build() will report no_index", db_path)
+        # The ping thread starts even when no index exists.  The thread
+        # calls _ensure_daemon_running every PING_INTERVAL seconds, thus
+        # the watcher starts when the operator runs `fw-context index`.
+        # WHY this is necessary: this function is the only place that
+        # spawns the daemon at server startup.  A server that starts
+        # BEFORE the first index gets no watcher, and no background
+        # reindex runs for the full life of that server.
+        try:
+            _start_ping_thread(root)
+        except (RuntimeError, OSError):
+            log.exception("Ping thread startup failed — no automatic reindex until the server restarts")
         mcp.run()
         return
 
@@ -809,10 +823,20 @@ def _start_ping_thread(root: Path) -> None:
     daemon thread is simpler — it runs independently and dies with the
     process.
 
-    **Why ping?**  The watcher daemon is a separate process spawned by
-    the first MCP server.  If it dies (OOM, segfault, manual kill),
-    file watching stops silently — the ping thread detects this and
-    signals ``_ensure_daemon_running`` to respawn it.
+    **Why ping?**  The watcher daemon is a separate process that the
+    first MCP server spawns.  If the daemon stops (OOM, segfault,
+    manual kill), file watching stops without a message.  A failed ping
+    is the only signal that an MCP server gets, thus the loop calls
+    ``_ensure_daemon_running`` to start the daemon again.
+
+    **Two failure modes, one recovery.**  A ping fails when the daemon
+    stopped, and also when no daemon was ever spawned.  The second case
+    occurs when the server starts before the project has an index.
+    ``_ensure_daemon_running`` corrects the two cases.  Its only
+    precondition is an ``index.db`` file that exists.  It spawns a
+    daemon only when no daemon holds ``watcher.lock``.  Concurrent MCP
+    servers are thus safe — the flock serialises them, and exactly one
+    daemon starts.
     """
     import threading
     import time
@@ -823,12 +847,17 @@ def _start_ping_thread(root: Path) -> None:
         while True:
             time.sleep(PING_INTERVAL)
             try:
-                alive = ping_daemon(root)
-                if not alive:
-                    # Revival handled by _ensure_daemon_running in background.py
-                    log.debug("Daemon ping failed — daemon may have exited")
-            except OSError:
-                log.debug("Daemon ping error", exc_info=True)
+                if ping_daemon(root):
+                    continue
+                log.debug("Daemon ping failed — the ping thread spawns a new watcher daemon")
+                _ensure_daemon_running(root)
+            except (RuntimeError, OSError):
+                # RuntimeError — the project is not initialized, or it
+                # has no index yet.  _db_path() raises it through
+                # _check_server_ready().  The two states are temporary,
+                # because the operator can still run init or index.  The
+                # loop must stay alive and try again on the next tick.
+                log.debug("Could not start the watcher daemon", exc_info=True)
 
     # daemon=True: killed on process exit — no explicit stop mechanism needed
     t = threading.Thread(target=_ping_loop, daemon=True, name="fw-context-ping")

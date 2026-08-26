@@ -609,6 +609,30 @@ def _build_run_kwargs(
     )
 
 
+def _ensure_watcher_after_index(project_root: Path) -> None:
+    """Start the watcher daemon after an index run that was successful.
+
+    WHY: an MCP server spawns the daemon only at startup, and only when
+    ``index.db`` already exists.  A server that starts before the first
+    index takes an early return and spawns no daemon.  The daemon is the
+    only component that starts a background reindex, thus that project
+    gets no automatic reindex.
+
+    This function closes that window.  After the index run, ``index.db``
+    exists, which is the only precondition of ``_ensure_daemon_running``.
+    The call does nothing when a daemon already runs.
+    """
+    try:
+        from ..mcp.background import _ensure_daemon_running
+
+        _ensure_daemon_running(project_root)
+    except (RuntimeError, OSError):
+        # Not fatal — the index is complete and usable.  Only the
+        # automatic reindex of changed files is not available.  The
+        # command `fw-context watch restart` corrects this.
+        log.debug("Could not start the watcher daemon for %s", project_root, exc_info=True)
+
+
 def cmd_index(args: argparse.Namespace) -> int:
     """Build or rebuild the symbol index from compile_commands.json.
 
@@ -703,7 +727,7 @@ def cmd_index(args: argparse.Namespace) -> int:
             with index_run_lock(db_path.parent):
                 _claim_index(db_path.parent)
                 try:
-                    return _run_multi(
+                    exit_code = _run_multi(
                         args, cfg, project_root, project_id, db_path,
                         detected_system, run_kwargs,
                     )
@@ -712,6 +736,12 @@ def cmd_index(args: argparse.Namespace) -> int:
         except IndexRunLocked as exc:
             print(f"error: {exc}", file=sys.stderr)
             return EXIT_ALREADY_RUNNING
+
+        # Outside the index lock, and only after a run that was
+        # successful — see the same call at the end of this function.
+        if exit_code == 0:
+            _ensure_watcher_after_index(project_root)
+        return exit_code
 
     # ── Resolve compile_commands.json ──
     cc_result = _resolve_compile_commands(args, project_root, cfg, detected_system, bg)
@@ -753,7 +783,6 @@ def cmd_index(args: argparse.Namespace) -> int:
                 _post_index_optimize(
                     db_path, project_root, project_id, detected_system, args
                 )
-                return 0
             except IndexSuperseded as exc:
                 # Not a failure — see IndexSuperseded.  The distinct exit code
                 # lets the daemon retry instead of treating it as a broken run.
@@ -764,3 +793,9 @@ def cmd_index(args: argparse.Namespace) -> int:
     except IndexRunLocked as exc:
         print(f"error: {exc}", file=sys.stderr)
         return EXIT_ALREADY_RUNNING
+
+    # Outside the index lock.  The daemon does a staleness check when it
+    # starts, thus a daemon that starts inside the lock could start a
+    # second index run against the database that this run still changes.
+    _ensure_watcher_after_index(project_root)
+    return 0
