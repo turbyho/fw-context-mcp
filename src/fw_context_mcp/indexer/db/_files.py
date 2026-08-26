@@ -242,7 +242,11 @@ def delete_symbols_for_file(conn: sqlite3.Connection, file_id: int) -> None:
 
 
 
-def delete_orphan_files(conn: sqlite3.Connection, config_hash: str) -> int:
+def delete_orphan_files(
+    conn: sqlite3.Connection,
+    config_hash: str,
+    project_root: Path | None = None,
+) -> int:
     """Delete file records that have no symbols, no macros, and no ifdef-filtered
     content for *config_hash*.
 
@@ -250,17 +254,56 @@ def delete_orphan_files(conn: sqlite3.Connection, config_hash: str) -> int:
     are preserved even when they have no symbols (forward-declaration
     headers are still useful for ``search_content``).
 
+    A row whose FILE is genuinely empty on disk is NOT such an entry, and it
+    is kept.  Zephyr compiles ``misc/empty_file.c`` — a 0-byte placeholder —
+    three times per build, and a 0-byte source yields no symbols, no macros
+    and no content, so it matched all three conditions.  Its row went away
+    on every run, Tier 1 needs a row to skip a translation unit, and the
+    next run parsed it again: measured on zbox-ecb-fw-v5, all 9 builds
+    reported "3 updated" for ever and never reached "0 updated".
+
+    *project_root* resolves a relative stored path.  Without it a relative
+    path cannot be checked, and the row is deleted as before — the callers
+    that have a root pass it.
+
     Called after indexing or reindex to clean up stale entries from
     removed source files.  Returns the number of rows deleted.
     """
-    cur = conn.execute(
-        """DELETE FROM files WHERE config_hash = ?
+    candidates = conn.execute(
+        """SELECT id, path FROM files WHERE config_hash = ?
            AND id NOT IN (SELECT DISTINCT file_id FROM symbols WHERE config_hash = ?)
            AND id NOT IN (SELECT DISTINCT file_id FROM macros WHERE config_hash = ?)
            AND content = ''""",
         (config_hash, config_hash, config_hash),
-    )
-    return cur.rowcount
+    ).fetchall()
+    if not candidates:
+        return 0
+
+    doomed: list[int] = []
+    for row in candidates:
+        p = Path(row["path"])
+        if not p.is_absolute():
+            if project_root is None:
+                doomed.append(row["id"])
+                continue
+            p = project_root / p
+        try:
+            # A file that is gone, or that has text this index did not
+            # capture, is a stale row.  A file that really is 0 bytes is not.
+            if p.stat().st_size != 0:
+                doomed.append(row["id"])
+        except OSError:
+            doomed.append(row["id"])
+
+    deleted = 0
+    for batch in chunked(doomed):
+        placeholders = ",".join("?" * len(batch))
+        cur = conn.execute(
+            f"DELETE FROM files WHERE id IN ({placeholders})",  # noqa: S608 — placeholders only
+            batch,
+        )
+        deleted += cur.rowcount
+    return deleted
 
 
 def get_file_mtime_indexed(conn: sqlite3.Connection, config_hash: str, path: str) -> float | None:

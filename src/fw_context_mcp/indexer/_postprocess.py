@@ -648,7 +648,7 @@ def _step_orphan_cleanup(conn: sqlite3.Connection, ctx: dict) -> None:
     """Remove orphaned files, embeddings, and LLM analysis rows."""
     from .db import clean_orphan_embeddings, clean_orphan_embeddings_vec, delete_orphan_files
 
-    delete_orphan_files(conn, ctx["config_hash"])
+    delete_orphan_files(conn, ctx["config_hash"], ctx["project_root"])
     clean_orphan_embeddings(conn)
     clean_orphan_embeddings_vec(conn)
     conn.execute(

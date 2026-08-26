@@ -1084,7 +1084,7 @@ def _reindex_parse_and_store(
                 # Phase 4: clean up orphan files — files that existed in
                 # the previous index but are now absent from the TU list.
                 from ...indexer.db import delete_orphan_files
-                deleted_orphans = delete_orphan_files(conn, config_hash)
+                deleted_orphans = delete_orphan_files(conn, config_hash, root)
                 if deleted_orphans:
                     log.debug("Orphan files cleaned up: %d", deleted_orphans)
 

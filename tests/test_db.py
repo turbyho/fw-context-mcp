@@ -2436,3 +2436,153 @@ class TestPlatformIOBuildDirPattern:
         }
 
         assert header_is_trusted(record) is False
+
+
+class TestOrphanFileCleanup:
+    """An empty ENTRY is garbage.  An entry for an empty FILE is not.
+
+    Zephyr compiles misc/empty_file.c — a 0-byte placeholder — three times
+    per build.  A 0-byte source yields no symbols, no macros and no content,
+    so it matched every condition of the orphan sweep and its row went away
+    on every run.  Tier 1 needs a row to skip a translation unit, so the next
+    run parsed it again: measured on zbox-ecb-fw-v5, all 9 builds reported
+    "3 updated" for ever and never reached "0 updated".
+
+    The clause that spares a row with symbols or macros is NOT retested here.
+    It is unchanged: the same WHERE picks the candidates, and only what
+    happens to a candidate is different.
+    """
+
+    @staticmethod
+    def _conn(tmp_path: Path):
+        from fw_context_mcp.indexer.db import open_db, upsert_build_config, upsert_project
+
+        conn = open_db(tmp_path / "index.db")
+        upsert_project(conn, "proj", "Proj", str(tmp_path))
+        upsert_build_config(conn, "cafe", "proj", str(tmp_path / "cc.json"))
+        return conn
+
+    @staticmethod
+    def _paths(conn):
+        return {r[0] for r in conn.execute(
+            "SELECT path FROM files WHERE config_hash='cafe'")}
+
+    def test_a_zero_byte_translation_unit_keeps_its_row(self, tmp_path: Path):
+        from fw_context_mcp.indexer.db import delete_orphan_files, upsert_file
+
+        empty = tmp_path / "empty_file.c"
+        empty.write_text("")
+        conn = self._conn(tmp_path)
+        try:
+            upsert_file(conn, "cafe", str(empty), "c", mtime=1.0,
+                        content_hash="CH", source_hash="SH", flags_hash="FH")
+
+            delete_orphan_files(conn, "cafe", tmp_path)
+
+            assert str(empty) in self._paths(conn)
+        finally:
+            conn.close()
+
+    def test_a_relative_zero_byte_path_keeps_its_row(self, tmp_path: Path):
+        """The stored path of an in-project file is relative to the root."""
+        from fw_context_mcp.indexer.db import delete_orphan_files, upsert_file
+
+        (tmp_path / "src").mkdir()
+        (tmp_path / "src" / "empty.c").write_text("")
+        conn = self._conn(tmp_path)
+        try:
+            upsert_file(conn, "cafe", "src/empty.c", "c", mtime=1.0)
+
+            delete_orphan_files(conn, "cafe", tmp_path)
+
+            assert "src/empty.c" in self._paths(conn)
+        finally:
+            conn.close()
+
+    def test_a_row_for_a_file_with_text_is_still_deleted(self, tmp_path: Path):
+        """The negative control.  This is what the sweep exists for.
+
+        A file that HAS text but no symbols, no macros and no captured
+        content is a stale row from an earlier index.
+        """
+        from fw_context_mcp.indexer.db import delete_orphan_files, upsert_file
+
+        header = tmp_path / "stale.h"
+        header.write_text("// something\n")
+        conn = self._conn(tmp_path)
+        try:
+            upsert_file(conn, "cafe", str(header), "c")
+
+            assert delete_orphan_files(conn, "cafe", tmp_path) == 1
+            assert str(header) not in self._paths(conn)
+        finally:
+            conn.close()
+
+    def test_a_row_for_a_missing_file_is_still_deleted(self, tmp_path: Path):
+        from fw_context_mcp.indexer.db import delete_orphan_files, upsert_file
+
+        conn = self._conn(tmp_path)
+        try:
+            upsert_file(conn, "cafe", str(tmp_path / "gone.c"), "c")
+
+            assert delete_orphan_files(conn, "cafe", tmp_path) == 1
+        finally:
+            conn.close()
+
+    def test_a_row_with_content_is_untouched(self, tmp_path: Path):
+        """Unchanged behaviour: a header with captured content stays.
+
+        search_content serves those, which is why the sweep never took them.
+        """
+        from fw_context_mcp.indexer.db import delete_orphan_files, upsert_file
+
+        header = tmp_path / "decls.h"
+        header.write_text("void f(void);\n")
+        conn = self._conn(tmp_path)
+        try:
+            upsert_file(conn, "cafe", str(header), "c")
+            conn.execute(
+                "UPDATE files SET content = ? WHERE config_hash='cafe' AND path = ?",
+                ("void f(void);\n", str(header)),
+            )
+
+            assert delete_orphan_files(conn, "cafe", tmp_path) == 0
+            assert str(header) in self._paths(conn)
+        finally:
+            conn.close()
+
+    def test_without_a_root_a_relative_path_is_deleted_as_before(self, tmp_path: Path):
+        """A caller with no root cannot check, so nothing changes for it."""
+        from fw_context_mcp.indexer.db import delete_orphan_files, upsert_file
+
+        (tmp_path / "src").mkdir()
+        (tmp_path / "src" / "empty.c").write_text("")
+        conn = self._conn(tmp_path)
+        try:
+            upsert_file(conn, "cafe", "src/empty.c", "c")
+
+            assert delete_orphan_files(conn, "cafe") == 1
+        finally:
+            conn.close()
+
+    def test_another_build_is_not_touched(self, tmp_path: Path):
+        from fw_context_mcp.indexer.db import (
+            delete_orphan_files, open_db, upsert_build_config, upsert_file, upsert_project,
+        )
+
+        header = tmp_path / "stale.h"
+        header.write_text("// text\n")
+        conn = open_db(tmp_path / "index.db")
+        try:
+            upsert_project(conn, "proj", "Proj", str(tmp_path))
+            upsert_build_config(conn, "cafe", "proj", str(tmp_path / "cc.json"))
+            upsert_build_config(conn, "beef", "proj", str(tmp_path / "cc.json"))
+            upsert_file(conn, "cafe", str(header), "c")
+            upsert_file(conn, "beef", str(header), "c")
+
+            assert delete_orphan_files(conn, "cafe", tmp_path) == 1
+            other = conn.execute(
+                "SELECT COUNT(*) FROM files WHERE config_hash='beef'").fetchone()[0]
+            assert other == 1
+        finally:
+            conn.close()
