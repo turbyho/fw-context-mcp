@@ -74,7 +74,8 @@ def compute_analysis_coverage(conn: sqlite3.Connection, config_hash: str) -> dic
     * ``analyzed`` — symbols with a real analysis row.
     * ``skipped`` — symbols with a ``skip:*`` sentinel row.  The pipeline
       tried these symbols and cannot analyze them (the body is larger than
-      the model context, or the model gave an unparseable answer).
+      the model context, the model gave an unparseable answer, or the body
+      was not readable at all).
     * ``total`` — all symbols of the analyzable kinds.
 
     ``total - analyzed - skipped`` gives the symbols that the pipeline can

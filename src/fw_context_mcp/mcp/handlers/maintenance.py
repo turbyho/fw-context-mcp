@@ -265,7 +265,7 @@ def get_active_build(
     * ``analyze_vendor`` — the value at index time, not the current config.
     * ``project`` / ``vendor`` — ``{analyzed, skipped, total}``.
       ``skipped`` = tried, but not analyzable (body larger than the model
-      context, or an unparseable answer).
+      context, an unparseable answer, or a body that was not readable).
     * ``complete`` — no work left: every project symbol is analyzed or
       skipped.  True exactly when ``reindex_reasons`` holds no "unanalyzed
       symbols" entry.  Vendor symbols excluded by ``analyze_vendor=False``

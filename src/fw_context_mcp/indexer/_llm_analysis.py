@@ -74,11 +74,18 @@ def _fetch_referencers(conn, symbol_usr: str, config_hash: str) -> list[str]:
 
 
 def _enrich_batch(conn, batch_rows, config_hash: str, *, project_root: Path | None = None) -> list[dict]:
-    """Augment symbol rows with ``body`` and ``callees`` keys.
+    """Augment symbol rows with ``body``, ``callees`` and ``body_unavailable``.
 
-    Reads function/method bodies from disk and fetches callee names
-    from the reference index.  Failures are non-fatal — missing body
-    or callees are left as empty strings/lists.
+    Reads function/method bodies from disk and fetches callee names from
+    the reference index.  A callee lookup that gives nothing is normal and
+    stays an empty list.
+
+    ``body_unavailable`` is True when the kind of the symbol must have a
+    body, but the read gave nothing.  The two causes are a source file that
+    disappeared, and an extent that does not agree with the file on disk —
+    for example when an editor shortens the file while a background reindex
+    reads it.  The caller must skip such a symbol; see the note in
+    ``_build_llm_analysis``.
     """
     from ..utils import abs_path as resolve_abs_path
 
@@ -87,6 +94,7 @@ def _enrich_batch(conn, batch_rows, config_hash: str, *, project_root: Path | No
     for r in batch_rows:
         d = dict(r)
         body = ""
+        body_unavailable = False
         callees: list[str] = []
 
         kind = d.get("kind", "")
@@ -105,6 +113,7 @@ def _enrich_batch(conn, batch_rows, config_hash: str, *, project_root: Path | No
             and end_line > start_line
         ):
             if not os.path.exists(abs_file_path):
+                body_unavailable = True
                 log.warning(
                     "[%s] body not available for %s — file missing: %s",
                     kind, d.get("qualified_name", "?"), abs_file_path,
@@ -112,7 +121,8 @@ def _enrich_batch(conn, batch_rows, config_hash: str, *, project_root: Path | No
             else:
                 body = _read_body(abs_file_path, start_line, end_line)
                 if not body and start_line > 0:
-                    log.error(
+                    body_unavailable = True
+                    log.warning(
                         "[%s] empty body for %s at %s:%d-%d — "
                         "path resolution or extent mismatch",
                         kind, d.get("qualified_name", "?"), abs_file_path, start_line, end_line,
@@ -129,6 +139,7 @@ def _enrich_batch(conn, batch_rows, config_hash: str, *, project_root: Path | No
 
         d["body"] = body
         d["callees"] = callees
+        d["body_unavailable"] = body_unavailable
         enriched.append(d)
     return enriched
 
@@ -170,6 +181,10 @@ def _clear_skip_sentinels(
       now fit).
     - ``skip:unparseable:`` sentinels are cleared when *retry_unparseable*
       is True, or when the stored model name doesn't match *model*.
+    - ``skip:nobody`` sentinels stay.  They need no rule here, because the
+      recorded hash is the hash of an empty body: a body that reads
+      correctly gives a different hash, thus the next run re-analyses the
+      symbol on its own.
     """
     conn.execute(
         """DELETE FROM llm_analysis
@@ -333,6 +348,34 @@ def _build_llm_analysis(
                 total += 1
                 elapsed = time.monotonic() - t0
                 log.debug("[%d/%d] %s: hash-matched %s", idx + 1, total_symbols, qname, _fmt_dur(elapsed))
+                continue
+
+            # ── Body unavailable: store a sentinel, do not call the model ──
+            # An analysis without the body is worthless, because the model
+            # then sees only the name and the signature.  It is also unsafe
+            # to cache: ``h`` is the hash of an EMPTY body, thus a later
+            # symbol with the same name, signature and docstring could read
+            # the answer back from the content-addressable caches.  The
+            # unparseable-response path below keeps its sentinel out of
+            # those caches for the same reason.
+            #
+            # The sentinel goes into the per-build table only.  It keeps
+            # the symbol out of ``count_pending_analysis``, thus a file
+            # that a build step removed cannot hold the index in
+            # ``reindex_needed`` for good.  The next run still repairs the
+            # symbol: ``h`` came from an empty body, thus it cannot match
+            # the hash of a body that reads correctly, and the code above
+            # falls through to a real analysis.
+            if d.get("body_unavailable"):
+                with write_lock(db_dir, timeout=5.0) if not write_lock_held else nullcontext():
+                    with transaction(conn, checkpoint=False):
+                        upsert_llm_analysis_batch(conn, [(d["id"], "", "", "", "skip:nobody", h)])
+                total += 1
+                elapsed = time.monotonic() - t0
+                log.warning(
+                    "[%d/%d] %s: skip %s (body unavailable — the next run retries)",
+                    idx + 1, total_symbols, qname, _fmt_dur(elapsed),
+                )
                 continue
 
             # Tier 1: local global cache (~/.fw-context/llm_cache.db)
