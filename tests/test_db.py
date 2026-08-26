@@ -2586,3 +2586,117 @@ class TestOrphanFileCleanup:
             assert other == 1
         finally:
             conn.close()
+
+
+class TestHashColumnsAreNotErased:
+    """An EMPTY hash never overwrites a stored one.
+
+    Four of the five callers of upsert_file() pass no hashes.  reindex_file
+    is one of them: it re-parses one translation unit through
+    store_symbols_for_unit() without them, and that erased content_hash,
+    source_hash and flags_hash for that row.
+
+    Erasing them was never a WRONG answer.  Tier 1 compares the mtime, which
+    a re-parse does not move, so the next run never read the cleared value —
+    measured on zbox-ecb-fw-v5, where a reindex_file of proj/app/src/main.c
+    left 254 of 257 units unchanged on the following run.  The cost came
+    later: once something moved the mtime without changing the text, Tier 2
+    found an empty content_hash, could not take its shortcut, and paid one
+    libclang parse to rebuild what was already known.
+    """
+
+    @staticmethod
+    def _conn(tmp_path: Path):
+        from fw_context_mcp.indexer.db import open_db, upsert_build_config, upsert_project
+
+        conn = open_db(tmp_path / "index.db")
+        upsert_project(conn, "proj", "Proj", str(tmp_path))
+        upsert_build_config(conn, "cafe", "proj", str(tmp_path / "cc.json"))
+        return conn
+
+    @staticmethod
+    def _row(conn):
+        return dict(conn.execute(
+            "SELECT mtime, content_hash, source_hash, flags_hash FROM files "
+            "WHERE config_hash='cafe' AND path='src/main.c'").fetchone())
+
+    def test_a_caller_without_hashes_keeps_the_stored_ones(self, tmp_path: Path):
+        from fw_context_mcp.indexer.db import upsert_file
+
+        conn = self._conn(tmp_path)
+        try:
+            upsert_file(conn, "cafe", "src/main.c", "c", mtime=10.0,
+                        content_hash="CH", source_hash="SH", flags_hash="FH")
+            # exactly what _reindex_parse_and_store does
+            upsert_file(conn, "cafe", "src/main.c", "c", mtime=20.0)
+
+            row = self._row(conn)
+            assert row["content_hash"] == "CH"
+            assert row["source_hash"] == "SH"
+            assert row["flags_hash"] == "FH"
+        finally:
+            conn.close()
+
+    def test_the_mtime_still_moves(self, tmp_path: Path):
+        """Only the hashes are protected.  The mtime must keep updating."""
+        from fw_context_mcp.indexer.db import upsert_file
+
+        conn = self._conn(tmp_path)
+        try:
+            upsert_file(conn, "cafe", "src/main.c", "c", mtime=10.0, content_hash="CH")
+            upsert_file(conn, "cafe", "src/main.c", "c", mtime=20.0)
+
+            assert self._row(conn)["mtime"] == 20.0
+        finally:
+            conn.close()
+
+    def test_a_new_hash_still_overwrites(self, tmp_path: Path):
+        """The negative control.  A caller that KNOWS must still win."""
+        from fw_context_mcp.indexer.db import upsert_file
+
+        conn = self._conn(tmp_path)
+        try:
+            upsert_file(conn, "cafe", "src/main.c", "c", mtime=10.0,
+                        content_hash="OLD", source_hash="OLDS", flags_hash="OLDF")
+            upsert_file(conn, "cafe", "src/main.c", "c", mtime=20.0,
+                        content_hash="NEW", source_hash="NEWS", flags_hash="NEWF")
+
+            row = self._row(conn)
+            assert row["content_hash"] == "NEW"
+            assert row["source_hash"] == "NEWS"
+            assert row["flags_hash"] == "NEWF"
+        finally:
+            conn.close()
+
+    def test_each_column_is_protected_on_its_own(self, tmp_path: Path):
+        """A caller that knows one hash must not erase the other two."""
+        from fw_context_mcp.indexer.db import upsert_file
+
+        conn = self._conn(tmp_path)
+        try:
+            upsert_file(conn, "cafe", "src/main.c", "c",
+                        content_hash="CH", source_hash="SH", flags_hash="FH")
+            upsert_file(conn, "cafe", "src/main.c", "c", source_hash="NEWS")
+
+            row = self._row(conn)
+            assert row["content_hash"] == "CH"
+            assert row["source_hash"] == "NEWS"
+            assert row["flags_hash"] == "FH"
+        finally:
+            conn.close()
+
+    def test_a_row_that_never_had_hashes_stays_empty(self, tmp_path: Path):
+        """A header row keeps its empty hashes — nothing is invented."""
+        from fw_context_mcp.indexer.db import upsert_file
+
+        conn = self._conn(tmp_path)
+        try:
+            upsert_file(conn, "cafe", "src/main.c", "c")
+            upsert_file(conn, "cafe", "src/main.c", "c", mtime=5.0)
+
+            row = self._row(conn)
+            assert row["content_hash"] == ""
+            assert row["source_hash"] == ""
+            assert row["flags_hash"] == ""
+        finally:
+            conn.close()

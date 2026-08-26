@@ -126,6 +126,20 @@ def upsert_file(
     in-project paths anyway.  _step_reconcile_generated() is what makes the
     column right again, and it is the authoritative write.
 
+    The three hash columns follow the same rule for the same reason: an
+    EMPTY hash never overwrites a stored one.  Four of the five callers pass
+    no hashes at all, and reindex_file is one of them — it re-parses one
+    translation unit through store_symbols_for_unit() without them, and that
+    used to erase content_hash, source_hash and flags_hash for that row.
+
+    The cost of erasing them was NOT a wrong answer.  Tier 1 compares the
+    mtime, which a re-parse does not move, so the next run never even read
+    the cleared value.  It surfaced only later: once something moved the
+    mtime without changing the text, Tier 2 found an empty content_hash,
+    could not take its shortcut, and paid one libclang parse to rebuild what
+    was already known.  files.content_hash has exactly one reader,
+    _check_and_parse_unit; source_hash and flags_hash have none.
+
     Args:
         conn: Open database connection.
         config_hash: Build config hash the file belongs to.
@@ -147,9 +161,12 @@ def upsert_file(
            ON CONFLICT(config_hash, path) DO UPDATE SET
                language=excluded.language,
                mtime=excluded.mtime,
-               content_hash=excluded.content_hash,
-               source_hash=excluded.source_hash,
-               flags_hash=excluded.flags_hash,
+               content_hash=CASE WHEN excluded.content_hash = ''
+                            THEN files.content_hash ELSE excluded.content_hash END,
+               source_hash=CASE WHEN excluded.source_hash = ''
+                           THEN files.source_hash ELSE excluded.source_hash END,
+               flags_hash=CASE WHEN excluded.flags_hash = ''
+                          THEN files.flags_hash ELSE excluded.flags_hash END,
                generated=MAX(files.generated, excluded.generated)
            RETURNING id""",
         (
