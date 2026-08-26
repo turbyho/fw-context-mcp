@@ -39,6 +39,13 @@ WHY ``watchfiles`` instead of ``inotify`` directly:
   debouncing built in.  Raw inotify requires manual event coalescing
   (a ``git checkout`` generates hundreds of events).
 
+WHY the file watcher is a separate task: an index run takes minutes on
+a large project.  A loop that watches and indexes in turn must leave its
+``async for`` to start the run, and that closes the inotify subscription.
+``watchfiles`` keeps no events while the subscription is closed, thus each
+edit made during the run is lost.  A watcher task that lives as long as
+the daemon keeps those edits as a flag for the reindex loop.
+
 WHY ``debounce=2000 ms``: ``git checkout``, ``git pull``, and IDE
 auto-save generate bursts of file-change events.  Without debouncing,
 the daemon would spawn a ``fw-context index`` for each event — then
@@ -64,6 +71,7 @@ import socket
 import sqlite3
 import sys
 import time
+from collections.abc import Callable
 from pathlib import Path
 
 from ..config import derive_project_id
@@ -187,8 +195,6 @@ async def daemon_main(project_root: Path) -> None:
     _setup_signal_handlers(shutdown)
 
     # ── Main loop ────────────────────────────────────────────────────────
-    from watchfiles import awatch
-
     # ── Structured logger — attach project context for log aggregation ──
     dlog = logging.LoggerAdapter(
         log,
@@ -197,104 +203,228 @@ async def daemon_main(project_root: Path) -> None:
 
     dlog.info("Daemon started  socket=%s", sock_path)
 
+    watch_task: asyncio.Task | None = None
     try:
-        # ── Initial staleness check ──────────────────────────────────────
-        # Runs before the socket server is accepting pings, so blocking the
-        # event loop briefly with a synchronous DB call is harmless.
-        from .background import _check_bg_pause as _bg_paused
-        needs, reasons = await asyncio.get_running_loop().run_in_executor(
-            None, _staleness_check, project_root
-        )
-        if needs and not _bg_paused(project_root):
-            dlog.info("Initial index needed (%s)", ", ".join(reasons))
-            force_refs = "refs missing" in reasons
-            index_proc = await _run_index_async(project_root, db_dir, force_refs=force_refs)
-            await _wait_index(index_proc, shutdown, db_dir=db_dir)
-            index_proc = None
-
-        # Load build-dir exclusion patterns from manifest (derived from
-        # SDK detection + [index] exclude_paths config).  Supplements the
-        # hardcoded _EXCLUDE_RX during file-change filtering.
+        # Load the build-dir exclusion patterns from the manifest (derived
+        # from SDK detection and the ``[index] exclude_paths`` config).  They
+        # supplement the hardcoded _EXCLUDE_RX during change filtering.  This
+        # runs before the initial index, because the watcher starts first and
+        # reads this list.
         build_patterns = await asyncio.get_running_loop().run_in_executor(
             None, _load_build_patterns, db_dir
         )
 
-        while not shutdown.is_set():
-            # ── Check ping timeout ───────────────────────────────────────
-            ping_elapsed = time.monotonic() - last_ping_time
-            if ping_elapsed > PING_TIMEOUT:
-                dlog.info(
-                    "No ping for %.0f s — all clients disconnected, exiting",
-                    ping_elapsed,
-                )
-                break
+        # Start the watcher BEFORE the initial index.  The initial index runs
+        # as long as any other index run, thus a watcher that starts after it
+        # loses each edit that a user makes while it runs.
+        pending: asyncio.Event = asyncio.Event()
+        watch_task = asyncio.create_task(
+            _watch_changes(project_root, build_patterns, pending, shutdown, dlog)
+        )
 
-            # ── Watch for file changes ───────────────────────────────────
-            changed = False
-            try:
-                async for changes in awatch(
-                    project_root,
-                    debounce=int(_DEBOUNCE_S * 1000),
-                    recursive=True,
-                    rust_timeout=_WATCH_TIMEOUT * 1000,
-                    yield_on_timeout=True,
-                ):
-                    if shutdown.is_set():
-                        break
-                    ping_elapsed = time.monotonic() - last_ping_time
-                    if ping_elapsed > PING_TIMEOUT:
-                        break
+        # ── Initial staleness check ──────────────────────────────────────
+        # watchfiles reports new events only.  Files that changed before the
+        # daemon started are found here, and become the first pending change.
+        # The check is synchronous, thus it runs in an executor and does not
+        # block the socket server.
+        from .background import _check_bg_pause as _bg_paused
+        needs, reasons = await asyncio.get_running_loop().run_in_executor(
+            None, _staleness_check, project_root
+        )
+        force_refs = False
+        if needs and not _bg_paused(project_root):
+            dlog.info("Initial index needed (%s)", ", ".join(reasons))
+            force_refs = "refs missing" in reasons
+            pending.set()
 
-                    for _, changed_path_str in changes:
-                        if _is_source_file(changed_path_str, build_patterns):
-                            changed = True
-                            break
-                    if changed:
-                        break  # Exit watch loop → run index
-            except (OSError, RuntimeError) as exc:
-                dlog.warning("watchfiles error: %s", exc)
-                await asyncio.sleep(5)
-                continue
+        def _set_index_proc(proc: asyncio.subprocess.Process | None) -> None:
+            """Publish the running subprocess, thus the cleanup can stop it."""
+            nonlocal index_proc
+            index_proc = proc
 
-            if changed and not shutdown.is_set():
-                # Skip when a manual fw-context index holds the pause marker
-                from .background import _check_bg_pause as _bg_paused
-                if _bg_paused(project_root):
-                    dlog.info("Manual index in progress — skipping background reindex")
-                else:
-                    # A manual operation can take the index over mid-run, and
-                    # the run then abandons itself rather than finishing from
-                    # a snapshot that operation invalidated.  Its work is
-                    # still outstanding, so retry once the marker clears
-                    # instead of falling back to waiting for another change —
-                    # the edits that triggered this would otherwise stay
-                    # unindexed indefinitely.
-                    for _attempt in range(_SUPERSEDED_RETRIES):
-                        index_proc = await _run_index_async(project_root, db_dir)
-                        superseded = await _wait_index(
-                            index_proc, shutdown, db_dir=db_dir
-                        )
-                        index_proc = None
-                        if not superseded or shutdown.is_set():
-                            break
-                        if not await _wait_for_pause_to_clear(project_root, shutdown):
-                            dlog.info(
-                                "Pause marker still held — leaving the reindex "
-                                "to the next change"
-                            )
-                            break
-                    else:
-                        dlog.warning(
-                            "Background reindex superseded %d times — giving up "
-                            "until the next change",
-                            _SUPERSEDED_RETRIES,
-                        )
+        def _ping_expired() -> bool:
+            """Return True when no MCP client sent a ping for PING_TIMEOUT."""
+            elapsed = time.monotonic() - last_ping_time
+            if elapsed <= PING_TIMEOUT:
+                return False
+            dlog.info(
+                "No ping for %.0f s — all clients disconnected, exiting", elapsed
+            )
+            return True
+
+        await _reindex_loop(
+            project_root,
+            db_dir,
+            pending=pending,
+            shutdown=shutdown,
+            dlog=dlog,
+            ping_expired=_ping_expired,
+            on_index_proc=_set_index_proc,
+            build_patterns=build_patterns,
+            force_refs=force_refs,
+        )
 
     finally:
+        shutdown.set()
+        if watch_task is not None:
+            await _stop_watcher(watch_task)
         await _cleanup_daemon(index_proc, server, sock_path, pid_file, lock_fd, shutdown)
 
 
 # ── Internal helpers ─────────────────────────────────────────────────────────
+
+
+# ── Change watcher ───────────────────────────────────────────────────────────
+
+
+async def _watch_changes(
+    project_root: Path,
+    build_patterns: list[str],
+    pending: asyncio.Event,
+    shutdown: asyncio.Event,
+    dlog: logging.LoggerAdapter,
+) -> None:
+    """Set *pending* for each C/C++ change under *project_root*, until shutdown.
+
+    WHY this is a task, and not an ``async for`` inside the reindex loop:
+    an index run takes minutes on a large project.  A loop that watches and
+    indexes in turn must leave its ``async for`` to start the run, and that
+    closes the inotify subscription.  ``watchfiles`` keeps no events while
+    the subscription is closed, thus each edit made during the run is lost,
+    and the index stays stale until an unrelated edit starts the next run.
+    This task lives as long as the daemon, thus it keeps those edits as a
+    flag that the reindex loop reads when the current run stops.
+
+    ``awatch`` gets *shutdown* as its ``stop_event``, thus it returns as soon
+    as the daemon stops, and does not wait for the Rust timeout.
+
+    *build_patterns* is read for each change, thus the caller can refresh the
+    list in place after an index run writes a new manifest.
+    """
+    from watchfiles import awatch
+
+    while not shutdown.is_set():
+        try:
+            async for changes in awatch(
+                project_root,
+                debounce=int(_DEBOUNCE_S * 1000),
+                recursive=True,
+                rust_timeout=_WATCH_TIMEOUT * 1000,
+                yield_on_timeout=True,
+                stop_event=shutdown,
+            ):
+                if shutdown.is_set():
+                    return
+                for _, changed_path_str in changes:
+                    if _is_source_file(changed_path_str, build_patterns):
+                        pending.set()
+                        break
+        except (OSError, RuntimeError) as exc:
+            dlog.warning("watchfiles error: %s", exc)
+            await asyncio.sleep(5)
+
+
+async def _stop_watcher(task: asyncio.Task) -> None:
+    """Stop the watcher *task*, and do not let its error stop the shutdown.
+
+    The task stops on its own when the daemon sets the shutdown event.  The
+    cancel is the fallback for a task that is between two ``awatch`` calls at
+    that moment.
+    """
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+    except (OSError, RuntimeError):
+        log.exception("Watcher task stopped with an error")
+
+
+# ── Reindex loop ─────────────────────────────────────────────────────────────
+
+
+async def _reindex_loop(
+    project_root: Path,
+    db_dir: Path,
+    *,
+    pending: asyncio.Event,
+    shutdown: asyncio.Event,
+    dlog: logging.LoggerAdapter,
+    ping_expired: Callable[[], bool],
+    on_index_proc: Callable[[asyncio.subprocess.Process | None], None],
+    build_patterns: list[str] | None = None,
+    force_refs: bool = False,
+) -> None:
+    """Run one index for each pending change, until shutdown or a ping timeout.
+
+    WHY the loop clears *pending* BEFORE it starts the index subprocess: a
+    change that arrives while the subprocess runs sets the flag again, thus
+    the next turn of the loop indexes that change.  A clear after the run
+    drops such a change, and the index then stays stale until an unrelated
+    edit starts the next run.  The cost of this order is one more run when
+    the subprocess already saw the change.  A run that is not necessary is
+    cheaper than an index that is not correct.
+    """
+    from .background import _check_bg_pause as _bg_paused
+
+    loop = asyncio.get_running_loop()
+
+    while not shutdown.is_set():
+        if not pending.is_set():
+            try:
+                await asyncio.wait_for(pending.wait(), timeout=_WATCH_TIMEOUT)
+            except TimeoutError:
+                pass
+        if ping_expired():
+            return
+        if shutdown.is_set() or not pending.is_set():
+            continue
+
+        # Collect the rest of the burst.  A git checkout and a build both
+        # touch many files, and one index run covers all of them.
+        await asyncio.sleep(_DEBOUNCE_S)
+
+        # A manual operation can hold the index.  Keep the pending flag while
+        # it does — a single-file reindex does not cover the other changes.
+        if _bg_paused(project_root):
+            dlog.info("Manual index in progress — the background reindex waits")
+            if not await _wait_for_pause_to_clear(project_root, shutdown):
+                continue
+
+        pending.clear()
+
+        # A manual operation can also take the index over mid-run, and the run
+        # then abandons itself rather than finishing from a snapshot that
+        # operation invalidated.  Its work is still outstanding, thus retry
+        # after the marker clears.  After the last attempt the loop gives the
+        # work up, because a manual operation that takes the index over again
+        # and again would otherwise spawn one index subprocess after another.
+        for _attempt in range(_SUPERSEDED_RETRIES):
+            proc = await _run_index_async(project_root, db_dir, force_refs=force_refs)
+            on_index_proc(proc)
+            superseded = await _wait_index(proc, shutdown, db_dir=db_dir)
+            on_index_proc(None)
+            if not superseded or shutdown.is_set():
+                break
+            if not await _wait_for_pause_to_clear(project_root, shutdown):
+                dlog.info(
+                    "Pause marker still held — leaving the reindex to the next change"
+                )
+                break
+        else:
+            dlog.warning(
+                "Background reindex superseded %d times — giving up until the "
+                "next change",
+                _SUPERSEDED_RETRIES,
+            )
+        force_refs = False
+
+        # A completed run can write a new manifest.  Refresh the exclusions in
+        # place, because the watcher task holds the same list object.
+        if build_patterns is not None and not shutdown.is_set():
+            build_patterns[:] = await loop.run_in_executor(
+                None, _load_build_patterns, db_dir
+            )
 
 
 async def _setup_unix_socket(db_dir: Path, on_ping) -> tuple[asyncio.Server, Path]:
@@ -393,8 +523,8 @@ def _load_build_patterns(db_dir: Path) -> list[str]:
 
     Reads the patterns without parsing the whole manifest — the file runs to
     tens of megabytes and this needs one short list from it.  The daemon calls
-    this once at startup, so the cost was one-off rather than per query, but
-    there is no reason to pay it.
+    this at startup and after each index run that can write a new manifest,
+    thus the cost is per run rather than per query.
     """
     try:
         from ..indexer.manifest import load_build_dir_patterns_any
