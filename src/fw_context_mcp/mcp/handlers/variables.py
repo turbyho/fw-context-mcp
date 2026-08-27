@@ -31,10 +31,10 @@ from pydantic import Field
 
 from ...utils import abs_path
 from ..shared.stale import (
-    _count_modified_files,
     _stale_files,
     annotate_stale,
     collect_result_paths,
+    diagnose_empty_result,
 )
 from ._base import BaseHandler
 
@@ -228,13 +228,16 @@ def find_variables(
         results = _do_find(conn, config_hash)
         file_paths = collect_result_paths(results, root)
         if file_paths:
-            return results, _stale_files(conn, config_hash, file_paths, root), 0
-        # No variable found: count the whole index instead, so an empty
+            return results, _stale_files(conn, config_hash, file_paths, root), 0, []
+        # No variable found: diagnose the whole index instead, so an empty
         # answer over a changed tree does not read as proof of absence.
-        return results, [], _count_modified_files(conn, config_hash, root, use_cache=False)
+        dirty, new_sources = diagnose_empty_result(conn, config_hash, root)
+        return results, [], dirty, new_sources
 
-    results, stale, dirty = db.executor.execute_sync(_query, db.config_hash)
+    results, stale, dirty, new_sources = db.executor.execute_sync(_query, db.config_hash)
     if stale or dirty:
         from fw_context_mcp.mcp.background import _ensure_daemon_running
         _ensure_daemon_running(root)
-    return annotate_stale(results, stale, empty_dirty_count=dirty)
+    return annotate_stale(
+        results, stale, empty_dirty_count=dirty, empty_new_sources=new_sources
+    )

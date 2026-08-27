@@ -287,6 +287,171 @@ def _count_modified_files(
     return modified
 
 
+# ── New source files ──
+# A file that the build system never saw has no translation unit, thus a
+# reindex cannot pick it up: it is absent from compile_commands.json, and
+# only a build puts it there.  Detection therefore needs the file tree, not
+# the mtimes of the rows the index already holds.
+
+# Only translation-unit candidates.  A new header is deliberately out of
+# scope: one that nothing includes stays out of the index even after a
+# build, thus reporting it would give a warning with no cure, and one that
+# some unit includes reaches the index on its own.
+_TU_EXTENSIONS = frozenset({".c", ".cc", ".cpp", ".cxx"})
+
+# Cap on the number of reported paths.  The count is what matters to the
+# caller; a full list of a hundred paths would only crowd the message.
+_UNINDEXED_REPORT_LIMIT = 20
+
+
+def _project_scan_roots(scan_roots: set[str], build_patterns: list[str]) -> set[str]:
+    """Drop the build-output directories from the scan roots.
+
+    ``_indexed_paths`` collects the roots from the index, because the layouts
+    differ: zbox-ecb-fw keeps code in ``lib``, ``src`` and ``targets_custom``,
+    birdie1-v2-fw-v3 adds ``mbed_target_stm`` and ``components``.  A fixed
+    list of ``src``/``lib``/``include`` would miss those.
+
+    A build directory can hold a project file — a generated config header —
+    and thus reach the set.  Walking it would cost a lot and find only build
+    output, so it goes out here.
+
+    ``"."`` means that the project holds source files in its root directory,
+    and it never matches a build pattern.
+    """
+    return {
+        root
+        for root in scan_roots
+        if root == "." or not _path_matches_patterns(root, build_patterns)
+    }
+
+
+def find_unindexed_sources(
+    conn,
+    config_hash: str,
+    root: Path,
+    cc_path: Path,
+    *,
+    limit: int = _UNINDEXED_REPORT_LIMIT,
+) -> list[str]:
+    """Return source files that ``compile_commands.json`` does not cover.
+
+    A file qualifies when BOTH conditions hold:
+
+    1. The index holds no row for it.
+    2. Its mtime is newer than ``compile_commands.json``.
+
+    Both are necessary.  Condition 1 alone is useless: a project keeps many
+    source files out of the build on purpose — library headers that nothing
+    includes, tests outside the build, ``secrets.example.h``.  On
+    birdie1-v2-fw-v3 that is 726 files, and every one of them is correct.
+
+    Condition 2 must compare against ``compile_commands.json``, never against
+    the index timestamp.  A reindex moves the index timestamp even when it
+    ignores the new file, thus the file would look old on the next run and
+    stay invisible forever.  Only a build writes compile_commands.json.
+
+    The same property stops a loop: after a successful build the file is
+    older than the regenerated compile_commands.json, thus a file that the
+    build system never accepts is reported once, not forever.
+
+    Args:
+        conn: Open connection to the index database.
+        config_hash: Active build configuration.
+        root: Project root.
+        cc_path: Path of the compile_commands.json of this build.
+        limit: Maximum number of paths to return.  The caller reports the
+            count, thus a long list adds nothing.
+
+    Returns:
+        list[str]: Paths relative to *root*, sorted, at most *limit* long.
+        Empty when compile_commands.json is absent — without a reference
+        point every file would look new, and a warning on every query is
+        worse than none.
+    """
+    from ...indexer.manifest import load_build_dir_patterns
+    from ...indexer.ops import _normalize_file_path
+
+    try:
+        cc_mtime = os.path.getmtime(cc_path)
+    except OSError:
+        return []
+
+    known, scan_roots = _indexed_paths(conn, config_hash)
+    db_path = Path(conn.execute("PRAGMA database_list").fetchone()["file"])
+    build_patterns = load_build_dir_patterns(db_path.parent, config_hash)
+
+    found: list[str] = []
+    for scan_root in sorted(_project_scan_roots(scan_roots, build_patterns)):
+        start = root if scan_root == "." else root / scan_root
+        for candidate in _walk_tu_candidates(start, scan_root == ".", build_patterns):
+            # _normalize_file_path decides the one spelling that every
+            # path-keyed lookup uses, thus the comparison must go through it.
+            # It runs on the candidates only — resolving every indexed path
+            # instead cost one syscall per row and made the scan 7x slower.
+            key = _normalize_file_path(candidate, root)
+            if key in known:
+                continue
+            try:
+                if os.path.getmtime(candidate) <= cc_mtime:
+                    continue
+            except OSError:
+                continue  # vanished between the walk and the stat
+            found.append(key)
+
+    return sorted(found)[:limit]
+
+
+def _indexed_paths(conn, config_hash: str) -> tuple[set[str], set[str]]:
+    """Return what the index knows, as ``(paths, scan_roots)``.
+
+    *paths* holds the ``files.path`` column verbatim.  The indexer writes it
+    through ``_normalize_file_path``, thus a caller that normalises its own
+    candidate the same way can compare the two directly, with no syscall per
+    row.
+
+    *scan_roots* holds the first path component of every project file, which
+    seeds the directory walk.  A vendor file adds nothing: a new file lands
+    beside the code of the team, not inside the SDK.
+    """
+    paths: set[str] = set()
+    scan_roots: set[str] = set()
+    for row in conn.execute(
+        "SELECT path, is_project FROM files WHERE config_hash=?", (config_hash,)
+    ):
+        stored = row["path"]
+        paths.add(stored)
+        if row["is_project"] and not os.path.isabs(stored):
+            parts = Path(stored).parts
+            scan_roots.add(parts[0] if len(parts) > 1 else ".")
+    return paths, scan_roots
+
+
+def _walk_tu_candidates(start: Path, root_only: bool, build_patterns: list[str]):
+    """Yield the absolute path of every translation-unit candidate under *start*.
+
+    With *root_only* the walk covers the directory itself and no child: the
+    named scan roots already cover the subtrees, and a recursive walk from
+    the project root would cross the vendor tree.
+    """
+    if not start.is_dir():
+        return
+
+    if root_only:
+        for entry in start.iterdir():
+            if entry.is_file() and entry.suffix.lower() in _TU_EXTENSIONS:
+                yield str(entry.resolve())
+        return
+
+    for dirpath, dirnames, filenames in os.walk(start):
+        if build_patterns and _path_matches_patterns(dirpath, build_patterns):
+            dirnames[:] = []  # build output — do not descend
+            continue
+        for filename in filenames:
+            if Path(filename).suffix.lower() in _TU_EXTENSIONS:
+                yield str(Path(dirpath, filename).resolve())
+
+
 
 
 # ── Header dependency staleness ──
@@ -429,19 +594,23 @@ def _with_stale_recovery(
         safe_rows: list[dict] = [dict(r) for r in result_rows]
         paths = collect_result_paths(safe_rows, root)
         if paths:
-            return safe_rows, _stale_files(db_conn, cfg_hash, paths, root), 0
+            return safe_rows, _stale_files(db_conn, cfg_hash, paths, root), 0, []
         # An empty search result is the case the caller most easily reads as
-        # "does not exist".  See with_stale_annotation for why the cache of
-        # _count_modified_files must stay off here.
-        return safe_rows, [], _count_modified_files(db_conn, cfg_hash, root, use_cache=False)
+        # "does not exist".
+        dirty, new_sources = diagnose_empty_result(db_conn, cfg_hash, root)
+        return safe_rows, [], dirty, new_sources
 
-    safe_rows, stale_f, dirty = executor.execute_sync(_query, config_hash)
+    safe_rows, stale_f, dirty, new_sources = executor.execute_sync(_query, config_hash)
 
     if stale_f or dirty:
         # Kept here, not in annotate_stale: this path knows that the project
-        # has a database, thus _db_path cannot raise.
+        # has a database, thus _db_path cannot raise.  A new source file does
+        # not start the daemon: only a build repairs that, and the daemon
+        # does not build.
         _ensure_daemon_running(root)
-    return annotate_stale(safe_rows, stale_f, empty_dirty_count=dirty)
+    return annotate_stale(
+        safe_rows, stale_f, empty_dirty_count=dirty, empty_new_sources=new_sources
+    )
 
 
 # ── shared stale annotation ──
@@ -465,6 +634,15 @@ EMPTY_RESULT_STALE_MESSAGE = (
     "No result, and {count} indexed file(s) changed after the last index run. "
     "What you look for can be in one of them, thus an empty result is not "
     "proof that it does not exist. Run 'fw-context index'."
+)
+
+# A file that compile_commands.json does not cover is a stronger case than a
+# changed file, and it needs a different command: only a build writes that
+# file, thus a plain reindex leaves the caller in a circle.
+EMPTY_RESULT_NEW_SOURCE_MESSAGE = (
+    "No result, and {count} source file(s) are not in compile_commands.json "
+    "(first: {first}). A plain reindex cannot see them, because they have no "
+    "translation unit. Run `fw-context index --build`."
 )
 
 # The handlers do not agree on one name for the path of a record, thus a
@@ -534,22 +712,33 @@ def collect_result_paths(result, root: Path, *, _nested: bool = False) -> list[s
     return paths
 
 
-def annotate_stale(result, stale_files: list[str], *, empty_dirty_count: int = 0):
+def annotate_stale(
+    result,
+    stale_files: list[str],
+    *,
+    empty_dirty_count: int = 0,
+    empty_new_sources: list[str] | None = None,
+):
     """Add a stale warning to *result*.
 
-    Two conditions produce a warning, and they never overlap:
+    Three conditions produce a warning, in this order of precedence:
 
     * *stale_files* — the result names files, and some of them changed.
-    * *empty_dirty_count* — the result names no file at all, and this many
-      indexed files changed.  Only this case can tell the caller that an
-      empty result is not proof of absence.
+    * *empty_new_sources* — the result names no file, and these source files
+      are absent from compile_commands.json.  Named first among the empty
+      cases, because it is the only one that needs ``--build``.
+    * *empty_dirty_count* — the result names no file, and this many indexed
+      files changed.
+
+    The last two exist because an empty result gives per-record detection
+    nothing to compare, and the caller reads silence as absence.
 
     A list gets the warning as its first record, which matches the shape that
     ``_with_stale_recovery`` gives.  A dict gets ``stale_warning`` and
     ``stale`` keys instead — a leading record would break the dict contract
     of the source handlers.
 
-    Returns *result* unchanged when neither condition holds.
+    Returns *result* unchanged when no condition holds.
 
     WHY no daemon start here: ``server.main`` starts the watcher daemon and
     its ping loop keeps it alive, thus a query does not have to.  A side
@@ -559,6 +748,10 @@ def annotate_stale(result, stale_files: list[str], *, empty_dirty_count: int = 0
     """
     if stale_files:
         message = STALE_RESULT_MESSAGE.format(count=len(stale_files))
+    elif empty_new_sources:
+        message = EMPTY_RESULT_NEW_SOURCE_MESSAGE.format(
+            count=len(empty_new_sources), first=empty_new_sources[0]
+        )
     elif empty_dirty_count:
         message = EMPTY_RESULT_STALE_MESSAGE.format(count=empty_dirty_count)
     else:
@@ -574,6 +767,29 @@ def annotate_stale(result, stale_files: list[str], *, empty_dirty_count: int = 0
     return result
 
 
+def diagnose_empty_result(conn, config_hash: str, root: Path) -> tuple[int, list[str]]:
+    """Explain an empty result: ``(changed_file_count, unindexed_sources)``.
+
+    Runs only when the result names no file, thus its cost falls on the
+    queries that returned nothing anyway.
+
+    ``use_cache=False`` on purpose: the cache of ``_count_modified_files``
+    validates itself against ``MAX(mtime)`` of the files table, which only a
+    reindex changes.  An edit on disk leaves that cache valid, thus a cached
+    answer would miss the very edit this check exists for.
+    """
+    dirty = _count_modified_files(conn, config_hash, root, use_cache=False)
+    row = conn.execute(
+        "SELECT compile_commands_path FROM build_configs WHERE config_hash=?",
+        (config_hash,),
+    ).fetchone()
+    if row is None or not row["compile_commands_path"]:
+        return dirty, []
+    return dirty, find_unindexed_sources(
+        conn, config_hash, root, Path(row["compile_commands_path"])
+    )
+
+
 def with_stale_annotation(root: Path, executor, query_fn, config_hash: str):
     """Run *query_fn* on *executor* and annotate a stale result.
 
@@ -582,7 +798,7 @@ def with_stale_annotation(root: Path, executor, query_fn, config_hash: str):
     the executor lock twice and could see a different index state.
 
     A result that names files is checked file by file.  A result that names
-    none gets a project-wide count instead: an empty answer is the case where
+    none goes to ``diagnose_empty_result``: an empty answer is the case where
     the caller most needs to know that the index is behind, and it is the one
     case where per-record detection has nothing to work with.
     """
@@ -591,14 +807,11 @@ def with_stale_annotation(root: Path, executor, query_fn, config_hash: str):
         result = query_fn(conn, cfg_hash)
         paths = collect_result_paths(result, root)
         if paths:
-            return result, _stale_files(conn, cfg_hash, paths, root), 0
-        # No path in the result.  Count every indexed file instead.
-        #
-        # use_cache=False on purpose: the cache of _count_modified_files
-        # validates itself against MAX(mtime) of the files table, which only
-        # a reindex changes.  An edit on disk leaves it valid, thus a cached
-        # answer would miss the very edit this check exists for.
-        return result, [], _count_modified_files(conn, cfg_hash, root, use_cache=False)
+            return result, _stale_files(conn, cfg_hash, paths, root), 0, []
+        dirty, new_sources = diagnose_empty_result(conn, cfg_hash, root)
+        return result, [], dirty, new_sources
 
-    result, stale, dirty = executor.execute_sync(_query, config_hash)
-    return annotate_stale(result, stale, empty_dirty_count=dirty)
+    result, stale, dirty, new_sources = executor.execute_sync(_query, config_hash)
+    return annotate_stale(
+        result, stale, empty_dirty_count=dirty, empty_new_sources=new_sources
+    )

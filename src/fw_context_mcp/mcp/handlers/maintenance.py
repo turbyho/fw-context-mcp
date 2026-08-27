@@ -63,7 +63,11 @@ from ..shared.context import (
     get_executor,
     invalidate_executor,
 )
-from ..shared.stale import _check_header_staleness, _count_modified_files
+from ..shared.stale import (
+    _check_header_staleness,
+    _count_modified_files,
+    find_unindexed_sources,
+)
 
 log = logging.getLogger(__name__)
 
@@ -242,15 +246,21 @@ def get_active_build(
     * ``"ready"`` — up to date. Continue.
     * ``"reindexing"`` — background reindex running; queries stay accurate.
       Continue. ``reindex_progress`` holds its last log line.
-    * ``"reindex_needed"`` — schema mismatch or compile_commands.json
-      changed. Queries still work on existing data; run ``fw-context index``.
+    * ``"reindex_needed"`` — schema mismatch, changed compile_commands.json,
+      or a source file that compile_commands.json does not cover. Queries
+      still work on existing data. Read ``reindex_reasons``: a missing
+      source file needs ``fw-context index --build``, the other two need
+      only ``fw-context index``.
     * ``"no_index"`` — initialized, never indexed. Run ``fw-context index``.
     * ``"not_initialized"`` — run ``fw-context init``.
     * ``"error"`` — DB corruption or access error. Use other tools.
 
-    Only a structural mismatch sets ``reindex_needed`` — an outdated schema,
-    or a changed compile_commands.json.  Modified source files are handled
-    per-query, and never set it.
+    Three conditions set ``reindex_needed``: an outdated schema, a changed
+    compile_commands.json, and a source file that is on disk but absent from
+    compile_commands.json.  The third one needs a build, because only the
+    build system writes that file — a plain reindex has no translation unit
+    for the file and skips it without a word.  Modified source files are
+    something else: they are handled per-query, and never set it.
 
     ``indexed_at`` and ``first_indexed_at`` are UTC; file mtimes are local
     time.  Never compare the two directly — in UTC+2 a correctly indexed
@@ -446,13 +456,23 @@ def get_active_build(
         cc_changed, stale_reason = _is_stale(cfg, cfg["compile_commands_path"])
         schema_old = db_schema_ver < CURRENT_SCHEMA_VERSION
 
-        # Two conditions force a reindex:
+        # A source file that the build system never saw has no translation
+        # unit, thus a plain reindex cannot pick it up: it is absent from
+        # compile_commands.json, and only a build puts it there.  Without
+        # this check the tool reported "ready" over a file it knew nothing
+        # about, and it kept reporting it after a reindex.
+        new_sources = find_unindexed_sources(
+            conn, config_hash, root, Path(cfg["compile_commands_path"])
+        )
+
+        # Three conditions force a reindex:
         #   1. Schema version in DB is older than current code expects.
         #   2. compile_commands.json was modified since indexing
         #      (detected via mtime comparison in _is_stale).
+        #   3. A source file is missing from compile_commands.json.
         # Modified source files are handled per-query via auto-reindex
         # and do NOT cause reindex_needed=True.
-        needs_reindex = cc_changed or schema_old
+        needs_reindex = cc_changed or schema_old or bool(new_sources)
 
         # Build reindex_reasons — only when reindex is actually needed
         reindex_reasons: list[str] = []
@@ -460,6 +480,13 @@ def get_active_build(
             reindex_reasons.append(f"schema_mismatch: {db_schema_ver} < {CURRENT_SCHEMA_VERSION}")
         if cc_changed:
             reindex_reasons.append(stale_reason or "compile_commands_changed")
+        if new_sources:
+            listed = ", ".join(new_sources[:3])
+            more = f" and {len(new_sources) - 3} more" if len(new_sources) > 3 else ""
+            reindex_reasons.append(
+                f"{len(new_sources)} source file(s) not in compile_commands.json "
+                f"({listed}{more}) — needs `fw-context index --build`"
+            )
 
         # Determine status — single value that drives LLM decision-making.
         # Priority: reindex_needed > reindexing > ready.
@@ -483,6 +510,15 @@ def get_active_build(
                 index_message = (
                     "Index is usable — background reindex in progress. All queries return accurate results."
                 )
+        elif new_sources:
+            # Checked before the other reindex reasons: `--build` is the only
+            # command that repairs this one, and a message that says plain
+            # `index` would send the caller in a circle.
+            index_message = (
+                f"{len(new_sources)} source file(s) are not in compile_commands.json "
+                f"(first: {new_sources[0]}). A plain reindex cannot see them — "
+                f"run `fw-context index --build`. Queries still work on existing data."
+            )
         elif schema_old and cc_changed:
             index_message = (
                 f"Schema version mismatch ({db_schema_ver} < {CURRENT_SCHEMA_VERSION}) "
