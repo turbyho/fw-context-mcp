@@ -1047,8 +1047,12 @@ def find_wrapper_callers(
         list of dicts, each with: wrapper_class (str — ``"(global)"`` for a
         free function), method_count (int),
         methods (list of dicts — each with method, qualified_name, kind,
-        and calls (list of dicts — ``driver_method`` (str) and ``line``
-        (int) of each call into the driver))).
+        file (str — absolute path of the file that holds the body of that
+        method), and calls (list of dicts — ``driver_method`` (str) and
+        ``line`` (int) of each call into the driver))).
+
+        The path sits on the method, not on the class, because one wrapper
+        class often spans several files.
 
         Never empty: one dict with ``error`` (cannot resolve) or ``info``
         (no results) replaces the results.  Check both keys first.
@@ -1154,13 +1158,20 @@ def find_wrapper_callers(
             else:
                 wrapper_class = "(global)"
             if wrapper_class not in wrapped:
-                wrapped[wrapper_class] = {"class": wrapper_class, "methods": {}, "_file": r["from_file"]}
+                wrapped[wrapper_class] = {"class": wrapper_class, "methods": {}}
             cm = wrapped[wrapper_class]["methods"]
             if caller_qn not in cm:
                 cm[caller_qn] = {
                     "method": r["caller_name"],
                     "qualified_name": caller_qn,
                     "kind": r["caller_kind"],
+                    # The file that holds the call, thus the file that holds
+                    # the body of this wrapper method.  A per-method path is
+                    # necessary: one wrapper class can span many files (18%
+                    # of the classes in zbox-ecb-fw do, up to 49 files), thus
+                    # a single path on the class would cover only one of
+                    # them, and the staleness check would miss the rest.
+                    "file": abs_path(db.root, r["from_file"]),
                     "calls": [],
                 }
             target = driver_usr_map.get(r["to_usr"])

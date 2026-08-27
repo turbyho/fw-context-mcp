@@ -64,6 +64,7 @@ from ...indexer.db import (
 from ...llm.ollama import OllamaError, OllamaModelNotFoundError, call_ollama_async
 from ...utils import abs_path, read_file_lines
 from ..shared.context import _normalize_file_path_query
+from ..shared.stale import _check_file_stale
 from ._base import BaseHandler
 
 log = logging.getLogger(__name__)
@@ -257,6 +258,162 @@ def _read_symbol_body(file_path: str, line_no: int, end_line: int = 0, max_lines
     return "\n".join(f"{read_start + i + 1:4d}  {window[i]}" for i in range(local_start, local_end + 1))
 
 
+# ── stale-aware body reading ──
+# A body comes from the disk, but its line number comes from the index.
+# An edit that adds or removes lines above a symbol moves that symbol, and
+# the stored line number then points at unrelated code.  That code reads as
+# a valid function body, thus the caller cannot see the error.  The helpers
+# below detect this condition and give the caller a body it can trust.
+
+# Lines from the start of the window that can hold the symbol name.  A
+# definition can start with attributes, a template header, or a signature
+# that continues over more than one line, thus the name is not always on
+# the first line.
+_NAME_PROBE_LINES = 3
+
+
+def _stored_file_mtime(conn: sqlite3.Connection, file_id: int) -> float:
+    """Return the mtime that the index holds for *file_id*.
+
+    Returns 0.0 when the row is absent or the column holds NULL.  0.0 makes
+    ``_check_file_stale`` report the file as changed, thus an index that
+    predates the ``mtime`` column degrades to the safe path instead of a
+    silent wrong answer.
+    """
+    try:
+        row = conn.execute("SELECT mtime FROM files WHERE id = ?", (file_id,)).fetchone()
+    except sqlite3.Error:
+        return 0.0
+    if row is None or row["mtime"] is None:
+        return 0.0
+    return float(row["mtime"])
+
+
+def _read_probe_lines(file_path: str, line_no: int, count: int = _NAME_PROBE_LINES) -> list[str]:
+    """Read *count* lines from *file_path*, starting at 1-based *line_no*.
+
+    Gives the raw text, without the line numbers that ``_read_symbol_body``
+    adds.  ``_body_matches_symbol`` compares this text, thus it must not
+    hold the number prefix.
+    """
+    from itertools import islice
+
+    start = max(0, line_no - 1)
+    try:
+        with Path(file_path).open(errors="replace") as fh:
+            return [line.rstrip("\n\r") for line in islice(fh, start, start + count)]
+    except OSError:
+        return []
+
+
+def _first_content_line(text: str) -> str:
+    """Return the first line of *text* that is not empty, with spaces collapsed."""
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped:
+            return " ".join(stripped.split())
+    return ""
+
+
+def _number_lines(text: str, start_line: int) -> str:
+    """Add the line-number prefix that ``_read_symbol_body`` uses.
+
+    Keeps one output format for both body origins.  Without it the caller
+    gets numbered text from the disk and bare text from the index, and it
+    cannot tell the two apart from the shape alone.
+
+    The numbers are the ones the index holds, thus they can differ from the
+    file on disk.  The warning that goes with an "index" body says so.
+    """
+    return "\n".join(
+        f"{start_line + offset:4d}  {line}"
+        for offset, line in enumerate(text.splitlines())
+    )
+
+
+def _body_matches_symbol(file_path: str, row) -> bool:
+    """Tell whether the text at the stored line number is still the symbol.
+
+    Two checks, in order of accuracy:
+
+    1. ``symbols.source`` holds the body that the index run read.  Its first
+       content line is the exact start of the symbol, thus a comparison with
+       the disk is definite.
+    2. Without an indexed body, look for the symbol name in the first
+       ``_NAME_PROBE_LINES`` lines of the window.  This check is permissive:
+       it accepts a name that a comment holds.  A false accept keeps the
+       current behaviour, and a false reject only costs the indexed body,
+       thus the permissive direction is the safe one.
+    """
+    probe = _read_probe_lines(file_path, row["line"])
+    if not probe:
+        return False
+
+    indexed_body = row["source"] or ""
+    if indexed_body:
+        indexed_first = _first_content_line(indexed_body)
+        disk_first = _first_content_line("\n".join(probe))
+        if indexed_first and disk_first:
+            return indexed_first == disk_first
+
+    name = row["name"] or ""
+    return bool(name) and any(name in line for line in probe)
+
+
+def _read_verified_body(row, file_path: str, stored_mtime: float) -> tuple[str, str, str | None]:
+    """Return the symbol body, its origin, and a warning about its age.
+
+    Args:
+        row: The ``symbols`` row of the symbol.  Must hold ``line``,
+            ``end_line``, ``name``, and ``source``.
+        file_path: Absolute path of the file that holds the symbol.
+        stored_mtime: The mtime that the index holds for that file.
+
+    Returns:
+        tuple: ``(text, origin, warning)``.  *origin* is ``"disk"`` when the
+        text comes from the file, ``"index"`` when it comes from
+        ``symbols.source``, and ``""`` when there is no body.  *warning* is
+        None when the file did not change after the index run.
+    """
+    line_no = row["line"]
+    end_line = row["end_line"] or 0
+
+    if not _check_file_stale(file_path, stored_mtime):
+        # The usual path: the file did not change after the index run, thus
+        # the stored line number is correct.  Costs one stat() call.
+        return _read_symbol_body(file_path, line_no, end_line=end_line), "disk", None
+
+    if _body_matches_symbol(file_path, row):
+        # The file changed, but the symbol did not move.  The disk gives the
+        # current body, which is better than the indexed copy.
+        return (
+            _read_symbol_body(file_path, line_no, end_line=end_line),
+            "disk",
+            f"{file_path} changed after the last index run. The body below is "
+            f"current. The metadata (callers, callees, line numbers of other "
+            f"symbols) can be out of date.",
+        )
+
+    indexed_body = row["source"] or ""
+    if indexed_body:
+        return (
+            _number_lines(indexed_body, line_no),
+            "index",
+            f"{file_path} changed after the last index run, and the stored line "
+            f"number does not point at {row['name']} any more. The body below "
+            f"comes from the index, not from the disk. Its line numbers can be "
+            f"different now.",
+        )
+
+    return (
+        "",
+        "",
+        f"{file_path} changed after the last index run, and the stored line "
+        f"number does not point at {row['name']} any more. The index holds no "
+        f"body for this symbol. Run `fw-context index`.",
+    )
+
+
 # ── shared macro fallback ──
 def _try_macro_fallback(
     conn: sqlite3.Connection, config_hash: str, name: str, root: Path,
@@ -333,6 +490,12 @@ async def explain_symbol(
         holds ``source`` and ``explain_prompt``: read the source, and answer
         the prompt yourself.
 
+        When the file changed after the last index run, the dict adds
+        ``stale`` (True) and ``stale_warning`` (str).  ``stale_warning`` is
+        separate from ``warning``, which the LLM error paths use.  A symbol
+        that moved gives its indexed body, not the code that now sits at the
+        stored line number.
+
         On failure the dict holds only ``error`` with the reason.
     """
     try:
@@ -361,12 +524,22 @@ async def explain_symbol(
             return {"error": f"Path {file_path} outside project root"}
         # Check for pre-computed LLM analysis (instant, no Ollama call)
         llm_analysis = get_llm_analysis_for_symbol(conn, row["id"])
-        return row, file_path, llm_analysis
+        return row, file_path, llm_analysis, _stored_file_mtime(conn, row["file_id"])
 
     query_result = db.executor.execute_sync(_query, db.config_hash)
     if isinstance(query_result, dict):
         return query_result
-    row, file_path, llm_analysis = query_result
+    row, file_path, llm_analysis, stored_mtime = query_result
+    # A changed file can move the symbol, thus the stored line number can
+    # point at unrelated code.  The prompt below must never carry that code.
+    file_changed = _check_file_stale(file_path, stored_mtime)
+    symbol_moved = file_changed and not _body_matches_symbol(file_path, row)
+    stale_warning = (
+        f"{file_path} changed after the last index run. The result below can "
+        f"be out of date."
+        if file_changed
+        else None
+    )
     line_no = row["line"]
     signature = row["signature"] or ""
     kind = row["kind"]
@@ -390,6 +563,10 @@ async def explain_symbol(
             explanation += f"\nOutputs: {llm_analysis['outputs']}"
         result["explanation"] = explanation
         result["llm_analysis"] = llm_analysis
+        if stale_warning:
+            # The stored analysis describes the code as it was at index time.
+            result["stale_warning"] = stale_warning
+            result["stale"] = True
         return result
 
     # No pre-computed analysis — fall through to the on-demand path.
@@ -397,16 +574,32 @@ async def explain_symbol(
     # see what the code actually does, not just the signature.
     context_lines = max(1, min(context_lines, _CONTEXT_LINES_MAX))
     source_snippet = ""
-    try:
-        lines = Path(file_path).read_text(errors="replace").splitlines()
-        start = max(0, line_no - context_lines - 1)
-        end = min(len(lines), line_no + context_lines)
-        numbered = "\n".join(
-            f"{i + start + 1:4d}  {lines[i + start]}" for i in range(end - start)
+    if symbol_moved:
+        # The disk window would show unrelated code.  The indexed body is
+        # older, but it is the code of this symbol.
+        source_snippet = row["source"] or ""
+        stale_warning = (
+            f"{file_path} changed after the last index run, and the stored line "
+            f"number does not point at {name} any more. The source below comes "
+            f"from the index, not from the disk."
         )
-        source_snippet = numbered
-    except (IndexError, ValueError, OSError):
-        pass
+    else:
+        try:
+            lines = Path(file_path).read_text(errors="replace").splitlines()
+            start = max(0, line_no - context_lines - 1)
+            end = min(len(lines), line_no + context_lines)
+            numbered = "\n".join(
+                f"{i + start + 1:4d}  {lines[i + start]}" for i in range(end - start)
+            )
+            source_snippet = numbered
+        except (IndexError, ValueError, OSError):
+            pass
+    if stale_warning:
+        # Set before the Ollama call, thus every return path below carries it.
+        # A separate key keeps it clear of ``warning``, which the LLM error
+        # paths use.
+        result["stale_warning"] = stale_warning
+        result["stale"] = True
     prompt = (
         f"You are a C/C++ embedded firmware expert.\n"
         f"Explain what the following {kind} does. "
@@ -491,6 +684,12 @@ def get_source(
         ``constants`` (list for enums), ``value`` (raw macro definition),
         ``expanded_value`` (preprocessor-resolved macro value) when applicable.
 
+        When the file changed after the last index run, the dict adds
+        ``stale`` (True) and ``stale_warning`` (str).  ``source_origin`` then
+        tells where the body comes from: ``"disk"`` when the symbol did not
+        move, ``"index"`` when it did and the body comes from the index
+        instead.  A moved symbol never gives the code of another symbol.
+
         On failure the dict holds only ``error`` with the reason.
     """
     try:
@@ -558,18 +757,25 @@ def get_source(
                     }
                     for c in const_rows
                 ]
-        return result, file_path, row["line"], row["end_line"] or 0
+        # The mtime must come from the same connection as the symbol row —
+        # _read_verified_body compares it against the file on disk to decide
+        # whether the stored line number still points at this symbol.
+        return result, file_path, row, _stored_file_mtime(conn, row["file_id"])
 
     query_result = db.executor.execute_sync(_query, db.config_hash)
     if isinstance(query_result, dict):
         # Early-return path from the closure: macro fallback or error dict.
         return query_result
-    result, file_path, line_no, end_line = query_result
-    source = _read_symbol_body(file_path, line_no, end_line=end_line)
-    if not source:
-        result["warning"] = f"Could not read source from {file_path}"
-    else:
+    result, file_path, row, stored_mtime = query_result
+    source, origin, stale_warning = _read_verified_body(row, file_path, stored_mtime)
+    if stale_warning:
+        result["stale_warning"] = stale_warning
+        result["stale"] = True
+    if source:
         result["source"] = source[:_SOURCE_TRUNCATE_CHARS] if len(source) > _SOURCE_TRUNCATE_CHARS else source
+        result["source_origin"] = origin
+    elif not stale_warning:
+        result["warning"] = f"Could not read source from {file_path}"
     return result
 
 # ── moved from server.py ──
@@ -662,7 +868,9 @@ def get_file_map(
             signatures=signatures, max_per_kind=max_per_kind,
         )
 
-    return db.executor.execute_sync(_query, db.config_hash)
+    from ..shared.stale import with_stale_annotation
+
+    return with_stale_annotation(root, db.executor, _query, db.config_hash)
 
 # ── moved from server.py ──
 # ── get_symbol_context collectors ───────────────────────────────────
@@ -921,6 +1129,12 @@ def get_symbol_context(
         with a structured description of the symbol's purpose, parameters, and
         return values/side effects.
 
+        When the file changed after the last index run, the dict adds
+        ``stale`` (True) and ``stale_warning`` (str), and ``source_origin``
+        tells where the body comes from: ``"disk"`` when the symbol did not
+        move, ``"index"`` when it did.  The callers and callees come from the
+        index in all cases, thus a stale dict can hold an incomplete list.
+
         The dict also carries the libclang flags of the symbol:
         is_virtual, is_pure_virtual, is_template, parent_usr, and
         template_usr.  For a virtual method it adds ``overrides`` (the base
@@ -986,6 +1200,7 @@ def get_symbol_context(
         return (
             row, file_path, callers_list, callees_list, indirect_calls_list,
             resolution, enum_constants, llm_analysis, overrides_info,
+            _stored_file_mtime(conn, row["file_id"]),
         )
 
     query_result = db.executor.execute_sync(_query, db.config_hash)
@@ -995,9 +1210,10 @@ def get_symbol_context(
     (
         row, file_path, callers_list, callees_list, indirect_calls_list,
         resolution, enum_constants, llm_analysis, overrides_info,
+        stored_mtime,
     ) = query_result
 
-    source = _read_symbol_body(file_path, row["line"], end_line=row["end_line"] or 0)
+    source, source_origin, stale_warning = _read_verified_body(row, file_path, stored_mtime)
     result: dict = {
         "name": row["name"],
         "qualified_name": row["qualified_name"],
@@ -1031,6 +1247,12 @@ def get_symbol_context(
         result["overridden_by"] = overrides_info["overridden_by"]
     if source:
         result["source"] = source[:_SOURCE_TRUNCATE_CHARS] if len(source) > _SOURCE_TRUNCATE_CHARS else source
+        result["source_origin"] = source_origin
+    if stale_warning:
+        # The callers and callees come from the index, thus a changed file
+        # makes them incomplete as well.  One warning covers the whole dict.
+        result["stale_warning"] = stale_warning
+        result["stale"] = True
     return result
 
 
@@ -1147,6 +1369,15 @@ def read_file(
         lines_list = content.splitlines()
         result["lines"] = len(lines_list)
         result["content"] = content
+        if _check_file_stale(result["file"], row["mtime"] or 0.0):
+            # The content comes from the index, thus a changed file makes it
+            # a copy of an older state.  The disk path below does not need
+            # this warning: it reads the file as it is now.
+            result["stale"] = True
+            result["stale_warning"] = (
+                f"{result['file']} changed after the last index run. The content "
+                f"below comes from the index, not from the disk."
+            )
     else:
         # Legacy index fallback: older indexes (pre-ifdef-filtering) have an
         # empty content column.  Read from raw disk instead and emit a

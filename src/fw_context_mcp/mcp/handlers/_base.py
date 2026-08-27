@@ -69,18 +69,38 @@ class DbContext:
     def execute_scoped(self, query_fn):
         """Run ``query_fn(conn, config_hash)`` per build scope, merge + annotate.
 
-        Single-scope calls behave exactly like ``executor.execute_sync`` (result
-        shape unchanged).  Multi-scope calls merge per-build outputs: list items
-        and dict records gain a ``variant``/``image`` key so the LLM always
-        knows which build produced a result.
+        Single-scope calls keep the result shape of ``executor.execute_sync``.
+        Multi-scope calls merge per-build outputs: list items and dict records
+        gain a ``variant``/``image`` key so the LLM always knows which build
+        produced a result.
+
+        Every scope goes through ``with_stale_annotation``, thus a result that
+        names a changed file carries a warning.  Without it the call-graph and
+        inheritance handlers gave index data as current data, and the caller
+        had no way to see the difference.  ``run_scoped_query`` in
+        ``shared/variants.py`` does the same for the lookup handler.
         """
+        from ..shared.stale import with_stale_annotation
+
         if len(self.scopes) <= 1:
-            return self.executor.execute_sync(query_fn, self.config_hash)
+            return with_stale_annotation(
+                self.root, self.executor, query_fn, self.config_hash
+            )
         merged: list = []
+        # Every scope reports staleness on its own, and the scopes usually
+        # share the same changed files.  Collect the notices and emit each
+        # distinct one once, otherwise a three-variant project shows the same
+        # warning three times and reads like three separate problems.
+        notices: list[str] = []
         for scope in self.scopes:
-            part = self.executor.execute_sync(query_fn, scope["config_hash"])
+            part = with_stale_annotation(
+                self.root, self.executor, query_fn, scope["config_hash"]
+            )
             if isinstance(part, list):
                 for r in part:
+                    if isinstance(r, dict) and set(r) == {"warning"}:
+                        notices.append(r["warning"])
+                        continue
                     if isinstance(r, dict) and "error" not in r and "warning" not in r:
                         r = dict(r)
                         r["variant"] = scope["variant"]
@@ -96,6 +116,8 @@ class DbContext:
                     merged.append(d)
             else:
                 merged.append(part)
+        if notices:
+            merged[:0] = [{"warning": w} for w in dict.fromkeys(notices)]
         return merged
 
 

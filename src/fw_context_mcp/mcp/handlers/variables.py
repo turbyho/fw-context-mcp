@@ -30,7 +30,12 @@ from typing import Annotated
 from pydantic import Field
 
 from ...utils import abs_path
-from ..shared.stale import _stale_files
+from ..shared.stale import (
+    _count_modified_files,
+    _stale_files,
+    annotate_stale,
+    collect_result_paths,
+)
 from ._base import BaseHandler
 
 log = logging.getLogger(__name__)
@@ -221,16 +226,15 @@ def find_variables(
         # must not open its own connection.  Timeout is enforced by
         # _wrap_tool (300 s + interrupt), not here.
         results = _do_find(conn, config_hash)
-        file_paths = [abs_path(root, r["file"]) for r in results if "file" in r]
-        stale = _stale_files(conn, config_hash, file_paths, root) if file_paths else []
-        return results, stale
+        file_paths = collect_result_paths(results, root)
+        if file_paths:
+            return results, _stale_files(conn, config_hash, file_paths, root), 0
+        # No variable found: count the whole index instead, so an empty
+        # answer over a changed tree does not read as proof of absence.
+        return results, [], _count_modified_files(conn, config_hash, root, use_cache=False)
 
-    results, stale = db.executor.execute_sync(_query, db.config_hash)
-    if stale:
+    results, stale, dirty = db.executor.execute_sync(_query, db.config_hash)
+    if stale or dirty:
         from fw_context_mcp.mcp.background import _ensure_daemon_running
         _ensure_daemon_running(root)
-        return [{"warning": (
-            f"Results may be stale — {len(stale)} file(s) changed. "
-            "Background reindex in progress. Run 'fw-context index' to force full update."
-        )}] + results
-    return results
+    return annotate_stale(results, stale, empty_dirty_count=dirty)

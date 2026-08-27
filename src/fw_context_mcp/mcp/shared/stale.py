@@ -427,23 +427,178 @@ def _with_stale_recovery(
         result_rows = query_fn(db_conn, cfg_hash)
         # Ensure plain dicts — rows must be materialised before returning.
         safe_rows: list[dict] = [dict(r) for r in result_rows]
-        stale_f = _stale_files(
-            db_conn,
-            cfg_hash,
-            [abs_path(root, r["file"]) for r in result_rows if "file" in r],
-            root,
-        )
-        return safe_rows, stale_f
+        paths = collect_result_paths(safe_rows, root)
+        if paths:
+            return safe_rows, _stale_files(db_conn, cfg_hash, paths, root), 0
+        # An empty search result is the case the caller most easily reads as
+        # "does not exist".  See with_stale_annotation for why the cache of
+        # _count_modified_files must stay off here.
+        return safe_rows, [], _count_modified_files(db_conn, cfg_hash, root, use_cache=False)
 
-    safe_rows, stale_f = executor.execute_sync(_query, config_hash)
+    safe_rows, stale_f, dirty = executor.execute_sync(_query, config_hash)
 
-    results: list[dict] = []
-    if stale_f:
+    if stale_f or dirty:
+        # Kept here, not in annotate_stale: this path knows that the project
+        # has a database, thus _db_path cannot raise.
         _ensure_daemon_running(root)
-        results.append(
-            {
-                "warning": f"Results may be stale — {len(stale_f)} file(s) changed. Background reindex in progress. Run 'fw-context index' to force full update."
-            }
-        )
-    results += safe_rows
-    return results
+    return annotate_stale(safe_rows, stale_f, empty_dirty_count=dirty)
+
+
+# ── shared stale annotation ──
+# _with_stale_recovery above serves the search handlers, which always give a
+# list of records.  The call-graph, inheritance, and source handlers give
+# either a list or a single dict, thus they need a shape-tolerant form.  Both
+# use the same detection: compare the mtime of every file that the result
+# names against the mtime that the index holds.
+
+STALE_RESULT_MESSAGE = (
+    "Results may be stale — {count} file(s) changed. Background reindex in "
+    "progress. Run 'fw-context index' to force full update."
+)
+
+# An empty result names no file, thus the per-record check has nothing to
+# compare.  Without this second message the caller reads "nothing found" as
+# "does not exist", and the empty-result playbook makes that worse: the model
+# tries four or five tools, gets nothing every time, and the repetition reads
+# as proof.
+EMPTY_RESULT_STALE_MESSAGE = (
+    "No result, and {count} indexed file(s) changed after the last index run. "
+    "What you look for can be in one of them, thus an empty result is not "
+    "proof that it does not exist. Run 'fw-context index'."
+)
+
+# The handlers do not agree on one name for the path of a record, thus a
+# check for a single key silently skips whole tools.  The names below were
+# collected from the actual output of every call-graph, inheritance, and
+# source tool against an indexed project.
+#
+# Aliases for the one file that a record is about — the first one present
+# wins, because a record that holds two of them names the same file twice.
+_PRIMARY_PATH_KEYS = ("file", "file_path", "source_file")
+# Keys of records that name more than one file.  ``find_indirect_targets``
+# gives the assignment site and the call site, and they are different files,
+# thus both must be checked.
+_EXTRA_PATH_KEYS = ("assign_file", "call_file")
+
+
+def collect_result_paths(result, root: Path, *, _nested: bool = False) -> list[str]:
+    """Give the absolute path of every file that *result* names.
+
+    Accepts both result shapes that the handlers use: a list of records, and
+    a single record.  A record with no path key adds nothing, thus an error
+    dict or a summary dict passes through without a stat() call.
+
+    Which tool uses which key:
+
+    * ``file`` — ``find_callers``, ``find_references``, the search tools,
+      ``get_file_map``, ``read_file``, and the ``methods`` of
+      ``find_wrapper_callers``
+    * ``file_path`` — ``find_dead_code``, ``find_hotspots``,
+      ``find_all_callers_recursive``, ``find_callees_recursive``
+    * ``source_file`` — ``trace_data_flow``
+    * ``assign_file`` + ``call_file`` — ``find_indirect_targets``
+
+    Args:
+        result: A record, or a list of records.
+        root: Project root, for the relative paths that the index stores.
+        _nested: Internal.  True while the function reads a nested list, and
+            it stops a second descent.
+
+    Returns:
+        list[str]: The absolute paths, with duplicates.  ``_stale_files``
+        removes them before it calls stat().
+    """
+    records = result if isinstance(result, list) else [result]
+    paths: list[str] = []
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        for key in _PRIMARY_PATH_KEYS:
+            value = record.get(key)
+            if value:
+                paths.append(abs_path(root, value))
+                break
+        for key in _EXTRA_PATH_KEYS:
+            value = record.get(key)
+            if value:
+                paths.append(abs_path(root, value))
+        if _nested:
+            continue
+        # One level down, no more.  ``find_wrapper_callers`` holds its paths
+        # in ``methods``, thus a check of the top level alone covers none of
+        # its files.  The depth stops at one because no handler nests deeper,
+        # and an open recursion would walk large results for nothing.
+        for value in record.values():
+            if isinstance(value, list) and any(isinstance(v, dict) for v in value):
+                paths.extend(collect_result_paths(value, root, _nested=True))
+    return paths
+
+
+def annotate_stale(result, stale_files: list[str], *, empty_dirty_count: int = 0):
+    """Add a stale warning to *result*.
+
+    Two conditions produce a warning, and they never overlap:
+
+    * *stale_files* — the result names files, and some of them changed.
+    * *empty_dirty_count* — the result names no file at all, and this many
+      indexed files changed.  Only this case can tell the caller that an
+      empty result is not proof of absence.
+
+    A list gets the warning as its first record, which matches the shape that
+    ``_with_stale_recovery`` gives.  A dict gets ``stale_warning`` and
+    ``stale`` keys instead — a leading record would break the dict contract
+    of the source handlers.
+
+    Returns *result* unchanged when neither condition holds.
+
+    WHY no daemon start here: ``server.main`` starts the watcher daemon and
+    its ping loop keeps it alive, thus a query does not have to.  A side
+    effect in this function would also break every caller whose project has
+    no database — ``_db_path`` raises there, and a warning must never fail
+    the query it describes.
+    """
+    if stale_files:
+        message = STALE_RESULT_MESSAGE.format(count=len(stale_files))
+    elif empty_dirty_count:
+        message = EMPTY_RESULT_STALE_MESSAGE.format(count=empty_dirty_count)
+    else:
+        return result
+
+    if isinstance(result, list):
+        return [{"warning": message}, *result]
+    if isinstance(result, dict):
+        annotated = dict(result)
+        annotated["stale_warning"] = message
+        annotated["stale"] = True
+        return annotated
+    return result
+
+
+def with_stale_annotation(root: Path, executor, query_fn, config_hash: str):
+    """Run *query_fn* on *executor* and annotate a stale result.
+
+    The staleness check must share the connection with the query, thus it
+    runs inside the same ``execute_sync`` call.  A separate call would take
+    the executor lock twice and could see a different index state.
+
+    A result that names files is checked file by file.  A result that names
+    none gets a project-wide count instead: an empty answer is the case where
+    the caller most needs to know that the index is behind, and it is the one
+    case where per-record detection has nothing to work with.
+    """
+
+    def _query(conn, cfg_hash):
+        result = query_fn(conn, cfg_hash)
+        paths = collect_result_paths(result, root)
+        if paths:
+            return result, _stale_files(conn, cfg_hash, paths, root), 0
+        # No path in the result.  Count every indexed file instead.
+        #
+        # use_cache=False on purpose: the cache of _count_modified_files
+        # validates itself against MAX(mtime) of the files table, which only
+        # a reindex changes.  An edit on disk leaves it valid, thus a cached
+        # answer would miss the very edit this check exists for.
+        return result, [], _count_modified_files(conn, cfg_hash, root, use_cache=False)
+
+    result, stale, dirty = executor.execute_sync(_query, config_hash)
+    return annotate_stale(result, stale, empty_dirty_count=dirty)
