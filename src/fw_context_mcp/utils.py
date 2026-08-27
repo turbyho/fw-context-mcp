@@ -51,6 +51,8 @@ __all__ = [
     "is_db_exception",
     "is_fatal",
     "read_file_lines",
+    "AUTOBUILD_REL",
+    "autobuild_dir",
     "resolve_build_dir",
     "resolve_project_root",
     "resolve_real_binary",
@@ -67,6 +69,24 @@ MTIME_TOLERANCE_S: float = 1.0
 # does not pollute the repository; ``fw-context init`` adds the containing
 # directory to .gitignore.
 CC_OUTPUT_REL: Path = Path(".fw-context") / "build" / "compile_commands.json"
+
+# Output directory of a build that fw-context starts on its own, one
+# subdirectory per variant.  It sits under .fw-context, which `fw-context
+# init` already adds to .gitignore, and apart from the directory of the
+# build that the user runs: fw-context cannot lock that build, thus
+# separation is the only defence against two builds in one directory.
+AUTOBUILD_REL: Path = Path(".fw-context") / "autobuild"
+
+
+def autobuild_dir(variant: str = "") -> str:
+    """Return the isolated build directory for *variant*, relative to the root.
+
+    An empty *variant* names the single-build case.  The name goes into the
+    path because every variant has its own output directory, thus one shared
+    directory would make the variants overwrite each other.
+    """
+    return str(AUTOBUILD_REL / (variant or "default"))
+
 
 # Standard exception tuple for non-fatal recoverable errors.
 # Use in all broad-except blocks where the operation can safely
