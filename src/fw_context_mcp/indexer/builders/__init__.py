@@ -29,6 +29,29 @@ from .protocol import BuildSystem
 log = logging.getLogger(__name__)
 
 
+def background_build_safe(builder: BuildSystem | None, cfg) -> bool:
+    """Tell whether fw-context may start a build of *builder* on its own.
+
+    A backend that does not implement ``background_build_safe`` answers no.
+    The concrete classes implement the ``BuildSystem`` protocol structurally,
+    not by inheritance, thus a default on the protocol would never reach
+    them, and the safe answer is the negative one: an automatic build that
+    writes to the usual directory can corrupt the build that the user runs in
+    an IDE at the same time, and fw-context cannot lock that build.
+    """
+    if builder is None:
+        return False
+    probe = getattr(builder, "background_build_safe", None)
+    if probe is None:
+        return False
+    try:
+        return bool(probe(cfg))
+    except (AttributeError, TypeError, ValueError, RuntimeError, OSError):
+        # A backend that cannot answer must not be trusted with a build.
+        log.debug("background_build_safe failed for %r", builder, exc_info=True)
+        return False
+
+
 class BuildSystemRegistry:
     """Holds registered build systems and delegates detection to them.
 

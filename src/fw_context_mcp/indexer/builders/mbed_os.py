@@ -144,6 +144,12 @@ class MbedOSBuildSystem:
         for d in cfg.defines:
             cmd += ["-D", d]
 
+        if cfg.isolated_build_dir:
+            # `mbed compile --build <dir>` writes every artifact there, thus
+            # a build that fw-context starts cannot touch the object files
+            # of the build that the user runs in an IDE.
+            cmd += ["--build", cfg.isolated_build_dir]
+
         if cfg.clean:
             cmd.append("--clean")
 
@@ -154,6 +160,14 @@ class MbedOSBuildSystem:
             raise RuntimeError("compile_commands.json was not generated — bear may have failed silently")
 
         return cc_path
+
+    def background_build_safe(self, cfg: BuildConfig) -> bool:
+        """Safe — ``mbed compile`` takes ``--build <dir>``.
+
+        Every artifact goes under that directory, thus the build of
+        fw-context cannot reach the object files in ``BUILD/<TARGET>/``.
+        """
+        return True
 
     # ── Build dir patterns ──
 

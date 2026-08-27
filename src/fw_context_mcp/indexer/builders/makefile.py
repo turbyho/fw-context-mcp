@@ -128,6 +128,17 @@ class MakefileBuildSystem:
             "  pip install compiledb"
         )
 
+    def background_build_safe(self, cfg: BuildConfig) -> bool:
+        """Safe only in dry-run mode, which is the default.
+
+        ``compiledb -n make`` reads what make would do and compiles nothing,
+        thus no artifact exists to collide with.  With ``make_dry_run`` off
+        the backend runs a real build, and the Makefile owns the output
+        directory: fw-context cannot move it, thus it must not start that
+        build on its own.
+        """
+        return bool(cfg.make_dry_run)
+
     # ── Build dir patterns ──
 
     def get_build_dir_patterns(self, project_root: Path) -> list[str]:

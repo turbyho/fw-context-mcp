@@ -51,6 +51,7 @@ __all__ = [
     "is_db_exception",
     "is_fatal",
     "read_file_lines",
+    "resolve_build_dir",
     "resolve_project_root",
     "resolve_real_binary",
     "SAFE_EXCEPT",
@@ -286,6 +287,24 @@ def cc_output_path(project_root: Path) -> Path:
     target = project_root / CC_OUTPUT_REL
     target.parent.mkdir(parents=True, exist_ok=True)
     return target
+
+
+def resolve_build_dir(project_root: Path, cfg, default: str) -> Path:
+    """Return the directory that the build must write to.
+
+    ``cfg.isolated_build_dir`` wins when it is set.  fw-context sets it for a
+    build that it starts on its own, so that the artifacts stay apart from
+    the ones of a build that the user runs in an IDE at the same time —
+    fw-context cannot lock that build, thus separation is the only defence.
+
+    A relative value resolves against *project_root*.  Without the setting
+    the backend keeps *default*, its usual directory.
+    """
+    isolated = getattr(cfg, "isolated_build_dir", None)
+    if isolated:
+        candidate = Path(isolated)
+        return candidate if candidate.is_absolute() else project_root / candidate
+    return project_root / default
 
 
 # Content LRU cache — mtime-keyed to auto-invalidate on file changes.

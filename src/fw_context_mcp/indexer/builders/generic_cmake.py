@@ -10,7 +10,7 @@ import shutil
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from fw_context_mcp.utils import cc_output_path, run_build_command
+from fw_context_mcp.utils import cc_output_path, resolve_build_dir, run_build_command
 
 from . import registry
 from .protocol import BuildIssue
@@ -63,7 +63,7 @@ class GenericCMakeBuildSystem:
         if not shutil.which("cmake"):
             raise RuntimeError("cmake is required.  Install it:  sudo pacman -S cmake")
 
-        build_dir = project_root / "build"
+        build_dir = resolve_build_dir(project_root, cfg, "build")
 
         # Configure
         configure_cmd: list[str] = [
@@ -98,6 +98,10 @@ class GenericCMakeBuildSystem:
         log.info("Copied %s → %s", cc_in_build, target_cc)
 
         return target_cc
+
+    def background_build_safe(self, cfg: BuildConfig) -> bool:
+        """Safe — configure and build both take the chosen directory."""
+        return True
 
     # ── Build dir patterns ──
 

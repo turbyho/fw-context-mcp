@@ -77,6 +77,35 @@ class BuildSystem(Protocol):
         """Return the CLI tool names required by this build system."""
         ...
 
+    # ── Optional: automatic background build ──
+    # Not every backend implements the method below.  The concrete classes
+    # are structural implementations of this Protocol, not subclasses, thus
+    # a default here would never reach them.  Ask through
+    # ``builders.background_build_safe`` instead, which treats a missing
+    # method as "no" — the safe answer, because it stops fw-context from
+    # starting a build that could collide with the one in the IDE.
+
+    def background_build_safe(self, cfg: BuildConfig) -> bool:
+        """Tell whether fw-context may run this build on its own.
+
+        fw-context starts a build by itself when it finds a source file that
+        compile_commands.json does not cover.  That build runs while the user
+        works, possibly while an IDE builds the same project, and fw-context
+        cannot lock the build of the IDE — the IDE knows nothing about it.
+
+        Answer True only when one of these holds:
+
+        * The backend writes every artifact under
+          ``cfg.isolated_build_dir``, thus the two builds cannot meet.
+        * The backend compiles nothing (a converter, or a dry run), thus
+          there is no artifact to corrupt.
+
+        Answer False otherwise, and for a backend that cannot build at all.
+        *cfg* is a parameter because the answer can depend on it: the
+        makefile backend compiles only when ``make_dry_run`` is off.
+        """
+        ...
+
     def get_build_dir_patterns(self, project_root: Path) -> list[str]:
         """Return path patterns for build-output directories.
 

@@ -135,6 +135,10 @@ class KeilBuildSystem:
             "  pip install keil2clangd"
         )
 
+    def background_build_safe(self, cfg: BuildConfig) -> bool:
+        """Safe — the backend converts a .uvprojx and compiles nothing."""
+        return True
+
     # ── Build dir patterns ──
 
     def get_build_dir_patterns(self, project_root: Path) -> list[str]:

@@ -184,6 +184,15 @@ class ManualBuildSystem:
         """Manual mode does not require any external tools."""
         return []
 
+    def background_build_safe(self, cfg: BuildConfig) -> bool:
+        """Safe — ``-fsyntax-only`` produces no object file.
+
+        The compiler writes one ``.d`` file beside each source, and its
+        content depends on the source alone, thus a concurrent build reads
+        or writes the same bytes.
+        """
+        return True
+
     # ── Build dir patterns ──
 
     def get_build_dir_patterns(self, project_root: Path) -> list[str]:

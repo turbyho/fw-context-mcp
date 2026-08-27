@@ -122,6 +122,22 @@ class BuildConfig:
     make_vars: dict[str, str] = field(default_factory=dict)  # extra vars for make
     make_dry_run: bool = True  # use compiledb -n (dry-run, no real build)
 
+    # ── Isolated build directory ──
+    # Set only for a build that fw-context starts on its own, after it finds
+    # a source file that compile_commands.json does not cover.  The build
+    # then writes to this directory instead of the usual one, thus it cannot
+    # corrupt the object files of a build that the user runs in an IDE at the
+    # same time.  fw-context cannot lock that build: the IDE knows nothing
+    # about fw-context, so separation is the only defence.
+    #
+    # A relative path resolves against the project root.  None keeps the
+    # default directory of the build system.
+    #
+    # The price is one more set of artifacts (192 MB on zbox-ecb-fw) and a
+    # first build with no shared object cache.  Measured at 15-30 s there,
+    # which is nothing against an index run of over an hour.
+    isolated_build_dir: str | None = None
+
     # ── Toolchain (shared by Keil, IAR, Makefile) ──
     toolchain_path: str | None = None  # path to toolchain bin directory
     toolchain_prefix: str | None = None  # e.g. "arm-none-eabi-"

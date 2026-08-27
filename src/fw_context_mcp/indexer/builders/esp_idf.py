@@ -8,7 +8,12 @@ import shutil
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from fw_context_mcp.utils import cc_output_path, resolve_real_binary, run_build_command
+from fw_context_mcp.utils import (
+    cc_output_path,
+    resolve_build_dir,
+    resolve_real_binary,
+    run_build_command,
+)
 
 from . import registry
 from .protocol import BuildIssue
@@ -70,11 +75,18 @@ class ESPIDFBuildSystem:
                 "  cd esp-idf && ./install.sh && source export.sh"
             )
 
-        cmd: list[str] = [idf_py, "build"]
+        # -B is a global flag of idf.py, thus it comes before the command.
+        # With no isolated directory the list stays empty and idf.py keeps
+        # its default `build/`.
+        build_dir_flag: list[str] = []
+        if cfg.isolated_build_dir:
+            build_dir_flag = ["-B", str(resolve_build_dir(project_root, cfg, "build"))]
+
+        cmd: list[str] = [idf_py, *build_dir_flag, "build"]
 
         if cfg.clean:
             # idf.py fullclean removes all build artifacts
-            clean_cmd = [idf_py, "fullclean"]
+            clean_cmd = [idf_py, *build_dir_flag, "fullclean"]
             log.info("esp-idf clean: %s", " ".join(clean_cmd))
             try:
                 run_build_command(clean_cmd, cwd=project_root, description="idf.py fullclean", build_cfg=cfg)
@@ -151,7 +163,7 @@ class ESPIDFBuildSystem:
                     "Could not detect ESP-IDF target from sdkconfig — defaulting to esp32. "
                     "Set target explicitly with 'idf.py set-target <chip>' if using a different variant."
                 )
-            set_target_cmd = [idf_py, "set-target", target]
+            set_target_cmd = [idf_py, *build_dir_flag, "set-target", target]
             log.info("esp-idf set-target: %s", " ".join(set_target_cmd))
             try:
                 run_build_command(set_target_cmd, cwd=project_root, description="idf.py set-target", build_cfg=cfg)
@@ -175,6 +187,10 @@ class ESPIDFBuildSystem:
         log.info("Copied %s → %s", cc_in_build, target_cc)
 
         return target_cc
+
+    def background_build_safe(self, cfg: BuildConfig) -> bool:
+        """Safe — ``idf.py -B <dir>`` puts every artifact there."""
+        return True
 
     # ── Build dir patterns ──
 

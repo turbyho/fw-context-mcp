@@ -12,7 +12,12 @@ from functools import lru_cache
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from fw_context_mcp.utils import cc_output_path, resolve_real_binary, run_build_command
+from fw_context_mcp.utils import (
+    cc_output_path,
+    resolve_build_dir,
+    resolve_real_binary,
+    run_build_command,
+)
 
 from . import registry
 from .protocol import BuildIssue
@@ -224,7 +229,7 @@ class ZephyrBuildSystem:
                 'Zephyr requires a board name.  Set it in .fw-context/config.toml:\n  [build]\n  board = "your_board"'
             )
 
-        build_dir = project_root / (cfg.build_dir or "build")
+        build_dir = resolve_build_dir(project_root, cfg, cfg.build_dir or "build")
 
         _, env = self._prepare_ninja_wrapper(project_root)
 
@@ -418,6 +423,10 @@ class ZephyrBuildSystem:
                 log.info("Copied %s → %s", cc_src, target)
 
         return results
+
+    def background_build_safe(self, cfg: BuildConfig) -> bool:
+        """Safe — ``west build -d <dir>`` puts every artifact there."""
+        return True
 
     # ── Build dir patterns ──
 

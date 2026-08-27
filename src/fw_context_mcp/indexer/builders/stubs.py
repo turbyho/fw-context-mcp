@@ -68,6 +68,10 @@ class STM32CubeIDEStub:
     def required_tools(self) -> list[str]:
         return []
 
+    def background_build_safe(self, cfg: BuildConfig) -> bool:
+        """No — ``build`` raises, thus an automatic attempt only wastes a run."""
+        return False
+
     # ── Build dir patterns ──
 
     def get_build_dir_patterns(self, project_root: Path) -> list[str]:
@@ -138,6 +142,10 @@ class TICCSStub:
 
     def required_tools(self) -> list[str]:
         return []
+
+    def background_build_safe(self, cfg: BuildConfig) -> bool:
+        """No — ``build`` raises, thus an automatic attempt only wastes a run."""
+        return False
 
     # ── Build dir patterns ──
 

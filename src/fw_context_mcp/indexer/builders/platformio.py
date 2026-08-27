@@ -106,16 +106,24 @@ class PlatformIOBuildSystem:
 
         cmd: list[str] = pio_prefix + ["run", "--project-dir", str(project_root), "--target", "compiledb"]
 
+        # PlatformIO has no CLI flag for the build directory; the documented
+        # override is the environment variable, which beats build_dir in
+        # platformio.ini.  run_build_command merges this into the child
+        # environment, thus every pio call below writes to it.
+        build_env: dict[str, str] | None = None
+        if cfg.isolated_build_dir:
+            build_env = {"PLATFORMIO_BUILD_DIR": cfg.isolated_build_dir}
+
         if cfg.clean:
             clean_cmd = pio_prefix + ["run", "--project-dir", str(project_root), "--target", "clean"]
             log.info("platformio clean: %s", " ".join(clean_cmd))
             try:
-                run_build_command(clean_cmd, cwd=project_root, description="pio run --target clean", build_cfg=cfg)
+                run_build_command(clean_cmd, cwd=project_root, description="pio run --target clean", build_cfg=cfg, env=build_env)
             except RuntimeError:
                 pass  # clean is best-effort — build dir may not exist yet
 
         log.info("platformio build: %s", " ".join(cmd))
-        run_build_command(cmd, cwd=project_root, description="pio run --target compiledb", build_cfg=cfg)
+        run_build_command(cmd, cwd=project_root, description="pio run --target compiledb", build_cfg=cfg, env=build_env)
 
         # PlatformIO writes compile_commands.json natively to the project
         # root; copy it to the gitignored fw-context build dir for a stable
@@ -136,7 +144,7 @@ class PlatformIOBuildSystem:
         build_cmd = pio_prefix + ["run", "--project-dir", str(project_root)]
         log.info("platformio compile: %s", " ".join(build_cmd))
         try:
-            run_build_command(build_cmd, cwd=project_root, description="pio run (full build for .d files)", build_cfg=cfg)
+            run_build_command(build_cmd, cwd=project_root, description="pio run (full build for .d files)", build_cfg=cfg, env=build_env)
         except RuntimeError:
             log.warning(
                 "Full build failed — .d files may be missing. "
@@ -145,6 +153,14 @@ class PlatformIOBuildSystem:
             )
 
         return cc_path
+
+    def background_build_safe(self, cfg: BuildConfig) -> bool:
+        """Safe — ``PLATFORMIO_BUILD_DIR`` overrides ``build_dir``.
+
+        The variable wins over platformio.ini, and every pio call of this
+        backend gets it, thus the artifacts stay out of ``.pio/build/``.
+        """
+        return True
 
     # ── Build dir patterns ──
 

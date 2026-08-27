@@ -7,7 +7,7 @@ import shutil
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from fw_context_mcp.utils import cc_output_path, run_build_command
+from fw_context_mcp.utils import cc_output_path, resolve_build_dir, run_build_command
 
 from . import registry
 from .protocol import BuildIssue
@@ -64,7 +64,7 @@ class ArduinoBuildSystem:
                 '  [build]\n  fqbn = "arduino:avr:uno"'
             )
 
-        build_dir = project_root / "build"
+        build_dir = resolve_build_dir(project_root, cfg, "build")
         if cfg.clean and build_dir.exists():
             shutil.rmtree(build_dir)
 
@@ -115,6 +115,10 @@ class ArduinoBuildSystem:
             log.warning("arduino-cli real compile failed — .d files may be missing")
 
         return target_cc
+
+    def background_build_safe(self, cfg: BuildConfig) -> bool:
+        """Safe — ``arduino-cli compile --build-path`` puts artifacts there."""
+        return True
 
     # ── Build dir patterns ──
 
