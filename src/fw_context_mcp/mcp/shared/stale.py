@@ -318,11 +318,16 @@ def _project_scan_roots(scan_roots: set[str], build_patterns: list[str]) -> set[
 
     ``"."`` means that the project holds source files in its root directory,
     and it never matches a build pattern.
+
+    The trailing separator is necessary.  ``load_build_dir_patterns`` gives
+    directory patterns with one — ``"BUILD/"``, ``".pio/build/"`` — and
+    ``_path_matches_patterns`` does a substring test, thus a bare ``"BUILD"``
+    matched nothing and the walk descended into the build output.
     """
     return {
         root
         for root in scan_roots
-        if root == "." or not _path_matches_patterns(root, build_patterns)
+        if root == "." or not _path_matches_patterns(f"{root}/", build_patterns)
     }
 
 

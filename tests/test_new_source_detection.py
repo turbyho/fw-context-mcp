@@ -193,3 +193,40 @@ class TestAnnotateNewSources:
 
         assert "changed" in annotated[0]["warning"]
         assert "--build" not in annotated[0]["warning"]
+
+
+class TestScanRootFilter:
+    """A build directory reaches the scan roots and must not be walked.
+
+    Mbed writes a generated ``mbed_config.h`` into ``BUILD/``, and the
+    indexer marks it as project code.  ``BUILD`` therefore lands among the
+    roots of zbox-ecb-fw and birdie1-v2-fw-v3, and walking it would cost a
+    lot and could report generated sources as new.
+    """
+
+    def test_a_build_root_is_dropped(self):
+        from fw_context_mcp.mcp.shared.stale import _project_scan_roots
+
+        assert _project_scan_roots({"src", "lib", "BUILD"}, ["BUILD/"]) == {"src", "lib"}
+
+    def test_the_pattern_separator_is_handled(self):
+        """The patterns carry a trailing separator, the roots do not.
+
+        ``_path_matches_patterns`` does a substring test, thus comparing the
+        bare ``"BUILD"`` against ``"BUILD/"`` matched nothing: the filter had
+        no effect and the walk descended into the build output.
+        """
+        from fw_context_mcp.mcp.shared.stale import _project_scan_roots
+
+        assert _project_scan_roots({"BUILD"}, ["BUILD/"]) == set()
+        assert _project_scan_roots({".pio"}, [".pio/"]) == set()
+
+    def test_the_project_root_survives_every_pattern(self):
+        from fw_context_mcp.mcp.shared.stale import _project_scan_roots
+
+        assert _project_scan_roots({"."}, ["BUILD/", "build/"]) == {"."}
+
+    def test_an_unrelated_root_survives(self):
+        from fw_context_mcp.mcp.shared.stale import _project_scan_roots
+
+        assert _project_scan_roots({"targets_custom"}, ["BUILD/"]) == {"targets_custom"}
