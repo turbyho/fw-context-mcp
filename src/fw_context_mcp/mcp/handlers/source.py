@@ -272,21 +272,27 @@ def _read_symbol_body(file_path: str, line_no: int, end_line: int = 0, max_lines
 _NAME_PROBE_LINES = 3
 
 
-def _stored_file_mtime(conn: sqlite3.Connection, file_id: int) -> float:
-    """Return the mtime that the index holds for *file_id*.
+def _stored_file_state(conn: sqlite3.Connection, file_id: int) -> tuple[float, str]:
+    """Return ``(mtime, source_hash)`` that the index holds for *file_id*.
 
-    Returns 0.0 when the row is absent or the column holds NULL.  0.0 makes
-    ``_check_file_stale`` report the file as changed, thus an index that
-    predates the ``mtime`` column degrades to the safe path instead of a
+    Returns ``(0.0, "")`` when the row is absent or the columns hold NULL.
+    That pair makes ``_check_file_stale`` report the file as changed, thus an
+    index that predates either column degrades to the safe path instead of a
     silent wrong answer.
+
+    The hash matters because the timestamp lies in both directions: git
+    rewrites it without changing the bytes, and a write inside the tolerance
+    band keeps it.  With the hash the timestamp only raises the question.
     """
     try:
-        row = conn.execute("SELECT mtime FROM files WHERE id = ?", (file_id,)).fetchone()
+        row = conn.execute(
+            "SELECT mtime, source_hash FROM files WHERE id = ?", (file_id,)
+        ).fetchone()
     except sqlite3.Error:
-        return 0.0
+        return 0.0, ""
     if row is None or row["mtime"] is None:
-        return 0.0
-    return float(row["mtime"])
+        return 0.0, ""
+    return float(row["mtime"]), row["source_hash"] or ""
 
 
 def _read_probe_lines(file_path: str, line_no: int, count: int = _NAME_PROBE_LINES) -> list[str]:
@@ -360,14 +366,18 @@ def _body_matches_symbol(file_path: str, row) -> bool:
     return bool(name) and any(name in line for line in probe)
 
 
-def _read_verified_body(row, file_path: str, stored_mtime: float) -> tuple[str, str, str | None]:
+def _read_verified_body(
+    row, file_path: str, stored_state: tuple[float, str]
+) -> tuple[str, str, str | None]:
     """Return the symbol body, its origin, and a warning about its age.
 
     Args:
         row: The ``symbols`` row of the symbol.  Must hold ``line``,
             ``end_line``, ``name``, and ``source``.
         file_path: Absolute path of the file that holds the symbol.
-        stored_mtime: The mtime that the index holds for that file.
+        stored_state: ``(mtime, source_hash)`` that the index holds for that
+            file.  The hash decides when it exists, because git rewrites the
+            mtime of a file it did not change.
 
     Returns:
         tuple: ``(text, origin, warning)``.  *origin* is ``"disk"`` when the
@@ -378,7 +388,7 @@ def _read_verified_body(row, file_path: str, stored_mtime: float) -> tuple[str, 
     line_no = row["line"]
     end_line = row["end_line"] or 0
 
-    if not _check_file_stale(file_path, stored_mtime):
+    if not _check_file_stale(file_path, stored_state[0], stored_state[1]):
         # The usual path: the file did not change after the index run, thus
         # the stored line number is correct.  Costs one stat() call.
         return _read_symbol_body(file_path, line_no, end_line=end_line), "disk", None
@@ -524,15 +534,15 @@ async def explain_symbol(
             return {"error": f"Path {file_path} outside project root"}
         # Check for pre-computed LLM analysis (instant, no Ollama call)
         llm_analysis = get_llm_analysis_for_symbol(conn, row["id"])
-        return row, file_path, llm_analysis, _stored_file_mtime(conn, row["file_id"])
+        return row, file_path, llm_analysis, _stored_file_state(conn, row["file_id"])
 
     query_result = db.executor.execute_sync(_query, db.config_hash)
     if isinstance(query_result, dict):
         return query_result
-    row, file_path, llm_analysis, stored_mtime = query_result
+    row, file_path, llm_analysis, stored_state = query_result
     # A changed file can move the symbol, thus the stored line number can
     # point at unrelated code.  The prompt below must never carry that code.
-    file_changed = _check_file_stale(file_path, stored_mtime)
+    file_changed = _check_file_stale(file_path, stored_state[0], stored_state[1])
     symbol_moved = file_changed and not _body_matches_symbol(file_path, row)
     stale_warning = (
         f"{file_path} changed after the last index run. The result below can "
@@ -760,14 +770,14 @@ def get_source(
         # The mtime must come from the same connection as the symbol row —
         # _read_verified_body compares it against the file on disk to decide
         # whether the stored line number still points at this symbol.
-        return result, file_path, row, _stored_file_mtime(conn, row["file_id"])
+        return result, file_path, row, _stored_file_state(conn, row["file_id"])
 
     query_result = db.executor.execute_sync(_query, db.config_hash)
     if isinstance(query_result, dict):
         # Early-return path from the closure: macro fallback or error dict.
         return query_result
-    result, file_path, row, stored_mtime = query_result
-    source, origin, stale_warning = _read_verified_body(row, file_path, stored_mtime)
+    result, file_path, row, stored_state = query_result
+    source, origin, stale_warning = _read_verified_body(row, file_path, stored_state)
     if stale_warning:
         result["stale_warning"] = stale_warning
         result["stale"] = True
@@ -1200,7 +1210,7 @@ def get_symbol_context(
         return (
             row, file_path, callers_list, callees_list, indirect_calls_list,
             resolution, enum_constants, llm_analysis, overrides_info,
-            _stored_file_mtime(conn, row["file_id"]),
+            _stored_file_state(conn, row["file_id"]),
         )
 
     query_result = db.executor.execute_sync(_query, db.config_hash)
@@ -1210,10 +1220,10 @@ def get_symbol_context(
     (
         row, file_path, callers_list, callees_list, indirect_calls_list,
         resolution, enum_constants, llm_analysis, overrides_info,
-        stored_mtime,
+        stored_state,
     ) = query_result
 
-    source, source_origin, stale_warning = _read_verified_body(row, file_path, stored_mtime)
+    source, source_origin, stale_warning = _read_verified_body(row, file_path, stored_state)
     result: dict = {
         "name": row["name"],
         "qualified_name": row["qualified_name"],

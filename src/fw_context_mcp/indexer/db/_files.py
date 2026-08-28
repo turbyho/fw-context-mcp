@@ -138,7 +138,9 @@ def upsert_file(
     mtime without changing the text, Tier 2 found an empty content_hash,
     could not take its shortcut, and paid one libclang parse to rebuild what
     was already known.  files.content_hash has exactly one reader,
-    _check_and_parse_unit; source_hash and flags_hash have none.
+    _check_and_parse_unit.  source_hash has two: the staleness checks in
+    mcp/shared/stale.py compare it against the file to tell a real change
+    from one where git only rewrote the mtime.  flags_hash still has none.
 
     Args:
         conn: Open database connection.

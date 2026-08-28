@@ -20,7 +20,7 @@ from fw_context_mcp.mcp.handlers.source import (
     _body_matches_symbol,
     _read_probe_lines,
     _read_verified_body,
-    _stored_file_mtime,
+    _stored_file_state,
 )
 
 # The two functions are deliberately adjacent.  After the shift below, the
@@ -123,7 +123,7 @@ class TestBodyMatchesSymbol:
 class TestReadVerifiedBody:
     def test_unchanged_file_reads_the_disk(self, source_file: Path):
         text, origin, warning = _read_verified_body(
-            _make_row(), str(source_file), _indexed_mtime(source_file)
+            _make_row(), str(source_file), (_indexed_mtime(source_file), "")
         )
         assert origin == "disk"
         assert warning is None
@@ -136,7 +136,7 @@ class TestReadVerifiedBody:
         os.utime(source_file, (now + 100, now + 100))
         row = _make_row(source="")
 
-        text, origin, warning = _read_verified_body(row, str(source_file), now - 100)
+        text, origin, warning = _read_verified_body(row, str(source_file), (now - 100, ""))
 
         assert origin == "disk"
         assert "uart_start_v2();" in text, "the disk holds the current body"
@@ -166,7 +166,7 @@ class TestReadVerifiedBody:
         _shift_file(source_file)
 
         text, origin, warning = _read_verified_body(
-            _make_row(), str(source_file), indexed_mtime
+            _make_row(), str(source_file), (indexed_mtime, "")
         )
 
         assert origin == "index"
@@ -181,12 +181,12 @@ class TestReadVerifiedBody:
         body is stored bare, thus it needs the same prefix on the way out.
         """
         disk_text, disk_origin, _ = _read_verified_body(
-            _make_row(), str(source_file), _indexed_mtime(source_file)
+            _make_row(), str(source_file), (_indexed_mtime(source_file), "")
         )
         indexed_mtime = os.path.getmtime(source_file)
         _shift_file(source_file)
         index_text, index_origin, _ = _read_verified_body(
-            _make_row(), str(source_file), indexed_mtime
+            _make_row(), str(source_file), (indexed_mtime, "")
         )
 
         assert (disk_origin, index_origin) == ("disk", "index")
@@ -204,7 +204,7 @@ class TestReadVerifiedBody:
         _shift_file(source_file)
         row = _make_row(source="")
 
-        text, origin, warning = _read_verified_body(row, str(source_file), indexed_mtime)
+        text, origin, warning = _read_verified_body(row, str(source_file), (indexed_mtime, ""))
 
         assert text == ""
         assert origin == ""
@@ -215,7 +215,7 @@ class TestReadVerifiedBody:
         source_file.unlink()
 
         text, origin, warning = _read_verified_body(
-            _make_row(), str(source_file), indexed_mtime
+            _make_row(), str(source_file), (indexed_mtime, "")
         )
 
         assert origin == "index"
@@ -223,17 +223,29 @@ class TestReadVerifiedBody:
         assert warning is not None
 
 
-class TestStoredFileMtime:
+class TestStoredFileState:
     def test_gives_the_stored_value(self, populated_db):
         from fw_context_mcp.indexer.db import transaction, upsert_file
 
         with transaction(populated_db):
             file_id = upsert_file(
-                populated_db, "hash-deadbeef", "/tmp/modem.c", "c", mtime=1234.5
+                populated_db, "hash-deadbeef", "/tmp/modem.c", "c",
+                mtime=1234.5, source_hash="abc123",
             )
 
-        assert _stored_file_mtime(populated_db, file_id) == pytest.approx(1234.5)
+        assert _stored_file_state(populated_db, file_id) == (pytest.approx(1234.5), "abc123")
+
+    def test_a_row_without_a_hash_gives_an_empty_string(self, populated_db):
+        """An index written before the hash existed must still work."""
+        from fw_context_mcp.indexer.db import transaction, upsert_file
+
+        with transaction(populated_db):
+            file_id = upsert_file(
+                populated_db, "hash-deadbeef", "/tmp/legacy.c", "c", mtime=99.0
+            )
+
+        assert _stored_file_state(populated_db, file_id) == (pytest.approx(99.0), "")
 
     def test_absent_row_gives_zero(self, populated_db):
         """0.0 makes the caller take the safe path instead of trusting a gap."""
-        assert _stored_file_mtime(populated_db, 999999) == 0.0
+        assert _stored_file_state(populated_db, 999999) == (0.0, "")

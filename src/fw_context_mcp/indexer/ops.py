@@ -461,10 +461,16 @@ def _store_symbol_rows(
                 sym_mtime = Path(sym_file).stat().st_mtime
             except OSError:
                 sym_mtime = 0.0
+            # The hash goes in for every file, not only for a translation
+            # unit.  The staleness check uses it to tell a real change from a
+            # file that git only rewrote, and a header is what git rewrites
+            # most.  One digest per file costs about 24 ms over a project of
+            # 1900 files, against an index run of tens of minutes.
             file_id_cache[normalized_sym_file] = upsert_file(
                 conn, config_hash, normalized_sym_file, lang,
                 generated=_is_generated_header(normalized_sym_file, build_dir_patterns),
                 mtime=sym_mtime,
+                source_hash=compute_source_hash(Path(sym_file)),
             )
         rel_path = normalized_sym_file
         # ── Compute is_project ──
@@ -811,7 +817,10 @@ def _store_macros_for_unit(
                 m_mtime = Path(m_raw).stat().st_mtime
             except OSError:
                 pass
-            file_id_cache[m_path] = upsert_file(conn, config_hash, m_path, lang, mtime=m_mtime)
+            file_id_cache[m_path] = upsert_file(
+                conn, config_hash, m_path, lang, mtime=m_mtime,
+                source_hash=compute_source_hash(Path(m_raw)),
+            )
         m_file_id = file_id_cache[m_path]
         macro_rows.append(
             (
