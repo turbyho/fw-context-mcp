@@ -91,8 +91,13 @@ clean-path:
 
 
 # ---- dev setup (install all deps including pytest, ruff, mypy, bandit) ----
+# Adds the dev tools to the SAME venv every other target uses.  It ran
+# `uv sync --extra dev` before, and uv sync manages the PROJECT environment
+# — <repo>/.venv — while test, lint and lint-security run out of $(VENV).
+# So `make dev` equipped one venv and `make test` used another, which is
+# what produced the second venv in the first place.
 dev: venv
-	@cd $(SRC) && $(UV) sync --extra dev
+	$(UV) pip install --python $(VENV)/bin/python -e "$(SRC)[dev]"
 	@echo ""
 	@echo "Dev environment ready. Run: make test, make lint, make lint-security"
 
