@@ -1030,6 +1030,56 @@ class TestReindexFileImplEdgeCases:
         assert "error" in result
         assert "not found" in result["error"].lower()
 
+    def test_reindex_refreshes_source_hash(self, indexed_project: Path):
+        """A reindexed file must not stay marked as changed forever.
+
+        reindex_file_impl moves ``files.mtime`` forward.  When it left
+        ``files.source_hash`` at the value from before the edit, the two
+        columns disagreed and every staleness check in mcp/shared/stale.py
+        answered "changed" for a file whose symbols were current.
+        """
+        from fw_context_mcp.indexer.db import open_db as _open_db
+        from fw_context_mcp.mcp.handlers.maintenance import reindex_file_impl
+        from fw_context_mcp.mcp.shared.stale import _check_file_stale
+        from fw_context_mcp.utils import compute_source_hash
+
+        db_path = _db_path_for_project(indexed_project)
+        target = indexed_project / "src" / "modem.c"
+        original = target.read_text(encoding="utf-8")
+
+        def stored_row() -> tuple[float, str]:
+            conn = _open_db(db_path)
+            try:
+                row = conn.execute(
+                    "SELECT mtime, source_hash FROM files WHERE path LIKE ?",
+                    ("%modem.c",),
+                ).fetchone()
+            finally:
+                conn.close()
+            assert row is not None, "modem.c missing from the files table"
+            return row["mtime"], row["source_hash"]
+
+        _, hash_before = stored_row()
+        assert hash_before, "the index must store a source_hash to start from"
+
+        try:
+            _write_file(target, original + "\nint reindex_hash_probe(void) { return 7; }\n")
+            _advance_mtime(target)
+
+            result = reindex_file_impl("src/modem.c", str(indexed_project), with_analysis=False)
+            assert "error" not in result, f"Reindex failed: {result.get('error')}"
+
+            mtime_after, hash_after = stored_row()
+            assert hash_after == compute_source_hash(target), (
+                "source_hash must describe the text the index just parsed"
+            )
+            assert hash_after != hash_before, "the content changed, thus the hash must change"
+            assert not _check_file_stale(str(target), mtime_after, hash_after)
+        finally:
+            _write_file(target, original)
+            _advance_mtime(target)
+            reindex_file_impl("src/modem.c", str(indexed_project), with_analysis=False)
+
 
 # ── direct store_symbols_for_unit tests ────────────────────────────────
 

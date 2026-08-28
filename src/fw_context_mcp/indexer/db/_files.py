@@ -142,6 +142,15 @@ def upsert_file(
     mcp/shared/stale.py compare it against the file to tell a real change
     from one where git only rewrote the mtime.  flags_hash still has none.
 
+    That second reader is why source_hash may no longer ride on this rule
+    alone.  A caller that MOVES mtime and knows the content must also pass
+    source_hash, or the row ends with the hash of the old text beside the
+    stamp of the new one, and the staleness checks then call the file
+    changed for as long as the pair disagrees.  store_symbols_for_unit()
+    computes it for exactly that reason.  The rule here stays as it is: it
+    protects a caller that knows NOTHING about the content, which is a
+    different case.
+
     Args:
         conn: Open database connection.
         config_hash: Build config hash the file belongs to.

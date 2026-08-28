@@ -999,8 +999,8 @@ def store_symbols_for_unit(
     # content/stability hashes), we store them in the files row.  These
     # hashes power the manifest verification step, which detects whether
     # a TU needs re-parsing by comparing current hashes to stored hashes.
-    # Without hashes (reindex_file path), we still upsert the file row
-    # but leave hash columns at their defaults.
+    # Without hashes (reindex_file path), we still compute source_hash —
+    # see the else branch for why it cannot be left out.
     if hashes is not None:
         source_hash, flags_hash, manifest_entry_hash = hashes
         content_hash_val = compute_tu_content_hash(source_hash, flags_hash, manifest_entry_hash)
@@ -1010,7 +1010,24 @@ def store_symbols_for_unit(
             source_hash=source_hash, flags_hash=flags_hash,
         )
     else:
-        tu_file_id = upsert_file(conn, config_hash, normalized_tu_path, unit.language, mtime=current_mtime)
+        # This call moves mtime forward, thus it MUST move source_hash too.
+        # upsert_file keeps a stored hash when the caller passes an empty
+        # one, which is right for a caller that knows nothing about the
+        # content — but this caller just re-parsed the file.  Left out, the
+        # row holds the hash of the text before the edit next to the mtime
+        # of the text after it, and every staleness check in
+        # mcp/shared/stale.py then reports the file as changed forever,
+        # although its symbols are current.
+        #
+        # content_hash and flags_hash stay as they are: they feed the
+        # manifest shortcut in _check_and_parse_unit, which compares them
+        # against freshly computed values and reparses on a mismatch.  A
+        # stale value there costs one parse, never a wrong answer.
+        tu_file_id = upsert_file(
+            conn, config_hash, normalized_tu_path, unit.language,
+            mtime=current_mtime,
+            source_hash=compute_source_hash(unit.file.resolve()),
+        )
 
     syms_added = 0
     refs_added = 0
