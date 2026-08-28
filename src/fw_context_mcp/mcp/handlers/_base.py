@@ -92,9 +92,18 @@ class DbContext:
         # distinct one once, otherwise a three-variant project shows the same
         # warning three times and reads like three separate problems.
         notices: list[str] = []
-        for scope in self.scopes:
+        for index, scope in enumerate(self.scopes):
+            # Only the first scope diagnoses an empty result.  That answer
+            # describes the project — files changed on disk, sources absent
+            # from compile_commands.json — not one build of it, so every
+            # scope reaches the same conclusion and the dedup below drops
+            # all but one.  It is not cheap to reach: a scan of every
+            # indexed file plus a listing of the source tree, and it runs
+            # inside the executor lock.  Nine configs on zbox-ecb-fw-v5
+            # paid for it nine times and used one.
             part = with_stale_annotation(
-                self.root, self.executor, query_fn, scope["config_hash"]
+                self.root, self.executor, query_fn, scope["config_hash"],
+                diagnose_empty=(index == 0),
             )
             if isinstance(part, list):
                 for r in part:

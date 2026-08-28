@@ -68,7 +68,13 @@ _CACHE_TTL_S: float = 30.0  # shared TTL for mtime cache and header staleness ca
 
 
 def _invalidate_modified_cache(config_hash: str | None = None) -> None:
-    """Invalidate the mtime cache.  If *config_hash* is None, clear all entries."""
+    """Invalidate the mtime cache.  If *config_hash* is None, clear all entries.
+
+    NOTE on who calls this: reindex_file_impl and reset_index, both in
+    mcp/handlers/maintenance.py.  The file watcher does NOT and cannot — it
+    reindexes in a subprocess, as the module docstring says — so the TTL is
+    the only bound on an edit the daemon picked up.
+    """
     if config_hash:
         _modified_cache.pop(config_hash, None)
     else:
@@ -1063,6 +1069,11 @@ def diagnose_empty_result(conn, config_hash: str, root: Path) -> tuple[int, list
     validates itself against ``MAX(mtime)`` of the files table, which only a
     reindex changes.  An edit on disk leaves that cache valid, thus a cached
     answer would miss the very edit this check exists for.
+
+    NOT cached either, for the same reason.  A cache on this answer was
+    tried and dropped: after the mtime gate was fixed the scan costs 23 ms
+    on the largest test project, and a cached diagnosis outlives the edit
+    it describes for as long as its TTL.
     """
     dirty = _count_modified_files(conn, config_hash, root, use_cache=False)
     row = conn.execute(
@@ -1076,7 +1087,9 @@ def diagnose_empty_result(conn, config_hash: str, root: Path) -> tuple[int, list
     )
 
 
-def with_stale_annotation(root: Path, executor, query_fn, config_hash: str):
+def with_stale_annotation(
+    root: Path, executor, query_fn, config_hash: str, *, diagnose_empty: bool = True
+):
     """Run *query_fn* on *executor* and annotate a stale result.
 
     The staleness check must share the connection with the query, thus it
@@ -1087,6 +1100,12 @@ def with_stale_annotation(root: Path, executor, query_fn, config_hash: str):
     none goes to ``diagnose_empty_result``: an empty answer is the case where
     the caller most needs to know that the index is behind, and it is the one
     case where per-record detection has nothing to work with.
+
+    *diagnose_empty* is for the multi-scope caller.  The diagnosis describes
+    the project, not one build of it, and every scope would reach the same
+    conclusion — ``execute_scoped`` then throws the duplicates away.  Nine
+    configs on zbox-ecb-fw-v5 meant nine scans of the whole index for one
+    message.
     """
 
     def _query(conn, cfg_hash):
@@ -1094,6 +1113,8 @@ def with_stale_annotation(root: Path, executor, query_fn, config_hash: str):
         paths = collect_result_paths(result, root)
         if paths:
             return result, _stale_files(conn, cfg_hash, paths, root), 0, []
+        if not diagnose_empty:
+            return result, [], 0, []
         dirty, new_sources = diagnose_empty_result(conn, cfg_hash, root)
         return result, [], dirty, new_sources
 
