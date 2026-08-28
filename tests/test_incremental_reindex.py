@@ -4722,4 +4722,12 @@ class TestReindexKeepsTheGeneratedFlag:
             monkeypatch=monkeypatch,
         )
 
-        assert seen == [["build/"]]
+        assert len(seen) == 1, "detection must run exactly once"
+        assert "build/" in seen[0], (
+            "the fallback has to reach the zephyr backend and take its pattern"
+        )
+        assert ".fw-context/" in seen[0], (
+            "and every set of build-output patterns carries the fw-context "
+            "directory, because an isolated build writes its generated "
+            "headers there — see utils.build_dir_patterns_with_fw_context"
+        )

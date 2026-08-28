@@ -1859,7 +1859,11 @@ def _reindex_build_patterns_for_generated(root: Path) -> tuple[list[str], None]:
     builder_cls = registry.get(system) if system else None
     if builder_cls is None:
         return [], None
-    return list(builder_cls().get_build_dir_patterns(root)), None
+    from ...utils import build_dir_patterns_with_fw_context
+
+    return build_dir_patterns_with_fw_context(
+        list(builder_cls().get_build_dir_patterns(root))
+    ), None
 
 
 def _reindex_build_patterns(

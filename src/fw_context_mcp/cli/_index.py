@@ -34,7 +34,12 @@ from typing import TYPE_CHECKING
 
 from ..indexer import autobuild
 from ..mcp.shared.pid_file import PidFile
-from ..utils import CC_OUTPUT_REL, SAFE_EXCEPT, autobuild_dir
+from ..utils import (
+    CC_OUTPUT_REL,
+    SAFE_EXCEPT,
+    autobuild_dir,
+    build_dir_patterns_with_fw_context,
+)
 from . import VerboseFormatter
 
 if TYPE_CHECKING:
@@ -244,7 +249,9 @@ def _validate_and_fix_artifacts(
         return compile_commands, None, True
 
     builder_instance = builder_cls()
-    build_dir_patterns = builder_instance.get_build_dir_patterns(project_root)
+    build_dir_patterns = build_dir_patterns_with_fw_context(
+        builder_instance.get_build_dir_patterns(project_root)
+    )
 
     if not bg:
         stale, stale_reasons = is_compile_commands_stale(compile_commands, project_root)
@@ -572,7 +579,10 @@ def _run_multi(
         env = dict(build_cfg.env)
         if v is not None:
             env.update(v.env)
-        build_dir_patterns = [f"{_variant_build_dir(v, build_cfg)}/"] if v is not None else None
+        build_dir_patterns = (
+            build_dir_patterns_with_fw_context([f"{_variant_build_dir(v, build_cfg)}/"])
+            if v is not None else None
+        )
         # The path layers are summed per build, not once for the command:
         # two variants may vendor different in-tree trees.  run_kwargs holds
         # the [index] layer (or the CLI flag, which replaces it).

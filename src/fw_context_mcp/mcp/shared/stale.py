@@ -32,10 +32,10 @@ from pathlib import Path
 from ...config import derive_project_id
 from ...indexer.db import get_active_config
 from ...utils import (
-    FW_CONTEXT_REL,
     MTIME_TOLERANCE_S,
     TU_EXTENSIONS,
     abs_path,
+    build_dir_patterns_with_fw_context,
     compute_source_hash,
 )
 from .context import _quick_open_readonly, get_executor
@@ -620,17 +620,12 @@ def find_unindexed_sources(
     db_path = Path(conn.execute("PRAGMA database_list").fetchone()["file"])
     # The directory fw-context writes into is not a place to look for the
     # source files of the user: it holds the generated compile_commands.json
-    # and the output of the automatic build.  Adding it here is not
-    # belt-and-braces over the patterns of the backend — measured, those do
-    # not cover it.  `.fw-context/autobuild/` misses mbed-os (`BUILD/`) and
-    # platformio (`.pio/build/`) outright, and the five backends where it
-    # does match only match because "autobuild/" happens to hold the
-    # substring "build/".  A generated .c left inside would be reported as
-    # missing from compile_commands.json, and that arms the build again.
-    build_patterns = [
-        *load_build_dir_patterns(db_path.parent, config_hash),
-        f"{FW_CONTEXT_REL}/",
-    ]
+    # and the output of the automatic build.  The shared helper adds it,
+    # because the same gap bites _is_generated_header — see its docstring
+    # for the measurement.
+    build_patterns = build_dir_patterns_with_fw_context(
+        load_build_dir_patterns(db_path.parent, config_hash)
+    )
     # Read once, before the walk.  The caller that WRITES the marker passes
     # apply_exclusions=False, or it would filter out the very files it is
     # about to record.

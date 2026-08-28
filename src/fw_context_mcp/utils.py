@@ -49,6 +49,7 @@ __all__ = [
     "TU_EXTENSIONS",
     "abs_path",
     "autobuild_dir",
+    "build_dir_patterns_with_fw_context",
     "cc_output_path",
     "compute_content_hash",
     "compute_source_hash",
@@ -101,6 +102,28 @@ AUTOBUILD_REL: Path = FW_CONTEXT_REL / "autobuild"
 # where the build of the user reads them, and a compiler does not write them
 # atomically, thus a concurrent make can read a truncated file.
 DEPS_REL: Path = FW_CONTEXT_REL / "build" / "deps"
+
+
+def build_dir_patterns_with_fw_context(patterns: list[str]) -> list[str]:
+    """Add the fw-context directory to the build-output patterns of a backend.
+
+    Everything fw-context writes into a project sits under FW_CONTEXT_REL,
+    and an isolated automatic build puts the generated configuration headers
+    there — mbed_config.h, sdkconfig.h, autoconf.h.  The patterns of the
+    backend do not reach them.  Measured against the real manifests:
+    mbed-os gives ``BUILD/``, platformio ``.pio/build/``, zephyr
+    ``build/nrf52840_sysbuild/``, and none of the three matches.  The
+    backends whose pattern is ``build/`` match only because
+    ".fw-context/autobuild/" happens to hold that substring, which is not a
+    rule anything should rest on.
+
+    A header the pipeline does not know is generated is re-hashed on every
+    index run, and a generated header changes with every build without a
+    change of meaning — so every unit that includes it is marked
+    header-stale and re-parsed, which is the opposite of what the three
+    staleness tiers are for.
+    """
+    return [*patterns, f"{FW_CONTEXT_REL}/"]
 
 
 def autobuild_dir(variant: str = "") -> str:
