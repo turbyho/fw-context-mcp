@@ -1439,7 +1439,6 @@ def _reindex_post_write_phases(
     total_symbols: int,
     db_dir: Path,
     target: Path,
-    matching: list,
     result: dict,
     root: Path,
 ) -> dict:
@@ -1456,9 +1455,13 @@ def _reindex_post_write_phases(
     When ``total_symbols <= 0``, all phases are skipped (nothing was
     added or updated).
 
-    A warning is emitted when a single header file is reindexed via only
-    one TU — other TUs including the same header may still have stale
-    symbols and the user should run a full ``fw-context index``.
+    The coverage warning for a header is NOT set here.  It used to be, and
+    that put it behind two gates it has nothing to do with: this function
+    returns early when ``total_symbols <= 0``, and the caller skips it
+    entirely when ``with_analysis=False`` — the mode the background
+    auto-reindex uses.  A caller that re-parsed a header through one unit
+    has to hear about it whether or not the enrichment phases ran, thus
+    _header_coverage_warning() is applied by the caller.
     """
     if total_symbols <= 0:
         return result
@@ -1467,14 +1470,33 @@ def _reindex_post_write_phases(
     _reindex_overrides(conn, config_hash, cfg, db_dir, result)
     _reindex_pagerank(conn, config_hash, cfg, result)
 
-    if len(matching) == 1 and target.suffix.lower() in {".h", ".hpp"}:
-        result["warning"] = (
-            "Header re-indexed via one TU. Other TUs including this header "
-            "may still have stale symbols — run 'fw-context index' for full accuracy."
-        )
-
     _reindex_embeddings(conn, config_hash, cfg, db_dir, target, root, result)
     return result
+
+
+def _header_coverage_warning(
+    target: Path, matching: list, via_header: bool
+) -> str | None:
+    """Say that a header was re-parsed through one compilation context.
+
+    Another unit can include the same header under a different set of
+    ``#define`` values and still hold symbols from before the edit.  Only a
+    full index covers every context, and the caller has to know that the
+    answer is partial.
+
+    *via_header* covers the manifest fallback.  The suffix test covers a
+    header that compile_commands.json does list, which some build systems
+    emit.  The suffix test alone is not enough: it names ``.h`` and
+    ``.hpp``, while an ``#include`` reaches ``.hh``, ``.hxx``, ``.inc`` and
+    extension-less headers just as well, and the fallback resolves those
+    too.
+    """
+    if not (via_header or (len(matching) == 1 and target.suffix.lower() in {".h", ".hpp"})):
+        return None
+    return (
+        "Header re-indexed via one TU. Other TUs including this header "
+        "may still have stale symbols — run 'fw-context index' for full accuracy."
+    )
 
 
 # ── moved from server.py ──
@@ -1482,7 +1504,7 @@ def reindex_file_impl(
     file_path: Annotated[
         str,
         Field(
-            description="Absolute or project-relative path to the source file to re-parse. Must have a matching entry in compile_commands.json."
+            description="Absolute or project-relative path to the file to re-parse. A source file must have an entry in compile_commands.json. A header is re-parsed through one translation unit that includes it, and the result then carries a warning that other units can still hold stale symbols."
         ),
     ],
     project_root: Annotated[
@@ -1499,15 +1521,25 @@ def reindex_file_impl(
     """Re-parse a single source file with libclang and update its symbols in the index.
 
     Not read-only — uses the exact compiler flags from ``compile_commands.json``.
-    The file must be listed in ``compile_commands.json`` (headers are re-indexed
-    via the translation unit that includes them). Use after editing a file to
-    keep the index current without a full rebuild.
+    Use after editing a file to keep the index current without a full rebuild.
+
+    A source file must be listed in ``compile_commands.json``.  A header is
+    not listed there — compile_commands.json names translation units — so it
+    is re-parsed through one unit that includes it, taken from the manifest.
+    That answer describes a single compilation context, thus the result
+    carries a ``warning``: another unit can see the header under a different
+    set of ``#define`` values and still hold stale symbols.  Only a full
+    ``fw-context index`` covers every context.  One unit and not all of them
+    is a cost decision — an application header reaches a median of 3 units
+    but as many as 266 on a real project, at tens of seconds each.
 
     Also regenerates LLM analysis and method override relationships for
-    affected symbols when ``with_analysis=True``.
+    affected symbols when ``with_analysis=True``.  The analysis is
+    content-addressed, thus an unchanged symbol is never re-analysed.
 
     Args:
-        file_path: Path to source file to re-parse. Must be in compile_commands.json.
+        file_path: Path to the file to re-parse.  A source file must be in
+            compile_commands.json; a header goes through one including unit.
         project_root: Project root directory. Auto-detected if omitted.
         with_analysis: When True (default), also regenerates LLM symbol analysis,
             method override relationships, PageRank, and embeddings. Set False
@@ -1547,16 +1579,24 @@ def reindex_file_impl(
         if not target.exists():
             return _reindex_cleanup_deleted_file(conn, cfg_data, target, root, db_path)
 
-        matching, error = _reindex_match_tus(target, cfg_data)
-        if error:
-            return error
-
         # The manifest of THIS build carries the vendor set the index run
         # applied.  reindex_file must write is_project with that same
         # boundary, or one file ends up on the other side of it.
+        #
+        # Loaded before the match because it answers a second question:
+        # compile_commands.json lists no headers, so a header target finds
+        # its translation unit only through the manifest.  One load serves
+        # both — it costs 14 ms on a 9.3 MB manifest.
         from ...indexer.manifest import load as load_manifest
 
         build_manifest = load_manifest(db_path.parent, config_hash)
+
+        matching, via_header, error = _reindex_match_tus(
+            target, cfg_data, manifest=build_manifest, project_root=root,
+        )
+        if error:
+            return error
+
         vendor_patterns, project_patterns_list = _reindex_build_patterns(
             cfg, root, build_manifest
         )
@@ -1566,12 +1606,20 @@ def reindex_file_impl(
         )
         if "error" in result:
             return result
+
+        # Set before the with_analysis gate: the warning describes how much
+        # of the header the re-parse covered, which does not depend on
+        # whether the enrichment phases run.
+        coverage_warning = _header_coverage_warning(target, matching, via_header)
+        if coverage_warning:
+            result["warning"] = coverage_warning
+
         if not with_analysis:
             return result
 
         return _reindex_post_write_phases(
             conn, config_hash, cfg, total_symbols, db_path.parent,
-            target, matching, result, root,
+            target, result, root,
         )
 
     try:
@@ -1609,28 +1657,99 @@ def _reindex_resolve_target(
     return target, None
 
 
+def _tu_for_header(
+    target: Path, manifest: dict | None, project_root: Path
+) -> Path | None:
+    """Return one translation unit that includes *target*, or None.
+
+    A header is never its own entry in compile_commands.json, thus the
+    direct match cannot find it.  The manifest records each TU with the
+    header paths it pulled in, which answers the reverse question.
+
+    ONE unit, not all of them.  The fan-out is large: measured on
+    zbox-ecb-fw, an application header reaches a median of 3 translation
+    units but ``sdk_config.h`` reaches 266, and one re-parse costs about
+    42 s on that project.  Re-parsing every including unit would turn a
+    single tool call into hours, thus the caller warns that the answer
+    comes from one compilation context and points at a full index.
+
+    The choice is the lowest path in sort order, not the first entry.
+    Manifest order follows compile_commands.json, which a rebuild can
+    reshuffle, and a tool that picked a different unit on every call
+    would be hard to reason about.
+
+    Paths are compared as strings.  The manifest already stores resolved
+    forms — relative to the project root when inside it, absolute
+    otherwise (see ops.py) — and *target* arrives resolved from
+    _reindex_resolve_target, thus another resolve() per header would only
+    add a syscall for each of the tens of thousands of header references
+    a large manifest holds.
+    """
+    if not manifest:
+        return None
+    root = project_root.resolve()
+    target_str = str(target)
+    best: str | None = None
+    for entry in manifest.get("entries") or ():
+        tu_file = entry.get("file")
+        if not tu_file:
+            continue
+        for header in entry.get("headers") or ():
+            header_abs = header if Path(header).is_absolute() else str(root / header)
+            if header_abs != target_str:
+                continue
+            tu_abs = tu_file if Path(tu_file).is_absolute() else str(root / tu_file)
+            if best is None or tu_abs < best:
+                best = tu_abs
+            break
+    return Path(best) if best is not None else None
+
+
 def _reindex_match_tus(
-    target: Path, cfg_data: sqlite3.Row
-) -> tuple[list, dict | None]:
+    target: Path,
+    cfg_data: sqlite3.Row,
+    *,
+    manifest: dict | None = None,
+    project_root: Path | None = None,
+) -> tuple[list, bool, dict | None]:
     """Find compilation units in compile_commands.json that build *target*.
 
     Parses the compile_commands.json file and matches by absolute,
-    resolved file path.  A single source file may appear in multiple TUs
-    (e.g. when a header is included by several .cpp files) — all
-    matching TUs are returned so symbols from every context are updated.
+    resolved file path.  A single source file may appear in more than one
+    unit — the same .cpp built with two flag sets — and every match is
+    returned so symbols from each context are updated.
 
-    Returns ``(matching_tus, None)`` on success or an empty list with
-    an ``error_dict`` when the compile_commands.json is missing or the
-    target file is not listed.
+    A header matches nothing this way, because compile_commands.json
+    lists translation units and a header is not one.  For that case
+    *manifest* supplies one unit that includes the header; see
+    _tu_for_header for why one and which one.
+
+    Returns ``(matching_tus, via_header, None)`` on success, where
+    *via_header* says the units came from the manifest fallback and the
+    result therefore describes a single compilation context.  On failure
+    it returns an empty list with an ``error_dict`` — the
+    compile_commands.json is missing, or nothing builds the target.
     """
     cc_path = Path(cfg_data["compile_commands_path"])
     if not cc_path.exists():
-        return [], {"error": f"compile_commands.json not found: {cc_path}"}
-    units = parse_cc(cc_path)
+        return [], False, {"error": f"compile_commands.json not found: {cc_path}"}
+    # list(), not the iterator parse_cc returns: the header fallback below
+    # walks the units a second time, and a generator is empty by then.
+    units = list(parse_cc(cc_path))
     matching = [u for u in units if Path(u.file).resolve() == target]
-    if not matching:
-        return [], {"error": f"{target.name} not found in compile_commands.json — it may be a header-only file."}
-    return matching, None
+    if matching:
+        return matching, False, None
+
+    tu_path = _tu_for_header(target, manifest, project_root or target.parent)
+    if tu_path is not None:
+        # The manifest can name a unit that a later build dropped from
+        # compile_commands.json.  An empty result here falls through to
+        # the error below, which is the same answer as before.
+        via = [u for u in units if Path(u.file).resolve() == tu_path]
+        if via:
+            return via[:1], True, None
+
+    return [], False, {"error": f"{target.name} not found in compile_commands.json — it may be a header-only file."}
 
 
 def _effective_vendor_patterns(
@@ -1707,21 +1826,27 @@ def _reindex_build_patterns(
 
 # ── moved from server.py ──
 def reindex_file(
-    file_path: Annotated[str, Field(description="Path to source file to re-parse. Must be in compile_commands.json.")],
+    file_path: Annotated[str, Field(description="Path to the file to re-parse. A source file must be in compile_commands.json. A header goes through one translation unit that includes it, and the result then carries a warning about the other units.")],
     project_root: Annotated[str | None, Field(description="Project root. Auto-detected if omitted.")] = None,
 ) -> dict:
     """Re-parse a single source file with libclang and update its symbols in the index.
 
     Not read-only — uses the exact compiler flags from ``compile_commands.json``.
-    The file must be listed in ``compile_commands.json`` (headers are re-indexed
-    via the translation unit that includes them). Use after editing a file to
-    keep the index current without a full rebuild.
+    Use after editing a file to keep the index current without a full rebuild.
+
+    A source file must be listed in ``compile_commands.json``.  A header is
+    not listed there, thus it is re-parsed through one unit that includes
+    it.  That answer covers a single compilation context, thus the result
+    carries a ``warning`` — only a full ``fw-context index`` covers every
+    unit that includes the header.
 
     Also regenerates LLM analysis and method override relationships for
-    affected symbols when those features are enabled in config.
+    affected symbols when those features are enabled in config.  An
+    unchanged symbol keeps its stored analysis.
 
     Args:
-        file_path: Path to source file to re-parse. Must be in compile_commands.json.
+        file_path: Path to the file to re-parse.  A source file must be in
+            compile_commands.json; a header goes through one including unit.
         project_root: Project root directory. Auto-detected if omitted.
 
     Returns:

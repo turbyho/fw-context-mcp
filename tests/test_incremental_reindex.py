@@ -745,18 +745,60 @@ int modem_flush(void) {
         # Restore original
         modem_c.write_text(original, encoding="utf-8")
 
-    def test_reindex_header_only_file(self, indexed_project: Path):
-        """Reindexing a header file that's not in compile_commands.json returns error."""
-        from fw_context_mcp.mcp.handlers.maintenance import reindex_file_impl
+    def test_reindex_header_refreshes_its_stored_state(self, indexed_project: Path):
+        """Reindexing a header brings the index up to the header's new text.
 
-        result = reindex_file_impl("src/modem.h", str(indexed_project), with_analysis=False)
-        # Header-only files not in compile_commands.json should return error
-        assert "error" in result, (
-            f"Expected error for header file not in compile_commands.json, got: {result}"
-        )
-        assert "header" in result["error"].lower() or "not found" in result["error"].lower(), (
-            f"Expected 'header' or 'not found' in error message, got: {result['error']!r}"
-        )
+        This used to assert the opposite — that a header returns "not found
+        in compile_commands.json".  A header is indeed not listed there, but
+        the manifest names the units that include it, so one of them now
+        carries the re-parse.
+
+        The assertion is the incremental-reindex outcome, not the mechanism
+        that TestReindexFileImplEdgeCases covers.  Two columns have to move
+        together: ``source_hash``, which every staleness check in
+        mcp/shared/stale.py compares against the file, and ``content``,
+        which backs read_file and search_content.  A re-parse that moved
+        only one of them would either warn forever or serve the old text.
+        """
+        from fw_context_mcp.indexer.db import open_db as _open_db
+        from fw_context_mcp.mcp.handlers.maintenance import reindex_file_impl
+        from fw_context_mcp.utils import compute_source_hash
+
+        header = indexed_project / "src" / "modem.h"
+        original = header.read_text(encoding="utf-8")
+
+        def stored() -> tuple[str, str]:
+            conn = _open_db(_db_path_for_project(indexed_project))
+            try:
+                row = conn.execute(
+                    "SELECT source_hash, content FROM files WHERE path LIKE ?",
+                    ("%modem.h",),
+                ).fetchone()
+            finally:
+                conn.close()
+            assert row is not None, "modem.h missing from the files table"
+            return row["source_hash"], row["content"] or ""
+
+        try:
+            _write_file(header, original.replace(
+                "#endif", "int modem_reset(void);\n\n#endif"))
+            _advance_mtime(header)
+
+            result = reindex_file_impl("src/modem.h", str(indexed_project),
+                                       with_analysis=False)
+            assert "error" not in result, f"header reindex failed: {result.get('error')}"
+
+            source_hash, content = stored()
+            assert source_hash == compute_source_hash(header), (
+                "source_hash must describe the text the index just parsed"
+            )
+            assert "modem_reset" in content, (
+                "files.content backs read_file, thus it must hold the new text"
+            )
+        finally:
+            _write_file(header, original)
+            _advance_mtime(header)
+            reindex_file_impl("src/modem.h", str(indexed_project), with_analysis=False)
 
 
 @pytest.mark.libclang
@@ -1079,6 +1121,93 @@ class TestReindexFileImplEdgeCases:
             _write_file(target, original)
             _advance_mtime(target)
             reindex_file_impl("src/modem.c", str(indexed_project), with_analysis=False)
+
+    def test_header_reindexes_through_an_including_tu(self, indexed_project: Path):
+        """A header is not in compile_commands.json, but it can still be reindexed.
+
+        compile_commands.json lists translation units, thus a header never
+        matches it directly.  The manifest names the units that include the
+        header, and one of them carries the re-parse.
+
+        This also covers the iterator trap: _reindex_match_tus walks the
+        units twice, so parse() — which returns a generator — has to be
+        materialised first.  Without that the second walk sees an exhausted
+        iterator and the header falls through to the "not found" error.
+        """
+        from fw_context_mcp.indexer.db import open_db as _open_db
+        from fw_context_mcp.mcp.handlers.maintenance import reindex_file_impl
+
+        header = indexed_project / "src" / "modem.h"
+        original = header.read_text(encoding="utf-8")
+
+        try:
+            _write_file(header, original.replace(
+                "#endif", "int modem_probe_added(int x);\n#endif"))
+            _advance_mtime(header)
+
+            result = reindex_file_impl("src/modem.h", str(indexed_project),
+                                       with_analysis=False)
+
+            assert "error" not in result, f"header reindex failed: {result.get('error')}"
+            assert result["translation_units"] == 1, (
+                "one unit carries the re-parse; re-parsing every including unit "
+                "would cost hours on a real project"
+            )
+            assert "warning" in result, (
+                "the answer covers one compilation context and must say so"
+            )
+            assert "run 'fw-context index'" in result["warning"]
+
+            conn = _open_db(_db_path_for_project(indexed_project))
+            try:
+                names = {
+                    r[0] for r in conn.execute(
+                        "SELECT name FROM symbols WHERE name = ?",
+                        ("modem_probe_added",),
+                    ).fetchall()
+                }
+            finally:
+                conn.close()
+            assert names == {"modem_probe_added"}, "the new declaration must be indexed"
+        finally:
+            _write_file(header, original)
+            _advance_mtime(header)
+            reindex_file_impl("src/modem.h", str(indexed_project), with_analysis=False)
+
+    def test_tu_for_header_is_deterministic(self, tmp_path: Path):
+        """Two units include the header — the lowest path in sort order wins.
+
+        Manifest order follows compile_commands.json, which a rebuild can
+        reshuffle.  A tool that re-parsed a different unit on every call
+        would give a different answer each time for no visible reason.
+        """
+        from fw_context_mcp.mcp.handlers.maintenance import _tu_for_header
+
+        manifest = {
+            "entries": [
+                {"file": "src/zeta.c", "headers": ["src/shared.h"]},
+                {"file": "src/alpha.c", "headers": ["src/shared.h"]},
+            ],
+        }
+        target = (tmp_path / "src" / "shared.h").resolve()
+
+        chosen = _tu_for_header(target, manifest, tmp_path)
+
+        assert chosen == tmp_path.resolve() / "src" / "alpha.c"
+        # Reversing the entries must not change the answer.
+        manifest["entries"].reverse()
+        assert _tu_for_header(target, manifest, tmp_path) == chosen
+
+    def test_tu_for_header_returns_none_when_nothing_includes_it(self, tmp_path: Path):
+        """No manifest, or no unit that includes the header, means no answer."""
+        from fw_context_mcp.mcp.handlers.maintenance import _tu_for_header
+
+        target = (tmp_path / "src" / "orphan.h").resolve()
+        manifest = {"entries": [{"file": "src/main.c", "headers": ["src/other.h"]}]}
+
+        assert _tu_for_header(target, None, tmp_path) is None
+        assert _tu_for_header(target, {}, tmp_path) is None
+        assert _tu_for_header(target, manifest, tmp_path) is None
 
 
 # ── direct store_symbols_for_unit tests ────────────────────────────────
