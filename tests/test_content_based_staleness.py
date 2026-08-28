@@ -20,13 +20,8 @@ from pathlib import Path
 
 import pytest
 
-from fw_context_mcp.mcp.shared.stale import (
-    _check_file_stale,
-    _content_differs,
-    _file_differs,
-    _in_racy_window,
-)
-from fw_context_mcp.utils import MTIME_TOLERANCE_S, compute_source_hash
+from fw_context_mcp.mcp.shared.stale import _content_differs, _file_differs
+from fw_context_mcp.utils import compute_source_hash
 
 
 @pytest.fixture
@@ -57,22 +52,16 @@ class TestContentDiffers:
         assert _content_differs(str(tmp_path / "absent.c"), "0" * 64) is None
 
 
-class TestRacyWindow:
-    """Git calls an entry whose stamp equals the index stamp "racily clean"."""
+class TestFileDiffers:
+    """One function decides for one file: the content, then the timestamp.
 
-    def test_an_equal_stamp_is_racy(self):
-        assert _in_racy_window(1000.0, 1000.0) is True
-
-    def test_a_stamp_inside_the_tolerance_is_racy(self):
-        assert _in_racy_window(1000.0 + MTIME_TOLERANCE_S / 2, 1000.0) is True
-
-    def test_a_stamp_well_past_the_tolerance_is_not_racy(self):
-        """Past the band the plain comparison already reports the change."""
-        assert _in_racy_window(1000.0 + MTIME_TOLERANCE_S * 10, 1000.0) is False
-
-
-class TestCheckFileStale:
-    """mtime filters, the hash decides."""
+    It used to be three in a row — _file_differs over _check_file_stale over
+    _in_racy_window.  Once the project-wide scan stopped gating on the
+    timestamp, _check_file_stale had one caller left and that caller never
+    passed it a hash, so its content branch was unreachable and the racy
+    window it consulted changed no answer at all.  The cases below are the
+    ones those three carried between them; none was dropped.
+    """
 
     def test_a_git_touch_is_not_a_change(self, source: Path):
         """The case that started this: same bytes, fresh stamp."""
@@ -80,7 +69,7 @@ class TestCheckFileStale:
         stored_hash = compute_source_hash(source)
         _touch_newer(source)
 
-        assert _check_file_stale(str(source), stored_mtime, stored_hash) is False
+        assert _file_differs(str(source), stored_mtime, stored_hash) is False
 
     def test_a_real_edit_is_a_change(self, source: Path):
         stored_mtime = os.path.getmtime(source)
@@ -88,66 +77,49 @@ class TestCheckFileStale:
         source.write_text("int modem_init(void) { return 1; }\n")
         _touch_newer(source)
 
-        assert _check_file_stale(str(source), stored_mtime, stored_hash) is True
-
-    def test_without_a_hash_the_timestamp_decides(self, source: Path):
-        """An index written before the hash existed keeps the old behaviour."""
-        stored_mtime = os.path.getmtime(source)
-        _touch_newer(source)
-
-        assert _check_file_stale(str(source), stored_mtime) is True
-
-    def test_an_unchanged_stamp_reads_nothing(self, source: Path, monkeypatch):
-        """The filter must come first, or every query would read every file."""
-        import fw_context_mcp.mcp.shared.stale as stale_mod
-
-        calls: list[str] = []
-        monkeypatch.setattr(
-            stale_mod, "compute_source_hash", lambda p: calls.append(str(p)) or ""
-        )
-
-        assert _check_file_stale(str(source), os.path.getmtime(source) + 100, "x") is False
-        assert calls == [], "an untouched file must not be read"
-
-    def test_a_missing_file_is_stale(self, tmp_path: Path):
-        assert _check_file_stale(str(tmp_path / "absent.c"), 1.0, "x") is True
-
-
-class TestFileDiffers:
-    """The per-record path asks the content first, with no timestamp gate.
-
-    A result names at most 200 files, thus the read is affordable and both
-    failure modes of the timestamp disappear at once.
-    """
-
-    def test_a_git_touch_is_not_a_change(self, source: Path):
-        stored_hash = compute_source_hash(source)
-        _touch_newer(source)
-
-        assert _file_differs(str(source), os.path.getmtime(source) - 100, stored_hash) is False
+        assert _file_differs(str(source), stored_mtime, stored_hash) is True
 
     def test_a_write_that_kept_the_old_stamp_is_caught(self, source: Path):
         """The failure mode the timestamp cannot see.
 
         `touch -r`, rsync --times and a fast write inside the tolerance band
         all leave the stamp alone.  The content check finds the change
-        anyway.
+        anyway, and it needs no gate to get there.
         """
         stored_mtime = os.path.getmtime(source)
         stored_hash = compute_source_hash(source)
         source.write_text("int modem_init(void) { return 99; }\n")
         os.utime(source, (stored_mtime, stored_mtime))  # restore the old stamp
 
-        assert _check_file_stale(str(source), stored_mtime, stored_hash) is True, (
-            "the racy window must send this to the content check"
-        )
         assert _file_differs(str(source), stored_mtime, stored_hash) is True
 
-    def test_without_a_hash_it_falls_back_to_the_timestamp(self, source: Path):
+    def test_a_backdated_file_is_caught_too(self, source: Path):
+        """The direction the old gate dropped: a stamp that moved backwards."""
+        stored_mtime = os.path.getmtime(source)
+        stored_hash = compute_source_hash(source)
+        source.write_text("int modem_init(void) { return 7; }\n")
+        os.utime(source, (stored_mtime - 3600, stored_mtime - 3600))
+
+        assert _file_differs(str(source), stored_mtime, stored_hash) is True
+
+    def test_without_a_hash_the_timestamp_decides(self, source: Path):
+        """An index written before the hash existed keeps the old behaviour."""
         stored_mtime = os.path.getmtime(source)
         _touch_newer(source)
 
-        assert _file_differs(str(source), stored_mtime, "") is True
+        assert _file_differs(str(source), stored_mtime) is True
+
+    def test_without_a_hash_an_unchanged_stamp_is_not_a_change(self, source: Path):
+        assert _file_differs(str(source), os.path.getmtime(source) + 100) is False
+
+    def test_a_missing_file_is_a_change(self, tmp_path: Path):
+        assert _file_differs(str(tmp_path / "absent.c"), 1.0, "x") is True
+
+    def test_an_unreadable_file_without_a_hash_is_not_a_change(self, tmp_path: Path):
+        """A directory stats fine and cannot be read; do not call that a change."""
+        d = tmp_path / "adir"
+        d.mkdir()
+        assert _file_differs(str(d), os.path.getmtime(d) + 100) is False
 
 
 class TestCountModifiedGate:

@@ -212,48 +212,40 @@ def _stale_files(conn, config_hash: str, file_paths: list[str], root: Path) -> l
     return stale
 
 
-def _file_differs(path: str, stored_mtime: float, stored_hash: str) -> bool:
-    """Answer by content when a hash exists, by timestamp when it does not.
+def _file_differs(path: str, stored_mtime: float, stored_hash: str = "") -> bool:
+    """Tell whether *path* no longer matches what the index holds.
 
-    THE ONE TO USE for a caller that holds a handful of files: a search
-    result, a symbol body, a file being read.  It asks the content first,
-    with no timestamp gate in front, which removes both failure modes of the
-    timestamp at once — the stamp git rewrote without changing a byte, and
-    the write that kept the old stamp.
+    The content decides whenever a hash exists.  It is the only signal that
+    survives git: ``checkout``, ``pull`` and ``stash pop`` rewrite the mtime
+    of every file they touch without regard to content, and a write that
+    lands in the same second as the index run leaves the stamp alone
+    altogether.
 
-    ``_check_file_stale`` is the other half and is NOT interchangeable: it
-    gates on the timestamp and reads the content only for a file the stamp
-    calls suspect.  That trade belongs to the caller that walks every
-    indexed file and cannot afford a hash per row.  Reaching for it on a
-    single file is what left read_file warning about a file git had only
-    touched.
+    Without a stored hash the timestamp is all there is, and only one
+    direction is readable from it: newer than the index means changed.  A
+    stamp that moved backwards cannot be told from one the index never saw,
+    and a write that kept the old stamp leaves nothing to see.  The caller
+    that scans every indexed file handles both by comparing the stamps for
+    equality first — see ``_count_modified_files``.
+
+    A missing file is a change: it was deleted since indexing.
+
+    This used to be three functions in a row.  ``_check_file_stale`` gated
+    on the timestamp and read the content only for a file the stamp called
+    suspect, and ``_in_racy_window`` widened that gate.  Once the batch path
+    stopped using them, the gate had one caller left — this one — which
+    never passed it a hash, so the branch the gate protected was
+    unreachable and the widening changed no answer at all.
     """
     differs = _content_differs(path, stored_hash)
     if differs is not None:
         return differs
-    return _check_file_stale(path, stored_mtime)
-
-
-def _in_racy_window(file_mtime: float, stored_mtime: float) -> bool:
-    """Tell whether the timestamp of a file is too close to trust.
-
-    A write that lands within ``MTIME_TOLERANCE_S`` of the index run keeps a
-    stamp that the plain comparison accepts, thus the change disappears.  The
-    same happens with ``touch -r``, with rsync ``--times``, and with any
-    editor that restores the original time.
-
-    Git calls such an entry "racily clean" and rehashes it instead of
-    trusting the stat cache.  This function marks the same set: a file whose
-    stamp sits inside the tolerance band around the stored one, in either
-    direction.
-
-    ONE caller, ``_check_file_stale``.  It used to gate the project-wide
-    scan as well, and there it was worse than useless: the band is symmetric
-    around the STORED stamp, and an unchanged file carries exactly that
-    stamp, so every unchanged file fell inside it.  See
-    ``_count_modified_files`` for the rule that replaced it.
-    """
-    return abs(file_mtime - stored_mtime) <= MTIME_TOLERANCE_S
+    try:
+        return os.path.getmtime(path) > stored_mtime + MTIME_TOLERANCE_S
+    except FileNotFoundError:
+        return True
+    except OSError:
+        return False
 
 
 def _content_differs(path: str, stored_hash: str) -> bool | None:
@@ -274,48 +266,6 @@ def _content_differs(path: str, stored_hash: str) -> bool | None:
     if not current:
         return None  # unreadable — compute_source_hash swallows the OSError
     return current != stored_hash
-
-
-def _check_file_stale(path: str, stored_mtime: float, stored_hash: str = "") -> bool:
-    """Return True when *path* no longer matches what the index holds.
-
-    The timestamp alone answers wrongly in both directions:
-
-    * Too often — git rewrites the mtime of a file it did not change.
-    * Not often enough — a write within ``MTIME_TOLERANCE_S`` of the index
-      run keeps the old stamp, and so do ``touch -r`` and rsync ``--times``.
-
-    With *stored_hash* the timestamp only raises the question and the content
-    answers it, which is what git does: its stat cache filters, and the
-    object hash decides.  Without a stored hash the behaviour is the old one,
-    thus an index written before this change still works.
-
-    FOR THE BATCH PATH ONLY.  The gate exists to keep a scan of every
-    indexed file affordable; a caller holding one file should use
-    ``_file_differs``, which skips the gate and asks the content directly.
-
-    A missing file is stale — it was deleted since indexing.
-    """
-    try:
-        file_mtime = os.path.getmtime(path)
-    except FileNotFoundError:
-        return True
-    except OSError:
-        return False
-
-    newer = file_mtime > stored_mtime + MTIME_TOLERANCE_S
-    # A stamp inside the tolerance band is not evidence of anything: the
-    # write may have landed in the same second as the index run.  Git treats
-    # such an entry as "racily clean" and rehashes it, and so does this.
-    if not newer and not _in_racy_window(file_mtime, stored_mtime):
-        return False
-
-    differs = _content_differs(path, stored_hash)
-    if differs is not None:
-        return differs
-    # No stored hash: the timestamp is all there is, and inside the band it
-    # says nothing, thus the file counts as unchanged — the old behaviour.
-    return newer
 
 
 def _count_modified_files(

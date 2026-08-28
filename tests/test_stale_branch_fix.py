@@ -391,10 +391,10 @@ class TestPurgeMissingFilesBatch:
 class TestStalenessCheck:
     """WP5 test 5 — staleness checks treat missing files as stale."""
 
-    def test_check_file_stale_missing_file(self):
-        from fw_context_mcp.mcp.shared.stale import _check_file_stale
+    def test_file_differs_missing_file(self):
+        from fw_context_mcp.mcp.shared.stale import _file_differs
 
-        result = _check_file_stale("/nonexistent/path_12345.c", 100.0)
+        result = _file_differs("/nonexistent/path_12345.c", 100.0)
         assert result is True, "Missing file must be reported as stale"
 
     def test_count_modified_files_counts_missing(self, tmp_path: Path):

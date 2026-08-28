@@ -1453,7 +1453,7 @@ class TestReindexFileImplEdgeCases:
         """
         from fw_context_mcp.indexer.db import open_db as _open_db
         from fw_context_mcp.mcp.handlers.maintenance import reindex_file_impl
-        from fw_context_mcp.mcp.shared.stale import _check_file_stale
+        from fw_context_mcp.mcp.shared.stale import _file_differs
         from fw_context_mcp.utils import compute_source_hash
 
         db_path = _db_path_for_project(indexed_project)
@@ -1487,7 +1487,7 @@ class TestReindexFileImplEdgeCases:
                 "source_hash must describe the text the index just parsed"
             )
             assert hash_after != hash_before, "the content changed, thus the hash must change"
-            assert not _check_file_stale(str(target), mtime_after, hash_after)
+            assert not _file_differs(str(target), mtime_after, hash_after)
         finally:
             _write_file(target, original)
             _advance_mtime(target)

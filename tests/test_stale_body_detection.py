@@ -255,7 +255,7 @@ class TestReadFileDecidesByContent:
     """read_file was the last path still deciding by timestamp alone.
 
     Its SELECT did not read source_hash and its check did not take one, so
-    _check_file_stale fell back to the stamp — the one signal a git checkout
+    the check fell back to the stamp — the one signal a git checkout
     rewrites without touching a byte.  Every other path had already moved to
     the content.
     """
