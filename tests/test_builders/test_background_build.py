@@ -12,6 +12,7 @@ under ``BuildConfig.isolated_build_dir``, or when it compiles nothing.
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
@@ -233,3 +234,115 @@ class TestManualDependencyFiles:
 
         assert len(targets) == 2
         assert len(set(targets)) == 2, f"the two collided: {targets}"
+
+
+class TestPlatformIOIsolatesObjectFiles:
+    """The invariant the contract actually rests on.
+
+    background_build_safe() promises that an automatic build cannot damage
+    the build of the user.  For PlatformIO that means the object files, and
+    PLATFORMIO_BUILD_DIR is what secures them — the compilation database in
+    the project root is a gitignored artifact and is left alone on purpose
+    (see the docstring of platformio.background_build_safe).
+    """
+
+    @staticmethod
+    def _run(cfg, tmp_path: Path, monkeypatch) -> list[dict]:
+        """Return the environment of every pio invocation."""
+        import fw_context_mcp.indexer.builders.platformio as mod
+
+        root = tmp_path / "proj"
+        (root / "src").mkdir(parents=True)
+        (root / "platformio.ini").write_text("[env:x]\n", encoding="utf-8")
+        envs: list[dict] = []
+
+        def fake_run(cmd, cwd=None, description="", env=None, build_cfg=None, timeout=None):
+            envs.append(dict(env or {}))
+            (root / "compile_commands.json").write_text("[]", encoding="utf-8")
+
+            class _Result:
+                returncode = 0
+                stdout = ""
+                stderr = ""
+
+            return _Result()
+
+        monkeypatch.setattr(mod, "run_build_command", fake_run)
+        monkeypatch.setattr(mod.shutil, "which", lambda n: f"/usr/bin/{n}")
+        mod.PlatformIOBuildSystem().build(root, cfg)
+        return envs
+
+    def test_an_isolated_build_redirects_every_call(self, tmp_path: Path, monkeypatch):
+        from dataclasses import replace
+
+        from fw_context_mcp.indexer.build import BuildConfig
+        from fw_context_mcp.utils import autobuild_dir
+
+        cfg = replace(BuildConfig(), isolated_build_dir=autobuild_dir(), clean=False)
+        envs = self._run(cfg, tmp_path, monkeypatch)
+
+        assert envs, "the backend must invoke pio at least once"
+        for env in envs:
+            assert env.get("PLATFORMIO_BUILD_DIR") == autobuild_dir(), (
+                "every pio call has to carry it, or one of them writes into "
+                ".pio/build while the user is building there"
+            )
+
+    def test_an_explicit_build_does_not_redirect(self, tmp_path: Path, monkeypatch):
+        from dataclasses import replace
+
+        from fw_context_mcp.indexer.build import BuildConfig
+
+        envs = self._run(replace(BuildConfig(), clean=False), tmp_path, monkeypatch)
+
+        assert envs
+        for env in envs:
+            assert "PLATFORMIO_BUILD_DIR" not in env, (
+                "the user asked for this build; it belongs in their own "
+                "output directory"
+            )
+
+
+class TestObjectPathStaysOutOfTheHashes:
+    """Why the project-root compile_commands.json rewrite costs nothing.
+
+    An isolated build differs from the build of the user in one token per
+    entry — the `.o` output path.  If that reached config_hash the two
+    builds would own two half-populated indexes; if it reached flags_hash
+    every translation unit would look changed and be reparsed.  Neither
+    happens, and these tests are what keeps it that way.
+    """
+
+    @staticmethod
+    def _entry(obj: str) -> dict:
+        return {
+            "directory": "/proj",
+            "file": "/proj/src/main.c",
+            "arguments": [
+                "cc", "-c", "/proj/src/main.c", "-o", obj,
+                "-I", "/proj/src", "-DFOO=1", "-std=c11",
+            ],
+        }
+
+    def test_the_object_path_does_not_reach_flags_hash(self):
+        from fw_context_mcp.indexer.config_hash import compute_flags_hash
+
+        user = self._entry(".pio/build/x/main.c.o")
+        isolated = self._entry(".fw-context/autobuild/default/x/main.c.o")
+
+        assert compute_flags_hash(user) == compute_flags_hash(isolated), (
+            "a differing flags_hash marks the unit changed and reparses it"
+        )
+
+    def test_the_object_path_does_not_reach_config_hash(self, tmp_path: Path):
+        from fw_context_mcp.indexer.compile_commands import parse as parse_cc
+        from fw_context_mcp.indexer.manifest import compute_config_hash
+
+        def _hash(obj: str) -> str:
+            cc = tmp_path / f"cc_{obj.count('/')}_{len(obj)}.json"
+            cc.write_text(json.dumps([self._entry(obj)]), encoding="utf-8")
+            return compute_config_hash(list(parse_cc(cc)), tmp_path, "pid")
+
+        assert _hash(".pio/build/x/main.c.o") == _hash(
+            ".fw-context/autobuild/default/x/main.c.o"
+        ), "a differing config_hash splits the index into two half-filled sets"

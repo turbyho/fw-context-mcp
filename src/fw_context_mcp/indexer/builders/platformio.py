@@ -155,10 +155,38 @@ class PlatformIOBuildSystem:
         return cc_path
 
     def background_build_safe(self, cfg: BuildConfig) -> bool:
-        """Safe — ``PLATFORMIO_BUILD_DIR`` overrides ``build_dir``.
+        """Safe — ``PLATFORMIO_BUILD_DIR`` keeps the object files apart.
 
-        The variable wins over platformio.ini, and every pio call of this
-        backend gets it, thus the artifacts stay out of ``.pio/build/``.
+        The variable wins over ``build_dir`` in platformio.ini, and every
+        pio call of this backend gets it, thus the artifacts stay out of
+        ``.pio/build/``.  That is what the contract asks for.
+
+        ``pio run -t compiledb`` ALSO rewrites
+        ``<project>/compile_commands.json``, and that cannot be redirected
+        from outside.  Three ways were checked and none exists:
+        ``COMPILATIONDB_PATH`` is a SCons construction variable that
+        ``clivars`` does not declare (builder/main.py:39-47,78), PlatformIO
+        has no project option for it, and the SCons tool takes the path from
+        the argument main.py passes.  Only an ``extra_scripts`` pre-script
+        could move it, which means editing the platformio.ini of the user.
+
+        That write is deliberately NOT repaired, and this paragraph is here
+        so nobody repairs it.  Measured over 209 entries, the file differs
+        from the one the build of the user produces in exactly one token per
+        entry — the ``.o`` output path — with no difference in -I, -D, -std,
+        -isystem or directory.  clangd does not read -o; config_hash and
+        flags_hash normalise it away (config_hash.py:_normalize_entry), so
+        alternating between an automatic and an explicit build neither
+        splits the index nor reparses one translation unit; and
+        ``fw-context init`` gitignores the file.
+
+        Both repairs that suggest themselves are worse than the write.  A
+        save/restore can leave the file missing or truncated, and on a real
+        project it is the ONLY compile_commands.json the user has — removing
+        it takes away what their clangd reads.  A generated second
+        platformio.ini works, but it has to reproduce the whole resolved
+        configuration, and getting that wrong feeds fw-context the wrong
+        flags in silence.  See plans/review_8d98343_fixes.md, finding 9.
         """
         return True
 

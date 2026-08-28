@@ -32,12 +32,24 @@ log = logging.getLogger(__name__)
 def background_build_safe(builder: BuildSystem | None, cfg) -> bool:
     """Tell whether fw-context may start a build of *builder* on its own.
 
+    The question is whether the build can DAMAGE the build of the user, not
+    whether it writes no file at all.  A backend qualifies when it keeps its
+    object files out of the directory the build of the user owns, or when it
+    compiles nothing.  fw-context cannot lock the build of an IDE, so two
+    builds sharing one output directory is the case this rule prevents.
+
+    A generated file the project already treats as build output is not a
+    violation.  ``fw-context init`` gitignores ``compile_commands.json`` for
+    exactly that reason — see ``cli/_init.py:_ensure_gitignore`` — and
+    PlatformIO rewrites it in the project root on every ``-t compiledb``.
+    The rule used to read "nothing reaches the tree of the user", which that
+    backend has never satisfied; stating an invariant the code does not hold
+    is how the next backend gets written against a promise that is not kept.
+
     A backend that does not implement ``background_build_safe`` answers no.
     The concrete classes implement the ``BuildSystem`` protocol structurally,
     not by inheritance, thus a default on the protocol would never reach
-    them, and the safe answer is the negative one: an automatic build that
-    writes to the usual directory can corrupt the build that the user runs in
-    an IDE at the same time, and fw-context cannot lock that build.
+    them, and the safe answer is the negative one.
     """
     if builder is None:
         return False
