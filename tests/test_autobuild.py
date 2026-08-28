@@ -323,3 +323,53 @@ class TestPlanAutoBuild:
         _plan_auto_build(tmp_path, db, cfg, None)
 
         assert cfg.build.isolated_build_dir is None
+
+
+class TestFailureMarkerFormat:
+    """The marker is JSON because a path may hold a newline.
+
+    It used to store the stamp and the file list as newline-delimited text.
+    A path containing a newline — a legal file name on Linux — split into
+    two entries, the list comparison never matched, and the backoff never
+    took effect: the same failing build ran on every daemon cycle.
+    """
+
+    def test_a_path_with_a_newline_still_blocks(self, tmp_path: Path):
+        from fw_context_mcp.indexer.autobuild import blocked, record_failure
+
+        sources = ["src/ok.c", "src/we\nird.c"]
+        record_failure(tmp_path, sources)
+
+        assert blocked(tmp_path, sources) is True, (
+            "the newline split the entry in two and the comparison never "
+            "matched, so nothing was ever blocked"
+        )
+
+    def test_a_different_list_is_still_allowed(self, tmp_path: Path):
+        from fw_context_mcp.indexer.autobuild import blocked, record_failure
+
+        record_failure(tmp_path, ["src/we\nird.c"])
+
+        assert blocked(tmp_path, ["src/other.c"]) is False, (
+            "a changed list means the tree moved on and earns another try"
+        )
+
+    def test_a_marker_in_the_old_text_format_does_not_block(self, tmp_path: Path):
+        """Reading as 'not blocked' is the safe direction: one more attempt."""
+        import time
+
+        from fw_context_mcp.indexer.autobuild import FAILED_MARKER, blocked
+
+        (tmp_path / FAILED_MARKER).write_text(
+            f"{time.time()}\nsrc/a.c\nsrc/b.c", encoding="utf-8"
+        )
+
+        assert blocked(tmp_path, ["src/a.c", "src/b.c"]) is False
+
+    def test_a_marker_holding_json_of_the_wrong_shape_does_not_block(self, tmp_path: Path):
+        from fw_context_mcp.indexer.autobuild import FAILED_MARKER, blocked
+
+        (tmp_path / FAILED_MARKER).write_text('{"stamp": "not a number"}',
+                                              encoding="utf-8")
+
+        assert blocked(tmp_path, ["src/a.c"]) is False

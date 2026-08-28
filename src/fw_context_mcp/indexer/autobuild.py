@@ -62,16 +62,27 @@ def blocked(db_dir: Path, new_sources: list[str]) -> bool:
     that the tree moved on, thus the next attempt is worth one more try; the
     same list within the backoff window means that nothing changed and the
     build would fail again.
+
+    JSON, not newline-delimited text.  A path may hold a newline — it is a
+    legal file name on Linux — and the split then produced two entries, the
+    comparison never matched, and the backoff this marker exists for never
+    took effect: the same failing build ran on every daemon cycle.  The
+    excluded-sources marker beside it is JSON for the same reason.
+
+    A marker in the old text format fails to parse and reads as "not
+    blocked", which is the safe direction: one more build attempt, not a
+    permanent block.
     """
-    marker = db_dir / FAILED_MARKER
     try:
-        stamp, _, recorded = marker.read_text(encoding="utf-8").partition("\n")
-        age = time.time() - float(stamp)
-    except (OSError, ValueError):
+        data = json.loads((db_dir / FAILED_MARKER).read_text(encoding="utf-8"))
+        age = time.time() - float(data["stamp"])
+        recorded = data["sources"]
+    except (OSError, ValueError, KeyError, TypeError):
+        # ValueError covers json.JSONDecodeError, which subclasses it.
         return False
     if age > BACKOFF_S:
         return False
-    return recorded.splitlines() == new_sources
+    return recorded == new_sources
 
 
 def record_failure(db_dir: Path, new_sources: list[str]) -> None:
@@ -79,7 +90,8 @@ def record_failure(db_dir: Path, new_sources: list[str]) -> None:
     try:
         db_dir.mkdir(parents=True, exist_ok=True)
         (db_dir / FAILED_MARKER).write_text(
-            f"{time.time()}\n" + "\n".join(new_sources), encoding="utf-8"
+            json.dumps({"stamp": time.time(), "sources": list(new_sources)}, indent=2),
+            encoding="utf-8",
         )
     except OSError:
         log.debug("could not write the autobuild failure marker", exc_info=True)
