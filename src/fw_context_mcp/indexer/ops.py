@@ -293,14 +293,18 @@ def _build_filtered_file_content(
     # Skip tokenization and AST walk — they're only needed for content-fill,
     # not for header collection (which only needs get_includes, already done).
     filled = 0
-    if remaining == 0 and not refresh_paths:
-        # Tokenization is what this early return saves, and the blank-out
-        # pass does not need it.  A header an edit reduced to comments must
-        # still lose its stale text on this path — it is the path a full
-        # index run takes for a translation unit it considers unchanged.
-        return _blank_out_inactive_files(
-            conn, config_hash, project_root, header_files, set(), build_dir_patterns,
-        ), headers
+    # Asked before the fast-path return, because the answer decides whether
+    # that return may be taken at all.  One indexed lookup per header and no
+    # file read — the hashes arrived with header_files above, which this
+    # function computed for the manifest either way.
+    changed_headers = _changed_header_rows(conn, config_hash, project_root, header_files)
+    if remaining == 0 and not refresh_paths and not changed_headers:
+        return 0, headers
+    # A changed header sends this parse down the full path even when every
+    # file already has content.  The blank-out pass at the end needs to know
+    # which files carried an active line, and only the tokenization below
+    # can tell it — without that set it cannot separate a header an edit
+    # emptied from one that still holds code, and it blanked both.
 
     # ── Build ifdef-filtered content for files that still need it ──
     tokens = list(tu.cursor.get_tokens())
@@ -351,6 +355,18 @@ def _build_filtered_file_content(
     # Paths this loop wrote.  The blank-out pass below must not touch them
     # again: this loop already put the current text there.
     written: set[str] = set()
+    # Every file this parse saw an active line in, whether or not the loop
+    # below writes it.  `written` cannot serve as that set: the loop also
+    # skips a file it deliberately leaves alone — one that already has text
+    # and that this parse does not own — and such a file carried active
+    # lines all the same.  The blank-out pass took the absence from
+    # `written` as "no active line" and erased the text of a header that
+    # still held code.
+    active_paths: set[str] = {
+        _normalize_file_path(path, project_root)
+        for path, lines in active.items()
+        if lines
+    }
 
     for abs_path, active_lines in active.items():
         if not active_lines:
@@ -419,7 +435,8 @@ def _build_filtered_file_content(
         written.add(db_path)
 
     filled += _blank_out_inactive_files(
-        conn, config_hash, project_root, header_files, written, build_dir_patterns,
+        conn, config_hash, project_root, changed_headers, written, active_paths,
+        build_dir_patterns,
     )
 
     if filled:
@@ -427,12 +444,56 @@ def _build_filtered_file_content(
     return filled, headers
 
 
-def _blank_out_inactive_files(
+def _changed_header_rows(
     conn,
     config_hash: str,
     project_root: Path,
     header_files: list[tuple[str, str]],
+) -> dict[str, tuple[str, str]]:
+    """Return ``{db_path: (abs_path, current_hash)}`` for headers gone stale.
+
+    A header qualifies when the index holds text for it AND a ``source_hash``
+    that disagrees with the file on disk.  Without a stored hash there is
+    nothing to compare, and rewriting on that basis alone would touch every
+    header on every parse.  Without stored text there is nothing that could
+    be serving a stale answer — the content loop owns the fill for those.
+
+    One indexed lookup per header and no file read: the current hash arrived
+    with *header_files*, which ``_build_filtered_file_content`` computes for
+    the manifest on every path, including the fast one.
+
+    The absolute path rides along because the blank-out pass has to read the
+    file: rebuilding it from *db_path* would depend on whether *project_root*
+    arrived resolved, and _normalize_file_path resolves before it compares.
+    The path that produced the key is the one that opens the file.
+
+    Two callers, one question: the fast-path return may not be taken while
+    this is non-empty, and the blank-out pass works from it.  Asking twice
+    would read the same rows twice.
+    """
+    changed: dict[str, tuple[str, str]] = {}
+    for header_path, current_hash in header_files:
+        db_path = _normalize_file_path(header_path, project_root)
+        row = conn.execute(
+            "SELECT content, source_hash FROM files WHERE config_hash=? AND path=?",
+            (config_hash, db_path),
+        ).fetchone()
+        if row is None or not row[0]:
+            continue
+        stored_hash = row[1]
+        if not stored_hash or stored_hash == current_hash:
+            continue
+        changed[db_path] = (header_path, current_hash)
+    return changed
+
+
+def _blank_out_inactive_files(
+    conn,
+    config_hash: str,
+    project_root: Path,
+    changed_headers: dict[str, tuple[str, str]],
     written: set[str],
+    active_paths: set[str],
     build_dir_patterns: list[str] | None,
 ) -> int:
     """Refresh a header the parse read that produced no active line.
@@ -452,32 +513,29 @@ def _blank_out_inactive_files(
     ``remaining`` count and to the loop's own skip test, so the file would
     be re-read on every parse for ever.
 
-    Only a header whose stored hash disagrees with the file is touched.  An
-    unchanged one costs one indexed lookup and no file read, which is what
-    keeps this affordable — a large project reaches tens of headers per
-    translation unit.
+    TWO exclusions, and both are necessary:
+
+    * *written* — the content loop already put the current text there.
+    * *active_paths* — this parse saw an active line in the file, thus it
+      is not a header that produced none, whatever the loop then did with
+      it.  This is the check the function used to lack: it took the absence
+      of a path from *written* as proof of no active line, and the loop
+      leaves a file out of *written* for a second reason — it already has
+      text and this parse does not own it.  A header that changed on disk
+      and still held code was blanked, and the blank was not recoverable:
+      it is not the empty string, so the fill test on the next parse skips
+      the file for ever.
+
+    *changed_headers* already holds only headers whose stored hash
+    disagrees with the file, so an unchanged one costs nothing here.
     """
     # Local, like the one in _build_filtered_file_content: manifest imports
     # from this module, thus a module-level import would close a cycle.
     from fw_context_mcp.indexer.manifest import _is_generated_header
 
     refreshed = 0
-    for header_path, current_hash in header_files:
-        db_path = _normalize_file_path(header_path, project_root)
-        if db_path in written:
-            continue
-        row = conn.execute(
-            "SELECT content, source_hash FROM files WHERE config_hash=? AND path=?",
-            (config_hash, db_path),
-        ).fetchone()
-        # No row, or no stored text: nothing that could be serving stale
-        # content.  The main loop owns the fill for those.
-        if row is None or not row[0]:
-            continue
-        stored_hash = row[1]
-        # Without a stored hash there is nothing to compare, and rewriting
-        # on that basis alone would blank out every header on every parse.
-        if not stored_hash or stored_hash == current_hash:
+    for db_path, (header_path, current_hash) in changed_headers.items():
+        if db_path in written or db_path in active_paths:
             continue
 
         resolved = Path(header_path)

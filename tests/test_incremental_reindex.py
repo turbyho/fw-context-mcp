@@ -16,6 +16,7 @@ Run::
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import subprocess
@@ -394,6 +395,101 @@ class TestContentHashHelpers:
         assert h1 != h2
 
 
+class TestChangedHeaderRows:
+    """Which headers the pipeline considers stale enough to touch."""
+
+    @staticmethod
+    def _db(tmp_path: Path):
+        from fw_context_mcp.indexer.db import (
+            open_db,
+            transaction,
+            upsert_build_config,
+            upsert_file,
+            upsert_project,
+        )
+        from fw_context_mcp.utils import compute_source_hash
+
+        root = tmp_path / "proj"
+        (root / "src").mkdir(parents=True)
+        hdr = root / "src" / "api.h"
+        hdr.write_text("#pragma once\nint kept(void);\n", encoding="utf-8")
+
+        conn = open_db(tmp_path / "index.db")
+        with transaction(conn):
+            upsert_project(conn, "pid", "p", str(root))
+            upsert_build_config(conn, "ch", "pid", str(root / "compile_commands.json"))
+            upsert_file(conn, "ch", "src/api.h", "c", mtime=1.0,
+                        source_hash=compute_source_hash(hdr))
+            conn.execute(
+                "UPDATE files SET content=? WHERE config_hash='ch' AND path='src/api.h'",
+                ("int kept(void);\n",),
+            )
+        return conn, root, hdr
+
+    def test_an_unchanged_header_is_not_listed(self, tmp_path: Path):
+        from fw_context_mcp.indexer.ops import _changed_header_rows
+        from fw_context_mcp.utils import compute_source_hash
+
+        conn, root, hdr = self._db(tmp_path)
+        try:
+            rows = _changed_header_rows(
+                conn, "ch", root, [(str(hdr), compute_source_hash(hdr))]
+            )
+        finally:
+            conn.close()
+        assert rows == {}
+
+    def test_a_changed_header_is_listed_with_its_path(self, tmp_path: Path):
+        from fw_context_mcp.indexer.ops import _changed_header_rows
+        from fw_context_mcp.utils import compute_source_hash
+
+        conn, root, hdr = self._db(tmp_path)
+        hdr.write_text("#pragma once\nint other(void);\n", encoding="utf-8")
+        digest = compute_source_hash(hdr)
+        try:
+            rows = _changed_header_rows(conn, "ch", root, [(str(hdr), digest)])
+        finally:
+            conn.close()
+        assert rows == {"src/api.h": (str(hdr), digest)}, (
+            "the absolute path rides along so the blank-out pass need not "
+            "rebuild it from the key"
+        )
+
+    def test_a_header_with_no_stored_hash_is_not_listed(self, tmp_path: Path):
+        from fw_context_mcp.indexer.db import transaction
+        from fw_context_mcp.indexer.ops import _changed_header_rows
+        from fw_context_mcp.utils import compute_source_hash
+
+        conn, root, hdr = self._db(tmp_path)
+        try:
+            with transaction(conn):
+                conn.execute("UPDATE files SET source_hash='' WHERE config_hash='ch'")
+            hdr.write_text("#pragma once\n/* nothing */\n", encoding="utf-8")
+            rows = _changed_header_rows(
+                conn, "ch", root, [(str(hdr), compute_source_hash(hdr))]
+            )
+        finally:
+            conn.close()
+        assert rows == {}, "nothing to compare against — see the docstring"
+
+    def test_a_header_with_no_stored_content_is_not_listed(self, tmp_path: Path):
+        from fw_context_mcp.indexer.db import transaction
+        from fw_context_mcp.indexer.ops import _changed_header_rows
+        from fw_context_mcp.utils import compute_source_hash
+
+        conn, root, hdr = self._db(tmp_path)
+        try:
+            with transaction(conn):
+                conn.execute("UPDATE files SET content='' WHERE config_hash='ch'")
+            hdr.write_text("#pragma once\n/* nothing */\n", encoding="utf-8")
+            rows = _changed_header_rows(
+                conn, "ch", root, [(str(hdr), compute_source_hash(hdr))]
+            )
+        finally:
+            conn.close()
+        assert rows == {}, "the content loop owns the fill for an empty column"
+
+
 class TestBlankOutInactiveFiles:
     """A header the parse read that produced no active line.
 
@@ -442,10 +538,18 @@ class TestBlankOutInactiveFiles:
             conn.close()
         return root, db_path, changed, unchanged
 
+    @staticmethod
+    def _changed(conn, root: Path, *headers: Path) -> dict:
+        from fw_context_mcp.indexer.ops import _changed_header_rows
+        from fw_context_mcp.utils import compute_source_hash
+
+        return _changed_header_rows(
+            conn, "ch", root, [(str(h), compute_source_hash(h)) for h in headers]
+        )
+
     def test_a_changed_header_loses_its_stale_text(self, tmp_path: Path):
         from fw_context_mcp.indexer.db import open_db, transaction
         from fw_context_mcp.indexer.ops import _blank_out_inactive_files
-        from fw_context_mcp.utils import compute_source_hash
 
         root, db_path, changed, unchanged = self._project(tmp_path)
         # The edit: everything a parse could see is gone.
@@ -453,14 +557,12 @@ class TestBlankOutInactiveFiles:
 
         conn = open_db(db_path)
         try:
+            rows = self._changed(conn, root, changed, unchanged)
             with transaction(conn):
                 count = _blank_out_inactive_files(
-                    conn, "ch", root,
-                    [(str(changed), compute_source_hash(changed)),
-                     (str(unchanged), compute_source_hash(unchanged))],
-                    set(), None,
+                    conn, "ch", root, rows, set(), set(), None,
                 )
-            rows = {
+            stored = {
                 r["path"]: r["content"]
                 for r in conn.execute(
                     "SELECT path, content FROM files WHERE config_hash='ch'"
@@ -470,29 +572,64 @@ class TestBlankOutInactiveFiles:
             conn.close()
 
         assert count == 1, "only the changed header may be touched"
-        assert rows["src/changed.h"] == "\n\n", (
+        assert stored["src/changed.h"] == "\n\n", (
             "the filter keeps line numbers and blanks inactive lines; here "
             'every line is inactive, and "" would read as "not filled yet"'
         )
-        assert rows["src/unchanged.h"] == "int kept(void);\n", (
+        assert stored["src/unchanged.h"] == "int kept(void);\n", (
             "a header whose hash still matches must not be rewritten"
+        )
+
+    def test_a_changed_header_with_active_code_is_left_alone(self, tmp_path: Path):
+        """The regression this pass was blanking.
+
+        A header can change AND still hold code.  The parse then sees active
+        lines in it, and the content loop may still skip it — it already has
+        text and this parse does not own it.  Absence from *written* is
+        therefore no proof of "no active line", and taking it as proof
+        erased the text of a header that was perfectly fine.
+        """
+        from fw_context_mcp.indexer.db import open_db, transaction
+        from fw_context_mcp.indexer.ops import _blank_out_inactive_files
+
+        root, db_path, changed, _ = self._project(tmp_path)
+        # The edit: a REAL code change — a declaration is added.
+        changed.write_text(
+            "#pragma once\nint gone(void);\nint added(void);\n", encoding="utf-8"
+        )
+
+        conn = open_db(db_path)
+        try:
+            rows = self._changed(conn, root, changed)
+            with transaction(conn):
+                count = _blank_out_inactive_files(
+                    conn, "ch", root, rows, set(), {"src/changed.h"}, None,
+                )
+            content = conn.execute(
+                "SELECT content FROM files WHERE config_hash='ch' AND path='src/changed.h'"
+            ).fetchone()[0]
+        finally:
+            conn.close()
+
+        assert count == 0
+        assert content == "int gone(void);\n", (
+            "a file the parse saw an active line in is not a header that "
+            "produced none, whatever the content loop then did with it"
         )
 
     def test_a_path_the_content_loop_wrote_is_left_alone(self, tmp_path: Path):
         from fw_context_mcp.indexer.db import open_db, transaction
         from fw_context_mcp.indexer.ops import _blank_out_inactive_files
-        from fw_context_mcp.utils import compute_source_hash
 
         root, db_path, changed, _ = self._project(tmp_path)
         changed.write_text("#pragma once\n/* nothing left */\n", encoding="utf-8")
 
         conn = open_db(db_path)
         try:
+            rows = self._changed(conn, root, changed)
             with transaction(conn):
                 count = _blank_out_inactive_files(
-                    conn, "ch", root,
-                    [(str(changed), compute_source_hash(changed))],
-                    {"src/changed.h"}, None,
+                    conn, "ch", root, rows, {"src/changed.h"}, set(), None,
                 )
             content = conn.execute(
                 "SELECT content FROM files WHERE config_hash='ch' AND path='src/changed.h'"
@@ -513,7 +650,6 @@ class TestBlankOutInactiveFiles:
         """
         from fw_context_mcp.indexer.db import open_db, transaction
         from fw_context_mcp.indexer.ops import _blank_out_inactive_files
-        from fw_context_mcp.utils import compute_source_hash
 
         root, db_path, changed, _ = self._project(tmp_path)
         conn = open_db(db_path)
@@ -523,11 +659,10 @@ class TestBlankOutInactiveFiles:
                     "UPDATE files SET source_hash='' WHERE config_hash='ch'"
                 )
             changed.write_text("#pragma once\n/* nothing left */\n", encoding="utf-8")
+            rows = self._changed(conn, root, changed)
             with transaction(conn):
                 count = _blank_out_inactive_files(
-                    conn, "ch", root,
-                    [(str(changed), compute_source_hash(changed))],
-                    set(), None,
+                    conn, "ch", root, rows, set(), set(), None,
                 )
             content = conn.execute(
                 "SELECT content FROM files WHERE config_hash='ch' AND path='src/changed.h'"
@@ -540,6 +675,97 @@ class TestBlankOutInactiveFiles:
 
 
 # ── functional tests: full indexing + reindex flow ────────────────────
+
+
+@pytest.mark.libclang
+class TestActivePathsFromRealParse:
+    """_build_filtered_file_content must tell the blank-out pass the truth.
+
+    The unit tests above hand *active_paths* in.  This one makes libclang
+    produce it, because the defect was not in the blank-out pass alone — it
+    was that nothing computed the set the pass needed, so the pass inferred
+    it from `written` and inferred it wrong.
+    """
+
+    def test_a_changed_header_with_code_keeps_its_content(self, tmp_path: Path):
+        from fw_context_mcp.indexer.compile_commands import parse as parse_cc
+        from fw_context_mcp.indexer.db import (
+            open_db,
+            transaction,
+            upsert_build_config,
+            upsert_file,
+            upsert_project,
+        )
+        from fw_context_mcp.indexer.ops import _build_filtered_file_content
+        from fw_context_mcp.utils import compute_source_hash
+
+        root = tmp_path / "proj"
+        (root / "src").mkdir(parents=True)
+        hdr = root / "src" / "api.h"
+        src = root / "src" / "main.c"
+        hdr.write_text("#pragma once\nint kept(void);\n", encoding="utf-8")
+        src.write_text('#include "api.h"\nint main(void) { return kept(); }\n',
+                       encoding="utf-8")
+        cc = root / "compile_commands.json"
+        cc.write_text(json.dumps([{
+            "directory": str(root),
+            "file": str(src),
+            "arguments": ["cc", "-c", str(src), "-I", str(root / "src")],
+        }]), encoding="utf-8")
+
+        db_path = tmp_path / "index.db"
+        conn = open_db(db_path)
+        try:
+            with transaction(conn):
+                upsert_project(conn, "pid", "p", str(root))
+                upsert_build_config(conn, "ch", "pid", str(cc))
+                # The rows exist before the content pass runs, which is the
+                # order store_symbols_for_unit uses: _store_symbol_rows
+                # creates them, then the content fill writes into them.
+                # Without them `remaining` is 0 and the fast path returns
+                # before the loop this test is about.
+                upsert_file(conn, "ch", "src/main.c", "c", mtime=1.0)
+                upsert_file(conn, "ch", "src/api.h", "c", mtime=1.0)
+
+            unit = next(iter(parse_cc(cc)))
+            # First pass fills the content of both files.
+            with transaction(conn):
+                _build_filtered_file_content(conn, unit, "ch", root)
+
+            before = conn.execute(
+                "SELECT content FROM files WHERE config_hash='ch' AND path='src/api.h'"
+            ).fetchone()[0]
+            assert "kept" in before, "the first pass must store the header text"
+
+            # _store_symbol_rows writes source_hash for every file it sees;
+            # the content loop does not.  Without it _changed_header_rows has
+            # nothing to compare and the case never arises.
+            with transaction(conn):
+                conn.execute(
+                    "UPDATE files SET source_hash=? WHERE config_hash='ch' AND path='src/api.h'",
+                    (compute_source_hash(hdr),),
+                )
+
+            # The edit: real code changes, and the header still holds code.
+            hdr.write_text(
+                "#pragma once\nint kept(void);\nint added(void);\n", encoding="utf-8"
+            )
+            unit = next(iter(parse_cc(cc)))
+            with transaction(conn):
+                _build_filtered_file_content(conn, unit, "ch", root)
+
+            after = conn.execute(
+                "SELECT content FROM files WHERE config_hash='ch' AND path='src/api.h'"
+            ).fetchone()[0]
+        finally:
+            conn.close()
+
+        assert after.strip(), (
+            "the header still holds code, thus it must not be blanked — this "
+            "is the path where nothing handed active_paths in"
+        )
+        assert "kept" in after
+
 
 
 @pytest.mark.libclang
