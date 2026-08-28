@@ -567,8 +567,16 @@ def _store_symbol_rows(
             # The hash goes in for every file, not only for a translation
             # unit.  The staleness check uses it to tell a real change from a
             # file that git only rewrote, and a header is what git rewrites
-            # most.  One digest per file costs about 24 ms over a project of
-            # 1900 files, against an index run of tens of minutes.
+            # most.
+            #
+            # The cost is per (TU, file) pair, NOT per file: file_id_cache is
+            # built fresh for every translation unit, and compute_source_hash
+            # has no cache of its own.  A header that 200 units include is
+            # read 200 times.  Measured on zbox-ecb-fw: 1,037 unique headers
+            # but 86,686 references, an amplification of 84x.  It still costs
+            # only about 1 s over a whole index run, because the files are
+            # small and the page cache serves the repeats — the amplification
+            # is what matters to anyone sizing a change here, not the 1 s.
             file_id_cache[normalized_sym_file] = upsert_file(
                 conn, config_hash, normalized_sym_file, lang,
                 generated=_is_generated_header(normalized_sym_file, build_dir_patterns),
@@ -920,6 +928,10 @@ def _store_macros_for_unit(
                 m_mtime = Path(m_raw).stat().st_mtime
             except OSError:
                 pass
+            # source_hash for the same reason as in _store_symbol_rows: a
+            # file whose mtime moves must carry the hash of the text that
+            # moved it, or the staleness check reports it as changed for
+            # ever.  Same per-(TU, file) cost as there.
             file_id_cache[m_path] = upsert_file(
                 conn, config_hash, m_path, lang, mtime=m_mtime,
                 source_hash=compute_source_hash(Path(m_raw)),
