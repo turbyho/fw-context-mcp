@@ -394,6 +394,151 @@ class TestContentHashHelpers:
         assert h1 != h2
 
 
+class TestBlankOutInactiveFiles:
+    """A header the parse read that produced no active line.
+
+    ``active`` in _build_filtered_file_content holds only files that carry a
+    token or a cursor extent, and its loop skips an entry whose line set is
+    empty.  A header reduced to comments and pragmas reaches neither, thus
+    the loop cannot refresh it and files.content kept the text from before
+    the edit.
+    """
+
+    @staticmethod
+    def _project(tmp_path: Path) -> tuple[Path, Path, Path, Path]:
+        """Return (root, db_path, changed_header, unchanged_header)."""
+        from fw_context_mcp.indexer.db import (
+            open_db,
+            transaction,
+            upsert_build_config,
+            upsert_file,
+            upsert_project,
+        )
+        from fw_context_mcp.utils import compute_source_hash
+
+        root = tmp_path / "proj"
+        (root / "src").mkdir(parents=True)
+        changed = root / "src" / "changed.h"
+        unchanged = root / "src" / "unchanged.h"
+        changed.write_text("#pragma once\nint gone(void);\n", encoding="utf-8")
+        unchanged.write_text("#pragma once\nint kept(void);\n", encoding="utf-8")
+
+        db_path = tmp_path / "index.db"
+        conn = open_db(db_path)
+        try:
+            with transaction(conn):
+                upsert_project(conn, "pid", "p", str(root))
+                upsert_build_config(conn, "ch", "pid", str(root / "compile_commands.json"))
+                for path, text in ((changed, "int gone(void);\n"),
+                                   (unchanged, "int kept(void);\n")):
+                    rel = f"src/{path.name}"
+                    upsert_file(conn, "ch", rel, "c", mtime=1.0,
+                                source_hash=compute_source_hash(path))
+                    conn.execute(
+                        "UPDATE files SET content=? WHERE config_hash='ch' AND path=?",
+                        (text, rel),
+                    )
+        finally:
+            conn.close()
+        return root, db_path, changed, unchanged
+
+    def test_a_changed_header_loses_its_stale_text(self, tmp_path: Path):
+        from fw_context_mcp.indexer.db import open_db, transaction
+        from fw_context_mcp.indexer.ops import _blank_out_inactive_files
+        from fw_context_mcp.utils import compute_source_hash
+
+        root, db_path, changed, unchanged = self._project(tmp_path)
+        # The edit: everything a parse could see is gone.
+        changed.write_text("#pragma once\n/* nothing left */\n", encoding="utf-8")
+
+        conn = open_db(db_path)
+        try:
+            with transaction(conn):
+                count = _blank_out_inactive_files(
+                    conn, "ch", root,
+                    [(str(changed), compute_source_hash(changed)),
+                     (str(unchanged), compute_source_hash(unchanged))],
+                    set(), None,
+                )
+            rows = {
+                r["path"]: r["content"]
+                for r in conn.execute(
+                    "SELECT path, content FROM files WHERE config_hash='ch'"
+                ).fetchall()
+            }
+        finally:
+            conn.close()
+
+        assert count == 1, "only the changed header may be touched"
+        assert rows["src/changed.h"] == "\n\n", (
+            "the filter keeps line numbers and blanks inactive lines; here "
+            'every line is inactive, and "" would read as "not filled yet"'
+        )
+        assert rows["src/unchanged.h"] == "int kept(void);\n", (
+            "a header whose hash still matches must not be rewritten"
+        )
+
+    def test_a_path_the_content_loop_wrote_is_left_alone(self, tmp_path: Path):
+        from fw_context_mcp.indexer.db import open_db, transaction
+        from fw_context_mcp.indexer.ops import _blank_out_inactive_files
+        from fw_context_mcp.utils import compute_source_hash
+
+        root, db_path, changed, _ = self._project(tmp_path)
+        changed.write_text("#pragma once\n/* nothing left */\n", encoding="utf-8")
+
+        conn = open_db(db_path)
+        try:
+            with transaction(conn):
+                count = _blank_out_inactive_files(
+                    conn, "ch", root,
+                    [(str(changed), compute_source_hash(changed))],
+                    {"src/changed.h"}, None,
+                )
+            content = conn.execute(
+                "SELECT content FROM files WHERE config_hash='ch' AND path='src/changed.h'"
+            ).fetchone()[0]
+        finally:
+            conn.close()
+
+        assert count == 0
+        assert content == "int gone(void);\n", (
+            "the content loop already put the current text there"
+        )
+
+    def test_a_header_with_no_stored_hash_is_left_alone(self, tmp_path: Path):
+        """Without a stored hash there is nothing to compare against.
+
+        An index written before source_hash was filled for every file would
+        otherwise have every header blanked on the next parse.
+        """
+        from fw_context_mcp.indexer.db import open_db, transaction
+        from fw_context_mcp.indexer.ops import _blank_out_inactive_files
+        from fw_context_mcp.utils import compute_source_hash
+
+        root, db_path, changed, _ = self._project(tmp_path)
+        conn = open_db(db_path)
+        try:
+            with transaction(conn):
+                conn.execute(
+                    "UPDATE files SET source_hash='' WHERE config_hash='ch'"
+                )
+            changed.write_text("#pragma once\n/* nothing left */\n", encoding="utf-8")
+            with transaction(conn):
+                count = _blank_out_inactive_files(
+                    conn, "ch", root,
+                    [(str(changed), compute_source_hash(changed))],
+                    set(), None,
+                )
+            content = conn.execute(
+                "SELECT content FROM files WHERE config_hash='ch' AND path='src/changed.h'"
+            ).fetchone()[0]
+        finally:
+            conn.close()
+
+        assert count == 0
+        assert content == "int gone(void);\n"
+
+
 # ── functional tests: full indexing + reindex flow ────────────────────
 
 
@@ -1197,6 +1342,60 @@ class TestReindexFileImplEdgeCases:
         # Reversing the entries must not change the answer.
         manifest["entries"].reverse()
         assert _tu_for_header(target, manifest, tmp_path) == chosen
+
+    def test_header_reduced_to_comments_stops_serving_its_old_text(
+        self, indexed_project: Path
+    ):
+        """An emptied header must not keep answering with what it used to hold.
+
+        The header contributes no token and no cursor after the edit, thus
+        it never enters ``active`` and the content loop cannot reach it.
+        Measured before the fix: read_file returned the declarations and
+        search_content still matched a name the file no longer carried.
+        """
+        from fw_context_mcp.indexer.db import open_db as _open_db
+        from fw_context_mcp.mcp.handlers.maintenance import reindex_file_impl
+        from fw_context_mcp.utils import compute_source_hash
+
+        header = indexed_project / "src" / "utils.h"
+        original = header.read_text(encoding="utf-8")
+
+        def stored() -> tuple[str, str]:
+            conn = _open_db(_db_path_for_project(indexed_project))
+            try:
+                row = conn.execute(
+                    "SELECT content, source_hash FROM files WHERE path LIKE ?",
+                    ("%utils.h",),
+                ).fetchone()
+            finally:
+                conn.close()
+            assert row is not None, "utils.h missing from the files table"
+            return row["content"] or "", row["source_hash"]
+
+        assert "compute_checksum" in stored()[0], "precondition: the old text is stored"
+
+        try:
+            _write_file(header, "#pragma once\n/* every declaration is gone */\n")
+            _advance_mtime(header)
+
+            result = reindex_file_impl("src/utils.c", str(indexed_project),
+                                       with_analysis=False)
+            assert "error" not in result, f"reindex failed: {result.get('error')}"
+
+            content, source_hash = stored()
+            assert "compute_checksum" not in content, (
+                "the declaration left the file, thus read_file must stop serving it"
+            )
+            assert content == "\n" * len(content), (
+                f"every line is inactive, thus every line blanks out: {content!r}"
+            )
+            assert source_hash == compute_source_hash(header), (
+                "content and source_hash have to move together"
+            )
+        finally:
+            _write_file(header, original)
+            _advance_mtime(header)
+            reindex_file_impl("src/utils.c", str(indexed_project), with_analysis=False)
 
     def test_tu_for_header_returns_none_when_nothing_includes_it(self, tmp_path: Path):
         """No manifest, or no unit that includes the header, means no answer."""

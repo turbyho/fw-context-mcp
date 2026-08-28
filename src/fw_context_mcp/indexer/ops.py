@@ -262,6 +262,12 @@ def _build_filtered_file_content(
     # ── Collect included header paths + SHA-256 hashes (always needed for manifest) ──
     headers: list[dict] = []
     seen_headers: set[str] = set()
+    # (resolved absolute path, content hash) for every header this parse
+    # read.  The blank-out pass at the end of this function needs both: the
+    # absolute path to read the file and to key the files row, and the hash
+    # to tell a changed header from an unchanged one.  `headers` alone
+    # cannot serve it — it stores the project-relative spelling.
+    header_files: list[tuple[str, str]] = []
 
     for inc in tu.get_includes():
         abs_path = str(inc.include.name)
@@ -281,13 +287,20 @@ def _build_filtered_file_content(
         h = compute_source_hash(resolved)
         generated = _is_generated_header(rel, build_dir_patterns)
         headers.append({"path": rel, "hash": h, "generated": generated})
+        header_files.append((str(resolved), h))
 
     # ── Fast-path return: all files already have filtered content ──
     # Skip tokenization and AST walk — they're only needed for content-fill,
     # not for header collection (which only needs get_includes, already done).
     filled = 0
     if remaining == 0 and not refresh_paths:
-        return 0, headers
+        # Tokenization is what this early return saves, and the blank-out
+        # pass does not need it.  A header an edit reduced to comments must
+        # still lose its stale text on this path — it is the path a full
+        # index run takes for a translation unit it considers unchanged.
+        return _blank_out_inactive_files(
+            conn, config_hash, project_root, header_files, set(), build_dir_patterns,
+        ), headers
 
     # ── Build ifdef-filtered content for files that still need it ──
     tokens = list(tu.cursor.get_tokens())
@@ -334,6 +347,10 @@ def _build_filtered_file_content(
                         active.setdefault(fname, set()).add(line)
 
     _collect_all_active_lines(tu.cursor)
+
+    # Paths this loop wrote.  The blank-out pass below must not touch them
+    # again: this loop already put the current text there.
+    written: set[str] = set()
 
     for abs_path, active_lines in active.items():
         if not active_lines:
@@ -399,10 +416,96 @@ def _build_filtered_file_content(
             ),
         )
         filled += 1
+        written.add(db_path)
+
+    filled += _blank_out_inactive_files(
+        conn, config_hash, project_root, header_files, written, build_dir_patterns,
+    )
 
     if filled:
         log.info("content fill: %d files from TU %s in %.1fs", filled, unit.file.name, _time.monotonic() - _t0)
     return filled, headers
+
+
+def _blank_out_inactive_files(
+    conn,
+    config_hash: str,
+    project_root: Path,
+    header_files: list[tuple[str, str]],
+    written: set[str],
+    build_dir_patterns: list[str] | None,
+) -> int:
+    """Refresh a header the parse read that produced no active line.
+
+    ``active`` holds only files that carry a token or a cursor extent, and
+    the content loop skips an entry whose line set is empty.  A header with
+    nothing to parse reaches neither: an empty one, or one an edit reduced
+    to comments, pragmas and include guards.  Measured before this pass
+    existed, files.content then kept the text from BEFORE the edit,
+    read_file served that text, and search_content still matched words the
+    file no longer held.
+
+    The right text is the all-blank form.  The filter keeps line numbers
+    and blanks every inactive line; here every line is inactive, thus the
+    content becomes one newline per line of the file.  Storing "" instead
+    would be wrong: an empty content column means "not filled yet" to the
+    ``remaining`` count and to the loop's own skip test, so the file would
+    be re-read on every parse for ever.
+
+    Only a header whose stored hash disagrees with the file is touched.  An
+    unchanged one costs one indexed lookup and no file read, which is what
+    keeps this affordable — a large project reaches tens of headers per
+    translation unit.
+    """
+    # Local, like the one in _build_filtered_file_content: manifest imports
+    # from this module, thus a module-level import would close a cycle.
+    from fw_context_mcp.indexer.manifest import _is_generated_header
+
+    refreshed = 0
+    for header_path, current_hash in header_files:
+        db_path = _normalize_file_path(header_path, project_root)
+        if db_path in written:
+            continue
+        row = conn.execute(
+            "SELECT content, source_hash FROM files WHERE config_hash=? AND path=?",
+            (config_hash, db_path),
+        ).fetchone()
+        # No row, or no stored text: nothing that could be serving stale
+        # content.  The main loop owns the fill for those.
+        if row is None or not row[0]:
+            continue
+        stored_hash = row[1]
+        # Without a stored hash there is nothing to compare, and rewriting
+        # on that basis alone would blank out every header on every parse.
+        if not stored_hash or stored_hash == current_hash:
+            continue
+
+        resolved = Path(header_path)
+        try:
+            with open(resolved, encoding="utf-8", errors="replace") as handle:
+                line_count = sum(1 for _ in handle)
+            file_mtime = resolved.stat().st_mtime
+        except OSError:
+            continue
+        if not line_count:
+            continue
+
+        lang = "cpp" if db_path.endswith((".cpp", ".cc", ".cxx", ".hpp", ".hxx")) else "c"
+        conn.execute(
+            "INSERT INTO files (config_hash, path, language, content, mtime, generated, source_hash) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT (config_hash, path) DO UPDATE SET "
+            "content = excluded.content, mtime = MAX(files.mtime, excluded.mtime), "
+            "generated = MAX(files.generated, excluded.generated), "
+            "source_hash = excluded.source_hash",
+            (
+                config_hash, db_path, lang, "\n" * line_count, file_mtime,
+                int(_is_generated_header(db_path, build_dir_patterns)),
+                current_hash,
+            ),
+        )
+        refreshed += 1
+    return refreshed
 
 
 def _store_symbol_rows(
