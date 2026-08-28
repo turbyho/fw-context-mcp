@@ -213,3 +213,73 @@ class TestSentinelBypass:
             from fw_context_mcp.mcp.handlers.maintenance import reset_index
 
             reset_index(project_root=str(root))
+
+
+# ── Modified files in fast mode ────────────────────────────────────
+
+
+class TestModifiedCountInFastMode:
+    """``fast=True`` must still count the files that changed on disk.
+
+    Before this, fast mode returned 0 unconditionally, thus the tool said
+    "fully up to date" while the search tools warned about the same file.
+    The caller then had two contradictory readings and no rule to pick one.
+    """
+
+    @staticmethod
+    def _project_with_one_indexed_file(tmp_path: Path) -> tuple[Path, Path]:
+        """Return (root, source) for a project whose index knows *source*."""
+        from fw_context_mcp.indexer.db import open_db, transaction, upsert_file
+        from fw_context_mcp.utils import compute_source_hash
+
+        pid = generate_project_id()
+        root = _make_project_root(tmp_path, project_id=pid)
+        db_path = _load_cfg(root).index.db_dir / pid / "index.db"
+        _create_index_db(db_path, pid, root)
+
+        source = root / "main.c"
+        source.write_text("int main(void) { return 0; }\n", encoding="utf-8")
+
+        conn = open_db(db_path)
+        try:
+            with transaction(conn):
+                upsert_file(
+                    conn,
+                    "hash-test",
+                    str(source),
+                    "c",
+                    mtime=source.stat().st_mtime,
+                    source_hash=compute_source_hash(source),
+                )
+        finally:
+            conn.close()
+        return root, source
+
+    def test_unchanged_file_is_not_counted(self, tmp_path: Path):
+        root, _ = self._project_with_one_indexed_file(tmp_path)
+
+        result = get_active_build(project_root=str(root))
+
+        assert result["status"] == "ready"
+        assert result["modified_files_count"] == 0
+        assert "fully up to date" in result["index_message"]
+
+    def test_changed_file_is_counted_in_fast_mode(self, tmp_path: Path):
+        import os
+
+        root, source = self._project_with_one_indexed_file(tmp_path)
+        source.write_text("int main(void) { return 42; }\n", encoding="utf-8")
+        # Move the stamp well past the index, out of the racy window, so the
+        # hash — not the tolerance — is what makes the decision.
+        stamp = os.path.getmtime(source) + 200
+        os.utime(source, (stamp, stamp))
+
+        fast = get_active_build(project_root=str(root))
+        slow = get_active_build(project_root=str(root), fast=False)
+
+        assert fast["modified_files_count"] == 1
+        assert slow["modified_files_count"] == 1
+        # The index still answers every query, thus the status stays "ready".
+        assert fast["status"] == "ready"
+        assert "fully up to date" not in fast["index_message"]
+        assert "1 file(s) changed" in fast["index_message"]

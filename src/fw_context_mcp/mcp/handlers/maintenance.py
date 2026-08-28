@@ -229,9 +229,9 @@ def get_active_build(
         str | None, Field(description="Project root directory. Auto-detected from CWD if omitted.")
     ] = None,
     fast: Annotated[
-        bool, Field(description="When True (default), skip the per-file stat scan. "
-        "modified_files_count is then always 0. header_affected_tus still comes from the "
-        "cached manifest hashes when manifest_verification is 'full'.")
+        bool, Field(description="When True (default), reuse the cached manifest "
+        "hashes for the header check. Both modes count modified files. Pass "
+        "False to recompute the header hashes, which is far slower.")
     ] = True,
 ) -> dict:
     """MANDATORY FIRST CALL for C/C++ projects. Return metadata about the
@@ -285,16 +285,19 @@ def get_active_build(
     Args:
         project_root: Project root directory. Auto-detected from CWD if
             omitted.
-        fast: When True (default), skip the per-file stat scan.
-            ``modified_files_count`` is then always 0.  ``header_affected_tus``
-            still comes from the cached manifest hashes when
-            ``manifest_verification`` is "full".
+        fast: When True (default), the header check reuses the cached
+            manifest hashes.  Both modes run the per-file scan, thus
+            ``modified_files_count`` is accurate either way — a tool that
+            reported "ready" while the search tools warned about the same
+            file gave the caller two readings and no way to choose.
+            False recomputes the header hashes and costs several times more.
 
     Returns:
         dict: {config_hash, project_id, project_root, build_system,
         compile_commands, indexed_at (str — "YYYY-MM-DD HH:MM:SS" in UTC,
         the completion time of the last full index), symbol_count, file_count,
-        reference_count, modified_files_count (int — 0 when fast=True),
+        reference_count, modified_files_count (int — files whose content no
+        longer matches the index; counted in both modes),
         header_affected_tus (int — number of TUs with stale header
         dependencies), manifest_verification (str —
         "full" when manifest.json exists, "none" otherwise),
@@ -395,10 +398,19 @@ def get_active_build(
         ref_count = count_refs(conn, config_hash)
         manifest_verification = cfg.get("manifest_verification", "none")
         if fast:
-            modified_count = 0
-            # header_affected_tus is cheap when the manifest is available —
-            # it compares stored hashes, not file stats.  Always compute it
-            # even in fast mode so the LLM knows about header staleness.
+            # The scan runs in fast mode too.  Without it this tool answered
+            # "ready" while search_code on the same index warned about the
+            # same file, and the caller had no way to tell which reading
+            # held.  It costs about 41 ms on a project of 1900 files,
+            # against the 749 ms that the header check below already spends.
+            #
+            # use_cache=False on purpose: the cache validates itself against
+            # MAX(mtime) of the files table, which only a reindex moves, thus
+            # a cached answer would miss the edit that just happened.
+            modified_count = _count_modified_files(conn, config_hash, root, use_cache=False)
+            # NOTE: the header check is NOT cheap — it hashes every header of
+            # every translation unit, which is 22,693 files and 749 ms on
+            # zbox-ecb-fw.  `fast` only gives it a cache; it does not skip it.
             if manifest_verification == "full":
                 header_affected_tus, _ = _check_header_staleness(
                     conn, config_hash, root, use_cache=True,
@@ -498,7 +510,17 @@ def get_active_build(
             status = "ready"
 
         # Build human-readable index message
-        if status == "ready":
+        if status == "ready" and modified_count:
+            # The index is structurally sound, thus the status stays "ready"
+            # and every query keeps working.  But files on disk have moved
+            # past it, and the per-query warnings will say so — this message
+            # must not contradict them by claiming full freshness.
+            index_message = (
+                f"Index is usable ({sym_count} symbols), but {modified_count} file(s) "
+                f"changed since the last index run. Results about those files can be "
+                f"out of date — run `fw-context index`."
+            )
+        elif status == "ready":
             index_message = f"Index is fully up to date ({sym_count} symbols)"
         elif status == "reindexing":
             if modified_count:
