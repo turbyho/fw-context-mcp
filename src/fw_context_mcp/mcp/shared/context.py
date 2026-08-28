@@ -107,6 +107,7 @@ def _normalize_file_path_query(path: str) -> str:
 
 
 __all__ = [
+    "HandlerContext",
     "_check_server_ready",
     "_db_path",
     "_detect_build_system",
@@ -117,8 +118,7 @@ __all__ = [
     "_resolve_handler_context",
     "_server_init_error",
     "_set_server_init_error",
-    "HandlerContext",
     "get_executor",
-    "invalidate_executor",
     "interrupt_all",
+    "invalidate_executor",
 ]

@@ -40,8 +40,8 @@ def __getattr__(name):
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 __all__ = [
-    "PipelineRunner",
-    "PipelineConfig",
     "SEARCH_CODE",
     "SMART_SEARCH",
+    "PipelineConfig",
+    "PipelineRunner",
 ]

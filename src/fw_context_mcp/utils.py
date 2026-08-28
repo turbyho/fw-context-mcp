@@ -40,11 +40,14 @@ from fw_context_mcp import _stdlib_sqlite3
 log = logging.getLogger(__name__)
 
 __all__ = [
+    "AUTOBUILD_REL",
     "CC_OUTPUT_REL",
     "DEPS_REL",
     "FW_CONTEXT_REL",
     "MTIME_TOLERANCE_S",
+    "SAFE_EXCEPT",
     "abs_path",
+    "autobuild_dir",
     "cc_output_path",
     "compute_content_hash",
     "compute_source_hash",
@@ -53,12 +56,9 @@ __all__ = [
     "is_db_exception",
     "is_fatal",
     "read_file_lines",
-    "AUTOBUILD_REL",
-    "autobuild_dir",
     "resolve_build_dir",
     "resolve_project_root",
     "resolve_real_binary",
-    "SAFE_EXCEPT",
     "truncate_path_middle",
 ]
 

@@ -85,11 +85,11 @@ __all__ = [
     "_search_code_macros_fts",
     "_search_code_name_tokens",
     "lookup_symbol",
+    "search_bodies",
     "search_code",
+    "search_content",
     "semantic_search",
     "smart_search",
-    "search_bodies",
-    "search_content",
 ]
 
 def _with_search_context(root: Path, tool_name: str, do_search, variant: str = "", image: str = "") -> list[dict]:

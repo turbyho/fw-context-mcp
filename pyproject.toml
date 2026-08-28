@@ -96,6 +96,10 @@ select = [
     "I",   # isort
     "B",   # flake8-bugbear
     "UP",  # pyupgrade
+    # One rule from the RUF family, not the family itself: __all__ in
+    # utils.py drifted out of order because nothing checked it, and the
+    # rest of RUF would drag in findings unrelated to that.
+    "RUF022",  # __all__ is not sorted
 ]
 ignore = [
     "E501",  # line too long (handled by formatter)
