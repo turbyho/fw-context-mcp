@@ -52,8 +52,20 @@ endif
 	@test -d $(VENV) || $(UV) venv $(VENV) --python $(PYTHON) --seed
 
 # ---- pip install into venv ----
+# Editable (-e), and that is not a convenience.  The test and lint targets
+# below run out of $(VENV), so a copied install made them measure whatever
+# the last `make install` had put there — a source change that was not
+# reinstalled was invisible, and a test could pass against code that no
+# longer existed.  Editable removes the step and the trap with it.
+#
+# CI already installs with `pip install -e ".[dev]"` (.github/workflows/
+# test.yml), thus this also stops local runs and CI from disagreeing.
+#
+# The price: `fw-context` on the PATH follows the working tree.  A process
+# that already runs keeps the modules it imported, so an edit reaches it on
+# the next start, not mid-session.
 pip-install: venv
-	$(UV) pip install --python $(VENV)/bin/python $(SRC)
+	$(UV) pip install --python $(VENV)/bin/python -e $(SRC)
 
 # ---- symlink binaries into ~/.local/bin ----
 link-add:
