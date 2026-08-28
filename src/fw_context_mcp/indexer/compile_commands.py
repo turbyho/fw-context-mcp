@@ -17,6 +17,8 @@ from collections.abc import Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from fw_context_mcp.utils import TU_EXTENSIONS
+
 # Flags libclang does not support — drop silently
 _DROP_FLAGS = frozenset({
     "-flto",
@@ -63,7 +65,7 @@ _DROP_WITH_ARG = frozenset({
     "-MQ",   # dependency target (quoted)
 })
 
-_SOURCE_EXTS = frozenset({".c", ".cpp", ".cc", ".cxx", ".c++"})
+
 
 # Target triple prefixes known to be supported by the bundled libclang.
 # Only inject --target for these; unsupported triples (xtensa, etc.) cause
@@ -237,7 +239,7 @@ def expand_response_file(token: str, cwd: Path | None = None) -> list[str]:
 
 
 def _is_source_file(token: str) -> bool:
-    return Path(token).suffix.lower() in _SOURCE_EXTS
+    return Path(token).suffix.lower() in TU_EXTENSIONS
 
 
 def _detect_language(file: Path, clang_args: list[str]) -> str:

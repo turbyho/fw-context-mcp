@@ -28,6 +28,7 @@ from ..exit_codes import (  # noqa: F401 — re-exported
     EXIT_SUPERSEDED,
 )
 from ..mcp.shared.pid_file import PidFile
+from ..utils import TU_EXTENSIONS
 from ._embedding import (
     _build_embeddings,
     _chunk_body,
@@ -47,8 +48,8 @@ from ._unit_processor import (
     _handle_unchanged,
     _process_unit,
 )
-from .compile_commands import _SOURCE_EXTS, validate_include_files
 from .compile_commands import parse as parse_compile_commands
+from .compile_commands import validate_include_files
 from .db import (
     drop_fts_triggers,
     get_file_hashes,
@@ -284,7 +285,7 @@ def run(
     # happen before config_hash computation so the manifest can be built
     # from the actual TU list.
     units = list(parse_compile_commands(compile_commands))
-    units = [u for u in units if u.file.suffix.lower() in _SOURCE_EXTS]
+    units = [u for u in units if u.file.suffix.lower() in TU_EXTENSIONS]
     log.info("TUs to index: %d", len(units))
 
     # ── The effective vendor set, computed HERE and not earlier ──

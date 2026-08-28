@@ -31,7 +31,13 @@ from pathlib import Path
 
 from ...config import derive_project_id
 from ...indexer.db import get_active_config
-from ...utils import FW_CONTEXT_REL, MTIME_TOLERANCE_S, abs_path, compute_source_hash
+from ...utils import (
+    FW_CONTEXT_REL,
+    MTIME_TOLERANCE_S,
+    TU_EXTENSIONS,
+    abs_path,
+    compute_source_hash,
+)
 from .context import _quick_open_readonly, get_executor
 
 log = logging.getLogger(__name__)
@@ -434,11 +440,11 @@ def _count_modified_files(
 # only a build puts it there.  Detection therefore needs the file tree, not
 # the mtimes of the rows the index already holds.
 
-# Only translation-unit candidates.  A new header is deliberately out of
-# scope: one that nothing includes stays out of the index even after a
-# build, thus reporting it would give a warning with no cure, and one that
-# some unit includes reaches the index on its own.
-_TU_EXTENSIONS = frozenset({".c", ".cc", ".cpp", ".cxx"})
+# Only translation-unit candidates — the set lives in utils.TU_EXTENSIONS,
+# shared with compile_commands.py and builders/manual.py.  A new header is
+# deliberately out of scope: one that nothing includes stays out of the
+# index even after a build, thus reporting it would give a warning with no
+# cure, and one that some unit includes reaches the index on its own.
 
 # Cap on the number of reported paths.  The count is what matters to the
 # caller; a full list of a hundred paths would only crowd the message.
@@ -472,13 +478,89 @@ def _project_scan_roots(scan_roots: set[str], build_patterns: list[str]) -> set[
     }
 
 
+# How long git may take to list the files of the project.  It is a local
+# read of the index file; a project big enough to need longer than this has
+# something else wrong, and the walk below is the answer either way.
+_GIT_LS_TIMEOUT_S: float = 30.0
+
+
+def _git_tu_candidates(root: Path) -> list[str] | None:
+    """Return the source files of the project, or None when git cannot say.
+
+    ``git ls-files -co --exclude-standard`` gives the tracked files plus the
+    untracked ones that .gitignore does not cover — which is the code of the
+    user and nothing else.  A gitignored vendor tree drops out on its own:
+    measured, that is ``ncs/`` on zbox-ecb-fw-v5, where the directory walk
+    found 109,687 candidates in 4.0 s and this finds 12 in 1 ms, and
+    ``.pio/`` on HA_Boiler.
+
+    It also answers what the walk could not.  ``scan_roots`` comes from
+    files the index already holds, so a whole new top-level directory named
+    no root, and the walk from "." does not descend — a new module arriving
+    as ``tests/`` or ``components/`` was reported by nothing at all.  An
+    untracked file in a new directory is in this listing.
+
+    Returns None when git cannot answer: no repository, no git binary, a
+    non-zero exit, a timeout.  The caller then walks, which is what a
+    project without a repository needs.
+
+    A vendored SDK that IS committed stays in the listing — mbed-os/ on
+    zbox-ecb-fw is 6,215 source files in git — so the caller still applies
+    the vendor roots it takes from the index.
+    """
+    import subprocess
+
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(root), "ls-files", "-co", "--exclude-standard"],
+            capture_output=True,
+            text=True,
+            timeout=_GIT_LS_TIMEOUT_S,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0:
+        return None
+    return [
+        rel for rel in result.stdout.splitlines()
+        if Path(rel).suffix.lower() in TU_EXTENSIONS
+    ]
+
+
+def _vendor_roots(conn, config_hash: str) -> set[str]:
+    """Return the top-level directories that hold vendor code only.
+
+    Taken from ``files.is_project``: a root that carries non-project rows
+    and no project row is the SDK.  The manifest's own vendor patterns are
+    not enough — measured, zbox-ecb-fw-v5 has none at all — and this
+    question has an answer in the index for every project that indexed the
+    vendor tree.
+
+    Only relative paths count.  An absolute one names a file outside the
+    project, which has no top-level directory inside it.
+    """
+    project: set[str] = set()
+    vendor: set[str] = set()
+    for row in conn.execute(
+        "SELECT path, is_project FROM files WHERE config_hash=?", (config_hash,)
+    ):
+        stored = row["path"]
+        if os.path.isabs(stored):
+            continue
+        parts = Path(stored).parts
+        first = parts[0] if len(parts) > 1 else "."
+        (project if row["is_project"] else vendor).add(first)
+    return vendor - project
+
+
 def find_unindexed_sources(
     conn,
     config_hash: str,
     root: Path,
     cc_path: Path,
     *,
-    limit: int = _UNINDEXED_REPORT_LIMIT,
+    limit: int | None = _UNINDEXED_REPORT_LIMIT,
     apply_exclusions: bool = True,
 ) -> list[str]:
     """Return source files that ``compile_commands.json`` does not cover.
@@ -507,8 +589,12 @@ def find_unindexed_sources(
         config_hash: Active build configuration.
         root: Project root.
         cc_path: Path of the compile_commands.json of this build.
-        limit: Maximum number of paths to return.  The caller reports the
-            count, thus a long list adds nothing.
+        limit: Maximum number of paths to return, or None for all of them.
+            The cap serves the caller that REPORTS the count — a list of a
+            hundred paths only crowds the message.  The caller that RECORDS
+            the set must pass None: record_excluded replaces the marker
+            wholesale, thus a truncated list silently drops every entry past
+            the cap and those files are reported again on every edit.
         apply_exclusions: When True (default), leave out the files that a
             build already ran for and still did not cover — see
             ``indexer.autobuild.load_excluded``.  The caller that writes
@@ -551,33 +637,60 @@ def find_unindexed_sources(
     excluded = load_excluded(db_path.parent) if apply_exclusions else {}
 
     found: list[str] = []
+    for candidate in _tu_candidates(conn, config_hash, root, scan_roots, build_patterns):
+        # _normalize_file_path decides the one spelling that every
+        # path-keyed lookup uses, thus the comparison must go through it.
+        # It runs on the candidates only — resolving every indexed path
+        # instead cost one syscall per row and made the scan 7x slower.
+        key = _normalize_file_path(candidate, root)
+        if key in known:
+            continue
+        try:
+            if os.path.getmtime(candidate) <= cc_mtime:
+                continue
+        except OSError:
+            continue  # vanished between the listing and the stat
+        # A build already ran for this file and the build system still
+        # did not take it.  Reporting it again only tells the caller to
+        # run a command that changes nothing, and it would hold
+        # get_active_build on "reindex_needed" for ever.  The hash is
+        # what expires the record: an edit means the user may have just
+        # added the file to the build, thus it earns one more report.
+        recorded = excluded.get(key)
+        if recorded and recorded == compute_source_hash(Path(candidate)):
+            continue
+        found.append(key)
+
+    return sorted(found) if limit is None else sorted(found)[:limit]
+
+
+def _tu_candidates(
+    conn, config_hash: str, root: Path, scan_roots: set[str], build_patterns: list[str]
+):
+    """Yield the absolute path of every source file that could need a build.
+
+    Git first, the directory walk as the fallback.  See _git_tu_candidates
+    for why git is the better question and _walk_tu_candidates for what the
+    walk cannot reach.
+    """
+    listed = _git_tu_candidates(root)
+    if listed is not None:
+        vendor = _vendor_roots(conn, config_hash)
+        for rel in listed:
+            top = rel.split("/")[0] if "/" in rel else "."
+            if top in vendor:
+                continue  # a vendored SDK that is committed to the repository
+            if _path_matches_patterns(rel, build_patterns):
+                continue
+            yield str((root / rel).resolve())
+        return
+
+    # No repository, or git could not answer.  The walk sees only the roots
+    # the index already knows, thus a new top-level directory stays
+    # invisible here — that is the cost of having no git to ask.
     for scan_root in sorted(_project_scan_roots(scan_roots, build_patterns)):
         start = root if scan_root == "." else root / scan_root
-        for candidate in _walk_tu_candidates(start, scan_root == ".", build_patterns):
-            # _normalize_file_path decides the one spelling that every
-            # path-keyed lookup uses, thus the comparison must go through it.
-            # It runs on the candidates only — resolving every indexed path
-            # instead cost one syscall per row and made the scan 7x slower.
-            key = _normalize_file_path(candidate, root)
-            if key in known:
-                continue
-            try:
-                if os.path.getmtime(candidate) <= cc_mtime:
-                    continue
-            except OSError:
-                continue  # vanished between the walk and the stat
-            # A build already ran for this file and the build system still
-            # did not take it.  Reporting it again only tells the caller to
-            # run a command that changes nothing, and it would hold
-            # get_active_build on "reindex_needed" for ever.  The hash is
-            # what expires the record: an edit means the user may have just
-            # added the file to the build, thus it earns one more report.
-            recorded = excluded.get(key)
-            if recorded and recorded == compute_source_hash(Path(candidate)):
-                continue
-            found.append(key)
-
-    return sorted(found)[:limit]
+        yield from _walk_tu_candidates(start, scan_root == ".", build_patterns)
 
 
 def _indexed_paths(conn, config_hash: str) -> tuple[set[str], set[str]]:
@@ -617,7 +730,7 @@ def _walk_tu_candidates(start: Path, root_only: bool, build_patterns: list[str])
 
     if root_only:
         for entry in start.iterdir():
-            if entry.is_file() and entry.suffix.lower() in _TU_EXTENSIONS:
+            if entry.is_file() and entry.suffix.lower() in TU_EXTENSIONS:
                 yield str(entry.resolve())
         return
 
@@ -626,7 +739,7 @@ def _walk_tu_candidates(start: Path, root_only: bool, build_patterns: list[str])
             dirnames[:] = []  # build output — do not descend
             continue
         for filename in filenames:
-            if Path(filename).suffix.lower() in _TU_EXTENSIONS:
+            if Path(filename).suffix.lower() in TU_EXTENSIONS:
                 yield str(Path(dirpath, filename).resolve())
 
 

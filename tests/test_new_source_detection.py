@@ -361,3 +361,194 @@ class TestFwContextDirIsSkipped:
         _add_file(root, ".fw-context/autobuild/default/other.c", newer_than=cc)
 
         assert find_unindexed_sources(conn, _CONFIG_HASH, root, cc) == []
+
+
+def _git_project(tmp_path: Path, *, gitignore: str = "") -> tuple[Path, Path]:
+    """A git repository with one indexed source.  Returns (root, cc_path)."""
+    import subprocess
+
+    from fw_context_mcp.indexer.db import (
+        open_db,
+        transaction,
+        upsert_build_config,
+        upsert_file,
+        upsert_project,
+    )
+
+    root = tmp_path / "proj"
+    (root / "src").mkdir(parents=True)
+    (root / "src" / "main.c").write_text("int main(void){return 0;}\n", encoding="utf-8")
+    if gitignore:
+        (root / ".gitignore").write_text(gitignore, encoding="utf-8")
+    cc = root / "compile_commands.json"
+    cc.write_text("[]", encoding="utf-8")
+
+    for cmd in (["init", "-q"], ["add", "-A"]):
+        subprocess.run(["git", "-C", str(root), *cmd], check=True,
+                       capture_output=True, timeout=30)
+
+    conn = open_db(tmp_path / "index.db")
+    with transaction(conn):
+        upsert_project(conn, "pid", "p", str(root))
+        upsert_build_config(conn, "ch", "pid", str(cc))
+        upsert_file(conn, "ch", "src/main.c", "c", mtime=1.0)
+        conn.execute("UPDATE files SET is_project=1 WHERE config_hash='ch'")
+    # compile_commands.json must be older than anything reported as new
+    os.utime(cc, (1000, 1000))
+    return root, cc
+
+
+class TestGitCandidates:
+    """git ls-files answers what the directory walk could not.
+
+    scan_roots comes from files the index already holds, so a whole new
+    top-level directory named no root and the walk from "." does not
+    descend.  An untracked file in a new directory is in the git listing.
+    """
+
+    def test_a_file_in_a_new_top_level_directory_is_reported(self, tmp_path: Path):
+        from fw_context_mcp.indexer.db import open_db
+        from fw_context_mcp.mcp.shared.stale import find_unindexed_sources
+
+        root, cc = _git_project(tmp_path)
+        (root / "tests").mkdir()
+        (root / "tests" / "new.cpp").write_text("void t(){}\n", encoding="utf-8")
+
+        conn = open_db(tmp_path / "index.db")
+        try:
+            found = find_unindexed_sources(conn, "ch", root, cc)
+        finally:
+            conn.close()
+
+        assert "tests/new.cpp" in found, (
+            "a new module arrives as a whole directory; the walk saw no root "
+            "for it and reported nothing"
+        )
+
+    def test_a_gitignored_directory_is_not_reported(self, tmp_path: Path):
+        from fw_context_mcp.indexer.db import open_db
+        from fw_context_mcp.mcp.shared.stale import find_unindexed_sources
+
+        root, cc = _git_project(tmp_path, gitignore="ncs/\n")
+        (root / "ncs" / "deep").mkdir(parents=True)
+        (root / "ncs" / "deep" / "vendor.c").write_text("int v(void);\n", encoding="utf-8")
+
+        conn = open_db(tmp_path / "index.db")
+        try:
+            found = find_unindexed_sources(conn, "ch", root, cc)
+        finally:
+            conn.close()
+
+        assert found == [], (
+            "a gitignored vendor tree drops out of the listing by itself — "
+            "on zbox-ecb-fw-v5 that is 109,687 candidates and 4 seconds"
+        )
+
+    def test_a_committed_vendor_tree_is_not_reported(self, tmp_path: Path):
+        """git alone is not enough when the SDK is committed to the repo."""
+        import subprocess
+
+        from fw_context_mcp.indexer.db import open_db, transaction, upsert_file
+        from fw_context_mcp.mcp.shared.stale import find_unindexed_sources
+
+        root, cc = _git_project(tmp_path)
+        (root / "mbed-os").mkdir()
+        (root / "mbed-os" / "vendor.c").write_text("int v(void);\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(root), "add", "-A"], check=True,
+                       capture_output=True, timeout=30)
+
+        conn = open_db(tmp_path / "index.db")
+        try:
+            # The index knows mbed-os as vendor: a row with is_project=0.
+            with transaction(conn):
+                upsert_file(conn, "ch", "mbed-os/other.c", "c", mtime=1.0)
+                conn.execute(
+                    "UPDATE files SET is_project=0 WHERE config_hash='ch' "
+                    "AND path='mbed-os/other.c'"
+                )
+            found = find_unindexed_sources(conn, "ch", root, cc)
+        finally:
+            conn.close()
+
+        assert found == [], (
+            "mbed-os is committed on zbox-ecb-fw — 6,215 source files in git "
+            "— so the vendor roots have to come from the index"
+        )
+
+    def test_a_cxx_plus_plus_source_is_reported(self, tmp_path: Path):
+        from fw_context_mcp.indexer.db import open_db
+        from fw_context_mcp.mcp.shared.stale import find_unindexed_sources
+
+        root, cc = _git_project(tmp_path)
+        (root / "src" / "new.c++").write_text("void n(){}\n", encoding="utf-8")
+
+        conn = open_db(tmp_path / "index.db")
+        try:
+            found = find_unindexed_sources(conn, "ch", root, cc)
+        finally:
+            conn.close()
+
+        assert "src/new.c++" in found, "`.c++` was missing from this module's copy"
+
+    def test_a_project_without_git_falls_back_to_the_walk(self, tmp_path: Path):
+        """autoproj is a real project with no repository."""
+        from fw_context_mcp.indexer.db import open_db
+        from fw_context_mcp.mcp.shared.stale import find_unindexed_sources
+
+        root, cc = _git_project(tmp_path)
+        import shutil
+
+        shutil.rmtree(root / ".git")
+        (root / "src" / "new.c").write_text("void n(void){}\n", encoding="utf-8")
+
+        conn = open_db(tmp_path / "index.db")
+        try:
+            found = find_unindexed_sources(conn, "ch", root, cc)
+        finally:
+            conn.close()
+
+        assert "src/new.c" in found, (
+            "with no repository the walk is the answer, and src is a scan root"
+        )
+
+    def test_a_missing_git_binary_falls_back(self, tmp_path: Path, monkeypatch):
+        from fw_context_mcp.indexer.db import open_db
+        from fw_context_mcp.mcp.shared.stale import find_unindexed_sources
+
+        root, cc = _git_project(tmp_path)
+        (root / "src" / "new.c").write_text("void n(void){}\n", encoding="utf-8")
+
+        import subprocess as _sp
+
+        def boom(*a, **kw):
+            raise OSError("git not found")
+
+        monkeypatch.setattr(_sp, "run", boom)
+
+        conn = open_db(tmp_path / "index.db")
+        try:
+            found = find_unindexed_sources(conn, "ch", root, cc)
+        finally:
+            conn.close()
+
+        assert "src/new.c" in found, "a missing git binary must not raise"
+
+    def test_the_limit_can_be_lifted(self, tmp_path: Path):
+        """record_excluded replaces the marker, thus it needs the whole set."""
+        from fw_context_mcp.indexer.db import open_db
+        from fw_context_mcp.mcp.shared.stale import find_unindexed_sources
+
+        root, cc = _git_project(tmp_path)
+        for i in range(25):
+            (root / "src" / f"extra{i:02d}.c").write_text(f"void e{i}(void){{}}\n",
+                                                          encoding="utf-8")
+
+        conn = open_db(tmp_path / "index.db")
+        try:
+            capped = find_unindexed_sources(conn, "ch", root, cc)
+            everything = find_unindexed_sources(conn, "ch", root, cc, limit=None)
+        finally:
+            conn.close()
+
+        assert len(capped) == 20, "the default cap serves the caller that reports"
+        assert len(everything) == 25

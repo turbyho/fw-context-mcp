@@ -3,8 +3,8 @@
 import json
 from pathlib import Path
 
+from fw_context_mcp.utils import TU_EXTENSIONS
 from fw_context_mcp.indexer.compile_commands import (
-    _SOURCE_EXTS,
     _detect_language,
     _detect_target_triple,
     _gcc_system_includes,
@@ -225,18 +225,32 @@ class TestParse:
 
 
 class TestSourceExts:
-    """_SOURCE_EXTS should cover all common C/C++ extensions."""
+    """TU_EXTENSIONS should cover all common C/C++ extensions.
+
+    The set moved to utils: three modules kept their own copy and they had
+    drifted — `.c++` was in two of them and not in the third, so a new
+    `.c++` file was never reported as missing from compile_commands.json.
+    """
+
     def test_c(self):
-        assert ".c" in _SOURCE_EXTS
+        assert ".c" in TU_EXTENSIONS
 
     def test_cpp(self):
-        assert ".cpp" in _SOURCE_EXTS
+        assert ".cpp" in TU_EXTENSIONS
 
     def test_cc(self):
-        assert ".cc" in _SOURCE_EXTS
+        assert ".cc" in TU_EXTENSIONS
 
     def test_cxx(self):
-        assert ".cxx" in _SOURCE_EXTS
+        assert ".cxx" in TU_EXTENSIONS
+
+    def test_cxx_plus_plus(self):
+        assert ".c++" in TU_EXTENSIONS
+
+    def test_uppercase_is_covered_by_the_comparison(self):
+        """`.C` is a C++ source; the set is lowercase and callers lower()."""
+        assert _is_source_file("a.C")
+        assert _is_source_file("a.CPP")
 
 
 class TestEdgeCases:

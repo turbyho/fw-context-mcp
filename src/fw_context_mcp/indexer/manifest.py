@@ -723,8 +723,8 @@ def compute_config_hash(
         a stray value.  The pre-pass joins every separated flag with its
         value, so a bare token that arrives here belongs to no flag.
 
-        This test compared the token SUFFIX against _SOURCE_EXTS and
-        _OUTPUT_EXTS before.  A whitelist of "what counts as a source file"
+        This test compared the token SUFFIX against a source-extension
+        whitelist and an output-extension one before.  A whitelist of "what counts as a source file"
         cannot stay complete, and a suffix outside the list put a filename
         into the hash — the translation-unit coupling that this function
         exists to remove.  The rule above needs no list.

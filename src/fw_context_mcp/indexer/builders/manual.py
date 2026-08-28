@@ -20,6 +20,7 @@ from typing import TYPE_CHECKING
 
 from fw_context_mcp.utils import (
     DEPS_REL,
+    TU_EXTENSIONS,
     cc_output_path,
     resolve_build_dir,
     run_build_command,
@@ -33,7 +34,7 @@ if TYPE_CHECKING:
 
 log = logging.getLogger(__name__)
 
-_SOURCE_EXTENSIONS = {".c", ".cpp", ".cc", ".cxx", ".C", ".c++"}
+
 
 
 def _scan_source_files(dirs: list[Path]) -> list[Path]:
@@ -45,7 +46,7 @@ def _scan_source_files(dirs: list[Path]) -> list[Path]:
             log.warning("source directory does not exist: %s", d)
             continue
         for f in sorted(d.rglob("*")):
-            if f.suffix in _SOURCE_EXTENSIONS and str(f) not in seen:
+            if f.suffix.lower() in TU_EXTENSIONS and str(f) not in seen:
                 # Deduplicate by full path — two source_dirs might contain same-named files
                 seen.add(str(f))
                 result.append(f)

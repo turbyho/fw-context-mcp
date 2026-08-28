@@ -46,6 +46,7 @@ __all__ = [
     "FW_CONTEXT_REL",
     "MTIME_TOLERANCE_S",
     "SAFE_EXCEPT",
+    "TU_EXTENSIONS",
     "abs_path",
     "autobuild_dir",
     "cc_output_path",
@@ -65,6 +66,18 @@ __all__ = [
 # Seconds of tolerance when comparing file mtimes to account for
 # clock skew between the indexer and the filesystem.
 MTIME_TOLERANCE_S: float = 1.0
+
+# Extensions of a translation unit.  ONE definition, THREE call sites that
+# each had their own: indexer/compile_commands.py decides what counts as a
+# source argument, indexer/builders/manual.py scans the source directories,
+# and mcp/shared/stale.py looks for a source the build system never saw.
+# A set that differs between them makes one blind to a file another builds
+# — `.c++` was in two of the three copies, so a new `.c++` file was never
+# reported as missing from compile_commands.json.
+#
+# Lowercase only: every comparison goes through `.lower()`, which covers
+# the `.C` of a C++ file as well.
+TU_EXTENSIONS: frozenset[str] = frozenset({".c", ".cc", ".cpp", ".cxx", ".c++"})
 
 # Everything fw-context writes into a project sits under this one directory,
 # which ``fw-context init`` adds to .gitignore.  One name, because more than
