@@ -36,6 +36,16 @@ from .context import _quick_open_readonly, get_executor
 
 log = logging.getLogger(__name__)
 
+# How close two timestamps must be to count as the same one.  NOT a
+# tolerance for clock skew — that is MTIME_TOLERANCE_S, and it is a whole
+# second.  This is only wide enough to absorb the float round trip through
+# SQLite REAL and a filesystem that does not return a stat bit-exactly.
+#
+# It must stay small.  The rule it serves reads "an exact match is the file
+# the index hashed"; widen it and every file inside the band reads as
+# unchanged again, which is the behaviour this replaced.
+_MTIME_MATCH_EPS_S: float = 0.001
+
 # ── Mtime cache ──
 # Cache for _count_modified_files results with a 30-second TTL.
 # Invalidation is done explicitly by _invalidate_modified_cache after
@@ -225,8 +235,11 @@ def _in_racy_window(file_mtime: float, stored_mtime: float) -> bool:
     stamp sits inside the tolerance band around the stored one, in either
     direction.
 
-    The caller then reads the content.  Cost is bounded, because the band is
-    narrow and only files inside it are read.
+    ONE caller, ``_check_file_stale``.  It used to gate the project-wide
+    scan as well, and there it was worse than useless: the band is symmetric
+    around the STORED stamp, and an unchanged file carries exactly that
+    stamp, so every unchanged file fell inside it.  See
+    ``_count_modified_files`` for the rule that replaced it.
     """
     return abs(file_mtime - stored_mtime) <= MTIME_TOLERANCE_S
 
@@ -374,21 +387,32 @@ def _count_modified_files(
             # filesystems this is <10ms for 10K files. If slow, consider
             # os.scandir() batch processing or caching more aggressively.
             #
-            # The timestamp only filters here; the content decides.  Hashing
-            # every file of a large project costs 24 ms against 1.8 ms for
-            # stat, thus this path reads only the files that the timestamp
-            # calls suspect.  A file whose stamp sits inside the racy window
-            # is suspect as well — see _in_racy_window.
+            # The index stores the mtime it read together with the hash it
+            # computed, thus an exact match means "this is the file we
+            # hashed" and nothing needs reading.  Anything else is suspect
+            # in BOTH directions: newer is the ordinary edit, older means
+            # the file was replaced by an older copy — a restore from a
+            # backup, or a tar that kept its times.
+            #
+            # The previous rule was "newer, or inside the racy window", and
+            # that window is symmetric around the stored stamp.  An
+            # unchanged file carries exactly that stamp, so it fell inside
+            # and reached the hash: measured on zbox-ecb-fw, 1910 of 1911
+            # rows did.  The gate filtered nothing while get_active_build —
+            # the mandatory first call — hashed the whole project every
+            # time.  The one set it did exclude was the backwards stamp,
+            # which is the one case that needed reading.
+            #
+            # What this cannot see: a write that restores the stamp to the
+            # exact float the index holds.  _stale_files has no gate at
+            # all, so a query about that file still reports it.
             file_mtime = os.path.getmtime(key)
-            suspect = (
-                file_mtime > stored_mtime + MTIME_TOLERANCE_S
-                or _in_racy_window(file_mtime, stored_mtime)
-            )
-            if not suspect:
+            if abs(file_mtime - stored_mtime) <= _MTIME_MATCH_EPS_S:
                 continue
             differs = _content_differs(key, stored_hash)
             if differs is None:
-                # No stored hash: the timestamp is all there is.
+                # No stored hash: the timestamp is all there is, and only
+                # one direction is readable from it.
                 if file_mtime > stored_mtime + MTIME_TOLERANCE_S:
                     modified += 1
             elif differs:
