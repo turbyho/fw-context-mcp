@@ -18,7 +18,12 @@ import shutil
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from fw_context_mcp.utils import cc_output_path, run_build_command
+from fw_context_mcp.utils import (
+    DEPS_REL,
+    cc_output_path,
+    resolve_build_dir,
+    run_build_command,
+)
 
 from . import registry
 from .protocol import BuildIssue
@@ -144,9 +149,25 @@ class ManualBuildSystem:
         # -fsyntax-only: check syntax but produce no object file (fast).
         # -MD -MF <path>.d: emit dependency file for header change detection.
         # -MP: add phony targets for each header (prevents errors if headers move).
+        #
+        # The .d files go to a directory that fw-context owns, never beside
+        # the source.  Beside the source they sit where the build of the user
+        # reads them, and the compiler does not write them atomically, thus a
+        # concurrent `make` could read a truncated file.  resolve_build_dir
+        # gives the isolated directory when fw-context started the build, and
+        # .fw-context/build/deps otherwise.
+        dep_root = resolve_build_dir(root, cfg, str(DEPS_REL))
         entries: list[dict] = []
         for src in sources:
-            d_file = src.with_suffix(".d")
+            # Mirror the tree under dep_root: `a/foo.c` and `b/foo.c` would
+            # otherwise share one `foo.d`.  A source outside the project root
+            # keeps its bare name — it has no relative path to mirror.
+            try:
+                rel = src.resolve().relative_to(root.resolve())
+            except ValueError:
+                rel = Path(src.name)
+            d_file = dep_root / rel.with_suffix(".d")
+            d_file.parent.mkdir(parents=True, exist_ok=True)
             dep_args = ["-MD", "-MF", str(d_file), "-MP"]
             cmd = [compiler] + dep_args + flags + ["-fsyntax-only", str(src)]
             log.debug("Compile: %s", " ".join(cmd))
@@ -185,11 +206,20 @@ class ManualBuildSystem:
         return []
 
     def background_build_safe(self, cfg: BuildConfig) -> bool:
-        """Safe — ``-fsyntax-only`` produces no object file.
+        """Safe — every artifact goes to a directory that fw-context owns.
 
-        The compiler writes one ``.d`` file beside each source, and its
-        content depends on the source alone, thus a concurrent build reads
-        or writes the same bytes.
+        ``-fsyntax-only`` writes no object file, but ``-MD -MF`` still writes
+        one ``.d`` file per source.  Those used to land beside the source.
+        The earlier note here argued that the content depends on the source
+        alone, thus a concurrent build would write the same bytes — true of
+        the content, and beside the point: the compiler does not write the
+        file atomically, so a `make` that reads `src/foo.d` while this build
+        rewrites it can see a truncated one.
+
+        They now go under ``cfg.isolated_build_dir`` when fw-context started
+        the build, and under ``.fw-context/build/deps`` otherwise.  Either
+        way nothing reaches the tree of the user, which is the first branch
+        of the contract in protocol.py.
         """
         return True
 

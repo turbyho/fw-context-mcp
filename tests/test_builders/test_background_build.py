@@ -138,3 +138,98 @@ class TestResolveBuildDir:
         assert resolve_build_dir(tmp_path, BuildConfig(), "build/nrf52840") == (
             tmp_path / "build/nrf52840"
         )
+
+
+class TestManualDependencyFiles:
+    """The manual backend must not write ``.d`` files into the source tree.
+
+    ``-fsyntax-only`` writes no object file, but ``-MD -MF`` writes one
+    dependency file per source.  Beside the source they sit where the build
+    of the user reads them, and the compiler does not write them atomically,
+    thus a concurrent ``make`` can read a truncated file.
+    """
+
+    @staticmethod
+    def _run(tmp_path: Path, monkeypatch, cfg: BuildConfig, extra: str = "") -> list[list[str]]:
+        """Build a tiny project and return the commands the backend issued."""
+        import shutil as _shutil
+
+        src = tmp_path / "src"
+        src.mkdir(parents=True)
+        (src / "main.c").write_text("int main(void) { return 0; }\n", encoding="utf-8")
+        if extra:
+            nested = tmp_path / extra
+            nested.parent.mkdir(parents=True, exist_ok=True)
+            nested.write_text("int f(void) { return 1; }\n", encoding="utf-8")
+
+        commands: list[list[str]] = []
+
+        def _fake_run(cmd, **kwargs):
+            commands.append(list(cmd))
+
+        monkeypatch.setattr(
+            "fw_context_mcp.indexer.builders.manual.run_build_command", _fake_run
+        )
+        # The backend refuses to start without a compiler on PATH.
+        monkeypatch.setattr(_shutil, "which", lambda name: f"/usr/bin/{name}")
+
+        ManualBuildSystem().generate(tmp_path, cfg)
+        return commands
+
+    @staticmethod
+    def _dep_targets(commands: list[list[str]]) -> list[Path]:
+        return [Path(cmd[cmd.index("-MF") + 1]) for cmd in commands if "-MF" in cmd]
+
+    def test_no_dependency_file_is_aimed_at_the_source_tree(
+        self, tmp_path: Path, monkeypatch
+    ):
+        """Assert on the -MF target, not on files on disk.
+
+        run_build_command is mocked, thus no compiler runs and no .d appears
+        either way — a glob over src/ would pass against any implementation.
+        What the backend ASKS for is the thing under test.
+        """
+        cfg = BuildConfig(system="bare", source_dirs=["src"])
+
+        targets = self._dep_targets(self._run(tmp_path, monkeypatch, cfg))
+
+        assert targets, "the backend must still emit dependency files"
+        for target in targets:
+            assert (tmp_path / "src") not in target.parents, (
+                f"{target} sits in the source tree of the user"
+            )
+
+    def test_the_default_goes_under_the_fw_context_directory(
+        self, tmp_path: Path, monkeypatch
+    ):
+        cfg = BuildConfig(system="bare", source_dirs=["src"])
+
+        targets = self._dep_targets(self._run(tmp_path, monkeypatch, cfg))
+
+        assert targets == [tmp_path / ".fw-context/build/deps/src/main.d"]
+
+    def test_an_isolated_build_wins(self, tmp_path: Path, monkeypatch):
+        cfg = BuildConfig(
+            system="bare",
+            source_dirs=["src"],
+            isolated_build_dir=".fw-context/autobuild/default",
+        )
+
+        targets = self._dep_targets(self._run(tmp_path, monkeypatch, cfg))
+
+        assert targets == [
+            tmp_path / ".fw-context/autobuild/default/src/main.d"
+        ]
+
+    def test_two_sources_of_one_name_do_not_collide(self, tmp_path: Path, monkeypatch):
+        """`a/foo.c` and `b/foo.c` would share one `foo.d` without mirroring."""
+        for sub in ("a", "b"):
+            nested = tmp_path / "lib" / sub
+            nested.mkdir(parents=True)
+            (nested / "foo.c").write_text("int foo(void) { return 0; }\n", encoding="utf-8")
+        cfg = BuildConfig(system="bare", source_dirs=["lib"])
+
+        targets = self._dep_targets(self._run(tmp_path, monkeypatch, cfg))
+
+        assert len(targets) == 2
+        assert len(set(targets)) == 2, f"the two collided: {targets}"

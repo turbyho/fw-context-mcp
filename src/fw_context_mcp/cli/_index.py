@@ -30,10 +30,14 @@ import signal
 import sys
 import time
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from ..mcp.shared.pid_file import PidFile
 from ..utils import CC_OUTPUT_REL, autobuild_dir
 from . import VerboseFormatter
+
+if TYPE_CHECKING:
+    from ..indexer.build import BuildConfig
 
 log = logging.getLogger(__name__)
 
@@ -98,11 +102,11 @@ def _plan_auto_build(
     db_path: Path,
     cfg,
     detected_system: str | None,
-) -> list[str]:
-    """Return the source files that make an automatic build necessary.
+) -> tuple[list[str], BuildConfig | None]:
+    """Return ``(sources that need a build, the config to build them with)``.
 
-    Empty means "do not build".  The list is non-empty only when all of
-    these hold:
+    An empty list means "do not build", and the config is then None.  The
+    list is non-empty only when all of these hold:
 
     1. An index exists.  Without one there is nothing to compare against.
     2. Source files sit on disk that compile_commands.json does not cover.
@@ -113,17 +117,30 @@ def _plan_auto_build(
     Condition 3 is the important one.  The build runs while the user works,
     possibly while an IDE builds the same project, and fw-context cannot
     lock the build of the IDE.
+
+    WHY the config comes back instead of being set on *cfg*: the contract of
+    ``background_build_safe`` says the answer MAY depend on
+    ``cfg.isolated_build_dir`` (protocol.py), thus the question has to be
+    asked with the value the build would really use.  Setting it on *cfg*
+    before asking would leave it behind on every path that then answers "do
+    not build", so the candidate is built with ``replace()`` and the caller
+    applies it only when there is something to do.
     """
     if not db_path.exists():
-        return []
+        return [], None
+
+    from dataclasses import replace
 
     from ..indexer.builders import background_build_safe, registry
     from ..mcp.shared.stale import find_unindexed_sources
 
     system = cfg.build.system or detected_system
     builder_cls = registry.get(system) if system else None
-    if builder_cls is None or not background_build_safe(builder_cls(), cfg.build):
-        return []
+    if builder_cls is None:
+        return [], None
+    candidate = replace(cfg.build, isolated_build_dir=autobuild_dir())
+    if not background_build_safe(builder_cls(), candidate):
+        return [], None
 
     from ..config import derive_project_id
     from ..indexer.db import get_active_config, open_db
@@ -132,7 +149,7 @@ def _plan_auto_build(
     try:
         active = get_active_config(conn, derive_project_id(project_root))
         if not active or not active["compile_commands_path"]:
-            return []
+            return [], None
         new_sources = find_unindexed_sources(
             conn,
             active["config_hash"],
@@ -143,8 +160,8 @@ def _plan_auto_build(
         conn.close()
 
     if not new_sources or _autobuild_blocked(db_path.parent, new_sources):
-        return []
-    return new_sources
+        return [], None
+    return new_sources, candidate
 
 
 def _resolve_compile_commands(
@@ -825,10 +842,17 @@ def cmd_index(args: argparse.Namespace) -> int:
     # build without touching the output of the build of the user.
     auto_build_sources: list[str] = []
     if not getattr(args, "build", False):
-        auto_build_sources = _plan_auto_build(project_root, db_path, cfg, detected_system)
-        if auto_build_sources:
+        auto_build_sources, auto_build_cfg = _plan_auto_build(
+            project_root, db_path, cfg, detected_system
+        )
+        # The two always arrive together; the second test is what lets the
+        # type checker see that, and it costs nothing.
+        if auto_build_sources and auto_build_cfg is not None:
             args.build = True
-            cfg.build.isolated_build_dir = autobuild_dir()
+            # The candidate that _plan_auto_build asked the backend about.
+            # Applying it here, and nowhere else, keeps every "do not build"
+            # path from leaving an isolated directory behind on cfg.
+            cfg.build = auto_build_cfg
             listed = ", ".join(auto_build_sources[:3])
             more = f" and {len(auto_build_sources) - 3} more" if len(auto_build_sources) > 3 else ""
             log.info(

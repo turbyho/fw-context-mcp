@@ -161,7 +161,7 @@ class TestPlanAutoBuild:
 
         missing_db = tmp_path / "index" / "index.db"
 
-        assert _plan_auto_build(tmp_path, missing_db, self._cfg("makefile"), None) == []
+        assert _plan_auto_build(tmp_path, missing_db, self._cfg("makefile"), None) == ([], None)
 
     def test_a_backend_that_cannot_isolate_is_refused(self, tmp_path: Path):
         """stm32cubeide cannot build at all, thus an attempt only wastes a run."""
@@ -170,7 +170,7 @@ class TestPlanAutoBuild:
         db = tmp_path / "index.db"
         db.write_text("", encoding="utf-8")
 
-        assert _plan_auto_build(tmp_path, db, self._cfg("stm32cubeide"), None) == []
+        assert _plan_auto_build(tmp_path, db, self._cfg("stm32cubeide"), None) == ([], None)
 
     def test_an_unknown_build_system_is_refused(self, tmp_path: Path):
         from fw_context_mcp.cli._index import _plan_auto_build
@@ -178,4 +178,45 @@ class TestPlanAutoBuild:
         db = tmp_path / "index.db"
         db.write_text("", encoding="utf-8")
 
-        assert _plan_auto_build(tmp_path, db, self._cfg("no-such-system"), None) == []
+        assert _plan_auto_build(tmp_path, db, self._cfg("no-such-system"), None) == ([], None)
+
+    def test_the_backend_is_asked_with_the_isolated_directory(
+        self, tmp_path: Path, monkeypatch
+    ):
+        """protocol.py lets the answer depend on cfg.isolated_build_dir.
+
+        The question must therefore carry the value the build would really
+        use.  It used to be asked with the untouched cfg, where the field is
+        still None, so a backend that answered on it would answer wrongly.
+        """
+        from fw_context_mcp.cli import _index
+
+        seen: list[object] = []
+
+        def _spy(builder, cfg):
+            seen.append(cfg.isolated_build_dir)
+            return False  # stop early; the recorded value is the point
+
+        # _plan_auto_build imports the helper inside the function body, thus
+        # patching the module attribute reaches the call.
+        monkeypatch.setattr(
+            "fw_context_mcp.indexer.builders.background_build_safe", _spy
+        )
+
+        db = tmp_path / "index.db"
+        db.write_text("", encoding="utf-8")
+        _index._plan_auto_build(tmp_path, db, self._cfg("makefile"), None)
+
+        assert seen == [".fw-context/autobuild/default"]
+
+    def test_a_refusal_leaves_the_config_untouched(self, tmp_path: Path):
+        """The planner must not set an isolated directory it never used."""
+        from fw_context_mcp.cli._index import _plan_auto_build
+
+        db = tmp_path / "index.db"
+        db.write_text("", encoding="utf-8")
+        cfg = self._cfg("stm32cubeide")
+
+        _plan_auto_build(tmp_path, db, cfg, None)
+
+        assert cfg.build.isolated_build_dir is None

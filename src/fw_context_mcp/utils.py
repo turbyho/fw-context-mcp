@@ -41,6 +41,7 @@ log = logging.getLogger(__name__)
 
 __all__ = [
     "CC_OUTPUT_REL",
+    "DEPS_REL",
     "FW_CONTEXT_REL",
     "MTIME_TOLERANCE_S",
     "abs_path",
@@ -81,6 +82,12 @@ CC_OUTPUT_REL: Path = FW_CONTEXT_REL / "build" / "compile_commands.json"
 # that the user runs: fw-context cannot lock that build, thus separation is
 # the only defence against two builds in one directory.
 AUTOBUILD_REL: Path = FW_CONTEXT_REL / "autobuild"
+
+# Where a backend puts dependency (.d) files when no isolated build
+# directory is set.  They must never land beside the source: there they sit
+# where the build of the user reads them, and a compiler does not write them
+# atomically, thus a concurrent make can read a truncated file.
+DEPS_REL: Path = FW_CONTEXT_REL / "build" / "deps"
 
 
 def autobuild_dir(variant: str = "") -> str:
