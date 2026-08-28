@@ -952,7 +952,8 @@ def _record_still_uncovered(project_root: Path, db_path: Path) -> None:
     Recomputing the scan here is simpler than remembering the list from
     before the build, and it covers an explicit `--build` from the user just
     as well as an automatic one.  ``apply_exclusions=False`` is required, or
-    the scan would filter out the files this is about to record.
+    the scan would filter out the files this is about to record, and
+    ``limit=None`` because the marker has to describe the WHOLE set.
 
     Best-effort: a marker that cannot be written costs one repeated report,
     never a wrong answer, thus no failure here may break the index run.
@@ -968,11 +969,19 @@ def _record_still_uncovered(project_root: Path, db_path: Path) -> None:
             active = get_active_config(conn, derive_project_id(project_root))
             if not active or not active["compile_commands_path"]:
                 return
+            # limit=None, and that is not a detail.  record_excluded
+            # replaces the marker wholesale, thus a list the report cap
+            # truncated would silently drop every entry past it — the
+            # marker could never hold more than the cap, and always the
+            # same first twenty in sort order.  A file past that point was
+            # reported again on every edit, armed a build that changed
+            # nothing, and never reached the suppression this marker is for.
             uncovered = find_unindexed_sources(
                 conn,
                 active["config_hash"],
                 project_root,
                 Path(active["compile_commands_path"]),
+                limit=None,
                 apply_exclusions=False,
             )
         finally:
@@ -981,6 +990,11 @@ def _record_still_uncovered(project_root: Path, db_path: Path) -> None:
         log.debug("could not recompute the uncovered sources", exc_info=True)
         return
 
+    if uncovered:
+        log.info(
+            "%d source file(s) stay outside compile_commands.json after the "
+            "build — recorded so they are not reported again", len(uncovered),
+        )
     autobuild.record_excluded(
         db_path.parent,
         {path: compute_source_hash(project_root / path) for path in uncovered},

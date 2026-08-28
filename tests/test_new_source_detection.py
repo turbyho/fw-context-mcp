@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 from pathlib import Path
 
 import pytest
@@ -496,8 +497,6 @@ class TestGitCandidates:
         from fw_context_mcp.mcp.shared.stale import find_unindexed_sources
 
         root, cc = _git_project(tmp_path)
-        import shutil
-
         shutil.rmtree(root / ".git")
         (root / "src" / "new.c").write_text("void n(void){}\n", encoding="utf-8")
 
@@ -552,3 +551,131 @@ class TestGitCandidates:
 
         assert len(capped) == 20, "the default cap serves the caller that reports"
         assert len(everything) == 25
+
+
+class TestEveryUncoveredFileIsRecorded:
+    """The marker has to describe the whole set, because it replaces itself.
+
+    record_excluded() writes the mapping it is given, wholesale.  Fed a list
+    the report cap had truncated to twenty, it could never hold more — and
+    always the same twenty in sort order.  A file past that point was
+    reported again on every edit, armed a build that changed nothing, and
+    never reached the suppression this marker exists for.
+    """
+
+    @staticmethod
+    def _project(tmp_path: Path, extra: int) -> tuple[Path, Path, Path]:
+        """A git project with *extra* sources that no build covers."""
+        root, cc = _git_project(tmp_path)
+        for i in range(extra):
+            (root / "src" / f"x{i:02d}.c").write_text(f"void x{i}(void){{}}\n",
+                                                      encoding="utf-8")
+        return root, cc, tmp_path / "index.db"
+
+    def test_the_marker_holds_more_than_the_report_cap(self, tmp_path: Path):
+        from fw_context_mcp.indexer.autobuild import load_excluded, record_excluded
+        from fw_context_mcp.indexer.db import open_db
+        from fw_context_mcp.mcp.shared.stale import find_unindexed_sources
+        from fw_context_mcp.utils import compute_source_hash
+
+        root, cc, db_path = self._project(tmp_path, extra=25)
+        conn = open_db(db_path)
+        try:
+            uncovered = find_unindexed_sources(
+                conn, "ch", root, cc, limit=None, apply_exclusions=False
+            )
+        finally:
+            conn.close()
+
+        assert len(uncovered) == 25
+        record_excluded(
+            db_path.parent,
+            {p: compute_source_hash(root / p) for p in uncovered},
+        )
+        assert len(load_excluded(db_path.parent)) == 25
+
+    def test_nothing_is_reported_once_the_whole_set_is_recorded(self, tmp_path: Path):
+        """The end the suppression exists for: a quiet get_active_build."""
+        from fw_context_mcp.indexer.autobuild import record_excluded
+        from fw_context_mcp.indexer.db import open_db
+        from fw_context_mcp.mcp.shared.stale import find_unindexed_sources
+        from fw_context_mcp.utils import compute_source_hash
+
+        root, cc, db_path = self._project(tmp_path, extra=25)
+        conn = open_db(db_path)
+        try:
+            uncovered = find_unindexed_sources(
+                conn, "ch", root, cc, limit=None, apply_exclusions=False
+            )
+            record_excluded(
+                db_path.parent,
+                {p: compute_source_hash(root / p) for p in uncovered},
+            )
+            still = find_unindexed_sources(conn, "ch", root, cc)
+        finally:
+            conn.close()
+
+        assert still == [], (
+            "with a truncated marker the files past the cap came back on "
+            "every scan and armed a build that could not help them"
+        )
+
+    def test_a_truncated_marker_leaves_files_reported(self, tmp_path: Path):
+        """What the defect looked like, kept as the reason for limit=None."""
+        from fw_context_mcp.indexer.autobuild import record_excluded
+        from fw_context_mcp.indexer.db import open_db
+        from fw_context_mcp.mcp.shared.stale import find_unindexed_sources
+        from fw_context_mcp.utils import compute_source_hash
+
+        root, cc, db_path = self._project(tmp_path, extra=25)
+        conn = open_db(db_path)
+        try:
+            capped = find_unindexed_sources(conn, "ch", root, cc, apply_exclusions=False)
+            record_excluded(
+                db_path.parent,
+                {p: compute_source_hash(root / p) for p in capped},
+            )
+            still = find_unindexed_sources(conn, "ch", root, cc)
+        finally:
+            conn.close()
+
+        assert len(capped) == 20
+        assert still, (
+            "this is the old behaviour: the marker took only the first twenty "
+            "and the rest kept coming back"
+        )
+
+    def test_the_recorder_asks_for_the_whole_set(self, tmp_path: Path, monkeypatch):
+        """The fix is in the caller, so the test has to be about the caller.
+
+        _record_still_uncovered() is what feeds record_excluded, and it used
+        to call the scan with the default cap.
+        """
+        import fw_context_mcp.mcp.shared.stale as stale_mod
+        from fw_context_mcp.cli._index import _record_still_uncovered
+
+        root, cc, db_path = self._project(tmp_path, extra=25)
+        seen: dict = {}
+        original = stale_mod.find_unindexed_sources
+
+        def spy(conn, config_hash, root_arg, cc_arg, **kwargs):
+            seen.update(kwargs)
+            return original(conn, config_hash, root_arg, cc_arg, **kwargs)
+
+        monkeypatch.setattr(stale_mod, "find_unindexed_sources", spy)
+        # A project id the config resolver can find, pointing at our database.
+        (root / ".fw-context").mkdir(exist_ok=True)
+        (root / ".fw-context" / "config.toml").write_text(
+            f'[project]\nid = "pid"\n\n[build]\n\n[index]\ndb_dir = "{db_path.parent}"\n',
+            encoding="utf-8",
+        )
+        target = db_path.parent / "pid" / "index.db"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(db_path, target)
+
+        _record_still_uncovered(root, target)
+
+        assert seen.get("limit", "absent") is None, (
+            f"the recorder must lift the report cap; it passed {seen!r}"
+        )
+        assert seen.get("apply_exclusions") is False
