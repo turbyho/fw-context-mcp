@@ -64,7 +64,7 @@ from ...indexer.db import (
 from ...llm.ollama import OllamaError, OllamaModelNotFoundError, call_ollama_async
 from ...utils import abs_path, read_file_lines
 from ..shared.context import _normalize_file_path_query
-from ..shared.stale import _check_file_stale
+from ..shared.stale import _file_differs
 from ._base import BaseHandler
 
 log = logging.getLogger(__name__)
@@ -276,7 +276,7 @@ def _stored_file_state(conn: sqlite3.Connection, file_id: int) -> tuple[float, s
     """Return ``(mtime, source_hash)`` that the index holds for *file_id*.
 
     Returns ``(0.0, "")`` when the row is absent or the columns hold NULL.
-    That pair makes ``_check_file_stale`` report the file as changed, thus an
+    That pair makes ``_file_differs`` report the file as changed, thus an
     index that predates either column degrades to the safe path instead of a
     silent wrong answer.
 
@@ -388,9 +388,12 @@ def _read_verified_body(
     line_no = row["line"]
     end_line = row["end_line"] or 0
 
-    if not _check_file_stale(file_path, stored_state[0], stored_state[1]):
+    if not _file_differs(file_path, *stored_state):
         # The usual path: the file did not change after the index run, thus
-        # the stored line number is correct.  Costs one stat() call.
+        # the stored line number is correct.  Costs one read of the file to
+        # hash it — the body read below opens it again, and one extra read
+        # of one file buys an answer a stat() cannot give, because git
+        # rewrites the stamp of a file it did not change.
         return _read_symbol_body(file_path, line_no, end_line=end_line), "disk", None
 
     if _body_matches_symbol(file_path, row):
@@ -542,7 +545,7 @@ async def explain_symbol(
     row, file_path, llm_analysis, stored_state = query_result
     # A changed file can move the symbol, thus the stored line number can
     # point at unrelated code.  The prompt below must never carry that code.
-    file_changed = _check_file_stale(file_path, stored_state[0], stored_state[1])
+    file_changed = _file_differs(file_path, *stored_state)
     symbol_moved = file_changed and not _body_matches_symbol(file_path, row)
     stale_warning = (
         f"{file_path} changed after the last index run. The result below can "
@@ -1351,7 +1354,8 @@ def read_file(
             return {"error": err}
 
         row = conn.execute(
-            "SELECT content, language, path, mtime FROM files WHERE config_hash=? AND path=?",
+            "SELECT content, language, path, mtime, source_hash "
+            "FROM files WHERE config_hash=? AND path=?",
             (config_hash, resolved),
         ).fetchone()
         return resolved, row
@@ -1379,7 +1383,7 @@ def read_file(
         lines_list = content.splitlines()
         result["lines"] = len(lines_list)
         result["content"] = content
-        if _check_file_stale(result["file"], row["mtime"] or 0.0):
+        if _file_differs(result["file"], row["mtime"] or 0.0, row["source_hash"] or ""):
             # The content comes from the index, thus a changed file makes it
             # a copy of an older state.  The disk path below does not need
             # this warning: it reads the file as it is now.

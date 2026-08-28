@@ -249,3 +249,200 @@ class TestStoredFileState:
     def test_absent_row_gives_zero(self, populated_db):
         """0.0 makes the caller take the safe path instead of trusting a gap."""
         assert _stored_file_state(populated_db, 999999) == (0.0, "")
+
+
+class TestReadFileDecidesByContent:
+    """read_file was the last path still deciding by timestamp alone.
+
+    Its SELECT did not read source_hash and its check did not take one, so
+    _check_file_stale fell back to the stamp — the one signal a git checkout
+    rewrites without touching a byte.  Every other path had already moved to
+    the content.
+    """
+
+    @staticmethod
+    def _project(tmp_path: Path, *, with_hash: bool = True):
+        """An indexed file with content, mtime and (optionally) a hash."""
+        from fw_context_mcp.indexer.db import (
+            open_db,
+            transaction,
+            upsert_build_config,
+            upsert_file,
+            upsert_project,
+        )
+        from fw_context_mcp.utils import compute_source_hash
+
+        root = tmp_path / "proj"
+        (root / "src").mkdir(parents=True)
+        src = root / "src" / "main.c"
+        src.write_text("int main(void) { return 0; }\n", encoding="utf-8")
+
+        db_path = tmp_path / "index.db"
+        conn = open_db(db_path)
+        try:
+            with transaction(conn):
+                upsert_project(conn, "pid", "p", str(root))
+                upsert_build_config(conn, "ch", "pid", str(root / "compile_commands.json"))
+                upsert_file(
+                    conn, "ch", "src/main.c", "c",
+                    mtime=src.stat().st_mtime,
+                    source_hash=compute_source_hash(src) if with_hash else "",
+                )
+                conn.execute(
+                    "UPDATE files SET content=? WHERE config_hash='ch' AND path='src/main.c'",
+                    ("int main(void) { return 0; }\n",),
+                )
+        finally:
+            conn.close()
+        return root, db_path, src
+
+    @staticmethod
+    def _row(db_path: Path):
+        from fw_context_mcp.indexer.db import open_db
+
+        conn = open_db(db_path)
+        try:
+            return conn.execute(
+                "SELECT content, language, path, mtime, source_hash "
+                "FROM files WHERE config_hash='ch' AND path='src/main.c'"
+            ).fetchone()
+        finally:
+            conn.close()
+
+    def test_a_git_touch_is_not_a_change(self, tmp_path: Path):
+        """The regression: mtime moves, the bytes do not."""
+        import os
+
+        from fw_context_mcp.mcp.shared.stale import _file_differs
+
+        root, db_path, src = self._project(tmp_path)
+        row = self._row(db_path)
+        os.utime(src, (row["mtime"] + 3600, row["mtime"] + 3600))
+
+        assert _file_differs(str(src), row["mtime"], row["source_hash"] or "") is False, (
+            "git checkout rewrites the mtime of a file it did not change; "
+            "read_file must not warn about it"
+        )
+
+    def test_a_real_edit_is_a_change(self, tmp_path: Path):
+        from fw_context_mcp.mcp.shared.stale import _file_differs
+
+        root, db_path, src = self._project(tmp_path)
+        row = self._row(db_path)
+        src.write_text("int main(void) { return 1; }\n", encoding="utf-8")
+
+        assert _file_differs(str(src), row["mtime"], row["source_hash"] or "") is True
+
+    def test_without_a_hash_the_timestamp_still_decides(self, tmp_path: Path):
+        """An index written before the column was filled must keep working."""
+        import os
+
+        from fw_context_mcp.mcp.shared.stale import _file_differs
+
+        root, db_path, src = self._project(tmp_path, with_hash=False)
+        row = self._row(db_path)
+        assert not row["source_hash"]
+        os.utime(src, (row["mtime"] + 3600, row["mtime"] + 3600))
+
+        assert _file_differs(str(src), row["mtime"], "") is True, (
+            "no hash to ask, thus the stamp is all there is — the old behaviour"
+        )
+
+    def test_read_file_itself_does_not_warn_after_a_git_touch(self, tmp_path: Path):
+        """End to end, because half the defect was in read_file's SELECT.
+
+        The column was never fetched, so no matter which helper the check
+        called it had nothing to compare.  Exercising the helper alone would
+        pass over exactly that half.
+        """
+        import os
+
+        from fw_context_mcp.mcp.handlers.source import read_file
+
+        root, src = _indexed_project(tmp_path)
+        stored = os.path.getmtime(src)
+        os.utime(src, (stored + 3600, stored + 3600))
+
+        result = read_file(file_path="src/main.c", project_root=str(root))
+
+        assert "error" not in result, result
+        assert result.get("content"), "the indexed content must still come back"
+        assert "stale" not in result and "stale_warning" not in result, (
+            f"a git touch changed no byte, thus no warning: {result.get('stale_warning')}"
+        )
+
+    def test_read_file_itself_warns_on_a_real_edit(self, tmp_path: Path):
+        """The other failure mode of the timestamp, made deterministic.
+
+        The stamp is put back to what the index recorded, so only the bytes
+        differ.  A timestamp comparison sees nothing — which is what a write
+        landing inside MTIME_TOLERANCE_S of the index run does by itself,
+        just without the wait.
+        """
+        import os
+
+        from fw_context_mcp.mcp.handlers.source import read_file
+
+        root, src = _indexed_project(tmp_path)
+        stored = os.path.getmtime(src)
+        src.write_text("int main(void) { return 1; }\n", encoding="utf-8")
+        os.utime(src, (stored, stored))
+
+        result = read_file(file_path="src/main.c", project_root=str(root))
+
+        assert result.get("stale") is True, (
+            "the bytes differ, thus the content check must report it even "
+            "though the stamp is unchanged"
+        )
+        assert "changed after the last index run" in result["stale_warning"]
+
+
+def _indexed_project(tmp_path: Path) -> tuple[Path, Path]:
+    """A project resolve_db_context() can find, with one indexed file.
+
+    The config points db_dir at tmp_path, so the database lands where
+    _resolve_context computes it: ``db_dir / project_id / index.db``.
+    """
+    from fw_context_mcp.indexer.db import (
+        open_db,
+        transaction,
+        upsert_build_config,
+        upsert_file,
+        upsert_project,
+    )
+    from fw_context_mcp.utils import compute_source_hash
+
+    root = tmp_path / "proj"
+    (root / "src").mkdir(parents=True)
+    (root / ".fw-context").mkdir()
+    # A fixed id, like the other integration tests use: _resolve_context
+    # computes db_dir / project_id / index.db, and db_dir points at tmp_path.
+    project_id = "proj-001"
+    (root / ".fw-context" / "config.toml").write_text(
+        f'[project]\nid = "{project_id}"\n\n[build]\n\n[index]\ndb_dir = "{tmp_path}"\n',
+        encoding="utf-8",
+    )
+    src = root / "src" / "main.c"
+    src.write_text("int main(void) { return 0; }\n", encoding="utf-8")
+
+    db_path = tmp_path / project_id / "index.db"
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+
+    conn = open_db(db_path)
+    try:
+        with transaction(conn):
+            upsert_project(conn, project_id, root.name, str(root))
+            upsert_build_config(conn, "ch", project_id, str(root / "compile_commands.json"))
+            upsert_file(
+                conn, "ch", "src/main.c", "c",
+                mtime=src.stat().st_mtime,
+                source_hash=compute_source_hash(src),
+            )
+            conn.execute(
+                "UPDATE files SET content=? WHERE config_hash='ch' AND path='src/main.c'",
+                ("int main(void) { return 0; }\n",),
+            )
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    finally:
+        conn.close()
+    return root, src

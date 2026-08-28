@@ -193,9 +193,18 @@ def _stale_files(conn, config_hash: str, file_paths: list[str], root: Path) -> l
 def _file_differs(path: str, stored_mtime: float, stored_hash: str) -> bool:
     """Answer by content when a hash exists, by timestamp when it does not.
 
-    Unlike ``_check_file_stale`` this one asks the content first, without the
-    timestamp as a gate.  A caller with few files can afford it, and it
-    removes both failure modes of the timestamp at once.
+    THE ONE TO USE for a caller that holds a handful of files: a search
+    result, a symbol body, a file being read.  It asks the content first,
+    with no timestamp gate in front, which removes both failure modes of the
+    timestamp at once — the stamp git rewrote without changing a byte, and
+    the write that kept the old stamp.
+
+    ``_check_file_stale`` is the other half and is NOT interchangeable: it
+    gates on the timestamp and reads the content only for a file the stamp
+    calls suspect.  That trade belongs to the caller that walks every
+    indexed file and cannot afford a hash per row.  Reaching for it on a
+    single file is what left read_file warning about a file git had only
+    touched.
     """
     differs = _content_differs(path, stored_hash)
     if differs is not None:
@@ -255,6 +264,10 @@ def _check_file_stale(path: str, stored_mtime: float, stored_hash: str = "") -> 
     answers it, which is what git does: its stat cache filters, and the
     object hash decides.  Without a stored hash the behaviour is the old one,
     thus an index written before this change still works.
+
+    FOR THE BATCH PATH ONLY.  The gate exists to keep a scan of every
+    indexed file affordable; a caller holding one file should use
+    ``_file_differs``, which skips the gate and asks the content directly.
 
     A missing file is stale — it was deleted since indexing.
     """
