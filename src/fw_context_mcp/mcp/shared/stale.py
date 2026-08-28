@@ -442,6 +442,7 @@ def find_unindexed_sources(
     cc_path: Path,
     *,
     limit: int = _UNINDEXED_REPORT_LIMIT,
+    apply_exclusions: bool = True,
 ) -> list[str]:
     """Return source files that ``compile_commands.json`` does not cover.
 
@@ -471,6 +472,11 @@ def find_unindexed_sources(
         cc_path: Path of the compile_commands.json of this build.
         limit: Maximum number of paths to return.  The caller reports the
             count, thus a long list adds nothing.
+        apply_exclusions: When True (default), leave out the files that a
+            build already ran for and still did not cover — see
+            ``indexer.autobuild.load_excluded``.  The caller that writes
+            that marker passes False, or it would filter out the very files
+            it is about to record.
 
     Returns:
         list[str]: Paths relative to *root*, sorted, at most *limit* long.
@@ -478,6 +484,7 @@ def find_unindexed_sources(
         point every file would look new, and a warning on every query is
         worse than none.
     """
+    from ...indexer.autobuild import load_excluded
     from ...indexer.manifest import load_build_dir_patterns
     from ...indexer.ops import _normalize_file_path
 
@@ -501,6 +508,10 @@ def find_unindexed_sources(
         *load_build_dir_patterns(db_path.parent, config_hash),
         f"{FW_CONTEXT_REL}/",
     ]
+    # Read once, before the walk.  The caller that WRITES the marker passes
+    # apply_exclusions=False, or it would filter out the very files it is
+    # about to record.
+    excluded = load_excluded(db_path.parent) if apply_exclusions else {}
 
     found: list[str] = []
     for scan_root in sorted(_project_scan_roots(scan_roots, build_patterns)):
@@ -518,6 +529,15 @@ def find_unindexed_sources(
                     continue
             except OSError:
                 continue  # vanished between the walk and the stat
+            # A build already ran for this file and the build system still
+            # did not take it.  Reporting it again only tells the caller to
+            # run a command that changes nothing, and it would hold
+            # get_active_build on "reindex_needed" for ever.  The hash is
+            # what expires the record: an edit means the user may have just
+            # added the file to the build, thus it earns one more report.
+            recorded = excluded.get(key)
+            if recorded and recorded == compute_source_hash(Path(candidate)):
+                continue
             found.append(key)
 
     return sorted(found)[:limit]

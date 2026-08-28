@@ -34,7 +34,7 @@ from typing import TYPE_CHECKING
 
 from ..indexer import autobuild
 from ..mcp.shared.pid_file import PidFile
-from ..utils import CC_OUTPUT_REL, autobuild_dir
+from ..utils import CC_OUTPUT_REL, SAFE_EXCEPT, autobuild_dir
 from . import VerboseFormatter
 
 if TYPE_CHECKING:
@@ -929,8 +929,59 @@ def cmd_index(args: argparse.Namespace) -> int:
         # obsolete.
         autobuild.clear_failure(db_path.parent)
 
+    if getattr(args, "build", False):
+        _record_still_uncovered(project_root, db_path)
+
     # Outside the index lock.  The daemon does a staleness check when it
     # starts, thus a daemon that starts inside the lock could start a
     # second index run against the database that this run still changes.
     _ensure_watcher_after_index(project_root)
     return 0
+
+
+def _record_still_uncovered(project_root: Path, db_path: Path) -> None:
+    """Remember the sources a build ran for and still did not cover.
+
+    Called only after a run that built.  What is left uncovered then is not
+    a file waiting for a build — the build system does not want it: a test
+    outside the build, an old experiment, a variant that is not compiled.
+    Reporting it again would tell the caller to run `fw-context index
+    --build`, which changes nothing, and would hold get_active_build on
+    "reindex_needed" for as long as the file stays edited.
+
+    Recomputing the scan here is simpler than remembering the list from
+    before the build, and it covers an explicit `--build` from the user just
+    as well as an automatic one.  ``apply_exclusions=False`` is required, or
+    the scan would filter out the files this is about to record.
+
+    Best-effort: a marker that cannot be written costs one repeated report,
+    never a wrong answer, thus no failure here may break the index run.
+    """
+    from ..config import derive_project_id
+    from ..indexer.db import get_active_config, open_db
+    from ..mcp.shared.stale import find_unindexed_sources
+    from ..utils import compute_source_hash
+
+    try:
+        conn = open_db(db_path)
+        try:
+            active = get_active_config(conn, derive_project_id(project_root))
+            if not active or not active["compile_commands_path"]:
+                return
+            uncovered = find_unindexed_sources(
+                conn,
+                active["config_hash"],
+                project_root,
+                Path(active["compile_commands_path"]),
+                apply_exclusions=False,
+            )
+        finally:
+            conn.close()
+    except SAFE_EXCEPT:
+        log.debug("could not recompute the uncovered sources", exc_info=True)
+        return
+
+    autobuild.record_excluded(
+        db_path.parent,
+        {path: compute_source_hash(project_root / path) for path in uncovered},
+    )

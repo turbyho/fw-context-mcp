@@ -232,6 +232,82 @@ class TestScanRootFilter:
         assert _project_scan_roots({"targets_custom"}, ["BUILD/"]) == {"targets_custom"}
 
 
+class TestExcludedSources:
+    """A file a build ran for and still did not cover is reported once.
+
+    Without this, editing a .c that the build system deliberately leaves out
+    holds get_active_build on "reindex_needed" for ever: the only thing that
+    clears the report is a build that makes compile_commands.json newer than
+    the file, and no build will ever take that file.
+    """
+
+    @staticmethod
+    def _db_dir(conn) -> Path:
+        return Path(conn.execute("PRAGMA database_list").fetchone()["file"]).parent
+
+    def test_a_recorded_file_is_not_reported(self, project):
+        from fw_context_mcp.indexer.autobuild import record_excluded
+        from fw_context_mcp.utils import compute_source_hash
+
+        conn, root, cc = project
+        added = _add_file(root, "src/experiment.c", newer_than=cc)
+        assert find_unindexed_sources(conn, _CONFIG_HASH, root, cc) == [
+            "src/experiment.c"
+        ]
+
+        record_excluded(
+            self._db_dir(conn), {"src/experiment.c": compute_source_hash(added)}
+        )
+
+        assert find_unindexed_sources(conn, _CONFIG_HASH, root, cc) == []
+
+    def test_an_edit_brings_it_back(self, project):
+        """The user may have just added the file to the build."""
+        from fw_context_mcp.indexer.autobuild import record_excluded
+        from fw_context_mcp.utils import compute_source_hash
+
+        conn, root, cc = project
+        added = _add_file(root, "src/experiment.c", newer_than=cc)
+        record_excluded(
+            self._db_dir(conn), {"src/experiment.c": compute_source_hash(added)}
+        )
+
+        added.write_text("int experiment(void) { return 2; }\n")
+        reference = os.path.getmtime(cc)
+        os.utime(added, (reference + 200, reference + 200))
+
+        assert find_unindexed_sources(conn, _CONFIG_HASH, root, cc) == [
+            "src/experiment.c"
+        ]
+
+    def test_the_writer_path_ignores_the_marker(self, project):
+        """apply_exclusions=False, or the recorder filters out its own input."""
+        from fw_context_mcp.indexer.autobuild import record_excluded
+        from fw_context_mcp.utils import compute_source_hash
+
+        conn, root, cc = project
+        added = _add_file(root, "src/experiment.c", newer_than=cc)
+        record_excluded(
+            self._db_dir(conn), {"src/experiment.c": compute_source_hash(added)}
+        )
+
+        assert find_unindexed_sources(
+            conn, _CONFIG_HASH, root, cc, apply_exclusions=False
+        ) == ["src/experiment.c"]
+
+    def test_a_damaged_marker_reads_as_empty(self, project):
+        """Erring towards one extra report beats hiding an uncovered file."""
+        conn, root, cc = project
+        _add_file(root, "src/experiment.c", newer_than=cc)
+        (self._db_dir(conn) / "excluded_sources.json").write_text(
+            "{not json at all", encoding="utf-8"
+        )
+
+        assert find_unindexed_sources(conn, _CONFIG_HASH, root, cc) == [
+            "src/experiment.c"
+        ]
+
+
 class TestFwContextDirIsSkipped:
     """The directory fw-context writes into is never scanned for sources.
 

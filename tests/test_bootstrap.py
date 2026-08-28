@@ -264,6 +264,69 @@ class TestModifiedCountInFastMode:
         assert result["modified_files_count"] == 0
         assert "fully up to date" in result["index_message"]
 
+    def test_an_uncovered_source_reads_as_reindexing_when_it_builds_itself(
+        self, tmp_path: Path, monkeypatch
+    ):
+        """A file fw-context will build on its own is work under way.
+
+        "reindex_needed" would ask the caller for a command that only
+        duplicates the build the daemon is about to run.
+        """
+        from fw_context_mcp.indexer.autobuild import AutobuildState
+        from fw_context_mcp.mcp.handlers import maintenance
+
+        root, _ = self._project_with_one_indexed_file(tmp_path)
+        monkeypatch.setattr(
+            maintenance, "find_unindexed_sources", lambda *a, **k: ["src/added.c"]
+        )
+        monkeypatch.setattr(
+            maintenance, "_autobuild_state", lambda *a, **k: AutobuildState.WILL_BUILD
+        )
+
+        result = get_active_build(project_root=str(root))
+
+        assert result["status"] == "reindexing"
+        assert "src/added.c" in result["index_message"]
+        assert "no command is needed" in result["index_message"]
+
+    def test_an_uncovered_source_reads_as_reindex_needed_when_it_cannot(
+        self, tmp_path: Path, monkeypatch
+    ):
+        from fw_context_mcp.indexer.autobuild import AutobuildState
+        from fw_context_mcp.mcp.handlers import maintenance
+
+        root, _ = self._project_with_one_indexed_file(tmp_path)
+        monkeypatch.setattr(
+            maintenance, "find_unindexed_sources", lambda *a, **k: ["src/added.c"]
+        )
+        monkeypatch.setattr(
+            maintenance, "_autobuild_state", lambda *a, **k: AutobuildState.UNSUPPORTED
+        )
+
+        result = get_active_build(project_root=str(root))
+
+        assert result["status"] == "reindex_needed"
+        assert "fw-context index --build" in result["index_message"]
+
+    def test_a_failed_automatic_build_says_to_read_the_error(
+        self, tmp_path: Path, monkeypatch
+    ):
+        from fw_context_mcp.indexer.autobuild import AutobuildState
+        from fw_context_mcp.mcp.handlers import maintenance
+
+        root, _ = self._project_with_one_indexed_file(tmp_path)
+        monkeypatch.setattr(
+            maintenance, "find_unindexed_sources", lambda *a, **k: ["src/added.c"]
+        )
+        monkeypatch.setattr(
+            maintenance, "_autobuild_state", lambda *a, **k: AutobuildState.BACKOFF
+        )
+
+        result = get_active_build(project_root=str(root))
+
+        assert result["status"] == "reindex_needed"
+        assert "failed recently" in result["index_message"]
+
     def test_changed_file_is_counted_in_fast_mode(self, tmp_path: Path):
         import os
 

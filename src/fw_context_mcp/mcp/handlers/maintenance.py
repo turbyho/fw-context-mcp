@@ -36,6 +36,8 @@ from pydantic import Field
 from ...config import derive_project_id
 from ...config import load as load_config
 from ...config.settings import Config
+from ...indexer.autobuild import AutobuildState
+from ...indexer.autobuild import state as autobuild_state
 from ...indexer.compile_commands import parse as parse_cc
 from ...indexer.db import (
     CURRENT_SCHEMA_VERSION,
@@ -70,6 +72,47 @@ from ..shared.stale import (
 )
 
 log = logging.getLogger(__name__)
+
+
+# What to tell the caller for each outcome of the automatic build.  Three
+# different sentences, because the required action differs: none, run the
+# build, or look at why the build failed.
+_AUTOBUILD_ADVICE: dict[AutobuildState, str] = {
+    AutobuildState.WILL_BUILD: (
+        "fw-context builds them on its own; no command is needed"
+    ),
+    AutobuildState.UNSUPPORTED: (
+        "this build system cannot build in the background without touching "
+        "the output of your own build — run `fw-context index --build`"
+    ),
+    AutobuildState.BACKOFF: (
+        "an automatic build for these files failed recently — run "
+        "`fw-context index --build` and read the error"
+    ),
+}
+
+
+def _autobuild_state(
+    root: Path, proj_cfg, db_path: Path, new_sources: list[str]
+) -> AutobuildState:
+    """Say what will happen to *new_sources*, for the message and the status.
+
+    Answers UNSUPPORTED when the build system cannot be determined: without
+    a backend nothing can build on its own, and that is the answer that
+    tells the caller to act rather than to wait.
+    """
+    if not new_sources:
+        return AutobuildState.WILL_BUILD  # unused — no file to report
+
+    from dataclasses import replace
+
+    from ...indexer.builders import registry
+    from ...utils import autobuild_dir
+
+    system = proj_cfg.build.system or _detect_build_system(root)
+    builder_cls = registry.get(system) if system else None
+    candidate = replace(proj_cfg.build, isolated_build_dir=autobuild_dir())
+    return autobuild_state(builder_cls, candidate, db_path.parent, new_sources)
 
 
 def _expand_dir_placeholder(dir_str: str, root: Path) -> str:
@@ -476,15 +519,24 @@ def get_active_build(
         new_sources = find_unindexed_sources(
             conn, config_hash, root, Path(cfg["compile_commands_path"])
         )
+        # What will happen to those files decides both the status and the
+        # wording.  fw-context builds them on its own where the backend can
+        # isolate its output, and then the caller has nothing to do; where it
+        # cannot, or where a build already failed, the caller must act.
+        auto_state = _autobuild_state(root, proj_cfg, db_path, new_sources)
 
         # Three conditions force a reindex:
         #   1. Schema version in DB is older than current code expects.
         #   2. compile_commands.json was modified since indexing
         #      (detected via mtime comparison in _is_stale).
-        #   3. A source file is missing from compile_commands.json.
+        #   3. A source file is missing from compile_commands.json AND
+        #      fw-context will not build it on its own.  When it will, the
+        #      state is "reindexing" below — work is under way, and telling
+        #      the caller to run a command would only duplicate it.
         # Modified source files are handled per-query via auto-reindex
         # and do NOT cause reindex_needed=True.
-        needs_reindex = cc_changed or schema_old or bool(new_sources)
+        blocked_sources = bool(new_sources) and auto_state is not AutobuildState.WILL_BUILD
+        needs_reindex = cc_changed or schema_old or blocked_sources
 
         # Build reindex_reasons — only when reindex is actually needed
         reindex_reasons: list[str] = []
@@ -497,14 +549,19 @@ def get_active_build(
             more = f" and {len(new_sources) - 3} more" if len(new_sources) > 3 else ""
             reindex_reasons.append(
                 f"{len(new_sources)} source file(s) not in compile_commands.json "
-                f"({listed}{more}) — needs `fw-context index --build`"
+                f"({listed}{more}) — {_AUTOBUILD_ADVICE[auto_state]}"
             )
 
         # Determine status — single value that drives LLM decision-making.
         # Priority: reindex_needed > reindexing > ready.
+        #
+        # A file that fw-context will build on its own counts as
+        # "reindexing": the work is under way or about to be, and every query
+        # keeps working meanwhile.  "reindex_needed" would ask the caller for
+        # a command that only duplicates it.
         if needs_reindex:
             status = "reindex_needed"
-        elif bg_running:
+        elif bg_running or (new_sources and auto_state is AutobuildState.WILL_BUILD):
             status = "reindexing"
         else:
             status = "ready"
@@ -523,7 +580,13 @@ def get_active_build(
         elif status == "ready":
             index_message = f"Index is fully up to date ({sym_count} symbols)"
         elif status == "reindexing":
-            if modified_count:
+            if new_sources and auto_state is AutobuildState.WILL_BUILD:
+                index_message = (
+                    f"{len(new_sources)} source file(s) are not in compile_commands.json "
+                    f"(first: {new_sources[0]}). fw-context builds them on its own — "
+                    f"no command is needed. Queries work on existing data meanwhile."
+                )
+            elif modified_count:
                 index_message = (
                     f"Index is usable — {modified_count} file(s) being reindexed "
                     f"in background. All queries return accurate results."
@@ -535,11 +598,13 @@ def get_active_build(
         elif new_sources:
             # Checked before the other reindex reasons: `--build` is the only
             # command that repairs this one, and a message that says plain
-            # `index` would send the caller in a circle.
+            # `index` would send the caller in a circle.  Reaching here means
+            # fw-context will NOT build them itself — _AUTOBUILD_ADVICE says
+            # which of the two reasons applies.
             index_message = (
                 f"{len(new_sources)} source file(s) are not in compile_commands.json "
                 f"(first: {new_sources[0]}). A plain reindex cannot see them — "
-                f"run `fw-context index --build`. Queries still work on existing data."
+                f"{_AUTOBUILD_ADVICE[auto_state]}. Queries still work on existing data."
             )
         elif schema_old and cc_changed:
             index_message = (
@@ -990,6 +1055,13 @@ def reset_index(
         for suffix in ("-wal", "-shm", "-journal"):
             p = db_path.with_name(db_path.name + suffix)
             p.unlink(missing_ok=True)
+        # Both autobuild markers describe the index that just went away: a
+        # build that failed for a file list, and the files a build ran for
+        # and did not cover.  Left behind they would suppress or delay work
+        # on a fresh index that knows nothing about either.
+        from ...indexer.autobuild import clear_excluded, clear_failure
+        clear_failure(db_path.parent)
+        clear_excluded(db_path.parent)
         from ...mcp.shared.stale import _invalidate_modified_cache
         _invalidate_modified_cache()  # clear all entries — DB is gone
         info["action"] = "deleted"

@@ -141,6 +141,111 @@ def _resolve_compile_commands_with(args, root, cfg, system, bg):
     return _resolve_compile_commands(args, root, cfg, system, bg)
 
 
+class TestAutobuildState:
+    """The three answers that decide both the status and the wording."""
+
+    @staticmethod
+    def _cfg(isolated: str | None = ".fw-context/autobuild/default"):
+        from fw_context_mcp.indexer.build import BuildConfig
+
+        return BuildConfig(isolated_build_dir=isolated)
+
+    def test_a_backend_that_isolates_will_build(self, tmp_path: Path):
+        from fw_context_mcp.indexer.autobuild import AutobuildState, state
+        from fw_context_mcp.indexer.builders.mbed_os import MbedOSBuildSystem
+
+        assert state(
+            MbedOSBuildSystem, self._cfg(), tmp_path, ["src/a.c"]
+        ) is AutobuildState.WILL_BUILD
+
+    def test_a_backend_that_compiles_without_isolation_is_unsupported(
+        self, tmp_path: Path
+    ):
+        """makefile compiles for real once the dry run is off."""
+        from fw_context_mcp.indexer.autobuild import AutobuildState, state
+        from fw_context_mcp.indexer.build import BuildConfig
+        from fw_context_mcp.indexer.builders.makefile import MakefileBuildSystem
+
+        cfg = BuildConfig(make_dry_run=False)
+
+        assert state(
+            MakefileBuildSystem, cfg, tmp_path, ["src/a.c"]
+        ) is AutobuildState.UNSUPPORTED
+
+    def test_no_backend_is_unsupported(self, tmp_path: Path):
+        """Without a build system nothing can build on its own."""
+        from fw_context_mcp.indexer.autobuild import AutobuildState, state
+
+        assert state(
+            None, self._cfg(), tmp_path, ["src/a.c"]
+        ) is AutobuildState.UNSUPPORTED
+
+    def test_a_fresh_failure_for_the_same_files_is_backoff(self, tmp_path: Path):
+        from fw_context_mcp.indexer.autobuild import (
+            AutobuildState,
+            record_failure,
+            state,
+        )
+        from fw_context_mcp.indexer.builders.mbed_os import MbedOSBuildSystem
+
+        record_failure(tmp_path, ["src/a.c"])
+
+        assert state(
+            MbedOSBuildSystem, self._cfg(), tmp_path, ["src/a.c"]
+        ) is AutobuildState.BACKOFF
+
+    def test_a_failure_for_other_files_does_not_block(self, tmp_path: Path):
+        from fw_context_mcp.indexer.autobuild import (
+            AutobuildState,
+            record_failure,
+            state,
+        )
+        from fw_context_mcp.indexer.builders.mbed_os import MbedOSBuildSystem
+
+        record_failure(tmp_path, ["src/a.c"])
+
+        assert state(
+            MbedOSBuildSystem, self._cfg(), tmp_path, ["src/b.c"]
+        ) is AutobuildState.WILL_BUILD
+
+
+class TestExcludedMarker:
+    """The record that stops a file the build system refuses being reported."""
+
+    def test_a_round_trip_keeps_the_mapping(self, tmp_path: Path):
+        from fw_context_mcp.indexer.autobuild import load_excluded, record_excluded
+
+        record_excluded(tmp_path, {"src/a.c": "hash-a", "src/b.c": "hash-b"})
+
+        assert load_excluded(tmp_path) == {"src/a.c": "hash-a", "src/b.c": "hash-b"}
+
+    def test_an_empty_mapping_removes_the_marker(self, tmp_path: Path):
+        """Everything it named is covered now; an empty file would only linger."""
+        from fw_context_mcp.indexer.autobuild import (
+            EXCLUDED_MARKER,
+            load_excluded,
+            record_excluded,
+        )
+
+        record_excluded(tmp_path, {"src/a.c": "hash-a"})
+        record_excluded(tmp_path, {})
+
+        assert not (tmp_path / EXCLUDED_MARKER).exists()
+        assert load_excluded(tmp_path) == {}
+
+    def test_a_damaged_marker_reads_as_empty(self, tmp_path: Path):
+        from fw_context_mcp.indexer.autobuild import EXCLUDED_MARKER, load_excluded
+
+        (tmp_path / EXCLUDED_MARKER).write_text("[1, 2, 3]", encoding="utf-8")
+
+        assert load_excluded(tmp_path) == {}
+
+    def test_a_missing_marker_reads_as_empty(self, tmp_path: Path):
+        from fw_context_mcp.indexer.autobuild import load_excluded
+
+        assert load_excluded(tmp_path) == {}
+
+
 class TestPlanAutoBuild:
     """The planner refuses every case where a build is not safe or not needed."""
 
