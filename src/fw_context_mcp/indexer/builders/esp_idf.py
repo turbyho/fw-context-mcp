@@ -151,31 +151,36 @@ class ESPIDFBuildSystem:
         if "-MMD" not in env["EXTRA_CXXFLAGS"]:
             env["EXTRA_CXXFLAGS"] += " -MMD" if env["EXTRA_CXXFLAGS"] else "-MMD"
 
-        # Ensure the target is configured — idf.py build without a prior
-        # set-target fails when the cmake cache is missing (e.g. after fullclean
-        # or a fresh clone).  set-target reads the target from sdkconfig.
+        # Configure the build directory when it holds no cmake cache.
         #
-        # The gate asks about the directory this build writes to, not about
+        # The gate asks about the directory THIS build writes to, not about
         # project_root/"build": with `-B` those are different, and asking
         # about the wrong one left the isolated directory unconfigured while
         # the build of the user made it look ready.
-        if not build_dir.exists():
+        #
+        # `set-target` runs only when there is no sdkconfig, and that is a
+        # correctness rule, not a saving.  It renames <project>/sdkconfig to
+        # sdkconfig.old — `-B` does not move that, because
+        # tools/cmake/project.cmake takes ${CMAKE_SOURCE_DIR}/sdkconfig and
+        # renames it whenever _IDF_PY_SET_TARGET_ACTION is set — and that
+        # file is usually committed.  An automatic build would have deleted
+        # it, and the target it passed comes from the guess below, read out
+        # of that same file with esp32 as the fallback, so it could also
+        # regenerate the configuration for a different chip.
+        #
+        # Nothing is lost by skipping it: ensure_build_directory() in
+        # idf_py_actions/tools.py creates the directory and runs cmake on
+        # its own, and project.cmake takes the target from the sdkconfig
+        # that is already there.  set-target is needed only when that file
+        # does not exist — and then it renames nothing.
+        sdkconfig = project_root / "sdkconfig"
+        if not build_dir.exists() and not sdkconfig.exists():
             target = "esp32"
-            sdkconfig = project_root / "sdkconfig"
-            if sdkconfig.exists():
-                import re
-                try:
-                    content = sdkconfig.read_text(encoding="utf-8")
-                    m = re.search(r'CONFIG_IDF_TARGET="(\w+)"', content)
-                    if m:
-                        target = m.group(1)
-                except OSError:
-                    pass
-            if target == "esp32":
-                log.warning(
-                    "Could not detect ESP-IDF target from sdkconfig — defaulting to esp32. "
-                    "Set target explicitly with 'idf.py set-target <chip>' if using a different variant."
-                )
+            log.warning(
+                "No sdkconfig in %s — defaulting the ESP-IDF target to esp32. "
+                "Run 'idf.py set-target <chip>' yourself if this project uses "
+                "a different variant.", project_root,
+            )
             set_target_cmd = [idf_py, *build_dir_flag, "set-target", target]
             log.info("esp-idf set-target: %s", " ".join(set_target_cmd))
             try:
