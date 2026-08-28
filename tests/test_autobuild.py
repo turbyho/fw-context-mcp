@@ -19,11 +19,9 @@ from pathlib import Path
 
 import pytest
 
-from fw_context_mcp.cli._index import (
-    _autobuild_blocked,
-    _clear_autobuild_failure,
-    _record_autobuild_failure,
-)
+from fw_context_mcp.indexer.autobuild import blocked as _autobuild_blocked
+from fw_context_mcp.indexer.autobuild import clear_failure as _clear_autobuild_failure
+from fw_context_mcp.indexer.autobuild import record_failure as _record_autobuild_failure
 from fw_context_mcp.utils import AUTOBUILD_REL, autobuild_dir
 
 

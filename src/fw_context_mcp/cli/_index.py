@@ -32,6 +32,7 @@ import time
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from ..indexer import autobuild
 from ..mcp.shared.pid_file import PidFile
 from ..utils import CC_OUTPUT_REL, autobuild_dir
 from . import VerboseFormatter
@@ -46,55 +47,10 @@ log = logging.getLogger(__name__)
 # A new .c file has no translation unit: it is absent from
 # compile_commands.json, and only a build puts it there.  A plain reindex
 # skips it without a word, thus fw-context runs the build itself.
-
-# Marker of a failed automatic build.  Without it a failing build would run
-# again on every daemon cycle: the failure leaves compile_commands.json
-# untouched, thus the file stays "newer" and the trigger stays armed.
-_AUTOBUILD_FAILED = "autobuild.failed"
-
-# How long a failure keeps the automatic build off.  Long enough that a
-# broken tree does not burn the CPU, short enough that a repair takes effect
-# within one working session.  An explicit `fw-context index --build`
-# ignores the marker.
-_AUTOBUILD_BACKOFF_S = 1800.0
-
-
-def _autobuild_blocked(db_dir: Path, new_sources: list[str]) -> bool:
-    """Tell whether a previous automatic build failed for the same files.
-
-    The marker holds the file list of the attempt.  A different list means
-    that the tree moved on, thus the next attempt is worth one more try; the
-    same list within the backoff window means that nothing changed and the
-    build would fail again.
-    """
-    marker = db_dir / _AUTOBUILD_FAILED
-    try:
-        stamp, _, recorded = marker.read_text(encoding="utf-8").partition("\n")
-        age = time.time() - float(stamp)
-    except (OSError, ValueError):
-        return False
-    if age > _AUTOBUILD_BACKOFF_S:
-        return False
-    return recorded.splitlines() == new_sources
-
-
-def _record_autobuild_failure(db_dir: Path, new_sources: list[str]) -> None:
-    """Remember a failed automatic build, so the next run does not repeat it."""
-    try:
-        db_dir.mkdir(parents=True, exist_ok=True)
-        (db_dir / _AUTOBUILD_FAILED).write_text(
-            f"{time.time()}\n" + "\n".join(new_sources), encoding="utf-8"
-        )
-    except OSError:
-        log.debug("could not write the autobuild failure marker", exc_info=True)
-
-
-def _clear_autobuild_failure(db_dir: Path) -> None:
-    """Drop the marker after a build that worked."""
-    try:
-        (db_dir / _AUTOBUILD_FAILED).unlink(missing_ok=True)
-    except OSError:
-        log.debug("could not remove the autobuild failure marker", exc_info=True)
+#
+# The markers and the state machine live in indexer/autobuild.py, because
+# mcp/handlers/maintenance.py needs the same answers to tell the caller what
+# will happen, and it cannot import from cli/.
 
 
 def _plan_auto_build(
@@ -159,7 +115,7 @@ def _plan_auto_build(
     finally:
         conn.close()
 
-    if not new_sources or _autobuild_blocked(db_path.parent, new_sources):
+    if not new_sources or autobuild.blocked(db_path.parent, new_sources):
         return [], None
     return new_sources, candidate
 
@@ -906,10 +862,10 @@ def cmd_index(args: argparse.Namespace) -> int:
         # successful — see the same call at the end of this function.
         if exit_code == 0:
             if auto_build_sources:
-                _clear_autobuild_failure(db_path.parent)
+                autobuild.clear_failure(db_path.parent)
             _ensure_watcher_after_index(project_root)
         elif auto_build_sources:
-            _record_autobuild_failure(db_path.parent, auto_build_sources)
+            autobuild.record_failure(db_path.parent, auto_build_sources)
         return exit_code
 
     # ── Resolve compile_commands.json ──
@@ -919,7 +875,7 @@ def cmd_index(args: argparse.Namespace) -> int:
             # The build that fw-context started failed.  Remember it, or the
             # next daemon cycle repeats it: a failed build leaves
             # compile_commands.json untouched, thus the trigger stays armed.
-            _record_autobuild_failure(db_path.parent, auto_build_sources)
+            autobuild.record_failure(db_path.parent, auto_build_sources)
         return 1
     compile_commands, explicit_cc = cc_result
     assert compile_commands is not None  # checked above via cc_result[0]
@@ -971,7 +927,7 @@ def cmd_index(args: argparse.Namespace) -> int:
     if auto_build_sources:
         # The build worked, thus the backoff marker of an earlier failure is
         # obsolete.
-        _clear_autobuild_failure(db_path.parent)
+        autobuild.clear_failure(db_path.parent)
 
     # Outside the index lock.  The daemon does a staleness check when it
     # starts, thus a daemon that starts inside the lock could start a
