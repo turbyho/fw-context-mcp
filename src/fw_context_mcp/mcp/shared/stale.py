@@ -31,7 +31,7 @@ from pathlib import Path
 
 from ...config import derive_project_id
 from ...indexer.db import get_active_config
-from ...utils import MTIME_TOLERANCE_S, abs_path, compute_source_hash
+from ...utils import FW_CONTEXT_REL, MTIME_TOLERANCE_S, abs_path, compute_source_hash
 from .context import _quick_open_readonly, get_executor
 
 log = logging.getLogger(__name__)
@@ -488,7 +488,19 @@ def find_unindexed_sources(
 
     known, scan_roots = _indexed_paths(conn, config_hash)
     db_path = Path(conn.execute("PRAGMA database_list").fetchone()["file"])
-    build_patterns = load_build_dir_patterns(db_path.parent, config_hash)
+    # The directory fw-context writes into is not a place to look for the
+    # source files of the user: it holds the generated compile_commands.json
+    # and the output of the automatic build.  Adding it here is not
+    # belt-and-braces over the patterns of the backend — measured, those do
+    # not cover it.  `.fw-context/autobuild/` misses mbed-os (`BUILD/`) and
+    # platformio (`.pio/build/`) outright, and the five backends where it
+    # does match only match because "autobuild/" happens to hold the
+    # substring "build/".  A generated .c left inside would be reported as
+    # missing from compile_commands.json, and that arms the build again.
+    build_patterns = [
+        *load_build_dir_patterns(db_path.parent, config_hash),
+        f"{FW_CONTEXT_REL}/",
+    ]
 
     found: list[str] = []
     for scan_root in sorted(_project_scan_roots(scan_roots, build_patterns)):

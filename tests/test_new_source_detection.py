@@ -230,3 +230,58 @@ class TestScanRootFilter:
         from fw_context_mcp.mcp.shared.stale import _project_scan_roots
 
         assert _project_scan_roots({"targets_custom"}, ["BUILD/"]) == {"targets_custom"}
+
+
+class TestFwContextDirIsSkipped:
+    """The directory fw-context writes into is never scanned for sources.
+
+    The patterns of the backend do not cover it.  Measured against
+    ``.fw-context/autobuild/default/``: mbed-os contributes ``BUILD/`` and
+    platformio ``.pio/build/``, and neither matches; five other backends
+    match only because "autobuild/" happens to hold the substring "build/".
+    A generated .c left inside would be reported as missing from
+    compile_commands.json, and that arms the automatic build again.
+    """
+
+    def test_a_source_under_autobuild_is_not_reported(self, project):
+        conn, root, cc = project
+        _add_file(root, ".fw-context/autobuild/default/src/generated.c", newer_than=cc)
+
+        assert find_unindexed_sources(conn, _CONFIG_HASH, root, cc) == []
+
+    def test_a_source_under_the_generated_build_dir_is_not_reported(self, project):
+        conn, root, cc = project
+        _add_file(root, ".fw-context/build/whatever.c", newer_than=cc)
+
+        assert find_unindexed_sources(conn, _CONFIG_HASH, root, cc) == []
+
+    def test_a_real_source_is_still_reported(self, project):
+        """The exclusion must not narrow the scan any further than that."""
+        conn, root, cc = project
+        _add_file(root, "src/added.c", newer_than=cc)
+        _add_file(root, ".fw-context/autobuild/default/src/generated.c", newer_than=cc)
+
+        assert find_unindexed_sources(conn, _CONFIG_HASH, root, cc) == ["src/added.c"]
+
+    def test_fw_context_never_survives_as_a_scan_root(self, project):
+        """Even when an indexed project file put it into the root set.
+
+        A generated header under .fw-context can reach the files table with
+        is_project=1, and _indexed_paths seeds the walk from the first path
+        component of every project file.
+        """
+        from fw_context_mcp.indexer.db import transaction, upsert_file
+
+        conn, root, cc = project
+        generated = _add_file(root, ".fw-context/autobuild/default/cfg.c", newer_than=cc)
+        with transaction(conn):
+            upsert_file(
+                conn, _CONFIG_HASH, ".fw-context/autobuild/default/cfg.c", "c",
+                mtime=os.path.getmtime(generated),
+            )
+            conn.execute(
+                "UPDATE files SET is_project=1 WHERE config_hash=?", (_CONFIG_HASH,)
+            )
+        _add_file(root, ".fw-context/autobuild/default/other.c", newer_than=cc)
+
+        assert find_unindexed_sources(conn, _CONFIG_HASH, root, cc) == []

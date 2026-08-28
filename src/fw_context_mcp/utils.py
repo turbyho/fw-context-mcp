@@ -41,6 +41,7 @@ log = logging.getLogger(__name__)
 
 __all__ = [
     "CC_OUTPUT_REL",
+    "FW_CONTEXT_REL",
     "MTIME_TOLERANCE_S",
     "abs_path",
     "cc_output_path",
@@ -64,18 +65,22 @@ __all__ = [
 # clock skew between the indexer and the filesystem.
 MTIME_TOLERANCE_S: float = 1.0
 
+# Everything fw-context writes into a project sits under this one directory,
+# which ``fw-context init`` adds to .gitignore.  One name, because more than
+# one place has to recognise it: the paths below are built from it, and the
+# new-source scan skips it wholesale.
+FW_CONTEXT_REL: Path = Path(".fw-context")
+
 # Relative location (from the project root) of the generated
 # compile_commands.json.  Kept out of the project root so the build artifact
-# does not pollute the repository; ``fw-context init`` adds the containing
-# directory to .gitignore.
-CC_OUTPUT_REL: Path = Path(".fw-context") / "build" / "compile_commands.json"
+# does not pollute the repository.
+CC_OUTPUT_REL: Path = FW_CONTEXT_REL / "build" / "compile_commands.json"
 
 # Output directory of a build that fw-context starts on its own, one
-# subdirectory per variant.  It sits under .fw-context, which `fw-context
-# init` already adds to .gitignore, and apart from the directory of the
-# build that the user runs: fw-context cannot lock that build, thus
-# separation is the only defence against two builds in one directory.
-AUTOBUILD_REL: Path = Path(".fw-context") / "autobuild"
+# subdirectory per variant.  It sits apart from the directory of the build
+# that the user runs: fw-context cannot lock that build, thus separation is
+# the only defence against two builds in one directory.
+AUTOBUILD_REL: Path = FW_CONTEXT_REL / "autobuild"
 
 
 def autobuild_dir(variant: str = "") -> str:
