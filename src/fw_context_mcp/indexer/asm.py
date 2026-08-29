@@ -207,6 +207,7 @@ def store_units(conn, config_hash: str, units: list, project_root: Path,
         if source is None:
             failed += 1
             continue
+        _store_symbols(conn, config_hash, source, project_root)
         for path, active_lines in source.active.items():
             content = filtered_content(path, active_lines)
             if content is None:
@@ -230,3 +231,174 @@ def store_units(conn, config_hash: str, units: list, project_root: Path,
             )
             stored += 1
     return stored, failed
+
+
+# Directives that name a symbol.  GNU as accepts both spellings of the
+# global one, and the projects measured use `.global`; a regex that knows
+# only `.globl` returns nothing on any of them.
+_GLOBAL_RE = re.compile(r"^\s*\.(?:globl|global)\s+([A-Za-z_.$][\w.$]*)")
+_WEAK_RE = re.compile(r"^\s*\.weak\s+([A-Za-z_.$][\w.$]*)")
+_TYPE_RE = re.compile(r"^\s*\.type\s+([A-Za-z_.$][\w.$]*)\s*,\s*[%@#]?(\w+)")
+_LABEL_RE = re.compile(r"^\s*([A-Za-z_.$][\w.$]*)\s*:")
+# `.thumb_set alias, target` is how CMSIS points an unimplemented interrupt
+# at the default handler.  `.set` and `.equ` do the same for other targets.
+_ALIAS_RE = re.compile(
+    r"^\s*\.(?:thumb_set|set|equ)\s+([A-Za-z_.$][\w.$]*)\s*,\s*([A-Za-z_.$][\w.$]*)\s*$"
+)
+# A label directive can carry a `.section` before it on the same line, so
+# every pattern here matches a STATEMENT, not a whole line.
+
+
+@dataclass
+class AsmSymbol:
+    """A symbol an assembly unit defines.
+
+    Attributes:
+        name: The symbol as written.
+        file: Resolved path of the file holding the label.
+        line: Line of the label in that file.
+        kind: ``"function"`` or ``"variable"``, from ``.type``.  GNU as does
+            not require the directive, so a label without one is called a
+            function: in assembly an exported label is overwhelmingly code,
+            and calling it a variable would put it in the wrong place in
+            every answer.
+        is_global: The unit exported it with ``.global``.
+        is_weak: Declared ``.weak``, thus a definition another object may
+            override.  The vector-table step needs this to tell an
+            interrupt that is handled from one that is not.
+        alias_target: For ``.thumb_set``/``.set``/``.equ``, the name this
+            one points at.  None otherwise.
+    """
+
+    name: str
+    file: str
+    line: int
+    kind: str = "function"
+    is_global: bool = False
+    is_weak: bool = False
+    alias_target: str | None = None
+
+
+def extract_symbols(source: AsmSource) -> list[AsmSymbol]:
+    """Return the symbols *source* defines, located in their own files.
+
+    A label is what defines a symbol; ``.global`` and ``.weak`` only say
+    how it is exported, and ``.type`` says what it is.  The directives may
+    come before or after the label — measured, irq_cm4f.S writes `.type`
+    then `.global` then the label — so the whole unit is read before
+    anything is decided.
+
+    Each line is split on `;` first, because the assembler reads it that
+    way and a macro expansion arrives as one line of several statements.
+    Zephyr's SECTION_FUNC expands to
+    `.section .text.sym, "ax"; .thumb; .balign 4; sym :` — anchoring on the
+    start of the line finds `.section` there and never sees the label, which
+    is why this returned nothing at all on Zephyr assembly.
+
+    An alias (``.thumb_set``) has no label of its own and is reported at the
+    line of the directive: it IS the definition.
+    """
+    labels: dict[str, tuple[str, int]] = {}
+    kinds: dict[str, str] = {}
+    globals_: set[str] = set()
+    weaks: set[str] = set()
+    aliases: dict[str, tuple[str, str, int]] = {}
+
+    # splitlines() once, not once per line: the output of a Zephyr unit is
+    # over a thousand lines and re-splitting it each time made this
+    # quadratic for no reason.
+    text_lines = source.text.splitlines()
+
+    for out_line, mapped in enumerate(source.line_map):
+        if mapped is None:
+            continue
+        file, line = mapped
+
+        for stmt in text_lines[out_line].split(";"):
+            m = _LABEL_RE.match(stmt)
+            if m is not None:
+                labels.setdefault(m.group(1), (file, line))
+                continue
+            m = _GLOBAL_RE.match(stmt)
+            if m is not None:
+                globals_.add(m.group(1))
+                continue
+            m = _WEAK_RE.match(stmt)
+            if m is not None:
+                weaks.add(m.group(1))
+                continue
+            m = _TYPE_RE.match(stmt)
+            if m is not None:
+                kinds[m.group(1)] = "variable" if m.group(2) == "object" else "function"
+                continue
+            m = _ALIAS_RE.match(stmt)
+            if m is not None:
+                aliases.setdefault(m.group(1), (m.group(2), file, line))
+
+    found: list[AsmSymbol] = []
+    for name, (file, line) in labels.items():
+        found.append(AsmSymbol(
+            name=name, file=file, line=line,
+            kind=kinds.get(name, "function"),
+            is_global=name in globals_, is_weak=name in weaks,
+        ))
+    for name, (target, file, line) in aliases.items():
+        if name in labels:
+            continue  # a real label wins over an alias of the same name
+        found.append(AsmSymbol(
+            name=name, file=file, line=line,
+            kind=kinds.get(name, "function"),
+            is_global=name in globals_, is_weak=name in weaks,
+            alias_target=target,
+        ))
+    return found
+
+
+# NOT here: header edges for assembly units.  They were planned and
+# measured out.  An assembly unit is reprocessed on every index run — 25 to
+# 53 ms each, 374 ms for the largest project — so nothing gates on its
+# staleness and an edge would record a dependency no reader consults.  The
+# headers themselves are already in the manifest anyway: measured, assembly
+# adds one to three that C did not already pull in, on four of the five
+# projects that have assembly.
+#
+# The edge becomes worth recording the day an unchanged assembly unit is
+# skipped.  At 374 ms that day is not close.
+
+
+# USR namespace for a symbol that libclang never saw.  libclang mints
+# `c:@F@name` and friends; assembly needs its own prefix or a handler
+# defined both in C and in a `.S` would collide on the primary key and one
+# definition would silently replace the other.
+_ASM_USR_PREFIX = "asm:"
+
+
+def _store_symbols(conn, config_hash: str, source: AsmSource, project_root: Path) -> int:
+    """Write the symbols of one preprocessed unit.  Returns how many.
+
+    A weak definition is stored like any other and marked through its USR
+    namespace, not merged with the C one of the same name: `except.S`
+    defines HardFault_Handler weakly and a project defines it strongly, and
+    both are true — the linker picks, the index reports.
+    """
+    from fw_context_mcp.indexer.db import insert_symbols_batch, upsert_file
+    from fw_context_mcp.indexer.ops import _normalize_file_path
+
+    symbols = extract_symbols(source)
+    if not symbols:
+        return 0
+
+    file_ids: dict[str, int] = {}
+    rows = []
+    for sym in symbols:
+        db_path = _normalize_file_path(sym.file, project_root)
+        if db_path not in file_ids:
+            file_ids[db_path] = upsert_file(conn, config_hash, db_path, "c")
+        rows.append((
+            config_hash, file_ids[db_path], db_path, sym.name,
+            f"{_ASM_USR_PREFIX}{db_path}@{sym.name}", sym.name, sym.name,
+            sym.kind, sym.line, 1, sym.line, 1,
+            "", "", None, 0, 0, "", 0, "", 1, 0.0, "",
+        ))
+    insert_symbols_batch(conn, rows)
+    return len(rows)

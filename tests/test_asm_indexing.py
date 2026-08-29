@@ -261,7 +261,12 @@ class TestStoreUnits:
         assert row["mtime"] > 0
         assert row["source_hash"] == compute_source_hash(tmp_path / "t.S")
 
-    def test_no_symbols_are_created(self, tmp_path: Path):
+    def test_the_symbols_come_from_the_preprocessor_not_libclang(self, tmp_path: Path):
+        """libclang never saw this unit — it cannot read assembly.
+
+        The symbols are real all the same, and their USR namespace says
+        where they came from.
+        """
         from fw_context_mcp.indexer.asm import store_units
         from fw_context_mcp.indexer.db import transaction
 
@@ -270,10 +275,145 @@ class TestStoreUnits:
         try:
             with transaction(conn):
                 store_units(conn, "ch", [unit], tmp_path)
-            n = conn.execute(
-                "SELECT COUNT(*) FROM symbols WHERE config_hash='ch'"
+            rows = conn.execute(
+                "SELECT name, usr FROM symbols WHERE config_hash='ch'"
+            ).fetchall()
+        finally:
+            conn.close()
+
+        assert [r["name"] for r in rows] == ["Foo"]
+        assert all(r["usr"].startswith("asm:") for r in rows)
+
+
+class TestExtractSymbols:
+    """A label defines; `.global` and `.weak` say how, `.type` says what."""
+
+    @staticmethod
+    def _syms(tmp_path: Path, text: str):
+        from fw_context_mcp.indexer.asm import extract_symbols
+
+        src = preprocess(_unit(tmp_path, "t.S", text))
+        assert src is not None
+        return {s.name: s for s in extract_symbols(src)}
+
+    def test_a_label_defines_a_symbol(self, tmp_path: Path):
+        syms = self._syms(tmp_path, ".global Foo\nFoo:\n  b .\n")
+
+        assert syms["Foo"].is_global
+        assert syms["Foo"].kind == "function"
+        assert syms["Foo"].line == 2, "the label is the definition, not the .global"
+
+    def test_a_declaration_without_a_label_is_not_a_definition(self, tmp_path: Path):
+        """`.global X` alone says X exists elsewhere."""
+        syms = self._syms(tmp_path, ".global Elsewhere\n")
+
+        assert "Elsewhere" not in syms
+
+    def test_statements_separated_by_semicolons_are_read(self, tmp_path: Path):
+        """The regression that returned nothing at all on Zephyr assembly.
+
+        SECTION_FUNC expands to
+        `.section .text.sym, "ax"; .thumb; .balign 4; sym :` — anchoring on
+        the start of the line finds `.section` and never sees the label.
+        """
+        syms = self._syms(
+            tmp_path,
+            '#define SECTION_FUNC(s, sym) .section .text.sym, "ax"; .thumb; sym :\n'
+            ".global z_SysNmiOnReset\n"
+            "SECTION_FUNC(TEXT, z_SysNmiOnReset)\n"
+            "  wfi\n",
+        )
+
+        assert "z_SysNmiOnReset" in syms
+        assert syms["z_SysNmiOnReset"].is_global
+
+    def test_a_macro_defined_symbol_is_found(self, tmp_path: Path):
+        syms = self._syms(tmp_path,
+                          "#define GTEXT(s) .global s\nGTEXT(Foo)\nFoo:\n  b .\n")
+
+        assert syms["Foo"].is_global
+
+    def test_type_object_is_a_variable(self, tmp_path: Path):
+        syms = self._syms(tmp_path, ".type table, %object\ntable:\n  .long 0\n")
+
+        assert syms["table"].kind == "variable"
+
+    def test_a_label_without_a_type_is_a_function(self, tmp_path: Path):
+        """GNU as does not require .type, and an exported label is code."""
+        syms = self._syms(tmp_path, "Bare:\n  b .\n")
+
+        assert syms["Bare"].kind == "function"
+
+    def test_a_weak_symbol_is_marked(self, tmp_path: Path):
+        syms = self._syms(tmp_path, ".weak Maybe\nMaybe:\n  b .\n")
+
+        assert syms["Maybe"].is_weak
+
+    def test_an_alias_records_its_target(self, tmp_path: Path):
+        """CMSIS points an unimplemented interrupt at the default handler."""
+        syms = self._syms(
+            tmp_path,
+            ".weak TIM1_IRQHandler\n.thumb_set TIM1_IRQHandler, Default_Handler\n"
+            "Default_Handler:\n  b .\n",
+        )
+
+        assert syms["TIM1_IRQHandler"].alias_target == "Default_Handler"
+        assert syms["TIM1_IRQHandler"].is_weak
+        assert syms["Default_Handler"].alias_target is None
+
+    def test_a_real_label_wins_over_an_alias_of_the_same_name(self, tmp_path: Path):
+        syms = self._syms(tmp_path, ".set Both, Other\nBoth:\n  b .\n")
+
+        assert syms["Both"].alias_target is None
+
+    def test_the_directives_may_come_after_the_label(self, tmp_path: Path):
+        """irq_cm4f.S writes .type, then .global, then the label."""
+        syms = self._syms(tmp_path,
+                          "Late:\n  b .\n.global Late\n.type Late, %function\n")
+
+        assert syms["Late"].is_global
+
+
+class TestStoredSymbols:
+    def test_an_assembly_symbol_lands_in_the_index(self, tmp_path: Path):
+        from fw_context_mcp.indexer.asm import store_units
+        from fw_context_mcp.indexer.db import transaction
+
+        unit = _unit(tmp_path, "startup.S", ".global Reset_Handler\nReset_Handler:\n  b .\n")
+        conn = TestStoreUnits._db(tmp_path)
+        try:
+            with transaction(conn):
+                store_units(conn, "ch", [unit], tmp_path)
+            row = conn.execute(
+                "SELECT name, kind, usr, line FROM symbols WHERE config_hash='ch'"
+            ).fetchone()
+        finally:
+            conn.close()
+
+        assert row["name"] == "Reset_Handler"
+        assert row["kind"] == "function"
+        assert row["line"] == 2
+
+    def test_the_usr_has_its_own_namespace(self, tmp_path: Path):
+        """A handler defined in both C and assembly must not collide.
+
+        except.S defines HardFault_Handler weakly and a project defines it
+        strongly; both are true, and a shared USR would make one silently
+        replace the other on the primary key.
+        """
+        from fw_context_mcp.indexer.asm import store_units
+        from fw_context_mcp.indexer.db import transaction
+
+        unit = _unit(tmp_path, "t.S", "HardFault_Handler:\n  b .\n")
+        conn = TestStoreUnits._db(tmp_path)
+        try:
+            with transaction(conn):
+                store_units(conn, "ch", [unit], tmp_path)
+            usr = conn.execute(
+                "SELECT usr FROM symbols WHERE config_hash='ch'"
             ).fetchone()[0]
         finally:
             conn.close()
 
-        assert n == 0, "step 1 stores text; symbols are the next step"
+        assert usr.startswith("asm:")
+        assert not usr.startswith("c:")
