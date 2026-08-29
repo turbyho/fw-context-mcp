@@ -45,6 +45,18 @@ _DROP_FLAGS = frozenset({
     "-Wno-format-overflow",
     "-Wformat-truncation",
     "-Wno-format-truncation",
+    # GCC-only code-generation flags.  They change no declaration and no
+    # macro, so dropping them cannot change what the index sees — but clang
+    # rejects them as unknown arguments and the whole parse dies.
+    #
+    # Found by running clang over the flags of every real project rather
+    # than one at a time: five, not the two that first showed up.  They
+    # blocked the preprocessor on assembly units, where there is no libclang
+    # fallback to hide the failure.
+    "-fno-reorder-functions",
+    "-fno-printf-return-value",
+    "-fstrict-volatile-bitfields",
+    "-fno-tree-switch-conversion",
 })
 
 # GCC-only warning flags that take a level suffix (=1, =2) — drop any token
@@ -55,6 +67,9 @@ _DROP_PREFIXES = frozenset({
     "-Wno-format-overflow=",
     "-Wformat-truncation=",
     "-Wno-format-truncation=",
+    # GCC-only ABI switch carrying a value (=ieee, =alternative).  A prefix
+    # rather than an exact match, because the value varies by project.
+    "-mfp16-format=",
 })
 
 # Two-token flags: drop both the flag and its next argument

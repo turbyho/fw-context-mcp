@@ -108,6 +108,41 @@ class TestNormalizeArgs:
         result = normalize_args(["-save-temps", "-std=c++14", "main.cpp"], Path.cwd())
         assert "-save-temps" not in result
 
+    def test_drops_gcc_only_codegen_flags(self):
+        """Flags clang rejects outright, which kills the whole parse.
+
+        They change no declaration and no macro, so dropping them cannot
+        change what the index sees.  Found by running clang over the flags
+        of every real project at once rather than one at a time — there were
+        five, not the two that first surfaced.
+        """
+        gcc_only = [
+            "-fno-reorder-functions",
+            "-fno-printf-return-value",
+            "-fstrict-volatile-bitfields",
+            "-fno-tree-switch-conversion",
+        ]
+        result = normalize_args([*gcc_only, "-std=c11", "main.c"], Path.cwd())
+
+        for flag in gcc_only:
+            assert flag not in result, f"clang rejects {flag} as an unknown argument"
+
+    def test_drops_the_fp16_format_flag_with_any_value(self):
+        """A prefix, not an exact match: the value varies by project."""
+        for value in ("ieee", "alternative"):
+            result = normalize_args(
+                [f"-mfp16-format={value}", "-std=c11", "main.c"], Path.cwd()
+            )
+            assert not any(a.startswith("-mfp16-format") for a in result)
+
+    def test_a_flag_that_changes_meaning_is_kept(self):
+        """The strip list must stay narrow — these decide what compiles."""
+        result = normalize_args(
+            ["-DFOO=1", "-I/inc", "-std=c11", "-mcpu=cortex-m4", "main.c"], Path.cwd()
+        )
+        for keep in ("-DFOO=1", "-I/inc", "-std=c11", "-mcpu=cortex-m4"):
+            assert keep in result, f"{keep} decides what the compiler sees"
+
     def test_drops_specs(self):
         result = normalize_args(["-specs=nosys.specs", "-std=c++14", "main.cpp"], Path.cwd())
         assert not any(a.startswith("-specs") for a in result)
