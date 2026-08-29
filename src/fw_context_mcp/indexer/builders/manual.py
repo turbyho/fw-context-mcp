@@ -46,7 +46,7 @@ def _scan_source_files(dirs: list[Path]) -> list[Path]:
             log.warning("source directory does not exist: %s", d)
             continue
         for f in sorted(d.rglob("*")):
-            if f.suffix.lower() in TU_EXTENSIONS and str(f) not in seen:
+            if f.suffix in TU_EXTENSIONS and str(f) not in seen:
                 # Deduplicate by full path — two source_dirs might contain same-named files
                 seen.add(str(f))
                 result.append(f)

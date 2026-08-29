@@ -17,7 +17,7 @@ from collections.abc import Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from fw_context_mcp.utils import TU_EXTENSIONS
+from fw_context_mcp.utils import CPP_SOURCE_EXTENSIONS, TU_EXTENSIONS
 
 # Flags libclang does not support — drop silently
 _DROP_FLAGS = frozenset({
@@ -239,11 +239,22 @@ def expand_response_file(token: str, cwd: Path | None = None) -> list[str]:
 
 
 def _is_source_file(token: str) -> bool:
-    return Path(token).suffix.lower() in TU_EXTENSIONS
+    # No .lower(): the suffix table of gcc is case-sensitive, and `.C`
+    # is a C++ source while `.c` is a C one.
+    return Path(token).suffix in TU_EXTENSIONS
 
 
 def _detect_language(file: Path, clang_args: list[str]) -> str:
-    if file.suffix.lower() in {".cpp", ".cc", ".cxx", ".c++"}:
+    """Say whether the compiler reads this unit as C or as C++.
+
+    The suffix decides when the compiler has a rule for it — see
+    CPP_SOURCE_EXTENSIONS, taken from the table in `man gcc`.  Case is part
+    of that rule: `.C` is C++ and `.c` is C, so this must not lowercase.
+
+    A suffix the table does not cover falls through to `-std=`, which is how
+    a project building `.S` or an unusual extension still gets an answer.
+    """
+    if file.suffix in CPP_SOURCE_EXTENSIONS:
         return "cpp"
     std = next((a for a in clang_args if a.startswith("-std=")), "")
     if "++" in std:

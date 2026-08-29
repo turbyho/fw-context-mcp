@@ -285,7 +285,7 @@ def run(
     # happen before config_hash computation so the manifest can be built
     # from the actual TU list.
     units = list(parse_compile_commands(compile_commands))
-    units = [u for u in units if u.file.suffix.lower() in TU_EXTENSIONS]
+    units = [u for u in units if u.file.suffix in TU_EXTENSIONS]
     log.info("TUs to index: %d", len(units))
 
     # ── The effective vendor set, computed HERE and not earlier ──

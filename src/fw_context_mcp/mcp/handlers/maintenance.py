@@ -54,7 +54,7 @@ from ...indexer.db import (
     transaction,
 )
 from ...llm.ollama import check_setup
-from ...utils import resolve_project_root
+from ...utils import HEADER_EXTENSIONS, resolve_project_root
 from ..background import _is_bg_reindex_running
 from ..shared.context import (
     _db_path,
@@ -1563,7 +1563,7 @@ def _header_coverage_warning(
     extension-less headers just as well, and the fallback resolves those
     too.
     """
-    if not (via_header or (len(matching) == 1 and target.suffix.lower() in {".h", ".hpp"})):
+    if not (via_header or (len(matching) == 1 and target.suffix in HEADER_EXTENSIONS)):
         return None
     return (
         "Header re-indexed via one TU. Other TUs including this header "

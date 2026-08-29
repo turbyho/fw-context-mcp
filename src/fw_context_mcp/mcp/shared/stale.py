@@ -480,7 +480,7 @@ def _git_tu_candidates(root: Path) -> list[str] | None:
         return None
     return [
         rel for rel in result.stdout.splitlines()
-        if Path(rel).suffix.lower() in TU_EXTENSIONS
+        if Path(rel).suffix in TU_EXTENSIONS
     ]
 
 
@@ -681,7 +681,7 @@ def _walk_tu_candidates(start: Path, root_only: bool, build_patterns: list[str])
 
     if root_only:
         for entry in start.iterdir():
-            if entry.is_file() and entry.suffix.lower() in TU_EXTENSIONS:
+            if entry.is_file() and entry.suffix in TU_EXTENSIONS:
                 yield str(entry.resolve())
         return
 
@@ -690,7 +690,7 @@ def _walk_tu_candidates(start: Path, root_only: bool, build_patterns: list[str])
             dirnames[:] = []  # build output — do not descend
             continue
         for filename in filenames:
-            if Path(filename).suffix.lower() in TU_EXTENSIONS:
+            if Path(filename).suffix in TU_EXTENSIONS:
                 yield str(Path(dirpath, filename).resolve())
 
 

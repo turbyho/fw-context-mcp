@@ -72,7 +72,13 @@ from fw_context_mcp.indexer.db import (
     split_tokens,
     upsert_file,
 )
-from fw_context_mcp.utils import abs_path, compute_content_hash, compute_source_hash, read_file_lines
+from fw_context_mcp.utils import (
+    CPP_EXTENSIONS,
+    abs_path,
+    compute_content_hash,
+    compute_source_hash,
+    read_file_lines,
+)
 
 from .db._chunking import chunked
 from .db._files import FileIdLookup
@@ -402,7 +408,7 @@ def _build_filtered_file_content(
         content = "".join(filtered)
 
         # Insert or update — file rows may not exist for headers-only files.
-        lang = "cpp" if db_path.endswith((".cpp", ".cc", ".cxx", ".hpp", ".hxx")) else "c"
+        lang = "cpp" if Path(db_path).suffix in CPP_EXTENSIONS else "c"
         # Grab real mtime so _count_modified_files won't flag this as stale.
         try:
             file_mtime = resolved.stat().st_mtime
@@ -548,7 +554,7 @@ def _blank_out_inactive_files(
         if not line_count:
             continue
 
-        lang = "cpp" if db_path.endswith((".cpp", ".cc", ".cxx", ".hpp", ".hxx")) else "c"
+        lang = "cpp" if Path(db_path).suffix in CPP_EXTENSIONS else "c"
         conn.execute(
             "INSERT INTO files (config_hash, path, language, content, mtime, generated, source_hash) "
             "VALUES (?, ?, ?, ?, ?, ?, ?) "
@@ -617,7 +623,7 @@ def _store_symbol_rows(
         sym_file = s.file
         normalized_sym_file = _normalize_file_path(sym_file, project_root)
         if normalized_sym_file not in file_id_cache:
-            lang = "cpp" if Path(sym_file).suffix.lower() in {".cpp", ".cc", ".cxx", ".c++"} else "c"
+            lang = "cpp" if Path(sym_file).suffix in CPP_EXTENSIONS else "c"
             try:
                 sym_mtime = Path(sym_file).stat().st_mtime
             except OSError:
@@ -980,7 +986,7 @@ def _store_macros_for_unit(
         m_raw = str(m.file) if m.file else file_path
         m_path = _normalize_file_path(m_raw, project_root)
         if m_path not in file_id_cache:
-            lang = "cpp" if Path(m_raw).suffix.lower() in {".cpp", ".cc", ".cxx", ".c++"} else "c"
+            lang = "cpp" if Path(m_raw).suffix in CPP_EXTENSIONS else "c"
             m_mtime = current_mtime if m_path == normalized_tu_path else 0.0
             try:
                 m_mtime = Path(m_raw).stat().st_mtime

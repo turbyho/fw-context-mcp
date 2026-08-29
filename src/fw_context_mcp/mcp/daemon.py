@@ -77,6 +77,7 @@ from pathlib import Path
 from ..config import derive_project_id
 from ..config import load as load_config
 from ..exit_codes import EXIT_ALREADY_RUNNING, EXIT_SUPERSEDED
+from ..utils import HEADER_EXTENSIONS, TU_EXTENSIONS
 from .shared.pid_file import PidFile
 
 log = logging.getLogger(__name__)
@@ -95,7 +96,14 @@ _SUPERSEDED_RETRIES = 3
 _PAUSE_WAIT_S = 120.0  # How long to wait for a manual operation to release
 
 # ── Watched file extensions ──────────────────────────────────────────────────
-_SOURCE_EXTS_WATCH = frozenset({".c", ".cpp", ".cc", ".cxx", ".h", ".hpp", ".hh", ".hxx"})
+# What the watcher reacts to: a translation unit or a header, by the
+# compiler rules.  The hand-written set this replaced was missing `.c++`,
+# `.tcc` and every uppercase form — measured against the real manifests,
+# `.tcc` alone appears 3 to 18 times per project.
+#
+# Extension-less headers stay out: the compiler has no rule for them, so
+# they belong to the derived set of the project rather than here.
+_SOURCE_EXTS_WATCH: frozenset[str] = TU_EXTENSIONS | HEADER_EXTENSIONS
 _EXCLUDE_RX = re.compile(r"(/\.git/|/\.pio/|/build/|/__pycache__/|/node_modules/)")
 
 
@@ -509,7 +517,7 @@ def _is_source_file(path_str: str, build_patterns: list[str] | None = None) -> b
     from SDK detection and ``[index] exclude_paths`` config).
     """
     p = Path(path_str)
-    if p.suffix.lower() not in _SOURCE_EXTS_WATCH:
+    if p.suffix not in _SOURCE_EXTS_WATCH:
         return False
     if _EXCLUDE_RX.search(path_str):
         return False

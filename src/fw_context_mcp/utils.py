@@ -42,8 +42,13 @@ log = logging.getLogger(__name__)
 __all__ = [
     "AUTOBUILD_REL",
     "CC_OUTPUT_REL",
+    "CPP_EXTENSIONS",
+    "CPP_HEADER_EXTENSIONS",
+    "CPP_SOURCE_EXTENSIONS",
+    "C_SOURCE_EXTENSIONS",
     "DEPS_REL",
     "FW_CONTEXT_REL",
+    "HEADER_EXTENSIONS",
     "MTIME_TOLERANCE_S",
     "SAFE_EXCEPT",
     "TU_EXTENSIONS",
@@ -68,17 +73,38 @@ __all__ = [
 # clock skew between the indexer and the filesystem.
 MTIME_TOLERANCE_S: float = 1.0
 
-# Extensions of a translation unit.  ONE definition, THREE call sites that
-# each had their own: indexer/compile_commands.py decides what counts as a
-# source argument, indexer/builders/manual.py scans the source directories,
-# and mcp/shared/stale.py looks for a source the build system never saw.
-# A set that differs between them makes one blind to a file another builds
-# — `.c++` was in two of the three copies, so a new `.c++` file was never
-# reported as missing from compile_commands.json.
+# ── Compiler rules, from the file-suffix table in `man gcc` ──
 #
-# Lowercase only: every comparison goes through `.lower()`, which covers
-# the `.C` of a C++ file as well.
-TU_EXTENSIONS: frozenset[str] = frozenset({".c", ".cc", ".cpp", ".cxx", ".c++"})
+# These are rules of the COMPILER, not a setting of the project: a project
+# cannot decide that `.C` means C.  What a project CAN decide — which
+# extensions its own build compiles — is derived from compile_commands.json
+# instead; see indexer/manifest.py.
+#
+# CASE IS PART OF THE RULE and nothing here goes through `.lower()`.  gcc
+# reads `.c` as C and `.C` as C++, and lowercasing merged the two: a `.C`
+# file was classified as C, which is the opposite of what the compiler did
+# with it.  Verified against gcc and clang directly, not from memory.
+C_SOURCE_EXTENSIONS: frozenset[str] = frozenset({".c"})
+CPP_SOURCE_EXTENSIONS: frozenset[str] = frozenset(
+    {".cc", ".cp", ".cxx", ".cpp", ".CPP", ".c++", ".C"}
+)
+
+# What the compiler will build as a translation unit from source.  Assembly
+# is deliberately absent: it reaches the index through the derived set of a
+# project that compiles it, not through a rule that says every project does.
+TU_EXTENSIONS: frozenset[str] = C_SOURCE_EXTENSIONS | CPP_SOURCE_EXTENSIONS
+
+# `.h` is the ambiguous one — gcc calls it "C, C++, ObjC or ObjC++ header",
+# so it is not in the C++ set and a `.h` counts as C for classification.
+CPP_HEADER_EXTENSIONS: frozenset[str] = frozenset(
+    {".hh", ".H", ".hp", ".hxx", ".hpp", ".HPP", ".h++", ".tcc"}
+)
+HEADER_EXTENSIONS: frozenset[str] = CPP_HEADER_EXTENSIONS | {".h"}
+
+# Everything the compiler reads as C++, source or header.  One name for the
+# question "is this C++?", which five places used to answer with five
+# inline literals.
+CPP_EXTENSIONS: frozenset[str] = CPP_SOURCE_EXTENSIONS | CPP_HEADER_EXTENSIONS
 
 # Everything fw-context writes into a project sits under this one directory,
 # which ``fw-context init`` adds to .gitignore.  One name, because more than
