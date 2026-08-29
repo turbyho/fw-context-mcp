@@ -133,6 +133,49 @@ def _intern_arguments(arguments: list[str], arg_sets: list[list[str]]) -> int:
     return len(arg_sets) - 1
 
 
+def derive_extension_sets(
+    compile_commands_path: Path, header_table
+) -> tuple[list[str], list[str]]:
+    """Return ``(tu_extensions, header_extensions)`` of THIS project.
+
+    The compiler rules in ``utils`` say which suffix means C or C++.  This
+    says something else: which suffixes this particular build actually
+    touches.  No list can answer that in advance — measured across the test
+    projects, five of seven compile ``.S`` units, and their headers include
+    ``.tcc`` and extension-less libstdc++ ones that no hand-written set had.
+
+    Taken from the manifest itself, so it cannot drift from what was
+    indexed.  Stored rather than derived on read, because a reader on the
+    query path must not parse a 52 MB manifest to learn two short lists —
+    see ``load_build_dir_patterns`` for the same reasoning.
+
+    An empty suffix is kept.  ``<string>`` and ``<vector>`` have none, and
+    dropping them would make the watcher blind to a header the project
+    really includes.
+
+    The units come from compile_commands.json and NOT from the manifest
+    entries, which is the whole point: by the time entries exist the runner
+    has already dropped every unit libclang cannot read as C or C++.
+    Deriving from them would say a project never compiles assembly, when
+    the truth is that its assembly is skipped — and the new-file scan would
+    then stay blind to exactly the files that need reporting.
+
+    Reading the file again costs a plain json.load of a few hundred
+    kilobytes, once per index run.  It is not on the query path.
+    """
+    try:
+        raw = json.loads(compile_commands_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        raw = []
+    tu = {
+        Path(e["file"]).suffix
+        for e in raw
+        if isinstance(e, dict) and e.get("file")
+    }
+    headers = {Path(h).suffix for h in (header_table or ())}
+    return sorted(tu), sorted(headers)
+
+
 def _is_generated_header(header_path: str, build_dir_patterns: list[str] | None = None) -> bool:
     """Return True when *header_path* looks like a build-generated file.
 
@@ -300,6 +343,9 @@ def generate(
         "headers": header_table,
         "entries": entries,
     }
+    tu_exts, header_exts = derive_extension_sets(compile_commands_path, header_table)
+    manifest["tu_extensions"] = tu_exts
+    manifest["header_extensions"] = header_exts
     if macros:
         manifest["macros"] = macros
     if build_dir_patterns:
@@ -353,7 +399,62 @@ def _manifest_path(db_dir: Path, config_hash: str) -> Path:
 # small list is retained — never the parsed manifest, which is 150 MB+ of
 # Python objects for a large project and would sit in the MCP server for its
 # whole life.
-_BUILD_PATTERNS_CACHE: dict[tuple[str, int], list[str]] = {}
+_BUILD_PATTERNS_CACHE: dict[tuple[str, int], dict] = {}
+
+# The top-level keys a reader on the query path may need.  All short, all
+# read from one parse — adding a second cache would mean a second parse of
+# the same 52 MB file.
+_CHEAP_KEYS = ("build_dir_patterns", "tu_extensions", "header_extensions")
+
+
+def _load_cheap_keys(db_dir: Path, config_hash: str) -> dict:
+    """Return the short top-level manifest keys, cached across calls.
+
+    WHY this exists rather than ``load(...)[key]``: the staleness helpers on
+    the MCP query path need nothing else from the manifest, and parsing the
+    whole file to reach one short list is the most expensive thing they do.
+    Measured on zbox-ecb-fw (876 TUs), the manifest is 52 MB and takes 109 ms
+    to read and parse — paid on EVERY query routed through
+    ``_with_stale_recovery``.
+
+    The first call after an index still parses once; every later one is a
+    dict lookup.  Only the short lists are kept, so the cost is bytes rather
+    than the hundreds of megabytes a parsed manifest occupies.
+    """
+    path = _manifest_path(db_dir, config_hash)
+    try:
+        key = (str(path), path.stat().st_mtime_ns)
+    except OSError:
+        return {}
+    cached = _BUILD_PATTERNS_CACHE.get(key)
+    if cached is not None:
+        return cached
+    manifest = load(db_dir, config_hash)
+    cheap = {k: list(manifest.get(k, [])) for k in _CHEAP_KEYS} if manifest else {}
+    # One project has one active manifest; bound the dict so a long-running
+    # server that reindexes repeatedly cannot accumulate entries.
+    if len(_BUILD_PATTERNS_CACHE) > 32:
+        _BUILD_PATTERNS_CACHE.clear()
+    _BUILD_PATTERNS_CACHE[key] = cheap
+    return cheap
+
+
+def load_tu_extensions(db_dir: Path, config_hash: str) -> frozenset[str] | None:
+    """Return the suffixes this build compiles, or None when unknown.
+
+    None means the manifest predates the key or does not exist.  The caller
+    then falls back to the compiler rules in ``utils.TU_EXTENSIONS``, which
+    is what a project without a manifest — manual mode, a first run — needs
+    anyway.
+    """
+    exts = _load_cheap_keys(db_dir, config_hash).get("tu_extensions")
+    return frozenset(exts) if exts else None
+
+
+def load_header_extensions(db_dir: Path, config_hash: str) -> frozenset[str] | None:
+    """Return the suffixes of the headers this build includes, or None."""
+    exts = _load_cheap_keys(db_dir, config_hash).get("header_extensions")
+    return frozenset(exts) if exts else None
 
 
 def load_build_dir_patterns(db_dir: Path, config_hash: str) -> list[str]:
@@ -367,26 +468,9 @@ def load_build_dir_patterns(db_dir: Path, config_hash: str) -> list[str]:
     through ``_with_stale_recovery``, to obtain a list of two or three
     strings.
 
-    The first call after an index still parses once; every later one is a
-    dict lookup.  Only the list is kept, so the cost is bytes rather than the
-    hundreds of megabytes a parsed manifest occupies.
+    Shares one parse with the other cheap keys — see ``_load_cheap_keys``.
     """
-    path = _manifest_path(db_dir, config_hash)
-    try:
-        key = (str(path), path.stat().st_mtime_ns)
-    except OSError:
-        return []
-    cached = _BUILD_PATTERNS_CACHE.get(key)
-    if cached is not None:
-        return cached
-    manifest = load(db_dir, config_hash)
-    patterns = list(manifest.get("build_dir_patterns", [])) if manifest else []
-    # One project has one active manifest; bound the dict so a long-running
-    # server that reindexes repeatedly cannot accumulate entries.
-    if len(_BUILD_PATTERNS_CACHE) > 32:
-        _BUILD_PATTERNS_CACHE.clear()
-    _BUILD_PATTERNS_CACHE[key] = patterns
-    return patterns
+    return _load_cheap_keys(db_dir, config_hash).get("build_dir_patterns", [])
 
 
 def _read_manifest_file(manifest_path: Path) -> dict | None:
@@ -553,6 +637,11 @@ def build_preliminary(
     }
     if build_dir_patterns:
         manifest["build_dir_patterns"] = build_dir_patterns
+    # The units are known even in a preliminary manifest; the headers are
+    # not, and an empty list there is the honest answer rather than a guess.
+    tu_exts, _ = derive_extension_sets(compile_commands_path, None)
+    manifest["tu_extensions"] = tu_exts
+    manifest["header_extensions"] = []
 
     manifest["config_hash"] = config_hash
     manifest_json = json.dumps(manifest, sort_keys=True, indent=2, ensure_ascii=False)

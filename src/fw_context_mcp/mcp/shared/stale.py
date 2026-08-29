@@ -31,6 +31,7 @@ from pathlib import Path
 
 from ...config import derive_project_id
 from ...indexer.db import get_active_config
+from ...indexer.manifest import load_tu_extensions
 from ...utils import (
     MTIME_TOLERANCE_S,
     TU_EXTENSIONS,
@@ -396,15 +397,30 @@ def _count_modified_files(
 # only a build puts it there.  Detection therefore needs the file tree, not
 # the mtimes of the rows the index already holds.
 
-# Only translation-unit candidates — the set lives in utils.TU_EXTENSIONS,
-# shared with compile_commands.py and builders/manual.py.  A new header is
-# deliberately out of scope: one that nothing includes stays out of the
-# index even after a build, thus reporting it would give a warning with no
-# cure, and one that some unit includes reaches the index on its own.
+# Which suffixes count as a candidate is a question about THIS project, not
+# about the compiler: a build that compiles `.S` should have `.S` looked
+# for, and one that never does should not.  The answer comes from the
+# manifest, which derives it from compile_commands.json; utils.TU_EXTENSIONS
+# is the fallback for a project that has no manifest yet.
+#
+# A new header is deliberately out of scope either way: one that nothing
+# includes stays out of the index even after a build, thus reporting it
+# would give a warning with no cure, and one that some unit includes
+# reaches the index on its own.
 
 # Cap on the number of reported paths.  The count is what matters to the
 # caller; a full list of a hundred paths would only crowd the message.
 _UNINDEXED_REPORT_LIMIT = 20
+
+
+def db_dir_of(conn) -> Path:
+    """Return the directory that holds the database this connection opened.
+
+    The manifest lives beside it, and the staleness helpers reach it the
+    same way everywhere — through PRAGMA database_list rather than a path
+    threaded down from the caller.
+    """
+    return Path(conn.execute("PRAGMA database_list").fetchone()["file"]).parent
 
 
 def _project_scan_roots(scan_roots: set[str], build_patterns: list[str]) -> set[str]:
@@ -440,7 +456,7 @@ def _project_scan_roots(scan_roots: set[str], build_patterns: list[str]) -> set[
 _GIT_LS_TIMEOUT_S: float = 30.0
 
 
-def _git_tu_candidates(root: Path) -> list[str] | None:
+def _git_tu_candidates(root: Path, tu_exts: frozenset[str]) -> list[str] | None:
     """Return the source files of the project, or None when git cannot say.
 
     ``git ls-files -co --exclude-standard`` gives the tracked files plus the
@@ -480,7 +496,7 @@ def _git_tu_candidates(root: Path) -> list[str] | None:
         return None
     return [
         rel for rel in result.stdout.splitlines()
-        if Path(rel).suffix in TU_EXTENSIONS
+        if Path(rel).suffix in tu_exts
     ]
 
 
@@ -573,6 +589,7 @@ def find_unindexed_sources(
         return []
 
     known, scan_roots = _indexed_paths(conn, config_hash)
+    tu_exts = load_tu_extensions(db_dir_of(conn), config_hash) or TU_EXTENSIONS
     db_path = Path(conn.execute("PRAGMA database_list").fetchone()["file"])
     # The directory fw-context writes into is not a place to look for the
     # source files of the user: it holds the generated compile_commands.json
@@ -588,7 +605,9 @@ def find_unindexed_sources(
     excluded = load_excluded(db_path.parent) if apply_exclusions else {}
 
     found: list[str] = []
-    for candidate in _tu_candidates(conn, config_hash, root, scan_roots, build_patterns):
+    for candidate in _tu_candidates(
+        conn, config_hash, root, scan_roots, build_patterns, tu_exts
+    ):
         # _normalize_file_path decides the one spelling that every
         # path-keyed lookup uses, thus the comparison must go through it.
         # It runs on the candidates only — resolving every indexed path
@@ -616,7 +635,12 @@ def find_unindexed_sources(
 
 
 def _tu_candidates(
-    conn, config_hash: str, root: Path, scan_roots: set[str], build_patterns: list[str]
+    conn,
+    config_hash: str,
+    root: Path,
+    scan_roots: set[str],
+    build_patterns: list[str],
+    tu_exts: frozenset[str],
 ):
     """Yield the absolute path of every source file that could need a build.
 
@@ -624,7 +648,7 @@ def _tu_candidates(
     for why git is the better question and _walk_tu_candidates for what the
     walk cannot reach.
     """
-    listed = _git_tu_candidates(root)
+    listed = _git_tu_candidates(root, tu_exts)
     if listed is not None:
         vendor = _vendor_roots(conn, config_hash)
         for rel in listed:
@@ -641,7 +665,7 @@ def _tu_candidates(
     # invisible here — that is the cost of having no git to ask.
     for scan_root in sorted(_project_scan_roots(scan_roots, build_patterns)):
         start = root if scan_root == "." else root / scan_root
-        yield from _walk_tu_candidates(start, scan_root == ".", build_patterns)
+        yield from _walk_tu_candidates(start, scan_root == ".", build_patterns, tu_exts)
 
 
 def _indexed_paths(conn, config_hash: str) -> tuple[set[str], set[str]]:
@@ -669,7 +693,9 @@ def _indexed_paths(conn, config_hash: str) -> tuple[set[str], set[str]]:
     return paths, scan_roots
 
 
-def _walk_tu_candidates(start: Path, root_only: bool, build_patterns: list[str]):
+def _walk_tu_candidates(
+    start: Path, root_only: bool, build_patterns: list[str], tu_exts: frozenset[str]
+):
     """Yield the absolute path of every translation-unit candidate under *start*.
 
     With *root_only* the walk covers the directory itself and no child: the
@@ -681,7 +707,7 @@ def _walk_tu_candidates(start: Path, root_only: bool, build_patterns: list[str])
 
     if root_only:
         for entry in start.iterdir():
-            if entry.is_file() and entry.suffix in TU_EXTENSIONS:
+            if entry.is_file() and entry.suffix in tu_exts:
                 yield str(entry.resolve())
         return
 
@@ -690,7 +716,7 @@ def _walk_tu_candidates(start: Path, root_only: bool, build_patterns: list[str])
             dirnames[:] = []  # build output — do not descend
             continue
         for filename in filenames:
-            if Path(filename).suffix in TU_EXTENSIONS:
+            if Path(filename).suffix in tu_exts:
                 yield str(Path(dirpath, filename).resolve())
 
 

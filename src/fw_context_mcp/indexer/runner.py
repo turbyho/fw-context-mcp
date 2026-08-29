@@ -284,8 +284,29 @@ def run(
     # Parse compile_commands.json to discover translation units.  Must
     # happen before config_hash computation so the manifest can be built
     # from the actual TU list.
-    units = list(parse_compile_commands(compile_commands))
-    units = [u for u in units if u.file.suffix in TU_EXTENSIONS]
+    all_units = list(parse_compile_commands(compile_commands))
+
+    # libclang reads a translation unit as C or C++.  Handed an assembly
+    # unit it parses it as C, which yields no cursor and one error
+    # diagnostic per file — measured on a Zephyr startup.S: 0 cursors,
+    # "error: expected identifier or '('".  So they are skipped.
+    #
+    # Skipped, and SAID so.  This used to drop them without a word, and the
+    # new-file scan could not report them either, because a suffix outside
+    # TU_EXTENSIONS was not even a candidate — the units were invisible from
+    # both directions.  Five of the seven test projects compile assembly.
+    units = [u for u in all_units if u.file.suffix in TU_EXTENSIONS]
+    skipped_units = len(all_units) - len(units)
+    if skipped_units:
+        from collections import Counter
+        by_ext = Counter(
+            u.file.suffix for u in all_units if u.file.suffix not in TU_EXTENSIONS
+        )
+        log.info(
+            "skipping %d of %d TUs libclang cannot read as C or C++: %s",
+            skipped_units, len(all_units),
+            ", ".join(f"{n}x {ext or '(no suffix)'}" for ext, n in by_ext.most_common()),
+        )
     log.info("TUs to index: %d", len(units))
 
     # ── The effective vendor set, computed HERE and not earlier ──
