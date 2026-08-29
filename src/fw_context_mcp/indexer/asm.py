@@ -269,9 +269,10 @@ def store_units(conn, config_hash: str, units: list, project_root: Path,
     """Index every assembly unit: text, symbols, and vector table edges.
 
     Runs AFTER every C and C++ unit, and that ordering is load-bearing for
-    the steps built on top of this one: classifying a vector slot as
-    unhandled means asking whether a strong definition exists anywhere, and
-    that question has no answer until the rest of the index is in place.
+    the steps built on top of this one: pointing a vector slot at the
+    handler it names means asking which definition of that name the linker
+    keeps, and that question has no answer until the rest of the index is
+    in place.
 
     libclang never saw these units — it cannot read assembly — so nothing
     here comes from an AST.  The text is the preprocessed source, the
@@ -303,12 +304,12 @@ def store_units(conn, config_hash: str, units: list, project_root: Path,
             conn, config_hash, source, project_root, symbols,
             vendor_patterns or [], project_patterns or [],
         )
-        linked, unhandled = _store_vectors(
-            conn, config_hash, source, symbols, project_root,
+        linked, unresolved = _store_vectors(
+            conn, config_hash, source, project_root,
         )
         result.symbols += len(symbols)
         result.vectors += linked
-        result.unhandled += unhandled
+        result.unresolved += unresolved
         for path, active_lines in source.active.items():
             content = filtered_content(path, active_lines)
             if content is None:
@@ -374,8 +375,10 @@ class AsmResult:
         files: files rows written, unit and includes together.
         symbols: symbol definitions found.
         vectors: vector slots linked to a handler.
-        unhandled: vector slots left unlinked — the interrupt is not
-            serviced, or the name resolves to nothing clear.
+        unresolved: vector slots naming something the index does not hold —
+            a linker symbol such as `_estack`, an ambiguous name, or a
+            handler an assembler macro defines, which the C preprocessor
+            does not expand.
         failed: units the preprocessor could not read.
         paths: the files rows written, in the spelling files.path uses.
             The coverage purge in _postprocess deletes any row that does
@@ -388,7 +391,7 @@ class AsmResult:
     files: int = 0
     symbols: int = 0
     vectors: int = 0
-    unhandled: int = 0
+    unresolved: int = 0
     failed: int = 0
     paths: set[str] = field(default_factory=set)
 
@@ -408,10 +411,17 @@ class AsmSymbol:
             every answer.
         is_global: The unit exported it with ``.global``.
         is_weak: Declared ``.weak``, thus a definition another object may
-            override.  The vector-table step needs this to tell an
-            interrupt that is handled from one that is not.
+            override.
         alias_target: For ``.thumb_set``/``.set``/``.equ``, the name this
             one points at.  None otherwise.
+
+    The pair ``is_weak`` + ``alias_target == "Default_Handler"`` is how
+    CMSIS says "assembly does not service this interrupt, C may".  The
+    vector-table step deliberately does NOT act on it: the slot gets its
+    edge either way, and where that edge lands — the startup file rather
+    than C — is what tells a reader the interrupt traps.  Acting on it
+    once meant asking about the alias before asking the index, and every
+    C override was thrown away: measured on FM, one edge instead of 27.
     """
 
     name: str
@@ -637,7 +647,7 @@ def extract_vectors(source: AsmSource) -> list[VectorEntry]:
 
     A linker symbol IS returned, `__StackTop` and `_estack` alike.  Nothing
     in the index defines it, so it resolves to no handler and becomes an
-    unhandled slot rather than an edge — the right answer, since a slot the
+    unresolved slot rather than an edge — the right answer, since a slot the
     linker fills is not an interrupt anybody services.
 
     Reads through ``_statements`` for the same reason the symbol pass does:
@@ -659,11 +669,6 @@ def extract_vectors(source: AsmSource) -> list[VectorEntry]:
             found.setdefault(key, VectorEntry(name=m.group(1), file=file, line=line))
     return list(found.values())
 
-
-# The interrupt a project does not handle points at this, through a weak
-# alias.  Measured on FM: 90 of 194 slots, of which 64 have no strong
-# definition anywhere — those are the unhandled ones.
-_DEFAULT_HANDLER_NAMES = frozenset({"Default_Handler", "0"})
 
 # refs.ref_kind for a vector table slot.  NOT "call": nothing calls a
 # handler by name, the hardware jumps to an address in a table, and an
@@ -701,48 +706,42 @@ def _resolve_handler(conn, config_hash: str, name: str) -> str | None:
 
 
 def _store_vectors(
-    conn, config_hash: str, source: AsmSource, symbols: list[AsmSymbol],
+    conn, config_hash: str, source: AsmSource,
     project_root: Path,
 ) -> tuple[int, int]:
-    """Write a reference for every handled vector slot.  Returns (linked, unhandled).
+    """Write a reference for every vector slot.  Returns (linked, unresolved).
 
-    An unhandled slot gets NO edge: it reaches the default handler and
-    nothing else, which means the interrupt is not serviced.  Linking it
-    anyway would make Default_Handler look like the target of ninety calls
-    and every interrupt look serviced, which is the opposite of the truth.
+    Every slot that names something the index knows gets an edge, and a
+    slot pointing at a weak alias of the default handler is no exception.
+    That slot exists, the hardware reaches it, and the symbol it names is
+    already in the index — withholding the one reference it has would say
+    the alias is unreferenced, which is false.
 
-    The order of the two questions is the whole point.  ``.weak X`` plus
-    ``.thumb_set X, Default_Handler`` is how CMSIS lets C override a
-    handler, so the alias says nothing about whether the interrupt is
-    serviced — only that assembly does not service it.  Asking about the
-    alias first threw the override away: measured on FM, 26 handlers that
-    interrupt.cpp, HardwareTimer.cpp, uart.c and clock.c really do define,
-    SysTick_Handler among them, were reported unhandled and got no edge.
-    zbox-ecb-fw hid the defect because its startup writes weak bodies
-    rather than aliases, so nothing short-circuited there.
+    Whether the interrupt is serviced is then visible from where the edge
+    LANDS, and that is a better answer than a count: an edge into C means a
+    handler runs, an edge into the startup file means the slot reaches
+    `Default_Handler` and the device traps.  Measured on FM, 26 of 97 slots
+    land in C, 64 in the startup file, 6 name a linker symbol.
+
+    ``.weak X`` plus ``.thumb_set X, Default_Handler`` is how CMSIS lets C
+    override a handler, so the alias never decides anything on its own.
+    Asking about it before asking the index threw every override away: the
+    same FM table carried one edge instead of 27.
+
+    *unresolved* counts slots naming something the index does not hold —
+    a linker symbol such as `_estack`, an ambiguous name, or a handler an
+    assembler macro defines, which the C preprocessor does not expand.
     """
     from fw_context_mcp.indexer.db import insert_refs_batch
     from fw_context_mcp.indexer.ops import _normalize_file_path
 
-    by_name = {s.name: s for s in symbols}
     rows = []
-    unhandled = 0
+    unresolved = 0
 
     for entry in extract_vectors(source):
         usr = _resolve_handler(conn, config_hash, entry.name)
         if usr is None:
-            unhandled += 1
-            continue
-        sym = by_name.get(entry.name)
-        if (
-            usr.startswith(_ASM_USR_PREFIX)
-            and sym is not None
-            and sym.is_weak
-            and sym.alias_target in _DEFAULT_HANDLER_NAMES
-        ):
-            # Nothing outside assembly defines it, and inside assembly it
-            # is only the alias.  The slot reaches the default handler.
-            unhandled += 1
+            unresolved += 1
             continue
         rows.append((
             config_hash, usr,
@@ -752,4 +751,4 @@ def _store_vectors(
 
     if rows:
         insert_refs_batch(conn, rows)
-    return len(rows), unhandled
+    return len(rows), unresolved

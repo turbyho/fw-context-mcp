@@ -495,7 +495,8 @@ class TestVectorEdges:
             result = store_units(conn, "ch", [_unit(tmp_path, "startup.S", asm)],
                                  tmp_path)
         rows = conn.execute(
-            "SELECT s.name, r.from_file, r.from_line, r.from_usr, r.ref_kind "
+            "SELECT s.name, r.to_usr, r.from_file, r.from_line, r.from_usr, "
+            "r.ref_kind "
             "FROM refs r JOIN symbols s ON s.usr=r.to_usr "
             "WHERE r.config_hash='ch' AND r.ref_kind='vector'"
         ).fetchall()
@@ -517,12 +518,18 @@ class TestVectorEdges:
         )
         assert edge["from_file"] == "startup.S"
 
-    def test_an_unhandled_slot_gets_no_edge(self, tmp_path: Path):
-        """A weak alias of the default handler means the interrupt is not serviced.
+    def test_a_default_aliased_slot_links_to_the_alias(self, tmp_path: Path):
+        """An unserviced interrupt still has a slot, and the slot has a target.
 
-        Measured on FM: 90 of 194 slots are aliased that way and 64 have no
-        strong definition.  Linking them would make Default_Handler look
-        like the target of ninety calls and every interrupt look serviced.
+        The slot exists, the hardware reaches it, and the alias it names is
+        already a symbol in the index.  Withholding the one reference that
+        symbol has would say it is unreferenced, which is false — measured
+        on FM, that hid 64 of 97 slots.
+
+        Whether the interrupt is serviced is read from where the edge LANDS:
+        into the startup file means it reaches Default_Handler, into C means
+        a handler runs.  Default_Handler itself gains nothing here, because
+        the table names the per-interrupt alias, not the handler.
         """
         result, edges = self._run(
             tmp_path,
@@ -531,15 +538,23 @@ class TestVectorEdges:
             ".weak TIM1_IRQHandler\n.thumb_set TIM1_IRQHandler, Default_Handler\n",
         )
 
-        assert edges == {}
-        assert result.unhandled == 1
+        assert result.vectors == 1
+        assert result.unresolved == 0
+        assert "TIM1_IRQHandler" in edges, edges
+        assert edges["TIM1_IRQHandler"]["to_usr"].startswith("asm:"), (
+            "the edge lands in assembly, which is what says the slot traps"
+        )
+        assert "Default_Handler" not in edges, (
+            "the table names the alias; Default_Handler must not collect an "
+            "edge per interrupt"
+        )
 
     def test_a_name_no_symbol_matches_gets_no_edge(self, tmp_path: Path):
         """`_estack` and friends sit in the same table and are not handlers."""
         result, edges = self._run(tmp_path, "  .word _estack\n")
 
         assert edges == {}
-        assert result.unhandled == 1
+        assert result.unresolved == 1
 
     def test_the_strong_definition_wins_over_the_weak_assembly_one(self, tmp_path: Path):
         """except.S defines HardFault_Handler weakly; a project defines it in C.
@@ -1158,7 +1173,7 @@ class TestCommentStrippingWidensTheVectorMatch:
             conn.close()
 
         assert result.vectors == 1
-        assert result.unhandled == 1
+        assert result.unresolved == 1
 
 
 class TestAWeakAliasDoesNotHideTheCOverride:
@@ -1220,24 +1235,30 @@ class TestAWeakAliasDoesNotHideTheCOverride:
         result, edges = self._run(tmp_path, ["SysTick_Handler"])
 
         assert "c:@F@SysTick_Handler" in edges, edges
-        assert result.vectors == 2, "Reset_Handler and SysTick_Handler"
-        assert result.unhandled == 1, "TIM2_IRQHandler has no C definition"
+        assert result.vectors == 3, "every slot is linked"
+        assert result.unresolved == 0
 
     def test_every_override_is_found_not_just_one(self, tmp_path: Path):
         result, edges = self._run(tmp_path, ["SysTick_Handler", "TIM2_IRQHandler"])
 
         assert result.vectors == 3
-        assert result.unhandled == 0
+        assert result.unresolved == 0
         assert "c:@F@TIM2_IRQHandler" in edges, edges
 
-    def test_an_alias_nobody_overrides_still_gets_no_edge(self, tmp_path: Path):
-        """The property the short circuit was there to protect.
+    def test_the_edge_says_which_handler_actually_runs(self, tmp_path: Path):
+        """The discriminator, now that every slot is linked.
 
-        Without it Default_Handler would look like the target of every
-        interrupt, and every interrupt would look serviced.
+        An edge into C means the interrupt is serviced; an edge back into
+        the assembly unit means it reaches the alias and thus the trap
+        loop.  This is what replaced the old counter, and it says which
+        interrupt rather than how many.
         """
-        result, edges = self._run(tmp_path, [])
+        _, edges = self._run(tmp_path, ["SysTick_Handler"])
 
-        assert result.vectors == 1, "only Reset_Handler, which has a body"
-        assert result.unhandled == 2
-        assert not any("SysTick" in e or "TIM2" in e for e in edges), edges
+        assert "c:@F@SysTick_Handler" in edges, (
+            f"overridden in C, thus serviced: {edges}"
+        )
+        assert any(e.startswith("asm:") and e.endswith("TIM2_IRQHandler")
+                   for e in edges), (
+            f"nobody overrode it, thus it reaches Default_Handler: {edges}"
+        )

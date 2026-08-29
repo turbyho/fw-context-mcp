@@ -687,8 +687,8 @@ def run(
                 )
         log.info(
             "assembly: %d unit(s) -> %d file(s), %d symbol(s), "
-            "%d vector edge(s), %d unhandled vector(s)%s",
-            len(asm_units), asm.files, asm.symbols, asm.vectors, asm.unhandled,
+            "%d vector edge(s), %d unresolved vector(s)%s",
+            len(asm_units), asm.files, asm.symbols, asm.vectors, asm.unresolved,
             f", {asm.failed} could not be preprocessed" if asm.failed else "",
         )
 
