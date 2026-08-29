@@ -468,11 +468,20 @@ def _strip_block_comments(text: str, in_comment: bool) -> tuple[str, bool]:
         index = start + 2
     return "".join(out), in_comment
 
+# Directives that open a body the assembler expands later, and the
+# directives that close them.  `.macro` needs `.endm`; `.rept`, `.irp`
+# and `.irpc` all need `.endr`.
+_BODY_OPEN = re.compile(r"^\s*\.(macro|rept|irp|irpc)\b", re.IGNORECASE)
+_BODY_CLOSE = {
+    "macro": re.compile(r"^\s*\.endm\b", re.IGNORECASE),
+    "rept": re.compile(r"^\s*\.endr\b", re.IGNORECASE),
+}
+
 
 def _statements(source: AsmSource) -> Iterator[tuple[str, int, str]]:
     """Yield ``(file, line, statement)`` for every statement of the unit.
 
-    Two transformations, and each one was needed to read real assembly:
+    Three transformations, and each one was needed to read real assembly:
 
     * Block comments go first.  The preprocessor keeps them — ``-C`` is
       deliberate, because ``files.content`` must match what a reader sees
@@ -485,6 +494,29 @@ def _statements(source: AsmSource) -> Iterator[tuple[str, int, str]]:
       ``.section .text.sym, "ax"; .thumb; .balign 4; sym :`` — anchoring on
       the start of the line finds ``.section`` and never the label, which
       is why the symbol pass returned nothing at all on Zephyr assembly.
+    * The body of ``.macro``, ``.rept``, ``.irp`` and ``.irpc`` is then
+      skipped, because reading it as ordinary assembly INVENTS symbols.
+
+    The last one is a correctness rule, not a simplification.  These are
+    assembler directives, which `clang -E` does not touch: it expands C
+    preprocessor macros and leaves these alone.  A body is a template,
+    and what it defines depends on whether — and how often — it is
+    invoked:
+
+    * a macro that is never invoked emits nothing at all;
+    * ``.rept 0`` assembles its body zero times;
+    * ``.exitm`` stops a body part way through;
+    * a body behind ``.if`` may take the other branch.
+
+    Measured against `arm-none-eabi-as` on the corpus in
+    ``tests/fixtures/asm``: reading the bodies produced four names the
+    assembler puts in no object file.  A missing symbol means something
+    is not found; an invented one puts a name in ``lookup_symbol`` that
+    is in no binary, which is worse.
+
+    Skipping is therefore what the reader does until it can expand these
+    exactly.  Everything the bodies define is missing meanwhile — on
+    zbox-ecb-fw that is 43 of 54 vector slots — but nothing is wrong.
 
     A line the map cannot place still advances the comment state: a
     comment opened in it closes lines later, in a line that IS placed.
@@ -494,12 +526,26 @@ def _statements(source: AsmSource) -> Iterator[tuple[str, int, str]]:
     # quadratic for no reason.
     text_lines = source.text.splitlines()
     in_comment = False
+    # The bodies currently open, innermost last, each holding the kind of
+    # terminator that closes it.  A stack rather than a counter, because
+    # the two kinds nest inside each other and a `.endr` must not be
+    # allowed to close a `.macro`.
+    open_bodies: list[str] = []
     for out_line, mapped in enumerate(source.line_map):
         clean, in_comment = _strip_block_comments(text_lines[out_line], in_comment)
         if mapped is None:
             continue
         file, line = mapped
         for stmt in clean.split(";"):
+            opened = _BODY_OPEN.match(stmt)
+            if opened is not None:
+                kind = opened.group(1).lower()
+                open_bodies.append("macro" if kind == "macro" else "rept")
+                continue
+            if open_bodies:
+                if _BODY_CLOSE[open_bodies[-1]].match(stmt):
+                    open_bodies.pop()
+                continue
             yield file, line, stmt
 
 

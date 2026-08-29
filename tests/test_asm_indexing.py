@@ -1262,3 +1262,88 @@ class TestAWeakAliasDoesNotHideTheCOverride:
                    for e in edges), (
             f"nobody overrode it, thus it reaches Default_Handler: {edges}"
         )
+
+
+class TestBodiesAreSkippedNotRead:
+    """A .macro or .rept body is a template, not code that exists.
+
+    These are ASSEMBLER directives; `clang -E` expands C preprocessor
+    macros and leaves them alone.  What a body defines depends on whether
+    and how often it is invoked, so reading it as ordinary assembly
+    invents symbols — verified against arm-none-eabi-as in
+    tests/test_asm_corpus.py, where it produced four names that are in no
+    object file.
+    """
+
+    @staticmethod
+    def _names(tmp_path: Path, body: str) -> set[str]:
+        from fw_context_mcp.indexer.asm import extract_symbols, preprocess
+
+        source = preprocess(_unit(tmp_path, "a.S", body))
+        assert source is not None
+        return {s.name for s in extract_symbols(source)}
+
+    def test_a_macro_never_invoked_defines_nothing(self, tmp_path: Path):
+        names = self._names(
+            tmp_path,
+            ".global Real\nReal:\n  b .\n"
+            ".macro never_called\n.global Ghost\nGhost:\n  b .\n.endm\n",
+        )
+
+        assert names == {"Real"}, names
+
+    def test_a_rept_body_is_skipped(self, tmp_path: Path):
+        """`.rept 0` assembles its body zero times."""
+        names = self._names(
+            tmp_path,
+            ".global Real\nReal:\n  b .\n"
+            ".rept 0\n.global Ghost\nGhost:\n  .word 0\n.endr\n",
+        )
+
+        assert names == {"Real"}, names
+
+    def test_an_irp_body_is_skipped(self, tmp_path: Path):
+        names = self._names(
+            tmp_path,
+            ".global Real\nReal:\n  b .\n"
+            ".irp which, a, b\n.global Ghost\nGhost:\n  .word 0\n.endr\n",
+        )
+
+        assert names == {"Real"}, names
+
+    def test_code_after_a_body_is_read_again(self, tmp_path: Path):
+        """The skip must end where the body does."""
+        names = self._names(
+            tmp_path,
+            ".macro m\n.global Ghost\nGhost:\n.endm\n"
+            ".global After\nAfter:\n  b .\n",
+        )
+
+        assert names == {"After"}, names
+
+    def test_a_nested_body_does_not_end_the_outer_one(self, tmp_path: Path):
+        """`.endr` must not close a `.macro`, which is why a stack is used."""
+        names = self._names(
+            tmp_path,
+            ".macro outer\n"
+            ".rept 2\n.global GhostInner\nGhostInner:\n.endr\n"
+            ".global GhostOuter\nGhostOuter:\n"
+            ".endm\n"
+            ".global After\nAfter:\n  b .\n",
+        )
+
+        assert names == {"After"}, names
+
+    def test_a_vector_slot_inside_a_body_is_skipped_too(self, tmp_path: Path):
+        """The rule protects the table as well as the symbol list."""
+        from fw_context_mcp.indexer.asm import extract_vectors, preprocess
+
+        source = preprocess(_unit(
+            tmp_path, "a.S",
+            "  .word RealSlot\n"
+            ".macro m\n  .word GhostSlot\n.endm\n",
+        ))
+        assert source is not None
+        names = {v.name for v in extract_vectors(source)}
+
+        assert names == {"RealSlot"}, names
