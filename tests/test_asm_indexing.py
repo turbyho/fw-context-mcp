@@ -936,3 +936,226 @@ class TestReindexReplacesWhatItWrote:
         assert before == 1
         assert result.failed == 1
         assert after == before, "a failed run must not be a delete"
+
+
+class TestCommentsAndLocalLabels:
+    """Prose reads like assembly, and not every label is a symbol.
+
+    Both defects came from a real startup file.  startup_NRF52840.S opens
+    with a block comment whose first line is `NOTE: Template files ...`,
+    and the label pattern took `NOTE` for a definition.  The same file
+    writes its copy loop with `.LC0` and `.LC1`, which GNU as keeps out of
+    the object symbol table entirely.
+    """
+
+    @staticmethod
+    def _symbols(tmp_path: Path, body: str):
+        from fw_context_mcp.indexer.asm import extract_symbols, preprocess
+
+        source = preprocess(_unit(tmp_path, "a.S", body))
+        assert source is not None
+        return {s.name for s in extract_symbols(source)}
+
+    def test_a_word_in_a_comment_is_not_a_label(self, tmp_path: Path):
+        names = self._symbols(
+            tmp_path,
+            "/*\nNOTE: Template files are application specific\n*/\n"
+            ".global Real\nReal:\n  b .\n",
+        )
+
+        assert names == {"Real"}, names
+
+    def test_a_directive_in_a_comment_does_not_count(self, tmp_path: Path):
+        """The comment fix protects every pattern, not just the label one."""
+        names = self._symbols(
+            tmp_path,
+            "/* .global Ghost\nGhost:\n*/\n.global Real\nReal:\n  b .\n",
+        )
+
+        assert names == {"Real"}, names
+
+    def test_a_comment_that_opens_and_closes_on_one_line(self, tmp_path: Path):
+        names = self._symbols(
+            tmp_path, ".global Real  /* Fake: not a label */\nReal:\n  b .\n"
+        )
+
+        assert names == {"Real"}, names
+
+    def test_code_after_a_closing_comment_still_counts(self, tmp_path: Path):
+        names = self._symbols(
+            tmp_path, "/* lead */ .global Real\nReal:\n  b .\n"
+        )
+
+        assert names == {"Real"}, names
+
+    def test_a_local_label_is_not_a_symbol(self, tmp_path: Path):
+        names = self._symbols(
+            tmp_path,
+            ".global Real\nReal:\n.LC1:\n  subs r3, 4\n  bgt .LC1\n.LC0:\n  b .\n",
+        )
+
+        assert names == {"Real"}, names
+
+    def test_a_vector_slot_in_a_comment_is_not_a_slot(self, tmp_path: Path):
+        from fw_context_mcp.indexer.asm import extract_vectors, preprocess
+
+        source = preprocess(_unit(
+            tmp_path, "a.S",
+            ".global Real\nReal:\n  b .\n"
+            "/*\n  .word Ghost\n*/\n  .word Real\n",
+        ))
+        assert source is not None
+        names = {v.name for v in extract_vectors(source)}
+
+        assert names == {"Real"}, names
+
+
+class TestAssemblyDefinitionSortsLast:
+    """A weak assembly stub must not shadow the C definition that wins.
+
+    A CMSIS startup file defines every interrupt handler weakly so C code
+    can override it, and both end up in the index under the same name —
+    measured on zbox-ecb-fw, 11 names carry one of each.  Line number used
+    to decide, so a project whose handler sits further down its file than
+    the stub does in the startup file got the stub: no callers, and a body
+    of two directives.
+    """
+
+    @staticmethod
+    def _db_with_both(tmp_path: Path, c_line: int, asm_line: int):
+        from fw_context_mcp.indexer.db import (
+            insert_symbols_batch,
+            open_db,
+            transaction,
+            upsert_build_config,
+            upsert_file,
+            upsert_project,
+        )
+
+        conn = open_db(tmp_path / "index.db")
+        with transaction(conn):
+            upsert_project(conn, "pid", "p", str(tmp_path))
+            upsert_build_config(conn, "ch", "pid", str(tmp_path / "cc.json"))
+            c_file = upsert_file(conn, "ch", "src/main.cpp", "cpp")
+            asm_file = upsert_file(conn, "ch", "startup.S", "c")
+            insert_symbols_batch(conn, [
+                ("ch", c_file, "src/main.cpp", "HardFault_Handler",
+                 "c:@F@HardFault_Handler", "HardFault_Handler",
+                 "HardFault_Handler", "function", c_line, 1, c_line, 1,
+                 "", "", None, 0, 0, "", 0, "", 1, 0.0, ""),
+                ("ch", asm_file, "startup.S", "HardFault_Handler",
+                 "asm:startup.S@HardFault_Handler", "HardFault_Handler",
+                 "HardFault_Handler", "function", asm_line, 1, asm_line, 1,
+                 "", "", None, 0, 0, "", 0, "", 0, 0.0, ""),
+            ])
+        return conn
+
+    def test_the_c_definition_wins_even_when_it_comes_later(self, tmp_path: Path):
+        """The failing arrangement: C at 300, the weak stub at 181."""
+        from fw_context_mcp.mcp.handlers.source import _lookup_definition
+
+        conn = self._db_with_both(tmp_path, c_line=300, asm_line=181)
+        try:
+            sym = _lookup_definition(
+                conn, "ch", "HardFault_Handler", preferred_kinds=None)
+        finally:
+            conn.close()
+
+        assert sym["usr"] == "c:@F@HardFault_Handler", sym["usr"]
+
+    def test_the_c_definition_wins_when_it_comes_first_too(self, tmp_path: Path):
+        """The arrangement that happened to work before, must keep working."""
+        from fw_context_mcp.mcp.handlers.source import _lookup_definition
+
+        conn = self._db_with_both(tmp_path, c_line=81, asm_line=181)
+        try:
+            sym = _lookup_definition(
+                conn, "ch", "HardFault_Handler", preferred_kinds=None)
+        finally:
+            conn.close()
+
+        assert sym["usr"] == "c:@F@HardFault_Handler", sym["usr"]
+
+    def test_an_assembly_only_symbol_still_resolves(self, tmp_path: Path):
+        """Reset_Handler has no C definition anywhere; it must still resolve."""
+        from fw_context_mcp.indexer.db import (
+            insert_symbols_batch,
+            open_db,
+            transaction,
+            upsert_build_config,
+            upsert_file,
+            upsert_project,
+        )
+        from fw_context_mcp.mcp.handlers.source import _lookup_definition
+
+        conn = open_db(tmp_path / "index.db")
+        try:
+            with transaction(conn):
+                upsert_project(conn, "pid", "p", str(tmp_path))
+                upsert_build_config(conn, "ch", "pid", str(tmp_path / "cc.json"))
+                fid = upsert_file(conn, "ch", "startup.S", "c")
+                insert_symbols_batch(conn, [(
+                    "ch", fid, "startup.S", "Reset_Handler",
+                    "asm:startup.S@Reset_Handler", "Reset_Handler",
+                    "Reset_Handler", "function", 130, 1, 130, 1,
+                    "", "", None, 0, 0, "", 0, "", 0, 0.0, "",
+                )])
+            sym = _lookup_definition(
+                conn, "ch", "Reset_Handler", preferred_kinds=None)
+        finally:
+            conn.close()
+
+        assert sym is not None
+        assert sym["usr"] == "asm:startup.S@Reset_Handler"
+
+
+class TestCommentStrippingWidensTheVectorMatch:
+    """Removing the comment changes what the slot pattern accepts.
+
+    The pattern requires the statement to end after the identifier, so a
+    slot written `.long __StackTop  /* Top of Stack */` did not match while
+    the comment was still in the line.  Measured on zbox-ecb-fw: the slot
+    count went from 53 to 54 when the comment stripping arrived, with the
+    linked count unchanged at 11 — the new slot is the initial stack
+    pointer, which no handler serves.
+    """
+
+    def test_a_slot_with_a_trailing_comment_is_seen(self, tmp_path: Path):
+        from fw_context_mcp.indexer.asm import extract_vectors, preprocess
+
+        source = preprocess(_unit(
+            tmp_path, "a.S",
+            ".global Reset_Handler\nReset_Handler:\n  b .\n"
+            "  .long   __StackTop   /* Top of Stack */\n"
+            "  .long   Reset_Handler\n",
+        ))
+        assert source is not None
+        names = {v.name for v in extract_vectors(source)}
+
+        assert names == {"__StackTop", "Reset_Handler"}, names
+
+    def test_a_linker_symbol_slot_produces_no_edge(self, tmp_path: Path):
+        """Seeing the slot is not the same as linking it.
+
+        __StackTop is defined by the linker script, so nothing in the index
+        defines it and the slot stays unlinked — which is why the linked
+        count did not move when the slot count did.
+        """
+        from fw_context_mcp.indexer.asm import store_units
+        from fw_context_mcp.indexer.db import transaction
+
+        unit = _unit(
+            tmp_path, "a.S",
+            ".global Reset_Handler\nReset_Handler:\n  b .\n"
+            "  .long   __StackTop   /* Top of Stack */\n"
+            "  .long   Reset_Handler\n",
+        )
+        conn = TestStoreUnits._db(tmp_path)
+        try:
+            with transaction(conn):
+                result = store_units(conn, "ch", [unit], tmp_path)
+        finally:
+            conn.close()
+
+        assert result.vectors == 1
+        assert result.unhandled == 1

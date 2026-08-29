@@ -29,6 +29,7 @@ import logging
 import re
 import sqlite3
 import subprocess
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -422,6 +423,76 @@ class AsmSymbol:
     alias_target: str | None = None
 
 
+# GNU as treats a label with this prefix as local to the file and keeps it
+# out of the object symbol table.  A compiler-written branch target is
+# spelled that way — startup_NRF52840.S has `.LC0` and `.LC1` around its
+# copy loop — and indexing them puts names in `lookup_symbol` that no
+# linker, debugger or reader will ever ask for.
+_LOCAL_LABEL_PREFIX = ".L"
+
+
+def _strip_block_comments(text: str, in_comment: bool) -> tuple[str, bool]:
+    """Remove ``/* */`` regions from one line.  Returns (text, still open).
+
+    The state has to cross lines because the comments do.  A string holding
+    the two characters — `.ascii "/*"` — would open one falsely; no
+    assembly measured does that, and the alternative is a full tokenizer
+    for a case that has not appeared.
+    """
+    out: list[str] = []
+    index = 0
+    while index < len(text):
+        if in_comment:
+            end = text.find("*/", index)
+            if end < 0:
+                break
+            in_comment = False
+            index = end + 2
+            continue
+        start = text.find("/*", index)
+        if start < 0:
+            out.append(text[index:])
+            break
+        out.append(text[index:start])
+        in_comment = True
+        index = start + 2
+    return "".join(out), in_comment
+
+
+def _statements(source: AsmSource) -> Iterator[tuple[str, int, str]]:
+    """Yield ``(file, line, statement)`` for every statement of the unit.
+
+    Two transformations, and each one was needed to read real assembly:
+
+    * Block comments go first.  The preprocessor keeps them — ``-C`` is
+      deliberate, because ``files.content`` must match what a reader sees
+      in the file — and prose reads like assembly often enough to matter.
+      startup_NRF52840.S opens with ``NOTE: Template files ...`` inside
+      ``/* */`` and the label pattern took ``NOTE`` for a definition.
+    * The line is then split on ``;``, because the assembler reads it that
+      way and a macro expansion arrives as one line of several statements.
+      Zephyr's ``SECTION_FUNC`` expands to
+      ``.section .text.sym, "ax"; .thumb; .balign 4; sym :`` — anchoring on
+      the start of the line finds ``.section`` and never the label, which
+      is why the symbol pass returned nothing at all on Zephyr assembly.
+
+    A line the map cannot place still advances the comment state: a
+    comment opened in it closes lines later, in a line that IS placed.
+    """
+    # splitlines() once, not once per line: the output of a Zephyr unit is
+    # over a thousand lines and re-splitting it each time made this
+    # quadratic for no reason.
+    text_lines = source.text.splitlines()
+    in_comment = False
+    for out_line, mapped in enumerate(source.line_map):
+        clean, in_comment = _strip_block_comments(text_lines[out_line], in_comment)
+        if mapped is None:
+            continue
+        file, line = mapped
+        for stmt in clean.split(";"):
+            yield file, line, stmt
+
+
 def extract_symbols(source: AsmSource) -> list[AsmSymbol]:
     """Return the symbols *source* defines, located in their own files.
 
@@ -431,12 +502,10 @@ def extract_symbols(source: AsmSource) -> list[AsmSymbol]:
     then `.global` then the label — so the whole unit is read before
     anything is decided.
 
-    Each line is split on `;` first, because the assembler reads it that
-    way and a macro expansion arrives as one line of several statements.
-    Zephyr's SECTION_FUNC expands to
-    `.section .text.sym, "ax"; .thumb; .balign 4; sym :` — anchoring on the
-    start of the line finds `.section` there and never sees the label, which
-    is why this returned nothing at all on Zephyr assembly.
+    ``_statements`` supplies the lines: it removes block comments and
+    splits on `;`, and both matter here — a comment line reading
+    ``NOTE: Template files ...`` looked exactly like a label definition,
+    and a Zephyr macro arrives as several statements on one line.
 
     An alias (``.thumb_set``) has no label of its own and is reported at the
     line of the directive: it IS the definition.
@@ -447,36 +516,27 @@ def extract_symbols(source: AsmSource) -> list[AsmSymbol]:
     weaks: set[str] = set()
     aliases: dict[str, tuple[str, str, int]] = {}
 
-    # splitlines() once, not once per line: the output of a Zephyr unit is
-    # over a thousand lines and re-splitting it each time made this
-    # quadratic for no reason.
-    text_lines = source.text.splitlines()
-
-    for out_line, mapped in enumerate(source.line_map):
-        if mapped is None:
-            continue
-        file, line = mapped
-
-        for stmt in text_lines[out_line].split(";"):
-            m = _LABEL_RE.match(stmt)
-            if m is not None:
+    for file, line, stmt in _statements(source):
+        m = _LABEL_RE.match(stmt)
+        if m is not None:
+            if not m.group(1).startswith(_LOCAL_LABEL_PREFIX):
                 labels.setdefault(m.group(1), (file, line))
-                continue
-            m = _GLOBAL_RE.match(stmt)
-            if m is not None:
-                globals_.add(m.group(1))
-                continue
-            m = _WEAK_RE.match(stmt)
-            if m is not None:
-                weaks.add(m.group(1))
-                continue
-            m = _TYPE_RE.match(stmt)
-            if m is not None:
-                kinds[m.group(1)] = "variable" if m.group(2) == "object" else "function"
-                continue
-            m = _ALIAS_RE.match(stmt)
-            if m is not None:
-                aliases.setdefault(m.group(1), (m.group(2), file, line))
+            continue
+        m = _GLOBAL_RE.match(stmt)
+        if m is not None:
+            globals_.add(m.group(1))
+            continue
+        m = _WEAK_RE.match(stmt)
+        if m is not None:
+            weaks.add(m.group(1))
+            continue
+        m = _TYPE_RE.match(stmt)
+        if m is not None:
+            kinds[m.group(1)] = "variable" if m.group(2) == "object" else "function"
+            continue
+        m = _ALIAS_RE.match(stmt)
+        if m is not None:
+            aliases.setdefault(m.group(1), (m.group(2), file, line))
 
     found: list[AsmSymbol] = []
     for name, (file, line) in labels.items():
@@ -573,24 +633,30 @@ def extract_vectors(source: AsmSource) -> list[VectorEntry]:
     A slot holding a number is not one: a reserved slot is written `.word 0`
     and a startup file has dozens of them — measured on FM, 12 of 206.  The
     pattern therefore takes an identifier and nothing else, which also drops
-    the IAR form `sfe(CSTACK)` and the linker symbols `_sidata`, `_estack`
-    that sit in the same table.
+    the IAR form `sfe(CSTACK)`.
+
+    A linker symbol IS returned, `__StackTop` and `_estack` alike.  Nothing
+    in the index defines it, so it resolves to no handler and becomes an
+    unhandled slot rather than an edge — the right answer, since a slot the
+    linker fills is not an interrupt anybody services.
+
+    Reads through ``_statements`` for the same reason the symbol pass does:
+    a `.word` inside a block comment is not a slot of the table.  That
+    stripping widened what this accepts, because the pattern requires the
+    statement to end after the identifier and a trailing `/* Top of Stack */`
+    used to prevent the match.  Measured on zbox-ecb-fw the slot count went
+    from 53 to 54 and the linked count stayed at 11.
     """
     found: dict[tuple[str, str, int], VectorEntry] = {}
-    text_lines = source.text.splitlines()
-    for out_line, mapped in enumerate(source.line_map):
-        if mapped is None:
-            continue
-        file, line = mapped
-        for stmt in text_lines[out_line].split(";"):
-            m = _VECTOR_RE.match(stmt)
-            if m is not None:
-                # Keyed, not appended: cpp can emit the same source line
-                # more than once — measured, a Zephyr unit appears twice in
-                # its own output — and one slot must not become two edges.
-                # The symbol side dedupes the same way, through setdefault.
-                key = (m.group(1), file, line)
-                found.setdefault(key, VectorEntry(name=m.group(1), file=file, line=line))
+    for file, line, stmt in _statements(source):
+        m = _VECTOR_RE.match(stmt)
+        if m is not None:
+            # Keyed, not appended: cpp can emit the same source line
+            # more than once — measured, a Zephyr unit appears twice in
+            # its own output — and one slot must not become two edges.
+            # The symbol side dedupes the same way, through setdefault.
+            key = (m.group(1), file, line)
+            found.setdefault(key, VectorEntry(name=m.group(1), file=file, line=line))
     return list(found.values())
 
 

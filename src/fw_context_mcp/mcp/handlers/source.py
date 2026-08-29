@@ -133,8 +133,25 @@ def _lookup_definition(
     the kind-priority clause so project-code symbols (``is_project=1``) sort
     before vendor/SDK symbols.  This prevents base-class definitions in SDK
     headers from shadowing project overrides when both share the same name.
+
+    An assembly definition always sorts last.  A CMSIS startup file defines
+    every interrupt handler weakly so that C code can override it, and both
+    definitions are then in the index under the same name: measured on
+    zbox-ecb-fw, 11 names carry one of each.  The C definition is the one
+    the linker keeps, thus it is the one to report — and without this the
+    winner is decided by line number, so a project whose handler sits
+    further down its file than the stub does in the startup file gets the
+    stub, with no callers and no body worth reading.
+
+    The reverse pattern — a weak C definition overridden in assembly — does
+    not appear in the projects measured, and the convention runs the other
+    way.
     """
-    _order_parts: list[str] = []
+    # substr, not LIKE: the templates below are composed with `%`, so a
+    # literal one in the SQL would be read as a conversion specifier.
+    _order_parts: list[str] = [
+        "CASE WHEN substr(s.usr, 1, 4) = 'asm:' THEN 1 ELSE 0 END"
+    ]
     if preferred_kinds:
         for k in preferred_kinds:
             if not isinstance(k, str) or "'" in k:
