@@ -669,6 +669,8 @@ def run(
 
 
 
+    asm = None
+
     # ── Assembly, after every other unit ──
     # The ordering is deliberate and the steps built on this one depend on
     # it: deciding whether a vector slot is handled means asking whether a
@@ -681,6 +683,7 @@ def run(
             with transaction(conn, checkpoint=False):
                 asm = _store_asm(
                     conn, config_hash, asm_units, project_root, build_dir_patterns,
+                    vendor_patterns, project_patterns_list,
                 )
         log.info(
             "assembly: %d unit(s) -> %d file(s), %d symbol(s), "
@@ -691,6 +694,7 @@ def run(
 
     # ── Post-processing ──
     _run_postprocess(
+        asm_paths=asm.paths if asm is not None else set(),
         conn=conn,
         config_hash=config_hash,
         project_root=project_root,

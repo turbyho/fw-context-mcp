@@ -809,6 +809,11 @@ def _step_purge_files_outside_build(conn: sqlite3.Connection, ctx: dict) -> None
     if covered is None:
         log.debug("coverage purge skipped: manifest carries no header lists")
         return
+    # Assembly units are part of the build and of neither source above:
+    # libclang never parsed them, so they are absent from *units*, and the
+    # manifest lists only what libclang saw.  They were written and then
+    # deleted again in the same run until this line existed.
+    covered |= set(ctx.get("asm_paths") or ())
 
     # Vendor and SDK files are candidates too, not just project sources: a
     # framework upgrade replaces headers, and the ones it dropped must go with
@@ -1545,6 +1550,7 @@ def _run_postprocess(
     project_id: str,
     git_description: str,
     *,
+    asm_paths: set[str] | None = None,
     index_refs: bool,
     index_embeddings: bool,
     index_macros_expanded: bool,
@@ -1584,6 +1590,7 @@ def _run_postprocess(
         "project_root": project_root,
         "db_dir": db_dir,
         "units": units,
+        "asm_paths": asm_paths or set(),
         "tu_headers": tu_headers,
         "manifest": manifest,
         "compile_commands": compile_commands,

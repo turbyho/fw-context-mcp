@@ -566,3 +566,373 @@ class TestVectorEdges:
 
         assert result.vectors == 1
         assert "Reset_Handler" in edges
+
+
+class TestAssemblySurvivesPostProcessing:
+    """The coverage purge deletes any files row that is not part of the build.
+
+    It builds that set from the libclang units and the manifest, and knows
+    about neither assembly unit nor assembly include.  Measured on a real
+    FM reindex: the log said "2 file(s), 99 symbol(s), 1 vector edge(s)" and
+    the database held none of it — written and deleted in the same run.
+
+    The end-to-end test through runner.run() did NOT catch this: a synthetic
+    project has no manifest header lists, so the purge returns early.
+    """
+
+    def test_the_purge_keeps_the_paths_it_was_told_about(self, tmp_path: Path):
+        from fw_context_mcp.indexer._postprocess import _step_purge_files_outside_build
+        from fw_context_mcp.indexer.db import (
+            open_db,
+            transaction,
+            upsert_build_config,
+            upsert_file,
+            upsert_project,
+        )
+
+        conn = open_db(tmp_path / "index.db")
+        with transaction(conn):
+            upsert_project(conn, "pid", "p", str(tmp_path))
+            upsert_build_config(conn, "ch", "pid", str(tmp_path / "cc.json"))
+            # Twenty covered C files against two assembly ones, because the
+            # step refuses to act when more than 20% of the rows look stale.
+            # On the real FM index the assembly was 2 rows of about 600 —
+            # 0.3%, far under the guard — which is why it was purged there
+            # and why a fixture of four files hides the bug entirely.
+            covered_c = [f"src/keep{i}.c" for i in range(20)]
+            for path in [*covered_c, "src/api.h", "src/startup.S", "src/table.inc"]:
+                upsert_file(conn, "ch", path, "c")
+
+        # A manifest that covers the C units only — exactly what a real one
+        # holds, because libclang never saw the assembly.
+        #
+        # The entries MUST carry a non-empty header list.  _build_coverage_set
+        # returns None otherwise and the purge stops before it deletes
+        # anything — a test built on an empty list passes without ever
+        # reaching the line it means to check.
+        manifest = {
+            "entries": [{"file": c, "headers": ["src/api.h"]} for c in covered_c],
+            "headers": {"src/api.h": {}},
+        }
+        ctx = {
+            "config_hash": "ch",
+            "project_root": tmp_path,
+            "units": [SimpleNamespace(file=tmp_path / c) for c in covered_c],
+            "effective_manifest": manifest,
+            "asm_paths": {"src/startup.S", "src/table.inc"},
+            "db_dir": tmp_path,
+        }
+        with transaction(conn):
+            _step_purge_files_outside_build(conn, ctx)
+        kept = {r["path"] for r in conn.execute(
+            "SELECT path FROM files WHERE config_hash='ch'")}
+        conn.close()
+
+        assert "src/startup.S" in kept, (
+            "an assembly unit belongs to the build; the purge has no other "
+            "way to learn that"
+        )
+        assert "src/table.inc" in kept, "and so does what it includes"
+
+    def test_a_file_outside_the_build_still_goes(self, tmp_path: Path):
+        """The purge must keep doing its job.
+
+        Ten covered files against one stale, because the step refuses to act
+        when more than 20% of the rows look stale — that guard reads such a
+        set as broken coverage data rather than a stale index.
+        """
+        from fw_context_mcp.indexer._postprocess import _step_purge_files_outside_build
+        from fw_context_mcp.indexer.db import (
+            open_db,
+            transaction,
+            upsert_build_config,
+            upsert_file,
+            upsert_project,
+        )
+
+        conn = open_db(tmp_path / "index.db")
+        with transaction(conn):
+            upsert_project(conn, "pid", "p", str(tmp_path))
+            upsert_build_config(conn, "ch", "pid", str(tmp_path / "cc.json"))
+            covered = [f"src/keep{i}.c" for i in range(10)]
+            for path in [*covered, "src/api.h", "src/dropped.c"]:
+                upsert_file(conn, "ch", path, "c")
+
+        units = [SimpleNamespace(file=tmp_path / c) for c in covered]
+        ctx = {
+            "config_hash": "ch",
+            "project_root": tmp_path,
+            "units": units,
+            "effective_manifest": {
+                "entries": [{"file": c, "headers": ["src/api.h"]} for c in covered],
+                "headers": {"src/api.h": {}},
+            },
+            "asm_paths": set(),
+            "db_dir": tmp_path,
+        }
+        with transaction(conn):
+            _step_purge_files_outside_build(conn, ctx)
+        kept = {r["path"] for r in conn.execute(
+            "SELECT path FROM files WHERE config_hash='ch'")}
+        conn.close()
+
+        assert "src/dropped.c" not in kept
+        assert "src/keep0.c" in kept
+
+
+class TestIsProjectClassification:
+    """A startup file lives in the framework package, not in the project.
+
+    Calling it project code put ninety weak interrupt aliases into
+    `find_dead_code(project_only=True)`: measured on a real FM index, 91
+    handlers reported where two real ones stood before assembly was indexed
+    at all.  The rule is the one the C path uses.
+    """
+
+    def test_a_file_outside_the_project_is_vendor(self, tmp_path: Path):
+        from fw_context_mcp.indexer.asm import _is_project_file
+
+        outside = tmp_path.parent / "framework" / "startup.S"
+
+        assert _is_project_file(str(outside), tmp_path, [], []) == 0
+
+    def test_a_file_inside_the_project_is_project(self, tmp_path: Path):
+        from fw_context_mcp.indexer.asm import _is_project_file
+
+        inside = tmp_path / "src" / "startup.S"
+
+        assert _is_project_file(str(inside), tmp_path, [], []) == 1
+
+    def test_a_vendor_pattern_wins_inside_the_project(self, tmp_path: Path):
+        """A vendored SDK committed into the tree is still not team code."""
+        from fw_context_mcp.indexer.asm import _is_project_file
+
+        vendored = tmp_path / "mbed-os" / "startup.S"
+
+        assert _is_project_file(str(vendored), tmp_path, ["mbed-os/%"], []) == 0
+
+    def test_a_project_pattern_wins_over_a_vendor_one(self, tmp_path: Path):
+        from fw_context_mcp.indexer.asm import _is_project_file
+
+        claimed = tmp_path / "mbed-os" / "targets_custom" / "startup.S"
+
+        assert _is_project_file(
+            str(claimed), tmp_path, ["mbed-os/%"], ["mbed-os/targets_custom/%"]
+        ) == 1
+
+    def test_the_stored_symbol_carries_the_verdict(self, tmp_path: Path):
+        from fw_context_mcp.indexer.asm import store_units
+        from fw_context_mcp.indexer.db import transaction
+
+        vendor_root = tmp_path / "vendor"
+        vendor_root.mkdir()
+        unit = _unit(vendor_root, "startup.S", ".global Foo\nFoo:\n  b .\n")
+        project_root = tmp_path / "proj"
+        project_root.mkdir()
+
+        conn = TestStoreUnits._db(tmp_path)
+        try:
+            with transaction(conn):
+                store_units(conn, "ch", [unit], project_root)
+            is_project = conn.execute(
+                "SELECT is_project FROM symbols WHERE config_hash='ch'"
+            ).fetchone()[0]
+        finally:
+            conn.close()
+
+        assert is_project == 0, (
+            "the unit is outside the project, thus find_dead_code with "
+            "project_only must not report its symbols"
+        )
+
+    def test_the_stored_file_carries_the_verdict_too(self, tmp_path: Path):
+        """files.is_project is a separate column and a separate filter.
+
+        It defaults to 0 and `upsert_file` cannot set it, thus a project
+        that writes its own assembly would not find its own file through
+        search_content(project_only=True) unless the content update sets it.
+        """
+        from fw_context_mcp.indexer.asm import store_units
+        from fw_context_mcp.indexer.db import transaction
+
+        project_root = tmp_path / "proj"
+        project_root.mkdir()
+        unit = _unit(project_root, "startup.S", ".global Foo\nFoo:\n  b .\n")
+
+        conn = TestStoreUnits._db(tmp_path)
+        try:
+            with transaction(conn):
+                store_units(conn, "ch", [unit], project_root)
+            rows = dict(conn.execute(
+                "SELECT path, is_project FROM files WHERE config_hash='ch'"
+            ).fetchall())
+        finally:
+            conn.close()
+
+        assert rows.get("startup.S") == 1, rows
+
+    def test_a_vendor_file_row_stays_vendor(self, tmp_path: Path):
+        from fw_context_mcp.indexer.asm import store_units
+        from fw_context_mcp.indexer.db import transaction
+
+        project_root = tmp_path / "proj"
+        project_root.mkdir()
+        (project_root / "mbed-os").mkdir()
+        unit = _unit(project_root / "mbed-os", "startup.S",
+                     ".global Foo\nFoo:\n  b .\n")
+
+        conn = TestStoreUnits._db(tmp_path)
+        try:
+            with transaction(conn):
+                store_units(conn, "ch", [unit], project_root,
+                            vendor_patterns=["mbed-os/%"])
+            rows = dict(conn.execute(
+                "SELECT path, is_project FROM files WHERE config_hash='ch'"
+            ).fetchall())
+        finally:
+            conn.close()
+
+        assert rows.get("mbed-os/startup.S") == 0, rows
+
+
+class TestReindexReplacesWhatItWrote:
+    """A second run must be able to correct the first one.
+
+    Two mechanisms hid the stale rows, and both were found on real data:
+
+    * `insert_symbols_batch` merges on ON CONFLICT(config_hash, usr), but
+      guards the UPDATE with `excluded.is_definition = 1 AND
+      symbols.is_definition = 0`.  Every assembly symbol is a definition,
+      so neither side matches and the row from the earlier run survives.
+      An is_project fix looked like it had no effect until this was found:
+      99 symbols, 99 still carrying the old verdict after a --force run.
+    * `refs` has no unique constraint, so a vector edge is appended again
+      every run.  FM reported one edge and held two rows.
+    """
+
+    @staticmethod
+    def _store(conn, tmp_path: Path, body: str, name: str = "startup.S", **kw):
+        from fw_context_mcp.indexer.asm import store_units
+        from fw_context_mcp.indexer.db import transaction
+
+        unit = _unit(tmp_path, name, body)
+        with transaction(conn):
+            return store_units(conn, "ch", [unit], tmp_path, **kw)
+
+    def test_a_moved_symbol_gets_its_new_line(self, tmp_path: Path):
+        conn = TestStoreUnits._db(tmp_path)
+        try:
+            self._store(conn, tmp_path, ".global Foo\nFoo:\n  b .\n")
+            first = conn.execute(
+                "SELECT line FROM symbols WHERE name='Foo'").fetchone()[0]
+            # The same symbol, two lines further down.
+            self._store(conn, tmp_path, "  .text\n  .text\n.global Foo\nFoo:\n  b .\n")
+            second = conn.execute(
+                "SELECT line FROM symbols WHERE name='Foo'").fetchone()[0]
+        finally:
+            conn.close()
+
+        assert second == first + 2, (
+            f"the row still carries the line of the previous run: "
+            f"{first} then {second}"
+        )
+
+    def test_a_removed_symbol_goes_away(self, tmp_path: Path):
+        conn = TestStoreUnits._db(tmp_path)
+        try:
+            self._store(conn, tmp_path,
+                        ".global Foo\nFoo:\n  b .\n.global Bar\nBar:\n  b .\n")
+            self._store(conn, tmp_path, ".global Foo\nFoo:\n  b .\n")
+            names = {r[0] for r in conn.execute(
+                "SELECT name FROM symbols WHERE config_hash='ch'")}
+        finally:
+            conn.close()
+
+        assert names == {"Foo"}, f"Bar was deleted from the source: {names}"
+
+    def test_a_changed_verdict_reaches_the_row(self, tmp_path: Path):
+        """The case that made the is_project fix look inert."""
+        conn = TestStoreUnits._db(tmp_path)
+        body = ".global Foo\nFoo:\n  b .\n"
+        try:
+            self._store(conn, tmp_path, body)
+            assert conn.execute(
+                "SELECT is_project FROM symbols WHERE name='Foo'").fetchone()[0] == 1
+            # The same file, now covered by a vendor pattern.
+            self._store(conn, tmp_path, body, vendor_patterns=["startup.S"])
+            after = conn.execute(
+                "SELECT is_project FROM symbols WHERE name='Foo'").fetchone()[0]
+        finally:
+            conn.close()
+
+        assert after == 0, "the second run must be able to reclassify the symbol"
+
+    def test_a_vector_edge_is_not_appended_twice(self, tmp_path: Path):
+        conn = TestStoreUnits._db(tmp_path)
+        body = ".global Reset_Handler\nReset_Handler:\n  b .\n  .word Reset_Handler\n"
+        try:
+            self._store(conn, tmp_path, body)
+            self._store(conn, tmp_path, body)
+            rows = conn.execute(
+                "SELECT COUNT(*) FROM refs WHERE ref_kind='vector'").fetchone()[0]
+        finally:
+            conn.close()
+
+        assert rows == 1, f"refs has no unique constraint; got {rows} rows"
+
+    def test_c_symbols_are_left_alone(self, tmp_path: Path):
+        """The clear keys on the USR namespace, never on the file.
+
+        An assembly unit can include a header that C includes too.  Keying
+        the cleanup by file id — which is what the C path does — would
+        delete the C symbols stored earlier in the same run.
+        """
+        from fw_context_mcp.indexer.db import insert_symbols_batch, transaction, upsert_file
+
+        conn = TestStoreUnits._db(tmp_path)
+        try:
+            with transaction(conn):
+                fid = upsert_file(conn, "ch", "shared.h", "c")
+                insert_symbols_batch(conn, [(
+                    "ch", fid, "shared.h", "c_thing", "c:@F@c_thing", "c_thing",
+                    "c_thing", "function", 1, 1, 1, 1,
+                    "", "", None, 0, 0, "", 0, "", 1, 0.0, "",
+                )])
+            self._store(conn, tmp_path, ".global Foo\nFoo:\n  b .\n")
+            names = {r[0] for r in conn.execute(
+                "SELECT name FROM symbols WHERE config_hash='ch'")}
+        finally:
+            conn.close()
+
+        assert "c_thing" in names, f"the C symbol was collateral damage: {names}"
+
+    def test_a_run_that_preprocesses_nothing_keeps_the_old_index(self, tmp_path: Path):
+        """No clang on PATH must not empty what an earlier run stored.
+
+        The clear happens once, on the first unit that preprocessed, for
+        exactly this reason.  The C path gets the property for free: a
+        translation unit that fails to parse never reaches its own
+        `replace_file_data`.
+        """
+        import fw_context_mcp.indexer.asm as asm_mod
+
+        conn = TestStoreUnits._db(tmp_path)
+        try:
+            self._store(conn, tmp_path, ".global Foo\nFoo:\n  b .\n")
+            before = conn.execute(
+                "SELECT COUNT(*) FROM symbols WHERE config_hash='ch'").fetchone()[0]
+
+            original = asm_mod.preprocess
+            asm_mod.preprocess = lambda unit: None
+            try:
+                result = self._store(conn, tmp_path, ".global Foo\nFoo:\n  b .\n")
+            finally:
+                asm_mod.preprocess = original
+            after = conn.execute(
+                "SELECT COUNT(*) FROM symbols WHERE config_hash='ch'").fetchone()[0]
+        finally:
+            conn.close()
+
+        assert before == 1
+        assert result.failed == 1
+        assert after == before, "a failed run must not be a delete"

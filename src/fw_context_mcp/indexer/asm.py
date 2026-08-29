@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import logging
 import re
+import sqlite3
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -182,8 +183,88 @@ def filtered_content(path: str, active_lines: set[int]) -> str | None:
     )
 
 
+def _is_project_file(path: str, project_root: Path,
+                     vendor_patterns: list[str], project_patterns: list[str]) -> int:
+    """Say whether *path* is code of the team or of the SDK.
+
+    The same rule the C path uses, and it has to be: a startup file lives in
+    the framework package, outside the project entirely — FM's is under
+    ~/.platformio/packages — and calling it project code puts ninety weak
+    interrupt aliases into `find_dead_code(project_only=True)`.  Measured
+    before this: 91 handlers reported, against 2 real ones before assembly
+    was indexed at all.
+    """
+    from .sdk_detect import _path_matches
+
+    resolved = Path(path).resolve()
+    try:
+        rel = str(resolved.relative_to(project_root.resolve()))
+    except ValueError:
+        # Outside the project: vendor unless a project pattern claims it.
+        return 1 if any(_path_matches(str(resolved), p) for p in project_patterns) else 0
+    if any(_path_matches(rel, p) for p in project_patterns):
+        return 1
+    return 0 if any(_path_matches(rel, p) for p in vendor_patterns) else 1
+
+
+def _clear_previous_pass(conn, config_hash: str) -> None:
+    """Delete everything a previous run of this pass wrote.
+
+    Without it a re-index cannot correct anything this pass stored.  Two
+    separate mechanisms hide the stale rows:
+
+    * ``insert_symbols_batch`` merges on ``ON CONFLICT(config_hash, usr)``
+      but its guard is ``WHERE excluded.is_definition = 1 AND
+      symbols.is_definition = 0``.  Every assembly symbol is a definition,
+      so an existing row matches neither side and the UPDATE never runs —
+      the row from the earlier index survives untouched, line number,
+      is_project and all.  Measured: an is_project fix looked like it had
+      no effect at all until this function existed.
+    * ``refs`` has no unique constraint, so a vector edge is appended
+      again on every run.  Measured on FM: one edge reported, two rows.
+
+    The C path solves the same problem with ``replace_file_data``, keyed by
+    file id.  That is the wrong key here: an assembly unit can include a
+    header that C also includes, and clearing by file would delete the C
+    symbols stored earlier in this same run.  The ``asm:`` USR namespace is
+    the right key — it exists precisely so the two cannot collide.
+
+    Clearing the whole namespace is safe because the pass has no
+    incremental path: ``runner.run`` hands it every assembly unit of the
+    build on every run, thus everything deleted here is about to be
+    written again.
+    """
+    ids = [
+        r[0]
+        for r in conn.execute(
+            "SELECT id FROM symbols WHERE config_hash=? AND usr LIKE 'asm:%'",
+            (config_hash,),
+        )
+    ]
+    for chunk_start in range(0, len(ids), 500):
+        chunk = ids[chunk_start:chunk_start + 500]
+        marks = ",".join("?" * len(chunk))
+        # Ordered like _delete_rows_owned_by: what selects by symbol_id has
+        # to go before the symbols do.
+        conn.execute(f"DELETE FROM embeddings WHERE symbol_id IN ({marks})", chunk)  # noqa: S608
+        conn.execute(f"DELETE FROM llm_analysis WHERE symbol_id IN ({marks})", chunk)  # noqa: S608
+        try:
+            conn.execute(f"DELETE FROM vec_symbols WHERE symbol_id IN ({marks})", chunk)  # noqa: S608
+        except sqlite3.OperationalError:
+            pass  # sqlite-vec not loaded — the virtual table does not exist
+    conn.execute(
+        "DELETE FROM symbols WHERE config_hash=? AND usr LIKE 'asm:%'", (config_hash,)
+    )
+    conn.execute(
+        "DELETE FROM refs WHERE config_hash=? AND ref_kind=?",
+        (config_hash, VECTOR_REF_KIND),
+    )
+
+
 def store_units(conn, config_hash: str, units: list, project_root: Path,
-                build_dir_patterns: list[str] | None = None) -> AsmResult:
+                build_dir_patterns: list[str] | None = None,
+                vendor_patterns: list[str] | None = None,
+                project_patterns: list[str] | None = None) -> AsmResult:
     """Index every assembly unit: text, symbols, and vector table edges.
 
     Runs AFTER every C and C++ unit, and that ordering is load-bearing for
@@ -202,13 +283,25 @@ def store_units(conn, config_hash: str, units: list, project_root: Path,
     from fw_context_mcp.utils import compute_source_hash
 
     result = AsmResult()
+    cleared = False
     for unit in units:
         source = preprocess(unit)
         if source is None:
             result.failed += 1
             continue
+        # Deferred to the first unit that preprocessed, so that a run where
+        # nothing preprocesses at all — no clang on PATH is the way that
+        # happens — leaves the previous index alone instead of emptying it.
+        # The C path has the same property for free: a translation unit
+        # that fails to parse never reaches its own `replace_file_data`.
+        if not cleared:
+            _clear_previous_pass(conn, config_hash)
+            cleared = True
         symbols = extract_symbols(source)
-        _store_symbols(conn, config_hash, source, project_root, symbols)
+        _store_symbols(
+            conn, config_hash, source, project_root, symbols,
+            vendor_patterns or [], project_patterns or [],
+        )
         linked, unhandled = _store_vectors(
             conn, config_hash, source, symbols, project_root,
         )
@@ -232,11 +325,27 @@ def store_units(conn, config_hash: str, units: list, project_root: Path,
                 mtime=mtime,
                 source_hash=compute_source_hash(resolved),
             )
+            # is_project rides along with the content, and it must: the
+            # column defaults to 0, `upsert_file` cannot set it, and
+            # search_content(project_only=True) filters on it.  Without this
+            # a project that writes its own assembly could not find its own
+            # file.  MAX keeps the rule the C path uses — a file that any
+            # project symbol claimed is never downgraded to vendor.
             conn.execute(
-                "UPDATE files SET content=? WHERE config_hash=? AND path=?",
-                (content, config_hash, db_path),
+                "UPDATE files SET content=?, is_project=MAX(is_project, ?) "
+                "WHERE config_hash=? AND path=?",
+                (
+                    content,
+                    _is_project_file(
+                        path, project_root, vendor_patterns or [],
+                        project_patterns or [],
+                    ),
+                    config_hash,
+                    db_path,
+                ),
             )
             result.files += 1
+            result.paths.add(db_path)
     return result
 
 
@@ -267,6 +376,12 @@ class AsmResult:
         unhandled: vector slots left unlinked — the interrupt is not
             serviced, or the name resolves to nothing clear.
         failed: units the preprocessor could not read.
+        paths: the files rows written, in the spelling files.path uses.
+            The coverage purge in _postprocess deletes any row that does
+            not belong to the build, and it builds that set from the
+            libclang units and the manifest — neither of which knows about
+            assembly.  Without this the rows were written and then removed
+            in the same run.
     """
 
     files: int = 0
@@ -274,6 +389,7 @@ class AsmResult:
     vectors: int = 0
     unhandled: int = 0
     failed: int = 0
+    paths: set[str] = field(default_factory=set)
 
 
 @dataclass
@@ -401,7 +517,8 @@ _ASM_USR_PREFIX = "asm:"
 
 
 def _store_symbols(conn, config_hash: str, source: AsmSource, project_root: Path,
-                   symbols: list[AsmSymbol]) -> int:
+                   symbols: list[AsmSymbol], vendor_patterns: list[str],
+                   project_patterns: list[str]) -> int:
     """Write the symbols of one preprocessed unit.  Returns how many.
 
     A weak definition is stored like any other and marked through its USR
@@ -425,7 +542,9 @@ def _store_symbols(conn, config_hash: str, source: AsmSource, project_root: Path
             config_hash, file_ids[db_path], db_path, sym.name,
             f"{_ASM_USR_PREFIX}{db_path}@{sym.name}", sym.name, sym.name,
             sym.kind, sym.line, 1, sym.line, 1,
-            "", "", None, 0, 0, "", 0, "", 1, 0.0, "",
+            "", "", None, 0, 0, "", 0, "",
+            _is_project_file(sym.file, project_root, vendor_patterns, project_patterns),
+            0.0, "",
         ))
     insert_symbols_batch(conn, rows)
     return len(rows)
