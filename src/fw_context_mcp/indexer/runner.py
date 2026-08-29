@@ -296,7 +296,8 @@ def run(
     # TU_EXTENSIONS was not even a candidate — the units were invisible from
     # both directions.  Five of the seven test projects compile assembly.
     units = [u for u in all_units if u.file.suffix in TU_EXTENSIONS]
-    skipped_units = len(all_units) - len(units)
+    asm_units = [u for u in all_units if u.file.suffix not in TU_EXTENSIONS]
+    skipped_units = len(asm_units)
     if skipped_units:
         from collections import Counter
         by_ext = Counter(
@@ -667,6 +668,25 @@ def run(
                 log.info("[%d/%d] %s: skipped", processed, len(units), fname)
 
 
+
+    # ── Assembly, after every other unit ──
+    # The ordering is deliberate and the steps built on this one depend on
+    # it: deciding whether a vector slot is handled means asking whether a
+    # strong definition exists, and nothing can answer that until the C and
+    # C++ units are stored.
+    if asm_units:
+        from .asm import store_units as _store_asm
+
+        with write_lock(db_path.parent, timeout=120.0):
+            with transaction(conn, checkpoint=False):
+                asm_files, asm_failed = _store_asm(
+                    conn, config_hash, asm_units, project_root, build_dir_patterns,
+                )
+        log.info(
+            "assembly: %d file(s) from %d unit(s)%s",
+            asm_files, len(asm_units),
+            f", {asm_failed} could not be preprocessed" if asm_failed else "",
+        )
 
     # ── Post-processing ──
     _run_postprocess(
