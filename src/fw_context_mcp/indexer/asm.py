@@ -706,11 +706,20 @@ def _store_vectors(
 ) -> tuple[int, int]:
     """Write a reference for every handled vector slot.  Returns (linked, unhandled).
 
-    An unhandled slot gets NO edge.  It points at a weak alias of the
-    default handler and nothing else, which means the interrupt is not
-    serviced — measured on FM, 64 of 194.  Linking it anyway would make
-    Default_Handler look like the target of ninety calls and every
-    interrupt look serviced, which is the opposite of the truth.
+    An unhandled slot gets NO edge: it reaches the default handler and
+    nothing else, which means the interrupt is not serviced.  Linking it
+    anyway would make Default_Handler look like the target of ninety calls
+    and every interrupt look serviced, which is the opposite of the truth.
+
+    The order of the two questions is the whole point.  ``.weak X`` plus
+    ``.thumb_set X, Default_Handler`` is how CMSIS lets C override a
+    handler, so the alias says nothing about whether the interrupt is
+    serviced — only that assembly does not service it.  Asking about the
+    alias first threw the override away: measured on FM, 26 handlers that
+    interrupt.cpp, HardwareTimer.cpp, uart.c and clock.c really do define,
+    SysTick_Handler among them, were reported unhandled and got no edge.
+    zbox-ecb-fw hid the defect because its startup writes weak bodies
+    rather than aliases, so nothing short-circuited there.
     """
     from fw_context_mcp.indexer.db import insert_refs_batch
     from fw_context_mcp.indexer.ops import _normalize_file_path
@@ -720,13 +729,19 @@ def _store_vectors(
     unhandled = 0
 
     for entry in extract_vectors(source):
-        sym = by_name.get(entry.name)
-        if sym is not None and sym.is_weak and sym.alias_target in _DEFAULT_HANDLER_NAMES:
-            # The slot resolves to nothing but the default handler.
-            unhandled += 1
-            continue
         usr = _resolve_handler(conn, config_hash, entry.name)
         if usr is None:
+            unhandled += 1
+            continue
+        sym = by_name.get(entry.name)
+        if (
+            usr.startswith(_ASM_USR_PREFIX)
+            and sym is not None
+            and sym.is_weak
+            and sym.alias_target in _DEFAULT_HANDLER_NAMES
+        ):
+            # Nothing outside assembly defines it, and inside assembly it
+            # is only the alias.  The slot reaches the default handler.
             unhandled += 1
             continue
         rows.append((

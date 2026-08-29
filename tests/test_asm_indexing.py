@@ -1159,3 +1159,85 @@ class TestCommentStrippingWidensTheVectorMatch:
 
         assert result.vectors == 1
         assert result.unhandled == 1
+
+
+class TestAWeakAliasDoesNotHideTheCOverride:
+    """`.weak X` + `.thumb_set X, Default_Handler` is how C overrides X.
+
+    The pair says assembly does not service the interrupt.  It says nothing
+    about whether C does, and CMSIS writes it precisely so that C can.
+    Asking about the alias before asking the index threw every override
+    away: measured on FM, 26 handlers that interrupt.cpp, HardwareTimer.cpp,
+    uart.c and clock.c really define — SysTick_Handler among them — were
+    reported unhandled and got no edge, leaving the whole vector table with
+    one edge out of 97 slots.
+    """
+
+    _STARTUP = (
+        "  .word  Reset_Handler\n"
+        "  .word  SysTick_Handler\n"
+        "  .word  TIM2_IRQHandler\n"
+        ".global Reset_Handler\n"
+        "Reset_Handler:\n  b .\n"
+        "Default_Handler:\n  b .\n"
+        "  .weak SysTick_Handler\n"
+        "  .thumb_set SysTick_Handler,Default_Handler\n"
+        "  .weak TIM2_IRQHandler\n"
+        "  .thumb_set TIM2_IRQHandler,Default_Handler\n"
+    )
+
+    @staticmethod
+    def _run(tmp_path: Path, c_handlers: list[str]):
+        """Index *c_handlers* as C definitions, then the startup file."""
+        from fw_context_mcp.indexer.asm import store_units
+        from fw_context_mcp.indexer.db import (
+            insert_symbols_batch,
+            transaction,
+            upsert_file,
+        )
+
+        conn = TestStoreUnits._db(tmp_path)
+        with transaction(conn):
+            fid = upsert_file(conn, "ch", "src/hal.c", "c")
+            insert_symbols_batch(conn, [
+                ("ch", fid, "src/hal.c", name, f"c:@F@{name}", name, name,
+                 "function", 10 + i, 1, 12 + i, 1,
+                 "", "", None, 0, 0, "", 0, "", 1, 0.0, "")
+                for i, name in enumerate(c_handlers)
+            ])
+        unit = _unit(tmp_path, "startup.S",
+                     TestAWeakAliasDoesNotHideTheCOverride._STARTUP)
+        with transaction(conn):
+            result = store_units(conn, "ch", [unit], tmp_path)
+        edges = {
+            r[0] for r in conn.execute(
+                "SELECT to_usr FROM refs WHERE ref_kind='vector'")
+        }
+        conn.close()
+        return result, edges
+
+    def test_an_overridden_alias_gets_an_edge_to_the_c_definition(self, tmp_path: Path):
+        result, edges = self._run(tmp_path, ["SysTick_Handler"])
+
+        assert "c:@F@SysTick_Handler" in edges, edges
+        assert result.vectors == 2, "Reset_Handler and SysTick_Handler"
+        assert result.unhandled == 1, "TIM2_IRQHandler has no C definition"
+
+    def test_every_override_is_found_not_just_one(self, tmp_path: Path):
+        result, edges = self._run(tmp_path, ["SysTick_Handler", "TIM2_IRQHandler"])
+
+        assert result.vectors == 3
+        assert result.unhandled == 0
+        assert "c:@F@TIM2_IRQHandler" in edges, edges
+
+    def test_an_alias_nobody_overrides_still_gets_no_edge(self, tmp_path: Path):
+        """The property the short circuit was there to protect.
+
+        Without it Default_Handler would look like the target of every
+        interrupt, and every interrupt would look serviced.
+        """
+        result, edges = self._run(tmp_path, [])
+
+        assert result.vectors == 1, "only Reset_Handler, which has a body"
+        assert result.unhandled == 2
+        assert not any("SysTick" in e or "TIM2" in e for e in edges), edges
