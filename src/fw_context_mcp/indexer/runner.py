@@ -679,13 +679,14 @@ def run(
 
         with write_lock(db_path.parent, timeout=120.0):
             with transaction(conn, checkpoint=False):
-                asm_files, asm_failed = _store_asm(
+                asm = _store_asm(
                     conn, config_hash, asm_units, project_root, build_dir_patterns,
                 )
         log.info(
-            "assembly: %d file(s) from %d unit(s)%s",
-            asm_files, len(asm_units),
-            f", {asm_failed} could not be preprocessed" if asm_failed else "",
+            "assembly: %d unit(s) -> %d file(s), %d symbol(s), "
+            "%d vector edge(s), %d unhandled vector(s)%s",
+            len(asm_units), asm.files, asm.symbols, asm.vectors, asm.unhandled,
+            f", {asm.failed} could not be preprocessed" if asm.failed else "",
         )
 
     # ── Post-processing ──

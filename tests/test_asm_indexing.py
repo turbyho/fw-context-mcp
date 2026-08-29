@@ -176,14 +176,14 @@ class TestStoreUnits:
         conn = self._db(tmp_path)
         try:
             with transaction(conn):
-                stored, failed = store_units(conn, "ch", [unit], tmp_path)
+                result = store_units(conn, "ch", [unit], tmp_path)
             row = conn.execute(
                 "SELECT path, content FROM files WHERE config_hash='ch'"
             ).fetchone()
         finally:
             conn.close()
 
-        assert (stored, failed) == (1, 0)
+        assert (result.files, result.failed) == (1, 0)
         assert row["path"] == "startup.S"
         assert "HardFault_Handler" in row["content"]
         assert "@brief vector table" in row["content"], "comments must survive"
@@ -235,11 +235,13 @@ class TestStoreUnits:
         conn = self._db(tmp_path)
         try:
             with transaction(conn):
-                stored, failed = store_units(conn, "ch", [good, bad], tmp_path)
+                result = store_units(conn, "ch", [good, bad], tmp_path)
         finally:
             conn.close()
 
-        assert (stored, failed) == (1, 1), "one unit must not lose the other"
+        assert (result.files, result.failed) == (1, 1), (
+            "one unit must not lose the other"
+        )
 
     def test_the_row_carries_mtime_and_hash_together(self, tmp_path: Path):
         """The pair the staleness checks need; see db/_files.py upsert_file."""
@@ -417,3 +419,150 @@ class TestStoredSymbols:
 
         assert usr.startswith("asm:")
         assert not usr.startswith("c:")
+
+
+class TestVectorTable:
+    """A vector slot is the only edge an interrupt handler has.
+
+    Nothing calls a handler by name; the hardware jumps to an address in a
+    table.  Without the table in the index, HardFault_Handler had zero
+    references and find_dead_code reported it — measured on zbox-ecb-fw,
+    alongside BusFault_Handler.
+    """
+
+    @staticmethod
+    def _vectors(tmp_path: Path, text: str):
+        from fw_context_mcp.indexer.asm import extract_vectors
+
+        src = preprocess(_unit(tmp_path, "t.S", text))
+        assert src is not None
+        return {v.name: v for v in extract_vectors(src)}
+
+    def test_a_word_entry_names_a_handler(self, tmp_path: Path):
+        vec = self._vectors(tmp_path, "  .word HardFault_Handler\n")
+
+        assert vec["HardFault_Handler"].line == 1
+
+    def test_the_arm_dcd_spelling_is_read(self, tmp_path: Path):
+        """mbed's ARM-toolchain startup files write DCD, not .word."""
+        vec = self._vectors(tmp_path, "  DCD SVC_Handler\n")
+
+        assert "SVC_Handler" in vec
+
+    def test_a_reserved_slot_is_not_an_entry(self, tmp_path: Path):
+        """A startup table holds dozens: measured on FM, 12 of 206."""
+        vec = self._vectors(tmp_path, "  .word 0\n  .word 0x20000000\n")
+
+        assert vec == {}
+
+    def test_an_expression_is_not_an_entry(self, tmp_path: Path):
+        """The IAR form, and `.word A + 4`, name no single symbol."""
+        vec = self._vectors(tmp_path, "  .word sfe(CSTACK)\n  .word A + 4\n")
+
+        assert vec == {}
+
+    def test_a_repeated_line_yields_one_entry(self, tmp_path: Path):
+        """cpp can emit the same source line twice; one slot is one edge."""
+        from fw_context_mcp.indexer.asm import extract_vectors
+
+        src = preprocess(_unit(tmp_path, "t.S", "  .word Foo\n"))
+        src.line_map = src.line_map + src.line_map
+        src.text = src.text + "\n" + src.text
+
+        assert len(extract_vectors(src)) == 1
+
+
+class TestVectorEdges:
+    @staticmethod
+    def _run(tmp_path: Path, asm: str, c_symbols: list[str] = ()):
+        """Store *c_symbols* as C definitions, then index the assembly."""
+        from fw_context_mcp.indexer.asm import store_units
+        from fw_context_mcp.indexer.db import (
+            insert_symbols_batch,
+            transaction,
+            upsert_file,
+        )
+
+        conn = TestStoreUnits._db(tmp_path)
+        with transaction(conn):
+            if c_symbols:
+                fid = upsert_file(conn, "ch", "src/main.c", "c")
+                insert_symbols_batch(conn, [
+                    ("ch", fid, "src/main.c", n, f"c:@F@{n}", n, n, "function",
+                     10, 1, 12, 1, "", "", None, 0, 0, "", 0, "", 1, 0.0, "")
+                    for n in c_symbols
+                ])
+            result = store_units(conn, "ch", [_unit(tmp_path, "startup.S", asm)],
+                                 tmp_path)
+        rows = conn.execute(
+            "SELECT s.name, r.from_file, r.from_line, r.from_usr, r.ref_kind "
+            "FROM refs r JOIN symbols s ON s.usr=r.to_usr "
+            "WHERE r.config_hash='ch' AND r.ref_kind='vector'"
+        ).fetchall()
+        conn.close()
+        return result, {r["name"]: r for r in rows}
+
+    def test_a_handled_slot_becomes_a_reference(self, tmp_path: Path):
+        """The regression this whole plan exists for."""
+        result, edges = self._run(
+            tmp_path, "  .word HardFault_Handler\n", ["HardFault_Handler"]
+        )
+
+        assert result.vectors == 1
+        edge = edges["HardFault_Handler"]
+        assert edge["ref_kind"] == "vector"
+        assert edge["from_usr"] is None, (
+            "a table entry has no enclosing function; the column is nullable "
+            "and already used that way by 6445 rows on zbox-ecb-fw"
+        )
+        assert edge["from_file"] == "startup.S"
+
+    def test_an_unhandled_slot_gets_no_edge(self, tmp_path: Path):
+        """A weak alias of the default handler means the interrupt is not serviced.
+
+        Measured on FM: 90 of 194 slots are aliased that way and 64 have no
+        strong definition.  Linking them would make Default_Handler look
+        like the target of ninety calls and every interrupt look serviced.
+        """
+        result, edges = self._run(
+            tmp_path,
+            "Default_Handler:\n  b .\n"
+            "  .word TIM1_IRQHandler\n"
+            ".weak TIM1_IRQHandler\n.thumb_set TIM1_IRQHandler, Default_Handler\n",
+        )
+
+        assert edges == {}
+        assert result.unhandled == 1
+
+    def test_a_name_no_symbol_matches_gets_no_edge(self, tmp_path: Path):
+        """`_estack` and friends sit in the same table and are not handlers."""
+        result, edges = self._run(tmp_path, "  .word _estack\n")
+
+        assert edges == {}
+        assert result.unhandled == 1
+
+    def test_the_strong_definition_wins_over_the_weak_assembly_one(self, tmp_path: Path):
+        """except.S defines HardFault_Handler weakly; a project defines it in C.
+
+        The linker takes the strong one, and so must the edge.
+        """
+        result, edges = self._run(
+            tmp_path,
+            ".weak HardFault_Handler\nHardFault_Handler:\n  b .\n"
+            "  .word HardFault_Handler\n",
+            ["HardFault_Handler"],
+        )
+
+        assert result.vectors == 1
+        conn_usr = edges["HardFault_Handler"]
+        assert conn_usr["name"] == "HardFault_Handler"
+
+    def test_a_slot_pointing_at_assembly_only_code_still_links(self, tmp_path: Path):
+        """No C definition anywhere, but the assembly one is unambiguous."""
+        result, edges = self._run(
+            tmp_path, ".global Reset_Handler\nReset_Handler:\n  b .\n"
+                      "  .word Reset_Handler\n"
+        )
+
+        assert result.vectors == 1
+        assert "Reset_Handler" in edges

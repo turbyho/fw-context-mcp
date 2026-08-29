@@ -183,31 +183,38 @@ def filtered_content(path: str, active_lines: set[int]) -> str | None:
 
 
 def store_units(conn, config_hash: str, units: list, project_root: Path,
-                build_dir_patterns: list[str] | None = None) -> tuple[int, int]:
-    """Give every assembly unit and its includes a files row.  Returns (files, failed).
+                build_dir_patterns: list[str] | None = None) -> AsmResult:
+    """Index every assembly unit: text, symbols, and vector table edges.
 
     Runs AFTER every C and C++ unit, and that ordering is load-bearing for
     the steps built on top of this one: classifying a vector slot as
     unhandled means asking whether a strong definition exists anywhere, and
     that question has no answer until the rest of the index is in place.
 
-    The rows carry text and nothing else.  libclang never saw these units —
-    it cannot read assembly — so they contribute no symbol, and a caller
-    that finds a files row here must not conclude the file was parsed.
+    libclang never saw these units — it cannot read assembly — so nothing
+    here comes from an AST.  The text is the preprocessed source, the
+    symbols are the directives it holds, and the vector edges are the slots
+    that name a symbol the rest of the index already knows.
     """
     from fw_context_mcp.indexer.db import upsert_file
     from fw_context_mcp.indexer.manifest import _is_generated_header
     from fw_context_mcp.indexer.ops import _normalize_file_path
     from fw_context_mcp.utils import compute_source_hash
 
-    stored = 0
-    failed = 0
+    result = AsmResult()
     for unit in units:
         source = preprocess(unit)
         if source is None:
-            failed += 1
+            result.failed += 1
             continue
-        _store_symbols(conn, config_hash, source, project_root)
+        symbols = extract_symbols(source)
+        _store_symbols(conn, config_hash, source, project_root, symbols)
+        linked, unhandled = _store_vectors(
+            conn, config_hash, source, symbols, project_root,
+        )
+        result.symbols += len(symbols)
+        result.vectors += linked
+        result.unhandled += unhandled
         for path, active_lines in source.active.items():
             content = filtered_content(path, active_lines)
             if content is None:
@@ -229,8 +236,8 @@ def store_units(conn, config_hash: str, units: list, project_root: Path,
                 "UPDATE files SET content=? WHERE config_hash=? AND path=?",
                 (content, config_hash, db_path),
             )
-            stored += 1
-    return stored, failed
+            result.files += 1
+    return result
 
 
 # Directives that name a symbol.  GNU as accepts both spellings of the
@@ -247,6 +254,26 @@ _ALIAS_RE = re.compile(
 )
 # A label directive can carry a `.section` before it on the same line, so
 # every pattern here matches a STATEMENT, not a whole line.
+
+
+@dataclass
+class AsmResult:
+    """What one pass over the assembly units produced.
+
+    Attributes:
+        files: files rows written, unit and includes together.
+        symbols: symbol definitions found.
+        vectors: vector slots linked to a handler.
+        unhandled: vector slots left unlinked — the interrupt is not
+            serviced, or the name resolves to nothing clear.
+        failed: units the preprocessor could not read.
+    """
+
+    files: int = 0
+    symbols: int = 0
+    vectors: int = 0
+    unhandled: int = 0
+    failed: int = 0
 
 
 @dataclass
@@ -373,7 +400,8 @@ def extract_symbols(source: AsmSource) -> list[AsmSymbol]:
 _ASM_USR_PREFIX = "asm:"
 
 
-def _store_symbols(conn, config_hash: str, source: AsmSource, project_root: Path) -> int:
+def _store_symbols(conn, config_hash: str, source: AsmSource, project_root: Path,
+                   symbols: list[AsmSymbol]) -> int:
     """Write the symbols of one preprocessed unit.  Returns how many.
 
     A weak definition is stored like any other and marked through its USR
@@ -384,7 +412,6 @@ def _store_symbols(conn, config_hash: str, source: AsmSource, project_root: Path
     from fw_context_mcp.indexer.db import insert_symbols_batch, upsert_file
     from fw_context_mcp.indexer.ops import _normalize_file_path
 
-    symbols = extract_symbols(source)
     if not symbols:
         return 0
 
@@ -402,3 +429,127 @@ def _store_symbols(conn, config_hash: str, source: AsmSource, project_root: Path
         ))
     insert_symbols_batch(conn, rows)
     return len(rows)
+
+
+# A vector table slot: a data directive naming the symbol the hardware
+# jumps to.  `.word` and `.long` are GNU as, `DCD` is the ARM assembler,
+# and both spellings appear in the startup files measured.
+_VECTOR_RE = re.compile(
+    r"^\s*(?:\.word|\.long|\.quad|DCD|DCQ)\s+([A-Za-z_.$][\w.$]*)\s*$", re.IGNORECASE
+)
+
+
+@dataclass
+class VectorEntry:
+    """One slot of a vector table, and where it is written."""
+
+    name: str
+    file: str
+    line: int
+
+
+def extract_vectors(source: AsmSource) -> list[VectorEntry]:
+    """Return the vector table slots that name a symbol.
+
+    A slot holding a number is not one: a reserved slot is written `.word 0`
+    and a startup file has dozens of them — measured on FM, 12 of 206.  The
+    pattern therefore takes an identifier and nothing else, which also drops
+    the IAR form `sfe(CSTACK)` and the linker symbols `_sidata`, `_estack`
+    that sit in the same table.
+    """
+    found: dict[tuple[str, str, int], VectorEntry] = {}
+    text_lines = source.text.splitlines()
+    for out_line, mapped in enumerate(source.line_map):
+        if mapped is None:
+            continue
+        file, line = mapped
+        for stmt in text_lines[out_line].split(";"):
+            m = _VECTOR_RE.match(stmt)
+            if m is not None:
+                # Keyed, not appended: cpp can emit the same source line
+                # more than once — measured, a Zephyr unit appears twice in
+                # its own output — and one slot must not become two edges.
+                # The symbol side dedupes the same way, through setdefault.
+                key = (m.group(1), file, line)
+                found.setdefault(key, VectorEntry(name=m.group(1), file=file, line=line))
+    return list(found.values())
+
+
+# The interrupt a project does not handle points at this, through a weak
+# alias.  Measured on FM: 90 of 194 slots, of which 64 have no strong
+# definition anywhere — those are the unhandled ones.
+_DEFAULT_HANDLER_NAMES = frozenset({"Default_Handler", "0"})
+
+# refs.ref_kind for a vector table slot.  NOT "call": nothing calls a
+# handler by name, the hardware jumps to an address in a table, and an
+# answer that says "called from" would misdescribe how it runs.
+VECTOR_REF_KIND = "vector"
+
+
+def _resolve_handler(conn, config_hash: str, name: str) -> str | None:
+    """Return the USR a vector slot points at, or None when it is not clear.
+
+    A handler often has two definitions — a weak one in the SDK's assembly
+    and a strong one in the project's C — and the linker takes the strong
+    one.  So does this: a definition outside assembly wins, and only when
+    there is none does an assembly definition answer.
+
+    None when nothing matches, and None when several equally good ones do.
+    A wrong edge here would claim the vector table reaches something it does
+    not, and on an interrupt that is the only edge a reader has.
+    """
+    rows = conn.execute(
+        "SELECT usr, is_definition FROM symbols WHERE config_hash=? AND name=?",
+        (config_hash, name),
+    ).fetchall()
+    if not rows:
+        return None
+
+    strong = [r for r in rows if r["is_definition"] and not r["usr"].startswith(_ASM_USR_PREFIX)]
+    if len(strong) == 1:
+        return strong[0]["usr"]
+    if len(strong) > 1:
+        return None
+
+    from_asm = [r for r in rows if r["usr"].startswith(_ASM_USR_PREFIX)]
+    return from_asm[0]["usr"] if len(from_asm) == 1 else None
+
+
+def _store_vectors(
+    conn, config_hash: str, source: AsmSource, symbols: list[AsmSymbol],
+    project_root: Path,
+) -> tuple[int, int]:
+    """Write a reference for every handled vector slot.  Returns (linked, unhandled).
+
+    An unhandled slot gets NO edge.  It points at a weak alias of the
+    default handler and nothing else, which means the interrupt is not
+    serviced — measured on FM, 64 of 194.  Linking it anyway would make
+    Default_Handler look like the target of ninety calls and every
+    interrupt look serviced, which is the opposite of the truth.
+    """
+    from fw_context_mcp.indexer.db import insert_refs_batch
+    from fw_context_mcp.indexer.ops import _normalize_file_path
+
+    by_name = {s.name: s for s in symbols}
+    rows = []
+    unhandled = 0
+
+    for entry in extract_vectors(source):
+        sym = by_name.get(entry.name)
+        if sym is not None and sym.is_weak and sym.alias_target in _DEFAULT_HANDLER_NAMES:
+            # The slot resolves to nothing but the default handler.
+            unhandled += 1
+            continue
+        usr = _resolve_handler(conn, config_hash, entry.name)
+        if usr is None:
+            unhandled += 1
+            continue
+        rows.append((
+            config_hash, usr,
+            _normalize_file_path(entry.file, project_root), entry.line,
+            None, VECTOR_REF_KIND,
+        ))
+
+    if rows:
+        insert_refs_batch(conn, rows)
+    return len(rows), unhandled
