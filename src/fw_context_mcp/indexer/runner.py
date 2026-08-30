@@ -691,6 +691,13 @@ def run(
             len(asm_units), asm.files, asm.symbols, asm.vectors, asm.unresolved,
             f", {asm.failed} could not be preprocessed" if asm.failed else "",
         )
+        # A separate line, and only when a unit held a `.macro` at all.
+        # A refused macro leaves its symbols out of the index, and a
+        # refusal nobody can see looks exactly like a file that held
+        # nothing worth indexing.
+        macro_summary = asm.macros.summary()
+        if macro_summary:
+            log.info("assembly macros: %s", macro_summary)
 
     # ── Post-processing ──
     _run_postprocess(

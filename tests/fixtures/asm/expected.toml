@@ -21,22 +21,22 @@ defined = ["a_data_symbol", "alias_via_equ", "alias_via_set", "alias_via_thumb_s
 
 [macro_args]
 description = 'Macro argument defaults, :req, :vararg, keyword calls and quoting.'
-complete = false
+complete = true
 defined = ["both_given_one", "both_given_two", "by_position_0_6", "by_position_1_2", "by_position_3_4", "default_was_overridden", "default_was_used", "first_defaulted", "quotes_were_stripped", "required_was_given", "second_only", "vararg_head"]
 
 [macro_basic]
 description = 'The plain .macro forms, and a macro never invoked.'
-complete = false
+complete = true
 defined = ["POWER_CLOCK_IRQHandler", "RADIO_IRQHandler", "blank_one", "blank_two", "comma_one", "comma_two", "from_no_args", "mixed_one", "mixed_two"]
 
 [macro_control]
 description = '.exitm and .purgem.'
-complete = false
+complete = true
 defined = ["before_exitm", "first_definition", "second_definition"]
 
 [macro_substitution]
 description = '\name, \() and \@ inside a body.'
-complete = false
+complete = true
 defined = ["blank_before_colon", "head_tail", "paren_before_colon", "uses_counters"]
 
 [refuse]

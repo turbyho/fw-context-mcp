@@ -33,6 +33,9 @@ from collections.abc import Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from ._asm_macro import Report as MacroReport
+from ._asm_macro import expand_stream as expand_macros
+
 log = logging.getLogger(__name__)
 
 # How long the preprocessor may take on one unit.  It reads a handful of
@@ -299,7 +302,7 @@ def store_units(conn, config_hash: str, units: list, project_root: Path,
         if not cleared:
             _clear_previous_pass(conn, config_hash)
             cleared = True
-        symbols = extract_symbols(source)
+        symbols = extract_symbols(source, result.macros)
         _store_symbols(
             conn, config_hash, source, project_root, symbols,
             vendor_patterns or [], project_patterns or [],
@@ -386,6 +389,9 @@ class AsmResult:
             libclang units and the manifest — neither of which knows about
             assembly.  Without this the rows were written and then removed
             in the same run.
+        macros: what the assembler-macro expansion did, over every unit.
+            Carried out so the run can log it: a refusal nobody can see
+            is indistinguishable from a file that simply held nothing.
     """
 
     files: int = 0
@@ -394,6 +400,7 @@ class AsmResult:
     unresolved: int = 0
     failed: int = 0
     paths: set[str] = field(default_factory=set)
+    macros: MacroReport = field(default_factory=MacroReport)
 
 
 @dataclass
@@ -468,20 +475,19 @@ def _strip_block_comments(text: str, in_comment: bool) -> tuple[str, bool]:
         index = start + 2
     return "".join(out), in_comment
 
-# Directives that open a body the assembler expands later, and the
-# directives that close them.  `.macro` needs `.endm`; `.rept`, `.irp`
-# and `.irpc` all need `.endr`.
-_BODY_OPEN = re.compile(r"^\s*\.(macro|rept|irp|irpc)\b", re.IGNORECASE)
-_BODY_CLOSE = {
-    "macro": re.compile(r"^\s*\.endm\b", re.IGNORECASE),
-    "rept": re.compile(r"^\s*\.endr\b", re.IGNORECASE),
-}
+# The repetition directives, whose bodies are still skipped rather than
+# expanded.  `.macro` is no longer here: `_asm_macro` expands it, and a
+# body reached through an invocation is real code.  A `.rept 0` body is
+# not, so reading one would invent — see the corpus in
+# tests/fixtures/asm, where it did.
+_REPEAT_OPEN = re.compile(r"^\s*\.(rept|irp|irpc)\b", re.IGNORECASE)
+_REPEAT_CLOSE = re.compile(r"^\s*\.endr\b", re.IGNORECASE)
 
 
-def _statements(source: AsmSource) -> Iterator[tuple[str, int, str]]:
-    """Yield ``(file, line, statement)`` for every statement of the unit.
+def _raw_statements(source: AsmSource) -> Iterator[tuple[str, int, str]]:
+    """Yield ``(file, line, statement)`` before macros are expanded.
 
-    Three transformations, and each one was needed to read real assembly:
+    Two transformations, and each one was needed to read real assembly:
 
     * Block comments go first.  The preprocessor keeps them — ``-C`` is
       deliberate, because ``files.content`` must match what a reader sees
@@ -494,29 +500,15 @@ def _statements(source: AsmSource) -> Iterator[tuple[str, int, str]]:
       ``.section .text.sym, "ax"; .thumb; .balign 4; sym :`` — anchoring on
       the start of the line finds ``.section`` and never the label, which
       is why the symbol pass returned nothing at all on Zephyr assembly.
-    * The body of ``.macro``, ``.rept``, ``.irp`` and ``.irpc`` is then
-      skipped, because reading it as ordinary assembly INVENTS symbols.
 
-    The last one is a correctness rule, not a simplification.  These are
-    assembler directives, which `clang -E` does not touch: it expands C
-    preprocessor macros and leaves these alone.  A body is a template,
-    and what it defines depends on whether — and how often — it is
-    invoked:
+    The body of ``.rept``, ``.irp`` and ``.irpc`` is skipped here, because
+    reading it as ordinary assembly INVENTS symbols: ``.rept 0`` assembles
+    its body zero times, so a label inside is defined nowhere.  Measured
+    against `arm-none-eabi-as` on the corpus in ``tests/fixtures/asm``,
+    which is where that one was found.
 
-    * a macro that is never invoked emits nothing at all;
-    * ``.rept 0`` assembles its body zero times;
-    * ``.exitm`` stops a body part way through;
-    * a body behind ``.if`` may take the other branch.
-
-    Measured against `arm-none-eabi-as` on the corpus in
-    ``tests/fixtures/asm``: reading the bodies produced four names the
-    assembler puts in no object file.  A missing symbol means something
-    is not found; an invented one puts a name in ``lookup_symbol`` that
-    is in no binary, which is worse.
-
-    Skipping is therefore what the reader does until it can expand these
-    exactly.  Everything the bodies define is missing meanwhile — on
-    zbox-ecb-fw that is 43 of 54 vector slots — but nothing is wrong.
+    ``.macro`` is NOT skipped here — :func:`_statements` expands it, and
+    a statement reached through an invocation is code that really exists.
 
     A line the map cannot place still advances the comment state: a
     comment opened in it closes lines later, in a line that IS placed.
@@ -526,30 +518,41 @@ def _statements(source: AsmSource) -> Iterator[tuple[str, int, str]]:
     # quadratic for no reason.
     text_lines = source.text.splitlines()
     in_comment = False
-    # The bodies currently open, innermost last, each holding the kind of
-    # terminator that closes it.  A stack rather than a counter, because
-    # the two kinds nest inside each other and a `.endr` must not be
-    # allowed to close a `.macro`.
-    open_bodies: list[str] = []
+    repeat_depth = 0
     for out_line, mapped in enumerate(source.line_map):
         clean, in_comment = _strip_block_comments(text_lines[out_line], in_comment)
         if mapped is None:
             continue
         file, line = mapped
         for stmt in clean.split(";"):
-            opened = _BODY_OPEN.match(stmt)
-            if opened is not None:
-                kind = opened.group(1).lower()
-                open_bodies.append("macro" if kind == "macro" else "rept")
+            if _REPEAT_OPEN.match(stmt):
+                repeat_depth += 1
                 continue
-            if open_bodies:
-                if _BODY_CLOSE[open_bodies[-1]].match(stmt):
-                    open_bodies.pop()
+            if repeat_depth:
+                if _REPEAT_CLOSE.match(stmt):
+                    repeat_depth -= 1
                 continue
             yield file, line, stmt
 
 
-def extract_symbols(source: AsmSource) -> list[AsmSymbol]:
+def _statements(
+    source: AsmSource, report: MacroReport | None = None
+) -> Iterator[tuple[str, int, str]]:
+    """Yield every statement of the unit, macros expanded.
+
+    The single funnel both the symbol pass and the vector pass read
+    through, so a construct handled here is handled by both.
+
+    *report* collects what the expansion did.  Pass one to log it; the
+    default discards it, which is what the callers that only want the
+    statements do.
+    """
+    return expand_macros(_raw_statements(source), report or MacroReport())
+
+
+def extract_symbols(
+    source: AsmSource, report: MacroReport | None = None
+) -> list[AsmSymbol]:
     """Return the symbols *source* defines, located in their own files.
 
     A label is what defines a symbol; ``.global`` and ``.weak`` only say
@@ -558,10 +561,17 @@ def extract_symbols(source: AsmSource) -> list[AsmSymbol]:
     then `.global` then the label — so the whole unit is read before
     anything is decided.
 
-    ``_statements`` supplies the lines: it removes block comments and
-    splits on `;`, and both matter here — a comment line reading
-    ``NOTE: Template files ...`` looked exactly like a label definition,
-    and a Zephyr macro arrives as several statements on one line.
+    ``_statements`` supplies the lines: it removes block comments, splits
+    on `;` and expands assembler macros.  All three matter here — a
+    comment line reading ``NOTE: Template files ...`` looked exactly like
+    a label definition, a Zephyr macro arrives as several statements on
+    one line, and an nRF startup defines every handler through `.macro`.
+
+    *report* collects what the macro expansion did, so the caller can log
+    it.  The vector pass reads the same stream and expands the same
+    macros again rather than sharing this one, which would double-count
+    the report; the cost is one extra pass over a file measured in tens
+    of milliseconds.
 
     An alias (``.thumb_set``) has no label of its own and is reported at the
     line of the directive: it IS the definition.
@@ -572,7 +582,7 @@ def extract_symbols(source: AsmSource) -> list[AsmSymbol]:
     weaks: set[str] = set()
     aliases: dict[str, tuple[str, str, int]] = {}
 
-    for file, line, stmt in _statements(source):
+    for file, line, stmt in _statements(source, report):
         m = _LABEL_RE.match(stmt)
         if m is not None:
             if not m.group(1).startswith(_LOCAL_LABEL_PREFIX):
