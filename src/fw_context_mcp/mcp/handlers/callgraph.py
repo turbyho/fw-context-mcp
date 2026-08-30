@@ -1422,3 +1422,97 @@ def find_hotspots(
 
     return db.execute_scoped(_query)
 
+
+
+def get_vector_table(
+    project_root: Annotated[str | None, Field(description="Project root. Auto-detected if omitted.")] = None,
+    unhandled_only: Annotated[bool, Field(description="Return only the slots that reach the default handler.")] = False,
+    limit: Annotated[int, Field(description="Maximum slots (default 300).")] = 300,
+    variant: Annotated[str | None, Field(description="Build variant name (multi-project). Omit to use default_variant or fail-closed. Use '*' for all variants.")] = None,
+    image: Annotated[str | None, Field(description="Sysbuild image name within the variant (multi-project). Omit for all images of the variant.")] = None,
+) -> list[dict]:
+    """Read the interrupt vector table, and say what services each interrupt.
+
+    The vector table is how an interrupt reaches code.  Nothing CALLS a
+    handler — the hardware reads a slot and jumps — so a handler has no
+    caller, and every other tool shows it as unreferenced.  This tool
+    reads the table itself, from the assembly the build compiles.
+
+    Use it to answer "which interrupts does this firmware service", to
+    find the handler for one interrupt, or to find the interrupts that
+    reach the trap loop.
+
+    **The slot number is the position in the table.**  What that position
+    means belongs to the architecture, not to the index.  On Cortex-M
+    slots 0 to 15 are the system exceptions and slot 16 + n is external
+    interrupt n, so ``TIM2_IRQHandler`` in slot 44 is ``TIM2_IRQn = 28``.
+    On other architectures the same position means something else.
+
+    The ``status`` field says what services the interrupt:
+
+    * ``"c"`` — a definition outside assembly.  Code runs.  When the
+      index also holds the weak definition that this one replaced, the
+      row has ``overridden`` with its file and line.
+    * ``"assembly"`` — a strong assembly definition.  Assembly services
+      the interrupt.
+    * ``"unhandled"`` — a weak assembly definition that nothing
+      overrode.  A CMSIS startup file makes this an alias of
+      ``Default_Handler``, which is an infinite loop.  If the interrupt
+      fires, the device stops.
+    * ``"linker"`` — no definition in the build.  The linker script gives
+      the address.  Slot 0 holds the initial stack pointer, not a
+      handler, and looks like this.
+
+    A ``"c"`` row with ``overridden`` is the CMSIS pattern: the startup
+    file defines each handler weakly, the project defines the same name
+    again, and the linker keeps the strong one.
+
+    Only tables written as address words are read — ``.word`` and
+    ``.long`` in a vector section, which is what Cortex-M startup files
+    write.  arm64, Xtensa, RISC-V and MIPS build their tables from branch
+    instructions, and this tool finds nothing for them.
+
+    Read-only. No side effects. Requires an index of the assembly
+    (``fw-context index``).
+
+    Args:
+        project_root: Project root. Auto-detected if omitted.
+        unhandled_only: When True, return only the ``"unhandled"`` slots.
+        limit: Maximum slots (default 300, max 1000).
+        variant: Build variant (multi-project). Omit for the default
+            variant, ``"*"`` for all.
+        image: Sysbuild image in the variant. Omit for all images.
+
+    Returns:
+        list of dicts sorted by slot, each with: slot (int), name, file,
+        line, status (``"c"``, ``"assembly"``, ``"unhandled"`` or
+        ``"linker"``), table_file and table_line (where the slot is
+        written).  A ``"c"`` row can also hold overridden, a dict with
+        file and line.
+
+        Never empty: one dict with ``error`` (no index) or ``info`` (no
+        vector table in this build).  Check both keys first.
+    """
+    limit = max(0, min(limit, 1000))
+    db, err = _refs_guard(project_root, variant=variant, image=image)
+    if err:
+        return err
+    assert db is not None  # narrowed: err is None only on success
+
+    def _query(conn, config_hash):
+        # Runs under the executor lock on the single shared connection;
+        # must not open its own connection.  Timeout is enforced by
+        # _wrap_tool (300 s + interrupt), not here.
+        rows = index_db.get_vector_table(
+            conn, config_hash, unhandled_only=unhandled_only,
+        )
+        if not rows:
+            return [{"info": (
+                "No vector table in this build. The assembly holds no table "
+                "of address words, or the build has no assembly at all. "
+                "arm64, Xtensa, RISC-V and MIPS write their tables as branch "
+                "instructions, which this tool does not read."
+            )}]
+        return rows[:limit]
+
+    return db.execute_scoped(_query)

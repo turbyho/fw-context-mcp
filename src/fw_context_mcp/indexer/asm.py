@@ -270,8 +270,8 @@ def _clear_previous_pass(conn, config_hash: str) -> None:
         "DELETE FROM symbols WHERE config_hash=? AND usr LIKE 'asm:%'", (config_hash,)
     )
     conn.execute(
-        "DELETE FROM refs WHERE config_hash=? AND ref_kind=?",
-        (config_hash, VECTOR_REF_KIND),
+        "DELETE FROM refs WHERE config_hash=? AND ref_kind IN (?, ?)",
+        (config_hash, VECTOR_REF_KIND, ALIAS_REF_KIND),
     )
 
 
@@ -316,6 +316,11 @@ def store_units(conn, config_hash: str, units: list, project_root: Path,
         _store_symbols(
             conn, config_hash, source, project_root, symbols,
             vendor_patterns or [], project_patterns or [],
+        )
+        # Aliases before vectors: a slot naming an alias needs the edge
+        # that says what the alias really is.
+        result.aliases += _store_aliases(
+            conn, config_hash, symbols, project_root,
         )
         linked, unresolved = _store_vectors(
             conn, config_hash, source, project_root,
@@ -424,6 +429,7 @@ class AsmResult:
     symbols: int = 0
     vectors: int = 0
     unresolved: int = 0
+    aliases: int = 0
     failed: int = 0
     paths: set[str] = field(default_factory=set)
     macros: MacroReport = field(default_factory=MacroReport)
@@ -804,6 +810,17 @@ def extract_vectors(source: AsmSource) -> list[VectorEntry]:
 # answer that says "called from" would misdescribe how it runs.
 VECTOR_REF_KIND = "vector"
 
+# refs.ref_kind for `.thumb_set X, Y` — X is another name for Y.  An edge
+# rather than a column, because that is what it is: one symbol naming
+# another, which `find_references` should show like any other reference.
+#
+# It is also the only thing that separates a handler with a body from one
+# without.  A CMSIS startup declares BOTH weak: `Reset_Handler` is weak
+# and has a body, `NMI_Handler` is weak and is an alias of
+# `Default_Handler`, which is an infinite loop.  Weakness alone reports
+# the reset vector as unserviced.
+ALIAS_REF_KIND = "alias"
+
 
 
 # The kind of a name a vector slot points at that NOTHING in the build
@@ -815,6 +832,45 @@ VECTOR_REF_KIND = "vector"
 # filter and out of the LLM analysis, both of which would be claiming
 # knowledge that does not exist.
 _UNDEFINED_KIND = "undefined"
+
+
+def _store_aliases(
+    conn, config_hash: str, symbols: list[AsmSymbol], project_root: Path,
+) -> int:
+    """Write an edge for every `.thumb_set X, Y`.  Returns how many.
+
+    The alias is a reference: X is another name for Y, and a reader
+    asking what reaches `Default_Handler` should see the ninety handlers
+    that alias it, exactly as they would see calls.
+
+    It is also what tells a serviced interrupt from an unserviced one.  A
+    CMSIS startup declares both kinds weak — `Reset_Handler` weak with a
+    body, `NMI_Handler` weak with nothing but an alias — so weakness
+    cannot separate them and the edge can.
+
+    Runs after the unit's symbols are stored, so a target defined in the
+    same file is already there to point at.
+    """
+    from fw_context_mcp.indexer.db import insert_refs_batch
+    from fw_context_mcp.indexer.ops import _normalize_file_path
+
+    rows = []
+    for symbol in symbols:
+        if not symbol.alias_target:
+            continue
+        target = _resolve_handler(conn, config_hash, symbol.alias_target)
+        if target is None:
+            # The name resolves to nothing or to several things.  An
+            # alias edge to the wrong symbol would be worse than none.
+            continue
+        db_path = _normalize_file_path(symbol.file, project_root)
+        rows.append((
+            config_hash, target, db_path, symbol.line,
+            f"{_ASM_USR_PREFIX}{db_path}@{symbol.name}", ALIAS_REF_KIND, None,
+        ))
+    if rows:
+        insert_refs_batch(conn, rows)
+    return len(rows)
 
 
 def _declare_referenced_only(

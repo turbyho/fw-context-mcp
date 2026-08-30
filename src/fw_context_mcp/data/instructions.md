@@ -125,7 +125,7 @@ search_content (full file content), smart_search, semantic_search.
 Call graph: find_callers, find_references, find_call_path,
 find_all_callers_recursive, find_callees_recursive, find_hotspots,
 find_dead_code, find_wrapper_callers, trace_data_flow,
-find_indirect_call_sites, find_indirect_targets.
+find_indirect_call_sites, find_indirect_targets, get_vector_table.
 Inheritance: get_inheritance_chain, get_class_members,
 get_template_instances, get_method_overrides.
 Source: get_source, get_symbol_context, get_file_map, explain_symbol, read_file.

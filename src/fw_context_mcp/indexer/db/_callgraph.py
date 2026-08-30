@@ -77,6 +77,7 @@ __all__ = [
     "find_callees_recursive",
     "find_dead_code",
     "find_hotspots",
+    "get_vector_table",
 ]
 
 # ---------------------------------------------------------------------------
@@ -935,3 +936,121 @@ def find_hotspots(
     ).fetchall()
 
     return [dict(r) for r in rows]
+
+
+def get_vector_table(
+    conn: sqlite3.Connection,
+    config_hash: str,
+    unhandled_only: bool = False,
+) -> list[dict]:
+    """Read the interrupt vector table, one row for each slot.
+
+    A slot is a position in the table, and the hardware reaches it
+    directly.  Nothing calls the handler, so the table is the only edge a
+    reader has, and the indexer writes one ``refs`` row for each slot with
+    ``ref_kind='vector'`` and ``slot_index`` set.
+
+    Each row gets a ``status`` from where its target is defined:
+
+    * ``"c"`` — the target is defined outside assembly.  Code services
+      this interrupt.
+    * ``"assembly"`` — the target is a strong assembly definition.
+      Assembly services this interrupt.
+    * ``"unhandled"`` — the target is an alias of another symbol, and
+      nothing overrode it.  A CMSIS startup file writes each unserviced
+      interrupt as an alias of ``Default_Handler``, which is an infinite
+      loop.  The row then holds ``aliases`` with the name, file and line
+      of what it really reaches.
+
+    Weakness alone cannot say this, which is why the alias edge exists.
+    The same startup declares ``Reset_Handler`` weak WITH a body and
+    ``NMI_Handler`` weak with nothing but an alias.
+    * ``"linker"`` — the target has no definition in the build.  The
+      linker script gives the address.  Slot 0 holds the initial stack
+      pointer and looks like this.
+
+    ``overridden`` holds the weak definition that a ``"c"`` row replaced,
+    when one is in the index.  This is the CMSIS pattern: the startup file
+    defines each handler weakly, and the project defines the same name
+    again.  The linker keeps the strong one.
+
+    Args:
+        conn: An open index database connection.
+        config_hash: The build configuration to read.
+        unhandled_only: When True, return only the ``"unhandled"`` rows.
+
+    Returns:
+        A list of dicts sorted by slot.  Each dict has: slot, name, file,
+        line, status, and table_file and table_line for the position in
+        the table itself.  A ``"c"`` row can also have overridden, a dict
+        with file and line.
+    """
+    rows = conn.execute(
+        """SELECT r.slot_index AS slot,
+                  r.from_file  AS table_file,
+                  r.from_line  AS table_line,
+                  s.name       AS name,
+                  s.file_path  AS file,
+                  s.line       AS line,
+                  s.kind       AS kind,
+                  s.is_weak    AS is_weak,
+                  s.usr        AS usr
+           FROM refs r
+           JOIN symbols s ON s.usr = r.to_usr AND s.config_hash = r.config_hash
+           WHERE r.config_hash = ? AND r.ref_kind = 'vector'
+             AND r.slot_index IS NOT NULL
+           ORDER BY r.from_file, r.slot_index""",
+        (config_hash,),
+    ).fetchall()
+
+    out: list[dict] = []
+    for row in rows:
+        entry = dict(row)
+        entry_usr = str(entry.pop("usr"))
+        from_assembly = entry_usr.startswith("asm:")
+        weak = bool(entry.pop("is_weak"))
+        kind = entry.pop("kind")
+
+        if kind == "undefined":
+            entry["status"] = "linker"
+        elif not from_assembly:
+            entry["status"] = "c"
+        else:
+            # An alias edge, not weakness, says the target is only
+            # another name for something else.  The startup declares
+            # Reset_Handler weak WITH a body and NMI_Handler weak with
+            # nothing but an alias, so weakness would report the reset
+            # vector as unserviced.
+            reaches = conn.execute(
+                """SELECT t.name, t.file_path AS file, t.line FROM refs r
+                   JOIN symbols t ON t.usr = r.to_usr
+                                 AND t.config_hash = r.config_hash
+                   WHERE r.config_hash = ? AND r.ref_kind = 'alias'
+                     AND r.from_usr = ?
+                   LIMIT 1""",
+                (config_hash, entry_usr),
+            ).fetchone()
+            if reaches is not None:
+                entry["status"] = "unhandled"
+                entry["aliases"] = dict(reaches)
+            else:
+                entry["status"] = "assembly"
+        del weak
+
+        if entry["status"] == "c":
+            # The weak definition this one replaced, when the index holds
+            # it.  A reader asking "who really services this" wants both:
+            # the code that runs, and the stub it took the place of.
+            replaced = conn.execute(
+                """SELECT file_path AS file, line FROM symbols
+                   WHERE config_hash = ? AND name = ? AND is_weak = 1
+                   LIMIT 1""",
+                (config_hash, entry["name"]),
+            ).fetchone()
+            if replaced is not None:
+                entry["overridden"] = dict(replaced)
+
+        if unhandled_only and entry["status"] != "unhandled":
+            continue
+        out.append(entry)
+    return out

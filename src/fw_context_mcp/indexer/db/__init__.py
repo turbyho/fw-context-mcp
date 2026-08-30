@@ -79,6 +79,7 @@ __all__ = [
     "get_overrides_for_method",
     "get_template_instances",
     "get_vec_dim",
+    "get_vector_table",
     "init_vec_table",
     "insert_fp_assignments_batch",
     "insert_indirect_call_sites_batch",
@@ -119,6 +120,7 @@ from ._callgraph import (
     find_callees_recursive,
     find_dead_code,
     find_hotspots,
+    get_vector_table,
 )
 from ._connection import (
     DatabaseCorruptionError,

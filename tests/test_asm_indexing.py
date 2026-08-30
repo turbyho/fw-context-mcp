@@ -1835,3 +1835,188 @@ class TestTheSlotPositionReachesTheIndex:
             conn.close()
 
         assert value is None
+
+
+class TestAliasEdges:
+    """`.thumb_set X, Y` is a reference: X is another name for Y.
+
+    It is also the only thing that separates a serviced interrupt from an
+    unserviced one.  A CMSIS startup declares BOTH kinds weak —
+    `Reset_Handler` weak with a body, `NMI_Handler` weak with nothing but
+    an alias of `Default_Handler` — so weakness reported the reset vector
+    as unserviced until this edge existed.
+    """
+
+    @staticmethod
+    def _store(tmp_path: Path, body: str):
+        from fw_context_mcp.indexer.asm import store_units
+        from fw_context_mcp.indexer.db import transaction
+
+        conn = TestStoreUnits._db(tmp_path)
+        with transaction(conn):
+            store_units(conn, "ch", [_unit(tmp_path, "startup.S", body)],
+                        tmp_path)
+        return conn
+
+    def test_an_alias_becomes_an_edge(self, tmp_path: Path):
+        conn = self._store(tmp_path, _table(
+            "  .word TIM2_IRQHandler\n"
+            "Default_Handler:\n  b .\n"
+            "  .weak TIM2_IRQHandler\n"
+            "  .thumb_set TIM2_IRQHandler, Default_Handler\n"))
+        try:
+            rows = conn.execute(
+                "SELECT s.name FROM refs r JOIN symbols s ON s.usr = r.to_usr "
+                "WHERE r.ref_kind='alias'"
+            ).fetchall()
+        finally:
+            conn.close()
+
+        assert [r[0] for r in rows] == ["Default_Handler"]
+
+    def test_a_handler_with_a_body_gets_no_alias_edge(self, tmp_path: Path):
+        """`Reset_Handler` is weak AND real.  Weakness cannot say that."""
+        conn = self._store(tmp_path, _table(
+            "  .word Reset_Handler\n"
+            "  .weak Reset_Handler\nReset_Handler:\n  b .\n"))
+        try:
+            count = conn.execute(
+                "SELECT COUNT(*) FROM refs WHERE ref_kind='alias'"
+            ).fetchone()[0]
+            weak = conn.execute(
+                "SELECT is_weak FROM symbols WHERE name='Reset_Handler'"
+            ).fetchone()[0]
+        finally:
+            conn.close()
+
+        assert count == 0, "a label with a body is not an alias of anything"
+        assert weak == 1, "and it is still weak, which is why weakness cannot tell"
+
+    def test_an_alias_to_an_unknown_name_writes_nothing(self, tmp_path: Path):
+        """An edge to the wrong symbol would be worse than no edge."""
+        conn = self._store(tmp_path, _table(
+            "  .word Handler\n"
+            "  .thumb_set Handler, NoSuchSymbol\n"))
+        try:
+            count = conn.execute(
+                "SELECT COUNT(*) FROM refs WHERE ref_kind='alias'"
+            ).fetchone()[0]
+        finally:
+            conn.close()
+
+        assert count == 0
+
+    def test_the_alias_edges_go_on_a_reindex(self, tmp_path: Path):
+        """`_clear_previous_pass` owns them like the vector edges."""
+        body = _table(
+            "  .word TIM2_IRQHandler\n"
+            "Default_Handler:\n  b .\n"
+            "  .thumb_set TIM2_IRQHandler, Default_Handler\n")
+        from fw_context_mcp.indexer.asm import store_units
+        from fw_context_mcp.indexer.db import transaction
+
+        conn = TestStoreUnits._db(tmp_path)
+        try:
+            for _ in range(2):
+                with transaction(conn):
+                    store_units(conn, "ch",
+                                [_unit(tmp_path, "startup.S", body)], tmp_path)
+            count = conn.execute(
+                "SELECT COUNT(*) FROM refs WHERE ref_kind='alias'"
+            ).fetchone()[0]
+        finally:
+            conn.close()
+
+        assert count == 1, f"two runs left {count} edges"
+
+
+class TestGetVectorTable:
+    """The tool that answers "which interrupts does this firmware service"."""
+
+    @staticmethod
+    def _table_of(tmp_path: Path, body: str, c_symbols: list[str] = ()):
+        from fw_context_mcp.indexer.asm import store_units
+        from fw_context_mcp.indexer.db import (
+            get_vector_table,
+            insert_symbols_batch,
+            transaction,
+            upsert_file,
+        )
+
+        conn = TestStoreUnits._db(tmp_path)
+        try:
+            with transaction(conn):
+                if c_symbols:
+                    fid = upsert_file(conn, "ch", "src/main.c", "c")
+                    insert_symbols_batch(conn, [
+                        ("ch", fid, "src/main.c", n, f"c:@F@{n}", n, n,
+                         "function", 10, 1, 12, 1, "", "", None, 0, 0, "", 0,
+                         "", 1, 0.0, "", 0)
+                        for n in c_symbols
+                    ])
+                store_units(conn, "ch", [_unit(tmp_path, "startup.S", body)],
+                            tmp_path)
+            return {r["slot"]: r for r in get_vector_table(conn, "ch")}
+        finally:
+            conn.close()
+
+    _STARTUP = _table(
+        "  .word _estack\n"
+        "  .word Reset_Handler\n"
+        "  .word NMI_Handler\n"
+        "  .word SysTick_Handler\n"
+        "  .weak Reset_Handler\nReset_Handler:\n  b .\n"
+        "Default_Handler:\n  b .\n"
+        "  .weak NMI_Handler\n  .thumb_set NMI_Handler, Default_Handler\n"
+        "  .weak SysTick_Handler\n  .thumb_set SysTick_Handler, Default_Handler\n"
+    )
+
+    def test_a_linker_symbol_is_not_a_handler(self, tmp_path: Path):
+        """Slot 0 holds the initial stack pointer."""
+        table = self._table_of(tmp_path, self._STARTUP)
+
+        assert table[0]["name"] == "_estack"
+        assert table[0]["status"] == "linker"
+
+    def test_a_handler_with_a_body_is_serviced_by_assembly(self, tmp_path: Path):
+        table = self._table_of(tmp_path, self._STARTUP)
+
+        assert table[1]["status"] == "assembly"
+        assert table[1]["name"] == "Reset_Handler"
+
+    def test_an_unoverridden_alias_is_unhandled(self, tmp_path: Path):
+        table = self._table_of(tmp_path, self._STARTUP)
+
+        assert table[2]["status"] == "unhandled"
+        assert table[2]["aliases"]["name"] == "Default_Handler", (
+            "the row says what the interrupt really reaches"
+        )
+
+    def test_a_c_definition_services_the_interrupt(self, tmp_path: Path):
+        table = self._table_of(tmp_path, self._STARTUP, ["SysTick_Handler"])
+
+        assert table[3]["status"] == "c"
+        assert table[3]["file"] == "src/main.c"
+
+    def test_a_serviced_slot_names_the_stub_it_replaced(self, tmp_path: Path):
+        """The CMSIS pattern, which the reader asked to see."""
+        table = self._table_of(tmp_path, self._STARTUP, ["SysTick_Handler"])
+
+        assert "overridden" in table[3], table[3]
+        assert table[3]["overridden"]["file"] == "startup.S"
+
+    def test_unhandled_only_keeps_just_those(self, tmp_path: Path):
+        from fw_context_mcp.indexer.asm import store_units
+        from fw_context_mcp.indexer.db import get_vector_table, transaction
+
+        conn = TestStoreUnits._db(tmp_path)
+        try:
+            with transaction(conn):
+                store_units(conn, "ch",
+                            [_unit(tmp_path, "startup.S", self._STARTUP)],
+                            tmp_path)
+            rows = get_vector_table(conn, "ch", unhandled_only=True)
+        finally:
+            conn.close()
+
+        assert {r["name"] for r in rows} == {"NMI_Handler", "SysTick_Handler"}

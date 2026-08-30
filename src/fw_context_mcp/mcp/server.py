@@ -50,6 +50,7 @@ client-side connection timeouts.
 **Call graph tools** (require ``--refs`` index): ``find_callers``,
 ``find_references``, ``find_call_path``, ``find_all_callers_recursive``,
 ``find_callees_recursive``, ``find_hotspots``, ``find_dead_code``,
+``get_vector_table``,
 ``find_wrapper_callers``, ``find_indirect_call_sites``,
 ``find_indirect_targets``, ``trace_data_flow``.
 
@@ -392,6 +393,7 @@ mcp = FastMCP(
         "Call graph: find_callers, find_references, find_call_path,\n"
         "find_all_callers_recursive, find_callees_recursive, find_hotspots,\n"
         "find_dead_code, find_wrapper_callers, trace_data_flow,\n"
+        "get_vector_table,\n"
         "find_indirect_call_sites, find_indirect_targets.\n"
         "Inheritance: get_inheritance_chain, get_class_members,\n"
         "get_template_instances, get_method_overrides.\n"
@@ -562,6 +564,7 @@ mcp.tool()(_wrap_tool(search.smart_search))
 # callgraph.py
 mcp.tool()(_wrap_tool(callgraph.find_all_callers_recursive))
 mcp.tool()(_wrap_tool(callgraph.find_call_path))
+mcp.tool()(_wrap_tool(callgraph.get_vector_table))
 mcp.tool()(_wrap_tool(callgraph.find_callees_recursive))
 mcp.tool()(_wrap_tool(callgraph.find_callers))
 mcp.tool()(_wrap_tool(callgraph.find_dead_code))
