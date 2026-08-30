@@ -75,6 +75,19 @@ _INVOKE = re.compile(r"^\s*([A-Za-z_.$][\w.$]*)\s*(.*)$")
 _ALTMACRO = re.compile(r"^\s*\.altmacro\b", re.IGNORECASE)
 _NOALTMACRO = re.compile(r"^\s*\.noaltmacro\b", re.IGNORECASE)
 
+# The repetition directives.  All three end at `.endr`, and all three are
+# bounded, which is what separates them from the conditionals: `.rept 3`
+# repeats three times whatever the symbols hold, so expanding them needs
+# no expression evaluator.  A `.rept` whose count is an expression is the
+# exception, and is refused.
+_REPEAT_OPEN = re.compile(r"^\s*\.(rept|irp|irpc)\b(.*)$", re.IGNORECASE)
+_REPEAT_CLOSE = re.compile(r"^\s*\.endr\b", re.IGNORECASE)
+
+# One statement with the place it came from.  Repetition bodies carry
+# these rather than bare text, because the body sits in the file and its
+# own line is the honest answer for a symbol defined there.
+Located = tuple[str, int, str]
+
 # Every conditional the manual lists, plus the ARM spellings.  A body
 # holding one is refused: which branch it takes is an expression, and
 # this does not evaluate expressions.
@@ -134,12 +147,18 @@ class Report:
 
     defined: int = 0
     expanded: int = 0
+    repeated: int = 0
     refused: Counter = field(default_factory=Counter)
 
     def summary(self) -> str:
-        if not self.defined:
+        if not (self.defined or self.repeated or self.refused):
             return ""
-        parts = [f"{self.defined} macro(s) defined", f"{self.expanded} expanded"]
+        parts = []
+        if self.defined:
+            parts.append(f"{self.defined} macro(s) defined")
+            parts.append(f"{self.expanded} expanded")
+        if self.repeated:
+            parts.append(f"{self.repeated} repetition(s) expanded")
         for reason, count in sorted(self.refused.items()):
             parts.append(f"{count} refused ({reason})")
         return ", ".join(parts)
@@ -300,8 +319,61 @@ def substitute(statement: str, values: dict[str, str], counter: int) -> str:
     return _SUBSTITUTION.sub(replace, statement)
 
 
+@dataclass
+class _Repetition:
+    """A `.rept`, `.irp` or `.irpc` while its body is being collected.
+
+    Attributes:
+        kind: ``"rept"``, ``"irp"`` or ``"irpc"``.
+        argument: The text after the directive — a count, or a symbol
+            and its values.
+        body: The statements between the directive and its ``.endr``.
+        depth: How many are open, so a nested ``.endr`` does not close
+            the outer one.
+    """
+
+    kind: str
+    argument: str
+    body: list[Located]
+    depth: int
+
+    def iterations(self) -> list[dict[str, str]] | None:
+        """Return the substitutions to make, once per repetition.
+
+        None means refuse: a `.rept` whose count is an expression, which
+        this does not evaluate.
+        """
+        if self.kind == "rept":
+            try:
+                count = int(self.argument, 0)
+            except ValueError:
+                return None
+            # "A count of zero is allowed, but nothing is generated.
+            # Negative counts are not allowed."
+            return [{} for _ in range(max(0, count))]
+
+        symbol, _, values = self.argument.partition(",")
+        symbol = symbol.strip()
+        if not symbol:
+            return None
+        if self.kind == "irpc":
+            # One iteration per CHARACTER of the (possibly quoted) value.
+            text = values.strip().strip('"')
+            return [{symbol: char} for char in text] or [{symbol: ""}]
+        # `.irp`: one iteration per value, and with no values at all the
+        # body runs once with the symbol bound to the null string.
+        items = [v for v in split_arguments(values) if v != ""]
+        return [{symbol: item} for item in items] or [{symbol: ""}]
+
+
 class _Expander:
-    """Holds the definitions and the budgets while one unit is read."""
+    """Holds the definitions, the mode and the budgets while a unit is read.
+
+    One recursive routine handles definitions, invocations and
+    repetitions, so the ways they nest all work without a case for each:
+    a `.rept` inside a macro body, a macro invoked inside an `.irp` body,
+    an `.irp` inside an `.irp`, and a macro invoked from a macro.
+    """
 
     def __init__(self, report: Report) -> None:
         self.macros: dict[str, Macro] = {}
@@ -309,14 +381,121 @@ class _Expander:
         self.counter = 0
         self.emitted = 0
         self.exhausted = False
+        self.alternate = False
 
-    def expand(self, macro: Macro, argument_text: str, depth: int) -> Iterator[str]:
-        """Yield the statements one invocation produces."""
-        if macro.refuse_reason:
-            self.report.refused[macro.refuse_reason] += 1
-            return
+    def _budget_left(self) -> bool:
+        if self.emitted < MAX_STATEMENTS:
+            return True
+        if not self.exhausted:
+            self.exhausted = True
+            self.report.refused["statement budget exhausted"] += 1
+        return False
+
+    def process(
+        self, stream: Iterable[Located], depth: int = 0
+    ) -> Iterator[Located]:
+        """Yield *stream* with every macro and repetition expanded.
+
+        The recursion is what makes the constructs compose; *depth* stops
+        one that does not terminate.
+        """
         if depth > MAX_DEPTH:
             self.report.refused["recursion deeper than the limit"] += 1
+            return
+
+        collecting: Macro | None = None
+        repeat: _Repetition | None = None
+
+        for located in stream:
+            _, _, statement = located
+
+            if repeat is not None:
+                if _REPEAT_OPEN.match(statement):
+                    repeat.depth += 1
+                elif _REPEAT_CLOSE.match(statement):
+                    repeat.depth -= 1
+                    if repeat.depth == 0:
+                        yield from self._repeat(repeat, depth)
+                        repeat = None
+                        continue
+                repeat.body.append(located)
+                continue
+
+            if collecting is not None:
+                if _END.match(statement):
+                    if not collecting.refuse_reason and _has_conditional(
+                        collecting.body
+                    ):
+                        collecting.refuse_reason = "conditional body"
+                    self.macros[collecting.name] = collecting
+                    self.report.defined += 1
+                    collecting = None
+                else:
+                    collecting.body.append(statement)
+                continue
+
+            if _ALTMACRO.match(statement):
+                self.alternate = True
+                continue
+            if _NOALTMACRO.match(statement):
+                self.alternate = False
+                continue
+
+            defined = _DEFINE.match(statement)
+            if defined is not None:
+                collecting = Macro(
+                    name=defined.group(1),
+                    parameters=parse_parameters(defined.group(2)),
+                    body=[],
+                )
+                continue
+
+            purged = _PURGEM.match(statement)
+            if purged is not None:
+                self.macros.pop(purged.group(1), None)
+                continue
+
+            opened = _REPEAT_OPEN.match(statement)
+            if opened is not None:
+                repeat = _Repetition(
+                    kind=opened.group(1).lower(),
+                    argument=opened.group(2).strip(),
+                    body=[],
+                    depth=1,
+                )
+                continue
+
+            invocation = _INVOKE.match(statement)
+            if invocation is not None:
+                macro = self.macros.get(invocation.group(1))
+                if macro is not None:
+                    yield from self._invoke(
+                        macro, invocation.group(2), located, depth
+                    )
+                    continue
+
+            if not self._budget_left():
+                return
+            self.emitted += 1
+            yield located
+
+        if collecting is not None:
+            # `.macro` with no `.endm`.  The assembler rejects the file,
+            # so this cannot come from anything a build compiled; drop
+            # the body rather than read it as code.
+            self.report.refused["unterminated macro"] += 1
+        if repeat is not None:
+            self.report.refused["unterminated repetition"] += 1
+
+    def _invoke(
+        self, macro: Macro, argument_text: str, at: Located, depth: int
+    ) -> Iterator[Located]:
+        """Yield what one macro invocation produces."""
+        if self.alternate:
+            self.report.refused["alternate macro mode"] += 1
+            return
+        if macro.refuse_reason:
+            self.report.refused[macro.refuse_reason] += 1
             return
         values = bind(macro, split_arguments(argument_text))
         if values is None:
@@ -326,95 +505,53 @@ class _Expander:
         self.counter += 1
         counter = self.counter
         self.report.expanded += 1
-        for raw in macro.body:
-            if self.emitted >= MAX_STATEMENTS:
-                if not self.exhausted:
-                    self.exhausted = True
-                    self.report.refused["statement budget exhausted"] += 1
-                return
-            statement = substitute(raw, values, counter)
-            if _EXITM.match(statement):
-                return
-            self.emitted += 1
-            invocation = _INVOKE.match(statement)
-            if invocation is not None:
-                nested = self.macros.get(invocation.group(1))
-                if nested is not None:
-                    yield from self.expand(nested, invocation.group(2), depth + 1)
-                    continue
-            yield statement
+        file, line, _ = at
+
+        def body() -> Iterator[Located]:
+            for raw in macro.body:
+                statement = substitute(raw, values, counter)
+                if _EXITM.match(statement):
+                    return
+                # The location is the INVOCATION's.  A reader looking for
+                # POWER_CLOCK_IRQHandler wants the startup line that says
+                # `IRQ POWER_CLOCK_IRQHandler`, not a line inside a
+                # `.macro` that names no handler at all.
+                yield file, line, statement
+
+        yield from self.process(body(), depth + 1)
+
+    def _repeat(self, repetition: _Repetition, depth: int) -> Iterator[Located]:
+        """Yield what one `.rept` / `.irp` / `.irpc` produces."""
+        bindings = repetition.iterations()
+        if bindings is None:
+            self.report.refused[
+                f".{repetition.kind} this cannot evaluate"
+            ] += 1
+            return
+        self.report.repeated += 1
+
+        def body() -> Iterator[Located]:
+            for values in bindings:
+                for file, line, raw in repetition.body:
+                    # The location is the body statement's own.  Unlike a
+                    # macro body, this one is right here in the file, so
+                    # the more precise answer is available.
+                    yield file, line, substitute(raw, values, self.counter)
+
+        yield from self.process(body(), depth + 1)
 
 
 def expand_stream(
-    statements: Iterable[tuple[str, int, str]], report: Report
-) -> Iterator[tuple[str, int, str]]:
-    """Yield *statements* with every macro invocation replaced by its body.
-
-    A statement produced by an expansion carries the ``(file, line)`` of
-    the INVOCATION, not of the definition.  A reader looking for
-    POWER_CLOCK_IRQHandler wants the line of the startup file that says
-    ``IRQ POWER_CLOCK_IRQHandler``, not a line inside a `.macro` that
-    names no handler at all.
+    statements: Iterable[Located], report: Report
+) -> Iterator[Located]:
+    """Yield *statements* with macros and repetitions expanded.
 
     Definitions are collected as they are met, which is also the order
     the assembler reads them in: a macro cannot be invoked before its
     ``.macro`` line, and ``.purgem`` must undefine before the name can be
     defined again.
     """
-    expander = _Expander(report)
-    collecting: Macro | None = None
-    alternate = False
-
-    for file, line, statement in statements:
-        if _ALTMACRO.match(statement):
-            alternate = True
-            continue
-        if _NOALTMACRO.match(statement):
-            alternate = False
-            continue
-        if collecting is not None:
-            if _END.match(statement):
-                if not collecting.refuse_reason and _has_conditional(collecting.body):
-                    collecting.refuse_reason = "conditional body"
-                expander.macros[collecting.name] = collecting
-                report.defined += 1
-                collecting = None
-            else:
-                collecting.body.append(statement)
-            continue
-
-        defined = _DEFINE.match(statement)
-        if defined is not None:
-            collecting = Macro(
-                name=defined.group(1),
-                parameters=parse_parameters(defined.group(2)),
-                body=[],
-            )
-            continue
-
-        purged = _PURGEM.match(statement)
-        if purged is not None:
-            expander.macros.pop(purged.group(1), None)
-            continue
-
-        invocation = _INVOKE.match(statement)
-        if invocation is not None:
-            macro = expander.macros.get(invocation.group(1))
-            if macro is not None:
-                if alternate:
-                    report.refused["alternate macro mode"] += 1
-                    continue
-                for produced in expander.expand(macro, invocation.group(2), depth=1):
-                    yield file, line, produced
-                continue
-
-        yield file, line, statement
-
-    if collecting is not None:
-        # `.macro` with no `.endm`.  The assembler rejects the file, so
-        # this cannot come from anything a build compiled; drop the body
-        # rather than read it as code.
-        report.refused["unterminated macro"] += 1
+    return _Expander(report).process(statements)
 
 
 def _has_conditional(body: list[str]) -> bool:

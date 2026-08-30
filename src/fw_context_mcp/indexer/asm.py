@@ -490,15 +490,6 @@ def _strip_block_comments(text: str, in_comment: bool) -> tuple[str, bool]:
         index = start + 2
     return "".join(out), in_comment
 
-# The repetition directives, whose bodies are still skipped rather than
-# expanded.  `.macro` is no longer here: `_asm_macro` expands it, and a
-# body reached through an invocation is real code.  A `.rept 0` body is
-# not, so reading one would invent — see the corpus in
-# tests/fixtures/asm, where it did.
-_REPEAT_OPEN = re.compile(r"^\s*\.(rept|irp|irpc)\b", re.IGNORECASE)
-_REPEAT_CLOSE = re.compile(r"^\s*\.endr\b", re.IGNORECASE)
-
-
 def _raw_statements(source: AsmSource) -> Iterator[tuple[str, int, str]]:
     """Yield ``(file, line, statement)`` before macros are expanded.
 
@@ -516,14 +507,9 @@ def _raw_statements(source: AsmSource) -> Iterator[tuple[str, int, str]]:
       the start of the line finds ``.section`` and never the label, which
       is why the symbol pass returned nothing at all on Zephyr assembly.
 
-    The body of ``.rept``, ``.irp`` and ``.irpc`` is skipped here, because
-    reading it as ordinary assembly INVENTS symbols: ``.rept 0`` assembles
-    its body zero times, so a label inside is defined nowhere.  Measured
-    against `arm-none-eabi-as` on the corpus in ``tests/fixtures/asm``,
-    which is where that one was found.
-
-    ``.macro`` is NOT skipped here — :func:`_statements` expands it, and
-    a statement reached through an invocation is code that really exists.
+    Nothing is skipped here.  ``.macro``, ``.rept``, ``.irp`` and
+    ``.irpc`` all reach :func:`_statements`, which expands them; a body
+    is a template and only an expansion says what it really defines.
 
     A line the map cannot place still advances the comment state: a
     comment opened in it closes lines later, in a line that IS placed.
@@ -533,20 +519,12 @@ def _raw_statements(source: AsmSource) -> Iterator[tuple[str, int, str]]:
     # quadratic for no reason.
     text_lines = source.text.splitlines()
     in_comment = False
-    repeat_depth = 0
     for out_line, mapped in enumerate(source.line_map):
         clean, in_comment = _strip_block_comments(text_lines[out_line], in_comment)
         if mapped is None:
             continue
         file, line = mapped
         for stmt in clean.split(";"):
-            if _REPEAT_OPEN.match(stmt):
-                repeat_depth += 1
-                continue
-            if repeat_depth:
-                if _REPEAT_CLOSE.match(stmt):
-                    repeat_depth -= 1
-                continue
             yield file, line, stmt
 
 
@@ -585,8 +563,13 @@ def extract_symbols(
     *report* collects what the macro expansion did, so the caller can log
     it.  The vector pass reads the same stream and expands the same
     macros again rather than sharing this one, which would double-count
-    the report; the cost is one extra pass over a file measured in tens
-    of milliseconds.
+    the report.
+
+    Measured, that second pass costs about 1 ms per project: the whole
+    statement-and-expansion side of the assembly pass is 2–3 ms, against
+    16–19 ms for EACH `clang -E` subprocess, which is 89–95% of the pass.
+    Caching the stream to save the second pass would buy a millisecond
+    and cost a piece of shared state, so it is not done.
 
     An alias (``.thumb_set``) has no label of its own and is reported at the
     line of the directive: it IS the definition.

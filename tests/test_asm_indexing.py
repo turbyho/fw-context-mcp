@@ -1269,10 +1269,15 @@ class TestBodiesAreSkippedNotRead:
 
     These are ASSEMBLER directives; `clang -E` expands C preprocessor
     macros and leaves them alone.  What a body defines depends on whether
-    and how often it is invoked, so reading it as ordinary assembly
-    invents symbols — verified against arm-none-eabi-as in
+    and how often it runs, so READING it as ordinary assembly invents
+    symbols — verified against arm-none-eabi-as in
     tests/test_asm_corpus.py, where it produced four names that are in no
     object file.
+
+    The reader expands these bodies now rather than skipping them, which
+    is how it gets the same answer as the assembler.  The cases here are
+    the ones where an expansion yields NOTHING, and reading would have
+    yielded a name: a macro nobody invokes, and `.rept 0`.
     """
 
     @staticmethod
@@ -1302,14 +1307,26 @@ class TestBodiesAreSkippedNotRead:
 
         assert names == {"Real"}, names
 
-    def test_an_irp_body_is_skipped(self, tmp_path: Path):
+    def test_an_irp_body_is_expanded_once_per_value(self, tmp_path: Path):
+        """`.irp` runs its body once per value, so what it defines exists."""
         names = self._names(
             tmp_path,
             ".global Real\nReal:\n  b .\n"
-            ".irp which, a, b\n.global Ghost\nGhost:\n  .word 0\n.endr\n",
+            ".irp which, a, b\n.global from_\\which\nfrom_\\which:\n"
+            "  .word 0\n.endr\n",
         )
 
-        assert names == {"Real"}, names
+        assert names == {"Real", "from_a", "from_b"}, names
+
+    def test_an_irp_with_no_values_runs_once(self, tmp_path: Path):
+        """"If no VALUE is listed, the sequence is assembled once, with
+        SYMBOL set to the null string.\""""
+        names = self._names(
+            tmp_path,
+            ".irp nothing\n.global ran_once\nran_once:\n  b .\n.endr\n",
+        )
+
+        assert names == {"ran_once"}, names
 
     def test_code_after_a_body_is_read_again(self, tmp_path: Path):
         """The skip must end where the body does."""

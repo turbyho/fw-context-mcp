@@ -44,7 +44,7 @@ COMPLETE = {
     "macro_control": True,
     "macro_substitution": True,
     "refuse": False,
-    "repeat": False,
+    "repeat": True,
     "statements_semicolon": True,
     "vector_table": True,
 }

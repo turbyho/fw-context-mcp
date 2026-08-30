@@ -53,3 +53,31 @@ irp_ran_once:
 irpc_\digit:
     b       .
     .endr
+
+/* A quoted value list: the quotes are not part of any value. */
+    .irp    which, "quoted_one", "quoted_two"
+    .globl  \which
+\which:
+    b       .
+    .endr
+
+/* Nesting: a repetition inside a repetition. */
+    .irp    outer, a, b
+    .irp    inner, 1, 2
+    .globl  nest_\outer\()_\inner
+nest_\outer\()_\inner:
+    b       .
+    .endr
+    .endr
+
+/* A repetition inside a macro body, which only expands when invoked. */
+    .macro  three_of name
+    .rept   3
+    .word   0
+    .endr
+    .globl  \name
+\name:
+    b       .
+    .endm
+
+    three_of from_macro_with_rept

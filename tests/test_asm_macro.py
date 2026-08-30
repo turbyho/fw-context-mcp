@@ -404,3 +404,94 @@ class TestAlternateMacroMode:
 
         assert produced == []
         assert report.refused["alternate macro mode"] == 1
+
+
+class TestRepetition:
+    """`.rept`, `.irp` and `.irpc`, all closed by `.endr`.
+
+    All three are BOUNDED, which is what separates them from the
+    conditionals: `.rept 3` repeats three times whatever any symbol
+    holds, so expanding them needs no expression evaluator.
+    """
+
+    def test_rept_repeats_the_body(self):
+        produced, report = _run("  .rept 3\n  .word 0\n  .endr\n")
+
+        assert produced == ["  .word 0"] * 3
+        assert report.repeated == 1
+
+    def test_a_count_of_zero_generates_nothing(self):
+        """"A count of zero is allowed, but nothing is generated." """
+        produced, _ = _run("  .rept 0\n  .globl Ghost\nGhost:\n  .endr\n")
+
+        assert produced == []
+
+    def test_a_negative_count_generates_nothing(self):
+        """"Negative counts are not allowed"; nothing is the safe reading."""
+        produced, _ = _run("  .rept -2\n  .word 0\n  .endr\n")
+
+        assert produced == []
+
+    def test_a_count_that_is_not_a_literal_is_refused(self):
+        """An expression needs an evaluator, which this does not have."""
+        produced, report = _run("  .rept SIZE*2\n  .word 0\n  .endr\n")
+
+        assert produced == []
+        assert report.refused[".rept this cannot evaluate"] == 1
+
+    def test_irp_binds_the_symbol_to_each_value(self):
+        produced, _ = _run("  .irp n, 1, 2, 3\n  .word \\n\n  .endr\n")
+
+        assert produced == ["  .word 1", "  .word 2", "  .word 3"]
+
+    def test_irp_with_no_values_runs_once_with_the_null_string(self):
+        produced, _ = _run("  .irp nothing\n  .globl ran\n  .endr\n")
+
+        assert produced == ["  .globl ran"]
+
+    def test_irpc_binds_one_character_at_a_time(self):
+        produced, _ = _run("  .irpc c, 123\n  .word \\c\n  .endr\n")
+
+        assert produced == ["  .word 1", "  .word 2", "  .word 3"]
+
+    def test_a_repetition_may_nest(self):
+        produced, _ = _run(
+            "  .irp outer, a, b\n  .irp inner, 1, 2\n"
+            "  .globl \\outer\\()_\\inner\n  .endr\n  .endr\n"
+        )
+
+        assert produced == [
+            "  .globl a_1", "  .globl a_2", "  .globl b_1", "  .globl b_2",
+        ]
+
+    def test_a_macro_may_be_invoked_inside_a_repetition(self):
+        """The reason one routine handles both: they compose."""
+        produced, _ = _run(
+            ".macro emit name\n  .globl \\name\n.endm\n"
+            "  .irp which, x, y\n  emit \\which\n  .endr\n"
+        )
+
+        assert produced == ["  .globl x", "  .globl y"]
+
+    def test_a_repetition_may_sit_inside_a_macro_body(self):
+        produced, _ = _run(
+            ".macro three\n  .rept 3\n  .word 0\n  .endr\n.endm\n  three\n"
+        )
+
+        assert produced == ["  .word 0"] * 3
+
+    def test_a_statement_keeps_its_own_line(self):
+        """Unlike a macro body, a repetition body sits in the file, so the
+        more precise location is available and is used."""
+        report = Report()
+        lines = "  .irp n, 1, 2\n  .word \\n\n  .endr\n".splitlines()
+        stream = (("a.S", i + 1, line) for i, line in enumerate(lines))
+        produced = [row for row in expand_stream(stream, report) if row[2].strip()]
+
+        assert produced == [("a.S", 2, "  .word 1"), ("a.S", 2, "  .word 2")]
+
+    def test_a_repetition_with_no_endr_is_refused(self):
+        produced, report = _run("  .rept 2\n  .globl Ghost\n")
+
+        assert produced == []
+        assert report.refused["unterminated repetition"] == 1
