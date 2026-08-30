@@ -117,7 +117,7 @@ class TestPurgeFileRecords:
         # Insert refs
         insert_refs_batch(
             conn,
-            [(ch, usr2, "src/a.c", 3, usr1, "call")],
+            [(ch, usr2, "src/a.c", 3, usr1, "call", None)],
         )
 
         # Insert indirect call site
@@ -250,8 +250,8 @@ class TestDeleteDanglingIncomingRefs:
         )
 
         # Insert edges from surviving file → dead symbols
-        insert_refs_batch(conn, [(ch, usr_dead1, "src/surviving.c", 1, usr_surv, "call")])
-        insert_refs_batch(conn, [(ch, "c:@F@unrelated", "src/surviving.c", 11, usr_surv, "call")])
+        insert_refs_batch(conn, [(ch, usr_dead1, "src/surviving.c", 1, usr_surv, "call", None)])
+        insert_refs_batch(conn, [(ch, "c:@F@unrelated", "src/surviving.c", 11, usr_surv, "call", None)])
         insert_indirect_call_sites_batch(
             conn, [(ch, "src/surviving.c", 2, usr_surv, "fp()", usr_dead2, "dead2", "void(*)()")]
         )

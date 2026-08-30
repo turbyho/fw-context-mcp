@@ -747,7 +747,9 @@ class TestCallGraphDispatchAndGlobalCtors:
             ("u_watch_ble",        "src/zble.cpp",  22,  "u_zble_ctor",         "call"),
         ]
         ref_rows = [
-            (CH, to_usr, fp, line, from_usr, rk)
+            # The trailing None is slot_index, which only a vector table
+            # slot carries.
+            (CH, to_usr, fp, line, from_usr, rk, None)
             for to_usr, fp, line, from_usr, rk in refs_data
         ]
         insert_refs_batch(conn, ref_rows)
@@ -783,10 +785,11 @@ class TestCallGraphDispatchAndGlobalCtors:
             # Re-add only the dispatch and direct call edges (no implicit_construct)
             from fw_context_mcp.indexer.db import insert_refs_batch
             insert_refs_batch(conn, [
-                (ch, "u_dispatch_forever", "src/main.cpp", 2, "u_main", "call"),
-                (ch, "u_watch_ble", "src/zble.cpp", 26, "u_dispatch_forever", "dispatch"),
-                (ch, "u_swdt_check", "src/zble.cpp", 27, "u_watch_ble", "call"),
-                (ch, "u_zbox_reset", "src/wdt.cpp", 46, "u_swdt_check", "call"),
+                (ch, "u_dispatch_forever", "src/main.cpp", 2, "u_main", "call", None),
+                (ch, "u_watch_ble", "src/zble.cpp", 26, "u_dispatch_forever",
+                 "dispatch", None),
+                (ch, "u_swdt_check", "src/zble.cpp", 27, "u_watch_ble", "call", None),
+                (ch, "u_zbox_reset", "src/wdt.cpp", 46, "u_swdt_check", "call", None),
             ])
             paths = self._find_call_path(conn, ch, "main", "watch_ble", max_depth=6)
             assert paths, (

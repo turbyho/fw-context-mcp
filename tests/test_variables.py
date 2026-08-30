@@ -203,8 +203,8 @@ class TestFetchReferencers:
                        usr="c:@F@update", name="update", kind="function")
 
         refs = [
-            ("hash-deadbeef", "c:@g_count", "/tmp/test.c", 10, "c:@F@init", "ref"),
-            ("hash-deadbeef", "c:@g_count", "/tmp/test.c", 20, "c:@F@update", "ref"),
+            ("hash-deadbeef", "c:@g_count", "/tmp/test.c", 10, "c:@F@init", "ref", None),
+            ("hash-deadbeef", "c:@g_count", "/tmp/test.c", 20, "c:@F@update", "ref", None),
         ]
         insert_refs_batch(populated_db, refs)
 
@@ -235,8 +235,8 @@ class TestFetchReferencers:
                        qualified_name="writer")
 
         refs = [
-            ("hash-deadbeef", "c:@g_level", "/tmp/test.c", 5, "c:@F@reader", "ref"),
-            ("hash-deadbeef", "c:@g_level", "/tmp/test.c", 8, "c:@F@writer", "ref"),
+            ("hash-deadbeef", "c:@g_level", "/tmp/test.c", 5, "c:@F@reader", "ref", None),
+            ("hash-deadbeef", "c:@g_level", "/tmp/test.c", 8, "c:@F@writer", "ref", None),
         ]
         insert_refs_batch(populated_db, refs)
 

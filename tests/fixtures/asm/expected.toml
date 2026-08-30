@@ -64,5 +64,5 @@ defined = ["from_gdata", "from_gtext", "from_section_func", "hand_written", "lab
 description = 'A vector table, its reserved slots and its weak aliases of the default handler.'
 complete = true
 defined = ["Default_Handler", "HardFault_Handler", "NMI_Handler", "Reset_Handler", "SysTick_Handler", "TIM2_IRQHandler", "__Vectors", "legacy_table"]
-undefined = ["__StackTop"]
+undefined = ["__StackTop", "_ebss", "_sdata", "_sidata"]
 vectors = ["HardFault_Handler", "NMI_Handler", "Reset_Handler", "SysTick_Handler", "TIM2_IRQHandler", "__StackTop"]

@@ -84,7 +84,9 @@ __all__ = [
 def insert_refs_batch(conn: sqlite3.Connection, rows: list[tuple]) -> int:
     """Insert reference rows for the cross-reference / call graph.
 
-    Each row: (config_hash, to_usr, from_file, from_line, from_usr, ref_kind).
+    Each row: (config_hash, to_usr, from_file, from_line, from_usr,
+               ref_kind, slot_index).  slot_index is the position of a
+    vector table slot and None for every other kind.
 
     Why INSERT OR IGNORE: the same TU can be indexed multiple times
     (reindex after header change).  OR IGNORE skips duplicates silently
@@ -93,8 +95,8 @@ def insert_refs_batch(conn: sqlite3.Connection, rows: list[tuple]) -> int:
     migration AFTER deduplication for performance.
     """
     cur = conn.executemany(
-        """INSERT OR IGNORE INTO refs (config_hash, to_usr, from_file, from_line, from_usr, ref_kind)
-           VALUES (?,?,?,?,?,?)""",
+        """INSERT OR IGNORE INTO refs (config_hash, to_usr, from_file, from_line, from_usr, ref_kind, slot_index)
+           VALUES (?,?,?,?,?,?,?)""",
         rows,
     )
     return cur.rowcount

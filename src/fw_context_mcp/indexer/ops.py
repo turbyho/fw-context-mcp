@@ -1252,7 +1252,7 @@ def store_symbols_for_unit(
 
     # References
     if index_refs and refs:
-        ref_rows = [(config_hash, r.to_usr, _rel(r.from_file), r.from_line, r.from_usr, r.ref_kind) for r in refs]
+        ref_rows = [(config_hash, r.to_usr, _rel(r.from_file), r.from_line, r.from_usr, r.ref_kind, None) for r in refs]
         insert_refs_batch(conn, ref_rows)
         refs_added = len(ref_rows)
 
@@ -1479,7 +1479,8 @@ def backfill_cross_tu_refs(
                     # (recursion) would already have a per-TU ref.
                     if target_usr and target_usr != fn_usr:
                         new_refs.append(
-                            (config_hash, target_usr, file_path_rel, lineno, fn_usr, "call")
+                            (config_hash, target_usr, file_path_rel, lineno,
+                             fn_usr, "call", None)
                         )
                         # Mark this line as having a ref to avoid
                         # inserting duplicate references when multiple

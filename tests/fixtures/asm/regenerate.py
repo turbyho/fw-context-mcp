@@ -21,6 +21,7 @@ flag is what turns the equality assertion on once the construct lands.
 
 from __future__ import annotations
 
+import re
 import subprocess
 import sys
 import tempfile
@@ -98,12 +99,31 @@ def symbols(obj: Path) -> tuple[set[str], set[str]]:
 
 
 def vector_targets(obj: Path) -> set[str]:
+    """Return the symbols the object's VECTOR sections point at.
+
+    Restricted to those sections on purpose.  A relocation in `.text` is
+    an ordinary reference — the STM32 startup makes five for the linker
+    script's section boundaries, which its copy loop reads — and counting
+    them here would ask the reader to report constants as table slots.
+    The section is what separates the two, for the oracle exactly as for
+    the reader.
+    """
     out = subprocess.run([str(OBJDUMP), "-r", str(obj)], capture_output=True,
                          text=True, timeout=60)
-    return {
-        parts[2] for parts in (line.split() for line in out.stdout.splitlines())
-        if len(parts) == 3 and parts[1].startswith("R_")
-    }
+    ordinary = re.compile(
+        r"^\.(?:text|data|bss|rodata|init|fini|note|comment|debug|ARM)\b")
+    targets: set[str] = set()
+    section = ""
+    for line in out.stdout.splitlines():
+        header = re.match(r"RELOCATION RECORDS FOR \[([^\]]+)\]", line)
+        if header:
+            section = header.group(1)
+            continue
+        parts = line.split()
+        if len(parts) == 3 and parts[1].startswith("R_") \
+                and not ordinary.match(section):
+            targets.add(parts[2])
+    return targets
 
 
 def quoted(items: set[str]) -> str:

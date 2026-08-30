@@ -88,7 +88,17 @@ def preprocess(unit) -> AsmSource | None:
     The compiler comes from the unit's own flags, so a cross build gets its
     own preprocessor rather than the host one.
     """
-    args = list(unit.clang_args)
+    # The source file is dropped from the flags and named once at the end.
+    # `clang_args` already holds it, and appending it again handed clang
+    # the same file twice: it preprocessed the whole unit twice and
+    # concatenated the results.  The duplicate output was mistaken for a
+    # habit of cpp and worked around with a dedupe, which hid it — until
+    # the vector pass began carrying a section and a slot counter across
+    # statements, and the second copy started at a position the first had
+    # already used.  It also doubled the cost of the pass, which is 89-95%
+    # preprocessor.
+    source_name = unit.file.name
+    args = [a for a in unit.clang_args if Path(a).name != source_name]
     try:
         result = subprocess.run(
             # -C keeps comments.  Without it cpp strips them, and every
@@ -684,53 +694,108 @@ def _store_symbols(conn, config_hash: str, source: AsmSource, project_root: Path
     return len(rows)
 
 
-# A vector table slot: a data directive naming the symbol the hardware
-# jumps to.  `.word` and `.long` are GNU as, `DCD` is the ARM assembler,
-# and both spellings appear in the startup files measured.
-_VECTOR_RE = re.compile(
-    r"^\s*(?:\.word|\.long|\.quad|DCD|DCQ)\s+([A-Za-z_.$][\w.$]*)\s*$", re.IGNORECASE
-)
-
-
 @dataclass
 class VectorEntry:
-    """One slot of a vector table, and where it is written."""
+    """One slot of a vector table, and where it is written.
+
+    Attributes:
+        name: The symbol the slot names.
+        file: The file holding the table.
+        line: The line the slot is written on.
+        index: The slot's POSITION in its table, counting from zero and
+            counting the reserved entries.  What that position means is
+            architecture knowledge and is deliberately not decided here:
+            on Cortex-M slot 15 is SysTick and slot 16+n is external IRQ
+            n, on arm64 the position selects an exception class instead.
+            The position is a fact of the file; its meaning is not.
+    """
 
     name: str
     file: str
     line: int
+    index: int = -1
+
+
+# Data directives that build a table, and the sections that hold code or
+# ordinary data rather than a table.
+_DATA_DIRECTIVE = re.compile(
+    r"^\s*(?:\.word|\.long|\.quad|\.short|\.hword|DCD|DCQ|DCW)\s+(.+?)\s*$",
+    re.IGNORECASE,
+)
+_SECTION_RE = re.compile(
+    r"^\s*\.(?:section\s+\"?([.\w]+)|(text|data|bss|rodata)\b)", re.IGNORECASE
+)
+_ORDINARY_SECTION = re.compile(
+    r"^\.(?:text|data|bss|rodata|init|fini|note|comment|debug|ARM)\b",
+    re.IGNORECASE,
+)
+# An entry that names something, as opposed to a reserved `.word 0`.
+_ENTRY_NAME = re.compile(r"^[A-Za-z_.$][\w.$]*$")
 
 
 def extract_vectors(source: AsmSource) -> list[VectorEntry]:
-    """Return the vector table slots that name a symbol.
+    """Return the vector table slots that name a symbol, with their positions.
 
-    A slot holding a number is not one: a reserved slot is written `.word 0`
-    and a startup file has dozens of them — measured on FM, 12 of 206.  The
-    pattern therefore takes an identifier and nothing else, which also drops
-    the IAR form `sfe(CSTACK)`.
+    A slot is a data directive **inside a vector section**.  The section
+    is what makes it a table rather than a constant: a linker script
+    places `.isr_vector` or `.Vectors` at the reset address, so the
+    section is part of the contract between the startup file and the
+    linker, not a matter of style.
 
-    A linker symbol IS returned, `__StackTop` and `_estack` alike.  Nothing
-    in the index defines it, so it resolves to no handler and becomes an
-    unresolved slot rather than an edge — the right answer, since a slot the
-    linker fills is not an interrupt anybody services.
+    Requiring it fixes a real error.  The STM32 startup writes
 
-    Reads through ``_statements`` for the same reason the symbol pass does:
-    a `.word` inside a block comment is not a slot of the table.  That
-    stripping widened what this accepts, because the pattern requires the
-    statement to end after the identifier and a trailing `/* Top of Stack */`
-    used to prevent the match.  Measured on zbox-ecb-fw the slot count went
-    from 53 to 54 and the linked count stayed at 11.
+        /* start address for the .data section, defined in linker script */
+        .word _sidata
+        .word _sdata
+
+    in the ORDINARY section, as constants its copy loop reads.  Matching
+    `.word` anywhere took those five for table slots, and once undefined
+    targets began to be declared, the index said the vector table reached
+    `_sidata` — which it does not.
+
+    A reserved slot, written `.word 0`, names nothing but still OCCUPIES a
+    position, so it is counted and not returned.  Without counting it the
+    positions would be wrong exactly where they matter: FM's table holds
+    five reserved entries before SysTick, which sits at 15 and would
+    otherwise look like 10.
+
+    Only tables written as address words are found.  Measured across the
+    Zephyr tree, arm64, Xtensa, RISC-V and MIPS write theirs as branch
+    instructions at fixed alignment instead, and those yield no slots
+    here — a miss, never a wrong answer.
     """
     found: dict[tuple[str, str, int], VectorEntry] = {}
+    in_table = False
+    position = 0
+
     for file, line, stmt in _statements(source):
-        m = _VECTOR_RE.match(stmt)
-        if m is not None:
-            # Keyed, not appended: cpp can emit the same source line
-            # more than once — measured, a Zephyr unit appears twice in
-            # its own output — and one slot must not become two edges.
-            # The symbol side dedupes the same way, through setdefault.
-            key = (m.group(1), file, line)
-            found.setdefault(key, VectorEntry(name=m.group(1), file=file, line=line))
+        section = _SECTION_RE.match(stmt)
+        if section is not None:
+            name = section.group(1) or f".{section.group(2)}"
+            was = in_table
+            in_table = not _ORDINARY_SECTION.match(name)
+            if in_table and not was:
+                position = 0
+            continue
+        if not in_table:
+            continue
+        data = _DATA_DIRECTIVE.match(stmt)
+        if data is None:
+            continue
+        # `.word a, b, c` is three entries, and each takes a position.
+        for value in data.group(1).split(","):
+            value = value.strip()
+            if _ENTRY_NAME.match(value):
+                # Keyed, not appended: cpp can emit the same source line
+                # more than once — measured, a Zephyr unit appears twice
+                # in its own output — and one slot must not become two
+                # edges.  The symbol side dedupes the same way.
+                key = (value, file, line)
+                found.setdefault(
+                    key,
+                    VectorEntry(name=value, file=file, line=line, index=position),
+                )
+            position += 1
     return list(found.values())
 
 
@@ -905,7 +970,7 @@ def _store_vectors(
         rows.append((
             config_hash, usr,
             _normalize_file_path(entry.file, project_root), entry.line,
-            None, VECTOR_REF_KIND,
+            None, VECTOR_REF_KIND, entry.index,
         ))
 
     if rows:

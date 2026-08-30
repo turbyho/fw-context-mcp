@@ -30,6 +30,23 @@ def _unit(tmp_path: Path, name: str, text: str, args: list[str] | None = None):
     return SimpleNamespace(file=src, directory=tmp_path, clang_args=args or [])
 
 
+# A vector table lives in its own section, because a linker script places
+# that section at the reset address — the section is part of the contract
+# between the startup file and the linker, not a matter of style.  A
+# `.word` outside one is a constant: the STM32 startup writes five for
+# its copy loop, and taking those for slots made the index claim the
+# vector table reached `_sidata`.
+#
+# Fixtures that mean a TABLE therefore have to say so, exactly as a real
+# startup does.
+_VECTOR_SECTION = '    .section .vectors, "a"\n'
+
+
+def _table(body: str) -> str:
+    """Wrap *body* in a vector section, for a fixture that means a table."""
+    return _VECTOR_SECTION + body
+
+
 class TestPreprocess:
     def test_an_inactive_branch_does_not_reach_the_output(self, tmp_path: Path):
         """The first version of this plan called `#if` filtering impossible."""
@@ -434,14 +451,17 @@ class TestVectorTable:
     def _vectors(tmp_path: Path, text: str):
         from fw_context_mcp.indexer.asm import extract_vectors
 
-        src = preprocess(_unit(tmp_path, "t.S", text))
+        src = preprocess(_unit(tmp_path, "t.S", _table(text)))
         assert src is not None
         return {v.name: v for v in extract_vectors(src)}
 
     def test_a_word_entry_names_a_handler(self, tmp_path: Path):
         vec = self._vectors(tmp_path, "  .word HardFault_Handler\n")
 
-        assert vec["HardFault_Handler"].line == 1
+        # Line 2: _table puts the `.section` directive on line 1, exactly
+        # as a startup file does.
+        assert vec["HardFault_Handler"].line == 2
+        assert vec["HardFault_Handler"].index == 0, "first slot of the table"
 
     def test_the_arm_dcd_spelling_is_read(self, tmp_path: Path):
         """mbed's ARM-toolchain startup files write DCD, not .word."""
@@ -462,10 +482,17 @@ class TestVectorTable:
         assert vec == {}
 
     def test_a_repeated_line_yields_one_entry(self, tmp_path: Path):
-        """cpp can emit the same source line twice; one slot is one edge."""
+        """One source line is one slot, however often it reaches the reader.
+
+        This used to be about cpp: the reader handed clang the source file
+        twice, so the whole unit came back doubled, and the dedupe here
+        hid it.  The duplication is fixed at the source now — see
+        `preprocess` — and the dedupe stays because a slot must not become
+        two edges whatever produces the repeat.
+        """
         from fw_context_mcp.indexer.asm import extract_vectors
 
-        src = preprocess(_unit(tmp_path, "t.S", "  .word Foo\n"))
+        src = preprocess(_unit(tmp_path, "t.S", _table("  .word Foo\n")))
         src.line_map = src.line_map + src.line_map
         src.text = src.text + "\n" + src.text
 
@@ -492,7 +519,7 @@ class TestVectorEdges:
                      10, 1, 12, 1, "", "", None, 0, 0, "", 0, "", 1, 0.0, "", 0)
                     for n in c_symbols
                 ])
-            result = store_units(conn, "ch", [_unit(tmp_path, "startup.S", asm)],
+            result = store_units(conn, "ch", [_unit(tmp_path, "startup.S", _table(asm))],
                                  tmp_path)
         rows = conn.execute(
             "SELECT s.name, r.to_usr, r.from_file, r.from_line, r.from_usr, "
@@ -574,8 +601,9 @@ class TestVectorEdges:
         conn = TestStoreUnits._db(tmp_path)
         try:
             with transaction(conn):
-                store_units(conn, "ch", [_unit(tmp_path, "startup.S",
-                                               "  .word _estack\n")], tmp_path)
+                store_units(conn, "ch",
+                            [_unit(tmp_path, "startup.S",
+                                   _table("  .word _estack\n"))], tmp_path)
             row = conn.execute(
                 "SELECT kind, is_definition FROM symbols WHERE name='_estack'"
             ).fetchone()
@@ -602,7 +630,7 @@ class TestVectorEdges:
         first = _unit(tmp_path, "one.S", ".global Twice\nTwice:\n  b .\n")
         (tmp_path / "sub").mkdir()
         second = _unit(tmp_path / "sub", "two.S",
-                       ".global Twice\nTwice:\n  b .\n  .word Twice\n")
+                       _table(".global Twice\nTwice:\n  b .\n  .word Twice\n"))
 
         conn = TestStoreUnits._db(tmp_path)
         try:
@@ -946,7 +974,8 @@ class TestReindexReplacesWhatItWrote:
 
     def test_a_vector_edge_is_not_appended_twice(self, tmp_path: Path):
         conn = TestStoreUnits._db(tmp_path)
-        body = ".global Reset_Handler\nReset_Handler:\n  b .\n  .word Reset_Handler\n"
+        body = _table(".global Reset_Handler\nReset_Handler:\n  b .\n"
+                      "  .word Reset_Handler\n")
         try:
             self._store(conn, tmp_path, body)
             self._store(conn, tmp_path, body)
@@ -1078,7 +1107,8 @@ class TestCommentsAndLocalLabels:
 
         source = preprocess(_unit(
             tmp_path, "a.S",
-            ".global Real\nReal:\n  b .\n"
+            _VECTOR_SECTION
+            + ".global Real\nReal:\n  b .\n"
             "/*\n  .word Ghost\n*/\n  .word Real\n",
         ))
         assert source is not None
@@ -1202,7 +1232,8 @@ class TestCommentStrippingWidensTheVectorMatch:
 
         source = preprocess(_unit(
             tmp_path, "a.S",
-            ".global Reset_Handler\nReset_Handler:\n  b .\n"
+            _VECTOR_SECTION
+            + ".global Reset_Handler\nReset_Handler:\n  b .\n"
             "  .long   __StackTop   /* Top of Stack */\n"
             "  .long   Reset_Handler\n",
         ))
@@ -1223,9 +1254,11 @@ class TestCommentStrippingWidensTheVectorMatch:
 
         unit = _unit(
             tmp_path, "a.S",
-            ".global Reset_Handler\nReset_Handler:\n  b .\n"
-            "  .long   __StackTop   /* Top of Stack */\n"
-            "  .long   Reset_Handler\n",
+            _table(
+                ".global Reset_Handler\nReset_Handler:\n  b .\n"
+                "  .long   __StackTop   /* Top of Stack */\n"
+                "  .long   Reset_Handler\n"
+            ),
         )
         conn = TestStoreUnits._db(tmp_path)
         try:
@@ -1251,6 +1284,7 @@ class TestAWeakAliasDoesNotHideTheCOverride:
     """
 
     _STARTUP = (
+        _VECTOR_SECTION +
         "  .word  Reset_Handler\n"
         "  .word  SysTick_Handler\n"
         "  .word  TIM2_IRQHandler\n"
@@ -1419,7 +1453,8 @@ class TestBodiesAreSkippedNotRead:
 
         source = preprocess(_unit(
             tmp_path, "a.S",
-            "  .word RealSlot\n"
+            _VECTOR_SECTION
+            + "  .word RealSlot\n"
             ".macro m\n  .word GhostSlot\n.endm\n",
         ))
         assert source is not None
@@ -1618,3 +1653,185 @@ class TestWeakLosesToStrong:
             conn.close()
 
         assert rows == {"Strong": 0, "Weak": 1}
+
+
+class TestSlotPositions:
+    """A vector table is an ORDERED array, and the position is the answer.
+
+    Verified against the Cortex-M layout on two real projects: SysTick
+    sits at 15 and the first external interrupt at 16, on FM's STM32 and
+    on zbox-ecb-fw's nRF52 alike.
+
+    What the position MEANS is architecture knowledge the index does not
+    decide.  On Cortex-M slot 16+n is external IRQ n; on arm64 it selects
+    an exception class, and that table is written as branch instructions
+    this reader does not read at all.
+    """
+
+    @staticmethod
+    def _slots(tmp_path: Path, body: str):
+        from fw_context_mcp.indexer.asm import extract_vectors, preprocess
+
+        source = preprocess(_unit(tmp_path, "t.S", body))
+        assert source is not None
+        return {v.name: v.index for v in extract_vectors(source)}
+
+    def test_positions_count_from_zero(self, tmp_path: Path):
+        slots = self._slots(tmp_path, _table(
+            "  .word First\n  .word Second\n  .word Third\n"))
+
+        assert slots == {"First": 0, "Second": 1, "Third": 2}
+
+    def test_a_reserved_slot_takes_its_position(self, tmp_path: Path):
+        """`.word 0` names nothing and still occupies a place.
+
+        Skipping it would put SysTick at 10 instead of 15 on every
+        Cortex-M table, because five reserved entries come before it.
+        """
+        slots = self._slots(tmp_path, _table(
+            "  .word First\n  .word 0\n  .word 0\n  .word Fourth\n"))
+
+        assert slots == {"First": 0, "Fourth": 3}
+
+    def test_the_cortex_m_layout_comes_out_right(self, tmp_path: Path):
+        """The arrangement every CMSIS startup writes, in miniature."""
+        slots = self._slots(tmp_path, _table(
+            "  .word _estack\n  .word Reset_Handler\n  .word NMI_Handler\n"
+            "  .word HardFault_Handler\n  .word MemManage_Handler\n"
+            "  .word BusFault_Handler\n  .word UsageFault_Handler\n"
+            "  .word 0\n  .word 0\n  .word 0\n  .word 0\n"
+            "  .word SVC_Handler\n  .word DebugMon_Handler\n  .word 0\n"
+            "  .word PendSV_Handler\n  .word SysTick_Handler\n"
+            "  .word WWDG_IRQHandler\n"))
+
+        assert slots["SysTick_Handler"] == 15
+        assert slots["WWDG_IRQHandler"] == 16, "the first external interrupt"
+
+    def test_several_entries_on_one_line_each_take_a_position(self, tmp_path: Path):
+        slots = self._slots(tmp_path, _table("  .word One, Two, Three\n"))
+
+        assert slots == {"One": 0, "Two": 1, "Three": 2}
+
+    def test_a_constant_outside_the_table_is_not_a_slot(self, tmp_path: Path):
+        """The error this rule exists for.
+
+        A real STM32 startup writes `.word _sidata` in the ordinary
+        section for its copy loop.  Taking those for slots made the index
+        claim the vector table reached `_sidata`, which it does not.
+        """
+        slots = self._slots(
+            tmp_path,
+            "  .word _sidata\n  .word _sdata\n" + _table("  .word Real\n"),
+        )
+
+        assert slots == {"Real": 0}, slots
+
+    def test_leaving_the_section_ends_the_table(self, tmp_path: Path):
+        slots = self._slots(
+            tmp_path,
+            _table("  .word InTable\n") + "  .text\n  .word AfterTable\n",
+        )
+
+        assert slots == {"InTable": 0}, slots
+
+
+class TestPreprocessRunsOnce:
+    """The source file is named once, not twice.
+
+    `clang_args` from compile_commands.json already holds the file, and
+    appending it again handed clang the same file twice: it preprocessed
+    the whole unit twice and concatenated the results.  Every assembly
+    unit cost twice what it should — the preprocessor is 89-95% of the
+    pass — and once the vector reader began carrying a section and a slot
+    counter, the second copy started at positions the first had used.
+    """
+
+    def test_the_file_is_preprocessed_once(self, tmp_path: Path):
+        """One `<built-in>` ENTRY per invocation.
+
+        A linemarker's trailing flag says what happened: 1 is entering a
+        file, 2 returning to one, 3 a system header.  `<built-in>` is
+        entered once per clang run, so counting the flag-1 markers counts
+        the runs — the bare name appears several times in a single run.
+        """
+        source = preprocess(_unit(
+            tmp_path, "t.S", "  .globl Foo\nFoo:\n  b .\n",
+            args=[str(tmp_path / "t.S")],
+        ))
+
+        assert source is not None
+        assert source.text.count('"<built-in>" 1') == 1, (
+            "the unit was preprocessed more than once"
+        )
+
+    def test_the_source_survives_the_filtering(self, tmp_path: Path):
+        """Dropping the file from the flags must not drop the file."""
+        from fw_context_mcp.indexer.asm import extract_symbols
+
+        source = preprocess(_unit(
+            tmp_path, "t.S", "  .globl Foo\nFoo:\n  b .\n",
+            args=[str(tmp_path / "t.S")],
+        ))
+
+        assert source is not None
+        assert {s.name for s in extract_symbols(source)} == {"Foo"}
+
+
+class TestTheSlotPositionReachesTheIndex:
+    """The position has to survive into refs, or it answers nothing.
+
+    Verified against the CMSIS header on FM: TIM2_IRQHandler sits in slot
+    44, and stm32l476xx.h defines TIM2_IRQn = 28, which is 44 - 16.  The
+    subtraction is Cortex-M knowledge and stays with the reader of the
+    index; what is stored is the position.
+    """
+
+    def test_the_edge_carries_the_position(self, tmp_path: Path):
+        from fw_context_mcp.indexer.asm import store_units
+        from fw_context_mcp.indexer.db import transaction
+
+        unit = _unit(tmp_path, "startup.S", _table(
+            "  .word Slot0\n  .word 0\n  .word Slot2\n"
+            "Slot0:\n  b .\nSlot2:\n  b .\n"))
+        conn = TestStoreUnits._db(tmp_path)
+        try:
+            with transaction(conn):
+                store_units(conn, "ch", [unit], tmp_path)
+            rows = dict(conn.execute(
+                "SELECT s.name, r.slot_index FROM refs r "
+                "JOIN symbols s ON s.usr = r.to_usr "
+                "WHERE r.ref_kind='vector'"
+            ).fetchall())
+        finally:
+            conn.close()
+
+        assert rows == {"Slot0": 0, "Slot2": 2}, (
+            "the reserved entry between them takes position 1"
+        )
+
+    def test_an_ordinary_reference_carries_no_position(self, tmp_path: Path):
+        """slot_index belongs to a vector slot and to nothing else."""
+        from fw_context_mcp.indexer.db import (
+            insert_refs_batch,
+            open_db,
+            transaction,
+            upsert_build_config,
+            upsert_project,
+        )
+
+        conn = open_db(tmp_path / "index.db")
+        try:
+            with transaction(conn):
+                upsert_project(conn, "pid", "p", str(tmp_path))
+                upsert_build_config(conn, "ch", "pid", str(tmp_path / "cc.json"))
+                insert_refs_batch(conn, [
+                    ("ch", "c:@F@callee", "src/a.c", 10, "c:@F@caller",
+                     "call", None),
+                ])
+            value = conn.execute(
+                "SELECT slot_index FROM refs WHERE ref_kind='call'"
+            ).fetchone()[0]
+        finally:
+            conn.close()
+
+        assert value is None

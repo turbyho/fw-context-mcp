@@ -8,6 +8,22 @@
     .syntax unified
     .thumb
 
+/*
+ * Address constants in the ORDINARY section, before any table.  A real
+ * STM32 startup writes exactly these, with a comment saying the linker
+ * script defines them, and its copy loop reads them.  They are NOT slots
+ * of any table: matching `.word` wherever it appears took them for slots,
+ * and once undefined targets began to be declared the index claimed the
+ * vector table reached `_sidata`.
+ *
+ * The section is what tells them apart.  A linker script places the
+ * table at the reset address by its section name, so the section is part
+ * of the contract between the startup file and the linker.
+ */
+    .word   _sidata
+    .word   _sdata
+    .word   _ebss
+
     .section .vectors, "a"
     .globl  __Vectors
 __Vectors:

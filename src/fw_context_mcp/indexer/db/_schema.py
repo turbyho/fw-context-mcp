@@ -254,6 +254,13 @@ _MIGRATION_ADD_COLUMNS = [
     # a CMSIS startup and an RTOS both defined the core exceptions and
     # the index saw no difference between them.
     "ALTER TABLE symbols ADD COLUMN is_weak INTEGER NOT NULL DEFAULT 0",
+    # Position of a vector table slot, counting from zero and counting
+    # the reserved entries.  Meaningful only for ref_kind='vector'; NULL
+    # everywhere else.  What the position MEANS is architecture
+    # knowledge the index deliberately does not decide: on Cortex-M slot
+    # 15 is SysTick and 16+n is external IRQ n, on arm64 it selects an
+    # exception class.  The position is a fact of the file.
+    "ALTER TABLE refs ADD COLUMN slot_index INTEGER",
     # Schema version bump — DO NOT REMOVE. When adding new migration steps after this
     # column, also add a NEW ALTER TABLE … ADD COLUMN _schema_bump_… line. The hash
     # of _MIGRATION_ADD_COLUMNS drives CURRENT_SCHEMA_VERSION.
@@ -529,7 +536,9 @@ CREATE TABLE IF NOT EXISTS refs (
     from_file    TEXT    NOT NULL,
     from_line    INTEGER NOT NULL,
     from_usr     TEXT,
-    ref_kind     TEXT    NOT NULL
+    ref_kind     TEXT    NOT NULL,
+    -- Position of a vector table slot; NULL for every other ref_kind.
+    slot_index   INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_refs_to_usr   ON refs(config_hash, to_usr);
 CREATE INDEX IF NOT EXISTS idx_refs_from_usr ON refs(config_hash, from_usr);
