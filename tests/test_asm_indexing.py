@@ -549,12 +549,74 @@ class TestVectorEdges:
             "edge per interrupt"
         )
 
-    def test_a_name_no_symbol_matches_gets_no_edge(self, tmp_path: Path):
-        """`_estack` and friends sit in the same table and are not handlers."""
+    def test_a_name_nothing_defines_is_declared_and_linked(self, tmp_path: Path):
+        """`_estack` comes from the linker script, so no unit defines it.
+
+        The slot used to disappear.  Two things about it are true and
+        worth keeping: the name exists in the program, and the table
+        reaches it from a known line — which is what `nm` calls `U`.
+        """
         result, edges = self._run(tmp_path, "  .word _estack\n")
 
-        assert edges == {}
+        assert result.vectors == 1
+        assert result.unresolved == 0
+        assert "_estack" in edges, edges
+        assert edges["_estack"]["to_usr"] == "asm:@_estack", (
+            "no file part: there is no defining file, and one row shared by "
+            "every reference is the truth"
+        )
+
+    def test_the_declaration_is_not_a_definition(self, tmp_path: Path):
+        """It says this file NAMES the symbol, not that it defines it."""
+        from fw_context_mcp.indexer.asm import store_units
+        from fw_context_mcp.indexer.db import transaction
+
+        conn = TestStoreUnits._db(tmp_path)
+        try:
+            with transaction(conn):
+                store_units(conn, "ch", [_unit(tmp_path, "startup.S",
+                                               "  .word _estack\n")], tmp_path)
+            row = conn.execute(
+                "SELECT kind, is_definition FROM symbols WHERE name='_estack'"
+            ).fetchone()
+        finally:
+            conn.close()
+
+        assert row["is_definition"] == 0
+        assert row["kind"] == "undefined", (
+            "guessing between function and variable would be wrong half the "
+            "time: a linker script's _estack is an address, a handler from a "
+            "prebuilt library is code"
+        )
+
+    def test_an_ambiguous_name_is_still_left_unresolved(self, tmp_path: Path):
+        """Not a missing symbol but one with two answers.
+
+        Two units define the same name strongly, so the resolver cannot
+        choose and the slot stays unlinked.  Declaring it as well would
+        add a third row and make the ambiguity worse, not better.
+        """
+        from fw_context_mcp.indexer.asm import store_units
+        from fw_context_mcp.indexer.db import transaction
+
+        first = _unit(tmp_path, "one.S", ".global Twice\nTwice:\n  b .\n")
+        (tmp_path / "sub").mkdir()
+        second = _unit(tmp_path / "sub", "two.S",
+                       ".global Twice\nTwice:\n  b .\n  .word Twice\n")
+
+        conn = TestStoreUnits._db(tmp_path)
+        try:
+            with transaction(conn):
+                result = store_units(conn, "ch", [first, second], tmp_path)
+            rows = conn.execute(
+                "SELECT COUNT(*) FROM symbols WHERE name='Twice'"
+            ).fetchone()[0]
+        finally:
+            conn.close()
+
+        assert result.vectors == 0
         assert result.unresolved == 1
+        assert rows == 2, "no third row was added for an ambiguous name"
 
     def test_the_strong_definition_wins_over_the_weak_assembly_one(self, tmp_path: Path):
         """except.S defines HardFault_Handler weakly; a project defines it in C.
@@ -1149,12 +1211,12 @@ class TestCommentStrippingWidensTheVectorMatch:
 
         assert names == {"__StackTop", "Reset_Handler"}, names
 
-    def test_a_linker_symbol_slot_produces_no_edge(self, tmp_path: Path):
-        """Seeing the slot is not the same as linking it.
+    def test_a_linker_symbol_slot_is_linked_to_a_declaration(self, tmp_path: Path):
+        """__StackTop is defined by the linker script, not by any unit.
 
-        __StackTop is defined by the linker script, so nothing in the index
-        defines it and the slot stays unlinked — which is why the linked
-        count did not move when the slot count did.
+        The slot is real all the same, and so is the name; both are now
+        recorded, with the target stored as a declaration rather than a
+        definition.
         """
         from fw_context_mcp.indexer.asm import store_units
         from fw_context_mcp.indexer.db import transaction
@@ -1172,8 +1234,8 @@ class TestCommentStrippingWidensTheVectorMatch:
         finally:
             conn.close()
 
-        assert result.vectors == 1
-        assert result.unresolved == 1
+        assert result.vectors == 2, "Reset_Handler and __StackTop"
+        assert result.unresolved == 0
 
 
 class TestAWeakAliasDoesNotHideTheCOverride:

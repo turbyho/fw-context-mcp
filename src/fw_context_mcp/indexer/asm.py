@@ -309,6 +309,7 @@ def store_units(conn, config_hash: str, units: list, project_root: Path,
         )
         linked, unresolved = _store_vectors(
             conn, config_hash, source, project_root,
+            vendor_patterns or [], project_patterns or [],
         )
         result.symbols += len(symbols)
         result.vectors += linked
@@ -739,6 +740,71 @@ def extract_vectors(source: AsmSource) -> list[VectorEntry]:
 VECTOR_REF_KIND = "vector"
 
 
+
+# The kind of a name a vector slot points at that NOTHING in the build
+# defines.  Not a guess between "function" and "variable": the assembler
+# knows only that the name was referenced, and the two candidates would
+# each be wrong half the time — a linker script's `_estack` is an
+# address, a handler from a prebuilt library is code.  A word of its own
+# says what is true and keeps the name out of every `kind='function'`
+# filter and out of the LLM analysis, both of which would be claiming
+# knowledge that does not exist.
+_UNDEFINED_KIND = "undefined"
+
+
+def _declare_referenced_only(
+    conn, config_hash: str, entry: VectorEntry, project_root: Path,
+    vendor_patterns: list[str], project_patterns: list[str],
+) -> str | None:
+    """Record a vector slot's target that no unit in the build defines.
+
+    A startup file's first slot holds the initial stack pointer and names
+    something like `_estack` or `__StackTop`, which the LINKER SCRIPT
+    defines — so no translation unit does, and the slot used to vanish
+    from the index entirely.  Two things about it are true and worth
+    keeping: the name exists in the program, and the vector table reaches
+    it from a known line.  That is exactly what `nm` reports as `U`.
+
+    Stored as a DECLARATION, never a definition: this file names the
+    symbol, and where it comes from is not known here.  The USR carries
+    no file part for the same reason — there is no defining file, and one
+    row shared by every reference is the truth, where one row per
+    referencing file would look like several different symbols.
+
+    Returns None when the index already holds the name.  That case is not
+    a missing symbol but an ambiguous one — two definitions the resolver
+    could not choose between — and adding a third row would make it
+    worse rather than better.
+
+    When someone later defines the handler in C, that definition wins on
+    the next index run: `_resolve_handler` prefers a definition outside
+    assembly, so the slot moves from this placeholder to the real code
+    and the edge is already in place.
+    """
+    from fw_context_mcp.indexer.db import insert_symbols_batch, upsert_file
+    from fw_context_mcp.indexer.ops import _normalize_file_path
+
+    existing = conn.execute(
+        "SELECT 1 FROM symbols WHERE config_hash=? AND name=? LIMIT 1",
+        (config_hash, entry.name),
+    ).fetchone()
+    if existing is not None:
+        return None
+
+    db_path = _normalize_file_path(entry.file, project_root)
+    file_id = upsert_file(conn, config_hash, db_path, "c")
+    usr = f"{_ASM_USR_PREFIX}@{entry.name}"
+    insert_symbols_batch(conn, [(
+        config_hash, file_id, db_path, entry.name, usr, entry.name, entry.name,
+        _UNDEFINED_KIND, entry.line, 1, entry.line,
+        0,  # is_definition: the slot references it, nothing defines it
+        "", "", None, 0, 0, "", 0, "",
+        _is_project_file(entry.file, project_root, vendor_patterns,
+                         project_patterns),
+        0.0, "", 0,
+    )])
+    return usr
+
 def _resolve_handler(conn, config_hash: str, name: str) -> str | None:
     """Return the USR a vector slot points at, or None when it is not clear.
 
@@ -788,7 +854,7 @@ def _resolve_handler(conn, config_hash: str, name: str) -> str | None:
 
 def _store_vectors(
     conn, config_hash: str, source: AsmSource,
-    project_root: Path,
+    project_root: Path, vendor_patterns: list[str], project_patterns: list[str],
 ) -> tuple[int, int]:
     """Write a reference for every vector slot.  Returns (linked, unresolved).
 
@@ -809,9 +875,16 @@ def _store_vectors(
     Asking about it before asking the index threw every override away: the
     same FM table carried one edge instead of 27.
 
-    *unresolved* counts slots naming something the index does not hold —
-    a linker symbol such as `_estack`, an ambiguous name, or a handler an
-    assembler macro defines, which the C preprocessor does not expand.
+    A slot naming something NO unit defines still gets an edge, to a
+    declaration :func:`_declare_referenced_only` records for it.  The
+    linker script defines `_estack` and `__StackTop`, so no translation
+    unit does, and the slot used to disappear from the index although two
+    things about it were known: the name exists, and the table reaches it
+    from a given line.
+
+    *unresolved* is therefore down to the ambiguous case — a name with
+    several definitions the resolver cannot choose between, where another
+    row would make matters worse rather than better.
     """
     from fw_context_mcp.indexer.db import insert_refs_batch
     from fw_context_mcp.indexer.ops import _normalize_file_path
@@ -821,6 +894,11 @@ def _store_vectors(
 
     for entry in extract_vectors(source):
         usr = _resolve_handler(conn, config_hash, entry.name)
+        if usr is None:
+            usr = _declare_referenced_only(
+                conn, config_hash, entry, project_root,
+                vendor_patterns, project_patterns,
+            )
         if usr is None:
             unresolved += 1
             continue
