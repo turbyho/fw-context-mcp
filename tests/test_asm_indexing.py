@@ -489,7 +489,7 @@ class TestVectorEdges:
                 fid = upsert_file(conn, "ch", "src/main.c", "c")
                 insert_symbols_batch(conn, [
                     ("ch", fid, "src/main.c", n, f"c:@F@{n}", n, n, "function",
-                     10, 1, 12, 1, "", "", None, 0, 0, "", 0, "", 1, 0.0, "")
+                     10, 1, 12, 1, "", "", None, 0, 0, "", 0, "", 1, 0.0, "", 0)
                     for n in c_symbols
                 ])
             result = store_units(conn, "ch", [_unit(tmp_path, "startup.S", asm)],
@@ -911,7 +911,7 @@ class TestReindexReplacesWhatItWrote:
                 insert_symbols_batch(conn, [(
                     "ch", fid, "shared.h", "c_thing", "c:@F@c_thing", "c_thing",
                     "c_thing", "function", 1, 1, 1, 1,
-                    "", "", None, 0, 0, "", 0, "", 1, 0.0, "",
+                    "", "", None, 0, 0, "", 0, "", 1, 0.0, "", 0,
                 )])
             self._store(conn, tmp_path, ".global Foo\nFoo:\n  b .\n")
             names = {r[0] for r in conn.execute(
@@ -1057,11 +1057,11 @@ class TestAssemblyDefinitionSortsLast:
                 ("ch", c_file, "src/main.cpp", "HardFault_Handler",
                  "c:@F@HardFault_Handler", "HardFault_Handler",
                  "HardFault_Handler", "function", c_line, 1, c_line, 1,
-                 "", "", None, 0, 0, "", 0, "", 1, 0.0, ""),
+                 "", "", None, 0, 0, "", 0, "", 1, 0.0, "", 0),
                 ("ch", asm_file, "startup.S", "HardFault_Handler",
                  "asm:startup.S@HardFault_Handler", "HardFault_Handler",
                  "HardFault_Handler", "function", asm_line, 1, asm_line, 1,
-                 "", "", None, 0, 0, "", 0, "", 0, 0.0, ""),
+                 "", "", None, 0, 0, "", 0, "", 0, 0.0, "", 0),
             ])
         return conn
 
@@ -1113,7 +1113,7 @@ class TestAssemblyDefinitionSortsLast:
                     "ch", fid, "startup.S", "Reset_Handler",
                     "asm:startup.S@Reset_Handler", "Reset_Handler",
                     "Reset_Handler", "function", 130, 1, 130, 1,
-                    "", "", None, 0, 0, "", 0, "", 0, 0.0, "",
+                    "", "", None, 0, 0, "", 0, "", 0, 0.0, "", 0,
                 )])
             sym = _lookup_definition(
                 conn, "ch", "Reset_Handler", preferred_kinds=None)
@@ -1217,7 +1217,7 @@ class TestAWeakAliasDoesNotHideTheCOverride:
             insert_symbols_batch(conn, [
                 ("ch", fid, "src/hal.c", name, f"c:@F@{name}", name, name,
                  "function", 10 + i, 1, 12 + i, 1,
-                 "", "", None, 0, 0, "", 0, "", 1, 0.0, "")
+                 "", "", None, 0, 0, "", 0, "", 1, 0.0, "", 0)
                 for i, name in enumerate(c_handlers)
             ])
         unit = _unit(tmp_path, "startup.S",
@@ -1411,3 +1411,131 @@ class TestConstantsDefinedByEqu:
         syms = self._symbols(tmp_path, "  .set noreorder\n  .set nomacro\n")
 
         assert syms == {}
+
+
+class TestWeakLosesToStrong:
+    """`.weak` says the linker drops this definition for a strong one.
+
+    A CMSIS startup defines every core exception weakly so that an RTOS
+    can define it properly, and both then sit in the index under one
+    name.  Without knowing which is weak the resolver saw two equally
+    good answers and gave up, so the slot reached no handler at all:
+    measured, that cost 3 slots on zbox-ecb-fw and 7 on birdie1-v2-fw-v3,
+    HardFault_Handler, SysTick_Handler and the rest of the core
+    exceptions among them.
+    """
+
+    @staticmethod
+    def _db(tmp_path: Path, rows: list[tuple[str, int, int]]):
+        """Index *rows* as (usr, is_definition, is_weak) for one name."""
+        from fw_context_mcp.indexer.db import (
+            insert_symbols_batch,
+            open_db,
+            transaction,
+            upsert_build_config,
+            upsert_file,
+            upsert_project,
+        )
+
+        conn = open_db(tmp_path / "index.db")
+        with transaction(conn):
+            upsert_project(conn, "pid", "p", str(tmp_path))
+            upsert_build_config(conn, "ch", "pid", str(tmp_path / "cc.json"))
+            fid = upsert_file(conn, "ch", "src/a.c", "c")
+            insert_symbols_batch(conn, [
+                ("ch", fid, "src/a.c", "SysTick_Handler", usr, "SysTick_Handler",
+                 "SysTick_Handler", "function", 10, 1, 12, definition,
+                 "", "", None, 0, 0, "", 0, "", 1, 0.0, "", weak)
+                for usr, definition, weak in rows
+            ])
+        return conn
+
+    def test_a_strong_assembly_definition_wins_over_a_weak_one(self, tmp_path: Path):
+        """The zbox case: an RTOS body against a CMSIS stub."""
+        from fw_context_mcp.indexer.asm import _resolve_handler
+
+        conn = self._db(tmp_path, [
+            ("asm:irq_cm4f.S@SysTick_Handler", 1, 0),
+            ("asm:startup.S@SysTick_Handler", 1, 1),
+        ])
+        try:
+            assert _resolve_handler(conn, "ch", "SysTick_Handler") == (
+                "asm:irq_cm4f.S@SysTick_Handler"
+            )
+        finally:
+            conn.close()
+
+    def test_two_strong_definitions_are_still_refused(self, tmp_path: Path):
+        """A wrong edge is worse than none: on an interrupt it is the only
+        edge a reader has."""
+        from fw_context_mcp.indexer.asm import _resolve_handler
+
+        conn = self._db(tmp_path, [
+            ("asm:one.S@SysTick_Handler", 1, 0),
+            ("asm:two.S@SysTick_Handler", 1, 0),
+        ])
+        try:
+            assert _resolve_handler(conn, "ch", "SysTick_Handler") is None
+        finally:
+            conn.close()
+
+    def test_two_weak_definitions_are_refused_too(self, tmp_path: Path):
+        from fw_context_mcp.indexer.asm import _resolve_handler
+
+        conn = self._db(tmp_path, [
+            ("asm:one.S@SysTick_Handler", 1, 1),
+            ("asm:two.S@SysTick_Handler", 1, 1),
+        ])
+        try:
+            assert _resolve_handler(conn, "ch", "SysTick_Handler") is None
+        finally:
+            conn.close()
+
+    def test_a_single_weak_definition_still_resolves(self, tmp_path: Path):
+        """Nothing overrode it, so it IS what the interrupt reaches."""
+        from fw_context_mcp.indexer.asm import _resolve_handler
+
+        conn = self._db(tmp_path, [("asm:startup.S@SysTick_Handler", 1, 1)])
+        try:
+            assert _resolve_handler(conn, "ch", "SysTick_Handler") == (
+                "asm:startup.S@SysTick_Handler"
+            )
+        finally:
+            conn.close()
+
+    def test_a_c_definition_still_wins_over_any_assembly_one(self, tmp_path: Path):
+        from fw_context_mcp.indexer.asm import _resolve_handler
+
+        conn = self._db(tmp_path, [
+            ("c:@F@SysTick_Handler", 1, 0),
+            ("asm:irq_cm4f.S@SysTick_Handler", 1, 0),
+            ("asm:startup.S@SysTick_Handler", 1, 1),
+        ])
+        try:
+            assert _resolve_handler(conn, "ch", "SysTick_Handler") == (
+                "c:@F@SysTick_Handler"
+            )
+        finally:
+            conn.close()
+
+    def test_the_weak_flag_reaches_the_stored_symbol(self, tmp_path: Path):
+        """The column is only useful if the assembly pass fills it."""
+        from fw_context_mcp.indexer.asm import store_units
+        from fw_context_mcp.indexer.db import transaction
+
+        unit = _unit(
+            tmp_path, "startup.S",
+            ".global Strong\nStrong:\n  b .\n"
+            ".weak Weak\nWeak:\n  b .\n",
+        )
+        conn = TestStoreUnits._db(tmp_path)
+        try:
+            with transaction(conn):
+                store_units(conn, "ch", [unit], tmp_path)
+            rows = dict(conn.execute(
+                "SELECT name, is_weak FROM symbols WHERE config_hash='ch'"
+            ).fetchall())
+        finally:
+            conn.close()
+
+        assert rows == {"Strong": 0, "Weak": 1}

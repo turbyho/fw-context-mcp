@@ -690,6 +690,11 @@ def _store_symbols(conn, config_hash: str, source: AsmSource, project_root: Path
             "", "", None, 0, 0, "", 0, "",
             _is_project_file(sym.file, project_root, vendor_patterns, project_patterns),
             0.0, "",
+            # `.weak`, which is what lets the vector table pick between two
+            # definitions of one name: a CMSIS startup defines every core
+            # exception weakly so an RTOS can define it properly, and the
+            # linker keeps the strong one.
+            int(sym.is_weak),
         ))
     insert_symbols_batch(conn, rows)
     return len(rows)
@@ -764,20 +769,38 @@ def _resolve_handler(conn, config_hash: str, name: str) -> str | None:
     not, and on an interrupt that is the only edge a reader has.
     """
     rows = conn.execute(
-        "SELECT usr, is_definition FROM symbols WHERE config_hash=? AND name=?",
+        "SELECT usr, is_definition, is_weak FROM symbols "
+        "WHERE config_hash=? AND name=?",
         (config_hash, name),
     ).fetchall()
     if not rows:
         return None
 
-    strong = [r for r in rows if r["is_definition"] and not r["usr"].startswith(_ASM_USR_PREFIX)]
-    if len(strong) == 1:
-        return strong[0]["usr"]
-    if len(strong) > 1:
+    def pick(candidates: list) -> str | None:
+        """One candidate, preferring the definition the linker keeps.
+
+        A weak definition loses to a strong one of the same name — that is
+        what `.weak` means — so the two are ranked before they are
+        counted.  Ambiguity within a rank is still refused: a wrong edge
+        would claim the vector table reaches something it does not, and
+        on an interrupt that edge is the only one a reader has.
+        """
+        for weak in (0, 1):
+            same_rank = [c for c in candidates if bool(c["is_weak"]) == bool(weak)]
+            if len(same_rank) == 1:
+                return str(same_rank[0]["usr"])
+            if len(same_rank) > 1:
+                return None
         return None
 
-    from_asm = [r for r in rows if r["usr"].startswith(_ASM_USR_PREFIX)]
-    return from_asm[0]["usr"] if len(from_asm) == 1 else None
+    strong = [
+        r for r in rows
+        if r["is_definition"] and not r["usr"].startswith(_ASM_USR_PREFIX)
+    ]
+    if strong:
+        return pick(strong)
+
+    return pick([r for r in rows if r["usr"].startswith(_ASM_USR_PREFIX)])
 
 
 def _store_vectors(

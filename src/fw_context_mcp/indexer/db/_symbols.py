@@ -186,7 +186,8 @@ def insert_symbols_batch(
     Each row: (config_hash, file_id, file_path, name_tokens, usr, name,
                qualified_name, kind, line, col, end_line, is_definition,
                signature, docstring, enum_value, is_virtual, is_pure_virtual,
-               parent_usr, is_template, template_usr, is_project, pagerank, source)
+               parent_usr, is_template, template_usr, is_project, pagerank, source,
+               is_weak)
 
     Returns count of rows inserted or upgraded to definition.
 
@@ -216,8 +217,9 @@ def insert_symbols_batch(
         """INSERT INTO symbols
            (config_hash, file_id, file_path, name_tokens, usr, name, qualified_name, kind,
             line, col, end_line, is_definition, signature, docstring, enum_value,
-            is_virtual, is_pure_virtual, parent_usr, is_template, template_usr, is_project, pagerank, source)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            is_virtual, is_pure_virtual, parent_usr, is_template, template_usr, is_project, pagerank, source,
+            is_weak)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
            ON CONFLICT(config_hash, usr) DO UPDATE SET
                file_id       = excluded.file_id,
                file_path     = excluded.file_path,
@@ -236,7 +238,8 @@ def insert_symbols_batch(
                template_usr  = excluded.template_usr,
                is_project    = excluded.is_project,
                pagerank      = excluded.pagerank,
-               source        = excluded.source
+               source        = excluded.source,
+               is_weak       = excluded.is_weak
            WHERE excluded.is_definition = 1 AND symbols.is_definition = 0""",
         rows,
     )

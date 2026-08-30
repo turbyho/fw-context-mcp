@@ -30,7 +30,7 @@ def _add_symbol(conn, file_id, name, kind, *, is_project=1, is_definition=1):
         [
             (CONFIG_HASH, file_id, "src/test.cpp", name, f"usr-{name}", name,
              f"ns::{name}", kind, 10, 1, 20, is_definition, f"void {name}()",
-             "", None, 0, 0, "", 0, "", is_project, 0.0, "body"),
+             "", None, 0, 0, "", 0, "", is_project, 0.0, "body", 0),
         ],
     )
     return conn.execute(

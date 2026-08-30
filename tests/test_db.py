@@ -251,9 +251,9 @@ class TestInsertSymbolsBatch:
         file_id = upsert_file(populated_db, "hash-deadbeef", "/tmp/test.cpp", "cpp")
         rows = [
             ("hash-deadbeef", file_id, "src/test.cpp", "foo", "usr-1", "foo", "ns::foo", "function",
-             10, 1, 0, 0, "void foo()", "", None, 0, 0, "", 0, "", 0, 0.0, ""),
+             10, 1, 0, 0, "void foo()", "", None, 0, 0, "", 0, "", 0, 0.0, "", 0),
             ("hash-deadbeef", file_id, "src/test.cpp", "bar", "usr-2", "bar", "ns::bar", "function",
-             20, 1, 0, 0, "int bar(int)", "Returns bar", None, 0, 0, "", 0, "", 0, 0.0, ""),
+             20, 1, 0, 0, "int bar(int)", "Returns bar", None, 0, 0, "", 0, "", 0, 0.0, "", 0),
         ]
         count = insert_symbols_batch(populated_db, rows)
         assert count == 2
@@ -263,12 +263,12 @@ class TestInsertSymbolsBatch:
         # Insert as declaration
         insert_symbols_batch(populated_db, [
             ("hash-deadbeef", file_id, "src/test.cpp", "foo", "usr-1", "foo", "ns::foo", "function",
-             5, 1, 0, 0, "void foo()", "", None, 0, 0, "", 0, "", 0, 0.0, ""),
+             5, 1, 0, 0, "void foo()", "", None, 0, 0, "", 0, "", 0, 0.0, "", 0),
         ])
         # Insert as definition (same USR) — should promote
         insert_symbols_batch(populated_db, [
             ("hash-deadbeef", file_id, "src/test.cpp", "foo", "usr-1", "foo", "ns::foo", "function",
-             10, 1, 0, 1, "void foo(int x)", "Does foo", None, 0, 0, "", 0, "", 0, 0.0, ""),
+             10, 1, 0, 1, "void foo(int x)", "Does foo", None, 0, 0, "", 0, "", 0, 0.0, "", 0),
         ])
         row = populated_db.execute(
             "SELECT is_definition, signature, line FROM symbols WHERE usr=?", ("usr-1",)
@@ -282,12 +282,12 @@ class TestInsertSymbolsBatch:
         # Insert as definition first
         insert_symbols_batch(populated_db, [
             ("hash-deadbeef", file_id, "src/test.cpp", "foo", "usr-1", "foo", "ns::foo", "function",
-             10, 1, 0, 1, "void foo()", "", None, 0, 0, "", 0, "", 0, 0.0, ""),
+             10, 1, 0, 1, "void foo()", "", None, 0, 0, "", 0, "", 0, 0.0, "", 0),
         ])
         # Then try to insert as declaration — WHERE clause prevents demotion
         insert_symbols_batch(populated_db, [
             ("hash-deadbeef", file_id, "src/test.cpp", "foo", "usr-1", "foo", "ns::foo", "function",
-             5, 1, 0, 0, "void foo();", "", None, 0, 0, "", 0, "", 0, 0.0, ""),
+             5, 1, 0, 0, "void foo();", "", None, 0, 0, "", 0, "", 0, 0.0, "", 0),
         ])
         row = populated_db.execute(
             "SELECT is_definition FROM symbols WHERE usr=?", ("usr-1",)
@@ -299,8 +299,8 @@ class TestDeleteSymbolsForFile:
     def test_delete(self, populated_db):
         file_id = upsert_file(populated_db, "hash-deadbeef", "/tmp/del.cpp", "cpp")
         insert_symbols_batch(populated_db, [
-            ("hash-deadbeef", file_id, "src/del.cpp", "f1", "usr-1", "f1", "ns::f1", "function", 1, 1, 0, 1, "void f1()", "", None, 0, 0, "", 0, "", 0, 0.0, ""),
-            ("hash-deadbeef", file_id, "src/del.cpp", "f2", "usr-2", "f2", "ns::f2", "function", 2, 1, 0, 1, "void f2()", "", None, 0, 0, "", 0, "", 0, 0.0, ""),
+            ("hash-deadbeef", file_id, "src/del.cpp", "f1", "usr-1", "f1", "ns::f1", "function", 1, 1, 0, 1, "void f1()", "", None, 0, 0, "", 0, "", 0, 0.0, "", 0),
+            ("hash-deadbeef", file_id, "src/del.cpp", "f2", "usr-2", "f2", "ns::f2", "function", 2, 1, 0, 1, "void f2()", "", None, 0, 0, "", 0, "", 0, 0.0, "", 0),
         ])
         count_before = populated_db.execute(
             "SELECT COUNT(*) FROM symbols WHERE file_id=?", (file_id,)
@@ -343,13 +343,13 @@ class TestSearchSymbols:
         insert_symbols_batch(populated_db, [
             ("hash-deadbeef", file_id, "src/modem/modem_driver.cpp",
              split_tokens("modem_init", "ns::modem_init"),
-             "u1", "modem_init", "ns::modem_init", "function", 1, 1, 0, 1, "void modem_init()", "", None, 0, 0, "", 0, "", 0, 0.0, ""),
+             "u1", "modem_init", "ns::modem_init", "function", 1, 1, 0, 1, "void modem_init()", "", None, 0, 0, "", 0, "", 0, 0.0, "", 0),
             ("hash-deadbeef", file_id, "src/uart/uart_driver.cpp",
              split_tokens("uart_send", "ns::uart_send"),
-             "u2", "uart_send", "ns::uart_send", "function", 5, 1, 0, 1, "void uart_send(char c)", "", None, 0, 0, "", 0, "", 0, 0.0, ""),
+             "u2", "uart_send", "ns::uart_send", "function", 5, 1, 0, 1, "void uart_send(char c)", "", None, 0, 0, "", 0, "", 0, 0.0, "", 0),
             ("hash-deadbeef", file_id, "src/modem/modem_driver.cpp",
              split_tokens("modem_connect", "ns::modem_connect"),
-             "u3", "modem_connect", "ns::modem_connect", "function", 10, 1, 0, 1, "int modem_connect(const char* host)", "", None, 0, 0, "", 0, "", 0, 0.0, ""),
+             "u3", "modem_connect", "ns::modem_connect", "function", 10, 1, 0, 1, "int modem_connect(const char* host)", "", None, 0, 0, "", 0, "", 0, 0.0, "", 0),
         ])
 
         results = search_symbols(populated_db, "modem", "hash-deadbeef")
@@ -363,10 +363,10 @@ class TestSearchSymbols:
         insert_symbols_batch(populated_db, [
             ("hash-deadbeef", file_id, "src/spi/spi_driver.cpp",
              split_tokens("write", "SPI::write"),
-             "u10", "write", "SPI::write", "method", 1, 1, 0, 1, "void write(const uint8_t* buf, int len)", "", None, 0, 0, "", 0, "", 0, 0.0, ""),
+             "u10", "write", "SPI::write", "method", 1, 1, 0, 1, "void write(const uint8_t* buf, int len)", "", None, 0, 0, "", 0, "", 0, 0.0, "", 0),
             ("hash-deadbeef", file_id, "src/uart/uart_driver.cpp",
              split_tokens("write", "UART::write"),
-             "u11", "write", "UART::write", "method", 1, 1, 0, 1, "void write(char c)", "", None, 0, 0, "", 0, "", 0, 0.0, ""),
+             "u11", "write", "UART::write", "method", 1, 1, 0, 1, "void write(char c)", "", None, 0, 0, "", 0, "", 0, 0.0, "", 0),
         ])
         results = search_symbols(populated_db, "spi* AND write*", "hash-deadbeef")
         assert len(results) == 1
@@ -380,11 +380,11 @@ class TestSearchSymbols:
             ("hash-deadbeef", file_id, "lib/ble/ble.cpp",
              split_tokens("onConnectionComplete", "ZBLE::onConnectionComplete"),
              "u20", "onConnectionComplete", "ZBLE::onConnectionComplete",
-             "method", 1, 1, 0, 1, "void onConnectionComplete()", "", None, 0, 0, "", 0, "", 0, 0.0, ""),
+             "method", 1, 1, 0, 1, "void onConnectionComplete()", "", None, 0, 0, "", 0, "", 0, 0.0, "", 0),
             ("hash-deadbeef", file_id, "lib/ble/ble.cpp",
              split_tokens("startAdvertising", "ZBLE::startAdvertising"),
              "u21", "startAdvertising", "ZBLE::startAdvertising",
-             "method", 2, 1, 0, 1, "void startAdvertising()", "", None, 0, 0, "", 0, "", 0, 0.0, ""),
+             "method", 2, 1, 0, 1, "void startAdvertising()", "", None, 0, 0, "", 0, "", 0, 0.0, "", 0),
         ])
         # connect* must find onConnectionComplete via name_tokens = "on connection complete"
         results = search_symbols(populated_db, "connect*", "hash-deadbeef")
@@ -401,7 +401,7 @@ class TestSearchSymbols:
         rows_data = [
             ("hash-deadbeef", file_id, "src/limit.cpp",
              split_tokens(f"func{i}", f"ns::func{i}"),
-                          f"u{i}", f"func{i}", f"ns::func{i}", "function", i, 1, 0, 1, f"void func{i}()", "", None, 0, 0, "", 0, "", 0, 0.0, "")
+                          f"u{i}", f"func{i}", f"ns::func{i}", "function", i, 1, 0, 1, f"void func{i}()", "", None, 0, 0, "", 0, "", 0, 0.0, "", 0)
             for i in range(10)
         ]
         insert_symbols_batch(populated_db, rows_data)
@@ -417,12 +417,12 @@ class TestSearchSymbols:
             ("hash-deadbeef", file_id, "mbed-os/drivers/Driver.cpp",
              split_tokens("mbed_driver_init", "mbed::driver_init"),
              "usr-pto-1", "mbed_driver_init", "mbed::driver_init", "function",
-             1, 1, 0, 1, "void driver_init()", "", None, 0, 0, "", 0, "", 0, 0.0, ""),
+             1, 1, 0, 1, "void driver_init()", "", None, 0, 0, "", 0, "", 0, 0.0, "", 0),
             # Project symbol (is_project=1 in column 20)
             ("hash-deadbeef", file_id, "src/my_driver.cpp",
              split_tokens("my_driver_init", "my_driver_init"),
              "usr-pto-2", "my_driver_init", "my_driver_init", "function",
-             1, 1, 0, 1, "void my_driver_init()", "", None, 0, 0, "", 0, "", 1, 0.0, ""),
+             1, 1, 0, 1, "void my_driver_init()", "", None, 0, 0, "", 0, "", 1, 0.0, "", 0),
         ])
 
         # Without project_only — both symbols
@@ -445,7 +445,7 @@ class TestSearchSymbols:
             ("hash-deadbeef", file_id, "mbed-os/drivers/I2C.cpp",
              split_tokens("i2c_read", "mbed::I2C::read"),
              "usr-pto-3", "i2c_read", "mbed::I2C::read", "method",
-             1, 1, 0, 1, "int read(int address, char* data, int length)", "", None, 0, 0, "", 0, "", 0, 0.0, ""),
+             1, 1, 0, 1, "int read(int address, char* data, int length)", "", None, 0, 0, "", 0, "", 0, 0.0, "", 0),
         ])
 
         # Without project_only — found
@@ -516,9 +516,9 @@ class TestRefs:
         fid = upsert_file(db, "hash-deadbeef", "/tmp/app.cpp", "cpp")
         insert_symbols_batch(db, [
             ("hash-deadbeef", fid, "src/modem.cpp", split_tokens("modem_init", "modem_init"),
-             "U_callee", "modem_init", "modem_init", "function", 10, 1, 0, 1, "void modem_init()", "", None, 0, 0, "", 0, "", 0, 0.0, ""),
+             "U_callee", "modem_init", "modem_init", "function", 10, 1, 0, 1, "void modem_init()", "", None, 0, 0, "", 0, "", 0, 0.0, "", 0),
             ("hash-deadbeef", fid, "src/app.cpp", split_tokens("app_run", "App::app_run"),
-             "U_caller", "app_run", "App::app_run", "method", 50, 1, 0, 1, "void app_run()", "", None, 0, 0, "", 0, "", 0, 0.0, ""),
+             "U_caller", "app_run", "App::app_run", "method", 50, 1, 0, 1, "void app_run()", "", None, 0, 0, "", 0, "", 0, 0.0, "", 0),
         ])
 
     def test_count_refs_empty(self, populated_db):
@@ -629,11 +629,11 @@ class TestRefs:
             ("hash-deadbeef", fid, "src/modem.cpp",
              split_tokens("send", "ns::DRIVER::send"),
              "U_drv_send", "send", "ns::DRIVER::send", "method",
-             100, 1, 0, 1, "void send(char* data)", "", None, 0, 0, "", 0, "", 0, 0.0, ""),
+             100, 1, 0, 1, "void send(char* data)", "", None, 0, 0, "", 0, "", 0, 0.0, "", 0),
             ("hash-deadbeef", fid, "src/wrapper.cpp",
              split_tokens("transmit", "ns::WRAPPER::transmit"),
              "U_wrp_xmit", "transmit", "ns::WRAPPER::transmit", "method",
-             50, 1, 0, 1, "void transmit()", "", None, 0, 0, "", 0, "", 0, 0.0, ""),
+             50, 1, 0, 1, "void transmit()", "", None, 0, 0, "", 0, "", 0, 0.0, "", 0),
         ])
         # Reference: WRAPPER::transmit calls DRIVER::send
         insert_refs_batch(populated_db, [
@@ -657,15 +657,15 @@ class TestRefs:
             ("hash-deadbeef", fid, "src/drv.cpp",
              split_tokens("DRIVER", "ns::DRIVER"),
              "c:@N@ns@S@DRIVER", "DRIVER", "ns::DRIVER", "class",
-             1, 1, 0, 1, "", "", None, 0, 0, "", 0, "", 0, 0.0, ""),
+             1, 1, 0, 1, "", "", None, 0, 0, "", 0, "", 0, 0.0, "", 0),
             ("hash-deadbeef", fid, "src/drv.cpp",
              split_tokens("send", "ns::DRIVER::send"),
              "c:@N@ns@S@DRIVER@F@send#1", "send", "ns::DRIVER::send", "method",
-             10, 1, 0, 1, "void send()", "", None, 0, 0, "", 0, "", 0, 0.0, ""),
+             10, 1, 0, 1, "void send()", "", None, 0, 0, "", 0, "", 0, 0.0, "", 0),
             ("hash-deadbeef", fid, "src/main.cpp",
              split_tokens("main", "main"),
              "U_main", "main", "main", "function",
-             1, 1, 0, 1, "int main()", "", None, 0, 0, "", 0, "", 0, 0.0, ""),
+             1, 1, 0, 1, "int main()", "", None, 0, 0, "", 0, "", 0, 0.0, "", 0),
         ])
         insert_refs_batch(populated_db, [
             ("hash-deadbeef", "c:@N@ns@S@DRIVER@F@send#1", "src/main.cpp", 5, "U_main", "call"),
@@ -685,7 +685,7 @@ class TestRefs:
              split_tokens("i2c_write", "mbed::I2C::write"),
              "U_callee_i2c", "i2c_write", "mbed::I2C::write", "method",
              10, 1, 0, 1, "int write(int address, const char* data, int length)",
-             "", None, 0, 0, "", 0, "", 0, 0.0, ""),
+             "", None, 0, 0, "", 0, "", 0, 0.0, "", 0),
         ])
         # Insert caller (project, is_project=1)
         caller_fid = upsert_file(populated_db, "hash-deadbeef", "/tmp/app.cpp", "cpp")
@@ -693,7 +693,7 @@ class TestRefs:
             ("hash-deadbeef", caller_fid, "src/app.cpp",
              split_tokens("app_run", "App::app_run"),
              "U_caller_app", "app_run", "App::app_run", "method",
-             50, 1, 0, 1, "void app_run()", "", None, 0, 0, "", 0, "", 1, 0.0, ""),
+             50, 1, 0, 1, "void app_run()", "", None, 0, 0, "", 0, "", 1, 0.0, "", 0),
         ])
         insert_refs_batch(populated_db, [
             ("hash-deadbeef", "U_callee_i2c", "src/app.cpp", 55, "U_caller_app", "call"),
@@ -717,19 +717,19 @@ class TestEnumValue:
             ("hash-deadbeef", file_id, "src/ble_cmd.h",
              split_tokens("StatusCode", "zbox::BleCmd::StatusCode"),
              "U_enum", "StatusCode", "zbox::BleCmd::StatusCode", "enum",
-             19, 1, 36, 1, "", "", None, 0, 0, "", 0, "", 0, 0.0, ""),
+             19, 1, 36, 1, "", "", None, 0, 0, "", 0, "", 0, 0.0, "", 0),
             ("hash-deadbeef", file_id, "src/ble_cmd.h",
              split_tokens("TOKEN_INVALID", "zbox::BleCmd::StatusCode::TOKEN_INVALID"),
              "U_tok_inv", "TOKEN_INVALID", "zbox::BleCmd::StatusCode::TOKEN_INVALID",
-             "enum_constant", 23, 1, 0, 1, "", "", -2, 0, 0, "", 0, "", 0, 0.0, ""),
+             "enum_constant", 23, 1, 0, 1, "", "", -2, 0, 0, "", 0, "", 0, 0.0, "", 0),
             ("hash-deadbeef", file_id, "src/ble_cmd.h",
              split_tokens("OPERATION_SUCCESSFUL", "zbox::BleCmd::StatusCode::OPERATION_SUCCESSFUL"),
              "U_ok", "OPERATION_SUCCESSFUL", "zbox::BleCmd::StatusCode::OPERATION_SUCCESSFUL",
-             "enum_constant", 21, 1, 0, 1, "", "", 1, 0, 0, "", 0, "", 0, 0.0, ""),
+             "enum_constant", 21, 1, 0, 1, "", "", 1, 0, 0, "", 0, "", 0, 0.0, "", 0),
             ("hash-deadbeef", file_id, "src/ble_cmd.h",
              split_tokens("DEVICE_ERROR", "zbox::BleCmd::StatusCode::DEVICE_ERROR"),
              "U_dev_err", "DEVICE_ERROR", "zbox::BleCmd::StatusCode::DEVICE_ERROR",
-             "enum_constant", 28, 1, 0, 1, "", "", -7, 0, 0, "", 0, "", 0, 0.0, ""),
+             "enum_constant", 28, 1, 0, 1, "", "", -7, 0, 0, "", 0, "", 0, 0.0, "", 0),
         ])
 
         # Verify enum_value is stored and retrievable
@@ -751,23 +751,23 @@ class TestEnumValue:
             ("hash-deadbeef", file_id, "src/ble_cmd.h",
              split_tokens("StatusCode", "zbox::BleCmd::StatusCode"),
              "U_enum", "StatusCode", "zbox::BleCmd::StatusCode", "enum",
-             19, 1, 0, 1, "", "", None, 0, 0, "", 0, "", 0, 0.0, ""),
+             19, 1, 0, 1, "", "", None, 0, 0, "", 0, "", 0, 0.0, "", 0),
             ("hash-deadbeef", file_id, "src/ble_cmd.h",
              split_tokens("TOKEN_INVALID", "zbox::BleCmd::StatusCode::TOKEN_INVALID"),
              "U_tok_inv", "TOKEN_INVALID", "zbox::BleCmd::StatusCode::TOKEN_INVALID",
-             "enum_constant", 23, 1, 0, 1, "", "", -2, 0, 0, "", 0, "", 0, 0.0, ""),
+             "enum_constant", 23, 1, 0, 1, "", "", -2, 0, 0, "", 0, "", 0, 0.0, "", 0),
             ("hash-deadbeef", file_id, "src/ble_cmd.h",
              split_tokens("OPERATION_SUCCESSFUL", "zbox::BleCmd::StatusCode::OPERATION_SUCCESSFUL"),
              "U_ok", "OPERATION_SUCCESSFUL", "zbox::BleCmd::StatusCode::OPERATION_SUCCESSFUL",
-             "enum_constant", 21, 1, 0, 1, "", "", 1, 0, 0, "", 0, "", 0, 0.0, ""),
+             "enum_constant", 21, 1, 0, 1, "", "", 1, 0, 0, "", 0, "", 0, 0.0, "", 0),
             ("hash-deadbeef", file_id, "src/ble_cmd.h",
              split_tokens("State", "zbox::BleCmd::State"),
              "U_state", "State", "zbox::BleCmd::State", "enum",
-             90, 1, 0, 1, "", "", None, 0, 0, "", 0, "", 0, 0.0, ""),
+             90, 1, 0, 1, "", "", None, 0, 0, "", 0, "", 0, 0.0, "", 0),
             ("hash-deadbeef", file_id, "src/ble_cmd.h",
              split_tokens("Idle", "zbox::BleCmd::State::Idle"),
              "U_idle", "Idle", "zbox::BleCmd::State::Idle",
-             "enum_constant", 92, 1, 0, 1, "", "", 0, 0, 0, "", 0, "", 0, 0.0, ""),
+             "enum_constant", 92, 1, 0, 1, "", "", 0, 0, 0, "", 0, "", 0, 0.0, "", 0),
         ])
 
         from fw_context_mcp.indexer.db import get_file_map
@@ -808,11 +808,11 @@ class TestEnumValue:
             ("hash-deadbeef", file_id, "src/ble_cmd.h",
              split_tokens("TOKEN_INVALID", "zbox::BleCmd::StatusCode::TOKEN_INVALID"),
              "U_tok_inv", "TOKEN_INVALID", "zbox::BleCmd::StatusCode::TOKEN_INVALID",
-                          "enum_constant", 23, 1, 0, 1, "", "", -2, 0, 0, "", 0, "", 0, 0.0, ""),
+                          "enum_constant", 23, 1, 0, 1, "", "", -2, 0, 0, "", 0, "", 0, 0.0, "", 0),
             ("hash-deadbeef", file_id, "src/ble_cmd.h",
              split_tokens("OPERATION_SUCCESSFUL", "zbox::BleCmd::StatusCode::OPERATION_SUCCESSFUL"),
              "U_ok", "OPERATION_SUCCESSFUL", "zbox::BleCmd::StatusCode::OPERATION_SUCCESSFUL",
-                          "enum_constant", 21, 1, 0, 1, "", "", 1, 0, 0, "", 0, "", 0, 0.0, ""),
+                          "enum_constant", 21, 1, 0, 1, "", "", 1, 0, 0, "", 0, "", 0, 0.0, "", 0),
         ])
 
         results = search_symbols(populated_db, "TOKEN", "hash-deadbeef")
@@ -902,7 +902,7 @@ class TestInheritance:
         fid = upsert_file(conn, "hash-deadbeef", "/tmp/test.h", "cpp")
         insert_symbols_batch(conn, [
             ("hash-deadbeef", fid, "/tmp/test.h", "derived", "usr_derived",
-             "Derived", "Derived", "class", 1, 1, 5, 1, "", "", None, 0, 0, "", 0, "", 0, 0.0, ""),
+             "Derived", "Derived", "class", 1, 1, 5, 1, "", "", None, 0, 0, "", 0, "", 0, 0.0, "", 0),
         ])
         insert_inheritance_batch(conn, [
             ("hash-deadbeef", "usr_derived", "usr_base", "public", 0),
@@ -936,24 +936,24 @@ class TestParentUsr:
             ("hash-deadbeef", file_id, "src/widget.h",
              split_tokens("Widget", "ns::Widget"),
              "U_class", "Widget", "ns::Widget", "class",
-             10, 1, 50, 1, "", "", None, 0, 0, "", 0, "", 0, 0.0, ""),
+             10, 1, 50, 1, "", "", None, 0, 0, "", 0, "", 0, 0.0, "", 0),
             # Method — parent_usr = class USR
             ("hash-deadbeef", file_id, "src/widget.h",
              split_tokens("render", "ns::Widget::render"),
              "U_render", "render", "ns::Widget::render", "method",
              15, 3, 20, 1, "void render()", "Render widget", None, 0, 0,
-             "U_class", 0, "", 0, 0.0, ""),
+             "U_class", 0, "", 0, 0.0, "", 0),
             # Field — parent_usr = class USR
             ("hash-deadbeef", file_id, "src/widget.h",
              split_tokens("_x", "ns::Widget::_x"),
              "U_x", "_x", "ns::Widget::_x", "field",
              12, 5, 0, 1, "", "", None, 0, 0,
-             "U_class", 0, "", 0, 0.0, ""),
+             "U_class", 0, "", 0, 0.0, "", 0),
             # Free function — parent_usr = ""
             ("hash-deadbeef", file_id, "src/widget.h",
              split_tokens("init", "ns::init"),
              "U_init", "init", "ns::init", "function",
-             60, 1, 0, 1, "void init()", "", None, 0, 0, "", 0, "", 0, 0.0, ""),
+             60, 1, 0, 1, "void init()", "", None, 0, 0, "", 0, "", 0, 0.0, "", 0),
         ])
 
         # Verify parent_usr is stored correctly
@@ -984,22 +984,22 @@ class TestParentUsr:
             ("hash-deadbeef", file_id, "src/widget.h",
              split_tokens("Widget", "ns::Widget"),
              "U_class", "Widget", "ns::Widget", "class",
-             10, 1, 50, 1, "", "", None, 0, 0, "", 0, "", 0, 0.0, ""),
+             10, 1, 50, 1, "", "", None, 0, 0, "", 0, "", 0, 0.0, "", 0),
             ("hash-deadbeef", file_id, "src/widget.h",
              split_tokens("render", "ns::Widget::render"),
              "U_render", "render", "ns::Widget::render", "method",
              15, 3, 20, 1, "void render()", "", None, 0, 0,
-             "U_class", 0, "", 0, 0.0, ""),
+             "U_class", 0, "", 0, 0.0, "", 0),
             ("hash-deadbeef", file_id, "src/widget.h",
              split_tokens("get_name", "ns::Widget::get_name"),
              "U_name", "get_name", "ns::Widget::get_name", "method",
              20, 3, 25, 1, "const char* get_name()", "", None, 0, 0,
-             "U_class", 0, "", 0, 0.0, ""),
+             "U_class", 0, "", 0, 0.0, "", 0),
             ("hash-deadbeef", file_id, "src/widget.h",
              split_tokens("_x", "ns::Widget::_x"),
              "U_x", "_x", "ns::Widget::_x", "field",
              12, 5, 0, 1, "", "", None, 0, 0,
-             "U_class", 0, "", 0, 0.0, ""),
+             "U_class", 0, "", 0, 0.0, "", 0),
         ])
 
         members = get_class_members(populated_db, "hash-deadbeef", "U_class")
@@ -1039,11 +1039,11 @@ class TestTemplateTracking:
             ("hash-deadbeef", file_id, "src/vector.h",
              split_tokens("vector", "std::vector"),
              "U_tpl", "vector", "std::vector", "class",
-             10, 1, 50, 1, "", "", None, 0, 0, "", 1, "", 0, 0.0, ""),
+             10, 1, 50, 1, "", "", None, 0, 0, "", 1, "", 0, 0.0, "", 0),
             ("hash-deadbeef", file_id, "src/main.cpp",
              split_tokens("vector", "std::vector<int>"),
              "U_inst", "vector", "std::vector<int>", "class",
-             42, 1, 0, 1, "", "", None, 0, 0, "", 0, "U_tpl", 0, 0.0, ""),
+             42, 1, 0, 1, "", "", None, 0, 0, "", 0, "U_tpl", 0, 0.0, "", 0),
         ])
         row = populated_db.execute(
             "SELECT is_template, template_usr FROM symbols WHERE usr=?",
@@ -1067,16 +1067,16 @@ class TestTemplateTracking:
             ("hash-deadbeef", file_id, "src/list.h",
              split_tokens("list", "ns::list"),
              "U_list_tpl", "list", "ns::list", "class",
-             5, 1, 100, 1, "", "", None, 0, 0, "", 1, "", 0, 0.0, ""),
+             5, 1, 100, 1, "", "", None, 0, 0, "", 1, "", 0, 0.0, "", 0),
             # Two instantiations
             ("hash-deadbeef", file_id, "src/list.h",
              split_tokens("list", "ns::list<int>"),
              "U_list_int", "list", "ns::list<int>", "class",
-             200, 1, 0, 1, "", "", None, 0, 0, "", 0, "U_list_tpl", 0, 0.0, ""),
+             200, 1, 0, 1, "", "", None, 0, 0, "", 0, "U_list_tpl", 0, 0.0, "", 0),
             ("hash-deadbeef", file_id, "src/widget.cpp",
              split_tokens("list", "ns::list<Widget>"),
              "U_list_widget", "list", "ns::list<Widget>", "class",
-             10, 5, 0, 1, "", "", None, 0, 0, "", 0, "U_list_tpl", 0, 0.0, ""),
+             10, 5, 0, 1, "", "", None, 0, 0, "", 0, "U_list_tpl", 0, 0.0, "", 0),
         ])
         instances = get_template_instances(populated_db, "hash-deadbeef", "U_list_tpl")
         assert len(instances) == 2
@@ -1109,7 +1109,7 @@ class TestOverrides:
              split_tokens(name, qname),
              usr, name, qname, "method",
              10, 1, 20, 1, signature, "", None,
-             is_virtual, is_pure, parent_usr, 0, "", 0, 0.0, ""),
+             is_virtual, is_pure, parent_usr, 0, "", 0, 0.0, "", 0),
         ])
 
     def _insert_class(self, conn, file_id, name, qname, usr):
@@ -1118,7 +1118,7 @@ class TestOverrides:
             ("hash-deadbeef", file_id, "src/test.cpp",
              split_tokens(name, qname),
              usr, name, qname, "class",
-             1, 1, 100, 1, "", "", None, 0, 0, "", 0, "", 0, 0.0, ""),
+             1, 1, 100, 1, "", "", None, 0, 0, "", 0, "", 0, 0.0, "", 0),
         ])
 
     def test_insert_and_query_overrides(self, populated_db):
@@ -1215,7 +1215,7 @@ class TestSearchEdgeCases:
             "hash-deadbeef", fid, "src/empty_parent.c",
             split_tokens("top_level_fn", "top_level_fn"),
             "usr-empty-parent", "top_level_fn", "top_level_fn", "function",
-            1, 0, 1, 1, "void top_level_fn()", "", None, 0, 0, "", 0, "", 0, 0.0, ""
+            1, 0, 1, 1, "void top_level_fn()", "", None, 0, 0, "", 0, "", 0, 0.0, "", 0
         )]
         insert_symbols_batch(populated_db, rows)
         row = populated_db.execute(
@@ -1231,7 +1231,7 @@ class TestSearchEdgeCases:
             "hash-deadbeef", fid, "src/empty_sig.c",
             split_tokens("fn", "fn"),
             "usr-empty-sig", "fn", "fn", "function",
-            1, 0, 1, 1, "", "", None, 0, 0, "", 0, "", 0, 0.0, ""
+            1, 0, 1, 1, "", "", None, 0, 0, "", 0, "", 0, 0.0, "", 0
         )]
         insert_symbols_batch(populated_db, rows)
         row = populated_db.execute(
@@ -1247,7 +1247,7 @@ class TestSearchEdgeCases:
             "hash-deadbeef", fid, "src/line_zero.c",
             split_tokens("fn", "fn"),
             "usr-zero-line", "fn", "fn", "function",
-            0, 0, 0, 1, "void fn()", "", None, 0, 0, "", 0, "", 0, 0.0, ""
+            0, 0, 0, 1, "void fn()", "", None, 0, 0, "", 0, "", 0, 0.0, "", 0
         )]
         insert_symbols_batch(populated_db, rows)
         row = populated_db.execute(
@@ -1289,7 +1289,7 @@ class TestSearchBodies:
              "usr-attach-1", "check_timer", "BleMsg::check_timer", "method",
              10, 1, 20, 1, "void check_timer()", "", None, 0, 0, "", 0, "", 1, 0.0,
              'void BleMsg::check_timer() {\n    _timeout.attach('
-             'callback(&BleMsg::TimeoutInterrupt, this), 5s);\n}'),
+             'callback(&BleMsg::TimeoutInterrupt, this), 5s);\n}', 0),
         ])
 
         # Query using snippet with the FIXED column index 9 (source column)
@@ -1321,7 +1321,7 @@ class TestSearchBodies:
              split_tokens("fn", "ns::fn"),
              "usr-snippet10", "fn", "ns::fn", "function",
              1, 1, 5, 1, "void fn()", "", None, 0, 0, "", 0, "", 1, 0.0,
-             "void fn() { NVIC_SystemReset(); }"),
+             "void fn() { NVIC_SystemReset(); }", 0),
         ])
 
         # pysqlite3 (used by open_db when available) raises DatabaseError
@@ -1349,18 +1349,18 @@ class TestSearchBodies:
              split_tokens("check_timer", "ModemMsg::check_timer"),
              "usr-src-1", "check_timer", "ModemMsg::check_timer", "method",
              10, 1, 20, 1, "void check_timer()", "", None, 0, 0, "", 0, "", 1, 0.0,
-             '_timeout.attach(callback(&ModemMsg::TimeoutInterrupt, this), 30s);'),
+             '_timeout.attach(callback(&ModemMsg::TimeoutInterrupt, this), 30s);', 0),
             ("hash-deadbeef", fid, "src/multi.cpp",
              split_tokens("zbox_reset", "WDT::zbox_reset"),
              "usr-src-2", "zbox_reset", "WDT::zbox_reset", "method",
              30, 1, 35, 1, "void zbox_reset()", "", None, 0, 0, "", 0, "", 1, 0.0,
-             '_timeout.attach(callback(&WDT::_timeout_interrupt), delay);'),
+             '_timeout.attach(callback(&WDT::_timeout_interrupt), delay);', 0),
             # Negative: this one does NOT contain "attach"
             ("hash-deadbeef", fid, "src/multi.cpp",
              split_tokens("main", "main"),
              "usr-src-3", "main", "main", "function",
              40, 1, 45, 1, "int main()", "", None, 0, 0, "", 0, "", 1, 0.0,
-             "int main() { return 0; }"),
+             "int main() { return 0; }", 0),
         ])
 
         # Simulate what search_bodies does (using the fixed index 9)
@@ -1389,7 +1389,7 @@ class TestSearchBodies:
              "usr-nvic-1", "nordic_nrf5_uart0_handler", "nordic_nrf5_uart0_handler",
              "function", 540, 1, 10, 1, "void nordic_nrf5_uart0_handler()",
              "", None, 0, 0, "", 0, "", 1, 0.0,
-             "NVIC_SetVector(UARTE0_UART0_IRQn, (uint32_t)nordic_nrf5_uart0_handler);"),
+             "NVIC_SetVector(UARTE0_UART0_IRQn, (uint32_t)nordic_nrf5_uart0_handler);", 0),
         ])
 
         expanded = _expand_query("NVIC_SetVector")
@@ -1419,7 +1419,7 @@ class TestSearchBodies:
             ("hash-deadbeef", fid, "src/empty_source.cpp",
              split_tokens("empty_fn", "ns::empty_fn"),
              "usr-empty-1", "empty_fn", "ns::empty_fn", "function",
-             1, 1, 1, 1, "void empty_fn()", "", None, 0, 0, "", 0, "", 1, 0.0, ""),
+             1, 1, 1, 1, "void empty_fn()", "", None, 0, 0, "", 0, "", 1, 0.0, "", 0),
         ])
 
         expanded = _expand_query("empty")
@@ -1446,14 +1446,14 @@ class TestSearchBodies:
              "usr-pri-1", "attach", "mbed::Ticker::attach", "method",
              1, 1, 5, 1, "void attach(Callback<void()> func, float t)",
              "", None, 0, 0, "", 0, "", 0, 0.0,
-             "void Ticker::attach(Callback<void()> func, float t) { _ticker.attach(func, t); }"),
+             "void Ticker::attach(Callback<void()> func, float t) { _ticker.attach(func, t); }", 0),
             # Project code second (is_project=1)
             ("hash-deadbeef", fid, "src/wdt.cpp",
              split_tokens("zbox_reset", "WDT::zbox_reset"),
              "usr-pri-2", "zbox_reset", "WDT::zbox_reset", "method",
              30, 1, 35, 1, "void zbox_reset(duration delay)",
              "", None, 0, 0, "", 0, "", 1, 0.0,
-             "_timeout.attach(callback(&WDT::_timeout_interrupt), delay);"),
+             "_timeout.attach(callback(&WDT::_timeout_interrupt), delay);", 0),
         ])
 
         expanded = _expand_query("attach")
@@ -1483,14 +1483,14 @@ class TestSearchBodies:
              "usr-po-1", "attach", "mbed::SerialBase::attach", "method",
              1, 1, 5, 1, "void attach(Callback<void()> func, IrqType type)",
              "", None, 0, 0, "", 0, "", 0, 0.0,
-             'serial.attach(callback(&handler), SerialBase::RxIrq);'),
+             'serial.attach(callback(&handler), SerialBase::RxIrq);', 0),
             # Project code (is_project=1)
             ("hash-deadbeef", fid, "src/rs485.cpp",
              split_tokens("_rx_handler", "RS485::_rx_handler"),
              "usr-po-2", "_rx_handler", "RS485::_rx_handler", "method",
              85, 1, 10, 1, "void _rx_handler()",
              "", None, 0, 0, "", 0, "", 1, 0.0,
-             'serial.attach(callback(this, &RS485::_rx_handler), SerialBase::RxIrq);'),
+             'serial.attach(callback(this, &RS485::_rx_handler), SerialBase::RxIrq);', 0),
         ])
 
         expanded = _expand_query("attach")

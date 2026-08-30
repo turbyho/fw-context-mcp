@@ -54,6 +54,7 @@ def _insert_symbol(conn, config_hash: str, file_id: int, file_path: str, **kw):
         kw.get("is_project", 1),
         kw.get("pagerank", 0.0),
         kw.get("source", ""),
+        kw.get("is_weak", 0),
     )
     insert_symbols_batch(conn, [row])
 

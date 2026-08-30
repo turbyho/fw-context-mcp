@@ -247,6 +247,13 @@ _MIGRATION_ADD_COLUMNS = [
     # feed an embedding description.  Lets _build_embeddings skip unchanged
     # symbols instead of re-embedding the whole index on every `fw-context index`.
     "ALTER TABLE embeddings ADD COLUMN content_hash TEXT NOT NULL DEFAULT ''",
+    # Weakness of a definition.  A `.weak` symbol is one the linker drops
+    # as soon as a strong definition of the same name exists, and the
+    # vector table cannot be resolved without knowing which is which:
+    # measured, ten slots across two projects reached no handler because
+    # a CMSIS startup and an RTOS both defined the core exceptions and
+    # the index saw no difference between them.
+    "ALTER TABLE symbols ADD COLUMN is_weak INTEGER NOT NULL DEFAULT 0",
     # Schema version bump — DO NOT REMOVE. When adding new migration steps after this
     # column, also add a NEW ALTER TABLE … ADD COLUMN _schema_bump_… line. The hash
     # of _MIGRATION_ADD_COLUMNS drives CURRENT_SCHEMA_VERSION.
@@ -348,6 +355,14 @@ CREATE TABLE IF NOT EXISTS symbols (
     col            INTEGER NOT NULL,
     end_line       INTEGER NOT NULL DEFAULT 0,
     is_definition  INTEGER NOT NULL DEFAULT 0,
+    -- A definition another object may override: `.weak` in assembly.  The
+    -- linker keeps the strong one, and without this the index cannot tell
+    -- which that is.  Measured on zbox-ecb-fw and birdie1-v2-fw-v3, ten
+    -- vector slots — HardFault_Handler, SysTick_Handler and the rest of
+    -- the core exceptions — reached no handler because a CMSIS startup
+    -- defines them weakly and an RTOS defines them properly, and both
+    -- looked equally good.
+    is_weak        INTEGER NOT NULL DEFAULT 0,
     signature      TEXT    NOT NULL DEFAULT '',
     docstring      TEXT    NOT NULL DEFAULT '',
     is_virtual     INTEGER NOT NULL DEFAULT 0,

@@ -132,7 +132,7 @@ def _add_symbol(conn, file_id: int, file_path: str, *, line: int, end_line: int)
             (CONFIG_HASH, file_id, file_path, "img_parse_tlvs", "usr-img", "img_parse_tlvs",
              "zbox::img_parse_tlvs", "function", line, 1, end_line, 1,
              "int img_parse_tlvs(const uint8_t*, size_t)",
-             "", None, 0, 0, "", 0, "", 1, 0.0, "// line 5\n"),
+             "", None, 0, 0, "", 0, "", 1, 0.0, "// line 5\n", 0),
         ],
     )
     return conn.execute("SELECT id FROM symbols WHERE usr = 'usr-img'").fetchone()["id"]

@@ -724,7 +724,7 @@ class TestCallGraphDispatchAndGlobalCtors:
             ("swdt_check","WDT::swdt_check",   "method",       "src/wdt.cpp",    45, "u_swdt_check", 1),
         ]
         sym_rows = [
-            (CH, fid, fp, name, usr, name, qn, kind, line, 1, 0, 1, "", "", None, 0, 0, "", 0, "", ip, 0.0, "")
+            (CH, fid, fp, name, usr, name, qn, kind, line, 1, 0, 1, "", "", None, 0, 0, "", 0, "", ip, 0.0, "", 0)
             for name, qn, kind, fp, line, usr, ip in _sym_data
         ]
         insert_symbols_batch(conn, sym_rows)
@@ -854,7 +854,7 @@ class TestCallGraphDispatchAndGlobalCtors:
             fid = upsert_file(conn, ch, "src/ghost.cpp", "cpp")
             insert_symbols_batch(conn, [
                 (ch, fid, "src/ghost.cpp", "ghost", "u_ghost", "ghost", "ghost",
-                 "function", 1, 1, 0, 1, "", "", None, 0, 0, "", 0, "", 1, 0.0, ""),
+                 "function", 1, 1, 0, 1, "", "", None, 0, 0, "", 0, "", 1, 0.0, "", 0),
             ])
             paths = self._find_call_path(conn, ch, "ghost", "zbox_reset", max_depth=5)
             assert not paths, "Unconnected function must have no path"

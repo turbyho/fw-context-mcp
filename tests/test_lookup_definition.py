@@ -49,13 +49,13 @@ def _insert_class_and_constructor(
          split_tokens("Foo", class_qname),
          "U_Foo_class", "Foo", class_qname, "class",
          class_line, 1, 30, class_is_definition,
-         "", "", None, 0, 0, "", 0, "", 0, 0.0, ""),
+         "", "", None, 0, 0, "", 0, "", 0, 0.0, "", 0),
         # Constructor definition in .cpp
         (config_hash, file_cpp, "src/foo.cpp",
          split_tokens("Foo", ctor_qname),
          "U_Foo_ctor", "Foo", ctor_qname, "constructor",
          ctor_line, 1, 15, ctor_is_definition,
-         "Foo(int x)", "", None, 0, 0, "U_Foo_class", 0, "", 0, 0.0, ""),
+         "Foo(int x)", "", None, 0, 0, "U_Foo_class", 0, "", 0, 0.0, "", 0),
     ])
 
 
@@ -151,11 +151,11 @@ class TestLookupDefinitionClassVsConstructor:
                 (ch, file_h, "include/bar.h",
                  split_tokens("Bar", "Bar"),
                  "U_Bar_struct", "Bar", "Bar", "struct",
-                 8, 1, 30, 1, "", "", None, 0, 0, "", 0, "", 0, 0.0, ""),
+                 8, 1, 30, 1, "", "", None, 0, 0, "", 0, "", 0, 0.0, "", 0),
                 (ch, file_cpp, "src/bar.cpp",
                  split_tokens("Bar", "Bar::Bar"),
                  "U_Bar_ctor", "Bar", "Bar::Bar", "constructor",
-                 2, 1, 10, 1, "Bar()", "", None, 0, 0, "U_Bar_struct", 0, "", 0, 0.0, ""),
+                 2, 1, 10, 1, "Bar()", "", None, 0, 0, "U_Bar_struct", 0, "", 0, 0.0, "", 0),
             ])
 
             row = _lookup_definition(conn, ch, "Bar")
@@ -223,7 +223,7 @@ class TestLookupDefinitionNoCollision:
                 (ch, file_id, "src/main.cpp",
                  split_tokens("main", "main"),
                  "U_main", "main", "main", "function",
-                 1, 1, 5, 1, "int main()", "", None, 0, 0, "", 0, "", 0, 0.0, ""),
+                 1, 1, 5, 1, "int main()", "", None, 0, 0, "", 0, "", 0, 0.0, "", 0),
             ])
 
             row = _lookup_definition(conn, ch, "main")
@@ -242,7 +242,7 @@ class TestLookupDefinitionNoCollision:
                 (ch, file_id, "src/widget.cpp",
                  split_tokens("render", "Widget::render"),
                  "U_render", "render", "Widget::render", "method",
-                 42, 3, 50, 1, "void render()", "", None, 0, 0, "U_Widget", 0, "", 0, 0.0, ""),
+                 42, 3, 50, 1, "void render()", "", None, 0, 0, "U_Widget", 0, "", 0, 0.0, "", 0),
             ])
 
             row = _lookup_definition(conn, ch, "render")
@@ -260,7 +260,7 @@ class TestLookupDefinitionNoCollision:
                 (ch, file_id, "src/types.h",
                  split_tokens("Color", "Color"),
                  "U_Color", "Color", "Color", "enum",
-                 5, 1, 10, 1, "", "", None, 0, 0, "", 0, "", 0, 0.0, ""),
+                 5, 1, 10, 1, "", "", None, 0, 0, "", 0, "", 0, 0.0, "", 0),
             ])
 
             row = _lookup_definition(conn, ch, "Color")
@@ -278,7 +278,7 @@ class TestLookupDefinitionNoCollision:
                 (ch, file_id, "include/baz.h",
                  split_tokens("Baz", "Baz"),
                  "U_Baz", "Baz", "Baz", "class",
-                 3, 1, 40, 1, "", "", None, 0, 0, "", 0, "", 0, 0.0, ""),
+                 3, 1, 40, 1, "", "", None, 0, 0, "", 0, "", 0, 0.0, "", 0),
             ])
 
             row = _lookup_definition(conn, ch, "Baz")
@@ -297,7 +297,7 @@ class TestLookupDefinitionNoCollision:
                 (ch, file_id, "src/qux.cpp",
                  split_tokens("Qux", "Qux::Qux"),
                  "U_Qux_ctor", "Qux", "Qux::Qux", "constructor",
-                 5, 1, 15, 1, "Qux(int x)", "", None, 0, 0, "U_Qux_class", 0, "", 0, 0.0, ""),
+                 5, 1, 15, 1, "Qux(int x)", "", None, 0, 0, "U_Qux_class", 0, "", 0, 0.0, "", 0),
             ])
 
             row = _lookup_definition(conn, ch, "Qux")
@@ -365,11 +365,11 @@ class TestLookupDefinitionEdgeCases:
                 (ch, file_id, "src/stat.c",
                  split_tokens("stat", "stat"),
                  "U_stat_struct", "stat", "stat", "struct",
-                 10, 1, 20, 1, "", "", None, 0, 0, "", 0, "", 0, 0.0, ""),
+                 10, 1, 20, 1, "", "", None, 0, 0, "", 0, "", 0, 0.0, "", 0),
                 (ch, file_id, "src/stat.c",
                  split_tokens("stat", "stat"),
                  "U_stat_func", "stat", "stat", "function",
-                 30, 1, 40, 1, "int stat()", "", None, 0, 0, "", 0, "", 0, 0.0, ""),
+                 30, 1, 40, 1, "int stat()", "", None, 0, 0, "", 0, "", 0, 0.0, "", 0),
             ])
 
             # struct wins because of CASE priority — this is intentional
@@ -393,11 +393,11 @@ class TestLookupDefinitionEdgeCases:
                 (ch, file_id, "src/types.h",
                  split_tokens("Foo", "Foo"),
                  "U_Foo_class", "Foo", "Foo", "class",
-                 5, 1, 10, 1, "", "", None, 0, 0, "", 0, "", 0, 0.0, ""),
+                 5, 1, 10, 1, "", "", None, 0, 0, "", 0, "", 0, 0.0, "", 0),
                 (ch, file_id, "src/types.h",
                  split_tokens("Foo", "Foo"),
                  "U_Foo_typedef", "Foo", "Foo", "typedef",
-                 1, 1, 0, 1, "", "", None, 0, 0, "", 0, "", 0, 0.0, ""),
+                 1, 1, 0, 1, "", "", None, 0, 0, "", 0, "", 0, 0.0, "", 0),
             ])
 
             row = _lookup_definition(conn, ch, "Foo")
@@ -457,11 +457,11 @@ class TestPreferredKindsParameter:
                 (ch, file_id, "src/stat.c",
                  split_tokens("stat", "stat"),
                  "U_stat_struct", "stat", "stat", "struct",
-                 10, 1, 20, 1, "", "", None, 0, 0, "", 0, "", 0, 0.0, ""),
+                 10, 1, 20, 1, "", "", None, 0, 0, "", 0, "", 0, 0.0, "", 0),
                 (ch, file_id, "src/stat.c",
                  split_tokens("stat", "stat"),
                  "U_stat_func", "stat", "stat", "function",
-                 30, 1, 40, 1, "int stat()", "", None, 0, 0, "", 0, "", 0, 0.0, ""),
+                 30, 1, 40, 1, "int stat()", "", None, 0, 0, "", 0, "", 0, 0.0, "", 0),
             ])
             # Default: struct wins
             row_default = _lookup_definition(conn, ch, "stat")
@@ -561,15 +561,15 @@ class TestIntegrationInheritanceChain:
                 (ch, file_h, "include/foo.h",
                  split_tokens("Foo", "Foo"),
                  "U_Foo_class", "Foo", "Foo", "class",
-                 5, 1, 30, 1, "", "", None, 0, 0, "", 0, "", 0, 0.0, ""),
+                 5, 1, 30, 1, "", "", None, 0, 0, "", 0, "", 0, 0.0, "", 0),
                 (ch, file_cpp, "src/foo.cpp",
                  split_tokens("Foo", "Foo::Foo"),
                  "U_Foo_ctor", "Foo", "Foo::Foo", "constructor",
-                 3, 1, 15, 1, "Foo()", "", None, 0, 0, "U_Foo_class", 0, "", 0, 0.0, ""),
+                 3, 1, 15, 1, "Foo()", "", None, 0, 0, "U_Foo_class", 0, "", 0, 0.0, "", 0),
                 (ch, file_h, "include/foo.h",
                  split_tokens("init", "Foo::init"),
                  "U_Foo_init", "init", "Foo::init", "method",
-                 8, 3, 10, 1, "int init()", "", None, 0, 0, "U_Foo_class", 0, "", 0, 0.0, ""),
+                 8, 3, 10, 1, "int init()", "", None, 0, 0, "U_Foo_class", 0, "", 0, 0.0, "", 0),
             ])
 
         _setup_integration(tmp_path)
@@ -604,11 +604,11 @@ class TestPreferProjectParameter:
                 (ch, file_sdk, "mbed-os/foo.h",
                  split_tokens("Foo", "Foo"),
                  "U_Foo_sdk", "Foo", "Foo", "class",
-                 10, 1, 30, 1, "", "", None, 0, 0, "", 0, "", 0, 0.0, ""),
+                 10, 1, 30, 1, "", "", None, 0, 0, "", 0, "", 0, 0.0, "", 0),
                 (ch, file_proj, "src/foo.h",
                  split_tokens("Foo", "Foo"),
                  "U_Foo_proj", "Foo", "Foo", "class",
-                 50, 1, 30, 1, "", "", None, 0, 0, "", 0, "", 1, 0.0, ""),
+                 50, 1, 30, 1, "", "", None, 0, 0, "", 0, "", 1, 0.0, "", 0),
             ])
 
             # prefer_project=True: project wins despite higher line
@@ -643,11 +643,11 @@ class TestPreferProjectParameter:
                 (ch, file_sdk, "mbed-os/device.h",
                  split_tokens("Device", "hal::Device"),
                  "U_dev_sdk", "Device", "hal::Device", "class",
-                 20, 1, 100, 1, "", "", None, 0, 0, "", 0, "", 0, 0.0, ""),
+                 20, 1, 100, 1, "", "", None, 0, 0, "", 0, "", 0, 0.0, "", 0),
                 (ch, file_proj, "src/my_device.h",
                  split_tokens("Device", "hal::Device"),
                  "U_dev_proj", "Device", "hal::Device", "class",
-                 30, 1, 80, 1, "", "", None, 0, 0, "", 0, "", 1, 0.0, ""),
+                 30, 1, 80, 1, "", "", None, 0, 0, "", 0, "", 1, 0.0, "", 0),
             ])
 
             row = _lookup_definition(conn, ch, "hal::Device", prefer_project=True)
@@ -674,17 +674,17 @@ class TestPreferProjectParameter:
                 (ch, file_sdk_cls, "mbed-os/init.h",
                  split_tokens("init", "init"),
                  "U_init_sdk", "init", "init", "class",
-                 10, 1, 20, 1, "", "", None, 0, 0, "", 0, "", 0, 0.0, ""),
+                 10, 1, 20, 1, "", "", None, 0, 0, "", 0, "", 0, 0.0, "", 0),
                 # Project function — is_project=1, kind=function (not preferred), line=5
                 (ch, file_proj_fn, "src/my_init.cpp",
                  split_tokens("init", "init"),
                  "U_init_proj_fn", "init", "init", "function",
-                 5, 1, 15, 1, "int init()", "", None, 0, 0, "", 0, "", 1, 0.0, ""),
+                 5, 1, 15, 1, "int init()", "", None, 0, 0, "", 0, "", 1, 0.0, "", 0),
                 # Project class — is_project=1, kind=class (preferred), line=50
                 (ch, file_proj_cls, "src/my_init.h",
                  split_tokens("init", "MyInit"),
                  "U_init_proj_cls", "init", "MyInit", "class",
-                 50, 1, 30, 1, "", "", None, 0, 0, "", 0, "", 1, 0.0, ""),
+                 50, 1, 30, 1, "", "", None, 0, 0, "", 0, "", 1, 0.0, "", 0),
             ])
 
             # With prefer_project=True + preferred_kinds=("class","struct"):
@@ -721,7 +721,7 @@ class TestPreferProjectParameter:
                 (ch, file_id, "src/main.cpp",
                  split_tokens("main", "main"),
                  "U_main", "main", "main", "function",
-                 1, 1, 5, 1, "int main()", "", None, 0, 0, "", 0, "", 1, 0.0, ""),
+                 1, 1, 5, 1, "int main()", "", None, 0, 0, "", 0, "", 1, 0.0, "", 0),
             ])
 
             row = _lookup_definition(conn, ch, "main", prefer_project=True)

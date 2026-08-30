@@ -1696,6 +1696,7 @@ class TestStoreSymbolsForUnitAnalysisRestore:
                     0,
                     0.0,
                     "",
+                    0,
                 ),
             ],
         )
@@ -1813,6 +1814,7 @@ class TestStoreSymbolsForUnitAnalysisRestore:
                     0,
                     0.0,
                     "int bar(int x) {\n    return x * 2;\n}\n",
+                        0,
                 ),
             ],
         )
@@ -1931,6 +1933,7 @@ class TestStoreSymbolsForUnitAnalysisRestore:
                     0,
                     0.0,
                     "",
+                    0,
                 ),
             ],
         )
@@ -2025,6 +2028,7 @@ class TestStoreSymbolsForUnitAnalysisRestore:
                     0,
                     0.0,
                     "",
+                    0,
                 ),
             ],
         )
