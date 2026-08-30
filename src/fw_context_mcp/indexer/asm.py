@@ -363,9 +363,24 @@ _TYPE_RE = re.compile(r"^\s*\.type\s+([A-Za-z_.$][\w.$]*)\s*,\s*[%@#]?(\w+)")
 _LABEL_RE = re.compile(r"^\s*([A-Za-z_.$][\w.$]*)\s*:")
 # `.thumb_set alias, target` is how CMSIS points an unimplemented interrupt
 # at the default handler.  `.set` and `.equ` do the same for other targets.
+#
+# The value is anything, not only a symbol name.  `.equ TCB_SP_OFS, 56`
+# defines TCB_SP_OFS just as surely, and the assembler records it as an
+# absolute symbol — a startup file writes its structure offsets and magic
+# values that way.  Requiring an identifier lost six of them across the
+# two projects measured, `BootRAM` and `TCB_SP_OFS` among them, found by
+# comparing the reader against the object files the builds had already
+# produced.
+#
+# The comma is what keeps this from matching a mode-setting `.set`:
+# `.set noreorder` and `.set nomacro` take one operand and define nothing.
 _ALIAS_RE = re.compile(
-    r"^\s*\.(?:thumb_set|set|equ)\s+([A-Za-z_.$][\w.$]*)\s*,\s*([A-Za-z_.$][\w.$]*)\s*$"
+    r"^\s*\.(?:thumb_set|set|equ)\s+([A-Za-z_.$][\w.$]*)\s*,\s*(\S.*?)\s*$"
 )
+# Which of those values names another symbol rather than being a number
+# or an expression.  Only a name can be an alias TARGET, and the vector
+# pass asks that question of `alias_target`.
+_ALIAS_TARGET_RE = re.compile(r"^[A-Za-z_.$][\w.$]*$")
 # A label directive can carry a `.section` before it on the same line, so
 # every pattern here matches a STATEMENT, not a whole line.
 
@@ -611,14 +626,18 @@ def extract_symbols(
             kind=kinds.get(name, "function"),
             is_global=name in globals_, is_weak=name in weaks,
         ))
-    for name, (target, file, line) in aliases.items():
+    for name, (value, file, line) in aliases.items():
         if name in labels:
             continue  # a real label wins over an alias of the same name
+        names_a_symbol = _ALIAS_TARGET_RE.match(value) is not None
         found.append(AsmSymbol(
             name=name, file=file, line=line,
-            kind=kinds.get(name, "function"),
+            # A constant is data, not code.  `.equ TCB_SP_OFS, 56` is a
+            # structure offset, and calling it a function would put it
+            # among the answers to "what does this firmware do".
+            kind=kinds.get(name, "function" if names_a_symbol else "variable"),
             is_global=name in globals_, is_weak=name in weaks,
-            alias_target=target,
+            alias_target=value if names_a_symbol else None,
         ))
     return found
 

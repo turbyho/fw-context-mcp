@@ -1347,3 +1347,67 @@ class TestBodiesAreSkippedNotRead:
         names = {v.name for v in extract_vectors(source)}
 
         assert names == {"RealSlot"}, names
+
+
+class TestConstantsDefinedByEqu:
+    """`.equ NAME, 56` defines NAME as surely as `.equ NAME, other_symbol`.
+
+    The assembler records both, the second as an absolute symbol.  A
+    startup file writes its structure offsets and magic values that way:
+    irq_cm4f.S defines TCB_SP_OFS, FPU_USED and three more, and the STM32
+    startup defines BootRAM.  Requiring the value to be an identifier
+    lost all six — found by comparing the reader against the object files
+    the builds had already produced.
+    """
+
+    @staticmethod
+    def _symbols(tmp_path: Path, body: str):
+        from fw_context_mcp.indexer.asm import extract_symbols, preprocess
+
+        source = preprocess(_unit(tmp_path, "a.S", body))
+        assert source is not None
+        return {s.name: s for s in extract_symbols(source)}
+
+    def test_a_numeric_constant_is_a_symbol(self, tmp_path: Path):
+        syms = self._symbols(tmp_path, "  .equ TCB_SP_OFS, 56\n")
+
+        assert "TCB_SP_OFS" in syms
+
+    def test_a_hex_constant_is_a_symbol(self, tmp_path: Path):
+        syms = self._symbols(tmp_path, "  .equ BootRAM, 0xF1E0F85F\n")
+
+        assert "BootRAM" in syms
+
+    def test_an_expression_is_a_symbol(self, tmp_path: Path):
+        syms = self._symbols(tmp_path, "  .set SIZE, 8 * 4 + 1\n")
+
+        assert "SIZE" in syms
+
+    def test_a_constant_is_data_not_code(self, tmp_path: Path):
+        """A structure offset must not answer "what does this firmware do"."""
+        syms = self._symbols(tmp_path, "  .equ TCB_SP_OFS, 56\n")
+
+        assert syms["TCB_SP_OFS"].kind == "variable"
+        assert syms["TCB_SP_OFS"].alias_target is None, (
+            "a number is not an alias of anything"
+        )
+
+    def test_an_alias_of_a_symbol_stays_an_alias(self, tmp_path: Path):
+        syms = self._symbols(
+            tmp_path,
+            "Default_Handler:\n  b .\n"
+            "  .thumb_set TIM2_IRQHandler, Default_Handler\n",
+        )
+
+        assert syms["TIM2_IRQHandler"].alias_target == "Default_Handler"
+        assert syms["TIM2_IRQHandler"].kind == "function"
+
+    def test_a_mode_setting_set_defines_nothing(self, tmp_path: Path):
+        """`.set noreorder` takes one operand and is not a definition.
+
+        The comma is what separates the two, which is why the pattern
+        requires it.
+        """
+        syms = self._symbols(tmp_path, "  .set noreorder\n  .set nomacro\n")
+
+        assert syms == {}

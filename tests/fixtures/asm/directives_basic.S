@@ -61,6 +61,20 @@ a_data_symbol:
     .globl  alias_via_equ
     .equ    alias_via_equ, spelled_globl
 
+/*
+ * The same directives with a NUMBER, or an expression, instead of a
+ * symbol.  The assembler records these too — as absolute symbols — and
+ * they are what a startup file uses for structure offsets and magic
+ * values.  Found by comparing the reader against the object files the
+ * builds had already produced: irq_cm4f.S defines TCB_SP_OFS and four
+ * more this way, and the STM32 startup defines BootRAM.
+ */
+    .equ    a_numeric_constant, 56
+    .equ    a_hex_constant, 0xF1E0F85F
+    .set    a_computed_constant, 8 * 4 + 1
+    .globl  an_exported_constant
+    .equ    an_exported_constant, 1
+
 /* A local label is a branch target, not a symbol.  GNU as keeps the
    .L prefix out of the object symbol table entirely, so nm never shows
    these and neither may the reader. */

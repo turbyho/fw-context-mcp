@@ -17,7 +17,7 @@ defined = ["after_a_comment_block", "after_a_line_comment", "after_the_long_bloc
 [directives_basic]
 description = 'Every directive that names a symbol, with no macro facility involved.'
 complete = true
-defined = ["a_data_symbol", "alias_via_equ", "alias_via_set", "alias_via_thumb_set", "declared_after", "has$dollar", "has.period", "plain_local_label", "spelled_global", "spelled_globl", "uses_local_labels", "weak_handler"]
+defined = ["a_computed_constant", "a_data_symbol", "a_hex_constant", "a_numeric_constant", "alias_via_equ", "alias_via_set", "alias_via_thumb_set", "an_exported_constant", "declared_after", "has$dollar", "has.period", "plain_local_label", "spelled_global", "spelled_globl", "uses_local_labels", "weak_handler"]
 
 [macro_args]
 description = 'Macro argument defaults, :req, :vararg, keyword calls and quoting.'
