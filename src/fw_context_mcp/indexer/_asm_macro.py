@@ -61,6 +61,20 @@ _EXITM = re.compile(r"^\s*\.exitm\b", re.IGNORECASE)
 _PURGEM = re.compile(r"^\s*\.purgem\s+([A-Za-z_.$][\w.$]*)", re.IGNORECASE)
 _INVOKE = re.compile(r"^\s*([A-Za-z_.$][\w.$]*)\s*(.*)$")
 
+# Alternate macro mode changes the rules this file implements: arguments
+# may be delimited by `'…'` or `<…>`, `!` escapes any single character,
+# `%expr` substitutes the value of an expression, `&` separates like
+# `\()`, keyword arguments stop working, and `LOCAL` mints a unique name
+# per expansion.
+#
+# Applying the ordinary rules inside it does not merely miss symbols, it
+# INVENTS them: measured, a `LOCAL scratch` body made the expander report
+# `scratch`, which is in no object file because the assembler renames it
+# on every expansion, while the real symbol behind `<bracket_delimited>`
+# went missing.  So an invocation in this mode is refused instead.
+_ALTMACRO = re.compile(r"^\s*\.altmacro\b", re.IGNORECASE)
+_NOALTMACRO = re.compile(r"^\s*\.noaltmacro\b", re.IGNORECASE)
+
 # Every conditional the manual lists, plus the ARM spellings.  A body
 # holding one is refused: which branch it takes is an expression, and
 # this does not evaluate expressions.
@@ -349,8 +363,15 @@ def expand_stream(
     """
     expander = _Expander(report)
     collecting: Macro | None = None
+    alternate = False
 
     for file, line, statement in statements:
+        if _ALTMACRO.match(statement):
+            alternate = True
+            continue
+        if _NOALTMACRO.match(statement):
+            alternate = False
+            continue
         if collecting is not None:
             if _END.match(statement):
                 if not collecting.refuse_reason and _has_conditional(collecting.body):
@@ -380,6 +401,9 @@ def expand_stream(
         if invocation is not None:
             macro = expander.macros.get(invocation.group(1))
             if macro is not None:
+                if alternate:
+                    report.refused["alternate macro mode"] += 1
+                    continue
                 for produced in expander.expand(macro, invocation.group(2), depth=1):
                     yield file, line, produced
                 continue

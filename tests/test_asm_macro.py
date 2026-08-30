@@ -351,3 +351,56 @@ class TestVarargSlicing:
         bound = bind(self._macro("first, rest:vararg"), ["only"])
 
         assert bound == {"first": "only", "rest": ""}
+
+
+class TestAlternateMacroMode:
+    """`.altmacro` changes the rules, so an invocation in it is refused.
+
+    The mode adds `'…'` and `<…>` string delimiters, `!` as a character
+    escape, `%expr`, `&` as a separator, and `LOCAL`; keyword arguments
+    stop working.  Applying the ordinary rules there does not merely miss
+    symbols, it INVENTS them: measured against arm-none-eabi-as, a
+    `LOCAL scratch` body made the expander report `scratch`, a name the
+    assembler renames on every expansion so it is in no object file,
+    while the real symbol behind `<bracket_delimited>` went missing.
+    """
+
+    _ALT = (
+        ".macro named who\n  .globl \\who\n\\who:\n.endm\n"
+        "  named before_the_switch\n"
+        "  .altmacro\n"
+        "  named <in_alternate_mode>\n"
+        "  .noaltmacro\n"
+        "  named after_the_switch\n"
+    )
+
+    def test_an_invocation_in_alternate_mode_is_refused(self):
+        _, report = _run(self._ALT)
+
+        assert report.refused["alternate macro mode"] == 1
+
+    def test_the_refusal_starts_only_at_the_directive(self):
+        produced, _ = _run(self._ALT)
+
+        assert "  .globl before_the_switch" in produced
+
+    def test_noaltmacro_turns_expansion_back_on(self):
+        produced, _ = _run(self._ALT)
+
+        assert "  .globl after_the_switch" in produced
+
+    def test_nothing_from_alternate_mode_reaches_the_output(self):
+        produced, _ = _run(self._ALT)
+
+        assert not any("alternate_mode" in stmt for stmt in produced), produced
+
+    def test_a_local_name_is_never_reported(self):
+        """LOCAL is the invention that made this refusal necessary."""
+        produced, report = _run(
+            "  .altmacro\n"
+            ".macro with_local\n  LOCAL scratch\nscratch:\n.endm\n"
+            "  with_local\n"
+        )
+
+        assert produced == []
+        assert report.refused["alternate macro mode"] == 1
