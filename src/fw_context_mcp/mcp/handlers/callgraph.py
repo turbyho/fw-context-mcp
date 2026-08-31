@@ -1424,10 +1424,31 @@ def find_hotspots(
 
 
 
+def _slots_within_limit(rows: list[dict], limit: int) -> list[dict]:
+    """Cut *rows* to *limit*, and say so whenever anything was cut.
+
+    A generated table on its own can be longer than the default: 290
+    entries plus the assembly exceptions measured 301 rows.  A silent cut
+    would let a part of a table read as a whole one, and a reader counting
+    serviced interrupts would be wrong with no way to notice.  The notice
+    is a trailing dict, which is how this tool already reports ``info``
+    and ``error``.
+    """
+    if len(rows) <= limit:
+        return rows
+    return [
+        *rows[:limit],
+        {"truncated": (
+            f"{len(rows) - limit} of {len(rows)} slots are not shown. "
+            f"Raise limit (max 1000), or narrow with unhandled_only."
+        )},
+    ]
+
+
 def get_vector_table(
     project_root: Annotated[str | None, Field(description="Project root. Auto-detected if omitted.")] = None,
     unhandled_only: Annotated[bool, Field(description="Return only the slots that reach the default handler.")] = False,
-    limit: Annotated[int, Field(description="Maximum slots (default 300).")] = 300,
+    limit: Annotated[int, Field(description="Maximum slots (default 400).")] = 400,
     variant: Annotated[str | None, Field(description="Build variant name (multi-project). Omit to use default_variant or fail-closed. Use '*' for all variants.")] = None,
     image: Annotated[str | None, Field(description="Sysbuild image name within the variant (multi-project). Omit for all images of the variant.")] = None,
 ) -> list[dict]:
@@ -1465,28 +1486,47 @@ def get_vector_table(
       ``file`` and ``line`` name the assignment in it — on zbox-ecb-fw,
       `__StackTop` at `.link_script.ld:148`.  Do not read this row as
       code: there is no function to follow.
+    * ``"dispatcher"`` — the slot reaches a function that holds more than
+      one slot of this table AND calls through a pointer.  It cannot be
+      servicing one particular interrupt; it decides at run time where to
+      go.  Zephyr fills every external IRQ slot with ``_isr_wrapper``,
+      which reads the interrupt number and jumps through
+      ``_sw_isr_table``.  Follow it: ``get_symbol_context`` on the name,
+      then ``find_references`` on the table it uses.  A handler that
+      merely calls one registered callback is NOT this — it holds a
+      single slot and keeps ``"c"``.
 
     A ``"c"`` row with ``overridden`` is the CMSIS pattern: the startup
     file defines each handler weakly, the project defines the same name
     again, and the linker keeps the strong one.
 
-    Only tables written as address words are read — ``.word`` and
-    ``.long`` in a vector section, which is what a CMSIS startup file
-    writes.  Two limits follow, and both give fewer slots, never wrong
-    ones:
+    **Two sources are read**, and ``source`` says which one a row came
+    from:
 
-    * **Zephyr gives the exceptions only.**  Its ``vector_table.S`` holds
-      slots 0 to 15, and ``gen_isr_tables.py`` writes the table of
-      external interrupts into C.  Measured on an nRF54L application:
-      11 slots from the assembly.
-    * **Some architectures write no address table.**  arm64, Xtensa and
-      MIPS build theirs from branch instructions.  A RISC-V target has no
-      table at all: ``mtvec`` holds one trap handler, and software reads
-      the cause.  Measured on the RISC-V image of the same project: 27
-      assembly symbols and 0 slots.
+    * ``"assembly"`` — a table of address words, ``.word`` or ``.long``
+      in a vector section, which is what a CMSIS startup file writes.
+    * ``"c"`` — an array whose elements are addresses of functions, which
+      is what a build that generates its table produces.  Zephyr writes
+      its external interrupts this way, with ``gen_isr_tables.py``.  These
+      rows also carry ``table_name``, the array the slot belongs to.
 
-    For an interrupt this tool cannot show, ``find_references`` on the
-    handler name still gives every reference the index holds.
+    Recognition is by shape, never by name, so any array of function
+    addresses is reported and the row names its table.  A table of
+    interrupt handlers and a table of state machine steps are the same
+    construct, and ``table_name`` is how they are told apart.
+
+    **Slot numbers are not joined across tables.**  Each slot is the index
+    inside its own table, so two tables both start at 0 — read ``slot``
+    together with ``table_name`` and ``source``.  They are not renumbered
+    into one run because the index does not hold the length of the
+    assembly table, only its occupied slots, and an offset derived from
+    that would be silently wrong for every entry of a 290-entry table.
+
+    What is still not covered: an architecture that builds its table from
+    branch instructions (arm64, Xtensa, MIPS) writes no table of
+    addresses in either form.  For an interrupt this tool cannot show,
+    ``find_references`` on the handler name still gives every reference
+    the index holds.
 
     Read-only. No side effects. Requires an index of the assembly
     (``fw-context index``).
@@ -1494,20 +1534,24 @@ def get_vector_table(
     Args:
         project_root: Project root. Auto-detected if omitted.
         unhandled_only: When True, return only the ``"unhandled"`` slots.
-        limit: Maximum slots (default 300, max 1000).
+        limit: Maximum slots (default 400, max 1000).
         variant: Build variant (multi-project). Omit for the default
             variant, ``"*"`` for all.
         image: Sysbuild image in the variant. Omit for all images.
 
     Returns:
-        list of dicts sorted by slot, each with: slot (int), name, file,
-        line, status (``"c"``, ``"assembly"``, ``"unhandled"`` or
-        ``"linker"``), table_file and table_line (where the slot is
-        written).  A ``"c"`` row can also hold overridden, a dict with
+        list of dicts sorted by source, then table, then slot.  Each holds:
+        slot (int), name, file, line, source (``"assembly"`` or ``"c"``),
+        status (``"c"``, ``"assembly"``, ``"unhandled"``, ``"linker"`` or
+        ``"dispatcher"``), and table_file and table_line (where the slot is
+        written).  A ``"c"`` source row also holds table_name and
+        table_usr.  A ``"c"`` status row can hold overridden, a dict with
         file and line.
 
         Never empty: one dict with ``error`` (no index) or ``info`` (no
-        vector table in this build).  Check both keys first.
+        vector table in this build).  Check both keys first.  When more
+        slots exist than ``limit``, the last dict holds ``truncated``
+        saying how many are not shown.
     """
     limit = max(0, min(limit, 1000))
     db, err = _refs_guard(project_root, variant=variant, image=image)
@@ -1524,14 +1568,14 @@ def get_vector_table(
         )
         if not rows:
             return [{"info": (
-                "No vector table in this build. The assembly holds no table "
-                "of address words, or the build has no assembly at all. A "
-                "RISC-V target has no such table: mtvec holds one trap "
-                "handler and software reads the cause. arm64, Xtensa and "
-                "MIPS build theirs from branch instructions, which this "
-                "tool does not read. Use find_references on a handler name "
-                "instead."
+                "No vector table in this build. Neither source found one: "
+                "the assembly holds no table of address words, and no array "
+                "of function addresses was recognised. arm64, Xtensa and "
+                "MIPS build their tables from branch instructions, which "
+                "this tool does not read. An index written before slots "
+                "were recorded also answers this way — reindex to read the "
+                "C source. Use find_references on a handler name instead."
             )}]
-        return rows[:limit]
+        return _slots_within_limit(rows, limit)
 
     return db.execute_scoped(_query)

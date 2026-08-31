@@ -938,6 +938,25 @@ def find_hotspots(
     return [dict(r) for r in rows]
 
 
+def _callers_that_call_through_a_pointer(
+    conn: sqlite3.Connection,
+    config_hash: str,
+) -> set[str]:
+    """Return the USR of every function that holds an indirect call site.
+
+    Read in one query and answered from memory afterwards, because the
+    question is asked once for each slot and a generated table has hundreds.
+    Measured on a Zephyr index: 148 functions for one build, so the set is
+    small enough to hold.
+    """
+    rows = conn.execute(
+        """SELECT DISTINCT from_usr FROM indirect_call_sites
+           WHERE config_hash = ? AND from_usr IS NOT NULL""",
+        (config_hash,),
+    ).fetchall()
+    return {str(row[0]) for row in rows}
+
+
 def get_vector_table(
     conn: sqlite3.Connection,
     config_hash: str,
@@ -947,8 +966,26 @@ def get_vector_table(
 
     A slot is a position in the table, and the hardware reaches it
     directly.  Nothing calls the handler, so the table is the only edge a
-    reader has, and the indexer writes one ``refs`` row for each slot with
-    ``ref_kind='vector'`` and ``slot_index`` set.
+    reader has.
+
+    Two sources hold slots, and ``source`` says which one a row came from:
+
+    * ``"assembly"`` — a table written as address words.  The indexer
+      writes one ``refs`` row for each with ``ref_kind='vector'``.
+    * ``"c"`` — an array whose elements are function addresses, which is
+      what a build that generates its table in C produces.  See
+      ``get_function_address_arrays``.  These rows also carry
+      ``table_name`` and ``table_usr``, because the array is a symbol.
+
+    **Slots are NOT renumbered across sources.**  Each row holds the index
+    inside its own table, so two tables both start at zero and the reader
+    must read ``table_name`` together with ``slot``.  Joining them into one
+    run of numbers would need to know where the second table starts, and
+    that is not in the index: the assembly table of a Zephyr ARM build
+    reports slots 1 to 15 with holes, so the count of rows is not the
+    length of the table.  A number derived from it would be silently wrong
+    for every entry of a 290-entry table on a build that leaves its last
+    exception slot unused.
 
     Each row gets a ``status`` from where its target is defined:
 
@@ -956,6 +993,13 @@ def get_vector_table(
       this interrupt.
     * ``"assembly"`` — the target is a strong assembly definition.
       Assembly services this interrupt.
+    * ``"dispatcher"`` — the target holds more than one slot of this table
+      AND calls through a pointer.  It cannot be servicing one particular
+      interrupt, and it decides at run time where to go, so a reader must
+      follow it further instead of stopping here.  Both conditions are
+      needed: ``z_irq_spurious`` fills 43 slots and calls nothing, and
+      ``POWER_CLOCK_IRQHandler`` holds one slot and calls 6 registered
+      callbacks.  Neither dispatches.
     * ``"unhandled"`` — the target is an alias of another symbol, and
       nothing overrode it.  A CMSIS startup file writes each unserviced
       interrupt as an alias of ``Default_Handler``, which is an infinite
@@ -983,10 +1027,11 @@ def get_vector_table(
         unhandled_only: When True, return only the ``"unhandled"`` rows.
 
     Returns:
-        A list of dicts sorted by slot.  Each dict has: slot, name, file,
-        line, status, and table_file and table_line for the position in
-        the table itself.  A ``"c"`` row can also have overridden, a dict
-        with file and line.
+        A list of dicts sorted by source, then table, then slot.  Each dict
+        has: slot, name, file, line, status, source, and table_file and
+        table_line for the position in the table itself.  A row from the C
+        source also has table_name and table_usr.  A ``"c"`` row can also
+        have overridden, a dict with file and line.
     """
     rows = conn.execute(
         """SELECT r.slot_index AS slot,
@@ -1006,13 +1051,42 @@ def get_vector_table(
         (config_hash,),
     ).fetchall()
 
+    # A slot of an array in C is the same fact as a slot of an address word
+    # in assembly, so both sources go through one status ladder.
+    slots: list[tuple[dict, str]] = [
+        (dict(row) | {"source": "assembly"}, str(row["table_file"]))
+        for row in rows
+    ]
+    slots += [
+        (row | {"source": "c"}, str(row["table_usr"]))
+        for row in get_function_address_arrays(conn, config_hash)
+    ]
+
+    # A target that holds more than one slot of one table cannot be serving
+    # a particular interrupt — it is the entry for every one of them — and a
+    # target that calls through a pointer decides at run time where to go.
+    # Both together are a dispatcher.  Neither alone is enough, and this was
+    # measured on two projects: `_isr_wrapper` fills 48 slots and calls
+    # through a pointer, while `z_irq_spurious` fills 43 slots of
+    # `_sw_isr_table` and calls nothing, and `POWER_CLOCK_IRQHandler` holds
+    # one slot but calls 6 registered callbacks.  Only the first dispatches.
+    filled: dict[tuple[str, str], int] = {}
+    for entry, table_key in slots:
+        filled[(table_key, str(entry["usr"]))] = (
+            filled.get((table_key, str(entry["usr"])), 0) + 1
+        )
+    through_pointer = _callers_that_call_through_a_pointer(conn, config_hash)
+
     out: list[dict] = []
-    for row in rows:
-        entry = dict(row)
+    for entry, table_key in slots:
         entry_usr = str(entry.pop("usr"))
         from_assembly = entry_usr.startswith("asm:")
         weak = bool(entry.pop("is_weak"))
         kind = entry.pop("kind")
+        dispatches = (
+            filled[(table_key, entry_usr)] > 1
+            and entry_usr in through_pointer
+        )
 
         # `linker` covers both shapes of the same fact: the slot reaches a
         # name the linker script gives an address to.
@@ -1031,13 +1105,18 @@ def get_vector_table(
         if kind == "undefined" or entry_usr.startswith("ld:"):
             entry["status"] = "linker"
         elif not from_assembly:
-            entry["status"] = "c"
+            entry["status"] = "dispatcher" if dispatches else "c"
         else:
             # An alias edge, not weakness, says the target is only
             # another name for something else.  The startup declares
             # Reset_Handler weak WITH a body and NMI_Handler weak with
             # nothing but an alias, so weakness would report the reset
             # vector as unserviced.
+            #
+            # This is asked before `dispatcher` on purpose.  A CMSIS
+            # `Default_Handler` also fills many slots, and calling it a
+            # dispatcher would hide the thing a reader most needs to know:
+            # nothing services that interrupt.
             reaches = conn.execute(
                 """SELECT t.name, t.file_path AS file, t.line FROM refs r
                    JOIN symbols t ON t.usr = r.to_usr
@@ -1050,6 +1129,10 @@ def get_vector_table(
             if reaches is not None:
                 entry["status"] = "unhandled"
                 entry["aliases"] = dict(reaches)
+            elif dispatches:
+                entry["status"] = "dispatcher"
+            elif not from_assembly:
+                entry["status"] = "c"
             else:
                 entry["status"] = "assembly"
         del weak
@@ -1070,6 +1153,12 @@ def get_vector_table(
         if unhandled_only and entry["status"] != "unhandled":
             continue
         out.append(entry)
+
+    # Slots are numbered inside their own table, so the table has to lead
+    # the order — two tables both start at zero.
+    out.sort(key=lambda e: (
+        e["source"], str(e.get("table_name") or ""), e["table_file"], e["slot"],
+    ))
     return out
 
 
