@@ -226,6 +226,22 @@ class ManualBuildSystem:
 
     # ── Build dir patterns ──
 
+    def get_linker_scripts(
+        self,
+        project_root: Path,
+        *,
+        compile_commands: Path | None = None,
+        variant: str = "",
+        units: list | None = None,
+    ) -> list[Path]:
+        """Return nothing: the manual backend never links.
+
+        The user gives source directories and flags, and fw-context runs a
+        syntax-only compilation of each file.  There is no link step and
+        thus no linker script in this configuration.
+        """
+        return []
+
     def get_build_dir_patterns(self, project_root: Path) -> list[str]:
         """Return build-output directory patterns for staleness filtering."""
         return []

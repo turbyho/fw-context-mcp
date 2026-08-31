@@ -122,6 +122,23 @@ class ArduinoBuildSystem:
 
     # ── Build dir patterns ──
 
+    def get_linker_scripts(
+        self,
+        project_root: Path,
+        *,
+        compile_commands: Path | None = None,
+        variant: str = "",
+        units: list | None = None,
+    ) -> list[Path]:
+        """Return nothing: the Arduino build records no link command.
+
+        arduino-cli compiles through a temporary build directory and keeps
+        no artifact that names the script of the core it linked.  No
+        Arduino project is available to measure, thus this backend answers
+        with nothing rather than with a path from a pattern.
+        """
+        return []
+
     def get_build_dir_patterns(self, project_root: Path) -> list[str]:
         """Return build-output directory patterns for staleness filtering."""
         return ["build/"]

@@ -141,6 +141,23 @@ class MakefileBuildSystem:
 
     # ── Build dir patterns ──
 
+    def get_linker_scripts(
+        self,
+        project_root: Path,
+        *,
+        compile_commands: Path | None = None,
+        variant: str = "",
+        units: list | None = None,
+    ) -> list[Path]:
+        """Return nothing: a makefile can name the script anywhere.
+
+        The `-T` flag can be in any variable of any included makefile, and
+        reading it means running `make` and reading the link line.  The
+        backend compiles with `compiledb` or a dry run, which never links,
+        so no link command exists to read.
+        """
+        return []
+
     def get_build_dir_patterns(self, project_root: Path) -> list[str]:
         """Return build-output directory patterns for staleness filtering."""
         return ["build/"]

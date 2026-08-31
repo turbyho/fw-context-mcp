@@ -143,6 +143,48 @@ class BuildSystem(Protocol):
         """
         return []
 
+    def get_linker_scripts(
+        self,
+        project_root: Path,
+        *,
+        compile_commands: Path | None = None,
+        variant: str = "",
+        units: list | None = None,
+    ) -> list[Path]:
+        """Return the linker scripts of this build, or an empty list.
+
+        The linker script defines symbols that no translation unit defines —
+        the initial stack pointer of a vector table, the boundaries of
+        `.data` and `.bss` — and it holds the memory map.  It is an INPUT to
+        the linker, thus `compile_commands.json` never names it, and each
+        build system keeps it somewhere else.
+
+        Answer with a path only when the BUILD names it.  A path built from
+        a pattern that looks right is a guess, and a wrong script puts a
+        wrong memory map in front of a user who cannot tell.  An empty list
+        is the correct answer for a build system that records nothing, and
+        `builders._linker` holds the mechanisms that more than one backend
+        shares.
+
+        The return type is a list because one build can pass several
+        scripts: ESP-IDF splits its script into about ten files, and Zephyr
+        passes a final script and a pre-pass script.
+
+        *compile_commands* is this build's compile_commands.json, whose
+        directory is the build directory for a CMake backend.  *variant*
+        names the build variant, which a backend needs when it keeps one
+        output directory per variant.  *units* are this build's translation
+        units, which a backend reads when the compiler flags name the
+        output tree — mbed-tools writes one tree per toolchain and profile,
+        and the flags say which one this build used.
+
+        Ask through ``builders.linker_scripts``, which treats a missing
+        method as "no script".  The concrete classes implement this
+        Protocol structurally and not by inheritance, thus a default here
+        would never reach them.
+        """
+        return []
+
     # ── Environment auto-detection ──
 
     @classmethod

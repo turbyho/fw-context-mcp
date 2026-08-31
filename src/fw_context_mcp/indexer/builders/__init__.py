@@ -64,6 +64,42 @@ def background_build_safe(builder: BuildSystem | None, cfg) -> bool:
         return False
 
 
+def linker_scripts(
+    builder: BuildSystem | None,
+    project_root: Path,
+    *,
+    compile_commands: Path | None = None,
+    variant: str = "",
+    units: list | None = None,
+) -> list[Path]:
+    """Return the linker scripts of *builder*, or an empty list.
+
+    A backend that does not implement ``get_linker_scripts`` answers with
+    nothing, which is correct: the concrete classes implement the
+    ``BuildSystem`` protocol structurally and not by inheritance, thus a
+    default on the protocol never reaches them.
+
+    A backend that raises answers with nothing too.  A missing memory map
+    must not stop an index run, and a partial index is better than none.
+    """
+    if builder is None:
+        return []
+    probe = getattr(builder, "get_linker_scripts", None)
+    if probe is None:
+        return []
+    try:
+        found = probe(
+            project_root,
+            compile_commands=compile_commands,
+            variant=variant,
+            units=units,
+        )
+    except (AttributeError, TypeError, ValueError, RuntimeError, OSError):
+        log.debug("get_linker_scripts failed for %r", builder, exc_info=True)
+        return []
+    return [Path(item) for item in found or []]
+
+
 class BuildSystemRegistry:
     """Holds registered build systems and delegates detection to them.
 

@@ -192,6 +192,32 @@ class PlatformIOBuildSystem:
 
     # ── Build dir patterns ──
 
+    def get_linker_scripts(
+        self,
+        project_root: Path,
+        *,
+        compile_commands: Path | None = None,
+        variant: str = "",
+        units: list | None = None,
+    ) -> list[Path]:
+        """Return nothing: PlatformIO records no reachable link command.
+
+        SCons runs the link and writes no ninja file, no `link.txt`, and no
+        response file that the index can read.  The map file does not name
+        the script either: measured on FM, `firmware.map` holds the
+        resolved `Memory Configuration` and the assignments, but never the
+        file name of the script.
+
+        Measured on FM (STM32, `ldscript.ld` in the framework variant) and
+        on HA_Boiler (ESP32): neither names its script anywhere the index
+        can find.  A search of the include directories would find a
+        candidate, and a candidate is a guess.
+
+        The map file is a possible source of the memory map by itself, and
+        `plans/vector_normalization.md` keeps that as separate work.
+        """
+        return []
+
     def get_build_dir_patterns(self, project_root: Path) -> list[str]:
         """Return the directory PlatformIO writes its build output into.
 

@@ -19,7 +19,7 @@ from fw_context_mcp.utils import (
     run_build_command,
 )
 
-from . import registry
+from . import _linker, registry
 from .protocol import BuildIssue
 
 if TYPE_CHECKING:
@@ -184,6 +184,12 @@ class SdkChoice:
         """One line for the init picker."""
         state = "" if self.usable else "  (incomplete)"
         return f"{self.label} {self.version}  {self.path}{state}"
+
+
+# The script of the real link.  Zephyr links twice, and the pre-pass script
+# carries a suffix — `linker_zephyr_pre0.cmd`.  ninja names the pre-pass
+# first, so `get_linker_scripts` moves this name to the front.
+_FINAL_LINKER_SCRIPT = "linker.cmd"
 
 
 class ZephyrBuildSystem:
@@ -429,6 +435,36 @@ class ZephyrBuildSystem:
         return True
 
     # ── Build dir patterns ──
+
+    def get_linker_scripts(
+        self,
+        project_root: Path,
+        *,
+        compile_commands: Path | None = None,
+        variant: str = "",
+        units: list | None = None,
+    ) -> list[Path]:
+        """Return the scripts that this image's ninja file names with `-T`.
+
+        A sysbuild image keeps its own `build.ninja` and its own
+        `compile_commands.json` in one directory, thus the build directory
+        is the parent of *compile_commands*.  Every image has its own memory
+        map: measured on zbox-ecb-fw-v5, `app` starts at flash 372736,
+        `mcuboot` at 110592, and `app_flpr` declares no flash region at all.
+
+        Zephyr links twice and names two scripts, `zephyr/linker.cmd` and
+        `zephyr/linker_zephyr_pre0.cmd`.  Both come back, and the FINAL one
+        goes first.  Measured on three images, the two hold the same symbols
+        on the same lines and the same regions, thus the order changes no
+        value — but the caller keeps the first file it reads, and
+        `get_source` should show the script of the real link and not the
+        pre-pass.  The ninja file names the pre-pass first, so the order
+        needs this correction.
+        """
+        if compile_commands is None:
+            return []
+        found = _linker.from_ninja(compile_commands.parent)
+        return sorted(found, key=lambda path: path.name != _FINAL_LINKER_SCRIPT)
 
     def get_build_dir_patterns(self, project_root: Path) -> list[str]:
         """Return build-output directory patterns for staleness filtering."""

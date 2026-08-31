@@ -16,7 +16,7 @@ from fw_context_mcp.utils import (
     run_build_command,
 )
 
-from . import registry
+from . import _linker, registry
 from .protocol import BuildIssue
 
 if TYPE_CHECKING:
@@ -214,6 +214,24 @@ class ESPIDFBuildSystem:
         return True
 
     # ── Build dir patterns ──
+
+    def get_linker_scripts(
+        self,
+        project_root: Path,
+        *,
+        compile_commands: Path | None = None,
+        variant: str = "",
+        units: list | None = None,
+    ) -> list[Path]:
+        """Return the scripts that `build/build.ninja` names with `-T`.
+
+        ESP-IDF does not use one script.  It passes about ten — the ROM
+        symbol files of the chip, `memory.ld`, and `sections.ld` — so the
+        caller reads them all and each one adds what it holds.
+        """
+        if compile_commands is None:
+            return []
+        return _linker.from_ninja(compile_commands.parent)
 
     def get_build_dir_patterns(self, project_root: Path) -> list[str]:
         """Return build-output directory patterns for staleness filtering."""

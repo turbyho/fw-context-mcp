@@ -12,7 +12,7 @@ from typing import TYPE_CHECKING
 
 from fw_context_mcp.utils import cc_output_path, resolve_build_dir, run_build_command
 
-from . import registry
+from . import _linker, registry
 from .protocol import BuildIssue
 
 if TYPE_CHECKING:
@@ -104,6 +104,26 @@ class GenericCMakeBuildSystem:
         return True
 
     # ── Build dir patterns ──
+
+    def get_linker_scripts(
+        self,
+        project_root: Path,
+        *,
+        compile_commands: Path | None = None,
+        variant: str = "",
+        units: list | None = None,
+    ) -> list[Path]:
+        """Return the scripts that the ninja file names with `-T`.
+
+        A CMake project with the ninja generator records the whole link
+        command in `build.ninja`, thus the flag is authoritative here as
+        well.  A project built with the Makefile generator writes no ninja
+        file and gets an empty list — the answer is nothing rather than a
+        path built from a pattern.
+        """
+        if compile_commands is None:
+            return []
+        return _linker.from_ninja(compile_commands.parent)
 
     def get_build_dir_patterns(self, project_root: Path) -> list[str]:
         """Return build-output directory patterns for staleness filtering."""
