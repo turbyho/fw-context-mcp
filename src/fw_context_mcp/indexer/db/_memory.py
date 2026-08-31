@@ -21,6 +21,7 @@ import sqlite3
 
 __all__ = [
     "get_entry_point",
+    "get_entry_points_by_config",
     "get_memory_regions",
     "get_memory_regions_by_config",
     "replace_memory_regions",
@@ -93,13 +94,23 @@ def get_memory_regions(
 
     File order and not alphabetical: a linker script lists the regions of a
     target in the order a reader expects them, usually flash before RAM.
+
+    An index written before this feature holds no such table, and neither
+    read path of the MCP server migrates one: `_quick_open_readonly` skips
+    the schema block by design, and `SyncQueryExecutor` connects with plain
+    sqlite3.  So a missing table answers "no region recorded" rather than
+    raising — the caller reports an empty map, which is already the answer
+    for a build system that records no linker script.
     """
-    rows = conn.execute(
-        "SELECT name, attributes, origin, length, origin_value, length_value, "
-        "file_path, line FROM memory_regions WHERE config_hash = ? "
-        "ORDER BY line, name",
-        (config_hash,),
-    ).fetchall()
+    try:
+        rows = conn.execute(
+            "SELECT name, attributes, origin, length, origin_value, "
+            "length_value, file_path, line FROM memory_regions "
+            "WHERE config_hash = ? ORDER BY line, name",
+            (config_hash,),
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return []
     return [
         {
             "name": row["name"],
@@ -133,13 +144,18 @@ def get_memory_regions_by_config(
     for start in range(0, len(config_hashes), 500):
         chunk = config_hashes[start:start + 500]
         marks = ",".join("?" * len(chunk))
-        rows = conn.execute(
-            f"SELECT config_hash, name, attributes, origin, length, "  # noqa: S608
-            f"origin_value, length_value, file_path, line "
-            f"FROM memory_regions WHERE config_hash IN ({marks}) "
-            f"ORDER BY config_hash, line, name",
-            chunk,
-        )
+        try:
+            rows = conn.execute(
+                f"SELECT config_hash, name, attributes, origin, length, "  # noqa: S608
+                f"origin_value, length_value, file_path, line "
+                f"FROM memory_regions WHERE config_hash IN ({marks}) "
+                f"ORDER BY config_hash, line, name",
+                chunk,
+            ).fetchall()
+        except sqlite3.OperationalError:
+            # No table: an index from before this feature.  See
+            # `get_memory_regions`.
+            return {}
         for row in rows:
             grouped.setdefault(row["config_hash"], []).append({
                 "name": row["name"],
@@ -169,9 +185,48 @@ def set_entry_point(
 
 
 def get_entry_point(conn: sqlite3.Connection, config_hash: str) -> str:
-    """Return the entry point of *config_hash*, or an empty string."""
-    row = conn.execute(
-        "SELECT entry_point FROM build_configs WHERE config_hash = ?",
-        (config_hash,),
-    ).fetchone()
+    """Return the entry point of *config_hash*, or an empty string.
+
+    An index written before this feature holds no such column, and neither
+    read path of the MCP server migrates one — see `get_memory_regions`.
+    A missing column answers "not recorded".
+    """
+    try:
+        row = conn.execute(
+            "SELECT entry_point FROM build_configs WHERE config_hash = ?",
+            (config_hash,),
+        ).fetchone()
+    except sqlite3.OperationalError:
+        return ""
     return str(row["entry_point"]) if row is not None else ""
+
+
+def get_entry_points_by_config(
+    conn: sqlite3.Connection, config_hashes: list[str]
+) -> dict[str, str]:
+    """Return the entry point of every config in *config_hashes*.
+
+    One query rather than one per config, for the same reason as
+    `get_memory_regions_by_config`.  A config with no entry point is absent
+    from the result, thus the caller uses ``result.get(hash, "")``.
+
+    A missing column answers with nothing — see `get_entry_point`.
+    """
+    if not config_hashes:
+        return {}
+    found: dict[str, str] = {}
+    for start in range(0, len(config_hashes), 500):
+        chunk = config_hashes[start:start + 500]
+        marks = ",".join("?" * len(chunk))
+        try:
+            rows = conn.execute(
+                f"SELECT config_hash, entry_point FROM build_configs "  # noqa: S608
+                f"WHERE config_hash IN ({marks})",
+                chunk,
+            ).fetchall()
+        except sqlite3.OperationalError:
+            return {}
+        for row in rows:
+            if row["entry_point"]:
+                found[row["config_hash"]] = str(row["entry_point"])
+    return found

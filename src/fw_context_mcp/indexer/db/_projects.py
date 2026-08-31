@@ -402,7 +402,7 @@ def get_all_builds_for_project(conn: sqlite3.Connection, project_id: str) -> lis
         """SELECT b.config_hash, b.created_at, b.first_indexed_at,
                   b.compile_commands_path, b.embedding_dim,
                   b.manifest_verification, b.description,
-                  b.variant, b.image, b.board, b.entry_point,
+                  b.variant, b.image, b.board,
                   COALESCE(s.sym_count, 0) AS symbol_count,
                   COALESCE(f.file_count, 0) AS file_count,
                   COALESCE(r.ref_count, 0) AS reference_count

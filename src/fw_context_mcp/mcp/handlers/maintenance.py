@@ -38,6 +38,7 @@ from ...config import load as load_config
 from ...config.settings import Config
 from ...indexer.autobuild import AutobuildState
 from ...indexer.autobuild import state as autobuild_state
+from ...indexer.compile_commands import command_line_defines
 from ...indexer.compile_commands import parse as parse_cc
 from ...indexer.db import (
     CURRENT_SCHEMA_VERSION,
@@ -50,6 +51,7 @@ from ...indexer.db import (
     get_all_projects,
     get_db_schema_version,
     get_entry_point,
+    get_entry_points_by_config,
     get_memory_regions,
     get_memory_regions_by_config,
     make_analysis_summary,
@@ -266,9 +268,14 @@ def list_variants(
         # in the `images` list of get_active_build: that list holds one entry
         # per image NAME, and two variants of zbox-ecb-fw-v5 both carry an
         # image called `app` with different flash addresses.
-        regions_by_config = get_memory_regions_by_config(
-            conn, [b["config_hash"] for b in builds]
-        )
+        hashes = [b["config_hash"] for b in builds]
+        regions_by_config = get_memory_regions_by_config(conn, hashes)
+        # Read separately and not as a column of the query above: this
+        # connection comes from `_quick_open_readonly`, which skips the
+        # schema block by design, so an index written before this feature
+        # holds no such column.  Naming it in a shared SELECT made
+        # get_active_build raise on HA_Boiler.
+        entry_by_config = get_entry_points_by_config(conn, hashes)
     finally:
         conn.close()
 
@@ -283,7 +290,7 @@ def list_variants(
                 "symbol_count": b["symbol_count"],
                 "file_count": b["file_count"],
                 "manifest_verification": b["manifest_verification"],
-                "entry_point": b["entry_point"] or "",
+                "entry_point": entry_by_config.get(b["config_hash"], ""),
                 "memory": regions_by_config.get(b["config_hash"], []),
             }
         )
@@ -419,6 +426,24 @@ def get_active_build(
         ninja file and no link command the index can read, and the map file
         never names the script.  An empty list means "not recorded", never
         "no memory".
+
+        ``defines`` (dict — the `-D` flags of that build) and
+        ``defines_varying`` (int).  ``defines`` holds only the names that
+        EVERY translation unit of the build carries with the same value, so
+        the tool never shows the defines of one file as the defines of the
+        build.  ``defines_varying`` counts the names left out, thus a name
+        absent from ``defines`` is either not defined at all or not defined
+        everywhere — measured on zbox-ecb-fw: 27 names in all 881 units, 59
+        in only some, where the three assembly files get a shorter set.
+
+        This is the configuration the BUILD states, not every macro the
+        preprocessor saw.  The second is three orders of magnitude larger —
+        27800 distinct names on FM — and almost all of it comes from the
+        headers and the compiler.  A Zephyr build keeps its real
+        configuration in ``autoconf.h`` (740 `CONFIG_*` names) and passes
+        few `-D` flags, so ``defines`` says little there and a great deal on
+        an mbed build, where it holds `APPLICATION_ADDR`,
+        `APPLICATION_SIZE`, and `CMSIS_VECTAB_VIRTUAL`.
 
         For a project that is not initialized, the result holds only
         ``status``, ``project_root``, and ``index_message``.  When no index
@@ -802,12 +827,25 @@ def get_active_build(
         if active_hash:
             result["entry_point"] = get_entry_point(conn, active_hash)
             result["memory"] = get_memory_regions(conn, active_hash)
+            # The `-D` flags of the build that `config_hash` names, read
+            # from ITS compile_commands.json rather than from the project's.
+            # Computed here and not stored: the read costs 19 ms on
+            # zbox-ecb-fw with 881 units, measured, so a column would buy
+            # nothing and a stale one would mislead.
+            defines, varying = command_line_defines(
+                Path(result["compile_commands"])
+                if result["compile_commands"] else Path()
+            )
+            result["defines"] = defines
+            result["defines_varying"] = varying
         else:
             # A multi-variant project with no [build] default_variant: the
             # LLM has to pick a variant first, thus there is no one map to
             # report.  Empty rather than a guess at which build is meant.
             result["entry_point"] = ""
             result["memory"] = []
+            result["defines"] = {}
+            result["defines_varying"] = 0
 
         return result
 

@@ -22,7 +22,14 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from fw_context_mcp.indexer.db import open_db, transaction
+from fw_context_mcp.indexer.db import (
+    get_entry_point,
+    get_entry_points_by_config,
+    get_memory_regions,
+    get_memory_regions_by_config,
+    open_db,
+    transaction,
+)
 from fw_context_mcp.indexer.db._schema import (
     _CRITICAL_TABLES,
     CURRENT_SCHEMA_VERSION,
@@ -126,6 +133,107 @@ class TestAnExistingDatabase:
             conn.close()
         assert [r["name"] for r in regions] == ["FLASH"]
         assert regions[0]["length_value"] == 65536
+
+
+class TestTheReadPathToleratesAnOlderIndex:
+    """Neither read path of the MCP server migrates a database.
+
+    `_quick_open_readonly` skips the schema block by design — its docstring
+    says so — and `SyncQueryExecutor` connects with plain sqlite3 and
+    "deliberately differs from open_db".  An index written before this
+    feature therefore holds neither the column nor the table, and a query
+    that requires them raises.
+
+    Measured: HA_Boiler holds user_version 155546819 and no `entry_point`
+    column, and naming that column in a shared SELECT made
+    `get_active_build` raise `no such column: b.entry_point`.
+
+    "Not recorded" is the honest answer there, and it is already the answer
+    for a build system that records no linker script.
+    """
+
+    def _old_index(self, tmp_path: Path):
+        """A connection to a database with neither the column nor the table.
+
+        Opened WITHOUT `open_db` afterwards, the way the read paths do, so
+        nothing heals it behind the test's back.
+        """
+        import sqlite3 as raw
+
+        db_path = tmp_path / "index.db"
+        conn = open_db(db_path)
+        try:
+            # Every column the table really has, minus the new one.  Keeping
+            # the rest matters: `get_all_builds_for_project` needs
+            # `created_at` and the others, and a fixture that dropped them
+            # would fail for a reason an older index never has.
+            kept = [
+                row[1]
+                for row in conn.execute("PRAGMA table_info(build_configs)")
+                if row[1] != "entry_point"
+            ]
+            assert "entry_point" not in kept
+            assert "created_at" in kept, "the fixture must keep the old columns"
+            columns = ", ".join(kept)
+            with transaction(conn):
+                conn.execute("DROP TABLE IF EXISTS memory_regions")
+                # SQLite before 3.35 cannot DROP COLUMN, and rebuilding is
+                # the portable way to reach the shape an older schema had.
+                conn.execute(
+                    f"CREATE TABLE bc_old AS SELECT {columns} "  # noqa: S608
+                    f"FROM build_configs"
+                )
+                conn.execute("DROP TABLE build_configs")
+                conn.execute("ALTER TABLE bc_old RENAME TO build_configs")
+                conn.execute(
+                    "INSERT INTO build_configs (config_hash, project_id) "
+                    "VALUES ('ch', 'pid')"
+                )
+        finally:
+            conn.close()
+        plain = raw.connect(str(db_path))
+        plain.row_factory = raw.Row
+        return plain
+
+    def test_the_regions_of_one_config(self, tmp_path):
+        conn = self._old_index(tmp_path)
+        try:
+            assert get_memory_regions(conn, "ch") == []
+        finally:
+            conn.close()
+
+    def test_the_regions_of_several_configs(self, tmp_path):
+        conn = self._old_index(tmp_path)
+        try:
+            assert get_memory_regions_by_config(conn, ["ch", "other"]) == {}
+        finally:
+            conn.close()
+
+    def test_the_entry_point_of_one_config(self, tmp_path):
+        conn = self._old_index(tmp_path)
+        try:
+            assert get_entry_point(conn, "ch") == ""
+        finally:
+            conn.close()
+
+    def test_the_entry_points_of_several_configs(self, tmp_path):
+        conn = self._old_index(tmp_path)
+        try:
+            assert get_entry_points_by_config(conn, ["ch", "other"]) == {}
+        finally:
+            conn.close()
+
+    def test_the_shared_build_query_needs_no_new_column(self, tmp_path):
+        # `get_all_builds_for_project` runs on both read paths, thus it must
+        # name no column an older index can lack.
+        from fw_context_mcp.indexer.db import get_all_builds_for_project
+
+        conn = self._old_index(tmp_path)
+        try:
+            rows = get_all_builds_for_project(conn, "pid")
+        finally:
+            conn.close()
+        assert len(rows) == 1
 
 
 class TestTheFingerprintDescribesTheSchema:

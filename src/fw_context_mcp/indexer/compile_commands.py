@@ -529,3 +529,100 @@ def parse(path: Path) -> Iterator[CompilationUnit]:
             clang_args=clang_args,
             raw_entry=entry,
         )
+
+
+# ── Command-line defines ───────────────────────────────────────────────────
+
+
+def _defines_of_entry(entry: dict) -> dict[str, str]:
+    """Return the `-D` flags of one compilation database entry.
+
+    Both spellings: `-DNAME=value` and `-D NAME=value`.  A name with no
+    value maps to an empty string, which is what the compiler does — a bare
+    `-DNAME` defines it as `1`, and the index reports the flag as written
+    rather than the value the preprocessor derives.
+    """
+    tokens = entry.get("arguments")
+    if not isinstance(tokens, list):
+        command = entry.get("command")
+        tokens = str(command).split() if command else []
+    found: dict[str, str] = {}
+    expect_value = False
+    for token in tokens:
+        text = str(token)
+        if expect_value:
+            name, _, value = text.partition("=")
+            found[name] = value
+            expect_value = False
+            continue
+        if text == "-D":
+            expect_value = True
+        elif text.startswith("-D") and len(text) > 2:
+            name, _, value = text[2:].partition("=")
+            found[name] = value
+    return found
+
+
+def command_line_defines(cc_path: Path) -> tuple[dict[str, str], int]:
+    """Return the defines EVERY unit shares, and how many names vary.
+
+    The `-D` flags of a build are its configuration.  zbox-ecb-fw passes
+    `APPLICATION_ADDR=0x10200`, `APPLICATION_SIZE=0xefe00`, and
+    `CMSIS_VECTAB_VIRTUAL` — the memory map and the fact that the vector
+    table moves to RAM, stated by the build itself.
+
+    WHY only the shared set: a tool that describes ONE build must not show
+    the defines of one file as the defines of the build.  Measured:
+    zbox-ecb-fw has 881 units, 27 names in every one and 59 in only some —
+    the three `.S` files get a shorter set.  HA_Boiler splits on
+    `ARDUINO_CORE_BUILD`, which 46 of its 114 units carry.  The second
+    return value counts the names left out, so a caller can tell "not
+    defined" from "not defined everywhere".
+
+    WHY this reads the JSON itself instead of calling `parse`: `parse`
+    normalizes every flag for libclang, which costs 6966 ms on zbox-ecb-fw
+    against 19 ms here — measured.  `get_active_build` is the mandatory
+    first call, so seven seconds of flag normalization to read 27 defines
+    would be paid by every session.
+
+    WHY not the `macros` table: that holds every macro the preprocessor
+    saw — 27800 distinct names on FM, 23507 on zbox-ecb-fw.  Three orders
+    of magnitude more, and almost all of it comes from the headers and the
+    compiler rather than from the build.
+
+    Returns an empty dict and 0 when the file is unreadable.  A missing
+    answer is correct there; an invented one is not.
+
+    No log line on that path, and this module keeps no logger on purpose.
+    An unreadable compile_commands.json is not a detail a caller could
+    miss: the whole index is built from it, and `get_active_build` reports
+    that state on its own.
+    """
+    try:
+        entries = json.loads(cc_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, UnicodeDecodeError):
+        return {}, 0
+    if not isinstance(entries, list):
+        return {}, 0
+
+    shared: dict[str, str] | None = None
+    every_name: set[str] = set()
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        one = _defines_of_entry(entry)
+        every_name |= set(one)
+        if shared is None:
+            shared = dict(one)
+        else:
+            # A name survives only with the SAME value everywhere.  Two
+            # units that define one name differently do not agree on it,
+            # and reporting either value would be a guess.
+            shared = {
+                name: value
+                for name, value in shared.items()
+                if name in one and one[name] == value
+            }
+    if shared is None:
+        return {}, 0
+    return shared, len(every_name) - len(shared)

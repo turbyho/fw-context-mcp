@@ -73,6 +73,7 @@ __all__ = [
     "get_direct_derived_batch",
     "get_embeddings",
     "get_entry_point",
+    "get_entry_points_by_config",
     "get_file_hashes",
     "get_file_map",
     "get_file_mtime_indexed",
@@ -186,6 +187,7 @@ from ._llm import (
 from ._locking import WriteLockTimeout, write_lock
 from ._memory import (
     get_entry_point,
+    get_entry_points_by_config,
     get_memory_regions,
     get_memory_regions_by_config,
     replace_memory_regions,
