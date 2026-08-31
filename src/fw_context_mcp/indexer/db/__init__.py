@@ -10,6 +10,7 @@ specialized modules.  The package is split by concern:
 - ``_embeddings`` — vector storage (BLOB and vec0)
 - ``_fts`` — FTS5 rebuild utilities
 - ``_llm`` — LLM analysis storage
+- ``_memory`` — memory map (the MEMORY command of the linker script)
 - ``_locking`` — file-system write lock
 - ``_projects`` — project/build config CRUD
 - ``_schema`` — schema versioning and migration
@@ -71,11 +72,14 @@ __all__ = [
     "get_direct_derived",
     "get_direct_derived_batch",
     "get_embeddings",
+    "get_entry_point",
     "get_file_hashes",
     "get_file_map",
     "get_file_mtime_indexed",
     "get_file_mtimes",
     "get_llm_analysis_for_symbol",
+    "get_memory_regions",
+    "get_memory_regions_by_config",
     "get_overrides_for_method",
     "get_template_instances",
     "get_vec_dim",
@@ -97,9 +101,11 @@ __all__ = [
     "rebuild_fts",
     "rebuild_macros_fts",
     "replace_file_data",
+    "replace_memory_regions",
     "search_similar_hybrid",
     "search_similar_vec",
     "search_symbols",
+    "set_entry_point",
     "split_tokens",
     "transaction",
     "upsert_build_config",
@@ -178,6 +184,13 @@ from ._llm import (
     upsert_llm_analysis_batch,
 )
 from ._locking import WriteLockTimeout, write_lock
+from ._memory import (
+    get_entry_point,
+    get_memory_regions,
+    get_memory_regions_by_config,
+    replace_memory_regions,
+    set_entry_point,
+)
 from ._projects import (
     compute_analysis_coverage,
     count_pending_analysis,

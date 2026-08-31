@@ -182,6 +182,83 @@ def _tus_to_requeue(
     )
 
 
+def _store_linker_scripts(
+    *,
+    conn,
+    config_hash: str,
+    project_root: Path,
+    db_dir: Path,
+    compile_commands: Path,
+    build_system: str | None,
+    variant: str,
+    units: list,
+    vendor_patterns: list[str],
+    project_patterns: list[str],
+):
+    """Read the linker scripts of this build and store what they define.
+
+    Returns a ``linker_script.LinkerResult``, or None when the build names
+    no script.
+
+    **The position of this pass is between the C units and the assembly**,
+    and both neighbours depend on it:
+
+    * AFTER C, so ``store_scripts`` can see a definition the compiled code
+      makes and leave that name alone.  A linker script and a C file can
+      name the same symbol, and the compiled definition is the real one.
+    * BEFORE assembly, so ``asm._declare_referenced_only`` finds the name
+      already in the index and adds no ``kind="undefined"`` row for it.
+      That is what closes slot 0 of a vector table: measured before this,
+      FM held ``_estack`` and zbox held ``__StackTop`` with that kind, one
+      per project.
+
+    *build_system* is the ``[build] system`` config key, which wins over
+    marker detection for the same reason it does for the vendor patterns: a
+    freestanding NCS application reads as a plain CMake project by its
+    markers alone.
+
+    A build that names no script gets a log line and nothing else.  Reading
+    a script the build did not name would be a guess, and a wrong memory
+    map is worse than none — see ``builders._linker``.
+    """
+    from .build import detect_build_system
+    from .builders import linker_scripts, registry
+    from .linker_script import store_scripts
+
+    key = build_system or detect_build_system(project_root)
+    builder_cls = registry.get(key) if key else None
+    scripts = linker_scripts(
+        builder_cls() if builder_cls else None,
+        project_root,
+        compile_commands=compile_commands,
+        variant=variant,
+        units=units,
+    )
+    if not scripts:
+        log.info("linker script: none found for this build")
+        return None
+
+    with write_lock(db_dir, timeout=120.0):
+        with transaction(conn, checkpoint=False):
+            result = store_scripts(
+                conn, config_hash, scripts, project_root,
+                vendor_patterns, project_patterns,
+            )
+    log.info(
+        "linker script: %d file(s) -> %d symbol(s), %d region(s), entry %s%s",
+        result.files, result.symbols, result.regions,
+        result.entry or "(none)",
+        f", {result.skipped_defined} name(s) already defined"
+        if result.skipped_defined else "",
+    )
+    # A refusal nobody can see looks exactly like a script that held nothing
+    # worth indexing.
+    summary = result.report.summary()
+    if summary:
+        log.info("linker script refusals: %s", summary)
+    return result
+
+
 def run(
     compile_commands: Path,
     db_path: Path,
@@ -668,6 +745,21 @@ def run(
                 log.info("[%d/%d] %s: skipped", processed, len(units), fname)
 
 
+    # ── Linker scripts, between the C units and the assembly ──
+    # The position is deliberate, and both neighbours depend on it — see
+    # _store_linker_scripts.
+    linker = _store_linker_scripts(
+        conn=conn,
+        config_hash=config_hash,
+        project_root=project_root,
+        db_dir=db_path.parent,
+        compile_commands=compile_commands,
+        build_system=build_system,
+        variant=variant,
+        units=all_units,
+        vendor_patterns=vendor_patterns,
+        project_patterns=project_patterns_list,
+    )
 
     asm = None
 
@@ -701,8 +793,16 @@ def run(
             log.info("assembly macros: %s", macro_summary)
 
     # ── Post-processing ──
+    # Every path no libclang unit covers travels in one set.  The coverage
+    # purge counts a file it cannot see in the units as missing, and the
+    # assembly pass lost every row it wrote to exactly that purge before
+    # its paths were threaded through.  A linker script is invisible the
+    # same way — it is an input to the linker, not a compilation unit.
+    uncovered_paths = set(asm.paths) if asm is not None else set()
+    if linker is not None:
+        uncovered_paths |= linker.paths
     _run_postprocess(
-        asm_paths=asm.paths if asm is not None else set(),
+        asm_paths=uncovered_paths,
         conn=conn,
         config_hash=config_hash,
         project_root=project_root,

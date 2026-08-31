@@ -199,6 +199,7 @@ def delete_build_data(conn: sqlite3.Connection, config_hash: str) -> None:
     conn.execute("DELETE FROM inheritance WHERE config_hash = ?", (config_hash,))
     conn.execute("DELETE FROM overrides WHERE config_hash = ?", (config_hash,))
     conn.execute("DELETE FROM hotspot_cache WHERE config_hash = ?", (config_hash,))
+    conn.execute("DELETE FROM memory_regions WHERE config_hash = ?", (config_hash,))
     conn.execute("DELETE FROM files WHERE config_hash = ?", (config_hash,))
     conn.execute("DELETE FROM build_configs WHERE config_hash = ?", (config_hash,))
     # vec0 virtual table — not covered by ON DELETE CASCADE.
@@ -401,7 +402,7 @@ def get_all_builds_for_project(conn: sqlite3.Connection, project_id: str) -> lis
         """SELECT b.config_hash, b.created_at, b.first_indexed_at,
                   b.compile_commands_path, b.embedding_dim,
                   b.manifest_verification, b.description,
-                  b.variant, b.image, b.board,
+                  b.variant, b.image, b.board, b.entry_point,
                   COALESCE(s.sym_count, 0) AS symbol_count,
                   COALESCE(f.file_count, 0) AS file_count,
                   COALESCE(r.ref_count, 0) AS reference_count

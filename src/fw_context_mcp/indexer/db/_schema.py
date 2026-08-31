@@ -261,6 +261,12 @@ _MIGRATION_ADD_COLUMNS = [
     # 15 is SysTick and 16+n is external IRQ n, on arm64 it selects an
     # exception class.  The position is a fact of the file.
     "ALTER TABLE refs ADD COLUMN slot_index INTEGER",
+    # The entry point the linker script names with `ENTRY()`.  It belongs to
+    # the build and not to a file, thus a column here rather than a symbol
+    # row: a Cortex-M build says `ENTRY(Reset_Handler)` and a Zephyr build
+    # says `ENTRY("__start")`, and neither fact is a property of any one
+    # translation unit.  Empty when no script of the build names one.
+    "ALTER TABLE build_configs ADD COLUMN entry_point TEXT NOT NULL DEFAULT ''",
     # Schema version bump — DO NOT REMOVE. When adding new migration steps after this
     # column, also add a NEW ALTER TABLE … ADD COLUMN _schema_bump_… line. The hash
     # of _MIGRATION_ADD_COLUMNS drives CURRENT_SCHEMA_VERSION.
@@ -306,7 +312,10 @@ CREATE TABLE IF NOT EXISTS build_configs (
     manifest_verification   TEXT NOT NULL DEFAULT 'none',
     description             TEXT NOT NULL DEFAULT '',
     first_indexed_at        TEXT NOT NULL DEFAULT '',
-    analyze_vendor          INTEGER NOT NULL DEFAULT 0
+    analyze_vendor          INTEGER NOT NULL DEFAULT 0,
+    -- The `ENTRY()` of the linker script of this build, or '' when no
+    -- script names one.  A property of the build, not of a file.
+    entry_point             TEXT NOT NULL DEFAULT ''
 );
 
 -- ── files: source files tracked during indexing ─────────────────────────
@@ -751,6 +760,71 @@ CREATE TABLE IF NOT EXISTS hotspot_cache (
     UNIQUE(config_hash, symbol_id)
 );
 CREATE INDEX IF NOT EXISTS idx_hotspot_cache_config ON hotspot_cache(config_hash);
+
+-- ── memory_regions: the MEMORY command of the linker script ─────────────
+-- One row per region the linker script of this build declares.  The index
+-- has no other source for a memory map: it is not in compile_commands.json
+-- and no translation unit holds it.
+--
+-- Why keyed on config_hash: the map belongs to ONE build, not to a project.
+-- Measured on zbox-ecb-fw-v5, which holds nine configurations in one
+-- database: `app` starts at flash 372736, `mcuboot` at 110592, and
+-- `app_flpr` declares no flash region at all.  A map stored per project
+-- would be wrong for eight of the nine.
+--
+-- Why the raw text AND a number: the script writes an expression, and its
+-- form differs by platform.  An mbed script writes `LENGTH = 0xefe00`, a
+-- Zephyr script writes `LENGTH = ((673792) - 0xe6)`, which mixes decimal
+-- and hexadecimal.  The text is always what the file says; the number is
+-- filled in only when the expression is constant arithmetic, and stays
+-- NULL for an expression that names a symbol such as
+-- `ORIGIN(RAM) + LENGTH(RAM)`.  The index does not evaluate a symbol.
+--
+-- Why no `end` column: origin_value + length_value is the end, and storing
+-- a derived value invites the two to disagree.
+--
+-- Why UNIQUE(config_hash, name): a MEMORY command names each region once.
+--
+-- CRITICAL_TABLE — and this annotation is load-bearing, not decoration.
+-- CURRENT_SCHEMA_VERSION is a HASH of the column set, thus a schema change
+-- can make it SMALLER.  `ensure_schema` compares with `<`: a stored version
+-- ABOVE the current one takes the `elif` branch, which re-stamps the version
+-- and never runs _SCHEMA.  `_ensure_migrated_columns` saves every ADD COLUMN
+-- unconditionally, but a new TABLE has no such net.
+--
+-- Measured: adding this table moved the version from 1739388653 down to
+-- 275729191, so every existing index re-stamped itself and never created
+-- the table.  A full reindex of birdie1-v2-fw-v3 then walked all 449
+-- translation units and died on the last step with "no such table:
+-- memory_regions".  The self-healing block runs on every open and closes
+-- that hole.
+CREATE TABLE IF NOT EXISTS memory_regions (
+    id            INTEGER PRIMARY KEY,
+    config_hash   TEXT    NOT NULL REFERENCES build_configs(config_hash),
+    name          TEXT    NOT NULL,
+    attributes    TEXT    NOT NULL DEFAULT '',
+    origin        TEXT    NOT NULL,
+    length        TEXT    NOT NULL,
+    origin_value  INTEGER,
+    length_value  INTEGER,
+    file_path     TEXT    NOT NULL DEFAULT '',
+    line          INTEGER NOT NULL DEFAULT 0,
+    UNIQUE(config_hash, name)
+);
+-- CRITICAL_TABLE — the extraction stops capturing when the parentheses of
+-- the table close, thus the index needs a marker of its own.  It travels
+-- with the table because a self-healed table without its index answers
+-- correctly and slowly, and the next reader would have no way to tell
+-- which of the two states the database is in.
+--
+-- NOTE for the next editor: never write the two words that open a table
+-- definition inside a comment in this string.  `_parse_expected_columns`
+-- looks for them with a regex, and a comment that holds them makes the
+-- parser read the following statement as a table body.  Measured: this
+-- very comment did it, and the fingerprint then held ONE column for
+-- memory_regions instead of ten — so a later column would not have moved
+-- the schema version at all.
+CREATE INDEX IF NOT EXISTS idx_memory_regions_config ON memory_regions(config_hash);
 """
 
 # ── Self-healing critical-tables block ───────────────────────────────────
