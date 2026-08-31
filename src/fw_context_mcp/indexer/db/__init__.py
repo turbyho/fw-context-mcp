@@ -78,6 +78,7 @@ __all__ = [
     "get_file_map",
     "get_file_mtime_indexed",
     "get_file_mtimes",
+    "get_function_address_arrays",
     "get_llm_analysis_for_symbol",
     "get_memory_regions",
     "get_memory_regions_by_config",
@@ -127,6 +128,7 @@ from ._callgraph import (
     find_callees_recursive,
     find_dead_code,
     find_hotspots,
+    get_function_address_arrays,
     get_vector_table,
 )
 from ._connection import (

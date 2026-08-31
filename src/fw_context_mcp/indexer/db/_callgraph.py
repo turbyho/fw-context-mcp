@@ -1071,3 +1071,94 @@ def get_vector_table(
             continue
         out.append(entry)
     return out
+
+
+def get_function_address_arrays(
+    conn: sqlite3.Connection,
+    config_hash: str,
+) -> list[dict]:
+    """Read every array in C whose elements are addresses of functions.
+
+    This is the second place a vector table can live.  The assembly reader
+    finds a table written as address words; a build that generates its
+    table in C writes the same thing as an array initializer::
+
+        /* build/zephyr/isr_tables.c, generated */
+        const uintptr_t __irq_vector_table _irq_vector_table[290] = {
+            ((uintptr_t)&_isr_wrapper),
+            ((uintptr_t)&_isr_wrapper),
+            ...
+
+    The recognition is the same in both: an array of function addresses,
+    and the index of the element is the number of the slot.  No name is
+    matched and no count is weighed.  A build that puts its table in C is
+    read because the shape is there, not because the reader knows Zephyr.
+
+    The owning array comes from a range join.  A ``refs`` row names the
+    file and the line of an element, and the array is the ``varglobal``
+    whose extent holds that line.  Two arrays at file scope cannot overlap,
+    so the array that answers is unambiguous.  ``end_line`` is measured to
+    cover a whole initializer: ``_irq_vector_table`` in a real index spans
+    lines 10 to 301.
+
+    Every array of function addresses is reported, and each row names the
+    array it came from.  A table of interrupt handlers and a table of state
+    machine steps are the same construct, and the index cannot tell them
+    apart without knowing the platform — which is the thing this reader
+    exists to avoid.  The caller decides what the table means.
+
+    Args:
+        conn: An open index database connection.
+        config_hash: The build configuration to read.
+
+    Returns:
+        A list of dicts sorted by array and then by slot.  Each dict has:
+        slot, name, file, line, kind, is_weak and usr for the target, plus
+        table_name, table_usr, table_file and table_line for the array and
+        the element inside it.  Empty when no array was recognised, which
+        is also what an index written before slots were recorded returns.
+    """
+    rows = conn.execute(
+        """SELECT r.slot_index AS slot,
+                  r.from_file  AS table_file,
+                  r.from_line  AS table_line,
+                  t.name       AS table_name,
+                  t.usr        AS table_usr,
+                  s.name       AS name,
+                  s.file_path  AS file,
+                  s.line       AS line,
+                  s.kind       AS kind,
+                  s.is_weak    AS is_weak,
+                  s.usr        AS usr
+           FROM refs r
+           JOIN symbols s ON s.usr = r.to_usr
+                         AND s.config_hash = r.config_hash
+           JOIN symbols t ON t.config_hash = r.config_hash
+                         AND t.file_path = r.from_file
+                         AND t.kind = 'varglobal'
+                         AND r.from_line BETWEEN t.line
+                                            AND MAX(t.line, t.end_line)
+           WHERE r.config_hash = ? AND r.ref_kind = 'indirect'
+             AND r.slot_index IS NOT NULL
+           ORDER BY t.usr, r.slot_index""",
+        (config_hash,),
+    ).fetchall()
+
+    # The target join answers once — ``symbols`` is UNIQUE on
+    # (config_hash, usr) — so a second row for one element means two arrays
+    # claim the same line.  Only a file that declares both on one line does
+    # that, and then which array owns the element is not knowable from a
+    # line number.  Such an element is dropped: naming the wrong array is
+    # the same class of error as reporting the wrong slot.
+    owners: dict[tuple, set[str]] = {}
+    for row in rows:
+        element = (row["table_file"], row["table_line"], row["usr"])
+        owners.setdefault(element, set()).add(str(row["table_usr"]))
+
+    out: list[dict] = []
+    for row in rows:
+        element = (row["table_file"], row["table_line"], row["usr"])
+        if len(owners[element]) > 1:
+            continue
+        out.append(dict(row))
+    return out
