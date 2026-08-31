@@ -63,17 +63,33 @@ def _plan_auto_build(
     db_path: Path,
     cfg,
     detected_system: str | None,
-) -> tuple[list[str], BuildConfig | None]:
-    """Return ``(sources that need a build, the config to build them with)``.
+) -> tuple[list[str], BuildConfig | None, str]:
+    """Return ``(the keys of this build, its config, a line to log)``.
 
     An empty list means "do not build", and the config is then None.  The
     list is non-empty only when all of these hold:
 
     1. An index exists.  Without one there is nothing to compare against.
-    2. Source files sit on disk that compile_commands.json does not cover.
+    2. Something a build can repair and a reindex cannot.  Two such things,
+       and either is enough:
+
+       * Source files sit on disk that compile_commands.json does not cover.
+         Such a file has no translation unit, so a reindex skips it.
+       * The tree is on a different branch than the index.
+         compile_commands.json is a build artifact of the branch it was
+         generated on and carries that branch's file list AND its compiler
+         flags.  Measured on zbox-ecb-fw, a switch from 4.15.3 to 4.15.1
+         left two generated zcbor sources listed in it and absent from the
+         tree; a reindex reads the same file again.
+
     3. The backend may build in the background — it isolates its output, or
        it compiles nothing.  See ``builders.background_build_safe``.
-    4. No recent automatic build failed for the same files.
+    4. No recent automatic build failed for the same keys.
+
+    The KEYS are what ``autobuild.blocked`` compares, and they differ by
+    trigger: source paths for the first, ``"branch:<name>"`` for the second.
+    The comparison is on the list contents, thus a record for one trigger
+    does not block the other.
 
     Condition 3 is the important one.  The build runs while the user works,
     possibly while an IDE builds the same project, and fw-context cannot
@@ -88,20 +104,21 @@ def _plan_auto_build(
     applies it only when there is something to do.
     """
     if not db_path.exists():
-        return [], None
+        return [], None, ""
 
     from dataclasses import replace
 
     from ..indexer.builders import background_build_safe, registry
+    from ..indexer.git_context import branch_moved_since
     from ..mcp.shared.stale import find_unindexed_sources
 
     system = cfg.build.system or detected_system
     builder_cls = registry.get(system) if system else None
     if builder_cls is None:
-        return [], None
+        return [], None, ""
     candidate = replace(cfg.build, isolated_build_dir=autobuild_dir())
     if not background_build_safe(builder_cls(), candidate):
-        return [], None
+        return [], None, ""
 
     from ..config import derive_project_id
     from ..indexer.db import get_active_config, open_db
@@ -110,19 +127,42 @@ def _plan_auto_build(
     try:
         active = get_active_config(conn, derive_project_id(project_root))
         if not active or not active["compile_commands_path"]:
-            return [], None
+            return [], None, ""
         new_sources = find_unindexed_sources(
             conn,
             active["config_hash"],
             project_root,
             Path(active["compile_commands_path"]),
         )
+        recorded = ""
+        if "description" in active.keys():
+            recorded = str(active["description"] or "")
     finally:
         conn.close()
 
+    # The branch first: it makes compile_commands.json wrong as a whole,
+    # while an uncovered source makes it incomplete.  A build repairs both,
+    # so the more complete reason is the one worth logging.
+    indexed_branch, live_branch = branch_moved_since(recorded, project_root)
+    if indexed_branch:
+        keys = [f"branch:{live_branch}"]
+        if autobuild.blocked(db_path.parent, keys):
+            return [], None, ""
+        return keys, candidate, (
+            f"branch changed from {indexed_branch} to {live_branch} — "
+            f"compile_commands.json belongs to the old branch, "
+            f"running a build into {candidate.isolated_build_dir}"
+        )
+
     if not new_sources or autobuild.blocked(db_path.parent, new_sources):
-        return [], None
-    return new_sources, candidate
+        return [], None, ""
+    listed = ", ".join(new_sources[:3])
+    more = f" and {len(new_sources) - 3} more" if len(new_sources) > 3 else ""
+    return new_sources, candidate, (
+        f"{len(new_sources)} source file(s) are missing from "
+        f"compile_commands.json ({listed}{more}) — running a build into "
+        f"{candidate.isolated_build_dir}"
+    )
 
 
 def _resolve_compile_commands(
@@ -808,7 +848,7 @@ def cmd_index(args: argparse.Namespace) -> int:
     # build without touching the output of the build of the user.
     auto_build_sources: list[str] = []
     if not getattr(args, "build", False):
-        auto_build_sources, auto_build_cfg = _plan_auto_build(
+        auto_build_sources, auto_build_cfg, auto_build_reason = _plan_auto_build(
             project_root, db_path, cfg, detected_system
         )
         # The two always arrive together; the second test is what lets the
@@ -817,15 +857,12 @@ def cmd_index(args: argparse.Namespace) -> int:
             args.build = True
             # The candidate that _plan_auto_build asked the backend about.
             # Applying it here, and nowhere else, keeps every "do not build"
-            # path from leaving an isolated directory behind on cfg.
+            # path from leaving an isolated directory behind on cfg.  It also
+            # carries `isolated_build_dir`, which is what makes `--build`
+            # legal on a `--background` run — see the check in
+            # `_resolve_compile_commands`.
             cfg.build = auto_build_cfg
-            listed = ", ".join(auto_build_sources[:3])
-            more = f" and {len(auto_build_sources) - 3} more" if len(auto_build_sources) > 3 else ""
-            log.info(
-                "%d source file(s) are missing from compile_commands.json (%s%s) — "
-                "running a build into %s",
-                len(auto_build_sources), listed, more, cfg.build.isolated_build_dir,
-            )
+            log.info("%s", auto_build_reason)
 
     # The CLI flag REPLACES the [index] layer.  A variant's own [index] keys
     # are added on top of whichever of the two won — see _layered_paths().

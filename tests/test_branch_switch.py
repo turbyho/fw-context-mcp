@@ -409,154 +409,142 @@ class TestTheToolAsksForABuild:
         assert "run `fw-context index --build`" in reason, reason
 
 
-# ── The daemon reindexes with --build ──────────────────────────────────────
+# ── The automatic build takes the branch as a second trigger ──────────────
 
 
-class TestTheDaemonDecision:
-    """`daemon._branch_needs_build` answers with a branch or with nothing.
+class TestThePlanTakesTheBranch:
+    """`cli._index._plan_auto_build` is where fw-context decides to build.
 
-    A git checkout is one of the bursts the reindex loop already debounces —
-    its own comment says so — and the only missing piece was that the run it
-    starts reused `compile_commands.json` from the branch the tree left.
-
-    Every guard here answers "no", which costs a plain reindex and a reported
-    reason rather than an unwanted build.
+    It is also the only path that sets `isolated_build_dir`, and that value
+    is what makes `--build` legal on a `--background` run.  A `--build` from
+    anywhere else fails: measured on a real checkout of zbox-ecb-fw, the
+    daemon passing the flag itself produced "error: --build and --background
+    are mutually exclusive" and the run died in under a second.
     """
 
-    def _indexed(self, repo: Path, db_dir: Path, description: str) -> None:
-        """Put one build config with *description* in a database."""
+    def _project(self, repo: Path, tmp_path: Path, description: str,
+                 system: str = "cmake"):
+        """A project with an index that records *description*."""
+        import json
+
+        (repo / "compile_commands.json").write_text(
+            json.dumps([{
+                "directory": str(repo), "file": "main.c",
+                "arguments": ["cc", "-c", "main.c"],
+            }]),
+            encoding="utf-8",
+        )
+        db_dir = tmp_path / "index" / "0123456789abcdef0123456789abcdef"
+        db_dir.mkdir(parents=True)
         conn = open_db(db_dir / "index.db")
         try:
             with transaction(conn):
-                upsert_project(conn, "pid", "p", str(repo))
+                upsert_project(
+                    conn, "0123456789abcdef0123456789abcdef", "p", str(repo)
+                )
                 upsert_build_config(
-                    conn, "ch", "pid", str(repo / "compile_commands.json"),
+                    conn, "ch", "0123456789abcdef0123456789abcdef",
+                    str(repo / "compile_commands.json"),
                     description=description,
+                    manifest_verification="full",
                 )
         finally:
             conn.close()
-
-    def test_the_same_branch_needs_no_build(self, repo, tmp_path):
-        from fw_context_mcp.mcp.daemon import _branch_needs_build
-
-        db_dir = tmp_path / "db"
-        db_dir.mkdir()
-        self._indexed(repo, db_dir, "branch: main")
-        assert _branch_needs_build(repo, db_dir) == ""
-
-    def test_no_database_needs_no_build(self, repo, tmp_path):
-        from fw_context_mcp.mcp.daemon import _branch_needs_build
-
-        assert _branch_needs_build(repo, tmp_path / "absent") == ""
-
-    def test_no_recorded_branch_needs_no_build(self, repo, tmp_path):
-        from fw_context_mcp.mcp.daemon import _branch_needs_build
-
-        db_dir = tmp_path / "db"
-        db_dir.mkdir()
-        self._indexed(repo, db_dir, "")
-        assert _branch_needs_build(repo, db_dir) == ""
-
-    def test_a_switch_asks_for_the_new_branch(self, repo, tmp_path):
-        from fw_context_mcp.mcp.daemon import _branch_needs_build
-
-        db_dir = tmp_path / "db"
-        db_dir.mkdir()
-        self._indexed(repo, db_dir, "branch: main")
-        # A build system that may build in the background.  Without one the
-        # answer is "no" regardless of the branch.
-        (repo / ".fw-context").mkdir(exist_ok=True)
-        (repo / ".fw-context" / "config.toml").write_text(
-            '[project]\nid = "0123456789abcdef0123456789abcdef"\n'
-            '[build]\nsystem = "cmake"\n',
+        config_dir = repo / ".fw-context"
+        config_dir.mkdir(exist_ok=True)
+        (config_dir / "config.toml").write_text(
+            f'[project]\nid = "0123456789abcdef0123456789abcdef"\n'
+            f'[build]\nsystem = "{system}"\n',
             encoding="utf-8",
         )
-        _switch_to(repo, "release/4.15.1")
-        assert _branch_needs_build(repo, db_dir) == "release/4.15.1"
-
-    def test_a_build_system_that_refuses_the_background(self, repo, tmp_path):
-        from fw_context_mcp.mcp.daemon import _branch_needs_build
-
-        db_dir = tmp_path / "db"
-        db_dir.mkdir()
-        self._indexed(repo, db_dir, "branch: main")
-        # A detection-only backend: it builds nothing, thus it must not be
-        # asked to build in the background.
-        (repo / ".fw-context").mkdir(exist_ok=True)
-        (repo / ".fw-context" / "config.toml").write_text(
-            '[project]\nid = "0123456789abcdef0123456789abcdef"\n'
-            '[build]\nsystem = "keil"\n',
-            encoding="utf-8",
+        (config_dir / "local.toml").write_text(
+            f'[index]\ndb_dir = "{tmp_path / "index"}"\n', encoding="utf-8"
         )
+        return db_dir / "index.db"
+
+    def _plan(self, repo: Path, db_path: Path):
+        from fw_context_mcp.cli._index import _plan_auto_build
+        from fw_context_mcp.config import load as load_config
+
+        cfg = load_config(project_root=repo)
+        return _plan_auto_build(repo, db_path, cfg, None)
+
+    def test_the_same_branch_plans_no_build(self, repo, tmp_path):
+        db_path = self._project(repo, tmp_path, "branch: main")
+        keys, config, reason = self._plan(repo, db_path)
+        assert keys == []
+        assert config is None
+        assert reason == ""
+
+    def test_a_switch_plans_a_build(self, repo, tmp_path):
+        db_path = self._project(repo, tmp_path, "branch: main")
         _switch_to(repo, "release/4.15.1")
-        assert _branch_needs_build(repo, db_dir) == ""
+        keys, config, reason = self._plan(repo, db_path)
+        assert keys == ["branch:release/4.15.1"]
+        assert config is not None
+        # The value that makes --build legal on a --background run.
+        assert config.isolated_build_dir
+        assert "branch changed from main to release/4.15.1" in reason
+        assert "compile_commands.json belongs to the old branch" in reason
+
+    def test_no_index_plans_nothing(self, repo, tmp_path):
+        # The project and its config exist; the database does not.  Without
+        # one there is nothing to compare the branch against, thus no plan —
+        # the first condition of the docstring.
+        self._project(repo, tmp_path, "branch: main")
+        _switch_to(repo, "release/4.15.1")
+        keys, config, reason = self._plan(repo, tmp_path / "absent" / "index.db")
+        assert (keys, config, reason) == ([], None, "")
+
+    def test_a_backend_that_cannot_isolate_plans_nothing(self, repo, tmp_path):
+        # Keil detects and builds nothing, thus it must not be asked to build
+        # in the background — that refusal outranks the branch.
+        db_path = self._project(repo, tmp_path, "branch: main", system="keil")
+        _switch_to(repo, "release/4.15.1")
+        keys, config, reason = self._plan(repo, db_path)
+        assert (keys, config, reason) == ([], None, "")
 
     def test_a_recent_failure_for_the_same_branch_blocks(self, repo, tmp_path):
         # A branch that does not build would otherwise start a build on every
-        # burst of file changes.
+        # index run.
         from fw_context_mcp.indexer.autobuild import record_failure
-        from fw_context_mcp.mcp.daemon import _branch_needs_build
 
-        db_dir = tmp_path / "db"
-        db_dir.mkdir()
-        self._indexed(repo, db_dir, "branch: main")
-        (repo / ".fw-context").mkdir(exist_ok=True)
-        (repo / ".fw-context" / "config.toml").write_text(
-            '[project]\nid = "0123456789abcdef0123456789abcdef"\n'
-            '[build]\nsystem = "cmake"\n',
-            encoding="utf-8",
-        )
+        db_path = self._project(repo, tmp_path, "branch: main")
         _switch_to(repo, "release/4.15.1")
-        record_failure(db_dir, ["branch:release/4.15.1"])
-        assert _branch_needs_build(repo, db_dir) == ""
+        record_failure(db_path.parent, ["branch:release/4.15.1"])
+        keys, config, reason = self._plan(repo, db_path)
+        assert (keys, config, reason) == ([], None, "")
 
     def test_a_failure_for_another_branch_does_not_block(self, repo, tmp_path):
-        # The marker holds the key of the attempt, so a different branch is
-        # worth one try.
         from fw_context_mcp.indexer.autobuild import record_failure
-        from fw_context_mcp.mcp.daemon import _branch_needs_build
 
-        db_dir = tmp_path / "db"
-        db_dir.mkdir()
-        self._indexed(repo, db_dir, "branch: main")
-        (repo / ".fw-context").mkdir(exist_ok=True)
-        (repo / ".fw-context" / "config.toml").write_text(
-            '[project]\nid = "0123456789abcdef0123456789abcdef"\n'
-            '[build]\nsystem = "cmake"\n',
-            encoding="utf-8",
-        )
+        db_path = self._project(repo, tmp_path, "branch: main")
         _switch_to(repo, "release/4.15.1")
-        record_failure(db_dir, ["branch:some/other"])
-        assert _branch_needs_build(repo, db_dir) == "release/4.15.1"
+        record_failure(db_path.parent, ["branch:some/other"])
+        keys, _config, _reason = self._plan(repo, db_path)
+        assert keys == ["branch:release/4.15.1"]
 
     def test_a_source_failure_does_not_block_a_branch_build(self, repo, tmp_path):
-        # One marker file serves two triggers, and the comparison is on the
+        # One marker file serves both triggers, and `blocked` compares the
         # list contents, thus they do not interfere.
         from fw_context_mcp.indexer.autobuild import record_failure
-        from fw_context_mcp.mcp.daemon import _branch_needs_build
 
-        db_dir = tmp_path / "db"
-        db_dir.mkdir()
-        self._indexed(repo, db_dir, "branch: main")
-        (repo / ".fw-context").mkdir(exist_ok=True)
-        (repo / ".fw-context" / "config.toml").write_text(
-            '[project]\nid = "0123456789abcdef0123456789abcdef"\n'
-            '[build]\nsystem = "cmake"\n',
-            encoding="utf-8",
-        )
+        db_path = self._project(repo, tmp_path, "branch: main")
         _switch_to(repo, "release/4.15.1")
-        record_failure(db_dir, ["src/new_file.c"])
-        assert _branch_needs_build(repo, db_dir) == "release/4.15.1"
+        record_failure(db_path.parent, ["src/new_file.c"])
+        keys, _config, _reason = self._plan(repo, db_path)
+        assert keys == ["branch:release/4.15.1"]
 
 
-class TestTheFlagReachesTheSubprocess:
-    """`--build` has to be in the REAL argv, not only in the decision.
+class TestTheDaemonPassesNoBuildFlag:
+    """The daemon decides nothing about building, and must not.
 
-    The spawn is intercepted rather than reconstructed: a test that rebuilds
-    the argument list checks a literal the test author wrote, not the code.
+    `--build --background` is legal only with an isolated output directory,
+    which only `_plan_auto_build` sets.  A flag from the daemon reached the
+    CLI without it and every branch-triggered reindex failed instantly.
     """
 
-    async def _spawn_argv(self, tmp_path: Path, *, with_build: bool) -> list[str]:
+    def test_the_spawn_carries_no_build_flag(self, tmp_path):
         import asyncio as aio
 
         from fw_context_mcp.mcp import daemon
@@ -571,51 +559,30 @@ class TestTheFlagReachesTheSubprocess:
             captured.extend(str(arg) for arg in args)
             return _FakeProc()
 
-        original = aio.create_subprocess_exec
-        aio.create_subprocess_exec = _fake_exec  # type: ignore[assignment]
-        try:
-            await daemon._run_index_async(
-                tmp_path, tmp_path, with_build=with_build
-            )
-        finally:
-            aio.create_subprocess_exec = original  # type: ignore[assignment]
-        return captured
+        async def _drive() -> None:
+            original = aio.create_subprocess_exec
+            aio.create_subprocess_exec = _fake_exec  # type: ignore[assignment]
+            try:
+                await daemon._run_index_async(tmp_path, tmp_path)
+            finally:
+                aio.create_subprocess_exec = original  # type: ignore[assignment]
 
-    def test_without_the_flag(self, tmp_path):
-        import asyncio as aio
+        aio.run(_drive())
+        assert "index" in captured
+        assert "--background" in captured
+        assert "--build" not in captured, (
+            "the daemon must leave the build decision to the index run"
+        )
 
-        argv = aio.run(self._spawn_argv(tmp_path, with_build=False))
-        assert "index" in argv
-        assert "--background" in argv
-        assert "--build" not in argv
-
-    def test_with_the_flag(self, tmp_path):
-        import asyncio as aio
-
-        argv = aio.run(self._spawn_argv(tmp_path, with_build=True))
-        assert "--background" in argv
-        assert "--build" in argv
-        # Order matters to argparse only in that both are options of `index`.
-        assert argv.index("index") < argv.index("--build")
-
-    def test_the_helper_accepts_the_keyword(self):
+    def test_the_helper_takes_no_build_keyword(self):
         import inspect
 
         from fw_context_mcp.mcp import daemon
 
         signature = inspect.signature(daemon._run_index_async)
-        assert "with_build" in signature.parameters
-        assert signature.parameters["with_build"].default is False
+        assert "with_build" not in signature.parameters
 
-    def test_the_loop_passes_the_decision_through(self):
-        # The wiring, read from the source: the loop must call the decision
-        # and hand it to the spawn.  Twice in this series a wiring mistake
-        # survived tests that checked the parts.
-        import inspect
-
+    def test_the_daemon_holds_no_branch_decision(self):
         from fw_context_mcp.mcp import daemon
 
-        source = inspect.getsource(daemon._reindex_loop)
-        assert "_branch_needs_build" in source
-        assert "with_build=bool(build_for)" in source
-        assert "record_failure" in source
+        assert not hasattr(daemon, "_branch_needs_build")
