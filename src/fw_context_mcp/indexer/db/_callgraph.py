@@ -965,9 +965,12 @@ def get_vector_table(
     Weakness alone cannot say this, which is why the alias edge exists.
     The same startup declares ``Reset_Handler`` weak WITH a body and
     ``NMI_Handler`` weak with nothing but an alias.
-    * ``"linker"`` — the target has no definition in the build.  The
-      linker script gives the address.  Slot 0 holds the initial stack
-      pointer and looks like this.
+    * ``"linker"`` — the linker script gives the target its address, and no
+      compiled file defines it.  Slot 0 holds the initial stack pointer and
+      looks like this.  When the index read the script, ``file`` and
+      ``line`` name the assignment in it; otherwise the row carries the
+      name alone.  NOT code — a reader must not follow this row expecting
+      a function.
 
     ``overridden`` holds the weak definition that a ``"c"`` row replaced,
     when one is in the index.  This is the CMSIS pattern: the startup file
@@ -1011,7 +1014,21 @@ def get_vector_table(
         weak = bool(entry.pop("is_weak"))
         kind = entry.pop("kind")
 
-        if kind == "undefined":
+        # `linker` covers both shapes of the same fact: the slot reaches a
+        # name the linker script gives an address to.
+        #
+        # `kind == "undefined"` is the older shape — the assembly reader saw
+        # the name in a vector slot and nothing in the build defined it.
+        # The `ld:` namespace is the newer one: the linker-script pass now
+        # reads that script and stores a real definition with a file and a
+        # line, so slot 0 of a CMSIS table went from `undefined` to a
+        # `varglobal` in `.link_script.ld`.
+        #
+        # It must NOT fall through to "c".  That status means "a definition
+        # outside assembly, code runs", and slot 0 holds the initial stack
+        # pointer, not code.  Measured on zbox-ecb-fw: with the fall-through
+        # the tool reported `__StackTop` as code that runs.
+        if kind == "undefined" or entry_usr.startswith("ld:"):
             entry["status"] = "linker"
         elif not from_assembly:
             entry["status"] = "c"

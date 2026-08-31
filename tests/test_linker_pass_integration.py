@@ -259,6 +259,62 @@ class TestTheRunReachesThePass:
             "the script's definition of _estack is missing"
         )
 
+    def test_slot_zero_is_not_reported_as_code(
+        self, ninja_project, tmp_path
+    ):
+        """A linker-script symbol in a vector slot is not a handler.
+
+        Before the linker pass, slot 0 reached a `kind="undefined"` row and
+        `get_vector_table` answered `status="linker"`.  With a real
+        definition in the index the classification fell through to `"c"`,
+        whose documented meaning is "a definition outside assembly, code
+        runs" — false for an initial stack pointer.  Measured on
+        zbox-ecb-fw: the tool reported `__StackTop` as code that runs.
+
+        `"linker"` now covers both shapes, and the row carries the file and
+        line of the assignment in the script.
+        """
+        from fw_context_mcp.indexer.db import get_vector_table, open_db
+
+        (ninja_project / "startup.S").write_text(
+            '  .section .isr_vector, "a"\n'
+            "  .word _estack\n"
+            "  .word Reset_Handler\n"
+            "Reset_Handler:\n"
+            "  b .\n",
+            encoding="utf-8",
+        )
+        cc = ninja_project / "compile_commands.json"
+        entries = json.loads(cc.read_text(encoding="utf-8"))
+        entries.append({
+            "directory": str(ninja_project),
+            "file": "startup.S",
+            "arguments": ["cc", "-x", "assembler-with-cpp", "-c", "startup.S",
+                          "-o", "startup.o"],
+        })
+        cc.write_text(json.dumps(entries), encoding="utf-8")
+
+        db_path = tmp_path / "db" / "index.db"
+        db_path.parent.mkdir()
+        config_hash = _index(ninja_project, db_path)
+        conn = open_db(db_path)
+        try:
+            table = get_vector_table(conn, config_hash)
+        finally:
+            conn.close()
+
+        assert table, "the vector table is empty"
+        slot_zero = table[0]
+        assert slot_zero["name"] == "_estack"
+        assert slot_zero["status"] == "linker", (
+            f"slot 0 must not read as code: {slot_zero}"
+        )
+        # The script is in the index, thus the row can name where.  Line 12
+        # of SCRIPT: MEMORY, {, FLASH, RAM, }, ENTRY, SECTIONS, {, .text,
+        # _etext, .data, _estack.
+        assert slot_zero["file"].endswith("app.ld")
+        assert slot_zero["line"] == 12
+
     def test_the_script_survives_the_coverage_purge(
         self, ninja_project, tmp_path
     ):

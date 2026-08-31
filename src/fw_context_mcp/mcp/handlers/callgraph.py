@@ -1459,9 +1459,12 @@ def get_vector_table(
       overrode.  A CMSIS startup file makes this an alias of
       ``Default_Handler``, which is an infinite loop.  If the interrupt
       fires, the device stops.
-    * ``"linker"`` — no definition in the build.  The linker script gives
-      the address.  Slot 0 holds the initial stack pointer, not a
-      handler, and looks like this.
+    * ``"linker"`` — the linker script gives the address and no compiled
+      file defines the name.  Slot 0 holds the initial stack pointer, not
+      a handler, and looks like this.  When the index read the script,
+      ``file`` and ``line`` name the assignment in it — on zbox-ecb-fw,
+      `__StackTop` at `.link_script.ld:148`.  Do not read this row as
+      code: there is no function to follow.
 
     A ``"c"`` row with ``overridden`` is the CMSIS pattern: the startup
     file defines each handler weakly, the project defines the same name
