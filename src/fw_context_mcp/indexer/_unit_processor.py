@@ -54,6 +54,11 @@ import time
 from contextlib import AbstractContextManager, nullcontext
 from pathlib import Path
 
+try:
+    from clang.cindex import TranslationUnitLoadError
+except ImportError:
+    TranslationUnitLoadError = RuntimeError  # clang not available — use fallback
+
 from ..utils import MTIME_TOLERANCE_S, SAFE_EXCEPT, compute_source_hash, is_fatal
 from .config_hash import compute_flags_hash, compute_tu_content_hash
 from .db import (
@@ -199,7 +204,18 @@ def _check_and_parse_unit(
     except sqlite3.Error:
         log.error("Fatal DB error parsing %s — stopping indexer", unit.file.name)
         raise
-    except SAFE_EXCEPT as exc:
+    # TranslationUnitLoadError is named next to SAFE_EXCEPT and not inside
+    # it: the class derives straight from Exception, so the tuple
+    # `(ValueError, TypeError, RuntimeError, AttributeError, sqlite3.Error,
+    # OSError)` does not hold it.  Without the name here the exception left
+    # the run, and `ops.py` — which handles the same failure by skipping —
+    # never saw the unit at all.
+    #
+    # Measured on zbox-ecb-fw: a branch switch removed two generated zcbor
+    # sources that compile_commands.json still listed, and those two files
+    # out of 881 ended the run at translation unit 39.  The 842 units behind
+    # them were never read.
+    except (*SAFE_EXCEPT, TranslationUnitLoadError) as exc:
         if is_fatal(exc):
             raise
         msg = str(exc)
@@ -369,7 +385,9 @@ def _process_unit(
                 return_tu=True,
                 skip_files=skip_files,
             )
-        except SAFE_EXCEPT as exc:
+        # Same reason as in `_check_and_parse_unit`: the parse error is not
+        # inside SAFE_EXCEPT, thus it has to be named.
+        except (*SAFE_EXCEPT, TranslationUnitLoadError) as exc:
             if is_fatal(exc):
                 raise
             log.warning("skip TU %s: %s", unit.file.name, exc)
