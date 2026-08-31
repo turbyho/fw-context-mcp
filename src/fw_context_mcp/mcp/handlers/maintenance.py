@@ -49,6 +49,9 @@ from ...indexer.db import (
     get_all_builds_for_project,
     get_all_projects,
     get_db_schema_version,
+    get_entry_point,
+    get_memory_regions,
+    get_memory_regions_by_config,
     make_analysis_summary,
     open_db,
     transaction,
@@ -228,7 +231,21 @@ def list_variants(
         Each build dict holds: variant (str — empty for a single-project
         index), image (str — empty for a single-project index), board (str),
         config_hash (str), symbol_count (int), file_count (int),
-        manifest_verification (str — "full" or "none").
+        manifest_verification (str — "full" or "none"),
+        entry_point (str — the `ENTRY()` of the linker script of this build,
+        empty when no script names one),
+        memory (list[dict] — the `MEMORY` regions of this build:
+        {name, attributes, origin, length, origin_value, length_value,
+        file_path, line}).  `origin` and `length` are the expression the
+        script writes; `origin_value` and `length_value` are numbers, and
+        they are None for an expression that names a symbol such as
+        `ORIGIN(RAM) + LENGTH(RAM)`.  Empty for a build whose system
+        records no linker script — see the note below.
+
+        THIS is where a per-build memory map lives, not in the `images`
+        list of ``get_active_build``: that list holds one entry per image
+        NAME, and one name can belong to two variants with different
+        addresses.
 
         When the project is not initialized, or has no index, the result is
         {builds: [], multi: False, error (str)}.
@@ -245,6 +262,13 @@ def list_variants(
     conn = _quick_open_readonly(db_path)
     try:
         builds = get_all_builds_for_project(conn, project_id)
+        # The memory map is per build, thus it belongs on these rows and not
+        # in the `images` list of get_active_build: that list holds one entry
+        # per image NAME, and two variants of zbox-ecb-fw-v5 both carry an
+        # image called `app` with different flash addresses.
+        regions_by_config = get_memory_regions_by_config(
+            conn, [b["config_hash"] for b in builds]
+        )
     finally:
         conn.close()
 
@@ -259,6 +283,8 @@ def list_variants(
                 "symbol_count": b["symbol_count"],
                 "file_count": b["file_count"],
                 "manifest_verification": b["manifest_verification"],
+                "entry_point": b["entry_point"] or "",
+                "memory": regions_by_config.get(b["config_hash"], []),
             }
         )
 
@@ -367,7 +393,32 @@ def get_active_build(
         images (list[dict] — {name, description, dir, type}),
         variant_images (dict — variant name to its image names),
         active_variant (str or None — [build] default_variant),
-        active_image (str or None — [build] default_image)}
+        active_image (str or None — [build] default_image),
+        entry_point (str — the `ENTRY()` of the linker script of the build
+        that the other fields describe, empty when no script names one),
+        memory (list[dict] — the `MEMORY` regions of that build:
+        {name, attributes, origin, length, origin_value, length_value,
+        file_path, line})}
+
+        About ``memory``: ``origin`` and ``length`` hold the expression the
+        script writes, thus they differ by platform — an mbed script writes
+        `0xefe00` and a Zephyr script writes `((673792) - 0xe6)`.
+        ``origin_value`` and ``length_value`` hold the number, and both are
+        None for an expression that names a symbol, such as
+        `ORIGIN(RAM) + LENGTH(RAM)`.  The end of a region is
+        ``origin_value + length_value``.
+
+        ``memory`` and ``entry_point`` describe ONE build.  For a
+        multi-variant project they follow ``config_hash``, which is the
+        build named by ``[build] default_variant``, and both are empty when
+        the config names no default.  Use ``list_variants`` for the map of
+        every build.
+
+        ``memory`` is empty for a build system that records no linker
+        script.  A PlatformIO project is the measured case: SCons writes no
+        ninja file and no link command the index can read, and the map file
+        never names the script.  An empty list means "not recorded", never
+        "no memory".
 
         For a project that is not initialized, the result holds only
         ``status``, ``project_root``, and ``index_message``.  When no index
@@ -737,6 +788,26 @@ def get_active_build(
             result["compile_commands"] = (
                 default_build["compile_commands_path"] if default_build else ""
             )
+
+        # ── The memory map of the build these fields describe ──
+        # AFTER the multi-variant block, because that block replaces
+        # `config_hash` with the default build.  Read before it, a
+        # multi-variant project would report the map of one build under the
+        # identity of another — measured on zbox-ecb-fw-v5, where `app`
+        # starts at flash 372736 and `mcuboot` at 110592.
+        #
+        # One build only.  `list_variants` reports every build's map, and
+        # this tool has no variant parameter to ask for another.
+        active_hash = result["config_hash"]
+        if active_hash:
+            result["entry_point"] = get_entry_point(conn, active_hash)
+            result["memory"] = get_memory_regions(conn, active_hash)
+        else:
+            # A multi-variant project with no [build] default_variant: the
+            # LLM has to pick a variant first, thus there is no one map to
+            # report.  Empty rather than a guess at which build is meant.
+            result["entry_point"] = ""
+            result["memory"] = []
 
         return result
 
