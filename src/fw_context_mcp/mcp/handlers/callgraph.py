@@ -1468,9 +1468,22 @@ def get_vector_table(
     again, and the linker keeps the strong one.
 
     Only tables written as address words are read — ``.word`` and
-    ``.long`` in a vector section, which is what Cortex-M startup files
-    write.  arm64, Xtensa, RISC-V and MIPS build their tables from branch
-    instructions, and this tool finds nothing for them.
+    ``.long`` in a vector section, which is what a CMSIS startup file
+    writes.  Two limits follow, and both give fewer slots, never wrong
+    ones:
+
+    * **Zephyr gives the exceptions only.**  Its ``vector_table.S`` holds
+      slots 0 to 15, and ``gen_isr_tables.py`` writes the table of
+      external interrupts into C.  Measured on an nRF54L application:
+      11 slots from the assembly.
+    * **Some architectures write no address table.**  arm64, Xtensa and
+      MIPS build theirs from branch instructions.  A RISC-V target has no
+      table at all: ``mtvec`` holds one trap handler, and software reads
+      the cause.  Measured on the RISC-V image of the same project: 27
+      assembly symbols and 0 slots.
+
+    For an interrupt this tool cannot show, ``find_references`` on the
+    handler name still gives every reference the index holds.
 
     Read-only. No side effects. Requires an index of the assembly
     (``fw-context index``).
@@ -1509,9 +1522,12 @@ def get_vector_table(
         if not rows:
             return [{"info": (
                 "No vector table in this build. The assembly holds no table "
-                "of address words, or the build has no assembly at all. "
-                "arm64, Xtensa, RISC-V and MIPS write their tables as branch "
-                "instructions, which this tool does not read."
+                "of address words, or the build has no assembly at all. A "
+                "RISC-V target has no such table: mtvec holds one trap "
+                "handler and software reads the cause. arm64, Xtensa and "
+                "MIPS build theirs from branch instructions, which this "
+                "tool does not read. Use find_references on a handler name "
+                "instead."
             )}]
         return rows[:limit]
 

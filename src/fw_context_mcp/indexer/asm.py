@@ -299,6 +299,11 @@ def store_units(conn, config_hash: str, units: list, project_root: Path,
 
     result = AsmResult()
     cleared = False
+    # The sources are kept so the vector pass can run over all of them
+    # after every symbol is stored, without preprocessing anything twice.
+    # Assembly units are few — one on FM, three on zbox-ecb-fw, seven per
+    # Zephyr image — and the preprocessor is 89-95% of the pass.
+    preprocessed: list[AsmSource] = []
     for unit in units:
         source = preprocess(unit)
         if source is None:
@@ -322,13 +327,16 @@ def store_units(conn, config_hash: str, units: list, project_root: Path,
         result.aliases += _store_aliases(
             conn, config_hash, symbols, project_root,
         )
-        linked, unresolved = _store_vectors(
-            conn, config_hash, source, project_root,
-            vendor_patterns or [], project_patterns or [],
-        )
         result.symbols += len(symbols)
-        result.vectors += linked
-        result.unresolved += unresolved
+        # The vector pass waits for every unit.  A table in one file and
+        # its handlers in another cannot resolve before both are stored,
+        # and Zephyr splits them: `vector_table.S` names z_arm_svc, and
+        # `svc.S` defines it.  Resolving per unit put a declaration in
+        # the index for a handler that a later unit then defined, so the
+        # slot pointed at the placeholder and the name appeared twice.
+        # FM and zbox-ecb-fw hid it — their table and handlers share one
+        # file.
+        preprocessed.append(source)
         for path, active_lines in source.active.items():
             content = filtered_content(path, active_lines)
             if content is None:
@@ -367,6 +375,16 @@ def store_units(conn, config_hash: str, units: list, project_root: Path,
             )
             result.files += 1
             result.paths.add(db_path)
+
+    # Second pass: every symbol of every unit is now in the index, so a
+    # slot can reach a handler its own file does not define.
+    for source in preprocessed:
+        linked, unresolved = _store_vectors(
+            conn, config_hash, source, project_root,
+            vendor_patterns or [], project_patterns or [],
+        )
+        result.vectors += linked
+        result.unresolved += unresolved
     return result
 
 

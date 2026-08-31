@@ -2020,3 +2020,84 @@ class TestGetVectorTable:
             conn.close()
 
         assert {r["name"] for r in rows} == {"NMI_Handler", "SysTick_Handler"}
+
+
+class TestATableResolvesAcrossUnits:
+    """A table in one file and its handler in another must still link.
+
+    Zephyr splits them: `vector_table.S` names `z_arm_svc` and `svc.S`
+    defines it.  Resolving each unit right after its own symbols put a
+    declaration in the index for a handler a later unit then defined, so
+    the slot pointed at the placeholder and the name appeared twice —
+    measured on zbox-ecb-fw-v5, slots 11 and 14 of the nRF54L application.
+
+    FM and zbox-ecb-fw could not show this: their table and handlers share
+    one file.
+    """
+
+    @staticmethod
+    def _two_units(tmp_path: Path):
+        """A table unit FIRST, then the unit that defines the handler."""
+        from fw_context_mcp.indexer.asm import store_units
+        from fw_context_mcp.indexer.db import transaction
+
+        table = _unit(tmp_path, "vector_table.S",
+                      _table("  .word Handler\n"))
+        (tmp_path / "sub").mkdir(exist_ok=True)
+        defines = _unit(tmp_path / "sub", "handler.S",
+                        ".global Handler\nHandler:\n  b .\n")
+
+        conn = TestStoreUnits._db(tmp_path)
+        with transaction(conn):
+            result = store_units(conn, "ch", [table, defines], tmp_path)
+        return conn, result
+
+    def test_the_slot_reaches_the_other_unit(self, tmp_path: Path):
+        conn, result = self._two_units(tmp_path)
+        try:
+            row = conn.execute(
+                "SELECT s.file_path, s.is_definition FROM refs r "
+                "JOIN symbols s ON s.usr = r.to_usr "
+                "WHERE r.ref_kind='vector'"
+            ).fetchone()
+        finally:
+            conn.close()
+
+        assert result.vectors == 1
+        assert row["is_definition"] == 1, "the edge must reach the definition"
+        assert row["file_path"] == "sub/handler.S"
+
+    def test_no_placeholder_is_left_behind(self, tmp_path: Path):
+        """The declaration path must not fire for a name a later unit defines."""
+        conn, _ = self._two_units(tmp_path)
+        try:
+            rows = conn.execute(
+                "SELECT file_path, kind FROM symbols WHERE name='Handler'"
+            ).fetchall()
+        finally:
+            conn.close()
+
+        assert len(rows) == 1, f"the name appears {len(rows)} times: {rows}"
+        assert rows[0]["kind"] == "function"
+
+    def test_a_name_nothing_defines_is_still_declared(self, tmp_path: Path):
+        """The second pass must not lose the linker-symbol case."""
+        from fw_context_mcp.indexer.asm import store_units
+        from fw_context_mcp.indexer.db import transaction
+
+        conn = TestStoreUnits._db(tmp_path)
+        try:
+            with transaction(conn):
+                result = store_units(
+                    conn, "ch",
+                    [_unit(tmp_path, "vector_table.S", _table("  .word _estack\n"))],
+                    tmp_path,
+                )
+            kind = conn.execute(
+                "SELECT kind FROM symbols WHERE name='_estack'"
+            ).fetchone()[0]
+        finally:
+            conn.close()
+
+        assert result.vectors == 1
+        assert kind == "undefined"
