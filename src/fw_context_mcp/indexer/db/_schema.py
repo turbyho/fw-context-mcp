@@ -546,7 +546,17 @@ CREATE TABLE IF NOT EXISTS refs (
     from_line    INTEGER NOT NULL,
     from_usr     TEXT,
     ref_kind     TEXT    NOT NULL,
-    -- Position of a vector table slot; NULL for every other ref_kind.
+    -- Position of the reference inside the construct that holds it, or NULL
+    -- when it has none.  Two producers fill it: the assembly reader, for a
+    -- slot of a vector table, and the C indexer, for an element of a
+    -- positional one-dimensional array initializer.  Both mean an index
+    -- counted from zero.
+    --
+    -- Note that idx_refs_unique, built during migration below, does not
+    -- cover this column.  Two elements of one array that share a target, a
+    -- line AND a from_usr therefore keep only the first.  A table at file
+    -- scope has from_usr NULL, which SQLite treats as distinct, so a real
+    -- vector table is not affected.
     slot_index   INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_refs_to_usr   ON refs(config_hash, to_usr);

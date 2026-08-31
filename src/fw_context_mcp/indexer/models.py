@@ -31,12 +31,31 @@ class Reference:
             for member accesses, ``"indirect"`` for function pointers found
             in call arguments, assignments, variable initializers, or
             struct/array init lists.
+        slot_index: Position of this reference inside the construct that
+            holds it, counting from zero, or None when the construct has no
+            position to give.
+
+            Set for an ``"indirect"`` reference that comes from an element
+            of a positional one-dimensional array initializer, where the
+            position of the element is its index.  That is what turns "a
+            function address appears on line 11 of isr_tables.c" into "a
+            function address sits in slot 0" — and a table of function
+            addresses is a vector table, whether an assembler wrote it or a
+            generator emitted C.
+
+            None wherever a position is not an index: a designated
+            initializer (``[5] = &fn``), a struct initializer (which
+            numbers fields), a multi-dimensional table (which has no single
+            index), and every reference that no initializer holds.  A wrong
+            slot number in front of a reader is worse than none, so the
+            conditions are strict — see ``symbols._init_list_gives_slots``.
     """
     to_usr: str        # USR of the referenced definition (links to Symbol.usr)
     from_file: str     # file containing the reference (absolute, as clang reports)
     from_line: int
     from_usr: str | None   # USR of the enclosing function/method (caller), or None
     ref_kind: str      # "call" | "ref" | "member" | "indirect" | "implicit_construct"
+    slot_index: int | None = None
 
 
 @dataclass

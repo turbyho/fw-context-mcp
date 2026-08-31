@@ -1252,7 +1252,10 @@ def store_symbols_for_unit(
 
     # References
     if index_refs and refs:
-        ref_rows = [(config_hash, r.to_usr, _rel(r.from_file), r.from_line, r.from_usr, r.ref_kind, None) for r in refs]
+        # The last column is refs.slot_index.  It carries a value only for an
+        # indirect reference that came from an element of a positional
+        # one-dimensional array initializer; it is None everywhere else.
+        ref_rows = [(config_hash, r.to_usr, _rel(r.from_file), r.from_line, r.from_usr, r.ref_kind, r.slot_index) for r in refs]
         insert_refs_batch(conn, ref_rows)
         refs_added = len(ref_rows)
 

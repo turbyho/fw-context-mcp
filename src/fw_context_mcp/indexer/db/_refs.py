@@ -85,8 +85,10 @@ def insert_refs_batch(conn: sqlite3.Connection, rows: list[tuple]) -> int:
     """Insert reference rows for the cross-reference / call graph.
 
     Each row: (config_hash, to_usr, from_file, from_line, from_usr,
-               ref_kind, slot_index).  slot_index is the position of a
-    vector table slot and None for every other kind.
+               ref_kind, slot_index).  slot_index is an index counted from
+    zero — a slot of a vector table from the assembly reader, or an element
+    of a positional array initializer from the C indexer — and None for a
+    reference that has no position.
 
     Why INSERT OR IGNORE: the same TU can be indexed multiple times
     (reindex after header change).  OR IGNORE skips duplicates silently
