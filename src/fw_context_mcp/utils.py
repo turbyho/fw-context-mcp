@@ -59,6 +59,7 @@ __all__ = [
     "compute_content_hash",
     "compute_source_hash",
     "fmt_count",
+    "ignore_autobuild_dir",
     "is_compile_commands_stale",
     "is_db_exception",
     "is_fatal",
@@ -160,6 +161,38 @@ def autobuild_dir(variant: str = "") -> str:
     directory would make the variants overwrite each other.
     """
     return str(AUTOBUILD_REL / (variant or "default"))
+
+
+def ignore_autobuild_dir(project_root: Path) -> None:
+    """Keep the autobuild output out of the project's git status.
+
+    fw-context builds into ``.fw-context/autobuild/`` when it starts a build
+    of its own, and that output is a build artifact of a tool, never
+    something to commit.  The project's ``.gitignore`` cannot be relied on
+    for it: ``fw-context init`` is the only writer of that file, so a
+    project initialised before this directory existed lists
+    ``.fw-context/build/`` and nothing more, and the autobuild output then
+    shows up as untracked — measured on zbox-ecb-fw.
+
+    Writing the rule INSIDE the directory fixes that without touching a
+    file the user owns, and it covers a project that will never run ``init``
+    again.  ``*`` also hides this ``.gitignore`` itself, which is what we
+    want: nothing here belongs in a commit.
+
+    Silent on failure.  A build artifact that stays visible in git status
+    is untidy; refusing to build over it would be worse.
+    """
+    marker = project_root / AUTOBUILD_REL / ".gitignore"
+    if marker.exists():
+        return
+    try:
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text("# Build output of fw-context. Not for committing.\n*\n",
+                          encoding="utf-8")
+    except OSError:
+        logging.getLogger(__name__).debug(
+            "could not write %s", marker, exc_info=True,
+        )
 
 
 # Standard exception tuple for non-fatal recoverable errors.

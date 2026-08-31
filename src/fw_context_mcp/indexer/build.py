@@ -20,7 +20,7 @@ import subprocess
 from dataclasses import dataclass, field, fields
 from pathlib import Path
 
-from fw_context_mcp.utils import cc_output_path
+from fw_context_mcp.utils import cc_output_path, ignore_autobuild_dir
 
 # Import builders package so the registry is populated with all registered
 # build system backends before ``detect_build_system()`` is called.
@@ -494,6 +494,13 @@ def generate_compile_commands(
 
     log.info("Detected build system: %s (clean=%s)", system, cfg.clean)
     builder = builder_cls()
+
+    # Every path below can write into the autobuild directory, and a builder
+    # creates it itself, so the rule that keeps it out of git has to be in
+    # place before any of them runs.  One point covers convert, generate and
+    # build alike.
+    if cfg.isolated_build_dir:
+        ignore_autobuild_dir(root)
 
     # Run pre-build hook before any generation path
     _run_pre_build(cfg, root)

@@ -842,9 +842,15 @@ def _ensure_gitignore(project_root: Path, *, fix: bool = False, build_system: st
     """Add fw-context build artifacts and ``.fw-context/local.toml`` to the
     project's ``.gitignore`` if they aren't already listed.
 
-    ``.fw-context/build/`` holds the generated ``compile_commands.*`` files;
-    the root-level ``compile_commands.json`` entry covers build systems that
-    write natively to the project root (PlatformIO) and legacy layouts.
+    ``.fw-context/build/`` holds the generated ``compile_commands.*`` files
+    and ``.fw-context/autobuild/`` the output of a build that fw-context
+    started itself; the root-level ``compile_commands.json`` entry covers
+    build systems that write natively to the project root (PlatformIO) and
+    legacy layouts.
+
+    A project initialised before an entry was added here keeps the old list,
+    because init is the only caller.  ``utils.ignore_autobuild_dir`` covers
+    the autobuild directory for those projects, from inside.
 
     For Mbed OS projects, also adds ``mbed_config.h`` — the build-generated
     config header that ends up in the project root.
@@ -859,6 +865,7 @@ def _ensure_gitignore(project_root: Path, *, fix: bool = False, build_system: st
     entries = [
         "compile_commands.json",
         ".fw-context/build/",
+        ".fw-context/autobuild/",
         ".fw-context/local.toml",
     ]
     if build_system == "mbed-os":
