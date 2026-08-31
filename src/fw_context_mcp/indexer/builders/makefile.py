@@ -8,8 +8,10 @@ or slow.
 
 from __future__ import annotations
 
+import importlib.util
 import logging
 import shutil
+import sys
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -22,6 +24,69 @@ if TYPE_CHECKING:
     from ..build import BuildConfig
 
 log = logging.getLogger(__name__)
+
+
+def _resolve_compiledb(configured_python: str | None) -> list[str]:
+    """Return the command prefix that runs compiledb, or raise.
+
+    Three routes are tried in order of how much the answer is trusted:
+
+    1. **The interpreter the user configured.**  An explicit choice wins.
+    2. **The interpreter running fw-context**, when ``compiledb`` can be
+       imported by it.  This is the route that matters in practice:
+       fw-context is installed into its own virtualenv and reached through
+       a symlink in ``~/.local/bin``, so that virtualenv's ``bin/`` is NOT
+       on PATH.  ``compiledb`` sits right next to the running interpreter
+       and ``-m`` finds it there whatever PATH says.
+    3. **A ``compiledb`` on PATH**, for a system-wide install outside any
+       virtualenv fw-context knows about.
+
+    Route 2 exists because route 3 alone told a lie.  Measured: with
+    ``~/.fw-context/.venv/bin/compiledb`` present and ``python -m
+    compiledb`` working, ``shutil.which("compiledb")`` still found nothing,
+    and a Makefile project failed with "Install it: pip install compiledb"
+    — advice that could not have helped, because it was already installed.
+
+    Raises:
+        RuntimeError: No route found.  The message names what was tried,
+            so the reader is not sent to reinstall something present.
+    """
+    if configured_python:
+        return [configured_python, "-m", "compiledb"]
+
+    if sys.executable and _module_is_importable("compiledb"):
+        return [sys.executable, "-m", "compiledb"]
+
+    on_path = shutil.which("compiledb")
+    if on_path:
+        return [on_path]
+
+    raise RuntimeError(
+        "compiledb is required for Makefile projects, and none of these "
+        "found it:\n"
+        "  [build] python  — not set in the project config\n"
+        f"  {sys.executable or 'the running interpreter'} -m compiledb "
+        "— not importable\n"
+        "  compiledb on PATH — not found\n"
+        "Install it into the environment that runs fw-context:\n"
+        f"  {sys.executable or 'python'} -m pip install compiledb\n"
+        "Or use bear instead with a custom command:\n"
+        '  [build]\n  command = "bear -- make"'
+    )
+
+
+def _module_is_importable(name: str) -> bool:
+    """Report whether *name* can be imported, without importing it.
+
+    ``find_spec`` is used rather than a real import because compiledb is a
+    build tool that this process only ever runs as a subprocess; importing
+    it here would run its module-level code for no reason.
+    """
+    try:
+        return importlib.util.find_spec(name) is not None
+    except (ImportError, ValueError):
+        # ValueError: `name` present in sys.modules but with no spec.
+        return False
 
 
 class MakefileBuildSystem:
@@ -59,17 +124,7 @@ class MakefileBuildSystem:
         """
         root = project_root.resolve()
 
-        if cfg.python:
-            compiledb_prefix: list[str] = [cfg.python, "-m", "compiledb"]
-        elif not shutil.which("compiledb"):
-            raise RuntimeError(
-                "compiledb is required for Makefile projects.\n"
-                "Install it:  pip install compiledb\n"
-                "Or use bear instead with a custom command:\n"
-                '  [build]\n  command = "bear -- make"'
-            )
-        else:
-            compiledb_prefix = ["compiledb"]
+        compiledb_prefix = _resolve_compiledb(cfg.python)
 
         target = cfg.make_target or "all"
 
