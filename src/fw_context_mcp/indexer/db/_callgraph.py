@@ -64,6 +64,7 @@ any call-path query that can reach ``main``.
 from __future__ import annotations
 
 import logging
+import re
 import sqlite3
 from collections import deque
 
@@ -1264,6 +1265,129 @@ def get_function_address_arrays(
             continue
         out.append(dict(row))
     _follow_declarations_to_definitions(conn, config_hash, out)
+    return out
+
+
+_DECLARED_LENGTH = re.compile(r"\[(\d+)\]")
+
+
+def _declared_length(signature: str) -> int | None:
+    """Read the element count out of an array type, or None.
+
+    ``symbols.signature`` holds the resolved type, so the count is a literal
+    even where the source wrote a macro: measured
+    ``const struct _isr_table_entry[290] _sw_isr_table`` and
+    ``const uintptr_t[290] _irq_vector_table``.
+
+    Answers only when the signature holds EXACTLY ONE bracketed number.
+    Two of them mean the count is ambiguous — an array of arrays, or a
+    function pointer whose parameter is an array — and a wrong length would
+    turn into a wrong list of missing slots.
+    """
+    found = _DECLARED_LENGTH.findall(signature or "")
+    if len(found) != 1:
+        return None
+    return int(found[0])
+
+
+def _as_ranges(numbers: list[int]) -> str:
+    """Fold a sorted list into ``"0-88, 90, 219-221"``.
+
+    A table of 290 slots can be missing 284 of them, and a bare list of 284
+    numbers is not something a reader takes in.  Ranges stay complete while
+    staying short.
+    """
+    parts: list[str] = []
+    start = previous = numbers[0]
+    for number in numbers[1:]:
+        if number == previous + 1:
+            previous = number
+            continue
+        parts.append(str(start) if start == previous else f"{start}-{previous}")
+        start = previous = number
+    parts.append(str(start) if start == previous else f"{start}-{previous}")
+    return ", ".join(parts)
+
+
+def get_table_coverage(
+    conn: sqlite3.Connection,
+    config_hash: str,
+) -> list[dict]:
+    """Report the slots of each recognised array that hold no named function.
+
+    An array can be longer than the number of slots the index can name, and
+    the difference is worth reporting because it is where the interesting
+    entries often are.  Measured on the Zephyr image of zbox-ecb-fw-v5:
+    ``_sw_isr_table`` is declared ``[290]``, 284 slots name
+    ``z_irq_spurious``, and the 6 that name nothing — 89, 198, 219, 228,
+    269, 270 — are the interrupts the firmware actually services.
+    ``gen_isr_tables.py`` wrote a resolved ADDRESS into those, so there is
+    no name to make a reference from.
+
+    **A missing slot does not mean unserviced, and it does not mean
+    serviced.**  It means the element is not the address of a function the
+    index can name: a zero, a resolved address, a data pointer, or a
+    position that could not be trusted.  Which of those it is depends on
+    the table, and the two real cases point opposite ways — a hole in a
+    table of handlers is an unused vector, while a hole in Zephyr's
+    ``_sw_isr_table`` is a vector in use.  The reader decides; this only
+    says where to look.
+
+    The length comes from the declared type, so no platform knowledge is
+    involved.  A table whose length cannot be read, or that has no missing
+    slot, is not reported.
+
+    Args:
+        conn: An open index database connection.
+        config_hash: The build configuration to read.
+
+    Returns:
+        A list of dicts, one for each array with missing slots, sorted by
+        table name.  Each has table_name, table_usr, table_file, declared
+        (the element count), named (how many slots name a function), and
+        missing (a compact range string such as ``"89, 198, 219"``).
+    """
+    rows = get_function_address_arrays(conn, config_hash)
+    if not rows:
+        return []
+
+    present: dict[str, set] = {}
+    where: dict[str, dict] = {}
+    for row in rows:
+        table_usr = str(row["table_usr"])
+        present.setdefault(table_usr, set()).add(row["slot"])
+        where.setdefault(table_usr, {
+            "table_name": row["table_name"],
+            "table_usr": table_usr,
+            "table_file": row["table_file"],
+        })
+
+    lengths: dict[str, int | None] = {}
+    for table_usr in present:
+        found = conn.execute(
+            """SELECT signature FROM symbols
+               WHERE config_hash = ? AND usr = ? LIMIT 1""",
+            (config_hash, table_usr),
+        ).fetchone()
+        lengths[table_usr] = (
+            _declared_length(str(found["signature"])) if found else None
+        )
+
+    out: list[dict] = []
+    for table_usr, slots in present.items():
+        declared = lengths[table_usr]
+        if declared is None:
+            continue
+        gaps = sorted(set(range(declared)) - slots)
+        if not gaps:
+            continue
+        out.append({
+            **where[table_usr],
+            "declared": declared,
+            "named": len(slots),
+            "missing": _as_ranges(gaps),
+        })
+    out.sort(key=lambda entry: str(entry["table_name"]))
     return out
 
 

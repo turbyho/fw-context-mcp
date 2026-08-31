@@ -1522,9 +1522,23 @@ def get_vector_table(
     assembly table, only its occupied slots, and an offset derived from
     that would be silently wrong for every entry of a 290-entry table.
 
+    **A ``coverage`` row follows the slots** for each table longer than the
+    number of slots that name a function.  It says how many of the declared
+    elements were named and which slot numbers were not, because a name is
+    not always there to be read: an element can be a zero, or an address
+    the linker resolved before the table was written.
+
+    Read it in both directions.  A hole in a table of handlers is a vector
+    nothing services.  A hole in Zephyr's ``_sw_isr_table`` is the
+    opposite — measured on an nRF54L application, 284 of 290 slots name the
+    spurious stub and the 6 without a name are the interrupts in use.  The
+    tool reports where to look; which meaning applies depends on the table.
+
     What is still not covered: an architecture that builds its table from
     branch instructions (arm64, Xtensa, MIPS) writes no table of
-    addresses in either form.  For an interrupt this tool cannot show,
+    addresses in either form.  A handler whose address the build resolved
+    at link time has no name to report either — ``coverage`` names its slot
+    but not the function.  For an interrupt this tool cannot show,
     ``find_references`` on the handler name still gives every reference
     the index holds.
 
@@ -1549,9 +1563,10 @@ def get_vector_table(
         file and line.
 
         Never empty: one dict with ``error`` (no index) or ``info`` (no
-        vector table in this build).  Check both keys first.  When more
-        slots exist than ``limit``, the last dict holds ``truncated``
-        saying how many are not shown.
+        vector table in this build).  Check both keys first.  A dict with
+        ``coverage`` follows the slots for each table that has unnamed
+        elements.  When more rows exist than ``limit``, the last dict holds
+        ``truncated`` saying how many are not shown.
     """
     limit = max(0, min(limit, 1000))
     db, err = _refs_guard(project_root, variant=variant, image=image)
@@ -1576,6 +1591,22 @@ def get_vector_table(
                 "were recorded also answers this way — reindex to read the "
                 "C source. Use find_references on a handler name instead."
             )}]
+        # Coverage goes after the slots and only when a table has gaps: a
+        # table the index named completely has nothing to add.  It is left
+        # out under unhandled_only, where the caller asked for one kind of
+        # row and a summary of every table would not be it.
+        if not unhandled_only:
+            rows = rows + [
+                {"coverage": (
+                    f"{entry['table_name']}: {entry['named']} of "
+                    f"{entry['declared']} slots name a function. No name in "
+                    f"slots {entry['missing']} — the element there is a zero, "
+                    f"an address the linker resolved, or not a function. "
+                    f"Whether that means the vector is unused or in use "
+                    f"depends on the table."
+                )}
+                for entry in index_db.get_table_coverage(conn, config_hash)
+            ]
         return _slots_within_limit(rows, limit)
 
     return db.execute_scoped(_query)

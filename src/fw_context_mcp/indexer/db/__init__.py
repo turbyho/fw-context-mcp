@@ -83,6 +83,7 @@ __all__ = [
     "get_memory_regions",
     "get_memory_regions_by_config",
     "get_overrides_for_method",
+    "get_table_coverage",
     "get_template_instances",
     "get_vec_dim",
     "get_vector_table",
@@ -129,6 +130,7 @@ from ._callgraph import (
     find_dead_code,
     find_hotspots,
     get_function_address_arrays,
+    get_table_coverage,
     get_vector_table,
 )
 from ._connection import (
