@@ -307,6 +307,124 @@ def test_an_empty_index_answers_empty(tmp_path, unhandled_only):
         conn.close()
 
 
+class TestADeclarationIsNotTheDefinition:
+    """A table in C names what the compiler saw, not where the code is.
+
+    Measured on the RISC-V image of zbox-ecb-fw-v5: all 571 slots pointed at
+    ``_isr_wrapper`` in ``sw_isr_table.h:29`` with ``is_definition = 0``,
+    while the definition is ``arch/riscv/core/isr.S:137``.  Every row then
+    named a header with nothing to read, and the status came out ``"c"`` —
+    asserting that code outside assembly services the interrupt, which is
+    false when the definition is assembly.
+    """
+
+    @staticmethod
+    def _riscv_shape(conn, definition_files=("isr.S",)):
+        """Write the shape: a C declaration in a header, plus definitions.
+
+        More than one *definition_files* entry makes the name ambiguous,
+        which is the case the rule has to refuse.
+        """
+        with transaction(conn):
+            header = upsert_file(conn, CONFIG, "sw_isr_table.h", "c")
+            insert_symbols_batch(conn, [
+                # The C declaration the initializer resolves to.
+                (CONFIG, header, "sw_isr_table.h", "_isr_wrapper",
+                 "c:@F@_isr_wrapper", "_isr_wrapper", "_isr_wrapper",
+                 "function", 29, 1, 29, 0, "", "", None, 0, 0, "", 0, "",
+                 1, 0.0, "", 0),
+            ])
+            for index, name in enumerate(definition_files):
+                fid = upsert_file(conn, CONFIG, name, "asm")
+                insert_symbols_batch(conn, [
+                    _symbol_row(CONFIG, fid, name, "_isr_wrapper",
+                                f"asm:{index}:_isr_wrapper", line=137 + index,
+                                end_line=200 + index),
+                ])
+            table = upsert_file(conn, CONFIG, "isr_tables.c", "c")
+            insert_symbols_batch(conn, [
+                _symbol_row(CONFIG, table, "isr_tables.c",
+                            "_irq_vector_table", "c:@_irq_vector_table",
+                            kind="varglobal", line=10, end_line=13),
+            ])
+            insert_refs_batch(conn, [
+                (CONFIG, "c:@F@_isr_wrapper", "isr_tables.c", 11 + slot,
+                 None, "indirect", slot)
+                for slot in (0, 1)
+            ])
+
+    def test_the_row_moves_onto_the_definition(self, tmp_path):
+        """file and line must name code, and the status must be assembly."""
+        conn = _db(tmp_path)
+        try:
+            self._riscv_shape(conn)
+
+            rows = get_vector_table(conn, CONFIG)
+            assert [(r["slot"], r["file"], r["line"], r["status"]) for r in rows] == [
+                (0, "isr.S", 137, "assembly"),
+                (1, "isr.S", 137, "assembly"),
+            ]
+        finally:
+            conn.close()
+
+    def test_two_definitions_of_one_name_leave_the_row_alone(self, tmp_path):
+        """Two static functions may share a name; guessing between them is worse.
+
+        The row keeps the declaration, which is at least not a claim about
+        the wrong file.
+        """
+        conn = _db(tmp_path)
+        try:
+            self._riscv_shape(conn, definition_files=("isr.S", "other.S"))
+
+            rows = get_vector_table(conn, CONFIG)
+            assert {r["file"] for r in rows} == {"sw_isr_table.h"}
+            assert {r["status"] for r in rows} == {"c"}
+        finally:
+            conn.close()
+
+    def test_a_declaration_with_no_definition_stays_put(self, tmp_path):
+        """Nothing to move onto is not an error."""
+        conn = _db(tmp_path)
+        try:
+            self._riscv_shape(conn, definition_files=())
+
+            rows = get_vector_table(conn, CONFIG)
+            assert {r["file"] for r in rows} == {"sw_isr_table.h"}
+        finally:
+            conn.close()
+
+    def test_a_row_that_already_names_a_definition_is_untouched(self, tmp_path):
+        """The common case must not be disturbed by the repair path."""
+        conn = _db(tmp_path)
+        try:
+            _c_table(conn, "_irq_vector_table", {0: "uart_isr"})
+
+            rows = get_vector_table(conn, CONFIG)
+            assert [(r["slot"], r["name"], r["status"]) for r in rows] == [
+                (0, "uart_isr", "c"),
+            ]
+            assert rows[0]["file"] == "handlers.c"
+        finally:
+            conn.close()
+
+    def test_no_row_carries_the_internal_flag(self, tmp_path):
+        """Both sources must return the same keys.
+
+        is_definition is how the C reader repairs a row; a reader of the
+        tool should not have to know that only C rows have it.
+        """
+        conn = _db(tmp_path)
+        try:
+            _assembly_table(conn, {1: "Reset_Handler"})
+            _c_table(conn, "_irq_vector_table", {0: "uart_isr"})
+
+            keys = [set(row) for row in get_vector_table(conn, CONFIG)]
+            assert all("is_definition" not in row for row in keys)
+        finally:
+            conn.close()
+
+
 class TestTheLimitIsVisible:
     """Cutting a table short must never look like a whole table.
 

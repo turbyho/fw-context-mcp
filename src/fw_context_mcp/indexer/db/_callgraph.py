@@ -1083,6 +1083,10 @@ def get_vector_table(
         from_assembly = entry_usr.startswith("asm:")
         weak = bool(entry.pop("is_weak"))
         kind = entry.pop("kind")
+        # Dropped so every row has the same keys whichever source it came
+        # from.  The C reader uses it to move a row off a declaration and
+        # onto the definition, and by here that work is done.
+        entry.pop("is_definition", None)
         dispatches = (
             filled[(table_key, entry_usr)] > 1
             and entry_usr in through_pointer
@@ -1202,10 +1206,18 @@ def get_function_address_arrays(
 
     Returns:
         A list of dicts sorted by array and then by slot.  Each dict has:
-        slot, name, file, line, kind, is_weak and usr for the target, plus
-        table_name, table_usr, table_file and table_line for the array and
-        the element inside it.  Empty when no array was recognised, which
-        is also what an index written before slots were recorded returns.
+        slot, name, file, line, kind, is_weak, usr and is_definition for the
+        target, plus table_name, table_usr, table_file and table_line for
+        the array and the element inside it.  Empty when no array was
+        recognised, which is also what an index written before slots were
+        recorded returns.
+
+        ``file`` and ``line`` name the definition of the target wherever the
+        index holds exactly one — an initializer in C names the DECLARATION
+        of a symbol defined in assembly, and that is a header with nothing
+        to read.  ``is_definition`` is 0 on the rows where no single
+        definition was found and the declaration had to stand.  See
+        ``_follow_declarations_to_definitions``.
     """
     rows = conn.execute(
         """SELECT r.slot_index AS slot,
@@ -1218,7 +1230,8 @@ def get_function_address_arrays(
                   s.line       AS line,
                   s.kind       AS kind,
                   s.is_weak    AS is_weak,
-                  s.usr        AS usr
+                  s.usr        AS usr,
+                  s.is_definition AS is_definition
            FROM refs r
            JOIN symbols s ON s.usr = r.to_usr
                          AND s.config_hash = r.config_hash
@@ -1250,4 +1263,78 @@ def get_function_address_arrays(
         if len(owners[element]) > 1:
             continue
         out.append(dict(row))
+    _follow_declarations_to_definitions(conn, config_hash, out)
     return out
+
+
+def _follow_declarations_to_definitions(
+    conn: sqlite3.Connection,
+    config_hash: str,
+    rows: list[dict],
+) -> None:
+    """Move a row from a declaration of its target onto the definition.
+
+    An initializer in C names whatever the compiler saw, and for a symbol
+    defined in assembly that is the C DECLARATION in a header.  Measured on
+    the RISC-V image of zbox-ecb-fw-v5: every one of the 571 slots pointed
+    at ``_isr_wrapper`` in ``sw_isr_table.h:29``, ``is_definition = 0``,
+    while the definition is ``arch/riscv/core/isr.S:137``.  The row was
+    wrong twice over — ``file`` and ``line`` named a header with nothing to
+    read, and the status came out ``"c"``, which asserts that code outside
+    assembly services the interrupt.
+
+    The definition is found by NAME, because a C declaration and an
+    assembly definition of one symbol do not share a USR: they live in the
+    ``c:@F@`` and ``asm:`` namespaces.
+
+    Matching by name is exactly the kind of rule that fails quietly — two
+    static functions in different files may share a name — so it applies
+    only when the config holds EXACTLY ONE definition of that name.  With
+    two or more the declaration stays, because a row pointing at the wrong
+    definition would be worse than one pointing at a header.
+
+    Rewrites *rows* in place, and leaves a row that already names a
+    definition untouched.
+    """
+    wanted = {
+        str(row["name"]) for row in rows if not row.get("is_definition")
+    }
+    if not wanted:
+        return
+
+    definitions: dict[str, dict] = {}
+    ambiguous: set[str] = set()
+    names = sorted(wanted)
+    # SQLite caps the number of bound parameters (999 by default), and this
+    # list is one name per target that resolved to a declaration.  Real data
+    # measured at most 1, but a table whose handlers are all declared in a
+    # header and defined in assembly would make it as long as the table, so
+    # the query is chunked rather than trusted to stay small.
+    chunk = 500
+    for start in range(0, len(names), chunk):
+        batch = names[start:start + chunk]
+        placeholders = ",".join("?" * len(batch))
+        for found in conn.execute(
+            f"""SELECT name, usr, file_path AS file, line, kind, is_weak
+                FROM symbols
+                WHERE config_hash = ? AND is_definition = 1
+                  AND name IN ({placeholders})""",
+            (config_hash, *batch),
+        ).fetchall():
+            name = str(found["name"])
+            if name in definitions:
+                ambiguous.add(name)
+                continue
+            definitions[name] = dict(found)
+
+    for row in rows:
+        if row.get("is_definition"):
+            continue
+        name = str(row["name"])
+        if name in ambiguous:
+            continue
+        definition = definitions.get(name)
+        if definition is None:
+            continue
+        row.update(definition)
+        row["is_definition"] = 1
