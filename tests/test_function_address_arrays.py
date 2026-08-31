@@ -169,6 +169,34 @@ void install(void) { cb = handler; }
         conn.close()
 
 
+def test_a_macro_expansion_does_not_donate_slots_to_a_neighbour(tmp_path):
+    """A driver macro puts a whole device definition on one line.
+
+    Measured on a Zephyr index: ``__pinctrl_state_pins_0`` sits at line
+    3465 with ``end_line`` 3465, and ``uarte_0_init`` and
+    ``uarte_nrfx_isr_int`` are on that same line, because one macro expands
+    to all of it.  The range join asks which array covers the line, and the
+    pinctrl array answers — so those two functions would be reported as its
+    elements, with slot numbers that mean nothing.
+
+    They are not, and the reason is worth pinning because it rests on two
+    separate rules meeting: the references come from a STRUCT initializer,
+    which is given no slot, and the reader only reads a reference that has
+    one.  Break either rule and this shape produces invented slots.
+    """
+    conn = _index(tmp_path, """
+void isr(void); void init(void);
+struct dev { int (*ini)(void); void (*irq)(void); };
+typedef unsigned char pin_t;
+const pin_t pins[] = { 11, 12 }; const struct dev d = { (int (*)(void))init, isr };
+void (*const real_table[])(void) = { isr, init };
+""", filename="driver.c")
+    try:
+        assert _slots(conn) == {"real_table": {0: "isr", 1: "init"}}
+    finally:
+        conn.close()
+
+
 def test_two_arrays_on_one_line_report_neither(tmp_path):
     """When a line holds two arrays, ownership is not knowable from it.
 
