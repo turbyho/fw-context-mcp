@@ -511,7 +511,13 @@ def run(
                 config_hash,
                 project_id,
                 str(compile_commands),
-                description=git_description,
+                # None keeps the recorded git context of the CONTENT.  This
+                # write happens before a single translation unit is read, so
+                # stamping the current branch here would mark the index as
+                # coming from a tree it has not been built from — and a run
+                # that fails leaves exactly that.  `_run_postprocess` writes
+                # the real value at the end, when the content matches it.
+                description=None,
                 manifest_verification=initial_manifest_verification,
                 analyze_vendor=int(_analyze_vendor),
                 variant=variant,

@@ -235,7 +235,7 @@ def upsert_build_config(
     compile_commands_path: str,
     embedding_dim: int | None = None,
     manifest_verification: str = "none",
-    description: str = "",
+    description: str | None = "",
     analyze_vendor: int = 0,
     variant: str = "",
     image: str = "",
@@ -258,7 +258,17 @@ def upsert_build_config(
         manifest_verification: ``"full"`` or ``"none"`` —
             indicates whether manifest.json was available during indexing.
         description: Human-readable build description (git branch + tag).
-            Updated on every index to reflect current git context.
+            ``None`` keeps whatever the row already holds.
+
+            WHY None exists: this description says which branch the CONTENT
+            of the index came from, and a run stamps the row twice — once
+            before the translation units and once after.  The first write
+            used to overwrite it with the current git context, so a run
+            that FAILED left the new branch recorded over the old content.
+            Anything comparing the two to notice a branch switch would then
+            see agreement that is not there.  ``runner.run`` passes None on
+            the first write for that reason; ``_postprocess`` passes the
+            real value on the last one, when the content matches it.
         variant: Build variant name (``''`` for single-project builds).
         image: Sysbuild image name (``''`` for non-sysbuild builds).
         board: Concrete board string per-(variant, image) — captures per-image
@@ -267,6 +277,16 @@ def upsert_build_config(
     Returns:
         None.
     """
+
+    if description is None:
+        # Read it rather than express "keep the old one" in SQL: the column
+        # is NOT NULL, so a NULL cannot travel through the INSERT arm to a
+        # coalesce in the UPDATE arm.  One row by primary key.
+        row = conn.execute(
+            "SELECT description FROM build_configs WHERE config_hash = ?",
+            (config_hash,),
+        ).fetchone()
+        description = str(row["description"]) if row is not None else ""
 
     # Columns guaranteed by open_db() → _ensure_migrated_columns()
     conn.execute(

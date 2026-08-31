@@ -58,6 +58,7 @@ from ...indexer.db import (
     open_db,
     transaction,
 )
+from ...indexer.git_context import branch_moved_since
 from ...llm.ollama import check_setup
 from ...utils import HEADER_EXTENSIONS, resolve_project_root
 from ..background import _is_bg_reindex_running
@@ -390,7 +391,12 @@ def get_active_build(
         current_schema (int — code expects), status (str — "ready"|"reindexing"|
         "reindex_needed"|"no_index"|"not_initialized"|"error"), reindex_needed (bool —
         structural mismatch requiring a full reindex),
-        reindex_reasons (list[str] — why reindex is needed, empty when False),
+        reindex_reasons (list[str] — why reindex is needed, empty when False.
+        One of them asks for `fw-context index --build` rather than a plain
+        reindex: when the tree is on a different branch than the index,
+        compile_commands.json belongs to the OLD branch and carries its file
+        list and its compiler flags, so only a build regenerates it.  Read
+        the reason text — it names the command it needs),
         stale (bool — True when reindex_needed or header_affected_tus > 0),
         _warning (str, optional — when manifest verification is not "full"),
         vec_available (bool), vec_error (str, optional),
@@ -612,10 +618,32 @@ def get_active_build(
         # Modified source files are handled per-query via auto-reindex
         # and do NOT cause reindex_needed=True.
         blocked_sources = bool(new_sources) and auto_state is not AutobuildState.WILL_BUILD
-        needs_reindex = cc_changed or schema_old or blocked_sources
+
+        # ── The tree moved to another branch since this index ──
+        # A fourth condition, and the only one a plain reindex cannot fix.
+        # compile_commands.json is a build artifact of the branch it was
+        # generated on: it carries that branch's file list AND its compiler
+        # flags.  Measured on zbox-ecb-fw, a switch from 4.15.3 to 4.15.1
+        # left two generated zcbor sources listed in that file and absent
+        # from the tree, and a reindex reads the same file again.
+        indexed_branch, live_branch = branch_moved_since(
+            cfg["description"] if "description" in cfg.keys() else "", root
+        )
+        branch_moved = bool(indexed_branch)
+        needs_reindex = cc_changed or schema_old or blocked_sources or branch_moved
 
         # Build reindex_reasons — only when reindex is actually needed
         reindex_reasons: list[str] = []
+        if branch_moved:
+            # Names `--build` on purpose.  A plain `fw-context index` reuses
+            # compile_commands.json, which belongs to the branch the index
+            # was built on, so it would reindex the wrong file list with the
+            # wrong flags.
+            reindex_reasons.append(
+                f"branch changed: indexed on {indexed_branch!r}, "
+                f"now on {live_branch!r} — compile_commands.json belongs to "
+                f"the old branch, run `fw-context index --build`"
+            )
         if schema_old:
             reindex_reasons.append(f"schema_mismatch: {db_schema_ver} < {CURRENT_SCHEMA_VERSION}")
         if cc_changed:

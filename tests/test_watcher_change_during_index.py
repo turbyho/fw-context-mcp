@@ -93,7 +93,7 @@ class TestChangeDuringIndex:
         pending.set()
         flag_at_spawn: list[bool] = []
 
-        async def _fake_run(project_root, db_dir, *, force_refs=False):
+        async def _fake_run(project_root, db_dir, *, force_refs=False, with_build=False):
             flag_at_spawn.append(pending.is_set())
             return SimpleNamespace(pid=4321, returncode=0)
 
@@ -124,7 +124,7 @@ class TestChangeDuringIndex:
         pending.set()
         spawns: list[int] = []
 
-        async def _fake_run(project_root, db_dir, *, force_refs=False):
+        async def _fake_run(project_root, db_dir, *, force_refs=False, with_build=False):
             spawns.append(1)
             return SimpleNamespace(pid=1, returncode=0)
 
@@ -155,7 +155,7 @@ class TestChangeDuringIndex:
             waits.append(1)
             return False
 
-        async def _must_not_run(project_root, db_dir, *, force_refs=False):
+        async def _must_not_run(project_root, db_dir, *, force_refs=False, with_build=False):
             raise AssertionError("the loop started an index under a held pause")
 
         monkeypatch.setattr(daemon_mod, "_wait_for_pause_to_clear", _never_clears)

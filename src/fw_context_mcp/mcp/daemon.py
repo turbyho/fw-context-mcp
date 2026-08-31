@@ -407,11 +407,37 @@ async def _reindex_loop(
         # after the marker clears.  After the last attempt the loop gives the
         # work up, because a manual operation that takes the index over again
         # and again would otherwise spawn one index subprocess after another.
+        # A git checkout is one of the bursts this loop debounces, and it can
+        # leave compile_commands.json describing the branch the tree left.
+        build_for = await loop.run_in_executor(
+            None, _branch_needs_build, project_root, db_dir
+        )
+
         for _attempt in range(_SUPERSEDED_RETRIES):
-            proc = await _run_index_async(project_root, db_dir, force_refs=force_refs)
+            proc = await _run_index_async(
+                project_root, db_dir, force_refs=force_refs,
+                with_build=bool(build_for),
+            )
             on_index_proc(proc)
             superseded = await _wait_index(proc, shutdown, db_dir=db_dir)
             on_index_proc(None)
+            if build_for and proc.returncode not in (
+                None, 0, EXIT_SUPERSEDED, EXIT_ALREADY_RUNNING,
+            ):
+                # Remember the failure so the next burst of file changes does
+                # not start the same build again.  Nothing CLEARS the marker
+                # here: a build that worked updates the recorded branch, thus
+                # `_branch_needs_build` stops asking on its own, and clearing
+                # would also drop a record the source-driven autobuild wrote.
+                from ..indexer.autobuild import record_failure
+
+                record_failure(db_dir, [f"branch:{build_for}"])
+                dlog.warning(
+                    "Build for branch %s failed (exit %s) — the index still "
+                    "describes the previous branch; run "
+                    "`fw-context index --build` and read the error",
+                    build_for, proc.returncode,
+                )
             if not superseded or shutdown.is_set():
                 break
             if not await _wait_for_pause_to_clear(project_root, shutdown):
@@ -603,10 +629,119 @@ def _staleness_check(project_root: Path) -> tuple[bool, list[str]]:
 # ── Index subprocess ─────────────────────────────────────────────────────────
 
 
+def _branch_needs_build(project_root: Path, db_dir: Path) -> str:
+    """Return the branch a `--build` is needed for, or an empty string.
+
+    A plain reindex reads the same `compile_commands.json`, and that file is
+    a build artifact of the branch it was generated on: it carries that
+    branch's file list AND its compiler flags.  Measured on zbox-ecb-fw, a
+    switch from 4.15.3 to 4.15.1 left two generated zcbor sources listed in
+    it and absent from the tree.  Only a build regenerates the file.
+
+    Answers with a branch only when all of these hold:
+
+    * The index records a branch and the tree is on a different one.
+    * The backend may build in the background — `background_build_safe`
+      refuses where a build of fw-context would reach the object files of
+      the build of the user, and that refusal outranks this.
+    * No build for this same branch failed inside the backoff window.  A
+      branch that does not build would otherwise start a build on every
+      burst of file changes.
+
+    Any failure to answer reads as "no", which costs a plain reindex and
+    a reported reason rather than an unwanted build.
+    """
+    from ..indexer.autobuild import blocked
+    from ..indexer.git_context import branch_moved_since
+    from ..utils import SAFE_EXCEPT
+    from .shared.context import _quick_open_readonly
+
+    db_path = db_dir / "index.db"
+    if not db_path.exists():
+        return ""
+
+    conn = None
+    try:
+        conn = _quick_open_readonly(db_path)
+        row = conn.execute(
+            "SELECT description FROM build_configs "
+            "ORDER BY created_at DESC, rowid DESC LIMIT 1"
+        ).fetchone()
+    except SAFE_EXCEPT:
+        log.debug("branch check: cannot read %s", db_path, exc_info=True)
+        return ""
+    finally:
+        if conn is not None:
+            conn.close()
+    if row is None:
+        return ""
+
+    indexed, current = branch_moved_since(str(row["description"] or ""), project_root)
+    if not indexed:
+        return ""
+
+    # The backend decides whether fw-context may build at all, and its
+    # refusal outranks this: `background_build_safe` says no where a build of
+    # fw-context would reach the object files of the build of the user.
+    from dataclasses import replace
+
+    from ..config import load as load_config
+    from ..indexer.build import detect_build_system
+    from ..indexer.builders import background_build_safe, registry
+    from ..utils import autobuild_dir
+
+    try:
+        cfg = load_config(project_root=project_root)
+        key = cfg.build.system or detect_build_system(project_root)
+        builder_cls = registry.get(key) if key else None
+        candidate = (
+            replace(
+                cfg.build,
+                isolated_build_dir=autobuild_dir(cfg.build.default_variant or ""),
+            )
+            if builder_cls is not None
+            else None
+        )
+    except SAFE_EXCEPT:
+        log.debug("branch check: cannot resolve the build system", exc_info=True)
+        return ""
+    if builder_cls is None:
+        return ""
+    if not background_build_safe(builder_cls(), candidate):
+        log.info(
+            "Branch changed %s -> %s, but this build system cannot build in "
+            "the background — run `fw-context index --build`",
+            indexed, current,
+        )
+        return ""
+
+    if blocked(db_dir, [f"branch:{current}"]):
+        log.info(
+            "Branch changed %s -> %s, but a build for %s failed recently — "
+            "reindexing without --build",
+            indexed, current, current,
+        )
+        return ""
+
+    log.info(
+        "Branch changed %s -> %s — reindexing with --build so "
+        "compile_commands.json is regenerated",
+        indexed, current,
+    )
+    return current
+
+
 async def _run_index_async(
     project_root: Path, db_dir: Path, *, force_refs: bool = False,
+    with_build: bool = False,
 ) -> asyncio.subprocess.Process:
     """Spawn ``fw-context index --background``, write stdout to ``reindex.log``.
+
+    *with_build* adds ``--build``, which regenerates
+    ``compile_commands.json`` before indexing.  Needed when the tree moved
+    to another branch: that file belongs to the branch it was generated on,
+    so a plain reindex would read the wrong file list with the wrong flags.
+    See ``_branch_needs_build``, which is the only caller that sets it.
 
     Writes the subprocess PID to ``reindex.pid`` so ``_is_bg_reindex_running``
     can reliably detect an active index run (without false positives from
@@ -646,7 +781,8 @@ async def _run_index_async(
 
     try:
         proc = await asyncio.create_subprocess_exec(
-            sys.executable, "-u", "-m", "fw_context_mcp.cli", "index", "--background",
+            sys.executable, "-u", "-m", "fw_context_mcp.cli", "index",
+            "--background", *(("--build",) if with_build else ()),
             cwd=str(project_root),
             stdout=log_fh,
             stderr=asyncio.subprocess.STDOUT,

@@ -68,3 +68,73 @@ def get_git_description(project_root: Path) -> str:
         pass
 
     return ", ".join(parts)
+
+
+_BRANCH_PREFIX = "branch: "
+
+
+def branch_of_description(description: str) -> str:
+    """Return the branch a stored ``description`` names, or an empty string.
+
+    The format is the one `get_git_description` writes:
+    ``"branch: main, tag: v2.1.0"``.  A description written when HEAD was
+    detached carries no branch part and gives an empty string.
+    """
+    for part in description.split(","):
+        stripped = part.strip()
+        if stripped.startswith(_BRANCH_PREFIX):
+            return stripped[len(_BRANCH_PREFIX):].strip()
+    return ""
+
+
+def current_branch(project_root: Path) -> str:
+    """Return the branch checked out at *project_root*, or an empty string.
+
+    Empty for a detached HEAD, for a directory that is not a repository, and
+    for any git failure — the same rule `get_git_description` follows, so the
+    two agree on what "no branch" means.
+    """
+    try:
+        branch = subprocess.check_output(
+            ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+            cwd=str(project_root),
+            text=True,
+            encoding=_GIT_ENCODING,
+            timeout=_GIT_TIMEOUT,
+            stderr=subprocess.PIPE,
+        ).strip()
+    except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired,
+            UnicodeDecodeError):
+        return ""
+    return "" if branch == "HEAD" else branch
+
+
+def branch_moved_since(description: str, project_root: Path) -> tuple[str, str]:
+    """Say whether the tree is on a different branch than the index.
+
+    Returns ``(indexed_branch, current_branch)`` when they differ, and
+    ``("", "")`` when they agree or when either is unknown.
+
+    WHY this matters more than a plain reindex: a branch switch changes the
+    source tree AND the compiler flags, and `compile_commands.json` is a
+    build artifact of the branch it was generated on.  Measured on
+    zbox-ecb-fw, switching from 4.15.3 to 4.15.1 left two generated zcbor
+    sources listed in that file and absent from the tree.  A reindex reads
+    the same stale file; only a build regenerates it.
+
+    WHY the branch and not the whole description: the description also
+    carries the last tag, and a new tag on the same branch moves nothing.
+    Comparing whole strings would ask for a build after every release tag.
+
+    WHAT THIS DOES NOT SEE: a move that leaves no branch name — checking out
+    a tag or a commit detaches HEAD, and both sides then read as unknown.
+    The index reports nothing rather than guessing, and the ordinary
+    staleness checks still see the changed files.
+    """
+    indexed = branch_of_description(description)
+    if not indexed:
+        return "", ""
+    current = current_branch(project_root)
+    if not current or current == indexed:
+        return "", ""
+    return indexed, current
