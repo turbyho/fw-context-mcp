@@ -363,6 +363,51 @@ class TestTheToolAsksForABuild:
         assert state["status"] == "reindex_needed"
         assert state["stale"] is True
 
+    def test_the_advice_names_the_automatic_path_too(self, indexed_repo):
+        """Both halves, and the reason why.
+
+        Measured on a real checkout of zbox-ecb-fw: this reason read as a
+        command while the new-source reason beside it read "no command is
+        needed", and the two contradicted each other.  A project the daemon
+        will handle must not read like one that needs a command typed — and
+        the command still has to be there, because a checkout on a project
+        nobody watches produces no burst for the daemon to see.
+
+        `cmake` is a backend that allows a background build.  Named
+        explicitly: the fixture leaves `[build] system` out, and marker
+        detection on a bare directory answers with something else.
+        """
+        (indexed_repo / ".fw-context" / "config.toml").write_text(
+            '[project]\nid = "0123456789abcdef0123456789abcdef"\n'
+            '[build]\nsystem = "cmake"\n',
+            encoding="utf-8",
+        )
+        _switch_to(indexed_repo, "release/4.15.1")
+        state = self._state(indexed_repo)
+        reason = next(
+            r for r in state["reindex_reasons"] if "branch changed" in r
+        )
+        assert "background reindex" in reason, reason
+        assert "--build" in reason, reason
+
+    def test_a_backend_that_cannot_build_gets_the_command_alone(
+        self, indexed_repo
+    ):
+        # Keil detects and builds nothing, thus nothing will happen on its
+        # own and the command is the whole answer.
+        (indexed_repo / ".fw-context" / "config.toml").write_text(
+            '[project]\nid = "0123456789abcdef0123456789abcdef"\n'
+            '[build]\nsystem = "keil"\n',
+            encoding="utf-8",
+        )
+        _switch_to(indexed_repo, "release/4.15.1")
+        state = self._state(indexed_repo)
+        reason = next(
+            r for r in state["reindex_reasons"] if "branch changed" in r
+        )
+        assert "background reindex" not in reason, reason
+        assert "run `fw-context index --build`" in reason, reason
+
 
 # ── The daemon reindexes with --build ──────────────────────────────────────
 

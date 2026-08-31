@@ -143,6 +143,37 @@ def _expand_dir_placeholder(dir_str: str, root: Path) -> str:
     return dir_str
 
 
+def _background_build_allowed(root: Path, proj_cfg: Config) -> bool:
+    """Say whether fw-context may run a build of this project on its own.
+
+    The same question `daemon._branch_needs_build` asks, and the same
+    answer: `background_build_safe` refuses where a build of fw-context
+    would reach the object files of the build of the user.  Asked here only
+    to word the advice — a project the daemon will handle should not read
+    like one that needs a command typed.
+
+    Any failure to decide answers no, which keeps the command in the advice.
+    """
+    from dataclasses import replace
+
+    from ...indexer.build import detect_build_system
+    from ...indexer.builders import background_build_safe, registry
+    from ...utils import SAFE_EXCEPT, autobuild_dir
+
+    try:
+        key = proj_cfg.build.system or detect_build_system(root)
+        builder_cls = registry.get(key) if key else None
+        if builder_cls is None:
+            return False
+        candidate = replace(
+            proj_cfg.build,
+            isolated_build_dir=autobuild_dir(proj_cfg.build.default_variant or ""),
+        )
+        return background_build_safe(builder_cls(), candidate)
+    except SAFE_EXCEPT:
+        return False
+
+
 def _build_variant_discovery(cfg: Config, builds: list, root: Path) -> dict:
     """Build discovery data (variants/images/variant_images) for the LLM.
 
@@ -635,14 +666,28 @@ def get_active_build(
         # Build reindex_reasons — only when reindex is actually needed
         reindex_reasons: list[str] = []
         if branch_moved:
-            # Names `--build` on purpose.  A plain `fw-context index` reuses
+            # Always names `--build`, never a plain reindex: that would reuse
             # compile_commands.json, which belongs to the branch the index
-            # was built on, so it would reindex the wrong file list with the
-            # wrong flags.
+            # was built on, with its file list and its compiler flags.
+            #
+            # The daemon runs it on its own where the backend allows a
+            # background build, so the advice says both — a checkout on a
+            # project nobody is watching gets no burst, and then the manual
+            # command is the only thing that fixes it.  Measured: without the
+            # second half this reason read as a command while the
+            # new-source reason beside it read "no command is needed", and
+            # the two contradicted each other on one checkout of zbox-ecb-fw.
             reindex_reasons.append(
                 f"branch changed: indexed on {indexed_branch!r}, "
                 f"now on {live_branch!r} — compile_commands.json belongs to "
-                f"the old branch, run `fw-context index --build`"
+                f"the old branch"
+                + (
+                    "; a background reindex regenerates it with --build when "
+                    "the watcher sees a change, or run "
+                    "`fw-context index --build` now"
+                    if _background_build_allowed(root, proj_cfg)
+                    else ", run `fw-context index --build`"
+                )
             )
         if schema_old:
             reindex_reasons.append(f"schema_mismatch: {db_schema_ver} < {CURRENT_SCHEMA_VERSION}")
