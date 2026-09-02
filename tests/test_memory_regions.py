@@ -5,7 +5,7 @@ firmware knowledge of its kind in the index — it is not in
 `compile_commands.json` and no translation unit holds it.
 
 The rule these tests exist to pin: **the map belongs to ONE build.**
-zbox-ecb-fw-v5 keeps nine configurations in one database, and three of them
+the Zephyr project keeps nine configurations in one database, and three of them
 on the same chip declare different addresses — `app` at flash 372736,
 `mcuboot` at 110592, and `app_flpr` no flash region at all.  A map that
 leaked between configurations would put a wrong address in front of a user

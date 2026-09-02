@@ -2,7 +2,7 @@
 
 Why no RRF (Reciprocal Rank Fusion)?
     RRF merges FTS5 and embedding results by giving each result a score
-    based on its rank in both lists.  Evaluation on zbox-ecb-fw (30 queries)
+    based on its rank in both lists.  Evaluation on the Mbed project (30 queries)
     showed Dense-only MRR 0.609 vs any hybrid combination < 0.58.  FTS5
     adds noise for natural-language queries because it matches sub-word
     tokens without semantic understanding — a "dma transfer" query via
@@ -11,13 +11,13 @@ Why no RRF (Reciprocal Rank Fusion)?
 
 Why the dense-count threshold?
     On some projects, embedding quality is poor (pre-desc-v4 model:
-    HA_Boiler dense MRR=0.066 vs FTS5 MRR=0.335).  The threshold prevents
+    The ESP32 project dense MRR=0.066 vs FTS5 MRR=0.335).  The threshold prevents
     returning 2-3 barely-relevant dense results when FTS5 would return
     20 solid hits.  When dense results are too sparse to be trustworthy,
     fall back to FTS5.
 
 Replaces old ``rrf_fusion`` + ``rerank`` dual-phase.
-Evaluation on zbox-ecb-fw (30 queries): Dense-only MRR 0.609 > any hybrid.
+Evaluation on the Mbed project (30 queries): Dense-only MRR 0.609 > any hybrid.
 FTS5 adds noise for NL queries — best strategy is to trust the embedding model.
 
 When embeddings produce too few results (below *min_dense_count* threshold),
@@ -40,7 +40,7 @@ log = logging.getLogger(__name__)
 
 # Minimum number of embedding results to trust dense-only routing.
 # Below this threshold, FTS5 is used as fallback — dense results are
-# too sparse to be reliable (e.g. HA_Boiler: dense MRR=0.066 vs
+# too sparse to be reliable (e.g. The ESP32 project: dense MRR=0.066 vs
 # FTS5 MRR=0.335 at pre-desc-v4 embedding quality).
 MIN_DENSE_COUNT: int = 3
 

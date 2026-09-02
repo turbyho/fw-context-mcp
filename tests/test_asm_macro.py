@@ -52,7 +52,7 @@ class TestParseParameters:
         assert param.default == "default_value"
 
     def test_an_empty_default_is_not_no_default(self):
-        """`sum from=0` and `sum from=` differ: the second defaults to ""."""
+        """`sum from=0` and `sum from=` differ: The second defaults to ""."""
         (param,) = parse_parameters("from=")
 
         assert param.default == ""

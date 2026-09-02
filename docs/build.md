@@ -499,7 +499,7 @@ default_variant = "nrf52840-dev"
 name = "nrf52840-dev"
 board = "nrf52840dk/nrf52840"
 build_dir = "build/nrf52840_sysbuild"
-env = { ZBOX_ENV = "DEV" }
+env = { BOARD_ENV = "DEV" }
 images = [
   { name = "app",      dir = "proj/app",                  type = "project" },
   { name = "mcuboot",  dir = "${NCS}/bootloader/mcuboot", type = "sdk" },

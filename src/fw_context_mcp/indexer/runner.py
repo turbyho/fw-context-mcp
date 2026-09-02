@@ -209,7 +209,7 @@ def _store_linker_scripts(
     * BEFORE assembly, so ``asm._declare_referenced_only`` finds the name
       already in the index and adds no ``kind="undefined"`` row for it.
       That is what closes slot 0 of a vector table: measured before this,
-      FM held ``_estack`` and zbox held ``__StackTop`` with that kind, one
+      the STM32 project held ``_estack`` and the Mbed project held ``__StackTop`` with that kind, one
       per project.
 
     *build_system* is the ``[build] system`` config key, which wins over

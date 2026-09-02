@@ -2,7 +2,7 @@
 
 Observed defect: a background reindex logged
 
-    ERROR [function] empty body for zbox::img_parse_tlvs at
+    ERROR [function] empty body for the Mbed project::img_parse_tlvs at
     .../src/img_parse.cpp:56-216 — path resolution or extent mismatch
 
 The cause was benign — an editor shortened the file while the reindex read
@@ -58,7 +58,7 @@ def _row(
     return {
         "id": 1,
         "name": "img_parse_tlvs",
-        "qualified_name": "zbox::img_parse_tlvs",
+        "qualified_name": "the Mbed project::img_parse_tlvs",
         "kind": kind,
         "file_path": file_path,
         "line": line,
@@ -130,7 +130,7 @@ def _add_symbol(conn, file_id: int, file_path: str, *, line: int, end_line: int)
         conn,
         [
             (CONFIG_HASH, file_id, file_path, "img_parse_tlvs", "usr-img", "img_parse_tlvs",
-             "zbox::img_parse_tlvs", "function", line, 1, end_line, 1,
+             "the Mbed project::img_parse_tlvs", "function", line, 1, end_line, 1,
              "int img_parse_tlvs(const uint8_t*, size_t)",
              "", None, 0, 0, "", 0, "", 1, 0.0, "// line 5\n", 0),
         ],

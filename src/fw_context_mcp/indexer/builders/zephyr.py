@@ -44,7 +44,7 @@ def _zephyr_vendor_patterns(
     Derived from ZEPHYR_BASE and WEST_TOPDIR, never guessed from a marker
     file.  The application directory gives no signal: it is arbitrary, and
     for a sysbuild image such as mcuboot it sits INSIDE the SDK.  Measured on
-    zbox-ecb-fw-v5: four different CMAKE_SOURCE_DIR values across 9 builds,
+    the Zephyr project: four different CMAKE_SOURCE_DIR values across 9 builds,
     one of them under the SDK root.
 
     A root outside project_root needs no pattern.  A path outside
@@ -82,7 +82,7 @@ def _prefix_map_roots(units: list | None) -> tuple[Path | None, Path | None]:
         -fmacro-prefix-map=/home/u/ncs/v3.4.0=WEST_TOPDIR
         -fmacro-prefix-map=<app dir>=CMAKE_SOURCE_DIR
 
-    Verified in all 9 production artifacts of zbox-ecb-fw-v5 with no
+    Verified in all 9 production artifacts of the Zephyr project with no
     exception.  This is the strongest source there is: it describes the
     build that is indexed, not the shell that runs fw-context and not the
     state of the filesystem.
@@ -449,7 +449,7 @@ class ZephyrBuildSystem:
         A sysbuild image keeps its own `build.ninja` and its own
         `compile_commands.json` in one directory, thus the build directory
         is the parent of *compile_commands*.  Every image has its own memory
-        map: measured on zbox-ecb-fw-v5, `app` starts at flash 372736,
+        map: measured on the Zephyr project, `app` starts at flash 372736,
         `mcuboot` at 110592, and `app_flpr` declares no flash region at all.
 
         Zephyr links twice and names two scripts, `zephyr/linker.cmd` and

@@ -156,7 +156,7 @@ def read_reindex_progress(db_dir: Path) -> str | None:
     stdout AND the stderr of ``fw-context index --background`` to that
     file, and a build runs inside that process, so the file also holds the
     output of west, cmake, ninja, and the shell that started them.  The
-    last line is often one of theirs: a run in zbox-ecb-fw-v5 ended on a
+    last line is often one of theirs: a run in the Zephyr project ended on a
     bare ``lean-ctx:``, and both readers of this log — ``get_active_build``
     and ``fw-context watch status`` — reported that text as the progress.
 

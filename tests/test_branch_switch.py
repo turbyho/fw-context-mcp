@@ -4,7 +4,7 @@
 on: it carries that branch's file list AND its compiler flags.  A reindex
 reads the same file again.
 
-Measured on zbox-ecb-fw: switching from 4.15.3 to 4.15.1 left two generated
+Measured on the Mbed project: switching from 4.15.3 to 4.15.1 left two generated
 zcbor sources listed in that file and absent from the tree.  Two files out of
 881 then ended the whole index run — fixed separately — and even with the
 skip in place the index describes the wrong tree until a build regenerates
@@ -54,7 +54,7 @@ class TestReadingTheStoredBranch:
         assert branch_of_description("") == ""
 
     def test_a_branch_name_that_holds_a_slash(self):
-        # The measured shape on zbox-ecb-fw.
+        # The measured shape on the Mbed project.
         found = branch_of_description(
             "branch: v4.15.1/devel_work, tag: 4.15.1-PRE.12"
         )
@@ -366,7 +366,7 @@ class TestTheToolAsksForABuild:
     def test_the_advice_names_the_automatic_path_too(self, indexed_repo):
         """Both halves, and the reason why.
 
-        Measured on a real checkout of zbox-ecb-fw: this reason read as a
+        Measured on a real checkout of the Mbed project: this reason read as a
         command while the new-source reason beside it read "no command is
         needed", and the two contradicted each other.  A project the daemon
         will handle must not read like one that needs a command typed — and
@@ -417,7 +417,7 @@ class TestThePlanTakesTheBranch:
 
     It is also the only path that sets `isolated_build_dir`, and that value
     is what makes `--build` legal on a `--background` run.  A `--build` from
-    anywhere else fails: measured on a real checkout of zbox-ecb-fw, the
+    anywhere else fails: measured on a real checkout of the Mbed project, the
     daemon passing the flag itself produced "error: --build and --background
     are mutually exclusive" and the run died in under a second.
     """

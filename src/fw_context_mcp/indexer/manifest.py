@@ -36,7 +36,7 @@ from fw_context_mcp.utils import compute_source_hash
 log = logging.getLogger(__name__)
 
 # Bumped from /1, which repeated every header's hash and every TU's argument
-# list inside each entry.  On zbox that was 86 686 header records for 1 037
+# list inside each entry.  On the Mbed project that was 86 686 header records for 1 037
 # distinct files and 876 argument lists for 2 distinct ones — 52.45 MB, of
 # which 74% was duplication.  /2 keeps one ``headers`` map and one
 # ``arg_sets`` table and has each entry reference them.
@@ -123,7 +123,7 @@ def _intern_arguments(arguments: list[str], arg_sets: list[list[str]]) -> int:
     """Return the index of *arguments* in *arg_sets*, appending it if new.
 
     Linear search is deliberate: a project has a handful of distinct argument
-    lists (2 on zbox, 14 on HA_Boiler), so the scan is shorter than the cost
+    lists (2 on the Mbed project, 14 on the ESP32 project), so the scan is shorter than the cost
     of hashing a 410-token list to key a dict.
     """
     for index, existing in enumerate(arg_sets):
@@ -201,7 +201,7 @@ def _collect_headers_from_tokens(
     Returns the paths as stored in the manifest.  The hash and the
     ``generated`` flag go into *header_table*, keyed by path — a file included
     by 300 TUs is hashed on the first TU that reaches it and looked up by the
-    other 299.  On zbox that is 1 037 hashes instead of 86 686.
+    other 299.  On the Mbed project that is 1 037 hashes instead of 86 686.
 
     Pass a fresh dict per manifest, not per TU; the table is the manifest's
     ``headers`` section and must span every entry.  When *header_table* is
@@ -255,7 +255,7 @@ def _collect_headers_from_tokens(
         # whitelist here ({.h .hpp .hxx .hh .inl}), and it silently dropped
         # every extensionless C++ standard header (<algorithm>, <bit>) and
         # every .tcc template body.  Two consequences, both measured on
-        # HA_Boiler: the coverage purge deleted 29 such files and 1810 symbols
+        # The ESP32 project: the coverage purge deleted 29 such files and 1810 symbols
         # because the manifest did not list them, and a toolchain upgrade
         # could change any of them without marking a single TU stale, because
         # no hash was recorded to compare.  A whitelist of "what counts as a
@@ -413,7 +413,7 @@ def _load_cheap_keys(db_dir: Path, config_hash: str) -> dict:
     WHY this exists rather than ``load(...)[key]``: the staleness helpers on
     the MCP query path need nothing else from the manifest, and parsing the
     whole file to reach one short list is the most expensive thing they do.
-    Measured on zbox-ecb-fw (876 TUs), the manifest is 52 MB and takes 109 ms
+    Measured on the Mbed project (876 TUs), the manifest is 52 MB and takes 109 ms
     to read and parse — paid on EVERY query routed through
     ``_with_stale_recovery``.
 
@@ -463,7 +463,7 @@ def load_build_dir_patterns(db_dir: Path, config_hash: str) -> list[str]:
     WHY this exists rather than ``load(...)["build_dir_patterns"]``: the
     staleness helpers on the MCP query path need nothing else from the
     manifest, and parsing the whole file to reach one short list is the most
-    expensive thing they do.  Measured on zbox-ecb-fw (876 TUs), the manifest
+    expensive thing they do.  Measured on the Mbed project (876 TUs), the manifest
     is 52 MB and takes 109 ms to read and parse — paid on EVERY query routed
     through ``_with_stale_recovery``, to obtain a list of two or three
     strings.
@@ -725,8 +725,8 @@ def compute_config_hash(
       header stayed under the old hash and retention deleted them.
     - **Include search paths INSIDE the project** (``-I``, ``-isystem``,
       ``-include``, …).  This is where per-directory variance lives —
-      HA_Boiler has 14 distinct flag-sets but 208 distinct include paths, and
-      zbox-ecb-fw has 268 in-project ones.  A directory that moves inside the
+      the ESP32 project has 14 distinct flag-sets but 208 distinct include paths, and
+      the Mbed project has 268 in-project ones.  A directory that moves inside the
       project does not change what the compiler reads.
 
     An include path OUTSIDE the project is KEPT, because it names the
@@ -834,15 +834,15 @@ def compute_config_hash(
 
     # Accumulated across ALL translation units, deduplicated: a macro or
     # dialect flag anywhere in the build is part of that build's identity,
-    # and it counts once no matter how many TUs carry it.  (Measured: FM has
-    # an identical -D set on all 216 TUs; HA_Boiler has exactly one macro
+    # and it counts once no matter how many TUs carry it.  (Measured: the STM32 project has
+    # an identical -D set on all 216 TUs; the ESP32 project has exactly one macro
     # that varies, ARDUINO_CORE_BUILD on 46 of 114.)
     defines: set[str] = set()
     dialect: set[str] = set()
     # Out-of-project include paths go in as the INTERSECTION over translation
     # units, not as the union.  A path that only some units carry is per-unit
     # state, and to put it in would put the translation-unit list back into
-    # the hash: on zbox-ecb-fw-v5 one generated unit,
+    # the hash: on the Zephyr project one generated unit,
     # validate_binding_headers.c, carries 11 devicetree binding headers, so
     # the union moves each time the board overlay changes.  The intersection
     # does not move.  Measured over 2 052 translation units in 7 real builds:
@@ -899,13 +899,13 @@ def compute_config_hash(
             # Join ANY flag with a following non-flag token, before the sort.
             # The path pass below pairs a flag with its neighbour BY POSITION,
             # and the sort has already moved each value away from its flag.
-            # Measured on zbox-ecb-fw-v5, one build of 257 translation units:
+            # Measured on the Zephyr project, one build of 257 translation units:
             # a sorted -isystem consumed -mabi=aapcs 230 times, and it left
             # its own directory in the set as a token with no flag.
             #
             # WHY no list of "flags that take a value": such a list cannot
             # stay complete, and _is_dialect_token() drops what it forgets.
-            # Measured on FM, the forgotten ones were
+            # Measured on the STM32 project, the forgotten ones were
             # "--param max-inline-insns-single=500" and the separated
             # --sysroot form, which carries the toolchain root.
             #
@@ -946,7 +946,7 @@ def compute_config_hash(
             # Include search paths INSIDE the project are dropped.  Paths
             # outside it are kept.  The two answer different questions.
             #
-            # An in-project path is per-unit state.  zbox-ecb-fw has 268 of
+            # An in-project path is per-unit state.  The Mbed project has 268 of
             # them, and they move when a directory moves.  A moved directory
             # does not change what the compiler reads.
             #

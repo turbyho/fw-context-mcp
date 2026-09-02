@@ -197,7 +197,7 @@ class TestTheConfiguredSystemWins:
         A freestanding NCS application has CMakeLists.txt and no west.yml.  A
         marker scan calls it a CMake project, so GenericCMakeBuildSystem
         validated its artifacts and answered for its build directories.
-        Measured on zbox-ecb-fw-v5, which declares system = "zephyr".
+        Measured on the Zephyr project, which declares system = "zephyr".
         """
         from fw_context_mcp.config import load as load_config
         from fw_context_mcp.indexer.builders import registry
@@ -257,7 +257,7 @@ class TestBuildVariantConfig:
     def test_the_build_dir_pattern_is_per_variant(self):
         """``build_dir`` IS per-variant, and this is the boundary that measurement supports.
 
-        Measured on zbox-ecb-fw-v5: 9 builds and 2 different build_dir values.
+        Measured on the Zephyr project: 9 builds and 2 different build_dir values.
         The vendor patterns have no such measured trigger, so do not read this
         test as evidence for a per-variant vendor set.
         """

@@ -21,7 +21,7 @@ from pathlib import Path
 log = logging.getLogger(__name__)
 
 # The linker takes its script with `-T <path>`, and a ninja file records the
-# whole link command.  Measured on zbox-ecb-fw-v5, every image:
+# whole link command.  Measured on the Zephyr project, every image:
 #
 #   LINK_LIBRARIES = … -T  zephyr/linker.cmd  -Wl,-Map,…
 #
@@ -110,13 +110,13 @@ def output_dirs_from_units(
 
     A build system can keep one output tree per configuration.  mbed-tools
     compiles into `BUILD/<target>/<toolchain>-<profile>/`, and
-    birdie1-v2-fw-v3 holds two such trees, `GCC_ARM-DEBUG` and
+    the second Mbed project holds two such trees, `GCC_ARM-DEBUG` and
     `GCC_ARM-DEVELOP`, each with its own linker script.  Only one belongs
     to the build the index describes, and the build itself says which.
 
     The source is `raw_entry`, the entry as the build wrote it.  NOT
     `clang_args`: those are normalized for libclang, and the normalization
-    removes the output flag — measured on birdie1, 349 normalized tokens
+    removes the output flag — measured on the second Mbed project, 349 normalized tokens
     and no `-o` among them, against 105 raw tokens that hold it.
 
     Two fields carry the answer, in this order:

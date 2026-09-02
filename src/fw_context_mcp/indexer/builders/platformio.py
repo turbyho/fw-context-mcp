@@ -204,12 +204,13 @@ class PlatformIOBuildSystem:
 
         SCons runs the link and writes no ninja file, no `link.txt`, and no
         response file that the index can read.  The map file does not name
-        the script either: measured on FM, `firmware.map` holds the
+        the script either: measured on the STM32 project, `firmware.map` holds the
         resolved `Memory Configuration` and the assignments, but never the
         file name of the script.
 
-        Measured on FM (STM32, `ldscript.ld` in the framework variant) and
-        on HA_Boiler (ESP32): neither names its script anywhere the index
+        Measured on the STM32 project, whose `ldscript.ld` comes from the
+        framework variant, and on the ESP32 project: neither names its
+        script anywhere the index
         can find.  A search of the include directories would find a
         candidate, and a candidate is a guess.
 
@@ -229,8 +230,8 @@ class PlatformIOBuildSystem:
         That mattered once a build-generated header became the only thing the
         staleness check still trusts: every vendored library header under
         ``.pio/libdeps/`` was trusted, so an edit to one went unnoticed.
-        Measured: 56 of the 56 headers HA_Boiler called generated were under
-        libdeps and none were under build, and 1 of 1 on FM.  Every other
+        Measured: 56 of the 56 headers the ESP32 project called generated were under
+        libdeps and none were under build, and 1 of 1 on the STM32 project.  Every other
         build system was clean — Mbed 0 of 1, Zephyr 0 of 27.
 
         ``.pio/libdeps/`` keeps its own answer in get_vendor_patterns(): it is

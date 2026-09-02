@@ -1155,7 +1155,7 @@ def find_wrapper_callers(
         wrapped: dict[str, dict] = {}
         for r in rows:
             caller_qn = r["caller_qname"] or r["caller_name"] or "?"
-            # Extract class from qualified name: "zbox::ZMODEM::start" → "zbox::ZMODEM"
+            # Extract class from qualified name: "the Mbed project::ZMODEM::start" → "the Mbed project::ZMODEM"
             if "::" in caller_qn:
                 wrapper_class = caller_qn.rsplit("::", 1)[0]
             else:
@@ -1171,7 +1171,7 @@ def find_wrapper_callers(
                     # The file that holds the call, thus the file that holds
                     # the body of this wrapper method.  A per-method path is
                     # necessary: one wrapper class can span many files (18%
-                    # of the classes in zbox-ecb-fw do, up to 49 files), thus
+                    # of the classes in the Mbed project do, up to 49 files), thus
                     # a single path on the class would cover only one of
                     # them, and the staleness check would miss the rest.
                     "file": abs_path(db.root, r["from_file"]),
@@ -1618,7 +1618,7 @@ def get_vector_table(
     * ``"linker"`` — the linker script gives the address and no compiled
       file defines the name.  Slot 0 holds the initial stack pointer, not
       a handler, and looks like this.  When the index read the script,
-      ``file`` and ``line`` name the assignment in it — on zbox-ecb-fw,
+      ``file`` and ``line`` name the assignment in it — on the Mbed project,
       `__StackTop` at `.link_script.ld:148`.  Do not read this row as
       code: there is no function to follow.
     * ``"dispatcher"`` — the slot reaches a function that holds more than

@@ -51,7 +51,7 @@ def _normalize_entry(entry: dict) -> dict:
 
     # Expand response files inline so hash is stable across build dirs.
     # A relative @rsp resolves against the entry's OWN directory, not the
-    # directory fw-context happens to run from.  Measured on zbox-ecb-fw: all
+    # directory fw-context happens to run from.  Measured on the Mbed project: all
     # 873 entries carry a relative @./BUILD/... response file with 269 -I
     # tokens inside, and expand_response_file returns [] for a file it cannot
     # find, with no error and no log.  flags_hash therefore depended on the

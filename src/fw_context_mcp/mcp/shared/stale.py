@@ -360,7 +360,7 @@ def _count_modified_files(
             # The previous rule was "newer, or inside the racy window", and
             # that window is symmetric around the stored stamp.  An
             # unchanged file carries exactly that stamp, so it fell inside
-            # and reached the hash: measured on zbox-ecb-fw, 1910 of 1911
+            # and reached the hash: measured on the Mbed project, 1910 of 1911
             # rows did.  The gate filtered nothing while get_active_build —
             # the mandatory first call — hashed the whole project every
             # time.  The one set it did exclude was the backwards stamp,
@@ -427,8 +427,8 @@ def _project_scan_roots(scan_roots: set[str], build_patterns: list[str]) -> set[
     """Drop the build-output directories from the scan roots.
 
     ``_indexed_paths`` collects the roots from the index, because the layouts
-    differ: zbox-ecb-fw keeps code in ``lib``, ``src`` and ``targets_custom``,
-    birdie1-v2-fw-v3 adds ``mbed_target_stm`` and ``components``.  A fixed
+    differ: the Mbed project keeps code in ``lib``, ``src`` and ``targets_custom``,
+    the second Mbed project adds ``mbed_target_stm`` and ``components``.  A fixed
     list of ``src``/``lib``/``include`` would miss those.
 
     A build directory can hold a project file — a generated config header —
@@ -462,9 +462,9 @@ def _git_tu_candidates(root: Path, tu_exts: frozenset[str]) -> list[str] | None:
     ``git ls-files -co --exclude-standard`` gives the tracked files plus the
     untracked ones that .gitignore does not cover — which is the code of the
     user and nothing else.  A gitignored vendor tree drops out on its own:
-    measured, that is ``ncs/`` on zbox-ecb-fw-v5, where the directory walk
+    measured, that is ``ncs/`` on the Zephyr project, where the directory walk
     found 109,687 candidates in 4.0 s and this finds 12 in 1 ms, and
-    ``.pio/`` on HA_Boiler.
+    ``.pio/`` on the ESP32 project.
 
     It also answers what the walk could not.  ``scan_roots`` comes from
     files the index already holds, so a whole new top-level directory named
@@ -477,7 +477,7 @@ def _git_tu_candidates(root: Path, tu_exts: frozenset[str]) -> list[str] | None:
     project without a repository needs.
 
     A vendored SDK that IS committed stays in the listing — mbed-os/ on
-    zbox-ecb-fw is 6,215 source files in git — so the caller still applies
+    the Mbed project is 6,215 source files in git — so the caller still applies
     the vendor roots it takes from the index.
     """
     import subprocess
@@ -505,7 +505,7 @@ def _vendor_roots(conn, config_hash: str) -> set[str]:
 
     Taken from ``files.is_project``: a root that carries non-project rows
     and no project row is the SDK.  The manifest's own vendor patterns are
-    not enough — measured, zbox-ecb-fw-v5 has none at all — and this
+    not enough — measured, the Zephyr project has none at all — and this
     question has an answer in the index for every project that indexed the
     vendor tree.
 
@@ -545,7 +545,7 @@ def find_unindexed_sources(
     Both are necessary.  Condition 1 alone is useless: a project keeps many
     source files out of the build on purpose — library headers that nothing
     includes, tests outside the build, ``secrets.example.h``.  On
-    birdie1-v2-fw-v3 that is 726 files, and every one of them is correct.
+    the second Mbed project that is 726 files, and every one of them is correct.
 
     Condition 2 must compare against ``compile_commands.json``, never against
     the index timestamp.  A reindex moves the index timestamp even when it
@@ -1080,7 +1080,7 @@ def with_stale_annotation(
     *diagnose_empty* is for the multi-scope caller.  The diagnosis describes
     the project, not one build of it, and every scope would reach the same
     conclusion — ``execute_scoped`` then throws the duplicates away.  Nine
-    configs on zbox-ecb-fw-v5 meant nine scans of the whole index for one
+    configs on the Zephyr project meant nine scans of the whole index for one
     message.
     """
 

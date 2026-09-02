@@ -23,17 +23,17 @@ class TestBuildVariantConfig:
         assert c.extra_profiles == ["lto.json"]  # inherited
 
     def test_dict_merge(self):
-        base = BuildConfig(env={"ZBOX_ENV": "DEV", "SHARED": "x"})
-        v = BuildVariant(name="v", env={"ZBOX_ENV": "TST"})
+        base = BuildConfig(env={"BOARD_ENV": "DEV", "SHARED": "x"})
+        v = BuildVariant(name="v", env={"BOARD_ENV": "TST"})
         c = build_variant_config(base, v)
-        assert c.env == {"ZBOX_ENV": "TST", "SHARED": "x"}
+        assert c.env == {"BOARD_ENV": "TST", "SHARED": "x"}
 
     def test_base_not_mutated(self):
-        base = BuildConfig(defines=["A=1"], env={"ZBOX_ENV": "DEV"})
-        v = BuildVariant(name="v", overrides={"defines": ["B=2"]}, env={"ZBOX_ENV": "TST"})
+        base = BuildConfig(defines=["A=1"], env={"BOARD_ENV": "DEV"})
+        v = BuildVariant(name="v", overrides={"defines": ["B=2"]}, env={"BOARD_ENV": "TST"})
         build_variant_config(base, v)
         assert base.defines == ["A=1"]
-        assert base.env == {"ZBOX_ENV": "DEV"}
+        assert base.env == {"BOARD_ENV": "DEV"}
 
     def test_build_dir_override(self):
         base = BuildConfig(build_dir="build/")
@@ -57,7 +57,7 @@ class TestVariantConfigParsing:
                         "name": "nrf52840-dev",
                         "board": "nrf52840dk/nrf52840",
                         "build_dir": "build/nrf52840_sysbuild",
-                        "env": {"ZBOX_ENV": "DEV"},
+                        "env": {"BOARD_ENV": "DEV"},
                         "images": [
                             {"name": "app", "dir": "proj/app", "type": "project"},
                             {"name": "mcuboot", "dir": "${NCS}/bootloader/mcuboot", "type": "sdk"},
@@ -76,7 +76,7 @@ class TestVariantConfigParsing:
         v = b.variants[0]
         assert v.name == "nrf52840-dev"
         assert v.board == "nrf52840dk/nrf52840"
-        assert v.env == {"ZBOX_ENV": "DEV"}
+        assert v.env == {"BOARD_ENV": "DEV"}
         assert v.overrides == {"defines": ["HW_REV=2"]}
         assert [i.name for i in v.images] == ["app", "mcuboot"]
         assert v.images[1].type == "sdk"

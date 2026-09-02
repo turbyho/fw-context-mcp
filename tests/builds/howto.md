@@ -120,7 +120,7 @@ tar xf gcc-arm-none-eabi-9-2020-q2-update-x86_64-linux.tar.bz2
 Configure in `~/.mbed`:
 
 ```ini
-GCC_ARM_PATH=/home/turbyho/dev/sw/dev_tools/gcc-arm-none-eabi-9-2020-q2-update/bin
+GCC_ARM_PATH=$HOME/dev/sw/dev_tools/gcc-arm-none-eabi-9-2020-q2-update/bin
 ```
 
 Verify:
@@ -146,8 +146,8 @@ Manual environment (without the setup script):
 
 ```bash
 export PYENV_VERSION=3.11.8
-export ZEPHYR_BASE=/home/turbyho/ncs/v3.2.3/zephyr
-export ZEPHYR_SDK_INSTALL_DIR=/home/turbyho/ncs/toolchains/2ac5840438/opt/zephyr-sdk
+export ZEPHYR_BASE=$HOME/ncs/v3.2.3/zephyr
+export ZEPHYR_SDK_INSTALL_DIR=$HOME/ncs/toolchains/2ac5840438/opt/zephyr-sdk
 export PATH="$ZEPHYR_SDK_INSTALL_DIR/arm-zephyr-eabi/bin:$HOME/.pyenv/versions/3.11.8/bin:$PATH"
 ```
 

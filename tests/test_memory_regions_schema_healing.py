@@ -11,7 +11,7 @@ runs on every open.
 
 Measured before the annotation: adding the table moved the version from
 1739388653 down to 275729191, every existing index re-stamped itself, and a
-full reindex of birdie1-v2-fw-v3 walked all 449 translation units and died
+full reindex of the second Mbed project walked all 449 translation units and died
 at the last step with "no such table: memory_regions".
 
 The unit tests never saw it: they build a fresh database, where `_SCHEMA`
@@ -81,7 +81,7 @@ class TestAnExistingDatabase:
 
     def test_a_version_equal_to_the_current_one(self, tmp_path: Path):
         # The state after one re-stamp: the gate now says "current" and no
-        # migration runs at all.  This is what birdie1 held.
+        # migration runs at all.  This is what the second Mbed project held.
         db_path = tmp_path / "index.db"
         conn = open_db(db_path)
         try:
@@ -144,7 +144,7 @@ class TestTheReadPathToleratesAnOlderIndex:
     feature therefore holds neither the column nor the table, and a query
     that requires them raises.
 
-    Measured: HA_Boiler holds user_version 155546819 and no `entry_point`
+    Measured: the ESP32 project holds user_version 155546819 and no `entry_point`
     column, and naming that column in a shared SELECT made
     `get_active_build` raise `no such column: b.entry_point`.
 

@@ -211,7 +211,7 @@ def _check_and_parse_unit(
     # the run, and `ops.py` — which handles the same failure by skipping —
     # never saw the unit at all.
     #
-    # Measured on zbox-ecb-fw: a branch switch removed two generated zcbor
+    # Measured on the Mbed project: a branch switch removed two generated zcbor
     # sources that compile_commands.json still listed, and those two files
     # out of 881 ended the run at translation unit 39.  The 842 units behind
     # them were never read.

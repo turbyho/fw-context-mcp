@@ -4,7 +4,7 @@
  * These belong to the ASSEMBLER, not to the C preprocessor, so
  * `clang -E` passes them through untouched and a reader that stops at
  * the preprocessor never sees the symbols they define.  Measured on
- * zbox-ecb-fw, that is 43 of 54 vector slots.
+ * The Mbed project, that is 43 of 54 vector slots.
  */
 
     .syntax unified

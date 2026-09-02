@@ -566,27 +566,27 @@ def _defines_of_entry(entry: dict) -> dict[str, str]:
 def command_line_defines(cc_path: Path) -> tuple[dict[str, str], int]:
     """Return the defines EVERY unit shares, and how many names vary.
 
-    The `-D` flags of a build are its configuration.  zbox-ecb-fw passes
+    The `-D` flags of a build are its configuration.  The Mbed project passes
     `APPLICATION_ADDR=0x10200`, `APPLICATION_SIZE=0xefe00`, and
     `CMSIS_VECTAB_VIRTUAL` — the memory map and the fact that the vector
     table moves to RAM, stated by the build itself.
 
     WHY only the shared set: a tool that describes ONE build must not show
     the defines of one file as the defines of the build.  Measured:
-    zbox-ecb-fw has 881 units, 27 names in every one and 59 in only some —
-    the three `.S` files get a shorter set.  HA_Boiler splits on
+    The Mbed project has 881 units, 27 names in every one and 59 in only some —
+    the three `.S` files get a shorter set.  The ESP32 project splits on
     `ARDUINO_CORE_BUILD`, which 46 of its 114 units carry.  The second
     return value counts the names left out, so a caller can tell "not
     defined" from "not defined everywhere".
 
     WHY this reads the JSON itself instead of calling `parse`: `parse`
-    normalizes every flag for libclang, which costs 6966 ms on zbox-ecb-fw
+    normalizes every flag for libclang, which costs 6966 ms on the Mbed project
     against 19 ms here — measured.  `get_active_build` is the mandatory
     first call, so seven seconds of flag normalization to read 27 defines
     would be paid by every session.
 
     WHY not the `macros` table: that holds every macro the preprocessor
-    saw — 27800 distinct names on FM, 23507 on zbox-ecb-fw.  Three orders
+    saw — 27800 distinct names on the STM32 project, 23507 on the Mbed project.  Three orders
     of magnitude more, and almost all of it comes from the headers and the
     compiler rather than from the build.
 

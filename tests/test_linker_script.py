@@ -176,7 +176,7 @@ class TestProvide:
 class TestPlacementSuffix:
     """An output section ends with a suffix that carries no semicolon.
 
-    Not a manual rule but a measured loss: with an anchored match, zbox
+    Not a manual rule but a measured loss: with an anchored match, the Mbed project
     lost 18 names, `__StackTop` among them — the one name of that build
     that the index held as `kind="undefined"`.
     """
@@ -288,7 +288,7 @@ class TestEvaluateConstant:
         assert evaluate_constant("1G") == 1024 ** 3
 
     def test_a_lowercase_suffix(self):
-        # The manual writes them uppercase.  Measured on birdie1-v2-fw-v3:
+        # The manual writes them uppercase.  Measured on the second Mbed project:
         # `SRAM1 (xrw) : ORIGIN = 0x20000194, LENGTH = 160k - 0x194`, and
         # that script produced the binaries in its build directory, thus ld
         # accepted the lowercase form.  With an uppercase-only pattern the

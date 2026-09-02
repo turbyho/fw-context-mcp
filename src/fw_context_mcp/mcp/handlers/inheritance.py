@@ -282,7 +282,7 @@ def get_inheritance_chain(
 
 # ── moved from server.py ──
 def get_class_members(
-    class_name: Annotated[str, Field(description="Class or struct name. E.g. 'ModemManager' or 'zbox::ZMODEM'.")],
+    class_name: Annotated[str, Field(description="Class or struct name. E.g. 'ModemManager' or 'the Mbed project::ZMODEM'.")],
     project_root: Annotated[str | None, Field(description="Project root. Auto-detected if omitted.")] = None,
     variant: Annotated[str | None, Field(description="Build variant name (multi-project). Omit to use default_variant or fail-closed. Use '*' for all variants.")] = None,
     image: Annotated[str | None, Field(description="Sysbuild image name within the variant (multi-project). Omit for all images of the variant.")] = None,

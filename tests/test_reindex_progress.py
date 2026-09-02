@@ -31,12 +31,12 @@ from fw_context_mcp.mcp.background import (
 # The exact tail of the run that exposed the defect, from
 # ~/.fw-context/index/<id>/reindex.log.
 OBSERVED_LOG = """\
-Project: zbox-ecb-fw-v5  path=/home/u/zbox-ecb-fw-v5  build=zephyr
+Project: demo-fw  path=/home/u/demo-fw  build=zephyr
 16:45:15 INFO 13 source file(s) are missing from compile_commands.json
 16:45:15 INFO zephyr build_multi[nrf52840-dev]: west build --sysbuild
 fw-context: error: Build command failed (exit 126): west build --sysbuild (nrf52840-dev)
 stderr: [BLOCKED — DO NOT RETRY] Command uses eval or $()/ backticks at command position.
-Command: source /home/u/zbox-ecb-fw-v5/scripts/setup_nordic_env.sh && west build
+Command: source /home/u/demo-fw/scripts/setup_nordic_env.sh && west build
 lean-ctx:
 """
 
@@ -108,13 +108,13 @@ def test_header_alone_is_progress(tmp_path: Path) -> None:
     """A run that dies before its first log record still has the header."""
     db_dir = _write(
         tmp_path,
-        "Project: zbox-ecb-fw-v5  path=/home/u/zbox-ecb-fw-v5  build=zephyr\n"
+        "Project: demo-fw  path=/home/u/demo-fw  build=zephyr\n"
         "Traceback (most recent call last):\n"
         '  File "<string>", line 1, in <module>\n',
     )
 
     assert read_reindex_progress(db_dir) == (
-        "Project: zbox-ecb-fw-v5  path=/home/u/zbox-ecb-fw-v5  build=zephyr"
+        "Project: demo-fw  path=/home/u/demo-fw  build=zephyr"
     )
 
 

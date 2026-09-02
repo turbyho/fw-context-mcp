@@ -99,7 +99,7 @@ class DbContext:
             # scope reaches the same conclusion and the dedup below drops
             # all but one.  It is not cheap to reach: a scan of every
             # indexed file plus a listing of the source tree, and it runs
-            # inside the executor lock.  Nine configs on zbox-ecb-fw-v5
+            # inside the executor lock.  Nine configs on the Zephyr project
             # paid for it nine times and used one.
             part = with_stale_annotation(
                 self.root, self.executor, query_fn, scope["config_hash"],

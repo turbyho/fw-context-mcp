@@ -1106,7 +1106,7 @@ def get_vector_table(
         #
         # It must NOT fall through to "c".  That status means "a definition
         # outside assembly, code runs", and slot 0 holds the initial stack
-        # pointer, not code.  Measured on zbox-ecb-fw: with the fall-through
+        # pointer, not code.  Measured on the Mbed project: with the fall-through
         # the tool reported `__StackTop` as code that runs.
         if kind == "undefined" or entry_usr.startswith("ld:"):
             entry["status"] = "linker"
@@ -1299,7 +1299,7 @@ def get_table_coverage(
 
     An array can be longer than the number of slots the index can name, and
     the difference is worth reporting because it is where the interesting
-    entries often are.  Measured on the Zephyr image of zbox-ecb-fw-v5:
+    entries often are.  Measured on the Zephyr image of the Zephyr project:
     ``_sw_isr_table`` is declared ``[290]``, 284 slots name
     ``z_irq_spurious``, and the 6 that name nothing — 89, 198, 219, 228,
     269, 270 — are the interrupts the firmware actually services.
@@ -1387,7 +1387,7 @@ def _follow_declarations_to_definitions(
 
     An initializer in C names whatever the compiler saw, and for a symbol
     defined in assembly that is the C DECLARATION in a header.  Measured on
-    the RISC-V image of zbox-ecb-fw-v5: every one of the 571 slots pointed
+    the RISC-V image of the Zephyr project: every one of the 571 slots pointed
     at ``_isr_wrapper`` in ``sw_isr_table.h:29``, ``is_definition = 0``,
     while the definition is ``arch/riscv/core/isr.S:137``.  The row was
     wrong twice over — ``file`` and ``line`` named a header with nothing to

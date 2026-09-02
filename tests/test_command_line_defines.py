@@ -1,14 +1,14 @@
 """The `-D` flags of a build, and only the ones every unit shares.
 
-Those flags ARE the configuration the build states.  zbox-ecb-fw passes
+Those flags ARE the configuration the build states.  The Mbed project passes
 `APPLICATION_ADDR=0x10200`, `APPLICATION_SIZE=0xefe00`, and
 `CMSIS_VECTAB_VIRTUAL` — the memory map and the fact that the vector table
 moves to RAM.
 
 The rule the tests exist to pin: a tool that describes ONE build must not
 show the defines of one FILE as the defines of the build.  Measured on
-zbox-ecb-fw, 881 units: 27 names in every one and 59 in only some, because
-the three assembly files get a shorter set.  HA_Boiler splits on
+the Mbed project, 881 units: 27 names in every one and 59 in only some, because
+the three assembly files get a shorter set.  The ESP32 project splits on
 `ARDUINO_CORE_BUILD`, which 46 of its 114 units carry.
 """
 
@@ -51,7 +51,7 @@ class TestOneEntry:
         assert _defines_of_entry(_entry("a.c", "-DA=B=C")) == {"A": "B=C"}
 
     def test_a_quoted_value(self):
-        # Measured on FM: `BOARD_NAME=\"NUCLEO_L476RG\"`.
+        # Measured on the STM32 project: `BOARD_NAME=\"NUCLEO_L476RG\"`.
         found = _defines_of_entry(_entry("a.c", '-DBOARD=\\"X\\"'))
         assert found == {"BOARD": '\\"X\\"'}
 
@@ -83,7 +83,7 @@ class TestOnlyWhatEveryUnitShares:
         assert varying == 0
 
     def test_a_name_in_only_some_units(self, tmp_path):
-        # HA_Boiler: ARDUINO_CORE_BUILD reaches 46 of 114 units.
+        # The ESP32 project: ARDUINO_CORE_BUILD reaches 46 of 114 units.
         cc = _cc(tmp_path, [
             _entry("core.c", "-DBOARD=X", "-DCORE_BUILD"),
             _entry("app.c", "-DBOARD=X"),
@@ -104,7 +104,7 @@ class TestOnlyWhatEveryUnitShares:
         assert varying == 1
 
     def test_the_assembly_unit_with_a_shorter_set(self, tmp_path):
-        # The measured shape on zbox-ecb-fw: three .S files out of 881 carry
+        # The measured shape on the Mbed project: three .S files out of 881 carry
         # 27 of the 86 names.
         cc = _cc(tmp_path, [
             _entry("a.cpp", "-DA", "-DB", "-DC"),
@@ -163,7 +163,7 @@ class TestTheCostIsWhyItIsNotStored:
     """The reason this is computed on demand.
 
     `compile_commands.parse` normalizes every flag for libclang and costs
-    6966 ms on zbox-ecb-fw against 19 ms for the direct read — measured.
+    6966 ms on the Mbed project against 19 ms for the direct read — measured.
     `get_active_build` is the mandatory first call, thus the difference is
     paid by every session.
     """

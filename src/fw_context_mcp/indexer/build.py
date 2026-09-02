@@ -133,7 +133,7 @@ class BuildConfig:
     # A relative path resolves against the project root.  None keeps the
     # default directory of the build system.
     #
-    # The price is one more set of artifacts (192 MB on zbox-ecb-fw) and a
+    # The price is one more set of artifacts (192 MB on the Mbed project) and a
     # first build with no shared object cache.  Measured at 15-30 s there,
     # which is nothing against an index run of over an hour.
     isolated_build_dir: str | None = None

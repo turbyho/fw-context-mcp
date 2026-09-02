@@ -78,7 +78,7 @@ def _plan_auto_build(
        * The tree is on a different branch than the index.
          compile_commands.json is a build artifact of the branch it was
          generated on and carries that branch's file list AND its compiler
-         flags.  Measured on zbox-ecb-fw, a switch from 4.15.3 to 4.15.1
+         flags.  Measured on the Mbed project, a switch from 4.15.3 to 4.15.1
          left two generated zcbor sources listed in it and absent from the
          tree; a reindex reads the same file again.
 

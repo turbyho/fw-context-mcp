@@ -504,7 +504,7 @@ class TestCollectHeadersFromTokens:
     def test_a_shared_header_is_hashed_once(self, tmp_path: Path):
         """Two TUs including the same header produce one table record.
 
-        This is what makes the manifest 74% smaller on zbox: the old shape
+        This is what makes the manifest 74% smaller on the Mbed project: the old shape
         stored one record per (TU, header) pair — 86 686 of them for 1 037
         files.
         """
@@ -845,7 +845,7 @@ class TestVendorPatternCarrier:
 
         This test had the opposite sign, and the writer agreed with it: the
         key was written under a truthiness test, so an empty set was dropped.
-        Measured on all 9 builds of zbox-ecb-fw-v5 — every one keeps its SDK
+        Measured on all 9 builds of the Zephyr project — every one keeps its SDK
         outside the project, so every one computes the empty set — and not
         one of their manifests carried the key.  vendor_patterns_for_build()
         then fell back to detection, which is the disagreement between the
@@ -988,7 +988,7 @@ class TestLoadBuildDirPatterns:
     ``_stale_files`` runs on every query routed through
     ``_with_stale_recovery`` and needs nothing from the manifest but this one
     short list.  Parsing the whole file for it was the most expensive thing on
-    that path: measured on zbox-ecb-fw, 94.7 ms to fetch ``['BUILD/']`` from a
+    that path: measured on the Mbed project, 94.7 ms to fetch ``['BUILD/']`` from a
     52 MB manifest.  Cached, the same call is 0.007 ms.
 
     The cache is keyed by the manifest's mtime, so the interesting case is not
@@ -1551,7 +1551,7 @@ class TestTheFlagReachesTheReport:
     def test_an_entry_past_the_window_is_not_seen(self, tmp_path: Path):
         """A recorded limit, not a defect to fix here.
 
-        max_files exists for the latency of get_active_build.  On zbox (876
+        max_files exists for the latency of get_active_build.  On the Mbed project (876
         TUs) a flagged entry past index 200 is invisible to this report,
         while the index run itself still queues it.
         """
@@ -1620,7 +1620,7 @@ class TestFilesGeneratedColumn:
 
     No caller of upsert_file() passed the flag, so every row held 0 from the
     default while the manifest of the same build said True for the same
-    paths.  Measured on zbox-v5 52840/app: 28 files under
+    paths.  Measured on the Zephyr project 52840/app: 28 files under
     build/.../generated/ with files.generated = 0.
 
     A disagreement between the two means somebody wrote the manifest with
@@ -1655,7 +1655,7 @@ class TestFilesGeneratedColumn:
 
         is_project comes from project_patterns and vendor_patterns alone.
         build_dir_patterns must stay out of it, or filling this column would
-        move 28 files of zbox-v5 out of every project_only query.
+        move 28 files of the Zephyr project out of every project_only query.
         """
         import inspect
 

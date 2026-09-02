@@ -2,7 +2,7 @@
 
 fw-context builds into ``.fw-context/autobuild/`` when it starts a build of
 its own.  That output is a tool's build artifact, and it was showing up as
-untracked in the user's repository — measured on zbox-ecb-fw, which had been
+untracked in the user's repository — measured on the Mbed project, which had been
 initialised before that directory existed and so listed only
 ``.fw-context/build/``.
 

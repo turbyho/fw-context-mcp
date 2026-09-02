@@ -2,7 +2,7 @@
 
 `.macro` belongs to the ASSEMBLER, not to the C preprocessor, so
 `clang -E` leaves it untouched and everything it defines is invisible to
-a reader that stops at the preprocessor.  Measured on zbox-ecb-fw, that
+a reader that stops at the preprocessor.  Measured on the Mbed project, that
 is 43 of 54 vector slots: its startup writes
 
     .macro  IRQ handler

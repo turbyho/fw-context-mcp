@@ -33,7 +33,7 @@ def _unit(tmp_path: Path, name: str, text: str, args: list[str] | None = None):
 # A vector table lives in its own section, because a linker script places
 # that section at the reset address — the section is part of the contract
 # between the startup file and the linker, not a matter of style.  A
-# `.word` outside one is a constant: the STM32 startup writes five for
+# `.word` outside one is a constant: The STM32 startup writes five for
 # its copy loop, and taking those for slots made the index claim the
 # vector table reached `_sidata`.
 #
@@ -96,7 +96,7 @@ class TestPreprocess:
         assert (resolved, 3) in placed
 
     def test_an_included_file_is_attributed_to_itself(self, tmp_path: Path):
-        """FM's startup unit is five lines of #include; the table is elsewhere."""
+        """the STM32 project's startup unit is five lines of #include; the table is elsewhere."""
         (tmp_path / "table.inc").write_text("  .long HardFault_Handler\n",
                                             encoding="utf-8")
         unit = _unit(tmp_path, "t.S", '#include "table.inc"\n')
@@ -206,7 +206,7 @@ class TestStoreUnits:
         assert "@brief vector table" in row["content"], "comments must survive"
 
     def test_an_included_file_gets_its_own_row(self, tmp_path: Path):
-        """FM's startup unit is five lines; the 194-entry table is included."""
+        """the STM32 project's startup unit is five lines; the 194-entry table is included."""
         from fw_context_mcp.indexer.asm import store_units
         from fw_context_mcp.indexer.db import transaction
 
@@ -443,7 +443,7 @@ class TestVectorTable:
 
     Nothing calls a handler by name; the hardware jumps to an address in a
     table.  Without the table in the index, HardFault_Handler had zero
-    references and find_dead_code reported it — measured on zbox-ecb-fw,
+    references and find_dead_code reported it — measured on the Mbed project,
     alongside BusFault_Handler.
     """
 
@@ -470,7 +470,7 @@ class TestVectorTable:
         assert "SVC_Handler" in vec
 
     def test_a_reserved_slot_is_not_an_entry(self, tmp_path: Path):
-        """A startup table holds dozens: measured on FM, 12 of 206."""
+        """A startup table holds dozens: measured on the STM32 project, 12 of 206."""
         vec = self._vectors(tmp_path, "  .word 0\n  .word 0x20000000\n")
 
         assert vec == {}
@@ -541,7 +541,7 @@ class TestVectorEdges:
         assert edge["ref_kind"] == "vector"
         assert edge["from_usr"] is None, (
             "a table entry has no enclosing function; the column is nullable "
-            "and already used that way by 6445 rows on zbox-ecb-fw"
+            "and already used that way by 6445 rows on the Mbed project"
         )
         assert edge["from_file"] == "startup.S"
 
@@ -551,7 +551,7 @@ class TestVectorEdges:
         The slot exists, the hardware reaches it, and the alias it names is
         already a symbol in the index.  Withholding the one reference that
         symbol has would say it is unreferenced, which is false — measured
-        on FM, that hid 64 of 97 slots.
+        on the STM32 project, that hid 64 of 97 slots.
 
         Whether the interrupt is serviced is read from where the edge LANDS:
         into the startup file means it reaches Default_Handler, into C means
@@ -678,7 +678,7 @@ class TestAssemblySurvivesPostProcessing:
 
     It builds that set from the libclang units and the manifest, and knows
     about neither assembly unit nor assembly include.  Measured on a real
-    FM reindex: the log said "2 file(s), 99 symbol(s), 1 vector edge(s)" and
+    the STM32 project reindex: the log said "2 file(s), 99 symbol(s), 1 vector edge(s)" and
     the database held none of it — written and deleted in the same run.
 
     The end-to-end test through runner.run() did NOT catch this: a synthetic
@@ -701,7 +701,7 @@ class TestAssemblySurvivesPostProcessing:
             upsert_build_config(conn, "ch", "pid", str(tmp_path / "cc.json"))
             # Twenty covered C files against two assembly ones, because the
             # step refuses to act when more than 20% of the rows look stale.
-            # On the real FM index the assembly was 2 rows of about 600 —
+            # On the real the STM32 project index the assembly was 2 rows of about 600 —
             # 0.3%, far under the guard — which is why it was purged there
             # and why a fixture of four files hides the bug entirely.
             covered_c = [f"src/keep{i}.c" for i in range(20)]
@@ -789,7 +789,7 @@ class TestIsProjectClassification:
     """A startup file lives in the framework package, not in the project.
 
     Calling it project code put ninety weak interrupt aliases into
-    `find_dead_code(project_only=True)`: measured on a real FM index, 91
+    `find_dead_code(project_only=True)`: measured on a real the STM32 project index, 91
     handlers reported where two real ones stood before assembly was indexed
     at all.  The rule is the one the C path uses.
     """
@@ -912,7 +912,7 @@ class TestReindexReplacesWhatItWrote:
       An is_project fix looked like it had no effect until this was found:
       99 symbols, 99 still carrying the old verdict after a --force run.
     * `refs` has no unique constraint, so a vector edge is appended again
-      every run.  FM reported one edge and held two rows.
+      every run.  The STM32 project reported one edge and held two rows.
     """
 
     @staticmethod
@@ -1122,7 +1122,7 @@ class TestAssemblyDefinitionSortsLast:
 
     A CMSIS startup file defines every interrupt handler weakly so C code
     can override it, and both end up in the index under the same name —
-    measured on zbox-ecb-fw, 11 names carry one of each.  Line number used
+    measured on the Mbed project, 11 names carry one of each.  Line number used
     to decide, so a project whose handler sits further down its file than
     the stub does in the startup file got the stub: no callers, and a body
     of two directives.
@@ -1221,7 +1221,7 @@ class TestCommentStrippingWidensTheVectorMatch:
 
     The pattern requires the statement to end after the identifier, so a
     slot written `.long __StackTop  /* Top of Stack */` did not match while
-    the comment was still in the line.  Measured on zbox-ecb-fw: the slot
+    the comment was still in the line.  Measured on the Mbed project: the slot
     count went from 53 to 54 when the comment stripping arrived, with the
     linked count unchanged at 11 — the new slot is the initial stack
     pointer, which no handler serves.
@@ -1277,7 +1277,7 @@ class TestAWeakAliasDoesNotHideTheCOverride:
     The pair says assembly does not service the interrupt.  It says nothing
     about whether C does, and CMSIS writes it precisely so that C can.
     Asking about the alias before asking the index threw every override
-    away: measured on FM, 26 handlers that interrupt.cpp, HardwareTimer.cpp,
+    away: measured on the STM32 project, 26 handlers that interrupt.cpp, HardwareTimer.cpp,
     uart.c and clock.c really define — SysTick_Handler among them — were
     reported unhandled and got no edge, leaving the whole vector table with
     one edge out of 97 slots.
@@ -1534,7 +1534,7 @@ class TestWeakLosesToStrong:
     can define it properly, and both then sit in the index under one
     name.  Without knowing which is weak the resolver saw two equally
     good answers and gave up, so the slot reached no handler at all:
-    measured, that cost 3 slots on zbox-ecb-fw and 7 on birdie1-v2-fw-v3,
+    measured, that cost 3 slots on the Mbed project and 7 on the second Mbed project,
     HardFault_Handler, SysTick_Handler and the rest of the core
     exceptions among them.
     """
@@ -1565,7 +1565,7 @@ class TestWeakLosesToStrong:
         return conn
 
     def test_a_strong_assembly_definition_wins_over_a_weak_one(self, tmp_path: Path):
-        """The zbox case: an RTOS body against a CMSIS stub."""
+        """The Mbed case: an RTOS body against a CMSIS stub."""
         from fw_context_mcp.indexer.asm import _resolve_handler
 
         conn = self._db(tmp_path, [
@@ -1659,8 +1659,8 @@ class TestSlotPositions:
     """A vector table is an ORDERED array, and the position is the answer.
 
     Verified against the Cortex-M layout on two real projects: SysTick
-    sits at 15 and the first external interrupt at 16, on FM's STM32 and
-    on zbox-ecb-fw's nRF52 alike.
+    sits at 15 and the first external interrupt at 16, on an STM32 target and
+    on an nRF52 target alike.
 
     What the position MEANS is architecture knowledge the index does not
     decide.  On Cortex-M slot 16+n is external IRQ n; on arm64 it selects
@@ -1780,7 +1780,7 @@ class TestPreprocessRunsOnce:
 class TestTheSlotPositionReachesTheIndex:
     """The position has to survive into refs, or it answers nothing.
 
-    Verified against the CMSIS header on FM: TIM2_IRQHandler sits in slot
+    Verified against the CMSIS header on the STM32 project: TIM2_IRQHandler sits in slot
     44, and stm32l476xx.h defines TIM2_IRQn = 28, which is 44 - 16.  The
     subtraction is Cortex-M knowledge and stays with the reader of the
     index; what is stored is the position.
@@ -2029,9 +2029,9 @@ class TestATableResolvesAcrossUnits:
     defines it.  Resolving each unit right after its own symbols put a
     declaration in the index for a handler a later unit then defined, so
     the slot pointed at the placeholder and the name appeared twice —
-    measured on zbox-ecb-fw-v5, slots 11 and 14 of the nRF54L application.
+    measured on the Zephyr project, slots 11 and 14 of the nRF54L application.
 
-    FM and zbox-ecb-fw could not show this: their table and handlers share
+    The STM32 project and the Mbed project could not show this: their table and handlers share
     one file.
     """
 

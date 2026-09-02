@@ -1,7 +1,7 @@
 """Which slots of a table hold no name, and why that cuts both ways.
 
 An array can be longer than the number of slots the index can name.
-Measured on the Zephyr image of zbox-ecb-fw-v5: ``_sw_isr_table`` is
+Measured on the Zephyr image of the Zephyr project: ``_sw_isr_table`` is
 declared ``[290]``, 284 slots name ``z_irq_spurious``, and the 6 with no
 name — 89, 198, 219, 228, 269, 270 — are the interrupts the firmware
 actually services, because ``gen_isr_tables.py`` wrote a resolved address

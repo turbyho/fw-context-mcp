@@ -14,13 +14,13 @@ plays, and three things depend on it:
 * ``#if`` resolves, so an inactive branch does not reach the index.
 * Macros expand.  Zephyr writes ``GTEXT(sym)``, not ``.globl sym``; a regex
   over the raw text finds nothing at all.
-* An include can carry the whole file.  Measured on FM,
+* An include can carry the whole file.  Measured on the STM32 project,
   ``startup_stm32yyxx.S`` is five lines of ``#include CMSIS_STARTUP_FILE``
   and expands to 946 lines holding a 194-entry vector table.
 
 The output is split per source file through the ``# <line> "<file>"``
 linemarkers, so every line keeps the file and line it came from — which is
-often an included file rather than the unit itself, as in that FM case.
+often an included file rather than the unit itself, as in that case.
 """
 
 from __future__ import annotations
@@ -202,7 +202,7 @@ def _is_project_file(path: str, project_root: Path,
     """Say whether *path* is code of the team or of the SDK.
 
     The same rule the C path uses, and it has to be: a startup file lives in
-    the framework package, outside the project entirely — FM's is under
+    the framework package, outside the project entirely — the STM32 project's is under
     ~/.platformio/packages — and calling it project code puts ninety weak
     interrupt aliases into `find_dead_code(project_only=True)`.  Measured
     before this: 91 handlers reported, against 2 real ones before assembly
@@ -235,7 +235,7 @@ def _clear_previous_pass(conn, config_hash: str) -> None:
       is_project and all.  Measured: an is_project fix looked like it had
       no effect at all until this function existed.
     * ``refs`` has no unique constraint, so a vector edge is appended
-      again on every run.  Measured on FM: one edge reported, two rows.
+      again on every run.  Measured on the STM32 project: one edge reported, two rows.
 
     The C path solves the same problem with ``replace_file_data``, keyed by
     file id.  That is the wrong key here: an assembly unit can include a
@@ -301,7 +301,7 @@ def store_units(conn, config_hash: str, units: list, project_root: Path,
     cleared = False
     # The sources are kept so the vector pass can run over all of them
     # after every symbol is stored, without preprocessing anything twice.
-    # Assembly units are few — one on FM, three on zbox-ecb-fw, seven per
+    # Assembly units are few — one on the STM32 project, three on the Mbed project, seven per
     # Zephyr image — and the preprocessor is 89-95% of the pass.
     preprocessed: list[AsmSource] = []
     for unit in units:
@@ -334,7 +334,7 @@ def store_units(conn, config_hash: str, units: list, project_root: Path,
         # `svc.S` defines it.  Resolving per unit put a declaration in
         # the index for a handler that a later unit then defined, so the
         # slot pointed at the placeholder and the name appeared twice.
-        # FM and zbox-ecb-fw hid it — their table and handlers share one
+        # The STM32 project and the Mbed project hid it — their table and handlers share one
         # file.
         preprocessed.append(source)
         for path, active_lines in source.active.items():
@@ -478,7 +478,7 @@ class AsmSymbol:
     edge either way, and where that edge lands — the startup file rather
     than C — is what tells a reader the interrupt traps.  Acting on it
     once meant asking about the alias before asking the index, and every
-    C override was thrown away: measured on FM, one edge instead of 27.
+    C override was thrown away: measured on the STM32 project, one edge instead of 27.
     """
 
     name: str
@@ -779,7 +779,7 @@ def extract_vectors(source: AsmSource) -> list[VectorEntry]:
 
     A reserved slot, written `.word 0`, names nothing but still OCCUPIES a
     position, so it is counted and not returned.  Without counting it the
-    positions would be wrong exactly where they matter: FM's table holds
+    positions would be wrong exactly where they matter: the STM32 project's table holds
     five reserved entries before SysTick, which sits at 15 and would
     otherwise look like 10.
 
@@ -1006,13 +1006,13 @@ def _store_vectors(
     Whether the interrupt is serviced is then visible from where the edge
     LANDS, and that is a better answer than a count: an edge into C means a
     handler runs, an edge into the startup file means the slot reaches
-    `Default_Handler` and the device traps.  Measured on FM, 26 of 97 slots
+    `Default_Handler` and the device traps.  Measured on the STM32 project, 26 of 97 slots
     land in C, 64 in the startup file, 6 name a linker symbol.
 
     ``.weak X`` plus ``.thumb_set X, Default_Handler`` is how CMSIS lets C
     override a handler, so the alias never decides anything on its own.
     Asking about it before asking the index threw every override away: the
-    same FM table carried one edge instead of 27.
+    same the STM32 project table carried one edge instead of 27.
 
     A slot naming something NO unit defines still gets an edge, to a
     declaration :func:`_declare_referenced_only` records for it.  The

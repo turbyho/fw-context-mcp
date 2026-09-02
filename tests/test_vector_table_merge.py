@@ -191,7 +191,7 @@ def test_a_single_slot_handler_that_calls_a_callback_is_not_a_dispatcher(tmp_pat
     """``POWER_CLOCK_IRQHandler`` holds one slot and calls 6 callbacks.
 
     It does service its interrupt, so the pointer call alone must not
-    relabel it — measured on zbox-ecb-fw, where three such handlers would
+    relabel it — measured on the Mbed project, where three such handlers would
     otherwise change status.
     """
     conn = _db(tmp_path)
@@ -310,7 +310,7 @@ def test_an_empty_index_answers_empty(tmp_path, unhandled_only):
 class TestADeclarationIsNotTheDefinition:
     """A table in C names what the compiler saw, not where the code is.
 
-    Measured on the RISC-V image of zbox-ecb-fw-v5: all 571 slots pointed at
+    Measured on the RISC-V image of the Zephyr project: all 571 slots pointed at
     ``_isr_wrapper`` in ``sw_isr_table.h:29`` with ``is_definition = 0``,
     while the definition is ``arch/riscv/core/isr.S:137``.  Every row then
     named a header with nothing to read, and the status came out ``"c"`` —

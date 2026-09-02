@@ -28,9 +28,9 @@ to answer: "which functions can be called through this function pointer?"
 Name → USR resolution uses a four-tier match:
 
 1. Exact ``name`` match — ``send`` matches bare name.
-2. Exact ``qualified_name`` match — ``zbox::ZMODEM_DRIVER::send``.
+2. Exact ``qualified_name`` match — ``the Mbed project::ZMODEM_DRIVER::send``.
 3. Suffix LIKE on ``qualified_name`` — ``ZMODEM_DRIVER::send`` matches
-   ``zbox::ZMODEM_DRIVER::send``.
+   ``the Mbed project::ZMODEM_DRIVER::send``.
 4. Plain name fallback — the segment after the last ``::``.
 
 For aggregate types (class, struct, enum), references are stored at
@@ -583,9 +583,9 @@ def find_refs(
     work without requiring the full ``Namespace::Class::method`` prefix:
 
     1. Exact ``name`` — ``send`` matches bare name ``send``.
-    2. Exact ``qualified_name`` — ``zbox::ZMODEM_DRIVER::send``.
+    2. Exact ``qualified_name`` — ``the Mbed project::ZMODEM_DRIVER::send``.
     3. Suffix LIKE on ``qualified_name`` — ``ZMODEM_DRIVER::send`` matches
-       ``zbox::ZMODEM_DRIVER::send``.
+       ``the Mbed project::ZMODEM_DRIVER::send``.
     4. Plain name — the segment after the last ``::`` (same as tier 1 but
        with precedence for exact qualified_name match).
 

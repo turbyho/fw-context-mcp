@@ -88,7 +88,7 @@ class TestFindUnindexedSources:
 
         Library sources that nothing compiles, tests outside the build, and
         templates are all absent from the index and all correct.  On
-        birdie1-v2-fw-v3 there are 726 of them.  Only the mtime tells them
+        the second Mbed project there are 726 of them.  Only the mtime tells them
         apart from a file that the user just added.
         """
         conn, root, cc = project
@@ -201,7 +201,7 @@ class TestScanRootFilter:
 
     Mbed writes a generated ``mbed_config.h`` into ``BUILD/``, and the
     indexer marks it as project code.  ``BUILD`` therefore lands among the
-    roots of zbox-ecb-fw and birdie1-v2-fw-v3, and walking it would cost a
+    roots of the Mbed project and the second Mbed project, and walking it would cost a
     lot and could report generated sources as new.
     """
 
@@ -442,7 +442,7 @@ class TestGitCandidates:
 
         assert found == [], (
             "a gitignored vendor tree drops out of the listing by itself — "
-            "on zbox-ecb-fw-v5 that is 109,687 candidates and 4 seconds"
+            "on the Zephyr project that is 109,687 candidates and 4 seconds"
         )
 
     def test_a_committed_vendor_tree_is_not_reported(self, tmp_path: Path):
@@ -472,7 +472,7 @@ class TestGitCandidates:
             conn.close()
 
         assert found == [], (
-            "mbed-os is committed on zbox-ecb-fw — 6,215 source files in git "
+            "mbed-os is committed on the Mbed project — 6,215 source files in git "
             "— so the vendor roots have to come from the index"
         )
 

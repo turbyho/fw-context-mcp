@@ -127,7 +127,7 @@ class TestCountModifiedGate:
 
     It read "newer than stored, or inside the racy window", and that window
     is symmetric around the STORED stamp.  An unchanged file carries exactly
-    that stamp, so it fell inside and was hashed — measured on zbox-ecb-fw,
+    that stamp, so it fell inside and was hashed — measured on the Mbed project,
     1910 of 1911 rows reached the hash.  The gate filtered nothing, while
     the one set it did exclude was a stamp that had moved backwards, which
     is a file replaced by an older copy.

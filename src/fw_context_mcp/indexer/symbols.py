@@ -799,7 +799,7 @@ def _resolve_method_usr(
        the caller's class.
     4. Caller-class match — bare ``method()`` calls inside a class method
        resolve to sibling methods of the enclosing class (fixes
-       ``zbox_reset()`` inside ``WDT::swdt_check``).
+       ``wdt_reset()`` inside ``WDT::swdt_check``).
     5. Ambiguous → ``None``.  Never emit a possibly-wrong edge: previously
        an arbitrary first candidate was returned, which mis-resolved
        ``_timeout.attach(...)`` to ``mbed::SerialBase::attach``.
@@ -2028,7 +2028,7 @@ def _run_source_line_fallback(
     # Map each function's definition start line → its USR.  Used to suppress
     # the false self-reference created when the bare-call regex matches the
     # function's OWN name in its definition signature (e.g. ``void WDT::
-    # zbox_reset(`` → a self-caller edge at the definition line).
+    # wdt_reset(`` → a self-caller edge at the definition line).
     _fn_def_lines: dict[int, str] = {
         _fn_start: _fn_usr for _fn_usr, _fn_start, _fn_end in _fn_spans
     }
@@ -2107,7 +2107,7 @@ def _run_source_line_fallback(
         # function ``if``).  Suppresses the self-reference false-positive:
         # a bare match of the enclosing function's own name on its
         # definition line is the declaration signature, not a recursive
-        # call (e.g. ``void zbox_reset(void)`` matches ``zbox_reset(``).
+        # call (e.g. ``void wdt_reset(void)`` matches ``wdt_reset(``).
         # Bare call fallback: function(args) or function<T>(args)
         for _m in _re.finditer(r'(?<![.\w])(\w+)(<[^>]+>)?\s*\(', _line):
             _method_name = _m.group(1)

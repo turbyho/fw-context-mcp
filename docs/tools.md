@@ -277,7 +277,7 @@ fw-context init-variants list                          # list declared variants
 fw-context init-variants add --name <name> --board <board>
 fw-context init-variants add --name <name> --board <board> --description "text"
 fw-context init-variants add --name <name> --build-dir build/<name>
-fw-context init-variants add --name <name> --env ZBOX_ENV=DEV
+fw-context init-variants add --name <name> --env BOARD_ENV=DEV
 fw-context init-variants remove <name>
 ```
 

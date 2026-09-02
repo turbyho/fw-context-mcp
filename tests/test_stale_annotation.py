@@ -84,7 +84,7 @@ class TestCollectResultPaths:
         find_callees_recursive give the raw ``file_path`` column.
 
         A check for ``file`` alone left those four tools with no staleness
-        detection.  Verified against an indexed zbox-ecb-fw on 2026-08-27.
+        detection.  Verified against an indexed the Mbed project on 2026-08-27.
         """
         result = [{"file_path": "src/a.c", "name": "dead_fn"}]
         assert collect_result_paths(result, tmp_path) == [str(tmp_path / "src/a.c")]
@@ -128,11 +128,11 @@ class TestCollectResultPaths:
         """find_wrapper_callers keeps its paths one level down, in methods.
 
         One wrapper class often spans several files (18% of the classes in
-        zbox-ecb-fw, up to 49 files), thus a single path on the class record
+        the Mbed project, up to 49 files), thus a single path on the class record
         would leave most of them unchecked.
         """
         result = [{
-            "wrapper_class": "zbox::ZMODEM",
+            "wrapper_class": "the Mbed project::ZMODEM",
             "method_count": 2,
             "methods": [
                 {"method": "start", "file": "src/zmodem.cpp", "calls": []},

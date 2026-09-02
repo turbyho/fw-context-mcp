@@ -373,7 +373,7 @@ CREATE TABLE IF NOT EXISTS symbols (
     is_definition  INTEGER NOT NULL DEFAULT 0,
     -- A definition another object may override: `.weak` in assembly.  The
     -- linker keeps the strong one, and without this the index cannot tell
-    -- which that is.  Measured on zbox-ecb-fw and birdie1-v2-fw-v3, ten
+    -- which that is.  Measured on the Mbed project and the second Mbed project, ten
     -- vector slots — HardFault_Handler, SysTick_Handler and the rest of
     -- the core exceptions — reached no handler because a CMSIS startup
     -- defines them weakly and an RTOS defines them properly, and both
@@ -777,7 +777,7 @@ CREATE INDEX IF NOT EXISTS idx_hotspot_cache_config ON hotspot_cache(config_hash
 -- and no translation unit holds it.
 --
 -- Why keyed on config_hash: the map belongs to ONE build, not to a project.
--- Measured on zbox-ecb-fw-v5, which holds nine configurations in one
+-- Measured on the Zephyr project, which holds nine configurations in one
 -- database: `app` starts at flash 372736, `mcuboot` at 110592, and
 -- `app_flpr` declares no flash region at all.  A map stored per project
 -- would be wrong for eight of the nine.
@@ -804,7 +804,7 @@ CREATE INDEX IF NOT EXISTS idx_hotspot_cache_config ON hotspot_cache(config_hash
 --
 -- Measured: adding this table moved the version from 1739388653 down to
 -- 275729191, so every existing index re-stamped itself and never created
--- the table.  A full reindex of birdie1-v2-fw-v3 then walked all 449
+-- the table.  A full reindex of the second Mbed project then walked all 449
 -- translation units and died on the last step with "no such table:
 -- memory_regions".  The self-healing block runs on every open and closes
 -- that hole.

@@ -137,32 +137,32 @@ class TestResolveMethodUsr:
 
     def test_exact_name_wins(self):
         """A bare unqualified name that exists must win."""
-        qn = {"zbox::WDT::zbox_reset": "u_self"}
-        assert self._resolve("zbox_reset", qn) == "u_self"
+        qn = {"the Mbed project::WDT::wdt_reset": "u_self"}
+        assert self._resolve("wdt_reset", qn) == "u_self"
 
     def test_single_candidate_suffix(self):
         """A single ::method candidate resolves even without context."""
-        qn = {"zbox::WDT::zbox_reset": "u_self"}
-        assert self._resolve("zbox_reset", qn) == "u_self"
+        qn = {"the Mbed project::WDT::wdt_reset": "u_self"}
+        assert self._resolve("wdt_reset", qn) == "u_self"
 
     def test_caller_class_preferred_for_bare_call(self):
         """Bare method() inside a class must resolve to a sibling method."""
         qn = {
-            "zbox::WDT::zbox_reset": "u_self",
-            "other::zbox_reset": "u_other",
+            "the Mbed project::WDT::wdt_reset": "u_self",
+            "other::wdt_reset": "u_other",
         }
-        result = self._resolve("zbox_reset", qn, caller_qn="zbox::WDT::swdt_check")
+        result = self._resolve("wdt_reset", qn, caller_qn="the Mbed project::WDT::swdt_check")
         assert result == "u_self"
 
     def test_receiver_field_hint_preferred(self):
         """obj.attach() must prefer the receiver type over the caller class."""
         qn = {
-            "zbox::WDT::attach": "u_wdt_attach",  # caller-class sibling (WRONG choice)
+            "the Mbed project::WDT::attach": "u_wdt_attach",  # caller-class sibling (WRONG choice)
             "mbed::Timeout::attach": "u_timeout_attach",
             "mbed::SerialBase::attach": "u_serial_attach",
         }
         result = self._resolve("attach", qn, field_name="_timeout",
-                               caller_qn="zbox::WDT::swdt_check")
+                               caller_qn="the Mbed project::WDT::swdt_check")
         assert result == "u_timeout_attach"
 
     def test_ambiguous_returns_none(self):
@@ -225,13 +225,13 @@ class TestRunSourceLineFallbackSelfRef:
             os.unlink(path)
 
     def test_no_self_caller_at_definition_line(self):
-        """The signature line `void WDT::zbox_reset(` must not produce a self edge."""
+        """The signature line `void WDT::wdt_reset(` must not produce a self edge."""
         src = (
-            "void WDT::zbox_reset(int delay) {\n"
+            "void WDT::wdt_reset(int delay) {\n"
             "    helper(delay);\n"
             "}\n"
         )
-        qn = {"zbox::WDT::zbox_reset": "u_self", "zbox::WDT::helper": "u_helper"}
+        qn = {"the Mbed project::WDT::wdt_reset": "u_self", "the Mbed project::WDT::helper": "u_helper"}
         refs, _fp = self._run(src, qn)
 
         self_refs = [r for r in refs if r.to_usr == "u_self" and r.from_usr == "u_self"]
@@ -244,12 +244,12 @@ class TestRunSourceLineFallbackSelfRef:
     def test_real_recursion_still_detected(self):
         """A genuine self-call inside the body (not the signature) must be kept."""
         src = (
-            "void WDT::zbox_reset(int delay) {\n"
+            "void WDT::wdt_reset(int delay) {\n"
             "    helper(delay);\n"
-            "    zbox_reset(delay + 1);\n"
+            "    wdt_reset(delay + 1);\n"
             "}\n"
         )
-        qn = {"zbox::WDT::zbox_reset": "u_self", "zbox::WDT::helper": "u_helper"}
+        qn = {"the Mbed project::WDT::wdt_reset": "u_self", "the Mbed project::WDT::helper": "u_helper"}
         refs, _fp = self._run(src, qn)
 
         body_self = [r for r in refs
@@ -264,11 +264,11 @@ class TestRunSourceLineFallbackSelfRef:
         source-line fallback (F4b) — the path that also works when the AST is
         too degraded for libclang to produce CALL_EXPR cursors."""
         src = (
-            "void WDT::zbox_reset() {\n"
+            "void WDT::wdt_reset() {\n"
             "    _timeout.attach(callback(&WDT::_timeout_interrupt), delay);\n"
             "}\n"
         )
-        qn = {"zbox::WDT::zbox_reset": "u_self", "zbox::WDT::_timeout_interrupt": "u_ti"}
+        qn = {"the Mbed project::WDT::wdt_reset": "u_self", "the Mbed project::WDT::_timeout_interrupt": "u_ti"}
         refs, fp_assignments = self._run(src, qn)
 
         indirect = [
@@ -276,7 +276,7 @@ class TestRunSourceLineFallbackSelfRef:
             if r.ref_kind == "indirect" and r.to_usr == "u_ti" and r.from_usr == "u_self"
         ]
         assert indirect, (
-            "&WDT::_timeout_interrupt must be an indirect ref from zbox_reset via raw text"
+            "&WDT::_timeout_interrupt must be an indirect ref from wdt_reset via raw text"
         )
         fpa_matches = [
             f for f in fp_assignments
@@ -303,7 +303,7 @@ class TestEmbedContentHash:
 
     def _row(self, **overrides):
         base = {
-            "name": "foo", "qualified_name": "zbox::foo", "kind": "method",
+            "name": "foo", "qualified_name": "the Mbed project::foo", "kind": "method",
             "file_path": "src/foo.cpp", "signature": "void foo(int)",
             "docstring": "doc", "summary": "sum", "source": "void foo(int) {}",
         }
@@ -381,7 +381,7 @@ class TestEmbeddingsSchemaAndUpsert:
                 is_virtual, is_pure_virtual, parent_usr, is_template, template_usr,
                 is_project, pagerank, source)
                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-            (config_hash, 1, "a.cpp", "foo", "u_foo", "foo", "zbox::foo",
+            (config_hash, 1, "a.cpp", "foo", "u_foo", "foo", "the Mbed project::foo",
              "function", 1, 1, 3, 1, "void foo()", "", None,
              0, 0, "", 0, "", 1, 1.0, "void foo() {}"),
         )
@@ -428,7 +428,7 @@ class TestBuildEmbeddingsIncremental:
                 is_virtual, is_pure_virtual, parent_usr, is_template, template_usr,
                 is_project, pagerank, source)
                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-            (config_hash, file_row["id"], "src/foo.cpp", "foo", "u_foo", "foo", "zbox::foo",
+            (config_hash, file_row["id"], "src/foo.cpp", "foo", "u_foo", "foo", "the Mbed project::foo",
              "function", 1, 1, 3, 1, "void foo()", "", None,
              0, 0, "", 0, "", 1, 1.0, source),
         )
@@ -530,10 +530,10 @@ class TestCallbackTargetIndirectRef:
             "class WDT {\n"
             "public:\n"
             "    void attach(void (*cb)());\n"
-            "    void zbox_reset();\n"
+            "    void wdt_reset();\n"
             "    void _timeout_interrupt();\n"
             "};\n"
-            "void WDT::zbox_reset() {\n"
+            "void WDT::wdt_reset() {\n"
             "    attach(&WDT::_timeout_interrupt);\n"
             "}\n",
             encoding="utf-8",
@@ -549,19 +549,19 @@ class TestCallbackTargetIndirectRef:
             "callback(&WDT::_timeout_interrupt) must be detected as an indirect ref"
         )
 
-        # F2: the definition line `void WDT::zbox_reset()` must NOT create a
-        # self-caller edge (from == to == zbox_reset).
-        zbox_usrs = {s.usr for s in result.symbols if s.name == "zbox_reset"}
-        assert zbox_usrs, "zbox_reset symbol must be extracted"
+        # F2: the definition line `void WDT::wdt_reset()` must NOT create a
+        # self-caller edge (from == to == wdt_reset).
+        reset_usrs = {s.usr for s in result.symbols if s.name == "wdt_reset"}
+        assert reset_usrs, "wdt_reset symbol must be extracted"
         self_edges = [
             r for r in result.references
-            if r.to_usr in zbox_usrs and r.from_usr in zbox_usrs
+            if r.to_usr in reset_usrs and r.from_usr in reset_usrs
         ]
         assert not self_edges, (
             f"Definition line must not create a self-reference, got {self_edges}"
         )
 
-        # The `attach(...)` call from zbox_reset must be present (libclang
+        # The `attach(...)` call from wdt_reset must be present (libclang
         # classifies a bare member call as ref_kind "member").
         attach_refs = [
             r for r in result.references if "attach" in r.to_usr
@@ -608,9 +608,9 @@ class TestDispatchDetectionFallback:
             "}\n"
         )
         qn = {
-            "zbox::ZBLE::ZBLE": "u_caller",
+            "the Mbed project::ZBLE::ZBLE": "u_caller",
             "events::EventQueue::call_every": "u_call_every",
-            "zbox::ZBLE::watch_ble": "u_watch",
+            "the Mbed project::ZBLE::watch_ble": "u_watch",
         }
         _refs, _fpa, pending = self._run(src, qn)
 
@@ -632,9 +632,9 @@ class TestDispatchDetectionFallback:
         )
         # "attach" is a dispatch method name but "App::attach" is NOT in the map
         qn = {
-            "zbox::App::run": "u_caller",
-            "zbox::App::attach": "u_attach",
-            "zbox::App::onTick": "u_tick",
+            "the Mbed project::App::run": "u_caller",
+            "the Mbed project::App::attach": "u_attach",
+            "the Mbed project::App::onTick": "u_tick",
         }
         _refs, _fpa, pending = self._run(src, qn)
         assert not pending, (
@@ -649,9 +649,9 @@ class TestDispatchDetectionFallback:
             "}\n"
         )
         qn = {
-            "zbox::App::run": "u_caller",
+            "the Mbed project::App::run": "u_caller",
             "rtos::Thread::start": "u_start",
-            "zbox::App::threadLoop": "u_loop",
+            "the Mbed project::App::threadLoop": "u_loop",
         }
         _refs, _fpa, pending = self._run(src, qn)
 
@@ -714,13 +714,13 @@ class TestCallGraphDispatchAndGlobalCtors:
         _sym_data = [
             ("main",     "main",               "function",      "src/main.cpp",    1, "u_main", 1),
             ("run",      "App::run",           "method",        "src/app.cpp",    10, "u_run", 1),
-            ("ZBLE_ctor","zbox::ZBLE::ZBLE",   "constructor",   "src/zble.cpp",   20, "u_zble_ctor", 1),
-            ("watch_ble","zbox::ZBLE::watch_ble","method",      "src/zble.cpp",   25, "u_watch_ble", 1),
+            ("ZBLE_ctor","the Mbed project::ZBLE::ZBLE",   "constructor",   "src/zble.cpp",   20, "u_zble_ctor", 1),
+            ("watch_ble","the Mbed project::ZBLE::watch_ble","method",      "src/zble.cpp",   25, "u_watch_ble", 1),
             ("dispatch_forever", "events::EventQueue::dispatch_forever", "method",
              "vendor/EventQueue.cpp", 100, "u_dispatch_forever", 0),
             ("call_every","events::EventQueue::call_every", "method",
              "vendor/EventQueue.cpp", 90, "u_call_every", 0),
-            ("zbox_reset","WDT::zbox_reset",   "method",       "src/wdt.cpp",    50, "u_zbox_reset", 1),
+            ("wdt_reset","WDT::wdt_reset",   "method",       "src/wdt.cpp",    50, "u_wdt_reset", 1),
             ("swdt_check","WDT::swdt_check",   "method",       "src/wdt.cpp",    45, "u_swdt_check", 1),
         ]
         sym_rows = [
@@ -739,8 +739,8 @@ class TestCallGraphDispatchAndGlobalCtors:
             ("u_watch_ble",        "src/zble.cpp",  26,  "u_dispatch_forever",  "dispatch"),
             # watch_ble → swdt_check
             ("u_swdt_check",       "src/zble.cpp",  27,  "u_watch_ble",         "call"),
-            # swdt_check → zbox_reset
-            ("u_zbox_reset",       "src/wdt.cpp",   46,  "u_swdt_check",        "call"),
+            # swdt_check → wdt_reset
+            ("u_wdt_reset",       "src/wdt.cpp",   46,  "u_swdt_check",        "call"),
             # File-scope implicit_construct: ZBLE global object ctor
             ("u_zble_ctor",        "src/zble.cpp",  20,  None,                  "implicit_construct"),
             # ZBLE ctor → watch_ble (method called from ctor body)
@@ -757,12 +757,12 @@ class TestCallGraphDispatchAndGlobalCtors:
         return conn, CH
 
     def test_call_path_through_dispatch_edge(self):
-        """find_call_path(main → zbox_reset) returns paths through dispatch edge."""
+        """find_call_path(main → wdt_reset) returns paths through dispatch edge."""
         conn, ch = self._build_db()
         try:
-            paths = self._find_call_path(conn, ch, "main", "zbox_reset", max_depth=8)
+            paths = self._find_call_path(conn, ch, "main", "wdt_reset", max_depth=8)
             assert paths, (
-                "Path must exist from main to zbox_reset"
+                "Path must exist from main to wdt_reset"
             )
             chains = [p["chain"] for p in paths]
             # One path via dispatch_forever, another via implicit_construct
@@ -771,7 +771,7 @@ class TestCallGraphDispatchAndGlobalCtors:
             assert any_dispatch or any_global_ctors, (
                 f"Path must include dispatch_forever or <global ctors>, got: {chains}"
             )
-            assert any("zbox_reset" in c for c in chains)
+            assert any("wdt_reset" in c for c in chains)
         finally:
             conn.close()
 
@@ -789,7 +789,7 @@ class TestCallGraphDispatchAndGlobalCtors:
                 (ch, "u_watch_ble", "src/zble.cpp", 26, "u_dispatch_forever",
                  "dispatch", None),
                 (ch, "u_swdt_check", "src/zble.cpp", 27, "u_watch_ble", "call", None),
-                (ch, "u_zbox_reset", "src/wdt.cpp", 46, "u_swdt_check", "call", None),
+                (ch, "u_wdt_reset", "src/wdt.cpp", 46, "u_swdt_check", "call", None),
             ])
             paths = self._find_call_path(conn, ch, "main", "watch_ble", max_depth=6)
             assert paths, (
@@ -820,28 +820,28 @@ class TestCallGraphDispatchAndGlobalCtors:
             conn.close()
 
     def test_all_callers_recursive_includes_main(self):
-        """find_all_callers_recursive(zbox_reset) includes main via dispatch."""
+        """find_all_callers_recursive(wdt_reset) includes main via dispatch."""
         conn, ch = self._build_db()
         try:
-            callers = self._find_all_callers_recursive(conn, ch, "zbox_reset", max_depth=6)
+            callers = self._find_all_callers_recursive(conn, ch, "wdt_reset", max_depth=6)
             caller_names = [c["name"] for c in callers]
             assert "main" in caller_names, (
-                f"main must be in transitive callers of zbox_reset, got: {caller_names}"
+                f"main must be in transitive callers of wdt_reset, got: {caller_names}"
             )
             assert "swdt_check" in caller_names, (
-                "swdt_check must be in callers of zbox_reset"
+                "swdt_check must be in callers of wdt_reset"
             )
         finally:
             conn.close()
 
     def test_callees_recursive_includes_dispatch(self):
-        """find_callees_recursive(main) includes zbox_reset via dispatch."""
+        """find_callees_recursive(main) includes wdt_reset via dispatch."""
         conn, ch = self._build_db()
         try:
             callees = self._find_callees_recursive(conn, ch, "main", max_depth=8, limit=50)
             callee_names = [c["name"] for c in callees]
-            assert "zbox_reset" in callee_names, (
-                f"zbox_reset must be in transitive callees of main, got: {callee_names}"
+            assert "wdt_reset" in callee_names, (
+                f"wdt_reset must be in transitive callees of main, got: {callee_names}"
             )
             assert "watch_ble" in callee_names, (
                 "watch_ble must be in callees of main"
@@ -859,7 +859,7 @@ class TestCallGraphDispatchAndGlobalCtors:
                 (ch, fid, "src/ghost.cpp", "ghost", "u_ghost", "ghost", "ghost",
                  "function", 1, 1, 0, 1, "", "", None, 0, 0, "", 0, "", 1, 0.0, "", 0),
             ])
-            paths = self._find_call_path(conn, ch, "ghost", "zbox_reset", max_depth=5)
+            paths = self._find_call_path(conn, ch, "ghost", "wdt_reset", max_depth=5)
             assert not paths, "Unconnected function must have no path"
         finally:
             conn.close()

@@ -118,7 +118,7 @@ def branch_moved_since(description: str, project_root: Path) -> tuple[str, str]:
     WHY this matters more than a plain reindex: a branch switch changes the
     source tree AND the compiler flags, and `compile_commands.json` is a
     build artifact of the branch it was generated on.  Measured on
-    zbox-ecb-fw, switching from 4.15.3 to 4.15.1 left two generated zcbor
+    the Mbed project, switching from 4.15.3 to 4.15.1 left two generated zcbor
     sources listed in that file and absent from the tree.  A reindex reads
     the same stale file; only a build regenerates it.
 

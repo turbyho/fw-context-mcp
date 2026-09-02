@@ -200,7 +200,7 @@ def ignore_autobuild_dir(project_root: Path) -> None:
     for it: ``fw-context init`` is the only writer of that file, so a
     project initialised before this directory existed lists
     ``.fw-context/build/`` and nothing more, and the autobuild output then
-    shows up as untracked — measured on zbox-ecb-fw.
+    shows up as untracked — measured on the Mbed project.
 
     Writing the rule INSIDE the directory fixes that without touching a
     file the user owns, and it covers a project that will never run ``init``
@@ -673,7 +673,7 @@ def is_compile_commands_stale(
 def truncate_path_middle(path: str, max_len: int) -> str:
     """Truncate a path by removing the middle, keeping start and end visible.
 
-    Example: ``/home/turbyho/dev/sw/…/privat/HA_Boiler``
+    Example: ``/home/user/dev/…/projects/boiler-fw``
     """
     if len(path) <= max_len:
         return path

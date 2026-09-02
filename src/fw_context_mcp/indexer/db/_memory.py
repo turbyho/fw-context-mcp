@@ -4,7 +4,7 @@ The linker script is the only source the index has for a memory map.  It is
 not in `compile_commands.json`, and no translation unit holds it.
 
 WHY a table keyed on config_hash and not a column on the project: the map
-belongs to ONE build.  Measured on zbox-ecb-fw-v5, which keeps nine
+belongs to ONE build.  Measured on the Zephyr project, which keeps nine
 configurations in one database — `app` starts at flash 372736, `mcuboot` at
 110592, and `app_flpr` declares no flash region at all.  A map stored per
 project would be wrong for eight of the nine.
@@ -132,7 +132,7 @@ def get_memory_regions_by_config(
     """Return the regions of every config in *config_hashes*.
 
     One query rather than one per config.  `list_variants` reports every
-    build of a project, and zbox-ecb-fw-v5 has nine — a query each would
+    build of a project, and the Zephyr project has nine — a query each would
     make the tool nine times as slow for no gain.
 
     A config with no regions is absent from the result, so the caller uses

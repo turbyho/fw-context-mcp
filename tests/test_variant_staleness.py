@@ -7,7 +7,7 @@ helper used to load the manifest without a config_hash, and
 variant indexed last.  The count reported for variant A could therefore
 describe variant B's translation units, and it was cached under A's key.
 
-Real shape of this: zbox-ecb-fw-v5 declares nrf52840-dev and nrf54lm20a-dev.
+Real shape of this: the Zephyr project declares nrf52840-dev and nrf54lm20a-dev.
 Index one, then the other, and every query about the first was answered from
 the second's manifest.
 """

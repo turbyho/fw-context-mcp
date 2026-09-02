@@ -3,7 +3,7 @@
 `tests/test_linker_script.py` covers the grammar, `test_linker_storage.py`
 the writing, and `test_builders/test_linker_discovery.py` the discovery.
 None of them proves that a real index run reaches the pass at all — and a
-run of zbox-ecb-fw produced no `ld:` symbol while every part passed its own
+run of the Mbed project produced no `ld:` symbol while every part passed its own
 tests, which is exactly the gap this file closes.
 
 The project is synthetic and holds one small C file, so the run takes about
@@ -58,7 +58,7 @@ def ninja_project(tmp_path: Path) -> Path:
     (tmp_path / "main.c").write_text(SOURCE, encoding="utf-8")
     (tmp_path / "app.ld").write_text(SCRIPT, encoding="utf-8")
     # The flag as a real ninja file writes it — TWO spaces after `-T`,
-    # measured on zbox-ecb-fw-v5.
+    # measured on the Zephyr project.
     (tmp_path / "build.ninja").write_text(
         "rule link\n"
         "  command = ld $in  -T  app.ld  -o $out\n",
@@ -212,7 +212,7 @@ class TestTheRunReachesThePass:
         A vector table names its initial stack pointer, and no compiled file
         defines it — the linker script does.  The assembly reader used to
         add a `kind="undefined"` placeholder for it, one per CMSIS project:
-        `_estack` on FM and `__StackTop` on zbox.
+        `_estack` on the STM32 project and `__StackTop` on the Mbed project.
 
         With the linker pass in front, `asm._declare_referenced_only` finds
         the name already in the index and adds nothing.  This is the one
@@ -269,7 +269,7 @@ class TestTheRunReachesThePass:
         definition in the index the classification fell through to `"c"`,
         whose documented meaning is "a definition outside assembly, code
         runs" — false for an initial stack pointer.  Measured on
-        zbox-ecb-fw: the tool reported `__StackTop` as code that runs.
+        the Mbed project: the tool reported `__StackTop` as code that runs.
 
         `"linker"` now covers both shapes, and the row carries the file and
         line of the assignment in the script.

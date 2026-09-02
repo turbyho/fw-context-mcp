@@ -3,7 +3,7 @@
 diagnose_empty_result() stats every indexed file, hashes the suspects and
 lists the source tree, and it runs inside execute_sync — filesystem work
 holding the one shared connection.  execute_scoped() called it per scope:
-nine configs on zbox-ecb-fw-v5 meant nine scans, and the duplicate notices
+nine configs on the Zephyr project meant nine scans, and the duplicate notices
 were thrown away afterwards by the dedup _base.py already had.
 """
 
@@ -123,6 +123,6 @@ class TestDiagnoseOncePerQuery:
 #   that most needs it.
 #
 # * Caching the diagnosis on the module TTL.  After the mtime gate was
-#   fixed the whole multi-scope query costs 23 ms on zbox-ecb-fw-v5, so the
+#   fixed the whole multi-scope query costs 23 ms on the Zephyr project, so the
 #   cache bought little, and a cached diagnosis outlives the edit it
 #   describes for as long as its TTL.

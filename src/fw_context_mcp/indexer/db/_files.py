@@ -107,7 +107,7 @@ def upsert_file(
     ON CONFLICT clause never mentioned it, so a row that another caller
     created first kept 0 whatever a later caller knew.  Five callers reach
     this function and only one of them has the build-output patterns; the
-    other four pass the default False.  Measured on HA_Boiler once the
+    other four pass the default False.  Measured on the ESP32 project once the
     column was first filled: the manifest said 56 generated headers and the
     database said 49, and the seven that differed were exactly the rows some
     other caller had inserted first.
@@ -122,7 +122,7 @@ def upsert_file(
     version of this text claimed the case could not arise, because a change
     to build_dir_patterns mints a new config_hash.  Measured, that is false:
     narrowing PlatformIO from ``.pio/`` to ``.pio/build/`` left the
-    config_hash of HA_Boiler and of FM identical, because the path pass drops
+    config_hash of the ESP32 project and of the STM32 project identical, because the path pass drops
     in-project paths anyway.  _step_reconcile_generated() is what makes the
     column right again, and it is the authoritative write.
 
@@ -287,7 +287,7 @@ def delete_orphan_files(
     three times per build, and a 0-byte source yields no symbols, no macros
     and no content, so it matched all three conditions.  Its row went away
     on every run, Tier 1 needs a row to skip a translation unit, and the
-    next run parsed it again: measured on zbox-ecb-fw-v5, all 9 builds
+    next run parsed it again: measured on the Zephyr project, all 9 builds
     reported "3 updated" for ever and never reached "0 updated".
 
     *project_root* resolves a relative stored path.  Without it a relative

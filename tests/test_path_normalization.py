@@ -3,7 +3,7 @@
 Every path-keyed lookup in the indexer assumes it.  When it did not hold, an
 out-of-project header got two rows — symbols hung off one, ifdef content off
 the other — and the coverage purge then removed whichever spelling the
-manifest did not use.  Measured on HA_Boiler: 145 duplicate rows, and the
+manifest did not use.  Measured on the ESP32 project: 145 duplicate rows, and the
 entire C++ standard library became invisible once 6698 symbols went with them.
 
 This is the third time the same divergence appeared in this indexer, so the

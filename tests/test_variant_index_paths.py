@@ -1,13 +1,13 @@
 """A variant may ADD to the [index] path layers, never replace them.
 
 These fixtures are SYNTHETIC.  The measured set of five projects has no
-per-variant in-tree vendor tree at all: zbox-ecb-fw-v5 is the only
+per-variant in-tree vendor tree at all: the Zephyr project is the only
 multi-build project and all 6889 of its is_project=0 files sit under ~/ncs,
 outside the project.  Do not read these tests as evidence about real
 behaviour — they pin the semantics, not a measurement.
 
 What IS measured, and must not be confused with the above: build_dir is
-per-variant (9 builds, 2 distinct values on zbox-ecb-fw-v5).
+per-variant (9 builds, 2 distinct values on the Zephyr project).
 """
 
 from __future__ import annotations
@@ -161,7 +161,7 @@ board = "nrf52840dk/nrf52840"
         assert rel == ["third_party"]
 
     def test_an_existing_config_without_the_key_is_unchanged(self, tmp_path: Path):
-        """No-op on zbox-ecb-fw-v5, which is the only real multi-build project.
+        """No-op on the Zephyr project, which is the only real multi-build project.
 
         Its [index] vendor_paths and project_paths are both empty and both
         variants have no overrides, so the effective set stays [] — identical

@@ -149,7 +149,7 @@ class TestVerifyIntegrity:
         The CLI passes defer_fts=True per (variant, image) and rebuilds at the
         end, so during each build the FTS index is legitimately behind its
         content table.  Checking it there condemned every build of
-        zbox-ecb-fw-v5: verification failed, finalize_manifest never ran, and
+        the Zephyr project: verification failed, finalize_manifest never ran, and
         both variants stayed stamped "indexing" — hidden from readers.  The
         caller that owns the deferral runs the check after its rebuild.
         """

@@ -6,7 +6,7 @@ The registrations are in the build though, and this reads them.
 
 Every ELF here is BUILT BY THE TEST rather than copied from a real build,
 so the suite does not depend on a checkout of somebody's firmware.  The
-values are the ones measured on zbox-ecb-fw-v5, and a separate check
+values are the ones measured on the Zephyr project, and a separate check
 against the real artifacts is in the commit message.
 """
 import struct

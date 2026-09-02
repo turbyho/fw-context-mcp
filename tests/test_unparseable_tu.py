@@ -11,7 +11,7 @@ catches `SAFE_EXCEPT`, which is
 `clang.cindex.TranslationUnitLoadError` derives straight from `Exception`, so
 that tuple does not hold it and the exception leaves the run.
 
-Measured on zbox-ecb-fw: a branch switch from 4.15.3 to 4.15.1 removed two
+Measured on the Mbed project: a branch switch from 4.15.3 to 4.15.1 removed two
 generated zcbor sources that compile_commands.json still listed.  Two files
 out of 881 ended the whole index run at translation unit 39, and the 842
 units behind them were never read.

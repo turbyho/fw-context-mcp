@@ -260,7 +260,7 @@ class TestBuildSdkExcludes:
 
         A freestanding NCS application has CMakeLists.txt and no west.yml, so
         a marker scan calls it a CMake project and it gets no pattern at all.
-        Measured on zbox-ecb-fw-v5, which declares system = "zephyr".
+        Measured on the Zephyr project, which declares system = "zephyr".
         """
         (tmp_path / "CMakeLists.txt").write_text("cmake_minimum_required(VERSION 3.20)\n")
         workspace = tmp_path / "deps" / "ncs"
@@ -360,7 +360,7 @@ class TestZephyrVendorPatterns:
     def test_the_app_directory_is_not_a_signal(self, tmp_path: Path, monkeypatch):
         """Two images of one build give the same patterns, whatever their source dir.
 
-        Measured on zbox-ecb-fw-v5: four different CMAKE_SOURCE_DIR values
+        Measured on the Zephyr project: four different CMAKE_SOURCE_DIR values
         across 9 builds, and the mcuboot image has its source dir INSIDE the
         SDK.  The application directory therefore proves nothing about where
         the SDK is.

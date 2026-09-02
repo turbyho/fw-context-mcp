@@ -142,7 +142,7 @@ class LinkerScript:
 # length of a memory region, and scripts use them there.
 #
 # Case-insensitive, which the manual does not say.  Measured on
-# birdie1-v2-fw-v3: `SRAM1 (xrw) : ORIGIN = 0x20000194, LENGTH = 160k - 0x194`
+# The second Mbed project: `SRAM1 (xrw) : ORIGIN = 0x20000194, LENGTH = 160k - 0x194`
 # — lowercase — and that script produced the binaries in its build
 # directory, thus ld accepted it.  With an uppercase-only pattern the
 # expression stayed text and the region reported no length at all.
@@ -499,7 +499,7 @@ def find_assignment(statement: str) -> Assignment | None:
     An output section description ends with a placement suffix that carries
     no semicolon, such as `} > RAM AT > FLASH`.  The statement after the
     closing brace therefore starts with that suffix, and an anchored match
-    loses the assignment behind it.  Measured on zbox: 18 names went
+    loses the assignment behind it.  Measured on the Mbed project: 18 names went
     missing, and one of them is `__StackTop` — the single name of that
     build that the index held as `kind="undefined"`.
 
@@ -769,7 +769,7 @@ def store_scripts(
     * Before assembly, so `asm._declare_referenced_only` finds the name
       already in the index and adds no `kind="undefined"` row for it.  That
       is what removes the placeholder for slot 0 of a vector table:
-      measured before this, FM held `_estack` and zbox held `__StackTop`
+      measured before this, the STM32 project held `_estack` and the Mbed project held `__StackTop`
       with that kind, one per project.
 
     The first script that names a symbol wins.  Zephyr passes two scripts
@@ -874,7 +874,7 @@ def _is_project_file(
     """Say whether *path* is code of the team or of the SDK.
 
     The same rule the C and the assembly paths use.  A script from a
-    framework package lives outside the project entirely — the one FM uses
+    framework package lives outside the project entirely — the one the STM32 project uses
     is under ~/.platformio/packages — and calling it project code would put
     its symbols into `find_dead_code(project_only=True)`.
     """

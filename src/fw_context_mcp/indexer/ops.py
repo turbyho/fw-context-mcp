@@ -170,7 +170,7 @@ def _normalize_file_path(file_path: str, project_root: Path) -> str:
     function stored verbatim, while ``_build_filtered_file_content`` stored
     ``str(Path(p).resolve())`` — ``/usr/include/c++/16/algorithm``.  The
     symbols hung off one row and the content off the other, and nothing
-    matched them up.  Measured on HA_Boiler: 145 duplicate rows, and the
+    matched them up.  Measured on the ESP32 project: 145 duplicate rows, and the
     whole C++ standard library became invisible once the coverage purge
     removed the spelling the manifest did not use.
 
@@ -420,7 +420,7 @@ def _build_filtered_file_content(
         # `generated` is written here too, and not only in
         # _store_symbol_rows.  That function iterates over SYMBOLS, so a
         # header that declares nothing never reaches it — this INSERT is the
-        # only creator of its row.  Measured on HA_Boiler: 7 of 56 generated
+        # only creator of its row.  Measured on the ESP32 project: 7 of 56 generated
         # headers, among them umbrella and version headers, came in this way
         # and kept generated=0 while the manifest said True.
         #
@@ -636,7 +636,7 @@ def _store_symbol_rows(
             # The cost is per (TU, file) pair, NOT per file: file_id_cache is
             # built fresh for every translation unit, and compute_source_hash
             # has no cache of its own.  A header that 200 units include is
-            # read 200 times.  Measured on zbox-ecb-fw: 1,037 unique headers
+            # read 200 times.  Measured on the Mbed project: 1,037 unique headers
             # but 86,686 references, an amplification of 84x.  It still costs
             # only about 1 s over a whole index run, because the files are
             # small and the page cache serves the repeats — the amplification

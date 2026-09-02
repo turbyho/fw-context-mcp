@@ -74,7 +74,7 @@ def _patterns_changed(
 
     ``vendor_patterns``: an ABSENT key is a change even when the run computed
     an empty set, because absent sends the query layer back to detection
-    while empty is an answer.  Measured on zbox-ecb-fw-v5: all 9 builds have
+    while empty is an answer.  Measured on the Zephyr project: all 9 builds have
     their SDK outside the project, so all 9 want the empty answer stored.
     """
     if build_dir_patterns and set(manifest.get("build_dir_patterns") or ()) != set(
@@ -461,7 +461,7 @@ def _update_manifest_after_index(
     # staleness check reads a manifest that describes a different boundary.
     # `is not None`, NOT truthiness: an empty list is an ANSWER.  Most
     # projects keep their SDK outside the project, and the correct set for
-    # them is empty — measured on all 9 builds of zbox-ecb-fw-v5.  Written as
+    # them is empty — measured on all 9 builds of the Zephyr project.  Written as
     # a missing key it would send the query layer back to detection, which is
     # exactly the disagreement the carrier exists to remove.
     if vendor_patterns is not None:

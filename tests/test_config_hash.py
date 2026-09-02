@@ -147,8 +147,8 @@ class TestConfigHashIdentity:
         started keeping those, its assertion had the wrong sign.  It is
         rewritten on in-project paths, which is what it always meant to test.
 
-        HA_Boiler has 14 distinct flag-sets but 208 distinct include paths,
-        and zbox-ecb-fw has 268 in-project ones.  A directory that moves
+        The ESP32 project has 14 distinct flag-sets but 208 distinct include paths,
+        and the Mbed project has 268 in-project ones.  A directory that moves
         inside the project does not change what the compiler reads.
         """
         base = [_FakeUnit("/tmp/proj/src/main.c", ["-DFOO=1", "-I/tmp/proj/inc"])]
@@ -192,7 +192,7 @@ class TestConfigHashIdentity:
     def test_adding_a_tu_with_a_new_sdk_include_keeps_the_hash(self):
         """Out-of-project paths go in as the INTERSECTION, not the union.
 
-        Regression against the union.  On zbox-ecb-fw-v5 one generated unit,
+        Regression against the union.  On the Zephyr project one generated unit,
         validate_binding_headers.c, carries 11 devicetree binding headers, so
         a union would mint a new build identity on every overlay edit.
         Measured over 2 052 units in 7 real builds: the union has 7 units
@@ -240,7 +240,7 @@ class TestConfigHashIdentity:
         2. compute_flags_hash expanded a response file against the process
            CWD, so a relative @rsp expanded to [] with no error and no log.
            Fixed in this commit.
-        3. On zbox-ecb-fw that response file holds exactly the include paths
+        3. On the Mbed project that response file holds exactly the include paths
            this sentence is about — 269 tokens on all 873 entries.
 
         An out-of-project include path therefore belongs in config_hash, and
@@ -257,7 +257,7 @@ class TestConfigHashIdentity:
     def test_per_tu_flag_variance_does_not_multiply_the_hash(self):
         """One TU carrying an extra -I must not change build identity.
 
-        Measured shape of a real build: FM has 216 TUs with an identical -D
+        Measured shape of a real build: the STM32 project has 216 TUs with an identical -D
         set and 5 flag-sets that differ only in -I.
         """
         uniform = [
@@ -273,7 +273,7 @@ class TestConfigHashIdentity:
     def test_a_define_on_a_single_tu_changes_the_hash(self):
         """A macro anywhere flips #ifdef somewhere — that IS build identity.
 
-        HA_Boiler really does this: ARDUINO_CORE_BUILD is defined for 46 of
+        The ESP32 project really does this: ARDUINO_CORE_BUILD is defined for 46 of
         its 114 TUs.
         """
         uniform = [
@@ -353,7 +353,7 @@ class TestTheFlagValueJoin:
     The pre-pass sorted the arguments before the path pass paired a flag with
     args[i + 1].  After the sort no value stands beside its own flag: values
     start with '/' (0x2F) and flags with '-' (0x2D), so sorted() puts every
-    path after every flag.  Measured on zbox-ecb-fw-v5, one build of 257
+    path after every flag.  Measured on the Zephyr project, one build of 257
     translation units: -isystem consumed -mabi=aapcs 230 times, and 30 bare
     directories stayed in the dialect set with no flag.
     """
@@ -401,7 +401,7 @@ class TestTheFlagValueJoin:
         A whitelist of "flags that take a value" would forget --param, and
         the extension test that used to catch the orphan is gone.  The value
         would then vanish and two builds with different inlining limits would
-        share one hash.  Measured on FM:
+        share one hash.  Measured on the STM32 project:
         "--param max-inline-insns-single=500".
         """
         a = [_FakeUnit("/tmp/proj/src/main.c",
@@ -465,7 +465,7 @@ class TestNoBareTokenReachesTheDialectSet:
 class TestResponseFileExpansion:
     """A relative @rsp resolves against the ENTRY's directory, not the CWD.
 
-    Measured on zbox-ecb-fw: all 873 entries carry a relative @./BUILD/...
+    Measured on the Mbed project: all 873 entries carry a relative @./BUILD/...
     response file with 269 -I tokens inside, and expand_response_file returns
     [] for a file it cannot find, with no error and no log.  flags_hash
     therefore depended on the directory fw-context ran from, and the whole

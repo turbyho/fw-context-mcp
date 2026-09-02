@@ -4086,7 +4086,7 @@ class TestBuildRetention:
         The manifest used to be left behind.  Nothing reads an abandoned
         build's manifest since the reuse tier was removed, so it was pure
         accumulation — one file per dialect change, and 52 MB of it on
-        zbox-ecb-fw.  It also made ``manifest.load(db_dir)`` ambiguous: that
+        the Mbed project.  It also made ``manifest.load(db_dir)`` ambiguous: that
         form picks the most recently modified manifest in the directory.
         """
         db_path = _db_path_for_project(c_project)
@@ -4488,7 +4488,7 @@ class TestManifestRecordsEveryInclude:
     silently dropped every extensionless C++ standard header (``<algorithm>``,
     ``<bit>``) and every ``.tcc`` template body.  Two things broke.  The
     coverage purge deleted those files because the manifest did not list them:
-    measured on HA_Boiler, 29 files and 1810 symbols.  And nothing recorded a
+    measured on the ESP32 project, 29 files and 1810 symbols.  And nothing recorded a
     hash for them, so a toolchain or SDK upgrade could change any of them
     without marking a single TU stale.
 
@@ -4580,7 +4580,7 @@ class TestReindexKeepsTheGeneratedFlag:
     it wrote claimed "generated": False.  After the end of vendor trust
     ``generated`` is the only trust rule left, so a single reindex_file
     turned the next full index run into a complete reparse.  Measured on
-    zbox-ecb-fw-v5 variant nrf52840-dev: 27 generated headers went to 0.
+    the Zephyr project variant nrf52840-dev: 27 generated headers went to 0.
     """
 
     @staticmethod
@@ -4712,7 +4712,7 @@ class TestReindexKeepsTheGeneratedFlag:
         """An index written before the key existed must still get patterns.
 
         The probe for this whole class must run on a build whose manifest HAS
-        patterns: five of the nine zbox-v5 manifests carry none, and on those
+        patterns: five of the nine the Zephyr project manifests carry none, and on those
         "generated is 0 after reindex_file" holds before the fix as well.
         """
         (tmp_path / "west.yml").write_text("")

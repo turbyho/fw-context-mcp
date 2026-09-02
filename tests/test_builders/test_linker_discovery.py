@@ -40,7 +40,7 @@ class TestFromNinja:
     """`-T <path>` in build.ninja is what the linker receives."""
 
     def test_two_spaces_after_the_flag(self, tmp_path):
-        # Measured on zbox-ecb-fw-v5, every image:
+        # Measured on the Zephyr project, every image:
         #   LINK_LIBRARIES = … -T  zephyr/linker.cmd  -Wl,-Map,…
         # A pattern with one space finds nothing here, which is the bug this
         # test pins.
@@ -109,7 +109,7 @@ class TestOutputDirsFromUnits:
     """Which output tree did THIS build compile into?
 
     mbed-tools writes one tree per toolchain and profile.  Measured on
-    birdie1-v2-fw-v3, which holds `GCC_ARM-DEBUG` and `GCC_ARM-DEVELOP`,
+    the second Mbed project, which holds `GCC_ARM-DEBUG` and `GCC_ARM-DEVELOP`,
     each with its own `.link_script.ld`.
     """
 
@@ -148,7 +148,7 @@ class TestOutputDirsFromUnits:
 
     def test_normalized_flags_are_not_the_source(self, tmp_path):
         # `clang_args` is normalized for libclang and the normalization drops
-        # the output flag: measured on birdie1, 349 normalized tokens with no
+        # the output flag: measured on the second Mbed project, 349 normalized tokens with no
         # `-o`, against 105 raw tokens that hold it.  Reading clang_args
         # would find nothing, thus raw_entry has to be the source.
         self._tree(tmp_path, "GCC_ARM-DEVELOP")
@@ -315,5 +315,5 @@ class TestTheBackends:
 
     def test_platformio_answers_nothing(self, tmp_path):
         # SCons records no link command the index can read, and the map file
-        # never names the script.  Measured on FM and on HA_Boiler.
+        # never names the script.  Measured on the STM32 project and on the ESP32 project.
         assert PlatformIOBuildSystem().get_linker_scripts(tmp_path) == []

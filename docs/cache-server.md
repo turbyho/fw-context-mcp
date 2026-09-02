@@ -38,8 +38,8 @@ fw-context uses a two-tier lookup. Each tier caches the answer, for next time:
 
 fw-context computes each content hash from the function body and the
 signature. Identical code produces identical hashes, regardless of the
-project. So an analysis that fw-context generates for *birdie1* is also
-available automatically to *zbox-ecb* and *HA_Boiler*. When you configure
+project. So an analysis that fw-context generates for *the second Mbed project* is also
+available automatically to *the Mbed project* and *the ESP32 project*. When you configure
 `[cache_server]` and re-index any project, fw-context skips Ollama entirely
 for symbols that are already in the cache.
 

@@ -298,7 +298,7 @@ def list_variants(
         builds = get_all_builds_for_project(conn, project_id)
         # The memory map is per build, thus it belongs on these rows and not
         # in the `images` list of get_active_build: that list holds one entry
-        # per image NAME, and two variants of zbox-ecb-fw-v5 both carry an
+        # per image NAME, and two variants of the Zephyr project both carry an
         # image called `app` with different flash addresses.
         hashes = [b["config_hash"] for b in builds]
         regions_by_config = get_memory_regions_by_config(conn, hashes)
@@ -306,7 +306,7 @@ def list_variants(
         # connection comes from `_quick_open_readonly`, which skips the
         # schema block by design, so an index written before this feature
         # holds no such column.  Naming it in a shared SELECT made
-        # get_active_build raise on HA_Boiler.
+        # get_active_build raise on the ESP32 project.
         entry_by_config = get_entry_points_by_config(conn, hashes)
     finally:
         conn.close()
@@ -470,12 +470,12 @@ def get_active_build(
         the tool never shows the defines of one file as the defines of the
         build.  ``defines_varying`` counts the names left out, thus a name
         absent from ``defines`` is either not defined at all or not defined
-        everywhere — measured on zbox-ecb-fw: 27 names in all 881 units, 59
+        everywhere — measured on the Mbed project: 27 names in all 881 units, 59
         in only some, where the three assembly files get a shorter set.
 
         This is the configuration the BUILD states, not every macro the
         preprocessor saw.  The second is three orders of magnitude larger —
-        27800 distinct names on FM — and almost all of it comes from the
+        27800 distinct names on the STM32 project — and almost all of it comes from the
         headers and the compiler.  A Zephyr build keeps its real
         configuration in ``autoconf.h`` (740 `CONFIG_*` names) and passes
         few `-D` flags, so ``defines`` says little there and a great deal on
@@ -566,7 +566,7 @@ def get_active_build(
             modified_count = _count_modified_files(conn, config_hash, root, use_cache=False)
             # NOTE: the header check is NOT cheap — it hashes every header of
             # every translation unit, which is 22,693 files and 749 ms on
-            # zbox-ecb-fw.  `fast` only gives it a cache; it does not skip it.
+            # The Mbed project.  `fast` only gives it a cache; it does not skip it.
             if manifest_verification == "full":
                 header_affected_tus, _ = _check_header_staleness(
                     conn, config_hash, root, use_cache=True,
@@ -654,7 +654,7 @@ def get_active_build(
         # A fourth condition, and the only one a plain reindex cannot fix.
         # compile_commands.json is a build artifact of the branch it was
         # generated on: it carries that branch's file list AND its compiler
-        # flags.  Measured on zbox-ecb-fw, a switch from 4.15.3 to 4.15.1
+        # flags.  Measured on the Mbed project, a switch from 4.15.3 to 4.15.1
         # left two generated zcbor sources listed in that file and absent
         # from the tree, and a reindex reads the same file again.
         indexed_branch, live_branch = branch_moved_since(
@@ -676,7 +676,7 @@ def get_active_build(
             # command is the only thing that fixes it.  Measured: without the
             # second half this reason read as a command while the
             # new-source reason beside it read "no command is needed", and
-            # the two contradicted each other on one checkout of zbox-ecb-fw.
+            # the two contradicted each other on one checkout of the Mbed project.
             reindex_reasons.append(
                 f"branch changed: indexed on {indexed_branch!r}, "
                 f"now on {live_branch!r} — compile_commands.json belongs to "
@@ -891,7 +891,7 @@ def get_active_build(
         # AFTER the multi-variant block, because that block replaces
         # `config_hash` with the default build.  Read before it, a
         # multi-variant project would report the map of one build under the
-        # identity of another — measured on zbox-ecb-fw-v5, where `app`
+        # identity of another — measured on the Zephyr project, where `app`
         # starts at flash 372736 and `mcuboot` at 110592.
         #
         # One build only.  `list_variants` reports every build's map, and
@@ -903,7 +903,7 @@ def get_active_build(
             # The `-D` flags of the build that `config_hash` names, read
             # from ITS compile_commands.json rather than from the project's.
             # Computed here and not stored: the read costs 19 ms on
-            # zbox-ecb-fw with 881 units, measured, so a column would buy
+            # The Mbed project with 881 units, measured, so a column would buy
             # nothing and a stale one would mislead.
             defines, varying = command_line_defines(
                 Path(result["compile_commands"])
@@ -1438,7 +1438,7 @@ def _update_manifest_after_reindex(
             # every header, so every record this function writes claimed
             # "generated": False.  After the end of vendor trust `generated`
             # is the only trust rule left, so that turned every build of a
-            # re-indexed file into a full reparse.  Measured on zbox-ecb-fw-v5
+            # re-indexed file into a full reparse.  Measured on the Zephyr project
             # variant nrf52840-dev: 27 generated headers dropped to 0.
             bdp = manifest_data.get("build_dir_patterns")
             if not bdp:
@@ -1900,7 +1900,7 @@ def _tu_for_header(
     header paths it pulled in, which answers the reverse question.
 
     ONE unit, not all of them.  The fan-out is large: measured on
-    zbox-ecb-fw, an application header reaches a median of 3 translation
+    the Mbed project, an application header reaches a median of 3 translation
     units but ``sdk_config.h`` reaches 266, and one re-parse costs about
     42 s on that project.  Re-parsing every including unit would turn a
     single tool call into hours, thus the caller warns that the answer

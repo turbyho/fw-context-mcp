@@ -70,3 +70,18 @@ LEAN-CTX.md
 # it tracked only shipped a stale 500 KB file inside every sdist. Track it
 # again if the build ever moves to `uv sync --locked`.
 uv.lock
+
+# Search-quality experiments — local only.  The scripts and their datasets
+# are named after the private firmware projects they were measured on, and
+# this repository is public.  Kept on disk, out of git.
+experiments/
+
+# Planning documents — local only.  Czech-language internal planning that
+# names private firmware projects, their repository layout and their
+# findings.  This repository is public.  Kept on disk, out of git.
+plans/
+
+# Local comparison harness — runs only with FW_CONTEXT_COMPARISON=1 against
+# indexes of private firmware projects, and is hardcoded to their project
+# ids and symbol names.  It can never run for anyone else.
+tests/test_feature_comparison.py

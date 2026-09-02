@@ -22,7 +22,7 @@
 
 /*
  * The manual's own shape: a default on the FIRST argument and none on
- * the second.  Called as `reserve_str A,B` both are given; called as
+ * The second.  Called as `reserve_str A,B` both are given; called as
  * `reserve_str ,B` the first takes its default.
  */
     .macro  reserve_str p1=first_defaulted p2

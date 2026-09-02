@@ -715,20 +715,20 @@ class TestEnumValue:
         file_id = upsert_file(populated_db, "hash-deadbeef", "/tmp/cmd.h", "cpp")
         insert_symbols_batch(populated_db, [
             ("hash-deadbeef", file_id, "src/ble_cmd.h",
-             split_tokens("StatusCode", "zbox::BleCmd::StatusCode"),
-             "U_enum", "StatusCode", "zbox::BleCmd::StatusCode", "enum",
+             split_tokens("StatusCode", "the Mbed project::BleCmd::StatusCode"),
+             "U_enum", "StatusCode", "the Mbed project::BleCmd::StatusCode", "enum",
              19, 1, 36, 1, "", "", None, 0, 0, "", 0, "", 0, 0.0, "", 0),
             ("hash-deadbeef", file_id, "src/ble_cmd.h",
-             split_tokens("TOKEN_INVALID", "zbox::BleCmd::StatusCode::TOKEN_INVALID"),
-             "U_tok_inv", "TOKEN_INVALID", "zbox::BleCmd::StatusCode::TOKEN_INVALID",
+             split_tokens("TOKEN_INVALID", "the Mbed project::BleCmd::StatusCode::TOKEN_INVALID"),
+             "U_tok_inv", "TOKEN_INVALID", "the Mbed project::BleCmd::StatusCode::TOKEN_INVALID",
              "enum_constant", 23, 1, 0, 1, "", "", -2, 0, 0, "", 0, "", 0, 0.0, "", 0),
             ("hash-deadbeef", file_id, "src/ble_cmd.h",
-             split_tokens("OPERATION_SUCCESSFUL", "zbox::BleCmd::StatusCode::OPERATION_SUCCESSFUL"),
-             "U_ok", "OPERATION_SUCCESSFUL", "zbox::BleCmd::StatusCode::OPERATION_SUCCESSFUL",
+             split_tokens("OPERATION_SUCCESSFUL", "the Mbed project::BleCmd::StatusCode::OPERATION_SUCCESSFUL"),
+             "U_ok", "OPERATION_SUCCESSFUL", "the Mbed project::BleCmd::StatusCode::OPERATION_SUCCESSFUL",
              "enum_constant", 21, 1, 0, 1, "", "", 1, 0, 0, "", 0, "", 0, 0.0, "", 0),
             ("hash-deadbeef", file_id, "src/ble_cmd.h",
-             split_tokens("DEVICE_ERROR", "zbox::BleCmd::StatusCode::DEVICE_ERROR"),
-             "U_dev_err", "DEVICE_ERROR", "zbox::BleCmd::StatusCode::DEVICE_ERROR",
+             split_tokens("DEVICE_ERROR", "the Mbed project::BleCmd::StatusCode::DEVICE_ERROR"),
+             "U_dev_err", "DEVICE_ERROR", "the Mbed project::BleCmd::StatusCode::DEVICE_ERROR",
              "enum_constant", 28, 1, 0, 1, "", "", -7, 0, 0, "", 0, "", 0, 0.0, "", 0),
         ])
 
@@ -749,24 +749,24 @@ class TestEnumValue:
         file_id = upsert_file(populated_db, "hash-deadbeef", "/tmp/cmd.h", "cpp")
         insert_symbols_batch(populated_db, [
             ("hash-deadbeef", file_id, "src/ble_cmd.h",
-             split_tokens("StatusCode", "zbox::BleCmd::StatusCode"),
-             "U_enum", "StatusCode", "zbox::BleCmd::StatusCode", "enum",
+             split_tokens("StatusCode", "the Mbed project::BleCmd::StatusCode"),
+             "U_enum", "StatusCode", "the Mbed project::BleCmd::StatusCode", "enum",
              19, 1, 0, 1, "", "", None, 0, 0, "", 0, "", 0, 0.0, "", 0),
             ("hash-deadbeef", file_id, "src/ble_cmd.h",
-             split_tokens("TOKEN_INVALID", "zbox::BleCmd::StatusCode::TOKEN_INVALID"),
-             "U_tok_inv", "TOKEN_INVALID", "zbox::BleCmd::StatusCode::TOKEN_INVALID",
+             split_tokens("TOKEN_INVALID", "the Mbed project::BleCmd::StatusCode::TOKEN_INVALID"),
+             "U_tok_inv", "TOKEN_INVALID", "the Mbed project::BleCmd::StatusCode::TOKEN_INVALID",
              "enum_constant", 23, 1, 0, 1, "", "", -2, 0, 0, "", 0, "", 0, 0.0, "", 0),
             ("hash-deadbeef", file_id, "src/ble_cmd.h",
-             split_tokens("OPERATION_SUCCESSFUL", "zbox::BleCmd::StatusCode::OPERATION_SUCCESSFUL"),
-             "U_ok", "OPERATION_SUCCESSFUL", "zbox::BleCmd::StatusCode::OPERATION_SUCCESSFUL",
+             split_tokens("OPERATION_SUCCESSFUL", "the Mbed project::BleCmd::StatusCode::OPERATION_SUCCESSFUL"),
+             "U_ok", "OPERATION_SUCCESSFUL", "the Mbed project::BleCmd::StatusCode::OPERATION_SUCCESSFUL",
              "enum_constant", 21, 1, 0, 1, "", "", 1, 0, 0, "", 0, "", 0, 0.0, "", 0),
             ("hash-deadbeef", file_id, "src/ble_cmd.h",
-             split_tokens("State", "zbox::BleCmd::State"),
-             "U_state", "State", "zbox::BleCmd::State", "enum",
+             split_tokens("State", "the Mbed project::BleCmd::State"),
+             "U_state", "State", "the Mbed project::BleCmd::State", "enum",
              90, 1, 0, 1, "", "", None, 0, 0, "", 0, "", 0, 0.0, "", 0),
             ("hash-deadbeef", file_id, "src/ble_cmd.h",
-             split_tokens("Idle", "zbox::BleCmd::State::Idle"),
-             "U_idle", "Idle", "zbox::BleCmd::State::Idle",
+             split_tokens("Idle", "the Mbed project::BleCmd::State::Idle"),
+             "U_idle", "Idle", "the Mbed project::BleCmd::State::Idle",
              "enum_constant", 92, 1, 0, 1, "", "", 0, 0, 0, "", 0, "", 0, 0.0, "", 0),
         ])
 
@@ -780,8 +780,8 @@ class TestEnumValue:
 
         # Find StatusCode subgroup
         subgroups_by_name = {s["name"]: s for s in enum_const["subgroups"]}
-        assert "zbox::BleCmd::StatusCode" in subgroups_by_name
-        sc = subgroups_by_name["zbox::BleCmd::StatusCode"]
+        assert "the Mbed project::BleCmd::StatusCode" in subgroups_by_name
+        sc = subgroups_by_name["the Mbed project::BleCmd::StatusCode"]
         assert sc["count"] == 2
         assert len(sc["constants"]) == 2
         # Verify constants include name, qualified_name, line, and enum_value
@@ -795,7 +795,7 @@ class TestEnumValue:
         assert tok_const["enum_value"] == -2
 
         # State subgroup
-        st = subgroups_by_name["zbox::BleCmd::State"]
+        st = subgroups_by_name["the Mbed project::BleCmd::State"]
         assert st["count"] == 1
         idle = st["constants"][0]
         assert idle["name"] == "Idle"
@@ -806,12 +806,12 @@ class TestEnumValue:
         file_id = upsert_file(populated_db, "hash-deadbeef", "/tmp/cmd.h", "cpp")
         insert_symbols_batch(populated_db, [
             ("hash-deadbeef", file_id, "src/ble_cmd.h",
-             split_tokens("TOKEN_INVALID", "zbox::BleCmd::StatusCode::TOKEN_INVALID"),
-             "U_tok_inv", "TOKEN_INVALID", "zbox::BleCmd::StatusCode::TOKEN_INVALID",
+             split_tokens("TOKEN_INVALID", "the Mbed project::BleCmd::StatusCode::TOKEN_INVALID"),
+             "U_tok_inv", "TOKEN_INVALID", "the Mbed project::BleCmd::StatusCode::TOKEN_INVALID",
                           "enum_constant", 23, 1, 0, 1, "", "", -2, 0, 0, "", 0, "", 0, 0.0, "", 0),
             ("hash-deadbeef", file_id, "src/ble_cmd.h",
-             split_tokens("OPERATION_SUCCESSFUL", "zbox::BleCmd::StatusCode::OPERATION_SUCCESSFUL"),
-             "U_ok", "OPERATION_SUCCESSFUL", "zbox::BleCmd::StatusCode::OPERATION_SUCCESSFUL",
+             split_tokens("OPERATION_SUCCESSFUL", "the Mbed project::BleCmd::StatusCode::OPERATION_SUCCESSFUL"),
+             "U_ok", "OPERATION_SUCCESSFUL", "the Mbed project::BleCmd::StatusCode::OPERATION_SUCCESSFUL",
                           "enum_constant", 21, 1, 0, 1, "", "", 1, 0, 0, "", 0, "", 0, 0.0, "", 0),
         ])
 
@@ -1351,9 +1351,9 @@ class TestSearchBodies:
              10, 1, 20, 1, "void check_timer()", "", None, 0, 0, "", 0, "", 1, 0.0,
              '_timeout.attach(callback(&ModemMsg::TimeoutInterrupt, this), 30s);', 0),
             ("hash-deadbeef", fid, "src/multi.cpp",
-             split_tokens("zbox_reset", "WDT::zbox_reset"),
-             "usr-src-2", "zbox_reset", "WDT::zbox_reset", "method",
-             30, 1, 35, 1, "void zbox_reset()", "", None, 0, 0, "", 0, "", 1, 0.0,
+             split_tokens("wdt_reset", "WDT::wdt_reset"),
+             "usr-src-2", "wdt_reset", "WDT::wdt_reset", "method",
+             30, 1, 35, 1, "void wdt_reset()", "", None, 0, 0, "", 0, "", 1, 0.0,
              '_timeout.attach(callback(&WDT::_timeout_interrupt), delay);', 0),
             # Negative: this one does NOT contain "attach"
             ("hash-deadbeef", fid, "src/multi.cpp",
@@ -1377,7 +1377,7 @@ class TestSearchBodies:
 
         # Only the two symbols with ".attach(" in their source should be found
         names = {r[0] for r in rows}
-        assert names == {"check_timer", "zbox_reset"}
+        assert names == {"check_timer", "wdt_reset"}
         assert "main" not in names
 
     def test_find_nvic_pattern_in_body(self, populated_db):
@@ -1449,9 +1449,9 @@ class TestSearchBodies:
              "void Ticker::attach(Callback<void()> func, float t) { _ticker.attach(func, t); }", 0),
             # Project code second (is_project=1)
             ("hash-deadbeef", fid, "src/wdt.cpp",
-             split_tokens("zbox_reset", "WDT::zbox_reset"),
-             "usr-pri-2", "zbox_reset", "WDT::zbox_reset", "method",
-             30, 1, 35, 1, "void zbox_reset(duration delay)",
+             split_tokens("wdt_reset", "WDT::wdt_reset"),
+             "usr-pri-2", "wdt_reset", "WDT::wdt_reset", "method",
+             30, 1, 35, 1, "void wdt_reset(duration delay)",
              "", None, 0, 0, "", 0, "", 1, 0.0,
              "_timeout.attach(callback(&WDT::_timeout_interrupt), delay);", 0),
         ])
@@ -1470,7 +1470,7 @@ class TestSearchBodies:
         # Both should be found
         assert len(rows) == 2
         names = {r[0] for r in rows}
-        assert "zbox_reset" in names
+        assert "wdt_reset" in names
         assert "attach" in names
 
     def test_project_only_excludes_vendor(self, populated_db):
@@ -2161,7 +2161,7 @@ class TestGeneratedFlagIsMonotone:
 
     The flag could not be RAISED: the column was written on INSERT and the
     ON CONFLICT clause never mentioned it, so a row another caller inserted
-    first kept 0 whatever a later caller knew.  Measured on HA_Boiler once
+    first kept 0 whatever a later caller knew.  Measured on the ESP32 project once
     the column was first filled: manifest 56, database 49, and the seven
     that differed were the rows some other caller had inserted first.
 
@@ -2265,7 +2265,7 @@ class TestReconcileGenerated:
     upsert_file() takes MAX, so a row can gain the flag but never lose it.
     That is right inside a run and wrong across two.  Measured: narrowing
     PlatformIO from ``.pio/`` to ``.pio/build/`` leaves the config_hash
-    identical, so 57 rows on HA_Boiler and FM would have kept a flag their
+    identical, so 57 rows on the ESP32 project and the STM32 project would have kept a flag their
     manifest no longer gives them.
     """
 
@@ -2445,7 +2445,7 @@ class TestOrphanFileCleanup:
     per build.  A 0-byte source yields no symbols, no macros and no content,
     so it matched every condition of the orphan sweep and its row went away
     on every run.  Tier 1 needs a row to skip a translation unit, so the next
-    run parsed it again: measured on zbox-ecb-fw-v5, all 9 builds reported
+    run parsed it again: measured on the Zephyr project, all 9 builds reported
     "3 updated" for ever and never reached "0 updated".
 
     The clause that spares a row with symbols or macros is NOT retested here.
@@ -2598,7 +2598,7 @@ class TestHashColumnsAreNotErased:
 
     Erasing them was never a WRONG answer.  Tier 1 compares the mtime, which
     a re-parse does not move, so the next run never read the cleared value —
-    measured on zbox-ecb-fw-v5, where a reindex_file of proj/app/src/main.c
+    measured on the Zephyr project, where a reindex_file of proj/app/src/main.c
     left 254 of 257 units unchanged on the following run.  The cost came
     later: once something moved the mtime without changing the text, Tier 2
     found an empty content_hash, could not take its shortcut, and paid one

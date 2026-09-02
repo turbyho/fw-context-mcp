@@ -2,7 +2,7 @@
 
 A build that generates its interrupt table writes resolved ADDRESSES into
 the generated C, so the slots that are actually in use carry no name that
-an index can read.  Measured on zbox-ecb-fw-v5: ``_sw_isr_table`` is
+an index can read.  Measured on the Zephyr project: ``_sw_isr_table`` is
 declared ``[290]``, 284 slots name the spurious stub, and the 6 in use name
 nothing at all.
 

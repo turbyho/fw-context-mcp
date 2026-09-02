@@ -25,7 +25,7 @@ class TestInitVariants:
         cfg = self._cfg(tmp_path)
         rc = _add_variant(
             cfg,
-            _Args(name="nrf52840-dev", board="nrf52840dk/nrf52840", env=["ZBOX_ENV=DEV"]),
+            _Args(name="nrf52840-dev", board="nrf52840dk/nrf52840", env=["BOARD_ENV=DEV"]),
         )
         assert rc == 0
         data = tomllib.loads(cfg.read_text())
@@ -33,7 +33,7 @@ class TestInitVariants:
         assert len(variants) == 1
         assert variants[0]["name"] == "nrf52840-dev"
         assert variants[0]["board"] == "nrf52840dk/nrf52840"
-        assert variants[0]["env"] == {"ZBOX_ENV": "DEV"}
+        assert variants[0]["env"] == {"BOARD_ENV": "DEV"}
 
     def test_add_duplicate_fails(self, tmp_path):
         cfg = self._cfg(tmp_path)

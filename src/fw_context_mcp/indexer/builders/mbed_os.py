@@ -183,7 +183,7 @@ class MbedOSBuildSystem:
 
         mbed-tools preprocesses the target's script and writes the result as
         `.link_script.ld` in the build output directory.  Measured on
-        zbox-ecb-fw: `.fw-context/autobuild/default/.link_script.ld`, which
+        the Mbed project: `.fw-context/autobuild/default/.link_script.ld`, which
         holds the four regions of that target and `__StackTop`.
 
         The output directory is per variant, thus one shared directory would
@@ -194,7 +194,7 @@ class MbedOSBuildSystem:
 
         A project the USER built keeps the tree somewhere else:
         `BUILD/<target>/<toolchain>-<profile>/`.  Measured on
-        birdie1-v2-fw-v3, which holds two of them, `GCC_ARM-DEBUG` and
+        the second Mbed project, which holds two of them, `GCC_ARM-DEBUG` and
         `GCC_ARM-DEVELOP`, each with its own `.link_script.ld`.  The `-o`
         flags of the units say which tree this build compiled into, so
         `output_dirs_from_units` reads them instead of choosing by name.

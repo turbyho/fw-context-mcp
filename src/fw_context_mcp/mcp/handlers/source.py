@@ -137,7 +137,7 @@ def _lookup_definition(
     An assembly definition always sorts last.  A CMSIS startup file defines
     every interrupt handler weakly so that C code can override it, and both
     definitions are then in the index under the same name: measured on
-    zbox-ecb-fw, 11 names carry one of each.  The C definition is the one
+    the Mbed project, 11 names carry one of each.  The C definition is the one
     the linker keeps, thus it is the one to report — and without this the
     winner is decided by line number, so a project whose handler sits
     further down its file than the stub does in the startup file gets the
@@ -184,7 +184,7 @@ def _lookup_definition(
         )
         if result:
             return result
-        # Plain-name fallback: e.g. "zbox::NoinitStruct" where the symbol
+        # Plain-name fallback: e.g. "the Mbed project::NoinitStruct" where the symbol
         # is global (qualified_name == name, no namespace prefix).
         result = _lookup_try_columns(
             conn, f"{QUERY_WHERE} AND s.qualified_name = s.name {QUERY_ORDER} LIMIT 1",
