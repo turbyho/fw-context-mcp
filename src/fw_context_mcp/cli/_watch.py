@@ -33,7 +33,7 @@ def cmd_watch_status(args: argparse.Namespace) -> int:
 
     from ..config import derive_project_id
     from ..config import load as load_config
-    from ..mcp.background import _is_bg_reindex_running
+    from ..mcp.background import _is_bg_reindex_running, read_reindex_progress
     from ..mcp.daemon import DAEMON_SOCK_NAME, ping_daemon
     from ..utils import resolve_project_root
 
@@ -44,7 +44,6 @@ def cmd_watch_status(args: argparse.Namespace) -> int:
 
     pid_file = db_dir / "watcher.pid"
     sock_path = db_dir / DAEMON_SOCK_NAME
-    log_file = db_dir / "reindex.log"
 
     print(f"Project:    {root.name}")
     print(f"Path:       {root}")
@@ -99,14 +98,12 @@ def cmd_watch_status(args: argparse.Namespace) -> int:
     else:
         print("Index:      idle")
 
-    # Last index log line
-    if log_file.exists():
-        try:
-            lines = log_file.read_text().splitlines()
-            if lines:
-                print(f"Last index: {lines[-1]}")
-        except OSError:
-            pass
+    # Last line the index run itself wrote.  Not the last line of the
+    # file: reindex.log also holds the output of the build tools, and the
+    # helper says why taking that would be wrong.
+    last = read_reindex_progress(db_dir)
+    if last is not None:
+        print(f"Last index: {last}")
 
     return 0
 

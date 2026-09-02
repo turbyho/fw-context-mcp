@@ -61,7 +61,7 @@ from ...indexer.db import (
 from ...indexer.git_context import branch_moved_since
 from ...llm.ollama import check_setup
 from ...utils import HEADER_EXTENSIONS, resolve_project_root
-from ..background import _is_bg_reindex_running
+from ..background import _is_bg_reindex_running, read_reindex_progress
 from ..shared.context import (
     _db_path,
     _detect_build_system,
@@ -930,7 +930,7 @@ def get_active_build(
     # not spawn subprocesses.
     result["bg_reindex_running"] = bg_running
     if bg_running:
-        result["reindex_progress"] = _read_reindex_progress(db_path)
+        result["reindex_progress"] = read_reindex_progress(db_path.parent)
 
     # sqlite-vec is an optional C extension for vector embeddings.
     # Report its availability so semantic_search can degrade gracefully.
@@ -941,27 +941,6 @@ def get_active_build(
         result["vec_error"] = vec_err
 
     return result
-def _read_reindex_progress(db_path: Path) -> str | None:
-    """Read the last log line from the background reindex process.
-
-    Opens ``reindex.log`` in the same directory as the index database.
-    Reads only the last 4 KiB of the file — sufficient for a single
-    log line without reading a multi-megabyte log file into memory.
-    Returns ``None`` when the log file is missing or empty.
-    """
-    log_file = db_path.parent / "reindex.log"
-    try:
-        with open(log_file, encoding="utf-8") as fh:
-            fh.seek(0, 2)
-            file_size = fh.tell()
-            if file_size == 0:
-                return None
-            fh.seek(max(0, file_size - 4096))
-            last_chunk = fh.read()
-            lines = last_chunk.splitlines()
-            return lines[-1].strip() if lines else None
-    except (OSError, IndexError):
-        return None
 
 
 # ── moved from server.py ──

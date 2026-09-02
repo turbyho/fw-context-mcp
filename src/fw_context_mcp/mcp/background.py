@@ -36,6 +36,7 @@ from __future__ import annotations
 import fcntl
 import logging
 import os
+import re
 import sqlite3
 import subprocess
 import sys
@@ -127,6 +128,79 @@ def _is_bg_reindex_running(root: Path) -> bool:
         return True
 
     return False
+
+
+# ── read_reindex_progress ────────────────────────────────────────────────────
+# How a fw-context line starts.  Three shapes, and nothing else writes them:
+#
+# * ``HH:MM:SS LEVEL `` — the logging format of a background index run,
+#   ``cli/_index.py`` (``datefmt="%H:%M:%S"``).  ``--verbose`` picks the
+#   framed VerboseFormatter instead, but the daemon never passes ``-v``.
+# * ``fw-context: error: `` — a CLI diagnostic.
+# * ``Project: `` — the header, printed before the first log record.
+_REINDEX_RECORD_START = re.compile(
+    r"^(?:\d{2}:\d{2}:\d{2} \w+ |fw-context: \w+: |Project: )"
+)
+
+# How much of the tail to read.  A record start must be inside it, and a
+# failed build can quote up to 500 characters of another tool's stderr
+# ahead of one — see the docstring below.  64 KiB holds hundreds of lines
+# and keeps a multi-megabyte log off the query path.
+_REINDEX_TAIL_BYTES = 65536
+
+
+def read_reindex_progress(db_dir: Path) -> str | None:
+    """Return the newest line the index run itself wrote to ``reindex.log``.
+
+    Not the last line of the file.  ``daemon._run_index_async`` sends the
+    stdout AND the stderr of ``fw-context index --background`` to that
+    file, and a build runs inside that process, so the file also holds the
+    output of west, cmake, ninja, and the shell that started them.  The
+    last line is often one of theirs: a run in zbox-ecb-fw-v5 ended on a
+    bare ``lean-ctx:``, and both readers of this log — ``get_active_build``
+    and ``fw-context watch status`` — reported that text as the progress.
+
+    The error text of fw-context is not safe to take either.  When a build
+    command fails, ``utils.run_build`` puts 500 characters of the tool's
+    stderr into the message, so the record ends on a line that fw-context
+    printed but did not write.
+
+    So this reads backwards for the newest line that STARTS a fw-context
+    record and gives that line.  After a failed build it is the
+    ``fw-context: error:`` line, which names the failure, and not the
+    quoted tool output below it.
+
+    *db_dir* is the directory that holds ``index.db``.  Returns None when
+    the file is absent, is empty, or holds no record start in its tail.
+    """
+    log_file = db_dir / "reindex.log"
+    start = 0
+    try:
+        # Binary, and NOT text with a seek.  A text-mode seek to
+        # ``size - N`` can land inside a UTF-8 sequence, and the read then
+        # raises UnicodeDecodeError — which this function did not catch.
+        # The log carries "→" and "—" in ordinary progress lines, so the
+        # boundary is reachable.
+        with open(log_file, "rb") as fh:
+            fh.seek(0, os.SEEK_END)
+            size = fh.tell()
+            if size == 0:
+                return None
+            start = max(0, size - _REINDEX_TAIL_BYTES)
+            fh.seek(start)
+            tail = fh.read()
+    except OSError:
+        return None
+
+    lines = tail.decode("utf-8", errors="replace").splitlines()
+    # A tail that begins mid-file begins mid-line.  Drop that fragment: a
+    # cut line cannot be reported as a whole one, and its start is gone.
+    if start > 0 and lines:
+        del lines[0]
+    for line in reversed(lines):
+        if _REINDEX_RECORD_START.match(line):
+            return line.strip()
+    return None
 
 
 # ── _ensure_daemon_running ───────────────────────────────────────────────────
