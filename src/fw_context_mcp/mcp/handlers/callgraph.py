@@ -50,6 +50,7 @@ from __future__ import annotations
 
 import logging
 import time
+from pathlib import Path
 from typing import Annotated
 
 from pydantic import Field
@@ -70,6 +71,7 @@ from ...indexer.db import (
 from ...indexer.db import (
     find_indirect_targets as query_indirect_targets,
 )
+from ...indexer.intlist import read_isr_registrations
 from ...utils import abs_path
 from ...utils import escape_like as _escape_like
 from ._base import BaseHandler, DbContext
@@ -1424,6 +1426,99 @@ def find_hotspots(
 
 
 
+def _from_the_build(conn, config_hash: str, coverage: list[dict]) -> list[dict]:
+    """Name the slots the index could not, from what the build recorded.
+
+    A generated table holds a resolved ADDRESS in every slot that is in
+    use, so those slots have no name for the index to read — measured, 6 of
+    290 on an nRF54L application, and they are the interrupts the firmware
+    actually services.  The build recorded the registrations that produced
+    them, and ``intlist.read_isr_registrations`` reads them back.
+
+    A registration is reported only where it fills a gap the index found in
+    a real table.  That keeps the two sources honest about each other: a
+    registration for a slot the index already named would be a
+    contradiction worth noticing rather than a row to add, and one for a
+    table the index never saw has nothing to attach to.
+
+    Each row carries ``source="build"``, and ``argument`` where the build
+    named one.  The argument is NOT a second handler: measured, it is
+    ``nrfx_power_clock_irq_handler`` behind the ``nrfx_isr`` shim in one
+    driver and the device ``__device_dts_ord_116`` in another.
+    """
+    gaps = {
+        slot: entry
+        for entry in coverage
+        for slot in entry.get("missing_slots", ())
+    }
+    if not gaps:
+        return []
+
+    build_dir = _build_directory(conn, config_hash)
+    if build_dir is None:
+        return []
+    table = read_isr_registrations(build_dir)
+    if table is None:
+        return []
+
+    out: list[dict] = []
+    for registration in table.registrations:
+        entry = gaps.get(registration.slot)
+        if entry is None:
+            continue
+        row = {
+            "slot": registration.slot,
+            "name": registration.handler,
+            "status": "c",
+            "source": "build",
+            "table_name": entry["table_name"],
+            "table_usr": entry["table_usr"],
+            "table_file": entry["table_file"],
+            "table_line": 0,
+            "file": "",
+            "line": 0,
+        }
+        if registration.argument:
+            row["argument"] = registration.argument
+        found = conn.execute(
+            """SELECT file_path AS file, line, kind, usr FROM symbols
+               WHERE config_hash = ? AND name = ? AND is_definition = 1
+               LIMIT 2""",
+            (config_hash, registration.handler),
+        ).fetchall()
+        # Only one definition may answer.  Two mean the name is ambiguous,
+        # and pointing at the wrong file is worse than pointing at none.
+        if len(found) == 1:
+            row["file"] = found[0]["file"]
+            row["line"] = found[0]["line"]
+            if str(found[0]["usr"]).startswith("asm:"):
+                row["status"] = "assembly"
+        out.append(row)
+
+    out.sort(key=lambda entry: (str(entry["table_name"]), entry["slot"]))
+    if table.dynamic and out:
+        # Without this the list reads as complete, and it is not.
+        out.append({"info": (
+            "This build enables CONFIG_DYNAMIC_INTERRUPTS, so an interrupt "
+            "can also be connected at run time. A run-time registration "
+            "leaves nothing in the build for this to read, so the rows with "
+            'source="build" are not necessarily all of them.'
+        )})
+    return out
+
+
+def _build_directory(conn, config_hash: str):
+    """Return the directory holding this build's compile_commands.json."""
+    found = conn.execute(
+        """SELECT compile_commands_path FROM build_configs
+           WHERE config_hash = ? LIMIT 1""",
+        (config_hash,),
+    ).fetchone()
+    if found is None or not found["compile_commands_path"]:
+        return None
+    return Path(str(found["compile_commands_path"])).parent
+
+
 def _slots_within_limit(rows: list[dict], limit: int) -> list[dict]:
     """Cut *rows* to *limit*, and say so whenever anything was cut.
 
@@ -1509,6 +1604,22 @@ def get_vector_table(
       is what a build that generates its table produces.  Zephyr writes
       its external interrupts this way, with ``gen_isr_tables.py``.  These
       rows also carry ``table_name``, the array the slot belongs to.
+    * ``"build"`` — the registration the build itself recorded, for a slot
+      the other two could not name.  A generator writes a resolved ADDRESS
+      into every slot that is in use, so those slots have no name in the
+      source at all — and they are the interrupts the firmware actually
+      services.  Measured on an nRF54L application: 284 of 290 slots name
+      the spurious stub, and the 6 without a name are IRQ 89, 198, 219,
+      228, 269 and 270, which these rows fill in.
+
+      Such a row can carry ``argument``, the symbol the build passes to
+      the handler.  Read it as an argument and not as a second handler:
+      behind the ``nrfx_isr`` shim it is the real worker
+      (``nrfx_power_clock_irq_handler``), while for another driver it is
+      the device (``__device_dts_ord_116``).  When the build enables
+      run-time registration, a dict with ``info`` says so, because an
+      interrupt connected at run time leaves nothing to read and the rows
+      are then not all of them.
 
     Recognition is by shape, never by name, so any array of function
     addresses is reported and the row names its table.  A table of
@@ -1555,7 +1666,8 @@ def get_vector_table(
 
     Returns:
         list of dicts sorted by source, then table, then slot.  Each holds:
-        slot (int), name, file, line, source (``"assembly"`` or ``"c"``),
+        slot (int), name, file, line, source (``"assembly"``, ``"c"`` or
+        ``"build"``),
         status (``"c"``, ``"assembly"``, ``"unhandled"``, ``"linker"`` or
         ``"dispatcher"``), and table_file and table_line (where the slot is
         written).  A ``"c"`` source row also holds table_name and
@@ -1591,12 +1703,15 @@ def get_vector_table(
                 "were recorded also answers this way — reindex to read the "
                 "C source. Use find_references on a handler name instead."
             )}]
-        # Coverage goes after the slots and only when a table has gaps: a
-        # table the index named completely has nothing to add.  It is left
-        # out under unhandled_only, where the caller asked for one kind of
-        # row and a summary of every table would not be it.
         if not unhandled_only:
-            rows = rows + [
+            coverage = index_db.get_table_coverage(conn, config_hash)
+            rows = rows + _from_the_build(conn, config_hash, coverage)
+            # Coverage goes last and only where a table still has gaps a
+            # name could not be found for.  A table the index read
+            # completely has nothing to add.  It is left out under
+            # unhandled_only, where the caller asked for one kind of row and
+            # a summary of every table would not be it.
+            rows += [
                 {"coverage": (
                     f"{entry['table_name']}: {entry['named']} of "
                     f"{entry['declared']} slots name a function. No name in "
@@ -1605,7 +1720,7 @@ def get_vector_table(
                     f"Whether that means the vector is unused or in use "
                     f"depends on the table."
                 )}
-                for entry in index_db.get_table_coverage(conn, config_hash)
+                for entry in coverage
             ]
         return _slots_within_limit(rows, limit)
 

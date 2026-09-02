@@ -1344,8 +1344,10 @@ def get_table_coverage(
     Returns:
         A list of dicts, one for each array with missing slots, sorted by
         table name.  Each has table_name, table_usr, table_file, declared
-        (the element count), named (how many slots name a function), and
-        missing (a compact range string such as ``"89, 198, 219"``).
+        (the element count), named (how many slots name a function),
+        missing (a compact range string such as ``"89, 198, 219"``) and
+        missing_slots (the same numbers, for a caller that has to match
+        them against another source).
     """
     rows = get_function_address_arrays(conn, config_hash)
     if not rows:
@@ -1386,6 +1388,9 @@ def get_table_coverage(
             "declared": declared,
             "named": len(slots),
             "missing": _as_ranges(gaps),
+            # The numbers as well as the display form, because a caller that
+            # has another source for those slots has to match them by value.
+            "missing_slots": tuple(gaps),
         })
     out.sort(key=lambda entry: str(entry["table_name"]))
     return out
