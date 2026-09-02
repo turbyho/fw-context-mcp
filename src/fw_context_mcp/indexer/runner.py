@@ -363,26 +363,31 @@ def run(
     # from the actual TU list.
     all_units = list(parse_compile_commands(compile_commands))
 
-    # libclang reads a translation unit as C or C++.  Handed an assembly
-    # unit it parses it as C, which yields no cursor and one error
+    # libclang reads a translation unit as C or C++.  Given an assembly
+    # unit, it parses that unit as C and gets no cursor and one error
     # diagnostic per file — measured on a Zephyr startup.S: 0 cursors,
-    # "error: expected identifier or '('".  So they are skipped.
+    # "error: expected identifier or '('".  So libclang never gets them.
     #
-    # Skipped, and SAID so.  This used to drop them without a word, and the
-    # new-file scan could not report them either, because a suffix outside
-    # TU_EXTENSIONS was not even a candidate — the units were invisible from
-    # both directions.  Five of the seven test projects compile assembly.
+    # They are NOT dropped.  The assembly pass further down preprocesses
+    # them, stores their symbols, and logs its own "assembly:" summary.
+    # This line reports only the split, and it must say so: the wording
+    # was "skipping %d of %d TUs", which reads as data loss to anyone who
+    # watches the run — the units are indexed, by a different reader.
+    #
+    # The line stays, because no other line reports these units before the
+    # assembly pass ends.  The new-file scan cannot report them either: a
+    # suffix outside TU_EXTENSIONS is not even a candidate there, so the
+    # units are invisible from that direction.  Five of the seven test
+    # projects compile assembly.
     units = [u for u in all_units if u.file.suffix in TU_EXTENSIONS]
     asm_units = [u for u in all_units if u.file.suffix not in TU_EXTENSIONS]
-    skipped_units = len(asm_units)
-    if skipped_units:
+    if asm_units:
         from collections import Counter
-        by_ext = Counter(
-            u.file.suffix for u in all_units if u.file.suffix not in TU_EXTENSIONS
-        )
+        by_ext = Counter(u.file.suffix for u in asm_units)
         log.info(
-            "skipping %d of %d TUs libclang cannot read as C or C++: %s",
-            skipped_units, len(all_units),
+            "%d of %d TUs go to the assembly indexer "
+            "(libclang cannot read them as C or C++): %s",
+            len(asm_units), len(all_units),
             ", ".join(f"{n}x {ext or '(no suffix)'}" for ext, n in by_ext.most_common()),
         )
     log.info("TUs to index: %d", len(units))

@@ -154,11 +154,11 @@ def derive_extension_sets(
     really includes.
 
     The units come from compile_commands.json and NOT from the manifest
-    entries, which is the whole point: by the time entries exist the runner
-    has already dropped every unit libclang cannot read as C or C++.
-    Deriving from them would say a project never compiles assembly, when
-    the truth is that its assembly is skipped — and the new-file scan would
-    then stay blind to exactly the files that need reporting.
+    entries, and that is the whole point.  An entry exists only for a unit
+    libclang read, because the assembly pass writes no entry.  Deriving
+    from the entries would say that a project never compiles assembly.
+    The truth is that its assembly went to a different reader, and the
+    new-file scan would then stay blind to the files that need reporting.
 
     Reading the file again costs a plain json.load of a few hundred
     kilobytes, once per index run.  It is not on the query path.
