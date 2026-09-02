@@ -20,7 +20,7 @@ import subprocess
 from dataclasses import dataclass, field, fields
 from pathlib import Path
 
-from fw_context_mcp.utils import cc_output_path, ignore_autobuild_dir
+from fw_context_mcp.utils import build_env, cc_output_path, ignore_autobuild_dir
 
 # Import builders package so the registry is populated with all registered
 # build system backends before ``detect_build_system()`` is called.
@@ -430,7 +430,12 @@ def _run_pre_build(cfg: BuildConfig, cwd: Path) -> None:
         cfg.pre_build,
     )
     import shlex
-    result = subprocess.run(shlex.split(cfg.pre_build), shell=False, cwd=cwd, timeout=cfg.timeout)
+    # build_env, not the raw inherited environment: a hook the harness put in
+    # BASH_ENV hijacks any `bash -c` the user configures here — see utils.
+    result = subprocess.run(
+        shlex.split(cfg.pre_build), shell=False, cwd=cwd,
+        timeout=cfg.timeout, env=build_env(),
+    )
     if result.returncode != 0:
         raise RuntimeError(f"Pre-build command failed with exit code {result.returncode}")
 
@@ -463,7 +468,11 @@ def generate_compile_commands(
         _run_pre_build(cfg, root)
         log.info("Running custom build command: %s", cfg.command)
         import shlex
-        result = subprocess.run(shlex.split(cfg.command), shell=False, cwd=root)
+        # Same reason as the pre-build hook: `command = "bash -c ..."` is a
+        # documented override, and BASH_ENV would hijack it.
+        result = subprocess.run(
+            shlex.split(cfg.command), shell=False, cwd=root, env=build_env(),
+        )
         if result.returncode != 0:
             raise RuntimeError(f"Build command failed with exit code {result.returncode}")
         # A custom command runs an arbitrary build tool in the project root;

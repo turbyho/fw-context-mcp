@@ -56,6 +56,7 @@ __all__ = [
     "abs_path",
     "autobuild_dir",
     "build_dir_patterns_with_fw_context",
+    "build_env",
     "cc_output_path",
     "compute_content_hash",
     "compute_source_hash",
@@ -271,6 +272,51 @@ def is_db_exception(exc: BaseException) -> bool:
         return True
     return False
 
+
+# Shell startup variables that must not reach a build subprocess.
+#
+# ``bash -c`` reads the file named by BASH_ENV BEFORE it runs the command,
+# and neither ``--norc`` nor ``--noprofile`` suppresses that — measured, not
+# assumed.  An AI coding harness sets BASH_ENV to a hook that re-execs the
+# command through its own guarded shell, and that guard refused ours::
+#
+#   Build command failed (exit 126): west build --sysbuild (nrf52840-dev)
+#   stderr: [BLOCKED — DO NOT RETRY] Command uses eval or $()/ backticks
+#           at command position
+#
+# The whole environment is inherited down the chain: the MCP server takes it
+# from the harness, ``background._spawn_daemon`` from the server, and
+# ``daemon._run_index_async`` from the daemon.  So a background reindex
+# could not build at all, while the same build from a plain shell passed.
+#
+# fw-context reaches for bash only to source an activate script — it wants
+# no shell startup file, from any source.  A build that depends on ambient
+# shell state is not reproducible; ``activate``, ``extra_path``, and
+# ``extra_env`` are the declared ways to give a build its environment.
+#
+# Measured scope: ``sh -c`` reads neither BASH_ENV nor ENV when it is not
+# interactive, so make recipes and cmake sub-shells were never touched.
+# The whole vector is our own ``bash -c``.
+_SHELL_STARTUP_VARS: frozenset[str] = frozenset({"BASH_ENV"})
+
+
+def build_env(overrides: dict[str, str] | None = None) -> dict[str, str]:
+    """Return the environment for a build subprocess.
+
+    The inherited environment, minus the shell startup hooks named in
+    ``_SHELL_STARTUP_VARS``, with *overrides* applied on top.
+
+    Stripping happens BEFORE *overrides*, so a project that sets one of
+    those variables deliberately — in ``[build] env`` or ``extra_env`` —
+    still gets it.  Configuration is a declared intent; inheritance from
+    whoever started fw-context is an accident.
+    """
+    env = {k: v for k, v in os.environ.items() if k not in _SHELL_STARTUP_VARS}
+    if overrides:
+        env.update(overrides)
+    return env
+
+
 def run_build_command(
     cmd: list[str],
     cwd: Path,
@@ -295,7 +341,8 @@ def run_build_command(
       field (a shell script path) into a ``bash -c "source <script>
       && <cmd>"`` invocation.  Centralising this logic means only one
       call site tests quoting (``shlex.quote``) and shell injection
-      resistance.
+      resistance — and only one call site has to keep the shell startup
+      hooks out of that bash, which :func:`build_env` does.
     - The ``extra_path`` / ``extra_env`` blocks apply per-build-system
       configuration that callers must not need to know about.
 
@@ -307,7 +354,8 @@ def run_build_command(
             long first builds (Zephyr, ESP-IDF) must not be killed at
             10 min.
         description: Human-readable description for error messages.
-        env: Optional environment variables dict (merged with os.environ).
+        env: Optional environment variables dict, applied on top of the
+            environment that :func:`build_env` gives.
         build_cfg: Optional BuildConfig — when set, ``activate`` wraps the
             command in ``bash -c "source <activate> && <cmd>"``, and
             ``extra_path`` / ``extra_env`` are merged into the environment.
@@ -321,9 +369,7 @@ def run_build_command(
     if timeout is None:
         timeout = build_cfg.timeout if build_cfg is not None else 7200
 
-    merged_env = dict(os.environ)
-    if env:
-        merged_env.update(env)
+    merged_env = build_env(env)
 
     if build_cfg:
         if build_cfg.env:
