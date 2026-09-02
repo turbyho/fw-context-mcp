@@ -74,6 +74,7 @@ from ...indexer.db import (
 from ...indexer.intlist import read_isr_registrations
 from ...utils import abs_path
 from ...utils import escape_like as _escape_like
+from ...utils import format_number_ranges as _as_ranges
 from ._base import BaseHandler, DbContext
 from .source import _lookup_definition
 
@@ -1426,7 +1427,58 @@ def find_hotspots(
 
 
 
-def _from_the_build(conn, config_hash: str, coverage: list[dict]) -> list[dict]:
+def _interrupt_summary(table) -> dict | None:
+    """Say which interrupts are connected, and so which are not.
+
+    ``unhandled_only`` used to answer nothing at all on a build that
+    generates its table — measured, zero rows on all eleven images of a
+    Zephyr project, against 39 to 72 on four CMSIS and Mbed ones.  That
+    answer is read from an alias edge, which CMSIS writes and a generator
+    does not.
+
+    The registrations settle it from the other side.  They are the whole
+    list of what the build connected, so the interrupts NOT in it have
+    nothing servicing them, and no handler has to be recognised by name for
+    that to hold.
+
+    The complement is taken over the declared length and NOT over the named
+    slots of a table, which would be wrong.  Measured on mcuboot: its
+    software table names 44 of 48 slots, but slot 2 holds
+    ``uarte_0_direct_isr`` — an interrupt wired straight into the vector
+    table, bypassing the software one.  Counting named slots calls that
+    unserviced; counting registrations does not.  The two sources were
+    measured to partition every table exactly, on all eleven images.
+    """
+    if not table.declared:
+        return None
+    connected = sorted({item.slot for item in table.registrations})
+    if not connected:
+        return None
+    idle = sorted(set(range(table.declared)) - set(connected))
+
+    text = (
+        f"{table.declared} interrupts in the table, {len(connected)} "
+        f"connected by the build: {_as_ranges(connected)}."
+    )
+    if not idle:
+        return {"interrupts": text}
+    if table.dynamic:
+        # The list is not the whole story, so the complement cannot be
+        # asserted — only the part that is known.
+        text += (
+            f" The other {len(idle)} have nothing connected in the build, but "
+            f"this build also enables CONFIG_DYNAMIC_INTERRUPTS, so some of "
+            f"them may be connected at run time instead."
+        )
+    else:
+        text += (
+            f" Nothing is connected to the other {len(idle)}: "
+            f"{_as_ranges(idle)}."
+        )
+    return {"interrupts": text}
+
+
+def _from_the_build(conn, config_hash: str, coverage: list[dict], table) -> list[dict]:
     """Name the slots the index could not, from what the build recorded.
 
     A generated table holds a resolved ADDRESS in every slot that is in
@@ -1452,13 +1504,6 @@ def _from_the_build(conn, config_hash: str, coverage: list[dict]) -> list[dict]:
         for slot in entry.get("missing_slots", ())
     }
     if not gaps:
-        return []
-
-    build_dir = _build_directory(conn, config_hash)
-    if build_dir is None:
-        return []
-    table = read_isr_registrations(build_dir)
-    if table is None:
         return []
 
     out: list[dict] = []
@@ -1496,14 +1541,9 @@ def _from_the_build(conn, config_hash: str, coverage: list[dict]) -> list[dict]:
         out.append(row)
 
     out.sort(key=lambda entry: (str(entry["table_name"]), entry["slot"]))
-    if table.dynamic and out:
-        # Without this the list reads as complete, and it is not.
-        out.append({"info": (
-            "This build enables CONFIG_DYNAMIC_INTERRUPTS, so an interrupt "
-            "can also be connected at run time. A run-time registration "
-            "leaves nothing in the build for this to read, so the rows with "
-            'source="build" are not necessarily all of them.'
-        )})
+    # The caveat about run-time registration is said once, by
+    # _interrupt_summary, which reports it whether or not any gap was
+    # filled here.
     return out
 
 
@@ -1645,6 +1685,22 @@ def get_vector_table(
     spurious stub and the 6 without a name are the interrupts in use.  The
     tool reports where to look; which meaning applies depends on the table.
 
+    **An ``interrupts`` row answers "which are unserviced"** wherever the
+    build recorded its registrations, and it is the answer under
+    ``unhandled_only`` too.  The row-level ``unhandled`` status is read
+    from an alias edge, which a CMSIS startup writes and a generator does
+    not — measured, zero unhandled rows on all eleven images of a Zephyr
+    project against 39 to 72 on four CMSIS and Mbed ones.  The
+    registrations settle it from the other side: what the build connected
+    is the whole list, so anything else has nothing servicing it, and no
+    handler has to be recognised by name.
+
+    The complement is taken over the length of the table, NOT over the
+    slots that hold a stub.  Measured on an mcuboot image: its software
+    table names 44 of 48 slots, and one of those 44 is
+    ``uarte_0_direct_isr``, an interrupt wired straight into the vector
+    table.  It IS serviced, and counting stubs would report it as not.
+
     What is still not covered: an architecture that builds its table from
     branch instructions (arm64, Xtensa, MIPS) writes no table of
     addresses in either form.  A handler whose address the build resolved
@@ -1677,8 +1733,10 @@ def get_vector_table(
         Never empty: one dict with ``error`` (no index) or ``info`` (no
         vector table in this build).  Check both keys first.  A dict with
         ``coverage`` follows the slots for each table that has unnamed
-        elements.  When more rows exist than ``limit``, the last dict holds
-        ``truncated`` saying how many are not shown.
+        elements, and a dict with ``interrupts`` says which are connected
+        and which are not — the latter in both modes.  When more rows exist
+        than ``limit``, the last dict holds ``truncated`` saying how many
+        are not shown.
     """
     limit = max(0, min(limit, 1000))
     db, err = _refs_guard(project_root, variant=variant, image=image)
@@ -1703,9 +1761,17 @@ def get_vector_table(
                 "were recorded also answers this way — reindex to read the "
                 "C source. Use find_references on a handler name instead."
             )}]
+        # Read once and share: both the rows that name a gap and the
+        # summary of what is connected come out of the same artifact.
+        build_dir = _build_directory(conn, config_hash)
+        recorded = read_isr_registrations(build_dir) if build_dir else None
+
         if not unhandled_only:
             coverage = index_db.get_table_coverage(conn, config_hash)
-            rows = rows + _from_the_build(conn, config_hash, coverage)
+            if recorded is not None:
+                rows = rows + _from_the_build(
+                    conn, config_hash, coverage, recorded,
+                )
             # Coverage goes last and only where a table still has gaps a
             # name could not be found for.  A table the index read
             # completely has nothing to add.  It is left out under
@@ -1722,6 +1788,15 @@ def get_vector_table(
                 )}
                 for entry in coverage
             ]
+
+        # The summary is reported in BOTH modes, because under
+        # unhandled_only it is the answer: a build that generates its table
+        # writes no alias edge, so the row-level filter finds nothing there.
+        if recorded is not None:
+            summary = _interrupt_summary(recorded)
+            if summary is not None:
+                rows = rows + [summary]
+
         return _slots_within_limit(rows, limit)
 
     return db.execute_scoped(_query)

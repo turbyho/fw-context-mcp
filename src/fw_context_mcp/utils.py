@@ -28,6 +28,7 @@ import sqlite3
 import subprocess
 import threading
 from collections import OrderedDict
+from collections.abc import Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -59,6 +60,7 @@ __all__ = [
     "compute_content_hash",
     "compute_source_hash",
     "fmt_count",
+    "format_number_ranges",
     "ignore_autobuild_dir",
     "is_compile_commands_stale",
     "is_db_exception",
@@ -161,6 +163,31 @@ def autobuild_dir(variant: str = "") -> str:
     directory would make the variants overwrite each other.
     """
     return str(AUTOBUILD_REL / (variant or "default"))
+
+
+def format_number_ranges(numbers: Sequence[int]) -> str:
+    """Fold sorted numbers into ``"0-88, 90, 219-221"``.
+
+    A table of 290 interrupt slots can have 284 of them to report, and a
+    bare list of 284 numbers is not something a reader takes in.  Ranges
+    stay complete while staying short — the worst case measured folds to
+    51 characters.
+
+    *numbers* must be sorted and hold no duplicate; the callers derive them
+    from a set difference, which gives both.
+    """
+    if not numbers:
+        return ""
+    parts: list[str] = []
+    start = previous = numbers[0]
+    for number in numbers[1:]:
+        if number == previous + 1:
+            previous = number
+            continue
+        parts.append(str(start) if start == previous else f"{start}-{previous}")
+        start = previous = number
+    parts.append(str(start) if start == previous else f"{start}-{previous}")
+    return ", ".join(parts)
 
 
 def ignore_autobuild_dir(project_root: Path) -> None:

@@ -23,7 +23,8 @@ from fw_context_mcp.indexer.db import (
     upsert_file,
     upsert_project,
 )
-from fw_context_mcp.indexer.db._callgraph import _as_ranges, _declared_length
+from fw_context_mcp.indexer.db._callgraph import _declared_length
+from fw_context_mcp.utils import format_number_ranges as _as_ranges
 
 CONFIG = "ch"
 

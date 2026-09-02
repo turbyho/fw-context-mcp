@@ -69,6 +69,7 @@ import sqlite3
 from collections import deque
 
 from fw_context_mcp.utils import escape_like as _escape_like
+from fw_context_mcp.utils import format_number_ranges
 
 log = logging.getLogger(__name__)
 
@@ -1290,25 +1291,6 @@ def _declared_length(signature: str) -> int | None:
     return int(found[0])
 
 
-def _as_ranges(numbers: list[int]) -> str:
-    """Fold a sorted list into ``"0-88, 90, 219-221"``.
-
-    A table of 290 slots can be missing 284 of them, and a bare list of 284
-    numbers is not something a reader takes in.  Ranges stay complete while
-    staying short.
-    """
-    parts: list[str] = []
-    start = previous = numbers[0]
-    for number in numbers[1:]:
-        if number == previous + 1:
-            previous = number
-            continue
-        parts.append(str(start) if start == previous else f"{start}-{previous}")
-        start = previous = number
-    parts.append(str(start) if start == previous else f"{start}-{previous}")
-    return ", ".join(parts)
-
-
 def get_table_coverage(
     conn: sqlite3.Connection,
     config_hash: str,
@@ -1387,7 +1369,7 @@ def get_table_coverage(
             **where[table_usr],
             "declared": declared,
             "named": len(slots),
-            "missing": _as_ranges(gaps),
+            "missing": format_number_ranges(gaps),
             # The numbers as well as the display form, because a caller that
             # has another source for those slots has to match them by value.
             "missing_slots": tuple(gaps),

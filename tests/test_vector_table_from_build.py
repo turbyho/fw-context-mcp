@@ -25,7 +25,8 @@ from fw_context_mcp.indexer.db import (
     upsert_file,
     upsert_project,
 )
-from fw_context_mcp.mcp.handlers.callgraph import _from_the_build
+from fw_context_mcp.indexer.intlist import read_isr_registrations
+from fw_context_mcp.mcp.handlers.callgraph import _from_the_build, _interrupt_summary
 from tests.test_intlist import _elf, _intlist
 
 CONFIG = "ch"
@@ -99,8 +100,18 @@ def _index(tmp_path, *, declared=8, named=(0, 1, 2), handlers=(),
     return conn
 
 
-def _rows(conn):
-    return _from_the_build(conn, CONFIG, get_table_coverage(conn, CONFIG))
+def _recorded(tmp_path):
+    """The registrations the build wrote, as the handler reads them."""
+    return read_isr_registrations(tmp_path / "build")
+
+
+def _rows(conn, tmp_path):
+    recorded = _recorded(tmp_path)
+    if recorded is None:
+        return []
+    return _from_the_build(
+        conn, CONFIG, get_table_coverage(conn, CONFIG), recorded,
+    )
 
 
 def test_a_gap_the_build_can_name_becomes_a_row(tmp_path):
@@ -112,7 +123,7 @@ def test_a_gap_the_build_can_name_becomes_a_row(tmp_path):
                    "uart_nrfx_uarte.c", 484)],
     )
     try:
-        rows = _rows(conn)
+        rows = _rows(conn, tmp_path)
         assert len(rows) == 1
         assert rows[0]["slot"] == 5
         assert rows[0]["name"] == "uarte_nrfx_isr_int"
@@ -135,7 +146,7 @@ def test_a_slot_the_index_already_named_is_not_duplicated(tmp_path):
         handlers=[("handler", "c:@F@handler", "drv.c", 7)],
     )
     try:
-        assert [row["slot"] for row in _rows(conn)] == [5]
+        assert [row["slot"] for row in _rows(conn, tmp_path)] == [5]
     finally:
         conn.close()
 
@@ -156,7 +167,7 @@ def test_the_argument_is_reported_when_the_build_named_one(tmp_path):
         handlers=[("nrfx_isr", "c:@F@nrfx_isr", "nrfx_glue.c", 11)],
     )
     try:
-        rows = _rows(conn)
+        rows = _rows(conn, tmp_path)
         # One shim, two interrupts, and the argument is the only thing that
         # tells them apart.
         assert [(r["slot"], r["name"], r["argument"]) for r in rows] == [
@@ -175,7 +186,7 @@ def test_no_argument_key_when_the_build_named_none(tmp_path):
         handlers=[("rtc_nrf_isr", "c:@F@rtc_nrf_isr", "nrf_rtc_timer.c", 586)],
     )
     try:
-        rows = _rows(conn)
+        rows = _rows(conn, tmp_path)
         assert rows[0]["name"] == "rtc_nrf_isr"
         assert "argument" not in rows[0]
     finally:
@@ -190,7 +201,7 @@ def test_an_assembly_handler_reads_as_assembly(tmp_path):
         handlers=[("asm_handler", "asm:asm_handler", "isr.S", 137)],
     )
     try:
-        rows = _rows(conn)
+        rows = _rows(conn, tmp_path)
         assert rows[0]["status"] == "assembly"
         assert (rows[0]["file"], rows[0]["line"]) == ("isr.S", 137)
     finally:
@@ -206,30 +217,75 @@ def test_a_handler_with_two_definitions_names_no_file(tmp_path):
                   ("shared", "c:@F@b@shared", "b.c", 20)],
     )
     try:
-        rows = _rows(conn)
+        rows = _rows(conn, tmp_path)
         assert rows[0]["name"] == "shared"
         assert (rows[0]["file"], rows[0]["line"]) == ("", 0)
     finally:
         conn.close()
 
 
-def test_dynamic_interrupts_add_a_notice(tmp_path):
-    """A run-time registration leaves nothing to read, so say so.
+class TestTheSummary:
+    """"Which interrupts are unserviced" had no answer on a generated table.
 
-    Without it the list reads as the whole story when it is not.
+    Measured: ``unhandled_only`` returned zero rows on all eleven images of
+    a Zephyr project, against 39 to 72 on four CMSIS and Mbed ones, because
+    that answer is read from an alias edge which a generator does not
+    write.  The registrations settle it from the other side.
     """
-    conn = _index(
-        tmp_path,
-        registrations=[(5, "handler")],
-        handlers=[("handler", "c:@F@handler", "drv.c", 7)],
-        config_text="CONFIG_DYNAMIC_INTERRUPTS=y\n",
-    )
-    try:
-        rows = _rows(conn)
-        assert rows[0]["slot"] == 5
-        assert "CONFIG_DYNAMIC_INTERRUPTS" in rows[-1]["info"]
-    finally:
-        conn.close()
+
+    def test_the_complement_of_the_registrations_is_reported(self, tmp_path):
+        _index(tmp_path, declared=8,
+               registrations=[(1, "a"), (5, "b"), (6, "c")],
+               handlers=[])
+
+        summary = _interrupt_summary(_recorded(tmp_path))
+        assert summary is not None
+        text = summary["interrupts"]
+        assert "8 interrupts in the table, 3 connected by the build" in text
+        assert "1, 5-6" in text
+        assert "Nothing is connected to the other 5: 0, 2-4, 7." in text
+
+    def test_the_complement_comes_from_the_declared_length(self, tmp_path):
+        """NOT from the named slots of a table, which gets mcuboot wrong.
+
+        Measured there: the software table names 44 of 48 slots, but slot 2
+        holds ``uarte_0_direct_isr`` — an interrupt wired straight into the
+        vector table.  Counting named slots calls that unserviced; counting
+        registrations does not.  Here slot 1 is named AND registered, and
+        must not appear as unserviced.
+        """
+        _index(tmp_path, declared=4, named=(0, 1, 2),
+               registrations=[(1, "direct_isr")],
+               handlers=[("direct_isr", "c:@F@direct_isr", "drv.c", 7)])
+
+        summary = _interrupt_summary(_recorded(tmp_path))
+        assert summary is not None
+        assert "4 interrupts in the table, 1 connected by the build: 1." in summary["interrupts"]
+        assert "Nothing is connected to the other 3: 0, 2-3." in summary["interrupts"]
+
+    def test_run_time_registration_stops_the_complement_being_asserted(
+        self, tmp_path,
+    ):
+        """With CONFIG_DYNAMIC_INTERRUPTS the list is not the whole story.
+
+        Claiming the rest are unserviced would then be a guess, so only the
+        connected part is stated as fact.
+        """
+        _index(tmp_path, declared=8, registrations=[(1, "a")], handlers=[],
+               config_text="CONFIG_DYNAMIC_INTERRUPTS=y\n")
+
+        summary = _interrupt_summary(_recorded(tmp_path))
+        assert summary is not None
+        text = summary["interrupts"]
+        assert "1 connected by the build: 1." in text
+        assert "may be connected at run time" in text
+        assert "Nothing is connected" not in text
+
+    def test_a_build_that_registered_nothing_says_nothing(self, tmp_path):
+        """No claim to make, so no row."""
+        _index(tmp_path, declared=8, registrations=[], handlers=[])
+
+        assert _interrupt_summary(_recorded(tmp_path)) is None
 
 
 def test_a_registration_outside_any_gap_is_ignored(tmp_path):
@@ -242,7 +298,7 @@ def test_a_registration_outside_any_gap_is_ignored(tmp_path):
         handlers=[("handler", "c:@F@handler", "drv.c", 7)],
     )
     try:
-        assert _rows(conn) == []
+        assert _rows(conn, tmp_path) == []
     finally:
         conn.close()
 
@@ -256,6 +312,6 @@ def test_nothing_to_read_is_not_an_error(tmp_path, cc_in_db):
     """
     conn = _index(tmp_path, registrations=[], cc_in_db=cc_in_db)
     try:
-        assert _rows(conn) == []
+        assert _rows(conn, tmp_path) == []
     finally:
         conn.close()
