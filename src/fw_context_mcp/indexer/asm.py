@@ -270,8 +270,8 @@ def _clear_previous_pass(conn, config_hash: str) -> None:
         "DELETE FROM symbols WHERE config_hash=? AND usr LIKE 'asm:%'", (config_hash,)
     )
     conn.execute(
-        "DELETE FROM refs WHERE config_hash=? AND ref_kind IN (?, ?)",
-        (config_hash, VECTOR_REF_KIND, ALIAS_REF_KIND),
+        "DELETE FROM refs WHERE config_hash=? AND ref_kind IN (?, ?, ?)",
+        (config_hash, VECTOR_REF_KIND, VECTOR_DATA_REF_KIND, ALIAS_REF_KIND),
     )
 
 
@@ -732,12 +732,21 @@ class VectorEntry:
             on Cortex-M slot 15 is SysTick and slot 16+n is external IRQ
             n, on arm64 the position selects an exception class instead.
             The position is a fact of the file; its meaning is not.
+        is_data: True when the slot holds an ADDRESS derived from the
+            symbol rather than the symbol itself — written as an
+            expression, ``.word z_main_stack + CONFIG_MAIN_STACK_SIZE``.
+            Nothing there is a function to jump to, so a reader must not
+            follow it as code.  Measured on Zephyr for ARM: slot 0 of
+            ``vector_table.S`` is that expression and is the initial
+            stack pointer, the same fact a CMSIS table states as the
+            plain name ``__StackTop``.
     """
 
     name: str
     file: str
     line: int
     index: int = -1
+    is_data: bool = False
 
 
 # Data directives that build a table, and the sections that hold code or
@@ -755,6 +764,35 @@ _ORDINARY_SECTION = re.compile(
 )
 # An entry that names something, as opposed to a reserved `.word 0`.
 _ENTRY_NAME = re.compile(r"^[A-Za-z_.$][\w.$]*$")
+# An entry whose value is BUILT from a symbol: `.word sym + CONST`.  The
+# symbol is the base of an address, not the address itself, so the slot
+# holds data rather than a place to jump to.  Zephyr for ARM writes slot
+# 0 that way (`z_main_stack + CONFIG_MAIN_STACK_SIZE`), which is how the
+# initial stack pointer used to be dropped from the table entirely while
+# the CMSIS equivalent (`__StackTop`) was reported.
+_ENTRY_EXPRESSION = re.compile(
+    r"^([A-Za-z_.$][\w.$]*)\s*[-+]\s*\S"
+)
+
+
+def _entry_symbol(value: str) -> tuple[str, bool] | None:
+    """Return (symbol, is_data) for one table entry, or None.
+
+    None is a reserved entry (`.word 0`) or anything else that names no
+    symbol; the caller still counts its position.
+
+    ``is_data`` separates the two shapes that DO name one: the slot holds
+    the symbol, or it holds an address computed from it.  Both are worth
+    reporting and they mean different things to a reader — one is a place
+    to jump to, the other is not — so the distinction is made here,
+    where the text is, and carried rather than re-derived.
+    """
+    if _ENTRY_NAME.match(value):
+        return value, False
+    expression = _ENTRY_EXPRESSION.match(value)
+    if expression is not None:
+        return expression.group(1), True
+    return None
 
 
 def extract_vectors(source: AsmSource) -> list[VectorEntry]:
@@ -809,15 +847,18 @@ def extract_vectors(source: AsmSource) -> list[VectorEntry]:
         # `.word a, b, c` is three entries, and each takes a position.
         for value in data.group(1).split(","):
             value = value.strip()
-            if _ENTRY_NAME.match(value):
+            named = _entry_symbol(value)
+            if named is not None:
+                name, is_data = named
                 # Keyed, not appended: cpp can emit the same source line
                 # more than once — measured, a Zephyr unit appears twice
                 # in its own output — and one slot must not become two
                 # edges.  The symbol side dedupes the same way.
-                key = (value, file, line)
+                key = (name, file, line)
                 found.setdefault(
                     key,
-                    VectorEntry(name=value, file=file, line=line, index=position),
+                    VectorEntry(name=name, file=file, line=line,
+                                index=position, is_data=is_data),
                 )
             position += 1
     return list(found.values())
@@ -827,6 +868,16 @@ def extract_vectors(source: AsmSource) -> list[VectorEntry]:
 # handler by name, the hardware jumps to an address in a table, and an
 # answer that says "called from" would misdescribe how it runs.
 VECTOR_REF_KIND = "vector"
+
+# refs.ref_kind for a slot whose value is computed from a symbol rather
+# than being one.  Separate from VECTOR_REF_KIND because the reader must
+# not treat it as a place the hardware jumps to: the target of a
+# `.word sym + CONST` slot is data, and on Cortex-M slot 0 it is the
+# initial stack pointer.  Reporting it as `c` — which is what a shared
+# kind would do, since `z_main_stack` is defined in C — would say "code
+# runs here", the same error that was measured on the Mbed project with
+# `__StackTop` before slot 0 got a status of its own.
+VECTOR_DATA_REF_KIND = "vector_data"
 
 # refs.ref_kind for `.thumb_set X, Y` — X is another name for Y.  An edge
 # rather than a column, because that is what it is: one symbol naming
@@ -1044,7 +1095,9 @@ def _store_vectors(
         rows.append((
             config_hash, usr,
             _normalize_file_path(entry.file, project_root), entry.line,
-            None, VECTOR_REF_KIND, entry.index,
+            None,
+            VECTOR_DATA_REF_KIND if entry.is_data else VECTOR_REF_KIND,
+            entry.index,
         ))
 
     if rows:

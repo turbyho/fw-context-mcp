@@ -15,6 +15,7 @@ import fw_context_mcp  # noqa: F401  — must precede sqlite3
 from fw_context_mcp.indexer.db import (
     get_vector_table,
     insert_indirect_call_sites_batch,
+    insert_macros_batch,
     insert_refs_batch,
     insert_symbols_batch,
     open_db,
@@ -96,6 +97,49 @@ def _calls_through_pointer(conn, name):
             (CONFIG, "handlers.c", 101, f"c:@F@{name}", "handler()",
              "c:@F@slot", "handler", "void (*)(void)"),
         ])
+
+
+def _aliases_default(conn, *names, table_file="startup.S"):
+    """Make each of *names* a weak alias of ``Default_Handler``.
+
+    This is the CMSIS shape: the startup file gives every unserviced
+    vector its own name and points it at the trap loop.
+    """
+    with transaction(conn):
+        fid = upsert_file(conn, CONFIG, table_file, "asm")
+        insert_symbols_batch(conn, [
+            _symbol_row(CONFIG, fid, table_file, "Default_Handler",
+                        "asm:Default_Handler", line=90),
+        ])
+        insert_refs_batch(conn, [
+            (CONFIG, "asm:Default_Handler", table_file, 70, f"asm:{name}",
+             "alias", None)
+            for name in names
+        ])
+
+
+def _installs_at_runtime(conn, irq, handler, offset="16", at_line=90,
+                         at_file="us_ticker.c"):
+    """Record a run-time registration of *handler* for *irq*.
+
+    ``NVIC_USER_IRQ_OFFSET`` goes in as a macro because that is where the
+    reader takes it from — a test that wrote the slot directly would not
+    cover the addition.
+    """
+    with transaction(conn):
+        fid = upsert_file(conn, CONFIG, at_file, "c")
+        insert_symbols_batch(conn, [
+            _symbol_row(CONFIG, fid, "driver.c", handler, f"c:@F@{handler}",
+                        line=300),
+        ])
+        insert_refs_batch(conn, [
+            (CONFIG, f"c:@F@{handler}", at_file, at_line, None,
+             "runtime_vector", irq),
+        ])
+        if offset is not None:
+            insert_macros_batch(conn, [
+                (CONFIG, fid, "NVIC_USER_IRQ_OFFSET", offset, offset, 5, 0),
+            ])
 
 
 def test_both_sources_arrive(tmp_path):
@@ -441,13 +485,13 @@ class TestTheLimitIsVisible:
         from fw_context_mcp.mcp.handlers.callgraph import _slots_within_limit
 
         rows = self._rows(5)
-        assert _slots_within_limit(rows, 5) == rows
-        assert _slots_within_limit(rows, 9) == rows
+        assert _slots_within_limit(rows, [], 5) == rows
+        assert _slots_within_limit(rows, [], 9) == rows
 
     def test_the_cut_is_reported_with_both_counts(self):
         from fw_context_mcp.mcp.handlers.callgraph import _slots_within_limit
 
-        out = _slots_within_limit(self._rows(301), 300)
+        out = _slots_within_limit(self._rows(301), [], 300)
         assert len(out) == 301
         assert out[:300] == self._rows(301)[:300]
         assert "1 of 301 slots are not shown" in out[-1]["truncated"]
@@ -455,11 +499,30 @@ class TestTheLimitIsVisible:
     def test_a_limit_of_zero_still_says_what_was_hidden(self):
         from fw_context_mcp.mcp.handlers.callgraph import _slots_within_limit
 
-        out = _slots_within_limit(self._rows(7), 0)
+        out = _slots_within_limit(self._rows(7), [], 0)
         assert out == [{"truncated": (
             "7 of 7 slots are not shown. "
             "Raise limit (max 1000), or narrow with unhandled_only."
         )}]
+
+    def test_a_trailer_is_not_subject_to_the_limit(self):
+        """What describes the whole table survives a cut of the slots.
+
+        Measured on the nRF54L application: 584 rows against a default
+        limit of 400, and the two lines summarizing 290 interrupts were
+        the two that were cut.
+        """
+        from fw_context_mcp.mcp.handlers.callgraph import _slots_within_limit
+
+        trailers = [{"coverage": "…"}, {"interrupts": "…"}]
+        out = _slots_within_limit(self._rows(7), trailers, 2)
+        assert out[:2] == self._rows(7)[:2]
+        assert "5 of 7 slots are not shown" in out[2]["truncated"]
+        assert out[3:] == trailers
+        # And with room to spare the trailers still come last.
+        assert _slots_within_limit(self._rows(2), trailers, 9) == [
+            *self._rows(2), *trailers,
+        ]
 
     def test_the_default_limit_holds_a_measured_table(self):
         """290 generated entries plus a 92-slot assembly table must fit."""
@@ -469,3 +532,135 @@ class TestTheLimitIsVisible:
 
         default = inspect.signature(get_vector_table).parameters["limit"].default
         assert default >= 290 + 92
+
+
+class TestASlotThatHoldsData:
+    """A slot whose value is computed from a symbol, not the symbol.
+
+    Zephyr for ARM writes slot 0 as
+    ``.word z_main_stack + CONFIG_MAIN_STACK_SIZE``, so the base symbol
+    has a definition in C.  Reading that as ``c`` would say "code runs
+    here" about the initial stack pointer — the same error measured on
+    the Mbed project with ``__StackTop`` before slot 0 got its own
+    status.
+    """
+
+    def test_a_data_slot_is_not_reported_as_code(self, tmp_path):
+        conn = _db(tmp_path)
+        try:
+            with transaction(conn):
+                fid = upsert_file(conn, CONFIG, "vector_table.S", "asm")
+                insert_symbols_batch(conn, [
+                    _symbol_row(CONFIG, fid, "kernel.c", "z_main_stack",
+                                "c:@z_main_stack", kind="varglobal", line=40),
+                ])
+                insert_refs_batch(conn, [
+                    (CONFIG, "c:@z_main_stack", "vector_table.S", 39, None,
+                     "vector_data", 0),
+                ])
+
+            rows = get_vector_table(conn, CONFIG)
+            assert len(rows) == 1
+            assert rows[0]["slot"] == 0
+            assert rows[0]["name"] == "z_main_stack"
+            assert rows[0]["status"] == "data"
+            # And it is not an answer to "what is unserviced".
+            assert get_vector_table(conn, CONFIG, unhandled_only=True) == []
+            # Same keys as every other row, whichever source it came from.
+            assert "ref_kind" not in rows[0]
+        finally:
+            conn.close()
+
+
+class TestASlotFilledAtRunTime:
+    """A table in RAM, and what the image says about it.
+
+    Measured on the Mbed project, which defines ``CMSIS_VECTAB_VIRTUAL``
+    and gives RAM a 256-byte ``RAM_NVIC`` region: 12 of its 41
+    ``unhandled`` slots have a handler installed by ``NVIC_SetVector``,
+    the tick source and the console among them.
+    """
+
+    def test_the_status_says_run_time_instead_of_unhandled(self, tmp_path):
+        conn = _db(tmp_path)
+        try:
+            _assembly_table(conn, {25: "TIMER1_IRQHandler_v"})
+            _aliases_default(conn, "TIMER1_IRQHandler_v")
+            _installs_at_runtime(conn, 9, "us_ticker_irq_handler")
+
+            rows = get_vector_table(conn, CONFIG)
+            assert len(rows) == 1
+            assert rows[0]["status"] == "runtime"
+            # What the image holds is kept beside what replaces it.
+            assert rows[0]["aliases"]["name"] == "Default_Handler"
+            assert rows[0]["installed"] == [{
+                "name": "us_ticker_irq_handler",
+                "file": "driver.c",
+                "line": 300,
+                "at": "us_ticker.c:90",
+            }]
+        finally:
+            conn.close()
+
+    def test_unhandled_only_no_longer_returns_it(self, tmp_path):
+        """The point of the change: it is not unserviced any more."""
+        conn = _db(tmp_path)
+        try:
+            _assembly_table(conn, {25: "TIMER1_IRQHandler_v",
+                                   33: "RTC1_IRQHandler_v"})
+            _aliases_default(conn, "TIMER1_IRQHandler_v", "RTC1_IRQHandler_v")
+            _installs_at_runtime(conn, 9, "us_ticker_irq_handler")
+
+            left = get_vector_table(conn, CONFIG, unhandled_only=True)
+            assert [row["slot"] for row in left] == [33]
+        finally:
+            conn.close()
+
+    def test_without_the_offset_macro_nothing_changes(self, tmp_path):
+        """An index that never saw the macro must not assume 16."""
+        conn = _db(tmp_path)
+        try:
+            _assembly_table(conn, {25: "TIMER1_IRQHandler_v"})
+            _aliases_default(conn, "TIMER1_IRQHandler_v")
+            _installs_at_runtime(conn, 9, "us_ticker_irq_handler", offset=None)
+
+            rows = get_vector_table(conn, CONFIG)
+            assert rows[0]["status"] == "unhandled"
+            assert "installed" not in rows[0]
+        finally:
+            conn.close()
+
+    def test_a_real_static_handler_keeps_its_status(self, tmp_path):
+        """Code in the image does run, up to the registration.
+
+        Reporting `runtime` here would hide the handler that services the
+        interrupt before the driver initializes, so the status stays and
+        `installed` carries the rest.
+        """
+        conn = _db(tmp_path)
+        try:
+            _assembly_table(conn, {25: "TIMER1_IRQHandler"})
+            _installs_at_runtime(conn, 9, "us_ticker_irq_handler")
+
+            rows = get_vector_table(conn, CONFIG)
+            assert rows[0]["status"] == "assembly"
+            assert rows[0]["installed"][0]["name"] == "us_ticker_irq_handler"
+        finally:
+            conn.close()
+
+    def test_a_c_table_slot_is_not_matched_by_the_offset(self, tmp_path):
+        """A generated table indexes by IRQ, so the offset must not apply.
+
+        Zephyr's `_sw_isr_table` puts IRQ 9 in slot 9.  Adding 16 there
+        would name slot 25 of a table that means something else.
+        """
+        conn = _db(tmp_path)
+        try:
+            _c_table(conn, "_sw_isr_table", {9: "z_irq_spurious",
+                                             25: "z_irq_spurious"})
+            _installs_at_runtime(conn, 9, "us_ticker_irq_handler")
+
+            rows = get_vector_table(conn, CONFIG)
+            assert all("installed" not in row for row in rows)
+        finally:
+            conn.close()

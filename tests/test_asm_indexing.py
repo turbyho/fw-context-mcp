@@ -475,11 +475,34 @@ class TestVectorTable:
 
         assert vec == {}
 
-    def test_an_expression_is_not_an_entry(self, tmp_path: Path):
-        """The IAR form, and `.word A + 4`, name no single symbol."""
-        vec = self._vectors(tmp_path, "  .word sfe(CSTACK)\n  .word A + 4\n")
+    def test_a_call_like_expression_is_not_an_entry(self, tmp_path: Path):
+        """The IAR form names a function of the linker, not a symbol."""
+        vec = self._vectors(tmp_path, "  .word sfe(CSTACK)\n")
 
         assert vec == {}
+
+    def test_an_address_built_from_a_symbol_is_a_data_slot(self, tmp_path: Path):
+        """`.word sym + CONST` names the symbol, and is not a handler.
+
+        This used to yield nothing, which dropped a slot the table really
+        holds: Zephyr for ARM writes slot 0 as
+        ``.word z_main_stack + CONFIG_MAIN_STACK_SIZE``, the initial stack
+        pointer, so the Zephyr images reported no slot 0 at all while the
+        CMSIS ones reported ``__StackTop``.
+
+        ``is_data`` is what keeps it from reading as code: the symbol is
+        the base of an address, and nothing jumps to it.
+        """
+        vec = self._vectors(tmp_path, "  .word z_main_stack + 4096\n")
+
+        assert vec["z_main_stack"].index == 0
+        assert vec["z_main_stack"].is_data is True
+
+    def test_a_plain_name_is_not_a_data_slot(self, tmp_path: Path):
+        """A handler must keep being a handler."""
+        vec = self._vectors(tmp_path, "  .word HardFault_Handler\n")
+
+        assert vec["HardFault_Handler"].is_data is False
 
     def test_a_repeated_line_yields_one_entry(self, tmp_path: Path):
         """One source line is one slot, however often it reaches the reader.

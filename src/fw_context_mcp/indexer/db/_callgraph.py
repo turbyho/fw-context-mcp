@@ -959,6 +959,116 @@ def _callers_that_call_through_a_pointer(
     return {str(row[0]) for row in rows}
 
 
+def _user_irq_offset(conn: sqlite3.Connection, config_hash: str) -> int | None:
+    """Return ``NVIC_USER_IRQ_OFFSET`` of this build, or None.
+
+    The offset is where the external interrupts start in the vector
+    table — 16 on Cortex-M, because the system exceptions come first.
+    It is read from the macro table of the same index rather than
+    written here, for two reasons: the value belongs to the target and
+    not to this tool, and the same macro is what the SDK function itself
+    uses to find the slot (``nrf_dispatch_vector[IRQn +
+    NVIC_USER_IRQ_OFFSET]``).
+
+    None means no answer, and a caller reports no run-time slot at all.
+    Adding an assumed 16 would place a handler in a slot no build
+    confirmed.
+    """
+    rows = conn.execute(
+        """SELECT expanded_value, value FROM macros
+           WHERE config_hash = ? AND name = 'NVIC_USER_IRQ_OFFSET'
+           LIMIT 8""",
+        (config_hash,),
+    ).fetchall()
+    for row in rows:
+        for text in (row["expanded_value"], row["value"]):
+            try:
+                return int(str(text).strip(), 0)
+            except (TypeError, ValueError):
+                continue
+    return None
+
+
+def _runtime_registrations(
+    conn: sqlite3.Connection, config_hash: str
+) -> dict[int, list[dict]]:
+    """Return the vector slots a call installs at run time, by slot.
+
+    ``refs`` holds one ``runtime_vector`` row for each
+    ``NVIC_SetVector`` the indexer could read completely, with the IRQ
+    number in ``slot_index`` — see ``indexer.nvic``.  The slot is that
+    number plus the offset of the first external interrupt.
+
+    A slot can have more than one row, and both are kept.  Measured on
+    the Mbed project: the two I2C/SPI instances are registered from
+    ``spi_api.c`` and again from ``i2c_api.c``, with the same handler
+    both times.  Reporting one place would hide the other, and choosing
+    between them would be a guess; a reader that sees two call sites for
+    one slot learns something true about the driver.
+    """
+    offset = _user_irq_offset(conn, config_hash)
+    if offset is None:
+        return {}
+    rows = conn.execute(
+        """SELECT r.slot_index AS irq,
+                  r.from_file  AS at_file,
+                  r.from_line  AS at_line,
+                  s.name       AS name,
+                  s.file_path  AS file,
+                  s.line       AS line
+           FROM refs r
+           JOIN symbols s ON s.usr = r.to_usr AND s.config_hash = r.config_hash
+           WHERE r.config_hash = ? AND r.ref_kind = 'runtime_vector'
+             AND r.slot_index IS NOT NULL
+           ORDER BY r.slot_index, r.from_file, r.from_line""",
+        (config_hash,),
+    ).fetchall()
+    found: dict[int, list[dict]] = {}
+    for row in rows:
+        entry = {
+            "name": row["name"],
+            "file": row["file"],
+            "line": row["line"],
+            "at": f"{row['at_file']}:{row['at_line']}",
+        }
+        installed = found.setdefault(int(row["irq"]) + offset, [])
+        if entry not in installed:
+            installed.append(entry)
+    return found
+
+
+def _add_runtime_installation(
+    entry: dict, runtime: dict[int, list[dict]]
+) -> None:
+    """Say what a call installs into this slot once the code runs.
+
+    A target that moves its table into RAM fills it by calling
+    ``NVIC_SetVector``, and the image then holds an alias of the trap
+    loop for every such slot.  ``unhandled`` describes the flash
+    correctly and the running machine wrongly — measured on the Mbed
+    project, 12 of 41 unhandled slots have a handler installed at run
+    time, among them the tick source and the console.  ``runtime`` is
+    that state: nothing services the interrupt until the code that
+    registers it has run.
+
+    The status changes ONLY where it was ``unhandled``.  A slot whose
+    static definition is real code stays ``c`` or ``assembly``, because
+    that code does run — up to the moment the registration replaces it —
+    and ``installed`` says what replaces it either way.
+
+    Only an assembly row is passed here.  The offset counts slots of the
+    table the hardware reads, which is the one an assembler wrote; a
+    generated table in C indexes its entries by IRQ number directly, and
+    adding the offset there would name the wrong slot.
+    """
+    installed = runtime.get(entry["slot"])
+    if not installed:
+        return
+    entry["installed"] = installed
+    if entry["status"] == "unhandled":
+        entry["status"] = "runtime"
+
+
 def get_vector_table(
     conn: sqlite3.Connection,
     config_hash: str,
@@ -973,7 +1083,9 @@ def get_vector_table(
     Two sources hold slots, and ``source`` says which one a row came from:
 
     * ``"assembly"`` — a table written as address words.  The indexer
-      writes one ``refs`` row for each with ``ref_kind='vector'``.
+      writes one ``refs`` row for each with ``ref_kind='vector'``, or
+      ``'vector_data'`` where the slot holds an address computed from a
+      symbol instead of the symbol itself.
     * ``"c"`` — an array whose elements are function addresses, which is
       what a build that generates its table in C produces.  See
       ``get_function_address_arrays``.  These rows also carry
@@ -1007,6 +1119,21 @@ def get_vector_table(
       interrupt as an alias of ``Default_Handler``, which is an infinite
       loop.  The row then holds ``aliases`` with the name, file and line
       of what it really reaches.
+    * ``"data"`` — the slot holds an address BUILT from the symbol it
+      names, written as an expression.  Nothing jumps there: on
+      Cortex-M this is slot 0, the initial stack pointer, which Zephyr
+      writes as ``z_main_stack + CONFIG_MAIN_STACK_SIZE`` and a CMSIS
+      startup writes as the plain name ``__StackTop`` (status
+      ``linker``).  Do not follow it as code.
+    * ``"runtime"`` — the image holds that same alias, and a call to
+      ``NVIC_SetVector`` installs a handler into this slot once it runs.
+      A target with ``CMSIS_VECTAB_VIRTUAL`` keeps its table in RAM and
+      fills it that way, so the interrupt IS serviced, from the moment
+      the registering code has run and not before.  The row holds
+      ``installed``, a list of what each call site puts there.  Any row
+      can hold ``installed``; only a row that would otherwise read
+      ``unhandled`` takes this status — see
+      ``_add_runtime_installation``.
 
     Weakness alone cannot say this, which is why the alias edge exists.
     The same startup declares ``Reset_Handler`` weak WITH a body and
@@ -1039,6 +1166,7 @@ def get_vector_table(
         """SELECT r.slot_index AS slot,
                   r.from_file  AS table_file,
                   r.from_line  AS table_line,
+                  r.ref_kind   AS ref_kind,
                   s.name       AS name,
                   s.file_path  AS file,
                   s.line       AS line,
@@ -1047,7 +1175,7 @@ def get_vector_table(
                   s.usr        AS usr
            FROM refs r
            JOIN symbols s ON s.usr = r.to_usr AND s.config_hash = r.config_hash
-           WHERE r.config_hash = ? AND r.ref_kind = 'vector'
+           WHERE r.config_hash = ? AND r.ref_kind IN ('vector', 'vector_data')
              AND r.slot_index IS NOT NULL
            ORDER BY r.from_file, r.slot_index""",
         (config_hash,),
@@ -1078,11 +1206,17 @@ def get_vector_table(
             filled.get((table_key, str(entry["usr"])), 0) + 1
         )
     through_pointer = _callers_that_call_through_a_pointer(conn, config_hash)
+    # What a call installs into the table once the code runs.  Read once
+    # for the whole table: the map is keyed by slot, and every row asks it.
+    runtime = _runtime_registrations(conn, config_hash)
 
     out: list[dict] = []
     for entry, table_key in slots:
         entry_usr = str(entry.pop("usr"))
         from_assembly = entry_usr.startswith("asm:")
+        # Popped so every row has the same keys whichever source it came
+        # from; the C reader has no equivalent and would leave it absent.
+        holds_data = entry.pop("ref_kind", None) == "vector_data"
         weak = bool(entry.pop("is_weak"))
         kind = entry.pop("kind")
         # Dropped so every row has the same keys whichever source it came
@@ -1110,6 +1244,13 @@ def get_vector_table(
         # the tool reported `__StackTop` as code that runs.
         if kind == "undefined" or entry_usr.startswith("ld:"):
             entry["status"] = "linker"
+        elif holds_data:
+            # The slot holds an address BUILT from this symbol, so the
+            # symbol is a base and not a destination.  Asked before the
+            # rest for the same reason `linker` is: `z_main_stack` has a
+            # definition in C, and the ladder below would call that "code
+            # runs here" about the initial stack pointer.
+            entry["status"] = "data"
         elif not from_assembly:
             entry["status"] = "dispatcher" if dispatches else "c"
         else:
@@ -1142,6 +1283,9 @@ def get_vector_table(
             else:
                 entry["status"] = "assembly"
         del weak
+
+        if from_assembly:
+            _add_runtime_installation(entry, runtime)
 
         if entry["status"] == "c":
             # The weak definition this one replaced, when the index holds

@@ -78,6 +78,7 @@ from .models import (
     Reference,
     Symbol,
 )
+from .nvic import runtime_vector_reference
 
 _log = logging.getLogger(__name__)
 
@@ -1364,6 +1365,31 @@ def _handle_direct_refs(cursor: cx.Cursor, cur_fn: str | None, refs: list[Refere
         if cursor.kind == cx.CursorKind.CALL_EXPR:
             _handle_field_call_fallback(cursor, cur_fn, refs, seen_ref, tu_path_str)
             _handle_constructor_fallback(cursor, cur_fn, refs, seen_ref, tu_path_str, resolve_fn)
+            _handle_runtime_vector(cursor, referenced, cur_fn, refs, seen_ref)
+
+
+def _handle_runtime_vector(cursor: cx.Cursor, referenced: cx.Cursor | None,
+                           cur_fn: str | None, refs: list[Reference],
+                           seen_ref: set[tuple]) -> None:
+    """Record a vector table entry this call installs at run time.
+
+    A CMSIS target that moves its table into RAM fills it with
+    ``NVIC_SetVector``, and the static table then says nothing about
+    which handler services the interrupt.  See ``nvic`` for what makes a
+    call qualify and why the IRQ number is stored unshifted.
+
+    Deduplicated on the same key as every other reference, so one call
+    site emitted twice by the preprocessor stays one edge.
+    """
+    found = runtime_vector_reference(cursor, referenced, cur_fn)
+    if found is None:
+        return
+    key = (found.to_usr, found.from_file, found.from_line, found.from_usr,
+           found.ref_kind)
+    if key in seen_ref:
+        return
+    seen_ref.add(key)
+    refs.append(found)
 
 
 def _handle_field_call_fallback(cursor: cx.Cursor, cur_fn: str | None,

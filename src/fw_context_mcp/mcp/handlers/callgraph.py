@@ -56,6 +56,7 @@ from typing import Annotated
 from pydantic import Field
 
 from ...indexer import db as index_db
+from ...indexer.compile_commands import compile_directory
 from ...indexer.db import (
     count_fp_assignments,
     count_indirect_call_sites,
@@ -1548,7 +1549,25 @@ def _from_the_build(conn, config_hash: str, coverage: list[dict], table) -> list
 
 
 def _build_directory(conn, config_hash: str):
-    """Return the directory holding this build's compile_commands.json."""
+    """Return the build tree of this configuration, or None.
+
+    The tree is what holds the artifacts a build records, and it is NOT
+    the directory of compile_commands.json.  fw-context generates its own
+    copy of that file under `.fw-context/build/`, so the parent of the
+    path in the database is a directory with no artifact in it.  The
+    build itself names the tree, in the `directory` field of every entry,
+    which `compile_directory` reads.
+
+    Measured on the Zephyr project before this read the field: every one
+    of the nine images answered "no registrations", because
+    `read_isr_registrations` looked for `zephyr/zephyr_pre0.elf` under
+    `.fw-context/build`.  The artifact was there all along, two
+    directories away, with its `.intList` section intact.
+
+    The parent is still the answer when the file names no directory.  A
+    build system that writes compile_commands.json into its own tree —
+    which is where CMake puts it — is right either way.
+    """
     found = conn.execute(
         """SELECT compile_commands_path FROM build_configs
            WHERE config_hash = ? LIMIT 1""",
@@ -1556,11 +1575,14 @@ def _build_directory(conn, config_hash: str):
     ).fetchone()
     if found is None or not found["compile_commands_path"]:
         return None
-    return Path(str(found["compile_commands_path"])).parent
+    path = Path(str(found["compile_commands_path"]))
+    return compile_directory(path) or path.parent
 
 
-def _slots_within_limit(rows: list[dict], limit: int) -> list[dict]:
-    """Cut *rows* to *limit*, and say so whenever anything was cut.
+def _slots_within_limit(
+    slots: list[dict], trailers: list[dict], limit: int
+) -> list[dict]:
+    """Cut *slots* to *limit*, keep every *trailer*, and say what was cut.
 
     A generated table on its own can be longer than the default: 290
     entries plus the assembly exceptions measured 301 rows.  A silent cut
@@ -1568,16 +1590,119 @@ def _slots_within_limit(rows: list[dict], limit: int) -> list[dict]:
     serviced interrupts would be wrong with no way to notice.  The notice
     is a trailing dict, which is how this tool already reports ``info``
     and ``error``.
+
+    A trailer is not a slot, and the limit does not apply to it.
+    ``coverage`` and ``interrupts`` describe the WHOLE table, and they used
+    to be appended to the slots, so the cut took them first — measured on
+    the nRF54L application: 573 generated slots plus 11 assembly ones
+    against a default limit of 400, and the two lines that summarize 290
+    interrupts were exactly the two the reader never saw.  The longer the
+    table, the more the summary is the answer, so it sits outside the cut.
+
+    ``truncated`` comes before the other trailers because it is about the
+    slots above it, not about the table.
     """
-    if len(rows) <= limit:
-        return rows
+    if len(slots) <= limit:
+        return slots + trailers
     return [
-        *rows[:limit],
+        *slots[:limit],
         {"truncated": (
-            f"{len(rows) - limit} of {len(rows)} slots are not shown. "
+            f"{len(slots) - limit} of {len(slots)} slots are not shown. "
             f"Raise limit (max 1000), or narrow with unhandled_only."
         )},
+        *trailers,
     ]
+
+
+def _vector_rows(
+    conn, config_hash: str, *, unhandled_only: bool, limit: int
+) -> list[dict]:
+    """Assemble the answer of ``get_vector_table`` for one build config.
+
+    Separate from the tool so a test can hand it a connection.  The tool
+    itself only resolves the project and the config; everything that
+    decides WHAT is reported is here.
+
+    Two sources answer, and either one can answer alone:
+
+    * the index, which holds the slots of the table, and
+    * the build artifact, which holds the registrations that produced the
+      slots the index cannot name.
+
+    The artifact is read before deciding that there is nothing to report,
+    because on a build that generates its table it is the ONLY source
+    that answers ``unhandled_only`` — that filter reads an alias edge,
+    which a CMSIS startup writes and a generator does not.
+    """
+    slots = index_db.get_vector_table(
+        conn, config_hash, unhandled_only=unhandled_only,
+    )
+    # Read once and share: both the rows that name a gap and the summary
+    # of what is connected come out of the same artifact.
+    build_dir = _build_directory(conn, config_hash)
+    recorded = read_isr_registrations(build_dir) if build_dir else None
+
+    # A trailer describes the whole table rather than one slot, so it is
+    # kept apart: the limit applies to slots only, and a long table must
+    # not lose its summary.  See _slots_within_limit.
+    trailers: list[dict] = []
+
+    if not unhandled_only:
+        coverage = index_db.get_table_coverage(conn, config_hash)
+        if recorded is not None:
+            slots = slots + _from_the_build(
+                conn, config_hash, coverage, recorded,
+            )
+        # Coverage is reported only where a table still has gaps a name
+        # could not be found for.  A table the index read completely has
+        # nothing to add.  It is left out under unhandled_only, where the
+        # caller asked for one kind of row and a summary of every table
+        # would not be it.
+        trailers += [
+            {"coverage": (
+                f"{entry['table_name']}: {entry['named']} of "
+                f"{entry['declared']} slots name a function. No name in "
+                f"slots {entry['missing']} — the element there is a zero, "
+                f"an address the linker resolved, or not a function. "
+                f"Whether that means the vector is unused or in use "
+                f"depends on the table."
+            )}
+            for entry in coverage
+        ]
+
+    # The summary is reported in BOTH modes, for the reason in the
+    # docstring above.
+    if recorded is not None:
+        summary = _interrupt_summary(recorded)
+        if summary is not None:
+            trailers.append(summary)
+
+    if not slots and not trailers:
+        return [{"info": (
+            "No vector table in this build. Neither source found one: "
+            "the assembly holds no table of address words, and no array "
+            "of function addresses was recognised. arm64, Xtensa and "
+            "MIPS build their tables from branch instructions, which "
+            "this tool does not read. An index written before slots "
+            "were recorded also answers this way — reindex to read the "
+            "C source. Use find_references on a handler name instead."
+        )}]
+    if not slots:
+        # There IS an answer, it just does not have the shape of a slot
+        # row.  Saying "no vector table" here would contradict the lines
+        # that follow — measured, that is what all nine images of the
+        # Zephyr project used to answer under unhandled_only.
+        trailers.insert(0, {"info": (
+            "No slot row to report, and the lines below are the answer. "
+            "A build that generates its table names each unserviced "
+            "vector with a dispatcher rather than an alias of a default "
+            "handler, and the alias is what a slot row is read from."
+            if unhandled_only else
+            "The index recorded no slot for this build; what follows "
+            "comes from the build artifact instead."
+        )})
+
+    return _slots_within_limit(slots, trailers, limit)
 
 
 def get_vector_table(
@@ -1615,6 +1740,23 @@ def get_vector_table(
       overrode.  A CMSIS startup file makes this an alias of
       ``Default_Handler``, which is an infinite loop.  If the interrupt
       fires, the device stops.
+    * ``"runtime"`` — the image holds that same alias, and the code
+      installs a real handler into this slot by calling
+      ``NVIC_SetVector``.  A target that defines
+      ``CMSIS_VECTAB_VIRTUAL`` keeps its vector table in RAM and fills
+      it that way, so the interrupt IS serviced once the registering
+      code has run — and not before it.  The row holds ``installed``,
+      one entry per call site with the handler name, its file and line,
+      and ``at``, where the registration happens.  Follow ``at`` to see
+      WHEN it happens: on the Mbed project ``us_ticker_irq_handler``
+      reaches slot 25 from ``us_ticker_init``, so the tick source is
+      unserviced until the ticker starts.  A row with a real static
+      definition keeps its own status and still carries ``installed``.
+    * ``"data"`` — the slot holds an address BUILT from the symbol it
+      names (``.word z_main_stack + CONFIG_MAIN_STACK_SIZE``), so the
+      symbol is a base and nothing jumps to it.  On Cortex-M this is
+      slot 0 of a Zephyr table: the initial stack pointer.  Do not read
+      it as code.
     * ``"linker"`` — the linker script gives the address and no compiled
       file defines the name.  Slot 0 holds the initial stack pointer, not
       a handler, and looks like this.  When the index read the script,
@@ -1724,19 +1866,22 @@ def get_vector_table(
         list of dicts sorted by source, then table, then slot.  Each holds:
         slot (int), name, file, line, source (``"assembly"``, ``"c"`` or
         ``"build"``),
-        status (``"c"``, ``"assembly"``, ``"unhandled"``, ``"linker"`` or
-        ``"dispatcher"``), and table_file and table_line (where the slot is
-        written).  A ``"c"`` source row also holds table_name and
-        table_usr.  A ``"c"`` status row can hold overridden, a dict with
-        file and line.
+        status (``"c"``, ``"assembly"``, ``"unhandled"``, ``"runtime"``,
+        ``"data"``, ``"linker"`` or ``"dispatcher"``), and table_file and table_line
+        (where the slot is written).  A ``"c"`` source row also holds
+        table_name and table_usr.  A ``"c"`` status row can hold
+        overridden, a dict with file and line.  Any assembly row can hold
+        installed, a list of dicts with name, file, line and at.
 
         Never empty: one dict with ``error`` (no index) or ``info`` (no
         vector table in this build).  Check both keys first.  A dict with
         ``coverage`` follows the slots for each table that has unnamed
         elements, and a dict with ``interrupts`` says which are connected
-        and which are not — the latter in both modes.  When more rows exist
-        than ``limit``, the last dict holds ``truncated`` saying how many
-        are not shown.
+        and which are not — the latter in both modes.  Neither is subject
+        to ``limit``: they describe the whole table, and the longest table
+        is where they matter most.  When more slots exist than ``limit``,
+        a dict with ``truncated`` sits between the slots and those two,
+        saying how many slots are not shown.
     """
     limit = max(0, min(limit, 1000))
     db, err = _refs_guard(project_root, variant=variant, image=image)
@@ -1748,55 +1893,8 @@ def get_vector_table(
         # Runs under the executor lock on the single shared connection;
         # must not open its own connection.  Timeout is enforced by
         # _wrap_tool (300 s + interrupt), not here.
-        rows = index_db.get_vector_table(
-            conn, config_hash, unhandled_only=unhandled_only,
+        return _vector_rows(
+            conn, config_hash, unhandled_only=unhandled_only, limit=limit,
         )
-        if not rows:
-            return [{"info": (
-                "No vector table in this build. Neither source found one: "
-                "the assembly holds no table of address words, and no array "
-                "of function addresses was recognised. arm64, Xtensa and "
-                "MIPS build their tables from branch instructions, which "
-                "this tool does not read. An index written before slots "
-                "were recorded also answers this way — reindex to read the "
-                "C source. Use find_references on a handler name instead."
-            )}]
-        # Read once and share: both the rows that name a gap and the
-        # summary of what is connected come out of the same artifact.
-        build_dir = _build_directory(conn, config_hash)
-        recorded = read_isr_registrations(build_dir) if build_dir else None
-
-        if not unhandled_only:
-            coverage = index_db.get_table_coverage(conn, config_hash)
-            if recorded is not None:
-                rows = rows + _from_the_build(
-                    conn, config_hash, coverage, recorded,
-                )
-            # Coverage goes last and only where a table still has gaps a
-            # name could not be found for.  A table the index read
-            # completely has nothing to add.  It is left out under
-            # unhandled_only, where the caller asked for one kind of row and
-            # a summary of every table would not be it.
-            rows += [
-                {"coverage": (
-                    f"{entry['table_name']}: {entry['named']} of "
-                    f"{entry['declared']} slots name a function. No name in "
-                    f"slots {entry['missing']} — the element there is a zero, "
-                    f"an address the linker resolved, or not a function. "
-                    f"Whether that means the vector is unused or in use "
-                    f"depends on the table."
-                )}
-                for entry in coverage
-            ]
-
-        # The summary is reported in BOTH modes, because under
-        # unhandled_only it is the answer: a build that generates its table
-        # writes no alias edge, so the row-level filter finds nothing there.
-        if recorded is not None:
-            summary = _interrupt_summary(recorded)
-            if summary is not None:
-                rows = rows + [summary]
-
-        return _slots_within_limit(rows, limit)
 
     return db.execute_scoped(_query)

@@ -626,3 +626,43 @@ def command_line_defines(cc_path: Path) -> tuple[dict[str, str], int]:
     if shared is None:
         return {}, 0
     return shared, len(every_name) - len(shared)
+
+
+def compile_directory(cc_path: Path) -> Path | None:
+    """Return the directory the compiler worked in, or None.
+
+    The ``directory`` field of an entry is the working directory of that
+    compilation, which is the build tree.  The location of
+    compile_commands.json is NOT that tree: fw-context writes its own copy
+    under ``.fw-context/build/``, one file per variant and image, so the
+    parent of that file holds no build artifact at all.
+
+    Measured on the Zephyr project: the parent is ``.fw-context/build``,
+    while ``directory`` is ``build/nrf52840_dev/stage0`` — where
+    ``zephyr/zephyr_pre0.elf`` and its ``.intList`` section really are.
+    A caller that took the parent found nothing and had no way to tell
+    "no artifact" from "wrong directory".
+
+    WHY this reads the JSON itself instead of calling `parse`: the same
+    reason `command_line_defines` does — flag normalization costs three
+    orders of magnitude more than reading one field, and this answers a
+    question about the build, not about a translation unit.
+
+    The first entry that names a directory answers.  The entries of one
+    build configuration are compiled in one tree, and an entry without
+    the field says nothing about where that tree is.
+
+    Returns None when the file is unreadable or names no directory.  The
+    caller then has the same answer it had before this existed, which is
+    "not known" rather than a guess.
+    """
+    try:
+        entries = json.loads(cc_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, UnicodeDecodeError):
+        return None
+    if not isinstance(entries, list):
+        return None
+    for entry in entries:
+        if isinstance(entry, dict) and entry.get("directory"):
+            return Path(str(entry["directory"]))
+    return None

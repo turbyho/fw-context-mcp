@@ -255,11 +255,13 @@ _MIGRATION_ADD_COLUMNS = [
     # the index saw no difference between them.
     "ALTER TABLE symbols ADD COLUMN is_weak INTEGER NOT NULL DEFAULT 0",
     # Position of a vector table slot, counting from zero and counting
-    # the reserved entries.  Meaningful only for ref_kind='vector'; NULL
-    # everywhere else.  What the position MEANS is architecture
-    # knowledge the index deliberately does not decide: on Cortex-M slot
-    # 15 is SysTick and 16+n is external IRQ n, on arm64 it selects an
-    # exception class.  The position is a fact of the file.
+    # the reserved entries.  Meaningful for ref_kind='vector' and
+    # 'vector_data'; NULL everywhere else except 'runtime_vector', where
+    # it is the IRQ NUMBER rather than a position — see the column
+    # comment on refs.slot_index below.  What a position MEANS is
+    # architecture knowledge the index deliberately does not decide: on
+    # Cortex-M slot 15 is SysTick and 16+n is external IRQ n, on arm64 it
+    # selects an exception class.  The position is a fact of the file.
     "ALTER TABLE refs ADD COLUMN slot_index INTEGER",
     # The entry point the linker script names with `ENTRY()`.  It belongs to
     # the build and not to a file, thus a column here rather than a symbol
@@ -547,10 +549,17 @@ CREATE TABLE IF NOT EXISTS refs (
     from_usr     TEXT,
     ref_kind     TEXT    NOT NULL,
     -- Position of the reference inside the construct that holds it, or NULL
-    -- when it has none.  Two producers fill it: the assembly reader, for a
+    -- when it has none.  Three producers fill it: the assembly reader, for a
     -- slot of a vector table, and the C indexer, for an element of a
     -- positional one-dimensional array initializer.  Both mean an index
     -- counted from zero.
+    --
+    -- The third is the NVIC pass, for ref_kind='runtime_vector', and there
+    -- it holds the IRQ NUMBER of the argument, not a position.  The slot is
+    -- that number plus NVIC_USER_IRQ_OFFSET, which the reader takes from
+    -- the macro table of the same index: adding it here would write a
+    -- target constant into the data, and the number the build stated is
+    -- the one worth keeping.
     --
     -- Note that idx_refs_unique, built during migration below, does not
     -- cover this column.  Two elements of one array that share a target, a
