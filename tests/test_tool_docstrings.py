@@ -30,7 +30,8 @@ IGNORED_PARAMS = {"self", "ctx"}
 def _registered_tools() -> list[tuple[str, str]]:
     """Return the (handler module, function name) of every registered tool.
 
-    Reads ``mcp.tool()(handler.fn)`` and ``mcp.tool()(_wrap_tool(handler.fn))``
+    Reads ``mcp.tool()(handler.fn)`` and every nesting of wrappers around
+    it — ``mcp.tool()(_with_project_selector(_wrap_tool(handler.fn)))`` —
     from the source of ``server.py``.
     """
     tree = ast.parse(SERVER.read_text(encoding="utf-8"))
@@ -47,10 +48,13 @@ def _registered_tools() -> list[tuple[str, str]]:
         ):
             continue
         target = node.args[0]
-        if isinstance(target, ast.Call):  # _wrap_tool(handler.fn)
-            if not target.args:
-                continue
+        # Remove each wrapper call until the handler stays.  A loop, not one
+        # test: the wrappers are nested, and a single step would silently
+        # drop every tool as soon as a second wrapper is added.
+        while isinstance(target, ast.Call) and target.args:
             target = target.args[0]
+        if isinstance(target, ast.Call):
+            continue
         if isinstance(target, ast.Attribute) and isinstance(target.value, ast.Name):
             found.append((target.value.id, target.attr))
     return sorted(set(found))

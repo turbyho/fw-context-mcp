@@ -1034,7 +1034,10 @@ def list_projects(
         ``info`` key.  When fw-context cannot read a database, the result
         holds a dict with ``db`` and ``error`` keys for that file.
     """
-    cfg = load_config(project_root=Path(project_root).resolve() if project_root else None)
+    # resolve_project_root, not Path().resolve(): project_root can hold a
+    # project name or a project_id, and only the shared resolver reads the
+    # global registry that maps those to a root directory.
+    cfg = load_config(project_root=resolve_project_root(project_root) if project_root else None)
     index_dir = cfg.index.db_dir
     # Glob for subdirectories containing index.db — each subdirectory
     # is named after a project_id UUID4.

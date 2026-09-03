@@ -49,6 +49,17 @@ EMPTY RESULT STRATEGY — if a fw-context tool returns nothing:
 project_only=True (on search_code, search_bodies, search_content, and
 callgraph tools) excludes vendor SDK code — use when asking about YOUR code.
 
+MULTI-PROJECT — a question about a DIFFERENT project:
+Each tool answers about ONE project. Without project or project_root
+this is the project of the current directory — NOT the project that
+the operator asked about.
+1. Call list_projects. It gives the name, the project_id, and the
+   root_path of each indexed project.
+2. Give project="<name>" (or project_root="<root_path>") to EVERY
+   call that follows, get_active_build included.
+Do not invent other parameter names. An unknown argument causes an
+error that names it.
+
 ANTI-PATTERNS — do NOT:
 • Use external search tools for C/C++ symbols → use lookup_symbol or search_code
 • Use external search tools for code patterns → use search_bodies (function

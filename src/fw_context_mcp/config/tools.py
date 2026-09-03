@@ -76,6 +76,20 @@ Your project has TWO kinds of code:
 Set `project_only=True` for questions about YOUR code.
 Leave `project_only=False` (default) when vendor code is relevant.
 
+### A question about a DIFFERENT project
+
+Each tool answers about ONE project. Without `project` or `project_root`
+this is the project of the current directory — NOT the project that the
+operator asked about.
+
+1. Call `list_projects`. It gives the `name`, the `project_id`, and the
+   `root_path` of each indexed project.
+2. Give `project="<name>"` (or `project_root="<root_path>"`) to EVERY
+   call that follows, `get_active_build` included.
+
+Do not invent other parameter names. An unknown argument causes an error
+that names it.
+
 ### FTS5 query tips
 - Multi-word bare queries are OR-joined — prefer single words.
 - For exact phrases use double quotes: `'"interrupt handler"'`.
@@ -217,9 +231,27 @@ class InstructionTarget:
 
         For ``marked_section`` method, returns content WITHOUT markers —
         the caller (``_update_marked_section``) adds them.
-        For ``separate_file`` method, returns the full file content.
+        For ``separate_file`` method, returns the full file content
+        BETWEEN the markers.
+
+        WHY the markers go into a separate file as well, although
+        fw-context owns the whole file: ``check_target`` reads a file
+        that holds three or more fw-context keywords and no markers as
+        content of the user, and ``fw-context init`` then skips it.  A
+        separate file that fw-context wrote itself holds every one of
+        those keywords, thus each later run of ``init`` skipped the file
+        and the instructions in it stayed at the version of the first
+        run.  With the markers, ``check_target`` reports
+        ``has_marked_section`` and the file gets the new text.
+
+        A file that an earlier version wrote holds no markers.  That one
+        run of ``init`` still skips it, and ``--force`` writes it once;
+        every run after that finds the markers.
         """
-        return BASE_INSTRUCTIONS + SUBAGENT_INSTRUCTIONS
+        body = BASE_INSTRUCTIONS + SUBAGENT_INSTRUCTIONS
+        if self.method == "separate_file":
+            return f"{MARKER_START}\n{body}\n{MARKER_END}\n"
+        return body
 
 
 # ── AI tool definition ──────────────────────────────────────────────────────

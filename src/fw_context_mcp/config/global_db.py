@@ -149,3 +149,34 @@ def get_project_by_id(project_id: str) -> dict | None:
     return dict(row)
 
 
+def get_projects_by_name(name: str) -> list[dict]:
+    """Look up projects in the global registry by their name.
+
+    The ``name`` column has no UNIQUE constraint, thus two projects can
+    carry the same name — for example one checkout under ``work/`` and a
+    second checkout of the same repository under ``archive/``.  This
+    function returns every match, and the caller decides what an
+    ambiguous name means.  ``get_project_by_id`` returns a single dict
+    because ``project_id`` is the primary key.
+
+    The match is exact and case-sensitive.  A prefix match would let one
+    project name select a different project, and a wrong project answers
+    with symbols that look correct but come from other source code.
+
+    Args:
+        name: Exact project name, as ``list_projects`` shows it.
+
+    Returns:
+        list of dicts with keys ``project_id``, ``name``, ``project_type``,
+        ``root_path``, ``created_at``, ``updated_at``.  The list is empty
+        when no project has this name.  The order is the most recently
+        indexed project first.
+    """
+    conn = open_global_db()
+    rows = conn.execute(
+        "SELECT * FROM projects WHERE name = ? ORDER BY updated_at DESC",
+        (name,),
+    ).fetchall()
+    return [dict(row) for row in rows]
+
+

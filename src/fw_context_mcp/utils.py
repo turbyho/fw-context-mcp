@@ -443,16 +443,108 @@ def resolve_real_binary(name: str) -> str | None:
     return which
 
 
+class AmbiguousProjectError(ValueError):
+    """One project name matches more than one project in the registry.
+
+    The ``name`` column of the global registry has no UNIQUE constraint.
+    fw-context does not guess which of the matches the user wants,
+    because a wrong guess answers with symbols from other source code —
+    and such an answer looks correct.  The error message lists each
+    candidate with its ``project_id`` and root path, thus the caller can
+    repeat the request with a value that has one match only.
+    """
+
+
+def _lookup_registry_root(selector: str) -> Path | None:
+    """Resolve a project name or ``project_id`` to its root directory.
+
+    Reads the global registry at ``~/.fw-context/projects.db``.  The
+    ``project_id`` is tried first because it is the primary key and thus
+    always has one match; a name can have more than one.
+
+    Args:
+        selector: Project name or ``project_id``, as ``list_projects``
+            shows them.
+
+    Returns:
+        The registered root directory, or ``None`` when the registry
+        holds no match for *selector*.  ``None`` is also the result when
+        the registry cannot be read — a broken or missing registry must
+        not stop path resolution, thus the caller continues with the
+        path branch and gets the usual error for an unknown project.
+
+    Raises:
+        AmbiguousProjectError: More than one project has this name.
+    """
+    # Local import: fw_context_mcp.config.global_db imports this module,
+    # thus a module-level import here would be circular.
+    from fw_context_mcp.config.global_db import get_project_by_id, get_projects_by_name
+
+    try:
+        by_id = get_project_by_id(selector)
+        matches = [by_id] if by_id is not None else get_projects_by_name(selector)
+    except sqlite3.Error as e:
+        log.debug("Global registry lookup failed for %r: %s", selector, e)
+        return None
+
+    if not matches:
+        return None
+    if len(matches) > 1:
+        candidates = "\n".join(
+            f"  {m['name']} ({m['project_id']}) → {m['root_path']}" for m in matches
+        )
+        raise AmbiguousProjectError(
+            f"The project name {selector!r} matches {len(matches)} projects:\n"
+            f"{candidates}\n"
+            "Use the project_id, or give the root path as project_root."
+        )
+
+    root_path = matches[0]["root_path"]
+    if not root_path:
+        # The registry row predates root_path tracking, or the column was
+        # written empty.  There is no path to return, thus the caller
+        # continues with the path branch.
+        log.debug("Registry entry %r has no root_path", selector)
+        return None
+    return Path(root_path).resolve()
+
+
 def resolve_project_root(explicit: str | Path | None = None) -> Path:
     """Return the project root directory.
 
     Resolution order:
-    1. *explicit* path (resolved absolutely)
-    2. Nearest git-root from ``$PWD``
-    3. ``$PWD`` when no git repository is found
+
+    1. *explicit* when it names an existing directory (resolved absolutely)
+    2. *explicit* as a project name or ``project_id`` in the global registry
+    3. *explicit* as a path that does not exist yet (resolved absolutely)
+    4. Nearest git-root from ``$PWD``
+    5. ``$PWD`` when no git repository is found
+
+    WHY an existing directory wins over a registry name: a path is what
+    the caller can see on disk, and step 3 keeps the behaviour that
+    ``fw-context init`` needs — it must accept a directory that holds no
+    project yet.  Steps 1 and 3 together give the same result as before
+    for every path, thus the registry branch is added and changes
+    nothing that worked before.
+
+    Args:
+        explicit: Root directory, project name, or ``project_id``.
+            ``None`` starts the search from ``$PWD``.
+
+    Returns:
+        The resolved project root.  The directory is not guaranteed to
+        exist — the caller reports a missing or uninitialized project.
+
+    Raises:
+        AmbiguousProjectError: *explicit* is a project name with more
+            than one match in the registry.
     """
     if explicit:
-        return Path(explicit).resolve()
+        as_path = Path(explicit).resolve()
+        if as_path.is_dir():
+            return as_path
+        from_registry = _lookup_registry_root(str(explicit))
+        return from_registry if from_registry is not None else as_path
     cwd = Path(os.getcwd())
     p = cwd
     while p != p.parent:

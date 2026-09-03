@@ -540,6 +540,23 @@ value that fw-context detects automatically from the current working
 directory. Every input block below shows this parameter, but you typically
 omit it, because the automatic detection handles the common case.
 
+**A question about a different project.** Every tool answers about one
+project. To ask about a project that is not the project of the current
+directory, give the `project` parameter — the `name` or the `project_id`
+that `list_projects` shows. It is an alternative to `project_root`, which
+takes the root path. Give one of the two, not both. The `project`
+parameter must go on each call, `get_active_build` included, because
+fw-context keeps no session state.
+
+```
+list_projects   →  {"name": "boot-loader", "project_id": "<32 hex chars>", "root_path": "/…/boot-loader"}
+lookup_symbol   →  {"name": "main", "project": "boot-loader"}
+```
+
+A parameter name that no tool declares causes an error that names it.
+Earlier releases dropped such an argument without a message, and the tool
+then answered about the project of the current directory.
+
 **Multi-variant projects.** For a project with `[[build.variants]]`, every
 query tool also accepts `variant` and `image` parameters. When you omit
 `variant`, fw-context uses `[build] default_variant`, or returns an error

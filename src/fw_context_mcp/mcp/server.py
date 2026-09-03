@@ -73,13 +73,17 @@ import functools
 import inspect
 import logging
 import os
+import re
 import sqlite3
 import sys
+import textwrap
 import time
 from pathlib import Path
+from typing import Annotated
 
 from mcp.server.fastmcp import Context as MCPContext
 from mcp.server.fastmcp import FastMCP
+from pydantic import Field
 
 from ..utils import resolve_project_root
 from .background import _ensure_daemon_running
@@ -252,6 +256,277 @@ def _wrap_tool(fn):
             _SERVER_LOCK.release()
     return _wrapper
 
+
+# ── Project selector ──────────────────────────────────────────────────
+
+#: Text of the ``project`` parameter.  One constant feeds both the JSON
+#: schema and the docstring, because a tool that describes the parameter
+#: differently from its neighbour teaches the model a different rule for
+#: that tool.
+_PROJECT_PARAM_DESCRIPTION = (
+    "Project name or project_id — call list_projects to get them. Use it to "
+    "ask about a project that is not the project of the current directory. It "
+    "is an alternative to project_root, which takes a root path. Give one of "
+    "the two, not both."
+)
+
+#: Added to the description of ``project_root``, which now also resolves a
+#: name and a project_id.  The sentence must stay short and must point at
+#: ``project``: two fields that accept the same three things teach the
+#: model nothing about which one to write.
+_PROJECT_ROOT_DESCRIPTION_SUFFIX = (
+    " This field also accepts a project name or a project_id, but project is "
+    "the clear field for those."
+)
+
+#: Used when a docstring has no ``project_root:`` entry to insert after.
+#: Every handler has one today, thus this is the guard for a handler that
+#: someone adds later without an Args: section.
+_PROJECT_DOC_FALLBACK = (
+    "\nProject selection:\n"
+    + textwrap.fill(
+        f"project: {_PROJECT_PARAM_DESCRIPTION}",
+        width=76,
+        initial_indent="    ",
+        subsequent_indent="        ",
+    )
+    + "\n"
+)
+
+
+def _document_project_parameter(doc: str) -> str:
+    """Write the ``project`` entry into the ``Args:`` section of *doc*.
+
+    FastMCP sends the docstring as the description of the tool.  A
+    parameter that the ``Args:`` section does not name reaches the model
+    as a bare word in the JSON schema, and the model reads the list of
+    parameters in ``Args:``.  The entry therefore goes next to
+    ``project_root``, and not at the end of the docstring.
+
+    The indentation comes from the ``project_root:`` line that the entry
+    follows.  It is not a constant: some handlers hold a docstring that
+    starts at column 0, and others hold one that keeps the indentation of
+    the source.
+
+    Args:
+        doc: Docstring of the handler.
+
+    Returns:
+        The docstring with one more entry in its ``Args:`` section.  When
+        the docstring has no ``project_root:`` line, the result holds a
+        separate ``Project selection:`` block at the end instead.
+    """
+    lines = doc.splitlines()
+    start = None
+    indent = ""
+    for index, line in enumerate(lines):
+        found = re.match(r"([ \t]*)project_root:", line)
+        if found:
+            start, indent = index, found.group(1)
+            break
+    if start is None:
+        return doc.rstrip() + "\n" + _PROJECT_DOC_FALLBACK
+
+    # Step over the continuation lines of the project_root entry.  A line
+    # that is empty, or that is not deeper than the entry, starts
+    # something else.
+    end = start + 1
+    while end < len(lines):
+        line = lines[end]
+        if not line.strip() or len(line) - len(line.lstrip()) <= len(indent):
+            break
+        end += 1
+
+    entry = textwrap.fill(
+        f"project: {_PROJECT_PARAM_DESCRIPTION}",
+        width=79,
+        initial_indent=indent,
+        subsequent_indent=indent + "    ",
+    ).splitlines()
+    # splitlines() drops a final newline; put it back so the docstring
+    # keeps the shape that it had.
+    tail = "\n" if doc.endswith("\n") else ""
+    return "\n".join([*lines[:end], *entry, *lines[end:]]) + tail
+
+
+def _merge_project_selector(tool_name: str, kwargs: dict) -> dict:
+    """Move a ``project`` value into ``project_root``.
+
+    ``resolve_project_root`` accepts a project name, a ``project_id``, or
+    a path, thus one handler parameter carries all three and no handler
+    signature changes.
+
+    Args:
+        tool_name: Name of the tool, for the error message.
+        kwargs: Keyword arguments of the call.  Changed in place.
+
+    Returns:
+        The same dict, with ``project`` removed and its value written to
+        ``project_root``.
+
+    Raises:
+        ValueError: The call gives ``project`` and ``project_root``, and
+            the two values are different.  fw-context does not choose one
+            of them, because the answer of the losing project looks
+            correct but comes from other source code.
+    """
+    project = kwargs.pop("project", None)
+    if isinstance(project, str):
+        project = project.strip()
+    if not project:
+        return kwargs
+    project_root = kwargs.get("project_root")
+    if project_root and str(project_root).strip() != project:
+        raise ValueError(
+            f"{tool_name}: project={project!r} and project_root={project_root!r} "
+            "select different projects. Give one of the two, not both."
+        )
+    kwargs["project_root"] = project
+    return kwargs
+
+
+def _describe_project_root(param: inspect.Parameter) -> inspect.Parameter:
+    """Say in the schema that ``project_root`` also takes a name or an id.
+
+    ``resolve_project_root`` resolves a project name and a project_id as
+    well as a path.  A description that names only the path is not true
+    any more, and a model cannot read behaviour that no text states.
+
+    The sentence is appended to the description that the handler wrote,
+    and does not replace it: the handlers say different useful things
+    there — ``list_projects`` for example explains that the parameter
+    picks one of several indexed projects.
+
+    Args:
+        param: One parameter of the signature of a handler.
+
+    Returns:
+        The parameter with a longer description, or *param* unchanged
+        when it is not ``project_root`` or carries no description.
+    """
+    if param.name != "project_root":
+        return param
+    metadata = getattr(param.annotation, "__metadata__", ())
+    description = next(
+        (text for text in (getattr(m, "description", None) for m in metadata) if text),
+        None,
+    )
+    if description is None:
+        return param
+    base = getattr(param.annotation, "__origin__", param.annotation)
+    # A second Field goes at the END of the Annotated metadata, and it
+    # holds the description only.  Pydantic merges the Field objects of
+    # an Annotated in order and the last value wins, thus every other
+    # setting of the original Field stays.  A change in place would not
+    # do: pydantic reads FieldInfo._attributes_set, and not the live
+    # attribute, thus a written description would never reach the schema.
+    return param.replace(
+        annotation=Annotated[
+            (
+                base,
+                *metadata,
+                Field(description=description + _PROJECT_ROOT_DESCRIPTION_SUFFIX),
+            )
+        ]
+    )
+
+
+def _with_project_selector(fn):
+    """Add a ``project`` parameter that selects a project by name or id.
+
+    Each tool answers about ONE project.  Before this parameter existed,
+    the only selector was ``project_root`` — an absolute path.  A model
+    that wrote ``project="<name>"`` got no error, because pydantic
+    ignores an unknown argument: the tool then answered about the project
+    of the current directory, and that answer looked correct but came
+    from other source code.
+
+    The parameter is added here, and not in each of the ~30 handler
+    signatures, for two reasons.  One handler that keeps the old
+    signature causes exactly the failure above again, and the description
+    of the parameter must read the same in every tool.
+
+    HOW the parameter reaches the JSON schema: FastMCP builds the schema
+    from ``inspect.signature(fn, eval_str=True)``, and ``inspect`` stops
+    its walk along ``__wrapped__`` at the first object that has a
+    ``__signature__`` attribute.  This wrapper sets ``__signature__``,
+    thus the schema comes from here.  Context injection still works,
+    because FastMCP finds the ``ctx`` parameter with
+    ``typing.get_type_hints()``, which reads ``__annotations__``, and
+    ``functools.wraps`` copies those from *fn* unchanged.
+
+    Args:
+        fn: A tool handler, or the ``_wrap_tool`` wrapper around one.
+
+    Returns:
+        A wrapper that accepts ``project``, or *fn* unchanged when it has
+        no ``project_root`` parameter — ``get_project_info`` and
+        ``check_ollama`` take no project.
+    """
+    # eval_str=True: the handler modules use PEP 563 string annotations,
+    # and a stored __signature__ is given to pydantic as it is — inspect
+    # does not evaluate it a second time.
+    base_sig = inspect.signature(fn, eval_str=True)
+    if "project_root" not in base_sig.parameters:
+        return fn
+
+    project_param = inspect.Parameter(
+        "project",
+        inspect.Parameter.KEYWORD_ONLY,
+        default=None,
+        annotation=Annotated[str | None, Field(description=_PROJECT_PARAM_DESCRIPTION)],
+    )
+    # A KEYWORD_ONLY parameter must come before **kwargs and after every
+    # other parameter kind.
+    head = [p for p in base_sig.parameters.values() if p.kind is not inspect.Parameter.VAR_KEYWORD]
+    tail = [p for p in base_sig.parameters.values() if p.kind is inspect.Parameter.VAR_KEYWORD]
+    head = [_describe_project_root(p) for p in head]
+    new_sig = base_sig.replace(parameters=[*head, project_param, *tail])
+
+    if inspect.iscoroutinefunction(fn):
+        @functools.wraps(fn)
+        async def _selector(*a, **kw):
+            return await fn(*a, **_merge_project_selector(fn.__name__, kw))
+    else:
+        @functools.wraps(fn)
+        def _selector(*a, **kw):
+            return fn(*a, **_merge_project_selector(fn.__name__, kw))
+
+    # inspect.signature() reads __signature__ and stops there, thus this
+    # assignment is what puts `project` into the JSON schema of the tool.
+    _selector.__signature__ = new_sig
+    _selector.__doc__ = _document_project_parameter(fn.__doc__ or "")
+    return _selector
+
+
+def _forbid_unknown_tool_arguments() -> None:
+    """Make FastMCP reject an argument that the tool does not declare.
+
+    Pydantic ignores an unknown field by default.  A call that wrote
+    ``project="<name>"`` before that parameter existed thus lost the
+    argument without a message, and the tool answered about the project
+    of the current directory — a wrong answer that looks correct.  A
+    misspelled parameter must fail, and the failure must name it.
+
+    Every argument model that FastMCP builds is a subclass of
+    ``ArgModelBase``, and pydantic merges the ``model_config`` of the
+    parent when it creates the subclass.  This function therefore must
+    run BEFORE the first ``mcp.tool()`` registration.
+
+    A future release of ``mcp`` can change the name or the shape of that
+    class.  The server must still start in that case, thus the failure is
+    a warning in the log and not an exception.
+    """
+    try:
+        from mcp.server.fastmcp.utilities.func_metadata import ArgModelBase
+
+        ArgModelBase.model_config["extra"] = "forbid"
+    except (ImportError, AttributeError, TypeError) as e:
+        log.warning(
+            "Unknown tool arguments stay silent: cannot set extra=forbid on "
+            "the FastMCP argument model (%s)", e
+        )
+
 # The FastMCP instructions string is embedded here (not loaded from a file)
 # because it must be available at import time — FastMCP reads it during
 # construction.  Loading from a data file would add an I/O dependency to
@@ -305,6 +580,16 @@ mcp = FastMCP(
         "7. Only AFTER exhausting fw-context — use other available tools.\n\n"
         "project_only=True (on search_code, search_bodies, search_content, and\n"
         "callgraph tools) excludes vendor SDK code — use when asking about YOUR code.\n\n"
+        "MULTI-PROJECT — a question about a DIFFERENT project:\n"
+        "Each tool answers about ONE project. Without project or project_root\n"
+        "this is the project of the current directory — NOT the project that\n"
+        "the operator asked about.\n"
+        "1. Call list_projects. It gives the name, the project_id, and the\n"
+        "   root_path of each indexed project.\n"
+        '2. Give project="<name>" (or project_root="<root_path>") to EVERY\n'
+        "   call that follows, get_active_build included.\n"
+        "Do not invent other parameter names. An unknown argument causes an\n"
+        "error that names it.\n\n"
         "ANTI-PATTERNS — do NOT:\n"
         "• Use external search tools for C/C++ symbols → use lookup_symbol or search_code\n"
         "• Use external search tools for code patterns → use search_bodies (function\n"
@@ -539,57 +824,65 @@ mcp = FastMCP(
 # ARE wrapped — they may run for seconds to minutes (BFS traversal,
 # Ollama HTTP calls, libclang re-parsing) and need progress notifications
 # and the 5 s busy-rejection guard.
+#
+# _with_project_selector adds the `project` parameter to every tool that
+# takes a project_root.  It must stay the OUTERMOST wrapper: it is the one
+# that FastMCP inspects, and it reads the signature of what it wraps.
+#
+# _forbid_unknown_tool_arguments must run BEFORE the first registration —
+# it changes the base model from which FastMCP builds each argument model.
+_forbid_unknown_tool_arguments()
 
 # maintenance.py
-mcp.tool()(maintenance.check_dependencies)
-mcp.tool()(maintenance.check_ollama)
-mcp.tool()(maintenance.configure_llm)
-mcp.tool()(maintenance.get_active_build)
-mcp.tool()(maintenance.get_environment_status)
-mcp.tool()(maintenance.get_project_info)
-mcp.tool()(maintenance.list_projects)
-mcp.tool()(maintenance.list_variants)
-mcp.tool()(maintenance.reindex_file)
-mcp.tool()(maintenance.reindex_file_impl)
-mcp.tool()(maintenance.reset_index)
+mcp.tool()(_with_project_selector(maintenance.check_dependencies))
+mcp.tool()(_with_project_selector(maintenance.check_ollama))
+mcp.tool()(_with_project_selector(maintenance.configure_llm))
+mcp.tool()(_with_project_selector(maintenance.get_active_build))
+mcp.tool()(_with_project_selector(maintenance.get_environment_status))
+mcp.tool()(_with_project_selector(maintenance.get_project_info))
+mcp.tool()(_with_project_selector(maintenance.list_projects))
+mcp.tool()(_with_project_selector(maintenance.list_variants))
+mcp.tool()(_with_project_selector(maintenance.reindex_file))
+mcp.tool()(_with_project_selector(maintenance.reindex_file_impl))
+mcp.tool()(_with_project_selector(maintenance.reset_index))
 
 # search.py
-mcp.tool()(_wrap_tool(search.lookup_symbol))
-mcp.tool()(_wrap_tool(search.search_code))
-mcp.tool()(_wrap_tool(search.search_bodies))
-mcp.tool()(_wrap_tool(search.search_content))
-mcp.tool()(_wrap_tool(search.semantic_search))
-mcp.tool()(_wrap_tool(search.smart_search))
+mcp.tool()(_with_project_selector(_wrap_tool(search.lookup_symbol)))
+mcp.tool()(_with_project_selector(_wrap_tool(search.search_code)))
+mcp.tool()(_with_project_selector(_wrap_tool(search.search_bodies)))
+mcp.tool()(_with_project_selector(_wrap_tool(search.search_content)))
+mcp.tool()(_with_project_selector(_wrap_tool(search.semantic_search)))
+mcp.tool()(_with_project_selector(_wrap_tool(search.smart_search)))
 
 # callgraph.py
-mcp.tool()(_wrap_tool(callgraph.find_all_callers_recursive))
-mcp.tool()(_wrap_tool(callgraph.find_call_path))
-mcp.tool()(_wrap_tool(callgraph.get_vector_table))
-mcp.tool()(_wrap_tool(callgraph.find_callees_recursive))
-mcp.tool()(_wrap_tool(callgraph.find_callers))
-mcp.tool()(_wrap_tool(callgraph.find_dead_code))
-mcp.tool()(_wrap_tool(callgraph.find_hotspots))
-mcp.tool()(_wrap_tool(callgraph.find_indirect_call_sites))
-mcp.tool()(_wrap_tool(callgraph.find_indirect_targets))
-mcp.tool()(_wrap_tool(callgraph.find_references))
-mcp.tool()(_wrap_tool(callgraph.find_wrapper_callers))
-mcp.tool()(_wrap_tool(callgraph.trace_data_flow))
+mcp.tool()(_with_project_selector(_wrap_tool(callgraph.find_all_callers_recursive)))
+mcp.tool()(_with_project_selector(_wrap_tool(callgraph.find_call_path)))
+mcp.tool()(_with_project_selector(_wrap_tool(callgraph.get_vector_table)))
+mcp.tool()(_with_project_selector(_wrap_tool(callgraph.find_callees_recursive)))
+mcp.tool()(_with_project_selector(_wrap_tool(callgraph.find_callers)))
+mcp.tool()(_with_project_selector(_wrap_tool(callgraph.find_dead_code)))
+mcp.tool()(_with_project_selector(_wrap_tool(callgraph.find_hotspots)))
+mcp.tool()(_with_project_selector(_wrap_tool(callgraph.find_indirect_call_sites)))
+mcp.tool()(_with_project_selector(_wrap_tool(callgraph.find_indirect_targets)))
+mcp.tool()(_with_project_selector(_wrap_tool(callgraph.find_references)))
+mcp.tool()(_with_project_selector(_wrap_tool(callgraph.find_wrapper_callers)))
+mcp.tool()(_with_project_selector(_wrap_tool(callgraph.trace_data_flow)))
 
 # source.py
-mcp.tool()(_wrap_tool(source.explain_symbol))
-mcp.tool()(_wrap_tool(source.get_file_map))
-mcp.tool()(_wrap_tool(source.get_source))
-mcp.tool()(_wrap_tool(source.get_symbol_context))
-mcp.tool()(_wrap_tool(source.read_file))
+mcp.tool()(_with_project_selector(_wrap_tool(source.explain_symbol)))
+mcp.tool()(_with_project_selector(_wrap_tool(source.get_file_map)))
+mcp.tool()(_with_project_selector(_wrap_tool(source.get_source)))
+mcp.tool()(_with_project_selector(_wrap_tool(source.get_symbol_context)))
+mcp.tool()(_with_project_selector(_wrap_tool(source.read_file)))
 
 # inheritance.py
-mcp.tool()(_wrap_tool(inheritance.get_class_members))
-mcp.tool()(_wrap_tool(inheritance.get_inheritance_chain))
-mcp.tool()(_wrap_tool(inheritance.get_method_overrides))
-mcp.tool()(_wrap_tool(inheritance.get_template_instances))
+mcp.tool()(_with_project_selector(_wrap_tool(inheritance.get_class_members)))
+mcp.tool()(_with_project_selector(_wrap_tool(inheritance.get_inheritance_chain)))
+mcp.tool()(_with_project_selector(_wrap_tool(inheritance.get_method_overrides)))
+mcp.tool()(_with_project_selector(_wrap_tool(inheritance.get_template_instances)))
 
 # variables.py
-mcp.tool()(_wrap_tool(variables.find_variables))
+mcp.tool()(_with_project_selector(_wrap_tool(variables.find_variables)))
 
 # ── MCP Resources ──────────────────────────────────────────────────────────
 
