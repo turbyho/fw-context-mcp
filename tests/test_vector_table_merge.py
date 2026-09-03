@@ -576,9 +576,10 @@ class TestASlotFilledAtRunTime:
     """A table in RAM, and what the image says about it.
 
     Measured on the Mbed project, which defines ``CMSIS_VECTAB_VIRTUAL``
-    and gives RAM a 256-byte ``RAM_NVIC`` region: 12 of its 41
+    and gives RAM a 256-byte ``RAM_NVIC`` region: 11 of its 41
     ``unhandled`` slots have a handler installed by ``NVIC_SetVector``,
-    the tick source and the console among them.
+    the tick source and the console among them, and 30 slots are left
+    unhandled.
     """
 
     def test_the_status_says_run_time_instead_of_unhandled(self, tmp_path):

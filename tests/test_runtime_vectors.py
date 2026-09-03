@@ -5,9 +5,9 @@ A CMSIS target can move its table into RAM and install each handler with
 every such slot, so the static table says "nothing services this
 interrupt" about interrupts that are serviced.
 
-Measured on the Mbed project, which sets ``CMSIS_VECTAB_VIRTUAL``: 14
-calls, 12 distinct slots, all of them reported ``unhandled`` before this
-existed.  Among them the tick source (IRQ 9 -> slot 25 ->
+Measured on the Mbed project, which sets ``CMSIS_VECTAB_VIRTUAL``: 13
+registrations across 11 slots, all of them reported ``unhandled`` before
+this existed.  Among them the tick source (IRQ 9 -> slot 25 ->
 ``us_ticker_irq_handler``), the low-power tick (17 -> 33), the console
 (2 -> 18) and USB (39 -> 55).
 

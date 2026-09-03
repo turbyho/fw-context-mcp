@@ -6,12 +6,14 @@ the only record of which handler services that interrupt: the table in
 flash holds an alias of the default handler, which is a trap loop.
 
 Measured on the Mbed project, which sets ``CMSIS_VECTAB_VIRTUAL`` and
-gives RAM a 256-byte ``RAM_NVIC`` region: 14 calls, 12 distinct slots,
-and every one of those slots read as ``unhandled`` because that is what
-the static table says.  Among them the tick source (``TIMER1`` ->
-``us_ticker_irq_handler``), the low-power tick (``RTC1``), the console
-(``UARTE0``), both I2C/SPI instances and USB.  The answer "nothing
-services this interrupt" was wrong for all of them.
+gives RAM a 256-byte ``RAM_NVIC`` region: 13 registrations across 11
+slots, and every one of those slots read as ``unhandled`` because that
+is what the static table says.  Among them the tick source (``TIMER1``
+-> ``us_ticker_irq_handler``), the low-power tick (``RTC1``), the
+console (``UARTE0``), both I2C/SPI instances and USB.  The answer
+"nothing services this interrupt" was wrong for all of them.  Two of
+the slots are registered from two files each, which is where the
+difference between 13 and 11 comes from.
 
 **The name of the function is what identifies the pattern.**  That is
 platform knowledge, of the same kind this package already holds in

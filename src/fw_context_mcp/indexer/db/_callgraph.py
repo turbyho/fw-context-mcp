@@ -1046,10 +1046,10 @@ def _add_runtime_installation(
     ``NVIC_SetVector``, and the image then holds an alias of the trap
     loop for every such slot.  ``unhandled`` describes the flash
     correctly and the running machine wrongly — measured on the Mbed
-    project, 12 of 41 unhandled slots have a handler installed at run
-    time, among them the tick source and the console.  ``runtime`` is
-    that state: nothing services the interrupt until the code that
-    registers it has run.
+    project, 11 of its 41 unhandled slots have a handler installed at
+    run time, among them the tick source and the console, and the count
+    of unhandled slots drops to 30.  ``runtime`` is that state: nothing
+    services the interrupt until the code that registers it has run.
 
     The status changes ONLY where it was ``unhandled``.  A slot whose
     static definition is real code stays ``c`` or ``assembly``, because
