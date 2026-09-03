@@ -16,9 +16,6 @@ plans/
 # Local debug scripts
 _debug_*.py
 
-# fw-context runtime data
-.fw-context/
-
 .lean-ctx
 
 # AI tools
@@ -85,3 +82,7 @@ plans/
 # indexes of private firmware projects, and is hardcoded to their project
 # ids and symbol names.  It can never run for anyone else.
 tests/test_feature_comparison.py
+
+# fw-context
+**/.fw-context/*
+!**/.fw-context/config.toml

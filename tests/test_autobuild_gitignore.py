@@ -119,16 +119,32 @@ def test_git_really_stops_reporting_the_directory(tmp_path):
     )
 
 
-def test_init_lists_the_directory_for_a_new_project(tmp_path):
-    """A new project gets the entry in its own .gitignore as well.
+@pytest.mark.skipif(
+    subprocess.run(["git", "--version"], capture_output=True, check=False).returncode != 0,
+    reason="git is not available",
+)
+def test_init_covers_the_directory_for_a_new_project(tmp_path):
+    """A new project ignores the autobuild output through its own .gitignore.
 
-    The inside rule covers every project; this entry is what a developer
-    reading the project's .gitignore sees.
+    The rule inside the directory covers every project; the entry that
+    ``init`` writes is what covers a project whose autobuild directory does
+    not exist yet.
+
+    ``init`` writes ``.fw-context/*`` and not one line for each directory,
+    thus this asks git what the entries do and does not read their text.
+    The shared ``config.toml`` must stay visible — ``test_gitignore_rules``
+    holds that whole rule.
     """
     from fw_context_mcp.cli._init import _ensure_gitignore
 
+    subprocess.run(["git", "-C", str(tmp_path), "init", "-q"], check=True)
     _ensure_gitignore(tmp_path, fix=True)
 
-    listed = (tmp_path / ".gitignore").read_text(encoding="utf-8").splitlines()
-    assert ".fw-context/autobuild/" in listed
-    assert ".fw-context/build/" in listed
+    def ignored(relative: str) -> bool:
+        return subprocess.run(
+            ["git", "-C", str(tmp_path), "check-ignore", "-q", relative], check=False
+        ).returncode == 0
+
+    assert ignored(f"{AUTOBUILD_REL}/default/app.elf")
+    assert ignored(".fw-context/build/compile_commands.json")
+    assert not ignored(".fw-context/config.toml"), "the shared config must stay committable"

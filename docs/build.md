@@ -23,7 +23,23 @@ does the rest.
 The generated `compile_commands.json` is written to
 `.fw-context/build/compile_commands.json` — a gitignored subdirectory of the
 project config dir, so the build artifact stays out of the repository root.
-`fw-context init` adds `.fw-context/build/` to `.gitignore` automatically.
+`fw-context init` writes the rules for it into `.gitignore` automatically:
+
+```gitignore
+**/.fw-context/*
+!**/.fw-context/config.toml
+```
+
+Everything under `.fw-context/` stays out of the repository, and
+`config.toml` is the one exception — it holds the build configuration of the
+project, thus every developer gets the same index. Keep the two lines in this
+order: a later line wins in `.gitignore`.
+
+The `/*` matters. A rule `.fw-context/` excludes the DIRECTORY, git does not
+descend into an excluded directory, and no later negation can then bring
+`config.toml` back. The `**/` prefix gives the rules every depth, for a
+repository that holds more than one initialized project. `init` removes a
+line of the older form when it finds one.
 
 ### Detection order
 

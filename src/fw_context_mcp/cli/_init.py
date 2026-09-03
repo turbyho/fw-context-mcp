@@ -744,8 +744,11 @@ def cmd_init(args: argparse.Namespace) -> int:
             all_warnings.extend(w)
 
     # ── 8. gitignore + skills + agents (gitignore NOT ok-gated) ──
+    # The gitignore step runs in a dry run as well, with fix=False.  It can
+    # REMOVE a line — a blanket `.fw-context/` that hides config.toml — and
+    # a dry run must show that before the run that does it.
+    _ensure_gitignore(project_root, fix=not args.dry_run, build_system=build_system)
     if not args.dry_run:
-        _ensure_gitignore(project_root, fix=True, build_system=build_system)
         if not quick:
             scope = getattr(args, "scope", "project")
             _install_skills(dry_run=False, project_root=project_root, scope=scope)
@@ -838,66 +841,171 @@ def _check_config_file(project_root: Path, rel_path: str, template: str, fix: bo
         print(f"  [ok] {path}")
 
 
-def _ensure_gitignore(project_root: Path, *, fix: bool = False, build_system: str | None = None) -> None:
-    """Add fw-context build artifacts and ``.fw-context/local.toml`` to the
-    project's ``.gitignore`` if they aren't already listed.
+#: The two lines that control what git sees under ``.fw-context/``.
+#:
+#: The ``/*`` decides the whole rule.  ``.fw-context/`` excludes the
+#: DIRECTORY, and git does not descend into an excluded directory, thus no
+#: later negation can bring ``config.toml`` back.  ``.fw-context/*``
+#: excludes the CONTENTS, git reads each entry, and the negation applies.
+#:
+#: The ``**/`` prefix gives the rule every depth.  A repository can hold
+#: more than one initialized project (a bootloader beside an application),
+#: and only the root usually has a ``.gitignore``.  Without the prefix the
+#: pair holds a leading path element, which anchors it to the root, and
+#: the ``local.toml`` of a project one level down reaches git.
+#:
+#: The order is part of the rule — a later line wins in ``.gitignore``,
+#: thus the negation must FOLLOW the exclude.
+FW_CONTEXT_IGNORE_PAIR = ("**/.fw-context/*", "!**/.fw-context/config.toml")
 
-    ``.fw-context/build/`` holds the generated ``compile_commands.*`` files
-    and ``.fw-context/autobuild/`` the output of a build that fw-context
-    started itself; the root-level ``compile_commands.json`` entry covers
-    build systems that write natively to the project root (PlatformIO) and
-    legacy layouts.
+#: Lines that ``FW_CONTEXT_IGNORE_PAIR`` replaces, thus ``init`` removes
+#: them.  The four blanket forms exclude the directory and hide
+#: ``config.toml``; the two root-anchored lines are the same pair without
+#: the ``**/`` prefix and miss every project below the root.
+FW_CONTEXT_SUPERSEDED_IGNORES = frozenset(
+    {
+        ".fw-context/",
+        ".fw-context",
+        "/.fw-context/",
+        "/.fw-context",
+        ".fw-context/*",
+        "!.fw-context/config.toml",
+    }
+)
 
-    A project initialised before an entry was added here keeps the old list,
-    because init is the only caller.  ``utils.ignore_autobuild_dir`` covers
-    the autobuild directory for those projects, from inside.
 
-    For Mbed OS projects, also adds ``mbed_config.h`` — the build-generated
-    config header that ends up in the project root.
+def _pair_is_ordered(lines: list[str]) -> bool:
+    """Tell whether the ``.fw-context`` exclude and its negation are correct.
 
-    Reads the existing file (when present), checks each entry as a literal
-    line, and appends missing entries.  Idempotent — running multiple times
-    adds no duplicates.
+    Both lines must be present, and the negation must come after the
+    exclude.  A negation before the exclude has no result, because the
+    last line that matches a path wins.
 
-    In fix mode (*fix=True*), actually writes the file.  Otherwise only
-    reports what would be added.
+    Args:
+        lines: Lines of the ``.gitignore``, with their line ends removed.
+
+    Returns:
+        True when the pair is present and in the correct order.
     """
-    entries = [
-        "compile_commands.json",
-        ".fw-context/build/",
-        ".fw-context/autobuild/",
-        ".fw-context/local.toml",
-    ]
-    if build_system == "mbed-os":
-        entries.insert(1, "mbed_config.h")
+    exclude = negation = None
+    for index, line in enumerate(lines):
+        text = line.strip()
+        if text == FW_CONTEXT_IGNORE_PAIR[0]:
+            exclude = index
+        elif text == FW_CONTEXT_IGNORE_PAIR[1]:
+            negation = index
+    return exclude is not None and negation is not None and negation > exclude
 
+
+def plan_gitignore(
+    raw: list[str], build_system: str | None = None
+) -> tuple[list[str], list[str], list[str]]:
+    """Decide what a ``.gitignore`` must lose and gain.
+
+    Pure — it reads lines and returns lines, thus the rules can be tested
+    without a file.  ``_ensure_gitignore`` does the input and the output.
+
+    ``.fw-context/`` holds one file that the team shares and several that
+    it must not.  ``config.toml`` holds the build configuration of the
+    project and belongs in the repository, thus every developer gets the
+    same index.  ``local.toml`` holds the settings of one developer
+    (paths, API keys), and ``build/`` and ``autobuild/`` hold generated
+    output; none of the three belongs in the repository.
+    ``FW_CONTEXT_IGNORE_PAIR`` gives that split, and its documentation
+    tells why the exclude needs the ``/*``.
+
+    A blanket ``.fw-context/`` line goes.  Such a line hides
+    ``config.toml``, and a project that got one from an earlier version
+    of fw-context, or from a person, cannot commit the file until the
+    line goes.  A pair in the wrong order goes for the same reason, and
+    comes back in the correct order.  No other line is touched.
+
+    Args:
+        raw: Lines of the current ``.gitignore``, with the line ends
+            removed.  An empty list stands for a file that is not there.
+        build_system: Build system key.  ``"mbed-os"`` adds
+            ``mbed_config.h``, the build-generated header that lands in
+            the project root.
+
+    Returns:
+        ``(kept, removed, append)`` — the lines that stay, the text of
+        each line that must go, and the entries to write at the end.
+    """
+    needs_pair = not _pair_is_ordered(raw)
+    # A stray half of the pair goes together with the superseded lines, so
+    # that both lines come back as one ordered block.
+    drop = set(FW_CONTEXT_SUPERSEDED_IGNORES)
+    if needs_pair:
+        drop.update(FW_CONTEXT_IGNORE_PAIR)
+
+    removed = sorted({line.strip() for line in raw if line.strip() in drop})
+    kept = [line for line in raw if line.strip() not in drop]
+    present = {line.strip() for line in kept if line.strip() and not line.strip().startswith("#")}
+
+    plain = ["compile_commands.json"]
+    if build_system == "mbed-os":
+        plain.append("mbed_config.h")
+    append = [entry for entry in plain if entry not in present]
+    if needs_pair:
+        append.extend(FW_CONTEXT_IGNORE_PAIR)
+
+    return kept, removed, append
+
+
+def _ensure_gitignore(project_root: Path, *, fix: bool = False, build_system: str | None = None) -> None:
+    """Make git ignore the fw-context artifacts, but keep ``config.toml``.
+
+    ``plan_gitignore`` holds the rules and the reasons for them.  This
+    function reads the file, reports the plan, and — with *fix* — writes
+    it.  It is idempotent: more runs add no duplicates.
+
+    Args:
+        project_root: Directory that holds the ``.gitignore``.
+        fix: True writes the file.  False only reports the changes.
+        build_system: Build system key, for the Mbed OS entry.
+    """
     gitignore = project_root / ".gitignore"
     try:
-        existing_lines: set[str] = set()
-        if gitignore.exists():
-            existing_lines = {
-                line.strip()
-                for line in gitignore.read_text(encoding="utf-8").splitlines()
-                if line.strip() and not line.strip().startswith("#")
-            }
+        raw = gitignore.read_text(encoding="utf-8").splitlines() if gitignore.exists() else []
     except (OSError, PermissionError):
         return
 
-    missing = [e for e in entries if e not in existing_lines]
-    if not missing:
+    kept, removed, append = plan_gitignore(raw, build_system)
+    if not append and not removed:
         print(f"  [ok] {gitignore}")
         return
 
-    if fix:
-        try:
-            with gitignore.open("a", encoding="utf-8") as f:
-                if gitignore.stat().st_size > 0:
-                    f.seek(0, 2)
-                f.write("\n# fw-context\n")
-                for e in missing:
-                    f.write(f"{e}\n")
-            print(f"  [fix] {gitignore}: added {', '.join(missing)}")
-        except (OSError, PermissionError) as e:
-            logging.getLogger(__name__).warning("Could not update %s: %s", gitignore, e)
-    else:
-        print(f"  [info] {gitignore}: missing entries: {', '.join(missing)}")
+    verb, mark = ("would remove", "[info]") if not fix else ("removed", "[fix]")
+    if removed:
+        print(f"  {mark} {gitignore}: {verb} {', '.join(removed)} — it hides .fw-context/config.toml")
+    if append:
+        word = "missing entries:" if not fix else "added"
+        print(f"  {mark} {gitignore}: {word} {', '.join(append)}")
+    if not fix:
+        return
+
+    try:
+        _write_gitignore(gitignore, kept if removed else None, append)
+    except (OSError, PermissionError) as e:
+        logging.getLogger(__name__).warning("Could not update %s: %s", gitignore, e)
+
+
+def _write_gitignore(gitignore: Path, kept: list[str] | None, append: list[str]) -> None:
+    """Write the planned ``.gitignore``.
+
+    Args:
+        gitignore: File to write.
+        kept: Lines to keep, when a line was removed and the file needs a
+            rewrite.  ``None`` leaves the current content in place.
+        append: Entries to write at the end, under one comment.
+    """
+    if kept is not None:
+        gitignore.write_text("\n".join(kept) + "\n" if kept else "", encoding="utf-8")
+    if not append:
+        return
+    with gitignore.open("a", encoding="utf-8") as f:
+        if gitignore.stat().st_size > 0:
+            f.write("\n")
+        f.write("# fw-context\n")
+        for entry in append:
+            f.write(f"{entry}\n")
