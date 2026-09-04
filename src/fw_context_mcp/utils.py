@@ -317,6 +317,59 @@ def build_env(overrides: dict[str, str] | None = None) -> dict[str, str]:
     return env
 
 
+#: How much of each captured stream a failed build quotes.
+#:
+#: A build log runs to megabytes and the reason for the failure sits at
+#: its END, thus the tail is the part that answers "why".  The value is
+#: large enough to hold the error block of a compiler — measured on an
+#: Mbed OS build, whose three ``error:`` lines with their source excerpts
+#: and ``note:`` lines came to about 1200 characters.
+_BUILD_OUTPUT_TAIL = 2000
+
+
+def _as_text(raw: str | bytes | None) -> str | None:
+    """Return a captured stream as text.
+
+    ``subprocess.run(text=True)`` gives ``str``, but the ``stdout`` and
+    ``stderr`` that ``TimeoutExpired`` carries can still be ``bytes`` —
+    the exception holds what the pipes had read when the clock ran out,
+    and that path does not always decode.  Undecodable bytes are
+    replaced, because an error message that raises its own error tells
+    the reader nothing.
+
+    Args:
+        raw: The captured stream, or ``None``.
+
+    Returns:
+        The stream as text, or ``None`` when there was none.
+    """
+    if isinstance(raw, bytes):
+        return raw.decode("utf-8", errors="replace")
+    return raw
+
+
+def _quote_stream(name: str, text: str | None, limit: int = _BUILD_OUTPUT_TAIL) -> str:
+    """Return the tail of one captured stream, for an error message.
+
+    Args:
+        name: Name of the stream, ``"stdout"`` or ``"stderr"``.
+        text: The whole captured stream, or ``None`` when the run gave none.
+        limit: How many characters of the end to keep.
+
+    Returns:
+        A block that starts with *name* on its own line, or an empty
+        string when the stream holds nothing.  A stream that was cut says
+        how much went missing, so that nobody reads the first line of the
+        block as the first line of the output.
+    """
+    text = (text or "").strip()
+    if not text:
+        return ""
+    if len(text) <= limit:
+        return f"\n{name}:\n{text}"
+    return f"\n{name} (last {limit} of {len(text)} characters):\n{text[-limit:]}"
+
+
 def run_build_command(
     cmd: list[str],
     cwd: Path,
@@ -387,16 +440,27 @@ def run_build_command(
         result = subprocess.run(
             cmd, cwd=cwd, capture_output=True, text=True, timeout=timeout, env=merged_env
         )
-    except subprocess.TimeoutExpired:
+    except subprocess.TimeoutExpired as e:
+        # Quote what the build managed to say.  A timeout with no output
+        # gives the reader nothing to act on, and the last lines usually
+        # name the step that hung.
         raise RuntimeError(
             f"Build command timed out after {timeout}s: "
             f"{description or ' '.join(cmd)}"
+            f"{_quote_stream('stdout', _as_text(e.stdout))}"
+            f"{_quote_stream('stderr', _as_text(e.stderr))}"
         ) from None
     if result.returncode != 0:
+        # BOTH streams, and the END of each.  A build tool writes the
+        # reason for the failure wherever it likes: mbed-cli puts its own
+        # wrapper text on stderr and leaves the compiler errors on stdout,
+        # thus quoting the head of stderr showed a cut-off "[mbed] ERROR:
+        # ... returned error" and hid every line that said why.
         raise RuntimeError(
             f"Build command failed (exit {result.returncode}): "
-            f"{description or ' '.join(cmd)}\n"
-            f"stderr: {result.stderr[:500]}"
+            f"{description or ' '.join(cmd)}"
+            f"{_quote_stream('stdout', result.stdout)}"
+            f"{_quote_stream('stderr', result.stderr)}"
         )
     return result
 
