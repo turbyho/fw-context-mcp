@@ -729,9 +729,10 @@ def get_source(
 
         ``source`` carries a line-number prefix on every line — four
         columns, right-aligned, then two spaces (``"  20     bool ..."``).
-        This tool is the only one that numbers its text: the ``source`` of
-        ``search_bodies`` and the ``content`` of ``read_file`` are both
-        bare.  Strip the prefix before you compare the text with anything.
+        This tool always numbers its text.  ``read_file`` numbers its
+        ``content`` when you pass ``line_numbers=True``, and the ``source``
+        of ``search_bodies`` is always bare.  Strip the prefix before you
+        compare the text with anything.
 
         When the file changed after the last index run, the dict adds
         ``stale`` (True) and ``stale_warning`` (str).  ``source_origin`` then

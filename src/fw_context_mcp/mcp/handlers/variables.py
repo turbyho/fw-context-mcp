@@ -74,6 +74,11 @@ def find_variables(
     ``lookup_symbol``.  For all references to a specific variable
     (including reads in expressions), use ``find_references``.
 
+    This tool is the way to a LOCAL variable: ``search_code`` drops the
+    ``varlocal`` kind, because a local matches every topic query aimed at
+    the function around it.  ``search_code(..., kind="varlocal")`` reaches
+    them as well.
+
     Legacy indexes with ``kind="variable"`` (pre-split) are detected and
     included in results — reindex to fully benefit from the split.
 
