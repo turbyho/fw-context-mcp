@@ -752,8 +752,10 @@ def find_call_path(
 
     Returns:
         list of dicts, each with: depth (edge count, int), chain (str —
-        e.g. ``"main → app_run → modem_init"``). When no path exists
-        within the depth limit, the list holds one ``info`` dict.
+        e.g. ``"main → app_run → modem_init"``), target_usr (str — the USR
+        of the symbol the path ends at, which tells two overloads apart).
+        When no path exists within the depth limit, the list holds one
+        ``info`` dict.
 
         Never empty: one dict with ``error`` (cannot resolve) or ``info``
         (no results) replaces the results.  Check both keys first.

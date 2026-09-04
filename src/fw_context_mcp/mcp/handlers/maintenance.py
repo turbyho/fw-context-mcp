@@ -416,6 +416,11 @@ def get_active_build(
         indexed_at),
         vendor_paths (list[str] — config index.vendor_paths),
         project_paths (list[str] — config index.project_paths),
+        effective_vendor_patterns (list[str] — the SQL LIKE patterns that
+        this build really used to mark vendor code, for example
+        ``["mbed-os/%"]``; empty when the manifest cannot be read.  The two
+        lists above hold what the config asks for, this one what the index
+        did),
         bg_reindex_running (bool),
         reindex_progress (str or None — last log line when reindex is running),
         schema_version (int — DB schema version),
@@ -2119,6 +2124,8 @@ def check_ollama(
         "not_configured"|"model_missing"|"embedding_unavailable"|"error"),
         ollama_running (bool), ollama_url (str), configured_model (str),
         num_ctx (int), installed_models (list[str]),
+        chat_api (dict — ``{configured (bool), model (str)}``: whether an
+        external chat API replaces Ollama, and the model it names),
         configured_embed_model (str), embedding_installed (bool),
         message (str, on error/disabled), model_details (list[dict], when
         Ollama running), suggest_cloud (bool), vec_available (bool),
