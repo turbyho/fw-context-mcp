@@ -207,7 +207,9 @@ def _build_filtered_file_content(
     the manifest update phase to avoid a second tokenization pass.
 
     Inactive lines are replaced with ``\\n`` so line numbers stay
-    consistent with the original source.
+    consistent with the original source.  The text spans the whole file:
+    the lines after the last active one are blank, and not absent, thus
+    ``len(content.splitlines())`` is the length of the file.
 
     Files inside *project_root* are stored with a relative path; files
     outside (framework headers from PlatformIO, ESP-IDF, Zephyr modules)
@@ -400,10 +402,21 @@ def _build_filtered_file_content(
         if not original:
             continue
 
-        # Replace inactive lines with \n to preserve line numbers
-        max_line = max(active_lines)
+        # Replace inactive lines with \n to keep the line numbers.
+        #
+        # The range covers the whole file, and not only the lines up to the
+        # last active one.  A conditional directive carries no token, thus
+        # the `#endif` of an include guard is never an active line — and it
+        # is the last line of almost every header.  A range that stopped at
+        # max(active_lines) cut that tail off: measured on a 115-line
+        # header, `read_file` stored 113 lines and then reported 113 as the
+        # length of the file.  The same column backs `search_content`, so a
+        # pattern in the tail was also unreachable.
+        #
+        # The cost is one byte for each line after the last active one, thus
+        # a few bytes for each header.
         filtered = [
-            original[i - 1] if (i in active_lines) else "\n" for i in range(1, min(len(original), max_line) + 1)
+            original[i - 1] if (i in active_lines) else "\n" for i in range(1, len(original) + 1)
         ]
         content = "".join(filtered)
 

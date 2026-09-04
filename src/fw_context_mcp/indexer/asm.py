@@ -190,10 +190,19 @@ def filtered_content(path: str, active_lines: set[int]) -> str | None:
     if not original:
         return None
 
-    last = max(active_lines) if active_lines else 0
+    # The range covers the whole file, for the reason the C path in
+    # `ops._build_filtered_file_content` gives: the preprocessor emits no
+    # line for a directive, thus a range that stopped at the last active
+    # line cut off the tail of every file that ends with `#endif`, and the
+    # stored length of the file with it.
+    #
+    # An empty *active_lines* gives a file of blank lines.  The caller
+    # cannot send one — a file enters ``AsmSource.active`` only when it
+    # gives at least one line — and blank lines are the correct answer for
+    # a file that the preprocessor dropped completely.
     return "".join(
         original[i - 1] if i in active_lines else "\n"
-        for i in range(1, min(len(original), last) + 1)
+        for i in range(1, len(original) + 1)
     )
 
 
