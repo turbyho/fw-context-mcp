@@ -545,9 +545,9 @@ mcp = FastMCP(
         "TOOL SELECTION (pick the right one):\n"
         '• Symbol by exact/prefix name _____ → lookup_symbol (e.g. "uart_", "main")\n'
         '• Symbols by concept/topic _________ → search_code (e.g. "interrupt handler")\n'
-        '• Patterns in the CODE of a definition → search_bodies (e.g. "attach", "BATT_TEST")\n'
-        '• Preprocessor / file-scope text ____ → search_content (e.g. "extern C", "#define")\n'
-        "• Read a complete file ______________ → read_file\n"
+        '• WHICH DEFINITION holds the code ___ → search_bodies (e.g. "attach", "SELF_TEST")\n'
+        '• WHICH FILES a topic touches ______ → search_content (e.g. "extern C", "SELF_TEST")\n'
+        "• Read a file, or a window of it ____ → read_file (line_numbers, start_line, end_line)\n"
         "• Read function body + callers/callees → get_symbol_context (preferred) / get_source\n"
         "• Function pointer assignments/calls _ → find_indirect_call_sites / find_indirect_targets\n"
         "• Natural-language question ________ → smart_search (slow, thorough)\n\n"
@@ -558,40 +558,67 @@ mcp = FastMCP(
         "initializer.  An enum constant, a bit field, a member declaration such\n"
         "as `InterruptIn _pin;` are all inside search_bodies.\n"
         "A match on a type answers with the type: a query for one enum constant\n"
-        "returns the enum, and `_match_lines` gives the line of the constant.\n"
-        "Only text that belongs to NO definition is out of reach — #define,\n"
+        "returns the enum, and `match_lines` gives the line of the constant.\n"
+        "Only the TEXT matches: a hit in the name, the signature or the\n"
+        "`llm_analysis` of a symbol is not a hit here — that is search_code.\n"
+        "Text that belongs to NO definition is out of reach — #define,\n"
         '#include, #ifdef, extern "C", and a file-scope comment.  Use\n'
         "search_content for those.\n\n"
+        "search_content is the COMPLEMENT of search_bodies, not its fallback.\n"
+        "search_bodies answers which definition and takes the query literally;\n"
+        "search_content answers which files and widens the query.  Measured:\n"
+        "`SELF_TEST` gave 6 files there and 5 definitions here, the extra file\n"
+        "holding the comment `Self tester`.  For a feature footprint, run both.\n\n"
         "CITE FROM THE RIGHT FIELD:\n"
-        "• search_bodies → `_match_lines` holds the lines of the matches.  `line`\n"
-        "  is where the DEFINITION starts, which in a long function is hundreds\n"
-        "  of lines away from the match.  Never cite `line` for a statement.\n"
+        "• search_bodies / search_content → `match_lines` holds the lines of the\n"
+        "  matches.  In search_bodies, `line` is where the DEFINITION starts,\n"
+        "  which in a long function is hundreds of lines away from the match.\n"
+        "  Never cite `line` for a statement.\n"
         "• get_source / get_file_map → `line` and `end_line` are the extent of\n"
         "  the symbol.  Cite `file:line-end_line`.  Do not count lines yourself.\n"
-        "• get_source is the ONLY tool that numbers its text: every line of its\n"
-        "  `source` starts with the line number.  The `source` of search_bodies\n"
-        "  and the `content` of read_file are BARE — never count lines there.\n"
-        "These three cover the statement-level anchor.  Do not leave fw-context\n"
-        "for a text search to find a line number.\n\n"
+        "• read_file → pass line_numbers=True, or read a window with start_line\n"
+        "  and end_line.  Its bare `content` must never be counted.\n"
+        "• A field with NO leading underscore is an answer to cite.  An\n"
+        "  `_`-prefixed one (`_match_snippet`, `_fallback`) says where it\n"
+        "  came from.\n"
+        "Do not leave fw-context for a text search to find a line number.\n\n"
+        "READ THE RESULT YOU ALREADY HAVE — measured on one session, 4 of 12\n"
+        "calls asked again for what the payload already carried.\n"
+        "1. Before calling anything for a `path:line`, re-read the last result:\n"
+        "   `match_lines` and `file` are usually already there.\n"
+        "2. Never repeat one query with a filter added.  Write `kind` in the\n"
+        "   first call, or read `kind` on each result.\n"
+        '3. Never invent a symbol name because "it should be called that".\n'
+        "   Take the name from a result.  A guess costs a whole call.\n"
+        "4. A caller is find_callers, never a comment that reads like one.\n\n"
         "UNTRUSTED FIELD — `llm_analysis` ({summary, inputs, outputs}) is written\n"
         "by a model, not by the code.  It is a hint that points you at a symbol.\n"
         "NEVER quote it as fact: one measured summary called an identifier\n"
-        '"possibly related to battery status", which was a guess from its name.\n'
+        '"possibly related to sensor status", which was a guess from its name.\n'
         "Quote `source`, `signature`, or `docstring` instead.\n\n"
-        "FTS5 QUERY TIPS:\n"
-        '• Multi-word queries are OR-joined: "attach callback" becomes attach* OR callback*\n'
-        "  (matches functions containing EITHER word, not both).\n"
-        '• Prefer SINGLE-WORD queries for broad matching: "attach" not "attach callback".\n'
-        "• For exact phrases use double quotes: '\"interrupt handler\"'.\n"
-        '• Underscores are word separators: "modem_init" → modem AND init.\n'
-        '  Write "modem init" instead.\n\n'
-        "EMPTY RESULT STRATEGY — if a fw-context tool returns nothing:\n"
+        "HOW EACH TOOL READS YOUR QUERY:\n"
+        "• search_code, search_content — every bare term gets a trailing `*` and\n"
+        '  the terms are OR-joined: "modem init" → modem* OR init*, thus a symbol\n'
+        "  with EITHER word matches.  Prefer single words.\n"
+        "• search_bodies — the query goes to FTS5 as you wrote it.  A space is an\n"
+        "  AND of two exact tokens and NO wildcard is added: `SELF_TEST` misses\n"
+        "  `Self tester`, `SELF_TEST*` finds it.  Add the `*` yourself.\n"
+        "• Punctuation is not searchable anywhere — FTS5 cannot parse `.attach(`,\n"
+        "  thus it is repaired into a phrase and what runs is the word `attach`.\n"
+        '  search_bodies marks such an answer (`_fallback: "sanitized"` +\n'
+        "  `_query_used`); the hits whose body really holds the pattern are the\n"
+        "  ones with `match_lines`.\n"
+        '• Underscores are word separators: "modem_init" asks for the two tokens\n'
+        '  next to each other and misses modem_parser_oob_init.  Write "modem init".\n'
+        "• For exact phrases use double quotes: '\"interrupt handler\"'.\n\n"
+        "EMPTY RESULT STRATEGY — an empty list means NO SUCH CODE.  A query FTS5\n"
+        "cannot parse comes back as a `warning` + `hint`, never as `[]`.\n"
         "1. Try a simpler/single-word query in the SAME tool first.\n"
-        "2. Switch to a DIFFERENT fw-context tool (search_bodies → search_code, etc.).\n"
+        "2. In search_bodies, add the `*` — that tool adds none.\n"
         "3. Use lookup_symbol for known symbol names.\n"
-        "4. If search_bodies returns empty, switch to search_content — it covers\n"
-        '   the preprocessor (#define, #ifdef) and extern "C", which belong to no\n'
-        "   definition and thus reach no symbol body.\n"
+        "4. If search_bodies returns empty, switch to search_content — it widens\n"
+        '   the query and covers the preprocessor (#define, #ifdef) and extern "C",\n'
+        "   which belong to no definition and thus reach no symbol body.\n"
         "5. find_callers empty → callers exist through member-field accesses\n"
         "   (obj.method()) or base-class pointers. Fall back to\n"
         '   search_bodies("function_name") which text-searches function bodies\n'

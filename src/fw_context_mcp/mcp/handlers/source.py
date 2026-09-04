@@ -1319,9 +1319,51 @@ def get_symbol_context(
 
 # ── moved from server.py ──
 
+# Least width of the line-number prefix.  Four columns keep a short file
+# aligned with the body that ``get_source`` prints, and a longer file widens
+# the column — a fixed "%4d" loses the alignment above 9999 lines, and an
+# embedded project reaches that in generated and vendor headers.
+_LINE_NUMBER_MIN_WIDTH = 4
+
+
+def _shape_file_lines(
+    lines_list: list[str], start_line: int, end_line: int, line_numbers: bool,
+) -> tuple[str, int, int] | str:
+    """Cut *lines_list* to a range and number it, or say what is wrong.
+
+    Returns ``(text, first_line, last_line)``, or an error message when the
+    range makes no sense.  Both bounds are 1-based and inclusive, and 0 on
+    either means "no bound on this side" — the caller that passes neither
+    gets the whole file, which is what every caller before the range
+    parameters got.
+
+    WHY the numbers are optional and not always there: the text of this tool
+    is read by a machine that also compares it with a patch or a diff, and a
+    prefix would have to be stripped first.  The caller that needs to cite a
+    line asks for the numbers; the caller that needs the code does not.
+    """
+    total = len(lines_list)
+    if start_line < 0 or end_line < 0:
+        return "start_line and end_line must not be negative."
+    if start_line and end_line and end_line < start_line:
+        return f"end_line ({end_line}) is before start_line ({start_line})."
+    if start_line > total:
+        return f"start_line ({start_line}) is past the end of the file ({total} lines)."
+    first = start_line or 1
+    last = min(end_line or total, total)
+    window = lines_list[first - 1:last]
+    if line_numbers:
+        width = max(_LINE_NUMBER_MIN_WIDTH, len(str(last)))
+        window = [f"{first + i:>{width}}  {text}" for i, text in enumerate(window)]
+    return "\n".join(window), first, last
+
+
 def read_file(
     file_path: Annotated[str, Field(description="Path to source file — relative to project root or just filename.")],
     project_root: Annotated[str | None, Field(description="Project root. Auto-detected if omitted.")] = None,
+    line_numbers: Annotated[bool, Field(description="Prefix every line with its line number, like get_source. Default False (bare text).")] = False,
+    start_line: Annotated[int, Field(description="First line to return, 1-based inclusive. 0 = from the start of the file.")] = 0,
+    end_line: Annotated[int, Field(description="Last line to return, 1-based inclusive. 0 = to the end of the file.")] = 0,
     variant: Annotated[str | None, Field(description="Build variant name (multi-project). Omit to use default_variant or fail-closed. Use '*' for all variants.")] = None,
     image: Annotated[str | None, Field(description="Sysbuild image name within the variant (multi-project). Omit for all images of the variant.")] = None,
 ) -> dict:
@@ -1337,11 +1379,17 @@ def read_file(
     the original file — inactive branches appear as blank lines, and the
     text spans the whole file, thus ``lines`` is the length of the file.
 
-    ``content`` is bare text and carries NO line-number prefix — unlike
-    the ``source`` of ``get_source``, which numbers every line.  To cite
-    ``file:line``, take the number from ``get_file_map``, ``get_source``,
-    or the ``_match_lines`` of ``search_bodies`` — never by counting the
-    lines here.
+    ``content`` is bare text by default and carries NO line-number prefix —
+    unlike the ``source`` of ``get_source``, which numbers every line.
+    Never count the lines here to find a number.  Take it from a field
+    instead: the ``match_lines`` of ``search_bodies`` or ``search_content``,
+    the ``line`` / ``end_line`` of ``get_source`` and ``get_file_map``, or
+    pass ``line_numbers=True`` and read the number off the line.
+
+    ``start_line`` and ``end_line`` cut a window out of the file (1-based,
+    both ends inclusive, 0 = no bound on that side).  Reading around a
+    known line costs a fraction of the whole file — 40 lines around a match
+    instead of 2000 lines of a header.
 
     An include guard is a blank line: ``#ifndef`` and ``#endif`` are
     conditional directives, which carry no token and thus never count as
@@ -1362,20 +1410,30 @@ def read_file(
         file_path: Path relative to project root, or just the filename.
             E.g. ``src/main.cpp`` or ``main.cpp``.
         project_root: Project root. Auto-detected if omitted.
+        line_numbers: Prefix every line with its number, right-aligned and
+            followed by two spaces, as ``get_source`` does. Default False.
+        start_line: First line to return, 1-based inclusive. 0 = file start.
+        end_line: Last line to return, 1-based inclusive. 0 = file end.
         variant: Build variant (multi-project). Omit for the default
             variant, ``"*"`` for all.
         image: Sysbuild image in the variant. Omit for all images.
 
     Returns:
         dict: {file (str), language (str — ``"c"`` or ``"cpp"``),
-        mtime (float), lines (int — total line count, equal to the length
-        of the file on disk),
-        content (str — the complete ifdef-filtered file text, with no
-        line-number prefix),
+        mtime (float), lines (int — total line count of the WHOLE file,
+        whatever range was asked for),
+        content (str — the ifdef-filtered text, bare unless
+        ``line_numbers`` was set),
         warning (str, optional — when reading from raw disk instead of
         indexed content)}.
 
-        On failure the dict holds only ``error`` with the reason.
+        A range adds ``start_line`` and ``end_line`` — the first and last
+        line the ``content`` really holds, after the end was clamped to the
+        length of the file.
+
+        On failure the dict holds only ``error`` with the reason: a
+        negative bound, an ``end_line`` before ``start_line``, or a
+        ``start_line`` past the end of the file.
     """
     try:
         db = BaseHandler.resolve_db_context(project_root, variant=variant, image=image)
@@ -1441,9 +1499,6 @@ def read_file(
         # Normal path: ifdef-filtered content is available from the index.
         # This is the preferred code path — inactive #ifdef branches are
         # already stripped, line numbers are preserved as blank lines.
-        lines_list = content.splitlines()
-        result["lines"] = len(lines_list)
-        result["content"] = content
         if _file_differs(result["file"], row["mtime"] or 0.0, row["source_hash"] or ""):
             # The content comes from the index, thus a changed file makes it
             # a copy of an older state.  The disk path below does not need
@@ -1460,11 +1515,28 @@ def read_file(
         disk_lines = read_file_lines(abs_path(root, resolved))
         if disk_lines is None:
             return {"error": f"Could not read file: {abs_path(root, resolved)}"}
-        result["lines"] = len(disk_lines)
-        result["content"] = "".join(disk_lines)
+        content = "".join(disk_lines)
         result["warning"] = (
             "Raw disk content — ifdef-filtered content not available. "
             "Run 'fw-context index' to populate build-accurate content."
         )
 
+    # Both paths end here: `lines` stays the length of the whole file, and
+    # the range only decides how much of it travels to the caller.
+    lines_list = content.splitlines()
+    result["lines"] = len(lines_list)
+    if not (start_line or end_line or line_numbers):
+        # The whole file, bare: hand over the stored text itself.  Rebuilding
+        # it from the split would drop the closing newline, and a caller that
+        # compares the text with the file would see a difference that is not
+        # there.
+        result["content"] = content
+        return result
+    shaped = _shape_file_lines(lines_list, start_line, end_line, line_numbers)
+    if isinstance(shaped, str):
+        return {"error": shaped}
+    result["content"], first, last = shaped
+    if start_line or end_line:
+        result["start_line"] = first
+        result["end_line"] = last
     return result

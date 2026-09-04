@@ -25,10 +25,10 @@ class TestQueryTerms:
     """The terms must come from the operator's query, not from FTS5 syntax."""
 
     def test_plain_words_pass_through(self) -> None:
-        assert _body_query_terms("batt test") == ["batt", "test"]
+        assert _body_query_terms("self test") == ["self", "test"]
 
     def test_case_is_folded(self) -> None:
-        assert _body_query_terms("BATT_TEST") == ["batt_test"]
+        assert _body_query_terms("SELF_TEST") == ["self_test"]
 
     def test_trailing_wildcard_is_dropped(self) -> None:
         # `attach*` is FTS5 syntax; the star never appears in source text.
@@ -54,16 +54,16 @@ class TestMatchLines:
             "void handler(void)\n"   # 1636
             "{\n"                    # 1637
             "    prepare();\n"       # 1638
-            "    case BATT_TEST:\n"  # 1639
+            "    case SELF_TEST:\n"  # 1639
             "}\n"                    # 1640
         )
-        assert _body_match_lines(source, 1636, ["batt_test"]) == [1639]
+        assert _body_match_lines(source, 1636, ["self_test"]) == [1639]
 
     def test_underscore_query_matches_a_longer_identifier(self) -> None:
-        # FTS5 splits on the underscore, thus a query for `batt test` must
-        # reach `_is_batt_test`.  The substring test does that.
-        source = "struct Flags\n{\n    uint32_t _is_batt_test:1;\n};\n"
-        assert _body_match_lines(source, 369, ["batt", "test"]) == [371]
+        # FTS5 splits on the underscore, thus a query for `self test` must
+        # reach `_is_self_test`.  The substring test does that.
+        source = "struct Flags\n{\n    uint32_t _is_self_test:1;\n};\n"
+        assert _body_match_lines(source, 369, ["self", "test"]) == [371]
 
     def test_every_matching_line_is_reported(self) -> None:
         source = "a attach\nb\nc attach\n"

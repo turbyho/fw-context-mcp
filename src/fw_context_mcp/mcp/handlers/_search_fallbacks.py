@@ -41,16 +41,24 @@ def _search_code_fts5_kind(
 
     Returns ``(rows, method_name)`` on success, ``None`` when no
     results are found.
+
+    WHY ``exclude_variables=True``: FTS5 indexes the qualified name, thus a
+    local variable matches through the name of the function that holds it —
+    a search for ``sensor`` answered with ``V``, ``ret`` and ``tmp_value``
+    from inside ``read_sensor_value``, 4 of 20 results on one measured
+    query.  A local is never the answer to "which symbol is about X".
+    ``search_symbols`` gives an explicit *kind* precedence over this filter,
+    thus ``search_code(..., kind="varlocal")`` still reaches them.
     """
     rows = search_symbols(
         c, query, config_hash, limit=limit, kind=kind,
-        exclude_variables=False, project_only=project_only,
+        exclude_variables=True, project_only=project_only,
     )
     method = "fts5+kind"
     if not rows and kind:
         rows = search_symbols(
             c, query, config_hash, limit=limit, kind=None,
-            exclude_variables=False, project_only=project_only,
+            exclude_variables=True, project_only=project_only,
         )
         if rows:
             method = "fts5"

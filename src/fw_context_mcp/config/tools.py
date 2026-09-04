@@ -50,12 +50,12 @@ file-reading tool:
 |---|---|---|
 | Find symbol by name | `lookup_symbol` | `"uart_"`, `"HardFault_Handler"` |
 | Search by concept/topic | `search_code` | `"interrupt handler"` |
-| Search the code of any definition | `search_bodies` | `"attach"`, `"BATT_TEST"` |
-| Search preprocessor / file scope | `search_content` | `"extern C"`, `"#define"` |
+| Which definition holds the code | `search_bodies` | `"attach"`, `"SELF_TEST"` |
+| Which files a topic touches | `search_content` | `"extern C"`, `"SELF_TEST"` |
 | Natural-language query | `smart_search` | `"how does the modem connect?"` |
-| Read function body | `get_source` | function name |
-| Body + callers + callees | `get_symbol_context` | function name |
-| Read complete file | `read_file` | `"main.cpp"` |
+| Body + callers + callees | `get_symbol_context` | function name — prefer this |
+| Body only | `get_source` | function name |
+| Read a file, or a range of it | `read_file` | `"main.cpp"`, `start_line=60` |
 | File structure overview | `get_file_map` | `"main.cpp"` |
 | Check index health | `get_active_build` | — always call first |
 
@@ -111,26 +111,76 @@ never skip `get_active_build`.
 method body, and also the body of a class, struct, union, enum or
 namespace, and a global with a multi-line initializer. An enum constant,
 a bit field, and a member declaration such as `InterruptIn _pin;` are all
-inside it. A match on a type answers with the type, and `_match_lines`
+inside it. A match on a type answers with the type, and `match_lines`
 gives the line of the match itself.
 
-Only text that belongs to no definition is out of reach — `#define`,
+Only the TEXT matches: a hit in the name, the signature or the
+`llm_analysis` of a symbol is not a hit here — that is `search_code`.
+
+Text that belongs to no definition is out of reach — `#define`,
 `#include`, `#ifdef`, `extern "C"`, a file-scope comment. Use
 `search_content` for those.
 
+### search_content is the complement, not the fallback
+
+The two answer different questions and reach different text:
+
+- `search_bodies` — WHICH DEFINITION holds the pattern. Takes the query
+  literally, thus it is the precise one.
+- `search_content` — WHICH FILES the topic touches. Widens the query
+  (see below), thus it reaches text the literal query misses. Measured:
+  `SELF_TEST` gave 6 files here and 5 definitions through `search_bodies`,
+  the extra file holding the comment `Self tester`.
+
+For the footprint of one feature, run both.
+
+### How each tool reads your query
+
+- `search_code`, `search_content` — every bare term gets a trailing `*`
+  and the terms are OR-joined: `modem init` → `modem* OR init*`, thus a
+  symbol with EITHER word matches. Prefer single words.
+- `search_bodies` — the query goes to FTS5 as you wrote it. A space is an
+  AND of two exact tokens, and NO wildcard is added: `SELF_TEST` misses
+  `Self tester`, and `SELF_TEST*` finds it. Add the `*` yourself.
+- Every tool: punctuation is not searchable. FTS5 cannot parse `.attach(`,
+  thus it is repaired into a phrase and what runs is the word `attach`.
+  `search_bodies` marks such an answer (`_fallback: "sanitized"` +
+  `_query_used`); the hits whose body really holds the pattern are the
+  ones with `match_lines`.
+- Every tool: an underscore separates words. `modem_init` asks for the two
+  tokens next to each other and misses `modem_parser_oob_init`. Write
+  `modem init` to reach it.
+- An exact phrase is `'"interrupt handler"'` in every tool.
+
 ### Where a line number comes from
 
-- `search_bodies` → `_match_lines`, the lines of the matches. `line` is
-  the first line of the DEFINITION, far from the match in a long
-  function. Never cite `line` for a statement.
+- `search_bodies`, `search_content` → `match_lines`, the lines of the
+  matches. In `search_bodies`, `line` is the first line of the DEFINITION,
+  far from the match in a long function. Never cite `line` for a statement.
 - `get_source` / `get_file_map` → `line` and `end_line` are the extent.
   Cite `file:line-end_line`.
-- `get_source` is the ONLY tool that numbers its text — every line of its
-  `source` starts with the line number. The `source` of `search_bodies`
-  and the `content` of `read_file` are BARE. Never count lines there.
+- `read_file` → pass `line_numbers=True`, or read a window with
+  `start_line` / `end_line`. Never count the lines of a bare `content`.
+- A field with NO leading underscore is an answer to cite. An `_`-prefixed
+  field (`_match_snippet`, `_fallback`, `_source_truncated`) says where the
+  answer came from.
 
 These cover the statement-level anchor. Do not leave fw-context for a
 text search to find a line number.
+
+### Read the result you already have
+
+Measured on one session: 4 of 12 calls asked again for something the
+payload already carried.
+
+1. Before you call anything for a `path:line`, re-read the last result.
+   `match_lines` and `file` are usually already there.
+2. Never repeat one query with a filter added. Write `kind` in the first
+   call, or read `kind` on each result — the unfiltered answer already
+   holds the filtered one.
+3. Never invent a symbol name because "it should be called that".
+   Take the name from a result. A guess costs a whole call.
+4. A caller is `find_callers`, never a comment that reads like one.
 
 ### llm_analysis is not evidence
 
@@ -138,17 +188,14 @@ text search to find a line number.
 by the code. Use it to find a symbol. Never quote it as fact. Quote
 `source`, `signature`, or `docstring`.
 
-### FTS5 query tips
-- Multi-word bare queries are OR-joined — prefer single words.
-- For exact phrases use double quotes: `'"interrupt handler"'`.
-- Underscores are word separators — write `"modem init"`, not `"modem_init"`.
-
 ### Empty result playbook
+An empty list means "no such code" — a query FTS5 cannot parse comes back
+as a `warning` + `hint` instead, thus `[]` is an answer, not a failure.
 1. Simplify to a single-word query in the same tool.
-2. Switch tools — search_bodies → search_code, or search_content → search_bodies.
-3. Use `lookup_symbol` for known names.
-4. search_bodies empty → switch to search_content (covers the
-   preprocessor and extern "C", which belong to no definition).
+2. In `search_bodies`, add the `*` — the tool adds none.
+3. Switch tools — search_bodies → search_content (wider query, and it
+   covers the preprocessor and extern "C", which belong to no definition).
+4. Use `lookup_symbol` for known names.
 5. Only AFTER exhausting all fw-context tools — use other tools.
 
 ### Agent loop

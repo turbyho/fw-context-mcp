@@ -37,11 +37,13 @@ Input parameter analysis from LLMs (weight 5.0) provides structured
 data.  Qualified names are de-weighted (0.75) to prevent double-
 counting tokens already present in the unqualified name.
 
-**Sanitization** — ``_sanitize_fts5_syntax`` repairs queries that
-contain characters illegal in FTS5 (``#define``, backslashes from
-copy-pasted string literals).  Rather than rejecting them, the layer
-strips backslashes and quote-marks, then double-quotes tokens that
-still contain unsafe characters so they match as phrase terms.
+**Sanitization** — a term may hold only ``[A-Za-z0-9_]`` plus one
+trailing ``*`` to go to FTS5 bare; ``_fts5_safe_token`` puts anything
+else into a quoted phrase (``#define``, ``.attach(``, a backslash from
+a copy-pasted string literal).  ``_expand_token`` adds the prefix
+wildcard on top for the name and content searches, and
+``_sanitize_body_query`` leaves it out for the body search, which must
+stay as precise as the caller wrote it.
 
 Token decomposition
 ───────────────────
@@ -389,10 +391,20 @@ def find_macro_refs(
         return []
 
 
-# Characters that break FTS5 when they appear unquoted in a bare term.
-# The `unicode61` tokenizer treats these as separators/syntax, and FTS5's
-# query parser raises "fts5: syntax error" for e.g. `#define` or a backslash.
-_FTS5_UNSAFE_TERM_CHARS: frozenset[str] = frozenset('#\\[]{}^:+-')
+# A bare FTS5 term may hold only these characters, plus one trailing `*`.
+# Everything else — punctuation of C code included — must go into a quoted
+# phrase, else the FTS5 parser raises "fts5: syntax error".
+#
+# WHY a positive test and not a list of bad characters: the list was
+# `#\[]{}^:+-`, and it named neither `.` nor `(`.  A search for the call
+# pattern `.attach(` thus passed as a bare term, FTS5 rejected it, and every
+# search tool answered with an empty list — a false negative that reads as
+# "this code does not exist".  Measured on one project: `.attach(` gave 0
+# results and `attach` gave 18.  A whitelist cannot miss the next character.
+_RE_FTS5_SAFE_TERM = re.compile(r"^[A-Za-z0-9_]+\*?$")
+
+# FTS5 operators.  They are syntax, not text to look for.
+_FTS5_OPERATOR_TOKENS = frozenset({"AND", "OR", "NOT", "NEAR"})
 
 
 def _quote_fts5_term(term: str) -> str:
@@ -400,44 +412,105 @@ def _quote_fts5_term(term: str) -> str:
     return '"' + term.replace('"', '""') + '"'
 
 
+def _fts5_safe_token(token: str) -> str:
+    """Return *token* in a form FTS5 accepts, without widening its meaning.
+
+    A bareword stays as it is, an operator stays as it is, and anything else
+    becomes a quoted phrase.  A trailing ``*`` survives outside the quotes,
+    where FTS5 reads it as a prefix on the last token of the phrase
+    (``"self test"*``).
+
+    The quotes buy legality, not precision: the tokenizer drops punctuation
+    inside a phrase as well, thus ``".attach("`` looks for the token
+    ``attach``.  No FTS5 query can match a bracket — the caller sees which
+    hit is the call from ``match_lines`` and ``_match_snippet``.
+    """
+    if not token:
+        return token
+    if token in _FTS5_OPERATOR_TOKENS or _RE_FTS5_SAFE_TERM.match(token):
+        return token
+    if token.endswith("*"):
+        return _quote_fts5_term(token[:-1]) + "*"
+    return _quote_fts5_term(token)
+
+
+def _sanitize_body_query(query: str) -> str:
+    """Repair a body query that FTS5 refused, without widening it.
+
+    Call this only AFTER FTS5 has rejected the query as written.  Every
+    query the engine accepts must reach it untouched: ``search_bodies``
+    looks for a pattern in code, no wildcard is added, and a space stays an
+    implicit AND.
+
+    WHY the order matters, measured: a first version decided up front which
+    tokens looked like syntax and quoted the rest.  It could not tell
+    ``NEAR(attach rise)`` — an FTS5 operator — from ``.attach(`` — C code
+    with a bracket.  The NEAR query dropped from 6 results to 0, and
+    ``^attach``, which anchors a term to the start of a column, widened
+    from 23 to 106.  The engine itself is the only exact judge of what it
+    accepts, thus we ask it first and repair only what it turns down.
+
+    The repair puts every token that is not a bareword into a quoted
+    phrase.  A backslash goes first — it is never valid FTS5, and operators
+    paste escaped strings from other tools (``extern \\"C\\"``).  A query
+    that still holds a double quote is left as it is: an unbalanced quote
+    is not something quoting more can fix.
+    """
+    if "\\" in query:
+        log.debug("FTS5 sanitization: stripping backslashes from body query=%r", query)
+        query = query.replace("\\", "")
+    if '"' in query:
+        return query
+    return " ".join(_fts5_safe_token(tok) for tok in query.split())
+
+
 def _sanitize_fts5_syntax(query: str) -> str:
     """Repair a query containing characters that are illegal in FTS5 syntax.
 
     A backslash is never valid FTS5 syntax (e.g. ``"extern \\"C\\""`` from a
     user copying a quoted string).  Strip backslashes and stray quote marks,
-    then re-quote any remaining token that still contains unsafe characters
-    (e.g. ``#define``).  Safe tokens get the usual trailing-wildcard expansion.
+    then hand each token to :func:`_expand_token`, which quotes what FTS5
+    would reject (e.g. ``#define``) and gives a bareword the usual
+    trailing-wildcard expansion.
     """
     if "\\" in query:
         log.debug("FTS5 sanitization: stripping backslashes from query=%r", query)
     cleaned = query.replace("\\", "").replace('"', "")
-    parts = cleaned.split()
-    expanded: list[str] = []
-    for tok in parts:
-        if tok.endswith("*"):
-            expanded.append(tok)
-        elif any(ch in _FTS5_UNSAFE_TERM_CHARS for ch in tok):
-            expanded.append(_quote_fts5_term(tok.rstrip("*")))
-        else:
-            expanded.append(f"{tok}*")
-    return " OR ".join(expanded)
+    return " OR ".join(_expand_token(tok) for tok in cleaned.split())
+
+
+def _expand_token(token: str) -> str:
+    """Return *token* as a legal FTS5 term with prefix matching where it helps.
+
+    A bareword gets a trailing ``*`` so ``modem`` reaches ``modem_init``.  A
+    token that FTS5 would reject becomes a quoted phrase instead — a prefix
+    on punctuation buys nothing, because the tokenizer already dropped it.
+    """
+    if token in _FTS5_OPERATOR_TOKENS:
+        return token
+    if _RE_FTS5_SAFE_TERM.match(token):
+        return token if token.endswith("*") else f"{token}*"
+    return _fts5_safe_token(token)
 
 
 def _expand_query(query: str, *, for_body_search: bool = False) -> str:
     """Add trailing wildcard to each bare word for broader prefix matching.
 
-    Leaves existing wildcards (*) and FTS5 syntax (NEAR, ", parentheses,
+    Leaves existing wildcards (*) and FTS5 syntax (NEAR, ", the operators,
     column filters with ``name_tokens : term*``) intact.  Single colons in
     column-filter syntax are detected via regex; C++ ``::`` passes through
     so its tokens get wildcard expansion.
 
     Queries containing a backslash (never valid FTS5) are repaired via
-    :func:`_sanitize_fts5_syntax`.  Bare terms containing FTS5-unsafe
-    characters (``#define``, ``#ifdef``, ``user-defined``) are quoted as
-    phrases so they match instead of raising ``fts5: syntax error``.
+    :func:`_sanitize_fts5_syntax`.  A term that FTS5 cannot take as a
+    bareword (``#define``, ``.attach(``, ``user-defined``) becomes a quoted
+    phrase, thus it matches instead of raising ``fts5: syntax error``.
 
-    When *for_body_search* is True, the query is returned as-is — body
-    search patterns like ``.attach(`` should not be wildcard-expanded.
+    When *for_body_search* is True, no wildcard is added and the terms stay
+    AND-joined — ``search_bodies`` looks for a pattern in code, and a
+    prefix on every word would widen each query.  The caller must still
+    pass the result through :func:`_sanitize_body_query`, which repairs the
+    punctuation of a code pattern without widening it.
     """
     if for_body_search:
         return query
@@ -446,9 +519,24 @@ def _expand_query(query: str, *, for_body_search: bool = False) -> str:
     if "\\" in query:
         return _sanitize_fts5_syntax(query)
 
-    # Tokens that already are FTS5 syntax — don't touch them.
-    # Single colon (not part of ::) covers column-filter expressions like
-    _bare_syntax = ('"', "NEAR", "AND", "OR", "(", ")")
+    # Tokens that already are FTS5 syntax — don't touch them.  A single
+    # colon (not part of ::) marks a column filter, e.g. `name_tokens : uart*`.
+    #
+    # A parenthesis is NOT in this list, although FTS5 groups with one: C
+    # code holds far more brackets than a query holds groups, and while `(`
+    # counted as syntax, the query `.attach(` went to FTS5 raw, was rejected,
+    # and every search tool answered with an empty list.  A query that really
+    # groups carries an operator as well (`(uart OR spi) AND init`), and the
+    # operator keeps it on this path.
+    #
+    # What this costs, measured: `(connect write)` used to bypass expansion
+    # and reach FTS5 as an implicit AND of two exact tokens — 18 rows.  It
+    # is now expanded like any other pair of words, `connect* OR write*` —
+    # 2442 rows.  The bypass was an accident of the old rule, not a feature:
+    # the same words WITHOUT the brackets always expanded to OR, and FTS5
+    # reads `(a b)` and `a b` alike.  A caller who wants AND writes the
+    # operator, which is on the list above.
+    _bare_syntax = ('"', "NEAR", "AND", "OR")
     _has_col_filter = _RE_COL_FILTER.search(query)
     if any(c in query for c in _bare_syntax) or _has_col_filter:
         return query
@@ -459,15 +547,7 @@ def _expand_query(query: str, *, for_body_search: bool = False) -> str:
     # spaces and non-alphanumeric chars; replacing :: with space lets
     # each namespace/class-component become an independent search term.
     parts = query.replace("::", " ").split()
-    expanded = []
-    for p in parts:
-        if p.endswith("*"):
-            expanded.append(p)
-        elif any(ch in _FTS5_UNSAFE_TERM_CHARS for ch in p):
-            expanded.append(_quote_fts5_term(p))
-        else:
-            expanded.append(f"{p}*")
-    return " OR ".join(expanded)
+    return " OR ".join(_expand_token(p) for p in parts)
 
 
 def search_symbols(

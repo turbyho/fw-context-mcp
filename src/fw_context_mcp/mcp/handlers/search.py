@@ -44,6 +44,7 @@ from pydantic import Field
 from ...config import derive_project_id
 from ...config import load as load_config
 from ...indexer.db import _expand_query, get_active_config
+from ...indexer.db._symbols import _RE_COL_FILTER, _sanitize_body_query
 from ...llm._diag import check_setup
 from ...utils import abs_path, resolve_project_root
 from ..shared.context import _db_path, _is_stale, _quick_open_readonly
@@ -222,10 +223,17 @@ def search_code(
     docstring — not its implementation code.
 
     **FTS5 syntax:**
+    - Every bare term gets a trailing ``*`` and the terms are OR-joined:
+      ``modem init`` goes to FTS5 as ``modem* OR init*`` and answers with
+      the symbols that hold EITHER word.  ``search_bodies`` does the
+      opposite — it takes the query literally, where a space is an AND.
     - ``init*`` matches init, init_uart, initialize (trailing wildcard)
     - ``"spi init"`` matches the exact phrase "spi init"
     - Do NOT use underscore in queries — ``modem_init`` is split into
       ``modem AND init``. Write ``modem init`` instead.
+    - Punctuation is not searchable.  The tokenizer drops it, thus
+      ``.attach(`` becomes a phrase that looks for the token ``attach``.
+      The query is repaired, never rejected.
 
     **Progressive relaxation:** when FTS5 finds nothing, the search widens
     in up to six steps, and every result carries the ``_fallback`` method
@@ -247,13 +255,14 @@ def search_code(
     ``typedef``, ``varglobal``, ``varlocal``, ``variable``, ``field``,
     ``namespace``.
 
-    **Precision — a local variable matches through its parent.**  FTS5
-    indexes the qualified name, thus a query for ``battery`` also returns
-    ``V``, ``ret``, and ``tmp_value`` when they live inside
-    ``get_battery_voltage``: their qualified name holds the term, their own
-    name does not.  Measured on one project, 4 of 20 results for one query
-    were locals of a single function.  Pass ``kind`` to exclude them, or
-    read ``kind`` on each result before you act on it.
+    **Local variables are out.**  FTS5 indexes the qualified name, thus a
+    local matches through the function that holds it: a query for
+    ``sensor`` used to answer with ``V``, ``ret`` and ``tmp_value`` from
+    inside ``read_sensor_value``, 4 of 20 results on one measured query.
+    A local is never the answer to "which symbol is about X", thus
+    ``varlocal`` and the legacy ``variable`` kind are excluded.
+    ``varglobal`` stays — a global carries architectural weight.  Ask for
+    them explicitly with ``kind="varlocal"``, or use ``find_variables``.
 
     After ``fw-context index --analyze``, a result also holds
     ``llm_analysis`` — ``{summary, inputs, outputs}``.  A model wrote that
@@ -664,6 +673,67 @@ _MATCH_LINES_CAP = 20
 _FTS5_OPERATORS = frozenset({"and", "or", "not", "near"})
 
 
+# What SQLite says when its FTS5 query parser refuses the text.  The engine
+# names the module in some messages ("fts5: syntax error near ...") and not
+# in others ("unterminated string"), and both arrive as SQLITE_ERROR from a
+# statement whose SQL is a constant in this file — thus the query is the
+# only thing that can be wrong.
+_FTS5_QUERY_ERROR_MARKERS = ("fts5", "syntax error", "unterminated", "malformed match")
+
+
+def _is_fts5_query_error(exc: sqlite3.OperationalError) -> bool:
+    """Say whether *exc* means "the query text is bad", not "the DB is bad"."""
+    if getattr(exc, "sqlite_errorcode", 0) != 1:  # SQLITE_ERROR
+        return False
+    message = str(exc).lower()
+    return any(marker in message for marker in _FTS5_QUERY_ERROR_MARKERS)
+
+
+def _fts5_rejection(tool: str, query: str, exc: Exception) -> dict:
+    """Build the result element that reports a query FTS5 would not parse.
+
+    WHY this is not an empty list: an empty result reads as "this code does
+    not exist", and the caller then rewrites the question instead of the
+    query.  Measured before the sanitizer landed, ``search_bodies(".attach(")``
+    answered with ``[]`` while ``attach`` answered with 18 definitions — the
+    caller had no way to tell the two cases apart.
+    """
+    return {
+        "warning": f"{tool}: FTS5 rejected the query {query!r} ({exc}).",
+        "hint": (
+            "The punctuation of a code pattern is repaired on its own, thus "
+            "what is left is deliberate syntax: an unbalanced double quote, "
+            "or a bare operator (AND, OR, NOT, NEAR) with nothing to join. "
+            "Search one word, or write an explicit phrase: '\"self test\"'."
+        ),
+    }
+
+
+def _scoped_to_source(match_query: str) -> str:
+    """Bind *match_query* to the ``source`` column of ``symbols_fts``.
+
+    WHY: ``symbols_fts`` indexes ten columns — name, qualified_name,
+    signature, docstring, file_path, name_tokens, source, and the three
+    that hold ``llm_analysis`` (summary, inputs, outputs).  A bare MATCH
+    searches all of them, thus ``search_bodies`` answered with definitions
+    whose BODY never held the query.  Measured on one project, the query
+    ``sensor`` gave 36 results of which 22 matched only through the
+    summary that a model wrote — text the instructions call untrusted, and
+    which cannot be cited.  Those results also carried a ``_match_snippet``
+    with no match in it: the snippet is taken from the source column, which
+    is where the caller looks.
+
+    The caller who names a column keeps it: ``name_tokens : attach`` is an
+    explicit ask for another column, and wrapping it would intersect the
+    two into nothing.
+    """
+    if not match_query.strip():
+        return match_query
+    if _RE_COL_FILTER.search(match_query):
+        return match_query
+    return "{source} : (" + match_query + ")"
+
+
 def _body_query_terms(query: str) -> list[str]:
     """Reduce an FTS5 query to the plain terms to look for in a body.
 
@@ -671,8 +741,8 @@ def _body_query_terms(query: str) -> list[str]:
     expansion adds wildcards and operators, which never appear in source
     text.  Quotes and a trailing ``*`` go for the same reason.
 
-    Underscores stay.  FTS5 splits on them, thus a query for ``batt test``
-    must match ``_is_batt_test``.  A substring test for each term does that,
+    Underscores stay.  FTS5 splits on them, thus a query for ``self test``
+    must match ``_is_self_test``.  A substring test for each term does that,
     and it needs no second tokenizer here.
     """
     terms = []
@@ -738,15 +808,42 @@ def search_bodies(
       table with a multi-line initializer is found by its content.
 
     A match on a type reports the type as the result, thus a query for one
-    enum constant answers with the enum, and ``_match_lines`` gives the line
+    enum constant answers with the enum, and ``match_lines`` gives the line
     of the constant itself.
+
+    **Only the text matches.**  The query is bound to the stored body: a
+    hit in the NAME, the signature, the docstring or the ``llm_analysis``
+    of a symbol is not a hit here.  Measured on one project, ``sensor``
+    used to give 36 results of which 22 matched only through a summary that
+    a model wrote — untrusted text that cannot be cited, and a
+    ``_match_snippet`` with no match in it.  Use ``search_code`` to reach a
+    name or a concept.  A column filter you write yourself
+    (``summary : sensor``) overrides the binding.
 
     **When to use ``search_bodies`` and when ``search_code``:**
 
     - ``search_bodies`` — patterns in the code (what the code DOES or
-      DECLARES): ``batt test``, ``attach``, ``BATT_TEST``.
+      DECLARES): ``self test``, ``attach``, ``SELF_TEST``.
     - ``search_code`` — symbols by NAME (what the code IS): ``modem init``,
       ``interrupt handler``.
+
+    **The query goes to FTS5 as you wrote it.**  This tool alone adds no
+    wildcard, and that is what keeps a pattern precise:
+
+    - A space is an AND of two exact tokens, NOT an OR.  ``CommandType NUM``
+      answers with the definitions that hold both.
+    - No prefix is implied.  ``SELF_TEST`` matches the tokens ``self test``
+      and misses ``Self tester``; write ``SELF_TEST*`` to reach the second.
+      Measured on one project, the wildcard added the one caller that the
+      bare query missed.
+    - Punctuation is not searchable.  FTS5 cannot parse ``.attach(`` at
+      all, thus the query is repaired into the phrase ``".attach("`` — and
+      the tokenizer inside a phrase drops the punctuation too, so what runs
+      is the word ``attach``.  Such a result carries ``_fallback:
+      "sanitized"`` and ``_query_used``.  The hits whose body really holds
+      ``.attach(`` are the ones with ``match_lines``.
+    - ``search_code`` and ``search_content`` behave the OTHER way: each of
+      their terms gets a trailing ``*`` and the terms are OR-joined.
 
     **Limitation — the extent of a definition is the boundary.**  Text that
     belongs to no definition is out of reach:
@@ -766,19 +863,20 @@ def search_bodies(
 
     Results include ``_match_snippet`` — a highlighted excerpt that shows
     each match in context (e.g. ``_timeout.<b>attach</b>(callback(...))``) —
-    and ``_match_lines``, the line numbers of the matches inside the
+    and ``match_lines``, the line numbers of the matches inside the
     definition.  ``line`` is where the definition starts, which for a large
-    function is far from the match.  Cite from ``_match_lines`` instead.
+    function is far from the match.  Cite from ``match_lines`` instead.
     Project code sorts before vendor code in the output.
 
     Read-only. No side effects. Requires the FTS5 index.
 
     Args:
-        query: FTS5 search terms. 1-3 words. Bare multi-word queries are
-            OR-joined (each term prefixed with ``*``).  Prefer single-word
-            queries for broad matching: ``'attach'`` finds ``.attach(...)``
-            patterns including callback attachments, timer registrations, etc.
-            For exact phrases wrap in double quotes: ``'\"attach callback\"'``.
+        query: FTS5 search terms, 1-3 words.  A bare multi-word query is an
+            AND of exact tokens, and no wildcard is added — see the query
+            rules above.  A single word is the broadest form: ``'attach'``
+            reaches every ``.attach(...)`` pattern.  Add ``*`` for a prefix
+            (``'attach*'``), and double quotes for a phrase
+            (``'\"attach callback\"'``).
         project_root: Project root. Auto-detected if omitted.
         kind: Optional filter to return only symbols of this kind.
         limit: Maximum results (default 20, max 100).
@@ -796,20 +894,31 @@ def search_bodies(
 
         Also, when they carry an answer:
 
-        * ``_match_lines`` (list[int]) — absolute line numbers of the
+        * ``match_lines`` (list[int]) — absolute line numbers of the
           matches, up to 20.  Computed from the full text, thus a match
           after the cut below still has a number.  Use these to cite
-          ``file:line``, and not the ``line`` of the definition.
+          ``file:line``, and not the ``line`` of the definition.  The name
+          carries no leading underscore for a reason: a field the caller
+          must cite is an answer, while ``_``-prefixed fields
+          (``_match_snippet``, ``_fallback``, ``_source_truncated``) tell
+          where the answer came from.
         * ``_source_truncated`` (True) — ``source`` is cut.  A callable
           keeps 2000 characters, any other kind 500, because the body of a
           type is mostly members that the match has nothing to do with.
           ``get_source`` gives the whole text.
+        * ``_fallback`` (``"sanitized"``) with ``_query_used`` — FTS5 could
+          not parse the query as written, thus a repaired one ran.  The
+          repair drops punctuation, so the answer is wider than the text
+          that was asked for.  Every query FTS5 accepts runs untouched and
+          carries neither field.
 
         ``source`` here is bare text with no line-number prefix.  Only
         ``get_source`` numbers its lines.
 
         No match gives ``[]``.  A dict with ``error`` means the query
-        failed.  A stale index prepends a dict with ``warning`` + ``hint``.
+        failed.  A stale index prepends a dict with ``warning`` + ``hint``,
+        and so does a query that FTS5 refuses to parse — an empty list
+        always means "no such code", never "bad query".
     """
     root = resolve_project_root(project_root)
     # Enforce limit bounds at the function entry point (not inside _do_search)
@@ -821,15 +930,10 @@ def search_bodies(
     # closure again, and the terms depend only on the operator's query.
     terms = _body_query_terms(query)
 
+    # The body search keeps the query of the caller: no wildcard is added and
+    # a space stays an AND, thus a pattern stays as precise as it was written.
+    # A repair happens only when FTS5 turns the query down — see _do_search.
     expanded = _expand_query(query, for_body_search=True)
-    # Body search passes the query through unmodified — repair backslashes
-    # (never valid FTS5) so `"extern \"C\""`-style queries don't raise.
-    # Operators sometimes paste escaped strings from other tools; this
-    # sanitization prevents FTS5 syntax errors from propagated escapes.
-    if "\\" in expanded:
-        from ...indexer.db._symbols import _sanitize_fts5_syntax
-
-        expanded = _sanitize_fts5_syntax(expanded)
 
     def _do_search(c: sqlite3.Connection, config_hash: str) -> list[dict]:
         """Execute FTS5 search over the stored text of definitions.
@@ -839,7 +943,7 @@ def search_bodies(
         callable, a type, or a definition of data.  Each result includes a
         ``_match_snippet`` from SQLite's ``snippet()`` function for
         contextual highlighting with ``<b>`` tags around matches, and
-        ``_match_lines`` for the position that ``snippet()`` drops.
+        ``match_lines`` for the position that ``snippet()`` drops.
 
         **Sorting strategy — project-first:** When ``project_only=False``
         (default), results are sorted with project code first, then vendor
@@ -880,31 +984,46 @@ def search_bodies(
         """
         kind_filter = ""
         project_filter = ""
-        params: list = [expanded, config_hash]
         if kind:
             kind_filter = "AND s.kind = ?"
-            params.append(kind)
         if project_only:
             project_filter = "AND s.is_project = 1"
-        params.append(limit * 3 if not project_only else limit)
-
-        try:
-            rows = c.execute(
-                f"""SELECT s.*, snippet(symbols_fts, 9, '<b>', '</b>', '…', 60) AS _match_snippet
+        sql = f"""SELECT s.*, snippet(symbols_fts, 9, '<b>', '</b>', '…', 60) AS _match_snippet
                    FROM symbols_fts
                    JOIN symbols s ON s.id = symbols_fts.rowid
                    WHERE symbols_fts MATCH ? AND s.config_hash = ? AND s.is_definition = 1
                      AND s.source != '' {kind_filter} {project_filter}
                     ORDER BY rank
-                   LIMIT ?""",
-                params,
-            ).fetchall()
+                   LIMIT ?"""
+
+        def _params(match_query: str) -> list:
+            row_limit = limit if project_only else limit * 3
+            return [_scoped_to_source(match_query), config_hash,
+                    *([kind] if kind else []), row_limit]
+
+        repaired = ""
+        try:
+            rows = c.execute(sql, _params(expanded)).fetchall()
         except sqlite3.OperationalError as e:
-            if getattr(e, "sqlite_errorcode", 0) == 1 and "fts5" in str(e).lower():
-                log.warning("search_bodies: FTS5 syntax error (%s) — returning empty", e)
-                rows = []
-            else:
+            if not _is_fts5_query_error(e):
                 raise
+            # The query of the caller goes to FTS5 untouched, thus every
+            # query the engine accepts keeps its exact meaning — NEAR(),
+            # `^term`, a column filter.  Only what it turns down is
+            # repaired, and that is the punctuation of a code pattern
+            # (`.attach(`), which FTS5 cannot parse as a bare term.
+            repaired = _sanitize_body_query(expanded)
+            if repaired == expanded:
+                log.warning("search_bodies: FTS5 syntax error (%s)", e)
+                return [_fts5_rejection("search_bodies", query, e)]
+            log.debug("search_bodies: repaired %r → %r after (%s)", expanded, repaired, e)
+            try:
+                rows = c.execute(sql, _params(repaired)).fetchall()
+            except sqlite3.OperationalError as retry_error:
+                if not _is_fts5_query_error(retry_error):
+                    raise
+                log.warning("search_bodies: FTS5 syntax error after repair (%s)", retry_error)
+                return [_fts5_rejection("search_bodies", query, retry_error)]
 
         results = []
         for r in rows:
@@ -919,6 +1038,14 @@ def search_bodies(
                 "_match_snippet": r["_match_snippet"],
                 "_is_project": bool(r["is_project"]),
             }
+            if repaired:
+                # The caller wrote a pattern FTS5 could not parse.  Report the
+                # repaired form of the query — the punctuation is gone from it,
+                # thus the answer is wider than the text that was asked for.
+                # The binding to the source column is not shown: it holds for
+                # every call of this tool and says nothing about this one.
+                d["_fallback"] = "sanitized"
+                d["_query_used"] = repaired
             source = r["source"]
             if source:
                 cap = _SOURCE_CAP_CALLABLE if r["kind"] in _CALLABLE_KINDS else _SOURCE_CAP_TYPE
@@ -933,7 +1060,7 @@ def search_bodies(
                 # The lines come from the full body, thus a match after the
                 # cut above still gets a number.
                 if match_lines := _body_match_lines(source, r["line"], terms):
-                    d["_match_lines"] = match_lines
+                    d["match_lines"] = match_lines
             results.append(d)
 
         if project_only:
@@ -973,12 +1100,25 @@ def search_content(
     Covers the text that belongs to no definition, which is what
     ``search_bodies`` cannot see: ``#include``, ``#define``, ``#ifdef``,
     ``extern "C"``, and a comment or declaration at file scope.  It covers
-    the text of definitions too, but prefer ``search_bodies`` there — it
-    reports the symbol that holds the match and the line of the match
-    itself.  To find a symbol by NAME (``modem init``, ``interrupt
-    handler``), use ``search_code``.
+    the text of definitions too.  To find a symbol by NAME (``modem init``,
+    ``interrupt handler``), use ``search_code``.
 
-    Results are file-level — one entry per matching file.
+    **Not a fallback of ``search_bodies`` — its complement.**  The two
+    answer different questions and reach different text:
+
+    - ``search_bodies`` answers WHICH DEFINITION holds the pattern, and
+      takes the query literally (no wildcard, space = AND).
+    - ``search_content`` answers WHICH FILES the topic touches, and widens
+      the query: every term gets a trailing ``*`` and the terms are
+      OR-joined.  The wider query reaches text the literal one misses —
+      measured on one project, ``SELF_TEST`` found 6 files here and the
+      same word found 5 through ``search_bodies``, the extra file holding
+      the comment ``Self tester``.
+
+    For the footprint of one feature, run both.
+
+    Results are file-level — one entry per matching file, with
+    ``match_lines`` for the lines that hold a query term.
     ``project_only=True`` filters to ``is_project = 1`` files; the default
     False includes the vendor SDK files.
 
@@ -1003,14 +1143,31 @@ def search_content(
         list of dicts, each with: file, language, mtime,
         _match_snippet (highlighted excerpt around the match).
 
+        Also, when it carries an answer:
+
+        * ``match_lines`` (list[int]) — line numbers of the lines that hold
+          a query term, up to 20.  They are the line numbers of the file
+          itself: an inactive ``#ifdef`` branch is a blank line, thus the
+          count never shifts.  Cite ``file:line`` from here.
+
+          The field is absent when FTS5 matched a variant of the token that
+          the term is not a substring of — ``SELF_TEST`` matches the file
+          that writes ``Self tester``, and no line holds ``self_test``.
+          Read ``_match_snippet`` in that case.
+
         No match gives ``[]``.  A dict with ``error`` means the query
-        failed.  A stale index prepends a dict with ``warning`` + ``hint``.
+        failed.  A stale index prepends a dict with ``warning`` + ``hint``,
+        and so does a query that FTS5 refuses to parse — the answer then
+        comes from the LIKE path and carries ``_fallback: "like"``.
     """
     root = resolve_project_root(project_root)
     # Enforce limit bounds at the function entry point (not inside _do_search)
     # — same rationale as search_bodies: consistent bound across stale-recovery retries.
     limit = max(0, min(limit, 100))
     expanded = _expand_query(query)
+    # Computed once, outside the query closure: stale recovery can call the
+    # closure again, and the terms depend only on the query of the caller.
+    terms = _body_query_terms(query)
 
     def _do_search(c: sqlite3.Connection, config_hash: str) -> list[dict]:
         """Execute FTS5 search over complete ifdef-filtered file content.
@@ -1048,11 +1205,15 @@ def search_content(
 
         Returns:
             List of result dicts with file, language, mtime, _match_snippet,
-            and optionally _fallback.
+            and optionally match_lines and _fallback.  A query that FTS5
+            refuses heads the list with a warning dict.
         """
         project_filter = ""
         if project_only:
             project_filter = "AND f.is_project = 1"
+        # Set when FTS5 refuses the query below — it then heads the result
+        # list, so the caller reads "bad query" and not "no such code".
+        rejection: dict | None = None
 
         # Check whether the files_fts virtual table exists.
         # Legacy indexes created before file-content FTS5 indexing was added
@@ -1077,11 +1238,15 @@ def search_content(
                     (expanded, config_hash, limit * 3),
                 ).fetchall()
             except sqlite3.OperationalError as e:
-                # FTS5 syntax error on the query — fall back to LIKE.
+                # FTS5 syntax error on the query — fall back to LIKE, which
+                # reads the query as literal text and thus still answers.
                 # This handles edge cases where the expanded query produces
                 # FTS5-invalid syntax (e.g. unbalanced quotes, stray operators).
-                if getattr(e, "sqlite_errorcode", 0) == 1 and "fts5" in str(e).lower():
+                # The caller is told: the answer then comes from the slower
+                # path and matches text, not tokens.
+                if _is_fts5_query_error(e):
                     table_row = None
+                    rejection = _fts5_rejection("search_content", query, e)
                     log.warning(
                         "search_content: FTS5 syntax error (%s) — falling back to LIKE",
                         e,
@@ -1097,10 +1262,13 @@ def search_content(
             # Each query term is individually escaped (%, _, \) and wrapped
             # in %wildcards% for a substring match. This is slower than FTS5
             # (sequential scan) but works on legacy indexes.
-            terms = [t.strip() for t in query.replace("_", " ").split() if t.strip()]
-            if not terms:
-                return []
-            escaped_terms = [t.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") for t in terms]
+            # A separate name from the `terms` of the match-line scan above:
+            # an assignment here would make that name local to this closure
+            # and the FTS5 path would then read it before it is set.
+            like_terms = [t.strip() for t in query.replace("_", " ").split() if t.strip()]
+            if not like_terms:
+                return [rejection] if rejection else []
+            escaped_terms = [t.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") for t in like_terms]
             like_clauses = " AND ".join(["f.content LIKE ? ESCAPE '\\'" for _ in escaped_terms])
             like_params = [f"%{t}%" for t in escaped_terms]
             rows = c.execute(
@@ -1115,8 +1283,10 @@ def search_content(
                 (config_hash, *like_params, limit * 3),
             ).fetchall()
 
-        results = []
-        for r in rows:
+        results: list[dict] = [rejection] if rejection else []
+        # Sliced before the scan below: the query over-fetches 3×, and reading
+        # the text of a file that never reaches the caller is wasted work.
+        for r in rows[:limit]:
             d = {
                 "file": abs_path(root, r["path"]),
                 "language": r["language"],
@@ -1125,7 +1295,13 @@ def search_content(
             }
             if table_row is None:
                 d["_fallback"] = "like"
+            # The whole file text sits in the row, thus the line of each match
+            # can be given here.  Without it the caller had to read the file
+            # and count the lines, which the index forbids — an inactive
+            # #ifdef branch is a blank line, and a raw read shows it as code.
+            if match_lines := _body_match_lines(r["content"], 1, terms):
+                d["match_lines"] = match_lines
             results.append(d)
-        return results[:limit]
+        return results
 
     return _with_search_context(root, "search_content", _do_search, variant or "", image or "")

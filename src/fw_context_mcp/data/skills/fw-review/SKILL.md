@@ -190,8 +190,8 @@ Set `project_only=False` — vendor code MUST be searched.
 |---|---|
 | Known symbol by name | `lookup_symbol(exact=True)` |
 | Symbols by concept | `search_code` |
-| Patterns in the code of any definition | `search_bodies` — also class, struct, union, enum bodies. Cite `_match_lines`, not `line` |
-| Preprocessor and file-scope text | `search_content` |
+| Patterns in the code of any definition | `search_bodies` — also class, struct, union, enum bodies. Matches the BODY only, never a name or `llm_analysis`. Cite `match_lines`, not `line`. Query goes to FTS5 literally: space = AND, no wildcard added |
+| Which files a topic touches, preprocessor and file-scope text | `search_content` — widens the query (`term*`, OR-joined) and gives `match_lines` |
 | Natural language | `smart_search` (slow, uses Ollama) |
 | Full context (body+callers+callees) | `get_symbol_context(name)` — preferred over `get_source`+`find_callers` |
 | Who calls this? | `find_callers` → if empty: `search_bodies` |

@@ -34,7 +34,10 @@ def _insert_symbol(conn, config_hash: str, file_id: int, file_path: str, **kw):
         config_hash,
         file_id,
         file_path,
-        kw.get("name", ""),                     # name_tokens
+        # name_tokens: the real indexer splits the QUALIFIED name, thus a
+        # local carries the tokens of the function around it.  A test that
+        # needs that shape passes it; the default keeps the older callers.
+        kw.get("name_tokens", kw.get("name", "")),
         kw["usr"],
         kw["name"],
         kw.get("qualified_name", kw["name"]),
@@ -153,6 +156,76 @@ class TestExcludeVariables:
         names = {r["name"] for r in results}
         assert "g_config" in names, "varglobal should be visible"
         assert "old_var" not in names, "legacy 'variable' kind should also be excluded"
+
+
+class TestSearchCodeExcludesLocals:
+    """The topic search must not answer with the locals of one function.
+
+    FTS5 indexes the qualified name, thus ``read_sensor_value::ret``
+    carries the token ``sensor`` although the name of the symbol does not.
+    Measured on one query, 4 of 20 results were locals of a single function.
+    The handler used to pass ``exclude_variables=False`` while the docstring
+    of ``search_symbols`` said the topic tools pass True.
+    """
+
+    def _project(self, populated_db):
+        fid = upsert_file(populated_db, "hash-deadbeef", "/tmp/sensor.c", "c")
+        _insert_symbol(populated_db, "hash-deadbeef", fid, "src/sensor.c",
+                       usr="c:@F@read_sensor_value", name="read_sensor_value",
+                       kind="function", line=10)
+        _insert_symbol(populated_db, "hash-deadbeef", fid, "src/sensor.c",
+                       usr="c:@F@read_sensor_value@ret", name="ret",
+                       qualified_name="read_sensor_value::ret",
+                       name_tokens="get sensor voltage ret",
+                       kind="varlocal", line=12)
+        _insert_symbol(populated_db, "hash-deadbeef", fid, "src/sensor.c",
+                       usr="c:@g_sensor_state", name="g_sensor_state",
+                       kind="varglobal", line=3)
+        return fid
+
+    def test_the_fts5_path_drops_a_local(self, populated_db):
+        from pathlib import Path
+
+        from fw_context_mcp.mcp.handlers.search import _search_code_fts5_kind
+
+        self._project(populated_db)
+        rows, _method = _search_code_fts5_kind(
+            populated_db, "sensor", "hash-deadbeef", 50, None, False, Path("/tmp"),
+        )
+        names = {r["name"] for r in rows}
+
+        assert "read_sensor_value" in names
+        assert "g_sensor_state" in names, "a global carries architectural weight"
+        assert "ret" not in names, "a local is never the answer to a topic query"
+
+    def test_an_explicit_kind_still_reaches_them(self, populated_db):
+        """``kind`` is the caller saying exactly what it wants."""
+        from pathlib import Path
+
+        from fw_context_mcp.mcp.handlers.search import _search_code_fts5_kind
+
+        self._project(populated_db)
+        rows, _method = _search_code_fts5_kind(
+            populated_db, "sensor", "hash-deadbeef", 50, "varlocal", False, Path("/tmp"),
+        )
+
+        assert {r["name"] for r in rows} == {"ret"}
+
+    def test_the_name_tokens_fallback_drops_a_local_too(self, populated_db):
+        """The relaxation steps query ``symbols`` directly and had no filter."""
+        from pathlib import Path
+
+        from fw_context_mcp.mcp.handlers.search import _search_code_name_tokens
+
+        self._project(populated_db)
+        result = _search_code_name_tokens(
+            populated_db, "sensor", "hash-deadbeef", 50, None, False, Path("/tmp"),
+        )
+
+        assert result is not None
+        names = {r["name"] for r in result[0]}
+        assert "read_sensor_value" in names, "the tokens of the function match"
+        assert "ret" not in names, "and so do the tokens of its local — dropped"
 
 
 # ── Deduplicate short-name filter ───────────────────────────────────────────

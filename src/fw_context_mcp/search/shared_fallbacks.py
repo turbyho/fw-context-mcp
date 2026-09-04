@@ -95,7 +95,7 @@ def _symbol_row_to_dict(r: sqlite3.Row, root: Path, **extra) -> dict[str, Any]:
     # LLM analysis goes in a wrapper, and not next to `signature` and
     # `docstring`.  Those two come from the code.  These three come from a
     # model.  Measured on one project, a summary said that an identifier
-    # was "possibly related to battery status or level" — a guess from the
+    # was "possibly related to sensor status or level" — a guess from the
     # name of the identifier.  Flat keys put that text among indexed facts
     # with nothing to separate the two, and a reader cited it as code.
     #
@@ -128,10 +128,31 @@ def _fmt_symbol_rows(rows: list, root: Path, method: str) -> tuple[list[dict[str
 
 # ── Fallback strategies ──────────────────────────────────────────────────────
 
+# The kinds a topic search drops.  A local variable is indexed under the
+# qualified name of the function that holds it, thus `sensor` reaches the
+# `ret` of `read_sensor_value` although its own name says nothing.
+# `varglobal` is NOT here — a global name is a real search target.
+_LOW_SIGNAL_KINDS = ("variable", "varlocal")
+
+
+def _variable_filter(kind: str | None) -> str:
+    """SQL that drops the low-signal kinds, unless the caller asked for one.
+
+    The relaxation steps below do not apply the ``kind`` of the caller to
+    their rows, thus the filter cannot key on "a kind was given": with
+    ``kind="function"`` that would let a local back in through the very step
+    that ignores the kind.  Only an explicit ask for a variable kind turns
+    the filter off.
+    """
+    if kind in _LOW_SIGNAL_KINDS:
+        return ""
+    kinds = ", ".join(f"'{k}'" for k in _LOW_SIGNAL_KINDS)
+    return f"AND s.kind NOT IN ({kinds})"
+
 
 def _search_code_name_tokens(
     c: sqlite3.Connection, query: str, config_hash: str,
-    limit: int, _kind: str | None, project_only: bool,
+    limit: int, kind: str | None, project_only: bool,
     root: Path,
 ) -> tuple[list[dict[str, Any]], str] | None:
     """Token-based LIKE fallback — matches CamelCase/snake_case token splits.
@@ -141,6 +162,15 @@ def _search_code_name_tokens(
         or uses a different convention than the code.  Requiring N-1 matches
         (instead of all N) tolerates one bad term while still filtering
         noise — a single shared term is too weak a signal.
+
+    Why local variables drop out:
+        ``name_tokens`` holds the tokens of the qualified name, thus a local
+        carries the tokens of the function around it and matches every topic
+        query aimed at that function.  The filter stays on for every kind
+        but the variable kinds themselves — this step does not apply the
+        ``kind`` of the caller to its rows, thus keying the filter on "a
+        kind was given" would let a local back in through
+        ``kind="function"``.
     """
     terms = [t.lower() for t in query.split() if len(t) > 1]
     if not terms:
@@ -156,10 +186,11 @@ def _search_code_name_tokens(
         like_params.append(f"%{escaped}%")
     match_sum = " + ".join(like_cases)
     project_filter = "AND s.is_project = 1" if project_only else ""
+    variable_filter = _variable_filter(kind)
     rows = c.execute(
         f"""SELECT * FROM (
             SELECT s.*, ({match_sum}) AS _match_cnt FROM symbols s
-            WHERE s.config_hash = ? {project_filter}
+            WHERE s.config_hash = ? {project_filter} {variable_filter}
         ) sub WHERE sub._match_cnt >= ?
         ORDER BY sub.is_definition DESC, sub._match_cnt DESC, sub.line
         LIMIT ?""",
@@ -172,7 +203,7 @@ def _search_code_name_tokens(
 
 def _search_code_docstring(
     c: sqlite3.Connection, query: str, config_hash: str,
-    limit: int, _kind: str | None, project_only: bool,
+    limit: int, kind: str | None, project_only: bool,
     root: Path,
 ) -> tuple[list[dict[str, Any]], str] | None:
     """Single-term docstring LIKE fallback — only runs for 1-word queries.
@@ -194,9 +225,14 @@ def _search_code_docstring(
         return None
     escaped = terms[0].replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
     project_filter = "AND s.is_project = 1" if project_only else ""
+    # A local variable carries no docstring of its own worth reading; when
+    # it matches, the text belongs to the function around it.  Kept when the
+    # caller asked for a kind — see _search_code_name_tokens.
+    variable_filter = _variable_filter(kind)
     rows = c.execute(
         f"""SELECT s.* FROM symbols s
-           WHERE s.config_hash = ? {project_filter} AND s.docstring LIKE ? ESCAPE '\\'
+           WHERE s.config_hash = ? {project_filter} {variable_filter}
+             AND s.docstring LIKE ? ESCAPE '\\'
            ORDER BY s.is_definition DESC, s.line
            LIMIT ?""",
         (config_hash, f"%{escaped}%", limit),

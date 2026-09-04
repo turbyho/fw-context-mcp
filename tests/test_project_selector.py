@@ -448,8 +448,27 @@ def test_every_copy_of_the_instructions_states_the_scope_of_search_bodies():
 def test_every_copy_of_the_instructions_says_where_a_line_number_comes_from():
     """Without this the reader leaves fw-context for a text search."""
     for label, text in _instruction_copies():
-        assert "_match_lines" in text, label
+        assert "match_lines" in text, label
+        # The field carries no leading underscore: measured on one session,
+        # the reader skipped `_match_lines` as internal and then spent three
+        # calls deriving a line number it already held.
+        assert "_match_lines" not in text, label
         assert "end_line" in text, label
+
+
+def test_every_copy_of_the_instructions_gives_the_query_rule_per_tool():
+    """One rule for every tool was false and cost recall silently.
+
+    ``search_bodies`` sends the query to FTS5 as written — a space is an AND
+    and no wildcard is added — while ``search_code`` and ``search_content``
+    expand each term to ``term*`` and OR-join them.  Both copies used to
+    carry the OR rule alone, thus a reader wrote ``SELF_TEST`` for a body
+    search and never saw the definition that holds ``Self tester``.
+    """
+    for label, text in _instruction_copies():
+        assert "OR-joined" in text, label
+        assert "AND" in text, label
+        assert "SELF_TEST*" in text, label
 
 
 def test_every_copy_of_the_instructions_marks_the_llm_analysis_untrusted():

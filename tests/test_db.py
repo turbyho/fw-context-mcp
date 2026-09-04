@@ -490,8 +490,22 @@ class TestExpandQuery:
     def test_or_operator_bypassed(self):
         assert _expand_query("connect OR write") == "connect OR write"
 
-    def test_parentheses_bypassed(self):
-        assert _expand_query("(connect write)") == "(connect write)"
+    def test_grouping_with_an_operator_is_bypassed(self):
+        """Real grouping carries an operator, and the operator protects it."""
+        assert _expand_query("(connect OR write)") == "(connect OR write)"
+
+    def test_a_bracket_without_an_operator_is_quoted(self):
+        """A bracket alone is C code, not FTS5 grouping.
+
+        While a parenthesis counted as syntax, the call pattern `.attach(`
+        went to FTS5 raw, FTS5 rejected it, and every search tool answered
+        with an empty list — a false negative that reads as "no such code".
+        Quoting the token makes the query legal; the tokenizer then drops
+        the punctuation, so it searches for the word.
+        """
+        assert _expand_query("(connect write)") == '"(connect" OR "write)"'
+        assert _expand_query(".attach(") == '".attach("'
+        assert _expand_query("callback(&") == '"callback(&"'
 
 
 class TestForeignKeyConstraint:
@@ -714,19 +728,19 @@ class TestEnumValue:
     def test_enum_constant_with_value(self, populated_db):
         file_id = upsert_file(populated_db, "hash-deadbeef", "/tmp/cmd.h", "cpp")
         insert_symbols_batch(populated_db, [
-            ("hash-deadbeef", file_id, "src/ble_cmd.h",
+            ("hash-deadbeef", file_id, "src/radio_cmd.h",
              split_tokens("StatusCode", "the Mbed project::BleCmd::StatusCode"),
              "U_enum", "StatusCode", "the Mbed project::BleCmd::StatusCode", "enum",
              19, 1, 36, 1, "", "", None, 0, 0, "", 0, "", 0, 0.0, "", 0),
-            ("hash-deadbeef", file_id, "src/ble_cmd.h",
+            ("hash-deadbeef", file_id, "src/radio_cmd.h",
              split_tokens("TOKEN_INVALID", "the Mbed project::BleCmd::StatusCode::TOKEN_INVALID"),
              "U_tok_inv", "TOKEN_INVALID", "the Mbed project::BleCmd::StatusCode::TOKEN_INVALID",
              "enum_constant", 23, 1, 0, 1, "", "", -2, 0, 0, "", 0, "", 0, 0.0, "", 0),
-            ("hash-deadbeef", file_id, "src/ble_cmd.h",
+            ("hash-deadbeef", file_id, "src/radio_cmd.h",
              split_tokens("OPERATION_SUCCESSFUL", "the Mbed project::BleCmd::StatusCode::OPERATION_SUCCESSFUL"),
              "U_ok", "OPERATION_SUCCESSFUL", "the Mbed project::BleCmd::StatusCode::OPERATION_SUCCESSFUL",
              "enum_constant", 21, 1, 0, 1, "", "", 1, 0, 0, "", 0, "", 0, 0.0, "", 0),
-            ("hash-deadbeef", file_id, "src/ble_cmd.h",
+            ("hash-deadbeef", file_id, "src/radio_cmd.h",
              split_tokens("DEVICE_ERROR", "the Mbed project::BleCmd::StatusCode::DEVICE_ERROR"),
              "U_dev_err", "DEVICE_ERROR", "the Mbed project::BleCmd::StatusCode::DEVICE_ERROR",
              "enum_constant", 28, 1, 0, 1, "", "", -7, 0, 0, "", 0, "", 0, 0.0, "", 0),
@@ -748,30 +762,30 @@ class TestEnumValue:
     def test_get_file_map_groups_by_parent_enum(self, populated_db):
         file_id = upsert_file(populated_db, "hash-deadbeef", "/tmp/cmd.h", "cpp")
         insert_symbols_batch(populated_db, [
-            ("hash-deadbeef", file_id, "src/ble_cmd.h",
+            ("hash-deadbeef", file_id, "src/radio_cmd.h",
              split_tokens("StatusCode", "the Mbed project::BleCmd::StatusCode"),
              "U_enum", "StatusCode", "the Mbed project::BleCmd::StatusCode", "enum",
              19, 1, 0, 1, "", "", None, 0, 0, "", 0, "", 0, 0.0, "", 0),
-            ("hash-deadbeef", file_id, "src/ble_cmd.h",
+            ("hash-deadbeef", file_id, "src/radio_cmd.h",
              split_tokens("TOKEN_INVALID", "the Mbed project::BleCmd::StatusCode::TOKEN_INVALID"),
              "U_tok_inv", "TOKEN_INVALID", "the Mbed project::BleCmd::StatusCode::TOKEN_INVALID",
              "enum_constant", 23, 1, 0, 1, "", "", -2, 0, 0, "", 0, "", 0, 0.0, "", 0),
-            ("hash-deadbeef", file_id, "src/ble_cmd.h",
+            ("hash-deadbeef", file_id, "src/radio_cmd.h",
              split_tokens("OPERATION_SUCCESSFUL", "the Mbed project::BleCmd::StatusCode::OPERATION_SUCCESSFUL"),
              "U_ok", "OPERATION_SUCCESSFUL", "the Mbed project::BleCmd::StatusCode::OPERATION_SUCCESSFUL",
              "enum_constant", 21, 1, 0, 1, "", "", 1, 0, 0, "", 0, "", 0, 0.0, "", 0),
-            ("hash-deadbeef", file_id, "src/ble_cmd.h",
+            ("hash-deadbeef", file_id, "src/radio_cmd.h",
              split_tokens("State", "the Mbed project::BleCmd::State"),
              "U_state", "State", "the Mbed project::BleCmd::State", "enum",
              90, 1, 0, 1, "", "", None, 0, 0, "", 0, "", 0, 0.0, "", 0),
-            ("hash-deadbeef", file_id, "src/ble_cmd.h",
+            ("hash-deadbeef", file_id, "src/radio_cmd.h",
              split_tokens("Idle", "the Mbed project::BleCmd::State::Idle"),
              "U_idle", "Idle", "the Mbed project::BleCmd::State::Idle",
              "enum_constant", 92, 1, 0, 1, "", "", 0, 0, 0, "", 0, "", 0, 0.0, "", 0),
         ])
 
         from fw_context_mcp.indexer.db import get_file_map
-        result = get_file_map(populated_db, "hash-deadbeef", "src/ble_cmd.h", max_per_kind=0)
+        result = get_file_map(populated_db, "hash-deadbeef", "src/radio_cmd.h", max_per_kind=0)
 
         enum_const = result["symbols"]["enum_constant"]
         assert enum_const["count"] == 3
@@ -805,11 +819,11 @@ class TestEnumValue:
         """Enum constants remain searchable by name via FTS5."""
         file_id = upsert_file(populated_db, "hash-deadbeef", "/tmp/cmd.h", "cpp")
         insert_symbols_batch(populated_db, [
-            ("hash-deadbeef", file_id, "src/ble_cmd.h",
+            ("hash-deadbeef", file_id, "src/radio_cmd.h",
              split_tokens("TOKEN_INVALID", "the Mbed project::BleCmd::StatusCode::TOKEN_INVALID"),
              "U_tok_inv", "TOKEN_INVALID", "the Mbed project::BleCmd::StatusCode::TOKEN_INVALID",
                           "enum_constant", 23, 1, 0, 1, "", "", -2, 0, 0, "", 0, "", 0, 0.0, "", 0),
-            ("hash-deadbeef", file_id, "src/ble_cmd.h",
+            ("hash-deadbeef", file_id, "src/radio_cmd.h",
              split_tokens("OPERATION_SUCCESSFUL", "the Mbed project::BleCmd::StatusCode::OPERATION_SUCCESSFUL"),
              "U_ok", "OPERATION_SUCCESSFUL", "the Mbed project::BleCmd::StatusCode::OPERATION_SUCCESSFUL",
                           "enum_constant", 21, 1, 0, 1, "", "", 1, 0, 0, "", 0, "", 0, 0.0, "", 0),
