@@ -254,6 +254,29 @@ def _build_alias_temp_table(
 
 
 
+#: How many distinct paths ``find_call_path`` reports.
+_MAX_CALL_PATHS = 5
+
+
+def _record_path(
+    found: list[dict], seen_chains: set[str], depth: int, chain: str, to_usr: str
+) -> bool:
+    """Add one path to *found* when it is new.  Say whether the list is full.
+
+    WHY the set: a bidirectional BFS records a path at every node where the
+    two fronts meet, and several meeting nodes on ONE path reconstruct the
+    SAME text.  Measured on one project, three of four queries answered with
+    the same chain four times, and the limit of five paths was spent on
+    repeats instead of alternatives.  A caller that reads the answer as "the
+    ways to reach this function" then counts one way as four.
+    """
+    if chain in seen_chains:
+        return False
+    seen_chains.add(chain)
+    found.append({"depth": depth, "chain": chain, "target_usr": to_usr})
+    return len(found) >= _MAX_CALL_PATHS
+
+
 def find_call_path(
     conn: sqlite3.Connection,
     config_hash: str,
@@ -486,6 +509,7 @@ def find_call_path(
     f_queue: deque[str] = deque(f_dist.keys())
     r_queue: deque[str] = deque([to_usr])
     found: list[dict] = []
+    seen_chains: set[str] = set()
     depth = 0
     nodes_expanded = 0
 
@@ -507,8 +531,7 @@ def find_call_path(
                     r_parts = r_chain[v].split(" → ")
                     tail = " → ".join(r_parts[1:])  # skip meeting node (already in f_chain)
                     chain = f_chain[v] if not tail else f"{f_chain[v]} → {tail}"
-                    found.append({"depth": total_depth, "chain": chain, "target_usr": to_usr})
-                    if len(found) >= 5:
+                    if _record_path(found, seen_chains, total_depth, chain, to_usr):
                         return found
 
         # ── Expand reverse (incoming edges) ──
@@ -527,8 +550,7 @@ def find_call_path(
                     r_parts = r_chain[v].split(" → ")
                     tail = " → ".join(r_parts[1:])
                     chain = f_chain[v] if not tail else f"{f_chain[v]} → {tail}"
-                    found.append({"depth": total_depth, "chain": chain, "target_usr": to_usr})
-                    if len(found) >= 5:
+                    if _record_path(found, seen_chains, total_depth, chain, to_usr):
                         return found
 
     return found
