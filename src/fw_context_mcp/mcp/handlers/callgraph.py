@@ -680,6 +680,31 @@ def _refs_guard(project_root: str | None, variant: str | None = None, image: str
 
     return db, None
 
+
+def _with_absolute_file(rows: list[dict], root: Path) -> list[dict]:
+    """Rename the ``file_path`` of each row to an absolute ``file``.
+
+    WHY: the index stores a path relative to the project root, and four
+    graph tools handed that row to the caller as it came from the database.
+    Their documents promised ``file``, thus ``result["file"]`` raised a
+    KeyError, and the ``file_path`` that was really there held a relative
+    path where every other tool gives an absolute one.  A caller cannot
+    cite ``file:line`` from a path whose root it must guess.
+
+    A row that carries neither key passes through untouched: an ``info`` or
+    an ``error`` element is a row as well.
+    """
+    out: list[dict] = []
+    for row in rows:
+        if not isinstance(row, dict) or "file_path" not in row:
+            out.append(row)
+            continue
+        moved = dict(row)
+        moved["file"] = abs_path(root, moved.pop("file_path"))
+        out.append(moved)
+    return out
+
+
 # ── moved from server.py ──
 def find_call_path(
     from_name: Annotated[str, Field(description="Starting symbol for path search.")],
@@ -832,9 +857,13 @@ def find_all_callers_recursive(
         image: Sysbuild image in the variant. Omit for all images.
 
     Returns:
-        list of dicts, each with: caller (str — caller name),
-        caller_qualified_name (str), depth (int — distance from target),
-        file (str), line (int), ref_kind (``"call"`` or ``"indirect"``).
+        list of dicts, each with: name (str — the caller),
+        qualified_name (str), kind (str), signature (str),
+        depth (int — distance from the target), file (str — absolute).
+
+        This tool gives no line, because one caller can hold several call
+        sites.  For the line of each call use ``find_callers`` on the name
+        that this tool reports.
 
         Never empty: one dict with ``error`` (cannot resolve) or ``info``
         (no results) replaces the results.  Check both keys first.
@@ -853,7 +882,7 @@ def find_all_callers_recursive(
         rows = index_db.find_all_callers_recursive(conn, config_hash, name, max_depth=max_depth, limit=limit)
         if not rows:
             return [{"info": f"No callers found for '{name}'."}]
-        return rows
+        return _with_absolute_file(rows, db.root)
 
     return db.execute_scoped(_query)
 
@@ -904,9 +933,13 @@ def find_callees_recursive(
         image: Sysbuild image in the variant. Omit for all images.
 
     Returns:
-        list of dicts, each with: callee (str — callee name),
-        callee_qualified_name (str), depth (int — distance from source),
-        file (str), line (int), ref_kind (``"call"`` or ``"indirect"``).
+        list of dicts, each with: name (str — the callee),
+        qualified_name (str), kind (str), signature (str),
+        depth (int — distance from the source), file (str — absolute).
+
+        This tool gives no line, because one function can call the same
+        callee several times.  For the line of each call use
+        ``find_callers`` on the name that this tool reports.
 
         Never empty: one dict with ``error`` (cannot resolve) or ``info``
         (no results) replaces the results.  Check both keys first.
@@ -925,7 +958,7 @@ def find_callees_recursive(
         rows = index_db.find_callees_recursive(conn, config_hash, name, max_depth=max_depth, limit=limit)
         if not rows:
             return [{"info": f"No callees found for '{name}'."}]
-        return rows
+        return _with_absolute_file(rows, db.root)
 
     return db.execute_scoped(_query)
 
@@ -987,9 +1020,10 @@ def find_dead_code(
         image: Sysbuild image in the variant. Omit for all images.
 
     Returns:
-        list of dicts, each with: name, qualified_name, kind, file, line,
-        status (``"dead"`` or ``"possibly_dead"``), and reason (str —
-        explains why the function is classified as dead or possibly dead).
+        list of dicts, each with: name, qualified_name, kind, signature,
+        file (str — absolute), line, status (``"dead"`` or
+        ``"possibly_dead"``), and reason (str — explains why the function
+        is classified as dead or possibly dead).
 
         Never empty: one dict with ``info`` replaces an empty result.
         Check that key first.
@@ -1011,7 +1045,7 @@ def find_dead_code(
         )
         if not rows:
             return [{"info": "No dead or possibly-dead functions found — every defined function has at least one caller."}]
-        return rows
+        return _with_absolute_file(rows, db.root)
 
     return db.execute_scoped(_query)
 
@@ -1399,8 +1433,9 @@ def find_hotspots(
         image: Sysbuild image in the variant. Omit for all images.
 
     Returns:
-        list of dicts, each with: name, qualified_name, kind, file, line,
-        caller_count (int — total number of call sites), signature.
+        list of dicts, each with: name, qualified_name, kind, signature,
+        file (str — absolute), line,
+        caller_count (int — total number of call sites).
 
         Never empty: one dict with ``info`` replaces an empty result.
         Check that key first.
@@ -1424,7 +1459,7 @@ def find_hotspots(
             return [{"info": "No project hotspots found. Try project_only=False to include vendor code."}]
         if not rows:
             return [{"info": "No references indexed — enable index_refs and re-index."}]
-        return rows
+        return _with_absolute_file(rows, db.root)
 
     return db.execute_scoped(_query)
 
