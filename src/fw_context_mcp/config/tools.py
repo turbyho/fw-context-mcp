@@ -50,8 +50,8 @@ file-reading tool:
 |---|---|---|
 | Find symbol by name | `lookup_symbol` | `"uart_"`, `"HardFault_Handler"` |
 | Search by concept/topic | `search_code` | `"interrupt handler"` |
-| Search function bodies | `search_bodies` | `"attach"`, `"NVIC_SetVector"` |
-| Search full file content | `search_content` | `"extern C"`, `"#define"` |
+| Search the code of any definition | `search_bodies` | `"attach"`, `"BATT_TEST"` |
+| Search preprocessor / file scope | `search_content` | `"extern C"`, `"#define"` |
 | Natural-language query | `smart_search` | `"how does the modem connect?"` |
 | Read function body | `get_source` | function name |
 | Body + callers + callees | `get_symbol_context` | function name |
@@ -90,6 +90,54 @@ operator asked about.
 Do not invent other parameter names. An unknown argument causes an error
 that names it.
 
+### Parameter names
+
+Every tool rejects an unknown argument, thus a guess costs a whole call.
+The schema of each tool is in the tool list — read it there. Three names
+cover almost every tool:
+
+- `name` — the symbol. NOT `symbol`, NOT `symbol_name`.
+- `file_path` — the file (`read_file`, `get_file_map`).
+- `query` — the search terms (every search tool).
+
+No tool takes a filler argument. `get_active_build` accepts only
+`project_root` and `fast`. When a call fails on an argument, drop that
+argument and REPEAT the call — never continue without the answer, and
+never skip `get_active_build`.
+
+### search_bodies reaches more than functions
+
+`search_bodies` searches the text of EVERY definition: a function or
+method body, and also the body of a class, struct, union, enum or
+namespace, and a global with a multi-line initializer. An enum constant,
+a bit field, and a member declaration such as `InterruptIn _pin;` are all
+inside it. A match on a type answers with the type, and `_match_lines`
+gives the line of the match itself.
+
+Only text that belongs to no definition is out of reach — `#define`,
+`#include`, `#ifdef`, `extern "C"`, a file-scope comment. Use
+`search_content` for those.
+
+### Where a line number comes from
+
+- `search_bodies` → `_match_lines`, the lines of the matches. `line` is
+  the first line of the DEFINITION, far from the match in a long
+  function. Never cite `line` for a statement.
+- `get_source` / `get_file_map` → `line` and `end_line` are the extent.
+  Cite `file:line-end_line`.
+- `get_source` is the ONLY tool that numbers its text — every line of its
+  `source` starts with the line number. The `source` of `search_bodies`
+  and the `content` of `read_file` are BARE. Never count lines there.
+
+These cover the statement-level anchor. Do not leave fw-context for a
+text search to find a line number.
+
+### llm_analysis is not evidence
+
+`llm_analysis` (`{summary, inputs, outputs}`) is written by a model, not
+by the code. Use it to find a symbol. Never quote it as fact. Quote
+`source`, `signature`, or `docstring`.
+
 ### FTS5 query tips
 - Multi-word bare queries are OR-joined — prefer single words.
 - For exact phrases use double quotes: `'"interrupt handler"'`.
@@ -99,7 +147,8 @@ that names it.
 1. Simplify to a single-word query in the same tool.
 2. Switch tools — search_bodies → search_code, or search_content → search_bodies.
 3. Use `lookup_symbol` for known names.
-4. search_bodies empty → switch to search_content (covers file scope too).
+4. search_bodies empty → switch to search_content (covers the
+   preprocessor and extern "C", which belong to no definition).
 5. Only AFTER exhausting all fw-context tools — use other tools.
 
 ### Agent loop
@@ -160,8 +209,9 @@ PROHIBITED for .c/.cpp/.h/.hpp/.s/.inc files:
 REQUIRED for ALL C/C++ code access:
 - lookup_symbol → find symbol by exact or prefix name
 - search_code → find symbols by concept/topic
-- search_bodies → search function implementations (inside { })
-- search_content → search full file content (file-scope patterns)
+- search_bodies → search the text of any definition (a function body, and
+  also a class, struct, union, enum or namespace body)
+- search_content → search full file content (the preprocessor, extern "C")
 - get_source → read function body (libclang exact extents)
 - get_symbol_context → body + callers + callees in one call
 - find_callers / find_references → impact analysis

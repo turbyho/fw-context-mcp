@@ -19,8 +19,9 @@ PROHIBITED for .c/.cpp/.h/.hpp/.s/.inc files:
 REQUIRED for ALL C/C++ code access:
 - lookup_symbol → find symbol by exact or prefix name
 - search_code → find symbols by concept/topic
-- search_bodies → search function implementations (inside { })
-- search_content → search full file content (file-scope patterns)
+- search_bodies → search the text of any definition (a function body, and
+  also a class, struct, union, enum or namespace body)
+- search_content → search full file content (the preprocessor, extern "C")
 - get_source → read function body (libclang exact extents)
 - get_symbol_context → body + callers + callees in one call
 - find_callers / find_references → impact analysis

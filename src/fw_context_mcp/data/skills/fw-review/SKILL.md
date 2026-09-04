@@ -190,8 +190,8 @@ Set `project_only=False` — vendor code MUST be searched.
 |---|---|
 | Known symbol by name | `lookup_symbol(exact=True)` |
 | Symbols by concept | `search_code` |
-| Patterns in function bodies | `search_bodies` |
-| Patterns at file scope | `search_content` |
+| Patterns in the code of any definition | `search_bodies` — also class, struct, union, enum bodies. Cite `_match_lines`, not `line` |
+| Preprocessor and file-scope text | `search_content` |
 | Natural language | `smart_search` (slow, uses Ollama) |
 | Full context (body+callers+callees) | `get_symbol_context(name)` — preferred over `get_source`+`find_callers` |
 | Who calls this? | `find_callers` → if empty: `search_bodies` |

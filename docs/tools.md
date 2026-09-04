@@ -577,8 +577,9 @@ Output: [{"name": "uart_init", "qualified_name": "drv::uart_init", "kind": "func
           "file": "/path/src/uart.c", "line": 42, "is_definition": true,
           "signature": "void uart_init(int baudrate)", "docstring": "Initialize UART",
           "is_template": false, "is_virtual": false, "is_pure_virtual": false,
-          "summary": "Initialize the UART peripheral…", "inputs": "baudrate…",
-          "outputs": "…", "enum_value": null, "_fallback": "fts5+kind"}, …]
+          "llm_analysis": {"summary": "Initialize the UART peripheral…",
+                           "inputs": "baudrate…", "outputs": "…"},
+          "enum_value": null, "_fallback": "fts5+kind"}, …]
 ```
 
 Enum constants include `enum_value` (the integer value) when non-None.
@@ -587,8 +588,21 @@ Results include `is_template`, `is_virtual`, `is_pure_virtual` flags
 `template_usr` references the template definition. When the symbol is
 a member (method/field/nested type), `parent_usr` references the parent class.
 When fw-context generates LLM analysis (with `fw-context index --analyze`),
-results include `summary`, `inputs`, and `outputs` fields, with
+a result carries `llm_analysis` — `{summary, inputs, outputs}`, with
 plain-English descriptions.
+
+A model wrote that text, and the code did not. It is nested for that
+reason: a flat key would sit beside `signature` and `docstring`, which
+come from the source, with nothing to separate a description from a
+guess. Use `llm_analysis` to find a symbol. Quote `signature`,
+`docstring`, or the `source` of `get_source`.
+`get_active_build().analysis.model` names the model — one for each index.
+
+**Precision:** FTS5 indexes the qualified name, thus a local variable
+matches through the name of its parent. A query for `battery` also
+returns `V`, `ret`, and `tmp_value` when they live inside
+`get_battery_voltage`. Pass `kind` to exclude them, or read `kind` on
+each result before you act on it.
 
 **Progressive relaxation:** when the initial FTS5 search returns nothing, the
 tool automatically broadens the search in up to six steps:
@@ -626,11 +640,25 @@ succeeded: `"fts5"`, `"name_tokens_like"`, `"docstring_like"`,
 
 #### `search_bodies`
 
-Find patterns in C/C++ function **bodies** — the implementation code inside `{ }`.
+Find patterns in the **text of a definition** — the code inside its extent.
 
-Searches **only** the text between `{` and `}` of function and method
-definitions. Does **not** search file-scope constructs, such as
-`extern "C"`, `#include`, `#define`, or type declarations in headers.
+Searches the stored text of every definition, and a definition is not only
+a callable. Measured on one project of 60,877 symbols, the text covers:
+
+- Callables — `function`, `method`, `constructor`, `destructor`.
+- Types — `class`, `struct`, `union`, `enum`, `namespace`. An enum
+  constant, a bit field, and a member declaration such as
+  `InterruptIn _pin;` are inside the body of the type that holds them.
+- Definitions of data — `varglobal`, `varlocal`, `typedef`. A table with
+  a multi-line initializer is found by its content.
+
+A match on a type reports the type as the result. A query for one enum
+constant thus answers with the enum, and `_match_lines` gives the line of
+the constant itself.
+
+Text that belongs to **no** definition is out of reach: `#define`,
+`#include`, `#ifdef`, `extern "C"`, and a comment or declaration at file
+scope. Use `search_content` for those.
 
 ```
 Input:  {"query": "attach", "project_root?": "/path/to/project", "kind?": "function", "limit?": 20, "project_only?": true}
@@ -638,14 +666,24 @@ Output: [{"name": "setup", "qualified_name": "setup", "kind": "function",
           "file": "/path/src/main.cpp", "line": 55, "is_definition": true,
           "signature": "void setup()",
           "_match_snippet": "…_timeout.<b>attach</b>(callback(&led_blink, 1000))…",
-          "source": "… (function body, truncated at 2000 chars)"}]
+          "_match_lines": [58],
+          "source": "… (the text of the definition)",
+          "_source_truncated": true}]
 ```
 
+`line` is the first line of the definition, which in a long function is
+far from the match. Cite from `_match_lines`, never from `line`.
+
+`_source_truncated` says that `source` is cut. A callable keeps 2000
+characters, any other kind 500 — the body of a type is mostly members
+that the match has nothing to do with, and `_match_snippet` already
+carries the match in context. `get_source` gives the whole text.
+
 - **When to use `search_bodies` vs. `search_code` vs. `search_content`:**
-  - `search_bodies` — patterns in function **bodies** (what the code does):
-    `.attach(`, `NVIC_SetVector(`, `.rise(`, `.fall(`, `callback(&`
-  - `search_content` — patterns anywhere in **files**:
-    `extern "C"`, `InterruptIn`, `#define`, type declarations
+  - `search_bodies` — patterns in the code (what the code does or
+    declares): `.attach(`, `NVIC_SetVector(`, `BATT_TEST`, `InterruptIn`
+  - `search_content` — the preprocessor and file scope:
+    `extern "C"`, `#define`, `#include`
   - `search_code` — find symbols by **name**:
     `modem init`, `interrupt handler`
 
@@ -661,8 +699,8 @@ code. Set `project_only=True` to filter to application code only.
 
 #### `search_content`
 
-Find patterns in **full file content** — file-scope + function bodies, not
-limited to function bodies.
+Find patterns in **full file content** — the whole file, and not only the
+text that belongs to a definition.
 
 Searches **ifdef-filtered** file text: only the code that actually
 compiles for the current build configuration. fw-context replaces an
@@ -675,10 +713,11 @@ Output: [{"file": "/path/src/main.cpp", "language": "cpp",
           "mtime": "2026-06-05T09:35:18", "_match_snippet": "…InterruptIn…"}]
 ```
 
-Covers file-scope constructs that `search_bodies` cannot see: `extern "C"`,
-type declarations in headers, `#include`, `#define`, global variables, and
-namespace blocks. Results are file-level, with one entry for each matching
-file. Use `search_bodies` for per-function detail.
+Covers the text that belongs to no definition, which is what
+`search_bodies` cannot see: `#define`, `#include`, `#ifdef`, `extern "C"`,
+and a comment at file scope. Results are file-level, with one entry for
+each matching file. Use `search_bodies` when you want the symbol that
+holds the match and the line of the match itself.
 
 When `files_fts` is missing, in a legacy index, this tool falls back to a
 LIKE search on `files.content`. The results include `_fallback: "like"`,
@@ -862,7 +901,13 @@ Output: {"name": "adc_read", "kind": "function", "file": "/path/src/adc.c",
 ```
 
 Uses libclang's `end_line` for exact body boundaries. Falls back to
-brace-matching for older indexes.
+brace-matching for older indexes. The result also carries `end_line`, thus
+`file:line-end_line` is the citation — no counting.
+
+Every line of `source` starts with its line number in the file: four
+columns, right-aligned, then two spaces. `get_source` is the **only** tool
+that numbers its text — the `source` of `search_bodies` and the `content`
+of `read_file` are both bare.
 
 For enum constants, the result includes `enum_value` (the integer value).
 For enums, the result includes a `constants` array that lists all the

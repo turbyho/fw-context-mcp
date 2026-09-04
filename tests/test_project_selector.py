@@ -389,18 +389,77 @@ def test_the_selector_reaches_the_handler():
 # ── The instructions ───────────────────────────────────────────────────
 
 
+def _instruction_copies() -> tuple[tuple[str, str], ...]:
+    """The copies of the instruction text that must agree.
+
+    Two remain, and they reach the reader by different routes:
+
+    * ``server.mcp.instructions`` — sent over the MCP protocol.  It is a
+      literal in ``server.py`` because FastMCP reads it while it builds the
+      object, thus before any file read could run.
+    * ``BASE_INSTRUCTIONS`` — what ``fw-context init`` writes into
+      ``CLAUDE.md`` and ``AGENTS.md``.
+
+    A third copy lived in ``data/instructions.md`` until 2026-09-04.  No
+    code ever read it: a claim corrected in the other two stayed wrong
+    there, and the file was deleted rather than kept in step.
+    """
+    from fw_context_mcp.config.tools import BASE_INSTRUCTIONS
+
+    return (
+        ("FastMCP instructions", server.mcp.instructions or ""),
+        ("BASE_INSTRUCTIONS", BASE_INSTRUCTIONS),
+    )
+
+
 def test_every_copy_of_the_instructions_teaches_the_selector():
-    """Three files hold the same instruction text — all three must agree."""
+    for label, text in _instruction_copies():
+        assert "list_projects" in text, label
+        assert "DIFFERENT project" in text, label
+
+
+def test_no_copy_of_the_instructions_holds_a_dead_file():
+    """``data/instructions.md`` is gone.  Nothing may point a reader at it."""
     from pathlib import Path
 
     import fw_context_mcp
-    from fw_context_mcp.config.tools import BASE_INSTRUCTIONS
 
-    data_file = Path(fw_context_mcp.__file__).parent / "data" / "instructions.md"
-    for label, text in (
-        ("FastMCP instructions", server.mcp.instructions or ""),
-        ("BASE_INSTRUCTIONS", BASE_INSTRUCTIONS),
-        ("data/instructions.md", data_file.read_text(encoding="utf-8")),
-    ):
-        assert "list_projects" in text, label
-        assert "DIFFERENT project" in text, label
+    assert not (Path(fw_context_mcp.__file__).parent / "data" / "instructions.md").exists()
+    for label, text in _instruction_copies():
+        assert "instructions.md" not in text, label
+
+
+def test_every_copy_of_the_instructions_states_the_scope_of_search_bodies():
+    """The scope of ``search_bodies`` must not drift back to a false claim.
+
+    ``symbols.source`` holds the text of EVERY definition — measured on one
+    index: 1,844 struct, 1,142 class, 878 enum, 498 varglobal.  Both copies
+    used to say "function BODIES … inside {}" and name a type declaration in
+    a header as unreachable, and a reader then avoided the one tool that
+    answers such a question.
+    """
+    for label, text in _instruction_copies():
+        assert "TEXT OF EVERY DEFINITION" in text.upper(), label
+        # The false claim, in the two shapes both copies carried.
+        assert "inside {}" not in text, label
+        assert "type definitions in headers" not in text, label
+
+
+def test_every_copy_of_the_instructions_says_where_a_line_number_comes_from():
+    """Without this the reader leaves fw-context for a text search."""
+    for label, text in _instruction_copies():
+        assert "_match_lines" in text, label
+        assert "end_line" in text, label
+
+
+def test_every_copy_of_the_instructions_marks_the_llm_analysis_untrusted():
+    """A model wrote it.  A reader must not quote it as a fact."""
+    for label, text in _instruction_copies():
+        assert "llm_analysis" in text, label
+
+
+def test_every_copy_of_the_instructions_names_the_symbol_parameter():
+    """A guessed argument name costs a whole call — the tools reject it."""
+    for label, text in _instruction_copies():
+        assert "symbol_name" in text, label  # named as the WRONG spelling
+        assert "PARAMETER NAMES" in text.upper(), label
