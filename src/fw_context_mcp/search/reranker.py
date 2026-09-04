@@ -148,7 +148,10 @@ class CrossEncoderReranker:
         parts = [candidate.get("kind", ""), candidate.get("name", "")]
         if sig := candidate.get("signature"):
             parts.append(sig)
-        if summary := candidate.get("summary"):
+        # A formatted result holds the summary under `llm_analysis`.  A raw
+        # symbol row still carries it flat.  Both shapes reach this method.
+        analysis = candidate.get("llm_analysis") or {}
+        if summary := (analysis.get("summary") or candidate.get("summary")):
             parts.append(summary)
         if source := candidate.get("source"):
             snip = source[:500]

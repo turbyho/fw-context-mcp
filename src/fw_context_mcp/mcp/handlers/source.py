@@ -240,6 +240,12 @@ def _read_symbol_body(file_path: str, line_no: int, end_line: int = 0, max_lines
 
     When *end_line* is provided (from libclang) it is used as the exact body
     boundary.  Otherwise brace-matching finds the closing ``}``.
+
+    Every line gets a ``"%4d  "`` prefix with its number in the file, thus
+    the caller can cite a statement inside the body without counting.  This
+    is the only body text in the tool surface that is numbered — the
+    ``source`` column that ``search_bodies`` returns is bare, and so is the
+    ``content`` of ``read_file``.
     """
     try:
         p = Path(file_path)
@@ -710,9 +716,22 @@ def get_source(
         docstring, is_definition, is_template, is_virtual, is_pure_virtual,
         source (str — the function/enum/macro body, truncated at 8000 chars),
         warning (str, optional — when source file cannot be read)}.
-        May also include ``template_usr``, ``parent_usr``, ``enum_value``,
-        ``constants`` (list for enums), ``value`` (raw macro definition),
-        ``expanded_value`` (preprocessor-resolved macro value) when applicable.
+        May also include ``end_line`` (the last line of the extent),
+        ``template_usr``, ``parent_usr``, ``enum_value``, ``constants``
+        (list for enums), ``value`` (raw macro definition),
+        ``expanded_value`` (preprocessor-resolved macro value) when
+        applicable.  A declaration has no extent, thus it gets no
+        ``end_line``.
+
+        ``line`` and ``end_line`` are the extent of the symbol, thus they
+        are the citation: quote ``file:line-end_line``.  Do not count the
+        lines of ``source`` to find the end.
+
+        ``source`` carries a line-number prefix on every line — four
+        columns, right-aligned, then two spaces (``"  20     bool ..."``).
+        This tool is the only one that numbers its text: the ``source`` of
+        ``search_bodies`` and the ``content`` of ``read_file`` are both
+        bare.  Strip the prefix before you compare the text with anything.
 
         When the file changed after the last index run, the dict adds
         ``stale`` (True) and ``stale_warning`` (str).  ``source_origin`` then
@@ -758,6 +777,14 @@ def get_source(
             "is_pure_virtual": bool(row["is_pure_virtual"]),
             "docstring": row["docstring"] or "",
         }
+        # `end_line` completes the citation.  With `line` alone a caller
+        # that must quote `file:start-end` has to count the lines of
+        # `source` by hand, and one that reads the body from disk has no
+        # bound to stop at.  The column holds 0 for a declaration, which
+        # has no extent to report, thus the key appears only when it
+        # carries an answer.
+        if row["end_line"]:
+            result["end_line"] = row["end_line"]
         if row["template_usr"]:
             result["template_usr"] = row["template_usr"]
         if row["parent_usr"]:
@@ -854,6 +881,10 @@ def get_file_map(
     Returns:
         dict: {file, total_symbols, symbols: {kind: {count, items[],
         subgroups?[]}}}
+
+        Each item holds ``name``, ``qualified_name``, and ``line``, plus
+        ``end_line`` when the symbol is a definition.  The two line numbers
+        are the extent, thus ``file:line-end_line`` is the citation.
 
         On failure the dict holds only ``error`` with the reason.
     """
@@ -1303,7 +1334,18 @@ def read_file(
     Unlike generic file readers, this tool returns build-accurate content:
     code gated behind ``#ifdef BOARD_V2`` stays visible only when
     ``BOARD_V2`` is actually defined for this build.  Line numbers match
-    the original file — inactive branches appear as blank lines.
+    the original file — inactive branches appear as blank lines, and the
+    text spans the whole file, thus ``lines`` is the length of the file.
+
+    ``content`` is bare text and carries NO line-number prefix — unlike
+    the ``source`` of ``get_source``, which numbers every line.  To cite
+    ``file:line``, take the number from ``get_file_map``, ``get_source``,
+    or the ``_match_lines`` of ``search_bodies`` — never by counting the
+    lines here.
+
+    An include guard is a blank line: ``#ifndef`` and ``#endif`` are
+    conditional directives, which carry no token and thus never count as
+    active.  The line stays in place, and only its text is gone.
 
     For reading a single function body with libclang exact extents use
     ``get_source``.  For body + callers + callees in one call use
@@ -1326,8 +1368,10 @@ def read_file(
 
     Returns:
         dict: {file (str), language (str — ``"c"`` or ``"cpp"``),
-        mtime (float), lines (int — total line count),
-        content (str — the complete ifdef-filtered file text),
+        mtime (float), lines (int — total line count, equal to the length
+        of the file on disk),
+        content (str — the complete ifdef-filtered file text, with no
+        line-number prefix),
         warning (str, optional — when reading from raw disk instead of
         indexed content)}.
 

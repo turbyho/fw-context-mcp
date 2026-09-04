@@ -2386,8 +2386,15 @@ def get_project_info(
 
     if not project_id:
         # Empty string is the default — the LLM must be told that a
-        # project_id is required before this tool can return anything.
-        return {"error": "project_id is required — provide a UUID4 hex string from fw-context init."}
+        # project_id is necessary before this tool can return anything.
+        #
+        # The message names the two tools that give the value.  It used to
+        # say "from fw-context init", which is a command the caller cannot
+        # run to answer a question about a project that is already indexed.
+        return {
+            "error": "project_id is necessary. Call list_projects for the id of every "
+            "indexed project, or get_active_build for the id of this one."
+        }
     result = get_project_by_id(project_id)
     if result is None:
         # The UUID was not found in the global registry (~/.fw-context/projects.db).

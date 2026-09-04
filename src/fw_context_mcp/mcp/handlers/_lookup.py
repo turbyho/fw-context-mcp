@@ -78,7 +78,10 @@ def lookup_symbol(
         with the integer value. Macro results include ``kind="macro"``,
         ``value`` (raw definition), and ``expanded_value`` (preprocessor-
         resolved value). May also include ``template_usr``,
-        ``parent_usr``, ``summary``, ``inputs``, ``outputs`` when available.
+        ``parent_usr``, and ``llm_analysis`` (``{summary, inputs,
+        outputs}``) when available.  A model wrote the text in
+        ``llm_analysis``, and the code did not — use it to find a symbol,
+        and quote ``signature``, ``docstring``, or ``get_source`` instead.
         When no results found, may include ``_did_you_mean`` with suggested
         symbol names. When no symbol matches, the list is empty —
         this tool gives no ``info`` entry for an empty result.

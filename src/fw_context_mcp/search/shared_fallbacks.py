@@ -57,9 +57,15 @@ def _symbol_row_to_dict(r: sqlite3.Row, root: Path, **extra) -> dict[str, Any]:
 
     Why conditional fields?
         Fields like ``template_usr``, ``parent_usr``, ``enum_value``, and
-        LLM analysis fields (``summary``, ``inputs``, ``outputs``) are
-        absent from many symbols.  Including them as empty strings would
-        bloat the output.  Conditional inclusion keeps the dict lean.
+        the LLM analysis are absent from many symbols.  Including them as
+        empty strings would bloat the output.  Conditional inclusion keeps
+        the dict lean.
+
+    Why the LLM analysis is nested?
+        ``summary``, ``inputs``, and ``outputs`` are the output of a model,
+        not a property of the code.  They go under ``llm_analysis`` so that
+        a reader cannot mistake them for ``signature`` or ``docstring``,
+        which come from the source.
 
     Accepts both ``sqlite3.Row`` (from database queries) and plain dicts
     (from in-memory test fixtures).  Includes all standard symbol fields
@@ -86,9 +92,19 @@ def _symbol_row_to_dict(r: sqlite3.Row, root: Path, **extra) -> dict[str, Any]:
         d["parent_usr"] = row["parent_usr"]
     if row.get("enum_value") is not None:
         d["enum_value"] = row["enum_value"]
-    for field in ("summary", "inputs", "outputs"):
-        if row.get(field):
-            d[field] = row[field]
+    # LLM analysis goes in a wrapper, and not next to `signature` and
+    # `docstring`.  Those two come from the code.  These three come from a
+    # model.  Measured on one project, a summary said that an identifier
+    # was "possibly related to battery status or level" — a guess from the
+    # name of the identifier.  Flat keys put that text among indexed facts
+    # with nothing to separate the two, and a reader cited it as code.
+    #
+    # The name of the wrapper says where the text came from.  The name of
+    # the model is not repeated here: there is one model for each index,
+    # and `get_active_build().analysis.model` already gives it.
+    analysis = {f: row[f] for f in ("summary", "inputs", "outputs") if row.get(f)}
+    if analysis:
+        d["llm_analysis"] = analysis
     d.update(extra)
     return d
 

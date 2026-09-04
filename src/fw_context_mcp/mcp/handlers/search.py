@@ -5,10 +5,12 @@ Provides the search tools exposed through the MCP interface:
 - ``search_code`` — lexical symbol-name search with progressive relaxation;
   searches symbol names, signatures, and docstrings via FTS5 with six
   fallback strategies when the primary query returns nothing.
-- ``search_bodies`` — full-text search over function/method definition
-  bodies (the code inside ``{ }``); project code sorts before vendor code.
+- ``search_bodies`` — full-text search over the stored text of every
+  definition, callables and types alike.  Project code sorts before vendor
+  code.
 - ``search_content`` — full-text search over complete ifdef-filtered file
-  content including file-scope constructs that ``search_bodies`` cannot see.
+  content, including the text that belongs to no definition and that
+  ``search_bodies`` cannot see (preprocessor directives, ``extern "C"``).
 - ``smart_search`` — LLM-powered natural-language to FTS5 translation
   pipeline; async because it calls external chat and embedding APIs.
 - ``semantic_search`` — embedding-based conceptual search using pre-computed
@@ -245,9 +247,19 @@ def search_code(
     ``typedef``, ``varglobal``, ``varlocal``, ``variable``, ``field``,
     ``namespace``.
 
-    After ``fw-context index --analyze``, a result also holds ``summary``,
-    ``inputs``, and ``outputs`` — what the symbol does, what it receives,
-    and what it returns.
+    **Precision — a local variable matches through its parent.**  FTS5
+    indexes the qualified name, thus a query for ``battery`` also returns
+    ``V``, ``ret``, and ``tmp_value`` when they live inside
+    ``get_battery_voltage``: their qualified name holds the term, their own
+    name does not.  Measured on one project, 4 of 20 results for one query
+    were locals of a single function.  Pass ``kind`` to exclude them, or
+    read ``kind`` on each result before you act on it.
+
+    After ``fw-context index --analyze``, a result also holds
+    ``llm_analysis`` — ``{summary, inputs, outputs}``.  A model wrote that
+    text, and the code did not.  Treat it as a hint that points you at a
+    symbol, never as a fact to quote.  Quote ``source`` from
+    ``get_source``, ``signature``, or ``docstring``.
 
     Read-only. No side effects.
 
@@ -267,8 +279,9 @@ def search_code(
         is_definition, signature, docstring, is_template, is_virtual,
         is_pure_virtual. Enum constants include ``enum_value`` with the
         integer value. May also include ``template_usr``, ``parent_usr``,
-        ``summary``, ``inputs``, ``outputs`` when available. Fallback
-        results include ``_fallback`` with the method name.
+        and ``llm_analysis`` (``{summary, inputs, outputs}`` — written by a
+        model, not by the code.  ``get_active_build().analysis.model`` names
+        it). Fallback results include ``_fallback`` with the method name.
 
         No match gives ``[]``.  A dict with ``error`` means the query
         failed.  A stale index prepends a dict with ``warning`` + ``hint``.
@@ -631,8 +644,76 @@ async def semantic_search(
 
 
 
+# Body text budget for one search_bodies result.  A callable body is the
+# answer to "what does this code do", thus it gets the larger share.  The
+# body of a type is mostly members that have nothing to do with the match —
+# measured on one project, a match on a single bitfield returned about 1900
+# characters of unrelated enum — and `_match_snippet` already carries the
+# match in context, thus the head of the declaration is enough to identify
+# the type.
+_SOURCE_CAP_CALLABLE = 2000
+_SOURCE_CAP_TYPE = 500
+_CALLABLE_KINDS = frozenset({"function", "method", "constructor", "destructor"})
+
+# Cap on the line numbers reported for one result.  A common term appears on
+# many lines of a long body, and the caller needs enough anchors to find the
+# code, not all of them.
+_MATCH_LINES_CAP = 20
+
+# FTS5 operators.  They are syntax and carry no text to find in a body.
+_FTS5_OPERATORS = frozenset({"and", "or", "not", "near"})
+
+
+def _body_query_terms(query: str) -> list[str]:
+    """Reduce an FTS5 query to the plain terms to look for in a body.
+
+    The terms come from the raw query and not from the expanded form: the
+    expansion adds wildcards and operators, which never appear in source
+    text.  Quotes and a trailing ``*`` go for the same reason.
+
+    Underscores stay.  FTS5 splits on them, thus a query for ``batt test``
+    must match ``_is_batt_test``.  A substring test for each term does that,
+    and it needs no second tokenizer here.
+    """
+    terms = []
+    for raw in query.replace('"', " ").split():
+        term = raw.strip("*").strip().lower()
+        # One character matches almost every line and tells the reader
+        # nothing.
+        if len(term) > 1 and term not in _FTS5_OPERATORS:
+            terms.append(term)
+    return terms
+
+
+def _body_match_lines(source: str, start_line: int, terms: list[str]) -> list[int]:
+    """Give the absolute line numbers in *source* that hold one of *terms*.
+
+    WHY this exists: FTS5 ``snippet()`` gives the matching text but no
+    position, and the symbol row gives only the first line of the body.  A
+    caller that must cite the statement — one ``case`` label, one call in a
+    long function — was left with the line of the enclosing definition,
+    which for a large function is wrong by hundreds of lines.  It then had
+    to leave fw-context for a text search to find the real line, and that
+    text search reads unfiltered source.
+
+    *source* is the full stored body and not the truncated copy that goes
+    into the result, thus a match after the truncation point still gets a
+    line number.
+    """
+    if not terms or not source:
+        return []
+    hits: list[int] = []
+    for offset, text in enumerate(source.splitlines()):
+        lowered = text.lower()
+        if any(term in lowered for term in terms):
+            hits.append(start_line + offset)
+            if len(hits) >= _MATCH_LINES_CAP:
+                break
+    return hits
+
+
 def search_bodies(
-    query: Annotated[str, Field(description="FTS5 search terms for function bodies. 1-3 words. E.g. 'attach', 'callback', 'rise'.")],
+    query: Annotated[str, Field(description="FTS5 search terms for the body of a definition. 1-3 words. E.g. 'attach', 'callback', 'rise'.")],
     project_root: Annotated[str | None, Field(description="Project root. Auto-detected if omitted.")] = None,
     kind: Annotated[str | None, Field(description="Optional kind filter: function, method, class, etc.")] = None,
     limit: Annotated[int, Field(description="Maximum results (default 20, max 100).")] = 20,
@@ -640,41 +721,54 @@ def search_bodies(
     variant: Annotated[str | None, Field(description="Build variant name (multi-project). Omit to use default_variant or fail-closed. Use '*' for all variants.")] = None,
     image: Annotated[str | None, Field(description="Sysbuild image name within the variant (multi-project). Omit for all images of the variant.")] = None,
 ) -> list[dict]:
-    """Find patterns in C/C++ function BODIES — the implementation code inside ``{ }``.
+    """Find patterns in the TEXT OF A DEFINITION — the code inside its extent.
 
-    Searches ONLY the text between ``{`` and ``}`` of function/method
-    definitions.  Does NOT search file-scope constructs (see Limitations
-    below).
+    Searches the stored text of every definition (``is_definition=1``), and
+    a definition is not only a callable.  Measured on one project of 60,877
+    symbols, the text covers:
 
-    **When to use ``search_bodies`` vs ``search_code``:**
+    - Callables — ``function``, ``method``, ``constructor``, ``destructor``.
+      Call patterns (``.attach(``, ``.rise(``, ``callback(&``), ISR
+      registration, one ``case`` label of a long ``switch``.
+    - Types — ``class``, ``struct``, ``union``, ``enum``, ``namespace``.
+      An enum constant, a bit field, a member declaration such as
+      ``InterruptIn _pin;`` — all inside the body of the type that holds
+      them.
+    - Definitions of data — ``varglobal``, ``varlocal``, ``typedef``.  A
+      table with a multi-line initializer is found by its content.
 
-    - ``search_bodies`` — patterns in function BODIES (what the code DOES):
-      function call patterns (``.attach(``, ``.rise(``, ``.fall(``,
-      ``callback(&``), ISR registration code.
-    - ``search_code`` — find symbols by NAME (what the code IS):
-      ``modem init``, ``interrupt handler``, ``uart send``.
+    A match on a type reports the type as the result, thus a query for one
+    enum constant answers with the enum, and ``_match_lines`` gives the line
+    of the constant itself.
 
-    **Limitation — this tool searches ONLY function bodies.**  The index
-    holds the source text of definition bodies (``is_definition=1``), thus
-    the ``source`` column NEVER holds a file-scope construct:
+    **When to use ``search_bodies`` and when ``search_code``:**
 
-    - ``extern "C"`` — linkage specifier at file scope
-    - Type declarations in headers — ``InterruptIn _pin;`` in class bodies
-    - ``#include``, ``#define``, ``#ifdef`` — preprocessor directives
-    - Global/static variable definitions outside functions
-    - Namespace declarations
-    - Any code outside ``{ }`` of a function definition
+    - ``search_bodies`` — patterns in the code (what the code DOES or
+      DECLARES): ``batt test``, ``attach``, ``BATT_TEST``.
+    - ``search_code`` — symbols by NAME (what the code IS): ``modem init``,
+      ``interrupt handler``.
 
-    For a pattern that can be at file scope, use ``search_content``, which
-    indexes the full file.  ``search_bodies`` returns nothing for it.
+    **Limitation — the extent of a definition is the boundary.**  Text that
+    belongs to no definition is out of reach:
+
+    - ``#include``, ``#define``, ``#ifdef`` — preprocessor directives.
+      ``search_code`` covers a macro name and value.  ``search_content``
+      covers the directive as text.
+    - ``extern "C"`` — a linkage specifier is no symbol.
+    - A comment or a declaration at file scope, outside every definition.
+
+    For those, use ``search_content``, which indexes the full file text.
 
     Set ``project_only=True`` for a question about YOUR code (``"where do we
     register interrupt handlers?"``).  Leave it ``False`` (default) when the
     vendor SDK code — the framework or OS code that your team did not write
     — is also relevant.
 
-    Results include ``_match_snippet`` — a highlighted excerpt showing
-    each match in context (e.g. ``_timeout.<b>attach</b>(callback(...))``).
+    Results include ``_match_snippet`` — a highlighted excerpt that shows
+    each match in context (e.g. ``_timeout.<b>attach</b>(callback(...))``) —
+    and ``_match_lines``, the line numbers of the matches inside the
+    definition.  ``line`` is where the definition starts, which for a large
+    function is far from the match.  Cite from ``_match_lines`` instead.
     Project code sorts before vendor code in the output.
 
     Read-only. No side effects. Requires the FTS5 index.
@@ -695,9 +789,24 @@ def search_bodies(
         image: Sysbuild image in the variant. Omit for all images.
 
     Returns:
-        list of dicts, each with: name, qualified_name, kind, file, line,
-        is_definition, signature, _match_snippet (excerpt around match),
-        source (function body, truncated at 2000 chars).
+        list of dicts, each with: name, qualified_name, kind, file, line
+        (first line of the definition), is_definition, signature,
+        _match_snippet (excerpt around the match), source (the text of the
+        definition).
+
+        Also, when they carry an answer:
+
+        * ``_match_lines`` (list[int]) — absolute line numbers of the
+          matches, up to 20.  Computed from the full text, thus a match
+          after the cut below still has a number.  Use these to cite
+          ``file:line``, and not the ``line`` of the definition.
+        * ``_source_truncated`` (True) — ``source`` is cut.  A callable
+          keeps 2000 characters, any other kind 500, because the body of a
+          type is mostly members that the match has nothing to do with.
+          ``get_source`` gives the whole text.
+
+        ``source`` here is bare text with no line-number prefix.  Only
+        ``get_source`` numbers its lines.
 
         No match gives ``[]``.  A dict with ``error`` means the query
         failed.  A stale index prepends a dict with ``warning`` + ``hint``.
@@ -707,6 +816,10 @@ def search_bodies(
     # because _do_search may be called multiple times by stale recovery —
     # applying the clamp once here ensures consistency across retries.
     limit = max(0, min(limit, 100))
+
+    # Computed once, outside the query closure: stale recovery can call the
+    # closure again, and the terms depend only on the operator's query.
+    terms = _body_query_terms(query)
 
     expanded = _expand_query(query, for_body_search=True)
     # Body search passes the query through unmodified — repair backslashes
@@ -719,12 +832,14 @@ def search_bodies(
         expanded = _sanitize_fts5_syntax(expanded)
 
     def _do_search(c: sqlite3.Connection, config_hash: str) -> list[dict]:
-        """Execute FTS5 search over function/method definition bodies.
+        """Execute FTS5 search over the stored text of definitions.
 
-        Searches the ``symbols_fts`` FTS5 index which covers only function
-        bodies (``is_definition=1 AND source != ''``). Each result includes
-        a ``_match_snippet`` from SQLite's ``snippet()`` function for
-        contextual highlighting with ``<b>`` tags around matches.
+        Searches the ``symbols_fts`` FTS5 index, which covers the text of
+        every definition (``is_definition=1 AND source != ''``) — a
+        callable, a type, or a definition of data.  Each result includes a
+        ``_match_snippet`` from SQLite's ``snippet()`` function for
+        contextual highlighting with ``<b>`` tags around matches, and
+        ``_match_lines`` for the position that ``snippet()`` drops.
 
         **Sorting strategy — project-first:** When ``project_only=False``
         (default), results are sorted with project code first, then vendor
@@ -806,7 +921,19 @@ def search_bodies(
             }
             source = r["source"]
             if source:
-                d["source"] = source[:2000] if len(source) > 2000 else source
+                cap = _SOURCE_CAP_CALLABLE if r["kind"] in _CALLABLE_KINDS else _SOURCE_CAP_TYPE
+                if len(source) > cap:
+                    d["source"] = source[:cap]
+                    # Say that the text is cut.  Without this the caller
+                    # reads a partial body as the whole one, and nothing in
+                    # the result shows that `get_source` holds more.
+                    d["_source_truncated"] = True
+                else:
+                    d["source"] = source
+                # The lines come from the full body, thus a match after the
+                # cut above still gets a number.
+                if match_lines := _body_match_lines(source, r["line"], terms):
+                    d["_match_lines"] = match_lines
             results.append(d)
 
         if project_only:
@@ -836,18 +963,20 @@ def search_content(
     variant: Annotated[str | None, Field(description="Build variant name (multi-project). Omit to use default_variant or fail-closed. Use '*' for all variants.")] = None,
     image: Annotated[str | None, Field(description="Sysbuild image name within the variant (multi-project). Omit for all images of the variant.")] = None,
 ) -> list[dict]:
-    """Find patterns in FULL file content — not limited to function bodies.
+    """Find patterns in FULL file content — the whole file, not only the
+    text that belongs to a definition.
 
     Searches **ifdef-filtered** file text — only code that actually compiles
     for the current build configuration.  Inactive ``#ifdef`` branches are
     replaced with blank lines (preserving original line numbers).
 
-    Covers the file-scope constructs that ``search_bodies`` cannot see:
-    ``extern "C"``, ``InterruptIn`` and other type declarations in headers,
-    ``#include``, ``#define``, global variables, namespace blocks.  It
-    covers function bodies too, but prefer ``search_bodies`` there — it
-    gives per-function context and a snippet per match.  To find a symbol by
-    NAME (``modem init``, ``interrupt handler``), use ``search_code``.
+    Covers the text that belongs to no definition, which is what
+    ``search_bodies`` cannot see: ``#include``, ``#define``, ``#ifdef``,
+    ``extern "C"``, and a comment or declaration at file scope.  It covers
+    the text of definitions too, but prefer ``search_bodies`` there — it
+    reports the symbol that holds the match and the line of the match
+    itself.  To find a symbol by NAME (``modem init``, ``interrupt
+    handler``), use ``search_code``.
 
     Results are file-level — one entry per matching file.
     ``project_only=True`` filters to ``is_project = 1`` files; the default

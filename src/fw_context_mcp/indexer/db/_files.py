@@ -438,6 +438,13 @@ def get_file_map(
                     "qualified_name": r["qualified_name"],
                     "line": r["line"],
                 }
+                # The SELECT above has always read `end_line`, and nothing
+                # here gave it to the caller.  A map that gives the start
+                # and not the end makes the reader open the file to find
+                # where a symbol stops.  0 means a declaration, which has
+                # no extent, thus the key appears only when it answers.
+                if r["end_line"]:
+                    entry["end_line"] = r["end_line"]
                 if signatures and r["signature"]:
                     entry["signature"] = r["signature"]
                 groups[kind]["items"].append(entry)
