@@ -43,7 +43,7 @@ class BuildConfig:
             or None (auto-detect from project markers).
         clean: Always clean-build before generating compile_commands.json.
         command: Full shell command override — bypasses all detection when set.
-        target: Mbed OS target board name (e.g. ``"P_ECB_BOARD"``).
+        target: Mbed OS target board name (e.g. ``"BOARD_V2_BOARD"``).
         toolchain: Mbed OS toolchain (e.g. ``"GCC_ARM"``).
         profile: Mbed OS build profile (default ``"develop"``).
         app_config: Path to Mbed OS app config JSON (default ``"mbed_app.json"``).
@@ -539,7 +539,7 @@ def resolve_reuse_compile_commands(project_root: Path, configured: Path) -> Path
     at the project root — a file ``--build`` no longer produces.  Reusing that
     stale root file instead of the freshly generated one changes the
     config_hash and silently drops the injected ``-D`` defines (e.g.
-    ``SKEY_INIT_BASE64``) and any newly listed translation units.
+    ``KEY_INIT_BASE64``) and any newly listed translation units.
 
     When the configured path is exactly the legacy root file and the canonical
     file exists, prefer the canonical file.  All other configured paths

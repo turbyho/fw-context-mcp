@@ -23,7 +23,7 @@ ROOT = Path("/proj")
 def _row(**overrides) -> dict:
     base = {
         "name": "get_bv",
-        "qualified_name": "zbox::ZRTDATA::get_bv",
+        "qualified_name": "app::RuntimeData::get_bv",
         "kind": "method",
         "file_path": "src/zrtdata.cpp",
         "line": 282,

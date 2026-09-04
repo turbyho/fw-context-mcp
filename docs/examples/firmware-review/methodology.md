@@ -17,8 +17,8 @@
 | `get_source` / `get_symbol_context` | ~60 | Function body reading |
 | `get_class_members` | ~12 | Class inspection |
 | `get_file_map` | ~8 | Symbol overview in new files |
-| `get_inheritance_chain` | ~4 | MsgManager, CborMsg, BleMsg inheritance |
-| `get_method_overrides` | ~3 | Virtual methods in BleMsg hierarchy |
+| `get_inheritance_chain` | ~4 | MsgManager, CborMsg, RadioMsg inheritance |
+| `get_method_overrides` | ~3 | Virtual methods in RadioMsg hierarchy |
 | `find_callers` | ~35 | Direct callers of changed functions |
 | `find_all_callers_recursive` | ~5 | Transitive call tree |
 | `find_callees_recursive` | ~10 | Transitive callee analysis |
@@ -47,12 +47,12 @@
 
 | Query type | fw-context tool | Example from the review |
 |-----------|-------------------|---------|
-| Find function by name | `lookup_symbol(exact=true)` | `"nexbox::BleMsgManager::process_cons"` |
-| Find class and its methods | `lookup_symbol` + `get_class_members` | `"nexbox::NCfgDataManager"` |
+| Find function by name | `lookup_symbol(exact=true)` | `"device::RadioMsgManager::process_cons"` |
+| Find class and its methods | `lookup_symbol` + `get_class_members` | `"device::ConfigManager"` |
 | Find symbols by concept | `search_code` | `"interrupt handler"` (not used in this review) |
-| Preview new files | `get_file_map` | `"ble_msg.cpp"` |
-| Inheritance | `get_inheritance_chain(transitive=true)` | `"nexbox::MsgManager"` |
-| Virtual dispatch | `get_method_overrides` | `"nexbox::BleMsg::process_prod_specialized"` |
+| Preview new files | `get_file_map` | `"radio_msg.cpp"` |
+| Inheritance | `get_inheritance_chain(transitive=true)` | `"device::MsgManager"` |
+| Virtual dispatch | `get_method_overrides` | `"device::RadioMsg::process_prod_specialized"` |
 
 ### 2.2 Code reading → always fw-context
 
@@ -83,8 +83,8 @@
 
 **Key distinction used in the review:**
 - `search_bodies("attach")` — finding callback registrations in function bodies
-- `search_content("CH_ECB")` — finding preprocessor directives and comments across files
-- `search_content("#define SKEY_INIT")` — finding macros (only `search_content` sees them)
+- `search_content("BOARD_V1")` — finding preprocessor directives and comments across files
+- `search_content("#define SESSION_KEY_INIT")` — finding macros (only `search_content` sees them)
 
 ### 2.5 Where fw-context **cannot** be used → other tools
 
@@ -105,59 +105,59 @@
 
 ## 3. Per-Subagent Breakdown
 
-### 3.1 Subagent #1: nble.cpp/h analysis
+### 3.1 Subagent #1: radio_driver.cpp/h analysis
 
-**Task:** Analyze changes in `src/nble.cpp` and `src/nble.h`
+**Task:** Analyze changes in `src/radio_driver.cpp` and `src/radio_driver.h`
 
 | Step | Tool | fw-context? | Result |
 |------|----------------|-------------|----------|
-| Find NBLE symbols | `lookup_symbol("nexbox::NBLE")` | ✅ | Found 23 changed/added functions |
+| Find RADIO symbols | `lookup_symbol("device::RADIO")` | ✅ | Found 23 changed/added functions |
 | Read `update_rw_sdkv3_char` | `get_source` | ✅ | Confirmed chunking logic |
 | Read `onDataWritten` | `get_source` | ✅ | Found memory leak (C1) |
 | Read `requestConnParamsUpdate` | `get_source` | ✅ | Found `error` vs `err` bug (C2) |
-| Callers `check_msg` | `find_callers` | ✅ | BleMsgManager::_flush_prod_buffer, onDataSent |
-| Callers `write_cmd_sdkv3` | `find_callers` | ✅ | BleMsgToken::process_cons_specialized |
-| Callers `get_rx_mailbox` | `find_callers` | ✅ | BleMsgManager::_get_cons_buffer, _release_cons_buffer |
+| Callers `check_msg` | `find_callers` | ✅ | RadioMsgManager::_flush_prod_buffer, onDataSent |
+| Callers `write_cmd_sdkv3` | `find_callers` | ✅ | RadioMsgToken::process_cons_specialized |
+| Callers `get_rx_mailbox` | `find_callers` | ✅ | RadioMsgManager::_get_cons_buffer, _release_cons_buffer |
 | Find `send_to_main_queue` | `search_bodies` | ✅ | Confirmed single-thread model |
 | Find `CriticalSection` | `search_content` | ✅ | Verified critical_section removal |
 | Callers `onDataSent` | `find_callers` | ✅ | BLE stack callback |
 
 **fw-context coverage:** 100% — every C/C++ operation went through fw-context
 
-### 3.2 Subagent #2: modem_msg.cpp/h analysis
+### 3.2 Subagent #2: net_msg.cpp/h analysis
 
-**Task:** Analyze changes in the modem_msg subsystem
+**Task:** Analyze changes in the net_msg subsystem
 
 | Step | Tool | fw-context? | Result |
 |------|----------------|-------------|----------|
-| Find ModemMsg | `lookup_symbol(exact=true, "nexbox::ModemMsg")` | ✅ | Found all class methods |
+| Find ModemMsg | `lookup_symbol(exact=true, "device::ModemMsg")` | ✅ | Found all class methods |
 | Class inspection | `get_class_members` | ✅ | Full member listing |
-| Read KeyV3 methods | `get_source` | ✅ | Confirmed key rotation |
+| Read KeyFormatV3 methods | `get_source` | ✅ | Confirmed key rotation |
 | Read DspCom methods | `get_source` | ✅ | Found ignored response data |
-| Callers KeyV3 | `find_callers` | ✅ | ModemMsgManager |
+| Callers KeyFormatV3 | `find_callers` | ✅ | ModemMsgManager |
 | Callers DspCom | `find_callers` | ✅ | AppManager, LbKeyboard |
 | Find `localtime` | `search_bodies` | ✅ | Found pre-existing bug in NTP |
-| Find `SocketType` | `search_content` | ✅ | Confirmed NORMAL socket for DSP_COM |
+| Find `SocketType` | `search_content` | ✅ | Confirmed NORMAL socket for PANEL_COM |
 
 **fw-context coverage:** 100% for C/C++ analysis
 
-### 3.3 Subagent #3: ncfgdata_manager + ncfgdata_fram
+### 3.3 Subagent #3: config_manager + config_store
 
 **Task:** Analyze changes in persisted data and key management
 
 | Step | Tool | fw-context? | Result |
 |------|----------------|-------------|----------|
-| Find NCfgDataManager | `lookup_symbol(exact=true)` | ✅ | Found all methods |
+| Find ConfigManager | `lookup_symbol(exact=true)` | ✅ | Found all methods |
 | Class inspection | `get_class_members` | ✅ | Complete member listing |
 | Read `_initialize_keys` | `get_source` | ✅ | Found breaking change in indices |
 | Read `get_key` / `set_key` | `get_source` | ✅ | New rotation API |
 | Callers `get_key` | `find_callers` | ✅ | 161 callers — encrypt_pin, decrypt_pin, BleToken |
-| Callers `set_key` | `find_callers` | ✅ | ModemMsgKeyV3 |
+| Callers `set_key` | `find_callers` | ✅ | ModemMsgKeyFormatV3 |
 | References `InventorySlot` | `find_references` | ✅ | 7 locations — confirmed sizeof=41 |
 | Find `sizeof(InventorySlot)` | `search_bodies` | ✅ | Confirmed static_assert |
 | Find `_num_shipments` | `search_bodies` | ✅ | Found all accesses |
 | Find `DataCfg` | `search_content` | ✅ | Confirmed unchanged |
-| Find `CH_ECB` | `search_content` | ✅ | Confirmed complete removal |
+| Find `BOARD_V1` | `search_content` | ✅ | Confirmed complete removal |
 | Read `_write_old_slot` | `get_source` | ✅ | Found missing `_num_shipments` in migration |
 
 **fw-context coverage:** 100%
@@ -168,10 +168,10 @@
 
 | Step | Tool | fw-context? | Result |
 |------|----------------|-------------|----------|
-| Overview ble_msg.cpp | `get_file_map` | ✅ | Found BleMsg, BleMsgToken, BleMsgState, BleMsgDefault |
-| Overview ble_msg_manager.cpp | `get_file_map` | ✅ | Found BufferCons, process_cons/prod/timers |
-| MsgManager inheritance | `get_inheritance_chain(transitive=true)` | ✅ | MsgManager → BleMsgManager |
-| CborMsg inheritance | `get_inheritance_chain(transitive=true)` | ✅ | CborMsg → BleMsg → Token/State/Default |
+| Overview radio_msg.cpp | `get_file_map` | ✅ | Found RadioMsg, RadioMsgToken, RadioMsgState, RadioMsgDefault |
+| Overview radio_msg_manager.cpp | `get_file_map` | ✅ | Found BufferCons, process_cons/prod/timers |
+| MsgManager inheritance | `get_inheritance_chain(transitive=true)` | ✅ | MsgManager → RadioMsgManager |
+| CborMsg inheritance | `get_inheritance_chain(transitive=true)` | ✅ | CborMsg → RadioMsg → Token/State/Default |
 | Virtual methods | `get_method_overrides` | ✅ | process_prod_specialized, process_cons_specialized |
 | Read `process_cons` | `get_source` | ✅ | Found missing frame_length validation |
 | Read `process_prod` | `get_source` | ✅ | Confirmed CRC + chunking flow |
@@ -186,23 +186,23 @@
 
 **fw-context coverage:** 100%
 
-### 3.5 Subagent #5: CH_ECB cleanup verification
+### 3.5 Subagent #5: BOARD_V1 cleanup verification
 
-**Task:** Verify complete removal of the CH_ECB target
+**Task:** Verify complete removal of the BOARD_V1 target
 
 | Step | Tool | fw-context? | Result |
 |------|----------------|-------------|----------|
-| Find `CH_ECB` | `search_content(project_only=true)` | ✅ | 0 results (except comment) |
-| Find `SIM800` | `search_content` | ✅ | 0 results |
-| Find `SIMCOM` | `search_content` | ✅ | 0 results |
-| Find `TARGET_CH_ECB` | `search_content` | ✅ | 0 results |
+| Find `BOARD_V1` | `search_content(project_only=true)` | ✅ | 0 results (except comment) |
+| Find `MODEM_A` | `search_content` | ✅ | 0 results |
+| Find `MODEM_VENDOR` | `search_content` | ✅ | 0 results |
+| Find `TARGET_BOARD_V1` | `search_content` | ✅ | 0 results |
 | Find `modbus` | `search_content` | ✅ | Only in comments and rs485.cpp |
 | Dead code | `find_dead_code(project_only=true)` | ✅ | No orphaned functions from removal |
 | File existence | `ls` (bash) | — | Verify physical deletion of 7 files |
 
 **fw-context coverage:** ~85% — `ls` is legitimate for filesystem checks outside the index
 
-### 3.6 Subagent #6: lb_keyboard + ble_cmd
+### 3.6 Subagent #6: panel_keypad + radio_cmd
 
 **Task:** Analyze changes in keyboard and BLE commands
 
@@ -213,7 +213,7 @@
 | Class inspection | `get_class_members` | ✅ | Complete member listing |
 | Read `check_buffer` | `get_source` | ✅ | Found unused `elapsed_time` |
 | Read `token_decrypt` | `get_source` | ✅ | Found incomplete array init |
-| Read `write` (BleCmd) | `get_source` | ✅ | Confirmed SKEY_INIT fallback |
+| Read `write` (BleCmd) | `get_source` | ✅ | Confirmed SESSION_KEY_INIT fallback |
 | Read `check_cmd_timeout` | `get_source` | ✅ | Confirmed SDKv2 guard |
 | Callers `check_buffer` | `find_callers` | ✅ | LbManager::_thread_lb_func |
 | Callers `token_decrypt` | `find_callers` | ✅ | BleCmd::write |
@@ -222,20 +222,20 @@
 
 **fw-context coverage:** 100%
 
-### 3.7 Subagent #7: app_manager + inventory_writer (14 files)
+### 3.7 Subagent #7: app_manager + record_writer (14 files)
 
 **Task:** Analyze changes in app_manager and related files
 
 | Step | Tool | fw-context? | Result |
 |------|----------------|-------------|----------|
-| Find AppManager | `lookup_symbol` | ✅ | Found BleMsgManager member |
+| Find AppManager | `lookup_symbol` | ✅ | Found RadioMsgManager member |
 | Find InventoryWriter | `lookup_symbol` | ✅ | Found new methods |
 | Class inspection | `get_class_members` | ✅ | MsgTypeApp enum changes |
-| Read `_periodic_app_task` | `get_source` | ✅ | Found BleMsgManager interactions |
+| Read `_periodic_app_task` | `get_source` | ✅ | Found RadioMsgManager interactions |
 | Read `dispatch_open_slot` | `get_source` | ✅ | Found conditional set_slot + lost snapshot |
 | Read `pickup_open` | `get_source` | ✅ | Confirmed snapshot logic |
 | References `CFG_INVALID_SKEY` | `find_references` | ✅ | Used in shutdown system |
-| Find `MODEM_MSG_PKEY` | `search_content` | ✅ | Renamed to PKEYV3 |
+| Find `NET_MSG_PKEY` | `search_content` | ✅ | Renamed to PKEY_V3 |
 | Find `is_keyboard_cfg` | `search_content` | ✅ | Confirmed scope fix |
 
 **fw-context coverage:** 100%
@@ -246,18 +246,18 @@
 
 | Step | Tool | fw-context? | Result |
 |------|----------------|-------------|----------|
-| Find `NTP_MAX_DIFF_SEC` | `search_content` | ✅ | Found definition in nconfig.h |
-| Find `BLE_DEFAULT_LL_DATA_SIZE` | `search_content` | ✅ | Found definition in nconfig.h |
+| Find `NTP_MAX_DIFF_SEC` | `search_content` | ✅ | Found definition in app_config.h |
+| Find `BLE_DEFAULT_LL_DATA_SIZE` | `search_content` | ✅ | Found definition in app_config.h |
 | Find `NUM_KEYS_FOR_ROTATION` | `search_content` | ✅ | Confirmed change 3→2 |
-| Find `SKEY_INIT_BASE64` | `search_content` | ✅ | Found #error guard |
-| Find `CH_ECB` in nconfig.h | `search_content` | ✅ | Confirmed removal |
+| Find `SESSION_KEY_INIT_BASE64` | `search_content` | ✅ | Found #error guard |
+| Find `BOARD_V1` in app_config.h | `search_content` | ✅ | Confirmed removal |
 | Read `restrict_size` | `read` | — | JSON file |
 | Read `mbed_app.json` | `read` / diff | — | JSON file |
 | Read `mbed_app_dbg.json` | `read` | — | JSON file |
 | Read `.gitlab-ci.yml` | `read` / diff | — | YAML file |
 | Read `build_app.py` | `read` / diff | — | Python script |
 
-**fw-context coverage:** ~40%. The review analyzed nconfig.h with fw-context, but used standard tools for JSON, YAML, and Python files. **This is correct** — fw-context is designed only for C/C++.
+**fw-context coverage:** ~40%. The review analyzed app_config.h with fw-context, but used standard tools for JSON, YAML, and Python files. **This is correct** — fw-context is designed only for C/C++.
 
 ---
 
@@ -267,13 +267,13 @@
 |-------|-------------------|---------------------------|
 | Memory leak in `onDataWritten` | `get_source` | Exact callback body — `grep` would not find the `try_alloc`/`put`/`free` pairing |
 | `error` vs `err` in `requestConnParamsUpdate` | `get_source` | Libclang extents — exact function boundaries |
-| Ignored DSP_COM response | `get_source` | Body of `process_cons_specialized` — CBOR decode called but data not read |
+| Ignored PANEL_COM response | `get_source` | Body of `process_cons_specialized` — CBOR decode called but data not read |
 | Missing `_num_shipments` in migration | `get_source` + `search_bodies` | `operator=` from `InventorySlotOld` — manual field comparison |
 | `_p_msg` not reset after CRC error | `get_source` | `_clean_cons_process()` — `grep` would not find the absence of `_p_msg = nullptr` |
 | Dead code `get_last_key` | `find_callers` | `grep` would find both definition and calls — but `find_callers` showed 0 callers |
 | 161 callers of `get_key` | `find_callers` | `grep` would have to search 2 562 files — manually impossible |
 | Race condition `_thread_app_func` vs `_periodic_app_task` | `find_callers` on both | Revealed shared access to `_p_msg` from two thread contexts |
-| Complete CH_ECB removal verification | `search_content` ×4 | FTS5 search across 2 562 files in seconds vs minutes of grep |
+| Complete BOARD_V1 removal verification | `search_content` ×4 | FTS5 search across 2 562 files in seconds vs minutes of grep |
 
 ---
 
@@ -281,10 +281,10 @@
 
 | Anti-pattern | How it was avoided | Concrete case |
 |-------------|-------------------|-----------------|
-| Using `grep` to find callers | Used `find_callers` | `find_callers("nexbox::BleMsgManager::register_prod")` — found 0 callers (unlike `grep` which wouldn't distinguish declaration from call) |
+| Using `grep` to find callers | Used `find_callers` | `find_callers("device::RadioMsgManager::register_prod")` — found 0 callers (unlike `grep` which wouldn't distinguish declaration from call) |
 | Using `grep` for `sizeof` | Used `search_bodies("sizeof.*InventorySlot")` | Found static_assert in code |
-| Using `cat`/`read` for C/C++ | Used `get_source` | `get_source("nexbox::NBLE::onDataWritten")` — exact callback body |
-| Using `grep` for `CH_ECB` | Used `search_content` | FTS5 index, ifdef-filtered content |
+| Using `cat`/`read` for C/C++ | Used `get_source` | `get_source("device::RADIO::onDataWritten")` — exact callback body |
+| Using `grep` for `BOARD_V1` | Used `search_content` | FTS5 index, ifdef-filtered content |
 | Using `find` for dead code | Used `find_dead_code(project_only=true)` | Detection of orphaned functions across the entire project |
 
 ---

@@ -18,7 +18,7 @@ from fw_context_mcp.indexer.build import (
 
 class TestDetectBuildSystem:
     def test_mbed_os_detected_via_dotfile(self, tmpdir):
-        (tmpdir / ".mbed").write_text("TOOLCHAIN=GCC_ARM\nTARGET=P_ECB_BOARD\n")
+        (tmpdir / ".mbed").write_text("TOOLCHAIN=GCC_ARM\nTARGET=BOARD_V2_BOARD\n")
         assert detect_build_system(tmpdir) == "mbed-os"
 
     def test_mbed_os_detected_via_mbed_os_dir(self, tmpdir):
@@ -53,9 +53,9 @@ class TestDetectBuildSystem:
 class TestParseMbedDotfile:
     def test_parses_valid_file(self, tmpdir):
         dotfile = tmpdir / ".mbed"
-        dotfile.write_text("TOOLCHAIN=GCC_ARM\nTARGET=P_ECB_BOARD\nROOT=.\n")
+        dotfile.write_text("TOOLCHAIN=GCC_ARM\nTARGET=BOARD_V2_BOARD\nROOT=.\n")
         result = _parse_mbed_dotfile(tmpdir)
-        assert result == {"TOOLCHAIN": "GCC_ARM", "TARGET": "P_ECB_BOARD", "ROOT": "."}
+        assert result == {"TOOLCHAIN": "GCC_ARM", "TARGET": "BOARD_V2_BOARD", "ROOT": "."}
 
     def test_ignores_comments_and_empty_lines(self, tmpdir):
         dotfile = tmpdir / ".mbed"
@@ -71,18 +71,18 @@ class TestMbedTargetFromCustomTargets:
     def test_extracts_first_board(self, tmpdir):
         ct = tmpdir / "custom_targets.json"
         ct.write_text(json.dumps({
-            "P_ECB_BOARD": {"inherits": ["MCU_NRF52840"]},
+            "BOARD_V2_BOARD": {"inherits": ["MCU_NRF52840"]},
             "OTHER_BOARD": {"inherits": ["MCU_STM32"]},
         }))
-        assert _mbed_target_from_custom_targets(tmpdir) == "P_ECB_BOARD"
+        assert _mbed_target_from_custom_targets(tmpdir) == "BOARD_V2_BOARD"
 
     def test_skips_non_board_keys(self, tmpdir):
         ct = tmpdir / "custom_targets.json"
         ct.write_text(json.dumps({
             "some_setting": "value",
-            "P_ECB_BOARD": {"inherits": ["MCU_NRF52840"]},
+            "BOARD_V2_BOARD": {"inherits": ["MCU_NRF52840"]},
         }))
-        assert _mbed_target_from_custom_targets(tmpdir) == "P_ECB_BOARD"
+        assert _mbed_target_from_custom_targets(tmpdir) == "BOARD_V2_BOARD"
 
     def test_missing_file_returns_none(self, tmpdir):
         assert _mbed_target_from_custom_targets(tmpdir) is None

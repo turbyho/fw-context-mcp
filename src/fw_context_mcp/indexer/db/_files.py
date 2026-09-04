@@ -352,7 +352,7 @@ def get_file_map(
 ) -> dict:
     """Return all symbols in a file grouped by kind — fast structural overview.
 
-    *file_path* is relative to the project root (e.g. ``src/modem_msg.cpp``),
+    *file_path* is relative to the project root (e.g. ``src/net_msg.cpp``),
     matching the ``symbols.file_path`` column.  Exact match first, then
     LIKE-based path match so both ``src/main.cpp`` and ``main.cpp`` work.
 
@@ -370,8 +370,8 @@ def get_file_map(
     ).fetchall()
 
     # Two-phase path matching — the symbols table stores the relative
-    # path as libclang sees it (e.g. "src/modem_msg.cpp"), but callers
-    # may pass just the filename ("modem_msg.cpp") or a partial path.
+    # path as libclang sees it (e.g. "src/net_msg.cpp"), but callers
+    # may pass just the filename ("net_msg.cpp") or a partial path.
     #
     # Phase 1: exact file_path match.  Uses the index on (config_hash,
     # file_path), fast for the common case.
@@ -380,7 +380,7 @@ def get_file_map(
     # _escape_like call prevents "_" and "%" in the filename itself
     # from matching as wildcards (important for filenames like
     # "hw_config_v2.cpp" where "v2" must be literal).  The prefix "%"
-    # allows "modem_msg.cpp" to match "src/net/modem_msg.cpp".
+    # allows "net_msg.cpp" to match "src/net/net_msg.cpp".
     if not rows:
         rows = conn.execute(
             """SELECT name, qualified_name, kind, line, col, end_line,

@@ -15,7 +15,7 @@
 | Total lines in src/ | ~67 000 (54K .cpp + 13K .h) |
 | Average .cpp size | 1 466 lines |
 | Average .h size | 342 lines |
-| Largest analyzed file | `modem_msg.cpp` — 4 745 lines |
+| Largest analyzed file | `net_msg.cpp` — 4 745 lines |
 | Subagents | 8 (6 successful with full analysis) |
 | Total fw-context calls | ~231 |
 
@@ -205,11 +205,11 @@ Even the "least effective" tools save 10× — still an order of magnitude fewer
 Traditional `grep` for `grep -rn "get_key(" src/ lib/` would return:
 - Actual calls `get_key(...)`
 - Declarations `bool get_key(...)`
-- Definitions `bool NCfgDataManager::get_key(...)`
+- Definitions `bool ConfigManager::get_key(...)`
 - Comments `// calls get_key`
 - String literals `"get_key"`
 
-The LLM would have to read all these results, and filter them manually. This filtering costs additional tokens, on the prompt and the chain-of-thought. fw-context `find_callers("nexbox::NCfgDataManager::get_key")` returns **only call sites**.
+The LLM would have to read all these results, and filter them manually. This filtering costs additional tokens, on the prompt and the chain-of-thought. fw-context `find_callers("device::ConfigManager::get_key")` returns **only call sites**.
 
 ### 6.2 Exact Function Boundaries (libclang Extents)
 
@@ -217,11 +217,11 @@ Traditional approach: `read file.cpp offset=100 limit=200` — you have to **gue
 
 ### 6.3 Ifdef-Filtered Content
 
-The project has `#ifdef TARGET_P_ECB_BOARD` / `#ifdef TARGET_CH_ECB_BOARD` (historically). Traditional `read`/`grep` would show **all branches**, including dead code for CH_ECB. The LLM would analyze code that never compiles. fw-context `search_content` and `get_source` show **only what actually compiles** for the active build configuration.
+The project has `#ifdef TARGET_BOARD_V2_BOARD` / `#ifdef TARGET_BOARD_V1_BOARD` (historically). Traditional `read`/`grep` would show **all branches**, including dead code for BOARD_V1. The LLM would analyze code that never compiles. fw-context `search_content` and `get_source` show **only what actually compiles** for the active build configuration.
 
 ### 6.4 Automatic Deduplication
 
-With 8 parallel subagents, and without fw-context, each subagent would have to read the same header files over and over, for example `nconfig.h` or `ncfgdata_manager.h`. Each subagent has its own context window. With fw-context, each subagent gets only relevant excerpts. fw-context does not read a header in full, only the queried symbols.
+With 8 parallel subagents, and without fw-context, each subagent would have to read the same header files over and over, for example `app_config.h` or `config_manager.h`. Each subagent has its own context window. With fw-context, each subagent gets only relevant excerpts. fw-context does not read a header in full, only the queried symbols.
 
 ---
 

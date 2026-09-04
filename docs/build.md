@@ -79,7 +79,7 @@ detection or to force a specific builder.
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `target` | `str` | (from `.mbed`) | The target board name, for example `"P_ECB_BOARD"` |
+| `target` | `str` | (from `.mbed`) | The target board name, for example `"BOARD_V2_BOARD"` |
 | `toolchain` | `str` | (from `.mbed`) | The toolchain, for example `"GCC_ARM"` |
 | `profile` | `str` | `"develop"` | The build profile |
 | `app_config` | `str` | `"mbed_app.json"` | The application configuration JSON file |
@@ -259,7 +259,7 @@ Build command: `west build -b nrf52840dk_nrf52840`. CMake generates
 ```toml
 [build]
 system = "mbed-os"
-target = "P_ECB_BOARD"
+target = "BOARD_V2_BOARD"
 toolchain = "GCC_ARM"
 profile = "develop"
 extra_profiles = ["lto.json"]
@@ -489,7 +489,7 @@ toolchain = "GCC_ARM"
 
 [[build.variants]]
 name = "target-a"
-target = "P_ECB_BOARD"
+target = "BOARD_V2_BOARD"
 defines = ["HW_REV=1"]
 
 [[build.variants]]

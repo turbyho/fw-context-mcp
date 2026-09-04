@@ -323,7 +323,7 @@ def _qualified_name(
 
     When *anon_map* is provided and *cursor* is an anonymous struct/union
     with a recorded field name, the field name is used in place of the
-    anonymous marker (e.g. ``"_ble_cmd"`` instead of
+    anonymous marker (e.g. ``"_radio_cmd"`` instead of
     ``"struct (unnamed at ...)"``).
 
     Returns a string like ``"namespace::Class::method"``, or an empty
@@ -737,8 +737,8 @@ def _class_match_score(hint: str, class_part: str) -> int:
     """Score how well a field-name hint matches a class name.
 
     Multi-level matching designed for the fallback path where field
-    names use snake_case (``_ble_msg_manager``) but class names use
-    CamelCase (``BleMsgManager``), or where the field name is a
+    names use snake_case (``_radio_msg_manager``) but class names use
+    CamelCase (``RadioMsgManager``), or where the field name is a
     superset of the class name (``_uart_driver`` → ``UART_DRIVER``).
 
     Returns 0 = no match, 1 = weak (token-level), 2 = good.
@@ -2329,7 +2329,7 @@ def extract_all(
     class_cursors: list[cx.Cursor] = []  # class/struct def cursors for inheritance extraction
 
     # Pre-scan: map anonymous struct/union USRs to their field names
-    # (e.g. struct { ... } _ble_cmd;  →  anon_usr → "_ble_cmd")
+    # (e.g. struct { ... } _radio_cmd;  →  anon_usr → "_radio_cmd")
     anon_usr_to_field = _build_anon_usr_to_field(
         tu.cursor, skip_files=_skip_frozen, resolve_fn=_resolve,
     )

@@ -171,7 +171,7 @@ _PROJECT_DEFAULTS_TEMPLATE = """\
 # Most values are auto-detected from .mbed and custom_targets.json.
 # Override them here when auto-detection is wrong or incomplete.
 #
-# target = "P_ECB_BOARD"
+# target = "BOARD_V2_BOARD"
 # toolchain = "GCC_ARM"
 # profile = "develop"
 # app_config = "mbed_app.json"

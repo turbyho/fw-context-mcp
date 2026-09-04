@@ -26,7 +26,7 @@ the token savings compared with traditional `grep` and `read` workflows.
 | Cross-module race condition | `find_callers` on both functions | Traced two call chains to different thread contexts — invisible in single-file reads |
 | Dead code after migration | `find_callers` | Zero callers confirmed — `grep` would find the definition and make it look used |
 | Missing frame length validation | `get_source` | Absence of bounds check visible in exact function body — `grep` only shows where things **are** |
-| Complete CH_ECB target removal | `search_content` ×4 | FTS5 index searched 2 562 files in seconds, ifdef-filtered — `grep -r` takes minutes |
+| Complete BOARD_V1 target removal | `search_content` ×4 | FTS5 index searched 2 562 files in seconds, ifdef-filtered — `grep -r` takes minutes |
 
 Traditional `grep` and `read` workflows could not find **9 of the 19 findings**.
 
