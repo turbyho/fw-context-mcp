@@ -37,26 +37,6 @@ if TYPE_CHECKING:
 log = logging.getLogger(__name__)
 
 
-def _round_robin(groups: list[list], limit: int | None) -> list:
-    """Merge *groups* one item per group in turn, and cut at *limit*.
-
-    A plain concatenation with a cut spends the whole budget on the first
-    group, thus the later builds of a multi-variant project would never
-    appear.  Taking one item per group in turn shows every build first,
-    and only then a second item from any of them.
-
-    ``limit`` of ``None`` keeps everything, which is what a caller that
-    documents no maximum wants.
-    """
-    merged: list = []
-    for depth in range(max((len(g) for g in groups), default=0)):
-        for group in groups:
-            if depth < len(group):
-                merged.append(group[depth])
-                if limit is not None and len(merged) >= limit:
-                    return merged
-    return merged
-
 
 @dataclasses.dataclass
 class DbContext:
@@ -87,95 +67,31 @@ class DbContext:
     scopes: list[dict] = dataclasses.field(default_factory=list)
     multi: bool = False
 
-    def execute_scoped(self, query_fn, limit: int | None = None):
-        """Run ``query_fn(conn, config_hash)`` per build scope, merge + annotate.
+    def execute_scoped(self, query_fn):
+        """Run ``query_fn(conn, config_hash)`` for the selected build.
 
-        Single-scope calls keep the result shape of ``executor.execute_sync``.
-        Multi-scope calls merge per-build outputs: list items and dict records
-        gain a ``variant``/``image`` key so the LLM always knows which build
-        produced a result.
+        ``resolve_scopes`` answers with ONE scope, because a question about
+        code is a question about one program — see the docstring of
+        ``shared/variants.py``.  This therefore runs one query and returns
+        its result unchanged.
 
-        Every scope goes through ``with_stale_annotation``, thus a result that
-        names a changed file carries a warning.  Without it the call-graph and
-        inheritance handlers gave index data as current data, and the caller
-        had no way to see the difference.  ``run_scoped_query`` in
+        The call goes through ``with_stale_annotation``, thus a result that
+        names a changed file carries a warning.  Without it the call-graph
+        and inheritance handlers gave index data as current data, and the
+        caller had no way to see the difference.  ``run_scoped_query`` in
         ``shared/variants.py`` does the same for the lookup handler.
 
-        *limit* bounds the MERGED list, and a caller that documents a maximum
-        must pass it.  ``query_fn`` carries the limit of one scope, thus a
-        plain merge multiplied it by the number of scopes: measured on a
-        two-variant project with five images, a request for 4 rows answered
-        with 16.  The rows are taken one per scope in turn, so every build
-        appears before any build gets a second row, and a busy variant cannot
-        crowd out a quiet one.  A notice is metadata and never counts.
+        This used to merge the answers of several builds, interleave them and
+        share one limit between them.  That machinery is gone with the
+        merging it served: a bootloader and an application are separate
+        programs, and one answer about both served no question.
         """
         from ..shared.stale import with_stale_annotation
 
-        if len(self.scopes) <= 1:
-            return with_stale_annotation(
-                self.root, self.executor, query_fn, self.config_hash
-            )
-        # Every scope reports staleness on its own, and the scopes usually
-        # share the same changed files.  Collect the notices and emit each
-        # distinct one once, otherwise a three-variant project shows the same
-        # warning three times and reads like three separate problems.
-        notices: list[str] = []
-        per_scope: list[list] = []
-        singles: list = []
-        meta: list = []
-        for index, scope in enumerate(self.scopes):
-            # Only the first scope diagnoses an empty result.  That answer
-            # describes the project — files changed on disk, sources absent
-            # from compile_commands.json — not one build of it, so every
-            # scope reaches the same conclusion and the dedup below drops
-            # all but one.  It is not cheap to reach: a scan of every
-            # indexed file plus a listing of the source tree, and it runs
-            # inside the executor lock.  Nine configs on the Zephyr project
-            # paid for it nine times and used one.
-            part = with_stale_annotation(
-                self.root, self.executor, query_fn, scope["config_hash"],
-                diagnose_empty=(index == 0),
-            )
-            rows: list = []
-            if isinstance(part, list):
-                for r in part:
-                    if isinstance(r, dict) and set(r) == {"warning"}:
-                        notices.append(r["warning"])
-                        continue
-                    if isinstance(r, dict) and ("info" in r or "error" in r):
-                        # A scope that found nothing says so, and that is an
-                        # answer about that build.  It is not a result, thus
-                        # it must not spend a slot of the limit and push a
-                        # real row out of a sibling scope.
-                        meta.append(
-                            {**r, "variant": scope["variant"], "image": scope["image"]}
-                            if "error" not in r else r
-                        )
-                        continue
-                    if isinstance(r, dict) and "warning" not in r:
-                        r = dict(r)
-                        r["variant"] = scope["variant"]
-                        r["image"] = scope["image"]
-                    rows.append(r)
-                per_scope.append(rows)
-            elif isinstance(part, dict):
-                if "error" in part:
-                    singles.append(part)
-                else:
-                    d = dict(part)
-                    d["variant"] = scope["variant"]
-                    d["image"] = scope["image"]
-                    singles.append(d)
-            else:
-                singles.append(part)
-
-        payload = _round_robin(per_scope, limit)
-        # A "nothing here" line is worth keeping only when no build answered.
-        # With a real row beside it, it is noise that costs the reader tokens.
-        merged: list = singles + payload + ([] if payload else meta)
-        if notices:
-            merged[:0] = [{"warning": w} for w in dict.fromkeys(notices)]
-        return merged
+        config_hash = self.scopes[0]["config_hash"] if self.scopes else self.config_hash
+        return with_stale_annotation(
+            self.root, self.executor, query_fn, config_hash
+        )
 
 
 class BaseHandler:

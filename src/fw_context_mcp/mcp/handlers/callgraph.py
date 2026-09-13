@@ -344,15 +344,15 @@ def _references_result(name: str, project_root: str | None, ref_kind: str | list
             result.insert(0, ambiguity_notice(name, candidate_labels(candidates), label))
         return result
 
-    return db.execute_scoped(_query, limit=max(0, min(limit, 200)))
+    return db.execute_scoped(_query)
 
 # ── moved from server.py ──
 def find_callers(
     name: Annotated[str, Field(description="Symbol name to find callers of. Returns direct call sites and indirect calls via function pointers.")],
     project_root: Annotated[str | None, Field(description="Project root. Auto-detected if omitted.")] = None,
     limit: Annotated[int, Field(description="Maximum results.")] = 50,
-    variant: Annotated[str | None, Field(description="Build variant name (multi-project). Omit to use default_variant or fail-closed. Use '*' for all variants.")] = None,
-    image: Annotated[str | None, Field(description="Sysbuild image name within the variant (multi-project). Omit for all images of the variant.")] = None,
+    variant: Annotated[str | None, Field(description="Build variant (multi-build project). Omit to use default_variant. One query answers for ONE build.")] = None,
+    image: Annotated[str | None, Field(description="Sysbuild image within the variant. Required when the variant holds several: each image is a separate program.")] = None,
 ) -> list[dict]:
     """Find who calls a C/C++ function — direct calls AND indirect via
     function pointers, callbacks, interrupt vector registrations, and
@@ -391,9 +391,10 @@ def find_callers(
             suffix LIKE).
         project_root: Project root directory. Auto-detected if omitted.
         limit: Maximum results (default 50).
-        variant: Build variant (multi-project). Omit for the default
-            variant, ``"*"`` for all.
-        image: Sysbuild image in the variant. Omit for all images.
+        variant: Build variant (multi-build project). Omit to use
+            default_variant. One query answers for ONE build.
+        image: Sysbuild image within the variant. Required when the
+            variant holds several: each image is a separate program.
 
     Returns:
         list of dicts, each with: file, line, ref_kind (``"call"``,
@@ -418,8 +419,8 @@ def find_references(
     name: Annotated[str, Field(description="Symbol name to find all references of — calls, reads, member accesses.")],
     project_root: Annotated[str | None, Field(description="Project root. Auto-detected if omitted.")] = None,
     limit: Annotated[int, Field(description="Maximum results.")] = 50,
-    variant: Annotated[str | None, Field(description="Build variant name (multi-project). Omit to use default_variant or fail-closed. Use '*' for all variants.")] = None,
-    image: Annotated[str | None, Field(description="Sysbuild image name within the variant (multi-project). Omit for all images of the variant.")] = None,
+    variant: Annotated[str | None, Field(description="Build variant (multi-build project). Omit to use default_variant. One query answers for ONE build.")] = None,
+    image: Annotated[str | None, Field(description="Sysbuild image within the variant. Required when the variant holds several: each image is a separate program.")] = None,
 ) -> list[dict]:
     """Find ALL references to a C/C++ symbol — calls, reads, member accesses,
     function pointer registrations, template references, and macro
@@ -444,9 +445,10 @@ def find_references(
         name: Symbol name to find all references of.
         project_root: Project root directory. Auto-detected if omitted.
         limit: Maximum results (default 50, max 200).
-        variant: Build variant (multi-project). Omit for the default
-            variant, ``"*"`` for all.
-        image: Sysbuild image in the variant. Omit for all images.
+        variant: Build variant (multi-build project). Omit to use
+            default_variant. One query answers for ONE build.
+        image: Sysbuild image within the variant. Required when the
+            variant holds several: each image is a separate program.
 
     Returns:
         list of dicts, each with: file, line, ref_kind, caller, caller_kind.
@@ -474,8 +476,8 @@ def find_indirect_call_sites(
     name: Annotated[str, Field(description="Name of the function pointer field or variable to find call sites of. E.g. 'onData' finds all calls through Driver::onData.")],
     project_root: Annotated[str | None, Field(description="Project root directory. Auto-detected if omitted.")] = None,
     limit: Annotated[int, Field(description="Maximum results (default 50).")] = 50,
-    variant: Annotated[str | None, Field(description="Build variant name (multi-project). Omit to use default_variant or fail-closed. Use '*' for all variants.")] = None,
-    image: Annotated[str | None, Field(description="Sysbuild image name within the variant (multi-project). Omit for all images of the variant.")] = None,
+    variant: Annotated[str | None, Field(description="Build variant (multi-build project). Omit to use default_variant. One query answers for ONE build.")] = None,
+    image: Annotated[str | None, Field(description="Sysbuild image within the variant. Required when the variant holds several: each image is a separate program.")] = None,
 ) -> list[dict]:
     """Find indirect call sites where a C/C++ function pointer field or
     variable is invoked. libclang-powered: resolves calls through
@@ -503,9 +505,10 @@ def find_indirect_call_sites(
             qualified, suffix LIKE.
         project_root: Project root directory. Auto-detected if omitted.
         limit: Maximum results (default 50, max 200).
-        variant: Build variant (multi-project). Omit for the default
-            variant, ``"*"`` for all.
-        image: Sysbuild image in the variant. Omit for all images.
+        variant: Build variant (multi-build project). Omit to use
+            default_variant. One query answers for ONE build.
+        image: Sysbuild image within the variant. Required when the
+            variant holds several: each image is a separate program.
 
     Returns:
         list of dicts, each with: file, line, expr_text (the callee
@@ -554,7 +557,7 @@ def find_indirect_call_sites(
             for r in rows
         ]
 
-    return db.execute_scoped(_query, limit=max(0, min(limit, 200)))
+    return db.execute_scoped(_query)
 
 # ── moved from server.py ──
 def find_indirect_targets(
@@ -562,8 +565,8 @@ def find_indirect_targets(
         "E.g. 'onData' — returns functions assigned to Driver::onData.")],
     project_root: Annotated[str | None, Field(description="Project root. Auto-detected if omitted.")] = None,
     limit: Annotated[int, Field(description="Maximum results (default 50, max 200).")] = 50,
-    variant: Annotated[str | None, Field(description="Build variant name (multi-project). Omit to use default_variant or fail-closed. Use '*' for all variants.")] = None,
-    image: Annotated[str | None, Field(description="Sysbuild image name within the variant (multi-project). Omit for all images of the variant.")] = None,
+    variant: Annotated[str | None, Field(description="Build variant (multi-build project). Omit to use default_variant. One query answers for ONE build.")] = None,
+    image: Annotated[str | None, Field(description="Sysbuild image within the variant. Required when the variant holds several: each image is a separate program.")] = None,
 ) -> list[dict]:
     """Find functions assigned to a C/C++ function pointer field or
     variable. libclang-powered: links assignment sites to call sites
@@ -591,9 +594,10 @@ def find_indirect_targets(
             named ``onData``.  Uses three-tier resolution.
         project_root: Project root directory. Auto-detected if omitted.
         limit: Maximum results (default 50, max 200).
-        variant: Build variant (multi-project). Omit for the default
-            variant, ``"*"`` for all.
-        image: Sysbuild image in the variant. Omit for all images.
+        variant: Build variant (multi-build project). Omit to use
+            default_variant. One query answers for ONE build.
+        image: Sysbuild image within the variant. Required when the
+            variant holds several: each image is a separate program.
 
     Returns:
         list of dicts, each with: rhs_name (assigned function),
@@ -672,7 +676,7 @@ def find_indirect_targets(
             results.append(entry)
         return results
 
-    return db.execute_scoped(_query, limit=max(0, min(limit, 200)))
+    return db.execute_scoped(_query)
 
 # ── moved from server.py ──
 def _refs_guard(project_root: str | None, variant: str | None = None, image: str | None = None) -> tuple[DbContext, None] | tuple[None, list[dict]]:
@@ -736,8 +740,8 @@ def find_call_path(
     to_name: Annotated[str, Field(description="Target symbol to find path to.")],
     project_root: Annotated[str | None, Field(description="Project root. Auto-detected if omitted.")] = None,
     max_depth: Annotated[int, Field(description="Maximum BFS depth for path search (default 10).")] = 10,
-    variant: Annotated[str | None, Field(description="Build variant name (multi-project). Omit to use default_variant or fail-closed. Use '*' for all variants.")] = None,
-    image: Annotated[str | None, Field(description="Sysbuild image name within the variant (multi-project). Omit for all images of the variant.")] = None,
+    variant: Annotated[str | None, Field(description="Build variant (multi-build project). Omit to use default_variant. One query answers for ONE build.")] = None,
+    image: Annotated[str | None, Field(description="Sysbuild image within the variant. Required when the variant holds several: each image is a separate program.")] = None,
 ) -> list[dict]:
     """Find call paths between two C/C++ functions via BFS in the libclang
     call graph, including function-pointer edges, ISR vector
@@ -796,9 +800,10 @@ def find_call_path(
         to_name: Target symbol to find path to.
         project_root: Project root. Auto-detected if omitted.
         max_depth: Maximum BFS depth for path search (default 10, max 50).
-        variant: Build variant (multi-project). Omit for the default
-            variant, ``"*"`` for all.
-        image: Sysbuild image in the variant. Omit for all images.
+        variant: Build variant (multi-build project). Omit to use
+            default_variant. One query answers for ONE build.
+        image: Sysbuild image within the variant. Required when the
+            variant holds several: each image is a separate program.
 
     Returns:
         list of dicts, each with: depth (edge count, int), chain (str —
@@ -845,8 +850,8 @@ def find_all_callers_recursive(
     project_root: Annotated[str | None, Field(description="Project root. Auto-detected if omitted.")] = None,
     max_depth: Annotated[int, Field(description="Maximum BFS depth for transitive search (default 5).")] = 5,
     limit: Annotated[int, Field(description="Maximum results (default 50).")] = 50,
-    variant: Annotated[str | None, Field(description="Build variant name (multi-project). Omit to use default_variant or fail-closed. Use '*' for all variants.")] = None,
-    image: Annotated[str | None, Field(description="Sysbuild image name within the variant (multi-project). Omit for all images of the variant.")] = None,
+    variant: Annotated[str | None, Field(description="Build variant (multi-build project). Omit to use default_variant. One query answers for ONE build.")] = None,
+    image: Annotated[str | None, Field(description="Sysbuild image within the variant. Required when the variant holds several: each image is a separate program.")] = None,
 ) -> list[dict]:
     """Find all transitive C/C++ callers — who calls *name*, directly or
     indirectly, through the libclang call graph including
@@ -883,9 +888,10 @@ def find_all_callers_recursive(
         project_root: Project root. Auto-detected if omitted.
         max_depth: Maximum BFS depth for transitive search (default 5).
         limit: Maximum results (default 50).
-        variant: Build variant (multi-project). Omit for the default
-            variant, ``"*"`` for all.
-        image: Sysbuild image in the variant. Omit for all images.
+        variant: Build variant (multi-build project). Omit to use
+            default_variant. One query answers for ONE build.
+        image: Sysbuild image within the variant. Required when the
+            variant holds several: each image is a separate program.
 
     Returns:
         list of dicts, each with: name (str — the caller),
@@ -922,7 +928,7 @@ def find_all_callers_recursive(
             return [{"info": f"No callers found for '{name}'."}]
         return _with_absolute_file(rows, db.root)
 
-    return db.execute_scoped(_query, limit=limit)
+    return db.execute_scoped(_query)
 
 # ── moved from server.py ──
 def find_callees_recursive(
@@ -930,8 +936,8 @@ def find_callees_recursive(
     project_root: Annotated[str | None, Field(description="Project root. Auto-detected if omitted.")] = None,
     max_depth: Annotated[int, Field(description="Maximum BFS depth for transitive search (default 5).")] = 5,
     limit: Annotated[int, Field(description="Maximum results (default 50).")] = 50,
-    variant: Annotated[str | None, Field(description="Build variant name (multi-project). Omit to use default_variant or fail-closed. Use '*' for all variants.")] = None,
-    image: Annotated[str | None, Field(description="Sysbuild image name within the variant (multi-project). Omit for all images of the variant.")] = None,
+    variant: Annotated[str | None, Field(description="Build variant (multi-build project). Omit to use default_variant. One query answers for ONE build.")] = None,
+    image: Annotated[str | None, Field(description="Sysbuild image within the variant. Required when the variant holds several: each image is a separate program.")] = None,
 ) -> list[dict]:
     """Find all transitive C/C++ callees — what *name* calls, directly or
     indirectly, through the libclang call graph including
@@ -966,9 +972,10 @@ def find_callees_recursive(
         project_root: Project root. Auto-detected if omitted.
         max_depth: Maximum BFS depth for transitive search (default 5).
         limit: Maximum results (default 50).
-        variant: Build variant (multi-project). Omit for the default
-            variant, ``"*"`` for all.
-        image: Sysbuild image in the variant. Omit for all images.
+        variant: Build variant (multi-build project). Omit to use
+            default_variant. One query answers for ONE build.
+        image: Sysbuild image within the variant. Required when the
+            variant holds several: each image is a separate program.
 
     Returns:
         list of dicts, each with: name (str — the callee),
@@ -1004,7 +1011,7 @@ def find_callees_recursive(
             return [{"info": f"No callees found for '{name}'."}]
         return _with_absolute_file(rows, db.root)
 
-    return db.execute_scoped(_query, limit=limit)
+    return db.execute_scoped(_query)
 
 # ── moved from server.py ──
 def find_dead_code(
@@ -1012,8 +1019,8 @@ def find_dead_code(
     limit: Annotated[int, Field(description="Maximum results (default 100).")] = 100,
     exclude_paths: Annotated[list[str] | None, Field(description="Additional LIKE patterns to exclude. Merged with defaults from config. E.g. ['lib/%'].")] = None,
     project_only: Annotated[bool, Field(description="When True (default), auto-excludes SDK/vendor paths based on the detected build system and applies project config exclude_paths. Set False to see all results.")] = True,
-    variant: Annotated[str | None, Field(description="Build variant name (multi-project). Omit to use default_variant or fail-closed. Use '*' for all variants.")] = None,
-    image: Annotated[str | None, Field(description="Sysbuild image name within the variant (multi-project). Omit for all images of the variant.")] = None,
+    variant: Annotated[str | None, Field(description="Build variant (multi-build project). Omit to use default_variant. One query answers for ONE build.")] = None,
+    image: Annotated[str | None, Field(description="Sysbuild image within the variant. Required when the variant holds several: each image is a separate program.")] = None,
 ) -> list[dict]:
     """Find C/C++ functions that are defined but never called —
     libclang-powered dead code detection across the entire indexed
@@ -1059,9 +1066,10 @@ def find_dead_code(
             tool parameter, not config). E.g. ``['lib/%']``.
         project_only: When True (default), filters to ``is_project = 1``
             symbols. Set False to see all results.
-        variant: Build variant (multi-project). Omit for the default
-            variant, ``"*"`` for all.
-        image: Sysbuild image in the variant. Omit for all images.
+        variant: Build variant (multi-build project). Omit to use
+            default_variant. One query answers for ONE build.
+        image: Sysbuild image within the variant. Required when the
+            variant holds several: each image is a separate program.
 
     Returns:
         list of dicts, each with: name, qualified_name, kind, signature,
@@ -1091,15 +1099,15 @@ def find_dead_code(
             return [{"info": "No dead or possibly-dead functions found — every defined function has at least one caller."}]
         return _with_absolute_file(rows, db.root)
 
-    return db.execute_scoped(_query, limit=limit)
+    return db.execute_scoped(_query)
 
 # ── moved from server.py ──
 def find_wrapper_callers(
     class_name: Annotated[str, Field(description="Driver class name to find wrappers for. E.g. 'UART_DRIVER' or 'hal::UART_DRIVER'.")],
     project_root: Annotated[str | None, Field(description="Project root. Auto-detected if omitted.")] = None,
     limit: Annotated[int, Field(description="Maximum wrapper method results (default 50).")] = 50,
-    variant: Annotated[str | None, Field(description="Build variant name (multi-project). Omit to use default_variant or fail-closed. Use '*' for all variants.")] = None,
-    image: Annotated[str | None, Field(description="Sysbuild image name within the variant (multi-project). Omit for all images of the variant.")] = None,
+    variant: Annotated[str | None, Field(description="Build variant (multi-build project). Omit to use default_variant. One query answers for ONE build.")] = None,
+    image: Annotated[str | None, Field(description="Sysbuild image within the variant. Required when the variant holds several: each image is a separate program.")] = None,
 ) -> list[dict]:
     """Find C/C++ wrapper classes that call methods of a driver class —
     libclang-powered adapter pattern detection. Traces method ownership
@@ -1123,9 +1131,10 @@ def find_wrapper_callers(
             E.g. ``'UART_DRIVER'`` or ``'hal::UART_DRIVER'``.
         project_root: Project root. Auto-detected if omitted.
         limit: Maximum wrapper method results (default 50).
-        variant: Build variant (multi-project). Omit for the default
-            variant, ``"*"`` for all.
-        image: Sysbuild image in the variant. Omit for all images.
+        variant: Build variant (multi-build project). Omit to use
+            default_variant. One query answers for ONE build.
+        image: Sysbuild image within the variant. Required when the
+            variant holds several: each image is a separate program.
 
     Returns:
         list of dicts, each with: wrapper_class (str — ``"(global)"`` for a
@@ -1276,7 +1285,7 @@ def find_wrapper_callers(
             })
         return result
 
-    return db.execute_scoped(_query, limit=limit)
+    return db.execute_scoped(_query)
 
 # ── moved from server.py ──
 def trace_data_flow(
@@ -1287,8 +1296,8 @@ def trace_data_flow(
     limit: Annotated[int, Field(description="Maximum source functions to trace (default 15).")] = 15,
     timeout_ms: Annotated[int, Field(description="Maximum total execution time in "
         "milliseconds (default 30000).")] = 30000,
-    variant: Annotated[str | None, Field(description="Build variant name (multi-project). Omit to use default_variant or fail-closed. Use '*' for all variants.")] = None,
-    image: Annotated[str | None, Field(description="Sysbuild image name within the variant (multi-project). Omit for all images of the variant.")] = None,
+    variant: Annotated[str | None, Field(description="Build variant (multi-build project). Omit to use default_variant. One query answers for ONE build.")] = None,
+    image: Annotated[str | None, Field(description="Sysbuild image within the variant. Required when the variant holds several: each image is a separate program.")] = None,
 ) -> list[dict]:
     """Trace how C/C++ data of a given type flows to a target function via
     libclang call paths. libclang-powered: finds functions by type
@@ -1318,9 +1327,10 @@ def trace_data_flow(
         limit: Maximum source functions to trace (default 15).
         timeout_ms: Maximum total execution time in milliseconds
             (default 30000). Clamped to 1000–300000.
-        variant: Build variant (multi-project). Omit for the default
-            variant, ``"*"`` for all.
-        image: Sysbuild image in the variant. Omit for all images.
+        variant: Build variant (multi-build project). Omit to use
+            default_variant. One query answers for ONE build.
+        image: Sysbuild image within the variant. Required when the
+            variant holds several: each image is a separate program.
 
     Returns:
         list of dicts with a leading ``_summary`` entry:
@@ -1442,8 +1452,8 @@ def find_hotspots(
     limit: Annotated[int, Field(description="Number of top-called functions to return (default 20).")] = 20,
     project_only: Annotated[bool, Field(description="When True (default), auto-excludes SDK/vendor paths so hotspots reflect project code.")] = True,
     exclude_paths: Annotated[list[str] | None, Field(description="Additional LIKE patterns to exclude. Merged with defaults. E.g. ['lib/%'].")] = None,
-    variant: Annotated[str | None, Field(description="Build variant name (multi-project). Omit to use default_variant or fail-closed. Use '*' for all variants.")] = None,
-    image: Annotated[str | None, Field(description="Sysbuild image name within the variant (multi-project). Omit for all images of the variant.")] = None,
+    variant: Annotated[str | None, Field(description="Build variant (multi-build project). Omit to use default_variant. One query answers for ONE build.")] = None,
+    image: Annotated[str | None, Field(description="Sysbuild image within the variant. Required when the variant holds several: each image is a separate program.")] = None,
 ) -> list[dict]:
     """Find the most-called C/C++ functions ranked by caller count —
     libclang call-graph hotspot detection. Identifies functions with
@@ -1472,9 +1482,10 @@ def find_hotspots(
             symbols so hotspots reflect project code.
         exclude_paths: Additional LIKE patterns to exclude (user-supplied
             tool parameter). E.g. ``['lib/%']``.
-        variant: Build variant (multi-project). Omit for the default
-            variant, ``"*"`` for all.
-        image: Sysbuild image in the variant. Omit for all images.
+        variant: Build variant (multi-build project). Omit to use
+            default_variant. One query answers for ONE build.
+        image: Sysbuild image within the variant. Required when the
+            variant holds several: each image is a separate program.
 
     Returns:
         list of dicts, each with: name, qualified_name, kind, signature,
@@ -1505,7 +1516,7 @@ def find_hotspots(
             return [{"info": "No references indexed — enable index_refs and re-index."}]
         return _with_absolute_file(rows, db.root)
 
-    return db.execute_scoped(_query, limit=limit)
+    return db.execute_scoped(_query)
 
 
 
@@ -1790,8 +1801,8 @@ def get_vector_table(
     project_root: Annotated[str | None, Field(description="Project root. Auto-detected if omitted.")] = None,
     unhandled_only: Annotated[bool, Field(description="Return only the slots that reach the default handler.")] = False,
     limit: Annotated[int, Field(description="Maximum slots (default 400).")] = 400,
-    variant: Annotated[str | None, Field(description="Build variant name (multi-project). Omit to use default_variant or fail-closed. Use '*' for all variants.")] = None,
-    image: Annotated[str | None, Field(description="Sysbuild image name within the variant (multi-project). Omit for all images of the variant.")] = None,
+    variant: Annotated[str | None, Field(description="Build variant (multi-build project). Omit to use default_variant. One query answers for ONE build.")] = None,
+    image: Annotated[str | None, Field(description="Sysbuild image within the variant. Required when the variant holds several: each image is a separate program.")] = None,
 ) -> list[dict]:
     """Read the interrupt vector table, and say what services each interrupt.
 
@@ -1939,9 +1950,10 @@ def get_vector_table(
         project_root: Project root. Auto-detected if omitted.
         unhandled_only: When True, return only the ``"unhandled"`` slots.
         limit: Maximum slots (default 400, max 1000).
-        variant: Build variant (multi-project). Omit for the default
-            variant, ``"*"`` for all.
-        image: Sysbuild image in the variant. Omit for all images.
+        variant: Build variant (multi-build project). Omit to use
+            default_variant. One query answers for ONE build.
+        image: Sysbuild image within the variant. Required when the
+            variant holds several: each image is a separate program.
 
     Returns:
         list of dicts sorted by source, then table, then slot.  Each holds:
@@ -1978,4 +1990,4 @@ def get_vector_table(
             conn, config_hash, unhandled_only=unhandled_only, limit=limit,
         )
 
-    return db.execute_scoped(_query, limit=limit)
+    return db.execute_scoped(_query)

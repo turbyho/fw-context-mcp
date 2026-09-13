@@ -1,15 +1,33 @@
 """Variant/image scoping for MCP query tools.
 
 Resolves the ``(variant, image)`` selection carried by query-tool parameters
-into a list of concrete build scopes (``config_hash`` + identity), with the
-fail-closed selection semantics from §5.7:
+into ONE concrete build scope (``config_hash`` + identity).
+
+── One question about code, one build ──
+
+A project can hold several builds, and they are not variations of one answer.
+Measured on one Zephyr project, nine builds sit on two axes: two boards
+(``nrf52840-dev``, ``nrf54lm20a-dev``) and, inside each, several images —
+``app``, ``mcuboot``, ``stage0``, ``app_slot1_variant``.  An image is a
+separate firmware binary: a bootloader is not the application.
+
+Nobody reasons about code across two programs or two boards at once, thus a
+merged answer serves no question and carries two hazards.  It blends symbols
+of different binaries, and where two builds ARE near-identical it duplicates
+almost every row: ``app`` and ``app_slot1_variant`` of that project share
+10585 of about 11000 names.
+
+Both selectors are therefore fail-closed:
 
 - single-project → one scope ``(variant='', image='')``, no error.
-- multi-project, variant omitted → error unless ``[build] default_variant``.
-- ``variant="*"`` → every build.
-- ``image`` omitted → all images of the selected variant.
-- unknown variant → error listing known names.
+- multi-build, variant omitted → error unless ``[build] default_variant``.
+- multi-build, image omitted while the variant holds several → error that
+  lists the images.
+- unknown variant or image → error listing the known names.
 - declared-but-unindexed variant → error pointing at ``fw-context index``.
+
+A caller that wants to know whether a symbol lives in the bootloader as well
+asks twice, once per image.  Two plain answers beat one blended answer.
 """
 
 from __future__ import annotations
@@ -31,9 +49,10 @@ def resolve_scopes(
 ) -> tuple[list[dict], bool, str | None]:
     """Resolve ``(variant, image)`` → ``(scopes, multi, error)``.
 
-    Each scope is ``{"config_hash", "variant", "image"}``.  ``multi`` is True
-    for multi-variant projects (even when a single scope resolves).  ``error``
-    is a human-readable string on failure (fail-closed).
+    *scopes* holds AT MOST ONE scope ``{"config_hash", "variant", "image"}``.
+    ``multi`` is True for a project that declares build variants, even when
+    one scope resolves.  ``error`` is a human-readable string on failure,
+    because both selectors are fail-closed — see the module docstring.
     """
     from ...indexer.db import get_active_config, get_builds_for_scope
 
@@ -49,7 +68,7 @@ def resolve_scopes(
         )
         return scopes, False, None
 
-    # ── Multi-variant: fail-closed on variant ──
+    # ── Multi-build: fail-closed on variant ──
     if not variant:
         if build_cfg.default_variant:
             variant = build_cfg.default_variant
@@ -62,11 +81,13 @@ def resolve_scopes(
             )
 
     if variant == "*":
-        rows = get_builds_for_scope(conn, project_id, "*")
-        return [
-            {"config_hash": r["config_hash"], "variant": r["variant"] or "", "image": r["image"] or ""}
-            for r in rows
-        ], True, None
+        return [], True, (
+            "A query about code answers for ONE build. A project can hold a "
+            "bootloader, a first-stage loader and the application, and they "
+            "are separate programs. Name one variant, and one image of it. "
+            "To learn whether a symbol is in two of them, ask twice. Call "
+            "get_active_build() for the variants/images table."
+        )
 
     name_set = {v.name for v in build_cfg.variants}
     if variant not in name_set:
@@ -74,13 +95,41 @@ def resolve_scopes(
 
     rows = get_builds_for_scope(conn, project_id, variant, image or "")
     if not rows:
+        if image:
+            known = get_builds_for_scope(conn, project_id, variant)
+            names = sorted({r["image"] or "" for r in known if r["image"]})
+            if names:
+                return [], True, (
+                    f"Unknown image '{image}' of variant '{variant}'. "
+                    f"Available: {', '.join(names)}."
+                )
         return [], True, (
             f"Variant '{variant}' is declared in config but not indexed. "
             f"Run 'fw-context index --build --variant {variant}'."
         )
+
+    # ── Fail-closed on image ──
+    # Several images of one variant are several PROGRAMS, thus a query that
+    # names none of them has not said what it asks about.  Answering for all
+    # of them would blend a bootloader with an application, and two builds of
+    # one application would duplicate nearly every row.
+    images = sorted({r["image"] or "" for r in rows if r["image"]})
+    if not image and len(images) > 1:
+        return [], True, (
+            f"Variant '{variant}' holds {len(images)} images, and each is a "
+            f"separate program: {', '.join(images)}. Specify ``image``. "
+            f"Call get_active_build() for the variants/images table."
+        )
+
+    # One build answers.  The rows arrive newest first, thus an older build
+    # left behind by an interrupted index run cannot win.
+    row = rows[0]
     return [
-        {"config_hash": r["config_hash"], "variant": r["variant"] or "", "image": r["image"] or ""}
-        for r in rows
+        {
+            "config_hash": row["config_hash"],
+            "variant": row["variant"] or "",
+            "image": row["image"] or "",
+        }
     ], True, None
 
 
@@ -91,12 +140,12 @@ def run_scoped_query(
     variant: str = "",
     image: str = "",
 ) -> list[dict]:
-    """Resolve ``(variant, image)`` and run ``query_fn(conn, config_hash)`` per scope.
+    """Resolve ``(variant, image)`` and run ``query_fn(conn, config_hash)``.
 
-    Single-scope results are bit-identical to today's single-build output
-    (no annotation).  Multi-scope results merge per-build outputs, annotating
-    each record with its resolved ``variant``/``image``.  Fail-closed: a
-    resolution error is returned as a single ``{"error": …}`` dict.
+    ``resolve_scopes`` answers with one scope, thus the result is the output
+    of that one build with no annotation.  Fail-closed: a resolution error is
+    returned as a single ``{"error": …}`` dict, which names what the caller
+    must choose.
     """
     from ...config import derive_project_id
     from ...config import load as load_config
@@ -112,16 +161,6 @@ def run_scoped_query(
         conn.close()
     if err:
         return [{"error": err}]
-    if len(scopes) == 1:
-        return _with_stale_recovery(root, db_path, query_fn, config_hash=scopes[0]["config_hash"])
-
-    merged: list[dict] = []
-    for scope in scopes:
-        part = _with_stale_recovery(root, db_path, query_fn, config_hash=scope["config_hash"])
-        for r in part:
-            if isinstance(r, dict) and "error" not in r and "warning" not in r:
-                r = dict(r)
-                r["variant"] = scope["variant"]
-                r["image"] = scope["image"]
-            merged.append(r)
-    return merged
+    if not scopes:
+        return []
+    return _with_stale_recovery(root, db_path, query_fn, config_hash=scopes[0]["config_hash"])

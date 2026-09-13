@@ -169,19 +169,42 @@ class TestResolveScopes:
         assert err is not None and "default_variant" in err
         assert scopes == []
 
-    def test_multi_uses_default_variant(self, temp_db):
+    def test_default_variant_still_needs_an_image(self, temp_db):
+        """A variant with several images has not said which program to read.
+
+        Variant 'a' holds 'app' and 'stage0', and those are separate
+        binaries.  Answering for both would blend a loader with the
+        application, thus the selection fails closed and names the choice.
+        """
         self._seed(temp_db)
         cfg = self._cfg([BuildVariant(name="a"), BuildVariant(name="b")], default_variant="a")
         scopes, multi, err = resolve_scopes(temp_db, "proj", cfg, "", "")
-        assert err is None and multi is True
-        # image omitted → all images of variant 'a'
-        assert {s["image"] for s in scopes} == {"app", "stage0"}
+        assert scopes == []
+        assert err is not None and "image" in err
+        assert "app" in err and "stage0" in err, f"the error names no choice: {err}"
 
-    def test_variant_star_returns_all(self, temp_db):
+    def test_a_variant_with_one_image_needs_no_image(self, temp_db):
+        """With nothing to confuse, the query answers."""
+        self._seed(temp_db)
+        cfg = self._cfg([BuildVariant(name="a"), BuildVariant(name="b")], default_variant="b")
+        scopes, multi, err = resolve_scopes(temp_db, "proj", cfg, "", "")
+        assert err is None and multi is True
+        assert [s["config_hash"] for s in scopes] == ["h-b-app"]
+
+    def test_variant_star_is_refused(self, temp_db):
+        """One query answers for ONE build — see shared/variants.py.
+
+        The star used to answer for every build at once.  A bootloader and
+        an application are separate programs, thus that answer served no
+        question, and two builds of one application repeated nearly every
+        row.
+        """
         self._seed(temp_db)
         cfg = self._cfg([BuildVariant(name="a"), BuildVariant(name="b")])
         scopes, multi, err = resolve_scopes(temp_db, "proj", cfg, "*", "")
-        assert err is None and len(scopes) == 3
+        assert scopes == []
+        assert err is not None and "ONE build" in err
+        assert "ask twice" in err, f"the error gives no way forward: {err}"
 
     def test_unknown_variant_errors(self, temp_db):
         self._seed(temp_db)
@@ -189,8 +212,25 @@ class TestResolveScopes:
         scopes, multi, err = resolve_scopes(temp_db, "proj", cfg, "zzz", "")
         assert err is not None and "Unknown variant" in err
 
+    def test_unknown_image_names_the_known_ones(self, temp_db):
+        self._seed(temp_db)
+        cfg = self._cfg([BuildVariant(name="a")])
+        scopes, multi, err = resolve_scopes(temp_db, "proj", cfg, "a", "zzz")
+        assert scopes == []
+        assert err is not None and "Unknown image" in err
+        assert "app" in err and "stage0" in err, f"got: {err}"
+
     def test_specific_image_narrows(self, temp_db):
         self._seed(temp_db)
         cfg = self._cfg([BuildVariant(name="a")])
         scopes, multi, err = resolve_scopes(temp_db, "proj", cfg, "a", "stage0")
         assert err is None and [s["image"] for s in scopes] == ["stage0"]
+
+    def test_a_selection_never_gives_two_scopes(self, temp_db):
+        """The contract the rest of the code now rests on."""
+        self._seed(temp_db)
+        cfg = self._cfg([BuildVariant(name="a"), BuildVariant(name="b")])
+        for variant, image in (("a", "app"), ("a", "stage0"), ("b", "app")):
+            scopes, _multi, err = resolve_scopes(temp_db, "proj", cfg, variant, image)
+            assert err is None, f"{variant}/{image}: {err}"
+            assert len(scopes) == 1, f"{variant}/{image} gave {len(scopes)} scopes"

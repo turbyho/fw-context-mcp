@@ -53,8 +53,8 @@ def find_variables(
         "'varglobal', 'varlocal', 'field', or None for all.")] = None,
     limit: Annotated[int, Field(description="Maximum results "
         "(default 20, max 100).")] = 20,
-    variant: Annotated[str | None, Field(description="Build variant name (multi-project). Omit to use default_variant or fail-closed. Use '*' for all variants.")] = None,
-    image: Annotated[str | None, Field(description="Sysbuild image name within the variant (multi-project). Omit for all images of the variant.")] = None,
+    variant: Annotated[str | None, Field(description="Build variant (multi-build project). Omit to use default_variant. One query answers for ONE build.")] = None,
+    image: Annotated[str | None, Field(description="Sysbuild image within the variant. Required when the variant holds several: each image is a separate program.")] = None,
 ) -> list[dict]:
     """Find C/C++ variables by name or prefix and trace who reads or
     writes them through the call graph.  libclang-powered: splits
@@ -91,9 +91,10 @@ def find_variables(
         kind: Optional kind filter — ``"varglobal"``, ``"varlocal"``,
             ``"field"``, or ``None`` (all). Default ``None``.
         limit: Maximum results (default 20, max 100).
-        variant: Build variant (multi-project). Omit for the default
-            variant, ``"*"`` for all.
-        image: Sysbuild image in the variant. Omit for all images.
+        variant: Build variant (multi-build project). Omit to use
+            default_variant. One query answers for ONE build.
+        image: Sysbuild image within the variant. Required when the
+            variant holds several: each image is a separate program.
 
     Returns:
         list of dicts, each with: name (str), qualified_name (str),

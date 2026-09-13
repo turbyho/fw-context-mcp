@@ -80,8 +80,8 @@ def lookup_symbol(
     exact: Annotated[bool, Field(description="True = exact name match, False = prefix LIKE match (default).")] = False,
     limit: Annotated[int, Field(description="Maximum results returned (capped at 100, default 50).")] = 50,
     offset: Annotated[int, Field(description="Skip this many results. Pages through a name that many classes share, such as 'read' or 'write'.")] = 0,
-    variant: Annotated[str | None, Field(description="Build variant name (multi-project). Omit to use default_variant or fail-closed. Use '*' for all variants.")] = None,
-    image: Annotated[str | None, Field(description="Sysbuild image name within the variant (multi-project). Omit for all images of the variant.")] = None,
+    variant: Annotated[str | None, Field(description="Build variant (multi-build project). Omit to use default_variant. One query answers for ONE build.")] = None,
+    image: Annotated[str | None, Field(description="Sysbuild image within the variant. Required when the variant holds several: each image is a separate program.")] = None,
 ) -> list[dict]:
     """Look up a C/C++ symbol by name via libclang index — exact or prefix
     matching. Finds symbols text-based search can miss: build-conditional
@@ -106,9 +106,10 @@ def lookup_symbol(
             symbols — and this walks past the ones already seen.  The order
             is stable (a definition first, then the line), thus two pages
             never overlap and never skip a symbol.
-        variant: Build variant (multi-project). Omit for the default
-            variant, ``"*"`` for all.
-        image: Sysbuild image in the variant. Omit for all images.
+        variant: Build variant (multi-build project). Omit to use
+            default_variant. One query answers for ONE build.
+        image: Sysbuild image within the variant. Required when the
+            variant holds several: each image is a separate program.
 
     Returns:
         list[dict]: Symbols with name, qualified_name, kind, file, line,

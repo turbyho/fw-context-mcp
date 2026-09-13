@@ -418,6 +418,24 @@ def test_every_copy_of_the_instructions_teaches_the_selector():
         assert "DIFFERENT project" in text, label
 
 
+def test_every_copy_of_the_instructions_says_one_query_one_build():
+    """A reader that misses this asks about a bootloader and an application.
+
+    Both selectors fail closed, thus a reader who does not know the rule
+    meets an error and has to guess what to do.  The text must name the
+    two axes, say that the answer covers one build, and give the way
+    forward: ask twice.
+    """
+    for label, text in _instruction_copies():
+        # One copy shouts the rule and the other writes it in prose, thus
+        # the check reads the meaning and not the casing.
+        assert "one build" in text.lower(), label
+        assert "image" in text, label
+        assert "variant" in text, label
+        assert "get_active_build" in text, label
+        assert "twice" in text, f"{label}: no way given to compare two builds"
+
+
 def test_no_copy_of_the_instructions_holds_a_dead_file():
     """``data/instructions.md`` is gone.  Nothing may point a reader at it."""
     from pathlib import Path

@@ -601,8 +601,8 @@ async def explain_symbol(
     name: Annotated[str, Field(description="Symbol name to explain. E.g. 'uart_init', 'ModemMsg::send'.")],
     project_root: Annotated[str | None, Field(description="Project root. Auto-detected if omitted.")] = None,
     context_lines: Annotated[int, Field(description="Lines of source context around the symbol definition.")] = 40,
-    variant: Annotated[str | None, Field(description="Build variant name (multi-project). Omit to use default_variant or fail-closed. Use '*' for all variants.")] = None,
-    image: Annotated[str | None, Field(description="Sysbuild image name within the variant (multi-project). Omit for all images of the variant.")] = None,
+    variant: Annotated[str | None, Field(description="Build variant (multi-build project). Omit to use default_variant. One query answers for ONE build.")] = None,
+    image: Annotated[str | None, Field(description="Sysbuild image within the variant. Required when the variant holds several: each image is a separate program.")] = None,
 ) -> dict:
     """Explain what a C/C++ symbol does in plain English — libclang-aware
     analysis. Uses pre-computed LLM analysis when available (instant),
@@ -623,9 +623,10 @@ async def explain_symbol(
         project_root: Project root directory. Auto-detected if omitted.
         context_lines: Lines of source context around the symbol definition
             (default 40, max 200). Only used when no pre-computed analysis exists.
-        variant: Build variant (multi-project). Omit for the default
-            variant, ``"*"`` for all.
-        image: Sysbuild image in the variant. Omit for all images.
+        variant: Build variant (multi-build project). Omit to use
+            default_variant. One query answers for ONE build.
+        image: Sysbuild image within the variant. Required when the
+            variant holds several: each image is a separate program.
 
     Returns:
         dict: {name, kind, file, line, signature, explanation, llm_analysis
@@ -808,8 +809,8 @@ async def explain_symbol(
 def get_source(
     name: Annotated[str, Field(description="Fully qualified symbol name. Returns exact function body via libclang extent.")],
     project_root: Annotated[str | None, Field(description="Project root. Auto-detected if omitted.")] = None,
-    variant: Annotated[str | None, Field(description="Build variant name (multi-project). Omit to use default_variant or fail-closed. Use '*' for all variants.")] = None,
-    image: Annotated[str | None, Field(description="Sysbuild image name within the variant (multi-project). Omit for all images of the variant.")] = None,
+    variant: Annotated[str | None, Field(description="Build variant (multi-build project). Omit to use default_variant. One query answers for ONE build.")] = None,
+    image: Annotated[str | None, Field(description="Sysbuild image within the variant. Required when the variant holds several: each image is a separate program.")] = None,
 ) -> dict:
     """Read a C/C++ function/method/enum/macro body using libclang exact
     extents — no guessing line numbers. Uses AST-precise {start, end}
@@ -839,9 +840,10 @@ def get_source(
         name: Fully qualified symbol name. Returns exact function body
             via libclang extent.
         project_root: Project root. Auto-detected if omitted.
-        variant: Build variant (multi-project). Omit for the default
-            variant, ``"*"`` for all.
-        image: Sysbuild image in the variant. Omit for all images.
+        variant: Build variant (multi-build project). Omit to use
+            default_variant. One query answers for ONE build.
+        image: Sysbuild image within the variant. Required when the
+            variant holds several: each image is a separate program.
 
     Returns:
         dict: {name, qualified_name, kind, file, line, signature,
@@ -990,8 +992,8 @@ def get_file_map(
     project_root: Annotated[str | None, Field(description="Project root. Auto-detected if omitted.")] = None,
     signatures: Annotated[bool, Field(description="Include full function signatures in output.")] = False,
     max_per_kind: Annotated[int, Field(description="Max items per symbol kind group (default 30, 0 = unlimited).")] = 30,
-    variant: Annotated[str | None, Field(description="Build variant name (multi-project). Omit to use default_variant or fail-closed. Use '*' for all variants.")] = None,
-    image: Annotated[str | None, Field(description="Sysbuild image name within the variant (multi-project). Omit for all images of the variant.")] = None,
+    variant: Annotated[str | None, Field(description="Build variant (multi-build project). Omit to use default_variant. One query answers for ONE build.")] = None,
+    image: Annotated[str | None, Field(description="Sysbuild image within the variant. Required when the variant holds several: each image is a separate program.")] = None,
 ) -> dict:
     """Fast structural map of all C/C++ symbols in a file grouped by kind —
     libclang-powered table of contents. Like a table of contents before
@@ -1023,9 +1025,10 @@ def get_file_map(
         project_root: Project directory. Auto-detected if omitted.
         signatures: Include full function signatures. Default: False.
         max_per_kind: Max items per kind group (default 30, 0 = unlimited).
-        variant: Build variant (multi-project). Omit for the default
-            variant, ``"*"`` for all.
-        image: Sysbuild image in the variant. Omit for all images.
+        variant: Build variant (multi-build project). Omit to use
+            default_variant. One query answers for ONE build.
+        image: Sysbuild image within the variant. Required when the
+            variant holds several: each image is a separate program.
 
     Returns:
         dict: {file, total_symbols, symbols: {kind: {count, items[],
@@ -1306,8 +1309,8 @@ def _collect_override_info(
 def get_symbol_context(
     name: Annotated[str, Field(description="Symbol name. Returns body, signature, all direct callers and callees.")],
     project_root: Annotated[str | None, Field(description="Project root. Auto-detected if omitted.")] = None,
-    variant: Annotated[str | None, Field(description="Build variant name (multi-project). Omit to use default_variant or fail-closed. Use '*' for all variants.")] = None,
-    image: Annotated[str | None, Field(description="Sysbuild image name within the variant (multi-project). Omit for all images of the variant.")] = None,
+    variant: Annotated[str | None, Field(description="Build variant (multi-build project). Omit to use default_variant. One query answers for ONE build.")] = None,
+    image: Annotated[str | None, Field(description="Sysbuild image within the variant. Required when the variant holds several: each image is a separate program.")] = None,
 ) -> dict:
     """Rich one-shot context for a C/C++ symbol: body, signature, all direct
     callers and callees. Answers "what does this do and how does it fit in
@@ -1335,9 +1338,10 @@ def get_symbol_context(
         name: Symbol name. Returns body, signature, all direct callers
             and callees.
         project_root: Project root. Auto-detected if omitted.
-        variant: Build variant (multi-project). Omit for the default
-            variant, ``"*"`` for all.
-        image: Sysbuild image in the variant. Omit for all images.
+        variant: Build variant (multi-build project). Omit to use
+            default_variant. One query answers for ONE build.
+        image: Sysbuild image within the variant. Required when the
+            variant holds several: each image is a separate program.
 
     Returns:
         dict with: name, qualified_name, kind, file, line, signature,
@@ -1542,8 +1546,8 @@ def read_file(
     line_numbers: Annotated[bool, Field(description="Prefix every line with its line number, like get_source. Default False (bare text).")] = False,
     start_line: Annotated[int, Field(description="First line to return, 1-based inclusive. 0 = from the start of the file.")] = 0,
     end_line: Annotated[int, Field(description="Last line to return, 1-based inclusive. 0 = to the end of the file.")] = 0,
-    variant: Annotated[str | None, Field(description="Build variant name (multi-project). Omit to use default_variant or fail-closed. Use '*' for all variants.")] = None,
-    image: Annotated[str | None, Field(description="Sysbuild image name within the variant (multi-project). Omit for all images of the variant.")] = None,
+    variant: Annotated[str | None, Field(description="Build variant (multi-build project). Omit to use default_variant. One query answers for ONE build.")] = None,
+    image: Annotated[str | None, Field(description="Sysbuild image within the variant. Required when the variant holds several: each image is a separate program.")] = None,
 ) -> dict:
     """Read a complete C/C++ source file with **ifdef-filtered** content —
     only code that actually compiles for the current build configuration.
@@ -1599,9 +1603,10 @@ def read_file(
             followed by two spaces, as ``get_source`` does. Default False.
         start_line: First line to return, 1-based inclusive. 0 = file start.
         end_line: Last line to return, 1-based inclusive. 0 = file end.
-        variant: Build variant (multi-project). Omit for the default
-            variant, ``"*"`` for all.
-        image: Sysbuild image in the variant. Omit for all images.
+        variant: Build variant (multi-build project). Omit to use
+            default_variant. One query answers for ONE build.
+        image: Sysbuild image within the variant. Required when the
+            variant holds several: each image is a separate program.
 
     Returns:
         dict: {file (str), language (str — ``"c"`` or ``"cpp"``),

@@ -118,6 +118,24 @@ operator asked about.
 Do not invent other parameter names. An unknown argument causes an error
 that names it.
 
+### A project that holds several builds
+
+One project can hold several builds on two axes: `variant` is the board,
+`image` is the program. A Zephyr project has `app`, `mcuboot` and `stage0`
+— a bootloader is NOT the application.
+
+**One query answers for ONE build.** Both selectors fail closed: when the
+project has more than one variant, or the variant holds more than one
+image, a query that names none gets an error that lists the choices. That
+is on purpose — an answer blending a bootloader with an application serves
+no question, and two builds of one application would repeat nearly every
+row.
+
+- Call `get_active_build` for the variants/images table.
+- Pass `variant` and `image` to EVERY call that follows.
+- To learn whether a symbol is in the bootloader TOO, ask twice — once per
+  image. Two plain answers beat one blended answer.
+
 ### Parameter names
 
 Every tool rejects an unknown argument, thus a guess costs a whole call.
