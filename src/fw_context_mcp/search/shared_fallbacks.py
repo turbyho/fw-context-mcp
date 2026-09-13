@@ -37,15 +37,24 @@ from pathlib import Path
 from typing import Any
 
 from fw_context_mcp.indexer.db import _expand_query, search_symbols
+from fw_context_mcp.indexer.db._symbols import count_symbols
 from fw_context_mcp.utils import abs_path, is_db_exception
 
 # ── Row → dict conversion ───────────────────────────────────────────────────
 
 
+# The last argument is the offset of the page.  It is positional, because
+# one table drives every strategy with the same call; it has a default,
+# because the pipeline layer does not page and calls without it.
 FallbackFunc = Callable[
-    [sqlite3.Connection, str, str, int, str | None, bool, Path],
+    [sqlite3.Connection, str, str, int, str | None, bool, Path, int],
     tuple[list[dict[str, Any]], str] | None,
 ]
+
+# The counter of one strategy.  It takes what the strategy takes, less the
+# page bound and the root, thus one table can drive a strategy and its
+# counter with the same arguments.
+CountFunc = Callable[[sqlite3.Connection, str, str, str | None, bool], int]
 
 
 def _symbol_row_to_dict(r: sqlite3.Row, root: Path, **extra) -> dict[str, Any]:
@@ -150,10 +159,53 @@ def _variable_filter(kind: str | None) -> str:
     return f"AND s.kind NOT IN ({kinds})"
 
 
+def _name_token_terms(query: str) -> list[str]:
+    """Give the terms that the two LIKE strategies below search for."""
+    return [t.lower() for t in query.split() if len(t) > 1]
+
+
+def _name_tokens_sql(terms: list[str], kind: str | None, project_only: bool) -> tuple[str, list]:
+    """Build the WHERE text and its parameters for the name-token search.
+
+    The count and the page run on this one text, thus a ``total`` can
+    never describe another answer than the rows do.
+    """
+    like_cases: list[str] = []
+    like_params: list[str] = []
+    for term in terms:
+        escaped = term.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        like_cases.append(
+            "CASE WHEN s.name_tokens LIKE ? ESCAPE '\\' THEN 1 ELSE 0 END"
+        )
+        like_params.append(f"%{escaped}%")
+    match_sum = " + ".join(like_cases)
+    project_filter = "AND s.is_project = 1" if project_only else ""
+    inner = f"""SELECT * FROM (
+            SELECT s.*, ({match_sum}) AS _match_cnt FROM symbols s
+            WHERE s.config_hash = ? {project_filter} {_variable_filter(kind)}
+        ) sub WHERE sub._match_cnt >= ?"""
+    return inner, like_params
+
+
+def count_name_tokens(
+    c: sqlite3.Connection, query: str, config_hash: str,
+    kind: str | None = None, project_only: bool = False,
+) -> int:
+    """Count the symbols that ``_search_code_name_tokens`` answers with."""
+    terms = _name_token_terms(query)
+    if not terms:
+        return 0
+    inner, like_params = _name_tokens_sql(terms, kind, project_only)
+    return c.execute(
+        f"SELECT COUNT(*) FROM ({inner})",
+        (*like_params, config_hash, max(1, len(terms) - 1)),
+    ).fetchone()[0]
+
+
 def _search_code_name_tokens(
     c: sqlite3.Connection, query: str, config_hash: str,
     limit: int, kind: str | None, project_only: bool,
-    root: Path,
+    root: Path, offset: int = 0,
 ) -> tuple[list[dict[str, Any]], str] | None:
     """Token-based LIKE fallback — matches CamelCase/snake_case token splits.
 
@@ -171,40 +223,67 @@ def _search_code_name_tokens(
         ``kind`` of the caller to its rows, thus keying the filter on "a
         kind was given" would let a local back in through
         ``kind="function"``.
+
+    Why the order ends at ``sub.usr``:
+        The definition flag, the match count and the line all tie, and
+        SQLite may then return tied rows in any order.  An OFFSET over such
+        an order shows one row twice and hides another.  ``usr`` is unique
+        within one build.
     """
-    terms = [t.lower() for t in query.split() if len(t) > 1]
+    terms = _name_token_terms(query)
     if not terms:
         return None
-    min_matches = max(1, len(terms) - 1)
-    like_cases: list[str] = []
-    like_params: list[str] = []
-    for term in terms:
-        escaped = term.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
-        like_cases.append(
-            "CASE WHEN s.name_tokens LIKE ? ESCAPE '\\' THEN 1 ELSE 0 END"
-        )
-        like_params.append(f"%{escaped}%")
-    match_sum = " + ".join(like_cases)
-    project_filter = "AND s.is_project = 1" if project_only else ""
-    variable_filter = _variable_filter(kind)
+    inner, like_params = _name_tokens_sql(terms, kind, project_only)
     rows = c.execute(
-        f"""SELECT * FROM (
-            SELECT s.*, ({match_sum}) AS _match_cnt FROM symbols s
-            WHERE s.config_hash = ? {project_filter} {variable_filter}
-        ) sub WHERE sub._match_cnt >= ?
-        ORDER BY sub.is_definition DESC, sub._match_cnt DESC, sub.line
-        LIMIT ?""",
-        (*like_params, config_hash, min_matches, limit),
+        f"""{inner}
+        ORDER BY sub.is_definition DESC, sub._match_cnt DESC, sub.line, sub.usr
+        LIMIT ? OFFSET ?""",
+        (*like_params, config_hash, max(1, len(terms) - 1), limit, max(0, offset)),
     ).fetchall()
     if not rows:
         return None
     return _fmt_symbol_rows(rows, root, "name_tokens_like")
 
 
+def _docstring_sql(
+    query: str, config_hash: str, kind: str | None, project_only: bool,
+) -> tuple[str, tuple] | None:
+    """Build the FROM/WHERE text of the docstring search and its parameters.
+
+    Gives None when the strategy does not apply, which is every query that
+    does not hold exactly one term.  The count and the page run on this one
+    text — see ``_name_tokens_sql``.
+    """
+    terms = _name_token_terms(query)
+    if len(terms) != 1:
+        return None
+    escaped = terms[0].replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    project_filter = "AND s.is_project = 1" if project_only else ""
+    # A local variable carries no docstring of its own worth reading; when
+    # it matches, the text belongs to the function around it.  Kept when the
+    # caller asked for a kind — see _search_code_name_tokens.
+    where = f"""FROM symbols s
+           WHERE s.config_hash = ? {project_filter} {_variable_filter(kind)}
+             AND s.docstring LIKE ? ESCAPE '\\'"""
+    return where, (config_hash, f"%{escaped}%")
+
+
+def count_docstring(
+    c: sqlite3.Connection, query: str, config_hash: str,
+    kind: str | None = None, project_only: bool = False,
+) -> int:
+    """Count the symbols that ``_search_code_docstring`` answers with."""
+    built = _docstring_sql(query, config_hash, kind, project_only)
+    if built is None:
+        return 0
+    where, params = built
+    return c.execute(f"SELECT COUNT(*) {where}", params).fetchone()[0]
+
+
 def _search_code_docstring(
     c: sqlite3.Connection, query: str, config_hash: str,
     limit: int, kind: str | None, project_only: bool,
-    root: Path,
+    root: Path, offset: int = 0,
 ) -> tuple[list[dict[str, Any]], str] | None:
     """Single-term docstring LIKE fallback — only runs for 1-word queries.
 
@@ -219,33 +298,51 @@ def _search_code_docstring(
         NOT docstrings.  A concept like "power consumption" may only appear
         in the docstring of ``get_load_power``, not in its name.  LIKE
         catches these cases as a last resort for single-word queries.
+
+    Why the order ends at ``s.usr``:
+        The definition flag and the line tie — line 1 of two headers — and
+        SQLite may then return tied rows in any order.  An OFFSET over such
+        an order shows one row twice and hides another.
     """
-    terms = [t.lower() for t in query.split() if len(t) > 1]
-    if len(terms) != 1:
+    built = _docstring_sql(query, config_hash, kind, project_only)
+    if built is None:
         return None
-    escaped = terms[0].replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
-    project_filter = "AND s.is_project = 1" if project_only else ""
-    # A local variable carries no docstring of its own worth reading; when
-    # it matches, the text belongs to the function around it.  Kept when the
-    # caller asked for a kind — see _search_code_name_tokens.
-    variable_filter = _variable_filter(kind)
+    where, params = built
     rows = c.execute(
-        f"""SELECT s.* FROM symbols s
-           WHERE s.config_hash = ? {project_filter} {variable_filter}
-             AND s.docstring LIKE ? ESCAPE '\\'
-           ORDER BY s.is_definition DESC, s.line
-           LIMIT ?""",
-        (config_hash, f"%{escaped}%", limit),
+        f"""SELECT s.* {where}
+           ORDER BY s.is_definition DESC, s.line, s.usr
+           LIMIT ? OFFSET ?""",
+        (*params, limit, max(0, offset)),
     ).fetchall()
     if not rows:
         return None
     return _fmt_symbol_rows(rows, root, "docstring_like")
 
 
+def count_individual_terms(
+    c: sqlite3.Connection, query: str, config_hash: str,
+    _kind: str | None = None, project_only: bool = False,
+) -> int:
+    """Count the symbols that ``_search_code_individual_terms`` reaches.
+
+    The strategy merges one search per term and drops a symbol it has
+    already seen, thus the answer is the count of the symbols that match
+    ANY term.  One OR query counts exactly that set, and it does not have
+    to build it.
+    """
+    terms = _name_token_terms(query)
+    if len(terms) <= 1:
+        return 0
+    return count_symbols(
+        c, " ".join(terms), config_hash,
+        exclude_variables=True, project_only=project_only,
+    )
+
+
 def _search_code_individual_terms(
     c: sqlite3.Connection, query: str, config_hash: str,
     limit: int, _kind: str | None, project_only: bool,
-    root: Path,
+    root: Path, offset: int = 0,
 ) -> tuple[list[dict[str, Any]], str] | None:
     """Individual-term FTS5 fallback — each word searched separately.
 
@@ -260,32 +357,80 @@ def _search_code_individual_terms(
         The same symbol may match multiple terms — merging without dedup
         would produce duplicates.  USR (Unified Symbol Resolution) is
         unique per symbol across the entire index.
+
+    Why the offset slices the MERGED list:
+        The rows of the terms interleave.  Giving the offset to each term
+        query would walk each term past its own rows, and the merge would
+        then step over the rows between — page 2 of a two-term answer
+        would jump from row 4 to row 13 and hide the eight between.  Each
+        term reads ``offset + limit`` rows, the merge runs, and the slice
+        comes last.
+
+    Why the terms interleave and no longer follow one another:
+        A page of the concatenation holds the first term alone until that
+        term runs out.  The reader then reads a whole page about one word
+        of a two-word query.  Round-robin puts both on the first page,
+        which is what this strategy exists for.
     """
-    terms = [t.lower() for t in query.split() if len(t) > 1]
+    terms = _name_token_terms(query)
     if len(terms) <= 1:
         return None  # Need at least 2 terms for individual search to make sense
-    seen_usr: set[str] = set()
-    ind_rows: list = []
-    for term in terms:
-        term_results = search_symbols(
-            c, term, config_hash,
-            limit=max(3, limit // len(terms)),
+    reach = max(0, offset) + limit
+    per_term = [
+        search_symbols(
+            c, term, config_hash, limit=reach,
             kind=None, exclude_variables=True, project_only=project_only,
         )
-        for r in term_results:
-            if r["usr"] not in seen_usr:
-                seen_usr.add(r["usr"])
-                ind_rows.append(r)
-    rows = ind_rows[:limit]
+        for term in terms
+    ]
+    seen_usr: set[str] = set()
+    merged: list = []
+    for rank in range(max((len(rows) for rows in per_term), default=0)):
+        for rows in per_term:
+            if rank >= len(rows):
+                continue
+            row = rows[rank]
+            if row["usr"] not in seen_usr:
+                seen_usr.add(row["usr"])
+                merged.append(row)
+    rows = merged[max(0, offset):reach]
     if not rows:
         return None
     return _fmt_symbol_rows(rows, root, "individual_terms")
 
 
+_MACRO_FTS_FROM = """FROM macros_fts
+               JOIN macros m ON m.id = macros_fts.rowid
+               JOIN files f ON f.id = m.file_id
+               WHERE macros_fts MATCH ? AND m.config_hash = ?"""
+
+
+def count_macros_fts(
+    c: sqlite3.Connection, query: str, config_hash: str,
+    _kind: str | None = None, project_only: bool = False,
+) -> int:
+    """Count the macros that ``_search_code_macros_fts`` answers with.
+
+    A database error counts as zero, for the same reason that the strategy
+    answers with None: every earlier strategy already found nothing, thus
+    "no results at all" is the honest answer.
+    """
+    project_filter = "AND f.is_project = 1" if project_only else ""
+    try:
+        return c.execute(
+            f"SELECT COUNT(*) {_MACRO_FTS_FROM} {project_filter}",
+            (_expand_query(query), config_hash),
+        ).fetchone()[0]
+    except Exception as exc:
+        if not is_db_exception(exc):
+            raise
+        return 0
+
+
 def _search_code_macros_fts(
     c: sqlite3.Connection, query: str, config_hash: str,
     limit: int, _kind: str | None, project_only: bool,
-    root: Path,
+    root: Path, offset: int = 0,
 ) -> tuple[list[dict[str, Any]], str] | None:
     """Macro FTS fallback — searches ``#define`` names and values.
 
@@ -299,19 +444,20 @@ def _search_code_macros_fts(
     ``_expand_query()`` adds ``*`` suffix to each term — macros are
     typically short and exact (``UART_BAUD``), not prefix-matchable
     without the wildcard.
+
+    Why the order ends at ``m.id``:
+        ``rank`` ties — several macros score alike — and SQLite may then
+        return tied rows in any order.  An OFFSET over such an order shows
+        one macro twice and hides another.  ``m.id`` is unique.
     """
     try:
-        expanded = _expand_query(query)
         project_filter = "AND f.is_project = 1" if project_only else ""
         m_rows = c.execute(
             f"""SELECT m.*, f.path AS file_path
-               FROM macros_fts
-               JOIN macros m ON m.id = macros_fts.rowid
-               JOIN files f ON f.id = m.file_id
-               WHERE macros_fts MATCH ? AND m.config_hash = ? {project_filter}
-               ORDER BY rank
-               LIMIT ?""",
-            (expanded, config_hash, limit),
+               {_MACRO_FTS_FROM} {project_filter}
+               ORDER BY rank, m.id
+               LIMIT ? OFFSET ?""",
+            (_expand_query(query), config_hash, limit, max(0, offset)),
         ).fetchall()
         if not m_rows:
             return None
@@ -349,4 +495,16 @@ _SEARCH_CODE_FALLBACKS: list[FallbackFunc] = [
     _search_code_docstring,         # single-word docstring catch-all
     _search_code_individual_terms,  # each word separately
     _search_code_macros_fts,        # last resort: macro names
+]
+
+# The same chain with the counter of each step beside it.  A paged caller
+# needs both: the count decides WHICH step owns the answer, because an
+# empty page of a step that did match means "past the end" and not "try
+# the next step".  The pipeline layer does not page and uses the list
+# above alone.
+_SEARCH_CODE_STEPS: list[tuple[FallbackFunc, CountFunc]] = [
+    (_search_code_name_tokens, count_name_tokens),
+    (_search_code_docstring, count_docstring),
+    (_search_code_individual_terms, count_individual_terms),
+    (_search_code_macros_fts, count_macros_fts),
 ]

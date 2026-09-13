@@ -21,8 +21,10 @@ import sqlite3
 from pathlib import Path
 
 from fw_context_mcp.indexer.db import search_symbols
+from fw_context_mcp.indexer.db._symbols import count_symbols
 from fw_context_mcp.search.shared_fallbacks import (  # noqa: F401 — re-export
     _SEARCH_CODE_FALLBACKS,
+    _SEARCH_CODE_STEPS,
     _fmt_symbol_rows,
     _search_code_docstring,
     _search_code_individual_terms,
@@ -32,10 +34,33 @@ from fw_context_mcp.search.shared_fallbacks import (  # noqa: F401 — re-export
 )
 
 
+def count_fts5_kind(
+    c: sqlite3.Connection, query: str, config_hash: str,
+    kind: str | None = None, project_only: bool = False,
+) -> int:
+    """Count what the primary search answers with, kind-less retry included.
+
+    The retry is part of the answer: when a kind matches nothing, the
+    search drops the kind and answers from the wider set.  A count that
+    stopped at the kind would then describe a different answer than the
+    rows do.
+    """
+    total = count_symbols(
+        c, query, config_hash, kind=kind,
+        exclude_variables=True, project_only=project_only,
+    )
+    if total == 0 and kind:
+        total = count_symbols(
+            c, query, config_hash, kind=None,
+            exclude_variables=True, project_only=project_only,
+        )
+    return total
+
+
 def _search_code_fts5_kind(
     c: sqlite3.Connection, query: str, config_hash: str,
     limit: int, kind: str | None, project_only: bool,
-    root: Path,
+    root: Path, offset: int = 0,
 ) -> tuple[list[dict], str] | None:
     """Primary FTS5 search with optional kind + kind-less fallback.
 
@@ -49,20 +74,27 @@ def _search_code_fts5_kind(
     query.  A local is never the answer to "which symbol is about X".
     ``search_symbols`` gives an explicit *kind* precedence over this filter,
     thus ``search_code(..., kind="varlocal")`` still reaches them.
+
+    WHY the kind-less retry keys on the COUNT of the first query: with an
+    offset past the end of the kind-filtered answer the page is empty
+    although the kind did match, and the retry would then answer about a
+    wider set under the kind the caller asked for.
     """
     rows = search_symbols(
         c, query, config_hash, limit=limit, kind=kind,
-        exclude_variables=True, project_only=project_only,
+        exclude_variables=True, project_only=project_only, offset=offset,
     )
     method = "fts5+kind"
-    if not rows and kind:
+    if not rows and kind and count_symbols(
+        c, query, config_hash, kind=kind,
+        exclude_variables=True, project_only=project_only,
+    ) == 0:
         rows = search_symbols(
             c, query, config_hash, limit=limit, kind=None,
-            exclude_variables=True, project_only=project_only,
+            exclude_variables=True, project_only=project_only, offset=offset,
         )
         if rows:
             method = "fts5"
     if not rows:
         return None
     return _fmt_symbol_rows(rows, root, method)
-

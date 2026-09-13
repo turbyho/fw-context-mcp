@@ -582,6 +582,65 @@ def _expand_query(query: str, *, for_body_search: bool = False) -> str:
     return " OR ".join(_expand_token(p) for p in parts)
 
 
+def _symbol_search_filters(
+    kind: str | None, exclude_variables: bool, project_only: bool,
+) -> tuple[str, str]:
+    """Give the two SQL filters of a symbol search.
+
+    The count and the page must run on the SAME conditions.  Two copies of
+    this text drift apart, and a ``total`` that describes another answer
+    than the rows do is worse than no total at all.
+    """
+    if kind:
+        kind_filter = "AND s.kind = ?"
+    elif exclude_variables:
+        # Covers both 'variable' (legacy unsplit kind) and 'varlocal'
+        # (post-split kind for locals).  'varglobal' is deliberately NOT
+        # excluded — global variables carry higher architectural weight
+        # and their names are often meaningful search targets.
+        kind_filter = "AND s.kind NOT IN ('variable', 'varlocal')"
+    else:
+        kind_filter = ""
+    project_filter = "AND s.is_project = 1" if project_only else ""
+    return kind_filter, project_filter
+
+
+def count_symbols(
+    conn: sqlite3.Connection,
+    query: str,
+    config_hash: str,
+    kind: str | None = None,
+    exclude_variables: bool = False,
+    project_only: bool = False,
+) -> int:
+    """Count the symbols that ``search_symbols`` answers with.
+
+    Reports how many symbols the query matches ALTOGETHER, thus a reader
+    of one page knows whether more exist.  A query that FTS5 refuses
+    counts as zero, which is what ``search_symbols`` answers with.
+    """
+    kind_filter, project_filter = _symbol_search_filters(
+        kind, exclude_variables, project_only,
+    )
+    params: list = [_expand_query(query), config_hash]
+    if kind:
+        params.append(kind)
+    try:
+        return conn.execute(
+            f"""SELECT COUNT(*)
+               FROM symbols_fts
+               JOIN symbols s ON s.id = symbols_fts.rowid
+               WHERE symbols_fts MATCH ? AND s.config_hash = ?
+                 {kind_filter} {project_filter}""",
+            params,
+        ).fetchone()[0]
+    except sqlite3.OperationalError as e:
+        if getattr(e, "sqlite_errorcode", 0) == 1 and "fts5" in str(e).lower():
+            log.debug("count_symbols: FTS5 syntax error (%s) — counting zero", e)
+            return 0
+        raise
+
+
 def search_symbols(
     conn: sqlite3.Connection,
     query: str,
@@ -590,6 +649,7 @@ def search_symbols(
     kind: str | None = None,
     exclude_variables: bool = False,
     project_only: bool = False,
+    offset: int = 0,
 ) -> list[sqlite3.Row]:
     """FTS5 search over symbols for a given build config.
 
@@ -604,29 +664,22 @@ def search_symbols(
     phases (hybrid / embedding search) where vector re-ranking handles relevance.
     When *project_only* is True, SDK/vendor paths are excluded
     (only src/, lib/, app/, include/ are retained).
+    *offset* walks past the rows of an earlier page.  The bm25 score ties —
+    many symbols score alike — and SQLite may return tied rows in any
+    order, thus ``s.usr`` ends the order.  It is unique within one build,
+    so two pages of one walk cannot repeat or skip a row.
     Note: file_path is read from the denormalized symbols.file_path column,
     not re-joined from files — the JOIN was removed to avoid the redundant
     round-trip and the shadowing hazard.
     """
     expanded = _expand_query(query)
-    if kind:
-        kind_filter = "AND s.kind = ?"
-    elif exclude_variables:
-        # Covers both 'variable' (legacy unsplit kind) and 'varlocal'
-        # (post-split kind for locals).  'varglobal' is deliberately NOT
-        # excluded — global variables carry higher architectural weight
-        # and their names are often meaningful search targets.
-        kind_filter = "AND s.kind NOT IN ('variable', 'varlocal')"
-    else:
-        kind_filter = ""
-    if project_only:
-        project_filter = "AND s.is_project = 1"
-    else:
-        project_filter = ""
+    kind_filter, project_filter = _symbol_search_filters(
+        kind, exclude_variables, project_only,
+    )
     params: list = [expanded, config_hash]
     if kind:
         params.append(kind)
-    params.append(limit)
+    params += [limit, max(0, offset)]
     # Build bm25 weights — cache column count per connection to avoid
     # querying PRAGMA table_info on every search_symbols call.
     #
@@ -650,8 +703,8 @@ def search_symbols(
                FROM symbols_fts
                JOIN symbols s ON s.id = symbols_fts.rowid
                WHERE symbols_fts MATCH ? AND s.config_hash = ? {kind_filter} {project_filter}
-                ORDER BY {bm25_expr}
-               LIMIT ?""",
+                ORDER BY {bm25_expr}, s.usr
+               LIMIT ? OFFSET ?""",
             params,
         ).fetchall()
     except sqlite3.OperationalError as e:

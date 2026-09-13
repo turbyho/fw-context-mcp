@@ -54,12 +54,23 @@ from ..shared.stale import _with_stale_recovery
 from ._lookup import lookup_symbol
 from ._search_fallbacks import (
     _SEARCH_CODE_FALLBACKS,
+    _SEARCH_CODE_STEPS,
     _fmt_symbol_rows,
     _search_code_docstring,
     _search_code_fts5_kind,
     _search_code_macros_fts,
     _search_code_name_tokens,
+    count_fts5_kind,
 )
+
+# The relaxation chain of ``search_code``, each step beside its counter.
+# The primary FTS5 search leads it: it is a step of the same shape, and a
+# paged walk has to treat it as one — the step that matches owns the whole
+# answer, and the count is what says which step that is.
+_SEARCH_CODE_STEPS_WITH_PRIMARY = [
+    (_search_code_fts5_kind, count_fts5_kind),
+    *_SEARCH_CODE_STEPS,
+]
 
 log = logging.getLogger(__name__)
 
@@ -204,7 +215,8 @@ def search_code(
     query: Annotated[str, Field(description="FTS5 search terms. 1-3 words, omit underscores. E.g. 'modem init' not 'modem_init'. Supports trailing wildcard 'modem*'.")],
     project_root: Annotated[str | None, Field(description="Project root. Auto-detected if omitted.")] = None,
      kind: Annotated[str | None, Field(description="Optional kind filter: function, method, constructor, destructor, class, struct, union, enum, enum_constant, typedef, varglobal, varlocal, variable, field, namespace.")] = None,
-     limit: Annotated[int, Field(description="Maximum results (default 20, max 100).")] = 20,
+     limit: Annotated[int, Field(description="Maximum results of one page (default 20, max 100).")] = 20,
+     offset: Annotated[int, Field(description="Skip this many results. Reads the next page of a topic that many symbols carry.")] = 0,
      project_only: Annotated[bool, Field(description="Exclude vendor SDK code. When True, only application code. Default False.")] = False,
      variant: Annotated[str | None, Field(description="Build variant (multi-build project). Omit to use default_variant. One query answers for ONE build.")] = None,
      image: Annotated[str | None, Field(description="Sysbuild image within the variant. Required when the variant holds several: each image is a separate program.")] = None,
@@ -277,7 +289,11 @@ def search_code(
         query: FTS5 search terms. Keep queries short — 1–3 words.
         project_root: Project root directory. Auto-detected from CWD if omitted.
         kind: Optional filter to return only symbols of this kind.
-        limit: Maximum results (default 20, max 100).
+        limit: Maximum results of one page (default 20, max 100).
+        offset: Skip this many results. Reads the next page of a topic
+            that many symbols carry; the page notice names the offset to
+            use.  One relaxation step owns the whole answer, thus a walk
+            never changes the step under the reader.
         project_only: When True, exclude vendor SDK directories and return only
             application code. Default False.
         variant: Build variant (multi-build project). Omit to use
@@ -286,19 +302,23 @@ def search_code(
             variant holds several: each image is a separate program.
 
     Returns:
-        list of dicts, each with: name, qualified_name, kind, file, line,
-        is_definition, signature, docstring, is_template, is_virtual,
-        is_pure_virtual. Enum constants include ``enum_value`` with the
-        integer value. May also include ``template_usr``, ``parent_usr``,
-        and ``llm_analysis`` (``{summary, inputs, outputs}`` — written by a
-        model, not by the code.  ``get_active_build().analysis.model`` names
-        it). Fallback results include ``_fallback`` with the method name.
+        list of dicts.  The first is the page notice — ``total``,
+        ``offset``, ``shown``, ``more`` — where ``total`` counts the
+        answer of the step that answered.  Each symbol that follows has
+        name, qualified_name, kind, file, line, is_definition, signature,
+        docstring, is_template, is_virtual, is_pure_virtual. Enum
+        constants include ``enum_value`` with the integer value. May also
+        include ``template_usr``, ``parent_usr``, and ``llm_analysis``
+        (``{summary, inputs, outputs}`` — written by a model, not by the
+        code.  ``get_active_build().analysis.model`` names it). Fallback
+        results include ``_fallback`` with the method name.
 
         No match gives ``[]``.  A dict with ``error`` means the query
         failed.  A stale index prepends a dict with ``warning`` + ``hint``.
     """
     root = resolve_project_root(project_root)
     limit = max(0, min(limit, 100))
+    skip = clamp_offset(offset)
 
     def _do_search(c: sqlite3.Connection, config_hash: str) -> list[dict]:
         """Execute the six-step progressive relaxation search for ``search_code``.
@@ -327,32 +347,41 @@ def search_code(
         ``_fmt_symbol_rows`` (called by each fallback), so the caller only
         needs to extract ``result[0]`` — the result list.
 
-        The cascade stops at the first non-None result. Earlier strategies
-        are faster and more precise; later ones are broader but slower.
-        This ordering means the operator gets the best match with minimal
-        overhead when the query is well-formed, and progressively broader
-        searches when the initial query misses.
+        Earlier strategies are faster and more precise; later ones are
+        broader but slower.  The operator thus gets the best match with
+        minimal overhead when the query is well-formed, and progressively
+        broader searches when the initial query misses.
 
         Why progressive relaxation instead of returning empty: operators
         often search with incomplete information ("I think it's called
         something like 'uart init'"). Returning empty on a near-match is
         worse than returning slightly noisy results with a ``_fallback``
         marker that the LLM can use to qualify its confidence.
-        """
-        result = _search_code_fts5_kind(c, query, config_hash, limit, kind, project_only, root)
-        if result is not None:
-            # Each fallback returns (data, method_name) tuple — data is the
-            # result list, method_name is already embedded in each dict via
-            # _fmt_symbol_rows → _fallback key.
-            return result[0]
 
-        # Try each progressive fallback in order — first non-None result wins.
-        # _SEARCH_CODE_FALLBACKS is a list of callables ordered from
-        # fastest/most-precise to slowest/broadest.
-        for strategy in _SEARCH_CODE_FALLBACKS:
-            result = strategy(c, query, config_hash, limit, kind, project_only, root)
-            if result is not None:
-                return result[0]
+        **Why the cascade stops on a COUNT and no longer on the rows:**
+        the step that matches owns the WHOLE answer, and a page of it is a
+        slice of that answer.  An empty page of a step that did match
+        means "past the end", and a cascade that read that as "try the
+        next step" would answer page 2 from a broader step than page 1.
+        The reader would then walk two different answers under one query.
+        """
+        for strategy, counter in _SEARCH_CODE_STEPS_WITH_PRIMARY:
+            total = counter(c, query, config_hash, kind, project_only)
+            if not total:
+                continue
+            result = strategy(c, query, config_hash, limit, kind, project_only, root, skip)
+            # Each strategy returns (data, method_name) — the method name is
+            # already on each dict through _fmt_symbol_rows → _fallback.
+            page = result[0] if result is not None else []
+            if not page:
+                return [{"info": (
+                    f"No symbol at offset {skip}; the answer holds {total}."
+                )}]
+            page.insert(0, page_notice(
+                total, skip, len(page),
+                hint=f"search_code('{query}', offset={skip + len(page)}) reads the next page.",
+            ))
+            return page
 
         return []
 

@@ -50,11 +50,11 @@ def _notice(rows: list[dict]) -> dict | None:
 
 
 def _symbol(file_id, path, name, qualified_name, usr, line, *,
-            kind="function", source="", is_project=1, parent_usr=""):
+            kind="function", source="", is_project=1, parent_usr="", docstring=""):
     """One symbol row in the column order of ``insert_symbols_batch``."""
     return (
         CH, file_id, path, name.replace("_", " "), usr, name, qualified_name, kind,
-        line, 0, line + 3, 1, f"void {qualified_name}()", "", None, 0, 0,
+        line, 0, line + 3, 1, f"void {qualified_name}()", docstring, None, 0, 0,
         parent_usr, 0, "", is_project, 0.0, source, 0,
     )
 
@@ -82,6 +82,9 @@ def project(tmp_path: Path) -> Path:
       project ones sit LAST by relevance, thus a project-first order that
       only reaches into a window would lose them on a deeper page.
     * Nine files hold the word ``probe`` in their text.
+    * Seven symbols, five docstrings and six macros hold an infix that no
+      FTS5 prefix reaches, one block for each relaxation step of
+      ``search_code`` that a caller can reach.
     * Six symbols are named ``read``, and every one of them is a definition
       at line 1 — the tie that an OFFSET needs a third column to survive.
     """
@@ -149,6 +152,33 @@ def project(tmp_path: Path) -> Path:
             symbols.append(_symbol(
                 fid, rel, f"Reader{i}", f"Reader{i}", f"u_cls{i}", 1, kind="class",
             ))
+        # Four symbols that the name-token step reaches under a query the
+        # primary search also answers.  FTS5 splits `reprobe_0` into the
+        # tokens "reprobe" and "0", thus `probe*` matches neither, while
+        # `name_tokens LIKE '%probe%'` matches.  The name-token step thus
+        # holds 17 rows where the primary holds 13, and a cascade that
+        # falls through at an empty page answers row 14 from the wrong
+        # step.
+        for i in range(4):
+            symbols.append(_symbol(
+                fid, rel, f"reprobe_{i}", f"reprobe_{i}", f"u_rp{i}", 80 + i,
+            ))
+        # Seven symbols that only an INFIX reaches.  FTS5 gives every bare
+        # term a trailing `*`, thus `nitial*` matches no token of
+        # "handle initialise", while `name_tokens LIKE '%nitial%'` does.
+        # This is what makes the name-token step fire.
+        for i in range(7):
+            symbols.append(_symbol(
+                fid, rel, f"handle_initialise_{i}", f"handle_initialise_{i}",
+                f"u_nit{i}", 50 + i,
+            ))
+        # Five symbols whose DOCSTRING alone holds an infix.  The name-token
+        # step above must miss them, thus the token text holds no `qqzz`.
+        for i in range(5):
+            symbols.append(_symbol(
+                fid, rel, f"parse_frame_{i}", f"parse_frame_{i}", f"u_doc{i}",
+                70 + i, docstring="Reads a qqzz payload.",
+            ))
         # One symbol that only the "Foo::bar" suffix fallback reaches.
         symbols.append(_symbol(
             fid, rel, "flush", "deep::ns::Buffer::flush", "u_flush", 40,
@@ -158,6 +188,10 @@ def project(tmp_path: Path) -> Path:
 
         insert_macros_batch(conn, [
             (CH, fid, f"LIMIT_{i}", str(i), str(i), 10 + i, 0) for i in range(5)
+        ] + [
+            # `ZQTIMER` is in no symbol, thus every symbol step of the
+            # relaxation chain misses and the macro step answers.
+            (CH, fid, f"ZQTIMER_{i}", str(i), str(i), 90 + i, 0) for i in range(6)
         ])
     conn.close()
     return root
@@ -418,3 +452,97 @@ class TestMacroPaging:
             assert sorted(seen) == [f"LIMIT_{i}" for i in range(5)]
         finally:
             conn.close()
+
+
+class TestSearchCodePages:
+    """The relaxation chain answers from ONE step, and that step pages.
+
+    The step that matches owns the whole answer.  A cascade that read an
+    empty page as "try the next step" would answer page 2 from a broader
+    step than page 1, and the reader would walk two answers under one
+    query.
+    """
+
+    def _walk(self, project: Path, query: str, page: int) -> tuple[list, int]:
+        from fw_context_mcp.mcp.handlers.search import search_code
+
+        seen: list = []
+        total = 0
+        offset = 0
+        while True:
+            rows = search_code(query, project_root=str(project), limit=page, offset=offset)
+            body = _answers(rows)
+            if not body:
+                break
+            notice = _notice(rows)
+            total = notice["total"]
+            assert notice["offset"] == offset
+            assert notice["shown"] == len(body)
+            seen += [r["qualified_name"] for r in body]
+            offset += len(body)
+            if not notice["more"]:
+                break
+        return seen, total
+
+    @pytest.mark.parametrize(("query", "step", "count"), [
+        ("probe", "fts5+kind", 13),         # the primary search
+        ("nitial", "name_tokens_like", 7),  # an infix of the tokens
+        ("qzz", "docstring_like", 5),       # an infix of a docstring token
+        ("zqtimer", "macros_fts", 6),       # no symbol holds it
+    ])
+    def test_each_step_pages_whole_and_once(
+        self, project: Path, query: str, step: str, count: int,
+    ):
+        from fw_context_mcp.mcp.handlers.search import search_code
+
+        rows = search_code(query, project_root=str(project), limit=3)
+        body = _answers(rows)
+        assert body, f"{query!r} reached no step"
+        marks = {r.get("_fallback", "fts5+kind") for r in body}
+        assert marks == {step}, f"{query!r} answered from {marks}"
+        assert _notice(rows)["total"] == count
+
+        for page in (2, 3, 5):
+            seen, total = self._walk(project, query, page)
+            assert total == count, f"page={page} counted {total}"
+            assert len(seen) == count, f"page={page} walked {len(seen)}"
+            assert len(set(seen)) == count, f"page={page} repeated a row"
+
+    def test_an_offset_past_the_end_does_not_fall_to_the_next_step(
+        self, project: Path,
+    ):
+        """The defect the COUNT gate removes.
+
+        The primary search answers ``probe`` with 13 symbols.  The
+        name-token step below it reaches 17, because it matches an infix
+        that no FTS5 prefix reaches.  At offset 13 the primary has nothing
+        left, and a cascade that keyed on the ROWS would hand the reader
+        rows 14 to 17 of a DIFFERENT answer under the same query.
+        """
+        from fw_context_mcp.mcp.handlers.search import search_code
+
+        rows = search_code("probe", project_root=str(project), limit=5, offset=13)
+
+        body = _answers(rows)
+        assert body == [], f"the answer of another step leaked in: {body}"
+        assert any("13" in r.get("info", "") for r in rows), rows
+
+    def test_the_step_below_really_reaches_further(self, project: Path):
+        """Hold the premise of the test above: the two steps differ in size.
+
+        Without this the test above passes for the wrong reason — two steps
+        of equal size cannot show a fall-through.
+        """
+        from fw_context_mcp.indexer.db import open_db
+        from fw_context_mcp.mcp.handlers.search import search_code
+        from fw_context_mcp.mcp.shared.context import _db_path
+        from fw_context_mcp.search.shared_fallbacks import count_name_tokens
+
+        primary = _notice(search_code("probe", project_root=str(project), limit=1))
+        conn = open_db(_db_path(project))
+        try:
+            wider = count_name_tokens(conn, "probe", CH)
+        finally:
+            conn.close()
+        assert primary["total"] == 13
+        assert wider == 17, f"the name-token step must reach further, got {wider}"
