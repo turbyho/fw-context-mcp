@@ -147,24 +147,56 @@ class Candidate(tuple):
         return self[6]
 
 
+def _parameters(signature: str) -> str:
+    """Cut the parameter list out of a signature, brackets included.
+
+    ``bool set(uint8_t, const char *)`` gives ``(uint8_t, const char *)``.
+    A signature with no parentheses gives ``""``.
+    """
+    start = signature.find("(")
+    end = signature.rfind(")")
+    if start == -1 or end <= start:
+        return ""
+    return signature[start: end + 1]
+
+
 def candidate_labels(candidates: list[Candidate]) -> list[str]:
     """Name each candidate so that a reader can tell them apart.
 
     A qualified name alone is enough almost always, and it is then what the
-    caller can type back.  It is NOT enough for a C function at file scope:
-    measured on one Zephyr project, a name matched three symbols and the
-    notice read ``clock_stop, clock_stop, clock_stop``.  A repeated name
-    therefore takes its file.
+    caller can type back.  Two measured cases where it is not:
+
+    * Overloads.  ``CoilData::set`` has five, thus one project answered
+      with two rows that read ``CoilData.cpp:183 → CoilData::set`` and
+      differed only in a USR the reader never sees.  The parameter list is
+      what separates overloads, and it is what a reader recognises.
+    * A C function at file scope, whose qualified name IS its bare name.
+      One Zephyr project gave a notice reading ``clock_stop, clock_stop,
+      clock_stop``.  Those live in different files, thus the file
+      separates them.
+
+    The parameter list comes first because two overloads usually share a
+    file, which would leave the file label as ambiguous as the bare name.
+    A candidate that neither tells apart keeps the plain name: a label that
+    adds nothing is worse than a short one.
     """
     seen: dict[str, int] = {}
     for candidate in candidates:
         seen[candidate.qualified_name] = seen.get(candidate.qualified_name, 0) + 1
-    return [
-        f"{c.qualified_name} ({c.file_path})"
-        if seen[c.qualified_name] > 1 and c.file_path
-        else c.qualified_name
-        for c in candidates
-    ]
+
+    labels: list[str] = []
+    for c in candidates:
+        if seen[c.qualified_name] <= 1:
+            labels.append(c.qualified_name)
+            continue
+        params = _parameters(c.signature)
+        if params:
+            labels.append(f"{c.qualified_name}{params}")
+        elif c.file_path:
+            labels.append(f"{c.qualified_name} ({c.file_path})")
+        else:
+            labels.append(c.qualified_name)
+    return labels
 
 
 def candidate_rows(candidates: list[Candidate], root=None) -> list[dict]:

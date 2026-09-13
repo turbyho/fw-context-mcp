@@ -786,12 +786,68 @@ def find_callees_recursive(
     return _rows_with_targets(rows, name, source_usrs, source_names, "callees")
 
 
+def count_dead_code(
+    conn: sqlite3.Connection,
+    config_hash: str,
+    exclude_paths: list[str] | None = None,
+    project_only: bool = False,
+) -> int:
+    """Count every symbol that :func:`find_dead_code` would report.
+
+    Runs the two categories under the same conditions and counts their
+    union, thus a paged answer can say how much it does not show.  The
+    second category already excludes a symbol of the first in SQL, so the
+    union is the sum.
+    """
+    project_only_clause = "AND s.is_project = 1" if project_only else ""
+    if exclude_paths:
+        path_clause = "AND " + " AND ".join("s.file_path NOT LIKE ?" for _ in exclude_paths)
+        exclude_params = list(exclude_paths)
+    else:
+        path_clause = ""
+        exclude_params = []
+
+    dead = conn.execute(
+        f"""SELECT COUNT(*) FROM symbols s
+            WHERE s.config_hash = ? AND s.is_definition = 1
+              AND s.kind IN ('function', 'method', 'constructor', 'destructor')
+              AND s.usr NOT IN (
+                  SELECT DISTINCT to_usr FROM refs WHERE config_hash = ?
+              )
+              {path_clause} {project_only_clause}""",
+        [config_hash, config_hash, *exclude_params],
+    ).fetchone()
+    possibly = conn.execute(
+        f"""SELECT COUNT(*) FROM symbols s
+            WHERE s.config_hash = ? AND s.is_definition = 1
+              AND s.kind IN ('function', 'method', 'constructor', 'destructor')
+              AND s.usr IN (
+                  SELECT DISTINCT to_usr FROM refs
+                  WHERE config_hash = ? AND ref_kind = 'indirect'
+              )
+              AND s.usr NOT IN (
+                  SELECT fpa.rhs_usr FROM fp_assignments fpa
+                  JOIN indirect_call_sites ics
+                    ON ics.target_usr = fpa.lhs_usr
+                   AND ics.config_hash = fpa.config_hash
+                  WHERE fpa.config_hash = ?
+              )
+              AND s.usr NOT IN (
+                  SELECT to_usr FROM refs WHERE config_hash = ? AND ref_kind = 'call'
+              )
+              {path_clause} {project_only_clause}""",
+        [config_hash, config_hash, config_hash, config_hash, *exclude_params],
+    ).fetchone()
+    return (dead[0] if dead else 0) + (possibly[0] if possibly else 0)
+
+
 def find_dead_code(
     conn: sqlite3.Connection,
     config_hash: str,
     limit: int = 100,
     exclude_paths: list[str] | None = None,
     project_only: bool = False,
+    offset: int = 0,
 ) -> list[dict]:
     """Find functions that are defined but never called, with two confidence levels.
 
@@ -827,8 +883,19 @@ def find_dead_code(
         path_clause = ""
         exclude_params = []
 
+    # The two categories concatenate, and the second is filtered in Python
+    # against the first, thus an OFFSET in SQL would skip rows of a list
+    # that this function has not built yet.  Each query therefore reaches
+    # ``offset + limit`` rows and the slice comes after the merge.
+    #
+    # ``s.usr`` ends both orders because it is unique.  Two symbols can
+    # share a kind and a name — that is the whole subject of this module —
+    # and SQLite may then return them in any order, which would make one
+    # page repeat a row and another lose one.
+    reach = offset + limit
+
     # Category 1: truly dead — no refs at all
-    dead_params: list[object] = [config_hash, config_hash] + exclude_params + [limit]
+    dead_params: list[object] = [config_hash, config_hash] + exclude_params + [reach]
     dead_rows = conn.execute(
         f"""SELECT s.name, s.qualified_name, s.kind, s.file_path,
                   s.signature, s.line, s.usr
@@ -841,7 +908,7 @@ def find_dead_code(
              )
              {path_clause}
              {project_only_clause}
-           ORDER BY s.kind, s.name
+           ORDER BY s.kind, s.name, s.usr
            LIMIT ?""",
         dead_params,
     ).fetchall()
@@ -867,7 +934,7 @@ def find_dead_code(
     # A symbol is possibly dead when it has ref_kind='indirect' entries
     # (function pointer assignments) but is NOT found as a resolved target
     # via fp_assignments → indirect_call_sites linking.
-    remaining_slots = limit - len(results)
+    remaining_slots = reach - len(results)
     if remaining_slots > 0:
         possibly_params: list[object] = (
             [
@@ -911,7 +978,7 @@ def find_dead_code(
                  )
                  {path_clause}
                  {project_only_clause}
-               ORDER BY s.kind, s.name
+               ORDER BY s.kind, s.name, s.usr
                LIMIT ?""",
             possibly_params,
         ).fetchall()
@@ -932,7 +999,50 @@ def find_dead_code(
                 }
             )
 
-    return results
+    return results[offset:reach]
+
+
+def count_hotspots(
+    conn: sqlite3.Connection,
+    config_hash: str,
+    exclude_paths: list[str] | None = None,
+    project_only: bool = False,
+) -> int:
+    """Count every function that has at least one caller.
+
+    Runs on the same conditions as :func:`find_hotspots` and differs only
+    in the LIMIT, thus a paged answer can say how much it does not show.
+    """
+    proj_clause = "AND s.is_project = 1" if project_only else ""
+    path_clauses = ""
+    params: list = [config_hash]
+    if exclude_paths:
+        path_clauses = "AND " + " AND ".join("s.file_path NOT LIKE ?" for _ in exclude_paths)
+        params.extend(exclude_paths)
+    cached = conn.execute(
+        "SELECT COUNT(*) FROM hotspot_cache WHERE config_hash = ?", (config_hash,)
+    ).fetchone()
+    if cached and cached[0] > 0:
+        row = conn.execute(
+            f"""SELECT COUNT(*)
+                FROM hotspot_cache h
+                JOIN symbols s ON s.id = h.symbol_id AND s.config_hash = h.config_hash
+                WHERE h.config_hash = ? {path_clauses} {proj_clause}""",
+            params,
+        ).fetchone()
+        return row[0] if row else 0
+    row = conn.execute(
+        f"""SELECT COUNT(*) FROM (
+                SELECT 1 FROM refs r
+                JOIN symbols s ON s.usr = r.to_usr AND s.config_hash = r.config_hash
+                WHERE r.config_hash = ?
+                  AND s.is_definition = 1
+                  AND r.ref_kind IN ('call', 'indirect')
+                  {path_clauses} {proj_clause}
+                GROUP BY s.usr)""",
+        params,
+    ).fetchone()
+    return row[0] if row else 0
 
 
 def find_hotspots(
@@ -941,6 +1051,7 @@ def find_hotspots(
     limit: int = 20,
     exclude_paths: list[str] | None = None,
     project_only: bool = False,
+    offset: int = 0,
 ) -> list[dict]:
     """Find the most-called functions ranked by caller count.
 
@@ -962,6 +1073,11 @@ def find_hotspots(
     ``find_hotspots()`` call is unacceptable for interactive use.
     The cache trades a small write cost at index time for zero-latency
     reads at query time.
+
+    **The order ends at the USR**, which is unique.  A caller count ties
+    constantly — most functions have one or two callers — and SQLite may
+    return tied rows in any order, thus an OFFSET over the count alone
+    would show one function twice and hide another.
     """
     proj_clause = "AND s.is_project = 1" if project_only else ""
     # Try cache first
@@ -972,7 +1088,7 @@ def find_hotspots(
         if exclude_paths:
             path_clauses = "AND " + " AND ".join("s.file_path NOT LIKE ?" for _ in exclude_paths)
             params.extend(exclude_paths)
-        params.append(limit)
+        params.extend([limit, offset])
         rows = conn.execute(
             f"""SELECT s.name, s.qualified_name, s.kind, s.file_path,
                       s.signature, s.line,
@@ -982,8 +1098,8 @@ def find_hotspots(
                WHERE h.config_hash = ?
                  {path_clauses}
                  {proj_clause}
-               ORDER BY h.caller_count DESC
-               LIMIT ?""",
+               ORDER BY h.caller_count DESC, s.usr
+               LIMIT ? OFFSET ?""",
             params,
         ).fetchall()
         return [dict(r) for r in rows]
@@ -994,7 +1110,7 @@ def find_hotspots(
     if exclude_paths:
         path_clauses = "AND " + " AND ".join("s.file_path NOT LIKE ?" for _ in exclude_paths)
         p.extend(exclude_paths)
-    p.append(limit)
+    p.extend([limit, offset])
 
     rows = conn.execute(
         f"""SELECT s.name, s.qualified_name, s.kind, s.file_path,
@@ -1008,8 +1124,8 @@ def find_hotspots(
              {path_clauses}
              {proj_clause}
            GROUP BY s.usr
-           ORDER BY caller_count DESC
-           LIMIT ?""",
+           ORDER BY caller_count DESC, s.usr
+           LIMIT ? OFFSET ?""",
         p,
     ).fetchall()
 

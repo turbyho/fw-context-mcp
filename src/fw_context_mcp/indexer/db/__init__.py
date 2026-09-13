@@ -36,7 +36,9 @@ __all__ = [
     "clean_orphan_embeddings",
     "clean_orphan_embeddings_vec",
     "compute_analysis_coverage",
+    "count_dead_code",
     "count_fp_assignments",
+    "count_hotspots",
     "count_indirect_call_sites",
     "count_llm_analysis",
     "count_pending_analysis",
@@ -129,6 +131,8 @@ import logging
 
 from ._callgraph import (
     _resolve_target_usr,  # noqa: F401 — part of the package API
+    count_dead_code,
+    count_hotspots,
     find_all_callers_recursive,
     find_call_path,
     find_callees_recursive,

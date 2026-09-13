@@ -606,3 +606,40 @@ class TestALabelTellsTwoCandidatesApart:
             Candidate("u2", "same", "function", ""),
         ]
         assert candidate_labels(candidates) == ["same", "same"]
+
+    def test_an_overload_takes_its_parameter_list(self):
+        """Overloads share a qualified name AND a file, thus only the
+        parameters separate them.
+
+        Measured on one real project: ``CoilData::set`` has five overloads,
+        and two rows of one call site read ``CoilData.cpp:183 →
+        CoilData::set`` twice, differing only in a USR the reader never
+        sees.
+        """
+        candidates = [
+            Candidate("u1", "CoilData::set", "method", "src/CoilData.cpp",
+                      "CoilData", 10, "bool set(uint16_t index, bool value)"),
+            Candidate("u2", "CoilData::set", "method", "src/CoilData.cpp",
+                      "CoilData", 20, "bool set(uint16_t index, const char * iv)"),
+        ]
+        labels = candidate_labels(candidates)
+        assert labels[0] == "CoilData::set(uint16_t index, bool value)", f"got: {labels}"
+        assert labels[1] == "CoilData::set(uint16_t index, const char * iv)", f"got: {labels}"
+
+    def test_the_parameter_list_wins_over_the_file(self):
+        """Two overloads usually share a file, thus the file separates
+        nothing and the parameters must be tried first."""
+        candidates = [
+            Candidate("u1", "A::f", "method", "src/a.cpp", "A", 1, "void f(int)"),
+            Candidate("u2", "A::f", "method", "src/a.cpp", "A", 2, "void f(char)"),
+        ]
+        labels = candidate_labels(candidates)
+        assert labels == ["A::f(int)", "A::f(char)"], f"got: {labels}"
+
+    def test_a_signature_without_brackets_falls_back_to_the_file(self):
+        candidates = [
+            Candidate("u1", "clock_stop", "function", "drivers/a.c", "", 1, ""),
+            Candidate("u2", "clock_stop", "function", "drivers/b.c", "", 2, ""),
+        ]
+        labels = candidate_labels(candidates)
+        assert labels == ["clock_stop (drivers/a.c)", "clock_stop (drivers/b.c)"]

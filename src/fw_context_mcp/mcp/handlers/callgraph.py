@@ -1038,7 +1038,8 @@ def find_callees_recursive(
 # ── moved from server.py ──
 def find_dead_code(
     project_root: Annotated[str | None, Field(description="Project root. Auto-detected if omitted.")] = None,
-    limit: Annotated[int, Field(description="Maximum results (default 100).")] = 100,
+    limit: Annotated[int, Field(description="Maximum results of one page (default 100).")] = 100,
+    offset: Annotated[int, Field(description="Skip this many results. Reads the next page of a long report.")] = 0,
     exclude_paths: Annotated[list[str] | None, Field(description="Additional LIKE patterns to exclude. Merged with defaults from config. E.g. ['lib/%'].")] = None,
     project_only: Annotated[bool, Field(description="When True (default), auto-excludes SDK/vendor paths based on the detected build system and applies project config exclude_paths. Set False to see all results.")] = True,
     variant: Annotated[str | None, Field(description="Build variant (multi-build project). Omit to use default_variant. One query answers for ONE build.")] = None,
@@ -1083,7 +1084,9 @@ def find_dead_code(
 
     Args:
         project_root: Project root. Auto-detected if omitted.
-        limit: Maximum results (default 100).
+        limit: Maximum results of one page (default 100).
+        offset: Skip this many results. Reads the next page; the page
+            notice names the offset to use.
         exclude_paths: Additional LIKE patterns to exclude (user-supplied
             tool parameter, not config). E.g. ``['lib/%']``.
         project_only: When True (default), filters to ``is_project = 1``
@@ -1112,14 +1115,30 @@ def find_dead_code(
         # Runs under the executor lock on the single shared connection;
         # must not open its own connection.  Timeout is enforced by
         # _wrap_tool (300 s + interrupt), not here.
+        skip = clamp_offset(offset)
         rows = index_db.find_dead_code(
             conn, config_hash, limit=limit,
             exclude_paths=exclude_paths,
             project_only=project_only,
+            offset=skip,
+        )
+        total = index_db.count_dead_code(
+            conn, config_hash,
+            exclude_paths=exclude_paths,
+            project_only=project_only,
         )
         if not rows:
+            if skip and total:
+                return [{"info": (
+                    f"No dead function at offset {skip}; the answer holds {total}."
+                )}]
             return [{"info": "No dead or possibly-dead functions found — every defined function has at least one caller."}]
-        return _with_absolute_file(rows, db.root)
+        out = _with_absolute_file(rows, db.root)
+        out.insert(0, page_notice(
+            total, skip, len(rows),
+            hint=f"find_dead_code(offset={skip + len(rows)}) reads the next page.",
+        ))
+        return out
 
     return db.execute_scoped(_query)
 
@@ -1471,7 +1490,8 @@ def trace_data_flow(
 # ── moved from server.py ──
 def find_hotspots(
     project_root: Annotated[str | None, Field(description="Project root. Auto-detected if omitted.")] = None,
-    limit: Annotated[int, Field(description="Number of top-called functions to return (default 20).")] = 20,
+    limit: Annotated[int, Field(description="Number of top-called functions per page (default 20).")] = 20,
+    offset: Annotated[int, Field(description="Skip this many results. Reads further down the ranking.")] = 0,
     project_only: Annotated[bool, Field(description="When True (default), auto-excludes SDK/vendor paths so hotspots reflect project code.")] = True,
     exclude_paths: Annotated[list[str] | None, Field(description="Additional LIKE patterns to exclude. Merged with defaults. E.g. ['lib/%'].")] = None,
     variant: Annotated[str | None, Field(description="Build variant (multi-build project). Omit to use default_variant. One query answers for ONE build.")] = None,
@@ -1499,7 +1519,9 @@ def find_hotspots(
 
     Args:
         project_root: Project root. Auto-detected if omitted.
-        limit: Number of top-called functions to return (default 20).
+        limit: Number of top-called functions per page (default 20).
+        offset: Skip this many results. Reads further down the ranking;
+            the page notice names the offset to use.
         project_only: When True (default), filters to ``is_project = 1``
             symbols so hotspots reflect project code.
         exclude_paths: Additional LIKE patterns to exclude (user-supplied
@@ -1527,16 +1549,32 @@ def find_hotspots(
         # Runs under the executor lock on the single shared connection;
         # must not open its own connection.  Timeout is enforced by
         # _wrap_tool (300 s + interrupt), not here.
+        skip = clamp_offset(offset)
         rows = index_db.find_hotspots(
             conn, config_hash, limit=limit,
+            exclude_paths=exclude_paths,
+            project_only=project_only,
+            offset=skip,
+        )
+        total = index_db.count_hotspots(
+            conn, config_hash,
             exclude_paths=exclude_paths,
             project_only=project_only,
         )
         if not rows and project_only:
             return [{"info": "No project hotspots found. Try project_only=False to include vendor code."}]
         if not rows:
+            if skip and total:
+                return [{"info": (
+                    f"No hotspot at offset {skip}; the answer holds {total}."
+                )}]
             return [{"info": "No references indexed — enable index_refs and re-index."}]
-        return _with_absolute_file(rows, db.root)
+        out = _with_absolute_file(rows, db.root)
+        out.insert(0, page_notice(
+            total, skip, len(rows),
+            hint=f"find_hotspots(offset={skip + len(rows)}) reads the next page.",
+        ))
+        return out
 
     return db.execute_scoped(_query)
 

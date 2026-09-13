@@ -712,7 +712,7 @@ def find_refs_with_candidates(
     rows, the merge runs, and the slice comes last — which is what a plain
     SQL OFFSET does anyway.
     """
-    from ._resolve import resolve_candidates
+    from ._resolve import candidate_labels, resolve_candidates
 
     candidates = resolve_candidates(conn, config_hash, name)
     if not candidates:
@@ -733,14 +733,18 @@ def find_refs_with_candidates(
     # copied into a dict.  A dict here would change what every caller of
     # this function receives, and only the ambiguous answer needs the tag.
     reach = offset + limit
+    # The label separates two candidates that share a qualified name, which
+    # an overload always does.  Without it two rows of one call site read
+    # alike and a reader cannot tell which symbol each belongs to.
+    labels = candidate_labels(candidates)
     per_symbol: list[list] = []
     total = 0
-    for candidate in candidates:
+    for candidate, label in zip(candidates, labels, strict=True):
         rows = refs_for_symbol(
             conn, config_hash, candidate.usr, candidate.kind,
             ref_kind=ref_kind, limit=reach,
         )
-        per_symbol.append([_TaggedRef(row, candidate) for row in rows])
+        per_symbol.append([_TaggedRef(row, candidate, label) for row in rows])
         total += count_refs_for_symbol(
             conn, config_hash, candidate.usr, candidate.kind, ref_kind=ref_kind
         )
@@ -782,17 +786,22 @@ class _TaggedRef:
     This wrapper forwards the mapping access and adds the two target keys.
     """
 
-    __slots__ = ("_row", "_candidate")
+    __slots__ = ("_row", "_candidate", "_label")
 
-    def __init__(self, row: sqlite3.Row, candidate) -> None:
+    def __init__(self, row: sqlite3.Row, candidate, label: str = "") -> None:
         self._row = row
         self._candidate = candidate
+        # The label tells two same-name symbols apart, which the qualified
+        # name alone cannot do for an overload: measured on one project,
+        # ``CoilData::set`` has five overloads, and two rows of one call
+        # site then read alike and differed only in a USR.
+        self._label = label or candidate.qualified_name
 
     def __getitem__(self, key):
         if key == "target_usr":
             return self._candidate.usr
         if key == "target_qualified_name":
-            return self._candidate.qualified_name
+            return self._label
         return self._row[key]
 
     def keys(self) -> list[str]:
