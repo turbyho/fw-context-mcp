@@ -629,14 +629,14 @@ def refs_for_symbol(
     ).fetchall()
 
 
-def find_refs(
+def find_refs_with_candidates(
     conn: sqlite3.Connection,
     config_hash: str,
     name: str,
     ref_kind: str | list[str] | None = None,
     limit: int = 50,
-) -> list[sqlite3.Row]:
-    """Find all references to a symbol by name or partial qualified name.
+) -> tuple[list, list]:
+    """Give ``(rows, candidates)`` — the references and what the name matched.
 
     Name resolution goes through :func:`~._resolve.resolve_candidates`,
     which ranks a match on its specificity: an exact ``qualified_name``
@@ -652,32 +652,68 @@ def find_refs(
     with ``LIMIT 1`` and reported nothing, so a caller could not tell that
     it was reading half the answer.
 
-    *limit* applies to each symbol, not to the total, so an ambiguous name
-    cannot push one symbol's references out of the answer.
+    *candidates* holds EVERY symbol that the name matched, and not only the
+    ones that have a reference.  A caller that reports the ambiguity needs
+    that number: measured on one firmware index, ``getMember`` matched 18
+    symbols and 5 of them had callers, and a notice built from the rows
+    alone told the reader that the name matched 5.
+
+    *limit* bounds the TOTAL, as the tools promise.  The rows are taken one
+    per symbol in turn, thus every symbol appears before any symbol gets a
+    second row, and a symbol with many references cannot crowd out a symbol
+    with few.
     """
     from ._resolve import resolve_candidates
 
     candidates = resolve_candidates(conn, config_hash, name)
     if not candidates:
-        return []
+        return [], []
 
     if len(candidates) == 1:
         only = candidates[0]
-        return refs_for_symbol(
+        rows = refs_for_symbol(
             conn, config_hash, only.usr, only.kind, ref_kind=ref_kind, limit=limit,
         )
+        return rows, candidates
 
     # sqlite3.Row takes no new key, thus each row is wrapped rather than
     # copied into a dict.  A dict here would change what every caller of
     # this function receives, and only the ambiguous answer needs the tag.
-    tagged: list = []
+    per_symbol: list[list] = []
     for candidate in candidates:
         rows = refs_for_symbol(
             conn, config_hash, candidate.usr, candidate.kind,
             ref_kind=ref_kind, limit=limit,
         )
-        tagged.extend(_TaggedRef(row, candidate) for row in rows)
-    return tagged
+        per_symbol.append([_TaggedRef(row, candidate) for row in rows])
+
+    merged: list = []
+    for depth in range(max((len(rows) for rows in per_symbol), default=0)):
+        for rows in per_symbol:
+            if depth < len(rows):
+                merged.append(rows[depth])
+                if len(merged) >= limit:
+                    return merged, candidates
+    return merged, candidates
+
+
+def find_refs(
+    conn: sqlite3.Connection,
+    config_hash: str,
+    name: str,
+    ref_kind: str | list[str] | None = None,
+    limit: int = 50,
+) -> list[sqlite3.Row]:
+    """Find all references to a symbol by name or partial qualified name.
+
+    A view on :func:`find_refs_with_candidates` for a caller that needs the
+    rows only.  See that function for the resolution rules and for what an
+    ambiguous name does to the answer.
+    """
+    rows, _ = find_refs_with_candidates(
+        conn, config_hash, name, ref_kind=ref_kind, limit=limit
+    )
+    return rows
 
 
 class _TaggedRef:

@@ -61,7 +61,12 @@ from ...indexer.db import (
     lookup_macro,
     refs_for_symbol,
 )
-from ...indexer.db._resolve import resolve_candidates
+from ...indexer.db._resolve import (
+    MAX_AMBIGUOUS_TARGETS,
+    candidate_labels,
+    name_list,
+    resolve_candidates,
+)
 from ...llm.ollama import OllamaError, OllamaModelNotFoundError, call_ollama_async
 from ...utils import abs_path, read_file_lines
 from ..shared.context import _normalize_file_path_query
@@ -220,29 +225,41 @@ def _other_definitions_named(
     that others exist is new.
     """
     candidates = resolve_candidates(conn, config_hash, name)
-    return [c.qualified_name for c in candidates if c.usr != chosen_usr]
+    # The label takes the file when two candidates share a qualified name,
+    # which a C function at file scope makes common.
+    labels = candidate_labels(candidates)
+    return [
+        label for candidate, label in zip(candidates, labels, strict=True)
+        if candidate.usr != chosen_usr
+    ]
 
 
 def _ambiguous_symbol_warning(
     conn, config_hash: str, name: str, row
 ) -> str | None:
-    """Give the text for the ``warning`` key, or ``None`` when the name is clear.
+    """Give the text of ``ambiguous_warning``, or ``None`` for a clear name.
 
     The three tools that return ONE body — ``get_source``,
     ``get_symbol_context`` and ``explain_symbol`` — cannot put a notice in
     a row of their own, because they answer with a dict.  They carry it in
-    ``warning``, the key that ``get_source`` already uses for a body it
-    could not verify.
+    ``ambiguous_warning``, which is separate from ``warning``: that key
+    already reports an LLM failure and a body that could not be read.
+
+    The text names the symbol that this answer is about, and it writes out
+    only the first few of the others.  Measured on one firmware index, a
+    bare ``size`` matched 50 symbols, and the full list cost more to read
+    than the body it described.
     """
     others = _other_definitions_named(conn, config_hash, name, row["usr"])
     if not others:
         return None
     chosen = row["qualified_name"] or row["name"]
+    capped = len(others) >= MAX_AMBIGUOUS_TARGETS
+    count = f"more than {MAX_AMBIGUOUS_TARGETS}" if capped else str(len(others) + 1)
     return (
-        f"The name '{name}' matches {len(others) + 1} definitions. This "
-        f"answer is about {chosen} only. The others are: "
-        f"{', '.join(others)}. To get one of them, give its full qualified "
-        f"name."
+        f"The name '{name}' matches {count} definitions. This answer is "
+        f"about {chosen} only. The others are: {name_list(others)}. To get "
+        f"one of them, give its full qualified name."
     )
 
 

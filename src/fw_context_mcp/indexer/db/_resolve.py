@@ -42,6 +42,7 @@ log = logging.getLogger(__name__)
 __all__ = [
     "Candidate",
     "ambiguity_notice",
+    "candidate_labels",
     "resolve_candidates",
     "resolve_usr",
     "resolve_usrs",
@@ -56,18 +57,23 @@ MAX_AMBIGUOUS_TARGETS = 50
 
 
 class Candidate(tuple):
-    """One symbol that a name can mean: ``(usr, qualified_name, kind)``.
+    """One symbol that a name can mean: ``(usr, qualified_name, kind, file_path)``.
 
     A named tuple subclass rather than a dataclass, because the callers
     unpack it and pass the parts to SQL.  ``kind`` is here for ``find_refs``:
     a class, struct or enum keeps its references at member granularity, and
     that query needs the kind to know it must match a USR prefix.
+
+    ``file_path`` is here because a qualified name does not always tell two
+    candidates apart.  A C function at file scope carries a qualified name
+    equal to its bare name, thus three static functions of one name in
+    three files all read as that one name.
     """
 
     __slots__ = ()
 
-    def __new__(cls, usr: str, qualified_name: str, kind: str):
-        return super().__new__(cls, (usr, qualified_name, kind))
+    def __new__(cls, usr: str, qualified_name: str, kind: str, file_path: str = ""):
+        return super().__new__(cls, (usr, qualified_name, kind, file_path))
 
     @property
     def usr(self) -> str:
@@ -80,6 +86,30 @@ class Candidate(tuple):
     @property
     def kind(self) -> str:
         return self[2]
+
+    @property
+    def file_path(self) -> str:
+        return self[3]
+
+
+def candidate_labels(candidates: list[Candidate]) -> list[str]:
+    """Name each candidate so that a reader can tell them apart.
+
+    A qualified name alone is enough almost always, and it is then what the
+    caller can type back.  It is NOT enough for a C function at file scope:
+    measured on one Zephyr project, a name matched three symbols and the
+    notice read ``clock_stop, clock_stop, clock_stop``.  A repeated name
+    therefore takes its file.
+    """
+    seen: dict[str, int] = {}
+    for candidate in candidates:
+        seen[candidate.qualified_name] = seen.get(candidate.qualified_name, 0) + 1
+    return [
+        f"{c.qualified_name} ({c.file_path})"
+        if seen[c.qualified_name] > 1 and c.file_path
+        else c.qualified_name
+        for c in candidates
+    ]
 
 
 def resolve_candidates(
@@ -95,15 +125,26 @@ def resolve_candidates(
     Inside one rank the order is: a definition before a declaration, then
     the variant with the most references.  Candidates of equal specificity
     are interchangeable for the purpose of the caller.
+
+    Rank 0 needs a name that HOLDS ``::``.  A bare name carries no
+    disambiguator, thus it means every symbol that bears it.  Without this
+    guard a bare name that is also the whole qualified name of a free
+    function sat alone at rank 0 and hid every method of that name:
+    measured on one firmware index, ``read`` gave one free function while
+    the body tools answered with ``IteratorReader::read``, and the two
+    tools then described different symbols.
     """
     esc_name = _escape_like(name)
     suffix_pattern = f"%::{esc_name}"
     plain_name = name.rsplit("::", 1)[-1] if "::" in name else name
+    # NULL never equals a column value, thus a bare name reaches no rank 0.
+    qualified_probe = name if "::" in name else None
     try:
         rows = conn.execute(
             """SELECT s.usr,
                       COALESCE(s.qualified_name, s.name) AS qualified_name,
                       s.kind AS kind,
+                      s.file_path AS file_path,
                       CASE WHEN s.qualified_name = ? THEN 0
                            WHEN s.name = ? THEN 1
                            WHEN s.qualified_name LIKE ? ESCAPE '\\' THEN 2
@@ -118,7 +159,7 @@ def resolve_candidates(
                       OR s.name = ?)
                ORDER BY match_rank, s.is_definition DESC, ref_count DESC, out_count DESC""",
             (
-                name, name, suffix_pattern,
+                qualified_probe, name, suffix_pattern,
                 config_hash, name, name, suffix_pattern, plain_name,
             ),
         ).fetchall()
@@ -143,7 +184,10 @@ def resolve_candidates(
         if usr in seen:
             continue
         seen.add(usr)
-        out.append(Candidate(usr, row["qualified_name"] or usr, row["kind"] or ""))
+        out.append(Candidate(
+            usr, row["qualified_name"] or usr, row["kind"] or "",
+            row["file_path"] or "",
+        ))
         if len(out) >= MAX_AMBIGUOUS_TARGETS:
             break
     return out
@@ -152,13 +196,18 @@ def resolve_candidates(
 def resolve_usrs(
     conn: sqlite3.Connection, config_hash: str, name: str
 ) -> tuple[list[str], list[str]]:
-    """Give ``(usrs, qualified_names)`` for *name* as two parallel lists.
+    """Give ``(usrs, labels)`` for *name* as two parallel lists.
 
     A view on :func:`resolve_candidates` for the call-graph queries, which
     build SQL parameter lists and never need the kind.
+
+    The label is the qualified name, and it is the qualified name alone
+    almost always.  It takes the file when two candidates share a qualified
+    name, because a reader cannot otherwise tell them apart — see
+    :func:`candidate_labels`.
     """
     candidates = resolve_candidates(conn, config_hash, name)
-    return [c.usr for c in candidates], [c.qualified_name for c in candidates]
+    return [c.usr for c in candidates], candidate_labels(candidates)
 
 
 def resolve_usr(conn: sqlite3.Connection, config_hash: str, name: str) -> str | None:
@@ -173,6 +222,24 @@ def resolve_usr(conn: sqlite3.Connection, config_hash: str, name: str) -> str | 
     return candidates[0].usr if candidates else None
 
 
+#: How many names a notice writes out before it counts the rest.
+#: Measured on one firmware index, a bare ``size`` matched 50 symbols, and
+#: a notice that spelled all of them out cost more to read than the rows it
+#: described.  A reader needs enough names to recognise the ambiguity, not
+#: the whole list.
+_NAMES_SHOWN_IN_NOTICE = 8
+
+
+def name_list(qualified_names: list[str]) -> str:
+    """Write out the first few names, then count the rest."""
+    shown = qualified_names[:_NAMES_SHOWN_IN_NOTICE]
+    rest = len(qualified_names) - len(shown)
+    text = ", ".join(shown)
+    if rest > 0:
+        text += f", and {rest} more"
+    return text
+
+
 def ambiguity_notice(name: str, qualified_names: list[str], relation: str) -> dict[str, str]:
     """Build the row that reports a name with more than one symbol.
 
@@ -185,17 +252,17 @@ def ambiguity_notice(name: str, qualified_names: list[str], relation: str) -> di
     not take that path.  It stays in the middle of the rows, where a
     reader that looks at the first row does not see it.
     """
-    targets = ", ".join(qualified_names)
+    capped = len(qualified_names) >= MAX_AMBIGUOUS_TARGETS
+    count = f"more than {MAX_AMBIGUOUS_TARGETS}" if capped else str(len(qualified_names))
     message = (
-        f"The name '{name}' matches {len(qualified_names)} symbols. The "
-        f"{relation} of all of them are in the rows below: {targets}. Each "
-        f"row has 'target_qualified_name', which tells the symbol that the "
-        f"row belongs to. To get one symbol only, give its full qualified "
-        f"name."
+        f"The name '{name}' matches {count} symbols. The {relation} of them "
+        f"are in the rows below: {name_list(qualified_names)}. Each row has "
+        f"'target_qualified_name', which tells the symbol that the row "
+        f"belongs to. To get one symbol only, give its full qualified name."
     )
-    if len(qualified_names) >= MAX_AMBIGUOUS_TARGETS:
+    if capped:
         message += (
-            f" More than {MAX_AMBIGUOUS_TARGETS} symbols have this name. "
-            f"The query used the first {MAX_AMBIGUOUS_TARGETS} only."
+            f" The query used the first {MAX_AMBIGUOUS_TARGETS} symbols only,"
+            f" thus a symbol of this name can be missing from the rows."
         )
     return {"warning": message}

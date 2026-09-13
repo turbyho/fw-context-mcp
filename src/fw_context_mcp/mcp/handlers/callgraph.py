@@ -62,7 +62,7 @@ from ...indexer.db import (
     count_indirect_call_sites,
     count_refs,
     find_macro_refs,
-    find_refs,
+    find_refs_with_candidates,
     get_active_config,
     lookup_macro,
 )
@@ -72,7 +72,7 @@ from ...indexer.db import (
 from ...indexer.db import (
     find_indirect_targets as query_indirect_targets,
 )
-from ...indexer.db._resolve import ambiguity_notice
+from ...indexer.db._resolve import ambiguity_notice, candidate_labels
 from ...indexer.intlist import read_isr_registrations
 from ...utils import abs_path
 from ...utils import escape_like as _escape_like
@@ -304,7 +304,9 @@ def _references_result(name: str, project_root: str | None, ref_kind: str | list
                 "Re-run 'fw-context index' to rebuild with refs enabled."
             )}]
         clamped_limit = max(0, min(limit, 200))
-        rows = find_refs(conn, config_hash, name, ref_kind=ref_kind, limit=clamped_limit)
+        rows, candidates = find_refs_with_candidates(
+            conn, config_hash, name, ref_kind=ref_kind, limit=clamped_limit
+        )
         if not rows:
             # When zero refs are recorded for this specific symbol, try
             # virtual dispatch resolution. C++ virtual method calls
@@ -320,11 +322,8 @@ def _references_result(name: str, project_root: str | None, ref_kind: str | list
                 return virtual_result
             label = "callers" if caller_mode else "references"
             return [{"info": f"No {label} found for '{name}'."}]
-        # ``find_refs`` tags each row when the name matched several symbols,
-        # and returns plain rows when it matched one.  The tag decides both
-        # the extra key and the notice, thus one read of the first row
-        # answers both questions.
-        tagged = "target_qualified_name" in rows[0].keys()
+        # The rows carry a tag only when the name matched several symbols.
+        tagged = len(candidates) > 1
         result: list[dict] = [
             {
                 "file": abs_path(root, r["from_file"]),
@@ -337,9 +336,12 @@ def _references_result(name: str, project_root: str | None, ref_kind: str | list
             for r in rows
         ]
         if tagged:
-            targets = list(dict.fromkeys(r["target_qualified_name"] for r in rows))
+            # Every symbol that the name matched is named, and NOT only the
+            # ones that a row came from.  Measured on one firmware index,
+            # ``getMember`` matched 18 symbols and 5 of them had callers; a
+            # notice built from the rows told the reader it matched 5.
             label = "callers" if caller_mode else "references"
-            result.insert(0, ambiguity_notice(name, targets, label))
+            result.insert(0, ambiguity_notice(name, candidate_labels(candidates), label))
         return result
 
     return db.execute_scoped(_query)

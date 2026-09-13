@@ -27,6 +27,7 @@ import pytest
 from fw_context_mcp.indexer._postprocess import _step_repair_from_usr
 from fw_context_mcp.indexer.db import (
     find_refs,
+    find_refs_with_candidates,
     insert_refs_batch,
     insert_symbols_batch,
     open_db,
@@ -41,6 +42,12 @@ from fw_context_mcp.indexer.db._callgraph import (
     find_all_callers_recursive,
     find_call_path,
     find_callees_recursive,
+)
+from fw_context_mcp.indexer.db._resolve import (
+    MAX_AMBIGUOUS_TARGETS,
+    Candidate,
+    ambiguity_notice,
+    candidate_labels,
 )
 from fw_context_mcp.mcp.handlers.source import (
     _ambiguous_symbol_warning,
@@ -417,3 +424,140 @@ class TestSingleBodyToolsReportAmbiguity:
 
         row = _lookup_definition(db, CH, "only", preferred_kinds=None)
         assert _ambiguous_symbol_warning(db, CH, "only", row) is None
+
+
+class TestAmbiguousAnswerStaysWithinItsPromises:
+    """Two faults that a synthetic fixture alone did not show.
+
+    Both were found by running the tools over a real index, where one name
+    matches many symbols and most of them have no reference at all.
+    """
+
+    def test_the_limit_bounds_the_total_and_not_each_symbol(self, db):
+        """``limit`` is documented as the maximum, thus it must hold.
+
+        The first version applied it per symbol, so a caller that asked for
+        8 rows about an ambiguous name got 11.
+        """
+        rows, _ = find_refs_with_candidates(db, CH, "probe", ref_kind=["call"], limit=3)
+        assert len(rows) == 3, f"asked for 3, got {len(rows)}"
+
+    def test_every_symbol_appears_before_any_gets_a_second_row(self, db):
+        """ClassA has three call sites and ClassB one.  Both must show.
+
+        A plain concatenation with a total cap would spend the budget on
+        ClassA and hide ClassB completely.
+        """
+        rows, _ = find_refs_with_candidates(db, CH, "probe", ref_kind=["call"], limit=2)
+        targets = {r["target_qualified_name"] for r in rows}
+        assert targets == {"ClassA::probe", "ClassB::probe"}, f"got: {targets}"
+
+    def test_the_candidates_hold_a_symbol_that_has_no_reference(self, db):
+        """The notice must count what the name MATCHED, not what had rows.
+
+        Measured on one real index: a name matched 18 symbols and 5 of them
+        had callers, and a notice built from the rows said it matched 5.
+        """
+        fid = upsert_file(db, CH, "src/quiet.cpp", "cpp")
+        insert_symbols_batch(db, [
+            _symbol_row(fid, "src/quiet.cpp", "probe", "ClassC::probe", "u_c_probe", 10, 20),
+        ])
+        db.commit()
+
+        rows, candidates = find_refs_with_candidates(
+            db, CH, "probe", ref_kind=["call"], limit=50
+        )
+        named = {c.qualified_name for c in candidates}
+        with_rows = {r["target_qualified_name"] for r in rows}
+
+        assert named == {"ClassA::probe", "ClassB::probe", "ClassC::probe"}, f"got: {named}"
+        assert "ClassC::probe" not in with_rows, "ClassC has no call site"
+        assert len(named) > len(with_rows), (
+            "the fixture no longer covers a matched symbol without rows"
+        )
+
+
+class TestTheNoticeStaysReadableAndHonest:
+    """A notice is read by a model, thus its size and its counts both matter."""
+
+    def test_it_writes_out_only_the_first_few_names(self):
+        names = [f"Class{i}::probe" for i in range(30)]
+        text = ambiguity_notice("probe", names, "callers")["warning"]
+        assert "Class0::probe" in text
+        assert "Class7::probe" in text
+        assert "Class8::probe" not in text, "the notice spelled out too many names"
+        assert "and 22 more" in text, f"got: {text}"
+
+    def test_it_says_more_than_when_the_set_was_cut(self):
+        """A cut set must not report an exact count that it cannot know."""
+        names = [f"Class{i}::probe" for i in range(MAX_AMBIGUOUS_TARGETS)]
+        text = ambiguity_notice("probe", names, "callers")["warning"]
+        assert f"more than {MAX_AMBIGUOUS_TARGETS} symbols" in text, f"got: {text}"
+        assert "can be missing from the rows" in text
+
+    def test_a_small_set_reports_its_exact_count(self, db):
+        rows = find_all_callers_recursive(db, CH, "probe", max_depth=3)
+        assert "matches 2 symbols" in rows[0]["warning"], f"got: {rows[0]['warning']}"
+
+
+class TestBareNameIsNotAQualifiedName:
+    """A bare name carries no disambiguator, thus it means every match.
+
+    A free function whose qualified_name equals its bare name used to sit
+    alone at rank 0, and every method of that name became unreachable.
+    Measured on one real index: a bare name gave one free function while
+    the body tools answered with a method of the same name, and the two
+    tools then described different symbols.
+    """
+
+    def test_a_free_function_does_not_hide_the_methods(self, db):
+        fid = upsert_file(db, CH, "src/free.cpp", "cpp")
+        insert_symbols_batch(db, [
+            # qualified_name == name, as a function at file scope carries.
+            _symbol_row(fid, "src/free.cpp", "probe", "probe", "u_free_probe", 5, 8,
+                        kind="function"),
+        ])
+        db.commit()
+
+        _, names = _resolve_target_usrs(db, CH, "probe")
+        assert set(names) == {"ClassA::probe", "ClassB::probe", "probe"}, (
+            f"the free function hid the methods: {names}"
+        )
+
+    def test_a_qualified_name_still_wins_alone(self, db):
+        _, names = _resolve_target_usrs(db, CH, "ClassB::probe")
+        assert names == ["ClassB::probe"], f"got: {names}"
+
+
+class TestALabelTellsTwoCandidatesApart:
+    """A C function at file scope makes the qualified name repeat.
+
+    Measured on one Zephyr project: a name matched three symbols and the
+    notice read ``clock_stop, clock_stop, clock_stop``, which tells a
+    reader nothing.  Such a name takes its file.
+    """
+
+    def test_a_repeated_qualified_name_takes_its_file(self):
+        candidates = [
+            Candidate("u1", "clock_stop", "function", "drivers/a.c"),
+            Candidate("u2", "clock_stop", "function", "drivers/b.c"),
+            Candidate("u3", "Class::other", "method", "src/x.cpp"),
+        ]
+        labels = candidate_labels(candidates)
+        assert labels[0] == "clock_stop (drivers/a.c)", f"got: {labels}"
+        assert labels[1] == "clock_stop (drivers/b.c)", f"got: {labels}"
+        # A name that stands alone stays typeable, thus it keeps no file.
+        assert labels[2] == "Class::other", f"got: {labels}"
+
+    def test_a_unique_name_keeps_the_plain_qualified_name(self, db):
+        """The common case must not gain noise that the caller cannot type."""
+        _, labels = _resolve_target_usrs(db, CH, "probe")
+        assert set(labels) == {"ClassA::probe", "ClassB::probe"}, f"got: {labels}"
+
+    def test_a_candidate_without_a_file_keeps_its_name(self):
+        """A missing file must not produce an empty bracket."""
+        candidates = [
+            Candidate("u1", "same", "function", ""),
+            Candidate("u2", "same", "function", ""),
+        ]
+        assert candidate_labels(candidates) == ["same", "same"]
