@@ -1098,6 +1098,55 @@ def _step_build_overrides(conn: sqlite3.Connection, ctx: dict) -> None:
     conn.commit()
 
 
+def _step_repair_from_usr(conn: sqlite3.Connection, ctx: dict) -> None:
+    """Give a caller to each reference that the AST walk left without one.
+
+    ``_build_refs_and_fp_assignments`` tracks the enclosing function on a
+    stack, and it pops that stack on the line number and on the file of
+    each cursor.  Both conditions are heuristics, thus the stack can go
+    empty while the walk is still inside a body.  The reference that the
+    walk then makes has the correct target, but it has no ``from_usr``.
+
+    Such a reference is not only incomplete, it is invisible.  The
+    recursive CTE of ``find_all_callers_recursive`` starts at
+    ``SELECT from_usr ... WHERE to_usr = ?`` and ends at
+    ``WHERE COALESCE(s_def.name, s_any.name) IS NOT NULL``, thus a NULL
+    ``from_usr`` falls out of the graph.  Measured on one firmware index:
+    738 call references had no caller, and 697 of them were inside a known
+    definition.
+
+    The repair takes the innermost definition that contains the line.  The
+    innermost one is correct, because a lambda inside a method is the real
+    caller.  A reference with no enclosing definition keeps its NULL: it is
+    at file scope, which is a fact and not a gap.
+
+    This step runs BEFORE the cross-TU backfill, which skips a line that
+    already has a reference and must thus see the repaired rows.
+
+    The AST walk itself does not change.  Its docstring records an earlier
+    regression from a change to those pop conditions, and a repair after
+    the fact cannot cause one.
+    """
+    config_hash = ctx["config_hash"]
+    cur = conn.execute(
+        """UPDATE refs SET from_usr = (
+               SELECT s.usr FROM symbols s
+               WHERE s.config_hash = refs.config_hash
+                 AND s.file_path = refs.from_file
+                 AND s.is_definition = 1
+                 AND s.end_line > s.line
+                 AND s.line <= refs.from_line
+                 AND s.end_line >= refs.from_line
+               ORDER BY (s.end_line - s.line) ASC
+               LIMIT 1)
+           WHERE config_hash = ? AND from_usr IS NULL""",
+        (config_hash,),
+    )
+    conn.commit()
+    if cur.rowcount:
+        log.info("Repaired the caller of %d reference(s)", cur.rowcount)
+
+
 def _step_backfill_cross_tu_refs(conn: sqlite3.Connection, ctx: dict) -> None:
     """Backfill call references that per-TU symbol lookup could not resolve.
 
@@ -1539,6 +1588,7 @@ _STEPS: list[tuple[str, Callable[..., None], Callable[..., bool] | None]] = [
     ("llm_analysis",     _step_llm_analysis,       lambda c: c["analyze_symbols"] and c["llm_config"] is not None and c["llm_config"].enabled),
     ("embeddings",       _step_build_embeddings,   lambda c: c["index_embeddings"] and c["llm_config"] is not None and c["llm_config"].enabled),
     ("overrides",        _step_build_overrides,    lambda c: c["analyze_overrides"]),
+    ("repair_from_usr",  _step_repair_from_usr,    lambda c: c["index_refs"]),
     ("cross_tu_refs",    _step_backfill_cross_tu_refs, lambda c: c["index_refs"]),
     ("pagerank_hotspot", _step_pagerank_hotspot,   lambda c: c["index_refs"]),
     ("verify_integrity", _step_verify_integrity,   None),

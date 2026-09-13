@@ -104,6 +104,7 @@ __all__ = [
     "rebuild_files_fts",
     "rebuild_fts",
     "rebuild_macros_fts",
+    "refs_for_symbol",
     "replace_file_data",
     "replace_memory_regions",
     "row_format_is_newer",
@@ -126,7 +127,7 @@ __all__ = [
 import logging
 
 from ._callgraph import (
-    _resolve_target_usr,  # noqa: F401 — re-exported for ops.py
+    _resolve_target_usr,  # noqa: F401 — part of the package API
     find_all_callers_recursive,
     find_call_path,
     find_callees_recursive,
@@ -226,6 +227,7 @@ from ._refs import (
     insert_fp_assignments_batch,
     insert_indirect_call_sites_batch,
     insert_refs_batch,
+    refs_for_symbol,
 )
 from ._schema import (
     CURRENT_ROW_FORMAT,

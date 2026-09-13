@@ -61,7 +61,6 @@ if TYPE_CHECKING:
 
 from fw_context_mcp.indexer.config_hash import compute_tu_content_hash
 from fw_context_mcp.indexer.db import (
-    _resolve_target_usr,
     get_file_mtimes,
     insert_fp_assignments_batch,
     insert_indirect_call_sites_batch,
@@ -1612,7 +1611,7 @@ def store_symbols_for_unit(
 # declared in any included header).
 #
 # Captures two groups:
-#   group(1) — the object/receiver name (unused, but validated by regex)
+#   group(1) — the object/receiver name, the hint for the receiver class
 #   group(2) — the method name (used to resolve against the symbols table)
 _CALL_PATTERN_RE = re.compile(r"(\w+)(?:\.|->)(\w+)\s*\(")
 
@@ -1626,19 +1625,52 @@ def backfill_cross_tu_refs(
 
     Scans project source files for ``obj.method(`` and ``obj->method(``
     patterns on lines inside known function bodies that have no existing
-    call/indirect reference.  Resolves the callee via the global symbols
-    table (``_resolve_target_usr``) — which has visibility across ALL TUs
-    after the TU loop completes.
+    call/indirect reference.  Resolves the callee with
+    ``_resolve_method_usr``, the same function that the per-TU fallback in
+    ``symbols.py`` uses, over a symbol map built from the WHOLE symbols
+    table.  The per-TU ``qn_to_usr`` holds one translation unit, so a
+    method that another ``.cpp`` file defines is out of its reach.  The
+    map built here has no such limit.
 
-    This fills the gap left by per-TU ``_qn_to_usr`` which only contains
-    symbols from the current translation unit.  Cross-TU method calls
-    (e.g. a private method defined in another ``.cpp`` file) are resolved
-    here using the complete symbols table.
+    WHY ``_resolve_method_usr`` and not ``_resolve_target_usr``: this
+    function WRITES an edge into ``refs``, and ``refs`` has no column that
+    marks where a row came from.  A wrong edge is thus permanent and
+    indistinguishable from one that libclang made.  ``_resolve_target_usr``
+    answers an ambiguous name with the most-referenced candidate, which is
+    a guess.  ``_resolve_method_usr`` answers it with ``None``, and it
+    takes the receiver name as a hint for the class.  Its own docstring
+    records why: an arbitrary candidate once made ``_timeout.attach(...)``
+    point at ``mbed::SerialBase::attach``.  The per-TU path learned that
+    lesson; this path had not.
+
+    A name that stays ambiguous gets NO edge.  That loses a true edge
+    sometimes, and the trade is deliberate: a missing edge shows up as an
+    empty answer, which a reader can test, but a wrong edge reads exactly
+    like a fact.
 
     Returns:
         Number of new references inserted.
     """
+    # _resolve_method_usr lives in symbols.py, which imports libclang at
+    # module scope.  The import stays inside the function, as the other
+    # symbols.py imports in this module do, to keep libclang out of the
+    # import time of ops.py.
+    from fw_context_mcp.indexer.symbols import _resolve_method_usr
+
     total_added = 0
+
+    # One map for every TU, built once.  _resolve_method_usr matches on the
+    # qualified name, thus the map holds the qualified name as its key.
+    qn_to_usr: dict[str, str] = {}
+    usr_to_qn: dict[str, str] = {}
+    for srow in conn.execute(
+        """SELECT qualified_name, usr FROM symbols
+           WHERE config_hash = ? AND qualified_name != ''
+             AND kind IN ('function', 'method', 'constructor', 'destructor')""",
+        (config_hash,),
+    ):
+        qn_to_usr[srow["qualified_name"]] = srow["usr"]
+        usr_to_qn.setdefault(srow["usr"], srow["qualified_name"])
 
     # 1. Get all project source files (.c/.cpp) with indexed content.
     #    Only project files are scanned — vendor SDK code is not expected
@@ -1712,13 +1744,22 @@ def backfill_cross_tu_refs(
                 # Each match yields a potential cross-TU call that
                 # libclang's per-TU cursor visitor could not resolve.
                 for m in _CALL_PATTERN_RE.finditer(line_text):
+                    receiver_name = m.group(1)
                     method_name = m.group(2)
                     # Skip common false positives — C++ keywords and
                     # builtins that match the regex but are not method
                     # calls (e.g. `if (` in minified code).
                     if method_name in ("if", "for", "while", "switch", "sizeof", "return"):
                         continue
-                    target_usr = _resolve_target_usr(conn, config_hash, method_name)
+                    # The receiver name is the hint for the class, and the
+                    # enclosing function gives the second hint.  An
+                    # ambiguous name gives None, and then no edge is made.
+                    target_usr = _resolve_method_usr(
+                        method_name,
+                        qn_to_usr,
+                        field_name=receiver_name,
+                        caller_qn=usr_to_qn.get(fn_usr, ""),
+                    )
                     # Avoid self-references — a function calling itself
                     # (recursion) would already have a per-TU ref.
                     if target_usr and target_usr != fn_usr:

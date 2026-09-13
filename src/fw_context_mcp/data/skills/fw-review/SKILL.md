@@ -86,6 +86,8 @@ For each symbol, verify impact through the call graph and type system.
 **Per type change:** `find_references` + `search_bodies` on the type name.
 **Post-removal:** `find_dead_code(project_only=True)` → verify `possibly_dead` with `find_indirect_targets` → `search_content` on removed symbols (must return empty).
 
+**Same-named symbols:** two classes can each hold a method of the same name. `find_all_callers_recursive`, `find_callees_recursive` and `find_call_path` then answer for ALL of them: a `warning` row comes first, and each result carries `target_qualified_name`. Read that key before you report a caller, and pass the full qualified name (`ClassB::probe`) to scope the question to one symbol.
+
 
 ## Phase 2: Logic review — correctness of changed behavior
 

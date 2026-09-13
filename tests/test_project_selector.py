@@ -456,6 +456,26 @@ def test_every_copy_of_the_instructions_says_where_a_line_number_comes_from():
         assert "end_line" in text, label
 
 
+def test_every_copy_of_the_instructions_warns_about_a_same_name_symbol():
+    """A reader that misses this reports the callers of the wrong symbol.
+
+    Two classes can each hold a method of one name.  The tools answer in two
+    shapes, and a reader needs both: a list tool labels each row with
+    ``target_qualified_name``, and a tool that returns one body adds
+    ``ambiguous_warning``.  Without the first, a caller of one class reads
+    as a caller of the other — the report that led to the fix.  Without the
+    second, one body reads as the only body of that name.
+    """
+    for label, text in _instruction_copies():
+        assert "target_qualified_name" in text, label
+        assert "ambiguous_warning" in text, label
+        assert "qualified name" in text, label
+        # Both shapes must name their tools, or a reader cannot tell which
+        # answer to expect from which tool.
+        assert "find_callers" in text, label
+        assert "get_symbol_context" in text, label
+
+
 def test_every_copy_of_the_instructions_gives_the_query_rule_per_tool():
     """One rule for every tool was false and cost recall silently.
 

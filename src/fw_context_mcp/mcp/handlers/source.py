@@ -56,11 +56,12 @@ from pydantic import Field
 from ...indexer import db as index_db
 from ...indexer.db import (
     find_indirect_call_sites,
-    find_refs,
     get_llm_analysis_for_symbol,
     get_overrides_for_method,
     lookup_macro,
+    refs_for_symbol,
 )
+from ...indexer.db._resolve import resolve_candidates
 from ...llm.ollama import OllamaError, OllamaModelNotFoundError, call_ollama_async
 from ...utils import abs_path, read_file_lines
 from ..shared.context import _normalize_file_path_query
@@ -194,6 +195,55 @@ def _lookup_definition(
         if result:
             return result
     return None
+
+
+def _other_definitions_named(
+    conn, config_hash: str, name: str, chosen_usr: str
+) -> list[str]:
+    """Give the qualified names of the OTHER symbols that *name* matches.
+
+    ``_lookup_definition`` answers with one symbol and says nothing about
+    the rest.  That is correct for a tool that returns one body, but a
+    reader cannot tell a clear answer from a silent choice between two.
+    This function reports the alternatives so the tool can say so.
+
+    The candidates come from ``resolve_candidates``, the one resolver that
+    the whole database layer shares.  That matters for a qualified name: it
+    sits alone at the best rank, thus ``ClassB::probe`` reports nothing even
+    though the tail ``probe`` also names another class.  A check written
+    here by hand got exactly that case wrong.
+
+    WHY ``_lookup_definition`` does not change: 27 tests in
+    ``tests/test_lookup_definition.py`` pin its order — a class before a
+    constructor of the same name, ``preferred_kinds``, an assembly
+    definition last.  The choice must stay as it is.  Only the knowledge
+    that others exist is new.
+    """
+    candidates = resolve_candidates(conn, config_hash, name)
+    return [c.qualified_name for c in candidates if c.usr != chosen_usr]
+
+
+def _ambiguous_symbol_warning(
+    conn, config_hash: str, name: str, row
+) -> str | None:
+    """Give the text for the ``warning`` key, or ``None`` when the name is clear.
+
+    The three tools that return ONE body — ``get_source``,
+    ``get_symbol_context`` and ``explain_symbol`` — cannot put a notice in
+    a row of their own, because they answer with a dict.  They carry it in
+    ``warning``, the key that ``get_source`` already uses for a body it
+    could not verify.
+    """
+    others = _other_definitions_named(conn, config_hash, name, row["usr"])
+    if not others:
+        return None
+    chosen = row["qualified_name"] or row["name"]
+    return (
+        f"The name '{name}' matches {len(others) + 1} definitions. This "
+        f"answer is about {chosen} only. The others are: "
+        f"{', '.join(others)}. To get one of them, give its full qualified "
+        f"name."
+    )
 
 
 def _lookup_try_columns(
@@ -582,6 +632,12 @@ async def explain_symbol(
         that moved gives its indexed body, not the code that now sits at the
         stored line number.
 
+        An ``ambiguous_warning`` key means that *name* matched more than one
+        symbol, such as two classes with a method of the same name.  This
+        answer is about ONE of them, and the key names it and lists the
+        others.  Give the full qualified name to ask about one symbol only.
+        It is separate from ``warning``, which the LLM error paths use.
+
         On failure the dict holds only ``error`` with the reason.
     """
     try:
@@ -610,12 +666,15 @@ async def explain_symbol(
             return {"error": f"Path {file_path} outside project root"}
         # Check for pre-computed LLM analysis (instant, no Ollama call)
         llm_analysis = get_llm_analysis_for_symbol(conn, row["id"])
-        return row, file_path, llm_analysis, _stored_file_state(conn, row["file_id"])
+        return (
+            row, file_path, llm_analysis, _stored_file_state(conn, row["file_id"]),
+            _ambiguous_symbol_warning(conn, config_hash, name, row),
+        )
 
     query_result = db.executor.execute_sync(_query, db.config_hash)
     if isinstance(query_result, dict):
         return query_result
-    row, file_path, llm_analysis, stored_state = query_result
+    row, file_path, llm_analysis, stored_state, ambiguous_warning = query_result
     # A changed file can move the symbol, thus the stored line number can
     # point at unrelated code.  The prompt below must never carry that code.
     file_changed = _file_differs(file_path, *stored_state)
@@ -637,6 +696,10 @@ async def explain_symbol(
         "line": line_no,
         "signature": signature,
     }
+    if ambiguous_warning:
+        # A separate key, because ``warning`` below already carries the LLM
+        # failure text and the two facts are unrelated.
+        result["ambiguous_warning"] = ambiguous_warning
 
     # Pre-computed LLM analysis (from `fw-context index --analyze`) is
     # instant — no Ollama network call.  Return immediately when available
@@ -804,6 +867,13 @@ def get_source(
         middle of a line, thus a body with this mark can end in an
         unbalanced brace.  Read the rest with ``read_file`` and a range.
 
+        An ``ambiguous_warning`` key means that *name* matched more than one
+        symbol, such as two classes with a method of the same name.  This
+        body belongs to ONE of them, and the key names it and lists the
+        others.  Give the full qualified name to get one symbol only.  It is
+        separate from ``warning``, which reports a body that could not be
+        read from the disk.
+
         On failure the dict holds only ``error`` with the reason.
     """
     try:
@@ -842,6 +912,10 @@ def get_source(
             "is_pure_virtual": bool(row["is_pure_virtual"]),
             "docstring": row["docstring"] or "",
         }
+        if (_amb := _ambiguous_symbol_warning(conn, config_hash, name, row)):
+            # A separate key, because ``warning`` on this tool already
+            # reports a body that could not be verified against the disk.
+            result["ambiguous_warning"] = _amb
         # `end_line` completes the citation.  With `line` alone a caller
         # that must quote `file:start-end` has to count the lines of
         # `source` by hand, and one that reads the body from disk has no
@@ -1003,10 +1077,24 @@ def get_file_map(
 
 
 def _collect_callers(
-    conn: sqlite3.Connection, config_hash: str, name: str, root: Path
+    conn: sqlite3.Connection, config_hash: str, row: sqlite3.Row, root: Path
 ) -> list[dict]:
-    """Return immediate callers (direct + indirect) for a symbol."""
-    callers = find_refs(conn, config_hash, name, ref_kind=["call", "indirect"])
+    """Return immediate callers (direct + indirect) of the symbol in *row*.
+
+    Takes the symbol that ``_lookup_definition`` already chose, and NOT its
+    name.  It used to take the name and hand it to ``find_refs``, which ran
+    its own resolution with its own ranking.  The two then disagreed
+    whenever one name meant several symbols: measured on one firmware
+    index, ``get_symbol_context`` reported the body of one class's method
+    together with the call sites of another class's method of the same
+    name, and no field in the answer said so.
+
+    ``_collect_callees`` has always taken the USR.  Both halves of the
+    answer now describe one symbol.
+    """
+    callers = refs_for_symbol(
+        conn, config_hash, row["usr"], row["kind"], ref_kind=["call", "indirect"]
+    )
     return [
         {"name": c["caller_name"] or "?", "qualified_name": c["caller_qname"] or "",
          "file": abs_path(root, c["caller_file"] or c["from_file"]),
@@ -1273,6 +1361,12 @@ def get_symbol_context(
         derived methods that override it) — use these two before you change
         a virtual method.
 
+        An ``ambiguous_warning`` key means that *name* matched more than one
+        symbol, such as two classes with a method of the same name.  Every
+        part of this answer — body, callers and callees — is about the ONE
+        symbol that the key names, and the key lists the others.  Give the
+        full qualified name to ask about one symbol only.
+
         On failure the dict holds only ``error`` with the reason.
     """
     try:
@@ -1307,7 +1401,7 @@ def get_symbol_context(
         # is held for the entire _query closure so the snapshot is consistent.
 
         # Immediate callers (who calls this symbol, direct + indirect).
-        callers_list = _collect_callers(conn, config_hash, name, root)
+        callers_list = _collect_callers(conn, config_hash, row, root)
 
         # Immediate callees (what this symbol calls, direct + indirect).
         callees_list = _collect_callees(conn, config_hash, symbol_usr, root)
@@ -1332,6 +1426,7 @@ def get_symbol_context(
             row, file_path, callers_list, callees_list, indirect_calls_list,
             resolution, enum_constants, llm_analysis, overrides_info,
             _stored_file_state(conn, row["file_id"]),
+            _ambiguous_symbol_warning(conn, config_hash, name, row),
         )
 
     query_result = db.executor.execute_sync(_query, db.config_hash)
@@ -1341,7 +1436,7 @@ def get_symbol_context(
     (
         row, file_path, callers_list, callees_list, indirect_calls_list,
         resolution, enum_constants, llm_analysis, overrides_info,
-        stored_state,
+        stored_state, ambiguous_warning,
     ) = query_result
 
     source, source_origin, stale_warning = _read_verified_body(row, file_path, stored_state)
@@ -1361,6 +1456,10 @@ def get_symbol_context(
         "indirect_call_sites": indirect_calls_list,
         "docstring": row["docstring"] or "",
     }
+    if ambiguous_warning:
+        # Every part of this answer — body, callers, callees — is about the
+        # one symbol named here, and this key says which one that is.
+        result["ambiguous_warning"] = ambiguous_warning
     if resolution:
         result["resolution"] = resolution
     if row["template_usr"]:

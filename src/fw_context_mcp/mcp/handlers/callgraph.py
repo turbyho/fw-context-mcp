@@ -72,6 +72,7 @@ from ...indexer.db import (
 from ...indexer.db import (
     find_indirect_targets as query_indirect_targets,
 )
+from ...indexer.db._resolve import ambiguity_notice
 from ...indexer.intlist import read_isr_registrations
 from ...utils import abs_path
 from ...utils import escape_like as _escape_like
@@ -319,6 +320,11 @@ def _references_result(name: str, project_root: str | None, ref_kind: str | list
                 return virtual_result
             label = "callers" if caller_mode else "references"
             return [{"info": f"No {label} found for '{name}'."}]
+        # ``find_refs`` tags each row when the name matched several symbols,
+        # and returns plain rows when it matched one.  The tag decides both
+        # the extra key and the notice, thus one read of the first row
+        # answers both questions.
+        tagged = "target_qualified_name" in rows[0].keys()
         result: list[dict] = [
             {
                 "file": abs_path(root, r["from_file"]),
@@ -326,9 +332,14 @@ def _references_result(name: str, project_root: str | None, ref_kind: str | list
                 "ref_kind": r["ref_kind"],
                 "caller": r["caller_qname"] or r["caller_name"] or "<file scope>",
                 "caller_kind": r["caller_kind"],
+                **({"target_qualified_name": r["target_qualified_name"]} if tagged else {}),
             }
             for r in rows
         ]
+        if tagged:
+            targets = list(dict.fromkeys(r["target_qualified_name"] for r in rows))
+            label = "callers" if caller_mode else "references"
+            result.insert(0, ambiguity_notice(name, targets, label))
         return result
 
     return db.execute_scoped(_query)
@@ -389,6 +400,12 @@ def find_callers(
         ``"method"``, …). Macro fallback includes a leading dict with
         ``kind="macro"``, ``value``, and ``expanded_value``.
 
+        When *name* matches more than one symbol, such as two classes with
+        a method of the same name, the answer holds the call sites of all
+        of them.  A ``warning`` dict then comes first and names the
+        symbols, and each result carries ``target_qualified_name``.  Give
+        the full qualified name to ask about one symbol only.
+
         Never empty: one dict with ``error`` (symbol not resolved) or
         ``info`` (no references of this kind).  Check both keys first.
     """
@@ -438,6 +455,12 @@ def find_references(
         initialization), ``"macro_use"`` (macro usage
         in file). Macro fallback includes a leading dict with
         ``kind="macro"``, ``value``, and ``expanded_value``.
+
+        When *name* matches more than one symbol, the answer holds the
+        references of all of them.  A ``warning`` dict then comes first and
+        names the symbols, and each result carries
+        ``target_qualified_name``.  Give the full qualified name to ask
+        about one symbol only.
 
         Never empty: one dict with ``error`` (symbol not resolved) or
         ``info`` (no references).  Check both keys first.
@@ -782,6 +805,12 @@ def find_call_path(
         When no path exists within the depth limit, the list holds one
         ``info`` dict.
 
+        When *to_name* matches more than one symbol, the search reaches
+        all of them.  A ``warning`` dict then comes first and names the
+        symbols, and each path carries ``target_qualified_name`` next to
+        ``target_usr``.  Give the full qualified name to ask about one
+        symbol only.
+
         Never empty: one dict with ``error`` (cannot resolve) or ``info``
         (no results) replaces the results.  Check both keys first.
     """
@@ -865,6 +894,13 @@ def find_all_callers_recursive(
         sites.  For the line of each call use ``find_callers`` on the name
         that this tool reports.
 
+        When *name* matches more than one symbol, such as two classes with
+        a method of the same name, the answer holds the callers of all of
+        them.  A ``warning`` dict then comes first and names the symbols,
+        and each result carries ``target_qualified_name``, which tells the
+        symbol that it calls.  Give the full qualified name to ask about
+        one symbol only.
+
         Never empty: one dict with ``error`` (cannot resolve) or ``info``
         (no results) replaces the results.  Check both keys first.
     """
@@ -940,6 +976,12 @@ def find_callees_recursive(
         This tool gives no line, because one function can call the same
         callee several times.  For the line of each call use
         ``find_callers`` on the name that this tool reports.
+
+        When *name* matches more than one symbol, the answer holds the
+        callees of all of them.  A ``warning`` dict then comes first and
+        names the symbols, and each result carries
+        ``target_qualified_name``, which tells the symbol that calls it.
+        Give the full qualified name to ask about one symbol only.
 
         Never empty: one dict with ``error`` (cannot resolve) or ``info``
         (no results) replaces the results.  Check both keys first.

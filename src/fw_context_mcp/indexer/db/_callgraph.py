@@ -68,8 +68,14 @@ import re
 import sqlite3
 from collections import deque
 
-from fw_context_mcp.utils import escape_like as _escape_like
 from fw_context_mcp.utils import format_number_ranges
+
+from ._resolve import (
+    MAX_AMBIGUOUS_TARGETS,
+    ambiguity_notice,
+    resolve_usr,
+    resolve_usrs,
+)
 
 log = logging.getLogger(__name__)
 
@@ -87,47 +93,67 @@ __all__ = [
 # ---------------------------------------------------------------------------
 
 
-def _resolve_target_usr(conn: sqlite3.Connection, config_hash: str, name: str) -> str | None:
-    """Look up the USR of a symbol by name, preferring the most-referenced variant.
+# Name resolution lives in ``_resolve`` because ``_refs`` needs the same
+# choice.  The two modules each held their own copy of it, and the copies
+# then disagreed about what one name meant.  These aliases keep the older
+# spelling for the readers inside this module.
+_MAX_AMBIGUOUS_TARGETS = MAX_AMBIGUOUS_TARGETS
+_resolve_target_usrs = resolve_usrs
+_resolve_target_usr = resolve_usr
+_ambiguity_notice = ambiguity_notice
 
-    When multiple USRs exist for the same name — e.g. C++ inline functions
-    with ``#*1C.#`` ABI tags in different TUs — the system must pick one.
-    Picking arbitrarily would produce inconsistent call-graph results:
-    some queries would traverse edges to one variant, others to another,
-    and paths would break.
 
-    Strategy: pick the variant with the most incoming references (``to_usr``
-    count) and outgoing references (``from_usr`` count), preferring
-    ``is_definition = 1``.  This chooses the variant that is actually called
-    throughout the codebase, not an incidental declaration in a header.
+def _rows_with_targets(
+    rows: list[sqlite3.Row],
+    name: str,
+    target_usrs: list[str],
+    target_names: list[str],
+    relation: str,
+) -> list[dict]:
+    """Make the answer from the query rows, and label an ambiguous one.
 
-    Why correlated subqueries with LIMIT 1 over LEFT JOIN + GROUP BY:
-    SQLite's query planner short-circuits after the first matching row
-    in a correlated subquery, avoiding a full scan of the refs table.
-    A JOIN + GROUP BY would materialize all rows before aggregating.
+    The ``target`` column leaves the query as the USR of the symbol that
+    the row belongs to.  A USR tells a reader nothing, thus the column
+    becomes ``target_qualified_name`` when the name was ambiguous, and it
+    goes away when the name was not.
+
+    WHY the key is absent for a single target: it would then hold the same
+    value on each row and add nothing, and the tools have readers and
+    tests that count on the row that they get today.
     """
-    esc_name = _escape_like(name)
-    suffix_pattern = f"%::{esc_name}"
-    plain_name = name.rsplit("::", 1)[-1] if "::" in name else name
-    try:
-        rows = conn.execute(
-            """SELECT s.usr,
-                      (SELECT COUNT(*) FROM refs r
-                       WHERE r.to_usr = s.usr AND r.config_hash = s.config_hash) AS ref_count,
-                      (SELECT COUNT(*) FROM refs r
-                       WHERE r.from_usr = s.usr AND r.config_hash = s.config_hash) AS out_count
-               FROM symbols s
-               WHERE s.config_hash = ?
-                 AND (s.name = ? OR s.qualified_name = ? OR s.qualified_name LIKE ? ESCAPE '\\'
-                      OR s.name = ?)
-               ORDER BY s.is_definition DESC, ref_count DESC, out_count DESC
-               LIMIT 1""",
-            (config_hash, name, name, suffix_pattern, plain_name),
-        ).fetchone()
-    except sqlite3.Error:
-        log.exception("_resolve_target_usr failed for '%s'", name)
-        return None
-    return rows["usr"] if rows else None
+    usr_to_name = dict(zip(target_usrs, target_names, strict=True))
+    ambiguous = len(target_usrs) > 1
+    out: list[dict] = []
+    for raw in rows:
+        row = dict(raw)
+        target_usr = str(row.pop("target", None) or "")
+        if ambiguous:
+            row["target_qualified_name"] = usr_to_name.get(target_usr, "?")
+        out.append(row)
+    if ambiguous and out:
+        out.insert(0, _ambiguity_notice(name, target_names, relation))
+    return out
+
+
+def _paths_with_targets(
+    paths: list[dict], to_name: str, to_usrs: list[str], to_names: list[str]
+) -> list[dict]:
+    """Name the target of each path, and label an ambiguous search.
+
+    ``target_usr`` stays on each path, because the readers of the tool and
+    ``tests/test_call_path_dedup.py`` count on it.
+    ``target_qualified_name`` joins it only when *to_name* means more than
+    one symbol, for the reason given in :func:`_rows_with_targets`.
+    """
+    if len(to_usrs) <= 1:
+        return paths
+    usr_to_name = dict(zip(to_usrs, to_names, strict=True))
+    for path in paths:
+        target_usr = str(path.get("target_usr") or "")
+        path["target_qualified_name"] = usr_to_name.get(target_usr, "?")
+    if paths:
+        paths.insert(0, _ambiguity_notice(to_name, to_names, "call paths"))
+    return paths
 
 
 # Cache for _get_alias_pairs — module-level dict keyed by id(conn).
@@ -321,30 +347,17 @@ def find_call_path(
         Up to 5 paths, each with ``depth`` (edge count), ``chain``
         (``A → B → C`` string), and ``target_usr``.
     """
-    from_usr = _resolve_target_usr(conn, config_hash, from_name)
-    to_usr = _resolve_target_usr(conn, config_hash, to_name)
-    if not from_usr or not to_usr:
+    # Edges from ANY USR of from_name are valid, thus every variant of the
+    # best match seeds the forward BFS.  The ranked resolver keeps the TU
+    # variants of one symbol together and leaves out the same-name symbols
+    # of other scopes, which the earlier flat query mixed in.
+    from_usrs, _from_names = _resolve_target_usrs(conn, config_hash, from_name)
+    to_usrs, to_names = _resolve_target_usrs(conn, config_hash, to_name)
+    if not from_usrs or not to_usrs:
         return []
-
-    # ── Resolve ALL USRs for from_name (there can be multiple due to TU variants) ──
-    esc_name = _escape_like(from_name)
-    suffix_pattern = f"%::{esc_name}"
-    plain_name = from_name.rsplit("::", 1)[-1] if "::" in from_name else from_name
-    try:
-        from_usr_rows = conn.execute(
-            """SELECT s.usr FROM symbols s
-               WHERE s.config_hash = ?
-                 AND (s.name = ? OR s.qualified_name = ? OR s.qualified_name LIKE ? ESCAPE '\\'
-                      OR s.name = ?)
-               ORDER BY s.is_definition DESC""",
-            (config_hash, from_name, from_name, suffix_pattern, plain_name),
-        ).fetchall()
-    except sqlite3.Error:
-        log.exception("Multi-USR resolution failed for '%s'", from_name)
-        return []
-    from_usr_set: set[str] = {r["usr"] for r in from_usr_rows}
-    if not from_usr_set:
-        return []
+    from_usr = from_usrs[0]
+    from_usr_set: set[str] = set(from_usrs)
+    _to_variants: set[str] = set(to_usrs)
 
     # ── Lazy edge / name caches ──────────────────────────────────────
     # Avoid loading all 1M+ refs into memory.  Each USR's edges are
@@ -484,8 +497,15 @@ def find_call_path(
 
     # ── Direct edge check (depth 1) — same as old code for fast path ──
     for to_usr_edge, callee_name in _get_edges_multi(_from_variants):
-        if to_usr_edge == to_usr:
-            return [{"depth": 1, "chain": f"{from_name_resolved} → {callee_name}", "target_usr": to_usr}]
+        if to_usr_edge in _to_variants:
+            return _paths_with_targets(
+                [{
+                    "depth": 1,
+                    "chain": f"{from_name_resolved} → {callee_name}",
+                    "target_usr": to_usr_edge,
+                }],
+                to_name, to_usrs, to_names,
+            )
 
     # ── Bidirectional BFS — expands forward from source AND reverse from target
     # simultaneously.  Halves the effective search depth (O(b^(d/2)) vs O(b^d))
@@ -495,19 +515,27 @@ def find_call_path(
     f_chain: dict[str, str] = {}    # usr → chain string from source
     r_dist: dict[str, int] = {}     # usr → distance to target (reverse)
     r_chain: dict[str, str] = {}    # usr → chain string to target (reverse)
+    # usr → the target USR that its reverse chain ends at.  A name that
+    # means several symbols seeds several reverse searches together, thus a
+    # meeting node must tell which of the targets it reached.  Without this
+    # map each path would report the first target, whichever one it found.
+    r_target: dict[str, str] = {}
 
     # Seed forward: all USR variants of from_name
     for u in _from_variants:
         if u not in f_dist:
             f_dist[u] = 0
             f_chain[u] = _get_name(u) if u != from_usr else from_name_resolved
-    # Seed reverse: target
-    to_name_resolved = _get_name(to_usr)
-    r_dist[to_usr] = 0
-    r_chain[to_usr] = to_name_resolved
+    # Seed reverse: each symbol that to_name can mean
+    for t in to_usrs:
+        if t in r_dist:
+            continue
+        r_dist[t] = 0
+        r_chain[t] = _get_name(t)
+        r_target[t] = t
 
     f_queue: deque[str] = deque(f_dist.keys())
-    r_queue: deque[str] = deque([to_usr])
+    r_queue: deque[str] = deque(r_dist.keys())
     found: list[dict] = []
     seen_chains: set[str] = set()
     depth = 0
@@ -531,8 +559,8 @@ def find_call_path(
                     r_parts = r_chain[v].split(" → ")
                     tail = " → ".join(r_parts[1:])  # skip meeting node (already in f_chain)
                     chain = f_chain[v] if not tail else f"{f_chain[v]} → {tail}"
-                    if _record_path(found, seen_chains, total_depth, chain, to_usr):
-                        return found
+                    if _record_path(found, seen_chains, total_depth, chain, r_target[v]):
+                        return _paths_with_targets(found, to_name, to_usrs, to_names)
 
         # ── Expand reverse (incoming edges) ──
         for _ in range(len(r_queue)):
@@ -542,6 +570,7 @@ def find_call_path(
                     continue
                 r_dist[v] = depth
                 r_chain[v] = f"{v_name} → {r_chain[u]}"
+                r_target[v] = r_target[u]
                 r_queue.append(v)
                 nodes_expanded += 1
                 if v in f_dist:
@@ -550,10 +579,10 @@ def find_call_path(
                     r_parts = r_chain[v].split(" → ")
                     tail = " → ".join(r_parts[1:])
                     chain = f_chain[v] if not tail else f"{f_chain[v]} → {tail}"
-                    if _record_path(found, seen_chains, total_depth, chain, to_usr):
-                        return found
+                    if _record_path(found, seen_chains, total_depth, chain, r_target[v]):
+                        return _paths_with_targets(found, to_name, to_usrs, to_names)
 
-    return found
+    return _paths_with_targets(found, to_name, to_usrs, to_names)
 
 
 
@@ -569,6 +598,12 @@ def find_all_callers_recursive(
     Returns deduplicated callers at depth 1 (direct), depth 2
     (callers of callers), up to *max_depth*.  Each caller appears once
     at its shortest distance — ``MIN(depth) GROUP BY usr``.
+
+    When *name* matches more than one symbol, such as two classes with a
+    method of the same name, the query walks all of them.  Each row then
+    gets ``target_qualified_name``, which tells the symbol that the row is
+    a caller of, and a ``warning`` row comes first.  With one match the
+    rows keep the shape that they had before.
 
     Why recursive CTE over Python BFS: the search radius is small
     (max 5), and SQLite's recursive CTE with a depth bound is efficient
@@ -586,8 +621,8 @@ def find_all_callers_recursive(
     declared in a header but defined in assembly.  Falling back to
     s_any ensures the caller still appears in results.
     """
-    target_usr = _resolve_target_usr(conn, config_hash, name)
-    if not target_usr:
+    target_usrs, target_names = _resolve_target_usrs(conn, config_hash, name)
+    if not target_usrs:
         return []
 
     # Build extended refs: real refs + synthetic weak-alias edges.
@@ -603,34 +638,41 @@ def find_all_callers_recursive(
         if alias_cte
         else ""
     )
+    placeholders = ",".join("?" * len(target_usrs))
 
+    # The target USR travels with each row of the recursion.  A caller that
+    # reaches two same-name targets is thus reported one time for each, and
+    # the row can say which target it belongs to.  With a single target the
+    # column holds one value, so GROUP BY usr, target groups exactly as the
+    # earlier GROUP BY usr did.
     query = f"""WITH {alias_cte}
         extended_refs(from_usr, to_usr) AS (
             SELECT from_usr, to_usr FROM refs
             WHERE config_hash = ? AND ref_kind IN ('call', 'indirect', 'implicit_construct', 'dispatch')
             {alias_join}
         ),
-        callers(usr, depth) AS (
-            SELECT from_usr, 1
+        callers(usr, depth, target) AS (
+            SELECT from_usr, 1, to_usr
             FROM extended_refs
-            WHERE to_usr = ?
+            WHERE to_usr IN ({placeholders})
             UNION
-            SELECT er.from_usr, c.depth + 1
+            SELECT er.from_usr, c.depth + 1, c.target
             FROM extended_refs er
             JOIN callers c ON er.to_usr = c.usr
             WHERE c.depth < ?
         ),
         dedup AS (
-            SELECT usr, MIN(depth) AS depth
+            SELECT usr, target, MIN(depth) AS depth
             FROM callers
-            GROUP BY usr
+            GROUP BY usr, target
         )
         SELECT COALESCE(s_def.name, s_any.name, '?') AS name,
                COALESCE(s_def.qualified_name, s_any.qualified_name) AS qualified_name,
                COALESCE(s_def.kind, s_any.kind) AS kind,
                COALESCE(s_def.file_path, s_any.file_path) AS file_path,
                COALESCE(s_def.signature, s_any.signature) AS signature,
-               d.depth
+               d.depth,
+               d.target
         FROM dedup d
         LEFT JOIN symbols s_def ON s_def.usr = d.usr AND s_def.config_hash = ?
                                    AND s_def.is_definition = 1
@@ -642,11 +684,12 @@ def find_all_callers_recursive(
     params: list[object] = [config_hash]
     if alias_cte:
         params.append(config_hash)
-    params.extend([target_usr, max_depth, config_hash, config_hash, limit])
+    params.extend(target_usrs)
+    params.extend([max_depth, config_hash, config_hash, limit])
 
     rows = conn.execute(query, params).fetchall()
 
-    return [dict(r) for r in rows]
+    return _rows_with_targets(rows, name, target_usrs, target_names, "callers")
 
 
 def find_callees_recursive(
@@ -664,12 +707,17 @@ def find_callees_recursive(
     real definition that decl_usr aliases, anything def_usr calls should
     also appear as callees of decl_usr.
 
+    When *name* matches more than one symbol, the query walks all of them.
+    Each row then gets ``target_qualified_name``, which tells the symbol
+    that calls it, and a ``warning`` row comes first.  With one match the
+    rows keep the shape that they had before.
+
     Query structure: WITH alias_pairs → extended_refs (real + synthetic
     edges) → recursive callees CTE → dedup with MIN(depth) → join symbols
     for metadata.
     """
-    source_usr = _resolve_target_usr(conn, config_hash, name)
-    if not source_usr:
+    source_usrs, source_names = _resolve_target_usrs(conn, config_hash, name)
+    if not source_usrs:
         return []
 
     # Build extended refs: real refs + synthetic weak-alias edges.
@@ -686,34 +734,39 @@ def find_callees_recursive(
         if alias_cte
         else ""
     )
+    placeholders = ",".join("?" * len(source_usrs))
 
+    # The source USR travels with each row of the recursion, for the same
+    # reason as in find_all_callers_recursive: a callee that two same-name
+    # sources reach must say which source reached it.
     query = f"""WITH {alias_cte}
         extended_refs(from_usr, to_usr) AS (
             SELECT from_usr, to_usr FROM refs
             WHERE config_hash = ? AND ref_kind IN ('call', 'indirect', 'implicit_construct', 'dispatch')
             {alias_join}
         ),
-        callees(usr, depth) AS (
-            SELECT to_usr, 1
+        callees(usr, depth, target) AS (
+            SELECT to_usr, 1, from_usr
             FROM extended_refs
-            WHERE from_usr = ?
+            WHERE from_usr IN ({placeholders})
             UNION
-            SELECT er.to_usr, c.depth + 1
+            SELECT er.to_usr, c.depth + 1, c.target
             FROM extended_refs er
             JOIN callees c ON er.from_usr = c.usr
             WHERE c.depth < ?
         ),
         dedup AS (
-            SELECT usr, MIN(depth) AS depth
+            SELECT usr, target, MIN(depth) AS depth
             FROM callees
-            GROUP BY usr
+            GROUP BY usr, target
         )
         SELECT COALESCE(s_def.name, s_any.name, '?') AS name,
                COALESCE(s_def.qualified_name, s_any.qualified_name) AS qualified_name,
                COALESCE(s_def.kind, s_any.kind) AS kind,
                COALESCE(s_def.file_path, s_any.file_path) AS file_path,
                COALESCE(s_def.signature, s_any.signature) AS signature,
-               d.depth
+               d.depth,
+               d.target
         FROM dedup d
         LEFT JOIN symbols s_def ON s_def.usr = d.usr AND s_def.config_hash = ?
                                    AND s_def.is_definition = 1
@@ -725,11 +778,12 @@ def find_callees_recursive(
     params: list[object] = [config_hash]
     if alias_cte:
         params.append(config_hash)
-    params.extend([source_usr, max_depth, config_hash, config_hash, limit])
+    params.extend(source_usrs)
+    params.extend([max_depth, config_hash, config_hash, limit])
 
     rows = conn.execute(query, params).fetchall()
 
-    return [dict(r) for r in rows]
+    return _rows_with_targets(rows, name, source_usrs, source_names, "callees")
 
 
 def find_dead_code(

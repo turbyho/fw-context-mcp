@@ -226,6 +226,33 @@ as a `warning` + `hint` instead, thus `[]` is an answer, not a failure.
 4. Use `lookup_symbol` for known names.
 5. Only AFTER exhausting all fw-context tools — use other tools.
 
+### A name that means several symbols
+
+Two classes can each hold a method of the same name. A bare `probe` then
+names both `ClassA::probe` and `ClassB::probe`.
+
+Every tool that takes a symbol name handles this, in one of two shapes.
+
+**Tools that return a LIST** — `find_all_callers_recursive`,
+`find_callees_recursive`, `find_call_path`, `find_callers`,
+`find_references` — answer for ALL of the symbols. The answer starts with
+a `warning` row that names them, and each result carries
+`target_qualified_name`, which tells the symbol it belongs to.
+
+**Tools that return ONE body** — `get_source`, `get_symbol_context`,
+`explain_symbol` — answer for one symbol and add the key
+`ambiguous_warning`, which names the one they chose and lists the others.
+
+- Read `target_qualified_name` before you say who calls what. Without it
+  a caller of one class reads as a caller of the other.
+- Treat `ambiguous_warning` as a signal that you are reading one of
+  several bodies. Ask again with the qualified name before you conclude.
+- To ask about one symbol, give the full qualified name
+  (`ClassB::probe`). An exact qualified name always wins over a bare
+  sibling, thus the answer then holds that symbol only.
+- `lookup_symbol` on the bare name lists the candidates with their
+  `qualified_name`. Take the name from there.
+
 ### Agent loop
 Check(`get_active_build`) → Find(`search_code`/`lookup_symbol`)
 → Read(`get_symbol_context`) ← preferred. Fallback: `get_source` (body only).

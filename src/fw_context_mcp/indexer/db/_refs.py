@@ -570,61 +570,30 @@ def _build_kind_filter(ref_kind: str | list[str] | None) -> tuple[str, list[str]
     return "AND r.ref_kind = ?", [ref_kind]
 
 
-def find_refs(
+def refs_for_symbol(
     conn: sqlite3.Connection,
     config_hash: str,
-    name: str,
+    usr: str,
+    kind: str,
     ref_kind: str | list[str] | None = None,
     limit: int = 50,
 ) -> list[sqlite3.Row]:
-    """Find all references to a symbol by name or partial qualified name.
+    """Return the reference rows of ONE symbol, named by its USR.
 
-    **Name resolution** uses a four-tier match so partially-qualified names
-    work without requiring the full ``Namespace::Class::method`` prefix:
+    This half of ``find_refs`` does no name resolution.  A caller that has
+    already chosen a symbol must use it, so that the choice is made once.
+    ``get_symbol_context`` used to call ``find_refs`` with the NAME after
+    ``_lookup_definition`` had already picked a symbol from that same name,
+    and the two resolvers ranked differently: measured on one firmware
+    index, one answer held the body of one symbol and the call sites of
+    another.
 
-    1. Exact ``name`` — ``send`` matches bare name ``send``.
-    2. Exact ``qualified_name`` — ``the Mbed project::ZMODEM_DRIVER::send``.
-    3. Suffix LIKE on ``qualified_name`` — ``ZMODEM_DRIVER::send`` matches
-       ``the Mbed project::ZMODEM_DRIVER::send``.
-    4. Plain name — the segment after the last ``::`` (same as tier 1 but
-       with precedence for exact qualified_name match).
-
-    Why tier 3 (suffix LIKE): users typically start typing at the class
-    level, not the namespace level.  Requiring the full qualified name
-    would make partial queries return empty.
-
-    **Aggregate type handling**: for classes, structs, and enums, references
-    are stored at member granularity (``MyClass::method``).  When the
-    resolved symbol IS an aggregate type, the query uses USR prefix matching
-    (``to_usr LIKE usr || '@%'``) to include all member references.
-    GROUP BY on (qualified_name, file, line) deduplicates when multiple
-    members of the same class are referenced at the same location.
-
-    Why GROUP BY: USR prefix matching can return the same reference
-    site multiple times if multiple member references happen on the
-    same line (e.g., ``obj.a = obj.b``).  Grouping by caller+file+line
-    gives one result per unique reference location.
+    **Aggregate type handling**: for a class, struct or enum the references
+    sit at member granularity (``MyClass::method``), thus the query matches
+    a USR prefix (``to_usr LIKE usr || '@%'``) to reach every member.
+    GROUP BY deduplicates when several members are referenced on one line,
+    as in ``obj.a = obj.b``.
     """
-    # ── Resolve name → USR and kind ──────────────────────────────────────
-    # Four-tier match: exact name, exact qualified_name, suffix LIKE, plain name
-    # Escape % and _ for the LIKE pattern
-    esc_name = name.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
-    suffix_pattern = f"%::{esc_name}"
-    plain_name = name.rsplit("::", 1)[-1] if "::" in name else name
-    symbol = conn.execute(
-        """SELECT usr, kind FROM symbols
-           WHERE config_hash = ?
-             AND (name = ? OR qualified_name = ? OR qualified_name LIKE ? ESCAPE '\\'
-                  OR name = ?)
-           ORDER BY is_definition DESC, qualified_name = ? DESC
-           LIMIT 1""",
-        (config_hash, name, name, suffix_pattern, plain_name, name),
-    ).fetchone()
-
-    if not symbol:
-        return []
-
-    is_aggregate = symbol["kind"] in ("class", "struct", "enum")
     kind_filter, kind_params = _build_kind_filter(ref_kind)
 
     _SELECT = """SELECT r.from_file, r.from_line, r.ref_kind,
@@ -639,9 +608,8 @@ def find_refs(
                    ON caller.config_hash = r.config_hash AND caller.usr = r.from_usr
                  WHERE r.config_hash = ?"""
 
-    if is_aggregate:
-        usr_prefix = symbol["usr"] + "@%"
-        params: list = [config_hash, usr_prefix] + kind_params + [limit]
+    if kind in ("class", "struct", "enum"):
+        params: list = [config_hash, usr + "@%"] + kind_params + [limit]
         return conn.execute(
             f"""{_SELECT}
                   AND r.to_usr LIKE ? {kind_filter}
@@ -651,8 +619,7 @@ def find_refs(
             params,
         ).fetchall()
 
-    # ── Exact USR match for functions, methods, variables, etc. ──────────
-    params = [config_hash, symbol["usr"]] + kind_params + [limit]
+    params = [config_hash, usr] + kind_params + [limit]
     return conn.execute(
         f"""{_SELECT}
               AND r.to_usr = ? {kind_filter}
@@ -660,6 +627,82 @@ def find_refs(
             LIMIT ?""",
         params,
     ).fetchall()
+
+
+def find_refs(
+    conn: sqlite3.Connection,
+    config_hash: str,
+    name: str,
+    ref_kind: str | list[str] | None = None,
+    limit: int = 50,
+) -> list[sqlite3.Row]:
+    """Find all references to a symbol by name or partial qualified name.
+
+    Name resolution goes through :func:`~._resolve.resolve_candidates`,
+    which ranks a match on its specificity: an exact ``qualified_name``
+    first, then the bare ``name``, then a suffix of ``qualified_name``,
+    then the tail after the last ``::``.  Users typically start typing at
+    the class level and not at the namespace level, thus the suffix tier
+    keeps a partial query useful.
+
+    When the name matches SEVERAL symbols of the best rank — two classes
+    with a method of one name — the rows of all of them come back, and
+    each row carries ``target_usr`` and ``target_qualified_name`` to say
+    which symbol it belongs to.  The earlier version picked one of them
+    with ``LIMIT 1`` and reported nothing, so a caller could not tell that
+    it was reading half the answer.
+
+    *limit* applies to each symbol, not to the total, so an ambiguous name
+    cannot push one symbol's references out of the answer.
+    """
+    from ._resolve import resolve_candidates
+
+    candidates = resolve_candidates(conn, config_hash, name)
+    if not candidates:
+        return []
+
+    if len(candidates) == 1:
+        only = candidates[0]
+        return refs_for_symbol(
+            conn, config_hash, only.usr, only.kind, ref_kind=ref_kind, limit=limit,
+        )
+
+    # sqlite3.Row takes no new key, thus each row is wrapped rather than
+    # copied into a dict.  A dict here would change what every caller of
+    # this function receives, and only the ambiguous answer needs the tag.
+    tagged: list = []
+    for candidate in candidates:
+        rows = refs_for_symbol(
+            conn, config_hash, candidate.usr, candidate.kind,
+            ref_kind=ref_kind, limit=limit,
+        )
+        tagged.extend(_TaggedRef(row, candidate) for row in rows)
+    return tagged
+
+
+class _TaggedRef:
+    """A reference row that also knows which same-name symbol it belongs to.
+
+    ``sqlite3.Row`` cannot take a new key, and turning every row into a
+    dict here would change what each caller of ``find_refs`` receives.
+    This wrapper forwards the mapping access and adds the two target keys.
+    """
+
+    __slots__ = ("_row", "_candidate")
+
+    def __init__(self, row: sqlite3.Row, candidate) -> None:
+        self._row = row
+        self._candidate = candidate
+
+    def __getitem__(self, key):
+        if key == "target_usr":
+            return self._candidate.usr
+        if key == "target_qualified_name":
+            return self._candidate.qualified_name
+        return self._row[key]
+
+    def keys(self) -> list[str]:
+        return [*self._row.keys(), "target_usr", "target_qualified_name"]
 
 
 def count_refs(conn: sqlite3.Connection, config_hash: str) -> int:
