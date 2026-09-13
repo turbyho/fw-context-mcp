@@ -344,7 +344,7 @@ def _references_result(name: str, project_root: str | None, ref_kind: str | list
             result.insert(0, ambiguity_notice(name, candidate_labels(candidates), label))
         return result
 
-    return db.execute_scoped(_query)
+    return db.execute_scoped(_query, limit=max(0, min(limit, 200)))
 
 # ── moved from server.py ──
 def find_callers(
@@ -554,7 +554,7 @@ def find_indirect_call_sites(
             for r in rows
         ]
 
-    return db.execute_scoped(_query)
+    return db.execute_scoped(_query, limit=max(0, min(limit, 200)))
 
 # ── moved from server.py ──
 def find_indirect_targets(
@@ -672,7 +672,7 @@ def find_indirect_targets(
             results.append(entry)
         return results
 
-    return db.execute_scoped(_query)
+    return db.execute_scoped(_query, limit=max(0, min(limit, 200)))
 
 # ── moved from server.py ──
 def _refs_guard(project_root: str | None, variant: str | None = None, image: str | None = None) -> tuple[DbContext, None] | tuple[None, list[dict]]:
@@ -922,7 +922,7 @@ def find_all_callers_recursive(
             return [{"info": f"No callers found for '{name}'."}]
         return _with_absolute_file(rows, db.root)
 
-    return db.execute_scoped(_query)
+    return db.execute_scoped(_query, limit=limit)
 
 # ── moved from server.py ──
 def find_callees_recursive(
@@ -1004,7 +1004,7 @@ def find_callees_recursive(
             return [{"info": f"No callees found for '{name}'."}]
         return _with_absolute_file(rows, db.root)
 
-    return db.execute_scoped(_query)
+    return db.execute_scoped(_query, limit=limit)
 
 # ── moved from server.py ──
 def find_dead_code(
@@ -1091,7 +1091,7 @@ def find_dead_code(
             return [{"info": "No dead or possibly-dead functions found — every defined function has at least one caller."}]
         return _with_absolute_file(rows, db.root)
 
-    return db.execute_scoped(_query)
+    return db.execute_scoped(_query, limit=limit)
 
 # ── moved from server.py ──
 def find_wrapper_callers(
@@ -1276,7 +1276,7 @@ def find_wrapper_callers(
             })
         return result
 
-    return db.execute_scoped(_query)
+    return db.execute_scoped(_query, limit=limit)
 
 # ── moved from server.py ──
 def trace_data_flow(
@@ -1505,7 +1505,7 @@ def find_hotspots(
             return [{"info": "No references indexed — enable index_refs and re-index."}]
         return _with_absolute_file(rows, db.root)
 
-    return db.execute_scoped(_query)
+    return db.execute_scoped(_query, limit=limit)
 
 
 
@@ -1978,4 +1978,4 @@ def get_vector_table(
             conn, config_hash, unhandled_only=unhandled_only, limit=limit,
         )
 
-    return db.execute_scoped(_query)
+    return db.execute_scoped(_query, limit=limit)

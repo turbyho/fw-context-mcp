@@ -295,6 +295,68 @@ class TestExecuteScopedMultiScope:
 
         assert not [r for r in result if "warning" in r]
 
+    def test_the_limit_bounds_the_merged_list(self, indexed_file):
+        """``limit`` is the maximum of the ANSWER, not of each build.
+
+        The closure carries the limit of one scope, thus a plain merge
+        multiplied it: measured on a two-variant project with five images,
+        a request for 4 rows answered with 16.
+        """
+        ctx, file_path = self._context(indexed_file, 4)
+
+        result = ctx.execute_scoped(
+            lambda c, h: [{"file": str(file_path), "n": i} for i in range(5)],
+            limit=6,
+        )
+
+        payload = [r for r in result if "warning" not in r]
+        assert len(payload) == 6, f"asked for 6, got {len(payload)}"
+
+    def test_every_scope_appears_before_any_gets_a_second_row(self, indexed_file):
+        """A concatenation with a cut would answer from the first build only."""
+        ctx, file_path = self._context(indexed_file, 4)
+
+        result = ctx.execute_scoped(
+            lambda c, h: [{"file": str(file_path), "n": i} for i in range(5)],
+            limit=4,
+        )
+
+        variants = {r["variant"] for r in result if "warning" not in r}
+        assert variants == {"v0", "v1", "v2", "v3"}, f"got: {variants}"
+
+    def test_no_limit_keeps_everything(self, indexed_file):
+        """A tool that documents no maximum must not start losing rows."""
+        ctx, file_path = self._context(indexed_file, 3)
+
+        result = ctx.execute_scoped(
+            lambda c, h: [{"file": str(file_path), "n": i} for i in range(4)]
+        )
+
+        assert len([r for r in result if "warning" not in r]) == 12
+
+    def test_an_empty_scope_does_not_spend_a_slot(self, indexed_file):
+        """A build that found nothing says so, and that is not a result.
+
+        With the notice counted, a scope that answered nothing pushed a
+        real row of a sibling scope out of the limit.
+        """
+        ctx, file_path = self._context(indexed_file, 3)
+        calls = {"n": 0}
+
+        def _query(c, h):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return [{"info": "No callers found."}]
+            return [{"file": str(file_path), "n": i} for i in range(3)]
+
+        result = ctx.execute_scoped(_query, limit=4)
+
+        payload = [
+            r for r in result
+            if "warning" not in r and "info" not in r and "error" not in r
+        ]
+        assert len(payload) == 4, f"the info row ate a slot: {result}"
+
 
 class TestEmptyResult:
     """An empty result names no file, thus per-record detection cannot fire.

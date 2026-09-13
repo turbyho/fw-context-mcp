@@ -462,7 +462,7 @@ def get_template_instances(
         ]
         return result
 
-    return db.execute_scoped(_query)
+    return db.execute_scoped(_query, limit=limit)
 
 # ── moved from server.py ──
 def get_method_overrides(
