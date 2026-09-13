@@ -470,6 +470,11 @@ def test_every_copy_of_the_instructions_warns_about_a_same_name_symbol():
         assert "target_qualified_name" in text, label
         assert "ambiguous_warning" in text, label
         assert "qualified name" in text, label
+        # The structured offer, and the way to reach past the shown part.
+        assert "candidates" in text, label
+        assert "candidates_total" in text, label
+        assert "offset" in text, label
+        assert "`class`" in text, label
         # Both shapes must name their tools, or a reader cannot tell which
         # answer to expect from which tool.
         assert "find_callers" in text, label

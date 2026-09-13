@@ -178,7 +178,7 @@ class TestLookupSymbolSQL:
                        qualified_name="mbed::DigitalOut::write")
         rows = db.execute(LOOKUP_EXACT_SQL,
                           ("hash-aaa", "mbed::DigitalOut::write",
-                           "mbed::DigitalOut::write", 50)).fetchall()
+                           "mbed::DigitalOut::write", 50, 0)).fetchall()
         assert len(rows) == 1
         assert rows[0]["name"] == "write"
         assert rows[0]["qualified_name"] == "mbed::DigitalOut::write"
@@ -187,7 +187,7 @@ class TestLookupSymbolSQL:
         """Exact match by short name still works (backward compatibility)."""
         _insert_symbol(db, usr="u1", name="write",
                        qualified_name="mbed::DigitalOut::write")
-        rows = db.execute(LOOKUP_EXACT_SQL, ("hash-aaa", "write", "write", 50)).fetchall()
+        rows = db.execute(LOOKUP_EXACT_SQL, ("hash-aaa", "write", "write", 50, 0)).fetchall()
         assert len(rows) == 1
 
     def test_exact_no_match_on_wrong_qualified_name(self, db):
@@ -196,7 +196,7 @@ class TestLookupSymbolSQL:
                        qualified_name="mbed::DigitalOut::write")
         rows = db.execute(LOOKUP_EXACT_SQL,
                           ("hash-aaa", "mbed::GPIO::write",
-                           "mbed::GPIO::write", 50)).fetchall()
+                           "mbed::GPIO::write", 50, 0)).fetchall()
         assert rows == []
 
     # ── exact=False ──────────────────────────────────────────────────────
@@ -209,7 +209,7 @@ class TestLookupSymbolSQL:
                        qualified_name="mbed::AnalogIn::read_voltage")
         rows = db.execute(LOOKUP_PREFIX_SQL,
                           ("hash-aaa", "mbed::DigitalOut%",
-                           "mbed::DigitalOut%", 50)).fetchall()
+                           "mbed::DigitalOut%", 50, 0)).fetchall()
         assert len(rows) == 1
         assert rows[0]["qualified_name"] == "mbed::DigitalOut::read"
 
@@ -218,7 +218,7 @@ class TestLookupSymbolSQL:
         _insert_symbol(db, usr="u1", name="read_voltage",
                        qualified_name="mbed::AnalogIn::read_voltage")
         rows = db.execute(LOOKUP_PREFIX_SQL,
-                          ("hash-aaa", "read%", "read%", 50)).fetchall()
+                          ("hash-aaa", "read%", "read%", 50, 0)).fetchall()
         assert len(rows) >= 1
         assert any(r["name"] == "read_voltage" for r in rows)
 
@@ -229,7 +229,7 @@ class TestLookupSymbolSQL:
         _insert_symbol(db, usr="u2", name="write",
                        qualified_name="mbed::SPI::write")
         rows = db.execute(LOOKUP_PREFIX_SQL,
-                          ("hash-aaa", "mbed::%", "mbed::%", 50)).fetchall()
+                          ("hash-aaa", "mbed::%", "mbed::%", 50, 0)).fetchall()
         assert len(rows) >= 2
 
     # ── ordering ─────────────────────────────────────────────────────────
@@ -244,7 +244,7 @@ class TestLookupSymbolSQL:
                        is_definition=1, signature="void write(int)")
         rows = db.execute(LOOKUP_PREFIX_SQL,
                           ("hash-aaa", "mbed::DigitalOut::write%",
-                           "mbed::DigitalOut::write%", 50)).fetchall()
+                           "mbed::DigitalOut::write%", 50, 0)).fetchall()
         assert len(rows) == 2
         assert rows[0]["is_definition"] == 1
         assert rows[1]["is_definition"] == 0

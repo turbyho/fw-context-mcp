@@ -228,10 +228,26 @@ as a `warning` + `hint` instead, thus `[]` is an answer, not a failure.
 
 ### A name that means several symbols
 
-Two classes can each hold a method of the same name. A bare `probe` then
+A common method name lives in many classes. `read`, `write`, `get` and
+`size` each match dozens of symbols in a firmware project. A bare `probe`
 names both `ClassA::probe` and `ClassB::probe`.
 
 Every tool that takes a symbol name handles this, in one of two shapes.
+
+**Tools that return ONE body** — `get_source`, `get_symbol_context`,
+`explain_symbol` — answer for one symbol and add:
+
+- `candidates` — a row per symbol that the name matched, with
+  `qualified_name`, **`class`**, `kind`, `file`, `line` and `signature`.
+  Pick from it and ask again with that `qualified_name`. Read `class`
+  first: it is what tells two same-name methods apart.
+- `candidates_total` — how many symbols the name matches ALTOGETHER.
+  When it is larger than the list, `candidates` holds the most referenced
+  ones; `lookup_symbol(name, exact=True)` lists them ALL and its `offset`
+  pages through them. The two orders differ, so start that listing at the
+  top — it is not a continuation of `candidates`.
+- `ambiguous_warning` — one sentence that names the symbol the answer is
+  about.
 
 **Tools that return a LIST** — `find_all_callers_recursive`,
 `find_callees_recursive`, `find_call_path`, `find_callers`,
@@ -239,19 +255,12 @@ Every tool that takes a symbol name handles this, in one of two shapes.
 a `warning` row that names them, and each result carries
 `target_qualified_name`, which tells the symbol it belongs to.
 
-**Tools that return ONE body** — `get_source`, `get_symbol_context`,
-`explain_symbol` — answer for one symbol and add the key
-`ambiguous_warning`, which names the one they chose and lists the others.
-
 - Read `target_qualified_name` before you say who calls what. Without it
   a caller of one class reads as a caller of the other.
-- Treat `ambiguous_warning` as a signal that you are reading one of
-  several bodies. Ask again with the qualified name before you conclude.
-- To ask about one symbol, give the full qualified name
-  (`ClassB::probe`). An exact qualified name always wins over a bare
+- An exact qualified name (`ClassB::probe`) always wins over a bare
   sibling, thus the answer then holds that symbol only.
-- `lookup_symbol` on the bare name lists the candidates with their
-  `qualified_name`. Take the name from there.
+- `lookup_symbol` lists every match with its `class`, and its `offset`
+  parameter pages through a name that many classes share.
 
 ### Agent loop
 Check(`get_active_build`) → Find(`search_code`/`lookup_symbol`)

@@ -28,17 +28,50 @@ from fw_context_mcp.mcp.handlers._search_fallbacks import _symbol_row_to_dict
 from fw_context_mcp.mcp.shared.context import _db_path
 from fw_context_mcp.utils import abs_path, resolve_project_root
 
-LOOKUP_EXACT_SQL = """SELECT s.* FROM symbols s
+# ``class`` comes from the parent symbol, and it is empty for a free
+# function.  It is what tells two same-name methods apart at a glance: a
+# common name such as ``read`` or ``write`` lives in many classes, and a
+# reader should not have to cut a qualified name at the last ``::``.
+_OWNER_SQL = """CASE WHEN p.kind IN ('class', 'struct', 'union')
+                     THEN p.name ELSE '' END AS owner"""
+_OWNER_JOIN = """LEFT JOIN symbols p
+                   ON p.usr = s.parent_usr AND p.config_hash = s.config_hash"""
+
+# OFFSET pages through a name that matches more symbols than one answer
+# should carry.  Without it the tools could offer a short list and a reader
+# had no way to reach the rest.
+#
+# The order stays as it was — a definition first, then the line — because
+# an OFFSET is only meaningful over a STABLE order.  Relevance belongs to
+# the ``candidates`` list of the body tools, which ranks by reference
+# count; this listing is the complete one, and it must not shuffle between
+# two pages of the same walk.
+LOOKUP_EXACT_SQL = f"""SELECT s.*, {_OWNER_SQL} FROM symbols s
+   {_OWNER_JOIN}
    WHERE s.config_hash=? AND (s.name=? OR s.qualified_name=?)
    ORDER BY s.is_definition DESC, s.line
-   LIMIT ?"""
+   LIMIT ? OFFSET ?"""
 
-LOOKUP_PREFIX_SQL = r"""SELECT s.* FROM symbols s
+LOOKUP_PREFIX_SQL = rf"""SELECT s.*, {_OWNER_SQL} FROM symbols s
+   {_OWNER_JOIN}
    WHERE s.config_hash=? AND (s.name LIKE ? ESCAPE '\' OR s.qualified_name LIKE ? ESCAPE '\')
    ORDER BY s.is_definition DESC, s.line
-   LIMIT ?"""
+   LIMIT ? OFFSET ?"""
 
 log = logging.getLogger(__name__)
+
+
+def _owner_of(row) -> str:
+    """Read the ``owner`` column, or give ``""`` when the query omits it.
+
+    The fallback queries select ``s.*`` alone, thus a row from one of them
+    carries no owner.  A missing class is reported as no class, and never
+    as an error.
+    """
+    try:
+        return row["owner"] or ""
+    except (IndexError, KeyError):
+        return ""
 
 
 def lookup_symbol(
@@ -46,6 +79,7 @@ def lookup_symbol(
     project_root: Annotated[str | None, Field(description="Project root directory. Auto-detected from CWD if omitted.")] = None,
     exact: Annotated[bool, Field(description="True = exact name match, False = prefix LIKE match (default).")] = False,
     limit: Annotated[int, Field(description="Maximum results returned (capped at 100, default 50).")] = 50,
+    offset: Annotated[int, Field(description="Skip this many results. Pages through a name that many classes share, such as 'read' or 'write'.")] = 0,
     variant: Annotated[str | None, Field(description="Build variant name (multi-project). Omit to use default_variant or fail-closed. Use '*' for all variants.")] = None,
     image: Annotated[str | None, Field(description="Sysbuild image name within the variant (multi-project). Omit for all images of the variant.")] = None,
 ) -> list[dict]:
@@ -67,6 +101,11 @@ def lookup_symbol(
         project_root: Project directory. Auto-detected if omitted.
         exact: True = exact name match, False = prefix LIKE match (default).
         limit: Maximum results (default 50).
+        offset: Skip this many results (default 0).  A common method name
+            lives in many classes — ``read`` and ``write`` match dozens of
+            symbols — and this walks past the ones already seen.  The order
+            is stable (a definition first, then the line), thus two pages
+            never overlap and never skip a symbol.
         variant: Build variant (multi-project). Omit for the default
             variant, ``"*"`` for all.
         image: Sysbuild image in the variant. Omit for all images.
@@ -74,7 +113,10 @@ def lookup_symbol(
     Returns:
         list[dict]: Symbols with name, qualified_name, kind, file, line,
         signature, docstring, is_definition, is_template, is_virtual,
-        is_pure_virtual fields. Enum constants include ``enum_value``
+        is_pure_virtual fields, and ``class`` — the class, struct or union
+        that declares the symbol, absent for a free function.  ``class`` is
+        what tells two same-name methods apart at a glance.
+        Enum constants include ``enum_value``
         with the integer value. Macro results include ``kind="macro"``,
         ``value`` (raw definition), and ``expanded_value`` (preprocessor-
         resolved value). May also include ``template_usr``,
@@ -105,6 +147,7 @@ def lookup_symbol(
             return [{"error": f"No index found for {root}."}]
 
         limit = max(0, min(limit, 100))
+        skip = max(0, offset)
 
         def _do_lookup(c: sqlite3.Connection, config_hash: str) -> list[dict]:
             # ── Tier 1: Exact or prefix LIKE, no tokenization ──
@@ -113,14 +156,14 @@ def lookup_symbol(
             # literal underscore, not "UART+any_char+DRIVER".
             if exact:
                 rows = c.execute(
-LOOKUP_EXACT_SQL,
-                    (config_hash, name, name, limit),
+                    LOOKUP_EXACT_SQL,
+                    (config_hash, name, name, limit, skip),
                 ).fetchall()
             else:
                 esc = name.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
                 rows = c.execute(
-LOOKUP_PREFIX_SQL,
-                    (config_hash, f"{esc}%", f"{esc}%", limit),
+                    LOOKUP_PREFIX_SQL,
+                    (config_hash, f"{esc}%", f"{esc}%", limit, skip),
                 ).fetchall()
 
             # Fallback: "Foo::bar" without namespace — extract short name, suffix-filter
@@ -194,6 +237,9 @@ LOOKUP_PREFIX_SQL,
             result = [
                 _symbol_row_to_dict(
                     r, root,
+                    # ``class`` is empty for a free function, and the
+                    # fallback queries below do not select it at all.
+                    **({"class": _owner_of(r)} if _owner_of(r) else {}),
                     **({"_fallback": True} if fallback_used else {}),
                 )
                 for r in rows

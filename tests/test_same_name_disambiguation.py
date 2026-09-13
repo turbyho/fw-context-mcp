@@ -50,7 +50,7 @@ from fw_context_mcp.indexer.db._resolve import (
     candidate_labels,
 )
 from fw_context_mcp.mcp.handlers.source import (
-    _ambiguous_symbol_warning,
+    _ambiguity,
     _collect_callers,
     _lookup_definition,
 )
@@ -67,16 +67,23 @@ def _symbol_row(
     line: int,
     end_line: int = 0,
     kind: str = "method",
+    parent_usr: str = "",
+    signature: str = "",
 ) -> tuple:
     """Build one row for insert_symbols_batch.
 
     The column order is the one that the function documents.  Only the
     fields that these tests read carry a value; the rest take the same
     neutral defaults that the other call-graph tests use.
+
+    *parent_usr* points at the class that declares a method.  The tools
+    read the class through it, thus a fixture that leaves it empty cannot
+    show what a reader sees.
     """
     return (
         CH, file_id, file_path, name, usr, name, qualified_name, kind,
-        line, 1, end_line, 1, "", "", None, 0, 0, "", 0, "", 1, 0.0, "", 0,
+        line, 1, end_line, 1, signature, "", None, 0, 0, parent_usr,
+        0, "", 1, 0.0, "", 0,
     )
 
 
@@ -101,11 +108,23 @@ def db():
     fid = upsert_file(conn, CH, "src/main.cpp", "cpp")
 
     insert_symbols_batch(conn, [
-        _symbol_row(fid, "src/main.cpp", "probe", "ClassA::probe", "u_a_probe", 10, 20),
-        _symbol_row(fid, "src/main.cpp", "probe", "ClassB::probe", "u_b_probe", 30, 40),
-        _symbol_row(fid, "src/main.cpp", "run_a", "ClassA::run_a", "u_a_run", 50, 60),
-        _symbol_row(fid, "src/main.cpp", "run_b", "ClassB::run_b", "u_b_run", 70, 80),
-        _symbol_row(fid, "src/main.cpp", "only", "Solo::only", "u_solo", 90, 95),
+        # The classes themselves, so that a method can point at its owner.
+        _symbol_row(fid, "src/main.cpp", "ClassA", "ClassA", "u_class_a", 5, 25,
+                    kind="class"),
+        _symbol_row(fid, "src/main.cpp", "ClassB", "ClassB", "u_class_b", 26, 45,
+                    kind="class"),
+        _symbol_row(fid, "src/main.cpp", "Solo", "Solo", "u_class_solo", 85, 96,
+                    kind="class"),
+        _symbol_row(fid, "src/main.cpp", "probe", "ClassA::probe", "u_a_probe", 10, 20,
+                    parent_usr="u_class_a", signature="bool probe()"),
+        _symbol_row(fid, "src/main.cpp", "probe", "ClassB::probe", "u_b_probe", 30, 40,
+                    parent_usr="u_class_b", signature="bool probe(int)"),
+        _symbol_row(fid, "src/main.cpp", "run_a", "ClassA::run_a", "u_a_run", 50, 60,
+                    parent_usr="u_class_a"),
+        _symbol_row(fid, "src/main.cpp", "run_b", "ClassB::run_b", "u_b_run", 70, 80,
+                    parent_usr="u_class_b"),
+        _symbol_row(fid, "src/main.cpp", "only", "Solo::only", "u_solo", 90, 95,
+                    parent_usr="u_class_solo"),
         _symbol_row(fid, "src/main.cpp", "top", "top", "u_top", 100, 110, kind="function"),
     ])
     insert_refs_batch(conn, [
@@ -393,24 +412,50 @@ class TestSymbolContextIsAboutOneSymbol:
         )
 
 
-class TestSingleBodyToolsReportAmbiguity:
-    """A tool that returns ONE body must say when the name matched more."""
+class TestSingleBodyToolsOfferTheChoice:
+    """A tool that returns ONE body must offer the others as rows.
 
-    def test_a_bare_name_reports_the_other_definitions(self, db):
+    A sentence that lists the alternatives makes the reader parse text and
+    ask again.  These rows carry the class, the file, the line and the
+    signature, thus the reader picks the right symbol in one more call.
+    """
+
+    def test_a_bare_name_offers_every_match_as_a_row(self, db):
         row = _lookup_definition(db, CH, "probe", preferred_kinds=None)
-        warning = _ambiguous_symbol_warning(db, CH, "probe", row)
-        assert warning is not None, "the silent choice was not reported"
-        assert "ClassA::probe" in warning
-        assert "ClassB::probe" in warning
-        assert "qualified name" in warning
+        out = _ambiguity(db, CH, "probe", row, Path("/tmp/test"))
+        names = {c["qualified_name"] for c in out["candidates"]}
+        assert names == {"ClassA::probe", "ClassB::probe"}, f"got: {names}"
+        assert out["candidates_total"] == 2
 
-    def test_a_qualified_name_reports_nothing(self, db):
+    def test_each_row_names_the_class(self, db):
+        """The field that tells two same-name methods apart at a glance."""
+        row = _lookup_definition(db, CH, "probe", preferred_kinds=None)
+        out = _ambiguity(db, CH, "probe", row, Path("/tmp/test"))
+        by_name = {c["qualified_name"]: c["class"] for c in out["candidates"]}
+        assert by_name["ClassA::probe"] == "ClassA", f"got: {by_name}"
+        assert by_name["ClassB::probe"] == "ClassB", f"got: {by_name}"
+
+    def test_each_row_carries_what_the_choice_needs(self, db):
+        row = _lookup_definition(db, CH, "probe", preferred_kinds=None)
+        out = _ambiguity(db, CH, "probe", row, Path("/tmp/test"))
+        assert set(out["candidates"][0]) == {
+            "qualified_name", "class", "kind", "file", "line", "signature",
+        }, f"got: {sorted(out['candidates'][0])}"
+
+    def test_the_warning_names_the_symbol_that_the_answer_is_about(self, db):
+        row = _lookup_definition(db, CH, "probe", preferred_kinds=None)
+        out = _ambiguity(db, CH, "probe", row, Path("/tmp/test"))
+        chosen = row["qualified_name"]
+        assert chosen in out["ambiguous_warning"]
+        assert "candidates" in out["ambiguous_warning"]
+
+    def test_a_qualified_name_offers_nothing(self, db):
         row = _lookup_definition(db, CH, "ClassB::probe", preferred_kinds=None)
-        assert _ambiguous_symbol_warning(db, CH, "ClassB::probe", row) is None
+        assert _ambiguity(db, CH, "ClassB::probe", row, Path("/tmp/test")) == {}
 
-    def test_an_unambiguous_bare_name_reports_nothing(self, db):
+    def test_an_unambiguous_bare_name_offers_nothing(self, db):
         row = _lookup_definition(db, CH, "only", preferred_kinds=None)
-        assert _ambiguous_symbol_warning(db, CH, "only", row) is None
+        assert _ambiguity(db, CH, "only", row, Path("/tmp/test")) == {}
 
     def test_a_declaration_is_not_a_second_definition(self, db):
         """A declaration shares the USR of its definition — one symbol, not two."""
@@ -423,7 +468,7 @@ class TestSingleBodyToolsReportAmbiguity:
         db.commit()
 
         row = _lookup_definition(db, CH, "only", preferred_kinds=None)
-        assert _ambiguous_symbol_warning(db, CH, "only", row) is None
+        assert _ambiguity(db, CH, "only", row, Path("/tmp/test")) == {}
 
 
 class TestAmbiguousAnswerStaysWithinItsPromises:

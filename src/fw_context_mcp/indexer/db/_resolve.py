@@ -40,40 +40,83 @@ from fw_context_mcp.utils import escape_like as _escape_like
 log = logging.getLogger(__name__)
 
 __all__ = [
+    "CANDIDATES_SHOWN",
     "Candidate",
     "ambiguity_notice",
     "candidate_labels",
+    "candidate_rows",
+    "count_candidates",
     "resolve_candidates",
     "resolve_usr",
     "resolve_usrs",
 ]
 
-#: The maximum number of same-name targets that one query walks.
-#: Measured on one firmware index: 90% of the names give a single USR and
-#: never touch this limit, but ``operator=`` gives 204.  To walk all of
-#: those gives an answer to a question that nobody asked.  Thus the query
-#: cuts the set, and it tells the caller that it did.
-MAX_AMBIGUOUS_TARGETS = 50
+#: How many same-name symbols one graph query WALKS.
+#:
+#: This is a cost bound, not a display bound.  Each target costs a
+#: recursive CTE or a reference query, thus the two must not share one
+#: number: measured on one firmware index, ``size`` matches 132 symbols and
+#: ``operator=`` matches 204, and walking all of them answers a question
+#: that nobody asked.
+MAX_TRAVERSED_TARGETS = 50
+
+#: Kept for the readers that still spell it the older way.
+MAX_AMBIGUOUS_TARGETS = MAX_TRAVERSED_TARGETS
+
+#: How many candidates a tool OFFERS the caller to choose from.
+#:
+#: A candidate row costs about 250 bytes, thus this is a display bound and
+#: it is far cheaper than a walk.  It stays small because the list sits
+#: beside the body that the caller asked for, and the caller reads the
+#: whole answer.  The count of ALL matches travels with the list, and
+#: ``lookup_symbol`` pages through the rest, so a small list hides nothing:
+#: it only spares the common case.
+CANDIDATES_SHOWN = 20
+
+
+#: The fields of a Candidate, in order.
+_CANDIDATE_FIELDS = (
+    "usr", "qualified_name", "kind", "file_path", "owner", "line", "signature",
+)
 
 
 class Candidate(tuple):
-    """One symbol that a name can mean: ``(usr, qualified_name, kind, file_path)``.
+    """One symbol that a name can mean.
+
+    Fields: ``usr``, ``qualified_name``, ``kind``, ``file_path``, ``owner``,
+    ``line``, ``signature``.
 
     A named tuple subclass rather than a dataclass, because the callers
-    unpack it and pass the parts to SQL.  ``kind`` is here for ``find_refs``:
-    a class, struct or enum keeps its references at member granularity, and
-    that query needs the kind to know it must match a USR prefix.
+    unpack it and pass the parts to SQL.
 
-    ``file_path`` is here because a qualified name does not always tell two
-    candidates apart.  A C function at file scope carries a qualified name
-    equal to its bare name, thus three static functions of one name in
-    three files all read as that one name.
+    ``kind`` is here for ``find_refs``: a class, struct or enum keeps its
+    references at member granularity, and that query needs the kind to know
+    it must match a USR prefix.
+
+    ``owner`` is the class, struct or union that declares the symbol, and
+    it is empty for a free function.  It is the field that tells two
+    same-name methods apart at a glance, without a reader having to cut a
+    qualified name at the last ``::``.
+
+    ``file_path``, ``line`` and ``signature`` complete the description, so
+    that a caller can choose between the candidates without asking again.
     """
 
     __slots__ = ()
 
-    def __new__(cls, usr: str, qualified_name: str, kind: str, file_path: str = ""):
-        return super().__new__(cls, (usr, qualified_name, kind, file_path))
+    def __new__(
+        cls,
+        usr: str,
+        qualified_name: str,
+        kind: str,
+        file_path: str = "",
+        owner: str = "",
+        line: int = 0,
+        signature: str = "",
+    ):
+        return super().__new__(
+            cls, (usr, qualified_name, kind, file_path, owner, line, signature)
+        )
 
     @property
     def usr(self) -> str:
@@ -90,6 +133,18 @@ class Candidate(tuple):
     @property
     def file_path(self) -> str:
         return self[3]
+
+    @property
+    def owner(self) -> str:
+        return self[4]
+
+    @property
+    def line(self) -> int:
+        return self[5]
+
+    @property
+    def signature(self) -> str:
+        return self[6]
 
 
 def candidate_labels(candidates: list[Candidate]) -> list[str]:
@@ -112,15 +167,102 @@ def candidate_labels(candidates: list[Candidate]) -> list[str]:
     ]
 
 
+def candidate_rows(candidates: list[Candidate], root=None) -> list[dict]:
+    """Describe each candidate as a row that a caller can choose from.
+
+    WHY a list of rows and not a sentence: a tool that answers with ONE body
+    used to name the alternatives in prose, and a reader then had to parse
+    that text and ask again.  These rows carry what the choice needs —
+    ``class``, ``file``, ``line``, ``signature`` — thus the reader can pick
+    the right symbol, or read all of them, without another round trip.
+
+    ``class`` is empty for a free function.  ``qualified_name`` is the
+    string to give back to the tool to get that one symbol.
+    """
+    rows: list[dict] = []
+    for c in candidates:
+        file_path = c.file_path
+        if root is not None and file_path:
+            from fw_context_mcp.utils import abs_path
+
+            file_path = abs_path(root, file_path)
+        rows.append({
+            "qualified_name": c.qualified_name,
+            "class": c.owner,
+            "kind": c.kind,
+            "file": file_path,
+            "line": c.line,
+            "signature": c.signature,
+        })
+    return rows
+
+
+#: The rank expression and the WHERE clause, shared by the two queries
+#: below so that a count can never disagree with a list.
+_RANK_SQL = """CASE WHEN s.qualified_name = ? THEN 0
+                    WHEN s.name = ? THEN 1
+                    WHEN s.qualified_name LIKE ? ESCAPE '\\' THEN 2
+                    ELSE 3 END"""
+_WHERE_SQL = """s.config_hash = ?
+                AND (s.name = ? OR s.qualified_name = ?
+                     OR s.qualified_name LIKE ? ESCAPE '\\' OR s.name = ?)"""
+
+
+def _match_params(name: str) -> tuple:
+    """Build the parameters that the rank and the WHERE clause both need."""
+    esc_name = _escape_like(name)
+    suffix_pattern = f"%::{esc_name}"
+    plain_name = name.rsplit("::", 1)[-1] if "::" in name else name
+    # NULL never equals a column value, thus a bare name reaches no rank 0.
+    qualified_probe = name if "::" in name else None
+    return qualified_probe, name, suffix_pattern, plain_name
+
+
+def count_candidates(conn: sqlite3.Connection, config_hash: str, name: str) -> int:
+    """Count EVERY symbol that *name* matches at its best rank.
+
+    The list that a tool shows is cut to keep an answer readable, thus the
+    caller must learn how much it is not seeing.  Without the true count a
+    short list reads as the whole truth: measured on one firmware index,
+    ``size`` matches 132 symbols and a list of 20 says nothing about the
+    other 112.
+    """
+    qualified_probe, plain, suffix_pattern, plain_name = _match_params(name)
+    try:
+        row = conn.execute(
+            f"""WITH ranked AS (
+                    SELECT s.usr AS usr, {_RANK_SQL} AS match_rank
+                    FROM symbols s
+                    WHERE {_WHERE_SQL}
+                )
+                SELECT COUNT(DISTINCT usr) FROM ranked
+                WHERE match_rank = (SELECT MIN(match_rank) FROM ranked)""",
+            (
+                qualified_probe, plain, suffix_pattern,
+                config_hash, plain, plain, suffix_pattern, plain_name,
+            ),
+        ).fetchone()
+    except sqlite3.Error:
+        log.exception("count_candidates failed for '%s'", name)
+        return 0
+    return row[0] if row else 0
+
+
 def resolve_candidates(
-    conn: sqlite3.Connection, config_hash: str, name: str
+    conn: sqlite3.Connection, config_hash: str, name: str, limit: int | None = None
 ) -> list[Candidate]:
     """Find each symbol that *name* can mean.  The best match comes first.
 
-    Returns the candidates that share the BEST match rank.  One element
-    means the name was not ambiguous.  More than one means the caller must
-    either walk all of them or say which one it took — it must not pick one
-    in silence.
+    Returns the candidates that share the BEST match rank, at most *limit*
+    of them (``MAX_TRAVERSED_TARGETS`` by default).  One element means the
+    name was not ambiguous.  More than one means the caller must either
+    walk all of them or say which one it took — it must not pick one in
+    silence.
+
+    *limit* is a parameter because two callers need different numbers: a
+    graph query pays a recursive CTE per target and wants few, while a
+    tool that only LISTS the choice pays about 250 bytes per row and can
+    afford more.  :func:`count_candidates` gives the true total either way.
 
     Inside one rank the order is: a definition before a declaration, then
     the variant with the most references.  Candidates of equal specificity
@@ -134,17 +276,18 @@ def resolve_candidates(
     the body tools answered with ``IteratorReader::read``, and the two
     tools then described different symbols.
     """
-    esc_name = _escape_like(name)
-    suffix_pattern = f"%::{esc_name}"
-    plain_name = name.rsplit("::", 1)[-1] if "::" in name else name
-    # NULL never equals a column value, thus a bare name reaches no rank 0.
-    qualified_probe = name if "::" in name else None
+    cap = MAX_TRAVERSED_TARGETS if limit is None else limit
+    qualified_probe, plain, suffix_pattern, plain_name = _match_params(name)
     try:
         rows = conn.execute(
             """SELECT s.usr,
                       COALESCE(s.qualified_name, s.name) AS qualified_name,
                       s.kind AS kind,
                       s.file_path AS file_path,
+                      s.line AS line,
+                      s.signature AS signature,
+                      CASE WHEN p.kind IN ('class', 'struct', 'union')
+                           THEN p.name ELSE '' END AS owner,
                       CASE WHEN s.qualified_name = ? THEN 0
                            WHEN s.name = ? THEN 1
                            WHEN s.qualified_name LIKE ? ESCAPE '\\' THEN 2
@@ -154,13 +297,16 @@ def resolve_candidates(
                       (SELECT COUNT(*) FROM refs r
                        WHERE r.from_usr = s.usr AND r.config_hash = s.config_hash) AS out_count
                FROM symbols s
+               LEFT JOIN symbols p
+                 ON p.usr = s.parent_usr AND p.config_hash = s.config_hash
                WHERE s.config_hash = ?
                  AND (s.name = ? OR s.qualified_name = ? OR s.qualified_name LIKE ? ESCAPE '\\'
                       OR s.name = ?)
-               ORDER BY match_rank, s.is_definition DESC, ref_count DESC, out_count DESC""",
+               ORDER BY match_rank, s.is_definition DESC, s.is_project DESC,
+                        ref_count DESC, out_count DESC""",
             (
-                qualified_probe, name, suffix_pattern,
-                config_hash, name, name, suffix_pattern, plain_name,
+                qualified_probe, plain, suffix_pattern,
+                config_hash, plain, plain, suffix_pattern, plain_name,
             ),
         ).fetchall()
     except sqlite3.Error:
@@ -186,9 +332,10 @@ def resolve_candidates(
         seen.add(usr)
         out.append(Candidate(
             usr, row["qualified_name"] or usr, row["kind"] or "",
-            row["file_path"] or "",
+            row["file_path"] or "", row["owner"] or "",
+            row["line"] or 0, row["signature"] or "",
         ))
-        if len(out) >= MAX_AMBIGUOUS_TARGETS:
+        if len(out) >= cap:
             break
     return out
 
