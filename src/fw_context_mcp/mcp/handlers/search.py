@@ -49,6 +49,7 @@ from ...llm._diag import check_setup
 from ...utils import abs_path, resolve_project_root
 from ..shared.context import _db_path, _is_stale, _quick_open_readonly
 from ..shared.fallback import _fallback_to_search_code
+from ..shared.paging import clamp_offset, page_notice
 from ..shared.stale import _with_stale_recovery
 from ._lookup import lookup_symbol
 from ._search_fallbacks import (
@@ -787,7 +788,8 @@ def search_bodies(
     query: Annotated[str, Field(description="FTS5 search terms for the body of a definition. 1-3 words. E.g. 'attach', 'callback', 'rise'.")],
     project_root: Annotated[str | None, Field(description="Project root. Auto-detected if omitted.")] = None,
     kind: Annotated[str | None, Field(description="Optional kind filter: function, method, class, etc.")] = None,
-    limit: Annotated[int, Field(description="Maximum results (default 20, max 100).")] = 20,
+    limit: Annotated[int, Field(description="Maximum results of one page (default 20, max 100).")] = 20,
+    offset: Annotated[int, Field(description="Skip this many results. Reads the next page of a pattern with many hits.")] = 0,
     project_only: Annotated[bool, Field(description="Exclude vendor SDK code. When True, only application code. Default False.")] = False,
     variant: Annotated[str | None, Field(description="Build variant (multi-build project). Omit to use default_variant. One query answers for ONE build.")] = None,
     image: Annotated[str | None, Field(description="Sysbuild image within the variant. Required when the variant holds several: each image is a separate program.")] = None,
@@ -885,7 +887,9 @@ def search_bodies(
             (``'\"attach callback\"'``).
         project_root: Project root. Auto-detected if omitted.
         kind: Optional filter to return only symbols of this kind.
-        limit: Maximum results (default 20, max 100).
+        limit: Maximum results of one page (default 20, max 100).
+        offset: Skip this many results. Reads the next page of a pattern
+            with many hits; the page notice names the offset to use.
         project_only: When True, exclude vendor SDK directories and return only
             application code. Default False.
         variant: Build variant (multi-build project). Omit to use
@@ -894,10 +898,11 @@ def search_bodies(
             variant holds several: each image is a separate program.
 
     Returns:
-        list of dicts, each with: name, qualified_name, kind, file, line
-        (first line of the definition), is_definition, signature,
-        _match_snippet (excerpt around the match), source (the text of the
-        definition).
+        list of dicts.  The first is the page notice — ``total``,
+        ``offset``, ``shown``, ``more`` — and each that follows holds:
+        name, qualified_name, kind, file, line (first line of the
+        definition), is_definition, signature, _match_snippet (excerpt
+        around the match), source (the text of the definition).
 
         Also, when they carry an answer:
 
@@ -953,25 +958,23 @@ def search_bodies(
         ``match_lines`` for the position that ``snippet()`` drops.
 
         **Sorting strategy — project-first:** When ``project_only=False``
-        (default), results are sorted with project code first, then vendor
-        code. The operator sees their own code before framework internals.
-        Sorting happens in Python after the DB query because SQLite FTS5
-        ``rank`` already provides relevance ordering within each group.
+        (default), project code comes before vendor code.  The operator
+        sees their own code before framework internals.
 
-        **Limit enforcement — over-fetch then slice:** The DB query fetches
-        ``limit * 3`` rows (3× multiplier for non-project_only, just
-        ``limit`` for project_only). The 3× compensates for vendor-code
-        filtering — most matches may be in vendor code, so we over-fetch,
-        sort project-first, then slice to ``limit``. This avoids returning
-        fewer than ``limit`` results when the majority of FTS5 matches live
-        in vendor directories.
+        The order is one ORDER BY over the whole answer, and the page is
+        one LIMIT/OFFSET on it.  It used to be a Python re-sort over a
+        ``limit * 3`` over-fetch, and that shape cannot be paged: the
+        grouping held only inside the window that was fetched, thus a
+        deeper page fetched a wider window, pulled a project row from the
+        tail of it to the front, and pushed every vendor row behind that
+        row onto a different page.  A walk then saw one row twice and
+        another never.
 
-        **Why DB-level limit matters:** SQLite FTS5's ``rank`` column is a
-        bm25 score computed during the MATCH — ordering by rank and limiting
-        at the DB level ensures we get the most relevant matches before any
-        Python-level filtering. Doing the same filtering in Python would
-        require fetching all matches, which could be tens of thousands of
-        rows in a large codebase.
+        **Why the DB does the ordering:** ``rank`` is a bm25 score that
+        FTS5 computes during the MATCH.  Ordering and cutting in SQL gives
+        the most relevant matches of the whole index, where the same work
+        in Python needs every match first — tens of thousands of rows in a
+        large codebase.
 
         **FTS5 syntax errors:** Invalid FTS5 queries (e.g. unescaped special
         characters) raise ``sqlite3.OperationalError`` with error code 1.
@@ -985,9 +988,10 @@ def search_bodies(
             config_hash: Active build configuration hash for filtering.
 
         Returns:
-            List of result dicts with name, qualified_name, kind, file,
-            line, is_definition, signature, _match_snippet, and optionally
-            source (truncated at 2000 characters).
+            A page notice, then a result dict per definition with name,
+            qualified_name, kind, file, line, is_definition, signature,
+            _match_snippet, and optionally source (truncated at 2000
+            characters).
         """
         kind_filter = ""
         project_filter = ""
@@ -995,18 +999,38 @@ def search_bodies(
             kind_filter = "AND s.kind = ?"
         if project_only:
             project_filter = "AND s.is_project = 1"
+        where_sql = f"""WHERE symbols_fts MATCH ? AND s.config_hash = ? AND s.is_definition = 1
+                      AND s.source != '' {kind_filter} {project_filter}"""
+        skip = clamp_offset(offset)
+
+        # Project code first, and in SQL.  This used to be a Python re-sort
+        # over a 3x over-fetch, and a page walk cannot survive that: the
+        # grouping then held only inside the fetched window, thus a deeper
+        # page fetched more rows, pulled a project row from the tail to the
+        # front and pushed every vendor row behind it to another page.  One
+        # order over the whole answer keeps each row on the page where the
+        # walk first met it.
+        #
+        # ``rank`` ties — several bodies score alike — and SQLite may then
+        # return tied rows in any order.  ``s.usr`` is unique and ends the
+        # order, thus two pages of one walk cannot repeat or skip a row.
         sql = f"""SELECT s.*, snippet(symbols_fts, 9, '<b>', '</b>', '…', 60) AS _match_snippet
                    FROM symbols_fts
                    JOIN symbols s ON s.id = symbols_fts.rowid
-                   WHERE symbols_fts MATCH ? AND s.config_hash = ? AND s.is_definition = 1
-                     AND s.source != '' {kind_filter} {project_filter}
-                    ORDER BY rank
-                   LIMIT ?"""
+                   {where_sql}
+                    ORDER BY s.is_project DESC, rank, s.usr
+                   LIMIT ? OFFSET ?"""
+        count_sql = f"""SELECT COUNT(*) FROM symbols_fts
+                        JOIN symbols s ON s.id = symbols_fts.rowid
+                        {where_sql}"""
 
         def _params(match_query: str) -> list:
-            row_limit = limit if project_only else limit * 3
             return [_scoped_to_source(match_query), config_hash,
-                    *([kind] if kind else []), row_limit]
+                    *([kind] if kind else []), limit, skip]
+
+        def _count_params(match_query: str) -> list:
+            return [_scoped_to_source(match_query), config_hash,
+                    *([kind] if kind else [])]
 
         repaired = ""
         try:
@@ -1043,7 +1067,6 @@ def search_bodies(
                 "is_definition": bool(r["is_definition"]),
                 "signature": r["signature"],
                 "_match_snippet": r["_match_snippet"],
-                "_is_project": bool(r["is_project"]),
             }
             if repaired:
                 # The caller wrote a pattern FTS5 could not parse.  Report the
@@ -1070,20 +1093,20 @@ def search_bodies(
                     d["match_lines"] = match_lines
             results.append(d)
 
-        if project_only:
-            final = results
-        else:
-            # Project-first sorting: group results by is_project, project
-            # code first. The 3× over-fetch compensates for vendor matches
-            # being filtered out. After sorting, slice to the operator's
-            # requested limit. ``_is_project`` is a temporary sort key —
-            # it is removed from each dict before returning.
-            project_results = [r for r in results if r["_is_project"]]
-            vendor_results = [r for r in results if not r["_is_project"]]
-            final = project_results + vendor_results
-        for r in final:
-            del r["_is_project"]
-        return final[:limit]
+        # The rows are already the page: SQL ordered them and cut them.
+        page = results
+        total = c.execute(count_sql, _count_params(repaired or expanded)).fetchone()[0]
+        if not page:
+            if skip and total:
+                return [{"info": (
+                    f"No body at offset {skip}; the answer holds {total}."
+                )}]
+            return []
+        page.insert(0, page_notice(
+            total, skip, len(page),
+            hint=f"search_bodies('{query}', offset={skip + len(page)}) reads the next page.",
+        ))
+        return page
 
     return _with_search_context(root, "search_bodies", _do_search, variant or "", image or "")
 
@@ -1092,7 +1115,8 @@ def search_bodies(
 def search_content(
     query: Annotated[str, Field(description="FTS5 search terms for full file content. 1-3 words. E.g. 'InterruptIn', 'extern C'. Bare multi-word = OR-joined.")],
     project_root: Annotated[str | None, Field(description="Project root. Auto-detected if omitted.")] = None,
-    limit: Annotated[int, Field(description="Maximum results (default 20, max 100).")] = 20,
+    limit: Annotated[int, Field(description="Maximum results of one page (default 20, max 100).")] = 20,
+    offset: Annotated[int, Field(description="Skip this many results. Reads the next page of a topic that many files touch.")] = 0,
     project_only: Annotated[bool, Field(description="Exclude vendor SDK code. When True, only application code. Default False.")] = False,
     variant: Annotated[str | None, Field(description="Build variant (multi-build project). Omit to use default_variant. One query answers for ONE build.")] = None,
     image: Annotated[str | None, Field(description="Sysbuild image within the variant. Required when the variant holds several: each image is a separate program.")] = None,
@@ -1142,7 +1166,9 @@ def search_content(
             OR-joined (prefix-wildcarded). Prefer single-word queries.
             E.g. ``'InterruptIn'``, ``'extern C'``, ``'#define'``.
         project_root: Project root. Auto-detected if omitted.
-        limit: Maximum results (default 20, max 100).
+        limit: Maximum results of one page (default 20, max 100).
+        offset: Skip this many results. Reads the next page of a topic
+            that many files touch; the page notice names the offset to use.
         project_only: When True, filter to project code only (files with is_project = 1).
         variant: Build variant (multi-build project). Omit to use
             default_variant. One query answers for ONE build.
@@ -1150,8 +1176,10 @@ def search_content(
             variant holds several: each image is a separate program.
 
     Returns:
-        list of dicts, each with: file, language, mtime,
-        _match_snippet (highlighted excerpt around the match).
+        list of dicts.  The first is the page notice — ``total``,
+        ``offset``, ``shown``, ``more`` — and each that follows holds:
+        file, language, mtime, _match_snippet (highlighted excerpt around
+        the match).
 
         Also, when it carries an answer:
 
@@ -1204,19 +1232,20 @@ def search_content(
         ``fw-context index`` upgrades a legacy index to include
         ``files_fts``, enabling the faster FTS5 path on subsequent queries.
 
-        **Limit enforcement:** The DB query fetches ``limit * 3`` rows. The
-        3× multiplier compensates for post-filtering (removing duplicate
-        files, applying vendor-code sorting if needed). After Python-level
-        processing, results are sliced to ``limit``.
+        **The page comes from SQL:** both paths order their rows and cut
+        them with LIMIT/OFFSET, thus the rows this function builds are
+        already the page.  There is no re-sort in Python here, therefore
+        nothing to over-fetch for.
 
         Args:
             c: Open read-only SQLite connection (provided by stale recovery).
             config_hash: Active build configuration hash for filtering.
 
         Returns:
-            List of result dicts with file, language, mtime, _match_snippet,
-            and optionally match_lines and _fallback.  A query that FTS5
-            refuses heads the list with a warning dict.
+            A page notice, then a result dict per file with file, language,
+            mtime, _match_snippet, and optionally match_lines and
+            _fallback.  A query that FTS5 refuses heads the list with a
+            warning dict.
         """
         project_filter = ""
         if project_only:
@@ -1224,6 +1253,8 @@ def search_content(
         # Set when FTS5 refuses the query below — it then heads the result
         # list, so the caller reads "bad query" and not "no such code".
         rejection: dict | None = None
+        skip = clamp_offset(offset)
+        total = 0
 
         # Check whether the files_fts virtual table exists.
         # Legacy indexes created before file-content FTS5 indexing was added
@@ -1234,19 +1265,32 @@ def search_content(
 
         if table_row is not None:
             try:
-                # FTS5 path: uses snippet() for contextual highlighting.
-                # Fetches limit * 3 rows — 3× compensates for vendor-code
-                # files that may crowd out project-code matches.
+                # ``rank`` ties — several files score alike — and SQLite may
+                # then return tied rows in any order.  ``f.path`` is unique
+                # within one build and ends the order, thus two pages of one
+                # walk cannot repeat or skip a file.
+                #
+                # The rows are sliced here and nowhere else, thus the OFFSET
+                # belongs in the query.  An earlier 3x over-fetch served a
+                # project-first re-sort that this function does not do, and
+                # it only read two thirds of its rows to throw them away.
                 rows = c.execute(
                     f"""SELECT f.*, snippet(files_fts, 1, '<b>', '</b>', '…', 80) AS _match_snippet
                        FROM files_fts
                        JOIN files f ON f.id = files_fts.rowid
                        WHERE files_fts MATCH ? AND f.config_hash = ?
                          AND f.content != '' {project_filter}
-                        ORDER BY rank
-                       LIMIT ?""",
-                    (expanded, config_hash, limit * 3),
+                        ORDER BY rank, f.path
+                       LIMIT ? OFFSET ?""",
+                    (expanded, config_hash, limit, skip),
                 ).fetchall()
+                total = c.execute(
+                    f"""SELECT COUNT(*) FROM files_fts
+                       JOIN files f ON f.id = files_fts.rowid
+                       WHERE files_fts MATCH ? AND f.config_hash = ?
+                         AND f.content != '' {project_filter}""",
+                    (expanded, config_hash),
+                ).fetchone()[0]
             except sqlite3.OperationalError as e:
                 # FTS5 syntax error on the query — fall back to LIKE, which
                 # reads the query as literal text and thus still answers.
@@ -1281,6 +1325,10 @@ def search_content(
             escaped_terms = [t.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") for t in like_terms]
             like_clauses = " AND ".join(["f.content LIKE ? ESCAPE '\\'" for _ in escaped_terms])
             like_params = [f"%{t}%" for t in escaped_terms]
+            # This path had NO order at all, thus SQLite was free to return
+            # the rows differently on every call.  A page walk over that is
+            # meaningless: the same file could arrive twice and another
+            # never.  ``f.path`` is unique within one build and settles it.
             rows = c.execute(
                 f"""SELECT f.*,
                            substr(f.content, 0, 200) || '…' AS _match_snippet
@@ -1289,14 +1337,23 @@ def search_content(
                        AND f.content != ''
                        AND {like_clauses}
                        {project_filter}
-                     LIMIT ?""",
-                (config_hash, *like_params, limit * 3),
+                     ORDER BY f.path
+                     LIMIT ? OFFSET ?""",
+                (config_hash, *like_params, limit, skip),
             ).fetchall()
+            total = c.execute(
+                f"""SELECT COUNT(*) FROM files f
+                     WHERE f.config_hash = ?
+                       AND f.content != ''
+                       AND {like_clauses}
+                       {project_filter}""",
+                (config_hash, *like_params),
+            ).fetchone()[0]
 
         results: list[dict] = [rejection] if rejection else []
-        # Sliced before the scan below: the query over-fetches 3×, and reading
-        # the text of a file that never reaches the caller is wasted work.
-        for r in rows[:limit]:
+        # ``rows`` IS the page — both paths above ordered and cut in SQL.
+        page: list[dict] = []
+        for r in rows:
             d = {
                 "file": abs_path(root, r["path"]),
                 "language": r["language"],
@@ -1311,7 +1368,18 @@ def search_content(
             # #ifdef branch is a blank line, and a raw read shows it as code.
             if match_lines := _body_match_lines(r["content"], 1, terms):
                 d["match_lines"] = match_lines
-            results.append(d)
+            page.append(d)
+        if not page:
+            if skip and total:
+                results.append({"info": (
+                    f"No file at offset {skip}; the answer holds {total}."
+                )})
+            return results
+        results.append(page_notice(
+            total, skip, len(page),
+            hint=f"search_content('{query}', offset={skip + len(page)}) reads the next page.",
+        ))
+        results += page
         return results
 
     return _with_search_context(root, "search_content", _do_search, variant or "", image or "")

@@ -118,7 +118,9 @@ class TestSearchContentFts5GracefulFallback:
                     )
         assert isinstance(result, list)
         assert result, "search_content should return at least one matching file"
-        assert result[0]["file"].endswith("a.cpp")
+        # The first row is the page notice; the file follows it.
+        assert result[0]["total"] == 1, result
+        assert result[1]["file"].endswith("a.cpp")
 
 
 # ═══════════════════════════════════════════════════════════════════════════

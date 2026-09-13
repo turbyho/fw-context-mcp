@@ -148,13 +148,28 @@ def indexed_project(tmp_path: Path) -> Path:
     return root
 
 
+_NOTICE_KEYS = {"total", "offset", "shown", "more"}
+_META_KEYS = {"warning", "error", "info"}
+
+
+def _answers(rows: list[dict]) -> list[dict]:
+    """Keep the results, drop the page notice and any warning or error.
+
+    Every paged tool leads with ``{"total", "offset", "shown", "more"}``.
+    That row says where the page sits, thus it is provenance and not an
+    answer.  The drop tests for those keys and not for the absence of the
+    key a test wants — a filter of the second kind hides a result that
+    lost a field, which is the defect such a test must catch.
+    """
+    return [
+        r for r in rows
+        if not _NOTICE_KEYS <= set(r) and not _META_KEYS & set(r)
+    ]
+
+
 def _by_file(rows: list[dict]) -> dict[str, dict]:
-    """Index the results by file name, dropping any warning element."""
-    return {
-        Path(r["file"]).name: r
-        for r in rows
-        if "warning" not in r and "error" not in r
-    }
+    """Index the results by file name."""
+    return {Path(r["file"]).name: r for r in _answers(rows)}
 
 
 class TestSearchContentMatchLines:
@@ -257,7 +272,7 @@ class TestSearchBodiesSearchesTheBody:
 
         rows = search_bodies("journal", project_root=str(indexed_project))
 
-        assert [r for r in rows if "warning" not in r] == []
+        assert _answers(rows) == []
 
     def test_search_code_is_the_tool_that_reaches_it(self, indexed_project: Path):
         """The row is in the index — only this tool is allowed to find it."""
@@ -287,7 +302,7 @@ class TestFtsSyntaxSurvivesTheRepair:
     """
 
     def _names(self, rows: list[dict]) -> set[str]:
-        return {r["name"] for r in rows if "warning" not in r and "error" not in r}
+        return {r["name"] for r in _answers(rows)}
 
     def test_the_near_operator_still_works(self, indexed_project: Path):
         from fw_context_mcp.mcp.handlers.search import search_bodies
