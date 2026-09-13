@@ -41,6 +41,7 @@ __all__ = [
     "count_hotspots",
     "count_indirect_call_sites",
     "count_llm_analysis",
+    "count_macros",
     "count_pending_analysis",
     "count_refs",
     "delete_build_data",
@@ -245,6 +246,7 @@ from ._schema import (
 )
 from ._symbols import (
     _expand_query,
+    count_macros,
     delete_macros_for_files,
     find_macro_refs,
     insert_macros_batch,

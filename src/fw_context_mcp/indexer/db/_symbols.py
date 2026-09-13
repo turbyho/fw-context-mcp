@@ -69,6 +69,7 @@ from ._chunking import chunked
 
 __all__ = [
     "_expand_query",
+    "count_macros",
     "delete_macros_for_files",
     "find_macro_refs",
     "insert_macros_batch",
@@ -306,12 +307,53 @@ def delete_macros_for_files(conn: sqlite3.Connection, file_ids: Sequence[int]) -
         )
 
 
+_MACRO_EXACT_WHERE = "m.config_hash = ? AND m.name = ?"
+_MACRO_PREFIX_WHERE = r"m.config_hash = ? AND m.name LIKE ? ESCAPE '\'"
+
+
+def _macro_where(name: str, exact: bool) -> tuple[str, str, str]:
+    r"""Give the WHERE text, the name parameter and the ORDER BY of a lookup.
+
+    The count and the page must run on the SAME conditions.  Two copies of
+    the text drift apart, and a ``total`` that describes another answer
+    than the rows do is worse than no total at all.
+
+    The ``ESCAPE '\'`` clause is required because a macro name legally
+    holds underscores (common in embedded code — ``SYSTICK_HANDLER``), and
+    ``_`` is the single-character wildcard of LIKE.  Without the escape it
+    would match any character at that position.
+    """
+    if exact:
+        return _MACRO_EXACT_WHERE, name, "ORDER BY m.line, m.file_id"
+    esc = name.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    return _MACRO_PREFIX_WHERE, f"{esc}%", "ORDER BY m.name, m.line, m.file_id"
+
+
+def count_macros(
+    conn: sqlite3.Connection,
+    config_hash: str,
+    name: str,
+    exact: bool = False,
+) -> int:
+    """Count the macros that ``lookup_macro`` answers with.
+
+    Reports how many macros the name matches ALTOGETHER, thus a reader of
+    one page knows whether more exist.
+    """
+    where, param, _order = _macro_where(name, exact)
+    return conn.execute(
+        f"SELECT COUNT(*) FROM macros m WHERE {where}",
+        (config_hash, param),
+    ).fetchone()[0]
+
+
 def lookup_macro(
     conn: sqlite3.Connection,
     config_hash: str,
     name: str,
     exact: bool = False,
     limit: int = 50,
+    offset: int = 0,
 ) -> list[sqlite3.Row]:
     """Look up macros by name — exact or prefix match.
 
@@ -320,34 +362,24 @@ def lookup_macro(
     for symbols (exact name, exact name with definition preference,
     prefix LIKE).
 
-    The ``ESCAPE '\\'`` clause is required because macro names can legally
-    contain underscores (common in embedded code — ``SYSTICK_HANDLER``,
-    ``STM32F4XX_HAL_CONF_H``).  Without ESCAPE, ``_`` in LIKE is the
-    single-character wildcard and would match any character at that
-    position.  The three-step escaping (``\\\\``, ``\\%``, ``\\\\_``) makes
-    ``_`` and ``%`` match literally.
+    The order ends at ``m.file_id``, which is unique for one macro name
+    and line.  One name can be defined at the same line of two headers,
+    and SQLite may return such tied rows in any order, thus an OFFSET
+    over the name and the line alone could repeat one row and skip
+    another.
+
+    See ``_macro_where`` for the escaping of the LIKE pattern.
     """
     limit = min(limit, 100)
-    if exact:
-        return conn.execute(
-            """SELECT m.*, f.path AS file_path
-               FROM macros m
-               JOIN files f ON f.id = m.file_id
-               WHERE m.config_hash = ? AND m.name = ?
-               ORDER BY m.line
-               LIMIT ?""",
-            (config_hash, name, limit),
-        ).fetchall()
-
-    esc = name.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    where, param, order = _macro_where(name, exact)
     return conn.execute(
-        r"""SELECT m.*, f.path AS file_path
-           FROM macros m
-           JOIN files f ON f.id = m.file_id
-           WHERE m.config_hash = ? AND m.name LIKE ? ESCAPE '\'
-           ORDER BY m.name, m.line
-           LIMIT ?""",
-        (config_hash, f"{esc}%", limit),
+        f"""SELECT m.*, f.path AS file_path
+              FROM macros m
+              JOIN files f ON f.id = m.file_id
+             WHERE {where}
+             {order}
+             LIMIT ? OFFSET ?""",
+        (config_hash, param, limit, max(0, offset)),
     ).fetchall()
 
 

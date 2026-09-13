@@ -23,9 +23,10 @@ from typing import Annotated
 
 from pydantic import Field
 
-from fw_context_mcp.indexer.db import lookup_macro
+from fw_context_mcp.indexer.db import count_macros, lookup_macro
 from fw_context_mcp.mcp.handlers._search_fallbacks import _symbol_row_to_dict
 from fw_context_mcp.mcp.shared.context import _db_path
+from fw_context_mcp.mcp.shared.paging import clamp_offset, page_notice
 from fw_context_mcp.utils import abs_path, resolve_project_root
 
 # ``class`` comes from the parent symbol, and it is empty for a free
@@ -46,32 +47,53 @@ _OWNER_JOIN = """LEFT JOIN symbols p
 # the ``candidates`` list of the body tools, which ranks by reference
 # count; this listing is the complete one, and it must not shuffle between
 # two pages of the same walk.
+#
+# ``s.file_path`` and ``s.usr`` end the order.  A definition flag and a
+# line number tie constantly — line 1 of two headers, or two template
+# instantiations of one name — and SQLite may return tied rows in any
+# order, thus an OFFSET over those two columns alone could show one symbol
+# twice and hide another.  ``s.usr`` is unique within one build.
+_LOOKUP_ORDER = "ORDER BY s.is_definition DESC, s.line, s.file_path, s.usr"
+
+_LOOKUP_EXACT_WHERE = "s.config_hash=? AND (s.name=? OR s.qualified_name=?)"
+_LOOKUP_PREFIX_WHERE = (
+    r"s.config_hash=? AND (s.name LIKE ? ESCAPE '\' "
+    r"OR s.qualified_name LIKE ? ESCAPE '\')"
+)
+
 LOOKUP_EXACT_SQL = f"""SELECT s.*, {_OWNER_SQL} FROM symbols s
    {_OWNER_JOIN}
-   WHERE s.config_hash=? AND (s.name=? OR s.qualified_name=?)
-   ORDER BY s.is_definition DESC, s.line
+   WHERE {_LOOKUP_EXACT_WHERE}
+   {_LOOKUP_ORDER}
    LIMIT ? OFFSET ?"""
 
-LOOKUP_PREFIX_SQL = rf"""SELECT s.*, {_OWNER_SQL} FROM symbols s
+LOOKUP_PREFIX_SQL = f"""SELECT s.*, {_OWNER_SQL} FROM symbols s
    {_OWNER_JOIN}
-   WHERE s.config_hash=? AND (s.name LIKE ? ESCAPE '\' OR s.qualified_name LIKE ? ESCAPE '\')
-   ORDER BY s.is_definition DESC, s.line
+   WHERE {_LOOKUP_PREFIX_WHERE}
+   {_LOOKUP_ORDER}
    LIMIT ? OFFSET ?"""
+
+
+def _escape_like(text: str) -> str:
+    r"""Make ``_`` and ``%`` literal for a LIKE pattern.
+
+    An embedded name carries underscores by habit (``uart_init``), and
+    ``_`` is the single-character wildcard of LIKE.  Without the escape
+    ``uart_init`` would also match ``uartXinit``.
+    """
+    return text.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
+def _page_hint(name: str, next_offset: int) -> str:
+    """Spell out the call that reads the next page.
+
+    Every query of this tool now selects the owner column, thus each row
+    carries its class and each page carries the same fields.
+    """
+    return f"lookup_symbol('{name}', offset={next_offset}) reads the next page."
+
 
 log = logging.getLogger(__name__)
-
-
-def _owner_of(row) -> str:
-    """Read the ``owner`` column, or give ``""`` when the query omits it.
-
-    The fallback queries select ``s.*`` alone, thus a row from one of them
-    carries no owner.  A missing class is reported as no class, and never
-    as an error.
-    """
-    try:
-        return row["owner"] or ""
-    except (IndexError, KeyError):
-        return ""
 
 
 def lookup_symbol(
@@ -100,20 +122,24 @@ def lookup_symbol(
             all symbols starting with 'uart_'.
         project_root: Project directory. Auto-detected if omitted.
         exact: True = exact name match, False = prefix LIKE match (default).
-        limit: Maximum results (default 50).
+        limit: Maximum results of one page (default 50).
         offset: Skip this many results (default 0).  A common method name
             lives in many classes — ``read`` and ``write`` match dozens of
-            symbols — and this walks past the ones already seen.  The order
-            is stable (a definition first, then the line), thus two pages
-            never overlap and never skip a symbol.
+            symbols — and this walks past the ones already seen.  The page
+            notice names the offset to use.  The order is stable (a
+            definition first, then the line, then the file and the USR),
+            thus two pages never overlap and never skip a symbol.
         variant: Build variant (multi-build project). Omit to use
             default_variant. One query answers for ONE build.
         image: Sysbuild image within the variant. Required when the
             variant holds several: each image is a separate program.
 
     Returns:
-        list[dict]: Symbols with name, qualified_name, kind, file, line,
-        signature, docstring, is_definition, is_template, is_virtual,
+        list[dict]: The first is the page notice — ``total``, ``offset``,
+        ``shown``, ``more`` — where ``total`` counts every symbol the name
+        matches.  Read it before you conclude that a page holds them all.
+        Each symbol that follows has name, qualified_name, kind, file,
+        line, signature, docstring, is_definition, is_template, is_virtual,
         is_pure_virtual fields, and ``class`` — the class, struct or union
         that declares the symbol, absent for a free function.  ``class`` is
         what tells two same-name methods apart at a glance.
@@ -126,8 +152,10 @@ def lookup_symbol(
         ``llm_analysis``, and the code did not — use it to find a symbol,
         and quote ``signature``, ``docstring``, or ``get_source`` instead.
         When no results found, may include ``_did_you_mean`` with suggested
-        symbol names. When no symbol matches, the list is empty —
-        this tool gives no ``info`` entry for an empty result.
+        symbol names. When no symbol matches, the list is empty — there is
+        then no page notice, because there is no page.  An ``info`` entry
+        comes back for one case only: an offset past the end of an answer
+        that does hold rows.
 
         **Note:** C++ constructors share their name with the enclosing
         class, so ``lookup_symbol("Foo")`` may return both ``class Foo``
@@ -148,7 +176,26 @@ def lookup_symbol(
             return [{"error": f"No index found for {root}."}]
 
         limit = max(0, min(limit, 100))
-        skip = max(0, offset)
+        skip = clamp_offset(offset)
+
+        def _page(c: sqlite3.Connection, where: str, params: tuple) -> tuple[list, int]:
+            """Read one page of the symbols that *where* selects, and count them.
+
+            The page and the count run on the SAME text, thus ``total`` can
+            never describe another answer than the rows do.
+            """
+            rows = c.execute(
+                f"""SELECT s.*, {_OWNER_SQL} FROM symbols s
+                    {_OWNER_JOIN}
+                    WHERE {where}
+                    {_LOOKUP_ORDER}
+                    LIMIT ? OFFSET ?""",
+                (*params, limit, skip),
+            ).fetchall()
+            total = c.execute(
+                f"SELECT COUNT(*) FROM symbols s WHERE {where}", params,
+            ).fetchone()[0]
+            return rows, total
 
         def _do_lookup(c: sqlite3.Connection, config_hash: str) -> list[dict]:
             # ── Tier 1: Exact or prefix LIKE, no tokenization ──
@@ -156,45 +203,45 @@ def lookup_symbol(
             # being interpreted — e.g. "UART_DRIVER" must match the
             # literal underscore, not "UART+any_char+DRIVER".
             if exact:
-                rows = c.execute(
-                    LOOKUP_EXACT_SQL,
-                    (config_hash, name, name, limit, skip),
-                ).fetchall()
+                rows, total = _page(c, _LOOKUP_EXACT_WHERE, (config_hash, name, name))
             else:
-                esc = name.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
-                rows = c.execute(
-                    LOOKUP_PREFIX_SQL,
-                    (config_hash, f"{esc}%", f"{esc}%", limit, skip),
-                ).fetchall()
+                esc = _escape_like(name)
+                rows, total = _page(
+                    c, _LOOKUP_PREFIX_WHERE, (config_hash, f"{esc}%", f"{esc}%"),
+                )
 
             # Fallback: "Foo::bar" without namespace — extract short name, suffix-filter
             # WHY: users often type qualified names partially — e.g. "bar" when
             # they mean "ns::Foo::bar".  The short-name LIKE search finds broad
             # candidates; the suffix filter then narrows to exact matches.
-            if not rows and "::" in name:
+            #
+            # The gate is the COUNT and not the rows.  An offset past the end
+            # of a name that DID match leaves the page empty, and a fallback
+            # would then answer about another symbol under the first name.
+            #
+            # The suffix test is a LIKE and no longer a filter in Python.  A
+            # filter after the LIMIT cuts an unknown number of rows, thus
+            # neither the page nor the count would be the truth.
+            if total == 0 and "::" in name:
                 short_name = name.rsplit("::", 1)[-1]
+                suffix = f"%{_escape_like(name)}"
                 if exact:
-                    rows = c.execute(
-                        """SELECT s.* FROM symbols s
-                           WHERE s.config_hash=? AND (s.name=? OR s.qualified_name=?)
-                           ORDER BY s.is_definition DESC, s.line
-                           LIMIT ?""",
-                        (config_hash, short_name, short_name, limit * 2),
-                    ).fetchall()
+                    rows, total = _page(
+                        c,
+                        _LOOKUP_EXACT_WHERE + r" AND s.qualified_name LIKE ? ESCAPE '\'",
+                        (config_hash, short_name, short_name, suffix),
+                    )
                 else:
-                    esc2 = short_name.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
-                    rows = c.execute(
-                        r"""SELECT s.* FROM symbols s
-                           WHERE s.config_hash=? AND (s.name LIKE ? ESCAPE '\' OR s.qualified_name LIKE ? ESCAPE '\')
-                           ORDER BY s.is_definition DESC, s.line
-                           LIMIT ?""",
-                        (config_hash, f"{esc2}%", f"{esc2}%", limit * 2),
-                    ).fetchall()
-                rows = [r for r in rows if r["qualified_name"].endswith(name)][:limit]
+                    esc2 = _escape_like(short_name)
+                    rows, total = _page(
+                        c,
+                        _LOOKUP_PREFIX_WHERE + r" AND s.qualified_name LIKE ? ESCAPE '\'",
+                        (config_hash, f"{esc2}%", f"{esc2}%", suffix),
+                    )
 
             # Did-you-mean? suggestions when nothing matched
             _suggestions: list[str] = []
-            if not rows:
+            if total == 0:
                 try:
                     from ...search.did_you_mean import suggest as suggest_names
                     _suggestions = suggest_names(c, config_hash, name, limit=5)
@@ -202,9 +249,12 @@ def lookup_symbol(
                     pass  # suggestions are best-effort
 
             # Macro fallback: check the macros table
-            if not rows:
-                _macro_rows = lookup_macro(c, config_hash, name, exact=exact, limit=limit)
-                if _macro_rows:
+            if total == 0:
+                macro_total = count_macros(c, config_hash, name, exact=exact)
+                _macro_rows = lookup_macro(
+                    c, config_hash, name, exact=exact, limit=limit, offset=skip,
+                )
+                if macro_total:
                     result = [
                         {
                             "name": m["name"],
@@ -217,34 +267,42 @@ def lookup_symbol(
                         }
                         for m in _macro_rows
                     ]
+                    result.insert(0, page_notice(
+                        macro_total, skip, len(result),
+                        hint=_page_hint(name, skip + len(result)),
+                    ))
                     if _suggestions:
                         result.append({"_did_you_mean": _suggestions})
                     return result
 
             fallback_used = False
-            if not rows and _suggestions:
+            if total == 0 and _suggestions:
                 for suggestion in _suggestions[:3]:
-                    rows = c.execute(
-                        """SELECT s.* FROM symbols s
-                           WHERE s.config_hash=? AND (s.name=? OR s.qualified_name=?)
-                           ORDER BY s.is_definition DESC, s.line
-                           LIMIT ?""",
-                        (config_hash, suggestion, suggestion, limit),
-                    ).fetchall()
-                    if rows:
+                    rows, total = _page(
+                        c, _LOOKUP_EXACT_WHERE, (config_hash, suggestion, suggestion),
+                    )
+                    if total:
                         fallback_used = True
                         break
 
             result = [
                 _symbol_row_to_dict(
                     r, root,
-                    # ``class`` is empty for a free function, and the
-                    # fallback queries below do not select it at all.
-                    **({"class": _owner_of(r)} if _owner_of(r) else {}),
+                    # ``class`` is empty for a free function.
+                    **({"class": r["owner"]} if r["owner"] else {}),
                     **({"_fallback": True} if fallback_used else {}),
                 )
                 for r in rows
             ]
+            if result:
+                result.insert(0, page_notice(
+                    total, skip, len(result),
+                    hint=_page_hint(name, skip + len(result)),
+                ))
+            elif skip and total:
+                result.append({"info": (
+                    f"No symbol at offset {skip}; the answer holds {total}."
+                )})
             if _suggestions:
                 result.append({"_did_you_mean": _suggestions})
             return result
