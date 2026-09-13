@@ -138,20 +138,26 @@ row.
 
 ### Reading past the first page
 
-`find_callers` and `find_references` lead with a page notice:
+Seven tools take an `offset` and lead with a page notice: `lookup_symbol`,
+`search_bodies`, `search_content`, `find_callers`, `find_references`,
+`find_dead_code`, `find_hotspots`.
 
     {"total": 137, "offset": 0, "shown": 50, "more": true, "hint": "…"}
 
-It is ALWAYS there, thus a full page never leaves you guessing whether
-more exists. `total` counts every row the query matches; `more` says
-whether any are left.
+It is ALWAYS there when the answer holds a row, thus a full page never
+leaves you guessing whether more exists. `total` counts every row the
+query matches; `more` says whether any are left.
 
 - When `more` is true, call again with `offset=<offset + shown>`. The
   `hint` spells out that call.
-- Do NOT conclude "that is all the callers" from a page alone. Read
-  `total` — a hot function can have hundreds.
-- The order is stable (file, then line), thus two pages never overlap and
-  never skip a row.
+- Do NOT conclude "that is all of them" from a page alone. Read `total` —
+  a hot function can have hundreds of call sites, and a common name such
+  as `read` can name hundreds of symbols.
+- Each order is stable, thus two pages never overlap and never skip a
+  row. The tools order by what they answer about: a reference by file and
+  line, a symbol by definition first, a search by relevance and then by
+  identity.
+- An `info` row that names an offset means you walked past the end.
 
 ### Parameter names
 
