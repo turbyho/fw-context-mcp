@@ -138,9 +138,9 @@ row.
 
 ### Reading past the first page
 
-Seven tools take an `offset` and lead with a page notice: `lookup_symbol`,
-`search_bodies`, `search_content`, `find_callers`, `find_references`,
-`find_dead_code`, `find_hotspots`.
+Eight tools take an `offset` and lead with a page notice: `lookup_symbol`,
+`search_code`, `search_bodies`, `search_content`, `find_callers`,
+`find_references`, `find_dead_code`, `find_hotspots`.
 
     {"total": 137, "offset": 0, "shown": 50, "more": true, "hint": "…"}
 
