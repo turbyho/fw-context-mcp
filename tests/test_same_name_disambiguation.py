@@ -484,7 +484,7 @@ class TestAmbiguousAnswerStaysWithinItsPromises:
         The first version applied it per symbol, so a caller that asked for
         8 rows about an ambiguous name got 11.
         """
-        rows, _ = find_refs_with_candidates(db, CH, "probe", ref_kind=["call"], limit=3)
+        rows, _c, _t = find_refs_with_candidates(db, CH, "probe", ref_kind=["call"], limit=3)
         assert len(rows) == 3, f"asked for 3, got {len(rows)}"
 
     def test_every_symbol_appears_before_any_gets_a_second_row(self, db):
@@ -493,7 +493,7 @@ class TestAmbiguousAnswerStaysWithinItsPromises:
         A plain concatenation with a total cap would spend the budget on
         ClassA and hide ClassB completely.
         """
-        rows, _ = find_refs_with_candidates(db, CH, "probe", ref_kind=["call"], limit=2)
+        rows, _c, _t = find_refs_with_candidates(db, CH, "probe", ref_kind=["call"], limit=2)
         targets = {r["target_qualified_name"] for r in rows}
         assert targets == {"ClassA::probe", "ClassB::probe"}, f"got: {targets}"
 
@@ -509,7 +509,7 @@ class TestAmbiguousAnswerStaysWithinItsPromises:
         ])
         db.commit()
 
-        rows, candidates = find_refs_with_candidates(
+        rows, candidates, _total = find_refs_with_candidates(
             db, CH, "probe", ref_kind=["call"], limit=50
         )
         named = {c.qualified_name for c in candidates}

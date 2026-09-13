@@ -570,6 +570,39 @@ def _build_kind_filter(ref_kind: str | list[str] | None) -> tuple[str, list[str]
     return "AND r.ref_kind = ?", [ref_kind]
 
 
+def count_refs_for_symbol(
+    conn: sqlite3.Connection,
+    config_hash: str,
+    usr: str,
+    kind: str,
+    ref_kind: str | list[str] | None = None,
+) -> int:
+    """Count every reference of one symbol, ignoring any page bound.
+
+    A paged answer must say how much it does not show, thus the count runs
+    on the same conditions as the page and only the LIMIT differs.
+    """
+    kind_filter, kind_params = _build_kind_filter(ref_kind)
+    if kind in ("class", "struct", "enum"):
+        # The page groups its rows, thus the count must group them too.
+        row = conn.execute(
+            f"""SELECT COUNT(*) FROM (
+                    SELECT 1 FROM refs r
+                    LEFT JOIN symbols caller
+                      ON caller.config_hash = r.config_hash AND caller.usr = r.from_usr
+                    WHERE r.config_hash = ? AND r.to_usr LIKE ? {kind_filter}
+                    GROUP BY caller.qualified_name, r.from_file, r.from_line)""",
+            [config_hash, usr + "@%", *kind_params],
+        ).fetchone()
+        return row[0] if row else 0
+    row = conn.execute(
+        f"""SELECT COUNT(*) FROM refs r
+            WHERE r.config_hash = ? AND r.to_usr = ? {kind_filter}""",
+        [config_hash, usr, *kind_params],
+    ).fetchone()
+    return row[0] if row else 0
+
+
 def refs_for_symbol(
     conn: sqlite3.Connection,
     config_hash: str,
@@ -577,6 +610,7 @@ def refs_for_symbol(
     kind: str,
     ref_kind: str | list[str] | None = None,
     limit: int = 50,
+    offset: int = 0,
 ) -> list[sqlite3.Row]:
     """Return the reference rows of ONE symbol, named by its USR.
 
@@ -593,6 +627,10 @@ def refs_for_symbol(
     a USR prefix (``to_usr LIKE usr || '@%'``) to reach every member.
     GROUP BY deduplicates when several members are referenced on one line,
     as in ``obj.a = obj.b``.
+
+    ``(from_file, from_line)`` orders the rows and no two references of one
+    symbol share both, thus *offset* walks the answer without repeating a
+    row or stepping over one.
     """
     kind_filter, kind_params = _build_kind_filter(ref_kind)
 
@@ -609,22 +647,22 @@ def refs_for_symbol(
                  WHERE r.config_hash = ?"""
 
     if kind in ("class", "struct", "enum"):
-        params: list = [config_hash, usr + "@%"] + kind_params + [limit]
+        params: list = [config_hash, usr + "@%"] + kind_params + [limit, offset]
         return conn.execute(
             f"""{_SELECT}
                   AND r.to_usr LIKE ? {kind_filter}
                 GROUP BY caller.qualified_name, r.from_file, r.from_line
                 ORDER BY r.from_file, r.from_line
-                LIMIT ?""",
+                LIMIT ? OFFSET ?""",
             params,
         ).fetchall()
 
-    params = [config_hash, usr] + kind_params + [limit]
+    params = [config_hash, usr] + kind_params + [limit, offset]
     return conn.execute(
         f"""{_SELECT}
               AND r.to_usr = ? {kind_filter}
             ORDER BY r.from_file, r.from_line
-            LIMIT ?""",
+            LIMIT ? OFFSET ?""",
         params,
     ).fetchall()
 
@@ -635,8 +673,9 @@ def find_refs_with_candidates(
     name: str,
     ref_kind: str | list[str] | None = None,
     limit: int = 50,
-) -> tuple[list, list]:
-    """Give ``(rows, candidates)`` — the references and what the name matched.
+    offset: int = 0,
+) -> tuple[list, list, int]:
+    """Give ``(rows, candidates, total)`` for one page of the references.
 
     Name resolution goes through :func:`~._resolve.resolve_candidates`,
     which ranks a match on its specificity: an exact ``qualified_name``
@@ -658,43 +697,62 @@ def find_refs_with_candidates(
     symbols and 5 of them had callers, and a notice built from the rows
     alone told the reader that the name matched 5.
 
-    *limit* bounds the TOTAL, as the tools promise.  The rows are taken one
-    per symbol in turn, thus every symbol appears before any symbol gets a
-    second row, and a symbol with many references cannot crowd out a symbol
-    with few.
+    *total* counts the references of every matched symbol, thus a paged
+    answer can say how much it does not show.
+
+    *limit* bounds the page.  The rows are taken one per symbol in turn,
+    thus every symbol appears before any symbol gets a second row, and a
+    symbol with many references cannot crowd out a symbol with few.
+
+    WHY *offset* skips the MERGED list and not each symbol's own: giving
+    the offset to every symbol query would walk each symbol past its own
+    rows, and the interleave would then step over the rows between.  Page 2
+    of a three-symbol answer would jump from row 4 to row 13 and never show
+    the eight between.  Each symbol therefore fetches ``offset + limit``
+    rows, the merge runs, and the slice comes last — which is what a plain
+    SQL OFFSET does anyway.
     """
     from ._resolve import resolve_candidates
 
     candidates = resolve_candidates(conn, config_hash, name)
     if not candidates:
-        return [], []
+        return [], [], 0
 
     if len(candidates) == 1:
         only = candidates[0]
         rows = refs_for_symbol(
-            conn, config_hash, only.usr, only.kind, ref_kind=ref_kind, limit=limit,
+            conn, config_hash, only.usr, only.kind,
+            ref_kind=ref_kind, limit=limit, offset=offset,
         )
-        return rows, candidates
+        total = count_refs_for_symbol(
+            conn, config_hash, only.usr, only.kind, ref_kind=ref_kind
+        )
+        return rows, candidates, total
 
     # sqlite3.Row takes no new key, thus each row is wrapped rather than
     # copied into a dict.  A dict here would change what every caller of
     # this function receives, and only the ambiguous answer needs the tag.
+    reach = offset + limit
     per_symbol: list[list] = []
+    total = 0
     for candidate in candidates:
         rows = refs_for_symbol(
             conn, config_hash, candidate.usr, candidate.kind,
-            ref_kind=ref_kind, limit=limit,
+            ref_kind=ref_kind, limit=reach,
         )
         per_symbol.append([_TaggedRef(row, candidate) for row in rows])
+        total += count_refs_for_symbol(
+            conn, config_hash, candidate.usr, candidate.kind, ref_kind=ref_kind
+        )
 
     merged: list = []
     for depth in range(max((len(rows) for rows in per_symbol), default=0)):
         for rows in per_symbol:
             if depth < len(rows):
                 merged.append(rows[depth])
-                if len(merged) >= limit:
-                    return merged, candidates
-    return merged, candidates
+                if len(merged) >= reach:
+                    return merged[offset:reach], candidates, total
+    return merged[offset:reach], candidates, total
 
 
 def find_refs(
@@ -710,7 +768,7 @@ def find_refs(
     rows only.  See that function for the resolution rules and for what an
     ambiguous name does to the answer.
     """
-    rows, _ = find_refs_with_candidates(
+    rows, _candidates, _total = find_refs_with_candidates(
         conn, config_hash, name, ref_kind=ref_kind, limit=limit
     )
     return rows

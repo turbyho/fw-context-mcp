@@ -77,6 +77,7 @@ from ...indexer.intlist import read_isr_registrations
 from ...utils import abs_path
 from ...utils import escape_like as _escape_like
 from ...utils import format_number_ranges as _as_ranges
+from ..shared.paging import clamp_offset, page_notice
 from ._base import BaseHandler, DbContext
 from .source import _lookup_definition
 
@@ -206,7 +207,7 @@ def _resolve_virtual_callers(conn, config_hash: str, usr: str, root, ref_kind: l
 
 
 # ── moved from server.py ──
-def _references_result(name: str, project_root: str | None, ref_kind: str | list[str] | None, limit: int, *, caller_mode: bool = False, variant: str | None = None, image: str | None = None) -> list[dict]:
+def _references_result(name: str, project_root: str | None, ref_kind: str | list[str] | None, limit: int, *, caller_mode: bool = False, offset: int = 0, variant: str | None = None, image: str | None = None) -> list[dict]:
     """Shared logic for ``find_callers`` and ``find_references``.
 
     Resolves the project, opens the DB, looks up the symbol, checks that refs
@@ -221,11 +222,14 @@ def _references_result(name: str, project_root: str | None, ref_kind: str | list
         project_root: Project root directory.
         ref_kind: Reference kind filter (``["call", "indirect"]`` for callers,
             ``None`` for all kinds).
-        limit: Maximum results.
+        limit: Maximum results of one page.
         caller_mode: If True, use "callers" in info messages instead of "references".
+        offset: How many rows to walk past before the page begins.
 
     Returns:
-        list of dicts, each with: file, line, ref_kind, caller, caller_kind.
+        list of dicts.  The first is the page notice — ``total``, ``offset``,
+        ``shown``, ``more`` — and each that follows holds: file, line,
+        ref_kind, caller, caller_kind.
     """
     try:
         db = BaseHandler.resolve_db_context(project_root, variant=variant, image=image)
@@ -303,9 +307,11 @@ def _references_result(name: str, project_root: str | None, ref_kind: str | list
                 "they may have been disabled with [index] index_refs = false. "
                 "Re-run 'fw-context index' to rebuild with refs enabled."
             )}]
-        clamped_limit = max(0, min(limit, 200))
-        rows, candidates = find_refs_with_candidates(
-            conn, config_hash, name, ref_kind=ref_kind, limit=clamped_limit
+        clamped_limit = max(1, min(limit, 200))
+        skip = clamp_offset(offset)
+        rows, candidates, total = find_refs_with_candidates(
+            conn, config_hash, name, ref_kind=ref_kind,
+            limit=clamped_limit, offset=skip,
         )
         if not rows:
             # When zero refs are recorded for this specific symbol, try
@@ -321,6 +327,11 @@ def _references_result(name: str, project_root: str | None, ref_kind: str | list
                     return [{"info": f"No {label} found for '{name}'."}]
                 return virtual_result
             label = "callers" if caller_mode else "references"
+            if skip and total:
+                return [{"info": (
+                    f"No {label} of '{name}' at offset {skip}; the answer "
+                    f"holds {total}."
+                )}]
             return [{"info": f"No {label} found for '{name}'."}]
         # The rows carry a tag only when the name matched several symbols.
         tagged = len(candidates) > 1
@@ -335,12 +346,17 @@ def _references_result(name: str, project_root: str | None, ref_kind: str | list
             }
             for r in rows
         ]
+        label = "callers" if caller_mode else "references"
+        tool = "find_callers" if caller_mode else "find_references"
+        result.insert(0, page_notice(
+            total, skip, len(rows),
+            hint=f"{tool}('{name}', offset={skip + len(rows)}) reads the next page.",
+        ))
         if tagged:
             # Every symbol that the name matched is named, and NOT only the
             # ones that a row came from.  Measured on one firmware index,
             # ``getMember`` matched 18 symbols and 5 of them had callers; a
             # notice built from the rows told the reader it matched 5.
-            label = "callers" if caller_mode else "references"
             result.insert(0, ambiguity_notice(name, candidate_labels(candidates), label))
         return result
 
@@ -350,7 +366,8 @@ def _references_result(name: str, project_root: str | None, ref_kind: str | list
 def find_callers(
     name: Annotated[str, Field(description="Symbol name to find callers of. Returns direct call sites and indirect calls via function pointers.")],
     project_root: Annotated[str | None, Field(description="Project root. Auto-detected if omitted.")] = None,
-    limit: Annotated[int, Field(description="Maximum results.")] = 50,
+    limit: Annotated[int, Field(description="Maximum results of one page.")] = 50,
+    offset: Annotated[int, Field(description="Skip this many results. Reads the next page of a symbol with many call sites.")] = 0,
     variant: Annotated[str | None, Field(description="Build variant (multi-build project). Omit to use default_variant. One query answers for ONE build.")] = None,
     image: Annotated[str | None, Field(description="Sysbuild image within the variant. Required when the variant holds several: each image is a separate program.")] = None,
 ) -> list[dict]:
@@ -390,7 +407,9 @@ def find_callers(
             resolution as ``find_references`` (exact name, exact qualified,
             suffix LIKE).
         project_root: Project root directory. Auto-detected if omitted.
-        limit: Maximum results (default 50).
+        limit: Maximum results of one page (default 50).
+        offset: Skip this many results. Reads the next page of a symbol
+            with many call sites; the page notice names the offset to use.
         variant: Build variant (multi-build project). Omit to use
             default_variant. One query answers for ONE build.
         image: Sysbuild image within the variant. Required when the
@@ -412,13 +431,14 @@ def find_callers(
         Never empty: one dict with ``error`` (symbol not resolved) or
         ``info`` (no references of this kind).  Check both keys first.
     """
-    return _references_result(name, project_root, ref_kind=["call", "indirect", "implicit_construct"], limit=limit, caller_mode=True, variant=variant, image=image)
+    return _references_result(name, project_root, ref_kind=["call", "indirect", "implicit_construct"], limit=limit, caller_mode=True, offset=offset, variant=variant, image=image)
 
 # ── moved from server.py ──
 def find_references(
     name: Annotated[str, Field(description="Symbol name to find all references of — calls, reads, member accesses.")],
     project_root: Annotated[str | None, Field(description="Project root. Auto-detected if omitted.")] = None,
-    limit: Annotated[int, Field(description="Maximum results.")] = 50,
+    limit: Annotated[int, Field(description="Maximum results of one page.")] = 50,
+    offset: Annotated[int, Field(description="Skip this many results. Reads the next page of a symbol with many references.")] = 0,
     variant: Annotated[str | None, Field(description="Build variant (multi-build project). Omit to use default_variant. One query answers for ONE build.")] = None,
     image: Annotated[str | None, Field(description="Sysbuild image within the variant. Required when the variant holds several: each image is a separate program.")] = None,
 ) -> list[dict]:
@@ -444,7 +464,9 @@ def find_references(
     Args:
         name: Symbol name to find all references of.
         project_root: Project root directory. Auto-detected if omitted.
-        limit: Maximum results (default 50, max 200).
+        limit: Maximum results of one page (default 50, max 200).
+        offset: Skip this many results. Reads the next page of a symbol
+            with many references; the page notice names the offset to use.
         variant: Build variant (multi-build project). Omit to use
             default_variant. One query answers for ONE build.
         image: Sysbuild image within the variant. Required when the
@@ -469,7 +491,7 @@ def find_references(
         Never empty: one dict with ``error`` (symbol not resolved) or
         ``info`` (no references).  Check both keys first.
     """
-    return _references_result(name, project_root, ref_kind=None, limit=limit, variant=variant, image=image)
+    return _references_result(name, project_root, ref_kind=None, limit=limit, offset=offset, variant=variant, image=image)
 
 # ── moved from server.py ──
 def find_indirect_call_sites(

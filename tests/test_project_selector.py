@@ -436,6 +436,18 @@ def test_every_copy_of_the_instructions_says_one_query_one_build():
         assert "twice" in text, f"{label}: no way given to compare two builds"
 
 
+def test_every_copy_of_the_instructions_teaches_paging():
+    """A reader that misses this stops at the first page and calls it all.
+
+    A full page is indistinguishable from a complete answer without the
+    count, thus the notice is always present and the text must say so.
+    """
+    for label, text in _instruction_copies():
+        assert "offset" in text, label
+        assert "total" in text, label
+        assert "more" in text, label
+
+
 def test_no_copy_of_the_instructions_holds_a_dead_file():
     """``data/instructions.md`` is gone.  Nothing may point a reader at it."""
     from pathlib import Path
