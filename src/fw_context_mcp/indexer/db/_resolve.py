@@ -419,20 +419,43 @@ def name_list(qualified_names: list[str]) -> str:
     return text
 
 
-def ambiguity_notice(name: str, qualified_names: list[str], relation: str) -> dict[str, str]:
+def ambiguity_notice(
+    name: str,
+    qualified_names: list[str],
+    relation: str,
+    total: int | None = None,
+) -> dict[str, str]:
     """Build the row that reports a name with more than one symbol.
 
     *relation* names the rows that come after it, for example ``callers``.
 
-    WHY the names go in the message text, and not in a second key:
-    ``handlers/_base.py`` lifts a row whose key set is exactly
-    ``{"warning"}`` out of the results of each build variant, removes the
-    duplicates, and puts one copy in front.  A row with a second key does
-    not take that path.  It stays in the middle of the rows, where a
-    reader that looks at the first row does not see it.
+    *total* is how many symbols the name matches ALTOGETHER, from
+    :func:`count_candidates`.  It matters because the list of names that
+    reaches this function is cut at ``MAX_TRAVERSED_TARGETS``, and the
+    exact number is known: without it a full list could only be reported
+    as "more than 50", while ``get_source`` answered for the same name
+    with an exact ``candidates_total``.  A reader who saw both had no way
+    to tell that the two described one ambiguity.  Measured on one
+    firmware index, ``size`` matches 132 symbols.
+
+    ``None`` falls back to the length of the list, for a caller that
+    cannot count — the notice is then honest about being a lower bound.
+
+    WHY the names go in the message text, and not in a second key: these
+    tools answer with a list of rows and have nowhere to put a key that
+    belongs to the whole answer.  A leading row that holds ``warning``
+    alone is the shape the project already uses for such a fact —
+    ``with_stale_annotation`` in ``mcp/shared/stale.py`` prepends the same
+    one — thus the count and the names travel inside that text.
     """
-    capped = len(qualified_names) >= MAX_AMBIGUOUS_TARGETS
-    count = f"more than {MAX_AMBIGUOUS_TARGETS}" if capped else str(len(qualified_names))
+    walked = len(qualified_names)
+    matched = walked if total is None else total
+    # The walk is what a row can come from, thus the cap is about the walk
+    # and not about the count.
+    capped = walked >= MAX_AMBIGUOUS_TARGETS or matched > walked
+    count = str(matched) if total is not None else (
+        f"more than {MAX_AMBIGUOUS_TARGETS}" if capped else str(walked)
+    )
     message = (
         f"The name '{name}' matches {count} symbols. The {relation} of them "
         f"are in the rows below: {name_list(qualified_names)}. Each row has "
@@ -441,7 +464,8 @@ def ambiguity_notice(name: str, qualified_names: list[str], relation: str) -> di
     )
     if capped:
         message += (
-            f" The query used the first {MAX_AMBIGUOUS_TARGETS} symbols only,"
-            f" thus a symbol of this name can be missing from the rows."
+            f" The query used the first {min(walked, MAX_AMBIGUOUS_TARGETS)} "
+            f"symbols only, thus a symbol of this name can be missing from "
+            f"the rows."
         )
     return {"warning": message}

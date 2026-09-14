@@ -1098,6 +1098,40 @@ def _step_build_overrides(conn: sqlite3.Connection, ctx: dict) -> None:
     conn.commit()
 
 
+#: The innermost CALLABLE definition that contains ``refs.from_line``.
+#:
+#: The kind filter is the whole point.  Without it the innermost
+#: definition around a reference is very often not a caller at all, and
+#: the smallest span wins, which favours exactly the wrong symbols.
+#: Measured on one firmware index over the call-like references that had
+#: no caller: a ``varglobal`` would have been named 1219 times, a ``class``
+#: 455 and a ``struct`` 105, against 629 real callables.  The two shapes
+#: behind those numbers are ordinary embedded C and C++ — a static table of
+#: function pointers, which is a variable whose initializer holds the
+#: callee, and a member initializer inside a class body.  Neither calls
+#: anything.
+#:
+#: A false edge here is permanent: ``refs`` has no column that records
+#: where a row came from, thus nothing downstream can tell a repaired edge
+#: from one that libclang made.  A missing edge shows up as an empty
+#: answer, which a reader can test.
+#:
+#: The text is one constant because the UPDATE below runs it in the SET and
+#: again in the WHERE.  Two copies would drift, and the step would then
+#: count rows it did not repair.
+_ENCLOSING_CALLABLE_SQL = """
+    SELECT s.usr FROM symbols s
+    WHERE s.config_hash = refs.config_hash
+      AND s.file_path = refs.from_file
+      AND s.is_definition = 1
+      AND s.kind IN ('function', 'method', 'constructor', 'destructor')
+      AND s.end_line > s.line
+      AND s.line <= refs.from_line
+      AND s.end_line >= refs.from_line
+    ORDER BY (s.end_line - s.line) ASC
+    LIMIT 1"""
+
+
 def _step_repair_from_usr(conn: sqlite3.Connection, ctx: dict) -> None:
     """Give a caller to each reference that the AST walk left without one.
 
@@ -1115,10 +1149,18 @@ def _step_repair_from_usr(conn: sqlite3.Connection, ctx: dict) -> None:
     738 call references had no caller, and 697 of them were inside a known
     definition.
 
-    The repair takes the innermost definition that contains the line.  The
-    innermost one is correct, because a lambda inside a method is the real
-    caller.  A reference with no enclosing definition keeps its NULL: it is
-    at file scope, which is a fact and not a gap.
+    The repair takes the innermost CALLABLE definition that contains the
+    line — see ``_ENCLOSING_CALLABLE_SQL`` for why the kind filter carries
+    the correctness of this step.  The innermost one is right, because a
+    lambda inside a method is the real caller.  A reference with no
+    enclosing callable keeps its NULL: it is at file scope, or inside a
+    variable initializer or a class body, and none of those calls
+    anything.  That is a fact, not a gap.
+
+    Every reference kind is repaired and not only ``call``.  A ``member``
+    or a plain ``ref`` answers ``find_references``, which reports the
+    caller of each row, thus a NULL there is the same hole in a different
+    tool.
 
     This step runs BEFORE the cross-TU backfill, which skips a line that
     already has a reference and must thus see the repaired rows.
@@ -1128,18 +1170,38 @@ def _step_repair_from_usr(conn: sqlite3.Connection, ctx: dict) -> None:
     the fact cannot cause one.
     """
     config_hash = ctx["config_hash"]
+
+    # ``idx_refs_unique`` covers ``from_usr``, and SQLite reads two NULLs
+    # as distinct values.  A gap row and its already-resolved twin can
+    # therefore both exist, and writing the caller into the gap row would
+    # collide and abort the whole index run.  The gap row is the redundant
+    # one, thus it goes.
+    conn.execute(
+        f"""DELETE FROM refs
+            WHERE config_hash = ? AND from_usr IS NULL
+              AND EXISTS (
+                  SELECT 1 FROM refs other
+                  WHERE other.config_hash = refs.config_hash
+                    AND other.to_usr     = refs.to_usr
+                    AND other.from_file  = refs.from_file
+                    AND other.from_line  = refs.from_line
+                    AND other.ref_kind   = refs.ref_kind
+                    AND other.from_usr   = ({_ENCLOSING_CALLABLE_SQL}))""",
+        (config_hash,),
+    )
+
+    # ``OR IGNORE`` covers what the DELETE cannot reach: two gap rows that
+    # are alike in every other column resolve to one caller, and the
+    # second write would then collide with the first.  Skipping it leaves
+    # the row as it was, which is what it already was.
+    #
+    # The WHERE repeats the subquery so that a row with no enclosing
+    # callable is not "updated" to the NULL it already holds.  Without it
+    # ``rowcount`` would report every gap as repaired.
     cur = conn.execute(
-        """UPDATE refs SET from_usr = (
-               SELECT s.usr FROM symbols s
-               WHERE s.config_hash = refs.config_hash
-                 AND s.file_path = refs.from_file
-                 AND s.is_definition = 1
-                 AND s.end_line > s.line
-                 AND s.line <= refs.from_line
-                 AND s.end_line >= refs.from_line
-               ORDER BY (s.end_line - s.line) ASC
-               LIMIT 1)
-           WHERE config_hash = ? AND from_usr IS NULL""",
+        f"""UPDATE OR IGNORE refs SET from_usr = ({_ENCLOSING_CALLABLE_SQL})
+            WHERE config_hash = ? AND from_usr IS NULL
+              AND ({_ENCLOSING_CALLABLE_SQL}) IS NOT NULL""",
         (config_hash,),
     )
     conn.commit()

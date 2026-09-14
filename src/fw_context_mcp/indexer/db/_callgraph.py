@@ -73,6 +73,7 @@ from fw_context_mcp.utils import format_number_ranges
 from ._resolve import (
     MAX_AMBIGUOUS_TARGETS,
     ambiguity_notice,
+    count_candidates,
     resolve_usr,
     resolve_usrs,
 )
@@ -103,12 +104,38 @@ _resolve_target_usr = resolve_usr
 _ambiguity_notice = ambiguity_notice
 
 
+def _matched_total(
+    conn: sqlite3.Connection, config_hash: str, name: str, targets: list[str]
+) -> int | None:
+    """Count every symbol that *name* matches, or ``None`` when it cannot.
+
+    The notice reports how many symbols a name means, and the walk that
+    feeds it is cut at ``MAX_TRAVERSED_TARGETS``.  The exact number is one
+    COUNT away, and without it two tools describe one ambiguity with two
+    different numbers — see :func:`~._resolve.ambiguity_notice`.
+
+    *targets* is the resolved walk.  One target means one symbol, the
+    notice never appears, and the count would answer nobody — thus it is
+    not run.  A failed count gives ``None`` rather than a wrong number:
+    the notice then falls back to the length of the walk, which is a lower
+    bound and says so.
+    """
+    if len(targets) <= 1:
+        return None
+    try:
+        return count_candidates(conn, config_hash, name)
+    except sqlite3.Error:
+        log.exception("counting the candidates of '%s' failed", name)
+        return None
+
+
 def _rows_with_targets(
     rows: list[sqlite3.Row],
     name: str,
     target_usrs: list[str],
     target_names: list[str],
     relation: str,
+    total: int | None = None,
 ) -> list[dict]:
     """Make the answer from the query rows, and label an ambiguous one.
 
@@ -116,6 +143,10 @@ def _rows_with_targets(
     the row belongs to.  A USR tells a reader nothing, thus the column
     becomes ``target_qualified_name`` when the name was ambiguous, and it
     goes away when the name was not.
+
+    *total* is how many symbols the name matches altogether; it reaches
+    the notice so that this tool and the one-body tools agree on one
+    number.
 
     WHY the key is absent for a single target: it would then hold the same
     value on each row and add nothing, and the tools have readers and
@@ -131,12 +162,16 @@ def _rows_with_targets(
             row["target_qualified_name"] = usr_to_name.get(target_usr, "?")
         out.append(row)
     if ambiguous and out:
-        out.insert(0, _ambiguity_notice(name, target_names, relation))
+        out.insert(0, _ambiguity_notice(name, target_names, relation, total))
     return out
 
 
 def _paths_with_targets(
-    paths: list[dict], to_name: str, to_usrs: list[str], to_names: list[str]
+    paths: list[dict],
+    to_name: str,
+    to_usrs: list[str],
+    to_names: list[str],
+    total: int | None = None,
 ) -> list[dict]:
     """Name the target of each path, and label an ambiguous search.
 
@@ -152,7 +187,7 @@ def _paths_with_targets(
         target_usr = str(path.get("target_usr") or "")
         path["target_qualified_name"] = usr_to_name.get(target_usr, "?")
     if paths:
-        paths.insert(0, _ambiguity_notice(to_name, to_names, "call paths"))
+        paths.insert(0, _ambiguity_notice(to_name, to_names, "call paths", total))
     return paths
 
 
@@ -355,6 +390,9 @@ def find_call_path(
     to_usrs, to_names = _resolve_target_usrs(conn, config_hash, to_name)
     if not from_usrs or not to_usrs:
         return []
+    # Counted once here, because four returns below build the same notice
+    # and they must all report the same number.
+    to_total = _matched_total(conn, config_hash, to_name, to_usrs)
     from_usr = from_usrs[0]
     from_usr_set: set[str] = set(from_usrs)
     _to_variants: set[str] = set(to_usrs)
@@ -504,7 +542,7 @@ def find_call_path(
                     "chain": f"{from_name_resolved} → {callee_name}",
                     "target_usr": to_usr_edge,
                 }],
-                to_name, to_usrs, to_names,
+                to_name, to_usrs, to_names, to_total,
             )
 
     # ── Bidirectional BFS — expands forward from source AND reverse from target
@@ -560,7 +598,8 @@ def find_call_path(
                     tail = " → ".join(r_parts[1:])  # skip meeting node (already in f_chain)
                     chain = f_chain[v] if not tail else f"{f_chain[v]} → {tail}"
                     if _record_path(found, seen_chains, total_depth, chain, r_target[v]):
-                        return _paths_with_targets(found, to_name, to_usrs, to_names)
+                        return _paths_with_targets(
+                            found, to_name, to_usrs, to_names, to_total)
 
         # ── Expand reverse (incoming edges) ──
         for _ in range(len(r_queue)):
@@ -580,9 +619,10 @@ def find_call_path(
                     tail = " → ".join(r_parts[1:])
                     chain = f_chain[v] if not tail else f"{f_chain[v]} → {tail}"
                     if _record_path(found, seen_chains, total_depth, chain, r_target[v]):
-                        return _paths_with_targets(found, to_name, to_usrs, to_names)
+                        return _paths_with_targets(
+                            found, to_name, to_usrs, to_names, to_total)
 
-    return _paths_with_targets(found, to_name, to_usrs, to_names)
+    return _paths_with_targets(found, to_name, to_usrs, to_names, to_total)
 
 
 
@@ -689,7 +729,10 @@ def find_all_callers_recursive(
 
     rows = conn.execute(query, params).fetchall()
 
-    return _rows_with_targets(rows, name, target_usrs, target_names, "callers")
+    return _rows_with_targets(
+        rows, name, target_usrs, target_names, "callers",
+        _matched_total(conn, config_hash, name, target_usrs),
+    )
 
 
 def find_callees_recursive(
@@ -783,7 +826,10 @@ def find_callees_recursive(
 
     rows = conn.execute(query, params).fetchall()
 
-    return _rows_with_targets(rows, name, source_usrs, source_names, "callees")
+    return _rows_with_targets(
+        rows, name, source_usrs, source_names, "callees",
+        _matched_total(conn, config_hash, name, source_usrs),
+    )
 
 
 def count_dead_code(

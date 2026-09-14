@@ -48,6 +48,7 @@ from fw_context_mcp.indexer.db._resolve import (
     Candidate,
     ambiguity_notice,
     candidate_labels,
+    count_candidates,
 )
 from fw_context_mcp.mcp.handlers.source import (
     _ambiguity,
@@ -87,9 +88,20 @@ def _symbol_row(
     )
 
 
-def _ref_row(to_usr: str, from_file: str, from_line: int, from_usr: str | None) -> tuple:
-    """Build one ``call`` row for insert_refs_batch.  The tail is slot_index."""
-    return (CH, to_usr, from_file, from_line, from_usr, "call", None)
+def _ref_row(
+    to_usr: str,
+    from_file: str,
+    from_line: int,
+    from_usr: str | None,
+    ref_kind: str = "call",
+) -> tuple:
+    """Build one reference row for insert_refs_batch.  The tail is slot_index.
+
+    *ref_kind* is a parameter because a function-pointer table writes
+    ``indirect`` rows, and that is the shape the repair below has to get
+    right — see ``TestRepairFromUsr``.
+    """
+    return (CH, to_usr, from_file, from_line, from_usr, ref_kind, None)
 
 
 @pytest.fixture
@@ -242,18 +254,34 @@ class TestRepairFromUsr:
 
     @pytest.fixture
     def db_with_gaps(self, db):
-        """Add three references that the AST walk left without a caller."""
+        """Add the references that the AST walk left without a caller.
+
+        The last two carry the shapes that dominate a real index: a static
+        function-pointer table, which is a ``varglobal`` that spans lines,
+        and a member initializer inside a ``class`` body.  Measured on one
+        firmware index, a repair with no kind filter named a ``varglobal``
+        1219 times and a ``class`` 455 times, against 629 real callables.
+        """
         fid = upsert_file(db, CH, "src/gap.cpp", "cpp")
         insert_symbols_batch(db, [
             # An outer method and a lambda inside it, to test the innermost pick.
             _symbol_row(fid, "src/gap.cpp", "outer", "Gap::outer", "u_outer", 10, 90),
             _symbol_row(fid, "src/gap.cpp", "inner", "Gap::outer::lambda", "u_inner", 40, 50),
             _symbol_row(fid, "src/gap.cpp", "callee", "Gap::callee", "u_callee", 200, 210),
+            # A static table of function pointers.  It holds the callee, and
+            # it calls nothing: a variable is not a caller.
+            _symbol_row(fid, "src/gap.cpp", "gapFcnTable", "gapFcnTable", "u_table",
+                        300, 310, kind="varglobal"),
+            # A class whose body holds a reference outside of any method.
+            _symbol_row(fid, "src/gap.cpp", "Holder", "Holder", "u_holder",
+                        400, 450, kind="class"),
         ])
         insert_refs_batch(db, [
             _ref_row("u_callee", "src/gap.cpp", 20, None),    # inside outer only
             _ref_row("u_callee", "src/gap.cpp", 45, None),    # inside outer AND the lambda
             _ref_row("u_callee", "src/gap.cpp", 500, None),   # inside nothing — file scope
+            _ref_row("u_callee", "src/gap.cpp", 305, None, ref_kind="indirect"),
+            _ref_row("u_callee", "src/gap.cpp", 405, None),
         ])
         db.commit()
         return db
@@ -279,6 +307,46 @@ class TestRepairFromUsr:
         """A NULL there is a fact, not a gap, thus the repair leaves it."""
         _step_repair_from_usr(db_with_gaps, {"config_hash": CH})
         assert self._callers_of(db_with_gaps, 500) is None
+
+    def test_a_function_pointer_table_is_not_a_caller(self, db_with_gaps):
+        """A static table of function pointers holds a callee; it calls none.
+
+        The row sits inside the initializer of a ``varglobal``, thus the
+        innermost definition around it is a variable.  A variable that
+        reads as a caller is a false edge, and ``refs`` records no
+        provenance — nothing downstream can tell it from a real one.
+        """
+        _step_repair_from_usr(db_with_gaps, {"config_hash": CH})
+        assert self._callers_of(db_with_gaps, 305) is None
+
+    def test_a_class_body_is_not_a_caller(self, db_with_gaps):
+        """A member initializer sits in the class, and a class calls nothing."""
+        _step_repair_from_usr(db_with_gaps, {"config_hash": CH})
+        assert self._callers_of(db_with_gaps, 405) is None
+
+    def test_the_repair_runs_twice_without_failing(self, db_with_gaps):
+        """A second index run meets the rows that the first one repaired.
+
+        ``idx_refs_unique`` covers ``from_usr`` and SQLite reads two NULLs
+        as distinct, thus a NULL row and its repaired twin can both exist.
+        Writing the same USR into the NULL one would then collide, and the
+        UPDATE would abort the whole index run.
+        """
+        insert_refs_batch(db_with_gaps, [
+            _ref_row("u_callee", "src/gap.cpp", 20, "u_outer"),
+        ])
+        db_with_gaps.commit()
+
+        _step_repair_from_usr(db_with_gaps, {"config_hash": CH})
+
+        rows = db_with_gaps.execute(
+            "SELECT from_usr FROM refs WHERE config_hash = ? AND from_file = ?"
+            " AND from_line = ?",
+            (CH, "src/gap.cpp", 20),
+        ).fetchall()
+        # The duplicate is dropped rather than written twice, and the row
+        # that survives names the caller.
+        assert [r["from_usr"] for r in rows] == ["u_outer"], f"got: {rows}"
 
     def test_the_repair_makes_the_caller_visible_in_the_graph(self, db_with_gaps):
         """This is the defect that the report was about, end to end.
@@ -543,6 +611,43 @@ class TestTheNoticeStaysReadableAndHonest:
     def test_a_small_set_reports_its_exact_count(self, db):
         rows = find_all_callers_recursive(db, CH, "probe", max_depth=3)
         assert "matches 2 symbols" in rows[0]["warning"], f"got: {rows[0]['warning']}"
+
+    def test_a_known_total_beats_more_than(self):
+        """The walk is cut; the count is not, thus the count is reported.
+
+        ``get_source`` answers the same name with an exact
+        ``candidates_total``.  A list tool that said "more than 50" for
+        the same name left the reader unable to see that the two describe
+        one ambiguity.
+        """
+        names = [f"Class{i}::probe" for i in range(MAX_AMBIGUOUS_TARGETS)]
+        text = ambiguity_notice("probe", names, "callers", total=132)["warning"]
+        assert "matches 132 symbols" in text, f"got: {text}"
+        assert "more than" not in text, f"got: {text}"
+        # The walk was still cut, thus the rows can miss a symbol.
+        assert "can be missing from the rows" in text, f"got: {text}"
+
+    def test_a_total_larger_than_the_walk_still_warns(self):
+        """Fewer names walked than matched: the rows are incomplete."""
+        names = [f"Class{i}::probe" for i in range(3)]
+        text = ambiguity_notice("probe", names, "callers", total=9)["warning"]
+        assert "matches 9 symbols" in text, f"got: {text}"
+        assert "can be missing from the rows" in text, f"got: {text}"
+
+    def test_the_two_tool_families_report_one_number(self, db):
+        """The list tools and the one-body tools must agree.
+
+        ``count_candidates`` is the single source of that number, thus the
+        notice of ``find_all_callers_recursive`` and the
+        ``candidates_total`` of ``get_source`` cannot drift apart.
+        """
+        total = count_candidates(db, CH, "probe")
+        rows = find_all_callers_recursive(db, CH, "probe", max_depth=3)
+        assert f"matches {total} symbols" in rows[0]["warning"], f"got: {rows[0]}"
+
+        row = _lookup_definition(db, CH, "probe", preferred_kinds=None)
+        body = _ambiguity(db, CH, "probe", row, Path("/tmp/test"))
+        assert body["candidates_total"] == total, f"got: {body}"
 
 
 class TestBareNameIsNotAQualifiedName:
