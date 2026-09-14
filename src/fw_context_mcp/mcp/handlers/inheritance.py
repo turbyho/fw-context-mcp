@@ -173,8 +173,9 @@ def get_inheritance_chain(
         transitive: When True, walk the full inheritance tree both up
             (ancestors) and down (descendants). Default: False (direct
             bases and derived only).
-        max_depth: Maximum BFS depth for transitive walk (default 10,
-            clamped to 1–50).
+        max_depth: Maximum BFS depth for transitive walk (default 10).
+            The schema holds it between 1 and 50, thus a number outside
+            that range is REFUSED and not cut down to fit.
         variant: Build variant (multi-build project). Omit to use
             default_variant. One query answers for ONE build.
         image: Sysbuild image within the variant. Required when the
@@ -370,7 +371,7 @@ def get_class_members(
 def get_template_instances(
     template_name: Annotated[str, Field(description="Template name to find instantiations for. E.g. 'Callback' or 'mbed::Callback'.")],
     project_root: Annotated[str | None, Field(description="Project root. Auto-detected if omitted.")] = None,
-    limit: Annotated[int, Field(description="Maximum results (default 50).")] = 50,
+    limit: Annotated[int, Field(description="Maximum results (default 50, max 200).")] = 50,
     variant: Annotated[str | None, Field(description="Build variant (multi-build project). Omit to use default_variant. One query answers for ONE build.")] = None,
     image: Annotated[str | None, Field(description="Sysbuild image within the variant. Required when the variant holds several: each image is a separate program.")] = None,
 ) -> list[dict]:
@@ -402,7 +403,7 @@ def get_template_instances(
         template_name: Template name to find instantiations for.
             E.g. ``'Callback'`` or ``'mbed::Callback'``.
         project_root: Project root. Auto-detected if omitted.
-        limit: Maximum results (default 50).
+        limit: Maximum results (default 50, max 200).
         variant: Build variant (multi-build project). Omit to use
             default_variant. One query answers for ONE build.
         image: Sysbuild image within the variant. Required when the

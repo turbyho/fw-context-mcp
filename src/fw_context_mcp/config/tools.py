@@ -131,8 +131,21 @@ is on purpose — an answer blending a bootloader with an application serves
 no question, and two builds of one application would repeat nearly every
 row.
 
-- Call `get_active_build` for the variants/images table.
-- Pass `variant` and `image` to EVERY call that follows.
+Two tools tell you what there is to choose from:
+
+- `get_active_build` — `multi`, `variants`, `images`, `variant_images`
+  (which images each variant holds) and `active_variant`. Call it first.
+- `list_variants` — one row per indexed build, with its own `config_hash`,
+  `board`, `symbol_count`, `entry_point` and memory map. Use it when you
+  must tell two builds apart by what they hold.
+
+Both read the INDEX and not only the config, thus a build indexed with
+`--variant` is listed even when config.toml no longer declares it.
+
+- Pass `variant` and `image` to every call that TAKES them. Every tool
+  that answers about code takes them, with two exceptions: `smart_search`
+  and `semantic_search` take neither, and they answer for the active
+  build. An argument a tool does not declare is an error that names it.
 - To learn whether a symbol is in the bootloader TOO, ask twice — once per
   image. Two plain answers beat one blended answer.
 
@@ -147,6 +160,10 @@ Eight tools take an `offset` and lead with a page notice: `lookup_symbol`,
 It is ALWAYS there when the answer holds a row, thus a full page never
 leaves you guessing whether more exists. `total` counts every row the
 query matches; `more` says whether any are left.
+
+Find the notice by its keys, and not by its position. A `warning` row
+comes before it when the index is stale, and so does the row that reports
+a query FTS5 could not parse.
 
 - When `more` is true, call again with `offset=<offset + shown>`. The
   `hint` spells out that call.

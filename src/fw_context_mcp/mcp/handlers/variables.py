@@ -89,7 +89,9 @@ def find_variables(
             (e.g. ``g_`` finds ``g_debug_level``, ``g_state``).
         project_root: Project root directory. Auto-detected if omitted.
         kind: Optional kind filter — ``"varglobal"``, ``"varlocal"``,
-            ``"field"``, or ``None`` (all). Default ``None``.
+            ``"field"``, or ``None`` (all). Default ``None``.  The legacy
+            ``"variable"`` is also accepted, for an index made before the
+            kind was split.
         limit: Maximum results (default 20, max 100).
         variant: Build variant (multi-build project). Omit to use
             default_variant. One query answers for ONE build.
@@ -98,7 +100,9 @@ def find_variables(
 
     Returns:
         list of dicts, each with: name (str), qualified_name (str),
-        kind (str — ``"varglobal"`` or ``"varlocal"``), file (str),
+        kind (str — ``"varglobal"``, ``"varlocal"``, ``"field"``, or
+        ``"variable"`` on an index made before the kind was split),
+        file (str),
         line (int), signature (str — e.g. ``"const IPAddress modbus_ip"``),
         enclosing_function (str — function name for varlocal,
         ``"<file scope>"`` for varglobal), enclosing_class (str — class
