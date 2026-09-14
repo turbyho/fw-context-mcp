@@ -387,12 +387,26 @@ def find_macro_refs(
     conn: sqlite3.Connection,
     config_hash: str,
     name: str,
-    limit: int = 50,
+    limit: int | None = 50,
 ) -> list[sqlite3.Row]:
     """Find file-level references to a macro using the files_fts index.
 
     Searches ifdef-filtered file content for occurrences of *name*.
     Returns file-level matches with highlighted snippets.
+
+    ``limit=None`` reads EVERY match.  The caller needs it because the
+    only reference that counts is one in active code, and a match inside
+    a comment can be told apart from one outside it by the snippet alone
+    — in Python, after the rows are here.  A SQL LIMIT therefore cuts a
+    set that the answer has not been filtered out of yet, and neither the
+    page nor its count would then be the truth.  One row per FILE bounds
+    the read: 1922 files on one measured firmware index, and a common
+    macro reached 316 of them.
+
+    The order ends at ``f.path``.  ``rank`` ties — several files score
+    alike — and SQLite may return tied rows in any order, thus a page
+    walk over the rank alone could show one file twice and hide another.
+    ``f.path`` is unique within one build.
 
     The ``files_fts`` existence check is not purely defensive — legacy
     indexes built before the files_fts table was introduced lack it
@@ -400,11 +414,13 @@ def find_macro_refs(
     the caller can fall back to raw LIKE search or report an empty result
     set gracefully.
     """
-    limit = min(limit, 100)
     table_row = conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='files_fts'").fetchone()
     if table_row is None:
         return []
 
+    # A negative LIMIT is how SQLite spells "no bound", thus one query
+    # text serves both callers.
+    bound = -1 if limit is None else min(limit, 100)
     expanded = _expand_query(name)
     try:
         return conn.execute(
@@ -413,9 +429,9 @@ def find_macro_refs(
                FROM files_fts
                JOIN files f ON f.id = files_fts.rowid
                WHERE files_fts MATCH ? AND f.config_hash = ? AND f.content != ''
-               ORDER BY rank
+               ORDER BY rank, f.path
                LIMIT ?""",
-            (expanded, config_hash, limit),
+            (expanded, config_hash, bound),
         ).fetchall()
     except Exception as exc:
         if not is_db_exception(exc):

@@ -35,8 +35,9 @@ Name → USR resolution uses a four-tier match:
 
 For aggregate types (class, struct, enum), references are stored at
 member granularity (``MyClass::method``, not just ``MyClass``).  The
-query uses USR prefix matching (``to_usr LIKE usr || '@%'``) to include
-all member references when the resolved symbol is an aggregate type.
+query takes the USR RANGE of the members to include all of them when the
+resolved symbol is an aggregate type — see ``_member_usr_range`` for why
+a range and not a LIKE prefix.
 
 ── Phase 3b / 3c fallbacks ──
 
@@ -570,6 +571,38 @@ def _build_kind_filter(ref_kind: str | list[str] | None) -> tuple[str, list[str]
     return "AND r.ref_kind = ?", [ref_kind]
 
 
+#: The kinds whose references sit at MEMBER granularity.  A reference to
+#: ``MyClass`` is recorded against ``MyClass::field``, not against the class,
+#: thus these kinds reach their references through the USR of each member.
+_MEMBER_GRANULAR_KINDS = ("class", "struct", "enum")
+
+
+def _member_usr_range(usr: str) -> tuple[str, str]:
+    """Give the half-open range ``[lo, hi)`` that holds every member of *usr*.
+
+    libclang writes the USR of a member as ``<owner>@<member>``, thus the
+    members of one aggregate sit in one unbroken stretch of a BINARY order.
+    ``hi`` is the owner followed by the character after ``@`` (``A``), which
+    is the first string that no member can reach.
+
+    WHY a range and not ``LIKE usr || '@%'``, which this replaced.  The LIKE
+    was wrong twice and slow once:
+
+    * No ESCAPE clause, and ``_`` is the single-character wildcard of LIKE.
+      A USR carries one whenever the C identifier does, which is most of the
+      time.  Measured on one firmware index, the members of ``my_type`` came
+      back together with the members of any type spelled ``myXtype``.
+    * LIKE is case-insensitive for ASCII while a USR is case-sensitive, thus
+      ``MY_TYPE`` and ``my_type`` reached each other.
+    * Case-insensitive LIKE cannot use ``idx_refs_to_usr``, which is BINARY.
+      The query plan fell back to a scan of every reference of the build.
+
+    A range comparison has none of those: no metacharacters, BINARY order,
+    and an index seek.
+    """
+    return usr + "@", usr + chr(ord("@") + 1)
+
+
 def count_refs_for_symbol(
     conn: sqlite3.Connection,
     config_hash: str,
@@ -583,16 +616,18 @@ def count_refs_for_symbol(
     on the same conditions as the page and only the LIMIT differs.
     """
     kind_filter, kind_params = _build_kind_filter(ref_kind)
-    if kind in ("class", "struct", "enum"):
+    if kind in _MEMBER_GRANULAR_KINDS:
         # The page groups its rows, thus the count must group them too.
+        lo, hi = _member_usr_range(usr)
         row = conn.execute(
             f"""SELECT COUNT(*) FROM (
                     SELECT 1 FROM refs r
                     LEFT JOIN symbols caller
                       ON caller.config_hash = r.config_hash AND caller.usr = r.from_usr
-                    WHERE r.config_hash = ? AND r.to_usr LIKE ? {kind_filter}
+                    WHERE r.config_hash = ?
+                      AND r.to_usr >= ? AND r.to_usr < ? {kind_filter}
                     GROUP BY caller.qualified_name, r.from_file, r.from_line)""",
-            [config_hash, usr + "@%", *kind_params],
+            [config_hash, lo, hi, *kind_params],
         ).fetchone()
         return row[0] if row else 0
     row = conn.execute(
@@ -623,14 +658,18 @@ def refs_for_symbol(
     another.
 
     **Aggregate type handling**: for a class, struct or enum the references
-    sit at member granularity (``MyClass::method``), thus the query matches
-    a USR prefix (``to_usr LIKE usr || '@%'``) to reach every member.
-    GROUP BY deduplicates when several members are referenced on one line,
-    as in ``obj.a = obj.b``.
+    sit at member granularity (``MyClass::method``), thus the query takes
+    the USR range of the members — see :func:`_member_usr_range` for why a
+    range and not a LIKE.  GROUP BY deduplicates when several members are
+    referenced on one line, as in ``obj.a = obj.b``.
 
-    ``(from_file, from_line)`` orders the rows and no two references of one
-    symbol share both, thus *offset* walks the answer without repeating a
-    row or stepping over one.
+    The order ends where the GROUP BY does.  A plain symbol is ordered by
+    ``(from_file, from_line)`` and no two of its references share both.  An
+    aggregate groups by the CALLER as well, and one line can carry
+    references from several callers — measured on one firmware index, 88
+    lines did, one of them from 8 callers.  Those groups tie on the file
+    and the line alone, thus the caller ends that order and *offset* can
+    neither repeat a row nor step over one.
     """
     kind_filter, kind_params = _build_kind_filter(ref_kind)
 
@@ -646,13 +685,14 @@ def refs_for_symbol(
                    ON caller.config_hash = r.config_hash AND caller.usr = r.from_usr
                  WHERE r.config_hash = ?"""
 
-    if kind in ("class", "struct", "enum"):
-        params: list = [config_hash, usr + "@%"] + kind_params + [limit, offset]
+    if kind in _MEMBER_GRANULAR_KINDS:
+        lo, hi = _member_usr_range(usr)
+        params: list = [config_hash, lo, hi] + kind_params + [limit, offset]
         return conn.execute(
             f"""{_SELECT}
-                  AND r.to_usr LIKE ? {kind_filter}
+                  AND r.to_usr >= ? AND r.to_usr < ? {kind_filter}
                 GROUP BY caller.qualified_name, r.from_file, r.from_line
-                ORDER BY r.from_file, r.from_line
+                ORDER BY r.from_file, r.from_line, caller.qualified_name
                 LIMIT ? OFFSET ?""",
             params,
         ).fetchall()
@@ -737,6 +777,9 @@ def find_refs_with_candidates(
     # an overload always does.  Without it two rows of one call site read
     # alike and a reader cannot tell which symbol each belongs to.
     labels = candidate_labels(candidates)
+    # ``reach`` is an upper bound per symbol and not a cost: SQLite stops
+    # at the end of the rows a symbol has, and measured on one firmware
+    # index the widest same-name answer held 159 rows over 50 symbols.
     per_symbol: list[list] = []
     total = 0
     for candidate, label in zip(candidates, labels, strict=True):

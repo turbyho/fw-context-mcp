@@ -72,7 +72,7 @@ from ...indexer.db import (
 from ...indexer.db import (
     find_indirect_targets as query_indirect_targets,
 )
-from ...indexer.db._resolve import ambiguity_notice, candidate_labels
+from ...indexer.db._resolve import ambiguity_notice, candidate_labels, count_candidates
 from ...indexer.intlist import read_isr_registrations
 from ...utils import abs_path
 from ...utils import escape_like as _escape_like
@@ -84,7 +84,8 @@ from .source import _lookup_definition
 log = logging.getLogger(__name__)
 
 def _resolve_virtual_callers(conn, config_hash: str, usr: str, root, ref_kind: list[str] | None,
-                            limit: int = 50) -> list[dict] | None:
+                            limit: int = 50,
+                            offset: int = 0) -> tuple[list[dict], int] | None:
     """Return callers of sibling override methods when *usr* has no direct callers.
 
     When libclang resolves ``this->end_download()`` to the nearest override
@@ -102,8 +103,10 @@ def _resolve_virtual_callers(conn, config_hash: str, usr: str, root, ref_kind: l
        class. This handles cases where the overrides table was not populated
        (e.g., partial indexing).
 
-    Returns None when the symbol is not a virtual method with overrides,
-    or an empty list when overrides exist but also have no callers.
+    Returns ``(rows, total)`` where *rows* is one page and *total* counts
+    every caller the peers have, so that the tool can say how much it does
+    not show.  Returns None when the symbol is not a virtual method with
+    overrides; ``([], 0)`` when overrides exist but also have no callers.
     """
     # Verify the symbol exists and is a method or destructor — virtual
     # dispatch only applies to methods, not free functions or fields.
@@ -179,8 +182,7 @@ def _resolve_virtual_callers(conn, config_hash: str, usr: str, root, ref_kind: l
         kind_clause = f"AND r.ref_kind IN ({rk_placeholders})"
         kind_params = list(ref_kind)
 
-    caller_rows = conn.execute(
-        f"""SELECT DISTINCT r.from_file, r.from_line, r.ref_kind,
+    virtual_select = f"""SELECT DISTINCT r.from_file, r.from_line, r.ref_kind,
                     caller.name AS caller_name,
                     caller.qualified_name AS caller_qname,
                     caller.kind AS caller_kind
@@ -189,9 +191,28 @@ def _resolve_virtual_callers(conn, config_hash: str, usr: str, root, ref_kind: l
                ON caller.config_hash = r.config_hash AND caller.usr = r.from_usr
              WHERE r.config_hash = ?
                AND r.to_usr IN ({placeholders})
-               {kind_clause}
-             LIMIT ?""",
-        (config_hash, *all_derived, *kind_params, limit),
+               {kind_clause}"""
+
+    # The page and the count run on the same text, thus a ``total`` can
+    # never describe another answer than the rows do.  It counts the
+    # DISTINCT rows, because that is what the page holds.
+    total_row = conn.execute(
+        f"SELECT COUNT(*) FROM ({virtual_select})",
+        (config_hash, *all_derived, *kind_params),
+    ).fetchone()
+    total = total_row[0] if total_row else 0
+
+    # This query had NO order at all, thus SQLite was free to return the
+    # rows differently on every call and a page walk over it was
+    # meaningless.  DISTINCT makes the whole selected tuple unique, so
+    # ordering by all of it is a total order and two pages of one walk can
+    # neither repeat nor skip a row.
+    caller_rows = conn.execute(
+        f"""{virtual_select}
+             ORDER BY r.from_file, r.from_line, r.ref_kind,
+                      caller.qualified_name, caller.name, caller.kind
+             LIMIT ? OFFSET ?""",
+        (config_hash, *all_derived, *kind_params, limit, max(0, offset)),
     ).fetchall()
 
     return [
@@ -203,7 +224,7 @@ def _resolve_virtual_callers(conn, config_hash: str, usr: str, root, ref_kind: l
             "caller_kind": r["caller_kind"],
         }
         for r in caller_rows
-    ]
+    ], total
 
 
 # ── moved from server.py ──
@@ -227,7 +248,7 @@ def _references_result(name: str, project_root: str | None, ref_kind: str | list
         offset: How many rows to walk past before the page begins.
 
     Returns:
-        list of dicts.  The first is the page notice — ``total``, ``offset``,
+        list of dicts.  The page notice leads the answer — ``total``, ``offset``,
         ``shown``, ``more`` — and each that follows holds: file, line,
         ref_kind, caller, caller_kind.
     """
@@ -244,6 +265,10 @@ def _references_result(name: str, project_root: str | None, ref_kind: str | list
         cfg_data = get_active_config(conn, db.project_id)
         if not cfg_data:
             return [{"error": "No build config indexed."}]
+        # Every branch below names the relation and the tool that reads the
+        # next page, thus both are resolved once here.
+        label = "callers" if caller_mode else "references"
+        tool = "find_callers" if caller_mode else "find_references"
         symbol = _lookup_definition(conn, config_hash, name, preferred_kinds=None)
         if symbol is None:
             # ── Macro fallback ──────────────────────────────────────────
@@ -255,7 +280,13 @@ def _references_result(name: str, project_root: str | None, ref_kind: str | list
             macros = lookup_macro(conn, config_hash, name, exact=True, limit=1)
             if macros:
                 macro = macros[0]
-                ref_rows = find_macro_refs(conn, config_hash, name, limit=limit)
+                # Every match is read, and not one page of them.  The
+                # comment filter below runs in Python, thus a SQL LIMIT
+                # would cut a set that the answer has not been filtered
+                # out of yet — the page would be short and the count would
+                # describe a wider answer than the rows do.  One row per
+                # file bounds the read.
+                ref_rows = find_macro_refs(conn, config_hash, name, limit=None)
                 # Post-filter: the FTS5 match snippet is checked for
                 # surrounding comment markers. Inline (//) and block (/* */)
                 # comments are detected via regex. This is heuristic —
@@ -281,7 +312,6 @@ def _references_result(name: str, project_root: str | None, ref_kind: str | list
                     **({"expanded_value": macro["expanded_value"]} if macro["expanded_value"] else {}),
                 }
                 if not _non_comment_refs:
-                    label = "callers" if caller_mode else "references"
                     extra: dict = {}
                     if _comment_refs:
                         extra["warning"] = (
@@ -290,15 +320,35 @@ def _references_result(name: str, project_root: str | None, ref_kind: str | list
                         )
                     return [{"info": f"No {label} (macro) found for '{name}'.",
                              **macro_def, **extra}]
+                # The comment filter is part of the answer, thus the total
+                # counts what survives it and the page is a slice of that.
+                macro_total = len(_non_comment_refs)
+                macro_skip = clamp_offset(offset)
+                macro_page = _non_comment_refs[macro_skip:macro_skip + max(1, min(limit, 200))]
+                if not macro_page:
+                    return [{"info": (
+                        f"No {label} (macro) of '{name}' at offset "
+                        f"{macro_skip}; the answer holds {macro_total}."
+                    ), **macro_def}]
                 macro_refs: list[dict] = [
                     {
                         "file": abs_path(root, r["file_path"]),
                         "ref_kind": "macro_use",
                         "_match_snippet": r["_match_snippet"],
                     }
-                    for r in _non_comment_refs
+                    for r in macro_page
                 ]
+                # The definition heads the rows, and the notice heads the
+                # whole answer — a reader that looks at the first row must
+                # see how much of the answer this page is.
                 macro_refs.insert(0, macro_def)
+                macro_refs.insert(0, page_notice(
+                    macro_total, macro_skip, len(macro_page),
+                    hint=(
+                        f"{tool}('{name}', offset={macro_skip + len(macro_page)}) "
+                        f"reads the next page."
+                    ),
+                ))
                 return macro_refs
             return [{"error": f"Symbol not found: {name}"}]
         if count_refs(conn, config_hash) == 0:
@@ -319,14 +369,28 @@ def _references_result(name: str, project_root: str | None, ref_kind: str | list
             # through base-class pointers are often recorded against
             # the nearest (base) override, not the most-derived one.
             virtual_result = _resolve_virtual_callers(
-                conn, config_hash, symbol["usr"], root, ref_kind=ref_kind, limit=clamped_limit,
+                conn, config_hash, symbol["usr"], root, ref_kind=ref_kind,
+                limit=clamped_limit, offset=skip,
             )
             if virtual_result is not None:
-                if not virtual_result:
-                    label = "callers" if caller_mode else "references"
+                virtual_rows, virtual_total = virtual_result
+                if not virtual_rows:
+                    if skip and virtual_total:
+                        return [{"info": (
+                            f"No {label} of '{name}' at offset {skip}; the "
+                            f"answer holds {virtual_total}."
+                        )}]
                     return [{"info": f"No {label} found for '{name}'."}]
-                return virtual_result
-            label = "callers" if caller_mode else "references"
+                # This answer pages like every other one.  Without the
+                # notice a full page of peer-override callers read as the
+                # whole truth, and the offset that a reader then passed
+                # was silently dropped.
+                shown = len(virtual_rows)
+                virtual_rows.insert(0, page_notice(
+                    virtual_total, skip, shown,
+                    hint=f"{tool}('{name}', offset={skip + shown}) reads the next page.",
+                ))
+                return virtual_rows
             if skip and total:
                 return [{"info": (
                     f"No {label} of '{name}' at offset {skip}; the answer "
@@ -346,8 +410,6 @@ def _references_result(name: str, project_root: str | None, ref_kind: str | list
             }
             for r in rows
         ]
-        label = "callers" if caller_mode else "references"
-        tool = "find_callers" if caller_mode else "find_references"
         result.insert(0, page_notice(
             total, skip, len(rows),
             hint=f"{tool}('{name}', offset={skip + len(rows)}) reads the next page.",
@@ -357,7 +419,13 @@ def _references_result(name: str, project_root: str | None, ref_kind: str | list
             # ones that a row came from.  Measured on one firmware index,
             # ``getMember`` matched 18 symbols and 5 of them had callers; a
             # notice built from the rows told the reader it matched 5.
-            result.insert(0, ambiguity_notice(name, candidate_labels(candidates), label))
+            #
+            # The exact count goes with it, so that this tool and
+            # ``get_source`` report one ambiguity with one number.
+            result.insert(0, ambiguity_notice(
+                name, candidate_labels(candidates), label,
+                count_candidates(conn, config_hash, name),
+            ))
         return result
 
     return db.execute_scoped(_query)
@@ -366,7 +434,7 @@ def _references_result(name: str, project_root: str | None, ref_kind: str | list
 def find_callers(
     name: Annotated[str, Field(description="Symbol name to find callers of. Returns direct call sites and indirect calls via function pointers.")],
     project_root: Annotated[str | None, Field(description="Project root. Auto-detected if omitted.")] = None,
-    limit: Annotated[int, Field(description="Maximum results of one page.")] = 50,
+    limit: Annotated[int, Field(description="Maximum results of one page (default 50, max 200).")] = 50,
     offset: Annotated[int, Field(description="Skip this many results. Reads the next page of a symbol with many call sites.")] = 0,
     variant: Annotated[str | None, Field(description="Build variant (multi-build project). Omit to use default_variant. One query answers for ONE build.")] = None,
     image: Annotated[str | None, Field(description="Sysbuild image within the variant. Required when the variant holds several: each image is a separate program.")] = None,
@@ -407,7 +475,7 @@ def find_callers(
             resolution as ``find_references`` (exact name, exact qualified,
             suffix LIKE).
         project_root: Project root directory. Auto-detected if omitted.
-        limit: Maximum results of one page (default 50).
+        limit: Maximum results of one page (default 50, max 200).
         offset: Skip this many results. Reads the next page of a symbol
             with many call sites; the page notice names the offset to use.
         variant: Build variant (multi-build project). Omit to use
@@ -416,11 +484,14 @@ def find_callers(
             variant holds several: each image is a separate program.
 
     Returns:
-        list of dicts, each with: file, line, ref_kind (``"call"``,
+        The page notice first — ``total``, ``offset``, ``shown``, ``more``
+        — then a dict per call site with: file, line, ref_kind (``"call"``,
         ``"indirect"``, ``"implicit_construct"``, or ``"macro_use"``),
         caller (enclosing function name), caller_kind (``"function"``,
-        ``"method"``, …). Macro fallback includes a leading dict with
-        ``kind="macro"``, ``value``, and ``expanded_value``.
+        ``"method"``, …). Macro fallback puts a dict with ``kind="macro"``,
+        ``value`` and ``expanded_value`` between the notice and the rows;
+        that answer pages too, and its ``total`` counts the uses in active
+        code only — a use inside a comment is not one.
 
         When *name* matches more than one symbol, such as two classes with
         a method of the same name, the answer holds the call sites of all
@@ -473,14 +544,18 @@ def find_references(
             variant holds several: each image is a separate program.
 
     Returns:
-        list of dicts, each with: file, line, ref_kind, caller, caller_kind.
+        The page notice first — ``total``, ``offset``, ``shown``, ``more``
+        — then a dict per reference with: file, line, ref_kind, caller,
+        caller_kind.
         ``ref_kind`` is one of: ``"call"``, ``"ref"``, ``"member"``,
         ``"indirect"`` (function-pointer reference in arguments, assignments,
         initializers, or init lists), ``"implicit_construct"`` (implicit
         constructor call from global/static object or member-field
         initialization), ``"macro_use"`` (macro usage
-        in file). Macro fallback includes a leading dict with
-        ``kind="macro"``, ``value``, and ``expanded_value``.
+        in file). Macro fallback puts a dict with ``kind="macro"``,
+        ``value`` and ``expanded_value`` between the notice and the rows;
+        that answer pages too, and its ``total`` counts the uses in active
+        code only — a use inside a comment is not one.
 
         When *name* matches more than one symbol, the answer holds the
         references of all of them.  A ``warning`` dict then comes first and
@@ -821,14 +896,17 @@ def find_call_path(
         from_name: Starting symbol for path search.
         to_name: Target symbol to find path to.
         project_root: Project root. Auto-detected if omitted.
-        max_depth: Maximum BFS depth for path search (default 10, max 50).
+        max_depth: Maximum BFS depth for path search (default 10). No
+            clamp holds this number. What bounds a deep search is the node
+            budget of the walk — 5000 expansions — thus a large depth
+            gives up on that budget and not on the depth.
         variant: Build variant (multi-build project). Omit to use
             default_variant. One query answers for ONE build.
         image: Sysbuild image within the variant. Required when the
             variant holds several: each image is a separate program.
 
     Returns:
-        list of dicts, each with: depth (edge count, int), chain (str —
+        At most 5 paths, each a dict with: depth (edge count, int), chain (str —
         e.g. ``"main → app_run → modem_init"``), target_usr (str — the USR
         of the symbol the path ends at, which tells two overloads apart).
         When no path exists within the depth limit, the list holds one
@@ -1038,7 +1116,7 @@ def find_callees_recursive(
 # ── moved from server.py ──
 def find_dead_code(
     project_root: Annotated[str | None, Field(description="Project root. Auto-detected if omitted.")] = None,
-    limit: Annotated[int, Field(description="Maximum results of one page (default 100).")] = 100,
+    limit: Annotated[int, Field(description="Maximum results of one page (default 100, max 200).")] = 100,
     offset: Annotated[int, Field(description="Skip this many results. Reads the next page of a long report.")] = 0,
     exclude_paths: Annotated[list[str] | None, Field(description="Additional LIKE patterns to exclude. Merged with defaults from config. E.g. ['lib/%'].")] = None,
     project_only: Annotated[bool, Field(description="When True (default), auto-excludes SDK/vendor paths based on the detected build system and applies project config exclude_paths. Set False to see all results.")] = True,
@@ -1084,7 +1162,7 @@ def find_dead_code(
 
     Args:
         project_root: Project root. Auto-detected if omitted.
-        limit: Maximum results of one page (default 100).
+        limit: Maximum results of one page (default 100, max 200).
         offset: Skip this many results. Reads the next page; the page
             notice names the offset to use.
         exclude_paths: Additional LIKE patterns to exclude (user-supplied
@@ -1146,7 +1224,7 @@ def find_dead_code(
 def find_wrapper_callers(
     class_name: Annotated[str, Field(description="Driver class name to find wrappers for. E.g. 'UART_DRIVER' or 'hal::UART_DRIVER'.")],
     project_root: Annotated[str | None, Field(description="Project root. Auto-detected if omitted.")] = None,
-    limit: Annotated[int, Field(description="Maximum wrapper method results (default 50).")] = 50,
+    limit: Annotated[int, Field(description="Maximum wrapper method results (default 50, max 50).")] = 50,
     variant: Annotated[str | None, Field(description="Build variant (multi-build project). Omit to use default_variant. One query answers for ONE build.")] = None,
     image: Annotated[str | None, Field(description="Sysbuild image within the variant. Required when the variant holds several: each image is a separate program.")] = None,
 ) -> list[dict]:
@@ -1171,7 +1249,7 @@ def find_wrapper_callers(
         class_name: Driver class name to find wrappers for.
             E.g. ``'UART_DRIVER'`` or ``'hal::UART_DRIVER'``.
         project_root: Project root. Auto-detected if omitted.
-        limit: Maximum wrapper method results (default 50).
+        limit: Maximum wrapper method results (default 50, max 50).
         variant: Build variant (multi-build project). Omit to use
             default_variant. One query answers for ONE build.
         image: Sysbuild image within the variant. Required when the
@@ -1333,8 +1411,8 @@ def trace_data_flow(
     type_name: Annotated[str, Field(description="Type name to trace. E.g. 'SensorData' or 'Config::SensorData'.")],
     to_symbol: Annotated[str, Field(description="Target symbol name. E.g. 'uart_send' or 'UART_DRIVER::send'.")],
     project_root: Annotated[str | None, Field(description="Project root. Auto-detected if omitted.")] = None,
-    max_depth: Annotated[int, Field(description="Maximum call path depth (default 8).")] = 8,
-    limit: Annotated[int, Field(description="Maximum source functions to trace (default 15).")] = 15,
+    max_depth: Annotated[int, Field(description="Maximum call path depth (default 8, max 20).")] = 8,
+    limit: Annotated[int, Field(description="Maximum source functions to trace (default 15, max 15).")] = 15,
     timeout_ms: Annotated[int, Field(description="Maximum total execution time in "
         "milliseconds (default 30000).")] = 30000,
     variant: Annotated[str | None, Field(description="Build variant (multi-build project). Omit to use default_variant. One query answers for ONE build.")] = None,
@@ -1364,8 +1442,8 @@ def trace_data_flow(
         to_symbol: Target symbol name. E.g. ``'uart_send'`` or
             ``'UART_DRIVER::send'``.
         project_root: Project root. Auto-detected if omitted.
-        max_depth: Maximum call path depth (default 8).
-        limit: Maximum source functions to trace (default 15).
+        max_depth: Maximum call path depth (default 8, max 20).
+        limit: Maximum source functions to trace (default 15, max 15).
         timeout_ms: Maximum total execution time in milliseconds
             (default 30000). Clamped to 1000–300000.
         variant: Build variant (multi-build project). Omit to use
@@ -1490,7 +1568,7 @@ def trace_data_flow(
 # ── moved from server.py ──
 def find_hotspots(
     project_root: Annotated[str | None, Field(description="Project root. Auto-detected if omitted.")] = None,
-    limit: Annotated[int, Field(description="Number of top-called functions per page (default 20).")] = 20,
+    limit: Annotated[int, Field(description="Number of top-called functions per page (default 20, max 50).")] = 20,
     offset: Annotated[int, Field(description="Skip this many results. Reads further down the ranking.")] = 0,
     project_only: Annotated[bool, Field(description="When True (default), auto-excludes SDK/vendor paths so hotspots reflect project code.")] = True,
     exclude_paths: Annotated[list[str] | None, Field(description="Additional LIKE patterns to exclude. Merged with defaults. E.g. ['lib/%'].")] = None,
@@ -1519,7 +1597,7 @@ def find_hotspots(
 
     Args:
         project_root: Project root. Auto-detected if omitted.
-        limit: Number of top-called functions per page (default 20).
+        limit: Number of top-called functions per page (default 20, max 50).
         offset: Skip this many results. Reads further down the ranking;
             the page notice names the offset to use.
         project_only: When True (default), filters to ``is_project = 1``
