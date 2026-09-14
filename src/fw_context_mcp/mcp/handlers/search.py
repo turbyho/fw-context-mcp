@@ -75,19 +75,21 @@ _SEARCH_CODE_STEPS_WITH_PRIMARY = [
 log = logging.getLogger(__name__)
 
 
-def _resolve_scopes_for_search(root: Path, db_path: Path, variant: str, image: str):
-    """Resolve ``(variant, image)`` → ``(scopes, multi, error)`` for search tools.
+def _resolve_build_for_search(
+    root: Path, db_path: Path, variant: str, image: str,
+) -> tuple[str | None, str | None]:
+    """Resolve ``(variant, image)`` → ``(config_hash, error)`` for search tools.
 
     Loads the project config, reads the project ID, and delegates to the shared
-    ``resolve_scopes`` helper on a short-lived read-only connection.
+    ``resolve_build`` helper on a short-lived read-only connection.
     """
-    from ..shared.variants import resolve_scopes
+    from ..shared.variants import resolve_build
 
     project_id = derive_project_id(root)
     cfg = load_config(root)
     conn = _quick_open_readonly(db_path)
     try:
-        return resolve_scopes(conn, project_id, cfg, variant or "", image or "")
+        return resolve_build(conn, project_id, cfg, variant or "", image or "")
     finally:
         conn.close()
 
@@ -113,13 +115,21 @@ def _with_search_context(root: Path, tool_name: str, do_search, variant: str = "
     Every search handler follows the same setup sequence:
     1. Locate the SQLite index database file from the project root.
     2. Verify the index exists — fail early with a clear message if not.
-    3. Run the actual search inside ``_with_stale_recovery``, which catches
+    3. Resolve ``(variant, image)`` to ONE build, fail-closed.
+    4. Run the actual search inside ``_with_stale_recovery``, which catches
        stale-index errors and retries once after triggering per-file
        re-parsing behind the scenes.
 
     This wrapper eliminates five repeated lines from every search function
     and ensures consistent error formatting. The ``tool_name`` parameter
     appears in error messages so the operator knows which operation failed.
+
+    ``resolve_build`` answers with one build — a question about code is a
+    question about one program, see ``shared/variants.py``.  This used to
+    run the search once per build and tag each row with its ``variant`` and
+    ``image``.  That branch became unreachable when the resolver stopped
+    answering with several builds, and it is gone with the merging it
+    served.
 
     Why stale-recovery is used: the compile-commands database can change
     between index runs (files added, removed, re-ordered). When a query
@@ -144,24 +154,13 @@ def _with_search_context(root: Path, tool_name: str, do_search, variant: str = "
         if not db_path.exists():
             return [{"error": f"No index found for {root}. Run 'fw-context index' first."}]
 
-        # Resolve (variant, image) selection → build scopes (fail-closed).
-        scopes, multi, err = _resolve_scopes_for_search(root, db_path, variant, image)
+        # Resolve (variant, image) selection → ONE build (fail-closed).
+        config_hash, err = _resolve_build_for_search(root, db_path, variant, image)
         if err:
             return [{"error": err}]
-        if len(scopes) == 1:
-            return _with_stale_recovery(root, db_path, do_search, config_hash=scopes[0]["config_hash"])
-
-        # Multi-scope: run per build and annotate each result with its identity.
-        merged: list[dict] = []
-        for scope in scopes:
-            part = _with_stale_recovery(root, db_path, do_search, config_hash=scope["config_hash"])
-            for r in part:
-                if isinstance(r, dict) and "error" not in r and "warning" not in r:
-                    r = dict(r)
-                    r["variant"] = scope["variant"]
-                    r["image"] = scope["image"]
-                merged.append(r)
-        return merged
+        if config_hash is None:
+            return []
+        return _with_stale_recovery(root, db_path, do_search, config_hash=config_hash)
     except (sqlite3.Error, OSError, RuntimeError) as e:
         log.exception("%s failed: %s", tool_name, e)
         return [{"error": f"{tool_name} failed: {e}"}]
@@ -242,18 +241,23 @@ def search_code(
       opposite — it takes the query literally, where a space is an AND.
     - ``init*`` matches init, init_uart, initialize (trailing wildcard)
     - ``"spi init"`` matches the exact phrase "spi init"
-    - Do NOT use underscore in queries — ``modem_init`` is split into
-      ``modem AND init``. Write ``modem init`` instead.
+    - Do NOT use an underscore in a query.  The tokenizer splits
+      ``modem_init`` into two tokens and looks for them NEXT TO EACH
+      OTHER.  That is a phrase and not an AND, thus the query misses
+      ``modem_parser_oob_init``.  Measured on one firmware index,
+      ``serial_write`` gave 1 result and ``serial write`` gave 200.
+      Write ``modem init`` instead.
     - Punctuation is not searchable.  The tokenizer drops it, thus
       ``.attach(`` becomes a phrase that looks for the token ``attach``.
       The query is repaired, never rejected.
 
-    **Progressive relaxation:** when FTS5 finds nothing, the search widens
-    in up to six steps, and every result carries the ``_fallback`` method
-    that found it:
+    **Progressive relaxation:** when a step matches nothing, the next one
+    runs.  Six steps can run.  Step 1 is the primary path and its results
+    carry NO ``_fallback`` key; each step after it names itself there:
 
-    1. FTS5 with the ``kind`` filter — ``_fallback="fts5"``.
-    2. FTS5 without it; operators often guess the wrong kind.
+    1. FTS5 with the ``kind`` filter.  No ``_fallback`` key.
+    2. FTS5 without the kind, when the kind matched nothing; operators
+       often guess the wrong kind — ``_fallback="fts5"``.
     3. ``name_tokens`` substring match over the pre-computed CamelCase /
        snake_case tokens (``BuildType`` is indexed as ``"build type"``).
        Needs N−1 of N query terms — ``"name_tokens_like"``.
@@ -283,7 +287,9 @@ def search_code(
     symbol, never as a fact to quote.  Quote ``source`` from
     ``get_source``, ``signature``, or ``docstring``.
 
-    Read-only. No side effects.
+    Read-only: yes. May auto-reindex stale files (non-blocking). When a
+    file that the answer names changed on disk, this tool starts the
+    watcher daemon in the background and answers from the index it has.
 
     Args:
         query: FTS5 search terms. Keep queries short — 1–3 words.
@@ -302,7 +308,7 @@ def search_code(
             variant holds several: each image is a separate program.
 
     Returns:
-        list of dicts.  The first is the page notice — ``total``,
+        list of dicts.  The page notice leads the answer — ``total``,
         ``offset``, ``shown``, ``more`` — where ``total`` counts the
         answer of the step that answered.  Each symbol that follows has
         name, qualified_name, kind, file, line, is_definition, signature,
@@ -314,10 +320,15 @@ def search_code(
         results include ``_fallback`` with the method name.
 
         No match gives ``[]``.  A dict with ``error`` means the query
-        failed.  A stale index prepends a dict with ``warning`` + ``hint``.
+        failed.  A stale index prepends a dict with ``warning`` + ``hint``,
+        and that dict comes BEFORE the page notice — find the notice by
+        its keys, and not by its position.
     """
     root = resolve_project_root(project_root)
-    limit = max(0, min(limit, 100))
+    # A page of zero rows is not a page.  It would report ``shown: 0`` with
+    # ``more: true`` and a hint naming the offset it already stands at, thus
+    # a reader that follows the hint walks the same empty page for ever.
+    limit = max(1, min(limit, 100))
     skip = clamp_offset(offset)
 
     def _do_search(c: sqlite3.Connection, config_hash: str) -> list[dict]:
@@ -400,10 +411,15 @@ async def smart_search(
     describe what you're looking for ("how does the modem connect?",
     "handle BLE pairing failure").
 
-    Read-only. No side effects. Slow (10-30 s) — delegates to the full
+    Read-only: yes. Slow (10-30 s) — delegates to the full
     ``SMART_SEARCH`` pipeline (translate → rough_search → llm_query →
     fts5_search → refine → embedding → adaptive_fusion → deduplicate →
     expand_context → format).
+
+    **This tool names no build.**  It takes neither ``variant`` nor
+    ``image``, and it answers for the build that ``get_active_build``
+    reports as the active one.  On a project that holds several builds,
+    use ``search_code`` or ``search_bodies`` to ask about one named build.
 
     Multi-phase approach:
     1) Translate non-English queries
@@ -425,7 +441,9 @@ async def smart_search(
         query: Natural language description of what you're looking for.
                Be specific — 5–15 words works best.
         project_root: Project root directory. Auto-detected from CWD if omitted.
-        limit: Maximum number of results (default 20, max 100).
+        limit: Maximum number of results (default 20). The pipeline holds
+            it between 5 and 100: a smaller number becomes 5, because the
+            re-rank steps need a set to choose from.
 
     Returns:
         list of dicts with metadata entries (_generated_queries, _rough_queries,
@@ -521,13 +539,22 @@ async def semantic_search(
     - ``0.60`` — precise: ~175 avg, high precision (default)
     - ``0.65`` — strict: few results, may miss relevant symbols
 
-    **Source-aware ranking:** Project code boosted 1.2×, library code
-    1.1×, vendored SDK code 0.85×.
+    **Source-aware ranking:** the similarity of a project symbol is
+    multiplied by 1.2, and the similarity of every other symbol by 0.85.
+    The index marks each file as project code or not, thus the two tiers
+    are all there are.  ``_similarity`` in the result holds the multiplied
+    score, and not the raw cosine distance.
 
     **Requires an LLM** with an embedding model.
     Falls back to ``search_code`` with a warning if the LLM is unavailable.
 
-    Read-only. No side effects.
+    **This tool names no build.**  It takes neither ``variant`` nor
+    ``image``, and it answers for the build that ``get_active_build``
+    reports as the active one.  On a project that holds several builds,
+    use ``search_code`` or ``search_bodies`` to ask about one named build.
+
+    Read-only: yes. The fallback to ``search_code`` may auto-reindex stale
+    files (non-blocking).
 
     Args:
         query: Natural language description of what you're looking for.
@@ -563,7 +590,9 @@ async def semantic_search(
         if not db_path.exists():
             return [{"error": f"No index found for {root}. Run 'fw-context index' first."}]
 
-        limit = max(0, min(limit, 100))
+        # One row at least: an answer of zero rows says nothing that an
+        # empty result does not already say, and it costs the whole search.
+        limit = max(1, min(limit, 100))
         threshold = max(0.0, min(1.0, threshold))
 
         # Verify LLM setup — embedding generation runs against the configured
@@ -905,7 +934,8 @@ def search_bodies(
     function is far from the match.  Cite from ``match_lines`` instead.
     Project code sorts before vendor code in the output.
 
-    Read-only. No side effects. Requires the FTS5 index.
+    Read-only: yes. Requires the FTS5 index. May auto-reindex stale files
+    (non-blocking) — see ``search_code``.
 
     Args:
         query: FTS5 search terms, 1-3 words.  A bare multi-word query is an
@@ -927,7 +957,7 @@ def search_bodies(
             variant holds several: each image is a separate program.
 
     Returns:
-        list of dicts.  The first is the page notice — ``total``,
+        list of dicts.  The page notice leads the answer — ``total``,
         ``offset``, ``shown``, ``more`` — and each that follows holds:
         name, qualified_name, kind, file, line (first line of the
         definition), is_definition, signature, _match_snippet (excerpt
@@ -965,7 +995,11 @@ def search_bodies(
     # Enforce limit bounds at the function entry point (not inside _do_search)
     # because _do_search may be called multiple times by stale recovery —
     # applying the clamp once here ensures consistency across retries.
-    limit = max(0, min(limit, 100))
+    #
+    # One row at least: a page of zero rows reports ``shown: 0`` with
+    # ``more: true`` and hints at the offset it already stands at, thus a
+    # reader that follows the hint never moves.
+    limit = max(1, min(limit, 100))
 
     # Computed once, outside the query closure: stale recovery can call the
     # closure again, and the terms depend only on the operator's query.
@@ -1188,7 +1222,8 @@ def search_content(
     search on ``files.content`` — results include ``_fallback: "like"``
     and no snippet highlighting. Run ``fw-context index`` to upgrade.
 
-    Read-only. No side effects. Requires the FTS5 index with file content.
+    Read-only: yes. Requires the FTS5 index with file content. May
+    auto-reindex stale files (non-blocking) — see ``search_code``.
 
     Args:
         query: FTS5 search terms. 1-3 words. Bare multi-word queries are
@@ -1205,7 +1240,7 @@ def search_content(
             variant holds several: each image is a separate program.
 
     Returns:
-        list of dicts.  The first is the page notice — ``total``,
+        list of dicts.  The page notice leads the answer — ``total``,
         ``offset``, ``shown``, ``more`` — and each that follows holds:
         file, language, mtime, _match_snippet (highlighted excerpt around
         the match).
@@ -1229,8 +1264,10 @@ def search_content(
     """
     root = resolve_project_root(project_root)
     # Enforce limit bounds at the function entry point (not inside _do_search)
-    # — same rationale as search_bodies: consistent bound across stale-recovery retries.
-    limit = max(0, min(limit, 100))
+    # — same rationale as search_bodies: consistent bound across stale-recovery
+    # retries, and one row at least, so that a page never hints at the offset
+    # it already stands at.
+    limit = max(1, min(limit, 100))
     expanded = _expand_query(query)
     # Computed once, outside the query closure: stale recovery can call the
     # closure again, and the terms depend only on the query of the caller.

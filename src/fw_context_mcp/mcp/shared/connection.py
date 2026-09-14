@@ -115,8 +115,6 @@ class HandlerContext:
     cfg: Config
     project_id: str
     db_path: Path
-    scopes: list[dict]
-    multi: bool
 
 
 def _resolve_handler_context(
@@ -170,14 +168,16 @@ def _resolve_handler_context(
 
     conn = _quick_open_readonly(db_path)
     try:
-        from .variants import resolve_scopes
+        from .variants import resolve_build
 
-        scopes, multi, err = resolve_scopes(conn, project_id, cfg, variant or "", image or "")
+        # One build answers, because a question about code is a question
+        # about one program.  That one hash IS the hash of this request,
+        # thus nothing downstream has to carry a selection to find it.
+        config_hash, err = resolve_build(conn, project_id, cfg, variant or "", image or "")
         if err:
             return None, [{"error": err}]
-        if not scopes:
+        if config_hash is None:
             return None, [{"error": "No build config indexed."}]
-        config_hash = scopes[0]["config_hash"]
 
         if require_refs:
             from fw_context_mcp.indexer.db import count_refs
@@ -200,6 +200,4 @@ def _resolve_handler_context(
         cfg=cfg,
         project_id=project_id,
         db_path=db_path,
-        scopes=scopes,
-        multi=multi,
     ), None

@@ -122,7 +122,7 @@ def lookup_symbol(
             all symbols starting with 'uart_'.
         project_root: Project directory. Auto-detected if omitted.
         exact: True = exact name match, False = prefix LIKE match (default).
-        limit: Maximum results of one page (default 50).
+        limit: Maximum results of one page (default 50, max 100).
         offset: Skip this many results (default 0).  A common method name
             lives in many classes — ``read`` and ``write`` match dozens of
             symbols — and this walks past the ones already seen.  The page
@@ -135,7 +135,7 @@ def lookup_symbol(
             variant holds several: each image is a separate program.
 
     Returns:
-        list[dict]: The first is the page notice — ``total``, ``offset``,
+        list[dict]: The page notice leads the answer — ``total``, ``offset``,
         ``shown``, ``more`` — where ``total`` counts every symbol the name
         matches.  Read it before you conclude that a page holds them all.
         Each symbol that follows has name, qualified_name, kind, file,
@@ -175,7 +175,10 @@ def lookup_symbol(
         if not db_path.exists():
             return [{"error": f"No index found for {root}."}]
 
-        limit = max(0, min(limit, 100))
+        # One row at least.  A page of zero rows reports ``shown: 0`` with
+        # ``more: true`` and a hint naming the offset it already stands at,
+        # thus a reader that follows the hint walks the same page for ever.
+        limit = max(1, min(limit, 100))
         skip = clamp_offset(offset)
 
         def _page(c: sqlite3.Connection, where: str, params: tuple) -> tuple[list, int]:

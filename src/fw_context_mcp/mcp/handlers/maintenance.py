@@ -187,16 +187,41 @@ def _build_variant_discovery(cfg: Config, builds: list, root: Path) -> dict:
     """
     build_cfg = cfg.build
     variants_cfg = build_cfg.variants
-    multi = bool(variants_cfg)
 
-    variants = [
-        {
-            "name": v.name,
-            "description": v.description,
-            "board": v.board or build_cfg.board or "",
-        }
-        for v in variants_cfg
-    ]
+    # The INDEX is the fact, the config only declares an intention.  These
+    # two used to disagree: a project indexed with ``--variant`` whose
+    # config declares no variant reported ``multi: false`` and an empty
+    # ``variants`` list, while ``variant_images`` below was filled from the
+    # same builds and ``list_variants`` reported ``multi: true``.  The LLM
+    # then read one payload that contradicted itself and another tool.
+    indexed_variants: list[str] = []
+    for b in builds:
+        name = b["variant"] or ""
+        if name and name not in indexed_variants:
+            indexed_variants.append(name)
+    multi = bool(variants_cfg) or bool(indexed_variants)
+
+    if variants_cfg:
+        variants = [
+            {
+                "name": v.name,
+                "description": v.description,
+                "board": v.board or build_cfg.board or "",
+            }
+            for v in variants_cfg
+        ]
+    else:
+        # Named by the builds themselves, so that a caller told to choose a
+        # variant has a list to choose from.
+        boards = {b["variant"] or "": (b["board"] or "") for b in builds}
+        variants = [
+            {
+                "name": name,
+                "description": "",
+                "board": boards.get(name) or build_cfg.board or "",
+            }
+            for name in indexed_variants
+        ]
 
     images: list[dict] = []
     variant_images: dict[str, list[str]] = {}
@@ -252,6 +277,12 @@ def list_variants(
     declares.  Each row is one ``(variant, image)`` build with its own
     ``config_hash`` and symbol count.  For single-project indexes this returns
     one row with ``variant``/``image`` empty.
+
+    This and ``get_active_build`` are the two tools that say what a query can
+    choose from.  Both read the index, thus a build written by
+    ``fw-context index --build --variant X`` is listed even when config.toml
+    no longer declares X — and ``resolve_build`` fails closed on that same
+    fact, so the two never disagree about whether a choice must be made.
 
     Use ``get_active_build`` for the mandatory first-call health check and the
     human-readable ``variants``/``images`` discovery; use this tool to see the
@@ -374,7 +405,11 @@ def get_active_build(
       the rows of the last FINISHED run.
     * ``"no_index"`` — initialized, never indexed. Run ``fw-context index``.
     * ``"not_initialized"`` — run ``fw-context init``.
-    * ``"error"`` — DB corruption or access error. Use other tools.
+
+    A failure sets NO ``status``.  DB corruption, or no access to the
+    index, gives a dict that holds ``error`` alone.  Read that key first:
+    a reader that waits for ``status == "error"`` waits for a value this
+    tool does not produce.
 
     Four conditions set ``reindex_needed``: an outdated schema, an outdated
     ROW FORMAT, a changed compile_commands.json, and a source file that is
@@ -458,7 +493,8 @@ def get_active_build(
         reindex_progress (str or None — last log line when reindex is running),
         schema_version (int — DB schema version),
         current_schema (int — code expects), status (str — "ready"|"reindexing"|
-        "reindex_needed"|"no_index"|"not_initialized"|"error"), reindex_needed (bool —
+        "reindex_needed"|"no_index"|"not_initialized"; a failure sets no
+        status and gives ``error`` alone), reindex_needed (bool —
         structural mismatch requiring a full reindex),
         reindex_reasons (list[str] — why reindex is needed, empty when False.
         One of them asks for `fw-context index --build` rather than a plain

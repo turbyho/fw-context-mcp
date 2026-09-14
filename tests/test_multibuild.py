@@ -4,7 +4,7 @@ from pathlib import Path
 
 from fw_context_mcp.indexer.build import BuildImage, BuildVariant
 from fw_context_mcp.indexer.builders.zephyr import ZephyrBuildSystem
-from fw_context_mcp.mcp.shared.variants import resolve_scopes
+from fw_context_mcp.mcp.shared.variants import resolve_build
 
 
 class TestZephyrHelpers:
@@ -117,6 +117,47 @@ class TestVariantDiscovery:
         assert discovery["variant_images"]["nrf52840"] == ["app", "mcuboot"]
         assert discovery["active_variant"] == "nrf52840"
 
+    def test_an_indexed_variant_is_discovered_without_config(self):
+        """get_active_build and list_variants must agree on ``multi``.
+
+        The index is the fact.  A config that declares no variant over an
+        index that holds two builds of one board reported ``multi: false``
+        and an empty ``variants`` list, while ``variant_images`` of the
+        SAME payload named the builds — a payload that contradicted itself,
+        and a tool that contradicted ``list_variants``.
+        """
+        from fw_context_mcp.mcp.handlers.maintenance import _build_variant_discovery
+
+        cfg = self._make_cfg()
+        cfg.build.variants = []          # the config declares nothing
+        cfg.build.default_variant = None
+        builds = [
+            {"variant": "nrf52840", "image": "app", "board": "b1", "config_hash": "h1"},
+            {"variant": "nrf52840", "image": "mcuboot", "board": "b1", "config_hash": "h2"},
+        ]
+
+        discovery = _build_variant_discovery(cfg, builds, Path("/tmp"))
+
+        assert discovery["multi"] is True, "an indexed variant makes it multi-build"
+        assert [v["name"] for v in discovery["variants"]] == ["nrf52840"], (
+            f"a caller told to choose a variant got no list: {discovery['variants']}"
+        )
+        assert discovery["variants"][0]["board"] == "b1"
+        assert discovery["variant_images"]["nrf52840"] == ["app", "mcuboot"]
+
+    def test_a_single_project_stays_single(self):
+        """No variant anywhere means no choice to make."""
+        from fw_context_mcp.mcp.handlers.maintenance import _build_variant_discovery
+
+        cfg = self._make_cfg()
+        cfg.build.variants = []
+        builds = [{"variant": "", "image": "", "board": "b", "config_hash": "h"}]
+
+        discovery = _build_variant_discovery(cfg, builds, Path("/tmp"))
+
+        assert discovery["multi"] is False
+        assert discovery["variants"] == []
+
     def test_discovery_auto_detect_from_builds(self):
         from fw_context_mcp.mcp.handlers.maintenance import _build_variant_discovery
 
@@ -131,7 +172,7 @@ class TestVariantDiscovery:
         assert discovery["variant_images"]["nrf52840"] == ["app", "stage0"]
 
 
-class TestResolveScopes:
+class TestResolveBuild:
     def _cfg(self, variants=None, default_variant=None):
         from fw_context_mcp.config.settings import Config
 
@@ -149,25 +190,56 @@ class TestResolveScopes:
             upsert_build_config(conn, "h-a-stage", "proj", "/tmp/b", variant="a", image="stage0")
             upsert_build_config(conn, "h-b-app", "proj", "/tmp/c", variant="b", image="app")
 
-    def test_single_project_returns_one_scope(self, temp_db):
+    def test_an_indexed_variant_makes_a_project_multi_build(self, temp_db):
+        """The INDEX is the fact; the config only declares an intention.
+
+        An index run with ``--variant`` writes the variant name into
+        build_configs.  A config that no longer declares that variant — it
+        was edited, or the index came from elsewhere — used to send the
+        query down the single-project path, where the NEWEST build wins in
+        silence.  Measured on a seeded index holding an application and a
+        bootloader, a query that named no build got the bootloader.
+        """
+        self._seed(temp_db)
+        config_hash, err = resolve_build(temp_db, "proj", self._cfg(), "", "")
+
+        assert config_hash is None, (
+            f"a query that named no build got {config_hash!r} of three builds"
+        )
+        assert err is not None and "variant" in err, f"got: {err}"
+        assert "a" in err and "b" in err, f"the error names no choice: {err}"
+
+    def test_the_indexed_names_reach_the_error(self, temp_db):
+        """A config that declares nothing must still name the real choices."""
+        self._seed(temp_db)
+        _hash, err = resolve_build(temp_db, "proj", self._cfg(), "zzz", "")
+        assert err is not None and "Unknown variant" in err
+        assert "a" in err and "b" in err, f"got: {err}"
+
+    def test_an_indexed_variant_still_answers_when_named(self, temp_db):
+        """Fail-closed must not mean unreachable."""
+        self._seed(temp_db)
+        config_hash, err = resolve_build(temp_db, "proj", self._cfg(), "a", "stage0")
+        assert err is None, f"got: {err}"
+        assert config_hash == "h-a-stage"
+
+    def test_single_project_needs_no_selector(self, temp_db):
         from fw_context_mcp.indexer.db import transaction, upsert_build_config, upsert_project
 
         with transaction(temp_db):
             upsert_project(temp_db, "proj", "t", "/tmp/t")
             upsert_build_config(temp_db, "h-single", "proj", "/tmp/cc.json")
 
-        scopes, multi, err = resolve_scopes(temp_db, "proj", self._cfg(), "", "")
+        config_hash, err = resolve_build(temp_db, "proj", self._cfg(), "", "")
         assert err is None
-        assert multi is False
-        assert len(scopes) == 1
-        assert scopes[0]["config_hash"] == "h-single"
+        assert config_hash == "h-single"
 
     def test_multi_fail_closed_without_default(self, temp_db):
         self._seed(temp_db)
         cfg = self._cfg([BuildVariant(name="a"), BuildVariant(name="b")])
-        scopes, multi, err = resolve_scopes(temp_db, "proj", cfg, "", "")
+        config_hash, err = resolve_build(temp_db, "proj", cfg, "", "")
         assert err is not None and "default_variant" in err
-        assert scopes == []
+        assert config_hash is None
 
     def test_default_variant_still_needs_an_image(self, temp_db):
         """A variant with several images has not said which program to read.
@@ -178,8 +250,8 @@ class TestResolveScopes:
         """
         self._seed(temp_db)
         cfg = self._cfg([BuildVariant(name="a"), BuildVariant(name="b")], default_variant="a")
-        scopes, multi, err = resolve_scopes(temp_db, "proj", cfg, "", "")
-        assert scopes == []
+        config_hash, err = resolve_build(temp_db, "proj", cfg, "", "")
+        assert config_hash is None
         assert err is not None and "image" in err
         assert "app" in err and "stage0" in err, f"the error names no choice: {err}"
 
@@ -187,9 +259,9 @@ class TestResolveScopes:
         """With nothing to confuse, the query answers."""
         self._seed(temp_db)
         cfg = self._cfg([BuildVariant(name="a"), BuildVariant(name="b")], default_variant="b")
-        scopes, multi, err = resolve_scopes(temp_db, "proj", cfg, "", "")
-        assert err is None and multi is True
-        assert [s["config_hash"] for s in scopes] == ["h-b-app"]
+        config_hash, err = resolve_build(temp_db, "proj", cfg, "", "")
+        assert err is None
+        assert config_hash == "h-b-app"
 
     def test_variant_star_is_refused(self, temp_db):
         """One query answers for ONE build — see shared/variants.py.
@@ -201,36 +273,44 @@ class TestResolveScopes:
         """
         self._seed(temp_db)
         cfg = self._cfg([BuildVariant(name="a"), BuildVariant(name="b")])
-        scopes, multi, err = resolve_scopes(temp_db, "proj", cfg, "*", "")
-        assert scopes == []
+        config_hash, err = resolve_build(temp_db, "proj", cfg, "*", "")
+        assert config_hash is None
         assert err is not None and "ONE build" in err
         assert "ask twice" in err, f"the error gives no way forward: {err}"
 
     def test_unknown_variant_errors(self, temp_db):
         self._seed(temp_db)
         cfg = self._cfg([BuildVariant(name="a")])
-        scopes, multi, err = resolve_scopes(temp_db, "proj", cfg, "zzz", "")
+        config_hash, err = resolve_build(temp_db, "proj", cfg, "zzz", "")
         assert err is not None and "Unknown variant" in err
 
     def test_unknown_image_names_the_known_ones(self, temp_db):
         self._seed(temp_db)
         cfg = self._cfg([BuildVariant(name="a")])
-        scopes, multi, err = resolve_scopes(temp_db, "proj", cfg, "a", "zzz")
-        assert scopes == []
+        config_hash, err = resolve_build(temp_db, "proj", cfg, "a", "zzz")
+        assert config_hash is None
         assert err is not None and "Unknown image" in err
         assert "app" in err and "stage0" in err, f"got: {err}"
 
     def test_specific_image_narrows(self, temp_db):
         self._seed(temp_db)
         cfg = self._cfg([BuildVariant(name="a")])
-        scopes, multi, err = resolve_scopes(temp_db, "proj", cfg, "a", "stage0")
-        assert err is None and [s["image"] for s in scopes] == ["stage0"]
+        config_hash, err = resolve_build(temp_db, "proj", cfg, "a", "stage0")
+        assert err is None and config_hash == "h-a-stage"
 
-    def test_a_selection_never_gives_two_scopes(self, temp_db):
-        """The contract the rest of the code now rests on."""
+    def test_every_selection_names_its_own_build(self, temp_db):
+        """The contract the rest of the code now rests on.
+
+        One selection, one ``config_hash``, and no two selections share it.
+        """
         self._seed(temp_db)
         cfg = self._cfg([BuildVariant(name="a"), BuildVariant(name="b")])
+        seen: dict[str, tuple[str, str]] = {}
         for variant, image in (("a", "app"), ("a", "stage0"), ("b", "app")):
-            scopes, _multi, err = resolve_scopes(temp_db, "proj", cfg, variant, image)
+            config_hash, err = resolve_build(temp_db, "proj", cfg, variant, image)
             assert err is None, f"{variant}/{image}: {err}"
-            assert len(scopes) == 1, f"{variant}/{image} gave {len(scopes)} scopes"
+            assert config_hash is not None, f"{variant}/{image} named no build"
+            assert config_hash not in seen, (
+                f"{variant}/{image} and {seen.get(config_hash)} share one build"
+            )
+            seen[config_hash] = (variant, image)

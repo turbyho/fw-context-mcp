@@ -1,10 +1,14 @@
-"""An empty result is diagnosed once, not once per build variant.
+"""An empty result is diagnosed once, and it warns once.
 
 diagnose_empty_result() stats every indexed file, hashes the suspects and
 lists the source tree, and it runs inside execute_sync — filesystem work
-holding the one shared connection.  execute_scoped() called it per scope:
-nine configs on the Zephyr project meant nine scans, and the duplicate notices
-were thrown away afterwards by the dedup _base.py already had.
+holding the one shared connection.  It must therefore run once per query.
+
+It once ran once per build scope: nine configs on the Zephyr project meant
+nine scans, and a dedup in _base.py threw the duplicate notices away
+afterwards.  Both the loop and the dedup are gone, because execute_scoped
+answers for ONE build — see mcp/shared/variants.py.  The invariant these
+tests hold is what survived that: one query, one diagnosis, one warning.
 """
 
 from __future__ import annotations
@@ -70,42 +74,36 @@ def _count_diagnoses(monkeypatch) -> dict:
     return calls
 
 
-class TestDiagnoseOncePerQuery:
-    def test_a_multi_scope_query_diagnoses_once(self, project, monkeypatch):
-        from fw_context_mcp.mcp.handlers._base import DbContext
+def _context(root, executor, db_path):
+    """The context of one request: one build, named by its config hash."""
+    from fw_context_mcp.mcp.handlers._base import DbContext
 
+    return DbContext(
+        db_path=db_path, executor=executor, config_hash="ch1", cfg=None,
+        project_id="pid", root=root,
+    )
+
+
+class TestDiagnoseOncePerQuery:
+    def test_one_query_diagnoses_once(self, project, monkeypatch):
         root, executor, db_path = project
         calls = _count_diagnoses(monkeypatch)
-        db = DbContext(
-            db_path=db_path, executor=executor, config_hash="ch1", cfg=None,
-            project_id="pid", root=root,
-            scopes=[{"config_hash": c, "variant": c, "image": ""}
-                    for c in ("ch1", "ch2", "ch3")],
-            multi=True,
-        )
+        db = _context(root, executor, db_path)
 
         db.execute_scoped(lambda conn, ch: [{"info": "no results"}])
 
         assert calls["n"] == 1, (
-            "the diagnosis describes the project, not one build of it; the "
-            "dedup below already threw the duplicates away"
+            "the diagnosis is filesystem work under the shared connection, "
+            "thus one query must pay for it once"
         )
 
-    def test_the_warning_still_reaches_the_caller_once(self, project, monkeypatch):
-        from fw_context_mcp.mcp.handlers._base import DbContext
-
+    def test_the_warning_reaches_the_caller_once(self, project, monkeypatch):
         root, executor, db_path = project
         # Make the project look behind: the bytes no longer match the hash
         # the index holds.  Content, not timestamp — see the fixture.
         (root / "src" / "main.c").write_text("int main(void){return 1;}\n",
                                              encoding="utf-8")
-        db = DbContext(
-            db_path=db_path, executor=executor, config_hash="ch1", cfg=None,
-            project_id="pid", root=root,
-            scopes=[{"config_hash": c, "variant": c, "image": ""}
-                    for c in ("ch1", "ch2", "ch3")],
-            multi=True,
-        )
+        db = _context(root, executor, db_path)
 
         result = db.execute_scoped(lambda conn, ch: [{"info": "no results"}])
         warnings = [r for r in result if isinstance(r, dict) and set(r) == {"warning"}]

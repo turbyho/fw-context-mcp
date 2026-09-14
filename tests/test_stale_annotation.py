@@ -263,14 +263,16 @@ class TestExecuteScopedAnswersForOneBuild:
     about both served none.  See ``mcp/shared/variants.py``.
     """
 
-    def _context(self, indexed_file, scope_count: int = 1):
+    def _context(self, indexed_file):
+        """Build the context of one request.
+
+        ``config_hash`` names the build, and there is no list of scopes to
+        pass: ``_resolve_handler_context`` reads the one hash that
+        ``resolve_scopes`` gives and stores it in that field.
+        """
         from fw_context_mcp.mcp.handlers._base import DbContext
 
         executor, root, file_path, _db_key = indexed_file
-        scopes = [
-            {"config_hash": _CONFIG_HASH, "variant": f"v{i}", "image": "app"}
-            for i in range(scope_count)
-        ]
         ctx = DbContext(
             db_path=root / "index.db",
             executor=executor,
@@ -278,8 +280,6 @@ class TestExecuteScopedAnswersForOneBuild:
             cfg=None,
             project_id="proj-001",
             root=root,
-            scopes=scopes,
-            multi=scope_count > 1,
         )
         return ctx, file_path
 

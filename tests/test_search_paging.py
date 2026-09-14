@@ -546,3 +546,59 @@ class TestSearchCodePages:
             conn.close()
         assert primary["total"] == 13
         assert wider == 17, f"the name-token step must reach further, got {wider}"
+
+
+class TestAZeroLimitCannotStallTheWalk:
+    """A page must hold a row, otherwise its own hint leads nowhere.
+
+    ``page_notice`` reads ``more`` from ``offset + shown < total``.  With
+    ``shown`` at zero the page is always "not the last one" and the hint
+    names the offset the reader already gave, thus a reader that follows
+    the hint asks the same question for ever.  Each tool clamps the limit
+    to one row at least.
+    """
+
+    @pytest.mark.parametrize("limit", [0, -3])
+    def test_search_code_still_answers_with_a_row(self, project: Path, limit: int):
+        from fw_context_mcp.mcp.handlers.search import search_code
+
+        rows = search_code("probe", project_root=str(project), limit=limit)
+
+        notice = _notice(rows)
+        assert notice is not None, f"no page notice: {rows}"
+        assert notice["shown"] >= 1, f"got: {notice}"
+        assert len(_answers(rows)) >= 1
+
+    @pytest.mark.parametrize("limit", [0, -3])
+    def test_search_bodies_still_answers_with_a_row(self, project: Path, limit: int):
+        from fw_context_mcp.mcp.handlers.search import search_bodies
+
+        notice = _notice(search_bodies("probe", project_root=str(project), limit=limit))
+        assert notice is not None
+        assert notice["shown"] >= 1, f"got: {notice}"
+
+    @pytest.mark.parametrize("limit", [0, -3])
+    def test_search_content_still_answers_with_a_row(self, project: Path, limit: int):
+        from fw_context_mcp.mcp.handlers.search import search_content
+
+        notice = _notice(search_content("probe", project_root=str(project), limit=limit))
+        assert notice is not None
+        assert notice["shown"] >= 1, f"got: {notice}"
+
+    @pytest.mark.parametrize("limit", [0, -3])
+    def test_lookup_symbol_still_answers_with_a_row(self, project: Path, limit: int):
+        from fw_context_mcp.mcp.handlers._lookup import lookup_symbol
+
+        notice = _notice(lookup_symbol(
+            "read", project_root=str(project), exact=True, limit=limit,
+        ))
+        assert notice is not None
+        assert notice["shown"] >= 1, f"got: {notice}"
+
+    def test_the_hint_of_such_a_page_would_not_advance(self):
+        """The defect itself, stated once: the hint repeats the offset."""
+        from fw_context_mcp.mcp.shared.paging import page_notice
+
+        stalled = page_notice(12, 4, 0, hint="search_code('x', offset=4) reads the next page.")
+        assert stalled["more"] is True
+        assert "offset=4" in stalled["hint"]

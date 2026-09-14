@@ -64,16 +64,14 @@ class DbContext:
     cfg: Config
     project_id: str
     root: Path
-    scopes: list[dict] = dataclasses.field(default_factory=list)
-    multi: bool = False
 
     def execute_scoped(self, query_fn):
         """Run ``query_fn(conn, config_hash)`` for the selected build.
 
-        ``resolve_scopes`` answers with ONE scope, because a question about
-        code is a question about one program — see the docstring of
-        ``shared/variants.py``.  This therefore runs one query and returns
-        its result unchanged.
+        ``config_hash`` IS the selected build.  ``resolve_build`` answers
+        with one build, because a question about code is a question about
+        one program — see the docstring of ``shared/variants.py`` — and
+        ``_resolve_handler_context`` reads that one hash into this field.
 
         The call goes through ``with_stale_annotation``, thus a result that
         names a changed file carries a warning.  Without it the call-graph
@@ -84,13 +82,15 @@ class DbContext:
         This used to merge the answers of several builds, interleave them and
         share one limit between them.  That machinery is gone with the
         merging it served: a bootloader and an application are separate
-        programs, and one answer about both served no question.
+        programs, and one answer about both served no question.  The list
+        of scopes went with it — a list that can hold one element invites
+        a second pass over it, and that is how an unreachable merge branch
+        outlived the merge.
         """
         from ..shared.stale import with_stale_annotation
 
-        config_hash = self.scopes[0]["config_hash"] if self.scopes else self.config_hash
         return with_stale_annotation(
-            self.root, self.executor, query_fn, config_hash
+            self.root, self.executor, query_fn, self.config_hash
         )
 
 
@@ -111,11 +111,11 @@ class BaseHandler:
         variant: str | None = None,
         image: str | None = None,
     ) -> DbContext:
-        """Resolve project → config → db → executor → config_hash (+ scopes).
+        """Resolve project → config → db → executor → config_hash.
 
         Delegates to :func:`_resolve_handler_context` — one call replaces
         the common handler preamble.  ``variant``/``image`` narrow the
-        multi-project selection (fail-closed, see ``resolve_scopes``).
+        multi-project selection (fail-closed, see ``resolve_build``).
 
         Returns:
             A ``DbContext`` with all resolved fields.
@@ -133,8 +133,6 @@ class BaseHandler:
             cfg=ctx.cfg,
             project_id=ctx.project_id,
             root=ctx.root,
-            scopes=ctx.scopes,
-            multi=ctx.multi,
         )
 
 
