@@ -283,6 +283,38 @@ class TestAmbiguousCallPath:
         for path in payload:
             assert path["target_qualified_name"] == "ClassB::probe", f"got: {path}"
 
+    def test_one_caller_of_two_targets_gives_a_path_to_each(self, db):
+        """The depth-1 step returned the FIRST direct edge and stopped.
+
+        A function that calls two same-name methods reaches both, and the
+        notice above the rows names both.  One row then made the notice
+        read as a promise that the answer did not keep.
+        """
+        fid = upsert_file(db, CH, "src/both.cpp", "cpp")
+        insert_symbols_batch(db, [
+            _symbol_row(fid, "src/both.cpp", "both", "both", "u_both", 500, 520,
+                        kind="function"),
+        ])
+        insert_refs_batch(db, [
+            _ref_row("u_a_probe", "src/both.cpp", 505, "u_both"),
+            _ref_row("u_b_probe", "src/both.cpp", 506, "u_both"),
+        ])
+        db.commit()
+
+        paths = find_call_path(db, CH, "both", "probe")
+        payload = [p for p in paths if "warning" not in p]
+        targets = {p["target_qualified_name"] for p in payload}
+        assert targets == {"ClassA::probe", "ClassB::probe"}, (
+            f"the depth-1 step stopped at the first edge: {payload}"
+        )
+        assert all(p["depth"] == 1 for p in payload), payload
+
+    def test_one_direct_edge_still_answers_with_one_path(self, db):
+        """A name that means one symbol keeps the shape that it had."""
+        paths = find_call_path(db, CH, "ClassB::run_b", "ClassB::probe")
+        assert len(paths) == 1, f"got: {paths}"
+        assert paths[0]["depth"] == 1
+
 
 class TestRepairFromUsr:
     """A reference with no caller is invisible to the graph, thus it is repaired."""
@@ -320,6 +352,28 @@ class TestRepairFromUsr:
         ])
         db.commit()
         return db
+
+    @pytest.fixture
+    def db_with_one_line_body(self, db_with_gaps):
+        """An inline accessor whose whole body sits on one line.
+
+        Embedded headers carry this shape by habit — ``bool ready() const
+        { return r_; }`` — and such a definition has ``end_line == line``.
+        Measured over seven indexed projects: 66 to 1158 of them per index,
+        and 54 caller-less references that no other body can claim.
+        """
+        insert_symbols_batch(db_with_gaps, [
+            _symbol_row(db_with_gaps.execute(
+                "SELECT id FROM files WHERE config_hash=? AND path=?",
+                (CH, "src/gap.cpp"),
+            ).fetchone()["id"], "src/gap.cpp", "ready", "Gap::ready", "u_ready",
+                600, 600),
+        ])
+        insert_refs_batch(db_with_gaps, [
+            _ref_row("u_callee", "src/gap.cpp", 600, None),
+        ])
+        db_with_gaps.commit()
+        return db_with_gaps
 
     def _callers_of(self, conn, from_line: int) -> str | None:
         row = conn.execute(
@@ -397,6 +451,62 @@ class TestRepairFromUsr:
         after = find_all_callers_recursive(db_with_gaps, CH, "Gap::callee", max_depth=3)
         names = {r["qualified_name"] for r in after}
         assert names == {"Gap::outer", "Gap::outer::lambda"}, f"got: {names}"
+
+    def test_a_body_on_one_line_is_a_caller_too(self, db_with_one_line_body):
+        """``end_line == line`` is a whole body, not a declaration.
+
+        ``is_definition = 1`` already keeps a declaration out, thus a span
+        of one line needs no guard of its own.  The guard that asked for
+        ``end_line > line`` only lost the inline accessors.
+        """
+        _step_repair_from_usr(db_with_one_line_body, {"config_hash": CH})
+        assert self._callers_of(db_with_one_line_body, 600) == "u_ready"
+
+    def test_a_definition_with_no_extent_is_not_a_caller(self, db_with_one_line_body):
+        """``end_line = 0`` means that the extent is missing, not that it is one line.
+
+        Such a row would otherwise claim every reference of its file that
+        sits on line 0 or below, and it describes no body at all.
+        """
+        fid = db_with_one_line_body.execute(
+            "SELECT id FROM files WHERE config_hash=? AND path=?",
+            (CH, "src/gap.cpp"),
+        ).fetchone()["id"]
+        insert_symbols_batch(db_with_one_line_body, [
+            _symbol_row(fid, "src/gap.cpp", "noextent", "Gap::noextent",
+                        "u_noextent", 0, 0),
+        ])
+        insert_refs_batch(db_with_one_line_body, [
+            _ref_row("u_callee", "src/gap.cpp", 0, None),
+        ])
+        db_with_one_line_body.commit()
+
+        _step_repair_from_usr(db_with_one_line_body, {"config_hash": CH})
+        assert self._callers_of(db_with_one_line_body, 0) is None
+
+    def test_two_bodies_of_one_span_resolve_the_same_way_twice(
+        self, db_with_one_line_body,
+    ):
+        """The repair WRITES an edge, thus it must not depend on a scan order.
+
+        Two definitions can share a span — one line that holds both, or
+        generated code.  The span alone then ties, and SQLite may return
+        either row.  A run that picks differently writes a different graph.
+        """
+        fid = db_with_one_line_body.execute(
+            "SELECT id FROM files WHERE config_hash=? AND path=?",
+            (CH, "src/gap.cpp"),
+        ).fetchone()["id"]
+        # Inserted after ``u_ready`` and sorting before it by USR.
+        insert_symbols_batch(db_with_one_line_body, [
+            _symbol_row(fid, "src/gap.cpp", "also", "Gap::also", "u_also", 600, 600),
+        ])
+        db_with_one_line_body.commit()
+
+        _step_repair_from_usr(db_with_one_line_body, {"config_hash": CH})
+        assert self._callers_of(db_with_one_line_body, 600) == "u_also", (
+            "the span tied, thus the USR must settle it"
+        )
 
 
 class TestBackfillWritesNoGuess:

@@ -320,7 +320,11 @@ _MAX_CALL_PATHS = 5
 
 
 def _record_path(
-    found: list[dict], seen_chains: set[str], depth: int, chain: str, to_usr: str
+    found: list[dict],
+    seen_chains: set[tuple[str, str]],
+    depth: int,
+    chain: str,
+    to_usr: str,
 ) -> bool:
     """Add one path to *found* when it is new.  Say whether the list is full.
 
@@ -330,10 +334,18 @@ def _record_path(
     the same chain four times, and the limit of five paths was spent on
     repeats instead of alternatives.  A caller that reads the answer as "the
     ways to reach this function" then counts one way as four.
+
+    WHY the target joins the key: a name that means several symbols seeds
+    several targets, and the chain carries the NAME of the callee.  Two
+    paths that end at two same-name symbols thus read alike, and a key of
+    the text alone drops the second one as a repeat.  Those are two
+    answers, not one — ``target_usr`` and ``target_qualified_name`` tell
+    them apart on the row.
     """
-    if chain in seen_chains:
+    key = (chain, to_usr)
+    if key in seen_chains:
         return False
-    seen_chains.add(chain)
+    seen_chains.add(key)
     found.append({"depth": depth, "chain": chain, "target_usr": to_usr})
     return len(found) >= _MAX_CALL_PATHS
 
@@ -533,17 +545,23 @@ def find_call_path(
 
     from_name_resolved = _get_name(from_usr)
 
-    # ── Direct edge check (depth 1) — same as old code for fast path ──
+    # ── Direct edge check (depth 1) — the fast path ──
+    # Every direct edge is taken, and not the first one alone.  A name that
+    # means several symbols seeds several targets, thus one function can
+    # call two of them: measured on a seeded index, a caller of two
+    # same-name methods answered with one path while the notice above the
+    # rows named both symbols.  ``_record_path`` keeps the answer within
+    # the five paths that this tool reports, and it drops a repeat.
+    direct: list[dict] = []
+    direct_chains: set[tuple[str, str]] = set()
     for to_usr_edge, callee_name in _get_edges_multi(_from_variants):
-        if to_usr_edge in _to_variants:
-            return _paths_with_targets(
-                [{
-                    "depth": 1,
-                    "chain": f"{from_name_resolved} → {callee_name}",
-                    "target_usr": to_usr_edge,
-                }],
-                to_name, to_usrs, to_names, to_total,
-            )
+        if to_usr_edge in _to_variants and _record_path(
+            direct, direct_chains, 1,
+            f"{from_name_resolved} → {callee_name}", to_usr_edge,
+        ):
+            break
+    if direct:
+        return _paths_with_targets(direct, to_name, to_usrs, to_names, to_total)
 
     # ── Bidirectional BFS — expands forward from source AND reverse from target
     # simultaneously.  Halves the effective search depth (O(b^(d/2)) vs O(b^d))
@@ -575,7 +593,7 @@ def find_call_path(
     f_queue: deque[str] = deque(f_dist.keys())
     r_queue: deque[str] = deque(r_dist.keys())
     found: list[dict] = []
-    seen_chains: set[str] = set()
+    seen_chains: set[tuple[str, str]] = set()
     depth = 0
     nodes_expanded = 0
 

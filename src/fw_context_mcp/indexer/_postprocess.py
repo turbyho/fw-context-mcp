@@ -1119,16 +1119,31 @@ def _step_build_overrides(conn: sqlite3.Connection, ctx: dict) -> None:
 #: The text is one constant because the UPDATE below runs it in the SET and
 #: again in the WHERE.  Two copies would drift, and the step would then
 #: count rows it did not repair.
+#:
+#: ``end_line >= s.line`` reaches a body that begins and ends on ONE line.
+#: An embedded header carries that shape by habit — ``bool ready() const {
+#: return r_; }`` — and ``is_definition = 1`` already keeps a declaration
+#: out, thus a span of one line needs no guard of its own.  The guard that
+#: asked for a span of more than one line lost only the inline accessors:
+#: measured over seven indexed projects, 66 to 1158 such definitions per
+#: index and 54 caller-less references that no other body can claim.
+#: ``end_line > 0`` stays, because a row with no extent describes no body.
+#:
+#: The order ends at ``s.usr``.  Two definitions can share a span — one
+#: line that holds both, or generated code — and the span alone then ties.
+#: This step WRITES an edge into ``refs``, thus a tie that SQLite settles
+#: by its scan order would give two index runs two different graphs.
 _ENCLOSING_CALLABLE_SQL = """
     SELECT s.usr FROM symbols s
     WHERE s.config_hash = refs.config_hash
       AND s.file_path = refs.from_file
       AND s.is_definition = 1
       AND s.kind IN ('function', 'method', 'constructor', 'destructor')
-      AND s.end_line > s.line
+      AND s.end_line >= s.line
+      AND s.end_line > 0
       AND s.line <= refs.from_line
       AND s.end_line >= refs.from_line
-    ORDER BY (s.end_line - s.line) ASC
+    ORDER BY (s.end_line - s.line) ASC, s.usr
     LIMIT 1"""
 
 
