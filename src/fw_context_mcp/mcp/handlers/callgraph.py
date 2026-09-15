@@ -268,6 +268,7 @@ def _references_result(name: str, project_root: str | None, ref_kind: str | list
         # Every branch below names the relation and the tool that reads the
         # next page, thus both are resolved once here.
         label = "callers" if caller_mode else "references"
+        relation_one = "caller" if caller_mode else "reference"
         tool = "find_callers" if caller_mode else "find_references"
         symbol = _lookup_definition(conn, config_hash, name, preferred_kinds=None)
         if symbol is None:
@@ -403,6 +404,22 @@ def _references_result(name: str, project_root: str | None, ref_kind: str | list
                     virtual_total, skip, shown,
                     hint=f"{tool}('{name}', offset={skip + shown}) reads the next page.",
                 ))
+                if len(candidates) > 1:
+                    # This branch answers about the peers of ONE symbol,
+                    # which ``_lookup_definition`` chose.  A row of it
+                    # carries no ``target_qualified_name``, because the
+                    # rows describe one hierarchy and not several symbols.
+                    # A reader thus has no way to see which symbol the
+                    # answer belongs to, and the name means more than one.
+                    virtual_rows.insert(0, {"warning": (
+                        f"The name '{name}' matches "
+                        f"{count_candidates(conn, config_hash, name)} symbols, "
+                        f"and none of them has a {relation_one} of its own. "
+                        f"The rows below are the {label} of the methods that "
+                        f"override the same base method as "
+                        f"'{symbol['qualified_name'] or symbol['name']}'. "
+                        f"Give a full qualified name to ask about one symbol."
+                    )})
                 return virtual_rows
             return [{"info": f"No {label} found for '{name}'."}]
         # The rows carry a tag only when the name matched several symbols.
@@ -507,6 +524,12 @@ def find_callers(
         symbols, and each result carries ``target_qualified_name``.  Give
         the full qualified name to ask about one symbol only.
 
+        A virtual method with no call site of its own answers with the
+        call sites of the methods that override the same base method.
+        Those rows describe ONE hierarchy, thus they carry no
+        ``target_qualified_name``.  When the name is ambiguous as well, a
+        ``warning`` dict names the symbol that the answer belongs to.
+
         Never empty: one dict with ``error`` (symbol not resolved) or
         ``info`` (no references of this kind).  Check both keys first.
     """
@@ -570,6 +593,12 @@ def find_references(
         names the symbols, and each result carries
         ``target_qualified_name``.  Give the full qualified name to ask
         about one symbol only.
+
+        A virtual method with no reference of its own answers with the
+        references of the methods that override the same base method.
+        Those rows describe ONE hierarchy, thus they carry no
+        ``target_qualified_name``.  When the name is ambiguous as well, a
+        ``warning`` dict names the symbol that the answer belongs to.
 
         Never empty: one dict with ``error`` (symbol not resolved) or
         ``info`` (no references).  Check both keys first.

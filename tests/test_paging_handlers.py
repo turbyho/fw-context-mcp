@@ -141,6 +141,58 @@ def project(tmp_path: Path) -> Path:
     return root
 
 
+@pytest.fixture
+def two_devs(project: Path) -> Path:
+    """Two namespaces, each with a ``Dev`` class that overrides one base.
+
+    ``Dev::reset`` is thus the name of TWO symbols, and neither of them has
+    a call site of its own.  ``Mid::reset`` overrides the same base method
+    and has three call sites.
+
+    ``Mid::reset`` stays OUT of the candidate list: the query matches it on
+    the bare tail alone, which is one rank below the two that match the
+    ``Dev::reset`` suffix.  The count of the direct answer is therefore
+    zero, and the peer-override fallback answers.
+    """
+    conn = open_db(project.parent / PROJECT_ID / "index.db")
+    try:
+        with transaction(conn):
+            fid = upsert_file(conn, CH, "src/dev.cpp", "cpp")
+            insert_symbols_batch(conn, [
+                _symbol(fid, "src/dev.cpp", "DevBase", "hal::DevBase", "u_devbase",
+                        300, kind="class"),
+                _symbol(fid, "src/dev.cpp", "reset", "hal::DevBase::reset",
+                        "u_devbase_reset", 301, parent_usr="u_devbase"),
+                _symbol(fid, "src/dev.cpp", "Dev", "a::Dev", "u_a_dev", 310,
+                        kind="class"),
+                _symbol(fid, "src/dev.cpp", "reset", "a::Dev::reset", "u_a_reset",
+                        311, parent_usr="u_a_dev"),
+                _symbol(fid, "src/dev.cpp", "Dev", "b::Dev", "u_b_dev", 320,
+                        kind="class"),
+                _symbol(fid, "src/dev.cpp", "reset", "b::Dev::reset", "u_b_reset",
+                        321, parent_usr="u_b_dev"),
+                _symbol(fid, "src/dev.cpp", "Mid", "hal::Mid", "u_mid", 330,
+                        kind="class"),
+                _symbol(fid, "src/dev.cpp", "reset", "hal::Mid::reset", "u_mid_reset",
+                        331, parent_usr="u_mid"),
+            ])
+            conn.executemany(
+                "INSERT INTO overrides(config_hash, derived_usr, base_usr) VALUES (?,?,?)",
+                [
+                    (CH, "u_a_reset", "u_devbase_reset"),
+                    (CH, "u_b_reset", "u_devbase_reset"),
+                    (CH, "u_mid_reset", "u_devbase_reset"),
+                ],
+            )
+            insert_refs_batch(conn, [
+                (CH, "u_mid_reset", "src/dl.cpp", 300 + i, "u_app", "call", None)
+                for i in range(3)
+            ])
+    finally:
+        conn.close()
+    return project
+
+
 class TestOneAnswerOwnsTheWalk:
     """The step that answers owns every page of the walk.
 
@@ -217,6 +269,35 @@ class TestOneAnswerOwnsTheWalk:
         assert notice == {"total": 8, "offset": 3, "shown": 3, "more": True,
                           "hint": notice.get("hint", "")}, notice
         assert "offset=6" in notice["hint"], notice
+
+    def test_a_named_symbol_needs_no_ambiguity_row(self, project: Path):
+        """One candidate, thus nothing to choose and nothing to report."""
+        from fw_context_mcp.mcp.handlers.callgraph import find_callers
+
+        rows = find_callers("Rom::stop", project_root=str(project), limit=50)
+
+        assert not any("warning" in r for r in rows), rows
+
+    def test_the_peer_answer_names_the_symbol_it_took(self, two_devs: Path):
+        """The rows describe ONE hierarchy, thus the answer must name it.
+
+        ``Dev::reset`` means two methods here and neither has a call site
+        of its own, thus the peer-override fallback answers.  Its rows
+        carry no ``target_qualified_name``, because they describe one
+        hierarchy and not several symbols.  Without a row that names the
+        symbol, a reader cannot tell which of the two the answer is about.
+        """
+        from fw_context_mcp.mcp.handlers.callgraph import find_callers
+
+        rows = find_callers("Dev::reset", project_root=str(two_devs), limit=50)
+
+        warning = next((r["warning"] for r in rows if "warning" in r), None)
+        assert warning is not None, f"the answer named no symbol: {rows}"
+        assert "matches 2 symbols" in warning, warning
+        assert "Dev::reset" in warning, warning
+        notice = _notice(rows)
+        assert notice is not None, rows
+        assert notice["total"] == 3, f"the peer holds three call sites: {notice}"
 
 
 class TestAZeroLimitCannotStallTheWalk:
