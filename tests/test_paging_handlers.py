@@ -163,14 +163,19 @@ def two_devs(project: Path) -> Path:
                         300, kind="class"),
                 _symbol(fid, "src/dev.cpp", "reset", "hal::DevBase::reset",
                         "u_devbase_reset", 301, parent_usr="u_devbase"),
-                _symbol(fid, "src/dev.cpp", "Dev", "a::Dev", "u_a_dev", 310,
-                        kind="class"),
-                _symbol(fid, "src/dev.cpp", "reset", "a::Dev::reset", "u_a_reset",
-                        311, parent_usr="u_a_dev"),
-                _symbol(fid, "src/dev.cpp", "Dev", "b::Dev", "u_b_dev", 320,
+                # The LINE order is the reverse of the USR order on purpose.
+                # ``_lookup_definition`` ranks by line and picks b::Dev,
+                # ``resolve_candidates`` breaks its tie on the USR and picks
+                # a::Dev.  A fixture where the two agree cannot show that
+                # one answer read both.
+                _symbol(fid, "src/dev.cpp", "Dev", "b::Dev", "u_b_dev", 304,
                         kind="class"),
                 _symbol(fid, "src/dev.cpp", "reset", "b::Dev::reset", "u_b_reset",
-                        321, parent_usr="u_b_dev"),
+                        305, parent_usr="u_b_dev"),
+                _symbol(fid, "src/dev.cpp", "Dev", "a::Dev", "u_a_dev", 314,
+                        kind="class"),
+                _symbol(fid, "src/dev.cpp", "reset", "a::Dev::reset", "u_a_reset",
+                        315, parent_usr="u_a_dev"),
                 _symbol(fid, "src/dev.cpp", "Mid", "hal::Mid", "u_mid", 330,
                         kind="class"),
                 _symbol(fid, "src/dev.cpp", "reset", "hal::Mid::reset", "u_mid_reset",
@@ -269,6 +274,32 @@ class TestOneAnswerOwnsTheWalk:
         assert notice == {"total": 8, "offset": 3, "shown": 3, "more": True,
                           "hint": notice.get("hint", "")}, notice
         assert "offset=6" in notice["hint"], notice
+
+    def test_the_named_symbol_is_one_the_answer_lists(self, two_devs: Path):
+        """One resolver owns the whole answer, count and name alike.
+
+        The tool resolves the name twice: ``_lookup_definition`` for the
+        symbol of the fallback, and ``resolve_candidates`` for the count
+        and the ambiguity.  The two rank differently — one is the resolver
+        of the body tools, the other ranks a match on its specificity —
+        thus the fallback could name a symbol that the count never counted.
+        """
+        from fw_context_mcp.indexer.db import open_db
+        from fw_context_mcp.indexer.db._resolve import resolve_candidates
+        from fw_context_mcp.mcp.handlers.callgraph import find_callers
+
+        rows = find_callers("Dev::reset", project_root=str(two_devs), limit=50)
+        warning = next((r["warning"] for r in rows if "warning" in r), None)
+        assert warning is not None, rows
+
+        conn = open_db(two_devs.parent / PROJECT_ID / "index.db")
+        try:
+            candidates = resolve_candidates(conn, CH, "Dev::reset")
+        finally:
+            conn.close()
+        assert candidates[0].qualified_name in warning, (
+            f"the fallback named a symbol outside the candidate list: {warning}"
+        )
 
     def test_a_named_symbol_needs_no_ambiguity_row(self, project: Path):
         """One candidate, thus nothing to choose and nothing to report."""

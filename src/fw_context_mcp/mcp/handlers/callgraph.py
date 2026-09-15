@@ -382,8 +382,20 @@ def _references_result(name: str, project_root: str | None, ref_kind: str | list
             # dispatch resolution. C++ virtual method calls through
             # base-class pointers are often recorded against the nearest
             # (base) override, not the most-derived one.
+            #
+            # The symbol comes from ``candidates``, which is the resolver
+            # that also built the count and the ambiguity of this answer.
+            # ``_lookup_definition`` ranks differently — it is the resolver
+            # of the body tools, and it orders by the line — thus a
+            # fallback that took ITS pick could name a symbol that this
+            # answer never lists.  Measured on a seeded index: two
+            # namespaces each with a Dev class, and the answer counted
+            # a::Dev::reset while the rows hung from b::Dev::reset.
+            # ``symbol`` stays the gate that says the name resolves at all.
+            chosen = candidates[0] if candidates else None
             virtual_result = _resolve_virtual_callers(
-                conn, config_hash, symbol["usr"], root, ref_kind=ref_kind,
+                conn, config_hash, chosen.usr if chosen else symbol["usr"],
+                root, ref_kind=ref_kind,
                 limit=clamped_limit, offset=skip,
             )
             if virtual_result is not None:
@@ -404,20 +416,20 @@ def _references_result(name: str, project_root: str | None, ref_kind: str | list
                     virtual_total, skip, shown,
                     hint=f"{tool}('{name}', offset={skip + shown}) reads the next page.",
                 ))
-                if len(candidates) > 1:
-                    # This branch answers about the peers of ONE symbol,
-                    # which ``_lookup_definition`` chose.  A row of it
-                    # carries no ``target_qualified_name``, because the
-                    # rows describe one hierarchy and not several symbols.
-                    # A reader thus has no way to see which symbol the
-                    # answer belongs to, and the name means more than one.
+                if chosen is not None and len(candidates) > 1:
+                    # This branch answers about the peers of ONE symbol.  A
+                    # row of it carries no ``target_qualified_name``,
+                    # because the rows describe one hierarchy and not
+                    # several symbols.  A reader thus has no way to see
+                    # which symbol the answer belongs to, and the name
+                    # means more than one.
                     virtual_rows.insert(0, {"warning": (
                         f"The name '{name}' matches "
                         f"{count_candidates(conn, config_hash, name)} symbols, "
                         f"and none of them has a {relation_one} of its own. "
                         f"The rows below are the {label} of the methods that "
                         f"override the same base method as "
-                        f"'{symbol['qualified_name'] or symbol['name']}'. "
+                        f"'{chosen.qualified_name}'. "
                         f"Give a full qualified name to ask about one symbol."
                     )})
                 return virtual_rows
