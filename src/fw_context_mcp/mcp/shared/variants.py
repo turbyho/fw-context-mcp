@@ -81,7 +81,17 @@ def resolve_build(
     indexed_variants = sorted(
         {r["variant"] for r in get_builds_for_scope(conn, project_id) if r["variant"]}
     )
-    names = declared or indexed_variants
+    # The two are UNITED, and it is not one or the other.  ``declared or
+    # indexed`` read the index only when the config declared NOTHING, thus
+    # one declared variant hid every indexed one beside it: that name came
+    # back as unknown and its build was out of reach, with no command to
+    # reach it — the operator would have to edit config.toml to query a
+    # build that already exists.  The reason the index takes part in this
+    # decision holds for every name in it, not only for the first.
+    #
+    # The declared order leads, because it is the order the operator wrote
+    # and the order the refusal below reads out.
+    names = declared + [v for v in indexed_variants if v not in declared]
 
     if not names:
         row = get_active_config(conn, project_id)

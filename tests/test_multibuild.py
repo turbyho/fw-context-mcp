@@ -145,6 +145,32 @@ class TestVariantDiscovery:
         assert discovery["variants"][0]["board"] == "b1"
         assert discovery["variant_images"]["nrf52840"] == ["app", "mcuboot"]
 
+    def test_a_declared_variant_does_not_hide_an_indexed_one(self):
+        """This table is where the refusal of ``resolve_build`` sends a reader.
+
+        ``resolve_build`` unites the declared names with the indexed ones,
+        thus its refusal reads "one of: a, b. Call get_active_build() for
+        the variants/images table".  Listing the declared names alone left
+        that table showing 'a' only, and a reader who followed the advice
+        could not find 'b'.
+        """
+        from fw_context_mcp.mcp.handlers.maintenance import _build_variant_discovery
+
+        cfg = self._make_cfg()
+        cfg.build.variants = [BuildVariant(name="a", board="board-a")]
+        cfg.build.default_variant = None
+        builds = [
+            {"variant": "a", "image": "app", "board": "board-a", "config_hash": "h1"},
+            {"variant": "b", "image": "app", "board": "board-b", "config_hash": "h2"},
+        ]
+
+        discovery = _build_variant_discovery(cfg, builds, Path("/tmp"))
+
+        assert [v["name"] for v in discovery["variants"]] == ["a", "b"], (
+            f"the table hides a build that exists: {discovery['variants']}"
+        )
+        assert discovery["variants"][1]["board"] == "board-b"
+
     def test_a_single_project_stays_single(self):
         """No variant anywhere means no choice to make."""
         from fw_context_mcp.mcp.handlers.maintenance import _build_variant_discovery
@@ -283,6 +309,46 @@ class TestResolveBuild:
         cfg = self._cfg([BuildVariant(name="a")])
         config_hash, err = resolve_build(temp_db, "proj", cfg, "zzz", "")
         assert err is not None and "Unknown variant" in err
+
+    def test_a_declared_variant_does_not_hide_an_indexed_one(self, temp_db):
+        """The declared names and the indexed ones are UNITED.
+
+        ``declared or indexed`` read the index only when the config
+        declared nothing at all.  One declared variant therefore hid every
+        other variant the index holds: 'b' came back as unknown and its
+        build was out of reach, with no command to reach it — config.toml
+        would have to be edited to query a build that already exists.
+        """
+        self._seed(temp_db)
+        cfg = self._cfg([BuildVariant(name="a")])
+
+        config_hash, err = resolve_build(temp_db, "proj", cfg, "b", "")
+
+        assert err is None, f"an indexed variant was refused: {err}"
+        assert config_hash == "h-b-app"
+
+    def test_the_refusal_names_the_indexed_variant_too(self, temp_db):
+        self._seed(temp_db)
+        cfg = self._cfg([BuildVariant(name="a")])
+
+        _hash, err = resolve_build(temp_db, "proj", cfg, "", "")
+
+        assert err is not None, "three builds, and no selector: this must refuse"
+        # The whole list, and not the letter alone — "b" also sits inside
+        # the word "build", which every one of these messages carries.
+        assert "one of: a, b" in err, (
+            f"the refusal hides a build that exists: {err}"
+        )
+
+    def test_a_declared_variant_that_is_not_indexed_still_says_so(self, temp_db):
+        """The union must not turn 'declared but never built' into 'unknown'."""
+        self._seed(temp_db)
+        cfg = self._cfg([BuildVariant(name="a"), BuildVariant(name="ghost")])
+
+        config_hash, err = resolve_build(temp_db, "proj", cfg, "ghost", "")
+
+        assert config_hash is None
+        assert err is not None and "not indexed" in err, f"got: {err}"
 
     def test_unknown_image_names_the_known_ones(self, temp_db):
         self._seed(temp_db)

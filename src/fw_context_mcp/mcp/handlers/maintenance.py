@@ -201,27 +201,34 @@ def _build_variant_discovery(cfg: Config, builds: list, root: Path) -> dict:
             indexed_variants.append(name)
     multi = bool(variants_cfg) or bool(indexed_variants)
 
-    if variants_cfg:
-        variants = [
-            {
-                "name": v.name,
-                "description": v.description,
-                "board": v.board or build_cfg.board or "",
-            }
-            for v in variants_cfg
-        ]
-    else:
-        # Named by the builds themselves, so that a caller told to choose a
-        # variant has a list to choose from.
-        boards = {b["variant"] or "": (b["board"] or "") for b in builds}
-        variants = [
-            {
-                "name": name,
-                "description": "",
-                "board": boards.get(name) or build_cfg.board or "",
-            }
-            for name in indexed_variants
-        ]
+    # The declared variants and the indexed ones are UNITED, exactly as
+    # ``resolve_build`` unites them.  Listing the declared ones ALONE was
+    # the same ``declared or indexed`` fault one module over, and this is
+    # the table that the refusal of ``resolve_build`` sends the reader to:
+    # with 'a' declared and 'b' indexed, that refusal reads "one of: a, b.
+    # Call get_active_build() for the variants/images table" and the table
+    # showed only 'a'.  A reader who followed the advice could not find 'b'.
+    boards = {b["variant"] or "": (b["board"] or "") for b in builds}
+    declared_names = {v.name for v in variants_cfg}
+    variants = [
+        {
+            "name": v.name,
+            "description": v.description,
+            "board": v.board or boards.get(v.name) or build_cfg.board or "",
+        }
+        for v in variants_cfg
+    ]
+    # Named by the builds themselves, so that a caller told to choose a
+    # variant has every real choice to choose from.
+    variants += [
+        {
+            "name": name,
+            "description": "",
+            "board": boards.get(name) or build_cfg.board or "",
+        }
+        for name in indexed_variants
+        if name not in declared_names
+    ]
 
     images: list[dict] = []
     variant_images: dict[str, list[str]] = {}
