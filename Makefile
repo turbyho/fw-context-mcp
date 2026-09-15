@@ -141,7 +141,7 @@ lint:
 	$(VENV)/bin/ruff check src/
 	$(VENV)/bin/mypy src/
 
-# all tests except system and slow (both require manual invocation)
+# all tests except system, slow and live (each requires manual invocation)
 test-all:
 	$(VENV)/bin/pytest tests/ -q
 
@@ -149,4 +149,10 @@ test-all:
 test-slow:
 	$(VENV)/bin/pytest tests/ -q -m "slow"
 
-.PHONY: install update uninstall venv pip-install link-add clean-path dev test lint lint-security test-all test-slow
+# functional tests over the indexes that THIS machine holds.  They depend
+# on local state, thus they stay out of test-all; with no indexed project
+# they skip.
+test-live:
+	$(VENV)/bin/pytest tests/ -q -m "live"
+
+.PHONY: install update uninstall venv pip-install link-add clean-path dev test lint lint-security test-all test-slow test-live

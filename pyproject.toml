@@ -116,7 +116,7 @@ warn_redundant_casts = true
 
 [tool.pytest.ini_options]
 addopts = [
-    "-m", "not system and not slow",
+    "-m", "not system and not slow and not live",
     "--ignore=tests/builds/mbed_os/mbed-os/tools",
 ]
 testpaths = ["tests"]
@@ -125,5 +125,6 @@ markers = [
     "ollama: tests that require a running Ollama instance",
     "libclang: tests that require libclang and a C compiler (gcc/clang)",
     "system: tests that require real build tools (gcc/CMake/Make/PlatformIO) and run index on test fixtures",
+    "live: functional tests over the indexes that the machine already holds — they depend on local state, thus they run only through make test-live",
     "litellm: tests that require a running LiteLLM proxy at localhost:4000",
 ]
