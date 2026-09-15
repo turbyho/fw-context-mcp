@@ -455,7 +455,11 @@ def _post_index_optimize(
     except _sqlite3.Error:
         log.debug("PRAGMA optimize failed for %s", db_path, exc_info=True)
 
-    from ..config.global_db import open_global_db, upsert_project_registry
+    from ..config.global_db import (
+        open_global_db,
+        prune_stale_projects,
+        upsert_project_registry,
+    )
 
     _ptype = detected_system or "unknown"
     _gconn = open_global_db()
@@ -463,6 +467,13 @@ def _post_index_optimize(
         upsert_project_registry(
             _gconn, project_id, getattr(args, "name", None) or project_root.name, _ptype, str(project_root)
         )
+        # The registry only ever grew.  An index run is a good moment to
+        # drop what nothing on disk answers for any more — it already
+        # writes the row of THIS project, and a stale row of another one
+        # costs the `project="<name>"` selector an ambiguity error.
+        _removed = prune_stale_projects(_gconn)
+        if _removed:
+            print(f"  registry: removed {_removed} stale project row(s)")
     finally:
         _gconn.close()
 

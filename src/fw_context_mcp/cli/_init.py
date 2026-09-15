@@ -675,7 +675,11 @@ def cmd_init(args: argparse.Namespace) -> int:
     if proj_id:
         provisioned = True
         if not args.dry_run:
-            from ..config.global_db import open_global_db, upsert_project_registry
+            from ..config.global_db import (
+                open_global_db,
+                prune_stale_projects,
+                upsert_project_registry,
+            )
 
             proj_name = getattr(args, "name", None) or _proj_cfg.project.name or project_root.name
             try:
@@ -683,6 +687,14 @@ def cmd_init(args: argparse.Namespace) -> int:
                 upsert_project_registry(
                     glob_conn, proj_id, proj_name, build_system or "unknown", str(project_root)
                 )
+                # A project that takes a NEW id leaves its old row behind,
+                # and the two then share a name — which is what makes the
+                # `project="<name>"` selector refuse to answer.  This is
+                # the moment that new id appears, thus the moment to drop
+                # the row it replaced.
+                removed = prune_stale_projects(glob_conn)
+                if removed:
+                    print(f"  registry: removed {removed} stale project row(s)")
                 glob_conn.close()
             except Exception as exc:  # registry is best-effort — never fatal
                 print(f"  [warn] could not update global registry: {exc}")

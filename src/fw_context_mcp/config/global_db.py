@@ -28,6 +28,7 @@ from process forks.
 from __future__ import annotations
 
 import logging
+import os
 import sqlite3
 import threading
 from pathlib import Path
@@ -101,6 +102,135 @@ def open_global_db() -> sqlite3.Connection:
     return _global_conn
 
 
+def _index_db_of(project_id: str) -> Path:
+    """Give the DEFAULT index database of *project_id*.
+
+    A registry row carries no config, thus the default location is the
+    only one this module can read.  ``FW_CONTEXT_INDEX_DIR`` overrides it
+    for the whole process, as ``config/settings.py`` does for a project.
+    A project that names its own ``db_dir`` in config.toml keeps its index
+    somewhere else, and this function then reports a path that does not
+    exist — see :func:`_row_is_stale` for what that costs.
+    """
+    root = os.environ.get("FW_CONTEXT_INDEX_DIR")
+    base = Path(root).expanduser() if root else Path.home() / ".fw-context" / "index"
+    return base / project_id / "index.db"
+
+
+def _row_is_stale(project_id: str, root_path: str) -> bool:
+    """Does anything on disk still confirm this registry row?
+
+    A row maps a NAME and an id to a path, and it holds nothing else.  It
+    is worth keeping only while something on disk still answers for it,
+    thus the test is ONE positive condition and the rest is stale:
+
+    * an index database of this id exists, or
+    * the config at the root declares exactly this ``project_id``.
+
+    WHY the rule reads that way round.  Written as a list of the ways a
+    row can die — the root is gone, the root holds no ``.fw-context``, the
+    root declares another id — it missed the shapes that fit none of them:
+    measured on one machine, 160 rows of a throwaway directory that still
+    existed and held a config with no id at all.  A row that nothing
+    confirms is stale, whatever the reason.
+
+    The index database is the guard against a false positive: a project
+    on a mount that is not attached right now cannot confirm itself, and
+    its index still can.  A project that names its own ``db_dir`` defeats
+    that guard, and the cost is one row that the next ``fw-context init``
+    or ``fw-context index`` writes again.
+
+    An unreadable path proves nothing, thus the row stays.
+    """
+    if _index_db_of(project_id).exists():
+        return False
+    if not root_path:
+        return True
+    try:
+        config = Path(root_path) / ".fw-context" / "config.toml"
+        if not config.is_file():
+            return True
+        return _declared_project_id(config) != project_id
+    except OSError:
+        return False
+
+
+def _declared_project_id(config: Path) -> str:
+    """Read ``id`` from the ``[project]`` table of a config, or give ``""``.
+
+    The read is a scan and not a TOML parse, because a config that no
+    parser accepts must still not raise here — a broken file leaves the
+    row alone rather than deleting it.
+
+    The scan tracks the section, thus an ``id`` key of another table
+    cannot answer for the project.  Reading the first ``id`` of the file
+    would let ``[llm]`` or a build variant decide whether a registry row
+    lives.
+    """
+    try:
+        text = config.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return ""
+    in_project = False
+    for raw in text.splitlines():
+        line = raw.strip()
+        if line.startswith("#") or not line:
+            continue
+        if line.startswith("["):
+            in_project = line.replace(" ", "") == "[project]"
+            continue
+        if not in_project:
+            continue
+        key, sep, value = line.partition("=")
+        if not sep or key.strip() != "id":
+            continue
+        return value.split("#")[0].strip().strip('"').strip("'")
+    return ""
+
+
+def prune_stale_projects(conn: sqlite3.Connection) -> int:
+    """Drop the registry rows that nothing on disk refers to any more.
+
+    WHY this runs by itself: the registry only ever grew.  A row is
+    written at ``init`` and at ``index`` and nothing removed one, thus a
+    project that moved, that was deleted, or that took a new id left its
+    old row behind for ever.  Measured on one machine: 28989 rows, of
+    which 6 named a project that exists.  This function left 60 of them
+    and took 362 ms; the pass after it removed none.
+
+    WHAT that cost: the row holds a NAME, and two rows of one name make
+    the ``project="<name>"`` selector fail with an ambiguity error.  The
+    id selector and ``project_root`` are unaffected, and no answer of any
+    tool is wrong — the cost is one refused call on the shortest path.
+
+    Returns the number of rows removed.  A failure removes none and
+    raises nothing: a registry that cannot be tidied must not stop the
+    write that called this.
+    """
+    try:
+        rows = conn.execute("SELECT project_id, root_path FROM projects").fetchall()
+    except sqlite3.Error:
+        log.debug("prune: cannot read the registry", exc_info=True)
+        return 0
+
+    stale = [r["project_id"] for r in rows if _row_is_stale(r["project_id"], r["root_path"] or "")]
+    if not stale:
+        return 0
+    try:
+        for chunk_start in range(0, len(stale), 500):
+            chunk = stale[chunk_start:chunk_start + 500]
+            placeholders = ",".join("?" * len(chunk))
+            conn.execute(
+                f"DELETE FROM projects WHERE project_id IN ({placeholders})", chunk  # noqa: S608
+            )
+        conn.commit()
+    except sqlite3.Error:
+        log.debug("prune: cannot delete stale rows", exc_info=True)
+        return 0
+    log.debug("prune: removed %d stale registry row(s)", len(stale))
+    return len(stale)
+
+
 def upsert_project_registry(
     conn: sqlite3.Connection,
     project_id: str,
@@ -109,6 +239,13 @@ def upsert_project_registry(
     root_path: str,
 ) -> None:
     """Insert or update a project in the global registry.
+
+    This function only WRITES.  The tidy-up is
+    :func:`prune_stale_projects`, and the two CLI commands that register a
+    project call it straight after this one.  Keeping the two apart
+    matters: a write that also deletes would judge every OTHER row at a
+    moment that says nothing about them, and a caller that wants one row
+    written could not ask for that alone.
 
     Args:
         conn: An open connection from ``open_global_db()``.

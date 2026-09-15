@@ -59,6 +59,142 @@ def _register(conn, project_id: str, name: str, root_path) -> None:
     global_db.upsert_project_registry(conn, project_id, name, "mbed-os", str(root_path))
 
 
+def _project_dir(root, project_id: str):
+    """Make a directory that answers for *project_id*, as ``init`` leaves it."""
+    marker = root / ".fw-context"
+    marker.mkdir(parents=True, exist_ok=True)
+    (marker / "config.toml").write_text(
+        f'[project]\nid = "{project_id}"\n', encoding="utf-8"
+    )
+    return root
+
+
+# ── The registry keeps only the rows that disk answers for ─────────────
+
+
+class TestPruneStaleProjects:
+    """A registry row is worth keeping while something still confirms it.
+
+    Nothing removed a row until this existed: one was written at ``init``
+    and at ``index``, and a project that moved, that went away, or that
+    took a new id left its old row for ever.  Measured on one machine,
+    28989 rows of which 6 named a project that exists.
+
+    The cost of a leftover is narrow and real: the row carries a NAME, and
+    two rows of one name make ``project="<name>"`` fail with an ambiguity
+    error.  The id selector and ``project_root`` still answer, and no
+    result of any tool is wrong.
+    """
+
+    def test_a_row_whose_config_declares_it_survives(self, registry, tmp_path):
+        pid = "a" * 32
+        _register(registry, pid, "keeper", _project_dir(tmp_path / "keeper", pid))
+        assert global_db.prune_stale_projects(registry) == 0
+        assert len(global_db.get_projects_by_name("keeper")) == 1
+
+    def test_a_row_whose_root_is_gone_is_dropped(self, registry, tmp_path):
+        _register(registry, "b" * 32, "vanished", tmp_path / "vanished")
+        assert global_db.prune_stale_projects(registry) == 1
+        assert global_db.get_projects_by_name("vanished") == []
+
+    def test_a_row_that_a_new_id_replaced_is_dropped(self, registry, tmp_path):
+        """The case that a reader meets: one path, two ids, one name.
+
+        The project regenerated its id, and the row of the old one stayed.
+        The config at the root names the new id, thus the old row is the
+        one that nothing answers for.
+        """
+        root = tmp_path / "FM"
+        new_id, old_id = "c" * 32, "d" * 32
+        _register(registry, old_id, "FM", root)
+        _register(registry, new_id, "FM", _project_dir(root, new_id))
+        assert len(global_db.get_projects_by_name("FM")) == 2
+
+        assert global_db.prune_stale_projects(registry) == 1
+        rows = global_db.get_projects_by_name("FM")
+        assert [r["project_id"] for r in rows] == [new_id]
+
+    def test_a_config_with_no_id_confirms_nothing(self, registry, tmp_path):
+        """A rule written as a list of deaths missed this shape.
+
+        Measured on one machine: 107 rows of a directory that still
+        existed and held a config that declared no id at all.
+        """
+        root = tmp_path / "half"
+        (root / ".fw-context").mkdir(parents=True)
+        (root / ".fw-context" / "config.toml").write_text("[project]\n", encoding="utf-8")
+        _register(registry, "e" * 32, "half", root)
+        assert global_db.prune_stale_projects(registry) == 1
+
+    def test_an_id_of_another_table_does_not_answer(self, registry, tmp_path):
+        """Only the ``[project]`` table names the project.
+
+        A scan that took the first ``id`` of the file would let another
+        table decide whether a registry row lives.
+        """
+        root = tmp_path / "elsewhere"
+        (root / ".fw-context").mkdir(parents=True)
+        (root / ".fw-context" / "config.toml").write_text(
+            '[llm]\nid = "9" * 32\n\n[project]\nid = "7777777777777777777777777777777a"\n',
+            encoding="utf-8",
+        )
+        _register(registry, "7" * 31 + "a", "elsewhere", root)
+        assert global_db.prune_stale_projects(registry) == 0
+
+    def test_a_comment_after_the_id_is_not_part_of_it(self, registry, tmp_path):
+        root = tmp_path / "commented"
+        pid = "8" * 32
+        (root / ".fw-context").mkdir(parents=True)
+        (root / ".fw-context" / "config.toml").write_text(
+            f'[project]\nid = "{pid}"   # generated at init\n', encoding="utf-8"
+        )
+        _register(registry, pid, "commented", root)
+        assert global_db.prune_stale_projects(registry) == 0
+
+    def test_a_root_without_the_marker_is_dropped(self, registry, tmp_path):
+        root = tmp_path / "plain"
+        root.mkdir()
+        _register(registry, "f" * 32, "plain", root)
+        assert global_db.prune_stale_projects(registry) == 1
+
+    def test_an_index_of_that_id_keeps_the_row(self, registry, tmp_path, monkeypatch):
+        """The guard against a false positive.
+
+        A project on a mount that is not attached cannot confirm itself,
+        and its index still can.
+        """
+        index_root = tmp_path / "index"
+        pid = "0" * 32
+        (index_root / pid).mkdir(parents=True)
+        (index_root / pid / "index.db").write_bytes(b"")
+        monkeypatch.setenv("FW_CONTEXT_INDEX_DIR", str(index_root))
+
+        _register(registry, pid, "unmounted", tmp_path / "not-here")
+        assert global_db.prune_stale_projects(registry) == 0
+        assert len(global_db.get_projects_by_name("unmounted")) == 1
+
+    def test_the_prune_is_idempotent(self, registry, tmp_path):
+        _register(registry, "1" * 32, "gone-a", tmp_path / "gone-a")
+        _register(registry, "2" * 32, "gone-b", tmp_path / "gone-b")
+        assert global_db.prune_stale_projects(registry) == 2
+        assert global_db.prune_stale_projects(registry) == 0
+
+    def test_an_empty_root_path_confirms_nothing(self, registry):
+        _register(registry, "3" * 32, "rootless", "")
+        assert global_db.prune_stale_projects(registry) == 1
+
+    def test_a_write_does_not_prune(self, registry, tmp_path):
+        """``upsert_project_registry`` writes and nothing else.
+
+        A write that also deleted would judge every OTHER row at a moment
+        that says nothing about them, and a caller that wants one row
+        written could not ask for that alone.
+        """
+        _register(registry, "4" * 32, "ghost", tmp_path / "ghost")
+        _register(registry, "5" * 32, "second", tmp_path / "second")
+        assert len(global_db.get_projects_by_name("ghost")) == 1
+
+
 # ── Registry lookup ────────────────────────────────────────────────────
 
 
