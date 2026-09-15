@@ -49,6 +49,7 @@ from fw_context_mcp.indexer.db._resolve import (
     ambiguity_notice,
     candidate_labels,
     count_candidates,
+    resolve_candidates,
 )
 from fw_context_mcp.mcp.handlers.source import (
     _ambiguity,
@@ -173,6 +174,40 @@ class TestRankedResolver:
 
     def test_an_unknown_name_gives_nothing(self, db):
         assert _resolve_target_usrs(db, CH, "no_such_symbol") == ([], [])
+
+    def test_a_partial_qualified_name_reaches_the_symbol(self, db):
+        """Rank 2: a name that starts at the class and not at the namespace.
+
+        A caller types ``Dev::send_byte`` for ``hal::Dev::send_byte``, thus
+        the resolver matches a SUFFIX of the qualified name.
+        """
+        fid = upsert_file(db, CH, "src/hal.cpp", "cpp")
+        insert_symbols_batch(db, [
+            _symbol_row(fid, "src/hal.cpp", "Dev", "hal::Dev", "u_hal_dev", 300, 340,
+                        kind="class"),
+            _symbol_row(fid, "src/hal.cpp", "send_byte", "hal::Dev::send_byte",
+                        "u_send_byte", 310, 320, parent_usr="u_hal_dev"),
+        ])
+        db.commit()
+        usrs, names = _resolve_target_usrs(db, CH, "Dev::send_byte")
+        assert usrs == ["u_send_byte"], f"the suffix tier missed the symbol: {names}"
+
+    def test_an_underscore_of_the_name_is_not_a_wildcard(self, db):
+        """The suffix tier is a LIKE, thus ``_`` needs the ESCAPE clause.
+
+        An embedded name carries underscores by habit.  Without the escape
+        ``Dev::send_byte`` would also reach ``Dev::sendXbyte``.
+        """
+        fid = upsert_file(db, CH, "src/hal.cpp", "cpp")
+        insert_symbols_batch(db, [
+            _symbol_row(fid, "src/hal.cpp", "Dev", "hal::Dev", "u_hal_dev", 300, 340,
+                        kind="class"),
+            _symbol_row(fid, "src/hal.cpp", "sendXbyte", "hal::Dev::sendXbyte",
+                        "u_send_x", 330, 335, parent_usr="u_hal_dev"),
+        ])
+        db.commit()
+        usrs, names = _resolve_target_usrs(db, CH, "Dev::send_byte")
+        assert usrs == [], f"the underscore matched any character: {names}"
 
 
 class TestAmbiguousCallers:
@@ -748,3 +783,95 @@ class TestALabelTellsTwoCandidatesApart:
         ]
         labels = candidate_labels(candidates)
         assert labels == ["clock_stop (drivers/a.c)", "clock_stop (drivers/b.c)"]
+
+
+class TestTheCandidateOrderIsStable:
+    """The order of the candidates must end at a column that is unique.
+
+    This order does more than rank a list.  It decides which symbols a
+    graph query walks when the name matches more than
+    ``MAX_TRAVERSED_TARGETS``, it decides the interleave that
+    ``find_refs_with_candidates`` cuts with an ``offset``, and it decides
+    which candidates the body tools offer.  Two pages of one walk read two
+    different orders when the order ties.
+
+    Every ranking column ties over exactly the population that this
+    resolver exists for: same-name methods in different classes share the
+    definition flag, the project flag, and often both reference counts.
+    """
+
+    @pytest.fixture
+    def tied_db(self, db):
+        """Six methods of one name that tie on every ranking column.
+
+        None of them carries a reference, thus ``ref_count`` and
+        ``out_count`` are zero for all six and only the last column of the
+        order can separate them.
+
+        The rows go in with the HIGHEST USR first, so that the rowid order
+        of the table is the reverse of the USR order.  Without that, a scan
+        that keeps the rowid order answers in USR order by accident, and a
+        test over it would pass with no tie-break at all.
+        """
+        fid = upsert_file(db, CH, "src/tied.cpp", "cpp")
+        rows = []
+        for i in reversed(range(6)):
+            rows.append(_symbol_row(
+                fid, "src/tied.cpp", f"Tied{i}", f"Tied{i}", f"u_tied_class_{i}",
+                200 + i * 10, 205 + i * 10, kind="class",
+            ))
+            rows.append(_symbol_row(
+                fid, "src/tied.cpp", "reset", f"Tied{i}::reset", f"u_tied_{i}",
+                201 + i * 10, 204 + i * 10, parent_usr=f"u_tied_class_{i}",
+            ))
+        insert_symbols_batch(db, rows)
+        db.commit()
+        return db
+
+    def test_the_order_ends_at_a_unique_column(self):
+        """The invariant, because no test can force the fault.
+
+        SQLite keeps the rowid order of a small table scan every time, thus
+        the fault needs a plan change and a test cannot ask for one.  What
+        holds either way: the order must END at a column that is unique
+        within one build.  ``usr`` is that column.
+        """
+        from fw_context_mcp.indexer.db._resolve import _CANDIDATE_ORDER
+
+        assert _CANDIDATE_ORDER.rstrip().endswith("s.usr"), _CANDIDATE_ORDER
+
+    def test_six_tied_candidates_come_back_in_one_order(self, tied_db):
+        """The same question twice must give the same answer twice."""
+        first = [c.usr for c in resolve_candidates(tied_db, CH, "reset")]
+        again = [c.usr for c in resolve_candidates(tied_db, CH, "reset")]
+        assert len(first) == 6, f"got: {first}"
+        assert first == again
+        assert first == sorted(first), (
+            f"every ranking column tied, thus the USR must order: {first}"
+        )
+
+    def test_a_cut_list_takes_the_same_head_as_the_whole_one(self, tied_db):
+        """``limit`` cuts the order, thus a cut must not change the head.
+
+        A graph query walks at most ``MAX_TRAVERSED_TARGETS`` symbols.  When
+        the order ties, which symbols it walks is a guess, and two tools
+        that ask with different bounds then describe different sets.
+        """
+        whole = [c.usr for c in resolve_candidates(tied_db, CH, "reset")]
+        cut = [c.usr for c in resolve_candidates(tied_db, CH, "reset", limit=3)]
+        assert cut == whole[:3], f"the cut took another head: {cut} vs {whole[:3]}"
+
+    def test_the_count_still_reports_every_tied_symbol(self, tied_db):
+        """The order bounds the list, and it must not reach the count."""
+        assert count_candidates(tied_db, CH, "reset") == 6
+
+    def test_the_rank_still_wins_over_the_usr(self, tied_db):
+        """The tie-break is the LAST column, thus it cannot beat the rank.
+
+        ``Tied5::reset`` sorts last by USR and first by rank, because the
+        caller named its qualified name.
+        """
+        candidates = resolve_candidates(tied_db, CH, "Tied5::reset")
+        assert [c.usr for c in candidates] == ["u_tied_5"], (
+            f"an exact qualified name must stand alone: {candidates}"
+        )

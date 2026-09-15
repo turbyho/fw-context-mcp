@@ -239,6 +239,23 @@ _WHERE_SQL = """s.config_hash = ?
                 AND (s.name = ? OR s.qualified_name = ?
                      OR s.qualified_name LIKE ? ESCAPE '\\' OR s.name = ?)"""
 
+#: The order of the candidates, which ranks more than a list.
+#:
+#: It decides which symbols a graph query WALKS when a name matches more
+#: than ``MAX_TRAVERSED_TARGETS``, it decides the interleave that
+#: ``find_refs_with_candidates`` cuts with an ``offset``, and it decides
+#: which candidates a tool that returns one body OFFERS.  Two pages of one
+#: walk read this order twice, thus it must give the same answer twice.
+#:
+#: It therefore ends at ``s.usr``, which is unique within one build.  Every
+#: column before it ties over exactly the population that this module
+#: exists for: two same-name methods of two classes share the definition
+#: flag and the project flag, and a pair that nothing references shares
+#: both counts as well.  SQLite may return tied rows in any order, thus a
+#: walk over such an order shows one symbol twice and hides another.
+_CANDIDATE_ORDER = """ORDER BY match_rank, s.is_definition DESC, s.is_project DESC,
+                               ref_count DESC, out_count DESC, s.usr"""
+
 
 def _match_params(name: str) -> tuple:
     """Build the parameters that the rank and the WHERE clause both need."""
@@ -297,8 +314,10 @@ def resolve_candidates(
     afford more.  :func:`count_candidates` gives the true total either way.
 
     Inside one rank the order is: a definition before a declaration, then
-    the variant with the most references.  Candidates of equal specificity
-    are interchangeable for the purpose of the caller.
+    the variant with the most references, and the USR last.  Candidates of
+    equal specificity carry the same answer for the caller, but they must
+    still come back in the SAME order every time — see
+    ``_CANDIDATE_ORDER`` for what reads this order.
 
     Rank 0 needs a name that HOLDS ``::``.  A bare name carries no
     disambiguator, thus it means every symbol that bears it.  Without this
@@ -312,7 +331,7 @@ def resolve_candidates(
     qualified_probe, plain, suffix_pattern, plain_name = _match_params(name)
     try:
         rows = conn.execute(
-            """SELECT s.usr,
+            f"""SELECT s.usr,
                       COALESCE(s.qualified_name, s.name) AS qualified_name,
                       s.kind AS kind,
                       s.file_path AS file_path,
@@ -334,8 +353,7 @@ def resolve_candidates(
                WHERE s.config_hash = ?
                  AND (s.name = ? OR s.qualified_name = ? OR s.qualified_name LIKE ? ESCAPE '\\'
                       OR s.name = ?)
-               ORDER BY match_rank, s.is_definition DESC, s.is_project DESC,
-                        ref_count DESC, out_count DESC""",
+               {_CANDIDATE_ORDER}""",
             (
                 qualified_probe, plain, suffix_pattern,
                 config_hash, plain, plain, suffix_pattern, plain_name,
