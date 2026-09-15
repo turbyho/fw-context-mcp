@@ -113,12 +113,15 @@ def resolve_build(
     rows = get_builds_for_scope(conn, project_id, variant, image or "")
     if not rows:
         if image:
+            # A name of its own: ``names`` above holds the VARIANTS, and a
+            # second meaning for one name inside one function reads as the
+            # first one until a reader checks.
             known = get_builds_for_scope(conn, project_id, variant)
-            names = sorted({r["image"] or "" for r in known if r["image"]})
-            if names:
+            known_images = sorted({r["image"] or "" for r in known if r["image"]})
+            if known_images:
                 return None, (
                     f"Unknown image '{image}' of variant '{variant}'. "
-                    f"Available: {', '.join(names)}."
+                    f"Available: {', '.join(known_images)}."
                 )
         return None, (
             f"Variant '{variant}' is declared in config but not indexed. "

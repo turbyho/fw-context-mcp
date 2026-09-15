@@ -229,8 +229,16 @@ def candidate_rows(candidates: list[Candidate], root=None) -> list[dict]:
     return rows
 
 
-#: The rank expression and the WHERE clause, shared by the two queries
-#: below so that a count can never disagree with a list.
+#: The rank expression and the WHERE clause.  ``count_candidates`` and
+#: ``resolve_candidates`` both read them, thus the count can never describe
+#: another set than the list does.  They were one text and two copies of
+#: it until this was written down, which is the drift these constants
+#: exist to stop.
+#:
+#: The parameter order is part of the contract: three for the rank
+#: (qualified name, bare name, suffix pattern), then five for the WHERE
+#: (config hash, bare name, bare name, suffix pattern, plain tail).
+#: :func:`_match_params` builds them.
 _RANK_SQL = """CASE WHEN s.qualified_name = ? THEN 0
                     WHEN s.name = ? THEN 1
                     WHEN s.qualified_name LIKE ? ESCAPE '\\' THEN 2
@@ -339,10 +347,7 @@ def resolve_candidates(
                       s.signature AS signature,
                       CASE WHEN p.kind IN ('class', 'struct', 'union')
                            THEN p.name ELSE '' END AS owner,
-                      CASE WHEN s.qualified_name = ? THEN 0
-                           WHEN s.name = ? THEN 1
-                           WHEN s.qualified_name LIKE ? ESCAPE '\\' THEN 2
-                           ELSE 3 END AS match_rank,
+                      {_RANK_SQL} AS match_rank,
                       (SELECT COUNT(*) FROM refs r
                        WHERE r.to_usr = s.usr AND r.config_hash = s.config_hash) AS ref_count,
                       (SELECT COUNT(*) FROM refs r
@@ -350,9 +355,7 @@ def resolve_candidates(
                FROM symbols s
                LEFT JOIN symbols p
                  ON p.usr = s.parent_usr AND p.config_hash = s.config_hash
-               WHERE s.config_hash = ?
-                 AND (s.name = ? OR s.qualified_name = ? OR s.qualified_name LIKE ? ESCAPE '\\'
-                      OR s.name = ?)
+               WHERE {_WHERE_SQL}
                {_CANDIDATE_ORDER}""",
             (
                 qualified_probe, plain, suffix_pattern,
