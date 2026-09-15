@@ -472,9 +472,18 @@ def ambiguity_notice(
     """
     walked = len(qualified_names)
     matched = walked if total is None else total
-    # The walk is what a row can come from, thus the cap is about the walk
-    # and not about the count.
-    capped = walked >= MAX_AMBIGUOUS_TARGETS or matched > walked
+    # A symbol is missing from the rows exactly when the name matches more
+    # of them than the walk took.  With *total* that is known outright.
+    # Without it the walk reaching its own bound is the only hint there is,
+    # and the notice then says "more than N" because it cannot do better.
+    #
+    # Reading the bound as "cut" even WITH a count was wrong: a name that
+    # matches exactly MAX_AMBIGUOUS_TARGETS symbols has every one of them
+    # in the rows, and the sentence below then warned about nothing.
+    capped = (
+        matched > walked if total is not None
+        else walked >= MAX_AMBIGUOUS_TARGETS
+    )
     count = str(matched) if total is not None else (
         f"more than {MAX_AMBIGUOUS_TARGETS}" if capped else str(walked)
     )
@@ -486,8 +495,7 @@ def ambiguity_notice(
     )
     if capped:
         message += (
-            f" The query used the first {min(walked, MAX_AMBIGUOUS_TARGETS)} "
-            f"symbols only, thus a symbol of this name can be missing from "
-            f"the rows."
+            f" The query used the first {walked} symbols only, thus a symbol "
+            f"of this name can be missing from the rows."
         )
     return {"warning": message}

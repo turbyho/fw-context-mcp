@@ -818,6 +818,28 @@ class TestTheNoticeStaysReadableAndHonest:
         assert "matches 9 symbols" in text, f"got: {text}"
         assert "can be missing from the rows" in text, f"got: {text}"
 
+    def test_a_walk_that_took_every_match_warns_about_nothing(self):
+        """A full walk that happens to fill the bound is still a full walk.
+
+        The cap used to be read off the LENGTH of the walk alone, thus a
+        name matching exactly ``MAX_AMBIGUOUS_TARGETS`` symbols — every one
+        of them in the rows — warned that one could be missing.
+        """
+        names = [f"Class{i}::probe" for i in range(MAX_AMBIGUOUS_TARGETS)]
+        text = ambiguity_notice(
+            "probe", names, "callers", total=MAX_AMBIGUOUS_TARGETS,
+        )["warning"]
+        assert f"matches {MAX_AMBIGUOUS_TARGETS} symbols" in text, f"got: {text}"
+        assert "can be missing from the rows" not in text, (
+            f"the walk took every match, thus nothing is missing: {text}"
+        )
+
+    def test_a_short_walk_with_a_matching_total_warns_about_nothing(self):
+        names = [f"Class{i}::probe" for i in range(4)]
+        text = ambiguity_notice("probe", names, "callers", total=4)["warning"]
+        assert "matches 4 symbols" in text, f"got: {text}"
+        assert "can be missing from the rows" not in text, f"got: {text}"
+
     def test_the_two_tool_families_report_one_number(self, db):
         """The list tools and the one-body tools must agree.
 
