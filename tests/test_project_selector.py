@@ -241,6 +241,149 @@ class TestPruneStaleProjects:
         _register(registry, "3" * 32, "rootless", "")
         assert global_db.prune_stale_projects(registry) == 1
 
+
+class TestTheOperatorCanRefuseThePrune:
+    """A DELETE over the data of the operator has to be refusable.
+
+    Nothing asks before this runs, and the judgement can be wrong: a
+    project on a filesystem that is not mounted right now, whose index
+    lives somewhere other than the default directory, confirms itself
+    through neither test and is dropped.  The cost is one row that the
+    next ``init`` or ``index`` writes again — small, but the operator
+    must be able to say no, and must be able to see what went.
+    """
+
+    def test_a_delete_that_fails_does_not_report_a_removal(self, registry, tmp_path):
+        """"removed 0 rows: gone-a" told the operator the opposite of the truth.
+
+        ``_delete_project_rows`` answers 0 for a registry it cannot write,
+        and the report used to paste that 0 into a sentence that went on
+        to name the rows as if they had gone.
+        """
+        import sqlite3 as _sqlite3
+
+        _register(registry, "4" * 32, "gone-a", tmp_path / "gone-a")
+        _register(registry, "5" * 32, "gone-b", tmp_path / "gone-b")
+
+        # A real read-only handle on the same file: the SELECT answers and
+        # the DELETE raises, which is the shape a locked or read-only
+        # ``~/.fw-context`` gives.
+        readonly = _sqlite3.connect(
+            f"file:{tmp_path / 'projects.db'}?mode=ro", uri=True
+        )
+        readonly.row_factory = _sqlite3.Row
+        try:
+            assert len(global_db.stale_project_rows(readonly)) == 2
+            message = global_db.prune_registry_report(readonly)
+        finally:
+            readonly.close()
+
+        assert "could NOT remove" in message, message
+        assert "removed 2" not in message, message
+        assert len(global_db.get_projects_by_name("gone-a")) == 1, (
+            "the rows must still be there"
+        )
+
+    def test_the_report_scans_the_disk_once(self, registry, tmp_path, monkeypatch):
+        """Two scans cost twice, and they can disagree with each other.
+
+        The names come from the scan and the count from the delete.  When
+        the report ran its own scan and the delete ran another, a row that
+        gained a config between them was named as removed and stayed.
+        """
+        _register(registry, "6" * 32, "gone-c", tmp_path / "gone-c")
+        calls = {"n": 0}
+        real = global_db.stale_project_rows
+
+        def _counted(conn):
+            calls["n"] += 1
+            return real(conn)
+
+        monkeypatch.setattr(global_db, "stale_project_rows", _counted)
+        global_db.prune_registry_report(registry)
+
+        assert calls["n"] == 1, f"the disk was scanned {calls['n']} times"
+
+    def test_the_rows_can_be_read_before_they_go(self, registry, tmp_path):
+        _register(registry, "6" * 32, "gone-c", tmp_path / "gone-c")
+        pid = "7" * 32
+        _register(registry, pid, "keeper", _project_dir(tmp_path / "keeper", pid))
+
+        stale = global_db.stale_project_rows(registry)
+
+        assert [r["name"] for r in stale] == ["gone-c"], stale
+        assert len(global_db.get_projects_by_name("gone-c")) == 1, "reading deleted"
+
+    def test_the_report_names_the_projects_it_removed(self, registry, tmp_path):
+        _register(registry, "8" * 32, "gone-d", tmp_path / "gone-d")
+
+        message = global_db.prune_registry_report(registry)
+
+        assert "gone-d" in message, message
+        assert "--no-prune" in message, f"the way out must be in the text: {message}"
+        assert global_db.get_projects_by_name("gone-d") == []
+
+    def test_keep_names_the_projects_and_leaves_them(self, registry, tmp_path):
+        _register(registry, "9" * 32, "gone-e", tmp_path / "gone-e")
+
+        message = global_db.prune_registry_report(registry, keep=True)
+
+        assert "gone-e" in message, message
+        assert "kept" in message, message
+        assert len(global_db.get_projects_by_name("gone-e")) == 1, (
+            "--no-prune removed a row anyway"
+        )
+
+    def test_a_tidy_registry_reports_nothing(self, registry, tmp_path):
+        pid = "a" * 32
+        _register(registry, pid, "keeper", _project_dir(tmp_path / "keeper", pid))
+
+        assert global_db.prune_registry_report(registry) == ""
+
+    def test_a_background_run_prunes_nothing(self, registry, tmp_path, capsys):
+        """The daemon spawns ``index --background`` with a fixed argv.
+
+        No flag reaches that run and its output goes to reindex.log, thus a
+        delete there is one the operator can neither refuse nor see.  The
+        next run that the operator starts does the work instead.
+        """
+        import argparse
+
+        from fw_context_mcp.cli._index import _post_index_optimize
+
+        _register(registry, "b" * 32, "gone-f", tmp_path / "gone-f")
+        db_path = tmp_path / "index.db"
+        db_path.touch()
+        root = _project_dir(tmp_path / "live", "c" * 32)
+
+        _post_index_optimize(
+            db_path, root, "c" * 32, "bare",
+            argparse.Namespace(background=True, no_prune=False),
+        )
+
+        assert len(global_db.get_projects_by_name("gone-f")) == 1, (
+            "a background run removed a registry row"
+        )
+        assert "registry:" not in capsys.readouterr().out
+
+    def test_a_foreground_run_still_prunes(self, registry, tmp_path, capsys):
+        import argparse
+
+        from fw_context_mcp.cli._index import _post_index_optimize
+
+        _register(registry, "d" * 32, "gone-g", tmp_path / "gone-g")
+        db_path = tmp_path / "index.db"
+        db_path.touch()
+        root = _project_dir(tmp_path / "live2", "e" * 32)
+
+        _post_index_optimize(
+            db_path, root, "e" * 32, "bare",
+            argparse.Namespace(background=False, no_prune=False),
+        )
+
+        assert global_db.get_projects_by_name("gone-g") == []
+        assert "gone-g" in capsys.readouterr().out
+
     def test_a_write_does_not_prune(self, registry, tmp_path):
         """``upsert_project_registry`` writes and nothing else.
 

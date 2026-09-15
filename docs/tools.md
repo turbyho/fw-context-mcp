@@ -60,7 +60,31 @@ fw-context index --source-roots src lib drivers
 | `--variants A,B` | all variants | Comma-separated list of build variants to index |
 | `--image NAME` | all images | Restrict indexing to one sysbuild image |
 | `--exclude-image NAME` | none | Exclude a sysbuild image from indexing (repeatable) |
+| `--no-prune` | off | Keep the global-registry rows that nothing on disk confirms |
 | `-v` | off | Verbose progress output |
+
+**The global registry:**
+
+`fw-context index` and `fw-context init` write this project into the global
+registry at `~/.fw-context/projects.db`. Then they remove the rows that
+nothing on disk confirms. The registry only grew before this, and two rows
+of one name make the `project="<name>"` tool selector fail with an
+ambiguity error.
+
+A row stays when one of these conditions is true:
+
+- An index database of that project ID is in the index directory.
+- The project root holds a `.fw-context/config.toml` that declares that
+  same project ID.
+
+The command names each row that it removes, up to five names. To keep the
+rows, use `--no-prune`. A live project can look stale: this happens when
+its filesystem is not mounted, and its index is not in the default index
+directory. If such a row goes, the next `init` or `index` of that project
+writes it again.
+
+A `--background` run removes no row. The file-watcher daemon starts those
+runs, no flag can reach them, and their output goes to `reindex.log`.
 
 For a multi-variant project, `fw-context index --build` builds and indexes
 every variant. Use `--variant`, `--variants`, `--image`, or
@@ -221,6 +245,7 @@ fw-context init --skip-doctor           # skip the dependency audit
 fw-context init --skip-build            # skip compile_commands.json generation
 fw-context init --non-interactive       # disable prompts (CI/pipe)
 fw-context init --name NAME             # project name in the global registry
+fw-context init --no-prune              # keep the stale global-registry rows
 ```
 
 `fw-context init` runs these steps, in order:

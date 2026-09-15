@@ -236,6 +236,13 @@ def main() -> None:
         dest="no_index",
         help="With --build: build only, skip indexing",
     )
+    p_index.add_argument(
+        "--no-prune",
+        action="store_true",
+        dest="no_prune",
+        help="Keep the registry rows that nothing on disk answers for "
+             "(they are named, not removed)",
+    )
     p_index.set_defaults(func=cmd_index)
 
     from ._search import cmd_list, cmd_search, cmd_status  # noqa: I001
@@ -253,6 +260,13 @@ def main() -> None:
     )
     p_init.add_argument("--dry-run", action="store_true", help="Show what would be done without making changes")
     p_init.add_argument("--force", action="store_true", help="Overwrite even when collisions are detected")
+    p_init.add_argument(
+        "--no-prune",
+        action="store_true",
+        dest="no_prune",
+        help="Keep the registry rows that nothing on disk answers for "
+             "(they are named, not removed)",
+    )
     p_init.add_argument(
         "--instructions-only", action="store_true", help="Only inject instructions, skip MCP registration"
     )

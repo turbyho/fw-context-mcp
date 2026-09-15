@@ -677,7 +677,7 @@ def cmd_init(args: argparse.Namespace) -> int:
         if not args.dry_run:
             from ..config.global_db import (
                 open_global_db,
-                prune_stale_projects,
+                prune_registry_report,
                 upsert_project_registry,
             )
 
@@ -692,9 +692,14 @@ def cmd_init(args: argparse.Namespace) -> int:
                 # `project="<name>"` selector refuse to answer.  This is
                 # the moment that new id appears, thus the moment to drop
                 # the row it replaced.
-                removed = prune_stale_projects(glob_conn)
-                if removed:
-                    print(f"  registry: removed {removed} stale project row(s)")
+                #
+                # ``--no-prune`` names the rows and leaves them: this is a
+                # DELETE over the data of the operator, thus it has to be
+                # refusable.
+                if (msg := prune_registry_report(
+                    glob_conn, keep=getattr(args, "no_prune", False)
+                )):
+                    print(f"  {msg}")
                 glob_conn.close()
             except Exception as exc:  # registry is best-effort — never fatal
                 print(f"  [warn] could not update global registry: {exc}")

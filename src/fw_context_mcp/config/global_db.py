@@ -233,37 +233,38 @@ def _declared_project_id(config: Path) -> str:
     return ""
 
 
-def prune_stale_projects(conn: sqlite3.Connection) -> int:
-    """Drop the registry rows that nothing on disk refers to any more.
+def stale_project_rows(conn: sqlite3.Connection) -> list[sqlite3.Row]:
+    """The registry rows that nothing on disk answers for any more.
 
-    WHY this runs by itself: the registry only ever grew.  A row is
-    written at ``init`` and at ``index`` and nothing removed one, thus a
-    project that moved, that was deleted, or that took a new id left its
-    old row behind for ever.  Measured on one machine: 28989 rows, of
-    which 6 named a project that exists.  This function left 60 of them
-    and took 362 ms; the pass after it removed none.
-
-    WHAT that cost: the row holds a NAME, and two rows of one name make
-    the ``project="<name>"`` selector fail with an ambiguity error.  The
-    id selector and ``project_root`` are unaffected, and no answer of any
-    tool is wrong — the cost is one refused call on the shortest path.
-
-    Returns the number of rows removed.  A failure removes none and
-    raises nothing: a registry that cannot be tidied must not stop the
-    write that called this.
+    Separate from the delete so that a caller can LOOK before it removes:
+    the CLI names the projects it is about to drop, and ``--no-prune``
+    stops at this step.  A registry that cannot be read gives an empty
+    list rather than raising — see :func:`prune_stale_projects`.
     """
     try:
-        rows = conn.execute("SELECT project_id, root_path FROM projects").fetchall()
+        rows = conn.execute(
+            "SELECT project_id, name, root_path FROM projects"
+        ).fetchall()
     except sqlite3.Error:
         log.debug("prune: cannot read the registry", exc_info=True)
-        return 0
+        return []
+    return [r for r in rows if _row_is_stale(r["project_id"], r["root_path"] or "")]
 
-    stale = [r["project_id"] for r in rows if _row_is_stale(r["project_id"], r["root_path"] or "")]
-    if not stale:
+
+def _delete_project_rows(conn: sqlite3.Connection, project_ids: list[str]) -> int:
+    """Delete the named rows.  Gives how many went, and 0 when none did.
+
+    All or nothing: a chunk that fails rolls the whole delete back, so the
+    number returned describes the registry as it now stands.  Without the
+    rollback a failed prune would leave the earlier chunks pending on a
+    connection that lives for the whole process, and the next commit of an
+    unrelated write would then carry them.
+    """
+    if not project_ids:
         return 0
     try:
-        for chunk_start in range(0, len(stale), 500):
-            chunk = stale[chunk_start:chunk_start + 500]
+        for chunk_start in range(0, len(project_ids), 500):
+            chunk = project_ids[chunk_start:chunk_start + 500]
             placeholders = ",".join("?" * len(chunk))
             conn.execute(
                 f"DELETE FROM projects WHERE project_id IN ({placeholders})", chunk  # noqa: S608
@@ -271,9 +272,86 @@ def prune_stale_projects(conn: sqlite3.Connection) -> int:
         conn.commit()
     except sqlite3.Error:
         log.debug("prune: cannot delete stale rows", exc_info=True)
+        try:
+            conn.rollback()
+        except sqlite3.Error:
+            log.debug("prune: cannot roll back either", exc_info=True)
         return 0
-    log.debug("prune: removed %d stale registry row(s)", len(stale))
-    return len(stale)
+    log.debug("prune: removed %d stale registry row(s)", len(project_ids))
+    return len(project_ids)
+
+
+def prune_registry_report(conn: sqlite3.Connection, *, keep: bool = False) -> str:
+    """Tidy the registry, or only look, and say what happened in one line.
+
+    Gives ``""`` when there is nothing to report, thus a caller prints it
+    only when it carries news.  Both CLI commands that register a project
+    read this, so the operator gets the same sentence from either.
+
+    *keep* comes from ``--no-prune``: the rows are then named and left
+    alone.  The flag exists because this is a DELETE over the data of the
+    operator that nothing asked for — a project on a filesystem that is
+    not mounted right now, and whose index lives somewhere other than the
+    default directory, cannot confirm itself and would be dropped.  The
+    cost of that is one row that the next ``init`` or ``index`` writes
+    again, but the operator must be able to say no.
+
+    ONE scan of the disk, and the delete reads its result.  Calling
+    :func:`prune_stale_projects` from here would run the scan a second
+    time — measured, 50 ms per 4000 rows — and the two passes could then
+    disagree: a row that gains a config between them would be named as
+    removed and stay.
+
+    A delete that fails says so.  ``_delete_project_rows`` answers 0 for a
+    registry it cannot write, and a sentence that read "removed 0 … " while
+    naming the rows told the operator the opposite of the truth.
+    """
+    stale = stale_project_rows(conn)
+    if not stale:
+        return ""
+    names = sorted({r["name"] for r in stale})
+    shown = ", ".join(names[:5]) + (", …" if len(names) > 5 else "")
+    if keep:
+        return f"registry: {len(stale)} stale project row(s) kept (--no-prune): {shown}"
+    removed = _delete_project_rows(conn, [r["project_id"] for r in stale])
+    if removed != len(stale):
+        return (
+            f"registry: could NOT remove {len(stale)} stale project row(s): "
+            f"{shown} — the registry is not writable right now"
+        )
+    return (
+        f"registry: removed {removed} stale project row(s): {shown} "
+        f"— pass --no-prune to keep them"
+    )
+
+
+def prune_stale_projects(conn: sqlite3.Connection) -> int:
+    """Drop the registry rows that nothing on disk refers to any more.
+
+    WHY this runs at all: the registry only ever grew.  A row is written
+    at ``init`` and at ``index`` and nothing removed one, thus a project
+    that moved, that was deleted, or that took a new id left its old row
+    behind for ever.  Measured on one machine: 28989 rows, of which 6
+    named a project that exists.  One scan-and-delete left 60 of them and
+    took 362 ms; the pass after it removed none.
+
+    WHAT that cost: the row holds a NAME, and two rows of one name make
+    the ``project="<name>"`` selector fail with an ambiguity error.  The
+    id selector and ``project_root`` are unaffected, and no answer of any
+    tool is wrong — the cost is one refused call on the shortest path.
+
+    The CLI uses :func:`prune_registry_report` instead, which names the
+    projects it drops and honours ``--no-prune``.  This is the plain form,
+    for a caller that wants the count and nothing else.  To LOOK without
+    deleting, read :func:`stale_project_rows`.
+
+    Returns the number of rows removed.  A failure removes none and raises
+    nothing: a registry that cannot be tidied must not stop the write that
+    called this.
+    """
+    return _delete_project_rows(
+        conn, [r["project_id"] for r in stale_project_rows(conn)]
+    )
 
 
 def upsert_project_registry(
@@ -286,11 +364,11 @@ def upsert_project_registry(
     """Insert or update a project in the global registry.
 
     This function only WRITES.  The tidy-up is
-    :func:`prune_stale_projects`, and the two CLI commands that register a
-    project call it straight after this one.  Keeping the two apart
-    matters: a write that also deletes would judge every OTHER row at a
-    moment that says nothing about them, and a caller that wants one row
-    written could not ask for that alone.
+    :func:`prune_registry_report`, which the two CLI commands that register
+    a project call straight after this one.  Keeping the two apart matters:
+    a write that also deletes would judge every OTHER row at a moment that
+    says nothing about them, and a caller that wants one row written could
+    not ask for that alone.
 
     Args:
         conn: An open connection from ``open_global_db()``.

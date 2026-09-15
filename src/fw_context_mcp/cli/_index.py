@@ -457,7 +457,7 @@ def _post_index_optimize(
 
     from ..config.global_db import (
         open_global_db,
-        prune_stale_projects,
+        prune_registry_report,
         upsert_project_registry,
     )
 
@@ -471,9 +471,21 @@ def _post_index_optimize(
         # drop what nothing on disk answers for any more — it already
         # writes the row of THIS project, and a stale row of another one
         # costs the `project="<name>"` selector an ambiguity error.
-        _removed = prune_stale_projects(_gconn)
-        if _removed:
-            print(f"  registry: removed {_removed} stale project row(s)")
+        #
+        # ``--no-prune`` names the rows and leaves them: this is a DELETE
+        # over the data of the operator, thus it has to be refusable.
+        #
+        # A ``--background`` run prunes NOTHING.  The file-watcher daemon
+        # spawns it with a fixed argv (``mcp/daemon.py``), thus no flag can
+        # reach it, and its output goes to reindex.log where nobody reads
+        # it.  A delete that the operator can neither refuse nor see is not
+        # a tidy-up.  The next run that the operator starts does the work.
+        if getattr(args, "background", False):
+            log.debug("registry: background run — the prune is left to the operator")
+        elif (_msg := prune_registry_report(
+            _gconn, keep=getattr(args, "no_prune", False)
+        )):
+            print(f"  {_msg}")
     finally:
         _gconn.close()
 
