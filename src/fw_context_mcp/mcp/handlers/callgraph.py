@@ -364,10 +364,23 @@ def _references_result(name: str, project_root: str | None, ref_kind: str | list
             limit=clamped_limit, offset=skip,
         )
         if not rows:
-            # When zero refs are recorded for this specific symbol, try
-            # virtual dispatch resolution. C++ virtual method calls
-            # through base-class pointers are often recorded against
-            # the nearest (base) override, not the most-derived one.
+            if total:
+                # The symbol HAS references and the reader walked past the
+                # last one.  The peer-override fallback below must not run
+                # here: it answers about other symbols, and it would then
+                # give page 2 of this walk a set of its own, a ``total`` of
+                # its own and a hint that leads deeper into that other
+                # answer.  The count is thus the gate, as it is in the
+                # relaxation cascade of ``search_code`` and in the
+                # fallbacks of ``lookup_symbol``.
+                return [{"info": (
+                    f"No {label} of '{name}' at offset {skip}; the answer "
+                    f"holds {total}."
+                )}]
+            # Zero refs are recorded for this symbol, thus try virtual
+            # dispatch resolution. C++ virtual method calls through
+            # base-class pointers are often recorded against the nearest
+            # (base) override, not the most-derived one.
             virtual_result = _resolve_virtual_callers(
                 conn, config_hash, symbol["usr"], root, ref_kind=ref_kind,
                 limit=clamped_limit, offset=skip,
@@ -391,11 +404,6 @@ def _references_result(name: str, project_root: str | None, ref_kind: str | list
                     hint=f"{tool}('{name}', offset={skip + shown}) reads the next page.",
                 ))
                 return virtual_rows
-            if skip and total:
-                return [{"info": (
-                    f"No {label} of '{name}' at offset {skip}; the answer "
-                    f"holds {total}."
-                )}]
             return [{"info": f"No {label} found for '{name}'."}]
         # The rows carry a tag only when the name matched several symbols.
         tagged = len(candidates) > 1
@@ -1183,7 +1191,12 @@ def find_dead_code(
         Never empty: one dict with ``info`` replaces an empty result.
         Check that key first.
     """
-    limit = max(0, min(limit, 200))  # clamp
+    # One row at least.  With no row the answer falls through to the
+    # ``info`` row below, which tells the reader that every defined
+    # function has a caller — a statement about the codebase, made from
+    # the page bound alone.  A page of zero rows is also a notice that
+    # hints at the offset the reader already stands at.
+    limit = max(1, min(limit, 200))  # clamp
     db, err = _refs_guard(project_root, variant=variant, image=image)
     if err:
         return err
@@ -1617,7 +1630,10 @@ def find_hotspots(
         Never empty: one dict with ``info`` replaces an empty result.
         Check that key first.
     """
-    limit = max(0, min(limit, 50))  # clamp
+    # One row at least, for the reason given in ``find_dead_code``: with
+    # no row this tool answers that the project holds no hotspot, which
+    # describes the page bound and not the index.
+    limit = max(1, min(limit, 50))  # clamp
     db, err = _refs_guard(project_root, variant=variant, image=image)
     if err:
         return err
