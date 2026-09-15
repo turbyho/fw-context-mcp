@@ -135,24 +135,37 @@ def pytest_sessionfinish(session, exitstatus):
 
 @pytest.fixture(scope="session", autouse=True)
 def _isolate_index_dir():
-    """Redirect fw-context index writes to a session temp dir.
+    """Redirect every fw-context write of this run to a session temp dir.
 
-    Sets ``FW_CONTEXT_INDEX_DIR`` for the whole test run, so every test
-    (including new tests) writes index databases to a temp dir instead of
-    the real ``~/.fw-context/index``.  The env var is inherited by any
-    subprocess a test spawns, so CLI invocations stay isolated too.  The
-    temp dir is removed at session end.
+    Two stores, and both need the redirect:
+
+    * ``FW_CONTEXT_INDEX_DIR`` — the index databases.
+    * ``FW_CONTEXT_PROJECTS_DB`` — the global project registry.
+
+    Only the first one had it.  The registry therefore took a row for
+    every throwaway project that this suite registers, in the registry of
+    the operator: measured on one machine, 28989 rows of which 6 named a
+    project that exists.  A row carries a NAME, and two rows of one name
+    make the ``project="<name>"`` selector fail — which is how it was
+    found.
+
+    Both variables are inherited by any subprocess a test spawns, thus a
+    CLI invocation stays isolated too.  The temp dir is removed at session
+    end.
     """
-    prev = os.environ.get("FW_CONTEXT_INDEX_DIR")
+    names = ("FW_CONTEXT_INDEX_DIR", "FW_CONTEXT_PROJECTS_DB")
+    prev = {name: os.environ.get(name) for name in names}
     with tempfile.TemporaryDirectory(prefix="fw-context-index-") as d:
         os.environ["FW_CONTEXT_INDEX_DIR"] = d
+        os.environ["FW_CONTEXT_PROJECTS_DB"] = str(Path(d) / "projects.db")
         try:
             yield d
         finally:
-            if prev is None:
-                os.environ.pop("FW_CONTEXT_INDEX_DIR", None)
-            else:
-                os.environ["FW_CONTEXT_INDEX_DIR"] = prev
+            for name in names:
+                if prev[name] is None:
+                    os.environ.pop(name, None)
+                else:
+                    os.environ[name] = prev[name]
 
 
 @pytest.fixture

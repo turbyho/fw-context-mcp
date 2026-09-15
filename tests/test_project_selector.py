@@ -69,6 +69,64 @@ def _project_dir(root, project_id: str):
     return root
 
 
+# ── The registry can be redirected, and the suite redirects it ─────────
+
+
+class TestTheRegistryPathIsRedirectable:
+    """A test must not write the registry of the operator.
+
+    ``conftest.py`` pointed ``FW_CONTEXT_INDEX_DIR`` at a temp directory
+    from the start, and the registry had no such door.  Every run of this
+    suite therefore registered its throwaway projects for real: measured
+    on one machine, 28989 rows of which 6 named a project that exists.
+    """
+
+    def test_the_environment_moves_the_registry(self, tmp_path, monkeypatch):
+        """A subprocess cannot inherit a monkeypatched attribute.
+
+        This suite spawns the CLI in one, thus the redirect has to travel
+        through the environment to reach it.
+        """
+        monkeypatch.setattr(global_db, "_GLOBAL_DB_PATH", global_db._DEFAULT_GLOBAL_DB_PATH)
+        monkeypatch.setenv("FW_CONTEXT_PROJECTS_DB", str(tmp_path / "moved.db"))
+        assert global_db._global_db_path() == tmp_path / "moved.db"
+
+    def test_an_explicit_path_wins_over_the_environment(self, tmp_path, monkeypatch):
+        """The in-process test knows which registry it wants."""
+        monkeypatch.setattr(global_db, "_GLOBAL_DB_PATH", tmp_path / "explicit.db")
+        monkeypatch.setenv("FW_CONTEXT_PROJECTS_DB", str(tmp_path / "from-env.db"))
+        assert global_db._global_db_path() == tmp_path / "explicit.db"
+
+    def test_the_default_answers_when_nothing_redirects(self, monkeypatch):
+        monkeypatch.setattr(global_db, "_GLOBAL_DB_PATH", global_db._DEFAULT_GLOBAL_DB_PATH)
+        monkeypatch.delenv("FW_CONTEXT_PROJECTS_DB", raising=False)
+        assert global_db._global_db_path() == global_db._DEFAULT_GLOBAL_DB_PATH
+
+    def test_a_moved_path_reopens_the_cached_connection(self, tmp_path, monkeypatch):
+        """The cache is keyed on the path, thus a redirect reaches it.
+
+        A connection opened before the redirect would read the registry
+        that the caller just moved away from — and a test would then write
+        the real one.
+        """
+        monkeypatch.setattr(global_db, "_GLOBAL_DB_PATH", global_db._DEFAULT_GLOBAL_DB_PATH)
+        monkeypatch.setattr(global_db, "_global_conn", None)
+        monkeypatch.setattr(global_db, "_global_conn_path", None)
+
+        monkeypatch.setenv("FW_CONTEXT_PROJECTS_DB", str(tmp_path / "first.db"))
+        first = global_db.open_global_db()
+        global_db.upsert_project_registry(
+            first, "a" * 32, "only-in-first", "mbed-os", str(tmp_path / "p")
+        )
+        assert global_db.get_projects_by_name("only-in-first")
+
+        monkeypatch.setenv("FW_CONTEXT_PROJECTS_DB", str(tmp_path / "second.db"))
+        second = global_db.open_global_db()
+        assert second is not first, "the connection did not follow the redirect"
+        assert global_db.get_projects_by_name("only-in-first") == []
+        second.close()
+
+
 # ── The registry keeps only the rows that disk answers for ─────────────
 
 

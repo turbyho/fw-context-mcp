@@ -37,7 +37,13 @@ from fw_context_mcp.utils import SAFE_EXCEPT, is_fatal
 
 log = logging.getLogger(__name__)
 
-_GLOBAL_DB_PATH = Path.home() / ".fw-context" / "projects.db"
+#: Where the registry lives when nothing redirects it.
+_DEFAULT_GLOBAL_DB_PATH = Path.home() / ".fw-context" / "projects.db"
+
+#: The path that :func:`_global_db_path` uses unless it is redirected.
+#: A test may set this attribute to reach a registry of its own; see that
+#: function for what wins over what.
+_GLOBAL_DB_PATH = _DEFAULT_GLOBAL_DB_PATH
 
 _SCHEMA = """\
 CREATE TABLE IF NOT EXISTS projects (
@@ -56,12 +62,38 @@ CREATE INDEX IF NOT EXISTS idx_projects_updated_at ON projects(updated_at);
 # init and index time, read on every MCP tool invocation), so a long-lived
 # connection is safe.
 _global_conn: sqlite3.Connection | None = None
+#: The path that ``_global_conn`` was opened on.  The cache is keyed on it
+#: because the redirect can move between two calls — a test sets it, and a
+#: connection from before would then read the registry of the operator.
+_global_conn_path: Path | None = None
 _global_lock = threading.Lock()  # guards initialization
 
 
 def _global_db_path() -> Path:
-    """Return the path to the global projects database."""
-    return _GLOBAL_DB_PATH
+    """Return the path to the global projects database.
+
+    Three sources, and they are read in this order:
+
+    1. ``_GLOBAL_DB_PATH`` when something set it away from the default.
+       An in-process test does that, and it must win — the test knows
+       which registry it wants.
+    2. ``FW_CONTEXT_PROJECTS_DB``.  A subprocess cannot inherit a
+       monkeypatched attribute, and this suite spawns the CLI in one,
+       thus the environment carries the redirect across the boundary.
+    3. The default, ``~/.fw-context/projects.db``.
+
+    WHY the redirect exists at all: ``conftest.py`` already points
+    ``FW_CONTEXT_INDEX_DIR`` at a temp directory so that no test writes
+    the real index, and the registry had no such door.  Every test run
+    therefore registered its throwaway projects in the registry of the
+    operator: measured on one machine, 28989 rows of which 6 named a
+    project that exists.  The same shape as the index dir, for the same
+    reason.
+    """
+    if _GLOBAL_DB_PATH != _DEFAULT_GLOBAL_DB_PATH:
+        return _GLOBAL_DB_PATH
+    env = os.environ.get("FW_CONTEXT_PROJECTS_DB")
+    return Path(env).expanduser() if env else _GLOBAL_DB_PATH
 
 
 def open_global_db() -> sqlite3.Connection:
@@ -70,8 +102,20 @@ def open_global_db() -> sqlite3.Connection:
     Returns a cached connection — the registry is read-mostly so a single
     long-lived connection is safe and avoids per-call open overhead.
     """
-    global _global_conn
+    global _global_conn, _global_conn_path
     with _global_lock:
+        wanted = _global_db_path()
+        if _global_conn is not None and _global_conn_path != wanted:
+            # The redirect moved after this connection opened.  Reusing it
+            # would read the registry that the caller just redirected away
+            # from, and a test would then write the real one.
+            try:
+                _global_conn.close()
+            except SAFE_EXCEPT as e:
+                if is_fatal(e):
+                    raise
+            _global_conn = None
+
         if _global_conn is not None:
             try:
                 _global_conn.execute("SELECT 1")
@@ -85,7 +129,7 @@ def open_global_db() -> sqlite3.Connection:
                 _global_conn = None  # stale connection, reopen
 
         if _global_conn is None:
-            db_path = _global_db_path()
+            db_path = wanted
             db_path.parent.mkdir(parents=True, exist_ok=True)
 
             _global_conn = sqlite3.connect(str(db_path), check_same_thread=False)
@@ -98,6 +142,7 @@ def open_global_db() -> sqlite3.Connection:
             _global_conn.execute("PRAGMA foreign_keys=ON")
             _global_conn.executescript(_SCHEMA)
             _global_conn.commit()
+            _global_conn_path = db_path
 
     return _global_conn
 
