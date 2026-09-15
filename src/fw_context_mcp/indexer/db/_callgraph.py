@@ -97,7 +97,14 @@ __all__ = [
 # Name resolution lives in ``_resolve`` because ``_refs`` needs the same
 # choice.  The two modules each held their own copy of it, and the copies
 # then disagreed about what one name meant.  These aliases keep the older
-# spelling for the readers inside this module.
+# spelling for the readers inside this module, and for the tests that
+# import them from here.
+#
+# They are MODULE-private.  ``_resolve_target_usr`` was re-exported from
+# ``indexer/db/__init__.py`` as well, and nothing outside this file ever
+# read it — the package surface named a function that only its own module
+# used.  New code takes ``resolve_usr`` and ``resolve_usrs`` from
+# ``._resolve``, which is where they are written down.
 _MAX_AMBIGUOUS_TARGETS = MAX_AMBIGUOUS_TARGETS
 _resolve_target_usrs = resolve_usrs
 _resolve_target_usr = resolve_usr

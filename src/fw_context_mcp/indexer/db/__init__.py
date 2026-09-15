@@ -32,7 +32,6 @@ __all__ = [
     "_cosine_sim",
     "_ensure_column",
     "_expand_query",
-    "_resolve_target_usr",
     "clean_orphan_embeddings",
     "clean_orphan_embeddings_vec",
     "compute_analysis_coverage",
@@ -130,7 +129,6 @@ __all__ = [
 import logging
 
 from ._callgraph import (
-    _resolve_target_usr,  # noqa: F401 — part of the package API
     count_dead_code,
     count_hotspots,
     find_all_callers_recursive,
