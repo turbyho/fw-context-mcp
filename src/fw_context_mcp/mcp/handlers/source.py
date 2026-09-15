@@ -37,7 +37,11 @@ Private helper functions provide reusable building blocks:
   - _try_macro_fallback   — #define macro lookup that returns a
                             standardised result dict callers can chain
   - _validate_path_in_root — path-security guard used by read_file and
-                            get_file_map
+                            get_file_map, which take a path FROM the caller
+  - _within_root          — the same question for a path the INDEX stored,
+                            used by the three one-body tools; both join
+                            with the root before resolving, thus a
+                            relative path means one thing in this module
   - _collect_*            — callers, callees, indirect calls, enum
                             constants, override metadata, and Phase 3
                             resolution info
@@ -256,6 +260,96 @@ def _ambiguity(conn, config_hash: str, name: str, row, root) -> dict:
         "candidates": candidate_rows(candidates, root),
         "candidates_total": total,
     }
+
+
+def _within_root(file_path: str, root: Path) -> bool:
+    """Say whether *file_path* resolves to a place inside *root*.
+
+    ``resolve()`` follows symlinks and settles ``..``, thus a path that
+    only looks as if it were under the root is caught.
+
+    The join with *root* is what makes a RELATIVE path mean the same thing
+    here as it does in :func:`_validate_path_in_root`, the other guard of
+    this module.  ``Path(file_path)`` alone would resolve it against the
+    working directory of the server process, which is not the project and
+    can be anywhere.  An absolute path is unaffected: it wins over the
+    first component of the join.
+    """
+    try:
+        Path(root, file_path).resolve().relative_to(root.resolve())
+    except ValueError:
+        return False
+    return True
+
+
+def _outside_root_error(
+    conn, config_hash: str, name: str, file_path: str, root: Path
+) -> dict:
+    """Refuse a body outside the project, and say what else the name means.
+
+    The three tools that give ONE body pick their symbol with
+    ``_lookup_definition`` and then refuse to read it when it sits outside
+    the project root.  A bare refusal is a dead end: it names a file the
+    caller never asked for, and it says nothing about the symbol.
+
+    WHY the candidates belong on this dict.  A common name matches many
+    symbols, and the pick that fails this guard is one of them — the
+    others can be inside the root.  Measured on one firmware index over
+    the 60 most ambiguous function and method names: 44 were refused here,
+    and 7 of those had candidates inside the project.  ``read`` refused
+    with a framework header while 8 of its 20 candidates were project
+    code, and ``find_callers`` answered for the same name without trouble.
+    The ``candidates`` list already existed for the ambiguous ANSWER; this
+    path returned before it was built.
+
+    The key stays ``error``, because the tool still gives no body.  The
+    rows are added beside it, so a reader can choose and ask again.
+
+    WHY the refused symbol is not simply ``candidates[0]``.  Two resolvers
+    answer here and they rank differently: ``_lookup_definition`` orders by
+    the project flag, the kind and the LINE, while ``resolve_candidates``
+    orders by match rank and reference count — the same divergence that
+    ``mcp/handlers/callgraph.py`` records for the peer-override fallback.
+    Thus the first row of the list can be a symbol INSIDE the root, and the
+    text below must not call it the one that was refused.
+
+    ``in_project_root`` on each row is what makes the count actionable: a
+    reader told "7 of the 20 below are inside the project" has no way to
+    tell WHICH seven from an absolute path alone.
+    """
+    # Annotated, because the keys below carry a list and an int beside the
+    # string, and an inferred dict[str, str] would refuse both.
+    error: dict[str, object] = {"error": f"Path {file_path} outside project root"}
+    candidates = resolve_candidates(conn, config_hash, name, limit=CANDIDATES_SHOWN)
+    inside_flags = [
+        bool(c.file_path) and _within_root(c.file_path, root)
+        for c in candidates
+    ]
+    inside = sum(inside_flags)
+    if not candidates or (len(candidates) == 1 and not inside):
+        # Nothing to offer: the only symbol this name means is the one just
+        # refused, thus a list of it repeats the refusal.  A single
+        # candidate INSIDE the root is a different matter — the resolvers
+        # disagreed, and that one row is the whole answer the reader needs.
+        return error
+    rows = candidate_rows(candidates, root)
+    for row, is_inside in zip(rows, inside_flags, strict=True):
+        row["in_project_root"] = is_inside
+    error["candidates"] = rows
+    error["candidates_total"] = count_candidates(conn, config_hash, name)
+    error["hint"] = (
+        f"The symbol that this tool chose for '{name}' is outside the project "
+        f"root — 'error' names its file — thus it gives no body. "
+        + (
+            f"{inside} of the {len(rows)} candidates below sit inside the "
+            f"project; each row says which in 'in_project_root'. Give a "
+            f"'qualified_name' from 'candidates' to ask about one symbol."
+            if inside else
+            "No candidate below is inside the project either, thus the name "
+            "belongs to code that this project only includes."
+        )
+    )
+    return error
 
 
 def _lookup_try_columns(
@@ -651,7 +745,12 @@ async def explain_symbol(
         others.  Give the full qualified name to ask about one symbol only.
         It is separate from ``warning``, which the LLM error paths use.
 
-        On failure the dict holds only ``error`` with the reason.
+        On failure the dict holds ``error`` with the reason.  One failure
+        carries more than that: when the best match for *name* is in a file
+        outside the project root, the dict also holds ``candidates``,
+        ``candidates_total`` and a ``hint``.  Read them — a common name
+        matches many symbols, and one of the others is often inside the
+        project.
     """
     try:
         db = BaseHandler.resolve_db_context(project_root, variant=variant, image=image)
@@ -671,12 +770,11 @@ async def explain_symbol(
                 return m
             return {"error": f"Symbol not found: {name}"}
         file_path = abs_path(root, row["file_path"])
-        # Defense-in-depth: validate path is within project root
-        try:
-            from pathlib import Path as _Path
-            _Path(file_path).resolve().relative_to(root.resolve())
-        except ValueError:
-            return {"error": f"Path {file_path} outside project root"}
+        # Defense-in-depth: validate path is within project root.  The
+        # refusal carries the other symbols of this name — see
+        # _outside_root_error for why a bare error is a dead end.
+        if not _within_root(file_path, root):
+            return _outside_root_error(conn, config_hash, name, file_path, root)
         # Check for pre-computed LLM analysis (instant, no Ollama call)
         llm_analysis = get_llm_analysis_for_symbol(conn, row["id"])
         return (
@@ -887,7 +985,12 @@ def get_source(
         separate from ``warning``, which reports a body that could not be
         read from the disk.
 
-        On failure the dict holds only ``error`` with the reason.
+        On failure the dict holds ``error`` with the reason.  One failure
+        carries more than that: when the best match for *name* is in a file
+        outside the project root, the dict also holds ``candidates``,
+        ``candidates_total`` and a ``hint``.  Read them — a common name
+        matches many symbols, and one of the others is often inside the
+        project.
     """
     try:
         db = BaseHandler.resolve_db_context(project_root, variant=variant, image=image)
@@ -906,12 +1009,11 @@ def get_source(
                 return m
             return {"error": f"Symbol not found: {name}"}
         file_path = abs_path(root, row["file_path"])
-        # Defense-in-depth: validate path is within project root
-        try:
-            from pathlib import Path as _Path
-            _Path(file_path).resolve().relative_to(root.resolve())
-        except ValueError:
-            return {"error": f"Path {file_path} outside project root"}
+        # Defense-in-depth: validate path is within project root.  The
+        # refusal carries the other symbols of this name — see
+        # _outside_root_error for why a bare error is a dead end.
+        if not _within_root(file_path, root):
+            return _outside_root_error(conn, config_hash, name, file_path, root)
         result: dict = {
             "name": row["name"],
             "qualified_name": row["qualified_name"],
@@ -1381,7 +1483,12 @@ def get_symbol_context(
         symbol that the key names, and the key lists the others.  Give the
         full qualified name to ask about one symbol only.
 
-        On failure the dict holds only ``error`` with the reason.
+        On failure the dict holds ``error`` with the reason.  One failure
+        carries more than that: when the best match for *name* is in a file
+        outside the project root, the dict also holds ``candidates``,
+        ``candidates_total`` and a ``hint``.  Read them — a common name
+        matches many symbols, and one of the others is often inside the
+        project.
     """
     try:
         db = BaseHandler.resolve_db_context(project_root, variant=variant, image=image)
@@ -1400,12 +1507,11 @@ def get_symbol_context(
                 return m
             return {"error": f"Symbol not found: {name}"}
         file_path = abs_path(root, row["file_path"])
-        # Defense-in-depth: validate path is within project root
-        try:
-            from pathlib import Path as _Path
-            _Path(file_path).resolve().relative_to(root.resolve())
-        except ValueError:
-            return {"error": f"Path {file_path} outside project root"}
+        # Defense-in-depth: validate path is within project root.  The
+        # refusal carries the other symbols of this name — see
+        # _outside_root_error for why a bare error is a dead end.
+        if not _within_root(file_path, root):
+            return _outside_root_error(conn, config_hash, name, file_path, root)
         symbol_usr = row["usr"]
 
         # Assemble six independent data sources inside a single DB transaction

@@ -1024,3 +1024,169 @@ class TestTheCandidateOrderIsStable:
         assert [c.usr for c in candidates] == ["u_tied_5"], (
             f"an exact qualified name must stand alone: {candidates}"
         )
+
+
+OUT_OF_ROOT_PROJECT_ID = "proj-outside-root"
+
+
+class TestARefusedBodyStillOffersTheChoice:
+    """A body outside the project root is refused WITH the other candidates.
+
+    ``_lookup_definition`` picks one symbol, and the three one-body tools
+    then refuse to read it when its file sits outside the project root.
+    The refusal used to be the whole answer: it named a file the caller
+    never asked for and said nothing about the symbol, while
+    ``find_callers`` answered for the same name without trouble.
+
+    Measured on one firmware index over the 60 most ambiguous function and
+    method names: 44 were refused this way, and 7 of those had candidates
+    inside the project — ``read`` refused with a framework header while 8
+    of its 20 candidates were project code.
+    """
+
+    @pytest.fixture
+    def project(self, tmp_path: Path) -> Path:
+        """``read`` names three symbols; the one the lookup picks is outside.
+
+        The vendor symbol takes the LOWEST line, because
+        ``_lookup_definition`` orders by the line once the project flag
+        ties — thus it is the one that the tools choose and refuse.
+        """
+        root = tmp_path / "proj"
+        (root / "src").mkdir(parents=True)
+        (root / ".fw-context").mkdir()
+        (root / ".fw-context" / "config.toml").write_text(
+            f'[project]\nid = "{OUT_OF_ROOT_PROJECT_ID}"\n\n'
+            f'[build]\n\n[index]\ndb_dir = "{tmp_path}"\n',
+            encoding="utf-8",
+        )
+        (root / "src" / "io.cpp").write_text("// io\n" * 40, encoding="utf-8")
+
+        db_path = tmp_path / OUT_OF_ROOT_PROJECT_ID / "index.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        conn = open_db(db_path)
+        try:
+            with transaction(conn):
+                upsert_project(conn, OUT_OF_ROOT_PROJECT_ID, root.name, str(root))
+                upsert_build_config(
+                    conn, CH, OUT_OF_ROOT_PROJECT_ID,
+                    str(root / "compile_commands.json"),
+                )
+                inside = upsert_file(conn, CH, "src/io.cpp", "cpp")
+                # An absolute path that no temp root can contain.
+                outside = upsert_file(
+                    conn, CH, "/opt/vendor-sdk/stream.hpp", "cpp",
+                )
+                insert_symbols_batch(conn, [
+                    _symbol_row(outside, "/opt/vendor-sdk/stream.hpp", "Stream",
+                                "Stream", "u_stream", 1, 90, kind="class"),
+                    _symbol_row(outside, "/opt/vendor-sdk/stream.hpp", "read",
+                                "Stream::read", "u_stream_read", 5, 9,
+                                parent_usr="u_stream", signature="int read()"),
+                    _symbol_row(inside, "src/io.cpp", "Fram", "Fram", "u_fram",
+                                8, 30, kind="class"),
+                    _symbol_row(inside, "src/io.cpp", "read", "Fram::read",
+                                "u_fram_read", 10, 18, parent_usr="u_fram",
+                                signature="int read(uint8_t *)"),
+                    _symbol_row(inside, "src/io.cpp", "Uart", "Uart", "u_uart",
+                                19, 34, kind="class"),
+                    _symbol_row(inside, "src/io.cpp", "read", "Uart::read",
+                                "u_uart_read", 20, 28, parent_usr="u_uart",
+                                signature="int read(char *, int)"),
+                    _symbol_row(inside, "src/io.cpp", "alone", "Fram::alone",
+                                "u_alone", 24, 26, parent_usr="u_fram"),
+                ])
+        finally:
+            conn.close()
+        return root
+
+    def test_get_source_offers_the_candidates(self, project: Path):
+        from fw_context_mcp.mcp.handlers.source import get_source
+
+        out = get_source(name="read", project_root=str(project))
+
+        assert "outside project root" in out["error"], out
+        assert out["candidates_total"] == 3, out
+        names = {c["qualified_name"] for c in out["candidates"]}
+        assert {"Fram::read", "Uart::read"} <= names, names
+
+    def test_get_symbol_context_offers_the_candidates(self, project: Path):
+        from fw_context_mcp.mcp.handlers.source import get_symbol_context
+
+        out = get_symbol_context(name="read", project_root=str(project))
+
+        assert "outside project root" in out["error"], out
+        assert out["candidates_total"] == 3, out
+
+    def test_explain_symbol_offers_the_candidates(self, project: Path):
+        import asyncio
+
+        from fw_context_mcp.mcp.handlers.source import explain_symbol
+
+        out = asyncio.run(explain_symbol(name="read", project_root=str(project)))
+
+        assert "outside project root" in out["error"], out
+        assert out["candidates_total"] == 3, out
+
+    def test_each_row_carries_what_the_choice_needs(self, project: Path):
+        from fw_context_mcp.mcp.handlers.source import get_source
+
+        out = get_source(name="read", project_root=str(project))
+
+        row = next(c for c in out["candidates"] if c["qualified_name"] == "Fram::read")
+        assert row["class"] == "Fram", row
+        assert row["signature"] == "int read(uint8_t *)", row
+        assert row["line"] == 10, row
+
+    def test_the_hint_counts_the_candidates_inside_the_root(self, project: Path):
+        from fw_context_mcp.mcp.handlers.source import get_source
+
+        out = get_source(name="read", project_root=str(project))
+
+        assert "2 of the 3 candidates" in out["hint"], out["hint"]
+        assert "qualified_name" in out["hint"], out["hint"]
+
+    def test_each_row_says_whether_it_is_inside_the_project(self, project: Path):
+        """A count of "2 of 3" is unreadable without a mark on each row."""
+        from fw_context_mcp.mcp.handlers.source import get_source
+
+        out = get_source(name="read", project_root=str(project))
+
+        by_name = {c["qualified_name"]: c for c in out["candidates"]}
+        assert by_name["Fram::read"]["in_project_root"] is True, by_name["Fram::read"]
+        assert by_name["Uart::read"]["in_project_root"] is True
+        assert by_name["Stream::read"]["in_project_root"] is False, (
+            by_name["Stream::read"]
+        )
+
+    def test_the_hint_does_not_call_the_first_row_the_refused_one(self, project: Path):
+        """``_lookup_definition`` and ``resolve_candidates`` rank differently.
+
+        The first candidate row can be a symbol INSIDE the root, thus the
+        text must not describe it as the one that was refused.
+        """
+        from fw_context_mcp.mcp.handlers.source import get_source
+
+        out = get_source(name="read", project_root=str(project))
+
+        assert "best match" not in out["hint"], out["hint"]
+        assert "chose" in out["hint"], out["hint"]
+
+    def test_an_unambiguous_name_keeps_the_bare_refusal(self, project: Path):
+        """One symbol means no choice, thus a list of one repeats the refusal."""
+        from fw_context_mcp.mcp.handlers.source import get_source
+
+        out = get_source(name="Stream::read", project_root=str(project))
+
+        assert "outside project root" in out["error"], out
+        assert "candidates" not in out, out
+        assert "hint" not in out, out
+
+    def test_a_symbol_inside_the_root_still_answers(self, project: Path):
+        """The guard must not have moved: a body inside the root comes back."""
+        from fw_context_mcp.mcp.handlers.source import get_source
+
+        out = get_source(name="Fram::alone", project_root=str(project))
+
+        assert "error" not in out, out
+        assert out["qualified_name"] == "Fram::alone"
