@@ -301,13 +301,74 @@ class TestOneAnswerOwnsTheWalk:
             f"the fallback named a symbol outside the candidate list: {warning}"
         )
 
-    def test_a_named_symbol_needs_no_ambiguity_row(self, project: Path):
-        """One candidate, thus nothing to choose and nothing to report."""
+    def test_a_qualified_name_is_told_where_the_rows_come_from(self, project: Path):
+        """The case that misleads most, and it needs no ambiguity at all.
+
+        ``Rom::stop`` names ONE symbol and it has no call site.  The answer
+        holds the call sites of its base and of its sibling overrides, and
+        the page notice counts them, thus a reader takes 8 callers for a
+        method that has none of its own.
+        """
         from fw_context_mcp.mcp.handlers.callgraph import find_callers
 
         rows = find_callers("Rom::stop", project_root=str(project), limit=50)
 
+        warning = next((r["warning"] for r in rows if "warning" in r), None)
+        assert warning is not None, f"the answer said nothing: {rows}"
+        assert "Rom::stop" in warning, warning
+        assert "recorded_against" in warning, warning
+        notice = _notice(rows)
+        assert notice is not None and notice["total"] == 8, notice
+
+    def test_each_row_says_which_symbol_it_is_recorded_against(self, project: Path):
+        """A base row reaches this override; a sibling row does not.
+
+        libclang records a call through a base-class pointer against the
+        nearest override it can see.  Propagating those is the point of
+        this answer — a call on the BASE dispatches to ``Rom::stop``
+        whenever the object is a ``Rom``.  A call recorded against
+        ``Sd::stop`` does not: the static type was ``Sd``.
+        """
+        from fw_context_mcp.mcp.handlers.callgraph import find_callers
+
+        rows = find_callers("Rom::stop", project_root=str(project), limit=50)
+        answers = _answers(rows)
+
+        assert all("recorded_against" in r for r in answers), answers[:2]
+        by_symbol = {r["recorded_against"] for r in answers}
+        assert by_symbol == {"Sd::stop", "Flash::stop"}, by_symbol
+        # Neither is the base in this fixture, thus nothing reaches Rom.
+        assert all(r["reaches_this_symbol"] is False for r in answers)
+
+    def test_a_row_on_the_base_reaches_the_symbol(self, project: Path):
+        """The base holds a call site, thus that row DOES reach the override."""
+        from fw_context_mcp.indexer.db import insert_refs_batch, open_db, transaction
+        from fw_context_mcp.mcp.handlers.callgraph import find_callers
+
+        conn = open_db(project.parent / PROJECT_ID / "index.db")
+        try:
+            with transaction(conn):
+                insert_refs_batch(conn, [
+                    (CH, "u_base_stop", "src/dl.cpp", 90, "u_app", "call", None),
+                ])
+        finally:
+            conn.close()
+
+        rows = find_callers("Rom::stop", project_root=str(project), limit=50)
+        base_rows = [
+            r for r in _answers(rows) if r.get("recorded_against") == "Base::stop"
+        ]
+        assert len(base_rows) == 1, _answers(rows)
+        assert base_rows[0]["reaches_this_symbol"] is True, base_rows
+
+    def test_a_direct_answer_carries_no_such_warning(self, project: Path):
+        """The row belongs to the fallback alone, not to every answer."""
+        from fw_context_mcp.mcp.handlers.callgraph import find_callers
+
+        rows = find_callers("Sd::stop", project_root=str(project), limit=50)
+
         assert not any("warning" in r for r in rows), rows
+        assert _notice(rows)["total"] == 2, rows
 
     def test_the_peer_answer_names_the_symbol_it_took(self, two_devs: Path):
         """The rows describe ONE hierarchy, thus the answer must name it.

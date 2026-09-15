@@ -134,6 +134,10 @@ def _resolve_virtual_callers(conn, config_hash: str, usr: str, root, ref_kind: l
     # Collect all peer overrides that share the same base method.
     # Include the base method itself — callers may be recorded directly
     # against it when libclang resolves the call to the base-level override.
+    # Empty when no base is known.  Strategy 2 below finds siblings within
+    # one class and no base at all, thus no row of that path reaches the
+    # symbol through dispatch.
+    base_usr = ""
     if base:
         base_usr = base["base_usr"]
         overrides = conn.execute(
@@ -182,7 +186,15 @@ def _resolve_virtual_callers(conn, config_hash: str, usr: str, root, ref_kind: l
         kind_clause = f"AND r.ref_kind IN ({rk_placeholders})"
         kind_params = list(ref_kind)
 
+    # ``r.to_usr`` travels with each row, because the rows are NOT all of
+    # one kind.  A call recorded against the BASE method reaches this
+    # override whenever the object has this dynamic type — that is what
+    # the propagation is for.  A call recorded against a SIBLING override
+    # does not: libclang wrote that one because the static type was the
+    # sibling.  Without this column a reader cannot tell the two apart,
+    # and the answer reads as one set of call sites.
     virtual_select = f"""SELECT DISTINCT r.from_file, r.from_line, r.ref_kind,
+                    r.to_usr AS recorded_usr,
                     caller.name AS caller_name,
                     caller.qualified_name AS caller_qname,
                     caller.kind AS caller_kind
@@ -209,11 +221,21 @@ def _resolve_virtual_callers(conn, config_hash: str, usr: str, root, ref_kind: l
     # neither repeat nor skip a row.
     caller_rows = conn.execute(
         f"""{virtual_select}
-             ORDER BY r.from_file, r.from_line, r.ref_kind,
+             ORDER BY r.from_file, r.from_line, r.ref_kind, r.to_usr,
                       caller.qualified_name, caller.name, caller.kind
              LIMIT ? OFFSET ?""",
         (config_hash, *all_derived, *kind_params, limit, max(0, offset)),
     ).fetchall()
+
+    # One query for the names of the symbols the rows are recorded against.
+    usr_names = {
+        row["usr"]: row["qualified_name"] or row["name"]
+        for row in conn.execute(
+            f"""SELECT usr, name, qualified_name FROM symbols
+                WHERE config_hash = ? AND usr IN ({placeholders})""",
+            (config_hash, *all_derived),
+        )
+    }
 
     return [
         {
@@ -222,6 +244,11 @@ def _resolve_virtual_callers(conn, config_hash: str, usr: str, root, ref_kind: l
             "ref_kind": r["ref_kind"],
             "caller": r["caller_qname"] or r["caller_name"] or "<file scope>",
             "caller_kind": r["caller_kind"],
+            # Which symbol the index records this reference against.  It is
+            # the base method, or another override of it — never the symbol
+            # that the caller asked about, which has no reference of its own.
+            "recorded_against": usr_names.get(r["recorded_usr"], "?"),
+            "reaches_this_symbol": bool(base_usr) and r["recorded_usr"] == base_usr,
         }
         for r in caller_rows
     ], total
@@ -416,21 +443,44 @@ def _references_result(name: str, project_root: str | None, ref_kind: str | list
                     virtual_total, skip, shown,
                     hint=f"{tool}('{name}', offset={skip + shown}) reads the next page.",
                 ))
-                if chosen is not None and len(candidates) > 1:
-                    # This branch answers about the peers of ONE symbol.  A
-                    # row of it carries no ``target_qualified_name``,
-                    # because the rows describe one hierarchy and not
-                    # several symbols.  A reader thus has no way to see
-                    # which symbol the answer belongs to, and the name
-                    # means more than one.
+                if chosen is not None:
+                    # The index records none of these rows against the
+                    # symbol that the caller named, and the page notice
+                    # counts them, thus the answer must say where they come
+                    # from.  It must NOT say that they belong to someone
+                    # else: a call recorded against the BASE method reaches
+                    # this override whenever the object has this dynamic
+                    # type, which is the whole point of the propagation.
+                    # Only a row recorded against a SIBLING override fails
+                    # to reach it, because libclang wrote that one from the
+                    # static type of the sibling.
+                    #
+                    # ``recorded_against`` and ``reaches_this_symbol`` carry
+                    # the difference per row.  This text says how to read
+                    # them, for EVERY such answer and not only an ambiguous
+                    # name: a qualified name gets the same rows.
+                    if len(candidates) > 1:
+                        opening = (
+                            f"The name '{name}' matches "
+                            f"{count_candidates(conn, config_hash, name)} "
+                            f"symbols, and none of them has a "
+                            f"{relation_one} of its own."
+                        )
+                    else:
+                        opening = (
+                            f"'{chosen.qualified_name}' has no "
+                            f"{relation_one} of its own."
+                        )
                     virtual_rows.insert(0, {"warning": (
-                        f"The name '{name}' matches "
-                        f"{count_candidates(conn, config_hash, name)} symbols, "
-                        f"and none of them has a {relation_one} of its own. "
-                        f"The rows below are the {label} of the methods that "
-                        f"override the same base method as "
-                        f"'{chosen.qualified_name}'. "
-                        f"Give a full qualified name to ask about one symbol."
+                        f"{opening} The rows below come from the virtual "
+                        f"dispatch of '{chosen.qualified_name}': each one is "
+                        f"recorded against the base method it overrides, or "
+                        f"against another override of that base. Read "
+                        f"'recorded_against' on each row. A row with "
+                        f"'reaches_this_symbol': true sits on the BASE, thus "
+                        f"it calls this symbol whenever the object has this "
+                        f"type. A row with false sits on a sibling override "
+                        f"and reaches that one instead."
                     )})
                 return virtual_rows
             return [{"info": f"No {label} found for '{name}'."}]
@@ -538,9 +588,9 @@ def find_callers(
 
         A virtual method with no call site of its own answers with the
         call sites of the methods that override the same base method.
-        Those rows describe ONE hierarchy, thus they carry no
-        ``target_qualified_name``.  When the name is ambiguous as well, a
-        ``warning`` dict names the symbol that the answer belongs to.
+        Those rows reach a PEER and not the symbol you named, and the page
+        notice counts them, thus a ``warning`` dict always leads such an
+        answer and says so.  Read it before you report a caller count.
 
         Never empty: one dict with ``error`` (symbol not resolved) or
         ``info`` (no references of this kind).  Check both keys first.
@@ -608,9 +658,9 @@ def find_references(
 
         A virtual method with no reference of its own answers with the
         references of the methods that override the same base method.
-        Those rows describe ONE hierarchy, thus they carry no
-        ``target_qualified_name``.  When the name is ambiguous as well, a
-        ``warning`` dict names the symbol that the answer belongs to.
+        Those rows reach a PEER and not the symbol you named, and the page
+        notice counts them, thus a ``warning`` dict always leads such an
+        answer and says so.  Read it before you report a reference count.
 
         Never empty: one dict with ``error`` (symbol not resolved) or
         ``info`` (no references).  Check both keys first.
