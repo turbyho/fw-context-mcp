@@ -440,3 +440,63 @@ class TestAZeroLimitCannotStallTheWalk:
         assert notice["shown"] >= 1, notice
         assert notice["total"] == 2, notice
         assert len(_answers(rows)) >= 1
+
+
+class TestPastTheEndNamesTheOffsetAndNotTheIndex:
+    """An empty page of an answer that holds rows reports the OFFSET.
+
+    Both tools keep a second ``info`` row for an index that really has
+    nothing to report, and that row makes a statement about the whole
+    codebase.  Reading it out at a deep offset tells the reader the
+    opposite of the truth.
+
+    ``find_hotspots`` read its ``project_only`` branch first, and that
+    parameter is True by DEFAULT — thus every past-the-end walk of the
+    ordinary call got "no hotspots at all".  Measured on one firmware
+    index: 16 project hotspots, and ``offset=116`` reported none.
+    """
+
+    def test_find_hotspots_past_the_end_names_the_offset(self, project: Path):
+        from fw_context_mcp.mcp.handlers.callgraph import find_hotspots
+
+        truth = _notice(find_hotspots(project_root=str(project), limit=50))
+        assert truth is not None and truth["total"] == 2, truth
+
+        rows = find_hotspots(project_root=str(project), limit=5, offset=50)
+
+        info = _info(rows)
+        assert info is not None, rows
+        assert "offset 50" in info["info"], info
+        assert "2" in info["info"], f"the count of the answer must be there: {info}"
+        assert "project_only" not in info["info"], (
+            f"the project holds hotspots, thus this is not that message: {info}"
+        )
+
+    def test_find_hotspots_past_the_end_reports_the_same_for_vendor_code(
+        self, project: Path
+    ):
+        """The fix must not move the message of ``project_only=False``."""
+        from fw_context_mcp.mcp.handlers.callgraph import find_hotspots
+
+        rows = find_hotspots(
+            project_root=str(project), limit=5, offset=50, project_only=False
+        )
+
+        info = _info(rows)
+        assert info is not None, rows
+        assert "offset 50" in info["info"], info
+
+    def test_find_dead_code_past_the_end_names_the_offset(self, project: Path):
+        from fw_context_mcp.mcp.handlers.callgraph import find_dead_code
+
+        truth = _notice(find_dead_code(project_root=str(project), limit=50))
+        assert truth is not None and truth["total"] >= 3, truth
+
+        rows = find_dead_code(project_root=str(project), limit=5, offset=500)
+
+        info = _info(rows)
+        assert info is not None, rows
+        assert "offset 500" in info["info"], info
+        assert "every defined function" not in info["info"], (
+            f"the project holds dead functions, thus this is not that message: {info}"
+        )

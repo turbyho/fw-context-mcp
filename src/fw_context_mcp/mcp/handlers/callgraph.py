@@ -1746,13 +1746,21 @@ def find_hotspots(
             exclude_paths=exclude_paths,
             project_only=project_only,
         )
-        if not rows and project_only:
-            return [{"info": "No project hotspots found. Try project_only=False to include vendor code."}]
         if not rows:
+            # The offset decides FIRST.  A reader that walked past the last
+            # page has an answer with rows in it, thus neither message below
+            # describes this call: they each report on the whole index, and
+            # the count says they would be untrue.  Ordered the other way
+            # round the project_only branch answered every past-the-end walk
+            # of the DEFAULT parameters — measured, a project holding 16
+            # hotspots reported that it holds none.  ``find_dead_code`` reads
+            # its two checks in this order for the same reason.
             if skip and total:
                 return [{"info": (
                     f"No hotspot at offset {skip}; the answer holds {total}."
                 )}]
+            if project_only:
+                return [{"info": "No project hotspots found. Try project_only=False to include vendor code."}]
             return [{"info": "No references indexed — enable index_refs and re-index."}]
         out = _with_absolute_file(rows, db.root)
         out.insert(0, page_notice(
