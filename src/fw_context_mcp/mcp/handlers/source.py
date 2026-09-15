@@ -1095,9 +1095,9 @@ def _collect_callers(
     """Return immediate callers (direct + indirect) of the symbol in *row*.
 
     Takes the symbol that ``_lookup_definition`` already chose, and NOT its
-    name.  It used to take the name and hand it to ``find_refs``, which ran
-    its own resolution with its own ranking.  The two then disagreed
-    whenever one name meant several symbols: measured on one firmware
+    name.  It used to take the name and hand it to the resolving reference
+    lookup, which ran its own resolution with its own ranking.  The two
+    then disagreed whenever one name meant several symbols: measured on one firmware
     index, ``get_symbol_context`` reported the body of one class's method
     together with the call sites of another class's method of the same
     name, and no field in the answer said so.

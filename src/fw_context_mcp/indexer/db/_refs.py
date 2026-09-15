@@ -75,7 +75,6 @@ __all__ = [
     "delete_refs_for_files",
     "find_indirect_call_sites",
     "find_indirect_targets",
-    "find_refs",
     "insert_fp_assignments_batch",
     "insert_indirect_call_sites_batch",
     "insert_refs_batch",
@@ -649,13 +648,13 @@ def refs_for_symbol(
 ) -> list[sqlite3.Row]:
     """Return the reference rows of ONE symbol, named by its USR.
 
-    This half of ``find_refs`` does no name resolution.  A caller that has
-    already chosen a symbol must use it, so that the choice is made once.
-    ``get_symbol_context`` used to call ``find_refs`` with the NAME after
-    ``_lookup_definition`` had already picked a symbol from that same name,
-    and the two resolvers ranked differently: measured on one firmware
-    index, one answer held the body of one symbol and the call sites of
-    another.
+    This half of ``find_refs_with_candidates`` does no name resolution.  A
+    caller that has already chosen a symbol must use it, so that the choice
+    is made once.  ``get_symbol_context`` once passed the NAME to the
+    resolving half after ``_lookup_definition`` picked a symbol from that
+    same name, and the two resolvers ranked differently: measured on one
+    firmware index, one answer held the body of one symbol and the call
+    sites of another.
 
     **Aggregate type handling**: for a class, struct or enum the references
     sit at member granularity (``MyClass::method``), thus the query takes
@@ -802,31 +801,13 @@ def find_refs_with_candidates(
     return merged[offset:reach], candidates, total
 
 
-def find_refs(
-    conn: sqlite3.Connection,
-    config_hash: str,
-    name: str,
-    ref_kind: str | list[str] | None = None,
-    limit: int = 50,
-) -> list[sqlite3.Row]:
-    """Find all references to a symbol by name or partial qualified name.
-
-    A view on :func:`find_refs_with_candidates` for a caller that needs the
-    rows only.  See that function for the resolution rules and for what an
-    ambiguous name does to the answer.
-    """
-    rows, _candidates, _total = find_refs_with_candidates(
-        conn, config_hash, name, ref_kind=ref_kind, limit=limit
-    )
-    return rows
-
-
 class _TaggedRef:
     """A reference row that also knows which same-name symbol it belongs to.
 
     ``sqlite3.Row`` cannot take a new key, and turning every row into a
-    dict here would change what each caller of ``find_refs`` receives.
-    This wrapper forwards the mapping access and adds the two target keys.
+    dict here would change what each caller of
+    ``find_refs_with_candidates`` receives.  This wrapper forwards the
+    mapping access and adds the two target keys.
     """
 
     __slots__ = ("_row", "_candidate", "_label")

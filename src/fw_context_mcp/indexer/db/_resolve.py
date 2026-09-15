@@ -7,8 +7,9 @@ per translation unit.
 
 This module holds that choice in ONE place.  It lived in three:
 ``_resolve_target_usr`` in ``_callgraph.py``, a second copy inside
-``find_call_path``, and a third inside ``find_refs`` in ``_refs.py``.  All
-three wrote the same four conditions as one flat ``OR`` with ``LIMIT 1``,
+``find_call_path``, and a third inside the reference lookup of
+``_refs.py``.  All three wrote the same four conditions as one flat
+``OR`` with ``LIMIT 1``,
 and each then disagreed with the others about what one name meant.
 Measured on one firmware index, a single tool reported the body of one
 symbol together with the call sites of another, because it asked two of
@@ -89,9 +90,9 @@ class Candidate(tuple):
     A named tuple subclass rather than a dataclass, because the callers
     unpack it and pass the parts to SQL.
 
-    ``kind`` is here for ``find_refs``: a class, struct or enum keeps its
-    references at member granularity, and that query needs the kind to know
-    it must match a USR prefix.
+    ``kind`` is here for ``refs_for_symbol``: a class, struct or enum keeps
+    its references at member granularity, and that query needs the kind to
+    know it must match a USR prefix.
 
     ``owner`` is the class, struct or union that declares the symbol, and
     it is empty for a free function.  It is the field that tells two

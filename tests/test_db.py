@@ -12,7 +12,7 @@ from fw_context_mcp.indexer.db import (
     delete_macros_for_files,
     delete_refs_for_files,
     delete_symbols_for_file,
-    find_refs,
+    find_refs_with_candidates,
     get_active_config,
     get_all_projects,
     get_class_members,
@@ -37,6 +37,21 @@ from fw_context_mcp.indexer.db import (
     upsert_file,
     upsert_project,
 )
+
+
+def find_refs(conn, config_hash, name, ref_kind=None, limit=50):
+    """The rows of ``find_refs_with_candidates``, for a test that reads rows.
+
+    The package used to ship this as a view.  Nothing in ``src/`` called it
+    after the resolution and the query were split, and it dropped
+    ``candidates`` and ``total`` — the two values that every real caller
+    reads.  A convenience that only a test wants belongs to the test.
+    ``tests/test_paging.py`` covers the two values that this helper drops.
+    """
+    rows, _candidates, _total = find_refs_with_candidates(
+        conn, config_hash, name, ref_kind=ref_kind, limit=limit
+    )
+    return rows
 
 
 class TestOpenDb:

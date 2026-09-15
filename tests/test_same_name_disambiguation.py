@@ -26,7 +26,6 @@ import pytest
 
 from fw_context_mcp.indexer._postprocess import _step_repair_from_usr
 from fw_context_mcp.indexer.db import (
-    find_refs,
     find_refs_with_candidates,
     insert_refs_batch,
     insert_symbols_batch,
@@ -58,6 +57,20 @@ from fw_context_mcp.mcp.handlers.source import (
 )
 
 CH = "hash-deadbeef"
+
+
+def find_refs(conn, config_hash, name, ref_kind=None, limit=50):
+    """The rows of ``find_refs_with_candidates``, for a test that reads rows.
+
+    The package used to ship this as a view.  Nothing in ``src/`` called it
+    after the resolution and the query were split, and it dropped
+    ``candidates`` and ``total`` — the two values that every real caller
+    reads.  A convenience that only a test wants belongs to the test.
+    """
+    rows, _candidates, _total = find_refs_with_candidates(
+        conn, config_hash, name, ref_kind=ref_kind, limit=limit
+    )
+    return rows
 
 
 def _symbol_row(

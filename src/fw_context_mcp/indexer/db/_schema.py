@@ -504,9 +504,10 @@ CREATE TABLE IF NOT EXISTS symbols (
 -- query in the system.  Covers both bare names and prefix LIKE.
 CREATE INDEX IF NOT EXISTS idx_symbols_name        ON symbols(name);
 
--- idx_symbols_qname: three-tier name resolution where qualified_name is
--- the second tier (exact match) and third tier (suffix LIKE).  Without
--- this index, every find_refs() call scans all symbols.
+-- idx_symbols_qname: the ranked name resolution of indexer/db/_resolve.py,
+-- where qualified_name carries rank 0 (exact match) and rank 2 (suffix
+-- LIKE).  Without this index, every name a tool resolves scans all
+-- symbols.
 CREATE INDEX IF NOT EXISTS idx_symbols_qname       ON symbols(qualified_name);
 
 -- idx_symbols_kind: filtered queries (search_code with kind='function',
