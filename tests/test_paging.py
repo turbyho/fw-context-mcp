@@ -399,3 +399,82 @@ class TestVirtualCallersPaging:
         assert _resolve_virtual_callers(
             virtual_db, CH, "u_app", Path("/tmp/test"), ref_kind=["call"],
         ) is None
+
+
+@pytest.fixture
+def tied_refs_db():
+    """One symbol whose references all sit on ONE line of ONE file.
+
+    ``idx_refs_unique`` covers ``from_usr`` and ``ref_kind``, thus rows that
+    share a file and a line are legal and common: measured over six
+    firmware indexes, 4792 to 80635 lines carry such a pair.  Here every
+    row ties, which is the extreme of the same shape.
+    """
+    tmpdir = Path(tempfile.mkdtemp())
+    conn = open_db(tmpdir / "test.db")
+    with transaction(conn):
+        upsert_project(conn, "proj-001", "test", "/tmp/test")
+        upsert_build_config(conn, CH, "proj-001", "/tmp/compile_commands.json")
+    fid = upsert_file(conn, CH, "src/main.cpp", "cpp")
+    insert_symbols_batch(
+        conn,
+        [_symbol_row(fid, "src/main.cpp", "probe", "C::probe", "u_t", 10)]
+        + [_symbol_row(fid, "src/main.cpp", f"c{i}", f"C::c{i}", f"u_c{i}",
+                       100 + i, kind="function") for i in range(40)],
+    )
+    insert_refs_batch(conn, [
+        (CH, "u_t", "src/main.cpp", 42, f"u_c{i}", "call", None)
+        for i in range(40)
+    ])
+    yield conn
+    conn.close()
+    shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+class TestAPlainSymbolPagesOverTiedRows:
+    """Two pages of one walk must not repeat or skip a tied reference.
+
+    The plain branch of ``refs_for_symbol`` used to order by
+    ``(from_file, from_line)`` alone, which is NOT a total order: one line
+    can hold a ``call`` row and a ``ref`` row for one symbol, or two rows
+    from two callers.  ``r.rowid`` now ends that order.
+
+    Honest about what this pins: the fault was never reproduced.  Walking
+    240 tied symbols over two real indexes, and 800 rows tied on one line
+    here, gave no repeat and no skip — SQLite's sorter happens to be
+    deterministic for this plan.  The test guards the CONTRACT that
+    ``mcp/shared/paging.py`` states and that the tool instructions promise
+    to the reader, not an observed failure.
+    """
+
+    @pytest.mark.parametrize("step", [1, 3, 7, 13])
+    def test_the_walk_holds_every_row_once(self, tied_refs_db, step: int):
+        whole = refs_for_symbol(tied_refs_db, CH, "u_t", "method", limit=500)
+        assert len(whole) == 40, f"the fixture must tie 40 rows: {len(whole)}"
+
+        walked: list = []
+        offset = 0
+        while True:
+            page = refs_for_symbol(
+                tied_refs_db, CH, "u_t", "method", limit=step, offset=offset,
+            )
+            if not page:
+                break
+            walked.extend(page)
+            offset += len(page)
+
+        callers = [r["from_usr"] for r in walked]
+        assert len(callers) == 40, f"the walk lost or gained rows: {len(callers)}"
+        assert len(set(callers)) == 40, "a reference came back twice"
+        assert set(callers) == {r["from_usr"] for r in whole}
+
+    def test_two_reads_of_one_page_agree(self, tied_refs_db):
+        """An OFFSET is only meaningful when the order repeats itself."""
+        first = refs_for_symbol(
+            tied_refs_db, CH, "u_t", "method", limit=5, offset=10)
+        again = refs_for_symbol(
+            tied_refs_db, CH, "u_t", "method", limit=5, offset=10)
+        assert [r["from_usr"] for r in first] == [r["from_usr"] for r in again]
+
+    def test_the_count_matches_the_walk(self, tied_refs_db):
+        assert count_refs_for_symbol(tied_refs_db, CH, "u_t", "method") == 40

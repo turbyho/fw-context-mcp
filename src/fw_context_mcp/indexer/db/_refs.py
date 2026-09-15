@@ -662,13 +662,22 @@ def refs_for_symbol(
     range and not a LIKE.  GROUP BY deduplicates when several members are
     referenced on one line, as in ``obj.a = obj.b``.
 
-    The order ends where the GROUP BY does.  A plain symbol is ordered by
-    ``(from_file, from_line)`` and no two of its references share both.  An
-    aggregate groups by the CALLER as well, and one line can carry
+    The order ends where the GROUP BY does, and both ends are TOTAL —
+    ``offset`` can then neither repeat a row nor step over one.
+
+    An aggregate groups by the CALLER as well, and one line can carry
     references from several callers — measured on one firmware index, 88
     lines did, one of them from 8 callers.  Those groups tie on the file
-    and the line alone, thus the caller ends that order and *offset* can
-    neither repeat a row nor step over one.
+    and the line alone, thus the caller ends that order.
+
+    A plain symbol ends at ``r.rowid``.  The file and the line alone do NOT
+    separate its references: ``idx_refs_unique`` covers ``from_usr`` and
+    ``ref_kind`` as well, thus one line may hold a ``call`` row and a
+    ``ref`` row for one symbol.  Measured over six firmware indexes, 4792
+    to 80635 lines carry such a pair — ``ARM_MPU_ClrRegion`` at
+    ``cortex_m/scb.c:64`` is one.  The rowid is unique whatever the columns
+    hold, which the unique index is not: SQLite reads two NULL
+    ``from_usr`` values as distinct, so even that index leaves ties.
     """
     kind_filter, kind_params = _build_kind_filter(ref_kind)
 
@@ -700,7 +709,7 @@ def refs_for_symbol(
     return conn.execute(
         f"""{_SELECT}
               AND r.to_usr = ? {kind_filter}
-            ORDER BY r.from_file, r.from_line
+            ORDER BY r.from_file, r.from_line, r.rowid
             LIMIT ? OFFSET ?""",
         params,
     ).fetchall()
