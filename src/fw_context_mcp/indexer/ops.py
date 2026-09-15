@@ -1661,16 +1661,31 @@ def backfill_cross_tu_refs(
 
     # One map for every TU, built once.  _resolve_method_usr matches on the
     # qualified name, thus the map holds the qualified name as its key.
+    #
+    # A qualified name is NOT unique: every overload of one method carries
+    # the same one, and the map holds one USR per key.  The overloads thus
+    # collapse into one entry, and _resolve_method_usr then sees a single
+    # candidate and answers with it.  That is a coin flip between two
+    # bodies, and the rule of this function — an ambiguous name gets no
+    # edge — never reached the shape.  The regex below reads ``obj.emit(``
+    # and nothing more, thus it cannot tell two overloads apart and
+    # neither can the answer.
+    #
+    # ``setdefault`` keeps the FIRST row of a key, so that the map does not
+    # depend on the order of a scan that carries no ORDER BY.
     qn_to_usr: dict[str, str] = {}
     usr_to_qn: dict[str, str] = {}
+    overloaded_qns: set[str] = set()
     for srow in conn.execute(
         """SELECT qualified_name, usr FROM symbols
            WHERE config_hash = ? AND qualified_name != ''
              AND kind IN ('function', 'method', 'constructor', 'destructor')""",
         (config_hash,),
     ):
-        qn_to_usr[srow["qualified_name"]] = srow["usr"]
-        usr_to_qn.setdefault(srow["usr"], srow["qualified_name"])
+        qualified_name, usr = srow["qualified_name"], srow["usr"]
+        if qn_to_usr.setdefault(qualified_name, usr) != usr:
+            overloaded_qns.add(qualified_name)
+        usr_to_qn.setdefault(usr, qualified_name)
 
     # 1. Get all project source files (.c/.cpp) with indexed content.
     #    Only project files are scanned — vendor SDK code is not expected
@@ -1761,8 +1776,15 @@ def backfill_cross_tu_refs(
                         caller_qn=usr_to_qn.get(fn_usr, ""),
                     )
                     # Avoid self-references — a function calling itself
-                    # (recursion) would already have a per-TU ref.
-                    if target_usr and target_usr != fn_usr:
+                    # (recursion) would already have a per-TU ref.  An
+                    # overload is refused here rather than inside
+                    # _resolve_method_usr, because the collapse happens in
+                    # the map and that function cannot see it.
+                    if (
+                        target_usr
+                        and target_usr != fn_usr
+                        and usr_to_qn.get(target_usr, "") not in overloaded_qns
+                    ):
                         new_refs.append(
                             (config_hash, target_usr, file_path_rel, lineno,
                              fn_usr, "call", None)

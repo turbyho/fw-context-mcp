@@ -532,17 +532,24 @@ class TestBackfillWritesNoGuess:
             "void top() {",                 # line 1  (u_top spans 100..110, so use
             "    obj.probe();",             # line 2   a separate span below)
             "    obj.only();",              # line 3
-            "}",                            # line 4
+            "    obj.emit(1);",             # line 4
+            "}",                            # line 5
         ])
         db.execute(
             "UPDATE files SET content = ?, is_project = 1"
             " WHERE config_hash = ? AND path = ?",
             (source, CH, "src/main.cpp"),
         )
-        # A body that covers the two call lines, so the scan looks at them.
+        # A body that covers the call lines, so the scan looks at them.
         fid = upsert_file(db, CH, "src/main.cpp", "cpp")
         insert_symbols_batch(db, [
-            _symbol_row(fid, "src/main.cpp", "scan", "Scan::scan", "u_scan", 1, 4),
+            _symbol_row(fid, "src/main.cpp", "scan", "Scan::scan", "u_scan", 1, 5),
+            # Two overloads.  They share a qualified name and differ in the
+            # parameters, which the regex of the backfill never sees.
+            _symbol_row(fid, "src/main.cpp", "emit", "Scan::emit", "u_emit_int",
+                        10, 12, signature="void emit(int)"),
+            _symbol_row(fid, "src/main.cpp", "emit", "Scan::emit", "u_emit_char",
+                        14, 16, signature="void emit(char)"),
         ])
         db.commit()
         return db
@@ -573,6 +580,25 @@ class TestBackfillWritesNoGuess:
         assert "u_solo" in self._edges_from_scan(db_for_backfill), (
             "the one clear name lost its edge too"
         )
+
+    def test_an_overload_makes_no_edge_either(self, db_for_backfill):
+        """Two overloads share a qualified name, thus the name is ambiguous.
+
+        The symbol map keys on the qualified name, and the two overloads
+        collapse to one entry in it.  ``_resolve_method_usr`` then saw ONE
+        candidate and answered with it, which is a coin flip between two
+        bodies — the rule that an ambiguous name gets no edge never
+        reached this shape.
+
+        The regex of the backfill reads ``obj.emit(`` and nothing more.
+        It cannot tell the overloads apart, thus neither can the answer.
+        """
+        from fw_context_mcp.indexer.ops import backfill_cross_tu_refs
+
+        backfill_cross_tu_refs(db_for_backfill, CH, Path("/tmp/test"))
+        edges = self._edges_from_scan(db_for_backfill)
+        assert "u_emit_int" not in edges, "the backfill guessed one overload"
+        assert "u_emit_char" not in edges, "the backfill guessed one overload"
 
 
 class TestReferenceQueries:
