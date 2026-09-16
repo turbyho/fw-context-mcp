@@ -679,9 +679,9 @@ def _try_macro_fallback(
     return result
 # ── moved from server.py ──
 async def explain_symbol(
-    name: Annotated[str, Field(description="Symbol name to explain. E.g. 'uart_init', 'ModemMsg::send'.")],
+    name: Annotated[str, Field(description="Symbol name to explain. E.g. 'uart_init', 'ModemMsg::send'.", min_length=1)],
     project_root: Annotated[str | None, Field(description="Project root. Auto-detected if omitted.")] = None,
-    context_lines: Annotated[int, Field(description="Lines of source context around the symbol definition.")] = 40,
+    context_lines: Annotated[int, Field(description="Lines of source context around the symbol definition.", ge=0)] = 40,
     variant: Annotated[str | None, Field(description="Build variant (multi-build project). Omit to use default_variant. One query answers for ONE build.")] = None,
     image: Annotated[str | None, Field(description="Sysbuild image within the variant. Required when the variant holds several: each image is a separate program.")] = None,
 ) -> dict:
@@ -894,7 +894,7 @@ async def explain_symbol(
 
 # ── moved from server.py ──
 def get_source(
-    name: Annotated[str, Field(description="Fully qualified symbol name. Returns exact function body via libclang extent.")],
+    name: Annotated[str, Field(description="Fully qualified symbol name. Returns exact function body via libclang extent.", min_length=1)],
     project_root: Annotated[str | None, Field(description="Project root. Auto-detected if omitted.")] = None,
     variant: Annotated[str | None, Field(description="Build variant (multi-build project). Omit to use default_variant. One query answers for ONE build.")] = None,
     image: Annotated[str | None, Field(description="Sysbuild image within the variant. Required when the variant holds several: each image is a separate program.")] = None,
@@ -1081,10 +1081,10 @@ def get_source(
 
 # ── moved from server.py ──
 def get_file_map(
-    file_path: Annotated[str, Field(description="Path to source file — relative to project root or just filename.")],
+    file_path: Annotated[str, Field(description="Path to source file — relative to project root or just filename.", min_length=1)],
     project_root: Annotated[str | None, Field(description="Project root. Auto-detected if omitted.")] = None,
     signatures: Annotated[bool, Field(description="Include full function signatures in output.")] = False,
-    max_per_kind: Annotated[int, Field(description="Max items per symbol kind group (default 30, 0 = unlimited).")] = 30,
+    max_per_kind: Annotated[int, Field(description="Max items per symbol kind group (default 30, 0 = unlimited).", ge=0)] = 30,
     variant: Annotated[str | None, Field(description="Build variant (multi-build project). Omit to use default_variant. One query answers for ONE build.")] = None,
     image: Annotated[str | None, Field(description="Sysbuild image within the variant. Required when the variant holds several: each image is a separate program.")] = None,
 ) -> dict:
@@ -1386,7 +1386,7 @@ def _collect_override_info(
 
 # ── moved from server.py ──
 def get_symbol_context(
-    name: Annotated[str, Field(description="Symbol name. Returns body, signature, all direct callers and callees.")],
+    name: Annotated[str, Field(description="Symbol name. Returns body, signature, all direct callers and callees.", min_length=1)],
     project_root: Annotated[str | None, Field(description="Project root. Auto-detected if omitted.")] = None,
     variant: Annotated[str | None, Field(description="Build variant (multi-build project). Omit to use default_variant. One query answers for ONE build.")] = None,
     image: Annotated[str | None, Field(description="Sysbuild image within the variant. Required when the variant holds several: each image is a separate program.")] = None,
@@ -1626,11 +1626,11 @@ def _shape_file_lines(
 
 
 def read_file(
-    file_path: Annotated[str, Field(description="Path to source file — relative to project root or just filename.")],
+    file_path: Annotated[str, Field(description="Path to source file — relative to project root or just filename.", min_length=1)],
     project_root: Annotated[str | None, Field(description="Project root. Auto-detected if omitted.")] = None,
     line_numbers: Annotated[bool, Field(description="Prefix every line with its line number, like get_source. Default False (bare text).")] = False,
-    start_line: Annotated[int, Field(description="First line to return, 1-based inclusive. 0 = from the start of the file.")] = 0,
-    end_line: Annotated[int, Field(description="Last line to return, 1-based inclusive. 0 = to the end of the file.")] = 0,
+    start_line: Annotated[int, Field(description="First line to return, 1-based inclusive. 0 = from the start of the file.", ge=0)] = 0,
+    end_line: Annotated[int, Field(description="Last line to return, 1-based inclusive. 0 = to the end of the file.", ge=0)] = 0,
     variant: Annotated[str | None, Field(description="Build variant (multi-build project). Omit to use default_variant. One query answers for ONE build.")] = None,
     image: Annotated[str | None, Field(description="Sysbuild image within the variant. Required when the variant holds several: each image is a separate program.")] = None,
 ) -> dict:

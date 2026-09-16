@@ -46,13 +46,13 @@ _VAR_KINDS = ("varglobal", "varlocal", "variable", "field")
 
 def find_variables(
     name: Annotated[str, Field(description="Variable name or prefix to search. "
-        "Uses LIKE match (e.g. 'g_' finds g_debug_level, g_state).")],
+        "Uses LIKE match (e.g. 'g_' finds g_debug_level, g_state).", min_length=1)],
     project_root: Annotated[str | None, Field(description="Project root. "
         "Auto-detected if omitted.")] = None,
     kind: Annotated[str | None, Field(description="Filter by kind: "
         "'varglobal', 'varlocal', 'field', or None for all.")] = None,
     limit: Annotated[int, Field(description="Maximum results "
-        "(default 20, max 100).")] = 20,
+        "(default 20, max 100).", ge=1)] = 20,
     variant: Annotated[str | None, Field(description="Build variant (multi-build project). Omit to use default_variant. One query answers for ONE build.")] = None,
     image: Annotated[str | None, Field(description="Sysbuild image within the variant. Required when the variant holds several: each image is a separate program.")] = None,
 ) -> list[dict]:

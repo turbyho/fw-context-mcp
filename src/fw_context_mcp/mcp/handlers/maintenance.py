@@ -1922,7 +1922,8 @@ def reindex_file_impl(
     file_path: Annotated[
         str,
         Field(
-            description="Absolute or project-relative path to the file to re-parse. A source file must have an entry in compile_commands.json. A header is re-parsed through one translation unit that includes it, and the result then carries a warning that other units can still hold stale symbols."
+            description="Absolute or project-relative path to the file to re-parse. A source file must have an entry in compile_commands.json. A header is re-parsed through one translation unit that includes it, and the result then carries a warning that other units can still hold stale symbols.",
+            min_length=1,
         ),
     ],
     project_root: Annotated[
@@ -2248,7 +2249,7 @@ def _reindex_build_patterns(
 
 # ── moved from server.py ──
 def reindex_file(
-    file_path: Annotated[str, Field(description="Path to the file to re-parse. A source file must be in compile_commands.json. A header goes through one translation unit that includes it, and the result then carries a warning about the other units.")],
+    file_path: Annotated[str, Field(description="Path to the file to re-parse. A source file must be in compile_commands.json. A header goes through one translation unit that includes it, and the result then carries a warning about the other units.", min_length=1)],
     project_root: Annotated[str | None, Field(description="Project root. Auto-detected if omitted.")] = None,
 ) -> dict:
     """Re-parse a single source file with libclang and update its symbols in the index.

@@ -142,7 +142,7 @@ def _bfs_inheritance_walk(
 
 # ── moved from server.py ──
 def get_inheritance_chain(
-    class_name: Annotated[str, Field(description="Class or struct name to get inheritance information for. E.g. 'UART_DRIVER' or 'comm::MODEM'.")],
+    class_name: Annotated[str, Field(description="Class or struct name to get inheritance information for. E.g. 'UART_DRIVER' or 'comm::MODEM'.", min_length=1)],
     project_root: Annotated[str | None, Field(description="Project root. Auto-detected if omitted.")] = None,
     transitive: Annotated[bool, Field(description="When True, walk the full inheritance tree both up (ancestors) and down (descendants). Default: False (direct bases and derived only).")] = False,
     max_depth: Annotated[int, Field(description="Maximum BFS depth for transitive walk (default 10).", ge=1, le=50)] = 10,
@@ -284,7 +284,7 @@ def get_inheritance_chain(
 
 # ── moved from server.py ──
 def get_class_members(
-    class_name: Annotated[str, Field(description="Class or struct name. E.g. 'ModemManager' or 'the Mbed project::ZMODEM'.")],
+    class_name: Annotated[str, Field(description="Class or struct name. E.g. 'ModemManager' or 'the Mbed project::ZMODEM'.", min_length=1)],
     project_root: Annotated[str | None, Field(description="Project root. Auto-detected if omitted.")] = None,
     variant: Annotated[str | None, Field(description="Build variant (multi-build project). Omit to use default_variant. One query answers for ONE build.")] = None,
     image: Annotated[str | None, Field(description="Sysbuild image within the variant. Required when the variant holds several: each image is a separate program.")] = None,
@@ -369,9 +369,9 @@ def get_class_members(
 
 # ── moved from server.py ──
 def get_template_instances(
-    template_name: Annotated[str, Field(description="Template name to find instantiations for. E.g. 'Callback' or 'mbed::Callback'.")],
+    template_name: Annotated[str, Field(description="Template name to find instantiations for. E.g. 'Callback' or 'mbed::Callback'.", min_length=1)],
     project_root: Annotated[str | None, Field(description="Project root. Auto-detected if omitted.")] = None,
-    limit: Annotated[int, Field(description="Maximum results (default 50, max 200).")] = 50,
+    limit: Annotated[int, Field(description="Maximum results (default 50, max 200).", ge=1)] = 50,
     variant: Annotated[str | None, Field(description="Build variant (multi-build project). Omit to use default_variant. One query answers for ONE build.")] = None,
     image: Annotated[str | None, Field(description="Sysbuild image within the variant. Required when the variant holds several: each image is a separate program.")] = None,
 ) -> list[dict]:
@@ -470,7 +470,7 @@ def get_template_instances(
 
 # ── moved from server.py ──
 def get_method_overrides(
-    method_name: Annotated[str, Field(description="Method name to get override information for. Use qualified name for disambiguation, e.g. 'UART_DRIVER::write'.")],
+    method_name: Annotated[str, Field(description="Method name to get override information for. Use qualified name for disambiguation, e.g. 'UART_DRIVER::write'.", min_length=1)],
     project_root: Annotated[str | None, Field(description="Project root. Auto-detected if omitted.")] = None,
     variant: Annotated[str | None, Field(description="Build variant (multi-build project). Omit to use default_variant. One query answers for ONE build.")] = None,
     image: Annotated[str | None, Field(description="Sysbuild image within the variant. Required when the variant holds several: each image is a separate program.")] = None,

@@ -211,11 +211,11 @@ def _append_staleness_warning(
 
 
 def search_code(
-    query: Annotated[str, Field(description="FTS5 search terms. 1-3 words, omit underscores. E.g. 'modem init' not 'modem_init'. Supports trailing wildcard 'modem*'.")],
+    query: Annotated[str, Field(description="FTS5 search terms. 1-3 words, omit underscores. E.g. 'modem init' not 'modem_init'. Supports trailing wildcard 'modem*'.", min_length=1)],
     project_root: Annotated[str | None, Field(description="Project root. Auto-detected if omitted.")] = None,
      kind: Annotated[str | None, Field(description="Optional kind filter: function, method, constructor, destructor, class, struct, union, enum, enum_constant, typedef, varglobal, varlocal, variable, field, namespace.")] = None,
-     limit: Annotated[int, Field(description="Maximum results of one page (default 20, max 100).")] = 20,
-     offset: Annotated[int, Field(description="Skip this many results. Reads the next page of a topic that many symbols carry.")] = 0,
+     limit: Annotated[int, Field(description="Maximum results of one page (default 20, max 100).", ge=1)] = 20,
+     offset: Annotated[int, Field(description="Skip this many results. Reads the next page of a topic that many symbols carry.", ge=0)] = 0,
      project_only: Annotated[bool, Field(description="Exclude vendor SDK code. When True, only application code. Default False.")] = False,
      variant: Annotated[str | None, Field(description="Build variant (multi-build project). Omit to use default_variant. One query answers for ONE build.")] = None,
      image: Annotated[str | None, Field(description="Sysbuild image within the variant. Required when the variant holds several: each image is a separate program.")] = None,
@@ -419,9 +419,9 @@ def search_code(
 
 
 async def smart_search(
-    query: Annotated[str, Field(description="Natural language description, 5-15 words. E.g. 'how does the modem connect?' or 'handle BLE pairing failure'.")],
+    query: Annotated[str, Field(description="Natural language description, 5-15 words. E.g. 'how does the modem connect?' or 'handle BLE pairing failure'.", min_length=1)],
     project_root: Annotated[str | None, Field(description="Project root. Auto-detected if omitted.")] = None,
-    limit: Annotated[int, Field(description="Maximum results (default 20, max 100).")] = 20,
+    limit: Annotated[int, Field(description="Maximum results (default 20, max 100).", ge=1)] = 20,
 ) -> list[dict]:
     """Natural-language search: an LLM generates FTS5 keywords, then searches
     the libclang index. Finds concepts by meaning rather than exact text
@@ -527,10 +527,10 @@ async def smart_search(
 
 # ── moved from server.py ──
 async def semantic_search(
-    query: Annotated[str, Field(description="Natural language description, 5-15 words. E.g. 'parcel locker state machine' or 'how does the modem connect?'.")],
+    query: Annotated[str, Field(description="Natural language description, 5-15 words. E.g. 'parcel locker state machine' or 'how does the modem connect?'.", min_length=1)],
     project_root: Annotated[str | None, Field(description="Project root. Auto-detected if omitted.")] = None,
-    threshold: Annotated[float, Field(description="Minimum cosine similarity (0.0-1.0). Default 0.60. Use 0.55 for exploratory, 0.50 for broad search.")] = 0.60,
-    limit: Annotated[int, Field(description="Maximum results (default 20, max 100).")] = 20,
+    threshold: Annotated[float, Field(description="Minimum cosine similarity (0.0-1.0). Default 0.60. Use 0.55 for exploratory, 0.50 for broad search.", ge=0.0, le=1.0)] = 0.60,
+    limit: Annotated[int, Field(description="Maximum results (default 20, max 100).", ge=1)] = 20,
 ) -> list[dict]:
     """Semantic search using pre-computed libclang symbol embeddings. Finds
     symbols by meaning, not by text — matches concepts even when query
@@ -861,11 +861,11 @@ def _body_match_lines(source: str, start_line: int, terms: list[str]) -> list[in
 
 
 def search_bodies(
-    query: Annotated[str, Field(description="FTS5 search terms for the body of a definition. 1-3 words. E.g. 'attach', 'callback', 'rise'.")],
+    query: Annotated[str, Field(description="FTS5 search terms for the body of a definition. 1-3 words. E.g. 'attach', 'callback', 'rise'.", min_length=1)],
     project_root: Annotated[str | None, Field(description="Project root. Auto-detected if omitted.")] = None,
     kind: Annotated[str | None, Field(description="Optional kind filter: function, method, class, etc.")] = None,
-    limit: Annotated[int, Field(description="Maximum results of one page (default 20, max 100).")] = 20,
-    offset: Annotated[int, Field(description="Skip this many results. Reads the next page of a pattern with many hits.")] = 0,
+    limit: Annotated[int, Field(description="Maximum results of one page (default 20, max 100).", ge=1)] = 20,
+    offset: Annotated[int, Field(description="Skip this many results. Reads the next page of a pattern with many hits.", ge=0)] = 0,
     project_only: Annotated[bool, Field(description="Exclude vendor SDK code. When True, only application code. Default False.")] = False,
     variant: Annotated[str | None, Field(description="Build variant (multi-build project). Omit to use default_variant. One query answers for ONE build.")] = None,
     image: Annotated[str | None, Field(description="Sysbuild image within the variant. Required when the variant holds several: each image is a separate program.")] = None,
@@ -1194,10 +1194,10 @@ def search_bodies(
 
 
 def search_content(
-    query: Annotated[str, Field(description="FTS5 search terms for full file content. 1-3 words. E.g. 'InterruptIn', 'extern C'. Bare multi-word = OR-joined.")],
+    query: Annotated[str, Field(description="FTS5 search terms for full file content. 1-3 words. E.g. 'InterruptIn', 'extern C'. Bare multi-word = OR-joined.", min_length=1)],
     project_root: Annotated[str | None, Field(description="Project root. Auto-detected if omitted.")] = None,
-    limit: Annotated[int, Field(description="Maximum results of one page (default 20, max 100).")] = 20,
-    offset: Annotated[int, Field(description="Skip this many results. Reads the next page of a topic that many files touch.")] = 0,
+    limit: Annotated[int, Field(description="Maximum results of one page (default 20, max 100).", ge=1)] = 20,
+    offset: Annotated[int, Field(description="Skip this many results. Reads the next page of a topic that many files touch.", ge=0)] = 0,
     project_only: Annotated[bool, Field(description="Exclude vendor SDK code. When True, only application code. Default False.")] = False,
     variant: Annotated[str | None, Field(description="Build variant (multi-build project). Omit to use default_variant. One query answers for ONE build.")] = None,
     image: Annotated[str | None, Field(description="Sysbuild image within the variant. Required when the variant holds several: each image is a separate program.")] = None,

@@ -519,10 +519,10 @@ def _references_result(name: str, project_root: str | None, ref_kind: str | list
 
 # ── moved from server.py ──
 def find_callers(
-    name: Annotated[str, Field(description="Symbol name to find callers of. Returns direct call sites and indirect calls via function pointers.")],
+    name: Annotated[str, Field(description="Symbol name to find callers of. Returns direct call sites and indirect calls via function pointers.", min_length=1)],
     project_root: Annotated[str | None, Field(description="Project root. Auto-detected if omitted.")] = None,
-    limit: Annotated[int, Field(description="Maximum results of one page (default 50, max 200).")] = 50,
-    offset: Annotated[int, Field(description="Skip this many results. Reads the next page of a symbol with many call sites.")] = 0,
+    limit: Annotated[int, Field(description="Maximum results of one page (default 50, max 200).", ge=1)] = 50,
+    offset: Annotated[int, Field(description="Skip this many results. Reads the next page of a symbol with many call sites.", ge=0)] = 0,
     variant: Annotated[str | None, Field(description="Build variant (multi-build project). Omit to use default_variant. One query answers for ONE build.")] = None,
     image: Annotated[str | None, Field(description="Sysbuild image within the variant. Required when the variant holds several: each image is a separate program.")] = None,
 ) -> list[dict]:
@@ -599,10 +599,10 @@ def find_callers(
 
 # ── moved from server.py ──
 def find_references(
-    name: Annotated[str, Field(description="Symbol name to find all references of — calls, reads, member accesses.")],
+    name: Annotated[str, Field(description="Symbol name to find all references of — calls, reads, member accesses.", min_length=1)],
     project_root: Annotated[str | None, Field(description="Project root. Auto-detected if omitted.")] = None,
-    limit: Annotated[int, Field(description="Maximum results of one page.")] = 50,
-    offset: Annotated[int, Field(description="Skip this many results. Reads the next page of a symbol with many references.")] = 0,
+    limit: Annotated[int, Field(description="Maximum results of one page.", ge=1)] = 50,
+    offset: Annotated[int, Field(description="Skip this many results. Reads the next page of a symbol with many references.", ge=0)] = 0,
     variant: Annotated[str | None, Field(description="Build variant (multi-build project). Omit to use default_variant. One query answers for ONE build.")] = None,
     image: Annotated[str | None, Field(description="Sysbuild image within the variant. Required when the variant holds several: each image is a separate program.")] = None,
 ) -> list[dict]:
@@ -669,9 +669,9 @@ def find_references(
 
 # ── moved from server.py ──
 def find_indirect_call_sites(
-    name: Annotated[str, Field(description="Name of the function pointer field or variable to find call sites of. E.g. 'onData' finds all calls through Driver::onData.")],
+    name: Annotated[str, Field(description="Name of the function pointer field or variable to find call sites of. E.g. 'onData' finds all calls through Driver::onData.", min_length=1)],
     project_root: Annotated[str | None, Field(description="Project root directory. Auto-detected if omitted.")] = None,
-    limit: Annotated[int, Field(description="Maximum results (default 50).")] = 50,
+    limit: Annotated[int, Field(description="Maximum results (default 50).", ge=1)] = 50,
     variant: Annotated[str | None, Field(description="Build variant (multi-build project). Omit to use default_variant. One query answers for ONE build.")] = None,
     image: Annotated[str | None, Field(description="Sysbuild image within the variant. Required when the variant holds several: each image is a separate program.")] = None,
 ) -> list[dict]:
@@ -758,9 +758,9 @@ def find_indirect_call_sites(
 # ── moved from server.py ──
 def find_indirect_targets(
     name: Annotated[str, Field(description="Name of the function pointer field, variable, or parameter. "
-        "E.g. 'onData' — returns functions assigned to Driver::onData.")],
+        "E.g. 'onData' — returns functions assigned to Driver::onData.", min_length=1)],
     project_root: Annotated[str | None, Field(description="Project root. Auto-detected if omitted.")] = None,
-    limit: Annotated[int, Field(description="Maximum results (default 50, max 200).")] = 50,
+    limit: Annotated[int, Field(description="Maximum results (default 50, max 200).", ge=1)] = 50,
     variant: Annotated[str | None, Field(description="Build variant (multi-build project). Omit to use default_variant. One query answers for ONE build.")] = None,
     image: Annotated[str | None, Field(description="Sysbuild image within the variant. Required when the variant holds several: each image is a separate program.")] = None,
 ) -> list[dict]:
@@ -932,10 +932,10 @@ def _with_absolute_file(rows: list[dict], root: Path) -> list[dict]:
 
 # ── moved from server.py ──
 def find_call_path(
-    from_name: Annotated[str, Field(description="Starting symbol for path search.")],
-    to_name: Annotated[str, Field(description="Target symbol to find path to.")],
+    from_name: Annotated[str, Field(description="Starting symbol for path search.", min_length=1)],
+    to_name: Annotated[str, Field(description="Target symbol to find path to.", min_length=1)],
     project_root: Annotated[str | None, Field(description="Project root. Auto-detected if omitted.")] = None,
-    max_depth: Annotated[int, Field(description="Maximum BFS depth for path search (default 10).")] = 10,
+    max_depth: Annotated[int, Field(description="Maximum BFS depth for path search (default 10).", ge=1)] = 10,
     variant: Annotated[str | None, Field(description="Build variant (multi-build project). Omit to use default_variant. One query answers for ONE build.")] = None,
     image: Annotated[str | None, Field(description="Sysbuild image within the variant. Required when the variant holds several: each image is a separate program.")] = None,
 ) -> list[dict]:
@@ -1045,10 +1045,10 @@ def find_call_path(
 
 # ── moved from server.py ──
 def find_all_callers_recursive(
-    name: Annotated[str, Field(description="Symbol name to find transitive callers of.")],
+    name: Annotated[str, Field(description="Symbol name to find transitive callers of.", min_length=1)],
     project_root: Annotated[str | None, Field(description="Project root. Auto-detected if omitted.")] = None,
-    max_depth: Annotated[int, Field(description="Maximum BFS depth for transitive search (default 5).")] = 5,
-    limit: Annotated[int, Field(description="Maximum results (default 50).")] = 50,
+    max_depth: Annotated[int, Field(description="Maximum BFS depth for transitive search (default 5).", ge=1)] = 5,
+    limit: Annotated[int, Field(description="Maximum results (default 50).", ge=1)] = 50,
     variant: Annotated[str | None, Field(description="Build variant (multi-build project). Omit to use default_variant. One query answers for ONE build.")] = None,
     image: Annotated[str | None, Field(description="Sysbuild image within the variant. Required when the variant holds several: each image is a separate program.")] = None,
 ) -> list[dict]:
@@ -1131,10 +1131,10 @@ def find_all_callers_recursive(
 
 # ── moved from server.py ──
 def find_callees_recursive(
-    name: Annotated[str, Field(description="Symbol name to find transitive callees of.")],
+    name: Annotated[str, Field(description="Symbol name to find transitive callees of.", min_length=1)],
     project_root: Annotated[str | None, Field(description="Project root. Auto-detected if omitted.")] = None,
-    max_depth: Annotated[int, Field(description="Maximum BFS depth for transitive search (default 5).")] = 5,
-    limit: Annotated[int, Field(description="Maximum results (default 50).")] = 50,
+    max_depth: Annotated[int, Field(description="Maximum BFS depth for transitive search (default 5).", ge=1)] = 5,
+    limit: Annotated[int, Field(description="Maximum results (default 50).", ge=1)] = 50,
     variant: Annotated[str | None, Field(description="Build variant (multi-build project). Omit to use default_variant. One query answers for ONE build.")] = None,
     image: Annotated[str | None, Field(description="Sysbuild image within the variant. Required when the variant holds several: each image is a separate program.")] = None,
 ) -> list[dict]:
@@ -1215,8 +1215,8 @@ def find_callees_recursive(
 # ── moved from server.py ──
 def find_dead_code(
     project_root: Annotated[str | None, Field(description="Project root. Auto-detected if omitted.")] = None,
-    limit: Annotated[int, Field(description="Maximum results of one page (default 100, max 200).")] = 100,
-    offset: Annotated[int, Field(description="Skip this many results. Reads the next page of a long report.")] = 0,
+    limit: Annotated[int, Field(description="Maximum results of one page (default 100, max 200).", ge=1)] = 100,
+    offset: Annotated[int, Field(description="Skip this many results. Reads the next page of a long report.", ge=0)] = 0,
     exclude_paths: Annotated[list[str] | None, Field(description="Additional LIKE patterns to exclude. Merged with defaults from config. E.g. ['lib/%'].")] = None,
     project_only: Annotated[bool, Field(description="When True (default), auto-excludes SDK/vendor paths based on the detected build system and applies project config exclude_paths. Set False to see all results.")] = True,
     variant: Annotated[str | None, Field(description="Build variant (multi-build project). Omit to use default_variant. One query answers for ONE build.")] = None,
@@ -1326,9 +1326,9 @@ def find_dead_code(
 
 # ── moved from server.py ──
 def find_wrapper_callers(
-    class_name: Annotated[str, Field(description="Driver class name to find wrappers for. E.g. 'UART_DRIVER' or 'hal::UART_DRIVER'.")],
+    class_name: Annotated[str, Field(description="Driver class name to find wrappers for. E.g. 'UART_DRIVER' or 'hal::UART_DRIVER'.", min_length=1)],
     project_root: Annotated[str | None, Field(description="Project root. Auto-detected if omitted.")] = None,
-    limit: Annotated[int, Field(description="Maximum wrapper method results (default 50, max 50).")] = 50,
+    limit: Annotated[int, Field(description="Maximum wrapper method results (default 50, max 50).", ge=1)] = 50,
     variant: Annotated[str | None, Field(description="Build variant (multi-build project). Omit to use default_variant. One query answers for ONE build.")] = None,
     image: Annotated[str | None, Field(description="Sysbuild image within the variant. Required when the variant holds several: each image is a separate program.")] = None,
 ) -> list[dict]:
@@ -1512,13 +1512,13 @@ def find_wrapper_callers(
 
 # ── moved from server.py ──
 def trace_data_flow(
-    type_name: Annotated[str, Field(description="Type name to trace. E.g. 'SensorData' or 'Config::SensorData'.")],
-    to_symbol: Annotated[str, Field(description="Target symbol name. E.g. 'uart_send' or 'UART_DRIVER::send'.")],
+    type_name: Annotated[str, Field(description="Type name to trace. E.g. 'SensorData' or 'Config::SensorData'.", min_length=1)],
+    to_symbol: Annotated[str, Field(description="Target symbol name. E.g. 'uart_send' or 'UART_DRIVER::send'.", min_length=1)],
     project_root: Annotated[str | None, Field(description="Project root. Auto-detected if omitted.")] = None,
-    max_depth: Annotated[int, Field(description="Maximum call path depth (default 8, max 20).")] = 8,
-    limit: Annotated[int, Field(description="Maximum source functions to trace (default 15, max 15).")] = 15,
+    max_depth: Annotated[int, Field(description="Maximum call path depth (default 8, max 20).", ge=1)] = 8,
+    limit: Annotated[int, Field(description="Maximum source functions to trace (default 15, max 15).", ge=1)] = 15,
     timeout_ms: Annotated[int, Field(description="Maximum total execution time in "
-        "milliseconds (default 30000).")] = 30000,
+        "milliseconds (default 30000).", ge=1)] = 30000,
     variant: Annotated[str | None, Field(description="Build variant (multi-build project). Omit to use default_variant. One query answers for ONE build.")] = None,
     image: Annotated[str | None, Field(description="Sysbuild image within the variant. Required when the variant holds several: each image is a separate program.")] = None,
 ) -> list[dict]:
@@ -1672,8 +1672,8 @@ def trace_data_flow(
 # ── moved from server.py ──
 def find_hotspots(
     project_root: Annotated[str | None, Field(description="Project root. Auto-detected if omitted.")] = None,
-    limit: Annotated[int, Field(description="Number of top-called functions per page (default 20, max 50).")] = 20,
-    offset: Annotated[int, Field(description="Skip this many results. Reads further down the ranking.")] = 0,
+    limit: Annotated[int, Field(description="Number of top-called functions per page (default 20, max 50).", ge=1)] = 20,
+    offset: Annotated[int, Field(description="Skip this many results. Reads further down the ranking.", ge=0)] = 0,
     project_only: Annotated[bool, Field(description="When True (default), auto-excludes SDK/vendor paths so hotspots reflect project code.")] = True,
     exclude_paths: Annotated[list[str] | None, Field(description="Additional LIKE patterns to exclude. Merged with defaults. E.g. ['lib/%'].")] = None,
     variant: Annotated[str | None, Field(description="Build variant (multi-build project). Omit to use default_variant. One query answers for ONE build.")] = None,
@@ -2053,7 +2053,7 @@ def _vector_rows(
 def get_vector_table(
     project_root: Annotated[str | None, Field(description="Project root. Auto-detected if omitted.")] = None,
     unhandled_only: Annotated[bool, Field(description="Return only the slots that reach the default handler.")] = False,
-    limit: Annotated[int, Field(description="Maximum slots (default 400).")] = 400,
+    limit: Annotated[int, Field(description="Maximum slots (default 400).", ge=1)] = 400,
     variant: Annotated[str | None, Field(description="Build variant (multi-build project). Omit to use default_variant. One query answers for ONE build.")] = None,
     image: Annotated[str | None, Field(description="Sysbuild image within the variant. Required when the variant holds several: each image is a separate program.")] = None,
 ) -> list[dict]:

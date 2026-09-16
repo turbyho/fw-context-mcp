@@ -97,11 +97,11 @@ log = logging.getLogger(__name__)
 
 
 def lookup_symbol(
-    name: Annotated[str, Field(description="Symbol name. Exact match if exact=True, prefix LIKE match otherwise. E.g. 'uart_init' or 'uart_'.")],
+    name: Annotated[str, Field(description="Symbol name. Exact match if exact=True, prefix LIKE match otherwise. E.g. 'uart_init' or 'uart_'.", min_length=1)],
     project_root: Annotated[str | None, Field(description="Project root directory. Auto-detected from CWD if omitted.")] = None,
     exact: Annotated[bool, Field(description="True = exact name match, False = prefix LIKE match (default).")] = False,
-    limit: Annotated[int, Field(description="Maximum results returned (capped at 100, default 50).")] = 50,
-    offset: Annotated[int, Field(description="Skip this many results. Pages through a name that many classes share, such as 'read' or 'write'.")] = 0,
+    limit: Annotated[int, Field(description="Maximum results returned (capped at 100, default 50).", ge=1)] = 50,
+    offset: Annotated[int, Field(description="Skip this many results. Pages through a name that many classes share, such as 'read' or 'write'.", ge=0)] = 0,
     variant: Annotated[str | None, Field(description="Build variant (multi-build project). Omit to use default_variant. One query answers for ONE build.")] = None,
     image: Annotated[str | None, Field(description="Sysbuild image within the variant. Required when the variant holds several: each image is a separate program.")] = None,
 ) -> list[dict]:
