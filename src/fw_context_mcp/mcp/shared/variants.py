@@ -94,6 +94,23 @@ def resolve_build(
     names = declared + [v for v in indexed_variants if v not in declared]
 
     if not names:
+        # WHY the arguments are read even here.  This branch used to
+        # return the active build without looking at `variant` or
+        # `image`, thus a project that declares no variant swallowed both
+        # silently — `variant="no_such_variant"` answered with rows, and
+        # so did `variant="*"`, which the refusal below calls out by
+        # name.  A caller that names a build is asking a question this
+        # project cannot answer, and an answer from the one build it has
+        # looks correct while the caller believes it asked about another.
+        if variant or image:
+            asked = f"variant={variant!r}" if variant else ""
+            if image:
+                asked = f"{asked} and image={image!r}" if asked else f"image={image!r}"
+            return None, (
+                f"This project has ONE build and declares no variants, thus "
+                f"{asked} names nothing. Drop the argument to ask about the "
+                f"build it has. Call get_active_build() for what is indexed."
+            )
         row = get_active_config(conn, project_id)
         return (row["config_hash"] if row is not None else None), None
 

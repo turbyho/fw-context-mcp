@@ -2,6 +2,8 @@
 
 from pathlib import Path
 
+import pytest
+
 from fw_context_mcp.indexer.build import BuildImage, BuildVariant
 from fw_context_mcp.indexer.builders.zephyr import ZephyrBuildSystem
 from fw_context_mcp.mcp.shared.variants import resolve_build
@@ -259,6 +261,47 @@ class TestResolveBuild:
         config_hash, err = resolve_build(temp_db, "proj", self._cfg(), "", "")
         assert err is None
         assert config_hash == "h-single"
+
+    def _single(self, temp_db):
+        """A project with ONE build and no declared variant."""
+        from fw_context_mcp.indexer.db import (
+            transaction,
+            upsert_build_config,
+            upsert_project,
+        )
+
+        with transaction(temp_db):
+            upsert_project(temp_db, "proj", "t", "/tmp/t")
+            upsert_build_config(temp_db, "h-single", "proj", "/tmp/cc.json")
+
+    @pytest.mark.parametrize(
+        ("variant", "image"),
+        [("zzz", ""), ("", "zzz"), ("zzz", "yyy"), ("*", "")],
+        ids=["variant", "image", "both", "star"],
+    )
+    def test_a_single_build_project_refuses_a_named_build(
+        self, temp_db, variant: str, image: str
+    ):
+        """Naming a build that cannot exist must fail, not answer.
+
+        This branch returned the active build without reading the two
+        arguments at all, thus every fail-closed check below it — the
+        refusal of ``variant="*"`` included — was out of reach for a
+        project that declares no variant.  Measured over 13 indexed
+        builds: the six single-build ones answered ``variant="zzz"`` with
+        rows while the seven Zephyr images refused it by name.
+        """
+        self._single(temp_db)
+
+        config_hash, err = resolve_build(temp_db, "proj", self._cfg(), variant, image)
+
+        assert config_hash is None, "a named build must not answer from another"
+        assert err is not None
+        assert "ONE build" in err, err
+        if variant:
+            assert repr(variant) in err, err
+        if image:
+            assert repr(image) in err, err
 
     def test_multi_fail_closed_without_default(self, temp_db):
         self._seed(temp_db)
