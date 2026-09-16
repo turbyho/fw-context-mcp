@@ -447,13 +447,26 @@ def get_all_projects(conn: sqlite3.Connection) -> list[sqlite3.Row]:
 
     Builds with ``manifest_verification = 'indexing'`` are excluded so that
     an in-progress index never appears as the latest project state.
+
+    WHY the counts come from subqueries and not from a join.  This used to
+    join ``symbols`` and ``files`` on one ``config_hash`` and count each
+    side with ``COUNT(DISTINCT …)``.  The join produces one row per PAIR:
+    on a firmware index of 61 322 symbols and 1 922 files that is 118
+    million rows for two numbers, and the query took 21 s.  The same
+    answer through two pre-aggregated subqueries takes 4,6 ms — measured
+    on that index, same result (61322 / 1922).  ``list_projects`` calls
+    this for every indexed project, thus the cost was paid once per
+    project on every call.
+
+    ``get_all_builds_for_project`` below counts the same way; the two
+    stayed different only because nothing forced them together.
     """
     return conn.execute(
         """SELECT p.project_id, p.name, p.root_path,
                   b.config_hash, b.created_at, b.compile_commands_path,
                   b.description, b.first_indexed_at,
-                  COUNT(DISTINCT s.id) AS symbol_count,
-                  COUNT(DISTINCT f.id) AS file_count
+                  COALESCE(s.sym_count, 0) AS symbol_count,
+                  COALESCE(f.file_count, 0) AS file_count
            FROM projects p
            LEFT JOIN build_configs b ON b.project_id = p.project_id
                AND b.rowid = (
@@ -463,9 +476,12 @@ def get_all_projects(conn: sqlite3.Connection) -> list[sqlite3.Row]:
                    ORDER BY created_at DESC, rowid DESC
                    LIMIT 1
                )
-           LEFT JOIN symbols s ON s.config_hash = b.config_hash
-           LEFT JOIN files f ON f.config_hash = b.config_hash
-           GROUP BY p.project_id""",
+           LEFT JOIN (
+               SELECT config_hash, COUNT(*) AS sym_count FROM symbols GROUP BY config_hash
+           ) s ON s.config_hash = b.config_hash
+           LEFT JOIN (
+               SELECT config_hash, COUNT(*) AS file_count FROM files GROUP BY config_hash
+           ) f ON f.config_hash = b.config_hash""",
     ).fetchall()
 
 

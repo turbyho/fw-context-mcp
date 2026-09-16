@@ -351,6 +351,102 @@ class TestGetAllProjects:
         rows = get_all_projects(temp_db)
         assert rows == []
 
+    def test_counts_are_per_table_not_per_pair(self, populated_db):
+        """``symbol_count`` counts symbols and ``file_count`` counts files.
+
+        The query used to join ``symbols`` and ``files`` on one
+        ``config_hash``, which gives one row per PAIR.  ``COUNT(DISTINCT)``
+        hid that from the ANSWER, thus only the run time showed it — 21 s
+        on a firmware index.  Two files and three symbols must give 3 and
+        2, never 6, and the numbers are asserted here so a join cannot
+        come back unnoticed.
+        """
+        file_a = upsert_file(populated_db, "hash-deadbeef", "/tmp/a.cpp", "cpp")
+        file_b = upsert_file(populated_db, "hash-deadbeef", "/tmp/b.cpp", "cpp")
+        insert_symbols_batch(populated_db, [
+            ("hash-deadbeef", file_a, "src/a.cpp", split_tokens("alpha", "alpha"),
+             "usr-a", "alpha", "alpha", "function", 1, 1, 0, 1, "void alpha()", "",
+             None, 0, 0, "", 0, "", 0, 0.0, "", 0),
+            ("hash-deadbeef", file_a, "src/a.cpp", split_tokens("beta", "beta"),
+             "usr-b", "beta", "beta", "function", 5, 1, 0, 1, "void beta()", "",
+             None, 0, 0, "", 0, "", 0, 0.0, "", 0),
+            ("hash-deadbeef", file_b, "src/b.cpp", split_tokens("gamma", "gamma"),
+             "usr-c", "gamma", "gamma", "function", 1, 1, 0, 1, "void gamma()", "",
+             None, 0, 0, "", 0, "", 0, 0.0, "", 0),
+        ])
+
+        row = next(r for r in get_all_projects(populated_db) if r["project_id"] == "proj-001")
+        assert row["symbol_count"] == 3
+        assert row["file_count"] == 2
+
+    def test_project_without_build_counts_zero(self, temp_db):
+        """A project whose build is still indexing reports zero, not NULL."""
+        with transaction(temp_db):
+            upsert_project(temp_db, "proj-002", "no-build", "/tmp/no-build")
+
+        row = next(r for r in get_all_projects(temp_db) if r["project_id"] == "proj-002")
+        assert row["symbol_count"] == 0
+        assert row["file_count"] == 0
+        assert row["config_hash"] is None
+
+    def test_cost_does_not_grow_with_symbols_times_files(self, tmpdir):
+        """The work must follow the ROWS, not the product of the two tables.
+
+        The counts alone cannot catch this: the join form answered with the
+        right numbers, because ``COUNT(DISTINCT)`` collapsed the duplicate
+        rows that the join made.  Only the cost showed it — 21 s on an
+        index of 61 322 symbols and 1 922 files.
+
+        Thus the guard measures the cost.  Four times the rows is sixteen
+        times the pairs; the step count of the join form grew 15x in this
+        test, the subquery form 3x.  The limit of 8x sits between them with
+        room on both sides, so a slower machine or another SQLite version
+        does not move the verdict.
+        """
+        def steps_for(n: int) -> int:
+            conn = open_db(Path(tmpdir) / f"scale-{n}.db")
+            try:
+                with transaction(conn):
+                    upsert_project(conn, "p-scale", "scale", "/tmp/scale")
+                    upsert_build_config(conn, "h-scale", "p-scale", "/tmp/cc.json")
+                rows = []
+                for i in range(n):
+                    file_id = upsert_file(conn, "h-scale", f"/tmp/f{i}.cpp", "cpp")
+                    rows.append(
+                        ("h-scale", file_id, f"src/f{i}.cpp",
+                         split_tokens(f"fn{i}", f"fn{i}"),
+                         f"usr-{i}", f"fn{i}", f"fn{i}", "function", 1, 1, 0, 1,
+                         "void f()", "", None, 0, 0, "", 0, "", 0, 0.0, "", 0)
+                    )
+                insert_symbols_batch(conn, rows)
+
+                counted = [0]
+
+                def bump() -> int:
+                    counted[0] += 1
+                    return 0
+
+                # Every 100 VDBE opcodes.  The absolute number depends on
+                # the SQLite build, thus only the RATIO of two sizes is
+                # asserted below.
+                conn.set_progress_handler(bump, 100)
+                result = get_all_projects(conn)
+                conn.set_progress_handler(None, 0)
+
+                assert result[0]["symbol_count"] == n
+                assert result[0]["file_count"] == n
+                return counted[0]
+            finally:
+                conn.close()
+
+        small = steps_for(20)
+        large = steps_for(80)
+        assert large <= max(small, 1) * 8, (
+            f"cost grew {large / max(small, 1):.1f}x for 4x the rows — "
+            f"the query is joining symbols against files again "
+            f"(steps: {small} → {large})"
+        )
+
 
 class TestSearchSymbols:
     def test_fts5_search(self, populated_db):
