@@ -376,11 +376,29 @@ def search_code(
         next step" would answer page 2 from a broader step than page 1.
         The reader would then walk two different answers under one query.
         """
+        # A query that FTS5 turns down stops the FTS5 steps, not the
+        # cascade: the LIKE steps below read no FTS5 syntax and can still
+        # answer.  The refusal is therefore remembered and given only when
+        # no step found rows — rows are a better answer than a warning,
+        # and an empty list is a worse one.  ``search_bodies`` and
+        # ``search_content`` report the same refusal; search_code let the
+        # exception reach the error boundary instead, and the caller then
+        # read "search_code failed" where its siblings said "FTS5 rejected
+        # the query" and named the repair.
+        rejection: dict | None = None
         for strategy, counter in _SEARCH_CODE_STEPS_WITH_PRIMARY:
-            total = counter(c, query, config_hash, kind, project_only)
-            if not total:
+            try:
+                total = counter(c, query, config_hash, kind, project_only)
+                if not total:
+                    continue
+                result = strategy(c, query, config_hash, limit, kind, project_only, root, skip)
+            except sqlite3.OperationalError as exc:
+                if not _is_fts5_query_error(exc):
+                    raise
+                if rejection is None:
+                    rejection = _fts5_rejection("search_code", query, exc)
+                log.debug("search_code: step turned down the query (%s)", exc)
                 continue
-            result = strategy(c, query, config_hash, limit, kind, project_only, root, skip)
             # Each strategy returns (data, method_name) — the method name is
             # already on each dict through _fmt_symbol_rows → _fallback.
             page = result[0] if result is not None else []
@@ -394,7 +412,7 @@ def search_code(
             ))
             return page
 
-        return []
+        return [rejection] if rejection else []
 
     return _with_search_context(root, "search_code", _do_search, variant or "", image or "")
 

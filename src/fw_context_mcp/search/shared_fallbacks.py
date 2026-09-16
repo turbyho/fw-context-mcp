@@ -159,9 +159,24 @@ def _variable_filter(kind: str | None) -> str:
     return f"AND s.kind NOT IN ({kinds})"
 
 
+# How many words of a query the LIKE strategies read.  The name-token
+# search builds one ``CASE WHEN … END`` per term and adds them together,
+# thus the term count is the DEPTH of the SQL expression — and SQLite
+# refuses an expression deeper than 1000 with "Expression tree is too
+# large".  A 1000-word query reached that limit and the tool answered
+# with an error about SQLite instead of an answer about the code.
+#
+# The cap costs no answer.  The strategy demands N-1 of N terms, thus a
+# query of hundreds of words matches nothing either way, and search_code
+# documents a query of 1-3 words.  The individual-term strategy runs one
+# FTS5 query PER term, so the same cap keeps a long query from turning
+# into hundreds of round trips.
+_MAX_QUERY_TERMS = 32
+
+
 def _name_token_terms(query: str) -> list[str]:
     """Give the terms that the two LIKE strategies below search for."""
-    return [t.lower() for t in query.split() if len(t) > 1]
+    return [t.lower() for t in query.split() if len(t) > 1][:_MAX_QUERY_TERMS]
 
 
 def _name_tokens_sql(terms: list[str], kind: str | None, project_only: bool) -> tuple[str, list]:
