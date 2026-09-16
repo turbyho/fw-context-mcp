@@ -85,7 +85,7 @@ from mcp.server.fastmcp import Context as MCPContext
 from mcp.server.fastmcp import FastMCP
 from pydantic import Field
 
-from ..utils import resolve_project_root
+from ..utils import AmbiguousProjectError, resolve_project_root
 from .background import _ensure_daemon_running
 from .handlers import callgraph, inheritance, maintenance, search, source, variables
 from .shared.context import _check_server_ready, _integrity_checked
@@ -366,9 +366,9 @@ def _merge_project_selector(tool_name: str, kwargs: dict) -> dict:
 
     Raises:
         ValueError: The call gives ``project`` and ``project_root``, and
-            the two values are different.  fw-context does not choose one
-            of them, because the answer of the losing project looks
-            correct but comes from other source code.
+            the two RESOLVE to different projects.  fw-context does not
+            choose one of them, because the answer of the losing project
+            looks correct but comes from other source code.
     """
     project = kwargs.pop("project", None)
     if isinstance(project, str):
@@ -376,13 +376,38 @@ def _merge_project_selector(tool_name: str, kwargs: dict) -> dict:
     if not project:
         return kwargs
     project_root = kwargs.get("project_root")
-    if project_root and str(project_root).strip() != project:
+    root_text = str(project_root).strip() if project_root else ""
+    if root_text and root_text != project and not _same_project(project, root_text):
         raise ValueError(
             f"{tool_name}: project={project!r} and project_root={project_root!r} "
             "select different projects. Give one of the two, not both."
         )
     kwargs["project_root"] = project
     return kwargs
+
+
+def _same_project(project: str, project_root: str) -> bool:
+    """Say whether two selectors name one project.
+
+    WHY a string comparison is not enough.  One row of ``list_projects``
+    carries a ``name`` and a ``root_path``, and a caller that passes both
+    is not contradicting itself — it is repeating itself.  The two
+    strings differ, thus the comparison above used to refuse the call
+    with a sentence that states a fact nobody checked: "select different
+    projects".  Both selectors go through ``resolve_project_root``
+    anyway, so that is what decides here too, and the message is true
+    whenever it appears.
+
+    A name that the registry cannot resolve to one project is not the
+    question this function answers: the refusal above stands, and the
+    handler reports the ambiguity with the words of the registry.
+    """
+    try:
+        return resolve_project_root(project) == resolve_project_root(project_root)
+    except AmbiguousProjectError:
+        # The name reaches more than one project.  That is a different
+        # refusal, and the handler gives it with the names it found.
+        return False
 
 
 def _describe_project_root(param: inspect.Parameter) -> inspect.Parameter:

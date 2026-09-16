@@ -526,6 +526,88 @@ def test_two_different_projects_in_one_call_is_an_error():
         )
 
 
+def test_a_name_and_the_root_of_that_same_project_are_accepted(
+    registry, tmp_path, monkeypatch
+):
+    """One row of ``list_projects`` carries both spellings of one project.
+
+    A caller that reads ``name`` and ``root_path`` from one row and sends
+    both is repeating itself, not contradicting itself.  The comparison
+    used to be string against string, thus the call was refused with a
+    sentence that states a fact nobody checked: "select different
+    projects".
+    """
+    root = tmp_path / "vendor" / "boot-loader"
+    root.mkdir(parents=True)
+    _register(registry, "a" * 32, "boot-loader", root)
+    monkeypatch.chdir(tmp_path)
+
+    kwargs = server._merge_project_selector(
+        "lookup_symbol", {"project": "boot-loader", "project_root": str(root)}
+    )
+    assert kwargs == {"project_root": "boot-loader"}
+
+
+def test_a_project_id_and_the_root_of_that_project_are_accepted(
+    registry, tmp_path, monkeypatch
+):
+    """The id is the third spelling of the same project."""
+    root = tmp_path / "vendor" / "boot-loader"
+    root.mkdir(parents=True)
+    _register(registry, "b" * 32, "boot-loader", root)
+    monkeypatch.chdir(tmp_path)
+
+    kwargs = server._merge_project_selector(
+        "lookup_symbol", {"project": "b" * 32, "project_root": str(root)}
+    )
+    assert kwargs == {"project_root": "b" * 32}
+
+
+def test_a_name_and_the_root_of_another_project_is_still_an_error(
+    registry, tmp_path, monkeypatch
+):
+    """Two spellings that resolve apart keep the refusal — and now it is true."""
+    mine = tmp_path / "vendor" / "boot-loader"
+    other = tmp_path / "vendor" / "application"
+    mine.mkdir(parents=True)
+    other.mkdir(parents=True)
+    _register(registry, "c" * 32, "boot-loader", mine)
+    monkeypatch.chdir(tmp_path)
+
+    with pytest.raises(ValueError, match="different projects"):
+        server._merge_project_selector(
+            "lookup_symbol", {"project": "boot-loader", "project_root": str(other)}
+        )
+
+
+def test_two_spellings_of_one_path_are_accepted(tmp_path, monkeypatch):
+    """A relative and an absolute spelling of one directory are one project."""
+    root = tmp_path / "work" / "boot-loader"
+    root.mkdir(parents=True)
+    monkeypatch.chdir(tmp_path / "work")
+
+    kwargs = server._merge_project_selector(
+        "lookup_symbol", {"project": "boot-loader", "project_root": str(root)}
+    )
+    assert kwargs == {"project_root": "boot-loader"}
+
+
+def test_an_ambiguous_name_beside_a_root_is_refused(registry, tmp_path, monkeypatch):
+    """A name that reaches two projects cannot confirm the root beside it."""
+    first = tmp_path / "work" / "boot-loader"
+    second = tmp_path / "archive" / "boot-loader"
+    first.mkdir(parents=True)
+    second.mkdir(parents=True)
+    _register(registry, "d" * 32, "boot-loader", first)
+    _register(registry, "e" * 32, "boot-loader", second)
+    monkeypatch.chdir(tmp_path)
+
+    with pytest.raises(ValueError, match="different projects"):
+        server._merge_project_selector(
+            "lookup_symbol", {"project": "boot-loader", "project_root": str(first)}
+        )
+
+
 # ── The registered tools ───────────────────────────────────────────────
 
 
