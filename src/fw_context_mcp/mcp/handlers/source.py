@@ -36,12 +36,12 @@ Private helper functions provide reusable building blocks:
                             fallback; avoids loading huge generated files
   - _try_macro_fallback   — #define macro lookup that returns a
                             standardised result dict callers can chain
-  - _validate_path_in_root — path-security guard used by read_file and
-                            get_file_map, which take a path FROM the caller
-  - _within_root          — the same question for a path the INDEX stored,
-                            used by the three one-body tools; both join
-                            with the root before resolving, thus a
-                            relative path means one thing in this module
+  - _resolve_indexed_file  — the path the index holds for what the caller
+                            wrote; the index is what allows a read, thus
+                            a path no row answers for is refused there
+  - _within_root          — a LABEL on a candidate row, not a guard: it
+                            says whether a file of the index sits inside
+                            the project or in the SDK beside it
   - _collect_*            — callers, callees, indirect calls, enum
                             constants, override metadata, and Phase 3
                             resolution info
@@ -78,22 +78,6 @@ from ..shared.stale import _file_differs
 from ._base import BaseHandler
 
 log = logging.getLogger(__name__)
-def _validate_path_in_root(resolved_path: str, root: Path) -> str | None:
-    """Check that *resolved_path* relative to *root* stays within the project.
-
-    Returns an error message string on failure, or ``None`` on success.
-    Uses ``Path.resolve().relative_to()`` which resolves symlinks and ``..``
-    components — a path like ``../../etc/passwd`` is caught even if it
-    appears to be under the project root.
-
-    Used by ``read_file`` and ``get_file_map`` for consistent path-security
-    checks before any disk read.
-    """
-    try:
-        Path(root, resolved_path).resolve().relative_to(root.resolve())
-    except ValueError:
-        return f"Path escapes project root: {resolved_path}"
-    return None
 
 
 def _resolve_indexed_file(conn, config_hash: str, file_path: str) -> str | None:
@@ -281,6 +265,12 @@ def _ambiguity(conn, config_hash: str, name: str, row, root) -> dict:
     total = count_candidates(conn, config_hash, name)
     chosen = row["qualified_name"] or row["name"]
     shown = len(candidates)
+    rows = candidate_rows(candidates, root)
+    inside_flags = [
+        bool(c.file_path) and _within_root(c.file_path, root) for c in candidates
+    ]
+    for candidate_row, is_inside in zip(rows, inside_flags, strict=False):
+        candidate_row["in_project_root"] = is_inside
     # The two listings order differently on purpose — this one by
     # relevance, lookup_symbol by file and line, which is what an OFFSET
     # needs.  Thus the text must not call lookup_symbol a continuation of
@@ -291,13 +281,33 @@ def _ambiguity(conn, config_hash: str, name: str, row, root) -> dict:
         f"'offset' pages through them."
         if total > shown else ""
     )
+    # WHY the answer says that the body it gives is vendor code.  The
+    # resolver can choose a symbol outside the project while candidates
+    # inside it wait in the list.  Measured on one firmware index over the
+    # 60 most ambiguous function and method names: 44 resolved to a file
+    # outside the root, and 7 of those had a candidate inside the project.
+    # ``read`` chose a framework header while 8 of its 20 candidates were
+    # project code.  That used to be a refusal, and the refusal cost the
+    # body of every vendor symbol a caller asked for on purpose.  The
+    # knowledge is worth keeping; the refusal was not.
+    inside = sum(inside_flags)
+    chosen_outside = bool(row["file_path"]) and not _within_root(
+        row["file_path"], root
+    )
+    outside_note = (
+        f" {chosen} is outside the project root, and {inside} of the {shown} "
+        f"candidates below are inside it — each row says which in "
+        f"'in_project_root'."
+        if chosen_outside and inside else ""
+    )
     return {
         "ambiguous_warning": (
             f"The name '{name}' matches {total} symbols. This answer is about "
             f"{chosen} only. Read 'candidates' for the others, and give a "
             f"'qualified_name' from it to ask about one of them.{more}"
+            f"{outside_note}"
         ),
-        "candidates": candidate_rows(candidates, root),
+        "candidates": rows,
         "candidates_total": total,
     }
 
@@ -305,91 +315,28 @@ def _ambiguity(conn, config_hash: str, name: str, row, root) -> dict:
 def _within_root(file_path: str, root: Path) -> bool:
     """Say whether *file_path* resolves to a place inside *root*.
 
-    ``resolve()`` follows symlinks and settles ``..``, thus a path that
-    only looks as if it were under the root is caught.
+    This is a LABEL, not a guard.  It answers "is this file of the index
+    application code, or does it live in the SDK beside the project", and
+    ``_ambiguity`` puts the answer on each candidate row.  Whether a file
+    may be READ is a different question, and the index answers that one:
+    a path that no row of ``files`` holds is refused before any read.
 
-    The join with *root* is what makes a RELATIVE path mean the same thing
-    here as it does in :func:`_validate_path_in_root`, the other guard of
-    this module.  ``Path(file_path)`` alone would resolve it against the
-    working directory of the server process, which is not the project and
-    can be anywhere.  An absolute path is unaffected: it wins over the
-    first component of the join.
+    ``resolve()`` follows symlinks and settles ``..``, thus a path that
+    only looks as if it were under the root is seen for what it is.
+
+    The join with *root* is what makes a RELATIVE path mean the same
+    thing it means in the index — the indexer stores a file under the
+    root relative and a file outside it absolute
+    (``indexer/ops.py``).  ``Path(file_path)`` alone would resolve it
+    against the working directory of the server process, which is not the
+    project and can be anywhere.  An absolute path is unaffected: it wins
+    over the first component of the join.
     """
     try:
         Path(root, file_path).resolve().relative_to(root.resolve())
     except ValueError:
         return False
     return True
-
-
-def _outside_root_error(
-    conn, config_hash: str, name: str, file_path: str, root: Path
-) -> dict:
-    """Refuse a body outside the project, and say what else the name means.
-
-    The three tools that give ONE body pick their symbol with
-    ``_lookup_definition`` and then refuse to read it when it sits outside
-    the project root.  A bare refusal is a dead end: it names a file the
-    caller never asked for, and it says nothing about the symbol.
-
-    WHY the candidates belong on this dict.  A common name matches many
-    symbols, and the pick that fails this guard is one of them — the
-    others can be inside the root.  Measured on one firmware index over
-    the 60 most ambiguous function and method names: 44 were refused here,
-    and 7 of those had candidates inside the project.  ``read`` refused
-    with a framework header while 8 of its 20 candidates were project
-    code, and ``find_callers`` answered for the same name without trouble.
-    The ``candidates`` list already existed for the ambiguous ANSWER; this
-    path returned before it was built.
-
-    The key stays ``error``, because the tool still gives no body.  The
-    rows are added beside it, so a reader can choose and ask again.
-
-    WHY the refused symbol is not simply ``candidates[0]``.  Two resolvers
-    answer here and they rank differently: ``_lookup_definition`` orders by
-    the project flag, the kind and the LINE, while ``resolve_candidates``
-    orders by match rank and reference count — the same divergence that
-    ``mcp/handlers/callgraph.py`` records for the peer-override fallback.
-    Thus the first row of the list can be a symbol INSIDE the root, and the
-    text below must not call it the one that was refused.
-
-    ``in_project_root`` on each row is what makes the count actionable: a
-    reader told "7 of the 20 below are inside the project" has no way to
-    tell WHICH seven from an absolute path alone.
-    """
-    # Annotated, because the keys below carry a list and an int beside the
-    # string, and an inferred dict[str, str] would refuse both.
-    error: dict[str, object] = {"error": f"Path {file_path} outside project root"}
-    candidates = resolve_candidates(conn, config_hash, name, limit=CANDIDATES_SHOWN)
-    inside_flags = [
-        bool(c.file_path) and _within_root(c.file_path, root)
-        for c in candidates
-    ]
-    inside = sum(inside_flags)
-    if not candidates or (len(candidates) == 1 and not inside):
-        # Nothing to offer: the only symbol this name means is the one just
-        # refused, thus a list of it repeats the refusal.  A single
-        # candidate INSIDE the root is a different matter — the resolvers
-        # disagreed, and that one row is the whole answer the reader needs.
-        return error
-    rows = candidate_rows(candidates, root)
-    for row, is_inside in zip(rows, inside_flags, strict=True):
-        row["in_project_root"] = is_inside
-    error["candidates"] = rows
-    error["candidates_total"] = count_candidates(conn, config_hash, name)
-    error["hint"] = (
-        f"The symbol that this tool chose for '{name}' is outside the project "
-        f"root — 'error' names its file — thus it gives no body. "
-        + (
-            f"{inside} of the {len(rows)} candidates below sit inside the "
-            f"project; each row says which in 'in_project_root'. Give a "
-            f"'qualified_name' from 'candidates' to ask about one symbol."
-            if inside else
-            "No candidate below is inside the project either, thus the name "
-            "belongs to code that this project only includes."
-        )
-    )
-    return error
 
 
 def _lookup_try_columns(
@@ -810,11 +757,13 @@ async def explain_symbol(
                 return m
             return {"error": f"Symbol not found: {name}"}
         file_path = abs_path(root, row["file_path"])
-        # Defense-in-depth: validate path is within project root.  The
-        # refusal carries the other symbols of this name — see
-        # _outside_root_error for why a bare error is a dead end.
-        if not _within_root(file_path, root):
-            return _outside_root_error(conn, config_hash, name, file_path, root)
+        # No root check here.  The file comes from the INDEX — the symbol
+        # was read out of it — thus the index is what says the file
+        # belongs to this build, and a vendor header of the SDK belongs to
+        # it as much as a file of the application.  A body outside the
+        # root used to be refused, and search_code then found a symbol
+        # that get_source would not read.  _ambiguity() says in the answer
+        # when the body it gives is outside the project.
         # Check for pre-computed LLM analysis (instant, no Ollama call)
         llm_analysis = get_llm_analysis_for_symbol(conn, row["id"])
         return (
@@ -1049,11 +998,13 @@ def get_source(
                 return m
             return {"error": f"Symbol not found: {name}"}
         file_path = abs_path(root, row["file_path"])
-        # Defense-in-depth: validate path is within project root.  The
-        # refusal carries the other symbols of this name — see
-        # _outside_root_error for why a bare error is a dead end.
-        if not _within_root(file_path, root):
-            return _outside_root_error(conn, config_hash, name, file_path, root)
+        # No root check here.  The file comes from the INDEX — the symbol
+        # was read out of it — thus the index is what says the file
+        # belongs to this build, and a vendor header of the SDK belongs to
+        # it as much as a file of the application.  A body outside the
+        # root used to be refused, and search_code then found a symbol
+        # that get_source would not read.  _ambiguity() says in the answer
+        # when the body it gives is outside the project.
         result: dict = {
             "name": row["name"],
             "qualified_name": row["qualified_name"],
@@ -1142,8 +1093,9 @@ def get_file_map(
     reading a chapter: see what functions, classes, and enums a file
     defines at a glance.
 
-    Paths are validated against the project root before read —
-    :func:`_validate_path_in_root` ensures resolved paths stay within bounds.
+    The index decides which file a path may reach: a path that no file of
+    this build answers for is refused, and a header of the SDK that the
+    build compiles is reachable like any file of the application.
 
     Pass a path relative to the project root (``src/main.cpp``) or just the
     filename (``main.cpp``). Returns symbols keyed by kind (function, method,
@@ -1198,10 +1150,11 @@ def get_file_map(
         resolved = _resolve_indexed_file(conn, config_hash, file_path)
         if resolved is None:
             return {"error": f"File not found in index: {file_path}. Check the path — use relative paths like 'src/main.cpp'."}
-        # Defense-in-depth: validate resolved path stays within project root
-        err = _validate_path_in_root(resolved, root)
-        if err:
-            return {"error": err}
+        # The path came out of the ``files`` table of this build, thus the
+        # index is what allows the read.  A path that walks out of the
+        # project ("../../etc/passwd") reaches no row and was already
+        # refused above; a vendor header of the SDK reaches one and is as
+        # much part of the build as a file of the application.
         return index_db.get_file_map(
             conn, config_hash, resolved,
             signatures=signatures, max_per_kind=max_per_kind,
@@ -1531,11 +1484,13 @@ def get_symbol_context(
                 return m
             return {"error": f"Symbol not found: {name}"}
         file_path = abs_path(root, row["file_path"])
-        # Defense-in-depth: validate path is within project root.  The
-        # refusal carries the other symbols of this name — see
-        # _outside_root_error for why a bare error is a dead end.
-        if not _within_root(file_path, root):
-            return _outside_root_error(conn, config_hash, name, file_path, root)
+        # No root check here.  The file comes from the INDEX — the symbol
+        # was read out of it — thus the index is what says the file
+        # belongs to this build, and a vendor header of the SDK belongs to
+        # it as much as a file of the application.  A body outside the
+        # root used to be refused, and search_code then found a symbol
+        # that get_source would not read.  _ambiguity() says in the answer
+        # when the body it gives is outside the project.
         symbol_usr = row["usr"]
 
         # Assemble six independent data sources inside a single DB transaction
@@ -1784,10 +1739,11 @@ def read_file(
                 f"Check the path — use relative paths like 'src/main.cpp'."
             }
 
-        # Defense-in-depth: validate resolved path stays within project root
-        err = _validate_path_in_root(resolved, root)
-        if err:
-            return {"error": err}
+        # The path came out of the ``files`` table of this build, thus the
+        # index is what allows the read.  A path that walks out of the
+        # project ("../../etc/passwd") reaches no row and was already
+        # refused above; a vendor header of the SDK reaches one and is as
+        # much part of the build as a file of the application.
 
         row = conn.execute(
             "SELECT content, language, path, mtime, source_hash "

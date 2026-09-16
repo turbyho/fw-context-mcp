@@ -165,6 +165,45 @@ class TestTheMatchIsOnAPathSegment:
             conn.close()
 
 
+class TestTheIndexDecidesWhatMayBeRead:
+    """A file of the build is readable; a path the build never saw is not.
+
+    The guard used to be the project ROOT, thus every SDK that lives
+    beside the tree instead of inside it was unreadable: search_code found
+    a vendor symbol and read_file answered "Path escapes project root".
+    Measured over 13 indexed builds, 9 were affected — every PlatformIO
+    project and every Zephyr image.
+    """
+
+    def test_a_vendor_file_outside_the_root_can_be_read(self, indexed: Path):
+        answer = read_file(file_path=VENDOR[0], project_root=str(indexed))
+
+        assert "error" not in answer, answer
+        assert answer["file"] == VENDOR[0]
+
+    def test_a_vendor_file_is_reachable_by_its_bare_name(self, indexed: Path):
+        answer = read_file(file_path="hw_config.h", project_root=str(indexed))
+
+        assert "error" not in answer, answer
+        assert answer["file"] == VENDOR[0]
+
+    def test_get_file_map_reads_a_vendor_file(self, indexed: Path):
+        answer = get_file_map(file_path=VENDOR[1], project_root=str(indexed))
+
+        assert "error" not in answer, answer
+
+    @pytest.mark.parametrize(
+        "path",
+        ["../../../../etc/passwd", "/etc/passwd", "src/../../../etc/shadow"],
+    )
+    def test_a_path_the_build_never_saw_is_refused(self, indexed: Path, path: str):
+        """The index is the allowlist, thus a traversal reaches no row."""
+        answer = read_file(file_path=path, project_root=str(indexed))
+
+        assert "error" in answer, answer
+        assert "not found in index" in answer["error"], answer
+
+
 def _db_of(root: Path) -> Path:
     from fw_context_mcp import config
     from fw_context_mcp.mcp.shared.readiness import _index_db_path

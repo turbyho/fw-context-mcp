@@ -692,6 +692,10 @@ class TestSingleBodyToolsOfferTheChoice:
         out = _ambiguity(db, CH, "probe", row, Path("/tmp/test"))
         assert set(out["candidates"][0]) == {
             "qualified_name", "class", "kind", "file", "line", "signature",
+            # Two files can carry one name and one of them can be vendor
+            # code.  An absolute path alone does not say which, thus each
+            # row states it.
+            "in_project_root",
         }, f"got: {sorted(out['candidates'][0])}"
 
     def test_the_warning_names_the_symbol_that_the_answer_is_about(self, db):
@@ -1051,19 +1055,23 @@ class TestTheCandidateOrderIsStable:
 OUT_OF_ROOT_PROJECT_ID = "proj-outside-root"
 
 
-class TestARefusedBodyStillOffersTheChoice:
-    """A body outside the project root is refused WITH the other candidates.
+class TestABodyOutsideTheRootIsGivenAndLabelled:
+    """A body outside the project root is ANSWERED, and the answer says so.
 
     ``_lookup_definition`` picks one symbol, and the three one-body tools
-    then refuse to read it when its file sits outside the project root.
-    The refusal used to be the whole answer: it named a file the caller
-    never asked for and said nothing about the symbol, while
-    ``find_callers`` answered for the same name without trouble.
+    used to refuse to read it when its file sits outside the project
+    root.  That refusal cost every vendor symbol its body: ``search_code``
+    found ``HAL_GetTick`` and ``get_source`` would not read it, on every
+    project whose SDK lives beside the tree rather than inside it —
+    measured, 9 of 13 indexed builds.
 
-    Measured on one firmware index over the 60 most ambiguous function and
-    method names: 44 were refused this way, and 7 of those had candidates
-    inside the project — ``read`` refused with a framework header while 8
-    of its 20 candidates were project code.
+    The index is what says a file belongs to the build, thus the body
+    comes back.  What the refusal knew is kept: measured on one firmware
+    index over the 60 most ambiguous function and method names, 44
+    resolved to a file outside the root and 7 of those had a candidate
+    inside the project — ``read`` chose a framework header while 8 of its
+    20 candidates were project code.  The answer now carries that in
+    ``ambiguous_warning`` and in ``in_project_root`` on each row.
     """
 
     @pytest.fixture
@@ -1122,32 +1130,32 @@ class TestARefusedBodyStillOffersTheChoice:
             conn.close()
         return root
 
-    def test_get_source_offers_the_candidates(self, project: Path):
+    def test_get_source_gives_the_body_and_the_candidates(self, project: Path):
         from fw_context_mcp.mcp.handlers.source import get_source
 
         out = get_source(name="read", project_root=str(project))
 
-        assert "outside project root" in out["error"], out
+        assert "error" not in out, out
         assert out["candidates_total"] == 3, out
         names = {c["qualified_name"] for c in out["candidates"]}
         assert {"Fram::read", "Uart::read"} <= names, names
 
-    def test_get_symbol_context_offers_the_candidates(self, project: Path):
+    def test_get_symbol_context_gives_the_body_and_the_candidates(self, project: Path):
         from fw_context_mcp.mcp.handlers.source import get_symbol_context
 
         out = get_symbol_context(name="read", project_root=str(project))
 
-        assert "outside project root" in out["error"], out
+        assert "error" not in out, out
         assert out["candidates_total"] == 3, out
 
-    def test_explain_symbol_offers_the_candidates(self, project: Path):
+    def test_explain_symbol_gives_the_body_and_the_candidates(self, project: Path):
         import asyncio
 
         from fw_context_mcp.mcp.handlers.source import explain_symbol
 
         out = asyncio.run(explain_symbol(name="read", project_root=str(project)))
 
-        assert "outside project root" in out["error"], out
+        assert "error" not in out, out
         assert out["candidates_total"] == 3, out
 
     def test_each_row_carries_what_the_choice_needs(self, project: Path):
@@ -1160,13 +1168,16 @@ class TestARefusedBodyStillOffersTheChoice:
         assert row["signature"] == "int read(uint8_t *)", row
         assert row["line"] == 10, row
 
-    def test_the_hint_counts_the_candidates_inside_the_root(self, project: Path):
+    def test_the_warning_counts_the_candidates_inside_the_root(self, project: Path):
+        """The measurement that the refusal carried must not be lost."""
         from fw_context_mcp.mcp.handlers.source import get_source
 
         out = get_source(name="read", project_root=str(project))
 
-        assert "2 of the 3 candidates" in out["hint"], out["hint"]
-        assert "qualified_name" in out["hint"], out["hint"]
+        warning = out["ambiguous_warning"]
+        assert "outside the project root" in warning, warning
+        assert "2 of the 3 candidates" in warning, warning
+        assert "in_project_root" in warning, warning
 
     def test_each_row_says_whether_it_is_inside_the_project(self, project: Path):
         """A count of "2 of 3" is unreadable without a mark on each row."""
@@ -1181,28 +1192,15 @@ class TestARefusedBodyStillOffersTheChoice:
             by_name["Stream::read"]
         )
 
-    def test_the_hint_does_not_call_the_first_row_the_refused_one(self, project: Path):
-        """``_lookup_definition`` and ``resolve_candidates`` rank differently.
-
-        The first candidate row can be a symbol INSIDE the root, thus the
-        text must not describe it as the one that was refused.
-        """
-        from fw_context_mcp.mcp.handlers.source import get_source
-
-        out = get_source(name="read", project_root=str(project))
-
-        assert "best match" not in out["hint"], out["hint"]
-        assert "chose" in out["hint"], out["hint"]
-
-    def test_an_unambiguous_name_keeps_the_bare_refusal(self, project: Path):
-        """One symbol means no choice, thus a list of one repeats the refusal."""
+    def test_an_unambiguous_vendor_name_answers_without_a_warning(self, project: Path):
+        """One symbol means no choice, thus no candidate list and no notice."""
         from fw_context_mcp.mcp.handlers.source import get_source
 
         out = get_source(name="Stream::read", project_root=str(project))
 
-        assert "outside project root" in out["error"], out
+        assert "error" not in out, out
         assert "candidates" not in out, out
-        assert "hint" not in out, out
+        assert "ambiguous_warning" not in out, out
 
     def test_a_symbol_inside_the_root_still_answers(self, project: Path):
         """The guard must not have moved: a body inside the root comes back."""
