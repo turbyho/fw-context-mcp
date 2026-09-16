@@ -96,6 +96,46 @@ def _validate_path_in_root(resolved_path: str, root: Path) -> str | None:
     return None
 
 
+def _resolve_indexed_file(conn, config_hash: str, file_path: str) -> str | None:
+    """Give the path the index holds for what the caller wrote, or None.
+
+    A caller writes ``main.cpp`` where the index holds ``src/main.cpp``,
+    thus a bare name has to reach the file.  Three rules decide which
+    file it reaches, and each one repairs a way the old query answered
+    with the wrong file:
+
+    * The match is on a SEGMENT of the path, not on its last characters.
+      ``LIKE '%config.h'`` also matched ``hw_config.h``, ``pinconfig.h``
+      and ``c++config.h`` — none of which is a file named ``config.h``.
+    * The ORDER decides, and it decides in SQL.  The old query read three
+      rows with ``LIMIT 3`` and picked the shortest of THOSE.  Measured on
+      one project, six files matched and the first three held neither the
+      right one: ``src/config.h`` was unreachable through its own name,
+      and the error named a framework header the caller never asked for.
+    * Application code wins over vendor code.  Two files can carry one
+      name, and the one the caller works on is the one in the project.
+
+    The shortest path breaks a remaining tie, because it is the least
+    nested and thus the most canonical spelling.
+    """
+    exact = conn.execute(
+        "SELECT path FROM files WHERE config_hash=? AND path=? LIMIT 1",
+        (config_hash, file_path),
+    ).fetchone()
+    if exact is not None:
+        return exact["path"]
+
+    # The caller writes a name, not a LIKE pattern: '%' and '_' in it are
+    # characters of a filename and must not widen the match.
+    escaped = file_path.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    row = conn.execute(
+        "SELECT path FROM files WHERE config_hash=? AND path LIKE ? ESCAPE '\\' "
+        "ORDER BY is_project DESC, LENGTH(path), path LIMIT 1",
+        (config_hash, f"%/{escaped}"),
+    ).fetchone()
+    return row["path"] if row is not None else None
+
+
 # ── Truncation limits ──
 # These prevent blowing up MCP tool responses with multi-megabyte source
 # bodies.  LLMs have token-budget constraints; returning the full body of a
@@ -1153,27 +1193,11 @@ def get_file_map(
         # Runs under the executor lock on the single shared connection;
         # must not open its own connection.  Timeout is enforced by
         # _wrap_tool (300 s + interrupt), not here.
-        # Path resolution: exact match first, then suffix LIKE fallback.
-        # Users often pass just "main.cpp" or "src/main.cpp" — the suffix
-        # match finds the canonical path without requiring the full relative
-        # prefix.  When multiple candidates exist, choose the shortest path
-        # because it is the least-nested (most canonical) match.
-        exact = conn.execute(
-            "SELECT COUNT(*) FROM symbols WHERE config_hash=? AND file_path=?",
-            (config_hash, file_path),
-        ).fetchone()[0]
-        if not exact:
-            # Try to find the canonical path from the files table
-            candidates = conn.execute(
-                "SELECT path FROM files WHERE config_hash=? AND path LIKE ? LIMIT 3",
-                (config_hash, f"%{file_path}"),
-            ).fetchall()
-            if not candidates:
-                return {"error": f"File not found in index: {file_path}. Check the path — use relative paths like 'src/main.cpp'."}
-            # Pick the best match (shortest path that ends with file_path)
-            resolved = min((c["path"] for c in candidates), key=len)
-        else:
-            resolved = file_path
+        # Path resolution: the exact path first, then the file of that
+        # name.  Callers often pass just "main.cpp" or "src/main.cpp".
+        resolved = _resolve_indexed_file(conn, config_hash, file_path)
+        if resolved is None:
+            return {"error": f"File not found in index: {file_path}. Check the path — use relative paths like 'src/main.cpp'."}
         # Defense-in-depth: validate resolved path stays within project root
         err = _validate_path_in_root(resolved, root)
         if err:
@@ -1750,25 +1774,15 @@ def read_file(
         # must not open its own connection.  Timeout is enforced by
         # _wrap_tool (300 s + interrupt), not here.
 
-        # Path resolution: exact match first, then suffix LIKE fallback
-        # (same strategy as get_file_map — users often pass bare filenames).
-        exact = conn.execute(
-            "SELECT COUNT(*) FROM files WHERE config_hash=? AND path=?",
-            (config_hash, file_path),
-        ).fetchone()[0]
-        if not exact:
-            candidates = conn.execute(
-                "SELECT path FROM files WHERE config_hash=? AND path LIKE ? LIMIT 3",
-                (config_hash, f"%{file_path}"),
-            ).fetchall()
-            if not candidates:
-                return {
-                    "error": f"File not found in index: {file_path}. "
-                    f"Check the path — use relative paths like 'src/main.cpp'."
-                }
-            resolved = min((c["path"] for c in candidates), key=len)
-        else:
-            resolved = file_path
+        # Path resolution: the exact path first, then the file of that
+        # name (same helper as get_file_map — callers often pass a bare
+        # filename).
+        resolved = _resolve_indexed_file(conn, config_hash, file_path)
+        if resolved is None:
+            return {
+                "error": f"File not found in index: {file_path}. "
+                f"Check the path — use relative paths like 'src/main.cpp'."
+            }
 
         # Defense-in-depth: validate resolved path stays within project root
         err = _validate_path_in_root(resolved, root)
