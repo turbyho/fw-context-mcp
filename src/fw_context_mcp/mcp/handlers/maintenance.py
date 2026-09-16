@@ -2168,7 +2168,12 @@ def _reindex_match_tus(
         if via:
             return via[:1], True, None
 
-    return [], False, {"error": f"{target.name} not found in compile_commands.json — it may be a header-only file."}
+    # The whole path, not target.name.  The basename made the refusal name
+    # something the caller never wrote: "../../../../etc/passwd" came back
+    # as "passwd not found in compile_commands.json", which reads as a fact
+    # about a file of the project and says nothing about the path that was
+    # refused.
+    return [], False, {"error": f"{target} is not built by this project — it has no entry in compile_commands.json, and no indexed translation unit includes it."}
 
 
 def _effective_vendor_patterns(

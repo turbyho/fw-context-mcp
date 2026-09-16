@@ -70,6 +70,29 @@ def configure_llm_core(
             "API proxy."
         )
 
+    # WHAT the file held before the write.  A setting that fails its own
+    # test must not stay behind: the tool writes AND verifies, thus a
+    # failed verification means the operator keeps the setup that worked.
+    # Measured: configure_llm(model="no_such_model:1b", auto_pull=False)
+    # answered "Configuration written but test call failed" and left the
+    # unusable model in local.toml — the next call then tested against it.
+    local_toml = project_root / ".fw-context" / "local.toml"
+    previous = local_toml.read_bytes() if local_toml.is_file() else None
+
+    def _roll_back() -> str:
+        """Put the previous settings back.  Gives a note for the message."""
+        try:
+            if previous is None:
+                local_toml.unlink(missing_ok=True)
+            else:
+                local_toml.write_bytes(previous)
+        except OSError as exc:
+            return (
+                f" The previous settings could NOT be restored ({exc}) — "
+                f"read {local_toml} before the next call."
+            )
+        return " The previous settings are back; nothing was changed."
+
     try:
         _update_local_toml(project_root, updates, clear_keys=clear_keys)
     except Exception as e:
@@ -78,7 +101,10 @@ def configure_llm_core(
     try:
         new_cfg = load_config(project_root=project_root)
     except Exception as e:
-        return {"status": "error", "message": f"Configuration written but reload failed: {e}"}
+        return {
+            "status": "error",
+            "message": f"The new settings could not be read back: {e}.{_roll_back()}",
+        }
 
     try:
         if new_cfg.llm.chat_api_base:
@@ -126,11 +152,14 @@ def configure_llm_core(
         result["message"] = f"Configuration written and tested successfully ({latency}s)."
     except OllamaError as e:
         result["status"] = "error"
-        result["message"] = f"Configuration written but test call failed: {e}. Check the API URL, key, and model name."
+        result["message"] = (
+            f"The test call failed: {e}. Check the API URL, key, and model "
+            f"name.{_roll_back()}"
+        )
     except Exception as e:
         # Never raise — a malformed URL or unexpected backend response must
         # surface as a structured error, not a traceback through the MCP tool.
         result["status"] = "error"
-        result["message"] = f"Configuration written but verification failed: {e}"
+        result["message"] = f"Verification failed: {e}.{_roll_back()}"
 
     return result

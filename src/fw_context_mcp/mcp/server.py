@@ -1,6 +1,8 @@
 """fw-context MCP server — build-aware code intelligence for embedded C/C++ projects.
 
-Serves 37 MCP tools and 4 MCP resources via FastMCP (stdio transport).
+Serves 39 MCP tools and 4 MCP resources via FastMCP (stdio transport).
+The two counts are pinned by a test — a docstring that drifts describes
+a server that no longer exists.
 
 **Concurrency model — single-tool execution with busy rejection:**
 The server processes at most ONE tool request at a time.  If a request

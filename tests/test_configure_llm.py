@@ -203,6 +203,69 @@ class TestConfigureLlmTestCall:
         assert kwargs["json"]["messages"][0]["content"] == "Reply with exactly: OK"
 
 
+class TestASettingThatFailsItsTestIsNotKept:
+    """The tool writes AND verifies, thus a failed test undoes the write.
+
+    It used to answer "Configuration written but test call failed" and
+    leave the unusable setting in local.toml.  Measured on a throwaway
+    project: ``model="no_such_model_xyz:1b"`` with ``auto_pull=False``
+    wrote the model, and the NEXT call then tested against that broken
+    model rather than against what the operator asked for.
+    """
+
+    @patch("fw_context_mcp.llm.chat_router.httpx.post")
+    def test_a_failed_test_restores_the_previous_settings(self, mock_post, tmp_path):
+        mock_post.side_effect = httpx.ConnectError("refused")
+        root = _make_project(tmp_path)
+        local = root / ".fw-context" / "local.toml"
+        local.write_text(
+            '[llm]\nmodel = "the-model-that-works"\n', encoding="utf-8"
+        )
+
+        result = configure_llm(
+            project_root=str(root),
+            chat_api_base="https://api.example.com/v1",
+            chat_api_key="sk-test",
+        )
+
+        assert result["status"] == "error"
+        text = local.read_text(encoding="utf-8")
+        assert "the-model-that-works" in text, text
+        assert "api.example.com" not in text, (
+            f"a setting that failed its own test stayed behind: {text}"
+        )
+
+    @patch("fw_context_mcp.llm.chat_router.httpx.post")
+    def test_the_message_says_that_nothing_changed(self, mock_post, tmp_path):
+        mock_post.side_effect = httpx.ConnectError("refused")
+        root = _make_project(tmp_path)
+
+        result = configure_llm(
+            project_root=str(root),
+            chat_api_base="https://api.example.com/v1",
+            chat_api_key="sk-test",
+        )
+
+        assert "nothing was changed" in result["message"], result["message"]
+        assert "Configuration written" not in result["message"], result["message"]
+
+    @patch("fw_context_mcp.llm.chat_router.httpx.post")
+    def test_a_passing_test_keeps_the_new_settings(self, mock_post, tmp_path):
+        """The rollback must not touch a write that verified."""
+        mock_post.return_value = _mock_openai_response()
+        root = _make_project(tmp_path)
+
+        result = configure_llm(
+            project_root=str(root),
+            chat_api_base="https://api.example.com/v1",
+            chat_api_key="sk-test",
+        )
+
+        assert result["status"] == "ok"
+        text = (root / ".fw-context" / "local.toml").read_text(encoding="utf-8")
+        assert "api.example.com" in text, text
+
+
 # ── Result structure ─────────────────────────────────────────────────────────
 
 

@@ -624,6 +624,21 @@ def test_the_server_registers_tools():
     assert len(TOOLS) >= 38, TOOL_IDS
 
 
+def test_the_module_docstring_counts_what_the_server_serves():
+    """A docstring that drifts describes a server that no longer exists.
+
+    It said "37 MCP tools" while 39 were registered.  The number is the
+    first thing a reader of the module sees, thus it is pinned here.
+    """
+    doc = server.__doc__ or ""
+    resources = asyncio.run(server.mcp.list_resource_templates())
+    static = asyncio.run(server.mcp.list_resources())
+    assert f"Serves {len(TOOLS)} MCP tools" in doc, doc.splitlines()[:4]
+    assert f"and {len(resources) + len(static)} MCP resources" in doc, (
+        doc.splitlines()[:4]
+    )
+
+
 @pytest.mark.parametrize("tool", TOOLS, ids=TOOL_IDS)
 def test_a_tool_that_takes_a_project_root_also_takes_a_project(tool):
     """One tool without the parameter recreates the original failure."""
