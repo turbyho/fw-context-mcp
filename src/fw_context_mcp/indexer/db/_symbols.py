@@ -255,7 +255,9 @@ def insert_macros_batch(
 ) -> int:
     """Insert macro rows, updating on (config_hash, file_id, line) conflict.
 
-    Each row: (config_hash, file_id, name, value, expanded_value, line, is_function_like)
+    Each row:
+    (config_hash, file_id, name, value, params, expanded_value, line,
+    is_function_like)
 
     Returns count of rows inserted or updated.
 
@@ -269,11 +271,13 @@ def insert_macros_batch(
     """
     cur = conn.executemany(
         """INSERT INTO macros
-           (config_hash, file_id, name, value, expanded_value, line, is_function_like)
-           VALUES (?,?,?,?,?,?,?)
+           (config_hash, file_id, name, value, params, expanded_value, line,
+            is_function_like)
+           VALUES (?,?,?,?,?,?,?,?)
            ON CONFLICT(config_hash, file_id, line) DO UPDATE SET
                name           = excluded.name,
                value          = excluded.value,
+               params         = excluded.params,
                expanded_value = CASE WHEN excluded.expanded_value != '' THEN excluded.expanded_value ELSE macros.expanded_value END,
                is_function_like = excluded.is_function_like""",
         rows,

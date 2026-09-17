@@ -69,7 +69,12 @@ class Macro:
         config_hash: Build configuration fingerprint.
         file_id: Foreign key to ``files.id`` in the index database.
         name: The macro name (without leading ``#define``).
-        value: Raw value text from the ``#define`` directive.
+        value: The replacement text alone.  The parameter list of a
+            function-like macro is NOT part of it — see *params*.
+        params: The parameter list of a function-like macro, without its
+            parentheses and written ``a, b``.  Empty for an object-like
+            macro AND for ``NAME()``, thus *is_function_like* and not this
+            string says which of the two a macro is.
         expanded_value: Fully expanded value from ``clang -dM -E`` (set
             later by the macros.py driver; empty during initial parsing).
         line: Source line number (1-based) of the ``#define`` directive.
@@ -81,6 +86,7 @@ class Macro:
     file_id: int = 0
     name: str = ""
     value: str = ""
+    params: str = ""
     expanded_value: str = ""
     line: int = 0
     is_function_like: bool = False

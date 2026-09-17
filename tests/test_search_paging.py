@@ -187,11 +187,11 @@ def project(tmp_path: Path) -> Path:
         insert_symbols_batch(conn, symbols)
 
         insert_macros_batch(conn, [
-            (CH, fid, f"LIMIT_{i}", str(i), str(i), 10 + i, 0) for i in range(5)
+            (CH, fid, f"LIMIT_{i}", str(i), "", str(i), 10 + i, 0) for i in range(5)
         ] + [
             # `ZQTIMER` is in no symbol, thus every symbol step of the
             # relaxation chain misses and the macro step answers.
-            (CH, fid, f"ZQTIMER_{i}", str(i), str(i), 90 + i, 0) for i in range(6)
+            (CH, fid, f"ZQTIMER_{i}", str(i), "", str(i), 90 + i, 0) for i in range(6)
         ])
     conn.close()
     return root

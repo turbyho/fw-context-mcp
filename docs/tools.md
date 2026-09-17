@@ -645,7 +645,8 @@ tool automatically broadens the search in up to six steps:
 5. *Individual term FTS5* — searches each query word separately and merges
    the results.
 6. *Macro FTS5 fallback* — searches the `macros_fts` table for matching
-   `#define` names and values (`kind="macro"`, `_fallback="macros_fts"`).
+   `#define` names, parameter lists and values (`kind="macro"`,
+   `_fallback="macros_fts"`).
 
 Results from fallback steps carry `_fallback` indicating which method
 succeeded: `"fts5"`, `"name_tokens_like"`, `"docstring_like"`,
@@ -812,8 +813,23 @@ Macro example:
 Input:  {"name": "CONFIG_UART_BAUDRATE", "project_root?": "/path/to/project", "exact?": true}
 Output: [{"name": "CONFIG_UART_BAUDRATE", "kind": "macro",
           "file": "/path/include/config.h", "line": 15,
+          "signature": "#define CONFIG_UART_BAUDRATE",
+          "is_function_like": false,
           "value": "115200", "expanded_value": "115200"}]
 ```
+
+A function-like macro shows its parameters in `signature`, and `value` holds
+the replacement text alone:
+```
+Output: [{"name": "MIN", "kind": "macro", "signature": "#define MIN(a, b)",
+          "is_function_like": true, "value": "((a) < (b) ? (a) : (b))"}]
+```
+
+`signature` is `#define NAME` for an object-like macro, `#define NAME()` for
+a function-like macro that takes no argument, and `#define NAME(a, b)`
+otherwise. `is_function_like` is what separates the first two: both have an
+empty parameter list. `get_source`, `explain_symbol` and the macro step of
+`search_code` write the same spelling.
 
 fw-context sorts definitions before declarations. Use `exact: true` for an
 exact name match. The default is a prefix match: `uart` matches
@@ -1014,6 +1030,7 @@ Input:  {"name": "CONFIG_UART_BAUDRATE", "project_root?": "/path/to/project"}
 Output: {"name": "CONFIG_UART_BAUDRATE", "kind": "macro",
          "file": "/path/include/config.h", "line": 15,
          "signature": "#define CONFIG_UART_BAUDRATE",
+         "is_function_like": false,
          "value": "115200", "expanded_value": "115200",
          "source": "#define CONFIG_UART_BAUDRATE 115200"}
 ```

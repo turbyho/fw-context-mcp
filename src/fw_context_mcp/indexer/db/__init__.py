@@ -109,6 +109,7 @@ __all__ = [
     "refs_for_symbol",
     "replace_file_data",
     "replace_memory_regions",
+    "row_format_effect",
     "row_format_is_newer",
     "row_format_is_older",
     "search_similar_hybrid",
@@ -237,6 +238,7 @@ from ._schema import (
     CURRENT_SCHEMA_VERSION,
     _ensure_column,
     drop_fts_triggers,
+    row_format_effect,
     row_format_is_newer,
     row_format_is_older,
 )

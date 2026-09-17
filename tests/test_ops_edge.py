@@ -77,43 +77,48 @@ class TestReadBody:
         # lines[1:5] = elements 1-4 = "line1\n", "line2\n", "line3\n", "ignored\n"
         assert body == "line1\nline2\nline3\nignored\n"
 
-    def test_single_line_body(self):
+    def test_two_line_body(self):
         lines = ["a\n", "body\n", "c\n"]
-        # For a single-line function on line 2, end_line should be 3 (exclusive)
+        # The range is inclusive on both ends: lines 2 and 3.
         body = _read_body(lines, 2, 3, frozenset())
-        # lines[1:3] = elements 1,2 = "body\n", "c\n"
-        assert "body" in body
+        assert body == "body\nc\n"
 
-    def test_start_equals_end_returns_empty(self):
-        lines = ["a\n", "b\n", "c\n"]
+    def test_start_equals_end_reads_that_one_line(self):
+        # An inline accessor begins and ends on ONE line.  The guard used to
+        # ask for more than one line, and every such definition then reached
+        # the index with an empty body — invisible to search_bodies.
+        lines = ["a\n", "bool ready() const { return r_; }\n", "c\n"]
         body = _read_body(lines, 2, 2, frozenset())
-        assert body == ""
+        assert body == "bool ready() const { return r_; }\n"
 
-    def test_end_past_file_truncates(self):
+    def test_start_equals_end_on_the_last_line(self):
+        lines = ["a\n", "int f() { return 1; }\n"]
+        assert _read_body(lines, 2, 2, frozenset()) == "int f() { return 1; }\n"
+
+    def test_start_equals_end_inside_a_dead_branch(self):
+        # The one-line body obeys the filter like any other body.
+        lines = ["a\n", "int f() { return 1; }\n", "c\n"]
+        assert _read_body(lines, 2, 2, frozenset({2})) == "\n"
+
+    def test_end_past_file_returns_empty(self):
         lines = ["line1\n", "line2\n"]
-        body = _read_body(lines, 1, 100, frozenset())
-        # end_line(100) > start_line(1) → True
-        # end_line(100) <= len(lines)(2) → False → returns ""
-        assert body == ""
+        # An extent that ends past the end of the file describes no body.
+        assert _read_body(lines, 1, 100, frozenset()) == ""
 
     def test_start_past_file_returns_empty(self):
         lines = ["line1\n"]
         body = _read_body(lines, 100, 200, frozenset())
         assert body == ""
 
-    def test_start_line_zero(self):
+    def test_start_line_zero_returns_empty(self):
+        # A row with no extent.  Python reads index -1 from the END of the
+        # list, thus line 0 used to give the text of the last line.
         lines = ["line0\n", "line1\n"]
-        # start_line - 1 = -1, which slices from the end in Python!
-        # This is an edge case we just want to verify doesn't crash
-        body = _read_body(lines, 0, 2, frozenset())
-        # Undefined behavior for invalid input — just verify no crash
-        assert isinstance(body, str)
+        assert _read_body(lines, 0, 2, frozenset()) == ""
 
-    def test_negative_start_line(self):
+    def test_negative_start_line_returns_empty(self):
         lines = ["a\n", "b\n"]
-        # Negative start_line — Python slicing will wrap
-        body = _read_body(lines, -1, 2, frozenset())
-        assert isinstance(body, str)
+        assert _read_body(lines, -1, 2, frozenset()) == ""
 
     def test_empty_lines_list(self):
         body = _read_body([], 1, 5, frozenset())
@@ -198,5 +203,7 @@ class TestComputeContentHash:
     def test_end_line_equals_start_line(self):
         lines = ["void fn() { return; }\n"]
         h = _compute_content_hash(lines, 1, 1, "void fn()", "fn", "", frozenset())
-        # body is "" because end_line > start_line is False
         assert len(h) == 64
+        # The one-line body is part of the hash, thus a change to it is seen.
+        other = ["void fn() { return 1; }\n"]
+        assert _compute_content_hash(other, 1, 1, "void fn()", "fn", "", frozenset()) != h

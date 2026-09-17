@@ -77,6 +77,7 @@ from ...indexer.intlist import read_isr_registrations
 from ...utils import abs_path
 from ...utils import escape_like as _escape_like
 from ...utils import format_number_ranges as _as_ranges
+from ...utils import macro_signature as _macro_signature
 from ..shared.paging import clamp_offset, page_notice
 from ._base import BaseHandler, DbContext
 from .source import _lookup_definition
@@ -336,6 +337,13 @@ def _references_result(name: str, project_root: str | None, ref_kind: str | list
                     "name": macro["name"],
                     "file": abs_path(root, macro["file_path"]),
                     "line": macro["line"],
+                    # `signature` says how the macro is invoked and `value`
+                    # holds the replacement text alone.  The two used to be
+                    # one string, thus neither could be read out of it.
+                    "signature": _macro_signature(
+                        macro["name"], bool(macro["is_function_like"]), macro["params"],
+                    ),
+                    "is_function_like": bool(macro["is_function_like"]),
                     "value": macro["value"],
                     **({"expanded_value": macro["expanded_value"]} if macro["expanded_value"] else {}),
                 }
@@ -576,7 +584,9 @@ def find_callers(
         ``"indirect"``, ``"implicit_construct"``, or ``"macro_use"``),
         caller (enclosing function name), caller_kind (``"function"``,
         ``"method"``, …). Macro fallback puts a dict with ``kind="macro"``,
-        ``value`` and ``expanded_value`` between the notice and the rows;
+        ``signature`` (``#define`` free: ``NAME`` or ``NAME(a, b)``),
+        ``is_function_like``, ``value`` (the replacement text ALONE) and
+        ``expanded_value`` between the notice and the rows;
         that answer pages too, and its ``total`` counts the uses in active
         code only — a use inside a comment is not one.
 
@@ -646,7 +656,9 @@ def find_references(
         constructor call from global/static object or member-field
         initialization), ``"macro_use"`` (macro usage
         in file). Macro fallback puts a dict with ``kind="macro"``,
-        ``value`` and ``expanded_value`` between the notice and the rows;
+        ``signature`` (``NAME`` or ``NAME(a, b)``), ``is_function_like``,
+        ``value`` (the replacement text ALONE) and ``expanded_value``
+        between the notice and the rows;
         that answer pages too, and its ``total`` counts the uses in active
         code only — a use inside a comment is not one.
 

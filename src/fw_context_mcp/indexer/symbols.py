@@ -690,6 +690,64 @@ def _extract_inheritance(class_cursors: list[cx.Cursor]) -> list[InheritanceReco
     return inheritance
 
 
+def _split_macro_definition(tokens: list) -> tuple[bool, str, str]:
+    """Split the tokens of one ``#define`` into shape, parameters and value.
+
+    ``tokens[0]`` is the macro name.  What follows is the parameter list of
+    a function-like macro and then the replacement text.
+
+    Returns ``(is_function_like, params, value)``.  *params* is the
+    parameter list without its parentheses, written ``a, b``.  It is empty
+    BOTH for an object-like macro and for ``NAME()``, thus the flag and not
+    the string says which of the two a macro is.
+
+    WHY the offsets decide whether a list opens, and not the spelling: a
+    macro is function-like only when ``(`` touches the name.  ``#define
+    SPACED (x)`` is object-like, and ``(x)`` is its replacement text.
+
+    WHY the parameter list is split off at all: both used to live in the
+    ``value`` column glued together — ``MBED_ASSERT`` read ``( expr ) do {
+    … }`` — thus a reader that wanted the replacement text got the
+    parameters with it, and a reader that wanted the parameters had to
+    parse the string.
+    """
+    if len(tokens) < 2:
+        return False, "", ""
+
+    rest = " ".join(t.spelling for t in tokens[1:])
+    opens_a_list = (
+        tokens[1].spelling == "("
+        and tokens[1].extent.start.offset == tokens[0].extent.end.offset
+    )
+    if not opens_a_list:
+        return False, "", rest
+
+    # Find the ")" that closes the list.  The depth is counted rather than
+    # the first ")" taken: the lexer hands over whatever the file holds,
+    # and a malformed #define must not make the split cut the value.
+    depth = 0
+    close = None
+    for position in range(1, len(tokens)):
+        spelling = tokens[position].spelling
+        if spelling == "(":
+            depth += 1
+        elif spelling == ")":
+            depth -= 1
+            if depth == 0:
+                close = position
+                break
+    if close is None:
+        # No closing parenthesis — this is not a parameter list.  Keep every
+        # token in the value, which is what a reader got before the split.
+        return False, "", rest
+
+    # Between the parentheses stand parameter names, commas, and ``...``.
+    # The commas carry no information a joined list does not, thus they go.
+    params = ", ".join(t.spelling for t in tokens[2:close] if t.spelling != ",")
+    value = " ".join(t.spelling for t in tokens[close + 1:])
+    return True, params, value
+
+
 def _extract_macros(tu_cursor: cx.Cursor, resolve_fn, skip_files=None) -> list[Macro]:
     """Extract ``#define`` macro definitions, skipping headers in *skip_files*.
 
@@ -708,24 +766,31 @@ def _extract_macros(tu_cursor: cx.Cursor, resolve_fn, skip_files=None) -> list[M
         if skip_files and fpath in skip_files:
             continue  # macro from already processed header
 
-        try:
-            is_fn_like = child.is_macro_function_like()
-        except (ValueError, TypeError, RuntimeError, AttributeError):
-            _log.debug("is_macro_function_like failed for %s", child.spelling)
-            is_fn_like = False
-
+        # The tokens answer every question about the shape of the #define,
+        # thus they are read once and `_split_macro_definition` reads them.
+        #
+        # WHY the tokens decide whether a macro is function-like, and not
+        # libclang: the pinned binding (libclang 18.1.1) has no
+        # ``Cursor.is_macro_function_like`` — the name is absent from
+        # ``clang/cindex.py``.  The call raised AttributeError on EVERY
+        # macro, and a broad ``except`` turned each one into a silent False.
+        # Measured over six indexes: 734 386 macros, 0 marked function-like,
+        # and 453 256 of them held a value that opens with a parameter list.
+        is_fn_like = False
+        params = ""
         value = ""
         try:
-            tokens = list(child.get_tokens())
-            if len(tokens) > 1:
-                value = " ".join(t.spelling for t in tokens[1:])
+            is_fn_like, params, value = _split_macro_definition(list(child.get_tokens()))
         except (ValueError, TypeError, RuntimeError, AttributeError):
             _log.debug("macro token extraction failed for %s", child.spelling)
+            is_fn_like = False
+            params = ""
             value = ""
 
         macros.append(Macro(
             name=child.spelling,
             value=value,
+            params=params,
             line=loc.line,
             is_function_like=is_fn_like,
             file=fpath,
@@ -1120,6 +1185,46 @@ def _build_refs_and_fp_assignments(
     return refs, indirect_call_sites, fp_assignments, pending_dispatches
 
 
+@cache
+def _template_of_instance_call() -> Callable[[cx.Cursor], cx.Cursor | None] | None:
+    """Resolve, ONCE, how to ask libclang which template a cursor instantiates.
+
+    WHY this exists instead of a plain ``cursor.specialized_template``: the
+    pinned binding (libclang 18.1.1) does not define that property — the name
+    is absent from ``clang/cindex.py``.  The attribute lookup raised
+    AttributeError on every cursor, and the broad ``except`` around it made
+    each one a silent default.  Measured over five C++ indexes: 11 934
+    templates and 0 instances, thus ``get_template_instances`` could never
+    answer and the two suite cases over it ended as SKIP in every round.
+
+    The C entry point ``clang_getSpecializedCursorTemplate`` IS in the
+    binding's function table, with the same argtypes, restype and errcheck
+    that the property would use, thus it gives exactly what the property
+    gives: the template cursor, or None for a cursor that instantiates none.
+
+    The property comes first so that a later binding which defines it wins
+    without a code change.  When NEITHER is available the answer is None and
+    the reason is said ONCE at WARNING — a DEBUG line is what hid the first
+    absence through every index run.
+
+    Resolution is lazy because ``cx.conf.lib`` loads libclang, and a module
+    that only imports this file must not pay for that.
+    """
+    if getattr(cx.Cursor, "specialized_template", None) is not None:
+        return lambda cursor: cursor.specialized_template
+    entry = getattr(cx.conf.lib, "clang_getSpecializedCursorTemplate", None)
+    if entry is not None:
+        return entry
+    _log.warning(
+        "libclang gives no way to read the template of an instance: "
+        "neither Cursor.specialized_template nor "
+        "clang_getSpecializedCursorTemplate is available. "
+        "symbols.template_usr stays empty, thus get_template_instances "
+        "cannot answer."
+    )
+    return None
+
+
 def _process_one_symbol(
     cursor: cx.Cursor,
     symbols: list[Symbol],
@@ -1233,21 +1338,26 @@ def _process_one_symbol(
             cx.CursorKind.CONSTRUCTOR, cx.CursorKind.FIELD_DECL,
             cx.CursorKind.VAR_DECL, cx.CursorKind.PARM_DECL,
         )
-        if cursor.kind in _template_check_kinds:
+        # The kind comes first: a C project reaches no cursor of these kinds,
+        # thus it never asks the binding and never logs the warning.
+        template_of = (
+            _template_of_instance_call() if cursor.kind in _template_check_kinds else None
+        )
+        if template_of is not None:
             try:
-                specialized = cursor.specialized_template
+                specialized = template_of(cursor)
                 if specialized is not None:
                     template_usr = specialized.get_usr() or ""
                 if not template_usr:
                     parent = cursor.semantic_parent
                     if parent is not None:
-                        parent_spec = parent.specialized_template
+                        parent_spec = template_of(parent)
                         if parent_spec is not None:
                             template_usr = parent_spec.get_usr() or ""
                 if not template_usr:
                     decl = cursor.type.get_declaration()
                     if decl is not None and decl != cursor:
-                        decl_spec = decl.specialized_template
+                        decl_spec = template_of(decl)
                         if decl_spec is not None:
                             template_usr = decl_spec.get_usr() or ""
             except (ValueError, TypeError, RuntimeError, AttributeError):

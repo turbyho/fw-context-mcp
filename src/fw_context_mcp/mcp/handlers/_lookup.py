@@ -27,7 +27,7 @@ from fw_context_mcp.indexer.db import count_macros, lookup_macro
 from fw_context_mcp.mcp.handlers._search_fallbacks import _symbol_row_to_dict
 from fw_context_mcp.mcp.shared.context import _db_path
 from fw_context_mcp.mcp.shared.paging import clamp_offset, page_notice
-from fw_context_mcp.utils import abs_path, resolve_project_root
+from fw_context_mcp.utils import abs_path, macro_signature, resolve_project_root
 
 # ``class`` comes from the parent symbol, and it is empty for a free
 # function.  It is what tells two same-name methods apart at a glance: a
@@ -145,8 +145,11 @@ def lookup_symbol(
         what tells two same-name methods apart at a glance.
         Enum constants include ``enum_value``
         with the integer value. Macro results include ``kind="macro"``,
-        ``value`` (raw definition), and ``expanded_value`` (preprocessor-
-        resolved value). May also include ``template_usr``,
+        ``signature`` (how the macro is invoked: ``#define NAME``,
+        ``#define NAME()`` or ``#define NAME(a, b)``), ``is_function_like``,
+        ``value`` (the replacement text ALONE — the parameter list is not
+        part of it), and ``expanded_value`` (preprocessor-resolved value).
+        May also include ``template_usr``,
         ``parent_usr``, and ``llm_analysis`` (``{summary, inputs,
         outputs}``) when available.  A model wrote the text in
         ``llm_analysis``, and the code did not — use it to find a symbol,
@@ -265,6 +268,20 @@ def lookup_symbol(
                             "kind": "macro",
                             "file": abs_path(root, m["file_path"]),
                             "line": m["line"],
+                            # `signature` says how the macro is invoked and
+                            # `value` holds the replacement text alone.  The
+                            # two used to be one string: `value` carried the
+                            # parameter list glued to the body, thus neither
+                            # could be read out of it.
+                            #
+                            # The `#define` prefix is what get_source and the
+                            # macro step of search_code already write.  One
+                            # spelling, thus a reader never has to ask which
+                            # tool wrote the answer.
+                            "signature": "#define " + macro_signature(
+                                m["name"], bool(m["is_function_like"]), m["params"],
+                            ),
+                            "is_function_like": bool(m["is_function_like"]),
                             "value": m["value"],
                             **({"expanded_value": m["expanded_value"]} if m["expanded_value"] else {}),
                         }

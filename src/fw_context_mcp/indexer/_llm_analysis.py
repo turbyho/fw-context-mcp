@@ -124,10 +124,16 @@ def _enrich_batch(conn, batch_rows, config_hash: str, *, project_root: Path | No
 
         # Read body for symbols with meaningful extents.  Enums and typedefs
         # benefit from body text during LLM analysis (enum constants, type alias).
+        #
+        # `0 < start_line <= end_line` takes the one-line definition too, and
+        # it keeps out a row with no extent.  The gate that asked for more
+        # than one line let a stored body through to nothing:
+        # `ops._read_body` now writes the text of an inline accessor, and
+        # this gate would then throw it away.
         if (
             kind in ("function", "method", "constructor", "destructor", "class", "struct", "union", "enum", "typedef")
             and abs_file_path
-            and end_line > start_line
+            and 0 < start_line <= end_line
         ):
             # The stored body is ifdef-filtered — prefer it, see the
             # docstring.  A row from before the column existed holds nothing

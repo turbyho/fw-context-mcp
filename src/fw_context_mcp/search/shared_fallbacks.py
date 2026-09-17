@@ -38,7 +38,7 @@ from typing import Any
 
 from fw_context_mcp.indexer.db import _expand_query, search_symbols
 from fw_context_mcp.indexer.db._symbols import count_symbols
-from fw_context_mcp.utils import abs_path, is_db_exception
+from fw_context_mcp.utils import abs_path, is_db_exception, macro_signature
 
 # ── Row → dict conversion ───────────────────────────────────────────────────
 
@@ -478,10 +478,16 @@ def _search_code_macros_fts(
             return None
         macro_dicts: list[dict[str, Any]] = []
         for r in m_rows:
+            # The signature carries the parameter list, thus a reader sees
+            # how the macro is invoked without a second call.  `params` used
+            # to be glued to the front of `value`, where nothing could read
+            # it apart from the replacement text.
             extra: dict[str, Any] = {
                 "kind": "macro",
                 "qualified_name": r["name"],
-                "signature": f"#define {r['name']}",
+                "signature": "#define " + macro_signature(
+                    r["name"], bool(r["is_function_like"]), r["params"],
+                ),
                 "is_definition": True,
                 "_fallback": "macros_fts",
             }

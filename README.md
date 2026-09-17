@@ -112,7 +112,7 @@ fw-context indexes the project through the same compilation database used by bui
 ```mermaid
 flowchart LR
     CCJ[compile_commands.json] & SRC[(source files)] --> LIBCLANG[libclang<br/>AST parser]
-    LIBCLANG --> SYMBOLS[symbols<br/>name, kind, USR<br/>signature, source body<br/>docstring, tokens] & FILES[files<br/>path, language<br/>ifdef-filtered content<br/>project/SDK sources] & REFS[refs &amp; call graph<br/>fp_assignments<br/>indirect_call_sites] & INHERIT[inheritance<br/>&amp; overrides<br/>virtual dispatch] & MACROS[macros<br/>raw &amp; expanded values<br/>FTS5 searchable] & ENRICH[optional enrichment<br/>embeddings &amp; summaries<br/>hotspot cache]
+    LIBCLANG --> SYMBOLS[symbols<br/>name, kind, USR<br/>signature, source body<br/>docstring, tokens] & FILES[files<br/>path, language<br/>ifdef-filtered content<br/>project/SDK sources] & REFS[refs &amp; call graph<br/>fp_assignments<br/>indirect_call_sites] & INHERIT[inheritance<br/>&amp; overrides<br/>virtual dispatch] & MACROS[macros<br/>params, value<br/>&amp; expanded value<br/>FTS5 searchable] & ENRICH[optional enrichment<br/>embeddings &amp; summaries<br/>hotspot cache]
     SYMBOLS & FILES & REFS & INHERIT & MACROS & ENRICH --> MCP[MCP server<br/>37 tools]
     MCP --> LLM[AI coding agent]
 ```
@@ -124,7 +124,7 @@ The index contains:
 - function-pointer assignments and indirect call sites
 - callback registrations and invocation relationships
 - active, preprocessor-filtered file content
-- raw and expanded macro values
+- macro parameter lists, replacement text and expanded values
 - inheritance, overrides and virtual-dispatch relationships
 - translation-unit and project/vendor metadata
 - optional embeddings and LLM-generated summaries

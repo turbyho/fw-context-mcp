@@ -234,3 +234,59 @@ class TestTheTwoVersionsMoveTogether:
             "compute_config_hash, then set ROW_FORMAT_PAIRED_WITH to the "
             "new value."
         )
+
+
+class TestTheReasonNamesTheRightFault:
+    """The reason must describe the gap it reports, not a fixed one.
+
+    The wording used to be one sentence about inactive ``#ifdef`` branches.
+    That describes the ``/0`` text alone.  From ``/1`` on the stored text is
+    filtered, thus the same sentence over a ``/2`` index told the reader to
+    expect dead code where the real fault is the opposite — the rows answer
+    LESS than they should.
+    """
+
+    def test_the_oldest_text_is_told_it_holds_dead_code(self) -> None:
+        from fw_context_mcp.indexer.db import row_format_effect
+
+        assert "#ifdef" in row_format_effect("fw-context-rows/0")
+
+    def test_the_newest_stale_text_is_told_it_answers_less(self) -> None:
+        from fw_context_mcp.indexer.db import row_format_effect
+
+        effect = row_format_effect("fw-context-rows/2")
+        assert "answer less" in effect
+        assert "#ifdef" not in effect, (
+            "a /2 index already filters #ifdef branches — naming them sends "
+            "the reader after a fault that is not there"
+        )
+
+    def test_each_generation_gets_its_own_wording(self) -> None:
+        from fw_context_mcp.indexer.db import row_format_effect
+
+        said = {row_format_effect(f"fw-context-rows/{n}") for n in (0, 1, 2)}
+        assert len(said) == 3
+
+    def test_an_unreadable_format_gets_the_oldest_wording(self) -> None:
+        # The safe direction: nothing says such text is free of any fault.
+        from fw_context_mcp.indexer.db import row_format_effect
+
+        for value in ("", "(none)", "fw-context-rows/", "something-else/2"):
+            assert row_format_effect(value) == row_format_effect("fw-context-rows/0"), value
+
+    def test_every_stale_generation_has_a_wording(self) -> None:
+        # A bump of CURRENT_ROW_FORMAT without a new entry in the fault table
+        # leaves the newest stale generation with the fallback text, which
+        # names no fault at all.
+        from fw_context_mcp.indexer.db import row_format_effect
+        from fw_context_mcp.indexer.db._schema import _row_format_number
+
+        current = _row_format_number(CURRENT_ROW_FORMAT)
+        assert current is not None
+        for number in range(current):
+            effect = row_format_effect(f"fw-context-rows/{number}")
+            assert "does not describe" not in effect, (
+                f"row format /{number} is stale but _ROW_FORMAT_FAULTS says "
+                f"nothing about it — add an entry when you bump "
+                f"CURRENT_ROW_FORMAT"
+            )

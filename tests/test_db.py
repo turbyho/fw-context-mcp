@@ -2134,18 +2134,24 @@ class TestMacros:
         conn = populated_db
         fid = upsert_file(conn, "hash-deadbeef", "/tmp/test.h", "cpp")
         insert_macros_batch(conn, [
-            ("hash-deadbeef", fid, "MAX_BUF", "256", "256", 10, 0),
-            ("hash-deadbeef", fid, "MIN(a,b)", "((a)<(b)?(a):(b))", "((a)<(b)?(a):(b))", 11, 1),
+            ("hash-deadbeef", fid, "MAX_BUF", "256", "", "256", 10, 0),
+            ("hash-deadbeef", fid, "MIN", "((a)<(b)?(a):(b))", "a, b", "((a)<(b)?(a):(b))", 11, 1),
         ])
         rows = conn.execute(
-            "SELECT name, value, expanded_value, line, is_function_like FROM macros WHERE file_id=? ORDER BY line",
+            "SELECT name, value, params, expanded_value, line, is_function_like "
+            "FROM macros WHERE file_id=? ORDER BY line",
             (fid,),
         ).fetchall()
         assert len(rows) == 2
         assert rows[0]["name"] == "MAX_BUF"
         assert rows[0]["value"] == "256"
+        assert rows[0]["params"] == ""
         assert rows[0]["is_function_like"] == 0
-        assert rows[1]["name"] == "MIN(a,b)"
+        # The parameter list is a column of its own — `value` holds the
+        # replacement text alone.
+        assert rows[1]["name"] == "MIN"
+        assert rows[1]["params"] == "a, b"
+        assert rows[1]["value"] == "((a)<(b)?(a):(b))"
         assert rows[1]["is_function_like"] == 1
 
     def test_macro_on_conflict_update(self, populated_db):
@@ -2153,10 +2159,10 @@ class TestMacros:
         conn = populated_db
         fid = upsert_file(conn, "hash-deadbeef", "/tmp/test.h", "cpp")
         insert_macros_batch(conn, [
-            ("hash-deadbeef", fid, "VAL", "1", "1", 5, 0),
+            ("hash-deadbeef", fid, "VAL", "1", "", "1", 5, 0),
         ])
         insert_macros_batch(conn, [
-            ("hash-deadbeef", fid, "VAL", "2", "2", 5, 0),
+            ("hash-deadbeef", fid, "VAL", "2", "", "2", 5, 0),
         ])
         rows = conn.execute("SELECT name, value FROM macros WHERE file_id=?", (fid,)).fetchall()
         assert len(rows) == 1
@@ -2167,8 +2173,8 @@ class TestMacros:
         conn = populated_db
         fid = upsert_file(conn, "hash-deadbeef", "/tmp/test.h", "cpp")
         insert_macros_batch(conn, [
-            ("hash-deadbeef", fid, "UART_BAUD", "115200", "115200", 1, 0),
-            ("hash-deadbeef", fid, "I2C_ADDR", "0x50", "0x50", 2, 0),
+            ("hash-deadbeef", fid, "UART_BAUD", "115200", "", "115200", 1, 0),
+            ("hash-deadbeef", fid, "I2C_ADDR", "0x50", "", "0x50", 2, 0),
         ])
         results = conn.execute(
             "SELECT name FROM macros_fts WHERE macros_fts MATCH 'name:uart*'"
@@ -2182,7 +2188,7 @@ class TestMacros:
         conn = populated_db
         fid = upsert_file(conn, "hash-deadbeef", "/tmp/test.h", "cpp")
         insert_macros_batch(conn, [
-            ("hash-deadbeef", fid, "REBUILD_TEST", "1", "1", 1, 0),
+            ("hash-deadbeef", fid, "REBUILD_TEST", "1", "", "1", 1, 0),
         ])
         rebuild_macros_fts(conn)
         results = conn.execute(
@@ -2196,7 +2202,7 @@ class TestMacros:
         conn = populated_db
         fid = upsert_file(conn, "hash-deadbeef", "/tmp/test.h", "cpp")
         insert_macros_batch(conn, [
-            ("hash-deadbeef", fid, "TO_DELETE", "42", "42", 1, 0),
+            ("hash-deadbeef", fid, "TO_DELETE", "42", "", "42", 1, 0),
         ])
         assert conn.execute(
             "SELECT COUNT(*) FROM macros_fts WHERE macros_fts MATCH 'name:to_delete'"
@@ -2216,9 +2222,9 @@ class TestMacros:
         hdr_id = upsert_file(conn, "hash-deadbeef", "/tmp/inline.h", "c")
         keep_id = upsert_file(conn, "hash-deadbeef", "/tmp/keep.h", "c")
         insert_macros_batch(conn, [
-            ("hash-deadbeef", tu_id, "TU_MACRO", "1", "1", 1, 0),
-            ("hash-deadbeef", hdr_id, "HDR_MACRO", "2", "2", 4, 0),
-            ("hash-deadbeef", keep_id, "KEEP_MACRO", "3", "3", 9, 0),
+            ("hash-deadbeef", tu_id, "TU_MACRO", "1", "", "1", 1, 0),
+            ("hash-deadbeef", hdr_id, "HDR_MACRO", "2", "", "2", 4, 0),
+            ("hash-deadbeef", keep_id, "KEEP_MACRO", "3", "", "3", 9, 0),
         ])
         delete_macros_for_files(conn, [tu_id, hdr_id])
         names = [
@@ -2234,7 +2240,7 @@ class TestMacros:
         conn = populated_db
         fid = upsert_file(conn, "hash-deadbeef", "/tmp/test.h", "cpp")
         insert_macros_batch(conn, [
-            ("hash-deadbeef", fid, "SURVIVOR", "1", "1", 1, 0),
+            ("hash-deadbeef", fid, "SURVIVOR", "1", "", "1", 1, 0),
         ])
         delete_macros_for_files(conn, [])
         count = conn.execute(
@@ -2251,11 +2257,11 @@ class TestMacros:
         ]
         keep_id = upsert_file(conn, "hash-deadbeef", "/tmp/keep.h", "c")
         insert_macros_batch(conn, [
-            ("hash-deadbeef", fid, f"GEN_{i:04d}", "1", "1", 1, 0)
+            ("hash-deadbeef", fid, f"GEN_{i:04d}", "1", "", "1", 1, 0)
             for i, fid in enumerate(ids)
         ])
         insert_macros_batch(conn, [
-            ("hash-deadbeef", keep_id, "KEEP_MACRO", "1", "1", 1, 0),
+            ("hash-deadbeef", keep_id, "KEEP_MACRO", "1", "", "1", 1, 0),
         ])
         delete_macros_for_files(conn, ids)
         names = [
@@ -2270,7 +2276,7 @@ class TestMacros:
         conn = populated_db
         fid = upsert_file(conn, "hash-deadbeef", "/tmp/test.h", "cpp")
         insert_macros_batch(conn, [
-            ("hash-deadbeef", fid, "API_KEY", "0xABCD", "0xABCD", 3, 0),
+            ("hash-deadbeef", fid, "API_KEY", "0xABCD", "", "0xABCD", 3, 0),
         ])
         results = lookup_macro(conn, "hash-deadbeef", "API_KEY", exact=True)
         assert len(results) == 1

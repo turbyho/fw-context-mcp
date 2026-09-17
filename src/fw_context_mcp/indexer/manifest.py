@@ -1031,6 +1031,13 @@ def compute_config_hash(
         # second change of the stored rows: ``files.content`` holds the
         # comments and the preprocessor directives of every file, which the
         # one-line-per-token rule and the token-free headers had dropped.
+        # /5 marks a third change: ``symbols.source`` holds a definition that
+        # begins and ends on one line, ``macros.is_function_like`` says
+        # whether a macro takes arguments, and ``symbols.template_usr`` links
+        # an instance to its template.  Each of the three held a constant
+        # before, thus no answer over them could be right.  ``macros.value``
+        # also lost the parameter list it used to carry — that text is now
+        # ``macros.params``.
         #
         # WHY the format version belongs in THIS hash: a new config_hash
         # leaves no row for the build, thus a plain `fw-context index` writes
@@ -1041,7 +1048,7 @@ def compute_config_hash(
         #
         # Every existing index therefore gets one final reindex, which is
         # intended.
-        "_format": "fw-context-cc/4",
+        "_format": "fw-context-cc/5",
         "project_root": str(project_root),
         # WHY only these two: config_hash answers "could the same source text
         # compile to something different now?"  Macros flip #ifdef, and the

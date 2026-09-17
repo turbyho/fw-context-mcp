@@ -56,6 +56,7 @@ __all__ = [
     "ROW_FORMAT_PAIRED_WITH",
     "_ensure_column",
     "drop_fts_triggers",
+    "row_format_effect",
     "row_format_is_newer",
     "row_format_is_older",
 ]
@@ -75,7 +76,23 @@ __all__ = [
 #      the token starts on — and a header carried no token at all.  A block
 #      comment thus lost its closing marker, and a reader took the live code
 #      below it as commented out.
-CURRENT_ROW_FORMAT = "fw-context-rows/2"
+# /3 — three columns that carried a constant now carry an answer, and a
+#      fourth column no longer carries two things at once.
+#      `symbols.source` holds a definition that begins and ends on ONE line:
+#      before it, every inline accessor of a header had an empty body and
+#      search_bodies could not reach it (1102 such definitions in one index).
+#      `macros.is_function_like` says whether a macro takes arguments:
+#      before it, 0 of 734 386 macros over six indexes were marked, although
+#      453 256 of them opened with a parameter list.  `symbols.template_usr`
+#      links an instance to its template: before it, 11 934 templates had 0
+#      instances, thus get_template_instances could never answer.
+#      Those three came from a libclang call that the pinned binding does
+#      not have, and a broad `except` made each absence a silent default.
+#      `macros.value` now holds the replacement text ALONE; the parameter
+#      list moved to `macros.params`.  Before it the two were one string —
+#      one macro of an SDK read `( expr ) do { … }` — and neither could be
+#      read out of it.
+CURRENT_ROW_FORMAT = "fw-context-rows/3"
 
 # The config-hash format that was current when CURRENT_ROW_FORMAT last moved.
 #
@@ -90,7 +107,7 @@ CURRENT_ROW_FORMAT = "fw-context-rows/2"
 # the build, thus a plain `fw-context index` writes every file and every
 # body again.  The two must therefore move together, and
 # `test_row_format_invalidation.py` fails when only one of them does.
-ROW_FORMAT_PAIRED_WITH = "fw-context-cc/4"
+ROW_FORMAT_PAIRED_WITH = "fw-context-cc/5"
 
 
 def _row_format_number(value: str) -> int | None:
@@ -116,6 +133,41 @@ def row_format_is_older(stored: str) -> bool:
     if stored_number is None or current_number is None:
         return stored != CURRENT_ROW_FORMAT
     return stored_number < current_number
+
+
+#: What an index of each row format gets wrong, keyed by the LAST ordinal
+#: that still has the fault.  The reader of a stale index has to know what
+#: its answers are worth, and a version string alone does not say.
+#:
+#: WHY this is a table and not one sentence: the faults are OPPOSITE.  The
+#: oldest text HOLDS code that never compiles, while the text one generation
+#: below this one ANSWERS LESS than it should.  A single fixed sentence
+#: described the first alone, thus every bump after it made the reason lie.
+_ROW_FORMAT_FAULTS: tuple[tuple[int, str], ...] = (
+    (0, "the stored text keeps inactive #ifdef branches, thus a body or a "
+        "file can show code that does not compile"),
+    (1, "a block comment in the stored text of a file lost its closing "
+        "marker, thus live code below it reads as commented out"),
+    (2, "the stored rows answer less than they should: a definition that "
+        "begins and ends on one line has no body, no macro is marked "
+        "function-like, no instance links to its template, and the value "
+        "of a macro holds its parameter list glued to its replacement text"),
+)
+
+
+def row_format_effect(stored: str) -> str:
+    """Say what an index whose text carries *stored* gets wrong.
+
+    The answer names the OLDEST fault the text still has, because that is
+    the one that misleads the reader most.  Text of an unreadable or absent
+    format gets the oldest answer for the same reason: nothing says it is
+    free of any fault.
+    """
+    number = _row_format_number(stored)
+    for last_faulty, effect in _ROW_FORMAT_FAULTS:
+        if number is None or number <= last_faulty:
+            return effect
+    return "the stored rows carry a meaning this version does not describe"
 
 
 def row_format_is_newer(stored: str) -> bool:
@@ -356,6 +408,11 @@ _MIGRATION_ADD_COLUMNS = [
     # CURRENT_SCHEMA_VERSION by itself, and every existing index therefore
     # asks for the one reindex that fills it.
     "ALTER TABLE build_configs ADD COLUMN row_format TEXT NOT NULL DEFAULT ''",
+    # The parameter list of a function-like macro, separated from its
+    # replacement text.  Both used to live in `macros.value`, glued into one
+    # string, thus neither could be read out of it.  A real column moves
+    # CURRENT_SCHEMA_VERSION by itself and needs no _schema_bump_ marker.
+    "ALTER TABLE macros ADD COLUMN params TEXT NOT NULL DEFAULT ''",
     # Schema version bump — DO NOT REMOVE. When adding new migration steps after this
     # column, also add a NEW ALTER TABLE … ADD COLUMN _schema_bump_… line. The hash
     # of _MIGRATION_ADD_COLUMNS drives CURRENT_SCHEMA_VERSION.
@@ -823,12 +880,20 @@ CREATE INDEX IF NOT EXISTS idx_overrides_base    ON overrides(config_hash, base_
 -- Why is_function_like: distinguishes object-like from function-like
 -- macros — needed because function-like macros participate in search
 -- differently (they accept arguments).
+-- Why params is a column of its own: `value` used to hold the parameter
+-- list glued to the replacement text — `MBED_ASSERT` read
+-- `( expr ) do { … }` — and nothing could tell the two apart.  A reader
+-- that wants the replacement text got the parameters with it, and a
+-- reader that wants the parameters had to parse the string.
+-- params is EMPTY both for an object-like macro and for `NAME()`, thus
+-- is_function_like is what separates those two.
 CREATE TABLE IF NOT EXISTS macros (
     id               INTEGER PRIMARY KEY,
     config_hash      TEXT    NOT NULL REFERENCES build_configs(config_hash),
     file_id          INTEGER NOT NULL REFERENCES files(id),
     name             TEXT    NOT NULL,
     value            TEXT    NOT NULL DEFAULT '',
+    params           TEXT    NOT NULL DEFAULT '',
     expanded_value   TEXT    NOT NULL DEFAULT '',
     line             INTEGER NOT NULL,
     is_function_like INTEGER NOT NULL DEFAULT 0,
@@ -839,31 +904,37 @@ CREATE INDEX IF NOT EXISTS idx_macros_file ON macros(file_id);
 
 -- ── macros_fts: full-text search over macro definitions ─────────────────
 -- Separate from symbols_fts because macros have a different content model
--- (name + value + expanded_value vs name + signature + docstring + source).
+-- (name + value + params + expanded_value vs name + signature + docstring
+-- + source).
 -- External content FTS5 with content='macros' — non-duplicating storage.
+-- Why params is indexed: it used to be part of `value`, thus a parameter
+-- name was searchable.  Splitting it into its own column without indexing
+-- it would take that reach away — a search for the argument of a HAL macro
+-- would stop matching.
 CREATE VIRTUAL TABLE IF NOT EXISTS macros_fts USING fts5(
     name,
     value,
+    params,
     expanded_value,
     content='macros',
     content_rowid='id'
 );
 
 CREATE TRIGGER IF NOT EXISTS macros_ai AFTER INSERT ON macros BEGIN
-    INSERT INTO macros_fts(rowid, name, value, expanded_value)
-    VALUES (new.id, new.name, new.value, new.expanded_value);
+    INSERT INTO macros_fts(rowid, name, value, params, expanded_value)
+    VALUES (new.id, new.name, new.value, new.params, new.expanded_value);
 END;
 
 CREATE TRIGGER IF NOT EXISTS macros_ad AFTER DELETE ON macros BEGIN
-    INSERT INTO macros_fts(macros_fts, rowid, name, value, expanded_value)
-    VALUES ('delete', old.id, old.name, old.value, old.expanded_value);
+    INSERT INTO macros_fts(macros_fts, rowid, name, value, params, expanded_value)
+    VALUES ('delete', old.id, old.name, old.value, old.params, old.expanded_value);
 END;
 
 CREATE TRIGGER IF NOT EXISTS macros_au AFTER UPDATE ON macros BEGIN
-    INSERT INTO macros_fts(macros_fts, rowid, name, value, expanded_value)
-    VALUES ('delete', old.id, old.name, old.value, old.expanded_value);
-    INSERT INTO macros_fts(rowid, name, value, expanded_value)
-    VALUES (new.id, new.name, new.value, new.expanded_value);
+    INSERT INTO macros_fts(macros_fts, rowid, name, value, params, expanded_value)
+    VALUES ('delete', old.id, old.name, old.value, old.params, old.expanded_value);
+    INSERT INTO macros_fts(rowid, name, value, params, expanded_value)
+    VALUES (new.id, new.name, new.value, new.params, new.expanded_value);
 END;
 
 -- ── hotspot_cache: pre-computed caller-count rankings ───────────────────

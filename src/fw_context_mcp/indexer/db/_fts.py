@@ -144,6 +144,11 @@ def rebuild_macros_fts(conn: sqlite3.Connection) -> None:
 
     Drops triggers first, recreates the FTS5 table, backfills from
     ``macros``, then reinstates content-sync triggers.
+
+    The drop is what repairs a SHAPE change.  ``CREATE VIRTUAL TABLE IF NOT
+    EXISTS`` in the schema leaves an existing table alone, thus an index
+    written before ``macros.params`` keeps a three-column FTS until this
+    function runs.  It runs in ``_step_rebuild_fts`` of every index run.
     """
 
     conn.executescript("""
@@ -153,30 +158,31 @@ def rebuild_macros_fts(conn: sqlite3.Connection) -> None:
         DROP TABLE IF EXISTS macros_fts;
 
         CREATE VIRTUAL TABLE macros_fts USING fts5(
-            name, value, expanded_value,
+            name, value, params, expanded_value,
             content='macros', content_rowid='id'
         );
     """)
 
     conn.execute("""
-        INSERT INTO macros_fts(rowid, name, value, expanded_value)
-        SELECT id, name, COALESCE(value,''), COALESCE(expanded_value,'') FROM macros
+        INSERT INTO macros_fts(rowid, name, value, params, expanded_value)
+        SELECT id, name, COALESCE(value,''), COALESCE(params,''),
+               COALESCE(expanded_value,'') FROM macros
     """)
     conn.commit()
 
     conn.executescript("""
         CREATE TRIGGER macros_ai AFTER INSERT ON macros BEGIN
-            INSERT INTO macros_fts(rowid, name, value, expanded_value)
-            VALUES (new.id, new.name, new.value, new.expanded_value);
+            INSERT INTO macros_fts(rowid, name, value, params, expanded_value)
+            VALUES (new.id, new.name, new.value, new.params, new.expanded_value);
         END;
         CREATE TRIGGER macros_ad AFTER DELETE ON macros BEGIN
-            INSERT INTO macros_fts(macros_fts, rowid, name, value, expanded_value)
-            VALUES ('delete', old.id, old.name, old.value, old.expanded_value);
+            INSERT INTO macros_fts(macros_fts, rowid, name, value, params, expanded_value)
+            VALUES ('delete', old.id, old.name, old.value, old.params, old.expanded_value);
         END;
         CREATE TRIGGER macros_au AFTER UPDATE ON macros BEGIN
-            INSERT INTO macros_fts(macros_fts, rowid, name, value, expanded_value)
-            VALUES ('delete', old.id, old.name, old.value, old.expanded_value);
-            INSERT INTO macros_fts(rowid, name, value, expanded_value)
-            VALUES (new.id, new.name, new.value, new.expanded_value);
+            INSERT INTO macros_fts(macros_fts, rowid, name, value, params, expanded_value)
+            VALUES ('delete', old.id, old.name, old.value, old.params, old.expanded_value);
+            INSERT INTO macros_fts(rowid, name, value, params, expanded_value)
+            VALUES (new.id, new.name, new.value, new.params, new.expanded_value);
         END;
     """)

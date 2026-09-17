@@ -170,13 +170,15 @@ def _make_macros_db() -> sqlite3.Connection:
             config_hash TEXT,
             name TEXT,
             value TEXT,
+            params TEXT DEFAULT '',
             expanded_value TEXT,
             file_id INTEGER,
             line INTEGER DEFAULT 1,
+            is_function_like INTEGER DEFAULT 0,
             is_project INTEGER DEFAULT 1
         );
         CREATE VIRTUAL TABLE macros_fts USING fts5(
-            name, value,
+            name, value, params,
             content='macros', content_rowid='id'
         );
     """)
@@ -355,8 +357,13 @@ class TestMacrosFtsFallbackPhase:
     def test_run_with_macro_match(self) -> None:
         ctx = _make_ctx(query="DEBUG", fts5_results=[])
         db = _make_macros_db()
+        # Named columns, not a positional VALUES: the row shape changed when
+        # `params` arrived, and a positional insert says nothing about which
+        # value lands where.
         db.execute(
-            "INSERT INTO macros VALUES (1, 'test_hash', 'DEBUG', '1', '1', 1, 42, 1)"
+            "INSERT INTO macros (id, config_hash, name, value, params, "
+            "expanded_value, file_id, line, is_function_like) "
+            "VALUES (1, 'test_hash', 'DEBUG', '1', '', '1', 1, 42, 0)"
         )
         db.execute("INSERT INTO macros_fts(rowid, name, value) VALUES (1, 'debug', '1')")
         db.commit()
@@ -467,7 +474,9 @@ class TestDoMacrosFtsFallback:
     def test_finds_macro(self) -> None:
         db = _make_macros_db()
         db.execute(
-            "INSERT INTO macros VALUES (1, 'test_hash', 'VERSION', '1.0', '1.0', 1, 1, 1)"
+            "INSERT INTO macros (id, config_hash, name, value, params, "
+            "expanded_value, file_id, line, is_function_like) "
+            "VALUES (1, 'test_hash', 'VERSION', '1.0', '', '1.0', 1, 1, 0)"
         )
         db.execute("INSERT INTO macros_fts(rowid, name, value) VALUES (1, 'version', '1.0')")
         db.commit()
@@ -476,6 +485,28 @@ class TestDoMacrosFtsFallback:
         assert len(rows) == 1
         assert rows[0]["name"] == "VERSION"
         assert rows[0]["kind"] == "macro"
+        assert rows[0]["signature"] == "#define VERSION"
+
+    def test_a_function_like_macro_shows_its_parameters(self) -> None:
+        # The parameter list used to be glued to the front of `value`, thus
+        # a reader could not tell how the macro is invoked.
+        db = _make_macros_db()
+        db.execute(
+            "INSERT INTO macros (id, config_hash, name, value, params, "
+            "expanded_value, file_id, line, is_function_like) "
+            "VALUES (1, 'test_hash', 'MIN', '((a)<(b)?(a):(b))', 'a, b', "
+            "'', 1, 1, 1)"
+        )
+        db.execute(
+            "INSERT INTO macros_fts(rowid, name, value, params) "
+            "VALUES (1, 'min', '((a)<(b)?(a):(b))', 'a, b')"
+        )
+        db.commit()
+        with _mock_abs_path():
+            rows = _do_macros_fts_fallback(db, "min", "test_hash", 10)
+        assert len(rows) == 1
+        assert rows[0]["signature"] == "#define MIN(a, b)"
+        assert rows[0]["_macro_value"] == "((a)<(b)?(a):(b))"
 
     def test_handles_missing_table(self) -> None:
         db = sqlite3.connect(":memory:")

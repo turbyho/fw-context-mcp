@@ -150,8 +150,20 @@ def _read_body(
     unfiltered shows dead code as live code, and an audit can then approve
     code that the compiler never sees.  A required parameter makes the type
     checker name each call site instead.
+
+    ``start_line <= end_line`` reaches a body that begins and ends on ONE
+    line.  An embedded header carries that shape by habit — ``bool ready()
+    const { return r_; }`` — and the guard that asked for more than one line
+    gave every such definition an empty body.  Measured on one index: 1102
+    definitions, all of them one line long, none of them reachable through
+    ``search_bodies``.  ``_postprocess.py`` already made the same repair for
+    the call graph; this is the same off-by-one on the stored text.
+
+    ``0 < start_line`` keeps a row with no extent out.  Python reads a
+    negative index from the end of the list, thus line 0 used to give the
+    text of the LAST line of the file.
     """
-    if not (end_line > start_line and end_line <= len(lines)):
+    if not (0 < start_line <= end_line <= len(lines)):
         return ""
     if not skipped:
         return "".join(lines[start_line - 1 : end_line])
@@ -870,8 +882,12 @@ def _store_symbol_rows(
         # store an empty body — only definitions have executable code.
         # _cached_read_lines reuses file content across symbols in the
         # same file, avoiding repeated disk I/O.
+        #
+        # `end_line >= s.line` takes the one-line definition too — the inline
+        # accessor of an embedded header.  `_read_body` gives the reason and
+        # the count.
         body = ""
-        if s.is_definition and s.end_line > s.line:
+        if s.is_definition and s.end_line >= s.line:
             file_lines = _cached_read_lines(s.file)
             if file_lines is not None:
                 # resolved_sym is reused from the is_project block above:
@@ -1239,6 +1255,7 @@ def _store_macros_for_unit(
                 m_file_id,
                 m.name,
                 m.value,
+                m.params,
                 m.expanded_value,
                 m.line,
                 int(m.is_function_like),

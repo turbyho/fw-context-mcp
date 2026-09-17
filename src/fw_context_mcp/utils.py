@@ -66,6 +66,7 @@ __all__ = [
     "is_compile_commands_stale",
     "is_db_exception",
     "is_fatal",
+    "macro_signature",
     "read_file_lines",
     "resolve_build_dir",
     "resolve_project_root",
@@ -836,6 +837,26 @@ def truncate_path_middle(path: str, max_len: int) -> str:
     keep_start = max(max_len // 3, 12)
     keep_end = max_len - keep_start - 1
     return path[:keep_start] + "…" + path[-keep_end:]
+
+
+def macro_signature(name: str, is_function_like: bool, params: str) -> str:
+    """Write how a macro is invoked: ``NAME``, ``NAME()`` or ``NAME(a, b)``.
+
+    *params* is the ``macros.params`` column — the parameter list without
+    its parentheses.  It is empty BOTH for an object-like macro and for a
+    function-like one that takes no argument, thus *is_function_like* is
+    what separates ``NAME`` from ``NAME()``.
+
+    WHY one function and not one f-string at each reader: four places
+    answer with a macro — ``lookup_symbol``, ``find_callers`` and
+    ``find_references``, the macro step of ``search_code``, and the shared
+    fallback behind ``get_source``, ``get_symbol_context`` and
+    ``explain_symbol``.  A reader that sees two spellings of one macro has
+    to guess which one the source holds.
+    """
+    if not is_function_like:
+        return name
+    return f"{name}({params})"
 
 
 def fmt_count(n: int) -> str:

@@ -72,7 +72,7 @@ from ...indexer.db._resolve import (
     resolve_candidates,
 )
 from ...llm.ollama import OllamaError, OllamaModelNotFoundError, call_ollama_async
-from ...utils import abs_path, read_file_lines
+from ...utils import abs_path, macro_signature, read_file_lines
 from ..shared.context import _normalize_file_path_query
 from ..shared.stale import _file_differs
 from ._base import BaseHandler
@@ -605,8 +605,18 @@ def _read_verified_body(
         indexed_body = row["source"] or ""
         if indexed_body:
             return _number_lines(indexed_body, line_no), "index", None
-        # No stored body — a declaration, or an extent of one line.  Only
-        # the disk can answer, and such a symbol has no branch to filter.
+        # No stored body.  A declaration is the usual reason: it holds a
+        # prototype and no code.  The others are an extent that ends past
+        # the end of the file, and a row written before `symbols.source`
+        # was filled.  Only the disk can answer for those.
+        #
+        # A definition of ONE line used to land here too, and that was a
+        # defect of the indexer, not a shape of its own: two guards asked
+        # for an extent of more than one line and gave every inline
+        # accessor an empty body (1102 of them in one index).  From
+        # `fw-context-rows/3` on, such a definition carries its text and
+        # takes the branch above.  An index older than that still reaches
+        # this line, and `get_active_build` asks it for a reindex.
         return _read_symbol_body(file_path, line_no, end_line=end_line), "disk", None
 
     if _body_matches_symbol(file_path, row):
@@ -662,13 +672,19 @@ def _try_macro_fallback(
     if not macros:
         return None
     m = macros[0]
+    # The parameter list is part of how the macro is written, thus both the
+    # signature and the reconstructed source line carry it.  It lives in its
+    # own column now — before, it was the head of `value`, and this line
+    # read it back by accident.
+    invocation = macro_signature(m["name"], bool(m["is_function_like"]), m["params"])
     result: dict = {
         "name": m["name"],
         "kind": "macro",
         "file": abs_path(root, m["file_path"]),
         "line": m["line"],
-        "signature": f"#define {m['name']}",
-        "source": f"#define {m['name']} {m['value']}",
+        "signature": f"#define {invocation}",
+        "source": f"#define {invocation} {m['value']}".rstrip(),
+        "is_function_like": bool(m["is_function_like"]),
         "value": m["value"],
     }
     if m["expanded_value"]:
@@ -712,8 +728,9 @@ async def explain_symbol(
     Returns:
         dict: {name, kind, file, line, signature, explanation, llm_analysis
         (if pre-computed)}, plus source/explain_prompt on fallback. Macro
-        fallback returns ``kind="macro"``, ``signature`` (as ``#define NAME``),
-        ``value`` (raw definition), and ``expanded_value``.
+        fallback returns ``kind="macro"``, ``signature`` (as ``#define NAME``
+        or ``#define NAME(a, b)``), ``is_function_like``, ``value`` (the
+        replacement text ALONE), and ``expanded_value``.
 
         A ``warning`` key means that the local LLM gave no explanation —
         the request timed out, or the model is not available.  The dict then
@@ -914,8 +931,10 @@ def get_source(
     ``stale_warning`` says so.
 
     For enums, includes a ``constants`` array listing all member constants
-    with their values. For macros, returns kind="macro" with ``value``
-    (raw definition) and ``expanded_value`` (preprocessor-resolved).
+    with their values. For macros, returns kind="macro" with ``signature``
+    (``#define NAME`` or ``#define NAME(a, b)``), ``is_function_like``,
+    ``value`` (the replacement text ALONE — the parameter list is not part
+    of it) and ``expanded_value`` (preprocessor-resolved).
 
     For rich context (who calls this, what does it call) use
     ``get_symbol_context`` instead — it returns body, callers, and callees
@@ -1434,8 +1453,10 @@ def get_symbol_context(
         linked (Phase 3).  ``resolved=False`` with a note when parts are
         missing — LLM can detect uncertainty.
         For enums also returns constants and enum_value.
-        For macros returns ``kind="macro"``, ``value`` (raw definition), and
-        ``expanded_value`` (preprocessor-resolved).
+        For macros returns ``kind="macro"``, ``signature`` (``#define NAME``
+        or ``#define NAME(a, b)``), ``is_function_like``, ``value`` (the
+        replacement text ALONE) and ``expanded_value``
+        (preprocessor-resolved).
         When LLM analysis has been generated (``fw-context index --analyze``),
         includes ``llm_analysis``: {summary, inputs, outputs, model, analyzed_at}
         with a structured description of the symbol's purpose, parameters, and

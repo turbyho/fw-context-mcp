@@ -138,7 +138,7 @@ def _installs_at_runtime(conn, irq, handler, offset="16", at_line=90,
         ])
         if offset is not None:
             insert_macros_batch(conn, [
-                (CONFIG, fid, "NVIC_USER_IRQ_OFFSET", offset, offset, 5, 0),
+                (CONFIG, fid, "NVIC_USER_IRQ_OFFSET", offset, "", offset, 5, 0),
             ])
 
 

@@ -57,6 +57,7 @@ from ...indexer.db import (
     get_memory_regions_by_config,
     make_analysis_summary,
     open_db,
+    row_format_effect,
     row_format_is_newer,
     row_format_is_older,
     transaction,
@@ -429,7 +430,15 @@ def get_active_build(
     ``row_format_mismatch`` means that the same columns hold text with an
     older meaning.  Take it seriously: an index written before
     ``fw-context-rows/1`` keeps every inactive ``#ifdef`` branch, thus a
-    body or a file from it can show code that the compiler never sees.
+    body or a file from it can show code that the compiler never sees.  An
+    index written before ``fw-context-rows/3`` is wrong the other way: it
+    ANSWERS LESS than it should.  A definition that begins and ends on one
+    line has no stored body there, thus ``search_bodies`` cannot reach an
+    inline accessor; no macro is marked function-like; and no instance links
+    to its template, thus ``get_template_instances`` gives an empty list for
+    every template.  Each of those looks like a legitimate empty answer.
+    The ``value`` of a macro there also holds its parameter list glued to
+    its replacement text, thus neither can be read out of it.
 
     ``client_restart_required`` is the OPPOSITE case, and no command repairs
     it.  The index carries a NEWER row format than this server process
@@ -814,13 +823,14 @@ def get_active_build(
             reindex_reasons.append(f"schema_mismatch: {db_schema_ver} < {CURRENT_SCHEMA_VERSION}")
         if row_format_old:
             # Names the effect, not only the value: the caller has to know
-            # that the answers it gets now can hold code that never
-            # compiles, which is not obvious from a version string.
+            # what the answers it gets now are worth, which is not obvious
+            # from a version string.  `row_format_effect` picks the wording
+            # by the gap — the faults of the generations are opposite, thus
+            # one fixed sentence would be false for every gap but one.
             reindex_reasons.append(
                 f"row_format_mismatch: {stored_row_format or '(none)'} != "
-                f"{CURRENT_ROW_FORMAT} — the stored text of this index keeps "
-                f"inactive #ifdef branches, thus a body or a file can show "
-                f"code that does not compile. Run `fw-context index`"
+                f"{CURRENT_ROW_FORMAT} — {row_format_effect(stored_row_format)}. "
+                f"Run `fw-context index`"
             )
         if cc_changed:
             reindex_reasons.append(stale_reason or "compile_commands_changed")
