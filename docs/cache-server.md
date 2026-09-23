@@ -353,9 +353,10 @@ fw-context cache clear --remote          # project's entries from server (Tier 2
 fw-context cache clear --all             # both tiers
 fw-context cache clear --remote -y       # skip confirmation
 
-# Push local cache to remote server (with overwrite)
-fw-context cache push                    # push all, batch size 100
+# Upload the local entries that the remote server does not have
+fw-context cache push                    # batch size 100
 fw-context cache push --batch 500        # larger batches for faster transfer
+fw-context cache push --overwrite        # also replace the server's entries
 
 # Interactive remote cache setup
 fw-context cache remote-init             # configure URL and token interactively
@@ -387,11 +388,24 @@ The `--remote` flag reads all the content hashes from the project's
 server's `POST /cache/clear` endpoint. This deletes only the current
 project's entries. Entries that other projects share remain on the server.
 
-`fw-context cache push` uploads all entries from the local global cache
-(`~/.fw-context/llm_cache.db`) to the remote server, with overwrite enabled
-(`X-Cache-Overwrite: true`). This command is useful for seeding a
-newly-deployed server, or for migrating the cache between machines. This
-command requires `can_write` and `can_overwrite` on the token.
+`fw-context cache push` sends the entries of the local global cache
+(`~/.fw-context/llm_cache.db`) to the remote server. The server keeps each
+entry it already has (first write wins), so only the missing entries are
+stored. The command reports how many entries it inserted and how many the
+server already had. This command is useful for seeding a newly-deployed
+server, or for migrating the cache between machines. This command requires
+`can_write` on the token.
+
+The same content hash does not guarantee the same analysis text: the output
+of the model varies from run to run, and the hash does not cover the prompt.
+To replace the server's entries with the local ones, add `--overwrite`. This
+sends `X-Cache-Overwrite: true`, and requires `can_overwrite` on the token.
+
+The command checks the token before it sends anything. It exits with status
+1 when the server is unreachable, when the server rejects the token, when
+the token cannot write, when
+`--overwrite` is given without `can_overwrite`, or when the server refuses a
+write part of the way through.
 
 ## Hardening (production)
 

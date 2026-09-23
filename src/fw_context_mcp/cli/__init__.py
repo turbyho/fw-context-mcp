@@ -391,9 +391,16 @@ def main() -> None:
     p_cache_clear.add_argument("-y", "--yes", action="store_true", help="Skip confirmation prompt")
     p_cache_clear.set_defaults(func=cmd_cache_clear)
 
-    p_cache_push = p_cache_sub.add_parser("push", help="Push all local cache entries to remote server")
+    p_cache_push = p_cache_sub.add_parser(
+        "push", help="Upload local cache entries that the remote server does not have yet"
+    )
     p_cache_push.add_argument("--project", metavar="DIR", help="Project root for remote config (default: cwd)")
     p_cache_push.add_argument("--batch", type=int, metavar="N", help="Batch size (default: from config, 100)")
+    p_cache_push.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="Replace entries that the server already has with the local ones (token needs can_overwrite)",
+    )
     p_cache_push.set_defaults(func=cmd_cache_push)
 
     p_cache_remote = p_cache_sub.add_parser(

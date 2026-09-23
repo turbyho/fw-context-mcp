@@ -100,11 +100,25 @@ def cmd_cache_stats(args: argparse.Namespace) -> int:
 
 
 def cmd_cache_push(args: argparse.Namespace) -> int:
-    """Push all local Tier 1 entries to the remote Tier 2 cache server.
+    """Upload local Tier 1 entries to the remote Tier 2 cache server.
 
-    Uses ``--force`` by default (X-Cache-Overwrite header) so newer local
-    entries replace older remote ones — this is safe because content hashes
-    guarantee identical analysis for identical source.
+    By default only the entries that the server does not have are stored:
+    the server keeps an existing entry (first write wins, see
+    ``cache_server/app.py``), so every local entry is sent and the server
+    reports how many it inserted.  ``--overwrite`` sends the
+    ``X-Cache-Overwrite`` header and replaces the server's entries.
+
+    WHY not overwrite by default: this used to overwrite always, on the
+    grounds that a content hash guarantees an identical analysis.  It does
+    not.  The model's output varies from run to run, and the hash covers the
+    body, name, signature and docstring — not the prompt.  Observed: 16
+    entries with the same hash and model held a different text locally and
+    on the server.  A push must not replace a team's entries without asking.
+
+    WHY the capability check first: with the header, a token without
+    ``can_overwrite`` gets 403, the client marks the token read-only and
+    skips every later chunk — and the command used to report
+    ``Done: 0/N`` with exit 0.  A refused write is now an error.
 
     WHY batch push: pushing entries one-by-one would incur HTTP overhead
     per entry; batching by ``batch_size`` (from config or ``--batch``)
@@ -138,19 +152,52 @@ def cmd_cache_push(args: argparse.Namespace) -> int:
             print("Local cache is empty — nothing to push.")
             return 0
 
+        overwrite = bool(getattr(args, "overwrite", False))
         batch_size = args.batch or cs.batch_size
-        cc = CacheClient(url=cs.url, token=cs.token, force=True, batch_size=batch_size)
+        cc = CacheClient(url=cs.url, token=cs.token, force=overwrite, batch_size=batch_size)
         try:
-            pushed = 0
+            caps = cc.stats()
+            if caps is None:
+                if cc.auth_rejected:
+                    print(
+                        f"error: remote cache {cs.url} rejected the token (401/403) — check [cache_server] token",
+                        file=sys.stderr,
+                    )
+                else:
+                    print(f"error: remote cache {cs.url} is not reachable", file=sys.stderr)
+                return 1
+            if not caps.get("can_write"):
+                print("error: the cache token is read-only (can_write=false)", file=sys.stderr)
+                return 1
+            if overwrite and not caps.get("can_overwrite"):
+                print(
+                    "error: --overwrite needs a token with can_overwrite; "
+                    "run without it to upload only the missing entries",
+                    file=sys.stderr,
+                )
+                return 1
+
+            verb = "written" if overwrite else "inserted"
+            written = 0
             for i in range(0, total, batch_size):
                 chunk = rows[i : i + batch_size]
                 entries = [
                     {"hash": r[0], "summary": r[1], "inputs": r[2], "outputs": r[3], "model": r[4]} for r in chunk
                 ]
                 n = cc.batch_put(entries)
-                pushed += n
-                print(f"  [{i + len(chunk)}/{total}] pushed {n} entries")
-            print(f"Done: {pushed}/{total} entries pushed to {cs.url}")
+                if cc.put_failures:
+                    print(
+                        f"error: the server did not accept the write after {i}/{total} entries "
+                        f"({written} {verb}) — see the log for the HTTP status",
+                        file=sys.stderr,
+                    )
+                    return 1
+                written += n
+                print(f"  [{i + len(chunk)}/{total}] {verb} {n}")
+            if overwrite:
+                print(f"Done: {written}/{total} entries written to {cs.url}")
+            else:
+                print(f"Done: {written} inserted, {total - written} already on {cs.url}")
         finally:
             cc.close()
     finally:

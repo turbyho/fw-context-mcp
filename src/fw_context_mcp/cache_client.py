@@ -65,6 +65,14 @@ logger = logging.getLogger(__name__)
 
 _LOCAL_CACHE_DIR = Path.home() / ".fw-context"
 _LOCAL_CACHE_PATH = _LOCAL_CACHE_DIR / "llm_cache.db"
+_SERVER_MAX_BATCH = 1000
+"""The most hashes/entries the server takes from one request.
+
+The server keeps the first 1000 and drops the rest, with ``truncated: true``
+in the answer (``cache_server/app.py``).  A larger chunk therefore loses
+entries without an error, and a push reported the dropped ones as already on
+the server.  The client never sends more.
+"""
 _BATCH_SIZE = 100
 """Default batch size for splitting large request lists into chunks.
 
@@ -329,12 +337,26 @@ class CacheClient:
         self.token = token
         self.timeout = timeout
         self.force = force
-        self.batch_size = batch_size
+        self.batch_size = max(1, min(batch_size, _SERVER_MAX_BATCH))
         self._session: Any = None
         self._connected = False
         self._can_write: bool | None = None
         """Tri-state: None (unknown — not checked yet), True (token allows writes), False (read-only)."""
         self._can_overwrite: bool | None = None
+        self.put_failures = 0
+        """Write chunks the server did not take whole: no answer, refused with
+        401/403, or truncated.
+
+        batch_put returns 0 (or a short count) for those, the same number as
+        for a chunk whose entries were all on the server already.  A caller
+        that has to tell the two apart — ``fw-context cache push`` — reads
+        this counter.
+        """
+        self.auth_rejected = False
+        """True when ``stats()`` got 401/403: the server is up and refused the token.
+
+        ``stats()`` returns None for that and for an unreachable server alike.
+        """
 
     def _ensure_capabilities(self) -> None:
         """Discover token permissions via ``stats()``, once per client.
@@ -581,8 +603,14 @@ class CacheClient:
             on_auth_failure=_on_auth
         )
         if resp is None:
+            self.put_failures += 1
             return 0
         data = resp.json()
+        if data.get("truncated"):
+            # Cannot happen while batch_size stays within _SERVER_MAX_BATCH;
+            # kept so that a server with a lower cap is not a silent loss.
+            logger.warning("Cache server truncated a batch_put of %d entries", len(chunk))
+            self.put_failures += 1
         return data.get("inserted", 0)
 
     def stats(self) -> dict[str, Any] | None:
@@ -604,9 +632,13 @@ class CacheClient:
         No separate "auth check" endpoint needed — the stats call
         serves double duty: cache monitoring AND capability discovery.
         """
+        def _on_auth():
+            self.auth_rejected = True
+
         resp = self._retry_http_call(
             lambda: self._get_session().get("/cache/stats"),
-            label="stats"
+            label="stats",
+            on_auth_failure=_on_auth,
         )
         if resp is None:
             return None

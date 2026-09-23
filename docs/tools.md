@@ -421,17 +421,24 @@ automatically, on the next `fw-context index --analyze` or
 
 ### `fw-context cache push`
 
-Push all local cache entries to the remote cache server. By default, this
-command uses overwrite mode, with `X-Cache-Overwrite`. So a newer local
-entry replaces an older remote entry.
+Upload the local cache entries that the remote cache server does not have
+yet. The server keeps each entry that it already has. To replace those
+entries with the local ones, add `--overwrite`.
 
 ```bash
-fw-context cache push                       # push all, batch size from config (100)
+fw-context cache push                       # missing entries only, batch size from config (100)
 fw-context cache push --batch 500           # larger batches for faster transfer
+fw-context cache push --overwrite           # also replace the server's entries
 ```
 
-This command requires `[cache_server]`, configured with `can_write` and
-`can_overwrite` permissions. This command reports progress in batches.
+The client never sends more than 1000 entries in one request, the most that
+the server accepts; a larger `--batch` is capped at 1000.
+
+This command requires `[cache_server]` and a token with `can_write`.
+`--overwrite` also requires `can_overwrite`. The command reports progress in
+batches, and ends with the number of entries inserted and already on the
+server. It exits with status 1 when the server is unreachable, or when the
+server refuses the write.
 
 ### `fw-context cache remote-init`
 
