@@ -44,10 +44,11 @@ class IndexRunLocked(RuntimeError):
     exclusion itself comes from the kernel, not from the PID.
     """
 
-    def __init__(self, db_dir: Path, holder_pid: int | None) -> None:
+    def __init__(self, db_dir: Path, holder_pid: int | None, hint: str = "") -> None:
         self.holder_pid = holder_pid
         who = f"pid {holder_pid}" if holder_pid else "another process"
-        super().__init__(f"an index run is already in progress for {db_dir} ({who})")
+        message = f"an index run is already in progress for {db_dir} ({who})"
+        super().__init__(f"{message} — {hint}" if hint else message)
 
 
 @contextmanager

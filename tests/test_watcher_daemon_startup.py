@@ -262,7 +262,6 @@ class TestCmdIndexWiring:
         monkeypatch.setattr(config_mod, "load", lambda project_root=None: cfg)
         monkeypatch.setattr(config_mod, "derive_project_id", lambda root: "pid")
         monkeypatch.setattr(build_mod, "detect_build_system", lambda root: "makefile")
-        monkeypatch.setattr(index_mod, "_kill_bg_reindex", lambda db_path: None)
         monkeypatch.setattr(index_mod, "_build_run_kwargs", lambda *a, **kw: {})
         monkeypatch.setattr(
             index_mod, "_resolve_compile_commands", lambda *a, **kw: (cc_path, True)
@@ -352,4 +351,37 @@ class TestCmdIndexWiring:
         monkeypatch.setattr(index_mod, "_run_multi", lambda *a, **kw: 1)
 
         assert cmd_index(self._args()) == 1
+        assert started == []
+
+    @pytest.mark.parametrize("variants", [[], [object()]], ids=["single", "variants"])
+    def test_a_refused_run_builds_nothing(self, monkeypatch, tmp_path: Path, variants: list):
+        """The index is owned BEFORE the build, on both paths.
+
+        Observed: `fw-context index --build` ran `pio run --target clean`,
+        `compiledb` and a full compile, and only then was refused because
+        another run held the index — having cleaned the build directory and
+        rewritten compile_commands.json under that run.
+        """
+        from fw_context_mcp.cli import _index as index_mod
+        from fw_context_mcp.cli._index import cmd_index
+        from fw_context_mcp.exit_codes import EXIT_ALREADY_RUNNING
+        from fw_context_mcp.indexer.db._locking import index_run_lock
+
+        cfg = _FakeCfg(
+            index=_FakeIndexCfg(db_dir=tmp_path / "index"),
+            build=_FakeBuildCfg(variants=variants),
+        )
+        started = self._patch_cmd_index(monkeypatch, tmp_path, cfg)
+        built: list[str] = []
+        monkeypatch.setattr(
+            index_mod, "_resolve_compile_commands", lambda *a, **kw: built.append("single") or (None, False)
+        )
+        monkeypatch.setattr(index_mod, "_run_multi", lambda *a, **kw: built.append("multi") or 0)
+
+        # This process holds the lock through another open file description,
+        # which flock treats as another owner.  The holder is this pytest
+        # process, not an fw-context index run, so nothing may be signalled.
+        with index_run_lock(tmp_path / "index" / "pid"):
+            assert cmd_index(self._args()) == EXIT_ALREADY_RUNNING
+        assert built == []
         assert started == []

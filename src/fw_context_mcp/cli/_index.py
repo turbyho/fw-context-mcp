@@ -29,6 +29,8 @@ import os
 import signal
 import sys
 import time
+from collections.abc import Iterator
+from contextlib import ExitStack, contextmanager
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -342,76 +344,181 @@ def _validate_and_fix_artifacts(
     return compile_commands, build_dir_patterns, True
 
 
-def _pid_is_fw_context_reindexer(pid: int) -> bool:
-    """Verify that *pid* is a BACKGROUND fw-context index run.
+# How long a run that was asked to stop (SIGTERM) gets to release the index
+# lock, and how long a run that got SIGKILL gets after that.  A cooperative
+# run stops at its next translation unit or at the next Python bytecode after
+# a C call returns — a single libclang parse or an HTTP request to Ollama can
+# hold it for longer than that, which is what SIGKILL is for.
+_TAKEOVER_GRACE_S = 10.0
+_KILL_GRACE_S = 5.0
 
-    WHY the identity check at all: Linux recycles PIDs.  A stale
-    ``reindex.pid`` may name a process that has nothing to do with
-    fw-context, and signalling it would take out an unrelated service.
 
-    WHY the cmdline and not the process name: this used to compare
+def _process_argv(pid: int) -> list[str] | None:
+    """Return the argv of *pid*, or None when it cannot be read.
+
+    ``/proc/<pid>/cmdline`` where it exists (Linux).  Elsewhere — macOS has no
+    ``/proc`` — ``ps -o command=``.  The ``/proc``-only version answered None
+    for every process on macOS, so no index run was ever recognised there and
+    the takeover never happened.
+
+    ``ps`` joins argv with spaces, so an argument that contains a space is
+    split.  The caller only looks for whole words (``index``,
+    ``--background``) and for a program name suffix, which a split does not
+    create.
+    """
+    proc_cmdline = Path(f"/proc/{pid}/cmdline")
+    try:
+        # /proc joins argv with NULs.
+        return [arg for arg in proc_cmdline.read_bytes().decode(errors="replace").split("\0") if arg]
+    except FileNotFoundError:
+        if Path("/proc/self").exists():
+            return None  # /proc works, so the process is gone
+    except OSError:
+        return None
+
+    import subprocess
+
+    try:
+        result = subprocess.run(  # noqa: S603 — fixed argv, no shell
+            ["ps", "-o", "command=", "-p", str(pid)],
+            capture_output=True, text=True, timeout=5, check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0:
+        return None
+    return result.stdout.split() or None
+
+
+def _index_run_kind(pid: int) -> str | None:
+    """Return ``"background"`` or ``"foreground"`` for an fw-context index run.
+
+    None for anything else: a dead PID, a recycled PID that now belongs to an
+    unrelated process, another fw-context subcommand.  Only an index run may
+    ever be signalled — a stale PID naming an unrelated service must not take
+    it out.
+
+    WHY the argv and not the process name: this used to compare
     ``/proc/<pid>/comm`` against ``("fw-context", "python", "python3")``.  A
     virtualenv interpreter is named for its version — ``python3.14`` here —
-    so the comparison never matched and the function always returned False.
-    The takeover it guards therefore never happened, and two index runs could
-    write the same database side by side.  Observed exactly that: a run
-    started at 16:42 was still going when a second one started at 17:04.
-
-    Only ``--background`` runs are killable.  The daemon spawns those and
-    will start another when it needs one; a foreground run belongs to a
-    person and is excluded through :func:`index_run_lock` instead of being
-    terminated under them.
+    so the comparison never matched.  Observed exactly that: a run started at
+    16:42 was still going when a second one started at 17:04.
     """
-    try:
-        cmdline = Path(f"/proc/{pid}/cmdline").read_bytes().decode(errors="replace")
-    except OSError:
-        return False
-    # /proc joins argv with NULs.
-    argv = [arg for arg in cmdline.split("\0") if arg]
+    argv = _process_argv(pid)
+    if not argv:
+        return None
     if not any(arg.endswith(("fw-context", "fw_context_mcp.cli", "fw_context_mcp")) for arg in argv):
-        return False
+        return None
     if "index" not in argv:
-        return False
-    return "--background" in argv
+        return None
+    return "background" if "--background" in argv else "foreground"
 
-def _kill_bg_reindex(db_path: Path) -> None:
-    """Terminate a running BACKGROUND index run so that its lock drops.
 
-    Reads reindex.pid, sends SIGTERM, waits up to 5 seconds and falls back
-    to SIGKILL.  Two concurrent writers on one SQLite database corrupt it,
-    and SQLITE_BUSY retries are not mutual exclusion on a long write.
+def _signal_index_run(pid: int, sig: signal.Signals) -> None:
+    """Send *sig* to *pid* when it is still an fw-context index run.
 
-    Writes nothing.  To claim the index is a separate step, and only the
-    process that won index_run_lock may do it — see _claim_index().  A run
-    that writes the pause marker and then LOSES the lock leaves a marker
-    that names a live process, and the run that WON reads that marker as
-    "somebody took the index over" and abandons itself.
-
-    Deliberately does NOT clean up the pause marker of the run it just
-    killed.  PidFile.is_active answers False for a dead PID and
-    raise_if_superseded ignores such a marker — its own docstring says so.
-    To unlink a marker that belongs to another process is the same defect
-    this function exists to remove, seen from the other side.
+    Checked again right before each signal: the PID was read from the lock
+    file earlier, and the process may have exited and the PID been reused
+    since.
     """
-    reindex_pid_file = db_path.parent / "reindex.pid"
+    if _index_run_kind(pid) is None:
+        return
+    try:
+        os.kill(pid, sig)
+    except ProcessLookupError:
+        pass
 
-    # Kill any running background reindex, with PID reuse safety.
-    old_pid = PidFile.read_pid(reindex_pid_file)
-    if old_pid is not None and old_pid != os.getpid():
-        if _pid_is_fw_context_reindexer(old_pid):
-            os.kill(old_pid, signal.SIGTERM)
-            deadline = time.monotonic() + 5.0
-            while time.monotonic() < deadline:
-                if not PidFile._pid_exists(old_pid):
-                    break
-                time.sleep(0.1)
-            else:
-                try:
-                    os.kill(old_pid, signal.SIGKILL)
-                except OSError:
-                    log.debug("SIGKILL on bg reindex process %d failed", old_pid)
-        else:
-            log.debug("PID %d from reindex.pid is not an fw-context reindexer — ignoring", old_pid)
+
+def _acquire_index(db_dir: Path, stack: ExitStack, args: argparse.Namespace) -> None:
+    """Enter ``index_run_lock`` on *stack*, taking the index over if needed.
+
+    A manual run always wins over a background one: the daemon starts those
+    and starts another when the work is still needed (the killed run exits
+    ``EXIT_SUPERSEDED``, which the daemon retries).  A manual run wins over
+    another MANUAL run only with ``--takeover`` — that one belongs to a person.
+    A background run takes over nothing.
+
+    The takeover asks first: SIGTERM makes the holder raise IndexSuperseded
+    (see _owned_index), which unwinds its ``finally`` blocks and drops the
+    markers and the lock.  A holder that does not release the lock within
+    _TAKEOVER_GRACE_S — stuck in a long C call, or in a handler that
+    swallowed the exception — gets SIGKILL.  The kernel drops a flock
+    however the process exits.
+
+    Writes nothing before the lock is won.  A run that wrote the pause marker
+    and then lost the lock would leave a marker naming a live process, and
+    the run that won would read it as "somebody took the index over" and
+    abandon itself — see _claim_index().
+
+    Raises IndexRunLocked when the holder may not be taken over, when it
+    survived SIGKILL, or when a third process won the lock in between.
+    """
+    from ..indexer.db._locking import IndexRunLocked, index_run_lock
+
+    try:
+        stack.enter_context(index_run_lock(db_dir))
+        return
+    except IndexRunLocked as exc:
+        pid = exc.holder_pid
+        if getattr(args, "background", False) or pid is None or pid == os.getpid():
+            raise
+        kind = _index_run_kind(pid)
+        if kind is None:
+            raise
+        if kind == "foreground" and not getattr(args, "takeover", False):
+            raise IndexRunLocked(
+                db_dir, pid, hint="a foreground run; use --takeover to terminate it and index anyway"
+            ) from None
+
+    print(f"Taking over the index from pid {pid} ({kind} run)", file=sys.stderr)
+    _signal_index_run(pid, signal.SIGTERM)
+    for grace, escalate in ((_TAKEOVER_GRACE_S, True), (_KILL_GRACE_S, False)):
+        deadline = time.monotonic() + grace
+        while time.monotonic() < deadline:
+            try:
+                stack.enter_context(index_run_lock(db_dir))
+                return
+            except IndexRunLocked as again:
+                # None: the holder is between truncating its PID and
+                # unlocking, or a new holder has not written its PID yet.
+                if again.holder_pid not in (pid, None):
+                    raise
+            time.sleep(0.1)
+        if escalate:
+            print(f"  pid {pid} did not stop within {grace:.0f}s — sending SIGKILL", file=sys.stderr)
+            _signal_index_run(pid, signal.SIGKILL)
+    raise IndexRunLocked(db_dir, pid, hint="it did not release the index even after SIGKILL")
+
+
+@contextmanager
+def _owned_index(db_dir: Path, args: argparse.Namespace) -> Iterator[None]:
+    """Own the index for the whole block: lock, markers, SIGTERM → superseded.
+
+    The ONE place where ``cmd_index`` takes the index, for the single build
+    and for ``[[build.variants]]`` alike.  The two used to do it separately,
+    and the single build did it only AFTER building — a run that was then
+    refused had already run ``pio run --target clean`` and rewritten
+    compile_commands.json under the run that held the index.
+
+    Inside the block SIGTERM raises IndexSuperseded, so a run that another
+    one takes over (see _acquire_index) unwinds normally and exits
+    ``EXIT_SUPERSEDED``.  The handler ignores a second SIGTERM, so the
+    unwinding itself is not interrupted.  On exit the handler, the markers
+    and the lock are released in that order.
+    """
+    from ..indexer.runner import IndexSuperseded
+
+    def _superseded(signum: int, frame: object) -> None:
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        raise IndexSuperseded("terminated by another index run that took the index over")
+
+    with ExitStack() as stack:
+        _acquire_index(db_dir, stack, args)
+        _claim_index(db_dir)
+        stack.callback(_release_index, db_dir)
+        previous = signal.signal(signal.SIGTERM, _superseded)
+        stack.callback(signal.signal, signal.SIGTERM, signal.SIG_DFL if previous is None else previous)
+        yield
 
 
 def _claim_index(db_dir: Path) -> None:
@@ -819,8 +926,8 @@ def cmd_index(args: argparse.Namespace) -> int:
     from ..config import load as load_config
     from ..exit_codes import EXIT_ALREADY_RUNNING, EXIT_SUPERSEDED
     from ..indexer.build import detect_build_system
-    from ..indexer.db._locking import IndexRunLocked, index_run_lock
-    from ..indexer.runner import IndexSuperseded, run
+    from ..indexer.db._locking import IndexRunLocked
+    from ..indexer.runner import IndexSuperseded
     from ..utils import resolve_project_root
 
     if args.verbose:
@@ -897,46 +1004,85 @@ def cmd_index(args: argparse.Namespace) -> int:
         from dataclasses import replace
         cs_config = replace(cs_config, force=True)
 
-    # ── Multi-variant: dispatch BEFORE single-build resolution ──
-    # WHY: [[build.variants]] replaces the single [build] board/source flow.
-    # build_multi() builds each variant; the single-build path below
-    # (generate_compile_commands → builder.build()) would fail on a project
-    # whose board lives per-variant (Zephyr "requires a board name").
-    if cfg.build.variants:
-        # Takes over from a background run by killing it, which also drops
-        # its index lock; the lock below then only refuses another
-        # FOREGROUND run.  The markers are claimed AFTER the lock — see
-        # _kill_bg_reindex().
-        _kill_bg_reindex(db_path)
-        run_kwargs = _build_run_kwargs(
-            args, cfg, project_root, project_id, vendor_paths, project_paths, cs_config,
-        )
-        try:
-            # Held across every (variant, image) build, not per build: a
-            # second run slipping in between two builds would index against a
-            # database this one is still changing.
-            with index_run_lock(db_path.parent):
-                _claim_index(db_path.parent)
-                try:
-                    exit_code = _run_multi(
-                        args, cfg, project_root, project_id, db_path,
-                        detected_system, run_kwargs,
-                    )
-                finally:
-                    _release_index(db_path.parent)
-        except IndexRunLocked as exc:
-            print(f"error: {exc}", file=sys.stderr)
-            return EXIT_ALREADY_RUNNING
+    run_kwargs = _build_run_kwargs(
+        args, cfg, project_root, project_id, vendor_paths, project_paths, cs_config,
+    )
+    multi = bool(cfg.build.variants)
 
-        # Outside the index lock, and only after a run that was
-        # successful — see the same call at the end of this function.
-        if exit_code == 0:
-            if auto_build_sources:
-                autobuild.clear_failure(db_path.parent)
-            _ensure_watcher_after_index(project_root)
-        elif auto_build_sources:
+    # The index is owned BEFORE anything is built, on both paths below.  A
+    # build run under another index run cleans the build directory and
+    # rewrites compile_commands.json under it, and a run that is refused
+    # afterwards has spent the whole build for nothing.  _owned_index takes
+    # over from a background run, and from a foreground one with --takeover.
+    try:
+        with _owned_index(db_path.parent, args):
+            # ── Multi-variant: dispatch BEFORE single-build resolution ──
+            # WHY: [[build.variants]] replaces the single [build] board/source
+            # flow.  build_multi() builds each variant; the single-build path
+            # (generate_compile_commands → builder.build()) would fail on a
+            # project whose board lives per-variant (Zephyr "requires a board
+            # name").  The index stays owned across every (variant, image)
+            # build: a second run slipping in between two builds would index
+            # against a database this one is still changing.
+            if multi:
+                exit_code = _run_multi(
+                    args, cfg, project_root, project_id, db_path,
+                    detected_system, run_kwargs,
+                )
+            else:
+                exit_code = _run_single(
+                    args, cfg, project_root, project_id, db_path,
+                    detected_system, bg, run_kwargs, auto_build_sources,
+                )
+    except IndexRunLocked as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return EXIT_ALREADY_RUNNING
+    except IndexSuperseded as exc:
+        # Not a failure — see IndexSuperseded.  The distinct exit code lets
+        # the daemon retry instead of treating it as a broken run.
+        print(f"Superseded: {exc}", file=sys.stderr)
+        exit_code = EXIT_SUPERSEDED
+
+    # Everything below runs outside the index lock.  The daemon does a
+    # staleness check when it starts, thus a daemon that starts inside the
+    # lock could start a second index run against the database that this run
+    # still changes.
+    if exit_code != 0:
+        # The single path records a failed build itself, at the step that
+        # failed — a failed validation is not a failed build.
+        if multi and auto_build_sources:
             autobuild.record_failure(db_path.parent, auto_build_sources)
         return exit_code
+
+    if auto_build_sources:
+        # The build worked, thus the backoff marker of an earlier failure is
+        # obsolete.
+        autobuild.clear_failure(db_path.parent)
+
+    if not multi and getattr(args, "build", False):
+        _record_still_uncovered(project_root, db_path)
+
+    _ensure_watcher_after_index(project_root)
+    return 0
+
+
+def _run_single(
+    args: argparse.Namespace,
+    cfg,
+    project_root: Path,
+    project_id: str,
+    db_path: Path,
+    detected_system: str | None,
+    bg: bool,
+    run_kwargs: dict,
+    auto_build_sources: list[str],
+) -> int:
+    """Build (when needed), validate and index the single ``[build]``.
+
+    Called ONLY inside _owned_index — the build writes the files the index
+    run reads, so it has to be excluded the same way the indexing is.
+    """
+    from ..indexer.runner import run
 
     # ── Resolve compile_commands.json ──
     cc_result = _resolve_compile_commands(args, project_root, cfg, detected_system, bg)
@@ -958,54 +1104,15 @@ def cmd_index(args: argparse.Namespace) -> int:
         return 1
     assert compile_commands is not None  # _validate_and_fix_artifacts returns Path|None, but ok=True → non-None
 
-    # ── Manage background reindex ──
-    # Takes over from a background run by killing it, which also drops its
-    # index lock; the lock below then only refuses another FOREGROUND run.
-    # The markers are claimed AFTER the lock — see _kill_bg_reindex().
-    _kill_bg_reindex(db_path)
-
-    run_kwargs = _build_run_kwargs(
-        args, cfg, project_root, project_id, vendor_paths, project_paths, cs_config,
+    config_hash = run(
+        compile_commands=compile_commands,
+        db_path=db_path,
+        build_dir_patterns=build_dir_patterns,
+        **run_kwargs,
     )
+    print(f"Indexed. config_hash={config_hash[:16]}…  db={db_path}")
 
-    try:
-        with index_run_lock(db_path.parent):
-            _claim_index(db_path.parent)
-            try:
-                config_hash = run(
-                    compile_commands=compile_commands,
-                    db_path=db_path,
-                    build_dir_patterns=build_dir_patterns,
-                    **run_kwargs,
-                )
-                print(f"Indexed. config_hash={config_hash[:16]}…  db={db_path}")
-
-                _post_index_optimize(
-                    db_path, project_root, project_id, detected_system, args
-                )
-            except IndexSuperseded as exc:
-                # Not a failure — see IndexSuperseded.  The distinct exit code
-                # lets the daemon retry instead of treating it as a broken run.
-                print(f"Superseded: {exc}", file=sys.stderr)
-                return EXIT_SUPERSEDED
-            finally:
-                _release_index(db_path.parent)
-    except IndexRunLocked as exc:
-        print(f"error: {exc}", file=sys.stderr)
-        return EXIT_ALREADY_RUNNING
-
-    if auto_build_sources:
-        # The build worked, thus the backoff marker of an earlier failure is
-        # obsolete.
-        autobuild.clear_failure(db_path.parent)
-
-    if getattr(args, "build", False):
-        _record_still_uncovered(project_root, db_path)
-
-    # Outside the index lock.  The daemon does a staleness check when it
-    # starts, thus a daemon that starts inside the lock could start a
-    # second index run against the database that this run still changes.
-    _ensure_watcher_after_index(project_root)
+    _post_index_optimize(db_path, project_root, project_id, detected_system, args)
     return 0
 
 

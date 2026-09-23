@@ -209,6 +209,13 @@ def main() -> None:
         help="Background reindex mode — skip build, validation, and dep-tracking fixes (safe for automated runs)",
     )
     p_index.add_argument(
+        "--takeover",
+        action="store_true",
+        default=False,
+        help="Terminate another running foreground index run for this project instead of refusing "
+        "(a background run is always taken over)",
+    )
+    p_index.add_argument(
         "--variant",
         metavar="NAME",
         help="Restrict to one build variant (name from [[build.variants]])",

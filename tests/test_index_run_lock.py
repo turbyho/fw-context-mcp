@@ -23,10 +23,10 @@ from pathlib import Path
 
 import pytest
 
+from fw_context_mcp.exit_codes import EXIT_ALREADY_RUNNING, EXIT_SUPERSEDED
 from fw_context_mcp.indexer.db._locking import (
     index_run_lock,
 )
-from fw_context_mcp.exit_codes import EXIT_ALREADY_RUNNING, EXIT_SUPERSEDED
 
 
 class TestIndexRunLock:
@@ -143,33 +143,33 @@ class TestIndexRunLock:
 
 
 class TestReindexerIdentity:
-    """Only a background run may be killed to make way for a foreground one."""
+    """Only an fw-context INDEX run may ever be signalled, and its kind decides how."""
 
     @staticmethod
-    def _pid_check():
-        from fw_context_mcp.cli._index import _pid_is_fw_context_reindexer
+    def _kind():
+        from fw_context_mcp.cli._index import _index_run_kind
 
-        return _pid_is_fw_context_reindexer
+        return _index_run_kind
 
     @staticmethod
     def _stand_in(*argv: str) -> subprocess.Popen:
         """Spawn a sleeping process that carries *argv*, and wait until it does.
 
-        _pid_is_fw_context_reindexer reads /proc/<pid>/cmdline and nothing
-        else, so a process carrying the same argv tests the same thing as a
-        real CLI run.  TWO races had to go:
+        _index_run_kind reads the argv of the process and nothing else, so a
+        process carrying the same argv tests the same thing as a real CLI
+        run.  TWO races had to go:
 
         - The stand-in used to be a real CLI invocation with a bad argument.
           argparse rejects it after 114 ms — measured — so the check read
-          /proc for a process that had already exited.
+          the argv of a process that had already exited.
         - Popen returns once fork succeeds, and execve finishes after that.
-          Until it does, /proc/<pid>/cmdline still holds the PARENT's argv,
-          which is pytest's and matches nothing.  The process is alive and
-          the answer is wrong, so waiting on poll() would not catch it.
+          Until it does, the argv is still the PARENT's, which is pytest's
+          and matches nothing.  The process is alive and the answer is wrong,
+          so waiting on poll() would not catch it.
 
         The child therefore prints a marker before it sleeps, and this
         function returns only once that marker arrives.  At that point the
-        exec is done and the argv on /proc is the child's own.
+        exec is done and the argv is the child's own.
         """
         proc = subprocess.Popen(  # noqa: S603 — fixed argv, no shell
             [sys.executable, "-c",
@@ -181,45 +181,191 @@ class TestReindexerIdentity:
         return proc
 
     def test_a_background_run_is_recognised(self, tmp_path: Path):
-        """The argv shape the daemon spawns."""
+        """The argv shape the daemon spawns.
+
+        Failed on macOS before: the argv came from /proc only, which macOS
+        does not have, so no run was ever recognised and none taken over.
+        """
         proc = self._stand_in("-m", "fw_context_mcp.cli", "index", "--background")
         try:
-            assert self._pid_check()(proc.pid) is True
+            assert self._kind()(proc.pid) == "background"
         finally:
             proc.kill()
             proc.wait(timeout=10)
 
-    def test_a_foreground_argv_is_not_killable(self, tmp_path: Path):
-        """Without --background the run belongs to a person.
-
-        index_run_lock excludes it instead; nothing may signal it.
-        """
+    def test_a_foreground_run_is_recognised_as_foreground(self, tmp_path: Path):
+        """Without --background the run belongs to a person — --takeover only."""
         proc = self._stand_in("-m", "fw_context_mcp.cli", "index")
         try:
-            assert self._pid_check()(proc.pid) is False
+            assert self._kind()(proc.pid) == "foreground"
         finally:
             proc.kill()
             proc.wait(timeout=10)
 
-    def test_another_fw_context_subcommand_is_not_killable(self, tmp_path: Path):
+    def test_another_fw_context_subcommand_is_not_an_index_run(self, tmp_path: Path):
         """Only an INDEX run is killable, not `status` or `init`."""
         proc = self._stand_in("-m", "fw_context_mcp.cli", "status", "--background")
         try:
-            assert self._pid_check()(proc.pid) is False
+            assert self._kind()(proc.pid) is None
         finally:
             proc.kill()
             proc.wait(timeout=10)
 
-    def test_a_foreground_run_is_not_killable(self):
-        """This test process runs `pytest`, not `fw-context index --background`."""
-        assert self._pid_check()(os.getpid()) is False
+    def test_this_test_process_is_not_an_index_run(self):
+        """This test process runs `pytest`, not `fw-context index`."""
+        assert self._kind()(os.getpid()) is None
 
-    def test_an_unrelated_process_is_not_killable(self):
+    def test_an_unrelated_process_is_not_an_index_run(self):
         """PID 1 must never be signalled."""
-        assert self._pid_check()(1) is False
+        assert self._kind()(1) is None
 
-    def test_a_dead_pid_is_not_killable(self):
-        assert self._pid_check()(2147483646) is False
+    def test_a_dead_pid_is_not_an_index_run(self):
+        assert self._kind()(2147483646) is None
+
+
+class TestTakeover:
+    """A manual run takes the index over; see _acquire_index."""
+
+    @staticmethod
+    def _holder(db_dir: Path, kind: str, *, ignore_sigterm: bool = False) -> subprocess.Popen:
+        """A real process that owns the index the way cmd_index does.
+
+        It enters _owned_index and then calls raise_if_superseded in a loop,
+        like the indexer before each translation unit.  Its argv carries the
+        shape of an index run of *kind*, so _index_run_kind recognises it.
+        With *ignore_sigterm* it plays a run stuck where the SIGTERM handler
+        never gets to run.
+        """
+        extra = ["-m", "fw_context_mcp.cli", "index"] + (["--background"] if kind == "background" else [])
+        script = textwrap.dedent(
+            f"""
+            import signal, sys, time
+            from pathlib import Path
+            from types import SimpleNamespace
+            sys.path.insert(0, {str(Path(__file__).resolve().parents[1] / "src")!r})
+            from fw_context_mcp.cli._index import _owned_index
+            from fw_context_mcp.exit_codes import EXIT_SUPERSEDED
+            from fw_context_mcp.indexer.runner import IndexSuperseded
+
+            args = SimpleNamespace(background={kind == "background"!r}, takeover=False)
+            try:
+                with _owned_index(Path({str(db_dir)!r}), args):
+                    if {ignore_sigterm!r}:
+                        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+                    print("HOLDING", flush=True)
+                    deadline = time.monotonic() + 30.0
+                    while time.monotonic() < deadline:
+                        time.sleep(0.05)
+            except IndexSuperseded:
+                sys.exit(EXIT_SUPERSEDED)
+            sys.exit(0)
+            """
+        )
+        proc = subprocess.Popen(  # noqa: S603 — fixed argv, no shell
+            [sys.executable, "-c", script, *extra],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
+        assert proc.stdout is not None
+        line = proc.stdout.readline()
+        assert line.strip() == "HOLDING", line + (proc.stderr.read() if proc.poll() is not None else "")
+        return proc
+
+    @staticmethod
+    def _args(*, background: bool = False, takeover: bool = False):
+        from types import SimpleNamespace
+
+        return SimpleNamespace(background=background, takeover=takeover)
+
+    @staticmethod
+    def _stop(proc: subprocess.Popen) -> None:
+        if proc.poll() is None:
+            proc.kill()
+        proc.wait(timeout=10)
+
+    def test_a_background_run_is_taken_over(self, tmp_path: Path):
+        """SIGTERM → the holder unwinds as superseded, and the lock is ours."""
+        from fw_context_mcp.cli._index import _owned_index
+
+        holder = self._holder(tmp_path, "background")
+        try:
+            with _owned_index(tmp_path, self._args()):
+                assert (tmp_path / "reindex.pause").read_text().strip() == str(os.getpid())
+            assert holder.wait(timeout=10) == EXIT_SUPERSEDED
+        finally:
+            self._stop(holder)
+
+    def test_a_stuck_background_run_is_killed(self, tmp_path: Path, monkeypatch):
+        """A holder that ignores SIGTERM gets SIGKILL after the grace period."""
+        import signal
+
+        from fw_context_mcp.cli import _index as index_mod
+
+        monkeypatch.setattr(index_mod, "_TAKEOVER_GRACE_S", 1.0)
+        holder = self._holder(tmp_path, "background", ignore_sigterm=True)
+        try:
+            with index_mod._owned_index(tmp_path, self._args()):
+                pass
+            assert holder.wait(timeout=10) == -signal.SIGKILL
+        finally:
+            self._stop(holder)
+
+    def test_a_foreground_run_is_refused_without_takeover(self, tmp_path: Path):
+        """It belongs to a person; the refusal names the way out."""
+        from fw_context_mcp.cli._index import _owned_index
+        from fw_context_mcp.indexer.db._locking import IndexRunLocked
+
+        holder = self._holder(tmp_path, "foreground")
+        try:
+            with pytest.raises(IndexRunLocked, match="--takeover"), _owned_index(tmp_path, self._args()):
+                pass
+            assert holder.poll() is None, "the holder must not have been signalled"
+            assert (tmp_path / "reindex.pause").read_text().strip() == str(holder.pid), (
+                "the refused run overwrote the holder's pause marker"
+            )
+        finally:
+            self._stop(holder)
+
+    def test_a_foreground_run_is_taken_over_with_takeover(self, tmp_path: Path):
+        from fw_context_mcp.cli._index import _owned_index
+
+        holder = self._holder(tmp_path, "foreground")
+        try:
+            with _owned_index(tmp_path, self._args(takeover=True)):
+                pass
+            assert holder.wait(timeout=10) == EXIT_SUPERSEDED
+        finally:
+            self._stop(holder)
+
+    def test_a_background_run_takes_over_nothing(self, tmp_path: Path):
+        """The daemon's run must never terminate a manual one, --takeover or not."""
+        from fw_context_mcp.cli._index import _owned_index
+        from fw_context_mcp.indexer.db._locking import IndexRunLocked
+
+        holder = self._holder(tmp_path, "foreground")
+        try:
+            with pytest.raises(IndexRunLocked), _owned_index(
+                tmp_path, self._args(background=True, takeover=True)
+            ):
+                pass
+            assert holder.poll() is None
+        finally:
+            self._stop(holder)
+
+    def test_the_owner_releases_everything(self, tmp_path: Path):
+        """Markers, the lock and the SIGTERM handler are all restored."""
+        import signal
+
+        from fw_context_mcp.cli._index import _owned_index
+        from fw_context_mcp.indexer.db._locking import index_run_lock
+
+        before = signal.getsignal(signal.SIGTERM)
+        with _owned_index(tmp_path, self._args()):
+            assert signal.getsignal(signal.SIGTERM) is not before
+        assert signal.getsignal(signal.SIGTERM) is before
+        assert not (tmp_path / "reindex.pause").exists()
+        assert not (tmp_path / "reindex.pid").exists()
+        with index_run_lock(tmp_path):
+            pass
 
 
 class TestExitCodes:
@@ -265,8 +411,8 @@ class TestARefusedRunLeavesNothingBehind:
 
     def test_the_pause_marker_is_not_left_behind_by_a_refused_run(self, tmp_path: Path):
         """B is refused, so it must leave no marker at all."""
-        from fw_context_mcp.cli._index import _claim_index, _kill_bg_reindex
-        from fw_context_mcp.indexer.db._locking import IndexRunLocked, index_run_lock
+        from fw_context_mcp.cli._index import _claim_index
+        from fw_context_mcp.indexer.db._locking import index_run_lock
 
         db_dir = tmp_path / "index"
         db_dir.mkdir()
@@ -277,14 +423,13 @@ class TestARefusedRunLeavesNothingBehind:
             import sys
             from pathlib import Path
             sys.path.insert(0, {str(Path(__file__).resolve().parents[1] / "src")!r})
-            from fw_context_mcp.cli._index import _claim_index, _kill_bg_reindex
-            from fw_context_mcp.indexer.db._locking import IndexRunLocked, index_run_lock
+            from types import SimpleNamespace
+            from fw_context_mcp.cli._index import _owned_index
+            from fw_context_mcp.indexer.db._locking import IndexRunLocked
 
             db_dir = Path({str(db_dir)!r})
-            _kill_bg_reindex(db_dir / "index.db")
             try:
-                with index_run_lock(db_dir):
-                    _claim_index(db_dir)
+                with _owned_index(db_dir, SimpleNamespace(background=False, takeover=False)):
                     print("ACQUIRED")
             except IndexRunLocked:
                 print("REFUSED")
@@ -308,9 +453,9 @@ class TestARefusedRunLeavesNothingBehind:
         Both sides are real processes.  A takes the lock, claims the index
         and then calls raise_if_superseded in a short loop, the same call the
         indexer makes before every translation unit.  B does what cmd_index
-        does: kill the background run, take the lock, claim on success.
+        does: _owned_index, which takes over only an fw-context index run —
+        A is not one, so B is refused.
         """
-        from fw_context_mcp.indexer.db._locking import index_run_lock
         from fw_context_mcp.exit_codes import EXIT_SUPERSEDED
 
         db_dir = tmp_path / "index"
@@ -353,15 +498,15 @@ class TestARefusedRunLeavesNothingBehind:
             import sys, time
             from pathlib import Path
             sys.path.insert(0, {str(Path(__file__).resolve().parents[1] / "src")!r})
-            from fw_context_mcp.cli._index import _claim_index, _kill_bg_reindex
-            from fw_context_mcp.indexer.db._locking import IndexRunLocked, index_run_lock
+            from types import SimpleNamespace
+            from fw_context_mcp.cli._index import _owned_index
+            from fw_context_mcp.indexer.db._locking import IndexRunLocked
             from fw_context_mcp.exit_codes import EXIT_ALREADY_RUNNING
 
             db_dir = Path({str(db_dir)!r})
-            _kill_bg_reindex(db_dir / "index.db")
             try:
-                with index_run_lock(db_dir):
-                    _claim_index(db_dir)
+                with _owned_index(db_dir, SimpleNamespace(background=False, takeover=False)):
+                    pass
                 code = 0
             except IndexRunLocked:
                 code = EXIT_ALREADY_RUNNING
@@ -429,17 +574,26 @@ class TestARefusedRunLeavesNothingBehind:
             other.kill()
             other.wait(timeout=10)
 
-    def test_the_kill_step_writes_nothing(self, tmp_path: Path):
-        """_kill_bg_reindex must leave the directory as it found it.
+    def test_a_refused_takeover_writes_nothing(self, tmp_path: Path):
+        """A run refused by _owned_index must leave the directory as it found it.
 
-        Its whole purpose is to be safe to call BEFORE the lock.
+        The holder here is this process through another open file
+        description, which is not an fw-context index run, so the refusal
+        comes before anything could be written.
         """
-        from fw_context_mcp.cli._index import _kill_bg_reindex
+        from types import SimpleNamespace
+
+        from fw_context_mcp.cli._index import _owned_index
+        from fw_context_mcp.indexer.db._locking import IndexRunLocked, index_run_lock
 
         db_dir = tmp_path / "index"
         db_dir.mkdir()
 
-        _kill_bg_reindex(db_dir / "index.db")
+        with index_run_lock(db_dir):
+            with pytest.raises(IndexRunLocked), _owned_index(
+                db_dir, SimpleNamespace(background=False, takeover=True)
+            ):
+                pass
 
-        assert not (db_dir / "reindex.pause").exists()
-        assert not (db_dir / "reindex.pid").exists()
+            assert not (db_dir / "reindex.pause").exists()
+            assert not (db_dir / "reindex.pid").exists()

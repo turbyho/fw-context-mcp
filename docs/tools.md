@@ -61,7 +61,24 @@ fw-context index --source-roots src lib drivers
 | `--image NAME` | all images | Restrict indexing to one sysbuild image |
 | `--exclude-image NAME` | none | Exclude a sysbuild image from indexing (repeatable) |
 | `--no-prune` | off | Keep the global-registry rows that nothing on disk confirms |
+| `--takeover` | off | Terminate another running foreground index run of this project instead of refusing |
 | `-v` | off | Verbose progress output |
+
+**When another index run is in progress:**
+
+Only one index run can own a project's index at a time. A manual run takes
+the index before it builds anything, so a refused run never cleans the build
+directory or rewrites `compile_commands.json`. This holds for a single build
+and for `[[build.variants]]`.
+
+- **A background run** (the file-watcher daemon starts these): a manual run
+  always takes over. It sends `SIGTERM`, and the background run stops with
+  exit code 75 (superseded); the daemon retries it later. A run that does
+  not stop within 10 seconds gets `SIGKILL`.
+- **Another foreground run**: the new run is refused with exit code 69, and
+  the message names the PID of that run. Add `--takeover` to terminate it
+  the same way and index anyway.
+- **A `--background` run** never takes over from another run.
 
 **The global registry:**
 
