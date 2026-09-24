@@ -356,7 +356,27 @@ class CacheClient:
         """True when ``stats()`` got 401/403: the server is up and refused the token.
 
         ``stats()`` returns None for that and for an unreachable server alike.
+        With ``rate_limited`` and ``invalid_response`` below, this flag tells
+        why.  ``stats()`` sets the three flags back to False when it starts,
+        thus a flag from an earlier call cannot explain a later result.
         """
+        self.rate_limited = False
+        """True when a request still got 429 after the last retry.
+
+        The server runs.  Its middleware gives 429 only to a request whose
+        token failed, after too many failed attempts from one address, thus
+        the token is the usual cause.  Without this flag a caller could only
+        report "not reachable", which sends the user to look for a network
+        fault.
+        """
+        self.invalid_response = False
+        """True when the server answered 200 with a body that is not a JSON object.
+
+        A proxy or a captive portal in front of the server does that: it
+        answers 200 with an HTML page, and ``resp.json()`` raises
+        ``JSONDecodeError`` for it.  See :meth:`_json_object`.
+        """
+        self._invalid_response_logged = False
 
     def _ensure_capabilities(self) -> None:
         """Discover token permissions via ``stats()``, once per client.
@@ -496,6 +516,8 @@ class CacheClient:
                     continue
                 logger.warning("Cache server %s returned %d after %d retries",
                                label, resp.status_code, _MAX_RETRIES)
+                if resp.status_code == 429:
+                    self.rate_limited = True
             except (httpx.HTTPError, OSError) as e:
                 # Connection errors (DNS, timeout, connection refused) —
                 # these are transient and worth retrying.
@@ -507,6 +529,37 @@ class CacheClient:
                     continue
                 logger.warning("Cache server unreachable on %s: %s", label, e)
         return None
+
+    def _json_object(self, resp: httpx.Response, label: str) -> dict[str, Any] | None:
+        """Return the body of *resp* as a dict, or None when it is not a JSON object.
+
+        WHY: a proxy in front of the server can answer 200 with an HTML
+        page.  ``resp.json()`` raises ``JSONDecodeError`` (a ``ValueError``)
+        for it, and before this function it went into callers that catch
+        none, thus ``cache push`` stopped with a traceback.  A JSON value that is not an object (a
+        list, a string) has no keys to read, thus it is invalid too.  The
+        warning names the content type, because that usually tells the
+        user which device answered.
+
+        One WARNING for each client, and DEBUG after it: the indexer asks
+        once for each symbol, and a proxy that answers each request with
+        HTML would otherwise write thousands of the same line.
+        """
+        try:
+            data = resp.json()
+        except ValueError:
+            data = None
+        if not isinstance(data, dict):
+            self.invalid_response = True
+            level = logging.DEBUG if self._invalid_response_logged else logging.WARNING
+            self._invalid_response_logged = True
+            logger.log(
+                level,
+                "Cache server %s answered 200 with a body that is not a JSON object (content-type %r)",
+                label, resp.headers.get("content-type", ""),
+            )
+            return None
+        return data
 
     def batch_get(self, hashes: list[str]) -> dict[str, dict | None]:
         """Batch lookup on the remote server.
@@ -547,7 +600,9 @@ class CacheClient:
         )
         if resp is None:
             return {h: None for h in hashes}
-        data = resp.json()
+        data = self._json_object(resp, "batch_get")
+        if data is None:
+            return {h: None for h in hashes}
         return data.get("results", {})
 
     def batch_put(self, entries: list[dict]) -> int:
@@ -605,7 +660,11 @@ class CacheClient:
         if resp is None:
             self.put_failures += 1
             return 0
-        data = resp.json()
+        data = self._json_object(resp, "batch_put")
+        if data is None:
+            # The server can have stored the chunk, but nothing says so.
+            self.put_failures += 1
+            return 0
         if data.get("truncated"):
             # Cannot happen while batch_size stays within _SERVER_MAX_BATCH;
             # kept so that a server with a lower cap is not a silent loss.
@@ -635,6 +694,10 @@ class CacheClient:
         def _on_auth():
             self.auth_rejected = True
 
+        # A flag from an earlier call must not explain the result of this one.
+        self.auth_rejected = False
+        self.rate_limited = False
+        self.invalid_response = False
         resp = self._retry_http_call(
             lambda: self._get_session().get("/cache/stats"),
             label="stats",
@@ -642,7 +705,9 @@ class CacheClient:
         )
         if resp is None:
             return None
-        data = resp.json()
+        data = self._json_object(resp, "stats")
+        if data is None:
+            return None
         self._can_write = data.get("can_write", False)
         self._can_overwrite = data.get("can_overwrite", False)
         return data
@@ -687,5 +752,7 @@ class CacheClient:
         )
         if resp is None:
             return 0
-        data = resp.json()
+        data = self._json_object(resp, "clear")
+        if data is None:
+            return 0
         return data.get("deleted", 0)

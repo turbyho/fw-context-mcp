@@ -41,6 +41,7 @@ class _FakeClient:
     caps: dict | None = {"can_write": True, "can_overwrite": False}
     refuse_after: int | None = None  # chunks accepted before a 403
     reject_token = False  # with caps=None: stats() got 401/403, not a network error
+    stats_failure = ""  # with caps=None: "429" or "html" instead of a network error
 
     def __init__(self, url: str, token: str, force: bool = False, batch_size: int = 100) -> None:
         from fw_context_mcp.cache_client import _SERVER_MAX_BATCH
@@ -48,6 +49,8 @@ class _FakeClient:
         self.force = force
         self.put_failures = 0
         self.auth_rejected = _FakeClient.caps is None and _FakeClient.reject_token
+        self.rate_limited = _FakeClient.caps is None and _FakeClient.stats_failure == "429"
+        self.invalid_response = _FakeClient.caps is None and _FakeClient.stats_failure == "html"
         self.calls = 0
         self.put_sizes: list[int] = []
         # The same limit as the real client: the CLI must read it from here.
@@ -99,6 +102,7 @@ def push(monkeypatch, tmp_path: Path):
     _FakeClient.caps = {"can_write": True, "can_overwrite": False}
     _FakeClient.refuse_after = None
     _FakeClient.reject_token = False
+    _FakeClient.stats_failure = ""
 
     monkeypatch.setattr(cache_client_mod, "CacheClient", _FakeClient)
     monkeypatch.setattr(utils_mod, "resolve_project_root", lambda arg: tmp_path)
@@ -321,3 +325,170 @@ def test_stats_does_not_blame_the_token_for_an_unreachable_server(monkeypatch):
     cc = _client(unreachable)
     assert cc.stats() is None
     assert cc.auth_rejected is False
+
+
+@pytest.mark.parametrize(
+    ("failure", "expected"),
+    [("429", "limits the failed attempts (429)"), ("html", "body that is not a JSON object")],
+)
+def test_a_running_server_is_not_reported_as_unreachable(push, capsys, failure, expected):
+    """429 and an HTML page both come from a server that runs."""
+    _FakeClient.caps = None
+    _FakeClient.stats_failure = failure
+
+    assert push(["a"]) == 1
+    err = capsys.readouterr().err
+    assert expected in err
+    assert "not reachable" not in err
+
+
+def test_stats_reports_a_rate_limit(monkeypatch):
+    """The middleware of the server answers 429 to too many failed attempts."""
+    import httpx
+
+    import fw_context_mcp.cache_client as cache_client_mod
+
+    monkeypatch.setattr(cache_client_mod.time, "sleep", lambda s: None)
+    cc = _client(lambda request: httpx.Response(429, json={"detail": "Too many auth attempts"}))
+
+    assert cc.stats() is None
+    assert cc.rate_limited is True
+    assert cc.auth_rejected is False
+
+
+_HTML = "<html><body>Sign in to the proxy</body></html>"
+
+
+def test_stats_survives_an_html_answer():
+    """A proxy answers 200 with HTML.  resp.json() raised JSONDecodeError here."""
+    import httpx
+
+    cc = _client(
+        lambda request: httpx.Response(200, text=_HTML, headers={"content-type": "text/html"})
+    )
+
+    assert cc.stats() is None
+    assert cc.invalid_response is True
+
+
+def test_a_json_answer_that_is_not_an_object_is_invalid():
+    import httpx
+
+    cc = _client(lambda request: httpx.Response(200, json=["not", "an", "object"]))
+
+    assert cc.stats() is None
+    assert cc.invalid_response is True
+
+
+def test_a_write_with_an_html_answer_counts_as_a_failure():
+    """Nothing says that the server stored the chunk, thus it is not a success."""
+    import httpx
+
+    cc = _client(_stats_or(lambda request: httpx.Response(200, text=_HTML)))
+
+    assert cc.batch_put(_entries(2)) == 0
+    assert cc.put_failures == 1
+
+
+def test_a_read_with_an_html_answer_gives_no_results():
+    import httpx
+
+    cc = _client(lambda request: httpx.Response(200, text=_HTML))
+
+    assert cc.batch_get(["a", "b"]) == {"a": None, "b": None}
+
+
+@pytest.mark.parametrize(
+    ("failure", "expected"),
+    [("429", "limits the failed attempts (429)"), ("html", "not a JSON object"), ("", "is not reachable")],
+)
+def test_cache_stats_remote_names_the_cause(push, capsys, failure, expected):
+    """``cache stats --remote`` said "Server unreachable" for each of the causes."""
+    push([])  # installs the fakes and the config
+    _FakeClient.caps = None
+    _FakeClient.stats_failure = failure
+    from fw_context_mcp.cli._cache import cmd_cache_stats
+
+    assert cmd_cache_stats(SimpleNamespace(remote=True, project="x")) == 0
+    assert expected in capsys.readouterr().out
+
+
+def test_stats_forgets_the_cause_of_an_earlier_call(monkeypatch):
+    """A long-lived client must not explain a later failure with an old flag."""
+    import httpx
+
+    import fw_context_mcp.cache_client as cache_client_mod
+
+    monkeypatch.setattr(cache_client_mod.time, "sleep", lambda s: None)
+    answers = iter([httpx.Response(429)] * 3)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        try:
+            return next(answers)
+        except StopIteration:
+            raise httpx.ConnectError("down", request=request) from None
+
+    cc = _client(handler)
+    assert cc.stats() is None and cc.rate_limited is True
+    assert cc.stats() is None
+    assert cc.rate_limited is False, "the second failure is a network fault, not 429"
+
+
+def test_a_proxy_that_answers_html_gives_one_warning(caplog):
+    """The indexer asks once for each symbol: thousands of the same line."""
+    import logging
+
+    import httpx
+
+    cc = _client(lambda request: httpx.Response(200, text=_HTML))
+    with caplog.at_level(logging.DEBUG, logger="fw_context_mcp.cache_client"):
+        for _ in range(5):
+            cc.batch_get(["a"])
+
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING and "JSON object" in r.message]
+    assert len(warnings) == 1
+
+
+def _remote_init(monkeypatch, tmp_path: Path, stats_answer) -> int:
+    """Run ``cache remote init`` against a mock server, with typed answers."""
+    import httpx
+
+    import fw_context_mcp.config.settings as settings_mod
+    from fw_context_mcp.cli import _cache as cache_mod
+
+    config = tmp_path / "config.toml"
+    config.write_text("", encoding="utf-8")
+    monkeypatch.setattr(settings_mod, "_ensure_global_config", lambda: config)
+    answers = iter(["https://cache.example", "token"])
+    monkeypatch.setattr("builtins.input", lambda prompt="": next(answers))
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/health":
+            return httpx.Response(200, json={"status": "ok"})
+        return stats_answer
+
+    real_client = httpx.Client
+    monkeypatch.setattr(
+        cache_mod.httpx, "Client",
+        lambda **kw: real_client(transport=httpx.MockTransport(handler), **kw),
+    )
+    return cache_mod.cmd_cache_remote_init(SimpleNamespace())
+
+
+def test_remote_init_survives_an_html_answer(monkeypatch, tmp_path: Path, capsys):
+    """``auth_resp.json()`` raised JSONDecodeError past every handler."""
+    import httpx
+
+    answer = httpx.Response(200, text=_HTML, headers={"content-type": "text/html"})
+
+    assert _remote_init(monkeypatch, tmp_path, answer) == 1
+    err = capsys.readouterr().err
+    assert "not a JSON object" in err
+    assert "text/html" in err
+
+
+def test_remote_init_names_the_token_for_a_429(monkeypatch, tmp_path: Path, capsys):
+    import httpx
+
+    assert _remote_init(monkeypatch, tmp_path, httpx.Response(429)) == 1
+    assert "check your token" in capsys.readouterr().err

@@ -18,8 +18,38 @@ import os
 import re
 import sys
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import httpx
+
+if TYPE_CHECKING:
+    from ..cache_client import CacheClient
+
+
+def _stats_failure(cc: CacheClient) -> str:
+    """Say why ``cc.stats()`` gave None, as the end of a sentence about the server.
+
+    ``stats()`` gives None for four causes, and each needs a different
+    action from the user.  "not reachable" for all four sent the user to
+    look for a network fault when the server ran.
+
+    The server gives 429 only to a request whose token failed (its
+    middleware limits failed authentication attempts), thus the message for
+    429 names the token first.
+    """
+    if cc.auth_rejected:
+        return "rejected the token (401/403) — check [cache_server] token"
+    if cc.rate_limited:
+        return (
+            "rejected the token and limits the failed attempts (429) — "
+            "check [cache_server] token, then wait and try again"
+        )
+    if cc.invalid_response:
+        return (
+            "answered with a body that is not a JSON object — a proxy can be "
+            "in front of the server, see the log for the content type"
+        )
+    return "is not reachable — check the URL and the network"
 
 
 def cmd_cache_stats(args: argparse.Namespace) -> int:
@@ -53,9 +83,11 @@ def cmd_cache_stats(args: argparse.Namespace) -> int:
         cc = CacheClient(url=cs.url, token=cs.token)
         try:
             remote_stats = cc.stats()
-            if not remote_stats:
+            if remote_stats is None:
+                # Exit 0 as before: this command shows a status, and a
+                # server that does not answer is one.  The text must be true.
                 print(f"Remote cache (Tier 2): {cs.url}")
-                print("  Server unreachable — check connectivity")
+                print(f"  The server {_stats_failure(cc)}")
                 return 0
 
             print(f"Remote cache (Tier 2): {cs.url}")
@@ -169,13 +201,7 @@ def cmd_cache_push(args: argparse.Namespace) -> int:
         try:
             caps = cc.stats()
             if caps is None:
-                if cc.auth_rejected:
-                    print(
-                        f"error: remote cache {cs.url} rejected the token (401/403) — check [cache_server] token",
-                        file=sys.stderr,
-                    )
-                else:
-                    print(f"error: remote cache {cs.url} is not reachable", file=sys.stderr)
+                print(f"error: remote cache {cs.url} {_stats_failure(cc)}", file=sys.stderr)
                 return 1
             if not caps.get("can_write"):
                 print("error: the cache token is read-only (can_write=false)", file=sys.stderr)
@@ -293,11 +319,33 @@ def cmd_cache_remote_init(args: argparse.Namespace) -> int:
             if auth_resp.status_code == 403:
                 print("error: access denied (403) — token may lack permissions", file=sys.stderr)
                 return 1
+            if auth_resp.status_code == 429:
+                # The middleware gives 429 only after failed authentication
+                # attempts from this address, thus the token is the cause.
+                print(
+                    "error: the server limits the failed authentication attempts (429) — "
+                    "check your token, then wait and try again",
+                    file=sys.stderr,
+                )
+                return 1
             if auth_resp.status_code != 200:
                 print(f"error: server returned {auth_resp.status_code}", file=sys.stderr)
                 return 1
 
-            stats = auth_resp.json()
+            # A proxy can answer 200 with an HTML page, and json() then
+            # raises a ValueError that the handlers below do not catch.
+            try:
+                stats = auth_resp.json()
+            except ValueError:
+                stats = None
+            if not isinstance(stats, dict):
+                content_type = auth_resp.headers.get("content-type", "")
+                print(
+                    f"error: {url} answered with a body that is not a JSON object "
+                    f"(content-type {content_type!r}) — a proxy can be in front of the server",
+                    file=sys.stderr,
+                )
+                return 1
             total = stats.get("total_entries", 0)
             can_read = stats.get("can_read", False)
             can_write = stats.get("can_write", False)
