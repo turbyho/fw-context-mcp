@@ -119,7 +119,7 @@ class MbedOSBuildSystem:
         else:
             mbed_prefix = ["mbed"]
 
-        cc_path = cc_output_path(project_root)
+        cc_path = cc_output_path(project_root, cfg)
 
         cmd: list[str] = [
             "bear",

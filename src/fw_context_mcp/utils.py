@@ -22,8 +22,10 @@ from __future__ import annotations
 import hashlib
 import logging
 import os
+import re
 import shlex
 import shutil
+import socket
 import sqlite3
 import subprocess
 import threading
@@ -43,6 +45,7 @@ log = logging.getLogger(__name__)
 __all__ = [
     "AUTOBUILD_REL",
     "CC_OUTPUT_REL",
+    "CC_STAGING_GLOB",
     "CPP_EXTENSIONS",
     "CPP_HEADER_EXTENSIONS",
     "CPP_SOURCE_EXTENSIONS",
@@ -58,6 +61,7 @@ __all__ = [
     "build_dir_patterns_with_fw_context",
     "build_env",
     "cc_output_path",
+    "cc_staging_path",
     "compute_content_hash",
     "compute_source_hash",
     "fmt_count",
@@ -67,10 +71,13 @@ __all__ = [
     "is_db_exception",
     "is_fatal",
     "macro_signature",
+    "owner_is_dead",
+    "owner_token",
     "read_file_lines",
     "resolve_build_dir",
     "resolve_project_root",
     "resolve_real_binary",
+    "staging_owner",
     "truncate_path_middle",
 ]
 
@@ -121,6 +128,11 @@ FW_CONTEXT_REL: Path = Path(".fw-context")
 # compile_commands.json.  Kept out of the project root so the build artifact
 # does not pollute the repository.
 CC_OUTPUT_REL: Path = FW_CONTEXT_REL / "build" / "compile_commands.json"
+
+# Glob that finds every staging file of :func:`cc_staging_path`.  A build that
+# a signal stopped leaves its staging file behind, thus the next build in the
+# same directory removes what it finds.
+CC_STAGING_GLOB: str = ".compile_commands.*.json"
 
 # Output directory of a build that fw-context starts on its own, one
 # subdirectory per variant.  It sits apart from the directory of the build
@@ -634,16 +646,124 @@ def abs_path(root: Path, path: str) -> str:
     return str(root / p)
 
 
-def cc_output_path(project_root: Path) -> Path:
-    """Return the default compile_commands.json output path for a project.
+def cc_output_path(project_root: Path, cfg: BuildConfig | None = None) -> Path:
+    """Return the compile_commands.json output path for a project.
 
     Ensures the parent directory exists.  Every builder writes the generated
     compilation database here so fw-context owns one stable, gitignored
     location regardless of where the native build system produces its file.
+
+    A builder that runs under ``generate_compile_commands`` gets a *cfg* whose
+    ``cc_output`` names the staging file of that run, and writes there
+    instead.  One atomic rename at the end of the build gives the canonical
+    file its new content.  WHY: a reader of the canonical file must never get
+    the half-written output of a build that still runs — measured on
+    2026-09-23, when a background run read a file that stopped in mid-line.
+
+    A caller that wants the canonical path passes no *cfg*.
     """
-    target = project_root / CC_OUTPUT_REL
+    if cfg is not None and cfg.cc_output is not None:
+        target = cfg.cc_output
+    else:
+        target = project_root / CC_OUTPUT_REL
     target.parent.mkdir(parents=True, exist_ok=True)
     return target
+
+
+def _owner_tag() -> str:
+    """Return the tag of the PID namespace that this process runs in.
+
+    A PID has a meaning only in its own PID namespace.  A container and its
+    host can share one project directory, and each has its own index lock
+    (the lock is in the home directory), thus the two can build at the same
+    time.  A PID from the container names no process on the host, and a host
+    that deleted each file of a "dead" PID would delete a live file.
+
+    The tag is the host name plus the inode of ``/proc/self/ns/pid``.  The
+    host name alone is not sufficient: ``--uts=host`` gives a container the
+    host name of the host.  The inode alone is not sufficient: the first PID
+    namespace of each Linux machine has the same inode, and two machines can
+    share a project on a network file system.  Where ``/proc`` is not
+    available (macOS), the tag is the host name.
+
+    Only ``[A-Za-z0-9.-]`` stays in the tag, because the tag goes into a
+    file name.
+    """
+    host = re.sub(r"[^A-Za-z0-9.-]", "_", socket.gethostname()) or "_"
+    try:
+        link = os.readlink("/proc/self/ns/pid")
+    except OSError:
+        return host
+    inode = re.sub(r"\D", "", link)
+    return f"{host}-{inode}" if inode else host
+
+
+def owner_token() -> str:
+    """Return ``<pid>@<tag>``, the owner of a file that this process writes.
+
+    See :func:`_owner_tag` for the tag.  :func:`owner_is_dead` reads the
+    token back.
+    """
+    return f"{os.getpid()}@{_owner_tag()}"
+
+
+def owner_is_dead(token: str) -> bool:
+    """Return True when *token* names a process of this PID namespace that stopped.
+
+    Only then is the file of that owner garbage.  A token from a different
+    PID namespace gives False: this process cannot see that PID, thus it
+    cannot know if the owner still runs.  A token that does not parse gives
+    False too, because the file then has an unknown source.
+
+    A process that runs and belongs to a different user (EPERM) is alive.
+    A PID that is too large for ``pid_t`` (OverflowError) names no process,
+    but it did not come from this code, thus the file stays.
+    """
+    pid_text, sep, tag = token.partition("@")
+    # isascii first: isdigit() also accepts digits such as "²", which int()
+    # refuses with a ValueError.
+    if not sep or not (pid_text.isascii() and pid_text.isdigit()) or tag != _owner_tag():
+        return False
+    try:
+        os.kill(int(pid_text), 0)
+    except ProcessLookupError:
+        return True
+    except (OSError, OverflowError):
+        return False
+    return False
+
+
+def cc_staging_path(project_root: Path) -> Path:
+    """Return the file that one build writes before the canonical file gets it.
+
+    The name holds the owner token of this process (see :func:`owner_token`),
+    thus two runs cannot write one staging file, also when they run in two
+    PID namespaces.  The leading dot keeps the file out of the two scans that
+    look for ``compile_commands.*``: the variant discovery in ``cli/_index``
+    and the orphan cleanup in ``indexer/_embedding``.
+
+    The staging file sits in the directory of the canonical file, thus
+    ``os.replace`` between the two is atomic.
+    """
+    canonical = project_root / CC_OUTPUT_REL
+    staging = canonical.with_name(f".{canonical.stem}.{owner_token()}{canonical.suffix}")
+    staging.parent.mkdir(parents=True, exist_ok=True)
+    return staging
+
+
+def staging_owner(path: Path) -> str | None:
+    """Return the owner token in the name of a staging file, or None.
+
+    The inverse of the name that :func:`cc_staging_path` makes.  The token
+    can hold dots (a host name), thus the name is cut at the fixed prefix and
+    suffix, and not split at each dot.
+    """
+    prefix = f".{CC_OUTPUT_REL.stem}."
+    suffix = CC_OUTPUT_REL.suffix
+    name = path.name
+    if not name.startswith(prefix) or not name.endswith(suffix):
+        return None
+    return name.removeprefix(prefix).removesuffix(suffix) or None
 
 
 def resolve_build_dir(project_root: Path, cfg, default: str) -> Path:

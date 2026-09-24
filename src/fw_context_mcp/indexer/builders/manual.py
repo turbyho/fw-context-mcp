@@ -185,7 +185,7 @@ class ManualBuildSystem:
                 }
             )
 
-        cc_path = cc_output_path(root)
+        cc_path = cc_output_path(root, cfg)
         cc_path.write_text(json.dumps(entries, indent=2, ensure_ascii=False), encoding="utf-8")
         log.info(
             "Generated compile_commands.json + .d files (%d entries, compiler=%s)",

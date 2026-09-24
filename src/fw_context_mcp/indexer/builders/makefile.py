@@ -128,7 +128,7 @@ class MakefileBuildSystem:
 
         target = cfg.make_target or "all"
 
-        cc_path = cc_output_path(root)
+        cc_path = cc_output_path(root, cfg)
 
         cmd: list[str] = compiledb_prefix
 

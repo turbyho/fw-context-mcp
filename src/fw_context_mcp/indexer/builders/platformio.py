@@ -132,7 +132,7 @@ class PlatformIOBuildSystem:
         if not native_cc.exists():
             raise RuntimeError("compile_commands.json was not generated — pio run may have failed silently")
 
-        cc_path = cc_output_path(project_root)
+        cc_path = cc_output_path(project_root, cfg)
         shutil.copy2(native_cc, cc_path)
         log.info("Copied %s → %s", native_cc, cc_path)
 

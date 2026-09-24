@@ -100,7 +100,7 @@ class ArduinoBuildSystem:
         # Copy to the gitignored fw-context build dir for consistency BEFORE
         # the real compile, which may overwrite build/compile_commands.json
         # (or not — but without --only-compilation-database it typically won't).
-        target_cc = cc_output_path(project_root)
+        target_cc = cc_output_path(project_root, cfg)
         shutil.copy2(cc_in_build, target_cc)
         log.info("Copied %s → %s", cc_in_build, target_cc)
 

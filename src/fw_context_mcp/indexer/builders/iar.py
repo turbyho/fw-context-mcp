@@ -100,7 +100,7 @@ class IARBuildSystem:
         if cfg.toolchain_prefix:
             cmd += ["--toolchain-prefix", cfg.toolchain_prefix]
 
-        cc_path = cc_output_path(root)
+        cc_path = cc_output_path(root, cfg)
         cmd += ["-o", str(cc_path)]
 
         log.info("iar convert: %s", " ".join(cmd))

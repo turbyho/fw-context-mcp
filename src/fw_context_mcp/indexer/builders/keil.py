@@ -101,7 +101,7 @@ class KeilBuildSystem:
         if cfg.toolchain_prefix:
             cmd += ["--toolchain-prefix", cfg.toolchain_prefix]
 
-        cc_path = cc_output_path(root)
+        cc_path = cc_output_path(root, cfg)
         cmd += ["-o", str(cc_path)]
 
         log.info("keil convert: %s", " ".join(cmd))

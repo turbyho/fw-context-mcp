@@ -203,7 +203,7 @@ class ESPIDFBuildSystem:
             )
 
         # Copy to the gitignored fw-context build dir for a stable location
-        target_cc = cc_output_path(project_root)
+        target_cc = cc_output_path(project_root, cfg)
         shutil.copy2(cc_in_build, target_cc)
         log.info("Copied %s → %s", cc_in_build, target_cc)
 

@@ -15,12 +15,21 @@ bare Makefile (via compiledb), and bare/manual mode.
 from __future__ import annotations
 
 import logging
+import os
 import shutil
 import subprocess
-from dataclasses import dataclass, field, fields
+from dataclasses import dataclass, field, fields, replace
 from pathlib import Path
 
-from fw_context_mcp.utils import build_env, cc_output_path, ignore_autobuild_dir
+from fw_context_mcp.utils import (
+    CC_STAGING_GLOB,
+    build_env,
+    cc_output_path,
+    cc_staging_path,
+    ignore_autobuild_dir,
+    owner_is_dead,
+    staging_owner,
+)
 
 # Import builders package so the registry is populated with all registered
 # build system backends before ``detect_build_system()`` is called.
@@ -137,6 +146,16 @@ class BuildConfig:
     # first build with no shared object cache.  Measured at 15-30 s there,
     # which is nothing against an index run of over an hour.
     isolated_build_dir: str | None = None
+
+    # ── Staging file for the compilation database ──
+    # generate_compile_commands sets this, and no user configuration does.
+    # The backend then writes the compilation database to this file instead
+    # of the canonical compile_commands.json, and the caller renames it when
+    # the build ends.  A reader of the canonical file thus never gets a
+    # database that a build still writes.
+    #
+    # None means the canonical path — see utils.cc_output_path.
+    cc_output: Path | None = None
 
     # ── Toolchain (shared by Keil, IAR, Makefile) ──
     toolchain_path: str | None = None  # path to toolchain bin directory
@@ -440,11 +459,46 @@ def _run_pre_build(cfg: BuildConfig, cwd: Path) -> None:
         raise RuntimeError(f"Pre-build command failed with exit code {result.returncode}")
 
 
+def _clear_dead_staging_files(staging: Path) -> None:
+    """Remove the staging files that stopped builds left in the directory.
+
+    A build that a signal stops leaves its staging file behind, and that file
+    holds a whole compilation database — megabytes on a large project.  The
+    name carries the owner token of the process that writes it (see
+    ``utils.owner_token``), thus a file whose process no longer runs is
+    garbage.  A file of a process that still runs stays: that build writes
+    it.  A file from a different PID namespace stays too, because this
+    process cannot see if its owner runs.
+
+    Best-effort.  A file that cannot be deleted costs disk space only, thus
+    no failure here may stop the build.  The unlink is thus outside the
+    ownership check, with its own handler: an exception in an ``except``
+    clause does not go to the next clause of the same ``try``.
+    """
+    for candidate in staging.parent.glob(CC_STAGING_GLOB):
+        if candidate == staging:
+            continue
+        token = staging_owner(candidate)
+        if token is None or not owner_is_dead(token):
+            continue
+        try:
+            candidate.unlink(missing_ok=True)
+        except OSError as exc:
+            log.debug("Cannot remove the dead staging file %s: %s", candidate, exc)
+
+
 def generate_compile_commands(
     project_root: Path,
     cfg: BuildConfig,
 ) -> Path:
     """Generate a fresh compile_commands.json and return its path.
+
+    The build writes a staging file, and one atomic rename then gives the
+    canonical ``compile_commands.json`` the new content.  WHY: on 2026-09-23
+    two builds of one project wrote that one file at the same time and each
+    destroyed the output of the other.  The index lock in ``cli/_index`` keeps
+    two builds apart, and this rename keeps a reader from getting a database
+    that a build still writes.
 
     WHY four paths: different build systems produce compile_commands.json
     differently.  Some require a full build (PlatformIO), others can convert
@@ -462,6 +516,44 @@ def generate_compile_commands(
     Raises ``RuntimeError`` when detection or generation fails.
     """
     root = project_root.resolve()
+    staging = cc_staging_path(root)
+    _clear_dead_staging_files(staging)
+    # A file with the name of this run can already exist: a run that SIGKILL
+    # stopped left it, and this run got the same PID again.  A backend that
+    # reports success and writes nothing would then pass the exists() check
+    # below, and the rename would publish that partial file.
+    staging.unlink(missing_ok=True)
+    try:
+        produced = _generate_into(root, replace(cfg, cc_output=staging))
+        if produced != staging:
+            # A backend that names its own output keeps it.  No backend does
+            # this now — each one writes through cc_output_path(root, cfg).
+            # The Zephyr multi-image build writes one file for each image, but
+            # cli/_index calls build_multi directly, not through this function.
+            return produced
+        if not staging.exists():
+            # A backend that returns its output path without writing the file.
+            # os.replace would raise FileNotFoundError here, and no caller
+            # catches that — every one of them catches RuntimeError.
+            raise RuntimeError(
+                f"The build reported success and wrote no compilation database to {staging}"
+            )
+        final = cc_output_path(root)
+        os.replace(staging, final)
+        return final
+    finally:
+        # A failed build leaves a partial staging file.  It must not stay —
+        # the file is large and no later run can use it.
+        staging.unlink(missing_ok=True)
+
+
+def _generate_into(root: Path, cfg: BuildConfig) -> Path:
+    """Run the generation path that *cfg* selects, and return what it wrote.
+
+    *root* must be resolved.  ``cfg.cc_output`` names the file that each
+    backend writes through :func:`cc_output_path` — see
+    :func:`generate_compile_commands`, the only caller.
+    """
 
     # Full command override — highest priority
     if cfg.command:
@@ -481,7 +573,7 @@ def generate_compile_commands(
         native_cc = root / "compile_commands.json"
         if not native_cc.exists():
             raise RuntimeError("compile_commands.json was not generated")
-        cc_path = cc_output_path(root)
+        cc_path = cc_output_path(root, cfg)
         shutil.copy2(native_cc, cc_path)
         return cc_path
 

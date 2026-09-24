@@ -23,6 +23,19 @@ does the rest.
 The generated `compile_commands.json` is written to
 `.fw-context/build/compile_commands.json` — a gitignored subdirectory of the
 project config dir, so the build artifact stays out of the repository root.
+
+A build does not write that file directly. It writes a staging file in the
+same directory, `.compile_commands.<pid>@<tag>.json`, and one rename then
+gives `compile_commands.json` the new content. Thus a build that fails keeps
+the file that the last good build wrote. A reader never gets a database that
+a build still writes.
+
+Only a build that a signal stops leaves a staging file. The next build in
+that directory deletes it when its process no longer runs. The `<tag>` is
+the host name and the PID namespace of the build. A PID of a container
+names no process on the host, thus a build deletes only the files of its
+own PID namespace.
+
 `fw-context init` writes the rules for it into `.gitignore` automatically:
 
 ```gitignore
