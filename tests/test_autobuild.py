@@ -379,3 +379,79 @@ class TestFailureMarkerFormat:
                                               encoding="utf-8")
 
         assert blocked(tmp_path, ["src/a.c"]) is False
+
+
+class TestATakenOverMultiRunIsNoFailedBuild:
+    """``cmd_index`` wrote the backoff marker for every non-zero multi exit.
+
+    A multi-variant run that another run takes over exits EXIT_SUPERSEDED.
+    The daemon retries such a run, but the marker blocked the automatic build
+    for 30 minutes, thus the retry indexed without the build.  The files that
+    only a build can cover then stayed out of the index.
+    """
+
+    @staticmethod
+    def _run(monkeypatch, tmp_path: Path, multi_exit: int) -> list[list[str]]:
+        """Run ``cmd_index`` with a multi run that ends in *multi_exit*.
+
+        Returns the lists that ``autobuild.record_failure`` got.
+        """
+        from dataclasses import dataclass, field
+        from types import SimpleNamespace
+
+        import fw_context_mcp.config as config_mod
+        import fw_context_mcp.indexer.build as build_mod
+        import fw_context_mcp.utils as utils_mod
+        from fw_context_mcp.cli import _index as index_mod
+
+        @dataclass
+        class _Index:
+            db_dir: Path
+            vendor_paths: list = field(default_factory=list)
+            project_paths: list = field(default_factory=list)
+
+        @dataclass
+        class _Build:
+            system: str | None = "zephyr"
+            variants: list = field(default_factory=lambda: ["one"])
+
+        @dataclass
+        class _Cfg:
+            index: _Index
+            build: _Build = field(default_factory=_Build)
+            cache_server: None = None
+
+        cfg = _Cfg(index=_Index(db_dir=tmp_path / "index"))
+        recorded: list[list[str]] = []
+
+        monkeypatch.setattr(utils_mod, "resolve_project_root", lambda arg: tmp_path)
+        monkeypatch.setattr(config_mod, "load", lambda project_root=None: cfg)
+        monkeypatch.setattr(config_mod, "derive_project_id", lambda root: "pid")
+        monkeypatch.setattr(build_mod, "detect_build_system", lambda root: "zephyr")
+        monkeypatch.setattr(
+            index_mod, "_plan_auto_build",
+            lambda *a, **kw: (["src/new.c"], cfg.build, "a new source file"),
+        )
+        monkeypatch.setattr(index_mod, "_build_run_kwargs", lambda *a, **kw: {})
+        monkeypatch.setattr(index_mod, "_run_multi", lambda *a, **kw: multi_exit)
+        monkeypatch.setattr(
+            index_mod.autobuild, "record_failure",
+            lambda db_dir, sources: recorded.append(list(sources)),
+        )
+
+        args = SimpleNamespace(
+            verbose=False, project=None, background=True, build=False,
+            no_clean=False, force=False, takeover=False,
+            vendor_paths=None, project_paths=None,
+        )
+        assert index_mod.cmd_index(args) == multi_exit
+        return recorded
+
+    def test_a_superseded_run_records_no_failure(self, monkeypatch, tmp_path: Path):
+        from fw_context_mcp.exit_codes import EXIT_SUPERSEDED
+
+        assert self._run(monkeypatch, tmp_path, EXIT_SUPERSEDED) == []
+
+    def test_a_failed_run_still_records_the_failure(self, monkeypatch, tmp_path: Path):
+        """The marker is still what stops a broken build on each daemon cycle."""
+        assert self._run(monkeypatch, tmp_path, 1) == [["src/new.c"]]

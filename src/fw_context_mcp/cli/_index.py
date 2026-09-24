@@ -1050,7 +1050,12 @@ def cmd_index(args: argparse.Namespace) -> int:
     if exit_code != 0:
         # The single path records a failed build itself, at the step that
         # failed — a failed validation is not a failed build.
-        if multi and auto_build_sources:
+        #
+        # A run that another run took over did not fail either.  The marker
+        # blocks the automatic build for 30 minutes, thus the daemon retry
+        # that EXIT_SUPERSEDED causes would then index without the build,
+        # and the files that only the build can cover would stay out.
+        if multi and auto_build_sources and exit_code != EXIT_SUPERSEDED:
             autobuild.record_failure(db_path.parent, auto_build_sources)
         return exit_code
 
