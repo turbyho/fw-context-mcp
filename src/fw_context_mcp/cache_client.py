@@ -51,21 +51,24 @@ client should not waste network calls on writes it knows will fail.
 
 from __future__ import annotations
 
+import json
 import logging
 import sqlite3
 import time
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
 import httpx
 
+from fw_context_mcp.cache_limits import MAX_BATCH_ENTRIES, MAX_BODY_BYTES
 from fw_context_mcp.utils import SAFE_EXCEPT, is_fatal
 
 logger = logging.getLogger(__name__)
 
 _LOCAL_CACHE_DIR = Path.home() / ".fw-context"
 _LOCAL_CACHE_PATH = _LOCAL_CACHE_DIR / "llm_cache.db"
-_SERVER_MAX_BATCH = 1000
+_SERVER_MAX_BATCH = MAX_BATCH_ENTRIES
 """The most hashes/entries the server takes from one request.
 
 The server keeps the first 1000 and drops the rest, with ``truncated: true``
@@ -73,6 +76,41 @@ in the answer (``cache_server/app.py``).  A larger chunk therefore loses
 entries without an error, and a push reported the dropped ones as already on
 the server.  The client never sends more.
 """
+
+_PUT_BODY_BUDGET = MAX_BODY_BYTES * 8 // 10
+"""The largest body that one write request gets: 80 % of the server limit.
+
+1000 entries at the field limits are about 200 MB, and the server answers
+413 above 10 MB.  The margin covers the JSON keys and the frame of the
+request that the estimate in :func:`_size_limited_chunks` leaves out.
+"""
+
+
+def _size_limited_chunks(
+    entries: list[dict], max_count: int, max_bytes: int
+) -> Iterator[list[dict]]:
+    """Split *entries* into chunks of at most *max_count* entries and *max_bytes*.
+
+    The size of an entry is the length of ``json.dumps(entry)``.  The
+    default ``ensure_ascii`` writes each non-ASCII character as a 6-byte
+    escape, which is never less than its UTF-8 form, thus the estimate is
+    not less than the bytes that go.  An entry larger than *max_bytes* goes
+    in a chunk of its own: the server decides about it, and a split cannot
+    make it smaller.
+    """
+    chunk: list[dict] = []
+    size = 0
+    for entry in entries:
+        entry_size = len(json.dumps(entry)) + 1  # the comma between entries
+        if chunk and (len(chunk) >= max_count or size + entry_size > max_bytes):
+            yield chunk
+            chunk, size = [], 0
+        chunk.append(entry)
+        size += entry_size
+    if chunk:
+        yield chunk
+
+
 _BATCH_SIZE = 100
 """Default batch size for splitting large request lists into chunks.
 
@@ -616,6 +654,14 @@ class CacheClient:
 
         Returns the number of entries inserted (best-effort — may be 0
         if the server is unreachable or the token is read-only).
+
+        The requests are limited by count (``batch_size``) and by size (see
+        :func:`_size_limited_chunks`).  After the first request that fails,
+        no more requests go: a 403 or an unreachable server fails the next
+        request too, and after a 403 each more request only repeats it.  A
+        422 or a 413 could let a later request pass, but the caller must
+        know that the write is not complete: ``cache push`` stops with an
+        error, and the indexer sends one entry for each call.
         """
         if not entries:
             return 0
@@ -626,9 +672,11 @@ class CacheClient:
             return 0
 
         total_inserted = 0
-        for chunk_start in range(0, len(entries), self.batch_size):
-            chunk = entries[chunk_start:chunk_start + self.batch_size]
+        failures_before = self.put_failures
+        for chunk in _size_limited_chunks(entries, self.batch_size, _PUT_BODY_BUDGET):
             total_inserted += self._batch_put_chunk(chunk)
+            if self.put_failures > failures_before:
+                break
         return total_inserted
 
     def _batch_put_chunk(self, chunk: list[dict]) -> int:

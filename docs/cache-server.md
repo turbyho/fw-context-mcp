@@ -407,6 +407,23 @@ the token cannot write, when
 `--overwrite` is given without `can_overwrite`, or when the server refuses a
 write part of the way through.
 
+The server refuses a whole request when one entry in it breaks one of these
+limits:
+
+| Field | Limit |
+|---|---|
+| `hash` | 64 lowercase hex characters (SHA-256) |
+| `summary` | 5000 characters |
+| `inputs`, `outputs` | 100000 characters each |
+| `model` | 100 characters |
+| Request body | 10 MB |
+
+The command sends no such entry. It keeps the entry in the local cache,
+shows the number of these entries and the first five with the reason, and
+sends the others. These entries do not change the exit status. The client
+also makes each request smaller than the body limit: it splits a batch of
+large entries into more requests.
+
 ## Hardening (production)
 
 ### Firewall

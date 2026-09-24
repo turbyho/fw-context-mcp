@@ -27,7 +27,6 @@ from __future__ import annotations
 
 import logging
 import os
-import re
 from contextlib import asynccontextmanager
 from typing import Any
 
@@ -37,6 +36,7 @@ from pydantic import BaseModel, Field, field_validator
 from starlette.middleware.base import BaseHTTPMiddleware
 
 from .. import __version__
+from ..cache_limits import FIELD_MAX_CHARS, HASH_PATTERN, MAX_BATCH_ENTRIES, MAX_BODY_BYTES
 from .auth import CacheAuthMiddleware, require_can_read, require_can_write, require_can_write_with_overwrite
 from .backend import CacheStorageBackend
 
@@ -59,7 +59,7 @@ class _BodySizeLimitMiddleware(BaseHTTPMiddleware):
     never sees oversized payloads.
     """
 
-    MAX_BYTES = 10 * 1024 * 1024  # 10 MB
+    MAX_BYTES = MAX_BODY_BYTES  # 10 MB, shared with the client
 
     async def dispatch(self, request, call_next):
         content_length = request.headers.get("content-length")
@@ -116,10 +116,10 @@ class CacheEntry(BaseModel):
     payloads that would waste database space.
     """
     hash: str
-    summary: str = Field(max_length=5000)
-    inputs: str = Field(max_length=100000)
-    outputs: str = Field(max_length=100000)
-    model: str = Field(max_length=100)
+    summary: str = Field(max_length=FIELD_MAX_CHARS["summary"])
+    inputs: str = Field(max_length=FIELD_MAX_CHARS["inputs"])
+    outputs: str = Field(max_length=FIELD_MAX_CHARS["outputs"])
+    model: str = Field(max_length=FIELD_MAX_CHARS["model"])
 
     @field_validator("hash")
     @classmethod
@@ -134,7 +134,7 @@ class CacheEntry(BaseModel):
         or silently return no results — both worse than a clear 422
         response at the API boundary.
         """
-        if not re.match(r"^[a-f0-9]{64}$", v):
+        if not HASH_PATTERN.match(v):
             raise ValueError("hash must be a 64-character hex string (SHA-256)")
         return v
 
@@ -268,8 +268,8 @@ def create_app(*, backend: CacheStorageBackend | None = None) -> FastAPI:
         query plan cache small and the response time predictable (<200ms
         for a cold cache, <50ms for warm).
         """
-        lookup_hashes = body.hashes[:1000]  # hard cap
-        truncated = len(body.hashes) > 1000
+        lookup_hashes = body.hashes[:MAX_BATCH_ENTRIES]  # hard cap
+        truncated = len(body.hashes) > MAX_BATCH_ENTRIES
         results = await request.app.state.backend.batch_get(lookup_hashes)
         return {"results": results, "truncated": truncated}
 
@@ -292,10 +292,10 @@ def create_app(*, backend: CacheStorageBackend | None = None) -> FastAPI:
         accidental cache churn.
         """
         overwrite = getattr(request.state, "can_overwrite", False)
-        truncated = len(body.entries) > 1000
+        truncated = len(body.entries) > MAX_BATCH_ENTRIES
         entries = [
             {"hash": e.hash, "summary": e.summary, "inputs": e.inputs, "outputs": e.outputs, "model": e.model}
-            for e in body.entries[:1000]  # hard cap
+            for e in body.entries[:MAX_BATCH_ENTRIES]  # hard cap
         ]
         inserted = await request.app.state.backend.batch_put(entries, can_overwrite=overwrite)
         return {"inserted": inserted, "total": len(entries), "truncated": truncated}

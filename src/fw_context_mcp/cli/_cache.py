@@ -160,6 +160,7 @@ def cmd_cache_push(args: argparse.Namespace) -> int:
     pushes (thousands of entries) to know the operation is still alive.
     """
     from ..cache_client import CacheClient, get_local_cache_db
+    from ..cache_limits import entry_violation
     from ..config import load as load_config
     from ..utils import resolve_project_root
 
@@ -214,19 +215,43 @@ def cmd_cache_push(args: argparse.Namespace) -> int:
                 )
                 return 1
 
+            # An entry that breaks a limit of the server gets 422 for its
+            # whole request, on each push, and the entries after it never
+            # reach the server.  It stays out, and the push goes on.
+            entries = []
+            skipped: list[tuple[str, str]] = []
+            for r in rows:
+                entry = {"hash": r[0], "summary": r[1], "inputs": r[2], "outputs": r[3], "model": r[4]}
+                reason = entry_violation(entry)
+                if reason is None:
+                    entries.append(entry)
+                else:
+                    skipped.append((str(r[0]), reason))
+            if skipped:
+                print(
+                    f"warning: {len(skipped)} local entries break a limit of the server and stay local:",
+                    file=sys.stderr,
+                )
+                for content_hash, reason in skipped[:5]:
+                    print(f"  {content_hash[:16]}: {reason}", file=sys.stderr)
+                if len(skipped) > 5:
+                    print(f"  … and {len(skipped) - 5} more", file=sys.stderr)
+            total = len(entries)
+
             verb = "written" if overwrite else "inserted"
             written = 0
             # The step is the size that the client uses, not the requested
             # one: the client limits it to what the server takes.  With a
             # larger step one batch_put sent more than one request, and the
             # progress and error counts no longer agreed with the requests.
+            # The client can still split one step by size, thus the count of
+            # a step that failed goes into the total before the error: the
+            # requests before the failed one are on the server.
             step = cc.batch_size
             for i in range(0, total, step):
-                chunk = rows[i : i + step]
-                entries = [
-                    {"hash": r[0], "summary": r[1], "inputs": r[2], "outputs": r[3], "model": r[4]} for r in chunk
-                ]
-                n = cc.batch_put(entries)
+                chunk = entries[i : i + step]
+                n = cc.batch_put(chunk)
+                written += n
                 if cc.put_failures:
                     print(
                         f"error: the server did not accept the write after {i}/{total} entries "
@@ -234,7 +259,6 @@ def cmd_cache_push(args: argparse.Namespace) -> int:
                         file=sys.stderr,
                     )
                     return 1
-                written += n
                 print(f"  [{i + len(chunk)}/{total}] {verb} {n}")
             if overwrite:
                 print(f"Done: {written}/{total} entries written to {cs.url}")

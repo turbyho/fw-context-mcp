@@ -12,6 +12,7 @@ command reported ``Done: 0/N`` with exit 0.
 
 from __future__ import annotations
 
+import hashlib
 import sqlite3
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -77,14 +78,19 @@ class _FakeClient:
         pass
 
 
-def _local_db(path: Path, hashes: list[str]) -> sqlite3.Connection:
+def _h(name: str) -> str:
+    """A valid content hash for the short test name *name*: the server takes only SHA-256."""
+    return hashlib.sha256(name.encode()).hexdigest()
+
+
+def _local_db(path: Path, names: list[str]) -> sqlite3.Connection:
     conn = sqlite3.connect(path)
     conn.execute(
         "CREATE TABLE llm_analysis_cache (content_hash TEXT PRIMARY KEY, summary TEXT, "
         "inputs TEXT, outputs TEXT, model TEXT)"
     )
     conn.executemany(
-        "INSERT INTO llm_analysis_cache VALUES (?, ?, '', '', 'm')", [(h, f"local {h}") for h in hashes]
+        "INSERT INTO llm_analysis_cache VALUES (?, ?, '', '', 'm')", [(_h(n), f"local {n}") for n in names]
     )
     conn.commit()
     return conn
@@ -113,12 +119,16 @@ def push(monkeypatch, tmp_path: Path):
         overwrite: bool = False,
         batch: int | None = None,
         config_batch_size: object = 2,
+        extra_rows: tuple[tuple, ...] = (),
     ) -> int:
         cfg = _FakeCfg(cache_server=_FakeCacheServerCfg(batch_size=config_batch_size))
         monkeypatch.setattr(config_mod, "load", lambda project_root=None: cfg)
         db_path = tmp_path / "llm_cache.db"
         db_path.unlink(missing_ok=True)
-        _local_db(db_path, local).close()
+        conn = _local_db(db_path, local)
+        conn.executemany("INSERT INTO llm_analysis_cache VALUES (?, ?, ?, ?, ?)", extra_rows)
+        conn.commit()
+        conn.close()
         monkeypatch.setattr(
             cache_client_mod, "get_local_cache_db", lambda readonly=False: sqlite3.connect(db_path)
         )
@@ -130,24 +140,24 @@ def push(monkeypatch, tmp_path: Path):
 
 
 def test_only_missing_entries_are_uploaded(push, capsys):
-    _FakeClient.server = {"a": {"hash": "a", "summary": "server a"}}
+    _FakeClient.server = {_h("a"): {"hash": _h("a"), "summary": "server a"}}
 
     assert push(["a", "b", "c"]) == 0
 
     assert _FakeClient.instances[0].force is False, "no overwrite header without --overwrite"
-    assert _FakeClient.server["a"]["summary"] == "server a", "the server's entry must survive"
-    assert set(_FakeClient.server) == {"a", "b", "c"}
+    assert _FakeClient.server[_h("a")]["summary"] == "server a", "the server's entry must survive"
+    assert set(_FakeClient.server) == {_h("a"), _h("b"), _h("c")}
     assert "2 inserted, 1 already on" in capsys.readouterr().out
 
 
 def test_overwrite_replaces_server_entries(push):
     _FakeClient.caps = {"can_write": True, "can_overwrite": True}
-    _FakeClient.server = {"a": {"hash": "a", "summary": "server a"}}
+    _FakeClient.server = {_h("a"): {"hash": _h("a"), "summary": "server a"}}
 
     assert push(["a", "b"], overwrite=True) == 0
 
     assert _FakeClient.instances[0].force is True
-    assert _FakeClient.server["a"]["summary"] == "local a"
+    assert _FakeClient.server[_h("a")]["summary"] == "local a"
 
 
 def test_overwrite_without_the_permission_is_refused_up_front(push, capsys):
@@ -492,3 +502,107 @@ def test_remote_init_names_the_token_for_a_429(monkeypatch, tmp_path: Path, caps
 
     assert _remote_init(monkeypatch, tmp_path, httpx.Response(429)) == 1
     assert "check your token" in capsys.readouterr().err
+
+
+# ── The limits of the server, on the side of the client ────────────────────
+
+
+def test_an_entry_that_breaks_a_limit_stays_local_and_the_rest_goes(push, capsys):
+    """One summary of 5001 characters got 422 for its whole request, on each push.
+
+    The entries after it thus never reached the server.
+    """
+    too_long = (_h("long"), "x" * 5001, "", "", "m")
+    no_text = (_h("null"), None, "", "", "m")
+
+    assert push(["a", "b"], extra_rows=(too_long, no_text)) == 0
+
+    assert set(_FakeClient.server) == {_h("a"), _h("b")}
+    captured = capsys.readouterr()
+    assert "2 local entries break a limit of the server" in captured.err
+    assert "summary has 5001 characters, more than 5000" in captured.err
+    assert "summary is not a string" in captured.err
+    assert "Done: 2 inserted, 0 already on" in captured.out
+
+
+def test_large_entries_are_split_by_size():
+    """1000 entries at the field limits are about 200 MB, and the server takes 10 MB."""
+    import json
+
+    import httpx
+
+    from fw_context_mcp.cache_limits import MAX_BODY_BYTES
+
+    sizes: list[int] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        sizes.append(len(request.content))
+        n = len(json.loads(request.content)["entries"])
+        return httpx.Response(200, json={"inserted": n, "total": n, "truncated": False})
+
+    big = [
+        {"hash": _h(str(i)), "summary": "", "inputs": "é" * 90_000, "outputs": "", "model": "m"}
+        for i in range(200)
+    ]
+    cc = _client(_stats_or(handler), batch_size=1000)
+
+    assert cc.batch_put(big) == 200
+    assert len(sizes) > 1
+    assert max(sizes) <= MAX_BODY_BYTES
+
+
+def test_no_request_goes_after_the_first_that_failed():
+    """A 403 or an unreachable server fails each more request too."""
+    import httpx
+
+    calls: list[int] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(1)
+        return httpx.Response(422, json={"detail": "bad"})
+
+    cc = _client(_stats_or(handler), batch_size=2)
+
+    assert cc.batch_put(_entries(6)) == 0
+    assert len(calls) == 1
+    assert cc.put_failures == 1
+
+
+@pytest.mark.parametrize(
+    ("field", "length", "ok"),
+    [("summary", 5000, True), ("summary", 5001, False), ("model", 100, True), ("model", 101, False),
+     ("inputs", 100_000, True), ("inputs", 100_001, False)],
+)
+def test_the_client_and_the_server_apply_the_same_limits(field, length, ok):
+    """The two sides take their limits from one module, thus they cannot drift."""
+    pytest.importorskip("fastapi")
+    import pydantic
+
+    from fw_context_mcp.cache_limits import entry_violation
+    from fw_context_mcp.cache_server.app import CacheEntry
+
+    entry = {"hash": _h("x"), "summary": "", "inputs": "", "outputs": "", "model": "m"}
+    entry[field] = "y" * length
+
+    assert (entry_violation(entry) is None) is ok
+    try:
+        CacheEntry(**entry)
+        server_ok = True
+    except pydantic.ValidationError:
+        server_ok = False
+    assert server_ok is ok
+
+
+@pytest.mark.parametrize("bad_hash", ["a", "A" * 64, "g" * 64, "a" * 63])
+def test_a_bad_hash_breaks_the_limit_on_both_sides(bad_hash):
+    pytest.importorskip("fastapi")
+    import pydantic
+
+    from fw_context_mcp.cache_limits import entry_violation
+    from fw_context_mcp.cache_server.app import CacheEntry
+
+    entry = {"hash": bad_hash, "summary": "", "inputs": "", "outputs": "", "model": "m"}
+
+    assert entry_violation(entry) is not None
+    with pytest.raises(pydantic.ValidationError):
+        CacheEntry(**entry)
