@@ -57,6 +57,7 @@ __all__ = [
     "SAFE_EXCEPT",
     "TU_EXTENSIONS",
     "abs_path",
+    "atomic_copy",
     "autobuild_dir",
     "build_dir_patterns_with_fw_context",
     "build_env",
@@ -754,16 +755,50 @@ def cc_staging_path(project_root: Path) -> Path:
 def staging_owner(path: Path) -> str | None:
     """Return the owner token in the name of a staging file, or None.
 
-    The inverse of the name that :func:`cc_staging_path` makes.  The token
-    can hold dots (a host name), thus the name is cut at the fixed prefix and
-    suffix, and not split at each dot.
+    The inverse of the names that :func:`cc_staging_path` and
+    :func:`atomic_copy` make: ``.compile_commands.[<name>.]<token>.json``.
+    The token is at the end, because a variant name before it can hold dots
+    and digits.  The host name in the token holds dots too, thus the token
+    is found by its form, ``<digits>@<tag>``, after a dot or at the start.
     """
     prefix = f".{CC_OUTPUT_REL.stem}."
     suffix = CC_OUTPUT_REL.suffix
     name = path.name
     if not name.startswith(prefix) or not name.endswith(suffix):
         return None
-    return name.removeprefix(prefix).removesuffix(suffix) or None
+    middle = name.removeprefix(prefix).removesuffix(suffix)
+    match = _OWNER_TOKEN_AT_END.search(middle)
+    return match.group(1) if match else None
+
+
+# The owner token at the end of the middle part of a staging name.  The tag
+# holds only the characters that _owner_tag keeps.
+_OWNER_TOKEN_AT_END = re.compile(r"(?:^|\.)(\d+@[A-Za-z0-9._-]+)$")
+
+
+def atomic_copy(source: Path, target: Path) -> None:
+    """Copy *source* to *target* so that a reader of *target* never gets a part.
+
+    ``shutil.copy2`` writes the target in place, thus a reader during the
+    copy gets a truncated file, and a copy that fails leaves one.  This
+    function copies to a temporary file beside *target* and then renames it
+    with ``os.replace``, which is atomic in one directory.  The metadata,
+    the mtime included, comes from *source* as with ``copy2``: the staleness
+    check compares that mtime.
+
+    The temporary name is ``.<stem>.<owner token><suffix>``.  The leading dot
+    keeps it out of each scan for ``compile_commands.*``, and the owner token
+    (see :func:`owner_token`) keeps two processes from one temporary file.
+    For a compilation database the name also matches ``CC_STAGING_GLOB``:
+    a copy that SIGKILL stops leaves the file, and the dead-owner cleanup of
+    the next build removes it.  A copy that fails removes its temporary file.
+    """
+    temporary = target.with_name(f".{target.stem}.{owner_token()}{target.suffix}")
+    try:
+        shutil.copy2(source, temporary)
+        os.replace(temporary, target)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def resolve_build_dir(project_root: Path, cfg, default: str) -> Path:

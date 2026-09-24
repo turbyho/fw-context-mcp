@@ -13,7 +13,9 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from fw_context_mcp.utils import (
+    atomic_copy,
     cc_output_path,
+    cc_staging_path,
     resolve_build_dir,
     resolve_real_binary,
     run_build_command,
@@ -375,7 +377,12 @@ class ZephyrBuildSystem:
         ``compile_commands.json``, so ``--pristine=auto`` (incremental) is used
         instead of ``--pristine`` (always), keeping re-builds fast (§5.8).
         """
-        from ..build import build_variant_config
+        from ..build import build_variant_config, clear_dead_staging_files
+
+        # This path does not go through generate_compile_commands, which does
+        # the cleanup for the other builds.  A copy below that SIGKILL stops
+        # leaves its temporary file in the same directory.
+        clear_dead_staging_files(cc_staging_path(project_root))
 
         if not shutil.which("west"):
             raise RuntimeError("west is required for Zephyr builds.  Install the Zephyr SDK and west tool.")
@@ -424,7 +431,11 @@ class ZephyrBuildSystem:
                 target = cc_output_path(project_root).with_name(
                     f"compile_commands.{variant.name}.{image_name}.json"
                 )
-                shutil.copy2(cc_src, target)
+                # Atomic, as the single build.  The index stores this path,
+                # and the MCP server reads the file from there (the staleness
+                # check, reindex_file) while a later build writes it again.
+                # An in-place copy lets that reader get a truncated file.
+                atomic_copy(cc_src, target)
                 results.append((variant.name, image_name, target))
                 log.info("Copied %s → %s", cc_src, target)
 
