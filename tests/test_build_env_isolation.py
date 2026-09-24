@@ -28,6 +28,7 @@ from pathlib import Path
 
 import pytest
 
+import fw_context_mcp.utils as utils_mod
 from fw_context_mcp.indexer.build import BuildConfig
 from fw_context_mcp.utils import build_env, run_build_command
 
@@ -169,7 +170,7 @@ def test_plain_command_environment_has_no_bash_env(
         seen.update(kwargs["env"])
         return subprocess.CompletedProcess(cmd, 0, "", "")
 
-    monkeypatch.setattr(subprocess, "run", _capture)
+    monkeypatch.setattr(utils_mod, "run_in_process_group", _capture)
 
     run_build_command(["true"], cwd=tmp_path, timeout=30)
 

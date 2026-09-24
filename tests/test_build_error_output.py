@@ -25,11 +25,12 @@ import subprocess
 
 import pytest
 
+import fw_context_mcp.utils as utils_mod
 from fw_context_mcp.utils import _BUILD_OUTPUT_TAIL, run_build_command
 
 
 class _Result:
-    """What subprocess.run gives back."""
+    """What run_in_process_group gives back, as subprocess.run does."""
 
     def __init__(self, returncode: int, stdout: str = "", stderr: str = ""):
         self.returncode = returncode
@@ -38,7 +39,7 @@ class _Result:
 
 
 def _fake_run(monkeypatch, result):
-    monkeypatch.setattr(subprocess, "run", lambda *a, **kw: result)
+    monkeypatch.setattr(utils_mod, "run_in_process_group", lambda *a, **kw: result)
 
 
 # ── Both streams ───────────────────────────────────────────────────────
@@ -127,7 +128,7 @@ def test_a_timeout_quotes_what_the_build_managed_to_say(monkeypatch, tmp_path):
             cmd=["make"], timeout=1, output="Compile: a.c\nlinking...\n", stderr=""
         )
 
-    monkeypatch.setattr(subprocess, "run", _raise)
+    monkeypatch.setattr(utils_mod, "run_in_process_group", _raise)
     with pytest.raises(RuntimeError) as exc:
         run_build_command(["make"], cwd=tmp_path, description="make", timeout=1)
 
@@ -144,7 +145,7 @@ def test_a_timeout_that_captured_bytes_does_not_raise_again(monkeypatch, tmp_pat
             cmd=["make"], timeout=1, output=b"partial \xff output", stderr=None
         )
 
-    monkeypatch.setattr(subprocess, "run", _raise)
+    monkeypatch.setattr(utils_mod, "run_in_process_group", _raise)
     with pytest.raises(RuntimeError) as exc:
         run_build_command(["make"], cwd=tmp_path, description="make", timeout=1)
 

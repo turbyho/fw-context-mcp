@@ -42,6 +42,8 @@ from ..utils import (
     SAFE_EXCEPT,
     autobuild_dir,
     build_dir_patterns_with_fw_context,
+    process_start_time,
+    record_build_groups,
 )
 from . import VerboseFormatter
 
@@ -606,15 +608,34 @@ def _owned_index(db_dir: Path, args: argparse.Namespace) -> Iterator[None]:
     from ..indexer.runner import IndexSuperseded, IndexTerminated
 
     def _stopped(signum: int, frame: object) -> None:
+        # SIGHUP too: a signal during the unwinding would interrupt it.
         signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        signal.signal(signal.SIGHUP, signal.SIG_IGN)
         if _taken_over(db_dir):
             raise IndexSuperseded("terminated by another index run that took the index over")
         raise IndexTerminated("a SIGTERM that no index run sent stopped this run")
 
+    def _hung_up(signum: int, frame: object) -> None:
+        # The terminal closed, or the ssh session dropped.  The build runs in
+        # its own session (see utils.run_in_process_group), thus the kernel
+        # no longer sends it SIGHUP with the terminal.  The default action
+        # stopped this process with no cleanup, and the build ran on.  Now
+        # the run unwinds, and the unwinding stops the build group.
+        signal.signal(signal.SIGHUP, signal.SIG_IGN)
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        raise IndexTerminated("the terminal closed (SIGHUP)")
+
     previous = signal.signal(signal.SIGTERM, _stopped)
+    # A SIGHUP that the caller ignores stays ignored: `nohup fw-context index`
+    # asks the run to live on after the terminal closes, and the build does
+    # (it has its own session).
+    previous_hup = signal.getsignal(signal.SIGHUP)
+    if previous_hup is not signal.SIG_IGN:
+        signal.signal(signal.SIGHUP, _hung_up)
 
     def _restore_handler() -> None:
         signal.signal(signal.SIGTERM, signal.SIG_DFL if previous is None else previous)
+        signal.signal(signal.SIGHUP, signal.SIG_DFL if previous_hup is None else previous_hup)
 
     with ExitStack() as stack:
         try:
@@ -625,15 +646,104 @@ def _owned_index(db_dir: Path, args: argparse.Namespace) -> Iterator[None]:
             # it is safe for a marker that _claim_index did not write yet.
             stack.callback(_release_index, db_dir)
             _claim_index(db_dir)
+            # The index is ours now, thus a build that a dead owner left is
+            # ours to stop, before this run builds in the same directory.
+            _reap_orphan_build_group(db_dir)
         except BaseException:
             # Before the lock is released: a late SIGTERM of a takeover must
             # reach the handler of the caller, not _stopped.
             _restore_handler()
             raise
+        stack.enter_context(record_build_groups(db_dir / _BUILD_GROUP_RECORD))
         # Registered last, thus it runs first: the handler of the caller is
         # back before the markers and the lock go.
         stack.callback(_restore_handler)
         yield
+
+
+# The file where a build of the index run records its process group — see
+# utils.record_build_groups.
+_BUILD_GROUP_RECORD = "reindex.build"
+
+
+def _reap_orphan_build_group(db_dir: Path) -> None:
+    """Stop the build that a run which SIGKILL (or the OOM killer) stopped left.
+
+    Such a run could not stop its build: the build runs in its own process
+    group (see utils.run_in_process_group), and nothing stops it when the
+    index run dies.  Its compilers then wrote into the build directory while
+    this run cleaned and filled it.
+
+    Call this function ONLY while this process holds index_run_lock.  Then
+    no other live index run owns the record, and a record whose index run
+    still runs is a leftover of no one.
+
+    A PID can come back for an unrelated process, thus four checks come
+    before the signal:
+
+    1. The index run of the record is no index run any more (see
+       _index_run_kind).  A live PID alone is not sufficient: the system can
+       give the PID of the dead run to an unrelated process.
+    2. The group still has members.
+    3. When the leader still runs, its argv names the recorded program
+       (argv[0], or argv[1] for a script that an interpreter runs).
+    4. When the leader still runs, it has the recorded start time.  When
+       the start time cannot be read for a live leader, nothing is signalled
+       (fail-closed): the name alone does not identify a ``bash`` leader.
+
+    A group whose leader exited cannot get a new process under its PGID
+    while a member lives, thus it needs no leader checks.  Such a group can
+    also be a member that a build left on purpose (a compiler server); it
+    stops too, because it writes to the build directory of this run.
+    """
+    from ..utils import stop_process_group
+
+    record = db_dir / _BUILD_GROUP_RECORD
+    try:
+        data = json.loads(record.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return
+    except (OSError, ValueError):
+        record.unlink(missing_ok=True)
+        return
+    if not isinstance(data, dict):
+        record.unlink(missing_ok=True)
+        return
+    index_pid, pgid, leader = data.get("index_pid"), data.get("pgid"), data.get("leader")
+    if not isinstance(index_pid, int) or not isinstance(pgid, int) or not isinstance(leader, str):
+        record.unlink(missing_ok=True)
+        return
+    if index_pid != os.getpid() and _index_run_kind(index_pid) is not None:
+        return
+    try:
+        os.killpg(pgid, 0)
+    except ProcessLookupError:
+        record.unlink(missing_ok=True)
+        return
+    except PermissionError:
+        # The group belongs to another user, thus not to an index run of ours.
+        record.unlink(missing_ok=True)
+        return
+    argv = _process_argv(pgid)
+    if argv is not None and leader not in {Path(arg).name for arg in argv[:2]}:
+        record.unlink(missing_ok=True)
+        return
+    # The name alone is not sufficient: a build under `activate` has "bash"
+    # as its leader, and so has the shell of a new terminal that got the
+    # PID.  A live leader must also have the recorded start time.
+    if argv is not None:
+        started = data.get("started")
+        current = process_start_time(pgid)
+        if not isinstance(started, str) or current is None or current != started:
+            record.unlink(missing_ok=True)
+            return
+    print(
+        f"Stopping process group {pgid}: an earlier index run started it, "
+        "and it still runs in the build directory",
+        file=sys.stderr,
+    )
+    stop_process_group(pgid)
+    record.unlink(missing_ok=True)
 
 
 def _claim_index(db_dir: Path) -> None:

@@ -389,6 +389,12 @@ Before the conversion step, `pre_build` runs a script that generates
 `config.toml` file with `pre_build` is a security risk. Anyone with commit
 access could run arbitrary commands on another developer's machine.
 
+`pre_build`, `command` and each build command run in a new session with no
+controlling terminal. Thus fw-context can stop the whole build, the
+compilers included. Output to the terminal still works. A hook that opens
+`/dev/tty` fails: a password prompt (`sudo`, `ssh`) or a curses screen
+(`menuconfig`) does not work there.
+
 ### 10. CMake with Ninja
 
 ```toml

@@ -28,6 +28,7 @@ from fw_context_mcp.utils import (
     cc_staging_path,
     ignore_autobuild_dir,
     owner_is_dead,
+    run_in_process_group,
     staging_owner,
 )
 
@@ -451,10 +452,16 @@ def _run_pre_build(cfg: BuildConfig, cwd: Path) -> None:
     import shlex
     # build_env, not the raw inherited environment: a hook the harness put in
     # BASH_ENV hijacks any `bash -c` the user configures here — see utils.
-    result = subprocess.run(
-        shlex.split(cfg.pre_build), shell=False, cwd=cwd,
-        timeout=cfg.timeout, env=build_env(),
-    )
+    # In its own process group, as each build command — see
+    # utils.run_in_process_group.  The timeout is a RuntimeError, because
+    # each caller of generate_compile_commands catches only that.
+    try:
+        result = run_in_process_group(
+            shlex.split(cfg.pre_build), cwd=cwd, env=build_env(),
+            timeout=cfg.timeout, capture_output=False,
+        )
+    except subprocess.TimeoutExpired:
+        raise RuntimeError(f"Pre-build command timed out after {cfg.timeout}s") from None
     if result.returncode != 0:
         raise RuntimeError(f"Pre-build command failed with exit code {result.returncode}")
 
@@ -573,8 +580,10 @@ def _generate_into(root: Path, cfg: BuildConfig) -> Path:
         import shlex
         # Same reason as the pre-build hook: `command = "bash -c ..."` is a
         # documented override, and BASH_ENV would hijack it.
-        result = subprocess.run(
-            shlex.split(cfg.command), shell=False, cwd=root, env=build_env(),
+        # In its own process group — see utils.run_in_process_group.
+        result = run_in_process_group(
+            shlex.split(cfg.command), cwd=root, env=build_env(),
+            timeout=None, capture_output=False,
         )
         if result.returncode != 0:
             raise RuntimeError(f"Build command failed with exit code {result.returncode}")

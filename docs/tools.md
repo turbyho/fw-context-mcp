@@ -93,6 +93,17 @@ A run that already released the index when the `SIGTERM` of a takeover
 arrives ignores that signal. The other run only wanted the index, and it
 already has it.
 
+Each build runs in its own process group. When a run stops, it stops the
+whole group, the compilers of `make -j`, `bear` and `pio` included, before
+the other run builds in the same directory. A run that `SIGKILL` stops
+cannot do that. It records its build group in `reindex.build`, and the next
+run that owns the index stops that group first.
+
+The build is not in the session of the terminal, thus it does not get the
+`SIGHUP` of a closed terminal. The index run gets it, and stops as with a
+foreign `SIGTERM`: `Terminated`, exit code 143, and the build group stops
+too.
+
 **The global registry:**
 
 `fw-context index` and `fw-context init` write this project into the global

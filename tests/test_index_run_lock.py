@@ -784,3 +784,19 @@ def test_a_refused_run_gives_back_the_handler(tmp_path: Path):
         assert signal.getsignal(signal.SIGTERM) is before
     finally:
         TestTakeover._stop(holder)
+
+
+def test_a_closed_terminal_stops_the_run_as_terminated(tmp_path: Path):
+    """The build has its own session, thus SIGHUP no longer reaches it with the terminal.
+
+    The default action stopped the index run with no cleanup, and the build
+    ran on.  The run now unwinds, and the unwinding stops the build group.
+    """
+    import signal
+
+    holder = TestTakeover._holder(tmp_path, "background")
+    try:
+        holder.send_signal(signal.SIGHUP)
+        assert holder.wait(timeout=10) == EXIT_TERMINATED
+    finally:
+        TestTakeover._stop(holder)

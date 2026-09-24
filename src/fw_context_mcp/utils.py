@@ -20,17 +20,22 @@ Why a single utils module instead of topic-split utility files:
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import os
 import re
 import shlex
 import shutil
+import signal
 import socket
 import sqlite3
 import subprocess
 import threading
+import time
 from collections import OrderedDict
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
+from contextlib import contextmanager
+from contextvars import ContextVar
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -74,11 +79,16 @@ __all__ = [
     "macro_signature",
     "owner_is_dead",
     "owner_token",
+    "process_group_is_gone",
+    "process_start_time",
     "read_file_lines",
+    "record_build_groups",
     "resolve_build_dir",
     "resolve_project_root",
     "resolve_real_binary",
+    "run_in_process_group",
     "staging_owner",
+    "stop_process_group",
     "truncate_path_middle",
 ]
 
@@ -384,6 +394,216 @@ def _quote_stream(name: str, text: str | None, limit: int = _BUILD_OUTPUT_TAIL) 
     return f"\n{name} (last {limit} of {len(text)} characters):\n{text[-limit:]}"
 
 
+# ── Builds in their own process group ──
+# A build tool starts compilers of its own: `make -j` a compiler for each
+# job, `bear` the build it records, `pio` scons.  subprocess.run stops only
+# the direct child, thus a run that another run took over left its
+# compilers to write object files into the directory that the new build
+# cleaned and filled.  Each build therefore starts a new session, and a stop
+# goes to the whole process group.
+
+# How long a build group gets to stop after SIGTERM before SIGKILL.
+BUILD_GROUP_GRACE_S = 5.0
+
+# The file that the build of this run records its process group in, or None.
+# A ContextVar and not a parameter: run_build_command has ten backends as
+# callers, and none of them knows the index directory.  The index run sets
+# it (see record_build_groups) for the time that it owns the index.
+_BUILD_GROUP_RECORD: ContextVar[Path | None] = ContextVar("_BUILD_GROUP_RECORD", default=None)
+
+
+@contextmanager
+def record_build_groups(record: Path) -> Iterator[None]:
+    """Record the process group of each build in this block in *record*.
+
+    WHY: a run that SIGKILL stops cannot stop its build.  The record lets
+    the next run that owns the index find the group and stop it (see
+    ``cli/_index._reap_orphan_build_group``).
+    """
+    token = _BUILD_GROUP_RECORD.set(record)
+    try:
+        yield
+    finally:
+        _BUILD_GROUP_RECORD.reset(token)
+
+
+def process_start_time(pid: int) -> str | None:
+    """Return a value that names the start of process *pid*, or None when unknown.
+
+    WHY: a PID can come back for an unrelated process, and the program name
+    alone does not tell the two apart — a build under ``activate`` has
+    ``bash`` as its leader, and so has the shell in a new terminal.  The
+    start time of a process does not change while it lives, and a new
+    process with the same PID has a different one.
+
+    Linux: field 22 of ``/proc/<pid>/stat``, the start in clock ticks after
+    the boot.  The name in field 2 can hold spaces and ")", thus the fields
+    are counted after the LAST ")".  Elsewhere (macOS): ``ps -o lstart=``.
+    """
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8", errors="replace")
+    except FileNotFoundError:
+        if Path("/proc/self/stat").exists():
+            return None  # /proc works, thus the process is gone
+    except OSError:
+        return None
+    else:
+        fields = stat.rpartition(")")[2].split()
+        # fields[0] is field 3 (the state), thus field 22 is fields[19].
+        return fields[19] if len(fields) > 19 else None
+    # A fixed locale and time zone: `lstart` is local time in the format of
+    # the locale, and the writer (a daemon run) and the reader (a run in a
+    # terminal) can have different ones.  The two strings must be equal.
+    env = {"LC_ALL": "C", "TZ": "UTC0", "PATH": os.environ.get("PATH", "/bin:/usr/bin")}
+    try:
+        result = subprocess.run(  # noqa: S603 — fixed argv, no shell
+            ["ps", "-o", "lstart=", "-p", str(pid)],
+            capture_output=True, text=True, timeout=5, check=False, env=env,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0:
+        return None
+    return result.stdout.strip() or None
+
+
+def _write_group_record(record: Path, pgid: int, program: str) -> None:
+    """Write ``{"index_pid", "pgid", "leader", "started"}`` to *record* atomically.
+
+    ``leader`` is the base name of the program that leads the group, and
+    ``started`` its start time (see :func:`process_start_time`).  The reader
+    compares the two with the live leader, because a PID can come back for
+    an unrelated process.
+    """
+    temporary = record.with_name(f".{record.name}.{os.getpid()}")
+    payload = {
+        "index_pid": os.getpid(),
+        "pgid": pgid,
+        "leader": Path(program).name,
+        "started": process_start_time(pgid),
+    }
+    try:
+        temporary.write_text(json.dumps(payload), encoding="utf-8")
+        os.replace(temporary, record)
+    except OSError as exc:
+        # The record helps only after a SIGKILL.  A build must not fail for it.
+        log.warning("Cannot record the build process group in %s: %s", record, exc)
+        temporary.unlink(missing_ok=True)
+
+
+def _remove_group_record(record: Path, pgid: int) -> None:
+    """Remove *record* when it still names the group *pgid*."""
+    try:
+        if json.loads(record.read_text(encoding="utf-8")).get("pgid") == pgid:
+            record.unlink(missing_ok=True)
+    except (OSError, ValueError, AttributeError):
+        return
+
+
+def stop_process_group(
+    pgid: int,
+    grace: float = BUILD_GROUP_GRACE_S,
+    leader: subprocess.Popen | None = None,
+) -> None:
+    """Send SIGTERM to the group *pgid*, and SIGKILL to what remains after *grace*.
+
+    The group can live on after its leader: the leader of a ``make -j``
+    exits and its compilers still run.  Thus the wait is for the whole
+    group, with ``killpg(pgid, 0)``, and not for the leader only.
+
+    *leader* is the ``Popen`` of the leader when this process started it.
+    Until this process reaps it, a leader that exited is a zombie, and a
+    zombie still counts as a member of the group.  The wait thus reaps it,
+    or it would always last the whole *grace*.
+
+    The SIGKILL is in ``finally``: a second Ctrl-C during the wait raises
+    ``KeyboardInterrupt`` out of ``time.sleep``, and a build that ignores
+    SIGTERM then ran on.
+    """
+    try:
+        os.killpg(pgid, signal.SIGTERM)
+    except ProcessLookupError:
+        return
+    try:
+        deadline = time.monotonic() + grace
+        while time.monotonic() < deadline:
+            if process_group_is_gone(pgid, leader):
+                return
+            time.sleep(0.05)
+    finally:
+        try:
+            os.killpg(pgid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+
+
+def process_group_is_gone(pgid: int, leader: subprocess.Popen | None = None) -> bool:
+    """Return True when no process of the group *pgid* runs.
+
+    *leader* as in :func:`stop_process_group`: it is reaped first, because
+    a zombie leader still counts as a member.
+    """
+    if leader is not None:
+        leader.poll()
+    try:
+        os.killpg(pgid, 0)
+    except ProcessLookupError:
+        return True
+    except PermissionError:
+        return False
+    return False
+
+
+def run_in_process_group(
+    cmd: list[str],
+    *,
+    cwd: Path,
+    env: dict[str, str],
+    timeout: float | None,
+    capture_output: bool,
+) -> subprocess.CompletedProcess:
+    """Run *cmd* in a new session, and stop its whole process group on any exit but its own.
+
+    Same result as ``subprocess.run(..., text=True)``: a timeout raises
+    ``TimeoutExpired`` with the output so far.  Any exception while the
+    command runs (the timeout, ``IndexStopped`` from a SIGTERM handler,
+    ``KeyboardInterrupt``) first stops the group, then goes on.
+
+    A new session also takes the build out of the process group of the
+    terminal.  Ctrl-C thus reaches this process only, as a
+    ``KeyboardInterrupt``, and this function stops the build.  The build has
+    no controlling terminal: output to the terminal still works, but an open
+    of ``/dev/tty`` fails, thus a password prompt (``sudo``, ``ssh``) or a
+    curses screen (``menuconfig``) in a ``pre_build`` hook does not work.
+    No build that fw-context starts needs one.
+
+    The record goes only when the group is gone.  An exception during the
+    stop (a second Ctrl-C) can leave members alive, and the next index run
+    then finds them through the record.
+    """
+    pipe = subprocess.PIPE if capture_output else None
+    proc = subprocess.Popen(  # noqa: S603 — argv list, no shell
+        cmd, cwd=cwd, env=env, stdout=pipe, stderr=pipe, text=True, start_new_session=True,
+    )
+    record = _BUILD_GROUP_RECORD.get()
+    try:
+        if record is not None:
+            _write_group_record(record, proc.pid, cmd[0])
+        stdout, stderr = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        stop_process_group(proc.pid, leader=proc)
+        stdout, stderr = proc.communicate()
+        raise subprocess.TimeoutExpired(cmd, timeout or 0, output=stdout, stderr=stderr) from None
+    except BaseException:
+        stop_process_group(proc.pid, leader=proc)
+        proc.wait()
+        raise
+    finally:
+        if record is not None and process_group_is_gone(proc.pid, proc):
+            _remove_group_record(record, proc.pid)
+    return subprocess.CompletedProcess(cmd, proc.returncode, stdout, stderr)
+
+
 def run_build_command(
     cmd: list[str],
     cwd: Path,
@@ -451,8 +671,9 @@ def run_build_command(
             cmd = ["bash", "-c", f"source {shlex.quote(expanded)} && {cmd_str}"]
 
     try:
-        result = subprocess.run(
-            cmd, cwd=cwd, capture_output=True, text=True, timeout=timeout, env=merged_env
+        # In its own process group — see run_in_process_group.
+        result = run_in_process_group(
+            cmd, cwd=cwd, env=merged_env, timeout=timeout, capture_output=True
         )
     except subprocess.TimeoutExpired as e:
         # Quote what the build managed to say.  A timeout with no output
