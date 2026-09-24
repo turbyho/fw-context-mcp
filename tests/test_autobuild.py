@@ -391,8 +391,14 @@ class TestATakenOverMultiRunIsNoFailedBuild:
     """
 
     @staticmethod
-    def _run(monkeypatch, tmp_path: Path, multi_exit: int) -> list[list[str]]:
+    def _run(
+        monkeypatch, tmp_path: Path, multi_exit: int, *, sigterm_self: bool = False
+    ) -> list[list[str]]:
         """Run ``cmd_index`` with a multi run that ends in *multi_exit*.
+
+        With *sigterm_self* the multi run gets a SIGTERM that no index run
+        sent, the way a CI timeout stops it, and *multi_exit* is the exit
+        code that ``cmd_index`` must give.
 
         Returns the lists that ``autobuild.record_failure`` got.
         """
@@ -433,7 +439,17 @@ class TestATakenOverMultiRunIsNoFailedBuild:
             lambda *a, **kw: (["src/new.c"], cfg.build, "a new source file"),
         )
         monkeypatch.setattr(index_mod, "_build_run_kwargs", lambda *a, **kw: {})
-        monkeypatch.setattr(index_mod, "_run_multi", lambda *a, **kw: multi_exit)
+        def _multi(*a, **kw) -> int:
+            if sigterm_self:
+                import os
+                import signal
+
+                os.kill(os.getpid(), signal.SIGTERM)
+                time.sleep(5)  # the handler raises before this ends
+                raise AssertionError("the SIGTERM handler did not stop the run")
+            return multi_exit
+
+        monkeypatch.setattr(index_mod, "_run_multi", _multi)
         monkeypatch.setattr(
             index_mod.autobuild, "record_failure",
             lambda db_dir, sources: recorded.append(list(sources)),
@@ -451,6 +467,15 @@ class TestATakenOverMultiRunIsNoFailedBuild:
         from fw_context_mcp.exit_codes import EXIT_SUPERSEDED
 
         assert self._run(monkeypatch, tmp_path, EXIT_SUPERSEDED) == []
+
+    def test_a_terminated_run_exits_143_and_records_no_failure(
+        self, monkeypatch, tmp_path: Path, capsys
+    ):
+        """A foreign SIGTERM is not a takeover and not a failed build."""
+        from fw_context_mcp.exit_codes import EXIT_TERMINATED
+
+        assert self._run(monkeypatch, tmp_path, EXIT_TERMINATED, sigterm_self=True) == []
+        assert "Terminated:" in capsys.readouterr().err
 
     def test_a_failed_run_still_records_the_failure(self, monkeypatch, tmp_path: Path):
         """The marker is still what stops a broken build on each daemon cycle."""

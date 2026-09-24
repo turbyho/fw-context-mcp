@@ -23,7 +23,7 @@ from pathlib import Path
 
 import pytest
 
-from fw_context_mcp.exit_codes import EXIT_ALREADY_RUNNING, EXIT_SUPERSEDED
+from fw_context_mcp.exit_codes import EXIT_ALREADY_RUNNING, EXIT_SUPERSEDED, EXIT_TERMINATED
 from fw_context_mcp.indexer.db._locking import (
     index_run_lock,
 )
@@ -244,8 +244,7 @@ class TestTakeover:
             from types import SimpleNamespace
             sys.path.insert(0, {str(Path(__file__).resolve().parents[1] / "src")!r})
             from fw_context_mcp.cli._index import _owned_index
-            from fw_context_mcp.exit_codes import EXIT_SUPERSEDED
-            from fw_context_mcp.indexer.runner import IndexSuperseded
+            from fw_context_mcp.indexer.runner import IndexStopped
 
             args = SimpleNamespace(background={kind == "background"!r}, takeover=False)
             try:
@@ -256,8 +255,8 @@ class TestTakeover:
                     deadline = time.monotonic() + 30.0
                     while time.monotonic() < deadline:
                         time.sleep(0.05)
-            except IndexSuperseded:
-                sys.exit(EXIT_SUPERSEDED)
+            except IndexStopped as exc:
+                sys.exit(exc.exit_code)
             sys.exit(0)
             """
         )
@@ -367,11 +366,150 @@ class TestTakeover:
         with index_run_lock(tmp_path):
             pass
 
+    def test_a_foreign_sigterm_is_not_a_takeover(self, tmp_path: Path):
+        """A CI timeout or a ``kill`` printed "Superseded" and exited 75.
+
+        The daemon retries 75, thus it did again the work that somebody
+        wanted stopped.
+        """
+        import signal
+
+        holder = self._holder(tmp_path, "background")
+        try:
+            holder.send_signal(signal.SIGTERM)
+            assert holder.wait(timeout=10) == EXIT_TERMINATED
+        finally:
+            self._stop(holder)
+
+    def test_the_takeover_marker_lives_as_long_as_the_taker_owns_the_index(
+        self, tmp_path: Path
+    ):
+        """A holder that released the lock early must still find it in its handler."""
+        from fw_context_mcp.cli._index import _TAKEOVER_MARKER, _owned_index
+
+        holder = self._holder(tmp_path, "background")
+        try:
+            with _owned_index(tmp_path, self._args()):
+                assert (tmp_path / _TAKEOVER_MARKER).exists()
+            assert not (tmp_path / _TAKEOVER_MARKER).exists()
+            assert holder.wait(timeout=10) == EXIT_SUPERSEDED
+        finally:
+            self._stop(holder)
+
+
+class TestSigtermOutsideTheLock:
+    """``cmd_index`` after it released the index, or before it took it."""
+
+    @staticmethod
+    def _runner(db_dir: Path) -> subprocess.Popen:
+        """A process under the handler of cmd_index, outside the lock."""
+        script = textwrap.dedent(
+            f"""
+            import signal, sys, time
+            from pathlib import Path
+            sys.path.insert(0, {str(Path(__file__).resolve().parents[1] / "src")!r})
+            from fw_context_mcp.cli._index import _SigtermOutsideTheLock
+
+            outside = _SigtermOutsideTheLock()
+            outside.db_dir = Path({str(db_dir)!r})
+            signal.signal(signal.SIGTERM, outside)
+            print("READY", flush=True)
+            time.sleep(1.5)
+            sys.exit(0)
+            """
+        )
+        proc = subprocess.Popen(  # noqa: S603 — fixed argv, no shell
+            [sys.executable, "-c", script],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
+        assert proc.stdout is not None
+        assert proc.stdout.readline().strip() == "READY"
+        return proc
+
+    def test_a_late_takeover_signal_does_not_kill_a_run_that_released(self, tmp_path: Path):
+        """The race: the holder released the lock, then the SIGTERM arrived.
+
+        With the default action that run died with -15 in the middle of its
+        work after the lock, and the daemon logged it as a failure.
+        """
+        import signal
+
+        from fw_context_mcp.cli._index import _write_takeover_marker
+
+        runner = self._runner(tmp_path)
+        try:
+            _write_takeover_marker(tmp_path, runner.pid)
+            runner.send_signal(signal.SIGTERM)
+            assert runner.wait(timeout=10) == 0
+        finally:
+            if runner.poll() is None:
+                runner.kill()
+            runner.wait(timeout=10)
+
+    def test_a_foreign_sigterm_outside_the_lock_stops_with_143(self, tmp_path: Path):
+        import signal
+
+        runner = self._runner(tmp_path)
+        try:
+            runner.send_signal(signal.SIGTERM)
+            assert runner.wait(timeout=10) == EXIT_TERMINATED
+            assert runner.stderr is not None
+            assert "Terminated:" in runner.stderr.read()
+        finally:
+            if runner.poll() is None:
+                runner.kill()
+            runner.wait(timeout=10)
+
+    def test_a_marker_for_another_victim_is_no_takeover(self, tmp_path: Path):
+        """A SIGTERM that a different run gets at the same time is still foreign."""
+        import signal
+
+        from fw_context_mcp.cli._index import _write_takeover_marker
+
+        runner = self._runner(tmp_path)
+        try:
+            _write_takeover_marker(tmp_path, runner.pid + 1)
+            runner.send_signal(signal.SIGTERM)
+            assert runner.wait(timeout=10) == EXIT_TERMINATED
+        finally:
+            if runner.poll() is None:
+                runner.kill()
+            runner.wait(timeout=10)
+
+    def test_a_marker_of_a_dead_taker_is_no_takeover(self, tmp_path: Path):
+        import json
+        import signal
+
+        from fw_context_mcp.cli._index import _TAKEOVER_MARKER
+
+        runner = self._runner(tmp_path)
+        try:
+            (tmp_path / _TAKEOVER_MARKER).write_text(
+                json.dumps({"taker": 2147483646, "victim": runner.pid}), encoding="utf-8"
+            )
+            runner.send_signal(signal.SIGTERM)
+            assert runner.wait(timeout=10) == EXIT_TERMINATED
+        finally:
+            if runner.poll() is None:
+                runner.kill()
+            runner.wait(timeout=10)
+
+    def test_cmd_index_gives_back_the_handler_of_the_caller(self, monkeypatch, tmp_path: Path):
+        import signal
+
+        from fw_context_mcp.cli import _index as index_mod
+
+        monkeypatch.setattr(index_mod, "_cmd_index", lambda args, outside: 0)
+        before = signal.getsignal(signal.SIGTERM)
+
+        assert index_mod.cmd_index(object()) == 0
+        assert signal.getsignal(signal.SIGTERM) is before
+
 
 class TestExitCodes:
     def test_the_three_outcomes_are_distinguishable(self):
-        """done / broken / superseded / already-running must not collide."""
-        assert len({0, 1, EXIT_SUPERSEDED, EXIT_ALREADY_RUNNING}) == 4
+        """done / broken / superseded / already-running / terminated must not collide."""
+        assert len({0, 1, EXIT_SUPERSEDED, EXIT_ALREADY_RUNNING, EXIT_TERMINATED}) == 5
 
 
 @pytest.mark.parametrize("name", ["index.lock", "write.lock"])
@@ -597,3 +735,52 @@ class TestARefusedRunLeavesNothingBehind:
 
             assert not (db_dir / "reindex.pause").exists()
             assert not (db_dir / "reindex.pid").exists()
+
+
+def test_the_handler_is_in_place_while_the_lock_is_taken(monkeypatch, tmp_path: Path):
+    """The lock writes the PID as soon as it is won, and a taker can signal at once.
+
+    With the handler of the caller still in place, that SIGTERM read as a
+    takeover after the release and was ignored, and the taker had to use
+    SIGKILL.
+    """
+    import signal
+
+    from fw_context_mcp.cli import _index as index_mod
+
+    seen: list[object] = []
+    real_acquire = index_mod._acquire_index
+
+    def _acquire(db_dir, stack, args):
+        real_acquire(db_dir, stack, args)
+        seen.append(signal.getsignal(signal.SIGTERM))
+
+    monkeypatch.setattr(index_mod, "_acquire_index", _acquire)
+    before = signal.getsignal(signal.SIGTERM)
+    from types import SimpleNamespace
+
+    with index_mod._owned_index(tmp_path, SimpleNamespace(background=False, takeover=False)):
+        pass
+
+    assert seen and seen[0] is not before
+    assert signal.getsignal(signal.SIGTERM) is before
+
+
+def test_a_refused_run_gives_back_the_handler(tmp_path: Path):
+    """The handler goes in before the lock, thus a refusal must take it out again."""
+    import signal
+    from types import SimpleNamespace
+
+    from fw_context_mcp.cli._index import _owned_index
+    from fw_context_mcp.indexer.db._locking import IndexRunLocked
+
+    before = signal.getsignal(signal.SIGTERM)
+    holder = TestTakeover._holder(tmp_path, "foreground")
+    try:
+        with pytest.raises(IndexRunLocked), _owned_index(
+            tmp_path, SimpleNamespace(background=False, takeover=False)
+        ):
+            pass
+        assert signal.getsignal(signal.SIGTERM) is before
+    finally:
+        TestTakeover._stop(holder)

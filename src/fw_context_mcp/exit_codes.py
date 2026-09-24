@@ -23,3 +23,11 @@ EXIT_SUPERSEDED = 75
 # nothing to retry: the run that holds the lock is doing this work.
 # 69 is EX_UNAVAILABLE from sysexits.h — the service is busy.
 EXIT_ALREADY_RUNNING = 69
+
+# Process exit status for a run that a SIGTERM stopped, when no other index
+# run sent it: a CI timeout, a `kill`, the shutdown of the daemon.  Such a
+# run did not lose the index to another run, thus EXIT_SUPERSEDED would be
+# false, and the daemon would retry work that somebody wanted stopped.
+# 143 is 128 + SIGTERM, the status that a shell shows for a process that
+# SIGTERM killed.
+EXIT_TERMINATED = 143

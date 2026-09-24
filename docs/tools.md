@@ -80,6 +80,19 @@ and for `[[build.variants]]`.
   the same way and index anyway.
 - **A `--background` run** never takes over from another run.
 
+Before it sends `SIGTERM`, the run that takes over writes
+`reindex.takeover` in the index directory, with its own PID and the PID of
+the run that it stops. Thus the stopped run knows why it stopped:
+
+| Cause of the `SIGTERM` | Exit code | Message | Daemon retries |
+|---|---|---|---|
+| Another index run takes over | 75 | `Superseded: …` | Yes |
+| Anything else (a CI timeout, `kill`, the shutdown of the daemon) | 143 | `Terminated: …` | No |
+
+A run that already released the index when the `SIGTERM` of a takeover
+arrives ignores that signal. The other run only wanted the index, and it
+already has it.
+
 **The global registry:**
 
 `fw-context index` and `fw-context init` write this project into the global

@@ -24,6 +24,7 @@ resolution, and graceful degradation when optional phases fail.
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import os
 import signal
@@ -429,6 +430,68 @@ def _signal_index_run(pid: int, sig: signal.Signals) -> None:
         pass
 
 
+# The marker that tells a run which SIGTERM is a takeover.  A signal handler
+# cannot see the sender of a signal (Python gives it no siginfo), thus the run
+# that takes over writes this file BEFORE it sends SIGTERM.  Without it, each
+# SIGTERM read as a takeover: a CI timeout or a `kill` printed "Superseded"
+# and exited 75, and the daemon retried work that somebody wanted stopped.
+_TAKEOVER_MARKER = "reindex.takeover"
+
+
+def _write_takeover_marker(db_dir: Path, victim: int) -> None:
+    """Write ``{"taker": <this PID>, "victim": <victim>}`` atomically.
+
+    Atomic, because the victim reads it in its signal handler at any time
+    after the signal.  The victim is named, thus a SIGTERM that a different
+    run gets at the same time does not read as a takeover.
+
+    Another marker than ``reindex.pause`` and ``reindex.pid``.  The rule
+    "write nothing before the lock is won" (see _acquire_index) keeps those
+    two from naming a run that lost.  No code reads this file except the
+    victim, and only to classify a signal, thus a run that loses harms
+    nothing with it.
+    """
+    marker = db_dir / _TAKEOVER_MARKER
+    temporary = marker.with_name(f".{marker.name}.{os.getpid()}")
+    temporary.write_text(json.dumps({"taker": os.getpid(), "victim": victim}), encoding="utf-8")
+    os.replace(temporary, marker)
+
+
+def _remove_takeover_marker(db_dir: Path) -> None:
+    """Remove the takeover marker when this process wrote it."""
+    marker = db_dir / _TAKEOVER_MARKER
+    if _read_takeover_marker(marker).get("taker") == os.getpid():
+        marker.unlink(missing_ok=True)
+
+
+def _read_takeover_marker(marker: Path) -> dict[str, int]:
+    """Return the marker as a dict, or an empty dict when it is missing or bad."""
+    try:
+        data = json.loads(marker.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    return {key: value for key, value in data.items() if isinstance(value, int)}
+
+
+def _taken_over(db_dir: Path) -> bool:
+    """Return True when a process that still runs takes the index from this process.
+
+    The check is that the taker runs, not that it is an index run (see
+    _index_run_kind): that check reads the argv, and a signal handler must
+    stay short and must not start ``ps`` on macOS.  The rest risk is a
+    marker that a dead taker left, whose PID the system gave to another
+    process, and that names THIS process as the victim.  Then a foreign
+    SIGTERM reads as a takeover, and the run exits 75 instead of 143.
+    """
+    data = _read_takeover_marker(db_dir / _TAKEOVER_MARKER)
+    taker = data.get("taker")
+    if data.get("victim") != os.getpid() or taker is None or taker == os.getpid():
+        return False
+    return PidFile._pid_exists(taker)
+
+
 def _acquire_index(db_dir: Path, stack: ExitStack, args: argparse.Namespace) -> None:
     """Enter ``index_run_lock`` on *stack*, taking the index over if needed.
 
@@ -471,13 +534,40 @@ def _acquire_index(db_dir: Path, stack: ExitStack, args: argparse.Namespace) -> 
             ) from None
 
     print(f"Taking over the index from pid {pid} ({kind} run)", file=sys.stderr)
-    _signal_index_run(pid, signal.SIGTERM)
+    # The marker stays until this run releases the index, not only until it
+    # wins the lock.  A holder that released the lock before the signal
+    # arrived reads the marker in its handler after that, and the marker
+    # must still be there, or that holder takes the signal as a foreign one
+    # and dies (see _SigtermOutsideTheLock).
+    _write_takeover_marker(db_dir, pid)
+    won = False
+    try:
+        _signal_index_run(pid, signal.SIGTERM)
+        won = _wait_for_the_lock(db_dir, stack, pid)
+    finally:
+        if won:
+            stack.callback(_remove_takeover_marker, db_dir)
+        else:
+            _remove_takeover_marker(db_dir)
+    if not won:
+        raise IndexRunLocked(db_dir, pid, hint="it did not release the index even after SIGKILL")
+
+
+def _wait_for_the_lock(db_dir: Path, stack: ExitStack, pid: int) -> bool:
+    """Wait for *pid* to release the lock after SIGTERM, then SIGKILL it.
+
+    Returns True when this process holds the lock on *stack*, and False
+    when *pid* survived SIGKILL.  Raises IndexRunLocked when a third
+    process won the lock in between.
+    """
+    from ..indexer.db._locking import IndexRunLocked, index_run_lock
+
     for grace, escalate in ((_TAKEOVER_GRACE_S, True), (_KILL_GRACE_S, False)):
         deadline = time.monotonic() + grace
         while time.monotonic() < deadline:
             try:
                 stack.enter_context(index_run_lock(db_dir))
-                return
+                return True
             except IndexRunLocked as again:
                 # None: the holder is between truncating its PID and
                 # unlocking, or a new holder has not written its PID yet.
@@ -487,12 +577,12 @@ def _acquire_index(db_dir: Path, stack: ExitStack, args: argparse.Namespace) -> 
         if escalate:
             print(f"  pid {pid} did not stop within {grace:.0f}s — sending SIGKILL", file=sys.stderr)
             _signal_index_run(pid, signal.SIGKILL)
-    raise IndexRunLocked(db_dir, pid, hint="it did not release the index even after SIGKILL")
+    return False
 
 
 @contextmanager
 def _owned_index(db_dir: Path, args: argparse.Namespace) -> Iterator[None]:
-    """Own the index for the whole block: lock, markers, SIGTERM → superseded.
+    """Own the index for the whole block: lock, markers, SIGTERM → superseded or terminated.
 
     The ONE place where ``cmd_index`` takes the index, for the single build
     and for ``[[build.variants]]`` alike.  The two used to do it separately,
@@ -500,24 +590,49 @@ def _owned_index(db_dir: Path, args: argparse.Namespace) -> Iterator[None]:
     refused had already run ``pio run --target clean`` and rewritten
     compile_commands.json under the run that held the index.
 
-    Inside the block SIGTERM raises IndexSuperseded, so a run that another
-    one takes over (see _acquire_index) unwinds normally and exits
-    ``EXIT_SUPERSEDED``.  The handler ignores a second SIGTERM, so the
-    unwinding itself is not interrupted.  On exit the handler, the markers
-    and the lock are released in that order.
-    """
-    from ..indexer.runner import IndexSuperseded
+    Inside the block SIGTERM unwinds the run normally.  A run that another
+    one takes over (see _acquire_index, and the takeover marker) raises
+    IndexSuperseded and exits ``EXIT_SUPERSEDED``.  Any other SIGTERM raises
+    IndexTerminated and exits ``EXIT_TERMINATED``.  The handler ignores a
+    second SIGTERM, so the unwinding itself is not interrupted.  On exit the
+    handler, the markers and the lock are released in that order.
 
-    def _superseded(signum: int, frame: object) -> None:
+    The handler goes in BEFORE the lock is taken.  The lock writes the PID
+    of this run as soon as it is won, and a taker can read it and send its
+    SIGTERM before _claim_index ends.  With the handler of the caller still
+    in place, that SIGTERM was ignored as "a takeover after the release",
+    and the taker had to use SIGKILL.
+    """
+    from ..indexer.runner import IndexSuperseded, IndexTerminated
+
+    def _stopped(signum: int, frame: object) -> None:
         signal.signal(signal.SIGTERM, signal.SIG_IGN)
-        raise IndexSuperseded("terminated by another index run that took the index over")
+        if _taken_over(db_dir):
+            raise IndexSuperseded("terminated by another index run that took the index over")
+        raise IndexTerminated("a SIGTERM that no index run sent stopped this run")
+
+    previous = signal.signal(signal.SIGTERM, _stopped)
+
+    def _restore_handler() -> None:
+        signal.signal(signal.SIGTERM, signal.SIG_DFL if previous is None else previous)
 
     with ExitStack() as stack:
-        _acquire_index(db_dir, stack, args)
-        _claim_index(db_dir)
-        stack.callback(_release_index, db_dir)
-        previous = signal.signal(signal.SIGTERM, _superseded)
-        stack.callback(signal.signal, signal.SIGTERM, signal.SIG_DFL if previous is None else previous)
+        try:
+            _acquire_index(db_dir, stack, args)
+            # Before _claim_index: a failure or a signal between its two
+            # writes left reindex.pause with the PID of a dead run.
+            # _release_index removes only the markers of this process, thus
+            # it is safe for a marker that _claim_index did not write yet.
+            stack.callback(_release_index, db_dir)
+            _claim_index(db_dir)
+        except BaseException:
+            # Before the lock is released: a late SIGTERM of a takeover must
+            # reach the handler of the caller, not _stopped.
+            _restore_handler()
+            raise
+        # Registered last, thus it runs first: the handler of the caller is
+        # back before the markers and the lock go.
+        stack.callback(_restore_handler)
         yield
 
 
@@ -702,12 +817,11 @@ def _run_multi(
     then runs the FTS rebuild and per-(variant, image) retention once at the
     end (§5.8).  A failure in one build does not abort the others.
     """
-    from ..exit_codes import EXIT_SUPERSEDED
     from ..indexer._postprocess import cleanup_old_builds_multi
     from ..indexer.build import build_variant_config, generate_compile_commands
     from ..indexer.builders import registry as builder_registry
     from ..indexer.db import open_db, rebuild_files_fts, rebuild_fts, rebuild_macros_fts
-    from ..indexer.runner import IndexSuperseded, run
+    from ..indexer.runner import IndexStopped, run
 
     build_cfg = cfg.build
     variants = _select_variants(build_cfg.variants, args)
@@ -803,13 +917,15 @@ def _run_multi(
                 defer_cleanup=True,
                 **per_build,
             )
-        except IndexSuperseded as exc:
-            # Another process owns the index now.  The remaining builds would
-            # abort on the same marker, so stop and let the whole command be
-            # retried — a partial sweep would leave some builds indexed
-            # against a database the other process is changing.
-            print(f"Superseded: {exc}", file=sys.stderr)
-            return EXIT_SUPERSEDED
+        except IndexStopped as exc:
+            # Another process owns the index now, or a SIGTERM asked this run
+            # to stop.  The remaining builds would stop on the same cause, so
+            # stop the sweep here — a partial sweep would leave some builds
+            # indexed against a database the other process is changing.
+            # IndexStopped comes before the broad handler below, which would
+            # otherwise swallow it and continue with the next build.
+            print(f"{exc.label}: {exc}", file=sys.stderr)
+            return exc.exit_code
         except Exception as exc:  # noqa: BLE001 — best-effort per-build
             print(f"error: indexing variant={variant_name} image={image}: {exc}", file=sys.stderr)
             continue
@@ -932,6 +1048,43 @@ def _ensure_watcher_after_index(project_root: Path) -> None:
         log.debug("Could not start the watcher daemon for %s", project_root, exc_info=True)
 
 
+class _SigtermOutsideTheLock:
+    """The SIGTERM handler of ``cmd_index`` while this run does not own the index.
+
+    Inside the lock, _owned_index has its own handler, and it gives this one
+    back when the run releases the index.
+
+    WHY a handler here and not the default action: a run that takes over
+    sends SIGTERM once, and the holder can release the lock between the
+    check of the taker and the arrival of the signal.  With the default
+    action that holder died with -15 in the middle of its work after the
+    lock (the daemon start, the registry update), and the daemon logged it
+    as a failure.  The taker only wants the index, and it has it, thus this
+    handler ignores a SIGTERM of a takeover (see _taken_over).
+
+    Any other SIGTERM stops the run with EXIT_TERMINATED.  SystemExit, not
+    a signal to itself: ``finally`` blocks then run, and the status is the
+    same as the one that _owned_index gives.
+
+    ``db_dir`` is None until ``cmd_index`` knows the index directory.
+    """
+
+    def __init__(self) -> None:
+        self.db_dir: Path | None = None
+
+    def __call__(self, signum: int, frame: object) -> None:
+        from ..exit_codes import EXIT_TERMINATED
+
+        if self.db_dir is not None and _taken_over(self.db_dir):
+            log.info("Ignored the SIGTERM of a takeover: this run no longer owns the index")
+            return
+        # os.write, not print: the signal can arrive while the main code
+        # writes to sys.stderr, and a second write to that buffered stream
+        # then raises "reentrant call" instead of this SystemExit.
+        os.write(2, b"Terminated: a SIGTERM that no index run sent stopped this run\n")
+        raise SystemExit(EXIT_TERMINATED)
+
+
 def cmd_index(args: argparse.Namespace) -> int:
     """Build or rebuild the symbol index from compile_commands.json.
 
@@ -945,13 +1098,26 @@ def cmd_index(args: argparse.Namespace) -> int:
     ``fw-context index``).  Forcing a build on every run would be
     wasteful — Mbed/zephyr builds can take minutes.  The auto-detect
     logic only triggers a build when necessary.
+
+    The SIGTERM handler of the whole command is _SigtermOutsideTheLock, and
+    the handler of the caller comes back when the command ends.
     """
+    outside = _SigtermOutsideTheLock()
+    previous = signal.signal(signal.SIGTERM, outside)
+    try:
+        return _cmd_index(args, outside)
+    finally:
+        signal.signal(signal.SIGTERM, signal.SIG_DFL if previous is None else previous)
+
+
+def _cmd_index(args: argparse.Namespace, outside: _SigtermOutsideTheLock) -> int:
+    """The body of :func:`cmd_index`, under its SIGTERM handler."""
     from ..config import derive_project_id
     from ..config import load as load_config
-    from ..exit_codes import EXIT_ALREADY_RUNNING, EXIT_SUPERSEDED
+    from ..exit_codes import EXIT_ALREADY_RUNNING, EXIT_SUPERSEDED, EXIT_TERMINATED
     from ..indexer.build import detect_build_system
     from ..indexer.db._locking import IndexRunLocked
-    from ..indexer.runner import IndexSuperseded
+    from ..indexer.runner import IndexStopped
     from ..utils import resolve_project_root
 
     if args.verbose:
@@ -1038,6 +1204,7 @@ def cmd_index(args: argparse.Namespace) -> int:
     # rewrites compile_commands.json under it, and a run that is refused
     # afterwards has spent the whole build for nothing.  _owned_index takes
     # over from a background run, and from a foreground one with --takeover.
+    outside.db_dir = db_path.parent
     try:
         with _owned_index(db_path.parent, args):
             # ── Multi-variant: dispatch BEFORE single-build resolution ──
@@ -1061,11 +1228,12 @@ def cmd_index(args: argparse.Namespace) -> int:
     except IndexRunLocked as exc:
         print(f"error: {exc}", file=sys.stderr)
         return EXIT_ALREADY_RUNNING
-    except IndexSuperseded as exc:
-        # Not a failure — see IndexSuperseded.  The distinct exit code lets
-        # the daemon retry instead of treating it as a broken run.
-        print(f"Superseded: {exc}", file=sys.stderr)
-        exit_code = EXIT_SUPERSEDED
+    except IndexStopped as exc:
+        # Not a failure — see IndexStopped.  The distinct exit codes let the
+        # daemon retry a superseded run, and not a terminated one, instead
+        # of treating either as a broken run.
+        print(f"{exc.label}: {exc}", file=sys.stderr)
+        exit_code = exc.exit_code
 
     # Everything below runs outside the index lock.  The daemon does a
     # staleness check when it starts, thus a daemon that starts inside the
@@ -1078,8 +1246,9 @@ def cmd_index(args: argparse.Namespace) -> int:
         # A run that another run took over did not fail either.  The marker
         # blocks the automatic build for 30 minutes, thus the daemon retry
         # that EXIT_SUPERSEDED causes would then index without the build,
-        # and the files that only the build can cover would stay out.
-        if multi and auto_build_sources and exit_code != EXIT_SUPERSEDED:
+        # and the files that only the build can cover would stay out.  A run
+        # that a SIGTERM stopped did not fail either: its build did not end.
+        if multi and auto_build_sources and exit_code not in (EXIT_SUPERSEDED, EXIT_TERMINATED):
             autobuild.record_failure(db_path.parent, auto_build_sources)
         return exit_code
 

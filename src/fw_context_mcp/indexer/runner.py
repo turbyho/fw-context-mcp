@@ -26,6 +26,7 @@ from ..config.settings import derive_project_id
 from ..exit_codes import (  # noqa: F401 — re-exported
     EXIT_ALREADY_RUNNING,
     EXIT_SUPERSEDED,
+    EXIT_TERMINATED,
 )
 from ..mcp.shared.pid_file import PidFile
 from ..utils import TU_EXTENSIONS
@@ -85,7 +86,23 @@ __all__ = [
 # ═══════════════════════════════════════════════════════════════
 
 
-class IndexSuperseded(Exception):
+class IndexStopped(Exception):
+    """This run stopped before its end, and it did not fail.
+
+    The base of the two reasons.  A handler that must unwind a stopped run
+    catches this class, and ``exit_code`` gives the status of the process.
+    ``label`` starts the line that the CLI prints for it.
+
+    Deliberately outside :data:`SAFE_EXCEPT` — a handler that swallowed this
+    as "a step failed, carry on" would resume exactly the run this exists to
+    stop.
+    """
+
+    exit_code: int = 1
+    label: str = "Stopped"
+
+
+class IndexSuperseded(IndexStopped):
     """Another process took over the index, so this run gave up.
 
     Not a failure: nothing is wrong with the index, and nothing was written
@@ -93,10 +110,23 @@ class IndexSuperseded(Exception):
     have applied decisions made from a snapshot the other process has since
     invalidated.
 
-    Deliberately outside :data:`SAFE_EXCEPT` — a handler that swallowed this
-    as "a step failed, carry on" would resume exactly the run this exists to
-    stop.  Callers report it as superseded and retry the work from the start.
+    Callers report it as superseded and retry the work from the start.
     """
+
+    exit_code = EXIT_SUPERSEDED
+    label = "Superseded"
+
+
+class IndexTerminated(IndexStopped):
+    """A SIGTERM stopped this run, and no other index run sent it.
+
+    A CI timeout, a ``kill`` or the shutdown of the daemon.  Nothing took
+    the index over, thus the work is not to be retried: somebody wanted it
+    to stop.
+    """
+
+    exit_code = EXIT_TERMINATED
+    label = "Terminated"
 
 
 def raise_if_superseded(db_dir: Path) -> None:
