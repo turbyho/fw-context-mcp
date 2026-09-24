@@ -654,6 +654,17 @@ def _filter_images(cc_list: list, args: argparse.Namespace) -> list:
     return out
 
 
+def _variant_cc_path(project_root: Path, variant_name: str) -> Path:
+    """Return the compilation database of one variant that builds without sysbuild.
+
+    One name for the two sides: ``_run_multi`` writes this file, and
+    ``_discover_existing_cc`` reads it in a later run without ``--build``.
+    It sits beside the canonical file, because only there is the rename in
+    ``generate_compile_commands`` atomic.
+    """
+    return (project_root / CC_OUTPUT_REL).with_name(f"compile_commands.{variant_name}.json")
+
+
 def _discover_existing_cc(project_root, variants: list, build_cfg) -> list:
     """Discover existing ``compile_commands.<variant>[.<image>].json`` copies."""
     found: list = []
@@ -667,7 +678,7 @@ def _discover_existing_cc(project_root, variants: list, build_cfg) -> list:
                 if cc.exists():
                     found.append((variant.name, sub.name, cc, _effective_board(build_cfg, variant, sub.name)))
         # non-sysbuild single-image layout: compile_commands.<variant>.json
-        single = (project_root / CC_OUTPUT_REL).with_name(f"compile_commands.{variant.name}.json")
+        single = _variant_cc_path(project_root, variant.name)
         if single.exists():
             found.append((variant.name, "", single, _effective_board(build_cfg, variant, "")))
         if not bd.is_dir() and not single.exists():
@@ -724,8 +735,21 @@ def _run_multi(
                     # output directory, thus a shared one would make the
                     # variants overwrite each other.
                     vcfg.isolated_build_dir = autobuild_dir(variant.name)
+                # Each variant gets its own file.  All variants build before
+                # the first one is indexed, thus one shared file gave each
+                # variant the database of the last one.
                 try:
-                    path = generate_compile_commands(project_root, vcfg)
+                    output = _variant_cc_path(project_root, variant.name)
+                except ValueError:
+                    # A name with "/" cannot be a part of a file name.  One bad
+                    # variant must not stop the others, as a failed build does not.
+                    print(
+                        f"error: variant '{variant.name}': the name cannot be a part of a file name",
+                        file=sys.stderr,
+                    )
+                    continue
+                try:
+                    path = generate_compile_commands(project_root, vcfg, output=output)
                 except RuntimeError as exc:
                     print(f"error: variant '{variant.name}': {exc}", file=sys.stderr)
                     continue

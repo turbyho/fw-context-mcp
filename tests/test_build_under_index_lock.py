@@ -399,9 +399,9 @@ class TestDeadStagingFiles:
 
     @staticmethod
     def _clear(tmp_path: Path) -> None:
-        from fw_context_mcp.indexer.build import _clear_dead_staging_files
+        from fw_context_mcp.indexer.build import clear_dead_staging_files
 
-        _clear_dead_staging_files(cc_staging_path(tmp_path))
+        clear_dead_staging_files(cc_staging_path(tmp_path))
 
     def test_the_file_of_a_dead_process_goes(self, tmp_path: Path):
         orphan = _staging_of(tmp_path, _token_of(2147483646))

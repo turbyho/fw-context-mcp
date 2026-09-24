@@ -459,7 +459,7 @@ def _run_pre_build(cfg: BuildConfig, cwd: Path) -> None:
         raise RuntimeError(f"Pre-build command failed with exit code {result.returncode}")
 
 
-def _clear_dead_staging_files(staging: Path) -> None:
+def clear_dead_staging_files(staging: Path) -> None:
     """Remove the staging files that stopped builds left in the directory.
 
     A build that a signal stops leaves its staging file behind, and that file
@@ -490,8 +490,17 @@ def _clear_dead_staging_files(staging: Path) -> None:
 def generate_compile_commands(
     project_root: Path,
     cfg: BuildConfig,
+    output: Path | None = None,
 ) -> Path:
     """Generate a fresh compile_commands.json and return its path.
+
+    *output* is the file that gets the result, and None means the canonical
+    ``compile_commands.json``.  A build of one variant of
+    ``[[build.variants]]`` gives ``compile_commands.<variant>.json``: the
+    variants all build before the first one is indexed, thus one shared file
+    gave every variant the database of the last one.  *output* must be in
+    the directory of the canonical file, because only there is the rename
+    atomic.
 
     The build writes a staging file, and one atomic rename then gives the
     canonical ``compile_commands.json`` the new content.  WHY: on 2026-09-23
@@ -517,7 +526,10 @@ def generate_compile_commands(
     """
     root = project_root.resolve()
     staging = cc_staging_path(root)
-    _clear_dead_staging_files(staging)
+    final = cc_output_path(root) if output is None else output
+    if final.parent.resolve() != staging.parent.resolve():
+        raise ValueError(f"{final} is not in {staging.parent}, thus the rename is not atomic")
+    clear_dead_staging_files(staging)
     # A file with the name of this run can already exist: a run that SIGKILL
     # stopped left it, and this run got the same PID again.  A backend that
     # reports success and writes nothing would then pass the exists() check
@@ -538,7 +550,6 @@ def generate_compile_commands(
             raise RuntimeError(
                 f"The build reported success and wrote no compilation database to {staging}"
             )
-        final = cc_output_path(root)
         os.replace(staging, final)
         return final
     finally:
